@@ -6,8 +6,9 @@ readme = "README.md"
 
 [features]
 default = ["std"]
-std = ["thiserror/std"]
+std = ["thiserror/std", "multihash/std"]
 
 [dependencies]
+multihash = { version = "0.19", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.10", default-features = false }
 thiserror = { version = "2", default-features = false }

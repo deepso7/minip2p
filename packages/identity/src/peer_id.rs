@@ -1,6 +1,10 @@
-use alloc::{string::String, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::{fmt, str::FromStr};
 
+use multihash::Multihash;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -14,6 +18,9 @@ const MAX_INLINE_KEY_LENGTH: usize = 42;
 
 const BASE58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const BASE32_ALPHABET_LOWER: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+const MAX_MULTIHASH_DIGEST_LENGTH: usize = 64;
+
+type PeerMultihash = Multihash<MAX_MULTIHASH_DIGEST_LENGTH>;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 /// A libp2p peer id represented as raw multihash bytes.
@@ -98,13 +105,14 @@ impl PeerId {
             _ => return Err(PeerIdError::UnsupportedMultibase(prefix)),
         };
 
-        let (version, version_len) = read_uvarint(&cid_bytes).map_err(PeerIdError::Varint)?;
+        let (version, version_len) =
+            read_uvarint(&cid_bytes).map_err(PeerIdError::InvalidCidVersionVarint)?;
         if version != 1 {
             return Err(PeerIdError::UnsupportedCidVersion(version));
         }
 
-        let (codec, codec_len) =
-            read_uvarint(&cid_bytes[version_len..]).map_err(PeerIdError::Varint)?;
+        let (codec, codec_len) = read_uvarint(&cid_bytes[version_len..])
+            .map_err(PeerIdError::InvalidCidMulticodecVarint)?;
         if codec != LIBP2P_KEY_MULTICODEC {
             return Err(PeerIdError::UnsupportedMulticodec(codec));
         }
@@ -146,10 +154,16 @@ pub enum PeerIdError {
     InvalidMultihashLength { expected: usize, actual: usize },
     #[error("invalid sha2-256 digest length: expected 32, got {actual}")]
     InvalidSha256DigestLength { actual: usize },
-    #[error("invalid base58btc character '{0}'")]
-    InvalidBase58Character(char),
-    #[error("invalid base32 character '{0}'")]
-    InvalidBase32Character(char),
+    #[error("invalid base58btc character '{character}' at index {index}")]
+    InvalidBase58Character { character: char, index: usize },
+    #[error("invalid base32 character '{character}' at index {index}")]
+    InvalidBase32Character { character: char, index: usize },
+    #[error("invalid cid version varint: {0}")]
+    InvalidCidVersionVarint(VarintError),
+    #[error("invalid cid multicodec varint: {0}")]
+    InvalidCidMulticodecVarint(VarintError),
+    #[error("invalid multihash: {0}")]
+    InvalidMultihash(String),
     #[error("invalid varint: {0}")]
     Varint(VarintError),
 }
@@ -220,28 +234,11 @@ pub(crate) fn read_uvarint(input: &[u8]) -> Result<(u64, usize), VarintError> {
 }
 
 fn validate_multihash(multihash: &[u8]) -> Result<(), PeerIdError> {
-    let (code, code_len) = read_uvarint(multihash).map_err(PeerIdError::Varint)?;
-    let (digest_len, digest_len_len) =
-        read_uvarint(&multihash[code_len..]).map_err(PeerIdError::Varint)?;
+    let parsed = PeerMultihash::from_bytes(multihash)
+        .map_err(|err| PeerIdError::InvalidMultihash(err.to_string()))?;
 
-    let digest_len: usize =
-        digest_len
-            .try_into()
-            .map_err(|_| PeerIdError::InvalidMultihashLength {
-                expected: usize::MAX,
-                actual: multihash.len(),
-            })?;
-
-    let header_len = code_len + digest_len_len;
-    let expected_total = header_len + digest_len;
-    if multihash.len() != expected_total {
-        return Err(PeerIdError::InvalidMultihashLength {
-            expected: expected_total,
-            actual: multihash.len(),
-        });
-    }
-
-    if code == SHA256_MULTIHASH_CODE && digest_len != 32 {
+    let digest_len = parsed.digest().len();
+    if parsed.code() == SHA256_MULTIHASH_CODE && digest_len != 32 {
         return Err(PeerIdError::InvalidSha256DigestLength { actual: digest_len });
     }
 
@@ -250,12 +247,18 @@ fn validate_multihash(multihash: &[u8]) -> Result<(), PeerIdError> {
 
 /// Constructs a multihash `<code><len><digest>` byte sequence.
 fn build_multihash(code: u64, digest: &[u8]) -> Vec<u8> {
-    let mut out =
-        Vec::with_capacity(uvarint_len(code) + uvarint_len(digest.len() as u64) + digest.len());
-    write_uvarint(code, &mut out);
-    write_uvarint(digest.len() as u64, &mut out);
-    out.extend_from_slice(digest);
-    out
+    match PeerMultihash::wrap(code, digest) {
+        Ok(multihash) => multihash.to_bytes(),
+        Err(_) => {
+            let mut out = Vec::with_capacity(
+                uvarint_len(code) + uvarint_len(digest.len() as u64) + digest.len(),
+            );
+            write_uvarint(code, &mut out);
+            write_uvarint(digest.len() as u64, &mut out);
+            out.extend_from_slice(digest);
+            out
+        }
+    }
 }
 
 /// Encodes bytes as base58btc.
@@ -309,8 +312,11 @@ fn decode_base58(input: &str) -> Result<Vec<u8>, PeerIdError> {
     let leading_zeros = input.chars().take_while(|c| *c == '1').count();
     let mut bytes = Vec::with_capacity(input.len());
 
-    for ch in input.chars().skip(leading_zeros) {
-        let value = base58_value(ch).ok_or(PeerIdError::InvalidBase58Character(ch))? as u32;
+    for (index, ch) in input.chars().enumerate().skip(leading_zeros) {
+        let value = base58_value(ch).ok_or(PeerIdError::InvalidBase58Character {
+            character: ch,
+            index,
+        })? as u32;
         let mut carry = value;
 
         if bytes.is_empty() {
@@ -385,8 +391,11 @@ fn decode_base32_nopad(input: &str) -> Result<Vec<u8>, PeerIdError> {
     let mut buffer = 0u32;
     let mut bits = 0u8;
 
-    for ch in input.chars() {
-        let value = base32_value(ch).ok_or(PeerIdError::InvalidBase32Character(ch))? as u32;
+    for (index, ch) in input.chars().enumerate() {
+        let value = base32_value(ch).ok_or(PeerIdError::InvalidBase32Character {
+            character: ch,
+            index,
+        })? as u32;
         buffer = (buffer << 5) | value;
         bits += 5;
 
@@ -411,6 +420,8 @@ fn base32_value(c: char) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
     use crate::{KeyType, PublicKey};
 
@@ -477,5 +488,39 @@ mod tests {
         assert_eq!(peer_from_legacy, peer_from_cid);
         assert_eq!(peer_from_legacy.to_base58(), legacy);
         assert_eq!(peer_from_legacy.to_cid_base32(), cid);
+    }
+
+    #[test]
+    fn includes_multihash_error_details() {
+        let err =
+            PeerId::from_multihash(vec![0xff]).expect_err("invalid multihash bytes should fail");
+
+        match err {
+            PeerIdError::InvalidMultihash(message) => assert!(!message.is_empty()),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn reports_base58_error_with_index() {
+        let err = PeerId::from_base58("Qm0bad").expect_err("invalid base58 should fail");
+
+        assert_eq!(
+            err,
+            PeerIdError::InvalidBase58Character {
+                character: '0',
+                index: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn reports_cid_varint_context() {
+        let err = PeerId::from_cid("b").expect_err("empty cid payload should fail");
+
+        assert_eq!(
+            err,
+            PeerIdError::InvalidCidVersionVarint(VarintError::BufferTooShort)
+        );
     }
 }
