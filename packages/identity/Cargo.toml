@@ -2,5 +2,12 @@
 name = "minip2p-identity"
 version = "0.1.0"
 edition = "2024"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["thiserror/std"]
 
 [dependencies]
+sha2 = { version = "0.10", default-features = false }
+thiserror = { version = "2", default-features = false }
