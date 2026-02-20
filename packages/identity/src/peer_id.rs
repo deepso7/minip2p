@@ -18,14 +18,14 @@ const MAX_INLINE_KEY_LENGTH: usize = 42;
 
 const BASE58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const BASE32_ALPHABET_LOWER: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-const MAX_MULTIHASH_DIGEST_LENGTH: usize = 64;
+pub const PEER_ID_MULTIHASH_SIZE: usize = 64;
 
-type PeerMultihash = Multihash<MAX_MULTIHASH_DIGEST_LENGTH>;
+pub type PeerMultihash = Multihash<PEER_ID_MULTIHASH_SIZE>;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 /// A libp2p peer id represented as raw multihash bytes.
 pub struct PeerId {
-    multihash: Vec<u8>,
+    multihash: PeerMultihash,
 }
 
 impl PeerId {
@@ -49,33 +49,48 @@ impl PeerId {
         Self { multihash }
     }
 
-    /// Validates and stores existing multihash bytes.
-    pub fn from_multihash(multihash: Vec<u8>) -> Result<Self, PeerIdError> {
+    /// Parses and validates multihash-encoded peer id bytes.
+    pub fn from_bytes(multihash: &[u8]) -> Result<Self, PeerIdError> {
+        let parsed = PeerMultihash::from_bytes(multihash)
+            .map_err(|err| PeerIdError::InvalidMultihash(err.to_string()))?;
+
+        Self::from_multihash(parsed)
+    }
+
+    /// Validates and stores an existing multihash value.
+    pub fn from_multihash(multihash: PeerMultihash) -> Result<Self, PeerIdError> {
         validate_multihash(&multihash)?;
         Ok(Self { multihash })
     }
 
-    /// Returns peer id bytes as multihash.
-    pub fn as_bytes(&self) -> &[u8] {
+    /// Returns the underlying typed multihash value.
+    pub fn multihash(&self) -> &PeerMultihash {
         &self.multihash
     }
 
-    /// Consumes the peer id and returns multihash bytes.
-    pub fn into_bytes(self) -> Vec<u8> {
+    /// Consumes the peer id and returns the typed multihash value.
+    pub fn into_multihash(self) -> PeerMultihash {
         self.multihash
+    }
+
+    /// Encodes this peer id into multihash bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.multihash.to_bytes()
     }
 
     /// Encodes this peer id as legacy base58btc multihash text.
     pub fn to_base58(&self) -> String {
-        encode_base58(&self.multihash)
+        let multihash = self.to_bytes();
+        encode_base58(&multihash)
     }
 
     /// Encodes this peer id as CIDv1 (`libp2p-key`) in base32 multibase.
     pub fn to_cid_base32(&self) -> String {
-        let mut cid = Vec::with_capacity(4 + self.multihash.len());
+        let multihash = self.to_bytes();
+        let mut cid = Vec::with_capacity(4 + multihash.len());
         write_uvarint(1, &mut cid);
         write_uvarint(LIBP2P_KEY_MULTICODEC, &mut cid);
-        cid.extend_from_slice(&self.multihash);
+        cid.extend_from_slice(&multihash);
 
         let mut out = String::with_capacity(1 + ((cid.len() * 8) + 4) / 5);
         out.push('b');
@@ -86,7 +101,7 @@ impl PeerId {
     /// Parses legacy base58btc peer id text.
     pub fn from_base58(input: &str) -> Result<Self, PeerIdError> {
         let multihash = decode_base58(input)?;
-        Self::from_multihash(multihash)
+        Self::from_bytes(&multihash)
     }
 
     /// Parses CID peer id text and extracts the multihash.
@@ -118,7 +133,7 @@ impl PeerId {
         }
 
         let multihash = cid_bytes[version_len + codec_len..].to_vec();
-        Self::from_multihash(multihash)
+        Self::from_bytes(&multihash)
     }
 }
 
@@ -150,8 +165,6 @@ pub enum PeerIdError {
     UnsupportedCidVersion(u64),
     #[error("unsupported multicodec 0x{0:x}; expected libp2p-key (0x72)")]
     UnsupportedMulticodec(u64),
-    #[error("invalid multihash length: expected {expected}, got {actual}")]
-    InvalidMultihashLength { expected: usize, actual: usize },
     #[error("invalid sha2-256 digest length: expected 32, got {actual}")]
     InvalidSha256DigestLength { actual: usize },
     #[error("invalid base58btc character '{character}' at index {index}")]
@@ -233,32 +246,19 @@ pub(crate) fn read_uvarint(input: &[u8]) -> Result<(u64, usize), VarintError> {
     Err(VarintError::BufferTooShort)
 }
 
-fn validate_multihash(multihash: &[u8]) -> Result<(), PeerIdError> {
-    let parsed = PeerMultihash::from_bytes(multihash)
-        .map_err(|err| PeerIdError::InvalidMultihash(err.to_string()))?;
-
-    let digest_len = parsed.digest().len();
-    if parsed.code() == SHA256_MULTIHASH_CODE && digest_len != 32 {
+fn validate_multihash(multihash: &PeerMultihash) -> Result<(), PeerIdError> {
+    let digest_len = multihash.digest().len();
+    if multihash.code() == SHA256_MULTIHASH_CODE && digest_len != 32 {
         return Err(PeerIdError::InvalidSha256DigestLength { actual: digest_len });
     }
 
     Ok(())
 }
 
-/// Constructs a multihash `<code><len><digest>` byte sequence.
-fn build_multihash(code: u64, digest: &[u8]) -> Vec<u8> {
-    match PeerMultihash::wrap(code, digest) {
-        Ok(multihash) => multihash.to_bytes(),
-        Err(_) => {
-            let mut out = Vec::with_capacity(
-                uvarint_len(code) + uvarint_len(digest.len() as u64) + digest.len(),
-            );
-            write_uvarint(code, &mut out);
-            write_uvarint(digest.len() as u64, &mut out);
-            out.extend_from_slice(digest);
-            out
-        }
-    }
+/// Constructs a typed multihash for peer id storage.
+fn build_multihash(code: u64, digest: &[u8]) -> PeerMultihash {
+    PeerMultihash::wrap(code, digest)
+        .expect("peer id digests are bounded (identity<=42, sha2-256=32)")
 }
 
 /// Encodes bytes as base58btc.
@@ -420,8 +420,6 @@ fn base32_value(c: char) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
-
     use super::*;
     use crate::{KeyType, PublicKey};
 
@@ -448,7 +446,7 @@ mod tests {
 
         let peer_id = PeerId::from_public_key(&public_key);
 
-        let mh = peer_id.as_bytes();
+        let mh = peer_id.to_bytes();
         assert_eq!(mh[0], 0x00);
         assert_eq!(mh[1], 0x24);
 
@@ -464,7 +462,7 @@ mod tests {
         );
 
         let peer_id = PeerId::from_public_key_protobuf(&encoded_public_key);
-        let mh = peer_id.as_bytes();
+        let mh = peer_id.to_bytes();
         assert_eq!(mh[0], 0x12);
         assert_eq!(mh[1], 0x20);
 
@@ -492,8 +490,7 @@ mod tests {
 
     #[test]
     fn includes_multihash_error_details() {
-        let err =
-            PeerId::from_multihash(vec![0xff]).expect_err("invalid multihash bytes should fail");
+        let err = PeerId::from_bytes(&[0xff]).expect_err("invalid multihash bytes should fail");
 
         match err {
             PeerIdError::InvalidMultihash(message) => assert!(!message.is_empty()),

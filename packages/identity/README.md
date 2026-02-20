@@ -12,6 +12,7 @@ Small, `no_std`-friendly libp2p identity crate focused on public key protobuf en
 - Peer ID string support:
   - Legacy base58btc multihash form (`Qm...`, `12D3Koo...`).
   - CIDv1 with `libp2p-key` multicodec (`0x72`) in base32 multibase (`b...`).
+- Typed multihash API via `PeerMultihash` (`multihash::Multihash<64>`).
 
 ## Usage
 
@@ -23,6 +24,10 @@ let peer_id = PeerId::from_public_key(&public_key);
 
 let legacy = peer_id.to_base58();
 let cid = peer_id.to_cid_base32();
+let raw = peer_id.to_bytes();
+
+let reparsed = PeerId::from_bytes(&raw).unwrap();
+assert_eq!(reparsed, peer_id);
 
 let parsed_legacy: PeerId = legacy.parse().unwrap();
 let parsed_cid: PeerId = cid.parse().unwrap();
