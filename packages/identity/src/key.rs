@@ -1,5 +1,9 @@
 use alloc::vec::Vec;
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use thiserror::Error;
+
+#[cfg(feature = "std")]
+use rand_core::OsRng;
 
 use crate::peer_id::{read_uvarint, uvarint_len, write_uvarint};
 
@@ -117,6 +121,75 @@ impl PublicKey {
             data: input[idx..].to_vec(),
         })
     }
+
+    /// Verifies `signature` over `message` using this public key.
+    ///
+    /// For this milestone only Ed25519 is supported.
+    pub fn verify(&self, message: &[u8], signature: &[u8]) -> bool {
+        if self.key_type != KeyType::Ed25519 {
+            return false;
+        }
+
+        let key_bytes: [u8; 32] = match self.data.as_slice().try_into() {
+            Ok(bytes) => bytes,
+            Err(_) => return false,
+        };
+
+        let verifying_key = match VerifyingKey::from_bytes(&key_bytes) {
+            Ok(key) => key,
+            Err(_) => return false,
+        };
+
+        let signature = match ed25519_dalek::Signature::from_slice(signature) {
+            Ok(sig) => sig,
+            Err(_) => return false,
+        };
+
+        verifying_key.verify(message, &signature).is_ok()
+    }
+}
+
+#[derive(Clone)]
+/// Host keypair used for libp2p identity operations.
+pub enum Keypair {
+    Ed25519(SigningKey),
+}
+
+impl Keypair {
+    /// Generates a fresh Ed25519 keypair.
+    #[cfg(feature = "std")]
+    pub fn generate_ed25519() -> Self {
+        Self::Ed25519(SigningKey::generate(&mut OsRng))
+    }
+
+    /// Constructs a keypair from an Ed25519 secret key.
+    pub fn from_ed25519_secret(secret_key: [u8; 32]) -> Self {
+        Self::Ed25519(SigningKey::from_bytes(&secret_key))
+    }
+
+    /// Returns the key type.
+    pub fn key_type(&self) -> KeyType {
+        match self {
+            Self::Ed25519(_) => KeyType::Ed25519,
+        }
+    }
+
+    /// Returns the public key for this keypair.
+    pub fn public(&self) -> PublicKey {
+        match self {
+            Self::Ed25519(signing_key) => {
+                let verifying_key = signing_key.verifying_key();
+                PublicKey::new(KeyType::Ed25519, verifying_key.to_bytes().to_vec())
+            }
+        }
+    }
+
+    /// Signs a message and returns the signature bytes.
+    pub fn sign(&self, message: &[u8]) -> Vec<u8> {
+        match self {
+            Self::Ed25519(signing_key) => signing_key.sign(message).to_vec(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -176,5 +249,18 @@ mod tests {
         let key = PublicKey::decode_protobuf(&encoded).expect("must decode");
         assert_eq!(key.key_type(), KeyType::Ed25519);
         assert_eq!(key.encode_protobuf(), encoded);
+    }
+
+    #[test]
+    fn signs_and_verifies_with_ed25519_keypair() {
+        let secret = [7u8; 32];
+        let keypair = Keypair::from_ed25519_secret(secret);
+        let public = keypair.public();
+
+        let message = b"hello minip2p";
+        let signature = keypair.sign(message);
+
+        assert!(public.verify(message, &signature));
+        assert!(!public.verify(b"tampered", &signature));
     }
 }

@@ -2,5 +2,15 @@
 name = "quic"
 version = "0.1.0"
 edition = "2024"
+readme = "README.md"
 
 [dependencies]
+boring = "4.3"
+der-parser = "10"
+minip2p-identity = { path = "../../packages/identity" }
+quiche = { version = "0.25", default-features = false, features = ["boringssl-boring-crate"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+rcgen = { version = "0.14", features = ["pem"] }
+thiserror = "2"
+x509-parser = { version = "0.18", features = ["verify"] }
+yasna = "0.5"
