@@ -3,6 +3,9 @@ use thiserror::Error;
 
 use crate::peer_id::{read_uvarint, uvarint_len, write_uvarint};
 
+#[cfg(feature = "ed25519")]
+use ed25519_dalek::{Signature, VerifyingKey};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
 /// Key type values used by libp2p key protobuf wrappers.
@@ -117,6 +120,38 @@ impl PublicKey {
             data: input[idx..].to_vec(),
         })
     }
+
+    /// Verifies a signature against this public key.
+    ///
+    /// Currently only Ed25519 verification is supported.
+    #[cfg(feature = "ed25519")]
+    pub fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), VerifyError> {
+        match self.key_type {
+            KeyType::Ed25519 => {
+                let public_key_bytes: [u8; 32] = self.data.as_slice().try_into().map_err(|_| {
+                    VerifyError::InvalidEd25519PublicKeyLength {
+                        actual: self.data.len(),
+                    }
+                })?;
+                let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)
+                    .map_err(|_| VerifyError::InvalidEd25519PublicKey)?;
+
+                let signature_bytes: [u8; 64] =
+                    signature
+                        .try_into()
+                        .map_err(|_| VerifyError::InvalidSignatureLength {
+                            expected: 64,
+                            actual: signature.len(),
+                        })?;
+                let signature = Signature::from_bytes(&signature_bytes);
+
+                verifying_key
+                    .verify_strict(message, &signature)
+                    .map_err(|_| VerifyError::InvalidSignature)
+            }
+            other => Err(VerifyError::UnsupportedKeyType(other)),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -138,11 +173,29 @@ pub enum PublicKeyError {
     },
 }
 
+#[cfg(feature = "ed25519")]
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum VerifyError {
+    #[error("signature verification is unsupported for key type {0:?}")]
+    UnsupportedKeyType(KeyType),
+    #[error("invalid ed25519 public key length: expected 32, got {actual}")]
+    InvalidEd25519PublicKeyLength { actual: usize },
+    #[error("invalid ed25519 public key bytes")]
+    InvalidEd25519PublicKey,
+    #[error("invalid signature length: expected {expected}, got {actual}")]
+    InvalidSignatureLength { expected: usize, actual: usize },
+    #[error("signature verification failed")]
+    InvalidSignature,
+}
+
 #[cfg(test)]
 mod tests {
     use alloc::vec;
 
     use super::*;
+
+    #[cfg(feature = "ed25519")]
+    use crate::Ed25519Keypair;
 
     fn decode_hex(input: &str) -> Vec<u8> {
         assert_eq!(input.len() % 2, 0);
@@ -176,5 +229,64 @@ mod tests {
         let key = PublicKey::decode_protobuf(&encoded).expect("must decode");
         assert_eq!(key.key_type(), KeyType::Ed25519);
         assert_eq!(key.encode_protobuf(), encoded);
+    }
+
+    #[cfg(feature = "ed25519")]
+    #[test]
+    fn verifies_ed25519_signature() {
+        let keypair = Ed25519Keypair::from_secret_key_bytes([9u8; 32]);
+        let message = b"minip2p-signature";
+        let signature = keypair.sign(message);
+
+        keypair
+            .public_key()
+            .verify(message, &signature)
+            .expect("signature must verify");
+    }
+
+    #[cfg(feature = "ed25519")]
+    #[test]
+    fn rejects_tampered_ed25519_signature() {
+        let keypair = Ed25519Keypair::from_secret_key_bytes([11u8; 32]);
+        let message = b"minip2p-signature";
+        let mut signature = keypair.sign(message);
+        signature[0] ^= 0x01;
+
+        let err = keypair
+            .public_key()
+            .verify(message, &signature)
+            .expect_err("tampered signature must fail");
+        assert_eq!(err, VerifyError::InvalidSignature);
+    }
+
+    #[cfg(feature = "ed25519")]
+    #[test]
+    fn rejects_wrong_signature_length() {
+        let keypair = Ed25519Keypair::from_secret_key_bytes([13u8; 32]);
+        let message = b"minip2p-signature";
+        let short_sig = vec![0u8; 63];
+
+        let err = keypair
+            .public_key()
+            .verify(message, &short_sig)
+            .expect_err("short signature must fail");
+        assert_eq!(
+            err,
+            VerifyError::InvalidSignatureLength {
+                expected: 64,
+                actual: 63,
+            }
+        );
+    }
+
+    #[cfg(feature = "ed25519")]
+    #[test]
+    fn rejects_unsupported_key_type_for_verification() {
+        let key = PublicKey::new(KeyType::Rsa, vec![1, 2, 3, 4]);
+        let err = key
+            .verify(b"msg", &[0u8; 64])
+            .expect_err("unsupported key type must fail");
+
+        assert_eq!(err, VerifyError::UnsupportedKeyType(KeyType::Rsa));
     }
 }

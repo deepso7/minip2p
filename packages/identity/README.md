@@ -16,6 +16,10 @@ Small, `no_std`-friendly libp2p identity crate focused on public key protobuf en
 - Ed25519 keypair generation (`ed25519` feature, enabled by default) with:
   - `generate()` for `std` users.
   - `generate_with_rng(...)` for `no_std` users.
+- Ed25519 signatures (`ed25519` feature):
+  - `Ed25519Keypair::sign(...)` for message signing.
+  - `PublicKey::verify(...)` for signature verification with typed errors.
+  - `SignedBytes` helper for bundled `{ public_key, payload, signature }` verification.
 
 ## Usage
 
@@ -52,6 +56,34 @@ use rand_core::CryptoRngCore;
 fn generate_with_rng<R: CryptoRngCore + ?Sized>(rng: &mut R) -> Ed25519Keypair {
     Ed25519Keypair::generate_with_rng(rng)
 }
+```
+
+Sign and verify messages:
+
+```rust
+use minip2p_identity::{Ed25519Keypair, VerifyError};
+
+let keypair = Ed25519Keypair::from_secret_key_bytes([42u8; 32]);
+let message = b"payload";
+let signature = keypair.sign(message);
+
+keypair.public_key().verify(message, &signature)?;
+
+// Recommended for protocol payloads: sign a domain-separated byte string,
+// e.g. b"/minip2p/ping/1" || payload.
+# Ok::<(), VerifyError>(())
+```
+
+Sign and verify a bundled payload:
+
+```rust
+use minip2p_identity::{Ed25519Keypair, SignedBytes};
+
+let keypair = Ed25519Keypair::from_secret_key_bytes([7u8; 32]);
+let signed = SignedBytes::sign_ed25519(&keypair, b"payload".to_vec());
+
+signed.verify()?;
+# Ok::<(), minip2p_identity::VerifyError>(())
 ```
 
 ## Error semantics
@@ -158,5 +190,5 @@ rand_core = { version = "0.6.4", default-features = false }
 ## Scope
 
 This crate covers key container encoding and peer ID computation/parsing.
-It includes feature-gated Ed25519 key generation (`ed25519`, enabled by default),
-but does not include signature primitives.
+It includes feature-gated Ed25519 key generation and signature primitives
+(`ed25519`, enabled by default).

@@ -1,6 +1,6 @@
 use core::fmt;
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use rand_core::CryptoRngCore;
 
 #[cfg(feature = "std")]
@@ -10,6 +10,7 @@ use crate::{KeyType, PeerId, PublicKey};
 
 pub const ED25519_SECRET_KEY_LENGTH: usize = 32;
 pub const ED25519_PUBLIC_KEY_LENGTH: usize = 32;
+pub const ED25519_SIGNATURE_LENGTH: usize = 64;
 
 /// Ed25519 keypair with helpers to derive `PublicKey` and `PeerId`.
 #[derive(Clone, Eq, PartialEq)]
@@ -76,6 +77,12 @@ impl Ed25519Keypair {
     /// Computes this keypair's peer id.
     pub fn peer_id(&self) -> PeerId {
         PeerId::from_public_key(&self.public_key())
+    }
+
+    /// Signs a message with this keypair's secret key.
+    pub fn sign(&self, message: &[u8]) -> [u8; ED25519_SIGNATURE_LENGTH] {
+        let signing_key = SigningKey::from_bytes(&self.secret_key);
+        signing_key.sign(message).to_bytes()
     }
 }
 
@@ -171,6 +178,31 @@ mod tests {
 
         assert_eq!(restored.public_key_bytes(), generated.public_key_bytes());
         assert_eq!(restored.peer_id(), generated.peer_id());
+    }
+
+    #[test]
+    fn signs_and_verifies_message() {
+        let keypair = Ed25519Keypair::from_secret_key_bytes([3u8; ED25519_SECRET_KEY_LENGTH]);
+        let message = b"minip2p";
+        let signature = keypair.sign(message);
+
+        assert_eq!(signature.len(), ED25519_SIGNATURE_LENGTH);
+        keypair
+            .public_key()
+            .verify(message, &signature)
+            .expect("signature must verify");
+    }
+
+    #[test]
+    fn signature_fails_for_tampered_message() {
+        let keypair = Ed25519Keypair::from_secret_key_bytes([5u8; ED25519_SECRET_KEY_LENGTH]);
+        let signature = keypair.sign(b"original");
+
+        let err = keypair
+            .public_key()
+            .verify(b"tampered", &signature)
+            .expect_err("tampered message must fail");
+        assert!(matches!(err, crate::VerifyError::InvalidSignature));
     }
 
     #[cfg(feature = "std")]
