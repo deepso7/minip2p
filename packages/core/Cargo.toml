@@ -2,5 +2,12 @@
 name = "minip2p-core"
 version = "0.1.0"
 edition = "2024"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["minip2p-identity/std", "thiserror/std"]
 
 [dependencies]
+minip2p-identity = { path = "../identity", default-features = false }
+thiserror = { version = "2", default-features = false }
