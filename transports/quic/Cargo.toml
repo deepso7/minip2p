@@ -1,0 +1,15 @@
+[package]
+name = "minip2p-quic"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+minip2p-transport = { path = "../../packages/transport" }
+minip2p-identity = { path = "../../packages/identity" }
+minip2p-core = { path = "../../packages/core" }
+quiche = "0.28"
+getrandom = "0.3"
+
+[dev-dependencies]
+rcgen = "0.14"
+tempfile = "3"
