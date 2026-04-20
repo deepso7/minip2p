@@ -41,16 +41,15 @@ impl QuicConnection {
 
     pub fn recv_packet(
         &mut self,
-        buf: &[u8],
+        buf: &mut [u8],
         from: SocketAddr,
         local: SocketAddr,
         socket: &UdpSocket,
         events: &mut Vec<TransportEvent>,
     ) -> Result<(), minip2p_transport::TransportError> {
         let recv_info = quiche::RecvInfo { from, to: local };
-        let mut pkt = buf.to_vec();
 
-        match self.conn.recv(&mut pkt, recv_info) {
+        match self.conn.recv(buf, recv_info) {
             Ok(_) => {}
             Err(quiche::Error::Done) => {}
             Err(e) => {
@@ -114,7 +113,6 @@ impl QuicConnection {
 
     pub fn poll_streams(
         &mut self,
-        id: ConnectionId,
         events: &mut Vec<TransportEvent>,
         socket: &UdpSocket,
     ) -> Result<(), minip2p_transport::TransportError> {
@@ -128,7 +126,7 @@ impl QuicConnection {
             while let Ok((read, fin)) = self.conn.stream_recv(stream_id, &mut buf) {
                 if read > 0 {
                     events.push(TransportEvent::Received {
-                        id,
+                        id: self.id,
                         data: buf[..read].to_vec(),
                     });
                 }

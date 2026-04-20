@@ -223,7 +223,6 @@ impl Transport for QuicTransport {
             .ok_or(TransportError::ConnectionNotFound { id })?;
 
         conn.close(&self.socket)?;
-        self.pending_events.push(TransportEvent::Closed { id });
 
         Ok(())
     }
@@ -302,13 +301,13 @@ impl Transport for QuicTransport {
                     continue;
                 }
 
-                conn.recv_packet(&buf[..len], from, local_addr, &self.socket, &mut events)?;
+                conn.recv_packet(&mut buf[..len], from, local_addr, &self.socket, &mut events)?;
             }
         }
 
         let mut to_remove = Vec::new();
         for (&id, conn) in self.connections.iter_mut() {
-            conn.poll_streams(id, &mut events, &self.socket)?;
+            conn.poll_streams(&mut events, &self.socket)?;
 
             if conn.is_closed() {
                 to_remove.push(id);
