@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::{Ed25519Keypair, PublicKey, VerifyError, ED25519_SIGNATURE_LENGTH};
+use crate::{ED25519_SIGNATURE_LENGTH, Ed25519Keypair, PublicKey, VerifyError};
 
 /// Signed byte payload using an embedded public key and Ed25519 signature.
 #[derive(Clone, Debug, Eq, PartialEq)]
