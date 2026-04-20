@@ -44,12 +44,6 @@ Build and run tests:
 cargo test
 ```
 
-Run QUIC integration tests only:
-
-```bash
-cargo test -p minip2p-quic
-```
-
 ## Roadmap focus
 
 - [x] Local QUIC connectivity and integration coverage.
