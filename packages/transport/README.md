@@ -10,8 +10,9 @@ This crate defines the transport abstraction that concrete adapters (QUIC, WebSo
 - `ConnectionId` — lightweight `u64`-backed connection identifier.
 - `ConnectionEndpoint` — transport endpoint + optional remote `PeerId`.
 - `ConnectionState` — connection lifecycle: `Connecting`, `Connected`, `Closing`, `Closed`.
+- `PeerSendPolicy` — peer-level connection selection for `send_to_peer` style APIs.
 - `TransportAction` — host-side intents: `Dial`, `Listen`, `Send`, `Close`.
-- `TransportEvent` — transport-side outcomes: `Connected`, `Received`, `Closed`, `Error`, `IncomingConnection`, `Listening`.
+- `TransportEvent` — transport-side outcomes: `Connected`, `Received`, `Closed`, `Error`, `IncomingConnection`, `PeerIdentityVerified`, `Listening`.
 - `TransportError` — typed errors with connection, address, and config context.
 - `no_std` support (`alloc`-based), with `std` enabled by default.
 
@@ -88,6 +89,9 @@ fn event_loop(transport: &mut impl Transport) {
                 TransportEvent::IncomingConnection { id, endpoint } => {
                     println!("incoming connection {id} from {}", endpoint.transport());
                 }
+                TransportEvent::PeerIdentityVerified { id, endpoint, .. } => {
+                    println!("connection {id} identity verified as {:?}", endpoint.peer_id());
+                }
                 TransportEvent::Listening { addr } => {
                     println!("listening on {addr}");
                 }
@@ -114,6 +118,9 @@ fn handle_error(err: TransportError) {
         }
         TransportError::ResourceExhausted { resource } => {
             eprintln!("resource exhausted: {resource}");
+        }
+        TransportError::PeerNotConnected { peer_id } => {
+            eprintln!("no connected connections for peer {peer_id}");
         }
         TransportError::ConnectionNotFound { id } => {
             eprintln!("connection {id} does not exist");

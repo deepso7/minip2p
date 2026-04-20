@@ -16,7 +16,8 @@ This repository is an early-stage workspace with four crates:
 - `packages/transport` (`minip2p-transport`): sans-IO transport trait + connection types/events.
 - `transports/quic` (`minip2p-quic`): synchronous QUIC adapter built on `quiche`.
 
-The stack now supports local two-peer QUIC connectivity and byte exchange in integration tests.
+The stack now supports local two-peer QUIC connectivity, multi-connection-per-peer routing,
+peer identity upgrade events, and byte exchange in integration tests.
 
 ## Quick start
 

@@ -1,5 +1,6 @@
 use alloc::string::String;
 
+use minip2p_core::PeerId;
 use thiserror::Error;
 
 use crate::ConnectionId;
@@ -15,6 +16,8 @@ pub enum TransportError {
     InvalidConfig { reason: String },
     #[error("resource exhausted: {resource}")]
     ResourceExhausted { resource: &'static str },
+    #[error("peer {peer_id} has no connected transport connections")]
+    PeerNotConnected { peer_id: PeerId },
     #[error("connection {id} not found")]
     ConnectionNotFound { id: ConnectionId },
     #[error("connection {id} already exists")]

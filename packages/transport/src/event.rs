@@ -1,7 +1,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::Multiaddr;
+use minip2p_core::{Multiaddr, PeerId};
 
 use crate::{ConnectionEndpoint, ConnectionId};
 
@@ -25,6 +25,11 @@ pub enum TransportEvent {
     IncomingConnection {
         id: ConnectionId,
         endpoint: ConnectionEndpoint,
+    },
+    PeerIdentityVerified {
+        id: ConnectionId,
+        endpoint: ConnectionEndpoint,
+        previous_peer_id: Option<PeerId>,
     },
     Listening {
         addr: Multiaddr,

@@ -3,7 +3,8 @@ use std::net::{IpAddr, SocketAddr, UdpSocket};
 
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
 use minip2p_transport::{
-    ConnectionEndpoint, ConnectionId, ConnectionState, Transport, TransportError, TransportEvent,
+    ConnectionEndpoint, ConnectionId, ConnectionState, PeerSendPolicy, Transport, TransportError,
+    TransportEvent,
 };
 use quiche::ConnectionId as QuicConnectionId;
 
@@ -167,9 +168,58 @@ impl QuicTransport {
     }
 
     pub fn primary_connection_for_peer(&self, peer_id: &PeerId) -> Option<ConnectionId> {
-        self.peer_connections
-            .get(peer_id)
-            .and_then(|ids| ids.iter().next().copied())
+        self.select_connection_for_peer(peer_id, PeerSendPolicy::Primary)
+    }
+
+    pub fn verify_connection_peer_id(
+        &mut self,
+        id: ConnectionId,
+        peer_id: PeerId,
+    ) -> Result<(), TransportError> {
+        let (previous_peer_id, endpoint) = {
+            let conn = self
+                .connections
+                .get_mut(&id)
+                .ok_or(TransportError::ConnectionNotFound { id })?;
+
+            let previous_peer_id = conn.endpoint().peer_id().cloned();
+            if previous_peer_id.as_ref() == Some(&peer_id) {
+                return Ok(());
+            }
+
+            conn.set_peer_id(peer_id.clone());
+            (previous_peer_id, conn.endpoint().clone())
+        };
+
+        if let Some(previous) = previous_peer_id.as_ref() {
+            self.remove_peer_connection(previous, id);
+        }
+
+        self.index_peer_connection(peer_id, id);
+        self.pending_events
+            .push(TransportEvent::PeerIdentityVerified {
+                id,
+                endpoint,
+                previous_peer_id,
+            });
+
+        Ok(())
+    }
+
+    pub fn send_to_peer(
+        &mut self,
+        peer_id: &PeerId,
+        data: Vec<u8>,
+        policy: PeerSendPolicy,
+    ) -> Result<ConnectionId, TransportError> {
+        let connection_id = self
+            .select_connection_for_peer(peer_id, policy)
+            .ok_or_else(|| TransportError::PeerNotConnected {
+                peer_id: peer_id.clone(),
+            })?;
+
+        self.send(connection_id, data)?;
+        Ok(connection_id)
     }
 
     fn allocate_connection_id(&mut self) -> Result<ConnectionId, TransportError> {
@@ -206,18 +256,47 @@ impl QuicTransport {
         self.peer_connections.entry(peer_id).or_default().insert(id);
     }
 
+    fn remove_peer_connection(&mut self, peer_id: &PeerId, id: ConnectionId) {
+        let mut remove_entry = false;
+
+        if let Some(ids) = self.peer_connections.get_mut(peer_id) {
+            ids.remove(&id);
+            remove_entry = ids.is_empty();
+        }
+
+        if remove_entry {
+            self.peer_connections.remove(peer_id);
+        }
+    }
+
+    fn select_connection_for_peer(
+        &self,
+        peer_id: &PeerId,
+        policy: PeerSendPolicy,
+    ) -> Option<ConnectionId> {
+        let ids = self.peer_connections.get(peer_id)?;
+
+        let is_connected = |id: &ConnectionId| {
+            self.connections
+                .get(id)
+                .is_some_and(QuicConnection::is_connected)
+        };
+
+        match policy {
+            PeerSendPolicy::Primary | PeerSendPolicy::OldestConnected => {
+                ids.iter().find(|id| is_connected(id)).copied()
+            }
+            PeerSendPolicy::NewestConnected => {
+                ids.iter().rev().find(|id| is_connected(id)).copied()
+            }
+        }
+    }
+
     fn unindex_connection(&mut self, id: ConnectionId, peer_id: Option<PeerId>) {
         self.cid_to_connection.retain(|_, mapped| *mapped != id);
 
         if let Some(peer_id) = peer_id {
-            let mut remove_entry = false;
-            if let Some(ids) = self.peer_connections.get_mut(&peer_id) {
-                ids.remove(&id);
-                remove_entry = ids.is_empty();
-            }
-            if remove_entry {
-                self.peer_connections.remove(&peer_id);
-            }
+            self.remove_peer_connection(&peer_id, id);
         }
     }
 }
@@ -269,7 +348,12 @@ impl Transport for QuicTransport {
                 })?;
         }
 
-        let conn = QuicConnection::new(id, quiche_conn, peer_socket, ConnectionEndpoint::from_peer_addr(addr));
+        let conn = QuicConnection::new(
+            id,
+            quiche_conn,
+            peer_socket,
+            ConnectionEndpoint::from_peer_addr(addr),
+        );
         let source_cid = conn.source_cid_bytes();
 
         if self.connections.insert(id, conn).is_some() {

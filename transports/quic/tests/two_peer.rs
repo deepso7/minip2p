@@ -5,7 +5,7 @@ use std::str::FromStr;
 use minip2p_core::{Multiaddr, PeerAddr, Protocol};
 use minip2p_identity::PeerId;
 use minip2p_quic::{QuicConfig, QuicTransport};
-use minip2p_transport::{ConnectionId, Transport, TransportError, TransportEvent};
+use minip2p_transport::{ConnectionId, PeerSendPolicy, Transport, TransportError, TransportEvent};
 use tempfile::TempDir;
 
 fn generate_cert_pair() -> (TempDir, String, String) {
@@ -240,8 +240,23 @@ fn same_peer_supports_multiple_connections() {
         Some(conn_a)
     );
 
-    client.send(conn_a, b"msg-a".to_vec()).expect("send conn_a");
-    client.send(conn_b, b"msg-b".to_vec()).expect("send conn_b");
+    let used_primary = client
+        .send_to_peer(
+            peer_addr.peer_id(),
+            b"msg-a".to_vec(),
+            PeerSendPolicy::Primary,
+        )
+        .expect("send primary");
+    let used_newest = client
+        .send_to_peer(
+            peer_addr.peer_id(),
+            b"msg-b".to_vec(),
+            PeerSendPolicy::NewestConnected,
+        )
+        .expect("send newest");
+
+    assert_eq!(used_primary, conn_a);
+    assert_eq!(used_newest, conn_b);
 
     let mut got_a = false;
     let mut got_b = false;
@@ -292,4 +307,76 @@ fn listen_without_tls_returns_config_error_and_no_listening_event() {
             .any(|event| matches!(event, TransportEvent::Listening { .. })),
         "listening event must not be emitted on failed listen"
     );
+}
+
+#[test]
+fn identity_upgrade_emits_verified_event_and_updates_peer_index() {
+    let (mut server, mut client, peer_addr, _cert_dir) = setup_pair();
+
+    let client_conn_id = ConnectionId::new(42);
+    client
+        .dial(client_conn_id, &peer_addr)
+        .expect("client dial");
+
+    let mut server_conn_id = None;
+    let mut client_connected = false;
+
+    for _ in 0..200 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        for event in server.poll().expect("server poll") {
+            match event {
+                TransportEvent::IncomingConnection { id, endpoint } => {
+                    assert!(endpoint.peer_id().is_none());
+                    server_conn_id = Some(id);
+                }
+                TransportEvent::Connected { id, .. } => {
+                    server_conn_id = Some(id);
+                }
+                _ => {}
+            }
+        }
+
+        for event in client.poll().expect("client poll") {
+            if let TransportEvent::Connected { .. } = event {
+                client_connected = true;
+            }
+        }
+
+        if server_conn_id.is_some() && client_connected {
+            break;
+        }
+    }
+
+    let server_conn_id = server_conn_id.expect("server connection id");
+    assert!(client_connected, "client should be connected");
+
+    let verified_peer_id = test_peer_id();
+    server
+        .verify_connection_peer_id(server_conn_id, verified_peer_id.clone())
+        .expect("verify peer id");
+
+    let events = server.poll().expect("server poll");
+    let verified_event = events
+        .iter()
+        .find_map(|event| {
+            if let TransportEvent::PeerIdentityVerified {
+                id,
+                endpoint,
+                previous_peer_id,
+            } = event
+            {
+                Some((*id, endpoint.clone(), previous_peer_id.clone()))
+            } else {
+                None
+            }
+        })
+        .expect("peer identity verified event");
+
+    assert_eq!(verified_event.0, server_conn_id);
+    assert_eq!(verified_event.1.peer_id(), Some(&verified_peer_id));
+    assert!(verified_event.2.is_none());
+
+    let indexed = server.connection_ids_for_peer(&verified_peer_id);
+    assert_eq!(indexed, vec![server_conn_id]);
 }

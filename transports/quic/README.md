@@ -11,8 +11,10 @@ No async runtime required. The host calls `poll()` in their own loop.
 - Self-signed TLS certificate support via PEM files on disk.
 - Server-side incoming connection detection.
 - Peer-aware endpoint events (`peer_id` is optional for inbound connections).
+- Explicit identity-upgrade hook via `verify_connection_peer_id(...)`.
 - Bidirectional stream send/recv.
 - Multiple concurrent connections per peer.
+- Peer-level send API with connection selection policy.
 - `verify_peer(false)` for local development and testing.
 
 ## Usage
@@ -107,7 +109,7 @@ fn drive(transport: &mut impl Transport) {
 ```rust
 use minip2p_identity::PeerId;
 use minip2p_quic::QuicTransport;
-use minip2p_transport::Transport;
+use minip2p_transport::{PeerSendPolicy, Transport};
 
 fn connect_and_pick_primary(
     transport: &mut QuicTransport,
@@ -121,6 +123,38 @@ fn connect_and_pick_primary(
 
     if let Some(primary) = transport.primary_connection_for_peer(peer_id) {
         println!("primary connection: {primary}");
+    }
+
+    let used = transport
+        .send_to_peer(peer_id, b"hello".to_vec(), PeerSendPolicy::Primary)
+        .expect("send");
+    println!("sent using connection: {used}");
+}
+```
+
+### Identity upgrade event
+
+Inbound connections can start with `peer_id: None`. Once your auth layer verifies identity, bind it to the connection:
+
+```rust
+use minip2p_identity::PeerId;
+use minip2p_transport::TransportEvent;
+use std::str::FromStr;
+
+fn verify_identity(transport: &mut minip2p_quic::QuicTransport, id: minip2p_transport::ConnectionId) {
+    let verified = PeerId::from_str(
+        "QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N"
+    )
+    .expect("peer id");
+
+    transport
+        .verify_connection_peer_id(id, verified)
+        .expect("verify peer id");
+
+    for event in transport.poll().expect("poll") {
+        if let TransportEvent::PeerIdentityVerified { id, endpoint, .. } = event {
+            println!("verified {id} as {:?}", endpoint.peer_id());
+        }
     }
 }
 ```

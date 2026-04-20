@@ -1,5 +1,6 @@
 use std::net::{SocketAddr, UdpSocket};
 
+use minip2p_core::PeerId;
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, ConnectionState, TransportError, TransportEvent,
 };
@@ -40,6 +41,14 @@ impl QuicConnection {
 
     pub fn state(&self) -> ConnectionState {
         self.state
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.state == ConnectionState::Connected
+    }
+
+    pub fn set_peer_id(&mut self, peer_id: PeerId) {
+        self.endpoint.set_peer_id(peer_id);
     }
 
     pub fn is_closed(&self) -> bool {
