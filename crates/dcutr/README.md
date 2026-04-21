@@ -14,8 +14,10 @@ This crate implements the message state machines only. It does **not**:
 
 ## State machines
 
-- **`DcutrInitiator`** -- the peer that initiates the upgrade after being connected via relay. Sends `CONNECT`, waits for the remote `CONNECT`, computes its own RTT, then issues `SYNC` and emits `InitiatorOutcome::DialNow { remote_addrs, rtt_ms }`.
-- **`DcutrResponder`** -- the remote peer. Receives the initiator's `CONNECT`, emits `ResponderEvent::ConnectReceived { remote_addrs }`, replies with its own `CONNECT`, then emits `ResponderEvent::SyncReceived` when the initiator's `SYNC` arrives. The caller kicks off the hole-punch bombardment on `SyncReceived`.
+- **`DcutrInitiator`** -- the peer that initiates the upgrade after being connected via relay. Sends `CONNECT`, waits for the remote `CONNECT`, records its own RTT, then issues `SYNC` and emits `InitiatorOutcome::DialNow { remote_addrs, remote_addr_bytes, rtt_ms }`.
+- **`DcutrResponder`** -- the remote peer. Receives the initiator's `CONNECT`, emits `ResponderEvent::ConnectReceived { remote_addrs, remote_addr_bytes }`, replies with its own `CONNECT`, then emits `ResponderEvent::SyncReceived` when the initiator's `SYNC` arrives. The caller kicks off the hole-punch bombardment on `SyncReceived`.
+
+Both machines accept `&[Multiaddr]` at construction time and automatically serialize them to the wire using multicodec-binary encoding (via `Multiaddr::to_bytes()` in `minip2p-core`). Incoming `obs_addrs` are decoded the same way; entries that fail to parse are dropped silently but remain available as raw bytes in `remote_addr_bytes` for diagnostics.
 
 Each machine accepts raw bytes via `on_data(&[u8])` and exposes pending outbound bytes via `take_outbound()`. The wire format is length-prefixed protobuf `HolePunch` messages; the frame helpers (`encode_frame`, `decode_frame`, `FrameDecode`) are re-exported from the crate root.
 
@@ -27,16 +29,16 @@ Each machine accepts raw bytes via `on_data(&[u8])` and exposes pending outbound
 ## Usage sketch
 
 ```rust
+use minip2p_core::Multiaddr;
 use minip2p_dcutr::{DcutrInitiator, InitiatorOutcome};
 
-let mut initiator = DcutrInitiator::new(our_observed_addrs);
-let out = initiator.start(now_ms); // send these bytes on the negotiated stream
+let mut initiator = DcutrInitiator::new(&our_observed_addrs); // &[Multiaddr]
+let out = initiator.take_outbound(); // send these bytes on the negotiated stream
 
-// Feed incoming bytes:
-// initiator.on_data(&data, now_ms);
-// for event in initiator.poll_events() { ... }
-// if let Some(InitiatorOutcome::DialNow { remote_addrs, rtt_ms }) = initiator.outcome() {
-//     // dial each remote_addr directly, wait rtt_ms for a connection,
+// Feed incoming bytes + measured RTT:
+// initiator.on_data(&data, rtt_ms)?;
+// if let Some(InitiatorOutcome::DialNow { remote_addrs, rtt_ms, .. }) = initiator.outcome() {
+//     // dial each remote Multiaddr directly, wait rtt_ms for a connection,
 //     // fall back to relayed ping if none succeeds.
 // }
 ```

@@ -27,14 +27,18 @@ let config = IdentifyConfig {
     protocol_version: "minip2p/0.1.0".into(),
     agent_version: "my-app/0.1.0".into(),
     protocols: vec!["/ipfs/ping/1.0.0".into()],
-    listen_addrs: vec![/* multiaddr bytes */],
     public_key: vec![/* protobuf PublicKey */],
 };
 let mut identify = IdentifyProtocol::new(config);
 
 // After multistream-select negotiates /ipfs/id/1.0.0:
 //   - inbound stream (we respond):
-//     let actions = identify.register_outbound_stream(peer_id, stream_id, Some(remote_addr))?;
+//     let actions = identify.register_outbound_stream(
+//         peer_id,
+//         stream_id,
+//         Some(remote_addr),   // observed_addr
+//         &listen_addrs,       // from the transport
+//     )?;
 //   - outbound stream (we receive the remote's info):
 //     identify.register_inbound_stream(peer_id, stream_id);
 
@@ -49,11 +53,13 @@ let mut identify = IdentifyProtocol::new(config);
 
 `observed_addr` should be the transport address we observed the remote dialing us from. Pass `None` when the information is not available.
 
+`listen_addrs` is the set of multiaddrs we're currently listening on. Typically the swarm driver snapshots this from the transport's `local_addresses()` on each `poll()` tick and passes it through — so the advertised set always reflects what we're actually bound to, with no caller ceremony required.
+
 ## Protocol
 
 - Protocol ID: `/ipfs/id/1.0.0`
-- Wire format: a single protobuf-encoded `Identify` message, then the responder half-closes its write side.
-- Fields: `publicKey`, `listenAddrs` (repeated), `protocols` (repeated), `observedAddr`, `protocolVersion`, `agentVersion`.
+- Wire format: a varint length prefix followed by a protobuf-encoded `Identify` message, then the responder half-closes its write side.
+- Fields: `publicKey`, `listenAddrs` (repeated, multicodec-binary), `protocols` (repeated), `observedAddr` (multicodec-binary), `protocolVersion`, `agentVersion`.
 
 ## no_std
 

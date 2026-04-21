@@ -131,19 +131,20 @@ and easy to grep/awk from tests.
 
 ## Architecture
 
-This binary is deliberately procedural: one long event loop per role,
-with a single `Phase` enum per role that makes the state machine
-visible at a glance.
+This binary is deliberately procedural: each role is a linear script
+built on `Swarm::run_until(deadline, predicate)`, so the sequence of
+steps is visible top-to-bottom.
 
 - `src/main.rs` — dispatch on parsed mode.
 - `src/cli.rs` — hand-rolled argv parser; shared `print_event` helper.
 - `src/direct.rs` — direct-mode listen/dial; zero relay machinery.
-- `src/relay.rs` — relay-mode state machines for both Peer B (listener)
-  and Peer A (dialer), including the DCUtR bridge and hole-punch timer.
+- `src/relay.rs` — relay-mode scripts for both Peer B (listener) and
+  Peer A (dialer), driving the HOP/STOP/DCUtR state machines inline
+  and running the hole-punch + relay-ping fallback at the bottom.
 
-See `holepunch-plan.md` at the repo root for the design rationale,
-state-transition diagrams, and open questions (RTT approximation on the
-responder side, relay-ping protocol id, etc).
+See `holepunch-plan.md` at the repo root for the design rationale and
+open questions (RTT approximation on the responder side, relay-ping
+protocol id, etc).
 
 ## Known limitations
 
@@ -152,11 +153,6 @@ responder side, relay-ping protocol id, etc).
   flow directly over the STOP stream with length-prefixed framing.
   Two minip2p peers work; a rust-libp2p peer on the other end of the
   bridge will not.
-
-- **Observed addresses are transmitted as multiaddr display strings,
-  not binary multicodec.** `minip2p-core` does not yet implement the
-  binary encoding; interop with third-party peers that require the
-  binary form is out of scope for this demo.
 
 - **Loopback only.** Both modes bind `127.0.0.1:0` and make no
   attempt to discover public addresses. A STUN client (or real

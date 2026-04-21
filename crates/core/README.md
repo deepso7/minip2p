@@ -35,6 +35,25 @@ assert!(addr.is_quic_transport());
 assert_eq!(addr.to_string(), "/dns4/example.com/udp/4001/quic-v1");
 ```
 
+Binary multicodec encoding (on-wire form used by Identify, DCUtR, etc.):
+
+```rust
+use core::str::FromStr;
+use minip2p_core::Multiaddr;
+
+let addr = Multiaddr::from_str("/ip4/127.0.0.1/udp/4001/quic-v1").unwrap();
+let bytes = addr.to_bytes();
+// [0x04, 0x7F, 0x00, 0x00, 0x01, 0x91, 0x02, 0x0F, 0xA1, 0xCC, 0x03]
+let decoded = Multiaddr::from_bytes(&bytes).unwrap();
+assert_eq!(decoded, addr);
+```
+
+Wire layout: each component is `<varint(multicodec)><value>`. Value
+shape depends on the protocol: fixed-size bytes for ip4/ip6/udp,
+varint-length-prefixed UTF-8 for dns*, varint-length-prefixed
+multihash for p2p, absent for quic-v1. See
+<https://github.com/multiformats/multiaddr> for the full spec.
+
 Work with peer-qualified addresses:
 
 ```rust
