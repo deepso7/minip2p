@@ -9,8 +9,9 @@
 //! - [`IdentifyProtocol`] -- `/ipfs/id/1.0.0`
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::Instant;
 
-use minip2p_core::{PeerAddr, PeerId};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId};
 use minip2p_identify::{
     IdentifyAction, IdentifyConfig, IdentifyEvent, IdentifyMessage, IdentifyProtocol,
     IDENTIFY_PROTOCOL_ID,
@@ -21,18 +22,24 @@ use minip2p_ping::{
 };
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, TransportEvent};
 
+mod builder;
+pub use builder::SwarmBuilder;
+
 // ---------------------------------------------------------------------------
 // Protocol identification
 // ---------------------------------------------------------------------------
 
 /// Identifies which protocol owns a negotiated stream.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 enum ProtocolId {
     Ping,
     /// Identify responder: we send our info.
     IdentifyResponder,
     /// Identify initiator: we receive their info.
     IdentifyInitiator,
+    /// A user-registered protocol, with its string ID retained so events can
+    /// surface it back to the application.
+    User(String),
 }
 
 /// Tracks a pending outbound stream that is still negotiating multistream-select.
@@ -64,6 +71,33 @@ pub enum SwarmEvent {
     },
     /// A ping timed out.
     PingTimeout { peer_id: PeerId },
+    /// A user-registered protocol was successfully negotiated on a stream,
+    /// either because we opened it via [`Swarm::open_user_stream`] or because
+    /// a remote opened a stream for a protocol we accepted via
+    /// [`Swarm::add_user_protocol`].
+    UserStreamReady {
+        peer_id: PeerId,
+        stream_id: StreamId,
+        protocol_id: String,
+        /// True if we opened this stream; false if the remote opened it.
+        initiated_locally: bool,
+    },
+    /// Raw data arrived on a negotiated user stream.
+    UserStreamData {
+        peer_id: PeerId,
+        stream_id: StreamId,
+        data: Vec<u8>,
+    },
+    /// The remote closed its write side on a user stream.
+    UserStreamRemoteWriteClosed {
+        peer_id: PeerId,
+        stream_id: StreamId,
+    },
+    /// A user stream was fully closed.
+    UserStreamClosed {
+        peer_id: PeerId,
+        stream_id: StreamId,
+    },
     /// A non-fatal error occurred.
     Error { message: String },
 }
@@ -107,7 +141,24 @@ pub struct Swarm<T: Transport> {
 
     // --- Configuration ---
     /// Protocol IDs we advertise for inbound negotiation.
+    ///
+    /// Always contains the built-in protocols (`/ipfs/id/1.0.0`,
+    /// `/ipfs/ping/1.0.0`) plus any user protocols registered via
+    /// [`Swarm::add_user_protocol`].
     supported_protocols: Vec<String>,
+    /// Application-registered protocol IDs (subset of `supported_protocols`).
+    user_protocols: Vec<String>,
+
+    // --- Bookkeeping ---
+    /// Auto-incrementing connection id counter. Used by [`Swarm::dial`] so
+    /// callers don't have to invent connection ids themselves.
+    next_connection_id: u64,
+    /// Peers with a pending `.ping(peer)` call: once the ping stream
+    /// negotiates, a 32-byte payload is sent automatically.
+    pending_pings: HashMap<PeerId, [u8; PING_PAYLOAD_LEN]>,
+    /// Start of the logical clock. Swarm tracks wall time itself so callers
+    /// don't have to thread `now_ms` through every method.
+    start: Instant,
 
     // --- Output ---
     /// Buffered events for the application.
@@ -137,7 +188,49 @@ impl<T: Transport> Swarm<T> {
             outbound_negotiators: HashMap::new(),
             stream_owner: HashMap::new(),
             supported_protocols,
+            user_protocols: Vec::new(),
+            next_connection_id: 1,
+            pending_pings: HashMap::new(),
+            start: Instant::now(),
             events: Vec::new(),
+        }
+    }
+
+    /// Returns the number of milliseconds elapsed since this swarm was
+    /// constructed.
+    ///
+    /// Swarm uses this internal clock for ping timeouts, RTT measurement,
+    /// and any other time-dependent protocol logic so callers don't have to
+    /// thread a timestamp through every method.
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+
+    /// Allocates the next unused connection id, skipping 0.
+    fn allocate_connection_id(&mut self) -> ConnectionId {
+        loop {
+            let raw = self.next_connection_id;
+            self.next_connection_id = self.next_connection_id.wrapping_add(1);
+            if raw != 0 {
+                return ConnectionId::new(raw);
+            }
+        }
+    }
+
+    /// Registers a user protocol id that this swarm will accept on inbound streams.
+    ///
+    /// When a remote peer negotiates this protocol on a stream we observe,
+    /// a [`SwarmEvent::UserStreamReady`] is emitted and subsequent stream
+    /// data is surfaced via [`SwarmEvent::UserStreamData`]. The application
+    /// is responsible for all protocol state; the swarm only handles
+    /// multistream-select negotiation and stream lifecycle.
+    pub fn add_user_protocol(&mut self, protocol_id: impl Into<String>) {
+        let id = protocol_id.into();
+        if !self.user_protocols.iter().any(|p| p == &id) {
+            self.user_protocols.push(id.clone());
+        }
+        if !self.supported_protocols.iter().any(|p| p == &id) {
+            self.supported_protocols.push(id);
         }
     }
 
@@ -153,43 +246,66 @@ impl<T: Transport> Swarm<T> {
 
     // --- Public API ---
 
-    /// Start listening on the given address.
-    pub fn listen(&mut self, addr: &minip2p_core::Multiaddr) -> Result<(), TransportError> {
+    /// Start listening on the given multiaddr.
+    pub fn listen(&mut self, addr: &Multiaddr) -> Result<(), TransportError> {
         self.transport.listen(addr)
     }
 
     /// Dial a remote peer.
-    pub fn dial(
-        &mut self,
-        id: ConnectionId,
-        addr: &PeerAddr,
-    ) -> Result<(), TransportError> {
-        self.transport.dial(id, addr)
-    }
-
-    /// Open a ping stream to a connected peer.
     ///
-    /// The swarm handles multistream-select negotiation. Once negotiated, the
-    /// stream is registered with the ping protocol.
-    pub fn open_ping(&mut self, peer_id: &PeerId) -> Result<StreamId, TransportError> {
-        self.open_protocol_stream(peer_id, PING_PROTOCOL_ID, ProtocolId::Ping)
+    /// Swarm allocates a connection id internally and returns it, so callers
+    /// don't have to invent ids themselves. The returned id can be used with
+    /// [`Swarm::disconnect_by_id`] but is otherwise optional to retain --
+    /// all higher-level APIs take [`PeerId`].
+    pub fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+        let id = self.allocate_connection_id();
+        self.transport.dial(id, addr)?;
+        Ok(id)
     }
 
-    /// Send a ping to a connected peer (must have an open ping stream).
-    pub fn send_ping(
-        &mut self,
-        peer_id: &PeerId,
-        payload: &[u8; PING_PAYLOAD_LEN],
-        now_ms: u64,
-    ) -> Result<(), TransportError> {
-        let action = self
-            .ping
-            .send_ping(peer_id, payload, now_ms)
-            .map_err(|e| TransportError::PollError {
-                reason: format!("ping error: {e}"),
+    /// Pings a peer, sending a random 32-byte payload and measuring RTT.
+    ///
+    /// If no ping stream exists yet, one is opened and the ping is queued
+    /// to fire as soon as multistream-select completes. The resulting RTT
+    /// is delivered via [`SwarmEvent::PingRttMeasured`].
+    ///
+    /// Returns an error if the peer is not currently connected.
+    pub fn ping(&mut self, peer_id: &PeerId) -> Result<(), TransportError> {
+        let payload: [u8; PING_PAYLOAD_LEN] = rand_ping_payload();
+
+        // If a ping stream is already negotiated, send right away.
+        if let Some(stream_id) = self.find_negotiated_ping_stream(peer_id) {
+            let now = self.now_ms();
+            let action = self.ping.send_ping(peer_id, &payload, now).map_err(|e| {
+                TransportError::PollError {
+                    reason: format!("ping error: {e}"),
+                }
             })?;
-        self.execute_ping_action(action);
+            self.execute_ping_action(action);
+            let _ = stream_id;
+            return Ok(());
+        }
+
+        // Otherwise open a ping stream and remember to send the payload once
+        // the stream is ready.
+        self.pending_pings.insert(peer_id.clone(), payload);
+        let _ = self.open_protocol_stream(peer_id, PING_PROTOCOL_ID, ProtocolId::Ping)?;
         Ok(())
+    }
+
+    /// Finds a ping stream that has already completed multistream-select for
+    /// the given peer, if any.
+    fn find_negotiated_ping_stream(&self, peer_id: &PeerId) -> Option<StreamId> {
+        let conn = *self.peer_to_conn.get(peer_id)?;
+        self.stream_owner
+            .iter()
+            .find_map(|((c, s), owner)| {
+                if *c == conn && matches!(owner, ProtocolId::Ping) {
+                    Some(*s)
+                } else {
+                    None
+                }
+            })
     }
 
     /// Close the connection to a peer.
@@ -204,10 +320,82 @@ impl<T: Transport> Swarm<T> {
         self.transport.close(conn_id)
     }
 
+    /// Opens a new outbound stream and negotiates `protocol_id` via
+    /// multistream-select.
+    ///
+    /// The protocol must have been registered with
+    /// [`Swarm::add_user_protocol`] first. When negotiation completes, a
+    /// [`SwarmEvent::UserStreamReady`] is emitted; subsequent stream data
+    /// arrives as [`SwarmEvent::UserStreamData`].
+    pub fn open_user_stream(
+        &mut self,
+        peer_id: &PeerId,
+        protocol_id: &str,
+    ) -> Result<StreamId, TransportError> {
+        if !self.user_protocols.iter().any(|p| p == protocol_id) {
+            return Err(TransportError::InvalidConfig {
+                reason: format!(
+                    "protocol '{protocol_id}' is not registered; call add_user_protocol first"
+                ),
+            });
+        }
+
+        self.open_protocol_stream(
+            peer_id,
+            protocol_id,
+            ProtocolId::User(protocol_id.to_string()),
+        )
+    }
+
+    /// Sends raw bytes on a previously-negotiated user stream.
+    pub fn send_user_stream(
+        &mut self,
+        peer_id: &PeerId,
+        stream_id: StreamId,
+        data: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        let conn_id = self.require_conn(peer_id)?;
+        self.transport.send_stream(conn_id, stream_id, data)
+    }
+
+    /// Half-closes the write side of a user stream.
+    pub fn close_user_stream_write(
+        &mut self,
+        peer_id: &PeerId,
+        stream_id: StreamId,
+    ) -> Result<(), TransportError> {
+        let conn_id = self.require_conn(peer_id)?;
+        self.transport.close_stream_write(conn_id, stream_id)
+    }
+
+    /// Resets (abruptly closes) a user stream.
+    pub fn reset_user_stream(
+        &mut self,
+        peer_id: &PeerId,
+        stream_id: StreamId,
+    ) -> Result<(), TransportError> {
+        let conn_id = self.require_conn(peer_id)?;
+        self.transport.reset_stream(conn_id, stream_id)
+    }
+
+    /// Looks up the connection id for a peer, or returns an error.
+    fn require_conn(&self, peer_id: &PeerId) -> Result<ConnectionId, TransportError> {
+        self.peer_to_conn
+            .get(peer_id)
+            .copied()
+            .ok_or_else(|| TransportError::PollError {
+                reason: format!("no connection for peer {peer_id}"),
+            })
+    }
+
     /// Drive the swarm: poll transport, dispatch events, run protocols.
     ///
-    /// Returns application-visible events. Must be called repeatedly.
-    pub fn poll(&mut self, now_ms: u64) -> Result<Vec<SwarmEvent>, TransportError> {
+    /// Returns application-visible events. Must be called repeatedly in an
+    /// event loop. Swarm tracks wall time internally, so no timestamp
+    /// argument is needed.
+    pub fn poll(&mut self) -> Result<Vec<SwarmEvent>, TransportError> {
+        let now_ms = self.now_ms();
+
         // 1. Poll the transport for raw events.
         let transport_events = self.transport.poll()?;
 
@@ -378,7 +566,7 @@ impl<T: Transport> Swarm<T> {
         now_ms: u64,
     ) {
         let key = (conn_id, stream_id);
-        let Some(&protocol) = self.stream_owner.get(&key) else {
+        let Some(protocol) = self.stream_owner.get(&key).cloned() else {
             return;
         };
         let peer_id = self.ensure_peer_id_for_conn(conn_id);
@@ -401,31 +589,45 @@ impl<T: Transport> Swarm<T> {
             ProtocolId::IdentifyResponder => {
                 // Responder doesn't expect data; ignore.
             }
+            ProtocolId::User(_) => {
+                self.events.push(SwarmEvent::UserStreamData {
+                    peer_id,
+                    stream_id,
+                    data,
+                });
+            }
         }
     }
 
     fn handle_stream_remote_write_closed(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
         let key = (conn_id, stream_id);
 
-        if let Some(&protocol) = self.stream_owner.get(&key) {
-            let peer_id = self.ensure_peer_id_for_conn(conn_id);
+        let Some(protocol) = self.stream_owner.get(&key).cloned() else {
+            return;
+        };
+        let peer_id = self.ensure_peer_id_for_conn(conn_id);
 
-            match protocol {
-                ProtocolId::Ping => {
-                    let actions = self
-                        .ping
-                        .on_stream_remote_write_closed(&peer_id, stream_id);
-                    for action in actions {
-                        self.execute_ping_action(action);
-                    }
+        match protocol {
+            ProtocolId::Ping => {
+                let actions = self
+                    .ping
+                    .on_stream_remote_write_closed(&peer_id, stream_id);
+                for action in actions {
+                    self.execute_ping_action(action);
                 }
-                ProtocolId::IdentifyInitiator => {
-                    let actions = self
-                        .identify
-                        .on_stream_remote_write_closed(peer_id, stream_id);
-                    self.execute_identify_actions(actions);
-                }
-                ProtocolId::IdentifyResponder => {}
+            }
+            ProtocolId::IdentifyInitiator => {
+                let actions = self
+                    .identify
+                    .on_stream_remote_write_closed(peer_id, stream_id);
+                self.execute_identify_actions(actions);
+            }
+            ProtocolId::IdentifyResponder => {}
+            ProtocolId::User(_) => {
+                self.events.push(SwarmEvent::UserStreamRemoteWriteClosed {
+                    peer_id,
+                    stream_id,
+                });
             }
         }
     }
@@ -434,14 +636,19 @@ impl<T: Transport> Swarm<T> {
         let key = (conn_id, stream_id);
 
         if let Some(protocol) = self.stream_owner.remove(&key) {
-            if let Some(peer_id) = self.conn_to_peer.get(&conn_id) {
+            if let Some(peer_id) = self.conn_to_peer.get(&conn_id).cloned() {
                 match protocol {
                     ProtocolId::Ping => {
-                        self.ping.on_stream_closed(peer_id, stream_id);
+                        self.ping.on_stream_closed(&peer_id, stream_id);
                     }
                     ProtocolId::IdentifyInitiator | ProtocolId::IdentifyResponder => {
-                        self.identify
-                            .on_stream_closed(peer_id.clone(), stream_id);
+                        self.identify.on_stream_closed(peer_id, stream_id);
+                    }
+                    ProtocolId::User(_) => {
+                        self.events.push(SwarmEvent::UserStreamClosed {
+                            peer_id,
+                            stream_id,
+                        });
                     }
                 }
             }
@@ -458,6 +665,7 @@ impl<T: Transport> Swarm<T> {
             self.peer_to_conn.remove(&peer_id);
             self.ping.remove_peer(&peer_id);
             self.identify.remove_peer(&peer_id);
+            self.pending_pings.remove(&peer_id);
             self.events
                 .push(SwarmEvent::ConnectionClosed { peer_id });
         }
@@ -544,7 +752,7 @@ impl<T: Transport> Swarm<T> {
         };
 
         let outputs = pending.negotiator.receive(data);
-        let target = pending.target_protocol;
+        let target = pending.target_protocol.clone();
         let mut negotiated = false;
 
         for output in outputs {
@@ -602,46 +810,57 @@ impl<T: Transport> Swarm<T> {
     ) {
         let peer_id = self.ensure_peer_id_for_conn(conn_id);
 
-        match protocol {
-            p if p == PING_PROTOCOL_ID => {
-                self.stream_owner
-                    .insert((conn_id, stream_id), ProtocolId::Ping);
-                let actions = self
-                    .ping
-                    .register_inbound_stream(peer_id, stream_id);
-                for action in actions {
-                    self.execute_ping_action(action);
-                }
+        if protocol == PING_PROTOCOL_ID {
+            self.stream_owner
+                .insert((conn_id, stream_id), ProtocolId::Ping);
+            let actions = self.ping.register_inbound_stream(peer_id, stream_id);
+            for action in actions {
+                self.execute_ping_action(action);
             }
-            p if p == IDENTIFY_PROTOCOL_ID => {
-                // Inbound identify: the remote wants our info. We are the responder.
-                self.stream_owner
-                    .insert((conn_id, stream_id), ProtocolId::IdentifyResponder);
-
-                // Build observed_addr from the connection's endpoint.
-                // For now, use an empty observed address; the Swarm doesn't
-                // have the remote's source address readily available in this
-                // context. A proper implementation would pass it through.
-                let observed_addr = Vec::new();
-
-                match self
-                    .identify
-                    .register_outbound_stream(peer_id, stream_id, observed_addr)
-                {
-                    Ok(actions) => {
-                        self.execute_identify_actions(actions);
-                    }
-                    Err(e) => {
-                        self.events.push(SwarmEvent::Error {
-                            message: format!("identify responder error: {e}"),
-                        });
-                    }
-                }
-            }
-            _ => {
-                // Unknown protocol — should not happen since we only advertise known ones.
-            }
+            return;
         }
+
+        if protocol == IDENTIFY_PROTOCOL_ID {
+            // Inbound identify: the remote wants our info. We are the responder.
+            self.stream_owner
+                .insert((conn_id, stream_id), ProtocolId::IdentifyResponder);
+
+            // Build observed_addr from the connection's endpoint.
+            // TODO: surface the remote's source address through the swarm
+            // so the observed-addr field can be filled in.
+            let observed_addr = Vec::new();
+
+            match self
+                .identify
+                .register_outbound_stream(peer_id, stream_id, observed_addr)
+            {
+                Ok(actions) => {
+                    self.execute_identify_actions(actions);
+                }
+                Err(e) => {
+                    self.events.push(SwarmEvent::Error {
+                        message: format!("identify responder error: {e}"),
+                    });
+                }
+            }
+            return;
+        }
+
+        if self.user_protocols.iter().any(|p| p == protocol) {
+            self.stream_owner.insert(
+                (conn_id, stream_id),
+                ProtocolId::User(protocol.to_string()),
+            );
+            self.events.push(SwarmEvent::UserStreamReady {
+                peer_id,
+                stream_id,
+                protocol_id: protocol.to_string(),
+                initiated_locally: false,
+            });
+            return;
+        }
+
+        // Unknown protocol — should not happen since we only advertise known ones.
     }
 
     /// Called when an outbound stream finishes multistream-select negotiation.
@@ -653,17 +872,30 @@ impl<T: Transport> Swarm<T> {
     ) {
         let peer_id = self.ensure_peer_id_for_conn(conn_id);
 
-        self.stream_owner.insert((conn_id, stream_id), target);
+        self.stream_owner
+            .insert((conn_id, stream_id), target.clone());
 
         match target {
             ProtocolId::Ping => {
                 if let Err(e) = self
                     .ping
-                    .register_outbound_stream(peer_id, stream_id)
+                    .register_outbound_stream(peer_id.clone(), stream_id)
                 {
                     self.events.push(SwarmEvent::Error {
                         message: format!("ping register error: {e}"),
                     });
+                }
+
+                // If the app called `swarm.ping(&peer)` before the stream
+                // was negotiated, flush the queued payload now.
+                if let Some(payload) = self.pending_pings.remove(&peer_id) {
+                    let now = self.now_ms();
+                    match self.ping.send_ping(&peer_id, &payload, now) {
+                        Ok(action) => self.execute_ping_action(action),
+                        Err(e) => self.events.push(SwarmEvent::Error {
+                            message: format!("deferred ping send failed: {e}"),
+                        }),
+                    }
                 }
             }
             ProtocolId::IdentifyInitiator => {
@@ -673,6 +905,14 @@ impl<T: Transport> Swarm<T> {
             }
             ProtocolId::IdentifyResponder => {
                 // Shouldn't happen for outbound.
+            }
+            ProtocolId::User(protocol_id) => {
+                self.events.push(SwarmEvent::UserStreamReady {
+                    peer_id,
+                    stream_id,
+                    protocol_id,
+                    initiated_locally: true,
+                });
             }
         }
     }
@@ -825,4 +1065,28 @@ impl<T: Transport> Swarm<T> {
             }
         }
     }
+}
+
+/// Generates a random 32-byte ping payload using OS randomness.
+///
+/// Falls back to a deterministic-but-non-repeating pattern if randomness is
+/// unavailable, which should only happen in very constrained environments.
+fn rand_ping_payload() -> [u8; PING_PAYLOAD_LEN] {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let mut payload = [0u8; PING_PAYLOAD_LEN];
+    if getrandom::fill(&mut payload).is_ok() {
+        return payload;
+    }
+
+    // Fallback: mix the wall clock into a simple pattern so payloads differ
+    // from ping to ping even when randomness is not available.
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    for (i, byte) in payload.iter_mut().enumerate() {
+        *byte = ((seed >> (i % 8)) as u8) ^ (i as u8);
+    }
+    payload
 }

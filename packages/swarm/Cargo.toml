@@ -6,7 +6,13 @@ readme = "README.md"
 
 [dependencies]
 minip2p-core = { path = "../core" }
+minip2p-dcutr = { path = "../dcutr" }
 minip2p-identify = { path = "../identify" }
+minip2p-identity = { path = "../identity" }
 minip2p-multistream-select = { path = "../multistream-select" }
 minip2p-ping = { path = "../ping" }
+minip2p-relay = { path = "../relay" }
 minip2p-transport = { path = "../transport" }
+getrandom = "0.4"
+
+
