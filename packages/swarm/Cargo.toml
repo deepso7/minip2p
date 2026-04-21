@@ -1,0 +1,12 @@
+[package]
+name = "minip2p-swarm"
+version = "0.1.0"
+edition = "2024"
+readme = "README.md"
+
+[dependencies]
+minip2p-core = { path = "../core" }
+minip2p-identify = { path = "../identify" }
+minip2p-multistream-select = { path = "../multistream-select" }
+minip2p-ping = { path = "../ping" }
+minip2p-transport = { path = "../transport" }

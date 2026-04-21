@@ -6,6 +6,7 @@ members = [
     "packages/identity",
     "packages/multistream-select",
     "packages/ping",
+    "packages/swarm",
     "packages/tls",
     "packages/transport",
     "transports/quic",
