@@ -17,7 +17,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use minip2p_core::PeerId;
+use minip2p_core::{Multiaddr, PeerId};
 use minip2p_identify::{
     IdentifyAction, IdentifyConfig, IdentifyEvent, IdentifyProtocol, IDENTIFY_PROTOCOL_ID,
 };
@@ -83,6 +83,13 @@ pub struct SwarmCore {
     peer_to_conn: BTreeMap<PeerId, ConnectionId>,
     /// Connections that have been established (with or without peer identity).
     active_connections: BTreeMap<ConnectionId, bool>,
+    /// Remote transport address per connection, captured from the
+    /// `ConnectionEndpoint` that arrives with the transport's
+    /// `Connected` / `IncomingConnection` / `PeerIdentityVerified`
+    /// events. Used to populate Identify's `observedAddr` so the remote
+    /// peer learns which of their transport addresses we saw them dial
+    /// us from.
+    conn_to_remote_addr: BTreeMap<ConnectionId, Multiaddr>,
 
     // --- Stream tracking ---
     /// Inbound streams being negotiated (server-side multistream-select).
@@ -128,6 +135,7 @@ impl SwarmCore {
             conn_to_peer: BTreeMap::new(),
             peer_to_conn: BTreeMap::new(),
             active_connections: BTreeMap::new(),
+            conn_to_remote_addr: BTreeMap::new(),
             inbound_negotiators: BTreeMap::new(),
             outbound_negotiators: BTreeMap::new(),
             stream_owner: BTreeMap::new(),
@@ -329,6 +337,8 @@ impl SwarmCore {
         match event {
             TransportEvent::Connected { id, endpoint } => {
                 self.active_connections.insert(id, true);
+                self.conn_to_remote_addr
+                    .insert(id, endpoint.transport().clone());
                 if let Some(peer_id) = endpoint.peer_id() {
                     self.register_connection(id, peer_id.clone());
                 } else {
@@ -342,12 +352,21 @@ impl SwarmCore {
                 }
             }
             TransportEvent::PeerIdentityVerified { id, endpoint, .. } => {
+                // Refresh the recorded transport address -- on mutual-TLS
+                // QUIC the `Connected` event precedes identity verification,
+                // and the transport may emit a more accurate endpoint here
+                // (e.g. with the real remote address observed after
+                // migration).
+                self.conn_to_remote_addr
+                    .insert(id, endpoint.transport().clone());
                 if let Some(peer_id) = endpoint.peer_id() {
                     self.upgrade_connection_identity(id, peer_id.clone());
                 }
             }
-            TransportEvent::IncomingConnection { id, .. } => {
+            TransportEvent::IncomingConnection { id, endpoint } => {
                 self.active_connections.insert(id, false);
+                self.conn_to_remote_addr
+                    .insert(id, endpoint.transport().clone());
             }
             TransportEvent::IncomingStream { id, stream_id } => {
                 self.handle_incoming_stream(id, stream_id);
@@ -593,6 +612,7 @@ impl SwarmCore {
     fn supersede_connection(&mut self, old_id: ConnectionId) {
         self.conn_to_peer.remove(&old_id);
         self.active_connections.remove(&old_id);
+        self.conn_to_remote_addr.remove(&old_id);
         self.stream_owner.retain(|(cid, _), _| *cid != old_id);
         self.inbound_negotiators
             .retain(|(cid, _), _| *cid != old_id);
@@ -805,6 +825,7 @@ impl SwarmCore {
 
     fn handle_connection_closed(&mut self, conn_id: ConnectionId) {
         self.active_connections.remove(&conn_id);
+        self.conn_to_remote_addr.remove(&conn_id);
 
         if let Some(peer_id) = self.conn_to_peer.remove(&conn_id) {
             let was_active = self.peer_to_conn.get(&peer_id) == Some(&conn_id);
@@ -979,8 +1000,14 @@ impl SwarmCore {
         }
 
         if protocol == IDENTIFY_PROTOCOL_ID {
-            // TODO: surface the remote's source address so observed-addr can be filled.
-            let observed_addr = Vec::new();
+            // Populate Identify's observedAddr field with the transport
+            // address we recorded for this connection. The address is
+            // cached when TransportEvent::Connected /
+            // TransportEvent::IncomingConnection / PeerIdentityVerified
+            // arrives; a missing entry means the driver never provided an
+            // endpoint for this conn_id, in which case we legitimately
+            // can't fill observedAddr and the field is omitted.
+            let observed_addr = self.conn_to_remote_addr.get(&conn_id).cloned();
             match self
                 .identify
                 .register_outbound_stream(peer_id, stream_id, observed_addr)

@@ -13,11 +13,11 @@ extern crate alloc;
 mod message;
 
 use alloc::collections::BTreeMap;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use minip2p_core::PeerId;
+use minip2p_core::{Multiaddr, PeerId};
 use minip2p_transport::StreamId;
 use thiserror::Error;
 
@@ -142,13 +142,18 @@ impl IdentifyProtocol {
     /// Registers a stream where we are the **responder** (sending our info).
     ///
     /// Call this after multistream-select negotiates `/ipfs/id/1.0.0` on an
-    /// inbound stream. The returned actions send our identify message and
-    /// close the write side.
+    /// inbound stream. `observed_addr` is the transport address we observed
+    /// the remote dialing us from; pass `None` if the information is not
+    /// available (the resulting identify message simply omits the
+    /// `observedAddr` field).
+    ///
+    /// The returned actions send our identify message and close the write
+    /// side.
     pub fn register_outbound_stream(
         &mut self,
         peer_id: PeerId,
         stream_id: StreamId,
-        observed_addr: Vec<u8>,
+        observed_addr: Option<Multiaddr>,
     ) -> Result<Vec<IdentifyAction>, IdentifyError> {
         let state = self.peers.entry(peer_id.clone()).or_default();
 
@@ -160,12 +165,21 @@ impl IdentifyProtocol {
 
         state.outbound_stream = Some(stream_id);
 
+        // Encode the observed multiaddr as its string form bytes. This is
+        // pragmatic rather than spec-pure: the libp2p identify spec calls
+        // for a binary multiaddr encoding, but minip2p does not yet
+        // implement multicodec-based binary serialization (see
+        // `packages/core`). The string form is non-empty and round-trips
+        // between minip2p peers; third-party libp2p peers will see it as
+        // opaque bytes until we add binary encoding to the core crate.
+        let observed_addr_bytes = observed_addr.map(|addr| addr.to_string().into_bytes());
+
         let msg = IdentifyMessage {
             protocol_version: Some(self.config.protocol_version.clone()),
             agent_version: Some(self.config.agent_version.clone()),
             public_key: Some(self.config.public_key.clone()),
             listen_addrs: self.config.listen_addrs.clone(),
-            observed_addr: Some(observed_addr),
+            observed_addr: observed_addr_bytes,
             protocols: self.config.protocols.clone(),
         };
 

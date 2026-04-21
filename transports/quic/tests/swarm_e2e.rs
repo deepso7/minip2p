@@ -3,6 +3,9 @@
 //! Contrast with `ping_e2e.rs` which requires ~200 lines of manual negotiation
 //! and dispatch code. Here, the Swarm handles everything.
 
+use std::str::FromStr;
+
+use minip2p_core::Multiaddr;
 use minip2p_identity::Ed25519Keypair;
 use minip2p_ping::PING_PROTOCOL_ID;
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
@@ -173,6 +176,68 @@ fn swarm_user_protocol_round_trip() {
     }
 
     assert_eq!(echo_received.as_deref(), Some(payload.as_slice()));
+}
+
+/// Regression test: after the client dials and Identify completes, the
+/// client's `IdentifyReceived` event must carry a non-empty `observed_addr`
+/// that parses back into a valid QUIC transport multiaddr.
+///
+/// This covers the prior behavior where `SwarmCore` passed an empty
+/// `observed_addr` byte vector into the Identify responder (the TODO at
+/// the former `packages/swarm/src/core.rs:982`). The fix plumbs the
+/// transport endpoint cached on `TransportEvent::Connected` /
+/// `IncomingConnection` into `IdentifyProtocol::register_outbound_stream`.
+///
+/// Note: we intentionally only assert the client-observed direction.
+/// The symmetric server-observed case requires the server to learn the
+/// client's real PeerId at handshake time so it can open its own Identify
+/// initiator stream -- that is the Milestone 6 mutual-TLS work and is not
+/// what this test covers.
+#[test]
+fn identify_exchange_carries_observed_addr() {
+    let mut server = make_swarm(Ed25519Keypair::generate());
+    server
+        .transport_mut()
+        .listen_on_bound_addr()
+        .expect("server listen");
+    let peer_addr = server.transport().local_peer_addr().expect("peer addr");
+    let server_peer_id = peer_addr.peer_id().clone();
+
+    let mut client = make_swarm(Ed25519Keypair::generate());
+    client.dial(&peer_addr).expect("dial");
+
+    let mut client_observed: Option<Vec<u8>> = None;
+
+    for _ in 0..500 {
+        let (_server_events, client_events) = drive_pair(&mut server, &mut client);
+
+        for event in client_events {
+            if let SwarmEvent::IdentifyReceived { peer_id, info } = event {
+                if peer_id == server_peer_id {
+                    client_observed = info.observed_addr;
+                }
+            }
+        }
+
+        if client_observed.is_some() {
+            break;
+        }
+    }
+
+    let client_bytes = client_observed.expect("client should see observed_addr");
+    assert!(
+        !client_bytes.is_empty(),
+        "client-side observed_addr must not be empty"
+    );
+
+    // The current encoding is the multiaddr's string form -- decode and
+    // check it round-trips into a valid QUIC transport multiaddr.
+    let addr_str = std::str::from_utf8(&client_bytes).expect("observed_addr should be utf-8");
+    let addr = Multiaddr::from_str(addr_str).expect("observed_addr should parse as multiaddr");
+    assert!(
+        addr.is_quic_transport(),
+        "observed_addr should be a QUIC transport multiaddr, got {addr}"
+    );
 }
 
 /// Regression test: calling `ping()` repeatedly before the ping stream has

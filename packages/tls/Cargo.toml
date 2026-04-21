@@ -19,6 +19,20 @@ std = [
     "ecdsa/std",
 ]
 
+# NOTE: pre-release version pins are intentional.
+#
+# `x509-cert`, `p256`, `ecdsa`, `signature`, and `sha2` are pinned to
+# RustCrypto release candidates (0.3.0-rc.4, 0.14.0-rc.9, 0.17.0-rc.17,
+# 3.0.0-rc.10, and 0.11 respectively). These are the first versions that
+# expose the certificate-builder and signature-trait APIs we need while
+# remaining `no_std + alloc` compatible; the current stable releases either
+# drop `no_std` support or lack the builder API surface.
+#
+# Upgrade coordination rule: bump all five pins together, in lockstep with
+# a matching `rand_core` / `sha2` / `signature` release train, otherwise
+# `Cargo.lock` ends up with duplicate versions of these crates alongside
+# those pulled in by `minip2p-identity` (ed25519-dalek 2.x → signature 2.x,
+# sha2 0.10).
 [dependencies]
 minip2p-identity = { path = "../identity", default-features = false, features = ["ed25519"] }
 der = { version = "0.8", default-features = false, features = ["alloc", "oid"] }

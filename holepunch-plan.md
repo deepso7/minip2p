@@ -58,7 +58,8 @@ Output format is plain text, one event per line, prefixed with a role tag:
 
 ```
 examples/peer/
-  Cargo.toml        # already exists; workspace-registered
+  Cargo.toml        # to be created; must be added to the workspace
+                    # [workspace].members array in the root Cargo.toml
   src/
     main.rs         # argv parsing + dispatch to mode
     direct.rs       # mode 1 (listen / dial) -- pure Swarm usage
@@ -68,6 +69,13 @@ examples/peer/
 ```
 
 Target budget: ~500 lines total.
+
+## Step 0: Scaffold the crate (prerequisite)
+
+Before any of the mode implementations, create `examples/peer/` with a
+minimal `Cargo.toml` and `src/main.rs`, and register it under
+`[workspace].members` in the root `Cargo.toml`. Confirm with
+`cargo check -p minip2p-peer` before moving on.
 
 ## Mode 1: Direct (no relay)
 
@@ -267,6 +275,8 @@ frame delivery without needing a separate poll round.
 
 ## Deliverable checklist
 
+- [ ] Scaffold `examples/peer/` (Cargo.toml + main.rs) and register in
+      root `Cargo.toml` workspace members (~20 LOC)
 - [ ] `examples/peer/src/main.rs` argv parsing (~50 LOC)
 - [ ] `examples/peer/src/direct.rs` direct mode listener + dialer (~80 LOC)
 - [ ] `examples/peer/src/relay.rs` relay mode state machines (~250 LOC)
