@@ -1,0 +1,24 @@
+[package]
+name = "minip2p-peer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Binary that exercises the full minip2p stack end-to-end: direct QUIC
+# peer-to-peer pings, and relay-coordinated hole-punch pings via Circuit
+# Relay v2 + DCUtR. See holepunch-plan.md for the full design.
+[[bin]]
+name = "minip2p-peer"
+path = "src/main.rs"
+
+[dependencies]
+minip2p-core = { path = "../../crates/core" }
+minip2p-identity = { path = "../../crates/identity" }
+minip2p-transport = { path = "../../crates/transport" }
+minip2p-swarm = { path = "../../crates/swarm" }
+minip2p-ping = { path = "../../crates/ping" }
+minip2p-identify = { path = "../../crates/identify" }
+minip2p-relay = { path = "../../crates/relay" }
+minip2p-dcutr = { path = "../../crates/dcutr" }
+minip2p-multistream-select = { path = "../../crates/multistream-select" }
+minip2p-quic = { path = "../../transports/quic" }
