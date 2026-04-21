@@ -170,7 +170,10 @@ impl HopReservation {
             return Ok(());
         }
 
-        enforce_max_size(&self.recv_buf)?;
+        enforce_max_size(&self.recv_buf).map_err(|e| {
+            self.state = FlowState::Done;
+            e
+        })?;
 
         let (payload, consumed) = match decode_frame(&self.recv_buf) {
             FrameDecode::Complete { payload, consumed } => (payload.to_vec(), consumed),
@@ -341,7 +344,10 @@ impl HopConnect {
             return Ok(());
         }
 
-        enforce_max_size(&self.recv_buf)?;
+        enforce_max_size(&self.recv_buf).map_err(|e| {
+            self.state = FlowState::Done;
+            e
+        })?;
 
         let (payload, consumed) = match decode_frame(&self.recv_buf) {
             FrameDecode::Complete { payload, consumed } => (payload.to_vec(), consumed),
@@ -529,7 +535,10 @@ impl StopResponder {
             return Ok(());
         }
 
-        enforce_max_size(&self.recv_buf)?;
+        enforce_max_size(&self.recv_buf).map_err(|e| {
+            self.state = StopState::Done;
+            e
+        })?;
 
         let (payload, consumed) = match decode_frame(&self.recv_buf) {
             FrameDecode::Complete { payload, consumed } => (payload.to_vec(), consumed),

@@ -167,6 +167,17 @@ impl SwarmCore {
         core::mem::take(&mut self.events)
     }
 
+    /// Records a non-fatal error observed by the driver while executing a
+    /// queued action (e.g. a [`SwarmAction::SendStream`] call on the
+    /// transport failed).
+    ///
+    /// Surfaces as a [`SwarmEvent::Error`] on the next
+    /// [`Self::poll_events`]. Used by the driver so transport-level
+    /// failures are never silently dropped.
+    pub fn record_error(&mut self, message: String) {
+        self.events.push(SwarmEvent::Error { message });
+    }
+
     // -----------------------------------------------------------------------
     // Application-facing intents
     // -----------------------------------------------------------------------
@@ -968,18 +979,31 @@ impl SwarmCore {
         }
 
         if protocol == IDENTIFY_PROTOCOL_ID {
-            self.stream_owner
-                .insert((conn_id, stream_id), ProtocolKind::IdentifyResponder);
             // TODO: surface the remote's source address so observed-addr can be filled.
             let observed_addr = Vec::new();
             match self
                 .identify
                 .register_outbound_stream(peer_id, stream_id, observed_addr)
             {
-                Ok(actions) => self.execute_identify_actions(actions),
-                Err(e) => self.events.push(SwarmEvent::Error {
-                    message: format!("identify responder error: {e}"),
-                }),
+                Ok(actions) => {
+                    // Only record ownership on success, so a rejected
+                    // registration doesn't leave the stream tracked here
+                    // with no owning handler.
+                    self.stream_owner
+                        .insert((conn_id, stream_id), ProtocolKind::IdentifyResponder);
+                    self.execute_identify_actions(actions);
+                }
+                Err(e) => {
+                    // Registration refused (e.g. identify already has a
+                    // responder stream for this peer). Don't leak the
+                    // underlying transport stream -- reset it so the
+                    // remote knows we're not going to respond.
+                    self.events.push(SwarmEvent::Error {
+                        message: format!("identify responder error: {e}"),
+                    });
+                    self.actions
+                        .push(SwarmAction::ResetStream { conn_id, stream_id });
+                }
             }
             return;
         }

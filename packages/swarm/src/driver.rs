@@ -268,16 +268,32 @@ impl<T: Transport> Swarm<T> {
                 stream_id,
                 data,
             } => {
-                let _ = self.transport.send_stream(conn_id, stream_id, data);
+                if let Err(e) = self.transport.send_stream(conn_id, stream_id, data) {
+                    self.core.record_error(format!(
+                        "send_stream to connection {conn_id} stream {stream_id} failed: {e}"
+                    ));
+                }
             }
             SwarmAction::CloseStreamWrite { conn_id, stream_id } => {
-                let _ = self.transport.close_stream_write(conn_id, stream_id);
+                if let Err(e) = self.transport.close_stream_write(conn_id, stream_id) {
+                    self.core.record_error(format!(
+                        "close_stream_write on connection {conn_id} stream {stream_id} failed: {e}"
+                    ));
+                }
             }
             SwarmAction::ResetStream { conn_id, stream_id } => {
-                let _ = self.transport.reset_stream(conn_id, stream_id);
+                if let Err(e) = self.transport.reset_stream(conn_id, stream_id) {
+                    self.core.record_error(format!(
+                        "reset_stream on connection {conn_id} stream {stream_id} failed: {e}"
+                    ));
+                }
             }
             SwarmAction::CloseConnection { conn_id } => {
-                let _ = self.transport.close(conn_id);
+                if let Err(e) = self.transport.close(conn_id) {
+                    self.core.record_error(format!(
+                        "close on connection {conn_id} failed: {e}"
+                    ));
+                }
             }
         }
     }

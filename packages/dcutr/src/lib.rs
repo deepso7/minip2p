@@ -199,7 +199,10 @@ impl DcutrInitiator {
             return Ok(());
         }
 
-        enforce_max_size(&self.recv_buf)?;
+        enforce_max_size(&self.recv_buf).map_err(|e| {
+            self.state = InitiatorState::Done;
+            e
+        })?;
 
         let (payload, consumed) = match decode_frame(&self.recv_buf) {
             FrameDecode::Complete { payload, consumed } => (payload.to_vec(), consumed),
@@ -330,7 +333,10 @@ impl DcutrResponder {
                 return Ok(());
             }
 
-            enforce_max_size(&self.recv_buf)?;
+            enforce_max_size(&self.recv_buf).map_err(|e| {
+                self.state = ResponderState::Done;
+                e
+            })?;
 
             let (payload, consumed) = match decode_frame(&self.recv_buf) {
                 FrameDecode::Complete { payload, consumed } => (payload.to_vec(), consumed),

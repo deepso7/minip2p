@@ -13,9 +13,9 @@ peers fall back to pinging over the relay circuit.
 
 ## Assumptions
 
-- Local rust-libp2p relay for the first iteration (runs with `cargo run
-  --example relay-server-example` from the rust-libp2p repo, or the
-  equivalent binary). Moving to a VM-hosted relay is a later step.
+- Local rust-libp2p relay for the first iteration (see the manual
+  testing section for the exact `cargo run` invocation). Moving to a
+  VM-hosted relay is a later step.
 - Both peers are minip2p. We skip Noise and Yamux on the bridged stream --
   DCUtR frames flow directly over the relay bridge with length-prefixed
   framing.
@@ -230,9 +230,13 @@ frame delivery without needing a separate poll round.
 - **Connection id tracking across modes.** We dial the relay first, then
   later dial the target peer directly. Swarm's `ConnectionEstablished`
   event gives us the peer id but not which dial call it corresponds to.
-  We key decisions on `peer_id != relay_peer_id` to identify the direct
-  connection. This is fine as long as we don't reconnect to the relay
-  mid-flow.
+  The hole-punch success criterion is specifically "a new
+  `ConnectionEstablished` for `target_peer_id` (the peer we're punching
+  to)" -- not "any peer other than the relay". Using the negative
+  formulation (`peer_id != relay_peer_id`) would misclassify any
+  unrelated inbound connection as a hole-punch success. The initiator
+  carries `target_peer_id` from the CLI args; the responder learns it
+  from the STOP `CONNECT` message's `source_peer_id` field.
 
 ## Testing strategy
 
@@ -250,11 +254,14 @@ frame delivery without needing a separate poll round.
 
 ### Manual
 
-1. `cargo run --example relay-server` from a checked-out rust-libp2p
-   (or the community `libp2p-relay-v2-server` crate), note the PeerAddr
-   it prints.
-2. Terminal 1: `cargo run -p minip2p-peer -- listen --relay <addr>`
-3. Terminal 2: `cargo run -p minip2p-peer -- dial --relay <addr> --target <B-peer-id>`
+1. Start a rust-libp2p relay server. From a checked-out `rust-libp2p`
+   tree, run `cargo run --example relay-server-example` (the example
+   lives at `examples/relay-server/`; verify the exact binary name
+   against the repo state at time of use, as it has historically
+   drifted). Note the `PeerAddr` it prints -- used as `<relay-addr>`
+   below.
+2. Terminal 1: `cargo run -p minip2p-peer -- listen --relay <relay-addr>`
+3. Terminal 2: `cargo run -p minip2p-peer -- dial --relay <relay-addr> --target <B-peer-id>`
 4. Both terminals should eventually print `direct-connected` or
    `via-relay` followed by a ping RTT.
 
@@ -269,7 +276,7 @@ frame delivery without needing a separate poll round.
 - [ ] Automated direct-mode E2E test
 - [ ] Automated relay-mode test with fake relay (optional, defer if
       oversized)
-- [ ] Manual verification against rust-libp2p relay-server
+- [ ] Manual verification against rust-libp2p `relay-server-example`
 - [ ] Brief README at `examples/peer/README.md` with run instructions
       (this is the one README we should actually write because users will
       run the binary)

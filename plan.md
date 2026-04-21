@@ -82,7 +82,9 @@ applications.
 
 ### Pending architectural work
 
-None currently.
+Tracked concretely under the roadmap milestones; see Milestone 6
+(mutual TLS on the QUIC transport) for the remaining architectural
+cleanup item.
 
 ## DX Principles
 
