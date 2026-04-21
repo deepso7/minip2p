@@ -83,18 +83,6 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
     // --- 1. Relay connection established -----------------------------------
     wait_connected(&mut swarm, role, &relay_peer_id, deadline)?;
 
-    // Capture the active connection count now, before DCUtR starts.
-    // This is the hole-punch-success baseline: any connection beyond
-    // this must be the remote peer coming in direct (or a relay
-    // probe-back, which rust-libp2p may do to verify our listen_addrs
-    // -- benign false positive, the session still completes cleanly).
-    //
-    // We MUST capture before B's DCUtR CONNECT reply goes out, because
-    // on a local loopback, the remote's direct Initial can arrive at
-    // our socket a few hundred microseconds later -- before we even
-    // observe the SYNC message.
-    let conn_baseline = swarm.transport().active_connection_count();
-
     // --- 2. Reserve a slot on the relay via HOP RESERVE --------------------
     let hop_stream = swarm
         .open_user_stream(&relay_peer_id, HOP_PROTOCOL_ID)
@@ -154,9 +142,14 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
     }
     send(&mut swarm, &relay_peer_id, bridge_stream, dcutr.take_outbound())?;
 
+    // DCUtR responder events arrive across multiple poll cycles:
+    // `ConnectReceived` fires in one call, `SyncReceived` in a later
+    // one. We thread the captured remote-addrs through the loop so
+    // the CONNECT payload isn't thrown away when the SYNC arrives.
+    let mut captured_remote_addrs: Option<Vec<Multiaddr>> = None;
     let remote_addrs: Vec<Multiaddr> = loop {
-        if let Some(addrs) = drain_dcutr_responder_events(&mut dcutr, role) {
-            break addrs;
+        if drain_dcutr_responder_events(&mut dcutr, role, &mut captured_remote_addrs) {
+            break captured_remote_addrs.take().unwrap_or_default();
         }
         let data = wait_user_stream_data(&mut swarm, role, bridge_stream, deadline)?;
         dcutr.on_data(&data).map_err(|e| format!("DCUtR decode: {e}"))?;
@@ -169,18 +162,30 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
     let punch_deadline = punch_start + HOLEPUNCH_DEADLINE;
     let mut next_blast = punch_start + RESPONDER_SYNC_DELAY;
 
-    // The baseline was captured right after we connected to the relay,
-    // before DCUtR started. Any connection beyond that -- including
-    // the remote's direct Initial, which can arrive BEFORE we observe
-    // the SYNC message on a tight local loopback -- should trigger
-    // the early-exit heuristic.
+    // Extract the host+port shape of each address we expect the remote
+    // to dial from. We compare against the transport addresses (no
+    // peer-id suffix) of any inbound QUIC connection; matching on
+    // (IP, port) keeps the check robust whether the remote is on the
+    // same host (dials from its bound port) or behind a NAT (dials
+    // from its NAT-external mapping, which is what DCUtR CONNECT put
+    // in `remote_addrs`).
     //
-    // Implementation note: we poll on a tight (~5ms) cadence rather
-    // than using `run_until`, because a successful remote direct-ping
-    // session can come and go in under 100ms -- the connection count
-    // is back to baseline before a slower tick would notice.
-    let mut saw_inbound_conn =
-        swarm.transport().active_connection_count() > conn_baseline;
+    // Using an address-match heuristic rather than a raw count
+    // comparison prevents unrelated inbound connections -- relay
+    // probe-backs, autonat probes, random scanners -- from being
+    // misinterpreted as hole-punch success.
+    let remote_match_targets: Vec<(String, u16)> = remote_addrs
+        .iter()
+        .filter_map(extract_ip_port)
+        .collect();
+
+    // Check any connections already present (e.g. the remote's direct
+    // Initial may have arrived BEFORE we observed the SYNC message on
+    // a tight local loopback). Only counts if the source matches.
+    let mut saw_inbound_conn = any_source_matches(
+        &swarm.transport().active_connection_sources(),
+        &remote_match_targets,
+    );
 
     let outcome = 'outer: loop {
         let now = Instant::now();
@@ -208,10 +213,18 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
             }
         }
 
-        // Sticky: if we've ever seen the count above baseline, we
-        // know a direct connection arrived even if it has since been
-        // torn down (e.g. the remote finished pinging and exited).
-        if swarm.transport().active_connection_count() > conn_baseline {
+        // Sticky: if we've ever seen an inbound connection from one
+        // of the remote's advertised addresses, we know the remote
+        // went direct even if the connection has since been torn
+        // down (e.g. the remote finished pinging and exited).
+        //
+        // Unrelated inbound connections (autonat probes, scans) do
+        // NOT trigger this because their source address won't match
+        // `remote_match_targets`.
+        if any_source_matches(
+            &swarm.transport().active_connection_sources(),
+            &remote_match_targets,
+        ) {
             saw_inbound_conn = true;
         }
         if saw_inbound_conn {
@@ -312,6 +325,51 @@ enum HolePunchOutcome {
 
 fn is_direct_connection_event(ev: &SwarmEvent, remote: &PeerId) -> bool {
     matches!(ev, SwarmEvent::ConnectionEstablished { peer_id } if peer_id == remote)
+}
+
+/// Pulls the (IP host, UDP port) tuple out of a QUIC-style multiaddr,
+/// returning `None` if the shape isn't a supported host + udp + quic-v1.
+///
+/// Host is returned as the multiaddr's display form for the IP/DNS
+/// component (e.g. `"127.0.0.1"`, `"2001:db8::1"`, `"example.com"`)
+/// so the comparison is protocol-aware without us having to case on
+/// every host variant.
+fn extract_ip_port(addr: &Multiaddr) -> Option<(String, u16)> {
+    use minip2p_core::Protocol;
+    let protocols = addr.protocols();
+    if protocols.len() < 2 {
+        return None;
+    }
+    let host = match &protocols[0] {
+        Protocol::Ip4(b) => {
+            format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+        }
+        Protocol::Ip6(b) => core::net::Ipv6Addr::from(*b).to_string(),
+        Protocol::Dns(v) | Protocol::Dns4(v) | Protocol::Dns6(v) => v.clone(),
+        _ => return None,
+    };
+    let port = match &protocols[1] {
+        Protocol::Udp(p) => *p,
+        _ => return None,
+    };
+    Some((host, port))
+}
+
+/// Returns `true` if at least one of `sources` has the same `(host, port)`
+/// as any of `targets`.
+///
+/// Used by the listener's hole-punch success heuristic to filter out
+/// inbound connections from unrelated peers (autonat probes, scans,
+/// etc.). A connection source matches only when it came from an
+/// address the remote peer advertised via DCUtR.
+fn any_source_matches(sources: &[Multiaddr], targets: &[(String, u16)]) -> bool {
+    if targets.is_empty() {
+        return false;
+    }
+    sources
+        .iter()
+        .filter_map(extract_ip_port)
+        .any(|src| targets.iter().any(|tgt| &src == tgt))
 }
 
 fn is_bridge_closed_event(ev: &SwarmEvent, bridge_stream: StreamId) -> bool {
@@ -566,13 +624,19 @@ fn wait_user_stream_data(
     Ok(data)
 }
 
-/// Drains any pending DCUtR responder events. Returns `Some(remote_addrs)`
-/// once `SyncReceived` has fired, `None` otherwise.
+/// Drains any pending DCUtR responder events into the caller's
+/// `captured` slot. Returns `true` when `SyncReceived` has fired
+/// (i.e. the responder flow is complete).
+///
+/// `captured` is threaded by reference because `ConnectReceived` and
+/// `SyncReceived` can arrive in separate poll cycles -- persisting the
+/// captured remote addresses across calls is essential so they aren't
+/// lost by the time SYNC arrives.
 fn drain_dcutr_responder_events(
     dcutr: &mut DcutrResponder,
     role: &str,
-) -> Option<Vec<Multiaddr>> {
-    let mut captured: Option<Vec<Multiaddr>> = None;
+    captured: &mut Option<Vec<Multiaddr>>,
+) -> bool {
     let mut sync = false;
     for ev in dcutr.poll_events() {
         match ev {
@@ -592,16 +656,12 @@ fn drain_dcutr_responder_events(
                     "[{role}] dcutr-connect-received addrs={}",
                     remote_addrs.len()
                 );
-                captured = Some(remote_addrs);
+                *captured = Some(remote_addrs);
             }
             ResponderEvent::SyncReceived => sync = true,
         }
     }
-    if sync {
-        captured.or_else(|| Some(Vec::new()))
-    } else {
-        None
-    }
+    sync
 }
 
 /// Send `data` on `stream_id` if non-empty; no-op otherwise.
