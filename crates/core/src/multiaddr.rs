@@ -96,6 +96,45 @@ impl Multiaddr {
     pub fn is_quic_transport(&self) -> bool {
         is_quic_transport_slice(&self.protocols)
     }
+
+    /// Encodes this multiaddr to its binary multicodec wire form.
+    ///
+    /// Shape: for each component, a varint multicodec code followed by
+    /// the value (fixed-size, length-prefixed, or absent depending on
+    /// the protocol). See the multiformats multiaddr specification at
+    /// <https://github.com/multiformats/multiaddr>.
+    ///
+    /// This is the on-wire encoding used by interoperable libp2p
+    /// components (Identify's `listen_addrs` / `observed_addr`, DCUtR
+    /// observed addresses, etc.).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for protocol in &self.protocols {
+            protocol.write_binary(&mut out);
+        }
+        out
+    }
+
+    /// Decodes a multiaddr from its binary multicodec wire form.
+    ///
+    /// Errors:
+    /// - `Varint` — a multicodec code or length prefix is malformed.
+    /// - `UnknownProtocolCode` — a component uses a code we don't
+    ///   implement.
+    /// - `TruncatedBinaryValue` — a component declared more bytes than
+    ///   the buffer contains.
+    /// - `InvalidBinaryValue` — a component's body failed validation
+    ///   (e.g. non-UTF-8 DNS name, malformed `/p2p/` multihash).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MultiaddrError> {
+        let mut protocols = Vec::new();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let (protocol, consumed) = Protocol::read_binary(&bytes[offset..])?;
+            offset += consumed;
+            protocols.push(protocol);
+        }
+        Ok(Self { protocols })
+    }
 }
 
 impl fmt::Display for Multiaddr {
@@ -329,5 +368,102 @@ mod tests {
 
         let decapsulated = full.decapsulate(&peer).expect("suffix should be found");
         assert_eq!(decapsulated, base);
+    }
+
+    // ---------------------------------------------------------------------
+    // Binary codec
+    // ---------------------------------------------------------------------
+
+    /// Hand-derived reference vector for `/ip4/127.0.0.1/udp/4001/quic-v1`.
+    ///
+    /// - `/ip4`: varint code 0x04, value 127.0.0.1 = 7F 00 00 01
+    /// - `/udp`: varint code 0x0111 -> 91 02, value 4001 (big-endian) = 0F A1
+    /// - `/quic-v1`: varint code 0x01cc -> CC 03, no value
+    #[test]
+    fn binary_codec_reference_vector_ip4_quic() {
+        let addr = Multiaddr::from_str("/ip4/127.0.0.1/udp/4001/quic-v1").unwrap();
+        let expected: Vec<u8> = vec![
+            0x04, 0x7F, 0x00, 0x00, 0x01, // ip4 127.0.0.1
+            0x91, 0x02, 0x0F, 0xA1, // udp 4001
+            0xCC, 0x03, // quic-v1
+        ];
+        assert_eq!(addr.to_bytes(), expected);
+        assert_eq!(Multiaddr::from_bytes(&expected).unwrap(), addr);
+    }
+
+    #[test]
+    fn binary_codec_round_trips_ip6() {
+        let input = "/ip6/2001:db8::1/udp/9000/quic-v1";
+        let addr = Multiaddr::from_str(input).unwrap();
+        let bytes = addr.to_bytes();
+        let decoded = Multiaddr::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.to_string(), input);
+    }
+
+    #[test]
+    fn binary_codec_round_trips_dns_variants() {
+        for proto in ["dns", "dns4", "dns6"] {
+            let input = alloc::format!("/{proto}/example.com/udp/443/quic-v1");
+            let addr = Multiaddr::from_str(&input).unwrap();
+            let bytes = addr.to_bytes();
+            let decoded = Multiaddr::from_bytes(&bytes).unwrap();
+            assert_eq!(decoded.to_string(), input);
+        }
+    }
+
+    #[test]
+    fn binary_codec_round_trips_p2p_suffix() {
+        let input = format!("/ip4/127.0.0.1/udp/4001/quic-v1/p2p/{PEER_ID}");
+        let addr = Multiaddr::from_str(&input).unwrap();
+        let bytes = addr.to_bytes();
+        let decoded = Multiaddr::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.to_string(), input);
+    }
+
+    #[test]
+    fn binary_codec_round_trips_empty_multiaddr() {
+        let addr = Multiaddr::new();
+        assert_eq!(addr.to_bytes(), Vec::<u8>::new());
+        assert_eq!(Multiaddr::from_bytes(&[]).unwrap(), addr);
+    }
+
+    #[test]
+    fn binary_codec_rejects_unknown_code() {
+        // 0xC1 0x01 is varint for 193; not a code we implement.
+        let err = Multiaddr::from_bytes(&[0xC1, 0x01, 0xFF]).unwrap_err();
+        assert!(matches!(
+            err,
+            MultiaddrError::UnknownProtocolCode { code: 193 }
+        ));
+    }
+
+    #[test]
+    fn binary_codec_rejects_truncated_ip4() {
+        // ip4 code (0x04) followed by only 2 bytes of value.
+        let err = Multiaddr::from_bytes(&[0x04, 0x7F, 0x00]).unwrap_err();
+        assert!(matches!(
+            err,
+            MultiaddrError::TruncatedBinaryValue { protocol: "ip4" }
+        ));
+    }
+
+    #[test]
+    fn binary_codec_rejects_truncated_length_prefix() {
+        // dns code (0x35) + length 10 + only 3 body bytes.
+        let err = Multiaddr::from_bytes(&[0x35, 0x0A, b'a', b'b', b'c']).unwrap_err();
+        assert!(matches!(
+            err,
+            MultiaddrError::TruncatedBinaryValue { protocol: "dns" }
+        ));
+    }
+
+    #[test]
+    fn binary_codec_rejects_invalid_dns_utf8() {
+        // dns code (0x35) + length 2 + invalid utf-8 bytes (0xFF 0xFE).
+        let err = Multiaddr::from_bytes(&[0x35, 0x02, 0xFF, 0xFE]).unwrap_err();
+        assert!(matches!(
+            err,
+            MultiaddrError::InvalidBinaryValue { protocol: "dns", .. }
+        ));
     }
 }
