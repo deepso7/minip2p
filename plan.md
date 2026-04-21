@@ -188,6 +188,14 @@ New crate: `crates/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 **Exit criteria**
 - One end-to-end example runs from docs without hidden steps.
 
+## Developer experience
+
+DX improvements and roadmap live in `dx-plan.md`. Includes a backlog
+of Tier 1/2/3 items (e.g. `SwarmEvent::PeerReady` for peer-ready
+signaling, typed `SwarmEvent::Error`, `Swarm::listen()` helper,
+keypair persistence) derived from real pain observed while writing
+`examples/peer`.
+
 ## Quality Gates
 
 - Unit tests for core parsing/types and error behavior.

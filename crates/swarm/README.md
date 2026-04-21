@@ -65,3 +65,13 @@ The `no_std` build omits the `Swarm<T>` driver and `SwarmBuilder`; only `SwarmCo
 ## Scope
 
 This crate orchestrates the protocol state machines. It does **not** implement the protocols themselves -- see `minip2p-identify`, `minip2p-ping`, `minip2p-multistream-select`, `minip2p-relay`, `minip2p-dcutr`. It does not implement transports either -- see `minip2p-transport` for the contract and `transports/quic` for a concrete adapter.
+
+## DX roadmap
+
+See `dx-plan.md` at the repo root for the tracked DX backlog. A few items that land in the swarm crate specifically:
+
+- **`SwarmEvent::PeerReady { peer_id }`** -- fire after the peer-id migration *and* the first `IdentifyReceived`. Removes the current "wait for Identify before calling `ping()`" gate in user code.
+- **Typed `SwarmEvent::Error`** -- replace the string-only `Error { message }` variant with a structured enum so callers can match on kinds instead of grepping on message contents.
+- **`Swarm::listen(&Multiaddr)` helper** -- one-call listen bring-up that wraps `transport.listen(...)` and returns the resolved bound address.
+
+PRs welcome; see `dx-plan.md` for the full priority list and motivation for each.

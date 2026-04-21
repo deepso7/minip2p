@@ -95,4 +95,4 @@ cargo doc --workspace --no-deps --open
 - [ ] Mutual TLS on the QUIC transport so the listener learns the client PeerId at handshake time.
 - [ ] Additional transport adapters (TCP, WebSocket, WebRTC).
 
-See `plan.md` for the detailed execution plan and milestones, and `holepunch-plan.md` for the ongoing CLI work.
+See `plan.md` for the detailed execution plan and milestones, `holepunch-plan.md` for the ongoing CLI work, and `dx-plan.md` for the developer-experience roadmap (landed improvements + prioritized backlog).
