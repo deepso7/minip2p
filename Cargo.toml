@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "packages/core",
+    "packages/dcutr",
     "packages/identify",
     "packages/identity",
     "packages/multistream-select",

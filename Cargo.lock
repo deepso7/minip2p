@@ -542,6 +542,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "minip2p-dcutr"
+version = "0.1.0"
+dependencies = [
+ "minip2p-core",
+ "thiserror",
+]
+
+[[package]]
 name = "minip2p-identify"
 version = "0.1.0"
 dependencies = [
