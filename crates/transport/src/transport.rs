@@ -115,4 +115,17 @@ pub trait Transport {
     fn local_addresses(&self) -> Vec<Multiaddr> {
         Vec::new()
     }
+
+    /// Returns the number of active connections the transport is
+    /// currently managing (dialed + accepted, pre-`Closed`).
+    ///
+    /// Intended for coarse heuristics -- e.g. a listener waiting for
+    /// any new inbound QUIC connection as a signal that hole-punch
+    /// succeeded, without having the remote's verified peer id. Not
+    /// suitable for security decisions.
+    ///
+    /// Default implementation returns 0; adapters should override.
+    fn active_connection_count(&self) -> usize {
+        0
+    }
 }

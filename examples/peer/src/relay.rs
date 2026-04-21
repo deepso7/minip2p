@@ -23,7 +23,7 @@ use minip2p_relay::{
     HOP_PROTOCOL_ID, STOP_PROTOCOL_ID,
 };
 use minip2p_swarm::{Swarm, SwarmBuilder, SwarmEvent};
-use minip2p_transport::StreamId;
+use minip2p_transport::{StreamId, Transport};
 
 use crate::cli::print_event;
 
@@ -37,7 +37,15 @@ const AGENT: &str = "minip2p-peer/0.1.0";
 /// flow should complete well inside this on a local relay.
 const LISTEN_DEADLINE: Duration = Duration::from_secs(60);
 /// Hole-punch window after SYNC is received / sent.
-const HOLEPUNCH_DEADLINE: Duration = Duration::from_secs(10);
+///
+/// Kept short because on the listener side we fall back to an
+/// inbound-connection-count heuristic for early exit (since without
+/// mutual TLS we can't directly observe the remote's verified peer
+/// id). On the dialer side, direct dials succeed in milliseconds on
+/// LAN/loopback; real-world NATs may occasionally need longer but
+/// three seconds already works for the common-case symmetric-NAT
+/// traversal path.
+const HOLEPUNCH_DEADLINE: Duration = Duration::from_secs(3);
 /// UDP blast cadence (responder side) during hole-punch.
 const HOLEPUNCH_INTERVAL: Duration = Duration::from_millis(100);
 /// Approximation of RTT/2 before the responder starts blasting UDP.
@@ -74,6 +82,18 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
 
     // --- 1. Relay connection established -----------------------------------
     wait_connected(&mut swarm, role, &relay_peer_id, deadline)?;
+
+    // Capture the active connection count now, before DCUtR starts.
+    // This is the hole-punch-success baseline: any connection beyond
+    // this must be the remote peer coming in direct (or a relay
+    // probe-back, which rust-libp2p may do to verify our listen_addrs
+    // -- benign false positive, the session still completes cleanly).
+    //
+    // We MUST capture before B's DCUtR CONNECT reply goes out, because
+    // on a local loopback, the remote's direct Initial can arrive at
+    // our socket a few hundred microseconds later -- before we even
+    // observe the SYNC message.
+    let conn_baseline = swarm.transport().active_connection_count();
 
     // --- 2. Reserve a slot on the relay via HOP RESERVE --------------------
     let hop_stream = swarm
@@ -149,7 +169,20 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
     let punch_deadline = punch_start + HOLEPUNCH_DEADLINE;
     let mut next_blast = punch_start + RESPONDER_SYNC_DELAY;
 
-    let outcome = loop {
+    // The baseline was captured right after we connected to the relay,
+    // before DCUtR started. Any connection beyond that -- including
+    // the remote's direct Initial, which can arrive BEFORE we observe
+    // the SYNC message on a tight local loopback -- should trigger
+    // the early-exit heuristic.
+    //
+    // Implementation note: we poll on a tight (~5ms) cadence rather
+    // than using `run_until`, because a successful remote direct-ping
+    // session can come and go in under 100ms -- the connection count
+    // is back to baseline before a slower tick would notice.
+    let mut saw_inbound_conn =
+        swarm.transport().active_connection_count() > conn_baseline;
+
+    let outcome = 'outer: loop {
         let now = Instant::now();
         if now >= punch_deadline {
             break HolePunchOutcome::Timeout;
@@ -158,28 +191,34 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
             blast_remote_addrs(&swarm, &remote_addrs, role);
             next_blast = now + HOLEPUNCH_INTERVAL;
         }
-        // Short tick window. In addition to a direct
-        // ConnectionEstablished for the remote, we also return on the
-        // bridge stream being closed by the relay -- that happens after
-        // the remote successfully goes direct and stops using the
-        // circuit, and without mutual TLS we can't detect the direct
-        // connection ourselves (see holepunch-plan.md Milestone 6).
-        let Some(ev) = swarm
-            .run_until(now + HOLEPUNCH_INTERVAL, |ev| {
-                print_event(role, ev);
-                is_direct_connection_event(ev, &remote_peer_id)
-                    || is_bridge_closed_event(ev, bridge_stream)
-            })
-            .map_err(|e| format!("holepunch poll: {e}"))?
-        else {
-            continue;
-        };
-        match ev {
-            SwarmEvent::ConnectionEstablished { peer_id } => {
-                break HolePunchOutcome::DirectConnected(peer_id);
+
+        // Drain any events the transport has for us. Event ordering
+        // within a tick matters: if we see ConnectionEstablished for
+        // the remote peer id, prefer that over the coarser count
+        // heuristic.
+        for ev in swarm.poll().map_err(|e| format!("holepunch poll: {e}"))? {
+            print_event(role, &ev);
+            if is_direct_connection_event(&ev, &remote_peer_id) {
+                if let SwarmEvent::ConnectionEstablished { peer_id } = ev {
+                    break 'outer HolePunchOutcome::DirectConnected(peer_id);
+                }
             }
-            _ => break HolePunchOutcome::BridgeClosed,
+            if is_bridge_closed_event(&ev, bridge_stream) {
+                break 'outer HolePunchOutcome::BridgeClosed;
+            }
         }
+
+        // Sticky: if we've ever seen the count above baseline, we
+        // know a direct connection arrived even if it has since been
+        // torn down (e.g. the remote finished pinging and exited).
+        if swarm.transport().active_connection_count() > conn_baseline {
+            saw_inbound_conn = true;
+        }
+        if saw_inbound_conn {
+            break HolePunchOutcome::InboundConnectionSeen;
+        }
+
+        std::thread::sleep(Duration::from_millis(5));
     };
 
     // --- 7. Resolve based on the hole-punch outcome -------------------------
@@ -187,6 +226,28 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
         HolePunchOutcome::DirectConnected(peer_id) => {
             println!("[{role}] direct-connected peer={peer_id} (hole-punch success)");
             ping_and_exit(&mut swarm, role, peer_id, deadline)
+        }
+        HolePunchOutcome::InboundConnectionSeen => {
+            // We can't ping the remote from our side (don't know their
+            // verified peer id without mTLS), and we can't detect when
+            // the remote's own ping round-trip completes either. Run
+            // the event loop for a short grace window so we stay
+            // responsive to inbound streams (including the remote's
+            // ping, which would otherwise time out waiting on our
+            // echo).
+            println!(
+                "[{role}] inbound-direct-connection detected (hole-punch success; \
+                 remote peer-id unverified pre-mTLS)"
+            );
+            let grace_deadline = Instant::now() + Duration::from_secs(2);
+            let _ = swarm
+                .run_until(grace_deadline, |ev| {
+                    print_event(role, ev);
+                    false // keep draining until the grace period elapses
+                })
+                .map_err(|e| format!("grace poll: {e}"))?;
+            println!("[{role}] grace-elapsed -- done");
+            Ok(())
         }
         HolePunchOutcome::BridgeClosed => {
             // Relay closed the circuit. Most likely the remote went
@@ -201,11 +262,12 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
         }
         HolePunchOutcome::Timeout => {
             println!("[{role}] hole-punch-timeout -> relay-ping fallback");
-            // Wait for either an echo payload from Peer A or the
-            // bridge to close (meaning A gave up). A short fallback
-            // deadline keeps the listener from hanging indefinitely
-            // if the relay GC'd the circuit while we weren't looking.
-            let fallback_deadline = Instant::now() + Duration::from_secs(5);
+            // Wait up to ~15s for either an echo payload from Peer A
+            // or the bridge to close (meaning A gave up). Longer
+            // than the hole-punch deadline because the relay's own
+            // idle-circuit GC can take several seconds -- but bounded
+            // so we don't hang forever if something goes wrong.
+            let fallback_deadline = Instant::now() + Duration::from_secs(15);
             let ev = swarm
                 .run_until(fallback_deadline, |ev| {
                     print_event(role, ev);
@@ -236,10 +298,15 @@ enum HolePunchOutcome {
     /// Saw `ConnectionEstablished` for the remote peer id (only
     /// possible once mutual TLS is implemented; see Milestone 6).
     DirectConnected(PeerId),
+    /// `transport.active_connection_count()` grew beyond the relay
+    /// baseline. Almost certainly the remote peer coming in direct.
+    /// Coarse heuristic; not suitable for security decisions but
+    /// fine for this demo binary.
+    InboundConnectionSeen,
     /// Relay closed the bridge stream -- strong signal that the
     /// remote went direct and stopped using the circuit.
     BridgeClosed,
-    /// Neither of the above happened within `HOLEPUNCH_DEADLINE`.
+    /// None of the above happened within `HOLEPUNCH_DEADLINE`.
     Timeout,
 }
 

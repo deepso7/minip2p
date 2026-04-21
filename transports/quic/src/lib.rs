@@ -657,6 +657,10 @@ impl Transport for QuicTransport {
         self.local_multiaddr().map(|addr| vec![addr]).unwrap_or_default()
     }
 
+    fn active_connection_count(&self) -> usize {
+        self.connections.len()
+    }
+
     fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
         let mut buf = [0u8; 65535];
         let mut events = std::mem::take(&mut self.pending_events);
