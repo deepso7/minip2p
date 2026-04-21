@@ -22,3 +22,4 @@ minip2p-relay = { path = "../../crates/relay" }
 minip2p-dcutr = { path = "../../crates/dcutr" }
 minip2p-multistream-select = { path = "../../crates/multistream-select" }
 minip2p-quic = { path = "../../transports/quic" }
+getrandom = "0.4"

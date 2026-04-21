@@ -23,8 +23,9 @@
 //! ```
 
 use std::collections::{HashMap, VecDeque};
+use std::str::FromStr;
 
-use minip2p_core::PeerId;
+use minip2p_core::{Multiaddr, PeerId};
 use minip2p_dcutr::{
     decode_frame as dcutr_decode_frame, DcutrInitiator, DcutrResponder, InitiatorOutcome,
     ResponderEvent,
@@ -340,11 +341,15 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
     let mut b_to_a: VecDeque<u8> = VecDeque::new();
 
     // A advertises its observed addresses; B advertises its own.
-    let a_observed = vec![b"/ip4/203.0.113.1/udp/12345/quic-v1".to_vec()];
-    let b_observed = vec![b"/ip4/198.51.100.2/udp/54321/quic-v1".to_vec()];
+    let a_observed: Vec<Multiaddr> = vec![
+        Multiaddr::from_str("/ip4/203.0.113.1/udp/12345/quic-v1").unwrap(),
+    ];
+    let b_observed: Vec<Multiaddr> = vec![
+        Multiaddr::from_str("/ip4/198.51.100.2/udp/54321/quic-v1").unwrap(),
+    ];
 
-    let mut dcutr_a = DcutrInitiator::new(a_observed.clone());
-    let mut dcutr_b = DcutrResponder::new(b_observed.clone());
+    let mut dcutr_a = DcutrInitiator::new(&a_observed);
+    let mut dcutr_b = DcutrResponder::new(&b_observed);
 
     // A sends CONNECT over the bridge.
     push_bytes(&mut a_to_b, &dcutr_a.take_outbound());
@@ -356,7 +361,8 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
     let events_b = dcutr_b.poll_events();
     assert!(matches!(
         events_b.first(),
-        Some(ResponderEvent::ConnectReceived { remote_addrs }) if *remote_addrs == a_observed
+        Some(ResponderEvent::ConnectReceived { remote_addrs, .. })
+            if *remote_addrs == a_observed
     ));
 
     // B flushes its CONNECT reply toward A.
@@ -371,6 +377,7 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
         Some(InitiatorOutcome::DialNow {
             remote_addrs,
             rtt_ms,
+            ..
         }) => {
             assert_eq!(*remote_addrs, b_observed);
             assert_eq!(*rtt_ms, simulated_rtt_ms);
@@ -429,8 +436,12 @@ fn connect_refused_when_target_not_reserved() {
 
 #[test]
 fn dcutr_rtt_is_reported_back_to_initiator() {
-    let mut a = DcutrInitiator::new(vec![b"/ip4/1.2.3.4/udp/1/quic-v1".to_vec()]);
-    let mut b = DcutrResponder::new(vec![b"/ip4/5.6.7.8/udp/2/quic-v1".to_vec()]);
+    let mut a = DcutrInitiator::new(&[
+        Multiaddr::from_str("/ip4/1.2.3.4/udp/1/quic-v1").unwrap(),
+    ]);
+    let mut b = DcutrResponder::new(&[
+        Multiaddr::from_str("/ip4/5.6.7.8/udp/2/quic-v1").unwrap(),
+    ]);
 
     let connect_from_a = a.take_outbound();
     b.on_data(&connect_from_a).unwrap();

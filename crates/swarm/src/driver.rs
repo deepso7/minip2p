@@ -26,6 +26,10 @@ pub struct Swarm<T: Transport> {
     transport: T,
     core: SwarmCore,
 
+    /// Our own `PeerId`. Cached from the [`crate::SwarmBuilder`]'s keypair
+    /// so applications don't have to drill into the transport to get it.
+    local_peer_id: PeerId,
+
     /// Auto-incrementing connection-id counter for outbound dials.
     next_connection_id: u64,
     /// Start of the logical clock. The driver tracks wall time so callers
@@ -37,11 +41,18 @@ impl<T: Transport> Swarm<T> {
     /// Creates a swarm driver around the given transport, identify config,
     /// and ping config.
     ///
-    /// Most callers should construct via `crate::SwarmBuilder` instead.
-    pub fn new(transport: T, identify_config: IdentifyConfig, ping_config: PingConfig) -> Self {
+    /// Most callers should construct via `crate::SwarmBuilder` instead,
+    /// which derives `local_peer_id` from the keypair automatically.
+    pub fn new(
+        transport: T,
+        identify_config: IdentifyConfig,
+        ping_config: PingConfig,
+        local_peer_id: PeerId,
+    ) -> Self {
         Self {
             transport,
             core: SwarmCore::new(identify_config, ping_config),
+            local_peer_id,
             next_connection_id: 1,
             start: Instant::now(),
         }
@@ -60,6 +71,15 @@ impl<T: Transport> Swarm<T> {
     /// Returns a reference to the Sans-I/O core (for advanced introspection).
     pub fn core(&self) -> &SwarmCore {
         &self.core
+    }
+
+    /// Returns this node's own `PeerId`.
+    ///
+    /// Unlike `swarm.transport().local_peer_id()` (transport-specific and
+    /// `Option`-wrapped), this accessor is infallible because the
+    /// [`crate::SwarmBuilder`] requires a keypair at construction time.
+    pub fn local_peer_id(&self) -> &PeerId {
+        &self.local_peer_id
     }
 
     /// Registers a user protocol id for inbound acceptance and outbound opens.

@@ -4,6 +4,7 @@
 //! configuration) so the common case takes a keypair and returns a ready-to-use
 //! swarm.
 
+use minip2p_core::PeerId;
 use minip2p_identify::{IdentifyConfig, IDENTIFY_PROTOCOL_ID};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_ping::{PingConfig, PING_PROTOCOL_ID};
@@ -32,6 +33,9 @@ pub struct SwarmBuilder {
     protocols: Vec<String>,
     listen_addrs: Vec<Vec<u8>>,
     public_key: Vec<u8>,
+    /// Derived once from the keypair and cached so [`Swarm::local_peer_id`]
+    /// is infallible.
+    local_peer_id: PeerId,
     ping_config: PingConfig,
 }
 
@@ -51,6 +55,7 @@ impl SwarmBuilder {
             ],
             listen_addrs: Vec::new(),
             public_key: keypair.public_key().encode_protobuf(),
+            local_peer_id: keypair.peer_id(),
             ping_config: PingConfig::default(),
         }
     }
@@ -105,7 +110,7 @@ impl SwarmBuilder {
             listen_addrs: self.listen_addrs,
             public_key: self.public_key,
         };
-        Swarm::new(transport, identify, self.ping_config)
+        Swarm::new(transport, identify, self.ping_config, self.local_peer_id)
     }
 
     /// Returns the underlying [`IdentifyConfig`] assembled from the builder.

@@ -28,8 +28,10 @@ extern crate alloc;
 
 mod message;
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+
+use minip2p_core::Multiaddr;
 
 pub use message::{
     decode_frame, encode_frame, DcutrMessageError, FrameDecode, HolePunch, HolePunchType,
@@ -69,8 +71,14 @@ pub enum InitiatorOutcome {
     /// The remote has replied with their observed addresses. The caller
     /// should immediately dial these addresses.
     DialNow {
-        /// Addresses observed by the remote (multiaddr binary).
-        remote_addrs: Vec<Vec<u8>>,
+        /// Addresses observed by the remote. Entries that fail to parse
+        /// as a valid [`Multiaddr`] are silently dropped; the raw bytes
+        /// are still available via [`InitiatorOutcome::DialNow::remote_addr_bytes`].
+        remote_addrs: Vec<Multiaddr>,
+        /// Raw observed-address bytes as received on the wire, before
+        /// parsing. Kept available so callers can surface diagnostics
+        /// about malformed entries.
+        remote_addr_bytes: Vec<Vec<u8>>,
         /// Measured relay RTT in milliseconds (wall clock between sending
         /// CONNECT and receiving the reply). Timing is the caller's
         /// responsibility; this is just the reported measurement.
@@ -112,12 +120,14 @@ enum InitiatorState {
 impl DcutrInitiator {
     /// Creates a new initiator, queuing the outbound CONNECT message.
     ///
-    /// `own_addrs` are our observed (and possibly predicted) multiaddrs
-    /// in binary form.
-    pub fn new(own_addrs: Vec<Vec<u8>>) -> Self {
+    /// `own_addrs` are our observed (and possibly predicted) multiaddrs.
+    /// They are serialized via [`Multiaddr`]'s `Display` for the wire
+    /// (see the crate-level note on binary vs string encoding).
+    pub fn new(own_addrs: &[Multiaddr]) -> Self {
+        let obs_addrs = own_addrs.iter().map(encode_multiaddr).collect();
         let msg = HolePunch {
             kind: HolePunchType::Connect,
-            obs_addrs: own_addrs,
+            obs_addrs,
         };
         let outbound = encode_frame(&msg.encode());
 
@@ -228,8 +238,10 @@ impl DcutrInitiator {
         }
 
         self.state = InitiatorState::ReadyToSync;
+        let remote_addrs = decode_remote_addrs(&reply.obs_addrs);
         self.outcome = Some(InitiatorOutcome::DialNow {
-            remote_addrs: reply.obs_addrs,
+            remote_addrs,
+            remote_addr_bytes: reply.obs_addrs,
             rtt_ms,
         });
 
@@ -248,7 +260,14 @@ pub enum ResponderEvent {
     ///
     /// We have already queued our own CONNECT reply via the constructor, but
     /// the caller now knows which addresses to NAT-punch towards.
-    ConnectReceived { remote_addrs: Vec<Vec<u8>> },
+    ConnectReceived {
+        /// Decoded remote observed addresses. Malformed entries are
+        /// dropped silently; the raw bytes remain in `remote_addr_bytes`
+        /// for diagnostics.
+        remote_addrs: Vec<Multiaddr>,
+        /// Raw bytes of the observed addresses as received on the wire.
+        remote_addr_bytes: Vec<Vec<u8>>,
+    },
     /// The initiator has sent SYNC. Per the spec, the responder should wait
     /// RTT/2 and then start sending random UDP packets to the remote's
     /// addresses to open its NAT binding.
@@ -287,9 +306,9 @@ impl DcutrResponder {
     /// `own_addrs` are the addresses we want the initiator to try dialing us
     /// on. The CONNECT reply is lazily queued once we actually receive the
     /// initiator's CONNECT.
-    pub fn new(own_addrs: Vec<Vec<u8>>) -> Self {
+    pub fn new(own_addrs: &[Multiaddr]) -> Self {
         Self {
-            own_addrs,
+            own_addrs: own_addrs.iter().map(encode_multiaddr).collect(),
             outbound: Vec::new(),
             recv_buf: Vec::new(),
             state: ResponderState::AwaitingConnect,
@@ -362,8 +381,11 @@ impl DcutrResponder {
                     };
                     self.outbound.extend(encode_frame(&reply.encode()));
 
+                    let remote_addr_bytes = msg.obs_addrs;
+                    let remote_addrs = decode_remote_addrs(&remote_addr_bytes);
                     self.events.push(ResponderEvent::ConnectReceived {
-                        remote_addrs: msg.obs_addrs,
+                        remote_addrs,
+                        remote_addr_bytes,
                     });
                     self.state = ResponderState::AwaitingSync;
                 }
@@ -395,6 +417,33 @@ fn enforce_max_size(buf: &[u8]) -> Result<(), DcutrError> {
     Ok(())
 }
 
+/// Encodes a [`Multiaddr`] for transmission in a `HolePunch` `obs_addrs`
+/// field.
+///
+/// The libp2p DCUtR spec calls for the multicodec-based binary encoding.
+/// minip2p-core does not yet implement that encoder, so we transmit the
+/// display-string form as UTF-8 bytes; two minip2p peers round-trip
+/// cleanly through this encoding and foreign libp2p peers will see the
+/// entries as opaque bytes until the binary encoder lands in core.
+fn encode_multiaddr(addr: &Multiaddr) -> Vec<u8> {
+    addr.to_string().into_bytes()
+}
+
+/// Decodes a list of raw observed-address bytes into [`Multiaddr`]
+/// values, dropping any entry that fails to parse as valid UTF-8 or
+/// a well-formed multiaddr.
+///
+/// The raw bytes remain available in the surrounding event/outcome so
+/// callers can emit diagnostics for dropped entries if they care.
+fn decode_remote_addrs(raw: &[Vec<u8>]) -> Vec<Multiaddr> {
+    raw.iter()
+        .filter_map(|bytes| {
+            let s = core::str::from_utf8(bytes).ok()?;
+            <Multiaddr as core::str::FromStr>::from_str(s).ok()
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -407,10 +456,14 @@ mod tests {
         encode_frame(&msg.encode())
     }
 
+    fn addr(s: &str) -> Multiaddr {
+        <Multiaddr as core::str::FromStr>::from_str(s).expect("test multiaddr")
+    }
+
     #[test]
     fn initiator_sends_connect_then_dials_on_reply() {
-        let own = vec![vec![0x04, 1, 2, 3, 4]];
-        let mut init = DcutrInitiator::new(own);
+        let own = [addr("/ip4/1.2.3.4/udp/1111/quic-v1")];
+        let mut init = DcutrInitiator::new(&own);
 
         // Take the initial CONNECT.
         let outbound = init.take_outbound();
@@ -419,18 +472,26 @@ mod tests {
         };
         let req = HolePunch::decode(payload).unwrap();
         assert_eq!(req.kind, HolePunchType::Connect);
+        assert_eq!(req.obs_addrs.len(), 1);
 
         // Remote replies with its own CONNECT.
-        let remote_addrs = vec![vec![0x04, 5, 6, 7, 8]];
+        let remote_str = "/ip4/5.6.7.8/udp/2222/quic-v1";
+        let remote_bytes = vec![remote_str.as_bytes().to_vec()];
         let reply = frame(HolePunch {
             kind: HolePunchType::Connect,
-            obs_addrs: remote_addrs.clone(),
+            obs_addrs: remote_bytes.clone(),
         });
         init.on_data(&reply, 42).unwrap();
 
         match init.outcome() {
-            Some(InitiatorOutcome::DialNow { remote_addrs: got, rtt_ms }) => {
-                assert_eq!(*got, remote_addrs);
+            Some(InitiatorOutcome::DialNow {
+                remote_addrs,
+                remote_addr_bytes,
+                rtt_ms,
+            }) => {
+                assert_eq!(remote_addrs.len(), 1);
+                assert_eq!(remote_addrs[0], addr(remote_str));
+                assert_eq!(*remote_addr_bytes, remote_bytes);
                 assert_eq!(*rtt_ms, 42);
             }
             other => panic!("unexpected outcome: {other:?}"),
@@ -439,7 +500,7 @@ mod tests {
 
     #[test]
     fn initiator_send_sync_after_reply() {
-        let mut init = DcutrInitiator::new(Vec::new());
+        let mut init = DcutrInitiator::new(&[]);
         let _ = init.take_outbound();
 
         let reply = frame(HolePunch {
@@ -460,7 +521,7 @@ mod tests {
 
     #[test]
     fn initiator_send_sync_before_reply_fails() {
-        let mut init = DcutrInitiator::new(Vec::new());
+        let mut init = DcutrInitiator::new(&[]);
         let _ = init.take_outbound();
 
         let err = init.send_sync().unwrap_err();
@@ -469,7 +530,7 @@ mod tests {
 
     #[test]
     fn initiator_rejects_sync_as_reply() {
-        let mut init = DcutrInitiator::new(Vec::new());
+        let mut init = DcutrInitiator::new(&[]);
         let _ = init.take_outbound();
 
         let wrong = frame(HolePunch {
@@ -482,12 +543,12 @@ mod tests {
 
     #[test]
     fn initiator_handles_fragmented_reply() {
-        let mut init = DcutrInitiator::new(Vec::new());
+        let mut init = DcutrInitiator::new(&[]);
         let _ = init.take_outbound();
 
         let reply = frame(HolePunch {
             kind: HolePunchType::Connect,
-            obs_addrs: vec![vec![0x04, 1, 2, 3, 4]],
+            obs_addrs: vec![b"/ip4/1.2.3.4/udp/1/quic-v1".to_vec()],
         });
         for byte in &reply {
             init.on_data(&[*byte], 10).unwrap();
@@ -500,33 +561,67 @@ mod tests {
     }
 
     #[test]
+    fn initiator_drops_malformed_remote_addrs_but_keeps_bytes() {
+        let mut init = DcutrInitiator::new(&[]);
+        let _ = init.take_outbound();
+
+        let reply = frame(HolePunch {
+            kind: HolePunchType::Connect,
+            obs_addrs: vec![
+                b"/ip4/1.2.3.4/udp/1/quic-v1".to_vec(), // valid
+                b"not-a-multiaddr".to_vec(),           // dropped
+                vec![0xFF, 0xFE],                      // dropped (not utf8)
+            ],
+        });
+        init.on_data(&reply, 10).unwrap();
+
+        match init.outcome() {
+            Some(InitiatorOutcome::DialNow {
+                remote_addrs,
+                remote_addr_bytes,
+                ..
+            }) => {
+                assert_eq!(remote_addrs.len(), 1);
+                assert_eq!(remote_addr_bytes.len(), 3);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn responder_replies_on_connect_then_surfaces_sync() {
-        let own_addrs = vec![vec![0x04, 10, 0, 0, 1]];
-        let mut resp = DcutrResponder::new(own_addrs.clone());
+        let own = [addr("/ip4/10.0.0.1/udp/1234/quic-v1")];
+        let mut resp = DcutrResponder::new(&own);
 
         // Feed initiator's CONNECT.
-        let remote = vec![vec![0x04, 5, 5, 5, 5]];
+        let remote_str = "/ip4/5.5.5.5/udp/7000/quic-v1";
+        let remote_bytes = vec![remote_str.as_bytes().to_vec()];
         let connect = frame(HolePunch {
             kind: HolePunchType::Connect,
-            obs_addrs: remote.clone(),
+            obs_addrs: remote_bytes.clone(),
         });
         resp.on_data(&connect).unwrap();
 
-        // Reply should be queued.
+        // Reply should be queued with our own addr (string-encoded).
         let outbound = resp.take_outbound();
         let FrameDecode::Complete { payload, .. } = decode_frame(&outbound) else {
             panic!();
         };
         let reply = HolePunch::decode(payload).unwrap();
         assert_eq!(reply.kind, HolePunchType::Connect);
-        assert_eq!(reply.obs_addrs, own_addrs);
+        assert_eq!(reply.obs_addrs, vec![own[0].to_string().into_bytes()]);
 
-        // ConnectReceived event should be queued.
+        // ConnectReceived event should surface parsed multiaddrs.
         let events = resp.poll_events();
         assert_eq!(events.len(), 1);
         match &events[0] {
-            ResponderEvent::ConnectReceived { remote_addrs } => {
-                assert_eq!(*remote_addrs, remote);
+            ResponderEvent::ConnectReceived {
+                remote_addrs,
+                remote_addr_bytes,
+            } => {
+                assert_eq!(remote_addrs.len(), 1);
+                assert_eq!(remote_addrs[0], addr(remote_str));
+                assert_eq!(*remote_addr_bytes, remote_bytes);
             }
             _ => panic!(),
         }
@@ -545,7 +640,7 @@ mod tests {
 
     #[test]
     fn responder_handles_pipelined_connect_and_sync() {
-        let mut resp = DcutrResponder::new(Vec::new());
+        let mut resp = DcutrResponder::new(&[]);
 
         // Send CONNECT and SYNC in one packet (unusual but possible).
         let mut packet = frame(HolePunch {
@@ -571,7 +666,7 @@ mod tests {
 
     #[test]
     fn responder_rejects_sync_before_connect() {
-        let mut resp = DcutrResponder::new(Vec::new());
+        let mut resp = DcutrResponder::new(&[]);
         let sync = frame(HolePunch {
             kind: HolePunchType::Sync,
             obs_addrs: Vec::new(),
@@ -582,7 +677,7 @@ mod tests {
 
     #[test]
     fn responder_rejects_duplicate_connect() {
-        let mut resp = DcutrResponder::new(Vec::new());
+        let mut resp = DcutrResponder::new(&[]);
 
         let connect = frame(HolePunch {
             kind: HolePunchType::Connect,
@@ -596,7 +691,7 @@ mod tests {
 
     #[test]
     fn rejects_oversized_message() {
-        let mut resp = DcutrResponder::new(Vec::new());
+        let mut resp = DcutrResponder::new(&[]);
         let large = vec![0u8; MAX_MESSAGE_SIZE + 1];
         let err = resp.on_data(&large).unwrap_err();
         assert!(matches!(err, DcutrError::MessageTooLarge { .. }));

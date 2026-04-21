@@ -9,6 +9,7 @@
 
 mod cli;
 mod direct;
+mod relay;
 
 use cli::{CliError, Mode};
 
@@ -35,17 +36,7 @@ fn run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
     match mode {
         Mode::DirectListen => direct::run_listen(),
         Mode::DirectDial { target } => direct::run_dial(target),
-        Mode::RelayListen { relay } => not_yet_implemented(&format!(
-            "relay listen via {relay}",
-        )),
-        Mode::RelayDial { relay, target } => not_yet_implemented(&format!(
-            "relay dial via {relay} to peer {target}",
-        )),
+        Mode::RelayListen { relay } => relay::run_listen(relay),
+        Mode::RelayDial { relay, target } => relay::run_dial(relay, target),
     }
-}
-
-fn not_yet_implemented(what: &str) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("[peer] mode '{what}' not yet implemented.");
-    eprintln!("       see holepunch-plan.md for the rollout order.");
-    std::process::exit(0);
 }
