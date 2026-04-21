@@ -35,7 +35,7 @@ impl PeerAddr {
             .ok_or(PeerAddrError::MissingPeerId)?;
 
         if last != protocols.len() - 1 {
-            return Err(PeerAddrError::NonTerminalPeerId { segment: last + 1 });
+            return Err(PeerAddrError::NonTerminalPeerId);
         }
 
         let first = protocols
@@ -44,7 +44,7 @@ impl PeerAddr {
             .ok_or(PeerAddrError::MissingPeerId)?;
 
         if first != last {
-            return Err(PeerAddrError::NonTerminalPeerId { segment: first + 1 });
+            return Err(PeerAddrError::NonTerminalPeerId);
         }
 
         let peer_id = match &protocols[last] {
@@ -127,7 +127,7 @@ mod tests {
     fn rejects_non_terminal_peer_id() {
         let input = format!("/ip4/127.0.0.1/p2p/{PEER_ID}/udp/4001/quic-v1");
         let err = PeerAddr::from_str(&input).expect_err("must fail");
-        assert!(matches!(err, PeerAddrError::NonTerminalPeerId { .. }));
+        assert!(matches!(err, PeerAddrError::NonTerminalPeerId));
     }
 
     #[test]

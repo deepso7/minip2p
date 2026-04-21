@@ -9,6 +9,7 @@ mod protocol;
 
 pub use error::{MultiaddrError, PeerAddrError};
 pub use minip2p_identity::PeerId;
+pub use minip2p_identity::{VarintError, read_uvarint, uvarint_len, write_uvarint};
 pub use multiaddr::Multiaddr;
 pub use peer_addr::PeerAddr;
 pub use protocol::Protocol;

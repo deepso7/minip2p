@@ -9,24 +9,23 @@ pub enum MultiaddrError {
     EmptyInput,
     #[error("multiaddr must start with '/' (example: /ip4/127.0.0.1/udp/4001/quic-v1)")]
     MissingLeadingSlash,
-    #[error("empty protocol segment at index {segment}")]
-    EmptyProtocol { segment: usize },
-    #[error("missing value for protocol '{protocol}' at segment {segment}")]
-    MissingValue { protocol: String, segment: usize },
-    #[error("unknown protocol '{protocol}' at segment {segment}")]
-    UnknownProtocol { protocol: String, segment: usize },
-    #[error("invalid ip4 value '{value}' at segment {segment}")]
-    InvalidIp4 { value: String, segment: usize },
-    #[error("invalid ip6 value '{value}' at segment {segment}")]
-    InvalidIp6 { value: String, segment: usize },
-    #[error("invalid udp port '{value}' at segment {segment}")]
-    InvalidPort { value: String, segment: usize },
-    #[error("invalid dns value '{value}' at segment {segment}")]
-    InvalidDnsName { value: String, segment: usize },
-    #[error("invalid peer id '{value}' at segment {segment}: {source}")]
+    #[error("empty protocol segment in multiaddr")]
+    EmptyProtocol,
+    #[error("missing value for protocol '{protocol}'")]
+    MissingValue { protocol: String },
+    #[error("unknown protocol '{protocol}'")]
+    UnknownProtocol { protocol: String },
+    #[error("invalid ip4 value '{value}'")]
+    InvalidIp4 { value: String },
+    #[error("invalid ip6 value '{value}'")]
+    InvalidIp6 { value: String },
+    #[error("invalid udp port '{value}'")]
+    InvalidPort { value: String },
+    #[error("invalid dns value '{value}'")]
+    InvalidDnsName { value: String },
+    #[error("invalid peer id '{value}': {source}")]
     InvalidPeerId {
         value: String,
-        segment: usize,
         #[source]
         source: PeerIdError,
     },
@@ -38,8 +37,8 @@ pub enum PeerAddrError {
     Multiaddr(#[from] MultiaddrError),
     #[error("peer address must end with /p2p/<peer-id>")]
     MissingPeerId,
-    #[error("peer id protocol must be terminal (found at segment {segment})")]
-    NonTerminalPeerId { segment: usize },
+    #[error("peer id protocol must be terminal")]
+    NonTerminalPeerId,
     #[error("transport address must not already contain /p2p")]
     TransportContainsPeerId,
     #[error("transport address must contain at least one protocol before /p2p/<peer-id>")]

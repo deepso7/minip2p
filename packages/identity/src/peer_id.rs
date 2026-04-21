@@ -198,7 +198,7 @@ pub enum VarintError {
     NonCanonical,
 }
 
-pub(crate) fn uvarint_len(mut value: u64) -> usize {
+pub fn uvarint_len(mut value: u64) -> usize {
     let mut len = 1;
     while value >= 0x80 {
         value >>= 7;
@@ -208,7 +208,7 @@ pub(crate) fn uvarint_len(mut value: u64) -> usize {
 }
 
 /// Writes minimally-encoded unsigned varint bytes.
-pub(crate) fn write_uvarint(mut value: u64, out: &mut Vec<u8>) {
+pub fn write_uvarint(mut value: u64, out: &mut Vec<u8>) {
     loop {
         let mut byte = (value & 0x7f) as u8;
         value >>= 7;
@@ -223,7 +223,7 @@ pub(crate) fn write_uvarint(mut value: u64, out: &mut Vec<u8>) {
 }
 
 /// Reads an unsigned varint and enforces canonical (minimal) encoding.
-pub(crate) fn read_uvarint(input: &[u8]) -> Result<(u64, usize), VarintError> {
+pub fn read_uvarint(input: &[u8]) -> Result<(u64, usize), VarintError> {
     let mut value = 0u64;
     let mut shift = 0u32;
 

@@ -392,6 +392,10 @@ dependencies = [
 [[package]]
 name = "minip2p-multistream-select"
 version = "0.1.0"
+dependencies = [
+ "minip2p-core",
+ "thiserror",
+]
 
 [[package]]
 name = "minip2p-ping"

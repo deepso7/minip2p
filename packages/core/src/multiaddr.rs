@@ -143,7 +143,7 @@ fn parse_multiaddr(input: &str) -> Result<Multiaddr, MultiaddrError> {
     while idx < segments.len() {
         let protocol = segments[idx];
         if protocol.is_empty() {
-            return Err(MultiaddrError::EmptyProtocol { segment: idx });
+            return Err(MultiaddrError::EmptyProtocol);
         }
 
         match protocol {
@@ -151,7 +151,6 @@ fn parse_multiaddr(input: &str) -> Result<Multiaddr, MultiaddrError> {
                 let value = require_value(&segments, idx, "ip4")?;
                 let parsed = parse_ip4(value).ok_or_else(|| MultiaddrError::InvalidIp4 {
                     value: value.to_string(),
-                    segment: idx + 1,
                 })?;
                 protocols.push(Protocol::Ip4(parsed));
                 idx += 2;
@@ -162,7 +161,6 @@ fn parse_multiaddr(input: &str) -> Result<Multiaddr, MultiaddrError> {
                     .parse::<Ipv6Addr>()
                     .map_err(|_| MultiaddrError::InvalidIp6 {
                         value: value.to_string(),
-                        segment: idx + 1,
                     })?
                     .octets();
                 protocols.push(Protocol::Ip6(parsed));
@@ -173,7 +171,6 @@ fn parse_multiaddr(input: &str) -> Result<Multiaddr, MultiaddrError> {
                 if !is_valid_dns(value) {
                     return Err(MultiaddrError::InvalidDnsName {
                         value: value.to_string(),
-                        segment: idx + 1,
                     });
                 }
 
@@ -192,7 +189,6 @@ fn parse_multiaddr(input: &str) -> Result<Multiaddr, MultiaddrError> {
                     .parse::<u16>()
                     .map_err(|_| MultiaddrError::InvalidPort {
                         value: value.to_string(),
-                        segment: idx + 1,
                     })?;
                 protocols.push(Protocol::Udp(parsed));
                 idx += 2;
@@ -208,7 +204,6 @@ fn parse_multiaddr(input: &str) -> Result<Multiaddr, MultiaddrError> {
                         .parse::<PeerId>()
                         .map_err(|source| MultiaddrError::InvalidPeerId {
                             value: value.to_string(),
-                            segment: idx + 1,
                             source,
                         })?;
                 protocols.push(Protocol::P2p(parsed));
@@ -217,7 +212,6 @@ fn parse_multiaddr(input: &str) -> Result<Multiaddr, MultiaddrError> {
             _ => {
                 return Err(MultiaddrError::UnknownProtocol {
                     protocol: protocol.to_string(),
-                    segment: idx,
                 });
             }
         }
@@ -235,7 +229,6 @@ fn require_value<'a>(
         Some(value) if !value.is_empty() => Ok(value),
         _ => Err(MultiaddrError::MissingValue {
             protocol: protocol.to_string(),
-            segment: idx,
         }),
     }
 }
