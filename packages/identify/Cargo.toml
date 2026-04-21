@@ -2,7 +2,6 @@
 name = "minip2p-identify"
 version = "0.1.0"
 edition = "2024"
-readme = "README.md"
 
 [features]
 default = ["std"]

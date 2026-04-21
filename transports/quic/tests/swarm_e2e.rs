@@ -174,3 +174,70 @@ fn swarm_user_protocol_round_trip() {
 
     assert_eq!(echo_received.as_deref(), Some(payload.as_slice()));
 }
+
+/// Regression test: calling `ping()` repeatedly before the ping stream has
+/// finished multistream-select must not open duplicate streams or surface
+/// "outbound ping stream already exists" errors.
+#[test]
+fn rapid_ping_calls_do_not_open_duplicate_streams() {
+    let mut server = make_swarm(Ed25519Keypair::generate());
+    server
+        .transport_mut()
+        .listen_on_bound_addr()
+        .expect("server listen");
+    let peer_addr = server.transport().local_peer_addr().expect("peer addr");
+    let server_peer_id = peer_addr.peer_id().clone();
+
+    let mut client = make_swarm(Ed25519Keypair::generate());
+    client.dial(&peer_addr).expect("dial");
+
+    let mut client_identified = false;
+    let mut ping_bursts_fired = false;
+    let mut rtt_measured = false;
+    let mut saw_register_error = false;
+
+    for _ in 0..500 {
+        let (_server_events, client_events) = drive_pair(&mut server, &mut client);
+
+        for event in client_events {
+            match event {
+                SwarmEvent::IdentifyReceived { ref peer_id, .. }
+                    if *peer_id == server_peer_id =>
+                {
+                    client_identified = true;
+                }
+                SwarmEvent::PingRttMeasured { ref peer_id, .. } => {
+                    assert_eq!(peer_id, &server_peer_id);
+                    rtt_measured = true;
+                }
+                SwarmEvent::Error { ref message } => {
+                    if message.contains("ping register error") {
+                        saw_register_error = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Once identified, fire three ping() calls back-to-back before the
+        // stream has a chance to negotiate. With the bug, this would open
+        // three outbound streams and trigger "OutboundStreamExists" errors
+        // on the second and third.
+        if client_identified && !ping_bursts_fired {
+            client.ping(&server_peer_id).expect("first ping");
+            client.ping(&server_peer_id).expect("second ping");
+            client.ping(&server_peer_id).expect("third ping");
+            ping_bursts_fired = true;
+        }
+
+        if rtt_measured {
+            break;
+        }
+    }
+
+    assert!(rtt_measured, "at least one ping RTT should be measured");
+    assert!(
+        !saw_register_error,
+        "rapid ping() calls must not emit ping-register errors"
+    );
+}

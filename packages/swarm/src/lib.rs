@@ -266,15 +266,17 @@ impl<T: Transport> Swarm<T> {
     /// Pings a peer, sending a random 32-byte payload and measuring RTT.
     ///
     /// If no ping stream exists yet, one is opened and the ping is queued
-    /// to fire as soon as multistream-select completes. The resulting RTT
-    /// is delivered via [`SwarmEvent::PingRttMeasured`].
+    /// to fire as soon as multistream-select completes. If a ping stream is
+    /// still in the middle of negotiating, the queued payload is updated in
+    /// place -- no duplicate stream is opened. The resulting RTT is
+    /// delivered via [`SwarmEvent::PingRttMeasured`].
     ///
     /// Returns an error if the peer is not currently connected.
     pub fn ping(&mut self, peer_id: &PeerId) -> Result<(), TransportError> {
         let payload: [u8; PING_PAYLOAD_LEN] = rand_ping_payload();
 
-        // If a ping stream is already negotiated, send right away.
-        if let Some(stream_id) = self.find_negotiated_ping_stream(peer_id) {
+        // Case 1: a ping stream is already negotiated -- send right away.
+        if self.find_negotiated_ping_stream(peer_id).is_some() {
             let now = self.now_ms();
             let action = self.ping.send_ping(peer_id, &payload, now).map_err(|e| {
                 TransportError::PollError {
@@ -282,12 +284,19 @@ impl<T: Transport> Swarm<T> {
                 }
             })?;
             self.execute_ping_action(action);
-            let _ = stream_id;
             return Ok(());
         }
 
-        // Otherwise open a ping stream and remember to send the payload once
-        // the stream is ready.
+        // Case 2: a ping stream is still negotiating. Just update the queued
+        // payload; it will fire when the stream becomes ready. Opening a
+        // second stream would create an orphan that PingProtocol refuses to
+        // register (one outbound stream per peer) and leak in stream_owner.
+        if self.has_pending_ping_stream(peer_id) {
+            self.pending_pings.insert(peer_id.clone(), payload);
+            return Ok(());
+        }
+
+        // Case 3: no stream yet -- open one and queue the payload.
         self.pending_pings.insert(peer_id.clone(), payload);
         let _ = self.open_protocol_stream(peer_id, PING_PROTOCOL_ID, ProtocolId::Ping)?;
         Ok(())
@@ -305,6 +314,19 @@ impl<T: Transport> Swarm<T> {
                 } else {
                     None
                 }
+            })
+    }
+
+    /// Returns `true` if a ping stream for the given peer is currently in the
+    /// middle of multistream-select negotiation.
+    fn has_pending_ping_stream(&self, peer_id: &PeerId) -> bool {
+        let Some(&conn) = self.peer_to_conn.get(peer_id) else {
+            return false;
+        };
+        self.outbound_negotiators
+            .iter()
+            .any(|((c, _), pending)| {
+                *c == conn && matches!(pending.target_protocol, ProtocolId::Ping)
             })
     }
 
@@ -446,12 +468,16 @@ impl<T: Transport> Swarm<T> {
                 if let Some(peer_id) = endpoint.peer_id() {
                     self.register_connection(id, peer_id.clone());
                 } else {
-                    // Connection established but peer identity unknown (e.g. server
-                    // side with verify_peer(false)). Create a synthetic PeerId so
-                    // protocol handlers can still operate.
-                    let peer_id = self.ensure_peer_id_for_conn(id);
-                    self.events
-                        .push(SwarmEvent::ConnectionEstablished { peer_id });
+                    // Peer identity is not yet known (e.g. server side with
+                    // verify_peer(false)). Create a synthetic PeerId for
+                    // internal bookkeeping so protocol handlers can still
+                    // operate, but do NOT emit ConnectionEstablished yet --
+                    // the application only cares about verified identities.
+                    // A real ConnectionEstablished fires later from
+                    // upgrade_connection_identity when PeerIdentityVerified
+                    // arrives (or when the application learns the real peer
+                    // id through Identify).
+                    let _ = self.ensure_peer_id_for_conn(id);
                 }
             }
             TransportEvent::PeerIdentityVerified { id, endpoint, .. } => {
@@ -502,6 +528,19 @@ impl<T: Transport> Swarm<T> {
 
     fn register_connection(&mut self, id: ConnectionId, peer_id: PeerId) {
         let is_new = !self.conn_to_peer.contains_key(&id);
+
+        // If a different connection to the same peer already exists, close
+        // it out explicitly. The swarm tracks one connection per peer (via
+        // `peer_to_conn: BTreeMap<PeerId, ConnectionId>`), so silently
+        // overwriting would orphan the old connection's state in
+        // `conn_to_peer` and break peer-keyed operations. Last connection
+        // wins; the old one is closed at the transport level.
+        if let Some(&existing_id) = self.peer_to_conn.get(&peer_id) {
+            if existing_id != id {
+                self.supersede_connection(existing_id, &peer_id);
+            }
+        }
+
         self.conn_to_peer.insert(id, peer_id.clone());
         self.peer_to_conn.insert(peer_id.clone(), id);
 
@@ -520,6 +559,35 @@ impl<T: Transport> Swarm<T> {
                 });
             }
         }
+    }
+
+    /// Closes an older connection that is being replaced by a newer one to
+    /// the same peer.
+    ///
+    /// Drops the old connection's swarm-side tracking (`conn_to_peer`,
+    /// `active_connections`, per-stream maps) and asks the transport to
+    /// close the underlying connection. Per-peer protocol state (ping,
+    /// identify, pending pings) is left untouched -- it will continue to
+    /// be used by the new connection.
+    fn supersede_connection(&mut self, old_id: ConnectionId, peer_id: &PeerId) {
+        self.conn_to_peer.remove(&old_id);
+        self.active_connections.remove(&old_id);
+        self.stream_owner.retain(|(cid, _), _| *cid != old_id);
+        self.inbound_negotiators
+            .retain(|(cid, _), _| *cid != old_id);
+        self.outbound_negotiators
+            .retain(|(cid, _), _| *cid != old_id);
+
+        // Best-effort transport close; we don't propagate the error since
+        // the new connection is already usable.
+        let _ = self.transport.close(old_id);
+
+        // Note: we intentionally do not emit ConnectionClosed here. The
+        // application sees one ConnectionEstablished for the peer followed
+        // by at most one ConnectionClosed when the last connection for this
+        // peer goes away. Emitting ConnectionClosed right before
+        // ConnectionEstablished for the same peer would be confusing.
+        let _ = peer_id;
     }
 
     /// Rebinds a connection from a placeholder (synthetic) peer id to a real
@@ -753,12 +821,22 @@ impl<T: Transport> Swarm<T> {
         self.active_connections.remove(&conn_id);
 
         if let Some(peer_id) = self.conn_to_peer.remove(&conn_id) {
-            self.peer_to_conn.remove(&peer_id);
-            self.ping.remove_peer(&peer_id);
-            self.identify.remove_peer(&peer_id);
-            self.pending_pings.remove(&peer_id);
-            self.events
-                .push(SwarmEvent::ConnectionClosed { peer_id });
+            // Only purge per-peer protocol state if this connection was
+            // still the active one for `peer_id`. If a newer connection
+            // superseded it (see `supersede_connection`), the active
+            // connection is something else and its state must survive.
+            let was_active = self.peer_to_conn.get(&peer_id) == Some(&conn_id);
+            if was_active {
+                self.peer_to_conn.remove(&peer_id);
+                self.ping.remove_peer(&peer_id);
+                self.identify.remove_peer(&peer_id);
+                self.pending_pings.remove(&peer_id);
+                self.events
+                    .push(SwarmEvent::ConnectionClosed { peer_id });
+            }
+            // Superseded connections close silently -- the application was
+            // never told about them as a separate peer session, so there's
+            // nothing to announce.
         }
 
         // Clean up all stream state for this connection.
@@ -982,9 +1060,17 @@ impl<T: Transport> Swarm<T> {
                     .ping
                     .register_outbound_stream(peer_id.clone(), stream_id)
                 {
+                    // The ping protocol refused the stream (e.g. another
+                    // outbound ping stream already exists for this peer).
+                    // Don't leave an orphan in stream_owner; reset the
+                    // stream and surface the error so the queued payload is
+                    // still delivered through the already-registered stream.
                     self.events.push(SwarmEvent::Error {
                         message: format!("ping register error: {e}"),
                     });
+                    self.stream_owner.remove(&(conn_id, stream_id));
+                    let _ = self.transport.reset_stream(conn_id, stream_id);
+                    return;
                 }
 
                 // If the app called `swarm.ping(&peer)` before the stream
