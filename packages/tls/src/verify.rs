@@ -89,6 +89,13 @@ fn verify_self_signature(cert_der: &[u8], cert: &Certificate) -> Result<(), TlsE
         )));
     }
 
+    // RFC 5280 Section 4.1.1.2: the outer signatureAlgorithm and the TBS
+    // signature field MUST be identical.
+    let tbs_sig_oid = cert.tbs_certificate().signature().oid;
+    if tbs_sig_oid != sig_alg_oid {
+        return Err(TlsError::InvalidSelfSignature);
+    }
+
     // Extract the raw TBS DER bytes from the original certificate encoding.
     let tbs_der = extract_tbs_der(cert_der)?;
 
