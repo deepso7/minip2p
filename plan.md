@@ -18,7 +18,12 @@ Implemented crates:
 - `packages/core` (`minip2p-core`)
 - `packages/multistream-select` (`minip2p-multistream-select`)
 - `packages/ping` (`minip2p-ping`)
+- `packages/identify` (`minip2p-identify`)
+- `packages/relay` (`minip2p-relay`)
+- `packages/dcutr` (`minip2p-dcutr`)
 - `packages/transport` (`minip2p-transport`)
+- `packages/tls` (`minip2p-tls`)
+- `packages/swarm` (`minip2p-swarm`) -- see "Runtime adapters" below
 - `transports/quic` (`minip2p-quic`)
 
 Current validated capabilities:
@@ -34,23 +39,52 @@ Current validated capabilities:
 
 ## Architecture Boundaries
 
-### Core (`no_std + alloc`)
+### Core (`no_std + alloc`, Sans-I/O)
+
+Pure state machines. No sockets, no async runtime, no wall-clock reads.
+Callers pump events and bytes in; the crate emits actions/events out.
 
 - `packages/identity`: peer identity primitives.
 - `packages/core`: transport-agnostic address and shared types.
-- `packages/transport`: transport contract, shared connection/event/error types.
+- `packages/transport`: transport contract, shared connection/event/error types (trait + data types only; concrete impls are adapters).
 - `packages/tls`: libp2p TLS certificate generation and peer verification. Transport-agnostic.
+- `packages/multistream-select`: `/multistream/1.0.0` negotiation state machine.
+- `packages/ping`: `/ipfs/ping/1.0.0` state machine.
+- `packages/identify`: `/ipfs/id/1.0.0` state machine.
+- `packages/relay`: Circuit Relay v2 client state machines (`HopReservation`, `HopConnect`, `StopResponder`).
+- `packages/dcutr`: DCUtR hole-punch coordination state machines (`DcutrInitiator`, `DcutrResponder`).
+- `packages/swarm` (core): `SwarmCore` -- Sans-I/O orchestration state machine. Composes the protocol state machines, tracks connections and streams, drives multistream-select for inbound and outbound streams, emits `SwarmAction` for the driver to execute and `SwarmEvent` for the application.
 
 ### Runtime adapters (`std`)
 
-- `transports/quic`: QUIC implementation and DX-oriented runtime integration.
-- Future `transports/tcp`, `transports/ws`, `transports/webrtc` follow the same separation.
+Concrete I/O, real clocks, async-friendly orchestration. Consumed by
+applications.
+
+- `transports/quic`: QUIC implementation over a non-blocking UDP socket.
+- `packages/swarm` (driver only): thin `std` wrapper around `SwarmCore`
+  that owns a concrete `Transport`, reads the wall clock, and preserves
+  the one-call DX (`swarm.dial`, `swarm.ping`, `swarm.open_user_stream`).
+  The actual orchestration logic lives in `packages/swarm`'s Sans-I/O
+  core (see above).
+- Future `transports/tcp`, `transports/ws`, `transports/webrtc` follow
+  the same pattern.
 
 ### Ownership rules
 
-- Runtime concerns (UDP/TCP sockets, DNS resolution, timers) belong in adapter crates.
-- Transport-specific address validation belongs in adapters, not in `packages/core`.
+- Runtime concerns (UDP/TCP sockets, DNS resolution, timers, wall clock)
+  belong in adapter crates.
+- Transport-specific address validation belongs in adapters, not in
+  `packages/core`.
 - Shared crates define generic contracts and common semantics only.
+- Protocol state machines (`ping`, `identify`, `relay`, `dcutr`,
+  `multistream-select`) stay Sans-I/O -- they must never grow a `Transport`
+  dependency or a clock.
+
+### Pending architectural work
+
+Tracked concretely under the roadmap milestones; see Milestone 6
+(mutual TLS on the QUIC transport) for the remaining architectural
+cleanup item.
 
 ## DX Principles
 
@@ -105,35 +139,46 @@ New crate: `packages/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 - Two QUIC peers connect and the dialer automatically knows the listener's PeerId without manual verification.
 - Spec test vectors pass (Ed25519 full verification; ECDSA/secp256k1 parsing + PeerId extraction).
 
-### Milestone 3: Identify protocol
+### Milestone 3: Identify protocol -- DONE
 
-- Add `packages/identify` for `/ipfs/id/1.0.0`.
-- Peers exchange supported protocols, observed addresses, agent version after connecting.
-- Required foundation for relay and hole punch (peers need to know each other's addresses).
-
-**Exit criteria**
-- After connecting, both peers learn each other's supported protocols and observed address.
-
-### Milestone 4: Swarm and connection management
-
-- Introduce a swarm layer that orchestrates connections, protocol negotiation, and address tracking.
-- Handle "connect to peer X" by picking transport, negotiating protocols, managing lifecycle.
-- Required before relay (relay needs to manage multiple connections per peer).
+- [x] Add `packages/identify` for `/ipfs/id/1.0.0`.
+- [x] Peers exchange supported protocols, observed addresses, agent version after connecting.
+- [x] Required foundation for relay and hole punch (peers need to know each other's addresses).
 
 **Exit criteria**
-- A swarm connects two peers, negotiates protocols, and runs ping without manual wiring.
+- After connecting, both peers learn each other's supported protocols and observed address. Auto-run by the swarm on every new connection.
 
-### Milestone 5: Relay and NAT traversal
+### Milestone 4: Swarm and connection management -- DONE
 
-- Add relay protocol: peers connect through a public relay server.
-- Add STUN client for public address discovery.
-- Add DCUtR / hole punch: attempt direct UDP connection, fall back to relay.
-- Relay server binary.
+- [x] Introduce a swarm layer that orchestrates connections, protocol negotiation, and address tracking.
+- [x] Handle "connect to peer X" by picking transport, negotiating protocols, managing lifecycle.
+- [x] Generic user-protocol hook: `add_user_protocol` + `open_user_stream` + `UserStream*` events so relay and DCUtR can ride on top without baking them into the core.
+- [x] DX: `SwarmBuilder`, auto-allocated connection ids, internal clock, one-call `swarm.ping(peer)`.
+- [x] Sans-I/O `SwarmCore` + `std` `Swarm<T: Transport>` driver split so core logic is `no_std + alloc` and portable.
 
 **Exit criteria**
-- Two peers behind NAT can ping each other via relay, with hole punch attempted for direct path.
+- A swarm connects two peers, negotiates protocols, and runs ping without manual wiring. [done]
+- `cargo check --no-default-features -p minip2p-swarm` succeeds.
 
-### Milestone 6: Additional transports and operational polish
+### Milestone 5: Relay client and DCUtR state machines -- DONE (demo pending)
+
+- [x] `packages/relay`: Circuit Relay v2 client state machines (HopReservation, HopConnect, StopResponder), `no_std + alloc`.
+- [x] `packages/dcutr`: DCUtR hole-punch coordination state machines (Initiator, Responder), `no_std + alloc`.
+- [x] Pure-state-machine integration test covering the full RESERVE + CONNECT + STOP + DCUtR flow with an in-memory relay emulator.
+- [ ] CLI binary `examples/peer` exercising the full stack against a real relay (local rust-libp2p for first iteration, VM-hosted relay later). See `holepunch-plan.md`.
+
+**Exit criteria**
+- Two minip2p peers connect via a real relay server, negotiate DCUtR, attempt hole punch, and succeed (direct ping) or fall back to relay ping.
+- Deferred (larger scope): STUN client for address discovery, relay server binary, production-grade refusal handling.
+
+### Milestone 6: Architectural cleanup
+
+- [ ] Mutual TLS on the QUIC transport so the listener side learns the real client PeerId without the synthetic-placeholder dance. Requires either `quiche`'s `boringssl-boring-crate` feature with a custom verify callback, or an upstream change.
+
+**Exit criteria**
+- `TransportEvent::PeerIdentityVerified` fires on the server side of a mutual-TLS QUIC handshake; the synthetic PeerId path in Swarm is exercised only as a fallback, not as the default.
+
+### Milestone 7: Additional transports and operational polish
 
 - TCP + TLS transport adapter (reuses `minip2p-tls`).
 - WebSocket transport adapter.

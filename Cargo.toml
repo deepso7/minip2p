@@ -2,9 +2,13 @@
 resolver = "3"
 members = [
     "packages/core",
+    "packages/dcutr",
+    "packages/identify",
     "packages/identity",
     "packages/multistream-select",
     "packages/ping",
+    "packages/relay",
+    "packages/swarm",
     "packages/tls",
     "packages/transport",
     "transports/quic",

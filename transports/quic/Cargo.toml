@@ -15,3 +15,6 @@ tempfile = "3"
 [dev-dependencies]
 minip2p-multistream-select = { path = "../../packages/multistream-select" }
 minip2p-ping = { path = "../../packages/ping" }
+minip2p-identify = { path = "../../packages/identify" }
+minip2p-swarm = { path = "../../packages/swarm" }
+minip2p-identity = { path = "../../packages/identity" }

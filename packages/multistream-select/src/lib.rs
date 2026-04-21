@@ -9,6 +9,7 @@ extern crate alloc;
 
 use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 use minip2p_core::{read_uvarint, uvarint_len, write_uvarint, VarintError};
 use thiserror::Error;
@@ -117,6 +118,22 @@ impl MultistreamSelect {
         vec![MultistreamOutput::OutboundData(encode_message(
             MULTISTREAM_PROTOCOL_ID,
         ))]
+    }
+
+    /// Returns `true` if negotiation has completed (successfully or with an error).
+    pub fn is_done(&self) -> bool {
+        self.state == State::Done
+    }
+
+    /// Drains and returns any buffered bytes received after negotiation finished.
+    ///
+    /// If the remote pipelines protocol data into the same network packet that
+    /// completes the multistream-select handshake, those extra bytes remain in
+    /// the internal receive buffer. After detecting [`MultistreamOutput::Negotiated`],
+    /// callers should drain these bytes and hand them to the negotiated
+    /// protocol handler.
+    pub fn take_remaining_buffer(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.recv_buf)
     }
 
     /// Feeds received bytes into the state machine and returns any outputs.

@@ -542,6 +542,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "minip2p-dcutr"
+version = "0.1.0"
+dependencies = [
+ "minip2p-core",
+ "thiserror",
+]
+
+[[package]]
+name = "minip2p-identify"
+version = "0.1.0"
+dependencies = [
+ "minip2p-core",
+ "minip2p-transport",
+ "thiserror",
+]
+
+[[package]]
 name = "minip2p-identity"
 version = "0.1.0"
 dependencies = [
@@ -575,13 +592,39 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.4.2",
  "minip2p-core",
+ "minip2p-identify",
  "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-ping",
+ "minip2p-swarm",
  "minip2p-tls",
  "minip2p-transport",
  "quiche",
  "tempfile",
+]
+
+[[package]]
+name = "minip2p-relay"
+version = "0.1.0"
+dependencies = [
+ "minip2p-core",
+ "thiserror",
+]
+
+[[package]]
+name = "minip2p-swarm"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.2",
+ "minip2p-core",
+ "minip2p-dcutr",
+ "minip2p-identify",
+ "minip2p-identity",
+ "minip2p-multistream-select",
+ "minip2p-ping",
+ "minip2p-relay",
+ "minip2p-transport",
+ "thiserror",
 ]
 
 [[package]]

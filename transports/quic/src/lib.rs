@@ -327,6 +327,29 @@ impl QuicTransport {
             })
     }
 
+    /// Sends a raw UDP packet to the given multiaddr, bypassing QUIC.
+    ///
+    /// This is intended for NAT hole-punch signaling (e.g. DCUtR), where a
+    /// peer needs to send stray UDP bytes to open a NAT binding for inbound
+    /// QUIC packets from a remote peer.
+    ///
+    /// The multiaddr must be of the form `/ip4|ip6|dns*/udp/<port>/quic-v1`.
+    /// DNS names are resolved synchronously.
+    pub fn send_raw_udp(&self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
+        let addr = resolve_dial_socket_addr(target, "raw udp target")?;
+        self.socket
+            .send_to(payload, addr)
+            .map_err(|e| TransportError::PollError {
+                reason: format!("raw udp send to {addr} failed: {e}"),
+            })?;
+        Ok(())
+    }
+
+    /// Exposes the bound local socket address as a multiaddr for external use.
+    pub fn local_multiaddr(&self) -> Result<Multiaddr, TransportError> {
+        Ok(socket_addr_to_multiaddr(self.local_addr()?))
+    }
+
     /// Returns this node's `PeerId`, derived from the configured keypair.
     ///
     /// Returns `None` if no keypair was configured.

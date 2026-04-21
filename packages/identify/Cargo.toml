@@ -1,0 +1,17 @@
+[package]
+name = "minip2p-identify"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["std"]
+std = [
+    "minip2p-core/std",
+    "minip2p-transport/std",
+    "thiserror/std",
+]
+
+[dependencies]
+minip2p-core = { path = "../core", default-features = false }
+minip2p-transport = { path = "../transport", default-features = false }
+thiserror = { version = "2", default-features = false }
