@@ -15,9 +15,14 @@ use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 use crate::core::SwarmCore;
 use crate::events::{SwarmAction, SwarmError, SwarmEvent};
 
-/// Sleep cadence when [`Swarm::poll_next`] idles. Chosen to match the
-/// polling cadence used by existing integration tests.
-const POLL_IDLE_SLEEP: Duration = Duration::from_millis(5);
+/// Sleep cadence when [`Swarm::poll_next`] idles.
+///
+/// 1ms is short enough that single-digit-millisecond RTTs are
+/// observable on loopback (two wakeups bound RTT, so ~2ms floor)
+/// without noticeably burning CPU on idle. The transport's `poll()` is
+/// a non-blocking `recvfrom` that returns `WouldBlock` immediately
+/// when there's no data, so the hot loop is cheap.
+const POLL_IDLE_SLEEP: Duration = Duration::from_millis(1);
 
 /// Thin std driver wrapping [`SwarmCore`] and a concrete [`Transport`].
 ///
