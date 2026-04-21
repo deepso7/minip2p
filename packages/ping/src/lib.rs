@@ -233,7 +233,11 @@ impl PingProtocol {
             });
         }
 
-        let peer = self.peers.entry(peer_id.clone()).or_default();
+        let peer = self.peers.get_mut(peer_id).ok_or_else(|| {
+            PingError::OutboundStreamMissing {
+                peer_id: peer_id.clone(),
+            }
+        })?;
         let stream_id = peer
             .outbound_stream
             .ok_or_else(|| PingError::OutboundStreamMissing {
@@ -266,7 +270,11 @@ impl PingProtocol {
         &mut self,
         peer_id: &PeerId,
     ) -> Result<PingAction, PingError> {
-        let peer = self.peers.entry(peer_id.clone()).or_default();
+        let peer = self.peers.get_mut(peer_id).ok_or_else(|| {
+            PingError::OutboundStreamMissing {
+                peer_id: peer_id.clone(),
+            }
+        })?;
         let stream_id = peer
             .outbound_stream
             .ok_or_else(|| PingError::OutboundStreamMissing {
@@ -318,9 +326,9 @@ impl PingProtocol {
         let buf_len = self.peers[peer_id].recv_bufs[&stream_id].len();
 
         if buf_len > PING_PAYLOAD_LEN {
-            self.peers
-                .get_mut(peer_id)
-                .map(|p| p.recv_bufs.remove(&stream_id));
+            if let Some(p) = self.peers.get_mut(peer_id) {
+                p.recv_bufs.remove(&stream_id);
+            }
             return self.protocol_violation(
                 peer_id,
                 stream_id,
@@ -399,7 +407,9 @@ impl PingProtocol {
         peer_id: &PeerId,
         stream_id: StreamId,
     ) -> Vec<PingAction> {
-        let peer = self.peers.entry(peer_id.clone()).or_default();
+        let Some(peer) = self.peers.get_mut(peer_id) else {
+            return Vec::new();
+        };
 
         if peer.inbound_streams.remove(&stream_id) {
             peer.recv_bufs.remove(&stream_id);
@@ -408,6 +418,10 @@ impl PingProtocol {
 
         if peer.outbound_stream == Some(stream_id) {
             if peer.pending_ping.is_some() {
+                // Clear stale state before emitting the violation.
+                peer.pending_ping = None;
+                peer.outbound_stream = None;
+                peer.recv_bufs.remove(&stream_id);
                 return self.protocol_violation(
                     peer_id,
                     stream_id,

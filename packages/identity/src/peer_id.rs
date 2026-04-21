@@ -199,8 +199,6 @@ pub enum PeerIdError {
     InvalidCidMulticodecVarint(VarintError),
     #[error("invalid multihash: {0}")]
     InvalidMultihash(String),
-    #[error("invalid varint: {0}")]
-    Varint(VarintError),
 }
 
 /// Errors from unsigned varint decoding.
