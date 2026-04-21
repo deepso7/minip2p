@@ -13,21 +13,21 @@ The project is built around four non-negotiables:
 
 Sans-I/O core crates (`no_std + alloc`):
 
-- `packages/identity` (`minip2p-identity`): peer identity primitives, Ed25519 keys, varint helpers.
-- `packages/core` (`minip2p-core`): transport-agnostic types (`Multiaddr`, `PeerAddr`, `Protocol`, `PeerId` re-export).
-- `packages/transport` (`minip2p-transport`): transport contract, shared lifecycle types (trait + data types only).
-- `packages/tls` (`minip2p-tls`): libp2p TLS certificate generation and peer verification, transport-agnostic.
-- `packages/multistream-select` (`minip2p-multistream-select`): `/multistream/1.0.0` negotiation state machine.
-- `packages/ping` (`minip2p-ping`): `/ipfs/ping/1.0.0` state machine with RTT measurement.
-- `packages/identify` (`minip2p-identify`): `/ipfs/id/1.0.0` state machine for protocol and address exchange.
-- `packages/relay` (`minip2p-relay`): Circuit Relay v2 *client-side* state machines (`HopReservation`, `HopConnect`, `StopResponder`).
-- `packages/dcutr` (`minip2p-dcutr`): DCUtR hole-punch coordination state machines (`DcutrInitiator`, `DcutrResponder`).
-- `packages/swarm` (`minip2p-swarm`): `SwarmCore` Sans-I/O orchestrator that composes the protocol state machines, tracks connections and streams, drives multistream-select, and emits actions/events for the driver.
+- `crates/identity` (`minip2p-identity`): peer identity primitives, Ed25519 keys, varint helpers.
+- `crates/core` (`minip2p-core`): transport-agnostic types (`Multiaddr`, `PeerAddr`, `Protocol`, `PeerId` re-export).
+- `crates/transport` (`minip2p-transport`): transport contract, shared lifecycle types (trait + data types only).
+- `crates/tls` (`minip2p-tls`): libp2p TLS certificate generation and peer verification, transport-agnostic.
+- `crates/multistream-select` (`minip2p-multistream-select`): `/multistream/1.0.0` negotiation state machine.
+- `crates/ping` (`minip2p-ping`): `/ipfs/ping/1.0.0` state machine with RTT measurement.
+- `crates/identify` (`minip2p-identify`): `/ipfs/id/1.0.0` state machine for protocol and address exchange.
+- `crates/relay` (`minip2p-relay`): Circuit Relay v2 *client-side* state machines (`HopReservation`, `HopConnect`, `StopResponder`).
+- `crates/dcutr` (`minip2p-dcutr`): DCUtR hole-punch coordination state machines (`DcutrInitiator`, `DcutrResponder`).
+- `crates/swarm` (`minip2p-swarm`): `SwarmCore` Sans-I/O orchestrator that composes the protocol state machines, tracks connections and streams, drives multistream-select, and emits actions/events for the driver.
 
 Runtime adapters (`std`):
 
-- `transports/quic` (`minip2p-quic`): QUIC transport adapter built on `quiche`, with libp2p TLS baked in.
-- `packages/swarm` (also ships a thin `std` driver `Swarm<T: Transport>` behind the `std` feature).
+- `crates/quic` (`minip2p-quic`): QUIC transport adapter built on `quiche`, with libp2p TLS baked in.
+- `crates/swarm` (also ships a thin `std` driver `Swarm<T: Transport>` behind the `std` feature).
 
 Current validated behavior:
 
@@ -44,8 +44,8 @@ Current validated behavior:
 
 - Core crates listed above are designed to remain `no_std + alloc`. Protocol state machines (`ping`, `identify`, `relay`, `dcutr`, `multistream-select`) never depend on sockets, async runtimes, or wall clocks.
 - Runtime networking concerns (UDP/TCP sockets, DNS resolution, timers) belong in transport adapter crates.
-- Transport-specific address validation belongs in transport adapters, not `packages/core`.
-- `packages/swarm` splits into a Sans-I/O `SwarmCore` (no_std) and a `std`-gated driver that owns a concrete `Transport` and reads the wall clock.
+- Transport-specific address validation belongs in transport adapters, not `crates/core`.
+- `crates/swarm` splits into a Sans-I/O `SwarmCore` (no_std) and a `std`-gated driver that owns a concrete `Transport` and reads the wall clock.
 
 ## Quick start
 

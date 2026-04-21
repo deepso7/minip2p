@@ -1,15 +1,15 @@
 [workspace]
 resolver = "3"
 members = [
-    "packages/core",
-    "packages/dcutr",
-    "packages/identify",
-    "packages/identity",
-    "packages/multistream-select",
-    "packages/ping",
-    "packages/relay",
-    "packages/swarm",
-    "packages/tls",
-    "packages/transport",
-    "transports/quic",
+    "crates/core",
+    "crates/dcutr",
+    "crates/identify",
+    "crates/identity",
+    "crates/multistream-select",
+    "crates/ping",
+    "crates/quic",
+    "crates/relay",
+    "crates/swarm",
+    "crates/tls",
+    "crates/transport",
 ]

@@ -49,7 +49,7 @@ core.add_user_protocol("/myapp/1.0.0");
 
 ## Std driver usage
 
-See `transports/quic/tests/swarm_e2e.rs` for a full round-trip example (two swarms over QUIC, auto-identify, user-protocol echo, rapid-ping regression).
+See `crates/quic/tests/swarm_e2e.rs` for a full round-trip example (two swarms over QUIC, auto-identify, user-protocol echo, rapid-ping regression).
 
 ## no_std
 
@@ -57,11 +57,11 @@ Disable default features:
 
 ```toml
 [dependencies]
-minip2p-swarm = { path = "packages/swarm", default-features = false }
+minip2p-swarm = { path = "crates/swarm", default-features = false }
 ```
 
 The `no_std` build omits the `Swarm<T>` driver and `SwarmBuilder`; only `SwarmCore` and its event / action / error types remain.
 
 ## Scope
 
-This crate orchestrates the protocol state machines. It does **not** implement the protocols themselves -- see `minip2p-identify`, `minip2p-ping`, `minip2p-multistream-select`, `minip2p-relay`, `minip2p-dcutr`. It does not implement transports either -- see `minip2p-transport` for the contract and `transports/quic` for a concrete adapter.
+This crate orchestrates the protocol state machines. It does **not** implement the protocols themselves -- see `minip2p-identify`, `minip2p-ping`, `minip2p-multistream-select`, `minip2p-relay`, `minip2p-dcutr`. It does not implement transports either -- see `minip2p-transport` for the contract and `crates/quic` for a concrete adapter.

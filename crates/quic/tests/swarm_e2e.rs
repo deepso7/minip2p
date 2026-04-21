@@ -184,7 +184,7 @@ fn swarm_user_protocol_round_trip() {
 ///
 /// This covers the prior behavior where `SwarmCore` passed an empty
 /// `observed_addr` byte vector into the Identify responder (the TODO at
-/// the former `packages/swarm/src/core.rs:982`). The fix plumbs the
+/// the former `crates/swarm/src/core.rs:982`). The fix plumbs the
 /// transport endpoint cached on `TransportEvent::Connected` /
 /// `IncomingConnection` into `IdentifyProtocol::register_outbound_stream`.
 ///

@@ -14,17 +14,17 @@ This plan reflects the current repository state and the next execution steps.
 
 Implemented crates:
 
-- `packages/identity` (`minip2p-identity`)
-- `packages/core` (`minip2p-core`)
-- `packages/multistream-select` (`minip2p-multistream-select`)
-- `packages/ping` (`minip2p-ping`)
-- `packages/identify` (`minip2p-identify`)
-- `packages/relay` (`minip2p-relay`)
-- `packages/dcutr` (`minip2p-dcutr`)
-- `packages/transport` (`minip2p-transport`)
-- `packages/tls` (`minip2p-tls`)
-- `packages/swarm` (`minip2p-swarm`) -- see "Runtime adapters" below
-- `transports/quic` (`minip2p-quic`)
+- `crates/identity` (`minip2p-identity`)
+- `crates/core` (`minip2p-core`)
+- `crates/multistream-select` (`minip2p-multistream-select`)
+- `crates/ping` (`minip2p-ping`)
+- `crates/identify` (`minip2p-identify`)
+- `crates/relay` (`minip2p-relay`)
+- `crates/dcutr` (`minip2p-dcutr`)
+- `crates/transport` (`minip2p-transport`)
+- `crates/tls` (`minip2p-tls`)
+- `crates/swarm` (`minip2p-swarm`) -- see "Runtime adapters" below
+- `crates/quic` (`minip2p-quic`)
 
 Current validated capabilities:
 
@@ -44,37 +44,37 @@ Current validated capabilities:
 Pure state machines. No sockets, no async runtime, no wall-clock reads.
 Callers pump events and bytes in; the crate emits actions/events out.
 
-- `packages/identity`: peer identity primitives.
-- `packages/core`: transport-agnostic address and shared types.
-- `packages/transport`: transport contract, shared connection/event/error types (trait + data types only; concrete impls are adapters).
-- `packages/tls`: libp2p TLS certificate generation and peer verification. Transport-agnostic.
-- `packages/multistream-select`: `/multistream/1.0.0` negotiation state machine.
-- `packages/ping`: `/ipfs/ping/1.0.0` state machine.
-- `packages/identify`: `/ipfs/id/1.0.0` state machine.
-- `packages/relay`: Circuit Relay v2 client state machines (`HopReservation`, `HopConnect`, `StopResponder`).
-- `packages/dcutr`: DCUtR hole-punch coordination state machines (`DcutrInitiator`, `DcutrResponder`).
-- `packages/swarm` (core): `SwarmCore` -- Sans-I/O orchestration state machine. Composes the protocol state machines, tracks connections and streams, drives multistream-select for inbound and outbound streams, emits `SwarmAction` for the driver to execute and `SwarmEvent` for the application.
+- `crates/identity`: peer identity primitives.
+- `crates/core`: transport-agnostic address and shared types.
+- `crates/transport`: transport contract, shared connection/event/error types (trait + data types only; concrete impls are adapters).
+- `crates/tls`: libp2p TLS certificate generation and peer verification. Transport-agnostic.
+- `crates/multistream-select`: `/multistream/1.0.0` negotiation state machine.
+- `crates/ping`: `/ipfs/ping/1.0.0` state machine.
+- `crates/identify`: `/ipfs/id/1.0.0` state machine.
+- `crates/relay`: Circuit Relay v2 client state machines (`HopReservation`, `HopConnect`, `StopResponder`).
+- `crates/dcutr`: DCUtR hole-punch coordination state machines (`DcutrInitiator`, `DcutrResponder`).
+- `crates/swarm` (core): `SwarmCore` -- Sans-I/O orchestration state machine. Composes the protocol state machines, tracks connections and streams, drives multistream-select for inbound and outbound streams, emits `SwarmAction` for the driver to execute and `SwarmEvent` for the application.
 
 ### Runtime adapters (`std`)
 
 Concrete I/O, real clocks, async-friendly orchestration. Consumed by
 applications.
 
-- `transports/quic`: QUIC implementation over a non-blocking UDP socket.
-- `packages/swarm` (driver only): thin `std` wrapper around `SwarmCore`
+- `crates/quic`: QUIC implementation over a non-blocking UDP socket.
+- `crates/swarm` (driver only): thin `std` wrapper around `SwarmCore`
   that owns a concrete `Transport`, reads the wall clock, and preserves
   the one-call DX (`swarm.dial`, `swarm.ping`, `swarm.open_user_stream`).
-  The actual orchestration logic lives in `packages/swarm`'s Sans-I/O
+  The actual orchestration logic lives in `crates/swarm`'s Sans-I/O
   core (see above).
-- Future `transports/tcp`, `transports/ws`, `transports/webrtc` follow
-  the same pattern.
+- Future `crates/tcp`, `crates/ws`, `crates/webrtc` transport adapters
+  follow the same pattern.
 
 ### Ownership rules
 
 - Runtime concerns (UDP/TCP sockets, DNS resolution, timers, wall clock)
   belong in adapter crates.
 - Transport-specific address validation belongs in adapters, not in
-  `packages/core`.
+  `crates/core`.
 - Shared crates define generic contracts and common semantics only.
 - Protocol state machines (`ping`, `identify`, `relay`, `dcutr`,
   `multistream-select`) stay Sans-I/O -- they must never grow a `Transport`
@@ -125,7 +125,7 @@ cleanup item.
 
 ### Milestone 2: libp2p TLS peer authentication -- DONE
 
-New crate: `packages/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
+New crate: `crates/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 
 - [x] Add `minip2p-tls` crate for cert generation and verification per the libp2p TLS spec.
 - [x] Generate self-signed X.509 certs with embedded libp2p public key (OID `1.3.6.1.4.1.53594.1.1`).
@@ -141,7 +141,7 @@ New crate: `packages/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 
 ### Milestone 3: Identify protocol -- DONE
 
-- [x] Add `packages/identify` for `/ipfs/id/1.0.0`.
+- [x] Add `crates/identify` for `/ipfs/id/1.0.0`.
 - [x] Peers exchange supported protocols, observed addresses, agent version after connecting.
 - [x] Required foundation for relay and hole punch (peers need to know each other's addresses).
 
@@ -162,8 +162,8 @@ New crate: `packages/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 
 ### Milestone 5: Relay client and DCUtR state machines -- DONE (demo pending)
 
-- [x] `packages/relay`: Circuit Relay v2 client state machines (HopReservation, HopConnect, StopResponder), `no_std + alloc`.
-- [x] `packages/dcutr`: DCUtR hole-punch coordination state machines (Initiator, Responder), `no_std + alloc`.
+- [x] `crates/relay`: Circuit Relay v2 client state machines (HopReservation, HopConnect, StopResponder), `no_std + alloc`.
+- [x] `crates/dcutr`: DCUtR hole-punch coordination state machines (Initiator, Responder), `no_std + alloc`.
 - [x] Pure-state-machine integration test covering the full RESERVE + CONNECT + STOP + DCUtR flow with an in-memory relay emulator.
 - [ ] CLI binary `examples/peer` exercising the full stack against a real relay (local rust-libp2p for first iteration, VM-hosted relay later). See `holepunch-plan.md`.
 
@@ -192,7 +192,7 @@ New crate: `packages/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 
 - Unit tests for core parsing/types and error behavior.
 - Integration tests for two-peer connectivity per transport.
-- `cargo check --no-default-features` for `packages/identity`, `packages/core`, `packages/transport`, and `packages/tls`.
+- `cargo check --no-default-features` for `crates/identity`, `crates/core`, `crates/transport`, and `crates/tls`.
 - Stable, documented error messages for common misconfiguration paths.
 - Dependency and footprint discipline for core crates.
 
@@ -201,7 +201,7 @@ New crate: `packages/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 - Keep **Sans-I/O** as architecture baseline.
 - Keep **`no_std + alloc`** support for shared/core crates.
 - Keep **QUIC-first** while designing for **multi-transport** expansion.
-- Keep `transports/quic` as a **single crate** with internal layering for logic and runtime ergonomics.
+- Keep `crates/quic` as a **single crate** with internal layering for logic and runtime ergonomics.
 - Optimize for **DX** without compromising explicit architecture boundaries.
 - Varint helpers live in `minip2p-identity` (public) and are re-exported through `minip2p-core` to avoid circular deps.
 - `multistream-select` depends on `minip2p-core` for shared varint code rather than duplicating it.

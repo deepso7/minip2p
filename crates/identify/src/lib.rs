@@ -169,7 +169,7 @@ impl IdentifyProtocol {
         // pragmatic rather than spec-pure: the libp2p identify spec calls
         // for a binary multiaddr encoding, but minip2p does not yet
         // implement multicodec-based binary serialization (see
-        // `packages/core`). The string form is non-empty and round-trips
+        // `crates/core`). The string form is non-empty and round-trips
         // between minip2p peers; third-party libp2p peers will see it as
         // opaque bytes until we add binary encoding to the core crate.
         let observed_addr_bytes = observed_addr.map(|addr| addr.to_string().into_bytes());

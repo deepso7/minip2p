@@ -1,0 +1,20 @@
+[package]
+name = "minip2p-quic"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+minip2p-transport = { path = "../transport" }
+minip2p-identity = { path = "../identity" }
+minip2p-core = { path = "../core" }
+minip2p-tls = { path = "../tls" }
+quiche = "0.28"
+getrandom = "0.4"
+tempfile = "3"
+
+[dev-dependencies]
+minip2p-multistream-select = { path = "../multistream-select" }
+minip2p-ping = { path = "../ping" }
+minip2p-identify = { path = "../identify" }
+minip2p-swarm = { path = "../swarm" }
+minip2p-identity = { path = "../identity" }

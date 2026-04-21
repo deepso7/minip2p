@@ -53,7 +53,7 @@ Disable default features:
 
 ```toml
 [dependencies]
-minip2p-ping = { path = "packages/ping", default-features = false }
+minip2p-ping = { path = "crates/ping", default-features = false }
 ```
 
 ## Scope

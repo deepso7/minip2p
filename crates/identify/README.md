@@ -61,7 +61,7 @@ Disable default features:
 
 ```toml
 [dependencies]
-minip2p-identify = { path = "packages/identify", default-features = false }
+minip2p-identify = { path = "crates/identify", default-features = false }
 ```
 
 ## Scope

@@ -49,9 +49,9 @@ Disable default features:
 
 ```toml
 [dependencies]
-minip2p-relay = { path = "packages/relay", default-features = false }
+minip2p-relay = { path = "crates/relay", default-features = false }
 ```
 
 ## Integration
 
-The state machines are transport-agnostic; in practice they ride on top of a `minip2p-swarm` user protocol (see `swarm.add_user_protocol(HOP_PROTOCOL_ID)` + `UserStream*` events). A Sans-I/O end-to-end test that exercises the full reservation + connect + stop + DCUtR flow lives at `packages/swarm/tests/relay_holepunch_flow.rs`.
+The state machines are transport-agnostic; in practice they ride on top of a `minip2p-swarm` user protocol (see `swarm.add_user_protocol(HOP_PROTOCOL_ID)` + `UserStream*` events). A Sans-I/O end-to-end test that exercises the full reservation + connect + stop + DCUtR flow lives at `crates/swarm/tests/relay_holepunch_flow.rs`.

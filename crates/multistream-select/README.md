@@ -51,7 +51,7 @@ Disable default features:
 
 ```toml
 [dependencies]
-minip2p-multistream-select = { path = "packages/multistream-select", default-features = false }
+minip2p-multistream-select = { path = "crates/multistream-select", default-features = false }
 ```
 
 ## Scope

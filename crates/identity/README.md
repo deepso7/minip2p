@@ -176,14 +176,14 @@ Disable default features:
 
 ```toml
 [dependencies]
-minip2p-identity = { path = "packages/identity", default-features = false }
+minip2p-identity = { path = "crates/identity", default-features = false }
 ```
 
 Enable Ed25519 key generation in `no_std`:
 
 ```toml
 [dependencies]
-minip2p-identity = { path = "packages/identity", default-features = false, features = ["ed25519"] }
+minip2p-identity = { path = "crates/identity", default-features = false, features = ["ed25519"] }
 rand_core = { version = "0.6.4", default-features = false }
 ```
 

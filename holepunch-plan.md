@@ -256,7 +256,7 @@ frame delivery without needing a separate poll round.
 
 2. Relay-mode loopback test with a **minimal in-process fake relay**.
    Rather than spinning up rust-libp2p, write a test-only fake relay
-   (reuses the pattern from `packages/swarm/tests/relay_holepunch_flow.rs`
+   (reuses the pattern from `crates/swarm/tests/relay_holepunch_flow.rs`
    but over real QUIC). Estimated cost is ~300 lines and gives us a CI
    signal that the full stack works. Defer if it balloons.
 

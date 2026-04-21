@@ -49,9 +49,9 @@ Disable default features:
 
 ```toml
 [dependencies]
-minip2p-dcutr = { path = "packages/dcutr", default-features = false }
+minip2p-dcutr = { path = "crates/dcutr", default-features = false }
 ```
 
 ## Integration
 
-The state machines typically run over a stream that was originally a relay circuit bridge. In minip2p that is exposed as a user protocol on the swarm (`swarm.add_user_protocol(DCUTR_PROTOCOL_ID)` + `UserStream*` events). The end-to-end pure-state-machine flow is exercised by `packages/swarm/tests/relay_holepunch_flow.rs`.
+The state machines typically run over a stream that was originally a relay circuit bridge. In minip2p that is exposed as a user protocol on the swarm (`swarm.add_user_protocol(DCUTR_PROTOCOL_ID)` + `UserStream*` events). The end-to-end pure-state-machine flow is exercised by `crates/swarm/tests/relay_holepunch_flow.rs`.

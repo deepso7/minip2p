@@ -58,7 +58,7 @@ Disable default features:
 
 ```toml
 [dependencies]
-minip2p-core = { path = "packages/core", default-features = false }
+minip2p-core = { path = "crates/core", default-features = false }
 ```
 
 ## Scope

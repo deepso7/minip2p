@@ -73,7 +73,7 @@ Disable default features:
 
 ```toml
 [dependencies]
-minip2p-transport = { path = "packages/transport", default-features = false }
+minip2p-transport = { path = "crates/transport", default-features = false }
 ```
 
 ## Scope
