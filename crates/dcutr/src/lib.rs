@@ -28,7 +28,7 @@ extern crate alloc;
 
 mod message;
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use minip2p_core::Multiaddr;
@@ -418,29 +418,20 @@ fn enforce_max_size(buf: &[u8]) -> Result<(), DcutrError> {
 }
 
 /// Encodes a [`Multiaddr`] for transmission in a `HolePunch` `obs_addrs`
-/// field.
-///
-/// The libp2p DCUtR spec calls for the multicodec-based binary encoding.
-/// minip2p-core does not yet implement that encoder, so we transmit the
-/// display-string form as UTF-8 bytes; two minip2p peers round-trip
-/// cleanly through this encoding and foreign libp2p peers will see the
-/// entries as opaque bytes until the binary encoder lands in core.
+/// field using the libp2p-spec multicodec-based binary encoding.
 fn encode_multiaddr(addr: &Multiaddr) -> Vec<u8> {
-    addr.to_string().into_bytes()
+    addr.to_bytes()
 }
 
 /// Decodes a list of raw observed-address bytes into [`Multiaddr`]
-/// values, dropping any entry that fails to parse as valid UTF-8 or
-/// a well-formed multiaddr.
+/// values, dropping any entry that fails to decode as a well-formed
+/// binary multiaddr.
 ///
 /// The raw bytes remain available in the surrounding event/outcome so
 /// callers can emit diagnostics for dropped entries if they care.
 fn decode_remote_addrs(raw: &[Vec<u8>]) -> Vec<Multiaddr> {
     raw.iter()
-        .filter_map(|bytes| {
-            let s = core::str::from_utf8(bytes).ok()?;
-            <Multiaddr as core::str::FromStr>::from_str(s).ok()
-        })
+        .filter_map(|bytes| Multiaddr::from_bytes(bytes).ok())
         .collect()
 }
 
@@ -476,7 +467,8 @@ mod tests {
 
         // Remote replies with its own CONNECT.
         let remote_str = "/ip4/5.6.7.8/udp/2222/quic-v1";
-        let remote_bytes = vec![remote_str.as_bytes().to_vec()];
+        let remote_addr = addr(remote_str);
+        let remote_bytes = vec![remote_addr.to_bytes()];
         let reply = frame(HolePunch {
             kind: HolePunchType::Connect,
             obs_addrs: remote_bytes.clone(),
@@ -490,7 +482,7 @@ mod tests {
                 rtt_ms,
             }) => {
                 assert_eq!(remote_addrs.len(), 1);
-                assert_eq!(remote_addrs[0], addr(remote_str));
+                assert_eq!(remote_addrs[0], remote_addr);
                 assert_eq!(*remote_addr_bytes, remote_bytes);
                 assert_eq!(*rtt_ms, 42);
             }
@@ -548,7 +540,7 @@ mod tests {
 
         let reply = frame(HolePunch {
             kind: HolePunchType::Connect,
-            obs_addrs: vec![b"/ip4/1.2.3.4/udp/1/quic-v1".to_vec()],
+            obs_addrs: vec![addr("/ip4/1.2.3.4/udp/1/quic-v1").to_bytes()],
         });
         for byte in &reply {
             init.on_data(&[*byte], 10).unwrap();
@@ -568,9 +560,9 @@ mod tests {
         let reply = frame(HolePunch {
             kind: HolePunchType::Connect,
             obs_addrs: vec![
-                b"/ip4/1.2.3.4/udp/1/quic-v1".to_vec(), // valid
-                b"not-a-multiaddr".to_vec(),           // dropped
-                vec![0xFF, 0xFE],                      // dropped (not utf8)
+                addr("/ip4/1.2.3.4/udp/1/quic-v1").to_bytes(), // valid binary
+                vec![0xFF, 0x7F, 0x00],                        // unknown code
+                vec![0x04, 0x7F],                              // truncated ip4
             ],
         });
         init.on_data(&reply, 10).unwrap();
@@ -595,21 +587,22 @@ mod tests {
 
         // Feed initiator's CONNECT.
         let remote_str = "/ip4/5.5.5.5/udp/7000/quic-v1";
-        let remote_bytes = vec![remote_str.as_bytes().to_vec()];
+        let remote_addr = addr(remote_str);
+        let remote_bytes = vec![remote_addr.to_bytes()];
         let connect = frame(HolePunch {
             kind: HolePunchType::Connect,
             obs_addrs: remote_bytes.clone(),
         });
         resp.on_data(&connect).unwrap();
 
-        // Reply should be queued with our own addr (string-encoded).
+        // Reply should be queued with our own addr (binary-encoded).
         let outbound = resp.take_outbound();
         let FrameDecode::Complete { payload, .. } = decode_frame(&outbound) else {
             panic!();
         };
         let reply = HolePunch::decode(payload).unwrap();
         assert_eq!(reply.kind, HolePunchType::Connect);
-        assert_eq!(reply.obs_addrs, vec![own[0].to_string().into_bytes()]);
+        assert_eq!(reply.obs_addrs, vec![own[0].to_bytes()]);
 
         // ConnectReceived event should surface parsed multiaddrs.
         let events = resp.poll_events();
@@ -620,7 +613,7 @@ mod tests {
                 remote_addr_bytes,
             } => {
                 assert_eq!(remote_addrs.len(), 1);
-                assert_eq!(remote_addrs[0], addr(remote_str));
+                assert_eq!(remote_addrs[0], remote_addr);
                 assert_eq!(*remote_addr_bytes, remote_bytes);
             }
             _ => panic!(),

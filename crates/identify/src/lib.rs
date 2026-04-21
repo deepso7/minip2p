@@ -13,7 +13,7 @@ extern crate alloc;
 mod message;
 
 use alloc::collections::BTreeMap;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -165,14 +165,11 @@ impl IdentifyProtocol {
 
         state.outbound_stream = Some(stream_id);
 
-        // Encode the observed multiaddr as its string form bytes. This is
-        // pragmatic rather than spec-pure: the libp2p identify spec calls
-        // for a binary multiaddr encoding, but minip2p does not yet
-        // implement multicodec-based binary serialization (see
-        // `crates/core`). The string form is non-empty and round-trips
-        // between minip2p peers; third-party libp2p peers will see it as
-        // opaque bytes until we add binary encoding to the core crate.
-        let observed_addr_bytes = observed_addr.map(|addr| addr.to_string().into_bytes());
+        // libp2p's Identify spec prescribes multicodec-based binary
+        // encoding for observed_addr (see
+        // <https://github.com/multiformats/multiaddr>). `to_bytes()`
+        // produces the on-wire shape foreign libp2p peers expect.
+        let observed_addr_bytes = observed_addr.map(|addr| addr.to_bytes());
 
         let msg = IdentifyMessage {
             protocol_version: Some(self.config.protocol_version.clone()),

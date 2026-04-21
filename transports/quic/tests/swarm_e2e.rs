@@ -3,8 +3,6 @@
 //! Contrast with `ping_e2e.rs` which requires ~200 lines of manual negotiation
 //! and dispatch code. Here, the Swarm handles everything.
 
-use std::str::FromStr;
-
 use minip2p_core::Multiaddr;
 use minip2p_identity::Ed25519Keypair;
 use minip2p_ping::PING_PROTOCOL_ID;
@@ -230,10 +228,10 @@ fn identify_exchange_carries_observed_addr() {
         "client-side observed_addr must not be empty"
     );
 
-    // The current encoding is the multiaddr's string form -- decode and
-    // check it round-trips into a valid QUIC transport multiaddr.
-    let addr_str = std::str::from_utf8(&client_bytes).expect("observed_addr should be utf-8");
-    let addr = Multiaddr::from_str(addr_str).expect("observed_addr should parse as multiaddr");
+    // Identify now encodes observed_addr per the libp2p spec -- varint
+    // multicodec + value -- so decode with Multiaddr::from_bytes.
+    let addr =
+        Multiaddr::from_bytes(&client_bytes).expect("observed_addr should decode as binary multiaddr");
     assert!(
         addr.is_quic_transport(),
         "observed_addr should be a QUIC transport multiaddr, got {addr}"
