@@ -461,6 +461,43 @@ impl PingProtocol {
         self.peers.remove(peer_id);
     }
 
+    /// Re-keys all state for `old_peer_id` to `new_peer_id`.
+    ///
+    /// Used when the swarm discovers a connection's real peer identity after
+    /// initially registering the connection under a placeholder (e.g. the
+    /// listener side of a one-way TLS handshake creates a synthetic PeerId
+    /// that is upgraded once the real identity is verified).
+    ///
+    /// Also rewrites any buffered events still referencing `old_peer_id` so
+    /// the application only ever sees events under the real PeerId.
+    ///
+    /// If there is no state for `old_peer_id`, this is a no-op.
+    pub fn migrate_peer(&mut self, old_peer_id: &PeerId, new_peer_id: &PeerId) {
+        if old_peer_id == new_peer_id {
+            return;
+        }
+
+        if let Some(state) = self.peers.remove(old_peer_id) {
+            self.peers.insert(new_peer_id.clone(), state);
+        }
+
+        for event in &mut self.pending_events {
+            match event {
+                PingEvent::OutboundStreamRegistered { peer_id, .. }
+                | PingEvent::InboundStreamAccepted { peer_id, .. }
+                | PingEvent::RttMeasured { peer_id, .. }
+                | PingEvent::Timeout { peer_id, .. }
+                | PingEvent::OutboundStreamClosed { peer_id, .. }
+                | PingEvent::StreamLimitExceeded { peer_id, .. }
+                | PingEvent::ProtocolViolation { peer_id, .. } => {
+                    if peer_id == old_peer_id {
+                        *peer_id = new_peer_id.clone();
+                    }
+                }
+            }
+        }
+    }
+
     /// Checks for timed-out ping requests. Call periodically.
     pub fn on_tick(&mut self, now_ms: u64) -> Vec<PingAction> {
         let mut actions = Vec::new();

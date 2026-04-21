@@ -456,7 +456,11 @@ impl<T: Transport> Swarm<T> {
             }
             TransportEvent::PeerIdentityVerified { id, endpoint, .. } => {
                 if let Some(peer_id) = endpoint.peer_id() {
-                    self.register_connection(id, peer_id.clone());
+                    // The transport has verified the real peer identity.
+                    // If we were operating under a synthetic PeerId, migrate
+                    // all per-peer state so nothing leaks and protocol
+                    // handlers continue to work under the real identity.
+                    self.upgrade_connection_identity(id, peer_id.clone());
                 }
             }
             TransportEvent::IncomingConnection { id, .. } => {
@@ -514,6 +518,93 @@ impl<T: Transport> Swarm<T> {
                 self.events.push(SwarmEvent::Error {
                     message: format!("failed to open identify stream to {peer_id}: {e}"),
                 });
+            }
+        }
+    }
+
+    /// Rebinds a connection from a placeholder (synthetic) peer id to a real
+    /// verified peer id.
+    ///
+    /// Migrates the following state atomically:
+    /// - `conn_to_peer[conn_id]` is updated to point at the real peer id.
+    /// - The stale `peer_to_conn[old]` entry is removed.
+    /// - `ping` and `identify` protocol state keyed under the old peer id is
+    ///   re-keyed under the new one.
+    /// - Any pending deferred ping payload is migrated.
+    /// - Buffered [`SwarmEvent`]s referencing the old peer id are rewritten.
+    ///
+    /// Also emits a fresh [`SwarmEvent::ConnectionEstablished`] for the real
+    /// peer id so applications correlating events by peer id see the
+    /// connection under its verified identity.
+    fn upgrade_connection_identity(&mut self, conn_id: ConnectionId, new_peer_id: PeerId) {
+        let existing = self.conn_to_peer.get(&conn_id).cloned();
+
+        match existing {
+            Some(ref current) if *current == new_peer_id => {
+                // Already bound to the correct peer id. Nothing to do.
+                return;
+            }
+            Some(ref stale) => {
+                // Rebind state from the synthetic id to the real one.
+                self.peer_to_conn.remove(stale);
+                self.ping.migrate_peer(stale, &new_peer_id);
+                self.identify.migrate_peer(stale, &new_peer_id);
+                if let Some(payload) = self.pending_pings.remove(stale) {
+                    self.pending_pings.insert(new_peer_id.clone(), payload);
+                }
+                self.migrate_buffered_events(stale, &new_peer_id);
+            }
+            None => {
+                // First time we're learning the peer id for this connection.
+            }
+        }
+
+        self.conn_to_peer.insert(conn_id, new_peer_id.clone());
+        self.peer_to_conn.insert(new_peer_id.clone(), conn_id);
+
+        self.events.push(SwarmEvent::ConnectionEstablished {
+            peer_id: new_peer_id.clone(),
+        });
+
+        // Kick off identify under the real peer id. The responder side may
+        // still have an identify stream open from the synthetic era; it
+        // will be cleaned up when the stream reaches `Closed`.
+        if let Err(e) = self.open_protocol_stream(
+            &new_peer_id,
+            IDENTIFY_PROTOCOL_ID,
+            ProtocolId::IdentifyInitiator,
+        ) {
+            self.events.push(SwarmEvent::Error {
+                message: format!(
+                    "failed to open identify stream to {new_peer_id} after identity upgrade: {e}"
+                ),
+            });
+        }
+    }
+
+    /// Rewrites any buffered [`SwarmEvent`]s that reference `old_peer_id` so
+    /// the application only ever sees events under the real identity.
+    fn migrate_buffered_events(&mut self, old_peer_id: &PeerId, new_peer_id: &PeerId) {
+        for event in &mut self.events {
+            match event {
+                SwarmEvent::ConnectionEstablished { peer_id }
+                | SwarmEvent::ConnectionClosed { peer_id }
+                | SwarmEvent::PingTimeout { peer_id } => {
+                    if peer_id == old_peer_id {
+                        *peer_id = new_peer_id.clone();
+                    }
+                }
+                SwarmEvent::IdentifyReceived { peer_id, .. }
+                | SwarmEvent::PingRttMeasured { peer_id, .. }
+                | SwarmEvent::UserStreamReady { peer_id, .. }
+                | SwarmEvent::UserStreamData { peer_id, .. }
+                | SwarmEvent::UserStreamRemoteWriteClosed { peer_id, .. }
+                | SwarmEvent::UserStreamClosed { peer_id, .. } => {
+                    if peer_id == old_peer_id {
+                        *peer_id = new_peer_id.clone();
+                    }
+                }
+                SwarmEvent::Error { .. } => {}
             }
         }
     }
@@ -705,7 +796,12 @@ impl<T: Transport> Swarm<T> {
                     negotiated_protocol = Some(protocol);
                 }
                 MultistreamOutput::NotAvailable => {
+                    // The multistream-select "na" response has already been
+                    // sent via the OutboundData arm above. Drop our negotiator
+                    // state AND reset the underlying transport stream so it
+                    // doesn't leak as an orphaned open stream.
                     self.inbound_negotiators.remove(&key);
+                    let _ = self.transport.reset_stream(conn_id, stream_id);
                     return;
                 }
                 MultistreamOutput::ProtocolError { reason } => {
@@ -715,6 +811,7 @@ impl<T: Transport> Swarm<T> {
                         ),
                     });
                     self.inbound_negotiators.remove(&key);
+                    let _ = self.transport.reset_stream(conn_id, stream_id);
                     return;
                 }
             }
@@ -770,6 +867,9 @@ impl<T: Transport> Swarm<T> {
                         ),
                     });
                     self.outbound_negotiators.remove(&key);
+                    // Free the stream we opened; without the reset it stays
+                    // open in the transport until the connection closes.
+                    let _ = self.transport.reset_stream(conn_id, stream_id);
                     return;
                 }
                 MultistreamOutput::ProtocolError { reason } => {
@@ -779,6 +879,7 @@ impl<T: Transport> Swarm<T> {
                         ),
                     });
                     self.outbound_negotiators.remove(&key);
+                    let _ = self.transport.reset_stream(conn_id, stream_id);
                     return;
                 }
             }

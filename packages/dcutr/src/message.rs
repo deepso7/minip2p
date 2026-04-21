@@ -21,9 +21,19 @@ use alloc::vec::Vec;
 use minip2p_core::{read_uvarint, uvarint_len, write_uvarint, VarintError};
 use thiserror::Error;
 
-// Tag bytes: (field_number << 3) | wire_type
-const TAG_TYPE: u8 = (1 << 3) | 0; // 0x08, varint
-const TAG_OBS_ADDRS: u8 = (2 << 3) | 2; // 0x12, length-delimited
+// Wire types from the protobuf spec.
+const WIRE_VARINT: u8 = 0;
+const WIRE_LEN: u8 = 2;
+
+// Field numbers for the HolePunch message.
+const FIELD_TYPE: u64 = 1;
+const FIELD_OBS_ADDRS: u64 = 2;
+
+// Single-byte tag bytes used by the encoder (valid for field numbers < 16).
+// The decoder does NOT match on truncated u8 tags -- it uses the full u64
+// field_number + wire_type split below -- so these are encoder-only.
+const TAG_TYPE: u8 = ((FIELD_TYPE as u8) << 3) | WIRE_VARINT; // 0x08
+const TAG_OBS_ADDRS: u8 = ((FIELD_OBS_ADDRS as u8) << 3) | WIRE_LEN; // 0x12
 
 /// Type discriminator for the HolePunch message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,13 +111,17 @@ impl HolePunch {
         let mut idx = 0;
 
         while idx < input.len() {
+            // Read the field tag as a full u64. Field numbers >= 16 encode as
+            // multi-byte varints; truncating to u8 would let a remote peer
+            // alias known tags (e.g. field 33 + LEN => 266, `266 as u8 = 0x0A`).
             let (tag_value, used) = read_uvarint(&input[idx..])?;
             idx += used;
-            let tag = tag_value as u8;
-            let wire_type = tag & 0x07;
 
-            match (tag, wire_type) {
-                (TAG_TYPE, 0) => {
+            let wire_type = (tag_value & 0x07) as u8;
+            let field_number = tag_value >> 3;
+
+            match (field_number, wire_type) {
+                (FIELD_TYPE, WIRE_VARINT) => {
                     let (value, used) = read_uvarint(&input[idx..])?;
                     idx += used;
                     kind = Some(
@@ -115,41 +129,19 @@ impl HolePunch {
                             .ok_or(DcutrMessageError::InvalidType { value })?,
                     );
                 }
-                (TAG_OBS_ADDRS, 2) => {
-                    let (length, len_used) = read_uvarint(&input[idx..])?;
-                    idx += len_used;
-                    let length = length as usize;
-                    let remaining = input.len().saturating_sub(idx);
-                    if length > remaining {
-                        return Err(DcutrMessageError::FieldOverflow {
-                            offset: idx,
-                            length,
-                            remaining,
-                        });
-                    }
-                    obs_addrs.push(input[idx..idx + length].to_vec());
-                    idx += length;
+                (FIELD_OBS_ADDRS, WIRE_LEN) => {
+                    let value = read_len_delimited(input, &mut idx)?;
+                    obs_addrs.push(value.to_vec());
                 }
-                // Skip unknown fields based on wire type.
-                (_, 0) => {
+                // Skip unknown fields based on their wire type.
+                (_, WIRE_VARINT) => {
                     let (_, used) = read_uvarint(&input[idx..])?;
                     idx += used;
                 }
-                (_, 2) => {
-                    let (length, len_used) = read_uvarint(&input[idx..])?;
-                    idx += len_used;
-                    let length = length as usize;
-                    let remaining = input.len().saturating_sub(idx);
-                    if length > remaining {
-                        return Err(DcutrMessageError::FieldOverflow {
-                            offset: idx,
-                            length,
-                            remaining,
-                        });
-                    }
-                    idx += length;
+                (_, WIRE_LEN) => {
+                    let _ = read_len_delimited(input, &mut idx)?;
                 }
-                (_, 1) => {
+                (_, 1 /* I64 */) => {
                     if idx + 8 > input.len() {
                         return Err(DcutrMessageError::FieldOverflow {
                             offset: idx,
@@ -159,7 +151,7 @@ impl HolePunch {
                     }
                     idx += 8;
                 }
-                (_, 5) => {
+                (_, 5 /* I32 */) => {
                     if idx + 4 > input.len() {
                         return Err(DcutrMessageError::FieldOverflow {
                             offset: idx,
@@ -183,6 +175,35 @@ impl HolePunch {
             obs_addrs,
         })
     }
+}
+
+/// Reads a length-delimited value, performing a checked `u64 -> usize`
+/// conversion to guard against truncation on 32-bit targets.
+fn read_len_delimited<'a>(
+    input: &'a [u8],
+    idx: &mut usize,
+) -> Result<&'a [u8], DcutrMessageError> {
+    let (length_u64, len_used) = read_uvarint(&input[*idx..])?;
+    *idx += len_used;
+
+    let remaining = input.len().saturating_sub(*idx);
+    let length = usize::try_from(length_u64).map_err(|_| DcutrMessageError::FieldOverflow {
+        offset: *idx,
+        length: usize::MAX,
+        remaining,
+    })?;
+
+    if length > remaining {
+        return Err(DcutrMessageError::FieldOverflow {
+            offset: *idx,
+            length,
+            remaining,
+        });
+    }
+
+    let value = &input[*idx..*idx + length];
+    *idx += length;
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -315,5 +336,32 @@ mod tests {
 
         let decoded = HolePunch::decode(&buf).unwrap();
         assert_eq!(decoded.kind, HolePunchType::Connect);
+    }
+
+    /// Regression test: a multi-byte tag for a high-numbered unknown field
+    /// must not alias a single-byte tag for a known field after truncation.
+    ///
+    /// Field 33 + wire type LEN encodes as varint `266 = 0x8A 0x02`. Casting
+    /// `266 as u8` yields `0x12` -- the tag byte for `TAG_OBS_ADDRS`. A
+    /// well-behaved decoder must treat it as an unknown field-33 record.
+    #[test]
+    fn decode_does_not_alias_high_field_numbers_to_known_fields() {
+        let mut buf = Vec::new();
+
+        // Unknown field 33, wire type LEN, payload "aliased"
+        write_uvarint((33 << 3) | (WIRE_LEN as u64), &mut buf);
+        write_uvarint(7, &mut buf);
+        buf.extend_from_slice(b"aliased");
+
+        // Then the real type field.
+        buf.push(TAG_TYPE);
+        write_uvarint(100, &mut buf); // CONNECT
+
+        let decoded = HolePunch::decode(&buf).unwrap();
+        assert_eq!(decoded.kind, HolePunchType::Connect);
+        assert!(
+            decoded.obs_addrs.is_empty(),
+            "field 33 must not alias obs_addrs (tag 0x12)"
+        );
     }
 }

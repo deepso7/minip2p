@@ -233,7 +233,10 @@ impl IdentifyProtocol {
 
     /// Notify that the remote peer closed its write side on a stream.
     ///
-    /// For inbound identify streams, this signals the message is complete.
+    /// For inbound identify streams (where we are the initiator), this
+    /// signals the message is complete. The initiator closes its own write
+    /// side in response so that the stream can reach the `Closed` state and
+    /// have its transport-level and protocol-level state reclaimed.
     pub fn on_stream_remote_write_closed(
         &mut self,
         peer_id: PeerId,
@@ -243,25 +246,36 @@ impl IdentifyProtocol {
             return Vec::new();
         };
 
-        if let Some(buf) = state.inbound_streams.remove(&stream_id) {
-            match IdentifyMessage::decode(&buf) {
-                Ok(info) => {
-                    self.events.push(IdentifyEvent::Received {
-                        peer_id,
-                        info,
-                    });
-                }
-                Err(e) => {
-                    self.events.push(IdentifyEvent::Error {
-                        peer_id,
-                        stream_id,
-                        error: alloc::format!("failed to decode identify message: {e}"),
-                    });
-                }
+        let Some(buf) = state.inbound_streams.remove(&stream_id) else {
+            return Vec::new();
+        };
+
+        match IdentifyMessage::decode(&buf) {
+            Ok(info) => {
+                self.events.push(IdentifyEvent::Received {
+                    peer_id: peer_id.clone(),
+                    info,
+                });
+            }
+            Err(e) => {
+                self.events.push(IdentifyEvent::Error {
+                    peer_id: peer_id.clone(),
+                    stream_id,
+                    error: alloc::format!("failed to decode identify message: {e}"),
+                });
             }
         }
 
-        Vec::new()
+        // Close our own write side. We never send data on an initiator
+        // identify stream, but multistream-select did, so the QUIC transport
+        // still considers the local write side open. Without this FIN the
+        // stream never transitions to `Closed` and both the swarm's
+        // stream_owner entry and the transport's per-stream state leak for
+        // the lifetime of the connection.
+        vec![IdentifyAction::CloseStreamWrite {
+            peer_id,
+            stream_id,
+        }]
     }
 
     /// Notify that a stream was fully closed.
@@ -284,6 +298,33 @@ impl IdentifyProtocol {
     /// Remove all state for a peer.
     pub fn remove_peer(&mut self, peer_id: &PeerId) {
         self.peers.remove(peer_id);
+    }
+
+    /// Re-keys all state for `old_peer_id` to `new_peer_id`.
+    ///
+    /// Used when the swarm discovers a connection's real peer identity after
+    /// initially registering the connection under a placeholder. Any buffered
+    /// events referencing `old_peer_id` are rewritten to `new_peer_id` so the
+    /// application only ever sees events under the real peer identity.
+    pub fn migrate_peer(&mut self, old_peer_id: &PeerId, new_peer_id: &PeerId) {
+        if old_peer_id == new_peer_id {
+            return;
+        }
+
+        if let Some(state) = self.peers.remove(old_peer_id) {
+            self.peers.insert(new_peer_id.clone(), state);
+        }
+
+        for event in &mut self.events {
+            match event {
+                IdentifyEvent::Received { peer_id, .. }
+                | IdentifyEvent::Error { peer_id, .. } => {
+                    if peer_id == old_peer_id {
+                        *peer_id = new_peer_id.clone();
+                    }
+                }
+            }
+        }
     }
 
     /// Drain buffered events.
