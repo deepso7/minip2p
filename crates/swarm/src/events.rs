@@ -174,6 +174,15 @@ pub enum SwarmError {
         peer_id: PeerId,
         protocol_id: String,
     },
+    /// A caller tried to use a user stream that is not currently negotiated
+    /// for the requested peer.
+    #[error("user stream {stream_id} for peer {peer_id} is not active")]
+    UserStreamNotFound {
+        /// Peer the caller expected the stream to belong to.
+        peer_id: PeerId,
+        /// Stream id supplied by the caller.
+        stream_id: StreamId,
+    },
     /// The ping state machine rejected the request (e.g. a ping is already
     /// in flight on the target peer).
     #[error("ping error: {reason}")]

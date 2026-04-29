@@ -60,7 +60,7 @@ minip2p-peer dial \
   --listen /ip4/0.0.0.0/udp/0/quic-v1
 ```
 
-`examples/peer autonat` runs a public AutoNAT service. Relay modes can pass
+`minip2p-peer autonat` runs a public AutoNAT service. Relay modes can pass
 `--autonat <peer-addr>` to ask that service to dial their advertised candidates
 before exchanging DCUtR addresses. The AutoNAT wire logic lives in
 `minip2p-autonat`, a `no_std + alloc` Sans-I/O crate; the CLI owns stream I/O,
