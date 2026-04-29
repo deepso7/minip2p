@@ -607,14 +607,7 @@ impl SwarmCore {
     }
 
     fn find_negotiated_ping_stream(&self, peer_id: &PeerId) -> Option<StreamId> {
-        let conn = *self.peer_to_conn.get(peer_id)?;
-        self.stream_owner.iter().find_map(|((c, s), owner)| {
-            if *c == conn && matches!(owner, ProtocolKind::Ping) {
-                Some(*s)
-            } else {
-                None
-            }
-        })
+        self.ping.outbound_stream(peer_id)
     }
 
     fn has_pending_ping_stream(&self, peer_id: &PeerId) -> bool {

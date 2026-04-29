@@ -195,6 +195,13 @@ impl PingProtocol {
         Ok(())
     }
 
+    /// Returns the negotiated outbound ping stream for `peer_id`, if any.
+    pub fn outbound_stream(&self, peer_id: &PeerId) -> Option<StreamId> {
+        self.peers
+            .get(peer_id)
+            .and_then(|peer| peer.outbound_stream)
+    }
+
     /// Registers a negotiated inbound stream from a peer.
     pub fn register_inbound_stream(
         &mut self,
@@ -831,6 +838,19 @@ mod tests {
             .expect("re-register outbound stream after remove_peer");
         let actions = ping.register_inbound_stream(peer.clone(), StreamId::new(11));
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn outbound_stream_ignores_inbound_streams() {
+        let mut ping = PingProtocol::default();
+        let peer = test_peer();
+
+        ping.register_inbound_stream(peer.clone(), StreamId::new(1));
+        assert_eq!(ping.outbound_stream(&peer), None);
+
+        ping.register_outbound_stream(peer.clone(), StreamId::new(2))
+            .expect("register outbound stream");
+        assert_eq!(ping.outbound_stream(&peer), Some(StreamId::new(2)));
     }
 
     #[test]
