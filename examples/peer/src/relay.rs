@@ -900,8 +900,28 @@ fn dialback_candidate(
     addr: &Multiaddr,
     timeout: Duration,
 ) -> Result<bool, Box<dyn Error>> {
+    let mut last_error: Option<String> = None;
+    for bind in dialback_bind_addrs(addr) {
+        match dialback_candidate_with_bind(peer_id, addr, timeout, bind) {
+            Ok(true) => return Ok(true),
+            Ok(false) => last_error = None,
+            Err(e) => last_error = Some(e.to_string()),
+        }
+    }
+
+    if let Some(error) = last_error {
+        return Err(error.into());
+    }
+    Ok(false)
+}
+
+fn dialback_candidate_with_bind(
+    peer_id: &PeerId,
+    addr: &Multiaddr,
+    timeout: Duration,
+    bind: &str,
+) -> Result<bool, Box<dyn Error>> {
     let keypair = Ed25519Keypair::generate();
-    let bind = dialback_bind_addr(addr);
     let transport = QuicTransport::new(QuicNodeConfig::new(keypair.clone()), bind)
         .map_err(|e| format!("dialback bind {bind}: {e}"))?;
     let mut probe = SwarmBuilder::new(&keypair)
@@ -921,10 +941,11 @@ fn dialback_candidate(
     Ok(found.is_some())
 }
 
-fn dialback_bind_addr(addr: &Multiaddr) -> &'static str {
+fn dialback_bind_addrs(addr: &Multiaddr) -> &'static [&'static str] {
     match addr.protocols().first() {
-        Some(Protocol::Ip6(_) | Protocol::Dns6(_)) => "[::]:0",
-        _ => "0.0.0.0:0",
+        Some(Protocol::Ip6(_) | Protocol::Dns6(_)) => &["[::]:0"],
+        Some(Protocol::Dns(_)) => &["[::]:0", "0.0.0.0:0"],
+        _ => &["0.0.0.0:0"],
     }
 }
 
@@ -1049,4 +1070,31 @@ fn random_bytes(len: usize) -> Vec<u8> {
     let mut buf = vec![0u8; len];
     let _ = getrandom::fill(&mut buf);
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str::FromStr;
+
+    use super::*;
+
+    #[test]
+    fn generic_dns_dialback_tries_both_ip_families() {
+        let addr = Multiaddr::from_str("/dns/example.com/udp/4001/quic-v1").unwrap();
+
+        assert_eq!(dialback_bind_addrs(&addr), &["[::]:0", "0.0.0.0:0"]);
+    }
+
+    #[test]
+    fn family_specific_dialback_uses_matching_bind() {
+        let ip4 = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
+        let dns4 = Multiaddr::from_str("/dns4/example.com/udp/4001/quic-v1").unwrap();
+        let ip6 = Multiaddr::from_str("/ip6/2001:db8::1/udp/4001/quic-v1").unwrap();
+        let dns6 = Multiaddr::from_str("/dns6/example.com/udp/4001/quic-v1").unwrap();
+
+        assert_eq!(dialback_bind_addrs(&ip4), &["0.0.0.0:0"]);
+        assert_eq!(dialback_bind_addrs(&dns4), &["0.0.0.0:0"]);
+        assert_eq!(dialback_bind_addrs(&ip6), &["[::]:0"]);
+        assert_eq!(dialback_bind_addrs(&dns6), &["[::]:0"]);
+    }
 }
