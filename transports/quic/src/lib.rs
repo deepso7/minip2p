@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::time::{Duration, Instant};
 
 use boring::pkey::PKey;
 use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
@@ -21,6 +22,14 @@ mod connection;
 pub use config::QuicNodeConfig;
 
 use connection::QuicConnection;
+
+const STUN_BINDING_REQUEST: u16 = 0x0001;
+const STUN_BINDING_SUCCESS_RESPONSE: u16 = 0x0101;
+const STUN_MAPPED_ADDRESS: u16 = 0x0001;
+const STUN_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
+const STUN_HEADER_LEN: usize = 20;
+const STUN_TRANSACTION_ID_LEN: usize = 12;
 
 /// Parses a QUIC multiaddr into (host protocol, port), validating the /host/udp/port/quic-v1 shape.
 fn extract_quic_host_and_port(
@@ -184,6 +193,121 @@ fn socket_addr_to_multiaddr(addr: SocketAddr) -> Multiaddr {
     }
 }
 
+fn generate_stun_transaction_id() -> Result<[u8; STUN_TRANSACTION_ID_LEN], TransportError> {
+    let mut id = [0u8; STUN_TRANSACTION_ID_LEN];
+    getrandom::fill(&mut id).map_err(|e| TransportError::PollError {
+        reason: format!("failed to generate stun transaction id: {e}"),
+    })?;
+    Ok(id)
+}
+
+fn build_stun_binding_request(transaction_id: &[u8; STUN_TRANSACTION_ID_LEN]) -> [u8; 20] {
+    let mut out = [0u8; STUN_HEADER_LEN];
+    out[0..2].copy_from_slice(&STUN_BINDING_REQUEST.to_be_bytes());
+    out[2..4].copy_from_slice(&0u16.to_be_bytes());
+    out[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    out[8..20].copy_from_slice(transaction_id);
+    out
+}
+
+fn parse_stun_binding_response(
+    packet: &[u8],
+    transaction_id: &[u8; STUN_TRANSACTION_ID_LEN],
+) -> Option<SocketAddr> {
+    if packet.len() < STUN_HEADER_LEN {
+        return None;
+    }
+    if u16::from_be_bytes([packet[0], packet[1]]) != STUN_BINDING_SUCCESS_RESPONSE {
+        return None;
+    }
+    let body_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    if packet.len() < STUN_HEADER_LEN + body_len {
+        return None;
+    }
+    if u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]) != STUN_MAGIC_COOKIE {
+        return None;
+    }
+    if &packet[8..20] != transaction_id {
+        return None;
+    }
+
+    let mut offset = STUN_HEADER_LEN;
+    let end = STUN_HEADER_LEN + body_len;
+    let mut mapped = None;
+    while offset + 4 <= end {
+        let attr_type = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+        let attr_len = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]) as usize;
+        offset += 4;
+        if offset + attr_len > end {
+            return None;
+        }
+
+        let value = &packet[offset..offset + attr_len];
+        match attr_type {
+            STUN_XOR_MAPPED_ADDRESS => {
+                if let Some(addr) = parse_stun_address(value, true, transaction_id) {
+                    return Some(addr);
+                }
+            }
+            STUN_MAPPED_ADDRESS => {
+                mapped = parse_stun_address(value, false, transaction_id);
+            }
+            _ => {}
+        }
+
+        offset += (attr_len + 3) & !3;
+    }
+    mapped
+}
+
+fn parse_stun_address(
+    value: &[u8],
+    xor: bool,
+    transaction_id: &[u8; STUN_TRANSACTION_ID_LEN],
+) -> Option<SocketAddr> {
+    if value.len() < 4 || value[0] != 0 {
+        return None;
+    }
+
+    let mut port = u16::from_be_bytes([value[2], value[3]]);
+    if xor {
+        port ^= (STUN_MAGIC_COOKIE >> 16) as u16;
+    }
+
+    match value[1] {
+        0x01 => {
+            if value.len() < 8 {
+                return None;
+            }
+            let mut ip = [value[4], value[5], value[6], value[7]];
+            if xor {
+                let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+                for (byte, mask) in ip.iter_mut().zip(cookie) {
+                    *byte ^= mask;
+                }
+            }
+            Some(SocketAddr::new(IpAddr::from(ip), port))
+        }
+        0x02 => {
+            if value.len() < 20 {
+                return None;
+            }
+            let mut ip = [0u8; 16];
+            ip.copy_from_slice(&value[4..20]);
+            if xor {
+                let mut mask = [0u8; 16];
+                mask[..4].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+                mask[4..].copy_from_slice(transaction_id);
+                for (byte, mask) in ip.iter_mut().zip(mask) {
+                    *byte ^= mask;
+                }
+            }
+            Some(SocketAddr::new(IpAddr::from(ip), port))
+        }
+        _ => None,
+    }
+}
+
 /// Builds the shared QUIC TLS configuration.
 fn build_quiche_config(node_config: &QuicNodeConfig) -> Result<quiche::Config, TransportError> {
     let mut tls_builder =
@@ -329,6 +453,65 @@ impl QuicTransport {
                 reason: format!("raw udp send to {addr} failed: {e}"),
             })?;
         Ok(())
+    }
+
+    /// Discovers this socket's external UDP mapping via a STUN Binding Request.
+    ///
+    /// The request is sent from the same UDP socket used by QUIC so the returned
+    /// address is suitable as a DCUtR candidate. Non-STUN datagrams received
+    /// while waiting are ignored; callers should run this before active QUIC
+    /// traffic starts to avoid delaying unrelated packets.
+    pub fn discover_external_addr(
+        &self,
+        stun_server: &str,
+        timeout: Duration,
+    ) -> Result<Multiaddr, TransportError> {
+        let server = stun_server
+            .to_socket_addrs()
+            .map_err(|e| TransportError::InvalidAddress {
+                context: "stun server",
+                reason: format!("failed to resolve {stun_server}: {e}"),
+            })?
+            .next()
+            .ok_or_else(|| TransportError::InvalidAddress {
+                context: "stun server",
+                reason: format!("{stun_server} resolved to no addresses"),
+            })?;
+
+        let transaction_id = generate_stun_transaction_id()?;
+        let request = build_stun_binding_request(&transaction_id);
+        self.socket
+            .send_to(&request, server)
+            .map_err(|e| TransportError::PollError {
+                reason: format!("stun send to {server} failed: {e}"),
+            })?;
+
+        let deadline = Instant::now() + timeout;
+        let mut buf = [0u8; 1500];
+        while Instant::now() < deadline {
+            match self.socket.recv_from(&mut buf) {
+                Ok((len, from)) => {
+                    if from != server {
+                        continue;
+                    }
+                    if let Some(addr) = parse_stun_binding_response(&buf[..len], &transaction_id) {
+                        return Ok(socket_addr_to_multiaddr(addr));
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    return Err(TransportError::PollError {
+                        reason: format!("stun recv failed: {e}"),
+                    });
+                }
+            }
+        }
+
+        Err(TransportError::PollError {
+            reason: format!("stun request to {server} timed out after {timeout:?}"),
+        })
     }
 
     /// Exposes the bound local socket address as a multiaddr for external use.
@@ -790,5 +973,43 @@ impl Transport for QuicTransport {
         }
 
         Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_xor_mapped_ipv4_stun_response() {
+        let tx = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let expected_ip = [203, 0, 113, 9];
+        let expected_port = 44_321u16;
+        let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+        let xport = expected_port ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+        let xip = [
+            expected_ip[0] ^ cookie[0],
+            expected_ip[1] ^ cookie[1],
+            expected_ip[2] ^ cookie[2],
+            expected_ip[3] ^ cookie[3],
+        ];
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&STUN_BINDING_SUCCESS_RESPONSE.to_be_bytes());
+        packet.extend_from_slice(&12u16.to_be_bytes());
+        packet.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        packet.extend_from_slice(&tx);
+        packet.extend_from_slice(&STUN_XOR_MAPPED_ADDRESS.to_be_bytes());
+        packet.extend_from_slice(&8u16.to_be_bytes());
+        packet.push(0);
+        packet.push(0x01);
+        packet.extend_from_slice(&xport.to_be_bytes());
+        packet.extend_from_slice(&xip);
+
+        let parsed = parse_stun_binding_response(&packet, &tx).expect("response should parse");
+        assert_eq!(
+            parsed,
+            SocketAddr::new(IpAddr::from(expected_ip), expected_port)
+        );
     }
 }

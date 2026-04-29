@@ -46,6 +46,8 @@ const HOLEPUNCH_INTERVAL: Duration = Duration::from_millis(100);
 const RESPONDER_SYNC_DELAY: Duration = Duration::from_millis(50);
 /// Payload length used by the relay-ping fallback.
 const RELAY_PING_LEN: usize = 32;
+const DEFAULT_STUN_SERVER: &str = "stun.l.google.com:19302";
+const STUN_TIMEOUT: Duration = Duration::from_millis(800);
 
 // ---------------------------------------------------------------------------
 // Listener (Peer B): reserve, accept STOP, respond DCUtR, hole-punch
@@ -57,7 +59,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     let our_addr = swarm
         .listen_on_bound_addr()
         .map_err(|e| format!("listen failed: {e}"))?;
-    let our_observed = dcutr_candidates(our_addr.transport(), &options.external_addrs);
+    let our_observed = dcutr_candidates(&swarm, our_addr.transport(), &options, role);
     println!("[{role}] bound={our_addr}");
     println!("[{role}] us={}", swarm.local_peer_id());
     print_candidates(role, &our_observed);
@@ -406,7 +408,7 @@ pub fn run_dial(
     let our_addr = swarm
         .listen_on_bound_addr()
         .map_err(|e| format!("listen failed: {e}"))?;
-    let our_observed = dcutr_candidates(our_addr.transport(), &options.external_addrs);
+    let our_observed = dcutr_candidates(&swarm, our_addr.transport(), &options, role);
     println!("[{role}] bound={our_addr}");
     println!("[{role}] us={}", swarm.local_peer_id());
     println!("[{role}] target={target}");
@@ -741,11 +743,38 @@ fn build_swarm_with_relay_protocols(
     Ok(swarm)
 }
 
-fn dcutr_candidates(bound_addr: &Multiaddr, external_addrs: &[Multiaddr]) -> Vec<Multiaddr> {
-    let mut candidates = Vec::with_capacity(external_addrs.len() + 1);
-    for addr in external_addrs {
+fn dcutr_candidates(
+    swarm: &Swarm<QuicTransport>,
+    bound_addr: &Multiaddr,
+    options: &RunOptions,
+    role: &str,
+) -> Vec<Multiaddr> {
+    let mut candidates = Vec::with_capacity(options.external_addrs.len() + 2);
+    for addr in &options.external_addrs {
         push_unique(&mut candidates, addr.clone());
     }
+
+    if !options.stun_disabled {
+        let server = options
+            .stun_server
+            .as_deref()
+            .unwrap_or(DEFAULT_STUN_SERVER);
+        match swarm
+            .transport()
+            .discover_external_addr(server, STUN_TIMEOUT)
+        {
+            Ok(addr) => {
+                println!("[{role}] stun-mapped server={server} addr={addr}");
+                push_unique(&mut candidates, addr);
+            }
+            Err(e) => {
+                eprintln!("[{role}] stun-failed server={server} reason={e}");
+            }
+        }
+    } else {
+        println!("[{role}] stun-disabled");
+    }
+
     push_unique(&mut candidates, bound_addr.clone());
     candidates
 }

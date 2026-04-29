@@ -49,20 +49,19 @@ Planned internet-ready usage:
 minip2p-peer listen \
   --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
   --key ./peer-b.key \
-  --listen /ip4/0.0.0.0/udp/0/quic-v1 \
-  --external-addr /ip4/<peer-b-public-ip>/udp/<peer-b-port>/quic-v1
+  --listen /ip4/0.0.0.0/udp/0/quic-v1
 
 minip2p-peer dial \
   --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
   --target <peer-b-id> \
   --key ./peer-a.key \
-  --listen /ip4/0.0.0.0/udp/0/quic-v1 \
-  --external-addr /ip4/<peer-a-public-ip>/udp/<peer-a-port>/quic-v1
+  --listen /ip4/0.0.0.0/udp/0/quic-v1
 ```
 
-`--external-addr` is a manual bridge to real-world testing before STUN. Once
-manual external addresses work across two networks, STUN can fill the same
-candidate slot automatically.
+Relay mode queries STUN by default (`stun.l.google.com:19302`) from the same
+UDP socket used by QUIC. `--stun <host:port>` overrides the server,
+`--no-stun` skips discovery for local/offline testing, and repeatable
+`--external-addr` remains available for known port-forwards or STUN failures.
 
 Output format is plain text, one event per line, prefixed with a role tag:
 
@@ -335,9 +334,10 @@ frame delivery without needing a separate poll round.
    - [x] Show exact listener and dialer commands.
    - [x] Log observed relay address, DCUtR candidates, direct dial attempts, direct timeout/failure reason, and relay fallback reason.
 
-5. STUN discovery
-   - Add STUN after manual `--external-addr` succeeds.
-   - STUN should populate the same candidate list as manual external addresses, not introduce new protocol coupling into core crates.
+5. STUN discovery -- DONE
+   - [x] Add STUN discovery from the QUIC socket used for DCUtR.
+   - [x] Populate the same candidate list as manual external addresses without adding protocol coupling to core crates.
+   - [x] Keep manual `--external-addr` as an override/fallback path.
 
 ## Future follow-ups (not on this branch)
 

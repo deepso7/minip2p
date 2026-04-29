@@ -18,8 +18,8 @@ Two modes:
 ```text
 minip2p-peer listen [--key <path>] [--listen <quic-multiaddr>]
 minip2p-peer dial   <peer-addr> [--key <path>] [--listen <quic-multiaddr>]
-minip2p-peer listen --relay <relay-peer-addr> [--key <path>] [--listen <quic-multiaddr>] [--external-addr <quic-multiaddr>]...
-minip2p-peer dial   --relay <relay-peer-addr> --target <peer-id> [--key <path>] [--listen <quic-multiaddr>] [--external-addr <quic-multiaddr>]...
+minip2p-peer listen --relay <relay-peer-addr> [--key <path>] [--listen <quic-multiaddr>] [--stun <host:port>|--no-stun] [--external-addr <quic-multiaddr>]...
+minip2p-peer dial   --relay <relay-peer-addr> --target <peer-id> [--key <path>] [--listen <quic-multiaddr>] [--stun <host:port>|--no-stun] [--external-addr <quic-multiaddr>]...
 ```
 
 Where:
@@ -32,8 +32,13 @@ Where:
 - `--listen <quic-multiaddr>` changes the UDP bind address; default is loopback
   (`127.0.0.1:0`). Use `/ip4/0.0.0.0/udp/0/quic-v1` or
   `/ip6/::/udp/0/quic-v1` for real-network tests.
-- `--external-addr <quic-multiaddr>` is repeatable in relay mode and advertises
-  manual DCUtR candidates before STUN exists.
+- Relay mode queries STUN by default (`stun.l.google.com:19302`) from the same
+  UDP socket used by QUIC and advertises the discovered mapping as a DCUtR
+  candidate.
+- `--stun <host:port>` overrides the STUN server. `--no-stun` skips discovery
+  for local/offline relay tests.
+- `--external-addr <quic-multiaddr>` is repeatable in relay mode and adds manual
+  DCUtR candidates when STUN is unavailable or you have a known port-forward.
 
 ## Direct mode (5-minute quickstart)
 
@@ -88,7 +93,8 @@ Peer B (listener, the NATed target):
 cargo run -p minip2p-peer -- listen --relay <relay-peer-addr> --key ./peer-b.key
 # [relay-listen] bound=/ip4/127.0.0.1/udp/52134/quic-v1/p2p/12D3KooW... (A)
 # [relay-listen] us=12D3KooW... (A)
-# [relay-listen] dcutr-candidates [/ip4/127.0.0.1/udp/52134/quic-v1]
+# [relay-listen] stun-mapped server=stun.l.google.com:19302 addr=/ip4/.../udp/.../quic-v1
+# [relay-listen] dcutr-candidates [/ip4/.../udp/.../quic-v1,/ip4/127.0.0.1/udp/52134/quic-v1]
 # [relay-listen] dialing-relay /ip4/.../p2p/12D3KooW... (relay)
 # [relay-listen] connected peer=12D3KooW... (relay)
 # [relay-listen] reserved-on-relay
@@ -111,6 +117,7 @@ cargo run -p minip2p-peer -- dial \
 # [relay-dial] bound=...
 # [relay-dial] us=...
 # [relay-dial] target=...
+# [relay-dial] stun-mapped server=stun.l.google.com:19302 addr=/ip4/.../udp/.../quic-v1
 # [relay-dial] dcutr-candidates [...]
 # [relay-dial] dialing-relay ...
 # [relay-dial] bridge-established via-relay
@@ -123,23 +130,26 @@ cargo run -p minip2p-peer -- dial \
 
 ### Public relay shape
 
-For cross-network tests, run the same commands with a public relay address,
-stable keys, non-loopback binds, and explicit public UDP candidates:
+For cross-network tests, run with a public relay address, stable keys, and
+non-loopback binds. STUN discovers the public UDP mapping automatically, so you
+do not need to know `peer-b-public-ip` before starting B:
 
 ```bash
 cargo run -p minip2p-peer -- listen \
     --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
     --key ./peer-b.key \
-    --listen /ip4/0.0.0.0/udp/0/quic-v1 \
-    --external-addr /ip4/<peer-b-public-ip>/udp/<peer-b-port>/quic-v1
+    --listen /ip4/0.0.0.0/udp/0/quic-v1
 
 cargo run -p minip2p-peer -- dial \
     --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
     --target <peer-b-id> \
     --key ./peer-a.key \
-    --listen /ip4/0.0.0.0/udp/0/quic-v1 \
-    --external-addr /ip4/<peer-a-public-ip>/udp/<peer-a-port>/quic-v1
+    --listen /ip4/0.0.0.0/udp/0/quic-v1
 ```
+
+If STUN fails or you have a known UDP port-forward, add one or more manual
+`--external-addr /ip4/<public-ip>/udp/<port>/quic-v1` candidates. Manual
+candidates are advertised before the STUN and bound-socket candidates.
 
 Expected terminal result is either `ping-direct` after a successful direct
 QUIC+mTLS connection, or `ping-via-relay` after a bounded hole-punch timeout.
@@ -195,8 +205,9 @@ protocol id, etc).
   Two minip2p peers work; a rust-libp2p peer on the other end of the
   bridge will not.
 
-- **No automatic public address discovery.** Use `--external-addr` for manual
-  DCUtR candidates. A STUN client is a future follow-up.
+- **STUN is best-effort.** Some NATs, firewalls, or corporate networks block
+  STUN or create mappings that cannot be hole-punched. In that case the demo
+  should still fall back to relay ping with diagnostics.
 
 - **No relay server.** This binary implements the client side of HOP
   and the responder side of STOP; it does not run a relay. Use the
@@ -213,7 +224,9 @@ Implemented flags:
 ```text
 --key <path>                         persist/reuse this peer's Ed25519 identity
 --listen <quic-multiaddr>            bind address, e.g. /ip4/0.0.0.0/udp/0/quic-v1
---external-addr <quic-multiaddr>     advertised public UDP candidate for DCUtR
+--stun <host:port>                   STUN server override; default is stun.l.google.com:19302
+--no-stun                            skip STUN for local/offline relay tests
+--external-addr <quic-multiaddr>     additional public UDP candidate for DCUtR
 ```
 
 Public relay workflow:
@@ -222,16 +235,11 @@ Public relay workflow:
 minip2p-peer listen \
   --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
   --key ./peer-b.key \
-  --listen /ip4/0.0.0.0/udp/0/quic-v1 \
-  --external-addr /ip4/<peer-b-public-ip>/udp/<peer-b-port>/quic-v1
+  --listen /ip4/0.0.0.0/udp/0/quic-v1
 
 minip2p-peer dial \
   --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
   --target <peer-b-id> \
   --key ./peer-a.key \
-  --listen /ip4/0.0.0.0/udp/0/quic-v1 \
-  --external-addr /ip4/<peer-a-public-ip>/udp/<peer-a-port>/quic-v1
+  --listen /ip4/0.0.0.0/udp/0/quic-v1
 ```
-
-Remaining follow-up: STUN discovery should populate the same candidate list as
-manual `--external-addr`, without adding protocol coupling to core crates.

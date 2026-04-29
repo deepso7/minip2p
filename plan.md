@@ -185,7 +185,7 @@ New crate: `crates/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 - [x] Manual external address override for DCUtR candidates (`--external-addr /ip4/<public-ip>/udp/<port>/quic-v1`) before adding STUN.
 - [x] Public relay walkthrough using rust-libp2p's relay server: relay command, listener command, dialer command, expected `ping-direct` and `ping-via-relay` output.
 - [x] Diagnostics for real-world NAT runs: print observed relay address, advertised DCUtR candidates, direct dial attempts, direct failure reason, and fallback reason.
-- [ ] STUN-based UDP mapping discovery after the manual external-address path works across two real networks.
+- [x] STUN-based UDP mapping discovery from the QUIC socket, with `--stun` override and `--no-stun` for local/offline relay tests.
 
 **Exit criteria**
 - Two peers on different networks can rendezvous through a public relay, attempt DCUtR, authenticate direct QUIC with mTLS, and either `ping-direct` or fall back to `ping-via-relay` with actionable logs.
