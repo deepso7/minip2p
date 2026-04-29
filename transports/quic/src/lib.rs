@@ -201,37 +201,36 @@ fn build_quiche_config(node_config: &QuicNodeConfig) -> Result<quiche::Config, T
         |_preverify_ok, _ctx| true,
     );
 
-    if let Some(keypair) = node_config.keypair() {
-        let (cert_der, key_der) = minip2p_tls::generate_certificate(keypair).map_err(|e| {
+    let (cert_der, key_der) =
+        minip2p_tls::generate_certificate(node_config.keypair()).map_err(|e| {
             TransportError::InvalidConfig {
                 reason: format!("failed to generate libp2p TLS certificate: {e}"),
             }
         })?;
 
-        let cert = X509::from_der(&cert_der).map_err(|e| TransportError::InvalidConfig {
-            reason: format!("failed to parse generated TLS certificate: {e}"),
+    let cert = X509::from_der(&cert_der).map_err(|e| TransportError::InvalidConfig {
+        reason: format!("failed to parse generated TLS certificate: {e}"),
+    })?;
+    tls_builder
+        .set_certificate(&cert)
+        .map_err(|e| TransportError::InvalidConfig {
+            reason: format!("failed to load generated cert into BoringSSL: {e}"),
         })?;
-        tls_builder
-            .set_certificate(&cert)
-            .map_err(|e| TransportError::InvalidConfig {
-                reason: format!("failed to load generated cert into BoringSSL: {e}"),
-            })?;
 
-        let private_key =
-            PKey::private_key_from_der(&key_der).map_err(|e| TransportError::InvalidConfig {
-                reason: format!("failed to parse generated TLS private key: {e}"),
-            })?;
-        tls_builder
-            .set_private_key(&private_key)
-            .map_err(|e| TransportError::InvalidConfig {
-                reason: format!("failed to load generated key into BoringSSL: {e}"),
-            })?;
-        tls_builder
-            .check_private_key()
-            .map_err(|e| TransportError::InvalidConfig {
-                reason: format!("generated TLS private key does not match certificate: {e}"),
-            })?;
-    }
+    let private_key =
+        PKey::private_key_from_der(&key_der).map_err(|e| TransportError::InvalidConfig {
+            reason: format!("failed to parse generated TLS private key: {e}"),
+        })?;
+    tls_builder
+        .set_private_key(&private_key)
+        .map_err(|e| TransportError::InvalidConfig {
+            reason: format!("failed to load generated key into BoringSSL: {e}"),
+        })?;
+    tls_builder
+        .check_private_key()
+        .map_err(|e| TransportError::InvalidConfig {
+            reason: format!("generated TLS private key does not match certificate: {e}"),
+        })?;
 
     let mut quiche_config =
         quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls_builder)
@@ -338,21 +337,16 @@ impl QuicTransport {
     }
 
     /// Returns this node's `PeerId`, derived from the configured keypair.
-    ///
-    /// Returns `None` if no keypair was configured.
-    pub fn local_peer_id(&self) -> Option<PeerId> {
+    pub fn local_peer_id(&self) -> PeerId {
         self.node_config.peer_id()
     }
 
     /// Returns a `PeerAddr` that other nodes can use to dial this transport.
     ///
-    /// Combines the bound socket address with this node's `PeerId`. Only
-    /// available after the transport has a keypair configured.
+    /// Combines the bound socket address with this node's `PeerId`.
     pub fn local_peer_addr(&self) -> Result<PeerAddr, TransportError> {
         let addr = self.local_addr()?;
-        let peer_id = self.local_peer_id().ok_or(TransportError::InvalidConfig {
-            reason: "no keypair configured; cannot derive local PeerAddr".into(),
-        })?;
+        let peer_id = self.local_peer_id();
         let multiaddr = socket_addr_to_multiaddr(addr);
         PeerAddr::new(multiaddr, peer_id).map_err(|e| TransportError::InvalidConfig {
             reason: format!("failed to build local PeerAddr: {e}"),
@@ -488,12 +482,6 @@ impl Transport for QuicTransport {
             return Err(TransportError::ConnectionExists { id });
         }
 
-        if self.node_config.keypair().is_none() {
-            return Err(TransportError::InvalidConfig {
-                reason: "dialer role requires an Ed25519 keypair for mutual TLS; use QuicNodeConfig::with_keypair(...) or QuicNodeConfig::dev_dialer()".into(),
-            });
-        }
-
         let peer_socket = resolve_dial_socket_addr(addr.transport(), "dial target")?;
         let local_socket = self.local_addr()?;
 
@@ -555,12 +543,6 @@ impl Transport for QuicTransport {
 
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
         let socket_addr = extract_listen_socket_addr(addr, "listen address")?;
-
-        if !self.node_config.can_listen() {
-            return Err(TransportError::InvalidConfig {
-                reason: "listener role requires an Ed25519 keypair; use QuicNodeConfig::with_keypair(...) or QuicNodeConfig::dev_listener()".into(),
-            });
-        }
 
         let local_addr = self.local_addr()?;
         ensure_listen_matches_bound_socket(socket_addr, local_addr)?;
