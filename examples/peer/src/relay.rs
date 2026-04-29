@@ -15,7 +15,6 @@ use minip2p_core::{Multiaddr, PeerAddr, PeerId};
 use minip2p_dcutr::{
     DCUTR_PROTOCOL_ID, DcutrInitiator, DcutrResponder, InitiatorOutcome, ResponderEvent,
 };
-use minip2p_identity::Ed25519Keypair;
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
 use minip2p_relay::{
     ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopReservation, ReservationOutcome,
@@ -24,13 +23,13 @@ use minip2p_relay::{
 use minip2p_swarm::{Swarm, SwarmBuilder, SwarmEvent};
 use minip2p_transport::{StreamId, Transport};
 
-use crate::cli::print_event;
+use crate::cli::{RunOptions, print_event};
+use crate::runtime::{bind_addr, load_keypair};
 
 // ---------------------------------------------------------------------------
 // Shared configuration
 // ---------------------------------------------------------------------------
 
-const LOCAL_BIND: &str = "127.0.0.1:0";
 const AGENT: &str = "minip2p-peer/0.1.0";
 /// Top-level deadline: the whole reservation + circuit + hole-punch
 /// flow should complete well inside this on a local relay.
@@ -52,15 +51,16 @@ const RELAY_PING_LEN: usize = 32;
 // Listener (Peer B): reserve, accept STOP, respond DCUtR, hole-punch
 // ---------------------------------------------------------------------------
 
-pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
+pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<dyn Error>> {
     let role = "relay-listen";
-    let mut swarm = build_swarm_with_relay_protocols()?;
+    let mut swarm = build_swarm_with_relay_protocols(&options, role)?;
     let our_addr = swarm
         .listen_on_bound_addr()
         .map_err(|e| format!("listen failed: {e}"))?;
-    let our_observed: Vec<Multiaddr> = vec![our_addr.transport().clone()];
+    let our_observed = dcutr_candidates(our_addr.transport(), &options.external_addrs);
     println!("[{role}] bound={our_addr}");
     println!("[{role}] us={}", swarm.local_peer_id());
+    print_candidates(role, &our_observed);
 
     let relay_peer_id = relay_addr.peer_id().clone();
     swarm
@@ -167,6 +167,7 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
 
     // --- 6. Hole-punch: blast UDP, wait for direct or timeout --------------
     println!("[{role}] dcutr-sync-received -> holepunching");
+    print_remote_candidates(role, &remote_addrs);
     let punch_start = Instant::now();
     let punch_deadline = punch_start + HOLEPUNCH_DEADLINE;
     let mut next_blast = punch_start + RESPONDER_SYNC_DELAY;
@@ -284,7 +285,7 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         HolePunchOutcome::Timeout => {
-            println!("[{role}] hole-punch-timeout -> relay-ping fallback");
+            println!("[{role}] hole-punch-timeout reason=deadline elapsed -> relay-ping fallback");
             // Wait up to ~15s for either an echo payload from Peer A
             // or the bridge to close (meaning A gave up). Longer
             // than the hole-punch deadline because the relay's own
@@ -395,16 +396,21 @@ fn is_bridge_closed_event(ev: &SwarmEvent, bridge_stream: StreamId) -> bool {
 // Dialer (Peer A): HOP CONNECT, DCUtR initiator, direct-dial, or fallback
 // ---------------------------------------------------------------------------
 
-pub fn run_dial(relay_addr: PeerAddr, target: PeerId) -> Result<(), Box<dyn Error>> {
+pub fn run_dial(
+    relay_addr: PeerAddr,
+    target: PeerId,
+    options: RunOptions,
+) -> Result<(), Box<dyn Error>> {
     let role = "relay-dial";
-    let mut swarm = build_swarm_with_relay_protocols()?;
+    let mut swarm = build_swarm_with_relay_protocols(&options, role)?;
     let our_addr = swarm
         .listen_on_bound_addr()
         .map_err(|e| format!("listen failed: {e}"))?;
-    let our_observed: Vec<Multiaddr> = vec![our_addr.transport().clone()];
+    let our_observed = dcutr_candidates(our_addr.transport(), &options.external_addrs);
     println!("[{role}] bound={our_addr}");
     println!("[{role}] us={}", swarm.local_peer_id());
     println!("[{role}] target={target}");
+    print_candidates(role, &our_observed);
 
     let relay_peer_id = relay_addr.peer_id().clone();
     swarm
@@ -482,6 +488,7 @@ pub fn run_dial(relay_addr: PeerAddr, target: PeerId) -> Result<(), Box<dyn Erro
         "[{role}] dcutr-dialnow addrs={} rtt={rtt_ms}ms",
         remote_addrs.len()
     );
+    print_remote_candidates(role, &remote_addrs);
 
     // --- 4. Flush SYNC and dial every observed remote address in parallel --
     dcutr
@@ -497,8 +504,8 @@ pub fn run_dial(relay_addr: PeerAddr, target: PeerId) -> Result<(), Box<dyn Erro
     for addr in &remote_addrs {
         match PeerAddr::new(addr.clone(), target.clone()) {
             Ok(pa) => match swarm.dial(&pa) {
-                Ok(_) => println!("[{role}] dialing-direct {pa}"),
-                Err(e) => eprintln!("[{role}] direct-dial {pa} failed: {e}"),
+                Ok(_) => println!("[{role}] direct-dial-attempt {pa}"),
+                Err(e) => eprintln!("[{role}] direct-dial-failed addr={pa} reason={e}"),
             },
             Err(e) => eprintln!("[{role}] bad PeerAddr for {addr}: {e}"),
         }
@@ -522,7 +529,7 @@ pub fn run_dial(relay_addr: PeerAddr, target: PeerId) -> Result<(), Box<dyn Erro
         println!("[{role}] direct-connected peer={target} (hole-punch success)");
         ping_and_exit(&mut swarm, role, target, deadline)
     } else {
-        println!("[{role}] hole-punch-timeout -> relay-ping fallback");
+        println!("[{role}] hole-punch-timeout reason=deadline elapsed -> relay-ping fallback");
         let payload = random_bytes(RELAY_PING_LEN);
         let sent_at = Instant::now();
         send(&mut swarm, &relay_peer_id, bridge_stream, payload.clone())?;
@@ -717,9 +724,13 @@ fn ping_and_exit(
 }
 
 /// Builds a swarm with the relay + DCUtR user protocols registered.
-fn build_swarm_with_relay_protocols() -> Result<Swarm<QuicTransport>, Box<dyn Error>> {
-    let keypair = Ed25519Keypair::generate();
-    let transport = QuicTransport::new(QuicNodeConfig::new(keypair.clone()), LOCAL_BIND)
+fn build_swarm_with_relay_protocols(
+    options: &RunOptions,
+    role: &str,
+) -> Result<Swarm<QuicTransport>, Box<dyn Error>> {
+    let keypair = load_keypair(options, role)?;
+    let bind_addr = bind_addr(options)?;
+    let transport = QuicTransport::new(QuicNodeConfig::new(keypair.clone()), &bind_addr)
         .map_err(|e| format!("quic bind: {e}"))?;
     let mut swarm = SwarmBuilder::new(&keypair)
         .agent_version(AGENT)
@@ -728,6 +739,39 @@ fn build_swarm_with_relay_protocols() -> Result<Swarm<QuicTransport>, Box<dyn Er
     swarm.add_user_protocol(STOP_PROTOCOL_ID);
     swarm.add_user_protocol(DCUTR_PROTOCOL_ID);
     Ok(swarm)
+}
+
+fn dcutr_candidates(bound_addr: &Multiaddr, external_addrs: &[Multiaddr]) -> Vec<Multiaddr> {
+    let mut candidates = Vec::with_capacity(external_addrs.len() + 1);
+    for addr in external_addrs {
+        push_unique(&mut candidates, addr.clone());
+    }
+    push_unique(&mut candidates, bound_addr.clone());
+    candidates
+}
+
+fn push_unique(addrs: &mut Vec<Multiaddr>, addr: Multiaddr) {
+    if !addrs.iter().any(|existing| existing == &addr) {
+        addrs.push(addr);
+    }
+}
+
+fn print_candidates(role: &str, candidates: &[Multiaddr]) {
+    let rendered = candidates
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    println!("[{role}] dcutr-candidates [{rendered}]");
+}
+
+fn print_remote_candidates(role: &str, candidates: &[Multiaddr]) {
+    let rendered = candidates
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    println!("[{role}] remote-dcutr-candidates [{rendered}]");
 }
 
 /// Sends a random 32-byte UDP payload to every remote address. These

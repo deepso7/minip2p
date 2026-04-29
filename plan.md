@@ -178,7 +178,19 @@ New crate: `crates/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 **Exit criteria**
 - `TransportEvent::PeerIdentityVerified` fires on the server side of a mutual-TLS QUIC handshake; the synthetic PeerId path in Swarm is exercised only as a fallback, not as the default.
 
-### Milestone 7: Additional transports and operational polish
+### Milestone 7: Internet-ready relay/DCUtR demo
+
+- [x] Persistent identities for `examples/peer` via `--key <path>` so peer IDs survive restarts and can be used as stable relay targets.
+- [x] Configurable listen address for `examples/peer` (default remains loopback for local DX; `--listen /ip4/0.0.0.0/udp/0/quic-v1` enables real-network tests).
+- [x] Manual external address override for DCUtR candidates (`--external-addr /ip4/<public-ip>/udp/<port>/quic-v1`) before adding STUN.
+- [x] Public relay walkthrough using rust-libp2p's relay server: relay command, listener command, dialer command, expected `ping-direct` and `ping-via-relay` output.
+- [x] Diagnostics for real-world NAT runs: print observed relay address, advertised DCUtR candidates, direct dial attempts, direct failure reason, and fallback reason.
+- [ ] STUN-based UDP mapping discovery after the manual external-address path works across two real networks.
+
+**Exit criteria**
+- Two peers on different networks can rendezvous through a public relay, attempt DCUtR, authenticate direct QUIC with mTLS, and either `ping-direct` or fall back to `ping-via-relay` with actionable logs.
+
+### Milestone 8: Additional transports and operational polish
 
 - TCP + TLS transport adapter (reuses `minip2p-tls`).
 - WebSocket transport adapter.
