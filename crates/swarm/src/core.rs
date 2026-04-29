@@ -635,6 +635,11 @@ impl SwarmCore {
         target: ProtocolKind,
     ) -> Result<(), SwarmError> {
         let conn_id = self.require_conn(peer_id)?;
+        debug_assert_eq!(
+            self.conn_to_peer.get(&conn_id),
+            Some(peer_id),
+            "protocol opens must use a connection mapped to the requested peer"
+        );
         let token = self.next_open_token();
         self.pending_opens.insert(
             token,

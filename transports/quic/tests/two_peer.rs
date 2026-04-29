@@ -1,6 +1,9 @@
+use std::net::UdpSocket;
+
 use minip2p_core::PeerAddr;
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, TransportEvent};
+use quiche::ConnectionId as QuicConnectionId;
 
 fn setup_pair() -> (QuicTransport, QuicTransport, PeerAddr) {
     let mut server =
@@ -263,6 +266,112 @@ fn listener_rejects_dialer_without_mtls_identity() {
 }
 
 #[test]
+fn dialer_rejects_listener_with_unexpected_peer_id() {
+    let mut listener_a =
+        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("listener a");
+    let mut listener_b =
+        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("listener b");
+    let mut dialer =
+        QuicTransport::new(QuicNodeConfig::dev_dialer(), "127.0.0.1:0").expect("dialer");
+
+    listener_a.listen_on_bound_addr().expect("listen a");
+    listener_b.listen_on_bound_addr().expect("listen b");
+
+    let listener_a_addr = listener_a.local_peer_addr().expect("listener a addr");
+    let listener_b_peer = listener_b.local_peer_id().expect("listener b peer id");
+    let wrong_peer_addr =
+        PeerAddr::new(listener_a_addr.transport().clone(), listener_b_peer).expect("peer addr");
+
+    let conn_id = ConnectionId::new(88);
+    dialer.dial(conn_id, &wrong_peer_addr).expect("dial starts");
+
+    let mut saw_mismatch = false;
+    let mut saw_connected = false;
+
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let _ = listener_a.poll().expect("listener a poll");
+        let events = dialer.poll().expect("dialer poll");
+
+        saw_mismatch |= events.iter().any(|event| {
+            matches!(event, TransportEvent::Error { message, .. } if message.contains("peer id mismatch"))
+        });
+        saw_connected |= events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Connected { .. }));
+
+        if saw_mismatch {
+            break;
+        }
+    }
+
+    assert!(saw_mismatch, "dialer must report peer id mismatch");
+    assert!(!saw_connected, "dialer must not connect wrong peer id");
+}
+
+#[test]
+fn listener_rejects_dialer_with_invalid_libp2p_cert() {
+    let mut server =
+        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("server bind");
+    server.listen_on_bound_addr().expect("server listen");
+    let server_addr = server.local_addr().expect("server socket addr");
+
+    let client_socket = UdpSocket::bind("127.0.0.1:0").expect("client socket");
+    client_socket
+        .set_nonblocking(true)
+        .expect("client socket nonblocking");
+    let client_addr = client_socket.local_addr().expect("client local addr");
+
+    let mut config = vanilla_tls_quiche_config();
+    let scid = QuicConnectionId::from_vec(vec![0x42; quiche::MAX_CONN_ID_LEN]);
+    let mut conn = quiche::connect(None, &scid, client_addr, server_addr, &mut config)
+        .expect("raw quiche connect");
+
+    flush_raw_quiche_client(&mut conn, &client_socket);
+
+    let mut saw_incoming = false;
+    let mut saw_cert_error = false;
+    let mut saw_connected = false;
+    let mut saw_verified = false;
+
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        for event in server.poll().expect("server poll") {
+            saw_incoming |= matches!(event, TransportEvent::IncomingConnection { .. });
+            saw_cert_error |= matches!(
+                event,
+                TransportEvent::Error { ref message, .. }
+                    if message.contains("peer TLS certificate verification failed")
+            );
+            saw_connected |= matches!(event, TransportEvent::Connected { .. });
+            saw_verified |= matches!(event, TransportEvent::PeerIdentityVerified { .. });
+        }
+
+        drain_raw_quiche_client(&mut conn, &client_socket, client_addr);
+        flush_raw_quiche_client(&mut conn, &client_socket);
+
+        if saw_cert_error || conn.is_closed() {
+            break;
+        }
+    }
+
+    assert!(
+        saw_incoming,
+        "listener may surface pre-auth incoming connection"
+    );
+    assert!(saw_cert_error, "listener must reject invalid libp2p cert");
+    assert!(
+        !saw_connected,
+        "listener must not connect invalid libp2p cert"
+    );
+    assert!(
+        !saw_verified,
+        "listener must not verify invalid libp2p cert"
+    );
+}
+
+#[test]
 fn mtls_verifies_listener_side_client_identity_and_updates_peer_index() {
     let (mut server, mut client, peer_addr) = setup_pair();
     let client_peer_id = client.local_peer_id().expect("client peer id");
@@ -391,4 +500,90 @@ fn open_stream_before_connected_returns_invalid_state() {
 fn stream_id_round_trips_as_u64() {
     let id = StreamId::new(1234);
     assert_eq!(id.as_u64(), 1234);
+}
+
+fn vanilla_tls_quiche_config() -> quiche::Config {
+    use boring::asn1::Asn1Time;
+    use boring::hash::MessageDigest;
+    use boring::nid::Nid;
+    use boring::pkey::PKey;
+    use boring::rsa::Rsa;
+    use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
+    use boring::x509::{X509, X509Name};
+
+    let rsa = Rsa::generate(2048).expect("rsa key");
+    let pkey = PKey::from_rsa(rsa).expect("pkey");
+
+    let mut name = X509Name::builder().expect("name builder");
+    name.append_entry_by_nid(Nid::COMMONNAME, "invalid-libp2p-cert")
+        .expect("common name");
+    let name = name.build();
+
+    let mut cert = X509::builder().expect("x509 builder");
+    cert.set_version(2).expect("version");
+    cert.set_subject_name(&name).expect("subject");
+    cert.set_issuer_name(&name).expect("issuer");
+    cert.set_not_before(&Asn1Time::days_from_now(0).expect("not before"))
+        .expect("set not before");
+    cert.set_not_after(&Asn1Time::days_from_now(365).expect("not after"))
+        .expect("set not after");
+    cert.set_pubkey(&pkey).expect("pubkey");
+    cert.sign(&pkey, MessageDigest::sha256())
+        .expect("sign cert");
+    let cert = cert.build();
+
+    let mut tls = SslContextBuilder::new(SslMethod::tls()).expect("tls context");
+    tls.set_verify_callback(
+        SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
+        |_preverify_ok, _ctx| true,
+    );
+    tls.set_certificate(&cert).expect("set cert");
+    tls.set_private_key(&pkey).expect("set key");
+    tls.check_private_key().expect("check key");
+
+    let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls)
+        .expect("quiche config");
+    config.set_application_protos(&[b"libp2p"]).expect("alpn");
+    config.set_initial_max_data(10_000_000);
+    config.set_initial_max_stream_data_bidi_local(1_000_000);
+    config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    config.set_initial_max_streams_bidi(100);
+    config.set_max_recv_udp_payload_size(1350);
+    config.set_max_send_udp_payload_size(1350);
+    config
+}
+
+fn flush_raw_quiche_client(conn: &mut quiche::Connection, socket: &UdpSocket) {
+    let mut out = [0u8; 1350];
+    loop {
+        match conn.send(&mut out) {
+            Ok((written, send_info)) => {
+                socket
+                    .send_to(&out[..written], send_info.to)
+                    .expect("raw client send");
+            }
+            Err(quiche::Error::Done) => break,
+            Err(e) => panic!("raw client send failed: {e}"),
+        }
+    }
+}
+
+fn drain_raw_quiche_client(
+    conn: &mut quiche::Connection,
+    socket: &UdpSocket,
+    local: std::net::SocketAddr,
+) {
+    let mut buf = [0u8; 65535];
+    loop {
+        let (len, from) = match socket.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("raw client recv failed: {e}"),
+        };
+        let recv_info = quiche::RecvInfo { from, to: local };
+        match conn.recv(&mut buf[..len], recv_info) {
+            Ok(_) | Err(quiche::Error::Done) => {}
+            Err(e) => panic!("raw client quiche recv failed: {e}"),
+        }
+    }
 }
