@@ -533,6 +533,9 @@ fn swarm_to_transport_error(err: SwarmError) -> TransportError {
         } => TransportError::PollError {
             reason: format!("peer {peer_id} does not support protocol '{protocol_id}'"),
         },
+        SwarmError::UserStreamNotFound { peer_id, stream_id } => TransportError::PollError {
+            reason: format!("user stream {stream_id} for peer {peer_id} is not active"),
+        },
         SwarmError::PingError { reason } => TransportError::PollError {
             reason: format!("ping error: {reason}"),
         },

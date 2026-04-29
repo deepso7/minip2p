@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/autonat",
     "crates/core",
     "crates/dcutr",
     "crates/identify",

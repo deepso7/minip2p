@@ -314,7 +314,7 @@ impl SwarmCore {
         stream_id: StreamId,
         data: Vec<u8>,
     ) -> Result<(), SwarmError> {
-        let conn_id = self.require_conn(peer_id)?;
+        let conn_id = self.require_user_stream_conn(peer_id, stream_id)?;
         self.actions.push(SwarmAction::SendStream {
             conn_id,
             stream_id,
@@ -329,7 +329,7 @@ impl SwarmCore {
         peer_id: &PeerId,
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
-        let conn_id = self.require_conn(peer_id)?;
+        let conn_id = self.require_user_stream_conn(peer_id, stream_id)?;
         self.actions
             .push(SwarmAction::CloseStreamWrite { conn_id, stream_id });
         Ok(())
@@ -341,7 +341,7 @@ impl SwarmCore {
         peer_id: &PeerId,
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
-        let conn_id = self.require_conn(peer_id)?;
+        let conn_id = self.require_user_stream_conn(peer_id, stream_id)?;
         self.actions
             .push(SwarmAction::ResetStream { conn_id, stream_id });
         Ok(())
@@ -561,6 +561,29 @@ impl SwarmCore {
             .copied()
             .ok_or_else(|| SwarmError::NotConnected {
                 peer_id: peer_id.clone(),
+            })
+    }
+
+    fn require_user_stream_conn(
+        &self,
+        peer_id: &PeerId,
+        stream_id: StreamId,
+    ) -> Result<ConnectionId, SwarmError> {
+        self.stream_owner
+            .iter()
+            .find_map(|((conn_id, sid), protocol)| {
+                if *sid == stream_id
+                    && matches!(protocol, ProtocolKind::User(_))
+                    && self.conn_to_peer.get(conn_id) == Some(peer_id)
+                {
+                    Some(*conn_id)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| SwarmError::UserStreamNotFound {
+                peer_id: peer_id.clone(),
+                stream_id,
             })
     }
 
@@ -1375,7 +1398,7 @@ mod tests {
 
     use minip2p_identify::IdentifyConfig;
     use minip2p_ping::PingConfig;
-    use minip2p_transport::{ConnectionEndpoint, ConnectionId, TransportEvent};
+    use minip2p_transport::{ConnectionEndpoint, ConnectionId, StreamId, TransportEvent};
 
     use super::*;
 
@@ -1458,5 +1481,70 @@ mod tests {
             .expect("transport error should surface");
         assert_eq!(error.peer_id.as_ref(), Some(&peer_id));
         assert_eq!(error.conn_id, Some(conn_id));
+    }
+
+    #[test]
+    fn user_stream_send_uses_connection_that_owns_stream() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
+        let original_conn = ConnectionId::new(1);
+        let newer_conn = ConnectionId::new(2);
+        let stream_id = StreamId::new(4);
+
+        core.conn_to_peer.insert(original_conn, peer_id.clone());
+        core.conn_to_peer.insert(newer_conn, peer_id.clone());
+        core.peer_to_conn.insert(peer_id.clone(), newer_conn);
+        core.stream_owner.insert(
+            (original_conn, stream_id),
+            ProtocolKind::User("/minip2p/test/1.0.0".into()),
+        );
+
+        core.send_user_stream(&peer_id, stream_id, b"ok".to_vec())
+            .expect("user stream should be active on original connection");
+        let actions = core.take_actions();
+
+        assert!(matches!(
+            actions.as_slice(),
+            [SwarmAction::SendStream { conn_id, stream_id: sid, data }]
+                if *conn_id == original_conn && *sid == stream_id && data == b"ok"
+        ));
+    }
+
+    #[test]
+    fn superseding_connection_invalidates_old_user_streams() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
+        let original_conn = ConnectionId::new(10);
+        let newer_conn = ConnectionId::new(11);
+        let stream_id = StreamId::new(8);
+
+        core.on_transport_event(
+            TransportEvent::Connected {
+                id: original_conn,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+            0,
+        );
+        core.stream_owner.insert(
+            (original_conn, stream_id),
+            ProtocolKind::User("/minip2p/test/1.0.0".into()),
+        );
+
+        core.on_transport_event(
+            TransportEvent::Connected {
+                id: newer_conn,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+            0,
+        );
+
+        let err = core
+            .send_user_stream(&peer_id, stream_id, b"lost".to_vec())
+            .expect_err("supersede should remove streams owned by original connection");
+        assert!(matches!(
+            err,
+            SwarmError::UserStreamNotFound { peer_id: p, stream_id: s }
+                if p == peer_id && s == stream_id
+        ));
     }
 }

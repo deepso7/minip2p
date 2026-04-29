@@ -8,13 +8,12 @@ use std::error::Error;
 use std::time::{Duration, Instant};
 
 use minip2p_core::PeerAddr;
-use minip2p_identity::Ed25519Keypair;
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
 use minip2p_swarm::{Swarm, SwarmBuilder, SwarmEvent};
 
-use crate::cli::print_event;
+use crate::cli::{RunOptions, print_event};
+use crate::runtime::{bind_addr, load_keypair};
 
-const LOCAL_BIND: &str = "127.0.0.1:0";
 const AGENT: &str = "minip2p-peer/0.1.0";
 /// Far-future deadline for the listener; practically "run forever".
 const LISTEN_FOREVER: Duration = Duration::from_secs(60 * 60 * 24 * 365);
@@ -22,8 +21,8 @@ const LISTEN_FOREVER: Duration = Duration::from_secs(60 * 60 * 24 * 365);
 const DIAL_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Runs the listener until interrupted (SIGINT).
-pub fn run_listen() -> Result<(), Box<dyn Error>> {
-    let mut swarm = build_swarm()?;
+pub fn run_listen(options: RunOptions) -> Result<(), Box<dyn Error>> {
+    let mut swarm = build_swarm(&options, "listen")?;
     let peer_addr = swarm
         .listen_on_bound_addr()
         .map_err(|e| format!("listen failed: {e}"))?;
@@ -45,8 +44,8 @@ pub fn run_listen() -> Result<(), Box<dyn Error>> {
 }
 
 /// Dials `target`, waits for Identify, pings, prints RTT, exits.
-pub fn run_dial(target: PeerAddr) -> Result<(), Box<dyn Error>> {
-    let mut swarm = build_swarm()?;
+pub fn run_dial(target: PeerAddr, options: RunOptions) -> Result<(), Box<dyn Error>> {
+    let mut swarm = build_swarm(&options, "dial")?;
     let target_peer_id = target.peer_id().clone();
     swarm
         .dial(&target)
@@ -83,9 +82,10 @@ pub fn run_dial(target: PeerAddr) -> Result<(), Box<dyn Error>> {
 /// Builds a `Swarm<QuicTransport>` bound to an ephemeral loopback UDP
 /// port with a fresh Ed25519 identity and the default Identify/Ping
 /// stack.
-fn build_swarm() -> Result<Swarm<QuicTransport>, Box<dyn Error>> {
-    let keypair = Ed25519Keypair::generate();
-    let transport = QuicTransport::new(QuicNodeConfig::new(keypair.clone()), LOCAL_BIND)
+fn build_swarm(options: &RunOptions, role: &str) -> Result<Swarm<QuicTransport>, Box<dyn Error>> {
+    let keypair = load_keypair(options, role)?;
+    let bind_addr = bind_addr(options)?;
+    let transport = QuicTransport::new(QuicNodeConfig::new(keypair.clone()), &bind_addr)
         .map_err(|e| format!("quic bind failed: {e}"))?;
     Ok(SwarmBuilder::new(&keypair)
         .agent_version(AGENT)

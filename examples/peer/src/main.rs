@@ -10,6 +10,7 @@
 mod cli;
 mod direct;
 mod relay;
+mod runtime;
 
 use cli::{CliError, Mode};
 
@@ -34,9 +35,14 @@ fn main() {
 /// in the `relay` / `holepunch` modules in subsequent steps.
 fn run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
     match mode {
-        Mode::DirectListen => direct::run_listen(),
-        Mode::DirectDial { target } => direct::run_dial(target),
-        Mode::RelayListen { relay } => relay::run_listen(relay),
-        Mode::RelayDial { relay, target } => relay::run_dial(relay, target),
+        Mode::DirectListen { options } => direct::run_listen(options),
+        Mode::DirectDial { target, options } => direct::run_dial(target, options),
+        Mode::RelayListen { relay, options } => relay::run_listen(relay, options),
+        Mode::RelayDial {
+            relay,
+            target,
+            options,
+        } => relay::run_dial(relay, target, options),
+        Mode::AutoNatServer { options } => relay::run_autonat_server(options),
     }
 }

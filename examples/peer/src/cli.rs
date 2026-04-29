@@ -17,9 +17,10 @@
 //! Keeping the parser hand-rolled avoids pulling in `clap` for the 4-mode
 //! CLI and keeps the whole example dependency-light.
 
+use std::path::PathBuf;
 use std::str::FromStr;
 
-use minip2p_core::{PeerAddr, PeerId};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId};
 use minip2p_swarm::SwarmEvent;
 
 /// The four modes the CLI dispatches to.
@@ -27,15 +28,40 @@ use minip2p_swarm::SwarmEvent;
 pub enum Mode {
     /// Bind a QUIC socket, listen, print our peer-addr, and echo every
     /// inbound ping. No relay involvement.
-    DirectListen,
+    DirectListen { options: RunOptions },
     /// Dial a peer directly, run ping, and exit on the first RTT event.
-    DirectDial { target: PeerAddr },
+    DirectDial {
+        target: PeerAddr,
+        options: RunOptions,
+    },
     /// Connect to a relay, reserve a slot, accept an incoming circuit,
     /// then drive DCUtR + hole-punch against whoever calls us.
-    RelayListen { relay: PeerAddr },
+    RelayListen {
+        relay: PeerAddr,
+        options: RunOptions,
+    },
     /// Connect to a relay, open a circuit to `target`, drive DCUtR as the
     /// initiator, and fall back to relayed ping if hole-punch fails.
-    RelayDial { relay: PeerAddr, target: PeerId },
+    RelayDial {
+        relay: PeerAddr,
+        target: PeerId,
+        options: RunOptions,
+    },
+    /// Public AutoNAT service: accepts probes and dials candidates back.
+    AutoNatServer { options: RunOptions },
+}
+
+/// Runtime options common to direct and relay modes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RunOptions {
+    /// Optional persistent Ed25519 raw-secret file.
+    pub key_path: Option<PathBuf>,
+    /// Optional QUIC listen/bind multiaddr. Defaults to loopback UDP/0.
+    pub listen_addr: Option<Multiaddr>,
+    /// Extra DCUtR candidates advertised in relay mode.
+    pub external_addrs: Vec<Multiaddr>,
+    /// Optional AutoNAT service peer used to validate candidate dialability.
+    pub autonat: Option<PeerAddr>,
 }
 
 /// Parse error surfaced back to `main` so the binary exits with a readable
@@ -61,6 +87,7 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode, CliError> {
     match subcommand.as_str() {
         "listen" => parse_listen(args),
         "dial" => parse_dial(args),
+        "autonat" => parse_autonat(args),
         "-h" | "--help" | "help" => Err(CliError(usage())),
         other => Err(CliError(format!(
             "unknown subcommand '{other}'\n\n{}",
@@ -81,9 +108,16 @@ fn parse_listen(args: Vec<String>) -> Result<Mode, CliError> {
         ));
     }
 
+    let options = flags.options;
+    if flags.relay.is_none() && options.has_relay_mode_only_flags() {
+        return Err(CliError(
+            "--autonat and --external-addr are only valid with relay modes".into(),
+        ));
+    }
+
     match flags.relay {
-        None => Ok(Mode::DirectListen),
-        Some(relay) => Ok(Mode::RelayListen { relay }),
+        None => Ok(Mode::DirectListen { options }),
+        Some(relay) => Ok(Mode::RelayListen { relay, options }),
     }
 }
 
@@ -96,28 +130,42 @@ fn parse_dial(args: Vec<String>) -> Result<Mode, CliError> {
     // transport address, the second gives us a relay + a bare peer id.
     let mut positional: Vec<String> = Vec::new();
     let mut rest: Vec<String> = Vec::new();
-    let mut iter = args.into_iter();
-    while let Some(arg) = iter.next() {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
         if arg.starts_with("--") {
-            rest.push(arg);
-            if let Some(v) = iter.next() {
-                rest.push(v);
-            }
+            rest.push(arg.clone());
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| CliError(format!("flag '{arg}' requires a value")))?;
+            rest.push(value.clone());
+            i += 2;
         } else {
-            positional.push(arg);
+            positional.push(arg.clone());
+            i += 1;
         }
     }
 
     let flags = Flags::from(rest.as_slice())?;
 
+    let options = flags.options;
     match (positional.len(), flags.relay, flags.target) {
         (1, None, None) => {
+            if options.has_relay_mode_only_flags() {
+                return Err(CliError(
+                    "--autonat and --external-addr are only valid with relay modes".into(),
+                ));
+            }
             let raw = &positional[0];
             let target = PeerAddr::from_str(raw)
                 .map_err(|e| CliError(format!("invalid peer-addr '{raw}': {e}")))?;
-            Ok(Mode::DirectDial { target })
+            Ok(Mode::DirectDial { target, options })
         }
-        (0, Some(relay), Some(target)) => Ok(Mode::RelayDial { relay, target }),
+        (0, Some(relay), Some(target)) => Ok(Mode::RelayDial {
+            relay,
+            target,
+            options,
+        }),
         (0, Some(_), None) => Err(CliError(
             "`dial --relay <addr>` requires `--target <peer-id>`".into(),
         )),
@@ -131,26 +179,37 @@ fn parse_dial(args: Vec<String>) -> Result<Mode, CliError> {
     }
 }
 
+fn parse_autonat(args: Vec<String>) -> Result<Mode, CliError> {
+    let flags = Flags::from(args.as_slice())?;
+    if flags.relay.is_some() || flags.target.is_some() || flags.options.has_relay_mode_only_flags()
+    {
+        return Err(CliError("`autonat` accepts only --key and --listen".into()));
+    }
+    Ok(Mode::AutoNatServer {
+        options: flags.options,
+    })
+}
+
 /// Accumulated values for the `--relay` / `--target` flags.
 struct Flags {
     relay: Option<PeerAddr>,
     target: Option<PeerId>,
+    options: RunOptions,
 }
 
 impl Flags {
     fn from(args: &[String]) -> Result<Self, CliError> {
         let mut relay: Option<PeerAddr> = None;
         let mut target: Option<PeerId> = None;
+        let mut options = RunOptions::default();
 
         let mut i = 0;
         while i < args.len() {
             let key = &args[i];
-            let value = args
-                .get(i + 1)
-                .ok_or_else(|| CliError(format!("flag '{key}' requires a value")))?;
 
             match key.as_str() {
                 "--relay" => {
+                    let value = flag_value(args, i, key)?;
                     if relay.is_some() {
                         return Err(CliError("--relay specified twice".into()));
                     }
@@ -160,11 +219,50 @@ impl Flags {
                     );
                 }
                 "--target" => {
+                    let value = flag_value(args, i, key)?;
                     if target.is_some() {
                         return Err(CliError("--target specified twice".into()));
                     }
                     target = Some(PeerId::from_str(value).map_err(|e| {
                         CliError(format!("invalid --target peer id '{value}': {e}"))
+                    })?);
+                }
+                "--key" => {
+                    let value = flag_value(args, i, key)?;
+                    if options.key_path.is_some() {
+                        return Err(CliError("--key specified twice".into()));
+                    }
+                    options.key_path = Some(PathBuf::from(value));
+                }
+                "--listen" => {
+                    let value = flag_value(args, i, key)?;
+                    if options.listen_addr.is_some() {
+                        return Err(CliError("--listen specified twice".into()));
+                    }
+                    let addr = parse_quic_multiaddr("--listen", value)?;
+                    if !matches!(
+                        addr.protocols().first(),
+                        Some(minip2p_core::Protocol::Ip4(_) | minip2p_core::Protocol::Ip6(_))
+                    ) {
+                        return Err(CliError(format!(
+                            "--listen requires /ip4 or /ip6 host, got '{value}'"
+                        )));
+                    }
+                    options.listen_addr = Some(addr);
+                }
+                "--external-addr" => {
+                    let value = flag_value(args, i, key)?;
+                    options
+                        .external_addrs
+                        .push(parse_quic_multiaddr("--external-addr", value)?);
+                }
+                "--autonat" => {
+                    let value = flag_value(args, i, key)?;
+                    if options.autonat.is_some() {
+                        return Err(CliError("--autonat specified twice".into()));
+                    }
+                    options.autonat = Some(PeerAddr::from_str(value).map_err(|e| {
+                        CliError(format!("invalid --autonat peer-addr '{value}': {e}"))
                     })?);
                 }
                 other => {
@@ -174,8 +272,34 @@ impl Flags {
             i += 2;
         }
 
-        Ok(Self { relay, target })
+        Ok(Self {
+            relay,
+            target,
+            options,
+        })
     }
+}
+
+impl RunOptions {
+    fn has_relay_mode_only_flags(&self) -> bool {
+        !self.external_addrs.is_empty() || self.autonat.is_some()
+    }
+}
+
+fn flag_value<'a>(args: &'a [String], i: usize, key: &str) -> Result<&'a String, CliError> {
+    args.get(i + 1)
+        .ok_or_else(|| CliError(format!("flag '{key}' requires a value")))
+}
+
+fn parse_quic_multiaddr(flag: &str, value: &str) -> Result<Multiaddr, CliError> {
+    let addr = Multiaddr::from_str(value)
+        .map_err(|e| CliError(format!("invalid {flag} '{value}': {e}")))?;
+    if !addr.is_quic_transport() {
+        return Err(CliError(format!(
+            "{flag} must be /ip4|ip6|dns|dns4|dns6/<host>/udp/<port>/quic-v1, got '{value}'"
+        )));
+    }
+    Ok(addr)
 }
 
 /// Prints a [`SwarmEvent`] in the plan's one-event-per-line format.
@@ -193,7 +317,15 @@ pub fn print_event(role: &str, event: &SwarmEvent) {
         SwarmEvent::IdentifyReceived { peer_id, info } => {
             let agent = info.agent_version.as_deref().unwrap_or("?");
             let nprotos = info.protocols.len();
-            println!("[{role}] identify peer={peer_id} agent={agent} protocols={nprotos}");
+            let observed = info
+                .observed_addr
+                .as_deref()
+                .and_then(|bytes| Multiaddr::from_bytes(bytes).ok())
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| "?".into());
+            println!(
+                "[{role}] identify peer={peer_id} agent={agent} protocols={nprotos} observed={observed}"
+            );
         }
         SwarmEvent::PeerReady { peer_id, protocols } => {
             println!(
@@ -250,16 +382,21 @@ pub fn usage() -> String {
     "minip2p-peer -- demo CLI for the full minip2p stack.
 
 USAGE:
-    minip2p-peer listen
-    minip2p-peer dial   <peer-addr>
-    minip2p-peer listen --relay <relay-peer-addr>
-    minip2p-peer dial   --relay <relay-peer-addr> --target <peer-id>
+    minip2p-peer listen [--key <path>] [--listen <quic-multiaddr>]
+    minip2p-peer dial   <peer-addr> [--key <path>] [--listen <quic-multiaddr>]
+    minip2p-peer autonat [--key <path>] [--listen <quic-multiaddr>]
+    minip2p-peer listen --relay <relay-peer-addr> [--autonat <peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--external-addr <quic-multiaddr>]...
+    minip2p-peer dial   --relay <relay-peer-addr> --target <peer-id> [--autonat <peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--external-addr <quic-multiaddr>]...
 
 NOTES:
     <peer-addr>        full libp2p-style address ending in /p2p/<peer-id>
                        (e.g. /ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3...)
     <relay-peer-addr>  same format, pointing at the relay server
     <peer-id>          bare libp2p PeerId (12D3... or Qm...)
+    --key              persistent Ed25519 raw-secret file (hex)
+    --listen           bind multiaddr; default is 127.0.0.1:0
+    --external-addr    repeatable relay-mode DCUtR candidate
+    --autonat          relay-mode public AutoNAT service for dialability checks
 
     See holepunch-plan.md at the repo root for full semantics."
         .to_string()
@@ -275,6 +412,8 @@ mod tests {
 
     const PEER_ADDR: &str =
         "/ip4/127.0.0.1/udp/4001/quic-v1/p2p/QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N";
+    const QUIC_ADDR: &str = "/ip4/0.0.0.0/udp/0/quic-v1";
+    const EXTERNAL_ADDR: &str = "/ip4/203.0.113.7/udp/4001/quic-v1";
     const PEER_ID: &str = "QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N";
 
     #[test]
@@ -286,7 +425,7 @@ mod tests {
     #[test]
     fn listen_without_args() {
         match parse(v(&["listen"])).unwrap() {
-            Mode::DirectListen => {}
+            Mode::DirectListen { options } => assert_eq!(options, RunOptions::default()),
             other => panic!("expected DirectListen, got {other:?}"),
         }
     }
@@ -294,7 +433,37 @@ mod tests {
     #[test]
     fn listen_with_relay() {
         match parse(v(&["listen", "--relay", PEER_ADDR])).unwrap() {
-            Mode::RelayListen { .. } => {}
+            Mode::RelayListen { options, .. } => assert_eq!(options, RunOptions::default()),
+            other => panic!("expected RelayListen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn listen_accepts_key_and_listen_addr() {
+        match parse(v(&["listen", "--key", "./peer.key", "--listen", QUIC_ADDR])).unwrap() {
+            Mode::DirectListen { options } => {
+                assert_eq!(options.key_path, Some(PathBuf::from("./peer.key")));
+                assert_eq!(options.listen_addr.unwrap().to_string(), QUIC_ADDR);
+            }
+            other => panic!("expected DirectListen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_listen_accepts_external_addr() {
+        match parse(v(&[
+            "listen",
+            "--relay",
+            PEER_ADDR,
+            "--external-addr",
+            EXTERNAL_ADDR,
+        ]))
+        .unwrap()
+        {
+            Mode::RelayListen { options, .. } => {
+                assert_eq!(options.external_addrs.len(), 1);
+                assert_eq!(options.external_addrs[0].to_string(), EXTERNAL_ADDR);
+            }
             other => panic!("expected RelayListen, got {other:?}"),
         }
     }
@@ -302,7 +471,7 @@ mod tests {
     #[test]
     fn dial_with_positional_peer_addr() {
         match parse(v(&["dial", PEER_ADDR])).unwrap() {
-            Mode::DirectDial { .. } => {}
+            Mode::DirectDial { options, .. } => assert_eq!(options, RunOptions::default()),
             other => panic!("expected DirectDial, got {other:?}"),
         }
     }
@@ -310,9 +479,80 @@ mod tests {
     #[test]
     fn dial_with_relay_and_target() {
         match parse(v(&["dial", "--relay", PEER_ADDR, "--target", PEER_ID])).unwrap() {
-            Mode::RelayDial { .. } => {}
+            Mode::RelayDial { options, .. } => assert_eq!(options, RunOptions::default()),
             other => panic!("expected RelayDial, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn relay_dial_accepts_repeated_external_addrs() {
+        match parse(v(&[
+            "dial",
+            "--relay",
+            PEER_ADDR,
+            "--target",
+            PEER_ID,
+            "--external-addr",
+            EXTERNAL_ADDR,
+            "--external-addr",
+            "/ip4/203.0.113.8/udp/4002/quic-v1",
+        ]))
+        .unwrap()
+        {
+            Mode::RelayDial { options, .. } => assert_eq!(options.external_addrs.len(), 2),
+            other => panic!("expected RelayDial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_dial_accepts_autonat_service() {
+        match parse(v(&[
+            "dial",
+            "--relay",
+            PEER_ADDR,
+            "--target",
+            PEER_ID,
+            "--autonat",
+            PEER_ADDR,
+        ]))
+        .unwrap()
+        {
+            Mode::RelayDial { options, .. } => {
+                assert_eq!(options.autonat.unwrap().to_string(), PEER_ADDR);
+            }
+            other => panic!("expected RelayDial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn autonat_server_accepts_key_and_listen_addr() {
+        match parse(v(&[
+            "autonat",
+            "--key",
+            "./autonat.key",
+            "--listen",
+            QUIC_ADDR,
+        ]))
+        .unwrap()
+        {
+            Mode::AutoNatServer { options } => {
+                assert_eq!(options.key_path, Some(PathBuf::from("./autonat.key")));
+                assert_eq!(options.listen_addr.unwrap().to_string(), QUIC_ADDR);
+            }
+            other => panic!("expected AutoNatServer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_mode_rejects_external_addr() {
+        let err = parse(v(&["listen", "--external-addr", EXTERNAL_ADDR])).unwrap_err();
+        assert!(err.0.contains("--external-addr"));
+    }
+
+    #[test]
+    fn direct_mode_rejects_autonat_flag() {
+        let err = parse(v(&["listen", "--autonat", PEER_ADDR])).unwrap_err();
+        assert!(err.0.contains("--autonat"));
     }
 
     #[test]

@@ -20,6 +20,7 @@ Implemented crates:
 - `crates/ping` (`minip2p-ping`)
 - `crates/identify` (`minip2p-identify`)
 - `crates/relay` (`minip2p-relay`)
+- `crates/autonat` (`minip2p-autonat`)
 - `crates/dcutr` (`minip2p-dcutr`)
 - `crates/transport` (`minip2p-transport`)
 - `crates/tls` (`minip2p-tls`)
@@ -35,6 +36,7 @@ Current validated capabilities:
 - End-to-end protocol stack: QUIC transport + multistream-select + ping in integration tests.
 - Transport contract with documented lifecycle guarantees and 12 conformance tests.
 - Varint helpers shared via `minip2p-identity` and re-exported through `minip2p-core`.
+- AutoNAT reachability probe wire logic and client/server state machines as a `no_std + alloc` Sans-I/O crate.
 - Rustdoc on all public APIs. Internal comments on all private functions and types.
 
 ## Architecture Boundaries
@@ -52,6 +54,7 @@ Callers pump events and bytes in; the crate emits actions/events out.
 - `crates/ping`: `/ipfs/ping/1.0.0` state machine.
 - `crates/identify`: `/ipfs/id/1.0.0` state machine.
 - `crates/relay`: Circuit Relay v2 client state machines (`HopReservation`, `HopConnect`, `StopResponder`).
+- `crates/autonat`: AutoNAT reachability probe state machines (`AutoNatClient`, `AutoNatServer`).
 - `crates/dcutr`: DCUtR hole-punch coordination state machines (`DcutrInitiator`, `DcutrResponder`).
 - `crates/swarm` (core): `SwarmCore` -- Sans-I/O orchestration state machine. Composes the protocol state machines, tracks connections and streams, drives multistream-select for inbound and outbound streams, emits `SwarmAction` for the driver to execute and `SwarmEvent` for the application.
 
@@ -169,7 +172,7 @@ New crate: `crates/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 
 **Exit criteria**
 - Two minip2p peers connect via a real relay server, negotiate DCUtR, attempt hole punch, and succeed (direct ping) or fall back to relay ping.
-- Deferred (larger scope): STUN client for address discovery, relay server binary, production-grade refusal handling.
+- Deferred (larger scope): relay server binary, production-grade refusal handling, and deeper AutoNAT policy integration into Swarm.
 
 ### Milestone 6: Architectural cleanup -- DONE
 
@@ -178,7 +181,19 @@ New crate: `crates/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 **Exit criteria**
 - `TransportEvent::PeerIdentityVerified` fires on the server side of a mutual-TLS QUIC handshake; the synthetic PeerId path in Swarm is exercised only as a fallback, not as the default.
 
-### Milestone 7: Additional transports and operational polish
+### Milestone 7: Internet-ready relay/DCUtR demo
+
+- [x] Persistent identities for `examples/peer` via `--key <path>` so peer IDs survive restarts and can be used as stable relay targets.
+- [x] Configurable listen address for `examples/peer` (default remains loopback for local DX; `--listen /ip4/0.0.0.0/udp/0/quic-v1` enables real-network tests).
+- [x] Manual external address override for DCUtR candidates (`--external-addr /ip4/<public-ip>/udp/<port>/quic-v1`) for known public addresses and port-forwards.
+- [x] Public relay walkthrough using rust-libp2p's relay server: relay command, listener command, dialer command, expected `ping-direct` and `ping-via-relay` output.
+- [x] Diagnostics for real-world NAT runs: print observed relay address, advertised DCUtR candidates, direct dial attempts, direct failure reason, and fallback reason.
+- [x] AutoNAT reachability probe support with `minip2p-autonat` (`no_std + alloc`, Sans-I/O), `minip2p-peer autonat`, and relay-mode `--autonat <peer-addr>` validation.
+
+**Exit criteria**
+- Two peers on different networks can rendezvous through a public relay, attempt DCUtR, authenticate direct QUIC with mTLS, and either `ping-direct` or fall back to `ping-via-relay` with actionable logs.
+
+### Milestone 8: Additional transports and operational polish
 
 - TCP + TLS transport adapter (reuses `minip2p-tls`).
 - WebSocket transport adapter.
@@ -206,7 +221,7 @@ and rotation policy belong to hosts.
 
 - Unit tests for core parsing/types and error behavior.
 - Integration tests for two-peer connectivity per transport.
-- `cargo check --no-default-features` for `crates/identity`, `crates/core`, `crates/transport`, and `crates/tls`.
+- `cargo check --no-default-features` for `crates/identity`, `crates/core`, `crates/transport`, `crates/tls`, and `crates/autonat`.
 - Stable, documented error messages for common misconfiguration paths.
 - Dependency and footprint discipline for core crates.
 
