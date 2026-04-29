@@ -156,9 +156,8 @@ impl<T: Transport> Swarm<T> {
 
     /// Returns this node's own `PeerId`.
     ///
-    /// Unlike `swarm.transport().local_peer_id()` (transport-specific and
-    /// `Option`-wrapped), this accessor is infallible because the
-    /// [`crate::SwarmBuilder`] requires a keypair at construction time.
+    /// This accessor is infallible because the [`crate::SwarmBuilder`] requires
+    /// a keypair at construction time.
     pub fn local_peer_id(&self) -> &PeerId {
         &self.local_peer_id
     }

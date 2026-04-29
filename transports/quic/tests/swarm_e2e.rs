@@ -12,8 +12,7 @@ use minip2p_transport::{StreamId, TransportError};
 
 fn make_swarm(keypair: Ed25519Keypair) -> Swarm<QuicTransport> {
     let transport =
-        QuicTransport::new(QuicNodeConfig::with_keypair(keypair.clone()), "127.0.0.1:0")
-            .expect("bind");
+        QuicTransport::new(QuicNodeConfig::new(keypair.clone()), "127.0.0.1:0").expect("bind");
     SwarmBuilder::new(&keypair)
         .agent_version("minip2p-test/0.1.0")
         .build(transport)

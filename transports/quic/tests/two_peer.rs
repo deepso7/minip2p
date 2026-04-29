@@ -220,49 +220,49 @@ fn close_stream_write_emits_remote_write_closed() {
 }
 
 #[test]
-fn listen_without_tls_returns_config_error_and_no_listening_event() {
-    let config = QuicNodeConfig::new();
-    let mut transport = QuicTransport::new(config, "127.0.0.1:0").expect("bind");
-
-    let err = transport
-        .listen_on_bound_addr()
-        .expect_err("listen should fail");
-    assert!(matches!(err, TransportError::InvalidConfig { .. }));
-
-    let events = transport.poll().expect("poll should still work");
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, TransportEvent::Listening { .. })),
-        "listening event must not be emitted on failed listen"
-    );
-}
-
-#[test]
 fn listener_rejects_dialer_without_mtls_identity() {
     let mut server =
         QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("server bind");
-    let mut anonymous_client =
-        QuicTransport::new(QuicNodeConfig::new(), "127.0.0.1:0").expect("client bind");
-
     server.listen_on_bound_addr().expect("server listen");
-    let peer_addr = server.local_peer_addr().expect("peer addr");
+    let server_addr = server.local_addr().expect("server socket addr");
 
-    let err = anonymous_client
-        .dial(ConnectionId::new(77), &peer_addr)
-        .expect_err("anonymous client must not start mTLS dial");
-    assert!(matches!(err, TransportError::InvalidConfig { .. }));
+    let client_socket = UdpSocket::bind("127.0.0.1:0").expect("client socket");
+    client_socket
+        .set_nonblocking(true)
+        .expect("client socket nonblocking");
+    let client_addr = client_socket.local_addr().expect("client local addr");
 
-    let server_events = server.poll().expect("server poll");
+    let mut config = raw_quiche_config(None);
+    let scid = QuicConnectionId::from_vec(vec![0x24; quiche::MAX_CONN_ID_LEN]);
+    let mut conn = quiche::connect(None, &scid, client_addr, server_addr, &mut config)
+        .expect("raw quiche connect");
+
+    flush_raw_quiche_client(&mut conn, &client_socket);
+
+    let mut saw_connected = false;
+    let mut saw_verified = false;
+
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        for event in server.poll().expect("server poll") {
+            saw_connected |= matches!(event, TransportEvent::Connected { .. });
+            saw_verified |= matches!(event, TransportEvent::PeerIdentityVerified { .. });
+        }
+
+        drain_raw_quiche_client(&mut conn, &client_socket, client_addr);
+        flush_raw_quiche_client(&mut conn, &client_socket);
+
+        if conn.is_closed() {
+            break;
+        }
+    }
+
     assert!(
-        server_events.iter().all(|event| !matches!(
-            event,
-            TransportEvent::IncomingConnection { .. }
-                | TransportEvent::Connected { .. }
-                | TransportEvent::PeerIdentityVerified { .. }
-        )),
-        "anonymous dial must not reach the listener"
+        !saw_connected,
+        "listener must not connect anonymous clients"
     );
+    assert!(!saw_verified, "anonymous clients must not verify identity");
 }
 
 #[test]
@@ -278,7 +278,7 @@ fn dialer_rejects_listener_with_unexpected_peer_id() {
     listener_b.listen_on_bound_addr().expect("listen b");
 
     let listener_a_addr = listener_a.local_peer_addr().expect("listener a addr");
-    let listener_b_peer = listener_b.local_peer_id().expect("listener b peer id");
+    let listener_b_peer = listener_b.local_peer_id();
     let wrong_peer_addr =
         PeerAddr::new(listener_a_addr.transport().clone(), listener_b_peer).expect("peer addr");
 
@@ -322,7 +322,8 @@ fn listener_rejects_dialer_with_invalid_libp2p_cert() {
         .expect("client socket nonblocking");
     let client_addr = client_socket.local_addr().expect("client local addr");
 
-    let mut config = vanilla_tls_quiche_config();
+    let (cert, key) = vanilla_tls_identity();
+    let mut config = raw_quiche_config(Some((&cert, &key)));
     let scid = QuicConnectionId::from_vec(vec![0x42; quiche::MAX_CONN_ID_LEN]);
     let mut conn = quiche::connect(None, &scid, client_addr, server_addr, &mut config)
         .expect("raw quiche connect");
@@ -374,7 +375,7 @@ fn listener_rejects_dialer_with_invalid_libp2p_cert() {
 #[test]
 fn mtls_verifies_listener_side_client_identity_and_updates_peer_index() {
     let (mut server, mut client, peer_addr) = setup_pair();
-    let client_peer_id = client.local_peer_id().expect("client peer id");
+    let client_peer_id = client.local_peer_id();
 
     let client_conn_id = ConnectionId::new(42);
     client
@@ -502,13 +503,15 @@ fn stream_id_round_trips_as_u64() {
     assert_eq!(id.as_u64(), 1234);
 }
 
-fn vanilla_tls_quiche_config() -> quiche::Config {
+fn vanilla_tls_identity() -> (
+    boring::x509::X509,
+    boring::pkey::PKey<boring::pkey::Private>,
+) {
     use boring::asn1::Asn1Time;
     use boring::hash::MessageDigest;
     use boring::nid::Nid;
     use boring::pkey::PKey;
     use boring::rsa::Rsa;
-    use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
     use boring::x509::{X509, X509Name};
 
     let rsa = Rsa::generate(2048).expect("rsa key");
@@ -532,14 +535,27 @@ fn vanilla_tls_quiche_config() -> quiche::Config {
         .expect("sign cert");
     let cert = cert.build();
 
+    (cert, pkey)
+}
+
+fn raw_quiche_config(
+    identity: Option<(
+        &boring::x509::X509,
+        &boring::pkey::PKey<boring::pkey::Private>,
+    )>,
+) -> quiche::Config {
+    use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
+
     let mut tls = SslContextBuilder::new(SslMethod::tls()).expect("tls context");
     tls.set_verify_callback(
         SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
         |_preverify_ok, _ctx| true,
     );
-    tls.set_certificate(&cert).expect("set cert");
-    tls.set_private_key(&pkey).expect("set key");
-    tls.check_private_key().expect("check key");
+    if let Some((cert, pkey)) = identity {
+        tls.set_certificate(cert).expect("set cert");
+        tls.set_private_key(pkey).expect("set key");
+        tls.check_private_key().expect("check key");
+    }
 
     let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls)
         .expect("quiche config");

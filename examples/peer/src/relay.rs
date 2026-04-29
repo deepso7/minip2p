@@ -719,7 +719,7 @@ fn ping_and_exit(
 /// Builds a swarm with the relay + DCUtR user protocols registered.
 fn build_swarm_with_relay_protocols() -> Result<Swarm<QuicTransport>, Box<dyn Error>> {
     let keypair = Ed25519Keypair::generate();
-    let transport = QuicTransport::new(QuicNodeConfig::with_keypair(keypair.clone()), LOCAL_BIND)
+    let transport = QuicTransport::new(QuicNodeConfig::new(keypair.clone()), LOCAL_BIND)
         .map_err(|e| format!("quic bind: {e}"))?;
     let mut swarm = SwarmBuilder::new(&keypair)
         .agent_version(AGENT)

@@ -85,7 +85,7 @@ pub fn run_dial(target: PeerAddr) -> Result<(), Box<dyn Error>> {
 /// stack.
 fn build_swarm() -> Result<Swarm<QuicTransport>, Box<dyn Error>> {
     let keypair = Ed25519Keypair::generate();
-    let transport = QuicTransport::new(QuicNodeConfig::with_keypair(keypair.clone()), LOCAL_BIND)
+    let transport = QuicTransport::new(QuicNodeConfig::new(keypair.clone()), LOCAL_BIND)
         .map_err(|e| format!("quic bind failed: {e}"))?;
     Ok(SwarmBuilder::new(&keypair)
         .agent_version(AGENT)

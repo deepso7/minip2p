@@ -17,6 +17,7 @@ No async runtime required. The host drives the transport by calling `poll()`.
 - Stream events (`StreamOpened`, `IncomingStream`, `StreamData`, `StreamRemoteWriteClosed`, `StreamClosed`).
 - Mutual libp2p TLS peer authentication. Dialing and listening require a configured Ed25519 keypair.
 - Automatic peer-id verification from libp2p TLS certificates. `Connected` carries the verified endpoint; `PeerIdentityVerified` is also emitted when the peer index is bound or updated.
+- `QuicNodeConfig` is identity-first: constructing a transport requires an Ed25519 host keypair.
 - Dial supports `/ip4`, `/ip6`, `/dns`, `/dns4`, `/dns6` QUIC transport addresses.
 
 ## Basic usage
@@ -28,7 +29,7 @@ use minip2p_quic::{QuicNodeConfig, QuicTransport};
 use minip2p_transport::{ConnectionId, Transport};
 
 let listener_key = Ed25519Keypair::generate();
-let listener_cfg = QuicNodeConfig::with_keypair(listener_key.clone());
+let listener_cfg = QuicNodeConfig::new(listener_key.clone());
 let mut listener = QuicTransport::new(listener_cfg, "127.0.0.1:0")?;
 
 let local = listener.local_addr()?;
