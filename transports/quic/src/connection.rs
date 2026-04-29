@@ -157,40 +157,49 @@ impl QuicConnection {
             self.flush(socket)?;
 
             // Auto-verify the remote peer's identity from their TLS certificate.
-            if let Some(peer_cert_der) = self.conn.peer_cert() {
-                match minip2p_tls::verify_libp2p_certificate(peer_cert_der) {
-                    Ok(verified_peer_id) => {
-                        // If the dialer specified an expected PeerId (via PeerAddr),
-                        // reject the connection if the verified identity doesn't match.
-                        if let Some(expected) = self.endpoint.peer_id() {
-                            if *expected != verified_peer_id {
-                                events.push(TransportEvent::Error {
-                                    id: self.id,
-                                    message: format!(
-                                        "peer id mismatch: dialed {expected} but server certificate proves {verified_peer_id}"
-                                    ),
-                                });
-                                // Close the connection — the peer is not who we expected.
-                                let _ = self.conn.close(true, 0x01, b"peer id mismatch");
-                                self.state = ConnectionState::Closing;
-                                self.flush(socket)?;
-                                return Ok(());
-                            }
+            let Some(peer_cert_der) = self.conn.peer_cert() else {
+                events.push(TransportEvent::Error {
+                    id: self.id,
+                    message: "peer TLS certificate missing".into(),
+                });
+                let _ = self.conn.close(true, 0x03, b"peer certificate missing");
+                self.state = ConnectionState::Closing;
+                self.flush(socket)?;
+                return Ok(());
+            };
+
+            match minip2p_tls::verify_libp2p_certificate(peer_cert_der) {
+                Ok(verified_peer_id) => {
+                    // If the dialer specified an expected PeerId (via PeerAddr),
+                    // reject the connection if the verified identity doesn't match.
+                    if let Some(expected) = self.endpoint.peer_id() {
+                        if *expected != verified_peer_id {
+                            events.push(TransportEvent::Error {
+                                id: self.id,
+                                message: format!(
+                                    "peer id mismatch: dialed {expected} but server certificate proves {verified_peer_id}"
+                                ),
+                            });
+                            // Close the connection — the peer is not who we expected.
+                            let _ = self.conn.close(true, 0x01, b"peer id mismatch");
+                            self.state = ConnectionState::Closing;
+                            self.flush(socket)?;
+                            return Ok(());
                         }
-                        self.endpoint.set_peer_id(verified_peer_id);
                     }
-                    Err(e) => {
-                        events.push(TransportEvent::Error {
-                            id: self.id,
-                            message: format!("peer TLS certificate verification failed: {e}"),
-                        });
-                        let _ = self
-                            .conn
-                            .close(true, 0x02, b"certificate verification failed");
-                        self.state = ConnectionState::Closing;
-                        self.flush(socket)?;
-                        return Ok(());
-                    }
+                    self.endpoint.set_peer_id(verified_peer_id);
+                }
+                Err(e) => {
+                    events.push(TransportEvent::Error {
+                        id: self.id,
+                        message: format!("peer TLS certificate verification failed: {e}"),
+                    });
+                    let _ = self
+                        .conn
+                        .close(true, 0x02, b"certificate verification failed");
+                    self.state = ConnectionState::Closing;
+                    self.flush(socket)?;
+                    return Ok(());
                 }
             }
 

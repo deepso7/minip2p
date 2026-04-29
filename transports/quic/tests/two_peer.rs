@@ -236,6 +236,33 @@ fn listen_without_tls_returns_config_error_and_no_listening_event() {
 }
 
 #[test]
+fn listener_rejects_dialer_without_mtls_identity() {
+    let mut server =
+        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("server bind");
+    let mut anonymous_client =
+        QuicTransport::new(QuicNodeConfig::new(), "127.0.0.1:0").expect("client bind");
+
+    server.listen_on_bound_addr().expect("server listen");
+    let peer_addr = server.local_peer_addr().expect("peer addr");
+
+    let err = anonymous_client
+        .dial(ConnectionId::new(77), &peer_addr)
+        .expect_err("anonymous client must not start mTLS dial");
+    assert!(matches!(err, TransportError::InvalidConfig { .. }));
+
+    let server_events = server.poll().expect("server poll");
+    assert!(
+        server_events.iter().all(|event| !matches!(
+            event,
+            TransportEvent::IncomingConnection { .. }
+                | TransportEvent::Connected { .. }
+                | TransportEvent::PeerIdentityVerified { .. }
+        )),
+        "anonymous dial must not reach the listener"
+    );
+}
+
+#[test]
 fn mtls_verifies_listener_side_client_identity_and_updates_peer_index() {
     let (mut server, mut client, peer_addr) = setup_pair();
     let client_peer_id = client.local_peer_id().expect("client peer id");

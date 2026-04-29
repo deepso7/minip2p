@@ -191,11 +191,15 @@ fn build_quiche_config(node_config: &QuicNodeConfig) -> Result<quiche::Config, T
             reason: format!("failed to create BoringSSL context: {e}"),
         })?;
 
-    // Request peer certificates on both client and server handshakes. BoringSSL's
-    // chain validation is intentionally bypassed here because libp2p TLS uses
-    // self-signed certificates with identity proof in a custom extension; the
-    // transport verifies that extension after QUIC reports the peer certificate.
-    tls_builder.set_verify_callback(SslVerifyMode::PEER, |_preverify_ok, _ctx| true);
+    // Require peer certificates on server handshakes and request them on client
+    // handshakes. BoringSSL's chain validation is intentionally bypassed here
+    // because libp2p TLS uses self-signed certificates with identity proof in a
+    // custom extension; the transport verifies that extension after QUIC reports
+    // the peer certificate.
+    tls_builder.set_verify_callback(
+        SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
+        |_preverify_ok, _ctx| true,
+    );
 
     if let Some(keypair) = node_config.keypair() {
         let (cert_der, key_der) = minip2p_tls::generate_certificate(keypair).map_err(|e| {
@@ -482,6 +486,12 @@ impl Transport for QuicTransport {
     fn dial(&mut self, id: ConnectionId, addr: &PeerAddr) -> Result<(), TransportError> {
         if self.connections.contains_key(&id) {
             return Err(TransportError::ConnectionExists { id });
+        }
+
+        if self.node_config.keypair().is_none() {
+            return Err(TransportError::InvalidConfig {
+                reason: "dialer role requires an Ed25519 keypair for mutual TLS; use QuicNodeConfig::with_keypair(...) or QuicNodeConfig::dev_dialer()".into(),
+            });
         }
 
         let peer_socket = resolve_dial_socket_addr(addr.transport(), "dial target")?;
