@@ -397,8 +397,7 @@ impl SwarmCore {
                 if let Some(peer_id) = endpoint.peer_id() {
                     self.register_connection(id, peer_id.clone());
                 } else {
-                    // Peer identity is not yet known (e.g. server side with
-                    // verify_peer(false)). Synthesize a placeholder PeerId
+                    // Peer identity is not yet known. Synthesize a placeholder PeerId
                     // for internal bookkeeping so protocol handlers can still
                     // operate. No ConnectionEstablished event yet -- we emit
                     // one when the real identity arrives via

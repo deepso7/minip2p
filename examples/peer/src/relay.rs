@@ -252,16 +252,12 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
             ping_and_exit(&mut swarm, role, peer_id, deadline)
         }
         HolePunchOutcome::InboundConnectionSeen => {
-            // We can't ping the remote from our side (don't know their
-            // verified peer id without mTLS), and we can't detect when
-            // the remote's own ping round-trip completes either. Run
-            // the event loop for a short grace window so we stay
-            // responsive to inbound streams (including the remote's
-            // ping, which would otherwise time out waiting on our
-            // echo).
+            // We saw an inbound direct path but this CLI flow has not mapped it
+            // back to the remote relay peer yet. Run the event loop for a short
+            // grace window so we stay responsive to inbound streams.
             println!(
                 "[{role}] inbound-direct-connection detected (hole-punch success; \
-                 remote peer-id unverified pre-mTLS)"
+                 waiting for peer mapping)"
             );
             let grace_deadline = Instant::now() + Duration::from_secs(2);
             let _ = swarm
@@ -275,12 +271,11 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
         }
         HolePunchOutcome::BridgeClosed => {
             // Relay closed the circuit. Most likely the remote went
-            // direct and no longer needs the bridge; we just can't
-            // confirm that independently without mutual TLS on the
-            // QUIC server side. Exit cleanly.
+            // direct and no longer needs the bridge; this CLI treats
+            // that as a clean terminal state.
             println!(
                 "[{role}] bridge-closed (remote likely completed via direct path; \
-                 mTLS gap prevents confirmation) -- done"
+                 relay no longer needed) -- done"
             );
             Ok(())
         }

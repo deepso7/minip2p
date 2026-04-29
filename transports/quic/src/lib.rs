@@ -6,6 +6,9 @@
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 
+use boring::pkey::PKey;
+use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
+use boring::x509::X509;
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
@@ -181,6 +184,73 @@ fn socket_addr_to_multiaddr(addr: SocketAddr) -> Multiaddr {
     }
 }
 
+/// Builds the shared QUIC TLS configuration.
+fn build_quiche_config(node_config: &QuicNodeConfig) -> Result<quiche::Config, TransportError> {
+    let mut tls_builder =
+        SslContextBuilder::new(SslMethod::tls()).map_err(|e| TransportError::ListenFailed {
+            reason: format!("failed to create BoringSSL context: {e}"),
+        })?;
+
+    // Request peer certificates on both client and server handshakes. BoringSSL's
+    // chain validation is intentionally bypassed here because libp2p TLS uses
+    // self-signed certificates with identity proof in a custom extension; the
+    // transport verifies that extension after QUIC reports the peer certificate.
+    tls_builder.set_verify_callback(SslVerifyMode::PEER, |_preverify_ok, _ctx| true);
+
+    if let Some(keypair) = node_config.keypair() {
+        let (cert_der, key_der) = minip2p_tls::generate_certificate(keypair).map_err(|e| {
+            TransportError::InvalidConfig {
+                reason: format!("failed to generate libp2p TLS certificate: {e}"),
+            }
+        })?;
+
+        let cert = X509::from_der(&cert_der).map_err(|e| TransportError::InvalidConfig {
+            reason: format!("failed to parse generated TLS certificate: {e}"),
+        })?;
+        tls_builder
+            .set_certificate(&cert)
+            .map_err(|e| TransportError::InvalidConfig {
+                reason: format!("failed to load generated cert into BoringSSL: {e}"),
+            })?;
+
+        let private_key =
+            PKey::private_key_from_der(&key_der).map_err(|e| TransportError::InvalidConfig {
+                reason: format!("failed to parse generated TLS private key: {e}"),
+            })?;
+        tls_builder
+            .set_private_key(&private_key)
+            .map_err(|e| TransportError::InvalidConfig {
+                reason: format!("failed to load generated key into BoringSSL: {e}"),
+            })?;
+        tls_builder
+            .check_private_key()
+            .map_err(|e| TransportError::InvalidConfig {
+                reason: format!("generated TLS private key does not match certificate: {e}"),
+            })?;
+    }
+
+    let mut quiche_config =
+        quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls_builder)
+            .map_err(|e| TransportError::ListenFailed {
+                reason: format!("failed to create quiche config: {e}"),
+            })?;
+
+    quiche_config
+        .set_application_protos(&[b"libp2p"])
+        .map_err(|e| TransportError::ListenFailed {
+            reason: format!("failed to set alpn: {e}"),
+        })?;
+
+    quiche_config.set_initial_max_data(10_000_000);
+    quiche_config.set_initial_max_stream_data_bidi_local(1_000_000);
+    quiche_config.set_initial_max_stream_data_bidi_remote(1_000_000);
+    quiche_config.set_initial_max_streams_bidi(100);
+    quiche_config.set_max_recv_udp_payload_size(1350);
+    quiche_config.set_max_send_udp_payload_size(1350);
+
+    Ok(quiche_config)
+}
+
 /// QUIC transport backed by a non-blocking UDP socket and `quiche`.
 pub struct QuicTransport {
     /// Non-blocking UDP socket for all QUIC traffic.
@@ -201,16 +271,11 @@ pub struct QuicTransport {
     next_connection_id: u64,
     /// Retained node configuration.
     node_config: QuicNodeConfig,
-    /// Temp files for the auto-generated TLS cert/key. Held here to keep them
-    /// alive for the lifetime of the transport (quiche reads from file paths).
-    _tls_temp_files: Option<(tempfile::NamedTempFile, tempfile::NamedTempFile)>,
 }
 
 impl QuicTransport {
     /// Creates a new QUIC transport bound to the given address.
     pub fn new(node_config: QuicNodeConfig, bind_addr: &str) -> Result<Self, TransportError> {
-        use std::io::Write;
-
         let socket = UdpSocket::bind(bind_addr).map_err(|e| TransportError::ListenFailed {
             reason: format!("failed to bind udp socket: {e}"),
         })?;
@@ -221,91 +286,7 @@ impl QuicTransport {
                 reason: format!("failed to set nonblocking: {e}"),
             })?;
 
-        let mut quiche_config = quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| {
-            TransportError::ListenFailed {
-                reason: format!("failed to create quiche config: {e}"),
-            }
-        })?;
-
-        quiche_config
-            .set_application_protos(&[b"libp2p"])
-            .map_err(|e| TransportError::ListenFailed {
-                reason: format!("failed to set alpn: {e}"),
-            })?;
-
-        quiche_config.set_initial_max_data(10_000_000);
-        quiche_config.set_initial_max_stream_data_bidi_local(1_000_000);
-        quiche_config.set_initial_max_stream_data_bidi_remote(1_000_000);
-        quiche_config.set_initial_max_streams_bidi(100);
-        quiche_config.set_max_recv_udp_payload_size(1350);
-        quiche_config.set_max_send_udp_payload_size(1350);
-        quiche_config.verify_peer(false);
-
-        // Auto-generate libp2p TLS cert from Ed25519 keypair.
-        //
-        // NOTE: quiche only supports loading certs/keys from PEM file paths
-        // (no in-memory API in the default build). We write to temp files as a
-        // workaround. The files are auto-deleted when the transport is dropped.
-        // To avoid this, quiche would need the `boringssl-boring-crate` feature
-        // for in-memory cert loading via `SslContextBuilder`.
-        let tls_temp_files = if let Some(keypair) = node_config.keypair() {
-            let (cert_der, key_der) = minip2p_tls::generate_certificate(keypair).map_err(|e| {
-                TransportError::InvalidConfig {
-                    reason: format!("failed to generate libp2p TLS certificate: {e}"),
-                }
-            })?;
-
-            let cert_pem = minip2p_tls::cert_to_pem(&cert_der);
-            let key_pem = minip2p_tls::private_key_to_pem(&key_der);
-
-            let mut cert_file =
-                tempfile::NamedTempFile::new().map_err(|e| TransportError::InvalidConfig {
-                    reason: format!("failed to create temp cert file: {e}"),
-                })?;
-            cert_file.write_all(cert_pem.as_bytes()).map_err(|e| {
-                TransportError::InvalidConfig {
-                    reason: format!("failed to write temp cert file: {e}"),
-                }
-            })?;
-
-            let mut key_file =
-                tempfile::NamedTempFile::new().map_err(|e| TransportError::InvalidConfig {
-                    reason: format!("failed to create temp key file: {e}"),
-                })?;
-            key_file
-                .write_all(key_pem.as_bytes())
-                .map_err(|e| TransportError::InvalidConfig {
-                    reason: format!("failed to write temp key file: {e}"),
-                })?;
-
-            let cert_path = cert_file
-                .path()
-                .to_str()
-                .ok_or(TransportError::InvalidConfig {
-                    reason: "temp cert file path is not valid UTF-8".into(),
-                })?;
-            quiche_config
-                .load_cert_chain_from_pem_file(cert_path)
-                .map_err(|e| TransportError::InvalidConfig {
-                    reason: format!("failed to load generated cert into quiche: {e}"),
-                })?;
-
-            let key_path = key_file
-                .path()
-                .to_str()
-                .ok_or(TransportError::InvalidConfig {
-                    reason: "temp key file path is not valid UTF-8".into(),
-                })?;
-            quiche_config
-                .load_priv_key_from_pem_file(key_path)
-                .map_err(|e| TransportError::InvalidConfig {
-                    reason: format!("failed to load generated key into quiche: {e}"),
-                })?;
-
-            Some((cert_file, key_file))
-        } else {
-            None
-        };
+        let quiche_config = build_quiche_config(&node_config)?;
 
         Ok(Self {
             socket,
@@ -317,7 +298,6 @@ impl QuicTransport {
             listen_addr: None,
             next_connection_id: 1,
             node_config,
-            _tls_temp_files: tls_temp_files,
         })
     }
 
@@ -762,13 +742,34 @@ impl Transport for QuicTransport {
 
             if let Some(id) = target_conn_id {
                 let mut source_cid: Option<Vec<u8>> = None;
+                let mut identity_update: Option<(Option<PeerId>, ConnectionEndpoint)> = None;
                 if let Some(conn) = self.connections.get_mut(&id) {
+                    let previous_peer_id = conn.endpoint().peer_id().cloned();
                     conn.recv_packet(packet, from, local_addr, &self.socket, &mut events)?;
                     source_cid = Some(conn.source_cid_bytes());
+                    if conn.endpoint().peer_id() != previous_peer_id.as_ref() {
+                        identity_update = Some((previous_peer_id, conn.endpoint().clone()));
+                    }
                 }
 
                 if let Some(source_cid) = source_cid {
                     self.cid_to_connection.insert(source_cid, id);
+                }
+
+                if let Some((previous_peer_id, endpoint)) = identity_update {
+                    if let Some(previous) = previous_peer_id.as_ref() {
+                        self.remove_peer_connection(previous, id);
+                    }
+
+                    if let Some(peer_id) = endpoint.peer_id() {
+                        self.index_peer_connection(peer_id.clone(), id);
+                    }
+
+                    events.push(TransportEvent::PeerIdentityVerified {
+                        id,
+                        endpoint,
+                        previous_peer_id,
+                    });
                 }
             }
         }

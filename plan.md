@@ -171,9 +171,9 @@ New crate: `crates/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 - Two minip2p peers connect via a real relay server, negotiate DCUtR, attempt hole punch, and succeed (direct ping) or fall back to relay ping.
 - Deferred (larger scope): STUN client for address discovery, relay server binary, production-grade refusal handling.
 
-### Milestone 6: Architectural cleanup
+### Milestone 6: Architectural cleanup -- DONE
 
-- [ ] Mutual TLS on the QUIC transport so the listener side learns the real client PeerId without the synthetic-placeholder dance. Requires either `quiche`'s `boringssl-boring-crate` feature with a custom verify callback, or an upstream change.
+- [x] Mutual TLS on the QUIC transport so the listener side learns the real client PeerId without the synthetic-placeholder dance. Uses `quiche`'s `boringssl-boring-crate` feature with a permissive TLS verify callback; libp2p certificate identity verification remains in `minip2p-tls` after the QUIC handshake.
 
 **Exit criteria**
 - `TransportEvent::PeerIdentityVerified` fires on the server side of a mutual-TLS QUIC handshake; the synthetic PeerId path in Swarm is exercised only as a fallback, not as the default.

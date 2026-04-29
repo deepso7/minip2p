@@ -468,9 +468,8 @@ impl PingProtocol {
     /// Re-keys all state for `old_peer_id` to `new_peer_id`.
     ///
     /// Used when the swarm discovers a connection's real peer identity after
-    /// initially registering the connection under a placeholder (e.g. the
-    /// listener side of a one-way TLS handshake creates a synthetic PeerId
-    /// that is upgraded once the real identity is verified).
+    /// initially registering the connection under a placeholder that is
+    /// upgraded once the real identity is verified.
     ///
     /// Also rewrites any buffered events still referencing `old_peer_id` so
     /// the application only ever sees events under the real PeerId.

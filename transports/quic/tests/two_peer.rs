@@ -1,6 +1,4 @@
-use std::str::FromStr;
-
-use minip2p_core::{PeerAddr, PeerId};
+use minip2p_core::PeerAddr;
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, TransportEvent};
 
@@ -238,52 +236,47 @@ fn listen_without_tls_returns_config_error_and_no_listening_event() {
 }
 
 #[test]
-fn identity_upgrade_emits_verified_event_and_updates_peer_index() {
+fn mtls_verifies_listener_side_client_identity_and_updates_peer_index() {
     let (mut server, mut client, peer_addr) = setup_pair();
+    let client_peer_id = client.local_peer_id().expect("client peer id");
 
     let client_conn_id = ConnectionId::new(42);
     client
         .dial(client_conn_id, &peer_addr)
         .expect("client dial");
 
-    let server_conn_id =
-        wait_for_connection(&mut server, &mut client, client_conn_id, &peer_addr, 250)
-            .expect("server connection");
+    let mut verified_event = None;
 
-    // On the server side, the client cert is not available (quiche with
-    // verify_peer(false) does not request client certs). So the server
-    // endpoint has no auto-verified peer id. Manual binding still works.
-    let override_peer_id =
-        PeerId::from_str("QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N").expect("peer id");
-    server
-        .verify_connection_peer_id(server_conn_id, override_peer_id.clone())
-        .expect("verify peer id");
+    for _ in 0..250 {
+        let (server_events, client_events) = drive_pair_once(&mut server, &mut client);
 
-    let events = server.poll().expect("server poll");
-    let verified_event = events
-        .iter()
-        .find_map(|event| {
+        for event in server_events {
             if let TransportEvent::PeerIdentityVerified {
                 id,
                 endpoint,
                 previous_peer_id,
             } = event
             {
-                Some((*id, endpoint.clone(), previous_peer_id.clone()))
-            } else {
-                None
+                verified_event = Some((id, endpoint, previous_peer_id));
             }
-        })
-        .expect("peer identity verified event");
+        }
 
-    assert_eq!(verified_event.0, server_conn_id);
-    assert_eq!(verified_event.1.peer_id(), Some(&override_peer_id));
-    // No previous_peer_id: server can't auto-verify client identity since
-    // quiche doesn't request client certs with verify_peer(false).
+        let client_connected = client_events.iter().any(
+            |event| matches!(event, TransportEvent::Connected { id, .. } if *id == client_conn_id),
+        );
+
+        if verified_event.is_some() && client_connected {
+            break;
+        }
+    }
+
+    let verified_event = verified_event.expect("peer identity verified event");
+
+    assert_eq!(verified_event.1.peer_id(), Some(&client_peer_id));
     assert!(verified_event.2.is_none());
 
-    let indexed = server.connection_ids_for_peer(&override_peer_id);
-    assert_eq!(indexed, vec![server_conn_id]);
+    let indexed = server.connection_ids_for_peer(&client_peer_id);
+    assert_eq!(indexed, vec![verified_event.0]);
 }
 
 #[test]
