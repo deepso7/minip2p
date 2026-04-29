@@ -24,15 +24,9 @@ const DIAL_DEADLINE: Duration = Duration::from_secs(10);
 /// Runs the listener until interrupted (SIGINT).
 pub fn run_listen() -> Result<(), Box<dyn Error>> {
     let mut swarm = build_swarm()?;
-    swarm
-        .transport_mut()
+    let peer_addr = swarm
         .listen_on_bound_addr()
         .map_err(|e| format!("listen failed: {e}"))?;
-
-    let peer_addr = swarm
-        .transport()
-        .local_peer_addr()
-        .map_err(|e| format!("local_peer_addr failed: {e}"))?;
     // Stdout: the machine-readable event stream the E2E test scans.
     println!("[listen] bound={peer_addr}");
     eprintln!("[listen] waiting for dialers (Ctrl-C to stop)");
@@ -61,15 +55,14 @@ pub fn run_dial(target: PeerAddr) -> Result<(), Box<dyn Error>> {
 
     let deadline = Instant::now() + DIAL_DEADLINE;
 
-    // Wait for Identify from the target before pinging -- avoids racing
-    // the synthetic-to-verified peer-id migration.
+    // Wait until the peer id is stable and Identify has populated protocol support.
     swarm
         .run_until(deadline, |ev| {
             print_event("dial", ev);
-            matches!(ev, SwarmEvent::IdentifyReceived { peer_id, .. } if peer_id == &target_peer_id)
+            matches!(ev, SwarmEvent::PeerReady { peer_id, .. } if peer_id == &target_peer_id)
         })
-        .map_err(|e| format!("waiting for identify: {e}"))?
-        .ok_or("deadline exceeded before identify arrived")?;
+        .map_err(|e| format!("waiting for peer ready: {e}"))?
+        .ok_or("deadline exceeded before peer became ready")?;
 
     swarm
         .ping(&target_peer_id)
@@ -94,5 +87,7 @@ fn build_swarm() -> Result<Swarm<QuicTransport>, Box<dyn Error>> {
     let keypair = Ed25519Keypair::generate();
     let transport = QuicTransport::new(QuicNodeConfig::with_keypair(keypair.clone()), LOCAL_BIND)
         .map_err(|e| format!("quic bind failed: {e}"))?;
-    Ok(SwarmBuilder::new(&keypair).agent_version(AGENT).build(transport))
+    Ok(SwarmBuilder::new(&keypair)
+        .agent_version(AGENT)
+        .build(transport))
 }

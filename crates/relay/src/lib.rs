@@ -22,8 +22,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 pub use message::{
-    decode_frame, describe_status, encode_frame, FrameDecode, HopMessage, HopMessageType, Limit,
-    Peer, RelayMessageError, Reservation, Status, StopMessage, StopMessageType,
+    FrameDecode, HopMessage, HopMessageType, Limit, Peer, RelayMessageError, Reservation, Status,
+    StopMessage, StopMessageType, decode_frame, describe_status, encode_frame,
 };
 
 /// Protocol id for the HOP subprotocol (client <-> relay).
@@ -238,10 +238,7 @@ pub enum ConnectOutcome {
         limit: Option<Limit>,
     },
     /// The relay refused to establish the circuit.
-    Refused {
-        status: Status,
-        reason: String,
-    },
+    Refused { status: Status, reason: String },
 }
 
 /// Client-side state machine for the HOP CONNECT flow.
@@ -665,7 +662,10 @@ mod tests {
         assert!(flow.is_done());
         match flow.outcome() {
             Some(ReservationOutcome::Accepted { reservation, limit }) => {
-                assert_eq!(reservation.as_ref().and_then(|r| r.expire), Some(2_000_000_000));
+                assert_eq!(
+                    reservation.as_ref().and_then(|r| r.expire),
+                    Some(2_000_000_000)
+                );
                 assert_eq!(limit.as_ref().and_then(|l| l.duration), Some(900));
             }
             other => panic!("unexpected outcome: {other:?}"),
@@ -834,7 +834,10 @@ mod tests {
 
         assert!(matches!(
             flow.outcome(),
-            Some(ConnectOutcome::Refused { status: Status::NoReservation, .. })
+            Some(ConnectOutcome::Refused {
+                status: Status::NoReservation,
+                ..
+            })
         ));
     }
 

@@ -463,7 +463,10 @@ mod tests {
         let err = Multiaddr::from_bytes(&[0x35, 0x02, 0xFF, 0xFE]).unwrap_err();
         assert!(matches!(
             err,
-            MultiaddrError::InvalidBinaryValue { protocol: "dns", .. }
+            MultiaddrError::InvalidBinaryValue {
+                protocol: "dns",
+                ..
+            }
         ));
     }
 }

@@ -38,9 +38,7 @@ use crate::{SIGNATURE_PREFIX, TlsError};
 /// X.509 certificate and `private_key_der` is the DER-encoded PKCS#8
 /// ephemeral private key.
 #[cfg(feature = "std")]
-pub fn generate_certificate(
-    keypair: &Ed25519Keypair,
-) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
+pub fn generate_certificate(keypair: &Ed25519Keypair) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
     let validity = Validity::from_now(core::time::Duration::from_secs(100 * 365 * 24 * 60 * 60))
         .map_err(|e| TlsError::CertificateGeneration(format!("{e}")))?;
     let mut rng = rand_core::UnwrapErr(getrandom::SysRng);
@@ -84,42 +82,30 @@ pub fn generate_certificate_with_rng(
 
     // 4. Build the SignedKey extension value (DER-encoded ASN.1 SEQUENCE).
     let public_key_protobuf = keypair.public_key().encode_protobuf();
-    let signed_key_der = encode_signed_key(&public_key_protobuf, &host_signature)
-        .map_err(gen_err)?;
+    let signed_key_der =
+        encode_signed_key(&public_key_protobuf, &host_signature).map_err(gen_err)?;
 
     // 5. Build the self-signed X.509 certificate.
-    let serial_number = SerialNumber::new(&[0x49, 0x96, 0x02, 0xd2])
-        .map_err(gen_err)?;
+    let serial_number = SerialNumber::new(&[0x49, 0x96, 0x02, 0xd2]).map_err(gen_err)?;
 
-    let spki_owned = SubjectPublicKeyInfoOwned::from_key(ephemeral_verifying_key)
-        .map_err(gen_err)?;
+    let spki_owned =
+        SubjectPublicKeyInfoOwned::from_key(ephemeral_verifying_key).map_err(gen_err)?;
 
     let libp2p_ext = Libp2pExtension(signed_key_der);
 
-    let mut builder = CertificateBuilder::new(
-        Libp2pProfile,
-        serial_number,
-        validity,
-        spki_owned,
-    )
-    .map_err(gen_err)?;
-
-    builder
-        .add_extension(&libp2p_ext)
+    let mut builder = CertificateBuilder::new(Libp2pProfile, serial_number, validity, spki_owned)
         .map_err(gen_err)?;
+
+    builder.add_extension(&libp2p_ext).map_err(gen_err)?;
 
     let cert = builder
         .build::<_, ecdsa::der::Signature<p256::NistP256>>(&ephemeral_signing_key)
         .map_err(gen_err)?;
 
-    let cert_der = cert
-        .to_der()
-        .map_err(gen_err)?;
+    let cert_der = cert.to_der().map_err(gen_err)?;
 
     // 6. Encode the ephemeral private key as PKCS#8 DER.
-    let key_doc = ephemeral_signing_key
-        .to_pkcs8_der()
-        .map_err(gen_err)?;
+    let key_doc = ephemeral_signing_key.to_pkcs8_der().map_err(gen_err)?;
 
     Ok((cert_der, key_doc.as_bytes().to_vec()))
 }
@@ -146,8 +132,7 @@ fn encode_signed_key(public_key: &[u8], signature: &[u8]) -> Result<Vec<u8>, der
     let mut buf = Vec::new();
     // SEQUENCE tag + length (DER encoding)
     buf.push(0x30);
-    let len_val = usize::try_from(content_len)
-        .map_err(|_| der::Tag::Sequence.value_error())?;
+    let len_val = usize::try_from(content_len).map_err(|_| der::Tag::Sequence.value_error())?;
     if len_val < 128 {
         buf.push(len_val as u8);
     } else if len_val < 256 {

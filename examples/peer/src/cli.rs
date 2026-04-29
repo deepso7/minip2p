@@ -113,9 +113,8 @@ fn parse_dial(args: Vec<String>) -> Result<Mode, CliError> {
     match (positional.len(), flags.relay, flags.target) {
         (1, None, None) => {
             let raw = &positional[0];
-            let target = PeerAddr::from_str(raw).map_err(|e| {
-                CliError(format!("invalid peer-addr '{raw}': {e}"))
-            })?;
+            let target = PeerAddr::from_str(raw)
+                .map_err(|e| CliError(format!("invalid peer-addr '{raw}': {e}")))?;
             Ok(Mode::DirectDial { target })
         }
         (0, Some(relay), Some(target)) => Ok(Mode::RelayDial { relay, target }),
@@ -146,18 +145,19 @@ impl Flags {
         let mut i = 0;
         while i < args.len() {
             let key = &args[i];
-            let value = args.get(i + 1).ok_or_else(|| {
-                CliError(format!("flag '{key}' requires a value"))
-            })?;
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| CliError(format!("flag '{key}' requires a value")))?;
 
             match key.as_str() {
                 "--relay" => {
                     if relay.is_some() {
                         return Err(CliError("--relay specified twice".into()));
                     }
-                    relay = Some(PeerAddr::from_str(value).map_err(|e| {
-                        CliError(format!("invalid --relay '{value}': {e}"))
-                    })?);
+                    relay = Some(
+                        PeerAddr::from_str(value)
+                            .map_err(|e| CliError(format!("invalid --relay '{value}': {e}")))?,
+                    );
                 }
                 "--target" => {
                     if target.is_some() {
@@ -193,8 +193,12 @@ pub fn print_event(role: &str, event: &SwarmEvent) {
         SwarmEvent::IdentifyReceived { peer_id, info } => {
             let agent = info.agent_version.as_deref().unwrap_or("?");
             let nprotos = info.protocols.len();
+            println!("[{role}] identify peer={peer_id} agent={agent} protocols={nprotos}");
+        }
+        SwarmEvent::PeerReady { peer_id, protocols } => {
             println!(
-                "[{role}] identify peer={peer_id} agent={agent} protocols={nprotos}"
+                "[{role}] peer-ready peer={peer_id} protocols={}",
+                protocols.len()
             );
         }
         SwarmEvent::PingRttMeasured { peer_id, rtt_ms } => {
@@ -209,7 +213,11 @@ pub fn print_event(role: &str, event: &SwarmEvent) {
             protocol_id,
             initiated_locally,
         } => {
-            let dir = if *initiated_locally { "outbound" } else { "inbound" };
+            let dir = if *initiated_locally {
+                "outbound"
+            } else {
+                "inbound"
+            };
             println!(
                 "[{role}] user-stream-ready peer={peer_id} stream={stream_id} \
                  protocol={protocol_id} dir={dir}"
@@ -226,17 +234,13 @@ pub fn print_event(role: &str, event: &SwarmEvent) {
             );
         }
         SwarmEvent::UserStreamRemoteWriteClosed { peer_id, stream_id } => {
-            println!(
-                "[{role}] user-stream-remote-write-closed peer={peer_id} stream={stream_id}"
-            );
+            println!("[{role}] user-stream-remote-write-closed peer={peer_id} stream={stream_id}");
         }
         SwarmEvent::UserStreamClosed { peer_id, stream_id } => {
-            println!(
-                "[{role}] user-stream-closed peer={peer_id} stream={stream_id}"
-            );
+            println!("[{role}] user-stream-closed peer={peer_id} stream={stream_id}");
         }
-        SwarmEvent::Error { message } => {
-            eprintln!("[{role}] error: {message}");
+        SwarmEvent::Error(error) => {
+            eprintln!("[{role}] error {:?}: {}", error.kind, error.detail);
         }
     }
 }

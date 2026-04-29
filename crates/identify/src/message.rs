@@ -22,7 +22,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{read_uvarint, write_uvarint, VarintError};
+use minip2p_core::{VarintError, read_uvarint, write_uvarint};
 use thiserror::Error;
 
 // Protobuf wire types from the spec.
@@ -161,24 +161,21 @@ impl IdentifyMessage {
                             msg.listen_addrs.push(value.to_vec());
                         }
                         FIELD_PROTOCOLS => {
-                            let s = core::str::from_utf8(value).map_err(|_| {
-                                IdentifyMessageError::InvalidUtf8 { field_number }
-                            })?;
+                            let s = core::str::from_utf8(value)
+                                .map_err(|_| IdentifyMessageError::InvalidUtf8 { field_number })?;
                             msg.protocols.push(String::from(s));
                         }
                         FIELD_OBSERVED_ADDR => {
                             msg.observed_addr = Some(value.to_vec());
                         }
                         FIELD_PROTOCOL_VERSION => {
-                            let s = core::str::from_utf8(value).map_err(|_| {
-                                IdentifyMessageError::InvalidUtf8 { field_number }
-                            })?;
+                            let s = core::str::from_utf8(value)
+                                .map_err(|_| IdentifyMessageError::InvalidUtf8 { field_number })?;
                             msg.protocol_version = Some(String::from(s));
                         }
                         FIELD_AGENT_VERSION => {
-                            let s = core::str::from_utf8(value).map_err(|_| {
-                                IdentifyMessageError::InvalidUtf8 { field_number }
-                            })?;
+                            let s = core::str::from_utf8(value)
+                                .map_err(|_| IdentifyMessageError::InvalidUtf8 { field_number })?;
                             msg.agent_version = Some(String::from(s));
                         }
                         _ => {

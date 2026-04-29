@@ -17,7 +17,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use minip2p_core::{read_uvarint, write_uvarint, Multiaddr, PeerId, VarintError};
+use minip2p_core::{Multiaddr, PeerId, VarintError, read_uvarint, write_uvarint};
 use minip2p_transport::StreamId;
 use thiserror::Error;
 
@@ -205,10 +205,7 @@ impl IdentifyProtocol {
                 stream_id,
                 data,
             },
-            IdentifyAction::CloseStreamWrite {
-                peer_id,
-                stream_id,
-            },
+            IdentifyAction::CloseStreamWrite { peer_id, stream_id },
         ])
     }
 
@@ -217,11 +214,7 @@ impl IdentifyProtocol {
     /// Call this after multistream-select negotiates `/ipfs/id/1.0.0` on an
     /// outbound stream. The protocol will buffer incoming data until the
     /// remote closes its write side.
-    pub fn register_inbound_stream(
-        &mut self,
-        peer_id: PeerId,
-        stream_id: StreamId,
-    ) {
+    pub fn register_inbound_stream(&mut self, peer_id: PeerId, stream_id: StreamId) {
         let state = self.peers.entry(peer_id).or_default();
         state.inbound_streams.entry(stream_id).or_default();
     }
@@ -300,10 +293,7 @@ impl IdentifyProtocol {
         // stream never transitions to `Closed` and both the swarm's
         // stream_owner entry and the transport's per-stream state leak for
         // the lifetime of the connection.
-        vec![IdentifyAction::CloseStreamWrite {
-            peer_id,
-            stream_id,
-        }]
+        vec![IdentifyAction::CloseStreamWrite { peer_id, stream_id }]
     }
 
     /// Notify that a stream was fully closed.
@@ -345,8 +335,7 @@ impl IdentifyProtocol {
 
         for event in &mut self.events {
             match event {
-                IdentifyEvent::Received { peer_id, .. }
-                | IdentifyEvent::Error { peer_id, .. } => {
+                IdentifyEvent::Received { peer_id, .. } | IdentifyEvent::Error { peer_id, .. } => {
                     if peer_id == old_peer_id {
                         *peer_id = new_peer_id.clone();
                     }
@@ -386,8 +375,8 @@ fn encode_length_prefixed(payload: &[u8]) -> Vec<u8> {
 ///   bytes we have (the stream was truncated before the full message
 ///   arrived, or the peer lied about the length).
 fn decode_length_prefixed(buf: &[u8]) -> Result<&[u8], message::IdentifyMessageError> {
-    let (len, consumed) = read_uvarint(buf)
-        .map_err(|e: VarintError| message::IdentifyMessageError::from(e))?;
+    let (len, consumed) =
+        read_uvarint(buf).map_err(|e: VarintError| message::IdentifyMessageError::from(e))?;
     let len = len as usize;
     let remaining = buf.len() - consumed;
     if len > remaining {
@@ -451,10 +440,11 @@ mod tests {
         let peer = sample_peer();
         let stream = StreamId::new(1);
 
-        let listen_addrs = [
-            <Multiaddr as core::str::FromStr>::from_str("/ip4/127.0.0.1/udp/4001/quic-v1")
-                .unwrap(),
-        ];
+        let listen_addrs =
+            [
+                <Multiaddr as core::str::FromStr>::from_str("/ip4/127.0.0.1/udp/4001/quic-v1")
+                    .unwrap(),
+            ];
         let actions = identify
             .register_outbound_stream(peer.clone(), stream, None, &listen_addrs)
             .unwrap();
@@ -477,8 +467,7 @@ mod tests {
         // listen_addrs are encoded as binary multicodec bytes, one per
         // multiaddr passed in -- the regression we're guarding against.
         assert_eq!(msg.listen_addrs.len(), 1);
-        let decoded =
-            Multiaddr::from_bytes(&msg.listen_addrs[0]).expect("listen_addr round-trips");
+        let decoded = Multiaddr::from_bytes(&msg.listen_addrs[0]).expect("listen_addr round-trips");
         assert_eq!(decoded, listen_addrs[0]);
     }
 

@@ -13,14 +13,13 @@ use std::time::{Duration, Instant};
 
 use minip2p_core::{Multiaddr, PeerAddr, PeerId};
 use minip2p_dcutr::{
-    DcutrInitiator, DcutrResponder, InitiatorOutcome, ResponderEvent,
-    DCUTR_PROTOCOL_ID,
+    DCUTR_PROTOCOL_ID, DcutrInitiator, DcutrResponder, InitiatorOutcome, ResponderEvent,
 };
 use minip2p_identity::Ed25519Keypair;
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
 use minip2p_relay::{
-    ConnectOutcome, HopConnect, HopReservation, ReservationOutcome, StopResponder,
-    HOP_PROTOCOL_ID, STOP_PROTOCOL_ID,
+    ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopReservation, ReservationOutcome,
+    STOP_PROTOCOL_ID, StopResponder,
 };
 use minip2p_swarm::{Swarm, SwarmBuilder, SwarmEvent};
 use minip2p_transport::{StreamId, Transport};
@@ -60,14 +59,9 @@ const RELAY_PING_LEN: usize = 32;
 pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
     let role = "relay-listen";
     let mut swarm = build_swarm_with_relay_protocols()?;
-    swarm
-        .transport_mut()
+    let our_addr = swarm
         .listen_on_bound_addr()
         .map_err(|e| format!("listen failed: {e}"))?;
-    let our_addr = swarm
-        .transport()
-        .local_peer_addr()
-        .map_err(|e| format!("local_peer_addr: {e}"))?;
     let our_observed: Vec<Multiaddr> = vec![our_addr.transport().clone()];
     println!("[{role}] bound={our_addr}");
     println!("[{role}] us={}", swarm.local_peer_id());
@@ -89,40 +83,42 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
         .map_err(|e| format!("open HOP: {e}"))?;
     wait_user_stream_ready(&mut swarm, role, hop_stream, deadline)?;
     let mut reservation = HopReservation::new();
-    send(&mut swarm, &relay_peer_id, hop_stream, reservation.take_outbound())?;
+    send(
+        &mut swarm,
+        &relay_peer_id,
+        hop_stream,
+        reservation.take_outbound(),
+    )?;
 
     while reservation.outcome().is_none() {
         let data = wait_user_stream_data(&mut swarm, role, hop_stream, deadline)?;
-        reservation.on_data(&data).map_err(|e| format!("HOP decode: {e}"))?;
+        reservation
+            .on_data(&data)
+            .map_err(|e| format!("HOP decode: {e}"))?;
     }
     match reservation.outcome() {
         Some(ReservationOutcome::Accepted { .. }) => {
             println!("[{role}] reserved-on-relay");
         }
         Some(ReservationOutcome::Refused { status, reason }) => {
-            return Err(format!(
-                "relay refused reservation: status={status:?} reason={reason}"
-            )
-            .into());
+            return Err(
+                format!("relay refused reservation: status={status:?} reason={reason}").into(),
+            );
         }
         None => unreachable!(),
     }
 
     // --- 3. Wait for the relay to push a STOP stream at us ------------------
-    let bridge_stream = wait_inbound_stream(
-        &mut swarm,
-        role,
-        &relay_peer_id,
-        STOP_PROTOCOL_ID,
-        deadline,
-    )?;
+    let bridge_stream =
+        wait_inbound_stream(&mut swarm, role, &relay_peer_id, STOP_PROTOCOL_ID, deadline)?;
     println!("[{role}] incoming-circuit via-relay stream={bridge_stream}");
 
     // --- 4. STOP responder: accept the CONNECT, keep any pipelined bytes ---
     let mut stop = StopResponder::new();
     let remote_peer_id: PeerId = loop {
         let data = wait_user_stream_data(&mut swarm, role, bridge_stream, deadline)?;
-        stop.on_data(&data).map_err(|e| format!("STOP decode: {e}"))?;
+        stop.on_data(&data)
+            .map_err(|e| format!("STOP decode: {e}"))?;
         if let Some(request) = stop.request() {
             break PeerId::from_bytes(&request.source_peer_id)
                 .map_err(|e| format!("bad STOP source peer id: {e}"))?;
@@ -130,7 +126,12 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
     };
     println!("[{role}] stop-connect-from peer={remote_peer_id}");
     stop.accept().map_err(|e| format!("STOP accept: {e}"))?;
-    send(&mut swarm, &relay_peer_id, bridge_stream, stop.take_outbound())?;
+    send(
+        &mut swarm,
+        &relay_peer_id,
+        bridge_stream,
+        stop.take_outbound(),
+    )?;
     let bridge_bytes = stop.take_bridge_bytes();
 
     // --- 5. DCUtR responder over the same bridge stream --------------------
@@ -140,7 +141,12 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
             .on_data(&bridge_bytes)
             .map_err(|e| format!("DCUtR decode (pipelined): {e}"))?;
     }
-    send(&mut swarm, &relay_peer_id, bridge_stream, dcutr.take_outbound())?;
+    send(
+        &mut swarm,
+        &relay_peer_id,
+        bridge_stream,
+        dcutr.take_outbound(),
+    )?;
 
     // DCUtR responder events arrive across multiple poll cycles:
     // `ConnectReceived` fires in one call, `SyncReceived` in a later
@@ -152,8 +158,15 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
             break captured_remote_addrs.take().unwrap_or_default();
         }
         let data = wait_user_stream_data(&mut swarm, role, bridge_stream, deadline)?;
-        dcutr.on_data(&data).map_err(|e| format!("DCUtR decode: {e}"))?;
-        send(&mut swarm, &relay_peer_id, bridge_stream, dcutr.take_outbound())?;
+        dcutr
+            .on_data(&data)
+            .map_err(|e| format!("DCUtR decode: {e}"))?;
+        send(
+            &mut swarm,
+            &relay_peer_id,
+            bridge_stream,
+            dcutr.take_outbound(),
+        )?;
     };
 
     // --- 6. Hole-punch: blast UDP, wait for direct or timeout --------------
@@ -174,10 +187,8 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
     // comparison prevents unrelated inbound connections -- relay
     // probe-backs, autonat probes, random scanners -- from being
     // misinterpreted as hole-punch success.
-    let remote_match_targets: Vec<(String, u16)> = remote_addrs
-        .iter()
-        .filter_map(extract_ip_port)
-        .collect();
+    let remote_match_targets: Vec<(String, u16)> =
+        remote_addrs.iter().filter_map(extract_ip_port).collect();
 
     // Check any connections already present (e.g. the remote's direct
     // Initial may have arrived BEFORE we observed the SYNC message on
@@ -390,14 +401,9 @@ fn is_bridge_closed_event(ev: &SwarmEvent, bridge_stream: StreamId) -> bool {
 pub fn run_dial(relay_addr: PeerAddr, target: PeerId) -> Result<(), Box<dyn Error>> {
     let role = "relay-dial";
     let mut swarm = build_swarm_with_relay_protocols()?;
-    swarm
-        .transport_mut()
+    let our_addr = swarm
         .listen_on_bound_addr()
         .map_err(|e| format!("listen failed: {e}"))?;
-    let our_addr = swarm
-        .transport()
-        .local_peer_addr()
-        .map_err(|e| format!("local_peer_addr: {e}"))?;
     let our_observed: Vec<Multiaddr> = vec![our_addr.transport().clone()];
     println!("[{role}] bound={our_addr}");
     println!("[{role}] us={}", swarm.local_peer_id());
@@ -431,10 +437,7 @@ pub fn run_dial(relay_addr: PeerAddr, target: PeerId) -> Result<(), Box<dyn Erro
             println!("[{role}] bridge-established via-relay");
         }
         Some(ConnectOutcome::Refused { status, reason }) => {
-            return Err(format!(
-                "relay refused CONNECT: status={status:?} reason={reason}"
-            )
-            .into());
+            return Err(format!("relay refused CONNECT: status={status:?} reason={reason}").into());
         }
         None => unreachable!(),
     }
@@ -444,7 +447,12 @@ pub fn run_dial(relay_addr: PeerAddr, target: PeerId) -> Result<(), Box<dyn Erro
     // --- 3. DCUtR initiator over the bridge --------------------------------
     let mut dcutr = DcutrInitiator::new(&our_observed);
     let dcutr_sent_at = Instant::now();
-    send(&mut swarm, &relay_peer_id, bridge_stream, dcutr.take_outbound())?;
+    send(
+        &mut swarm,
+        &relay_peer_id,
+        bridge_stream,
+        dcutr.take_outbound(),
+    )?;
     if !bridge_bytes.is_empty() {
         dcutr
             .on_data(&bridge_bytes, 0)
@@ -473,11 +481,21 @@ pub fn run_dial(relay_addr: PeerAddr, target: PeerId) -> Result<(), Box<dyn Erro
             .on_data(&data, elapsed_ms)
             .map_err(|e| format!("DCUtR decode: {e}"))?;
     };
-    println!("[{role}] dcutr-dialnow addrs={} rtt={rtt_ms}ms", remote_addrs.len());
+    println!(
+        "[{role}] dcutr-dialnow addrs={} rtt={rtt_ms}ms",
+        remote_addrs.len()
+    );
 
     // --- 4. Flush SYNC and dial every observed remote address in parallel --
-    dcutr.send_sync().map_err(|e| format!("DCUtR send_sync: {e}"))?;
-    send(&mut swarm, &relay_peer_id, bridge_stream, dcutr.take_outbound())?;
+    dcutr
+        .send_sync()
+        .map_err(|e| format!("DCUtR send_sync: {e}"))?;
+    send(
+        &mut swarm,
+        &relay_peer_id,
+        bridge_stream,
+        dcutr.take_outbound(),
+    )?;
 
     for addr in &remote_addrs {
         match PeerAddr::new(addr.clone(), target.clone()) {
@@ -540,9 +558,9 @@ fn wait_connected(
             matches!(ev, SwarmEvent::ConnectionEstablished { peer_id: p } if p == peer_id)
         })
         .map_err(|e| format!("wait-connected: {e}"))?;
-    found.map(|_| ()).ok_or_else(|| {
-        format!("deadline exceeded before connection to {peer_id}").into()
-    })
+    found
+        .map(|_| ())
+        .ok_or_else(|| format!("deadline exceeded before connection to {peer_id}").into())
 }
 
 /// Wait for a locally-initiated `UserStreamReady` on `stream_id`.
@@ -706,7 +724,9 @@ fn build_swarm_with_relay_protocols() -> Result<Swarm<QuicTransport>, Box<dyn Er
     let keypair = Ed25519Keypair::generate();
     let transport = QuicTransport::new(QuicNodeConfig::with_keypair(keypair.clone()), LOCAL_BIND)
         .map_err(|e| format!("quic bind: {e}"))?;
-    let mut swarm = SwarmBuilder::new(&keypair).agent_version(AGENT).build(transport);
+    let mut swarm = SwarmBuilder::new(&keypair)
+        .agent_version(AGENT)
+        .build(transport);
     swarm.add_user_protocol(HOP_PROTOCOL_ID);
     swarm.add_user_protocol(STOP_PROTOCOL_ID);
     swarm.add_user_protocol(DCUTR_PROTOCOL_ID);
@@ -732,5 +752,3 @@ fn random_bytes(len: usize) -> Vec<u8> {
     let _ = getrandom::fill(&mut buf);
     buf
 }
-
-

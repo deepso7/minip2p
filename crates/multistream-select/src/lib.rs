@@ -11,7 +11,7 @@ use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use minip2p_core::{read_uvarint, uvarint_len, write_uvarint, VarintError};
+use minip2p_core::{VarintError, read_uvarint, uvarint_len, write_uvarint};
 use thiserror::Error;
 
 /// The multistream-select protocol identifier.
@@ -151,9 +151,7 @@ impl MultistreamSelect {
             }
 
             let (payload, consumed) = match decode_message(&self.recv_buf) {
-                DecodeResult::Complete { payload, consumed } => {
-                    (payload.to_string(), consumed)
-                }
+                DecodeResult::Complete { payload, consumed } => (payload.to_string(), consumed),
                 DecodeResult::Incomplete => break,
                 DecodeResult::Error(err) => {
                     outputs.extend(self.protocol_error(err));

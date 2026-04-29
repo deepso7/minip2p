@@ -38,6 +38,7 @@ Current validated behavior:
 - Identify protocol exchange with observed-address plumbing from the transport.
 - Transport contract with documented lifecycle guarantees and conformance tests.
 - End-to-end stack via `SwarmBuilder`: QUIC transport + multistream-select + identify + ping with a single builder call.
+- Swarm DX events for application readiness (`PeerReady`) and typed runtime errors.
 - Pure-state-machine integration test covering Circuit Relay v2 + DCUtR (reservation, connect, stop, hole-punch coordination).
 
 ## Architecture boundaries

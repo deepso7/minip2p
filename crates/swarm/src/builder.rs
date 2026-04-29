@@ -5,9 +5,9 @@
 //! swarm.
 
 use minip2p_core::PeerId;
-use minip2p_identify::{IdentifyConfig, IDENTIFY_PROTOCOL_ID};
+use minip2p_identify::{IDENTIFY_PROTOCOL_ID, IdentifyConfig};
 use minip2p_identity::Ed25519Keypair;
-use minip2p_ping::{PingConfig, PING_PROTOCOL_ID};
+use minip2p_ping::{PING_PROTOCOL_ID, PingConfig};
 use minip2p_transport::Transport;
 
 use crate::Swarm;

@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 
 use minip2p_core::{Multiaddr, PeerAddr, PeerId};
 use minip2p_identify::IdentifyConfig;
-use minip2p_ping::{PingConfig, PING_PAYLOAD_LEN};
+use minip2p_ping::{PING_PAYLOAD_LEN, PingConfig};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
 use crate::core::SwarmCore;
-use crate::events::{SwarmAction, SwarmError, SwarmEvent};
+use crate::events::{SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError};
 
 /// Sleep cadence when [`Swarm::poll_next`] idles.
 ///
@@ -104,9 +104,35 @@ impl<T: Transport> Swarm<T> {
         self.core.add_user_protocol(protocol_id);
     }
 
-    /// Start listening on the given multiaddr.
-    pub fn listen(&mut self, addr: &Multiaddr) -> Result<(), TransportError> {
-        self.transport.listen(addr)
+    /// Start listening on the given multiaddr and return the resolved local address.
+    pub fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
+        self.transport.listen(addr)?;
+        Ok(self
+            .transport
+            .local_addresses()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| addr.clone()))
+    }
+
+    /// Start listening on the transport's already-bound local address.
+    ///
+    /// Transports that know their bound address expose it via
+    /// `Transport::local_addresses()`. This is the common QUIC path when the
+    /// UDP socket was bound to `127.0.0.1:0` and the OS selected the port.
+    pub fn listen_on_bound_addr(&mut self) -> Result<PeerAddr, TransportError> {
+        let addr = self
+            .transport
+            .local_addresses()
+            .into_iter()
+            .next()
+            .ok_or_else(|| TransportError::InvalidConfig {
+                reason: "transport does not expose a bound local address".into(),
+            })?;
+        self.transport.listen(&addr)?;
+        PeerAddr::new(addr, self.local_peer_id.clone()).map_err(|e| TransportError::InvalidConfig {
+            reason: format!("failed to build local PeerAddr: {e}"),
+        })
     }
 
     /// Dial a remote peer. Swarm auto-allocates a connection id.
@@ -258,10 +284,7 @@ impl<T: Transport> Swarm<T> {
     /// Makes single-event CLIs and scripts much easier to write than the
     /// raw [`Swarm::poll`] loop: no sleep-then-match-all-events
     /// boilerplate.
-    pub fn poll_next(
-        &mut self,
-        deadline: Instant,
-    ) -> Result<Option<SwarmEvent>, TransportError> {
+    pub fn poll_next(&mut self, deadline: Instant) -> Result<Option<SwarmEvent>, TransportError> {
         loop {
             if let Some(ev) = self.event_buffer.pop_front() {
                 return Ok(Some(ev));
@@ -353,13 +376,10 @@ impl<T: Transport> Swarm<T> {
     /// remembers the **last** stream id allocated during the flush, which
     /// is accurate because `open_user_stream` triggers exactly one
     /// `OpenStream` action per call.
-    fn dispatch_action(
-        &mut self,
-        action: SwarmAction,
-        captured_stream_id: &mut Option<StreamId>,
-    ) {
+    fn dispatch_action(&mut self, action: SwarmAction, captured_stream_id: &mut Option<StreamId>) {
         match action {
-            SwarmAction::OpenStream { conn_id, token } => match self.transport.open_stream(conn_id) {
+            SwarmAction::OpenStream { conn_id, token } => match self.transport.open_stream(conn_id)
+            {
                 Ok(stream_id) => {
                     *captured_stream_id = Some(stream_id);
                     self.core
@@ -367,7 +387,8 @@ impl<T: Transport> Swarm<T> {
                 }
                 Err(e) => {
                     let reason = format!("{e}");
-                    self.core.on_open_stream_failed(token, reason, self.now_ms());
+                    self.core
+                        .on_open_stream_failed(token, reason, self.now_ms());
                 }
             },
             SwarmAction::SendStream {
@@ -376,33 +397,60 @@ impl<T: Transport> Swarm<T> {
                 data,
             } => {
                 if let Err(e) = self.transport.send_stream(conn_id, stream_id, data) {
-                    self.core.record_error(format!(
-                        "send_stream to connection {conn_id} stream {stream_id} failed: {e}"
+                    self.core.record_error(runtime_error(
+                        SwarmErrorKind::Transport,
+                        Some(conn_id),
+                        format!(
+                            "send_stream to connection {conn_id} stream {stream_id} failed: {e}"
+                        ),
                     ));
                 }
             }
             SwarmAction::CloseStreamWrite { conn_id, stream_id } => {
                 if let Err(e) = self.transport.close_stream_write(conn_id, stream_id) {
-                    self.core.record_error(format!(
-                        "close_stream_write on connection {conn_id} stream {stream_id} failed: {e}"
+                    self.core.record_error(runtime_error(
+                        SwarmErrorKind::Transport,
+                        Some(conn_id),
+                        format!(
+                            "close_stream_write on connection {conn_id} stream {stream_id} failed: {e}"
+                        ),
                     ));
                 }
             }
             SwarmAction::ResetStream { conn_id, stream_id } => {
                 if let Err(e) = self.transport.reset_stream(conn_id, stream_id) {
-                    self.core.record_error(format!(
-                        "reset_stream on connection {conn_id} stream {stream_id} failed: {e}"
+                    self.core.record_error(runtime_error(
+                        SwarmErrorKind::Transport,
+                        Some(conn_id),
+                        format!(
+                            "reset_stream on connection {conn_id} stream {stream_id} failed: {e}"
+                        ),
                     ));
                 }
             }
             SwarmAction::CloseConnection { conn_id } => {
                 if let Err(e) = self.transport.close(conn_id) {
-                    self.core.record_error(format!(
-                        "close on connection {conn_id} failed: {e}"
+                    self.core.record_error(runtime_error(
+                        SwarmErrorKind::Transport,
+                        Some(conn_id),
+                        format!("close on connection {conn_id} failed: {e}"),
                     ));
                 }
             }
         }
+    }
+}
+
+fn runtime_error(
+    kind: SwarmErrorKind,
+    conn_id: Option<ConnectionId>,
+    detail: String,
+) -> SwarmRuntimeError {
+    SwarmRuntimeError {
+        kind,
+        peer_id: None,
+        conn_id,
+        detail,
     }
 }
 
@@ -449,5 +497,3 @@ fn rand_ping_payload() -> [u8; PING_PAYLOAD_LEN] {
     }
     payload
 }
-
-

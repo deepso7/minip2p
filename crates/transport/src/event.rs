@@ -40,14 +40,9 @@ pub enum TransportEvent {
         stream_id: StreamId,
     },
     /// The connection is fully closed. No further events for this connection.
-    Closed {
-        id: ConnectionId,
-    },
+    Closed { id: ConnectionId },
     /// A non-fatal error on a connection.
-    Error {
-        id: ConnectionId,
-        message: String,
-    },
+    Error { id: ConnectionId, message: String },
     /// A new inbound connection was accepted. `Connected` follows after handshake.
     IncomingConnection {
         id: ConnectionId,
@@ -60,7 +55,5 @@ pub enum TransportEvent {
         previous_peer_id: Option<PeerId>,
     },
     /// The transport is now listening on the given address.
-    Listening {
-        addr: Multiaddr,
-    },
+    Listening { addr: Multiaddr },
 }

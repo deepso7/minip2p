@@ -96,122 +96,46 @@ type 4."
 both encode and decode paths. Four regression tests guard against
 future drift.
 
+## Landed (`dx-core` branch)
+
+These are the breaking DX cleanup items that keep the Sans-I/O core intact:
+all lifecycle state is pure data in `SwarmCore`, while listen convenience stays
+in the std driver.
+
+### `SwarmEvent::PeerReady { peer_id, protocols }`
+
+The swarm now has an explicit application-ready lifecycle event. It fires only
+after the peer id is stable and the first Identify message from that peer has
+been processed.
+
+**Before**: callers waited for `IdentifyReceived` to avoid racing peer-id
+migration and unknown protocol support.
+
+**After**: callers wait for `PeerReady` before calling `ping()` or opening user
+protocol streams.
+
+### Typed `SwarmEvent::Error`
+
+`SwarmEvent::Error { message: String }` is replaced by
+`SwarmEvent::Error(SwarmRuntimeError)`, with a machine-testable
+`SwarmErrorKind`, optional peer/connection context, and a human-readable
+`detail` string.
+
+### `Swarm::listen_on_bound_addr()`
+
+The common quickstart path is now one swarm-level call that returns the local
+`PeerAddr`. Examples no longer need to drill into `transport_mut()` just to
+listen on the already-bound QUIC socket and then query `local_peer_addr()`.
+
 ---
 
 ## Open — Tier 1 (high leverage, small scope)
 
 Most of these are natural follow-ups to what's already in PR #5.
 
-### `SwarmEvent::PeerReady { peer_id }`
-
-**Motivation**: today's DX has a subtle foot-gun — once you see
-`ConnectionEstablished { peer_id }`, the peer id might still be under
-peer-id migration (synthetic → verified via `PeerIdentityVerified`),
-and you don't yet know what protocols the peer supports. The existing
-workaround is "wait for `IdentifyReceived` before calling anything
-protocol-specific":
-
-```rust
-// Today, everywhere we open a user stream:
-swarm.run_until(deadline, |ev| matches!(
-    ev, SwarmEvent::IdentifyReceived { peer_id, .. } if peer_id == &target
-))?;
-swarm.ping(&target)?; // safe now
-```
-
-That's what `examples/peer/src/direct.rs:64-69` does explicitly, and
-what the relay paths implicitly depend on.
-
-**Proposed event**: `SwarmEvent::PeerReady { peer_id, protocols: Vec<String> }`
-— fires **after** both of:
-1. The final (verified) peer id is bound to the connection.
-2. The first `IdentifyReceived` from that peer has been processed.
-
-Semantics: "this peer id is stable and we know what they support."
-
-```rust
-// With PeerReady:
-let ready = swarm.run_until(deadline, |ev|
-    matches!(ev, SwarmEvent::PeerReady { peer_id, .. } if peer_id == &target)
-)?;
-swarm.ping(&target)?;
-```
-
-**Second win**: once Milestone 6 (mTLS) lands, the listener side of
-the hole-punch can fire `PeerReady` for an inbound direct connection
-and exit *exactly* when the dialer's ping completes, eliminating the
-2s grace window in `examples/peer/src/relay.rs`.
-
-**Breaking**: adds a variant to `SwarmEvent` — technically breaking
-for exhaustive matches, but no existing in-repo caller is exhaustive.
-
-**Effort**: ~60 LOC in `SwarmCore` (gate on the peer-id migration +
-first identify event), ~30 LOC of tests. Use site delta in
-`examples/peer` removes ~6 lines of identify-wait boilerplate.
-
-### Typed `SwarmEvent::Error`
-
-**Motivation**: today it's `SwarmEvent::Error { message: String }`.
-`transports/quic/tests/swarm_e2e.rs:213` literally greps for
-`message.contains("ping register error")`, which is a smell.
-
-**Proposed**:
-```rust
-pub enum SwarmEvent {
-    // ...
-    Error(SwarmRuntimeError),
-}
-pub struct SwarmRuntimeError {
-    pub kind: SwarmErrorKind,
-    pub peer_id: Option<PeerId>,
-    pub conn_id: Option<ConnectionId>,
-    pub detail: String,
-}
-pub enum SwarmErrorKind {
-    Transport,
-    Multistream,
-    Identify,
-    Ping,
-    UserProtocol { protocol_id: String },
-    IdentifyStreamRejected,
-    OpenStreamFailed,
-}
-```
-
-**Breaking**: yes, by design. ~15 call sites in `SwarmCore` to migrate.
-
-**Effort**: ~2 hours.
-
-### `Swarm::listen_str(&str)` helper
-
-**Motivation**: `relay.rs` and `direct.rs` both have the three-liner
-
-```rust
-swarm.transport_mut().listen_on_bound_addr()?;
-let our_addr = swarm.transport().local_peer_addr()?;
-println!("[role] bound={our_addr}");
-```
-
-with a QUIC-specific method (`listen_on_bound_addr`) drilled through
-`transport_mut()`. The plan.md principle "fast first success" says
-this should be one call.
-
-**Proposed**:
-```rust
-impl<T: Transport> Swarm<T> {
-    pub fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, SwarmError>;
-}
-impl QuicSwarmExt for Swarm<QuicTransport> {
-    fn listen_on_bound(&mut self) -> Result<PeerAddr, SwarmError>;
-}
-```
-
-Return the resolved multiaddr so the caller can print it without a
-second call.
-
-**Breaking**: no; additive.
-
-**Effort**: ~40 LOC.
+The original Tier 1 items (`PeerReady`, typed errors, and swarm-level listen
+ergonomics) have landed on the `dx-core` branch. The next high-leverage item is
+user-protocol fail-fast, because it can now lean on `PeerReady`/Identify state.
 
 ---
 
@@ -353,14 +277,13 @@ in place to keep the composition sane.
 
 In order of bang-for-buck given current state:
 
-1. **`PeerReady` event** (removes identify-wait boilerplate in
-   examples; unlocks cleaner hole-punch exit once mTLS lands).
-2. **Typed `SwarmEvent::Error`** (stops the `message.contains(...)`
-   anti-pattern before more callers grow around it).
-3. **`Swarm::listen()` helper** (small but user-visible on the
-   quickstart path).
-4. Keypair persistence (required for any long-running demo / daemon).
-5. User-protocol fail-fast (leans on #1).
+1. User-protocol fail-fast on `open_user_stream` (now straightforward because
+   `PeerReady` records advertised protocols).
+2. Keypair persistence (required for any long-running demo / daemon).
+3. `Swarm::connected_peers()` / `Swarm::peer_info(&PeerId)` accessors.
+4. `PeerAddr::quic_v1(IpAddr, u16, PeerId)` constructor.
+5. Clock injection for deterministic driver tests.
 
-Items 1-3 together are estimated at ~1 day of focused work and would
-notably sharpen the "fast first success" story.
+The previous top three (`PeerReady`, typed errors, swarm-level listen helper)
+landed on `dx-core` and should be validated in examples before starting new
+runtime features.

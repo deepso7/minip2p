@@ -141,12 +141,11 @@ impl Protocol {
             P2P_CODE => {
                 let (body, used) = length_prefixed(rest, "p2p")?;
                 consumed += used;
-                let peer_id = PeerId::from_bytes(body).map_err(|e| {
-                    MultiaddrError::InvalidBinaryValue {
+                let peer_id =
+                    PeerId::from_bytes(body).map_err(|e| MultiaddrError::InvalidBinaryValue {
                         protocol: "p2p",
                         reason: e.to_string(),
-                    }
-                })?;
+                    })?;
                 Ok((Self::P2p(peer_id), consumed))
             }
             _ => Err(MultiaddrError::UnknownProtocolCode { code }),
@@ -155,10 +154,7 @@ impl Protocol {
 }
 
 /// Reads `N` bytes from the front of `bytes` as a fixed-size value.
-fn fixed<const N: usize>(
-    bytes: &[u8],
-    protocol: &'static str,
-) -> Result<[u8; N], MultiaddrError> {
+fn fixed<const N: usize>(bytes: &[u8], protocol: &'static str) -> Result<[u8; N], MultiaddrError> {
     if bytes.len() < N {
         return Err(MultiaddrError::TruncatedBinaryValue { protocol });
     }
