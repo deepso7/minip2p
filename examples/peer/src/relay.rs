@@ -903,12 +903,9 @@ fn dialback_candidate(
     addr: &Multiaddr,
     timeout: Duration,
 ) -> Result<bool, Box<dyn Error>> {
-    let mut results = Vec::new();
-    for bind in dialback_bind_addrs(addr) {
-        results.push(
-            dialback_candidate_with_bind(peer_id, addr, timeout, bind).map_err(|e| e.to_string()),
-        );
-    }
+    let results = dialback_bind_addrs(addr).iter().map(|bind| {
+        dialback_candidate_with_bind(peer_id, addr, timeout, bind).map_err(|e| e.to_string())
+    });
     merge_dialback_results(results).map_err(Into::into)
 }
 
@@ -1139,5 +1136,20 @@ mod tests {
             merge_dialback_results([Err("first".into()), Err("last".into())]),
             Err("last".into())
         );
+    }
+
+    #[test]
+    fn dialback_merge_is_lazy_after_success() {
+        let mut calls = 0;
+        let results = core::iter::from_fn(|| {
+            calls += 1;
+            match calls {
+                1 => Some(Ok(true)),
+                _ => panic!("merge should stop after first success"),
+            }
+        });
+
+        assert_eq!(merge_dialback_results(results), Ok(true));
+        assert_eq!(calls, 1);
     }
 }
