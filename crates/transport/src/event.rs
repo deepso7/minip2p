@@ -49,6 +49,12 @@ pub enum TransportEvent {
         endpoint: ConnectionEndpoint,
     },
     /// A peer identity was bound to a connection.
+    ///
+    /// Transports may emit this after `Connected` when identity is learned as a
+    /// post-handshake upgrade. Transports that verify identity during the
+    /// handshake may also emit both `Connected` with the verified endpoint and
+    /// this event so consumers that track identity-upgrade events have one
+    /// consistent signal to observe.
     PeerIdentityVerified {
         id: ConnectionId,
         endpoint: ConnectionEndpoint,

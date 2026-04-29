@@ -7,6 +7,10 @@
 //! Both verification and generation are `no_std + alloc` compatible. The
 //! `std` feature adds a convenience wrapper ([`generate_certificate`]) that
 //! uses OS randomness and a default validity window, plus PEM encoding helpers.
+//!
+//! Certificate generation currently uses Ed25519 host identities. Verification
+//! parses other libp2p public-key extensions for test-vector coverage, but only
+//! Ed25519 host-key signatures are accepted today.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 

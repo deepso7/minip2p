@@ -299,9 +299,5 @@ frame delivery without needing a separate poll round.
   the CLI to know the right abstraction.
 - Noise + Yamux over the relay bridge for interop with third-party
   libp2p peers.
-- Mutual TLS on the QUIC transport so the server side gets the client's
-  verified PeerId without relying on a post-hoc Identify or the synthetic
-  placeholder. Requires quiche custom verify callback (boringssl feature)
-  or upstream change.
 - Relay discovery (e.g. through DHT or a bootstrap list) instead of
   requiring the user to supply the relay multiaddr.

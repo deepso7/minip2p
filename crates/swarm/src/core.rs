@@ -397,8 +397,7 @@ impl SwarmCore {
                 if let Some(peer_id) = endpoint.peer_id() {
                     self.register_connection(id, peer_id.clone());
                 } else {
-                    // Peer identity is not yet known (e.g. server side with
-                    // verify_peer(false)). Synthesize a placeholder PeerId
+                    // Peer identity is not yet known. Synthesize a placeholder PeerId
                     // for internal bookkeeping so protocol handlers can still
                     // operate. No ConnectionEstablished event yet -- we emit
                     // one when the real identity arrives via
@@ -608,14 +607,7 @@ impl SwarmCore {
     }
 
     fn find_negotiated_ping_stream(&self, peer_id: &PeerId) -> Option<StreamId> {
-        let conn = *self.peer_to_conn.get(peer_id)?;
-        self.stream_owner.iter().find_map(|((c, s), owner)| {
-            if *c == conn && matches!(owner, ProtocolKind::Ping) {
-                Some(*s)
-            } else {
-                None
-            }
-        })
+        self.ping.outbound_stream(peer_id)
     }
 
     fn has_pending_ping_stream(&self, peer_id: &PeerId) -> bool {
@@ -643,6 +635,11 @@ impl SwarmCore {
         target: ProtocolKind,
     ) -> Result<(), SwarmError> {
         let conn_id = self.require_conn(peer_id)?;
+        debug_assert_eq!(
+            self.conn_to_peer.get(&conn_id),
+            Some(peer_id),
+            "protocol opens must use a connection mapped to the requested peer"
+        );
         let token = self.next_open_token();
         self.pending_opens.insert(
             token,

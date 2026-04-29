@@ -31,7 +31,7 @@ Runtime adapters (`std`):
 
 Current validated behavior:
 
-- Two local peers connect over QUIC in integration tests, with libp2p TLS peer authentication.
+- Two local peers connect over QUIC in integration tests, with mutual libp2p TLS peer authentication.
 - Bidirectional stream data exchange with half-close propagation.
 - Multistream-select negotiation with spec-compliant varint framing.
 - Ping protocol round-trips with RTT measurement over negotiated streams.
@@ -100,7 +100,7 @@ cargo doc --workspace --no-deps --open
 - [x] Circuit Relay v2 client state machines.
 - [x] DCUtR hole-punching state machines.
 - [ ] Runnable hole-punch CLI against a real relay (see `holepunch-plan.md`).
-- [ ] Mutual TLS on the QUIC transport so the listener learns the client PeerId at handshake time.
+- [x] Mutual TLS on the QUIC transport so the listener learns the client PeerId at handshake time.
 - [ ] Additional transport adapters (TCP, WebSocket, WebRTC).
 
 See `plan.md` for the detailed execution plan and milestones, and `holepunch-plan.md` for the runnable relay/DCUtR demo work.

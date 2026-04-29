@@ -86,16 +86,19 @@ fn read_bound_line<R: std::io::Read + Send + 'static>(
     thread::spawn(move || {
         let mut buf = BufReader::new(reader);
         let mut line = String::new();
+        let mut sent_bound = false;
         loop {
             line.clear();
             if buf.read_line(&mut line).unwrap_or(0) == 0 {
                 // EOF: listener died before printing its bound line.
-                let _ = tx.send(None);
+                if !sent_bound {
+                    let _ = tx.send(None);
+                }
                 return;
             }
-            if let Some(rest) = line.strip_prefix("[listen] bound=") {
+            if !sent_bound && let Some(rest) = line.strip_prefix("[listen] bound=") {
                 let _ = tx.send(Some(rest.trim_end().to_string()));
-                return;
+                sent_bound = true;
             }
         }
     });
