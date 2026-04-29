@@ -451,7 +451,7 @@ impl SwarmCore {
             TransportEvent::Error { id, message } => {
                 self.emit_error(
                     SwarmErrorKind::Transport,
-                    self.conn_to_peer.get(&id).cloned(),
+                    self.established_peer_for_conn(id),
                     Some(id),
                     format!("transport error on connection {id}: {message}"),
                 );
@@ -495,7 +495,7 @@ impl SwarmCore {
         if pending.conn_id != conn_id {
             self.emit_error(
                 SwarmErrorKind::Driver,
-                self.conn_to_peer.get(&conn_id).cloned(),
+                self.established_peer_for_conn(conn_id),
                 Some(conn_id),
                 format!(
                     "driver opened stream on connection {} but core requested {}",
@@ -530,7 +530,7 @@ impl SwarmCore {
         let pending = self.pending_opens.remove(&token);
         let (peer_id, conn_id, detail) = match pending {
             Some(p) => (
-                self.conn_to_peer.get(&p.conn_id).cloned(),
+                self.established_peer_for_conn(p.conn_id),
                 Some(p.conn_id),
                 format!(
                     "open_stream for protocol '{}' on connection {} failed: {reason}",
@@ -563,6 +563,15 @@ impl SwarmCore {
             .ok_or_else(|| SwarmError::NotConnected {
                 peer_id: peer_id.clone(),
             })
+    }
+
+    fn established_peer_for_conn(&self, conn_id: ConnectionId) -> Option<PeerId> {
+        let peer_id = self.conn_to_peer.get(&conn_id)?;
+        if self.established_peers.contains(peer_id) {
+            Some(peer_id.clone())
+        } else {
+            None
+        }
     }
 
     fn emit_error(
@@ -1012,7 +1021,7 @@ impl SwarmCore {
                 MultistreamOutput::ProtocolError { reason } => {
                     self.emit_error(
                         SwarmErrorKind::Multistream,
-                        self.conn_to_peer.get(&conn_id).cloned(),
+                        self.established_peer_for_conn(conn_id),
                         Some(conn_id),
                         format!("multistream error on inbound stream {stream_id}: {reason}"),
                     );
@@ -1072,7 +1081,7 @@ impl SwarmCore {
                 MultistreamOutput::NotAvailable => {
                     self.emit_error(
                         SwarmErrorKind::UnsupportedProtocol,
-                        self.conn_to_peer.get(&conn_id).cloned(),
+                        self.established_peer_for_conn(conn_id),
                         Some(conn_id),
                         format!("remote peer does not support protocol for stream {stream_id}"),
                     );
@@ -1084,7 +1093,7 @@ impl SwarmCore {
                 MultistreamOutput::ProtocolError { reason } => {
                     self.emit_error(
                         SwarmErrorKind::Multistream,
-                        self.conn_to_peer.get(&conn_id).cloned(),
+                        self.established_peer_for_conn(conn_id),
                         Some(conn_id),
                         format!("multistream error on outbound stream {stream_id}: {reason}"),
                     );
@@ -1360,5 +1369,97 @@ impl SwarmCore {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str::FromStr;
+
+    use minip2p_identify::IdentifyConfig;
+    use minip2p_ping::PingConfig;
+    use minip2p_transport::{ConnectionEndpoint, ConnectionId, TransportEvent};
+
+    use super::*;
+
+    fn test_core() -> SwarmCore {
+        SwarmCore::new(
+            IdentifyConfig {
+                protocol_version: "minip2p-test/0.1.0".into(),
+                agent_version: "minip2p-test/0.1.0".into(),
+                protocols: Vec::new(),
+                public_key: Vec::new(),
+            },
+            PingConfig::default(),
+        )
+    }
+
+    fn loopback_transport() -> Multiaddr {
+        Multiaddr::from_str("/ip4/127.0.0.1/udp/4001/quic-v1").expect("valid multiaddr")
+    }
+
+    #[test]
+    fn transport_error_does_not_surface_synthetic_peer_id() {
+        let mut core = test_core();
+        let conn_id = ConnectionId::new(7);
+
+        core.on_transport_event(
+            TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::new(loopback_transport()),
+            },
+            0,
+        );
+        core.on_transport_event(
+            TransportEvent::Error {
+                id: conn_id,
+                message: "boom".into(),
+            },
+            0,
+        );
+
+        let events = core.poll_events();
+        let error = events
+            .iter()
+            .find_map(|event| match event {
+                SwarmEvent::Error(error) => Some(error),
+                _ => None,
+            })
+            .expect("transport error should surface");
+        assert_eq!(error.peer_id, None);
+        assert_eq!(error.conn_id, Some(conn_id));
+    }
+
+    #[test]
+    fn transport_error_keeps_established_peer_id() {
+        let mut core = test_core();
+        let conn_id = ConnectionId::new(8);
+        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
+
+        core.on_transport_event(
+            TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+            0,
+        );
+        core.on_transport_event(
+            TransportEvent::Error {
+                id: conn_id,
+                message: "boom".into(),
+            },
+            0,
+        );
+
+        let events = core.poll_events();
+        let error = events
+            .iter()
+            .find_map(|event| match event {
+                SwarmEvent::Error(error) if error.kind == SwarmErrorKind::Transport => Some(error),
+                _ => None,
+            })
+            .expect("transport error should surface");
+        assert_eq!(error.peer_id.as_ref(), Some(&peer_id));
+        assert_eq!(error.conn_id, Some(conn_id));
     }
 }

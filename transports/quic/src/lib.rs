@@ -380,7 +380,7 @@ impl QuicTransport {
     /// Convenience wrapper around [`listen`](Transport::listen) that uses the
     /// address the UDP socket is bound to, avoiding manual `Multiaddr`
     /// construction.
-    pub fn listen_on_bound_addr(&mut self) -> Result<(), TransportError> {
+    pub fn listen_on_bound_addr(&mut self) -> Result<Multiaddr, TransportError> {
         let addr = self.local_addr()?;
         let multiaddr = socket_addr_to_multiaddr(addr);
         self.listen(&multiaddr)
@@ -563,7 +563,7 @@ impl Transport for QuicTransport {
         Ok(())
     }
 
-    fn listen(&mut self, addr: &Multiaddr) -> Result<(), TransportError> {
+    fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
         let socket_addr = extract_listen_socket_addr(addr, "listen address")?;
 
         if !self.node_config.can_listen() {
@@ -575,12 +575,13 @@ impl Transport for QuicTransport {
         let local_addr = self.local_addr()?;
         ensure_listen_matches_bound_socket(socket_addr, local_addr)?;
 
+        let listen_addr = socket_addr_to_multiaddr(local_addr);
         self.listen_addr = Some(local_addr);
         self.pending_events.push(TransportEvent::Listening {
-            addr: socket_addr_to_multiaddr(local_addr),
+            addr: listen_addr.clone(),
         });
 
-        Ok(())
+        Ok(listen_addr)
     }
 
     fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {

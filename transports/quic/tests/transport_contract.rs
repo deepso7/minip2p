@@ -103,6 +103,23 @@ fn connect_pair(
 // ---------------------------------------------------------------------------
 
 #[test]
+fn listen_returns_the_resolved_listen_address_and_event_matches() {
+    let mut listener =
+        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("listener");
+    let requested = listener.local_multiaddr().expect("local multiaddr");
+
+    let resolved = listener.listen(&requested).expect("listen");
+    assert_eq!(resolved, requested);
+
+    let events = listener.poll().expect("poll");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Listening { addr } if addr == &resolved))
+    );
+}
+
+#[test]
 fn connected_is_emitted_exactly_once_after_dial() {
     let (mut server, mut client, peer_addr) = setup_pair();
     let (_, _, _, client_events) = connect_pair(&mut server, &mut client, &peer_addr);

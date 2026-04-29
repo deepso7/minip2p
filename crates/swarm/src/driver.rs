@@ -170,13 +170,7 @@ impl<T: Transport> Swarm<T> {
 
     /// Start listening on the given multiaddr and return the resolved local address.
     pub fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
-        self.transport.listen(addr)?;
-        Ok(self
-            .transport
-            .local_addresses()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| addr.clone()))
+        self.transport.listen(addr)
     }
 
     /// Start listening on the transport's already-bound local address.
@@ -193,9 +187,11 @@ impl<T: Transport> Swarm<T> {
             .ok_or_else(|| TransportError::InvalidConfig {
                 reason: "transport does not expose a bound local address".into(),
             })?;
-        self.transport.listen(&addr)?;
-        PeerAddr::new(addr, self.local_peer_id.clone()).map_err(|e| TransportError::InvalidConfig {
-            reason: format!("failed to build local PeerAddr: {e}"),
+        let resolved = self.transport.listen(&addr)?;
+        PeerAddr::new(resolved, self.local_peer_id.clone()).map_err(|e| {
+            TransportError::InvalidConfig {
+                reason: format!("failed to build local PeerAddr: {e}"),
+            }
         })
     }
 

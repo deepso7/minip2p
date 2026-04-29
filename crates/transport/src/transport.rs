@@ -53,9 +53,10 @@ pub trait Transport {
 
     /// Start listening for inbound connections on the given address.
     ///
-    /// Emits `Listening` on success. Incoming connections produce
+    /// Returns the actual resolved listen address and emits `Listening` on
+    /// success with the same address. Incoming connections produce
     /// `IncomingConnection` followed by `Connected`.
-    fn listen(&mut self, addr: &Multiaddr) -> Result<(), TransportError>;
+    fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError>;
 
     /// Open a new bidirectional stream on an existing connection.
     ///
