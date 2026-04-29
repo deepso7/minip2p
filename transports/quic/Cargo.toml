@@ -7,6 +7,7 @@ edition = "2024"
 minip2p-transport = { path = "../../crates/transport" }
 minip2p-identity = { path = "../../crates/identity" }
 minip2p-core = { path = "../../crates/core" }
+minip2p-stun = { path = "../../crates/stun", default-features = false }
 minip2p-tls = { path = "../../crates/tls" }
 boring = "4"
 quiche = { version = "0.28", features = ["boringssl-boring-crate"] }

@@ -21,6 +21,7 @@ Sans-I/O core crates (`no_std + alloc`):
 - `crates/ping` (`minip2p-ping`): `/ipfs/ping/1.0.0` state machine with RTT measurement.
 - `crates/identify` (`minip2p-identify`): `/ipfs/id/1.0.0` state machine for protocol and address exchange.
 - `crates/relay` (`minip2p-relay`): Circuit Relay v2 *client-side* state machines (`HopReservation`, `HopConnect`, `StopResponder`).
+- `crates/stun` (`minip2p-stun`): STUN Binding packet builder/parser for UDP mapping discovery.
 - `crates/dcutr` (`minip2p-dcutr`): DCUtR hole-punch coordination state machines (`DcutrInitiator`, `DcutrResponder`).
 - `crates/swarm` (`minip2p-swarm`): `SwarmCore` Sans-I/O orchestrator that composes the protocol state machines, tracks connections and streams, drives multistream-select, and emits actions/events for the driver.
 
@@ -40,10 +41,11 @@ Current validated behavior:
 - End-to-end stack via `SwarmBuilder`: QUIC transport + multistream-select + identify + ping with a single builder call.
 - Swarm DX events for application readiness (`PeerReady`) and typed runtime errors.
 - Pure-state-machine integration test covering Circuit Relay v2 + DCUtR (reservation, connect, stop, hole-punch coordination).
+- STUN-based UDP mapping discovery in the QUIC adapter, with wire logic isolated in `minip2p-stun`.
 
 ## Architecture boundaries
 
-- Core crates listed above are designed to remain `no_std + alloc`. Protocol state machines (`ping`, `identify`, `relay`, `dcutr`, `multistream-select`) never depend on sockets, async runtimes, or wall clocks.
+- Core crates listed above are designed to remain `no_std + alloc`. Protocol state machines (`ping`, `identify`, `relay`, `stun`, `dcutr`, `multistream-select`) never depend on sockets, async runtimes, or wall clocks.
 - Runtime networking concerns (UDP/TCP sockets, DNS resolution, timers) belong in transport adapter crates.
 - Transport-specific address validation belongs in transport adapters, not `crates/core`.
 - `crates/swarm` splits into a Sans-I/O `SwarmCore` (no_std) and a `std`-gated driver that owns a concrete `Transport` and reads the wall clock.
@@ -73,7 +75,8 @@ Check `no_std` builds for the core crates:
 ```bash
 cargo check --no-default-features -p minip2p-core -p minip2p-identity \
     -p minip2p-transport -p minip2p-tls -p minip2p-identify \
-    -p minip2p-ping -p minip2p-relay -p minip2p-dcutr -p minip2p-swarm
+    -p minip2p-ping -p minip2p-relay -p minip2p-stun \
+    -p minip2p-dcutr -p minip2p-swarm
 ```
 
 ## Documentation

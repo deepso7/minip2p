@@ -59,9 +59,11 @@ minip2p-peer dial \
 ```
 
 Relay mode queries STUN by default (`stun.l.google.com:19302`) from the same
-UDP socket used by QUIC. `--stun <host:port>` overrides the server,
-`--no-stun` skips discovery for local/offline testing, and repeatable
-`--external-addr` remains available for known port-forwards or STUN failures.
+UDP socket used by QUIC. The STUN wire logic lives in `minip2p-stun`, a
+`no_std` Sans-I/O crate; the QUIC adapter only owns socket I/O and timing.
+`--stun <host:port>` overrides the server, `--no-stun` skips discovery for
+local/offline testing, and repeatable `--external-addr` remains available for
+known port-forwards or STUN failures.
 
 Output format is plain text, one event per line, prefixed with a role tag:
 
@@ -336,6 +338,7 @@ frame delivery without needing a separate poll round.
 
 5. STUN discovery -- DONE
    - [x] Add STUN discovery from the QUIC socket used for DCUtR.
+   - [x] Keep STUN packet logic in `minip2p-stun` (`no_std`, Sans-I/O), with runtime I/O in the QUIC adapter.
    - [x] Populate the same candidate list as manual external addresses without adding protocol coupling to core crates.
    - [x] Keep manual `--external-addr` as an override/fallback path.
 

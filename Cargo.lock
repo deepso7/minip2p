@@ -726,6 +726,7 @@ dependencies = [
  "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-ping",
+ "minip2p-stun",
  "minip2p-swarm",
  "minip2p-tls",
  "minip2p-transport",
@@ -737,6 +738,13 @@ name = "minip2p-relay"
 version = "0.1.0"
 dependencies = [
  "minip2p-core",
+ "thiserror",
+]
+
+[[package]]
+name = "minip2p-stun"
+version = "0.1.0"
+dependencies = [
  "thiserror",
 ]
 

@@ -8,6 +8,7 @@ members = [
     "crates/multistream-select",
     "crates/ping",
     "crates/relay",
+    "crates/stun",
     "crates/swarm",
     "crates/tls",
     "crates/transport",

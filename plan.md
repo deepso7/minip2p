@@ -20,6 +20,7 @@ Implemented crates:
 - `crates/ping` (`minip2p-ping`)
 - `crates/identify` (`minip2p-identify`)
 - `crates/relay` (`minip2p-relay`)
+- `crates/stun` (`minip2p-stun`)
 - `crates/dcutr` (`minip2p-dcutr`)
 - `crates/transport` (`minip2p-transport`)
 - `crates/tls` (`minip2p-tls`)
@@ -35,6 +36,7 @@ Current validated capabilities:
 - End-to-end protocol stack: QUIC transport + multistream-select + ping in integration tests.
 - Transport contract with documented lifecycle guarantees and 12 conformance tests.
 - Varint helpers shared via `minip2p-identity` and re-exported through `minip2p-core`.
+- STUN Binding Request/Response wire logic as a `no_std` Sans-I/O crate, used by the QUIC runtime adapter for UDP mapping discovery.
 - Rustdoc on all public APIs. Internal comments on all private functions and types.
 
 ## Architecture Boundaries
@@ -52,6 +54,7 @@ Callers pump events and bytes in; the crate emits actions/events out.
 - `crates/ping`: `/ipfs/ping/1.0.0` state machine.
 - `crates/identify`: `/ipfs/id/1.0.0` state machine.
 - `crates/relay`: Circuit Relay v2 client state machines (`HopReservation`, `HopConnect`, `StopResponder`).
+- `crates/stun`: STUN Binding client packet builder/parser for UDP mapping discovery.
 - `crates/dcutr`: DCUtR hole-punch coordination state machines (`DcutrInitiator`, `DcutrResponder`).
 - `crates/swarm` (core): `SwarmCore` -- Sans-I/O orchestration state machine. Composes the protocol state machines, tracks connections and streams, drives multistream-select for inbound and outbound streams, emits `SwarmAction` for the driver to execute and `SwarmEvent` for the application.
 
@@ -185,7 +188,7 @@ New crate: `crates/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 - [x] Manual external address override for DCUtR candidates (`--external-addr /ip4/<public-ip>/udp/<port>/quic-v1`) before adding STUN.
 - [x] Public relay walkthrough using rust-libp2p's relay server: relay command, listener command, dialer command, expected `ping-direct` and `ping-via-relay` output.
 - [x] Diagnostics for real-world NAT runs: print observed relay address, advertised DCUtR candidates, direct dial attempts, direct failure reason, and fallback reason.
-- [x] STUN-based UDP mapping discovery from the QUIC socket, with `--stun` override and `--no-stun` for local/offline relay tests.
+- [x] STUN-based UDP mapping discovery from the QUIC socket, with Sans-I/O `minip2p-stun` wire logic, `--stun` override, and `--no-stun` for local/offline relay tests.
 
 **Exit criteria**
 - Two peers on different networks can rendezvous through a public relay, attempt DCUtR, authenticate direct QUIC with mTLS, and either `ping-direct` or fall back to `ping-via-relay` with actionable logs.
@@ -218,7 +221,7 @@ and rotation policy belong to hosts.
 
 - Unit tests for core parsing/types and error behavior.
 - Integration tests for two-peer connectivity per transport.
-- `cargo check --no-default-features` for `crates/identity`, `crates/core`, `crates/transport`, and `crates/tls`.
+- `cargo check --no-default-features` for `crates/identity`, `crates/core`, `crates/transport`, `crates/tls`, and `crates/stun`.
 - Stable, documented error messages for common misconfiguration paths.
 - Dependency and footprint discipline for core crates.
 

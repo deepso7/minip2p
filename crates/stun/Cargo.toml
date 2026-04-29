@@ -1,0 +1,12 @@
+[package]
+name = "minip2p-stun"
+version = "0.1.0"
+edition = "2024"
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = ["thiserror/std"]
+
+[dependencies]
+thiserror = { version = "2", default-features = false }
