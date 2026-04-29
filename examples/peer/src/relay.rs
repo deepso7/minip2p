@@ -52,6 +52,9 @@ const RESPONDER_SYNC_DELAY: Duration = Duration::from_millis(50);
 const RELAY_PING_LEN: usize = 32;
 const AUTONAT_CLIENT_DEADLINE: Duration = Duration::from_secs(20);
 const AUTONAT_REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+// Client deadline must absorb candidate_count * binds_per_candidate * dialback
+// deadline. Generic /dns candidates may try two bind families; /ip4, /ip6,
+// /dns4, and /dns6 try one.
 const AUTONAT_DIALBACK_DEADLINE: Duration = Duration::from_secs(5);
 const LISTEN_FOREVER: Duration = Duration::from_secs(60 * 60 * 24 * 365);
 
@@ -900,19 +903,13 @@ fn dialback_candidate(
     addr: &Multiaddr,
     timeout: Duration,
 ) -> Result<bool, Box<dyn Error>> {
-    let mut last_error: Option<String> = None;
+    let mut results = Vec::new();
     for bind in dialback_bind_addrs(addr) {
-        match dialback_candidate_with_bind(peer_id, addr, timeout, bind) {
-            Ok(true) => return Ok(true),
-            Ok(false) => last_error = None,
-            Err(e) => last_error = Some(e.to_string()),
-        }
+        results.push(
+            dialback_candidate_with_bind(peer_id, addr, timeout, bind).map_err(|e| e.to_string()),
+        );
     }
-
-    if let Some(error) = last_error {
-        return Err(error.into());
-    }
-    Ok(false)
+    merge_dialback_results(results).map_err(Into::into)
 }
 
 fn dialback_candidate_with_bind(
@@ -946,6 +943,28 @@ fn dialback_bind_addrs(addr: &Multiaddr) -> &'static [&'static str] {
         Some(Protocol::Ip6(_) | Protocol::Dns6(_)) => &["[::]:0"],
         Some(Protocol::Dns(_)) => &["[::]:0", "0.0.0.0:0"],
         _ => &["0.0.0.0:0"],
+    }
+}
+
+fn merge_dialback_results(
+    results: impl IntoIterator<Item = Result<bool, String>>,
+) -> Result<bool, String> {
+    let mut last_error = None;
+    let mut saw_completion = false;
+    for result in results {
+        match result {
+            Ok(true) => return Ok(true),
+            Ok(false) => saw_completion = true,
+            Err(e) => last_error = Some(e),
+        }
+    }
+
+    if saw_completion {
+        Ok(false)
+    } else if let Some(error) = last_error {
+        Err(error)
+    } else {
+        Ok(false)
     }
 }
 
@@ -1096,5 +1115,29 @@ mod tests {
         assert_eq!(dialback_bind_addrs(&dns4), &["0.0.0.0:0"]);
         assert_eq!(dialback_bind_addrs(&ip6), &["[::]:0"]);
         assert_eq!(dialback_bind_addrs(&dns6), &["[::]:0"]);
+    }
+
+    #[test]
+    fn dialback_merge_does_not_let_later_error_override_completed_false() {
+        assert_eq!(
+            merge_dialback_results([Ok(false), Err("bind failed".into())]),
+            Ok(false)
+        );
+        assert_eq!(
+            merge_dialback_results([Err("bind failed".into()), Ok(false)]),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn dialback_merge_prefers_success_and_reports_all_error_case() {
+        assert_eq!(
+            merge_dialback_results([Err("first".into()), Ok(true), Ok(false)]),
+            Ok(true)
+        );
+        assert_eq!(
+            merge_dialback_results([Err("first".into()), Err("last".into())]),
+            Err("last".into())
+        );
     }
 }
