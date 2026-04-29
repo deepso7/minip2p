@@ -188,7 +188,7 @@ New crate: `crates/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 - [x] Manual external address override for DCUtR candidates (`--external-addr /ip4/<public-ip>/udp/<port>/quic-v1`) for known public addresses and port-forwards.
 - [x] Public relay walkthrough using rust-libp2p's relay server: relay command, listener command, dialer command, expected `ping-direct` and `ping-via-relay` output.
 - [x] Diagnostics for real-world NAT runs: print observed relay address, advertised DCUtR candidates, direct dial attempts, direct failure reason, and fallback reason.
-- [x] AutoNAT reachability probe support with `minip2p-autonat` (`no_std + alloc`, Sans-I/O), `examples/peer autonat`, and relay-mode `--autonat <peer-addr>` validation.
+- [x] AutoNAT reachability probe support with `minip2p-autonat` (`no_std + alloc`, Sans-I/O), `minip2p-peer autonat`, and relay-mode `--autonat <peer-addr>` validation.
 
 **Exit criteria**
 - Two peers on different networks can rendezvous through a public relay, attempt DCUtR, authenticate direct QUIC with mTLS, and either `ping-direct` or fall back to `ping-via-relay` with actionable logs.

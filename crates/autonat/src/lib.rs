@@ -148,6 +148,9 @@ pub enum AutoNatError {
     /// Incoming message exceeded the configured maximum size.
     #[error("AutoNAT message exceeds maximum size ({len} > {MAX_MESSAGE_SIZE})")]
     MessageTooLarge { len: usize },
+    /// Frame prefix declared a message larger than the configured maximum size.
+    #[error("AutoNAT frame length exceeds maximum size ({len} > {MAX_MESSAGE_SIZE})")]
+    FrameTooLarge { len: usize },
     /// A varint could not be decoded.
     #[error("varint error: {0}")]
     Varint(#[from] VarintError),
@@ -258,6 +261,7 @@ impl AutoNatClient {
         let (payload, consumed) = match decode_frame(&self.recv_buf) {
             FrameDecode::Complete { payload, consumed } => (payload.to_vec(), consumed),
             FrameDecode::Incomplete => return Ok(()),
+            FrameDecode::TooLarge { len } => return Err(AutoNatError::FrameTooLarge { len }),
             FrameDecode::Error(e) => return Err(AutoNatError::Varint(e)),
         };
         self.recv_buf.drain(..consumed);
@@ -358,6 +362,7 @@ impl AutoNatServer {
         let (payload, consumed) = match decode_frame(&self.recv_buf) {
             FrameDecode::Complete { payload, consumed } => (payload.to_vec(), consumed),
             FrameDecode::Incomplete => return Ok(()),
+            FrameDecode::TooLarge { len } => return Err(AutoNatError::FrameTooLarge { len }),
             FrameDecode::Error(e) => return Err(AutoNatError::Varint(e)),
         };
         self.recv_buf.drain(..consumed);
@@ -395,6 +400,8 @@ pub enum FrameDecode<'a> {
     Complete { payload: &'a [u8], consumed: usize },
     /// More bytes are needed.
     Incomplete,
+    /// Declared payload length exceeds [`MAX_MESSAGE_SIZE`].
+    TooLarge { len: usize },
     /// The frame length varint was malformed.
     Error(VarintError),
 }
@@ -415,6 +422,9 @@ pub fn decode_frame(input: &[u8]) -> FrameDecode<'_> {
         Err(e) => return FrameDecode::Error(e),
     };
     let len = len as usize;
+    if len > MAX_MESSAGE_SIZE {
+        return FrameDecode::TooLarge { len };
+    }
     let end = used.saturating_add(len);
     if input.len() < end {
         return FrameDecode::Incomplete;
@@ -702,6 +712,19 @@ mod tests {
 
         assert!(
             matches!(client.outcome(), Some(Reachability::Private { status: ResponseStatus::DialError, reason }) if reason == "all dialbacks failed")
+        );
+    }
+
+    #[test]
+    fn rejects_declared_frame_length_above_max() {
+        let mut frame = Vec::new();
+        write_uvarint((MAX_MESSAGE_SIZE + 1) as u64, &mut frame);
+
+        assert_eq!(
+            decode_frame(&frame),
+            FrameDecode::TooLarge {
+                len: MAX_MESSAGE_SIZE + 1
+            }
         );
     }
 }

@@ -31,7 +31,7 @@ let mut server = AutoNatServer::new();
 server.on_data(&outbound)?;
 if let Some(request) = server.request() {
     // Runtime dials request.addrs for request.peer_id, then responds:
-    server.respond_public(&request.addrs)?;
+    server.respond_public(&request.addrs);
 }
 ```
 

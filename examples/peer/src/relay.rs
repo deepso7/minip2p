@@ -14,10 +14,11 @@ use std::time::{Duration, Instant};
 use minip2p_autonat::{
     AUTONAT_PROTOCOL_ID, AutoNatClient, AutoNatServer, Reachability, ResponseStatus,
 };
-use minip2p_core::{Multiaddr, PeerAddr, PeerId};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
 use minip2p_dcutr::{
     DCUTR_PROTOCOL_ID, DcutrInitiator, DcutrResponder, InitiatorOutcome, ResponderEvent,
 };
+use minip2p_identity::Ed25519Keypair;
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
 use minip2p_relay::{
     ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopReservation, ReservationOutcome,
@@ -49,7 +50,9 @@ const HOLEPUNCH_INTERVAL: Duration = Duration::from_millis(100);
 const RESPONDER_SYNC_DELAY: Duration = Duration::from_millis(50);
 /// Payload length used by the relay-ping fallback.
 const RELAY_PING_LEN: usize = 32;
-const AUTONAT_DEADLINE: Duration = Duration::from_secs(5);
+const AUTONAT_CLIENT_DEADLINE: Duration = Duration::from_secs(20);
+const AUTONAT_REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+const AUTONAT_DIALBACK_DEADLINE: Duration = Duration::from_secs(5);
 const LISTEN_FOREVER: Duration = Duration::from_secs(60 * 60 * 24 * 365);
 
 // ---------------------------------------------------------------------------
@@ -68,7 +71,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         role,
         &options,
         &initial_candidates,
-        Instant::now() + AUTONAT_DEADLINE,
+        Instant::now() + AUTONAT_CLIENT_DEADLINE,
     )?;
     println!("[{role}] bound={our_addr}");
     println!("[{role}] us={}", swarm.local_peer_id());
@@ -424,7 +427,7 @@ pub fn run_dial(
         role,
         &options,
         &initial_candidates,
-        Instant::now() + AUTONAT_DEADLINE,
+        Instant::now() + AUTONAT_CLIENT_DEADLINE,
     )?;
     println!("[{role}] bound={our_addr}");
     println!("[{role}] us={}", swarm.local_peer_id());
@@ -570,7 +573,8 @@ pub fn run_dial(
 
 pub fn run_autonat_server(options: RunOptions) -> Result<(), Box<dyn Error>> {
     let role = "autonat";
-    let mut swarm = build_autonat_swarm(&options, role)?;
+    let keypair = load_keypair(&options, role)?;
+    let mut swarm = build_autonat_swarm(&options, &keypair)?;
     let peer_addr = swarm
         .listen_on_bound_addr()
         .map_err(|e| format!("listen failed: {e}"))?;
@@ -616,9 +620,9 @@ fn handle_autonat_request(
     stream_id: StreamId,
 ) -> Result<(), Box<dyn Error>> {
     let mut server = AutoNatServer::new();
+    let request_deadline = Instant::now() + AUTONAT_REQUEST_DEADLINE;
     let request = loop {
-        let data =
-            wait_user_stream_data(swarm, role, stream_id, Instant::now() + AUTONAT_DEADLINE)?;
+        let data = wait_user_stream_data(swarm, role, stream_id, request_deadline)?;
         server
             .on_data(&data)
             .map_err(|e| format!("AutoNAT decode: {e}"))?;
@@ -632,6 +636,13 @@ fn handle_autonat_request(
         request.peer_id,
         request.addrs.len()
     );
+    if request.addrs.len() < request.raw_addrs.len() {
+        eprintln!(
+            "[{role}] probe-request: {} of {} addrs parsed; unsupported addrs ignored",
+            request.addrs.len(),
+            request.raw_addrs.len()
+        );
+    }
 
     if request.peer_id != requester_peer {
         server.respond_error(
@@ -645,27 +656,23 @@ fn handle_autonat_request(
 
     let mut dialable = Vec::new();
     for addr in &request.addrs {
-        match PeerAddr::new(addr.clone(), request.peer_id.clone()) {
-            Ok(peer_addr) => match swarm.dial(&peer_addr) {
-                Ok(_) => println!("[{role}] dialback-attempt {peer_addr}"),
-                Err(e) => eprintln!("[{role}] dialback-start-failed addr={peer_addr} reason={e}"),
-            },
+        match dialback_candidate(&request.peer_id, addr, AUTONAT_DIALBACK_DEADLINE) {
+            Ok(true) => {
+                println!("[{role}] dialback-success addr={addr}");
+                push_unique(&mut dialable, addr.clone());
+            }
+            Ok(false) => println!("[{role}] dialback-timeout addr={addr}"),
             Err(e) => eprintln!("[{role}] dialback-bad-addr addr={addr} reason={e}"),
         }
     }
 
-    let dialback_deadline = Instant::now() + AUTONAT_DEADLINE;
-    let success = swarm
-        .run_until(dialback_deadline, |ev| {
-            print_event(role, ev);
-            matches!(ev, SwarmEvent::ConnectionEstablished { peer_id } if peer_id == &request.peer_id)
-        })
-        .map_err(|e| format!("autonat dialback poll: {e}"))?;
-
-    if success.is_some() {
-        dialable.extend(request.addrs.iter().cloned());
+    if !dialable.is_empty() {
         server.respond_public(&dialable);
-        println!("[{role}] probe-public peer={}", request.peer_id);
+        println!(
+            "[{role}] probe-public peer={} addrs={}",
+            request.peer_id,
+            dialable.len()
+        );
     } else {
         server.respond_error(ResponseStatus::DialError, "dialback deadline elapsed");
         println!(
@@ -876,17 +883,49 @@ fn build_swarm_with_relay_protocols(
 
 fn build_autonat_swarm(
     options: &RunOptions,
-    role: &str,
+    keypair: &Ed25519Keypair,
 ) -> Result<Swarm<QuicTransport>, Box<dyn Error>> {
-    let keypair = load_keypair(options, role)?;
     let bind_addr = bind_addr(options)?;
     let transport = QuicTransport::new(QuicNodeConfig::new(keypair.clone()), &bind_addr)
         .map_err(|e| format!("quic bind: {e}"))?;
-    let mut swarm = SwarmBuilder::new(&keypair)
+    let mut swarm = SwarmBuilder::new(keypair)
         .agent_version(AGENT)
         .build(transport);
     swarm.add_user_protocol(AUTONAT_PROTOCOL_ID);
     Ok(swarm)
+}
+
+fn dialback_candidate(
+    peer_id: &PeerId,
+    addr: &Multiaddr,
+    timeout: Duration,
+) -> Result<bool, Box<dyn Error>> {
+    let keypair = Ed25519Keypair::generate();
+    let bind = dialback_bind_addr(addr);
+    let transport = QuicTransport::new(QuicNodeConfig::new(keypair.clone()), bind)
+        .map_err(|e| format!("dialback bind {bind}: {e}"))?;
+    let mut probe = SwarmBuilder::new(&keypair)
+        .agent_version(AGENT)
+        .build(transport);
+    let peer_addr = PeerAddr::new(addr.clone(), peer_id.clone())
+        .map_err(|e| format!("bad dialback peer addr {addr}: {e}"))?;
+    probe
+        .dial(&peer_addr)
+        .map_err(|e| format!("dialback start {peer_addr}: {e}"))?;
+    let found = probe
+        .run_until(
+            Instant::now() + timeout,
+            |ev| matches!(ev, SwarmEvent::ConnectionEstablished { peer_id: p } if p == peer_id),
+        )
+        .map_err(|e| format!("dialback poll {peer_addr}: {e}"))?;
+    Ok(found.is_some())
+}
+
+fn dialback_bind_addr(addr: &Multiaddr) -> &'static str {
+    match addr.protocols().first() {
+        Some(Protocol::Ip6(_) | Protocol::Dns6(_)) => "[::]:0",
+        _ => "0.0.0.0:0",
+    }
 }
 
 fn candidate_addrs(bound_addr: &Multiaddr, external_addrs: &[Multiaddr]) -> Vec<Multiaddr> {
@@ -933,13 +972,16 @@ fn validate_candidates_with_autonat(
     }
 
     match client.outcome().cloned().expect("outcome checked") {
-        Reachability::Public { addrs, .. } => {
-            println!("[{role}] autonat-public addrs={}", addrs.len());
-            let mut ordered = addrs;
-            for addr in candidates {
-                push_unique(&mut ordered, addr.clone());
+        Reachability::Public { addrs, raw_addrs } => {
+            if addrs.len() < raw_addrs.len() {
+                eprintln!(
+                    "[{role}] autonat-public: {} of {} addrs parsed; unsupported addrs ignored",
+                    addrs.len(),
+                    raw_addrs.len()
+                );
             }
-            Ok(ordered)
+            println!("[{role}] autonat-public addrs={}", addrs.len());
+            Ok(successful_candidates_in_original_order(candidates, &addrs))
         }
         Reachability::Private { status, reason } => {
             println!("[{role}] autonat-private status={status:?} reason={reason}");
@@ -950,6 +992,19 @@ fn validate_candidates_with_autonat(
             Ok(candidates.to_vec())
         }
     }
+}
+
+fn successful_candidates_in_original_order(
+    candidates: &[Multiaddr],
+    successful: &[Multiaddr],
+) -> Vec<Multiaddr> {
+    let mut ordered = Vec::new();
+    for candidate in candidates {
+        if successful.iter().any(|addr| addr == candidate) {
+            push_unique(&mut ordered, candidate.clone());
+        }
+    }
+    ordered
 }
 
 fn push_unique(addrs: &mut Vec<Multiaddr>, addr: Multiaddr) {

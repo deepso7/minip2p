@@ -340,7 +340,7 @@ frame delivery without needing a separate poll round.
 
 5. AutoNAT reachability validation -- DONE
    - [x] Add `minip2p-autonat` (`no_std + alloc`, Sans-I/O) for AutoNAT request/response state machines.
-   - [x] Add `examples/peer autonat` service mode for public dial-back checks.
+   - [x] Add `minip2p-peer autonat` service mode for public dial-back checks.
    - [x] Add relay-mode `--autonat <peer-addr>` to validate advertised DCUtR candidates before relay/DCUtR exchange.
    - [x] Keep manual `--external-addr` as an override/debug path.
 

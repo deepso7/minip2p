@@ -109,7 +109,7 @@ fn parse_listen(args: Vec<String>) -> Result<Mode, CliError> {
     }
 
     let options = flags.options;
-    if flags.relay.is_none() && options.has_relay_only_options() {
+    if flags.relay.is_none() && options.has_relay_mode_only_flags() {
         return Err(CliError(
             "--autonat and --external-addr are only valid with relay modes".into(),
         ));
@@ -133,20 +133,16 @@ fn parse_dial(args: Vec<String>) -> Result<Mode, CliError> {
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        match arg.as_str() {
-            "--relay" | "--target" | "--key" | "--listen" | "--external-addr" | "--autonat" => {
-                rest.push(arg.clone());
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| CliError(format!("flag '{arg}' requires a value")))?;
-                rest.push(value.clone());
-                i += 2;
-            }
-            _ if arg.starts_with("--") => return Err(CliError(format!("unknown flag '{arg}'"))),
-            _ => {
-                positional.push(arg.clone());
-                i += 1;
-            }
+        if arg.starts_with("--") {
+            rest.push(arg.clone());
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| CliError(format!("flag '{arg}' requires a value")))?;
+            rest.push(value.clone());
+            i += 2;
+        } else {
+            positional.push(arg.clone());
+            i += 1;
         }
     }
 
@@ -155,7 +151,7 @@ fn parse_dial(args: Vec<String>) -> Result<Mode, CliError> {
     let options = flags.options;
     match (positional.len(), flags.relay, flags.target) {
         (1, None, None) => {
-            if options.has_relay_only_options() {
+            if options.has_relay_mode_only_flags() {
                 return Err(CliError(
                     "--autonat and --external-addr are only valid with relay modes".into(),
                 ));
@@ -185,7 +181,8 @@ fn parse_dial(args: Vec<String>) -> Result<Mode, CliError> {
 
 fn parse_autonat(args: Vec<String>) -> Result<Mode, CliError> {
     let flags = Flags::from(args.as_slice())?;
-    if flags.relay.is_some() || flags.target.is_some() || flags.options.has_relay_only_options() {
+    if flags.relay.is_some() || flags.target.is_some() || flags.options.has_relay_mode_only_flags()
+    {
         return Err(CliError("`autonat` accepts only --key and --listen".into()));
     }
     Ok(Mode::AutoNatServer {
@@ -284,7 +281,7 @@ impl Flags {
 }
 
 impl RunOptions {
-    fn has_relay_only_options(&self) -> bool {
+    fn has_relay_mode_only_flags(&self) -> bool {
         !self.external_addrs.is_empty() || self.autonat.is_some()
     }
 }

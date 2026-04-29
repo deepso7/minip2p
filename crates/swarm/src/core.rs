@@ -1509,4 +1509,42 @@ mod tests {
                 if *conn_id == original_conn && *sid == stream_id && data == b"ok"
         ));
     }
+
+    #[test]
+    fn superseding_connection_invalidates_old_user_streams() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
+        let original_conn = ConnectionId::new(10);
+        let newer_conn = ConnectionId::new(11);
+        let stream_id = StreamId::new(8);
+
+        core.on_transport_event(
+            TransportEvent::Connected {
+                id: original_conn,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+            0,
+        );
+        core.stream_owner.insert(
+            (original_conn, stream_id),
+            ProtocolKind::User("/minip2p/test/1.0.0".into()),
+        );
+
+        core.on_transport_event(
+            TransportEvent::Connected {
+                id: newer_conn,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+            0,
+        );
+
+        let err = core
+            .send_user_stream(&peer_id, stream_id, b"lost".to_vec())
+            .expect_err("supersede should remove streams owned by original connection");
+        assert!(matches!(
+            err,
+            SwarmError::UserStreamNotFound { peer_id: p, stream_id: s }
+                if p == peer_id && s == stream_id
+        ));
+    }
 }
