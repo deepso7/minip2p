@@ -5,11 +5,13 @@ CLI demo that exercises the full minip2p stack end-to-end.
 Two modes:
 
 - **Direct** — two peers on the same host dial each other directly over
-  QUIC and run ping. No relay. Validates the whole base stack
-  (QUIC + multistream-select + identify + ping + swarm) in one command.
+  QUIC, verify each other with libp2p mTLS, and run ping. No relay.
+  Validates the whole base stack (QUIC + mTLS + multistream-select +
+  identify + ping + swarm) in one command.
 - **Relay** — two NATed peers rendezvous via a Circuit Relay v2 server,
-  coordinate DCUtR, attempt a UDP hole-punch, and fall back to a
-  relay-bridged RTT measurement if direct connection fails.
+  coordinate DCUtR, attempt a UDP hole-punch, verify direct QUIC identities
+  with mTLS, and fall back to a relay-bridged RTT measurement if direct
+  connection fails.
 
 ## Usage
 
@@ -44,8 +46,13 @@ cargo run -p minip2p-peer -- dial /ip4/127.0.0.1/udp/53121/quic-v1/p2p/12D3KooW.
 # [dial] dialing .../p2p/12D3KooW...
 # [dial] connected peer=12D3KooW...
 # [dial] identify peer=12D3KooW... agent=minip2p-peer/0.1.0 protocols=2
+# [dial] peer-ready peer=12D3KooW... protocols=2
 # [dial] ping peer=12D3KooW... rtt=6ms
 ```
+
+Both sides authenticate during the QUIC TLS handshake. The listener learns the
+dialer's `PeerId` from the client certificate; no post-hoc manual binding is
+needed.
 
 Run the automated direct-mode E2E test:
 
@@ -140,7 +147,7 @@ steps is visible top-to-bottom.
 - `src/direct.rs` — direct-mode listen/dial; zero relay machinery.
 - `src/relay.rs` — relay-mode scripts for both Peer B (listener) and
   Peer A (dialer), driving the HOP/STOP/DCUtR state machines inline
-  and running the hole-punch + relay-ping fallback at the bottom.
+  and running mTLS-verified hole-punch + relay-ping fallback at the bottom.
 
 See `holepunch-plan.md` at the repo root for the design rationale and
 open questions (RTT approximation on the responder side, relay-ping

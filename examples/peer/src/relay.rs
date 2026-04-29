@@ -37,13 +37,9 @@ const AGENT: &str = "minip2p-peer/0.1.0";
 const LISTEN_DEADLINE: Duration = Duration::from_secs(60);
 /// Hole-punch window after SYNC is received / sent.
 ///
-/// Kept short because on the listener side we fall back to an
-/// inbound-connection-count heuristic for early exit (since without
-/// mutual TLS we can't directly observe the remote's verified peer
-/// id). On the dialer side, direct dials succeed in milliseconds on
-/// LAN/loopback; real-world NATs may occasionally need longer but
-/// three seconds already works for the common-case symmetric-NAT
-/// traversal path.
+/// Direct dials succeed in milliseconds on LAN/loopback; real-world NATs may
+/// occasionally need longer but three seconds already works for the common-case
+/// symmetric-NAT traversal path.
 const HOLEPUNCH_DEADLINE: Duration = Duration::from_secs(3);
 /// UDP blast cadence (responder side) during hole-punch.
 const HOLEPUNCH_INTERVAL: Duration = Duration::from_millis(100);
@@ -252,22 +248,30 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
             ping_and_exit(&mut swarm, role, peer_id, deadline)
         }
         HolePunchOutcome::InboundConnectionSeen => {
-            // We saw an inbound direct path but this CLI flow has not mapped it
-            // back to the remote relay peer yet. Run the event loop for a short
-            // grace window so we stay responsive to inbound streams.
+            // The address heuristic fired before Swarm surfaced the verified
+            // mTLS identity. Give QUIC one short grace window to complete the
+            // identity event so this side can direct-ping too.
             println!(
                 "[{role}] inbound-direct-connection detected (hole-punch success; \
-                 waiting for peer mapping)"
+                 waiting for verified mTLS identity)"
             );
             let grace_deadline = Instant::now() + Duration::from_secs(2);
-            let _ = swarm
+            let verified = swarm
                 .run_until(grace_deadline, |ev| {
                     print_event(role, ev);
-                    false // keep draining until the grace period elapses
+                    matches!(ev, SwarmEvent::ConnectionEstablished { peer_id } if peer_id == &remote_peer_id)
                 })
                 .map_err(|e| format!("grace poll: {e}"))?;
-            println!("[{role}] grace-elapsed -- done");
-            Ok(())
+            match verified {
+                Some(SwarmEvent::ConnectionEstablished { peer_id }) => {
+                    println!("[{role}] direct-connected peer={peer_id} (mTLS verified)");
+                    ping_and_exit(&mut swarm, role, peer_id, deadline)
+                }
+                _ => {
+                    println!("[{role}] grace-elapsed before mTLS identity -- done");
+                    Ok(())
+                }
+            }
         }
         HolePunchOutcome::BridgeClosed => {
             // Relay closed the circuit. Most likely the remote went
@@ -314,13 +318,11 @@ pub fn run_listen(relay_addr: PeerAddr) -> Result<(), Box<dyn Error>> {
 
 /// Terminal states the listener's hole-punch loop can resolve to.
 enum HolePunchOutcome {
-    /// Saw `ConnectionEstablished` for the remote peer id (only
-    /// possible once mutual TLS is implemented; see Milestone 6).
+    /// Saw `ConnectionEstablished` for the remote peer id from mTLS.
     DirectConnected(PeerId),
-    /// `transport.active_connection_count()` grew beyond the relay
-    /// baseline. Almost certainly the remote peer coming in direct.
-    /// Coarse heuristic; not suitable for security decisions but
-    /// fine for this demo binary.
+    /// Saw an inbound QUIC source matching the remote's DCUtR address before
+    /// the verified identity reached Swarm. Coarse trigger only; the listener
+    /// waits for mTLS identity before direct-pinging.
     InboundConnectionSeen,
     /// Relay closed the bridge stream -- strong signal that the
     /// remote went direct and stopped using the circuit.
