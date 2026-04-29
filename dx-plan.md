@@ -127,75 +127,53 @@ The common quickstart path is now one swarm-level call that returns the local
 `PeerAddr`. Examples no longer need to drill into `transport_mut()` just to
 listen on the already-bound QUIC socket and then query `local_peer_addr()`.
 
+### User-protocol fail-fast on `open_user_stream`
+
+Once a peer is ready, `open_user_stream` now checks the peer's Identify
+protocol list before opening a stream. If the remote did not advertise the
+protocol, the call fails synchronously instead of surfacing a later
+multistream-select runtime error.
+
+### Peer introspection accessors
+
+`SwarmCore` and the std `Swarm` driver now expose read-only helpers for
+`connected_peers()`, `peer_info(&PeerId)`, and `is_peer_ready(&PeerId)`, so
+applications do not need to rebuild this state from events.
+
+### `PeerAddr::quic_v1(IpAddr, u16, PeerId)`
+
+The core crate has a typed constructor for the common QUIC peer-address shape,
+avoiding string formatting/parsing in examples and FFI hosts.
+
+### Clock injection on `Swarm<T>`
+
+The std driver now accepts an injected `Clock` via `Swarm::with_clock` and
+`SwarmBuilder::build_with_clock`. The Sans-I/O core remains clockless; the
+driver just passes injected monotonic milliseconds into the core.
+
+### `justfile` for common workflows
+
+Common contributor commands are captured as `just fmt`, `just test`,
+`just check`, `just check-nostd`, `just peer-direct`, and `just docs`.
+
 ---
 
 ## Open — Tier 1 (high leverage, small scope)
 
 Most of these are natural follow-ups to what's already in PR #5.
 
-The original Tier 1 items (`PeerReady`, typed errors, and swarm-level listen
-ergonomics) have landed on the `dx-core` branch. The next high-leverage item is
-user-protocol fail-fast, because it can now lean on `PeerReady`/Identify state.
+The original Tier 1 items (`PeerReady`, typed errors, swarm-level listen
+ergonomics, and user-protocol fail-fast) have landed on the `dx-core` branch.
 
 ---
 
 ## Open — Tier 2 (ergonomic papercuts)
 
-### `Ed25519Keypair` persistence (`to_protobuf_bytes` / `from_protobuf_bytes`)
-
-**Motivation**: every `examples/peer` run generates a fresh identity.
-To re-test against the same relay with stable PeerIds you want a
-`--key-file` flag; there's no stable serialization API today.
-
-**Proposed**: add `to_bytes() -> [u8; 64]` and
-`from_bytes(&[u8; 64]) -> Self` on `Ed25519Keypair`; optionally
-`to_pkcs8_pem()` / `from_pkcs8_pem()` behind `std`.
-
-**Effort**: ~40 LOC.
-
-### User-protocol fail-fast on `open_user_stream`
-
-**Motivation**: calling `open_user_stream("/myapp/1.0.0")` on a peer
-that doesn't advertise `/myapp/1.0.0` today silently fails at
-multistream-select time and surfaces as a string-typed `Error`. No
-signal that the remote explicitly doesn't support it.
-
-**Proposed**: if we have the peer's Identify message, check the
-advertised protocols list at `open_user_stream` time and return
-`SwarmError::RemoteDoesNotSupport { protocol_id }` eagerly. Fold in
-nicely with `PeerReady`: if the peer isn't ready yet, defer the check
-until it becomes ready.
-
-**Effort**: ~30 LOC.
-
-### `Swarm::connected_peers()` / `Swarm::peer_info(&PeerId)`
-
-**Motivation**: to answer "who am I connected to?" or "what does
-peer X advertise?" today, the caller has to accumulate events
-themselves.
-
-**Proposed**: accessors backed by the core's existing maps.
-
-**Effort**: ~50 LOC.
-
-### `PeerAddr::quic_v1(IpAddr, u16, PeerId)` constructor
-
-**Motivation**: the most common address shape is
-`/ip4|ip6/<addr>/udp/<port>/quic-v1/p2p/<peer-id>`. Today you build
-it by string-parsing. A typed constructor is 3 lines.
-
-**Effort**: ~20 LOC.
-
-### Clock injection on `Swarm<T>`
-
-**Motivation**: `SwarmCore` is clockless (good) but the `Swarm<T>`
-driver reads `Instant::now()` internally. Time-dependent tests
-(ping timeout) need real sleeps. Low user-value but high test-value.
-
-**Proposed**: `Swarm::with_clock(transport, identify_cfg, ping_cfg,
-keypair, Arc<dyn Clock>)`. Default constructor unchanged.
-
-**Effort**: ~80 LOC including test migration.
+Keypair file persistence is intentionally not tracked as a core-library DX
+task. `Ed25519Keypair::secret_key_bytes()` and
+`Ed25519Keypair::from_secret_key_bytes()` already provide the no_std-friendly
+primitive; file format, encryption, keychain/KMS integration, and rotation are
+application concerns.
 
 ---
 
@@ -208,14 +186,6 @@ apps want structured spans. Gate behind a feature so `no_std` core
 stays clean.
 
 **Effort**: ~100 LOC across two crates.
-
-### `justfile` for common workflows
-
-`cargo check --no-default-features -p ...` is a ~9-flag incantation
-today. `just check-nostd` would capture that plus `fmt`, `lint`,
-`test`, `doc`.
-
-**Effort**: trivial.
 
 ### Doc-test the READMEs
 
@@ -277,13 +247,9 @@ in place to keep the composition sane.
 
 In order of bang-for-buck given current state:
 
-1. User-protocol fail-fast on `open_user_stream` (now straightforward because
-   `PeerReady` records advertised protocols).
-2. Keypair persistence (required for any long-running demo / daemon).
-3. `Swarm::connected_peers()` / `Swarm::peer_info(&PeerId)` accessors.
-4. `PeerAddr::quic_v1(IpAddr, u16, PeerId)` constructor.
-5. Clock injection for deterministic driver tests.
+1. Doc-test the READMEs so examples cannot drift.
+2. Add optional `tracing` feature gates for structured runtime diagnostics.
+3. Add `CHANGELOG.md` before the next public API cut.
 
-The previous top three (`PeerReady`, typed errors, swarm-level listen helper)
-landed on `dx-core` and should be validated in examples before starting new
-runtime features.
+The high-leverage core DX items have landed on `dx-core`. The next work should
+either be docs/tooling polish or architecture work such as Milestone 6 mTLS.

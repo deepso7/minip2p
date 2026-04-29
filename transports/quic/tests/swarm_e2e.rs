@@ -8,7 +8,7 @@ use minip2p_identity::Ed25519Keypair;
 use minip2p_ping::PING_PROTOCOL_ID;
 use minip2p_quic::{QuicNodeConfig, QuicTransport};
 use minip2p_swarm::{Swarm, SwarmBuilder, SwarmErrorKind, SwarmEvent};
-use minip2p_transport::StreamId;
+use minip2p_transport::{StreamId, TransportError};
 
 fn make_swarm(keypair: Ed25519Keypair) -> Swarm<QuicTransport> {
     let transport =
@@ -71,6 +71,15 @@ fn swarm_ping_roundtrip_with_auto_identify() {
                 } => {
                     assert_eq!(peer_id, &server_peer_id);
                     assert!(protocols.contains(&PING_PROTOCOL_ID.to_string()));
+                    assert!(client.is_peer_ready(&server_peer_id));
+                    assert!(client.connected_peers().contains(&server_peer_id));
+                    assert!(
+                        client
+                            .peer_info(&server_peer_id)
+                            .expect("peer info should exist")
+                            .protocols
+                            .contains(&PING_PROTOCOL_ID.to_string())
+                    );
                     client_ready = true;
                 }
                 SwarmEvent::PingRttMeasured {
@@ -191,6 +200,37 @@ fn swarm_user_protocol_round_trip() {
     }
 
     assert_eq!(echo_received.as_deref(), Some(payload.as_slice()));
+}
+
+#[test]
+fn open_user_stream_fails_fast_when_peer_did_not_advertise_protocol() {
+    let mut server = make_swarm(Ed25519Keypair::generate());
+    let peer_addr = server.listen_on_bound_addr().expect("server listen");
+    let server_peer_id = peer_addr.peer_id().clone();
+
+    let mut client = make_swarm(Ed25519Keypair::generate());
+    client.add_user_protocol(USER_PROTOCOL_ID);
+    client.dial(&peer_addr).expect("dial");
+
+    for _ in 0..500 {
+        let (_server_events, client_events) = drive_pair(&mut server, &mut client);
+
+        if client_events.iter().any(
+            |ev| matches!(ev, SwarmEvent::PeerReady { peer_id, .. } if peer_id == &server_peer_id),
+        ) {
+            break;
+        }
+    }
+
+    assert!(client.is_peer_ready(&server_peer_id));
+    let err = client
+        .open_user_stream(&server_peer_id, USER_PROTOCOL_ID)
+        .expect_err("unsupported user protocol should fail synchronously");
+    assert!(
+        matches!(err, TransportError::PollError { ref reason }
+            if reason.contains("does not support protocol")),
+        "expected fail-fast unsupported protocol error, got {err:?}"
+    );
 }
 
 /// Regression test: after the client dials and Identify completes, the

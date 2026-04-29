@@ -127,6 +127,8 @@ pub struct SwarmCore {
     peer_info: BTreeMap<PeerId, IdentifyMessage>,
     /// Peers for which `PeerReady` has already been emitted.
     ready_peers: BTreeSet<PeerId>,
+    /// Peers that have been surfaced through `ConnectionEstablished`.
+    established_peers: BTreeSet<PeerId>,
 
     // --- Output queues ---
     events: Vec<SwarmEvent>,
@@ -159,6 +161,7 @@ impl SwarmCore {
             local_addresses: Vec::new(),
             peer_info: BTreeMap::new(),
             ready_peers: BTreeSet::new(),
+            established_peers: BTreeSet::new(),
             events: Vec::new(),
             actions: Vec::new(),
         }
@@ -182,8 +185,9 @@ impl SwarmCore {
             self.user_protocols.push(id.clone());
         }
         if !self.supported_protocols.iter().any(|p| p == &id) {
-            self.supported_protocols.push(id);
+            self.supported_protocols.push(id.clone());
         }
+        self.identify.add_protocol(id);
     }
 
     // -----------------------------------------------------------------------
@@ -281,6 +285,18 @@ impl SwarmCore {
                 peer_id: peer_id.clone(),
             });
         }
+        if self.ready_peers.contains(peer_id)
+            && !self
+                .peer_info
+                .get(peer_id)
+                .map(|info| info.protocols.iter().any(|p| p == protocol_id))
+                .unwrap_or(false)
+        {
+            return Err(SwarmError::RemoteDoesNotSupport {
+                peer_id: peer_id.clone(),
+                protocol_id: protocol_id.to_string(),
+            });
+        }
 
         self.queue_open_protocol_stream(
             peer_id,
@@ -345,6 +361,21 @@ impl SwarmCore {
     /// Returns the primary connection id currently mapped to `peer_id`.
     pub fn conn_for(&self, peer_id: &PeerId) -> Option<ConnectionId> {
         self.peer_to_conn.get(peer_id).copied()
+    }
+
+    /// Returns the peers that have been surfaced to the application as connected.
+    pub fn connected_peers(&self) -> Vec<PeerId> {
+        self.established_peers.iter().cloned().collect()
+    }
+
+    /// Returns the latest Identify information received for `peer_id`.
+    pub fn peer_info(&self, peer_id: &PeerId) -> Option<&IdentifyMessage> {
+        self.peer_info.get(peer_id)
+    }
+
+    /// Returns whether `peer_id` has reached the application-ready state.
+    pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
+        self.ready_peers.contains(peer_id)
     }
 
     /// Returns the peer id currently mapped to `conn_id`, if any.
@@ -657,6 +688,7 @@ impl SwarmCore {
         self.peer_to_conn.insert(peer_id.clone(), id);
 
         if is_new {
+            self.established_peers.insert(peer_id.clone());
             self.events.push(SwarmEvent::ConnectionEstablished {
                 peer_id: peer_id.clone(),
             });
@@ -681,6 +713,7 @@ impl SwarmCore {
         if let Some(peer_id) = self.conn_to_peer.remove(&old_id) {
             self.peer_info.remove(&peer_id);
             self.ready_peers.remove(&peer_id);
+            self.established_peers.remove(&peer_id);
         }
         self.active_connections.remove(&old_id);
         self.conn_to_remote_addr.remove(&old_id);
@@ -712,6 +745,9 @@ impl SwarmCore {
                 if self.ready_peers.remove(stale) {
                     self.ready_peers.insert(new_peer_id.clone());
                 }
+                if self.established_peers.remove(stale) {
+                    self.established_peers.insert(new_peer_id.clone());
+                }
                 self.migrate_buffered_events(stale, &new_peer_id);
             }
             None => {}
@@ -719,6 +755,7 @@ impl SwarmCore {
 
         self.conn_to_peer.insert(conn_id, new_peer_id.clone());
         self.peer_to_conn.insert(new_peer_id.clone(), conn_id);
+        self.established_peers.insert(new_peer_id.clone());
 
         self.events.push(SwarmEvent::ConnectionEstablished {
             peer_id: new_peer_id.clone(),
@@ -921,6 +958,7 @@ impl SwarmCore {
                 self.pending_pings.remove(&peer_id);
                 self.peer_info.remove(&peer_id);
                 self.ready_peers.remove(&peer_id);
+                self.established_peers.remove(&peer_id);
                 self.events.push(SwarmEvent::ConnectionClosed { peer_id });
             }
         }

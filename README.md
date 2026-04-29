@@ -61,6 +61,13 @@ Build and run tests:
 cargo test
 ```
 
+Common contributor workflows are also available through `just`:
+
+```bash
+just test
+just check-nostd
+```
+
 Check `no_std` builds for the core crates:
 
 ```bash

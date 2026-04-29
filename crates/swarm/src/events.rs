@@ -168,6 +168,12 @@ pub enum SwarmError {
     /// A user protocol id was used before registering it.
     #[error("user protocol '{protocol_id}' is not registered")]
     ProtocolNotRegistered { protocol_id: String },
+    /// The peer has completed Identify and did not advertise the requested protocol.
+    #[error("peer {peer_id} does not support user protocol '{protocol_id}'")]
+    RemoteDoesNotSupport {
+        peer_id: PeerId,
+        protocol_id: String,
+    },
     /// The ping state machine rejected the request (e.g. a ping is already
     /// in flight on the target peer).
     #[error("ping error: {reason}")]

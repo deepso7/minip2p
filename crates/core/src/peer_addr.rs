@@ -1,4 +1,6 @@
-use core::{fmt, str::FromStr};
+use alloc::vec;
+
+use core::{fmt, net::IpAddr, str::FromStr};
 
 use minip2p_identity::PeerId;
 
@@ -29,6 +31,17 @@ impl PeerAddr {
         }
 
         Ok(Self { transport, peer_id })
+    }
+
+    /// Builds the common `/ip4|ip6/<addr>/udp/<port>/quic-v1/p2p/<peer-id>` shape.
+    pub fn quic_v1(ip: IpAddr, udp_port: u16, peer_id: PeerId) -> Self {
+        let host = match ip {
+            IpAddr::V4(v4) => Protocol::Ip4(v4.octets()),
+            IpAddr::V6(v6) => Protocol::Ip6(v6.octets()),
+        };
+        let transport =
+            Multiaddr::from_protocols(vec![host, Protocol::Udp(udp_port), Protocol::QuicV1]);
+        Self { transport, peer_id }
     }
 
     /// Extracts a peer address from a multiaddr with a terminal `/p2p/<peer-id>`.
@@ -109,7 +122,10 @@ impl FromStr for PeerAddr {
 
 #[cfg(test)]
 mod tests {
-    use core::str::FromStr;
+    use core::{
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        str::FromStr,
+    };
 
     use super::*;
 
@@ -164,6 +180,28 @@ mod tests {
         assert_eq!(
             peer_addr.to_string(),
             format!("/ip4/127.0.0.1/udp/4001/p2p/{PEER_ID}")
+        );
+    }
+
+    #[test]
+    fn quic_v1_constructor_builds_ipv4_peer_addr() {
+        let peer_id = PeerId::from_str(PEER_ID).expect("peer id must parse");
+        let peer_addr = PeerAddr::quic_v1(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4001, peer_id);
+
+        assert_eq!(
+            peer_addr.to_string(),
+            format!("/ip4/127.0.0.1/udp/4001/quic-v1/p2p/{PEER_ID}")
+        );
+    }
+
+    #[test]
+    fn quic_v1_constructor_builds_ipv6_peer_addr() {
+        let peer_id = PeerId::from_str(PEER_ID).expect("peer id must parse");
+        let peer_addr = PeerAddr::quic_v1(IpAddr::V6(Ipv6Addr::LOCALHOST), 4001, peer_id);
+
+        assert_eq!(
+            peer_addr.to_string(),
+            format!("/ip6/::1/udp/4001/quic-v1/p2p/{PEER_ID}")
         );
     }
 }

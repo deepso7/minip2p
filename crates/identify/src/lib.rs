@@ -143,6 +143,14 @@ impl IdentifyProtocol {
         }
     }
 
+    /// Adds a protocol id to future Identify responses if not already advertised.
+    pub fn add_protocol(&mut self, protocol_id: impl Into<String>) {
+        let id = protocol_id.into();
+        if !self.config.protocols.iter().any(|p| p == &id) {
+            self.config.protocols.push(id);
+        }
+    }
+
     /// Registers a stream where we are the **responder** (sending our info).
     ///
     /// Call this after multistream-select negotiates `/ipfs/id/1.0.0` on an
