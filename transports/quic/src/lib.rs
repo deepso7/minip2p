@@ -5,13 +5,11 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::time::{Duration, Instant};
 
 use boring::pkey::PKey;
 use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
 use boring::x509::X509;
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
-use minip2p_stun::{BindingClient, TRANSACTION_ID_LEN};
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
 };
@@ -186,14 +184,6 @@ fn socket_addr_to_multiaddr(addr: SocketAddr) -> Multiaddr {
     }
 }
 
-fn generate_stun_transaction_id() -> Result<[u8; TRANSACTION_ID_LEN], TransportError> {
-    let mut id = [0u8; TRANSACTION_ID_LEN];
-    getrandom::fill(&mut id).map_err(|e| TransportError::PollError {
-        reason: format!("failed to generate stun transaction id: {e}"),
-    })?;
-    Ok(id)
-}
-
 /// Builds the shared QUIC TLS configuration.
 fn build_quiche_config(node_config: &QuicNodeConfig) -> Result<quiche::Config, TransportError> {
     let mut tls_builder =
@@ -339,70 +329,6 @@ impl QuicTransport {
                 reason: format!("raw udp send to {addr} failed: {e}"),
             })?;
         Ok(())
-    }
-
-    /// Discovers this socket's external UDP mapping via a STUN Binding Request.
-    ///
-    /// The request is sent from the same UDP socket used by QUIC so the returned
-    /// address is suitable as a DCUtR candidate. Non-STUN datagrams received
-    /// while waiting are ignored; callers should run this before active QUIC
-    /// traffic starts to avoid delaying unrelated packets.
-    pub fn discover_external_addr(
-        &self,
-        stun_server: &str,
-        timeout: Duration,
-    ) -> Result<Multiaddr, TransportError> {
-        let server = stun_server
-            .to_socket_addrs()
-            .map_err(|e| TransportError::InvalidAddress {
-                context: "stun server",
-                reason: format!("failed to resolve {stun_server}: {e}"),
-            })?
-            .next()
-            .ok_or_else(|| TransportError::InvalidAddress {
-                context: "stun server",
-                reason: format!("{stun_server} resolved to no addresses"),
-            })?;
-
-        let stun = BindingClient::new(generate_stun_transaction_id()?);
-        let request = stun.binding_request();
-        self.socket
-            .send_to(&request, server)
-            .map_err(|e| TransportError::PollError {
-                reason: format!("stun send to {server} failed: {e}"),
-            })?;
-
-        let deadline = Instant::now() + timeout;
-        let mut buf = [0u8; 1500];
-        while Instant::now() < deadline {
-            match self.socket.recv_from(&mut buf) {
-                Ok((len, from)) => {
-                    if from != server {
-                        continue;
-                    }
-                    let mapped = stun.parse_response(&buf[..len]).map_err(|e| {
-                        TransportError::PollError {
-                            reason: format!("stun response from {server} was malformed: {e}"),
-                        }
-                    })?;
-                    if let Some(addr) = mapped {
-                        return Ok(socket_addr_to_multiaddr(addr));
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => {
-                    return Err(TransportError::PollError {
-                        reason: format!("stun recv failed: {e}"),
-                    });
-                }
-            }
-        }
-
-        Err(TransportError::PollError {
-            reason: format!("stun request to {server} timed out after {timeout:?}"),
-        })
     }
 
     /// Exposes the bound local socket address as a multiaddr for external use.

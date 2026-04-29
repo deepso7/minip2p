@@ -48,22 +48,24 @@ Planned internet-ready usage:
 ```
 minip2p-peer listen \
   --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
+  --autonat /ip4/<autonat-ip>/udp/4002/quic-v1/p2p/<autonat-peer-id> \
   --key ./peer-b.key \
   --listen /ip4/0.0.0.0/udp/0/quic-v1
 
 minip2p-peer dial \
   --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
   --target <peer-b-id> \
+  --autonat /ip4/<autonat-ip>/udp/4002/quic-v1/p2p/<autonat-peer-id> \
   --key ./peer-a.key \
   --listen /ip4/0.0.0.0/udp/0/quic-v1
 ```
 
-Relay mode queries STUN by default (`stun.l.google.com:19302`) from the same
-UDP socket used by QUIC. The STUN wire logic lives in `minip2p-stun`, a
-`no_std` Sans-I/O crate; the QUIC adapter only owns socket I/O and timing.
-`--stun <host:port>` overrides the server, `--no-stun` skips discovery for
-local/offline testing, and repeatable `--external-addr` remains available for
-known port-forwards or STUN failures.
+`examples/peer autonat` runs a public AutoNAT service. Relay modes can pass
+`--autonat <peer-addr>` to ask that service to dial their advertised candidates
+before exchanging DCUtR addresses. The AutoNAT wire logic lives in
+`minip2p-autonat`, a `no_std + alloc` Sans-I/O crate; the CLI owns stream I/O,
+dial-back attempts, and deadlines. Repeatable `--external-addr` remains
+available for known public addresses and port-forwards.
 
 Output format is plain text, one event per line, prefixed with a role tag:
 
@@ -336,11 +338,11 @@ frame delivery without needing a separate poll round.
    - [x] Show exact listener and dialer commands.
    - [x] Log observed relay address, DCUtR candidates, direct dial attempts, direct timeout/failure reason, and relay fallback reason.
 
-5. STUN discovery -- DONE
-   - [x] Add STUN discovery from the QUIC socket used for DCUtR.
-   - [x] Keep STUN packet logic in `minip2p-stun` (`no_std`, Sans-I/O), with runtime I/O in the QUIC adapter.
-   - [x] Populate the same candidate list as manual external addresses without adding protocol coupling to core crates.
-   - [x] Keep manual `--external-addr` as an override/fallback path.
+5. AutoNAT reachability validation -- DONE
+   - [x] Add `minip2p-autonat` (`no_std + alloc`, Sans-I/O) for AutoNAT request/response state machines.
+   - [x] Add `examples/peer autonat` service mode for public dial-back checks.
+   - [x] Add relay-mode `--autonat <peer-addr>` to validate advertised DCUtR candidates before relay/DCUtR exchange.
+   - [x] Keep manual `--external-addr` as an override/debug path.
 
 ## Future follow-ups (not on this branch)
 

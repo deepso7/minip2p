@@ -43,5 +43,6 @@ fn run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
             target,
             options,
         } => relay::run_dial(relay, target, options),
+        Mode::AutoNatServer { options } => relay::run_autonat_server(options),
     }
 }

@@ -11,6 +11,9 @@
 use std::error::Error;
 use std::time::{Duration, Instant};
 
+use minip2p_autonat::{
+    AUTONAT_PROTOCOL_ID, AutoNatClient, AutoNatServer, Reachability, ResponseStatus,
+};
 use minip2p_core::{Multiaddr, PeerAddr, PeerId};
 use minip2p_dcutr::{
     DCUTR_PROTOCOL_ID, DcutrInitiator, DcutrResponder, InitiatorOutcome, ResponderEvent,
@@ -46,8 +49,8 @@ const HOLEPUNCH_INTERVAL: Duration = Duration::from_millis(100);
 const RESPONDER_SYNC_DELAY: Duration = Duration::from_millis(50);
 /// Payload length used by the relay-ping fallback.
 const RELAY_PING_LEN: usize = 32;
-const DEFAULT_STUN_SERVER: &str = "stun.l.google.com:19302";
-const STUN_TIMEOUT: Duration = Duration::from_millis(800);
+const AUTONAT_DEADLINE: Duration = Duration::from_secs(5);
+const LISTEN_FOREVER: Duration = Duration::from_secs(60 * 60 * 24 * 365);
 
 // ---------------------------------------------------------------------------
 // Listener (Peer B): reserve, accept STOP, respond DCUtR, hole-punch
@@ -59,7 +62,14 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     let our_addr = swarm
         .listen_on_bound_addr()
         .map_err(|e| format!("listen failed: {e}"))?;
-    let our_observed = dcutr_candidates(&swarm, our_addr.transport(), &options, role);
+    let initial_candidates = candidate_addrs(our_addr.transport(), &options.external_addrs);
+    let our_observed = validate_candidates_with_autonat(
+        &mut swarm,
+        role,
+        &options,
+        &initial_candidates,
+        Instant::now() + AUTONAT_DEADLINE,
+    )?;
     println!("[{role}] bound={our_addr}");
     println!("[{role}] us={}", swarm.local_peer_id());
     print_candidates(role, &our_observed);
@@ -408,7 +418,14 @@ pub fn run_dial(
     let our_addr = swarm
         .listen_on_bound_addr()
         .map_err(|e| format!("listen failed: {e}"))?;
-    let our_observed = dcutr_candidates(&swarm, our_addr.transport(), &options, role);
+    let initial_candidates = candidate_addrs(our_addr.transport(), &options.external_addrs);
+    let our_observed = validate_candidates_with_autonat(
+        &mut swarm,
+        role,
+        &options,
+        &initial_candidates,
+        Instant::now() + AUTONAT_DEADLINE,
+    )?;
     println!("[{role}] bound={our_addr}");
     println!("[{role}] us={}", swarm.local_peer_id());
     println!("[{role}] target={target}");
@@ -545,6 +562,119 @@ pub fn run_dial(
             // Not our echo; keep waiting.
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// AutoNAT service: public helper peer for reachability probes
+// ---------------------------------------------------------------------------
+
+pub fn run_autonat_server(options: RunOptions) -> Result<(), Box<dyn Error>> {
+    let role = "autonat";
+    let mut swarm = build_autonat_swarm(&options, role)?;
+    let peer_addr = swarm
+        .listen_on_bound_addr()
+        .map_err(|e| format!("listen failed: {e}"))?;
+    println!("[{role}] bound={peer_addr}");
+    println!("[{role}] us={}", swarm.local_peer_id());
+    eprintln!("[{role}] waiting for AutoNAT probes (Ctrl-C to stop)");
+
+    let deadline = Instant::now() + LISTEN_FOREVER;
+    while Instant::now() < deadline {
+        let ev = swarm
+            .run_until(deadline, |ev| {
+                print_event(role, ev);
+                matches!(
+                    ev,
+                    SwarmEvent::UserStreamReady {
+                        protocol_id,
+                        initiated_locally: false,
+                        ..
+                    } if protocol_id == AUTONAT_PROTOCOL_ID
+                )
+            })
+            .map_err(|e| format!("autonat wait stream: {e}"))?;
+
+        let Some(SwarmEvent::UserStreamReady {
+            peer_id, stream_id, ..
+        }) = ev
+        else {
+            break;
+        };
+
+        if let Err(e) = handle_autonat_request(&mut swarm, role, peer_id, stream_id) {
+            eprintln!("[{role}] request-failed stream={stream_id} reason={e}");
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_autonat_request(
+    swarm: &mut Swarm<QuicTransport>,
+    role: &str,
+    requester_peer: PeerId,
+    stream_id: StreamId,
+) -> Result<(), Box<dyn Error>> {
+    let mut server = AutoNatServer::new();
+    let request = loop {
+        let data =
+            wait_user_stream_data(swarm, role, stream_id, Instant::now() + AUTONAT_DEADLINE)?;
+        server
+            .on_data(&data)
+            .map_err(|e| format!("AutoNAT decode: {e}"))?;
+        if let Some(request) = server.request().cloned() {
+            break request;
+        }
+    };
+
+    println!(
+        "[{role}] probe-request peer={} addrs={}",
+        request.peer_id,
+        request.addrs.len()
+    );
+
+    if request.peer_id != requester_peer {
+        server.respond_error(
+            ResponseStatus::BadRequest,
+            "AutoNAT request peer id did not match stream peer",
+        );
+        send(swarm, &requester_peer, stream_id, server.take_outbound())?;
+        println!("[{role}] probe-rejected reason=peer-id-mismatch");
+        return Ok(());
+    }
+
+    let mut dialable = Vec::new();
+    for addr in &request.addrs {
+        match PeerAddr::new(addr.clone(), request.peer_id.clone()) {
+            Ok(peer_addr) => match swarm.dial(&peer_addr) {
+                Ok(_) => println!("[{role}] dialback-attempt {peer_addr}"),
+                Err(e) => eprintln!("[{role}] dialback-start-failed addr={peer_addr} reason={e}"),
+            },
+            Err(e) => eprintln!("[{role}] dialback-bad-addr addr={addr} reason={e}"),
+        }
+    }
+
+    let dialback_deadline = Instant::now() + AUTONAT_DEADLINE;
+    let success = swarm
+        .run_until(dialback_deadline, |ev| {
+            print_event(role, ev);
+            matches!(ev, SwarmEvent::ConnectionEstablished { peer_id } if peer_id == &request.peer_id)
+        })
+        .map_err(|e| format!("autonat dialback poll: {e}"))?;
+
+    if success.is_some() {
+        dialable.extend(request.addrs.iter().cloned());
+        server.respond_public(&dialable);
+        println!("[{role}] probe-public peer={}", request.peer_id);
+    } else {
+        server.respond_error(ResponseStatus::DialError, "dialback deadline elapsed");
+        println!(
+            "[{role}] probe-private peer={} reason=timeout",
+            request.peer_id
+        );
+    }
+
+    send(swarm, &requester_peer, stream_id, server.take_outbound())
 }
 
 // ---------------------------------------------------------------------------
@@ -740,43 +870,86 @@ fn build_swarm_with_relay_protocols(
     swarm.add_user_protocol(HOP_PROTOCOL_ID);
     swarm.add_user_protocol(STOP_PROTOCOL_ID);
     swarm.add_user_protocol(DCUTR_PROTOCOL_ID);
+    swarm.add_user_protocol(AUTONAT_PROTOCOL_ID);
     Ok(swarm)
 }
 
-fn dcutr_candidates(
-    swarm: &Swarm<QuicTransport>,
-    bound_addr: &Multiaddr,
+fn build_autonat_swarm(
     options: &RunOptions,
     role: &str,
-) -> Vec<Multiaddr> {
-    let mut candidates = Vec::with_capacity(options.external_addrs.len() + 2);
-    for addr in &options.external_addrs {
+) -> Result<Swarm<QuicTransport>, Box<dyn Error>> {
+    let keypair = load_keypair(options, role)?;
+    let bind_addr = bind_addr(options)?;
+    let transport = QuicTransport::new(QuicNodeConfig::new(keypair.clone()), &bind_addr)
+        .map_err(|e| format!("quic bind: {e}"))?;
+    let mut swarm = SwarmBuilder::new(&keypair)
+        .agent_version(AGENT)
+        .build(transport);
+    swarm.add_user_protocol(AUTONAT_PROTOCOL_ID);
+    Ok(swarm)
+}
+
+fn candidate_addrs(bound_addr: &Multiaddr, external_addrs: &[Multiaddr]) -> Vec<Multiaddr> {
+    let mut candidates = Vec::with_capacity(external_addrs.len() + 1);
+    for addr in external_addrs {
         push_unique(&mut candidates, addr.clone());
     }
-
-    if !options.stun_disabled {
-        let server = options
-            .stun_server
-            .as_deref()
-            .unwrap_or(DEFAULT_STUN_SERVER);
-        match swarm
-            .transport()
-            .discover_external_addr(server, STUN_TIMEOUT)
-        {
-            Ok(addr) => {
-                println!("[{role}] stun-mapped server={server} addr={addr}");
-                push_unique(&mut candidates, addr);
-            }
-            Err(e) => {
-                eprintln!("[{role}] stun-failed server={server} reason={e}");
-            }
-        }
-    } else {
-        println!("[{role}] stun-disabled");
-    }
-
     push_unique(&mut candidates, bound_addr.clone());
     candidates
+}
+
+fn validate_candidates_with_autonat(
+    swarm: &mut Swarm<QuicTransport>,
+    role: &str,
+    options: &RunOptions,
+    candidates: &[Multiaddr],
+    deadline: Instant,
+) -> Result<Vec<Multiaddr>, Box<dyn Error>> {
+    let Some(service) = &options.autonat else {
+        return Ok(candidates.to_vec());
+    };
+
+    let service_peer = service.peer_id().clone();
+    swarm
+        .dial(service)
+        .map_err(|e| format!("dial AutoNAT service: {e}"))?;
+    println!("[{role}] autonat-dialing {service}");
+    wait_connected(swarm, role, &service_peer, deadline)?;
+
+    let stream_id = swarm
+        .open_user_stream(&service_peer, AUTONAT_PROTOCOL_ID)
+        .map_err(|e| format!("open AutoNAT stream: {e}"))?;
+    wait_user_stream_ready(swarm, role, stream_id, deadline)?;
+
+    let local_peer = swarm.local_peer_id().clone();
+    let mut client = AutoNatClient::new(&local_peer, candidates);
+    send(swarm, &service_peer, stream_id, client.take_outbound())?;
+
+    while client.outcome().is_none() {
+        let data = wait_user_stream_data(swarm, role, stream_id, deadline)?;
+        client
+            .on_data(&data)
+            .map_err(|e| format!("AutoNAT decode: {e}"))?;
+    }
+
+    match client.outcome().cloned().expect("outcome checked") {
+        Reachability::Public { addrs, .. } => {
+            println!("[{role}] autonat-public addrs={}", addrs.len());
+            let mut ordered = addrs;
+            for addr in candidates {
+                push_unique(&mut ordered, addr.clone());
+            }
+            Ok(ordered)
+        }
+        Reachability::Private { status, reason } => {
+            println!("[{role}] autonat-private status={status:?} reason={reason}");
+            Ok(candidates.to_vec())
+        }
+        Reachability::Unknown { status, reason } => {
+            println!("[{role}] autonat-unknown status={status:?} reason={reason}");
+            Ok(candidates.to_vec())
+        }
+    }
 }
 
 fn push_unique(addrs: &mut Vec<Multiaddr>, addr: Multiaddr) {

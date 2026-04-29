@@ -47,6 +47,8 @@ pub enum Mode {
         target: PeerId,
         options: RunOptions,
     },
+    /// Public AutoNAT service: accepts probes and dials candidates back.
+    AutoNatServer { options: RunOptions },
 }
 
 /// Runtime options common to direct and relay modes.
@@ -58,10 +60,8 @@ pub struct RunOptions {
     pub listen_addr: Option<Multiaddr>,
     /// Extra DCUtR candidates advertised in relay mode.
     pub external_addrs: Vec<Multiaddr>,
-    /// Optional STUN server override for relay-mode UDP mapping discovery.
-    pub stun_server: Option<String>,
-    /// Disables the default relay-mode STUN query.
-    pub stun_disabled: bool,
+    /// Optional AutoNAT service peer used to validate candidate dialability.
+    pub autonat: Option<PeerAddr>,
 }
 
 /// Parse error surfaced back to `main` so the binary exits with a readable
@@ -87,6 +87,7 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode, CliError> {
     match subcommand.as_str() {
         "listen" => parse_listen(args),
         "dial" => parse_dial(args),
+        "autonat" => parse_autonat(args),
         "-h" | "--help" | "help" => Err(CliError(usage())),
         other => Err(CliError(format!(
             "unknown subcommand '{other}'\n\n{}",
@@ -110,7 +111,7 @@ fn parse_listen(args: Vec<String>) -> Result<Mode, CliError> {
     let options = flags.options;
     if flags.relay.is_none() && options.has_relay_only_options() {
         return Err(CliError(
-            "STUN and --external-addr are only valid with relay modes".into(),
+            "--autonat and --external-addr are only valid with relay modes".into(),
         ));
     }
 
@@ -133,11 +134,7 @@ fn parse_dial(args: Vec<String>) -> Result<Mode, CliError> {
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
-            "--no-stun" => {
-                rest.push(arg.clone());
-                i += 1;
-            }
-            "--relay" | "--target" | "--key" | "--listen" | "--external-addr" | "--stun" => {
+            "--relay" | "--target" | "--key" | "--listen" | "--external-addr" | "--autonat" => {
                 rest.push(arg.clone());
                 let value = args
                     .get(i + 1)
@@ -160,7 +157,7 @@ fn parse_dial(args: Vec<String>) -> Result<Mode, CliError> {
         (1, None, None) => {
             if options.has_relay_only_options() {
                 return Err(CliError(
-                    "STUN and --external-addr are only valid with relay modes".into(),
+                    "--autonat and --external-addr are only valid with relay modes".into(),
                 ));
             }
             let raw = &positional[0];
@@ -186,6 +183,16 @@ fn parse_dial(args: Vec<String>) -> Result<Mode, CliError> {
     }
 }
 
+fn parse_autonat(args: Vec<String>) -> Result<Mode, CliError> {
+    let flags = Flags::from(args.as_slice())?;
+    if flags.relay.is_some() || flags.target.is_some() || flags.options.has_relay_only_options() {
+        return Err(CliError("`autonat` accepts only --key and --listen".into()));
+    }
+    Ok(Mode::AutoNatServer {
+        options: flags.options,
+    })
+}
+
 /// Accumulated values for the `--relay` / `--target` flags.
 struct Flags {
     relay: Option<PeerAddr>,
@@ -204,11 +211,6 @@ impl Flags {
             let key = &args[i];
 
             match key.as_str() {
-                "--no-stun" => {
-                    options.stun_disabled = true;
-                    i += 1;
-                    continue;
-                }
                 "--relay" => {
                     let value = flag_value(args, i, key)?;
                     if relay.is_some() {
@@ -257,24 +259,20 @@ impl Flags {
                         .external_addrs
                         .push(parse_quic_multiaddr("--external-addr", value)?);
                 }
-                "--stun" => {
+                "--autonat" => {
                     let value = flag_value(args, i, key)?;
-                    if options.stun_server.is_some() {
-                        return Err(CliError("--stun specified twice".into()));
+                    if options.autonat.is_some() {
+                        return Err(CliError("--autonat specified twice".into()));
                     }
-                    options.stun_server = Some(value.clone());
+                    options.autonat = Some(PeerAddr::from_str(value).map_err(|e| {
+                        CliError(format!("invalid --autonat peer-addr '{value}': {e}"))
+                    })?);
                 }
                 other => {
                     return Err(CliError(format!("unknown flag '{other}'")));
                 }
             }
             i += 2;
-        }
-
-        if options.stun_disabled && options.stun_server.is_some() {
-            return Err(CliError(
-                "--stun and --no-stun are mutually exclusive".into(),
-            ));
         }
 
         Ok(Self {
@@ -287,7 +285,7 @@ impl Flags {
 
 impl RunOptions {
     fn has_relay_only_options(&self) -> bool {
-        !self.external_addrs.is_empty() || self.stun_server.is_some() || self.stun_disabled
+        !self.external_addrs.is_empty() || self.autonat.is_some()
     }
 }
 
@@ -389,8 +387,9 @@ pub fn usage() -> String {
 USAGE:
     minip2p-peer listen [--key <path>] [--listen <quic-multiaddr>]
     minip2p-peer dial   <peer-addr> [--key <path>] [--listen <quic-multiaddr>]
-    minip2p-peer listen --relay <relay-peer-addr> [--key <path>] [--listen <quic-multiaddr>] [--stun <host:port>|--no-stun] [--external-addr <quic-multiaddr>]...
-    minip2p-peer dial   --relay <relay-peer-addr> --target <peer-id> [--key <path>] [--listen <quic-multiaddr>] [--stun <host:port>|--no-stun] [--external-addr <quic-multiaddr>]...
+    minip2p-peer autonat [--key <path>] [--listen <quic-multiaddr>]
+    minip2p-peer listen --relay <relay-peer-addr> [--autonat <peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--external-addr <quic-multiaddr>]...
+    minip2p-peer dial   --relay <relay-peer-addr> --target <peer-id> [--autonat <peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--external-addr <quic-multiaddr>]...
 
 NOTES:
     <peer-addr>        full libp2p-style address ending in /p2p/<peer-id>
@@ -400,8 +399,7 @@ NOTES:
     --key              persistent Ed25519 raw-secret file (hex)
     --listen           bind multiaddr; default is 127.0.0.1:0
     --external-addr    repeatable relay-mode DCUtR candidate
-    --stun             relay-mode STUN server override; default is stun.l.google.com:19302
-    --no-stun          relay-mode local/offline testing; skips STUN discovery
+    --autonat          relay-mode public AutoNAT service for dialability checks
 
     See holepunch-plan.md at the repo root for full semantics."
         .to_string()
@@ -510,60 +508,54 @@ mod tests {
     }
 
     #[test]
-    fn relay_dial_accepts_stun_override() {
+    fn relay_dial_accepts_autonat_service() {
         match parse(v(&[
             "dial",
             "--relay",
             PEER_ADDR,
             "--target",
             PEER_ID,
-            "--stun",
-            "stun.example.net:3478",
+            "--autonat",
+            PEER_ADDR,
         ]))
         .unwrap()
         {
             Mode::RelayDial { options, .. } => {
-                assert_eq!(
-                    options.stun_server.as_deref(),
-                    Some("stun.example.net:3478")
-                );
+                assert_eq!(options.autonat.unwrap().to_string(), PEER_ADDR);
             }
             other => panic!("expected RelayDial, got {other:?}"),
         }
     }
 
     #[test]
-    fn relay_listen_accepts_no_stun_without_value() {
-        match parse(v(&["listen", "--relay", PEER_ADDR, "--no-stun"])).unwrap() {
-            Mode::RelayListen { options, .. } => assert!(options.stun_disabled),
-            other => panic!("expected RelayListen, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn direct_mode_rejects_stun() {
-        let err = parse(v(&["listen", "--stun", "stun.example.net:3478"])).unwrap_err();
-        assert!(err.0.contains("STUN"));
-    }
-
-    #[test]
-    fn stun_and_no_stun_conflict() {
-        let err = parse(v(&[
-            "listen",
-            "--relay",
-            PEER_ADDR,
-            "--stun",
-            "stun.example.net:3478",
-            "--no-stun",
+    fn autonat_server_accepts_key_and_listen_addr() {
+        match parse(v(&[
+            "autonat",
+            "--key",
+            "./autonat.key",
+            "--listen",
+            QUIC_ADDR,
         ]))
-        .unwrap_err();
-        assert!(err.0.contains("mutually exclusive"));
+        .unwrap()
+        {
+            Mode::AutoNatServer { options } => {
+                assert_eq!(options.key_path, Some(PathBuf::from("./autonat.key")));
+                assert_eq!(options.listen_addr.unwrap().to_string(), QUIC_ADDR);
+            }
+            other => panic!("expected AutoNatServer, got {other:?}"),
+        }
     }
 
     #[test]
     fn direct_mode_rejects_external_addr() {
         let err = parse(v(&["listen", "--external-addr", EXTERNAL_ADDR])).unwrap_err();
-        assert!(err.0.contains("--external-addr") || err.0.contains("STUN"));
+        assert!(err.0.contains("--external-addr"));
+    }
+
+    #[test]
+    fn direct_mode_rejects_autonat_flag() {
+        let err = parse(v(&["listen", "--autonat", PEER_ADDR])).unwrap_err();
+        assert!(err.0.contains("--autonat"));
     }
 
     #[test]

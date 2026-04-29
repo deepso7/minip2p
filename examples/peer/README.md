@@ -18,8 +18,9 @@ Two modes:
 ```text
 minip2p-peer listen [--key <path>] [--listen <quic-multiaddr>]
 minip2p-peer dial   <peer-addr> [--key <path>] [--listen <quic-multiaddr>]
-minip2p-peer listen --relay <relay-peer-addr> [--key <path>] [--listen <quic-multiaddr>] [--stun <host:port>|--no-stun] [--external-addr <quic-multiaddr>]...
-minip2p-peer dial   --relay <relay-peer-addr> --target <peer-id> [--key <path>] [--listen <quic-multiaddr>] [--stun <host:port>|--no-stun] [--external-addr <quic-multiaddr>]...
+minip2p-peer autonat [--key <path>] [--listen <quic-multiaddr>]
+minip2p-peer listen --relay <relay-peer-addr> [--autonat <peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--external-addr <quic-multiaddr>]...
+minip2p-peer dial   --relay <relay-peer-addr> --target <peer-id> [--autonat <peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--external-addr <quic-multiaddr>]...
 ```
 
 Where:
@@ -32,13 +33,12 @@ Where:
 - `--listen <quic-multiaddr>` changes the UDP bind address; default is loopback
   (`127.0.0.1:0`). Use `/ip4/0.0.0.0/udp/0/quic-v1` or
   `/ip6/::/udp/0/quic-v1` for real-network tests.
-- Relay mode queries STUN by default (`stun.l.google.com:19302`) from the same
-  UDP socket used by QUIC and advertises the discovered mapping as a DCUtR
-  candidate.
-- `--stun <host:port>` overrides the STUN server. `--no-stun` skips discovery
-  for local/offline relay tests.
+- `autonat` runs a public AutoNAT service that accepts probes and dials the
+  requester's candidates back.
+- `--autonat <peer-addr>` asks a public AutoNAT service to validate relay-mode
+  candidate dialability before DCUtR.
 - `--external-addr <quic-multiaddr>` is repeatable in relay mode and adds manual
-  DCUtR candidates when STUN is unavailable or you have a known port-forward.
+  DCUtR candidates when you have a known public address or port-forward.
 
 ## Direct mode (5-minute quickstart)
 
@@ -73,10 +73,10 @@ cargo test -p minip2p-peer --test direct
 
 ## Relay mode (requires an external relay server)
 
-Relay mode expects a Circuit Relay v2 server listening somewhere
-reachable. The plan of record is to validate against the
-`rust-libp2p` `relay-server-example` on the same host; once that's
-working, swap in a VM-hosted relay.
+Relay mode expects a Circuit Relay v2 server listening somewhere reachable. For
+reachability validation, run an AutoNAT service on a public host too. For a
+single VPS demo, the relay and AutoNAT service can be separate processes on the
+same machine using different UDP ports.
 
 Start a rust-libp2p relay server (rough steps; verify the exact binary
 name against the `rust-libp2p` repo at time of use):
@@ -87,13 +87,26 @@ cargo run --example relay-server-example
 # note the peer-addr it prints -- that's <relay-peer-addr>
 ```
 
+Start an AutoNAT service peer on a public host:
+
+```bash
+cargo run -p minip2p-peer -- autonat \
+    --key ./autonat.key \
+    --listen /ip4/0.0.0.0/udp/4002/quic-v1
+# [autonat] bound=/ip4/0.0.0.0/udp/4002/quic-v1/p2p/12D3KooW...
+```
+
 Peer B (listener, the NATed target):
 
 ```bash
-cargo run -p minip2p-peer -- listen --relay <relay-peer-addr> --key ./peer-b.key
+cargo run -p minip2p-peer -- listen \
+    --relay <relay-peer-addr> \
+    --autonat <autonat-peer-addr> \
+    --key ./peer-b.key
 # [relay-listen] bound=/ip4/127.0.0.1/udp/52134/quic-v1/p2p/12D3KooW... (A)
 # [relay-listen] us=12D3KooW... (A)
-# [relay-listen] stun-mapped server=stun.l.google.com:19302 addr=/ip4/.../udp/.../quic-v1
+# [relay-listen] autonat-dialing /ip4/.../p2p/12D3KooW...
+# [relay-listen] autonat-public addrs=1
 # [relay-listen] dcutr-candidates [/ip4/.../udp/.../quic-v1,/ip4/127.0.0.1/udp/52134/quic-v1]
 # [relay-listen] dialing-relay /ip4/.../p2p/12D3KooW... (relay)
 # [relay-listen] connected peer=12D3KooW... (relay)
@@ -113,11 +126,12 @@ Peer A (dialer), run while B is still alive:
 cargo run -p minip2p-peer -- dial \
     --relay <relay-peer-addr> \
     --target <B-peer-id> \
+    --autonat <autonat-peer-addr> \
     --key ./peer-a.key
 # [relay-dial] bound=...
 # [relay-dial] us=...
 # [relay-dial] target=...
-# [relay-dial] stun-mapped server=stun.l.google.com:19302 addr=/ip4/.../udp/.../quic-v1
+# [relay-dial] autonat-public addrs=1
 # [relay-dial] dcutr-candidates [...]
 # [relay-dial] dialing-relay ...
 # [relay-dial] bridge-established via-relay
@@ -130,26 +144,29 @@ cargo run -p minip2p-peer -- dial \
 
 ### Public relay shape
 
-For cross-network tests, run with a public relay address, stable keys, and
-non-loopback binds. STUN discovers the public UDP mapping automatically, so you
-do not need to know `peer-b-public-ip` before starting B:
+For cross-network tests, run with public relay and AutoNAT service addresses,
+stable keys, and non-loopback binds. AutoNAT validates whether your advertised
+candidates are actually dialable by another libp2p peer:
 
 ```bash
 cargo run -p minip2p-peer -- listen \
     --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
+    --autonat /ip4/<autonat-ip>/udp/4002/quic-v1/p2p/<autonat-peer-id> \
     --key ./peer-b.key \
     --listen /ip4/0.0.0.0/udp/0/quic-v1
 
 cargo run -p minip2p-peer -- dial \
     --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
     --target <peer-b-id> \
+    --autonat /ip4/<autonat-ip>/udp/4002/quic-v1/p2p/<autonat-peer-id> \
     --key ./peer-a.key \
     --listen /ip4/0.0.0.0/udp/0/quic-v1
 ```
 
-If STUN fails or you have a known UDP port-forward, add one or more manual
+If you have a known UDP port-forward, add one or more manual
 `--external-addr /ip4/<public-ip>/udp/<port>/quic-v1` candidates. Manual
-candidates are advertised before the STUN and bound-socket candidates.
+candidates are advertised before the bound-socket candidate and validated by
+AutoNAT when `--autonat` is present.
 
 Expected terminal result is either `ping-direct` after a successful direct
 QUIC+mTLS connection, or `ping-via-relay` after a bounded hole-punch timeout.
@@ -205,9 +222,9 @@ protocol id, etc).
   Two minip2p peers work; a rust-libp2p peer on the other end of the
   bridge will not.
 
-- **STUN is best-effort.** Some NATs, firewalls, or corporate networks block
-  STUN or create mappings that cannot be hole-punched. In that case the demo
-  should still fall back to relay ping with diagnostics.
+- **AutoNAT is validation, not magic address discovery.** If you do not have a
+  useful public candidate or port-forward, AutoNAT will report private/unknown
+  and the demo should still fall back to relay ping with diagnostics.
 
 - **No relay server.** This binary implements the client side of HOP
   and the responder side of STOP; it does not run a relay. Use the
@@ -224,8 +241,7 @@ Implemented flags:
 ```text
 --key <path>                         persist/reuse this peer's Ed25519 identity
 --listen <quic-multiaddr>            bind address, e.g. /ip4/0.0.0.0/udp/0/quic-v1
---stun <host:port>                   STUN server override; default is stun.l.google.com:19302
---no-stun                            skip STUN for local/offline relay tests
+--autonat <peer-addr>                validate candidates with a public AutoNAT service
 --external-addr <quic-multiaddr>     additional public UDP candidate for DCUtR
 ```
 
@@ -234,12 +250,14 @@ Public relay workflow:
 ```bash
 minip2p-peer listen \
   --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
+  --autonat /ip4/<autonat-ip>/udp/4002/quic-v1/p2p/<autonat-peer-id> \
   --key ./peer-b.key \
   --listen /ip4/0.0.0.0/udp/0/quic-v1
 
 minip2p-peer dial \
   --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
   --target <peer-b-id> \
+  --autonat /ip4/<autonat-ip>/udp/4002/quic-v1/p2p/<autonat-peer-id> \
   --key ./peer-a.key \
   --listen /ip4/0.0.0.0/udp/0/quic-v1
 ```

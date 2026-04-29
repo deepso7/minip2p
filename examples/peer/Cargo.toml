@@ -18,6 +18,7 @@ minip2p-transport = { path = "../../crates/transport" }
 minip2p-swarm = { path = "../../crates/swarm" }
 minip2p-ping = { path = "../../crates/ping" }
 minip2p-identify = { path = "../../crates/identify" }
+minip2p-autonat = { path = "../../crates/autonat" }
 minip2p-relay = { path = "../../crates/relay" }
 minip2p-dcutr = { path = "../../crates/dcutr" }
 minip2p-multistream-select = { path = "../../crates/multistream-select" }
