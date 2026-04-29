@@ -27,14 +27,14 @@ use std::str::FromStr;
 
 use minip2p_core::{Multiaddr, PeerId};
 use minip2p_dcutr::{
-    decode_frame as dcutr_decode_frame, DcutrInitiator, DcutrResponder, InitiatorOutcome,
-    ResponderEvent,
+    DcutrInitiator, DcutrResponder, InitiatorOutcome, ResponderEvent,
+    decode_frame as dcutr_decode_frame,
 };
 use minip2p_identity::Ed25519Keypair;
 use minip2p_relay::{
-    decode_frame as relay_decode_frame, encode_frame as relay_encode_frame, FrameDecode,
-    HopConnect, HopMessage, HopMessageType, HopReservation, Peer, Reservation,
+    FrameDecode, HopConnect, HopMessage, HopMessageType, HopReservation, Peer, Reservation,
     ReservationOutcome, Status, StopMessage, StopMessageType, StopResponder,
+    decode_frame as relay_decode_frame, encode_frame as relay_encode_frame,
 };
 
 // ---------------------------------------------------------------------------
@@ -108,7 +108,9 @@ impl RelayEmulator {
             limit: None,
             status: Some(Status::Ok),
         };
-        channels.hop_inbox.extend(relay_encode_frame(&response.encode()));
+        channels
+            .hop_inbox
+            .extend(relay_encode_frame(&response.encode()));
         self.events.push(RelayEvent::ReservationStored {
             peer: reserver.clone(),
         });
@@ -325,14 +327,11 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
 
     // Sanity check: the relay recorded both the CONNECT bridge and the final
     // STATUS:OK forward.
-    assert!(relay
-        .events
-        .iter()
-        .any(|e| matches!(e, RelayEvent::ConnectBridgedBetween { initiator, target }
-            if initiator == &peer_a && target == &peer_b)));
-    assert!(relay
-        .events
-        .contains(&RelayEvent::StatusOkSentToInitiator));
+    assert!(relay.events.iter().any(
+        |e| matches!(e, RelayEvent::ConnectBridgedBetween { initiator, target }
+            if initiator == &peer_a && target == &peer_b)
+    ));
+    assert!(relay.events.contains(&RelayEvent::StatusOkSentToInitiator));
 
     // ---- Step 4: Over the bridge, A (initiator) runs DCUtR ---------------
 
@@ -341,12 +340,10 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
     let mut b_to_a: VecDeque<u8> = VecDeque::new();
 
     // A advertises its observed addresses; B advertises its own.
-    let a_observed: Vec<Multiaddr> = vec![
-        Multiaddr::from_str("/ip4/203.0.113.1/udp/12345/quic-v1").unwrap(),
-    ];
-    let b_observed: Vec<Multiaddr> = vec![
-        Multiaddr::from_str("/ip4/198.51.100.2/udp/54321/quic-v1").unwrap(),
-    ];
+    let a_observed: Vec<Multiaddr> =
+        vec![Multiaddr::from_str("/ip4/203.0.113.1/udp/12345/quic-v1").unwrap()];
+    let b_observed: Vec<Multiaddr> =
+        vec![Multiaddr::from_str("/ip4/198.51.100.2/udp/54321/quic-v1").unwrap()];
 
     let mut dcutr_a = DcutrInitiator::new(&a_observed);
     let mut dcutr_b = DcutrResponder::new(&b_observed);
@@ -436,12 +433,8 @@ fn connect_refused_when_target_not_reserved() {
 
 #[test]
 fn dcutr_rtt_is_reported_back_to_initiator() {
-    let mut a = DcutrInitiator::new(&[
-        Multiaddr::from_str("/ip4/1.2.3.4/udp/1/quic-v1").unwrap(),
-    ]);
-    let mut b = DcutrResponder::new(&[
-        Multiaddr::from_str("/ip4/5.6.7.8/udp/2/quic-v1").unwrap(),
-    ]);
+    let mut a = DcutrInitiator::new(&[Multiaddr::from_str("/ip4/1.2.3.4/udp/1/quic-v1").unwrap()]);
+    let mut b = DcutrResponder::new(&[Multiaddr::from_str("/ip4/5.6.7.8/udp/2/quic-v1").unwrap()]);
 
     let connect_from_a = a.take_outbound();
     b.on_data(&connect_from_a).unwrap();
@@ -473,7 +466,7 @@ fn drain_pipe(pipe: &mut VecDeque<u8>) -> Vec<u8> {
 #[test]
 fn dcutr_frame_decode_round_trips() {
     // Just asserting the crate's own helpers are in scope and work here.
-    use minip2p_dcutr::{encode_frame, HolePunch, HolePunchType};
+    use minip2p_dcutr::{HolePunch, HolePunchType, encode_frame};
     let msg = HolePunch {
         kind: HolePunchType::Sync,
         obs_addrs: Vec::new(),

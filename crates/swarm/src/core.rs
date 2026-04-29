@@ -11,7 +11,7 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -19,15 +19,18 @@ use alloc::vec::Vec;
 
 use minip2p_core::{Multiaddr, PeerId};
 use minip2p_identify::{
-    IdentifyAction, IdentifyConfig, IdentifyEvent, IdentifyProtocol, IDENTIFY_PROTOCOL_ID,
+    IDENTIFY_PROTOCOL_ID, IdentifyAction, IdentifyConfig, IdentifyEvent, IdentifyMessage,
+    IdentifyProtocol,
 };
 use minip2p_multistream_select::{MultistreamOutput, MultistreamSelect};
 use minip2p_ping::{
-    PingAction, PingConfig, PingEvent, PingProtocol, PING_PAYLOAD_LEN, PING_PROTOCOL_ID,
+    PING_PAYLOAD_LEN, PING_PROTOCOL_ID, PingAction, PingConfig, PingEvent, PingProtocol,
 };
 use minip2p_transport::{ConnectionId, StreamId, TransportEvent};
 
-use crate::events::{OpenStreamToken, SwarmAction, SwarmError, SwarmEvent};
+use crate::events::{
+    OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError,
+};
 
 // ---------------------------------------------------------------------------
 // Protocol identification
@@ -120,6 +123,12 @@ pub struct SwarmCore {
     /// auto-populate Identify's `listen_addrs` so advertised addresses
     /// always reflect what we're actually bound to.
     local_addresses: Vec<Multiaddr>,
+    /// Latest Identify payload received for each peer.
+    peer_info: BTreeMap<PeerId, IdentifyMessage>,
+    /// Peers for which `PeerReady` has already been emitted.
+    ready_peers: BTreeSet<PeerId>,
+    /// Peers that have been surfaced through `ConnectionEstablished`.
+    established_peers: BTreeSet<PeerId>,
 
     // --- Output queues ---
     events: Vec<SwarmEvent>,
@@ -150,6 +159,9 @@ impl SwarmCore {
             user_protocols: Vec::new(),
             pending_pings: BTreeMap::new(),
             local_addresses: Vec::new(),
+            peer_info: BTreeMap::new(),
+            ready_peers: BTreeSet::new(),
+            established_peers: BTreeSet::new(),
             events: Vec::new(),
             actions: Vec::new(),
         }
@@ -173,8 +185,9 @@ impl SwarmCore {
             self.user_protocols.push(id.clone());
         }
         if !self.supported_protocols.iter().any(|p| p == &id) {
-            self.supported_protocols.push(id);
+            self.supported_protocols.push(id.clone());
         }
+        self.identify.add_protocol(id);
     }
 
     // -----------------------------------------------------------------------
@@ -198,8 +211,8 @@ impl SwarmCore {
     /// Surfaces as a [`SwarmEvent::Error`] on the next
     /// [`Self::poll_events`]. Used by the driver so transport-level
     /// failures are never silently dropped.
-    pub fn record_error(&mut self, message: String) {
-        self.events.push(SwarmEvent::Error { message });
+    pub fn record_error(&mut self, error: SwarmRuntimeError) {
+        self.events.push(SwarmEvent::Error(error));
     }
 
     // -----------------------------------------------------------------------
@@ -272,6 +285,18 @@ impl SwarmCore {
                 peer_id: peer_id.clone(),
             });
         }
+        if self.ready_peers.contains(peer_id)
+            && !self
+                .peer_info
+                .get(peer_id)
+                .map(|info| info.protocols.iter().any(|p| p == protocol_id))
+                .unwrap_or(false)
+        {
+            return Err(SwarmError::RemoteDoesNotSupport {
+                peer_id: peer_id.clone(),
+                protocol_id: protocol_id.to_string(),
+            });
+        }
 
         self.queue_open_protocol_stream(
             peer_id,
@@ -325,8 +350,7 @@ impl SwarmCore {
     /// Closes the connection to `peer_id`.
     pub fn disconnect(&mut self, peer_id: &PeerId) -> Result<(), SwarmError> {
         let conn_id = self.require_conn(peer_id)?;
-        self.actions
-            .push(SwarmAction::CloseConnection { conn_id });
+        self.actions.push(SwarmAction::CloseConnection { conn_id });
         Ok(())
     }
 
@@ -337,6 +361,21 @@ impl SwarmCore {
     /// Returns the primary connection id currently mapped to `peer_id`.
     pub fn conn_for(&self, peer_id: &PeerId) -> Option<ConnectionId> {
         self.peer_to_conn.get(peer_id).copied()
+    }
+
+    /// Returns the peers that have been surfaced to the application as connected.
+    pub fn connected_peers(&self) -> Vec<PeerId> {
+        self.established_peers.iter().cloned().collect()
+    }
+
+    /// Returns the latest Identify information received for `peer_id`.
+    pub fn peer_info(&self, peer_id: &PeerId) -> Option<&IdentifyMessage> {
+        self.peer_info.get(peer_id)
+    }
+
+    /// Returns whether `peer_id` has reached the application-ready state.
+    pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
+        self.ready_peers.contains(peer_id)
     }
 
     /// Returns the peer id currently mapped to `conn_id`, if any.
@@ -410,9 +449,12 @@ impl SwarmCore {
             }
             TransportEvent::Listening { .. } => {}
             TransportEvent::Error { id, message } => {
-                self.events.push(SwarmEvent::Error {
-                    message: format!("transport error on connection {id}: {message}"),
-                });
+                self.emit_error(
+                    SwarmErrorKind::Transport,
+                    self.established_peer_for_conn(id),
+                    Some(id),
+                    format!("transport error on connection {id}: {message}"),
+                );
             }
         }
     }
@@ -439,24 +481,27 @@ impl SwarmCore {
         _now_ms: u64,
     ) {
         let Some(pending) = self.pending_opens.remove(&token) else {
-            self.events.push(SwarmEvent::Error {
-                message: format!(
-                    "unknown OpenStream token {} reported by driver",
-                    token.0
-                ),
-            });
+            self.emit_error(
+                SwarmErrorKind::Driver,
+                None,
+                None,
+                format!("unknown OpenStream token {} reported by driver", token.0),
+            );
             return;
         };
 
         // Guard against the driver reporting a different connection id than
         // the one we asked to open on.
         if pending.conn_id != conn_id {
-            self.events.push(SwarmEvent::Error {
-                message: format!(
+            self.emit_error(
+                SwarmErrorKind::Driver,
+                self.established_peer_for_conn(conn_id),
+                Some(conn_id),
+                format!(
                     "driver opened stream on connection {} but core requested {}",
                     conn_id, pending.conn_id
                 ),
-            });
+            );
             return;
         }
 
@@ -481,22 +526,24 @@ impl SwarmCore {
     }
 
     /// Reports that an [`SwarmAction::OpenStream`] failed at the driver.
-    pub fn on_open_stream_failed(
-        &mut self,
-        token: OpenStreamToken,
-        reason: String,
-        _now_ms: u64,
-    ) {
+    pub fn on_open_stream_failed(&mut self, token: OpenStreamToken, reason: String, _now_ms: u64) {
         let pending = self.pending_opens.remove(&token);
-        self.events.push(SwarmEvent::Error {
-            message: match pending {
-                Some(p) => format!(
+        let (peer_id, conn_id, detail) = match pending {
+            Some(p) => (
+                self.established_peer_for_conn(p.conn_id),
+                Some(p.conn_id),
+                format!(
                     "open_stream for protocol '{}' on connection {} failed: {reason}",
                     p.protocol, p.conn_id
                 ),
-                None => format!("open_stream failed (unknown token): {reason}"),
-            },
-        });
+            ),
+            None => (
+                None,
+                None,
+                format!("open_stream failed (unknown token): {reason}"),
+            ),
+        };
+        self.emit_error(SwarmErrorKind::OpenStreamFailed, peer_id, conn_id, detail);
     }
 
     /// Records that the driver just dialed `conn_id`. Currently a no-op
@@ -516,6 +563,48 @@ impl SwarmCore {
             .ok_or_else(|| SwarmError::NotConnected {
                 peer_id: peer_id.clone(),
             })
+    }
+
+    fn established_peer_for_conn(&self, conn_id: ConnectionId) -> Option<PeerId> {
+        let peer_id = self.conn_to_peer.get(&conn_id)?;
+        if self.established_peers.contains(peer_id) {
+            Some(peer_id.clone())
+        } else {
+            None
+        }
+    }
+
+    fn emit_error(
+        &mut self,
+        kind: SwarmErrorKind,
+        peer_id: Option<PeerId>,
+        conn_id: Option<ConnectionId>,
+        detail: impl Into<String>,
+    ) {
+        self.events.push(SwarmEvent::Error(SwarmRuntimeError {
+            kind,
+            peer_id,
+            conn_id,
+            detail: detail.into(),
+        }));
+    }
+
+    fn try_emit_peer_ready(&mut self, peer_id: &PeerId) {
+        if self.ready_peers.contains(peer_id) {
+            return;
+        }
+        let Some(info) = self.peer_info.get(peer_id) else {
+            return;
+        };
+        if !self.peer_to_conn.contains_key(peer_id) {
+            return;
+        }
+
+        self.ready_peers.insert(peer_id.clone());
+        self.events.push(SwarmEvent::PeerReady {
+            peer_id: peer_id.clone(),
+            protocols: info.protocols.clone(),
+        });
     }
 
     fn find_negotiated_ping_stream(&self, peer_id: &PeerId) -> Option<StreamId> {
@@ -542,9 +631,9 @@ impl SwarmCore {
         }
         // Also check `pending_opens` for Ping opens that haven't yet been
         // ack'd by the driver (common shortly after calling ping()).
-        self.pending_opens.values().any(|open| {
-            open.conn_id == conn && matches!(open.target, ProtocolKind::Ping)
-        })
+        self.pending_opens
+            .values()
+            .any(|open| open.conn_id == conn && matches!(open.target, ProtocolKind::Ping))
     }
 
     fn queue_open_protocol_stream(
@@ -608,6 +697,7 @@ impl SwarmCore {
         self.peer_to_conn.insert(peer_id.clone(), id);
 
         if is_new {
+            self.established_peers.insert(peer_id.clone());
             self.events.push(SwarmEvent::ConnectionEstablished {
                 peer_id: peer_id.clone(),
             });
@@ -618,15 +708,22 @@ impl SwarmCore {
                 IDENTIFY_PROTOCOL_ID,
                 ProtocolKind::IdentifyInitiator,
             ) {
-                self.events.push(SwarmEvent::Error {
-                    message: format!("failed to queue identify stream to {peer_id}: {e}"),
-                });
+                self.emit_error(
+                    SwarmErrorKind::Identify,
+                    Some(peer_id.clone()),
+                    Some(id),
+                    format!("failed to queue identify stream to {peer_id}: {e}"),
+                );
             }
         }
     }
 
     fn supersede_connection(&mut self, old_id: ConnectionId) {
-        self.conn_to_peer.remove(&old_id);
+        if let Some(peer_id) = self.conn_to_peer.remove(&old_id) {
+            self.peer_info.remove(&peer_id);
+            self.ready_peers.remove(&peer_id);
+            self.established_peers.remove(&peer_id);
+        }
         self.active_connections.remove(&old_id);
         self.conn_to_remote_addr.remove(&old_id);
         self.stream_owner.retain(|(cid, _), _| *cid != old_id);
@@ -651,6 +748,15 @@ impl SwarmCore {
                 if let Some(payload) = self.pending_pings.remove(stale) {
                     self.pending_pings.insert(new_peer_id.clone(), payload);
                 }
+                if let Some(info) = self.peer_info.remove(stale) {
+                    self.peer_info.insert(new_peer_id.clone(), info);
+                }
+                if self.ready_peers.remove(stale) {
+                    self.ready_peers.insert(new_peer_id.clone());
+                }
+                if self.established_peers.remove(stale) {
+                    self.established_peers.insert(new_peer_id.clone());
+                }
                 self.migrate_buffered_events(stale, &new_peer_id);
             }
             None => {}
@@ -658,21 +764,27 @@ impl SwarmCore {
 
         self.conn_to_peer.insert(conn_id, new_peer_id.clone());
         self.peer_to_conn.insert(new_peer_id.clone(), conn_id);
+        self.established_peers.insert(new_peer_id.clone());
 
         self.events.push(SwarmEvent::ConnectionEstablished {
             peer_id: new_peer_id.clone(),
         });
+
+        self.try_emit_peer_ready(&new_peer_id);
 
         if let Err(e) = self.queue_open_protocol_stream(
             &new_peer_id,
             IDENTIFY_PROTOCOL_ID,
             ProtocolKind::IdentifyInitiator,
         ) {
-            self.events.push(SwarmEvent::Error {
-                message: format!(
+            self.emit_error(
+                SwarmErrorKind::Identify,
+                Some(new_peer_id.clone()),
+                Some(conn_id),
+                format!(
                     "failed to queue identify stream to {new_peer_id} after identity upgrade: {e}"
                 ),
-            });
+            );
         }
     }
 
@@ -696,7 +808,16 @@ impl SwarmCore {
                         *peer_id = new.clone();
                     }
                 }
-                SwarmEvent::Error { .. } => {}
+                SwarmEvent::PeerReady { peer_id, .. } => {
+                    if peer_id == old {
+                        *peer_id = new.clone();
+                    }
+                }
+                SwarmEvent::Error(error) => {
+                    if error.peer_id.as_ref() == Some(old) {
+                        error.peer_id = Some(new.clone());
+                    }
+                }
             }
         }
     }
@@ -790,9 +911,7 @@ impl SwarmCore {
 
         match protocol {
             ProtocolKind::Ping => {
-                let actions = self
-                    .ping
-                    .on_stream_remote_write_closed(&peer_id, stream_id);
+                let actions = self.ping.on_stream_remote_write_closed(&peer_id, stream_id);
                 for action in actions {
                     self.execute_ping_action(action);
                 }
@@ -805,10 +924,8 @@ impl SwarmCore {
             }
             ProtocolKind::IdentifyResponder => {}
             ProtocolKind::User(_) => {
-                self.events.push(SwarmEvent::UserStreamRemoteWriteClosed {
-                    peer_id,
-                    stream_id,
-                });
+                self.events
+                    .push(SwarmEvent::UserStreamRemoteWriteClosed { peer_id, stream_id });
             }
         }
     }
@@ -826,10 +943,8 @@ impl SwarmCore {
                         self.identify.on_stream_closed(peer_id, stream_id);
                     }
                     ProtocolKind::User(_) => {
-                        self.events.push(SwarmEvent::UserStreamClosed {
-                            peer_id,
-                            stream_id,
-                        });
+                        self.events
+                            .push(SwarmEvent::UserStreamClosed { peer_id, stream_id });
                     }
                 }
             }
@@ -850,8 +965,10 @@ impl SwarmCore {
                 self.ping.remove_peer(&peer_id);
                 self.identify.remove_peer(&peer_id);
                 self.pending_pings.remove(&peer_id);
-                self.events
-                    .push(SwarmEvent::ConnectionClosed { peer_id });
+                self.peer_info.remove(&peer_id);
+                self.ready_peers.remove(&peer_id);
+                self.established_peers.remove(&peer_id);
+                self.events.push(SwarmEvent::ConnectionClosed { peer_id });
             }
         }
 
@@ -897,17 +1014,20 @@ impl SwarmCore {
                 }
                 MultistreamOutput::NotAvailable => {
                     self.inbound_negotiators.remove(&key);
-                    self.actions.push(SwarmAction::ResetStream { conn_id, stream_id });
+                    self.actions
+                        .push(SwarmAction::ResetStream { conn_id, stream_id });
                     return;
                 }
                 MultistreamOutput::ProtocolError { reason } => {
-                    self.events.push(SwarmEvent::Error {
-                        message: format!(
-                            "multistream error on inbound stream {stream_id}: {reason}"
-                        ),
-                    });
+                    self.emit_error(
+                        SwarmErrorKind::Multistream,
+                        self.established_peer_for_conn(conn_id),
+                        Some(conn_id),
+                        format!("multistream error on inbound stream {stream_id}: {reason}"),
+                    );
                     self.inbound_negotiators.remove(&key);
-                    self.actions.push(SwarmAction::ResetStream { conn_id, stream_id });
+                    self.actions
+                        .push(SwarmAction::ResetStream { conn_id, stream_id });
                     return;
                 }
             }
@@ -959,23 +1079,27 @@ impl SwarmCore {
                     negotiated = true;
                 }
                 MultistreamOutput::NotAvailable => {
-                    self.events.push(SwarmEvent::Error {
-                        message: format!(
-                            "remote peer does not support protocol for stream {stream_id}"
-                        ),
-                    });
+                    self.emit_error(
+                        SwarmErrorKind::UnsupportedProtocol,
+                        self.established_peer_for_conn(conn_id),
+                        Some(conn_id),
+                        format!("remote peer does not support protocol for stream {stream_id}"),
+                    );
                     self.outbound_negotiators.remove(&key);
-                    self.actions.push(SwarmAction::ResetStream { conn_id, stream_id });
+                    self.actions
+                        .push(SwarmAction::ResetStream { conn_id, stream_id });
                     return;
                 }
                 MultistreamOutput::ProtocolError { reason } => {
-                    self.events.push(SwarmEvent::Error {
-                        message: format!(
-                            "multistream error on outbound stream {stream_id}: {reason}"
-                        ),
-                    });
+                    self.emit_error(
+                        SwarmErrorKind::Multistream,
+                        self.established_peer_for_conn(conn_id),
+                        Some(conn_id),
+                        format!("multistream error on outbound stream {stream_id}: {reason}"),
+                    );
                     self.outbound_negotiators.remove(&key);
-                    self.actions.push(SwarmAction::ResetStream { conn_id, stream_id });
+                    self.actions
+                        .push(SwarmAction::ResetStream { conn_id, stream_id });
                     return;
                 }
             }
@@ -1027,6 +1151,7 @@ impl SwarmCore {
             // Snapshot of the transport's listening addresses at this
             // moment; the driver keeps `local_addresses` refreshed.
             let listen_addrs = self.local_addresses.as_slice();
+            let responder_peer_id = peer_id.clone();
             match self.identify.register_outbound_stream(
                 peer_id,
                 stream_id,
@@ -1046,9 +1171,12 @@ impl SwarmCore {
                     // responder stream for this peer). Don't leak the
                     // underlying transport stream -- reset it so the
                     // remote knows we're not going to respond.
-                    self.events.push(SwarmEvent::Error {
-                        message: format!("identify responder error: {e}"),
-                    });
+                    self.emit_error(
+                        SwarmErrorKind::IdentifyStreamRejected,
+                        Some(responder_peer_id),
+                        Some(conn_id),
+                        format!("identify responder error: {e}"),
+                    );
                     self.actions
                         .push(SwarmAction::ResetStream { conn_id, stream_id });
                 }
@@ -1087,9 +1215,12 @@ impl SwarmCore {
                     .ping
                     .register_outbound_stream(peer_id.clone(), stream_id)
                 {
-                    self.events.push(SwarmEvent::Error {
-                        message: format!("ping register error: {e}"),
-                    });
+                    self.emit_error(
+                        SwarmErrorKind::Ping,
+                        Some(peer_id.clone()),
+                        Some(conn_id),
+                        format!("ping register error: {e}"),
+                    );
                     self.stream_owner.remove(&(conn_id, stream_id));
                     self.actions
                         .push(SwarmAction::ResetStream { conn_id, stream_id });
@@ -1099,9 +1230,12 @@ impl SwarmCore {
                 if let Some(payload) = self.pending_pings.remove(&peer_id) {
                     match self.ping.send_ping(&peer_id, &payload, now_ms) {
                         Ok(action) => self.execute_ping_action(action),
-                        Err(e) => self.events.push(SwarmEvent::Error {
-                            message: format!("deferred ping send failed: {e}"),
-                        }),
+                        Err(e) => self.emit_error(
+                            SwarmErrorKind::Ping,
+                            Some(peer_id.clone()),
+                            Some(conn_id),
+                            format!("deferred ping send failed: {e}"),
+                        ),
                     }
                 }
             }
@@ -1204,9 +1338,12 @@ impl SwarmCore {
                 PingEvent::ProtocolViolation {
                     peer_id, reason, ..
                 } => {
-                    self.events.push(SwarmEvent::Error {
-                        message: format!("ping protocol violation from {peer_id}: {reason}"),
-                    });
+                    self.emit_error(
+                        SwarmErrorKind::Ping,
+                        Some(peer_id.clone()),
+                        self.conn_for(&peer_id),
+                        format!("ping protocol violation from {peer_id}: {reason}"),
+                    );
                 }
                 _ => {}
             }
@@ -1215,15 +1352,114 @@ impl SwarmCore {
         for event in self.identify.poll_events() {
             match event {
                 IdentifyEvent::Received { peer_id, info } => {
-                    self.events
-                        .push(SwarmEvent::IdentifyReceived { peer_id, info });
+                    self.peer_info.insert(peer_id.clone(), info.clone());
+                    self.events.push(SwarmEvent::IdentifyReceived {
+                        peer_id: peer_id.clone(),
+                        info,
+                    });
+                    self.try_emit_peer_ready(&peer_id);
                 }
                 IdentifyEvent::Error { error, .. } => {
-                    self.events.push(SwarmEvent::Error {
-                        message: format!("identify error: {error}"),
-                    });
+                    self.emit_error(
+                        SwarmErrorKind::Identify,
+                        None,
+                        None,
+                        format!("identify error: {error}"),
+                    );
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str::FromStr;
+
+    use minip2p_identify::IdentifyConfig;
+    use minip2p_ping::PingConfig;
+    use minip2p_transport::{ConnectionEndpoint, ConnectionId, TransportEvent};
+
+    use super::*;
+
+    fn test_core() -> SwarmCore {
+        SwarmCore::new(
+            IdentifyConfig {
+                protocol_version: "minip2p-test/0.1.0".into(),
+                agent_version: "minip2p-test/0.1.0".into(),
+                protocols: Vec::new(),
+                public_key: Vec::new(),
+            },
+            PingConfig::default(),
+        )
+    }
+
+    fn loopback_transport() -> Multiaddr {
+        Multiaddr::from_str("/ip4/127.0.0.1/udp/4001/quic-v1").expect("valid multiaddr")
+    }
+
+    #[test]
+    fn transport_error_does_not_surface_synthetic_peer_id() {
+        let mut core = test_core();
+        let conn_id = ConnectionId::new(7);
+
+        core.on_transport_event(
+            TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::new(loopback_transport()),
+            },
+            0,
+        );
+        core.on_transport_event(
+            TransportEvent::Error {
+                id: conn_id,
+                message: "boom".into(),
+            },
+            0,
+        );
+
+        let events = core.poll_events();
+        let error = events
+            .iter()
+            .find_map(|event| match event {
+                SwarmEvent::Error(error) => Some(error),
+                _ => None,
+            })
+            .expect("transport error should surface");
+        assert_eq!(error.peer_id, None);
+        assert_eq!(error.conn_id, Some(conn_id));
+    }
+
+    #[test]
+    fn transport_error_keeps_established_peer_id() {
+        let mut core = test_core();
+        let conn_id = ConnectionId::new(8);
+        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
+
+        core.on_transport_event(
+            TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+            0,
+        );
+        core.on_transport_event(
+            TransportEvent::Error {
+                id: conn_id,
+                message: "boom".into(),
+            },
+            0,
+        );
+
+        let events = core.poll_events();
+        let error = events
+            .iter()
+            .find_map(|event| match event {
+                SwarmEvent::Error(error) if error.kind == SwarmErrorKind::Transport => Some(error),
+                _ => None,
+            })
+            .expect("transport error should surface");
+        assert_eq!(error.peer_id.as_ref(), Some(&peer_id));
+        assert_eq!(error.conn_id, Some(conn_id));
     }
 }

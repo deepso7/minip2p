@@ -20,7 +20,20 @@ pub enum SwarmEvent {
     /// A connection was closed.
     ConnectionClosed { peer_id: PeerId },
     /// Identify information received from a remote peer.
-    IdentifyReceived { peer_id: PeerId, info: IdentifyMessage },
+    IdentifyReceived {
+        peer_id: PeerId,
+        info: IdentifyMessage,
+    },
+    /// A peer is ready for application-level operations.
+    ///
+    /// This fires after the swarm has a stable peer id for the connection and
+    /// has processed the first Identify message from that peer. At this point
+    /// callers can safely use protocol-specific APIs without racing peer-id
+    /// migration or unknown protocol support.
+    PeerReady {
+        peer_id: PeerId,
+        protocols: Vec<String>,
+    },
     /// A ping RTT measurement completed.
     PingRttMeasured { peer_id: PeerId, rtt_ms: u64 },
     /// A ping timed out.
@@ -41,11 +54,56 @@ pub enum SwarmEvent {
         data: Vec<u8>,
     },
     /// The remote closed its write side on a user stream.
-    UserStreamRemoteWriteClosed { peer_id: PeerId, stream_id: StreamId },
+    UserStreamRemoteWriteClosed {
+        peer_id: PeerId,
+        stream_id: StreamId,
+    },
     /// A user stream was fully closed.
-    UserStreamClosed { peer_id: PeerId, stream_id: StreamId },
-    /// A non-fatal error occurred.
-    Error { message: String },
+    UserStreamClosed {
+        peer_id: PeerId,
+        stream_id: StreamId,
+    },
+    /// A non-fatal runtime error occurred.
+    Error(SwarmRuntimeError),
+}
+
+/// Structured runtime error emitted through [`SwarmEvent::Error`].
+///
+/// This keeps the Sans-I/O core testable without string matching while still
+/// carrying a human-readable detail for logs and CLIs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwarmRuntimeError {
+    /// Broad subsystem that produced the error.
+    pub kind: SwarmErrorKind,
+    /// Remote peer involved, if known at the swarm layer.
+    pub peer_id: Option<PeerId>,
+    /// Transport connection involved, if known.
+    pub conn_id: Option<ConnectionId>,
+    /// Human-readable context for logs and diagnostics.
+    pub detail: String,
+}
+
+/// Machine-testable runtime error category.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SwarmErrorKind {
+    /// Underlying transport operation or event failed.
+    Transport,
+    /// Multistream-select negotiation failed.
+    Multistream,
+    /// Identify protocol failed.
+    Identify,
+    /// Ping protocol failed.
+    Ping,
+    /// User-protocol stream failed.
+    UserProtocol { protocol_id: String },
+    /// Identify stream setup was rejected.
+    IdentifyStreamRejected,
+    /// Outbound stream opening failed.
+    OpenStreamFailed,
+    /// The remote peer did not support the requested protocol.
+    UnsupportedProtocol,
+    /// The swarm driver violated the core/driver contract.
+    Driver,
 }
 
 /// Opaque correlation handle for a pending outbound stream-open request.
@@ -110,6 +168,12 @@ pub enum SwarmError {
     /// A user protocol id was used before registering it.
     #[error("user protocol '{protocol_id}' is not registered")]
     ProtocolNotRegistered { protocol_id: String },
+    /// The peer has completed Identify and did not advertise the requested protocol.
+    #[error("peer {peer_id} does not support user protocol '{protocol_id}'")]
+    RemoteDoesNotSupport {
+        peer_id: PeerId,
+        protocol_id: String,
+    },
     /// The ping state machine rejected the request (e.g. a ping is already
     /// in flight on the target peer).
     #[error("ping error: {reason}")]

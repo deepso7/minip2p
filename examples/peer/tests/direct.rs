@@ -40,11 +40,7 @@ fn direct_listen_and_dial_complete_ping_round_trip() {
             .expect("spawn listener"),
     );
 
-    let listener_stdout = listener
-        .0
-        .stdout
-        .take()
-        .expect("listener stdout is piped");
+    let listener_stdout = listener.0.stdout.take().expect("listener stdout is piped");
 
     let peer_addr = read_bound_line(listener_stdout, TEST_DEADLINE)
         .expect("listener should print a 'bound=...' line");
@@ -71,7 +67,9 @@ fn direct_listen_and_dial_complete_ping_round_trip() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.lines().any(|l| l.contains("rtt=") && l.contains("ping")),
+        stdout
+            .lines()
+            .any(|l| l.contains("rtt=") && l.contains("ping")),
         "dialer stdout should contain a 'ping ... rtt=...' line; got:\n{stdout}",
     );
 
@@ -106,10 +104,7 @@ fn read_bound_line<R: std::io::Read + Send + 'static>(
 }
 
 /// Wait for `child` to exit, but give up after `deadline` and kill it.
-fn wait_with_deadline(
-    mut child: Child,
-    deadline: Duration,
-) -> Option<std::process::Output> {
+fn wait_with_deadline(mut child: Child, deadline: Duration) -> Option<std::process::Output> {
     let start = Instant::now();
     loop {
         if let Ok(Some(_)) = child.try_wait() {

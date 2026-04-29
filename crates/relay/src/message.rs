@@ -27,7 +27,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{read_uvarint, uvarint_len, write_uvarint, VarintError};
+use minip2p_core::{VarintError, read_uvarint, uvarint_len, write_uvarint};
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -239,10 +239,7 @@ fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, RelayMes
 }
 
 /// Reads a length-delimited value, advancing `idx` past the length and bytes.
-fn read_len_delimited<'a>(
-    input: &'a [u8],
-    idx: &mut usize,
-) -> Result<&'a [u8], RelayMessageError> {
+fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], RelayMessageError> {
     let (length, used) = read_uvarint(&input[*idx..])?;
     *idx += used;
     let length = length as usize;
@@ -532,9 +529,10 @@ impl HopMessage {
             match (field, wire_type) {
                 (1, WIRE_VARINT) => {
                     let value = read_varint_value(input, &mut idx)?;
-                    kind = Some(HopMessageType::from_u64(value).ok_or(
-                        RelayMessageError::InvalidMessageType { value },
-                    )?);
+                    kind = Some(
+                        HopMessageType::from_u64(value)
+                            .ok_or(RelayMessageError::InvalidMessageType { value })?,
+                    );
                 }
                 (2, WIRE_LEN) => {
                     let body = read_len_delimited(input, &mut idx)?;
@@ -602,9 +600,10 @@ impl StopMessage {
             match (field, wire_type) {
                 (1, WIRE_VARINT) => {
                     let value = read_varint_value(input, &mut idx)?;
-                    kind = Some(StopMessageType::from_u64(value).ok_or(
-                        RelayMessageError::InvalidMessageType { value },
-                    )?);
+                    kind = Some(
+                        StopMessageType::from_u64(value)
+                            .ok_or(RelayMessageError::InvalidMessageType { value })?,
+                    );
                 }
                 (2, WIRE_LEN) => {
                     let body = read_len_delimited(input, &mut idx)?;
@@ -801,7 +800,10 @@ mod tests {
         let framed = encode_frame(payload);
 
         match decode_frame(&framed) {
-            FrameDecode::Complete { payload: p, consumed } => {
+            FrameDecode::Complete {
+                payload: p,
+                consumed,
+            } => {
                 assert_eq!(p, payload);
                 assert_eq!(consumed, framed.len());
             }

@@ -18,7 +18,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use minip2p_core::{read_uvarint, uvarint_len, write_uvarint, VarintError};
+use minip2p_core::{VarintError, read_uvarint, uvarint_len, write_uvarint};
 use thiserror::Error;
 
 // Wire types from the protobuf spec.
@@ -179,10 +179,7 @@ impl HolePunch {
 
 /// Reads a length-delimited value, performing a checked `u64 -> usize`
 /// conversion to guard against truncation on 32-bit targets.
-fn read_len_delimited<'a>(
-    input: &'a [u8],
-    idx: &mut usize,
-) -> Result<&'a [u8], DcutrMessageError> {
+fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], DcutrMessageError> {
     let (length_u64, len_used) = read_uvarint(&input[*idx..])?;
     *idx += len_used;
 
@@ -310,7 +307,10 @@ mod tests {
         let payload = b"abcdef";
         let framed = encode_frame(payload);
         match decode_frame(&framed) {
-            FrameDecode::Complete { payload: p, consumed } => {
+            FrameDecode::Complete {
+                payload: p,
+                consumed,
+            } => {
                 assert_eq!(p, payload);
                 assert_eq!(consumed, framed.len());
             }

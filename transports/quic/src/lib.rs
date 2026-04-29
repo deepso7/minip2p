@@ -249,50 +249,53 @@ impl QuicTransport {
         // To avoid this, quiche would need the `boringssl-boring-crate` feature
         // for in-memory cert loading via `SslContextBuilder`.
         let tls_temp_files = if let Some(keypair) = node_config.keypair() {
-            let (cert_der, key_der) =
-                minip2p_tls::generate_certificate(keypair).map_err(|e| {
-                    TransportError::InvalidConfig {
-                        reason: format!("failed to generate libp2p TLS certificate: {e}"),
-                    }
-                })?;
+            let (cert_der, key_der) = minip2p_tls::generate_certificate(keypair).map_err(|e| {
+                TransportError::InvalidConfig {
+                    reason: format!("failed to generate libp2p TLS certificate: {e}"),
+                }
+            })?;
 
             let cert_pem = minip2p_tls::cert_to_pem(&cert_der);
             let key_pem = minip2p_tls::private_key_to_pem(&key_der);
 
-            let mut cert_file = tempfile::NamedTempFile::new().map_err(|e| {
-                TransportError::InvalidConfig {
+            let mut cert_file =
+                tempfile::NamedTempFile::new().map_err(|e| TransportError::InvalidConfig {
                     reason: format!("failed to create temp cert file: {e}"),
-                }
-            })?;
+                })?;
             cert_file.write_all(cert_pem.as_bytes()).map_err(|e| {
                 TransportError::InvalidConfig {
                     reason: format!("failed to write temp cert file: {e}"),
                 }
             })?;
 
-            let mut key_file = tempfile::NamedTempFile::new().map_err(|e| {
-                TransportError::InvalidConfig {
+            let mut key_file =
+                tempfile::NamedTempFile::new().map_err(|e| TransportError::InvalidConfig {
                     reason: format!("failed to create temp key file: {e}"),
-                }
-            })?;
-            key_file.write_all(key_pem.as_bytes()).map_err(|e| {
-                TransportError::InvalidConfig {
+                })?;
+            key_file
+                .write_all(key_pem.as_bytes())
+                .map_err(|e| TransportError::InvalidConfig {
                     reason: format!("failed to write temp key file: {e}"),
-                }
-            })?;
+                })?;
 
-            let cert_path = cert_file.path().to_str().ok_or(TransportError::InvalidConfig {
-                reason: "temp cert file path is not valid UTF-8".into(),
-            })?;
+            let cert_path = cert_file
+                .path()
+                .to_str()
+                .ok_or(TransportError::InvalidConfig {
+                    reason: "temp cert file path is not valid UTF-8".into(),
+                })?;
             quiche_config
                 .load_cert_chain_from_pem_file(cert_path)
                 .map_err(|e| TransportError::InvalidConfig {
                     reason: format!("failed to load generated cert into quiche: {e}"),
                 })?;
 
-            let key_path = key_file.path().to_str().ok_or(TransportError::InvalidConfig {
-                reason: "temp key file path is not valid UTF-8".into(),
-            })?;
+            let key_path = key_file
+                .path()
+                .to_str()
+                .ok_or(TransportError::InvalidConfig {
+                    reason: "temp key file path is not valid UTF-8".into(),
+                })?;
             quiche_config
                 .load_priv_key_from_pem_file(key_path)
                 .map_err(|e| TransportError::InvalidConfig {
@@ -377,7 +380,7 @@ impl QuicTransport {
     /// Convenience wrapper around [`listen`](Transport::listen) that uses the
     /// address the UDP socket is bound to, avoiding manual `Multiaddr`
     /// construction.
-    pub fn listen_on_bound_addr(&mut self) -> Result<(), TransportError> {
+    pub fn listen_on_bound_addr(&mut self) -> Result<Multiaddr, TransportError> {
         let addr = self.local_addr()?;
         let multiaddr = socket_addr_to_multiaddr(addr);
         self.listen(&multiaddr)
@@ -560,7 +563,7 @@ impl Transport for QuicTransport {
         Ok(())
     }
 
-    fn listen(&mut self, addr: &Multiaddr) -> Result<(), TransportError> {
+    fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
         let socket_addr = extract_listen_socket_addr(addr, "listen address")?;
 
         if !self.node_config.can_listen() {
@@ -572,12 +575,13 @@ impl Transport for QuicTransport {
         let local_addr = self.local_addr()?;
         ensure_listen_matches_bound_socket(socket_addr, local_addr)?;
 
+        let listen_addr = socket_addr_to_multiaddr(local_addr);
         self.listen_addr = Some(local_addr);
         self.pending_events.push(TransportEvent::Listening {
-            addr: socket_addr_to_multiaddr(local_addr),
+            addr: listen_addr.clone(),
         });
 
-        Ok(())
+        Ok(listen_addr)
     }
 
     fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
@@ -654,7 +658,9 @@ impl Transport for QuicTransport {
         // normal usage -- we bind at construction time), return empty
         // rather than propagate the error. The swarm uses this only to
         // enrich Identify; a missing value is never fatal.
-        self.local_multiaddr().map(|addr| vec![addr]).unwrap_or_default()
+        self.local_multiaddr()
+            .map(|addr| vec![addr])
+            .unwrap_or_default()
     }
 
     fn active_connection_count(&self) -> usize {

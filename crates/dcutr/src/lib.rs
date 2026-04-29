@@ -34,7 +34,7 @@ use alloc::vec::Vec;
 use minip2p_core::Multiaddr;
 
 pub use message::{
-    decode_frame, encode_frame, DcutrMessageError, FrameDecode, HolePunch, HolePunchType,
+    DcutrMessageError, FrameDecode, HolePunch, HolePunchType, decode_frame, encode_frame,
 };
 
 /// Protocol id for DCUtR.

@@ -5,12 +5,13 @@
 //! swarm.
 
 use minip2p_core::PeerId;
-use minip2p_identify::{IdentifyConfig, IDENTIFY_PROTOCOL_ID};
+use minip2p_identify::{IDENTIFY_PROTOCOL_ID, IdentifyConfig};
 use minip2p_identity::Ed25519Keypair;
-use minip2p_ping::{PingConfig, PING_PROTOCOL_ID};
+use minip2p_ping::{PING_PROTOCOL_ID, PingConfig};
 use minip2p_transport::Transport;
+use std::sync::Arc;
 
-use crate::Swarm;
+use crate::{Clock, Swarm};
 
 /// Default protocol-version string advertised to peers on Identify.
 const DEFAULT_PROTOCOL_VERSION: &str = "minip2p/0.1.0";
@@ -107,6 +108,26 @@ impl SwarmBuilder {
             public_key: self.public_key,
         };
         Swarm::new(transport, identify, self.ping_config, self.local_peer_id)
+    }
+
+    /// Consumes the builder and returns a swarm using an injected clock.
+    ///
+    /// Intended for deterministic tests of timeout behavior. Normal callers
+    /// should use [`SwarmBuilder::build`].
+    pub fn build_with_clock<T: Transport>(self, transport: T, clock: Arc<dyn Clock>) -> Swarm<T> {
+        let identify = IdentifyConfig {
+            protocol_version: self.protocol_version,
+            agent_version: self.agent_version,
+            protocols: self.protocols,
+            public_key: self.public_key,
+        };
+        Swarm::with_clock(
+            transport,
+            identify,
+            self.ping_config,
+            self.local_peer_id,
+            clock,
+        )
     }
 
     /// Returns the underlying [`IdentifyConfig`] assembled from the builder.

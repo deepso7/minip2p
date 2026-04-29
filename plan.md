@@ -190,11 +190,17 @@ New crate: `crates/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 
 ## Developer experience
 
-DX improvements and roadmap live in `dx-plan.md`. Includes a backlog
-of Tier 1/2/3 items (e.g. `SwarmEvent::PeerReady` for peer-ready
-signaling, typed `SwarmEvent::Error`, `Swarm::listen()` helper,
-keypair persistence) derived from real pain observed while writing
-`examples/peer`.
+The core DX pass is complete: `SwarmEvent::PeerReady` models the
+application-ready peer lifecycle, runtime swarm errors are typed,
+`Swarm::listen_on_bound_addr()` covers the common quickstart path,
+`open_user_stream` fails fast for known-unsupported protocols, peer
+introspection accessors expose current Identify state, and common
+workflows are captured in the root `justfile`.
+
+Keypair file persistence is intentionally application-owned: the
+identity crate exposes no_std-friendly raw secret import/export
+primitives, while file formats, encryption, OS keychain/KMS integration,
+and rotation policy belong to hosts.
 
 ## Quality Gates
 

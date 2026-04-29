@@ -235,11 +235,12 @@ impl PingProtocol {
             });
         }
 
-        let peer = self.peers.get_mut(peer_id).ok_or_else(|| {
-            PingError::OutboundStreamMissing {
+        let peer = self
+            .peers
+            .get_mut(peer_id)
+            .ok_or_else(|| PingError::OutboundStreamMissing {
                 peer_id: peer_id.clone(),
-            }
-        })?;
+            })?;
         let stream_id = peer
             .outbound_stream
             .ok_or_else(|| PingError::OutboundStreamMissing {
@@ -272,11 +273,12 @@ impl PingProtocol {
         &mut self,
         peer_id: &PeerId,
     ) -> Result<PingAction, PingError> {
-        let peer = self.peers.get_mut(peer_id).ok_or_else(|| {
-            PingError::OutboundStreamMissing {
+        let peer = self
+            .peers
+            .get_mut(peer_id)
+            .ok_or_else(|| PingError::OutboundStreamMissing {
                 peer_id: peer_id.clone(),
-            }
-        })?;
+            })?;
         let stream_id = peer
             .outbound_stream
             .ok_or_else(|| PingError::OutboundStreamMissing {
@@ -787,9 +789,11 @@ mod tests {
         );
 
         let events = ping.poll_events();
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, PingEvent::ProtocolViolation { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, PingEvent::ProtocolViolation { .. }))
+        );
     }
 
     #[test]
@@ -805,10 +809,7 @@ mod tests {
         let _ = ping.send_ping(&peer, &payload, 100).expect("send ping");
 
         let result = ping.close_outbound_stream_write(&peer);
-        assert!(matches!(
-            result,
-            Err(PingError::PingAlreadyInFlight { .. })
-        ));
+        assert!(matches!(result, Err(PingError::PingAlreadyInFlight { .. })));
     }
 
     #[test]

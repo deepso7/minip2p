@@ -15,8 +15,7 @@ use minip2p_transport::{ConnectionId, Transport, TransportError, TransportEvent}
 fn setup_pair() -> (QuicTransport, QuicTransport, PeerAddr) {
     let mut server =
         QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("server");
-    let client =
-        QuicTransport::new(QuicNodeConfig::dev_dialer(), "127.0.0.1:0").expect("client");
+    let client = QuicTransport::new(QuicNodeConfig::dev_dialer(), "127.0.0.1:0").expect("client");
 
     server.listen_on_bound_addr().expect("listen");
     let peer_addr = server.local_peer_addr().expect("peer addr");
@@ -39,7 +38,12 @@ fn connect_pair(
     server: &mut QuicTransport,
     client: &mut QuicTransport,
     peer_addr: &PeerAddr,
-) -> (ConnectionId, ConnectionId, Vec<TransportEvent>, Vec<TransportEvent>) {
+) -> (
+    ConnectionId,
+    ConnectionId,
+    Vec<TransportEvent>,
+    Vec<TransportEvent>,
+) {
     let client_conn = ConnectionId::new(1);
     client.dial(client_conn, peer_addr).expect("dial");
 
@@ -86,12 +90,34 @@ fn connect_pair(
     assert!(client_connected, "client must connect");
     assert!(server_connected, "server must connect");
     let server_conn = server_conn.expect("server must accept");
-    (server_conn, client_conn, all_server_events, all_client_events)
+    (
+        server_conn,
+        client_conn,
+        all_server_events,
+        all_client_events,
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Connection lifecycle
 // ---------------------------------------------------------------------------
+
+#[test]
+fn listen_returns_the_resolved_listen_address_and_event_matches() {
+    let mut listener =
+        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("listener");
+    let requested = listener.local_multiaddr().expect("local multiaddr");
+
+    let resolved = listener.listen(&requested).expect("listen");
+    assert_eq!(resolved, requested);
+
+    let events = listener.poll().expect("poll");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Listening { addr } if addr == &resolved))
+    );
+}
 
 #[test]
 fn connected_is_emitted_exactly_once_after_dial() {
@@ -110,9 +136,9 @@ fn incoming_connection_precedes_connected_on_server() {
     let (mut server, mut client, peer_addr) = setup_pair();
     let (server_conn, _, server_events, _) = connect_pair(&mut server, &mut client, &peer_addr);
 
-    let incoming_idx = server_events
-        .iter()
-        .position(|e| matches!(e, TransportEvent::IncomingConnection { id, .. } if *id == server_conn));
+    let incoming_idx = server_events.iter().position(
+        |e| matches!(e, TransportEvent::IncomingConnection { id, .. } if *id == server_conn),
+    );
     let connected_idx = server_events
         .iter()
         .position(|e| matches!(e, TransportEvent::Connected { id, .. } if *id == server_conn));
@@ -159,7 +185,9 @@ fn dial_with_duplicate_id_returns_connection_exists() {
     let id = ConnectionId::new(42);
     client.dial(id, &peer_addr).expect("first dial");
 
-    let err = client.dial(id, &peer_addr).expect_err("duplicate must fail");
+    let err = client
+        .dial(id, &peer_addr)
+        .expect_err("duplicate must fail");
     assert!(
         matches!(err, TransportError::ConnectionExists { .. }),
         "expected ConnectionExists, got {err:?}"
@@ -187,10 +215,7 @@ fn close_rejects_further_stream_operations() {
     // After close(), the connection is in Closing state. Opening new streams
     // or sending on existing ones should fail.
     let err = client.open_stream(client_conn);
-    assert!(
-        err.is_err(),
-        "open_stream must fail after close"
-    );
+    assert!(err.is_err(), "open_stream must fail after close");
 }
 
 // ---------------------------------------------------------------------------
@@ -301,9 +326,7 @@ fn reset_stream_emits_stream_closed() {
         drive_pair_once(&mut server, &mut client);
     }
 
-    client
-        .reset_stream(client_conn, stream_id)
-        .expect("reset");
+    client.reset_stream(client_conn, stream_id).expect("reset");
 
     let mut saw_closed = false;
     let events = client.poll().unwrap();

@@ -94,14 +94,9 @@ impl PingHarness {
             .dial(client_conn_id, &peer_addr)
             .expect("client dial");
 
-        let server_conn_id = Self::wait_for_connection(
-            &mut server,
-            &mut client,
-            client_conn_id,
-            &peer_addr,
-            250,
-        )
-        .expect("server should observe connection");
+        let server_conn_id =
+            Self::wait_for_connection(&mut server, &mut client, client_conn_id, &peer_addr, 250)
+                .expect("server should observe connection");
 
         // Identity is now auto-verified from the TLS certificate. No manual
         // verify_connection_peer_id call needed.
@@ -172,9 +167,7 @@ impl PingHarness {
                                     client_negotiated = true;
                                 }
                                 MultistreamOutput::NotAvailable => {
-                                    panic!(
-                                        "dialer reported protocol not available unexpectedly"
-                                    )
+                                    panic!("dialer reported protocol not available unexpectedly")
                                 }
                                 MultistreamOutput::ProtocolError { reason } => {
                                     panic!("dialer multistream protocol error: {reason}")
@@ -267,8 +260,7 @@ impl PingHarness {
             match event {
                 TransportEvent::IncomingStream { id, stream_id } => {
                     assert_eq!(*id, server_conn_id);
-                    let mut listener =
-                        MultistreamSelect::listener([PING_PROTOCOL_ID.to_string()]);
+                    let mut listener = MultistreamSelect::listener([PING_PROTOCOL_ID.to_string()]);
                     let start_outputs = listener.start();
                     negotiators.insert(*stream_id, listener);
 
@@ -308,9 +300,7 @@ impl PingHarness {
                                     apply_ping_actions(server, server_conn_id, actions);
                                 }
                                 MultistreamOutput::NotAvailable => {
-                                    panic!(
-                                        "listener reported protocol not available unexpectedly"
-                                    )
+                                    panic!("listener reported protocol not available unexpectedly")
                                 }
                                 MultistreamOutput::ProtocolError { reason } => {
                                     panic!("listener multistream protocol error: {reason}")
@@ -336,8 +326,8 @@ impl PingHarness {
                 }
                 TransportEvent::StreamRemoteWriteClosed { id, stream_id } => {
                     assert_eq!(*id, server_conn_id);
-                    let actions = server_ping
-                        .on_stream_remote_write_closed(peer_addr.peer_id(), *stream_id);
+                    let actions =
+                        server_ping.on_stream_remote_write_closed(peer_addr.peer_id(), *stream_id);
                     apply_ping_actions(server, server_conn_id, actions);
                     *on_remote_write_closed = Some(*stream_id);
                 }
@@ -381,9 +371,7 @@ impl PingHarness {
 
     /// Drive the event loop including a custom server-side remote-write-closed
     /// callback (needed by the close-write test).
-    fn drive_once_with_server_close_hook(
-        &mut self,
-    ) -> (Vec<TransportEvent>, Option<StreamId>) {
+    fn drive_once_with_server_close_hook(&mut self) -> (Vec<TransportEvent>, Option<StreamId>) {
         let (server_events, client_events) = drive_pair_once(&mut self.server, &mut self.client);
 
         let mut closed_stream = None;
@@ -451,14 +439,16 @@ fn ping_roundtrip_after_identity_verification_and_multistream_negotiation() {
                 } => {
                     assert_eq!(id, h.client_conn_id);
                     let now = h.now_ms();
-                    let actions =
-                        h.client_ping.on_stream_data(&peer_id, stream_id, &data, now);
+                    let actions = h
+                        .client_ping
+                        .on_stream_data(&peer_id, stream_id, &data, now);
                     apply_ping_actions(&mut h.client, h.client_conn_id, actions);
                 }
                 TransportEvent::StreamRemoteWriteClosed { id, stream_id } => {
                     assert_eq!(id, h.client_conn_id);
-                    let actions =
-                        h.client_ping.on_stream_remote_write_closed(&peer_id, stream_id);
+                    let actions = h
+                        .client_ping
+                        .on_stream_remote_write_closed(&peer_id, stream_id);
                     apply_ping_actions(&mut h.client, h.client_conn_id, actions);
                 }
                 TransportEvent::StreamClosed { id, stream_id } => {
@@ -550,8 +540,9 @@ fn repeated_ping_on_same_stream_then_close_write_exits_listener_loop() {
                 } => {
                     assert_eq!(id, h.client_conn_id);
                     let now = h.now_ms();
-                    let actions =
-                        h.client_ping.on_stream_data(&peer_id, stream_id, &data, now);
+                    let actions = h
+                        .client_ping
+                        .on_stream_data(&peer_id, stream_id, &data, now);
                     apply_ping_actions(&mut h.client, h.client_conn_id, actions);
                 }
                 TransportEvent::StreamRemoteWriteClosed { id, stream_id } => {
@@ -559,8 +550,9 @@ fn repeated_ping_on_same_stream_then_close_write_exits_listener_loop() {
                     if stream_id == h.client_stream {
                         client_saw_remote_write_closed = true;
                     }
-                    let actions =
-                        h.client_ping.on_stream_remote_write_closed(&peer_id, stream_id);
+                    let actions = h
+                        .client_ping
+                        .on_stream_remote_write_closed(&peer_id, stream_id);
                     apply_ping_actions(&mut h.client, h.client_conn_id, actions);
                 }
                 TransportEvent::StreamClosed { id, stream_id } => {

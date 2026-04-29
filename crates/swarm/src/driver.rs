@@ -5,15 +5,16 @@
 //! the Sans-I/O core's actions and concrete transport calls.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use minip2p_core::{Multiaddr, PeerAddr, PeerId};
-use minip2p_identify::IdentifyConfig;
-use minip2p_ping::{PingConfig, PING_PAYLOAD_LEN};
+use minip2p_identify::{IdentifyConfig, IdentifyMessage};
+use minip2p_ping::{PING_PAYLOAD_LEN, PingConfig};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
 use crate::core::SwarmCore;
-use crate::events::{SwarmAction, SwarmError, SwarmEvent};
+use crate::events::{SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError};
 
 /// Sleep cadence when [`Swarm::poll_next`] idles.
 ///
@@ -23,6 +24,34 @@ use crate::events::{SwarmAction, SwarmError, SwarmEvent};
 /// a non-blocking `recvfrom` that returns `WouldBlock` immediately
 /// when there's no data, so the hot loop is cheap.
 const POLL_IDLE_SLEEP: Duration = Duration::from_millis(1);
+
+/// Clock source used by the std swarm driver.
+///
+/// The Sans-I/O core remains clockless; the driver reads this clock and passes
+/// milliseconds into the core. Tests can inject a deterministic clock while
+/// normal callers use the default system monotonic clock.
+pub trait Clock: Send + Sync {
+    /// Returns monotonic milliseconds since an arbitrary start point.
+    fn now_ms(&self) -> u64;
+}
+
+struct SystemClock {
+    start: Instant,
+}
+
+impl SystemClock {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Clock for SystemClock {
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+}
 
 /// Thin std driver wrapping [`SwarmCore`] and a concrete [`Transport`].
 ///
@@ -48,9 +77,8 @@ pub struct Swarm<T: Transport> {
 
     /// Auto-incrementing connection-id counter for outbound dials.
     next_connection_id: u64,
-    /// Start of the logical clock. The driver tracks wall time so callers
-    /// don't have to thread `now_ms` through every method.
-    start: Instant,
+    /// Logical clock used to drive Sans-I/O timers.
+    clock: Arc<dyn Clock>,
 }
 
 impl<T: Transport> Swarm<T> {
@@ -65,13 +93,34 @@ impl<T: Transport> Swarm<T> {
         ping_config: PingConfig,
         local_peer_id: PeerId,
     ) -> Self {
+        Self::with_clock(
+            transport,
+            identify_config,
+            ping_config,
+            local_peer_id,
+            Arc::new(SystemClock::new()),
+        )
+    }
+
+    /// Creates a swarm driver with an injected clock.
+    ///
+    /// This is primarily for deterministic tests around protocol timeouts. The
+    /// default [`Swarm::new`] constructor remains the right choice for normal
+    /// applications.
+    pub fn with_clock(
+        transport: T,
+        identify_config: IdentifyConfig,
+        ping_config: PingConfig,
+        local_peer_id: PeerId,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             transport,
             core: SwarmCore::new(identify_config, ping_config),
             local_peer_id,
             event_buffer: VecDeque::new(),
             next_connection_id: 1,
-            start: Instant::now(),
+            clock,
         }
     }
 
@@ -90,6 +139,21 @@ impl<T: Transport> Swarm<T> {
         &self.core
     }
 
+    /// Returns peers currently surfaced through `ConnectionEstablished` and not yet closed.
+    pub fn connected_peers(&self) -> Vec<PeerId> {
+        self.core.connected_peers()
+    }
+
+    /// Returns the latest Identify information received for `peer_id`.
+    pub fn peer_info(&self, peer_id: &PeerId) -> Option<&IdentifyMessage> {
+        self.core.peer_info(peer_id)
+    }
+
+    /// Returns whether `peer_id` has emitted `PeerReady`.
+    pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
+        self.core.is_peer_ready(peer_id)
+    }
+
     /// Returns this node's own `PeerId`.
     ///
     /// Unlike `swarm.transport().local_peer_id()` (transport-specific and
@@ -104,9 +168,31 @@ impl<T: Transport> Swarm<T> {
         self.core.add_user_protocol(protocol_id);
     }
 
-    /// Start listening on the given multiaddr.
-    pub fn listen(&mut self, addr: &Multiaddr) -> Result<(), TransportError> {
+    /// Start listening on the given multiaddr and return the resolved local address.
+    pub fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
         self.transport.listen(addr)
+    }
+
+    /// Start listening on the transport's already-bound local address.
+    ///
+    /// Transports that know their bound address expose it via
+    /// `Transport::local_addresses()`. This is the common QUIC path when the
+    /// UDP socket was bound to `127.0.0.1:0` and the OS selected the port.
+    pub fn listen_on_bound_addr(&mut self) -> Result<PeerAddr, TransportError> {
+        let addr = self
+            .transport
+            .local_addresses()
+            .into_iter()
+            .next()
+            .ok_or_else(|| TransportError::InvalidConfig {
+                reason: "transport does not expose a bound local address".into(),
+            })?;
+        let resolved = self.transport.listen(&addr)?;
+        PeerAddr::new(resolved, self.local_peer_id.clone()).map_err(|e| {
+            TransportError::InvalidConfig {
+                reason: format!("failed to build local PeerAddr: {e}"),
+            }
+        })
     }
 
     /// Dial a remote peer. Swarm auto-allocates a connection id.
@@ -258,10 +344,7 @@ impl<T: Transport> Swarm<T> {
     /// Makes single-event CLIs and scripts much easier to write than the
     /// raw [`Swarm::poll`] loop: no sleep-then-match-all-events
     /// boilerplate.
-    pub fn poll_next(
-        &mut self,
-        deadline: Instant,
-    ) -> Result<Option<SwarmEvent>, TransportError> {
+    pub fn poll_next(&mut self, deadline: Instant) -> Result<Option<SwarmEvent>, TransportError> {
         loop {
             if let Some(ev) = self.event_buffer.pop_front() {
                 return Ok(Some(ev));
@@ -314,7 +397,7 @@ impl<T: Transport> Swarm<T> {
     // -----------------------------------------------------------------------
 
     fn now_ms(&self) -> u64 {
-        self.start.elapsed().as_millis() as u64
+        self.clock.now_ms()
     }
 
     fn allocate_connection_id(&mut self) -> ConnectionId {
@@ -353,13 +436,10 @@ impl<T: Transport> Swarm<T> {
     /// remembers the **last** stream id allocated during the flush, which
     /// is accurate because `open_user_stream` triggers exactly one
     /// `OpenStream` action per call.
-    fn dispatch_action(
-        &mut self,
-        action: SwarmAction,
-        captured_stream_id: &mut Option<StreamId>,
-    ) {
+    fn dispatch_action(&mut self, action: SwarmAction, captured_stream_id: &mut Option<StreamId>) {
         match action {
-            SwarmAction::OpenStream { conn_id, token } => match self.transport.open_stream(conn_id) {
+            SwarmAction::OpenStream { conn_id, token } => match self.transport.open_stream(conn_id)
+            {
                 Ok(stream_id) => {
                     *captured_stream_id = Some(stream_id);
                     self.core
@@ -367,7 +447,8 @@ impl<T: Transport> Swarm<T> {
                 }
                 Err(e) => {
                     let reason = format!("{e}");
-                    self.core.on_open_stream_failed(token, reason, self.now_ms());
+                    self.core
+                        .on_open_stream_failed(token, reason, self.now_ms());
                 }
             },
             SwarmAction::SendStream {
@@ -376,33 +457,60 @@ impl<T: Transport> Swarm<T> {
                 data,
             } => {
                 if let Err(e) = self.transport.send_stream(conn_id, stream_id, data) {
-                    self.core.record_error(format!(
-                        "send_stream to connection {conn_id} stream {stream_id} failed: {e}"
+                    self.core.record_error(runtime_error(
+                        SwarmErrorKind::Transport,
+                        Some(conn_id),
+                        format!(
+                            "send_stream to connection {conn_id} stream {stream_id} failed: {e}"
+                        ),
                     ));
                 }
             }
             SwarmAction::CloseStreamWrite { conn_id, stream_id } => {
                 if let Err(e) = self.transport.close_stream_write(conn_id, stream_id) {
-                    self.core.record_error(format!(
-                        "close_stream_write on connection {conn_id} stream {stream_id} failed: {e}"
+                    self.core.record_error(runtime_error(
+                        SwarmErrorKind::Transport,
+                        Some(conn_id),
+                        format!(
+                            "close_stream_write on connection {conn_id} stream {stream_id} failed: {e}"
+                        ),
                     ));
                 }
             }
             SwarmAction::ResetStream { conn_id, stream_id } => {
                 if let Err(e) = self.transport.reset_stream(conn_id, stream_id) {
-                    self.core.record_error(format!(
-                        "reset_stream on connection {conn_id} stream {stream_id} failed: {e}"
+                    self.core.record_error(runtime_error(
+                        SwarmErrorKind::Transport,
+                        Some(conn_id),
+                        format!(
+                            "reset_stream on connection {conn_id} stream {stream_id} failed: {e}"
+                        ),
                     ));
                 }
             }
             SwarmAction::CloseConnection { conn_id } => {
                 if let Err(e) = self.transport.close(conn_id) {
-                    self.core.record_error(format!(
-                        "close on connection {conn_id} failed: {e}"
+                    self.core.record_error(runtime_error(
+                        SwarmErrorKind::Transport,
+                        Some(conn_id),
+                        format!("close on connection {conn_id} failed: {e}"),
                     ));
                 }
             }
         }
+    }
+}
+
+fn runtime_error(
+    kind: SwarmErrorKind,
+    conn_id: Option<ConnectionId>,
+    detail: String,
+) -> SwarmRuntimeError {
+    SwarmRuntimeError {
+        kind,
+        peer_id: None,
+        conn_id,
+        detail,
     }
 }
 
@@ -419,6 +527,12 @@ fn swarm_to_transport_error(err: SwarmError) -> TransportError {
             reason: format!(
                 "protocol '{protocol_id}' is not registered; call add_user_protocol first"
             ),
+        },
+        SwarmError::RemoteDoesNotSupport {
+            peer_id,
+            protocol_id,
+        } => TransportError::PollError {
+            reason: format!("peer {peer_id} does not support protocol '{protocol_id}'"),
         },
         SwarmError::PingError { reason } => TransportError::PollError {
             reason: format!("ping error: {reason}"),
@@ -449,5 +563,3 @@ fn rand_ping_payload() -> [u8; PING_PAYLOAD_LEN] {
     }
     payload
 }
-
-

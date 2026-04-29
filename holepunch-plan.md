@@ -275,19 +275,19 @@ frame delivery without needing a separate poll round.
 
 ## Deliverable checklist
 
-- [ ] Scaffold `examples/peer/` (Cargo.toml + main.rs) and register in
+- [x] Scaffold `examples/peer/` (Cargo.toml + main.rs) and register in
       root `Cargo.toml` workspace members (~20 LOC)
-- [ ] `examples/peer/src/main.rs` argv parsing (~50 LOC)
-- [ ] `examples/peer/src/direct.rs` direct mode listener + dialer (~80 LOC)
-- [ ] `examples/peer/src/relay.rs` relay mode state machines (~250 LOC)
-- [ ] `examples/peer/src/holepunch.rs` shared hole-punch dial/UDP logic
-      (~60 LOC)
-- [ ] `examples/peer/src/cli.rs` multiaddr parsing, event printing (~60 LOC)
-- [ ] Automated direct-mode E2E test
+- [x] `examples/peer/src/main.rs` argv parsing (~50 LOC)
+- [x] `examples/peer/src/direct.rs` direct mode listener + dialer (~80 LOC)
+- [x] `examples/peer/src/relay.rs` relay mode state machines (~250 LOC)
+- [x] Shared hole-punch dial/UDP logic (implemented inline in
+      `examples/peer/src/relay.rs` rather than a separate `holepunch.rs`)
+- [x] `examples/peer/src/cli.rs` multiaddr parsing, event printing (~60 LOC)
+- [x] Automated direct-mode E2E test
 - [ ] Automated relay-mode test with fake relay (optional, defer if
       oversized)
 - [ ] Manual verification against rust-libp2p `relay-server-example`
-- [ ] Brief README at `examples/peer/README.md` with run instructions
+- [x] Brief README at `examples/peer/README.md` with run instructions
       (this is the one README we should actually write because users will
       run the binary)
 

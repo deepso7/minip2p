@@ -16,7 +16,10 @@ Orchestration layer that composes minip2p's protocol state machines into a singl
       .build(transport);
   ```
 - Auto-opens identify on every new connection and surfaces `SwarmEvent::IdentifyReceived`.
+- Emits `SwarmEvent::PeerReady` once the peer id is stable and the first Identify message has been processed.
 - `swarm.ping(peer_id)` opens / reuses a ping stream with no manual protocol negotiation.
+- `swarm.listen_on_bound_addr()` starts listening on the transport's bound address and returns the local `PeerAddr`.
+- `swarm.connected_peers()`, `swarm.peer_info(&peer_id)`, and `swarm.is_peer_ready(&peer_id)` expose read-only peer state.
 - Generic user-protocol hook for anything else (relay, DCUtR, custom app protocols):
   ```rust
   swarm.add_user_protocol("/myapp/1.0.0");
@@ -65,13 +68,3 @@ The `no_std` build omits the `Swarm<T>` driver and `SwarmBuilder`; only `SwarmCo
 ## Scope
 
 This crate orchestrates the protocol state machines. It does **not** implement the protocols themselves -- see `minip2p-identify`, `minip2p-ping`, `minip2p-multistream-select`, `minip2p-relay`, `minip2p-dcutr`. It does not implement transports either -- see `minip2p-transport` for the contract and `transports/quic` for a concrete adapter.
-
-## DX roadmap
-
-See `dx-plan.md` at the repo root for the tracked DX backlog. A few items that land in the swarm crate specifically:
-
-- **`SwarmEvent::PeerReady { peer_id }`** -- fire after the peer-id migration *and* the first `IdentifyReceived`. Removes the current "wait for Identify before calling `ping()`" gate in user code.
-- **Typed `SwarmEvent::Error`** -- replace the string-only `Error { message }` variant with a structured enum so callers can match on kinds instead of grepping on message contents.
-- **`Swarm::listen(&Multiaddr)` helper** -- one-call listen bring-up that wraps `transport.listen(...)` and returns the resolved bound address.
-
-PRs welcome; see `dx-plan.md` for the full priority list and motivation for each.

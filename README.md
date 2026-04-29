@@ -38,6 +38,7 @@ Current validated behavior:
 - Identify protocol exchange with observed-address plumbing from the transport.
 - Transport contract with documented lifecycle guarantees and conformance tests.
 - End-to-end stack via `SwarmBuilder`: QUIC transport + multistream-select + identify + ping with a single builder call.
+- Swarm DX events for application readiness (`PeerReady`) and typed runtime errors.
 - Pure-state-machine integration test covering Circuit Relay v2 + DCUtR (reservation, connect, stop, hole-punch coordination).
 
 ## Architecture boundaries
@@ -58,6 +59,13 @@ Build and run tests:
 
 ```bash
 cargo test
+```
+
+Common contributor workflows are also available through `just`:
+
+```bash
+just test
+just check-nostd
 ```
 
 Check `no_std` builds for the core crates:
@@ -95,4 +103,4 @@ cargo doc --workspace --no-deps --open
 - [ ] Mutual TLS on the QUIC transport so the listener learns the client PeerId at handshake time.
 - [ ] Additional transport adapters (TCP, WebSocket, WebRTC).
 
-See `plan.md` for the detailed execution plan and milestones, `holepunch-plan.md` for the ongoing CLI work, and `dx-plan.md` for the developer-experience roadmap (landed improvements + prioritized backlog).
+See `plan.md` for the detailed execution plan and milestones, and `holepunch-plan.md` for the runnable relay/DCUtR demo work.

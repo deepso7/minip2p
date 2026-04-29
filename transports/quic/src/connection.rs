@@ -184,7 +184,9 @@ impl QuicConnection {
                             id: self.id,
                             message: format!("peer TLS certificate verification failed: {e}"),
                         });
-                        let _ = self.conn.close(true, 0x02, b"certificate verification failed");
+                        let _ = self
+                            .conn
+                            .close(true, 0x02, b"certificate verification failed");
                         self.state = ConnectionState::Closing;
                         self.flush(socket)?;
                         return Ok(());

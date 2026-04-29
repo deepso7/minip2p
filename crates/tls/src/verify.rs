@@ -27,17 +27,14 @@ use crate::{LIBP2P_EXTENSION_OID, SIGNATURE_PREFIX, TlsError};
 /// Currently supports Ed25519 host keys only.
 pub fn verify_libp2p_certificate(cert_der: &[u8]) -> Result<PeerId, TlsError> {
     // Step 1: Parse the X.509 certificate.
-    let cert =
-        Certificate::from_der(cert_der).map_err(|e| TlsError::Der(format!("{e}")))?;
+    let cert = Certificate::from_der(cert_der).map_err(|e| TlsError::Der(format!("{e}")))?;
 
     // Step 2: Verify the certificate's self-signature.
     verify_self_signature(cert_der, &cert)?;
 
     // Step 3: Find the libp2p extension.
     let tbs = cert.tbs_certificate();
-    let extensions = tbs
-        .extensions()
-        .ok_or(TlsError::MissingExtension)?;
+    let extensions = tbs.extensions().ok_or(TlsError::MissingExtension)?;
 
     let libp2p_ext = extensions
         .iter()
@@ -81,8 +78,7 @@ fn verify_self_signature(cert_der: &[u8], cert: &Certificate) -> Result<(), TlsE
     // Check that the signature algorithm is ECDSA with SHA-256.
     let sig_alg_oid = cert.signature_algorithm().oid;
     // ecdsa-with-SHA256: 1.2.840.10045.4.3.2
-    let ecdsa_sha256_oid =
-        const_oid::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
+    let ecdsa_sha256_oid = const_oid::ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
     if sig_alg_oid != ecdsa_sha256_oid {
         return Err(TlsError::UnsupportedSignatureAlgorithm(format!(
             "{sig_alg_oid}"
@@ -103,8 +99,8 @@ fn verify_self_signature(cert_der: &[u8], cert: &Certificate) -> Result<(), TlsE
     let tbs = cert.tbs_certificate();
     let spki = tbs.subject_public_key_info();
     let pk_bytes = spki.subject_public_key.raw_bytes();
-    let verifying_key = VerifyingKey::from_sec1_bytes(pk_bytes)
-        .map_err(|_| TlsError::InvalidSelfSignature)?;
+    let verifying_key =
+        VerifyingKey::from_sec1_bytes(pk_bytes).map_err(|_| TlsError::InvalidSelfSignature)?;
 
     // Extract and verify the signature.
     let sig_bytes = cert.signature().raw_bytes();
@@ -135,8 +131,8 @@ fn extract_tbs_der(cert_der: &[u8]) -> Result<&[u8], TlsError> {
     let tbs_header = der::Header::decode(&mut reader).map_err(map_err)?;
     let remaining_after = usize::try_from(reader.remaining_len()).map_err(map_err)?;
     let tbs_header_len = remaining_before - remaining_after;
-    let tbs_value_len =
-        usize::try_from(tbs_header.length()).map_err(|_| TlsError::Der("TBS length overflow".into()))?;
+    let tbs_value_len = usize::try_from(tbs_header.length())
+        .map_err(|_| TlsError::Der("TBS length overflow".into()))?;
 
     let tbs_end = tbs_start + tbs_header_len + tbs_value_len;
     if tbs_end > cert_der.len() {
@@ -211,9 +207,7 @@ mod tests {
         let mut i = 0;
         while i < bytes.len() {
             let hi = (bytes[i] as char).to_digit(16).expect("invalid hex") as u8;
-            let lo = (bytes[i + 1] as char)
-                .to_digit(16)
-                .expect("invalid hex") as u8;
+            let lo = (bytes[i + 1] as char).to_digit(16).expect("invalid hex") as u8;
             out.push((hi << 4) | lo);
             i += 2;
         }
@@ -261,8 +255,8 @@ mod tests {
             .find(|ext| ext.extn_id == LIBP2P_EXTENSION_OID)
             .expect("extension must exist");
 
-        let (pk_bytes, _sig_bytes) = decode_signed_key(libp2p_ext.extn_value.as_bytes())
-            .expect("signed key must decode");
+        let (pk_bytes, _sig_bytes) =
+            decode_signed_key(libp2p_ext.extn_value.as_bytes()).expect("signed key must decode");
 
         let public_key = PublicKey::decode_protobuf(&pk_bytes).expect("protobuf must decode");
         assert_eq!(public_key.key_type(), KeyType::Ed25519);
@@ -283,8 +277,8 @@ mod tests {
             .find(|ext| ext.extn_id == LIBP2P_EXTENSION_OID)
             .expect("extension must exist");
 
-        let (pk_bytes, _sig_bytes) = decode_signed_key(libp2p_ext.extn_value.as_bytes())
-            .expect("signed key must decode");
+        let (pk_bytes, _sig_bytes) =
+            decode_signed_key(libp2p_ext.extn_value.as_bytes()).expect("signed key must decode");
 
         let public_key = PublicKey::decode_protobuf(&pk_bytes).expect("protobuf must decode");
         assert_eq!(public_key.key_type(), KeyType::Ecdsa);
@@ -305,8 +299,8 @@ mod tests {
             .find(|ext| ext.extn_id == LIBP2P_EXTENSION_OID)
             .expect("extension must exist");
 
-        let (pk_bytes, _sig_bytes) = decode_signed_key(libp2p_ext.extn_value.as_bytes())
-            .expect("signed key must decode");
+        let (pk_bytes, _sig_bytes) =
+            decode_signed_key(libp2p_ext.extn_value.as_bytes()).expect("signed key must decode");
 
         let public_key = PublicKey::decode_protobuf(&pk_bytes).expect("protobuf must decode");
         assert_eq!(public_key.key_type(), KeyType::Secp256k1);
