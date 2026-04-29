@@ -163,4 +163,6 @@ protocol id, etc).
   `rust-libp2p` `relay-server-example` or equivalent.
 
 - **Fresh identity per run.** Every invocation generates a new Ed25519
-  keypair. A `--key-file` flag is on the DX roadmap.
+  keypair. Long-running applications should persist key material in an
+  application-specific store using the identity crate's raw secret import/export
+  primitives.
