@@ -355,7 +355,7 @@ frame delivery without needing a separate poll round.
 7. Direct-candidate discovery -- NEXT
    - [ ] Do not advertise wildcard bind addresses (`0.0.0.0`, `::`) as DCUtR candidates.
    - [ ] Add parseable Identify observed addresses as candidates after relay/public-peer Identify.
-   - [ ] Verify whether rust-libp2p observed addresses arrive as `/quic`; support `/quic` to `/quic-v1` normalization if needed.
+   - [x] Strictly require `/quic-v1`; legacy `/quic` is intentionally rejected rather than normalized.
    - [ ] Keep candidate priority deterministic: manual `--external-addr`, then Identify observed address, then non-wildcard listen address.
    - [ ] Preserve relay fallback as the success path when no dialable direct candidate exists.
 

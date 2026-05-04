@@ -28,7 +28,7 @@ pub const DNS6_CODE: u64 = 0x37;
 /// Multicodec code for `/udp/<port>`. 2 raw bytes (big-endian).
 pub const UDP_CODE: u64 = 0x0111;
 /// Multicodec code for `/quic-v1`. No value.
-pub const QUIC_V1_CODE: u64 = 0x01cc;
+pub const QUIC_V1_CODE: u64 = 0x01cd;
 /// Multicodec code for `/p2p/<peer-id>`. Varint-length-prefixed multihash.
 pub const P2P_CODE: u64 = 0x01a5;
 

@@ -378,17 +378,32 @@ mod tests {
     ///
     /// - `/ip4`: varint code 0x04, value 127.0.0.1 = 7F 00 00 01
     /// - `/udp`: varint code 0x0111 -> 91 02, value 4001 (big-endian) = 0F A1
-    /// - `/quic-v1`: varint code 0x01cc -> CC 03, no value
+    /// - `/quic-v1`: varint code 0x01cd -> CD 03, no value
     #[test]
     fn binary_codec_reference_vector_ip4_quic() {
         let addr = Multiaddr::from_str("/ip4/127.0.0.1/udp/4001/quic-v1").unwrap();
         let expected: Vec<u8> = vec![
             0x04, 0x7F, 0x00, 0x00, 0x01, // ip4 127.0.0.1
             0x91, 0x02, 0x0F, 0xA1, // udp 4001
-            0xCC, 0x03, // quic-v1
+            0xCD, 0x03, // quic-v1
         ];
         assert_eq!(addr.to_bytes(), expected);
         assert_eq!(Multiaddr::from_bytes(&expected).unwrap(), addr);
+    }
+
+    #[test]
+    fn rejects_legacy_quic_protocol() {
+        let err = Multiaddr::from_str("/ip4/127.0.0.1/udp/4001/quic").unwrap_err();
+        assert!(matches!(err, MultiaddrError::UnknownProtocol { protocol } if protocol == "quic"));
+
+        // 0x01cc is legacy `/quic`; minip2p intentionally supports only `/quic-v1`.
+        let err = Multiaddr::from_bytes(&[
+            0x04, 0x7F, 0x00, 0x00, 0x01, // ip4 127.0.0.1
+            0x91, 0x02, 0x0F, 0xA1, // udp 4001
+            0xCC, 0x03, // quic
+        ])
+        .unwrap_err();
+        assert!(matches!(err, MultiaddrError::UnknownProtocolCode { code: 0x01cc }));
     }
 
     #[test]
