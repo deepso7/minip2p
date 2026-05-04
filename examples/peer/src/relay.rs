@@ -187,9 +187,10 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         )?;
     };
 
-    // --- 6. Hole-punch: blast UDP, wait for direct or timeout --------------
+    // --- 6. Hole-punch: dial + blast UDP, wait for direct or timeout -------
     println!("[{role}] dcutr-sync-received -> holepunching");
     print_remote_candidates(role, &remote_addrs);
+    dial_direct_candidates(&mut swarm, role, &remote_peer_id, &remote_addrs);
     let punch_start = Instant::now();
     let punch_deadline = punch_start + HOLEPUNCH_DEADLINE;
     let mut next_blast = punch_start + RESPONDER_SYNC_DELAY;
@@ -531,15 +532,7 @@ pub fn run_dial(
         dcutr.take_outbound(),
     )?;
 
-    for addr in &remote_addrs {
-        match PeerAddr::new(addr.clone(), target.clone()) {
-            Ok(pa) => match swarm.dial(&pa) {
-                Ok(_) => println!("[{role}] direct-dial-attempt {pa}"),
-                Err(e) => eprintln!("[{role}] direct-dial-failed addr={pa} reason={e}"),
-            },
-            Err(e) => eprintln!("[{role}] bad PeerAddr for {addr}: {e}"),
-        }
-    }
+    dial_direct_candidates(&mut swarm, role, &target, &remote_addrs);
 
     // --- 5. Wait for direct connection or hole-punch timeout ---------------
     let punch_deadline = Instant::now() + HOLEPUNCH_DEADLINE;
@@ -949,6 +942,23 @@ fn drain_dcutr_responder_events(
         }
     }
     sync
+}
+
+fn dial_direct_candidates(
+    swarm: &mut Swarm<QuicTransport>,
+    role: &str,
+    peer_id: &PeerId,
+    addrs: &[Multiaddr],
+) {
+    for addr in addrs {
+        match PeerAddr::new(addr.clone(), peer_id.clone()) {
+            Ok(peer_addr) => match swarm.dial(&peer_addr) {
+                Ok(_) => println!("[{role}] direct-dial-attempt {peer_addr}"),
+                Err(e) => eprintln!("[{role}] direct-dial-failed addr={peer_addr} reason={e}"),
+            },
+            Err(e) => eprintln!("[{role}] bad PeerAddr for {addr}: {e}"),
+        }
+    }
 }
 
 /// Send `data` on `stream_id` if non-empty; no-op otherwise.
