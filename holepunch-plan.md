@@ -352,12 +352,13 @@ frame delivery without needing a separate poll round.
    - [x] Confirm DCUtR CONNECT/SYNC exchange succeeds over the relay circuit.
    - [x] Confirm fallback `ping-via-relay` succeeds when direct candidates are not dialable.
 
-7. Direct-candidate discovery -- NEXT
-   - [ ] Do not advertise wildcard bind addresses (`0.0.0.0`, `::`) as DCUtR candidates.
-   - [ ] Add parseable Identify observed addresses as candidates after relay/public-peer Identify.
+7. Direct-candidate discovery -- DONE
+   - [x] Do not advertise wildcard bind addresses (`0.0.0.0`, `::`) as DCUtR candidates.
+   - [x] Add parseable Identify observed addresses as candidates after relay/public-peer Identify.
    - [x] Strictly require `/quic-v1`; legacy `/quic` is intentionally rejected rather than normalized.
-   - [ ] Keep candidate priority deterministic: manual `--external-addr`, then Identify observed address, then non-wildcard listen address.
-   - [ ] Preserve relay fallback as the success path when no dialable direct candidate exists.
+   - [x] Keep candidate priority deterministic: manual `--external-addr`, then Identify observed address, then non-wildcard listen address.
+   - [x] Preserve relay fallback as the success path when no dialable direct candidate exists.
+   - [x] Move reusable candidate selection policy into `minip2p-core` as pure `no_std + alloc` logic.
 
 ## Future follow-ups (not on this branch)
 

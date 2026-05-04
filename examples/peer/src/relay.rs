@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use minip2p_autonat::{
     AUTONAT_PROTOCOL_ID, AutoNatClient, AutoNatServer, Reachability, ResponseStatus,
 };
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol, select_direct_candidates};
 use minip2p_dcutr::{
     DCUTR_PROTOCOL_ID, DcutrInitiator, DcutrResponder, InitiatorOutcome, ResponderEvent,
 };
@@ -1094,48 +1094,33 @@ fn candidate_addrs(
     external_addrs: &[Multiaddr],
     observed_addr: Option<Multiaddr>,
 ) -> Vec<Multiaddr> {
-    let mut candidates = Vec::with_capacity(external_addrs.len() + 2);
-    for addr in external_addrs {
-        push_candidate(role, &mut candidates, "manual", addr.clone());
+    let selection =
+        select_direct_candidates(external_addrs, observed_addr, Some(bound_addr.clone()));
+
+    for candidate in &selection.accepted {
+        println!(
+            "[{role}] candidate-added source={} addr={}",
+            candidate.source.as_str(),
+            candidate.addr
+        );
     }
-    if let Some(addr) = observed_addr {
-        push_candidate(role, &mut candidates, "identify-observed", addr);
+
+    for rejected in &selection.rejected {
+        println!(
+            "[{role}] candidate-skipped source={} addr={} reason={}",
+            rejected.source.as_str(),
+            rejected.addr,
+            rejected.reason.as_str()
+        );
     }
-    push_candidate(role, &mut candidates, "listen", bound_addr.clone());
-    if candidates.is_empty() {
+
+    if selection.candidates.is_empty() {
         eprintln!(
             "[{role}] no-dialable-dcutr-candidates; add --external-addr or bind a non-wildcard address"
         );
     }
-    candidates
-}
 
-fn push_candidate(role: &str, candidates: &mut Vec<Multiaddr>, source: &str, addr: Multiaddr) {
-    if is_wildcard_addr(&addr) {
-        println!(
-            "[{role}] candidate-skipped source={source} addr={addr} reason=wildcard-bind-address"
-        );
-        return;
-    }
-    if !addr.is_quic_transport() {
-        println!(
-            "[{role}] candidate-skipped source={source} addr={addr} reason=not-quic-transport"
-        );
-        return;
-    }
-    let before = candidates.len();
-    push_unique(candidates, addr.clone());
-    if candidates.len() > before {
-        println!("[{role}] candidate-added source={source} addr={addr}");
-    }
-}
-
-fn is_wildcard_addr(addr: &Multiaddr) -> bool {
-    match addr.protocols().first() {
-        Some(Protocol::Ip4(bytes)) => *bytes == [0, 0, 0, 0],
-        Some(Protocol::Ip6(bytes)) => *bytes == [0; 16],
-        _ => false,
-    }
+    selection.candidates
 }
 
 fn relay_observed_addr(
