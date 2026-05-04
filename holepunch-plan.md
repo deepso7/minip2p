@@ -344,6 +344,21 @@ frame delivery without needing a separate poll round.
    - [x] Add relay-mode `--autonat <peer-addr>` to validate advertised DCUtR candidates before relay/DCUtR exchange.
    - [x] Keep manual `--external-addr` as an override/debug path.
 
+6. VPS rust-libp2p relay validation -- DONE
+   - [x] Confirm public QUIC relay reachability from minip2p.
+   - [x] Handle rust-libp2p relay startup readiness by retrying until HOP is advertised after fresh Identify/PeerReady.
+   - [x] Confirm HOP reservation succeeds.
+   - [x] Confirm relay circuit creates inbound STOP stream on the listener.
+   - [x] Confirm DCUtR CONNECT/SYNC exchange succeeds over the relay circuit.
+   - [x] Confirm fallback `ping-via-relay` succeeds when direct candidates are not dialable.
+
+7. Direct-candidate discovery -- NEXT
+   - [ ] Do not advertise wildcard bind addresses (`0.0.0.0`, `::`) as DCUtR candidates.
+   - [ ] Add parseable Identify observed addresses as candidates after relay/public-peer Identify.
+   - [ ] Verify whether rust-libp2p observed addresses arrive as `/quic`; support `/quic` to `/quic-v1` normalization if needed.
+   - [ ] Keep candidate priority deterministic: manual `--external-addr`, then Identify observed address, then non-wildcard listen address.
+   - [ ] Preserve relay fallback as the success path when no dialable direct candidate exists.
+
 ## Future follow-ups (not on this branch)
 
 - Relay + DCUtR integration directly into `Swarm` (today the CLI

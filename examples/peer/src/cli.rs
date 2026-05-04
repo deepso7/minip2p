@@ -317,6 +317,7 @@ pub fn print_event(role: &str, event: &SwarmEvent) {
         SwarmEvent::IdentifyReceived { peer_id, info } => {
             let agent = info.agent_version.as_deref().unwrap_or("?");
             let nprotos = info.protocols.len();
+            let protocols = format_protocols(&info.protocols);
             let observed = info
                 .observed_addr
                 .as_deref()
@@ -324,13 +325,15 @@ pub fn print_event(role: &str, event: &SwarmEvent) {
                 .map(|addr| addr.to_string())
                 .unwrap_or_else(|| "?".into());
             println!(
-                "[{role}] identify peer={peer_id} agent={agent} protocols={nprotos} observed={observed}"
+                "[{role}] identify peer={peer_id} agent={agent} protocols={nprotos} list=[{protocols}] observed={observed}"
             );
         }
         SwarmEvent::PeerReady { peer_id, protocols } => {
+            let protocol_list = format_protocols(protocols);
             println!(
-                "[{role}] peer-ready peer={peer_id} protocols={}",
-                protocols.len()
+                "[{role}] peer-ready peer={peer_id} protocols={} list=[{}]",
+                protocols.len(),
+                protocol_list
             );
         }
         SwarmEvent::PingRttMeasured { peer_id, rtt_ms } => {
@@ -375,6 +378,10 @@ pub fn print_event(role: &str, event: &SwarmEvent) {
             eprintln!("[{role}] error {:?}: {}", error.kind, error.detail);
         }
     }
+}
+
+fn format_protocols(protocols: &[String]) -> String {
+    protocols.join(",")
 }
 
 /// Usage text printed on `--help` and parse errors.

@@ -1,3 +1,6 @@
 /target
 .DS_Store
 /tmp
+
+# Demo peer identity files contain raw Ed25519 secrets.
+*.key

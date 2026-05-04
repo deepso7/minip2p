@@ -42,6 +42,7 @@ Current validated behavior:
 - Swarm DX events for application readiness (`PeerReady`) and typed runtime errors.
 - Pure-state-machine integration test covering Circuit Relay v2 + DCUtR (reservation, connect, stop, hole-punch coordination).
 - AutoNAT reachability probe wire logic and state machines in `minip2p-autonat`.
+- Manual VPS test against rust-libp2p relay validates HOP reservation, STOP circuit establishment, DCUtR coordination, and relay-ping fallback.
 
 ## Architecture boundaries
 

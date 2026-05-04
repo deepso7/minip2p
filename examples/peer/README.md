@@ -39,6 +39,8 @@ Where:
   candidate dialability before DCUtR.
 - `--external-addr <quic-multiaddr>` is repeatable in relay mode and adds manual
   DCUtR candidates when you have a known public address or port-forward.
+- Wildcard bind addresses (`/ip4/0.0.0.0/...`, `/ip6/::/...`) are never
+  advertised as DCUtR candidates because they are not dialable remote addresses.
 
 ## Direct mode (5-minute quickstart)
 
@@ -168,8 +170,37 @@ If you have a known UDP port-forward, add one or more manual
 candidates are advertised before the bound-socket candidate and validated by
 AutoNAT when `--autonat` is present.
 
+If no manual/observed/non-wildcard candidate exists, the peers still exercise
+relay + DCUtR coordination but direct dialing is skipped or fails fast and the
+demo should fall back to `ping-via-relay`.
+
 Expected terminal result is either `ping-direct` after a successful direct
 QUIC+mTLS connection, or `ping-via-relay` after a bounded hole-punch timeout.
+
+Current VPS validation status: HOP reservation, STOP circuit establishment,
+DCUtR CONNECT/SYNC coordination, and `ping-via-relay` fallback have been
+validated against rust-libp2p's relay server. Direct `ping-direct` requires at
+least one dialable candidate; wildcard listen addresses such as
+`/ip4/0.0.0.0/...` are bind-only and must not be used as remote candidates.
+
+Candidate priority is intended to be:
+
+```text
+1. manual --external-addr
+2. Identify observed address, when parseable and dialable
+3. non-wildcard listen address, such as /ip4/127.0.0.1/... or a LAN IP
+```
+
+If peers are on the same machine while the relay is remote, use loopback binds
+to test the direct path:
+
+```bash
+--listen /ip4/127.0.0.1/udp/0/quic-v1
+```
+
+If peers are on the same LAN, bind each peer to its LAN IP. For real internet
+tests across NATs, use `--external-addr` with a known forwarded/public UDP
+address until observed-address candidate discovery is fully wired.
 
 ### Fallback output (when hole-punch fails)
 
@@ -225,6 +256,11 @@ protocol id, etc).
 - **AutoNAT is validation, not magic address discovery.** If you do not have a
   useful public candidate or port-forward, AutoNAT will report private/unknown
   and the demo should still fall back to relay ping with diagnostics.
+
+- **Direct hole punching needs dialable candidates.** Relay/DCUtR can coordinate
+  the attempt, but `ping-direct` cannot succeed if both sides only advertise
+  wildcard bind addresses. In that case, the expected success result is
+  `ping-via-relay`.
 
 - **No relay server.** This binary implements the client side of HOP
   and the responder side of STOP; it does not run a relay. Use the

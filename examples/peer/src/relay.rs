@@ -57,6 +57,9 @@ const AUTONAT_REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 // /dns4, and /dns6 try one.
 const AUTONAT_DIALBACK_DEADLINE: Duration = Duration::from_secs(5);
 const LISTEN_FOREVER: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+const RELAY_READY_ATTEMPTS: usize = 3;
+const RELAY_READY_ATTEMPT_DEADLINE: Duration = Duration::from_secs(12);
+const RELAY_READY_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
 // Listener (Peer B): reserve, accept STOP, respond DCUtR, hole-punch
@@ -68,7 +71,21 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     let our_addr = swarm
         .listen_on_bound_addr()
         .map_err(|e| format!("listen failed: {e}"))?;
-    let initial_candidates = candidate_addrs(our_addr.transport(), &options.external_addrs);
+    println!("[{role}] bound={our_addr}");
+    println!("[{role}] us={}", swarm.local_peer_id());
+
+    let relay_peer_id = relay_addr.peer_id().clone();
+    let deadline = Instant::now() + LISTEN_DEADLINE;
+
+    // --- 1. Relay connection ready -----------------------------------------
+    prepare_relay(&mut swarm, role, &relay_addr, &relay_peer_id, deadline)?;
+
+    let initial_candidates = candidate_addrs(
+        role,
+        our_addr.transport(),
+        &options.external_addrs,
+        relay_observed_addr(&swarm, &relay_peer_id, role),
+    );
     let our_observed = validate_candidates_with_autonat(
         &mut swarm,
         role,
@@ -76,20 +93,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         &initial_candidates,
         Instant::now() + AUTONAT_CLIENT_DEADLINE,
     )?;
-    println!("[{role}] bound={our_addr}");
-    println!("[{role}] us={}", swarm.local_peer_id());
     print_candidates(role, &our_observed);
-
-    let relay_peer_id = relay_addr.peer_id().clone();
-    swarm
-        .dial(&relay_addr)
-        .map_err(|e| format!("dial relay: {e}"))?;
-    println!("[{role}] dialing-relay {relay_addr}");
-
-    let deadline = Instant::now() + LISTEN_DEADLINE;
-
-    // --- 1. Relay connection established -----------------------------------
-    wait_connected(&mut swarm, role, &relay_peer_id, deadline)?;
 
     // --- 2. Reserve a slot on the relay via HOP RESERVE --------------------
     let hop_stream = swarm
@@ -424,7 +428,22 @@ pub fn run_dial(
     let our_addr = swarm
         .listen_on_bound_addr()
         .map_err(|e| format!("listen failed: {e}"))?;
-    let initial_candidates = candidate_addrs(our_addr.transport(), &options.external_addrs);
+    println!("[{role}] bound={our_addr}");
+    println!("[{role}] us={}", swarm.local_peer_id());
+    println!("[{role}] target={target}");
+
+    let relay_peer_id = relay_addr.peer_id().clone();
+    let deadline = Instant::now() + LISTEN_DEADLINE;
+
+    // --- 1. Relay connection ready -----------------------------------------
+    prepare_relay(&mut swarm, role, &relay_addr, &relay_peer_id, deadline)?;
+
+    let initial_candidates = candidate_addrs(
+        role,
+        our_addr.transport(),
+        &options.external_addrs,
+        relay_observed_addr(&swarm, &relay_peer_id, role),
+    );
     let our_observed = validate_candidates_with_autonat(
         &mut swarm,
         role,
@@ -432,21 +451,7 @@ pub fn run_dial(
         &initial_candidates,
         Instant::now() + AUTONAT_CLIENT_DEADLINE,
     )?;
-    println!("[{role}] bound={our_addr}");
-    println!("[{role}] us={}", swarm.local_peer_id());
-    println!("[{role}] target={target}");
     print_candidates(role, &our_observed);
-
-    let relay_peer_id = relay_addr.peer_id().clone();
-    swarm
-        .dial(&relay_addr)
-        .map_err(|e| format!("dial relay: {e}"))?;
-    println!("[{role}] dialing-relay {relay_addr}");
-
-    let deadline = Instant::now() + LISTEN_DEADLINE;
-
-    // --- 1. Relay connection established -----------------------------------
-    wait_connected(&mut swarm, role, &relay_peer_id, deadline)?;
 
     // --- 2. HOP CONNECT to `target` through the relay ----------------------
     let hop_stream = swarm
@@ -691,6 +696,107 @@ fn handle_autonat_request(
 // Small helpers
 // ---------------------------------------------------------------------------
 
+fn prepare_relay(
+    swarm: &mut Swarm<QuicTransport>,
+    role: &str,
+    relay_addr: &PeerAddr,
+    relay_peer_id: &PeerId,
+    deadline: Instant,
+) -> Result<(), Box<dyn Error>> {
+    let mut last_protocols = Vec::new();
+    for attempt in 1..=RELAY_READY_ATTEMPTS {
+        swarm
+            .dial(relay_addr)
+            .map_err(|e| format!("dial relay attempt {attempt}: {e}"))?;
+        println!("[{role}] dialing-relay attempt={attempt} {relay_addr}");
+
+        let attempt_deadline =
+            earlier_deadline(Instant::now() + RELAY_READY_ATTEMPT_DEADLINE, deadline);
+        let protocols =
+            wait_relay_protocols_after_dial(swarm, role, relay_peer_id, attempt_deadline)?;
+        let has_hop = protocols.iter().any(|p| p == HOP_PROTOCOL_ID);
+        println!(
+            "[{role}] relay-ready attempt={attempt} hop={has_hop} protocols=[{}]",
+            protocols.join(",")
+        );
+        if has_hop {
+            return Ok(());
+        }
+
+        last_protocols = protocols;
+        eprintln!(
+            "[{role}] relay-hop-not-advertised attempt={attempt}; retrying after relay readiness backoff"
+        );
+        retry_relay_connection(swarm, role, relay_peer_id)?;
+    }
+
+    Err(format!(
+        "relay did not advertise {HOP_PROTOCOL_ID} after {RELAY_READY_ATTEMPTS} attempts; advertised=[{}]",
+        last_protocols.join(",")
+    )
+    .into())
+}
+
+fn wait_relay_protocols_after_dial(
+    swarm: &mut Swarm<QuicTransport>,
+    role: &str,
+    peer_id: &PeerId,
+    deadline: Instant,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let ev = swarm
+        .run_until(deadline, |ev| {
+            if !is_benign_retry_close_error(ev) {
+                print_event(role, ev);
+            }
+            matches!(ev, SwarmEvent::IdentifyReceived { peer_id: p, .. } if p == peer_id)
+                || matches!(ev, SwarmEvent::PeerReady { peer_id: p, .. } if p == peer_id)
+        })
+        .map_err(|e| format!("wait-relay-protocols: {e}"))?
+        .ok_or_else(|| {
+            format!("deadline exceeded before relay peer {peer_id} advertised protocols")
+        })?;
+
+    match ev {
+        SwarmEvent::IdentifyReceived { info, .. } => Ok(info.protocols),
+        SwarmEvent::PeerReady { protocols, .. } => Ok(protocols),
+        _ => unreachable!(),
+    }
+}
+
+fn retry_relay_connection(
+    swarm: &mut Swarm<QuicTransport>,
+    role: &str,
+    relay_peer_id: &PeerId,
+) -> Result<(), Box<dyn Error>> {
+    if let Err(e) = swarm.disconnect(relay_peer_id) {
+        eprintln!("[{role}] relay-disconnect-for-retry failed: {e}");
+    }
+
+    let retry_deadline = Instant::now() + RELAY_READY_RETRY_BACKOFF;
+    let _ = swarm
+        .run_until(retry_deadline, |ev| {
+            if !is_benign_retry_close_error(ev) {
+                print_event(role, ev);
+            }
+            false
+        })
+        .map_err(|e| format!("relay retry drain: {e}"))?;
+    Ok(())
+}
+
+fn is_benign_retry_close_error(ev: &SwarmEvent) -> bool {
+    matches!(
+        ev,
+        SwarmEvent::Error(error)
+            if error.detail.contains("close on connection")
+                && error.detail.contains("close error: Done")
+    )
+}
+
+fn earlier_deadline(a: Instant, b: Instant) -> Instant {
+    if a <= b { a } else { b }
+}
+
 /// Wait for `ConnectionEstablished` with `peer_id`.
 fn wait_connected(
     swarm: &mut Swarm<QuicTransport>,
@@ -726,12 +832,29 @@ fn wait_user_stream_ready(
                     initiated_locally: true,
                     ..
                 } if *s == stream_id
+            ) || matches!(
+                ev,
+                SwarmEvent::UserStreamClosed { stream_id: s, .. } if *s == stream_id
+            ) || matches!(
+                ev,
+                SwarmEvent::Error(error)
+                    if error.detail.contains(&format!("stream {stream_id}"))
             )
         })
         .map_err(|e| format!("wait-user-stream-ready: {e}"))?;
-    found
-        .map(|_| ())
-        .ok_or_else(|| format!("deadline exceeded before stream {stream_id} ready").into())
+    match found {
+        Some(SwarmEvent::UserStreamReady { .. }) => Ok(()),
+        Some(SwarmEvent::UserStreamClosed { .. }) => {
+            Err(format!("stream {stream_id} closed before becoming ready").into())
+        }
+        Some(SwarmEvent::Error(error)) => Err(format!(
+            "stream {stream_id} failed before becoming ready: {:?}: {}",
+            error.kind, error.detail
+        )
+        .into()),
+        Some(_) => unreachable!(),
+        None => Err(format!("deadline exceeded before stream {stream_id} ready").into()),
+    }
 }
 
 /// Wait for an inbound (remotely-initiated) user stream for `protocol_id`
@@ -965,13 +1088,71 @@ fn merge_dialback_results(
     }
 }
 
-fn candidate_addrs(bound_addr: &Multiaddr, external_addrs: &[Multiaddr]) -> Vec<Multiaddr> {
-    let mut candidates = Vec::with_capacity(external_addrs.len() + 1);
+fn candidate_addrs(
+    role: &str,
+    bound_addr: &Multiaddr,
+    external_addrs: &[Multiaddr],
+    observed_addr: Option<Multiaddr>,
+) -> Vec<Multiaddr> {
+    let mut candidates = Vec::with_capacity(external_addrs.len() + 2);
     for addr in external_addrs {
-        push_unique(&mut candidates, addr.clone());
+        push_candidate(role, &mut candidates, "manual", addr.clone());
     }
-    push_unique(&mut candidates, bound_addr.clone());
+    if let Some(addr) = observed_addr {
+        push_candidate(role, &mut candidates, "identify-observed", addr);
+    }
+    push_candidate(role, &mut candidates, "listen", bound_addr.clone());
+    if candidates.is_empty() {
+        eprintln!(
+            "[{role}] no-dialable-dcutr-candidates; add --external-addr or bind a non-wildcard address"
+        );
+    }
     candidates
+}
+
+fn push_candidate(role: &str, candidates: &mut Vec<Multiaddr>, source: &str, addr: Multiaddr) {
+    if is_wildcard_addr(&addr) {
+        println!(
+            "[{role}] candidate-skipped source={source} addr={addr} reason=wildcard-bind-address"
+        );
+        return;
+    }
+    if !addr.is_quic_transport() {
+        println!(
+            "[{role}] candidate-skipped source={source} addr={addr} reason=not-quic-transport"
+        );
+        return;
+    }
+    let before = candidates.len();
+    push_unique(candidates, addr.clone());
+    if candidates.len() > before {
+        println!("[{role}] candidate-added source={source} addr={addr}");
+    }
+}
+
+fn is_wildcard_addr(addr: &Multiaddr) -> bool {
+    match addr.protocols().first() {
+        Some(Protocol::Ip4(bytes)) => *bytes == [0, 0, 0, 0],
+        Some(Protocol::Ip6(bytes)) => *bytes == [0; 16],
+        _ => false,
+    }
+}
+
+fn relay_observed_addr(
+    swarm: &Swarm<QuicTransport>,
+    relay_peer_id: &PeerId,
+    role: &str,
+) -> Option<Multiaddr> {
+    let raw = swarm.peer_info(relay_peer_id)?.observed_addr.as_deref()?;
+    match Multiaddr::from_bytes(raw) {
+        Ok(addr) => Some(addr),
+        Err(e) => {
+            eprintln!(
+                "[{role}] candidate-skipped source=identify-observed reason=parse-failed error={e}"
+            );
+            None
+        }
+    }
 }
 
 fn validate_candidates_with_autonat(
@@ -1112,6 +1293,31 @@ mod tests {
         assert_eq!(dialback_bind_addrs(&dns4), &["0.0.0.0:0"]);
         assert_eq!(dialback_bind_addrs(&ip6), &["[::]:0"]);
         assert_eq!(dialback_bind_addrs(&dns6), &["[::]:0"]);
+    }
+
+    #[test]
+    fn candidate_addrs_filters_wildcard_bind_addresses() {
+        let bound = Multiaddr::from_str("/ip4/0.0.0.0/udp/4001/quic-v1").unwrap();
+        let external = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
+        let observed = Multiaddr::from_str("/ip4/198.51.100.9/udp/5001/quic-v1").unwrap();
+
+        let candidates = candidate_addrs(
+            "test",
+            &bound,
+            core::slice::from_ref(&external),
+            Some(observed.clone()),
+        );
+
+        assert_eq!(candidates, vec![external, observed]);
+    }
+
+    #[test]
+    fn candidate_addrs_keeps_non_wildcard_listen_address() {
+        let bound = Multiaddr::from_str("/ip4/127.0.0.1/udp/4001/quic-v1").unwrap();
+
+        let candidates = candidate_addrs("test", &bound, &[], None);
+
+        assert_eq!(candidates, vec![bound]);
     }
 
     #[test]

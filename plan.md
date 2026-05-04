@@ -189,9 +189,12 @@ New crate: `crates/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 - [x] Public relay walkthrough using rust-libp2p's relay server: relay command, listener command, dialer command, expected `ping-direct` and `ping-via-relay` output.
 - [x] Diagnostics for real-world NAT runs: print observed relay address, advertised DCUtR candidates, direct dial attempts, direct failure reason, and fallback reason.
 - [x] AutoNAT reachability probe support with `minip2p-autonat` (`no_std + alloc`, Sans-I/O), `minip2p-peer autonat`, and relay-mode `--autonat <peer-addr>` validation.
+- [x] Manual VPS validation against rust-libp2p relay: HOP reservation, STOP circuit, DCUtR exchange, and `ping-via-relay` fallback work.
+- [x] Relay readiness retry for rust-libp2p relay startup: wait for fresh Identify/PeerReady protocol advertisement and retry until HOP is advertised.
+- [ ] Direct `ping-direct` candidate discovery: filter wildcard bind addresses, use parseable Identify observed addresses, support `/quic` vs `/quic-v1` observed-address interop if rust-libp2p reports legacy `/quic`, and keep `--external-addr` as the explicit override.
 
 **Exit criteria**
-- Two peers on different networks can rendezvous through a public relay, attempt DCUtR, authenticate direct QUIC with mTLS, and either `ping-direct` or fall back to `ping-via-relay` with actionable logs.
+- Two peers on different networks can rendezvous through a public relay, attempt DCUtR, authenticate direct QUIC with mTLS, and either `ping-direct` with dialable candidates or fall back to `ping-via-relay` with actionable logs.
 
 ### Milestone 8: Additional transports and operational polish
 
