@@ -16,7 +16,8 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 ///
 /// ## Connection lifecycle
 ///
-/// - `dial()` returns `Ok` before any events for that connection are emitted.
+/// - `dial()` returns the allocated connection id before any events for that
+///   connection are emitted.
 /// - A dialed connection emits `Connected` exactly once after the handshake
 ///   completes. No stream events may precede `Connected`.
 /// - An incoming connection emits `IncomingConnection` before `Connected`.
@@ -44,12 +45,13 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 /// - Events across different connections have no ordering guarantee.
 /// - `poll()` never blocks. It returns an empty vec when idle.
 pub trait Transport {
-    /// Initiate an outbound connection.
+    /// Initiate an outbound connection and return its allocated connection id.
     ///
-    /// The caller provides the `id`; the transport must reject duplicates with
-    /// `ConnectionExists`. The connection is not usable until `Connected` is
-    /// emitted from `poll()`.
-    fn dial(&mut self, id: ConnectionId, addr: &PeerAddr) -> Result<(), TransportError>;
+    /// The transport owns connection-id allocation for both inbound and
+    /// outbound connections, so adapters can avoid collisions between accepted
+    /// connections and later dials. The connection is not usable until
+    /// `Connected` is emitted from `poll()`.
+    fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError>;
 
     /// Start listening for inbound connections on the given address.
     ///

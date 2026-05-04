@@ -28,6 +28,18 @@ fn drive_pair(
     (server_events, client_events)
 }
 
+fn drive_three(
+    a: &mut Swarm<QuicTransport>,
+    b: &mut Swarm<QuicTransport>,
+    c: &mut Swarm<QuicTransport>,
+) -> (Vec<SwarmEvent>, Vec<SwarmEvent>, Vec<SwarmEvent>) {
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let a_events = a.poll().expect("a poll");
+    let b_events = b.poll().expect("b poll");
+    let c_events = c.poll().expect("c poll");
+    (a_events, b_events, c_events)
+}
+
 #[test]
 fn swarm_ping_roundtrip_with_auto_identify() {
     // Set up server.
@@ -112,6 +124,61 @@ fn swarm_ping_roundtrip_with_auto_identify() {
     assert!(client_identified, "client should receive identify");
     assert!(client_ready, "client should become ready");
     assert!(rtt_measured, "ping RTT should be measured");
+}
+
+#[test]
+fn inbound_connection_does_not_collide_with_later_outbound_dial() {
+    let mut inbound_peer = make_swarm(Ed25519Keypair::generate());
+    let mut middle = make_swarm(Ed25519Keypair::generate());
+    let mut outbound_peer = make_swarm(Ed25519Keypair::generate());
+
+    let middle_addr = middle.listen_on_bound_addr().expect("middle listen");
+    let middle_peer_id = middle_addr.peer_id().clone();
+    let outbound_addr = outbound_peer
+        .listen_on_bound_addr()
+        .expect("outbound listen");
+    let outbound_peer_id = outbound_addr.peer_id().clone();
+
+    inbound_peer.dial(&middle_addr).expect("inbound dial");
+
+    let mut middle_saw_inbound = false;
+    for _ in 0..500 {
+        let (inbound_events, middle_events, _outbound_events) =
+            drive_three(&mut inbound_peer, &mut middle, &mut outbound_peer);
+
+        let inbound_connected = inbound_events.iter().any(
+            |event| matches!(event, SwarmEvent::ConnectionEstablished { peer_id } if peer_id == &middle_peer_id),
+        );
+        middle_saw_inbound |= middle_events
+            .iter()
+            .any(|event| matches!(event, SwarmEvent::ConnectionEstablished { .. }));
+
+        if inbound_connected && middle_saw_inbound {
+            break;
+        }
+    }
+
+    assert!(
+        middle_saw_inbound,
+        "middle should accept inbound connection"
+    );
+
+    middle
+        .dial(&outbound_addr)
+        .expect("later outbound dial must not collide with inbound connection id");
+
+    for _ in 0..500 {
+        let (_inbound_events, middle_events, _outbound_events) =
+            drive_three(&mut inbound_peer, &mut middle, &mut outbound_peer);
+
+        if middle_events.iter().any(
+            |event| matches!(event, SwarmEvent::ConnectionEstablished { peer_id } if peer_id == &outbound_peer_id),
+        ) {
+            return;
+        }
+    }
+
+    panic!("middle should connect to outbound peer after accepting inbound connection");
 }
 
 const USER_PROTOCOL_ID: &str = "/minip2p/test/echo/1.0.0";
