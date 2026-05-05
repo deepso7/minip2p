@@ -366,9 +366,7 @@ impl QuicTransport {
 
     /// Dials a peer, automatically allocating a connection id.
     pub fn dial_auto(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
-        let id = self.allocate_connection_id()?;
-        self.dial(id, addr)?;
-        Ok(id)
+        self.dial(addr)
     }
 
     /// Returns all active connection ids for the given peer.
@@ -477,11 +475,8 @@ impl QuicTransport {
 }
 
 impl Transport for QuicTransport {
-    fn dial(&mut self, id: ConnectionId, addr: &PeerAddr) -> Result<(), TransportError> {
-        if self.connections.contains_key(&id) {
-            return Err(TransportError::ConnectionExists { id });
-        }
-
+    fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+        let id = self.allocate_connection_id()?;
         let peer_socket = resolve_dial_socket_addr(addr.transport(), "dial target")?;
         let local_socket = self.local_addr()?;
 
@@ -538,7 +533,7 @@ impl Transport for QuicTransport {
         self.cid_to_connection.insert(source_cid, id);
         self.index_peer_connection(addr.peer_id().clone(), id);
 
-        Ok(())
+        Ok(id)
     }
 
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
@@ -642,6 +637,14 @@ impl Transport for QuicTransport {
     fn active_connection_sources(&self) -> Vec<Multiaddr> {
         self.connections
             .values()
+            .map(|conn| conn.endpoint().transport().clone())
+            .collect()
+    }
+
+    fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
+        self.connections
+            .values()
+            .filter(|conn| conn.is_server())
             .map(|conn| conn.endpoint().transport().clone())
             .collect()
     }

@@ -8,11 +8,16 @@
 
 extern crate alloc;
 
+mod candidates;
 mod error;
 mod multiaddr;
 mod peer_addr;
 mod protocol;
 
+pub use candidates::{
+    DirectCandidate, DirectCandidateRejectReason, DirectCandidateRejection,
+    DirectCandidateSelection, DirectCandidateSource, is_wildcard_addr, select_direct_candidates,
+};
 pub use error::{MultiaddrError, PeerAddrError};
 pub use minip2p_identity::PeerId;
 pub use minip2p_identity::{VarintError, read_uvarint, uvarint_len, write_uvarint};

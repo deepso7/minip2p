@@ -56,7 +56,7 @@ impl Clock for SystemClock {
 /// Thin std driver wrapping [`SwarmCore`] and a concrete [`Transport`].
 ///
 /// Preserves the one-call DX built on top of the core:
-/// - `dial(addr) -> ConnectionId` auto-allocates the connection id.
+/// - `dial(addr) -> ConnectionId` delegates connection-id allocation to the transport.
 /// - `poll()` reads the wall clock internally; callers need not thread
 ///   `now_ms` through every call.
 /// - `ping(peer)` opens a ping stream if needed and fires the payload as
@@ -75,8 +75,6 @@ pub struct Swarm<T: Transport> {
     /// when the buffer drains.
     event_buffer: VecDeque<SwarmEvent>,
 
-    /// Auto-incrementing connection-id counter for outbound dials.
-    next_connection_id: u64,
     /// Logical clock used to drive Sans-I/O timers.
     clock: Arc<dyn Clock>,
 }
@@ -119,7 +117,6 @@ impl<T: Transport> Swarm<T> {
             core: SwarmCore::new(identify_config, ping_config),
             local_peer_id,
             event_buffer: VecDeque::new(),
-            next_connection_id: 1,
             clock,
         }
     }
@@ -194,10 +191,9 @@ impl<T: Transport> Swarm<T> {
         })
     }
 
-    /// Dial a remote peer. Swarm auto-allocates a connection id.
+    /// Dial a remote peer. The transport allocates the connection id.
     pub fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
-        let id = self.allocate_connection_id();
-        self.transport.dial(id, addr)?;
+        let id = self.transport.dial(addr)?;
         self.core.on_dialed(id);
         Ok(id)
     }
@@ -397,16 +393,6 @@ impl<T: Transport> Swarm<T> {
 
     fn now_ms(&self) -> u64 {
         self.clock.now_ms()
-    }
-
-    fn allocate_connection_id(&mut self) -> ConnectionId {
-        loop {
-            let raw = self.next_connection_id;
-            self.next_connection_id = self.next_connection_id.wrapping_add(1);
-            if raw != 0 {
-                return ConnectionId::new(raw);
-            }
-        }
     }
 
     /// Drains all actions from the core and dispatches each to the

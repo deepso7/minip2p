@@ -403,7 +403,10 @@ mod tests {
             0xCC, 0x03, // quic
         ])
         .unwrap_err();
-        assert!(matches!(err, MultiaddrError::UnknownProtocolCode { code: 0x01cc }));
+        assert!(matches!(
+            err,
+            MultiaddrError::UnknownProtocolCode { code: 0x01cc }
+        ));
     }
 
     #[test]

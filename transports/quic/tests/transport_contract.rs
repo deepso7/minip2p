@@ -44,8 +44,7 @@ fn connect_pair(
     Vec<TransportEvent>,
     Vec<TransportEvent>,
 ) {
-    let client_conn = ConnectionId::new(1);
-    client.dial(client_conn, peer_addr).expect("dial");
+    let client_conn = client.dial(peer_addr).expect("dial");
 
     let mut all_server_events = Vec::new();
     let mut all_client_events = Vec::new();
@@ -180,17 +179,14 @@ fn no_stream_events_before_connected() {
 }
 
 #[test]
-fn dial_with_duplicate_id_returns_connection_exists() {
+fn outbound_dial_allocates_unique_ids() {
     let (mut server, mut client, peer_addr) = setup_pair();
-    let id = ConnectionId::new(42);
-    client.dial(id, &peer_addr).expect("first dial");
+    let first = client.dial(&peer_addr).expect("first dial");
+    let second = client.dial(&peer_addr).expect("second dial");
 
-    let err = client
-        .dial(id, &peer_addr)
-        .expect_err("duplicate must fail");
-    assert!(
-        matches!(err, TransportError::ConnectionExists { .. }),
-        "expected ConnectionExists, got {err:?}"
+    assert_ne!(
+        first, second,
+        "transport must allocate unique connection ids"
     );
 
     // Drive to avoid dangling state.
