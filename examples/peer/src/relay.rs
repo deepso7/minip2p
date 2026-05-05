@@ -214,7 +214,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     // Initial may have arrived BEFORE we observed the SYNC message on
     // a tight local loopback). Only counts if the source matches.
     let mut saw_inbound_conn = any_source_matches(
-        &swarm.transport().active_connection_sources(),
+        &swarm.transport().active_inbound_connection_sources(),
         &remote_match_targets,
     );
 
@@ -253,7 +253,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         // NOT trigger this because their source address won't match
         // `remote_match_targets`.
         if any_source_matches(
-            &swarm.transport().active_connection_sources(),
+            &swarm.transport().active_inbound_connection_sources(),
             &remote_match_targets,
         ) {
             saw_inbound_conn = true;
@@ -292,8 +292,8 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
                     ping_and_exit(&mut swarm, role, peer_id, deadline)
                 }
                 _ => {
-                    println!("[{role}] grace-elapsed before mTLS identity -- done");
-                    Ok(())
+                    println!("[{role}] grace-elapsed before mTLS identity -> relay-ping fallback");
+                    relay_ping_fallback(&mut swarm, role, &relay_peer_id, bridge_stream)
                 }
             }
         }
@@ -309,33 +309,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         }
         HolePunchOutcome::Timeout => {
             println!("[{role}] hole-punch-timeout reason=deadline elapsed -> relay-ping fallback");
-            // Wait up to ~15s for either an echo payload from Peer A
-            // or the bridge to close (meaning A gave up). Longer
-            // than the hole-punch deadline because the relay's own
-            // idle-circuit GC can take several seconds -- but bounded
-            // so we don't hang forever if something goes wrong.
-            let fallback_deadline = Instant::now() + Duration::from_secs(15);
-            let ev = swarm
-                .run_until(fallback_deadline, |ev| {
-                    print_event(role, ev);
-                    matches!(
-                        ev,
-                        SwarmEvent::UserStreamData { stream_id: s, .. } if *s == bridge_stream
-                    ) || is_bridge_closed_event(ev, bridge_stream)
-                })
-                .map_err(|e| format!("fallback poll: {e}"))?;
-            match ev {
-                Some(SwarmEvent::UserStreamData { data, .. }) => {
-                    send(&mut swarm, &relay_peer_id, bridge_stream, data)?;
-                    println!("[{role}] relay-ping-echoed -- done");
-                    Ok(())
-                }
-                Some(_) => {
-                    println!("[{role}] bridge-closed during fallback -- done");
-                    Ok(())
-                }
-                None => Err("fallback deadline exceeded before any bridge activity".into()),
-            }
+            relay_ping_fallback(&mut swarm, role, &relay_peer_id, bridge_stream)
         }
     }
 }
@@ -958,6 +932,41 @@ fn dial_direct_candidates(
             },
             Err(e) => eprintln!("[{role}] bad PeerAddr for {addr}: {e}"),
         }
+    }
+}
+
+fn relay_ping_fallback(
+    swarm: &mut Swarm<QuicTransport>,
+    role: &str,
+    relay_peer_id: &PeerId,
+    bridge_stream: StreamId,
+) -> Result<(), Box<dyn Error>> {
+    // Wait up to ~15s for either an echo payload from Peer A or the bridge to
+    // close (meaning A gave up). Longer than the hole-punch deadline because
+    // the relay's own idle-circuit GC can take several seconds -- but bounded
+    // so we don't hang forever if something goes wrong.
+    let fallback_deadline = Instant::now() + Duration::from_secs(15);
+    let ev = swarm
+        .run_until(fallback_deadline, |ev| {
+            print_event(role, ev);
+            matches!(
+                ev,
+                SwarmEvent::UserStreamData { stream_id: s, .. } if *s == bridge_stream
+            ) || is_bridge_closed_event(ev, bridge_stream)
+        })
+        .map_err(|e| format!("fallback poll: {e}"))?;
+
+    match ev {
+        Some(SwarmEvent::UserStreamData { data, .. }) => {
+            send(swarm, relay_peer_id, bridge_stream, data)?;
+            println!("[{role}] relay-ping-echoed -- done");
+            Ok(())
+        }
+        Some(_) => {
+            println!("[{role}] bridge-closed during fallback -- done");
+            Ok(())
+        }
+        None => Err("fallback deadline exceeded before any bridge activity".into()),
     }
 }
 

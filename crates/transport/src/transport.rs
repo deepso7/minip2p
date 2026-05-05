@@ -152,4 +152,15 @@ pub trait Transport {
     fn active_connection_sources(&self) -> Vec<Multiaddr> {
         Vec::new()
     }
+
+    /// Returns the remote transport address for every active inbound/accepted
+    /// connection (pre-`Closed`).
+    ///
+    /// Unlike [`active_connection_sources`](Transport::active_connection_sources),
+    /// this intentionally excludes outbound dials. Hole-punch responders use it
+    /// to distinguish a real inbound packet from their own simultaneous direct
+    /// dial attempt.
+    fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
+        Vec::new()
+    }
 }
