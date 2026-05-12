@@ -1,6 +1,6 @@
 # minip2p
 
-A minimal, educational [libp2p](https://libp2p.io/) implementation in Rust.
+A minimal [libp2p](https://libp2p.io/) implementation in Rust, built with Sans-I/O architecture, `no_std`-friendly core crates, and clear developer experience.
 
 The project is built around four non-negotiables:
 
