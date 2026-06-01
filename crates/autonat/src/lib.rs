@@ -674,6 +674,7 @@ fn read_varint_value(input: &[u8], idx: &mut usize) -> Result<u64, AutoNatError>
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
     use core::str::FromStr;
 
     use super::*;

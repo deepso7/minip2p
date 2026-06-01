@@ -23,8 +23,8 @@ minip2p-identity = { path = "../identity", default-features = false, features = 
 minip2p-multistream-select = { path = "../multistream-select", default-features = false }
 minip2p-ping = { path = "../ping", default-features = false }
 minip2p-transport = { path = "../transport", default-features = false }
-thiserror = { version = "2", default-features = false }
-getrandom = { version = "0.4", optional = true }
+thiserror = { version = "2.0.18", default-features = false }
+getrandom = { version = "0.4.2", optional = true }
 
 [dev-dependencies]
 minip2p-relay = { path = "../relay" }

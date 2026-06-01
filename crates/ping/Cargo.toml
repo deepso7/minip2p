@@ -15,4 +15,4 @@ std = [
 [dependencies]
 minip2p-core = { path = "../core", default-features = false }
 minip2p-transport = { path = "../transport", default-features = false }
-thiserror = { version = "2", default-features = false }
+thiserror = { version = "2.0.18", default-features = false }

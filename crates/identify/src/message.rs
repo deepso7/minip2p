@@ -267,6 +267,8 @@ fn read_len_delimited<'a>(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
 
     #[test]
