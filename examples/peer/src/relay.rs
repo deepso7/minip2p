@@ -55,6 +55,7 @@ const RESPONDER_SYNC_DELAY: Duration = Duration::from_millis(50);
 /// Payload length used by the relay-ping fallback.
 const RELAY_PING_LEN: usize = 32;
 const AUTONAT_CLIENT_DEADLINE: Duration = Duration::from_secs(20);
+const AUTONAT_IDENTIFY_GRACE: Duration = Duration::from_secs(2);
 const AUTONAT_REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 // Client deadline must absorb candidate_count * binds_per_candidate * dialback
 // deadline. Generic /dns candidates may try two bind families; /ip4, /ip6,
@@ -1192,7 +1193,15 @@ fn relay_observed_addr(
     relay_peer_id: &PeerId,
     role: &str,
 ) -> Option<Multiaddr> {
-    let raw = swarm.peer_info(relay_peer_id)?.observed_addr.as_deref()?;
+    observed_addr_from_peer(swarm, relay_peer_id, role)
+}
+
+fn observed_addr_from_peer(
+    swarm: &Swarm<QuicTransport>,
+    peer_id: &PeerId,
+    role: &str,
+) -> Option<Multiaddr> {
+    let raw = swarm.peer_info(peer_id)?.observed_addr.as_deref()?;
     match Multiaddr::from_bytes(raw) {
         Ok(addr) => Some(addr),
         Err(e) => {
@@ -1202,6 +1211,27 @@ fn relay_observed_addr(
             None
         }
     }
+}
+
+fn wait_observed_addr_from_peer(
+    swarm: &mut Swarm<QuicTransport>,
+    role: &str,
+    peer_id: &PeerId,
+    deadline: Instant,
+) -> Result<Option<Multiaddr>, Box<dyn Error>> {
+    if let Some(addr) = observed_addr_from_peer(swarm, peer_id, role) {
+        return Ok(Some(addr));
+    }
+
+    let _ = swarm
+        .run_until(deadline, |ev| {
+            print_event(role, ev);
+            matches!(ev, SwarmEvent::IdentifyReceived { peer_id: p, .. } if p == peer_id)
+                || matches!(ev, SwarmEvent::PeerReady { peer_id: p, .. } if p == peer_id)
+        })
+        .map_err(|e| format!("wait-observed-addr: {e}"))?;
+
+    Ok(observed_addr_from_peer(swarm, peer_id, role))
 }
 
 fn validate_candidates_with_autonat(
@@ -1222,13 +1252,24 @@ fn validate_candidates_with_autonat(
     println!("[{role}] autonat-dialing {service}");
     wait_connected(swarm, role, &service_peer, deadline)?;
 
+    let mut probe_candidates = candidates.to_vec();
+    let identify_deadline = earlier_deadline(Instant::now() + AUTONAT_IDENTIFY_GRACE, deadline);
+    if let Some(addr) = wait_observed_addr_from_peer(swarm, role, &service_peer, identify_deadline)?
+    {
+        let before = probe_candidates.len();
+        push_unique(&mut probe_candidates, addr.clone());
+        if probe_candidates.len() > before {
+            println!("[{role}] autonat-candidate-added source=identify-observed addr={addr}");
+        }
+    }
+
     let stream_id = swarm
         .open_user_stream(&service_peer, AUTONAT_PROTOCOL_ID)
         .map_err(|e| format!("open AutoNAT stream: {e}"))?;
     wait_user_stream_ready(swarm, role, stream_id, deadline)?;
 
     let local_peer = swarm.local_peer_id().clone();
-    let mut client = AutoNatClient::new(&local_peer, candidates);
+    let mut client = AutoNatClient::new(&local_peer, &probe_candidates);
     send(swarm, &service_peer, stream_id, client.take_outbound())?;
 
     while client.outcome().is_none() {
@@ -1248,7 +1289,7 @@ fn validate_candidates_with_autonat(
                 );
             }
             println!("[{role}] autonat-public addrs={}", addrs.len());
-            let successful = successful_candidates_in_original_order(candidates, &addrs);
+            let successful = successful_candidates_in_original_order(&probe_candidates, &addrs);
             for addr in &successful {
                 swarm.confirm_external_address(ExternalAddressSource::AutoNat, addr.clone());
             }
@@ -1256,11 +1297,11 @@ fn validate_candidates_with_autonat(
         }
         Reachability::Private { status, reason } => {
             println!("[{role}] autonat-private status={status:?} reason={reason}");
-            Ok(candidates.to_vec())
+            Ok(probe_candidates)
         }
         Reachability::Unknown { status, reason } => {
             println!("[{role}] autonat-unknown status={status:?} reason={reason}");
-            Ok(candidates.to_vec())
+            Ok(probe_candidates)
         }
     }
 }
