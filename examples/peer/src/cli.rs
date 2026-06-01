@@ -336,6 +336,24 @@ pub fn print_event(role: &str, event: &SwarmEvent) {
                 protocol_list
             );
         }
+        SwarmEvent::ExternalAddrCandidate { source, address } => {
+            println!(
+                "[{role}] external-addr-candidate source={} addr={address}",
+                source.as_str()
+            );
+        }
+        SwarmEvent::ExternalAddrConfirmed { source, address } => {
+            println!(
+                "[{role}] external-addr-confirmed source={} addr={address}",
+                source.as_str()
+            );
+        }
+        SwarmEvent::ExternalAddrExpired { source, address } => {
+            println!(
+                "[{role}] external-addr-expired source={} addr={address}",
+                source.as_str()
+            );
+        }
         SwarmEvent::PingRttMeasured { peer_id, rtt_ms } => {
             println!("[{role}] ping peer={peer_id} rtt={rtt_ms}ms");
         }

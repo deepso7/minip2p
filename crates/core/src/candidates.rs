@@ -5,8 +5,8 @@ use crate::{Multiaddr, Protocol};
 /// Where a direct-connect candidate came from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirectCandidateSource {
-    /// User-supplied explicit public address.
-    Manual,
+    /// Confirmed local external address.
+    ConfirmedExternal,
     /// Address observed by a public peer through Identify.
     IdentifyObserved,
     /// Local non-wildcard listen address.
@@ -17,7 +17,7 @@ impl DirectCandidateSource {
     /// Stable text for logs and diagnostics.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Manual => "manual",
+            Self::ConfirmedExternal => "confirmed-external",
             Self::IdentifyObserved => "identify-observed",
             Self::Listen => "listen",
         }
@@ -86,7 +86,7 @@ impl DirectCandidateSelection {
 /// Selects dialable direct-connect candidates in deterministic priority order.
 ///
 /// Priority is:
-/// 1. manual external addresses,
+/// 1. confirmed external addresses,
 /// 2. Identify observed address,
 /// 3. local non-wildcard listen address.
 ///
@@ -94,18 +94,23 @@ impl DirectCandidateSelection {
 /// logging, timing, or transport side effects. It intentionally accepts only
 /// strict QUIC-v1 transport addresses (`/<host>/udp/<port>/quic-v1`).
 pub fn select_direct_candidates(
-    manual: &[Multiaddr],
+    external: &[Multiaddr],
     identify_observed: Option<Multiaddr>,
     listen: Option<Multiaddr>,
 ) -> DirectCandidateSelection {
-    let capacity = manual.len() + identify_observed.is_some() as usize + listen.is_some() as usize;
+    let capacity =
+        external.len() + identify_observed.is_some() as usize + listen.is_some() as usize;
     let mut selection = DirectCandidateSelection {
         accepted: Vec::with_capacity(capacity),
         rejected: Vec::new(),
     };
 
-    for addr in manual {
-        push_candidate(&mut selection, DirectCandidateSource::Manual, addr.clone());
+    for addr in external {
+        push_candidate(
+            &mut selection,
+            DirectCandidateSource::ConfirmedExternal,
+            addr.clone(),
+        );
     }
     if let Some(addr) = identify_observed {
         push_candidate(
@@ -206,7 +211,10 @@ mod tests {
         );
 
         assert_eq!(selected.accepted.len(), 3);
-        assert_eq!(selected.accepted[0].source, DirectCandidateSource::Manual);
+        assert_eq!(
+            selected.accepted[0].source,
+            DirectCandidateSource::ConfirmedExternal
+        );
         assert_eq!(selected.accepted[0].addr, manual);
         assert_eq!(
             selected.accepted[1].source,

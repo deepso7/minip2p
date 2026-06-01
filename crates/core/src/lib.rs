@@ -10,6 +10,7 @@ extern crate alloc;
 
 mod candidates;
 mod error;
+mod external_addresses;
 mod multiaddr;
 mod peer_addr;
 mod protocol;
@@ -19,6 +20,10 @@ pub use candidates::{
     DirectCandidateSelection, DirectCandidateSource, select_direct_candidates,
 };
 pub use error::{MultiaddrError, PeerAddrError};
+pub use external_addresses::{
+    ExternalAddress, ExternalAddressBook, ExternalAddressSource, ExternalAddressUpdate,
+    MAX_EXTERNAL_ADDRS,
+};
 pub use minip2p_identity::PeerId;
 pub use minip2p_identity::{VarintError, read_uvarint, uvarint_len, write_uvarint};
 pub use multiaddr::Multiaddr;

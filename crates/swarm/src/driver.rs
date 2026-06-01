@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId};
+use minip2p_core::{ExternalAddress, ExternalAddressSource, Multiaddr, PeerAddr, PeerId};
 use minip2p_identify::{IdentifyConfig, IdentifyMessage};
 use minip2p_ping::{PING_PAYLOAD_LEN, PingConfig};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
@@ -151,6 +151,16 @@ impl<T: Transport> Swarm<T> {
         self.core.is_peer_ready(peer_id)
     }
 
+    /// Returns confirmed external addresses in advertise/dial priority order.
+    pub fn external_addresses(&self) -> &[ExternalAddress] {
+        self.core.external_addresses()
+    }
+
+    /// Returns observed but unconfirmed external-address candidates.
+    pub fn external_address_candidates(&self) -> &[ExternalAddress] {
+        self.core.external_address_candidates()
+    }
+
     /// Returns this node's own `PeerId`.
     ///
     /// This accessor is infallible because the [`crate::SwarmBuilder`] requires
@@ -162,6 +172,25 @@ impl<T: Transport> Swarm<T> {
     /// Registers a user protocol id for inbound acceptance and outbound opens.
     pub fn add_user_protocol(&mut self, protocol_id: impl Into<String>) {
         self.core.add_user_protocol(protocol_id);
+    }
+
+    /// Adds a user-confirmed external address.
+    ///
+    /// This is the API equivalent of rust-libp2p's `add_external_address`:
+    /// callers should use it only when an address is known to be reachable,
+    /// such as an explicit public address supplied by the user.
+    pub fn add_external_address(&mut self, addr: Multiaddr) {
+        self.confirm_external_address(ExternalAddressSource::Manual, addr);
+    }
+
+    /// Confirms an external address from a specific discovery source.
+    pub fn confirm_external_address(&mut self, source: ExternalAddressSource, addr: Multiaddr) {
+        self.core.confirm_external_address(source, addr);
+    }
+
+    /// Removes a confirmed external address.
+    pub fn remove_external_address(&mut self, addr: &Multiaddr) {
+        self.core.remove_external_address(addr);
     }
 
     /// Start listening on the given multiaddr and return the resolved local address.

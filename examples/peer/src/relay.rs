@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use minip2p_autonat::{
     AUTONAT_PROTOCOL_ID, AutoNatClient, AutoNatServer, Reachability, ResponseStatus,
 };
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol, select_direct_candidates};
+use minip2p_core::{
+    ExternalAddressSource, Multiaddr, PeerAddr, PeerId, Protocol, select_direct_candidates,
+};
 use minip2p_dcutr::{
     DCUTR_PROTOCOL_ID, DcutrInitiator, DcutrResponder, InitiatorOutcome, ResponderEvent,
 };
@@ -41,11 +43,13 @@ const LISTEN_DEADLINE: Duration = Duration::from_secs(60);
 /// Hole-punch window after SYNC is received / sent.
 ///
 /// Direct dials succeed in milliseconds on LAN/loopback; real-world NATs may
-/// occasionally need longer but three seconds already works for the common-case
-/// symmetric-NAT traversal path.
-const HOLEPUNCH_DEADLINE: Duration = Duration::from_secs(3);
-/// UDP blast cadence (responder side) during hole-punch.
-const HOLEPUNCH_INTERVAL: Duration = Duration::from_millis(100);
+/// need longer because mapping creation and QUIC handshakes race through two
+/// consumer NATs.
+const HOLEPUNCH_DEADLINE: Duration = Duration::from_secs(10);
+/// Minimum UDP blast cadence during hole-punch.
+const HOLEPUNCH_INTERVAL_MIN_MS: u64 = 10;
+/// Maximum UDP blast cadence during hole-punch.
+const HOLEPUNCH_INTERVAL_MAX_MS: u64 = 200;
 /// Approximation of RTT/2 before the responder starts blasting UDP.
 const RESPONDER_SYNC_DELAY: Duration = Duration::from_millis(50);
 /// Payload length used by the relay-ping fallback.
@@ -68,6 +72,7 @@ const RELAY_READY_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<dyn Error>> {
     let role = "relay-listen";
     let mut swarm = build_swarm_with_relay_protocols(&options, role)?;
+    register_manual_external_addrs(&mut swarm, &options);
     let our_addr = swarm
         .listen_on_bound_addr()
         .map_err(|e| format!("listen failed: {e}"))?;
@@ -83,7 +88,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     let initial_candidates = candidate_addrs(
         role,
         our_addr.transport(),
-        &options.external_addrs,
+        &confirmed_external_addrs(&swarm),
         relay_observed_addr(&swarm, &relay_peer_id, role),
     );
     let our_observed = validate_candidates_with_autonat(
@@ -225,7 +230,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         }
         if now >= next_blast {
             blast_remote_addrs(&swarm, &remote_addrs, role);
-            next_blast = now + HOLEPUNCH_INTERVAL;
+            next_blast = now + next_holepunch_delay();
         }
 
         // Drain any events the transport has for us. Event ordering
@@ -400,6 +405,7 @@ pub fn run_dial(
 ) -> Result<(), Box<dyn Error>> {
     let role = "relay-dial";
     let mut swarm = build_swarm_with_relay_protocols(&options, role)?;
+    register_manual_external_addrs(&mut swarm, &options);
     let our_addr = swarm
         .listen_on_bound_addr()
         .map_err(|e| format!("listen failed: {e}"))?;
@@ -416,7 +422,7 @@ pub fn run_dial(
     let initial_candidates = candidate_addrs(
         role,
         our_addr.transport(),
-        &options.external_addrs,
+        &confirmed_external_addrs(&swarm),
         relay_observed_addr(&swarm, &relay_peer_id, role),
     );
     let our_observed = validate_candidates_with_autonat(
@@ -509,20 +515,16 @@ pub fn run_dial(
     dial_direct_candidates(&mut swarm, role, &target, &remote_addrs);
 
     // --- 5. Wait for direct connection or hole-punch timeout ---------------
-    let punch_deadline = Instant::now() + HOLEPUNCH_DEADLINE;
-    let punched = swarm
-        .run_until(punch_deadline, |ev| {
-            print_event(role, ev);
-            matches!(
-                ev,
-                SwarmEvent::ConnectionEstablished { peer_id }
-                    if peer_id == &target
-            )
-        })
-        .map_err(|e| format!("holepunch poll: {e}"))?;
+    let punched = wait_for_direct_with_udp_blast(
+        &mut swarm,
+        role,
+        &target,
+        &remote_addrs,
+        Instant::now() + HOLEPUNCH_DEADLINE,
+    )?;
 
     // --- 6. Direct ping or relay-ping fallback -----------------------------
-    if punched.is_some() {
+    if punched {
         println!("[{role}] direct-connected peer={target} (hole-punch success)");
         ping_and_exit(&mut swarm, role, target, deadline)
     } else {
@@ -935,6 +937,35 @@ fn dial_direct_candidates(
     }
 }
 
+fn wait_for_direct_with_udp_blast(
+    swarm: &mut Swarm<QuicTransport>,
+    role: &str,
+    peer_id: &PeerId,
+    addrs: &[Multiaddr],
+    deadline: Instant,
+) -> Result<bool, Box<dyn Error>> {
+    let mut next_blast = Instant::now();
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        if now >= next_blast {
+            blast_remote_addrs(swarm, addrs, role);
+            next_blast = now + next_holepunch_delay();
+        }
+
+        for ev in swarm.poll().map_err(|e| format!("holepunch poll: {e}"))? {
+            print_event(role, &ev);
+            if matches!(&ev, SwarmEvent::ConnectionEstablished { peer_id: p } if p == peer_id) {
+                return Ok(true);
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn relay_ping_fallback(
     swarm: &mut Swarm<QuicTransport>,
     role: &str,
@@ -1038,6 +1069,20 @@ fn build_autonat_swarm(
         .build(transport);
     swarm.add_user_protocol(AUTONAT_PROTOCOL_ID);
     Ok(swarm)
+}
+
+fn register_manual_external_addrs(swarm: &mut Swarm<QuicTransport>, options: &RunOptions) {
+    for addr in &options.external_addrs {
+        swarm.add_external_address(addr.clone());
+    }
+}
+
+fn confirmed_external_addrs(swarm: &Swarm<QuicTransport>) -> Vec<Multiaddr> {
+    swarm
+        .external_addresses()
+        .iter()
+        .map(|entry| entry.addr.clone())
+        .collect()
 }
 
 fn dialback_candidate(
@@ -1203,7 +1248,11 @@ fn validate_candidates_with_autonat(
                 );
             }
             println!("[{role}] autonat-public addrs={}", addrs.len());
-            Ok(successful_candidates_in_original_order(candidates, &addrs))
+            let successful = successful_candidates_in_original_order(candidates, &addrs);
+            for addr in &successful {
+                swarm.confirm_external_address(ExternalAddressSource::AutoNat, addr.clone());
+            }
+            Ok(successful)
         }
         Reachability::Private { status, reason } => {
             println!("[{role}] autonat-private status={status:?} reason={reason}");
@@ -1263,6 +1312,17 @@ fn blast_remote_addrs(swarm: &Swarm<QuicTransport>, addrs: &[Multiaddr], role: &
             eprintln!("[{role}] udp-blast {addr} failed: {e}");
         }
     }
+}
+
+fn next_holepunch_delay() -> Duration {
+    let range = HOLEPUNCH_INTERVAL_MAX_MS - HOLEPUNCH_INTERVAL_MIN_MS + 1;
+    let mut raw = [0u8; 8];
+    let jitter = if getrandom::fill(&mut raw).is_ok() {
+        u64::from_le_bytes(raw) % range
+    } else {
+        range / 2
+    };
+    Duration::from_millis(HOLEPUNCH_INTERVAL_MIN_MS + jitter)
 }
 
 /// Short random byte vector. Best-effort: falls back to zeros rather

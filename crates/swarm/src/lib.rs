@@ -38,6 +38,7 @@ pub use crate::core::SwarmCore;
 pub use crate::events::{
     OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError,
 };
+pub use minip2p_core::{ExternalAddress, ExternalAddressSource};
 
 #[cfg(feature = "std")]
 pub use crate::builder::SwarmBuilder;

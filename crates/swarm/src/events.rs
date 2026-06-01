@@ -8,7 +8,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::PeerId;
+use minip2p_core::{ExternalAddressSource, Multiaddr, PeerId};
 use minip2p_identify::IdentifyMessage;
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -33,6 +33,21 @@ pub enum SwarmEvent {
     PeerReady {
         peer_id: PeerId,
         protocols: Vec<String>,
+    },
+    /// A possible external address was observed but not yet confirmed.
+    ExternalAddrCandidate {
+        source: ExternalAddressSource,
+        address: Multiaddr,
+    },
+    /// A local external address was confirmed and will be advertised.
+    ExternalAddrConfirmed {
+        source: ExternalAddressSource,
+        address: Multiaddr,
+    },
+    /// A previously confirmed local external address expired or was removed.
+    ExternalAddrExpired {
+        source: ExternalAddressSource,
+        address: Multiaddr,
     },
     /// A ping RTT measurement completed.
     PingRttMeasured { peer_id: PeerId, rtt_ms: u64 },

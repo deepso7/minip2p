@@ -17,7 +17,9 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId};
+use minip2p_core::{
+    ExternalAddress, ExternalAddressBook, ExternalAddressSource, Multiaddr, PeerId,
+};
 use minip2p_identify::{
     IDENTIFY_PROTOCOL_ID, IdentifyAction, IdentifyConfig, IdentifyEvent, IdentifyMessage,
     IdentifyProtocol,
@@ -123,6 +125,8 @@ pub struct SwarmCore {
     /// auto-populate Identify's `listen_addrs` so advertised addresses
     /// always reflect what we're actually bound to.
     local_addresses: Vec<Multiaddr>,
+    /// External address lifecycle for this local node.
+    external_addresses: ExternalAddressBook,
     /// Latest Identify payload received for each peer.
     peer_info: BTreeMap<PeerId, IdentifyMessage>,
     /// Peers for which `PeerReady` has already been emitted.
@@ -159,6 +163,7 @@ impl SwarmCore {
             user_protocols: Vec::new(),
             pending_pings: BTreeMap::new(),
             local_addresses: Vec::new(),
+            external_addresses: ExternalAddressBook::default(),
             peer_info: BTreeMap::new(),
             ready_peers: BTreeSet::new(),
             established_peers: BTreeSet::new(),
@@ -175,6 +180,46 @@ impl SwarmCore {
     /// set changes (e.g. after `listen()` or `close()` on a listener).
     pub fn set_local_addresses(&mut self, addrs: Vec<Multiaddr>) {
         self.local_addresses = addrs;
+    }
+
+    /// Returns confirmed external addresses in advertise/dial priority order.
+    pub fn external_addresses(&self) -> &[ExternalAddress] {
+        self.external_addresses.confirmed()
+    }
+
+    /// Returns observed but unconfirmed external-address candidates.
+    pub fn external_address_candidates(&self) -> &[ExternalAddress] {
+        self.external_addresses.candidates()
+    }
+
+    /// Confirms an external address and advertises it in future Identify
+    /// responses.
+    ///
+    /// This is Sans-I/O policy only. Callers are responsible for deciding when
+    /// an address is trustworthy, e.g. because it was supplied manually,
+    /// confirmed by AutoNAT, or discovered through port mapping.
+    pub fn confirm_external_address(&mut self, source: ExternalAddressSource, addr: Multiaddr) {
+        let update = self.external_addresses.confirm(source, addr.clone());
+        self.events.push(SwarmEvent::ExternalAddrConfirmed {
+            source,
+            address: addr,
+        });
+        if let Some(expired) = update.expired {
+            self.events.push(SwarmEvent::ExternalAddrExpired {
+                source: expired.source,
+                address: expired.addr,
+            });
+        }
+    }
+
+    /// Removes a confirmed external address.
+    pub fn remove_external_address(&mut self, addr: &Multiaddr) {
+        if let Some(expired) = self.external_addresses.remove(addr) {
+            self.events.push(SwarmEvent::ExternalAddrExpired {
+                source: expired.source,
+                address: expired.addr,
+            });
+        }
     }
 
     /// Registers a user protocol id that this swarm will accept on inbound
@@ -629,6 +674,31 @@ impl SwarmCore {
         });
     }
 
+    fn observe_external_addr_candidate(&mut self, source: ExternalAddressSource, addr: Multiaddr) {
+        if self
+            .external_addresses
+            .observe_candidate(source, addr.clone())
+        {
+            self.events.push(SwarmEvent::ExternalAddrCandidate {
+                source,
+                address: addr,
+            });
+        }
+    }
+
+    fn identify_advertised_addrs(&self) -> Vec<Multiaddr> {
+        let mut addrs = Vec::with_capacity(
+            self.local_addresses.len() + self.external_addresses.confirmed().len(),
+        );
+        for addr in &self.local_addresses {
+            push_unique_addr(&mut addrs, addr.clone());
+        }
+        for external in self.external_addresses.confirmed() {
+            push_unique_addr(&mut addrs, external.addr.clone());
+        }
+        addrs
+    }
+
     fn find_negotiated_ping_stream(&self, peer_id: &PeerId) -> Option<StreamId> {
         self.ping.outbound_stream(peer_id)
     }
@@ -833,6 +903,9 @@ impl SwarmCore {
                         *peer_id = new.clone();
                     }
                 }
+                SwarmEvent::ExternalAddrCandidate { .. }
+                | SwarmEvent::ExternalAddrConfirmed { .. }
+                | SwarmEvent::ExternalAddrExpired { .. } => {}
                 SwarmEvent::Error(error) => {
                     if error.peer_id.as_ref() == Some(old) {
                         error.peer_id = Some(new.clone());
@@ -1168,15 +1241,17 @@ impl SwarmCore {
             // endpoint for this conn_id, in which case we legitimately
             // can't fill observedAddr and the field is omitted.
             let observed_addr = self.conn_to_remote_addr.get(&conn_id).cloned();
-            // Snapshot of the transport's listening addresses at this
-            // moment; the driver keeps `local_addresses` refreshed.
-            let listen_addrs = self.local_addresses.as_slice();
+            // Snapshot of the addresses we should advertise at this moment:
+            // transport listen addresses plus confirmed external addresses.
+            // The driver keeps `local_addresses` refreshed; this core owns
+            // the external-address book.
+            let listen_addrs = self.identify_advertised_addrs();
             let responder_peer_id = peer_id.clone();
             match self.identify.register_outbound_stream(
                 peer_id,
                 stream_id,
                 observed_addr,
-                listen_addrs,
+                &listen_addrs,
             ) {
                 Ok(actions) => {
                     // Only record ownership on success, so a rejected
@@ -1372,6 +1447,20 @@ impl SwarmCore {
         for event in self.identify.poll_events() {
             match event {
                 IdentifyEvent::Received { peer_id, info } => {
+                    if let Some(bytes) = info.observed_addr.as_deref() {
+                        match Multiaddr::from_bytes(bytes) {
+                            Ok(addr) => self.observe_external_addr_candidate(
+                                ExternalAddressSource::IdentifyObserved,
+                                addr,
+                            ),
+                            Err(e) => self.emit_error(
+                                SwarmErrorKind::Identify,
+                                Some(peer_id.clone()),
+                                self.conn_for(&peer_id),
+                                format!("failed to parse identify observed address: {e}"),
+                            ),
+                        }
+                    }
                     self.peer_info.insert(peer_id.clone(), info.clone());
                     self.events.push(SwarmEvent::IdentifyReceived {
                         peer_id: peer_id.clone(),
@@ -1389,6 +1478,12 @@ impl SwarmCore {
                 }
             }
         }
+    }
+}
+
+fn push_unique_addr(addrs: &mut Vec<Multiaddr>, addr: Multiaddr) {
+    if !addrs.iter().any(|existing| existing == &addr) {
+        addrs.push(addr);
     }
 }
 
@@ -1546,5 +1641,54 @@ mod tests {
             SwarmError::UserStreamNotFound { peer_id: p, stream_id: s }
                 if p == peer_id && s == stream_id
         ));
+    }
+
+    #[test]
+    fn confirmed_external_address_is_advertised_with_listen_addresses() {
+        let mut core = test_core();
+        let listen = loopback_transport();
+        let external = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
+
+        core.set_local_addresses(vec![listen.clone()]);
+        core.confirm_external_address(ExternalAddressSource::AutoNat, external.clone());
+
+        let addrs = core.identify_advertised_addrs();
+        assert_eq!(addrs, vec![listen, external]);
+    }
+
+    #[test]
+    fn confirming_external_address_emits_confirmed_event() {
+        let mut core = test_core();
+        let external = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
+
+        core.confirm_external_address(ExternalAddressSource::Manual, external.clone());
+
+        let events = core.poll_events();
+        assert!(matches!(
+            events.as_slice(),
+            [SwarmEvent::ExternalAddrConfirmed { source, address }]
+                if *source == ExternalAddressSource::Manual && address == &external
+        ));
+        assert_eq!(core.external_addresses()[0].addr, external);
+    }
+
+    #[test]
+    fn observed_external_candidate_is_deduplicated_against_confirmed_addresses() {
+        let mut core = test_core();
+        let external = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
+
+        core.observe_external_addr_candidate(
+            ExternalAddressSource::IdentifyObserved,
+            external.clone(),
+        );
+        core.observe_external_addr_candidate(
+            ExternalAddressSource::IdentifyObserved,
+            external.clone(),
+        );
+        core.confirm_external_address(ExternalAddressSource::AutoNat, external.clone());
+        core.observe_external_addr_candidate(ExternalAddressSource::IdentifyObserved, external);
+
+        assert!(core.external_address_candidates().is_empty());
+        assert_eq!(core.external_addresses().len(), 1);
     }
 }
