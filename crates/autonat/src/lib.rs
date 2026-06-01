@@ -13,7 +13,7 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId, VarintError, read_uvarint, write_uvarint};
+use minip2p_core::{Multiaddr, PeerId, VarintError, read_uvarint, uvarint_len, write_uvarint};
 
 /// Protocol id for AutoNAT v1.
 pub const AUTONAT_PROTOCOL_ID: &str = "/libp2p/autonat/1.0.0";
@@ -258,15 +258,15 @@ impl AutoNatClient {
 
     fn try_decode_response(&mut self) -> Result<(), AutoNatError> {
         enforce_max_size(&self.recv_buf)?;
-        let (payload, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => (payload.to_vec(), consumed),
+        let (decoded, consumed) = match decode_frame(&self.recv_buf) {
+            FrameDecode::Complete { payload, consumed } => (Message::decode(payload), consumed),
             FrameDecode::Incomplete => return Ok(()),
             FrameDecode::TooLarge { len } => return Err(AutoNatError::FrameTooLarge { len }),
             FrameDecode::Error(e) => return Err(AutoNatError::Varint(e)),
         };
         self.recv_buf.drain(..consumed);
+        let msg = decoded?;
 
-        let msg = Message::decode(&payload)?;
         if msg.kind != MessageType::DialResponse {
             self.state = FlowState::Done;
             return Err(AutoNatError::UnexpectedMessage(
@@ -359,15 +359,15 @@ impl AutoNatServer {
 
     fn try_decode_request(&mut self) -> Result<(), AutoNatError> {
         enforce_max_size(&self.recv_buf)?;
-        let (payload, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => (payload.to_vec(), consumed),
+        let (decoded, consumed) = match decode_frame(&self.recv_buf) {
+            FrameDecode::Complete { payload, consumed } => (Message::decode(payload), consumed),
             FrameDecode::Incomplete => return Ok(()),
             FrameDecode::TooLarge { len } => return Err(AutoNatError::FrameTooLarge { len }),
             FrameDecode::Error(e) => return Err(AutoNatError::Varint(e)),
         };
         self.recv_buf.drain(..consumed);
+        let msg = decoded?;
 
-        let msg = Message::decode(&payload)?;
         if msg.kind != MessageType::Dial {
             self.state = ServerState::Done;
             return Err(AutoNatError::UnexpectedMessage("expected DIAL".into()));
@@ -408,7 +408,7 @@ pub enum FrameDecode<'a> {
 
 /// Encodes a protobuf message body with a varint length prefix.
 pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(uvarint_len(payload.len() as u64) + payload.len());
     write_uvarint(payload.len() as u64, &mut out);
     out.extend_from_slice(payload);
     out
@@ -714,6 +714,49 @@ mod tests {
         assert!(
             matches!(client.outcome(), Some(Reachability::Private { status: ResponseStatus::DialError, reason }) if reason == "all dialbacks failed")
         );
+    }
+
+    #[test]
+    fn client_consumes_bad_frame_before_decode_error() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let mut client = AutoNatClient::new(&peer_id, &[]);
+        let _ = client.take_outbound();
+
+        let bad_frame = encode_frame(&[TAG_TYPE, 99]);
+        assert!(matches!(
+            client.on_data(&bad_frame),
+            Err(AutoNatError::InvalidMessageType { value: 99 })
+        ));
+
+        let mut server = AutoNatServer::new();
+        server.respond_error(ResponseStatus::DialError, "after bad frame");
+        client.on_data(&server.take_outbound()).unwrap();
+
+        assert!(
+            matches!(client.outcome(), Some(Reachability::Private { status: ResponseStatus::DialError, reason }) if reason == "after bad frame")
+        );
+    }
+
+    #[test]
+    fn server_consumes_bad_frame_before_decode_error() {
+        let mut server = AutoNatServer::new();
+
+        let bad_frame = encode_frame(&[TAG_TYPE, 99]);
+        assert!(matches!(
+            server.on_data(&bad_frame),
+            Err(AutoNatError::InvalidMessageType { value: 99 })
+        ));
+
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let addr = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
+        let mut client = AutoNatClient::new(&peer_id, core::slice::from_ref(&addr));
+        server.on_data(&client.take_outbound()).unwrap();
+
+        let request = server
+            .request()
+            .expect("request should decode after bad frame");
+        assert_eq!(request.peer_id, peer_id);
+        assert_eq!(request.addrs, vec![addr]);
     }
 
     #[test]

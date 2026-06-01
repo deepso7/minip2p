@@ -13,9 +13,8 @@ use minip2p_transport::{ConnectionId, Transport, TransportError, TransportEvent}
 // ---------------------------------------------------------------------------
 
 fn setup_pair() -> (QuicTransport, QuicTransport, PeerAddr) {
-    let mut server =
-        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("server");
-    let client = QuicTransport::new(QuicNodeConfig::dev_dialer(), "127.0.0.1:0").expect("client");
+    let mut server = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server");
+    let client = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("client");
 
     server.listen_on_bound_addr().expect("listen");
     let peer_addr = server.local_peer_addr().expect("peer addr");
@@ -44,8 +43,7 @@ fn connect_pair(
     Vec<TransportEvent>,
     Vec<TransportEvent>,
 ) {
-    let client_conn = ConnectionId::new(1);
-    client.dial(client_conn, peer_addr).expect("dial");
+    let client_conn = client.dial(peer_addr).expect("dial");
 
     let mut all_server_events = Vec::new();
     let mut all_client_events = Vec::new();
@@ -105,7 +103,7 @@ fn connect_pair(
 #[test]
 fn listen_returns_the_resolved_listen_address_and_event_matches() {
     let mut listener =
-        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("listener");
+        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("listener");
     let requested = listener.local_multiaddr().expect("local multiaddr");
 
     let resolved = listener.listen(&requested).expect("listen");
@@ -180,17 +178,14 @@ fn no_stream_events_before_connected() {
 }
 
 #[test]
-fn dial_with_duplicate_id_returns_connection_exists() {
+fn outbound_dial_allocates_unique_ids() {
     let (mut server, mut client, peer_addr) = setup_pair();
-    let id = ConnectionId::new(42);
-    client.dial(id, &peer_addr).expect("first dial");
+    let first = client.dial(&peer_addr).expect("first dial");
+    let second = client.dial(&peer_addr).expect("second dial");
 
-    let err = client
-        .dial(id, &peer_addr)
-        .expect_err("duplicate must fail");
-    assert!(
-        matches!(err, TransportError::ConnectionExists { .. }),
-        "expected ConnectionExists, got {err:?}"
+    assert_ne!(
+        first, second,
+        "transport must allocate unique connection ids"
     );
 
     // Drive to avoid dangling state.
@@ -357,7 +352,7 @@ fn reset_stream_emits_stream_closed() {
 #[test]
 fn open_stream_on_unknown_connection_returns_not_found() {
     let mut transport =
-        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("bind");
+        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
 
     let err = transport
         .open_stream(ConnectionId::new(999))
@@ -368,7 +363,7 @@ fn open_stream_on_unknown_connection_returns_not_found() {
 #[test]
 fn send_on_unknown_connection_returns_not_found() {
     let mut transport =
-        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("bind");
+        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
 
     let err = transport
         .send_stream(ConnectionId::new(999), 0.into(), b"data".to_vec())
@@ -379,7 +374,7 @@ fn send_on_unknown_connection_returns_not_found() {
 #[test]
 fn poll_returns_empty_when_idle() {
     let mut transport =
-        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("bind");
+        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
 
     let events = transport.poll().expect("poll");
     assert!(events.is_empty(), "idle poll must return empty vec");

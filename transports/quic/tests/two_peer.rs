@@ -7,9 +7,9 @@ use quiche::ConnectionId as QuicConnectionId;
 
 fn setup_pair() -> (QuicTransport, QuicTransport, PeerAddr) {
     let mut server =
-        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("server bind");
+        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server bind");
     let client =
-        QuicTransport::new(QuicNodeConfig::dev_dialer(), "127.0.0.1:0").expect("client bind");
+        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("client bind");
 
     server.listen_on_bound_addr().expect("server listen");
     let peer_addr = server.local_peer_addr().expect("peer addr");
@@ -76,10 +76,7 @@ fn wait_for_connection(
 fn two_peers_open_stream_and_exchange_data() {
     let (mut server, mut client, peer_addr) = setup_pair();
 
-    let client_conn_id = ConnectionId::new(1);
-    client
-        .dial(client_conn_id, &peer_addr)
-        .expect("client dial");
+    let client_conn_id = client.dial(&peer_addr).expect("client dial");
 
     let server_conn_id =
         wait_for_connection(&mut server, &mut client, client_conn_id, &peer_addr, 250)
@@ -154,8 +151,7 @@ fn two_peers_open_stream_and_exchange_data() {
 fn close_stream_write_emits_remote_write_closed() {
     let (mut server, mut client, peer_addr) = setup_pair();
 
-    let client_conn_id = ConnectionId::new(5);
-    client.dial(client_conn_id, &peer_addr).expect("dial");
+    let client_conn_id = client.dial(&peer_addr).expect("dial");
 
     let server_conn_id =
         wait_for_connection(&mut server, &mut client, client_conn_id, &peer_addr, 250)
@@ -222,7 +218,7 @@ fn close_stream_write_emits_remote_write_closed() {
 #[test]
 fn listener_rejects_dialer_without_mtls_identity() {
     let mut server =
-        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("server bind");
+        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server bind");
     server.listen_on_bound_addr().expect("server listen");
     let server_addr = server.local_addr().expect("server socket addr");
 
@@ -268,11 +264,10 @@ fn listener_rejects_dialer_without_mtls_identity() {
 #[test]
 fn dialer_rejects_listener_with_unexpected_peer_id() {
     let mut listener_a =
-        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("listener a");
+        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("listener a");
     let mut listener_b =
-        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("listener b");
-    let mut dialer =
-        QuicTransport::new(QuicNodeConfig::dev_dialer(), "127.0.0.1:0").expect("dialer");
+        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("listener b");
+    let mut dialer = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("dialer");
 
     listener_a.listen_on_bound_addr().expect("listen a");
     listener_b.listen_on_bound_addr().expect("listen b");
@@ -282,8 +277,7 @@ fn dialer_rejects_listener_with_unexpected_peer_id() {
     let wrong_peer_addr =
         PeerAddr::new(listener_a_addr.transport().clone(), listener_b_peer).expect("peer addr");
 
-    let conn_id = ConnectionId::new(88);
-    dialer.dial(conn_id, &wrong_peer_addr).expect("dial starts");
+    let _conn_id = dialer.dial(&wrong_peer_addr).expect("dial starts");
 
     let mut saw_mismatch = false;
     let mut saw_connected = false;
@@ -312,7 +306,7 @@ fn dialer_rejects_listener_with_unexpected_peer_id() {
 #[test]
 fn listener_rejects_dialer_with_invalid_libp2p_cert() {
     let mut server =
-        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("server bind");
+        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server bind");
     server.listen_on_bound_addr().expect("server listen");
     let server_addr = server.local_addr().expect("server socket addr");
 
@@ -377,10 +371,7 @@ fn mtls_verifies_listener_side_client_identity_and_updates_peer_index() {
     let (mut server, mut client, peer_addr) = setup_pair();
     let client_peer_id = client.local_peer_id();
 
-    let client_conn_id = ConnectionId::new(42);
-    client
-        .dial(client_conn_id, &peer_addr)
-        .expect("client dial");
+    let client_conn_id = client.dial(&peer_addr).expect("client dial");
 
     let mut verified_event = None;
 
@@ -433,8 +424,7 @@ fn dial_supports_dns4_target_for_quic_transport() {
     let dns_peer_addr =
         PeerAddr::new(dns_transport, peer_addr.peer_id().clone()).expect("dns peer addr");
 
-    let conn_id = ConnectionId::new(77);
-    client.dial(conn_id, &dns_peer_addr).expect("dial via dns4");
+    let conn_id = client.dial(&dns_peer_addr).expect("dial via dns4");
 
     let connected = wait_for_connection(&mut server, &mut client, conn_id, &dns_peer_addr, 250);
     assert!(connected.is_some(), "client should connect via dns4 target");
@@ -442,7 +432,7 @@ fn dial_supports_dns4_target_for_quic_transport() {
 
 #[test]
 fn listen_rejects_address_mismatch_with_bound_socket() {
-    let config = QuicNodeConfig::dev_listener();
+    let config = QuicNodeConfig::generate();
     let mut transport = QuicTransport::new(config, "127.0.0.1:0").expect("bind");
 
     let local = transport.local_addr().expect("local addr");
@@ -481,15 +471,13 @@ fn listen_rejects_address_mismatch_with_bound_socket() {
 #[test]
 fn open_stream_before_connected_returns_invalid_state() {
     let mut listener =
-        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("listener");
+        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("listener");
     listener.listen_on_bound_addr().expect("listen");
     let peer_addr = listener.local_peer_addr().expect("peer addr");
 
-    let mut dialer =
-        QuicTransport::new(QuicNodeConfig::dev_dialer(), "127.0.0.1:0").expect("dialer");
+    let mut dialer = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("dialer");
 
-    let conn_id = ConnectionId::new(999);
-    dialer.dial(conn_id, &peer_addr).expect("dial");
+    let conn_id = dialer.dial(&peer_addr).expect("dial");
 
     let err = dialer
         .open_stream(conn_id)

@@ -364,13 +364,6 @@ impl QuicTransport {
         self.listen(&multiaddr)
     }
 
-    /// Dials a peer, automatically allocating a connection id.
-    pub fn dial_auto(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
-        let id = self.allocate_connection_id()?;
-        self.dial(id, addr)?;
-        Ok(id)
-    }
-
     /// Returns all active connection ids for the given peer.
     pub fn connection_ids_for_peer(&self, peer_id: &PeerId) -> Vec<ConnectionId> {
         self.peer_connections
@@ -477,11 +470,8 @@ impl QuicTransport {
 }
 
 impl Transport for QuicTransport {
-    fn dial(&mut self, id: ConnectionId, addr: &PeerAddr) -> Result<(), TransportError> {
-        if self.connections.contains_key(&id) {
-            return Err(TransportError::ConnectionExists { id });
-        }
-
+    fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+        let id = self.allocate_connection_id()?;
         let peer_socket = resolve_dial_socket_addr(addr.transport(), "dial target")?;
         let local_socket = self.local_addr()?;
 
@@ -531,14 +521,11 @@ impl Transport for QuicTransport {
         );
         let source_cid = conn.source_cid_bytes();
 
-        if self.connections.insert(id, conn).is_some() {
-            return Err(TransportError::ConnectionExists { id });
-        }
-
+        self.connections.insert(id, conn);
         self.cid_to_connection.insert(source_cid, id);
         self.index_peer_connection(addr.peer_id().clone(), id);
 
-        Ok(())
+        Ok(id)
     }
 
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
@@ -642,6 +629,14 @@ impl Transport for QuicTransport {
     fn active_connection_sources(&self) -> Vec<Multiaddr> {
         self.connections
             .values()
+            .map(|conn| conn.endpoint().transport().clone())
+            .collect()
+    }
+
+    fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
+        self.connections
+            .values()
+            .filter(|conn| conn.is_server())
             .map(|conn| conn.endpoint().transport().clone())
             .collect()
     }

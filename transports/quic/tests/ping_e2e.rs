@@ -81,18 +81,16 @@ impl PingHarness {
     /// Create a connected, verified, and multistream-negotiated ping pair.
     fn new(client_conn_id_raw: u64) -> Self {
         let mut server =
-            QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("server bind");
+            QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server bind");
         let mut client =
-            QuicTransport::new(QuicNodeConfig::dev_dialer(), "127.0.0.1:0").expect("client bind");
+            QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("client bind");
 
         server.listen_on_bound_addr().expect("server listen");
         let peer_addr = server.local_peer_addr().expect("peer addr");
 
         // Connect.
-        let client_conn_id = ConnectionId::new(client_conn_id_raw);
-        client
-            .dial(client_conn_id, &peer_addr)
-            .expect("client dial");
+        let _ = client_conn_id_raw;
+        let client_conn_id = client.dial(&peer_addr).expect("client dial");
 
         let server_conn_id =
             Self::wait_for_connection(&mut server, &mut client, client_conn_id, &peer_addr, 250)

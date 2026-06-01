@@ -150,94 +150,112 @@ impl MultistreamSelect {
                 break;
             }
 
-            let (payload, consumed) = match decode_message(&self.recv_buf) {
-                DecodeResult::Complete { payload, consumed } => (payload.to_string(), consumed),
+            let (next_state, produced, consumed) = match decode_message(&self.recv_buf) {
+                DecodeResult::Complete { payload, consumed } => {
+                    let (next_state, produced) = handle_message(
+                        self.role,
+                        self.state,
+                        self.desired_protocol.as_deref(),
+                        &self.supported_protocols,
+                        payload,
+                    );
+                    (next_state, produced, consumed)
+                }
                 DecodeResult::Incomplete => break,
                 DecodeResult::Error(err) => {
-                    outputs.extend(self.protocol_error(err));
+                    self.state = State::Done;
+                    outputs.push(MultistreamOutput::ProtocolError {
+                        reason: err.to_string(),
+                    });
                     break;
                 }
             };
             self.recv_buf.drain(..consumed);
-            outputs.extend(self.on_message(&payload));
+            self.state = next_state;
+            outputs.extend(produced);
         }
 
         outputs
     }
+}
 
-    /// Processes a single decoded protocol line and advances the state machine.
-    fn on_message(&mut self, line: &str) -> Vec<MultistreamOutput> {
-        match self.state {
-            State::WaitingForRemoteHeader => {
-                if line != MULTISTREAM_PROTOCOL_ID {
-                    return self.protocol_error(MultistreamError::UnexpectedHeader {
-                        actual: line.to_string(),
-                    });
-                }
-
-                match self.role {
-                    Role::Dialer => {
-                        let desired = self
-                            .desired_protocol
-                            .as_ref()
-                            .expect("dialer must have desired protocol");
-                        self.state = State::WaitingForProtocolResponse;
-                        vec![MultistreamOutput::OutboundData(encode_message(desired))]
-                    }
-                    Role::Listener => {
-                        self.state = State::WaitingForProtocolRequest;
-                        Vec::new()
-                    }
-                }
+/// Processes a single decoded protocol line.
+fn handle_message(
+    role: Role,
+    state: State,
+    desired_protocol: Option<&str>,
+    supported_protocols: &BTreeSet<String>,
+    line: &str,
+) -> (State, Vec<MultistreamOutput>) {
+    match state {
+        State::WaitingForRemoteHeader => {
+            if line != MULTISTREAM_PROTOCOL_ID {
+                return protocol_error(MultistreamError::UnexpectedHeader {
+                    actual: line.to_string(),
+                });
             }
-            State::WaitingForProtocolRequest => {
-                if self.supported_protocols.contains(line) {
-                    self.state = State::Done;
+
+            match role {
+                Role::Dialer => {
+                    let desired = desired_protocol.expect("dialer must have desired protocol");
+                    (
+                        State::WaitingForProtocolResponse,
+                        vec![MultistreamOutput::OutboundData(encode_message(desired))],
+                    )
+                }
+                Role::Listener => (State::WaitingForProtocolRequest, Vec::new()),
+            }
+        }
+        State::WaitingForProtocolRequest => {
+            if supported_protocols.contains(line) {
+                (
+                    State::Done,
                     vec![
                         MultistreamOutput::OutboundData(encode_message(line)),
                         MultistreamOutput::Negotiated {
                             protocol: line.to_string(),
                         },
-                    ]
-                } else {
-                    self.state = State::Done;
+                    ],
+                )
+            } else {
+                (
+                    State::Done,
                     vec![
                         MultistreamOutput::OutboundData(encode_message(NOT_AVAILABLE)),
                         MultistreamOutput::NotAvailable,
-                    ]
-                }
+                    ],
+                )
             }
-            State::WaitingForProtocolResponse => {
-                let desired = self
-                    .desired_protocol
-                    .as_ref()
-                    .expect("dialer must have desired protocol");
-
-                if line == desired {
-                    self.state = State::Done;
-                    vec![MultistreamOutput::Negotiated {
-                        protocol: desired.clone(),
-                    }]
-                } else if line == NOT_AVAILABLE {
-                    self.state = State::Done;
-                    vec![MultistreamOutput::NotAvailable]
-                } else {
-                    self.protocol_error(MultistreamError::UnexpectedProtocolResponse {
-                        actual: line.to_string(),
-                    })
-                }
-            }
-            State::Done => Vec::new(),
         }
-    }
+        State::WaitingForProtocolResponse => {
+            let desired = desired_protocol.expect("dialer must have desired protocol");
 
-    /// Transitions to Done and returns a ProtocolError output.
-    fn protocol_error(&mut self, error: MultistreamError) -> Vec<MultistreamOutput> {
-        self.state = State::Done;
+            if line == desired {
+                (
+                    State::Done,
+                    vec![MultistreamOutput::Negotiated {
+                        protocol: desired.to_string(),
+                    }],
+                )
+            } else if line == NOT_AVAILABLE {
+                (State::Done, vec![MultistreamOutput::NotAvailable])
+            } else {
+                protocol_error(MultistreamError::UnexpectedProtocolResponse {
+                    actual: line.to_string(),
+                })
+            }
+        }
+        State::Done => (State::Done, Vec::new()),
+    }
+}
+
+fn protocol_error(error: MultistreamError) -> (State, Vec<MultistreamOutput>) {
+    (
+        State::Done,
         vec![MultistreamOutput::ProtocolError {
             reason: error.to_string(),
-        }]
-    }
+        }],
+    )
 }
 
 /// Encodes a protocol string as a varint-length-prefixed message.

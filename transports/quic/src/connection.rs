@@ -121,6 +121,10 @@ impl QuicConnection {
         &self.endpoint
     }
 
+    pub fn is_server(&self) -> bool {
+        self.conn.is_server()
+    }
+
     pub fn set_peer_id(&mut self, peer_id: PeerId) {
         self.endpoint.set_peer_id(peer_id);
     }

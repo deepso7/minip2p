@@ -175,8 +175,14 @@ impl HopReservation {
             e
         })?;
 
-        let (payload, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => (payload.to_vec(), consumed),
+        let (msg, consumed) = match decode_frame(&self.recv_buf) {
+            FrameDecode::Complete { payload, consumed } => {
+                let msg = HopMessage::decode(payload).map_err(|e| {
+                    self.state = FlowState::Done;
+                    RelayError::Malformed(e)
+                })?;
+                (msg, consumed)
+            }
             FrameDecode::Incomplete => return Ok(()),
             FrameDecode::Error(e) => {
                 self.state = FlowState::Done;
@@ -184,11 +190,6 @@ impl HopReservation {
             }
         };
         self.recv_buf.drain(..consumed);
-
-        let msg = HopMessage::decode(&payload).map_err(|e| {
-            self.state = FlowState::Done;
-            RelayError::Malformed(e)
-        })?;
 
         if msg.kind != HopMessageType::Status {
             self.state = FlowState::Done;
@@ -346,8 +347,14 @@ impl HopConnect {
             e
         })?;
 
-        let (payload, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => (payload.to_vec(), consumed),
+        let (msg, consumed) = match decode_frame(&self.recv_buf) {
+            FrameDecode::Complete { payload, consumed } => {
+                let msg = HopMessage::decode(payload).map_err(|e| {
+                    self.state = FlowState::Done;
+                    RelayError::Malformed(e)
+                })?;
+                (msg, consumed)
+            }
             FrameDecode::Incomplete => return Ok(()),
             FrameDecode::Error(e) => {
                 self.state = FlowState::Done;
@@ -355,11 +362,6 @@ impl HopConnect {
             }
         };
         self.recv_buf.drain(..consumed);
-
-        let msg = HopMessage::decode(&payload).map_err(|e| {
-            self.state = FlowState::Done;
-            RelayError::Malformed(e)
-        })?;
 
         if msg.kind != HopMessageType::Status {
             self.state = FlowState::Done;
@@ -537,8 +539,14 @@ impl StopResponder {
             e
         })?;
 
-        let (payload, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => (payload.to_vec(), consumed),
+        let (msg, consumed) = match decode_frame(&self.recv_buf) {
+            FrameDecode::Complete { payload, consumed } => {
+                let msg = StopMessage::decode(payload).map_err(|e| {
+                    self.state = StopState::Done;
+                    RelayError::Malformed(e)
+                })?;
+                (msg, consumed)
+            }
             FrameDecode::Incomplete => return Ok(()),
             FrameDecode::Error(e) => {
                 self.state = StopState::Done;
@@ -546,11 +554,6 @@ impl StopResponder {
             }
         };
         self.recv_buf.drain(..consumed);
-
-        let msg = StopMessage::decode(&payload).map_err(|e| {
-            self.state = StopState::Done;
-            RelayError::Malformed(e)
-        })?;
 
         if msg.kind != StopMessageType::Connect {
             self.state = StopState::Done;

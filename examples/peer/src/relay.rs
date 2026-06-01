@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use minip2p_autonat::{
     AUTONAT_PROTOCOL_ID, AutoNatClient, AutoNatServer, Reachability, ResponseStatus,
 };
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol, select_direct_candidates};
 use minip2p_dcutr::{
     DCUTR_PROTOCOL_ID, DcutrInitiator, DcutrResponder, InitiatorOutcome, ResponderEvent,
 };
@@ -187,9 +187,10 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         )?;
     };
 
-    // --- 6. Hole-punch: blast UDP, wait for direct or timeout --------------
+    // --- 6. Hole-punch: dial + blast UDP, wait for direct or timeout -------
     println!("[{role}] dcutr-sync-received -> holepunching");
     print_remote_candidates(role, &remote_addrs);
+    dial_direct_candidates(&mut swarm, role, &remote_peer_id, &remote_addrs);
     let punch_start = Instant::now();
     let punch_deadline = punch_start + HOLEPUNCH_DEADLINE;
     let mut next_blast = punch_start + RESPONDER_SYNC_DELAY;
@@ -213,7 +214,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     // Initial may have arrived BEFORE we observed the SYNC message on
     // a tight local loopback). Only counts if the source matches.
     let mut saw_inbound_conn = any_source_matches(
-        &swarm.transport().active_connection_sources(),
+        &swarm.transport().active_inbound_connection_sources(),
         &remote_match_targets,
     );
 
@@ -252,7 +253,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         // NOT trigger this because their source address won't match
         // `remote_match_targets`.
         if any_source_matches(
-            &swarm.transport().active_connection_sources(),
+            &swarm.transport().active_inbound_connection_sources(),
             &remote_match_targets,
         ) {
             saw_inbound_conn = true;
@@ -291,8 +292,8 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
                     ping_and_exit(&mut swarm, role, peer_id, deadline)
                 }
                 _ => {
-                    println!("[{role}] grace-elapsed before mTLS identity -- done");
-                    Ok(())
+                    println!("[{role}] grace-elapsed before mTLS identity -> relay-ping fallback");
+                    relay_ping_fallback(&mut swarm, role, &relay_peer_id, bridge_stream)
                 }
             }
         }
@@ -308,33 +309,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         }
         HolePunchOutcome::Timeout => {
             println!("[{role}] hole-punch-timeout reason=deadline elapsed -> relay-ping fallback");
-            // Wait up to ~15s for either an echo payload from Peer A
-            // or the bridge to close (meaning A gave up). Longer
-            // than the hole-punch deadline because the relay's own
-            // idle-circuit GC can take several seconds -- but bounded
-            // so we don't hang forever if something goes wrong.
-            let fallback_deadline = Instant::now() + Duration::from_secs(15);
-            let ev = swarm
-                .run_until(fallback_deadline, |ev| {
-                    print_event(role, ev);
-                    matches!(
-                        ev,
-                        SwarmEvent::UserStreamData { stream_id: s, .. } if *s == bridge_stream
-                    ) || is_bridge_closed_event(ev, bridge_stream)
-                })
-                .map_err(|e| format!("fallback poll: {e}"))?;
-            match ev {
-                Some(SwarmEvent::UserStreamData { data, .. }) => {
-                    send(&mut swarm, &relay_peer_id, bridge_stream, data)?;
-                    println!("[{role}] relay-ping-echoed -- done");
-                    Ok(())
-                }
-                Some(_) => {
-                    println!("[{role}] bridge-closed during fallback -- done");
-                    Ok(())
-                }
-                None => Err("fallback deadline exceeded before any bridge activity".into()),
-            }
+            relay_ping_fallback(&mut swarm, role, &relay_peer_id, bridge_stream)
         }
     }
 }
@@ -531,15 +506,7 @@ pub fn run_dial(
         dcutr.take_outbound(),
     )?;
 
-    for addr in &remote_addrs {
-        match PeerAddr::new(addr.clone(), target.clone()) {
-            Ok(pa) => match swarm.dial(&pa) {
-                Ok(_) => println!("[{role}] direct-dial-attempt {pa}"),
-                Err(e) => eprintln!("[{role}] direct-dial-failed addr={pa} reason={e}"),
-            },
-            Err(e) => eprintln!("[{role}] bad PeerAddr for {addr}: {e}"),
-        }
-    }
+    dial_direct_candidates(&mut swarm, role, &target, &remote_addrs);
 
     // --- 5. Wait for direct connection or hole-punch timeout ---------------
     let punch_deadline = Instant::now() + HOLEPUNCH_DEADLINE;
@@ -951,6 +918,58 @@ fn drain_dcutr_responder_events(
     sync
 }
 
+fn dial_direct_candidates(
+    swarm: &mut Swarm<QuicTransport>,
+    role: &str,
+    peer_id: &PeerId,
+    addrs: &[Multiaddr],
+) {
+    for addr in addrs {
+        match PeerAddr::new(addr.clone(), peer_id.clone()) {
+            Ok(peer_addr) => match swarm.dial(&peer_addr) {
+                Ok(_) => println!("[{role}] direct-dial-attempt {peer_addr}"),
+                Err(e) => eprintln!("[{role}] direct-dial-failed addr={peer_addr} reason={e}"),
+            },
+            Err(e) => eprintln!("[{role}] bad PeerAddr for {addr}: {e}"),
+        }
+    }
+}
+
+fn relay_ping_fallback(
+    swarm: &mut Swarm<QuicTransport>,
+    role: &str,
+    relay_peer_id: &PeerId,
+    bridge_stream: StreamId,
+) -> Result<(), Box<dyn Error>> {
+    // Wait up to ~15s for either an echo payload from Peer A or the bridge to
+    // close (meaning A gave up). Longer than the hole-punch deadline because
+    // the relay's own idle-circuit GC can take several seconds -- but bounded
+    // so we don't hang forever if something goes wrong.
+    let fallback_deadline = Instant::now() + Duration::from_secs(15);
+    let ev = swarm
+        .run_until(fallback_deadline, |ev| {
+            print_event(role, ev);
+            matches!(
+                ev,
+                SwarmEvent::UserStreamData { stream_id: s, .. } if *s == bridge_stream
+            ) || is_bridge_closed_event(ev, bridge_stream)
+        })
+        .map_err(|e| format!("fallback poll: {e}"))?;
+
+    match ev {
+        Some(SwarmEvent::UserStreamData { data, .. }) => {
+            send(swarm, relay_peer_id, bridge_stream, data)?;
+            println!("[{role}] relay-ping-echoed -- done");
+            Ok(())
+        }
+        Some(_) => {
+            println!("[{role}] bridge-closed during fallback -- done");
+            Ok(())
+        }
+        None => Err("fallback deadline exceeded before any bridge activity".into()),
+    }
+}
+
 /// Send `data` on `stream_id` if non-empty; no-op otherwise.
 fn send(
     swarm: &mut Swarm<QuicTransport>,
@@ -1094,48 +1113,33 @@ fn candidate_addrs(
     external_addrs: &[Multiaddr],
     observed_addr: Option<Multiaddr>,
 ) -> Vec<Multiaddr> {
-    let mut candidates = Vec::with_capacity(external_addrs.len() + 2);
-    for addr in external_addrs {
-        push_candidate(role, &mut candidates, "manual", addr.clone());
+    let selection =
+        select_direct_candidates(external_addrs, observed_addr, Some(bound_addr.clone()));
+
+    for candidate in &selection.accepted {
+        println!(
+            "[{role}] candidate-added source={} addr={}",
+            candidate.source.as_str(),
+            candidate.addr
+        );
     }
-    if let Some(addr) = observed_addr {
-        push_candidate(role, &mut candidates, "identify-observed", addr);
+
+    for rejected in &selection.rejected {
+        println!(
+            "[{role}] candidate-skipped source={} addr={} reason={}",
+            rejected.source.as_str(),
+            rejected.addr,
+            rejected.reason.as_str()
+        );
     }
-    push_candidate(role, &mut candidates, "listen", bound_addr.clone());
-    if candidates.is_empty() {
+
+    if selection.is_empty() {
         eprintln!(
             "[{role}] no-dialable-dcutr-candidates; add --external-addr or bind a non-wildcard address"
         );
     }
-    candidates
-}
 
-fn push_candidate(role: &str, candidates: &mut Vec<Multiaddr>, source: &str, addr: Multiaddr) {
-    if is_wildcard_addr(&addr) {
-        println!(
-            "[{role}] candidate-skipped source={source} addr={addr} reason=wildcard-bind-address"
-        );
-        return;
-    }
-    if !addr.is_quic_transport() {
-        println!(
-            "[{role}] candidate-skipped source={source} addr={addr} reason=not-quic-transport"
-        );
-        return;
-    }
-    let before = candidates.len();
-    push_unique(candidates, addr.clone());
-    if candidates.len() > before {
-        println!("[{role}] candidate-added source={source} addr={addr}");
-    }
-}
-
-fn is_wildcard_addr(addr: &Multiaddr) -> bool {
-    match addr.protocols().first() {
-        Some(Protocol::Ip4(bytes)) => *bytes == [0, 0, 0, 0],
-        Some(Protocol::Ip6(bytes)) => *bytes == [0; 16],
-        _ => false,
-    }
+    selection.into_addrs()
 }
 
 fn relay_observed_addr(
@@ -1219,7 +1223,7 @@ fn successful_candidates_in_original_order(
     let mut ordered = Vec::new();
     for candidate in candidates {
         if successful.iter().any(|addr| addr == candidate) {
-            push_unique(&mut ordered, candidate.clone());
+            ordered.push(candidate.clone());
         }
     }
     ordered
@@ -1293,31 +1297,6 @@ mod tests {
         assert_eq!(dialback_bind_addrs(&dns4), &["0.0.0.0:0"]);
         assert_eq!(dialback_bind_addrs(&ip6), &["[::]:0"]);
         assert_eq!(dialback_bind_addrs(&dns6), &["[::]:0"]);
-    }
-
-    #[test]
-    fn candidate_addrs_filters_wildcard_bind_addresses() {
-        let bound = Multiaddr::from_str("/ip4/0.0.0.0/udp/4001/quic-v1").unwrap();
-        let external = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
-        let observed = Multiaddr::from_str("/ip4/198.51.100.9/udp/5001/quic-v1").unwrap();
-
-        let candidates = candidate_addrs(
-            "test",
-            &bound,
-            core::slice::from_ref(&external),
-            Some(observed.clone()),
-        );
-
-        assert_eq!(candidates, vec![external, observed]);
-    }
-
-    #[test]
-    fn candidate_addrs_keeps_non_wildcard_listen_address() {
-        let bound = Multiaddr::from_str("/ip4/127.0.0.1/udp/4001/quic-v1").unwrap();
-
-        let candidates = candidate_addrs("test", &bound, &[], None);
-
-        assert_eq!(candidates, vec![bound]);
     }
 
     #[test]

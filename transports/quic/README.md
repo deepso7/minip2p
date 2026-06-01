@@ -40,7 +40,7 @@ let listen_addr = Multiaddr::from_protocols(vec![
 ]);
 listener.listen(&listen_addr)?;
 
-let dialer_cfg = QuicNodeConfig::dev_dialer();
+let dialer_cfg = QuicNodeConfig::generate();
 let mut dialer = QuicTransport::new(dialer_cfg, "127.0.0.1:0")?;
 
 let peer_addr = PeerAddr::new(listen_addr, listener_key.peer_id())?;
