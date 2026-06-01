@@ -18,8 +18,6 @@ pub enum TransportError {
     ResourceExhausted { resource: &'static str },
     #[error("connection {id} not found")]
     ConnectionNotFound { id: ConnectionId },
-    #[error("connection {id} already exists")]
-    ConnectionExists { id: ConnectionId },
     #[error("connection {id} is {state}, expected {expected}")]
     InvalidState {
         id: ConnectionId,

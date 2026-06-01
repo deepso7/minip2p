@@ -16,7 +16,7 @@ mod protocol;
 
 pub use candidates::{
     DirectCandidate, DirectCandidateRejectReason, DirectCandidateRejection,
-    DirectCandidateSelection, DirectCandidateSource, is_wildcard_addr, select_direct_candidates,
+    DirectCandidateSelection, DirectCandidateSource, select_direct_candidates,
 };
 pub use error::{MultiaddrError, PeerAddrError};
 pub use minip2p_identity::PeerId;

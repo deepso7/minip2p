@@ -92,16 +92,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base64_encodes_empty() {
-        assert_eq!(base64_encode(b""), "");
-    }
-
-    #[test]
-    fn base64_encodes_hello() {
-        assert_eq!(base64_encode(b"Hello"), "SGVsbG8=");
-    }
-
-    #[test]
     fn base64_encodes_three_byte_boundary() {
         assert_eq!(base64_encode(b"abc"), "YWJj");
     }

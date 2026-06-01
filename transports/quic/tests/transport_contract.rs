@@ -13,9 +13,8 @@ use minip2p_transport::{ConnectionId, Transport, TransportError, TransportEvent}
 // ---------------------------------------------------------------------------
 
 fn setup_pair() -> (QuicTransport, QuicTransport, PeerAddr) {
-    let mut server =
-        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("server");
-    let client = QuicTransport::new(QuicNodeConfig::dev_dialer(), "127.0.0.1:0").expect("client");
+    let mut server = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server");
+    let client = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("client");
 
     server.listen_on_bound_addr().expect("listen");
     let peer_addr = server.local_peer_addr().expect("peer addr");
@@ -104,7 +103,7 @@ fn connect_pair(
 #[test]
 fn listen_returns_the_resolved_listen_address_and_event_matches() {
     let mut listener =
-        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("listener");
+        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("listener");
     let requested = listener.local_multiaddr().expect("local multiaddr");
 
     let resolved = listener.listen(&requested).expect("listen");
@@ -353,7 +352,7 @@ fn reset_stream_emits_stream_closed() {
 #[test]
 fn open_stream_on_unknown_connection_returns_not_found() {
     let mut transport =
-        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("bind");
+        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
 
     let err = transport
         .open_stream(ConnectionId::new(999))
@@ -364,7 +363,7 @@ fn open_stream_on_unknown_connection_returns_not_found() {
 #[test]
 fn send_on_unknown_connection_returns_not_found() {
     let mut transport =
-        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("bind");
+        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
 
     let err = transport
         .send_stream(ConnectionId::new(999), 0.into(), b"data".to_vec())
@@ -375,7 +374,7 @@ fn send_on_unknown_connection_returns_not_found() {
 #[test]
 fn poll_returns_empty_when_idle() {
     let mut transport =
-        QuicTransport::new(QuicNodeConfig::dev_listener(), "127.0.0.1:0").expect("bind");
+        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
 
     let events = transport.poll().expect("poll");
     assert!(events.is_empty(), "idle poll must return empty vec");

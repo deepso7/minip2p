@@ -364,11 +364,6 @@ impl QuicTransport {
         self.listen(&multiaddr)
     }
 
-    /// Dials a peer, automatically allocating a connection id.
-    pub fn dial_auto(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
-        self.dial(addr)
-    }
-
     /// Returns all active connection ids for the given peer.
     pub fn connection_ids_for_peer(&self, peer_id: &PeerId) -> Vec<ConnectionId> {
         self.peer_connections
@@ -526,10 +521,7 @@ impl Transport for QuicTransport {
         );
         let source_cid = conn.source_cid_bytes();
 
-        if self.connections.insert(id, conn).is_some() {
-            return Err(TransportError::ConnectionExists { id });
-        }
-
+        self.connections.insert(id, conn);
         self.cid_to_connection.insert(source_cid, id);
         self.index_peer_connection(addr.peer_id().clone(), id);
 

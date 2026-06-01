@@ -65,8 +65,22 @@ pub struct DirectCandidate {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DirectCandidateSelection {
     pub accepted: Vec<DirectCandidate>,
-    pub candidates: Vec<Multiaddr>,
     pub rejected: Vec<DirectCandidateRejection>,
+}
+
+impl DirectCandidateSelection {
+    /// Returns true when no dialable candidates were accepted.
+    pub fn is_empty(&self) -> bool {
+        self.accepted.is_empty()
+    }
+
+    /// Consumes the selection and returns accepted candidate addresses in order.
+    pub fn into_addrs(self) -> Vec<Multiaddr> {
+        self.accepted
+            .into_iter()
+            .map(|candidate| candidate.addr)
+            .collect()
+    }
 }
 
 /// Selects dialable direct-connect candidates in deterministic priority order.
@@ -84,13 +98,9 @@ pub fn select_direct_candidates(
     identify_observed: Option<Multiaddr>,
     listen: Option<Multiaddr>,
 ) -> DirectCandidateSelection {
+    let capacity = manual.len() + identify_observed.is_some() as usize + listen.is_some() as usize;
     let mut selection = DirectCandidateSelection {
-        candidates: Vec::with_capacity(
-            manual.len() + identify_observed.is_some() as usize + listen.is_some() as usize,
-        ),
-        accepted: Vec::with_capacity(
-            manual.len() + identify_observed.is_some() as usize + listen.is_some() as usize,
-        ),
+        accepted: Vec::with_capacity(capacity),
         rejected: Vec::new(),
     };
 
@@ -135,9 +145,9 @@ fn push_candidate(
         return;
     }
     if selection
-        .candidates
+        .accepted
         .iter()
-        .any(|existing| existing == &addr)
+        .any(|candidate| candidate.addr == addr)
     {
         reject(
             selection,
@@ -148,11 +158,7 @@ fn push_candidate(
         return;
     }
 
-    selection.accepted.push(DirectCandidate {
-        source,
-        addr: addr.clone(),
-    });
-    selection.candidates.push(addr);
+    selection.accepted.push(DirectCandidate { source, addr });
 }
 
 fn reject(
@@ -169,7 +175,7 @@ fn reject(
 }
 
 /// Returns true when the multiaddr starts with a wildcard IP host.
-pub fn is_wildcard_addr(addr: &Multiaddr) -> bool {
+fn is_wildcard_addr(addr: &Multiaddr) -> bool {
     match addr.protocols().first() {
         Some(Protocol::Ip4(bytes)) => *bytes == [0, 0, 0, 0],
         Some(Protocol::Ip6(bytes)) => *bytes == [0; 16],
@@ -199,32 +205,37 @@ mod tests {
             Some(listen.clone()),
         );
 
-        assert_eq!(selected.candidates, vec![manual, observed, listen]);
         assert_eq!(selected.accepted.len(), 3);
         assert_eq!(selected.accepted[0].source, DirectCandidateSource::Manual);
+        assert_eq!(selected.accepted[0].addr, manual);
         assert_eq!(
             selected.accepted[1].source,
             DirectCandidateSource::IdentifyObserved
         );
+        assert_eq!(selected.accepted[1].addr, observed);
         assert_eq!(selected.accepted[2].source, DirectCandidateSource::Listen);
+        assert_eq!(selected.accepted[2].addr, listen);
         assert!(selected.rejected.is_empty());
     }
 
     #[test]
     fn rejects_wildcard_listen_addresses() {
-        let listen = addr("/ip4/0.0.0.0/udp/4001/quic-v1");
+        for listen in [
+            addr("/ip4/0.0.0.0/udp/4001/quic-v1"),
+            addr("/ip6/::/udp/4001/quic-v1"),
+        ] {
+            let selected = select_direct_candidates(&[], None, Some(listen.clone()));
 
-        let selected = select_direct_candidates(&[], None, Some(listen.clone()));
-
-        assert!(selected.candidates.is_empty());
-        assert_eq!(
-            selected.rejected,
-            vec![DirectCandidateRejection {
-                source: DirectCandidateSource::Listen,
-                addr: listen,
-                reason: DirectCandidateRejectReason::WildcardBindAddress,
-            }]
-        );
+            assert!(selected.is_empty());
+            assert_eq!(
+                selected.rejected,
+                vec![DirectCandidateRejection {
+                    source: DirectCandidateSource::Listen,
+                    addr: listen,
+                    reason: DirectCandidateRejectReason::WildcardBindAddress,
+                }]
+            );
+        }
     }
 
     #[test]
@@ -233,7 +244,7 @@ mod tests {
 
         let selected = select_direct_candidates(core::slice::from_ref(&bad), None, None);
 
-        assert!(selected.candidates.is_empty());
+        assert!(selected.is_empty());
         assert_eq!(
             selected.rejected[0].reason,
             DirectCandidateRejectReason::NotQuicV1Transport
@@ -250,7 +261,7 @@ mod tests {
             Some(manual.clone()),
         );
 
-        assert_eq!(selected.candidates, vec![manual.clone()]);
+        assert_eq!(selected.clone().into_addrs(), vec![manual.clone()]);
         assert_eq!(selected.rejected.len(), 2);
         assert_eq!(
             selected.rejected[0].source,
@@ -265,11 +276,5 @@ mod tests {
             selected.rejected[1].reason,
             DirectCandidateRejectReason::Duplicate
         );
-    }
-
-    #[test]
-    fn detects_ipv6_wildcard() {
-        assert!(is_wildcard_addr(&addr("/ip6/::/udp/4001/quic-v1")));
-        assert!(!is_wildcard_addr(&addr("/ip6/::1/udp/4001/quic-v1")));
     }
 }

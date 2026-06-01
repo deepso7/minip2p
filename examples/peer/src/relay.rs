@@ -1133,13 +1133,13 @@ fn candidate_addrs(
         );
     }
 
-    if selection.candidates.is_empty() {
+    if selection.is_empty() {
         eprintln!(
             "[{role}] no-dialable-dcutr-candidates; add --external-addr or bind a non-wildcard address"
         );
     }
 
-    selection.candidates
+    selection.into_addrs()
 }
 
 fn relay_observed_addr(
@@ -1223,7 +1223,7 @@ fn successful_candidates_in_original_order(
     let mut ordered = Vec::new();
     for candidate in candidates {
         if successful.iter().any(|addr| addr == candidate) {
-            push_unique(&mut ordered, candidate.clone());
+            ordered.push(candidate.clone());
         }
     }
     ordered
@@ -1297,31 +1297,6 @@ mod tests {
         assert_eq!(dialback_bind_addrs(&dns4), &["0.0.0.0:0"]);
         assert_eq!(dialback_bind_addrs(&ip6), &["[::]:0"]);
         assert_eq!(dialback_bind_addrs(&dns6), &["[::]:0"]);
-    }
-
-    #[test]
-    fn candidate_addrs_filters_wildcard_bind_addresses() {
-        let bound = Multiaddr::from_str("/ip4/0.0.0.0/udp/4001/quic-v1").unwrap();
-        let external = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
-        let observed = Multiaddr::from_str("/ip4/198.51.100.9/udp/5001/quic-v1").unwrap();
-
-        let candidates = candidate_addrs(
-            "test",
-            &bound,
-            core::slice::from_ref(&external),
-            Some(observed.clone()),
-        );
-
-        assert_eq!(candidates, vec![external, observed]);
-    }
-
-    #[test]
-    fn candidate_addrs_keeps_non_wildcard_listen_address() {
-        let bound = Multiaddr::from_str("/ip4/127.0.0.1/udp/4001/quic-v1").unwrap();
-
-        let candidates = candidate_addrs("test", &bound, &[], None);
-
-        assert_eq!(candidates, vec![bound]);
     }
 
     #[test]

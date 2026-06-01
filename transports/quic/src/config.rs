@@ -22,13 +22,8 @@ impl QuicNodeConfig {
         Self { keypair }
     }
 
-    /// Convenience: generates a fresh keypair for a dev/test dialer.
-    pub fn dev_dialer() -> Self {
-        Self::new(Ed25519Keypair::generate())
-    }
-
-    /// Convenience: generates a fresh keypair for a dev/test listener.
-    pub fn dev_listener() -> Self {
+    /// Generates a configuration with a fresh Ed25519 host keypair.
+    pub fn generate() -> Self {
         Self::new(Ed25519Keypair::generate())
     }
 
