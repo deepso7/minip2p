@@ -258,16 +258,14 @@ impl AutoNatClient {
 
     fn try_decode_response(&mut self) -> Result<(), AutoNatError> {
         enforce_max_size(&self.recv_buf)?;
-        let (msg, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => {
-                let msg = Message::decode(payload)?;
-                (msg, consumed)
-            }
+        let (decoded, consumed) = match decode_frame(&self.recv_buf) {
+            FrameDecode::Complete { payload, consumed } => (Message::decode(payload), consumed),
             FrameDecode::Incomplete => return Ok(()),
             FrameDecode::TooLarge { len } => return Err(AutoNatError::FrameTooLarge { len }),
             FrameDecode::Error(e) => return Err(AutoNatError::Varint(e)),
         };
         self.recv_buf.drain(..consumed);
+        let msg = decoded?;
 
         if msg.kind != MessageType::DialResponse {
             self.state = FlowState::Done;
@@ -361,16 +359,14 @@ impl AutoNatServer {
 
     fn try_decode_request(&mut self) -> Result<(), AutoNatError> {
         enforce_max_size(&self.recv_buf)?;
-        let (msg, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => {
-                let msg = Message::decode(payload)?;
-                (msg, consumed)
-            }
+        let (decoded, consumed) = match decode_frame(&self.recv_buf) {
+            FrameDecode::Complete { payload, consumed } => (Message::decode(payload), consumed),
             FrameDecode::Incomplete => return Ok(()),
             FrameDecode::TooLarge { len } => return Err(AutoNatError::FrameTooLarge { len }),
             FrameDecode::Error(e) => return Err(AutoNatError::Varint(e)),
         };
         self.recv_buf.drain(..consumed);
+        let msg = decoded?;
 
         if msg.kind != MessageType::Dial {
             self.state = ServerState::Done;
@@ -718,6 +714,49 @@ mod tests {
         assert!(
             matches!(client.outcome(), Some(Reachability::Private { status: ResponseStatus::DialError, reason }) if reason == "all dialbacks failed")
         );
+    }
+
+    #[test]
+    fn client_consumes_bad_frame_before_decode_error() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let mut client = AutoNatClient::new(&peer_id, &[]);
+        let _ = client.take_outbound();
+
+        let bad_frame = encode_frame(&[TAG_TYPE, 99]);
+        assert!(matches!(
+            client.on_data(&bad_frame),
+            Err(AutoNatError::InvalidMessageType { value: 99 })
+        ));
+
+        let mut server = AutoNatServer::new();
+        server.respond_error(ResponseStatus::DialError, "after bad frame");
+        client.on_data(&server.take_outbound()).unwrap();
+
+        assert!(
+            matches!(client.outcome(), Some(Reachability::Private { status: ResponseStatus::DialError, reason }) if reason == "after bad frame")
+        );
+    }
+
+    #[test]
+    fn server_consumes_bad_frame_before_decode_error() {
+        let mut server = AutoNatServer::new();
+
+        let bad_frame = encode_frame(&[TAG_TYPE, 99]);
+        assert!(matches!(
+            server.on_data(&bad_frame),
+            Err(AutoNatError::InvalidMessageType { value: 99 })
+        ));
+
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let addr = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
+        let mut client = AutoNatClient::new(&peer_id, core::slice::from_ref(&addr));
+        server.on_data(&client.take_outbound()).unwrap();
+
+        let request = server
+            .request()
+            .expect("request should decode after bad frame");
+        assert_eq!(request.peer_id, peer_id);
+        assert_eq!(request.addrs, vec![addr]);
     }
 
     #[test]
