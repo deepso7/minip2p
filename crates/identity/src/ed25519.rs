@@ -1,10 +1,10 @@
 use core::fmt;
 
 use ed25519_dalek::{Signer, SigningKey};
-use rand_core::CryptoRngCore;
+use rand_core::CryptoRng;
 
 #[cfg(feature = "std")]
-use rand_core::OsRng;
+use rand_core::UnwrapErr;
 
 use crate::{KeyType, PeerId, PublicKey};
 
@@ -42,7 +42,7 @@ impl Ed25519Keypair {
     }
 
     /// Generates a new Ed25519 keypair using the provided CSPRNG.
-    pub fn generate_with_rng<R: CryptoRngCore + ?Sized>(rng: &mut R) -> Self {
+    pub fn generate_with_rng<R: CryptoRng + ?Sized>(rng: &mut R) -> Self {
         let signing_key = SigningKey::generate(rng);
         let secret_key = signing_key.to_bytes();
         let public_key = signing_key.verifying_key().to_bytes();
@@ -56,7 +56,7 @@ impl Ed25519Keypair {
     /// Generates a new Ed25519 keypair using OS randomness.
     #[cfg(feature = "std")]
     pub fn generate() -> Self {
-        let mut rng = OsRng;
+        let mut rng = UnwrapErr(getrandom::SysRng);
         Self::generate_with_rng(&mut rng)
     }
 
@@ -103,7 +103,9 @@ impl From<&Ed25519Keypair> for PeerId {
 
 #[cfg(test)]
 mod tests {
-    use rand_core::{CryptoRng, Error, RngCore};
+    use core::convert::Infallible;
+
+    use rand_core::{TryCryptoRng, TryRng};
 
     use super::*;
 
@@ -115,34 +117,32 @@ mod tests {
         }
     }
 
-    impl RngCore for TestRng {
-        fn next_u32(&mut self) -> u32 {
-            self.next_u64() as u32
+    impl TryRng for TestRng {
+        type Error = Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.try_next_u64()? as u32)
         }
 
-        fn next_u64(&mut self) -> u64 {
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
             self.0 = self
                 .0
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            self.0
+            Ok(self.0)
         }
 
-        fn fill_bytes(&mut self, dest: &mut [u8]) {
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
             for chunk in dest.chunks_mut(8) {
-                let bytes = self.next_u64().to_le_bytes();
+                let bytes = self.try_next_u64()?.to_le_bytes();
                 let len = chunk.len();
                 chunk.copy_from_slice(&bytes[..len]);
             }
-        }
-
-        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Error> {
-            self.fill_bytes(dest);
             Ok(())
         }
     }
 
-    impl CryptoRng for TestRng {}
+    impl TryCryptoRng for TestRng {}
 
     #[test]
     fn derives_public_key_and_peer_id_from_secret() {

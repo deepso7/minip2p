@@ -1,0 +1,6 @@
+[env]
+# BoringSSL's bindgen step can see Apple's clang target spelling
+# (`arm64-apple-darwin`) while Rust uses `aarch64-apple-darwin`.
+# Keep this target-specific so plain `cargo test` works on Apple Silicon
+# without changing builds for other targets.
+BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin = "--target=aarch64-apple-darwin"

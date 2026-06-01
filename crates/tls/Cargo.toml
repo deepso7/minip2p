@@ -35,14 +35,14 @@ std = [
 # sha2 0.10).
 [dependencies]
 minip2p-identity = { path = "../identity", default-features = false, features = ["ed25519"] }
-der = { version = "0.8", default-features = false, features = ["alloc", "oid"] }
+der = { version = "0.8.0", default-features = false, features = ["alloc", "oid"] }
 x509-cert = { version = "0.3.0-rc.4", default-features = false, features = ["builder"] }
-const-oid = { version = "0.10", default-features = false }
-spki = { version = "0.8", default-features = false, features = ["alloc"] }
-thiserror = { version = "2", default-features = false }
+const-oid = { version = "0.10.2", default-features = false }
+spki = { version = "0.8.0", default-features = false, features = ["alloc"] }
+thiserror = { version = "2.0.18", default-features = false }
 p256 = { version = "0.14.0-rc.9", default-features = false, features = ["ecdsa", "pkcs8", "alloc"] }
-ecdsa = { version = "0.17.0-rc.17", default-features = false, features = ["der", "alloc"] }
-signature = { version = "3.0.0-rc.10", default-features = false }
-sha2 = { version = "0.11", default-features = false, features = ["oid"] }
-rand_core = { version = "0.10", default-features = false }
-getrandom = { version = "0.4", default-features = false, optional = true, features = ["sys_rng"] }
+ecdsa = { version = "0.17.0-rc.18", default-features = false, features = ["der", "alloc"] }
+signature = { version = "3.0.0", default-features = false }
+sha2 = { version = "0.11.0", default-features = false, features = ["oid"] }
+rand_core = { version = "0.10.1", default-features = false }
+getrandom = { version = "0.4.2", default-features = false, optional = true, features = ["sys_rng"] }

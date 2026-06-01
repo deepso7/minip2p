@@ -8,9 +8,9 @@ minip2p-transport = { path = "../../crates/transport" }
 minip2p-identity = { path = "../../crates/identity" }
 minip2p-core = { path = "../../crates/core" }
 minip2p-tls = { path = "../../crates/tls" }
-boring = "4"
-quiche = { version = "0.28", features = ["boringssl-boring-crate"] }
-getrandom = "0.4"
+boring = "4.22.0"
+quiche = { version = "0.29.1", features = ["boringssl-boring-crate"] }
+getrandom = "0.4.2"
 
 [dev-dependencies]
 minip2p-multistream-select = { path = "../../crates/multistream-select" }

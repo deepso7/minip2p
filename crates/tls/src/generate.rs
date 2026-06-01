@@ -210,13 +210,66 @@ impl der::Encode for Libp2pExtension {
 
 #[cfg(test)]
 mod tests {
+    use core::{convert::Infallible, time::Duration};
+
+    use rand_core::{TryCryptoRng, TryRng};
+    use x509_cert::time::Time;
+
     use super::*;
     use crate::verify::verify_libp2p_certificate;
 
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+    }
+
+    impl TryRng for TestRng {
+        type Error = Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.try_next_u64()? as u32)
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            Ok(self.0)
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+            for chunk in dest.chunks_mut(8) {
+                let bytes = self.try_next_u64()?.to_le_bytes();
+                let len = chunk.len();
+                chunk.copy_from_slice(&bytes[..len]);
+            }
+            Ok(())
+        }
+    }
+
+    impl TryCryptoRng for TestRng {}
+
+    fn test_validity() -> Validity {
+        let not_before = der::DateTime::from_unix_duration(Duration::from_secs(1_600_000_000))
+            .expect("valid not_before");
+        let not_after = der::DateTime::from_unix_duration(Duration::from_secs(4_700_000_000))
+            .expect("valid not_after");
+        Validity::new(Time::from(not_before), Time::from(not_after))
+    }
+
+    fn generate_test_certificate(keypair: &Ed25519Keypair, seed: u64) -> (Vec<u8>, Vec<u8>) {
+        let mut rng = TestRng::new(seed);
+        generate_certificate_with_rng(keypair, test_validity(), &mut rng).expect("must generate")
+    }
+
     #[test]
     fn round_trip_generate_and_verify() {
-        let keypair = Ed25519Keypair::generate();
-        let (cert_der, _key_der) = generate_certificate(&keypair).expect("must generate");
+        let keypair = Ed25519Keypair::from_secret_key_bytes([7u8; 32]);
+        let (cert_der, _key_der) = generate_test_certificate(&keypair, 1);
 
         let peer_id = verify_libp2p_certificate(&cert_der).expect("must verify");
         assert_eq!(peer_id, keypair.peer_id());
@@ -224,11 +277,11 @@ mod tests {
 
     #[test]
     fn different_keypairs_produce_different_peer_ids() {
-        let kp1 = Ed25519Keypair::generate();
-        let kp2 = Ed25519Keypair::generate();
+        let kp1 = Ed25519Keypair::from_secret_key_bytes([1u8; 32]);
+        let kp2 = Ed25519Keypair::from_secret_key_bytes([2u8; 32]);
 
-        let (cert1, _) = generate_certificate(&kp1).unwrap();
-        let (cert2, _) = generate_certificate(&kp2).unwrap();
+        let (cert1, _) = generate_test_certificate(&kp1, 11);
+        let (cert2, _) = generate_test_certificate(&kp2, 22);
 
         let pid1 = verify_libp2p_certificate(&cert1).unwrap();
         let pid2 = verify_libp2p_certificate(&cert2).unwrap();

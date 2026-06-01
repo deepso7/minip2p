@@ -6,12 +6,13 @@ readme = "README.md"
 
 [features]
 default = ["std", "ed25519"]
-std = ["thiserror/std", "multihash/std", "rand_core/std", "rand_core/getrandom"]
+std = ["thiserror/std", "multihash/std", "dep:getrandom", "getrandom/sys_rng"]
 ed25519 = ["dep:ed25519-dalek", "dep:rand_core", "ed25519-dalek/rand_core"]
 
 [dependencies]
-multihash = { version = "0.19", default-features = false, features = ["alloc"] }
-sha2 = { version = "0.10", default-features = false }
-thiserror = { version = "2", default-features = false }
-ed25519-dalek = { version = "2.2", default-features = false, optional = true }
-rand_core = { version = "0.6.4", default-features = false, optional = true }
+multihash = { version = "0.19.5", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.11.0", default-features = false }
+thiserror = { version = "2.0.18", default-features = false }
+ed25519-dalek = { version = "3.0.0-rc.0", default-features = false, optional = true }
+rand_core = { version = "0.10.1", default-features = false, optional = true }
+getrandom = { version = "0.4.2", default-features = false, optional = true }
