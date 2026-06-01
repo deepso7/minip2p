@@ -214,8 +214,14 @@ impl DcutrInitiator {
             e
         })?;
 
-        let (payload, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => (payload.to_vec(), consumed),
+        let (reply, consumed) = match decode_frame(&self.recv_buf) {
+            FrameDecode::Complete { payload, consumed } => {
+                let reply = HolePunch::decode(payload).map_err(|e| {
+                    self.state = InitiatorState::Done;
+                    DcutrError::Malformed(e)
+                })?;
+                (reply, consumed)
+            }
             FrameDecode::Incomplete => return Ok(()),
             FrameDecode::Error(e) => {
                 self.state = InitiatorState::Done;
@@ -223,11 +229,6 @@ impl DcutrInitiator {
             }
         };
         self.recv_buf.drain(..consumed);
-
-        let reply = HolePunch::decode(&payload).map_err(|e| {
-            self.state = InitiatorState::Done;
-            DcutrError::Malformed(e)
-        })?;
 
         if reply.kind != HolePunchType::Connect {
             self.state = InitiatorState::Done;
@@ -357,8 +358,14 @@ impl DcutrResponder {
                 e
             })?;
 
-            let (payload, consumed) = match decode_frame(&self.recv_buf) {
-                FrameDecode::Complete { payload, consumed } => (payload.to_vec(), consumed),
+            let (msg, consumed) = match decode_frame(&self.recv_buf) {
+                FrameDecode::Complete { payload, consumed } => {
+                    let msg = HolePunch::decode(payload).map_err(|e| {
+                        self.state = ResponderState::Done;
+                        DcutrError::Malformed(e)
+                    })?;
+                    (msg, consumed)
+                }
                 FrameDecode::Incomplete => return Ok(()),
                 FrameDecode::Error(e) => {
                     self.state = ResponderState::Done;
@@ -366,11 +373,6 @@ impl DcutrResponder {
                 }
             };
             self.recv_buf.drain(..consumed);
-
-            let msg = HolePunch::decode(&payload).map_err(|e| {
-                self.state = ResponderState::Done;
-                DcutrError::Malformed(e)
-            })?;
 
             match (self.state, msg.kind) {
                 (ResponderState::AwaitingConnect, HolePunchType::Connect) => {

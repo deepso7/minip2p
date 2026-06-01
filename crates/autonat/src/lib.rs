@@ -13,7 +13,7 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId, VarintError, read_uvarint, write_uvarint};
+use minip2p_core::{Multiaddr, PeerId, VarintError, read_uvarint, uvarint_len, write_uvarint};
 
 /// Protocol id for AutoNAT v1.
 pub const AUTONAT_PROTOCOL_ID: &str = "/libp2p/autonat/1.0.0";
@@ -258,15 +258,17 @@ impl AutoNatClient {
 
     fn try_decode_response(&mut self) -> Result<(), AutoNatError> {
         enforce_max_size(&self.recv_buf)?;
-        let (payload, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => (payload.to_vec(), consumed),
+        let (msg, consumed) = match decode_frame(&self.recv_buf) {
+            FrameDecode::Complete { payload, consumed } => {
+                let msg = Message::decode(payload)?;
+                (msg, consumed)
+            }
             FrameDecode::Incomplete => return Ok(()),
             FrameDecode::TooLarge { len } => return Err(AutoNatError::FrameTooLarge { len }),
             FrameDecode::Error(e) => return Err(AutoNatError::Varint(e)),
         };
         self.recv_buf.drain(..consumed);
 
-        let msg = Message::decode(&payload)?;
         if msg.kind != MessageType::DialResponse {
             self.state = FlowState::Done;
             return Err(AutoNatError::UnexpectedMessage(
@@ -359,15 +361,17 @@ impl AutoNatServer {
 
     fn try_decode_request(&mut self) -> Result<(), AutoNatError> {
         enforce_max_size(&self.recv_buf)?;
-        let (payload, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => (payload.to_vec(), consumed),
+        let (msg, consumed) = match decode_frame(&self.recv_buf) {
+            FrameDecode::Complete { payload, consumed } => {
+                let msg = Message::decode(payload)?;
+                (msg, consumed)
+            }
             FrameDecode::Incomplete => return Ok(()),
             FrameDecode::TooLarge { len } => return Err(AutoNatError::FrameTooLarge { len }),
             FrameDecode::Error(e) => return Err(AutoNatError::Varint(e)),
         };
         self.recv_buf.drain(..consumed);
 
-        let msg = Message::decode(&payload)?;
         if msg.kind != MessageType::Dial {
             self.state = ServerState::Done;
             return Err(AutoNatError::UnexpectedMessage("expected DIAL".into()));
@@ -408,7 +412,7 @@ pub enum FrameDecode<'a> {
 
 /// Encodes a protobuf message body with a varint length prefix.
 pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(uvarint_len(payload.len() as u64) + payload.len());
     write_uvarint(payload.len() as u64, &mut out);
     out.extend_from_slice(payload);
     out
