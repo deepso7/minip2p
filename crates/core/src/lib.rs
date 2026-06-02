@@ -9,6 +9,7 @@
 extern crate alloc;
 
 mod candidates;
+mod direct_paths;
 mod error;
 mod external_addresses;
 mod multiaddr;
@@ -18,6 +19,10 @@ mod protocol;
 pub use candidates::{
     DirectCandidate, DirectCandidateRejectReason, DirectCandidateRejection,
     DirectCandidateSelection, DirectCandidateSource, select_direct_candidates,
+};
+pub use direct_paths::{
+    DEFAULT_DIRECT_PATH_RETRY_MS, DirectPath, DirectPathBook, DirectPathSource, DirectPathStatus,
+    DirectPathUpdate, MAX_DIRECT_PATHS,
 };
 pub use error::{MultiaddrError, PeerAddrError};
 pub use external_addresses::{

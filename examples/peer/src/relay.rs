@@ -15,7 +15,8 @@ use minip2p_autonat::{
     AUTONAT_PROTOCOL_ID, AutoNatClient, AutoNatServer, Reachability, ResponseStatus,
 };
 use minip2p_core::{
-    ExternalAddressSource, Multiaddr, PeerAddr, PeerId, Protocol, select_direct_candidates,
+    DirectPathBook, DirectPathSource, ExternalAddressSource, Multiaddr, PeerAddr, PeerId, Protocol,
+    select_direct_candidates,
 };
 use minip2p_dcutr::{
     DCUTR_PROTOCOL_ID, DcutrInitiator, DcutrResponder, InitiatorOutcome, ResponderEvent,
@@ -195,10 +196,17 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
 
     // --- 6. Hole-punch: dial + blast UDP, wait for direct or timeout -------
     println!("[{role}] dcutr-sync-received -> holepunching");
-    print_remote_candidates(role, &remote_addrs);
-    dial_direct_candidates(&mut swarm, role, &remote_peer_id, &remote_addrs);
     let punch_start = Instant::now();
     let punch_deadline = punch_start + HOLEPUNCH_DEADLINE;
+    let mut remote_paths = remote_path_book(&remote_addrs);
+    print_remote_paths(role, &remote_paths);
+    dial_direct_candidates(
+        &mut swarm,
+        role,
+        &remote_peer_id,
+        &mut remote_paths,
+        elapsed_ms(punch_start),
+    );
     let mut next_blast = punch_start + RESPONDER_SYNC_DELAY;
 
     // Extract the host+port shape of each address we expect the remote
@@ -213,8 +221,11 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     // comparison prevents unrelated inbound connections -- relay
     // probe-backs, autonat probes, random scanners -- from being
     // misinterpreted as hole-punch success.
-    let remote_match_targets: Vec<(String, u16)> =
-        remote_addrs.iter().filter_map(extract_ip_port).collect();
+    let remote_match_targets: Vec<(String, u16)> = remote_paths
+        .addrs()
+        .iter()
+        .filter_map(extract_ip_port)
+        .collect();
 
     // Check any connections already present (e.g. the remote's direct
     // Initial may have arrived BEFORE we observed the SYNC message on
@@ -230,7 +241,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
             break HolePunchOutcome::Timeout;
         }
         if now >= next_blast {
-            blast_remote_addrs(&swarm, &remote_addrs, role);
+            blast_remote_paths(&swarm, &remote_paths, role);
             next_blast = now + next_holepunch_delay();
         }
 
@@ -274,6 +285,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     // --- 7. Resolve based on the hole-punch outcome -------------------------
     match outcome {
         HolePunchOutcome::DirectConnected(peer_id) => {
+            print_direct_path_summary(role, "hole-punch-open", &remote_paths);
             println!("[{role}] direct-connected peer={peer_id} (hole-punch success)");
             ping_and_exit(&mut swarm, role, peer_id, deadline)
         }
@@ -314,6 +326,8 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
             Ok(())
         }
         HolePunchOutcome::Timeout => {
+            remote_paths.fail_attempts(elapsed_ms(punch_start));
+            print_direct_path_summary(role, "hole-punch-failed", &remote_paths);
             println!("[{role}] hole-punch-timeout reason=deadline elapsed -> relay-ping fallback");
             relay_ping_fallback(&mut swarm, role, &relay_peer_id, bridge_stream)
         }
@@ -500,7 +514,8 @@ pub fn run_dial(
         "[{role}] dcutr-dialnow addrs={} rtt={rtt_ms}ms",
         remote_addrs.len()
     );
-    print_remote_candidates(role, &remote_addrs);
+    let mut remote_paths = remote_path_book(&remote_addrs);
+    print_remote_paths(role, &remote_paths);
 
     // --- 4. Flush SYNC and dial every observed remote address in parallel --
     dcutr
@@ -513,15 +528,23 @@ pub fn run_dial(
         dcutr.take_outbound(),
     )?;
 
-    dial_direct_candidates(&mut swarm, role, &target, &remote_addrs);
+    let punch_start = Instant::now();
+    dial_direct_candidates(
+        &mut swarm,
+        role,
+        &target,
+        &mut remote_paths,
+        elapsed_ms(punch_start),
+    );
 
     // --- 5. Wait for direct connection or hole-punch timeout ---------------
     let punched = wait_for_direct_with_udp_blast(
         &mut swarm,
         role,
         &target,
-        &remote_addrs,
-        Instant::now() + HOLEPUNCH_DEADLINE,
+        &mut remote_paths,
+        punch_start,
+        punch_start + HOLEPUNCH_DEADLINE,
     )?;
 
     // --- 6. Direct ping or relay-ping fallback -----------------------------
@@ -921,16 +944,34 @@ fn drain_dcutr_responder_events(
     sync
 }
 
+fn remote_path_book(addrs: &[Multiaddr]) -> DirectPathBook {
+    let mut book = DirectPathBook::new();
+    for addr in addrs.iter().rev() {
+        book.insert(DirectPathSource::Dcutr, addr.clone(), 0);
+    }
+    book
+}
+
 fn dial_direct_candidates(
     swarm: &mut Swarm<QuicTransport>,
     role: &str,
     peer_id: &PeerId,
-    addrs: &[Multiaddr],
+    paths: &mut DirectPathBook,
+    now_ms: u64,
 ) {
+    let addrs = paths.begin_attempts(now_ms);
+    if addrs.is_empty() {
+        println!("[{role}] direct-dial-skipped reason=no-path-ready");
+        return;
+    }
+
     for addr in addrs {
         match PeerAddr::new(addr.clone(), peer_id.clone()) {
             Ok(peer_addr) => match swarm.dial(&peer_addr) {
-                Ok(_) => println!("[{role}] direct-dial-attempt {peer_addr}"),
+                Ok(_) => {
+                    let attempts = path_attempts(paths, &addr).unwrap_or_default();
+                    println!("[{role}] direct-dial-attempt attempt={attempts} {peer_addr}");
+                }
                 Err(e) => eprintln!("[{role}] direct-dial-failed addr={peer_addr} reason={e}"),
             },
             Err(e) => eprintln!("[{role}] bad PeerAddr for {addr}: {e}"),
@@ -942,23 +983,27 @@ fn wait_for_direct_with_udp_blast(
     swarm: &mut Swarm<QuicTransport>,
     role: &str,
     peer_id: &PeerId,
-    addrs: &[Multiaddr],
+    paths: &mut DirectPathBook,
+    started_at: Instant,
     deadline: Instant,
 ) -> Result<bool, Box<dyn Error>> {
     let mut next_blast = Instant::now();
     loop {
         let now = Instant::now();
         if now >= deadline {
+            paths.fail_attempts(elapsed_ms(started_at));
+            print_direct_path_summary(role, "hole-punch-failed", paths);
             return Ok(false);
         }
         if now >= next_blast {
-            blast_remote_addrs(swarm, addrs, role);
+            blast_remote_paths(swarm, paths, role);
             next_blast = now + next_holepunch_delay();
         }
 
         for ev in swarm.poll().map_err(|e| format!("holepunch poll: {e}"))? {
             print_event(role, &ev);
             if matches!(&ev, SwarmEvent::ConnectionEstablished { peer_id: p } if p == peer_id) {
+                print_direct_path_summary(role, "hole-punch-open", paths);
                 return Ok(true);
             }
         }
@@ -1334,22 +1379,56 @@ fn print_candidates(role: &str, candidates: &[Multiaddr]) {
     println!("[{role}] dcutr-candidates [{rendered}]");
 }
 
-fn print_remote_candidates(role: &str, candidates: &[Multiaddr]) {
-    let rendered = candidates
+fn print_remote_paths(role: &str, paths: &DirectPathBook) {
+    print_direct_path_summary(role, "remote-direct-paths", paths);
+}
+
+fn print_direct_path_summary(role: &str, label: &str, paths: &DirectPathBook) {
+    if paths.is_empty() {
+        println!("[{role}] {label} []");
+        return;
+    }
+
+    let rendered = paths
+        .paths()
         .iter()
-        .map(ToString::to_string)
+        .map(|path| {
+            format!(
+                "{};source={};status={};attempts={}",
+                path.addr,
+                path.source.as_str(),
+                path.status.as_str(),
+                path.attempts
+            )
+        })
         .collect::<Vec<_>>()
         .join(",");
-    println!("[{role}] remote-dcutr-candidates [{rendered}]");
+    println!("[{role}] {label} [{rendered}]");
+}
+
+fn path_attempts(paths: &DirectPathBook, addr: &Multiaddr) -> Option<u32> {
+    paths
+        .paths()
+        .iter()
+        .find(|path| &path.addr == addr)
+        .map(|path| path.attempts)
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis() as u64
 }
 
 /// Sends a random 32-byte UDP payload to every remote address. These
 /// packets open the NAT binding so the remote's QUIC packets can reach
 /// us; the content is irrelevant per the DCUtR spec.
-fn blast_remote_addrs(swarm: &Swarm<QuicTransport>, addrs: &[Multiaddr], role: &str) {
+fn blast_remote_paths(swarm: &Swarm<QuicTransport>, paths: &DirectPathBook, role: &str) {
     let payload = random_bytes(RELAY_PING_LEN);
+    let addrs = match paths.usable_addrs() {
+        addrs if addrs.is_empty() => paths.addrs(),
+        addrs => addrs,
+    };
     for addr in addrs {
-        if let Err(e) = swarm.transport().send_raw_udp(addr, &payload) {
+        if let Err(e) = swarm.transport().send_raw_udp(&addr, &payload) {
             eprintln!("[{role}] udp-blast {addr} failed: {e}");
         }
     }
