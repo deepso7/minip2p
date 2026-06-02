@@ -52,6 +52,11 @@ const HOLEPUNCH_DEADLINE: Duration = Duration::from_secs(10);
 const HOLEPUNCH_INTERVAL_MIN_MS: u64 = 10;
 /// Maximum UDP blast cadence during hole-punch.
 const HOLEPUNCH_INTERVAL_MAX_MS: u64 = 200;
+/// How often to re-open direct QUIC dials while the hole-punch window is open.
+const HOLEPUNCH_REDIAL_INTERVAL: Duration = Duration::from_millis(250);
+/// DCUtR paths are short-lived and only used during the active punch window,
+/// so the std runner controls retry cadence directly.
+const HOLEPUNCH_DIRECT_PATH_RETRY_MS: u64 = 0;
 /// Approximation of RTT/2 before the responder starts blasting UDP.
 const RESPONDER_SYNC_DELAY: Duration = Duration::from_millis(50);
 /// Payload length used by the relay-ping fallback.
@@ -229,6 +234,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         elapsed_ms(punch_start),
     );
     let mut next_blast = punch_start + RESPONDER_SYNC_DELAY;
+    let mut next_redial = punch_start + HOLEPUNCH_REDIAL_INTERVAL;
 
     // Extract the host+port shape of each address we expect the remote
     // to dial from. We compare against the transport addresses (no
@@ -264,6 +270,17 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         if now >= next_blast {
             blast_remote_paths(&swarm, &remote_paths, role);
             next_blast = now + next_holepunch_delay();
+        }
+        if now >= next_redial {
+            remote_paths.fail_attempts(elapsed_ms(punch_start));
+            dial_direct_candidates(
+                &mut swarm,
+                role,
+                &remote_peer_id,
+                &mut remote_paths,
+                elapsed_ms(punch_start),
+            );
+            next_redial = now + HOLEPUNCH_REDIAL_INTERVAL;
         }
 
         // Drain any events the transport has for us. Event ordering
@@ -1033,7 +1050,7 @@ fn drain_dcutr_responder_events(
 }
 
 fn remote_path_book(addrs: &[Multiaddr]) -> DirectPathBook {
-    let mut book = DirectPathBook::new();
+    let mut book = DirectPathBook::new().with_retry_interval_ms(HOLEPUNCH_DIRECT_PATH_RETRY_MS);
     for addr in addrs.iter().rev() {
         book.insert(DirectPathSource::Dcutr, addr.clone(), 0);
     }
@@ -1076,6 +1093,7 @@ fn wait_for_direct_with_udp_blast(
     deadline: Instant,
 ) -> Result<bool, Box<dyn Error>> {
     let mut next_blast = Instant::now();
+    let mut next_redial = started_at + HOLEPUNCH_REDIAL_INTERVAL;
     loop {
         let now = Instant::now();
         if now >= deadline {
@@ -1086,6 +1104,11 @@ fn wait_for_direct_with_udp_blast(
         if now >= next_blast {
             blast_remote_paths(swarm, paths, role);
             next_blast = now + next_holepunch_delay();
+        }
+        if now >= next_redial {
+            paths.fail_attempts(elapsed_ms(started_at));
+            dial_direct_candidates(swarm, role, peer_id, paths, elapsed_ms(started_at));
+            next_redial = now + HOLEPUNCH_REDIAL_INTERVAL;
         }
 
         for ev in swarm.poll().map_err(|e| format!("holepunch poll: {e}"))? {
