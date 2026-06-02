@@ -109,7 +109,14 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     let hop_stream = swarm
         .open_user_stream(&relay_peer_id, HOP_PROTOCOL_ID)
         .map_err(|e| format!("open HOP: {e}"))?;
-    wait_user_stream_ready(&mut swarm, role, hop_stream, deadline)?;
+    wait_user_stream_ready(
+        &mut swarm,
+        role,
+        &relay_peer_id,
+        hop_stream,
+        HOP_PROTOCOL_ID,
+        deadline,
+    )?;
     let mut reservation = HopReservation::new();
     send(
         &mut swarm,
@@ -119,7 +126,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     )?;
 
     while reservation.outcome().is_none() {
-        let data = wait_user_stream_data(&mut swarm, role, hop_stream, deadline)?;
+        let data = wait_user_stream_data(&mut swarm, role, &relay_peer_id, hop_stream, deadline)?;
         reservation
             .on_data(&data)
             .map_err(|e| format!("HOP decode: {e}"))?;
@@ -144,7 +151,8 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     // --- 4. STOP responder: accept the CONNECT, keep any pipelined bytes ---
     let mut stop = StopResponder::new();
     let remote_peer_id: PeerId = loop {
-        let data = wait_user_stream_data(&mut swarm, role, bridge_stream, deadline)?;
+        let data =
+            wait_user_stream_data(&mut swarm, role, &relay_peer_id, bridge_stream, deadline)?;
         stop.on_data(&data)
             .map_err(|e| format!("STOP decode: {e}"))?;
         if let Some(request) = stop.request() {
@@ -185,7 +193,8 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         if drain_dcutr_responder_events(&mut dcutr, role, &mut captured_remote_addrs) {
             break captured_remote_addrs.take().unwrap_or_default();
         }
-        let data = wait_user_stream_data(&mut swarm, role, bridge_stream, deadline)?;
+        let data =
+            wait_user_stream_data(&mut swarm, role, &relay_peer_id, bridge_stream, deadline)?;
         dcutr
             .on_data(&data)
             .map_err(|e| format!("DCUtR decode: {e}"))?;
@@ -259,7 +268,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
                     break 'outer HolePunchOutcome::DirectConnected(peer_id);
                 }
             }
-            if is_bridge_closed_event(&ev, bridge_stream) {
+            if is_bridge_closed_event(&ev, &relay_peer_id, bridge_stream) {
                 break 'outer HolePunchOutcome::BridgeClosed;
             }
         }
@@ -408,14 +417,19 @@ fn any_source_matches(sources: &[Multiaddr], targets: &[(String, u16)]) -> bool 
         .any(|src| targets.iter().any(|tgt| &src == tgt))
 }
 
-fn is_bridge_closed_event(ev: &SwarmEvent, bridge_stream: StreamId) -> bool {
+fn is_bridge_closed_event(
+    ev: &SwarmEvent,
+    relay_peer_id: &PeerId,
+    bridge_stream: StreamId,
+) -> bool {
     matches!(
         ev,
-        SwarmEvent::UserStreamRemoteWriteClosed { stream_id, .. }
-            if *stream_id == bridge_stream
+        SwarmEvent::UserStreamRemoteWriteClosed { peer_id, stream_id }
+            if peer_id == relay_peer_id && *stream_id == bridge_stream
     ) || matches!(
         ev,
-        SwarmEvent::UserStreamClosed { stream_id, .. } if *stream_id == bridge_stream
+        SwarmEvent::UserStreamClosed { peer_id, stream_id }
+            if peer_id == relay_peer_id && *stream_id == bridge_stream
     )
 }
 
@@ -465,12 +479,19 @@ pub fn run_dial(
     let hop_stream = swarm
         .open_user_stream(&relay_peer_id, HOP_PROTOCOL_ID)
         .map_err(|e| format!("open HOP: {e}"))?;
-    wait_user_stream_ready(&mut swarm, role, hop_stream, deadline)?;
+    wait_user_stream_ready(
+        &mut swarm,
+        role,
+        &relay_peer_id,
+        hop_stream,
+        HOP_PROTOCOL_ID,
+        deadline,
+    )?;
     let mut hop = HopConnect::new(target.to_bytes());
     send(&mut swarm, &relay_peer_id, hop_stream, hop.take_outbound())?;
 
     while hop.outcome().is_none() {
-        let data = wait_user_stream_data(&mut swarm, role, hop_stream, deadline)?;
+        let data = wait_user_stream_data(&mut swarm, role, &relay_peer_id, hop_stream, deadline)?;
         hop.on_data(&data).map_err(|e| format!("HOP decode: {e}"))?;
     }
     match hop.outcome() {
@@ -516,7 +537,8 @@ pub fn run_dial(
             }
             break (remote_addrs, rtt_ms);
         }
-        let data = wait_user_stream_data(&mut swarm, role, bridge_stream, deadline)?;
+        let data =
+            wait_user_stream_data(&mut swarm, role, &relay_peer_id, bridge_stream, deadline)?;
         let elapsed_ms = dcutr_sent_at.elapsed().as_millis() as u64;
         dcutr
             .on_data(&data, elapsed_ms)
@@ -569,7 +591,8 @@ pub fn run_dial(
         let sent_at = Instant::now();
         send(&mut swarm, &relay_peer_id, bridge_stream, payload.clone())?;
         loop {
-            let data = wait_user_stream_data(&mut swarm, role, bridge_stream, deadline)?;
+            let data =
+                wait_user_stream_data(&mut swarm, role, &relay_peer_id, bridge_stream, deadline)?;
             if data == payload {
                 let rtt = sent_at.elapsed().as_millis();
                 println!("[{role}] ping-via-relay peer={target} rtt={rtt}ms -- done");
@@ -635,7 +658,8 @@ fn handle_autonat_request(
     let mut server = AutoNatServer::new();
     let request_deadline = Instant::now() + AUTONAT_REQUEST_DEADLINE;
     let request = loop {
-        let data = wait_user_stream_data(swarm, role, stream_id, request_deadline)?;
+        let data =
+            wait_user_stream_data(swarm, role, &requester_peer, stream_id, request_deadline)?;
         server
             .on_data(&data)
             .map_err(|e| format!("AutoNAT decode: {e}"))?;
@@ -820,11 +844,13 @@ fn wait_connected(
         .ok_or_else(|| format!("deadline exceeded before connection to {peer_id}").into())
 }
 
-/// Wait for a locally-initiated `UserStreamReady` on `stream_id`.
+/// Wait for a locally-initiated `UserStreamReady` on a specific peer stream.
 fn wait_user_stream_ready(
     swarm: &mut Swarm<QuicTransport>,
     role: &str,
+    peer_id: &PeerId,
     stream_id: StreamId,
+    protocol_id: &str,
     deadline: Instant,
 ) -> Result<(), Box<dyn Error>> {
     let found = swarm
@@ -833,17 +859,20 @@ fn wait_user_stream_ready(
             matches!(
                 ev,
                 SwarmEvent::UserStreamReady {
+                    peer_id: p,
                     stream_id: s,
+                    protocol_id: pid,
                     initiated_locally: true,
-                    ..
-                } if *s == stream_id
+                } if p == peer_id && *s == stream_id && pid == protocol_id
             ) || matches!(
                 ev,
-                SwarmEvent::UserStreamClosed { stream_id: s, .. } if *s == stream_id
+                SwarmEvent::UserStreamClosed { peer_id: p, stream_id: s }
+                    if p == peer_id && *s == stream_id
             ) || matches!(
                 ev,
                 SwarmEvent::Error(error)
-                    if error.detail.contains(&format!("stream {stream_id}"))
+                    if error.peer_id.as_ref() == Some(peer_id)
+                        && error.detail.contains(&format!("stream {stream_id}"))
             )
         })
         .map_err(|e| format!("wait-user-stream-ready: {e}"))?;
@@ -892,11 +921,12 @@ fn wait_inbound_stream(
     Ok(stream_id)
 }
 
-/// Wait for the next `UserStreamData` event on `stream_id`, returning
-/// the data payload.
+/// Wait for the next `UserStreamData` event on a specific peer stream,
+/// returning the data payload.
 fn wait_user_stream_data(
     swarm: &mut Swarm<QuicTransport>,
     role: &str,
+    peer_id: &PeerId,
     stream_id: StreamId,
     deadline: Instant,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -905,7 +935,8 @@ fn wait_user_stream_data(
             print_event(role, ev);
             matches!(
                 ev,
-                SwarmEvent::UserStreamData { stream_id: s, .. } if *s == stream_id
+                SwarmEvent::UserStreamData { peer_id: p, stream_id: s, .. }
+                    if p == peer_id && *s == stream_id
             )
         })
         .map_err(|e| format!("wait-user-stream-data: {e}"))?
@@ -1040,8 +1071,9 @@ fn relay_ping_fallback(
             print_event(role, ev);
             matches!(
                 ev,
-                SwarmEvent::UserStreamData { stream_id: s, .. } if *s == bridge_stream
-            ) || is_bridge_closed_event(ev, bridge_stream)
+                SwarmEvent::UserStreamData { peer_id, stream_id: s, .. }
+                    if peer_id == relay_peer_id && *s == bridge_stream
+            ) || is_bridge_closed_event(ev, relay_peer_id, bridge_stream)
         })
         .map_err(|e| format!("fallback poll: {e}"))?;
 
@@ -1372,14 +1404,21 @@ fn validate_candidates_with_autonat(
         Instant::now() + autonat_probe_timeout(&probe_candidates),
         deadline,
     );
-    wait_user_stream_ready(swarm, role, stream_id, request_deadline)?;
+    wait_user_stream_ready(
+        swarm,
+        role,
+        &service_peer,
+        stream_id,
+        AUTONAT_PROTOCOL_ID,
+        request_deadline,
+    )?;
 
     let local_peer = swarm.local_peer_id().clone();
     let mut client = AutoNatClient::new(&local_peer, &probe_candidates);
     send(swarm, &service_peer, stream_id, client.take_outbound())?;
 
     while client.outcome().is_none() {
-        let data = wait_user_stream_data(swarm, role, stream_id, request_deadline)?;
+        let data = wait_user_stream_data(swarm, role, &service_peer, stream_id, request_deadline)?;
         client
             .on_data(&data)
             .map_err(|e| format!("AutoNAT decode: {e}"))?;
