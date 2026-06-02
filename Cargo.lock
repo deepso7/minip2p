@@ -641,6 +641,7 @@ name = "minip2p-peer"
 version = "0.1.0"
 dependencies = [
  "getrandom",
+ "libc",
  "minip2p-autonat",
  "minip2p-core",
  "minip2p-dcutr",

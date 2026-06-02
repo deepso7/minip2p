@@ -2,7 +2,7 @@
 
 use std::error::Error;
 use std::fs;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
 use minip2p_core::{Multiaddr, Protocol};
@@ -50,6 +50,94 @@ pub fn bind_addr(options: &RunOptions) -> Result<String, Box<dyn Error>> {
         Some(addr) => multiaddr_to_socket_addr(addr).map(|addr| addr.to_string()),
         None => Ok(DEFAULT_BIND.into()),
     }
+}
+
+/// Returns global IPv6 interface addresses using the UDP port from `bound_transport`.
+///
+/// This is std-only CLI glue for DCUtR experiments. Core remains transport and
+/// platform agnostic; the example merely turns local interface information into
+/// extra direct candidates when the user binds an IPv6 socket.
+pub fn local_global_ipv6_quic_addrs(bound_transport: &Multiaddr) -> Vec<Multiaddr> {
+    if !matches!(bound_transport.protocols().first(), Some(Protocol::Ip6(_))) {
+        return Vec::new();
+    }
+
+    let Some(port) = udp_port(bound_transport) else {
+        return Vec::new();
+    };
+
+    local_global_ipv6_addrs()
+        .into_iter()
+        .map(|ip| ipv6_quic_addr(ip, port))
+        .collect()
+}
+
+fn ipv6_quic_addr(ip: Ipv6Addr, port: u16) -> Multiaddr {
+    Multiaddr::from_protocols(vec![
+        Protocol::Ip6(ip.octets()),
+        Protocol::Udp(port),
+        Protocol::QuicV1,
+    ])
+}
+
+fn udp_port(addr: &Multiaddr) -> Option<u16> {
+    addr.protocols().iter().find_map(|protocol| match protocol {
+        Protocol::Udp(port) => Some(*port),
+        _ => None,
+    })
+}
+
+#[cfg(unix)]
+fn local_global_ipv6_addrs() -> Vec<Ipv6Addr> {
+    let mut head = std::ptr::null_mut();
+    let rc = unsafe { libc::getifaddrs(&mut head) };
+    if rc != 0 || head.is_null() {
+        return Vec::new();
+    }
+
+    struct IfAddrsGuard(*mut libc::ifaddrs);
+    impl Drop for IfAddrsGuard {
+        fn drop(&mut self) {
+            unsafe { libc::freeifaddrs(self.0) };
+        }
+    }
+    let _guard = IfAddrsGuard(head);
+
+    let mut addrs = Vec::new();
+    let mut cursor = head;
+    while !cursor.is_null() {
+        let ifaddr = unsafe { &*cursor };
+        if !ifaddr.ifa_addr.is_null() {
+            let family = unsafe { (*ifaddr.ifa_addr).sa_family as i32 };
+            if family == libc::AF_INET6 {
+                let sockaddr = unsafe { &*(ifaddr.ifa_addr as *const libc::sockaddr_in6) };
+                let ip = Ipv6Addr::from(sockaddr.sin6_addr.s6_addr);
+                if is_global_unicast_ipv6(&ip) && !addrs.iter().any(|existing| existing == &ip) {
+                    addrs.push(ip);
+                }
+            }
+        }
+        cursor = ifaddr.ifa_next;
+    }
+
+    addrs
+}
+
+#[cfg(not(unix))]
+fn local_global_ipv6_addrs() -> Vec<Ipv6Addr> {
+    Vec::new()
+}
+
+fn is_global_unicast_ipv6(ip: &Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    let first = segments[0];
+
+    !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && (first & 0xffc0) != 0xfe80
+        && (first & 0xfe00) != 0xfc00
+        && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
 }
 
 fn write_secret(
@@ -131,5 +219,41 @@ fn hex_value(byte: u8) -> Result<u8, String> {
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
         _ => Err(format!("non-hex byte 0x{byte:02x}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::str::FromStr;
+
+    use super::*;
+
+    #[test]
+    fn local_ipv6_candidates_use_bound_udp_port() {
+        let bound = Multiaddr::from_str("/ip6/::/udp/4242/quic-v1").unwrap();
+        let candidate = ipv6_quic_addr(Ipv6Addr::LOCALHOST, udp_port(&bound).unwrap());
+
+        assert_eq!(candidate.to_string(), "/ip6/::1/udp/4242/quic-v1");
+    }
+
+    #[test]
+    fn global_ipv6_filter_skips_non_public_ranges() {
+        assert!(!is_global_unicast_ipv6(&Ipv6Addr::UNSPECIFIED));
+        assert!(!is_global_unicast_ipv6(&Ipv6Addr::LOCALHOST));
+        assert!(!is_global_unicast_ipv6(
+            &Ipv6Addr::from_str("fe80::1").unwrap()
+        ));
+        assert!(!is_global_unicast_ipv6(
+            &Ipv6Addr::from_str("fd00::1").unwrap()
+        ));
+        assert!(!is_global_unicast_ipv6(
+            &Ipv6Addr::from_str("ff02::1").unwrap()
+        ));
+        assert!(!is_global_unicast_ipv6(
+            &Ipv6Addr::from_str("2001:db8::1").unwrap()
+        ));
+        assert!(is_global_unicast_ipv6(
+            &Ipv6Addr::from_str("2001:4860:4860::8888").unwrap()
+        ));
     }
 }

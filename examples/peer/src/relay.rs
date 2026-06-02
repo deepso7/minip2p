@@ -31,7 +31,7 @@ use minip2p_swarm::{Swarm, SwarmBuilder, SwarmEvent};
 use minip2p_transport::{StreamId, Transport};
 
 use crate::cli::{RunOptions, print_event};
-use crate::runtime::{bind_addr, load_keypair};
+use crate::runtime::{bind_addr, load_keypair, local_global_ipv6_quic_addrs};
 
 // ---------------------------------------------------------------------------
 // Shared configuration
@@ -100,6 +100,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         &confirmed_external_addrs(&swarm),
         relay_observed_addr(&swarm, &relay_peer_id, role),
     );
+    let initial_candidates = append_interface_ipv6_candidates(role, initial_candidates, &our_addr);
     let initial_candidates = append_stun_candidates(role, initial_candidates, &stun_candidates);
     let mut our_observed = validate_candidates_with_autonat(
         &mut swarm,
@@ -489,6 +490,7 @@ pub fn run_dial(
         &confirmed_external_addrs(&swarm),
         relay_observed_addr(&swarm, &relay_peer_id, role),
     );
+    let initial_candidates = append_interface_ipv6_candidates(role, initial_candidates, &our_addr);
     let initial_candidates = append_stun_candidates(role, initial_candidates, &stun_candidates);
     let mut our_observed = validate_candidates_with_autonat(
         &mut swarm,
@@ -1281,6 +1283,25 @@ fn append_stun_candidates(
             println!("[{role}] candidate-added source=stun addr={addr}");
         } else {
             println!("[{role}] candidate-skipped source=stun addr={addr} reason=duplicate");
+        }
+    }
+    candidates
+}
+
+fn append_interface_ipv6_candidates(
+    role: &str,
+    mut candidates: Vec<Multiaddr>,
+    bound_addr: &PeerAddr,
+) -> Vec<Multiaddr> {
+    for addr in local_global_ipv6_quic_addrs(bound_addr.transport()) {
+        let before = candidates.len();
+        push_unique(&mut candidates, addr.clone());
+        if candidates.len() > before {
+            println!("[{role}] candidate-added source=interface-ipv6 addr={addr}");
+        } else {
+            println!(
+                "[{role}] candidate-skipped source=interface-ipv6 addr={addr} reason=duplicate"
+            );
         }
     }
     candidates
