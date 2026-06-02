@@ -3,7 +3,7 @@
 //! Implements [`Transport`] with a poll-driven, non-blocking UDP socket.
 //! No async runtime required.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,7 @@ const STUN_HEADER_LEN: usize = 20;
 const STUN_TRANSACTION_ID_LEN: usize = 12;
 const STUN_ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 const STUN_ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+const MAX_BUFFERED_UDP_DATAGRAMS: usize = 256;
 
 /// Parses a QUIC multiaddr into (host protocol, port), validating the /host/udp/port/quic-v1 shape.
 fn extract_quic_host_and_port(
@@ -277,6 +278,8 @@ pub struct QuicTransport {
     peer_connections: HashMap<PeerId, BTreeSet<ConnectionId>>,
     /// Events queued between poll() calls.
     pending_events: Vec<TransportEvent>,
+    /// Non-STUN datagrams seen while running a synchronous STUN probe.
+    buffered_datagrams: VecDeque<(Vec<u8>, SocketAddr)>,
     /// The socket address we're listening on, if any.
     listen_addr: Option<SocketAddr>,
     /// Auto-incrementing connection id counter.
@@ -307,6 +310,7 @@ impl QuicTransport {
             cid_to_connection: HashMap::new(),
             peer_connections: HashMap::new(),
             pending_events: Vec::new(),
+            buffered_datagrams: VecDeque::new(),
             listen_addr: None,
             next_connection_id: 1,
             node_config,
@@ -347,21 +351,26 @@ impl QuicTransport {
     /// advertised or confirmed; callers decide whether to feed it into DCUtR,
     /// AutoNAT, or an external-address book.
     pub fn discover_external_addr_stun(
-        &self,
+        &mut self,
         server: &str,
         timeout: Duration,
     ) -> Result<Multiaddr, TransportError> {
-        let server_addr = server
-            .to_socket_addrs()
-            .map_err(|e| TransportError::InvalidAddress {
+        let local_addr = self.local_addr()?;
+        let mut resolved =
+            server
+                .to_socket_addrs()
+                .map_err(|e| TransportError::InvalidAddress {
+                    context: "stun server",
+                    reason: format!("resolution failed for {server}: {e}"),
+                })?;
+        let server_addr = select_stun_server_addr(&mut resolved, local_addr).ok_or_else(|| {
+            TransportError::InvalidAddress {
                 context: "stun server",
-                reason: format!("resolution failed for {server}: {e}"),
-            })?
-            .next()
-            .ok_or_else(|| TransportError::InvalidAddress {
-                context: "stun server",
-                reason: format!("resolution returned no usable address for {server}"),
-            })?;
+                reason: format!(
+                    "resolution returned no address matching local socket family for {server}"
+                ),
+            }
+        })?;
 
         let mut transaction_id = [0u8; STUN_TRANSACTION_ID_LEN];
         getrandom::fill(&mut transaction_id).map_err(|e| TransportError::PollError {
@@ -376,13 +385,14 @@ impl QuicTransport {
             })?;
 
         let deadline = Instant::now() + timeout;
-        let mut buf = [0u8; 1500];
+        let mut buf = [0u8; 65535];
         loop {
             match self.socket.recv_from(&mut buf) {
-                Ok((n, _)) => {
+                Ok((n, from)) => {
                     if let Some(addr) = parse_stun_binding_response(&buf[..n], &transaction_id) {
                         return Ok(socket_addr_to_multiaddr(addr));
                     }
+                    self.buffer_udp_datagram(buf[..n].to_vec(), from);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if Instant::now() >= deadline {
@@ -537,6 +547,40 @@ impl QuicTransport {
             self.remove_peer_connection(&peer_id, id);
         }
     }
+
+    fn buffer_udp_datagram(&mut self, data: Vec<u8>, from: SocketAddr) {
+        if self.buffered_datagrams.len() >= MAX_BUFFERED_UDP_DATAGRAMS {
+            self.buffered_datagrams.pop_front();
+        }
+        self.buffered_datagrams.push_back((data, from));
+    }
+
+    fn recv_udp_datagram(
+        &mut self,
+        buf: &mut [u8],
+    ) -> Result<Option<(usize, SocketAddr)>, TransportError> {
+        if let Some((data, from)) = self.buffered_datagrams.pop_front() {
+            if data.len() > buf.len() {
+                return Err(TransportError::PollError {
+                    reason: format!(
+                        "buffered udp datagram too large: {} > {}",
+                        data.len(),
+                        buf.len()
+                    ),
+                });
+            }
+            buf[..data.len()].copy_from_slice(&data);
+            return Ok(Some((data.len(), from)));
+        }
+
+        match self.socket.recv_from(buf) {
+            Ok(v) => Ok(Some(v)),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(TransportError::PollError {
+                reason: format!("udp recv error: {e}"),
+            }),
+        }
+    }
 }
 
 fn stun_binding_request(transaction_id: [u8; STUN_TRANSACTION_ID_LEN]) -> [u8; STUN_HEADER_LEN] {
@@ -545,6 +589,15 @@ fn stun_binding_request(transaction_id: [u8; STUN_TRANSACTION_ID_LEN]) -> [u8; S
     out[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
     out[8..].copy_from_slice(&transaction_id);
     out
+}
+
+fn select_stun_server_addr(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+    local_addr: SocketAddr,
+) -> Option<SocketAddr> {
+    addrs
+        .into_iter()
+        .find(|addr| addr.is_ipv4() == local_addr.is_ipv4())
 }
 
 fn parse_stun_binding_response(
@@ -696,6 +749,51 @@ mod stun_tests {
         let parsed = parse_stun_binding_response(&response, &transaction_id).unwrap();
 
         assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn selects_stun_server_matching_bound_socket_family() {
+        let resolved = [
+            SocketAddr::from(([0x2001, 0x0db8, 0, 0, 0, 0, 0, 1], 3478)),
+            SocketAddr::from(([203, 0, 113, 10], 3478)),
+        ];
+
+        let selected = select_stun_server_addr(resolved, SocketAddr::from(([0, 0, 0, 0], 0)));
+
+        assert_eq!(selected, Some(SocketAddr::from(([203, 0, 113, 10], 3478))));
+    }
+
+    #[test]
+    fn stun_probe_buffers_unmatched_datagrams() {
+        let keypair = minip2p_identity::Ed25519Keypair::generate();
+        let mut transport =
+            QuicTransport::new(QuicNodeConfig::new(keypair), "127.0.0.1:0").unwrap();
+        let transport_addr = transport.local_addr().unwrap();
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let mut request = [0u8; STUN_HEADER_LEN];
+            let (n, from) = server.recv_from(&mut request).unwrap();
+            assert_eq!(n, STUN_HEADER_LEN);
+            assert_eq!(from, transport_addr);
+            server.send_to(b"not-stun", from).unwrap();
+
+            let mut transaction_id = [0u8; STUN_TRANSACTION_ID_LEN];
+            transaction_id.copy_from_slice(&request[8..20]);
+            let response = stun_response_with_xor_mapped_ipv4(transaction_id, from);
+            server.send_to(&response, from).unwrap();
+        });
+
+        let discovered = transport
+            .discover_external_addr_stun(&server_addr.to_string(), Duration::from_secs(1))
+            .unwrap();
+
+        handle.join().unwrap();
+        assert_eq!(discovered, socket_addr_to_multiaddr(transport_addr));
+        let (data, from) = transport.buffered_datagrams.pop_front().unwrap();
+        assert_eq!(data, b"not-stun");
+        assert_eq!(from, server_addr);
     }
 
     fn stun_response_with_xor_mapped_ipv4(
@@ -903,14 +1001,8 @@ impl Transport for QuicTransport {
         let mut events = std::mem::take(&mut self.pending_events);
 
         loop {
-            let (len, from) = match self.socket.recv_from(&mut buf) {
-                Ok(v) => v,
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    return Err(TransportError::PollError {
-                        reason: format!("udp recv error: {e}"),
-                    });
-                }
+            let Some((len, from)) = self.recv_udp_datagram(&mut buf)? else {
+                break;
             };
 
             let local_addr = self.local_addr()?;

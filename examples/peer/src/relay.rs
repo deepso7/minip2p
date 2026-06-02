@@ -81,7 +81,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         .map_err(|e| format!("listen failed: {e}"))?;
     println!("[{role}] bound={our_addr}");
     println!("[{role}] us={}", swarm.local_peer_id());
-    let stun_candidates = discover_stun_candidates(&swarm, role, &options);
+    let stun_candidates = discover_stun_candidates(&mut swarm, role, &options);
 
     let relay_peer_id = relay_addr.peer_id().clone();
     let deadline = Instant::now() + LISTEN_DEADLINE;
@@ -288,7 +288,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     // --- 7. Resolve based on the hole-punch outcome -------------------------
     match outcome {
         HolePunchOutcome::DirectConnected(peer_id) => {
-            print_direct_path_summary(role, "hole-punch-open", &remote_paths);
+            print_direct_path_summary(role, "hole-punch-success", &remote_paths);
             println!("[{role}] direct-connected peer={peer_id} (hole-punch success)");
             ping_and_exit(&mut swarm, role, peer_id, deadline)
         }
@@ -430,7 +430,7 @@ pub fn run_dial(
     println!("[{role}] bound={our_addr}");
     println!("[{role}] us={}", swarm.local_peer_id());
     println!("[{role}] target={target}");
-    let stun_candidates = discover_stun_candidates(&swarm, role, &options);
+    let stun_candidates = discover_stun_candidates(&mut swarm, role, &options);
 
     let relay_peer_id = relay_addr.peer_id().clone();
     let deadline = Instant::now() + LISTEN_DEADLINE;
@@ -1008,7 +1008,7 @@ fn wait_for_direct_with_udp_blast(
         for ev in swarm.poll().map_err(|e| format!("holepunch poll: {e}"))? {
             print_event(role, &ev);
             if matches!(&ev, SwarmEvent::ConnectionEstablished { peer_id: p } if p == peer_id) {
-                print_direct_path_summary(role, "hole-punch-open", paths);
+                print_direct_path_summary(role, "hole-punch-success", paths);
                 return Ok(true);
             }
         }
@@ -1137,7 +1137,7 @@ fn confirmed_external_addrs(swarm: &Swarm<QuicTransport>) -> Vec<Multiaddr> {
 }
 
 fn discover_stun_candidates(
-    swarm: &Swarm<QuicTransport>,
+    swarm: &mut Swarm<QuicTransport>,
     role: &str,
     options: &RunOptions,
 ) -> Vec<Multiaddr> {
@@ -1145,7 +1145,7 @@ fn discover_stun_candidates(
     for server in &options.stun_servers {
         println!("[{role}] stun-probing server={server}");
         match swarm
-            .transport()
+            .transport_mut()
             .discover_external_addr_stun(server, STUN_DISCOVERY_TIMEOUT)
         {
             Ok(addr) => {

@@ -191,7 +191,11 @@ impl DirectPathBook {
     pub fn begin_attempts(&mut self, now_ms: u64) -> Vec<Multiaddr> {
         let mut attempts = Vec::new();
         for path in &mut self.paths {
-            if path.status == DirectPathStatus::Open || now_ms < path.next_attempt_ms {
+            if matches!(
+                path.status,
+                DirectPathStatus::Open | DirectPathStatus::Dialing
+            ) || now_ms < path.next_attempt_ms
+            {
                 continue;
             }
             path.status = DirectPathStatus::Dialing;
@@ -202,10 +206,10 @@ impl DirectPathBook {
         attempts
     }
 
-    /// Marks every tracked path as failed and schedules retry.
+    /// Marks every in-flight path as failed and schedules retry.
     pub fn fail_attempts(&mut self, now_ms: u64) {
         for path in &mut self.paths {
-            if path.status == DirectPathStatus::Open {
+            if path.status != DirectPathStatus::Dialing {
                 continue;
             }
             path.status = DirectPathStatus::Failed;
@@ -315,10 +319,33 @@ mod tests {
 
         assert_eq!(book.begin_attempts(10), vec![first.clone()]);
         assert_eq!(book.paths()[0].status, DirectPathStatus::Dialing);
+        assert_eq!(book.begin_attempts(10), Vec::<Multiaddr>::new());
+        assert_eq!(book.paths()[0].attempts, 1);
         book.fail_attempts(100);
         assert_eq!(book.begin_attempts(1_000), Vec::<Multiaddr>::new());
         assert_eq!(book.begin_attempts(5_100), vec![first]);
         assert_eq!(book.paths()[0].attempts, 2);
+    }
+
+    #[test]
+    fn fail_attempts_only_marks_paths_that_were_dialed() {
+        let mut book = DirectPathBook::new().with_retry_interval_ms(5_000);
+        let ready = addr("/ip4/203.0.113.1/udp/4001/quic-v1");
+        let not_ready = addr("/ip4/203.0.113.2/udp/4001/quic-v1");
+        book.insert(DirectPathSource::Dcutr, ready.clone(), 0);
+        book.insert(DirectPathSource::Dcutr, not_ready.clone(), 100);
+
+        assert_eq!(book.begin_attempts(0), vec![ready.clone()]);
+        book.fail_attempts(10);
+
+        let ready_path = book.paths().iter().find(|path| path.addr == ready).unwrap();
+        let not_ready_path = book
+            .paths()
+            .iter()
+            .find(|path| path.addr == not_ready)
+            .unwrap();
+        assert_eq!(ready_path.status, DirectPathStatus::Failed);
+        assert_eq!(not_ready_path.status, DirectPathStatus::Unknown);
     }
 
     #[test]
@@ -334,6 +361,7 @@ mod tests {
 
         book.insert(DirectPathSource::Dcutr, first.clone(), 1);
         book.insert(DirectPathSource::Dcutr, second.clone(), 2);
+        assert_eq!(book.begin_attempts(3), vec![second.clone(), first.clone()]);
         book.fail_attempts(3);
         let update = book.insert(DirectPathSource::Dcutr, third.clone(), 4);
 
