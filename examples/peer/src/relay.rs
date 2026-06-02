@@ -39,8 +39,9 @@ use crate::runtime::{bind_addr, load_keypair};
 
 const AGENT: &str = "minip2p-peer/0.1.0";
 /// Top-level deadline: the whole reservation + circuit + hole-punch
-/// flow should complete well inside this on a local relay.
-const LISTEN_DEADLINE: Duration = Duration::from_secs(60);
+/// flow should complete inside this even when AutoNAT has several
+/// candidates to probe before the relay circuit is opened.
+const LISTEN_DEADLINE: Duration = Duration::from_secs(120);
 /// Hole-punch window after SYNC is received / sent.
 ///
 /// Direct dials succeed in milliseconds on LAN/loopback; real-world NATs may
@@ -55,7 +56,6 @@ const HOLEPUNCH_INTERVAL_MAX_MS: u64 = 200;
 const RESPONDER_SYNC_DELAY: Duration = Duration::from_millis(50);
 /// Payload length used by the relay-ping fallback.
 const RELAY_PING_LEN: usize = 32;
-const AUTONAT_CLIENT_DEADLINE: Duration = Duration::from_secs(20);
 const AUTONAT_IDENTIFY_GRACE: Duration = Duration::from_secs(2);
 const AUTONAT_REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 // Client deadline must absorb candidate_count * binds_per_candidate * dialback
@@ -101,7 +101,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         role,
         &options,
         &initial_candidates,
-        Instant::now() + AUTONAT_CLIENT_DEADLINE,
+        deadline,
     )?;
     print_candidates(role, &our_observed);
 
@@ -288,11 +288,18 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     // --- 7. Resolve based on the hole-punch outcome -------------------------
     match outcome {
         HolePunchOutcome::DirectConnected(peer_id) => {
-            print_direct_path_summary(role, "hole-punch-success", &remote_paths);
-            println!("[{role}] direct-connected peer={peer_id} (hole-punch success)");
-            ping_and_exit(&mut swarm, role, peer_id, deadline)
+            print_direct_path_summary(role, "hole-punch-attempts", &remote_paths);
+            println!("[{role}] direct-connected peer={peer_id} (hole-punch success) -- done");
+            Ok(())
         }
         HolePunchOutcome::InboundConnectionSeen => {
+            if swarm.connected_peers().iter().any(|p| p == &remote_peer_id) {
+                println!(
+                    "[{role}] direct-connected peer={remote_peer_id} (mTLS already verified) -- done"
+                );
+                return Ok(());
+            }
+
             // The address heuristic fired before Swarm surfaced the verified
             // mTLS identity. Give QUIC one short grace window to complete the
             // identity event so this side can direct-ping too.
@@ -309,8 +316,8 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
                 .map_err(|e| format!("grace poll: {e}"))?;
             match verified {
                 Some(SwarmEvent::ConnectionEstablished { peer_id }) => {
-                    println!("[{role}] direct-connected peer={peer_id} (mTLS verified)");
-                    ping_and_exit(&mut swarm, role, peer_id, deadline)
+                    println!("[{role}] direct-connected peer={peer_id} (mTLS verified) -- done");
+                    Ok(())
                 }
                 _ => {
                     println!("[{role}] grace-elapsed before mTLS identity -> relay-ping fallback");
@@ -450,7 +457,7 @@ pub fn run_dial(
         role,
         &options,
         &initial_candidates,
-        Instant::now() + AUTONAT_CLIENT_DEADLINE,
+        deadline,
     )?;
     print_candidates(role, &our_observed);
 
@@ -1008,7 +1015,7 @@ fn wait_for_direct_with_udp_blast(
         for ev in swarm.poll().map_err(|e| format!("holepunch poll: {e}"))? {
             print_event(role, &ev);
             if matches!(&ev, SwarmEvent::ConnectionEstablished { peer_id: p } if p == peer_id) {
-                print_direct_path_summary(role, "hole-punch-success", paths);
+                print_direct_path_summary(role, "hole-punch-attempts", paths);
                 return Ok(true);
             }
         }
@@ -1361,14 +1368,18 @@ fn validate_candidates_with_autonat(
     let stream_id = swarm
         .open_user_stream(&service_peer, AUTONAT_PROTOCOL_ID)
         .map_err(|e| format!("open AutoNAT stream: {e}"))?;
-    wait_user_stream_ready(swarm, role, stream_id, deadline)?;
+    let request_deadline = earlier_deadline(
+        Instant::now() + autonat_probe_timeout(&probe_candidates),
+        deadline,
+    );
+    wait_user_stream_ready(swarm, role, stream_id, request_deadline)?;
 
     let local_peer = swarm.local_peer_id().clone();
     let mut client = AutoNatClient::new(&local_peer, &probe_candidates);
     send(swarm, &service_peer, stream_id, client.take_outbound())?;
 
     while client.outcome().is_none() {
-        let data = wait_user_stream_data(swarm, role, stream_id, deadline)?;
+        let data = wait_user_stream_data(swarm, role, stream_id, request_deadline)?;
         client
             .on_data(&data)
             .map_err(|e| format!("AutoNAT decode: {e}"))?;
@@ -1399,6 +1410,15 @@ fn validate_candidates_with_autonat(
             Ok(probe_candidates)
         }
     }
+}
+
+fn autonat_probe_timeout(candidates: &[Multiaddr]) -> Duration {
+    let dialback_budget = candidates
+        .iter()
+        .map(|addr| dialback_bind_addrs(addr).len() as u32)
+        .sum::<u32>()
+        .max(1);
+    AUTONAT_REQUEST_DEADLINE + AUTONAT_DIALBACK_DEADLINE * dialback_budget
 }
 
 fn successful_candidates_in_original_order(
@@ -1527,6 +1547,21 @@ mod tests {
         assert_eq!(dialback_bind_addrs(&dns4), &["0.0.0.0:0"]);
         assert_eq!(dialback_bind_addrs(&ip6), &["[::]:0"]);
         assert_eq!(dialback_bind_addrs(&dns6), &["[::]:0"]);
+    }
+
+    #[test]
+    fn autonat_probe_timeout_scales_with_candidates_and_bind_families() {
+        let ip4 = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
+        let dns = Multiaddr::from_str("/dns/example.com/udp/4001/quic-v1").unwrap();
+
+        assert_eq!(
+            autonat_probe_timeout(&[ip4]),
+            AUTONAT_REQUEST_DEADLINE + AUTONAT_DIALBACK_DEADLINE
+        );
+        assert_eq!(
+            autonat_probe_timeout(&[dns]),
+            AUTONAT_REQUEST_DEADLINE + AUTONAT_DIALBACK_DEADLINE * 2
+        );
     }
 
     #[test]
