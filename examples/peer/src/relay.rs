@@ -96,11 +96,20 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         relay_observed_addr(&swarm, &relay_peer_id, role),
     );
     let initial_candidates = append_stun_candidates(role, initial_candidates, &stun_candidates);
-    let our_observed = validate_candidates_with_autonat(
+    let mut our_observed = validate_candidates_with_autonat(
         &mut swarm,
         role,
         &options,
         &initial_candidates,
+        deadline,
+    )?;
+    refresh_relay_after_slow_discovery(
+        &mut swarm,
+        role,
+        &options,
+        &relay_addr,
+        &relay_peer_id,
+        &mut our_observed,
         deadline,
     )?;
     print_candidates(role, &our_observed);
@@ -466,11 +475,20 @@ pub fn run_dial(
         relay_observed_addr(&swarm, &relay_peer_id, role),
     );
     let initial_candidates = append_stun_candidates(role, initial_candidates, &stun_candidates);
-    let our_observed = validate_candidates_with_autonat(
+    let mut our_observed = validate_candidates_with_autonat(
         &mut swarm,
         role,
         &options,
         &initial_candidates,
+        deadline,
+    )?;
+    refresh_relay_after_slow_discovery(
+        &mut swarm,
+        role,
+        &options,
+        &relay_addr,
+        &relay_peer_id,
+        &mut our_observed,
         deadline,
     )?;
     print_candidates(role, &our_observed);
@@ -810,6 +828,33 @@ fn retry_relay_connection(
             false
         })
         .map_err(|e| format!("relay retry drain: {e}"))?;
+    Ok(())
+}
+
+fn refresh_relay_after_slow_discovery(
+    swarm: &mut Swarm<QuicTransport>,
+    role: &str,
+    options: &RunOptions,
+    relay_addr: &PeerAddr,
+    relay_peer_id: &PeerId,
+    candidates: &mut Vec<Multiaddr>,
+    deadline: Instant,
+) -> Result<(), Box<dyn Error>> {
+    if options.autonat.is_none() {
+        return Ok(());
+    }
+
+    println!("[{role}] refreshing-relay after=autonat");
+    prepare_relay(swarm, role, relay_addr, relay_peer_id, deadline)?;
+
+    if let Some(addr) = relay_observed_addr(swarm, relay_peer_id, role) {
+        let before = candidates.len();
+        push_unique(candidates, addr.clone());
+        if candidates.len() > before {
+            println!("[{role}] candidate-added source=identify-observed-refresh addr={addr}");
+        }
+    }
+
     Ok(())
 }
 
