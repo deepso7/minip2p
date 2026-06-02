@@ -324,15 +324,13 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     match outcome {
         HolePunchOutcome::DirectConnected(peer_id) => {
             print_direct_path_summary(role, "hole-punch-attempts", &remote_paths);
-            println!("[{role}] direct-connected peer={peer_id} (hole-punch success) -- done");
-            Ok(())
+            println!("[{role}] direct-connected peer={peer_id} (hole-punch success)");
+            ping_and_exit(&mut swarm, role, peer_id, deadline)
         }
         HolePunchOutcome::InboundConnectionSeen => {
             if swarm.connected_peers().iter().any(|p| p == &remote_peer_id) {
-                println!(
-                    "[{role}] direct-connected peer={remote_peer_id} (mTLS already verified) -- done"
-                );
-                return Ok(());
+                println!("[{role}] direct-connected peer={remote_peer_id} (mTLS already verified)");
+                return ping_and_exit(&mut swarm, role, remote_peer_id, deadline);
             }
 
             // The address heuristic fired before Swarm surfaced the verified
@@ -351,8 +349,8 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
                 .map_err(|e| format!("grace poll: {e}"))?;
             match verified {
                 Some(SwarmEvent::ConnectionEstablished { peer_id }) => {
-                    println!("[{role}] direct-connected peer={peer_id} (mTLS verified) -- done");
-                    Ok(())
+                    println!("[{role}] direct-connected peer={peer_id} (mTLS verified)");
+                    ping_and_exit(&mut swarm, role, peer_id, deadline)
                 }
                 _ => {
                     println!("[{role}] grace-elapsed before mTLS identity -> relay-ping fallback");
