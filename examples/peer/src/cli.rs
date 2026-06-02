@@ -62,6 +62,8 @@ pub struct RunOptions {
     pub external_addrs: Vec<Multiaddr>,
     /// Optional AutoNAT service peer used to validate candidate dialability.
     pub autonat: Option<PeerAddr>,
+    /// STUN servers used to discover extra same-socket DCUtR candidates.
+    pub stun_servers: Vec<String>,
 }
 
 /// Parse error surfaced back to `main` so the binary exits with a readable
@@ -111,7 +113,7 @@ fn parse_listen(args: Vec<String>) -> Result<Mode, CliError> {
     let options = flags.options;
     if flags.relay.is_none() && options.has_relay_mode_only_flags() {
         return Err(CliError(
-            "--autonat and --external-addr are only valid with relay modes".into(),
+            "--autonat, --external-addr, and --stun are only valid with relay modes".into(),
         ));
     }
 
@@ -153,7 +155,7 @@ fn parse_dial(args: Vec<String>) -> Result<Mode, CliError> {
         (1, None, None) => {
             if options.has_relay_mode_only_flags() {
                 return Err(CliError(
-                    "--autonat and --external-addr are only valid with relay modes".into(),
+                    "--autonat, --external-addr, and --stun are only valid with relay modes".into(),
                 ));
             }
             let raw = &positional[0];
@@ -265,6 +267,11 @@ impl Flags {
                         CliError(format!("invalid --autonat peer-addr '{value}': {e}"))
                     })?);
                 }
+                "--stun" => {
+                    let value = flag_value(args, i, key)?;
+                    validate_host_port("--stun", value)?;
+                    options.stun_servers.push(value.clone());
+                }
                 other => {
                     return Err(CliError(format!("unknown flag '{other}'")));
                 }
@@ -282,7 +289,7 @@ impl Flags {
 
 impl RunOptions {
     fn has_relay_mode_only_flags(&self) -> bool {
-        !self.external_addrs.is_empty() || self.autonat.is_some()
+        !self.external_addrs.is_empty() || self.autonat.is_some() || !self.stun_servers.is_empty()
     }
 }
 
@@ -300,6 +307,22 @@ fn parse_quic_multiaddr(flag: &str, value: &str) -> Result<Multiaddr, CliError> 
         )));
     }
     Ok(addr)
+}
+
+fn validate_host_port(flag: &str, value: &str) -> Result<(), CliError> {
+    if value.parse::<std::net::SocketAddr>().is_ok() {
+        return Ok(());
+    }
+
+    if let Some((host, port)) = value.rsplit_once(':') {
+        if !host.is_empty() && !port.is_empty() && port.parse::<u16>().is_ok() {
+            return Ok(());
+        }
+    }
+
+    Err(CliError(format!(
+        "{flag} must be host:port, ip:port, or [ipv6]:port, got '{value}'"
+    )))
 }
 
 /// Prints a [`SwarmEvent`] in the plan's one-event-per-line format.
@@ -410,8 +433,8 @@ USAGE:
     minip2p-peer listen [--key <path>] [--listen <quic-multiaddr>]
     minip2p-peer dial   <peer-addr> [--key <path>] [--listen <quic-multiaddr>]
     minip2p-peer autonat [--key <path>] [--listen <quic-multiaddr>]
-    minip2p-peer listen --relay <relay-peer-addr> [--autonat <peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--external-addr <quic-multiaddr>]...
-    minip2p-peer dial   --relay <relay-peer-addr> --target <peer-id> [--autonat <peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--external-addr <quic-multiaddr>]...
+    minip2p-peer listen --relay <relay-peer-addr> [--autonat <peer-addr>] [--stun <host:port>]... [--key <path>] [--listen <quic-multiaddr>] [--external-addr <quic-multiaddr>]...
+    minip2p-peer dial   --relay <relay-peer-addr> --target <peer-id> [--autonat <peer-addr>] [--stun <host:port>]... [--key <path>] [--listen <quic-multiaddr>] [--external-addr <quic-multiaddr>]...
 
 NOTES:
     <peer-addr>        full libp2p-style address ending in /p2p/<peer-id>
@@ -422,6 +445,7 @@ NOTES:
     --listen           bind multiaddr; default is 127.0.0.1:0
     --external-addr    repeatable relay-mode DCUtR candidate
     --autonat          relay-mode public AutoNAT service for dialability checks
+    --stun             repeatable relay-mode STUN server for same-socket candidates
 
     See holepunch-plan.md at the repo root for full semantics."
         .to_string()
@@ -550,6 +574,49 @@ mod tests {
     }
 
     #[test]
+    fn relay_listen_accepts_repeated_stun_servers() {
+        match parse(v(&[
+            "listen",
+            "--relay",
+            PEER_ADDR,
+            "--stun",
+            "stun.example.com:3478",
+            "--stun",
+            "203.0.113.10:3478",
+        ]))
+        .unwrap()
+        {
+            Mode::RelayListen { options, .. } => {
+                assert_eq!(
+                    options.stun_servers,
+                    vec!["stun.example.com:3478", "203.0.113.10:3478"]
+                );
+            }
+            other => panic!("expected RelayListen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_dial_accepts_ipv6_stun_server() {
+        match parse(v(&[
+            "dial",
+            "--relay",
+            PEER_ADDR,
+            "--target",
+            PEER_ID,
+            "--stun",
+            "[2001:db8::1]:3478",
+        ]))
+        .unwrap()
+        {
+            Mode::RelayDial { options, .. } => {
+                assert_eq!(options.stun_servers, vec!["[2001:db8::1]:3478"]);
+            }
+            other => panic!("expected RelayDial, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn autonat_server_accepts_key_and_listen_addr() {
         match parse(v(&[
             "autonat",
@@ -578,6 +645,25 @@ mod tests {
     fn direct_mode_rejects_autonat_flag() {
         let err = parse(v(&["listen", "--autonat", PEER_ADDR])).unwrap_err();
         assert!(err.0.contains("--autonat"));
+    }
+
+    #[test]
+    fn direct_mode_rejects_stun_flag() {
+        let err = parse(v(&["listen", "--stun", "stun.example.com:3478"])).unwrap_err();
+        assert!(err.0.contains("--stun"));
+    }
+
+    #[test]
+    fn invalid_stun_server_errors() {
+        let err = parse(v(&[
+            "listen",
+            "--relay",
+            PEER_ADDR,
+            "--stun",
+            "stun.example.com",
+        ]))
+        .unwrap_err();
+        assert!(err.0.contains("--stun"));
     }
 
     #[test]

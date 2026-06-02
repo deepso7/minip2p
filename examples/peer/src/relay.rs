@@ -62,6 +62,7 @@ const AUTONAT_REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 // deadline. Generic /dns candidates may try two bind families; /ip4, /ip6,
 // /dns4, and /dns6 try one.
 const AUTONAT_DIALBACK_DEADLINE: Duration = Duration::from_secs(5);
+const STUN_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const LISTEN_FOREVER: Duration = Duration::from_secs(60 * 60 * 24 * 365);
 const RELAY_READY_ATTEMPTS: usize = 3;
 const RELAY_READY_ATTEMPT_DEADLINE: Duration = Duration::from_secs(12);
@@ -80,6 +81,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         .map_err(|e| format!("listen failed: {e}"))?;
     println!("[{role}] bound={our_addr}");
     println!("[{role}] us={}", swarm.local_peer_id());
+    let stun_candidates = discover_stun_candidates(&swarm, role, &options);
 
     let relay_peer_id = relay_addr.peer_id().clone();
     let deadline = Instant::now() + LISTEN_DEADLINE;
@@ -93,6 +95,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         &confirmed_external_addrs(&swarm),
         relay_observed_addr(&swarm, &relay_peer_id, role),
     );
+    let initial_candidates = append_stun_candidates(role, initial_candidates, &stun_candidates);
     let our_observed = validate_candidates_with_autonat(
         &mut swarm,
         role,
@@ -427,6 +430,7 @@ pub fn run_dial(
     println!("[{role}] bound={our_addr}");
     println!("[{role}] us={}", swarm.local_peer_id());
     println!("[{role}] target={target}");
+    let stun_candidates = discover_stun_candidates(&swarm, role, &options);
 
     let relay_peer_id = relay_addr.peer_id().clone();
     let deadline = Instant::now() + LISTEN_DEADLINE;
@@ -440,6 +444,7 @@ pub fn run_dial(
         &confirmed_external_addrs(&swarm),
         relay_observed_addr(&swarm, &relay_peer_id, role),
     );
+    let initial_candidates = append_stun_candidates(role, initial_candidates, &stun_candidates);
     let our_observed = validate_candidates_with_autonat(
         &mut swarm,
         role,
@@ -1129,6 +1134,51 @@ fn confirmed_external_addrs(swarm: &Swarm<QuicTransport>) -> Vec<Multiaddr> {
         .iter()
         .map(|entry| entry.addr.clone())
         .collect()
+}
+
+fn discover_stun_candidates(
+    swarm: &Swarm<QuicTransport>,
+    role: &str,
+    options: &RunOptions,
+) -> Vec<Multiaddr> {
+    let mut candidates = Vec::new();
+    for server in &options.stun_servers {
+        println!("[{role}] stun-probing server={server}");
+        match swarm
+            .transport()
+            .discover_external_addr_stun(server, STUN_DISCOVERY_TIMEOUT)
+        {
+            Ok(addr) => {
+                if candidates.iter().any(|existing| existing == &addr) {
+                    println!("[{role}] stun-candidate-duplicate server={server} addr={addr}");
+                } else {
+                    println!("[{role}] stun-candidate-added server={server} addr={addr}");
+                    candidates.push(addr);
+                }
+            }
+            Err(e) => {
+                eprintln!("[{role}] stun-probe-failed server={server} reason={e}");
+            }
+        }
+    }
+    candidates
+}
+
+fn append_stun_candidates(
+    role: &str,
+    mut candidates: Vec<Multiaddr>,
+    stun_candidates: &[Multiaddr],
+) -> Vec<Multiaddr> {
+    for addr in stun_candidates {
+        let before = candidates.len();
+        push_unique(&mut candidates, addr.clone());
+        if candidates.len() > before {
+            println!("[{role}] candidate-added source=stun addr={addr}");
+        } else {
+            println!("[{role}] candidate-skipped source=stun addr={addr} reason=duplicate");
+        }
+    }
+    candidates
 }
 
 fn dialback_candidate(
