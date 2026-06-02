@@ -30,6 +30,8 @@ const STUN_HEADER_LEN: usize = 20;
 const STUN_TRANSACTION_ID_LEN: usize = 12;
 const STUN_ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 const STUN_ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+const STUN_ATTR_SOFTWARE: u16 = 0x8022;
+const STUN_SOFTWARE: &[u8] = b"tailnode";
 const MAX_BUFFERED_UDP_DATAGRAMS: usize = 256;
 
 /// Parses a QUIC multiaddr into (host protocol, port), validating the /host/udp/port/quic-v1 shape.
@@ -583,11 +585,18 @@ impl QuicTransport {
     }
 }
 
-fn stun_binding_request(transaction_id: [u8; STUN_TRANSACTION_ID_LEN]) -> [u8; STUN_HEADER_LEN] {
-    let mut out = [0u8; STUN_HEADER_LEN];
+fn stun_binding_request(transaction_id: [u8; STUN_TRANSACTION_ID_LEN]) -> Vec<u8> {
+    let attr_len = STUN_SOFTWARE.len();
+    let attr_padding = padding_for(attr_len);
+    let msg_len = 4 + attr_len + attr_padding;
+    let mut out = vec![0u8; STUN_HEADER_LEN + msg_len];
     out[..2].copy_from_slice(&STUN_BINDING_REQUEST.to_be_bytes());
+    out[2..4].copy_from_slice(&(msg_len as u16).to_be_bytes());
     out[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-    out[8..].copy_from_slice(&transaction_id);
+    out[8..20].copy_from_slice(&transaction_id);
+    out[20..22].copy_from_slice(&STUN_ATTR_SOFTWARE.to_be_bytes());
+    out[22..24].copy_from_slice(&(attr_len as u16).to_be_bytes());
+    out[24..24 + attr_len].copy_from_slice(STUN_SOFTWARE);
     out
 }
 
@@ -764,6 +773,31 @@ mod stun_tests {
     }
 
     #[test]
+    fn binding_request_includes_software_attribute_for_derp_stun() {
+        let transaction_id = [3u8; STUN_TRANSACTION_ID_LEN];
+        let request = stun_binding_request(transaction_id);
+
+        assert_eq!(
+            u16::from_be_bytes([request[0], request[1]]),
+            STUN_BINDING_REQUEST
+        );
+        assert_eq!(
+            u16::from_be_bytes([request[2], request[3]]) as usize,
+            request.len() - STUN_HEADER_LEN
+        );
+        assert_eq!(&request[8..20], &transaction_id);
+        assert_eq!(
+            u16::from_be_bytes([request[20], request[21]]),
+            STUN_ATTR_SOFTWARE
+        );
+        assert_eq!(
+            u16::from_be_bytes([request[22], request[23]]) as usize,
+            STUN_SOFTWARE.len()
+        );
+        assert_eq!(&request[24..24 + STUN_SOFTWARE.len()], STUN_SOFTWARE);
+    }
+
+    #[test]
     fn stun_probe_buffers_unmatched_datagrams() {
         let keypair = minip2p_identity::Ed25519Keypair::generate();
         let mut transport =
@@ -773,9 +807,9 @@ mod stun_tests {
         let server_addr = server.local_addr().unwrap();
 
         let handle = std::thread::spawn(move || {
-            let mut request = [0u8; STUN_HEADER_LEN];
+            let mut request = [0u8; 128];
             let (n, from) = server.recv_from(&mut request).unwrap();
-            assert_eq!(n, STUN_HEADER_LEN);
+            assert!(n >= STUN_HEADER_LEN);
             assert_eq!(from, transport_addr);
             server.send_to(b"not-stun", from).unwrap();
 
