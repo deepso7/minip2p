@@ -188,6 +188,9 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     // one. We thread the captured remote-addrs through the loop so
     // the CONNECT payload isn't thrown away when the SYNC arrives.
     let remote_addrs: Vec<Multiaddr> = loop {
+        if dcutr.is_done() {
+            break captured_remote_addrs.take().unwrap_or_default();
+        }
         let data = wait_user_stream_data(&mut swarm, role, bridge_stream, deadline)?;
         dcutr_responder_feed(&mut dcutr, data)?;
         let outbound = drain_dcutr_responder_outputs(&mut dcutr, role, &mut captured_remote_addrs);
