@@ -13,7 +13,9 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId, VarintError, read_uvarint, uvarint_len, write_uvarint};
+use minip2p_core::{
+    Multiaddr, PeerId, SansIoProtocol, VarintError, read_uvarint, uvarint_len, write_uvarint,
+};
 
 /// Protocol id for AutoNAT v1.
 pub const AUTONAT_PROTOCOL_ID: &str = "/libp2p/autonat/1.0.0";
@@ -117,6 +119,51 @@ pub struct AutoNatRequest {
     pub raw_addrs: Vec<Vec<u8>>,
 }
 
+/// Input accepted by [`AutoNatClient`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AutoNatClientInput {
+    /// Drain any queued request bytes into an output.
+    Flush,
+    /// Bytes received from the AutoNAT service stream.
+    Data(Vec<u8>),
+}
+
+/// Output produced by [`AutoNatClient`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AutoNatClientOutput {
+    /// Bytes to write to the AutoNAT service stream.
+    Outbound(Vec<u8>),
+    /// Reachability result decoded from the service response.
+    Outcome(Reachability),
+}
+
+/// Input accepted by [`AutoNatServer`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AutoNatServerInput {
+    /// Bytes received from the requester stream.
+    Data(Vec<u8>),
+    /// Queue a successful DIAL_RESPONSE with dialable addresses.
+    RespondPublic { addrs: Vec<Multiaddr> },
+    /// Queue an unsuccessful DIAL_RESPONSE.
+    RespondError {
+        /// Response status.
+        status: ResponseStatus,
+        /// Human-readable reason.
+        reason: String,
+    },
+    /// Drain any queued response bytes into an output.
+    Flush,
+}
+
+/// Output produced by [`AutoNatServer`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AutoNatServerOutput {
+    /// Dial-back request decoded from the requester.
+    Request(AutoNatRequest),
+    /// Bytes to write to the requester stream.
+    Outbound(Vec<u8>),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PeerInfo {
     id: Vec<u8>,
@@ -190,6 +237,7 @@ pub struct AutoNatClient {
     recv_buf: Vec<u8>,
     state: FlowState,
     outcome: Option<Reachability>,
+    emitted_outcome: bool,
 }
 
 /// Server-side AutoNAT request handler.
@@ -197,6 +245,7 @@ pub struct AutoNatServer {
     outbound: Vec<u8>,
     recv_buf: Vec<u8>,
     request: Option<AutoNatRequest>,
+    emitted_request: bool,
     state: ServerState,
 }
 
@@ -231,6 +280,7 @@ impl AutoNatClient {
             recv_buf: Vec::new(),
             state: FlowState::Pending,
             outcome: None,
+            emitted_outcome: false,
         }
     }
 
@@ -305,6 +355,7 @@ impl AutoNatServer {
             outbound: Vec::new(),
             recv_buf: Vec::new(),
             request: None,
+            emitted_request: false,
             state: ServerState::AwaitingRequest,
         }
     }
@@ -382,8 +433,77 @@ impl AutoNatServer {
             addrs,
             raw_addrs: peer.addrs,
         });
+        self.emitted_request = false;
         self.state = ServerState::RequestReady;
         Ok(())
+    }
+}
+
+impl SansIoProtocol for AutoNatClient {
+    type Input = AutoNatClientInput;
+    type Output = AutoNatClientOutput;
+    type Error = AutoNatError;
+
+    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
+        match input {
+            AutoNatClientInput::Flush => {}
+            AutoNatClientInput::Data(data) => self.on_data(&data)?,
+        }
+        Ok(())
+    }
+
+    fn poll_output(&mut self) -> Option<Self::Output> {
+        let outbound = self.take_outbound();
+        if !outbound.is_empty() {
+            return Some(AutoNatClientOutput::Outbound(outbound));
+        }
+        if !self.emitted_outcome {
+            if let Some(outcome) = self.outcome.clone() {
+                self.emitted_outcome = true;
+                return Some(AutoNatClientOutput::Outcome(outcome));
+            }
+        }
+        None
+    }
+
+    fn is_idle(&self) -> bool {
+        self.outbound.is_empty() && (self.emitted_outcome || self.outcome.is_none())
+    }
+}
+
+impl SansIoProtocol for AutoNatServer {
+    type Input = AutoNatServerInput;
+    type Output = AutoNatServerOutput;
+    type Error = AutoNatError;
+
+    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
+        match input {
+            AutoNatServerInput::Data(data) => self.on_data(&data)?,
+            AutoNatServerInput::RespondPublic { addrs } => self.respond_public(&addrs),
+            AutoNatServerInput::RespondError { status, reason } => {
+                self.respond_error(status, reason)
+            }
+            AutoNatServerInput::Flush => {}
+        }
+        Ok(())
+    }
+
+    fn poll_output(&mut self) -> Option<Self::Output> {
+        if !self.emitted_request {
+            if let Some(request) = self.request.clone() {
+                self.emitted_request = true;
+                return Some(AutoNatServerOutput::Request(request));
+            }
+        }
+        let outbound = self.take_outbound();
+        if !outbound.is_empty() {
+            return Some(AutoNatServerOutput::Outbound(outbound));
+        }
+        None
+    }
+
+    fn is_idle(&self) -> bool {
+        self.outbound.is_empty() && (self.emitted_request || self.request.is_none())
     }
 }
 
@@ -770,5 +890,45 @@ mod tests {
                 len: MAX_MESSAGE_SIZE + 1
             }
         );
+    }
+
+    #[test]
+    fn client_and_server_implement_sans_io_protocol() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let addr = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
+        let mut client = AutoNatClient::new(&peer_id, core::slice::from_ref(&addr));
+        let mut server = AutoNatServer::new();
+
+        client.handle_input(AutoNatClientInput::Flush).unwrap();
+        let Some(AutoNatClientOutput::Outbound(request_bytes)) = client.poll_output() else {
+            panic!("client should emit request bytes");
+        };
+
+        server
+            .handle_input(AutoNatServerInput::Data(request_bytes))
+            .unwrap();
+        let Some(AutoNatServerOutput::Request(request)) = server.poll_output() else {
+            panic!("server should emit request");
+        };
+        assert_eq!(request.peer_id, peer_id);
+
+        server
+            .handle_input(AutoNatServerInput::RespondPublic {
+                addrs: request.addrs,
+            })
+            .unwrap();
+        let Some(AutoNatServerOutput::Outbound(response_bytes)) = server.poll_output() else {
+            panic!("server should emit response bytes");
+        };
+
+        client
+            .handle_input(AutoNatClientInput::Data(response_bytes))
+            .unwrap();
+        assert!(matches!(
+            client.poll_output(),
+            Some(AutoNatClientOutput::Outcome(Reachability::Public { addrs, .. }))
+                if addrs == vec![addr]
+        ));
+        assert!(client.is_idle());
     }
 }

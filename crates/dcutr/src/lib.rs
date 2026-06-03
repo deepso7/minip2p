@@ -31,7 +31,7 @@ mod message;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::Multiaddr;
+use minip2p_core::{Multiaddr, SansIoProtocol};
 
 pub use message::{
     DcutrMessageError, FrameDecode, HolePunch, HolePunchType, decode_frame, encode_frame,
@@ -86,6 +86,28 @@ pub enum InitiatorOutcome {
     },
 }
 
+/// Input accepted by [`DcutrInitiator`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DcutrInitiatorInput {
+    /// Drain queued CONNECT or SYNC bytes into an output.
+    Flush,
+    /// Bytes received from the relay stream, with measured relay RTT.
+    Data { bytes: Vec<u8>, rtt_ms: u64 },
+    /// Remote write side closed.
+    RemoteWriteClosed,
+    /// Queue the SYNC frame after the caller has started direct dialing.
+    SendSync,
+}
+
+/// Output produced by [`DcutrInitiator`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DcutrInitiatorOutput {
+    /// Bytes to write to the DCUtR stream.
+    Outbound(Vec<u8>),
+    /// Direct-dial instruction decoded from the remote CONNECT reply.
+    Outcome(InitiatorOutcome),
+}
+
 /// Client-side (initiator) state machine.
 ///
 /// Usage:
@@ -101,6 +123,7 @@ pub struct DcutrInitiator {
     recv_buf: Vec<u8>,
     state: InitiatorState,
     outcome: Option<InitiatorOutcome>,
+    emitted_outcome: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,6 +159,7 @@ impl DcutrInitiator {
             recv_buf: Vec::new(),
             state: InitiatorState::Pending,
             outcome: None,
+            emitted_outcome: false,
         }
     }
 
@@ -244,6 +268,7 @@ impl DcutrInitiator {
             remote_addr_bytes: reply.obs_addrs,
             rtt_ms,
         });
+        self.emitted_outcome = false;
 
         Ok(())
     }
@@ -272,6 +297,26 @@ pub enum ResponderEvent {
     /// RTT/2 and then start sending random UDP packets to the remote's
     /// addresses to open its NAT binding.
     SyncReceived,
+}
+
+/// Input accepted by [`DcutrResponder`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DcutrResponderInput {
+    /// Drain queued CONNECT reply bytes into an output.
+    Flush,
+    /// Bytes received from the relay stream.
+    Data(Vec<u8>),
+    /// Remote write side closed.
+    RemoteWriteClosed,
+}
+
+/// Output produced by [`DcutrResponder`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DcutrResponderOutput {
+    /// Bytes to write to the DCUtR stream.
+    Outbound(Vec<u8>),
+    /// Responder event decoded from incoming messages.
+    Event(ResponderEvent),
 }
 
 /// Server-side (responder) state machine.
@@ -403,6 +448,71 @@ impl DcutrResponder {
                 }
             }
         }
+    }
+}
+
+impl SansIoProtocol for DcutrInitiator {
+    type Input = DcutrInitiatorInput;
+    type Output = DcutrInitiatorOutput;
+    type Error = DcutrError;
+
+    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
+        match input {
+            DcutrInitiatorInput::Flush => {}
+            DcutrInitiatorInput::Data { bytes, rtt_ms } => self.on_data(&bytes, rtt_ms)?,
+            DcutrInitiatorInput::RemoteWriteClosed => self.on_remote_write_closed()?,
+            DcutrInitiatorInput::SendSync => self.send_sync()?,
+        }
+        Ok(())
+    }
+
+    fn poll_output(&mut self) -> Option<Self::Output> {
+        let outbound = self.take_outbound();
+        if !outbound.is_empty() {
+            return Some(DcutrInitiatorOutput::Outbound(outbound));
+        }
+        if !self.emitted_outcome {
+            if let Some(outcome) = self.outcome.clone() {
+                self.emitted_outcome = true;
+                return Some(DcutrInitiatorOutput::Outcome(outcome));
+            }
+        }
+        None
+    }
+
+    fn is_idle(&self) -> bool {
+        self.outbound.is_empty() && (self.emitted_outcome || self.outcome.is_none())
+    }
+}
+
+impl SansIoProtocol for DcutrResponder {
+    type Input = DcutrResponderInput;
+    type Output = DcutrResponderOutput;
+    type Error = DcutrError;
+
+    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
+        match input {
+            DcutrResponderInput::Flush => {}
+            DcutrResponderInput::Data(data) => self.on_data(&data)?,
+            DcutrResponderInput::RemoteWriteClosed => self.on_remote_write_closed()?,
+        }
+        Ok(())
+    }
+
+    fn poll_output(&mut self) -> Option<Self::Output> {
+        let outbound = self.take_outbound();
+        if !outbound.is_empty() {
+            return Some(DcutrResponderOutput::Outbound(outbound));
+        }
+        if self.events.is_empty() {
+            None
+        } else {
+            Some(DcutrResponderOutput::Event(self.events.remove(0)))
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.outbound.is_empty() && self.events.is_empty()
     }
 }
 
@@ -688,5 +798,42 @@ mod tests {
         let large = vec![0u8; MAX_MESSAGE_SIZE + 1];
         let err = resp.on_data(&large).unwrap_err();
         assert!(matches!(err, DcutrError::MessageTooLarge { .. }));
+    }
+
+    #[test]
+    fn initiator_and_responder_implement_sans_io_protocol() {
+        let own = [addr("/ip4/10.0.0.1/udp/1234/quic-v1")];
+        let mut init = DcutrInitiator::new(&own);
+        let mut resp = DcutrResponder::new(&own);
+
+        init.handle_input(DcutrInitiatorInput::Flush).unwrap();
+        let Some(DcutrInitiatorOutput::Outbound(connect)) = init.poll_output() else {
+            panic!("initiator should emit CONNECT");
+        };
+
+        resp.handle_input(DcutrResponderInput::Data(connect))
+            .unwrap();
+        let Some(DcutrResponderOutput::Outbound(reply)) = resp.poll_output() else {
+            panic!("responder should emit CONNECT reply");
+        };
+        assert!(matches!(
+            resp.poll_output(),
+            Some(DcutrResponderOutput::Event(
+                ResponderEvent::ConnectReceived { .. }
+            ))
+        ));
+
+        init.handle_input(DcutrInitiatorInput::Data {
+            bytes: reply,
+            rtt_ms: 42,
+        })
+        .unwrap();
+        assert!(matches!(
+            init.poll_output(),
+            Some(DcutrInitiatorOutput::Outcome(InitiatorOutcome::DialNow {
+                rtt_ms: 42,
+                ..
+            }))
+        ));
     }
 }

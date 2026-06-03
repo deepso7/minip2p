@@ -21,6 +21,8 @@ mod message;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use minip2p_core::SansIoProtocol;
+
 pub use message::{
     FrameDecode, HopMessage, HopMessageType, Limit, Peer, RelayMessageError, Reservation, Status,
     StopMessage, StopMessageType, decode_frame, describe_status, encode_frame,
@@ -77,6 +79,26 @@ pub enum ReservationOutcome {
     },
 }
 
+/// Input accepted by [`HopReservation`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HopReservationInput {
+    /// Drain queued RESERVE bytes into an output.
+    Flush,
+    /// Bytes received from the relay stream.
+    Data(Vec<u8>),
+    /// Remote write side closed.
+    RemoteWriteClosed,
+}
+
+/// Output produced by [`HopReservation`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HopReservationOutput {
+    /// Bytes to write to the relay stream.
+    Outbound(Vec<u8>),
+    /// Reservation result decoded from the relay response.
+    Outcome(ReservationOutcome),
+}
+
 /// Client-side state machine for the HOP RESERVE flow.
 ///
 /// Usage:
@@ -91,6 +113,7 @@ pub struct HopReservation {
     recv_buf: Vec<u8>,
     state: FlowState,
     outcome: Option<ReservationOutcome>,
+    emitted_outcome: bool,
 }
 
 /// Common flow states for client-initiated request/response exchanges.
@@ -122,6 +145,7 @@ impl HopReservation {
             recv_buf: Vec::new(),
             state: FlowState::Pending,
             outcome: None,
+            emitted_outcome: false,
         }
     }
 
@@ -211,8 +235,42 @@ impl HopReservation {
                 reason: describe_status(status),
             }
         });
+        self.emitted_outcome = false;
 
         Ok(())
+    }
+}
+
+impl SansIoProtocol for HopReservation {
+    type Input = HopReservationInput;
+    type Output = HopReservationOutput;
+    type Error = RelayError;
+
+    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
+        match input {
+            HopReservationInput::Flush => {}
+            HopReservationInput::Data(data) => self.on_data(&data)?,
+            HopReservationInput::RemoteWriteClosed => self.on_remote_write_closed()?,
+        }
+        Ok(())
+    }
+
+    fn poll_output(&mut self) -> Option<Self::Output> {
+        let outbound = self.take_outbound();
+        if !outbound.is_empty() {
+            return Some(HopReservationOutput::Outbound(outbound));
+        }
+        if !self.emitted_outcome {
+            if let Some(outcome) = self.outcome.clone() {
+                self.emitted_outcome = true;
+                return Some(HopReservationOutput::Outcome(outcome));
+            }
+        }
+        None
+    }
+
+    fn is_idle(&self) -> bool {
+        self.outbound.is_empty() && (self.emitted_outcome || self.outcome.is_none())
     }
 }
 
@@ -241,6 +299,28 @@ pub enum ConnectOutcome {
     Refused { status: Status, reason: String },
 }
 
+/// Input accepted by [`HopConnect`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HopConnectInput {
+    /// Drain queued CONNECT bytes into an output.
+    Flush,
+    /// Bytes received from the relay stream.
+    Data(Vec<u8>),
+    /// Remote write side closed.
+    RemoteWriteClosed,
+}
+
+/// Output produced by [`HopConnect`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HopConnectOutput {
+    /// Bytes to write to the relay stream.
+    Outbound(Vec<u8>),
+    /// CONNECT result decoded from the relay response.
+    Outcome(ConnectOutcome),
+    /// Bytes received after the relay circuit was bridged.
+    BridgeData(Vec<u8>),
+}
+
 /// Client-side state machine for the HOP CONNECT flow.
 ///
 /// Usage:
@@ -256,6 +336,7 @@ pub struct HopConnect {
     recv_buf: Vec<u8>,
     state: FlowState,
     outcome: Option<ConnectOutcome>,
+    emitted_outcome: bool,
     bridge_bytes: Vec<u8>,
 }
 
@@ -282,6 +363,7 @@ impl HopConnect {
             recv_buf: Vec::new(),
             state: FlowState::Pending,
             outcome: None,
+            emitted_outcome: false,
             bridge_bytes: Vec::new(),
         }
     }
@@ -385,8 +467,48 @@ impl HopConnect {
                 reason: describe_status(status),
             }
         });
+        self.emitted_outcome = false;
 
         Ok(())
+    }
+}
+
+impl SansIoProtocol for HopConnect {
+    type Input = HopConnectInput;
+    type Output = HopConnectOutput;
+    type Error = RelayError;
+
+    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
+        match input {
+            HopConnectInput::Flush => {}
+            HopConnectInput::Data(data) => self.on_data(&data)?,
+            HopConnectInput::RemoteWriteClosed => self.on_remote_write_closed()?,
+        }
+        Ok(())
+    }
+
+    fn poll_output(&mut self) -> Option<Self::Output> {
+        let outbound = self.take_outbound();
+        if !outbound.is_empty() {
+            return Some(HopConnectOutput::Outbound(outbound));
+        }
+        if !self.emitted_outcome {
+            if let Some(outcome) = self.outcome.clone() {
+                self.emitted_outcome = true;
+                return Some(HopConnectOutput::Outcome(outcome));
+            }
+        }
+        let bridge_bytes = self.take_bridge_bytes();
+        if !bridge_bytes.is_empty() {
+            return Some(HopConnectOutput::BridgeData(bridge_bytes));
+        }
+        None
+    }
+
+    fn is_idle(&self) -> bool {
+        self.outbound.is_empty()
+            && self.bridge_bytes.is_empty()
+            && (self.emitted_outcome || self.outcome.is_none())
     }
 }
 
@@ -401,6 +523,32 @@ pub struct StopConnectRequest {
     pub source_peer_id: Vec<u8>,
     /// Connection limits, if any.
     pub limit: Option<Limit>,
+}
+
+/// Input accepted by [`StopResponder`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StopResponderInput {
+    /// Drain queued STATUS bytes into an output.
+    Flush,
+    /// Bytes received from the relay stream.
+    Data(Vec<u8>),
+    /// Remote write side closed.
+    RemoteWriteClosed,
+    /// Accept the pending CONNECT request.
+    Accept,
+    /// Reject the pending CONNECT request with a status.
+    Reject(Status),
+}
+
+/// Output produced by [`StopResponder`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StopResponderOutput {
+    /// Decoded CONNECT request.
+    Request(StopConnectRequest),
+    /// Bytes to write to the relay stream.
+    Outbound(Vec<u8>),
+    /// Bytes received after the relay circuit was bridged.
+    BridgeData(Vec<u8>),
 }
 
 /// Server-side state machine for the STOP protocol (we are the destination).
@@ -419,6 +567,7 @@ pub struct StopResponder {
     recv_buf: Vec<u8>,
     state: StopState,
     request: Option<StopConnectRequest>,
+    emitted_request: bool,
     bridge_bytes: Vec<u8>,
 }
 
@@ -443,6 +592,7 @@ impl StopResponder {
             recv_buf: Vec::new(),
             state: StopState::AwaitingConnect,
             request: None,
+            emitted_request: false,
             bridge_bytes: Vec::new(),
         }
     }
@@ -570,9 +720,51 @@ impl StopResponder {
             source_peer_id: peer.id,
             limit: msg.limit,
         });
+        self.emitted_request = false;
         self.state = StopState::AwaitingDecision;
 
         Ok(())
+    }
+}
+
+impl SansIoProtocol for StopResponder {
+    type Input = StopResponderInput;
+    type Output = StopResponderOutput;
+    type Error = RelayError;
+
+    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
+        match input {
+            StopResponderInput::Flush => {}
+            StopResponderInput::Data(data) => self.on_data(&data)?,
+            StopResponderInput::RemoteWriteClosed => self.on_remote_write_closed()?,
+            StopResponderInput::Accept => self.accept()?,
+            StopResponderInput::Reject(status) => self.reject(status)?,
+        }
+        Ok(())
+    }
+
+    fn poll_output(&mut self) -> Option<Self::Output> {
+        if !self.emitted_request {
+            if let Some(request) = self.request.clone() {
+                self.emitted_request = true;
+                return Some(StopResponderOutput::Request(request));
+            }
+        }
+        let outbound = self.take_outbound();
+        if !outbound.is_empty() {
+            return Some(StopResponderOutput::Outbound(outbound));
+        }
+        let bridge_bytes = self.take_bridge_bytes();
+        if !bridge_bytes.is_empty() {
+            return Some(StopResponderOutput::BridgeData(bridge_bytes));
+        }
+        None
+    }
+
+    fn is_idle(&self) -> bool {
+        self.outbound.is_empty()
+            && self.bridge_bytes.is_empty()
+            && (self.emitted_request || self.request.is_none())
     }
 }
 
@@ -979,5 +1171,62 @@ mod tests {
         }
 
         assert!(flow.request().is_some());
+    }
+
+    #[test]
+    fn relay_flows_implement_sans_io_protocol() {
+        let mut reservation = HopReservation::new();
+        reservation
+            .handle_input(HopReservationInput::Flush)
+            .unwrap();
+        assert!(matches!(
+            reservation.poll_output(),
+            Some(HopReservationOutput::Outbound(_))
+        ));
+
+        let response = frame_hop(HopMessage {
+            kind: HopMessageType::Status,
+            peer: None,
+            reservation: None,
+            limit: None,
+            status: Some(Status::Ok),
+        });
+        reservation
+            .handle_input(HopReservationInput::Data(response))
+            .unwrap();
+        assert!(matches!(
+            reservation.poll_output(),
+            Some(HopReservationOutput::Outcome(
+                ReservationOutcome::Accepted { .. }
+            ))
+        ));
+
+        let mut stop = StopResponder::new();
+        let mut connect = frame_stop(StopMessage {
+            kind: StopMessageType::Connect,
+            peer: Some(Peer {
+                id: b"src".to_vec(),
+                addrs: vec![],
+            }),
+            limit: None,
+            status: None,
+        });
+        connect.extend_from_slice(b"bridge");
+        stop.handle_input(StopResponderInput::Data(connect))
+            .unwrap();
+        assert!(matches!(
+            stop.poll_output(),
+            Some(StopResponderOutput::Request(_))
+        ));
+
+        stop.handle_input(StopResponderInput::Accept).unwrap();
+        assert!(matches!(
+            stop.poll_output(),
+            Some(StopResponderOutput::Outbound(_))
+        ));
+        assert_eq!(
+            stop.poll_output(),
+            Some(StopResponderOutput::BridgeData(b"bridge".to_vec()))
+        );
     }
 }
