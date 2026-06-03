@@ -172,6 +172,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
 
     // --- 5. DCUtR responder over the same bridge stream --------------------
     let mut dcutr = DcutrResponder::new(&our_observed);
+    let mut captured_remote_addrs: Option<Vec<Multiaddr>> = None;
     if !bridge_bytes.is_empty() {
         dcutr_responder_feed(&mut dcutr, bridge_bytes)?;
     }
@@ -179,26 +180,21 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         &mut swarm,
         &relay_peer_id,
         bridge_stream,
-        dcutr_responder_flush(&mut dcutr),
+        drain_dcutr_responder_outputs(&mut dcutr, role, &mut captured_remote_addrs),
     )?;
 
     // DCUtR responder events arrive across multiple poll cycles:
     // `ConnectReceived` fires in one call, `SyncReceived` in a later
     // one. We thread the captured remote-addrs through the loop so
     // the CONNECT payload isn't thrown away when the SYNC arrives.
-    let mut captured_remote_addrs: Option<Vec<Multiaddr>> = None;
     let remote_addrs: Vec<Multiaddr> = loop {
-        if drain_dcutr_responder_events(&mut dcutr, role, &mut captured_remote_addrs) {
-            break captured_remote_addrs.take().unwrap_or_default();
-        }
         let data = wait_user_stream_data(&mut swarm, role, bridge_stream, deadline)?;
         dcutr_responder_feed(&mut dcutr, data)?;
-        send(
-            &mut swarm,
-            &relay_peer_id,
-            bridge_stream,
-            dcutr_responder_flush(&mut dcutr),
-        )?;
+        let outbound = drain_dcutr_responder_outputs(&mut dcutr, role, &mut captured_remote_addrs);
+        send(&mut swarm, &relay_peer_id, bridge_stream, outbound)?;
+        if dcutr.is_done() {
+            break captured_remote_addrs.take().unwrap_or_default();
+        }
     };
 
     // --- 6. Hole-punch: dial + blast UDP, wait for direct or timeout -------
@@ -770,12 +766,22 @@ fn stop_bridge_bytes(flow: &mut StopResponder) -> Vec<u8> {
     }
 }
 
-fn dcutr_responder_flush(flow: &mut DcutrResponder) -> Vec<u8> {
+fn drain_dcutr_responder_outputs(
+    flow: &mut DcutrResponder,
+    role: &str,
+    captured: &mut Option<Vec<Multiaddr>>,
+) -> Vec<u8> {
     let _ = flow.handle_input(DcutrResponderInput::Flush);
-    match flow.poll_output() {
-        Some(DcutrResponderOutput::Outbound(bytes)) => bytes,
-        _ => Vec::new(),
+    let mut outbound = Vec::new();
+    while let Some(output) = flow.poll_output() {
+        match output {
+            DcutrResponderOutput::Outbound(bytes) => outbound.extend(bytes),
+            DcutrResponderOutput::Event(ev) => {
+                handle_dcutr_responder_event(ev, role, captured);
+            }
+        }
     }
+    outbound
 }
 
 fn dcutr_responder_feed(flow: &mut DcutrResponder, data: Vec<u8>) -> Result<(), Box<dyn Error>> {
@@ -1065,47 +1071,32 @@ fn wait_user_stream_data(
     Ok(data)
 }
 
-/// Drains any pending DCUtR responder events into the caller's
-/// `captured` slot. Returns `true` when `SyncReceived` has fired
-/// (i.e. the responder flow is complete).
-///
-/// `captured` is threaded by reference because `ConnectReceived` and
-/// `SyncReceived` can arrive in separate poll cycles -- persisting the
-/// captured remote addresses across calls is essential so they aren't
-/// lost by the time SYNC arrives.
-fn drain_dcutr_responder_events(
-    dcutr: &mut DcutrResponder,
+fn handle_dcutr_responder_event(
+    ev: ResponderEvent,
     role: &str,
     captured: &mut Option<Vec<Multiaddr>>,
-) -> bool {
-    let mut sync = false;
-    while let Some(output) = dcutr.poll_output() {
-        let DcutrResponderOutput::Event(ev) = output else {
-            continue;
-        };
-        match ev {
-            ResponderEvent::ConnectReceived {
-                remote_addrs,
-                remote_addr_bytes,
-            } => {
-                if remote_addrs.len() < remote_addr_bytes.len() {
-                    eprintln!(
-                        "[{role}] dcutr-connect-received: {} of {} remote addrs \
-                         failed to parse and were ignored",
-                        remote_addr_bytes.len() - remote_addrs.len(),
-                        remote_addr_bytes.len()
-                    );
-                }
-                println!(
-                    "[{role}] dcutr-connect-received addrs={}",
-                    remote_addrs.len()
+) {
+    match ev {
+        ResponderEvent::ConnectReceived {
+            remote_addrs,
+            remote_addr_bytes,
+        } => {
+            if remote_addrs.len() < remote_addr_bytes.len() {
+                eprintln!(
+                    "[{role}] dcutr-connect-received: {} of {} remote addrs \
+                     failed to parse and were ignored",
+                    remote_addr_bytes.len() - remote_addrs.len(),
+                    remote_addr_bytes.len()
                 );
-                *captured = Some(remote_addrs);
             }
-            ResponderEvent::SyncReceived => sync = true,
+            println!(
+                "[{role}] dcutr-connect-received addrs={}",
+                remote_addrs.len()
+            );
+            *captured = Some(remote_addrs);
         }
+        ResponderEvent::SyncReceived => {}
     }
-    sync
 }
 
 fn dial_direct_candidates(

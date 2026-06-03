@@ -1349,6 +1349,7 @@ impl SwarmCore {
                         .push_back(SwarmAction::ResetStream { conn_id, stream_id });
                     return;
                 }
+                self.drain_ping_outputs();
 
                 if let Some(payload) = self.pending_pings.remove(&peer_id) {
                     match self.ping.handle_input(PingInput::SendPing {
@@ -1623,6 +1624,22 @@ mod tests {
 
         while core.poll_output().is_some() {}
         assert!(core.is_idle());
+    }
+
+    #[test]
+    fn outbound_ping_registration_without_payload_leaves_protocol_idle() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
+        let conn_id = ConnectionId::new(2);
+        let stream_id = StreamId::new(9);
+
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id, conn_id);
+
+        core.on_outbound_negotiated(conn_id, stream_id, ProtocolKind::Ping, 0);
+
+        assert!(core.ping.is_idle());
+        assert!(core.poll_output().is_none());
     }
 
     #[test]
