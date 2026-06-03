@@ -56,7 +56,7 @@ pub enum Mode {
 pub struct RunOptions {
     /// Optional persistent Ed25519 raw-secret file.
     pub key_path: Option<PathBuf>,
-    /// Optional QUIC listen/bind multiaddr. Defaults to loopback UDP/0.
+    /// Optional QUIC listen/bind multiaddr. Defaults to dual-stack UDP/0.
     pub listen_addr: Option<Multiaddr>,
     /// Extra DCUtR candidates advertised in relay mode.
     pub external_addrs: Vec<Multiaddr>,
@@ -302,7 +302,7 @@ fn parse_quic_multiaddr(flag: &str, value: &str) -> Result<Multiaddr, CliError> 
     Ok(addr)
 }
 
-/// Prints a [`SwarmEvent`] in the plan's one-event-per-line format.
+/// Prints a [`SwarmEvent`] in the CLI's one-event-per-line format.
 ///
 /// `role` is the tag shown in brackets at the start of the line
 /// (`listen`, `dial`, `relay-listen`, `relay-dial`).

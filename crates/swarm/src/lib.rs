@@ -10,7 +10,8 @@
 //!   for the application to observe. No sockets, no async runtime, no clock
 //!   reads.
 //!
-//! - [`Swarm`] -- std driver that owns a concrete [`Transport`] and a
+//! - [`Swarm`] -- std driver that owns a concrete
+//!   [`Transport`](minip2p_transport::Transport) and a
 //!   monotonic clock ([`std::time::Instant`]), and preserves the one-call
 //!   DX (`swarm.dial(addr)`, `swarm.ping(peer)`, `swarm.open_user_stream`)
 //!   by shuttling events and actions between the transport and the core.
