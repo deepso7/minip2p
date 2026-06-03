@@ -248,7 +248,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     // Using an address-match heuristic rather than a raw count
     // comparison prevents unrelated inbound connections -- relay
     // probe-backs, autonat probes, random scanners -- from being
-    // misinterpreted as hole-punch success.
+    // misinterpreted as direct path success.
     let remote_match_targets: Vec<(String, u16)> = remote_paths
         .addrs()
         .iter()
@@ -324,8 +324,8 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     // --- 7. Resolve based on the hole-punch outcome -------------------------
     match outcome {
         HolePunchOutcome::DirectConnected(peer_id) => {
-            print_direct_path_summary(role, "hole-punch-attempts", &remote_paths);
-            println!("[{role}] direct-connected peer={peer_id} (hole-punch success)");
+            print_direct_path_summary(role, "direct-path-attempts", &remote_paths);
+            println!("[{role}] direct-connected peer={peer_id} (direct path success)");
             ping_and_exit(&mut swarm, role, peer_id, deadline)
         }
         HolePunchOutcome::InboundConnectionSeen => {
@@ -338,7 +338,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
             // mTLS identity. Give QUIC one short grace window to complete the
             // identity event so this side can direct-ping too.
             println!(
-                "[{role}] inbound-direct-connection detected (hole-punch success; \
+                "[{role}] inbound-direct-connection detected (direct path success; \
                  waiting for verified mTLS identity)"
             );
             let grace_deadline = Instant::now() + Duration::from_secs(2);
@@ -371,7 +371,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         }
         HolePunchOutcome::Timeout => {
             remote_paths.fail_attempts(elapsed_ms(punch_start));
-            print_direct_path_summary(role, "hole-punch-failed", &remote_paths);
+            print_direct_path_summary(role, "direct-path-failed", &remote_paths);
             println!("[{role}] hole-punch-timeout reason=deadline elapsed -> relay-ping fallback");
             relay_ping_fallback(&mut swarm, role, &relay_peer_id, bridge_stream)
         }
@@ -428,7 +428,7 @@ fn extract_ip_port(addr: &Multiaddr) -> Option<(String, u16)> {
 /// Returns `true` if at least one of `sources` has the same `(host, port)`
 /// as any of `targets`.
 ///
-/// Used by the listener's hole-punch success heuristic to filter out
+/// Used by the listener's direct path success heuristic to filter out
 /// inbound connections from unrelated peers (autonat probes, scans,
 /// etc.). A connection source matches only when it came from an
 /// address the remote peer advertised via DCUtR.
@@ -618,7 +618,7 @@ pub fn run_dial(
 
     // --- 6. Direct ping or relay-ping fallback -----------------------------
     if punched {
-        println!("[{role}] direct-connected peer={target} (hole-punch success)");
+        println!("[{role}] direct-connected peer={target} (direct path success)");
         ping_and_exit(&mut swarm, role, target, deadline)
     } else {
         println!("[{role}] hole-punch-timeout reason=deadline elapsed -> relay-ping fallback");
@@ -1098,7 +1098,7 @@ fn wait_for_direct_with_udp_blast(
         let now = Instant::now();
         if now >= deadline {
             paths.fail_attempts(elapsed_ms(started_at));
-            print_direct_path_summary(role, "hole-punch-failed", paths);
+            print_direct_path_summary(role, "direct-path-failed", paths);
             return Ok(false);
         }
         if now >= next_blast {
@@ -1114,7 +1114,7 @@ fn wait_for_direct_with_udp_blast(
         for ev in swarm.poll().map_err(|e| format!("holepunch poll: {e}"))? {
             print_event(role, &ev);
             if matches!(&ev, SwarmEvent::ConnectionEstablished { peer_id: p } if p == peer_id) {
-                print_direct_path_summary(role, "hole-punch-attempts", paths);
+                print_direct_path_summary(role, "direct-path-attempts", paths);
                 return Ok(true);
             }
         }
