@@ -5,14 +5,15 @@
 //! linear: bring up the swarm, do the one interesting thing, exit.
 
 use std::error::Error;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
-use minip2p_core::PeerAddr;
-use minip2p_quic::{QuicNodeConfig, QuicTransport};
+use minip2p_core::{Multiaddr, PeerAddr, Protocol};
 use minip2p_swarm::{Swarm, SwarmBuilder, SwarmEvent};
+use minip2p_transport::Transport;
 
 use crate::cli::{RunOptions, print_event};
-use crate::runtime::{bind_addr, load_keypair};
+use crate::runtime::{PeerTransport, build_peer_transport, load_keypair};
 
 const AGENT: &str = "minip2p-peer/0.1.0";
 /// Far-future deadline for the listener; practically "run forever".
@@ -27,7 +28,10 @@ pub fn run_listen(options: RunOptions) -> Result<(), Box<dyn Error>> {
         .listen_on_bound_addr()
         .map_err(|e| format!("listen failed: {e}"))?;
     // Stdout: the machine-readable event stream the E2E test scans.
-    println!("[listen] bound={peer_addr}");
+    println!("[listen] bound={}", local_dialable_peer_addr(&peer_addr));
+    for addr in swarm.transport().local_addresses() {
+        println!("[listen] listen-addr={addr}/p2p/{}", swarm.local_peer_id());
+    }
     eprintln!("[listen] waiting for dialers (Ctrl-C to stop)");
 
     // Loop until a long deadline; SIGINT tears the process down.
@@ -79,15 +83,41 @@ pub fn run_dial(target: PeerAddr, options: RunOptions) -> Result<(), Box<dyn Err
     Ok(())
 }
 
-/// Builds a `Swarm<QuicTransport>` bound to an ephemeral loopback UDP
-/// port with a fresh Ed25519 identity and the default Identify/Ping
-/// stack.
-fn build_swarm(options: &RunOptions, role: &str) -> Result<Swarm<QuicTransport>, Box<dyn Error>> {
+/// Builds a swarm with a fresh Ed25519 identity and the default
+/// Identify/Ping stack.
+fn build_swarm(options: &RunOptions, role: &str) -> Result<Swarm<PeerTransport>, Box<dyn Error>> {
     let keypair = load_keypair(options, role)?;
-    let bind_addr = bind_addr(options)?;
-    let transport = QuicTransport::new(QuicNodeConfig::new(keypair.clone()), &bind_addr)
-        .map_err(|e| format!("quic bind failed: {e}"))?;
+    let transport = build_peer_transport(options, &keypair)?;
     Ok(SwarmBuilder::new(&keypair)
         .agent_version(AGENT)
         .build(transport))
+}
+
+fn local_dialable_peer_addr(peer_addr: &PeerAddr) -> PeerAddr {
+    let protocols = peer_addr.transport().protocols();
+    let Some(first) = protocols.first() else {
+        return peer_addr.clone();
+    };
+
+    let replacement = match first {
+        Protocol::Ip4(bytes) if *bytes == [0, 0, 0, 0] => {
+            Some(Protocol::Ip4(Ipv4Addr::LOCALHOST.octets()))
+        }
+        Protocol::Ip6(bytes) if *bytes == [0; 16] => {
+            Some(Protocol::Ip6(Ipv6Addr::LOCALHOST.octets()))
+        }
+        _ => None,
+    };
+
+    let Some(replacement) = replacement else {
+        return peer_addr.clone();
+    };
+
+    let mut rewritten = protocols.to_vec();
+    rewritten[0] = replacement;
+    PeerAddr::new(
+        Multiaddr::from_protocols(rewritten),
+        peer_addr.peer_id().clone(),
+    )
+    .unwrap_or_else(|_| peer_addr.clone())
 }
