@@ -6,7 +6,7 @@
 //! hole-punch, ping. No phase enums; every step is an obvious function
 //! call.
 //!
-//! See `holepunch-plan.md` at the repo root for the full design.
+//! See `examples/peer/README.md` for usage examples.
 
 use std::error::Error;
 use std::time::{Duration, Instant};

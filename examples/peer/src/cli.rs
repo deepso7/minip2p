@@ -405,7 +405,7 @@ NOTES:
     --external-addr    repeatable relay-mode DCUtR candidate
     --autonat          relay-mode public AutoNAT service for dialability checks
 
-    See holepunch-plan.md at the repo root for full semantics."
+    See examples/peer/README.md for full usage examples."
         .to_string()
 }
 

@@ -163,12 +163,12 @@ New crate: `crates/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 - A swarm connects two peers, negotiates protocols, and runs ping without manual wiring. [done]
 - `cargo check --no-default-features -p minip2p-swarm` succeeds.
 
-### Milestone 5: Relay client and DCUtR state machines -- DONE (demo pending)
+### Milestone 5: Relay client and DCUtR state machines -- DONE
 
 - [x] `crates/relay`: Circuit Relay v2 client state machines (HopReservation, HopConnect, StopResponder), `no_std + alloc`.
 - [x] `crates/dcutr`: DCUtR hole-punch coordination state machines (Initiator, Responder), `no_std + alloc`.
 - [x] Pure-state-machine integration test covering the full RESERVE + CONNECT + STOP + DCUtR flow with an in-memory relay emulator.
-- [ ] CLI binary `examples/peer` exercising the full stack against a real relay (local rust-libp2p for first iteration, VM-hosted relay later). See `holepunch-plan.md`.
+- [x] CLI binary `examples/peer` exercising the full stack against a real relay, including relay reservation, STOP circuit establishment, DCUtR coordination, direct ping, and relay fallback.
 
 **Exit criteria**
 - Two minip2p peers connect via a real relay server, negotiate DCUtR, attempt hole punch, and succeed (direct ping) or fall back to relay ping.

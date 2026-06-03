@@ -1,6 +1,6 @@
 //! `minip2p-peer`: CLI demo exercising the full minip2p stack.
 //!
-//! See `holepunch-plan.md` at the repo root for the full design.
+//! See `examples/peer/README.md` for usage examples.
 //!
 //! This file is the tiny dispatch layer: parse argv via [`cli`],
 //! then hand off to one of the four mode runners. The mode runners
@@ -31,8 +31,7 @@ fn main() {
     }
 }
 
-/// Dispatches to the mode runner. Relay modes are still stubs; they land
-/// in the `relay` / `holepunch` modules in subsequent steps.
+/// Dispatches to the mode runner.
 fn run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
     match mode {
         Mode::DirectListen { options } => direct::run_listen(options),

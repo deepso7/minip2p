@@ -42,7 +42,7 @@ Current validated behavior:
 - Swarm DX events for application readiness (`PeerReady`) and typed runtime errors.
 - Pure-state-machine integration test covering Circuit Relay v2 + DCUtR (reservation, connect, stop, hole-punch coordination).
 - AutoNAT reachability probe wire logic and state machines in `minip2p-autonat`.
-- Manual VPS test against rust-libp2p relay validates HOP reservation, STOP circuit establishment, DCUtR coordination, and relay-ping fallback.
+- Manual cross-network test against a rust-libp2p relay validates HOP reservation, STOP circuit establishment, DCUtR coordination, IPv6 hole punching, direct ping, and relay-ping fallback.
 
 ## Architecture boundaries
 
@@ -103,8 +103,8 @@ cargo doc --workspace --no-deps --open
 - [x] Swarm / connection management layer with builder DX.
 - [x] Circuit Relay v2 client state machines.
 - [x] DCUtR hole-punching state machines.
-- [ ] Runnable hole-punch CLI against a real relay (see `holepunch-plan.md`).
+- [x] Runnable hole-punch CLI against a real relay.
 - [x] Mutual TLS on the QUIC transport so the listener learns the client PeerId at handshake time.
 - [ ] Additional transport adapters (TCP, WebSocket, WebRTC).
 
-See `plan.md` for the detailed execution plan and milestones, and `holepunch-plan.md` for the runnable relay/DCUtR demo work.
+See `plan.md` for the detailed execution plan and longer-term milestones.

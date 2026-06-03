@@ -6,7 +6,7 @@ publish = false
 
 # Binary that exercises the full minip2p stack end-to-end: direct QUIC
 # peer-to-peer pings, and relay-coordinated hole-punch pings via Circuit
-# Relay v2 + DCUtR. See holepunch-plan.md for the full design.
+# Relay v2 + DCUtR. See examples/peer/README.md for usage.
 [[bin]]
 name = "minip2p-peer"
 path = "src/main.rs"

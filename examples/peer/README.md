@@ -55,7 +55,7 @@ cargo run -p minip2p-peer -- listen
 # [listen] waiting for dialers (Ctrl-C to stop)
 ```
 
-Terminal 2, with the `bound=` peer-addr from above:
+Terminal 2, with the local `bound=` peer address:
 
 ```bash
 cargo run -p minip2p-peer -- dial /ip4/127.0.0.1/udp/53121/quic-v1/p2p/12D3KooW...
@@ -83,12 +83,12 @@ reachability validation, run an AutoNAT service on a public host too. For a
 single VPS demo, the relay and AutoNAT service can be separate processes on the
 same machine using different UDP ports.
 
-Start a rust-libp2p relay server (rough steps; verify the exact binary
-name against the `rust-libp2p` repo at time of use):
+Start a rust-libp2p relay server. For IPv6 testing, make sure the relay prints
+an `/ip6/.../udp/4001/quic-v1/p2p/...` address and that UDP/4001 is reachable:
 
 ```bash
 # from a checked-out rust-libp2p tree
-cargo run --example relay-server-example
+cargo run -p relay-server-example -- --port 4001 --secret-key-seed 1 --use-ipv6 true
 # note the peer-addr it prints -- that's <relay-peer-addr>
 ```
 
@@ -124,6 +124,7 @@ cargo run -p minip2p-peer -- listen \
 # [relay-listen] dcutr-sync-received -> holepunching
 # [relay-listen] remote-dcutr-candidates [/ip4/.../udp/.../quic-v1]
 # [relay-listen] direct-connected peer=12D3KooW... (B) (hole-punch success)
+# [relay-listen] bridge-close stream=... reason=direct-path-ready
 # [relay-listen] ping-direct peer=12D3KooW... (B) rtt=12ms -- done
 ```
 
@@ -146,23 +147,26 @@ cargo run -p minip2p-peer -- dial \
 # [relay-dial] remote-dcutr-candidates [...]
 # [relay-dial] direct-dial-attempt /ip4/.../p2p/12D3KooW... (A)
 # [relay-dial] direct-connected peer=... (hole-punch success)
+# [relay-dial] bridge-close stream=... reason=direct-path-ready
 # [relay-dial] ping-direct peer=... rtt=Nms -- done
 ```
 
 ### Public relay shape
 
-For cross-network tests, run with public relay and AutoNAT service addresses,
-stable keys, and non-loopback binds. AutoNAT validates whether your advertised
-candidates are actually dialable by another libp2p peer:
+For cross-network tests, run with public relay and optional AutoNAT service
+addresses plus stable keys. By default the peer binds both IPv4 and IPv6
+wildcard UDP sockets; pass `--listen` only when you want one address family or
+a fixed port. AutoNAT validates whether your advertised candidates are actually
+dialable by another libp2p peer:
 
 ```bash
 cargo run -p minip2p-peer -- listen \
-    --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
+    --relay /ip6/<relay-ipv6>/udp/4001/quic-v1/p2p/<relay-peer-id> \
     --autonat /ip4/<autonat-ip>/udp/4002/quic-v1/p2p/<autonat-peer-id> \
     --key ./peer-b.key
 
 cargo run -p minip2p-peer -- dial \
-    --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
+    --relay /ip6/<relay-ipv6>/udp/4001/quic-v1/p2p/<relay-peer-id> \
     --target <peer-b-id> \
     --autonat /ip4/<autonat-ip>/udp/4002/quic-v1/p2p/<autonat-peer-id> \
     --key ./peer-a.key
@@ -180,11 +184,12 @@ demo should fall back to `ping-via-relay`.
 Expected terminal result is either `ping-direct` after a successful direct
 QUIC+mTLS connection, or `ping-via-relay` after a bounded hole-punch timeout.
 
-Current VPS validation status: HOP reservation, STOP circuit establishment,
-DCUtR CONNECT/SYNC coordination, and `ping-via-relay` fallback have been
-validated against rust-libp2p's relay server. Direct `ping-direct` requires at
-least one dialable candidate; wildcard listen addresses such as
-`/ip4/0.0.0.0/...` are bind-only and must not be used as remote candidates.
+Current validation status: HOP reservation, STOP circuit establishment, DCUtR
+CONNECT/SYNC coordination, IPv6 direct hole punching, `ping-direct`, and
+`ping-via-relay` fallback have been validated against rust-libp2p's relay
+server. Direct `ping-direct` requires at least one dialable candidate; wildcard
+listen addresses such as `/ip4/0.0.0.0/...` are bind-only and are filtered out
+before DCUtR candidate exchange.
 
 Candidate priority is intended to be:
 
@@ -201,9 +206,9 @@ to test the direct path:
 --listen /ip4/127.0.0.1/udp/0/quic-v1
 ```
 
-If peers are on the same LAN, bind each peer to its LAN IP. For real internet
-tests across NATs, use `--external-addr` with a known forwarded/public UDP
-address until observed-address candidate discovery is fully wired.
+If peers are on the same LAN, bind each peer to its LAN IP. For internet tests
+across NATs, the relay-observed address is used automatically when available;
+use `--external-addr` when you have a known forwarded/public UDP address.
 
 ### Fallback output (when hole-punch fails)
 
@@ -243,10 +248,6 @@ steps is visible top-to-bottom.
 - `src/relay.rs` — relay-mode scripts for both Peer B (listener) and
   Peer A (dialer), driving the HOP/STOP/DCUtR state machines inline
   and running mTLS-verified hole-punch + relay-ping fallback at the bottom.
-
-See `holepunch-plan.md` at the repo root for the design rationale and
-open questions (RTT approximation on the responder side, relay-ping
-protocol id, etc).
 
 ## Known limitations
 
@@ -288,15 +289,13 @@ Public relay workflow:
 
 ```bash
 minip2p-peer listen \
-  --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
+  --relay /ip6/<relay-ipv6>/udp/4001/quic-v1/p2p/<relay-peer-id> \
   --autonat /ip4/<autonat-ip>/udp/4002/quic-v1/p2p/<autonat-peer-id> \
-  --key ./peer-b.key \
-  --listen /ip4/0.0.0.0/udp/0/quic-v1
+  --key ./peer-b.key
 
 minip2p-peer dial \
-  --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
+  --relay /ip6/<relay-ipv6>/udp/4001/quic-v1/p2p/<relay-peer-id> \
   --target <peer-b-id> \
   --autonat /ip4/<autonat-ip>/udp/4002/quic-v1/p2p/<autonat-peer-id> \
-  --key ./peer-a.key \
-  --listen /ip4/0.0.0.0/udp/0/quic-v1
+  --key ./peer-a.key
 ```

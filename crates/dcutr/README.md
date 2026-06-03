@@ -50,7 +50,7 @@ while let Some(output) = initiator.poll_output() {
 // initiator.handle_input(DcutrInitiatorInput::Data { bytes: data, rtt_ms })?;
 ```
 
-The timing rules (wait `rtt / 2` on the responder side before blasting UDP, etc.) live in the caller -- see `holepunch-plan.md` for the CLI's approach.
+The timing rules (wait `rtt / 2` on the responder side before blasting UDP, etc.) live in the caller.
 
 ## no_std
 
