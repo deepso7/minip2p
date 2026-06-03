@@ -181,17 +181,17 @@ New crate: `crates/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 **Exit criteria**
 - `TransportEvent::PeerIdentityVerified` fires on the server side of a mutual-TLS QUIC handshake; the synthetic PeerId path in Swarm is exercised only as a fallback, not as the default.
 
-### Milestone 7: Internet-ready relay/DCUtR demo
+### Milestone 7: Internet-ready relay/DCUtR demo -- DONE
 
 - [x] Persistent identities for `examples/peer` via `--key <path>` so peer IDs survive restarts and can be used as stable relay targets.
-- [x] Configurable listen address for `examples/peer` (default remains loopback for local DX; `--listen /ip4/0.0.0.0/udp/0/quic-v1` enables real-network tests).
+- [x] Configurable listen address for `examples/peer` (default listens on both IPv4 and IPv6 wildcard UDP sockets; `--listen <quic-multiaddr>` forces a single address family or fixed port).
 - [x] Manual external address override for DCUtR candidates (`--external-addr /ip4/<public-ip>/udp/<port>/quic-v1`) for known public addresses and port-forwards.
 - [x] Public relay walkthrough using rust-libp2p's relay server: relay command, listener command, dialer command, expected `ping-direct` and `ping-via-relay` output.
 - [x] Diagnostics for real-world NAT runs: print observed relay address, advertised DCUtR candidates, direct dial attempts, direct failure reason, and fallback reason.
 - [x] AutoNAT reachability probe support with `minip2p-autonat` (`no_std + alloc`, Sans-I/O), `minip2p-peer autonat`, and relay-mode `--autonat <peer-addr>` validation.
 - [x] Manual VPS validation against rust-libp2p relay: HOP reservation, STOP circuit, DCUtR exchange, and `ping-via-relay` fallback work.
 - [x] Relay readiness retry for rust-libp2p relay startup: wait for fresh Identify/PeerReady protocol advertisement and retry until HOP is advertised.
-- [ ] Direct `ping-direct` candidate discovery: filter wildcard bind addresses, use parseable Identify observed addresses, support `/quic` vs `/quic-v1` observed-address interop if rust-libp2p reports legacy `/quic`, and keep `--external-addr` as the explicit override.
+- [x] Direct `ping-direct` candidate discovery: filter wildcard bind addresses, use parseable Identify observed addresses, strictly require `/quic-v1`, and keep `--external-addr` as the explicit override.
 
 **Exit criteria**
 - Two peers on different networks can rendezvous through a public relay, attempt DCUtR, authenticate direct QUIC with mTLS, and either `ping-direct` with dialable candidates or fall back to `ping-via-relay` with actionable logs.
@@ -210,9 +210,10 @@ New crate: `crates/tls` (`minip2p-tls`) -- `no_std + alloc` compatible.
 
 The core DX pass is complete: `SwarmEvent::PeerReady` models the
 application-ready peer lifecycle, runtime swarm errors are typed,
-`Swarm::listen_on_bound_addr()` covers the common quickstart path,
-`open_user_stream` fails fast for known-unsupported protocols, peer
-introspection accessors expose current Identify state, and common
+`Swarm::listen_on_bound_addrs()` covers the common dual-stack quickstart
+path while `listen_on_bound_addr()` remains available for single-socket
+transports, `open_user_stream` fails fast for known-unsupported protocols,
+peer introspection accessors expose current Identify state, and common
 workflows are captured in the root `justfile`.
 
 Keypair file persistence is intentionally application-owned: the
@@ -224,7 +225,7 @@ and rotation policy belong to hosts.
 
 - Unit tests for core parsing/types and error behavior.
 - Integration tests for two-peer connectivity per transport.
-- `cargo check --no-default-features` for `crates/identity`, `crates/core`, `crates/transport`, `crates/tls`, and `crates/autonat`.
+- `cargo check --no-default-features` for the core `no_std + alloc` crates: `identity`, `core`, `transport`, `tls`, `multistream-select`, `ping`, `identify`, `relay`, `autonat`, `dcutr`, and `swarm`.
 - Stable, documented error messages for common misconfiguration paths.
 - Dependency and footprint discipline for core crates.
 
