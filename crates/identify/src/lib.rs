@@ -124,6 +124,11 @@ pub enum IdentifyInput {
     },
     /// Remove all state for a peer.
     RemovePeer { peer_id: PeerId },
+    /// Move all peer-scoped state from an old id to a verified id.
+    MigratePeer {
+        old_peer_id: PeerId,
+        new_peer_id: PeerId,
+    },
 }
 
 /// Outputs produced by [`IdentifyProtocol`] when driven through
@@ -212,7 +217,7 @@ impl IdentifyProtocol {
     ///
     /// The returned actions send our identify message and close the write
     /// side.
-    pub fn register_outbound_stream(
+    fn register_outbound_stream(
         &mut self,
         peer_id: PeerId,
         stream_id: StreamId,
@@ -271,7 +276,7 @@ impl IdentifyProtocol {
     /// Call this after multistream-select negotiates `/ipfs/id/1.0.0` on an
     /// outbound stream. The protocol will buffer incoming data until the
     /// remote closes its write side.
-    pub fn register_inbound_stream(&mut self, peer_id: PeerId, stream_id: StreamId) {
+    fn register_inbound_stream(&mut self, peer_id: PeerId, stream_id: StreamId) {
         let state = self.peers.entry(peer_id).or_default();
         state.inbound_streams.entry(stream_id).or_default();
     }
@@ -280,7 +285,7 @@ impl IdentifyProtocol {
     ///
     /// Returns actions the host must execute (none expected for the initiator
     /// side, but included for consistency).
-    pub fn on_stream_data(
+    fn on_stream_data(
         &mut self,
         peer_id: PeerId,
         stream_id: StreamId,
@@ -315,7 +320,7 @@ impl IdentifyProtocol {
     /// signals the message is complete. The initiator closes its own write
     /// side in response so that the stream can reach the `Closed` state and
     /// have its transport-level and protocol-level state reclaimed.
-    pub fn on_stream_remote_write_closed(
+    fn on_stream_remote_write_closed(
         &mut self,
         peer_id: PeerId,
         stream_id: StreamId,
@@ -354,7 +359,7 @@ impl IdentifyProtocol {
     }
 
     /// Notify that a stream was fully closed.
-    pub fn on_stream_closed(&mut self, peer_id: PeerId, stream_id: StreamId) {
+    fn on_stream_closed(&mut self, peer_id: PeerId, stream_id: StreamId) {
         let Some(state) = self.peers.get_mut(&peer_id) else {
             return;
         };
@@ -371,7 +376,7 @@ impl IdentifyProtocol {
     }
 
     /// Remove all state for a peer.
-    pub fn remove_peer(&mut self, peer_id: &PeerId) {
+    fn remove_peer(&mut self, peer_id: &PeerId) {
         self.peers.remove(peer_id);
     }
 
@@ -381,7 +386,7 @@ impl IdentifyProtocol {
     /// initially registering the connection under a placeholder. Any buffered
     /// events referencing `old_peer_id` are rewritten to `new_peer_id` so the
     /// application only ever sees events under the real peer identity.
-    pub fn migrate_peer(&mut self, old_peer_id: &PeerId, new_peer_id: &PeerId) {
+    fn migrate_peer(&mut self, old_peer_id: &PeerId, new_peer_id: &PeerId) {
         if old_peer_id == new_peer_id {
             return;
         }
@@ -402,7 +407,8 @@ impl IdentifyProtocol {
     }
 
     /// Drain buffered events.
-    pub fn poll_events(&mut self) -> Vec<IdentifyEvent> {
+    #[cfg(test)]
+    fn poll_events(&mut self) -> Vec<IdentifyEvent> {
         core::mem::take(&mut self.events)
     }
 }
@@ -447,6 +453,10 @@ impl SansIoProtocol for IdentifyProtocol {
                 self.on_stream_closed(peer_id, stream_id);
             }
             IdentifyInput::RemovePeer { peer_id } => self.remove_peer(&peer_id),
+            IdentifyInput::MigratePeer {
+                old_peer_id,
+                new_peer_id,
+            } => self.migrate_peer(&old_peer_id, &new_peer_id),
         }
         Ok(())
     }

@@ -164,7 +164,7 @@ impl DcutrInitiator {
     }
 
     /// Drains and returns any pending outbound bytes.
-    pub fn take_outbound(&mut self) -> Vec<u8> {
+    fn take_outbound(&mut self) -> Vec<u8> {
         let bytes = core::mem::take(&mut self.outbound);
         self.state = match self.state {
             InitiatorState::Pending => InitiatorState::AwaitingConnectReply,
@@ -179,7 +179,7 @@ impl DcutrInitiator {
     /// `rtt_ms` is the caller's measured RTT from when they sent CONNECT
     /// (via `take_outbound`) to now. It is passed through into the
     /// `DialNow` outcome so the caller can use it for SYNC timing.
-    pub fn on_data(&mut self, data: &[u8], rtt_ms: u64) -> Result<(), DcutrError> {
+    fn on_data(&mut self, data: &[u8], rtt_ms: u64) -> Result<(), DcutrError> {
         if matches!(
             self.state,
             InitiatorState::Done | InitiatorState::SyncPending
@@ -192,13 +192,14 @@ impl DcutrInitiator {
     }
 
     /// Notifies the state machine that the remote closed its write side.
-    pub fn on_remote_write_closed(&mut self) -> Result<(), DcutrError> {
+    fn on_remote_write_closed(&mut self) -> Result<(), DcutrError> {
         // No-op: the outcome is already resolved by the time we'd care.
         Ok(())
     }
 
     /// Returns the current outcome, if available.
-    pub fn outcome(&self) -> Option<&InitiatorOutcome> {
+    #[cfg(test)]
+    fn outcome(&self) -> Option<&InitiatorOutcome> {
         self.outcome.as_ref()
     }
 
@@ -211,7 +212,7 @@ impl DcutrInitiator {
     ///
     /// Call this after you have initiated your simultaneous dial, per the
     /// spec. After calling, flush [`take_outbound`] to the stream.
-    pub fn send_sync(&mut self) -> Result<(), DcutrError> {
+    fn send_sync(&mut self) -> Result<(), DcutrError> {
         if self.state != InitiatorState::ReadyToSync {
             return Err(DcutrError::UnexpectedMessage(alloc::format!(
                 "cannot send SYNC from state {:?}",
@@ -362,12 +363,12 @@ impl DcutrResponder {
     }
 
     /// Drains and returns any pending outbound bytes.
-    pub fn take_outbound(&mut self) -> Vec<u8> {
+    fn take_outbound(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.outbound)
     }
 
     /// Feeds incoming stream bytes.
-    pub fn on_data(&mut self, data: &[u8]) -> Result<(), DcutrError> {
+    fn on_data(&mut self, data: &[u8]) -> Result<(), DcutrError> {
         if self.state == ResponderState::Done {
             return Ok(());
         }
@@ -377,12 +378,13 @@ impl DcutrResponder {
     }
 
     /// Notifies the state machine that the remote closed its write side.
-    pub fn on_remote_write_closed(&mut self) -> Result<(), DcutrError> {
+    fn on_remote_write_closed(&mut self) -> Result<(), DcutrError> {
         self.try_decode()
     }
 
     /// Drains buffered events.
-    pub fn poll_events(&mut self) -> Vec<ResponderEvent> {
+    #[cfg(test)]
+    fn poll_events(&mut self) -> Vec<ResponderEvent> {
         core::mem::take(&mut self.events)
     }
 

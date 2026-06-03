@@ -123,6 +123,8 @@ pub enum PingInput {
         payload: [u8; PING_PAYLOAD_LEN],
         now_ms: u64,
     },
+    /// Close the write side of the outbound ping stream.
+    CloseOutboundStreamWrite { peer_id: PeerId },
     /// Received stream data.
     StreamData {
         peer_id: PeerId,
@@ -142,6 +144,11 @@ pub enum PingInput {
     },
     /// Remove all state for a peer.
     RemovePeer { peer_id: PeerId },
+    /// Move all peer-scoped state from an old id to a verified id.
+    MigratePeer {
+        old_peer_id: PeerId,
+        new_peer_id: PeerId,
+    },
     /// Time advanced.
     Tick { now_ms: u64 },
 }
@@ -227,7 +234,7 @@ impl PingProtocol {
     }
 
     /// Registers a negotiated outbound stream for a peer.
-    pub fn register_outbound_stream(
+    fn register_outbound_stream(
         &mut self,
         peer_id: PeerId,
         stream_id: StreamId,
@@ -260,11 +267,7 @@ impl PingProtocol {
     }
 
     /// Registers a negotiated inbound stream from a peer.
-    pub fn register_inbound_stream(
-        &mut self,
-        peer_id: PeerId,
-        stream_id: StreamId,
-    ) -> Vec<PingAction> {
+    fn register_inbound_stream(&mut self, peer_id: PeerId, stream_id: StreamId) -> Vec<PingAction> {
         let peer = self.peers.entry(peer_id.clone()).or_default();
         if peer.inbound_streams.contains(&stream_id) {
             return Vec::new();
@@ -287,7 +290,7 @@ impl PingProtocol {
     }
 
     /// Sends a ping with the given 32-byte payload. Returns the action to execute.
-    pub fn send_ping(
+    fn send_ping(
         &mut self,
         peer_id: &PeerId,
         payload: &[u8],
@@ -333,10 +336,7 @@ impl PingProtocol {
     }
 
     /// Half-closes the outbound stream. Fails if a ping is in flight.
-    pub fn close_outbound_stream_write(
-        &mut self,
-        peer_id: &PeerId,
-    ) -> Result<PingAction, PingError> {
+    fn close_outbound_stream_write(&mut self, peer_id: &PeerId) -> Result<PingAction, PingError> {
         let peer = self
             .peers
             .get_mut(peer_id)
@@ -363,7 +363,7 @@ impl PingProtocol {
     }
 
     /// Feeds received stream data into the protocol. Returns actions to execute.
-    pub fn on_stream_data(
+    fn on_stream_data(
         &mut self,
         peer_id: &PeerId,
         stream_id: StreamId,
@@ -470,7 +470,7 @@ impl PingProtocol {
     }
 
     /// Notifies the protocol that the remote peer closed its write side.
-    pub fn on_stream_remote_write_closed(
+    fn on_stream_remote_write_closed(
         &mut self,
         peer_id: &PeerId,
         stream_id: StreamId,
@@ -510,7 +510,7 @@ impl PingProtocol {
     }
 
     /// Notifies the protocol that a stream was fully closed.
-    pub fn on_stream_closed(&mut self, peer_id: &PeerId, stream_id: StreamId) {
+    fn on_stream_closed(&mut self, peer_id: &PeerId, stream_id: StreamId) {
         let Some(peer) = self.peers.get_mut(peer_id) else {
             return;
         };
@@ -525,7 +525,7 @@ impl PingProtocol {
 
     /// Remove all state for a peer. Call this when the connection to a peer is
     /// closed to prevent unbounded memory growth.
-    pub fn remove_peer(&mut self, peer_id: &PeerId) {
+    fn remove_peer(&mut self, peer_id: &PeerId) {
         self.peers.remove(peer_id);
     }
 
@@ -539,7 +539,7 @@ impl PingProtocol {
     /// the application only ever sees events under the real PeerId.
     ///
     /// If there is no state for `old_peer_id`, this is a no-op.
-    pub fn migrate_peer(&mut self, old_peer_id: &PeerId, new_peer_id: &PeerId) {
+    fn migrate_peer(&mut self, old_peer_id: &PeerId, new_peer_id: &PeerId) {
         if old_peer_id == new_peer_id {
             return;
         }
@@ -566,7 +566,7 @@ impl PingProtocol {
     }
 
     /// Checks for timed-out ping requests. Call periodically.
-    pub fn on_tick(&mut self, now_ms: u64) -> Vec<PingAction> {
+    fn on_tick(&mut self, now_ms: u64) -> Vec<PingAction> {
         let mut actions = Vec::new();
 
         for (peer_id, peer) in self.peers.iter_mut() {
@@ -602,7 +602,8 @@ impl PingProtocol {
     }
 
     /// Drains and returns all pending events.
-    pub fn poll_events(&mut self) -> Vec<PingEvent> {
+    #[cfg(test)]
+    fn poll_events(&mut self) -> Vec<PingEvent> {
         core::mem::take(&mut self.pending_events)
     }
 
@@ -648,6 +649,10 @@ impl SansIoProtocol for PingProtocol {
                 let action = self.send_ping(&peer_id, &payload, now_ms)?;
                 self.pending_actions.push_back(action);
             }
+            PingInput::CloseOutboundStreamWrite { peer_id } => {
+                let action = self.close_outbound_stream_write(&peer_id)?;
+                self.pending_actions.push_back(action);
+            }
             PingInput::StreamData {
                 peer_id,
                 stream_id,
@@ -665,6 +670,10 @@ impl SansIoProtocol for PingProtocol {
                 self.on_stream_closed(&peer_id, stream_id);
             }
             PingInput::RemovePeer { peer_id } => self.remove_peer(&peer_id),
+            PingInput::MigratePeer {
+                old_peer_id,
+                new_peer_id,
+            } => self.migrate_peer(&old_peer_id, &new_peer_id),
             PingInput::Tick { now_ms } => {
                 let actions = self.on_tick(now_ms);
                 self.pending_actions.extend(actions);

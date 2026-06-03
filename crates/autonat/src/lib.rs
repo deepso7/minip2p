@@ -285,7 +285,7 @@ impl AutoNatClient {
     }
 
     /// Drains pending outbound bytes.
-    pub fn take_outbound(&mut self) -> Vec<u8> {
+    fn take_outbound(&mut self) -> Vec<u8> {
         if self.state == FlowState::Pending {
             self.state = FlowState::AwaitingResponse;
         }
@@ -293,7 +293,7 @@ impl AutoNatClient {
     }
 
     /// Feeds incoming bytes from the AutoNAT service stream.
-    pub fn on_data(&mut self, data: &[u8]) -> Result<(), AutoNatError> {
+    fn on_data(&mut self, data: &[u8]) -> Result<(), AutoNatError> {
         if self.state == FlowState::Done {
             return Ok(());
         }
@@ -302,7 +302,8 @@ impl AutoNatClient {
     }
 
     /// Returns the reachability outcome, if available.
-    pub fn outcome(&self) -> Option<&Reachability> {
+    #[cfg(test)]
+    fn outcome(&self) -> Option<&Reachability> {
         self.outcome.as_ref()
     }
 
@@ -361,7 +362,7 @@ impl AutoNatServer {
     }
 
     /// Feeds incoming bytes from a requester.
-    pub fn on_data(&mut self, data: &[u8]) -> Result<(), AutoNatError> {
+    fn on_data(&mut self, data: &[u8]) -> Result<(), AutoNatError> {
         if self.state != ServerState::AwaitingRequest {
             return Ok(());
         }
@@ -370,22 +371,23 @@ impl AutoNatServer {
     }
 
     /// Returns the parsed dial-back request, if ready.
-    pub fn request(&self) -> Option<&AutoNatRequest> {
+    #[cfg(test)]
+    fn request(&self) -> Option<&AutoNatRequest> {
         self.request.as_ref()
     }
 
     /// Queues a successful DIAL_RESPONSE with dialable addresses.
-    pub fn respond_public(&mut self, addrs: &[Multiaddr]) {
+    fn respond_public(&mut self, addrs: &[Multiaddr]) {
         self.respond(ResponseStatus::Ok, None, addrs);
     }
 
     /// Queues an unsuccessful DIAL_RESPONSE.
-    pub fn respond_error(&mut self, status: ResponseStatus, reason: impl Into<String>) {
+    fn respond_error(&mut self, status: ResponseStatus, reason: impl Into<String>) {
         self.respond(status, Some(reason.into()), &[]);
     }
 
     /// Drains pending outbound bytes.
-    pub fn take_outbound(&mut self) -> Vec<u8> {
+    fn take_outbound(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.outbound)
     }
 

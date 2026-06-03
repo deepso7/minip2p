@@ -121,7 +121,7 @@ impl MultistreamSelect {
     }
 
     /// Produces the initial multistream header to send. Idempotent.
-    pub fn start(&mut self) -> Vec<MultistreamOutput> {
+    fn start(&mut self) -> Vec<MultistreamOutput> {
         if self.started {
             return Vec::new();
         }
@@ -149,7 +149,7 @@ impl MultistreamSelect {
     }
 
     /// Feeds received bytes into the state machine and returns any outputs.
-    pub fn receive(&mut self, bytes: &[u8]) -> Vec<MultistreamOutput> {
+    fn receive(&mut self, bytes: &[u8]) -> Vec<MultistreamOutput> {
         if self.state == State::Done {
             return Vec::new();
         }

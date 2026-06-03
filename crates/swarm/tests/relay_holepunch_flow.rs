@@ -25,16 +25,17 @@
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 
-use minip2p_core::{Multiaddr, PeerId};
+use minip2p_core::{Multiaddr, PeerId, SansIoProtocol};
 use minip2p_dcutr::{
-    DcutrInitiator, DcutrResponder, InitiatorOutcome, ResponderEvent,
-    decode_frame as dcutr_decode_frame,
+    DcutrInitiator, DcutrInitiatorInput, DcutrInitiatorOutput, DcutrResponder, DcutrResponderInput,
+    DcutrResponderOutput, InitiatorOutcome, ResponderEvent, decode_frame as dcutr_decode_frame,
 };
 use minip2p_identity::Ed25519Keypair;
 use minip2p_relay::{
-    FrameDecode, HopConnect, HopMessage, HopMessageType, HopReservation, Peer, Reservation,
-    ReservationOutcome, Status, StopMessage, StopMessageType, StopResponder,
-    decode_frame as relay_decode_frame, encode_frame as relay_encode_frame,
+    FrameDecode, HopConnect, HopConnectInput, HopConnectOutput, HopMessage, HopMessageType,
+    HopReservation, HopReservationInput, HopReservationOutput, Peer, Reservation,
+    ReservationOutcome, Status, StopMessage, StopMessageType, StopResponder, StopResponderInput,
+    StopResponderOutput, decode_frame as relay_decode_frame, encode_frame as relay_encode_frame,
 };
 
 // ---------------------------------------------------------------------------
@@ -265,16 +266,16 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
     let mut b_reservation = HopReservation::new();
 
     // B sends RESERVE. Relay stores reservation and responds with STATUS:OK.
-    let reserve_bytes = b_reservation.take_outbound();
+    let reserve_bytes = reserve_flush(&mut b_reservation);
     relay.on_reserve_request(&peer_b, &reserve_bytes).unwrap();
 
     // B receives the relay's response on its HOP stream.
     let relay_to_b = relay.drain_hop_bytes_for(&peer_b);
-    b_reservation.on_data(&relay_to_b).unwrap();
+    let reservation_outcome = reserve_feed(&mut b_reservation, relay_to_b);
     assert!(b_reservation.is_done());
     assert!(matches!(
-        b_reservation.outcome(),
-        Some(ReservationOutcome::Accepted { .. })
+        reservation_outcome,
+        ReservationOutcome::Accepted { .. }
     ));
     assert_eq!(
         relay.events[0],
@@ -288,7 +289,7 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
     let mut a_connect = HopConnect::new(peer_b.to_bytes());
 
     // A sends HOP CONNECT(peer=B).
-    let connect_bytes = a_connect.take_outbound();
+    let connect_bytes = connect_flush(&mut a_connect);
 
     // The relay forwards a STOP CONNECT to B and remembers to send A a
     // STATUS:OK once B acks.
@@ -302,15 +303,12 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
 
     let mut b_stop = StopResponder::new();
     let stop_to_b = relay.drain_stop_bytes_for(&peer_b);
-    b_stop.on_data(&stop_to_b).unwrap();
-
-    let b_stop_request = b_stop.request().expect("CONNECT received");
+    let b_stop_request = stop_feed(&mut b_stop, stop_to_b);
     // The source peer id in the STOP CONNECT must be A.
     assert_eq!(b_stop_request.source_peer_id, peer_a.to_bytes());
 
     // B accepts; outbound STATUS:OK goes back to the relay.
-    b_stop.accept().unwrap();
-    let b_stop_ok = b_stop.take_outbound();
+    let b_stop_ok = stop_accept_flush(&mut b_stop);
 
     // Relay forwards the ack to A as HOP STATUS:OK.
     relay
@@ -318,11 +316,11 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
         .unwrap();
 
     // A receives the HOP STATUS:OK: the stream is now bridged.
-    a_connect.on_data(&initiator_inbox).unwrap();
+    let connect_outcome = connect_feed(&mut a_connect, initiator_inbox);
     assert!(a_connect.is_done());
     assert!(matches!(
-        a_connect.outcome(),
-        Some(minip2p_relay::ConnectOutcome::Bridged { .. })
+        connect_outcome,
+        minip2p_relay::ConnectOutcome::Bridged { .. }
     ));
 
     // Sanity check: the relay recorded both the CONNECT bridge and the final
@@ -349,50 +347,48 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
     let mut dcutr_b = DcutrResponder::new(&b_observed);
 
     // A sends CONNECT over the bridge.
-    push_bytes(&mut a_to_b, &dcutr_a.take_outbound());
+    push_bytes(&mut a_to_b, &dcutr_initiator_flush(&mut dcutr_a));
 
     // B receives CONNECT, queues a reply, emits ConnectReceived event.
     let bytes = drain_pipe(&mut a_to_b);
-    dcutr_b.on_data(&bytes).unwrap();
+    dcutr_responder_feed(&mut dcutr_b, bytes);
 
-    let events_b = dcutr_b.poll_events();
+    // B flushes its CONNECT reply toward A.
+    push_bytes(&mut b_to_a, &dcutr_responder_flush(&mut dcutr_b));
+
+    let events_b = dcutr_responder_events(&mut dcutr_b);
     assert!(matches!(
         events_b.first(),
         Some(ResponderEvent::ConnectReceived { remote_addrs, .. })
             if *remote_addrs == a_observed
     ));
 
-    // B flushes its CONNECT reply toward A.
-    push_bytes(&mut b_to_a, &dcutr_b.take_outbound());
-
     // A receives CONNECT reply, records remote addrs and RTT.
     let bytes = drain_pipe(&mut b_to_a);
     let simulated_rtt_ms = 42;
-    dcutr_a.on_data(&bytes, simulated_rtt_ms).unwrap();
+    let initiator_outcome = dcutr_initiator_feed(&mut dcutr_a, bytes, simulated_rtt_ms);
 
-    match dcutr_a.outcome() {
-        Some(InitiatorOutcome::DialNow {
+    match initiator_outcome {
+        InitiatorOutcome::DialNow {
             remote_addrs,
             rtt_ms,
             ..
-        }) => {
-            assert_eq!(*remote_addrs, b_observed);
-            assert_eq!(*rtt_ms, simulated_rtt_ms);
+        } => {
+            assert_eq!(remote_addrs, b_observed);
+            assert_eq!(rtt_ms, simulated_rtt_ms);
         }
-        other => panic!("unexpected initiator outcome: {other:?}"),
     }
 
     // A sends SYNC over the bridge and (in a real system) immediately dials
     // B's observed addresses directly.
-    dcutr_a.send_sync().unwrap();
-    push_bytes(&mut a_to_b, &dcutr_a.take_outbound());
+    push_bytes(&mut a_to_b, &dcutr_send_sync_flush(&mut dcutr_a));
     assert!(dcutr_a.is_done());
 
     // B receives SYNC: in a real system it would now send random UDP to A's
     // addresses after an RTT/2 delay.
     let bytes = drain_pipe(&mut a_to_b);
-    dcutr_b.on_data(&bytes).unwrap();
-    let events_b = dcutr_b.poll_events();
+    dcutr_responder_feed(&mut dcutr_b, bytes);
+    let events_b = dcutr_responder_events(&mut dcutr_b);
     assert_eq!(events_b.as_slice(), [ResponderEvent::SyncReceived]);
     assert!(dcutr_b.is_done());
 
@@ -414,18 +410,18 @@ fn connect_refused_when_target_not_reserved() {
     let mut relay = RelayEmulator::new();
 
     let mut a_connect = HopConnect::new(target.to_bytes());
-    let connect_bytes = a_connect.take_outbound();
+    let connect_bytes = connect_flush(&mut a_connect);
 
     let mut initiator_inbox: Vec<u8> = Vec::new();
     relay
         .on_connect_request(&peer_a, &connect_bytes, &mut initiator_inbox)
         .unwrap();
 
-    a_connect.on_data(&initiator_inbox).unwrap();
+    let outcome = connect_feed(&mut a_connect, initiator_inbox);
 
-    match a_connect.outcome() {
-        Some(minip2p_relay::ConnectOutcome::Refused { status, .. }) => {
-            assert_eq!(*status, Status::NoReservation);
+    match outcome {
+        minip2p_relay::ConnectOutcome::Refused { status, .. } => {
+            assert_eq!(status, Status::NoReservation);
         }
         other => panic!("expected refusal, got {other:?}"),
     }
@@ -436,16 +432,14 @@ fn dcutr_rtt_is_reported_back_to_initiator() {
     let mut a = DcutrInitiator::new(&[Multiaddr::from_str("/ip4/1.2.3.4/udp/1/quic-v1").unwrap()]);
     let mut b = DcutrResponder::new(&[Multiaddr::from_str("/ip4/5.6.7.8/udp/2/quic-v1").unwrap()]);
 
-    let connect_from_a = a.take_outbound();
-    b.on_data(&connect_from_a).unwrap();
-    let _ = b.poll_events();
+    let connect_from_a = dcutr_initiator_flush(&mut a);
+    dcutr_responder_feed(&mut b, connect_from_a);
+    let reply_from_b = dcutr_responder_flush(&mut b);
+    let _ = dcutr_responder_events(&mut b);
+    let outcome = dcutr_initiator_feed(&mut a, reply_from_b, 123);
 
-    let reply_from_b = b.take_outbound();
-    a.on_data(&reply_from_b, 123).unwrap();
-
-    match a.outcome() {
-        Some(InitiatorOutcome::DialNow { rtt_ms, .. }) => assert_eq!(*rtt_ms, 123),
-        _ => panic!("expected DialNow"),
+    match outcome {
+        InitiatorOutcome::DialNow { rtt_ms, .. } => assert_eq!(rtt_ms, 123),
     }
 }
 
@@ -459,6 +453,102 @@ fn push_bytes(pipe: &mut VecDeque<u8>, bytes: &[u8]) {
 
 fn drain_pipe(pipe: &mut VecDeque<u8>) -> Vec<u8> {
     pipe.drain(..).collect()
+}
+
+fn reserve_flush(flow: &mut HopReservation) -> Vec<u8> {
+    flow.handle_input(HopReservationInput::Flush).unwrap();
+    match flow.poll_output() {
+        Some(HopReservationOutput::Outbound(bytes)) => bytes,
+        other => panic!("expected reservation outbound, got {other:?}"),
+    }
+}
+
+fn reserve_feed(flow: &mut HopReservation, bytes: Vec<u8>) -> ReservationOutcome {
+    flow.handle_input(HopReservationInput::Data(bytes)).unwrap();
+    match flow.poll_output() {
+        Some(HopReservationOutput::Outcome(outcome)) => outcome,
+        other => panic!("expected reservation outcome, got {other:?}"),
+    }
+}
+
+fn connect_flush(flow: &mut HopConnect) -> Vec<u8> {
+    flow.handle_input(HopConnectInput::Flush).unwrap();
+    match flow.poll_output() {
+        Some(HopConnectOutput::Outbound(bytes)) => bytes,
+        other => panic!("expected connect outbound, got {other:?}"),
+    }
+}
+
+fn connect_feed(flow: &mut HopConnect, bytes: Vec<u8>) -> minip2p_relay::ConnectOutcome {
+    flow.handle_input(HopConnectInput::Data(bytes)).unwrap();
+    match flow.poll_output() {
+        Some(HopConnectOutput::Outcome(outcome)) => outcome,
+        other => panic!("expected connect outcome, got {other:?}"),
+    }
+}
+
+fn stop_feed(flow: &mut StopResponder, bytes: Vec<u8>) -> minip2p_relay::StopConnectRequest {
+    flow.handle_input(StopResponderInput::Data(bytes)).unwrap();
+    match flow.poll_output() {
+        Some(StopResponderOutput::Request(request)) => request,
+        other => panic!("expected stop request, got {other:?}"),
+    }
+}
+
+fn stop_accept_flush(flow: &mut StopResponder) -> Vec<u8> {
+    flow.handle_input(StopResponderInput::Accept).unwrap();
+    match flow.poll_output() {
+        Some(StopResponderOutput::Outbound(bytes)) => bytes,
+        other => panic!("expected stop outbound, got {other:?}"),
+    }
+}
+
+fn dcutr_initiator_flush(flow: &mut DcutrInitiator) -> Vec<u8> {
+    flow.handle_input(DcutrInitiatorInput::Flush).unwrap();
+    match flow.poll_output() {
+        Some(DcutrInitiatorOutput::Outbound(bytes)) => bytes,
+        other => panic!("expected dcutr initiator outbound, got {other:?}"),
+    }
+}
+
+fn dcutr_initiator_feed(
+    flow: &mut DcutrInitiator,
+    bytes: Vec<u8>,
+    rtt_ms: u64,
+) -> InitiatorOutcome {
+    flow.handle_input(DcutrInitiatorInput::Data { bytes, rtt_ms })
+        .unwrap();
+    match flow.poll_output() {
+        Some(DcutrInitiatorOutput::Outcome(outcome)) => outcome,
+        other => panic!("expected dcutr initiator outcome, got {other:?}"),
+    }
+}
+
+fn dcutr_send_sync_flush(flow: &mut DcutrInitiator) -> Vec<u8> {
+    flow.handle_input(DcutrInitiatorInput::SendSync).unwrap();
+    dcutr_initiator_flush(flow)
+}
+
+fn dcutr_responder_feed(flow: &mut DcutrResponder, bytes: Vec<u8>) {
+    flow.handle_input(DcutrResponderInput::Data(bytes)).unwrap();
+}
+
+fn dcutr_responder_flush(flow: &mut DcutrResponder) -> Vec<u8> {
+    flow.handle_input(DcutrResponderInput::Flush).unwrap();
+    match flow.poll_output() {
+        Some(DcutrResponderOutput::Outbound(bytes)) => bytes,
+        other => panic!("expected dcutr responder outbound, got {other:?}"),
+    }
+}
+
+fn dcutr_responder_events(flow: &mut DcutrResponder) -> Vec<ResponderEvent> {
+    let mut events = Vec::new();
+    while let Some(output) = flow.poll_output() {
+        if let DcutrResponderOutput::Event(event) = output {
+            events.push(event);
+        }
+    }
+    events
 }
 
 /// Sanity test: the DCUtR frame decoder is the same across the encode/decode

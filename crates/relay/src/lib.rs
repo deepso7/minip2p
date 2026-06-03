@@ -153,7 +153,7 @@ impl HopReservation {
     ///
     /// Call this after construction and whenever you need to flush data to
     /// the relay stream.
-    pub fn take_outbound(&mut self) -> Vec<u8> {
+    fn take_outbound(&mut self) -> Vec<u8> {
         if self.state == FlowState::Pending {
             self.state = FlowState::AwaitingResponse;
         }
@@ -161,7 +161,7 @@ impl HopReservation {
     }
 
     /// Feeds incoming stream bytes from the relay.
-    pub fn on_data(&mut self, data: &[u8]) -> Result<(), RelayError> {
+    fn on_data(&mut self, data: &[u8]) -> Result<(), RelayError> {
         if self.state == FlowState::Done {
             return Ok(());
         }
@@ -174,12 +174,13 @@ impl HopReservation {
     ///
     /// If a complete response has not yet been decoded, this is not itself
     /// an error -- callers can still receive partial buffered data.
-    pub fn on_remote_write_closed(&mut self) -> Result<(), RelayError> {
+    fn on_remote_write_closed(&mut self) -> Result<(), RelayError> {
         self.try_decode_response()
     }
 
     /// Returns the outcome of the flow, if available.
-    pub fn outcome(&self) -> Option<&ReservationOutcome> {
+    #[cfg(test)]
+    fn outcome(&self) -> Option<&ReservationOutcome> {
         self.outcome.as_ref()
     }
 
@@ -369,7 +370,7 @@ impl HopConnect {
     }
 
     /// Drains and returns any pending outbound bytes.
-    pub fn take_outbound(&mut self) -> Vec<u8> {
+    fn take_outbound(&mut self) -> Vec<u8> {
         if self.state == FlowState::Pending {
             self.state = FlowState::AwaitingResponse;
         }
@@ -381,7 +382,7 @@ impl HopConnect {
     /// After the CONNECT is accepted, any further bytes passed here are
     /// buffered as bridged relay traffic; drain them with
     /// [`HopConnect::take_bridge_bytes`].
-    pub fn on_data(&mut self, data: &[u8]) -> Result<(), RelayError> {
+    fn on_data(&mut self, data: &[u8]) -> Result<(), RelayError> {
         if self.state == FlowState::Done {
             // Already bridged or errored — any further bytes belong to the
             // bridged channel (or are garbage after an error).
@@ -396,12 +397,13 @@ impl HopConnect {
     }
 
     /// Notifies the state machine that the remote closed its write side.
-    pub fn on_remote_write_closed(&mut self) -> Result<(), RelayError> {
+    fn on_remote_write_closed(&mut self) -> Result<(), RelayError> {
         self.try_decode_response()
     }
 
     /// Returns the outcome of the flow, if available.
-    pub fn outcome(&self) -> Option<&ConnectOutcome> {
+    #[cfg(test)]
+    fn outcome(&self) -> Option<&ConnectOutcome> {
         self.outcome.as_ref()
     }
 
@@ -413,7 +415,7 @@ impl HopConnect {
     /// Drains any bridged relay traffic received since the last call.
     ///
     /// Only yields bytes after the flow transitions to `Bridged`.
-    pub fn take_bridge_bytes(&mut self) -> Vec<u8> {
+    fn take_bridge_bytes(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.bridge_bytes)
     }
 
@@ -598,12 +600,12 @@ impl StopResponder {
     }
 
     /// Drains and returns any pending outbound bytes.
-    pub fn take_outbound(&mut self) -> Vec<u8> {
+    fn take_outbound(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.outbound)
     }
 
     /// Feeds incoming stream bytes from the relay.
-    pub fn on_data(&mut self, data: &[u8]) -> Result<(), RelayError> {
+    fn on_data(&mut self, data: &[u8]) -> Result<(), RelayError> {
         if self.state == StopState::Bridged {
             self.bridge_bytes.extend_from_slice(data);
             return Ok(());
@@ -618,12 +620,13 @@ impl StopResponder {
     }
 
     /// Notifies the state machine that the remote closed its write side.
-    pub fn on_remote_write_closed(&mut self) -> Result<(), RelayError> {
+    fn on_remote_write_closed(&mut self) -> Result<(), RelayError> {
         self.try_decode_connect()
     }
 
     /// Returns the decoded CONNECT request, if received.
-    pub fn request(&self) -> Option<&StopConnectRequest> {
+    #[cfg(test)]
+    fn request(&self) -> Option<&StopConnectRequest> {
         self.request.as_ref()
     }
 
@@ -636,7 +639,7 @@ impl StopResponder {
     ///
     /// After this, the stream becomes the bridged circuit; any further bytes
     /// received from the relay are queued into [`StopResponder::take_bridge_bytes`].
-    pub fn accept(&mut self) -> Result<(), RelayError> {
+    fn accept(&mut self) -> Result<(), RelayError> {
         self.send_status(Status::Ok, StopState::Bridged)?;
         // Any bytes the relay pipelined after its CONNECT belong to the bridge.
         if !self.recv_buf.is_empty() {
@@ -646,12 +649,12 @@ impl StopResponder {
     }
 
     /// Rejects the CONNECT request with the given status code.
-    pub fn reject(&mut self, status: Status) -> Result<(), RelayError> {
+    fn reject(&mut self, status: Status) -> Result<(), RelayError> {
         self.send_status(status, StopState::Done)
     }
 
     /// Drains any bridged relay traffic received since the last call.
-    pub fn take_bridge_bytes(&mut self) -> Vec<u8> {
+    fn take_bridge_bytes(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.bridge_bytes)
     }
 
