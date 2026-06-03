@@ -18,7 +18,7 @@ Orchestration layer that composes minip2p's protocol state machines into a singl
 - Auto-opens identify on every new connection and surfaces `SwarmEvent::IdentifyReceived`.
 - Emits `SwarmEvent::PeerReady` once the peer id is stable and the first Identify message has been processed.
 - `swarm.ping(peer_id)` opens / reuses a ping stream with no manual protocol negotiation.
-- `swarm.listen_on_bound_addr()` starts listening on the transport's bound address and returns the local `PeerAddr`.
+- `swarm.listen_on_bound_addrs()` starts listening on every bound transport address and returns the local `PeerAddr`s. `listen_on_bound_addr()` remains as a first-address convenience for single-socket transports.
 - `swarm.connected_peers()`, `swarm.peer_info(&peer_id)`, and `swarm.is_peer_ready(&peer_id)` expose read-only peer state.
 - Generic user-protocol hook for anything else (relay, DCUtR, custom app protocols):
   ```rust

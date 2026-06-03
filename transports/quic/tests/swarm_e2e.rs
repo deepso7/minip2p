@@ -3,16 +3,23 @@
 //! Contrast with `ping_e2e.rs` which requires ~200 lines of manual negotiation
 //! and dispatch code. Here, the Swarm handles everything.
 
-use minip2p_core::Multiaddr;
+use minip2p_core::{Multiaddr, Protocol};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_ping::PING_PROTOCOL_ID;
-use minip2p_quic::{QuicNodeConfig, QuicTransport};
+use minip2p_quic::{QuicEndpoint, QuicNodeConfig, QuicTransport};
 use minip2p_swarm::{Swarm, SwarmBuilder, SwarmErrorKind, SwarmEvent};
 use minip2p_transport::{StreamId, TransportError};
 
 fn make_swarm(keypair: Ed25519Keypair) -> Swarm<QuicTransport> {
     let transport =
         QuicTransport::new(QuicNodeConfig::new(keypair.clone()), "127.0.0.1:0").expect("bind");
+    SwarmBuilder::new(&keypair)
+        .agent_version("minip2p-test/0.1.0")
+        .build(transport)
+}
+
+fn make_dual_stack_swarm(keypair: Ed25519Keypair) -> Swarm<QuicEndpoint> {
+    let transport = QuicEndpoint::dual_stack(QuicNodeConfig::new(keypair.clone())).expect("bind");
     SwarmBuilder::new(&keypair)
         .agent_version("minip2p-test/0.1.0")
         .build(transport)
@@ -38,6 +45,27 @@ fn drive_three(
     let b_events = b.poll().expect("b poll");
     let c_events = c.poll().expect("c poll");
     (a_events, b_events, c_events)
+}
+
+#[test]
+fn listen_on_bound_addrs_returns_ipv4_and_ipv6_peer_addrs() {
+    let mut swarm = make_dual_stack_swarm(Ed25519Keypair::generate());
+    let addrs = swarm
+        .listen_on_bound_addrs()
+        .expect("listen on bound addrs");
+
+    assert!(
+        addrs
+            .iter()
+            .any(|addr| matches!(addr.transport().protocols().first(), Some(Protocol::Ip4(_)))),
+        "expected an IPv4 peer addr: {addrs:?}"
+    );
+    assert!(
+        addrs
+            .iter()
+            .any(|addr| matches!(addr.transport().protocols().first(), Some(Protocol::Ip6(_)))),
+        "expected an IPv6 peer addr: {addrs:?}"
+    );
 }
 
 #[test]

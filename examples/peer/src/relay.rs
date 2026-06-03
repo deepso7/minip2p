@@ -19,7 +19,7 @@ use minip2p_dcutr::{
     DCUTR_PROTOCOL_ID, DcutrInitiator, DcutrResponder, InitiatorOutcome, ResponderEvent,
 };
 use minip2p_identity::Ed25519Keypair;
-use minip2p_quic::{QuicNodeConfig, QuicTransport};
+use minip2p_quic::{QuicEndpoint, QuicNodeConfig, QuicTransport};
 use minip2p_relay::{
     ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopReservation, ReservationOutcome,
     STOP_PROTOCOL_ID, StopResponder,
@@ -28,7 +28,7 @@ use minip2p_swarm::{Swarm, SwarmBuilder, SwarmEvent};
 use minip2p_transport::{StreamId, Transport};
 
 use crate::cli::{RunOptions, print_event};
-use crate::runtime::{PeerTransport, build_peer_transport, load_keypair};
+use crate::runtime::{build_peer_transport, load_keypair};
 
 // ---------------------------------------------------------------------------
 // Shared configuration
@@ -61,6 +61,23 @@ const RELAY_READY_ATTEMPTS: usize = 3;
 const RELAY_READY_ATTEMPT_DEADLINE: Duration = Duration::from_secs(12);
 const RELAY_READY_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
+fn listen_on_bound_addrs(
+    swarm: &mut Swarm<QuicEndpoint>,
+    role: &str,
+) -> Result<PeerAddr, Box<dyn Error>> {
+    let addrs = swarm
+        .listen_on_bound_addrs()
+        .map_err(|e| format!("listen failed: {e}"))?;
+    let first = addrs
+        .first()
+        .cloned()
+        .ok_or("listen completed without any bound peer addresses")?;
+    for addr in addrs {
+        println!("[{role}] listen-addr={addr}");
+    }
+    Ok(first)
+}
+
 // ---------------------------------------------------------------------------
 // Listener (Peer B): reserve, accept STOP, respond DCUtR, hole-punch
 // ---------------------------------------------------------------------------
@@ -68,9 +85,7 @@ const RELAY_READY_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<dyn Error>> {
     let role = "relay-listen";
     let mut swarm = build_swarm_with_relay_protocols(&options, role)?;
-    let our_addr = swarm
-        .listen_on_bound_addr()
-        .map_err(|e| format!("listen failed: {e}"))?;
+    let our_addr = listen_on_bound_addrs(&mut swarm, role)?;
     println!("[{role}] bound={our_addr}");
     println!("[{role}] us={}", swarm.local_peer_id());
 
@@ -400,9 +415,7 @@ pub fn run_dial(
 ) -> Result<(), Box<dyn Error>> {
     let role = "relay-dial";
     let mut swarm = build_swarm_with_relay_protocols(&options, role)?;
-    let our_addr = swarm
-        .listen_on_bound_addr()
-        .map_err(|e| format!("listen failed: {e}"))?;
+    let our_addr = listen_on_bound_addrs(&mut swarm, role)?;
     println!("[{role}] bound={our_addr}");
     println!("[{role}] us={}", swarm.local_peer_id());
     println!("[{role}] target={target}");
@@ -550,9 +563,7 @@ pub fn run_autonat_server(options: RunOptions) -> Result<(), Box<dyn Error>> {
     let role = "autonat";
     let keypair = load_keypair(&options, role)?;
     let mut swarm = build_autonat_swarm(&options, &keypair)?;
-    let peer_addr = swarm
-        .listen_on_bound_addr()
-        .map_err(|e| format!("listen failed: {e}"))?;
+    let peer_addr = listen_on_bound_addrs(&mut swarm, role)?;
     println!("[{role}] bound={peer_addr}");
     println!("[{role}] us={}", swarm.local_peer_id());
     eprintln!("[{role}] waiting for AutoNAT probes (Ctrl-C to stop)");
@@ -589,7 +600,7 @@ pub fn run_autonat_server(options: RunOptions) -> Result<(), Box<dyn Error>> {
 }
 
 fn handle_autonat_request(
-    swarm: &mut Swarm<PeerTransport>,
+    swarm: &mut Swarm<QuicEndpoint>,
     role: &str,
     requester_peer: PeerId,
     stream_id: StreamId,
@@ -664,7 +675,7 @@ fn handle_autonat_request(
 // ---------------------------------------------------------------------------
 
 fn prepare_relay(
-    swarm: &mut Swarm<PeerTransport>,
+    swarm: &mut Swarm<QuicEndpoint>,
     role: &str,
     relay_addr: &PeerAddr,
     relay_peer_id: &PeerId,
@@ -705,7 +716,7 @@ fn prepare_relay(
 }
 
 fn wait_relay_protocols_after_dial(
-    swarm: &mut Swarm<PeerTransport>,
+    swarm: &mut Swarm<QuicEndpoint>,
     role: &str,
     peer_id: &PeerId,
     deadline: Instant,
@@ -731,7 +742,7 @@ fn wait_relay_protocols_after_dial(
 }
 
 fn retry_relay_connection(
-    swarm: &mut Swarm<PeerTransport>,
+    swarm: &mut Swarm<QuicEndpoint>,
     role: &str,
     relay_peer_id: &PeerId,
 ) -> Result<(), Box<dyn Error>> {
@@ -766,7 +777,7 @@ fn earlier_deadline(a: Instant, b: Instant) -> Instant {
 
 /// Wait for `ConnectionEstablished` with `peer_id`.
 fn wait_connected(
-    swarm: &mut Swarm<PeerTransport>,
+    swarm: &mut Swarm<QuicEndpoint>,
     role: &str,
     peer_id: &PeerId,
     deadline: Instant,
@@ -784,7 +795,7 @@ fn wait_connected(
 
 /// Wait for a locally-initiated `UserStreamReady` on `stream_id`.
 fn wait_user_stream_ready(
-    swarm: &mut Swarm<PeerTransport>,
+    swarm: &mut Swarm<QuicEndpoint>,
     role: &str,
     stream_id: StreamId,
     deadline: Instant,
@@ -827,7 +838,7 @@ fn wait_user_stream_ready(
 /// Wait for an inbound (remotely-initiated) user stream for `protocol_id`
 /// from `peer_id`. Returns the allocated stream id.
 fn wait_inbound_stream(
-    swarm: &mut Swarm<PeerTransport>,
+    swarm: &mut Swarm<QuicEndpoint>,
     role: &str,
     peer_id: &PeerId,
     protocol_id: &str,
@@ -857,7 +868,7 @@ fn wait_inbound_stream(
 /// Wait for the next `UserStreamData` event on `stream_id`, returning
 /// the data payload.
 fn wait_user_stream_data(
-    swarm: &mut Swarm<PeerTransport>,
+    swarm: &mut Swarm<QuicEndpoint>,
     role: &str,
     stream_id: StreamId,
     deadline: Instant,
@@ -919,7 +930,7 @@ fn drain_dcutr_responder_events(
 }
 
 fn dial_direct_candidates(
-    swarm: &mut Swarm<PeerTransport>,
+    swarm: &mut Swarm<QuicEndpoint>,
     role: &str,
     peer_id: &PeerId,
     addrs: &[Multiaddr],
@@ -936,7 +947,7 @@ fn dial_direct_candidates(
 }
 
 fn relay_ping_fallback(
-    swarm: &mut Swarm<PeerTransport>,
+    swarm: &mut Swarm<QuicEndpoint>,
     role: &str,
     relay_peer_id: &PeerId,
     bridge_stream: StreamId,
@@ -972,7 +983,7 @@ fn relay_ping_fallback(
 
 /// Send `data` on `stream_id` if non-empty; no-op otherwise.
 fn send(
-    swarm: &mut Swarm<PeerTransport>,
+    swarm: &mut Swarm<QuicEndpoint>,
     peer_id: &PeerId,
     stream_id: StreamId,
     data: Vec<u8>,
@@ -987,7 +998,7 @@ fn send(
 
 /// Ping `peer_id` and wait for the RTT. Prints the result and returns.
 fn ping_and_exit(
-    swarm: &mut Swarm<PeerTransport>,
+    swarm: &mut Swarm<QuicEndpoint>,
     role: &str,
     peer_id: PeerId,
     deadline: Instant,
@@ -1011,7 +1022,7 @@ fn ping_and_exit(
 fn build_swarm_with_relay_protocols(
     options: &RunOptions,
     role: &str,
-) -> Result<Swarm<PeerTransport>, Box<dyn Error>> {
+) -> Result<Swarm<QuicEndpoint>, Box<dyn Error>> {
     let keypair = load_keypair(options, role)?;
     let transport = build_peer_transport(options, &keypair)?;
     let mut swarm = SwarmBuilder::new(&keypair)
@@ -1027,7 +1038,7 @@ fn build_swarm_with_relay_protocols(
 fn build_autonat_swarm(
     options: &RunOptions,
     keypair: &Ed25519Keypair,
-) -> Result<Swarm<PeerTransport>, Box<dyn Error>> {
+) -> Result<Swarm<QuicEndpoint>, Box<dyn Error>> {
     let transport = build_peer_transport(options, keypair)?;
     let mut swarm = SwarmBuilder::new(keypair)
         .agent_version(AGENT)
@@ -1139,7 +1150,7 @@ fn candidate_addrs(
 }
 
 fn relay_observed_addr(
-    swarm: &Swarm<PeerTransport>,
+    swarm: &Swarm<QuicEndpoint>,
     relay_peer_id: &PeerId,
     role: &str,
 ) -> Option<Multiaddr> {
@@ -1156,7 +1167,7 @@ fn relay_observed_addr(
 }
 
 fn validate_candidates_with_autonat(
-    swarm: &mut Swarm<PeerTransport>,
+    swarm: &mut Swarm<QuicEndpoint>,
     role: &str,
     options: &RunOptions,
     candidates: &[Multiaddr],
@@ -1252,7 +1263,7 @@ fn print_remote_candidates(role: &str, candidates: &[Multiaddr]) {
 /// Sends a random 32-byte UDP payload to every remote address. These
 /// packets open the NAT binding so the remote's QUIC packets can reach
 /// us; the content is irrelevant per the DCUtR spec.
-fn blast_remote_addrs(swarm: &Swarm<PeerTransport>, addrs: &[Multiaddr], role: &str) {
+fn blast_remote_addrs(swarm: &Swarm<QuicEndpoint>, addrs: &[Multiaddr], role: &str) {
     let payload = random_bytes(RELAY_PING_LEN);
     for addr in addrs {
         if let Err(e) = swarm.transport().send_raw_udp(addr, &payload) {

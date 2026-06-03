@@ -9,11 +9,11 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
 use minip2p_core::{Multiaddr, PeerAddr, Protocol};
+use minip2p_quic::QuicEndpoint;
 use minip2p_swarm::{Swarm, SwarmBuilder, SwarmEvent};
-use minip2p_transport::Transport;
 
 use crate::cli::{RunOptions, print_event};
-use crate::runtime::{PeerTransport, build_peer_transport, load_keypair};
+use crate::runtime::{build_peer_transport, load_keypair};
 
 const AGENT: &str = "minip2p-peer/0.1.0";
 /// Far-future deadline for the listener; practically "run forever".
@@ -24,13 +24,16 @@ const DIAL_DEADLINE: Duration = Duration::from_secs(10);
 /// Runs the listener until interrupted (SIGINT).
 pub fn run_listen(options: RunOptions) -> Result<(), Box<dyn Error>> {
     let mut swarm = build_swarm(&options, "listen")?;
-    let peer_addr = swarm
-        .listen_on_bound_addr()
+    let peer_addrs = swarm
+        .listen_on_bound_addrs()
         .map_err(|e| format!("listen failed: {e}"))?;
+    let peer_addr = peer_addrs
+        .first()
+        .ok_or("listen completed without any bound peer addresses")?;
     // Stdout: the machine-readable event stream the E2E test scans.
-    println!("[listen] bound={}", local_dialable_peer_addr(&peer_addr));
-    for addr in swarm.transport().local_addresses() {
-        println!("[listen] listen-addr={addr}/p2p/{}", swarm.local_peer_id());
+    println!("[listen] bound={}", local_dialable_peer_addr(peer_addr));
+    for addr in peer_addrs {
+        println!("[listen] listen-addr={addr}");
     }
     eprintln!("[listen] waiting for dialers (Ctrl-C to stop)");
 
@@ -85,7 +88,7 @@ pub fn run_dial(target: PeerAddr, options: RunOptions) -> Result<(), Box<dyn Err
 
 /// Builds a swarm with a fresh Ed25519 identity and the default
 /// Identify/Ping stack.
-fn build_swarm(options: &RunOptions, role: &str) -> Result<Swarm<PeerTransport>, Box<dyn Error>> {
+fn build_swarm(options: &RunOptions, role: &str) -> Result<Swarm<QuicEndpoint>, Box<dyn Error>> {
     let keypair = load_keypair(options, role)?;
     let transport = build_peer_transport(options, &keypair)?;
     Ok(SwarmBuilder::new(&keypair)

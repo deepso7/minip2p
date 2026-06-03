@@ -22,6 +22,9 @@ pub use config::QuicNodeConfig;
 
 use connection::QuicConnection;
 
+const DEFAULT_IPV4_BIND: &str = "0.0.0.0:0";
+const DEFAULT_IPV6_BIND: &str = "[::]:0";
+
 /// Parses a QUIC multiaddr into (host protocol, port), validating the /host/udp/port/quic-v1 shape.
 fn extract_quic_host_and_port(
     multiaddr: &Multiaddr,
@@ -274,6 +277,168 @@ pub struct QuicTransport {
     next_connection_id: u64,
     /// Retained node configuration.
     node_config: QuicNodeConfig,
+}
+
+/// QUIC endpoint that can be backed by one socket or a dual-stack pair.
+///
+/// This is the DX-oriented transport entrypoint. Use [`QuicEndpoint::bind`]
+/// when an application wants one explicit bind address, or
+/// [`QuicEndpoint::dual_stack`] to listen and dial over both IPv4 and IPv6.
+pub enum QuicEndpoint {
+    Single(QuicTransport),
+    Dual(DualQuicTransport),
+}
+
+/// QUIC transport backed by separate IPv4 and IPv6 sockets.
+pub struct DualQuicTransport {
+    ipv4: QuicTransport,
+    ipv6: QuicTransport,
+}
+
+#[derive(Clone, Copy)]
+enum AddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+impl QuicEndpoint {
+    /// Binds one QUIC socket to `bind_addr`.
+    pub fn bind(node_config: QuicNodeConfig, bind_addr: &str) -> Result<Self, TransportError> {
+        QuicTransport::new(node_config, bind_addr).map(Self::Single)
+    }
+
+    /// Binds one QUIC socket to the IP/UDP address represented by `addr`.
+    pub fn bind_multiaddr(
+        node_config: QuicNodeConfig,
+        addr: &Multiaddr,
+    ) -> Result<Self, TransportError> {
+        let bind = extract_listen_socket_addr(addr, "bind address")?;
+        Self::bind(node_config, &bind.to_string())
+    }
+
+    /// Binds IPv4 and IPv6 wildcard UDP sockets.
+    pub fn dual_stack(node_config: QuicNodeConfig) -> Result<Self, TransportError> {
+        DualQuicTransport::new(node_config).map(Self::Dual)
+    }
+
+    /// Sends a raw UDP packet to `target`, bypassing QUIC.
+    pub fn send_raw_udp(&self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
+        match self {
+            Self::Single(transport) => transport.send_raw_udp(target, payload),
+            Self::Dual(transport) => transport.send_raw_udp(target, payload),
+        }
+    }
+}
+
+impl DualQuicTransport {
+    /// Binds IPv4 and IPv6 wildcard UDP sockets.
+    pub fn new(node_config: QuicNodeConfig) -> Result<Self, TransportError> {
+        let ipv4 = QuicTransport::new(node_config.clone(), DEFAULT_IPV4_BIND)?;
+        let ipv6 = QuicTransport::new(node_config, DEFAULT_IPV6_BIND)?;
+        Ok(Self { ipv4, ipv6 })
+    }
+
+    /// Sends a raw UDP packet to `target`, bypassing QUIC.
+    pub fn send_raw_udp(&self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
+        let family = Self::family_for_addr(target);
+        self.transport(family).send_raw_udp(target, payload)
+    }
+
+    fn transport(&self, family: AddressFamily) -> &QuicTransport {
+        match family {
+            AddressFamily::Ipv4 => &self.ipv4,
+            AddressFamily::Ipv6 => &self.ipv6,
+        }
+    }
+
+    fn transport_mut(&mut self, family: AddressFamily) -> &mut QuicTransport {
+        match family {
+            AddressFamily::Ipv4 => &mut self.ipv4,
+            AddressFamily::Ipv6 => &mut self.ipv6,
+        }
+    }
+
+    fn family_for_addr(addr: &Multiaddr) -> AddressFamily {
+        match addr.protocols().first() {
+            Some(Protocol::Ip6(_) | Protocol::Dns6(_)) => AddressFamily::Ipv6,
+            _ => AddressFamily::Ipv4,
+        }
+    }
+
+    fn external_id(family: AddressFamily, id: ConnectionId) -> ConnectionId {
+        let raw = id.as_u64();
+        match family {
+            AddressFamily::Ipv4 => ConnectionId::new(raw.saturating_mul(2).saturating_sub(1)),
+            AddressFamily::Ipv6 => ConnectionId::new(raw.saturating_mul(2)),
+        }
+    }
+
+    fn internal_id(id: ConnectionId) -> (AddressFamily, ConnectionId) {
+        let raw = id.as_u64();
+        if raw % 2 == 0 {
+            (AddressFamily::Ipv6, ConnectionId::new(raw / 2))
+        } else {
+            (AddressFamily::Ipv4, ConnectionId::new(raw.div_ceil(2)))
+        }
+    }
+
+    fn map_event(family: AddressFamily, event: TransportEvent) -> TransportEvent {
+        let map = |id| Self::external_id(family, id);
+        match event {
+            TransportEvent::Connected { id, endpoint } => TransportEvent::Connected {
+                id: map(id),
+                endpoint,
+            },
+            TransportEvent::StreamOpened { id, stream_id } => TransportEvent::StreamOpened {
+                id: map(id),
+                stream_id,
+            },
+            TransportEvent::IncomingStream { id, stream_id } => TransportEvent::IncomingStream {
+                id: map(id),
+                stream_id,
+            },
+            TransportEvent::StreamData {
+                id,
+                stream_id,
+                data,
+            } => TransportEvent::StreamData {
+                id: map(id),
+                stream_id,
+                data,
+            },
+            TransportEvent::StreamRemoteWriteClosed { id, stream_id } => {
+                TransportEvent::StreamRemoteWriteClosed {
+                    id: map(id),
+                    stream_id,
+                }
+            }
+            TransportEvent::StreamClosed { id, stream_id } => TransportEvent::StreamClosed {
+                id: map(id),
+                stream_id,
+            },
+            TransportEvent::Closed { id } => TransportEvent::Closed { id: map(id) },
+            TransportEvent::Error { id, message } => TransportEvent::Error {
+                id: map(id),
+                message,
+            },
+            TransportEvent::IncomingConnection { id, endpoint } => {
+                TransportEvent::IncomingConnection {
+                    id: map(id),
+                    endpoint,
+                }
+            }
+            TransportEvent::PeerIdentityVerified {
+                id,
+                endpoint,
+                previous_peer_id,
+            } => TransportEvent::PeerIdentityVerified {
+                id: map(id),
+                endpoint,
+                previous_peer_id,
+            },
+            TransportEvent::Listening { addr } => TransportEvent::Listening { addr },
+        }
+    }
 }
 
 impl QuicTransport {
@@ -785,5 +950,194 @@ impl Transport for QuicTransport {
         }
 
         Ok(events)
+    }
+}
+
+impl Transport for QuicEndpoint {
+    fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+        match self {
+            Self::Single(transport) => transport.dial(addr),
+            Self::Dual(transport) => transport.dial(addr),
+        }
+    }
+
+    fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
+        match self {
+            Self::Single(transport) => transport.listen(addr),
+            Self::Dual(transport) => transport.listen(addr),
+        }
+    }
+
+    fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
+        match self {
+            Self::Single(transport) => transport.open_stream(id),
+            Self::Dual(transport) => transport.open_stream(id),
+        }
+    }
+
+    fn send_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+        data: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        match self {
+            Self::Single(transport) => transport.send_stream(id, stream_id, data),
+            Self::Dual(transport) => transport.send_stream(id, stream_id, data),
+        }
+    }
+
+    fn close_stream_write(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+    ) -> Result<(), TransportError> {
+        match self {
+            Self::Single(transport) => transport.close_stream_write(id, stream_id),
+            Self::Dual(transport) => transport.close_stream_write(id, stream_id),
+        }
+    }
+
+    fn reset_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+    ) -> Result<(), TransportError> {
+        match self {
+            Self::Single(transport) => transport.reset_stream(id, stream_id),
+            Self::Dual(transport) => transport.reset_stream(id, stream_id),
+        }
+    }
+
+    fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
+        match self {
+            Self::Single(transport) => transport.close(id),
+            Self::Dual(transport) => transport.close(id),
+        }
+    }
+
+    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+        match self {
+            Self::Single(transport) => transport.poll(),
+            Self::Dual(transport) => transport.poll(),
+        }
+    }
+
+    fn local_addresses(&self) -> Vec<Multiaddr> {
+        match self {
+            Self::Single(transport) => transport.local_addresses(),
+            Self::Dual(transport) => transport.local_addresses(),
+        }
+    }
+
+    fn active_connection_count(&self) -> usize {
+        match self {
+            Self::Single(transport) => transport.active_connection_count(),
+            Self::Dual(transport) => transport.active_connection_count(),
+        }
+    }
+
+    fn active_connection_sources(&self) -> Vec<Multiaddr> {
+        match self {
+            Self::Single(transport) => transport.active_connection_sources(),
+            Self::Dual(transport) => transport.active_connection_sources(),
+        }
+    }
+
+    fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
+        match self {
+            Self::Single(transport) => transport.active_inbound_connection_sources(),
+            Self::Dual(transport) => transport.active_inbound_connection_sources(),
+        }
+    }
+}
+
+impl Transport for DualQuicTransport {
+    fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+        let family = Self::family_for_addr(addr.transport());
+        let id = self.transport_mut(family).dial(addr)?;
+        Ok(Self::external_id(family, id))
+    }
+
+    fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
+        let family = Self::family_for_addr(addr);
+        self.transport_mut(family).listen(addr)
+    }
+
+    fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
+        let (family, id) = Self::internal_id(id);
+        self.transport_mut(family).open_stream(id)
+    }
+
+    fn send_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+        data: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        let (family, id) = Self::internal_id(id);
+        self.transport_mut(family).send_stream(id, stream_id, data)
+    }
+
+    fn close_stream_write(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+    ) -> Result<(), TransportError> {
+        let (family, id) = Self::internal_id(id);
+        self.transport_mut(family).close_stream_write(id, stream_id)
+    }
+
+    fn reset_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+    ) -> Result<(), TransportError> {
+        let (family, id) = Self::internal_id(id);
+        self.transport_mut(family).reset_stream(id, stream_id)
+    }
+
+    fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
+        let (family, id) = Self::internal_id(id);
+        self.transport_mut(family).close(id)
+    }
+
+    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+        let mut events = Vec::new();
+        events.extend(
+            self.ipv4
+                .poll()?
+                .into_iter()
+                .map(|event| Self::map_event(AddressFamily::Ipv4, event)),
+        );
+        events.extend(
+            self.ipv6
+                .poll()?
+                .into_iter()
+                .map(|event| Self::map_event(AddressFamily::Ipv6, event)),
+        );
+        Ok(events)
+    }
+
+    fn local_addresses(&self) -> Vec<Multiaddr> {
+        let mut addrs = self.ipv4.local_addresses();
+        addrs.extend(self.ipv6.local_addresses());
+        addrs
+    }
+
+    fn active_connection_count(&self) -> usize {
+        self.ipv4.active_connection_count() + self.ipv6.active_connection_count()
+    }
+
+    fn active_connection_sources(&self) -> Vec<Multiaddr> {
+        let mut addrs = self.ipv4.active_connection_sources();
+        addrs.extend(self.ipv6.active_connection_sources());
+        addrs
+    }
+
+    fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
+        let mut addrs = self.ipv4.active_inbound_connection_sources();
+        addrs.extend(self.ipv6.active_inbound_connection_sources());
+        addrs
     }
 }
