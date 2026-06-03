@@ -201,12 +201,18 @@ impl<T: Transport> Swarm<T> {
     /// Prefer [`Swarm::listen_on_bound_addrs`] for transports that may bind
     /// more than one socket.
     pub fn listen_on_bound_addr(&mut self) -> Result<PeerAddr, TransportError> {
-        self.listen_on_bound_addrs()?
+        let addr = self
+            .transport
+            .local_addresses()
             .into_iter()
             .next()
             .ok_or_else(|| TransportError::InvalidConfig {
                 reason: "transport does not expose a bound local address".into(),
-            })
+            })?;
+        let addr = self.transport.listen(&addr)?;
+        PeerAddr::new(addr, self.local_peer_id.clone()).map_err(|e| TransportError::InvalidConfig {
+            reason: format!("failed to build local PeerAddr: {e}"),
+        })
     }
 
     /// Dial a remote peer. The transport allocates the connection id.

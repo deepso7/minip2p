@@ -187,6 +187,18 @@ fn socket_addr_to_multiaddr(addr: SocketAddr) -> Multiaddr {
     }
 }
 
+fn resolve_dial_peer_addr(addr: &PeerAddr) -> Result<PeerAddr, TransportError> {
+    let socket_addr = resolve_dial_socket_addr(addr.transport(), "dial address")?;
+    PeerAddr::new(
+        socket_addr_to_multiaddr(socket_addr),
+        addr.peer_id().clone(),
+    )
+    .map_err(|e| TransportError::InvalidAddress {
+        context: "dial address",
+        reason: format!("failed to build resolved PeerAddr: {e}"),
+    })
+}
+
 /// Builds the shared QUIC TLS configuration.
 fn build_quiche_config(node_config: &QuicNodeConfig) -> Result<quiche::Config, TransportError> {
     let mut tls_builder =
@@ -341,8 +353,10 @@ impl DualQuicTransport {
 
     /// Sends a raw UDP packet to `target`, bypassing QUIC.
     pub fn send_raw_udp(&self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
-        let family = Self::family_for_addr(target);
-        self.transport(family).send_raw_udp(target, payload)
+        let target = resolve_dial_socket_addr(target, "raw udp target")?;
+        let family = Self::family_for_socket_addr(target);
+        self.transport(family)
+            .send_raw_udp(&socket_addr_to_multiaddr(target), payload)
     }
 
     fn transport(&self, family: AddressFamily) -> &QuicTransport {
@@ -363,6 +377,14 @@ impl DualQuicTransport {
         match addr.protocols().first() {
             Some(Protocol::Ip6(_) | Protocol::Dns6(_)) => AddressFamily::Ipv6,
             _ => AddressFamily::Ipv4,
+        }
+    }
+
+    fn family_for_socket_addr(addr: SocketAddr) -> AddressFamily {
+        if addr.is_ipv6() {
+            AddressFamily::Ipv6
+        } else {
+            AddressFamily::Ipv4
         }
     }
 
@@ -1054,8 +1076,9 @@ impl Transport for QuicEndpoint {
 
 impl Transport for DualQuicTransport {
     fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+        let addr = resolve_dial_peer_addr(addr)?;
         let family = Self::family_for_addr(addr.transport());
-        let id = self.transport_mut(family).dial(addr)?;
+        let id = self.transport_mut(family).dial(&addr)?;
         Ok(Self::external_id(family, id))
     }
 

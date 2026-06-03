@@ -8,7 +8,7 @@ use minip2p_identity::Ed25519Keypair;
 use minip2p_ping::PING_PROTOCOL_ID;
 use minip2p_quic::{QuicEndpoint, QuicNodeConfig, QuicTransport};
 use minip2p_swarm::{Swarm, SwarmBuilder, SwarmErrorKind, SwarmEvent};
-use minip2p_transport::{StreamId, TransportError};
+use minip2p_transport::{StreamId, Transport, TransportError};
 
 fn make_swarm(keypair: Ed25519Keypair) -> Swarm<QuicTransport> {
     let transport =
@@ -66,6 +66,24 @@ fn listen_on_bound_addrs_returns_ipv4_and_ipv6_peer_addrs() {
             .any(|addr| matches!(addr.transport().protocols().first(), Some(Protocol::Ip6(_)))),
         "expected an IPv6 peer addr: {addrs:?}"
     );
+}
+
+#[test]
+fn listen_on_bound_addr_keeps_first_address_contract() {
+    let keypair = Ed25519Keypair::generate();
+    let transport = QuicEndpoint::dual_stack(QuicNodeConfig::new(keypair.clone())).expect("bind");
+    let first_addr = transport
+        .local_addresses()
+        .into_iter()
+        .next()
+        .expect("dual stack exposes a first address");
+    let mut swarm = SwarmBuilder::new(&keypair)
+        .agent_version("minip2p-test/0.1.0")
+        .build(transport);
+
+    let addr = swarm.listen_on_bound_addr().expect("listen");
+
+    assert_eq!(addr.transport(), &first_addr);
 }
 
 #[test]

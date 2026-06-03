@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 use minip2p_autonat::{
     AUTONAT_PROTOCOL_ID, AutoNatClient, AutoNatServer, Reachability, ResponseStatus,
 };
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol, select_direct_candidates};
+use minip2p_core::{
+    DirectCandidateRejectReason, DirectCandidateRejection, Multiaddr, PeerAddr, PeerId, Protocol,
+    select_direct_candidates,
+};
 use minip2p_dcutr::{
     DCUTR_PROTOCOL_ID, DcutrInitiator, DcutrResponder, InitiatorOutcome, ResponderEvent,
 };
@@ -1125,7 +1128,21 @@ fn candidate_addrs(
     let mut selection = select_direct_candidates(external_addrs, observed_addr, None);
     for bound_addr in bound_addrs {
         let bound_selection = select_direct_candidates(&[], None, Some(bound_addr.clone()));
-        selection.accepted.extend(bound_selection.accepted);
+        for candidate in bound_selection.accepted {
+            if selection
+                .accepted
+                .iter()
+                .any(|accepted| accepted.addr == candidate.addr)
+            {
+                selection.rejected.push(DirectCandidateRejection {
+                    source: candidate.source,
+                    addr: candidate.addr,
+                    reason: DirectCandidateRejectReason::Duplicate,
+                });
+            } else {
+                selection.accepted.push(candidate);
+            }
+        }
         selection.rejected.extend(bound_selection.rejected);
     }
 
