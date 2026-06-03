@@ -22,16 +22,27 @@ Runtime adapters or applications perform dial-back attempts and feed the result 
 ## Usage Sketch
 
 ```rust
-use minip2p_autonat::{AutoNatClient, AutoNatServer, Reachability};
+use minip2p_autonat::{
+    AutoNatClient, AutoNatClientOutput, AutoNatServer, AutoNatServerInput, AutoNatServerOutput,
+};
+use minip2p_core::SansIoProtocol;
 
 let mut client = AutoNatClient::new(&our_peer_id, &candidate_addrs);
-let outbound = client.take_outbound(); // send on an outbound AutoNAT stream
-
 let mut server = AutoNatServer::new();
-server.on_data(&outbound)?;
-if let Some(request) = server.request() {
-    // Runtime dials request.addrs for request.peer_id, then responds:
-    server.respond_public(&request.addrs);
+
+while let Some(AutoNatClientOutput::Outbound(bytes)) = client.poll_output() {
+    send_to_server(bytes);
+}
+
+server.handle_input(AutoNatServerInput::Data(bytes_from_client))?;
+while let Some(output) = server.poll_output() {
+    match output {
+        AutoNatServerOutput::DialBack(request) => {
+            // Runtime dials request.addrs for request.peer_id, then responds:
+            server.handle_input(AutoNatServerInput::RespondPublic { addrs: request.addrs })?;
+        }
+        AutoNatServerOutput::Outbound(bytes) => send_to_client(bytes),
+    }
 }
 ```
 

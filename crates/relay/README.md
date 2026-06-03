@@ -20,7 +20,7 @@ Interop goal for this crate is bridging two minip2p peers through a third-party 
 - **`HopConnect`** -- drives `HOP.CONNECT` against a relay to open a circuit to another reserved peer (peer A's "dial" side). Produces `ConnectOutcome::Bridged` with the stream now acting as a bidirectional byte pipe.
 - **`StopResponder`** -- responds to an incoming `STOP.CONNECT` from the relay (peer B's "accept incoming circuit" side). Accept or reject the request; on accept, subsequent bytes flow through the same stream as the relayed data.
 
-Each machine exposes `on_data(&[u8])`, `outbound()` (take pending outbound bytes), and an outcome accessor. Bytes that arrive pipelined after the initial `STATUS:OK` reply are preserved via `take_bridge_bytes()` on the connect/stop side so the caller can feed them into an upper-layer stream without a second poll round.
+Each machine is driven through `SansIoProtocol`: feed role-specific inputs (`HopReservationInput`, `HopConnectInput`, `StopResponderInput`) and drain role-specific outputs until idle. Bytes that arrive pipelined after the initial `STATUS:OK` reply are emitted as bridge-data outputs on the connect/stop side so the caller can feed them into an upper-layer stream without a second poll round.
 
 ## Protocol IDs
 
@@ -31,17 +31,23 @@ Each machine exposes `on_data(&[u8])`, `outbound()` (take pending outbound bytes
 ## Usage (reservation)
 
 ```rust
-use minip2p_relay::{HopReservation, ReservationOutcome};
+use minip2p_core::SansIoProtocol;
+use minip2p_relay::{HopReservation, HopReservationInput, HopReservationOutput};
 
 let mut reservation = HopReservation::new();
-let initial_outbound = reservation.start(); // send these bytes on the negotiated stream
+
+while let Some(output) = reservation.poll_output() {
+    match output {
+        HopReservationOutput::Outbound(bytes) => send_to_relay(bytes),
+        HopReservationOutput::Outcome(outcome) => handle(outcome),
+    }
+}
 
 // Feed incoming bytes:
-// reservation.on_data(&data);
-// if let Some(outcome) = reservation.outcome() { ... }
+// reservation.handle_input(HopReservationInput::Data(data))?;
 ```
 
-`HopConnect` and `StopResponder` follow the same `start` / `on_data` / `outcome` shape.
+`HopConnect` and `StopResponder` follow the same input / output / drain-loop shape.
 
 ## no_std
 

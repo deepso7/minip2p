@@ -41,7 +41,7 @@ const MAX_MESSAGE_SIZE: usize = 8192;
 /// auto-populates it from the underlying transport's `local_addresses()`
 /// at send time, so the advertised set always reflects what the peer
 /// is actually listening on. See
-/// [`IdentifyProtocol::register_outbound_stream`].
+/// [`IdentifyInput::RegisterOutboundStream`].
 #[derive(Clone, Debug)]
 pub struct IdentifyConfig {
     /// Protocol version string (e.g. `"ipfs/0.1.0"`).
@@ -171,10 +171,11 @@ struct PeerIdentifyState {
 
 /// Sans-IO state machine for the identify protocol.
 ///
-/// The host drives this by:
-/// 1. Calling input methods (`on_stream_data`, etc.) when transport events arrive.
-/// 2. Executing the returned [`IdentifyAction`] commands on the transport.
-/// 3. Polling [`poll_events`] to collect [`IdentifyEvent`] notifications.
+/// Drive this through [`SansIoProtocol`]: feed [`IdentifyInput`] values with
+/// [`SansIoProtocol::handle_input`], execute [`IdentifyOutput::Action`]
+/// commands against the transport, surface [`IdentifyOutput::Event`]
+/// notifications to the application, and keep draining
+/// [`SansIoProtocol::poll_output`] until [`SansIoProtocol::is_idle`] is true.
 pub struct IdentifyProtocol {
     /// Per-peer identify state.
     peers: BTreeMap<PeerId, PeerIdentifyState>,
@@ -484,7 +485,7 @@ impl SansIoProtocol for IdentifyProtocol {
 /// Prepends a varint length prefix to a protobuf-encoded Identify payload.
 ///
 /// The libp2p Identify spec requires this framing on the wire; see the
-/// call site in [`IdentifyProtocol::register_outbound_stream`] for why
+/// call site for [`IdentifyInput::RegisterOutboundStream`] for why
 /// omitting it breaks interop with third-party libp2p peers.
 fn encode_length_prefixed(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(10 + payload.len());

@@ -19,7 +19,7 @@ This crate implements the message state machines only. It does **not**:
 
 Both machines accept `&[Multiaddr]` at construction time and automatically serialize them to the wire using multicodec-binary encoding (via `Multiaddr::to_bytes()` in `minip2p-core`). Incoming `obs_addrs` are decoded the same way; entries that fail to parse are dropped silently but remain available as raw bytes in `remote_addr_bytes` for diagnostics.
 
-Each machine accepts raw bytes via `on_data(&[u8])` and exposes pending outbound bytes via `take_outbound()`. The wire format is length-prefixed protobuf `HolePunch` messages; the frame helpers (`encode_frame`, `decode_frame`, `FrameDecode`) are re-exported from the crate root.
+Each machine is driven through `SansIoProtocol`: feed `DcutrInitiatorInput` / `DcutrResponderInput` values, then drain `DcutrInitiatorOutput` / `DcutrResponderOutput` values until idle. The wire format is length-prefixed protobuf `HolePunch` messages; the frame helpers (`encode_frame`, `decode_frame`, `FrameDecode`) are re-exported from the crate root.
 
 ## Protocol ID
 
@@ -30,17 +30,24 @@ Each machine accepts raw bytes via `on_data(&[u8])` and exposes pending outbound
 
 ```rust
 use minip2p_core::Multiaddr;
-use minip2p_dcutr::{DcutrInitiator, InitiatorOutcome};
+use minip2p_core::SansIoProtocol;
+use minip2p_dcutr::{DcutrInitiator, DcutrInitiatorInput, DcutrInitiatorOutput, InitiatorOutcome};
 
 let mut initiator = DcutrInitiator::new(&our_observed_addrs); // &[Multiaddr]
-let out = initiator.take_outbound(); // send these bytes on the negotiated stream
 
-// Feed incoming bytes + measured RTT:
-// initiator.on_data(&data, rtt_ms)?;
-// if let Some(InitiatorOutcome::DialNow { remote_addrs, rtt_ms, .. }) = initiator.outcome() {
-//     // dial each remote Multiaddr directly, wait rtt_ms for a connection,
-//     // fall back to relayed ping if none succeeds.
-// }
+while let Some(output) = initiator.poll_output() {
+    match output {
+        DcutrInitiatorOutput::Outbound(bytes) => send_on_relay_stream(bytes),
+        DcutrInitiatorOutput::Outcome(InitiatorOutcome::DialNow { remote_addrs, rtt_ms, .. }) => {
+            // Dial each remote Multiaddr directly, wait rtt_ms for a connection,
+            // then queue SYNC once the simultaneous dial attempt starts.
+            initiator.handle_input(DcutrInitiatorInput::SendSync)?;
+        }
+    }
+}
+
+// Feed incoming bytes + measured relay RTT:
+// initiator.handle_input(DcutrInitiatorInput::Data { bytes: data, rtt_ms })?;
 ```
 
 The timing rules (wait `rtt / 2` on the responder side before blasting UDP, etc.) live in the caller -- see `holepunch-plan.md` for the CLI's approach.

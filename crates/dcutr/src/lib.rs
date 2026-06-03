@@ -112,11 +112,13 @@ pub enum DcutrInitiatorOutput {
 ///
 /// Usage:
 /// 1. Construct with [`DcutrInitiator::new`], passing our observed addresses.
-/// 2. Call [`DcutrInitiator::take_outbound`] and send the bytes.
-/// 3. Record the send time; feed stream data via [`DcutrInitiator::on_data`].
-/// 4. When [`DcutrInitiator::outcome`] returns `DialNow`, the caller:
+/// 2. Drain [`DcutrInitiatorOutput::Outbound`] from
+///    [`SansIoProtocol::poll_output`] and send the bytes.
+/// 3. Record the send time; feed stream data with
+///    [`DcutrInitiatorInput::Data`].
+/// 4. When [`DcutrInitiatorOutput::Outcome`] returns `DialNow`, the caller:
 ///    - dials the returned addresses immediately,
-///    - calls [`DcutrInitiator::send_sync`] to queue the SYNC frame,
+///    - feeds [`DcutrInitiatorInput::SendSync`] to queue the SYNC frame,
 ///    - flushes the outbound bytes.
 pub struct DcutrInitiator {
     outbound: Vec<u8>,
@@ -211,7 +213,8 @@ impl DcutrInitiator {
     /// Queues the SYNC message to be sent.
     ///
     /// Call this after you have initiated your simultaneous dial, per the
-    /// spec. After calling, flush [`take_outbound`] to the stream.
+    /// spec. After feeding [`DcutrInitiatorInput::SendSync`], drain
+    /// [`DcutrInitiatorOutput::Outbound`] to the stream.
     fn send_sync(&mut self) -> Result<(), DcutrError> {
         if self.state != InitiatorState::ReadyToSync {
             return Err(DcutrError::UnexpectedMessage(alloc::format!(
@@ -325,9 +328,13 @@ pub enum DcutrResponderOutput {
 /// Usage:
 /// 1. Construct with [`DcutrResponder::new`], passing our observed addresses.
 ///    Our CONNECT reply is queued automatically.
-/// 2. Feed incoming bytes via [`DcutrResponder::on_data`].
-/// 3. Poll [`DcutrResponder::poll_events`] to collect [`ResponderEvent`]s.
-/// 4. Flush [`DcutrResponder::take_outbound`] to the stream.
+/// 2. Feed incoming bytes with [`DcutrResponderInput::Data`].
+/// 3. Drain [`DcutrResponderOutput`] values from
+///    [`SansIoProtocol::poll_output`].
+/// 4. Send [`DcutrResponderOutput::Outbound`] bytes back on the relay stream.
+/// 5. On [`DcutrResponderOutput::Event`] with
+///    [`ResponderEvent::SyncReceived`], start the responder-side dial timing /
+///    UDP bombardment strategy.
 pub struct DcutrResponder {
     own_addrs: Vec<Vec<u8>>,
     outbound: Vec<u8>,

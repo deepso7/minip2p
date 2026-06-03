@@ -1,9 +1,11 @@
 //! Sans-I/O core of the swarm.
 //!
-//! [`SwarmCore`] is a pure state machine: it consumes [`TransportEvent`]
-//! values (plus a caller-supplied wall-clock timestamp) and emits
-//! [`SwarmAction`] commands for a driver to execute against a concrete
-//! transport. No sockets, no async runtime, no clock reads.
+//! [`SwarmCore`] is a pure state machine: it consumes [`SwarmInput`] values
+//! through [`SwarmCore::handle_input`], emits [`SwarmOutput`] values through
+//! [`SwarmCore::poll_output`], and reports quiescence through
+//! [`SwarmCore::is_idle`]. Outputs wrap [`SwarmAction`] commands for a driver
+//! to execute against a concrete transport and [`SwarmEvent`] notifications
+//! for the application. No sockets, no async runtime, no clock reads.
 //!
 //! `no_std + alloc` compatible. The std [`crate::Swarm`] driver is a thin
 //! wrapper that owns a transport, reads the clock via [`std::time::Instant`],

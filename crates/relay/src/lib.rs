@@ -5,10 +5,9 @@
 //! - [`HopConnect`] -- ask a relay to connect us to another peer (client -> relay).
 //! - [`StopResponder`] -- accept an incoming circuit from a relay (relay -> us).
 //!
-//! Each state machine is driven by feeding stream bytes in via [`on_data`]
-//! methods and reading out a byte slice to send to the peer via
-//! [`take_outbound`]. No I/O is performed inside; the caller is responsible
-//! for writing to and reading from the underlying transport stream.
+//! Each state machine is driven through [`SansIoProtocol`]: callers feed
+//! role-specific input enums, drain output enums, and execute outbound bytes
+//! against the underlying transport stream. No I/O is performed inside.
 //!
 //! `no_std` + `alloc` compatible.
 
@@ -103,11 +102,11 @@ pub enum HopReservationOutput {
 ///
 /// Usage:
 /// 1. Construct with [`HopReservation::new`].
-/// 2. Call [`HopReservation::take_outbound`] and send the returned bytes on
-///    the relay stream.
-/// 3. Feed incoming stream bytes via [`HopReservation::on_data`].
-/// 4. Poll [`HopReservation::outcome`] after each step; `Some(_)` means the
-///    flow has completed (accepted or refused).
+/// 2. Drain [`HopReservationOutput::Outbound`] from
+///    [`SansIoProtocol::poll_output`] and send the bytes on the relay stream.
+/// 3. Feed incoming stream bytes with [`HopReservationInput::Data`].
+/// 4. Drain [`HopReservationOutput::Outcome`] to observe accepted/refused
+///    completion.
 pub struct HopReservation {
     outbound: Vec<u8>,
     recv_buf: Vec<u8>,
@@ -326,12 +325,12 @@ pub enum HopConnectOutput {
 ///
 /// Usage:
 /// 1. Construct with [`HopConnect::new`], passing the target peer's id.
-/// 2. Call [`HopConnect::take_outbound`] and send the returned bytes.
-/// 3. Feed incoming stream bytes via [`HopConnect::on_data`].
-/// 4. When [`HopConnect::outcome`] returns `ConnectOutcome::Bridged`, the
-///    stream becomes the relay circuit: caller may drain leftover bytes via
-///    [`HopConnect::take_bridge_bytes`] and treat subsequent stream data as
-///    relayed peer-to-peer traffic.
+/// 2. Drain [`HopConnectOutput::Outbound`] from
+///    [`SansIoProtocol::poll_output`] and send the bytes.
+/// 3. Feed incoming stream bytes with [`HopConnectInput::Data`].
+/// 4. When [`HopConnectOutput::Outcome`] returns `ConnectOutcome::Bridged`,
+///    the stream becomes the relay circuit; drain
+///    [`HopConnectOutput::BridgeData`] for any pipelined peer-to-peer bytes.
 pub struct HopConnect {
     outbound: Vec<u8>,
     recv_buf: Vec<u8>,
@@ -557,13 +556,13 @@ pub enum StopResponderOutput {
 ///
 /// Flow:
 /// 1. Relay opens a STOP stream to us and sends a CONNECT message.
-/// 2. We decode it via [`StopResponder::on_data`] -> observe
-///    [`StopResponder::request`] populated.
-/// 3. We decide to accept or reject and call [`StopResponder::accept`] or
-///    [`StopResponder::reject`].
-/// 4. We send the resulting outbound bytes via [`StopResponder::take_outbound`].
-/// 5. If accepted, the stream becomes the bridged circuit; drain leftover
-///    bytes via [`StopResponder::take_bridge_bytes`].
+/// 2. Feed bytes with [`StopResponderInput::Data`] and drain
+///    [`StopResponderOutput::Request`].
+/// 3. Decide to accept or reject with [`StopResponderInput::Accept`] or
+///    [`StopResponderInput::Reject`].
+/// 4. Send resulting [`StopResponderOutput::Outbound`] bytes to the relay.
+/// 5. If accepted, the stream becomes the bridged circuit; drain
+///    [`StopResponderOutput::BridgeData`] for any pipelined bytes.
 pub struct StopResponder {
     outbound: Vec<u8>,
     recv_buf: Vec<u8>,

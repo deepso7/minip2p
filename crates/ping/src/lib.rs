@@ -208,7 +208,7 @@ struct PeerPingState {
 pub struct PingProtocol {
     /// Per-peer protocol state.
     peers: BTreeMap<PeerId, PeerPingState>,
-    /// Events buffered until the next `poll_events` call.
+    /// Events buffered until the next `SansIoProtocol::poll_output` call.
     pending_events: Vec<PingEvent>,
     /// Actions buffered for [`SansIoProtocol::poll_output`].
     pending_actions: VecDeque<PingAction>,
