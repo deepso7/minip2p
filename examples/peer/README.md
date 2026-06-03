@@ -98,7 +98,8 @@ Start an AutoNAT service peer on a public host:
 cargo run -p minip2p-peer -- autonat \
     --key ./autonat.key \
     --listen /ip4/0.0.0.0/udp/4002/quic-v1
-# [autonat] bound=/ip4/0.0.0.0/udp/4002/quic-v1/p2p/12D3KooW...
+# [autonat] listen-addr=/ip4/0.0.0.0/udp/4002/quic-v1/p2p/12D3KooW...
+# [autonat] us=12D3KooW...
 ```
 
 Peer B (listener, the NATed target):
@@ -108,7 +109,8 @@ cargo run -p minip2p-peer -- listen \
     --relay <relay-peer-addr> \
     --autonat <autonat-peer-addr> \
     --key ./peer-b.key
-# [relay-listen] bound=/ip4/127.0.0.1/udp/52134/quic-v1/p2p/12D3KooW... (A)
+# [relay-listen] listen-addr=/ip4/0.0.0.0/udp/52134/quic-v1/p2p/12D3KooW... (A)
+# [relay-listen] listen-addr=/ip6/::/udp/52135/quic-v1/p2p/12D3KooW... (A)
 # [relay-listen] us=12D3KooW... (A)
 # [relay-listen] autonat-dialing /ip4/.../p2p/12D3KooW...
 # [relay-listen] autonat-public addrs=1
@@ -133,7 +135,7 @@ cargo run -p minip2p-peer -- dial \
     --target <B-peer-id> \
     --autonat <autonat-peer-addr> \
     --key ./peer-a.key
-# [relay-dial] bound=...
+# [relay-dial] listen-addr=...
 # [relay-dial] us=...
 # [relay-dial] target=...
 # [relay-dial] autonat-public addrs=1

@@ -64,18 +64,17 @@ const RELAY_READY_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 fn listen_on_bound_addrs(
     swarm: &mut Swarm<QuicEndpoint>,
     role: &str,
-) -> Result<PeerAddr, Box<dyn Error>> {
+) -> Result<Vec<PeerAddr>, Box<dyn Error>> {
     let addrs = swarm
         .listen_on_bound_addrs()
         .map_err(|e| format!("listen failed: {e}"))?;
-    let first = addrs
-        .first()
-        .cloned()
-        .ok_or("listen completed without any bound peer addresses")?;
-    for addr in addrs {
+    if addrs.is_empty() {
+        return Err("listen completed without any bound peer addresses".into());
+    }
+    for addr in &addrs {
         println!("[{role}] listen-addr={addr}");
     }
-    Ok(first)
+    Ok(addrs)
 }
 
 // ---------------------------------------------------------------------------
@@ -85,8 +84,7 @@ fn listen_on_bound_addrs(
 pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<dyn Error>> {
     let role = "relay-listen";
     let mut swarm = build_swarm_with_relay_protocols(&options, role)?;
-    let our_addr = listen_on_bound_addrs(&mut swarm, role)?;
-    println!("[{role}] bound={our_addr}");
+    let our_addrs = listen_on_bound_addrs(&mut swarm, role)?;
     println!("[{role}] us={}", swarm.local_peer_id());
 
     let relay_peer_id = relay_addr.peer_id().clone();
@@ -97,7 +95,10 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
 
     let initial_candidates = candidate_addrs(
         role,
-        our_addr.transport(),
+        &our_addrs
+            .iter()
+            .map(|addr| addr.transport().clone())
+            .collect::<Vec<_>>(),
         &options.external_addrs,
         relay_observed_addr(&swarm, &relay_peer_id, role),
     );
@@ -415,8 +416,7 @@ pub fn run_dial(
 ) -> Result<(), Box<dyn Error>> {
     let role = "relay-dial";
     let mut swarm = build_swarm_with_relay_protocols(&options, role)?;
-    let our_addr = listen_on_bound_addrs(&mut swarm, role)?;
-    println!("[{role}] bound={our_addr}");
+    let our_addrs = listen_on_bound_addrs(&mut swarm, role)?;
     println!("[{role}] us={}", swarm.local_peer_id());
     println!("[{role}] target={target}");
 
@@ -428,7 +428,10 @@ pub fn run_dial(
 
     let initial_candidates = candidate_addrs(
         role,
-        our_addr.transport(),
+        &our_addrs
+            .iter()
+            .map(|addr| addr.transport().clone())
+            .collect::<Vec<_>>(),
         &options.external_addrs,
         relay_observed_addr(&swarm, &relay_peer_id, role),
     );
@@ -563,8 +566,7 @@ pub fn run_autonat_server(options: RunOptions) -> Result<(), Box<dyn Error>> {
     let role = "autonat";
     let keypair = load_keypair(&options, role)?;
     let mut swarm = build_autonat_swarm(&options, &keypair)?;
-    let peer_addr = listen_on_bound_addrs(&mut swarm, role)?;
-    println!("[{role}] bound={peer_addr}");
+    let _ = listen_on_bound_addrs(&mut swarm, role)?;
     println!("[{role}] us={}", swarm.local_peer_id());
     eprintln!("[{role}] waiting for AutoNAT probes (Ctrl-C to stop)");
 
@@ -1116,12 +1118,16 @@ fn merge_dialback_results(
 
 fn candidate_addrs(
     role: &str,
-    bound_addr: &Multiaddr,
+    bound_addrs: &[Multiaddr],
     external_addrs: &[Multiaddr],
     observed_addr: Option<Multiaddr>,
 ) -> Vec<Multiaddr> {
-    let selection =
-        select_direct_candidates(external_addrs, observed_addr, Some(bound_addr.clone()));
+    let mut selection = select_direct_candidates(external_addrs, observed_addr, None);
+    for bound_addr in bound_addrs {
+        let bound_selection = select_direct_candidates(&[], None, Some(bound_addr.clone()));
+        selection.accepted.extend(bound_selection.accepted);
+        selection.rejected.extend(bound_selection.rejected);
+    }
 
     for candidate in &selection.accepted {
         println!(
