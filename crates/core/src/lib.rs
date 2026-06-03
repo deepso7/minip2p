@@ -13,6 +13,7 @@ mod error;
 mod multiaddr;
 mod peer_addr;
 mod protocol;
+mod sans_io;
 
 pub use candidates::{
     DirectCandidate, DirectCandidateRejectReason, DirectCandidateRejection,
@@ -24,3 +25,4 @@ pub use minip2p_identity::{VarintError, read_uvarint, uvarint_len, write_uvarint
 pub use multiaddr::Multiaddr;
 pub use peer_addr::PeerAddr;
 pub use protocol::Protocol;
+pub use sans_io::SansIo;
