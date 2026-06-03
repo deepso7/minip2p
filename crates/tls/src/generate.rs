@@ -200,7 +200,7 @@ impl const_oid::AssociatedOid for Libp2pExtension {
 
 impl der::Encode for Libp2pExtension {
     fn encoded_len(&self) -> Result<der::Length, der::Error> {
-        Ok(der::Length::try_from(self.0.len())?)
+        der::Length::try_from(self.0.len())
     }
 
     fn encode(&self, encoder: &mut impl der::Writer) -> Result<(), der::Error> {

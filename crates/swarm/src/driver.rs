@@ -169,11 +169,37 @@ impl<T: Transport> Swarm<T> {
         self.transport.listen(addr)
     }
 
-    /// Start listening on the transport's already-bound local address.
+    /// Start listening on the transport's already-bound local addresses.
     ///
-    /// Transports that know their bound address expose it via
-    /// `Transport::local_addresses()`. This is the common QUIC path when the
-    /// UDP socket was bound to `127.0.0.1:0` and the OS selected the port.
+    /// Transports that know their bound addresses expose them via
+    /// `Transport::local_addresses()`. Multi-socket transports such as a
+    /// dual-stack QUIC endpoint can therefore advertise every bound address
+    /// without forcing callers to pick one.
+    pub fn listen_on_bound_addrs(&mut self) -> Result<Vec<PeerAddr>, TransportError> {
+        let addrs = self.transport.local_addresses();
+        if addrs.is_empty() {
+            return Err(TransportError::InvalidConfig {
+                reason: "transport does not expose a bound local address".into(),
+            });
+        }
+
+        let mut resolved = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            let addr = self.transport.listen(&addr)?;
+            let peer_addr = PeerAddr::new(addr, self.local_peer_id.clone()).map_err(|e| {
+                TransportError::InvalidConfig {
+                    reason: format!("failed to build local PeerAddr: {e}"),
+                }
+            })?;
+            resolved.push(peer_addr);
+        }
+        Ok(resolved)
+    }
+
+    /// Start listening on the transport's first already-bound local address.
+    ///
+    /// Prefer [`Swarm::listen_on_bound_addrs`] for transports that may bind
+    /// more than one socket.
     pub fn listen_on_bound_addr(&mut self) -> Result<PeerAddr, TransportError> {
         let addr = self
             .transport
@@ -183,11 +209,9 @@ impl<T: Transport> Swarm<T> {
             .ok_or_else(|| TransportError::InvalidConfig {
                 reason: "transport does not expose a bound local address".into(),
             })?;
-        let resolved = self.transport.listen(&addr)?;
-        PeerAddr::new(resolved, self.local_peer_id.clone()).map_err(|e| {
-            TransportError::InvalidConfig {
-                reason: format!("failed to build local PeerAddr: {e}"),
-            }
+        let addr = self.transport.listen(&addr)?;
+        PeerAddr::new(addr, self.local_peer_id.clone()).map_err(|e| TransportError::InvalidConfig {
+            reason: format!("failed to build local PeerAddr: {e}"),
         })
     }
 

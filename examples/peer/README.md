@@ -30,9 +30,10 @@ Where:
 - `<relay-peer-addr>` is the same format, pointing at the relay server.
 - `<peer-id>` is a bare libp2p PeerId (`12D3KooW...` or `Qm...`).
 - `--key <path>` stores a raw Ed25519 secret as hex and reuses it on later runs.
-- `--listen <quic-multiaddr>` changes the UDP bind address; default is loopback
-  (`127.0.0.1:0`). Use `/ip4/0.0.0.0/udp/0/quic-v1` or
-  `/ip6/::/udp/0/quic-v1` for real-network tests.
+- `--listen <quic-multiaddr>` changes the UDP bind address. By default the
+  peer binds both IPv4 and IPv6 wildcard UDP sockets
+  (`/ip4/0.0.0.0/udp/0/quic-v1` and `/ip6/::/udp/0/quic-v1`). Pass
+  `--listen` when you want to force a single address family or fixed port.
 - `autonat` runs a public AutoNAT service that accepts probes and dials the
   requester's candidates back.
 - `--autonat <peer-addr>` asks a public AutoNAT service to validate relay-mode
@@ -49,6 +50,8 @@ Terminal 1:
 ```bash
 cargo run -p minip2p-peer -- listen
 # [listen] bound=/ip4/127.0.0.1/udp/53121/quic-v1/p2p/12D3KooW...
+# [listen] listen-addr=/ip4/0.0.0.0/udp/53121/quic-v1/p2p/12D3KooW...
+# [listen] listen-addr=/ip6/::/udp/53122/quic-v1/p2p/12D3KooW...
 # [listen] waiting for dialers (Ctrl-C to stop)
 ```
 
@@ -95,7 +98,8 @@ Start an AutoNAT service peer on a public host:
 cargo run -p minip2p-peer -- autonat \
     --key ./autonat.key \
     --listen /ip4/0.0.0.0/udp/4002/quic-v1
-# [autonat] bound=/ip4/0.0.0.0/udp/4002/quic-v1/p2p/12D3KooW...
+# [autonat] listen-addr=/ip4/0.0.0.0/udp/4002/quic-v1/p2p/12D3KooW...
+# [autonat] us=12D3KooW...
 ```
 
 Peer B (listener, the NATed target):
@@ -105,7 +109,8 @@ cargo run -p minip2p-peer -- listen \
     --relay <relay-peer-addr> \
     --autonat <autonat-peer-addr> \
     --key ./peer-b.key
-# [relay-listen] bound=/ip4/127.0.0.1/udp/52134/quic-v1/p2p/12D3KooW... (A)
+# [relay-listen] listen-addr=/ip4/0.0.0.0/udp/52134/quic-v1/p2p/12D3KooW... (A)
+# [relay-listen] listen-addr=/ip6/::/udp/52135/quic-v1/p2p/12D3KooW... (A)
 # [relay-listen] us=12D3KooW... (A)
 # [relay-listen] autonat-dialing /ip4/.../p2p/12D3KooW...
 # [relay-listen] autonat-public addrs=1
@@ -130,7 +135,7 @@ cargo run -p minip2p-peer -- dial \
     --target <B-peer-id> \
     --autonat <autonat-peer-addr> \
     --key ./peer-a.key
-# [relay-dial] bound=...
+# [relay-dial] listen-addr=...
 # [relay-dial] us=...
 # [relay-dial] target=...
 # [relay-dial] autonat-public addrs=1
@@ -154,15 +159,13 @@ candidates are actually dialable by another libp2p peer:
 cargo run -p minip2p-peer -- listen \
     --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
     --autonat /ip4/<autonat-ip>/udp/4002/quic-v1/p2p/<autonat-peer-id> \
-    --key ./peer-b.key \
-    --listen /ip4/0.0.0.0/udp/0/quic-v1
+    --key ./peer-b.key
 
 cargo run -p minip2p-peer -- dial \
     --relay /ip4/<relay-ip>/udp/4001/quic-v1/p2p/<relay-peer-id> \
     --target <peer-b-id> \
     --autonat /ip4/<autonat-ip>/udp/4002/quic-v1/p2p/<autonat-peer-id> \
-    --key ./peer-a.key \
-    --listen /ip4/0.0.0.0/udp/0/quic-v1
+    --key ./peer-a.key
 ```
 
 If you have a known UDP port-forward, add one or more manual

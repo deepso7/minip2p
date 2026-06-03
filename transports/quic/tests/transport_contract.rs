@@ -4,8 +4,8 @@
 //! They run against the QUIC adapter but should pass for any conforming
 //! transport implementation.
 
-use minip2p_core::PeerAddr;
-use minip2p_quic::{QuicNodeConfig, QuicTransport};
+use minip2p_core::{PeerAddr, Protocol};
+use minip2p_quic::{QuicEndpoint, QuicNodeConfig, QuicTransport};
 use minip2p_transport::{ConnectionId, Transport, TransportError, TransportEvent};
 
 // ---------------------------------------------------------------------------
@@ -20,6 +20,25 @@ fn setup_pair() -> (QuicTransport, QuicTransport, PeerAddr) {
     let peer_addr = server.local_peer_addr().expect("peer addr");
 
     (server, client, peer_addr)
+}
+
+#[test]
+fn dual_stack_endpoint_exposes_ipv4_and_ipv6_local_addresses() {
+    let endpoint = QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("dual stack bind");
+    let addrs = endpoint.local_addresses();
+
+    assert!(
+        addrs
+            .iter()
+            .any(|addr| matches!(addr.protocols().first(), Some(Protocol::Ip4(_)))),
+        "dual-stack endpoint should expose an IPv4 address: {addrs:?}"
+    );
+    assert!(
+        addrs
+            .iter()
+            .any(|addr| matches!(addr.protocols().first(), Some(Protocol::Ip6(_)))),
+        "dual-stack endpoint should expose an IPv6 address: {addrs:?}"
+    );
 }
 
 fn drive_pair_once(

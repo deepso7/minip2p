@@ -19,34 +19,32 @@ No async runtime required. The host drives the transport by calling `poll()`.
 - Automatic peer-id verification from libp2p TLS certificates. `Connected` carries the verified endpoint; `PeerIdentityVerified` is also emitted when the peer index is bound or updated.
 - `QuicNodeConfig` is identity-first: constructing a transport requires an Ed25519 host keypair.
 - Dial supports `/ip4`, `/ip6`, `/dns`, `/dns4`, `/dns6` QUIC transport addresses.
+- `QuicEndpoint::dual_stack` binds separate IPv4 and IPv6 wildcard sockets for the common "listen on both" case.
 
 ## Basic usage
 
 ```rust
-use minip2p_core::{Multiaddr, PeerAddr, Protocol};
 use minip2p_identity::Ed25519Keypair;
-use minip2p_quic::{QuicNodeConfig, QuicTransport};
-use minip2p_transport::{ConnectionId, Transport};
+use minip2p_quic::{QuicEndpoint, QuicNodeConfig};
+use minip2p_transport::Transport;
 
 let listener_key = Ed25519Keypair::generate();
 let listener_cfg = QuicNodeConfig::new(listener_key.clone());
-let mut listener = QuicTransport::new(listener_cfg, "127.0.0.1:0")?;
+let mut listener = QuicEndpoint::dual_stack(listener_cfg)?;
 
-let local = listener.local_addr()?;
-let listen_addr = Multiaddr::from_protocols(vec![
-    Protocol::Ip4([127, 0, 0, 1]),
-    Protocol::Udp(local.port()),
-    Protocol::QuicV1,
-]);
-listener.listen(&listen_addr)?;
+let listen_addrs = listener.local_addresses();
+for addr in &listen_addrs {
+    listener.listen(addr)?;
+}
 
 let dialer_cfg = QuicNodeConfig::generate();
-let mut dialer = QuicTransport::new(dialer_cfg, "127.0.0.1:0")?;
+let mut dialer = QuicEndpoint::bind(dialer_cfg, "127.0.0.1:0")?;
 
-let peer_addr = PeerAddr::new(listen_addr, listener_key.peer_id())?;
-
-let conn_id = ConnectionId::new(1);
-dialer.dial(conn_id, &peer_addr)?;
+let peer_addr = minip2p_core::PeerAddr::new(
+    listen_addrs[0].clone(),
+    listener_key.peer_id(),
+)?;
+let conn_id = dialer.dial(&peer_addr)?;
 let stream_id = dialer.open_stream(conn_id)?;
 dialer.send_stream(conn_id, stream_id, b"hello".to_vec())?;
 # Ok::<(), Box<dyn std::error::Error>>(())

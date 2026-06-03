@@ -113,7 +113,7 @@ impl PeerId {
         write_uvarint(LIBP2P_KEY_MULTICODEC, &mut cid);
         cid.extend_from_slice(&multihash);
 
-        let mut out = String::with_capacity(1 + ((cid.len() * 8) + 4) / 5);
+        let mut out = String::with_capacity(1 + (cid.len() * 8).div_ceil(5));
         out.push('b');
         out.push_str(&encode_base32_nopad_lower(&cid));
         out

@@ -2,15 +2,12 @@
 
 use std::error::Error;
 use std::fs;
-use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
-use minip2p_core::{Multiaddr, Protocol};
 use minip2p_identity::{ED25519_SECRET_KEY_LENGTH, Ed25519Keypair};
+use minip2p_quic::{QuicEndpoint, QuicNodeConfig};
 
 use crate::cli::RunOptions;
-
-const DEFAULT_BIND: &str = "127.0.0.1:0";
 
 /// Loads a persistent key from `--key`, or generates and writes one when missing.
 pub fn load_keypair(options: &RunOptions, role: &str) -> Result<Ed25519Keypair, Box<dyn Error>> {
@@ -44,12 +41,22 @@ pub fn load_keypair(options: &RunOptions, role: &str) -> Result<Ed25519Keypair, 
     Ok(keypair)
 }
 
-/// Returns the UDP bind address for the configured listen multiaddr.
-pub fn bind_addr(options: &RunOptions) -> Result<String, Box<dyn Error>> {
-    match &options.listen_addr {
-        Some(addr) => multiaddr_to_socket_addr(addr).map(|addr| addr.to_string()),
-        None => Ok(DEFAULT_BIND.into()),
+/// Builds the peer CLI's QUIC transport.
+///
+/// With an explicit `--listen`, bind exactly that address. With no explicit
+/// listen address, bind IPv4 and IPv6 sockets so the demo is reachable on both
+/// address families by default.
+pub fn build_peer_transport(
+    options: &RunOptions,
+    keypair: &Ed25519Keypair,
+) -> Result<QuicEndpoint, Box<dyn Error>> {
+    let config = QuicNodeConfig::new(keypair.clone());
+    if let Some(addr) = &options.listen_addr {
+        return QuicEndpoint::bind_multiaddr(config, addr)
+            .map_err(|e| format!("quic bind {addr}: {e}").into());
     }
+
+    QuicEndpoint::dual_stack(config).map_err(|e| format!("quic dual-stack bind: {e}").into())
 }
 
 fn write_secret(
@@ -74,26 +81,6 @@ fn write_secret(
     }
 
     Ok(())
-}
-
-fn multiaddr_to_socket_addr(addr: &Multiaddr) -> Result<SocketAddr, Box<dyn Error>> {
-    let protocols = addr.protocols();
-    if protocols.len() != 3 || !addr.is_quic_transport() {
-        return Err(
-            format!("--listen must be /ip4|ip6/<addr>/udp/<port>/quic-v1, got {addr}").into(),
-        );
-    }
-
-    let ip = match &protocols[0] {
-        Protocol::Ip4(bytes) => IpAddr::from(*bytes),
-        Protocol::Ip6(bytes) => IpAddr::from(*bytes),
-        _ => return Err(format!("--listen requires /ip4 or /ip6 host, got {addr}").into()),
-    };
-    let port = match &protocols[1] {
-        Protocol::Udp(port) => *port,
-        _ => unreachable!("is_quic_transport already checked udp"),
-    };
-    Ok(SocketAddr::new(ip, port))
 }
 
 fn encode_hex(bytes: &[u8]) -> String {

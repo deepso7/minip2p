@@ -209,9 +209,8 @@ impl DcutrInitiator {
             return Ok(());
         }
 
-        enforce_max_size(&self.recv_buf).map_err(|e| {
+        enforce_max_size(&self.recv_buf).inspect_err(|_| {
             self.state = InitiatorState::Done;
-            e
         })?;
 
         let (reply, consumed) = match decode_frame(&self.recv_buf) {
@@ -353,9 +352,8 @@ impl DcutrResponder {
                 return Ok(());
             }
 
-            enforce_max_size(&self.recv_buf).map_err(|e| {
+            enforce_max_size(&self.recv_buf).inspect_err(|_| {
                 self.state = ResponderState::Done;
-                e
             })?;
 
             let (msg, consumed) = match decode_frame(&self.recv_buf) {
