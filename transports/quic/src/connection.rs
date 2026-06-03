@@ -176,20 +176,20 @@ impl QuicConnection {
                 Ok(verified_peer_id) => {
                     // If the dialer specified an expected PeerId (via PeerAddr),
                     // reject the connection if the verified identity doesn't match.
-                    if let Some(expected) = self.endpoint.peer_id() {
-                        if *expected != verified_peer_id {
-                            events.push(TransportEvent::Error {
-                                id: self.id,
-                                message: format!(
-                                    "peer id mismatch: dialed {expected} but server certificate proves {verified_peer_id}"
-                                ),
-                            });
-                            // Close the connection — the peer is not who we expected.
-                            let _ = self.conn.close(true, 0x01, b"peer id mismatch");
-                            self.state = ConnectionState::Closing;
-                            self.flush(socket)?;
-                            return Ok(());
-                        }
+                    if let Some(expected) = self.endpoint.peer_id()
+                        && *expected != verified_peer_id
+                    {
+                        events.push(TransportEvent::Error {
+                            id: self.id,
+                            message: format!(
+                                "peer id mismatch: dialed {expected} but server certificate proves {verified_peer_id}"
+                            ),
+                        });
+                        // Close the connection — the peer is not who we expected.
+                        let _ = self.conn.close(true, 0x01, b"peer id mismatch");
+                        self.state = ConnectionState::Closing;
+                        self.flush(socket)?;
+                        return Ok(());
                     }
                     self.endpoint.set_peer_id(verified_peer_id);
                 }
@@ -467,19 +467,19 @@ impl QuicConnection {
                     }
                 };
 
-                if let Some(state) = self.stream_states.get_mut(&raw_stream_id) {
-                    if let Some(front) = state.pending_writes.front_mut() {
-                        if front.fin && front.bytes.is_empty() {
-                            state.pending_writes.pop_front();
-                        } else {
-                            if written == 0 {
-                                break;
-                            }
+                if let Some(state) = self.stream_states.get_mut(&raw_stream_id)
+                    && let Some(front) = state.pending_writes.front_mut()
+                {
+                    if front.fin && front.bytes.is_empty() {
+                        state.pending_writes.pop_front();
+                    } else {
+                        if written == 0 {
+                            break;
+                        }
 
-                            front.offset = front.offset.saturating_add(written);
-                            if front.offset >= front.bytes.len() {
-                                state.pending_writes.pop_front();
-                            }
+                        front.offset = front.offset.saturating_add(written);
+                        if front.offset >= front.bytes.len() {
+                            state.pending_writes.pop_front();
                         }
                     }
                 }
@@ -511,14 +511,15 @@ impl QuicConnection {
         stream_id: StreamId,
         events: &mut Vec<TransportEvent>,
     ) {
-        if let Some(state) = self.stream_states.get_mut(&stream_id.as_u64()) {
-            if state.is_fully_closed() && !state.closed_notified {
-                state.closed_notified = true;
-                events.push(TransportEvent::StreamClosed {
-                    id: self.id,
-                    stream_id,
-                });
-            }
+        if let Some(state) = self.stream_states.get_mut(&stream_id.as_u64())
+            && state.is_fully_closed()
+            && !state.closed_notified
+        {
+            state.closed_notified = true;
+            events.push(TransportEvent::StreamClosed {
+                id: self.id,
+                stream_id,
+            });
         }
     }
 

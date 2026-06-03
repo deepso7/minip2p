@@ -285,8 +285,8 @@ pub struct QuicTransport {
 /// when an application wants one explicit bind address, or
 /// [`QuicEndpoint::dual_stack`] to listen and dial over both IPv4 and IPv6.
 pub enum QuicEndpoint {
-    Single(QuicTransport),
-    Dual(DualQuicTransport),
+    Single(Box<QuicTransport>),
+    Dual(Box<DualQuicTransport>),
 }
 
 /// QUIC transport backed by separate IPv4 and IPv6 sockets.
@@ -304,7 +304,8 @@ enum AddressFamily {
 impl QuicEndpoint {
     /// Binds one QUIC socket to `bind_addr`.
     pub fn bind(node_config: QuicNodeConfig, bind_addr: &str) -> Result<Self, TransportError> {
-        QuicTransport::new(node_config, bind_addr).map(Self::Single)
+        QuicTransport::new(node_config, bind_addr)
+            .map(|transport| Self::Single(Box::new(transport)))
     }
 
     /// Binds one QUIC socket to the IP/UDP address represented by `addr`.
@@ -318,7 +319,7 @@ impl QuicEndpoint {
 
     /// Binds IPv4 and IPv6 wildcard UDP sockets.
     pub fn dual_stack(node_config: QuicNodeConfig) -> Result<Self, TransportError> {
-        DualQuicTransport::new(node_config).map(Self::Dual)
+        DualQuicTransport::new(node_config).map(|transport| Self::Dual(Box::new(transport)))
     }
 
     /// Sends a raw UDP packet to `target`, bypassing QUIC.
@@ -375,7 +376,7 @@ impl DualQuicTransport {
 
     fn internal_id(id: ConnectionId) -> (AddressFamily, ConnectionId) {
         let raw = id.as_u64();
-        if raw % 2 == 0 {
+        if raw.is_multiple_of(2) {
             (AddressFamily::Ipv6, ConnectionId::new(raw / 2))
         } else {
             (AddressFamily::Ipv4, ConnectionId::new(raw.div_ceil(2)))
@@ -832,56 +833,55 @@ impl Transport for QuicTransport {
                 .as_ref()
                 .and_then(|(_, dcid)| self.cid_to_connection.get(dcid).copied());
 
-            if target_conn_id.is_none() {
-                if self.listen_addr.is_some()
-                    && parsed_header
-                        .as_ref()
-                        .is_some_and(|(ty, _)| *ty == quiche::Type::Initial)
-                {
-                    let scid = Self::generate_scid().map_err(|e| TransportError::PollError {
-                        reason: format!("failed to generate server connection id: {e}"),
-                    })?;
+            if target_conn_id.is_none()
+                && self.listen_addr.is_some()
+                && parsed_header
+                    .as_ref()
+                    .is_some_and(|(ty, _)| *ty == quiche::Type::Initial)
+            {
+                let scid = Self::generate_scid().map_err(|e| TransportError::PollError {
+                    reason: format!("failed to generate server connection id: {e}"),
+                })?;
 
-                    let mut quiche_conn =
-                        quiche::accept(&scid, None, local_addr, from, &mut self.quiche_config)
-                            .map_err(|e| TransportError::PollError {
-                                reason: format!("quiche accept error: {e}"),
-                            })?;
+                let mut quiche_conn =
+                    quiche::accept(&scid, None, local_addr, from, &mut self.quiche_config)
+                        .map_err(|e| TransportError::PollError {
+                            reason: format!("quiche accept error: {e}"),
+                        })?;
 
-                    let mut out = [0u8; 1350];
-                    loop {
-                        let (written, send_info) = match quiche_conn.send(&mut out) {
-                            Ok(v) => v,
-                            Err(quiche::Error::Done) => break,
-                            Err(e) => {
-                                return Err(TransportError::PollError {
-                                    reason: format!("accept send error: {e}"),
-                                });
-                            }
-                        };
+                let mut out = [0u8; 1350];
+                loop {
+                    let (written, send_info) = match quiche_conn.send(&mut out) {
+                        Ok(v) => v,
+                        Err(quiche::Error::Done) => break,
+                        Err(e) => {
+                            return Err(TransportError::PollError {
+                                reason: format!("accept send error: {e}"),
+                            });
+                        }
+                    };
 
-                        self.socket
-                            .send_to(&out[..written], send_info.to)
-                            .map_err(|e| TransportError::PollError {
-                                reason: format!("udp send error: {e}"),
-                            })?;
-                    }
-
-                    let id = self.allocate_connection_id()?;
-                    let endpoint = ConnectionEndpoint::new(socket_addr_to_multiaddr(from));
-                    let conn = QuicConnection::new(id, quiche_conn, from, endpoint.clone());
-                    let source_cid = conn.source_cid_bytes();
-
-                    if self.connections.insert(id, conn).is_some() {
-                        return Err(TransportError::PollError {
-                            reason: format!("connection id collision for incoming connection {id}"),
-                        });
-                    }
-
-                    self.cid_to_connection.insert(source_cid, id);
-                    events.push(TransportEvent::IncomingConnection { id, endpoint });
-                    target_conn_id = Some(id);
+                    self.socket
+                        .send_to(&out[..written], send_info.to)
+                        .map_err(|e| TransportError::PollError {
+                            reason: format!("udp send error: {e}"),
+                        })?;
                 }
+
+                let id = self.allocate_connection_id()?;
+                let endpoint = ConnectionEndpoint::new(socket_addr_to_multiaddr(from));
+                let conn = QuicConnection::new(id, quiche_conn, from, endpoint.clone());
+                let source_cid = conn.source_cid_bytes();
+
+                if self.connections.insert(id, conn).is_some() {
+                    return Err(TransportError::PollError {
+                        reason: format!("connection id collision for incoming connection {id}"),
+                    });
+                }
+
+                self.cid_to_connection.insert(source_cid, id);
+                events.push(TransportEvent::IncomingConnection { id, endpoint });
+                target_conn_id = Some(id);
             }
 
             if target_conn_id.is_none() {

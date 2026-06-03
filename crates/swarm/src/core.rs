@@ -707,10 +707,10 @@ impl SwarmCore {
 
         // If a different connection to the same peer already exists, close
         // it so it doesn't orphan in conn_to_peer. Last connection wins.
-        if let Some(&existing_id) = self.peer_to_conn.get(&peer_id) {
-            if existing_id != id {
-                self.supersede_connection(existing_id);
-            }
+        if let Some(&existing_id) = self.peer_to_conn.get(&peer_id)
+            && existing_id != id
+        {
+            self.supersede_connection(existing_id);
         }
 
         self.conn_to_peer.insert(id, peer_id.clone());
@@ -953,19 +953,19 @@ impl SwarmCore {
     fn handle_stream_closed(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
         let key = (conn_id, stream_id);
 
-        if let Some(protocol) = self.stream_owner.remove(&key) {
-            if let Some(peer_id) = self.conn_to_peer.get(&conn_id).cloned() {
-                match protocol {
-                    ProtocolKind::Ping => {
-                        self.ping.on_stream_closed(&peer_id, stream_id);
-                    }
-                    ProtocolKind::IdentifyInitiator | ProtocolKind::IdentifyResponder => {
-                        self.identify.on_stream_closed(peer_id, stream_id);
-                    }
-                    ProtocolKind::User(_) => {
-                        self.events
-                            .push(SwarmEvent::UserStreamClosed { peer_id, stream_id });
-                    }
+        if let Some(protocol) = self.stream_owner.remove(&key)
+            && let Some(peer_id) = self.conn_to_peer.get(&conn_id).cloned()
+        {
+            match protocol {
+                ProtocolKind::Ping => {
+                    self.ping.on_stream_closed(&peer_id, stream_id);
+                }
+                ProtocolKind::IdentifyInitiator | ProtocolKind::IdentifyResponder => {
+                    self.identify.on_stream_closed(peer_id, stream_id);
+                }
+                ProtocolKind::User(_) => {
+                    self.events
+                        .push(SwarmEvent::UserStreamClosed { peer_id, stream_id });
                 }
             }
         }
