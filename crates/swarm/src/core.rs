@@ -119,7 +119,7 @@ pub struct SwarmCore {
     stream_owner: BTreeMap<(ConnectionId, StreamId), ProtocolKind>,
     /// Outstanding OpenStream requests keyed by token; populated when the
     /// core emits `SwarmAction::OpenStream` and drained when the driver
-    /// reports the allocated stream id back via `on_stream_opened`.
+    /// reports the allocated stream id back via [`SwarmInput::StreamOpened`].
     pending_opens: BTreeMap<OpenStreamToken, PendingOpen>,
     /// Auto-incrementing source for [`OpenStreamToken`]s.
     next_open_token: u64,
@@ -216,49 +216,10 @@ impl SwarmCore {
     /// action can feed more input back into the core. Once no actions remain,
     /// events are yielded in FIFO order.
     pub fn poll_output(&mut self) -> Option<SwarmOutput> {
-        self.poll_action()
-            .map(SwarmOutput::Action)
-            .or_else(|| self.poll_event().map(SwarmOutput::Event))
-    }
-
-    /// Returns the next pending driver action, if any.
-    ///
-    /// Polling one item at a time lets custom drivers execute an action and
-    /// immediately feed any resulting mutation back into the core before
-    /// continuing the drain loop.
-    pub fn poll_action(&mut self) -> Option<SwarmAction> {
-        if self.actions.is_empty() {
-            None
-        } else {
-            self.actions.pop_front()
+        if let Some(action) = self.actions.pop_front() {
+            return Some(SwarmOutput::Action(action));
         }
-    }
-
-    /// Returns the next application-visible event, if any.
-    pub fn poll_event(&mut self) -> Option<SwarmEvent> {
-        if self.events.is_empty() {
-            None
-        } else {
-            self.events.pop_front()
-        }
-    }
-
-    /// Drains all buffered actions for the driver to execute.
-    pub fn take_actions(&mut self) -> Vec<SwarmAction> {
-        let mut actions = Vec::new();
-        while let Some(action) = self.poll_action() {
-            actions.push(action);
-        }
-        actions
-    }
-
-    /// Drains all buffered application-visible events.
-    pub fn poll_events(&mut self) -> Vec<SwarmEvent> {
-        let mut events = Vec::new();
-        while let Some(event) = self.poll_event() {
-            events.push(event);
-        }
-        events
+        self.events.pop_front().map(SwarmOutput::Event)
     }
 
     /// Returns true when the core has no pending driver actions or
@@ -274,32 +235,21 @@ impl SwarmCore {
     /// Feeds one external input into the core.
     pub fn handle_input(&mut self, input: SwarmInput) {
         match input {
-            SwarmInput::Transport { event, now_ms } => self.on_transport_event(event, now_ms),
-            SwarmInput::Tick { now_ms } => self.on_tick(now_ms),
+            SwarmInput::Transport { event, now_ms } => self.handle_transport_event(event, now_ms),
+            SwarmInput::Tick { now_ms } => self.handle_tick(now_ms),
             SwarmInput::StreamOpened {
                 conn_id,
                 stream_id,
                 token,
                 now_ms,
-            } => self.on_stream_opened(conn_id, stream_id, token, now_ms),
+            } => self.handle_stream_opened(conn_id, stream_id, token, now_ms),
             SwarmInput::OpenStreamFailed {
                 token,
                 reason,
                 now_ms,
-            } => self.on_open_stream_failed(token, reason, now_ms),
-            SwarmInput::RuntimeError(error) => self.record_error(error),
+            } => self.handle_open_stream_failed(token, reason, now_ms),
+            SwarmInput::RuntimeError(error) => self.record_runtime_error(error),
         }
-    }
-
-    /// Records a non-fatal error observed by the driver while executing a
-    /// queued action (e.g. a [`SwarmAction::SendStream`] call on the
-    /// transport failed).
-    ///
-    /// Surfaces as a [`SwarmEvent::Error`] on the next
-    /// [`Self::poll_events`]. Used by the driver so transport-level
-    /// failures are never silently dropped.
-    pub fn record_error(&mut self, error: SwarmRuntimeError) {
-        self.events.push_back(SwarmEvent::Error(error));
     }
 
     // -----------------------------------------------------------------------
@@ -356,7 +306,7 @@ impl SwarmCore {
 
     /// Opens a new outbound stream and starts multistream-select negotiation
     /// for `protocol_id`. The actual stream id is not known until the driver
-    /// reports back via [`Self::on_stream_opened`].
+    /// reports back via [`SwarmInput::StreamOpened`].
     pub fn open_user_stream(
         &mut self,
         peer_id: &PeerId,
@@ -475,8 +425,11 @@ impl SwarmCore {
     // Ingress
     // -----------------------------------------------------------------------
 
-    /// Feeds a transport event into the core.
-    pub fn on_transport_event(&mut self, event: TransportEvent, now_ms: u64) {
+    fn record_runtime_error(&mut self, error: SwarmRuntimeError) {
+        self.events.push_back(SwarmEvent::Error(error));
+    }
+
+    fn handle_transport_event(&mut self, event: TransportEvent, now_ms: u64) {
         match event {
             TransportEvent::Connected { id, endpoint } => {
                 self.active_connections.insert(id, true);
@@ -515,7 +468,7 @@ impl SwarmCore {
             }
             TransportEvent::StreamOpened { .. } => {
                 // Outbound stream id allocation is driver-synchronous; the
-                // core tracks opens via `on_stream_opened` rather than this
+                // core tracks opens via `SwarmInput::StreamOpened` rather than this
                 // event. No-op here.
             }
             TransportEvent::StreamData {
@@ -546,8 +499,7 @@ impl SwarmCore {
         }
     }
 
-    /// Advances time-based protocol state (e.g. ping timeouts).
-    pub fn on_tick(&mut self, now_ms: u64) {
+    fn handle_tick(&mut self, now_ms: u64) {
         let tick_actions = self.ping.on_tick(now_ms);
         for action in tick_actions {
             self.execute_ping_action(action);
@@ -555,15 +507,7 @@ impl SwarmCore {
         self.collect_protocol_events();
     }
 
-    /// Reports the result of an [`SwarmAction::OpenStream`] back to the core.
-    ///
-    /// The driver calls this after `transport.open_stream(conn_id)`
-    /// succeeds. The core starts multistream-select on the stream and emits
-    /// the outbound handshake as `SendStream` actions.
-    ///
-    /// Prefer [`SwarmCore::handle_input`] with [`SwarmInput::StreamOpened`]
-    /// in new drivers.
-    pub fn on_stream_opened(
+    fn handle_stream_opened(
         &mut self,
         conn_id: ConnectionId,
         stream_id: StreamId,
@@ -615,11 +559,7 @@ impl SwarmCore {
         );
     }
 
-    /// Reports that an [`SwarmAction::OpenStream`] failed at the driver.
-    ///
-    /// Prefer [`SwarmCore::handle_input`] with
-    /// [`SwarmInput::OpenStreamFailed`] in new drivers.
-    pub fn on_open_stream_failed(&mut self, token: OpenStreamToken, reason: String, _now_ms: u64) {
+    fn handle_open_stream_failed(&mut self, token: OpenStreamToken, reason: String, _now_ms: u64) {
         let pending = self.pending_opens.remove(&token);
         let (peer_id, conn_id, detail) = match pending {
             Some(p) => (
@@ -1513,6 +1453,32 @@ mod tests {
         Multiaddr::from_str("/ip4/127.0.0.1/udp/4001/quic-v1").expect("valid multiaddr")
     }
 
+    fn feed(core: &mut SwarmCore, event: TransportEvent) {
+        core.handle_input(SwarmInput::Transport { event, now_ms: 0 });
+    }
+
+    fn drain_actions(core: &mut SwarmCore) -> Vec<SwarmAction> {
+        let mut actions = Vec::new();
+        while let Some(output) = core.poll_output() {
+            match output {
+                SwarmOutput::Action(action) => actions.push(action),
+                SwarmOutput::Event(_) => {}
+            }
+        }
+        actions
+    }
+
+    fn drain_events(core: &mut SwarmCore) -> Vec<SwarmEvent> {
+        let mut events = Vec::new();
+        while let Some(output) = core.poll_output() {
+            match output {
+                SwarmOutput::Action(_) => {}
+                SwarmOutput::Event(event) => events.push(event),
+            }
+        }
+        events
+    }
+
     #[test]
     fn is_idle_reflects_pending_actions_and_events() {
         let mut core = test_core();
@@ -1521,17 +1487,16 @@ mod tests {
 
         assert!(core.is_idle());
 
-        core.on_transport_event(
+        feed(
+            &mut core,
             TransportEvent::Connected {
                 id: conn_id,
                 endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
             },
-            0,
         );
         assert!(!core.is_idle());
 
-        let _ = core.take_actions();
-        let _ = core.poll_events();
+        while core.poll_output().is_some() {}
         assert!(core.is_idle());
     }
 
@@ -1540,22 +1505,22 @@ mod tests {
         let mut core = test_core();
         let conn_id = ConnectionId::new(7);
 
-        core.on_transport_event(
+        feed(
+            &mut core,
             TransportEvent::Connected {
                 id: conn_id,
                 endpoint: ConnectionEndpoint::new(loopback_transport()),
             },
-            0,
         );
-        core.on_transport_event(
+        feed(
+            &mut core,
             TransportEvent::Error {
                 id: conn_id,
                 message: "boom".into(),
             },
-            0,
         );
 
-        let events = core.poll_events();
+        let events = drain_events(&mut core);
         let error = events
             .iter()
             .find_map(|event| match event {
@@ -1573,22 +1538,22 @@ mod tests {
         let conn_id = ConnectionId::new(8);
         let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
 
-        core.on_transport_event(
+        feed(
+            &mut core,
             TransportEvent::Connected {
                 id: conn_id,
                 endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
             },
-            0,
         );
-        core.on_transport_event(
+        feed(
+            &mut core,
             TransportEvent::Error {
                 id: conn_id,
                 message: "boom".into(),
             },
-            0,
         );
 
-        let events = core.poll_events();
+        let events = drain_events(&mut core);
         let error = events
             .iter()
             .find_map(|event| match event {
@@ -1618,7 +1583,7 @@ mod tests {
 
         core.send_user_stream(&peer_id, stream_id, b"ok".to_vec())
             .expect("user stream should be active on original connection");
-        let actions = core.take_actions();
+        let actions = drain_actions(&mut core);
 
         assert!(matches!(
             actions.as_slice(),
@@ -1635,24 +1600,24 @@ mod tests {
         let newer_conn = ConnectionId::new(11);
         let stream_id = StreamId::new(8);
 
-        core.on_transport_event(
+        feed(
+            &mut core,
             TransportEvent::Connected {
                 id: original_conn,
                 endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
             },
-            0,
         );
         core.stream_owner.insert(
             (original_conn, stream_id),
             ProtocolKind::User("/minip2p/test/1.0.0".into()),
         );
 
-        core.on_transport_event(
+        feed(
+            &mut core,
             TransportEvent::Connected {
                 id: newer_conn,
                 endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
             },
-            0,
         );
 
         let err = core
