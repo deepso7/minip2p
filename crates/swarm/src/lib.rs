@@ -3,10 +3,12 @@
 //! This crate provides two layers:
 //!
 //! - [`SwarmCore`] -- pure Sans-I/O state machine. `no_std + alloc`
-//!   compatible. Consumes [`minip2p_transport::TransportEvent`]s and a
-//!   caller-supplied `now_ms`, emits [`SwarmAction`]s for a driver to
-//!   execute and [`SwarmEvent`]s for the application to observe. No
-//!   sockets, no async runtime, no clock reads.
+//!   compatible. Callers feed it [`SwarmInput`] values through
+//!   [`SwarmCore::handle_input`], then drain [`SwarmOutput`] values through
+//!   [`SwarmCore::poll_output`] until [`SwarmCore::is_idle`] returns true.
+//!   Outputs wrap [`SwarmAction`]s for a driver to execute and [`SwarmEvent`]s
+//!   for the application to observe. No sockets, no async runtime, no clock
+//!   reads.
 //!
 //! - [`Swarm`] -- std driver that owns a concrete [`Transport`] and a
 //!   monotonic clock ([`std::time::Instant`]), and preserves the one-call
@@ -36,7 +38,8 @@ mod driver;
 
 pub use crate::core::SwarmCore;
 pub use crate::events::{
-    OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError,
+    OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput,
+    SwarmRuntimeError,
 };
 
 #[cfg(feature = "std")]

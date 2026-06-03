@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 
 use minip2p_core::PeerId;
 use minip2p_identify::IdentifyMessage;
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::{ConnectionId, StreamId, TransportEvent};
 
 /// Events emitted by the swarm to the application.
 #[derive(Clone, Debug)]
@@ -110,12 +110,60 @@ pub enum SwarmErrorKind {
 ///
 /// The core emits it as part of [`SwarmAction::OpenStream`]; the driver
 /// echoes it back unchanged when reporting the stream id (or failure) via
-/// the core's `on_stream_opened` / `on_open_stream_failed` methods.
+/// [`SwarmInput::StreamOpened`] / [`SwarmInput::OpenStreamFailed`].
 ///
 /// The token's numeric value is an implementation detail and meaningless
 /// outside the core.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct OpenStreamToken(pub(crate) u64);
+
+/// Inputs accepted by the Sans-I/O swarm core.
+///
+/// A custom runtime feeds exactly one input, then drains [`SwarmOutput`] values
+/// through `SwarmCore::poll_output()` before feeding the next input.
+#[derive(Clone, Debug)]
+pub enum SwarmInput {
+    /// An event produced by the underlying transport.
+    Transport {
+        event: TransportEvent,
+        /// Monotonic milliseconds supplied by the driver.
+        now_ms: u64,
+    },
+    /// Time advanced; used for protocol timers such as ping timeouts.
+    Tick {
+        /// Monotonic milliseconds supplied by the driver.
+        now_ms: u64,
+    },
+    /// The driver successfully opened an outbound stream requested by
+    /// [`SwarmAction::OpenStream`].
+    StreamOpened {
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        token: OpenStreamToken,
+        /// Monotonic milliseconds supplied by the driver.
+        now_ms: u64,
+    },
+    /// The driver failed to open an outbound stream requested by
+    /// [`SwarmAction::OpenStream`].
+    OpenStreamFailed {
+        token: OpenStreamToken,
+        reason: String,
+        /// Monotonic milliseconds supplied by the driver.
+        now_ms: u64,
+    },
+    /// A non-fatal runtime error observed by the driver while executing a
+    /// [`SwarmAction`].
+    RuntimeError(SwarmRuntimeError),
+}
+
+/// Outputs produced by the Sans-I/O swarm core.
+#[derive(Clone, Debug)]
+pub enum SwarmOutput {
+    /// A command the runtime must execute against its transport.
+    Action(SwarmAction),
+    /// An application-visible event.
+    Event(SwarmEvent),
+}
 
 /// Commands the swarm asks its driver to execute against the underlying
 /// transport.
@@ -129,8 +177,8 @@ pub enum SwarmAction {
     ///
     /// The driver calls `transport.open_stream(conn_id)`. On success it
     /// reports the allocated stream id back to the core via
-    /// `on_stream_opened(conn_id, stream_id, token, now_ms)`. On failure it
-    /// reports the error via `on_open_stream_failed(token, error, now_ms)`.
+    /// [`SwarmInput::StreamOpened`]. On failure it reports the error via
+    /// [`SwarmInput::OpenStreamFailed`].
     /// The driver must echo `token` unchanged.
     OpenStream {
         conn_id: ConnectionId,

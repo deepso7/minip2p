@@ -353,7 +353,7 @@ fn open_user_stream_fails_fast_when_peer_did_not_advertise_protocol() {
 /// `observed_addr` byte vector into the Identify responder (the TODO at
 /// the former `crates/swarm/src/core.rs:982`). The fix plumbs the
 /// transport endpoint cached on `TransportEvent::Connected` /
-/// `IncomingConnection` into `IdentifyProtocol::register_outbound_stream`.
+/// `IncomingConnection` into `IdentifyInput::RegisterOutboundStream`.
 ///
 /// Note: we intentionally only assert the client-observed direction.
 /// The symmetric server-observed case requires the server to learn the

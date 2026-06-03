@@ -7,11 +7,11 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeSet, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use minip2p_core::{VarintError, read_uvarint, uvarint_len, write_uvarint};
+use minip2p_core::{SansIoProtocol, VarintError, read_uvarint, uvarint_len, write_uvarint};
 use thiserror::Error;
 
 /// The multistream-select protocol identifier.
@@ -32,6 +32,15 @@ pub enum MultistreamOutput {
     NotAvailable,
     /// A protocol-level error occurred; negotiation is terminated.
     ProtocolError { reason: String },
+}
+
+/// Input accepted by [`MultistreamSelect`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MultistreamInput {
+    /// Begin negotiation by emitting the multistream header.
+    Start,
+    /// Bytes received from the remote peer.
+    Data(Vec<u8>),
 }
 
 /// Errors encountered during multistream-select framing or negotiation.
@@ -81,6 +90,7 @@ pub struct MultistreamSelect {
     supported_protocols: BTreeSet<String>,
     recv_buf: Vec<u8>,
     started: bool,
+    pending_outputs: VecDeque<MultistreamOutput>,
 }
 
 impl MultistreamSelect {
@@ -93,6 +103,7 @@ impl MultistreamSelect {
             supported_protocols: BTreeSet::new(),
             recv_buf: Vec::new(),
             started: false,
+            pending_outputs: VecDeque::new(),
         }
     }
 
@@ -105,11 +116,12 @@ impl MultistreamSelect {
             supported_protocols: protocols.into_iter().collect(),
             recv_buf: Vec::new(),
             started: false,
+            pending_outputs: VecDeque::new(),
         }
     }
 
     /// Produces the initial multistream header to send. Idempotent.
-    pub fn start(&mut self) -> Vec<MultistreamOutput> {
+    fn start(&mut self) -> Vec<MultistreamOutput> {
         if self.started {
             return Vec::new();
         }
@@ -137,7 +149,7 @@ impl MultistreamSelect {
     }
 
     /// Feeds received bytes into the state machine and returns any outputs.
-    pub fn receive(&mut self, bytes: &[u8]) -> Vec<MultistreamOutput> {
+    fn receive(&mut self, bytes: &[u8]) -> Vec<MultistreamOutput> {
         if self.state == State::Done {
             return Vec::new();
         }
@@ -176,6 +188,29 @@ impl MultistreamSelect {
         }
 
         outputs
+    }
+}
+
+impl SansIoProtocol for MultistreamSelect {
+    type Input = MultistreamInput;
+    type Output = MultistreamOutput;
+    type Error = MultistreamError;
+
+    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
+        let outputs = match input {
+            MultistreamInput::Start => self.start(),
+            MultistreamInput::Data(data) => self.receive(&data),
+        };
+        self.pending_outputs.extend(outputs);
+        Ok(())
+    }
+
+    fn poll_output(&mut self) -> Option<Self::Output> {
+        self.pending_outputs.pop_front()
+    }
+
+    fn is_idle(&self) -> bool {
+        self.pending_outputs.is_empty()
     }
 }
 
@@ -510,5 +545,27 @@ mod tests {
 
         let out = dialer.receive(&encode_message("na"));
         assert_eq!(out, vec![MultistreamOutput::NotAvailable]);
+    }
+
+    #[test]
+    fn multistream_select_implements_sans_io_protocol() {
+        let mut dialer = MultistreamSelect::dialer(PING);
+
+        dialer.handle_input(MultistreamInput::Start).unwrap();
+        assert!(matches!(
+            dialer.poll_output(),
+            Some(MultistreamOutput::OutboundData(_))
+        ));
+        assert!(dialer.is_idle());
+
+        dialer
+            .handle_input(MultistreamInput::Data(encode_message(
+                MULTISTREAM_PROTOCOL_ID,
+            )))
+            .unwrap();
+        assert_eq!(
+            dialer.poll_output(),
+            Some(MultistreamOutput::OutboundData(encode_message(PING)))
+        );
     }
 }

@@ -4,7 +4,7 @@ Orchestration layer that composes minip2p's protocol state machines into a singl
 
 ## Two layers
 
-- **`SwarmCore`** (`no_std + alloc`): pure state machine. Consumes `TransportEvent` values (with caller-supplied `now_ms`), emits `SwarmAction` commands and `SwarmEvent` notifications. No sockets, no async runtime, no clock reads. Composes `IdentifyProtocol`, `PingProtocol`, and `MultistreamSelect`; tracks connections, streams, and pending stream opens.
+- **`SwarmCore`** (`no_std + alloc`): pure state machine. Consumes `SwarmInput` values through `handle_input`, emits `SwarmOutput` values through `poll_output`, and reports quiescence with `is_idle`. Outputs wrap `SwarmAction` commands for the driver and `SwarmEvent` notifications for the application. No sockets, no async runtime, no clock reads. Composes `IdentifyProtocol`, `PingProtocol`, and `MultistreamSelect`; tracks connections, streams, and pending stream opens.
 - **`Swarm<T: Transport>`** (`std` feature, default): thin driver around `SwarmCore`. Owns a concrete transport, reads `std::time::Instant` for `now_ms`, and shuttles events and actions between the transport and the core. Preserves the one-call DX (`swarm.dial`, `swarm.ping`, `swarm.open_user_stream`).
 
 ## Features
@@ -36,7 +36,7 @@ Orchestration layer that composes minip2p's protocol state machines into a singl
 ## Sans-I/O usage
 
 ```rust
-use minip2p_swarm::{SwarmCore, SwarmEvent};
+use minip2p_swarm::{SwarmCore, SwarmInput, SwarmOutput};
 use minip2p_identify::IdentifyConfig;
 use minip2p_ping::PingConfig;
 
@@ -44,11 +44,28 @@ let mut core = SwarmCore::new(identify_config, PingConfig::default());
 core.add_user_protocol("/myapp/1.0.0");
 
 // Drive it:
-// core.on_transport_event(event, now_ms);
-// core.on_tick(now_ms);
-// for action in core.take_actions() { execute(action); }
-// for event in core.poll_events() { ... }
+// core.handle_input(SwarmInput::Transport { event, now_ms });
+// core.handle_input(SwarmInput::Tick { now_ms });
+// while let Some(output) = core.poll_output() {
+//     match output {
+//         SwarmOutput::Action(action) => execute(action),
+//         SwarmOutput::Event(event) => { /* hand to app */ }
+//     }
+// }
 ```
+
+### Driver loop contract
+
+The core is deterministic when callers use a simple mutate-then-drain loop:
+
+1. Feed exactly one external input into the core with `core.handle_input(...)`, or call one application intent such as `ping`, `open_user_stream`, or `send_user_stream`.
+2. Drain `core.poll_output()`.
+3. Execute each `SwarmOutput::Action` against your transport.
+4. Feed driver results back with `SwarmInput::StreamOpened`, `SwarmInput::OpenStreamFailed`, or `SwarmInput::RuntimeError`.
+5. Hand each `SwarmOutput::Event` to the application.
+6. Before waiting on I/O again, `core.is_idle()` should be true.
+
+That shape mirrors the std `Swarm<T>` driver while keeping sockets, clocks, sleeps, async runtimes, and allocation policy outside the Sans-I/O core.
 
 ## Std driver usage
 

@@ -31,7 +31,7 @@ mod message;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::Multiaddr;
+use minip2p_core::{Multiaddr, SansIoProtocol};
 
 pub use message::{
     DcutrMessageError, FrameDecode, HolePunch, HolePunchType, decode_frame, encode_frame,
@@ -86,21 +86,46 @@ pub enum InitiatorOutcome {
     },
 }
 
+/// Input accepted by [`DcutrInitiator`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DcutrInitiatorInput {
+    /// Drain queued CONNECT or SYNC bytes into an output.
+    Flush,
+    /// Bytes received from the relay stream, with measured relay RTT.
+    Data { bytes: Vec<u8>, rtt_ms: u64 },
+    /// Remote write side closed.
+    RemoteWriteClosed,
+    /// Queue the SYNC frame after the caller has started direct dialing.
+    SendSync,
+}
+
+/// Output produced by [`DcutrInitiator`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DcutrInitiatorOutput {
+    /// Bytes to write to the DCUtR stream.
+    Outbound(Vec<u8>),
+    /// Direct-dial instruction decoded from the remote CONNECT reply.
+    Outcome(InitiatorOutcome),
+}
+
 /// Client-side (initiator) state machine.
 ///
 /// Usage:
 /// 1. Construct with [`DcutrInitiator::new`], passing our observed addresses.
-/// 2. Call [`DcutrInitiator::take_outbound`] and send the bytes.
-/// 3. Record the send time; feed stream data via [`DcutrInitiator::on_data`].
-/// 4. When [`DcutrInitiator::outcome`] returns `DialNow`, the caller:
+/// 2. Drain [`DcutrInitiatorOutput::Outbound`] from
+///    [`SansIoProtocol::poll_output`] and send the bytes.
+/// 3. Record the send time; feed stream data with
+///    [`DcutrInitiatorInput::Data`].
+/// 4. When [`DcutrInitiatorOutput::Outcome`] returns `DialNow`, the caller:
 ///    - dials the returned addresses immediately,
-///    - calls [`DcutrInitiator::send_sync`] to queue the SYNC frame,
+///    - feeds [`DcutrInitiatorInput::SendSync`] to queue the SYNC frame,
 ///    - flushes the outbound bytes.
 pub struct DcutrInitiator {
     outbound: Vec<u8>,
     recv_buf: Vec<u8>,
     state: InitiatorState,
     outcome: Option<InitiatorOutcome>,
+    emitted_outcome: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,11 +161,12 @@ impl DcutrInitiator {
             recv_buf: Vec::new(),
             state: InitiatorState::Pending,
             outcome: None,
+            emitted_outcome: false,
         }
     }
 
     /// Drains and returns any pending outbound bytes.
-    pub fn take_outbound(&mut self) -> Vec<u8> {
+    fn take_outbound(&mut self) -> Vec<u8> {
         let bytes = core::mem::take(&mut self.outbound);
         self.state = match self.state {
             InitiatorState::Pending => InitiatorState::AwaitingConnectReply,
@@ -155,7 +181,7 @@ impl DcutrInitiator {
     /// `rtt_ms` is the caller's measured RTT from when they sent CONNECT
     /// (via `take_outbound`) to now. It is passed through into the
     /// `DialNow` outcome so the caller can use it for SYNC timing.
-    pub fn on_data(&mut self, data: &[u8], rtt_ms: u64) -> Result<(), DcutrError> {
+    fn on_data(&mut self, data: &[u8], rtt_ms: u64) -> Result<(), DcutrError> {
         if matches!(
             self.state,
             InitiatorState::Done | InitiatorState::SyncPending
@@ -168,13 +194,14 @@ impl DcutrInitiator {
     }
 
     /// Notifies the state machine that the remote closed its write side.
-    pub fn on_remote_write_closed(&mut self) -> Result<(), DcutrError> {
+    fn on_remote_write_closed(&mut self) -> Result<(), DcutrError> {
         // No-op: the outcome is already resolved by the time we'd care.
         Ok(())
     }
 
     /// Returns the current outcome, if available.
-    pub fn outcome(&self) -> Option<&InitiatorOutcome> {
+    #[cfg(test)]
+    fn outcome(&self) -> Option<&InitiatorOutcome> {
         self.outcome.as_ref()
     }
 
@@ -186,8 +213,9 @@ impl DcutrInitiator {
     /// Queues the SYNC message to be sent.
     ///
     /// Call this after you have initiated your simultaneous dial, per the
-    /// spec. After calling, flush [`take_outbound`] to the stream.
-    pub fn send_sync(&mut self) -> Result<(), DcutrError> {
+    /// spec. After feeding [`DcutrInitiatorInput::SendSync`], drain
+    /// [`DcutrInitiatorOutput::Outbound`] to the stream.
+    fn send_sync(&mut self) -> Result<(), DcutrError> {
         if self.state != InitiatorState::ReadyToSync {
             return Err(DcutrError::UnexpectedMessage(alloc::format!(
                 "cannot send SYNC from state {:?}",
@@ -244,6 +272,7 @@ impl DcutrInitiator {
             remote_addr_bytes: reply.obs_addrs,
             rtt_ms,
         });
+        self.emitted_outcome = false;
 
         Ok(())
     }
@@ -274,14 +303,38 @@ pub enum ResponderEvent {
     SyncReceived,
 }
 
+/// Input accepted by [`DcutrResponder`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DcutrResponderInput {
+    /// Drain queued CONNECT reply bytes into an output.
+    Flush,
+    /// Bytes received from the relay stream.
+    Data(Vec<u8>),
+    /// Remote write side closed.
+    RemoteWriteClosed,
+}
+
+/// Output produced by [`DcutrResponder`] through [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DcutrResponderOutput {
+    /// Bytes to write to the DCUtR stream.
+    Outbound(Vec<u8>),
+    /// Responder event decoded from incoming messages.
+    Event(ResponderEvent),
+}
+
 /// Server-side (responder) state machine.
 ///
 /// Usage:
 /// 1. Construct with [`DcutrResponder::new`], passing our observed addresses.
 ///    Our CONNECT reply is queued automatically.
-/// 2. Feed incoming bytes via [`DcutrResponder::on_data`].
-/// 3. Poll [`DcutrResponder::poll_events`] to collect [`ResponderEvent`]s.
-/// 4. Flush [`DcutrResponder::take_outbound`] to the stream.
+/// 2. Feed incoming bytes with [`DcutrResponderInput::Data`].
+/// 3. Drain [`DcutrResponderOutput`] values from
+///    [`SansIoProtocol::poll_output`].
+/// 4. Send [`DcutrResponderOutput::Outbound`] bytes back on the relay stream.
+/// 5. On [`DcutrResponderOutput::Event`] with
+///    [`ResponderEvent::SyncReceived`], start the responder-side dial timing /
+///    UDP bombardment strategy.
 pub struct DcutrResponder {
     own_addrs: Vec<Vec<u8>>,
     outbound: Vec<u8>,
@@ -317,12 +370,12 @@ impl DcutrResponder {
     }
 
     /// Drains and returns any pending outbound bytes.
-    pub fn take_outbound(&mut self) -> Vec<u8> {
+    fn take_outbound(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.outbound)
     }
 
     /// Feeds incoming stream bytes.
-    pub fn on_data(&mut self, data: &[u8]) -> Result<(), DcutrError> {
+    fn on_data(&mut self, data: &[u8]) -> Result<(), DcutrError> {
         if self.state == ResponderState::Done {
             return Ok(());
         }
@@ -332,12 +385,13 @@ impl DcutrResponder {
     }
 
     /// Notifies the state machine that the remote closed its write side.
-    pub fn on_remote_write_closed(&mut self) -> Result<(), DcutrError> {
+    fn on_remote_write_closed(&mut self) -> Result<(), DcutrError> {
         self.try_decode()
     }
 
     /// Drains buffered events.
-    pub fn poll_events(&mut self) -> Vec<ResponderEvent> {
+    #[cfg(test)]
+    fn poll_events(&mut self) -> Vec<ResponderEvent> {
         core::mem::take(&mut self.events)
     }
 
@@ -403,6 +457,71 @@ impl DcutrResponder {
                 }
             }
         }
+    }
+}
+
+impl SansIoProtocol for DcutrInitiator {
+    type Input = DcutrInitiatorInput;
+    type Output = DcutrInitiatorOutput;
+    type Error = DcutrError;
+
+    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
+        match input {
+            DcutrInitiatorInput::Flush => {}
+            DcutrInitiatorInput::Data { bytes, rtt_ms } => self.on_data(&bytes, rtt_ms)?,
+            DcutrInitiatorInput::RemoteWriteClosed => self.on_remote_write_closed()?,
+            DcutrInitiatorInput::SendSync => self.send_sync()?,
+        }
+        Ok(())
+    }
+
+    fn poll_output(&mut self) -> Option<Self::Output> {
+        let outbound = self.take_outbound();
+        if !outbound.is_empty() {
+            return Some(DcutrInitiatorOutput::Outbound(outbound));
+        }
+        if !self.emitted_outcome {
+            if let Some(outcome) = self.outcome.clone() {
+                self.emitted_outcome = true;
+                return Some(DcutrInitiatorOutput::Outcome(outcome));
+            }
+        }
+        None
+    }
+
+    fn is_idle(&self) -> bool {
+        self.outbound.is_empty() && (self.emitted_outcome || self.outcome.is_none())
+    }
+}
+
+impl SansIoProtocol for DcutrResponder {
+    type Input = DcutrResponderInput;
+    type Output = DcutrResponderOutput;
+    type Error = DcutrError;
+
+    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
+        match input {
+            DcutrResponderInput::Flush => {}
+            DcutrResponderInput::Data(data) => self.on_data(&data)?,
+            DcutrResponderInput::RemoteWriteClosed => self.on_remote_write_closed()?,
+        }
+        Ok(())
+    }
+
+    fn poll_output(&mut self) -> Option<Self::Output> {
+        let outbound = self.take_outbound();
+        if !outbound.is_empty() {
+            return Some(DcutrResponderOutput::Outbound(outbound));
+        }
+        if self.events.is_empty() {
+            None
+        } else {
+            Some(DcutrResponderOutput::Event(self.events.remove(0)))
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.outbound.is_empty() && self.events.is_empty()
     }
 }
 
@@ -688,5 +807,42 @@ mod tests {
         let large = vec![0u8; MAX_MESSAGE_SIZE + 1];
         let err = resp.on_data(&large).unwrap_err();
         assert!(matches!(err, DcutrError::MessageTooLarge { .. }));
+    }
+
+    #[test]
+    fn initiator_and_responder_implement_sans_io_protocol() {
+        let own = [addr("/ip4/10.0.0.1/udp/1234/quic-v1")];
+        let mut init = DcutrInitiator::new(&own);
+        let mut resp = DcutrResponder::new(&own);
+
+        init.handle_input(DcutrInitiatorInput::Flush).unwrap();
+        let Some(DcutrInitiatorOutput::Outbound(connect)) = init.poll_output() else {
+            panic!("initiator should emit CONNECT");
+        };
+
+        resp.handle_input(DcutrResponderInput::Data(connect))
+            .unwrap();
+        let Some(DcutrResponderOutput::Outbound(reply)) = resp.poll_output() else {
+            panic!("responder should emit CONNECT reply");
+        };
+        assert!(matches!(
+            resp.poll_output(),
+            Some(DcutrResponderOutput::Event(
+                ResponderEvent::ConnectReceived { .. }
+            ))
+        ));
+
+        init.handle_input(DcutrInitiatorInput::Data {
+            bytes: reply,
+            rtt_ms: 42,
+        })
+        .unwrap();
+        assert!(matches!(
+            init.poll_output(),
+            Some(DcutrInitiatorOutput::Outcome(InitiatorOutcome::DialNow {
+                rtt_ms: 42,
+                ..
+            }))
+        ));
     }
 }
