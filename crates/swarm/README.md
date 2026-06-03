@@ -46,9 +46,21 @@ core.add_user_protocol("/myapp/1.0.0");
 // Drive it:
 // core.on_transport_event(event, now_ms);
 // core.on_tick(now_ms);
-// for action in core.take_actions() { execute(action); }
-// for event in core.poll_events() { ... }
+// while let Some(action) = core.poll_action() { execute(action); }
+// while let Some(event) = core.poll_event() { ... }
 ```
+
+### Driver loop contract
+
+The core is deterministic when callers use a simple mutate-then-drain loop:
+
+1. Feed exactly one external input into the core: a `TransportEvent`, a timer tick via `on_tick(now_ms)`, or one application intent such as `ping`, `open_user_stream`, or `send_user_stream`.
+2. Drain `core.poll_action()` and execute each `SwarmAction` against your transport.
+3. If executing an action feeds a result back into the core, such as `on_stream_opened` or `on_open_stream_failed`, drain actions again until no new actions are produced.
+4. Drain `core.poll_event()` and hand those events to the application.
+5. Before waiting on I/O again, `core.is_idle()` should be true.
+
+That shape mirrors the std `Swarm<T>` driver while keeping sockets, clocks, sleeps, async runtimes, and allocation policy outside the Sans-I/O core.
 
 ## Std driver usage
 

@@ -8,10 +8,27 @@
 //! `no_std + alloc` compatible. The std [`crate::Swarm`] driver is a thin
 //! wrapper that owns a transport, reads the clock via [`std::time::Instant`],
 //! and shuttles events and actions between the transport and the core.
+//!
+//! # Driver contract
+//!
+//! External drivers should follow a drain loop:
+//!
+//! 1. perform one mutation (`on_transport_event`, `on_tick`, or an
+//!    application-facing method such as `ping`);
+//! 2. drain and execute every [`SwarmAction`] from [`SwarmCore::poll_action`],
+//!    reporting stream-open results back through `on_stream_opened` /
+//!    `on_open_stream_failed`;
+//! 3. repeat action draining until no new actions are produced;
+//! 4. drain application events via [`SwarmCore::poll_event`].
+//!
+//! After a full drain, [`SwarmCore::is_idle`] returns `true`. Treating that as
+//! the handoff point before waiting on external I/O keeps the Sans-I/O state
+//! machine deterministic and avoids leaving protocol bytes buffered inside the
+//! core.
 
 extern crate alloc;
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -131,8 +148,8 @@ pub struct SwarmCore {
     established_peers: BTreeSet<PeerId>,
 
     // --- Output queues ---
-    events: Vec<SwarmEvent>,
-    actions: Vec<SwarmAction>,
+    events: VecDeque<SwarmEvent>,
+    actions: VecDeque<SwarmAction>,
 }
 
 impl SwarmCore {
@@ -162,8 +179,8 @@ impl SwarmCore {
             peer_info: BTreeMap::new(),
             ready_peers: BTreeSet::new(),
             established_peers: BTreeSet::new(),
-            events: Vec::new(),
-            actions: Vec::new(),
+            events: VecDeque::new(),
+            actions: VecDeque::new(),
         }
     }
 
@@ -194,14 +211,54 @@ impl SwarmCore {
     // Egress (driver drains these)
     // -----------------------------------------------------------------------
 
+    /// Returns the next pending driver action, if any.
+    ///
+    /// Polling one item at a time lets custom drivers execute an action and
+    /// immediately feed any resulting mutation back into the core before
+    /// continuing the drain loop.
+    pub fn poll_action(&mut self) -> Option<SwarmAction> {
+        if self.actions.is_empty() {
+            None
+        } else {
+            self.actions.pop_front()
+        }
+    }
+
+    /// Returns the next application-visible event, if any.
+    pub fn poll_event(&mut self) -> Option<SwarmEvent> {
+        if self.events.is_empty() {
+            None
+        } else {
+            self.events.pop_front()
+        }
+    }
+
     /// Drains all buffered actions for the driver to execute.
     pub fn take_actions(&mut self) -> Vec<SwarmAction> {
-        core::mem::take(&mut self.actions)
+        let mut actions = Vec::new();
+        while let Some(action) = self.poll_action() {
+            actions.push(action);
+        }
+        actions
     }
 
     /// Drains all buffered application-visible events.
     pub fn poll_events(&mut self) -> Vec<SwarmEvent> {
-        core::mem::take(&mut self.events)
+        let mut events = Vec::new();
+        while let Some(event) = self.poll_event() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// Returns true when the core has no pending driver actions or
+    /// application-visible events.
+    ///
+    /// Custom Sans-I/O drivers can use this as a cheap assertion that they
+    /// have fully drained the core before waiting on sockets, timers, or
+    /// application input again.
+    pub fn is_idle(&self) -> bool {
+        self.actions.is_empty() && self.events.is_empty()
     }
 
     /// Records a non-fatal error observed by the driver while executing a
@@ -212,7 +269,7 @@ impl SwarmCore {
     /// [`Self::poll_events`]. Used by the driver so transport-level
     /// failures are never silently dropped.
     pub fn record_error(&mut self, error: SwarmRuntimeError) {
-        self.events.push(SwarmEvent::Error(error));
+        self.events.push_back(SwarmEvent::Error(error));
     }
 
     // -----------------------------------------------------------------------
@@ -315,7 +372,7 @@ impl SwarmCore {
         data: Vec<u8>,
     ) -> Result<(), SwarmError> {
         let conn_id = self.require_user_stream_conn(peer_id, stream_id)?;
-        self.actions.push(SwarmAction::SendStream {
+        self.actions.push_back(SwarmAction::SendStream {
             conn_id,
             stream_id,
             data,
@@ -331,7 +388,7 @@ impl SwarmCore {
     ) -> Result<(), SwarmError> {
         let conn_id = self.require_user_stream_conn(peer_id, stream_id)?;
         self.actions
-            .push(SwarmAction::CloseStreamWrite { conn_id, stream_id });
+            .push_back(SwarmAction::CloseStreamWrite { conn_id, stream_id });
         Ok(())
     }
 
@@ -343,14 +400,15 @@ impl SwarmCore {
     ) -> Result<(), SwarmError> {
         let conn_id = self.require_user_stream_conn(peer_id, stream_id)?;
         self.actions
-            .push(SwarmAction::ResetStream { conn_id, stream_id });
+            .push_back(SwarmAction::ResetStream { conn_id, stream_id });
         Ok(())
     }
 
     /// Closes the connection to `peer_id`.
     pub fn disconnect(&mut self, peer_id: &PeerId) -> Result<(), SwarmError> {
         let conn_id = self.require_conn(peer_id)?;
-        self.actions.push(SwarmAction::CloseConnection { conn_id });
+        self.actions
+            .push_back(SwarmAction::CloseConnection { conn_id });
         Ok(())
     }
 
@@ -507,7 +565,7 @@ impl SwarmCore {
         let mut negotiator = MultistreamSelect::dialer(pending.protocol.as_str());
         for output in negotiator.start() {
             if let MultistreamOutput::OutboundData(bytes) = output {
-                self.actions.push(SwarmAction::SendStream {
+                self.actions.push_back(SwarmAction::SendStream {
                     conn_id,
                     stream_id,
                     data: bytes,
@@ -603,7 +661,7 @@ impl SwarmCore {
         conn_id: Option<ConnectionId>,
         detail: impl Into<String>,
     ) {
-        self.events.push(SwarmEvent::Error(SwarmRuntimeError {
+        self.events.push_back(SwarmEvent::Error(SwarmRuntimeError {
             kind,
             peer_id,
             conn_id,
@@ -623,7 +681,7 @@ impl SwarmCore {
         }
 
         self.ready_peers.insert(peer_id.clone());
-        self.events.push(SwarmEvent::PeerReady {
+        self.events.push_back(SwarmEvent::PeerReady {
             peer_id: peer_id.clone(),
             protocols: info.protocols.clone(),
         });
@@ -673,7 +731,7 @@ impl SwarmCore {
             },
         );
         self.actions
-            .push(SwarmAction::OpenStream { conn_id, token });
+            .push_back(SwarmAction::OpenStream { conn_id, token });
         Ok(())
     }
 
@@ -718,7 +776,7 @@ impl SwarmCore {
 
         if is_new {
             self.established_peers.insert(peer_id.clone());
-            self.events.push(SwarmEvent::ConnectionEstablished {
+            self.events.push_back(SwarmEvent::ConnectionEstablished {
                 peer_id: peer_id.clone(),
             });
 
@@ -753,7 +811,7 @@ impl SwarmCore {
             .retain(|(cid, _), _| *cid != old_id);
         self.pending_opens.retain(|_, p| p.conn_id != old_id);
         self.actions
-            .push(SwarmAction::CloseConnection { conn_id: old_id });
+            .push_back(SwarmAction::CloseConnection { conn_id: old_id });
     }
 
     fn upgrade_connection_identity(&mut self, conn_id: ConnectionId, new_peer_id: PeerId) {
@@ -786,7 +844,7 @@ impl SwarmCore {
         self.peer_to_conn.insert(new_peer_id.clone(), conn_id);
         self.established_peers.insert(new_peer_id.clone());
 
-        self.events.push(SwarmEvent::ConnectionEstablished {
+        self.events.push_back(SwarmEvent::ConnectionEstablished {
             peer_id: new_peer_id.clone(),
         });
 
@@ -854,7 +912,7 @@ impl SwarmCore {
 
         for output in outputs {
             if let MultistreamOutput::OutboundData(bytes) = output {
-                self.actions.push(SwarmAction::SendStream {
+                self.actions.push_back(SwarmAction::SendStream {
                     conn_id,
                     stream_id,
                     data: bytes,
@@ -913,7 +971,7 @@ impl SwarmCore {
                 // Responder doesn't expect data; ignore.
             }
             ProtocolKind::User(_) => {
-                self.events.push(SwarmEvent::UserStreamData {
+                self.events.push_back(SwarmEvent::UserStreamData {
                     peer_id,
                     stream_id,
                     data,
@@ -945,7 +1003,7 @@ impl SwarmCore {
             ProtocolKind::IdentifyResponder => {}
             ProtocolKind::User(_) => {
                 self.events
-                    .push(SwarmEvent::UserStreamRemoteWriteClosed { peer_id, stream_id });
+                    .push_back(SwarmEvent::UserStreamRemoteWriteClosed { peer_id, stream_id });
             }
         }
     }
@@ -965,7 +1023,7 @@ impl SwarmCore {
                 }
                 ProtocolKind::User(_) => {
                     self.events
-                        .push(SwarmEvent::UserStreamClosed { peer_id, stream_id });
+                        .push_back(SwarmEvent::UserStreamClosed { peer_id, stream_id });
                 }
             }
         }
@@ -988,7 +1046,8 @@ impl SwarmCore {
                 self.peer_info.remove(&peer_id);
                 self.ready_peers.remove(&peer_id);
                 self.established_peers.remove(&peer_id);
-                self.events.push(SwarmEvent::ConnectionClosed { peer_id });
+                self.events
+                    .push_back(SwarmEvent::ConnectionClosed { peer_id });
             }
         }
 
@@ -1023,7 +1082,7 @@ impl SwarmCore {
         for output in outputs {
             match output {
                 MultistreamOutput::OutboundData(bytes) => {
-                    self.actions.push(SwarmAction::SendStream {
+                    self.actions.push_back(SwarmAction::SendStream {
                         conn_id,
                         stream_id,
                         data: bytes,
@@ -1035,7 +1094,7 @@ impl SwarmCore {
                 MultistreamOutput::NotAvailable => {
                     self.inbound_negotiators.remove(&key);
                     self.actions
-                        .push(SwarmAction::ResetStream { conn_id, stream_id });
+                        .push_back(SwarmAction::ResetStream { conn_id, stream_id });
                     return;
                 }
                 MultistreamOutput::ProtocolError { reason } => {
@@ -1047,7 +1106,7 @@ impl SwarmCore {
                     );
                     self.inbound_negotiators.remove(&key);
                     self.actions
-                        .push(SwarmAction::ResetStream { conn_id, stream_id });
+                        .push_back(SwarmAction::ResetStream { conn_id, stream_id });
                     return;
                 }
             }
@@ -1089,7 +1148,7 @@ impl SwarmCore {
         for output in outputs {
             match output {
                 MultistreamOutput::OutboundData(bytes) => {
-                    self.actions.push(SwarmAction::SendStream {
+                    self.actions.push_back(SwarmAction::SendStream {
                         conn_id,
                         stream_id,
                         data: bytes,
@@ -1107,7 +1166,7 @@ impl SwarmCore {
                     );
                     self.outbound_negotiators.remove(&key);
                     self.actions
-                        .push(SwarmAction::ResetStream { conn_id, stream_id });
+                        .push_back(SwarmAction::ResetStream { conn_id, stream_id });
                     return;
                 }
                 MultistreamOutput::ProtocolError { reason } => {
@@ -1119,7 +1178,7 @@ impl SwarmCore {
                     );
                     self.outbound_negotiators.remove(&key);
                     self.actions
-                        .push(SwarmAction::ResetStream { conn_id, stream_id });
+                        .push_back(SwarmAction::ResetStream { conn_id, stream_id });
                     return;
                 }
             }
@@ -1198,7 +1257,7 @@ impl SwarmCore {
                         format!("identify responder error: {e}"),
                     );
                     self.actions
-                        .push(SwarmAction::ResetStream { conn_id, stream_id });
+                        .push_back(SwarmAction::ResetStream { conn_id, stream_id });
                 }
             }
             return;
@@ -1209,7 +1268,7 @@ impl SwarmCore {
                 (conn_id, stream_id),
                 ProtocolKind::User(protocol.to_string()),
             );
-            self.events.push(SwarmEvent::UserStreamReady {
+            self.events.push_back(SwarmEvent::UserStreamReady {
                 peer_id,
                 stream_id,
                 protocol_id: protocol.to_string(),
@@ -1243,7 +1302,7 @@ impl SwarmCore {
                     );
                     self.stream_owner.remove(&(conn_id, stream_id));
                     self.actions
-                        .push(SwarmAction::ResetStream { conn_id, stream_id });
+                        .push_back(SwarmAction::ResetStream { conn_id, stream_id });
                     return;
                 }
 
@@ -1264,7 +1323,7 @@ impl SwarmCore {
             }
             ProtocolKind::IdentifyResponder => {}
             ProtocolKind::User(protocol_id) => {
-                self.events.push(SwarmEvent::UserStreamReady {
+                self.events.push_back(SwarmEvent::UserStreamReady {
                     peer_id,
                     stream_id,
                     protocol_id,
@@ -1286,7 +1345,7 @@ impl SwarmCore {
                 data,
             } => {
                 if let Some(&conn_id) = self.peer_to_conn.get(peer_id) {
-                    self.actions.push(SwarmAction::SendStream {
+                    self.actions.push_back(SwarmAction::SendStream {
                         conn_id,
                         stream_id,
                         data: data.to_vec(),
@@ -1299,7 +1358,7 @@ impl SwarmCore {
             } => {
                 if let Some(&conn_id) = self.peer_to_conn.get(peer_id) {
                     self.actions
-                        .push(SwarmAction::CloseStreamWrite { conn_id, stream_id });
+                        .push_back(SwarmAction::CloseStreamWrite { conn_id, stream_id });
                 }
             }
             PingAction::ResetStream {
@@ -1308,7 +1367,7 @@ impl SwarmCore {
             } => {
                 if let Some(&conn_id) = self.peer_to_conn.get(peer_id) {
                     self.actions
-                        .push(SwarmAction::ResetStream { conn_id, stream_id });
+                        .push_back(SwarmAction::ResetStream { conn_id, stream_id });
                 }
             }
         }
@@ -1323,7 +1382,7 @@ impl SwarmCore {
                     ref data,
                 } => {
                     if let Some(&conn_id) = self.peer_to_conn.get(peer_id) {
-                        self.actions.push(SwarmAction::SendStream {
+                        self.actions.push_back(SwarmAction::SendStream {
                             conn_id,
                             stream_id,
                             data: data.clone(),
@@ -1336,7 +1395,7 @@ impl SwarmCore {
                 } => {
                     if let Some(&conn_id) = self.peer_to_conn.get(peer_id) {
                         self.actions
-                            .push(SwarmAction::CloseStreamWrite { conn_id, stream_id });
+                            .push_back(SwarmAction::CloseStreamWrite { conn_id, stream_id });
                     }
                 }
             }
@@ -1350,10 +1409,10 @@ impl SwarmCore {
                     peer_id, rtt_ms, ..
                 } => {
                     self.events
-                        .push(SwarmEvent::PingRttMeasured { peer_id, rtt_ms });
+                        .push_back(SwarmEvent::PingRttMeasured { peer_id, rtt_ms });
                 }
                 PingEvent::Timeout { peer_id, .. } => {
-                    self.events.push(SwarmEvent::PingTimeout { peer_id });
+                    self.events.push_back(SwarmEvent::PingTimeout { peer_id });
                 }
                 PingEvent::ProtocolViolation {
                     peer_id, reason, ..
@@ -1373,7 +1432,7 @@ impl SwarmCore {
             match event {
                 IdentifyEvent::Received { peer_id, info } => {
                     self.peer_info.insert(peer_id.clone(), info.clone());
-                    self.events.push(SwarmEvent::IdentifyReceived {
+                    self.events.push_back(SwarmEvent::IdentifyReceived {
                         peer_id: peer_id.clone(),
                         info,
                     });
@@ -1416,6 +1475,28 @@ mod tests {
 
     fn loopback_transport() -> Multiaddr {
         Multiaddr::from_str("/ip4/127.0.0.1/udp/4001/quic-v1").expect("valid multiaddr")
+    }
+
+    #[test]
+    fn is_idle_reflects_pending_actions_and_events() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
+        let conn_id = ConnectionId::new(1);
+
+        assert!(core.is_idle());
+
+        core.on_transport_event(
+            TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+            0,
+        );
+        assert!(!core.is_idle());
+
+        let _ = core.take_actions();
+        let _ = core.poll_events();
+        assert!(core.is_idle());
     }
 
     #[test]

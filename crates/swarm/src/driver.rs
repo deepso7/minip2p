@@ -268,9 +268,8 @@ impl<T: Transport> Swarm<T> {
 
         // Flush all actions, capturing the stream id allocated for this
         // user-protocol open. We inspect actions as we execute them.
-        let actions = self.core.take_actions();
         let mut allocated_stream: Option<StreamId> = None;
-        for action in actions {
+        while let Some(action) = self.core.poll_action() {
             self.dispatch_action(action, &mut allocated_stream);
         }
 
@@ -351,7 +350,11 @@ impl<T: Transport> Swarm<T> {
         self.flush_actions();
 
         // 4. Return the application's events.
-        Ok(self.core.poll_events())
+        let mut events = Vec::new();
+        while let Some(event) = self.core.poll_event() {
+            events.push(event);
+        }
+        Ok(events)
     }
 
     /// Returns the next swarm event, sleeping internally until one arrives
@@ -426,14 +429,8 @@ impl<T: Transport> Swarm<T> {
     /// reported back).
     fn flush_actions(&mut self) {
         let mut allocated: Option<StreamId> = None;
-        loop {
-            let actions = self.core.take_actions();
-            if actions.is_empty() {
-                break;
-            }
-            for action in actions {
-                self.dispatch_action(action, &mut allocated);
-            }
+        while let Some(action) = self.core.poll_action() {
+            self.dispatch_action(action, &mut allocated);
         }
     }
 
