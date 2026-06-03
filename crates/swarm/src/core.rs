@@ -32,7 +32,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId, SansIo};
+use minip2p_core::{Multiaddr, PeerId, SansIoProtocol};
 use minip2p_identify::{
     IDENTIFY_PROTOCOL_ID, IdentifyAction, IdentifyConfig, IdentifyEvent, IdentifyMessage,
     IdentifyProtocol,
@@ -1427,7 +1427,7 @@ impl SwarmCore {
     }
 }
 
-impl SansIo for SwarmCore {
+impl SansIoProtocol for SwarmCore {
     type Input = SwarmInput;
     type Output = SwarmOutput;
 
@@ -1497,8 +1497,8 @@ mod tests {
     }
 
     #[test]
-    fn swarm_core_implements_common_sans_io_trait() {
-        fn drive_idle<S: SansIo<Input = SwarmInput, Output = SwarmOutput>>(engine: &mut S) {
+    fn swarm_core_implements_common_sans_io_protocol_trait() {
+        fn drive_idle<S: SansIoProtocol<Input = SwarmInput, Output = SwarmOutput>>(engine: &mut S) {
             engine.handle_input(SwarmInput::Tick { now_ms: 0 });
             while engine.poll_output().is_some() {}
             assert!(engine.is_idle());

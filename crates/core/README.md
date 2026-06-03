@@ -8,7 +8,7 @@ This crate focuses on typed address handling and peer-qualified endpoint types.
 
 - `Multiaddr` parsing/formatting for a minimal protocol set.
 - `PeerAddr` helper for validated `transport + peer id` addresses with terminal `/p2p/<peer-id>`.
-- `SansIo` trait for poll-driven, runtime-agnostic protocol engines.
+- `SansIoProtocol` trait for poll-driven, runtime-agnostic protocol engines.
 - Typed error model with actionable parse context.
 - `no_std` support (`alloc`-based), with `std` enabled by default.
 
