@@ -36,7 +36,7 @@ Orchestration layer that composes minip2p's protocol state machines into a singl
 ## Sans-I/O usage
 
 ```rust
-use minip2p_swarm::{SwarmCore, SwarmEvent};
+use minip2p_swarm::{SwarmCore, SwarmInput, SwarmOutput};
 use minip2p_identify::IdentifyConfig;
 use minip2p_ping::PingConfig;
 
@@ -44,21 +44,26 @@ let mut core = SwarmCore::new(identify_config, PingConfig::default());
 core.add_user_protocol("/myapp/1.0.0");
 
 // Drive it:
-// core.on_transport_event(event, now_ms);
-// core.on_tick(now_ms);
-// while let Some(action) = core.poll_action() { execute(action); }
-// while let Some(event) = core.poll_event() { ... }
+// core.handle_input(SwarmInput::Transport { event, now_ms });
+// core.handle_input(SwarmInput::Tick { now_ms });
+// while let Some(output) = core.poll_output() {
+//     match output {
+//         SwarmOutput::Action(action) => execute(action),
+//         SwarmOutput::Event(event) => { /* hand to app */ }
+//     }
+// }
 ```
 
 ### Driver loop contract
 
 The core is deterministic when callers use a simple mutate-then-drain loop:
 
-1. Feed exactly one external input into the core: a `TransportEvent`, a timer tick via `on_tick(now_ms)`, or one application intent such as `ping`, `open_user_stream`, or `send_user_stream`.
-2. Drain `core.poll_action()` and execute each `SwarmAction` against your transport.
-3. If executing an action feeds a result back into the core, such as `on_stream_opened` or `on_open_stream_failed`, drain actions again until no new actions are produced.
-4. Drain `core.poll_event()` and hand those events to the application.
-5. Before waiting on I/O again, `core.is_idle()` should be true.
+1. Feed exactly one external input into the core with `core.handle_input(...)`, or call one application intent such as `ping`, `open_user_stream`, or `send_user_stream`.
+2. Drain `core.poll_output()`.
+3. Execute each `SwarmOutput::Action` against your transport.
+4. Feed driver results back with `SwarmInput::StreamOpened`, `SwarmInput::OpenStreamFailed`, or `SwarmInput::RuntimeError`.
+5. Hand each `SwarmOutput::Event` to the application.
+6. Before waiting on I/O again, `core.is_idle()` should be true.
 
 That shape mirrors the std `Swarm<T>` driver while keeping sockets, clocks, sleeps, async runtimes, and allocation policy outside the Sans-I/O core.
 

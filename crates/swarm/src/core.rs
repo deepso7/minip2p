@@ -13,13 +13,11 @@
 //!
 //! External drivers should follow a drain loop:
 //!
-//! 1. perform one mutation (`on_transport_event`, `on_tick`, or an
-//!    application-facing method such as `ping`);
-//! 2. drain and execute every [`SwarmAction`] from [`SwarmCore::poll_action`],
-//!    reporting stream-open results back through `on_stream_opened` /
-//!    `on_open_stream_failed`;
-//! 3. repeat action draining until no new actions are produced;
-//! 4. drain application events via [`SwarmCore::poll_event`].
+//! 1. perform one mutation (`handle_input` or an application-facing method
+//!    such as `ping`);
+//! 2. drain [`SwarmOutput`] values from [`SwarmCore::poll_output`], executing
+//!    each action and feeding driver results back through `handle_input`;
+//! 3. repeat output draining until no new outputs are produced.
 //!
 //! After a full drain, [`SwarmCore::is_idle`] returns `true`. Treating that as
 //! the handoff point before waiting on external I/O keeps the Sans-I/O state
@@ -46,7 +44,8 @@ use minip2p_ping::{
 use minip2p_transport::{ConnectionId, StreamId, TransportEvent};
 
 use crate::events::{
-    OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError,
+    OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput,
+    SwarmRuntimeError,
 };
 
 // ---------------------------------------------------------------------------
@@ -211,6 +210,17 @@ impl SwarmCore {
     // Egress (driver drains these)
     // -----------------------------------------------------------------------
 
+    /// Returns the next core output, if any.
+    ///
+    /// Actions are prioritized over application events because executing an
+    /// action can feed more input back into the core. Once no actions remain,
+    /// events are yielded in FIFO order.
+    pub fn poll_output(&mut self) -> Option<SwarmOutput> {
+        self.poll_action()
+            .map(SwarmOutput::Action)
+            .or_else(|| self.poll_event().map(SwarmOutput::Event))
+    }
+
     /// Returns the next pending driver action, if any.
     ///
     /// Polling one item at a time lets custom drivers execute an action and
@@ -259,6 +269,26 @@ impl SwarmCore {
     /// application input again.
     pub fn is_idle(&self) -> bool {
         self.actions.is_empty() && self.events.is_empty()
+    }
+
+    /// Feeds one external input into the core.
+    pub fn handle_input(&mut self, input: SwarmInput) {
+        match input {
+            SwarmInput::Transport { event, now_ms } => self.on_transport_event(event, now_ms),
+            SwarmInput::Tick { now_ms } => self.on_tick(now_ms),
+            SwarmInput::StreamOpened {
+                conn_id,
+                stream_id,
+                token,
+                now_ms,
+            } => self.on_stream_opened(conn_id, stream_id, token, now_ms),
+            SwarmInput::OpenStreamFailed {
+                token,
+                reason,
+                now_ms,
+            } => self.on_open_stream_failed(token, reason, now_ms),
+            SwarmInput::RuntimeError(error) => self.record_error(error),
+        }
     }
 
     /// Records a non-fatal error observed by the driver while executing a
@@ -530,6 +560,9 @@ impl SwarmCore {
     /// The driver calls this after `transport.open_stream(conn_id)`
     /// succeeds. The core starts multistream-select on the stream and emits
     /// the outbound handshake as `SendStream` actions.
+    ///
+    /// Prefer [`SwarmCore::handle_input`] with [`SwarmInput::StreamOpened`]
+    /// in new drivers.
     pub fn on_stream_opened(
         &mut self,
         conn_id: ConnectionId,
@@ -583,6 +616,9 @@ impl SwarmCore {
     }
 
     /// Reports that an [`SwarmAction::OpenStream`] failed at the driver.
+    ///
+    /// Prefer [`SwarmCore::handle_input`] with
+    /// [`SwarmInput::OpenStreamFailed`] in new drivers.
     pub fn on_open_stream_failed(&mut self, token: OpenStreamToken, reason: String, _now_ms: u64) {
         let pending = self.pending_opens.remove(&token);
         let (peer_id, conn_id, detail) = match pending {

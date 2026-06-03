@@ -14,7 +14,9 @@ use minip2p_ping::{PING_PAYLOAD_LEN, PingConfig};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
 use crate::core::SwarmCore;
-use crate::events::{SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError};
+use crate::events::{
+    SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput, SwarmRuntimeError,
+};
 
 /// Sleep cadence when [`Swarm::poll_next`] idles.
 ///
@@ -269,8 +271,13 @@ impl<T: Transport> Swarm<T> {
         // Flush all actions, capturing the stream id allocated for this
         // user-protocol open. We inspect actions as we execute them.
         let mut allocated_stream: Option<StreamId> = None;
-        while let Some(action) = self.core.poll_action() {
-            self.dispatch_action(action, &mut allocated_stream);
+        while let Some(output) = self.core.poll_output() {
+            match output {
+                SwarmOutput::Action(action) => {
+                    self.dispatch_action(action, &mut allocated_stream);
+                }
+                SwarmOutput::Event(event) => self.event_buffer.push_back(event),
+            }
         }
 
         // Any cascade from dispatch_action (e.g. MSS header SendStream) is
@@ -340,19 +347,23 @@ impl<T: Transport> Swarm<T> {
         // 1. Feed transport events to the core.
         let events = self.transport.poll()?;
         for event in events {
-            self.core.on_transport_event(event, now_ms);
+            self.core
+                .handle_input(SwarmInput::Transport { event, now_ms });
         }
 
         // 2. Advance timers.
-        self.core.on_tick(now_ms);
+        self.core.handle_input(SwarmInput::Tick { now_ms });
 
         // 3. Execute all queued actions (may cascade -- see flush_actions).
         self.flush_actions();
 
         // 4. Return the application's events.
-        let mut events = Vec::new();
-        while let Some(event) = self.core.poll_event() {
-            events.push(event);
+        let mut events: Vec<SwarmEvent> = self.event_buffer.drain(..).collect();
+        while let Some(output) = self.core.poll_output() {
+            match output {
+                SwarmOutput::Action(action) => self.dispatch_action(action, &mut None),
+                SwarmOutput::Event(event) => events.push(event),
+            }
         }
         Ok(events)
     }
@@ -429,8 +440,11 @@ impl<T: Transport> Swarm<T> {
     /// reported back).
     fn flush_actions(&mut self) {
         let mut allocated: Option<StreamId> = None;
-        while let Some(action) = self.core.poll_action() {
-            self.dispatch_action(action, &mut allocated);
+        while let Some(output) = self.core.poll_output() {
+            match output {
+                SwarmOutput::Action(action) => self.dispatch_action(action, &mut allocated),
+                SwarmOutput::Event(event) => self.event_buffer.push_back(event),
+            }
         }
     }
 
@@ -448,13 +462,20 @@ impl<T: Transport> Swarm<T> {
             {
                 Ok(stream_id) => {
                     *captured_stream_id = Some(stream_id);
-                    self.core
-                        .on_stream_opened(conn_id, stream_id, token, self.now_ms());
+                    self.core.handle_input(SwarmInput::StreamOpened {
+                        conn_id,
+                        stream_id,
+                        token,
+                        now_ms: self.now_ms(),
+                    });
                 }
                 Err(e) => {
                     let reason = format!("{e}");
-                    self.core
-                        .on_open_stream_failed(token, reason, self.now_ms());
+                    self.core.handle_input(SwarmInput::OpenStreamFailed {
+                        token,
+                        reason,
+                        now_ms: self.now_ms(),
+                    });
                 }
             },
             SwarmAction::SendStream {
@@ -463,44 +484,46 @@ impl<T: Transport> Swarm<T> {
                 data,
             } => {
                 if let Err(e) = self.transport.send_stream(conn_id, stream_id, data) {
-                    self.core.record_error(runtime_error(
-                        SwarmErrorKind::Transport,
-                        Some(conn_id),
-                        format!(
-                            "send_stream to connection {conn_id} stream {stream_id} failed: {e}"
-                        ),
-                    ));
+                    self.core
+                        .handle_input(SwarmInput::RuntimeError(runtime_error(
+                            SwarmErrorKind::Transport,
+                            Some(conn_id),
+                            format!(
+                                "send_stream to connection {conn_id} stream {stream_id} failed: {e}"
+                            ),
+                        )));
                 }
             }
             SwarmAction::CloseStreamWrite { conn_id, stream_id } => {
                 if let Err(e) = self.transport.close_stream_write(conn_id, stream_id) {
-                    self.core.record_error(runtime_error(
+                    self.core.handle_input(SwarmInput::RuntimeError(runtime_error(
                         SwarmErrorKind::Transport,
                         Some(conn_id),
                         format!(
                             "close_stream_write on connection {conn_id} stream {stream_id} failed: {e}"
                         ),
-                    ));
+                    )));
                 }
             }
             SwarmAction::ResetStream { conn_id, stream_id } => {
                 if let Err(e) = self.transport.reset_stream(conn_id, stream_id) {
-                    self.core.record_error(runtime_error(
+                    self.core.handle_input(SwarmInput::RuntimeError(runtime_error(
                         SwarmErrorKind::Transport,
                         Some(conn_id),
                         format!(
                             "reset_stream on connection {conn_id} stream {stream_id} failed: {e}"
                         ),
-                    ));
+                    )));
                 }
             }
             SwarmAction::CloseConnection { conn_id } => {
                 if let Err(e) = self.transport.close(conn_id) {
-                    self.core.record_error(runtime_error(
-                        SwarmErrorKind::Transport,
-                        Some(conn_id),
-                        format!("close on connection {conn_id} failed: {e}"),
-                    ));
+                    self.core
+                        .handle_input(SwarmInput::RuntimeError(runtime_error(
+                            SwarmErrorKind::Transport,
+                            Some(conn_id),
+                            format!("close on connection {conn_id} failed: {e}"),
+                        )));
                 }
             }
         }

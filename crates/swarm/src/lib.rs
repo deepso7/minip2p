@@ -36,7 +36,8 @@ mod driver;
 
 pub use crate::core::SwarmCore;
 pub use crate::events::{
-    OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmRuntimeError,
+    OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput,
+    SwarmRuntimeError,
 };
 
 #[cfg(feature = "std")]
