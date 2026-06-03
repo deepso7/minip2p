@@ -282,7 +282,14 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     match outcome {
         HolePunchOutcome::DirectConnected(peer_id) => {
             println!("[{role}] direct-connected peer={peer_id} (hole-punch success)");
-            ping_and_exit(&mut swarm, role, peer_id, deadline)
+            ping_and_exit(
+                &mut swarm,
+                role,
+                peer_id,
+                &relay_peer_id,
+                bridge_stream,
+                deadline,
+            )
         }
         HolePunchOutcome::InboundConnectionSeen => {
             // The address heuristic fired before Swarm surfaced the verified
@@ -302,7 +309,14 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
             match verified {
                 Some(SwarmEvent::ConnectionEstablished { peer_id }) => {
                     println!("[{role}] direct-connected peer={peer_id} (mTLS verified)");
-                    ping_and_exit(&mut swarm, role, peer_id, deadline)
+                    ping_and_exit(
+                        &mut swarm,
+                        role,
+                        peer_id,
+                        &relay_peer_id,
+                        bridge_stream,
+                        deadline,
+                    )
                 }
                 _ => {
                     println!("[{role}] grace-elapsed before mTLS identity -> relay-ping fallback");
@@ -542,7 +556,14 @@ pub fn run_dial(
     // --- 6. Direct ping or relay-ping fallback -----------------------------
     if punched.is_some() {
         println!("[{role}] direct-connected peer={target} (hole-punch success)");
-        ping_and_exit(&mut swarm, role, target, deadline)
+        ping_and_exit(
+            &mut swarm,
+            role,
+            target,
+            &relay_peer_id,
+            bridge_stream,
+            deadline,
+        )
     } else {
         println!("[{role}] hole-punch-timeout reason=deadline elapsed -> relay-ping fallback");
         let payload = random_bytes(RELAY_PING_LEN);
@@ -1174,6 +1195,8 @@ fn ping_and_exit(
     swarm: &mut Swarm<QuicEndpoint>,
     role: &str,
     peer_id: PeerId,
+    relay_peer_id: &PeerId,
+    bridge_stream: StreamId,
     deadline: Instant,
 ) -> Result<(), Box<dyn Error>> {
     swarm.ping(&peer_id).map_err(|e| format!("ping: {e}"))?;
@@ -1187,7 +1210,51 @@ fn ping_and_exit(
     let SwarmEvent::PingRttMeasured { rtt_ms, .. } = ev else {
         unreachable!()
     };
+    println!("[{role}] ping-direct peer={peer_id} rtt={rtt_ms}ms");
+    close_relay_bridge_after_direct_success(swarm, role, relay_peer_id, bridge_stream)?;
     println!("[{role}] ping-direct peer={peer_id} rtt={rtt_ms}ms -- done");
+    Ok(())
+}
+
+/// Once direct QUIC is proven, the relayed bridge is no longer part of the
+/// data path. Half-close our write side so the relay can retire the circuit
+/// promptly instead of reporting a later idle timeout.
+fn close_relay_bridge_after_direct_success(
+    swarm: &mut Swarm<QuicEndpoint>,
+    role: &str,
+    relay_peer_id: &PeerId,
+    bridge_stream: StreamId,
+) -> Result<(), Box<dyn Error>> {
+    println!("[{role}] bridge-close stream={bridge_stream} reason=direct-path-ready");
+    match swarm.close_user_stream_write(relay_peer_id, bridge_stream) {
+        Ok(()) => {}
+        Err(e) => {
+            // The remote side may have already closed the relayed stream after
+            // its own direct success. Treat that as terminally clean for this
+            // CLI; the direct ping above is the correctness signal.
+            println!("[{role}] bridge-close-skipped stream={bridge_stream} reason={e}");
+            return Ok(());
+        }
+    }
+
+    // Give the close action one short poll window to flush and surface any
+    // immediate close event without delaying the successful CLI path.
+    let drain_deadline = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < drain_deadline {
+        let events = swarm
+            .poll()
+            .map_err(|e| format!("bridge close poll: {e}"))?;
+        if events.is_empty() {
+            break;
+        }
+        for ev in events {
+            print_event(role, &ev);
+            if is_bridge_closed_event(&ev, bridge_stream) {
+                return Ok(());
+            }
+        }
+    }
+
     Ok(())
 }
 
