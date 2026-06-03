@@ -31,6 +31,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::convert::Infallible;
 
 use minip2p_core::{Multiaddr, PeerId, SansIoProtocol};
 use minip2p_identify::{
@@ -1430,9 +1431,11 @@ impl SwarmCore {
 impl SansIoProtocol for SwarmCore {
     type Input = SwarmInput;
     type Output = SwarmOutput;
+    type Error = Infallible;
 
-    fn handle_input(&mut self, input: Self::Input) {
+    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
         Self::handle_input(self, input);
+        Ok(())
     }
 
     fn poll_output(&mut self) -> Option<Self::Output> {
@@ -1499,7 +1502,7 @@ mod tests {
     #[test]
     fn swarm_core_implements_common_sans_io_protocol_trait() {
         fn drive_idle<S: SansIoProtocol<Input = SwarmInput, Output = SwarmOutput>>(engine: &mut S) {
-            engine.handle_input(SwarmInput::Tick { now_ms: 0 });
+            let _ = engine.handle_input(SwarmInput::Tick { now_ms: 0 });
             while engine.poll_output().is_some() {}
             assert!(engine.is_idle());
         }

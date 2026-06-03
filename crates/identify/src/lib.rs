@@ -12,12 +12,12 @@ extern crate alloc;
 
 mod message;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId, VarintError, read_uvarint, write_uvarint};
+use minip2p_core::{Multiaddr, PeerId, SansIoProtocol, VarintError, read_uvarint, write_uvarint};
 use minip2p_transport::StreamId;
 use thiserror::Error;
 
@@ -90,6 +90,52 @@ pub enum IdentifyEvent {
     },
 }
 
+/// Inputs accepted by [`IdentifyProtocol`] when driven through
+/// [`SansIoProtocol`].
+#[derive(Clone, Debug)]
+pub enum IdentifyInput {
+    /// Register a stream where we send our identify info.
+    RegisterOutboundStream {
+        peer_id: PeerId,
+        stream_id: StreamId,
+        observed_addr: Option<Multiaddr>,
+        listen_addrs: Vec<Multiaddr>,
+    },
+    /// Register a stream where we receive identify info.
+    RegisterInboundStream {
+        peer_id: PeerId,
+        stream_id: StreamId,
+    },
+    /// Received stream data.
+    StreamData {
+        peer_id: PeerId,
+        stream_id: StreamId,
+        data: Vec<u8>,
+    },
+    /// The remote closed its write side.
+    StreamRemoteWriteClosed {
+        peer_id: PeerId,
+        stream_id: StreamId,
+    },
+    /// The stream fully closed.
+    StreamClosed {
+        peer_id: PeerId,
+        stream_id: StreamId,
+    },
+    /// Remove all state for a peer.
+    RemovePeer { peer_id: PeerId },
+}
+
+/// Outputs produced by [`IdentifyProtocol`] when driven through
+/// [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IdentifyOutput {
+    /// Command the host must execute.
+    Action(IdentifyAction),
+    /// Application/protocol event.
+    Event(IdentifyEvent),
+}
+
 /// Errors returned by identify protocol methods.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum IdentifyError {
@@ -129,6 +175,8 @@ pub struct IdentifyProtocol {
     peers: BTreeMap<PeerId, PeerIdentifyState>,
     /// Buffered events for the host to poll.
     events: Vec<IdentifyEvent>,
+    /// Actions buffered for [`SansIoProtocol::poll_output`].
+    actions: VecDeque<IdentifyAction>,
     /// Local identify info used when responding.
     config: IdentifyConfig,
 }
@@ -139,6 +187,7 @@ impl IdentifyProtocol {
         Self {
             peers: BTreeMap::new(),
             events: Vec::new(),
+            actions: VecDeque::new(),
             config,
         }
     }
@@ -358,6 +407,66 @@ impl IdentifyProtocol {
     }
 }
 
+impl SansIoProtocol for IdentifyProtocol {
+    type Input = IdentifyInput;
+    type Output = IdentifyOutput;
+    type Error = IdentifyError;
+
+    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
+        match input {
+            IdentifyInput::RegisterOutboundStream {
+                peer_id,
+                stream_id,
+                observed_addr,
+                listen_addrs,
+            } => {
+                let actions = self.register_outbound_stream(
+                    peer_id,
+                    stream_id,
+                    observed_addr,
+                    &listen_addrs,
+                )?;
+                self.actions.extend(actions);
+            }
+            IdentifyInput::RegisterInboundStream { peer_id, stream_id } => {
+                self.register_inbound_stream(peer_id, stream_id);
+            }
+            IdentifyInput::StreamData {
+                peer_id,
+                stream_id,
+                data,
+            } => {
+                let actions = self.on_stream_data(peer_id, stream_id, data);
+                self.actions.extend(actions);
+            }
+            IdentifyInput::StreamRemoteWriteClosed { peer_id, stream_id } => {
+                let actions = self.on_stream_remote_write_closed(peer_id, stream_id);
+                self.actions.extend(actions);
+            }
+            IdentifyInput::StreamClosed { peer_id, stream_id } => {
+                self.on_stream_closed(peer_id, stream_id);
+            }
+            IdentifyInput::RemovePeer { peer_id } => self.remove_peer(&peer_id),
+        }
+        Ok(())
+    }
+
+    fn poll_output(&mut self) -> Option<Self::Output> {
+        if let Some(action) = self.actions.pop_front() {
+            return Some(IdentifyOutput::Action(action));
+        }
+        if self.events.is_empty() {
+            None
+        } else {
+            Some(IdentifyOutput::Event(self.events.remove(0)))
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.actions.is_empty() && self.events.is_empty()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Wire framing helpers
 // ---------------------------------------------------------------------------
@@ -413,6 +522,39 @@ mod tests {
     fn sample_peer() -> PeerId {
         // Deterministic peer id so test output is stable across runs.
         PeerId::from_public_key_protobuf(b"test-fixture-identify-lib")
+    }
+
+    #[test]
+    fn identify_protocol_implements_sans_io_protocol() {
+        let mut identify = IdentifyProtocol::new(sample_config());
+        let peer = sample_peer();
+        let stream_id = StreamId::new(1);
+
+        identify
+            .handle_input(IdentifyInput::RegisterOutboundStream {
+                peer_id: peer.clone(),
+                stream_id,
+                observed_addr: None,
+                listen_addrs: Vec::new(),
+            })
+            .expect("register outbound");
+
+        assert!(matches!(
+            identify.poll_output(),
+            Some(IdentifyOutput::Action(IdentifyAction::Send {
+                peer_id: p,
+                stream_id: sid,
+                data,
+            })) if p == peer && sid == stream_id && !data.is_empty()
+        ));
+        assert!(matches!(
+            identify.poll_output(),
+            Some(IdentifyOutput::Action(IdentifyAction::CloseStreamWrite {
+                peer_id: p,
+                stream_id: sid,
+            })) if p == peer && sid == stream_id
+        ));
+        assert!(identify.is_idle());
     }
 
     #[test]

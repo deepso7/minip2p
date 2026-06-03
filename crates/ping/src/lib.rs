@@ -7,13 +7,14 @@
 
 extern crate alloc;
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use minip2p_core::PeerId;
+use minip2p_core::SansIoProtocol;
 use minip2p_transport::StreamId;
 use thiserror::Error;
 
@@ -102,6 +103,59 @@ pub enum PingEvent {
     },
 }
 
+/// Inputs accepted by [`PingProtocol`] when driven through
+/// [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PingInput {
+    /// Register a negotiated outbound ping stream.
+    RegisterOutboundStream {
+        peer_id: PeerId,
+        stream_id: StreamId,
+    },
+    /// Register a negotiated inbound ping stream.
+    RegisterInboundStream {
+        peer_id: PeerId,
+        stream_id: StreamId,
+    },
+    /// Send one ping payload on the outbound stream.
+    SendPing {
+        peer_id: PeerId,
+        payload: [u8; PING_PAYLOAD_LEN],
+        now_ms: u64,
+    },
+    /// Received stream data.
+    StreamData {
+        peer_id: PeerId,
+        stream_id: StreamId,
+        data: Vec<u8>,
+        now_ms: u64,
+    },
+    /// The remote closed its write side.
+    StreamRemoteWriteClosed {
+        peer_id: PeerId,
+        stream_id: StreamId,
+    },
+    /// The stream fully closed.
+    StreamClosed {
+        peer_id: PeerId,
+        stream_id: StreamId,
+    },
+    /// Remove all state for a peer.
+    RemovePeer { peer_id: PeerId },
+    /// Time advanced.
+    Tick { now_ms: u64 },
+}
+
+/// Outputs produced by [`PingProtocol`] when driven through
+/// [`SansIoProtocol`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PingOutput {
+    /// Command the host must execute.
+    Action(PingAction),
+    /// Application/protocol event.
+    Event(PingEvent),
+}
+
 /// Errors returned by ping protocol operations.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum PingError {
@@ -149,6 +203,8 @@ pub struct PingProtocol {
     peers: BTreeMap<PeerId, PeerPingState>,
     /// Events buffered until the next `poll_events` call.
     pending_events: Vec<PingEvent>,
+    /// Actions buffered for [`SansIoProtocol::poll_output`].
+    pending_actions: VecDeque<PingAction>,
     /// Protocol configuration.
     config: PingConfig,
 }
@@ -165,6 +221,7 @@ impl PingProtocol {
         Self {
             peers: BTreeMap::new(),
             pending_events: Vec::new(),
+            pending_actions: VecDeque::new(),
             config,
         }
     }
@@ -569,6 +626,69 @@ impl PingProtocol {
     }
 }
 
+impl SansIoProtocol for PingProtocol {
+    type Input = PingInput;
+    type Output = PingOutput;
+    type Error = PingError;
+
+    fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
+        match input {
+            PingInput::RegisterOutboundStream { peer_id, stream_id } => {
+                self.register_outbound_stream(peer_id, stream_id)?;
+            }
+            PingInput::RegisterInboundStream { peer_id, stream_id } => {
+                let actions = self.register_inbound_stream(peer_id, stream_id);
+                self.pending_actions.extend(actions);
+            }
+            PingInput::SendPing {
+                peer_id,
+                payload,
+                now_ms,
+            } => {
+                let action = self.send_ping(&peer_id, &payload, now_ms)?;
+                self.pending_actions.push_back(action);
+            }
+            PingInput::StreamData {
+                peer_id,
+                stream_id,
+                data,
+                now_ms,
+            } => {
+                let actions = self.on_stream_data(&peer_id, stream_id, &data, now_ms);
+                self.pending_actions.extend(actions);
+            }
+            PingInput::StreamRemoteWriteClosed { peer_id, stream_id } => {
+                let actions = self.on_stream_remote_write_closed(&peer_id, stream_id);
+                self.pending_actions.extend(actions);
+            }
+            PingInput::StreamClosed { peer_id, stream_id } => {
+                self.on_stream_closed(&peer_id, stream_id);
+            }
+            PingInput::RemovePeer { peer_id } => self.remove_peer(&peer_id),
+            PingInput::Tick { now_ms } => {
+                let actions = self.on_tick(now_ms);
+                self.pending_actions.extend(actions);
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_output(&mut self) -> Option<Self::Output> {
+        if let Some(action) = self.pending_actions.pop_front() {
+            return Some(PingOutput::Action(action));
+        }
+        if self.pending_events.is_empty() {
+            None
+        } else {
+            Some(PingOutput::Event(self.pending_events.remove(0)))
+        }
+    }
+
+    fn is_idle(&self) -> bool {
+        self.pending_actions.is_empty() && self.pending_events.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::str::FromStr;
@@ -581,6 +701,47 @@ mod tests {
 
     fn test_peer() -> PeerId {
         peer("QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N")
+    }
+
+    #[test]
+    fn ping_protocol_implements_sans_io_protocol() {
+        let mut ping = PingProtocol::default();
+        let peer = test_peer();
+        let stream_id = StreamId::new(1);
+
+        ping.handle_input(PingInput::RegisterInboundStream {
+            peer_id: peer.clone(),
+            stream_id,
+        })
+        .expect("register inbound");
+
+        let mut payload = [0u8; PING_PAYLOAD_LEN];
+        payload[0] = 7;
+        ping.handle_input(PingInput::StreamData {
+            peer_id: peer.clone(),
+            stream_id,
+            data: payload.to_vec(),
+            now_ms: 10,
+        })
+        .expect("stream data");
+
+        assert!(matches!(
+            ping.poll_output(),
+            Some(PingOutput::Action(PingAction::Send {
+                peer_id: p,
+                stream_id: sid,
+                data,
+            })) if p == peer && sid == stream_id && data == payload
+        ));
+        assert!(!ping.is_idle());
+        assert!(matches!(
+            ping.poll_output(),
+            Some(PingOutput::Event(PingEvent::InboundStreamAccepted {
+                peer_id: p,
+                stream_id: sid,
+            })) if p == peer && sid == stream_id
+        ));
+        assert!(ping.is_idle());
     }
 
     #[test]
