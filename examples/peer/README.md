@@ -109,9 +109,9 @@ cargo run -p minip2p-peer -- listen \
     --relay <relay-peer-addr> \
     --autonat <autonat-peer-addr> \
     --key ./peer-b.key
-# [relay-listen] listen-addr=/ip4/0.0.0.0/udp/52134/quic-v1/p2p/12D3KooW... (A)
-# [relay-listen] listen-addr=/ip6/::/udp/52135/quic-v1/p2p/12D3KooW... (A)
-# [relay-listen] us=12D3KooW... (A)
+# [relay-listen] listen-addr=/ip4/0.0.0.0/udp/52134/quic-v1/p2p/12D3KooW... (B)
+# [relay-listen] listen-addr=/ip6/::/udp/52135/quic-v1/p2p/12D3KooW... (B)
+# [relay-listen] us=12D3KooW... (B)
 # [relay-listen] autonat-dialing /ip4/.../p2p/12D3KooW...
 # [relay-listen] autonat-public addrs=1
 # [relay-listen] dcutr-candidates [/ip4/.../udp/.../quic-v1,/ip4/127.0.0.1/udp/52134/quic-v1]
@@ -119,13 +119,13 @@ cargo run -p minip2p-peer -- listen \
 # [relay-listen] connected peer=12D3KooW... (relay)
 # [relay-listen] reserved-on-relay
 # [relay-listen] incoming-circuit via-relay stream=...
-# [relay-listen] stop-connect-from peer=12D3KooW... (B)
+# [relay-listen] stop-connect-from peer=12D3KooW... (A)
 # [relay-listen] dcutr-connect-received addrs=1
 # [relay-listen] dcutr-sync-received -> holepunching
 # [relay-listen] remote-dcutr-candidates [/ip4/.../udp/.../quic-v1]
-# [relay-listen] direct-connected peer=12D3KooW... (B) (hole-punch success)
+# [relay-listen] direct-connected peer=12D3KooW... (A) (hole-punch success)
 # [relay-listen] bridge-close stream=... reason=direct-path-ready
-# [relay-listen] ping-direct peer=12D3KooW... (B) rtt=12ms -- done
+# [relay-listen] ping-direct peer=12D3KooW... (A) rtt=12ms -- done
 ```
 
 Peer A (dialer), run while B is still alive:
@@ -145,7 +145,7 @@ cargo run -p minip2p-peer -- dial \
 # [relay-dial] bridge-established via-relay
 # [relay-dial] dcutr-dialnow addrs=1 rtt=N ms
 # [relay-dial] remote-dcutr-candidates [...]
-# [relay-dial] direct-dial-attempt /ip4/.../p2p/12D3KooW... (A)
+# [relay-dial] direct-dial-attempt /ip4/.../p2p/12D3KooW... (B)
 # [relay-dial] direct-connected peer=... (hole-punch success)
 # [relay-dial] bridge-close stream=... reason=direct-path-ready
 # [relay-dial] ping-direct peer=... rtt=Nms -- done
@@ -174,7 +174,7 @@ cargo run -p minip2p-peer -- dial \
 
 If you have a known UDP port-forward, add one or more manual
 `--external-addr /ip4/<public-ip>/udp/<port>/quic-v1` candidates. Manual
-candidates are advertised before the bound-socket candidate and validated by
+candidates are advertised before observed/listen candidates and validated by
 AutoNAT when `--autonat` is present.
 
 If no manual/observed/non-wildcard candidate exists, the peers still exercise

@@ -25,23 +25,19 @@ No async runtime required. The host drives the transport by calling `poll()`.
 
 ```rust
 use minip2p_identity::Ed25519Keypair;
-use minip2p_quic::{QuicEndpoint, QuicNodeConfig};
+use minip2p_quic::{QuicNodeConfig, QuicTransport};
 use minip2p_transport::Transport;
 
 let listener_key = Ed25519Keypair::generate();
 let listener_cfg = QuicNodeConfig::new(listener_key.clone());
-let mut listener = QuicEndpoint::dual_stack(listener_cfg)?;
-
-let listen_addrs = listener.local_addresses();
-for addr in &listen_addrs {
-    listener.listen(addr)?;
-}
+let mut listener = QuicTransport::new(listener_cfg, "127.0.0.1:0")?;
+let listen_addr = listener.listen_on_bound_addr()?;
 
 let dialer_cfg = QuicNodeConfig::generate();
-let mut dialer = QuicEndpoint::bind(dialer_cfg, "127.0.0.1:0")?;
+let mut dialer = QuicTransport::new(dialer_cfg, "127.0.0.1:0")?;
 
 let peer_addr = minip2p_core::PeerAddr::new(
-    listen_addrs[0].clone(),
+    listen_addr,
     listener_key.peer_id(),
 )?;
 let conn_id = dialer.dial(&peer_addr)?;

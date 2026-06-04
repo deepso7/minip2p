@@ -34,7 +34,7 @@ Current validated capabilities:
 - Multistream-select with spec-compliant varint-length-prefixed framing.
 - Ping protocol: outbound RTT measurement, inbound echo, fragmentation buffering, configurable timeouts.
 - End-to-end protocol stack: QUIC transport + multistream-select + ping in integration tests.
-- Transport contract with documented lifecycle guarantees and 12 conformance tests.
+- Transport contract with documented lifecycle guarantees and conformance tests.
 - Varint helpers shared via `minip2p-identity` and re-exported through `minip2p-core`.
 - AutoNAT reachability probe wire logic and client/server state machines as a `no_std + alloc` Sans-I/O crate.
 - Rustdoc on all public APIs. Internal comments on all private functions and types.
@@ -79,15 +79,9 @@ applications.
 - Transport-specific address validation belongs in adapters, not in
   `crates/core`.
 - Shared crates define generic contracts and common semantics only.
-- Protocol state machines (`ping`, `identify`, `relay`, `dcutr`,
-  `multistream-select`) stay Sans-I/O -- they must never grow a `Transport`
-  dependency or a clock.
-
-### Pending architectural work
-
-Tracked concretely under the roadmap milestones; see Milestone 6
-(mutual TLS on the QUIC transport) for the remaining architectural
-cleanup item.
+- Protocol state machines (`ping`, `identify`, `relay`, `autonat`,
+  `dcutr`, `multistream-select`) stay Sans-I/O -- they must never grow
+  a `Transport` dependency or a clock.
 
 ## DX Principles
 
@@ -120,7 +114,7 @@ cleanup item.
 ### Milestone 1: Transport contract hardening -- DONE
 
 - [x] Document connection lifecycle, stream lifecycle, and event ordering on Transport trait.
-- [x] Add 12 conformance tests for transport contract behavior.
+- [x] Add conformance tests for transport contract behavior.
 - [x] Fix ping memory leak (`entry().or_default()`), stale state, dead error variant.
 
 **Exit criteria**

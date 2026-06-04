@@ -76,8 +76,8 @@ Check `no_std` builds for the core crates:
 ```bash
 cargo check --no-default-features -p minip2p-core -p minip2p-identity \
     -p minip2p-transport -p minip2p-tls -p minip2p-identify \
-    -p minip2p-ping -p minip2p-relay -p minip2p-autonat \
-    -p minip2p-dcutr -p minip2p-swarm
+    -p minip2p-multistream-select -p minip2p-ping -p minip2p-relay \
+    -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm
 ```
 
 ## Documentation

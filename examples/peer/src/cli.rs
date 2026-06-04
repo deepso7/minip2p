@@ -3,10 +3,11 @@
 //! The grammar is:
 //!
 //! ```text
-//! minip2p-peer listen
-//! minip2p-peer dial   <peer-addr>
-//! minip2p-peer listen --relay <relay-peer-addr>
-//! minip2p-peer dial   --relay <relay-peer-addr> --target <peer-id>
+//! minip2p-peer listen [--key <path>] [--listen <quic-multiaddr>]
+//! minip2p-peer dial <peer-addr> [--key <path>] [--listen <quic-multiaddr>]
+//! minip2p-peer autonat [--key <path>] [--listen <quic-multiaddr>]
+//! minip2p-peer listen --relay <relay-peer-addr> [--autonat <peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--external-addr <quic-multiaddr>]...
+//! minip2p-peer dial --relay <relay-peer-addr> --target <peer-id> [--autonat <peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--external-addr <quic-multiaddr>]...
 //! ```
 //!
 //! Each `<peer-addr>` is a full libp2p-style string ending in
@@ -14,7 +15,7 @@
 //! The relay-dialer's `--target` is a bare `PeerId` because we reach B
 //! *through* the relay; we don't know B's transport address yet.
 //!
-//! Keeping the parser hand-rolled avoids pulling in `clap` for the 4-mode
+//! Keeping the parser hand-rolled avoids pulling in `clap` for the small
 //! CLI and keeps the whole example dependency-light.
 
 use std::path::PathBuf;
@@ -23,7 +24,7 @@ use std::str::FromStr;
 use minip2p_core::{Multiaddr, PeerAddr, PeerId};
 use minip2p_swarm::SwarmEvent;
 
-/// The four modes the CLI dispatches to.
+/// The modes the CLI dispatches to.
 #[derive(Clone, Debug)]
 pub enum Mode {
     /// Bind a QUIC socket, listen, print our peer-addr, and echo every

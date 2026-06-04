@@ -24,8 +24,8 @@ use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, Trans
 struct MyTransport;
 
 impl Transport for MyTransport {
-    fn dial(&mut self, id: ConnectionId, addr: &PeerAddr) -> Result<(), TransportError> {
-        todo!("initiate outgoing connection")
+    fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+        todo!("initiate outgoing connection and return its allocated id")
     }
 
     fn listen(&mut self, addr: &Multiaddr) -> Result<(), TransportError> {
@@ -63,6 +63,10 @@ impl Transport for MyTransport {
 
     fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
         todo!("drive transport and emit events")
+    }
+
+    fn local_addresses(&self) -> Vec<Multiaddr> {
+        todo!("return bind/listen addresses, if the adapter has any")
     }
 }
 ```
