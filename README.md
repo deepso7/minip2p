@@ -70,11 +70,16 @@ Build an app endpoint with the top-level facade:
 ```rust
 use minip2p::Endpoint;
 
-let mut node = Endpoint::builder()
-    .agent_version("my-app/0.1.0")
-    .bind_quic_dual_stack()?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut node = Endpoint::builder()
+        .agent_version("my-app/0.1.0")
+        .bind_quic_dual_stack()?;
 
-let addrs = node.listen_all()?;
+    let addrs = node.listen_all()?;
+    println!("listening on {addrs:?}");
+
+    Ok(())
+}
 ```
 
 Common contributor workflows are also available through `just`:
