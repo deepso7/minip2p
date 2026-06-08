@@ -775,11 +775,37 @@ impl SwarmCore {
                     format!("failed to queue identify stream to {peer_id}: {e}"),
                 );
             }
+
+            if self.pending_pings.contains_key(&peer_id)
+                && self.find_negotiated_ping_stream(&peer_id).is_none()
+                && !self.has_pending_ping_stream(&peer_id)
+                && let Err(e) =
+                    self.queue_open_protocol_stream(&peer_id, PING_PROTOCOL_ID, ProtocolKind::Ping)
+            {
+                self.emit_error(
+                    SwarmErrorKind::Ping,
+                    Some(peer_id.clone()),
+                    Some(id),
+                    format!("failed to requeue pending ping stream to {peer_id}: {e}"),
+                );
+            }
         }
     }
 
     fn supersede_connection(&mut self, old_id: ConnectionId) {
         if let Some(peer_id) = self.conn_to_peer.remove(&old_id) {
+            let pending_ping = self.pending_pings.remove(&peer_id);
+            let _ = self.ping.handle_input(PingInput::RemovePeer {
+                peer_id: peer_id.clone(),
+            });
+            let _ = self.identify.handle_input(IdentifyInput::RemovePeer {
+                peer_id: peer_id.clone(),
+            });
+            self.drain_ping_outputs();
+            self.drain_identify_outputs();
+            if let Some(payload) = pending_ping {
+                self.pending_pings.insert(peer_id.clone(), payload);
+            }
             self.peer_info.remove(&peer_id);
             self.ready_peers.remove(&peer_id);
             self.established_peers.remove(&peer_id);
@@ -1772,5 +1798,97 @@ mod tests {
             SwarmError::UserStreamNotFound { peer_id: p, stream_id: s }
                 if p == peer_id && s == stream_id
         ));
+    }
+
+    #[test]
+    fn superseding_connection_resets_stale_ping_stream() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
+        let original_conn = ConnectionId::new(10);
+        let newer_conn = ConnectionId::new(11);
+        let stale_stream = StreamId::new(8);
+
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: original_conn,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+        );
+        core.stream_owner
+            .insert((original_conn, stale_stream), ProtocolKind::Ping);
+        core.ping
+            .handle_input(PingInput::RegisterOutboundStream {
+                peer_id: peer_id.clone(),
+                stream_id: stale_stream,
+            })
+            .expect("register ping stream");
+        while core.ping.poll_output().is_some() {}
+
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: newer_conn,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+        );
+        while core.poll_output().is_some() {}
+
+        core.ping(&peer_id, [7; PING_PAYLOAD_LEN], 42)
+            .expect("ping should open a fresh stream on the newer connection");
+        let actions = drain_actions(&mut core);
+
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, SwarmAction::OpenStream { conn_id, .. } if *conn_id == newer_conn)),
+            "ping should negotiate a fresh stream on the active connection, got {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                SwarmAction::SendStream {
+                    conn_id,
+                    stream_id,
+                    ..
+                } if *conn_id == newer_conn && *stream_id == stale_stream
+            )),
+            "ping must not send on a stream id from the superseded connection"
+        );
+    }
+
+    #[test]
+    fn superseding_connection_requeues_pending_ping_open() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
+        let original_conn = ConnectionId::new(10);
+        let newer_conn = ConnectionId::new(11);
+
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: original_conn,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+        );
+        while core.poll_output().is_some() {}
+        core.ping(&peer_id, [7; PING_PAYLOAD_LEN], 42)
+            .expect("ping should queue an open on the original connection");
+
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: newer_conn,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+        );
+        let actions = drain_actions(&mut core);
+
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, SwarmAction::OpenStream { conn_id, .. } if *conn_id == newer_conn)),
+            "pending ping should be re-opened on the active connection, got {actions:?}"
+        );
     }
 }
