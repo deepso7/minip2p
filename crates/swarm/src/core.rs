@@ -627,6 +627,26 @@ impl SwarmCore {
             })
     }
 
+    fn conn_for_owned_stream(
+        &self,
+        peer_id: &PeerId,
+        stream_id: StreamId,
+        expected: ProtocolKind,
+    ) -> Option<ConnectionId> {
+        self.stream_owner
+            .iter()
+            .find_map(|((conn_id, sid), protocol)| {
+                if *sid == stream_id
+                    && *protocol == expected
+                    && self.conn_to_peer.get(conn_id) == Some(peer_id)
+                {
+                    Some(*conn_id)
+                } else {
+                    None
+                }
+            })
+    }
+
     fn established_peer_for_conn(&self, conn_id: ConnectionId) -> Option<PeerId> {
         let peer_id = self.conn_to_peer.get(&conn_id)?;
         if self.established_peers.contains(peer_id) {
@@ -1424,7 +1444,9 @@ impl SwarmCore {
                 stream_id,
                 data,
             } => {
-                if let Some(&conn_id) = self.peer_to_conn.get(peer_id) {
+                if let Some(conn_id) =
+                    self.conn_for_owned_stream(peer_id, stream_id, ProtocolKind::Ping)
+                {
                     self.actions.push_back(SwarmAction::SendStream {
                         conn_id,
                         stream_id,
@@ -1436,7 +1458,9 @@ impl SwarmCore {
                 ref peer_id,
                 stream_id,
             } => {
-                if let Some(&conn_id) = self.peer_to_conn.get(peer_id) {
+                if let Some(conn_id) =
+                    self.conn_for_owned_stream(peer_id, stream_id, ProtocolKind::Ping)
+                {
                     self.actions
                         .push_back(SwarmAction::CloseStreamWrite { conn_id, stream_id });
                 }
@@ -1445,7 +1469,9 @@ impl SwarmCore {
                 ref peer_id,
                 stream_id,
             } => {
-                if let Some(&conn_id) = self.peer_to_conn.get(peer_id) {
+                if let Some(conn_id) =
+                    self.conn_for_owned_stream(peer_id, stream_id, ProtocolKind::Ping)
+                {
                     self.actions
                         .push_back(SwarmAction::ResetStream { conn_id, stream_id });
                 }
@@ -1890,5 +1916,49 @@ mod tests {
                 .any(|action| matches!(action, SwarmAction::OpenStream { conn_id, .. } if *conn_id == newer_conn)),
             "pending ping should be re-opened on the active connection, got {actions:?}"
         );
+    }
+
+    #[test]
+    fn inbound_ping_response_uses_stream_owner_connection() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
+        let original_conn = ConnectionId::new(10);
+        let newer_conn = ConnectionId::new(11);
+        let inbound_stream = StreamId::new(8);
+
+        core.conn_to_peer.insert(original_conn, peer_id.clone());
+        core.conn_to_peer.insert(newer_conn, peer_id.clone());
+        core.peer_to_conn.insert(peer_id.clone(), newer_conn);
+        core.stream_owner
+            .insert((original_conn, inbound_stream), ProtocolKind::Ping);
+        core.ping
+            .handle_input(PingInput::RegisterInboundStream {
+                peer_id: peer_id.clone(),
+                stream_id: inbound_stream,
+            })
+            .expect("register inbound ping stream");
+        while core.ping.poll_output().is_some() {}
+
+        core.ping
+            .handle_input(PingInput::StreamData {
+                peer_id,
+                stream_id: inbound_stream,
+                data: [7; PING_PAYLOAD_LEN].to_vec(),
+                now_ms: 42,
+            })
+            .expect("receive inbound ping");
+        core.drain_ping_outputs();
+        let actions = drain_actions(&mut core);
+
+        assert!(matches!(
+            actions.as_slice(),
+            [SwarmAction::SendStream {
+                conn_id,
+                stream_id,
+                data
+            }] if *conn_id == original_conn
+                && *stream_id == inbound_stream
+                && data == &[7; PING_PAYLOAD_LEN]
+        ));
     }
 }
