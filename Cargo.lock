@@ -584,6 +584,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
+name = "minip2p"
+version = "0.1.0"
+dependencies = [
+ "minip2p-core",
+ "minip2p-identity",
+ "minip2p-quic",
+ "minip2p-swarm",
+ "minip2p-transport",
+]
+
+[[package]]
 name = "minip2p-autonat"
 version = "0.1.0"
 dependencies = [
@@ -661,6 +672,13 @@ dependencies = [
  "minip2p-core",
  "minip2p-transport",
  "thiserror",
+]
+
+[[package]]
+name = "minip2p-ping-app"
+version = "0.1.0"
+dependencies = [
+ "minip2p",
 ]
 
 [[package]]

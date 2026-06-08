@@ -6,6 +6,7 @@ members = [
     "crates/dcutr",
     "crates/identify",
     "crates/identity",
+    "crates/minip2p",
     "crates/multistream-select",
     "crates/ping",
     "crates/relay",
@@ -13,5 +14,6 @@ members = [
     "crates/tls",
     "crates/transport",
     "transports/quic",
+    "examples/ping-app",
     "examples/peer",
 ]

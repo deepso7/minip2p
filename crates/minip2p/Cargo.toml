@@ -1,0 +1,12 @@
+[package]
+name = "minip2p"
+version = "0.1.0"
+edition = "2024"
+readme = "README.md"
+
+[dependencies]
+minip2p-core = { path = "../core" }
+minip2p-identity = { path = "../identity" }
+minip2p-quic = { path = "../../transports/quic" }
+minip2p-swarm = { path = "../swarm" }
+minip2p-transport = { path = "../transport" }
