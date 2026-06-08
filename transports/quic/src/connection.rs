@@ -339,12 +339,15 @@ impl QuicConnection {
     }
 
     pub fn close(&mut self, socket: &UdpSocket) -> Result<(), TransportError> {
-        self.conn
-            .close(true, 0x00, b"bye")
-            .map_err(|e| TransportError::CloseFailed {
-                id: self.id,
-                reason: format!("close error: {e}"),
-            })?;
+        match self.conn.close(true, 0x00, b"bye") {
+            Ok(()) | Err(quiche::Error::Done) => {}
+            Err(e) => {
+                return Err(TransportError::CloseFailed {
+                    id: self.id,
+                    reason: format!("close error: {e}"),
+                });
+            }
+        }
 
         self.state = ConnectionState::Closing;
         let mut drain_events = Vec::new();
