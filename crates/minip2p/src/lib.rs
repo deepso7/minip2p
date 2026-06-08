@@ -47,9 +47,31 @@ impl Endpoint {
         self.swarm.listen_on_bound_addrs()
     }
 
-    /// Dials a remote peer.
-    pub fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
-        self.swarm.dial(addr)
+    /// Dials a remote peer on every applicable local address family.
+    ///
+    /// For dual-stack endpoints, `/dns` targets are resolved and both IPv4 and
+    /// IPv6 dials are started when both families are available. Use
+    /// [`Endpoint::dial_ip4`] or [`Endpoint::dial_ip6`] to force one family.
+    pub fn dial(&mut self, addr: &PeerAddr) -> Result<Vec<ConnectionId>, TransportError> {
+        let ids = self.swarm.transport_mut().dial_all(addr)?;
+        for id in &ids {
+            self.swarm.on_dialed(*id);
+        }
+        Ok(ids)
+    }
+
+    /// Dials a remote peer using IPv4.
+    pub fn dial_ip4(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+        let id = self.swarm.transport_mut().dial_ip4(addr)?;
+        self.swarm.on_dialed(id);
+        Ok(id)
+    }
+
+    /// Dials a remote peer using IPv6.
+    pub fn dial_ip6(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+        let id = self.swarm.transport_mut().dial_ip6(addr)?;
+        self.swarm.on_dialed(id);
+        Ok(id)
     }
 
     /// Sends a ping to `peer_id`.

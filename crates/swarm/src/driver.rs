@@ -224,6 +224,15 @@ impl<T: Transport> Swarm<T> {
         Ok(id)
     }
 
+    /// Records a connection id allocated by the underlying transport for an
+    /// outbound dial started outside [`Swarm::dial`].
+    ///
+    /// Facade layers use this when calling transport-specific dial helpers
+    /// while keeping swarm connection bookkeeping in sync.
+    pub fn on_dialed(&mut self, id: ConnectionId) {
+        self.core.on_dialed(id);
+    }
+
     /// Pings a peer, sending a random 32-byte payload and measuring RTT.
     ///
     /// If a ping stream isn't yet negotiated the payload is queued and
