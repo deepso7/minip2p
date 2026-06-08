@@ -10,7 +10,7 @@ use std::time::Instant;
 
 pub use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
 pub use minip2p_identity::Ed25519Keypair;
-use minip2p_quic::{QuicNodeConfig, QuicTransport};
+use minip2p_quic::{QuicEndpoint, QuicNodeConfig};
 pub use minip2p_swarm::SwarmEvent as Event;
 use minip2p_swarm::{Swarm, SwarmBuilder};
 pub use minip2p_transport::{ConnectionId, StreamId, TransportError};
@@ -23,7 +23,7 @@ const DEFAULT_AGENT_VERSION: &str = "minip2p/0.1.0";
 /// users can still borrow the underlying [`Swarm`] with [`Endpoint::swarm`]
 /// and [`Endpoint::swarm_mut`].
 pub struct Endpoint {
-    swarm: Swarm<QuicTransport>,
+    swarm: Swarm<QuicEndpoint>,
 }
 
 impl Endpoint {
@@ -97,17 +97,17 @@ impl Endpoint {
     }
 
     /// Borrows the underlying swarm.
-    pub fn swarm(&self) -> &Swarm<QuicTransport> {
+    pub fn swarm(&self) -> &Swarm<QuicEndpoint> {
         &self.swarm
     }
 
     /// Mutably borrows the underlying swarm.
-    pub fn swarm_mut(&mut self) -> &mut Swarm<QuicTransport> {
+    pub fn swarm_mut(&mut self) -> &mut Swarm<QuicEndpoint> {
         &mut self.swarm
     }
 
     /// Decomposes this endpoint into the underlying swarm.
-    pub fn into_swarm(self) -> Swarm<QuicTransport> {
+    pub fn into_swarm(self) -> Swarm<QuicEndpoint> {
         self.swarm
     }
 }
@@ -142,12 +142,41 @@ impl EndpointBuilder {
 
     /// Builds an endpoint with a QUIC transport bound to `bind_addr`.
     pub fn bind_quic(self, bind_addr: impl AsRef<str>) -> Result<Endpoint, TransportError> {
-        let keypair = self.keypair.unwrap_or_else(Ed25519Keypair::generate);
+        let (keypair, agent_version) = self.into_parts();
         let transport =
-            QuicTransport::new(QuicNodeConfig::new(keypair.clone()), bind_addr.as_ref())?;
-        let swarm = SwarmBuilder::new(&keypair)
-            .agent_version(self.agent_version)
-            .build(transport);
-        Ok(Endpoint { swarm })
+            QuicEndpoint::bind(QuicNodeConfig::new(keypair.clone()), bind_addr.as_ref())?;
+        Ok(build_endpoint(keypair, agent_version, transport))
     }
+
+    /// Builds an endpoint with a QUIC transport bound to a QUIC multiaddr.
+    pub fn bind_quic_multiaddr(self, addr: &Multiaddr) -> Result<Endpoint, TransportError> {
+        let (keypair, agent_version) = self.into_parts();
+        let transport = QuicEndpoint::bind_multiaddr(QuicNodeConfig::new(keypair.clone()), addr)?;
+        Ok(build_endpoint(keypair, agent_version, transport))
+    }
+
+    /// Builds an endpoint with separate IPv4 and IPv6 wildcard QUIC sockets.
+    pub fn bind_quic_dual_stack(self) -> Result<Endpoint, TransportError> {
+        let (keypair, agent_version) = self.into_parts();
+        let transport = QuicEndpoint::dual_stack(QuicNodeConfig::new(keypair.clone()))?;
+        Ok(build_endpoint(keypair, agent_version, transport))
+    }
+
+    fn into_parts(self) -> (Ed25519Keypair, String) {
+        (
+            self.keypair.unwrap_or_else(Ed25519Keypair::generate),
+            self.agent_version,
+        )
+    }
+}
+
+fn build_endpoint(
+    keypair: Ed25519Keypair,
+    agent_version: String,
+    transport: QuicEndpoint,
+) -> Endpoint {
+    let swarm = SwarmBuilder::new(&keypair)
+        .agent_version(agent_version)
+        .build(transport);
+    Endpoint { swarm }
 }

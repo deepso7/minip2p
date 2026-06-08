@@ -8,12 +8,11 @@ use std::error::Error;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
+use minip2p::{Endpoint, Event};
 use minip2p_core::{Multiaddr, PeerAddr, Protocol};
-use minip2p_quic::QuicEndpoint;
-use minip2p_swarm::{Swarm, SwarmBuilder, SwarmEvent};
 
 use crate::cli::{RunOptions, print_event};
-use crate::runtime::{build_peer_transport, load_keypair};
+use crate::runtime::load_keypair;
 
 const AGENT: &str = "minip2p-peer/0.1.0";
 /// Far-future deadline for the listener; practically "run forever".
@@ -23,9 +22,9 @@ const DIAL_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Runs the listener until interrupted (SIGINT).
 pub fn run_listen(options: RunOptions) -> Result<(), Box<dyn Error>> {
-    let mut swarm = build_swarm(&options, "listen")?;
-    let peer_addrs = swarm
-        .listen_on_bound_addrs()
+    let mut endpoint = build_endpoint(&options, "listen")?;
+    let peer_addrs = endpoint
+        .listen_all()
         .map_err(|e| format!("listen failed: {e}"))?;
     let peer_addr = peer_addrs
         .first()
@@ -39,7 +38,8 @@ pub fn run_listen(options: RunOptions) -> Result<(), Box<dyn Error>> {
 
     // Loop until a long deadline; SIGINT tears the process down.
     let deadline = Instant::now() + LISTEN_FOREVER;
-    while swarm
+    while endpoint
+        .swarm_mut()
         .run_until(deadline, |ev| {
             print_event("listen", ev);
             false // never stop on our own -- caller-driven shutdown
@@ -52,9 +52,9 @@ pub fn run_listen(options: RunOptions) -> Result<(), Box<dyn Error>> {
 
 /// Dials `target`, waits for Identify, pings, prints RTT, exits.
 pub fn run_dial(target: PeerAddr, options: RunOptions) -> Result<(), Box<dyn Error>> {
-    let mut swarm = build_swarm(&options, "dial")?;
+    let mut endpoint = build_endpoint(&options, "dial")?;
     let target_peer_id = target.peer_id().clone();
-    swarm
+    endpoint
         .dial(&target)
         .map_err(|e| format!("dial failed: {e}"))?;
     println!("[dial] dialing {target}");
@@ -62,23 +62,25 @@ pub fn run_dial(target: PeerAddr, options: RunOptions) -> Result<(), Box<dyn Err
     let deadline = Instant::now() + DIAL_DEADLINE;
 
     // Wait until the peer id is stable and Identify has populated protocol support.
-    swarm
+    endpoint
+        .swarm_mut()
         .run_until(deadline, |ev| {
             print_event("dial", ev);
-            matches!(ev, SwarmEvent::PeerReady { peer_id, .. } if peer_id == &target_peer_id)
+            matches!(ev, Event::PeerReady { peer_id, .. } if peer_id == &target_peer_id)
         })
         .map_err(|e| format!("waiting for peer ready: {e}"))?
         .ok_or("deadline exceeded before peer became ready")?;
 
-    swarm
+    endpoint
         .ping(&target_peer_id)
         .map_err(|e| format!("ping failed: {e}"))?;
 
     // Wait for the first RTT measurement, print it via print_event, exit.
-    swarm
+    endpoint
+        .swarm_mut()
         .run_until(deadline, |ev| {
             print_event("dial", ev);
-            matches!(ev, SwarmEvent::PingRttMeasured { peer_id, .. } if peer_id == &target_peer_id)
+            matches!(ev, Event::PingRttMeasured { peer_id, .. } if peer_id == &target_peer_id)
         })
         .map_err(|e| format!("waiting for ping rtt: {e}"))?
         .ok_or("deadline exceeded before ping rtt arrived")?;
@@ -86,14 +88,19 @@ pub fn run_dial(target: PeerAddr, options: RunOptions) -> Result<(), Box<dyn Err
     Ok(())
 }
 
-/// Builds a swarm with a fresh Ed25519 identity and the default
-/// Identify/Ping stack.
-fn build_swarm(options: &RunOptions, role: &str) -> Result<Swarm<QuicEndpoint>, Box<dyn Error>> {
+/// Builds an endpoint with the default Identify/Ping stack.
+fn build_endpoint(options: &RunOptions, role: &str) -> Result<Endpoint, Box<dyn Error>> {
     let keypair = load_keypair(options, role)?;
-    let transport = build_peer_transport(options, &keypair)?;
-    Ok(SwarmBuilder::new(&keypair)
-        .agent_version(AGENT)
-        .build(transport))
+    let builder = Endpoint::builder().identity(keypair).agent_version(AGENT);
+    if let Some(addr) = &options.listen_addr {
+        return builder
+            .bind_quic_multiaddr(addr)
+            .map_err(|e| format!("quic bind {addr}: {e}").into());
+    }
+
+    builder
+        .bind_quic_dual_stack()
+        .map_err(|e| format!("quic dual-stack bind: {e}").into())
 }
 
 fn local_dialable_peer_addr(peer_addr: &PeerAddr) -> PeerAddr {

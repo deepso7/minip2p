@@ -652,6 +652,7 @@ name = "minip2p-peer"
 version = "0.1.0"
 dependencies = [
  "getrandom",
+ "minip2p",
  "minip2p-autonat",
  "minip2p-core",
  "minip2p-dcutr",
@@ -672,13 +673,6 @@ dependencies = [
  "minip2p-core",
  "minip2p-transport",
  "thiserror",
-]
-
-[[package]]
-name = "minip2p-ping-app"
-version = "0.1.0"
-dependencies = [
- "minip2p",
 ]
 
 [[package]]

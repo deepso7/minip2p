@@ -12,6 +12,7 @@ name = "minip2p-peer"
 path = "src/main.rs"
 
 [dependencies]
+minip2p = { path = "../../crates/minip2p" }
 minip2p-core = { path = "../../crates/core" }
 minip2p-identity = { path = "../../crates/identity" }
 minip2p-transport = { path = "../../crates/transport" }
