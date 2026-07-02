@@ -216,6 +216,20 @@ fn close_stream_write_emits_remote_write_closed() {
 }
 
 #[test]
+fn close_connection_is_idempotent_after_close_started() {
+    let (mut server, mut client, peer_addr) = setup_pair();
+
+    let client_conn_id = client.dial(&peer_addr).expect("dial");
+    wait_for_connection(&mut server, &mut client, client_conn_id, &peer_addr, 250)
+        .expect("server connection");
+
+    client.close(client_conn_id).expect("first close");
+    client
+        .close(client_conn_id)
+        .expect("second close should ignore quiche Done");
+}
+
+#[test]
 fn listener_rejects_dialer_without_mtls_identity() {
     let mut server =
         QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server bind");

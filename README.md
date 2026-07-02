@@ -27,6 +27,7 @@ Sans-I/O core crates (`no_std + alloc`):
 
 Runtime adapters (`std`):
 
+- `crates/minip2p` (`minip2p`): app-facing facade that glues identity, QUIC, and the std swarm driver into an `Endpoint` API.
 - `transports/quic` (`minip2p-quic`): QUIC transport adapter built on `quiche`, with libp2p TLS baked in.
 - `crates/swarm` (also ships a thin `std` driver `Swarm<T: Transport>` behind the `std` feature).
 
@@ -38,7 +39,7 @@ Current validated behavior:
 - Ping protocol round-trips with RTT measurement over negotiated streams.
 - Identify protocol exchange with observed-address plumbing from the transport.
 - Transport contract with documented lifecycle guarantees and conformance tests.
-- End-to-end stack via `SwarmBuilder`: QUIC transport + multistream-select + identify + ping with a single builder call.
+- End-to-end stack via `minip2p::Endpoint`: QUIC transport + multistream-select + identify + ping through one app-facing facade.
 - Swarm DX events for application readiness (`PeerReady`) and typed runtime errors.
 - Pure-state-machine integration test covering Circuit Relay v2 + DCUtR (reservation, connect, stop, hole-punch coordination).
 - AutoNAT reachability probe wire logic and state machines in `minip2p-autonat`.
@@ -62,6 +63,23 @@ Build and run tests:
 
 ```bash
 cargo test
+```
+
+Build an app endpoint with the top-level facade:
+
+```rust
+use minip2p::Endpoint;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut node = Endpoint::builder()
+        .agent_version("my-app/0.1.0")
+        .bind_quic_dual_stack()?;
+
+    let addrs = node.listen_all()?;
+    println!("listening on {addrs:?}");
+
+    Ok(())
+}
 ```
 
 Common contributor workflows are also available through `just`:
@@ -101,6 +119,7 @@ cargo doc --workspace --no-deps --open
 - [x] libp2p TLS peer authentication (automatic PeerId verification after handshake on the dialer side).
 - [x] Identify protocol (`/ipfs/id/1.0.0`).
 - [x] Swarm / connection management layer with builder DX.
+- [x] Top-level `minip2p::Endpoint` facade for app authors.
 - [x] Circuit Relay v2 client state machines.
 - [x] DCUtR hole-punching state machines.
 - [x] Runnable hole-punch CLI against a real relay.
