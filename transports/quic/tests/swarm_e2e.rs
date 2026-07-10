@@ -7,8 +7,8 @@ use minip2p_core::{Multiaddr, Protocol};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_ping::PING_PROTOCOL_ID;
 use minip2p_quic::{QuicEndpoint, QuicNodeConfig, QuicTransport};
-use minip2p_swarm::{Swarm, SwarmBuilder, SwarmErrorKind, SwarmEvent};
-use minip2p_transport::{StreamId, Transport, TransportError};
+use minip2p_swarm::{DriverError, Swarm, SwarmBuilder, SwarmError, SwarmErrorKind, SwarmEvent};
+use minip2p_transport::{StreamId, Transport};
 
 fn make_swarm(keypair: Ed25519Keypair) -> Swarm<QuicTransport> {
     let transport =
@@ -339,8 +339,13 @@ fn open_user_stream_fails_fast_when_peer_did_not_advertise_protocol() {
         .open_user_stream(&server_peer_id, USER_PROTOCOL_ID)
         .expect_err("unsupported user protocol should fail synchronously");
     assert!(
-        matches!(err, TransportError::PollError { ref reason }
-            if reason.contains("does not support protocol")),
+        matches!(
+            err,
+            DriverError::Swarm(SwarmError::RemoteDoesNotSupport {
+                ref peer_id,
+                ref protocol_id,
+            }) if peer_id == &server_peer_id && protocol_id == USER_PROTOCOL_ID
+        ),
         "expected fail-fast unsupported protocol error, got {err:?}"
     );
 }
@@ -375,10 +380,10 @@ fn identify_exchange_carries_observed_addr() {
         let (_server_events, client_events) = drive_pair(&mut server, &mut client);
 
         for event in client_events {
-            if let SwarmEvent::IdentifyReceived { peer_id, info } = event {
-                if peer_id == server_peer_id {
-                    client_observed = info.observed_addr;
-                }
+            if let SwarmEvent::IdentifyReceived { peer_id, info } = event
+                && peer_id == server_peer_id
+            {
+                client_observed = info.observed_addr;
             }
         }
 
@@ -432,12 +437,11 @@ fn rapid_ping_calls_do_not_open_duplicate_streams() {
                     assert_eq!(peer_id, &server_peer_id);
                     rtt_measured = true;
                 }
-                SwarmEvent::Error(ref error) => {
+                SwarmEvent::Error(ref error)
                     if error.kind == SwarmErrorKind::Ping
-                        && error.detail.contains("ping register error")
-                    {
-                        saw_register_error = true;
-                    }
+                        && error.detail.contains("ping register error") =>
+                {
+                    saw_register_error = true;
                 }
                 _ => {}
             }

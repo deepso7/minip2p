@@ -46,21 +46,19 @@ fn wait_for_connection(
                     assert!(endpoint.peer_id().is_none());
                     server_conn = Some(id);
                 }
-                TransportEvent::Connected { id, .. } => {
-                    if server_conn.is_none() {
-                        server_conn = Some(id);
-                    }
+                TransportEvent::Connected { id, .. } if server_conn.is_none() => {
+                    server_conn = Some(id);
                 }
                 _ => {}
             }
         }
 
         for event in client_events {
-            if let TransportEvent::Connected { id, endpoint } = event {
-                if id == expected_client_conn {
-                    assert_eq!(endpoint.peer_id(), Some(expected_peer.peer_id()));
-                    client_connected = true;
-                }
+            if let TransportEvent::Connected { id, endpoint } = event
+                && id == expected_client_conn
+            {
+                assert_eq!(endpoint.peer_id(), Some(expected_peer.peer_id()));
+                client_connected = true;
             }
         }
 
@@ -91,10 +89,10 @@ fn two_peers_open_stream_and_exchange_data() {
     for _ in 0..250 {
         let (server_events, client_events) = drive_pair_once(&mut server, &mut client);
         for event in client_events {
-            if let TransportEvent::StreamOpened { id, stream_id } = event {
-                if id == client_conn_id {
-                    assert_eq!(stream_id, client_stream);
-                }
+            if let TransportEvent::StreamOpened { id, stream_id } = event
+                && id == client_conn_id
+            {
+                assert_eq!(stream_id, client_stream);
             }
         }
 
@@ -135,11 +133,11 @@ fn two_peers_open_stream_and_exchange_data() {
                 stream_id,
                 data,
             } = event
+                && id == client_conn_id
+                && stream_id == client_stream
             {
-                if id == client_conn_id && stream_id == client_stream {
-                    assert_eq!(data, b"hello from server");
-                    return;
-                }
+                assert_eq!(data, b"hello from server");
+                return;
             }
         }
     }

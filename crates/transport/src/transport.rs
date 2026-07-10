@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::time::Duration;
 
 use minip2p_core::{Multiaddr, PeerAddr};
 
@@ -104,6 +105,15 @@ pub trait Transport {
     /// Must be called regularly. Never blocks -- returns an empty vec when
     /// there is no work to do.
     fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError>;
+
+    /// Returns the duration until the transport next needs to be polled for a
+    /// protocol timer, if it has one.
+    ///
+    /// Runtime drivers can combine this with socket readiness instead of using
+    /// a fixed polling cadence. Returning zero means the timer is already due.
+    fn next_timeout(&self) -> Option<Duration> {
+        None
+    }
 
     /// Returns the transport multiaddrs this node is currently listening
     /// on.

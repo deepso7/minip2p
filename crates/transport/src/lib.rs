@@ -7,7 +7,6 @@
 
 extern crate alloc;
 
-mod action;
 mod connection_endpoint;
 mod connection_id;
 mod connection_state;
@@ -16,7 +15,6 @@ mod event;
 mod stream_id;
 mod transport;
 
-pub use action::TransportAction;
 pub use connection_endpoint::ConnectionEndpoint;
 pub use connection_id::ConnectionId;
 pub use connection_state::ConnectionState;

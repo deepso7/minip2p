@@ -1,8 +1,12 @@
 [package]
 name = "minip2p-peer"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 publish = false
+
+[lints]
+workspace = true
 
 # Binary that exercises the full minip2p stack end-to-end: direct QUIC
 # peer-to-peer pings, and relay-coordinated hole-punch pings via Circuit
@@ -24,4 +28,4 @@ minip2p-relay = { path = "../../crates/relay" }
 minip2p-dcutr = { path = "../../crates/dcutr" }
 minip2p-multistream-select = { path = "../../crates/multistream-select" }
 minip2p-quic = { path = "../../transports/quic" }
-getrandom = "0.4.2"
+getrandom = "0.4.3"

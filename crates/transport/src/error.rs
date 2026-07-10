@@ -24,8 +24,6 @@ pub enum TransportError {
         state: crate::ConnectionState,
         expected: crate::ConnectionState,
     },
-    #[error("not listening on any address")]
-    NotListening,
     #[error("listen failed: {reason}")]
     ListenFailed { reason: String },
     #[error("dial failed for {id}: {reason}")]
@@ -40,8 +38,6 @@ pub enum TransportError {
         id: ConnectionId,
         stream_id: StreamId,
     },
-    #[error("failed to open stream on {id}: {reason}")]
-    OpenStreamFailed { id: ConnectionId, reason: String },
     #[error("stream send failed for {id}/{stream_id}: {reason}")]
     StreamSendFailed {
         id: ConnectionId,

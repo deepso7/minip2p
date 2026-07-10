@@ -180,7 +180,7 @@ pub struct IdentifyProtocol {
     /// Per-peer identify state.
     peers: BTreeMap<PeerId, PeerIdentifyState>,
     /// Buffered events for the host to poll.
-    events: Vec<IdentifyEvent>,
+    events: VecDeque<IdentifyEvent>,
     /// Actions buffered for [`SansIoProtocol::poll_output`].
     actions: VecDeque<IdentifyAction>,
     /// Local identify info used when responding.
@@ -192,7 +192,7 @@ impl IdentifyProtocol {
     pub fn new(config: IdentifyConfig) -> Self {
         Self {
             peers: BTreeMap::new(),
-            events: Vec::new(),
+            events: VecDeque::new(),
             actions: VecDeque::new(),
             config,
         }
@@ -300,7 +300,7 @@ impl IdentifyProtocol {
             buf.extend_from_slice(&data);
 
             if buf.len() > MAX_MESSAGE_SIZE {
-                self.events.push(IdentifyEvent::Error {
+                self.events.push_back(IdentifyEvent::Error {
                     peer_id: peer_id.clone(),
                     stream_id,
                     error: alloc::format!(
@@ -336,13 +336,13 @@ impl IdentifyProtocol {
 
         match decode_length_prefixed(&buf).and_then(IdentifyMessage::decode) {
             Ok(info) => {
-                self.events.push(IdentifyEvent::Received {
+                self.events.push_back(IdentifyEvent::Received {
                     peer_id: peer_id.clone(),
                     info,
                 });
             }
             Err(e) => {
-                self.events.push(IdentifyEvent::Error {
+                self.events.push_back(IdentifyEvent::Error {
                     peer_id: peer_id.clone(),
                     stream_id,
                     error: alloc::format!("failed to decode identify message: {e}"),
@@ -410,7 +410,7 @@ impl IdentifyProtocol {
     /// Drain buffered events.
     #[cfg(test)]
     fn poll_events(&mut self) -> Vec<IdentifyEvent> {
-        core::mem::take(&mut self.events)
+        self.events.drain(..).collect()
     }
 }
 
@@ -466,11 +466,7 @@ impl SansIoProtocol for IdentifyProtocol {
         if let Some(action) = self.actions.pop_front() {
             return Some(IdentifyOutput::Action(action));
         }
-        if self.events.is_empty() {
-            None
-        } else {
-            Some(IdentifyOutput::Event(self.events.remove(0)))
-        }
+        self.events.pop_front().map(IdentifyOutput::Event)
     }
 
     fn is_idle(&self) -> bool {
@@ -505,7 +501,13 @@ fn encode_length_prefixed(payload: &[u8]) -> Vec<u8> {
 fn decode_length_prefixed(buf: &[u8]) -> Result<&[u8], message::IdentifyMessageError> {
     let (len, consumed) =
         read_uvarint(buf).map_err(|e: VarintError| message::IdentifyMessageError::from(e))?;
-    let len = len as usize;
+    let len_u64 = len;
+    let len =
+        usize::try_from(len_u64).map_err(|_| message::IdentifyMessageError::FieldOverflow {
+            offset: consumed,
+            length: len_u64,
+            remaining: buf.len().saturating_sub(consumed),
+        })?;
     let remaining = buf.len() - consumed;
     if len > remaining {
         return Err(message::IdentifyMessageError::FieldOverflow {

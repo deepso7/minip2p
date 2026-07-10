@@ -260,11 +260,11 @@ impl SansIoProtocol for HopReservation {
         if !outbound.is_empty() {
             return Some(HopReservationOutput::Outbound(outbound));
         }
-        if !self.emitted_outcome {
-            if let Some(outcome) = self.outcome.clone() {
-                self.emitted_outcome = true;
-                return Some(HopReservationOutput::Outcome(outcome));
-            }
+        if !self.emitted_outcome
+            && let Some(outcome) = self.outcome.clone()
+        {
+            self.emitted_outcome = true;
+            return Some(HopReservationOutput::Outcome(outcome));
         }
         None
     }
@@ -493,11 +493,11 @@ impl SansIoProtocol for HopConnect {
         if !outbound.is_empty() {
             return Some(HopConnectOutput::Outbound(outbound));
         }
-        if !self.emitted_outcome {
-            if let Some(outcome) = self.outcome.clone() {
-                self.emitted_outcome = true;
-                return Some(HopConnectOutput::Outcome(outcome));
-            }
+        if !self.emitted_outcome
+            && let Some(outcome) = self.outcome.clone()
+        {
+            self.emitted_outcome = true;
+            return Some(HopConnectOutput::Outcome(outcome));
         }
         let bridge_bytes = self.take_bridge_bytes();
         if !bridge_bytes.is_empty() {
@@ -746,11 +746,11 @@ impl SansIoProtocol for StopResponder {
     }
 
     fn poll_output(&mut self) -> Option<Self::Output> {
-        if !self.emitted_request {
-            if let Some(request) = self.request.clone() {
-                self.emitted_request = true;
-                return Some(StopResponderOutput::Request(request));
-            }
+        if !self.emitted_request
+            && let Some(request) = self.request.clone()
+        {
+            self.emitted_request = true;
+            return Some(StopResponderOutput::Request(request));
         }
         let outbound = self.take_outbound();
         if !outbound.is_empty() {

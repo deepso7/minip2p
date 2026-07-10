@@ -226,7 +226,10 @@ pub fn decode_frame(input: &[u8]) -> FrameDecode<'_> {
         Err(e) => return FrameDecode::Error(e),
     };
 
-    let length = length as usize;
+    let length = match usize::try_from(length) {
+        Ok(length) => length,
+        Err(_) => return FrameDecode::Error(VarintError::Overflow),
+    };
     let total = used + length;
     if input.len() < total {
         return FrameDecode::Incomplete;
@@ -329,7 +332,7 @@ mod tests {
     fn decoder_skips_unknown_fields() {
         // Unknown field 5 VARINT before the real type field.
         let mut buf = Vec::new();
-        buf.push((5 << 3) | 0); // unknown field, varint
+        buf.push(5 << 3); // unknown field, varint
         write_uvarint(42, &mut buf);
         buf.push(TAG_TYPE);
         write_uvarint(100, &mut buf); // CONNECT

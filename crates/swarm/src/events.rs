@@ -235,7 +235,4 @@ pub enum SwarmError {
     /// in flight on the target peer).
     #[error("ping error: {reason}")]
     PingError { reason: String },
-    /// The identify state machine rejected the request.
-    #[error("identify error: {reason}")]
-    IdentifyError { reason: String },
 }

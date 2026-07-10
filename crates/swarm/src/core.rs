@@ -104,8 +104,6 @@ pub struct SwarmCore {
     conn_to_peer: BTreeMap<ConnectionId, PeerId>,
     /// Maps peer ids to their primary connection id.
     peer_to_conn: BTreeMap<PeerId, ConnectionId>,
-    /// Connections that have been established (with or without peer identity).
-    active_connections: BTreeMap<ConnectionId, bool>,
     /// Remote transport address per connection, captured from the
     /// `ConnectionEndpoint` that arrives with the transport's
     /// `Connected` / `IncomingConnection` / `PeerIdentityVerified`
@@ -168,7 +166,6 @@ impl SwarmCore {
             identify: IdentifyProtocol::new(identify_config),
             conn_to_peer: BTreeMap::new(),
             peer_to_conn: BTreeMap::new(),
-            active_connections: BTreeMap::new(),
             conn_to_remote_addr: BTreeMap::new(),
             inbound_negotiators: BTreeMap::new(),
             outbound_negotiators: BTreeMap::new(),
@@ -439,7 +436,6 @@ impl SwarmCore {
     fn handle_transport_event(&mut self, event: TransportEvent, now_ms: u64) {
         match event {
             TransportEvent::Connected { id, endpoint } => {
-                self.active_connections.insert(id, true);
                 self.conn_to_remote_addr
                     .insert(id, endpoint.transport().clone());
                 if let Some(peer_id) = endpoint.peer_id() {
@@ -466,7 +462,6 @@ impl SwarmCore {
                 }
             }
             TransportEvent::IncomingConnection { id, endpoint } => {
-                self.active_connections.insert(id, false);
                 self.conn_to_remote_addr
                     .insert(id, endpoint.transport().clone());
             }
@@ -584,12 +579,6 @@ impl SwarmCore {
         };
         self.emit_error(SwarmErrorKind::OpenStreamFailed, peer_id, conn_id, detail);
     }
-
-    /// Records that the driver just dialed `conn_id`. Currently a no-op
-    /// -- the core begins tracking once `TransportEvent::Connected` or
-    /// `TransportEvent::IncomingConnection` arrives -- but kept as an
-    /// extension point.
-    pub fn on_dialed(&mut self, _conn_id: ConnectionId) {}
 
     // -----------------------------------------------------------------------
     // Internal: state helpers
@@ -830,7 +819,6 @@ impl SwarmCore {
             self.ready_peers.remove(&peer_id);
             self.established_peers.remove(&peer_id);
         }
-        self.active_connections.remove(&old_id);
         self.conn_to_remote_addr.remove(&old_id);
         self.stream_owner.retain(|(cid, _), _| *cid != old_id);
         self.inbound_negotiators
@@ -1087,7 +1075,6 @@ impl SwarmCore {
     }
 
     fn handle_connection_closed(&mut self, conn_id: ConnectionId) {
-        self.active_connections.remove(&conn_id);
         self.conn_to_remote_addr.remove(&conn_id);
 
         if let Some(peer_id) = self.conn_to_peer.remove(&conn_id) {

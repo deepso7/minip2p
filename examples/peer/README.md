@@ -240,7 +240,8 @@ and easy to grep/awk from tests.
 
 This binary is deliberately procedural: each role is a linear script
 built on `Swarm::run_until(deadline, predicate)`, so the sequence of
-steps is visible top-to-bottom.
+steps is visible top-to-bottom. Non-matching events are buffered and restored
+in order when a wait finishes.
 
 - `src/main.rs` — dispatch on parsed mode.
 - `src/cli.rs` — hand-rolled argv parser; shared `print_event` helper.

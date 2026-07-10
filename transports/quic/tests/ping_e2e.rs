@@ -280,21 +280,19 @@ impl PingHarness {
                         assert!(endpoint.peer_id().is_none());
                         server_conn = Some(id);
                     }
-                    TransportEvent::Connected { id, .. } => {
-                        if server_conn.is_none() {
-                            server_conn = Some(id);
-                        }
+                    TransportEvent::Connected { id, .. } if server_conn.is_none() => {
+                        server_conn = Some(id);
                     }
                     _ => {}
                 }
             }
 
             for event in client_events {
-                if let TransportEvent::Connected { id, endpoint } = event {
-                    if id == expected_client_conn {
-                        assert_eq!(endpoint.peer_id(), Some(expected_peer.peer_id()));
-                        client_connected = true;
-                    }
+                if let TransportEvent::Connected { id, endpoint } = event
+                    && id == expected_client_conn
+                {
+                    assert_eq!(endpoint.peer_id(), Some(expected_peer.peer_id()));
+                    client_connected = true;
                 }
             }
 
@@ -307,6 +305,7 @@ impl PingHarness {
     }
 
     /// Process server-side transport events (negotiation + ping echo).
+    #[allow(clippy::too_many_arguments)]
     fn handle_server_events(
         events: &[TransportEvent],
         server: &mut QuicTransport,

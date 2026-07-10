@@ -4,7 +4,10 @@ fmt:
     cargo fmt --all
 
 check:
-    cargo check --workspace
+    cargo check --workspace --all-targets
+
+clippy:
+    cargo clippy --workspace --all-targets -- -D warnings
 
 test:
     cargo test
@@ -17,3 +20,9 @@ peer-direct:
 
 docs:
     cargo doc --workspace --no-deps
+
+bench:
+    cargo bench -p minip2p-core --bench multiaddr
+
+fuzz seconds="30":
+    cargo +nightly fuzz run wire_inputs -- -max_total_time={{seconds}}

@@ -209,7 +209,7 @@ pub struct PingProtocol {
     /// Per-peer protocol state.
     peers: BTreeMap<PeerId, PeerPingState>,
     /// Events buffered until the next `SansIoProtocol::poll_output` call.
-    pending_events: Vec<PingEvent>,
+    pending_events: VecDeque<PingEvent>,
     /// Actions buffered for [`SansIoProtocol::poll_output`].
     pending_actions: VecDeque<PingAction>,
     /// Protocol configuration.
@@ -227,7 +227,7 @@ impl PingProtocol {
     pub fn new(config: PingConfig) -> Self {
         Self {
             peers: BTreeMap::new(),
-            pending_events: Vec::new(),
+            pending_events: VecDeque::new(),
             pending_actions: VecDeque::new(),
             config,
         }
@@ -255,7 +255,7 @@ impl PingProtocol {
 
         peer.outbound_stream = Some(stream_id);
         self.pending_events
-            .push(PingEvent::OutboundStreamRegistered { peer_id, stream_id });
+            .push_back(PingEvent::OutboundStreamRegistered { peer_id, stream_id });
         Ok(())
     }
 
@@ -274,18 +274,19 @@ impl PingProtocol {
         }
 
         if peer.inbound_streams.len() >= 2 {
-            self.pending_events.push(PingEvent::StreamLimitExceeded {
-                peer_id: peer_id.clone(),
-                stream_id,
-                limit: 2,
-            });
+            self.pending_events
+                .push_back(PingEvent::StreamLimitExceeded {
+                    peer_id: peer_id.clone(),
+                    stream_id,
+                    limit: 2,
+                });
 
             return vec![PingAction::ResetStream { peer_id, stream_id }];
         }
 
         peer.inbound_streams.insert(stream_id);
         self.pending_events
-            .push(PingEvent::InboundStreamAccepted { peer_id, stream_id });
+            .push_back(PingEvent::InboundStreamAccepted { peer_id, stream_id });
         Vec::new()
     }
 
@@ -450,7 +451,7 @@ impl PingProtocol {
             }
 
             let rtt_ms = now_ms.saturating_sub(pending.sent_at_ms);
-            self.pending_events.push(PingEvent::RttMeasured {
+            self.pending_events.push_back(PingEvent::RttMeasured {
                 peer_id: peer_id.clone(),
                 stream_id,
                 rtt_ms,
@@ -499,10 +500,11 @@ impl PingProtocol {
 
             peer.outbound_stream = None;
             peer.recv_bufs.remove(&stream_id);
-            self.pending_events.push(PingEvent::OutboundStreamClosed {
-                peer_id: peer_id.clone(),
-                stream_id,
-            });
+            self.pending_events
+                .push_back(PingEvent::OutboundStreamClosed {
+                    peer_id: peer_id.clone(),
+                    stream_id,
+                });
             return Vec::new();
         }
 
@@ -582,15 +584,16 @@ impl PingProtocol {
                 peer.pending_ping = None;
                 peer.outbound_stream = None;
                 peer.recv_bufs.remove(&stream_id);
-                self.pending_events.push(PingEvent::Timeout {
+                self.pending_events.push_back(PingEvent::Timeout {
                     peer_id: peer_id.clone(),
                     stream_id,
                     timeout_ms: self.config.request_timeout_ms,
                 });
-                self.pending_events.push(PingEvent::OutboundStreamClosed {
-                    peer_id: peer_id.clone(),
-                    stream_id,
-                });
+                self.pending_events
+                    .push_back(PingEvent::OutboundStreamClosed {
+                        peer_id: peer_id.clone(),
+                        stream_id,
+                    });
                 actions.push(PingAction::ResetStream {
                     peer_id: peer_id.clone(),
                     stream_id,
@@ -604,7 +607,7 @@ impl PingProtocol {
     /// Drains and returns all pending events.
     #[cfg(test)]
     fn poll_events(&mut self) -> Vec<PingEvent> {
-        core::mem::take(&mut self.pending_events)
+        self.pending_events.drain(..).collect()
     }
 
     /// Emits a ProtocolViolation event and returns a ResetStream action.
@@ -614,7 +617,7 @@ impl PingProtocol {
         stream_id: StreamId,
         reason: String,
     ) -> Vec<PingAction> {
-        self.pending_events.push(PingEvent::ProtocolViolation {
+        self.pending_events.push_back(PingEvent::ProtocolViolation {
             peer_id: peer_id.clone(),
             stream_id,
             reason,
@@ -686,11 +689,7 @@ impl SansIoProtocol for PingProtocol {
         if let Some(action) = self.pending_actions.pop_front() {
             return Some(PingOutput::Action(action));
         }
-        if self.pending_events.is_empty() {
-            None
-        } else {
-            Some(PingOutput::Event(self.pending_events.remove(0)))
-        }
+        self.pending_events.pop_front().map(PingOutput::Event)
     }
 
     fn is_idle(&self) -> bool {

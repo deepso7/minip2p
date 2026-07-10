@@ -28,6 +28,7 @@ extern crate alloc;
 
 mod message;
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -340,7 +341,7 @@ pub struct DcutrResponder {
     outbound: Vec<u8>,
     recv_buf: Vec<u8>,
     state: ResponderState,
-    events: Vec<ResponderEvent>,
+    events: VecDeque<ResponderEvent>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -365,7 +366,7 @@ impl DcutrResponder {
             outbound: Vec::new(),
             recv_buf: Vec::new(),
             state: ResponderState::AwaitingConnect,
-            events: Vec::new(),
+            events: VecDeque::new(),
         }
     }
 
@@ -392,7 +393,7 @@ impl DcutrResponder {
     /// Drains buffered events.
     #[cfg(test)]
     fn poll_events(&mut self) -> Vec<ResponderEvent> {
-        core::mem::take(&mut self.events)
+        self.events.drain(..).collect()
     }
 
     /// Returns `true` if the flow has completed.
@@ -437,14 +438,14 @@ impl DcutrResponder {
 
                     let remote_addr_bytes = msg.obs_addrs;
                     let remote_addrs = decode_remote_addrs(&remote_addr_bytes);
-                    self.events.push(ResponderEvent::ConnectReceived {
+                    self.events.push_back(ResponderEvent::ConnectReceived {
                         remote_addrs,
                         remote_addr_bytes,
                     });
                     self.state = ResponderState::AwaitingSync;
                 }
                 (ResponderState::AwaitingSync, HolePunchType::Sync) => {
-                    self.events.push(ResponderEvent::SyncReceived);
+                    self.events.push_back(ResponderEvent::SyncReceived);
                     self.state = ResponderState::Done;
                 }
                 (current_state, actual_kind) => {
@@ -480,11 +481,11 @@ impl SansIoProtocol for DcutrInitiator {
         if !outbound.is_empty() {
             return Some(DcutrInitiatorOutput::Outbound(outbound));
         }
-        if !self.emitted_outcome {
-            if let Some(outcome) = self.outcome.clone() {
-                self.emitted_outcome = true;
-                return Some(DcutrInitiatorOutput::Outcome(outcome));
-            }
+        if !self.emitted_outcome
+            && let Some(outcome) = self.outcome.clone()
+        {
+            self.emitted_outcome = true;
+            return Some(DcutrInitiatorOutput::Outcome(outcome));
         }
         None
     }
@@ -513,11 +514,7 @@ impl SansIoProtocol for DcutrResponder {
         if !outbound.is_empty() {
             return Some(DcutrResponderOutput::Outbound(outbound));
         }
-        if self.events.is_empty() {
-            None
-        } else {
-            Some(DcutrResponderOutput::Event(self.events.remove(0)))
-        }
+        self.events.pop_front().map(DcutrResponderOutput::Event)
     }
 
     fn is_idle(&self) -> bool {

@@ -362,14 +362,8 @@ mod tests {
 
     #[test]
     fn decode_skips_varint_unknown_fields() {
-        let mut data = Vec::new();
-
         // Unknown field 10, VARINT: value 42
-        data.push((10 << 3) | WIRE_VARINT);
-        data.push(42);
-
-        data.push(TAG_AGENT_VERSION);
-        data.push(2);
+        let mut data = vec![(10 << 3) | WIRE_VARINT, 42, TAG_AGENT_VERSION, 2];
         data.extend_from_slice(b"ok");
 
         let decoded = IdentifyMessage::decode(&data).unwrap();
@@ -435,8 +429,7 @@ mod tests {
     #[test]
     fn decode_rejects_unsupported_wire_type() {
         // Field 1 with wire type 3 (deprecated "start group").
-        let mut data = Vec::new();
-        data.push((1 << 3) | 3);
+        let data = vec![(1 << 3) | 3];
 
         let err = IdentifyMessage::decode(&data).unwrap_err();
         assert!(matches!(

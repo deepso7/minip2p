@@ -247,10 +247,10 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
         // heuristic.
         for ev in swarm.poll().map_err(|e| format!("holepunch poll: {e}"))? {
             print_event(role, &ev);
-            if is_direct_connection_event(&ev, &remote_peer_id) {
-                if let SwarmEvent::ConnectionEstablished { peer_id } = ev {
-                    break 'outer HolePunchOutcome::DirectConnected(peer_id);
-                }
+            if is_direct_connection_event(&ev, &remote_peer_id)
+                && let SwarmEvent::ConnectionEstablished { peer_id } = ev
+            {
+                break 'outer HolePunchOutcome::DirectConnected(peer_id);
             }
             if is_bridge_closed_event(&ev, bridge_stream) {
                 break 'outer HolePunchOutcome::BridgeClosed;

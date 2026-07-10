@@ -5,7 +5,7 @@
 //! transport implementation.
 
 use minip2p_core::{PeerAddr, Protocol};
-use minip2p_quic::{QuicEndpoint, QuicNodeConfig, QuicTransport};
+use minip2p_quic::{QuicEndpoint, QuicLimits, QuicNodeConfig, QuicTransport};
 use minip2p_transport::{ConnectionId, Transport, TransportError, TransportEvent};
 
 // ---------------------------------------------------------------------------
@@ -19,6 +19,19 @@ fn setup_pair() -> (QuicTransport, QuicTransport, PeerAddr) {
     server.listen_on_bound_addr().expect("listen");
     let peer_addr = server.local_peer_addr().expect("peer addr");
 
+    (server, client, peer_addr)
+}
+
+fn setup_pair_with_client_limits(limits: QuicLimits) -> (QuicTransport, QuicTransport, PeerAddr) {
+    let mut server = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server");
+    let client = QuicTransport::new(
+        QuicNodeConfig::generate().with_limits(limits),
+        "127.0.0.1:0",
+    )
+    .expect("client");
+
+    server.listen_on_bound_addr().expect("listen");
+    let peer_addr = server.local_peer_addr().expect("peer addr");
     (server, client, peer_addr)
 }
 
@@ -91,10 +104,10 @@ fn connect_pair(
             }
         }
         for e in &ce {
-            if let TransportEvent::Connected { id, .. } = e {
-                if *id == client_conn {
-                    client_connected = true;
-                }
+            if let TransportEvent::Connected { id, .. } = e
+                && *id == client_conn
+            {
+                client_connected = true;
             }
         }
         all_server_events.extend(se);
@@ -211,6 +224,83 @@ fn outbound_dial_allocates_unique_ids() {
     for _ in 0..20 {
         drive_pair_once(&mut server, &mut client);
     }
+}
+
+#[test]
+fn local_stream_limit_is_enforced_before_allocating_state() {
+    let limits = QuicLimits {
+        max_streams_per_connection: 1,
+        ..QuicLimits::default()
+    };
+    let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+    let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+
+    client.open_stream(client_conn).expect("first stream");
+    let error = client
+        .open_stream(client_conn)
+        .expect_err("second stream must exceed limit");
+    assert!(matches!(
+        error,
+        TransportError::ResourceExhausted {
+            resource: "local QUIC bidirectional streams"
+        }
+    ));
+}
+
+#[test]
+fn pending_stream_byte_limit_rejects_oversized_write() {
+    let limits = QuicLimits {
+        max_pending_stream_bytes: 8,
+        ..QuicLimits::default()
+    };
+    let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+    let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    let stream = client.open_stream(client_conn).expect("open stream");
+
+    let error = client
+        .send_stream(client_conn, stream, vec![0; 9])
+        .expect_err("oversized queued write must fail");
+    assert!(matches!(
+        error,
+        TransportError::ResourceExhausted {
+            resource: "queued QUIC stream bytes"
+        }
+    ));
+}
+
+#[test]
+fn quic_deadline_is_exposed_and_driven_without_socket_input() {
+    let limits = QuicLimits {
+        idle_timeout_ms: 50,
+        ..QuicLimits::default()
+    };
+    let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+    let (_, conn_id, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    assert!(
+        client.next_timeout().is_some(),
+        "connected QUIC session must arm a timer"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut closed = false;
+    while std::time::Instant::now() < deadline {
+        closed |= client
+            .poll()
+            .expect("poll")
+            .into_iter()
+            .any(|event| matches!(event, TransportEvent::Closed { id, .. } if id == conn_id));
+        if closed {
+            break;
+        }
+        let sleep = client
+            .next_timeout()
+            .unwrap_or(std::time::Duration::from_millis(1))
+            .min(std::time::Duration::from_millis(5));
+        if !sleep.is_zero() {
+            std::thread::sleep(sleep);
+        }
+    }
+    assert!(closed, "QUIC timeout must close a silent dial");
 }
 
 #[test]

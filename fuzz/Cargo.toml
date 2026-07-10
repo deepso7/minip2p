@@ -1,0 +1,23 @@
+[package]
+name = "minip2p-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+minip2p-autonat = { path = "../crates/autonat" }
+minip2p-core = { path = "../crates/core" }
+minip2p-dcutr = { path = "../crates/dcutr" }
+minip2p-identify = { path = "../crates/identify" }
+minip2p-relay = { path = "../crates/relay" }
+
+[[bin]]
+name = "wire_inputs"
+path = "fuzz_targets/wire_inputs.rs"
+test = false
+doc = false
+bench = false

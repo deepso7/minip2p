@@ -1,8 +1,12 @@
 [package]
 name = "minip2p-identity"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 readme = "README.md"
+
+[lints]
+workspace = true
 
 [features]
 default = ["std", "ed25519"]
@@ -13,6 +17,6 @@ ed25519 = ["dep:ed25519-dalek", "dep:rand_core", "ed25519-dalek/rand_core"]
 multihash = { version = "0.19.5", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.11.0", default-features = false }
 thiserror = { version = "2.0.18", default-features = false }
-ed25519-dalek = { version = "3.0.0-rc.0", default-features = false, optional = true }
+ed25519-dalek = { version = "3.0.0", default-features = false, optional = true }
 rand_core = { version = "0.10.1", default-features = false, optional = true }
-getrandom = { version = "0.4.2", default-features = false, optional = true }
+getrandom = { version = "0.4.3", default-features = false, optional = true }

@@ -242,7 +242,7 @@ fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, RelayMes
 fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], RelayMessageError> {
     let (length, used) = read_uvarint(&input[*idx..])?;
     *idx += used;
-    let length = length as usize;
+    let length = usize::try_from(length).map_err(|_| VarintError::Overflow)?;
     let remaining = input.len().saturating_sub(*idx);
     if length > remaining {
         return Err(RelayMessageError::FieldOverflow {
@@ -278,7 +278,7 @@ fn skip_unknown_field(
         WIRE_LEN => {
             let (length, used) = read_uvarint(&input[*idx..])?;
             *idx += used;
-            let length = length as usize;
+            let length = usize::try_from(length).map_err(|_| VarintError::Overflow)?;
             let remaining = input.len().saturating_sub(*idx);
             if length > remaining {
                 return Err(RelayMessageError::FieldOverflow {
@@ -352,7 +352,10 @@ pub fn decode_frame(input: &[u8]) -> FrameDecode<'_> {
         Err(e) => return FrameDecode::Error(e),
     };
 
-    let length = length as usize;
+    let length = match usize::try_from(length) {
+        Ok(length) => length,
+        Err(_) => return FrameDecode::Error(VarintError::Overflow),
+    };
     let total = used + length;
     if input.len() < total {
         return FrameDecode::Incomplete;

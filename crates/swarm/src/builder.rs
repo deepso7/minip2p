@@ -37,6 +37,7 @@ pub struct SwarmBuilder {
     protocol_version: String,
     agent_version: String,
     protocols: Vec<String>,
+    user_protocols: Vec<String>,
     public_key: Vec<u8>,
     /// Derived once from the keypair and cached so [`Swarm::local_peer_id`]
     /// is infallible.
@@ -58,6 +59,7 @@ impl SwarmBuilder {
                 IDENTIFY_PROTOCOL_ID.to_string(),
                 PING_PROTOCOL_ID.to_string(),
             ],
+            user_protocols: Vec::new(),
             public_key: keypair.public_key().encode_protobuf(),
             local_peer_id: keypair.peer_id(),
             ping_config: PingConfig::default(),
@@ -92,6 +94,19 @@ impl SwarmBuilder {
         self
     }
 
+    /// Registers an application protocol for both Identify advertisement and
+    /// inbound/outbound multistream-select negotiation.
+    pub fn user_protocol(mut self, protocol_id: impl Into<String>) -> Self {
+        let id = protocol_id.into();
+        if !self.protocols.iter().any(|protocol| protocol == &id) {
+            self.protocols.push(id.clone());
+        }
+        if !self.user_protocols.iter().any(|protocol| protocol == &id) {
+            self.user_protocols.push(id);
+        }
+        self
+    }
+
     /// Overrides the ping configuration (timeout, etc.).
     pub fn ping_config(mut self, config: PingConfig) -> Self {
         self.ping_config = config;
@@ -101,13 +116,18 @@ impl SwarmBuilder {
     /// Consumes the builder and returns a ready-to-use [`Swarm`] over the
     /// given transport.
     pub fn build<T: Transport>(self, transport: T) -> Swarm<T> {
+        let user_protocols = self.user_protocols;
         let identify = IdentifyConfig {
             protocol_version: self.protocol_version,
             agent_version: self.agent_version,
             protocols: self.protocols,
             public_key: self.public_key,
         };
-        Swarm::new(transport, identify, self.ping_config, self.local_peer_id)
+        let mut swarm = Swarm::new(transport, identify, self.ping_config, self.local_peer_id);
+        for protocol in user_protocols {
+            swarm.add_user_protocol(protocol);
+        }
+        swarm
     }
 
     /// Consumes the builder and returns a swarm using an injected clock.
@@ -115,19 +135,24 @@ impl SwarmBuilder {
     /// Intended for deterministic tests of timeout behavior. Normal callers
     /// should use [`SwarmBuilder::build`].
     pub fn build_with_clock<T: Transport>(self, transport: T, clock: Arc<dyn Clock>) -> Swarm<T> {
+        let user_protocols = self.user_protocols;
         let identify = IdentifyConfig {
             protocol_version: self.protocol_version,
             agent_version: self.agent_version,
             protocols: self.protocols,
             public_key: self.public_key,
         };
-        Swarm::with_clock(
+        let mut swarm = Swarm::with_clock(
             transport,
             identify,
             self.ping_config,
             self.local_peer_id,
             clock,
-        )
+        );
+        for protocol in user_protocols {
+            swarm.add_user_protocol(protocol);
+        }
+        swarm
     }
 
     /// Returns the underlying [`IdentifyConfig`] assembled from the builder.

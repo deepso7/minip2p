@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["fuzz"]
 members = [
     "crates/autonat",
     "crates/core",
@@ -16,3 +17,11 @@ members = [
     "transports/quic",
     "examples/peer",
 ]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

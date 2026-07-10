@@ -18,6 +18,23 @@ use crate::events::{
     SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput, SwarmRuntimeError,
 };
 
+/// Errors returned synchronously by the std swarm driver.
+///
+/// Protocol-state rejections remain distinguishable from transport failures;
+/// callers no longer need to recover their meaning from a flattened string.
+#[derive(Debug, thiserror::Error)]
+pub enum DriverError {
+    /// The underlying transport rejected the operation.
+    #[error(transparent)]
+    Transport(#[from] TransportError),
+    /// The Sans-I/O swarm core rejected the operation.
+    #[error(transparent)]
+    Swarm(#[from] SwarmError),
+    /// The driver and core violated their internal action contract.
+    #[error("swarm driver invariant violated: {reason}")]
+    Invariant { reason: &'static str },
+}
+
 /// Sleep cadence when [`Swarm::poll_next`] idles.
 ///
 /// 1ms is short enough that single-digit-millisecond RTTs are
@@ -219,18 +236,7 @@ impl<T: Transport> Swarm<T> {
 
     /// Dial a remote peer. The transport allocates the connection id.
     pub fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
-        let id = self.transport.dial(addr)?;
-        self.core.on_dialed(id);
-        Ok(id)
-    }
-
-    /// Records a connection id allocated by the underlying transport for an
-    /// outbound dial started outside [`Swarm::dial`].
-    ///
-    /// Facade layers use this when calling transport-specific dial helpers
-    /// while keeping swarm connection bookkeeping in sync.
-    pub fn on_dialed(&mut self, id: ConnectionId) {
-        self.core.on_dialed(id);
+        self.transport.dial(addr)
     }
 
     /// Pings a peer, sending a random 32-byte payload and measuring RTT.
@@ -238,20 +244,16 @@ impl<T: Transport> Swarm<T> {
     /// If a ping stream isn't yet negotiated the payload is queued and
     /// fires when the stream becomes ready. The resulting RTT is delivered
     /// via [`SwarmEvent::PingRttMeasured`] on the next `poll()`.
-    pub fn ping(&mut self, peer_id: &PeerId) -> Result<(), TransportError> {
+    pub fn ping(&mut self, peer_id: &PeerId) -> Result<(), DriverError> {
         let payload = rand_ping_payload();
-        self.core
-            .ping(peer_id, payload, self.now_ms())
-            .map_err(swarm_to_transport_error)?;
+        self.core.ping(peer_id, payload, self.now_ms())?;
         self.flush_actions();
         Ok(())
     }
 
     /// Close the connection to a peer.
-    pub fn disconnect(&mut self, peer_id: &PeerId) -> Result<(), TransportError> {
-        self.core
-            .disconnect(peer_id)
-            .map_err(swarm_to_transport_error)?;
+    pub fn disconnect(&mut self, peer_id: &PeerId) -> Result<(), DriverError> {
+        self.core.disconnect(peer_id)?;
         self.flush_actions();
         Ok(())
     }
@@ -268,14 +270,12 @@ impl<T: Transport> Swarm<T> {
         &mut self,
         peer_id: &PeerId,
         protocol_id: &str,
-    ) -> Result<StreamId, TransportError> {
+    ) -> Result<StreamId, DriverError> {
         // The core emits a Pending OpenStream action; we drain it now so
         // the transport.open_stream call happens synchronously and we can
         // return the allocated StreamId to the caller (for DX symmetry
         // with the previous API).
-        self.core
-            .open_user_stream(peer_id, protocol_id)
-            .map_err(swarm_to_transport_error)?;
+        self.core.open_user_stream(peer_id, protocol_id)?;
 
         // Flush all actions, capturing the stream id allocated for this
         // user-protocol open. We inspect actions as we execute them.
@@ -293,8 +293,8 @@ impl<T: Transport> Swarm<T> {
         // already in the core's action queue. Drain those too.
         self.flush_actions();
 
-        allocated_stream.ok_or_else(|| TransportError::PollError {
-            reason: "core did not allocate a stream id for open_user_stream".into(),
+        allocated_stream.ok_or(DriverError::Invariant {
+            reason: "core did not allocate a stream id for open_user_stream",
         })
     }
 
@@ -304,10 +304,8 @@ impl<T: Transport> Swarm<T> {
         peer_id: &PeerId,
         stream_id: StreamId,
         data: Vec<u8>,
-    ) -> Result<(), TransportError> {
-        self.core
-            .send_user_stream(peer_id, stream_id, data)
-            .map_err(swarm_to_transport_error)?;
+    ) -> Result<(), DriverError> {
+        self.core.send_user_stream(peer_id, stream_id, data)?;
         self.flush_actions();
         Ok(())
     }
@@ -317,10 +315,8 @@ impl<T: Transport> Swarm<T> {
         &mut self,
         peer_id: &PeerId,
         stream_id: StreamId,
-    ) -> Result<(), TransportError> {
-        self.core
-            .close_user_stream_write(peer_id, stream_id)
-            .map_err(swarm_to_transport_error)?;
+    ) -> Result<(), DriverError> {
+        self.core.close_user_stream_write(peer_id, stream_id)?;
         self.flush_actions();
         Ok(())
     }
@@ -330,10 +326,8 @@ impl<T: Transport> Swarm<T> {
         &mut self,
         peer_id: &PeerId,
         stream_id: StreamId,
-    ) -> Result<(), TransportError> {
-        self.core
-            .reset_user_stream(peer_id, stream_id)
-            .map_err(swarm_to_transport_error)?;
+    ) -> Result<(), DriverError> {
+        self.core.reset_user_stream(peer_id, stream_id)?;
         self.flush_actions();
         Ok(())
     }
@@ -402,7 +396,14 @@ impl<T: Transport> Swarm<T> {
             if Instant::now() >= deadline {
                 return Ok(None);
             }
-            std::thread::sleep(POLL_IDLE_SLEEP);
+            let sleep_for = self
+                .transport
+                .next_timeout()
+                .map(|timeout| timeout.min(POLL_IDLE_SLEEP))
+                .unwrap_or(POLL_IDLE_SLEEP);
+            if !sleep_for.is_zero() {
+                std::thread::sleep(sleep_for);
+            }
         }
     }
 
@@ -410,10 +411,9 @@ impl<T: Transport> Swarm<T> {
     /// `predicate` returns `true`, or `Ok(None)` if `deadline` expires
     /// first.
     ///
-    /// `predicate` sees every event as it arrives (even the ones that
-    /// don't trigger a return), so it's the natural place to put event
-    /// logging. Events for which `predicate` returns `false` are
-    /// discarded.
+    /// `predicate` sees every event as it arrives. Events for which it returns
+    /// `false` are restored to the front of the event buffer before this method
+    /// returns, preserving their original order for later consumers.
     pub fn run_until<F>(
         &mut self,
         deadline: Instant,
@@ -422,16 +422,23 @@ impl<T: Transport> Swarm<T> {
     where
         F: FnMut(&SwarmEvent) -> bool,
     {
-        loop {
-            match self.poll_next(deadline)? {
-                None => return Ok(None),
-                Some(ev) => {
+        let mut skipped = VecDeque::new();
+        let result = loop {
+            match self.poll_next(deadline) {
+                Err(error) => break Err(error),
+                Ok(None) => break Ok(None),
+                Ok(Some(ev)) => {
                     if predicate(&ev) {
-                        return Ok(Some(ev));
+                        break Ok(Some(ev));
                     }
+                    skipped.push_back(ev);
                 }
             }
+        };
+        for event in skipped.into_iter().rev() {
+            self.event_buffer.push_front(event);
         }
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -552,38 +559,6 @@ fn runtime_error(
     }
 }
 
-/// Bridges a [`SwarmError`] to the driver's public `TransportError` surface.
-///
-/// We keep the std-facing error type as `TransportError` so callers that
-/// already handle transport errors don't have to add a new variant path.
-fn swarm_to_transport_error(err: SwarmError) -> TransportError {
-    match err {
-        SwarmError::NotConnected { peer_id } => TransportError::PollError {
-            reason: format!("peer {peer_id} is not connected"),
-        },
-        SwarmError::ProtocolNotRegistered { protocol_id } => TransportError::InvalidConfig {
-            reason: format!(
-                "protocol '{protocol_id}' is not registered; call add_user_protocol first"
-            ),
-        },
-        SwarmError::RemoteDoesNotSupport {
-            peer_id,
-            protocol_id,
-        } => TransportError::PollError {
-            reason: format!("peer {peer_id} does not support protocol '{protocol_id}'"),
-        },
-        SwarmError::UserStreamNotFound { peer_id, stream_id } => TransportError::PollError {
-            reason: format!("user stream {stream_id} for peer {peer_id} is not active"),
-        },
-        SwarmError::PingError { reason } => TransportError::PollError {
-            reason: format!("ping error: {reason}"),
-        },
-        SwarmError::IdentifyError { reason } => TransportError::PollError {
-            reason: format!("identify error: {reason}"),
-        },
-    }
-}
-
 /// Generates a random 32-byte ping payload using OS randomness, falling
 /// back to a deterministic-but-non-repeating pattern seeded from the wall
 /// clock if the CSPRNG is unavailable.
@@ -603,4 +578,101 @@ fn rand_ping_payload() -> [u8; PING_PAYLOAD_LEN] {
         *byte = ((seed >> (i % 8)) as u8) ^ (i as u8);
     }
     payload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minip2p_identity::Ed25519Keypair;
+    use minip2p_transport::TransportEvent;
+
+    struct IdleTransport;
+
+    impl Transport for IdleTransport {
+        fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
+            unreachable!()
+        }
+
+        fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
+            unreachable!()
+        }
+
+        fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
+            unreachable!()
+        }
+
+        fn send_stream(
+            &mut self,
+            _: ConnectionId,
+            _: StreamId,
+            _: Vec<u8>,
+        ) -> Result<(), TransportError> {
+            unreachable!()
+        }
+
+        fn close_stream_write(
+            &mut self,
+            _: ConnectionId,
+            _: StreamId,
+        ) -> Result<(), TransportError> {
+            unreachable!()
+        }
+
+        fn reset_stream(&mut self, _: ConnectionId, _: StreamId) -> Result<(), TransportError> {
+            unreachable!()
+        }
+
+        fn close(&mut self, _: ConnectionId) -> Result<(), TransportError> {
+            unreachable!()
+        }
+
+        fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn run_until_preserves_non_matching_events() {
+        let keypair = Ed25519Keypair::generate();
+        let local_peer_id = keypair.peer_id();
+        let target_peer_id = Ed25519Keypair::generate().peer_id();
+        let identify = IdentifyConfig {
+            protocol_version: "test/1".into(),
+            agent_version: "test/1".into(),
+            protocols: Vec::new(),
+            public_key: keypair.public_key().encode_protobuf(),
+        };
+        let mut swarm = Swarm::new(
+            IdleTransport,
+            identify,
+            PingConfig::default(),
+            local_peer_id,
+        );
+        swarm
+            .event_buffer
+            .push_back(SwarmEvent::ConnectionEstablished {
+                peer_id: target_peer_id.clone(),
+            });
+        swarm.event_buffer.push_back(SwarmEvent::PeerReady {
+            peer_id: target_peer_id.clone(),
+            protocols: Vec::new(),
+        });
+
+        let found = swarm
+            .run_until(Instant::now(), |event| {
+                matches!(event, SwarmEvent::PeerReady { .. })
+            })
+            .expect("wait")
+            .expect("matching event");
+        assert!(matches!(found, SwarmEvent::PeerReady { .. }));
+
+        let restored = swarm
+            .poll_next(Instant::now())
+            .expect("poll")
+            .expect("restored event");
+        assert!(matches!(
+            restored,
+            SwarmEvent::ConnectionEstablished { peer_id } if peer_id == target_peer_id
+        ));
+    }
 }

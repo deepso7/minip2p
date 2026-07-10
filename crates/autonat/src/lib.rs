@@ -459,11 +459,11 @@ impl SansIoProtocol for AutoNatClient {
         if !outbound.is_empty() {
             return Some(AutoNatClientOutput::Outbound(outbound));
         }
-        if !self.emitted_outcome {
-            if let Some(outcome) = self.outcome.clone() {
-                self.emitted_outcome = true;
-                return Some(AutoNatClientOutput::Outcome(outcome));
-            }
+        if !self.emitted_outcome
+            && let Some(outcome) = self.outcome.clone()
+        {
+            self.emitted_outcome = true;
+            return Some(AutoNatClientOutput::Outcome(outcome));
         }
         None
     }
@@ -491,11 +491,11 @@ impl SansIoProtocol for AutoNatServer {
     }
 
     fn poll_output(&mut self) -> Option<Self::Output> {
-        if !self.emitted_request {
-            if let Some(request) = self.request.clone() {
-                self.emitted_request = true;
-                return Some(AutoNatServerOutput::Request(request));
-            }
+        if !self.emitted_request
+            && let Some(request) = self.request.clone()
+        {
+            self.emitted_request = true;
+            return Some(AutoNatServerOutput::Request(request));
         }
         let outbound = self.take_outbound();
         if !outbound.is_empty() {
@@ -543,7 +543,10 @@ pub fn decode_frame(input: &[u8]) -> FrameDecode<'_> {
         Err(VarintError::BufferTooShort) => return FrameDecode::Incomplete,
         Err(e) => return FrameDecode::Error(e),
     };
-    let len = len as usize;
+    let len = match usize::try_from(len) {
+        Ok(len) => len,
+        Err(_) => return FrameDecode::Error(VarintError::Overflow),
+    };
     if len > MAX_MESSAGE_SIZE {
         return FrameDecode::TooLarge { len };
     }
@@ -774,7 +777,7 @@ fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, AutoNatE
 fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], AutoNatError> {
     let (length, used) = read_uvarint(&input[*idx..])?;
     *idx += used;
-    let length = length as usize;
+    let length = usize::try_from(length).map_err(|_| VarintError::Overflow)?;
     let remaining = input.len().saturating_sub(*idx);
     if length > remaining {
         return Err(AutoNatError::FieldOverflow {

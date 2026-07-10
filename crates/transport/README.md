@@ -28,7 +28,7 @@ impl Transport for MyTransport {
         todo!("initiate outgoing connection and return its allocated id")
     }
 
-    fn listen(&mut self, addr: &Multiaddr) -> Result<(), TransportError> {
+    fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
         todo!("start listening")
     }
 
@@ -63,6 +63,10 @@ impl Transport for MyTransport {
 
     fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
         todo!("drive transport and emit events")
+    }
+
+    fn next_timeout(&self) -> Option<std::time::Duration> {
+        todo!("return the next protocol deadline, if any")
     }
 
     fn local_addresses(&self) -> Vec<Multiaddr> {
