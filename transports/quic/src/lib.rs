@@ -133,6 +133,10 @@ fn validate_retry_token(
     ))
 }
 
+fn reject_oversized_retry_token(require_address_validation: bool, token: &[u8]) -> bool {
+    require_address_validation && !token.is_empty() && token.len() > RETRY_TOKEN_MAX_LEN
+}
+
 /// Parses a QUIC multiaddr into (host protocol, port), validating the /host/udp/port/quic-v1 shape.
 fn extract_quic_host_and_port(
     multiaddr: &Multiaddr,
@@ -1199,10 +1203,12 @@ impl Transport for QuicTransport {
                 target_conn_id.is_none()
                     && self.listen_addr.is_some()
                     && header.ty == quiche::Type::Initial
-                    && header
-                        .token
-                        .as_deref()
-                        .is_some_and(|token| !token.is_empty() && token.len() > RETRY_TOKEN_MAX_LEN)
+                    && header.token.as_deref().is_some_and(|token| {
+                        reject_oversized_retry_token(
+                            self.node_config.limits().require_address_validation,
+                            token,
+                        )
+                    })
             });
             if oversized_new_initial_token {
                 continue;
@@ -1675,6 +1681,11 @@ mod tests {
         let mut oversized = max_token;
         oversized.push(0);
         assert!(validate_retry_token(&secret, ipv6_source, &oversized, 100).is_none());
+        assert!(reject_oversized_retry_token(true, &oversized));
+        assert!(
+            !reject_oversized_retry_token(false, &oversized),
+            "disabled address validation must not impose our Retry token format"
+        );
     }
 
     fn localhost_families(port: u16) -> BTreeSet<AddressFamily> {

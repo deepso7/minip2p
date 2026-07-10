@@ -463,11 +463,10 @@ impl<T: Transport> Swarm<T> {
     /// reported back).
     fn flush_actions(&mut self) {
         let mut allocated: Option<StreamId> = None;
-        let mut open_error: Option<TransportError> = None;
         while let Some(output) = self.core.poll_output() {
             match output {
                 SwarmOutput::Action(action) => {
-                    self.dispatch_action(action, &mut allocated, &mut open_error)
+                    self.dispatch_action(action, &mut allocated, &mut None)
                 }
                 SwarmOutput::Event(event) => self.event_buffer.push_back(event),
             }
