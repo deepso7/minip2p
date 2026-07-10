@@ -356,10 +356,10 @@ pub fn decode_frame(input: &[u8]) -> FrameDecode<'_> {
         Ok(length) => length,
         Err(_) => return FrameDecode::Error(VarintError::Overflow),
     };
-    let total = used + length;
-    if input.len() < total {
+    if length > input.len().saturating_sub(used) {
         return FrameDecode::Incomplete;
     }
+    let total = used + length;
 
     FrameDecode::Complete {
         payload: &input[used..total],
@@ -824,6 +824,14 @@ mod tests {
         let mut framed = encode_frame(b"hello world");
         framed.truncate(framed.len() - 3);
         assert!(matches!(decode_frame(&framed), FrameDecode::Incomplete));
+    }
+
+    #[test]
+    fn frame_incomplete_when_declared_length_overflows_total() {
+        let input = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x22, 0xad,
+        ];
+        assert!(matches!(decode_frame(&input), FrameDecode::Incomplete));
     }
 
     #[test]
