@@ -37,6 +37,10 @@ const DEFAULT_IPV6_BIND: &str = "[::]:0";
 const RETRY_TOKEN_VERSION: u8 = 1;
 const RETRY_TOKEN_LIFETIME_SECS: u64 = 10;
 const RETRY_TOKEN_MAC_LEN: usize = 32;
+const RETRY_TOKEN_MAX_ADDRESS_LEN: usize = 18;
+const RETRY_TOKEN_MIN_LEN: usize = 1 + 8 + 1 + 6 + 1 + 1 + RETRY_TOKEN_MAC_LEN;
+const RETRY_TOKEN_MAX_LEN: usize =
+    1 + 8 + 1 + RETRY_TOKEN_MAX_ADDRESS_LEN + 1 + quiche::MAX_CONN_ID_LEN + RETRY_TOKEN_MAC_LEN;
 
 type RetryHmac = Hmac<Sha256>;
 
@@ -47,11 +51,20 @@ fn unix_time_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn retry_ip_bytes(addr: SocketAddr) -> Vec<u8> {
-    match addr.ip() {
-        IpAddr::V4(ip) => ip.octets().to_vec(),
-        IpAddr::V6(ip) => ip.octets().to_vec(),
-    }
+fn retry_address_bytes(addr: SocketAddr) -> ([u8; RETRY_TOKEN_MAX_ADDRESS_LEN], usize) {
+    let mut bytes = [0u8; RETRY_TOKEN_MAX_ADDRESS_LEN];
+    let ip_len = match addr.ip() {
+        IpAddr::V4(ip) => {
+            bytes[..4].copy_from_slice(&ip.octets());
+            4
+        }
+        IpAddr::V6(ip) => {
+            bytes[..16].copy_from_slice(&ip.octets());
+            16
+        }
+    };
+    bytes[ip_len..ip_len + 2].copy_from_slice(&addr.port().to_be_bytes());
+    (bytes, ip_len + 2)
 }
 
 fn mint_retry_token(
@@ -60,12 +73,12 @@ fn mint_retry_token(
     original_dcid: &[u8],
     issued_at: u64,
 ) -> Vec<u8> {
-    let ip = retry_ip_bytes(source);
-    let mut token = Vec::with_capacity(1 + 8 + 1 + ip.len() + 1 + original_dcid.len() + 32);
+    let (address, address_len) = retry_address_bytes(source);
+    let mut token = Vec::with_capacity(1 + 8 + 1 + address_len + 1 + original_dcid.len() + 32);
     token.push(RETRY_TOKEN_VERSION);
     token.extend_from_slice(&issued_at.to_be_bytes());
-    token.push(ip.len() as u8);
-    token.extend_from_slice(&ip);
+    token.push(address_len as u8);
+    token.extend_from_slice(&address[..address_len]);
     token.push(original_dcid.len() as u8);
     token.extend_from_slice(original_dcid);
 
@@ -81,7 +94,7 @@ fn validate_retry_token(
     token: &[u8],
     now: u64,
 ) -> Option<QuicConnectionId<'static>> {
-    if token.len() < 1 + 8 + 1 + 1 + RETRY_TOKEN_MAC_LEN {
+    if !(RETRY_TOKEN_MIN_LEN..=RETRY_TOKEN_MAX_LEN).contains(&token.len()) {
         return None;
     }
 
@@ -98,16 +111,19 @@ fn validate_retry_token(
         return None;
     }
 
-    let ip_len = *body.get(9)? as usize;
-    let ip_start = 10;
-    let ip_end = ip_start + ip_len;
-    if body.get(ip_start..ip_end)? != retry_ip_bytes(source) {
+    let address_len = *body.get(9)? as usize;
+    let address_start: usize = 10;
+    let address_end = address_start.checked_add(address_len)?;
+    let (expected_address, expected_address_len) = retry_address_bytes(source);
+    if address_len != expected_address_len
+        || body.get(address_start..address_end)? != &expected_address[..expected_address_len]
+    {
         return None;
     }
 
-    let dcid_len = *body.get(ip_end)? as usize;
-    let dcid_start = ip_end + 1;
-    let dcid_end = dcid_start + dcid_len;
+    let dcid_len = *body.get(address_end)? as usize;
+    let dcid_start = address_end + 1;
+    let dcid_end = dcid_start.checked_add(dcid_len)?;
     if dcid_end != body.len() || dcid_len == 0 || dcid_len > quiche::MAX_CONN_ID_LEN {
         return None;
     }
@@ -300,6 +316,12 @@ fn socket_addr_to_multiaddr(addr: SocketAddr) -> Multiaddr {
 
 /// Builds the shared QUIC TLS configuration.
 fn build_quiche_config(node_config: &QuicNodeConfig) -> Result<quiche::Config, TransportError> {
+    if node_config.limits().max_pending_datagrams == 0 {
+        return Err(TransportError::InvalidConfig {
+            reason: "max_pending_datagrams must be greater than zero".into(),
+        });
+    }
+
     let mut tls_builder =
         SslContextBuilder::new(SslMethod::tls()).map_err(|e| TransportError::ListenFailed {
             reason: format!("failed to create BoringSSL context: {e}"),
@@ -1173,6 +1195,19 @@ impl Transport for QuicTransport {
                 .as_ref()
                 .and_then(|header| self.cid_to_connection.get(header.dcid.as_ref()).copied());
 
+            let oversized_new_initial_token = parsed_header.as_ref().is_some_and(|header| {
+                target_conn_id.is_none()
+                    && self.listen_addr.is_some()
+                    && header.ty == quiche::Type::Initial
+                    && header
+                        .token
+                        .as_deref()
+                        .is_some_and(|token| !token.is_empty() && token.len() > RETRY_TOKEN_MAX_LEN)
+            });
+            if oversized_new_initial_token {
+                continue;
+            }
+
             // Only copy header fields for a genuinely new Initial. Established
             // packet routing stays allocation-free.
             let new_initial = parsed_header.as_ref().and_then(|header| {
@@ -1616,11 +1651,30 @@ mod tests {
             )
             .is_none()
         );
+        assert!(
+            validate_retry_token(
+                &secret,
+                "192.0.2.10:4002".parse().expect("other port"),
+                &token,
+                105,
+            )
+            .is_none()
+        );
         assert!(validate_retry_token(&secret, source, &token, 111).is_none());
 
         let mut tampered = token;
         tampered[10] ^= 1;
         assert!(validate_retry_token(&secret, source, &tampered, 105).is_none());
+
+        let ipv6_source: SocketAddr = "[2001:db8::1]:65535".parse().expect("ipv6 source");
+        let max_dcid = [3u8; quiche::MAX_CONN_ID_LEN];
+        let max_token = mint_retry_token(&secret, ipv6_source, &max_dcid, 100);
+        assert_eq!(max_token.len(), RETRY_TOKEN_MAX_LEN);
+        assert!(validate_retry_token(&secret, ipv6_source, &max_token, 100).is_some());
+
+        let mut oversized = max_token;
+        oversized.push(0);
+        assert!(validate_retry_token(&secret, ipv6_source, &oversized, 100).is_none());
     }
 
     fn localhost_families(port: u16) -> BTreeSet<AddressFamily> {

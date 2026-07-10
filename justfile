@@ -2,12 +2,15 @@ default: test
 
 fmt:
     cargo fmt --all
+    cargo fmt --manifest-path fuzz/Cargo.toml
 
 check:
     cargo check --workspace --all-targets
+    cargo check --manifest-path fuzz/Cargo.toml --all-targets
 
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
 test:
     cargo test

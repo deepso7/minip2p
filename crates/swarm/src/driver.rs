@@ -280,10 +280,11 @@ impl<T: Transport> Swarm<T> {
         // Flush all actions, capturing the stream id allocated for this
         // user-protocol open. We inspect actions as we execute them.
         let mut allocated_stream: Option<StreamId> = None;
+        let mut open_error: Option<TransportError> = None;
         while let Some(output) = self.core.poll_output() {
             match output {
                 SwarmOutput::Action(action) => {
-                    self.dispatch_action(action, &mut allocated_stream);
+                    self.dispatch_action(action, &mut allocated_stream, &mut open_error);
                 }
                 SwarmOutput::Event(event) => self.event_buffer.push_back(event),
             }
@@ -293,6 +294,9 @@ impl<T: Transport> Swarm<T> {
         // already in the core's action queue. Drain those too.
         self.flush_actions();
 
+        if let Some(error) = open_error {
+            return Err(DriverError::Transport(error));
+        }
         allocated_stream.ok_or(DriverError::Invariant {
             reason: "core did not allocate a stream id for open_user_stream",
         })
@@ -364,7 +368,7 @@ impl<T: Transport> Swarm<T> {
         let mut events: Vec<SwarmEvent> = self.event_buffer.drain(..).collect();
         while let Some(output) = self.core.poll_output() {
             match output {
-                SwarmOutput::Action(action) => self.dispatch_action(action, &mut None),
+                SwarmOutput::Action(action) => self.dispatch_action(action, &mut None, &mut None),
                 SwarmOutput::Event(event) => events.push(event),
             }
         }
@@ -432,6 +436,9 @@ impl<T: Transport> Swarm<T> {
                         break Ok(Some(ev));
                     }
                     skipped.push_back(ev);
+                    if Instant::now() >= deadline {
+                        break Ok(None);
+                    }
                 }
             }
         };
@@ -456,9 +463,12 @@ impl<T: Transport> Swarm<T> {
     /// reported back).
     fn flush_actions(&mut self) {
         let mut allocated: Option<StreamId> = None;
+        let mut open_error: Option<TransportError> = None;
         while let Some(output) = self.core.poll_output() {
             match output {
-                SwarmOutput::Action(action) => self.dispatch_action(action, &mut allocated),
+                SwarmOutput::Action(action) => {
+                    self.dispatch_action(action, &mut allocated, &mut open_error)
+                }
                 SwarmOutput::Event(event) => self.event_buffer.push_back(event),
             }
         }
@@ -472,7 +482,12 @@ impl<T: Transport> Swarm<T> {
     /// remembers the **last** stream id allocated during the flush, which
     /// is accurate because `open_user_stream` triggers exactly one
     /// `OpenStream` action per call.
-    fn dispatch_action(&mut self, action: SwarmAction, captured_stream_id: &mut Option<StreamId>) {
+    fn dispatch_action(
+        &mut self,
+        action: SwarmAction,
+        captured_stream_id: &mut Option<StreamId>,
+        captured_open_error: &mut Option<TransportError>,
+    ) {
         match action {
             SwarmAction::OpenStream { conn_id, token } => match self.transport.open_stream(conn_id)
             {
@@ -487,6 +502,7 @@ impl<T: Transport> Swarm<T> {
                 }
                 Err(e) => {
                     let reason = format!("{e}");
+                    *captured_open_error = Some(e);
                     self.core.handle_input(SwarmInput::OpenStreamFailed {
                         token,
                         reason,
@@ -584,7 +600,7 @@ fn rand_ping_payload() -> [u8; PING_PAYLOAD_LEN] {
 mod tests {
     use super::*;
     use minip2p_identity::Ed25519Keypair;
-    use minip2p_transport::TransportEvent;
+    use minip2p_transport::{ConnectionEndpoint, TransportEvent};
 
     struct IdleTransport;
 
@@ -631,6 +647,74 @@ mod tests {
         }
     }
 
+    struct FailingUserOpenTransport {
+        events: VecDeque<TransportEvent>,
+        open_calls: usize,
+    }
+
+    impl FailingUserOpenTransport {
+        fn connected(peer_id: PeerId) -> Self {
+            let endpoint = ConnectionEndpoint::with_peer_id(Multiaddr::new(), peer_id);
+            Self {
+                events: VecDeque::from([TransportEvent::Connected {
+                    id: ConnectionId::new(1),
+                    endpoint,
+                }]),
+                open_calls: 0,
+            }
+        }
+    }
+
+    impl Transport for FailingUserOpenTransport {
+        fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
+            unreachable!()
+        }
+
+        fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
+            unreachable!()
+        }
+
+        fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
+            self.open_calls += 1;
+            if self.open_calls == 1 {
+                Ok(StreamId::new(0))
+            } else {
+                Err(TransportError::ResourceExhausted {
+                    resource: "test stream capacity",
+                })
+            }
+        }
+
+        fn send_stream(
+            &mut self,
+            _: ConnectionId,
+            _: StreamId,
+            _: Vec<u8>,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn close_stream_write(
+            &mut self,
+            _: ConnectionId,
+            _: StreamId,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn reset_stream(&mut self, _: ConnectionId, _: StreamId) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn close(&mut self, _: ConnectionId) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+            Ok(self.events.drain(..).collect())
+        }
+    }
+
     #[test]
     fn run_until_preserves_non_matching_events() {
         let keypair = Ed25519Keypair::generate();
@@ -659,7 +743,7 @@ mod tests {
         });
 
         let found = swarm
-            .run_until(Instant::now(), |event| {
+            .run_until(Instant::now() + Duration::from_secs(1), |event| {
                 matches!(event, SwarmEvent::PeerReady { .. })
             })
             .expect("wait")
@@ -674,5 +758,81 @@ mod tests {
             restored,
             SwarmEvent::ConnectionEstablished { peer_id } if peer_id == target_peer_id
         ));
+    }
+
+    #[test]
+    fn run_until_honors_expired_deadline_with_buffered_events() {
+        let keypair = Ed25519Keypair::generate();
+        let peer_id = Ed25519Keypair::generate().peer_id();
+        let identify = IdentifyConfig {
+            protocol_version: "test/1".into(),
+            agent_version: "test/1".into(),
+            protocols: Vec::new(),
+            public_key: keypair.public_key().encode_protobuf(),
+        };
+        let mut swarm = Swarm::new(
+            IdleTransport,
+            identify,
+            PingConfig::default(),
+            keypair.peer_id(),
+        );
+        swarm
+            .event_buffer
+            .push_back(SwarmEvent::ConnectionEstablished {
+                peer_id: peer_id.clone(),
+            });
+        swarm.event_buffer.push_back(SwarmEvent::PeerReady {
+            peer_id,
+            protocols: Vec::new(),
+        });
+
+        let found = swarm
+            .run_until(Instant::now(), |event| {
+                matches!(event, SwarmEvent::PeerReady { .. })
+            })
+            .expect("wait");
+        assert!(found.is_none(), "expired wait must not scan indefinitely");
+        assert_eq!(swarm.event_buffer.len(), 2, "events must be preserved");
+        assert!(matches!(
+            swarm.event_buffer.front(),
+            Some(SwarmEvent::ConnectionEstablished { .. })
+        ));
+    }
+
+    #[test]
+    fn user_stream_open_preserves_transport_error_type() {
+        const PROTOCOL: &str = "/test/1.0.0";
+        let keypair = Ed25519Keypair::generate();
+        let remote_peer = Ed25519Keypair::generate().peer_id();
+        let identify = IdentifyConfig {
+            protocol_version: "test/1".into(),
+            agent_version: "test/1".into(),
+            protocols: vec![PROTOCOL.into()],
+            public_key: keypair.public_key().encode_protobuf(),
+        };
+        let transport = FailingUserOpenTransport::connected(remote_peer.clone());
+        let mut swarm = Swarm::new(
+            transport,
+            identify,
+            PingConfig::default(),
+            keypair.peer_id(),
+        );
+        swarm.add_user_protocol(PROTOCOL);
+        swarm.poll().expect("process connected event");
+
+        let error = swarm
+            .open_user_stream(&remote_peer, PROTOCOL)
+            .expect_err("transport must reject user stream");
+        assert!(matches!(
+            error,
+            DriverError::Transport(TransportError::ResourceExhausted {
+                resource: "test stream capacity"
+            })
+        ));
+        assert!(swarm.core.is_idle(), "failed open must clear core state");
+        assert!(swarm.event_buffer.iter().any(|event| matches!(
+            event,
+            SwarmEvent::Error(error) if error.kind == SwarmErrorKind::OpenStreamFailed
+        )));
     }
 }

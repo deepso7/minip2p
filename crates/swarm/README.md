@@ -21,8 +21,10 @@ Orchestration layer that composes minip2p's protocol state machines into a singl
 - `swarm.ping(peer_id)` opens / reuses a ping stream with no manual protocol negotiation.
 - `swarm.listen_on_bound_addrs()` starts listening on every bound transport address and returns the local `PeerAddr`s. `listen_on_bound_addr()` remains as a first-address convenience for single-socket transports.
 - `swarm.connected_peers()`, `swarm.peer_info(&peer_id)`, and `swarm.is_peer_ready(&peer_id)` expose read-only peer state.
-- Synchronous application failures use `DriverError`, preserving whether the
-  transport or Sans-I/O core rejected an operation.
+- Core-driven intents such as `ping`, `disconnect`, and user-stream operations
+  use `DriverError`. Direct listen, dial, and polling methods return
+  `TransportError`; asynchronous action failures are emitted as
+  `SwarmEvent::Error`.
 - `run_until` preserves non-matching events in order, so convenience waits do
   not steal unrelated application events.
 - Generic user-protocol hook for anything else (relay, DCUtR, custom app protocols):

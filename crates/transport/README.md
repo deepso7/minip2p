@@ -18,6 +18,7 @@ This crate defines the transport abstraction that concrete adapters (QUIC, WebSo
 Implement the `Transport` trait for your adapter:
 
 ```rust
+use core::time::Duration;
 use minip2p_core::{Multiaddr, PeerAddr};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, TransportEvent};
 
@@ -65,7 +66,7 @@ impl Transport for MyTransport {
         todo!("drive transport and emit events")
     }
 
-    fn next_timeout(&self) -> Option<std::time::Duration> {
+    fn next_timeout(&self) -> Option<Duration> {
         todo!("return the next protocol deadline, if any")
     }
 

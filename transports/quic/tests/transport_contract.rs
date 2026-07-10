@@ -6,7 +6,7 @@
 
 use minip2p_core::{PeerAddr, Protocol};
 use minip2p_quic::{QuicEndpoint, QuicLimits, QuicNodeConfig, QuicTransport};
-use minip2p_transport::{ConnectionId, Transport, TransportError, TransportEvent};
+use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, TransportEvent};
 
 // ---------------------------------------------------------------------------
 // Helpers (shared with two_peer.rs; duplicated to keep test files independent)
@@ -244,6 +244,75 @@ fn local_stream_limit_is_enforced_before_allocating_state() {
         TransportError::ResourceExhausted {
             resource: "local QUIC bidirectional streams"
         }
+    ));
+}
+
+#[test]
+fn local_stream_limit_is_released_after_stream_gc() {
+    let limits = QuicLimits {
+        max_streams_per_connection: 1,
+        ..QuicLimits::default()
+    };
+    let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+    let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    let first = client.open_stream(client_conn).expect("first stream");
+    client
+        .send_stream(client_conn, first, b"data".to_vec())
+        .expect("send first stream");
+    for _ in 0..10 {
+        drive_pair_once(&mut server, &mut client);
+    }
+    client
+        .reset_stream(client_conn, first)
+        .expect("reset first");
+    client.poll().expect("collect and gc reset stream");
+
+    let second = client
+        .open_stream(client_conn)
+        .expect("closed stream must release concurrent capacity");
+    assert_ne!(second, first);
+}
+
+#[test]
+fn stream_operations_reject_ids_not_allocated_by_transport() {
+    let (mut server, mut client, peer_addr) = setup_pair();
+    let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    let forged = StreamId::new(0);
+
+    let send_error = client
+        .send_stream(client_conn, forged, b"bypass".to_vec())
+        .expect_err("send must require open_stream");
+    assert!(matches!(send_error, TransportError::StreamNotFound { .. }));
+    let close_error = client
+        .close_stream_write(client_conn, forged)
+        .expect_err("close must require open_stream");
+    assert!(matches!(close_error, TransportError::StreamNotFound { .. }));
+
+    assert_eq!(
+        client.open_stream(client_conn).expect("legitimate open"),
+        forged,
+        "rejected forged operations must not consume the allocator"
+    );
+}
+
+#[test]
+fn zero_pending_datagram_limit_is_rejected() {
+    let limits = QuicLimits {
+        max_pending_datagrams: 0,
+        ..QuicLimits::default()
+    };
+    let result = QuicTransport::new(
+        QuicNodeConfig::generate().with_limits(limits),
+        "127.0.0.1:0",
+    );
+    let error = match result {
+        Ok(_) => panic!("zero datagram capacity must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        TransportError::InvalidConfig { ref reason }
+            if reason.contains("max_pending_datagrams")
     ));
 }
 
