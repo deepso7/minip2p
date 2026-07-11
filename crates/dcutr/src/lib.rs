@@ -580,8 +580,19 @@ impl SansIoProtocol for DcutrResponder {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+/// Longest length prefix a legal frame can carry: [`MAX_MESSAGE_SIZE`] is
+/// below 2^14, so its uvarint prefix encodes in at most two bytes.
+const MAX_FRAME_PREFIX_LEN: usize = 2;
+
+/// Bounds the receive buffer to one maximal legal frame: payload plus its
+/// length prefix.
+///
+/// The payload bound itself is enforced by [`decode_frame`]; this guard
+/// only stops unbounded buffering, so it must never reject a frame the
+/// decoder would accept -- a payload of exactly [`MAX_MESSAGE_SIZE`] plus
+/// its two-byte prefix is legal on the wire.
 fn enforce_max_size(buf: &[u8]) -> Result<(), DcutrError> {
-    if buf.len() > MAX_MESSAGE_SIZE {
+    if buf.len() > MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN {
         return Err(DcutrError::MessageTooLarge { len: buf.len() });
     }
     Ok(())
@@ -867,8 +878,12 @@ mod tests {
 
     #[test]
     fn rejects_oversized_message() {
+        // One byte beyond a maximal legal frame (payload + 2-byte prefix)
+        // must trip the receive-buffer guard.
         let mut resp = DcutrResponder::new(&[]);
-        let large = vec![0u8; MAX_MESSAGE_SIZE + 1];
+        let mut large = Vec::new();
+        minip2p_core::write_uvarint(MAX_MESSAGE_SIZE as u64, &mut large);
+        large.extend_from_slice(&vec![0u8; MAX_MESSAGE_SIZE + 1]);
         let err = resp.on_data(&large).unwrap_err();
         assert!(matches!(err, DcutrError::MessageTooLarge { .. }));
     }
@@ -938,6 +953,17 @@ mod tests {
         assert!(matches!(
             decode_frame(&framed),
             FrameDecode::Complete { .. }
+        ));
+
+        // The framed bytes (payload + 2-byte prefix) must also survive the
+        // state machine's own receive-buffer guard, not just decode_frame.
+        let own = [addr("/ip4/10.0.0.1/udp/1234/quic-v1")];
+        let mut resp = DcutrResponder::new(&own);
+        resp.handle_input(DcutrResponderInput::Data(framed))
+            .expect("exactly-max CONNECT frame must be accepted by the responder");
+        assert!(matches!(
+            resp.poll_output(),
+            Some(DcutrResponderOutput::Outbound(_))
         ));
 
         // One more byte and the frame must be refused.

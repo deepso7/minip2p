@@ -819,9 +819,20 @@ impl Default for StopResponder {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Rejects an oversized receive buffer to protect against memory exhaustion.
+/// Longest length prefix a legal frame can carry: [`MAX_MESSAGE_SIZE`] is
+/// below 2^14, so its uvarint prefix encodes in at most two bytes.
+const MAX_FRAME_PREFIX_LEN: usize = 2;
+
+/// Rejects an oversized receive buffer to protect against memory
+/// exhaustion, bounding it to one maximal legal frame: payload plus its
+/// length prefix.
+///
+/// The payload bound itself is enforced by [`decode_frame`]; this guard
+/// must never reject a frame the decoder would accept -- a payload of
+/// exactly [`MAX_MESSAGE_SIZE`] plus its two-byte prefix is legal on the
+/// wire.
 fn enforce_max_size(buf: &[u8]) -> Result<(), RelayError> {
-    if buf.len() > MAX_MESSAGE_SIZE {
+    if buf.len() > MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN {
         return Err(RelayError::MessageTooLarge { len: buf.len() });
     }
     Ok(())
@@ -986,7 +997,11 @@ mod tests {
         let mut flow = HopReservation::new();
         let _ = flow.take_outbound();
 
-        let large = vec![0u8; MAX_MESSAGE_SIZE + 1];
+        // One byte beyond a maximal legal frame (payload + 2-byte prefix)
+        // must trip the receive-buffer guard.
+        let mut large = Vec::new();
+        minip2p_core::write_uvarint(MAX_MESSAGE_SIZE as u64, &mut large);
+        large.extend_from_slice(&vec![0u8; MAX_MESSAGE_SIZE + 1]);
         let err = flow.on_data(&large).unwrap_err();
         assert!(matches!(err, RelayError::MessageTooLarge { .. }));
     }
@@ -1134,12 +1149,36 @@ mod tests {
         };
         assert_eq!(request.encode().len(), MAX_MESSAGE_SIZE);
 
-        let mut flow = HopConnect::new(id);
+        let mut flow = HopConnect::new(id.clone());
         flow.handle_input(HopConnectInput::Flush).unwrap();
         let Some(HopConnectOutput::Outbound(bytes)) = flow.poll_output() else {
             panic!("exactly-max CONNECT must be emitted");
         };
         assert!(matches!(decode_frame(&bytes), FrameDecode::Complete { .. }));
+
+        // An exactly-max frame (payload + 2-byte prefix) must also survive
+        // a state machine's receive-buffer guard, not just decode_frame.
+        // A STOP CONNECT carrying the same peer id is exactly max-size too.
+        let stop_connect = StopMessage {
+            kind: StopMessageType::Connect,
+            peer: Some(Peer {
+                id,
+                addrs: Vec::new(),
+            }),
+            limit: None,
+            status: None,
+        };
+        assert_eq!(stop_connect.encode().len(), MAX_MESSAGE_SIZE);
+        let mut responder = StopResponder::new();
+        responder
+            .handle_input(StopResponderInput::Data(encode_frame(
+                &stop_connect.encode(),
+            )))
+            .expect("exactly-max STOP CONNECT frame must be accepted");
+        assert!(matches!(
+            responder.poll_output(),
+            Some(StopResponderOutput::Request(_))
+        ));
 
         // One more byte and the frame must be refused.
         let mut flow = HopConnect::new(vec![0u8; 8185]);
