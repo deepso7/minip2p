@@ -33,6 +33,17 @@ pub enum DriverError {
     /// The driver and core violated their internal action contract.
     #[error("swarm driver invariant violated: {reason}")]
     Invariant { reason: &'static str },
+    /// [`Swarm::run_until`] set aside [`RUN_UNTIL_SKIP_LIMIT`] non-matching
+    /// events without finding a match.
+    ///
+    /// The skipped events were restored to the event buffer in their
+    /// original order; drain them with [`Swarm::poll_next`] before waiting
+    /// again, or use a predicate that matches (and thereby consumes) the
+    /// high-volume events.
+    #[error(
+        "run_until skipped {limit} events without a match; drain the event buffer with poll_next"
+    )]
+    EventBacklogExceeded { limit: usize },
 }
 
 /// Fallback sleep cadence when [`Swarm::poll_next`] idles over a transport
@@ -49,6 +60,16 @@ const POLL_IDLE_SLEEP: Duration = Duration::from_millis(1);
 /// ([`Deadline::NEVER`]). Re-arming the wait occasionally is harmless (one
 /// syscall a minute) and keeps unbounded durations out of OS interfaces.
 const MAX_IDLE_WAIT: Duration = Duration::from_secs(60);
+
+/// Maximum number of non-matching events [`Swarm::run_until`] sets aside
+/// while scanning for a match.
+///
+/// Skipped events are buffered so they can be restored for later consumers;
+/// without a cap, a peer streaming [`SwarmEvent::StreamData`] payloads while
+/// the caller waits for an unrelated event could grow that buffer without
+/// bound. Hitting the cap aborts the wait with
+/// [`DriverError::EventBacklogExceeded`] after restoring every skipped event.
+pub const RUN_UNTIL_SKIP_LIMIT: usize = 1024;
 
 /// When a blocking wait should give up.
 ///
@@ -500,11 +521,16 @@ impl<T: Transport> Swarm<T> {
             if deadline.is_expired_at(now) {
                 return Ok(None);
             }
-            // Budget: never sleep past the caller's deadline or the
-            // transport's next protocol timer.
+            // Budget: never sleep past the caller's deadline, the
+            // transport's next protocol timer, or the core's next internal
+            // timer (e.g. a ping timeout, which only fires when a Tick is
+            // fed into the core by `poll()`).
             let mut budget = deadline.remaining_at(now).unwrap_or(MAX_IDLE_WAIT);
             if let Some(timeout) = self.transport.next_timeout() {
                 budget = budget.min(timeout);
+            }
+            if let Some(timeout_ms) = self.core.next_timeout(self.now_ms()) {
+                budget = budget.min(Duration::from_millis(timeout_ms));
             }
             if budget.is_zero() {
                 continue;
@@ -525,6 +551,13 @@ impl<T: Transport> Swarm<T> {
     /// `predicate` sees every event as it arrives. Events for which it returns
     /// `false` are restored to the front of the event buffer before this method
     /// returns, preserving their original order for later consumers.
+    ///
+    /// At most [`RUN_UNTIL_SKIP_LIMIT`] non-matching events are set aside
+    /// this way; an unbounded wait (e.g. [`Deadline::NEVER`]) must not buffer
+    /// arbitrary amounts of event data while a peer floods us with, say,
+    /// [`SwarmEvent::StreamData`]. When the cap is hit, every skipped event
+    /// is restored in order and [`DriverError::EventBacklogExceeded`] is
+    /// returned; drain the buffer with [`Swarm::poll_next`].
     ///
     /// The deadline never truncates the scan mid-buffer: once it passes,
     /// every event that is already synchronously available -- buffered
@@ -566,6 +599,12 @@ impl<T: Transport> Swarm<T> {
                         break;
                     }
                     skipped.push_back(ev);
+                    if skipped.len() >= RUN_UNTIL_SKIP_LIMIT {
+                        result = Err(DriverError::EventBacklogExceeded {
+                            limit: RUN_UNTIL_SKIP_LIMIT,
+                        });
+                        break;
+                    }
                 }
             }
         }
@@ -596,9 +635,17 @@ impl<T: Transport> Swarm<T> {
                     break;
                 }
                 skipped.push_back(ev);
+                if skipped.len() >= RUN_UNTIL_SKIP_LIMIT {
+                    result = Err(DriverError::EventBacklogExceeded {
+                        limit: RUN_UNTIL_SKIP_LIMIT,
+                    });
+                    break;
+                }
             }
         }
 
+        // Restore skipped events in their original order -- on a match, on
+        // deadline expiry, and on error alike.
         for event in skipped.into_iter().rev() {
             self.event_buffer.push_front(event);
         }
@@ -754,8 +801,15 @@ fn rand_ping_payload() -> [u8; PING_PAYLOAD_LEN] {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+    use minip2p_core::SansIoProtocol;
+    use minip2p_identify::IDENTIFY_PROTOCOL_ID;
     use minip2p_identity::Ed25519Keypair;
+    use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, MultistreamSelect};
+    use minip2p_ping::PING_PROTOCOL_ID;
     use minip2p_transport::{ConnectionEndpoint, TransportEvent};
 
     /// Transport that never produces events; counts `poll()` calls so tests
@@ -1134,6 +1188,312 @@ mod tests {
             buffered_open_failures(&swarm),
             1,
             "asynchronous failure must surface exactly once"
+        );
+    }
+
+    /// A `StreamData` event whose stream id encodes its position, so tests
+    /// can assert restoration order after `run_until` skips it.
+    fn indexed_stream_data(peer_id: &PeerId, index: u64) -> SwarmEvent {
+        SwarmEvent::StreamData {
+            peer_id: peer_id.clone(),
+            stream_id: StreamId::new(index),
+            data: vec![0u8; 8],
+        }
+    }
+
+    fn assert_indexed_order(swarm: &Swarm<IdleTransport>, expected_len: usize) {
+        assert_eq!(
+            swarm.event_buffer.len(),
+            expected_len,
+            "every skipped event must be restored"
+        );
+        for (i, event) in swarm.event_buffer.iter().enumerate() {
+            assert!(
+                matches!(
+                    event,
+                    SwarmEvent::StreamData { stream_id, .. } if *stream_id == StreamId::new(i as u64)
+                ),
+                "restored event {i} is out of order: {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_until_overflow_returns_error_and_restores_events_in_order() {
+        let peer_id = Ed25519Keypair::generate().peer_id();
+        let mut swarm = idle_swarm();
+        let total = RUN_UNTIL_SKIP_LIMIT + 5;
+        for i in 0..total {
+            swarm
+                .event_buffer
+                .push_back(indexed_stream_data(&peer_id, i as u64));
+        }
+
+        // An unbounded wait over a flood of non-matching events must abort
+        // at the cap instead of buffering them forever.
+        let error = swarm
+            .run_until(Deadline::NEVER, |event| {
+                matches!(event, SwarmEvent::PingTimeout { .. })
+            })
+            .expect_err("skip cap must abort an unbounded wait");
+        assert!(matches!(
+            error,
+            DriverError::EventBacklogExceeded { limit } if limit == RUN_UNTIL_SKIP_LIMIT
+        ));
+
+        assert_indexed_order(&swarm, total);
+    }
+
+    #[test]
+    fn run_until_overflow_applies_to_expired_deadline_scan() {
+        let peer_id = Ed25519Keypair::generate().peer_id();
+        let mut swarm = idle_swarm();
+        let total = RUN_UNTIL_SKIP_LIMIT + 3;
+        for i in 0..total {
+            swarm
+                .event_buffer
+                .push_back(indexed_stream_data(&peer_id, i as u64));
+        }
+
+        // Past the deadline, the synchronous buffered scan must honor the
+        // same cap as the waiting phase.
+        let error = swarm
+            .run_until(Instant::now() - Duration::from_secs(1), |event| {
+                matches!(event, SwarmEvent::PingTimeout { .. })
+            })
+            .expect_err("skip cap must bound the expired-deadline scan");
+        assert!(matches!(
+            error,
+            DriverError::EventBacklogExceeded { limit } if limit == RUN_UNTIL_SKIP_LIMIT
+        ));
+
+        assert_indexed_order(&swarm, total);
+    }
+
+    #[test]
+    fn run_until_under_cap_still_finds_match() {
+        let peer_id = Ed25519Keypair::generate().peer_id();
+        let mut swarm = idle_swarm();
+        for i in 0..RUN_UNTIL_SKIP_LIMIT - 1 {
+            swarm
+                .event_buffer
+                .push_back(indexed_stream_data(&peer_id, i as u64));
+        }
+        swarm.event_buffer.push_back(SwarmEvent::PeerReady {
+            peer_id: peer_id.clone(),
+            protocols: Vec::new(),
+        });
+
+        // Exactly RUN_UNTIL_SKIP_LIMIT - 1 events are skipped: one below the
+        // cap, so the match right behind them must still be found.
+        let found = swarm
+            .run_until(Deadline::NEVER, |event| {
+                matches!(event, SwarmEvent::PeerReady { .. })
+            })
+            .expect("wait")
+            .expect("match just under the cap");
+        assert!(matches!(found, SwarmEvent::PeerReady { .. }));
+        assert_indexed_order(&swarm, RUN_UNTIL_SKIP_LIMIT - 1);
+    }
+
+    /// Deterministic, manually advanced clock shared between the swarm
+    /// driver and a mock transport.
+    #[derive(Default)]
+    struct TestClock {
+        now_ms: AtomicU64,
+    }
+
+    impl TestClock {
+        fn advance(&self, ms: u64) {
+            self.now_ms.fetch_add(ms, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for TestClock {
+        fn now_ms(&self) -> u64 {
+            self.now_ms.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Readiness-capable transport simulating a remote peer that accepts any
+    /// multistream-select negotiation but never sends protocol data, so an
+    /// outbound ping dangles until its timeout. `wait_for_input` records each
+    /// budget it is handed and jumps the shared clock, standing in for a
+    /// transport that blocks for the full budget on an idle connection.
+    struct NeverRespondTransport {
+        clock: Arc<TestClock>,
+        events: VecDeque<TransportEvent>,
+        negotiators: BTreeMap<StreamId, MultistreamSelect>,
+        next_stream: u64,
+        waits: Vec<Duration>,
+        advance_per_wait_ms: u64,
+    }
+
+    impl NeverRespondTransport {
+        fn connected(clock: Arc<TestClock>, peer_id: PeerId, advance_per_wait_ms: u64) -> Self {
+            let endpoint = ConnectionEndpoint::with_peer_id(Multiaddr::new(), peer_id);
+            Self {
+                clock,
+                events: VecDeque::from([TransportEvent::Connected {
+                    id: ConnectionId::new(1),
+                    endpoint,
+                }]),
+                negotiators: BTreeMap::new(),
+                next_stream: 1,
+                waits: Vec::new(),
+                advance_per_wait_ms,
+            }
+        }
+    }
+
+    impl Transport for NeverRespondTransport {
+        fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
+            unreachable!()
+        }
+
+        fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
+            unreachable!()
+        }
+
+        fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
+            let stream_id = StreamId::new(self.next_stream);
+            self.next_stream += 1;
+            let mut listener = MultistreamSelect::listener(vec![
+                IDENTIFY_PROTOCOL_ID.to_string(),
+                PING_PROTOCOL_ID.to_string(),
+            ]);
+            listener
+                .handle_input(MultistreamInput::Start)
+                .expect("listener start");
+            self.negotiators.insert(stream_id, listener);
+            Ok(stream_id)
+        }
+
+        fn send_stream(
+            &mut self,
+            id: ConnectionId,
+            stream_id: StreamId,
+            data: Vec<u8>,
+        ) -> Result<(), TransportError> {
+            let Some(negotiator) = self.negotiators.get_mut(&stream_id) else {
+                // Stream already negotiated: swallow protocol payloads so
+                // pings never receive a response.
+                return Ok(());
+            };
+            negotiator
+                .handle_input(MultistreamInput::Data(data))
+                .expect("listener negotiation input");
+            let mut negotiated = false;
+            let mut outbound = Vec::new();
+            while let Some(output) = negotiator.poll_output() {
+                match output {
+                    MultistreamOutput::OutboundData(bytes) => outbound.push(bytes),
+                    MultistreamOutput::Negotiated { .. } => negotiated = true,
+                    other => panic!("unexpected multistream output: {other:?}"),
+                }
+            }
+            if negotiated {
+                self.negotiators.remove(&stream_id);
+            }
+            for data in outbound {
+                self.events.push_back(TransportEvent::StreamData {
+                    id,
+                    stream_id,
+                    data,
+                });
+            }
+            Ok(())
+        }
+
+        fn close_stream_write(
+            &mut self,
+            _: ConnectionId,
+            _: StreamId,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn reset_stream(&mut self, _: ConnectionId, _: StreamId) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn close(&mut self, _: ConnectionId) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+            Ok(self.events.drain(..).collect())
+        }
+
+        fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
+            self.waits.push(timeout);
+            self.clock.advance(self.advance_per_wait_ms);
+            WaitOutcome::TimedOut
+        }
+    }
+
+    #[test]
+    fn poll_next_budget_respects_core_ping_timer() {
+        const PING_TIMEOUT_MS: u64 = 5_000;
+
+        let remote_peer = Ed25519Keypair::generate().peer_id();
+        let keypair = Ed25519Keypair::generate();
+        let identify = IdentifyConfig {
+            protocol_version: "test/1".into(),
+            agent_version: "test/1".into(),
+            protocols: Vec::new(),
+            public_key: keypair.public_key().encode_protobuf(),
+        };
+        let clock = Arc::new(TestClock::default());
+        // Each blocking wait pretends the transport slept its full budget
+        // and jumps the clock past the ping deadline.
+        let transport = NeverRespondTransport::connected(
+            clock.clone(),
+            remote_peer.clone(),
+            PING_TIMEOUT_MS + 1_000,
+        );
+        let mut swarm = Swarm::with_clock(
+            transport,
+            identify,
+            PingConfig {
+                request_timeout_ms: PING_TIMEOUT_MS,
+            },
+            keypair.peer_id(),
+            clock.clone(),
+        );
+
+        // Settle connection setup and identify stream negotiation, then get
+        // a real ping in flight over the negotiated ping stream.
+        for _ in 0..5 {
+            swarm.poll().expect("setup poll");
+        }
+        swarm.ping(&remote_peer).expect("queue ping");
+        for _ in 0..5 {
+            swarm.poll().expect("negotiate ping stream");
+        }
+        assert_eq!(
+            swarm.core().next_timeout(clock.now_ms()),
+            Some(PING_TIMEOUT_MS + 1),
+            "ping must be in flight with an armed core timer"
+        );
+
+        // Drop setup events (ConnectionEstablished, ...) so poll_next blocks.
+        swarm.event_buffer.clear();
+        let event = swarm
+            .poll_next(Deadline::NEVER)
+            .expect("poll")
+            .expect("ping timeout event");
+        assert!(matches!(
+            event,
+            SwarmEvent::PingTimeout { peer_id } if peer_id == remote_peer
+        ));
+
+        let waits = &swarm.transport().waits;
+        assert_eq!(waits.len(), 1, "one blocking wait resolves the timer");
+        assert_eq!(
+            waits[0],
+            Duration::from_millis(PING_TIMEOUT_MS + 1),
+            "wait budget must shrink to the core's ping deadline instead of MAX_IDLE_WAIT"
         );
     }
 }

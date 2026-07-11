@@ -231,6 +231,18 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
     );
 
     let outcome = 'outer: loop {
+        // State check first: the remote's direct dial may have completed
+        // while an earlier consuming wait was running (e.g. while step 5
+        // was blocked in `wait_stream_data` waiting for SYNC -- the
+        // dialer sends SYNC and dials immediately, and the direct QUIC
+        // handshake can beat the relayed SYNC bytes). In that case the
+        // `ConnectionEstablished` event was already printed and dropped,
+        // so the event scan below would never see it; `connected_peers()`
+        // still knows.
+        if is_connected(&swarm, &remote_peer_id) {
+            break HolePunchOutcome::DirectConnected(remote_peer_id.clone());
+        }
+
         let now = Instant::now();
         if now >= punch_deadline {
             break HolePunchOutcome::Timeout;
@@ -299,13 +311,25 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
                  waiting for verified mTLS identity)"
             );
             let grace_deadline = Instant::now() + Duration::from_secs(2);
-            let verified = poll_until(&mut swarm, grace_deadline, |ev| {
-                print_event(role, ev);
-                matches!(ev, SwarmEvent::ConnectionEstablished { peer_id } if peer_id == &remote_peer_id)
-            })
-            .map_err(|e| format!("grace poll: {e}"))?;
+            // State first (the ConnectionEstablished event may already have
+            // been consumed by an earlier wait), event wait second.
+            let verified = if is_connected(&swarm, &remote_peer_id) {
+                Some(remote_peer_id.clone())
+            } else {
+                poll_until(&mut swarm, grace_deadline, |ev| {
+                    print_event(role, ev);
+                    matches!(ev, SwarmEvent::ConnectionEstablished { peer_id } if peer_id == &remote_peer_id)
+                })
+                .map_err(|e| format!("grace poll: {e}"))?
+                .map(|ev| {
+                    let SwarmEvent::ConnectionEstablished { peer_id } = ev else {
+                        unreachable!()
+                    };
+                    peer_id
+                })
+            };
             match verified {
-                Some(SwarmEvent::ConnectionEstablished { peer_id }) => {
+                Some(peer_id) => {
                     println!("[{role}] direct-connected peer={peer_id} (mTLS verified)");
                     ping_and_exit(
                         &mut swarm,
@@ -316,7 +340,7 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
                         deadline,
                     )
                 }
-                _ => {
+                None => {
                     println!("[{role}] grace-elapsed before mTLS identity -> relay-ping fallback");
                     relay_ping_fallback(&mut swarm, role, &relay_peer_id, bridge_stream)
                 }
@@ -539,19 +563,25 @@ pub fn run_dial(
     dial_direct_candidates(&mut swarm, role, &target, &remote_addrs);
 
     // --- 5. Wait for direct connection or hole-punch timeout ---------------
+    // State check first: connection facts are queryable at any time via
+    // `connected_peers()`, so this wait cannot be defeated by the
+    // `ConnectionEstablished` event having been consumed by an earlier
+    // wait (see `is_connected`).
     let punch_deadline = Instant::now() + HOLEPUNCH_DEADLINE;
-    let punched = poll_until(&mut swarm, punch_deadline, |ev| {
-        print_event(role, ev);
-        matches!(
-            ev,
-            SwarmEvent::ConnectionEstablished { peer_id }
-                if peer_id == &target
-        )
-    })
-    .map_err(|e| format!("holepunch poll: {e}"))?;
+    let punched = is_connected(&swarm, &target)
+        || poll_until(&mut swarm, punch_deadline, |ev| {
+            print_event(role, ev);
+            matches!(
+                ev,
+                SwarmEvent::ConnectionEstablished { peer_id }
+                    if peer_id == &target
+            )
+        })
+        .map_err(|e| format!("holepunch poll: {e}"))?
+        .is_some();
 
     // --- 6. Direct ping or relay-ping fallback -----------------------------
-    if punched.is_some() {
+    if punched {
         println!("[{role}] direct-connected peer={target} (hole-punch success)");
         ping_and_exit(
             &mut swarm,
@@ -1006,13 +1036,31 @@ fn poll_until(
     Ok(None)
 }
 
-/// Wait for `ConnectionEstablished` with `peer_id`.
+/// True if the swarm currently holds a verified connection to `peer_id`.
+///
+/// Connection-level facts must be read from swarm STATE, not caught as
+/// events: with consuming `poll_next` loops, a `ConnectionEstablished`
+/// that arrives while an earlier wait is running (e.g. while blocked on
+/// stream data) is printed and gone forever, but `connected_peers()` is
+/// queryable at any time. Waits that target "is X connected?" check this
+/// first so they are immune to the event having been consumed already.
+fn is_connected(swarm: &Swarm<QuicEndpoint>, peer_id: &PeerId) -> bool {
+    swarm.connected_peers().iter().any(|p| p == peer_id)
+}
+
+/// Wait until `peer_id` is connected (verified via mTLS).
+///
+/// Consults `connected_peers()` state first -- see [`is_connected`] --
+/// then falls back to waiting for the `ConnectionEstablished` event.
 fn wait_connected(
     swarm: &mut Swarm<QuicEndpoint>,
     role: &str,
     peer_id: &PeerId,
     deadline: Instant,
 ) -> Result<(), Box<dyn Error>> {
+    if is_connected(swarm, peer_id) {
+        return Ok(());
+    }
     let found = poll_until(swarm, deadline, |ev| {
         print_event(role, ev);
         matches!(ev, SwarmEvent::ConnectionEstablished { peer_id: p } if p == peer_id)

@@ -7,6 +7,11 @@ publish = false
 [package.metadata]
 cargo-fuzz = true
 
+# Excluded from the workspace, so `[workspace.lints.rust] unsafe_code =
+# "forbid"` does not apply here; restate it locally.
+[lints.rust]
+unsafe_code = "forbid"
+
 [dependencies]
 libfuzzer-sys = "0.4.13"
 minip2p-autonat = { path = "../crates/autonat" }

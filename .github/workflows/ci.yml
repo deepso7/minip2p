@@ -58,8 +58,11 @@ jobs:
         with:
           workspaces: fuzz
       # Swatinem/rust-cache does not cache ~/.cargo/bin, so cargo-fuzz is
-      # rebuilt on every run (~1 min); --locked keeps that build reproducible.
-      - run: cargo install cargo-fuzz --locked
+      # rebuilt on every run (~1 min). Pinned --version + --locked keeps the
+      # tool and its dependency tree fully reproducible (same intent as the
+      # pinned nightly above); a bare --locked would still float to whatever
+      # cargo-fuzz release is newest. Bump deliberately.
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
       - run: cargo +$NIGHTLY_TOOLCHAIN fuzz run wire_inputs -- -max_total_time=30
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: failure()

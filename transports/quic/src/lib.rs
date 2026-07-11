@@ -35,6 +35,13 @@ use connection::QuicConnection;
 
 const DEFAULT_IPV4_BIND: &str = "0.0.0.0:0";
 const DEFAULT_IPV6_BIND: &str = "[::]:0";
+/// Maximum UDP datagrams drained from the socket per `poll()` call.
+///
+/// Bounding the drain keeps a packet flood from starving the connection
+/// timers (loss recovery, idle timeouts) that only run after the recv loop.
+/// Leftover packets stay queued in the kernel buffer, and `wait_for_input`
+/// reports them as ready so the driver polls again immediately.
+const MAX_DATAGRAMS_PER_POLL: usize = 128;
 const RETRY_TOKEN_VERSION: u8 = 1;
 const RETRY_TOKEN_LIFETIME_SECS: u64 = 10;
 const RETRY_TOKEN_MAC_LEN: usize = 32;
@@ -332,6 +339,15 @@ fn build_quiche_config(node_config: &QuicNodeConfig) -> Result<quiche::Config, T
     if node_config.limits().max_pending_datagrams == 0 {
         return Err(TransportError::InvalidConfig {
             reason: "max_pending_datagrams must be greater than zero".into(),
+        });
+    }
+
+    // quiche treats a zero idle timeout as "no timeout", which would keep
+    // dead connections alive forever -- the opposite of what a limit
+    // promises -- so reject it up front.
+    if node_config.limits().idle_timeout_ms == 0 {
+        return Err(TransportError::InvalidConfig {
+            reason: "idle_timeout_ms must be greater than zero".into(),
         });
     }
 
@@ -1101,12 +1117,25 @@ impl Transport for QuicTransport {
                 }
             };
 
-            self.socket
-                .send_to(&out[..written], send_info.to)
-                .map_err(|e| TransportError::DialFailed {
-                    id,
-                    reason: format!("udp send error: {e}"),
-                })?;
+            match self.socket.send_to(&out[..written], send_info.to) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Transient backpressure must not fail the dial. Retain
+                    // the packet best-effort -- like `flush` does for
+                    // established connections -- and stop draining; any
+                    // packets left in quiche (or dropped by a full queue)
+                    // are resent by its loss-recovery timer once the
+                    // connection is registered below.
+                    self.queue_datagram_best_effort(&out[..written], send_info.to);
+                    break;
+                }
+                Err(e) => {
+                    return Err(TransportError::DialFailed {
+                        id,
+                        reason: format!("udp send error: {e}"),
+                    });
+                }
+            }
         }
 
         let mut conn = QuicConnection::new(
@@ -1253,7 +1282,7 @@ impl Transport for QuicTransport {
         self.flush_pending_datagrams()?;
         let mut buf = [0u8; 65535];
 
-        loop {
+        for _ in 0..MAX_DATAGRAMS_PER_POLL {
             let (len, from) = match self.socket.recv_from(&mut buf) {
                 Ok(v) => v,
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -1838,6 +1867,71 @@ mod tests {
             2,
             "queue must cap at the limit and silently drop the overflow"
         );
+    }
+
+    #[test]
+    fn zero_limits_are_rejected_at_construction() {
+        // A zero idle timeout would disable expiry entirely (quiche treats 0
+        // as "no timeout"), and a zero datagram queue could never retain a
+        // packet; both must fail fast instead of silently misbehaving.
+        for limits in [
+            QuicLimits {
+                idle_timeout_ms: 0,
+                ..QuicLimits::default()
+            },
+            QuicLimits {
+                max_pending_datagrams: 0,
+                ..QuicLimits::default()
+            },
+        ] {
+            let Err(error) = QuicTransport::new(
+                QuicNodeConfig::generate().with_limits(limits),
+                "127.0.0.1:0",
+            ) else {
+                panic!("zero limit must be rejected");
+            };
+            assert!(matches!(error, TransportError::InvalidConfig { .. }));
+        }
+    }
+
+    #[test]
+    fn poll_drains_a_bounded_number_of_datagrams_per_call() {
+        let mut transport =
+            QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+        let destination = transport.local_addr().expect("local addr");
+
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
+        for _ in 0..MAX_DATAGRAMS_PER_POLL + 8 {
+            sender.send_to(&[0u8; 8], destination).expect("send");
+        }
+
+        // Wait for the kernel to queue the first datagram, then give the
+        // rest a moment to land before polling.
+        let start = std::time::Instant::now();
+        while !socket_has_queued_input(&transport.socket) {
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "datagrams never arrived"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        transport.poll().expect("poll");
+        assert!(
+            socket_has_queued_input(&transport.socket),
+            "one poll must leave datagrams beyond the per-poll bound in the kernel buffer"
+        );
+
+        // Follow-up polls drain the remainder.
+        let start = std::time::Instant::now();
+        while socket_has_queued_input(&transport.socket) {
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "overflow never drained"
+            );
+            transport.poll().expect("poll");
+        }
     }
 
     #[test]

@@ -144,6 +144,17 @@ pub struct SwarmCore {
     /// Peers with a pending `.ping(peer)` call: once the ping stream
     /// negotiates, the queued 32-byte payload is sent automatically.
     pending_pings: BTreeMap<PeerId, [u8; PING_PAYLOAD_LEN]>,
+    /// Absolute `now_ms` at which the in-flight ping to each peer becomes
+    /// overdue. The ping protocol keeps its deadline bookkeeping private,
+    /// so the core records its own copy whenever it forwards a successful
+    /// `SendPing`; [`SwarmCore::next_timeout`] derives the earliest internal
+    /// timer from this map. Entries are cleared when the ping resolves
+    /// (RTT measured, timeout fired, outbound stream closed, peer removed)
+    /// and pruned on every tick once their deadline has passed.
+    ping_deadlines: BTreeMap<PeerId, u64>,
+    /// Copy of [`PingConfig::request_timeout_ms`] used to compute
+    /// `ping_deadlines` entries.
+    ping_timeout_ms: u64,
     /// Snapshot of the transport's local listening addresses, refreshed
     /// by the driver at the top of each `poll()` tick. Used to
     /// auto-populate Identify's `listen_addrs` so advertised addresses
@@ -169,6 +180,7 @@ impl SwarmCore {
             PING_PROTOCOL_ID.to_string(),
         ];
 
+        let ping_timeout_ms = ping_config.request_timeout_ms;
         Self {
             ping: PingProtocol::new(ping_config),
             identify: IdentifyProtocol::new(identify_config),
@@ -183,6 +195,8 @@ impl SwarmCore {
             supported_protocols,
             user_protocols: Vec::new(),
             pending_pings: BTreeMap::new(),
+            ping_deadlines: BTreeMap::new(),
+            ping_timeout_ms,
             local_addresses: Vec::new(),
             peer_info: BTreeMap::new(),
             ready_peers: BTreeSet::new(),
@@ -251,6 +265,25 @@ impl SwarmCore {
         self.actions.is_empty() && self.events.is_empty()
     }
 
+    /// Returns the milliseconds from `now_ms` until the earliest internal
+    /// protocol timer is due, or `None` when no timer is armed.
+    ///
+    /// Today the only internal timers are ping request timeouts: one is
+    /// armed whenever a ping payload is in flight to a peer. `Some(0)` means
+    /// a timer is already due and the caller should feed
+    /// [`SwarmInput::Tick`] immediately.
+    ///
+    /// Drivers should cap their wait/sleep budget with this value before
+    /// blocking on external I/O, so a `Tick` is delivered promptly when the
+    /// timer fires instead of only after the next transport event. The std
+    /// [`crate::Swarm`] driver already does this in its `poll_next` loop.
+    pub fn next_timeout(&self, now_ms: u64) -> Option<u64> {
+        self.ping_deadlines
+            .values()
+            .min()
+            .map(|due| due.saturating_sub(now_ms))
+    }
+
     /// Feeds one external input into the core.
     pub fn handle_input(&mut self, input: SwarmInput) {
         match input {
@@ -310,6 +343,7 @@ impl SwarmCore {
                 .map_err(|e| SwarmError::PingError {
                     reason: format!("{e}"),
                 })?;
+            self.record_ping_deadline(peer_id, now_ms);
             self.drain_ping_outputs();
             return Ok(());
         }
@@ -518,6 +552,12 @@ impl SwarmCore {
     fn handle_tick(&mut self, now_ms: u64) {
         let _ = self.ping.handle_input(PingInput::Tick { now_ms });
         self.collect_protocol_events();
+        // Safety net for deadlines whose ping was resolved without a
+        // corresponding ping event (e.g. the stream fully closed): the tick
+        // above has fired the Timeout for anything still pending at its
+        // deadline, so a past-due entry can never be load-bearing anymore.
+        // Dropping it keeps `next_timeout` from reporting a stale timer.
+        self.ping_deadlines.retain(|_, due| *due > now_ms);
     }
 
     fn handle_stream_opened(
@@ -696,6 +736,19 @@ impl SwarmCore {
         self.ping.outbound_stream(peer_id)
     }
 
+    /// Arms the internal ping-timeout timer for `peer_id` after a
+    /// successful `SendPing`.
+    ///
+    /// The ping protocol fires its timeout on the first tick where
+    /// `now_ms - sent_at_ms > request_timeout_ms`, i.e. strictly past the
+    /// timeout, so the timer is due one millisecond after it.
+    fn record_ping_deadline(&mut self, peer_id: &PeerId, now_ms: u64) {
+        let due = now_ms
+            .saturating_add(self.ping_timeout_ms)
+            .saturating_add(1);
+        self.ping_deadlines.insert(peer_id.clone(), due);
+    }
+
     fn has_pending_ping_stream(&self, peer_id: &PeerId) -> bool {
         let Some(&conn) = self.peer_to_conn.get(peer_id) else {
             return false;
@@ -829,6 +882,7 @@ impl SwarmCore {
             if let Some(payload) = pending_ping {
                 self.pending_pings.insert(peer_id.clone(), payload);
             }
+            self.ping_deadlines.remove(&peer_id);
             self.peer_info.remove(&peer_id);
             self.ready_peers.remove(&peer_id);
             self.established_peers.remove(&peer_id);
@@ -863,6 +917,9 @@ impl SwarmCore {
                 self.drain_identify_outputs();
                 if let Some(payload) = self.pending_pings.remove(stale) {
                     self.pending_pings.insert(new_peer_id.clone(), payload);
+                }
+                if let Some(due) = self.ping_deadlines.remove(stale) {
+                    self.ping_deadlines.insert(new_peer_id.clone(), due);
                 }
                 if let Some(info) = self.peer_info.remove(stale) {
                     self.peer_info.insert(new_peer_id.clone(), info);
@@ -1104,6 +1161,7 @@ impl SwarmCore {
                 self.drain_ping_outputs();
                 self.drain_identify_outputs();
                 self.pending_pings.remove(&peer_id);
+                self.ping_deadlines.remove(&peer_id);
                 self.peer_info.remove(&peer_id);
                 self.ready_peers.remove(&peer_id);
                 self.established_peers.remove(&peer_id);
@@ -1406,7 +1464,10 @@ impl SwarmCore {
                         payload,
                         now_ms,
                     }) {
-                        Ok(()) => self.drain_ping_outputs(),
+                        Ok(()) => {
+                            self.record_ping_deadline(&peer_id, now_ms);
+                            self.drain_ping_outputs();
+                        }
                         Err(e) => self.emit_error(
                             SwarmErrorKind::Ping,
                             Some(peer_id.clone()),
@@ -1535,11 +1596,18 @@ impl SwarmCore {
             PingEvent::RttMeasured {
                 peer_id, rtt_ms, ..
             } => {
+                self.ping_deadlines.remove(&peer_id);
                 self.events
                     .push_back(SwarmEvent::PingRttMeasured { peer_id, rtt_ms });
             }
             PingEvent::Timeout { peer_id, .. } => {
+                self.ping_deadlines.remove(&peer_id);
                 self.events.push_back(SwarmEvent::PingTimeout { peer_id });
+            }
+            PingEvent::OutboundStreamClosed { ref peer_id, .. } => {
+                // The outbound stream carried the in-flight ping (if any);
+                // its close disarms the timer.
+                self.ping_deadlines.remove(peer_id);
             }
             PingEvent::ProtocolViolation {
                 peer_id, reason, ..
@@ -1980,5 +2048,172 @@ mod tests {
                 && *stream_id == inbound_stream
                 && data == &[7; PING_PAYLOAD_LEN]
         ));
+    }
+
+    /// Registers `peer_id` as connected on `conn_id` with a fully
+    /// negotiated outbound ping stream, draining all setup outputs.
+    fn setup_outbound_ping_stream(
+        core: &mut SwarmCore,
+        peer_id: &PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+    ) {
+        feed(
+            core,
+            TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+        );
+        while core.poll_output().is_some() {}
+        core.stream_owner
+            .insert((conn_id, stream_id), ProtocolKind::Ping);
+        core.ping
+            .handle_input(PingInput::RegisterOutboundStream {
+                peer_id: peer_id.clone(),
+                stream_id,
+            })
+            .expect("register outbound ping stream");
+        while core.ping.poll_output().is_some() {}
+    }
+
+    #[test]
+    fn next_timeout_arms_on_ping_and_clears_on_rtt() {
+        let mut core = test_core(); // default request_timeout_ms = 10_000
+        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
+        let conn_id = ConnectionId::new(1);
+        let stream_id = StreamId::new(4);
+        setup_outbound_ping_stream(&mut core, &peer_id, conn_id, stream_id);
+
+        assert_eq!(
+            core.next_timeout(0),
+            None,
+            "no timer armed before a ping is in flight"
+        );
+
+        let payload = [7u8; PING_PAYLOAD_LEN];
+        core.ping(&peer_id, payload, 1_000).expect("send ping");
+
+        // The ping protocol times out strictly past request_timeout_ms, so
+        // the timer is due one millisecond after sent_at + timeout.
+        assert_eq!(core.next_timeout(1_000), Some(10_001));
+        assert_eq!(core.next_timeout(5_000), Some(6_001));
+        assert_eq!(
+            core.next_timeout(11_001),
+            Some(0),
+            "past-due timer reports zero"
+        );
+
+        // The echoed payload resolves the ping and disarms the timer.
+        core.handle_input(SwarmInput::Transport {
+            event: TransportEvent::StreamData {
+                id: conn_id,
+                stream_id,
+                data: payload.to_vec(),
+            },
+            now_ms: 1_500,
+        });
+        assert_eq!(core.next_timeout(1_500), None);
+        let events = drain_events(&mut core);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, SwarmEvent::PingRttMeasured { .. }))
+        );
+    }
+
+    #[test]
+    fn next_timeout_disarms_after_timeout_tick() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
+        let conn_id = ConnectionId::new(1);
+        let stream_id = StreamId::new(4);
+        setup_outbound_ping_stream(&mut core, &peer_id, conn_id, stream_id);
+
+        core.ping(&peer_id, [7u8; PING_PAYLOAD_LEN], 1_000)
+            .expect("send ping");
+
+        // An early tick must not disarm the timer.
+        core.handle_input(SwarmInput::Tick { now_ms: 5_000 });
+        assert_eq!(core.next_timeout(5_000), Some(6_001));
+
+        // A tick past the deadline fires the timeout and disarms the timer.
+        core.handle_input(SwarmInput::Tick { now_ms: 11_001 });
+        let events = drain_events(&mut core);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, SwarmEvent::PingTimeout { .. }))
+        );
+        assert_eq!(core.next_timeout(11_001), None);
+    }
+
+    #[test]
+    fn next_timeout_prunes_stale_deadline_after_silent_stream_close() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
+        let conn_id = ConnectionId::new(1);
+        let stream_id = StreamId::new(4);
+        setup_outbound_ping_stream(&mut core, &peer_id, conn_id, stream_id);
+
+        core.ping(&peer_id, [7u8; PING_PAYLOAD_LEN], 0)
+            .expect("send ping");
+
+        // A full stream close clears the ping protocol's pending state
+        // without emitting a ping event; the core's deadline entry goes
+        // stale until the first tick at/past its due time prunes it.
+        feed(
+            &mut core,
+            TransportEvent::StreamClosed {
+                id: conn_id,
+                stream_id,
+            },
+        );
+        assert_eq!(core.next_timeout(0), Some(10_001));
+
+        core.handle_input(SwarmInput::Tick { now_ms: 10_001 });
+        assert_eq!(core.next_timeout(10_001), None);
+        let events = drain_events(&mut core);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SwarmEvent::PingTimeout { .. })),
+            "the ping was already resolved; pruning must not surface a timeout"
+        );
+    }
+
+    #[test]
+    fn next_timeout_cleared_when_connection_closes() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
+        let conn_id = ConnectionId::new(1);
+        let stream_id = StreamId::new(4);
+        setup_outbound_ping_stream(&mut core, &peer_id, conn_id, stream_id);
+
+        core.ping(&peer_id, [7u8; PING_PAYLOAD_LEN], 0)
+            .expect("send ping");
+        assert_eq!(core.next_timeout(0), Some(10_001));
+
+        feed(&mut core, TransportEvent::Closed { id: conn_id });
+        assert_eq!(core.next_timeout(0), None);
+    }
+
+    #[test]
+    fn next_timeout_armed_by_deferred_ping_send() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
+        let conn_id = ConnectionId::new(2);
+        let stream_id = StreamId::new(9);
+
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        core.pending_pings
+            .insert(peer_id.clone(), [7u8; PING_PAYLOAD_LEN]);
+
+        // Negotiation completing at 2_000 fires the queued payload and must
+        // arm the timer from that send time.
+        core.on_outbound_negotiated(conn_id, stream_id, ProtocolKind::Ping, 2_000);
+        assert_eq!(core.next_timeout(2_000), Some(10_001));
+        assert_eq!(core.next_timeout(4_000), Some(8_001));
     }
 }

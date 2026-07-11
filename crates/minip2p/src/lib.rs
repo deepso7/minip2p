@@ -12,7 +12,8 @@ pub use minip2p_identity::Ed25519Keypair;
 pub use minip2p_quic::QuicLimits;
 use minip2p_quic::{QuicEndpoint, QuicNodeConfig};
 pub use minip2p_swarm::{
-    Deadline, DriverError as Error, RESERVED_PROTOCOL_IDS, SwarmError, SwarmEvent as Event,
+    Deadline, DriverError as Error, RESERVED_PROTOCOL_IDS, RUN_UNTIL_SKIP_LIMIT, SwarmError,
+    SwarmEvent as Event,
 };
 use minip2p_swarm::{Swarm, SwarmBuilder};
 pub use minip2p_transport::{ConnectionId, StreamId, TransportError};

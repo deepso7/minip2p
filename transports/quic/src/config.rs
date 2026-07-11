@@ -19,7 +19,9 @@ pub struct QuicLimits {
     /// Maximum UDP datagrams retained after the non-blocking socket reports
     /// `WouldBlock`.
     pub max_pending_datagrams: usize,
-    /// QUIC idle timeout advertised to peers, in milliseconds.
+    /// QUIC idle timeout advertised to peers, in milliseconds. Must be
+    /// greater than zero: quiche interprets zero as "no timeout", so
+    /// transport construction rejects it.
     pub idle_timeout_ms: u64,
     /// Require a stateless Retry before allocating an inbound connection.
     pub require_address_validation: bool,

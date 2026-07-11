@@ -46,4 +46,4 @@ pub use crate::events::{
 #[cfg(feature = "std")]
 pub use crate::builder::SwarmBuilder;
 #[cfg(feature = "std")]
-pub use crate::driver::{Clock, Deadline, DriverError, Swarm};
+pub use crate::driver::{Clock, Deadline, DriverError, RUN_UNTIL_SKIP_LIMIT, Swarm};

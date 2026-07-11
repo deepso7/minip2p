@@ -239,9 +239,21 @@ and easy to grep/awk from tests.
 ## Architecture
 
 This binary is deliberately procedural: each role is a linear script
-built on `Swarm::run_until(deadline, predicate)`, so the sequence of
-steps is visible top-to-bottom. Non-matching events are buffered and restored
-in order when a wait finishes.
+built on consuming `Swarm::poll_next(deadline)` loops (the `poll_until`
+helpers in `direct.rs` and `relay.rs`), so the sequence of steps is
+visible top-to-bottom. Each event is popped exactly once, printed at
+the consumption site, and gone; waits that target connection-level
+facts (`wait_connected`, hole-punch success) consult swarm state
+(`connected_peers()`) first so they don't depend on catching a
+`ConnectionEstablished` that an earlier wait already consumed.
+
+`Swarm::run_until(deadline, predicate)` — which restores non-matching
+events to the buffer in order — is reserved for the one place it fits:
+the short-lived AutoNAT dialback probe swarm, where the predicate is
+pure and the swarm is dropped right after, so restored events are never
+seen again. Side-effecting predicates (like the printing ones here) and
+restore semantics don't mix: restored events would be re-printed on
+every later wait, and stale events could satisfy later matches.
 
 - `src/main.rs` — dispatch on parsed mode.
 - `src/cli.rs` — hand-rolled argv parser; shared `print_event` helper.
