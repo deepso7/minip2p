@@ -202,10 +202,6 @@ impl HopReservation {
             return Ok(());
         }
 
-        enforce_max_size(&self.recv_buf).inspect_err(|_| {
-            self.state = FlowState::Done;
-        })?;
-
         let (msg, consumed) = match decode_frame(&self.recv_buf) {
             FrameDecode::Complete { payload, consumed } => {
                 let msg = HopMessage::decode(payload).map_err(|e| {
@@ -214,7 +210,17 @@ impl HopReservation {
                 })?;
                 (msg, consumed)
             }
-            FrameDecode::Incomplete => return Ok(()),
+            // Only the incomplete remainder is bounded: a complete frame
+            // decodes (and drains) regardless of what is coalesced behind
+            // it -- e.g. a STATUS frame pipelined with the first bridged
+            // bytes -- so the backstop can never reject a frame the
+            // decoder would accept.
+            FrameDecode::Incomplete => {
+                enforce_max_size(&self.recv_buf).inspect_err(|_| {
+                    self.state = FlowState::Done;
+                })?;
+                return Ok(());
+            }
             FrameDecode::TooLarge { len } => {
                 self.state = FlowState::Done;
                 return Err(RelayError::FrameTooLarge { len });
@@ -448,10 +454,6 @@ impl HopConnect {
             return Ok(());
         }
 
-        enforce_max_size(&self.recv_buf).inspect_err(|_| {
-            self.state = FlowState::Done;
-        })?;
-
         let (msg, consumed) = match decode_frame(&self.recv_buf) {
             FrameDecode::Complete { payload, consumed } => {
                 let msg = HopMessage::decode(payload).map_err(|e| {
@@ -460,7 +462,17 @@ impl HopConnect {
                 })?;
                 (msg, consumed)
             }
-            FrameDecode::Incomplete => return Ok(()),
+            // Only the incomplete remainder is bounded: a complete frame
+            // decodes (and drains) regardless of what is coalesced behind
+            // it -- e.g. a STATUS frame pipelined with the first bridged
+            // bytes -- so the backstop can never reject a frame the
+            // decoder would accept.
+            FrameDecode::Incomplete => {
+                enforce_max_size(&self.recv_buf).inspect_err(|_| {
+                    self.state = FlowState::Done;
+                })?;
+                return Ok(());
+            }
             FrameDecode::TooLarge { len } => {
                 self.state = FlowState::Done;
                 return Err(RelayError::FrameTooLarge { len });
@@ -719,10 +731,6 @@ impl StopResponder {
             return Ok(());
         }
 
-        enforce_max_size(&self.recv_buf).inspect_err(|_| {
-            self.state = StopState::Done;
-        })?;
-
         let (msg, consumed) = match decode_frame(&self.recv_buf) {
             FrameDecode::Complete { payload, consumed } => {
                 let msg = StopMessage::decode(payload).map_err(|e| {
@@ -731,7 +739,17 @@ impl StopResponder {
                 })?;
                 (msg, consumed)
             }
-            FrameDecode::Incomplete => return Ok(()),
+            // Only the incomplete remainder is bounded: a complete frame
+            // decodes (and drains) regardless of what is coalesced behind
+            // it -- e.g. a CONNECT pipelined with the first bridged bytes
+            // -- so the backstop can never reject a frame the decoder
+            // would accept.
+            FrameDecode::Incomplete => {
+                enforce_max_size(&self.recv_buf).inspect_err(|_| {
+                    self.state = StopState::Done;
+                })?;
+                return Ok(());
+            }
             FrameDecode::TooLarge { len } => {
                 self.state = StopState::Done;
                 return Err(RelayError::FrameTooLarge { len });
@@ -823,14 +841,14 @@ impl Default for StopResponder {
 /// below 2^14, so its uvarint prefix encodes in at most two bytes.
 const MAX_FRAME_PREFIX_LEN: usize = 2;
 
-/// Rejects an oversized receive buffer to protect against memory
-/// exhaustion, bounding it to one maximal legal frame: payload plus its
-/// length prefix.
+/// Backstop bound on the receive buffer once decoding has stalled on an
+/// incomplete frame.
 ///
-/// The payload bound itself is enforced by [`decode_frame`]; this guard
-/// must never reject a frame the decoder would accept -- a payload of
-/// exactly [`MAX_MESSAGE_SIZE`] plus its two-byte prefix is legal on the
-/// wire.
+/// Called only on [`FrameDecode::Incomplete`], after any complete frame
+/// has been drained: a stalled buffer can legally hold at most one
+/// partial frame (the payload bound is [`decode_frame`]'s `TooLarge`), so
+/// this can never reject traffic the decoder would accept -- including a
+/// maximal frame coalesced with pipelined trailing bytes.
 fn enforce_max_size(buf: &[u8]) -> Result<(), RelayError> {
     if buf.len() > MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN {
         return Err(RelayError::MessageTooLarge { len: buf.len() });
@@ -993,17 +1011,16 @@ mod tests {
     }
 
     #[test]
-    fn reservation_rejects_oversized_message() {
-        let mut flow = HopReservation::new();
-        let _ = flow.take_outbound();
-
-        // One byte beyond a maximal legal frame (payload + 2-byte prefix)
-        // must trip the receive-buffer guard.
-        let mut large = Vec::new();
-        minip2p_core::write_uvarint(MAX_MESSAGE_SIZE as u64, &mut large);
-        large.extend_from_slice(&vec![0u8; MAX_MESSAGE_SIZE + 1]);
-        let err = flow.on_data(&large).unwrap_err();
-        assert!(matches!(err, RelayError::MessageTooLarge { .. }));
+    fn receive_buffer_backstop_bounds_partial_frames() {
+        // The backstop allows one maximal legal frame (payload + 2-byte
+        // prefix) and rejects anything beyond it. It runs only on stalled
+        // (incomplete) buffers, where `decode_frame`'s own bounds make it
+        // unreachable from wire input -- a pure defense-in-depth check.
+        assert!(enforce_max_size(&vec![0u8; MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN]).is_ok());
+        assert!(matches!(
+            enforce_max_size(&vec![0u8; MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN + 1]),
+            Err(RelayError::MessageTooLarge { .. })
+        ));
     }
 
     #[test]
@@ -1072,6 +1089,32 @@ mod tests {
             Some(ConnectOutcome::Bridged { .. })
         ));
         assert_eq!(flow.take_bridge_bytes(), b"bridged-payload");
+    }
+
+    #[test]
+    fn connect_coalesced_bridge_bytes_beyond_frame_cap_are_captured() {
+        // A coalesced read can carry the STATUS frame plus more bridged
+        // bytes than one maximal frame; the receive path must not tear
+        // the flow down over the buffer total.
+        let mut flow = HopConnect::new(b"peer".to_vec());
+        let _ = flow.take_outbound();
+
+        let mut packet = frame_hop(HopMessage {
+            kind: HopMessageType::Status,
+            peer: None,
+            reservation: None,
+            limit: None,
+            status: Some(Status::Ok),
+        });
+        let bridged = vec![0xabu8; MAX_MESSAGE_SIZE + 1];
+        packet.extend_from_slice(&bridged);
+        flow.on_data(&packet).unwrap();
+
+        assert!(matches!(
+            flow.outcome(),
+            Some(ConnectOutcome::Bridged { .. })
+        ));
+        assert_eq!(flow.take_bridge_bytes(), bridged);
     }
 
     #[test]
@@ -1157,7 +1200,8 @@ mod tests {
         assert!(matches!(decode_frame(&bytes), FrameDecode::Complete { .. }));
 
         // An exactly-max frame (payload + 2-byte prefix) must also survive
-        // a state machine's receive-buffer guard, not just decode_frame.
+        // a state machine's receive path, not just decode_frame -- even
+        // with pipelined bridge bytes coalesced behind it in one input.
         // A STOP CONNECT carrying the same peer id is exactly max-size too.
         let stop_connect = StopMessage {
             kind: StopMessageType::Connect,
@@ -1169,12 +1213,12 @@ mod tests {
             status: None,
         };
         assert_eq!(stop_connect.encode().len(), MAX_MESSAGE_SIZE);
+        let mut coalesced = encode_frame(&stop_connect.encode());
+        coalesced.extend_from_slice(b"early-bridge-bytes");
         let mut responder = StopResponder::new();
         responder
-            .handle_input(StopResponderInput::Data(encode_frame(
-                &stop_connect.encode(),
-            )))
-            .expect("exactly-max STOP CONNECT frame must be accepted");
+            .handle_input(StopResponderInput::Data(coalesced))
+            .expect("exactly-max STOP CONNECT + pipelined bytes must be accepted");
         assert!(matches!(
             responder.poll_output(),
             Some(StopResponderOutput::Request(_))

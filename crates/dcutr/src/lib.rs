@@ -258,10 +258,6 @@ impl DcutrInitiator {
             return Ok(());
         }
 
-        enforce_max_size(&self.recv_buf).inspect_err(|_| {
-            self.state = InitiatorState::Done;
-        })?;
-
         let (reply, consumed) = match decode_frame(&self.recv_buf) {
             FrameDecode::Complete { payload, consumed } => {
                 let reply = HolePunch::decode(payload).map_err(|e| {
@@ -270,7 +266,16 @@ impl DcutrInitiator {
                 })?;
                 (reply, consumed)
             }
-            FrameDecode::Incomplete => return Ok(()),
+            // Only the incomplete remainder is bounded: a complete frame
+            // decodes (and drains) regardless of what is coalesced behind
+            // it, so the backstop can never reject a frame the decoder
+            // would accept.
+            FrameDecode::Incomplete => {
+                enforce_max_size(&self.recv_buf).inspect_err(|_| {
+                    self.state = InitiatorState::Done;
+                })?;
+                return Ok(());
+            }
             FrameDecode::TooLarge { len } => {
                 self.state = InitiatorState::Done;
                 return Err(DcutrError::FrameTooLarge { len });
@@ -451,10 +456,6 @@ impl DcutrResponder {
                 return Ok(());
             }
 
-            enforce_max_size(&self.recv_buf).inspect_err(|_| {
-                self.state = ResponderState::Done;
-            })?;
-
             let (msg, consumed) = match decode_frame(&self.recv_buf) {
                 FrameDecode::Complete { payload, consumed } => {
                     let msg = HolePunch::decode(payload).map_err(|e| {
@@ -463,7 +464,17 @@ impl DcutrResponder {
                     })?;
                     (msg, consumed)
                 }
-                FrameDecode::Incomplete => return Ok(()),
+                // Only the incomplete remainder is bounded: a complete
+                // frame decodes (and drains) regardless of what is
+                // coalesced behind it -- e.g. a maximal CONNECT pipelined
+                // with SYNC -- so the backstop can never reject a frame
+                // the decoder would accept.
+                FrameDecode::Incomplete => {
+                    enforce_max_size(&self.recv_buf).inspect_err(|_| {
+                        self.state = ResponderState::Done;
+                    })?;
+                    return Ok(());
+                }
                 FrameDecode::TooLarge { len } => {
                     self.state = ResponderState::Done;
                     return Err(DcutrError::FrameTooLarge { len });
@@ -584,13 +595,14 @@ impl SansIoProtocol for DcutrResponder {
 /// below 2^14, so its uvarint prefix encodes in at most two bytes.
 const MAX_FRAME_PREFIX_LEN: usize = 2;
 
-/// Bounds the receive buffer to one maximal legal frame: payload plus its
-/// length prefix.
+/// Backstop bound on the receive buffer once decoding has stalled on an
+/// incomplete frame.
 ///
-/// The payload bound itself is enforced by [`decode_frame`]; this guard
-/// only stops unbounded buffering, so it must never reject a frame the
-/// decoder would accept -- a payload of exactly [`MAX_MESSAGE_SIZE`] plus
-/// its two-byte prefix is legal on the wire.
+/// Called only on [`FrameDecode::Incomplete`], after any complete frame
+/// has been drained: a stalled buffer can legally hold at most one
+/// partial frame (the payload bound is [`decode_frame`]'s `TooLarge`), so
+/// this can never reject traffic the decoder would accept -- including a
+/// maximal frame coalesced with pipelined trailing bytes.
 fn enforce_max_size(buf: &[u8]) -> Result<(), DcutrError> {
     if buf.len() > MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN {
         return Err(DcutrError::MessageTooLarge { len: buf.len() });
@@ -877,15 +889,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_message() {
-        // One byte beyond a maximal legal frame (payload + 2-byte prefix)
-        // must trip the receive-buffer guard.
-        let mut resp = DcutrResponder::new(&[]);
-        let mut large = Vec::new();
-        minip2p_core::write_uvarint(MAX_MESSAGE_SIZE as u64, &mut large);
-        large.extend_from_slice(&vec![0u8; MAX_MESSAGE_SIZE + 1]);
-        let err = resp.on_data(&large).unwrap_err();
-        assert!(matches!(err, DcutrError::MessageTooLarge { .. }));
+    fn receive_buffer_backstop_bounds_partial_frames() {
+        // The backstop allows one maximal legal frame (payload + 2-byte
+        // prefix) and rejects anything beyond it. It runs only on stalled
+        // (incomplete) buffers, where `decode_frame`'s own bounds make it
+        // unreachable from wire input -- a pure defense-in-depth check.
+        assert!(enforce_max_size(&vec![0u8; MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN]).is_ok());
+        assert!(matches!(
+            enforce_max_size(&vec![0u8; MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN + 1]),
+            Err(DcutrError::MessageTooLarge { .. })
+        ));
     }
 
     #[test]
@@ -956,11 +969,18 @@ mod tests {
         ));
 
         // The framed bytes (payload + 2-byte prefix) must also survive the
-        // state machine's own receive-buffer guard, not just decode_frame.
+        // state machine's own receive path, not just decode_frame -- even
+        // when a coalesced read pipelines the SYNC frame behind the
+        // maximal CONNECT in the same input.
         let own = [addr("/ip4/10.0.0.1/udp/1234/quic-v1")];
         let mut resp = DcutrResponder::new(&own);
-        resp.handle_input(DcutrResponderInput::Data(framed))
-            .expect("exactly-max CONNECT frame must be accepted by the responder");
+        let mut coalesced = framed;
+        coalesced.extend(frame(HolePunch {
+            kind: HolePunchType::Sync,
+            obs_addrs: Vec::new(),
+        }));
+        resp.handle_input(DcutrResponderInput::Data(coalesced))
+            .expect("exactly-max CONNECT + pipelined SYNC must be accepted");
         assert!(matches!(
             resp.poll_output(),
             Some(DcutrResponderOutput::Outbound(_))
