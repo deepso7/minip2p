@@ -47,6 +47,9 @@ pub enum RelayError {
     /// The incoming message exceeded the maximum allowed size.
     #[error("relay message exceeds maximum size ({len} > {MAX_MESSAGE_SIZE})")]
     MessageTooLarge { len: usize },
+    /// The remote declared a frame length exceeding the maximum allowed size.
+    #[error("relay frame length exceeds maximum size ({len} > {MAX_MESSAGE_SIZE})")]
+    FrameTooLarge { len: u64 },
     /// An incoming message failed to decode.
     #[error("malformed relay message: {0}")]
     Malformed(#[from] RelayMessageError),
@@ -207,6 +210,10 @@ impl HopReservation {
                 (msg, consumed)
             }
             FrameDecode::Incomplete => return Ok(()),
+            FrameDecode::TooLarge { len } => {
+                self.state = FlowState::Done;
+                return Err(RelayError::FrameTooLarge { len });
+            }
             FrameDecode::Error(e) => {
                 self.state = FlowState::Done;
                 return Err(RelayError::Malformed(RelayMessageError::Varint(e)));
@@ -437,6 +444,10 @@ impl HopConnect {
                 (msg, consumed)
             }
             FrameDecode::Incomplete => return Ok(()),
+            FrameDecode::TooLarge { len } => {
+                self.state = FlowState::Done;
+                return Err(RelayError::FrameTooLarge { len });
+            }
             FrameDecode::Error(e) => {
                 self.state = FlowState::Done;
                 return Err(RelayError::Malformed(RelayMessageError::Varint(e)));
@@ -697,6 +708,10 @@ impl StopResponder {
                 (msg, consumed)
             }
             FrameDecode::Incomplete => return Ok(()),
+            FrameDecode::TooLarge { len } => {
+                self.state = StopState::Done;
+                return Err(RelayError::FrameTooLarge { len });
+            }
             FrameDecode::Error(e) => {
                 self.state = StopState::Done;
                 return Err(RelayError::Malformed(RelayMessageError::Varint(e)));
@@ -937,6 +952,20 @@ mod tests {
         let large = vec![0u8; MAX_MESSAGE_SIZE + 1];
         let err = flow.on_data(&large).unwrap_err();
         assert!(matches!(err, RelayError::MessageTooLarge { .. }));
+    }
+
+    #[test]
+    fn reservation_rejects_oversized_declared_frame_length() {
+        // A tiny header declaring an impossible payload length must fail
+        // immediately instead of stalling while waiting for more bytes.
+        let mut flow = HopReservation::new();
+        let _ = flow.take_outbound();
+
+        let mut header = Vec::new();
+        minip2p_core::write_uvarint((MAX_MESSAGE_SIZE + 1) as u64, &mut header);
+        let err = flow.on_data(&header).unwrap_err();
+        assert!(matches!(err, RelayError::FrameTooLarge { .. }));
+        assert!(flow.is_done());
     }
 
     // --- HopConnect ---------------------------------------------------------

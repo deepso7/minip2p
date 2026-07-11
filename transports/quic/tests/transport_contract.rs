@@ -317,7 +317,42 @@ fn zero_pending_datagram_limit_is_rejected() {
 }
 
 #[test]
-fn pending_stream_byte_limit_rejects_oversized_write() {
+fn write_larger_than_queue_cap_succeeds_when_quiche_accepts_it() {
+    let limits = QuicLimits {
+        max_pending_stream_bytes: 8,
+        ..QuicLimits::default()
+    };
+    let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+    let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    let stream = client.open_stream(client_conn).expect("open stream");
+
+    // 9 bytes exceed the queue cap but fit quiche's send capacity on an idle
+    // connection, so the write goes straight to quiche instead of failing.
+    client
+        .send_stream(client_conn, stream, vec![7; 9])
+        .expect("write above the queue cap must succeed via direct send");
+
+    let mut received = 0;
+    for _ in 0..50 {
+        let (se, _) = drive_pair_once(&mut server, &mut client);
+        received += se
+            .iter()
+            .filter_map(|e| match e {
+                TransportEvent::StreamData { id, data, .. } if *id == server_conn => {
+                    Some(data.len())
+                }
+                _ => None,
+            })
+            .sum::<usize>();
+        if received >= 9 {
+            break;
+        }
+    }
+    assert_eq!(received, 9, "server must receive the full direct write");
+}
+
+#[test]
+fn pending_stream_byte_limit_rejects_unqueueable_remainder() {
     let limits = QuicLimits {
         max_pending_stream_bytes: 8,
         ..QuicLimits::default()
@@ -326,13 +361,84 @@ fn pending_stream_byte_limit_rejects_oversized_write() {
     let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
     let stream = client.open_stream(client_conn).expect("open stream");
 
+    // Far beyond both quiche's fresh-connection send capacity and the queue
+    // cap, so the unsendable remainder cannot be retained.
     let error = client
-        .send_stream(client_conn, stream, vec![0; 9])
-        .expect_err("oversized queued write must fail");
+        .send_stream(client_conn, stream, vec![0; 4 * 1024 * 1024])
+        .expect_err("write whose remainder exceeds the queue cap must fail");
     assert!(matches!(
         error,
         TransportError::ResourceExhausted {
             resource: "queued QUIC stream bytes"
+        }
+    ));
+}
+
+#[test]
+fn queued_stream_writes_preserve_order_behind_direct_sends() {
+    let (mut server, mut client, peer_addr) = setup_pair();
+    let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    let stream = client.open_stream(client_conn).expect("open stream");
+
+    // The first write exceeds the initial congestion window, so part of it
+    // queues; the second write must land behind that queued remainder.
+    let first: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let second = vec![0xEEu8; 1_000];
+    client
+        .send_stream(client_conn, stream, first.clone())
+        .expect("first write");
+    client
+        .send_stream(client_conn, stream, second.clone())
+        .expect("second write");
+    client
+        .close_stream_write(client_conn, stream)
+        .expect("close write");
+
+    let mut received = Vec::new();
+    let mut remote_closed = false;
+    for _ in 0..1000 {
+        let (se, _) = drive_pair_once(&mut server, &mut client);
+        for e in se {
+            match e {
+                TransportEvent::StreamData { id, data, .. } if id == server_conn => {
+                    received.extend_from_slice(&data);
+                }
+                TransportEvent::StreamRemoteWriteClosed { id, .. } if id == server_conn => {
+                    remote_closed = true;
+                }
+                _ => {}
+            }
+        }
+        if remote_closed {
+            break;
+        }
+    }
+
+    let mut expected = first;
+    expected.extend_from_slice(&second);
+    assert!(remote_closed, "server must observe the FIN");
+    assert_eq!(
+        received, expected,
+        "bytes must arrive exactly in write order"
+    );
+}
+
+#[test]
+fn dial_enforces_max_connections() {
+    let limits = QuicLimits {
+        max_connections: 1,
+        ..QuicLimits::default()
+    };
+    let (_server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+
+    client.dial(&peer_addr).expect("first dial fits the limit");
+    let error = client
+        .dial(&peer_addr)
+        .expect_err("second dial must exceed the connection limit");
+    assert!(matches!(
+        error,
+        TransportError::ResourceExhausted {
+            resource: "QUIC connections"
         }
     ));
 }

@@ -16,6 +16,7 @@ fn make_swarm(keypair: Ed25519Keypair) -> Swarm<QuicTransport> {
     SwarmBuilder::new(&keypair)
         .agent_version("minip2p-test/0.1.0")
         .build(transport)
+        .expect("build swarm")
 }
 
 fn make_dual_stack_swarm(keypair: Ed25519Keypair) -> Swarm<QuicEndpoint> {
@@ -23,6 +24,7 @@ fn make_dual_stack_swarm(keypair: Ed25519Keypair) -> Swarm<QuicEndpoint> {
     SwarmBuilder::new(&keypair)
         .agent_version("minip2p-test/0.1.0")
         .build(transport)
+        .expect("build swarm")
 }
 
 fn drive_pair(
@@ -79,7 +81,8 @@ fn listen_on_bound_addr_keeps_first_address_contract() {
         .expect("dual stack exposes a first address");
     let mut swarm = SwarmBuilder::new(&keypair)
         .agent_version("minip2p-test/0.1.0")
-        .build(transport);
+        .build(transport)
+        .expect("build swarm");
 
     let addr = swarm.listen_on_bound_addr().expect("listen");
 
@@ -232,12 +235,16 @@ const USER_PROTOCOL_ID: &str = "/minip2p/test/echo/1.0.0";
 #[test]
 fn swarm_user_protocol_round_trip() {
     let mut server = make_swarm(Ed25519Keypair::generate());
-    server.add_user_protocol(USER_PROTOCOL_ID);
+    server
+        .add_protocol(USER_PROTOCOL_ID)
+        .expect("register protocol");
     let peer_addr = server.listen_on_bound_addr().expect("server listen");
     let server_peer_id = peer_addr.peer_id().clone();
 
     let mut client = make_swarm(Ed25519Keypair::generate());
-    client.add_user_protocol(USER_PROTOCOL_ID);
+    client
+        .add_protocol(USER_PROTOCOL_ID)
+        .expect("register protocol");
     client.dial(&peer_addr).expect("dial");
 
     let mut user_stream: Option<StreamId> = None;
@@ -321,7 +328,9 @@ fn open_user_stream_fails_fast_when_peer_did_not_advertise_protocol() {
     let server_peer_id = peer_addr.peer_id().clone();
 
     let mut client = make_swarm(Ed25519Keypair::generate());
-    client.add_user_protocol(USER_PROTOCOL_ID);
+    client
+        .add_protocol(USER_PROTOCOL_ID)
+        .expect("register protocol");
     client.dial(&peer_addr).expect("dial");
 
     for _ in 0..500 {

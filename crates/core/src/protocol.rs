@@ -1,7 +1,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_identity::{PeerId, VarintError, read_uvarint, write_uvarint};
+use minip2p_identity::{PeerId, read_uvarint, write_uvarint};
 
 use crate::MultiaddrError;
 
@@ -170,10 +170,12 @@ fn length_prefixed<'a>(
     protocol: &'static str,
 ) -> Result<(&'a [u8], usize), MultiaddrError> {
     let (len, consumed) = read_uvarint(bytes)?;
-    let len = usize::try_from(len).map_err(|_| VarintError::Overflow)?;
     let available = bytes.len() - consumed;
-    if len > available {
+    // Compare in u64 so an absurd declared length errs identically on
+    // 32-bit and 64-bit targets.
+    if len > available as u64 {
         return Err(MultiaddrError::TruncatedBinaryValue { protocol });
     }
+    let len = len as usize;
     Ok((&bytes[consumed..consumed + len], consumed + len))
 }

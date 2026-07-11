@@ -15,6 +15,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
+    WaitOutcome,
 };
 use quiche::ConnectionId as QuicConnectionId;
 use sha2::Sha256;
@@ -67,6 +68,14 @@ fn retry_address_bytes(addr: SocketAddr) -> ([u8; RETRY_TOKEN_MAX_ADDRESS_LEN], 
     (bytes, ip_len + 2)
 }
 
+/// Mints an address-bound, HMAC-authenticated Retry token.
+///
+/// Tokens are deliberately NOT single-use: within
+/// [`RETRY_TOKEN_LIFETIME_SECS`] the same token validates repeatedly.
+/// Single-use would require server-side state, defeating the point of a
+/// *stateless* Retry. The token only proves the source address is
+/// reachable (no amplification); a validated address opening several
+/// connections inside the 10s window is bounded by `max_connections`.
 fn mint_retry_token(
     secret: &[u8; 32],
     source: SocketAddr,
@@ -929,11 +938,15 @@ impl QuicTransport {
         }
     }
 
-    /// Removes all index entries (CID and peer) for a connection.
-    fn unindex_connection(&mut self, id: ConnectionId, peer_id: Option<PeerId>) {
-        self.cid_to_connection.retain(|_, mapped| *mapped != id);
+    /// Removes all index entries (CID and peer) for a removed connection,
+    /// using the connection's own record of indexed CIDs instead of scanning
+    /// the whole routing table.
+    fn unindex_connection(&mut self, id: ConnectionId, conn: &QuicConnection) {
+        for cid in conn.indexed_cids() {
+            self.cid_to_connection.remove(cid);
+        }
 
-        if let Some(peer_id) = peer_id {
+        if let Some(peer_id) = conn.endpoint().peer_id().cloned() {
             self.remove_peer_connection(&peer_id, id);
         }
     }
@@ -956,36 +969,85 @@ impl QuicTransport {
         Ok(())
     }
 
-    /// Sends a transport-level datagram or retains it for a later writable
-    /// poll when the non-blocking socket is full.
-    fn send_or_queue_datagram(
-        &mut self,
-        bytes: &[u8],
-        destination: SocketAddr,
-    ) -> Result<(), TransportError> {
+    /// Best-effort send for stateless response packets (e.g. Retry) that the
+    /// client regenerates by retransmitting its Initial. The packet is
+    /// retained when the socket reports `WouldBlock` and silently dropped
+    /// when the retention queue is full or the send fails outright; transient
+    /// backpressure on a pre-connection packet must never abort `poll()`.
+    fn send_stateless_datagram(&mut self, bytes: &[u8], destination: SocketAddr) {
         match self.socket.send_to(bytes, destination) {
-            Ok(_) => Ok(()),
+            Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if self.pending_datagrams.len() >= self.node_config.limits().max_pending_datagrams {
-                    return Err(TransportError::ResourceExhausted {
-                        resource: "queued QUIC UDP datagrams",
-                    });
-                }
-                self.pending_datagrams.push_back(PendingDatagram {
-                    bytes: bytes.to_vec(),
-                    destination,
-                });
-                Ok(())
+                self.queue_datagram_best_effort(bytes, destination);
             }
-            Err(e) => Err(TransportError::PollError {
-                reason: format!("udp send failed: {e}"),
-            }),
+            // A failed stateless send only affects one unvalidated client;
+            // dropping the packet is safer than failing the whole poll.
+            Err(_) => {}
         }
+    }
+
+    /// Retains a regenerable datagram for a later writable poll, dropping it
+    /// when the retention queue is already full.
+    fn queue_datagram_best_effort(&mut self, bytes: &[u8], destination: SocketAddr) {
+        if self.pending_datagrams.len() >= self.node_config.limits().max_pending_datagrams {
+            return;
+        }
+        self.pending_datagrams.push_back(PendingDatagram {
+            bytes: bytes.to_vec(),
+            destination,
+        });
+    }
+}
+
+/// Blocks until `socket` has a readable datagram or `timeout` elapses.
+///
+/// Temporarily switches the socket to blocking mode with a read timeout and
+/// peeks one byte, so no input is consumed. Errors other than a timeout map
+/// to `Ready` so the next `poll()` can surface them.
+fn wait_for_socket_input(socket: &UdpSocket, timeout: Duration) -> WaitOutcome {
+    if timeout.is_zero() {
+        return WaitOutcome::TimedOut;
+    }
+
+    // Arm the read timeout before entering blocking mode so a failure here
+    // can never leave the peek blocking indefinitely.
+    if socket.set_read_timeout(Some(timeout)).is_err() || socket.set_nonblocking(false).is_err() {
+        let _ = socket.set_nonblocking(true);
+        let _ = socket.set_read_timeout(None);
+        return WaitOutcome::Ready;
+    }
+
+    let mut probe = [0u8; 1];
+    let result = socket.peek_from(&mut probe);
+
+    // Restore non-blocking mode even when the peek failed.
+    let _ = socket.set_nonblocking(true);
+    let _ = socket.set_read_timeout(None);
+
+    match result {
+        Ok(_) => WaitOutcome::Ready,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            WaitOutcome::TimedOut
+        }
+        Err(_) => WaitOutcome::Ready,
     }
 }
 
 impl Transport for QuicTransport {
     fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+        // The connection limit counts inbound and outbound alike; the accept
+        // path enforces the same bound for incoming Initials.
+        if self.connections.len() >= self.node_config.limits().max_connections {
+            return Err(TransportError::ResourceExhausted {
+                resource: "QUIC connections",
+            });
+        }
+
         let id = self.allocate_connection_id()?;
         let peer_socket = resolve_dial_socket_addr(addr.transport(), "dial target")?;
         let local_socket = self.local_addr()?;
@@ -1028,7 +1090,7 @@ impl Transport for QuicTransport {
                 })?;
         }
 
-        let conn = QuicConnection::new(
+        let mut conn = QuicConnection::new(
             id,
             quiche_conn,
             peer_socket,
@@ -1036,10 +1098,11 @@ impl Transport for QuicTransport {
             self.node_config.limits().max_streams_per_connection,
             self.node_config.limits().max_pending_stream_bytes,
         );
-        let source_cid = conn.source_cid_bytes();
+        for cid in conn.take_unindexed_source_cids() {
+            self.cid_to_connection.insert(cid, id);
+        }
 
         self.connections.insert(id, conn);
-        self.cid_to_connection.insert(source_cid, id);
         self.index_peer_connection(addr.peer_id().clone(), id);
 
         Ok(id)
@@ -1156,17 +1219,6 @@ impl Transport for QuicTransport {
             .unwrap_or_default()
     }
 
-    fn active_connection_count(&self) -> usize {
-        self.connections.len()
-    }
-
-    fn active_connection_sources(&self) -> Vec<Multiaddr> {
-        self.connections
-            .values()
-            .map(|conn| conn.endpoint().transport().clone())
-            .collect()
-    }
-
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
         self.connections
             .values()
@@ -1176,9 +1228,11 @@ impl Transport for QuicTransport {
     }
 
     fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+        // Events accumulate in `self.pending_events` for the whole poll and
+        // are only taken at the very end, so any error path leaves the batch
+        // queued for the next call instead of dropping it.
         self.flush_pending_datagrams()?;
         let mut buf = [0u8; 65535];
-        let mut events = std::mem::take(&mut self.pending_events);
 
         loop {
             let (len, from) = match self.socket.recv_from(&mut buf) {
@@ -1260,7 +1314,9 @@ impl Transport for QuicTransport {
                         .map_err(|e| TransportError::PollError {
                             reason: format!("failed to encode QUIC Retry: {e}"),
                         })?;
-                        self.send_or_queue_datagram(&out[..written], from)?;
+                        // Best-effort: a dropped Retry is regenerated when
+                        // the client retransmits its Initial.
+                        self.send_stateless_datagram(&out[..written], from);
                         continue;
                     }
 
@@ -1292,7 +1348,7 @@ impl Transport for QuicTransport {
 
                 let id = self.allocate_connection_id()?;
                 let endpoint = ConnectionEndpoint::new(socket_addr_to_multiaddr(from));
-                let conn = QuicConnection::new(
+                let mut conn = QuicConnection::new(
                     id,
                     quiche_conn,
                     from,
@@ -1300,7 +1356,10 @@ impl Transport for QuicTransport {
                     self.node_config.limits().max_streams_per_connection,
                     self.node_config.limits().max_pending_stream_bytes,
                 );
-                let source_cid = conn.source_cid_bytes();
+                for cid in conn.take_unindexed_source_cids() {
+                    self.cid_to_connection.insert(cid, id);
+                }
+                conn.note_indexed_cid(client_dcid.clone());
 
                 if self.connections.insert(id, conn).is_some() {
                     return Err(TransportError::PollError {
@@ -1308,9 +1367,9 @@ impl Transport for QuicTransport {
                     });
                 }
 
-                self.cid_to_connection.insert(source_cid, id);
                 self.cid_to_connection.insert(client_dcid, id);
-                events.push(TransportEvent::IncomingConnection { id, endpoint });
+                self.pending_events
+                    .push(TransportEvent::IncomingConnection { id, endpoint });
                 target_conn_id = Some(id);
             }
 
@@ -1323,7 +1382,7 @@ impl Transport for QuicTransport {
             }
 
             if let Some(id) = target_conn_id {
-                let mut source_cid: Option<Vec<u8>> = None;
+                let mut new_cids = Vec::new();
                 let mut identity_update: Option<(Option<PeerId>, ConnectionEndpoint)> = None;
                 if let Some(conn) = self.connections.get_mut(&id) {
                     let previous_peer_id = conn.endpoint().peer_id().cloned();
@@ -1332,18 +1391,21 @@ impl Transport for QuicTransport {
                         from,
                         local_addr,
                         &self.socket,
-                        &mut events,
+                        &mut self.pending_events,
                         &mut self.pending_datagrams,
                         self.node_config.limits().max_pending_datagrams,
                     )?;
-                    source_cid = Some(conn.source_cid_bytes());
+                    // Source CIDs only change while packets are processed, so
+                    // indexing here keeps the routing table current without a
+                    // per-poll sweep over every connection.
+                    new_cids = conn.take_unindexed_source_cids();
                     if conn.endpoint().peer_id() != previous_peer_id.as_ref() {
                         identity_update = Some((previous_peer_id, conn.endpoint().clone()));
                     }
                 }
 
-                if let Some(source_cid) = source_cid {
-                    self.cid_to_connection.insert(source_cid, id);
+                for cid in new_cids {
+                    self.cid_to_connection.insert(cid, id);
                 }
 
                 if let Some((previous_peer_id, endpoint)) = identity_update {
@@ -1355,62 +1417,68 @@ impl Transport for QuicTransport {
                         self.index_peer_connection(peer_id.clone(), id);
                     }
 
-                    events.push(TransportEvent::PeerIdentityVerified {
-                        id,
-                        endpoint,
-                        previous_peer_id,
-                    });
+                    self.pending_events
+                        .push(TransportEvent::PeerIdentityVerified {
+                            id,
+                            endpoint,
+                            previous_peer_id,
+                        });
                 }
             }
         }
 
         let mut to_remove = Vec::new();
-        let mut cid_updates = Vec::new();
-        let cid_index = &self.cid_to_connection;
 
         for (&id, conn) in self.connections.iter_mut() {
             conn.handle_timeout(
                 &self.socket,
-                &mut events,
+                &mut self.pending_events,
                 &mut self.pending_datagrams,
                 self.node_config.limits().max_pending_datagrams,
             )?;
             conn.poll_streams(
-                &mut events,
+                &mut self.pending_events,
                 &self.socket,
                 &mut self.pending_datagrams,
                 self.node_config.limits().max_pending_datagrams,
             )?;
-            for cid in conn.source_cids() {
-                if !cid_index.contains_key(cid) {
-                    cid_updates.push((cid.to_vec(), id));
-                }
-            }
 
             if conn.is_closed() {
                 to_remove.push(id);
             }
         }
 
-        for (cid, id) in cid_updates {
-            self.cid_to_connection.insert(cid, id);
-        }
-
         for id in to_remove {
             if let Some(conn) = self.connections.remove(&id) {
-                self.unindex_connection(id, conn.endpoint().peer_id().cloned());
+                self.unindex_connection(id, &conn);
             }
-            events.push(TransportEvent::Closed { id });
+            self.pending_events.push(TransportEvent::Closed { id });
         }
 
-        Ok(events)
+        Ok(std::mem::take(&mut self.pending_events))
     }
 
     fn next_timeout(&self) -> Option<Duration> {
+        // Queued outbound work waits on socket writability rather than a
+        // QUIC timer; return a short duration so the driver retries the
+        // flush soon instead of blocking on a long timer.
+        if !self.pending_datagrams.is_empty()
+            || self
+                .connections
+                .values()
+                .any(QuicConnection::has_pending_stream_writes)
+        {
+            return Some(Duration::from_millis(1));
+        }
+
         self.connections
             .values()
             .filter_map(QuicConnection::timeout)
             .min()
+    }
+
+    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
+        wait_for_socket_input(&self.socket, timeout)
     }
 }
 
@@ -1491,24 +1559,17 @@ impl Transport for QuicEndpoint {
         }
     }
 
+    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
+        match self {
+            Self::Single(transport) => transport.wait_for_input(timeout),
+            Self::Dual(transport) => transport.wait_for_input(timeout),
+        }
+    }
+
     fn local_addresses(&self) -> Vec<Multiaddr> {
         match self {
             Self::Single(transport) => transport.local_addresses(),
             Self::Dual(transport) => transport.local_addresses(),
-        }
-    }
-
-    fn active_connection_count(&self) -> usize {
-        match self {
-            Self::Single(transport) => transport.active_connection_count(),
-            Self::Dual(transport) => transport.active_connection_count(),
-        }
-    }
-
-    fn active_connection_sources(&self) -> Vec<Multiaddr> {
-        match self {
-            Self::Single(transport) => transport.active_connection_sources(),
-            Self::Dual(transport) => transport.active_connection_sources(),
         }
     }
 
@@ -1576,16 +1637,25 @@ impl Transport for DualQuicTransport {
     }
 
     fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
-        let mut events = Vec::new();
+        let ipv4_events = self.ipv4.poll()?;
+        let ipv6_events = match self.ipv6.poll() {
+            Ok(events) => events,
+            Err(e) => {
+                // Requeue the already-taken IPv4 batch (ahead of anything
+                // newer) so the IPv6 error doesn't drop it.
+                let mut requeued = ipv4_events;
+                requeued.append(&mut self.ipv4.pending_events);
+                self.ipv4.pending_events = requeued;
+                return Err(e);
+            }
+        };
+
+        let mut events: Vec<TransportEvent> = ipv4_events
+            .into_iter()
+            .map(|event| Self::map_event(AddressFamily::Ipv4, event))
+            .collect();
         events.extend(
-            self.ipv4
-                .poll()?
-                .into_iter()
-                .map(|event| Self::map_event(AddressFamily::Ipv4, event)),
-        );
-        events.extend(
-            self.ipv6
-                .poll()?
+            ipv6_events
                 .into_iter()
                 .map(|event| Self::map_event(AddressFamily::Ipv6, event)),
         );
@@ -1600,19 +1670,35 @@ impl Transport for DualQuicTransport {
         }
     }
 
+    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
+        // Two independent sockets and no shared readiness primitive, so
+        // alternate short blocking peeks on each family; a packet on either
+        // socket wakes the driver within one slice.
+        const SLICE: Duration = Duration::from_millis(10);
+
+        if timeout.is_zero() {
+            return WaitOutcome::TimedOut;
+        }
+
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            for transport in [&self.ipv4, &self.ipv6] {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return WaitOutcome::TimedOut;
+                }
+                if wait_for_socket_input(&transport.socket, SLICE.min(remaining))
+                    == WaitOutcome::Ready
+                {
+                    return WaitOutcome::Ready;
+                }
+            }
+        }
+    }
+
     fn local_addresses(&self) -> Vec<Multiaddr> {
         let mut addrs = self.ipv4.local_addresses();
         addrs.extend(self.ipv6.local_addresses());
-        addrs
-    }
-
-    fn active_connection_count(&self) -> usize {
-        self.ipv4.active_connection_count() + self.ipv6.active_connection_count()
-    }
-
-    fn active_connection_sources(&self) -> Vec<Multiaddr> {
-        let mut addrs = self.ipv4.active_connection_sources();
-        addrs.extend(self.ipv6.active_connection_sources());
         addrs
     }
 
@@ -1685,6 +1771,175 @@ mod tests {
         assert!(
             !reject_oversized_retry_token(false, &oversized),
             "disabled address validation must not impose our Retry token format"
+        );
+    }
+
+    #[test]
+    fn best_effort_datagram_queue_drops_overflow_without_error() {
+        let limits = QuicLimits {
+            max_pending_datagrams: 2,
+            ..QuicLimits::default()
+        };
+        let mut transport = QuicTransport::new(
+            QuicNodeConfig::generate().with_limits(limits),
+            "127.0.0.1:0",
+        )
+        .expect("bind");
+        let destination = transport.local_addr().expect("local addr");
+
+        for payload in [&[1u8][..], &[2u8][..], &[3u8][..]] {
+            transport.queue_datagram_best_effort(payload, destination);
+        }
+
+        assert_eq!(
+            transport.pending_datagrams.len(),
+            2,
+            "queue must cap at the limit and silently drop the overflow"
+        );
+    }
+
+    #[test]
+    fn queued_events_survive_an_errored_poll() {
+        let mut transport =
+            QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+        let addr = transport.local_multiaddr().expect("multiaddr");
+        transport
+            .pending_events
+            .push(TransportEvent::Listening { addr: addr.clone() });
+
+        // An IPv6 destination on an IPv4 socket makes the datagram flush fail
+        // with a hard error before any events would be returned.
+        let bad_destination: SocketAddr = "[::1]:9".parse().expect("socket addr");
+        transport.queue_datagram_best_effort(&[0u8; 4], bad_destination);
+
+        let error = transport
+            .poll()
+            .expect_err("hard send failure must surface");
+        assert!(matches!(error, TransportError::PollError { .. }));
+        assert!(
+            transport
+                .pending_events
+                .iter()
+                .any(|event| matches!(event, TransportEvent::Listening { addr: a } if *a == addr)),
+            "events queued before the failed poll must remain queued"
+        );
+
+        // Once the poisoned datagram is gone the next poll delivers the batch.
+        transport.pending_datagrams.clear();
+        let events = transport.poll().expect("poll");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TransportEvent::Listening { addr: a } if *a == addr))
+        );
+    }
+
+    #[test]
+    fn next_timeout_is_short_while_outbound_work_is_queued() {
+        let mut transport =
+            QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+        assert_eq!(transport.next_timeout(), None);
+
+        let destination = transport.local_addr().expect("local addr");
+        transport.queue_datagram_best_effort(&[0u8; 4], destination);
+        assert_eq!(
+            transport.next_timeout(),
+            Some(Duration::from_millis(1)),
+            "queued datagrams must keep the driver polling"
+        );
+    }
+
+    #[test]
+    fn wait_for_input_reports_readiness_without_consuming_input() {
+        let mut transport =
+            QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+
+        assert_eq!(
+            transport.wait_for_input(Duration::ZERO),
+            WaitOutcome::TimedOut
+        );
+        assert_eq!(
+            transport.wait_for_input(Duration::from_millis(10)),
+            WaitOutcome::TimedOut,
+            "an idle socket must time out"
+        );
+
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
+        sender
+            .send_to(&[1, 2, 3], transport.local_addr().expect("local addr"))
+            .expect("send probe");
+        assert_eq!(
+            transport.wait_for_input(Duration::from_secs(2)),
+            WaitOutcome::Ready
+        );
+
+        // The peek must not consume the datagram, and the socket must be back
+        // in non-blocking mode afterwards.
+        let mut buf = [0u8; 16];
+        let (len, _) = transport
+            .socket
+            .recv_from(&mut buf)
+            .expect("datagram must still be queued");
+        assert_eq!(&buf[..len], &[1, 2, 3]);
+        let error = transport
+            .socket
+            .recv_from(&mut buf)
+            .expect_err("socket must be restored to non-blocking");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn garbage_and_oversized_token_initials_create_no_connection_state() {
+        let mut server =
+            QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+        server.listen_on_bound_addr().expect("listen");
+        let server_addr = server.local_addr().expect("local addr");
+
+        // A syntactically valid Initial whose Retry token exceeds anything we
+        // could have minted. Header parsing for an Initial stops after the
+        // token, so no payload is needed.
+        let token_len = RETRY_TOKEN_MAX_LEN + 1;
+        let mut packet = vec![0xc0];
+        packet.extend_from_slice(&quiche::PROTOCOL_VERSION.to_be_bytes());
+        packet.push(16);
+        packet.extend_from_slice(&[0xaa; 16]);
+        packet.push(16);
+        packet.extend_from_slice(&[0xbb; 16]);
+        packet.push(0x40 | (token_len >> 8) as u8);
+        packet.push((token_len & 0xff) as u8);
+        packet.extend_from_slice(&vec![0xcc; token_len]);
+
+        let mut parse_copy = packet.clone();
+        let header = quiche::Header::from_slice(&mut parse_copy, quiche::MAX_CONN_ID_LEN)
+            .expect("crafted Initial must parse");
+        assert_eq!(header.ty, quiche::Type::Initial);
+        assert_eq!(header.token.as_deref().map(<[u8]>::len), Some(token_len));
+
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
+        sender
+            .send_to(&packet, server_addr)
+            .expect("send oversized-token Initial");
+        sender
+            .send_to(&[0xff; 64], server_addr)
+            .expect("send garbage");
+
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(2));
+            let events = server.poll().expect("poll");
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, TransportEvent::IncomingConnection { .. })),
+                "junk datagrams must not surface a connection"
+            );
+        }
+        assert!(
+            server.connections.is_empty(),
+            "junk datagrams must not allocate connection state"
+        );
+        assert!(
+            server.cid_to_connection.is_empty(),
+            "junk datagrams must not populate the CID routing table"
         );
     }
 

@@ -2,9 +2,9 @@
 //!
 //! The two public entry points are [`run_listen`] (Peer B) and
 //! [`run_dial`] (Peer A). Each is written as a linear script against
-//! `Swarm::run_until`: dial the relay, run HOP/STOP, run DCUtR, attempt
-//! hole-punch, ping. No phase enums; every step is an obvious function
-//! call.
+//! consuming `Swarm::poll_next` loops (see [`poll_until`]): dial the
+//! relay, run HOP/STOP, run DCUtR, attempt hole-punch, ping. No phase
+//! enums; every step is an obvious function call.
 //!
 //! See `examples/peer/README.md` for usage examples.
 
@@ -31,7 +31,7 @@ use minip2p_relay::{
     StopResponderInput, StopResponderOutput,
 };
 use minip2p_swarm::{Swarm, SwarmBuilder, SwarmEvent};
-use minip2p_transport::{StreamId, Transport};
+use minip2p_transport::{StreamId, Transport, TransportError};
 
 use crate::cli::{RunOptions, print_event};
 use crate::runtime::{build_peer_transport, load_keypair};
@@ -300,12 +300,11 @@ pub fn run_listen(relay_addr: PeerAddr, options: RunOptions) -> Result<(), Box<d
                  waiting for verified mTLS identity)"
             );
             let grace_deadline = Instant::now() + Duration::from_secs(2);
-            let verified = swarm
-                .run_until(grace_deadline, |ev| {
-                    print_event(role, ev);
-                    matches!(ev, SwarmEvent::ConnectionEstablished { peer_id } if peer_id == &remote_peer_id)
-                })
-                .map_err(|e| format!("grace poll: {e}"))?;
+            let verified = poll_until(&mut swarm, grace_deadline, |ev| {
+                print_event(role, ev);
+                matches!(ev, SwarmEvent::ConnectionEstablished { peer_id } if peer_id == &remote_peer_id)
+            })
+            .map_err(|e| format!("grace poll: {e}"))?;
             match verified {
                 Some(SwarmEvent::ConnectionEstablished { peer_id }) => {
                     println!("[{role}] direct-connected peer={peer_id} (mTLS verified)");
@@ -542,16 +541,15 @@ pub fn run_dial(
 
     // --- 5. Wait for direct connection or hole-punch timeout ---------------
     let punch_deadline = Instant::now() + HOLEPUNCH_DEADLINE;
-    let punched = swarm
-        .run_until(punch_deadline, |ev| {
-            print_event(role, ev);
-            matches!(
-                ev,
-                SwarmEvent::ConnectionEstablished { peer_id }
-                    if peer_id == &target
-            )
-        })
-        .map_err(|e| format!("holepunch poll: {e}"))?;
+    let punched = poll_until(&mut swarm, punch_deadline, |ev| {
+        print_event(role, ev);
+        matches!(
+            ev,
+            SwarmEvent::ConnectionEstablished { peer_id }
+                if peer_id == &target
+        )
+    })
+    .map_err(|e| format!("holepunch poll: {e}"))?;
 
     // --- 6. Direct ping or relay-ping fallback -----------------------------
     if punched.is_some() {
@@ -595,19 +593,21 @@ pub fn run_autonat_server(options: RunOptions) -> Result<(), Box<dyn Error>> {
 
     let deadline = Instant::now() + LISTEN_FOREVER;
     while Instant::now() < deadline {
-        let ev = swarm
-            .run_until(deadline, |ev| {
-                print_event(role, ev);
-                matches!(
-                    ev,
-                    SwarmEvent::UserStreamReady {
-                        protocol_id,
-                        initiated_locally: false,
-                        ..
-                    } if protocol_id == AUTONAT_PROTOCOL_ID
-                )
-            })
-            .map_err(|e| format!("autonat wait stream: {e}"))?;
+        // Consuming loop: each event is printed exactly once here, then
+        // gone. A `run_until` predicate would restore its whole history
+        // and re-print it on every iteration of this server loop.
+        let ev = poll_until(&mut swarm, deadline, |ev| {
+            print_event(role, ev);
+            matches!(
+                ev,
+                SwarmEvent::UserStreamReady {
+                    protocol_id,
+                    initiated_locally: false,
+                    ..
+                } if protocol_id == AUTONAT_PROTOCOL_ID
+            )
+        })
+        .map_err(|e| format!("autonat wait stream: {e}"))?;
 
         let Some(SwarmEvent::UserStreamReady {
             peer_id, stream_id, ..
@@ -927,18 +927,19 @@ fn wait_relay_protocols_after_dial(
     peer_id: &PeerId,
     deadline: Instant,
 ) -> Result<Vec<String>, Box<dyn Error>> {
-    let ev = swarm
-        .run_until(deadline, |ev| {
-            if !is_benign_retry_close_error(ev) {
-                print_event(role, ev);
-            }
-            matches!(ev, SwarmEvent::IdentifyReceived { peer_id: p, .. } if p == peer_id)
-                || matches!(ev, SwarmEvent::PeerReady { peer_id: p, .. } if p == peer_id)
-        })
-        .map_err(|e| format!("wait-relay-protocols: {e}"))?
-        .ok_or_else(|| {
-            format!("deadline exceeded before relay peer {peer_id} advertised protocols")
-        })?;
+    // Consuming loop: `retry_relay_connection` drained the previous
+    // attempt's events before the redial, and nothing is restored here,
+    // so this match can only be satisfied by a fresh Identify exchange
+    // on the new connection -- never by stale pre-disconnect events.
+    let ev = poll_until(swarm, deadline, |ev| {
+        if !is_benign_retry_close_error(ev) {
+            print_event(role, ev);
+        }
+        matches!(ev, SwarmEvent::IdentifyReceived { peer_id: p, .. } if p == peer_id)
+            || matches!(ev, SwarmEvent::PeerReady { peer_id: p, .. } if p == peer_id)
+    })
+    .map_err(|e| format!("wait-relay-protocols: {e}"))?
+    .ok_or_else(|| format!("deadline exceeded before relay peer {peer_id} advertised protocols"))?;
 
     match ev {
         SwarmEvent::IdentifyReceived { info, .. } => Ok(info.protocols),
@@ -956,15 +957,19 @@ fn retry_relay_connection(
         eprintln!("[{role}] relay-disconnect-for-retry failed: {e}");
     }
 
+    // Consume-and-discard everything from the aborted attempt while the
+    // backoff elapses. `poll_next` pops events permanently, so the next
+    // `wait_relay_protocols_after_dial` cannot re-match a stale
+    // `PeerReady`/`IdentifyReceived` from before the disconnect.
     let retry_deadline = Instant::now() + RELAY_READY_RETRY_BACKOFF;
-    let _ = swarm
-        .run_until(retry_deadline, |ev| {
-            if !is_benign_retry_close_error(ev) {
-                print_event(role, ev);
-            }
-            false
-        })
-        .map_err(|e| format!("relay retry drain: {e}"))?;
+    while let Some(ev) = swarm
+        .poll_next(retry_deadline)
+        .map_err(|e| format!("relay retry drain: {e}"))?
+    {
+        if !is_benign_retry_close_error(&ev) {
+            print_event(role, &ev);
+        }
+    }
     Ok(())
 }
 
@@ -981,6 +986,27 @@ fn earlier_deadline(a: Instant, b: Instant) -> Instant {
     if a <= b { a } else { b }
 }
 
+/// Polls events via `Swarm::poll_next` (consuming each one) until
+/// `predicate` matches or `deadline` passes.
+///
+/// This is the app-side idiom for side-effecting waits: every event is
+/// handled exactly once at the consumption site. `Swarm::run_until`
+/// restores non-matching events to the buffer, so a predicate that
+/// prints (like the ones in this file) would re-print history on every
+/// subsequent wait and let stale events satisfy later matches.
+fn poll_until(
+    swarm: &mut Swarm<QuicEndpoint>,
+    deadline: Instant,
+    mut predicate: impl FnMut(&SwarmEvent) -> bool,
+) -> Result<Option<SwarmEvent>, TransportError> {
+    while let Some(ev) = swarm.poll_next(deadline)? {
+        if predicate(&ev) {
+            return Ok(Some(ev));
+        }
+    }
+    Ok(None)
+}
+
 /// Wait for `ConnectionEstablished` with `peer_id`.
 fn wait_connected(
     swarm: &mut Swarm<QuicEndpoint>,
@@ -988,12 +1014,11 @@ fn wait_connected(
     peer_id: &PeerId,
     deadline: Instant,
 ) -> Result<(), Box<dyn Error>> {
-    let found = swarm
-        .run_until(deadline, |ev| {
-            print_event(role, ev);
-            matches!(ev, SwarmEvent::ConnectionEstablished { peer_id: p } if p == peer_id)
-        })
-        .map_err(|e| format!("wait-connected: {e}"))?;
+    let found = poll_until(swarm, deadline, |ev| {
+        print_event(role, ev);
+        matches!(ev, SwarmEvent::ConnectionEstablished { peer_id: p } if p == peer_id)
+    })
+    .map_err(|e| format!("wait-connected: {e}"))?;
     found
         .map(|_| ())
         .ok_or_else(|| format!("deadline exceeded before connection to {peer_id}").into())
@@ -1006,26 +1031,25 @@ fn wait_user_stream_ready(
     stream_id: StreamId,
     deadline: Instant,
 ) -> Result<(), Box<dyn Error>> {
-    let found = swarm
-        .run_until(deadline, |ev| {
-            print_event(role, ev);
-            matches!(
-                ev,
-                SwarmEvent::UserStreamReady {
-                    stream_id: s,
-                    initiated_locally: true,
-                    ..
-                } if *s == stream_id
-            ) || matches!(
-                ev,
-                SwarmEvent::UserStreamClosed { stream_id: s, .. } if *s == stream_id
-            ) || matches!(
-                ev,
-                SwarmEvent::Error(error)
-                    if error.detail.contains(&format!("stream {stream_id}"))
-            )
-        })
-        .map_err(|e| format!("wait-user-stream-ready: {e}"))?;
+    let found = poll_until(swarm, deadline, |ev| {
+        print_event(role, ev);
+        matches!(
+            ev,
+            SwarmEvent::UserStreamReady {
+                stream_id: s,
+                initiated_locally: true,
+                ..
+            } if *s == stream_id
+        ) || matches!(
+            ev,
+            SwarmEvent::UserStreamClosed { stream_id: s, .. } if *s == stream_id
+        ) || matches!(
+            ev,
+            SwarmEvent::Error(error)
+                if error.detail.contains(&format!("stream {stream_id}"))
+        )
+    })
+    .map_err(|e| format!("wait-user-stream-ready: {e}"))?;
     match found {
         Some(SwarmEvent::UserStreamReady { .. }) => Ok(()),
         Some(SwarmEvent::UserStreamClosed { .. }) => {
@@ -1050,21 +1074,20 @@ fn wait_inbound_stream(
     protocol_id: &str,
     deadline: Instant,
 ) -> Result<StreamId, Box<dyn Error>> {
-    let ev = swarm
-        .run_until(deadline, |ev| {
-            print_event(role, ev);
-            matches!(
-                ev,
-                SwarmEvent::UserStreamReady {
-                    peer_id: p,
-                    initiated_locally: false,
-                    protocol_id: pid,
-                    ..
-                } if p == peer_id && pid == protocol_id
-            )
-        })
-        .map_err(|e| format!("wait-inbound-stream: {e}"))?
-        .ok_or_else(|| format!("deadline exceeded before inbound {protocol_id}"))?;
+    let ev = poll_until(swarm, deadline, |ev| {
+        print_event(role, ev);
+        matches!(
+            ev,
+            SwarmEvent::UserStreamReady {
+                peer_id: p,
+                initiated_locally: false,
+                protocol_id: pid,
+                ..
+            } if p == peer_id && pid == protocol_id
+        )
+    })
+    .map_err(|e| format!("wait-inbound-stream: {e}"))?
+    .ok_or_else(|| format!("deadline exceeded before inbound {protocol_id}"))?;
     let SwarmEvent::UserStreamReady { stream_id, .. } = ev else {
         unreachable!()
     };
@@ -1079,16 +1102,15 @@ fn wait_user_stream_data(
     stream_id: StreamId,
     deadline: Instant,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
-    let ev = swarm
-        .run_until(deadline, |ev| {
-            print_event(role, ev);
-            matches!(
-                ev,
-                SwarmEvent::UserStreamData { stream_id: s, .. } if *s == stream_id
-            )
-        })
-        .map_err(|e| format!("wait-user-stream-data: {e}"))?
-        .ok_or_else(|| format!("deadline exceeded before data on stream {stream_id}"))?;
+    let ev = poll_until(swarm, deadline, |ev| {
+        print_event(role, ev);
+        matches!(
+            ev,
+            SwarmEvent::UserStreamData { stream_id: s, .. } if *s == stream_id
+        )
+    })
+    .map_err(|e| format!("wait-user-stream-data: {e}"))?
+    .ok_or_else(|| format!("deadline exceeded before data on stream {stream_id}"))?;
     let SwarmEvent::UserStreamData { data, .. } = ev else {
         unreachable!()
     };
@@ -1151,15 +1173,14 @@ fn relay_ping_fallback(
     // the relay's own idle-circuit GC can take several seconds -- but bounded
     // so we don't hang forever if something goes wrong.
     let fallback_deadline = Instant::now() + Duration::from_secs(15);
-    let ev = swarm
-        .run_until(fallback_deadline, |ev| {
-            print_event(role, ev);
-            matches!(
-                ev,
-                SwarmEvent::UserStreamData { stream_id: s, .. } if *s == bridge_stream
-            ) || is_bridge_closed_event(ev, bridge_stream)
-        })
-        .map_err(|e| format!("fallback poll: {e}"))?;
+    let ev = poll_until(swarm, fallback_deadline, |ev| {
+        print_event(role, ev);
+        matches!(
+            ev,
+            SwarmEvent::UserStreamData { stream_id: s, .. } if *s == bridge_stream
+        ) || is_bridge_closed_event(ev, bridge_stream)
+    })
+    .map_err(|e| format!("fallback poll: {e}"))?;
 
     match ev {
         Some(SwarmEvent::UserStreamData { data, .. }) => {
@@ -1200,13 +1221,12 @@ fn ping_and_exit(
     deadline: Instant,
 ) -> Result<(), Box<dyn Error>> {
     swarm.ping(&peer_id).map_err(|e| format!("ping: {e}"))?;
-    let ev = swarm
-        .run_until(deadline, |ev| {
-            print_event(role, ev);
-            matches!(ev, SwarmEvent::PingRttMeasured { peer_id: p, .. } if p == &peer_id)
-        })
-        .map_err(|e| format!("wait-rtt: {e}"))?
-        .ok_or("deadline exceeded before ping rtt arrived")?;
+    let ev = poll_until(swarm, deadline, |ev| {
+        print_event(role, ev);
+        matches!(ev, SwarmEvent::PingRttMeasured { peer_id: p, .. } if p == &peer_id)
+    })
+    .map_err(|e| format!("wait-rtt: {e}"))?
+    .ok_or("deadline exceeded before ping rtt arrived")?;
     let SwarmEvent::PingRttMeasured { rtt_ms, .. } = ev else {
         unreachable!()
     };
@@ -1267,11 +1287,18 @@ fn build_swarm_with_relay_protocols(
     let transport = build_peer_transport(options, &keypair)?;
     let mut swarm = SwarmBuilder::new(&keypair)
         .agent_version(AGENT)
-        .build(transport);
-    swarm.add_user_protocol(HOP_PROTOCOL_ID);
-    swarm.add_user_protocol(STOP_PROTOCOL_ID);
-    swarm.add_user_protocol(DCUTR_PROTOCOL_ID);
-    swarm.add_user_protocol(AUTONAT_PROTOCOL_ID);
+        .build(transport)
+        .map_err(|e| format!("build swarm: {e}"))?;
+    for protocol_id in [
+        HOP_PROTOCOL_ID,
+        STOP_PROTOCOL_ID,
+        DCUTR_PROTOCOL_ID,
+        AUTONAT_PROTOCOL_ID,
+    ] {
+        swarm
+            .add_protocol(protocol_id)
+            .map_err(|e| format!("add protocol {protocol_id}: {e}"))?;
+    }
     Ok(swarm)
 }
 
@@ -1282,8 +1309,11 @@ fn build_autonat_swarm(
     let transport = build_peer_transport(options, keypair)?;
     let mut swarm = SwarmBuilder::new(keypair)
         .agent_version(AGENT)
-        .build(transport);
-    swarm.add_user_protocol(AUTONAT_PROTOCOL_ID);
+        .build(transport)
+        .map_err(|e| format!("build swarm: {e}"))?;
+    swarm
+        .add_protocol(AUTONAT_PROTOCOL_ID)
+        .map_err(|e| format!("add protocol {AUTONAT_PROTOCOL_ID}: {e}"))?;
     Ok(swarm)
 }
 
@@ -1309,12 +1339,16 @@ fn dialback_candidate_with_bind(
         .map_err(|e| format!("dialback bind {bind}: {e}"))?;
     let mut probe = SwarmBuilder::new(&keypair)
         .agent_version(AGENT)
-        .build(transport);
+        .build(transport)
+        .map_err(|e| format!("build dialback swarm: {e}"))?;
     let peer_addr = PeerAddr::new(addr.clone(), peer_id.clone())
         .map_err(|e| format!("bad dialback peer addr {addr}: {e}"))?;
     probe
         .dial(&peer_addr)
         .map_err(|e| format!("dialback start {peer_addr}: {e}"))?;
+    // `run_until` (not `poll_until`) is fine here: the predicate is pure
+    // and the probe swarm is dropped right after, so restored events
+    // are never seen again.
     let found = probe
         .run_until(
             Instant::now() + timeout,

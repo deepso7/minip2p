@@ -476,6 +476,20 @@ mod tests {
     }
 
     #[test]
+    fn binary_codec_rejects_length_prefix_beyond_usize() {
+        // dns code (0x35) + a 10-byte uvarint declaring u64::MAX bytes of
+        // body. Must fail cleanly on 32-bit and 64-bit targets alike.
+        let mut bytes = vec![0x35];
+        bytes.extend_from_slice(&[0xFF; 9]);
+        bytes.push(0x01);
+        let err = Multiaddr::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            MultiaddrError::TruncatedBinaryValue { protocol: "dns" }
+        ));
+    }
+
+    #[test]
     fn binary_codec_rejects_invalid_dns_utf8() {
         // dns code (0x35) + length 2 + invalid utf-8 bytes (0xFF 0xFE).
         let err = Multiaddr::from_bytes(&[0x35, 0x02, 0xFF, 0xFE]).unwrap_err();

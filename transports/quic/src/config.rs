@@ -7,11 +7,14 @@ use minip2p_identity::Ed25519Keypair;
 /// workloads while bounding memory and unauthenticated connection state.
 #[derive(Clone, Debug)]
 pub struct QuicLimits {
-    /// Maximum simultaneous QUIC connections per UDP socket.
+    /// Maximum simultaneous QUIC connections per UDP socket, counting both
+    /// inbound (accepted) and outbound (dialed) connections.
     pub max_connections: usize,
     /// Maximum locally initiated bidirectional streams per connection.
     pub max_streams_per_connection: u64,
-    /// Maximum queued application bytes per connection while QUIC is blocked.
+    /// Maximum application bytes queued per connection beyond what quiche
+    /// accepts immediately. A single write may exceed this limit as long as
+    /// the remainder quiche leaves unsent fits within it.
     pub max_pending_stream_bytes: usize,
     /// Maximum UDP datagrams retained after the non-blocking socket reports
     /// `WouldBlock`.

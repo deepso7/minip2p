@@ -54,6 +54,9 @@ pub enum DcutrError {
     /// The incoming message exceeded the maximum allowed size.
     #[error("DCUtR message exceeds maximum size ({len} > {MAX_MESSAGE_SIZE})")]
     MessageTooLarge { len: usize },
+    /// The remote declared a frame length exceeding the maximum allowed size.
+    #[error("DCUtR frame length exceeds maximum size ({len} > {MAX_MESSAGE_SIZE})")]
+    FrameTooLarge { len: u64 },
     /// An incoming message failed to decode.
     #[error("malformed DCUtR message: {0}")]
     Malformed(#[from] DcutrMessageError),
@@ -251,6 +254,10 @@ impl DcutrInitiator {
                 (reply, consumed)
             }
             FrameDecode::Incomplete => return Ok(()),
+            FrameDecode::TooLarge { len } => {
+                self.state = InitiatorState::Done;
+                return Err(DcutrError::FrameTooLarge { len });
+            }
             FrameDecode::Error(e) => {
                 self.state = InitiatorState::Done;
                 return Err(DcutrError::Malformed(DcutrMessageError::Varint(e)));
@@ -420,6 +427,10 @@ impl DcutrResponder {
                     (msg, consumed)
                 }
                 FrameDecode::Incomplete => return Ok(()),
+                FrameDecode::TooLarge { len } => {
+                    self.state = ResponderState::Done;
+                    return Err(DcutrError::FrameTooLarge { len });
+                }
                 FrameDecode::Error(e) => {
                     self.state = ResponderState::Done;
                     return Err(DcutrError::Malformed(DcutrMessageError::Varint(e)));
@@ -804,6 +815,18 @@ mod tests {
         let large = vec![0u8; MAX_MESSAGE_SIZE + 1];
         let err = resp.on_data(&large).unwrap_err();
         assert!(matches!(err, DcutrError::MessageTooLarge { .. }));
+    }
+
+    #[test]
+    fn rejects_oversized_declared_frame_length() {
+        // A tiny header declaring an impossible payload length must fail
+        // immediately instead of stalling while waiting for more bytes.
+        let mut resp = DcutrResponder::new(&[]);
+        let mut header = Vec::new();
+        minip2p_core::write_uvarint((MAX_MESSAGE_SIZE + 1) as u64, &mut header);
+        let err = resp.on_data(&header).unwrap_err();
+        assert!(matches!(err, DcutrError::FrameTooLarge { .. }));
+        assert!(resp.is_done());
     }
 
     #[test]

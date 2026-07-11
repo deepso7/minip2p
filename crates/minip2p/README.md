@@ -21,3 +21,9 @@ for address in endpoint.listen_all()? {
 `minip2p::Error` preserves transport failures, Sans-I/O state rejections, and
 driver-invariant failures as separate variants. QUIC resource limits are
 configurable through `EndpointBuilder::quic_limits`.
+
+Built-in protocol ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see
+`minip2p::RESERVED_PROTOCOL_IDS`) belong to the endpoint's own handlers;
+registering one via `EndpointBuilder::protocol` makes the `bind_quic*` step
+fail, and `Endpoint::add_protocol` rejects it with
+`SwarmError::ReservedProtocol`.

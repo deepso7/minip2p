@@ -13,9 +13,12 @@ Orchestration layer that composes minip2p's protocol state machines into a singl
   ```rust
   let swarm = SwarmBuilder::new(&keypair)
       .agent_version("my-app/0.1.0")
-      .user_protocol("/myapp/1.0.0")
-      .build(transport);
+      .protocol("/myapp/1.0.0")
+      .build(transport)?;
   ```
+  Built-in ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see
+  `RESERVED_PROTOCOL_IDS`) belong to the swarm's own handlers; registering one
+  via `protocol(...)` makes `build` fail with `SwarmError::ReservedProtocol`.
 - Auto-opens identify on every new connection and surfaces `SwarmEvent::IdentifyReceived`.
 - Emits `SwarmEvent::PeerReady` once the peer id is stable and the first Identify message has been processed.
 - `swarm.ping(peer_id)` opens / reuses a ping stream with no manual protocol negotiation.
@@ -26,10 +29,12 @@ Orchestration layer that composes minip2p's protocol state machines into a singl
   `TransportError`; asynchronous action failures are emitted as
   `SwarmEvent::Error`.
 - `run_until` preserves non-matching events in order, so convenience waits do
-  not steal unrelated application events.
+  not steal unrelated application events. Once the deadline expires it still
+  scans everything already synchronously available (buffered events plus one
+  final transport poll), so a buffered match is found regardless of position.
 - Generic user-protocol hook for anything else (relay, DCUtR, custom app protocols):
   ```rust
-  swarm.add_user_protocol("/myapp/1.0.0");
+  swarm.add_protocol("/myapp/1.0.0")?;
   let stream_id = swarm.open_user_stream(&peer_id, "/myapp/1.0.0")?;
   swarm.send_user_stream(&peer_id, stream_id, data)?;
   // receive via SwarmEvent::UserStreamData { ... }
@@ -48,7 +53,7 @@ use minip2p_identify::IdentifyConfig;
 use minip2p_ping::PingConfig;
 
 let mut core = SwarmCore::new(identify_config, PingConfig::default());
-core.add_user_protocol("/myapp/1.0.0");
+core.add_protocol("/myapp/1.0.0")?;
 
 // Drive it:
 // core.handle_input(SwarmInput::Transport { event, now_ms });

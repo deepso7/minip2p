@@ -57,7 +57,7 @@ registered application protocols. Relay, AutoNAT, and DCUtR remain independent
 Sans-I/O machines driven over generic streams; their dialing, retry, and
 fallback policy belongs to the host. This keeps the base library small and
 avoids hiding network policy in a monolithic swarm while still allowing
-declarative protocol registration through `SwarmBuilder::user_protocol` and
+declarative protocol registration through `SwarmBuilder::protocol` and
 `EndpointBuilder::protocol`.
 
 `transports/quic` is the optional synchronous socket adapter. It owns UDP and

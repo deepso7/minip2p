@@ -23,7 +23,7 @@
 //! Protocols baked into the core:
 //! - `/ipfs/ping/1.0.0` (ping RTT measurement)
 //! - `/ipfs/id/1.0.0` (identify)
-//! - user-registered protocols (see [`SwarmCore::add_user_protocol`])
+//! - user-registered protocols (see [`SwarmCore::add_protocol`])
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -37,7 +37,7 @@ mod builder;
 #[cfg(feature = "std")]
 mod driver;
 
-pub use crate::core::SwarmCore;
+pub use crate::core::{RESERVED_PROTOCOL_IDS, SwarmCore};
 pub use crate::events::{
     OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput,
     SwarmRuntimeError,

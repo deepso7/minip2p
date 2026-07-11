@@ -501,22 +501,17 @@ fn encode_length_prefixed(payload: &[u8]) -> Vec<u8> {
 fn decode_length_prefixed(buf: &[u8]) -> Result<&[u8], message::IdentifyMessageError> {
     let (len, consumed) =
         read_uvarint(buf).map_err(|e: VarintError| message::IdentifyMessageError::from(e))?;
-    let len_u64 = len;
-    let len =
-        usize::try_from(len_u64).map_err(|_| message::IdentifyMessageError::FieldOverflow {
-            offset: consumed,
-            length: len_u64,
-            remaining: buf.len().saturating_sub(consumed),
-        })?;
     let remaining = buf.len() - consumed;
-    if len > remaining {
+    // Compare in u64 so an absurd declared length errs identically on
+    // 32-bit and 64-bit targets.
+    if len > remaining as u64 {
         return Err(message::IdentifyMessageError::FieldOverflow {
             offset: consumed,
-            length: len as u64,
+            length: len,
             remaining,
         });
     }
-    Ok(&buf[consumed..consumed + len])
+    Ok(&buf[consumed..consumed + len as usize])
 }
 
 #[cfg(test)]

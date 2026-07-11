@@ -28,11 +28,12 @@ struct PendingStreamWrite {
 }
 
 impl PendingStreamWrite {
-    /// Creates a data write.
-    fn data(bytes: Vec<u8>) -> Self {
+    /// Creates a data write whose first `offset` bytes were already accepted
+    /// by quiche.
+    fn data(bytes: Vec<u8>, offset: usize) -> Self {
         Self {
             bytes,
-            offset: 0,
+            offset,
             fin: false,
         }
     }
@@ -102,6 +103,9 @@ pub struct QuicConnection {
     pending_write_bytes: usize,
     /// Maximum queued application bytes for this connection.
     max_pending_write_bytes: usize,
+    /// Source CIDs the transport has entered into its routing table, so
+    /// reindexing and unindexing never scan the whole table.
+    indexed_cids: Vec<Vec<u8>>,
 }
 
 impl QuicConnection {
@@ -127,16 +131,35 @@ impl QuicConnection {
             max_local_bidi_streams,
             pending_write_bytes: 0,
             max_pending_write_bytes,
+            indexed_cids: Vec::new(),
         }
     }
 
-    pub fn source_cid_bytes(&self) -> Vec<u8> {
-        self.conn.source_id().as_ref().to_vec()
+    /// Returns quiche source CIDs not yet in the transport's routing table,
+    /// recording them as indexed.
+    pub fn take_unindexed_source_cids(&mut self) -> Vec<Vec<u8>> {
+        let mut new_cids: Vec<Vec<u8>> = Vec::new();
+        for cid in self.conn.source_ids() {
+            let cid = cid.as_ref();
+            if !self.indexed_cids.iter().any(|known| known == cid) {
+                new_cids.push(cid.to_vec());
+            }
+        }
+        self.indexed_cids.extend(new_cids.iter().cloned());
+        new_cids
     }
 
-    /// Iterates all source connection IDs currently accepted by quiche.
-    pub fn source_cids(&self) -> impl Iterator<Item = &[u8]> {
-        self.conn.source_ids().map(|cid| cid.as_ref())
+    /// Records a CID the transport indexed outside of quiche's source-id set
+    /// (e.g. the client-chosen destination CID on an accepted connection).
+    pub fn note_indexed_cid(&mut self, cid: Vec<u8>) {
+        if !self.indexed_cids.contains(&cid) {
+            self.indexed_cids.push(cid);
+        }
+    }
+
+    /// All CIDs the transport currently routes to this connection.
+    pub fn indexed_cids(&self) -> &[Vec<u8>] {
+        &self.indexed_cids
     }
 
     pub fn endpoint(&self) -> &ConnectionEndpoint {
@@ -158,6 +181,14 @@ impl QuicConnection {
     /// Returns the duration until quiche next needs timer service.
     pub fn timeout(&self) -> Option<Duration> {
         self.conn.timeout()
+    }
+
+    /// Returns true when any stream has queued writes waiting for quiche
+    /// send capacity.
+    pub fn has_pending_stream_writes(&self) -> bool {
+        self.stream_states
+            .values()
+            .any(|state| !state.pending_writes.is_empty())
     }
 
     /// Advances quiche's loss-recovery and idle timers when they are due.
@@ -313,17 +344,8 @@ impl QuicConnection {
             return Ok(());
         }
 
-        if data.len()
-            > self
-                .max_pending_write_bytes
-                .saturating_sub(self.pending_write_bytes)
-        {
-            return Err(TransportError::ResourceExhausted {
-                resource: "queued QUIC stream bytes",
-            });
-        }
-
-        {
+        let raw_stream_id = stream_id.as_u64();
+        let has_queued_writes = {
             let state = self.stream_state_mut(stream_id)?;
             if state.local_write_closed {
                 return Err(TransportError::StreamSendFailed {
@@ -332,14 +354,65 @@ impl QuicConnection {
                     reason: "local stream write side is already closed".into(),
                 });
             }
-        }
+            !state.pending_writes.is_empty()
+        };
 
-        self.pending_write_bytes += data.len();
-        self.stream_states
-            .entry(stream_id.as_u64())
-            .or_default()
-            .pending_writes
-            .push_back(PendingStreamWrite::data(data));
+        let queue_capacity = self
+            .max_pending_write_bytes
+            .saturating_sub(self.pending_write_bytes);
+
+        let offset = if has_queued_writes {
+            // Earlier bytes are still queued; queue behind them so the direct
+            // send below cannot reorder the stream.
+            if data.len() > queue_capacity {
+                return Err(TransportError::ResourceExhausted {
+                    resource: "queued QUIC stream bytes",
+                });
+            }
+            0
+        } else {
+            // Touch the stream so quiche reports its send capacity, then
+            // reject up front when the unsendable remainder would not fit the
+            // queue. This keeps oversized writes all-or-nothing: no bytes are
+            // committed to quiche before the write is known to fit.
+            match self.conn.stream_send(raw_stream_id, &[], false) {
+                Ok(_) | Err(quiche::Error::Done) => {}
+                Err(e) => {
+                    return Err(TransportError::StreamSendFailed {
+                        id: self.id,
+                        stream_id,
+                        reason: format!("stream_send error: {e}"),
+                    });
+                }
+            }
+            let capacity = self.conn.stream_capacity(raw_stream_id).unwrap_or(0);
+            if data.len().saturating_sub(capacity) > queue_capacity {
+                return Err(TransportError::ResourceExhausted {
+                    resource: "queued QUIC stream bytes",
+                });
+            }
+
+            match self.conn.stream_send(raw_stream_id, &data, false) {
+                Ok(written) => written,
+                Err(quiche::Error::Done) => 0,
+                Err(e) => {
+                    return Err(TransportError::StreamSendFailed {
+                        id: self.id,
+                        stream_id,
+                        reason: format!("stream_send error: {e}"),
+                    });
+                }
+            }
+        };
+
+        if offset < data.len() {
+            self.pending_write_bytes += data.len() - offset;
+            self.stream_states
+                .entry(raw_stream_id)
+                .or_default()
+                .pending_writes
+                .push_back(PendingStreamWrite::data(data, offset));
+        }
 
         self.drain_send_queue(events)?;
         self.flush(socket, pending_datagrams, max_pending_datagrams)?;

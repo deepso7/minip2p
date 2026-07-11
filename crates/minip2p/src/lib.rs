@@ -13,7 +13,9 @@ pub use minip2p_identify::IdentifyMessage;
 pub use minip2p_identity::Ed25519Keypair;
 pub use minip2p_quic::QuicLimits;
 use minip2p_quic::{QuicEndpoint, QuicNodeConfig};
-pub use minip2p_swarm::{DriverError as Error, SwarmEvent as Event};
+pub use minip2p_swarm::{
+    DriverError as Error, RESERVED_PROTOCOL_IDS, SwarmError, SwarmEvent as Event,
+};
 use minip2p_swarm::{Swarm, SwarmBuilder};
 pub use minip2p_transport::{ConnectionId, StreamId, TransportError};
 
@@ -96,8 +98,12 @@ impl Endpoint {
     }
 
     /// Registers an application protocol for inbound and outbound negotiation.
-    pub fn add_protocol(&mut self, protocol_id: impl Into<String>) {
-        self.swarm.add_user_protocol(protocol_id);
+    ///
+    /// Built-in ids ([`RESERVED_PROTOCOL_IDS`]) are rejected with
+    /// [`SwarmError::ReservedProtocol`]; the endpoint's own identify and
+    /// ping handlers already own them.
+    pub fn add_protocol(&mut self, protocol_id: impl Into<String>) -> Result<(), Error> {
+        self.swarm.add_protocol(protocol_id)
     }
 
     /// Opens an application stream after negotiating `protocol_id`.
@@ -221,6 +227,10 @@ impl EndpointBuilder {
     }
 
     /// Registers an application protocol before the endpoint starts.
+    ///
+    /// Built-in ids ([`RESERVED_PROTOCOL_IDS`]) are reserved; registering
+    /// one makes the `bind_quic*` build step fail with
+    /// [`SwarmError::ReservedProtocol`].
     pub fn protocol(mut self, protocol_id: impl Into<String>) -> Self {
         let id = protocol_id.into();
         if !self.protocols.iter().any(|protocol| protocol == &id) {
@@ -234,7 +244,7 @@ impl EndpointBuilder {
         let (keypair, agent_version, limits, protocols) = self.into_parts();
         let config = QuicNodeConfig::new(keypair.clone()).with_limits(limits);
         let transport = QuicEndpoint::bind(config, bind_addr.as_ref())?;
-        Ok(build_endpoint(keypair, agent_version, protocols, transport))
+        build_endpoint(keypair, agent_version, protocols, transport)
     }
 
     /// Builds an endpoint with a QUIC transport bound to a QUIC multiaddr.
@@ -242,7 +252,7 @@ impl EndpointBuilder {
         let (keypair, agent_version, limits, protocols) = self.into_parts();
         let config = QuicNodeConfig::new(keypair.clone()).with_limits(limits);
         let transport = QuicEndpoint::bind_multiaddr(config, addr)?;
-        Ok(build_endpoint(keypair, agent_version, protocols, transport))
+        build_endpoint(keypair, agent_version, protocols, transport)
     }
 
     /// Builds an endpoint with separate IPv4 and IPv6 wildcard QUIC sockets.
@@ -250,7 +260,7 @@ impl EndpointBuilder {
         let (keypair, agent_version, limits, protocols) = self.into_parts();
         let config = QuicNodeConfig::new(keypair.clone()).with_limits(limits);
         let transport = QuicEndpoint::dual_stack(config)?;
-        Ok(build_endpoint(keypair, agent_version, protocols, transport))
+        build_endpoint(keypair, agent_version, protocols, transport)
     }
 
     fn into_parts(self) -> (Ed25519Keypair, String, QuicLimits, Vec<String>) {
@@ -268,11 +278,71 @@ fn build_endpoint(
     agent_version: String,
     protocols: Vec<String>,
     transport: QuicEndpoint,
-) -> Endpoint {
+) -> Result<Endpoint, Error> {
     let mut builder = SwarmBuilder::new(&keypair).agent_version(agent_version);
     for protocol in protocols {
-        builder = builder.user_protocol(protocol);
+        builder = builder.protocol(protocol);
     }
-    let swarm = builder.build(transport);
-    Endpoint { swarm }
+    let swarm = builder.build(transport)?;
+    Ok(Endpoint { swarm })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PROTOCOL: &str = "/myapp/1.0.0";
+
+    #[test]
+    fn builder_protocol_registers_for_user_stream_routing() {
+        let mut endpoint = Endpoint::builder()
+            .protocol(PROTOCOL)
+            .bind_quic("127.0.0.1:0")
+            .expect("bind loopback endpoint");
+
+        // A registered protocol fails with NotConnected for an unknown
+        // peer, not ProtocolNotRegistered -- proving the builder wired the
+        // protocol into user-stream routing.
+        let peer_id = Ed25519Keypair::generate().peer_id();
+        assert!(matches!(
+            endpoint.open_stream(&peer_id, PROTOCOL),
+            Err(Error::Swarm(SwarmError::NotConnected { .. }))
+        ));
+        assert!(matches!(
+            endpoint.open_stream(&peer_id, "/other/1.0.0"),
+            Err(Error::Swarm(SwarmError::ProtocolNotRegistered { .. }))
+        ));
+    }
+
+    #[test]
+    fn builder_rejects_reserved_protocol_ids() {
+        for reserved in RESERVED_PROTOCOL_IDS {
+            let error = Endpoint::builder()
+                .protocol(reserved)
+                .bind_quic("127.0.0.1:0")
+                .err()
+                .expect("reserved ids must fail the build");
+            assert!(matches!(
+                error,
+                Error::Swarm(SwarmError::ReservedProtocol { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn add_protocol_rejects_reserved_protocol_ids() {
+        let mut endpoint = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind loopback endpoint");
+        let error = endpoint
+            .add_protocol(RESERVED_PROTOCOL_IDS[0])
+            .expect_err("reserved ids must be rejected");
+        assert!(matches!(
+            error,
+            Error::Swarm(SwarmError::ReservedProtocol { .. })
+        ));
+        endpoint
+            .add_protocol(PROTOCOL)
+            .expect("application ids must be accepted");
+    }
 }

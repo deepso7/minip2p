@@ -56,6 +56,14 @@ use crate::events::{
 // Protocol identification
 // ---------------------------------------------------------------------------
 
+/// Protocol ids reserved for the swarm's built-in handlers.
+///
+/// Inbound routing dispatches these ids to the identify and ping state
+/// machines before consulting user registrations, so a user protocol under
+/// a reserved id could never receive traffic. [`SwarmCore::add_protocol`]
+/// rejects them with [`SwarmError::ReservedProtocol`].
+pub const RESERVED_PROTOCOL_IDS: [&str; 2] = [IDENTIFY_PROTOCOL_ID, PING_PROTOCOL_ID];
+
 /// Identifies which protocol owns a negotiated stream.
 ///
 /// Kept private; callers refer to protocols by their string ids via
@@ -194,10 +202,19 @@ impl SwarmCore {
         self.local_addresses = addrs;
     }
 
-    /// Registers a user protocol id that this swarm will accept on inbound
-    /// streams and allow for outbound opens via [`Self::open_user_stream`].
-    pub fn add_user_protocol(&mut self, protocol_id: impl Into<String>) {
+    /// Registers an application protocol id that this swarm will accept on
+    /// inbound streams and allow for outbound opens via
+    /// [`Self::open_user_stream`].
+    ///
+    /// Built-in ids ([`RESERVED_PROTOCOL_IDS`]) are rejected with
+    /// [`SwarmError::ReservedProtocol`]: inbound routing gives the built-in
+    /// handlers precedence, so a user registration under one of those ids
+    /// could never receive traffic.
+    pub fn add_protocol(&mut self, protocol_id: impl Into<String>) -> Result<(), SwarmError> {
         let id = protocol_id.into();
+        if RESERVED_PROTOCOL_IDS.contains(&id.as_str()) {
+            return Err(SwarmError::ReservedProtocol { protocol_id: id });
+        }
         if !self.user_protocols.iter().any(|p| p == &id) {
             self.user_protocols.push(id.clone());
         }
@@ -205,6 +222,7 @@ impl SwarmCore {
             self.supported_protocols.push(id.clone());
         }
         self.identify.add_protocol(id);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1644,6 +1662,25 @@ mod tests {
 
         let mut core = test_core();
         drive_idle(&mut core);
+    }
+
+    #[test]
+    fn add_protocol_rejects_reserved_builtin_ids() {
+        let mut core = test_core();
+        for reserved in RESERVED_PROTOCOL_IDS {
+            let error = core
+                .add_protocol(reserved)
+                .expect_err("built-in ids must be rejected");
+            assert_eq!(
+                error,
+                SwarmError::ReservedProtocol {
+                    protocol_id: reserved.into()
+                }
+            );
+        }
+        core.add_protocol("/myapp/1.0.0")
+            .expect("application ids must be accepted");
+        assert!(core.user_protocols.iter().any(|p| p == "/myapp/1.0.0"));
     }
 
     #[test]

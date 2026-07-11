@@ -216,6 +216,13 @@ pub enum SwarmError {
     /// A user protocol id was used before registering it.
     #[error("user protocol '{protocol_id}' is not registered")]
     ProtocolNotRegistered { protocol_id: String },
+    /// A built-in protocol id was registered as a user protocol.
+    ///
+    /// Inbound routing gives built-in handlers precedence over user
+    /// protocols, so a user registration under a reserved id could never
+    /// receive traffic. See [`crate::RESERVED_PROTOCOL_IDS`].
+    #[error("protocol '{protocol_id}' is reserved for the swarm's built-in handlers")]
+    ReservedProtocol { protocol_id: String },
     /// The peer has completed Identify and did not advertise the requested protocol.
     #[error("peer {peer_id} does not support user protocol '{protocol_id}'")]
     RemoteDoesNotSupport {

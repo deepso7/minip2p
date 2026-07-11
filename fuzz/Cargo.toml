@@ -13,7 +13,9 @@ minip2p-autonat = { path = "../crates/autonat" }
 minip2p-core = { path = "../crates/core" }
 minip2p-dcutr = { path = "../crates/dcutr" }
 minip2p-identify = { path = "../crates/identify" }
+minip2p-multistream-select = { path = "../crates/multistream-select" }
 minip2p-relay = { path = "../crates/relay" }
+minip2p-transport = { path = "../crates/transport" }
 
 [[bin]]
 name = "wire_inputs"

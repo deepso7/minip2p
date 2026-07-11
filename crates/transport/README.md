@@ -76,6 +76,11 @@ impl Transport for MyTransport {
 }
 ```
 
+Adapters that own a socket should also override `wait_for_input(timeout)`
+with a real readiness wait (e.g. a blocking peek with a read timeout) so
+idle drivers can sleep for the full timer budget instead of polling on a
+fixed cadence; the default returns `WaitOutcome::Unsupported`.
+
 ## no_std
 
 Disable default features:

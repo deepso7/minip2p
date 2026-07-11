@@ -8,7 +8,7 @@ use std::error::Error;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
-use minip2p::{Endpoint, Event};
+use minip2p::{Endpoint, Event, TransportError};
 use minip2p_core::{Multiaddr, PeerAddr, Protocol};
 
 use crate::cli::{RunOptions, print_event};
@@ -37,16 +37,12 @@ pub fn run_listen(options: RunOptions) -> Result<(), Box<dyn Error>> {
     eprintln!("[listen] waiting for dialers (Ctrl-C to stop)");
 
     // Loop until a long deadline; SIGINT tears the process down.
+    // `poll_next` consumes each event permanently -- a never-matching
+    // `run_until` predicate would restore every event and grow the
+    // buffer unboundedly for the process lifetime.
     let deadline = Instant::now() + LISTEN_FOREVER;
-    while endpoint
-        .swarm_mut()
-        .run_until(deadline, |ev| {
-            print_event("listen", ev);
-            false // never stop on our own -- caller-driven shutdown
-        })
-        .map_err(|e| format!("swarm run_until: {e}"))?
-        .is_some()
-    {}
+    poll_until(&mut endpoint, "listen", deadline, |_| false)
+        .map_err(|e| format!("swarm poll_next: {e}"))?;
     Ok(())
 }
 
@@ -62,30 +58,51 @@ pub fn run_dial(target: PeerAddr, options: RunOptions) -> Result<(), Box<dyn Err
     let deadline = Instant::now() + DIAL_DEADLINE;
 
     // Wait until the peer id is stable and Identify has populated protocol support.
-    endpoint
-        .swarm_mut()
-        .run_until(deadline, |ev| {
-            print_event("dial", ev);
-            matches!(ev, Event::PeerReady { peer_id, .. } if peer_id == &target_peer_id)
-        })
-        .map_err(|e| format!("waiting for peer ready: {e}"))?
-        .ok_or("deadline exceeded before peer became ready")?;
+    poll_until(
+        &mut endpoint,
+        "dial",
+        deadline,
+        |ev| matches!(ev, Event::PeerReady { peer_id, .. } if peer_id == &target_peer_id),
+    )
+    .map_err(|e| format!("waiting for peer ready: {e}"))?
+    .ok_or("deadline exceeded before peer became ready")?;
 
     endpoint
         .ping(&target_peer_id)
         .map_err(|e| format!("ping failed: {e}"))?;
 
     // Wait for the first RTT measurement, print it via print_event, exit.
-    endpoint
-        .swarm_mut()
-        .run_until(deadline, |ev| {
-            print_event("dial", ev);
-            matches!(ev, Event::PingRttMeasured { peer_id, .. } if peer_id == &target_peer_id)
-        })
-        .map_err(|e| format!("waiting for ping rtt: {e}"))?
-        .ok_or("deadline exceeded before ping rtt arrived")?;
+    poll_until(
+        &mut endpoint,
+        "dial",
+        deadline,
+        |ev| matches!(ev, Event::PingRttMeasured { peer_id, .. } if peer_id == &target_peer_id),
+    )
+    .map_err(|e| format!("waiting for ping rtt: {e}"))?
+    .ok_or("deadline exceeded before ping rtt arrived")?;
 
     Ok(())
+}
+
+/// Polls events via `Swarm::poll_next` (consuming and printing each one)
+/// until `want` matches or `deadline` passes.
+///
+/// This is the app-side idiom for side-effecting waits: `run_until`
+/// restores non-matching events, so a printing predicate would re-print
+/// the whole history on every subsequent wait.
+fn poll_until(
+    endpoint: &mut Endpoint,
+    role: &str,
+    deadline: Instant,
+    mut want: impl FnMut(&Event) -> bool,
+) -> Result<Option<Event>, TransportError> {
+    while let Some(ev) = endpoint.swarm_mut().poll_next(deadline)? {
+        print_event(role, &ev);
+        if want(&ev) {
+            return Ok(Some(ev));
+        }
+    }
+    Ok(None)
 }
 
 /// Builds an endpoint with the default Identify/Ping stack.

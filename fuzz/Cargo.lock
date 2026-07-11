@@ -149,7 +149,9 @@ dependencies = [
  "minip2p-core",
  "minip2p-dcutr",
  "minip2p-identify",
+ "minip2p-multistream-select",
  "minip2p-relay",
+ "minip2p-transport",
 ]
 
 [[package]]
@@ -168,6 +170,14 @@ dependencies = [
  "getrandom",
  "multihash",
  "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "minip2p-multistream-select"
+version = "0.1.0"
+dependencies = [
+ "minip2p-core",
  "thiserror",
 ]
 
