@@ -241,7 +241,7 @@ impl EndpointBuilder {
 
     /// Builds an endpoint with a QUIC transport bound to `bind_addr`.
     pub fn bind_quic(self, bind_addr: impl AsRef<str>) -> Result<Endpoint, Error> {
-        let (keypair, agent_version, limits, protocols) = self.into_parts();
+        let (keypair, agent_version, limits, protocols) = self.into_parts()?;
         let config = QuicNodeConfig::new(keypair.clone()).with_limits(limits);
         let transport = QuicEndpoint::bind(config, bind_addr.as_ref())?;
         build_endpoint(keypair, agent_version, protocols, transport)
@@ -249,7 +249,7 @@ impl EndpointBuilder {
 
     /// Builds an endpoint with a QUIC transport bound to a QUIC multiaddr.
     pub fn bind_quic_multiaddr(self, addr: &Multiaddr) -> Result<Endpoint, Error> {
-        let (keypair, agent_version, limits, protocols) = self.into_parts();
+        let (keypair, agent_version, limits, protocols) = self.into_parts()?;
         let config = QuicNodeConfig::new(keypair.clone()).with_limits(limits);
         let transport = QuicEndpoint::bind_multiaddr(config, addr)?;
         build_endpoint(keypair, agent_version, protocols, transport)
@@ -257,19 +257,34 @@ impl EndpointBuilder {
 
     /// Builds an endpoint with separate IPv4 and IPv6 wildcard QUIC sockets.
     pub fn bind_quic_dual_stack(self) -> Result<Endpoint, Error> {
-        let (keypair, agent_version, limits, protocols) = self.into_parts();
+        let (keypair, agent_version, limits, protocols) = self.into_parts()?;
         let config = QuicNodeConfig::new(keypair.clone()).with_limits(limits);
         let transport = QuicEndpoint::dual_stack(config)?;
         build_endpoint(keypair, agent_version, protocols, transport)
     }
 
-    fn into_parts(self) -> (Ed25519Keypair, String, QuicLimits, Vec<String>) {
-        (
+    /// Validates the static configuration and decomposes the builder.
+    ///
+    /// Reserved protocol ids are rejected here -- before any socket is
+    /// bound -- so a configuration error can neither allocate resources
+    /// nor be masked by a bind failure.
+    fn into_parts(self) -> Result<(Ed25519Keypair, String, QuicLimits, Vec<String>), Error> {
+        if let Some(protocol) = self
+            .protocols
+            .iter()
+            .find(|protocol| RESERVED_PROTOCOL_IDS.contains(&protocol.as_str()))
+        {
+            return Err(SwarmError::ReservedProtocol {
+                protocol_id: protocol.clone(),
+            }
+            .into());
+        }
+        Ok((
             self.keypair.unwrap_or_else(Ed25519Keypair::generate),
             self.agent_version,
             self.quic_limits,
             self.protocols,
-        )
+        ))
     }
 }
 
@@ -327,6 +342,21 @@ mod tests {
                 Error::Swarm(SwarmError::ReservedProtocol { .. })
             ));
         }
+    }
+
+    #[test]
+    fn builder_rejects_reserved_protocol_ids_before_binding() {
+        // An unbindable address must not mask the configuration error:
+        // validation happens before any socket is allocated.
+        let error = Endpoint::builder()
+            .protocol(RESERVED_PROTOCOL_IDS[0])
+            .bind_quic("not-a-bindable-address")
+            .err()
+            .expect("reserved ids must fail the build");
+        assert!(matches!(
+            error,
+            Error::Swarm(SwarmError::ReservedProtocol { .. })
+        ));
     }
 
     #[test]

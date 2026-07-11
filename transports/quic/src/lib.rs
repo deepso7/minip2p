@@ -1459,15 +1459,15 @@ impl Transport for QuicTransport {
     }
 
     fn next_timeout(&self) -> Option<Duration> {
-        // Queued outbound work waits on socket writability rather than a
-        // QUIC timer; return a short duration so the driver retries the
-        // flush soon instead of blocking on a long timer.
-        if !self.pending_datagrams.is_empty()
-            || self
-                .connections
-                .values()
-                .any(QuicConnection::has_pending_stream_writes)
-        {
+        // Datagrams stuck on socket writability can't be woken by a
+        // readable peek; return a short duration so the driver retries the
+        // flush soon. (A `flush` blocked mid-connection always leaves its
+        // packet queued here, so this also covers packets still in quiche.)
+        // Stream writes queued on QUIC flow-control credit, by contrast,
+        // only progress when a peer packet arrives -- which wakes
+        // `wait_for_input` -- or a QUIC timer fires, so they fall through
+        // to the real timers and never force a busy-poll.
+        if !self.pending_datagrams.is_empty() {
             return Some(Duration::from_millis(1));
         }
 
@@ -1680,13 +1680,22 @@ impl Transport for DualQuicTransport {
             return WaitOutcome::TimedOut;
         }
 
-        let deadline = std::time::Instant::now() + timeout;
+        // A caller-provided timeout can exceed what `Instant` arithmetic
+        // represents; an unrepresentable deadline means "no deadline".
+        let deadline = std::time::Instant::now().checked_add(timeout);
         loop {
             for transport in [&self.ipv4, &self.ipv6] {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    return WaitOutcome::TimedOut;
-                }
+                let remaining = match deadline {
+                    Some(deadline) => {
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
+                            return WaitOutcome::TimedOut;
+                        }
+                        remaining
+                    }
+                    None => SLICE,
+                };
                 if wait_for_socket_input(&transport.socket, SLICE.min(remaining))
                     == WaitOutcome::Ready
                 {

@@ -183,14 +183,6 @@ impl QuicConnection {
         self.conn.timeout()
     }
 
-    /// Returns true when any stream has queued writes waiting for quiche
-    /// send capacity.
-    pub fn has_pending_stream_writes(&self) -> bool {
-        self.stream_states
-            .values()
-            .any(|state| !state.pending_writes.is_empty())
-    }
-
     /// Advances quiche's loss-recovery and idle timers when they are due.
     pub fn handle_timeout(
         &mut self,
