@@ -201,10 +201,12 @@ impl DcutrInitiator {
     /// (via `take_outbound`) to now. It is passed through into the
     /// `DialNow` outcome so the caller can use it for SYNC timing.
     fn on_data(&mut self, data: &[u8], rtt_ms: u64) -> Result<(), DcutrError> {
-        if matches!(
-            self.state,
-            InitiatorState::Done | InitiatorState::SyncPending
-        ) {
+        // Once the CONNECT reply has been consumed the stream carries no
+        // further DCUtR frames toward the initiator, so later bytes are
+        // dropped rather than buffered -- including in `ReadyToSync`,
+        // where the caller has not sent SYNC yet and a misbehaving peer
+        // could otherwise grow the buffer without bound.
+        if self.state != InitiatorState::AwaitingConnectReply {
             return Ok(());
         }
 
@@ -296,6 +298,9 @@ impl DcutrInitiator {
         }
 
         self.state = InitiatorState::ReadyToSync;
+        // Nothing further is expected inbound; free any trailing bytes the
+        // peer coalesced behind the reply instead of retaining them.
+        self.recv_buf = Vec::new();
         let remote_addrs = decode_remote_addrs(&reply.obs_addrs);
         self.outcome = Some(InitiatorOutcome::DialNow {
             remote_addrs,
@@ -453,6 +458,10 @@ impl DcutrResponder {
     fn try_decode(&mut self) -> Result<(), DcutrError> {
         loop {
             if self.state == ResponderState::Done {
+                // The flow is complete; free any trailing bytes the peer
+                // coalesced behind the final frame instead of retaining
+                // them for the machine's lifetime.
+                self.recv_buf = Vec::new();
                 return Ok(());
             }
 
@@ -694,6 +703,52 @@ mod tests {
             }
             other => panic!("unexpected outcome: {other:?}"),
         }
+    }
+
+    #[test]
+    fn initiator_drops_bytes_after_reply_instead_of_buffering() {
+        let mut init = DcutrInitiator::new(&[]);
+        let _ = init.take_outbound();
+
+        // Reply arrives coalesced with trailing garbage: the reply must
+        // decode and the garbage must not be retained.
+        let mut coalesced = frame(HolePunch {
+            kind: HolePunchType::Connect,
+            obs_addrs: Vec::new(),
+        });
+        coalesced.extend_from_slice(&[0xaa; 512]);
+        init.on_data(&coalesced, 7).unwrap();
+        assert!(matches!(
+            init.outcome(),
+            Some(InitiatorOutcome::DialNow { .. })
+        ));
+        assert!(init.recv_buf.is_empty());
+
+        // Before the caller sends SYNC (`ReadyToSync`), further peer bytes
+        // must be dropped, not buffered without bound.
+        init.on_data(&[0xbb; 1024], 7).unwrap();
+        assert!(init.recv_buf.is_empty());
+    }
+
+    #[test]
+    fn responder_drops_trailing_bytes_after_flow_completes() {
+        let mut resp = DcutrResponder::new(&[]);
+
+        // CONNECT + SYNC + trailing garbage in one coalesced input: the
+        // flow completes and the garbage must not be retained for the
+        // machine's lifetime.
+        let mut coalesced = frame(HolePunch {
+            kind: HolePunchType::Connect,
+            obs_addrs: Vec::new(),
+        });
+        coalesced.extend(frame(HolePunch {
+            kind: HolePunchType::Sync,
+            obs_addrs: Vec::new(),
+        }));
+        coalesced.extend_from_slice(&[0xcc; 512]);
+        resp.on_data(&coalesced).unwrap();
+        assert!(resp.is_done());
+        assert!(resp.recv_buf.is_empty());
     }
 
     #[test]
