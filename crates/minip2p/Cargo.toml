@@ -1,11 +1,16 @@
 [package]
 name = "minip2p"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 readme = "README.md"
+
+[lints]
+workspace = true
 
 [dependencies]
 minip2p-core = { path = "../core" }
+minip2p-identify = { path = "../identify" }
 minip2p-identity = { path = "../identity" }
 minip2p-quic = { path = "../../transports/quic" }
 minip2p-swarm = { path = "../swarm" }

@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          components: clippy,rustfmt
+          # Real no_std target: a host check can't catch dependencies that
+          # unconditionally link std.
+          targets: thumbv7em-none-eabi
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo fmt --all -- --check
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+      - run: cargo check --no-default-features --target thumbv7em-none-eabi -p minip2p-core -p minip2p-identity -p minip2p-transport -p minip2p-tls -p minip2p-identify -p minip2p-multistream-select -p minip2p-ping -p minip2p-relay -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm
+      - run: cargo test --workspace
+      - run: cargo doc --workspace --no-deps
+      - run: cargo bench -p minip2p-core --bench multiaddr --no-run
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # 1.88 (workspace rust-version)
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo check --workspace --all-targets
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    env:
+      # Pinned so a broken upstream nightly can't fail every PR and the
+      # rust-cache key stays stable. Bump deliberately.
+      NIGHTLY_TOOLCHAIN: nightly-2026-07-01
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # pinned action revision (installs the nightly toolchain below)
+        with:
+          toolchain: ${{ env.NIGHTLY_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: fuzz
+      # Swatinem/rust-cache does not cache ~/.cargo/bin, so cargo-fuzz is
+      # rebuilt on every run (~1 min). Pinned --version + --locked keeps the
+      # tool and its dependency tree fully reproducible (same intent as the
+      # pinned nightly above); a bare --locked would still float to whatever
+      # cargo-fuzz release is newest. Bump deliberately.
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - run: cargo +$NIGHTLY_TOOLCHAIN fuzz run wire_inputs -- -max_total_time=30
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore

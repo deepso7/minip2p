@@ -16,7 +16,7 @@ Interop goal for this crate is bridging two minip2p peers through a third-party 
 
 ## State machines
 
-- **`HopReservation`** -- drives `HOP.RESERVE` against a relay to obtain a reservation (peer B's "listen" side). Produces `ReservationOutcome::Accepted { reservation, limit }` or `Rejected { status }`.
+- **`HopReservation`** -- drives `HOP.RESERVE` against a relay to obtain a reservation (peer B's "listen" side). Produces `ReservationOutcome::Accepted { reservation, limit }` or `Refused { status, reason }`.
 - **`HopConnect`** -- drives `HOP.CONNECT` against a relay to open a circuit to another reserved peer (peer A's "dial" side). Produces `ConnectOutcome::Bridged` with the stream now acting as a bidirectional byte pipe.
 - **`StopResponder`** -- responds to an incoming `STOP.CONNECT` from the relay (peer B's "accept incoming circuit" side). Accept or reject the request; on accept, subsequent bytes flow through the same stream as the relayed data.
 
@@ -60,4 +60,4 @@ minip2p-relay = { path = "crates/relay", default-features = false }
 
 ## Integration
 
-The state machines are transport-agnostic; in practice they ride on top of a `minip2p-swarm` user protocol (see `swarm.add_user_protocol(HOP_PROTOCOL_ID)` + `UserStream*` events). A Sans-I/O end-to-end test that exercises the full reservation + connect + stop + DCUtR flow lives at `crates/swarm/tests/relay_holepunch_flow.rs`.
+The state machines are transport-agnostic; in practice they ride on top of a `minip2p-swarm` user protocol (see `swarm.add_protocol(HOP_PROTOCOL_ID)` + `Stream*` events). A Sans-I/O end-to-end test that exercises the full reservation + connect + stop + DCUtR flow lives at `crates/swarm/tests/relay_holepunch_flow.rs`.

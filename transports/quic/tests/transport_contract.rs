@@ -5,8 +5,8 @@
 //! transport implementation.
 
 use minip2p_core::{PeerAddr, Protocol};
-use minip2p_quic::{QuicEndpoint, QuicNodeConfig, QuicTransport};
-use minip2p_transport::{ConnectionId, Transport, TransportError, TransportEvent};
+use minip2p_quic::{QuicEndpoint, QuicLimits, QuicNodeConfig, QuicTransport};
+use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, TransportEvent};
 
 // ---------------------------------------------------------------------------
 // Helpers (shared with two_peer.rs; duplicated to keep test files independent)
@@ -19,6 +19,19 @@ fn setup_pair() -> (QuicTransport, QuicTransport, PeerAddr) {
     server.listen_on_bound_addr().expect("listen");
     let peer_addr = server.local_peer_addr().expect("peer addr");
 
+    (server, client, peer_addr)
+}
+
+fn setup_pair_with_client_limits(limits: QuicLimits) -> (QuicTransport, QuicTransport, PeerAddr) {
+    let mut server = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server");
+    let client = QuicTransport::new(
+        QuicNodeConfig::generate().with_limits(limits),
+        "127.0.0.1:0",
+    )
+    .expect("client");
+
+    server.listen_on_bound_addr().expect("listen");
+    let peer_addr = server.local_peer_addr().expect("peer addr");
     (server, client, peer_addr)
 }
 
@@ -91,10 +104,10 @@ fn connect_pair(
             }
         }
         for e in &ce {
-            if let TransportEvent::Connected { id, .. } = e {
-                if *id == client_conn {
-                    client_connected = true;
-                }
+            if let TransportEvent::Connected { id, .. } = e
+                && *id == client_conn
+            {
+                client_connected = true;
             }
         }
         all_server_events.extend(se);
@@ -211,6 +224,258 @@ fn outbound_dial_allocates_unique_ids() {
     for _ in 0..20 {
         drive_pair_once(&mut server, &mut client);
     }
+}
+
+#[test]
+fn local_stream_limit_is_enforced_before_allocating_state() {
+    let limits = QuicLimits {
+        max_streams_per_connection: 1,
+        ..QuicLimits::default()
+    };
+    let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+    let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+
+    client.open_stream(client_conn).expect("first stream");
+    let error = client
+        .open_stream(client_conn)
+        .expect_err("second stream must exceed limit");
+    assert!(matches!(
+        error,
+        TransportError::ResourceExhausted {
+            resource: "local QUIC bidirectional streams"
+        }
+    ));
+}
+
+#[test]
+fn local_stream_limit_is_released_after_stream_gc() {
+    let limits = QuicLimits {
+        max_streams_per_connection: 1,
+        ..QuicLimits::default()
+    };
+    let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+    let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    let first = client.open_stream(client_conn).expect("first stream");
+    client
+        .send_stream(client_conn, first, b"data".to_vec())
+        .expect("send first stream");
+    for _ in 0..10 {
+        drive_pair_once(&mut server, &mut client);
+    }
+    client
+        .reset_stream(client_conn, first)
+        .expect("reset first");
+    client.poll().expect("collect and gc reset stream");
+
+    let second = client
+        .open_stream(client_conn)
+        .expect("closed stream must release concurrent capacity");
+    assert_ne!(second, first);
+}
+
+#[test]
+fn stream_operations_reject_ids_not_allocated_by_transport() {
+    let (mut server, mut client, peer_addr) = setup_pair();
+    let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    let forged = StreamId::new(0);
+
+    let send_error = client
+        .send_stream(client_conn, forged, b"bypass".to_vec())
+        .expect_err("send must require open_stream");
+    assert!(matches!(send_error, TransportError::StreamNotFound { .. }));
+    let close_error = client
+        .close_stream_write(client_conn, forged)
+        .expect_err("close must require open_stream");
+    assert!(matches!(close_error, TransportError::StreamNotFound { .. }));
+
+    assert_eq!(
+        client.open_stream(client_conn).expect("legitimate open"),
+        forged,
+        "rejected forged operations must not consume the allocator"
+    );
+}
+
+#[test]
+fn zero_pending_datagram_limit_is_rejected() {
+    let limits = QuicLimits {
+        max_pending_datagrams: 0,
+        ..QuicLimits::default()
+    };
+    let result = QuicTransport::new(
+        QuicNodeConfig::generate().with_limits(limits),
+        "127.0.0.1:0",
+    );
+    let error = match result {
+        Ok(_) => panic!("zero datagram capacity must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        TransportError::InvalidConfig { ref reason }
+            if reason.contains("max_pending_datagrams")
+    ));
+}
+
+#[test]
+fn write_larger_than_queue_cap_succeeds_when_quiche_accepts_it() {
+    let limits = QuicLimits {
+        max_pending_stream_bytes: 8,
+        ..QuicLimits::default()
+    };
+    let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+    let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    let stream = client.open_stream(client_conn).expect("open stream");
+
+    // 9 bytes exceed the queue cap but fit quiche's send capacity on an idle
+    // connection, so the write goes straight to quiche instead of failing.
+    client
+        .send_stream(client_conn, stream, vec![7; 9])
+        .expect("write above the queue cap must succeed via direct send");
+
+    let mut received = 0;
+    for _ in 0..50 {
+        let (se, _) = drive_pair_once(&mut server, &mut client);
+        received += se
+            .iter()
+            .filter_map(|e| match e {
+                TransportEvent::StreamData { id, data, .. } if *id == server_conn => {
+                    Some(data.len())
+                }
+                _ => None,
+            })
+            .sum::<usize>();
+        if received >= 9 {
+            break;
+        }
+    }
+    assert_eq!(received, 9, "server must receive the full direct write");
+}
+
+#[test]
+fn pending_stream_byte_limit_rejects_unqueueable_remainder() {
+    let limits = QuicLimits {
+        max_pending_stream_bytes: 8,
+        ..QuicLimits::default()
+    };
+    let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+    let (_, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    let stream = client.open_stream(client_conn).expect("open stream");
+
+    // Far beyond both quiche's fresh-connection send capacity and the queue
+    // cap, so the unsendable remainder cannot be retained.
+    let error = client
+        .send_stream(client_conn, stream, vec![0; 4 * 1024 * 1024])
+        .expect_err("write whose remainder exceeds the queue cap must fail");
+    assert!(matches!(
+        error,
+        TransportError::ResourceExhausted {
+            resource: "queued QUIC stream bytes"
+        }
+    ));
+}
+
+#[test]
+fn queued_stream_writes_preserve_order_behind_direct_sends() {
+    let (mut server, mut client, peer_addr) = setup_pair();
+    let (server_conn, client_conn, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    let stream = client.open_stream(client_conn).expect("open stream");
+
+    // The first write exceeds the initial congestion window, so part of it
+    // queues; the second write must land behind that queued remainder.
+    let first: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let second = vec![0xEEu8; 1_000];
+    client
+        .send_stream(client_conn, stream, first.clone())
+        .expect("first write");
+    client
+        .send_stream(client_conn, stream, second.clone())
+        .expect("second write");
+    client
+        .close_stream_write(client_conn, stream)
+        .expect("close write");
+
+    let mut received = Vec::new();
+    let mut remote_closed = false;
+    for _ in 0..1000 {
+        let (se, _) = drive_pair_once(&mut server, &mut client);
+        for e in se {
+            match e {
+                TransportEvent::StreamData { id, data, .. } if id == server_conn => {
+                    received.extend_from_slice(&data);
+                }
+                TransportEvent::StreamRemoteWriteClosed { id, .. } if id == server_conn => {
+                    remote_closed = true;
+                }
+                _ => {}
+            }
+        }
+        if remote_closed {
+            break;
+        }
+    }
+
+    let mut expected = first;
+    expected.extend_from_slice(&second);
+    assert!(remote_closed, "server must observe the FIN");
+    assert_eq!(
+        received, expected,
+        "bytes must arrive exactly in write order"
+    );
+}
+
+#[test]
+fn dial_enforces_max_connections() {
+    let limits = QuicLimits {
+        max_connections: 1,
+        ..QuicLimits::default()
+    };
+    let (_server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+
+    client.dial(&peer_addr).expect("first dial fits the limit");
+    let error = client
+        .dial(&peer_addr)
+        .expect_err("second dial must exceed the connection limit");
+    assert!(matches!(
+        error,
+        TransportError::ResourceExhausted {
+            resource: "QUIC connections"
+        }
+    ));
+}
+
+#[test]
+fn quic_deadline_is_exposed_and_driven_without_socket_input() {
+    let limits = QuicLimits {
+        idle_timeout_ms: 50,
+        ..QuicLimits::default()
+    };
+    let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+    let (_, conn_id, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+    assert!(
+        client.next_timeout().is_some(),
+        "connected QUIC session must arm a timer"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut closed = false;
+    while std::time::Instant::now() < deadline {
+        closed |= client
+            .poll()
+            .expect("poll")
+            .into_iter()
+            .any(|event| matches!(event, TransportEvent::Closed { id, .. } if id == conn_id));
+        if closed {
+            break;
+        }
+        let sleep = client
+            .next_timeout()
+            .unwrap_or(std::time::Duration::from_millis(1))
+            .min(std::time::Duration::from_millis(5));
+        if !sleep.is_zero() {
+            std::thread::sleep(sleep);
+        }
+    }
+    assert!(closed, "QUIC timeout must close a silent dial");
 }
 
 #[test]

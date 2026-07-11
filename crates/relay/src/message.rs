@@ -30,6 +30,8 @@ use alloc::vec::Vec;
 use minip2p_core::{VarintError, read_uvarint, uvarint_len, write_uvarint};
 use thiserror::Error;
 
+use crate::MAX_MESSAGE_SIZE;
+
 // ---------------------------------------------------------------------------
 // Enums
 // ---------------------------------------------------------------------------
@@ -242,7 +244,7 @@ fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, RelayMes
 fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], RelayMessageError> {
     let (length, used) = read_uvarint(&input[*idx..])?;
     *idx += used;
-    let length = length as usize;
+    let length = usize::try_from(length).map_err(|_| VarintError::Overflow)?;
     let remaining = input.len().saturating_sub(*idx);
     if length > remaining {
         return Err(RelayMessageError::FieldOverflow {
@@ -278,7 +280,7 @@ fn skip_unknown_field(
         WIRE_LEN => {
             let (length, used) = read_uvarint(&input[*idx..])?;
             *idx += used;
-            let length = length as usize;
+            let length = usize::try_from(length).map_err(|_| VarintError::Overflow)?;
             let remaining = input.len().saturating_sub(*idx);
             if length > remaining {
                 return Err(RelayMessageError::FieldOverflow {
@@ -334,13 +336,21 @@ pub enum FrameDecode<'a> {
     },
     /// Not enough bytes are buffered yet to decode a complete frame.
     Incomplete,
+    /// The declared payload length exceeds [`MAX_MESSAGE_SIZE`].
+    TooLarge {
+        /// The declared payload length from the frame header.
+        len: u64,
+    },
     /// The frame header is malformed.
     Error(VarintError),
 }
 
 /// Attempts to decode one varint-length-prefixed frame from `input`.
 ///
-/// Returns `Incomplete` if the buffer is missing bytes.
+/// Returns `Incomplete` if the buffer is missing bytes. A declared payload
+/// length greater than [`MAX_MESSAGE_SIZE`] is rejected with
+/// [`FrameDecode::TooLarge`], so callers never buffer towards a frame that
+/// can never legally complete.
 pub fn decode_frame(input: &[u8]) -> FrameDecode<'_> {
     if input.is_empty() {
         return FrameDecode::Incomplete;
@@ -352,11 +362,17 @@ pub fn decode_frame(input: &[u8]) -> FrameDecode<'_> {
         Err(e) => return FrameDecode::Error(e),
     };
 
+    // Check the declared length as u64 BEFORE any usize conversion so the
+    // rejection is identical on 32-bit and 64-bit targets.
+    if length > MAX_MESSAGE_SIZE as u64 {
+        return FrameDecode::TooLarge { len: length };
+    }
+    // Cannot truncate: `length <= MAX_MESSAGE_SIZE` holds here.
     let length = length as usize;
-    let total = used + length;
-    if input.len() < total {
+    if length > input.len().saturating_sub(used) {
         return FrameDecode::Incomplete;
     }
+    let total = used + length;
 
     FrameDecode::Complete {
         payload: &input[used..total],
@@ -821,6 +837,53 @@ mod tests {
         let mut framed = encode_frame(b"hello world");
         framed.truncate(framed.len() - 3);
         assert!(matches!(decode_frame(&framed), FrameDecode::Incomplete));
+    }
+
+    #[test]
+    fn frame_too_large_when_declared_length_is_u64_max() {
+        // Varint-encoded u64::MAX followed by garbage; must be rejected
+        // identically on 32-bit and 64-bit targets.
+        let input = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x22, 0xad,
+        ];
+        assert!(matches!(
+            decode_frame(&input),
+            FrameDecode::TooLarge { len: u64::MAX }
+        ));
+    }
+
+    #[test]
+    fn frame_too_large_when_declared_length_just_above_max() {
+        let mut input = Vec::new();
+        write_uvarint((MAX_MESSAGE_SIZE + 1) as u64, &mut input);
+        assert!(matches!(
+            decode_frame(&input),
+            FrameDecode::TooLarge { len } if len == (MAX_MESSAGE_SIZE + 1) as u64
+        ));
+    }
+
+    #[test]
+    fn frame_incomplete_when_declared_length_at_max_but_payload_missing() {
+        let mut input = Vec::new();
+        write_uvarint(MAX_MESSAGE_SIZE as u64, &mut input);
+        input.extend_from_slice(&[0u8; 16]);
+        assert!(matches!(decode_frame(&input), FrameDecode::Incomplete));
+    }
+
+    #[test]
+    fn frame_at_max_size_still_decodes() {
+        let payload = vec![0xabu8; MAX_MESSAGE_SIZE];
+        let framed = encode_frame(&payload);
+        match decode_frame(&framed) {
+            FrameDecode::Complete {
+                payload: p,
+                consumed,
+            } => {
+                assert_eq!(p, payload.as_slice());
+                assert_eq!(consumed, framed.len());
+            }
+            _ => panic!("expected complete frame"),
+        }
     }
 
     #[test]

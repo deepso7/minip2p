@@ -41,25 +41,25 @@ pub enum SwarmEvent {
     /// A user-registered protocol was successfully negotiated on a stream.
     /// `initiated_locally` is `true` when we opened the stream and `false`
     /// when the remote peer did.
-    UserStreamReady {
+    StreamReady {
         peer_id: PeerId,
         stream_id: StreamId,
         protocol_id: String,
         initiated_locally: bool,
     },
     /// Raw data arrived on a negotiated user stream.
-    UserStreamData {
+    StreamData {
         peer_id: PeerId,
         stream_id: StreamId,
         data: Vec<u8>,
     },
     /// The remote closed its write side on a user stream.
-    UserStreamRemoteWriteClosed {
+    StreamRemoteWriteClosed {
         peer_id: PeerId,
         stream_id: StreamId,
     },
     /// A user stream was fully closed.
-    UserStreamClosed {
+    StreamClosed {
         peer_id: PeerId,
         stream_id: StreamId,
     },
@@ -216,6 +216,13 @@ pub enum SwarmError {
     /// A user protocol id was used before registering it.
     #[error("user protocol '{protocol_id}' is not registered")]
     ProtocolNotRegistered { protocol_id: String },
+    /// A built-in protocol id was registered as a user protocol.
+    ///
+    /// Inbound routing gives built-in handlers precedence over user
+    /// protocols, so a user registration under a reserved id could never
+    /// receive traffic. See [`crate::RESERVED_PROTOCOL_IDS`].
+    #[error("protocol '{protocol_id}' is reserved for the swarm's built-in handlers")]
+    ReservedProtocol { protocol_id: String },
     /// The peer has completed Identify and did not advertise the requested protocol.
     #[error("peer {peer_id} does not support user protocol '{protocol_id}'")]
     RemoteDoesNotSupport {
@@ -225,7 +232,7 @@ pub enum SwarmError {
     /// A caller tried to use a user stream that is not currently negotiated
     /// for the requested peer.
     #[error("user stream {stream_id} for peer {peer_id} is not active")]
-    UserStreamNotFound {
+    StreamNotFound {
         /// Peer the caller expected the stream to belong to.
         peer_id: PeerId,
         /// Stream id supplied by the caller.
@@ -235,7 +242,4 @@ pub enum SwarmError {
     /// in flight on the target peer).
     #[error("ping error: {reason}")]
     PingError { reason: String },
-    /// The identify state machine rejected the request.
-    #[error("identify error: {reason}")]
-    IdentifyError { reason: String },
 }

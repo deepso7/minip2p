@@ -5,7 +5,7 @@ Orchestration layer that composes minip2p's protocol state machines into a singl
 ## Two layers
 
 - **`SwarmCore`** (`no_std + alloc`): pure state machine. Consumes `SwarmInput` values through `handle_input`, emits `SwarmOutput` values through `poll_output`, and reports quiescence with `is_idle`. Outputs wrap `SwarmAction` commands for the driver and `SwarmEvent` notifications for the application. No sockets, no async runtime, no clock reads. Composes `IdentifyProtocol`, `PingProtocol`, and `MultistreamSelect`; tracks connections, streams, and pending stream opens.
-- **`Swarm<T: Transport>`** (`std` feature, default): thin driver around `SwarmCore`. Owns a concrete transport, reads `std::time::Instant` for `now_ms`, and shuttles events and actions between the transport and the core. Preserves the one-call DX (`swarm.dial`, `swarm.ping`, `swarm.open_user_stream`).
+- **`Swarm<T: Transport>`** (`std` feature, default): thin driver around `SwarmCore`. Owns a concrete transport, reads `std::time::Instant` for `now_ms`, and shuttles events and actions between the transport and the core. Preserves the one-call DX (`swarm.dial`, `swarm.ping`, `swarm.open_stream`).
 
 ## Features
 
@@ -13,24 +13,41 @@ Orchestration layer that composes minip2p's protocol state machines into a singl
   ```rust
   let swarm = SwarmBuilder::new(&keypair)
       .agent_version("my-app/0.1.0")
-      .build(transport);
+      .protocol("/myapp/1.0.0")
+      .build(transport)?;
   ```
+  Built-in ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see
+  `RESERVED_PROTOCOL_IDS`) belong to the swarm's own handlers; registering one
+  via `protocol(...)` makes `build` fail with `SwarmError::ReservedProtocol`.
 - Auto-opens identify on every new connection and surfaces `SwarmEvent::IdentifyReceived`.
 - Emits `SwarmEvent::PeerReady` once the peer id is stable and the first Identify message has been processed.
 - `swarm.ping(peer_id)` opens / reuses a ping stream with no manual protocol negotiation.
 - `swarm.listen_on_bound_addrs()` starts listening on every bound transport address and returns the local `PeerAddr`s. `listen_on_bound_addr()` remains as a first-address convenience for single-socket transports.
 - `swarm.connected_peers()`, `swarm.peer_info(&peer_id)`, and `swarm.is_peer_ready(&peer_id)` expose read-only peer state.
+- Every public `Swarm` method returns `DriverError`, keeping transport
+  failures, Sans-I/O state rejections, and driver-invariant violations
+  distinguishable; asynchronous action failures are emitted as
+  `SwarmEvent::Error`.
+- Waits (`poll_next`, `run_until`) accept `impl Into<Deadline>`: an `Instant`
+  (absolute), a `Duration` (relative), or `Deadline::NEVER` to block until an
+  event arrives -- no far-future sentinel timestamps needed.
+- `run_until` preserves non-matching events in order, so convenience waits do
+  not steal unrelated application events. Once the deadline expires it still
+  scans everything already synchronously available (buffered events plus one
+  final transport poll), so a buffered match is found regardless of position.
+  Use a consuming `poll_next` loop instead when handling has side effects
+  (logging, dispatch).
 - Generic user-protocol hook for anything else (relay, DCUtR, custom app protocols):
   ```rust
-  swarm.add_user_protocol("/myapp/1.0.0");
-  let stream_id = swarm.open_user_stream(&peer_id, "/myapp/1.0.0")?;
-  swarm.send_user_stream(&peer_id, stream_id, data)?;
-  // receive via SwarmEvent::UserStreamData { ... }
+  swarm.add_protocol("/myapp/1.0.0")?;
+  let stream_id = swarm.open_stream(&peer_id, "/myapp/1.0.0")?;
+  swarm.send_stream(&peer_id, stream_id, data)?;
+  // receive via SwarmEvent::StreamData { ... }
   ```
 - Connection lifecycle events: `ConnectionEstablished`, `ConnectionClosed`.
 - Identify lifecycle: `IdentifyReceived { peer_id, info }` with observed-addr populated from the transport endpoint.
 - Ping lifecycle: `PingRttMeasured`, `PingTimeout`.
-- User-stream lifecycle: `UserStreamReady`, `UserStreamData`, `UserStreamRemoteWriteClosed`, `UserStreamClosed`.
+- User-stream lifecycle: `StreamReady`, `StreamData`, `StreamRemoteWriteClosed`, `StreamClosed`.
 - Synthetic-`PeerId` path for transports that don't authenticate the remote at handshake time; promotes the id to the verified one via `TransportEvent::PeerIdentityVerified`, migrating all per-peer state and buffered events atomically.
 
 ## Sans-I/O usage
@@ -41,7 +58,7 @@ use minip2p_identify::IdentifyConfig;
 use minip2p_ping::PingConfig;
 
 let mut core = SwarmCore::new(identify_config, PingConfig::default());
-core.add_user_protocol("/myapp/1.0.0");
+core.add_protocol("/myapp/1.0.0")?;
 
 // Drive it:
 // core.handle_input(SwarmInput::Transport { event, now_ms });
@@ -58,7 +75,7 @@ core.add_user_protocol("/myapp/1.0.0");
 
 The core is deterministic when callers use a simple mutate-then-drain loop:
 
-1. Feed exactly one external input into the core with `core.handle_input(...)`, or call one application intent such as `ping`, `open_user_stream`, or `send_user_stream`.
+1. Feed exactly one external input into the core with `core.handle_input(...)`, or call one application intent such as `ping`, `open_stream`, or `send_stream`.
 2. Drain `core.poll_output()`.
 3. Execute each `SwarmOutput::Action` against your transport.
 4. Feed driver results back with `SwarmInput::StreamOpened`, `SwarmInput::OpenStreamFailed`, or `SwarmInput::RuntimeError`.

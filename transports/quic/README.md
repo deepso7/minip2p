@@ -20,6 +20,13 @@ No async runtime required. The host drives the transport by calling `poll()`.
 - `QuicNodeConfig` is identity-first: constructing a transport requires an Ed25519 host keypair.
 - Dial supports `/ip4`, `/ip6`, `/dns`, `/dns4`, `/dns6` QUIC transport addresses.
 - `QuicEndpoint::dual_stack` binds separate IPv4 and IPv6 wildcard sockets for the common "listen on both" case.
+- QUIC deadlines are exposed through `Transport::next_timeout()` and processed
+  by `poll()`; no async runtime or hidden timer thread is used. Idle drivers
+  block on `Transport::wait_for_input()` (a readiness peek on the UDP socket)
+  instead of polling on a fixed cadence.
+- Stateless Retry authenticates source addresses before inbound connection
+  allocation. Configurable limits bound connections, streams, queued stream
+  bytes, queued UDP datagrams, and idle time.
 
 ## Basic usage
 
@@ -50,6 +57,10 @@ dialer.send_stream(conn_id, stream_id, b"hello".to_vec())?;
 
 This crate is a concrete transport adapter and depends on `std`.
 For Sans-I/O contracts and shared types, use `minip2p-transport`.
+
+`quiche 0.29` exposes its TLS builder using `boring` 4.x types, so this crate
+intentionally uses the newest compatible `boring` 4.x release rather than the
+incompatible 5.x major.
 
 ## Authentication Notes
 

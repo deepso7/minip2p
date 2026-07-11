@@ -18,6 +18,7 @@ This crate defines the transport abstraction that concrete adapters (QUIC, WebSo
 Implement the `Transport` trait for your adapter:
 
 ```rust
+use core::time::Duration;
 use minip2p_core::{Multiaddr, PeerAddr};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, TransportEvent};
 
@@ -28,7 +29,7 @@ impl Transport for MyTransport {
         todo!("initiate outgoing connection and return its allocated id")
     }
 
-    fn listen(&mut self, addr: &Multiaddr) -> Result<(), TransportError> {
+    fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
         todo!("start listening")
     }
 
@@ -65,11 +66,20 @@ impl Transport for MyTransport {
         todo!("drive transport and emit events")
     }
 
+    fn next_timeout(&self) -> Option<Duration> {
+        todo!("return the next protocol deadline, if any")
+    }
+
     fn local_addresses(&self) -> Vec<Multiaddr> {
         todo!("return bind/listen addresses, if the adapter has any")
     }
 }
 ```
+
+Adapters that own a socket should also override `wait_for_input(timeout)`
+with a real readiness wait (e.g. a blocking peek with a read timeout) so
+idle drivers can sleep for the full timer budget instead of polling on a
+fixed cadence; the default returns `WaitOutcome::Unsupported`.
 
 ## no_std
 

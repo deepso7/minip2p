@@ -44,9 +44,14 @@ pub const MAX_MESSAGE_SIZE: usize = 8192;
 /// Errors returned by relay state machines.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum RelayError {
-    /// The incoming message exceeded the maximum allowed size.
+    /// A message exceeded the maximum allowed size. This covers both
+    /// incoming data and locally constructed outbound messages: a frame
+    /// this crate's own decoder would reject is never queued for sending.
     #[error("relay message exceeds maximum size ({len} > {MAX_MESSAGE_SIZE})")]
     MessageTooLarge { len: usize },
+    /// The remote declared a frame length exceeding the maximum allowed size.
+    #[error("relay frame length exceeds maximum size ({len} > {MAX_MESSAGE_SIZE})")]
+    FrameTooLarge { len: u64 },
     /// An incoming message failed to decode.
     #[error("malformed relay message: {0}")]
     Malformed(#[from] RelayMessageError),
@@ -129,6 +134,9 @@ enum FlowState {
 impl HopReservation {
     /// Creates a new reservation state machine and queues the RESERVE message.
     pub fn new() -> Self {
+        // The RESERVE request has no variable-length fields, so its encoded
+        // frame is structurally far below MAX_MESSAGE_SIZE; no outbound size
+        // check is needed here.
         let request = HopMessage {
             kind: HopMessageType::Reserve,
             peer: None,
@@ -194,10 +202,6 @@ impl HopReservation {
             return Ok(());
         }
 
-        enforce_max_size(&self.recv_buf).inspect_err(|_| {
-            self.state = FlowState::Done;
-        })?;
-
         let (msg, consumed) = match decode_frame(&self.recv_buf) {
             FrameDecode::Complete { payload, consumed } => {
                 let msg = HopMessage::decode(payload).map_err(|e| {
@@ -206,7 +210,21 @@ impl HopReservation {
                 })?;
                 (msg, consumed)
             }
-            FrameDecode::Incomplete => return Ok(()),
+            // Only the incomplete remainder is bounded: a complete frame
+            // decodes (and drains) regardless of what is coalesced behind
+            // it -- e.g. a STATUS frame pipelined with the first bridged
+            // bytes -- so the backstop can never reject a frame the
+            // decoder would accept.
+            FrameDecode::Incomplete => {
+                enforce_max_size(&self.recv_buf).inspect_err(|_| {
+                    self.state = FlowState::Done;
+                })?;
+                return Ok(());
+            }
+            FrameDecode::TooLarge { len } => {
+                self.state = FlowState::Done;
+                return Err(RelayError::FrameTooLarge { len });
+            }
             FrameDecode::Error(e) => {
                 self.state = FlowState::Done;
                 return Err(RelayError::Malformed(RelayMessageError::Varint(e)));
@@ -260,11 +278,11 @@ impl SansIoProtocol for HopReservation {
         if !outbound.is_empty() {
             return Some(HopReservationOutput::Outbound(outbound));
         }
-        if !self.emitted_outcome {
-            if let Some(outcome) = self.outcome.clone() {
-                self.emitted_outcome = true;
-                return Some(HopReservationOutput::Outcome(outcome));
-            }
+        if !self.emitted_outcome
+            && let Some(outcome) = self.outcome.clone()
+        {
+            self.emitted_outcome = true;
+            return Some(HopReservationOutput::Outcome(outcome));
         }
         None
     }
@@ -338,12 +356,21 @@ pub struct HopConnect {
     outcome: Option<ConnectOutcome>,
     emitted_outcome: bool,
     bridge_bytes: Vec<u8>,
+    /// Deferred construction error (oversized CONNECT), surfaced by the
+    /// first [`SansIoProtocol::handle_input`] call.
+    pending_error: Option<RelayError>,
 }
 
 impl HopConnect {
     /// Creates a new CONNECT state machine targeting the given peer id.
     ///
     /// `target_peer_id` should be the multihash-encoded PeerId bytes.
+    ///
+    /// If the encoded CONNECT would exceed [`MAX_MESSAGE_SIZE`] -- a frame
+    /// any hardened relay (including this crate's own decoder) would
+    /// reject -- no bytes are queued and the first
+    /// [`SansIoProtocol::handle_input`] call fails with
+    /// [`RelayError::MessageTooLarge`].
     pub fn new(target_peer_id: Vec<u8>) -> Self {
         let request = HopMessage {
             kind: HopMessageType::Connect,
@@ -355,16 +382,19 @@ impl HopConnect {
             limit: None,
             status: None,
         };
-        let body = request.encode();
-        let outbound = encode_frame(&body);
+        let (outbound, state, pending_error) = match checked_outbound_frame(&request.encode()) {
+            Ok(frame) => (frame, FlowState::Pending, None),
+            Err(err) => (Vec::new(), FlowState::Done, Some(err)),
+        };
 
         Self {
             outbound,
             recv_buf: Vec::new(),
-            state: FlowState::Pending,
+            state,
             outcome: None,
             emitted_outcome: false,
             bridge_bytes: Vec::new(),
+            pending_error,
         }
     }
 
@@ -424,10 +454,6 @@ impl HopConnect {
             return Ok(());
         }
 
-        enforce_max_size(&self.recv_buf).inspect_err(|_| {
-            self.state = FlowState::Done;
-        })?;
-
         let (msg, consumed) = match decode_frame(&self.recv_buf) {
             FrameDecode::Complete { payload, consumed } => {
                 let msg = HopMessage::decode(payload).map_err(|e| {
@@ -436,7 +462,21 @@ impl HopConnect {
                 })?;
                 (msg, consumed)
             }
-            FrameDecode::Incomplete => return Ok(()),
+            // Only the incomplete remainder is bounded: a complete frame
+            // decodes (and drains) regardless of what is coalesced behind
+            // it -- e.g. a STATUS frame pipelined with the first bridged
+            // bytes -- so the backstop can never reject a frame the
+            // decoder would accept.
+            FrameDecode::Incomplete => {
+                enforce_max_size(&self.recv_buf).inspect_err(|_| {
+                    self.state = FlowState::Done;
+                })?;
+                return Ok(());
+            }
+            FrameDecode::TooLarge { len } => {
+                self.state = FlowState::Done;
+                return Err(RelayError::FrameTooLarge { len });
+            }
             FrameDecode::Error(e) => {
                 self.state = FlowState::Done;
                 return Err(RelayError::Malformed(RelayMessageError::Varint(e)));
@@ -480,6 +520,9 @@ impl SansIoProtocol for HopConnect {
     type Error = RelayError;
 
     fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
+        if let Some(err) = self.pending_error.take() {
+            return Err(err);
+        }
         match input {
             HopConnectInput::Flush => {}
             HopConnectInput::Data(data) => self.on_data(&data)?,
@@ -493,11 +536,11 @@ impl SansIoProtocol for HopConnect {
         if !outbound.is_empty() {
             return Some(HopConnectOutput::Outbound(outbound));
         }
-        if !self.emitted_outcome {
-            if let Some(outcome) = self.outcome.clone() {
-                self.emitted_outcome = true;
-                return Some(HopConnectOutput::Outcome(outcome));
-            }
+        if !self.emitted_outcome
+            && let Some(outcome) = self.outcome.clone()
+        {
+            self.emitted_outcome = true;
+            return Some(HopConnectOutput::Outcome(outcome));
         }
         let bridge_bytes = self.take_bridge_bytes();
         if !bridge_bytes.is_empty() {
@@ -507,7 +550,8 @@ impl SansIoProtocol for HopConnect {
     }
 
     fn is_idle(&self) -> bool {
-        self.outbound.is_empty()
+        self.pending_error.is_none()
+            && self.outbound.is_empty()
             && self.bridge_bytes.is_empty()
             && (self.emitted_outcome || self.outcome.is_none())
     }
@@ -666,6 +710,9 @@ impl StopResponder {
             )));
         }
 
+        // The STATUS response carries only fixed varint fields, so its
+        // encoded frame is structurally far below MAX_MESSAGE_SIZE; no
+        // outbound size check is needed here.
         let response = StopMessage {
             kind: StopMessageType::Status,
             peer: None,
@@ -684,10 +731,6 @@ impl StopResponder {
             return Ok(());
         }
 
-        enforce_max_size(&self.recv_buf).inspect_err(|_| {
-            self.state = StopState::Done;
-        })?;
-
         let (msg, consumed) = match decode_frame(&self.recv_buf) {
             FrameDecode::Complete { payload, consumed } => {
                 let msg = StopMessage::decode(payload).map_err(|e| {
@@ -696,7 +739,21 @@ impl StopResponder {
                 })?;
                 (msg, consumed)
             }
-            FrameDecode::Incomplete => return Ok(()),
+            // Only the incomplete remainder is bounded: a complete frame
+            // decodes (and drains) regardless of what is coalesced behind
+            // it -- e.g. a CONNECT pipelined with the first bridged bytes
+            // -- so the backstop can never reject a frame the decoder
+            // would accept.
+            FrameDecode::Incomplete => {
+                enforce_max_size(&self.recv_buf).inspect_err(|_| {
+                    self.state = StopState::Done;
+                })?;
+                return Ok(());
+            }
+            FrameDecode::TooLarge { len } => {
+                self.state = StopState::Done;
+                return Err(RelayError::FrameTooLarge { len });
+            }
             FrameDecode::Error(e) => {
                 self.state = StopState::Done;
                 return Err(RelayError::Malformed(RelayMessageError::Varint(e)));
@@ -746,11 +803,11 @@ impl SansIoProtocol for StopResponder {
     }
 
     fn poll_output(&mut self) -> Option<Self::Output> {
-        if !self.emitted_request {
-            if let Some(request) = self.request.clone() {
-                self.emitted_request = true;
-                return Some(StopResponderOutput::Request(request));
-            }
+        if !self.emitted_request
+            && let Some(request) = self.request.clone()
+        {
+            self.emitted_request = true;
+            return Some(StopResponderOutput::Request(request));
         }
         let outbound = self.take_outbound();
         if !outbound.is_empty() {
@@ -780,12 +837,36 @@ impl Default for StopResponder {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Rejects an oversized receive buffer to protect against memory exhaustion.
+/// Longest length prefix a legal frame can carry: [`MAX_MESSAGE_SIZE`] is
+/// below 2^14, so its uvarint prefix encodes in at most two bytes.
+const MAX_FRAME_PREFIX_LEN: usize = 2;
+
+/// Backstop bound on the receive buffer once decoding has stalled on an
+/// incomplete frame.
+///
+/// Called only on [`FrameDecode::Incomplete`], after any complete frame
+/// has been drained: a stalled buffer can legally hold at most one
+/// partial frame (the payload bound is [`decode_frame`]'s `TooLarge`), so
+/// this can never reject traffic the decoder would accept -- including a
+/// maximal frame coalesced with pipelined trailing bytes.
 fn enforce_max_size(buf: &[u8]) -> Result<(), RelayError> {
-    if buf.len() > MAX_MESSAGE_SIZE {
+    if buf.len() > MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN {
         return Err(RelayError::MessageTooLarge { len: buf.len() });
     }
     Ok(())
+}
+
+/// Encodes an outbound message payload as a length-prefixed frame,
+/// rejecting payloads that exceed [`MAX_MESSAGE_SIZE`].
+///
+/// This mirrors the inbound limit enforced by [`decode_frame`]: the state
+/// machines must never put a frame on the wire that a spec-compliant
+/// receiver (including this crate's own decoder) would reject as oversized.
+fn checked_outbound_frame(payload: &[u8]) -> Result<Vec<u8>, RelayError> {
+    if payload.len() > MAX_MESSAGE_SIZE {
+        return Err(RelayError::MessageTooLarge { len: payload.len() });
+    }
+    Ok(encode_frame(payload))
 }
 
 fn unexpected_hop_reason(actual: HopMessageType, expected: &str) -> String {
@@ -930,13 +1011,30 @@ mod tests {
     }
 
     #[test]
-    fn reservation_rejects_oversized_message() {
+    fn receive_buffer_backstop_bounds_partial_frames() {
+        // The backstop allows one maximal legal frame (payload + 2-byte
+        // prefix) and rejects anything beyond it. It runs only on stalled
+        // (incomplete) buffers, where `decode_frame`'s own bounds make it
+        // unreachable from wire input -- a pure defense-in-depth check.
+        assert!(enforce_max_size(&vec![0u8; MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN]).is_ok());
+        assert!(matches!(
+            enforce_max_size(&vec![0u8; MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN + 1]),
+            Err(RelayError::MessageTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn reservation_rejects_oversized_declared_frame_length() {
+        // A tiny header declaring an impossible payload length must fail
+        // immediately instead of stalling while waiting for more bytes.
         let mut flow = HopReservation::new();
         let _ = flow.take_outbound();
 
-        let large = vec![0u8; MAX_MESSAGE_SIZE + 1];
-        let err = flow.on_data(&large).unwrap_err();
-        assert!(matches!(err, RelayError::MessageTooLarge { .. }));
+        let mut header = Vec::new();
+        minip2p_core::write_uvarint((MAX_MESSAGE_SIZE + 1) as u64, &mut header);
+        let err = flow.on_data(&header).unwrap_err();
+        assert!(matches!(err, RelayError::FrameTooLarge { .. }));
+        assert!(flow.is_done());
     }
 
     // --- HopConnect ---------------------------------------------------------
@@ -994,6 +1092,32 @@ mod tests {
     }
 
     #[test]
+    fn connect_coalesced_bridge_bytes_beyond_frame_cap_are_captured() {
+        // A coalesced read can carry the STATUS frame plus more bridged
+        // bytes than one maximal frame; the receive path must not tear
+        // the flow down over the buffer total.
+        let mut flow = HopConnect::new(b"peer".to_vec());
+        let _ = flow.take_outbound();
+
+        let mut packet = frame_hop(HopMessage {
+            kind: HopMessageType::Status,
+            peer: None,
+            reservation: None,
+            limit: None,
+            status: Some(Status::Ok),
+        });
+        let bridged = vec![0xabu8; MAX_MESSAGE_SIZE + 1];
+        packet.extend_from_slice(&bridged);
+        flow.on_data(&packet).unwrap();
+
+        assert!(matches!(
+            flow.outcome(),
+            Some(ConnectOutcome::Bridged { .. })
+        ));
+        assert_eq!(flow.take_bridge_bytes(), bridged);
+    }
+
+    #[test]
     fn connect_post_bridge_data_goes_to_bridge_buffer() {
         let mut flow = HopConnect::new(b"peer".to_vec());
         let _ = flow.take_outbound();
@@ -1033,6 +1157,77 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn connect_rejects_oversized_target_peer_id() {
+        let mut flow = HopConnect::new(vec![0u8; MAX_MESSAGE_SIZE + 1]);
+
+        // The oversized frame must never be emitted...
+        assert!(!flow.is_idle());
+        assert!(flow.poll_output().is_none());
+        // ...and the error surfaces on the first input.
+        let err = flow.handle_input(HopConnectInput::Flush).unwrap_err();
+        assert!(matches!(err, RelayError::MessageTooLarge { .. }));
+        assert!(flow.is_done());
+        assert!(flow.is_idle());
+    }
+
+    #[test]
+    fn connect_at_exact_max_size_still_encodes() {
+        // Peer id sized so the encoded CONNECT payload is exactly
+        // MAX_MESSAGE_SIZE: 2 bytes type field + 1 tag + 2-byte length
+        // varint for the nested Peer + (1 tag + 2-byte length varint +
+        // 8184 id bytes).
+        let id = vec![0u8; 8184];
+        let request = HopMessage {
+            kind: HopMessageType::Connect,
+            peer: Some(Peer {
+                id: id.clone(),
+                addrs: Vec::new(),
+            }),
+            reservation: None,
+            limit: None,
+            status: None,
+        };
+        assert_eq!(request.encode().len(), MAX_MESSAGE_SIZE);
+
+        let mut flow = HopConnect::new(id.clone());
+        flow.handle_input(HopConnectInput::Flush).unwrap();
+        let Some(HopConnectOutput::Outbound(bytes)) = flow.poll_output() else {
+            panic!("exactly-max CONNECT must be emitted");
+        };
+        assert!(matches!(decode_frame(&bytes), FrameDecode::Complete { .. }));
+
+        // An exactly-max frame (payload + 2-byte prefix) must also survive
+        // a state machine's receive path, not just decode_frame -- even
+        // with pipelined bridge bytes coalesced behind it in one input.
+        // A STOP CONNECT carrying the same peer id is exactly max-size too.
+        let stop_connect = StopMessage {
+            kind: StopMessageType::Connect,
+            peer: Some(Peer {
+                id,
+                addrs: Vec::new(),
+            }),
+            limit: None,
+            status: None,
+        };
+        assert_eq!(stop_connect.encode().len(), MAX_MESSAGE_SIZE);
+        let mut coalesced = encode_frame(&stop_connect.encode());
+        coalesced.extend_from_slice(b"early-bridge-bytes");
+        let mut responder = StopResponder::new();
+        responder
+            .handle_input(StopResponderInput::Data(coalesced))
+            .expect("exactly-max STOP CONNECT + pipelined bytes must be accepted");
+        assert!(matches!(
+            responder.poll_output(),
+            Some(StopResponderOutput::Request(_))
+        ));
+
+        // One more byte and the frame must be refused.
+        let mut flow = HopConnect::new(vec![0u8; 8185]);
+        let err = flow.handle_input(HopConnectInput::Flush).unwrap_err();
+        assert!(matches!(err, RelayError::MessageTooLarge { len } if len == MAX_MESSAGE_SIZE + 1));
     }
 
     // --- StopResponder ------------------------------------------------------

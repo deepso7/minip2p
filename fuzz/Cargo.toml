@@ -1,0 +1,30 @@
+[package]
+name = "minip2p-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Excluded from the workspace, so `[workspace.lints.rust] unsafe_code =
+# "forbid"` does not apply here; restate it locally.
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+minip2p-autonat = { path = "../crates/autonat" }
+minip2p-core = { path = "../crates/core" }
+minip2p-dcutr = { path = "../crates/dcutr" }
+minip2p-identify = { path = "../crates/identify" }
+minip2p-multistream-select = { path = "../crates/multistream-select" }
+minip2p-relay = { path = "../crates/relay" }
+minip2p-transport = { path = "../crates/transport" }
+
+[[bin]]
+name = "wire_inputs"
+path = "fuzz_targets/wire_inputs.rs"
+test = false
+doc = false
+bench = false

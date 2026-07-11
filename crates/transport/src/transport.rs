@@ -1,8 +1,21 @@
 use alloc::vec::Vec;
+use core::time::Duration;
 
 use minip2p_core::{Multiaddr, PeerAddr};
 
 use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
+
+/// Result of [`Transport::wait_for_input`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// Input may be ready; the caller should poll now.
+    Ready,
+    /// The timeout elapsed without input arriving.
+    TimedOut,
+    /// The transport cannot wait for readiness; the caller should fall back
+    /// to sleeping between polls.
+    Unsupported,
+}
 
 /// The core transport abstraction.
 ///
@@ -105,6 +118,35 @@ pub trait Transport {
     /// there is no work to do.
     fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError>;
 
+    /// Returns the duration until the transport next needs to be polled for a
+    /// protocol timer, if it has one.
+    ///
+    /// Runtime drivers can combine this with socket readiness instead of using
+    /// a fixed polling cadence. Returning zero means the timer is already due.
+    ///
+    /// Adapters with queued outbound work that is waiting on socket
+    /// writability should return a short duration here so drivers keep
+    /// polling until the queue drains.
+    fn next_timeout(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Block the calling thread until new transport input may be available or
+    /// `timeout` elapses, whichever comes first.
+    ///
+    /// Adapters that own a socket should override this with a real readiness
+    /// wait (e.g. a blocking peek with a read timeout) so idle drivers can
+    /// sleep for the full timer budget instead of polling on a fixed cadence.
+    /// Implementations must not consume input and must tolerate spurious
+    /// wakeups; callers always follow up with [`poll`](Transport::poll).
+    ///
+    /// The default returns [`WaitOutcome::Unsupported`], telling the driver to
+    /// fall back to short sleeps between polls.
+    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
+        let _ = timeout;
+        WaitOutcome::Unsupported
+    }
+
     /// Returns the transport multiaddrs this node is currently listening
     /// on.
     ///
@@ -119,47 +161,16 @@ pub trait Transport {
         Vec::new()
     }
 
-    /// Returns the number of active connections the transport is
-    /// currently managing (dialed + accepted, pre-`Closed`).
+    /// Returns the remote transport address for every active inbound/accepted
+    /// connection (pre-`Closed`), intentionally excluding outbound dials.
     ///
-    /// Intended for coarse heuristics -- e.g. counting total active
-    /// connections. For address-specific matching use
-    /// [`active_connection_sources`](Transport::active_connection_sources).
-    ///
-    /// Default implementation returns 0; adapters should override.
-    fn active_connection_count(&self) -> usize {
-        0
-    }
-
-    /// Returns the remote transport address for every active connection
-    /// (dialed + accepted, pre-`Closed`).
-    ///
-    /// Each multiaddr is the *remote* side of the connection as the
-    /// transport observes it (source address for accepted connections,
-    /// dialed address for outbound connections). Note this does **not**
-    /// include any `/p2p/<peer-id>` suffix -- peer identity lives on
-    /// `ConnectionEndpoint`, not in this address.
-    ///
-    /// Callers that need to correlate incoming connections with a
-    /// specific remote peer (e.g. a hole-punch listener matching an
-    /// inbound QUIC connection against addresses learned from DCUtR)
-    /// should use this in preference to
-    /// [`active_connection_count`](Transport::active_connection_count),
-    /// which is too coarse to distinguish the intended peer from
-    /// unrelated probes.
+    /// Each multiaddr is the source address of the accepted connection as
+    /// the transport observes it, without any `/p2p/<peer-id>` suffix --
+    /// peer identity lives on `ConnectionEndpoint`, not in this address.
+    /// Hole-punch responders use this to distinguish a real inbound packet
+    /// from their own simultaneous direct dial attempt.
     ///
     /// Default implementation returns empty; adapters should override.
-    fn active_connection_sources(&self) -> Vec<Multiaddr> {
-        Vec::new()
-    }
-
-    /// Returns the remote transport address for every active inbound/accepted
-    /// connection (pre-`Closed`).
-    ///
-    /// Unlike [`active_connection_sources`](Transport::active_connection_sources),
-    /// this intentionally excludes outbound dials. Hole-punch responders use it
-    /// to distinguish a real inbound packet from their own simultaneous direct
-    /// dial attempt.
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
         Vec::new()
     }

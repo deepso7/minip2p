@@ -343,7 +343,7 @@ pub fn print_event(role: &str, event: &SwarmEvent) {
         SwarmEvent::PingTimeout { peer_id } => {
             println!("[{role}] ping-timeout peer={peer_id}");
         }
-        SwarmEvent::UserStreamReady {
+        SwarmEvent::StreamReady {
             peer_id,
             stream_id,
             protocol_id,
@@ -359,7 +359,7 @@ pub fn print_event(role: &str, event: &SwarmEvent) {
                  protocol={protocol_id} dir={dir}"
             );
         }
-        SwarmEvent::UserStreamData {
+        SwarmEvent::StreamData {
             peer_id,
             stream_id,
             data,
@@ -369,10 +369,10 @@ pub fn print_event(role: &str, event: &SwarmEvent) {
                 data.len()
             );
         }
-        SwarmEvent::UserStreamRemoteWriteClosed { peer_id, stream_id } => {
+        SwarmEvent::StreamRemoteWriteClosed { peer_id, stream_id } => {
             println!("[{role}] user-stream-remote-write-closed peer={peer_id} stream={stream_id}");
         }
-        SwarmEvent::UserStreamClosed { peer_id, stream_id } => {
+        SwarmEvent::StreamClosed { peer_id, stream_id } => {
             println!("[{role}] user-stream-closed peer={peer_id} stream={stream_id}");
         }
         SwarmEvent::Error(error) => {

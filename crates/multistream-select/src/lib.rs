@@ -327,7 +327,12 @@ fn decode_message(buf: &[u8]) -> DecodeResult<'_> {
         Err(e) => return DecodeResult::Error(MultistreamError::InvalidVarint(e)),
     };
 
-    let msg_len = msg_len as usize;
+    let msg_len = match usize::try_from(msg_len) {
+        Ok(msg_len) => msg_len,
+        Err(_) => {
+            return DecodeResult::Error(MultistreamError::InvalidVarint(VarintError::Overflow));
+        }
+    };
 
     if msg_len > MAX_MESSAGE_LEN {
         return DecodeResult::Error(MultistreamError::MessageTooLong { len: msg_len });

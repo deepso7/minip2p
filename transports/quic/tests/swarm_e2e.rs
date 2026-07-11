@@ -7,8 +7,8 @@ use minip2p_core::{Multiaddr, Protocol};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_ping::PING_PROTOCOL_ID;
 use minip2p_quic::{QuicEndpoint, QuicNodeConfig, QuicTransport};
-use minip2p_swarm::{Swarm, SwarmBuilder, SwarmErrorKind, SwarmEvent};
-use minip2p_transport::{StreamId, Transport, TransportError};
+use minip2p_swarm::{DriverError, Swarm, SwarmBuilder, SwarmError, SwarmErrorKind, SwarmEvent};
+use minip2p_transport::{StreamId, Transport};
 
 fn make_swarm(keypair: Ed25519Keypair) -> Swarm<QuicTransport> {
     let transport =
@@ -16,6 +16,7 @@ fn make_swarm(keypair: Ed25519Keypair) -> Swarm<QuicTransport> {
     SwarmBuilder::new(&keypair)
         .agent_version("minip2p-test/0.1.0")
         .build(transport)
+        .expect("build swarm")
 }
 
 fn make_dual_stack_swarm(keypair: Ed25519Keypair) -> Swarm<QuicEndpoint> {
@@ -23,6 +24,7 @@ fn make_dual_stack_swarm(keypair: Ed25519Keypair) -> Swarm<QuicEndpoint> {
     SwarmBuilder::new(&keypair)
         .agent_version("minip2p-test/0.1.0")
         .build(transport)
+        .expect("build swarm")
 }
 
 fn drive_pair(
@@ -79,7 +81,8 @@ fn listen_on_bound_addr_keeps_first_address_contract() {
         .expect("dual stack exposes a first address");
     let mut swarm = SwarmBuilder::new(&keypair)
         .agent_version("minip2p-test/0.1.0")
-        .build(transport);
+        .build(transport)
+        .expect("build swarm");
 
     let addr = swarm.listen_on_bound_addr().expect("listen");
 
@@ -232,15 +235,19 @@ const USER_PROTOCOL_ID: &str = "/minip2p/test/echo/1.0.0";
 #[test]
 fn swarm_user_protocol_round_trip() {
     let mut server = make_swarm(Ed25519Keypair::generate());
-    server.add_user_protocol(USER_PROTOCOL_ID);
+    server
+        .add_protocol(USER_PROTOCOL_ID)
+        .expect("register protocol");
     let peer_addr = server.listen_on_bound_addr().expect("server listen");
     let server_peer_id = peer_addr.peer_id().clone();
 
     let mut client = make_swarm(Ed25519Keypair::generate());
-    client.add_user_protocol(USER_PROTOCOL_ID);
+    client
+        .add_protocol(USER_PROTOCOL_ID)
+        .expect("register protocol");
     client.dial(&peer_addr).expect("dial");
 
-    let mut user_stream: Option<StreamId> = None;
+    let mut stream: Option<StreamId> = None;
     let mut server_echo_sent = false;
     let mut echo_received: Option<Vec<u8>> = None;
     let payload = b"hello-user-protocol".to_vec();
@@ -250,14 +257,14 @@ fn swarm_user_protocol_round_trip() {
 
         for event in server_events {
             match event {
-                SwarmEvent::UserStreamData {
+                SwarmEvent::StreamData {
                     ref peer_id,
                     stream_id,
                     ref data,
                 } if !server_echo_sent => {
                     // Echo the data back on the same stream.
                     server
-                        .send_user_stream(peer_id, stream_id, data.clone())
+                        .send_stream(peer_id, stream_id, data.clone())
                         .expect("server echo");
                     server_echo_sent = true;
                 }
@@ -271,14 +278,14 @@ fn swarm_user_protocol_round_trip() {
         for event in client_events {
             match event {
                 SwarmEvent::PeerReady { ref peer_id, .. }
-                    if *peer_id == server_peer_id && user_stream.is_none() =>
+                    if *peer_id == server_peer_id && stream.is_none() =>
                 {
                     let sid = client
-                        .open_user_stream(&server_peer_id, USER_PROTOCOL_ID)
+                        .open_stream(&server_peer_id, USER_PROTOCOL_ID)
                         .expect("open user stream");
-                    user_stream = Some(sid);
+                    stream = Some(sid);
                 }
-                SwarmEvent::UserStreamReady {
+                SwarmEvent::StreamReady {
                     ref peer_id,
                     stream_id,
                     ref protocol_id,
@@ -288,10 +295,10 @@ fn swarm_user_protocol_round_trip() {
                     assert_eq!(protocol_id, USER_PROTOCOL_ID);
                     assert!(initiated_locally);
                     client
-                        .send_user_stream(&server_peer_id, stream_id, payload.clone())
+                        .send_stream(&server_peer_id, stream_id, payload.clone())
                         .expect("client send");
                 }
-                SwarmEvent::UserStreamData {
+                SwarmEvent::StreamData {
                     ref peer_id,
                     ref data,
                     ..
@@ -315,13 +322,15 @@ fn swarm_user_protocol_round_trip() {
 }
 
 #[test]
-fn open_user_stream_fails_fast_when_peer_did_not_advertise_protocol() {
+fn open_stream_fails_fast_when_peer_did_not_advertise_protocol() {
     let mut server = make_swarm(Ed25519Keypair::generate());
     let peer_addr = server.listen_on_bound_addr().expect("server listen");
     let server_peer_id = peer_addr.peer_id().clone();
 
     let mut client = make_swarm(Ed25519Keypair::generate());
-    client.add_user_protocol(USER_PROTOCOL_ID);
+    client
+        .add_protocol(USER_PROTOCOL_ID)
+        .expect("register protocol");
     client.dial(&peer_addr).expect("dial");
 
     for _ in 0..500 {
@@ -336,11 +345,16 @@ fn open_user_stream_fails_fast_when_peer_did_not_advertise_protocol() {
 
     assert!(client.is_peer_ready(&server_peer_id));
     let err = client
-        .open_user_stream(&server_peer_id, USER_PROTOCOL_ID)
+        .open_stream(&server_peer_id, USER_PROTOCOL_ID)
         .expect_err("unsupported user protocol should fail synchronously");
     assert!(
-        matches!(err, TransportError::PollError { ref reason }
-            if reason.contains("does not support protocol")),
+        matches!(
+            err,
+            DriverError::Swarm(SwarmError::RemoteDoesNotSupport {
+                ref peer_id,
+                ref protocol_id,
+            }) if peer_id == &server_peer_id && protocol_id == USER_PROTOCOL_ID
+        ),
         "expected fail-fast unsupported protocol error, got {err:?}"
     );
 }
@@ -375,10 +389,10 @@ fn identify_exchange_carries_observed_addr() {
         let (_server_events, client_events) = drive_pair(&mut server, &mut client);
 
         for event in client_events {
-            if let SwarmEvent::IdentifyReceived { peer_id, info } = event {
-                if peer_id == server_peer_id {
-                    client_observed = info.observed_addr;
-                }
+            if let SwarmEvent::IdentifyReceived { peer_id, info } = event
+                && peer_id == server_peer_id
+            {
+                client_observed = info.observed_addr;
             }
         }
 
@@ -432,12 +446,11 @@ fn rapid_ping_calls_do_not_open_duplicate_streams() {
                     assert_eq!(peer_id, &server_peer_id);
                     rtt_measured = true;
                 }
-                SwarmEvent::Error(ref error) => {
+                SwarmEvent::Error(ref error)
                     if error.kind == SwarmErrorKind::Ping
-                        && error.detail.contains("ping register error")
-                    {
-                        saw_register_error = true;
-                    }
+                        && error.detail.contains("ping register error") =>
+                {
+                    saw_register_error = true;
                 }
                 _ => {}
             }

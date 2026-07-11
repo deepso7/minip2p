@@ -28,6 +28,7 @@ extern crate alloc;
 
 mod message;
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -50,9 +51,14 @@ pub const MAX_MESSAGE_SIZE: usize = 4096;
 /// Errors returned by DCUtR state machines.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum DcutrError {
-    /// The incoming message exceeded the maximum allowed size.
+    /// A message exceeded the maximum allowed size. This covers both
+    /// incoming data and locally constructed outbound messages: a frame
+    /// this crate's own decoder would reject is never queued for sending.
     #[error("DCUtR message exceeds maximum size ({len} > {MAX_MESSAGE_SIZE})")]
     MessageTooLarge { len: usize },
+    /// The remote declared a frame length exceeding the maximum allowed size.
+    #[error("DCUtR frame length exceeds maximum size ({len} > {MAX_MESSAGE_SIZE})")]
+    FrameTooLarge { len: u64 },
     /// An incoming message failed to decode.
     #[error("malformed DCUtR message: {0}")]
     Malformed(#[from] DcutrMessageError),
@@ -126,6 +132,9 @@ pub struct DcutrInitiator {
     state: InitiatorState,
     outcome: Option<InitiatorOutcome>,
     emitted_outcome: bool,
+    /// Deferred construction error (oversized CONNECT), surfaced by the
+    /// first [`SansIoProtocol::handle_input`] call.
+    pending_error: Option<DcutrError>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,20 +157,30 @@ impl DcutrInitiator {
     /// `own_addrs` are our observed (and possibly predicted) multiaddrs.
     /// They are serialized via [`Multiaddr`]'s `Display` for the wire
     /// (see the crate-level note on binary vs string encoding).
+    ///
+    /// If the encoded CONNECT would exceed [`MAX_MESSAGE_SIZE`] -- a frame
+    /// any spec-compliant peer (including this crate's own decoder) would
+    /// reject -- no bytes are queued and the first
+    /// [`SansIoProtocol::handle_input`] call fails with
+    /// [`DcutrError::MessageTooLarge`].
     pub fn new(own_addrs: &[Multiaddr]) -> Self {
         let obs_addrs = own_addrs.iter().map(encode_multiaddr).collect();
         let msg = HolePunch {
             kind: HolePunchType::Connect,
             obs_addrs,
         };
-        let outbound = encode_frame(&msg.encode());
+        let (outbound, state, pending_error) = match checked_outbound_frame(&msg.encode()) {
+            Ok(frame) => (frame, InitiatorState::Pending, None),
+            Err(err) => (Vec::new(), InitiatorState::Done, Some(err)),
+        };
 
         Self {
             outbound,
             recv_buf: Vec::new(),
-            state: InitiatorState::Pending,
+            state,
             outcome: None,
             emitted_outcome: false,
+            pending_error,
         }
     }
 
@@ -182,10 +201,12 @@ impl DcutrInitiator {
     /// (via `take_outbound`) to now. It is passed through into the
     /// `DialNow` outcome so the caller can use it for SYNC timing.
     fn on_data(&mut self, data: &[u8], rtt_ms: u64) -> Result<(), DcutrError> {
-        if matches!(
-            self.state,
-            InitiatorState::Done | InitiatorState::SyncPending
-        ) {
+        // Once the CONNECT reply has been consumed the stream carries no
+        // further DCUtR frames toward the initiator, so later bytes are
+        // dropped rather than buffered -- including in `ReadyToSync`,
+        // where the caller has not sent SYNC yet and a misbehaving peer
+        // could otherwise grow the buffer without bound.
+        if self.state != InitiatorState::AwaitingConnectReply {
             return Ok(());
         }
 
@@ -227,7 +248,9 @@ impl DcutrInitiator {
             kind: HolePunchType::Sync,
             obs_addrs: Vec::new(),
         };
-        self.outbound.extend(encode_frame(&msg.encode()));
+        // SYNC carries no addresses and is structurally tiny; the size check
+        // is kept for uniformity across all outbound frame constructions.
+        self.outbound.extend(checked_outbound_frame(&msg.encode())?);
         self.state = InitiatorState::SyncPending;
         Ok(())
     }
@@ -237,10 +260,6 @@ impl DcutrInitiator {
             return Ok(());
         }
 
-        enforce_max_size(&self.recv_buf).inspect_err(|_| {
-            self.state = InitiatorState::Done;
-        })?;
-
         let (reply, consumed) = match decode_frame(&self.recv_buf) {
             FrameDecode::Complete { payload, consumed } => {
                 let reply = HolePunch::decode(payload).map_err(|e| {
@@ -249,7 +268,20 @@ impl DcutrInitiator {
                 })?;
                 (reply, consumed)
             }
-            FrameDecode::Incomplete => return Ok(()),
+            // Only the incomplete remainder is bounded: a complete frame
+            // decodes (and drains) regardless of what is coalesced behind
+            // it, so the backstop can never reject a frame the decoder
+            // would accept.
+            FrameDecode::Incomplete => {
+                enforce_max_size(&self.recv_buf).inspect_err(|_| {
+                    self.state = InitiatorState::Done;
+                })?;
+                return Ok(());
+            }
+            FrameDecode::TooLarge { len } => {
+                self.state = InitiatorState::Done;
+                return Err(DcutrError::FrameTooLarge { len });
+            }
             FrameDecode::Error(e) => {
                 self.state = InitiatorState::Done;
                 return Err(DcutrError::Malformed(DcutrMessageError::Varint(e)));
@@ -266,6 +298,9 @@ impl DcutrInitiator {
         }
 
         self.state = InitiatorState::ReadyToSync;
+        // Nothing further is expected inbound; free any trailing bytes the
+        // peer coalesced behind the reply instead of retaining them.
+        self.recv_buf = Vec::new();
         let remote_addrs = decode_remote_addrs(&reply.obs_addrs);
         self.outcome = Some(InitiatorOutcome::DialNow {
             remote_addrs,
@@ -336,11 +371,16 @@ pub enum DcutrResponderOutput {
 ///    [`ResponderEvent::SyncReceived`], start the responder-side dial timing /
 ///    UDP bombardment strategy.
 pub struct DcutrResponder {
-    own_addrs: Vec<Vec<u8>>,
+    /// Pre-encoded, size-validated CONNECT reply frame; queued (taken)
+    /// when the initiator's CONNECT arrives.
+    connect_reply: Vec<u8>,
     outbound: Vec<u8>,
     recv_buf: Vec<u8>,
     state: ResponderState,
-    events: Vec<ResponderEvent>,
+    events: VecDeque<ResponderEvent>,
+    /// Deferred construction error (oversized CONNECT reply), surfaced by
+    /// the first [`SansIoProtocol::handle_input`] call.
+    pending_error: Option<DcutrError>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -357,15 +397,30 @@ impl DcutrResponder {
     /// Creates a new responder.
     ///
     /// `own_addrs` are the addresses we want the initiator to try dialing us
-    /// on. The CONNECT reply is lazily queued once we actually receive the
-    /// initiator's CONNECT.
+    /// on. The CONNECT reply is encoded (and size-validated) here, but only
+    /// queued once we actually receive the initiator's CONNECT.
+    ///
+    /// If the encoded reply would exceed [`MAX_MESSAGE_SIZE`] -- a frame any
+    /// spec-compliant peer (including this crate's own decoder) would
+    /// reject -- the first [`SansIoProtocol::handle_input`] call fails with
+    /// [`DcutrError::MessageTooLarge`].
     pub fn new(own_addrs: &[Multiaddr]) -> Self {
+        let reply = HolePunch {
+            kind: HolePunchType::Connect,
+            obs_addrs: own_addrs.iter().map(encode_multiaddr).collect(),
+        };
+        let (connect_reply, state, pending_error) = match checked_outbound_frame(&reply.encode()) {
+            Ok(frame) => (frame, ResponderState::AwaitingConnect, None),
+            Err(err) => (Vec::new(), ResponderState::Done, Some(err)),
+        };
+
         Self {
-            own_addrs: own_addrs.iter().map(encode_multiaddr).collect(),
+            connect_reply,
             outbound: Vec::new(),
             recv_buf: Vec::new(),
-            state: ResponderState::AwaitingConnect,
-            events: Vec::new(),
+            state,
+            events: VecDeque::new(),
+            pending_error,
         }
     }
 
@@ -392,7 +447,7 @@ impl DcutrResponder {
     /// Drains buffered events.
     #[cfg(test)]
     fn poll_events(&mut self) -> Vec<ResponderEvent> {
-        core::mem::take(&mut self.events)
+        self.events.drain(..).collect()
     }
 
     /// Returns `true` if the flow has completed.
@@ -403,12 +458,12 @@ impl DcutrResponder {
     fn try_decode(&mut self) -> Result<(), DcutrError> {
         loop {
             if self.state == ResponderState::Done {
+                // The flow is complete; free any trailing bytes the peer
+                // coalesced behind the final frame instead of retaining
+                // them for the machine's lifetime.
+                self.recv_buf = Vec::new();
                 return Ok(());
             }
-
-            enforce_max_size(&self.recv_buf).inspect_err(|_| {
-                self.state = ResponderState::Done;
-            })?;
 
             let (msg, consumed) = match decode_frame(&self.recv_buf) {
                 FrameDecode::Complete { payload, consumed } => {
@@ -418,7 +473,21 @@ impl DcutrResponder {
                     })?;
                     (msg, consumed)
                 }
-                FrameDecode::Incomplete => return Ok(()),
+                // Only the incomplete remainder is bounded: a complete
+                // frame decodes (and drains) regardless of what is
+                // coalesced behind it -- e.g. a maximal CONNECT pipelined
+                // with SYNC -- so the backstop can never reject a frame
+                // the decoder would accept.
+                FrameDecode::Incomplete => {
+                    enforce_max_size(&self.recv_buf).inspect_err(|_| {
+                        self.state = ResponderState::Done;
+                    })?;
+                    return Ok(());
+                }
+                FrameDecode::TooLarge { len } => {
+                    self.state = ResponderState::Done;
+                    return Err(DcutrError::FrameTooLarge { len });
+                }
                 FrameDecode::Error(e) => {
                     self.state = ResponderState::Done;
                     return Err(DcutrError::Malformed(DcutrMessageError::Varint(e)));
@@ -428,23 +497,21 @@ impl DcutrResponder {
 
             match (self.state, msg.kind) {
                 (ResponderState::AwaitingConnect, HolePunchType::Connect) => {
-                    // Queue our own CONNECT reply and transition state.
-                    let reply = HolePunch {
-                        kind: HolePunchType::Connect,
-                        obs_addrs: self.own_addrs.clone(),
-                    };
-                    self.outbound.extend(encode_frame(&reply.encode()));
+                    // Queue our pre-encoded CONNECT reply (size-validated in
+                    // `new`) and transition state.
+                    self.outbound
+                        .extend(core::mem::take(&mut self.connect_reply));
 
                     let remote_addr_bytes = msg.obs_addrs;
                     let remote_addrs = decode_remote_addrs(&remote_addr_bytes);
-                    self.events.push(ResponderEvent::ConnectReceived {
+                    self.events.push_back(ResponderEvent::ConnectReceived {
                         remote_addrs,
                         remote_addr_bytes,
                     });
                     self.state = ResponderState::AwaitingSync;
                 }
                 (ResponderState::AwaitingSync, HolePunchType::Sync) => {
-                    self.events.push(ResponderEvent::SyncReceived);
+                    self.events.push_back(ResponderEvent::SyncReceived);
                     self.state = ResponderState::Done;
                 }
                 (current_state, actual_kind) => {
@@ -466,6 +533,9 @@ impl SansIoProtocol for DcutrInitiator {
     type Error = DcutrError;
 
     fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
+        if let Some(err) = self.pending_error.take() {
+            return Err(err);
+        }
         match input {
             DcutrInitiatorInput::Flush => {}
             DcutrInitiatorInput::Data { bytes, rtt_ms } => self.on_data(&bytes, rtt_ms)?,
@@ -480,17 +550,19 @@ impl SansIoProtocol for DcutrInitiator {
         if !outbound.is_empty() {
             return Some(DcutrInitiatorOutput::Outbound(outbound));
         }
-        if !self.emitted_outcome {
-            if let Some(outcome) = self.outcome.clone() {
-                self.emitted_outcome = true;
-                return Some(DcutrInitiatorOutput::Outcome(outcome));
-            }
+        if !self.emitted_outcome
+            && let Some(outcome) = self.outcome.clone()
+        {
+            self.emitted_outcome = true;
+            return Some(DcutrInitiatorOutput::Outcome(outcome));
         }
         None
     }
 
     fn is_idle(&self) -> bool {
-        self.outbound.is_empty() && (self.emitted_outcome || self.outcome.is_none())
+        self.pending_error.is_none()
+            && self.outbound.is_empty()
+            && (self.emitted_outcome || self.outcome.is_none())
     }
 }
 
@@ -500,6 +572,9 @@ impl SansIoProtocol for DcutrResponder {
     type Error = DcutrError;
 
     fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
+        if let Some(err) = self.pending_error.take() {
+            return Err(err);
+        }
         match input {
             DcutrResponderInput::Flush => {}
             DcutrResponderInput::Data(data) => self.on_data(&data)?,
@@ -513,15 +588,11 @@ impl SansIoProtocol for DcutrResponder {
         if !outbound.is_empty() {
             return Some(DcutrResponderOutput::Outbound(outbound));
         }
-        if self.events.is_empty() {
-            None
-        } else {
-            Some(DcutrResponderOutput::Event(self.events.remove(0)))
-        }
+        self.events.pop_front().map(DcutrResponderOutput::Event)
     }
 
     fn is_idle(&self) -> bool {
-        self.outbound.is_empty() && self.events.is_empty()
+        self.pending_error.is_none() && self.outbound.is_empty() && self.events.is_empty()
     }
 }
 
@@ -529,11 +600,36 @@ impl SansIoProtocol for DcutrResponder {
 // Shared helpers
 // ---------------------------------------------------------------------------
 
+/// Longest length prefix a legal frame can carry: [`MAX_MESSAGE_SIZE`] is
+/// below 2^14, so its uvarint prefix encodes in at most two bytes.
+const MAX_FRAME_PREFIX_LEN: usize = 2;
+
+/// Backstop bound on the receive buffer once decoding has stalled on an
+/// incomplete frame.
+///
+/// Called only on [`FrameDecode::Incomplete`], after any complete frame
+/// has been drained: a stalled buffer can legally hold at most one
+/// partial frame (the payload bound is [`decode_frame`]'s `TooLarge`), so
+/// this can never reject traffic the decoder would accept -- including a
+/// maximal frame coalesced with pipelined trailing bytes.
 fn enforce_max_size(buf: &[u8]) -> Result<(), DcutrError> {
-    if buf.len() > MAX_MESSAGE_SIZE {
+    if buf.len() > MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN {
         return Err(DcutrError::MessageTooLarge { len: buf.len() });
     }
     Ok(())
+}
+
+/// Encodes an outbound message payload as a length-prefixed frame,
+/// rejecting payloads that exceed [`MAX_MESSAGE_SIZE`].
+///
+/// This mirrors the inbound limit enforced by [`decode_frame`]: the state
+/// machines must never put a frame on the wire that a spec-compliant
+/// receiver (including this crate's own decoder) would reject as oversized.
+fn checked_outbound_frame(payload: &[u8]) -> Result<Vec<u8>, DcutrError> {
+    if payload.len() > MAX_MESSAGE_SIZE {
+        return Err(DcutrError::MessageTooLarge { len: payload.len() });
+    }
+    Ok(encode_frame(payload))
 }
 
 /// Encodes a [`Multiaddr`] for transmission in a `HolePunch` `obs_addrs`
@@ -607,6 +703,52 @@ mod tests {
             }
             other => panic!("unexpected outcome: {other:?}"),
         }
+    }
+
+    #[test]
+    fn initiator_drops_bytes_after_reply_instead_of_buffering() {
+        let mut init = DcutrInitiator::new(&[]);
+        let _ = init.take_outbound();
+
+        // Reply arrives coalesced with trailing garbage: the reply must
+        // decode and the garbage must not be retained.
+        let mut coalesced = frame(HolePunch {
+            kind: HolePunchType::Connect,
+            obs_addrs: Vec::new(),
+        });
+        coalesced.extend_from_slice(&[0xaa; 512]);
+        init.on_data(&coalesced, 7).unwrap();
+        assert!(matches!(
+            init.outcome(),
+            Some(InitiatorOutcome::DialNow { .. })
+        ));
+        assert!(init.recv_buf.is_empty());
+
+        // Before the caller sends SYNC (`ReadyToSync`), further peer bytes
+        // must be dropped, not buffered without bound.
+        init.on_data(&[0xbb; 1024], 7).unwrap();
+        assert!(init.recv_buf.is_empty());
+    }
+
+    #[test]
+    fn responder_drops_trailing_bytes_after_flow_completes() {
+        let mut resp = DcutrResponder::new(&[]);
+
+        // CONNECT + SYNC + trailing garbage in one coalesced input: the
+        // flow completes and the garbage must not be retained for the
+        // machine's lifetime.
+        let mut coalesced = frame(HolePunch {
+            kind: HolePunchType::Connect,
+            obs_addrs: Vec::new(),
+        });
+        coalesced.extend(frame(HolePunch {
+            kind: HolePunchType::Sync,
+            obs_addrs: Vec::new(),
+        }));
+        coalesced.extend_from_slice(&[0xcc; 512]);
+        resp.on_data(&coalesced).unwrap();
+        assert!(resp.is_done());
+        assert!(resp.recv_buf.is_empty());
     }
 
     #[test]
@@ -802,11 +944,114 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_message() {
+    fn receive_buffer_backstop_bounds_partial_frames() {
+        // The backstop allows one maximal legal frame (payload + 2-byte
+        // prefix) and rejects anything beyond it. It runs only on stalled
+        // (incomplete) buffers, where `decode_frame`'s own bounds make it
+        // unreachable from wire input -- a pure defense-in-depth check.
+        assert!(enforce_max_size(&vec![0u8; MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN]).is_ok());
+        assert!(matches!(
+            enforce_max_size(&vec![0u8; MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN + 1]),
+            Err(DcutrError::MessageTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_declared_frame_length() {
+        // A tiny header declaring an impossible payload length must fail
+        // immediately instead of stalling while waiting for more bytes.
         let mut resp = DcutrResponder::new(&[]);
-        let large = vec![0u8; MAX_MESSAGE_SIZE + 1];
-        let err = resp.on_data(&large).unwrap_err();
+        let mut header = Vec::new();
+        minip2p_core::write_uvarint((MAX_MESSAGE_SIZE + 1) as u64, &mut header);
+        let err = resp.on_data(&header).unwrap_err();
+        assert!(matches!(err, DcutrError::FrameTooLarge { .. }));
+        assert!(resp.is_done());
+    }
+
+    /// Enough addresses that the encoded CONNECT payload far exceeds
+    /// [`MAX_MESSAGE_SIZE`] (each entry is ~25 bytes on the wire).
+    fn oversized_own_addrs() -> Vec<Multiaddr> {
+        vec![addr("/ip6/2001:db8::1/udp/4001/quic-v1"); 200]
+    }
+
+    #[test]
+    fn initiator_rejects_oversized_outbound_connect() {
+        let mut init = DcutrInitiator::new(&oversized_own_addrs());
+
+        // The oversized frame must never be emitted...
+        assert!(!init.is_idle());
+        assert!(init.poll_output().is_none());
+        // ...and the error surfaces on the first input.
+        let err = init.handle_input(DcutrInitiatorInput::Flush).unwrap_err();
         assert!(matches!(err, DcutrError::MessageTooLarge { .. }));
+        assert!(init.is_done());
+        assert!(init.is_idle());
+    }
+
+    #[test]
+    fn responder_rejects_oversized_outbound_connect_reply() {
+        let mut resp = DcutrResponder::new(&oversized_own_addrs());
+
+        assert!(!resp.is_idle());
+        let connect = frame(HolePunch {
+            kind: HolePunchType::Connect,
+            obs_addrs: Vec::new(),
+        });
+        let err = resp
+            .handle_input(DcutrResponderInput::Data(connect))
+            .unwrap_err();
+        assert!(matches!(err, DcutrError::MessageTooLarge { .. }));
+        // No reply frame may leak out after the failure.
+        assert!(resp.poll_output().is_none());
+        assert!(resp.is_done());
+    }
+
+    #[test]
+    fn outbound_frame_at_exact_max_size_still_encodes() {
+        // Payload layout: 2 bytes type field + 1 tag + 2-byte length varint
+        // + 4091 addr bytes = exactly MAX_MESSAGE_SIZE.
+        let at_max = HolePunch {
+            kind: HolePunchType::Connect,
+            obs_addrs: vec![vec![0u8; 4091]],
+        }
+        .encode();
+        assert_eq!(at_max.len(), MAX_MESSAGE_SIZE);
+
+        let framed = checked_outbound_frame(&at_max).expect("exactly-max payload must encode");
+        assert!(matches!(
+            decode_frame(&framed),
+            FrameDecode::Complete { .. }
+        ));
+
+        // The framed bytes (payload + 2-byte prefix) must also survive the
+        // state machine's own receive path, not just decode_frame -- even
+        // when a coalesced read pipelines the SYNC frame behind the
+        // maximal CONNECT in the same input.
+        let own = [addr("/ip4/10.0.0.1/udp/1234/quic-v1")];
+        let mut resp = DcutrResponder::new(&own);
+        let mut coalesced = framed;
+        coalesced.extend(frame(HolePunch {
+            kind: HolePunchType::Sync,
+            obs_addrs: Vec::new(),
+        }));
+        resp.handle_input(DcutrResponderInput::Data(coalesced))
+            .expect("exactly-max CONNECT + pipelined SYNC must be accepted");
+        assert!(matches!(
+            resp.poll_output(),
+            Some(DcutrResponderOutput::Outbound(_))
+        ));
+
+        // One more byte and the frame must be refused.
+        let over_max = HolePunch {
+            kind: HolePunchType::Connect,
+            obs_addrs: vec![vec![0u8; 4092]],
+        }
+        .encode();
+        assert_eq!(over_max.len(), MAX_MESSAGE_SIZE + 1);
+        assert!(matches!(
+            checked_outbound_frame(&over_max),
+            Err(DcutrError::MessageTooLarge { len }) if len == MAX_MESSAGE_SIZE + 1
+        ));
     }
 
     #[test]

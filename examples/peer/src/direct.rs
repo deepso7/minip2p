@@ -8,15 +8,13 @@ use std::error::Error;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
-use minip2p::{Endpoint, Event};
+use minip2p::{Deadline, Endpoint, Event};
 use minip2p_core::{Multiaddr, PeerAddr, Protocol};
 
 use crate::cli::{RunOptions, print_event};
 use crate::runtime::load_keypair;
 
 const AGENT: &str = "minip2p-peer/0.1.0";
-/// Far-future deadline for the listener; practically "run forever".
-const LISTEN_FOREVER: Duration = Duration::from_secs(60 * 60 * 24 * 365);
 /// Dialer's hard ceiling: connect, identify, ping -- comfortably fast.
 const DIAL_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -36,17 +34,12 @@ pub fn run_listen(options: RunOptions) -> Result<(), Box<dyn Error>> {
     }
     eprintln!("[listen] waiting for dialers (Ctrl-C to stop)");
 
-    // Loop until a long deadline; SIGINT tears the process down.
-    let deadline = Instant::now() + LISTEN_FOREVER;
-    while endpoint
-        .swarm_mut()
-        .run_until(deadline, |ev| {
-            print_event("listen", ev);
-            false // never stop on our own -- caller-driven shutdown
-        })
-        .map_err(|e| format!("swarm run_until: {e}"))?
-        .is_some()
-    {}
+    // Loop forever; SIGINT tears the process down. `poll_next` consumes
+    // each event permanently -- a never-matching `run_until` predicate
+    // would restore every event and grow the buffer unboundedly for the
+    // process lifetime.
+    poll_until(&mut endpoint, "listen", Deadline::NEVER, |_| false)
+        .map_err(|e| format!("swarm poll_next: {e}"))?;
     Ok(())
 }
 
@@ -62,30 +55,52 @@ pub fn run_dial(target: PeerAddr, options: RunOptions) -> Result<(), Box<dyn Err
     let deadline = Instant::now() + DIAL_DEADLINE;
 
     // Wait until the peer id is stable and Identify has populated protocol support.
-    endpoint
-        .swarm_mut()
-        .run_until(deadline, |ev| {
-            print_event("dial", ev);
-            matches!(ev, Event::PeerReady { peer_id, .. } if peer_id == &target_peer_id)
-        })
-        .map_err(|e| format!("waiting for peer ready: {e}"))?
-        .ok_or("deadline exceeded before peer became ready")?;
+    poll_until(
+        &mut endpoint,
+        "dial",
+        deadline,
+        |ev| matches!(ev, Event::PeerReady { peer_id, .. } if peer_id == &target_peer_id),
+    )
+    .map_err(|e| format!("waiting for peer ready: {e}"))?
+    .ok_or("deadline exceeded before peer became ready")?;
 
     endpoint
         .ping(&target_peer_id)
         .map_err(|e| format!("ping failed: {e}"))?;
 
     // Wait for the first RTT measurement, print it via print_event, exit.
-    endpoint
-        .swarm_mut()
-        .run_until(deadline, |ev| {
-            print_event("dial", ev);
-            matches!(ev, Event::PingRttMeasured { peer_id, .. } if peer_id == &target_peer_id)
-        })
-        .map_err(|e| format!("waiting for ping rtt: {e}"))?
-        .ok_or("deadline exceeded before ping rtt arrived")?;
+    poll_until(
+        &mut endpoint,
+        "dial",
+        deadline,
+        |ev| matches!(ev, Event::PingRttMeasured { peer_id, .. } if peer_id == &target_peer_id),
+    )
+    .map_err(|e| format!("waiting for ping rtt: {e}"))?
+    .ok_or("deadline exceeded before ping rtt arrived")?;
 
     Ok(())
+}
+
+/// Polls events via `Swarm::poll_next` (consuming and printing each one)
+/// until `want` matches or `deadline` passes.
+///
+/// This is the app-side idiom for side-effecting waits: `run_until`
+/// restores non-matching events, so a printing predicate would re-print
+/// the whole history on every subsequent wait.
+fn poll_until(
+    endpoint: &mut Endpoint,
+    role: &str,
+    deadline: impl Into<Deadline>,
+    mut want: impl FnMut(&Event) -> bool,
+) -> Result<Option<Event>, minip2p::Error> {
+    let deadline = deadline.into();
+    while let Some(ev) = endpoint.swarm_mut().poll_next(deadline)? {
+        print_event(role, &ev);
+        if want(&ev) {
+            return Ok(Some(ev));
+        }
+    }
+    Ok(None)
 }
 
 /// Builds an endpoint with the default Identify/Ping stack.

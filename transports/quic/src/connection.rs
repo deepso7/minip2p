@@ -5,16 +5,19 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
+use std::time::Duration;
 
 use minip2p_core::PeerId;
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, ConnectionState, StreamId, TransportError, TransportEvent,
 };
 
+use crate::PendingDatagram;
+
 const SEND_BUF_SIZE: usize = 1350;
 
 /// A queued write operation for a QUIC stream.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct PendingStreamWrite {
     /// Payload bytes to send.
     bytes: Vec<u8>,
@@ -25,11 +28,12 @@ struct PendingStreamWrite {
 }
 
 impl PendingStreamWrite {
-    /// Creates a data write.
-    fn data(bytes: Vec<u8>) -> Self {
+    /// Creates a data write whose first `offset` bytes were already accepted
+    /// by quiche.
+    fn data(bytes: Vec<u8>, offset: usize) -> Self {
         Self {
             bytes,
-            offset: 0,
+            offset,
             fin: false,
         }
     }
@@ -45,7 +49,7 @@ impl PendingStreamWrite {
 }
 
 /// Per-stream bookkeeping for half-close tracking and pending writes.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 struct StreamRuntimeState {
     /// Outbound write queue.
     pending_writes: VecDeque<PendingStreamWrite>,
@@ -91,6 +95,17 @@ pub struct QuicConnection {
     stream_states: HashMap<u64, StreamRuntimeState>,
     /// Next stream id to allocate (increments by 4 per QUIC spec).
     next_local_bidi_stream_id: u64,
+    /// Number of active locally initiated bidirectional streams.
+    active_local_bidi_streams: u64,
+    /// Maximum local bidirectional streams allowed by configuration.
+    max_local_bidi_streams: u64,
+    /// Total application bytes queued but not yet accepted by quiche.
+    pending_write_bytes: usize,
+    /// Maximum queued application bytes for this connection.
+    max_pending_write_bytes: usize,
+    /// Source CIDs the transport has entered into its routing table, so
+    /// reindexing and unindexing never scan the whole table.
+    indexed_cids: Vec<Vec<u8>>,
 }
 
 impl QuicConnection {
@@ -99,6 +114,8 @@ impl QuicConnection {
         conn: quiche::Connection,
         peer_addr: SocketAddr,
         endpoint: ConnectionEndpoint,
+        max_local_bidi_streams: u64,
+        max_pending_write_bytes: usize,
     ) -> Self {
         let next_local_bidi_stream_id = if conn.is_server() { 1 } else { 0 };
 
@@ -110,11 +127,39 @@ impl QuicConnection {
             state: ConnectionState::Connecting,
             stream_states: HashMap::new(),
             next_local_bidi_stream_id,
+            active_local_bidi_streams: 0,
+            max_local_bidi_streams,
+            pending_write_bytes: 0,
+            max_pending_write_bytes,
+            indexed_cids: Vec::new(),
         }
     }
 
-    pub fn source_cid_bytes(&self) -> Vec<u8> {
-        self.conn.source_id().as_ref().to_vec()
+    /// Returns quiche source CIDs not yet in the transport's routing table,
+    /// recording them as indexed.
+    pub fn take_unindexed_source_cids(&mut self) -> Vec<Vec<u8>> {
+        let mut new_cids: Vec<Vec<u8>> = Vec::new();
+        for cid in self.conn.source_ids() {
+            let cid = cid.as_ref();
+            if !self.indexed_cids.iter().any(|known| known == cid) {
+                new_cids.push(cid.to_vec());
+            }
+        }
+        self.indexed_cids.extend(new_cids.iter().cloned());
+        new_cids
+    }
+
+    /// Records a CID the transport indexed outside of quiche's source-id set
+    /// (e.g. the client-chosen destination CID on an accepted connection).
+    pub fn note_indexed_cid(&mut self, cid: Vec<u8>) {
+        if !self.indexed_cids.contains(&cid) {
+            self.indexed_cids.push(cid);
+        }
+    }
+
+    /// All CIDs the transport currently routes to this connection.
+    pub fn indexed_cids(&self) -> &[Vec<u8>] {
+        &self.indexed_cids
     }
 
     pub fn endpoint(&self) -> &ConnectionEndpoint {
@@ -133,6 +178,32 @@ impl QuicConnection {
         self.conn.is_closed()
     }
 
+    /// Returns the duration until quiche next needs timer service.
+    pub fn timeout(&self) -> Option<Duration> {
+        self.conn.timeout()
+    }
+
+    /// Advances quiche's loss-recovery and idle timers when they are due.
+    pub fn handle_timeout(
+        &mut self,
+        socket: &UdpSocket,
+        events: &mut Vec<TransportEvent>,
+        pending_datagrams: &mut VecDeque<PendingDatagram>,
+        max_pending_datagrams: usize,
+    ) -> Result<(), TransportError> {
+        if !self.timeout().is_some_and(|timeout| timeout.is_zero()) {
+            return Ok(());
+        }
+
+        self.conn.on_timeout();
+        self.drain_send_queue(events)?;
+        self.flush(socket, pending_datagrams, max_pending_datagrams)
+    }
+
+    // These arguments are the complete I/O context for a single datagram.
+    // Keeping them explicit makes this adapter easy to embed and avoids a
+    // second mutable runtime object on the packet hot path.
+    #[allow(clippy::too_many_arguments)]
     pub fn recv_packet(
         &mut self,
         buf: &mut [u8],
@@ -140,6 +211,8 @@ impl QuicConnection {
         local: SocketAddr,
         socket: &UdpSocket,
         events: &mut Vec<TransportEvent>,
+        pending_datagrams: &mut VecDeque<PendingDatagram>,
+        max_pending_datagrams: usize,
     ) -> Result<(), TransportError> {
         let recv_info = quiche::RecvInfo { from, to: local };
 
@@ -158,7 +231,7 @@ impl QuicConnection {
         if self.state == ConnectionState::Connecting && self.conn.is_established() {
             self.state = ConnectionState::Connected;
             self.drain_send_queue(events)?;
-            self.flush(socket)?;
+            self.flush(socket, pending_datagrams, max_pending_datagrams)?;
 
             // Auto-verify the remote peer's identity from their TLS certificate.
             let Some(peer_cert_der) = self.conn.peer_cert() else {
@@ -168,7 +241,7 @@ impl QuicConnection {
                 });
                 let _ = self.conn.close(true, 0x03, b"peer certificate missing");
                 self.state = ConnectionState::Closing;
-                self.flush(socket)?;
+                self.flush(socket, pending_datagrams, max_pending_datagrams)?;
                 return Ok(());
             };
 
@@ -188,7 +261,7 @@ impl QuicConnection {
                         // Close the connection — the peer is not who we expected.
                         let _ = self.conn.close(true, 0x01, b"peer id mismatch");
                         self.state = ConnectionState::Closing;
-                        self.flush(socket)?;
+                        self.flush(socket, pending_datagrams, max_pending_datagrams)?;
                         return Ok(());
                     }
                     self.endpoint.set_peer_id(verified_peer_id);
@@ -202,7 +275,7 @@ impl QuicConnection {
                         .conn
                         .close(true, 0x02, b"certificate verification failed");
                     self.state = ConnectionState::Closing;
-                    self.flush(socket)?;
+                    self.flush(socket, pending_datagrams, max_pending_datagrams)?;
                     return Ok(());
                 }
             }
@@ -213,7 +286,7 @@ impl QuicConnection {
             });
         } else {
             self.drain_send_queue(events)?;
-            self.flush(socket)?;
+            self.flush(socket, pending_datagrams, max_pending_datagrams)?;
         }
 
         Ok(())
@@ -225,6 +298,12 @@ impl QuicConnection {
                 id: self.id,
                 state: self.state,
                 expected: ConnectionState::Connected,
+            });
+        }
+
+        if self.active_local_bidi_streams >= self.max_local_bidi_streams {
+            return Err(TransportError::ResourceExhausted {
+                resource: "local QUIC bidirectional streams",
             });
         }
 
@@ -240,6 +319,7 @@ impl QuicConnection {
 
         self.stream_states
             .insert(raw_stream_id, StreamRuntimeState::default());
+        self.active_local_bidi_streams += 1;
         Ok(StreamId::new(raw_stream_id))
     }
 
@@ -249,26 +329,85 @@ impl QuicConnection {
         data: Vec<u8>,
         socket: &UdpSocket,
         events: &mut Vec<TransportEvent>,
+        pending_datagrams: &mut VecDeque<PendingDatagram>,
+        max_pending_datagrams: usize,
     ) -> Result<(), TransportError> {
         if data.is_empty() {
             return Ok(());
         }
 
-        let state = self.get_or_create_local_stream_state(stream_id)?;
-        if state.local_write_closed {
-            return Err(TransportError::StreamSendFailed {
-                id: self.id,
-                stream_id,
-                reason: "local stream write side is already closed".into(),
-            });
+        let raw_stream_id = stream_id.as_u64();
+        let has_queued_writes = {
+            let state = self.stream_state_mut(stream_id)?;
+            if state.local_write_closed {
+                return Err(TransportError::StreamSendFailed {
+                    id: self.id,
+                    stream_id,
+                    reason: "local stream write side is already closed".into(),
+                });
+            }
+            !state.pending_writes.is_empty()
+        };
+
+        let queue_capacity = self
+            .max_pending_write_bytes
+            .saturating_sub(self.pending_write_bytes);
+
+        let offset = if has_queued_writes {
+            // Earlier bytes are still queued; queue behind them so the direct
+            // send below cannot reorder the stream.
+            if data.len() > queue_capacity {
+                return Err(TransportError::ResourceExhausted {
+                    resource: "queued QUIC stream bytes",
+                });
+            }
+            0
+        } else {
+            // Touch the stream so quiche reports its send capacity, then
+            // reject up front when the unsendable remainder would not fit the
+            // queue. This keeps oversized writes all-or-nothing: no bytes are
+            // committed to quiche before the write is known to fit.
+            match self.conn.stream_send(raw_stream_id, &[], false) {
+                Ok(_) | Err(quiche::Error::Done) => {}
+                Err(e) => {
+                    return Err(TransportError::StreamSendFailed {
+                        id: self.id,
+                        stream_id,
+                        reason: format!("stream_send error: {e}"),
+                    });
+                }
+            }
+            let capacity = self.conn.stream_capacity(raw_stream_id).unwrap_or(0);
+            if data.len().saturating_sub(capacity) > queue_capacity {
+                return Err(TransportError::ResourceExhausted {
+                    resource: "queued QUIC stream bytes",
+                });
+            }
+
+            match self.conn.stream_send(raw_stream_id, &data, false) {
+                Ok(written) => written,
+                Err(quiche::Error::Done) => 0,
+                Err(e) => {
+                    return Err(TransportError::StreamSendFailed {
+                        id: self.id,
+                        stream_id,
+                        reason: format!("stream_send error: {e}"),
+                    });
+                }
+            }
+        };
+
+        if offset < data.len() {
+            self.pending_write_bytes += data.len() - offset;
+            self.stream_states
+                .entry(raw_stream_id)
+                .or_default()
+                .pending_writes
+                .push_back(PendingStreamWrite::data(data, offset));
         }
 
-        state
-            .pending_writes
-            .push_back(PendingStreamWrite::data(data));
-
         self.drain_send_queue(events)?;
-        self.flush(socket)?;
+        self.flush(socket, pending_datagrams, max_pending_datagrams)?;
         Ok(())
     }
 
@@ -277,8 +416,10 @@ impl QuicConnection {
         stream_id: StreamId,
         socket: &UdpSocket,
         events: &mut Vec<TransportEvent>,
+        pending_datagrams: &mut VecDeque<PendingDatagram>,
+        max_pending_datagrams: usize,
     ) -> Result<(), TransportError> {
-        let state = self.get_or_create_local_stream_state(stream_id)?;
+        let state = self.stream_state_mut(stream_id)?;
 
         if state.local_write_closed {
             return Err(TransportError::StreamCloseWriteFailed {
@@ -292,7 +433,7 @@ impl QuicConnection {
         state.pending_writes.push_back(PendingStreamWrite::fin());
 
         self.drain_send_queue(events)?;
-        self.flush(socket)?;
+        self.flush(socket, pending_datagrams, max_pending_datagrams)?;
         Ok(())
     }
 
@@ -307,6 +448,14 @@ impl QuicConnection {
                 stream_id,
             },
         )?;
+
+        let dropped = state
+            .pending_writes
+            .iter()
+            .map(|write| write.bytes.len().saturating_sub(write.offset))
+            .sum::<usize>();
+        state.pending_writes.clear();
+        self.pending_write_bytes = self.pending_write_bytes.saturating_sub(dropped);
 
         self.conn
             .stream_shutdown(stream_id.as_u64(), quiche::Shutdown::Write, 0x00)
@@ -338,7 +487,12 @@ impl QuicConnection {
         Ok(())
     }
 
-    pub fn close(&mut self, socket: &UdpSocket) -> Result<(), TransportError> {
+    pub fn close(
+        &mut self,
+        socket: &UdpSocket,
+        pending_datagrams: &mut VecDeque<PendingDatagram>,
+        max_pending_datagrams: usize,
+    ) -> Result<(), TransportError> {
         match self.conn.close(true, 0x00, b"bye") {
             Ok(()) | Err(quiche::Error::Done) => {}
             Err(e) => {
@@ -352,7 +506,7 @@ impl QuicConnection {
         self.state = ConnectionState::Closing;
         let mut drain_events = Vec::new();
         self.drain_send_queue(&mut drain_events)?;
-        self.flush(socket)?;
+        self.flush(socket, pending_datagrams, max_pending_datagrams)?;
         Ok(())
     }
 
@@ -360,6 +514,8 @@ impl QuicConnection {
         &mut self,
         events: &mut Vec<TransportEvent>,
         socket: &UdpSocket,
+        pending_datagrams: &mut VecDeque<PendingDatagram>,
+        max_pending_datagrams: usize,
     ) -> Result<(), TransportError> {
         if !self.conn.is_established() {
             return Ok(());
@@ -409,15 +565,26 @@ impl QuicConnection {
         }
 
         self.drain_send_queue(events)?;
-        self.flush(socket)?;
+        self.flush(socket, pending_datagrams, max_pending_datagrams)?;
         self.gc_closed_streams();
         Ok(())
     }
 
     /// Sends all pending quiche output packets via the UDP socket.
-    fn flush(&mut self, socket: &UdpSocket) -> Result<(), TransportError> {
+    fn flush(
+        &mut self,
+        socket: &UdpSocket,
+        pending_datagrams: &mut VecDeque<PendingDatagram>,
+        max_pending_datagrams: usize,
+    ) -> Result<(), TransportError> {
         let mut out = [0u8; SEND_BUF_SIZE];
         loop {
+            // `quiche::Connection::send()` advances congestion and loss state.
+            // Do not consume another packet unless we can retain it if the
+            // non-blocking UDP socket reports `WouldBlock`.
+            if pending_datagrams.len() >= max_pending_datagrams {
+                break;
+            }
             let (written, send_info) = match self.conn.send(&mut out) {
                 Ok(v) => v,
                 Err(quiche::Error::Done) => break,
@@ -429,12 +596,22 @@ impl QuicConnection {
                 }
             };
 
-            socket.send_to(&out[..written], send_info.to).map_err(|e| {
-                TransportError::CloseFailed {
-                    id: self.id,
-                    reason: format!("udp send error: {e}"),
+            match socket.send_to(&out[..written], send_info.to) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    pending_datagrams.push_back(PendingDatagram {
+                        bytes: out[..written].to_vec(),
+                        destination: send_info.to,
+                    });
+                    break;
                 }
-            })?;
+                Err(e) => {
+                    return Err(TransportError::CloseFailed {
+                        id: self.id,
+                        reason: format!("udp send error: {e}"),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -445,28 +622,27 @@ impl QuicConnection {
 
         for raw_stream_id in stream_ids {
             loop {
-                let pending = self
-                    .stream_states
-                    .get(&raw_stream_id)
-                    .and_then(|state| state.pending_writes.front().cloned());
-
-                let Some(pending) = pending else {
-                    break;
-                };
-
                 let stream_id = StreamId::new(raw_stream_id);
-                let payload = &pending.bytes[pending.offset..];
-                let fin = pending.fin && payload.is_empty();
-
-                let written = match self.conn.stream_send(raw_stream_id, payload, fin) {
-                    Ok(written) => written,
-                    Err(quiche::Error::Done) => break,
-                    Err(e) => {
-                        return Err(TransportError::StreamSendFailed {
-                            id: self.id,
-                            stream_id,
-                            reason: format!("stream_send error: {e}"),
-                        });
+                let written = {
+                    let (conn, stream_states) = (&mut self.conn, &mut self.stream_states);
+                    let Some(state) = stream_states.get_mut(&raw_stream_id) else {
+                        break;
+                    };
+                    let Some(front) = state.pending_writes.front_mut() else {
+                        break;
+                    };
+                    let payload = &front.bytes[front.offset..];
+                    let fin = front.fin && payload.is_empty();
+                    match conn.stream_send(raw_stream_id, payload, fin) {
+                        Ok(written) => written,
+                        Err(quiche::Error::Done) => break,
+                        Err(e) => {
+                            return Err(TransportError::StreamSendFailed {
+                                id: self.id,
+                                stream_id,
+                                reason: format!("stream_send error: {e}"),
+                            });
+                        }
                     }
                 };
 
@@ -481,6 +657,7 @@ impl QuicConnection {
                         }
 
                         front.offset = front.offset.saturating_add(written);
+                        self.pending_write_bytes = self.pending_write_bytes.saturating_sub(written);
                         if front.offset >= front.bytes.len() {
                             state.pending_writes.pop_front();
                         }
@@ -540,37 +717,40 @@ impl QuicConnection {
             })
             .collect();
 
+        let removed_local_bidi = to_remove
+            .iter()
+            .filter(|stream_id| self.is_local_bidi_stream(**stream_id))
+            .count() as u64;
         for stream_id in to_remove {
             self.stream_states.remove(&stream_id);
         }
+        self.active_local_bidi_streams = self
+            .active_local_bidi_streams
+            .saturating_sub(removed_local_bidi);
     }
 
-    /// Returns the stream state, creating it for locally-initiated streams.
-    fn get_or_create_local_stream_state(
+    /// Returns state for a stream previously opened or discovered by the transport.
+    fn stream_state_mut(
         &mut self,
         stream_id: StreamId,
     ) -> Result<&mut StreamRuntimeState, TransportError> {
-        if self.stream_states.contains_key(&stream_id.as_u64()) {
-            return Ok(self
-                .stream_states
-                .get_mut(&stream_id.as_u64())
-                .expect("stream state must exist"));
-        }
-
-        if !self.is_local_initiated_stream(stream_id.as_u64()) {
-            return Err(TransportError::StreamNotFound {
+        self.stream_states
+            .get_mut(&stream_id.as_u64())
+            .ok_or(TransportError::StreamNotFound {
                 id: self.id,
                 stream_id,
-            });
-        }
-
-        Ok(self.stream_states.entry(stream_id.as_u64()).or_default())
+            })
     }
 
     /// Checks if a stream id was initiated by this side (QUIC parity bit check).
     fn is_local_initiated_stream(&self, stream_id: u64) -> bool {
         let local_initiator_bit = if self.conn.is_server() { 1 } else { 0 };
         (stream_id & 0x1) == local_initiator_bit
+    }
+
+    /// Checks if a stream is bidirectional and was initiated by this side.
+    fn is_local_bidi_stream(&self, stream_id: u64) -> bool {
+        self.is_local_initiated_stream(stream_id) && (stream_id & 0x2) == 0
     }
 
     /// Checks if a stream id was initiated by the remote side.

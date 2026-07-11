@@ -52,6 +52,19 @@ Current validated behavior:
 - Transport-specific address validation belongs in transport adapters, not `crates/core`.
 - `crates/swarm` splits into a Sans-I/O `SwarmCore` (no_std) and a `std`-gated driver that owns a concrete `Transport` and reads the wall clock.
 
+The minimal default swarm intentionally composes only Identify, Ping, and
+registered application protocols. Relay, AutoNAT, and DCUtR remain independent
+Sans-I/O machines driven over generic streams; their dialing, retry, and
+fallback policy belongs to the host. This keeps the base library small and
+avoids hiding network policy in a monolithic swarm while still allowing
+declarative protocol registration through `SwarmBuilder::protocol` and
+`EndpointBuilder::protocol`.
+
+`transports/quic` is the optional synchronous socket adapter. It owns UDP and
+DNS I/O, but all libp2p protocol orchestration beneath it remains input/output
+driven. Hosts that own their I/O loop can use `SwarmCore` directly; the adapter
+exposes QUIC deadlines rather than creating an async runtime or timer thread.
+
 ## Quick start
 
 Prerequisites:
@@ -68,7 +81,7 @@ cargo test
 Build an app endpoint with the top-level facade:
 
 ```rust
-use minip2p::Endpoint;
+use minip2p::{Deadline, Endpoint, Event};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut node = Endpoint::builder()
@@ -78,15 +91,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addrs = node.listen_all()?;
     println!("listening on {addrs:?}");
 
+    // `next_event` also accepts an `Instant` or a relative `Duration`
+    // when a wait needs a timeout.
+    while let Some(event) = node.next_event(Deadline::NEVER)? {
+        println!("{event:?}");
+        if matches!(event, Event::ConnectionEstablished { .. }) {
+            // The endpoint remains entirely caller-driven: keep polling,
+            // or integrate `poll()` and transport deadlines in your host loop.
+        }
+    }
     Ok(())
 }
 ```
+
+`Endpoint` is the batteries-included synchronous facade. Custom runtimes can
+drive `SwarmCore` and the protocol crates directly with inputs, outputs, and
+explicit timestamps; none of those layers performs I/O, reads a clock, blocks,
+or requires an async executor.
 
 Common contributor workflows are also available through `just`:
 
 ```bash
 just test
 just check-nostd
+just bench
+just fuzz 30
 ```
 
 Check `no_std` builds for the core crates:

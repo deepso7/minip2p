@@ -37,13 +37,15 @@ while let Some(AutoNatClientOutput::Outbound(bytes)) = client.poll_output() {
 server.handle_input(AutoNatServerInput::Data(bytes_from_client))?;
 while let Some(output) = server.poll_output() {
     match output {
-        AutoNatServerOutput::DialBack(request) => {
+        AutoNatServerOutput::Request(request) => {
             // Runtime dials request.addrs for request.peer_id, then responds:
             server.handle_input(AutoNatServerInput::RespondPublic { addrs: request.addrs })?;
         }
         AutoNatServerOutput::Outbound(bytes) => send_to_client(bytes),
     }
 }
+
+server.handle_input(AutoNatServerInput::Flush)?;
 ```
 
 ## no_std

@@ -1,8 +1,12 @@
 [package]
 name = "minip2p-autonat"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 readme = "README.md"
+
+[lints]
+workspace = true
 
 [features]
 default = ["std"]
