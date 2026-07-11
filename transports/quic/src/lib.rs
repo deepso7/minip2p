@@ -999,14 +999,33 @@ impl QuicTransport {
     }
 }
 
+/// Non-blocking check for a datagram already queued on `socket`.
+///
+/// The socket must be in its usual non-blocking mode. Peeks one byte, so no
+/// input is consumed. Errors other than `WouldBlock` count as ready so the
+/// next `poll()` can surface them.
+fn socket_has_queued_input(socket: &UdpSocket) -> bool {
+    let mut probe = [0u8; 1];
+    match socket.peek_from(&mut probe) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(_) => true,
+    }
+}
+
 /// Blocks until `socket` has a readable datagram or `timeout` elapses.
 ///
 /// Temporarily switches the socket to blocking mode with a read timeout and
 /// peeks one byte, so no input is consumed. Errors other than a timeout map
-/// to `Ready` so the next `poll()` can surface them.
+/// to `Ready` so the next `poll()` can surface them. A zero timeout degrades
+/// to a non-blocking probe, so already-queued input is still reported.
 fn wait_for_socket_input(socket: &UdpSocket, timeout: Duration) -> WaitOutcome {
     if timeout.is_zero() {
-        return WaitOutcome::TimedOut;
+        return if socket_has_queued_input(socket) {
+            WaitOutcome::Ready
+        } else {
+            WaitOutcome::TimedOut
+        };
     }
 
     // Arm the read timeout before entering blocking mode so a failure here
@@ -1676,6 +1695,14 @@ impl Transport for DualQuicTransport {
         // socket wakes the driver within one slice.
         const SLICE: Duration = Duration::from_millis(10);
 
+        // Already-queued input must be reported before blocking anywhere:
+        // otherwise a short budget could be consumed entirely by the empty
+        // family while the other has a packet waiting, returning `TimedOut`
+        // despite input being available.
+        if socket_has_queued_input(&self.ipv4.socket) || socket_has_queued_input(&self.ipv6.socket)
+        {
+            return WaitOutcome::Ready;
+        }
         if timeout.is_zero() {
             return WaitOutcome::TimedOut;
         }
@@ -1684,7 +1711,7 @@ impl Transport for DualQuicTransport {
         // represents; an unrepresentable deadline means "no deadline".
         let deadline = std::time::Instant::now().checked_add(timeout);
         loop {
-            for transport in [&self.ipv4, &self.ipv6] {
+            for (family, transport) in [(0, &self.ipv4), (1, &self.ipv6)] {
                 let remaining = match deadline {
                     Some(deadline) => {
                         let remaining =
@@ -1696,9 +1723,15 @@ impl Transport for DualQuicTransport {
                     }
                     None => SLICE,
                 };
-                if wait_for_socket_input(&transport.socket, SLICE.min(remaining))
-                    == WaitOutcome::Ready
-                {
+                // Cap the first family's slice at half the remaining budget
+                // so a budget shorter than one slice still reaches the
+                // second family within this call. A zero slice degrades to
+                // a non-blocking probe.
+                let mut slice = SLICE.min(remaining);
+                if family == 0 {
+                    slice = slice.min(remaining / 2);
+                }
+                if wait_for_socket_input(&transport.socket, slice) == WaitOutcome::Ready {
                     return WaitOutcome::Ready;
                 }
             }
@@ -1881,6 +1914,9 @@ mod tests {
             transport.wait_for_input(Duration::from_secs(2)),
             WaitOutcome::Ready
         );
+        // A zero budget is an accurate non-blocking probe: queued input
+        // still reports Ready.
+        assert_eq!(transport.wait_for_input(Duration::ZERO), WaitOutcome::Ready);
 
         // The peek must not consume the datagram, and the socket must be back
         // in non-blocking mode afterwards.
@@ -1895,6 +1931,42 @@ mod tests {
             .recv_from(&mut buf)
             .expect_err("socket must be restored to non-blocking");
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn dual_stack_wait_reports_queued_ipv6_input_within_short_budget() {
+        let mut transport = DualQuicTransport::new(QuicNodeConfig::generate()).expect("bind");
+        let ipv6_port = transport
+            .ipv6
+            .socket
+            .local_addr()
+            .expect("ipv6 local addr")
+            .port();
+
+        let sender = UdpSocket::bind("[::1]:0").expect("sender");
+        sender
+            .send_to(&[1u8; 4], format!("[::1]:{ipv6_port}"))
+            .expect("send to ipv6 socket");
+
+        // Wait for the kernel to queue the datagram before asserting.
+        let start = std::time::Instant::now();
+        while !socket_has_queued_input(&transport.ipv6.socket) {
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "datagram never arrived on the ipv6 socket"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        // A budget shorter than one 10ms slice must still report the queued
+        // IPv6 packet instead of spending the whole wait blocked on the
+        // idle IPv4 socket and returning TimedOut.
+        assert_eq!(
+            transport.wait_for_input(Duration::from_millis(5)),
+            WaitOutcome::Ready
+        );
+        // A zero budget acts as an accurate non-blocking probe.
+        assert_eq!(transport.wait_for_input(Duration::ZERO), WaitOutcome::Ready);
     }
 
     #[test]
