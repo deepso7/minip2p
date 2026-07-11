@@ -6,15 +6,13 @@
 //! small batteries-included API for identity, QUIC, listen/dial, ping, and
 //! event polling.
 
-use std::time::Instant;
-
 pub use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
 pub use minip2p_identify::IdentifyMessage;
 pub use minip2p_identity::Ed25519Keypair;
 pub use minip2p_quic::QuicLimits;
 use minip2p_quic::{QuicEndpoint, QuicNodeConfig};
 pub use minip2p_swarm::{
-    DriverError as Error, RESERVED_PROTOCOL_IDS, SwarmError, SwarmEvent as Event,
+    Deadline, DriverError as Error, RESERVED_PROTOCOL_IDS, SwarmError, SwarmEvent as Event,
 };
 use minip2p_swarm::{Swarm, SwarmBuilder};
 pub use minip2p_transport::{ConnectionId, StreamId, TransportError};
@@ -43,12 +41,12 @@ impl Endpoint {
 
     /// Starts listening on the transport's first already-bound address.
     pub fn listen(&mut self) -> Result<PeerAddr, Error> {
-        Ok(self.swarm.listen_on_bound_addr()?)
+        self.swarm.listen_on_bound_addr()
     }
 
     /// Starts listening on all transport-bound addresses.
     pub fn listen_all(&mut self) -> Result<Vec<PeerAddr>, Error> {
-        Ok(self.swarm.listen_on_bound_addrs()?)
+        self.swarm.listen_on_bound_addrs()
     }
 
     /// Dials a remote peer on every applicable local address family.
@@ -108,7 +106,7 @@ impl Endpoint {
 
     /// Opens an application stream after negotiating `protocol_id`.
     pub fn open_stream(&mut self, peer_id: &PeerId, protocol_id: &str) -> Result<StreamId, Error> {
-        self.swarm.open_user_stream(peer_id, protocol_id)
+        self.swarm.open_stream(peer_id, protocol_id)
     }
 
     /// Sends bytes on a negotiated application stream.
@@ -118,7 +116,7 @@ impl Endpoint {
         stream_id: StreamId,
         data: impl Into<Vec<u8>>,
     ) -> Result<(), Error> {
-        self.swarm.send_user_stream(peer_id, stream_id, data.into())
+        self.swarm.send_stream(peer_id, stream_id, data.into())
     }
 
     /// Half-closes the local write side of an application stream.
@@ -127,41 +125,44 @@ impl Endpoint {
         peer_id: &PeerId,
         stream_id: StreamId,
     ) -> Result<(), Error> {
-        self.swarm.close_user_stream_write(peer_id, stream_id)
+        self.swarm.close_stream_write(peer_id, stream_id)
     }
 
     /// Resets an application stream.
     pub fn reset_stream(&mut self, peer_id: &PeerId, stream_id: StreamId) -> Result<(), Error> {
-        self.swarm.reset_user_stream(peer_id, stream_id)
+        self.swarm.reset_stream(peer_id, stream_id)
     }
 
     /// Polls the endpoint once and returns all currently available events.
     pub fn poll(&mut self) -> Result<Vec<Event>, Error> {
-        Ok(self.swarm.poll()?)
+        self.swarm.poll()
     }
 
     /// Returns the next event, waiting internally until `deadline`.
-    pub fn next_event(&mut self, deadline: Instant) -> Result<Option<Event>, Error> {
-        Ok(self.swarm.poll_next(deadline)?)
+    ///
+    /// `deadline` accepts an [`std::time::Instant`], a relative
+    /// [`std::time::Duration`], or [`Deadline::NEVER`] to wait indefinitely.
+    pub fn next_event(&mut self, deadline: impl Into<Deadline>) -> Result<Option<Event>, Error> {
+        self.swarm.poll_next(deadline)
     }
 
     /// Waits until a peer is ready or `deadline` expires.
     pub fn wait_peer_ready(
         &mut self,
         peer_id: &PeerId,
-        deadline: Instant,
+        deadline: impl Into<Deadline>,
     ) -> Result<Option<Event>, Error> {
-        Ok(self.swarm.run_until(
+        self.swarm.run_until(
             deadline,
             |event| matches!(event, Event::PeerReady { peer_id: ready, .. } if ready == peer_id),
-        )?)
+        )
     }
 
     /// Waits until a ping RTT for `peer_id` is measured or `deadline` expires.
     pub fn wait_ping_rtt(
         &mut self,
         peer_id: &PeerId,
-        deadline: Instant,
+        deadline: impl Into<Deadline>,
     ) -> Result<Option<u64>, Error> {
         let event = self.swarm.run_until(deadline, |event| {
             matches!(event, Event::PingRttMeasured { peer_id: ready, .. } if ready == peer_id)
@@ -309,7 +310,7 @@ mod tests {
     const PROTOCOL: &str = "/myapp/1.0.0";
 
     #[test]
-    fn builder_protocol_registers_for_user_stream_routing() {
+    fn builder_protocol_registers_for_stream_routing() {
         let mut endpoint = Endpoint::builder()
             .protocol(PROTOCOL)
             .bind_quic("127.0.0.1:0")

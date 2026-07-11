@@ -13,7 +13,7 @@
 //! - [`Swarm`] -- std driver that owns a concrete
 //!   [`Transport`](minip2p_transport::Transport) and a
 //!   monotonic clock ([`std::time::Instant`]), and preserves the one-call
-//!   DX (`swarm.dial(addr)`, `swarm.ping(peer)`, `swarm.open_user_stream`)
+//!   DX (`swarm.dial(addr)`, `swarm.ping(peer)`, `swarm.open_stream`)
 //!   by shuttling events and actions between the transport and the core.
 //!
 //! Most applications want [`Swarm`] and the [`SwarmBuilder`] convenience
@@ -46,4 +46,4 @@ pub use crate::events::{
 #[cfg(feature = "std")]
 pub use crate::builder::SwarmBuilder;
 #[cfg(feature = "std")]
-pub use crate::driver::{Clock, DriverError, Swarm};
+pub use crate::driver::{Clock, Deadline, DriverError, Swarm};

@@ -22,6 +22,10 @@ for address in endpoint.listen_all()? {
 driver-invariant failures as separate variants. QUIC resource limits are
 configurable through `EndpointBuilder::quic_limits`.
 
+Event waits (`next_event`, `wait_peer_ready`, `wait_ping_rtt`) accept an
+`Instant` (absolute deadline), a `Duration` (relative timeout), or
+`minip2p::Deadline::NEVER` to block until the event arrives.
+
 Built-in protocol ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see
 `minip2p::RESERVED_PROTOCOL_IDS`) belong to the endpoint's own handlers;
 registering one via `EndpointBuilder::protocol` makes the `bind_quic*` step

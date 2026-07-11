@@ -45,6 +45,58 @@ pub enum DriverError {
 /// input arrives or the timer budget elapses.
 const POLL_IDLE_SLEEP: Duration = Duration::from_millis(1);
 
+/// Cap on a single readiness wait when the caller has no deadline
+/// ([`Deadline::NEVER`]). Re-arming the wait occasionally is harmless (one
+/// syscall a minute) and keeps unbounded durations out of OS interfaces.
+const MAX_IDLE_WAIT: Duration = Duration::from_secs(60);
+
+/// When a blocking wait should give up.
+///
+/// Everywhere the driver can wait ([`Swarm::poll_next`], [`Swarm::run_until`])
+/// accepts `impl Into<Deadline>`, so callers pass whichever is natural:
+///
+/// - an [`Instant`] -- absolute deadline,
+/// - a [`Duration`] -- relative timeout from now,
+/// - [`Deadline::NEVER`] -- wait indefinitely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Deadline(Option<Instant>);
+
+impl Deadline {
+    /// Wait indefinitely; the call returns only when an event arrives (or,
+    /// for `run_until`, when the predicate matches).
+    pub const NEVER: Deadline = Deadline(None);
+
+    /// Absolute deadline. Equivalent to `Deadline::from(instant)`.
+    pub fn at(instant: Instant) -> Self {
+        Deadline(Some(instant))
+    }
+
+    /// Whether the deadline has passed at `now`.
+    fn is_expired_at(self, now: Instant) -> bool {
+        self.0.is_some_and(|deadline| now >= deadline)
+    }
+
+    /// Time left from `now`; `None` means unbounded.
+    fn remaining_at(self, now: Instant) -> Option<Duration> {
+        self.0
+            .map(|deadline| deadline.saturating_duration_since(now))
+    }
+}
+
+impl From<Instant> for Deadline {
+    fn from(instant: Instant) -> Self {
+        Deadline(Some(instant))
+    }
+}
+
+impl From<Duration> for Deadline {
+    /// Relative timeout starting now. A duration too large for `Instant`
+    /// arithmetic means [`Deadline::NEVER`].
+    fn from(timeout: Duration) -> Self {
+        Deadline(Instant::now().checked_add(timeout))
+    }
+}
+
 /// Clock source used by the std swarm driver.
 ///
 /// The Sans-I/O core remains clockless; the driver reads this clock and passes
@@ -200,8 +252,8 @@ impl<T: Transport> Swarm<T> {
     }
 
     /// Start listening on the given multiaddr and return the resolved local address.
-    pub fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
-        self.transport.listen(addr)
+    pub fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, DriverError> {
+        Ok(self.transport.listen(addr)?)
     }
 
     /// Start listening on the transport's already-bound local addresses.
@@ -210,12 +262,13 @@ impl<T: Transport> Swarm<T> {
     /// `Transport::local_addresses()`. Multi-socket transports such as a
     /// dual-stack QUIC endpoint can therefore advertise every bound address
     /// without forcing callers to pick one.
-    pub fn listen_on_bound_addrs(&mut self) -> Result<Vec<PeerAddr>, TransportError> {
+    pub fn listen_on_bound_addrs(&mut self) -> Result<Vec<PeerAddr>, DriverError> {
         let addrs = self.transport.local_addresses();
         if addrs.is_empty() {
             return Err(TransportError::InvalidConfig {
                 reason: "transport does not expose a bound local address".into(),
-            });
+            }
+            .into());
         }
 
         let mut resolved = Vec::with_capacity(addrs.len());
@@ -235,7 +288,7 @@ impl<T: Transport> Swarm<T> {
     ///
     /// Prefer [`Swarm::listen_on_bound_addrs`] for transports that may bind
     /// more than one socket.
-    pub fn listen_on_bound_addr(&mut self) -> Result<PeerAddr, TransportError> {
+    pub fn listen_on_bound_addr(&mut self) -> Result<PeerAddr, DriverError> {
         let addr = self
             .transport
             .local_addresses()
@@ -245,14 +298,18 @@ impl<T: Transport> Swarm<T> {
                 reason: "transport does not expose a bound local address".into(),
             })?;
         let addr = self.transport.listen(&addr)?;
-        PeerAddr::new(addr, self.local_peer_id.clone()).map_err(|e| TransportError::InvalidConfig {
-            reason: format!("failed to build local PeerAddr: {e}"),
-        })
+        Ok(
+            PeerAddr::new(addr, self.local_peer_id.clone()).map_err(|e| {
+                TransportError::InvalidConfig {
+                    reason: format!("failed to build local PeerAddr: {e}"),
+                }
+            })?,
+        )
     }
 
     /// Dial a remote peer. The transport allocates the connection id.
-    pub fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
-        self.transport.dial(addr)
+    pub fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, DriverError> {
+        Ok(self.transport.dial(addr)?)
     }
 
     /// Pings a peer, sending a random 32-byte payload and measuring RTT.
@@ -279,10 +336,10 @@ impl<T: Transport> Swarm<T> {
     ///
     /// The protocol must have been registered via
     /// [`Swarm::add_protocol`] first. When negotiation completes the
-    /// [`SwarmEvent::UserStreamReady`] event fires with the allocated
+    /// [`SwarmEvent::StreamReady`] event fires with the allocated
     /// stream id; subsequent stream data arrives as
-    /// [`SwarmEvent::UserStreamData`].
-    pub fn open_user_stream(
+    /// [`SwarmEvent::StreamData`].
+    pub fn open_stream(
         &mut self,
         peer_id: &PeerId,
         protocol_id: &str,
@@ -297,7 +354,7 @@ impl<T: Transport> Swarm<T> {
         // the transport.open_stream call happens synchronously and we can
         // return the allocated StreamId to the caller (for DX symmetry
         // with the previous API).
-        self.core.open_user_stream(peer_id, protocol_id)?;
+        self.core.open_stream(peer_id, protocol_id)?;
 
         // Flush all actions, capturing the stream id allocated for this
         // user-protocol open. We inspect actions as we execute them.
@@ -336,40 +393,40 @@ impl<T: Transport> Swarm<T> {
             return Err(DriverError::Transport(error));
         }
         allocated_stream.ok_or(DriverError::Invariant {
-            reason: "core did not allocate a stream id for open_user_stream",
+            reason: "core did not allocate a stream id for open_stream",
         })
     }
 
     /// Sends raw bytes on a negotiated user stream.
-    pub fn send_user_stream(
+    pub fn send_stream(
         &mut self,
         peer_id: &PeerId,
         stream_id: StreamId,
         data: Vec<u8>,
     ) -> Result<(), DriverError> {
-        self.core.send_user_stream(peer_id, stream_id, data)?;
+        self.core.send_stream(peer_id, stream_id, data)?;
         self.flush_actions();
         Ok(())
     }
 
     /// Half-closes the write side of a user stream.
-    pub fn close_user_stream_write(
+    pub fn close_stream_write(
         &mut self,
         peer_id: &PeerId,
         stream_id: StreamId,
     ) -> Result<(), DriverError> {
-        self.core.close_user_stream_write(peer_id, stream_id)?;
+        self.core.close_stream_write(peer_id, stream_id)?;
         self.flush_actions();
         Ok(())
     }
 
     /// Resets (abruptly closes) a user stream.
-    pub fn reset_user_stream(
+    pub fn reset_stream(
         &mut self,
         peer_id: &PeerId,
         stream_id: StreamId,
     ) -> Result<(), DriverError> {
-        self.core.reset_user_stream(peer_id, stream_id)?;
+        self.core.reset_stream(peer_id, stream_id)?;
         self.flush_actions();
         Ok(())
     }
@@ -380,7 +437,7 @@ impl<T: Transport> Swarm<T> {
     /// Most event-loop code can be simpler to write against
     /// [`Swarm::poll_next`] or [`Swarm::run_until`], which internally
     /// call this in a sleep/poll loop and return one event at a time.
-    pub fn poll(&mut self) -> Result<Vec<SwarmEvent>, TransportError> {
+    pub fn poll(&mut self) -> Result<Vec<SwarmEvent>, DriverError> {
         let now_ms = self.now_ms();
 
         // 0. Refresh the core's snapshot of our listening addresses so
@@ -422,7 +479,11 @@ impl<T: Transport> Swarm<T> {
     /// Makes single-event CLIs and scripts much easier to write than the
     /// raw [`Swarm::poll`] loop: no sleep-then-match-all-events
     /// boilerplate.
-    pub fn poll_next(&mut self, deadline: Instant) -> Result<Option<SwarmEvent>, TransportError> {
+    pub fn poll_next(
+        &mut self,
+        deadline: impl Into<Deadline>,
+    ) -> Result<Option<SwarmEvent>, DriverError> {
+        let deadline = deadline.into();
         loop {
             if let Some(ev) = self.event_buffer.pop_front() {
                 return Ok(Some(ev));
@@ -436,12 +497,12 @@ impl<T: Transport> Swarm<T> {
                 return Ok(Some(ev));
             }
             let now = Instant::now();
-            if now >= deadline {
+            if deadline.is_expired_at(now) {
                 return Ok(None);
             }
             // Budget: never sleep past the caller's deadline or the
             // transport's next protocol timer.
-            let mut budget = deadline.saturating_duration_since(now);
+            let mut budget = deadline.remaining_at(now).unwrap_or(MAX_IDLE_WAIT);
             if let Some(timeout) = self.transport.next_timeout() {
                 budget = budget.min(timeout);
             }
@@ -473,19 +534,20 @@ impl<T: Transport> Swarm<T> {
     /// cannot livelock an expired wait.
     pub fn run_until<F>(
         &mut self,
-        deadline: Instant,
+        deadline: impl Into<Deadline>,
         mut predicate: F,
-    ) -> Result<Option<SwarmEvent>, TransportError>
+    ) -> Result<Option<SwarmEvent>, DriverError>
     where
         F: FnMut(&SwarmEvent) -> bool,
     {
+        let deadline = deadline.into();
         let mut skipped = VecDeque::new();
         let mut result = Ok(None);
 
         // Phase 1: before the deadline, wait for fresh events normally.
         // `poll_next` sleeps between transport polls with a bounded budget.
         let mut polled_past_deadline = false;
-        while Instant::now() < deadline {
+        while !deadline.is_expired_at(Instant::now()) {
             match self.poll_next(deadline) {
                 Err(error) => {
                     result = Err(error);
@@ -571,10 +633,10 @@ impl<T: Transport> Swarm<T> {
     /// Executes a single action against the transport and feeds any result
     /// back into the core.
     ///
-    /// `captured_stream_id` is used by [`Swarm::open_user_stream`] to
+    /// `captured_stream_id` is used by [`Swarm::open_stream`] to
     /// synchronously recover the stream id for the caller. The driver
     /// remembers the **last** stream id allocated during the flush, which
-    /// is accurate because `open_user_stream` triggers exactly one
+    /// is accurate because `open_stream` triggers exactly one
     /// `OpenStream` action per call.
     fn dispatch_action(
         &mut self,
@@ -837,6 +899,46 @@ mod tests {
     }
 
     #[test]
+    fn deadline_conversions_cover_instant_duration_and_never() {
+        // A relative Duration lands in the future.
+        let relative: Deadline = Duration::from_secs(1).into();
+        assert!(!relative.is_expired_at(Instant::now()));
+        assert!(relative.remaining_at(Instant::now()).is_some());
+
+        // A Duration too large for Instant arithmetic degrades to NEVER.
+        let unbounded: Deadline = Duration::MAX.into();
+        assert_eq!(unbounded, Deadline::NEVER);
+
+        // NEVER neither expires nor bounds the wait budget.
+        assert!(!Deadline::NEVER.is_expired_at(Instant::now()));
+        assert_eq!(Deadline::NEVER.remaining_at(Instant::now()), None);
+
+        // An Instant behaves as an absolute deadline.
+        let past = Deadline::at(Instant::now());
+        assert!(past.is_expired_at(Instant::now() + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn poll_next_with_never_deadline_returns_buffered_event() {
+        let peer_id = Ed25519Keypair::generate().peer_id();
+        let mut swarm = idle_swarm();
+        swarm
+            .event_buffer
+            .push_back(SwarmEvent::ConnectionEstablished {
+                peer_id: peer_id.clone(),
+            });
+
+        let event = swarm
+            .poll_next(Deadline::NEVER)
+            .expect("poll")
+            .expect("buffered event");
+        assert!(matches!(
+            event,
+            SwarmEvent::ConnectionEstablished { peer_id: p } if p == peer_id
+        ));
+    }
+
+    #[test]
     fn run_until_preserves_non_matching_events() {
         let target_peer_id = Ed25519Keypair::generate().peer_id();
         let mut swarm = idle_swarm();
@@ -980,14 +1082,14 @@ mod tests {
     }
 
     #[test]
-    fn user_stream_open_preserves_transport_error_type() {
+    fn stream_open_preserves_transport_error_type() {
         const PROTOCOL: &str = "/test/1.0.0";
         let remote_peer = Ed25519Keypair::generate().peer_id();
         // open_stream call 1 = identify (ok), call 2 = the user's open (fails).
         let mut swarm = connected_swarm(&remote_peer, PROTOCOL, 2);
 
         let error = swarm
-            .open_user_stream(&remote_peer, PROTOCOL)
+            .open_stream(&remote_peer, PROTOCOL)
             .expect_err("transport must reject user stream");
         assert!(matches!(
             error,
@@ -1006,7 +1108,7 @@ mod tests {
     }
 
     #[test]
-    fn user_stream_open_not_misattributed_to_queued_failure() {
+    fn stream_open_not_misattributed_to_queued_failure() {
         const PROTOCOL: &str = "/test/1.0.0";
         let remote_peer = Ed25519Keypair::generate().peer_id();
         // open_stream call 1 = identify (ok), call 2 = the stale queued open
@@ -1018,11 +1120,11 @@ mod tests {
         // arrives.
         swarm
             .core
-            .open_user_stream(&remote_peer, PROTOCOL)
+            .open_stream(&remote_peer, PROTOCOL)
             .expect("queue stale open");
 
         let stream_id = swarm
-            .open_user_stream(&remote_peer, PROTOCOL)
+            .open_stream(&remote_peer, PROTOCOL)
             .expect("the caller's own open succeeds; the stale failure is not its error");
         assert_eq!(stream_id, StreamId::new(3), "caller gets its own stream id");
 

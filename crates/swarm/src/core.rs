@@ -67,8 +67,8 @@ pub const RESERVED_PROTOCOL_IDS: [&str; 2] = [IDENTIFY_PROTOCOL_ID, PING_PROTOCO
 /// Identifies which protocol owns a negotiated stream.
 ///
 /// Kept private; callers refer to protocols by their string ids via
-/// [`SwarmCore::open_user_stream`] and the `protocol_id` fields of
-/// [`SwarmEvent::UserStreamReady`] / [`SwarmEvent::UserStreamData`].
+/// [`SwarmCore::open_stream`] and the `protocol_id` fields of
+/// [`SwarmEvent::StreamReady`] / [`SwarmEvent::StreamData`].
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 enum ProtocolKind {
     Ping,
@@ -204,7 +204,7 @@ impl SwarmCore {
 
     /// Registers an application protocol id that this swarm will accept on
     /// inbound streams and allow for outbound opens via
-    /// [`Self::open_user_stream`].
+    /// [`Self::open_stream`].
     ///
     /// Built-in ids ([`RESERVED_PROTOCOL_IDS`]) are rejected with
     /// [`SwarmError::ReservedProtocol`]: inbound routing gives the built-in
@@ -329,11 +329,7 @@ impl SwarmCore {
     /// Opens a new outbound stream and starts multistream-select negotiation
     /// for `protocol_id`. The actual stream id is not known until the driver
     /// reports back via [`SwarmInput::StreamOpened`].
-    pub fn open_user_stream(
-        &mut self,
-        peer_id: &PeerId,
-        protocol_id: &str,
-    ) -> Result<(), SwarmError> {
+    pub fn open_stream(&mut self, peer_id: &PeerId, protocol_id: &str) -> Result<(), SwarmError> {
         if !self.user_protocols.iter().any(|p| p == protocol_id) {
             return Err(SwarmError::ProtocolNotRegistered {
                 protocol_id: protocol_id.to_string(),
@@ -367,13 +363,13 @@ impl SwarmCore {
     /// Sends raw bytes on a negotiated user stream.
     ///
     /// Emits a `SendStream` action; the driver executes it.
-    pub fn send_user_stream(
+    pub fn send_stream(
         &mut self,
         peer_id: &PeerId,
         stream_id: StreamId,
         data: Vec<u8>,
     ) -> Result<(), SwarmError> {
-        let conn_id = self.require_user_stream_conn(peer_id, stream_id)?;
+        let conn_id = self.require_stream_conn(peer_id, stream_id)?;
         self.actions.push_back(SwarmAction::SendStream {
             conn_id,
             stream_id,
@@ -383,24 +379,24 @@ impl SwarmCore {
     }
 
     /// Half-closes our write side of a user stream.
-    pub fn close_user_stream_write(
+    pub fn close_stream_write(
         &mut self,
         peer_id: &PeerId,
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
-        let conn_id = self.require_user_stream_conn(peer_id, stream_id)?;
+        let conn_id = self.require_stream_conn(peer_id, stream_id)?;
         self.actions
             .push_back(SwarmAction::CloseStreamWrite { conn_id, stream_id });
         Ok(())
     }
 
     /// Resets (abruptly closes) a user stream.
-    pub fn reset_user_stream(
+    pub fn reset_stream(
         &mut self,
         peer_id: &PeerId,
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
-        let conn_id = self.require_user_stream_conn(peer_id, stream_id)?;
+        let conn_id = self.require_stream_conn(peer_id, stream_id)?;
         self.actions
             .push_back(SwarmAction::ResetStream { conn_id, stream_id });
         Ok(())
@@ -611,7 +607,7 @@ impl SwarmCore {
             })
     }
 
-    fn require_user_stream_conn(
+    fn require_stream_conn(
         &self,
         peer_id: &PeerId,
         stream_id: StreamId,
@@ -628,7 +624,7 @@ impl SwarmCore {
                     None
                 }
             })
-            .ok_or_else(|| SwarmError::UserStreamNotFound {
+            .ok_or_else(|| SwarmError::StreamNotFound {
                 peer_id: peer_id.clone(),
                 stream_id,
             })
@@ -920,10 +916,10 @@ impl SwarmCore {
                 }
                 SwarmEvent::IdentifyReceived { peer_id, .. }
                 | SwarmEvent::PingRttMeasured { peer_id, .. }
-                | SwarmEvent::UserStreamReady { peer_id, .. }
-                | SwarmEvent::UserStreamData { peer_id, .. }
-                | SwarmEvent::UserStreamRemoteWriteClosed { peer_id, .. }
-                | SwarmEvent::UserStreamClosed { peer_id, .. } => {
+                | SwarmEvent::StreamReady { peer_id, .. }
+                | SwarmEvent::StreamData { peer_id, .. }
+                | SwarmEvent::StreamRemoteWriteClosed { peer_id, .. }
+                | SwarmEvent::StreamClosed { peer_id, .. } => {
                     if peer_id == old {
                         *peer_id = new.clone();
                     }
@@ -1025,7 +1021,7 @@ impl SwarmCore {
                 // Responder doesn't expect data; ignore.
             }
             ProtocolKind::User(_) => {
-                self.events.push_back(SwarmEvent::UserStreamData {
+                self.events.push_back(SwarmEvent::StreamData {
                     peer_id,
                     stream_id,
                     data,
@@ -1057,7 +1053,7 @@ impl SwarmCore {
             ProtocolKind::IdentifyResponder => {}
             ProtocolKind::User(_) => {
                 self.events
-                    .push_back(SwarmEvent::UserStreamRemoteWriteClosed { peer_id, stream_id });
+                    .push_back(SwarmEvent::StreamRemoteWriteClosed { peer_id, stream_id });
             }
         }
     }
@@ -1083,7 +1079,7 @@ impl SwarmCore {
                 }
                 ProtocolKind::User(_) => {
                     self.events
-                        .push_back(SwarmEvent::UserStreamClosed { peer_id, stream_id });
+                        .push_back(SwarmEvent::StreamClosed { peer_id, stream_id });
                 }
             }
         }
@@ -1365,7 +1361,7 @@ impl SwarmCore {
                 (conn_id, stream_id),
                 ProtocolKind::User(protocol.to_string()),
             );
-            self.events.push_back(SwarmEvent::UserStreamReady {
+            self.events.push_back(SwarmEvent::StreamReady {
                 peer_id,
                 stream_id,
                 protocol_id: protocol.to_string(),
@@ -1428,7 +1424,7 @@ impl SwarmCore {
             }
             ProtocolKind::IdentifyResponder => {}
             ProtocolKind::User(protocol_id) => {
-                self.events.push_back(SwarmEvent::UserStreamReady {
+                self.events.push_back(SwarmEvent::StreamReady {
                     peer_id,
                     stream_id,
                     protocol_id,
@@ -1786,7 +1782,7 @@ mod tests {
     }
 
     #[test]
-    fn user_stream_send_uses_connection_that_owns_stream() {
+    fn stream_send_uses_connection_that_owns_stream() {
         let mut core = test_core();
         let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
         let original_conn = ConnectionId::new(1);
@@ -1801,7 +1797,7 @@ mod tests {
             ProtocolKind::User("/minip2p/test/1.0.0".into()),
         );
 
-        core.send_user_stream(&peer_id, stream_id, b"ok".to_vec())
+        core.send_stream(&peer_id, stream_id, b"ok".to_vec())
             .expect("user stream should be active on original connection");
         let actions = drain_actions(&mut core);
 
@@ -1813,7 +1809,7 @@ mod tests {
     }
 
     #[test]
-    fn superseding_connection_invalidates_old_user_streams() {
+    fn superseding_connection_invalidates_old_streams() {
         let mut core = test_core();
         let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
         let original_conn = ConnectionId::new(10);
@@ -1841,11 +1837,11 @@ mod tests {
         );
 
         let err = core
-            .send_user_stream(&peer_id, stream_id, b"lost".to_vec())
+            .send_stream(&peer_id, stream_id, b"lost".to_vec())
             .expect_err("supersede should remove streams owned by original connection");
         assert!(matches!(
             err,
-            SwarmError::UserStreamNotFound { peer_id: p, stream_id: s }
+            SwarmError::StreamNotFound { peer_id: p, stream_id: s }
                 if p == peer_id && s == stream_id
         ));
     }

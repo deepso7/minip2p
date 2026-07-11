@@ -81,8 +81,7 @@ cargo test
 Build an app endpoint with the top-level facade:
 
 ```rust
-use minip2p::{Endpoint, Event};
-use std::time::{Duration, Instant};
+use minip2p::{Deadline, Endpoint, Event};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut node = Endpoint::builder()
@@ -92,15 +91,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addrs = node.listen_all()?;
     println!("listening on {addrs:?}");
 
-    loop {
-        if let Some(event) = node.next_event(Instant::now() + Duration::from_secs(1))? {
-            println!("{event:?}");
-            if matches!(event, Event::ConnectionEstablished { .. }) {
-                // The endpoint remains entirely caller-driven: keep polling,
-                // or integrate `poll()` and transport deadlines in your host loop.
-            }
+    // `next_event` also accepts an `Instant` or a relative `Duration`
+    // when a wait needs a timeout.
+    while let Some(event) = node.next_event(Deadline::NEVER)? {
+        println!("{event:?}");
+        if matches!(event, Event::ConnectionEstablished { .. }) {
+            // The endpoint remains entirely caller-driven: keep polling,
+            // or integrate `poll()` and transport deadlines in your host loop.
         }
     }
+    Ok(())
 }
 ```
 

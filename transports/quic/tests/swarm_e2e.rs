@@ -247,7 +247,7 @@ fn swarm_user_protocol_round_trip() {
         .expect("register protocol");
     client.dial(&peer_addr).expect("dial");
 
-    let mut user_stream: Option<StreamId> = None;
+    let mut stream: Option<StreamId> = None;
     let mut server_echo_sent = false;
     let mut echo_received: Option<Vec<u8>> = None;
     let payload = b"hello-user-protocol".to_vec();
@@ -257,14 +257,14 @@ fn swarm_user_protocol_round_trip() {
 
         for event in server_events {
             match event {
-                SwarmEvent::UserStreamData {
+                SwarmEvent::StreamData {
                     ref peer_id,
                     stream_id,
                     ref data,
                 } if !server_echo_sent => {
                     // Echo the data back on the same stream.
                     server
-                        .send_user_stream(peer_id, stream_id, data.clone())
+                        .send_stream(peer_id, stream_id, data.clone())
                         .expect("server echo");
                     server_echo_sent = true;
                 }
@@ -278,14 +278,14 @@ fn swarm_user_protocol_round_trip() {
         for event in client_events {
             match event {
                 SwarmEvent::PeerReady { ref peer_id, .. }
-                    if *peer_id == server_peer_id && user_stream.is_none() =>
+                    if *peer_id == server_peer_id && stream.is_none() =>
                 {
                     let sid = client
-                        .open_user_stream(&server_peer_id, USER_PROTOCOL_ID)
+                        .open_stream(&server_peer_id, USER_PROTOCOL_ID)
                         .expect("open user stream");
-                    user_stream = Some(sid);
+                    stream = Some(sid);
                 }
-                SwarmEvent::UserStreamReady {
+                SwarmEvent::StreamReady {
                     ref peer_id,
                     stream_id,
                     ref protocol_id,
@@ -295,10 +295,10 @@ fn swarm_user_protocol_round_trip() {
                     assert_eq!(protocol_id, USER_PROTOCOL_ID);
                     assert!(initiated_locally);
                     client
-                        .send_user_stream(&server_peer_id, stream_id, payload.clone())
+                        .send_stream(&server_peer_id, stream_id, payload.clone())
                         .expect("client send");
                 }
-                SwarmEvent::UserStreamData {
+                SwarmEvent::StreamData {
                     ref peer_id,
                     ref data,
                     ..
@@ -322,7 +322,7 @@ fn swarm_user_protocol_round_trip() {
 }
 
 #[test]
-fn open_user_stream_fails_fast_when_peer_did_not_advertise_protocol() {
+fn open_stream_fails_fast_when_peer_did_not_advertise_protocol() {
     let mut server = make_swarm(Ed25519Keypair::generate());
     let peer_addr = server.listen_on_bound_addr().expect("server listen");
     let server_peer_id = peer_addr.peer_id().clone();
@@ -345,7 +345,7 @@ fn open_user_stream_fails_fast_when_peer_did_not_advertise_protocol() {
 
     assert!(client.is_peer_ready(&server_peer_id));
     let err = client
-        .open_user_stream(&server_peer_id, USER_PROTOCOL_ID)
+        .open_stream(&server_peer_id, USER_PROTOCOL_ID)
         .expect_err("unsupported user protocol should fail synchronously");
     assert!(
         matches!(

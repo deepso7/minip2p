@@ -41,25 +41,25 @@ pub enum SwarmEvent {
     /// A user-registered protocol was successfully negotiated on a stream.
     /// `initiated_locally` is `true` when we opened the stream and `false`
     /// when the remote peer did.
-    UserStreamReady {
+    StreamReady {
         peer_id: PeerId,
         stream_id: StreamId,
         protocol_id: String,
         initiated_locally: bool,
     },
     /// Raw data arrived on a negotiated user stream.
-    UserStreamData {
+    StreamData {
         peer_id: PeerId,
         stream_id: StreamId,
         data: Vec<u8>,
     },
     /// The remote closed its write side on a user stream.
-    UserStreamRemoteWriteClosed {
+    StreamRemoteWriteClosed {
         peer_id: PeerId,
         stream_id: StreamId,
     },
     /// A user stream was fully closed.
-    UserStreamClosed {
+    StreamClosed {
         peer_id: PeerId,
         stream_id: StreamId,
     },
@@ -232,7 +232,7 @@ pub enum SwarmError {
     /// A caller tried to use a user stream that is not currently negotiated
     /// for the requested peer.
     #[error("user stream {stream_id} for peer {peer_id} is not active")]
-    UserStreamNotFound {
+    StreamNotFound {
         /// Peer the caller expected the stream to belong to.
         peer_id: PeerId,
         /// Stream id supplied by the caller.

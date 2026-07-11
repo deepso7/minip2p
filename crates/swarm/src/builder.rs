@@ -245,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_registers_for_user_stream_routing() {
+    fn protocol_registers_for_stream_routing() {
         let keypair = Ed25519Keypair::generate();
         let mut swarm = SwarmBuilder::new(&keypair)
             .protocol(PROTOCOL)
@@ -256,11 +256,11 @@ mod tests {
         // ProtocolNotRegistered -- proving registration reached the core.
         let peer_id = Ed25519Keypair::generate().peer_id();
         assert!(matches!(
-            swarm.open_user_stream(&peer_id, PROTOCOL),
+            swarm.open_stream(&peer_id, PROTOCOL),
             Err(DriverError::Swarm(SwarmError::NotConnected { .. }))
         ));
         assert!(matches!(
-            swarm.open_user_stream(&peer_id, "/other/1.0.0"),
+            swarm.open_stream(&peer_id, "/other/1.0.0"),
             Err(DriverError::Swarm(SwarmError::ProtocolNotRegistered { .. }))
         ));
     }
