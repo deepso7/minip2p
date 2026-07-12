@@ -24,6 +24,7 @@ Sans-I/O core crates (`no_std + alloc`):
 - `crates/autonat` (`minip2p-autonat`): AutoNAT reachability probe state machines.
 - `crates/dcutr` (`minip2p-dcutr`): DCUtR hole-punch coordination state machines (`DcutrInitiator`, `DcutrResponder`).
 - `crates/swarm` (`minip2p-swarm`): `SwarmCore` Sans-I/O orchestrator that composes the protocol state machines, tracks connections and streams, drives multistream-select, and emits actions/events for the driver.
+- `crates/nat` (`minip2p-nat`): `NatAgent` Sans-I/O NAT-traversal orchestrator — races direct dials against a relayed circuit, hole-punches with DCUtR over the bridge, and reports explicit path establish/upgrade/fallback events.
 
 Runtime adapters (`std`):
 
@@ -124,7 +125,7 @@ Check `no_std` builds for the core crates:
 cargo check --no-default-features -p minip2p-core -p minip2p-identity \
     -p minip2p-transport -p minip2p-tls -p minip2p-identify \
     -p minip2p-multistream-select -p minip2p-ping -p minip2p-relay \
-    -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm
+    -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm -p minip2p-nat
 ```
 
 ## Documentation

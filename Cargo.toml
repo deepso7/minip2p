@@ -9,6 +9,7 @@ members = [
     "crates/identity",
     "crates/minip2p",
     "crates/multistream-select",
+    "crates/nat",
     "crates/ping",
     "crates/relay",
     "crates/swarm",
