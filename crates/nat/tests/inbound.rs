@@ -142,8 +142,10 @@ fn sync_coalesced_with_application_data_preserves_the_bridge_remainder() {
 
 #[test]
 fn zero_blast_interval_is_clamped_to_one_millisecond() {
-    let mut config = NatConfig::default();
-    config.blast_interval_ms = 0;
+    let config = NatConfig {
+        blast_interval_ms: 0,
+        ..NatConfig::default()
+    };
     let mut h = inbound_harness(config);
     let stream = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stream, 0);
