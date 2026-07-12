@@ -40,6 +40,9 @@ pub(crate) struct InboundCircuit {
     stop: Option<StopResponder>,
     dcutr: Option<DcutrResponder>,
     remote_addrs: Vec<Multiaddr>,
+    /// Application bytes received after the final DCUtR SYNC frame in the
+    /// same stream read. These must accompany the raw bridge handoff.
+    pending_data: Vec<u8>,
     /// Deadline for the STOP + DCUtR exchange to finish; after it the
     /// bridge is released to the app punch-less rather than abandoned.
     exchange_deadline: u64,
@@ -62,6 +65,7 @@ impl InboundCircuit {
             stop: Some(StopResponder::new()),
             dcutr: None,
             remote_addrs: Vec::new(),
+            pending_data: Vec::new(),
             exchange_deadline: now.mono_ms + shared.config.relay_leg_deadline_ms,
             blast: None,
             linger_until: None,
@@ -110,7 +114,17 @@ impl InboundCircuit {
                     self.on_bridge_data(data, shared, now);
                 }
             }
-            StreamInput::Closed | StreamInput::RemoteWriteClosed => {
+            StreamInput::RemoteWriteClosed => {
+                // A peer can stop sending while the local write half remains
+                // usable. Let the protocol parser consume that boundary and
+                // retain the circuit until its normal exchange deadline.
+                if self.source.is_none() {
+                    self.on_stop_input(StopResponderInput::RemoteWriteClosed, shared, now);
+                } else {
+                    self.on_dcutr_input(DcutrResponderInput::RemoteWriteClosed, shared, now);
+                }
+            }
+            StreamInput::Closed => {
                 // The circuit died before the app took over.
                 self.abandon(shared, false);
             }
@@ -121,13 +135,14 @@ impl InboundCircuit {
     /// Feeds bytes into the STOP responder until the CONNECT request is
     /// decoded, then auto-accepts and starts the DCUtR responder.
     fn on_stop_data(&mut self, data: &[u8], shared: &mut Shared, now: Now) {
+        self.on_stop_input(StopResponderInput::Data(data.to_vec()), shared, now);
+    }
+
+    fn on_stop_input(&mut self, input: StopResponderInput, shared: &mut Shared, now: Now) {
         let Some(stop) = self.stop.as_mut() else {
             return;
         };
-        if stop
-            .handle_input(StopResponderInput::Data(data.to_vec()))
-            .is_err()
-        {
+        if stop.handle_input(input).is_err() {
             self.abandon(shared, true);
             return;
         }
@@ -197,13 +212,14 @@ impl InboundCircuit {
 
     /// Feeds bridge bytes into the DCUtR responder.
     fn on_bridge_data(&mut self, data: &[u8], shared: &mut Shared, now: Now) {
+        self.on_dcutr_input(DcutrResponderInput::Data(data.to_vec()), shared, now);
+    }
+
+    fn on_dcutr_input(&mut self, input: DcutrResponderInput, shared: &mut Shared, now: Now) {
         let Some(dcutr) = self.dcutr.as_mut() else {
             return;
         };
-        if dcutr
-            .handle_input(DcutrResponderInput::Data(data.to_vec()))
-            .is_err()
-        {
+        if dcutr.handle_input(input).is_err() {
             // The punch cannot proceed (malformed exchange or our own
             // oversized reply), but the bridge itself is fine: hand it to
             // the app without punching.
@@ -215,6 +231,7 @@ impl InboundCircuit {
         while let Some(output) = dcutr.poll_output() {
             outputs.push(output);
         }
+        let mut sync_received = false;
         for output in outputs {
             match output {
                 DcutrResponderOutput::Outbound(bytes) => {
@@ -232,9 +249,13 @@ impl InboundCircuit {
                         select_direct_candidates(&remote_addrs, None, None).into_addrs();
                 }
                 DcutrResponderOutput::Event(ResponderEvent::SyncReceived) => {
-                    self.on_sync(shared, now);
+                    sync_received = true;
                 }
             }
+        }
+        if sync_received {
+            self.pending_data = dcutr.take_trailing_data();
+            self.on_sync(shared, now);
         }
     }
 
@@ -284,10 +305,7 @@ impl InboundCircuit {
             shared.push_event(NatEvent::InboundRelayCircuit {
                 peer: source.clone(),
                 stream_id: self.stream,
-                // Bytes coalesced behind the SYNC frame inside one read are
-                // consumed by the DCUtR machine; in practice application
-                // data starts in later packets.
-                pending_data: Vec::new(),
+                pending_data: core::mem::take(&mut self.pending_data),
             });
         }
         if self.blast.is_none() && self.linger_until.is_none() {
@@ -312,6 +330,8 @@ impl InboundCircuit {
             }
         }
         if let Some(blast) = &mut self.blast {
+            let interval = shared.config.blast_interval_ms.max(1);
+            let mut exhausted = false;
             while now.mono_ms >= blast.next_at && blast.next_at <= blast.until {
                 for addr in &blast.addrs {
                     shared.push_action(NatAction::SendRandomUdp {
@@ -319,9 +339,15 @@ impl InboundCircuit {
                         payload_len: shared.config.blast_payload_len,
                     });
                 }
-                blast.next_at += shared.config.blast_interval_ms;
+                match blast.next_at.checked_add(interval) {
+                    Some(next_at) => blast.next_at = next_at,
+                    None => {
+                        exhausted = true;
+                        break;
+                    }
+                }
             }
-            if now.mono_ms >= blast.until {
+            if now.mono_ms >= blast.until || exhausted {
                 self.blast = None;
             }
         }

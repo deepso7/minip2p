@@ -43,9 +43,8 @@ pub struct Endpoint {
     swarm: Swarm<QuicEndpoint>,
     #[cfg(feature = "nat")]
     nat: Option<nat::NatDriver>,
-    /// Application events set aside while a NAT-focused wait
-    /// (`Endpoint::wait_path`, `Endpoint::next_nat_event`) was driving
-    /// the endpoint; drained first by [`Endpoint::next_event`].
+    /// Application events set aside while a NAT-aware wait was driving the
+    /// endpoint; drained first by [`Endpoint::next_event`].
     #[cfg(feature = "nat")]
     pending_events: std::collections::VecDeque<Event>,
 }
@@ -222,10 +221,19 @@ impl Endpoint {
     /// waits.
     #[cfg(feature = "nat")]
     fn next_event_with_nat(&mut self, deadline: Deadline) -> Result<Option<Event>, Error> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(Some(event));
+        }
+        self.poll_new_event_with_nat(deadline)
+    }
+
+    /// Drives the swarm and NAT agent until a newly-arrived application
+    /// event is available. Unlike [`Self::next_event_with_nat`], this never
+    /// drains `pending_events`: NAT-focused waits must leave application
+    /// events aside instead of repeatedly picking up the same one.
+    #[cfg(feature = "nat")]
+    fn poll_new_event_with_nat(&mut self, deadline: Deadline) -> Result<Option<Event>, Error> {
         loop {
-            if let Some(event) = self.pending_events.pop_front() {
-                return Ok(Some(event));
-            }
             let step = {
                 let nat = self.nat.as_ref().expect("nat checked by caller");
                 match nat.agent.next_timeout(nat.now().mono_ms) {
@@ -262,6 +270,13 @@ impl Endpoint {
         peer_id: &PeerId,
         deadline: impl Into<Deadline>,
     ) -> Result<Option<Event>, Error> {
+        let deadline = deadline.into();
+        #[cfg(feature = "nat")]
+        if self.nat.is_some() {
+            return self.wait_for_event_with_nat(deadline, |event| {
+                matches!(event, Event::PeerReady { peer_id: ready, .. } if ready == peer_id)
+            });
+        }
         self.swarm.run_until(
             deadline,
             |event| matches!(event, Event::PeerReady { peer_id: ready, .. } if ready == peer_id),
@@ -274,6 +289,18 @@ impl Endpoint {
         peer_id: &PeerId,
         deadline: impl Into<Deadline>,
     ) -> Result<Option<u64>, Error> {
+        let deadline = deadline.into();
+        #[cfg(feature = "nat")]
+        let event = if self.nat.is_some() {
+            self.wait_for_event_with_nat(deadline, |event| {
+                matches!(event, Event::PingRttMeasured { peer_id: ready, .. } if ready == peer_id)
+            })?
+        } else {
+            self.swarm.run_until(deadline, |event| {
+                matches!(event, Event::PingRttMeasured { peer_id: ready, .. } if ready == peer_id)
+            })?
+        };
+        #[cfg(not(feature = "nat"))]
         let event = self.swarm.run_until(deadline, |event| {
             matches!(event, Event::PingRttMeasured { peer_id: ready, .. } if ready == peer_id)
         })?;
@@ -372,7 +399,7 @@ impl Endpoint {
                     return Ok(None);
                 }
             }
-            match self.next_event_with_nat(deadline)? {
+            match self.poll_new_event_with_nat(deadline)? {
                 Some(event) => self.pending_events.push_back(event),
                 None => return Ok(None),
             }
@@ -406,7 +433,31 @@ impl Endpoint {
                 }
                 None => return Ok(None),
             }
-            match self.next_event_with_nat(deadline)? {
+            match self.poll_new_event_with_nat(deadline)? {
+                Some(event) => self.pending_events.push_back(event),
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// NAT-aware equivalent of `Swarm::run_until`. Every swarm event goes
+    /// through `NatDriver::ingest`, and non-matching application events are
+    /// retained for [`Endpoint::next_event`].
+    #[cfg(feature = "nat")]
+    fn wait_for_event_with_nat<F>(
+        &mut self,
+        deadline: Deadline,
+        mut predicate: F,
+    ) -> Result<Option<Event>, Error>
+    where
+        F: FnMut(&Event) -> bool,
+    {
+        if let Some(index) = self.pending_events.iter().position(&mut predicate) {
+            return Ok(self.pending_events.remove(index));
+        }
+        loop {
+            match self.poll_new_event_with_nat(deadline)? {
+                Some(event) if predicate(&event) => return Ok(Some(event)),
                 Some(event) => self.pending_events.push_back(event),
                 None => return Ok(None),
             }
@@ -660,6 +711,8 @@ fn build_endpoint(parts: BuilderParts, transport: QuicEndpoint) -> Result<Endpoi
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "nat")]
+    use std::time::Duration;
 
     const PROTOCOL: &str = "/myapp/1.0.0";
 
@@ -729,5 +782,60 @@ mod tests {
         endpoint
             .add_protocol(PROTOCOL)
             .expect("application ids must be accepted");
+    }
+
+    #[cfg(feature = "nat")]
+    #[test]
+    fn nat_focused_waits_do_not_repoll_buffered_application_events() {
+        let mut endpoint = Endpoint::builder()
+            .nat_config(NatConfig::default())
+            .bind_quic("127.0.0.1:0")
+            .expect("bind endpoint");
+        let unrelated = Ed25519Keypair::generate().peer_id();
+
+        endpoint.pending_events.push_back(Event::ConnectionClosed {
+            peer_id: unrelated.clone(),
+        });
+        assert!(
+            endpoint
+                .next_nat_event(Duration::from_millis(5))
+                .expect("NAT wait")
+                .is_none(),
+            "a buffered application event must not make next_nat_event spin"
+        );
+        assert!(matches!(
+            endpoint
+                .next_event(Duration::from_millis(1))
+                .expect("drain buffered event"),
+            Some(Event::ConnectionClosed { peer_id }) if peer_id == unrelated
+        ));
+
+        let id = endpoint
+            .connect(&Ed25519Keypair::generate().peer_id())
+            .expect("connect");
+        // This no-candidate attempt fails synchronously. Remove the failure
+        // to exercise the timeout path with a live ConnectId.
+        endpoint
+            .nat
+            .as_mut()
+            .expect("NAT configured")
+            .events
+            .clear();
+        endpoint.pending_events.push_back(Event::ConnectionClosed {
+            peer_id: unrelated.clone(),
+        });
+        assert!(
+            endpoint
+                .wait_path(id, Duration::from_millis(5))
+                .expect("path wait")
+                .is_none(),
+            "a buffered application event must not make wait_path spin"
+        );
+        assert!(matches!(
+            endpoint
+                .next_event(Duration::from_millis(1))
+                .expect("drain buffered event"),
+            Some(Event::ConnectionClosed { peer_id }) if peer_id == unrelated
+        ));
     }
 }

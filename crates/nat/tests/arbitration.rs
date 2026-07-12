@@ -15,8 +15,8 @@ use minip2p_transport::{ConnectionId, StreamId};
 /// relay leg up to `Bridged`: direct dial at t0, stagger, relay dial, HOP
 /// open/negotiate/CONNECT, STATUS:OK at t0+300.
 ///
-/// Leaves the `PathEstablished(Relayed)` event and the DCUtR CONNECT send
-/// action queued for the caller to drain.
+/// Leaves the DCUtR CONNECT send action queued for the caller to drain. The
+/// relay stream remains agent-owned until DCUtR has sent SYNC.
 fn drive_to_bridged(h: &mut Harness, t0: u64) -> (ConnectId, StreamId) {
     let id = h
         .agent
@@ -49,7 +49,7 @@ fn drive_to_bridged(h: &mut Harness, t0: u64) -> (ConnectId, StreamId) {
 }
 
 /// Continues a bridged attempt through the DCUtR reply: punch dial + SYNC
-/// go out and the bridge is handed back to the application.
+/// go out, then the bridge is handed back to the application and announced.
 fn drive_to_sync(h: &mut Harness, stream: StreamId, now_ms: u64) -> Vec<NatAction> {
     h.stream_data(
         stream,
@@ -67,6 +67,12 @@ fn drive_to_sync(h: &mut Harness, stream: StreamId, now_ms: u64) -> Vec<NatActio
         !h.agent.owns_stream(&h.relay, stream),
         "bridge belongs to the app once SYNC is out"
     );
+    let events = drain_events(&mut h.agent);
+    assert!(matches!(
+        events.as_slice(),
+        [NatEvent::PathEstablished { path: Path::Relayed { stream_id, .. }, .. }]
+            if *stream_id == stream
+    ));
     actions
 }
 
@@ -148,16 +154,12 @@ fn no_direct_candidates_skip_the_stagger() {
 }
 
 #[test]
-fn relayed_path_upgrades_to_punched_direct() {
+fn relayed_path_upgrades_to_direct_without_misattribution() {
     let mut h = Harness::with_relay(NatConfig::default());
     let (id, stream) = drive_to_bridged(&mut h, 0);
 
-    let events = drain_events(&mut h.agent);
-    assert!(matches!(
-        events.as_slice(),
-        [NatEvent::PathEstablished { connect_id, path: Path::Relayed { stream_id, .. }, .. }]
-            if *connect_id == id && *stream_id == stream
-    ));
+    assert!(drain_events(&mut h.agent).is_empty());
+    assert!(h.agent.owns_stream(&h.relay, stream));
     let actions = drain_actions(&mut h.agent);
     assert_eq!(
         send_stream_count(&actions),
@@ -175,7 +177,7 @@ fn relayed_path_upgrades_to_punched_direct() {
         [NatEvent::PathUpgraded {
             connect_id,
             from: Path::Relayed { .. },
-            to: Path::DirectPunched,
+            to: Path::DirectDialed,
             ..
         }] if *connect_id == id
     ));
@@ -188,10 +190,129 @@ fn relayed_path_upgrades_to_punched_direct() {
 }
 
 #[test]
+fn already_connected_peer_is_reported_without_starting_a_race() {
+    let mut h = Harness::without_relay(NatConfig::default());
+    h.target_connected(at(0));
+    let id = h.agent.connect(h.target.clone(), Vec::new(), at(1));
+
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::PathEstablished { connect_id, peer, path: Path::DirectDialed }]
+            if *connect_id == id && *peer == h.target
+    ));
+    assert!(drain_actions(&mut h.agent).is_empty());
+    assert!(h.agent.is_idle());
+}
+
+#[test]
+fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
+    let mut h = Harness::without_relay(NatConfig::default());
+    let attacker = peer(b"untrusted-peer");
+    let stream = StreamId::new(88);
+    h.agent.handle_event(
+        &SwarmEvent::StreamReady {
+            peer_id: attacker.clone(),
+            stream_id: stream,
+            protocol_id: minip2p_relay::STOP_PROTOCOL_ID.to_string(),
+            initiated_locally: false,
+        },
+        at(0),
+    );
+
+    assert!(!h.agent.owns_stream(&attacker, stream));
+    h.agent.handle_event(
+        &SwarmEvent::StreamData {
+            peer_id: attacker,
+            stream_id: stream,
+            data: stop_connect(&h.target),
+        },
+        at(1),
+    );
+    assert!(drain_actions(&mut h.agent).is_empty());
+    assert!(drain_events(&mut h.agent).is_empty());
+}
+
+#[test]
+fn remote_write_close_during_dcutr_is_not_a_full_bridge_close() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (_, stream) = drive_to_bridged(&mut h, 0);
+    drain_actions(&mut h.agent);
+
+    h.agent.handle_event(
+        &SwarmEvent::StreamRemoteWriteClosed {
+            peer_id: h.relay.clone(),
+            stream_id: stream,
+        },
+        at(310),
+    );
+
+    assert!(h.agent.owns_stream(&h.relay, stream));
+    assert!(drain_actions(&mut h.agent).is_empty());
+    assert!(drain_events(&mut h.agent).is_empty());
+}
+
+#[test]
+fn bridge_close_before_dcutr_finishes_waits_for_live_direct_dials() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, stream) = drive_to_bridged(&mut h, 0);
+    drain_actions(&mut h.agent);
+
+    h.agent.handle_event(
+        &SwarmEvent::StreamClosed {
+            peer_id: h.relay.clone(),
+            stream_id: stream,
+        },
+        at(310),
+    );
+    assert!(drain_events(&mut h.agent).is_empty());
+
+    h.target_connected(at(320));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::PathEstablished { connect_id, path: Path::DirectDialed, .. }]
+            if *connect_id == id
+    ));
+}
+
+#[test]
+fn released_bridge_close_cannot_be_reported_as_a_relay_fallback() {
+    let mut h = Harness::with_relay(NatConfig {
+        punch_max_retries: 0,
+        ..NatConfig::default()
+    });
+    let (id, stream) = drive_to_bridged(&mut h, 0);
+    drain_actions(&mut h.agent);
+    drive_to_sync(&mut h, stream, 350);
+
+    // The raw stream is application-owned, but the agent still observes its
+    // terminal event to keep the direct-upgrade race honest.
+    h.agent.handle_event(
+        &SwarmEvent::StreamClosed {
+            peer_id: h.relay.clone(),
+            stream_id: stream,
+        },
+        at(400),
+    );
+    h.agent.handle_tick(at(3_350));
+    let events = drain_events(&mut h.agent);
+    assert!(matches!(
+        events.as_slice(),
+        [
+            NatEvent::HolePunchFailed { .. },
+            NatEvent::ConnectFailed { connect_id, .. },
+        ] if *connect_id == id
+    ));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, NatEvent::FellBackToRelay { .. }))
+    );
+}
+
+#[test]
 fn punch_exhaustion_falls_back_to_the_relay() {
     let mut h = Harness::with_relay(NatConfig::default());
     let (id, stream) = drive_to_bridged(&mut h, 0);
-    drain_events(&mut h.agent);
     drain_actions(&mut h.agent);
     drive_to_sync(&mut h, stream, 350);
 

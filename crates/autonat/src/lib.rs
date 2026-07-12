@@ -126,6 +126,9 @@ pub enum AutoNatClientInput {
     Flush,
     /// Bytes received from the AutoNAT service stream.
     Data(Vec<u8>),
+    /// Remote write side closed. The local side remains usable; this lets the
+    /// client finish decoding any buffered response bytes.
+    RemoteWriteClosed,
 }
 
 /// Output produced by [`AutoNatClient`] through [`SansIoProtocol`].
@@ -301,6 +304,11 @@ impl AutoNatClient {
         self.try_decode_response()
     }
 
+    /// Notifies the client that the remote write half has closed.
+    fn on_remote_write_closed(&mut self) -> Result<(), AutoNatError> {
+        self.try_decode_response()
+    }
+
     /// Returns the reachability outcome, if available.
     #[cfg(test)]
     fn outcome(&self) -> Option<&Reachability> {
@@ -450,6 +458,7 @@ impl SansIoProtocol for AutoNatClient {
         match input {
             AutoNatClientInput::Flush => {}
             AutoNatClientInput::Data(data) => self.on_data(&data)?,
+            AutoNatClientInput::RemoteWriteClosed => self.on_remote_write_closed()?,
         }
         Ok(())
     }

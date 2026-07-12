@@ -93,6 +93,10 @@ pub(crate) struct Shared {
     pub(crate) connected: BTreeSet<PeerId>,
     /// Peers that reached `PeerReady`, with their advertised protocols.
     pub(crate) ready: BTreeMap<PeerId, Vec<String>>,
+    /// Bridges released to the application but still participating in a
+    /// direct-upgrade race. Data on these streams belongs to the app; only a
+    /// terminal close is routed back to the owning attempt.
+    released_bridges: BTreeMap<PeerId, BTreeMap<StreamId, ConnectId>>,
     /// Our validated external/listen addresses, advertised in DCUtR CONNECT.
     pub(crate) listen_addrs: Vec<Multiaddr>,
 }
@@ -129,6 +133,41 @@ impl Shared {
                 self.registry.remove(peer);
             }
         }
+    }
+
+    pub(crate) fn track_released_bridge(
+        &mut self,
+        peer: &PeerId,
+        stream: StreamId,
+        attempt: ConnectId,
+    ) {
+        self.released_bridges
+            .entry(peer.clone())
+            .or_default()
+            .insert(stream, attempt);
+    }
+
+    pub(crate) fn take_released_bridge(
+        &mut self,
+        peer: &PeerId,
+        stream: StreamId,
+    ) -> Option<ConnectId> {
+        let attempt = self
+            .released_bridges
+            .get_mut(peer)
+            .and_then(|streams| streams.remove(&stream));
+        if self
+            .released_bridges
+            .get(peer)
+            .is_some_and(BTreeMap::is_empty)
+        {
+            self.released_bridges.remove(peer);
+        }
+        attempt
+    }
+
+    pub(crate) fn forget_released_bridge(&mut self, peer: &PeerId, stream: StreamId) {
+        let _ = self.take_released_bridge(peer, stream);
     }
 }
 
@@ -169,6 +208,7 @@ impl NatAgent {
                 next_token: 0,
                 connected: BTreeSet::new(),
                 ready: BTreeMap::new(),
+                released_bridges: BTreeMap::new(),
                 listen_addrs: Vec::new(),
             },
             attempts: BTreeMap::new(),
@@ -194,6 +234,17 @@ impl NatAgent {
     pub fn connect(&mut self, peer: PeerId, direct_addrs: Vec<Multiaddr>, now: Now) -> ConnectId {
         let id = ConnectId(self.next_connect_id);
         self.next_connect_id += 1;
+        // A connection that is already identity-verified is the best path
+        // available. Do not manufacture a new race which can only waste
+        // work (and, with no candidates or relay, falsely report failure).
+        if self.shared.connected.contains(&peer) {
+            self.shared.push_event(NatEvent::PathEstablished {
+                connect_id: id,
+                peer,
+                path: crate::types::Path::DirectDialed,
+            });
+            return id;
+        }
         if let Some(attempt) = ConnectAttempt::start(id, peer, direct_addrs, &mut self.shared, now)
         {
             self.attempts.insert(id, attempt);
@@ -241,6 +292,7 @@ impl NatAgent {
                 // Streams on the closed connection are gone; drop any the
                 // attempts have not already cleaned up.
                 self.shared.registry.remove(peer_id);
+                self.shared.released_bridges.remove(peer_id);
             }
             SwarmEvent::PeerReady { peer_id, protocols } => {
                 self.shared.ready.insert(peer_id.clone(), protocols.clone());
@@ -257,6 +309,21 @@ impl NatAgent {
                 initiated_locally,
             } => {
                 if !initiated_locally && protocol_id == STOP_PROTOCOL_ID {
+                    // STOP is a relay control protocol, but registration of
+                    // its id makes it possible for any connected peer to
+                    // negotiate it. Only relays explicitly configured by
+                    // the application are trusted to request an inbound
+                    // circuit; otherwise a peer could make us punch its
+                    // chosen addresses.
+                    if !self
+                        .shared
+                        .config
+                        .relays
+                        .iter()
+                        .any(|relay| relay.peer_id() == peer_id)
+                    {
+                        return;
+                    }
                     // A relay is bridging an inbound circuit to us: claim
                     // the stream and run the responder flow on it.
                     let id = self.next_inbound_id;
@@ -282,7 +349,13 @@ impl NatAgent {
                 self.route_stream(peer_id, *stream_id, StreamInput::RemoteWriteClosed, now);
             }
             SwarmEvent::StreamClosed { peer_id, stream_id } => {
-                self.route_stream(peer_id, *stream_id, StreamInput::Closed, now);
+                if let Some(id) = self.shared.take_released_bridge(peer_id, *stream_id) {
+                    if let Some(attempt) = self.attempts.get_mut(&id) {
+                        attempt.on_released_bridge_closed(*stream_id, &mut self.shared, now);
+                    }
+                } else {
+                    self.route_stream(peer_id, *stream_id, StreamInput::Closed, now);
+                }
                 self.shared.release_stream(peer_id, *stream_id);
             }
             _ => {}

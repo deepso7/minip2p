@@ -106,3 +106,49 @@ fn wait_path_buffers_application_events() {
     }
     assert!(saw_connection, "application events must survive wait_path");
 }
+
+#[test]
+fn wait_peer_ready_drives_nat_agent() {
+    let mut a = nat_endpoint();
+    let mut b = Endpoint::builder()
+        .bind_quic("127.0.0.1:0")
+        .expect("bind loopback endpoint");
+    let b_addr = b.listen().expect("b listens");
+    a.listen().expect("a listens");
+
+    // The facade wait drives only `a`, so keep the remote's socket serviced
+    // concurrently. `wait_peer_ready` must feed ConnectionEstablished to
+    // the NAT agent on the way to the matching PeerReady event.
+    let (stop_remote, remote_stop) = std::sync::mpsc::channel();
+    let remote = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if remote_stop.try_recv().is_ok() {
+                break;
+            }
+            let _ = b.next_event(Duration::from_millis(10));
+        }
+    });
+
+    let id = a.connect_addr(&b_addr).expect("connect starts");
+    let ready = a
+        .wait_peer_ready(b_addr.peer_id(), Duration::from_secs(10))
+        .expect("wait succeeds");
+    assert!(
+        matches!(ready, Some(minip2p::Event::PeerReady { peer_id, .. }) if peer_id == *b_addr.peer_id())
+    );
+
+    let events = a.take_nat_events();
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                NatEvent::PathEstablished { connect_id, path: Path::DirectDialed, .. }
+                    if *connect_id == id
+            )
+        }),
+        "wait_peer_ready must deliver ConnectionEstablished to NAT: {events:?}"
+    );
+    let _ = stop_remote.send(());
+    remote.join().expect("remote driver thread");
+}

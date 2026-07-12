@@ -289,7 +289,32 @@ impl Prober {
                     None => false,
                 }
             }
-            (_, StreamInput::Closed | StreamInput::RemoteWriteClosed) => {
+            (ExchangeStage::AwaitResponse { .. }, StreamInput::RemoteWriteClosed) => {
+                let Some(machine) = flight.machine.as_mut() else {
+                    return false;
+                };
+                if machine
+                    .handle_input(AutoNatClientInput::RemoteWriteClosed)
+                    .is_err()
+                {
+                    self.abort_flight(shared, now);
+                    return false;
+                }
+                let mut sample = None;
+                while let Some(output) = machine.poll_output() {
+                    if let AutoNatClientOutput::Outcome(reachability) = output {
+                        sample = Some(reachability);
+                    }
+                }
+                match sample {
+                    Some(reachability) => {
+                        self.finish_flight(shared, now);
+                        self.record_sample(&reachability, shared, now)
+                    }
+                    None => false,
+                }
+            }
+            (_, StreamInput::Closed) => {
                 self.abort_flight(shared, now);
                 false
             }
@@ -317,7 +342,10 @@ impl Prober {
             self.window.remove(0);
         }
 
-        let threshold = usize::from(shared.config.confidence_threshold.max(1));
+        // A threshold above the bounded window can never be reached. Treat
+        // it as unanimity for the configured window instead of leaving
+        // reachability permanently Unknown.
+        let threshold = usize::from(shared.config.confidence_threshold.max(1)).min(window);
         let public_votes = self.window.iter().filter(|s| **s).count();
         let private_votes = self.window.len() - public_votes;
         let new = if public_votes >= threshold {
@@ -727,7 +755,35 @@ impl ReservationManager {
                     None => {}
                 }
             }
-            (_, StreamInput::Closed | StreamInput::RemoteWriteClosed) => {
+            (ExchangeStage::AwaitResponse { .. }, StreamInput::RemoteWriteClosed) => {
+                let Some(m) = machine.as_mut() else {
+                    return;
+                };
+                if m.handle_input(HopReservationInput::RemoteWriteClosed)
+                    .is_err()
+                {
+                    self.fail_acquire(shared, now);
+                    return;
+                }
+                let mut outcome = None;
+                while let Some(output) = m.poll_output() {
+                    if let HopReservationOutput::Outcome(o) = output {
+                        outcome = Some(o);
+                    }
+                }
+                match outcome {
+                    Some(ReservationOutcome::Accepted { reservation, .. }) => {
+                        let relay = relay.clone();
+                        let expire = reservation.and_then(|r| r.expire);
+                        self.complete_acquire(relay, stream, expire, shared, now);
+                    }
+                    Some(ReservationOutcome::Refused { .. }) => {
+                        self.fail_acquire(shared, now);
+                    }
+                    None => {}
+                }
+            }
+            (_, StreamInput::Closed) => {
                 self.fail_acquire(shared, now);
             }
             _ => {}
@@ -767,7 +823,11 @@ impl ReservationManager {
         let info = ReservationInfo {
             relay: relay_peer.clone(),
             expires_unix_secs: expire_unix_secs,
-            renew_at_mono_ms: now.mono_ms + renew_in_secs * 1_000,
+            // The relay controls `expire`, so this conversion must not let a
+            // large value wrap the monotonic renewal deadline.
+            renew_at_mono_ms: now
+                .mono_ms
+                .saturating_add(renew_in_secs.saturating_mul(1_000)),
         };
         shared.push_event(NatEvent::RelayReserved {
             relay: relay_peer,

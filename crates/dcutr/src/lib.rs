@@ -455,13 +455,23 @@ impl DcutrResponder {
         self.state == ResponderState::Done
     }
 
+    /// Returns bytes received after the final SYNC frame in the same stream
+    /// read.
+    ///
+    /// Once DCUtR completes, the caller normally hands the relay stream to
+    /// its application. Keeping this remainder available avoids dropping
+    /// application data that was coalesced behind SYNC by the transport.
+    /// The returned bytes are drained exactly once.
+    pub fn take_trailing_data(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.recv_buf)
+    }
+
     fn try_decode(&mut self) -> Result<(), DcutrError> {
         loop {
             if self.state == ResponderState::Done {
-                // The flow is complete; free any trailing bytes the peer
-                // coalesced behind the final frame instead of retaining
-                // them for the machine's lifetime.
-                self.recv_buf = Vec::new();
+                // The flow is complete. Any bytes coalesced behind SYNC
+                // belong to the application; the caller can drain them with
+                // `take_trailing_data` before handing over the raw stream.
                 return Ok(());
             }
 
@@ -731,12 +741,12 @@ mod tests {
     }
 
     #[test]
-    fn responder_drops_trailing_bytes_after_flow_completes() {
+    fn responder_exposes_trailing_bytes_after_flow_completes() {
         let mut resp = DcutrResponder::new(&[]);
 
-        // CONNECT + SYNC + trailing garbage in one coalesced input: the
-        // flow completes and the garbage must not be retained for the
-        // machine's lifetime.
+        // CONNECT + SYNC + application bytes in one coalesced input: the
+        // flow completes, but the caller must be able to hand those bytes to
+        // the application with the released raw stream.
         let mut coalesced = frame(HolePunch {
             kind: HolePunchType::Connect,
             obs_addrs: Vec::new(),
@@ -748,7 +758,8 @@ mod tests {
         coalesced.extend_from_slice(&[0xcc; 512]);
         resp.on_data(&coalesced).unwrap();
         assert!(resp.is_done());
-        assert!(resp.recv_buf.is_empty());
+        assert_eq!(resp.take_trailing_data(), vec![0xcc; 512]);
+        assert!(resp.take_trailing_data().is_empty());
     }
 
     #[test]

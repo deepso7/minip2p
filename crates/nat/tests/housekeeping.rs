@@ -28,6 +28,15 @@ struct Hk {
 }
 
 fn build(policy: ReservationPolicy, relay_count: usize, server_count: usize) -> Hk {
+    build_with_config(policy, relay_count, server_count, |_| {})
+}
+
+fn build_with_config(
+    policy: ReservationPolicy,
+    relay_count: usize,
+    server_count: usize,
+    configure: impl FnOnce(&mut NatConfig),
+) -> Hk {
     let relay = peer(b"relay-peer");
     let relay2 = peer(b"relay-peer-2");
     let server = peer(b"autonat-server");
@@ -48,12 +57,13 @@ fn build(policy: ReservationPolicy, relay_count: usize, server_count: usize) -> 
         autonat_servers.push(PeerAddr::new(maddr(SERVER2_ADDR), server2.clone()).unwrap());
     }
 
-    let config = NatConfig {
+    let mut config = NatConfig {
         reservation_policy: policy,
         relays,
         autonat_servers,
         ..NatConfig::default()
     };
+    configure(&mut config);
     let mut agent = NatAgent::new(peer(b"local-peer"), config);
     agent.set_listen_addrs(&[maddr(LISTEN_ADDR)]);
     Hk {
@@ -217,6 +227,34 @@ fn confidence_window_flips_once_and_never_flaps_on_one_probe() {
 }
 
 #[test]
+fn confidence_threshold_above_window_clamps_to_unanimity() {
+    let mut hk = build_with_config(ReservationPolicy::Never, 0, 1, |config| {
+        config.confidence_window = 3;
+        config.confidence_threshold = 9;
+    });
+
+    // Bootstrap the AutoNAT session, then collect a full (three-vote)
+    // unanimous window. An unclamped threshold could never settle here.
+    hk.agent.handle_tick(at(0));
+    let actions = drain_actions(&mut hk.agent);
+    let dial = dial_token_for(&actions, &hk.server);
+    hk.agent.dial_result(dial, Ok(ConnectionId::new(50)), at(1));
+    let server = hk.server.clone();
+    hk.session_ready(&server, &[AUTONAT_PROTOCOL_ID], at(2));
+    assert!(hk.finish_probe(true, 3).is_empty());
+    assert!(hk.run_probe(true, 6_000).is_empty());
+
+    let events = hk.run_probe(true, 12_000);
+    assert!(matches!(
+        events.as_slice(),
+        [NatEvent::ReachabilityChanged {
+            old: ReachabilityState::Unknown,
+            new: ReachabilityState::Public,
+        }]
+    ));
+}
+
+#[test]
 fn probe_timeout_rotates_to_the_next_server() {
     let mut hk = build(ReservationPolicy::Never, 0, 2);
 
@@ -303,6 +341,27 @@ fn reservation_renews_at_expire_minus_margin() {
             ..
         }]
     ));
+}
+
+#[test]
+fn enormous_relay_expiry_saturates_the_renewal_deadline() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(Some(u64::MAX)), at_unix(10, 0));
+
+    assert!(matches!(
+        events.as_slice(),
+        [NatEvent::RelayReserved {
+            renew_at_mono_ms: u64::MAX,
+            ..
+        }]
+    ));
+    assert_eq!(
+        hk.agent
+            .active_reservation()
+            .expect("reservation held")
+            .renew_at_mono_ms,
+        u64::MAX
+    );
 }
 
 #[test]

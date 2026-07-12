@@ -5,12 +5,24 @@ mod common;
 
 use common::*;
 
+use minip2p_core::PeerAddr;
 use minip2p_nat::{NatAction, NatConfig, NatEvent};
 use minip2p_relay::STOP_PROTOCOL_ID;
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::StreamId;
 
 const STOP_STREAM: u64 = 40;
+
+/// Inbound STOP is accepted only from a relay explicitly configured by the
+/// application. The scripted responder tests use the harness's relay peer.
+fn inbound_harness(mut config: NatConfig) -> Harness {
+    config.reservation_policy = minip2p_nat::ReservationPolicy::Never;
+    config.relays.push(
+        PeerAddr::new(maddr(RELAY_TRANSPORT_ADDR), peer(b"relay-peer"))
+            .expect("valid configured relay"),
+    );
+    Harness::without_relay(config)
+}
 
 /// Delivers an inbound STOP `StreamReady` (relay-initiated) to the agent.
 fn inbound_stop_stream(h: &mut Harness, stream: StreamId, t: u64) {
@@ -49,7 +61,7 @@ fn drive_to_sync_ready(h: &mut Harness, stream: StreamId) {
 
 #[test]
 fn full_inbound_flow_punches_back_and_upgrades() {
-    let mut h = Harness::without_relay(NatConfig::default());
+    let mut h = inbound_harness(NatConfig::default());
     let stream = StreamId::new(STOP_STREAM);
 
     inbound_stop_stream(&mut h, stream, 0);
@@ -106,8 +118,51 @@ fn full_inbound_flow_punches_back_and_upgrades() {
 }
 
 #[test]
+fn sync_coalesced_with_application_data_preserves_the_bridge_remainder() {
+    let mut h = inbound_harness(NatConfig::default());
+    let stream = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stream, 0);
+    drive_to_sync_ready(&mut h, stream);
+
+    let app_data = b"first application bytes".to_vec();
+    let mut coalesced = dcutr_sync();
+    coalesced.extend_from_slice(&app_data);
+    h.stream_data(stream, coalesced, at(30));
+
+    let events = drain_events(&mut h.agent);
+    assert!(matches!(
+        events.as_slice(),
+        [NatEvent::InboundRelayCircuit {
+            peer,
+            stream_id,
+            pending_data,
+        }] if *peer == h.target && *stream_id == stream && *pending_data == app_data
+    ));
+}
+
+#[test]
+fn zero_blast_interval_is_clamped_to_one_millisecond() {
+    let mut config = NatConfig::default();
+    config.blast_interval_ms = 0;
+    let mut h = inbound_harness(config);
+    let stream = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stream, 0);
+    drive_to_sync_ready(&mut h, stream);
+    h.stream_data(stream, dcutr_sync(), at(30));
+    drain_events(&mut h.agent);
+    drain_actions(&mut h.agent);
+
+    // The first due tick completes promptly (rather than repeatedly
+    // scheduling the same instant forever), then the clamped cadence is 1ms.
+    h.agent.handle_tick(at(80));
+    assert_eq!(blast_count(&drain_actions(&mut h.agent)), 1);
+    h.agent.handle_tick(at(81));
+    assert_eq!(blast_count(&drain_actions(&mut h.agent)), 1);
+}
+
+#[test]
 fn blast_schedule_exhausts_at_the_punch_deadline() {
-    let mut h = Harness::without_relay(NatConfig::default());
+    let mut h = inbound_harness(NatConfig::default());
     let stream = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stream, 0);
     drive_to_sync_ready(&mut h, stream);
@@ -134,7 +189,7 @@ fn blast_schedule_exhausts_at_the_punch_deadline() {
 
 #[test]
 fn stalled_exchange_still_releases_the_bridge() {
-    let mut h = Harness::without_relay(NatConfig::default());
+    let mut h = inbound_harness(NatConfig::default());
     let stream = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stream, 0);
     let target = h.target.clone();
@@ -157,8 +212,36 @@ fn stalled_exchange_still_releases_the_bridge() {
 }
 
 #[test]
+fn remote_write_close_keeps_an_accepted_bridge_alive_until_handoff() {
+    let mut h = inbound_harness(NatConfig::default());
+    let stream = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stream, 0);
+    let target = h.target.clone();
+    h.stream_data(stream, stop_connect(&target), at(10));
+    drain_actions(&mut h.agent);
+
+    h.agent.handle_event(
+        &SwarmEvent::StreamRemoteWriteClosed {
+            peer_id: h.relay.clone(),
+            stream_id: stream,
+        },
+        at(20),
+    );
+    assert!(h.agent.owns_stream(&h.relay, stream));
+    assert!(!has_reset_for(&drain_actions(&mut h.agent), stream));
+
+    // The half-close does not kill the local write half; hand the accepted
+    // bridge to the app once the DCUtR exchange deadline expires.
+    h.agent.handle_tick(at(12_000));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::InboundRelayCircuit { peer, .. }] if *peer == h.target
+    ));
+}
+
+#[test]
 fn malformed_stop_connect_tears_the_circuit_down() {
-    let mut h = Harness::without_relay(NatConfig::default());
+    let mut h = inbound_harness(NatConfig::default());
     let stream = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stream, 0);
 
@@ -173,7 +256,7 @@ fn malformed_stop_connect_tears_the_circuit_down() {
 
 #[test]
 fn unparsable_source_peer_id_is_rejected() {
-    let mut h = Harness::without_relay(NatConfig::default());
+    let mut h = inbound_harness(NatConfig::default());
     let stream = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stream, 0);
 
@@ -191,7 +274,7 @@ fn unparsable_source_peer_id_is_rejected() {
 
 #[test]
 fn inbound_application_streams_are_never_claimed() {
-    let mut h = Harness::without_relay(NatConfig::default());
+    let mut h = inbound_harness(NatConfig::default());
     let stream = StreamId::new(STOP_STREAM);
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
@@ -209,7 +292,7 @@ fn inbound_application_streams_are_never_claimed() {
 
 #[test]
 fn relay_disconnect_before_release_drops_the_circuit() {
-    let mut h = Harness::without_relay(NatConfig::default());
+    let mut h = inbound_harness(NatConfig::default());
     let stream = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stream, 0);
     let target = h.target.clone();

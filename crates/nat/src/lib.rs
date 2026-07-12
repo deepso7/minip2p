@@ -13,8 +13,8 @@
 //! t0      direct leg: dial every validated candidate address
 //! t0+δ    relay leg (stagger δ, 0 = fully parallel):
 //!           ensure relay session → HOP CONNECT(target)
-//!           → Bridged ⇒ PathEstablished(Relayed) (usable NOW)
-//!           → immediately start a DCUtR punch over the bridge, in parallel
+//!           → Bridged ⇒ start a DCUtR punch over the bridge
+//!           → after SYNC, release bridge ⇒ PathEstablished(Relayed)
 //! first usable path wins; a better path later ⇒ explicit PathUpgraded
 //! "fallback" is not a phase — it is what remains when the punch leg
 //! exhausts (FellBackToRelay)

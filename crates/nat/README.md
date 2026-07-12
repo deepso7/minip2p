@@ -16,8 +16,8 @@ Parallel racing with convergence — not sequential fallback:
 t0      direct leg: dial every validated candidate address
 t0+δ    relay leg (stagger δ, default 200 ms; 0 = fully parallel):
           ensure relay session → HOP CONNECT(target)
-          → Bridged ⇒ PathEstablished(Relayed)   (usable immediately)
-          → DCUtR punch starts over the bridge, in parallel
+          → Bridged ⇒ DCUtR punch starts over the bridge
+          → after SYNC, release bridge ⇒ PathEstablished(Relayed)
 first usable path wins
 a better path later  ⇒ PathUpgraded { from, to }  (+ the old bridge is reset)
 punch exhausted      ⇒ FellBackToRelay            (the bridge stays yours)
