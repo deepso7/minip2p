@@ -807,6 +807,7 @@ dependencies = [
 name = "minip2p-nat"
 version = "0.1.0"
 dependencies = [
+ "minip2p-autonat",
  "minip2p-core",
  "minip2p-dcutr",
  "minip2p-relay",

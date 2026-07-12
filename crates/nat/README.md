@@ -75,10 +75,26 @@ The `minip2p` facade (feature `nat`, upcoming) wires exactly this loop into
 `Endpoint` so applications get `connect(&peer)` / `wait_path(...)` without
 touching the pump.
 
+## Own-side housekeeping
+
+Independent of connect attempts, the agent also runs:
+
+- **Reachability probing** (`NatConfig::autonat_servers`): single-shot
+  AutoNAT probes aggregated through an M-sample window — the verdict flips
+  only when N of the last M probes agree (defaults N=3, M=5), so one flaky
+  probe never flaps `ReachabilityChanged`.
+- **Relay reservations** (`NatConfig::reservation_policy`): held per policy
+  (`Always` / `WhenPrivate` / `Never`), renewed
+  `reservation_renewal_margin_secs` before the relay-reported `expire`
+  (default-TTL fallback when the relay omits it or the host has no wall
+  clock), rotating relays with backoff on refusal, and reacquiring after a
+  lost relay session. `WhenPrivate` reserves while reachability is Unknown
+  or Private and releases once probes settle on Public.
+
 ## Status
 
 - Dialer-side race (direct dials × relay leg × DCUtR punch): implemented,
   covered by scripted no-I/O tests in `tests/arbitration.rs`.
 - Housekeeping (AutoNAT confidence aggregation, relay reservation renewal):
-  planned — knobs already exist on `NatConfig`.
+  implemented, covered by `tests/housekeeping.rs`.
 - Responder side (inbound STOP circuits, punch-back, UDP blasts): planned.

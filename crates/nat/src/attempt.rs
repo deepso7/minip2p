@@ -279,7 +279,7 @@ impl ConnectAttempt {
             // Punch dials are expected to fail often; the punch window
             // deadline governs the retry/fallback flow.
             TokenPurpose::PunchDial(_) => {}
-            TokenPurpose::OpenHop(..) => {}
+            _ => {}
         }
     }
 

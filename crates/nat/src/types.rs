@@ -93,6 +93,18 @@ pub enum ReachabilityState {
     Private,
 }
 
+/// A currently held relay reservation, as reported by
+/// [`NatAgent::active_reservation`](crate::NatAgent::active_reservation).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReservationInfo {
+    /// The relay holding the reservation.
+    pub relay: PeerId,
+    /// Absolute expiry reported by the relay, if any.
+    pub expires_unix_secs: Option<u64>,
+    /// When renewal fires, on the driver's monotonic clock.
+    pub renew_at_mono_ms: u64,
+}
+
 /// Terminal errors for a connect attempt, carried by
 /// [`NatEvent::ConnectFailed`](crate::NatEvent::ConnectFailed).
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]

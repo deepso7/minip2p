@@ -9,7 +9,8 @@ use minip2p_transport::{ConnectionId, StreamId};
 use crate::attempt::ConnectAttempt;
 use crate::config::NatConfig;
 use crate::events::{NatAction, NatEvent};
-use crate::types::{ConnectId, NatToken, Now, ReachabilityState};
+use crate::housekeeping::Housekeeping;
+use crate::types::{ConnectId, NatToken, Now, ReachabilityState, ReservationInfo};
 
 /// Roles a stream owned by the agent can play. Streams not in the registry
 /// belong to the application (`Released` is modeled as removal).
@@ -18,6 +19,10 @@ pub(crate) enum StreamRole {
     /// Outbound HOP CONNECT stream for a dialer-side attempt; after the
     /// relay reports `Bridged` the same stream carries the DCUtR exchange.
     HopConnect(ConnectId),
+    /// Outbound HOP RESERVE stream (reservation manager).
+    HopReserve,
+    /// Outbound AutoNAT probe stream (reachability prober).
+    AutonatProbe,
 }
 
 /// What a pending `Dial` / `OpenStream` token was issued for.
@@ -32,15 +37,24 @@ pub(crate) enum TokenPurpose {
     /// HOP stream open on the relay; the peer is kept so a result arriving
     /// after the attempt ended can still be cleaned up.
     OpenHop(ConnectId, PeerId),
+    /// Dial of an AutoNAT server for a reachability probe.
+    ProbeDial,
+    /// AutoNAT probe stream open.
+    OpenProbe(PeerId),
+    /// Dial of the relay for a reservation.
+    ReserveDial,
+    /// HOP RESERVE stream open.
+    OpenReserve(PeerId),
 }
 
 impl TokenPurpose {
-    fn connect_id(&self) -> ConnectId {
+    fn connect_id(&self) -> Option<ConnectId> {
         match self {
             Self::DirectDial(id)
             | Self::RelayDial(id)
             | Self::PunchDial(id)
-            | Self::OpenHop(id, _) => *id,
+            | Self::OpenHop(id, _) => Some(*id),
+            _ => None,
         }
     }
 }
@@ -56,6 +70,7 @@ pub(crate) enum StreamInput<'a> {
 
 /// State shared between the agent shell and its attempt state machines.
 pub(crate) struct Shared {
+    pub(crate) local_peer_id: PeerId,
     pub(crate) config: NatConfig,
     pub(crate) actions: VecDeque<NatAction>,
     pub(crate) events: VecDeque<NatEvent>,
@@ -123,18 +138,19 @@ impl Shared {
 /// ([`owns_stream`](Self::owns_stream)) into the agent *only* — application
 /// code must not see them — and forward everything else untouched.
 pub struct NatAgent {
-    local_peer_id: PeerId,
     shared: Shared,
     attempts: BTreeMap<ConnectId, ConnectAttempt>,
+    housekeeping: Housekeeping,
     next_connect_id: u64,
 }
 
 impl NatAgent {
     /// Creates an agent for the node identified by `local_peer_id`.
     pub fn new(local_peer_id: PeerId, config: NatConfig) -> Self {
+        let housekeeping = Housekeeping::new(&config);
         Self {
-            local_peer_id,
             shared: Shared {
+                local_peer_id,
                 config,
                 actions: VecDeque::new(),
                 events: VecDeque::new(),
@@ -146,13 +162,14 @@ impl NatAgent {
                 listen_addrs: Vec::new(),
             },
             attempts: BTreeMap::new(),
+            housekeeping,
             next_connect_id: 0,
         }
     }
 
     /// The local peer id the agent was constructed with.
     pub fn local_peer_id(&self) -> &PeerId {
-        &self.local_peer_id
+        &self.shared.local_peer_id
     }
 
     /// Starts a connect attempt toward `peer`.
@@ -201,6 +218,8 @@ impl NatAgent {
                 for attempt in self.attempts.values_mut() {
                     attempt.on_peer_disconnected(peer_id, &mut self.shared, now);
                 }
+                self.housekeeping
+                    .on_peer_disconnected(peer_id, &mut self.shared, now);
                 // Streams on the closed connection are gone; drop any the
                 // attempts have not already cleaned up.
                 self.shared.registry.remove(peer_id);
@@ -210,6 +229,8 @@ impl NatAgent {
                 for attempt in self.attempts.values_mut() {
                     attempt.on_peer_ready(peer_id, protocols, &mut self.shared, now);
                 }
+                self.housekeeping
+                    .on_peer_ready(peer_id, protocols, &mut self.shared, now);
             }
             SwarmEvent::StreamReady {
                 peer_id, stream_id, ..
@@ -241,6 +262,7 @@ impl NatAgent {
         for attempt in self.attempts.values_mut() {
             attempt.on_tick(&mut self.shared, now);
         }
+        self.housekeeping.on_tick(&mut self.shared, now);
         self.reap_done();
     }
 
@@ -249,8 +271,22 @@ impl NatAgent {
         let Some(purpose) = self.shared.tokens.remove(&token) else {
             return;
         };
-        if let Some(attempt) = self.attempts.get_mut(&purpose.connect_id()) {
-            attempt.on_dial_result(&purpose, result, &mut self.shared, now);
+        match &purpose {
+            TokenPurpose::ProbeDial => {
+                self.housekeeping
+                    .on_probe_dial_result(&result, &mut self.shared, now);
+            }
+            TokenPurpose::ReserveDial => {
+                self.housekeeping
+                    .on_reserve_dial_result(&result, &mut self.shared, now);
+            }
+            _ => {
+                if let Some(id) = purpose.connect_id()
+                    && let Some(attempt) = self.attempts.get_mut(&id)
+                {
+                    attempt.on_dial_result(&purpose, result, &mut self.shared, now);
+                }
+            }
         }
         self.reap_done();
     }
@@ -265,24 +301,36 @@ impl NatAgent {
         let Some(purpose) = self.shared.tokens.remove(&token) else {
             return;
         };
-        let TokenPurpose::OpenHop(id, relay_peer) = purpose else {
-            return;
-        };
-        match self.attempts.get_mut(&id) {
-            Some(attempt) => {
-                attempt.on_stream_open_result(result, &mut self.shared, now);
-                self.reap_done();
-            }
-            None => {
-                // The attempt ended (won, failed, or was cancelled) while the
-                // open was in flight; don't leak the stream.
-                if let Ok(stream_id) = result {
-                    self.shared.push_action(NatAction::ResetStream {
-                        peer: relay_peer,
-                        stream_id,
-                    });
+        match purpose {
+            TokenPurpose::OpenHop(id, relay_peer) => match self.attempts.get_mut(&id) {
+                Some(attempt) => {
+                    attempt.on_stream_open_result(result, &mut self.shared, now);
+                    self.reap_done();
                 }
+                None => {
+                    // The attempt ended (won, failed, or was cancelled) while
+                    // the open was in flight; don't leak the stream.
+                    if let Ok(stream_id) = result {
+                        self.shared.push_action(NatAction::ResetStream {
+                            peer: relay_peer,
+                            stream_id,
+                        });
+                    }
+                }
+            },
+            TokenPurpose::OpenProbe(server_peer) => {
+                self.housekeeping
+                    .on_probe_open_result(&server_peer, result, &mut self.shared, now);
             }
+            TokenPurpose::OpenReserve(relay_peer) => {
+                self.housekeeping.on_reserve_open_result(
+                    &relay_peer,
+                    result,
+                    &mut self.shared,
+                    now,
+                );
+            }
+            _ => {}
         }
     }
 
@@ -302,6 +350,7 @@ impl NatAgent {
         self.attempts
             .values()
             .filter_map(ConnectAttempt::next_deadline)
+            .chain(self.housekeeping.next_deadline())
             .min()
             .map(|due| due.saturating_sub(now_ms))
     }
@@ -316,17 +365,25 @@ impl NatAgent {
             .is_some_and(|streams| streams.contains_key(&stream_id))
     }
 
-    /// Our current reachability verdict. Stays
-    /// [`Unknown`](ReachabilityState::Unknown) until probing (a later
-    /// milestone) gathers confidence.
+    /// Our current reachability verdict: majority-of-N confidence over the
+    /// last M probe results, so it never flips on a single probe.
     pub fn reachability(&self) -> ReachabilityState {
-        ReachabilityState::Unknown
+        self.housekeeping.reachability()
+    }
+
+    /// The relay reservation currently held, if any.
+    pub fn active_reservation(&self) -> Option<&ReservationInfo> {
+        self.housekeeping.active_reservation()
     }
 
     /// Returns `true` when the agent has no queued outputs and no work in
-    /// flight.
+    /// flight (a settled reservation or a scheduled future probe is not
+    /// "work").
     pub fn is_idle(&self) -> bool {
-        self.shared.actions.is_empty() && self.shared.events.is_empty() && self.attempts.is_empty()
+        self.shared.actions.is_empty()
+            && self.shared.events.is_empty()
+            && self.attempts.is_empty()
+            && self.housekeeping.is_quiet()
     }
 
     fn route_stream(&mut self, peer: &PeerId, stream: StreamId, input: StreamInput<'_>, now: Now) {
@@ -342,6 +399,10 @@ impl NatAgent {
                 if let Some(attempt) = self.attempts.get_mut(&id) {
                     attempt.on_stream_input(stream, input, &mut self.shared, now);
                 }
+            }
+            StreamRole::HopReserve | StreamRole::AutonatProbe => {
+                self.housekeeping
+                    .on_stream_input(role, stream, input, &mut self.shared, now);
             }
         }
     }

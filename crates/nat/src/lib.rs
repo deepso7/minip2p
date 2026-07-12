@@ -40,9 +40,10 @@ mod agent;
 mod attempt;
 mod config;
 mod events;
+mod housekeeping;
 mod types;
 
 pub use agent::NatAgent;
 pub use config::{NatConfig, ReservationPolicy};
 pub use events::{NatAction, NatEvent};
-pub use types::{ConnectId, NatError, NatToken, Now, Path, ReachabilityState};
+pub use types::{ConnectId, NatError, NatToken, Now, Path, ReachabilityState, ReservationInfo};

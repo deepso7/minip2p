@@ -5,11 +5,13 @@
 // uses a different subset of the helpers.
 #![allow(dead_code)]
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId};
+use minip2p_autonat::{AutoNatServer, AutoNatServerInput, AutoNatServerOutput, ResponseStatus};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol};
 use minip2p_dcutr::{HolePunch, HolePunchType, encode_frame as dcutr_encode_frame};
-use minip2p_nat::{NatAction, NatAgent, NatConfig, NatEvent, NatToken, Now};
+use minip2p_nat::{NatAction, NatAgent, NatConfig, NatEvent, NatToken, Now, ReservationPolicy};
 use minip2p_relay::{
-    HOP_PROTOCOL_ID, HopMessage, HopMessageType, Status, encode_frame as relay_encode_frame,
+    HOP_PROTOCOL_ID, HopMessage, HopMessageType, Reservation, Status,
+    encode_frame as relay_encode_frame,
 };
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::StreamId;
@@ -29,6 +31,13 @@ pub fn maddr(s: &str) -> Multiaddr {
 
 pub fn at(ms: u64) -> Now {
     Now::from_mono(ms)
+}
+
+pub fn at_unix(ms: u64, secs: u64) -> Now {
+    Now {
+        mono_ms: ms,
+        unix_secs: Some(secs),
+    }
 }
 
 pub fn drain_actions(agent: &mut NatAgent) -> Vec<NatAction> {
@@ -61,6 +70,62 @@ pub fn dcutr_connect_reply(addrs: &[Multiaddr]) -> Vec<u8> {
     dcutr_encode_frame(&msg.encode())
 }
 
+/// A framed HOP STATUS:OK reservation response with an optional expiry.
+pub fn hop_reserve_ok(expire_unix_secs: Option<u64>) -> Vec<u8> {
+    let msg = HopMessage {
+        kind: HopMessageType::Status,
+        peer: None,
+        reservation: Some(Reservation {
+            expire: expire_unix_secs,
+            addrs: Vec::new(),
+            voucher: None,
+        }),
+        limit: None,
+        status: Some(Status::Ok),
+    };
+    relay_encode_frame(&msg.encode())
+}
+
+/// Runs `request_bytes` through a real [`AutoNatServer`] and returns the
+/// wire bytes of the given response — public with `addrs`, or a dial error.
+pub fn autonat_response(request_bytes: &[u8], public_addrs: Option<&[Multiaddr]>) -> Vec<u8> {
+    let mut server = AutoNatServer::new();
+    server
+        .handle_input(AutoNatServerInput::Data(request_bytes.to_vec()))
+        .expect("well-formed AutoNAT request");
+    assert!(matches!(
+        server.poll_output(),
+        Some(AutoNatServerOutput::Request(_))
+    ));
+    let response = match public_addrs {
+        Some(addrs) => AutoNatServerInput::RespondPublic {
+            addrs: addrs.to_vec(),
+        },
+        None => AutoNatServerInput::RespondError {
+            status: ResponseStatus::DialError,
+            reason: "dial-back failed".into(),
+        },
+    };
+    server.handle_input(response).expect("respond");
+    match server.poll_output() {
+        Some(AutoNatServerOutput::Outbound(bytes)) => bytes,
+        other => panic!("expected outbound response, got {other:?}"),
+    }
+}
+
+/// Extracts the payload of the single `SendStream` action on `stream`.
+pub fn sent_data_on(actions: &[NatAction], stream: StreamId) -> Vec<u8> {
+    let mut found = actions.iter().filter_map(|action| match action {
+        NatAction::SendStream {
+            stream_id, data, ..
+        } if *stream_id == stream => Some(data.clone()),
+        _ => None,
+    });
+    let data = found.next().expect("expected a SendStream on the stream");
+    assert!(found.next().is_none(), "more than one SendStream");
+    data
+}
+
 /// Finds the token of the single `Dial` action targeting `peer`.
 pub fn dial_token_for(actions: &[NatAction], peer: &PeerId) -> NatToken {
     let mut tokens = actions.iter().filter_map(|action| match action {
@@ -78,6 +143,19 @@ pub fn dial_count_for(actions: &[NatAction], peer: &PeerId) -> usize {
         .iter()
         .filter(|action| matches!(action, NatAction::Dial { addr, .. } if addr.peer_id() == peer))
         .count()
+}
+
+/// Finds the token of the single `OpenStream` action targeting `peer`.
+pub fn open_stream_token_for(actions: &[NatAction], peer: &PeerId) -> NatToken {
+    let mut tokens = actions.iter().filter_map(|action| match action {
+        NatAction::OpenStream { token, peer: p, .. } if p == peer => Some(*token),
+        _ => None,
+    });
+    let token = tokens
+        .next()
+        .expect("expected an OpenStream action for the peer");
+    assert!(tokens.next().is_none(), "more than one OpenStream for peer");
+    token
 }
 
 /// Finds the token of the single `OpenStream` action.
@@ -125,6 +203,10 @@ pub struct Harness {
 
 impl Harness {
     /// An agent with one relay configured and a validated listen address.
+    ///
+    /// Reservation housekeeping is disabled: this harness scripts the
+    /// dialer-side race in isolation. Housekeeping tests configure their
+    /// own policy explicitly.
     pub fn with_relay(mut config: NatConfig) -> Self {
         let local = peer(b"local-peer");
         let target = peer(b"target-peer");
@@ -132,6 +214,7 @@ impl Harness {
         let relay_addr =
             PeerAddr::new(maddr(RELAY_TRANSPORT_ADDR), relay.clone()).expect("valid relay addr");
         config.relays = vec![relay_addr.clone()];
+        config.reservation_policy = ReservationPolicy::Never;
         let mut agent = NatAgent::new(local.clone(), config);
         agent.set_listen_addrs(&[maddr(LISTEN_ADDR)]);
         Self {
