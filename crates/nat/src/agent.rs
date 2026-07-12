@@ -6,10 +6,13 @@ use minip2p_core::{Multiaddr, PeerId};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};
 
+use minip2p_relay::STOP_PROTOCOL_ID;
+
 use crate::attempt::ConnectAttempt;
 use crate::config::NatConfig;
 use crate::events::{NatAction, NatEvent};
 use crate::housekeeping::Housekeeping;
+use crate::inbound::InboundCircuit;
 use crate::types::{ConnectId, NatToken, Now, ReachabilityState, ReservationInfo};
 
 /// Roles a stream owned by the agent can play. Streams not in the registry
@@ -23,6 +26,8 @@ pub(crate) enum StreamRole {
     HopReserve,
     /// Outbound AutoNAT probe stream (reachability prober).
     AutonatProbe,
+    /// Inbound STOP stream from a relay (responder-side circuit).
+    StopInbound(u64),
 }
 
 /// What a pending `Dial` / `OpenStream` token was issued for.
@@ -45,6 +50,9 @@ pub(crate) enum TokenPurpose {
     ReserveDial,
     /// HOP RESERVE stream open.
     OpenReserve(PeerId),
+    /// Responder-side simultaneous-open dial of an initiator's observed
+    /// address. Results are ignored; the punch window governs.
+    InboundPunchDial,
 }
 
 impl TokenPurpose {
@@ -141,7 +149,9 @@ pub struct NatAgent {
     shared: Shared,
     attempts: BTreeMap<ConnectId, ConnectAttempt>,
     housekeeping: Housekeeping,
+    inbound: BTreeMap<u64, InboundCircuit>,
     next_connect_id: u64,
+    next_inbound_id: u64,
 }
 
 impl NatAgent {
@@ -163,7 +173,9 @@ impl NatAgent {
             },
             attempts: BTreeMap::new(),
             housekeeping,
+            inbound: BTreeMap::new(),
             next_connect_id: 0,
+            next_inbound_id: 0,
         }
     }
 
@@ -211,6 +223,9 @@ impl NatAgent {
                 for attempt in self.attempts.values_mut() {
                     attempt.on_peer_connected(peer_id, &mut self.shared, now);
                 }
+                for circuit in self.inbound.values_mut() {
+                    circuit.on_peer_connected(peer_id, &mut self.shared, now);
+                }
             }
             SwarmEvent::ConnectionClosed { peer_id } => {
                 self.shared.connected.remove(peer_id);
@@ -220,6 +235,9 @@ impl NatAgent {
                 }
                 self.housekeeping
                     .on_peer_disconnected(peer_id, &mut self.shared, now);
+                for circuit in self.inbound.values_mut() {
+                    circuit.on_relay_disconnected(peer_id, &mut self.shared);
+                }
                 // Streams on the closed connection are gone; drop any the
                 // attempts have not already cleaned up.
                 self.shared.registry.remove(peer_id);
@@ -233,9 +251,25 @@ impl NatAgent {
                     .on_peer_ready(peer_id, protocols, &mut self.shared, now);
             }
             SwarmEvent::StreamReady {
-                peer_id, stream_id, ..
+                peer_id,
+                stream_id,
+                protocol_id,
+                initiated_locally,
             } => {
-                self.route_stream(peer_id, *stream_id, StreamInput::Ready, now);
+                if !initiated_locally && protocol_id == STOP_PROTOCOL_ID {
+                    // A relay is bridging an inbound circuit to us: claim
+                    // the stream and run the responder flow on it.
+                    let id = self.next_inbound_id;
+                    self.next_inbound_id += 1;
+                    self.shared
+                        .own_stream(peer_id, *stream_id, StreamRole::StopInbound(id));
+                    self.inbound.insert(
+                        id,
+                        InboundCircuit::new(peer_id.clone(), *stream_id, &self.shared, now),
+                    );
+                } else {
+                    self.route_stream(peer_id, *stream_id, StreamInput::Ready, now);
+                }
             }
             SwarmEvent::StreamData {
                 peer_id,
@@ -263,6 +297,9 @@ impl NatAgent {
             attempt.on_tick(&mut self.shared, now);
         }
         self.housekeeping.on_tick(&mut self.shared, now);
+        for circuit in self.inbound.values_mut() {
+            circuit.on_tick(&mut self.shared, now);
+        }
         self.reap_done();
     }
 
@@ -351,6 +388,11 @@ impl NatAgent {
             .values()
             .filter_map(ConnectAttempt::next_deadline)
             .chain(self.housekeeping.next_deadline())
+            .chain(
+                self.inbound
+                    .values()
+                    .filter_map(InboundCircuit::next_deadline),
+            )
             .min()
             .map(|due| due.saturating_sub(now_ms))
     }
@@ -383,6 +425,7 @@ impl NatAgent {
         self.shared.actions.is_empty()
             && self.shared.events.is_empty()
             && self.attempts.is_empty()
+            && self.inbound.is_empty()
             && self.housekeeping.is_quiet()
     }
 
@@ -404,10 +447,16 @@ impl NatAgent {
                 self.housekeeping
                     .on_stream_input(role, stream, input, &mut self.shared, now);
             }
+            StreamRole::StopInbound(id) => {
+                if let Some(circuit) = self.inbound.get_mut(&id) {
+                    circuit.on_stream_input(stream, input, &mut self.shared, now);
+                }
+            }
         }
     }
 
     fn reap_done(&mut self) {
         self.attempts.retain(|_, attempt| !attempt.is_done());
+        self.inbound.retain(|_, circuit| !circuit.is_done());
     }
 }

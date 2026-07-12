@@ -41,6 +41,7 @@ mod attempt;
 mod config;
 mod events;
 mod housekeeping;
+mod inbound;
 mod types;
 
 pub use agent::NatAgent;

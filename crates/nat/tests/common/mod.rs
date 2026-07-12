@@ -10,8 +10,8 @@ use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol};
 use minip2p_dcutr::{HolePunch, HolePunchType, encode_frame as dcutr_encode_frame};
 use minip2p_nat::{NatAction, NatAgent, NatConfig, NatEvent, NatToken, Now, ReservationPolicy};
 use minip2p_relay::{
-    HOP_PROTOCOL_ID, HopMessage, HopMessageType, Reservation, Status,
-    encode_frame as relay_encode_frame,
+    HOP_PROTOCOL_ID, HopMessage, HopMessageType, Peer, Reservation, Status, StopMessage,
+    StopMessageType, encode_frame as relay_encode_frame,
 };
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::StreamId;
@@ -68,6 +68,42 @@ pub fn dcutr_connect_reply(addrs: &[Multiaddr]) -> Vec<u8> {
         obs_addrs: addrs.iter().map(Multiaddr::to_bytes).collect(),
     };
     dcutr_encode_frame(&msg.encode())
+}
+
+/// A framed STOP CONNECT from a relay, naming `source_peer_id` (raw bytes).
+pub fn stop_connect_raw(source_peer_id: Vec<u8>) -> Vec<u8> {
+    let msg = StopMessage {
+        kind: StopMessageType::Connect,
+        peer: Some(Peer {
+            id: source_peer_id,
+            addrs: Vec::new(),
+        }),
+        limit: None,
+        status: None,
+    };
+    relay_encode_frame(&msg.encode())
+}
+
+/// A framed STOP CONNECT from a relay, naming `source` as the initiator.
+pub fn stop_connect(source: &PeerId) -> Vec<u8> {
+    stop_connect_raw(source.to_bytes())
+}
+
+/// A framed DCUtR SYNC.
+pub fn dcutr_sync() -> Vec<u8> {
+    let msg = HolePunch {
+        kind: HolePunchType::Sync,
+        obs_addrs: Vec::new(),
+    };
+    dcutr_encode_frame(&msg.encode())
+}
+
+/// Counts `SendRandomUdp` actions.
+pub fn blast_count(actions: &[NatAction]) -> usize {
+    actions
+        .iter()
+        .filter(|action| matches!(action, NatAction::SendRandomUdp { .. }))
+        .count()
 }
 
 /// A framed HOP STATUS:OK reservation response with an optional expiry.

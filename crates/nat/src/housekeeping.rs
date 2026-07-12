@@ -903,7 +903,7 @@ impl Housekeeping {
                 self.reservations
                     .on_stream_input(stream, input, shared, now);
             }
-            StreamRole::HopConnect(_) => {}
+            StreamRole::HopConnect(_) | StreamRole::StopInbound(_) => {}
         }
     }
 
