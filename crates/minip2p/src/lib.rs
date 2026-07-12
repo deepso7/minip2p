@@ -6,9 +6,17 @@
 //! small batteries-included API for identity, QUIC, listen/dial, ping, and
 //! event polling.
 
+#[cfg(feature = "nat")]
+mod nat;
+
 pub use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
 pub use minip2p_identify::IdentifyMessage;
 pub use minip2p_identity::Ed25519Keypair;
+#[cfg(feature = "nat")]
+pub use minip2p_nat::{
+    ConnectId, NatConfig, NatError, NatEvent, Path, ReachabilityState, ReservationInfo,
+    ReservationPolicy,
+};
 pub use minip2p_quic::QuicLimits;
 use minip2p_quic::{QuicEndpoint, QuicNodeConfig};
 pub use minip2p_swarm::{
@@ -25,8 +33,21 @@ const DEFAULT_AGENT_VERSION: &str = "minip2p/0.1.0";
 /// `Endpoint` owns identity, transport, and the std swarm driver. Advanced
 /// users can still borrow the underlying [`Swarm`] with [`Endpoint::swarm`]
 /// and [`Endpoint::swarm_mut`].
+///
+/// With the `nat` cargo feature and a NAT configuration
+/// (`EndpointBuilder::relay` / `EndpointBuilder::nat_config`), the endpoint
+/// additionally runs the `minip2p_nat::NatAgent` traversal orchestrator:
+/// see `Endpoint::connect`, `Endpoint::wait_path`, and
+/// `Endpoint::take_nat_events`.
 pub struct Endpoint {
     swarm: Swarm<QuicEndpoint>,
+    #[cfg(feature = "nat")]
+    nat: Option<nat::NatDriver>,
+    /// Application events set aside while a NAT-focused wait
+    /// (`Endpoint::wait_path`, `Endpoint::next_nat_event`) was driving
+    /// the endpoint; drained first by [`Endpoint::next_event`].
+    #[cfg(feature = "nat")]
+    pending_events: std::collections::VecDeque<Event>,
 }
 
 impl Endpoint {
@@ -42,12 +63,31 @@ impl Endpoint {
 
     /// Starts listening on the transport's first already-bound address.
     pub fn listen(&mut self) -> Result<PeerAddr, Error> {
-        self.swarm.listen_on_bound_addr()
+        let addr = self.swarm.listen_on_bound_addr()?;
+        self.sync_nat_listen_addrs(std::slice::from_ref(&addr));
+        Ok(addr)
     }
 
     /// Starts listening on all transport-bound addresses.
     pub fn listen_all(&mut self) -> Result<Vec<PeerAddr>, Error> {
-        self.swarm.listen_on_bound_addrs()
+        let addrs = self.swarm.listen_on_bound_addrs()?;
+        self.sync_nat_listen_addrs(&addrs);
+        Ok(addrs)
+    }
+
+    /// Seeds the NAT agent's advertised addresses from the bound set
+    /// (wildcards and non-QUIC shapes filtered out). No-op without the
+    /// `nat` feature or when NAT is not configured.
+    #[allow(unused_variables)]
+    fn sync_nat_listen_addrs(&mut self, addrs: &[PeerAddr]) {
+        #[cfg(feature = "nat")]
+        if let Some(nat) = self.nat.as_mut() {
+            let transports: Vec<Multiaddr> =
+                addrs.iter().map(|addr| addr.transport().clone()).collect();
+            let validated =
+                minip2p_core::select_direct_candidates(&transports, None, None).into_addrs();
+            nat.agent.set_listen_addrs(&validated);
+        }
     }
 
     /// Dials a remote peer on every applicable local address family.
@@ -135,8 +175,32 @@ impl Endpoint {
     }
 
     /// Polls the endpoint once and returns all currently available events.
+    ///
+    /// With NAT configured, events belonging to the traversal agent are
+    /// consumed here (never surfaced to the application); the agent's own
+    /// events accumulate for `Endpoint::take_nat_events`.
     pub fn poll(&mut self) -> Result<Vec<Event>, Error> {
-        self.swarm.poll()
+        #[cfg(feature = "nat")]
+        {
+            let polled = self.swarm.poll()?;
+            let mut events: Vec<Event> = self.pending_events.drain(..).collect();
+            match self.nat.as_mut() {
+                Some(nat) => {
+                    for event in polled {
+                        if !nat.ingest(&event, &mut self.swarm) {
+                            events.push(event);
+                        }
+                    }
+                    nat.tick(&mut self.swarm);
+                }
+                None => events.extend(polled),
+            }
+            Ok(events)
+        }
+        #[cfg(not(feature = "nat"))]
+        {
+            self.swarm.poll()
+        }
     }
 
     /// Returns the next event, waiting internally until `deadline`.
@@ -144,7 +208,52 @@ impl Endpoint {
     /// `deadline` accepts an [`std::time::Instant`], a relative
     /// [`std::time::Duration`], or [`Deadline::NEVER`] to wait indefinitely.
     pub fn next_event(&mut self, deadline: impl Into<Deadline>) -> Result<Option<Event>, Error> {
+        let deadline = deadline.into();
+        #[cfg(feature = "nat")]
+        if self.nat.is_some() {
+            return self.next_event_with_nat(deadline);
+        }
         self.swarm.poll_next(deadline)
+    }
+
+    /// `next_event` with the NAT agent folded into the wait: the sleep
+    /// budget never overshoots the agent's next timer, agent-owned stream
+    /// events are consumed instead of surfaced, and ticks run between
+    /// waits.
+    #[cfg(feature = "nat")]
+    fn next_event_with_nat(&mut self, deadline: Deadline) -> Result<Option<Event>, Error> {
+        loop {
+            if let Some(event) = self.pending_events.pop_front() {
+                return Ok(Some(event));
+            }
+            let step = {
+                let nat = self.nat.as_ref().expect("nat checked by caller");
+                match nat.agent.next_timeout(nat.now().mono_ms) {
+                    Some(ms) => deadline
+                        .earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1)))),
+                    None => deadline,
+                }
+            };
+            let polled = self.swarm.poll_next(step)?;
+            let nat = self.nat.as_mut().expect("nat checked by caller");
+            match polled {
+                Some(event) => {
+                    let consumed = nat.ingest(&event, &mut self.swarm);
+                    nat.tick(&mut self.swarm);
+                    if !consumed {
+                        return Ok(Some(event));
+                    }
+                }
+                None => {
+                    nat.tick(&mut self.swarm);
+                    // Distinguish the caller's deadline from a mere agent
+                    // timer that shortened this wait step.
+                    if deadline.has_passed() {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
     }
 
     /// Waits until a peer is ready or `deadline` expires.
@@ -174,6 +283,155 @@ impl Endpoint {
         })
     }
 
+    /// Starts a NAT-traversing connect toward `peer` with no known direct
+    /// addresses: the relay leg carries the attempt and DCUtR upgrades it.
+    ///
+    /// Progress arrives as [`NatEvent`]s ([`Endpoint::take_nat_events`]);
+    /// [`Endpoint::wait_path`] blocks for the outcome.
+    #[cfg(feature = "nat")]
+    pub fn connect(&mut self, peer: &PeerId) -> Result<ConnectId, Error> {
+        self.connect_with_addrs(peer.clone(), Vec::new())
+    }
+
+    /// Starts a NAT-traversing connect racing dials of `direct_addrs`
+    /// against the relay leg.
+    #[cfg(feature = "nat")]
+    pub fn connect_with_addrs(
+        &mut self,
+        peer: PeerId,
+        direct_addrs: Vec<Multiaddr>,
+    ) -> Result<ConnectId, Error> {
+        let Some(nat) = self.nat.as_mut() else {
+            return Err(Error::Invariant {
+                reason: "NAT traversal is not configured; use EndpointBuilder::relay / nat_config",
+            });
+        };
+        let now = nat.now();
+        let id = nat.agent.connect(peer, direct_addrs, now);
+        nat.pump(&mut self.swarm);
+        Ok(id)
+    }
+
+    /// Starts a NAT-traversing connect toward a known peer address.
+    #[cfg(feature = "nat")]
+    pub fn connect_addr(&mut self, addr: &PeerAddr) -> Result<ConnectId, Error> {
+        self.connect_with_addrs(addr.peer_id().clone(), vec![addr.transport().clone()])
+    }
+
+    /// Abandons a connect attempt. Streams it holds are reset; no further
+    /// events are emitted for `id`.
+    #[cfg(feature = "nat")]
+    pub fn cancel_connect(&mut self, id: ConnectId) {
+        if let Some(nat) = self.nat.as_mut() {
+            let now = nat.now();
+            nat.agent.cancel(id, now);
+            nat.pump(&mut self.swarm);
+        }
+    }
+
+    /// Waits for the first usable path of connect attempt `id`.
+    ///
+    /// Returns `Ok(Some(path))` on [`NatEvent::PathEstablished`] (the event
+    /// is consumed), and `Ok(None)` when the attempt failed or `deadline`
+    /// passed — on failure the [`NatEvent::ConnectFailed`] stays queued so
+    /// its error remains inspectable via [`Endpoint::take_nat_events`].
+    /// Application events arriving meanwhile are buffered for later
+    /// [`Endpoint::next_event`] calls, never dropped.
+    #[cfg(feature = "nat")]
+    pub fn wait_path(
+        &mut self,
+        id: ConnectId,
+        deadline: impl Into<Deadline>,
+    ) -> Result<Option<Path>, Error> {
+        let deadline = deadline.into();
+        loop {
+            {
+                let Some(nat) = self.nat.as_mut() else {
+                    return Err(Error::Invariant {
+                        reason: "NAT traversal is not configured",
+                    });
+                };
+                if let Some(index) = nat.events.iter().position(|event| {
+                    matches!(
+                        event,
+                        NatEvent::PathEstablished { connect_id, .. } if *connect_id == id
+                    )
+                }) {
+                    let Some(NatEvent::PathEstablished { path, .. }) = nat.events.remove(index)
+                    else {
+                        unreachable!("position matched PathEstablished");
+                    };
+                    return Ok(Some(path));
+                }
+                if nat.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        NatEvent::ConnectFailed { connect_id, .. } if *connect_id == id
+                    )
+                }) {
+                    return Ok(None);
+                }
+            }
+            match self.next_event_with_nat(deadline)? {
+                Some(event) => self.pending_events.push_back(event),
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Drains all queued NAT events.
+    #[cfg(feature = "nat")]
+    pub fn take_nat_events(&mut self) -> Vec<NatEvent> {
+        match self.nat.as_mut() {
+            Some(nat) => nat.events.drain(..).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Returns the next NAT event, waiting internally until `deadline`.
+    /// Application events arriving meanwhile are buffered for
+    /// [`Endpoint::next_event`].
+    #[cfg(feature = "nat")]
+    pub fn next_nat_event(
+        &mut self,
+        deadline: impl Into<Deadline>,
+    ) -> Result<Option<NatEvent>, Error> {
+        let deadline = deadline.into();
+        loop {
+            match self.nat.as_mut() {
+                Some(nat) => {
+                    if let Some(event) = nat.events.pop_front() {
+                        return Ok(Some(event));
+                    }
+                }
+                None => return Ok(None),
+            }
+            match self.next_event_with_nat(deadline)? {
+                Some(event) => self.pending_events.push_back(event),
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Our current reachability verdict from AutoNAT probing
+    /// ([`ReachabilityState::Unknown`] until probes gather confidence, or
+    /// when NAT is not configured).
+    #[cfg(feature = "nat")]
+    pub fn reachability(&self) -> ReachabilityState {
+        self.nat
+            .as_ref()
+            .map(|nat| nat.agent.reachability())
+            .unwrap_or_default()
+    }
+
+    /// The relay reservation currently held, if any.
+    #[cfg(feature = "nat")]
+    pub fn active_reservation(&self) -> Option<ReservationInfo> {
+        self.nat
+            .as_ref()
+            .and_then(|nat| nat.agent.active_reservation().cloned())
+    }
+
     /// Borrows the underlying swarm.
     pub fn swarm(&self) -> &Swarm<QuicEndpoint> {
         &self.swarm
@@ -196,6 +454,12 @@ pub struct EndpointBuilder {
     agent_version: String,
     quic_limits: QuicLimits,
     protocols: Vec<String>,
+    #[cfg(feature = "nat")]
+    nat_config: Option<NatConfig>,
+    #[cfg(feature = "nat")]
+    relays: Vec<PeerAddr>,
+    #[cfg(feature = "nat")]
+    autonat_servers: Vec<PeerAddr>,
 }
 
 impl Default for EndpointBuilder {
@@ -205,8 +469,24 @@ impl Default for EndpointBuilder {
             agent_version: DEFAULT_AGENT_VERSION.to_string(),
             quic_limits: QuicLimits::default(),
             protocols: Vec::new(),
+            #[cfg(feature = "nat")]
+            nat_config: None,
+            #[cfg(feature = "nat")]
+            relays: Vec::new(),
+            #[cfg(feature = "nat")]
+            autonat_servers: Vec::new(),
         }
     }
+}
+
+/// Validated builder output consumed by the bind step.
+struct BuilderParts {
+    keypair: Ed25519Keypair,
+    agent_version: String,
+    quic_limits: QuicLimits,
+    protocols: Vec<String>,
+    #[cfg(feature = "nat")]
+    nat_config: Option<NatConfig>,
 }
 
 impl EndpointBuilder {
@@ -241,28 +521,57 @@ impl EndpointBuilder {
         self
     }
 
+    /// Adds a relay for NAT traversal (circuit legs and reservations), in
+    /// preference order. Configuring at least one relay (or calling
+    /// [`EndpointBuilder::nat_config`]) enables the traversal agent.
+    #[cfg(feature = "nat")]
+    pub fn relay(mut self, relay: PeerAddr) -> Self {
+        self.relays.push(relay);
+        self
+    }
+
+    /// Adds an AutoNAT server used for reachability probing.
+    #[cfg(feature = "nat")]
+    pub fn autonat_server(mut self, server: PeerAddr) -> Self {
+        self.autonat_servers.push(server);
+        self
+    }
+
+    /// Sets the base NAT configuration (timeouts, punch retries,
+    /// reservation policy, …). Relays and AutoNAT servers added through
+    /// [`EndpointBuilder::relay`] / [`EndpointBuilder::autonat_server`] are
+    /// appended to the config's own lists.
+    #[cfg(feature = "nat")]
+    pub fn nat_config(mut self, config: NatConfig) -> Self {
+        self.nat_config = Some(config);
+        self
+    }
+
     /// Builds an endpoint with a QUIC transport bound to `bind_addr`.
     pub fn bind_quic(self, bind_addr: impl AsRef<str>) -> Result<Endpoint, Error> {
-        let (keypair, agent_version, limits, protocols) = self.into_parts()?;
-        let config = QuicNodeConfig::new(keypair.clone()).with_limits(limits);
+        let parts = self.into_parts()?;
+        let config =
+            QuicNodeConfig::new(parts.keypair.clone()).with_limits(parts.quic_limits.clone());
         let transport = QuicEndpoint::bind(config, bind_addr.as_ref())?;
-        build_endpoint(keypair, agent_version, protocols, transport)
+        build_endpoint(parts, transport)
     }
 
     /// Builds an endpoint with a QUIC transport bound to a QUIC multiaddr.
     pub fn bind_quic_multiaddr(self, addr: &Multiaddr) -> Result<Endpoint, Error> {
-        let (keypair, agent_version, limits, protocols) = self.into_parts()?;
-        let config = QuicNodeConfig::new(keypair.clone()).with_limits(limits);
+        let parts = self.into_parts()?;
+        let config =
+            QuicNodeConfig::new(parts.keypair.clone()).with_limits(parts.quic_limits.clone());
         let transport = QuicEndpoint::bind_multiaddr(config, addr)?;
-        build_endpoint(keypair, agent_version, protocols, transport)
+        build_endpoint(parts, transport)
     }
 
     /// Builds an endpoint with separate IPv4 and IPv6 wildcard QUIC sockets.
     pub fn bind_quic_dual_stack(self) -> Result<Endpoint, Error> {
-        let (keypair, agent_version, limits, protocols) = self.into_parts()?;
-        let config = QuicNodeConfig::new(keypair.clone()).with_limits(limits);
+        let parts = self.into_parts()?;
+        let config =
+            QuicNodeConfig::new(parts.keypair.clone()).with_limits(parts.quic_limits.clone());
         let transport = QuicEndpoint::dual_stack(config)?;
-        build_endpoint(keypair, agent_version, protocols, transport)
+        build_endpoint(parts, transport)
     }
 
     /// Validates the static configuration and decomposes the builder.
@@ -270,7 +579,7 @@ impl EndpointBuilder {
     /// Reserved protocol ids are rejected here -- before any socket is
     /// bound -- so a configuration error can neither allocate resources
     /// nor be masked by a bind failure.
-    fn into_parts(self) -> Result<(Ed25519Keypair, String, QuicLimits, Vec<String>), Error> {
+    fn into_parts(self) -> Result<BuilderParts, Error> {
         if let Some(protocol) = self
             .protocols
             .iter()
@@ -281,27 +590,71 @@ impl EndpointBuilder {
             }
             .into());
         }
-        Ok((
-            self.keypair.unwrap_or_else(Ed25519Keypair::generate),
-            self.agent_version,
-            self.quic_limits,
-            self.protocols,
-        ))
+        #[cfg(feature = "nat")]
+        let nat_config = {
+            let enabled = self.nat_config.is_some()
+                || !self.relays.is_empty()
+                || !self.autonat_servers.is_empty();
+            enabled.then(|| {
+                let mut config = self.nat_config.unwrap_or_default();
+                config.relays.extend(self.relays);
+                config.autonat_servers.extend(self.autonat_servers);
+                config
+            })
+        };
+        Ok(BuilderParts {
+            keypair: self.keypair.unwrap_or_else(Ed25519Keypair::generate),
+            agent_version: self.agent_version,
+            quic_limits: self.quic_limits,
+            protocols: self.protocols,
+            #[cfg(feature = "nat")]
+            nat_config,
+        })
     }
 }
 
-fn build_endpoint(
-    keypair: Ed25519Keypair,
-    agent_version: String,
-    protocols: Vec<String>,
-    transport: QuicEndpoint,
-) -> Result<Endpoint, Error> {
-    let mut builder = SwarmBuilder::new(&keypair).agent_version(agent_version);
+fn build_endpoint(parts: BuilderParts, transport: QuicEndpoint) -> Result<Endpoint, Error> {
+    let mut builder = SwarmBuilder::new(&parts.keypair).agent_version(parts.agent_version);
+    #[cfg(feature = "nat")]
+    let mut protocols = parts.protocols;
+    #[cfg(not(feature = "nat"))]
+    let protocols = parts.protocols;
+    #[cfg(feature = "nat")]
+    if parts.nat_config.is_some() {
+        // The traversal agent's protocols are ordinary user protocols; the
+        // swarm just needs to accept and route them.
+        for id in [
+            minip2p_nat::HOP_PROTOCOL_ID,
+            minip2p_nat::STOP_PROTOCOL_ID,
+            minip2p_nat::DCUTR_PROTOCOL_ID,
+            minip2p_nat::AUTONAT_PROTOCOL_ID,
+        ] {
+            if !protocols.iter().any(|existing| existing == id) {
+                protocols.push(id.to_string());
+            }
+        }
+    }
     for protocol in protocols {
         builder = builder.protocol(protocol);
     }
     let swarm = builder.build(transport)?;
-    Ok(Endpoint { swarm })
+    #[cfg(feature = "nat")]
+    let nat = parts.nat_config.map(|config| {
+        let relay_addrs = config
+            .relays
+            .iter()
+            .map(|relay| (relay.peer_id().clone(), relay.transport().clone()))
+            .collect();
+        let agent = minip2p_nat::NatAgent::new(swarm.local_peer_id().clone(), config);
+        nat::NatDriver::new(agent, relay_addrs)
+    });
+    Ok(Endpoint {
+        swarm,
+        #[cfg(feature = "nat")]
+        nat,
+        #[cfg(feature = "nat")]
+        pending_events: std::collections::VecDeque::new(),
+    })
 }
 
 #[cfg(test)]

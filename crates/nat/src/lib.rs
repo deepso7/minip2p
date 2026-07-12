@@ -48,3 +48,9 @@ pub use agent::NatAgent;
 pub use config::{NatConfig, ReservationPolicy};
 pub use events::{NatAction, NatEvent};
 pub use types::{ConnectId, NatError, NatToken, Now, Path, ReachabilityState, ReservationInfo};
+
+// Protocol ids for everything the agent drives, so a driver can register
+// them without depending on each protocol crate.
+pub use minip2p_autonat::AUTONAT_PROTOCOL_ID;
+pub use minip2p_dcutr::DCUTR_PROTOCOL_ID;
+pub use minip2p_relay::{HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};

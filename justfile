@@ -14,6 +14,7 @@ clippy:
 
 test:
     cargo test
+    cargo test -p minip2p --features nat
 
 check-nostd:
     rustup target add thumbv7em-none-eabi

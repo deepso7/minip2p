@@ -71,9 +71,20 @@ loop {
 }
 ```
 
-The `minip2p` facade (feature `nat`, upcoming) wires exactly this loop into
-`Endpoint` so applications get `connect(&peer)` / `wait_path(...)` without
-touching the pump.
+The `minip2p` facade (cargo feature `nat`) wires exactly this loop into
+`Endpoint` so applications get `connect(&peer)` / `wait_path(...)` /
+`take_nat_events()` without touching the pump:
+
+```rust,ignore
+let mut node = minip2p::Endpoint::builder()
+    .relay(relay_peer_addr)
+    .bind_quic("0.0.0.0:0")?;
+node.listen_all()?;
+let id = node.connect_with_addrs(peer, candidate_addrs)?;
+if let Some(path) = node.wait_path(id, std::time::Duration::from_secs(30))? {
+    println!("reached peer via {path:?}");
+}
+```
 
 ## Own-side housekeeping
 

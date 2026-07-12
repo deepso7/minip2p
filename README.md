@@ -28,7 +28,7 @@ Sans-I/O core crates (`no_std + alloc`):
 
 Runtime adapters (`std`):
 
-- `crates/minip2p` (`minip2p`): app-facing facade that glues identity, QUIC, and the std swarm driver into an `Endpoint` API.
+- `crates/minip2p` (`minip2p`): app-facing facade that glues identity, QUIC, and the std swarm driver into an `Endpoint` API. The opt-in `nat` cargo feature wires the `minip2p-nat` traversal agent into `Endpoint` (`connect`/`wait_path`/`take_nat_events`, relay reservations, AutoNAT probing) with zero changes to the feature-off API.
 - `transports/quic` (`minip2p-quic`): QUIC transport adapter built on `quiche`, with libp2p TLS baked in.
 - `crates/swarm` (also ships a thin `std` driver `Swarm<T: Transport>` behind the `std` feature).
 
@@ -45,6 +45,7 @@ Current validated behavior:
 - Pure-state-machine integration test covering Circuit Relay v2 + DCUtR (reservation, connect, stop, hole-punch coordination).
 - AutoNAT reachability probe wire logic and state machines in `minip2p-autonat`.
 - Manual cross-network test against a rust-libp2p relay validates HOP reservation, STOP circuit establishment, DCUtR coordination, IPv6 hole punching, direct ping, and relay-ping fallback.
+- NAT-traversal orchestration (`minip2p-nat`): scripted agent tests for the dialer race, housekeeping, and responder side; a two-agent relay-emulator integration test; and a loopback QUIC e2e through the `minip2p` facade's `nat` feature.
 
 ## Architecture boundaries
 
