@@ -488,16 +488,21 @@ enum ResState {
 pub(crate) struct ReservationManager {
     state: ResState,
     relay_idx: usize,
+    /// The initial policy reconciliation is an immediate timer source. Once
+    /// it runs, later policy flips call `sync` directly from probe handling.
+    needs_sync: bool,
     /// Set while renewing or reconnecting so a failure emits
     /// [`NatEvent::RelayReservationLost`] exactly once.
     held: Option<PeerId>,
 }
 
 impl ReservationManager {
-    fn new() -> Self {
+    fn new(config: &crate::NatConfig) -> Self {
         Self {
             state: ResState::Idle,
             relay_idx: 0,
+            needs_sync: !config.relays.is_empty()
+                && config.reservation_policy != ReservationPolicy::Never,
             held: None,
         }
     }
@@ -517,6 +522,7 @@ impl ReservationManager {
 
     /// Reconciles the state machine with the policy and clock.
     fn sync(&mut self, verdict: ReachabilityState, shared: &mut Shared, now: Now) {
+        self.needs_sync = false;
         let wanted = self.wanted(shared, verdict);
         if !wanted {
             self.release(shared);
@@ -918,6 +924,7 @@ impl ReservationManager {
 
     fn next_deadline(&self) -> Option<u64> {
         match &self.state {
+            ResState::Idle if self.needs_sync => Some(0),
             ResState::Idle => None,
             ResState::Acquiring { deadline, .. } => Some(*deadline),
             ResState::Reserved { info, .. } => Some(info.renew_at_mono_ms),
@@ -941,7 +948,7 @@ impl Housekeeping {
     pub(crate) fn new(config: &crate::NatConfig) -> Self {
         Self {
             prober: Prober::new(!config.autonat_servers.is_empty()),
-            reservations: ReservationManager::new(),
+            reservations: ReservationManager::new(config),
         }
     }
 

@@ -279,8 +279,10 @@ impl NatAgent {
     /// Drivers use this to consume rejected inbound control streams.
     pub fn handle_event_with_disposition(&mut self, event: &SwarmEvent, now: Now) -> bool {
         let mut handled = false;
+        let mut touched_state = false;
         match event {
             SwarmEvent::ConnectionEstablished { peer_id } => {
+                touched_state = true;
                 let superseded = !self.shared.connected.insert(peer_id.clone());
                 if superseded {
                     // The swarm's last-connection-wins policy emits a second
@@ -316,6 +318,7 @@ impl NatAgent {
                 }
             }
             SwarmEvent::ConnectionClosed { peer_id } => {
+                touched_state = true;
                 self.shared.connected.remove(peer_id);
                 self.shared.ready.remove(peer_id);
                 for attempt in self.attempts.values_mut() {
@@ -332,6 +335,7 @@ impl NatAgent {
                 self.shared.released_bridges.remove(peer_id);
             }
             SwarmEvent::PeerReady { peer_id, protocols } => {
+                touched_state = true;
                 self.shared.ready.insert(peer_id.clone(), protocols.clone());
                 for attempt in self.attempts.values_mut() {
                     attempt.on_peer_ready(peer_id, protocols, &mut self.shared, now);
@@ -386,6 +390,7 @@ impl NatAgent {
                 } else {
                     handled = self.route_stream(peer_id, *stream_id, StreamInput::Ready, now);
                 }
+                touched_state = handled;
             }
             SwarmEvent::StreamData {
                 peer_id,
@@ -393,10 +398,12 @@ impl NatAgent {
                 data,
             } => {
                 handled = self.route_stream(peer_id, *stream_id, StreamInput::Data(data), now);
+                touched_state = handled;
             }
             SwarmEvent::StreamRemoteWriteClosed { peer_id, stream_id } => {
                 handled =
                     self.route_stream(peer_id, *stream_id, StreamInput::RemoteWriteClosed, now);
+                touched_state = handled;
             }
             SwarmEvent::StreamClosed { peer_id, stream_id } => {
                 if let Some(id) = self.shared.take_released_bridge(peer_id, *stream_id) {
@@ -406,12 +413,20 @@ impl NatAgent {
                     }
                 } else {
                     handled = self.route_stream(peer_id, *stream_id, StreamInput::Closed, now);
+                    if handled {
+                        self.shared.release_stream(peer_id, *stream_id);
+                    }
                 }
-                self.shared.release_stream(peer_id, *stream_id);
+                touched_state = handled;
             }
             _ => {}
         }
-        self.reap_done();
+        // Foreign application stream events stop after their single registry
+        // lookup. Only state that actually visited a NAT machine can make an
+        // attempt or inbound circuit reapable.
+        if touched_state {
+            self.reap_done();
+        }
         handled
     }
 

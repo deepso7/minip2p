@@ -12,7 +12,6 @@ use minip2p_core::{Multiaddr, PeerId, Protocol};
 use minip2p_nat::{NatAction, NatAgent, NatEvent, Now};
 use minip2p_quic::QuicEndpoint;
 use minip2p_swarm::{Swarm, SwarmEvent};
-use minip2p_transport::StreamId;
 
 /// Drives a [`NatAgent`] against the endpoint's swarm.
 pub(crate) struct NatDriver {
@@ -55,25 +54,24 @@ impl NatDriver {
 
     /// Feeds one swarm event to the agent and executes its cascade.
     ///
-    /// Returns `true` when the event belongs to an agent-owned stream and
-    /// must not be forwarded to the application. Ownership is checked both
-    /// before and after the agent runs, so a stream claimed *during* the
-    /// event (an inbound STOP) and one released *by* the event (a close)
-    /// are both consumed.
+    /// Returns `true` when the event belongs to the NAT control plane and
+    /// must not be forwarded to the application. The agent's disposition is
+    /// authoritative even when handling claims or releases the stream.
     pub(crate) fn ingest(&mut self, event: &SwarmEvent, swarm: &mut Swarm<QuicEndpoint>) -> bool {
-        let owned_before =
-            stream_key(event).is_some_and(|(peer, stream)| self.agent.owns_stream(peer, stream));
         let now = self.now();
         let handled = self.agent.handle_event_with_disposition(event, now);
-        let owned_after =
-            stream_key(event).is_some_and(|(peer, stream)| self.agent.owns_stream(peer, stream));
         self.pump(swarm);
-        handled || owned_before || owned_after
+        handled
     }
 
-    /// Advances the agent's timers and executes any resulting work.
+    /// Advances timers only when the agent reports a due deadline, then
+    /// executes any resulting work.
     pub(crate) fn tick(&mut self, swarm: &mut Swarm<QuicEndpoint>) {
-        self.agent.handle_tick(self.now());
+        let now = self.now();
+        if self.agent.next_timeout(now.mono_ms) != Some(0) {
+            return;
+        }
+        self.agent.handle_tick(now);
         self.pump(swarm);
     }
 
@@ -192,21 +190,6 @@ impl NatDriver {
             }
         }
         swarm.set_external_addresses(addrs);
-    }
-}
-
-/// The (peer, stream) a stream-scoped swarm event refers to.
-fn stream_key(event: &SwarmEvent) -> Option<(&PeerId, StreamId)> {
-    match event {
-        SwarmEvent::StreamReady {
-            peer_id, stream_id, ..
-        }
-        | SwarmEvent::StreamData {
-            peer_id, stream_id, ..
-        }
-        | SwarmEvent::StreamRemoteWriteClosed { peer_id, stream_id }
-        | SwarmEvent::StreamClosed { peer_id, stream_id } => Some((peer_id, *stream_id)),
-        _ => None,
     }
 }
 

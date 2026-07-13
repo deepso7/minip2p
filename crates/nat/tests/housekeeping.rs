@@ -181,6 +181,18 @@ impl Hk {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn initial_reservation_policy_arms_only_the_needed_tick() {
+    let mut wanted = build(ReservationPolicy::Always, 1, 0);
+    assert_eq!(wanted.agent.next_timeout(0), Some(0));
+    wanted.agent.handle_tick(at(0));
+    let relay = wanted.relay.clone();
+    assert_eq!(dial_count_for(&drain_actions(&mut wanted.agent), &relay), 1);
+
+    let not_wanted = build(ReservationPolicy::Never, 1, 0);
+    assert_eq!(not_wanted.agent.next_timeout(0), None);
+}
+
+#[test]
 fn confidence_window_flips_once_and_never_flaps_on_one_probe() {
     let mut hk = build(ReservationPolicy::Never, 0, 1);
     assert_eq!(hk.agent.reachability(), ReachabilityState::Unknown);
