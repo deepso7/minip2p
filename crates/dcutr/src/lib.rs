@@ -278,10 +278,9 @@ impl DcutrInitiator {
 
         let (reply, consumed) = match decode_frame(&self.recv_buf) {
             FrameDecode::Complete { payload, consumed } => {
-                let reply = HolePunch::decode(payload).map_err(|e| {
-                    self.state = InitiatorState::Done;
-                    DcutrError::Malformed(e)
-                })?;
+                let reply = HolePunch::decode(payload)
+                    .map_err(DcutrError::Malformed)
+                    .map_err(|e| self.fail_reply(e))?;
                 (reply, consumed)
             }
             // Only the incomplete remainder is bounded: a complete frame
@@ -289,28 +288,27 @@ impl DcutrInitiator {
             // it, so the backstop can never reject a frame the decoder
             // would accept.
             FrameDecode::Incomplete => {
-                enforce_max_size(&self.recv_buf).inspect_err(|_| {
-                    self.state = InitiatorState::Done;
-                })?;
+                if let Err(e) = enforce_max_size(&self.recv_buf) {
+                    return Err(self.fail_reply(e));
+                }
                 return Ok(());
             }
             FrameDecode::TooLarge { len } => {
-                self.state = InitiatorState::Done;
-                return Err(DcutrError::FrameTooLarge { len });
+                return Err(self.fail_reply(DcutrError::FrameTooLarge { len }));
             }
             FrameDecode::Error(e) => {
-                self.state = InitiatorState::Done;
-                return Err(DcutrError::Malformed(DcutrMessageError::Varint(e)));
+                return Err(self.fail_reply(DcutrError::Malformed(DcutrMessageError::Varint(e))));
             }
         };
         self.recv_buf.drain(..consumed);
 
         if reply.kind != HolePunchType::Connect {
-            self.state = InitiatorState::Done;
-            return Err(DcutrError::UnexpectedMessage(alloc::format!(
-                "expected HolePunch CONNECT but got {:?}",
-                reply.kind
-            )));
+            return Err(
+                self.fail_reply(DcutrError::UnexpectedMessage(alloc::format!(
+                    "expected HolePunch CONNECT but got {:?}",
+                    reply.kind
+                ))),
+            );
         }
 
         self.state = InitiatorState::ReadyToSync;
@@ -326,6 +324,14 @@ impl DcutrInitiator {
         self.emitted_outcome = false;
 
         Ok(())
+    }
+
+    /// Terminates a failed reply exchange without retaining attacker-controlled
+    /// protocol input or its backing allocation.
+    fn fail_reply(&mut self, error: DcutrError) -> DcutrError {
+        self.state = InitiatorState::Done;
+        self.recv_buf = Vec::new();
+        error
     }
 }
 
@@ -774,11 +780,13 @@ mod tests {
         let mut init = DcutrInitiator::new(&[]);
         let _ = init.take_outbound();
 
-        let malformed = encode_frame(&[0xff]);
+        let mut malformed = encode_frame(&[0xff]);
+        malformed.extend_from_slice(&vec![0xaa; MAX_MESSAGE_SIZE * 2]);
         let err = init.on_data(&malformed, 0).unwrap_err();
         assert!(matches!(err, DcutrError::Malformed(_)));
         assert!(init.is_done());
         assert_eq!(init.take_trailing_data(), None);
+        assert_eq!(init.recv_buf.capacity(), 0);
     }
 
     #[test]
@@ -792,6 +800,7 @@ mod tests {
         assert!(matches!(err, DcutrError::FrameTooLarge { .. }));
         assert!(init.is_done());
         assert_eq!(init.take_trailing_data(), None);
+        assert_eq!(init.recv_buf.capacity(), 0);
     }
 
     #[test]
