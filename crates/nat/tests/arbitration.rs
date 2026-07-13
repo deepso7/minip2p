@@ -534,7 +534,7 @@ fn relay_refusal_fails_when_no_direct_leg_remains() {
 }
 
 #[test]
-fn pipelined_bridge_bytes_reach_dcutr_before_any_later_event() {
+fn initiator_reply_coalesced_with_application_data_preserves_remainder() {
     let mut h = Harness::with_relay(NatConfig::default());
     let id = h.agent.connect(h.target.clone(), Vec::new(), at(0));
     let actions = drain_actions(&mut h.agent);
@@ -553,14 +553,20 @@ fn pipelined_bridge_bytes_reach_dcutr_before_any_later_event() {
     // STATUS:OK and the responder's DCUtR CONNECT coalesced in one read:
     // the pipelined bytes must feed the just-created DCUtR machine inside
     // the same cascade.
+    let app_data = b"application bytes after dcutr reply";
     let mut coalesced = hop_status(Status::Ok);
     coalesced.extend(dcutr_connect_reply(&[maddr(REMOTE_OBSERVED_ADDR)]));
+    coalesced.extend_from_slice(app_data);
     h.stream_data(stream, coalesced, at(100));
 
     let events = drain_events(&mut h.agent);
     assert!(matches!(
         events.as_slice(),
-        [NatEvent::PathEstablished { connect_id, path: Path::Relayed { .. }, .. }] if *connect_id == id
+        [NatEvent::PathEstablished {
+            connect_id,
+            path: Path::Relayed { pending_data, .. },
+            ..
+        }] if *connect_id == id && pending_data == app_data
     ));
     let actions = drain_actions(&mut h.agent);
     assert_eq!(
@@ -574,6 +580,17 @@ fn pipelined_bridge_bytes_reach_dcutr_before_any_later_event() {
         "DCUtR CONNECT and SYNC both go out"
     );
     assert!(!h.agent.owns_stream(&h.relay, stream));
+
+    h.target_connected(at(110));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::PathUpgraded {
+            connect_id,
+            from: Path::Relayed { pending_data, .. },
+            to: Path::DirectPunched,
+            ..
+        }] if *connect_id == id && pending_data.is_empty()
+    ));
 }
 
 #[test]

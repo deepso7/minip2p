@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use minip2p_core::PeerId;
 use minip2p_transport::StreamId;
 
@@ -71,6 +73,11 @@ pub enum Path {
         relay: PeerId,
         /// The bridged stream (originally the HOP CONNECT stream).
         stream_id: StreamId,
+        /// Application bytes received in the same transport read after the
+        /// final initiator-side DCUtR frame. Consume these before waiting for
+        /// later `StreamData` events; they are surfaced exactly once on the
+        /// original relayed `PathEstablished` event.
+        pending_data: Vec<u8>,
         /// Whether the remote write half reached EOF while the NAT control
         /// plane still owned the bridge. When true, the original stream event
         /// was consumed and will not be delivered again.

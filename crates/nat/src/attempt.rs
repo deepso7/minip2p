@@ -59,6 +59,9 @@ pub(crate) struct ConnectAttempt {
     bridge_released: bool,
     /// The remote write half reached EOF while the bridge was agent-owned.
     bridge_remote_write_closed: bool,
+    /// Application bytes coalesced behind the initiator-side DCUtR reply.
+    /// Drained exactly once into the first relayed `PathEstablished` event.
+    bridge_pending_data: Vec<u8>,
     punch_addrs: Vec<Multiaddr>,
     punch_dials_issued: bool,
     /// Absolute deadline of the current punch window.
@@ -107,6 +110,7 @@ impl ConnectAttempt {
             bridge_alive: false,
             bridge_released: false,
             bridge_remote_write_closed: false,
+            bridge_pending_data: Vec::new(),
             punch_addrs: Vec::new(),
             punch_dials_issued: false,
             punch_deadline: None,
@@ -715,6 +719,7 @@ impl ConnectAttempt {
             self.issue_punch_dials(shared);
         }
 
+        let relay_peer = self.relay_peer().cloned();
         if let Some(dcutr) = self.dcutr.as_mut() {
             match dcutr.handle_input(DcutrInitiatorInput::SendSync) {
                 Ok(()) => {
@@ -724,7 +729,7 @@ impl ConnectAttempt {
                             sync_frames.push(data);
                         }
                     }
-                    if let Some(relay_peer) = self.relay_peer().cloned() {
+                    if let Some(relay_peer) = relay_peer {
                         for data in sync_frames {
                             shared.push_action(NatAction::SendStream {
                                 peer: relay_peer.clone(),
@@ -733,6 +738,7 @@ impl ConnectAttempt {
                             });
                         }
                     }
+                    self.bridge_pending_data = dcutr.take_trailing_data().unwrap_or_default();
                 }
                 Err(e) => {
                     self.dcutr = None;
@@ -856,12 +862,22 @@ impl ConnectAttempt {
         let Some(relay) = self.relay_peer().cloned() else {
             return;
         };
+        let remote_write_closed = self.bridge_remote_write_closed;
         let path = Path::Relayed {
+            relay: relay.clone(),
+            stream_id: stream,
+            pending_data: core::mem::take(&mut self.bridge_pending_data),
+            remote_write_closed,
+        };
+        // `pending_data` is a one-shot handoff. Keep only stable path
+        // identity in `best`, so a later PathUpgraded event cannot surface
+        // the same bytes a second time.
+        self.best = Some(Path::Relayed {
             relay,
             stream_id: stream,
-            remote_write_closed: self.bridge_remote_write_closed,
-        };
-        self.best = Some(path.clone());
+            pending_data: Vec::new(),
+            remote_write_closed,
+        });
         shared.push_event(NatEvent::PathEstablished {
             connect_id: self.id,
             peer: self.peer.clone(),

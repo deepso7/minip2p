@@ -231,6 +231,19 @@ impl DcutrInitiator {
         self.state == InitiatorState::Done
     }
 
+    /// Returns bytes received after the CONNECT reply in the same stream
+    /// read.
+    ///
+    /// Once DCUtR completes, the caller normally hands the relay stream to
+    /// its application. Keeping this remainder available avoids dropping
+    /// application data that was coalesced behind the reply by the
+    /// transport. Returns `None` until SYNC has been flushed, leaving the
+    /// active decode buffer untouched. After completion, the trailing bytes
+    /// are returned (and drained) exactly once.
+    pub fn take_trailing_data(&mut self) -> Option<Vec<u8>> {
+        (self.state == InitiatorState::Done).then(|| core::mem::take(&mut self.recv_buf))
+    }
+
     /// Queues the SYNC message to be sent.
     ///
     /// Call this after you have initiated your simultaneous dial, per the
@@ -298,9 +311,9 @@ impl DcutrInitiator {
         }
 
         self.state = InitiatorState::ReadyToSync;
-        // Nothing further is expected inbound; free any trailing bytes the
-        // peer coalesced behind the reply instead of retaining them.
-        self.recv_buf = Vec::new();
+        // Nothing further is expected inbound. Bytes coalesced behind the
+        // reply belong to the application and remain available through
+        // `take_trailing_data` after SYNC has been flushed.
         let remote_addrs = decode_remote_addrs(&reply.obs_addrs);
         self.outcome = Some(InitiatorOutcome::DialNow {
             remote_addrs,
@@ -723,12 +736,12 @@ mod tests {
     }
 
     #[test]
-    fn initiator_drops_bytes_after_reply_instead_of_buffering() {
+    fn initiator_exposes_bytes_coalesced_after_reply_once_complete() {
         let mut init = DcutrInitiator::new(&[]);
         let _ = init.take_outbound();
 
-        // Reply arrives coalesced with trailing garbage: the reply must
-        // decode and the garbage must not be retained.
+        // Reply arrives coalesced with application bytes. They cannot be
+        // handed over before the protocol finishes.
         let mut coalesced = frame(HolePunch {
             kind: HolePunchType::Connect,
             obs_addrs: Vec::new(),
@@ -739,12 +752,18 @@ mod tests {
             init.outcome(),
             Some(InitiatorOutcome::DialNow { .. })
         ));
-        assert!(init.recv_buf.is_empty());
+        assert_eq!(init.take_trailing_data(), None);
 
         // Before the caller sends SYNC (`ReadyToSync`), further peer bytes
         // must be dropped, not buffered without bound.
         init.on_data(&[0xbb; 1024], 7).unwrap();
-        assert!(init.recv_buf.is_empty());
+        assert_eq!(init.take_trailing_data(), None);
+
+        init.send_sync().unwrap();
+        let _ = init.take_outbound();
+        assert!(init.is_done());
+        assert_eq!(init.take_trailing_data(), Some(vec![0xaa; 512]));
+        assert_eq!(init.take_trailing_data(), Some(Vec::new()));
     }
 
     #[test]
