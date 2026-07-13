@@ -28,11 +28,19 @@ Ranking: `DirectDialed` ≈ `DirectPunched` > `Relayed`.
 
 ## The relayed path is a raw bridge stream
 
-`Path::Relayed { relay, stream_id }` is **not** a full swarm connection: no
-identify, ping, or multistream-select runs over the circuit. Exchange raw
-bytes on `stream_id` (addressed to the relay peer) with `Swarm::send_stream`
-and receive them as ordinary `StreamData` events. A circuit transport that
-makes relayed paths look like normal connections is future work.
+`Path::Relayed { relay, stream_id, pending_data, remote_write_closed }` is
+**not** a full swarm connection: no identify, ping, or multistream-select runs
+over the circuit. Exchange raw bytes on `stream_id` (addressed to the relay
+peer) with `Swarm::send_stream` and receive later bytes as ordinary
+`StreamData` events.
+
+At handoff, consume `pending_data` before waiting for `StreamData`; it contains
+application bytes that arrived in the same transport read as the final DCUtR
+frame and is surfaced exactly once on the original `PathEstablished` event.
+When `remote_write_closed` is true, treat the remote read side as EOF after
+draining `pending_data`: the NAT agent already consumed that stream event, so
+the application will not receive it again. A circuit transport that makes
+relayed paths look like normal connections is future work.
 
 ## Driving the agent
 
@@ -46,9 +54,11 @@ agent.set_listen_addrs(&validated_external_addrs);
 let id = agent.connect(target_peer, candidate_addrs, now());
 
 loop {
-    // 1. Feed swarm events by reference; consume stream events the agent
-    //    owns (agent.owns_stream) instead of forwarding them to the app.
-    agent.handle_event(&swarm_event, now());
+    // 1. Feed swarm events by reference. The disposition stays true even
+    //    when handling claims or releases a control-plane stream, so only
+    //    forward events for which it returns false to the application.
+    let consumed = agent.handle_event_with_disposition(&swarm_event, now());
+    if !consumed { /* forward swarm_event to the application */ }
     // 2. Execute actions, echoing synchronous results back.
     while let Some(action) = agent.poll_action() {
         match action {

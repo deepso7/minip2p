@@ -15,6 +15,8 @@ use minip2p_relay::{
 pub enum ConnectRequestOutcome {
     /// The target held a reservation and a STOP CONNECT was queued for it.
     Bridging {
+        /// Opaque token tying the STOP response to this CONNECT request.
+        pending_id: PendingConnectId,
         target: PeerId,
         /// Bytes pipelined behind the HOP CONNECT frame.
         trailing: Vec<u8>,
@@ -35,6 +37,10 @@ pub enum RelayEvent {
     StatusOkSentToInitiator,
 }
 
+/// Opaque identity for a HOP CONNECT awaiting its target's STOP response.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PendingConnectId(u64);
+
 /// Minimal in-memory HOP/STOP relay used by protocol and NAT-agent tests.
 ///
 /// It validates real framed relay messages, stores reservations, queues STOP
@@ -42,7 +48,14 @@ pub enum RelayEvent {
 #[derive(Default)]
 pub struct RelayEmulator {
     reservations: HashMap<PeerId, ReservationChannels>,
+    pending_connects: HashMap<PendingConnectId, PendingConnect>,
+    next_connect_id: u64,
     pub events: Vec<RelayEvent>,
+}
+
+struct PendingConnect {
+    initiator: PeerId,
+    target: PeerId,
 }
 
 #[derive(Default)]
@@ -147,17 +160,31 @@ impl RelayEmulator {
         channels
             .stop_inbox
             .extend(encode_frame(&stop_connect.encode()));
-        self.events.push(RelayEvent::ConnectBridgedBetween {
-            initiator: initiator.clone(),
-            target: target.clone(),
-        });
-        Ok(ConnectRequestOutcome::Bridging { target, trailing })
+        let pending_id = PendingConnectId(self.next_connect_id);
+        self.next_connect_id = self.next_connect_id.wrapping_add(1);
+        self.pending_connects.insert(
+            pending_id,
+            PendingConnect {
+                initiator: initiator.clone(),
+                target: target.clone(),
+            },
+        );
+        Ok(ConnectRequestOutcome::Bridging {
+            pending_id,
+            target,
+            trailing,
+        })
     }
 
-    /// Handles a complete STOP STATUS:OK frame, queues HOP STATUS:OK for the
-    /// initiator, and returns any bytes already belonging to the bridge.
+    /// Handles the target's STOP response for one pending HOP CONNECT.
+    ///
+    /// The pending token and target must identify the same CONNECT. On a
+    /// successful STOP STATUS:OK, this queues HOP STATUS:OK for the initiator
+    /// and returns any bytes already belonging to the bridge.
     pub fn on_stop_ack_from_target(
         &mut self,
+        pending_id: PendingConnectId,
+        target: &PeerId,
         bytes: &[u8],
         initiator_inbox: &mut Vec<u8>,
     ) -> Result<Vec<u8>, RelayEmulatorError> {
@@ -165,6 +192,22 @@ impl RelayEmulator {
         if msg.kind != StopMessageType::Status || msg.status != Some(Status::Ok) {
             return Err(RelayEmulatorError::Unexpected("expected STOP STATUS:OK"));
         }
+
+        let pending =
+            self.pending_connects
+                .get(&pending_id)
+                .ok_or(RelayEmulatorError::Unexpected(
+                    "no matching pending CONNECT",
+                ))?;
+        if &pending.target != target {
+            return Err(RelayEmulatorError::Unexpected(
+                "STOP response target does not match pending CONNECT",
+            ));
+        }
+        let pending = self
+            .pending_connects
+            .remove(&pending_id)
+            .expect("pending CONNECT was checked above");
 
         let ok = HopMessage {
             kind: HopMessageType::Status,
@@ -174,6 +217,10 @@ impl RelayEmulator {
             status: Some(Status::Ok),
         };
         initiator_inbox.extend(encode_frame(&ok.encode()));
+        self.events.push(RelayEvent::ConnectBridgedBetween {
+            initiator: pending.initiator,
+            target: pending.target,
+        });
         self.events.push(RelayEvent::StatusOkSentToInitiator);
         Ok(bytes[consumed..].to_vec())
     }
@@ -209,5 +256,133 @@ fn decode_stop_message(bytes: &[u8]) -> Result<(StopMessage, usize), RelayEmulat
             .map(|message| (message, consumed))
             .map_err(|_| RelayEmulatorError::Unexpected("bad STOP")),
         _ => Err(RelayEmulatorError::Unexpected("incomplete STOP frame")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(tag: &[u8]) -> PeerId {
+        PeerId::from_public_key_protobuf(tag)
+    }
+
+    fn reserve(relay: &mut RelayEmulator, target: &PeerId) {
+        let request = HopMessage {
+            kind: HopMessageType::Reserve,
+            peer: None,
+            reservation: None,
+            limit: None,
+            status: None,
+        };
+        relay
+            .on_reserve_request(target, &encode_frame(&request.encode()))
+            .unwrap();
+        relay.events.clear();
+    }
+
+    fn connect(relay: &mut RelayEmulator, initiator: &PeerId, target: &PeerId) -> PendingConnectId {
+        let request = HopMessage {
+            kind: HopMessageType::Connect,
+            peer: Some(Peer {
+                id: target.to_bytes(),
+                addrs: Vec::new(),
+            }),
+            reservation: None,
+            limit: None,
+            status: None,
+        };
+        let mut inbox = Vec::new();
+        let outcome = relay
+            .on_connect_request(initiator, &encode_frame(&request.encode()), &mut inbox)
+            .unwrap();
+        assert!(inbox.is_empty());
+        match outcome {
+            ConnectRequestOutcome::Bridging { pending_id, .. } => pending_id,
+            ConnectRequestOutcome::Refused { .. } => panic!("reserved target was refused"),
+        }
+    }
+
+    fn stop_ok() -> Vec<u8> {
+        encode_frame(
+            &StopMessage {
+                kind: StopMessageType::Status,
+                peer: None,
+                limit: None,
+                status: Some(Status::Ok),
+            }
+            .encode(),
+        )
+    }
+
+    #[test]
+    fn bridge_event_is_emitted_only_after_stop_accepts() {
+        let initiator = peer(b"initiator");
+        let target = peer(b"target");
+        let mut relay = RelayEmulator::new();
+        reserve(&mut relay, &target);
+
+        let pending_id = connect(&mut relay, &initiator, &target);
+        assert!(relay.events.is_empty(), "CONNECT is still pending STOP ACK");
+
+        let mut inbox = Vec::new();
+        relay
+            .on_stop_ack_from_target(pending_id, &target, &stop_ok(), &mut inbox)
+            .unwrap();
+        assert!(!inbox.is_empty(), "initiator receives HOP STATUS:OK");
+        assert_eq!(
+            relay.events,
+            [
+                RelayEvent::ConnectBridgedBetween { initiator, target },
+                RelayEvent::StatusOkSentToInitiator,
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_ack_must_match_pending_connect_context() {
+        let initiator_a = peer(b"initiator-a");
+        let initiator_b = peer(b"initiator-b");
+        let target_a = peer(b"target-a");
+        let target_b = peer(b"target-b");
+        let mut relay = RelayEmulator::new();
+        reserve(&mut relay, &target_a);
+        reserve(&mut relay, &target_b);
+        let pending_a = connect(&mut relay, &initiator_a, &target_a);
+        let pending_b = connect(&mut relay, &initiator_b, &target_b);
+        let ack = stop_ok();
+
+        let mut inbox = Vec::new();
+        let wrong_circuit = relay
+            .on_stop_ack_from_target(pending_a, &target_b, &ack, &mut inbox)
+            .unwrap_err();
+        assert_eq!(
+            wrong_circuit,
+            RelayEmulatorError::Unexpected("STOP response target does not match pending CONNECT")
+        );
+        assert!(inbox.is_empty());
+        assert!(relay.events.is_empty());
+
+        relay
+            .on_stop_ack_from_target(pending_a, &target_a, &ack, &mut inbox)
+            .unwrap();
+        inbox.clear();
+        let already_consumed = relay
+            .on_stop_ack_from_target(pending_a, &target_a, &ack, &mut inbox)
+            .unwrap_err();
+        assert_eq!(
+            already_consumed,
+            RelayEmulatorError::Unexpected("no matching pending CONNECT")
+        );
+        assert!(inbox.is_empty());
+
+        relay
+            .on_stop_ack_from_target(pending_b, &target_b, &ack, &mut inbox)
+            .unwrap();
+        assert!(relay.events.iter().any(|event| matches!(
+            event,
+            RelayEvent::ConnectBridgedBetween { initiator, target }
+                if initiator == &initiator_b && target == &target_b
+        )));
     }
 }

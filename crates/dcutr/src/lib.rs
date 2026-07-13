@@ -238,10 +238,13 @@ impl DcutrInitiator {
     /// its application. Keeping this remainder available avoids dropping
     /// application data that was coalesced behind the reply by the
     /// transport. Returns `None` until SYNC has been flushed, leaving the
-    /// active decode buffer untouched. After completion, the trailing bytes
-    /// are returned (and drained) exactly once.
+    /// active decode buffer untouched. After successful completion, the
+    /// trailing bytes are returned (and drained) exactly once. Failed
+    /// exchanges never expose buffered control-plane bytes as application
+    /// data.
     pub fn take_trailing_data(&mut self) -> Option<Vec<u8>> {
-        (self.state == InitiatorState::Done).then(|| core::mem::take(&mut self.recv_buf))
+        (self.state == InitiatorState::Done && self.outcome.is_some())
+            .then(|| core::mem::take(&mut self.recv_buf))
     }
 
     /// Queues the SYNC message to be sent.
@@ -764,6 +767,31 @@ mod tests {
         assert!(init.is_done());
         assert_eq!(init.take_trailing_data(), Some(vec![0xaa; 512]));
         assert_eq!(init.take_trailing_data(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn initiator_does_not_expose_malformed_protocol_bytes_as_trailing_data() {
+        let mut init = DcutrInitiator::new(&[]);
+        let _ = init.take_outbound();
+
+        let malformed = encode_frame(&[0xff]);
+        let err = init.on_data(&malformed, 0).unwrap_err();
+        assert!(matches!(err, DcutrError::Malformed(_)));
+        assert!(init.is_done());
+        assert_eq!(init.take_trailing_data(), None);
+    }
+
+    #[test]
+    fn initiator_does_not_expose_oversized_frame_as_trailing_data() {
+        let mut init = DcutrInitiator::new(&[]);
+        let _ = init.take_outbound();
+
+        let mut header = Vec::new();
+        minip2p_core::write_uvarint((MAX_MESSAGE_SIZE + 1) as u64, &mut header);
+        let err = init.on_data(&header, 0).unwrap_err();
+        assert!(matches!(err, DcutrError::FrameTooLarge { .. }));
+        assert!(init.is_done());
+        assert_eq!(init.take_trailing_data(), None);
     }
 
     #[test]

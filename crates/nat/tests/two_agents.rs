@@ -15,7 +15,7 @@ use minip2p_core::{PeerAddr, PeerId};
 use minip2p_nat::{ConnectId, NatAction, NatAgent, NatConfig, NatEvent, Path, ReservationPolicy};
 use minip2p_relay::{HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 use minip2p_swarm::SwarmEvent;
-use minip2p_test_support::{ConnectRequestOutcome, RelayEmulator};
+use minip2p_test_support::{ConnectRequestOutcome, PendingConnectId, RelayEmulator};
 use minip2p_transport::{ConnectionId, StreamId};
 
 const A_LISTEN: &str = "/ip4/198.51.100.10/udp/4100/quic-v1";
@@ -50,8 +50,9 @@ struct World {
     relay_emulator: RelayEmulator,
     /// Roles of relay-facing streams, per side.
     streams: Vec<(Side, StreamId, EmuStream)>,
-    /// (A's bridge stream, B's stop stream) once the STOP handshake ran.
-    bridge: Option<(StreamId, StreamId)>,
+    /// (A's bridge stream, B's stop stream, pending CONNECT) while the relay
+    /// coordinates the STOP handshake.
+    bridge: Option<(StreamId, StreamId, PendingConnectId)>,
     bridged: bool,
     /// Whether dials between A and B produce connections.
     deliver_direct: bool,
@@ -255,7 +256,12 @@ impl World {
                         .relay_emulator
                         .on_connect_request(&initiator, &data, &mut initiator_inbox)
                         .expect("valid CONNECT request");
-                    let ConnectRequestOutcome::Bridging { target, trailing } = outcome else {
+                    let ConnectRequestOutcome::Bridging {
+                        pending_id,
+                        target,
+                        trailing,
+                    } = outcome
+                    else {
                         panic!("B must already hold a reservation");
                     };
                     assert_eq!(target, self.b_id);
@@ -268,7 +274,7 @@ impl World {
                     self.next_stream += 1;
                     let stop_stream = StreamId::new(self.next_stream);
                     self.streams.push((Side::B, stop_stream, EmuStream::Stop));
-                    self.bridge = Some((stream, stop_stream));
+                    self.bridge = Some((stream, stop_stream, pending_id));
 
                     let relay = self.relay_id.clone();
                     self.b.handle_event(
@@ -287,12 +293,12 @@ impl World {
             Some(EmuStream::Stop) if !self.bridged => {
                 // B's answer to STOP CONNECT.
                 let mut initiator_inbox = Vec::new();
+                let (a_bridge, _, pending_id) = self.bridge.expect("bridge pending");
                 let trailing = self
                     .relay_emulator
-                    .on_stop_ack_from_target(&data, &mut initiator_inbox)
+                    .on_stop_ack_from_target(pending_id, &self.b_id, &data, &mut initiator_inbox)
                     .expect("B auto-accepts with STOP STATUS:OK");
                 self.bridged = true;
-                let (a_bridge, _) = self.bridge.expect("bridge pending");
                 self.deliver(Side::A, a_bridge, initiator_inbox);
                 // Anything B pipelined behind its STATUS already belongs to
                 // the bridge.
@@ -301,12 +307,12 @@ impl World {
                 }
             }
             Some(EmuStream::HopBridge) if self.bridged => {
-                let (_, b_stop) = self.bridge.expect("bridged");
+                let (_, b_stop, _) = self.bridge.expect("bridged");
                 self.deliver(Side::B, b_stop, data);
             }
             Some(EmuStream::Stop) => {
                 // Post-bridge bytes from B flow to A's bridge stream.
-                let (a_bridge, _) = self.bridge.expect("bridged");
+                let (a_bridge, _, _) = self.bridge.expect("bridged");
                 self.deliver(Side::A, a_bridge, data);
             }
             Some(EmuStream::HopBridge) => {

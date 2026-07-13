@@ -94,9 +94,9 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
         .on_connect_request(&peer_a, &connect_bytes, &mut initiator_inbox)
         .unwrap();
     assert!(matches!(
-        connect_request,
-        ConnectRequestOutcome::Bridging { target, trailing }
-            if target == peer_b && trailing.is_empty()
+        &connect_request,
+        ConnectRequestOutcome::Bridging { target, trailing, .. }
+            if target == &peer_b && trailing.is_empty()
     ));
     assert_eq!(initiator_inbox, Vec::<u8>::new(), "no refusal expected");
 
@@ -112,8 +112,11 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
     let b_stop_ok = stop_accept_flush(&mut b_stop);
 
     // Relay forwards the ack to A as HOP STATUS:OK.
+    let ConnectRequestOutcome::Bridging { pending_id, .. } = connect_request else {
+        unreachable!("CONNECT was checked as bridging above")
+    };
     let stop_trailing = relay
-        .on_stop_ack_from_target(&b_stop_ok, &mut initiator_inbox)
+        .on_stop_ack_from_target(pending_id, &peer_b, &b_stop_ok, &mut initiator_inbox)
         .unwrap();
     assert!(stop_trailing.is_empty());
 
