@@ -153,6 +153,7 @@ impl fmt::Display for Multiaddr {
                 Protocol::Udp(port) => write!(f, "/udp/{port}")?,
                 Protocol::QuicV1 => f.write_str("/quic-v1")?,
                 Protocol::P2p(peer_id) => write!(f, "/p2p/{peer_id}")?,
+                Protocol::P2pCircuit => f.write_str("/p2p-circuit")?,
             }
         }
         Ok(())
@@ -252,6 +253,10 @@ fn parse_multiaddr(input: &str) -> Result<Multiaddr, MultiaddrError> {
             }
             "quic-v1" => {
                 protocols.push(Protocol::QuicV1);
+                idx += 1;
+            }
+            "p2p-circuit" => {
+                protocols.push(Protocol::P2pCircuit);
                 idx += 1;
             }
             "p2p" => {
@@ -432,6 +437,35 @@ mod tests {
     #[test]
     fn binary_codec_round_trips_p2p_suffix() {
         let input = format!("/ip4/127.0.0.1/udp/4001/quic-v1/p2p/{PEER_ID}");
+        let addr = Multiaddr::from_str(&input).unwrap();
+        let bytes = addr.to_bytes();
+        let decoded = Multiaddr::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.to_string(), input);
+    }
+
+    #[test]
+    fn parses_and_formats_circuit_multiaddr() {
+        let input = format!("/ip4/127.0.0.1/udp/4001/quic-v1/p2p/{PEER_ID}/p2p-circuit");
+        let parsed = Multiaddr::from_str(&input).expect("must parse");
+
+        assert_eq!(parsed.to_string(), input);
+        // A circuit address is not a direct QUIC transport address.
+        assert!(!parsed.is_quic_transport());
+    }
+
+    /// Hand-derived reference vector for `/p2p-circuit`: varint code
+    /// 0x0122 -> A2 02, no value.
+    #[test]
+    fn binary_codec_reference_vector_p2p_circuit() {
+        let addr = Multiaddr::from_protocols(vec![Protocol::P2pCircuit]);
+        let expected: Vec<u8> = vec![0xA2, 0x02];
+        assert_eq!(addr.to_bytes(), expected);
+        assert_eq!(Multiaddr::from_bytes(&expected).unwrap(), addr);
+    }
+
+    #[test]
+    fn binary_codec_round_trips_circuit_suffix() {
+        let input = format!("/ip4/127.0.0.1/udp/4001/quic-v1/p2p/{PEER_ID}/p2p-circuit");
         let addr = Multiaddr::from_str(&input).unwrap();
         let bytes = addr.to_bytes();
         let decoded = Multiaddr::from_bytes(&bytes).unwrap();

@@ -33,3 +33,4 @@ getrandom = { version = "0.4.3", optional = true }
 [dev-dependencies]
 minip2p-relay = { path = "../relay" }
 minip2p-dcutr = { path = "../dcutr" }
+minip2p-test-support = { path = "../test-support" }

@@ -216,6 +216,11 @@ impl SwarmCore {
         self.local_addresses = addrs;
     }
 
+    /// The current snapshot of addresses Identify will advertise.
+    pub fn local_addresses(&self) -> &[Multiaddr] {
+        &self.local_addresses
+    }
+
     /// Registers an application protocol id that this swarm will accept on
     /// inbound streams and allow for outbound opens via
     /// [`Self::open_stream`].

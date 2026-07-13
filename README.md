@@ -24,10 +24,11 @@ Sans-I/O core crates (`no_std + alloc`):
 - `crates/autonat` (`minip2p-autonat`): AutoNAT reachability probe state machines.
 - `crates/dcutr` (`minip2p-dcutr`): DCUtR hole-punch coordination state machines (`DcutrInitiator`, `DcutrResponder`).
 - `crates/swarm` (`minip2p-swarm`): `SwarmCore` Sans-I/O orchestrator that composes the protocol state machines, tracks connections and streams, drives multistream-select, and emits actions/events for the driver.
+- `crates/nat` (`minip2p-nat`): `NatAgent` Sans-I/O NAT-traversal orchestrator — races direct dials against a relayed circuit, hole-punches with DCUtR over the bridge, and reports explicit path establish/upgrade/fallback events.
 
 Runtime adapters (`std`):
 
-- `crates/minip2p` (`minip2p`): app-facing facade that glues identity, QUIC, and the std swarm driver into an `Endpoint` API.
+- `crates/minip2p` (`minip2p`): app-facing facade that glues identity, QUIC, and the std swarm driver into an `Endpoint` API. The opt-in `nat` cargo feature wires the `minip2p-nat` traversal agent into `Endpoint` (`connect`/`wait_path`/`take_nat_events`, relay reservations, AutoNAT probing) with zero changes to the feature-off API.
 - `transports/quic` (`minip2p-quic`): QUIC transport adapter built on `quiche`, with libp2p TLS baked in.
 - `crates/swarm` (also ships a thin `std` driver `Swarm<T: Transport>` behind the `std` feature).
 
@@ -44,6 +45,7 @@ Current validated behavior:
 - Pure-state-machine integration test covering Circuit Relay v2 + DCUtR (reservation, connect, stop, hole-punch coordination).
 - AutoNAT reachability probe wire logic and state machines in `minip2p-autonat`.
 - Manual cross-network test against a rust-libp2p relay validates HOP reservation, STOP circuit establishment, DCUtR coordination, IPv6 hole punching, direct ping, and relay-ping fallback.
+- NAT-traversal orchestration (`minip2p-nat`): scripted agent tests for the dialer race, housekeeping, and responder side; a two-agent relay-emulator integration test; and a loopback QUIC e2e through the `minip2p` facade's `nat` feature.
 
 ## Architecture boundaries
 
@@ -124,7 +126,7 @@ Check `no_std` builds for the core crates:
 cargo check --no-default-features -p minip2p-core -p minip2p-identity \
     -p minip2p-transport -p minip2p-tls -p minip2p-identify \
     -p minip2p-multistream-select -p minip2p-ping -p minip2p-relay \
-    -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm
+    -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm -p minip2p-nat
 ```
 
 ## Documentation

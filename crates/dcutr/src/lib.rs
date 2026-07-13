@@ -231,6 +231,22 @@ impl DcutrInitiator {
         self.state == InitiatorState::Done
     }
 
+    /// Returns bytes received after the CONNECT reply in the same stream
+    /// read.
+    ///
+    /// Once DCUtR completes, the caller normally hands the relay stream to
+    /// its application. Keeping this remainder available avoids dropping
+    /// application data that was coalesced behind the reply by the
+    /// transport. Returns `None` until SYNC has been flushed, leaving the
+    /// active decode buffer untouched. After successful completion, the
+    /// trailing bytes are returned (and drained) exactly once. Failed
+    /// exchanges never expose buffered control-plane bytes as application
+    /// data.
+    pub fn take_trailing_data(&mut self) -> Option<Vec<u8>> {
+        (self.state == InitiatorState::Done && self.outcome.is_some())
+            .then(|| core::mem::take(&mut self.recv_buf))
+    }
+
     /// Queues the SYNC message to be sent.
     ///
     /// Call this after you have initiated your simultaneous dial, per the
@@ -262,10 +278,9 @@ impl DcutrInitiator {
 
         let (reply, consumed) = match decode_frame(&self.recv_buf) {
             FrameDecode::Complete { payload, consumed } => {
-                let reply = HolePunch::decode(payload).map_err(|e| {
-                    self.state = InitiatorState::Done;
-                    DcutrError::Malformed(e)
-                })?;
+                let reply = HolePunch::decode(payload)
+                    .map_err(DcutrError::Malformed)
+                    .map_err(|e| self.fail_reply(e))?;
                 (reply, consumed)
             }
             // Only the incomplete remainder is bounded: a complete frame
@@ -273,34 +288,33 @@ impl DcutrInitiator {
             // it, so the backstop can never reject a frame the decoder
             // would accept.
             FrameDecode::Incomplete => {
-                enforce_max_size(&self.recv_buf).inspect_err(|_| {
-                    self.state = InitiatorState::Done;
-                })?;
+                if let Err(e) = enforce_max_size(&self.recv_buf) {
+                    return Err(self.fail_reply(e));
+                }
                 return Ok(());
             }
             FrameDecode::TooLarge { len } => {
-                self.state = InitiatorState::Done;
-                return Err(DcutrError::FrameTooLarge { len });
+                return Err(self.fail_reply(DcutrError::FrameTooLarge { len }));
             }
             FrameDecode::Error(e) => {
-                self.state = InitiatorState::Done;
-                return Err(DcutrError::Malformed(DcutrMessageError::Varint(e)));
+                return Err(self.fail_reply(DcutrError::Malformed(DcutrMessageError::Varint(e))));
             }
         };
         self.recv_buf.drain(..consumed);
 
         if reply.kind != HolePunchType::Connect {
-            self.state = InitiatorState::Done;
-            return Err(DcutrError::UnexpectedMessage(alloc::format!(
-                "expected HolePunch CONNECT but got {:?}",
-                reply.kind
-            )));
+            return Err(
+                self.fail_reply(DcutrError::UnexpectedMessage(alloc::format!(
+                    "expected HolePunch CONNECT but got {:?}",
+                    reply.kind
+                ))),
+            );
         }
 
         self.state = InitiatorState::ReadyToSync;
-        // Nothing further is expected inbound; free any trailing bytes the
-        // peer coalesced behind the reply instead of retaining them.
-        self.recv_buf = Vec::new();
+        // Nothing further is expected inbound. Bytes coalesced behind the
+        // reply belong to the application and remain available through
+        // `take_trailing_data` after SYNC has been flushed.
         let remote_addrs = decode_remote_addrs(&reply.obs_addrs);
         self.outcome = Some(InitiatorOutcome::DialNow {
             remote_addrs,
@@ -310,6 +324,14 @@ impl DcutrInitiator {
         self.emitted_outcome = false;
 
         Ok(())
+    }
+
+    /// Terminates a failed reply exchange without retaining attacker-controlled
+    /// protocol input or its backing allocation.
+    fn fail_reply(&mut self, error: DcutrError) -> DcutrError {
+        self.state = InitiatorState::Done;
+        self.recv_buf = Vec::new();
+        error
     }
 }
 
@@ -391,6 +413,8 @@ enum ResponderState {
     AwaitingSync,
     /// SYNC received; flow complete.
     Done,
+    /// The exchange terminated with a protocol or construction error.
+    Failed,
 }
 
 impl DcutrResponder {
@@ -411,7 +435,7 @@ impl DcutrResponder {
         };
         let (connect_reply, state, pending_error) = match checked_outbound_frame(&reply.encode()) {
             Ok(frame) => (frame, ResponderState::AwaitingConnect, None),
-            Err(err) => (Vec::new(), ResponderState::Done, Some(err)),
+            Err(err) => (Vec::new(), ResponderState::Failed, Some(err)),
         };
 
         Self {
@@ -431,7 +455,7 @@ impl DcutrResponder {
 
     /// Feeds incoming stream bytes.
     fn on_data(&mut self, data: &[u8]) -> Result<(), DcutrError> {
-        if self.state == ResponderState::Done {
+        if matches!(self.state, ResponderState::Done | ResponderState::Failed) {
             return Ok(());
         }
 
@@ -450,25 +474,40 @@ impl DcutrResponder {
         self.events.drain(..).collect()
     }
 
-    /// Returns `true` if the flow has completed.
+    /// Returns `true` if the flow completed or terminated with an error.
     pub fn is_done(&self) -> bool {
-        self.state == ResponderState::Done
+        matches!(self.state, ResponderState::Done | ResponderState::Failed)
+    }
+
+    /// Returns bytes received after the final SYNC frame in the same stream
+    /// read.
+    ///
+    /// Once DCUtR completes, the caller normally hands the relay stream to
+    /// its application. Keeping this remainder available avoids dropping
+    /// application data that was coalesced behind SYNC by the transport.
+    /// Returns `None` while the exchange is incomplete, leaving the active
+    /// decode buffer untouched. After completion, the trailing bytes are
+    /// returned (and drained) exactly once.
+    pub fn take_trailing_data(&mut self) -> Option<Vec<u8>> {
+        (self.state == ResponderState::Done).then(|| core::mem::take(&mut self.recv_buf))
     }
 
     fn try_decode(&mut self) -> Result<(), DcutrError> {
         loop {
             if self.state == ResponderState::Done {
-                // The flow is complete; free any trailing bytes the peer
-                // coalesced behind the final frame instead of retaining
-                // them for the machine's lifetime.
-                self.recv_buf = Vec::new();
+                // The flow is complete. Any bytes coalesced behind SYNC
+                // belong to the application; the caller can drain them with
+                // `take_trailing_data` before handing over the raw stream.
+                return Ok(());
+            }
+            if self.state == ResponderState::Failed {
                 return Ok(());
             }
 
             let (msg, consumed) = match decode_frame(&self.recv_buf) {
                 FrameDecode::Complete { payload, consumed } => {
                     let msg = HolePunch::decode(payload).map_err(|e| {
-                        self.state = ResponderState::Done;
+                        self.state = ResponderState::Failed;
                         DcutrError::Malformed(e)
                     })?;
                     (msg, consumed)
@@ -480,16 +519,16 @@ impl DcutrResponder {
                 // the decoder would accept.
                 FrameDecode::Incomplete => {
                     enforce_max_size(&self.recv_buf).inspect_err(|_| {
-                        self.state = ResponderState::Done;
+                        self.state = ResponderState::Failed;
                     })?;
                     return Ok(());
                 }
                 FrameDecode::TooLarge { len } => {
-                    self.state = ResponderState::Done;
+                    self.state = ResponderState::Failed;
                     return Err(DcutrError::FrameTooLarge { len });
                 }
                 FrameDecode::Error(e) => {
-                    self.state = ResponderState::Done;
+                    self.state = ResponderState::Failed;
                     return Err(DcutrError::Malformed(DcutrMessageError::Varint(e)));
                 }
             };
@@ -515,7 +554,7 @@ impl DcutrResponder {
                     self.state = ResponderState::Done;
                 }
                 (current_state, actual_kind) => {
-                    self.state = ResponderState::Done;
+                    self.state = ResponderState::Failed;
                     return Err(DcutrError::UnexpectedMessage(alloc::format!(
                         "unexpected {:?} in state {:?}",
                         actual_kind,
@@ -706,12 +745,12 @@ mod tests {
     }
 
     #[test]
-    fn initiator_drops_bytes_after_reply_instead_of_buffering() {
+    fn initiator_exposes_bytes_coalesced_after_reply_once_complete() {
         let mut init = DcutrInitiator::new(&[]);
         let _ = init.take_outbound();
 
-        // Reply arrives coalesced with trailing garbage: the reply must
-        // decode and the garbage must not be retained.
+        // Reply arrives coalesced with application bytes. They cannot be
+        // handed over before the protocol finishes.
         let mut coalesced = frame(HolePunch {
             kind: HolePunchType::Connect,
             obs_addrs: Vec::new(),
@@ -722,21 +761,55 @@ mod tests {
             init.outcome(),
             Some(InitiatorOutcome::DialNow { .. })
         ));
-        assert!(init.recv_buf.is_empty());
+        assert_eq!(init.take_trailing_data(), None);
 
         // Before the caller sends SYNC (`ReadyToSync`), further peer bytes
         // must be dropped, not buffered without bound.
         init.on_data(&[0xbb; 1024], 7).unwrap();
-        assert!(init.recv_buf.is_empty());
+        assert_eq!(init.take_trailing_data(), None);
+
+        init.send_sync().unwrap();
+        let _ = init.take_outbound();
+        assert!(init.is_done());
+        assert_eq!(init.take_trailing_data(), Some(vec![0xaa; 512]));
+        assert_eq!(init.take_trailing_data(), Some(Vec::new()));
     }
 
     #[test]
-    fn responder_drops_trailing_bytes_after_flow_completes() {
+    fn initiator_does_not_expose_malformed_protocol_bytes_as_trailing_data() {
+        let mut init = DcutrInitiator::new(&[]);
+        let _ = init.take_outbound();
+
+        let mut malformed = encode_frame(&[0xff]);
+        malformed.extend_from_slice(&vec![0xaa; MAX_MESSAGE_SIZE * 2]);
+        let err = init.on_data(&malformed, 0).unwrap_err();
+        assert!(matches!(err, DcutrError::Malformed(_)));
+        assert!(init.is_done());
+        assert_eq!(init.take_trailing_data(), None);
+        assert_eq!(init.recv_buf.capacity(), 0);
+    }
+
+    #[test]
+    fn initiator_does_not_expose_oversized_frame_as_trailing_data() {
+        let mut init = DcutrInitiator::new(&[]);
+        let _ = init.take_outbound();
+
+        let mut header = Vec::new();
+        minip2p_core::write_uvarint((MAX_MESSAGE_SIZE + 1) as u64, &mut header);
+        let err = init.on_data(&header, 0).unwrap_err();
+        assert!(matches!(err, DcutrError::FrameTooLarge { .. }));
+        assert!(init.is_done());
+        assert_eq!(init.take_trailing_data(), None);
+        assert_eq!(init.recv_buf.capacity(), 0);
+    }
+
+    #[test]
+    fn responder_exposes_trailing_bytes_after_flow_completes() {
         let mut resp = DcutrResponder::new(&[]);
 
-        // CONNECT + SYNC + trailing garbage in one coalesced input: the
-        // flow completes and the garbage must not be retained for the
-        // machine's lifetime.
+        // CONNECT + SYNC + application bytes in one coalesced input: the
+        // flow completes, but the caller must be able to hand those bytes to
+        // the application with the released raw stream.
         let mut coalesced = frame(HolePunch {
             kind: HolePunchType::Connect,
             obs_addrs: Vec::new(),
@@ -748,7 +821,26 @@ mod tests {
         coalesced.extend_from_slice(&[0xcc; 512]);
         resp.on_data(&coalesced).unwrap();
         assert!(resp.is_done());
-        assert!(resp.recv_buf.is_empty());
+        assert_eq!(resp.take_trailing_data(), Some(vec![0xcc; 512]));
+        assert_eq!(resp.take_trailing_data(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn responder_cannot_drain_protocol_bytes_before_completion() {
+        let mut resp = DcutrResponder::new(&[]);
+        let connect = frame(HolePunch {
+            kind: HolePunchType::Connect,
+            obs_addrs: Vec::new(),
+        });
+        let split = connect.len() / 2;
+        resp.on_data(&connect[..split]).unwrap();
+
+        assert_eq!(resp.take_trailing_data(), None);
+        resp.on_data(&connect[split..]).unwrap();
+        assert!(matches!(
+            resp.poll_events().as_slice(),
+            [ResponderEvent::ConnectReceived { .. }]
+        ));
     }
 
     #[test]
@@ -927,6 +1019,7 @@ mod tests {
         });
         let err = resp.on_data(&sync).unwrap_err();
         assert!(matches!(err, DcutrError::UnexpectedMessage(_)));
+        assert_eq!(resp.take_trailing_data(), None);
     }
 
     #[test]

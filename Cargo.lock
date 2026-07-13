@@ -741,9 +741,11 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 name = "minip2p"
 version = "0.1.0"
 dependencies = [
+ "getrandom",
  "minip2p-core",
  "minip2p-identify",
  "minip2p-identity",
+ "minip2p-nat",
  "minip2p-quic",
  "minip2p-swarm",
  "minip2p-transport",
@@ -800,6 +802,20 @@ name = "minip2p-multistream-select"
 version = "0.1.0"
 dependencies = [
  "minip2p-core",
+ "thiserror",
+]
+
+[[package]]
+name = "minip2p-nat"
+version = "0.1.0"
+dependencies = [
+ "minip2p-autonat",
+ "minip2p-core",
+ "minip2p-dcutr",
+ "minip2p-relay",
+ "minip2p-swarm",
+ "minip2p-test-support",
+ "minip2p-transport",
  "thiserror",
 ]
 
@@ -870,8 +886,17 @@ dependencies = [
  "minip2p-multistream-select",
  "minip2p-ping",
  "minip2p-relay",
+ "minip2p-test-support",
  "minip2p-transport",
  "thiserror",
+]
+
+[[package]]
+name = "minip2p-test-support"
+version = "0.1.0"
+dependencies = [
+ "minip2p-core",
+ "minip2p-relay",
 ]
 
 [[package]]

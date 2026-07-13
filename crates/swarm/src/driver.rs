@@ -92,6 +92,24 @@ impl Deadline {
         Deadline(Some(instant))
     }
 
+    /// Whether the deadline has already passed. [`Deadline::NEVER`] never
+    /// passes.
+    pub fn has_passed(self) -> bool {
+        self.is_expired_at(Instant::now())
+    }
+
+    /// The earlier of two deadlines ([`Deadline::NEVER`] is latest).
+    ///
+    /// Lets callers fold an extra timer source into a wait without access
+    /// to the deadline's internals, mirroring how [`Swarm::poll_next`]
+    /// folds the core's protocol timers into its budget.
+    pub fn earliest(self, other: Deadline) -> Deadline {
+        match (self.0, other.0) {
+            (Some(a), Some(b)) => Deadline(Some(a.min(b))),
+            (a, b) => Deadline(a.or(b)),
+        }
+    }
+
     /// Whether the deadline has passed at `now`.
     fn is_expired_at(self, now: Instant) -> bool {
         self.0.is_some_and(|deadline| now >= deadline)
@@ -168,6 +186,11 @@ pub struct Swarm<T: Transport> {
     /// when the buffer drains.
     event_buffer: VecDeque<SwarmEvent>,
 
+    /// Externally validated addresses advertised through Identify in
+    /// addition to the transport's bound set. See
+    /// [`Swarm::set_external_addresses`].
+    external_addresses: Vec<Multiaddr>,
+
     /// Logical clock used to drive Sans-I/O timers.
     clock: Arc<dyn Clock>,
 }
@@ -210,8 +233,20 @@ impl<T: Transport> Swarm<T> {
             core: SwarmCore::new(identify_config, ping_config),
             local_peer_id,
             event_buffer: VecDeque::new(),
+            external_addresses: Vec::new(),
             clock,
         }
+    }
+
+    /// Sets externally validated addresses (e.g. AutoNAT-confirmed public
+    /// addresses or relay circuit addresses) to advertise through Identify
+    /// alongside the transport's bound addresses.
+    ///
+    /// Replaces the previous external set; pass an empty vector to stop
+    /// advertising extras. Duplicates of transport-bound addresses are
+    /// dropped.
+    pub fn set_external_addresses(&mut self, addrs: Vec<Multiaddr>) {
+        self.external_addresses = addrs;
     }
 
     /// Returns a reference to the underlying transport.
@@ -462,10 +497,15 @@ impl<T: Transport> Swarm<T> {
         let now_ms = self.now_ms();
 
         // 0. Refresh the core's snapshot of our listening addresses so
-        //    Identify advertises the current bound set. Cheap -- a
-        //    handful of multiaddrs at most.
-        self.core
-            .set_local_addresses(self.transport.local_addresses());
+        //    Identify advertises the current bound set plus any validated
+        //    external addresses. Cheap -- a handful of multiaddrs at most.
+        let mut local_addresses = self.transport.local_addresses();
+        for addr in &self.external_addresses {
+            if !local_addresses.contains(addr) {
+                local_addresses.push(addr.clone());
+            }
+        }
+        self.core.set_local_addresses(local_addresses);
 
         // 1. Feed transport events to the core.
         let events = self.transport.poll()?;
@@ -950,6 +990,37 @@ mod tests {
             PingConfig::default(),
             keypair.peer_id(),
         )
+    }
+
+    #[test]
+    fn external_addresses_merge_into_the_identify_snapshot() {
+        let mut swarm = idle_swarm();
+        let external: Multiaddr = "/ip4/203.0.113.9/udp/4001/quic-v1".parse().unwrap();
+        let circuit: Multiaddr = "/ip4/203.0.113.1/udp/4001/quic-v1/p2p-circuit"
+            .parse()
+            .unwrap();
+
+        swarm.set_external_addresses(vec![external.clone(), circuit.clone()]);
+        swarm.poll().unwrap();
+        // IdleTransport binds nothing, so the snapshot is exactly the
+        // external set.
+        assert_eq!(swarm.core().local_addresses(), &[external.clone(), circuit]);
+
+        // Replacing the set (here: clearing it) stops advertising extras.
+        swarm.set_external_addresses(Vec::new());
+        swarm.poll().unwrap();
+        assert!(swarm.core().local_addresses().is_empty());
+    }
+
+    #[test]
+    fn deadline_earliest_picks_the_sooner_deadline() {
+        let soon = Deadline::from(Duration::from_millis(10));
+        let later = Deadline::from(Duration::from_secs(60));
+        assert_eq!(soon.earliest(later), soon);
+        assert_eq!(later.earliest(soon), soon);
+        assert_eq!(Deadline::NEVER.earliest(soon), soon);
+        assert_eq!(soon.earliest(Deadline::NEVER), soon);
+        assert_eq!(Deadline::NEVER.earliest(Deadline::NEVER), Deadline::NEVER);
     }
 
     #[test]

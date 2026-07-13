@@ -31,6 +31,8 @@ pub const UDP_CODE: u64 = 0x0111;
 pub const QUIC_V1_CODE: u64 = 0x01cd;
 /// Multicodec code for `/p2p/<peer-id>`. Varint-length-prefixed multihash.
 pub const P2P_CODE: u64 = 0x01a5;
+/// Multicodec code for `/p2p-circuit`. No value.
+pub const P2P_CIRCUIT_CODE: u64 = 0x0122;
 
 /// A single component of a multiaddr.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -43,6 +45,7 @@ pub enum Protocol {
     Udp(u16),
     QuicV1,
     P2p(PeerId),
+    P2pCircuit,
 }
 
 impl Protocol {
@@ -65,6 +68,7 @@ impl Protocol {
             Self::Udp(_) => UDP_CODE,
             Self::QuicV1 => QUIC_V1_CODE,
             Self::P2p(_) => P2P_CODE,
+            Self::P2pCircuit => P2P_CIRCUIT_CODE,
         }
     }
 
@@ -84,7 +88,7 @@ impl Protocol {
                 out.extend_from_slice(body);
             }
             Self::Udp(port) => out.extend_from_slice(&port.to_be_bytes()),
-            Self::QuicV1 => {}
+            Self::QuicV1 | Self::P2pCircuit => {}
             Self::P2p(peer_id) => {
                 let body = peer_id.to_bytes();
                 write_uvarint(body.len() as u64, out);
@@ -117,6 +121,7 @@ impl Protocol {
                 Ok((Self::Udp(u16::from_be_bytes(value)), consumed))
             }
             QUIC_V1_CODE => Ok((Self::QuicV1, consumed)),
+            P2P_CIRCUIT_CODE => Ok((Self::P2pCircuit, consumed)),
             DNS_CODE | DNS4_CODE | DNS6_CODE => {
                 let label = match code {
                     DNS_CODE => "dns",
