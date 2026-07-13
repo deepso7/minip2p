@@ -763,3 +763,84 @@ fn wildcard_and_non_quic_candidates_are_filtered() {
         "wildcards, non-QUIC shapes, and duplicates never get dialed"
     );
 }
+
+#[test]
+fn identify_observed_addr_joins_dcutr_connect() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    // The relay's identify tells us our public mapping before any attempt.
+    identify_observed(
+        &mut h.agent,
+        &h.relay.clone(),
+        &maddr(OUR_OBSERVED_ADDR),
+        at(0),
+    );
+
+    let (_id, stream) = drive_to_bridged(&mut h, 10);
+    let actions = drain_actions(&mut h.agent);
+    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    assert!(
+        obs.contains(&maddr(LISTEN_ADDR)),
+        "bound addresses stay in the CONNECT"
+    );
+    assert!(
+        obs.contains(&maddr(OUR_OBSERVED_ADDR)),
+        "the peer-observed public mapping must be advertised for the punch"
+    );
+}
+
+#[test]
+fn latest_observation_per_peer_wins_and_disconnect_drops_it() {
+    let stale = "/ip4/203.0.113.77/udp/1111/quic-v1";
+    let departed = "/ip4/203.0.113.88/udp/2222/quic-v1";
+    let mut h = Harness::with_relay(NatConfig::default());
+
+    // Same reporter twice: only the fresh observation survives.
+    let target = h.target.clone();
+    identify_observed(&mut h.agent, &target, &maddr(stale), at(0));
+    identify_observed(&mut h.agent, &target, &maddr(OUR_OBSERVED_ADDR), at(1));
+    // A reporter whose connection closes takes its observation along.
+    let other = peer(b"other-peer");
+    identify_observed(&mut h.agent, &other, &maddr(departed), at(2));
+    h.agent
+        .handle_event(&SwarmEvent::ConnectionClosed { peer_id: other }, at(3));
+
+    let (_id, stream) = drive_to_bridged(&mut h, 10);
+    let actions = drain_actions(&mut h.agent);
+    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    assert!(obs.contains(&maddr(OUR_OBSERVED_ADDR)));
+    assert!(!obs.contains(&maddr(stale)), "replaced observation leaks");
+    assert!(!obs.contains(&maddr(departed)), "dropped observation leaks");
+}
+
+#[test]
+fn invalid_or_non_quic_observed_addrs_are_ignored() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    // Undecodable observed_addr bytes.
+    let relay = h.relay.clone();
+    h.agent.handle_event(
+        &SwarmEvent::IdentifyReceived {
+            peer_id: relay.clone(),
+            info: minip2p_swarm::IdentifyMessage {
+                observed_addr: Some(vec![0xff, 0xff, 0xff]),
+                ..minip2p_swarm::IdentifyMessage::default()
+            },
+        },
+        at(0),
+    );
+    // Well-formed but not a dialable QUIC transport.
+    identify_observed(
+        &mut h.agent,
+        &relay,
+        &maddr("/ip4/203.0.113.9/udp/4001"),
+        at(1),
+    );
+
+    let (_id, stream) = drive_to_bridged(&mut h, 10);
+    let actions = drain_actions(&mut h.agent);
+    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    assert_eq!(
+        obs,
+        vec![maddr(LISTEN_ADDR)],
+        "only the validated bound address may be advertised"
+    );
+}

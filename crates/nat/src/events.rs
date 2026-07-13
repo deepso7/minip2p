@@ -110,7 +110,12 @@ pub enum NatEvent {
     /// stream is a raw bridge; `pending_data` holds any bytes that arrived
     /// pipelined behind the circuit setup.
     InboundRelayCircuit {
+        /// The initiating peer on the far end of the circuit.
         peer: PeerId,
+        /// The relay the bridge runs through. The bridge stream lives on the
+        /// connection to this peer: `send_stream` / `close_stream_write` on
+        /// `stream_id` must address `relay`, not `peer`.
+        relay: PeerId,
         stream_id: StreamId,
         pending_data: Vec<u8>,
         /// `true` when the remote write half reached EOF before handoff. The

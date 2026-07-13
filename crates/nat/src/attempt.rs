@@ -560,7 +560,7 @@ impl ConnectAttempt {
         self.bridge_alive = true;
         self.hop = None;
 
-        let mut dcutr = DcutrInitiator::new(&shared.listen_addrs);
+        let mut dcutr = DcutrInitiator::new(&shared.punch_candidates());
         if let Err(e) = dcutr.handle_input(DcutrInitiatorInput::Flush) {
             // Deferred construction error (e.g. oversized CONNECT): the
             // punch cannot even start, but the relayed path stands and is

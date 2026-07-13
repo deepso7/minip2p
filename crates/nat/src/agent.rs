@@ -2,7 +2,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId};
+use minip2p_core::{Multiaddr, PeerId, select_direct_candidates};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -102,6 +102,12 @@ pub(crate) struct Shared {
     released_bridges: BTreeMap<PeerId, BTreeMap<StreamId, ConnectId>>,
     /// Our validated external/listen addresses, advertised in DCUtR CONNECT.
     pub(crate) listen_addrs: Vec<Multiaddr>,
+    /// Our transport address as observed by each connected peer (Identify's
+    /// `observedAddr`). Behind a NAT this is the public mapping of our QUIC
+    /// socket — the address that makes cross-NAT hole punching possible.
+    /// Entries are dropped when the reporting peer disconnects, which keeps
+    /// the map bounded by the connection count.
+    observed_addrs: BTreeMap<PeerId, Multiaddr>,
 }
 
 impl Shared {
@@ -172,6 +178,18 @@ impl Shared {
     pub(crate) fn forget_released_bridge(&mut self, peer: &PeerId, stream: StreamId) {
         let _ = self.take_released_bridge(peer, stream);
     }
+
+    /// Addresses advertised in DCUtR exchanges: the validated listen/external
+    /// set plus our peer-observed public mappings, deduplicated.
+    pub(crate) fn punch_candidates(&self) -> Vec<Multiaddr> {
+        let mut addrs = self.listen_addrs.clone();
+        for addr in self.observed_addrs.values() {
+            if !addrs.contains(addr) {
+                addrs.push(addr.clone());
+            }
+        }
+        addrs
+    }
 }
 
 /// Sans-I/O NAT-traversal orchestrator.
@@ -213,6 +231,7 @@ impl NatAgent {
                 ready: BTreeMap::new(),
                 released_bridges: BTreeMap::new(),
                 listen_addrs: Vec::new(),
+                observed_addrs: BTreeMap::new(),
             },
             attempts: BTreeMap::new(),
             housekeeping,
@@ -333,6 +352,21 @@ impl NatAgent {
                 // attempts have not already cleaned up.
                 self.shared.registry.remove(peer_id);
                 self.shared.released_bridges.remove(peer_id);
+                self.shared.observed_addrs.remove(peer_id);
+            }
+            SwarmEvent::IdentifyReceived { peer_id, info } => {
+                // The remote reports the transport address it sees us from.
+                // Behind a NAT that is our public mapping — the only usable
+                // DCUtR punch candidate, since bound addresses are private.
+                // The event stays application-visible (`handled` = false),
+                // and nothing here can complete a machine (`touched_state`
+                // stays false).
+                if let Some(Ok(addr)) = info.observed_addr.as_deref().map(Multiaddr::from_bytes) {
+                    let validated = select_direct_candidates(&[], Some(addr), None);
+                    if let Some(addr) = validated.into_addrs().pop() {
+                        self.shared.observed_addrs.insert(peer_id.clone(), addr);
+                    }
+                }
             }
             SwarmEvent::PeerReady { peer_id, protocols } => {
                 touched_state = true;
