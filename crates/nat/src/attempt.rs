@@ -57,6 +57,8 @@ pub(crate) struct ConnectAttempt {
     bridge_alive: bool,
     /// The bridge stream has been handed back to the application.
     bridge_released: bool,
+    /// The remote write half reached EOF while the bridge was agent-owned.
+    bridge_remote_write_closed: bool,
     punch_addrs: Vec<Multiaddr>,
     punch_dials_issued: bool,
     /// Absolute deadline of the current punch window.
@@ -104,6 +106,7 @@ impl ConnectAttempt {
             dcutr_sent_at: None,
             bridge_alive: false,
             bridge_released: false,
+            bridge_remote_write_closed: false,
             punch_addrs: Vec::new(),
             punch_dials_issued: false,
             punch_deadline: None,
@@ -237,6 +240,31 @@ impl ConnectAttempt {
         }
     }
 
+    /// Invalidates relay state carried by a connection that the swarm
+    /// superseded. Unlike an ordinary close, cleanup must not emit stream
+    /// resets: peer-scoped stream ids now address the replacement connection.
+    pub(crate) fn on_peer_superseded(&mut self, peer: &PeerId, shared: &mut Shared, now: Now) {
+        if self.done || !self.is_relay_peer(peer) {
+            return;
+        }
+        match self.leg {
+            RelayLeg::WaitRelayReady
+            | RelayLeg::OpeningHop
+            | RelayLeg::WaitHopReady { .. }
+            | RelayLeg::AwaitHopStatus { .. } => {
+                self.leg = RelayLeg::Failed;
+                self.relay_deadline = None;
+                self.hop = None;
+                self.last_error = Some(NatError::DialFailed(
+                    "relay connection was superseded".into(),
+                ));
+                self.fail_if_no_legs_remain(shared);
+            }
+            RelayLeg::Bridged { .. } => self.on_bridge_lost(shared, now),
+            _ => {}
+        }
+    }
+
     pub(crate) fn on_peer_ready(
         &mut self,
         peer: &PeerId,
@@ -276,7 +304,15 @@ impl ConnectAttempt {
             TokenPurpose::DirectDial(_) => {
                 self.direct_live = self.direct_live.saturating_sub(1);
                 self.last_error = Some(NatError::DialFailed(reason));
-                self.fail_if_no_legs_remain(shared);
+                if self.direct_live == 0
+                    && matches!(self.best, Some(Path::Relayed { .. }))
+                    && self.dcutr.is_none()
+                    && self.punch_deadline.is_none()
+                {
+                    self.settle_after_punch(shared);
+                } else {
+                    self.fail_if_no_legs_remain(shared);
+                }
             }
             TokenPurpose::RelayDial(_) => {
                 self.fail_relay_leg(shared, NatError::DialFailed(reason));
@@ -633,6 +669,7 @@ impl ConnectAttempt {
     }
 
     fn on_bridge_remote_write_closed(&mut self, stream: StreamId, shared: &mut Shared, now: Now) {
+        self.bridge_remote_write_closed = true;
         let Some(dcutr) = self.dcutr.as_mut() else {
             return;
         };
@@ -642,6 +679,24 @@ impl ConnectAttempt {
             return;
         }
         self.drain_dcutr_outputs(stream, shared, now);
+        if self.dcutr.is_some() {
+            // No more inbound bytes can complete the CONNECT reply. Release
+            // the still-writable relay bridge immediately, but keep original
+            // direct candidate dials alive so a late direct path can upgrade
+            // it before the connect deadline.
+            self.dcutr = None;
+            shared.push_event(NatEvent::HolePunchFailed {
+                connect_id: self.id,
+                attempt: self.punch_window.max(1),
+                reason: "relay bridge reached EOF before the DCUtR reply completed".into(),
+            });
+            self.punch_deadline = None;
+            self.release_bridge(shared);
+            self.announce_relay_path(stream, shared);
+            if self.direct_live == 0 {
+                self.settle_after_punch(shared);
+            }
+        }
     }
 
     /// The remote's observed addresses arrived: dial them all, send SYNC,
@@ -804,6 +859,7 @@ impl ConnectAttempt {
         let path = Path::Relayed {
             relay,
             stream_id: stream,
+            remote_write_closed: self.bridge_remote_write_closed,
         };
         self.best = Some(path.clone());
         shared.push_event(NatEvent::PathEstablished {

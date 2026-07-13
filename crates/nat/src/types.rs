@@ -71,6 +71,10 @@ pub enum Path {
         relay: PeerId,
         /// The bridged stream (originally the HOP CONNECT stream).
         stream_id: StreamId,
+        /// Whether the remote write half reached EOF while the NAT control
+        /// plane still owned the bridge. When true, the original stream event
+        /// was consumed and will not be delivered again.
+        remote_write_closed: bool,
     },
 }
 

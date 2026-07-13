@@ -199,7 +199,8 @@ fn confidence_window_flips_once_and_never_flaps_on_one_probe() {
         [NatEvent::ReachabilityChanged {
             old: ReachabilityState::Unknown,
             new: ReachabilityState::Public,
-        }]
+            confirmed_addrs,
+        }] if *confirmed_addrs == vec![maddr(LISTEN_ADDR)]
     ));
     assert_eq!(hk.agent.reachability(), ReachabilityState::Public);
 
@@ -221,7 +222,8 @@ fn confidence_window_flips_once_and_never_flaps_on_one_probe() {
         [NatEvent::ReachabilityChanged {
             old: ReachabilityState::Public,
             new: ReachabilityState::Private,
-        }]
+            confirmed_addrs,
+        }] if confirmed_addrs.is_empty()
     ));
     assert_eq!(hk.agent.reachability(), ReachabilityState::Private);
 }
@@ -250,6 +252,7 @@ fn confidence_threshold_above_window_clamps_to_unanimity() {
         [NatEvent::ReachabilityChanged {
             old: ReachabilityState::Unknown,
             new: ReachabilityState::Public,
+            ..
         }]
     ));
 }

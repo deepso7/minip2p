@@ -391,6 +391,8 @@ enum ResponderState {
     AwaitingSync,
     /// SYNC received; flow complete.
     Done,
+    /// The exchange terminated with a protocol or construction error.
+    Failed,
 }
 
 impl DcutrResponder {
@@ -411,7 +413,7 @@ impl DcutrResponder {
         };
         let (connect_reply, state, pending_error) = match checked_outbound_frame(&reply.encode()) {
             Ok(frame) => (frame, ResponderState::AwaitingConnect, None),
-            Err(err) => (Vec::new(), ResponderState::Done, Some(err)),
+            Err(err) => (Vec::new(), ResponderState::Failed, Some(err)),
         };
 
         Self {
@@ -431,7 +433,7 @@ impl DcutrResponder {
 
     /// Feeds incoming stream bytes.
     fn on_data(&mut self, data: &[u8]) -> Result<(), DcutrError> {
-        if self.state == ResponderState::Done {
+        if matches!(self.state, ResponderState::Done | ResponderState::Failed) {
             return Ok(());
         }
 
@@ -450,9 +452,9 @@ impl DcutrResponder {
         self.events.drain(..).collect()
     }
 
-    /// Returns `true` if the flow has completed.
+    /// Returns `true` if the flow completed or terminated with an error.
     pub fn is_done(&self) -> bool {
-        self.state == ResponderState::Done
+        matches!(self.state, ResponderState::Done | ResponderState::Failed)
     }
 
     /// Returns bytes received after the final SYNC frame in the same stream
@@ -461,9 +463,11 @@ impl DcutrResponder {
     /// Once DCUtR completes, the caller normally hands the relay stream to
     /// its application. Keeping this remainder available avoids dropping
     /// application data that was coalesced behind SYNC by the transport.
-    /// The returned bytes are drained exactly once.
-    pub fn take_trailing_data(&mut self) -> Vec<u8> {
-        core::mem::take(&mut self.recv_buf)
+    /// Returns `None` while the exchange is incomplete, leaving the active
+    /// decode buffer untouched. After completion, the trailing bytes are
+    /// returned (and drained) exactly once.
+    pub fn take_trailing_data(&mut self) -> Option<Vec<u8>> {
+        (self.state == ResponderState::Done).then(|| core::mem::take(&mut self.recv_buf))
     }
 
     fn try_decode(&mut self) -> Result<(), DcutrError> {
@@ -474,11 +478,14 @@ impl DcutrResponder {
                 // `take_trailing_data` before handing over the raw stream.
                 return Ok(());
             }
+            if self.state == ResponderState::Failed {
+                return Ok(());
+            }
 
             let (msg, consumed) = match decode_frame(&self.recv_buf) {
                 FrameDecode::Complete { payload, consumed } => {
                     let msg = HolePunch::decode(payload).map_err(|e| {
-                        self.state = ResponderState::Done;
+                        self.state = ResponderState::Failed;
                         DcutrError::Malformed(e)
                     })?;
                     (msg, consumed)
@@ -490,16 +497,16 @@ impl DcutrResponder {
                 // the decoder would accept.
                 FrameDecode::Incomplete => {
                     enforce_max_size(&self.recv_buf).inspect_err(|_| {
-                        self.state = ResponderState::Done;
+                        self.state = ResponderState::Failed;
                     })?;
                     return Ok(());
                 }
                 FrameDecode::TooLarge { len } => {
-                    self.state = ResponderState::Done;
+                    self.state = ResponderState::Failed;
                     return Err(DcutrError::FrameTooLarge { len });
                 }
                 FrameDecode::Error(e) => {
-                    self.state = ResponderState::Done;
+                    self.state = ResponderState::Failed;
                     return Err(DcutrError::Malformed(DcutrMessageError::Varint(e)));
                 }
             };
@@ -525,7 +532,7 @@ impl DcutrResponder {
                     self.state = ResponderState::Done;
                 }
                 (current_state, actual_kind) => {
-                    self.state = ResponderState::Done;
+                    self.state = ResponderState::Failed;
                     return Err(DcutrError::UnexpectedMessage(alloc::format!(
                         "unexpected {:?} in state {:?}",
                         actual_kind,
@@ -758,8 +765,26 @@ mod tests {
         coalesced.extend_from_slice(&[0xcc; 512]);
         resp.on_data(&coalesced).unwrap();
         assert!(resp.is_done());
-        assert_eq!(resp.take_trailing_data(), vec![0xcc; 512]);
-        assert!(resp.take_trailing_data().is_empty());
+        assert_eq!(resp.take_trailing_data(), Some(vec![0xcc; 512]));
+        assert_eq!(resp.take_trailing_data(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn responder_cannot_drain_protocol_bytes_before_completion() {
+        let mut resp = DcutrResponder::new(&[]);
+        let connect = frame(HolePunch {
+            kind: HolePunchType::Connect,
+            obs_addrs: Vec::new(),
+        });
+        let split = connect.len() / 2;
+        resp.on_data(&connect[..split]).unwrap();
+
+        assert_eq!(resp.take_trailing_data(), None);
+        resp.on_data(&connect[split..]).unwrap();
+        assert!(matches!(
+            resp.poll_events().as_slice(),
+            [ResponderEvent::ConnectReceived { .. }]
+        ));
     }
 
     #[test]
@@ -938,6 +963,7 @@ mod tests {
         });
         let err = resp.on_data(&sync).unwrap_err();
         assert!(matches!(err, DcutrError::UnexpectedMessage(_)));
+        assert_eq!(resp.take_trailing_data(), None);
     }
 
     #[test]

@@ -209,7 +209,7 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
     let mut h = Harness::without_relay(NatConfig::default());
     let attacker = peer(b"untrusted-peer");
     let stream = StreamId::new(88);
-    h.agent.handle_event(
+    let handled = h.agent.handle_event_with_disposition(
         &SwarmEvent::StreamReady {
             peer_id: attacker.clone(),
             stream_id: stream,
@@ -219,7 +219,9 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
         at(0),
     );
 
+    assert!(handled, "rejected NAT control streams stay internal");
     assert!(!h.agent.owns_stream(&attacker, stream));
+    assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
     h.agent.handle_event(
         &SwarmEvent::StreamData {
             peer_id: attacker,
@@ -233,9 +235,9 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
 }
 
 #[test]
-fn remote_write_close_during_dcutr_is_not_a_full_bridge_close() {
+fn remote_write_close_during_dcutr_releases_relay_and_keeps_direct_dials_live() {
     let mut h = Harness::with_relay(NatConfig::default());
-    let (_, stream) = drive_to_bridged(&mut h, 0);
+    let (id, stream) = drive_to_bridged(&mut h, 0);
     drain_actions(&mut h.agent);
 
     h.agent.handle_event(
@@ -246,7 +248,68 @@ fn remote_write_close_during_dcutr_is_not_a_full_bridge_close() {
         at(310),
     );
 
+    assert!(!h.agent.owns_stream(&h.relay, stream));
+    assert!(drain_actions(&mut h.agent).is_empty());
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [
+            NatEvent::HolePunchFailed { connect_id: failed, .. },
+            NatEvent::PathEstablished {
+                connect_id,
+                path: Path::Relayed {
+                    remote_write_closed: true,
+                    ..
+                },
+                ..
+            }
+        ] if *failed == id && *connect_id == id
+    ));
+
+    h.target_connected(at(320));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::PathUpgraded {
+            connect_id,
+            from: Path::Relayed {
+                remote_write_closed: true,
+                ..
+            },
+            to: Path::DirectDialed,
+            ..
+        }] if *connect_id == id
+    ));
+}
+
+#[test]
+fn relay_supersede_scrubs_old_stream_ids_without_resetting_the_new_connection() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (_, stream) = drive_to_bridged(&mut h, 0);
+    drain_actions(&mut h.agent);
     assert!(h.agent.owns_stream(&h.relay, stream));
+
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            peer_id: h.relay.clone(),
+        },
+        at(310),
+    );
+
+    assert!(!h.agent.owns_stream(&h.relay, stream));
+    assert!(
+        !has_reset_for(&drain_actions(&mut h.agent), stream),
+        "a stale stream id must never reset a colliding stream on the replacement connection"
+    );
+
+    // The replacement connection may reuse the same stream id. Its event
+    // must not be routed into the retired attempt.
+    h.agent.handle_event(
+        &SwarmEvent::StreamData {
+            peer_id: h.relay.clone(),
+            stream_id: stream,
+            data: b"new connection data".to_vec(),
+        },
+        at(311),
+    );
     assert!(drain_actions(&mut h.agent).is_empty());
     assert!(drain_events(&mut h.agent).is_empty());
 }

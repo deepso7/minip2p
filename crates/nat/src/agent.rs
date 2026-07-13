@@ -268,9 +268,43 @@ impl NatAgent {
     /// Feeds one swarm event. Events for streams the agent does not own are
     /// ignored with a single map lookup and zero clones.
     pub fn handle_event(&mut self, event: &SwarmEvent, now: Now) {
+        let _ = self.handle_event_with_disposition(event, now);
+    }
+
+    /// Feeds one swarm event and reports whether it belongs to the NAT
+    /// control plane even when the event did not leave a stream registered.
+    /// Drivers use this to consume rejected inbound control streams.
+    pub fn handle_event_with_disposition(&mut self, event: &SwarmEvent, now: Now) -> bool {
+        let mut handled = false;
         match event {
             SwarmEvent::ConnectionEstablished { peer_id } => {
-                self.shared.connected.insert(peer_id.clone());
+                let superseded = !self.shared.connected.insert(peer_id.clone());
+                if superseded {
+                    // The swarm's last-connection-wins policy emits a second
+                    // establishment without closing the retired connection.
+                    // Stream ids are peer-scoped here, so scrub them before
+                    // any event from the replacement connection can collide.
+                    self.shared.ready.remove(peer_id);
+                    self.shared.registry.remove(peer_id);
+                    self.shared.released_bridges.remove(peer_id);
+                    self.shared.tokens.retain(|_, purpose| {
+                        !matches!(
+                            purpose,
+                            TokenPurpose::OpenHop(_, peer)
+                                | TokenPurpose::OpenProbe(peer)
+                                | TokenPurpose::OpenReserve(peer)
+                                if peer == peer_id
+                        )
+                    });
+                    for attempt in self.attempts.values_mut() {
+                        attempt.on_peer_superseded(peer_id, &mut self.shared, now);
+                    }
+                    self.housekeeping
+                        .on_peer_superseded(peer_id, &mut self.shared, now);
+                    for circuit in self.inbound.values_mut() {
+                        circuit.on_relay_disconnected(peer_id, &mut self.shared);
+                    }
+                }
                 for attempt in self.attempts.values_mut() {
                     attempt.on_peer_connected(peer_id, &mut self.shared, now);
                 }
@@ -322,20 +356,30 @@ impl NatAgent {
                         .iter()
                         .any(|relay| relay.peer_id() == peer_id)
                     {
-                        return;
+                        // STOP is registered only for the NAT control plane.
+                        // Reject untrusted opens here instead of leaking them
+                        // to the application and leaving their stream credit
+                        // occupied until the remote closes them.
+                        self.shared.push_action(NatAction::ResetStream {
+                            peer: peer_id.clone(),
+                            stream_id: *stream_id,
+                        });
+                        handled = true;
+                    } else {
+                        // A relay is bridging an inbound circuit to us: claim
+                        // the stream and run the responder flow on it.
+                        let id = self.next_inbound_id;
+                        self.next_inbound_id += 1;
+                        self.shared
+                            .own_stream(peer_id, *stream_id, StreamRole::StopInbound(id));
+                        self.inbound.insert(
+                            id,
+                            InboundCircuit::new(peer_id.clone(), *stream_id, &self.shared, now),
+                        );
+                        handled = true;
                     }
-                    // A relay is bridging an inbound circuit to us: claim
-                    // the stream and run the responder flow on it.
-                    let id = self.next_inbound_id;
-                    self.next_inbound_id += 1;
-                    self.shared
-                        .own_stream(peer_id, *stream_id, StreamRole::StopInbound(id));
-                    self.inbound.insert(
-                        id,
-                        InboundCircuit::new(peer_id.clone(), *stream_id, &self.shared, now),
-                    );
                 } else {
-                    self.route_stream(peer_id, *stream_id, StreamInput::Ready, now);
+                    handled = self.route_stream(peer_id, *stream_id, StreamInput::Ready, now);
                 }
             }
             SwarmEvent::StreamData {
@@ -343,24 +387,27 @@ impl NatAgent {
                 stream_id,
                 data,
             } => {
-                self.route_stream(peer_id, *stream_id, StreamInput::Data(data), now);
+                handled = self.route_stream(peer_id, *stream_id, StreamInput::Data(data), now);
             }
             SwarmEvent::StreamRemoteWriteClosed { peer_id, stream_id } => {
-                self.route_stream(peer_id, *stream_id, StreamInput::RemoteWriteClosed, now);
+                handled =
+                    self.route_stream(peer_id, *stream_id, StreamInput::RemoteWriteClosed, now);
             }
             SwarmEvent::StreamClosed { peer_id, stream_id } => {
                 if let Some(id) = self.shared.take_released_bridge(peer_id, *stream_id) {
+                    handled = true;
                     if let Some(attempt) = self.attempts.get_mut(&id) {
                         attempt.on_released_bridge_closed(*stream_id, &mut self.shared, now);
                     }
                 } else {
-                    self.route_stream(peer_id, *stream_id, StreamInput::Closed, now);
+                    handled = self.route_stream(peer_id, *stream_id, StreamInput::Closed, now);
                 }
                 self.shared.release_stream(peer_id, *stream_id);
             }
             _ => {}
         }
         self.reap_done();
+        handled
     }
 
     /// Advances time-based state: stagger expiry, leg deadlines, punch
@@ -502,13 +549,19 @@ impl NatAgent {
             && self.housekeeping.is_quiet()
     }
 
-    fn route_stream(&mut self, peer: &PeerId, stream: StreamId, input: StreamInput<'_>, now: Now) {
+    fn route_stream(
+        &mut self,
+        peer: &PeerId,
+        stream: StreamId,
+        input: StreamInput<'_>,
+        now: Now,
+    ) -> bool {
         // Guardrail: streams we don't own are none of our business.
         let Some(streams) = self.shared.registry.get(peer) else {
-            return;
+            return false;
         };
         let Some(role) = streams.get(&stream).copied() else {
-            return;
+            return false;
         };
         match role {
             StreamRole::HopConnect(id) => {
@@ -526,6 +579,7 @@ impl NatAgent {
                 }
             }
         }
+        true
     }
 
     fn reap_done(&mut self) {

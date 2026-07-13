@@ -136,6 +136,7 @@ fn sync_coalesced_with_application_data_preserves_the_bridge_remainder() {
             peer,
             stream_id,
             pending_data,
+            ..
         }] if *peer == h.target && *stream_id == stream && *pending_data == app_data
     ));
 }
@@ -237,7 +238,11 @@ fn remote_write_close_keeps_an_accepted_bridge_alive_until_handoff() {
     h.agent.handle_tick(at(12_000));
     assert!(matches!(
         drain_events(&mut h.agent).as_slice(),
-        [NatEvent::InboundRelayCircuit { peer, .. }] if *peer == h.target
+        [NatEvent::InboundRelayCircuit {
+            peer,
+            remote_write_closed: true,
+            ..
+        }] if *peer == h.target
     ));
 }
 

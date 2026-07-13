@@ -43,6 +43,9 @@ pub(crate) struct InboundCircuit {
     /// Application bytes received after the final DCUtR SYNC frame in the
     /// same stream read. These must accompany the raw bridge handoff.
     pending_data: Vec<u8>,
+    /// The remote write half reached EOF while the control plane still owned
+    /// the bridge. The transport will not repeat that event after handoff.
+    remote_write_closed: bool,
     /// Deadline for the STOP + DCUtR exchange to finish; after it the
     /// bridge is released to the app punch-less rather than abandoned.
     exchange_deadline: u64,
@@ -66,6 +69,7 @@ impl InboundCircuit {
             dcutr: None,
             remote_addrs: Vec::new(),
             pending_data: Vec::new(),
+            remote_write_closed: false,
             exchange_deadline: now.mono_ms + shared.config.relay_leg_deadline_ms,
             blast: None,
             linger_until: None,
@@ -115,6 +119,7 @@ impl InboundCircuit {
                 }
             }
             StreamInput::RemoteWriteClosed => {
+                self.remote_write_closed = true;
                 // A peer can stop sending while the local write half remains
                 // usable. Let the protocol parser consume that boundary and
                 // retain the circuit until its normal exchange deadline.
@@ -254,7 +259,7 @@ impl InboundCircuit {
             }
         }
         if sync_received {
-            self.pending_data = dcutr.take_trailing_data();
+            self.pending_data = dcutr.take_trailing_data().unwrap_or_default();
             self.on_sync(shared, now);
         }
     }
@@ -306,6 +311,7 @@ impl InboundCircuit {
                 peer: source.clone(),
                 stream_id: self.stream,
                 pending_data: core::mem::take(&mut self.pending_data),
+                remote_write_closed: self.remote_write_closed,
             });
         }
         if self.blast.is_none() && self.linger_until.is_none() {

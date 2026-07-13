@@ -49,6 +49,48 @@ pub struct Endpoint {
     pending_events: std::collections::VecDeque<Event>,
 }
 
+/// Why one NAT-aware swarm-driving step returned.
+#[cfg(feature = "nat")]
+enum NatPollKind {
+    /// An event not owned by the NAT agent is ready for the application.
+    Application,
+    /// The agent produced application-visible NAT output; NAT-focused waits
+    /// should re-check its queue immediately.
+    Progress,
+    /// The caller's deadline elapsed.
+    Deadline,
+}
+
+#[cfg(feature = "nat")]
+struct NatPoll {
+    kind: NatPollKind,
+    event: Option<Event>,
+}
+
+#[cfg(feature = "nat")]
+impl NatPoll {
+    fn application(event: Event) -> Self {
+        Self {
+            kind: NatPollKind::Application,
+            event: Some(event),
+        }
+    }
+
+    fn progress() -> Self {
+        Self {
+            kind: NatPollKind::Progress,
+            event: None,
+        }
+    }
+
+    fn deadline() -> Self {
+        Self {
+            kind: NatPollKind::Deadline,
+            event: None,
+        }
+    }
+}
+
 impl Endpoint {
     /// Starts building an endpoint.
     pub fn builder() -> EndpointBuilder {
@@ -224,7 +266,15 @@ impl Endpoint {
         if let Some(event) = self.pending_events.pop_front() {
             return Ok(Some(event));
         }
-        self.poll_new_event_with_nat(deadline)
+        let mut expired_poll_used = false;
+        loop {
+            let poll = self.poll_new_event_with_nat(deadline, &mut expired_poll_used)?;
+            match poll.kind {
+                NatPollKind::Application => return Ok(poll.event),
+                NatPollKind::Progress => {}
+                NatPollKind::Deadline => return Ok(None),
+            }
+        }
     }
 
     /// Drives the swarm and NAT agent until a newly-arrived application
@@ -232,8 +282,22 @@ impl Endpoint {
     /// drains `pending_events`: NAT-focused waits must leave application
     /// events aside instead of repeatedly picking up the same one.
     #[cfg(feature = "nat")]
-    fn poll_new_event_with_nat(&mut self, deadline: Deadline) -> Result<Option<Event>, Error> {
+    fn poll_new_event_with_nat(
+        &mut self,
+        deadline: Deadline,
+        expired_poll_used: &mut bool,
+    ) -> Result<NatPoll, Error> {
         loop {
+            // `Swarm::poll_next` deliberately performs one synchronous poll
+            // even for an expired deadline. That is useful for one-shot
+            // callers, but repeating it here under a continuous event stream
+            // would let a NAT-focused wait run forever past its deadline.
+            if deadline.has_passed() {
+                if *expired_poll_used {
+                    return Ok(NatPoll::deadline());
+                }
+                *expired_poll_used = true;
+            }
             let step = {
                 let nat = self.nat.as_ref().expect("nat checked by caller");
                 match nat.agent.next_timeout(nat.now().mono_ms) {
@@ -243,21 +307,31 @@ impl Endpoint {
                 }
             };
             let polled = self.swarm.poll_next(step)?;
+            if deadline.has_passed() {
+                *expired_poll_used = true;
+            }
             let nat = self.nat.as_mut().expect("nat checked by caller");
+            let events_before = nat.events.len();
             match polled {
                 Some(event) => {
                     let consumed = nat.ingest(&event, &mut self.swarm);
                     nat.tick(&mut self.swarm);
                     if !consumed {
-                        return Ok(Some(event));
+                        return Ok(NatPoll::application(event));
+                    }
+                    if nat.events.len() > events_before {
+                        return Ok(NatPoll::progress());
                     }
                 }
                 None => {
                     nat.tick(&mut self.swarm);
+                    if nat.events.len() > events_before {
+                        return Ok(NatPoll::progress());
+                    }
                     // Distinguish the caller's deadline from a mere agent
                     // timer that shortened this wait step.
                     if deadline.has_passed() {
-                        return Ok(None);
+                        return Ok(NatPoll::deadline());
                     }
                 }
             }
@@ -371,6 +445,7 @@ impl Endpoint {
         deadline: impl Into<Deadline>,
     ) -> Result<Option<Path>, Error> {
         let deadline = deadline.into();
+        let mut expired_poll_used = false;
         loop {
             {
                 let Some(nat) = self.nat.as_mut() else {
@@ -399,9 +474,14 @@ impl Endpoint {
                     return Ok(None);
                 }
             }
-            match self.poll_new_event_with_nat(deadline)? {
-                Some(event) => self.pending_events.push_back(event),
-                None => return Ok(None),
+            self.ensure_pending_event_capacity()?;
+            let poll = self.poll_new_event_with_nat(deadline, &mut expired_poll_used)?;
+            match poll.kind {
+                NatPollKind::Application => self
+                    .pending_events
+                    .push_back(poll.event.expect("application poll carries event")),
+                NatPollKind::Progress => {}
+                NatPollKind::Deadline => return Ok(None),
             }
         }
     }
@@ -424,6 +504,7 @@ impl Endpoint {
         deadline: impl Into<Deadline>,
     ) -> Result<Option<NatEvent>, Error> {
         let deadline = deadline.into();
+        let mut expired_poll_used = false;
         loop {
             match self.nat.as_mut() {
                 Some(nat) => {
@@ -433,9 +514,14 @@ impl Endpoint {
                 }
                 None => return Ok(None),
             }
-            match self.poll_new_event_with_nat(deadline)? {
-                Some(event) => self.pending_events.push_back(event),
-                None => return Ok(None),
+            self.ensure_pending_event_capacity()?;
+            let poll = self.poll_new_event_with_nat(deadline, &mut expired_poll_used)?;
+            match poll.kind {
+                NatPollKind::Application => self
+                    .pending_events
+                    .push_back(poll.event.expect("application poll carries event")),
+                NatPollKind::Progress => {}
+                NatPollKind::Deadline => return Ok(None),
             }
         }
     }
@@ -455,13 +541,32 @@ impl Endpoint {
         if let Some(index) = self.pending_events.iter().position(&mut predicate) {
             return Ok(self.pending_events.remove(index));
         }
+        let mut expired_poll_used = false;
         loop {
-            match self.poll_new_event_with_nat(deadline)? {
-                Some(event) if predicate(&event) => return Ok(Some(event)),
-                Some(event) => self.pending_events.push_back(event),
-                None => return Ok(None),
+            self.ensure_pending_event_capacity()?;
+            let poll = self.poll_new_event_with_nat(deadline, &mut expired_poll_used)?;
+            match poll.kind {
+                NatPollKind::Application => {
+                    let event = poll.event.expect("application poll carries event");
+                    if predicate(&event) {
+                        return Ok(Some(event));
+                    }
+                    self.pending_events.push_back(event);
+                }
+                NatPollKind::Progress => {}
+                NatPollKind::Deadline => return Ok(None),
             }
         }
+    }
+
+    #[cfg(feature = "nat")]
+    fn ensure_pending_event_capacity(&self) -> Result<(), Error> {
+        if self.pending_events.len() >= RUN_UNTIL_SKIP_LIMIT {
+            return Err(Error::EventBacklogExceeded {
+                limit: RUN_UNTIL_SKIP_LIMIT,
+            });
+        }
+        Ok(())
     }
 
     /// Our current reachability verdict from AutoNAT probing
@@ -836,6 +941,16 @@ mod tests {
                 .next_event(Duration::from_millis(1))
                 .expect("drain buffered event"),
             Some(Event::ConnectionClosed { peer_id }) if peer_id == unrelated
+        ));
+
+        for _ in 0..RUN_UNTIL_SKIP_LIMIT {
+            endpoint.pending_events.push_back(Event::ConnectionClosed {
+                peer_id: unrelated.clone(),
+            });
+        }
+        assert!(matches!(
+            endpoint.next_nat_event(Deadline::NEVER),
+            Err(Error::EventBacklogExceeded { limit }) if limit == RUN_UNTIL_SKIP_LIMIT
         ));
     }
 }

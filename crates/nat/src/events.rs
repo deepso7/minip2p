@@ -54,7 +54,13 @@ pub enum NatEvent {
     ReachabilityChanged {
         old: ReachabilityState,
         new: ReachabilityState,
+        /// AutoNAT-confirmed public addresses associated with the new
+        /// verdict. Empty for non-public verdicts.
+        confirmed_addrs: Vec<Multiaddr>,
     },
+    /// AutoNAT confirmed a different public address set without changing the
+    /// already-public reachability verdict.
+    PublicAddressesChanged { addrs: Vec<Multiaddr> },
     /// A relay accepted (or renewed) our reservation; we are now dialable
     /// through it.
     RelayReserved {
@@ -107,6 +113,10 @@ pub enum NatEvent {
         peer: PeerId,
         stream_id: StreamId,
         pending_data: Vec<u8>,
+        /// `true` when the remote write half reached EOF before handoff. The
+        /// original swarm event was consumed by the NAT control plane and
+        /// will not be emitted again for the application.
+        remote_write_closed: bool,
     },
     /// An inbound circuit's hole punch succeeded; the peer is now directly
     /// connected.

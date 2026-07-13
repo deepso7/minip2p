@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use minip2p_autonat::{
     AUTONAT_PROTOCOL_ID, AutoNatClient, AutoNatClientInput, AutoNatClientOutput, Reachability,
 };
-use minip2p_core::{PeerAddr, PeerId, SansIoProtocol};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol, select_direct_candidates};
 use minip2p_relay::{
     HOP_PROTOCOL_ID, HopReservation, HopReservationInput, HopReservationOutput, ReservationOutcome,
 };
@@ -66,6 +66,8 @@ pub(crate) struct Prober {
     verdict: ReachabilityState,
     /// Sliding window of recent samples (`true` = public).
     window: Vec<bool>,
+    /// Most recently confirmed, directly dialable public addresses.
+    public_addrs: Vec<Multiaddr>,
     flight: Option<ProbeFlight>,
     next_probe_at: Option<u64>,
     server_idx: usize,
@@ -76,6 +78,7 @@ impl Prober {
         Self {
             verdict: ReachabilityState::Unknown,
             window: Vec::new(),
+            public_addrs: Vec::new(),
             flight: None,
             // Without configured servers there is nothing to schedule, and
             // the agent must not report a phantom timeout.
@@ -176,6 +179,20 @@ impl Prober {
             && flight.server.peer_id() == peer
         {
             self.abort_flight(shared, now);
+        }
+    }
+
+    fn on_peer_superseded(&mut self, peer: &PeerId, shared: &mut Shared, now: Now) {
+        if self
+            .flight
+            .as_ref()
+            .is_some_and(|flight| flight.server.peer_id() == peer)
+        {
+            // The old connection's stream ids are invalid, but resetting
+            // them would target the replacement connection.
+            self.flight = None;
+            self.server_idx += 1;
+            self.next_probe_at = Some(now.mono_ms + shared.config.probe_interval_unsettled_ms);
         }
     }
 
@@ -330,9 +347,12 @@ impl Prober {
         shared: &mut Shared,
         _now: Now,
     ) -> bool {
-        let sample = match reachability {
-            Reachability::Public { .. } => true,
-            Reachability::Private { .. } => false,
+        let (sample, sample_addrs) = match reachability {
+            Reachability::Public { addrs, .. } => (
+                true,
+                select_direct_candidates(addrs, None, None).into_addrs(),
+            ),
+            Reachability::Private { .. } => (false, Vec::new()),
             // No signal: never move the window on an inconclusive probe.
             Reachability::Unknown { .. } => return false,
         };
@@ -356,10 +376,25 @@ impl Prober {
             self.verdict
         };
         if new == self.verdict {
+            if new == ReachabilityState::Public && sample && sample_addrs != self.public_addrs {
+                self.public_addrs = sample_addrs.clone();
+                shared.push_event(NatEvent::PublicAddressesChanged {
+                    addrs: sample_addrs,
+                });
+            }
             return false;
         }
         let old = core::mem::replace(&mut self.verdict, new);
-        shared.push_event(NatEvent::ReachabilityChanged { old, new });
+        self.public_addrs = if new == ReachabilityState::Public && sample {
+            sample_addrs
+        } else {
+            Vec::new()
+        };
+        shared.push_event(NatEvent::ReachabilityChanged {
+            old,
+            new,
+            confirmed_addrs: self.public_addrs.clone(),
+        });
         true
     }
 
@@ -635,6 +670,28 @@ impl ReservationManager {
         }
     }
 
+    fn on_peer_superseded(&mut self, peer: &PeerId, shared: &mut Shared, now: Now) {
+        match &self.state {
+            ResState::Reserved { relay, .. } if relay.peer_id() == peer => {
+                shared.push_event(NatEvent::RelayReservationLost {
+                    relay: peer.clone(),
+                });
+                self.relay_idx += 1;
+                self.state = ResState::Backoff {
+                    until: now.mono_ms + shared.config.reservation_retry_backoff_ms,
+                };
+            }
+            ResState::Acquiring { relay, .. } if relay.peer_id() == peer => {
+                // Do not reset the retired stream id on the new connection.
+                self.relay_idx += 1;
+                self.state = ResState::Backoff {
+                    until: now.mono_ms + shared.config.reservation_retry_backoff_ms,
+                };
+            }
+            _ => {}
+        }
+    }
+
     fn on_dial_result(
         &mut self,
         result: &Result<ConnectionId, String>,
@@ -901,6 +958,11 @@ impl Housekeeping {
     pub(crate) fn on_peer_disconnected(&mut self, peer: &PeerId, shared: &mut Shared, now: Now) {
         self.prober.on_peer_disconnected(peer, shared, now);
         self.reservations.on_peer_disconnected(peer, shared, now);
+    }
+
+    pub(crate) fn on_peer_superseded(&mut self, peer: &PeerId, shared: &mut Shared, now: Now) {
+        self.prober.on_peer_superseded(peer, shared, now);
+        self.reservations.on_peer_superseded(peer, shared, now);
     }
 
     pub(crate) fn on_probe_dial_result(

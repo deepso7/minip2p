@@ -26,6 +26,8 @@ pub(crate) struct NatDriver {
     reserved_relays: Vec<(PeerId, Multiaddr)>,
     /// Relay transport addresses by peer, captured at construction.
     relay_addrs: Vec<(PeerId, Multiaddr)>,
+    /// Direct public addresses confirmed by AutoNAT.
+    public_addrs: Vec<Multiaddr>,
 }
 
 impl NatDriver {
@@ -36,6 +38,7 @@ impl NatDriver {
             epoch: Instant::now(),
             reserved_relays: Vec::new(),
             relay_addrs,
+            public_addrs: Vec::new(),
         }
     }
 
@@ -61,11 +64,11 @@ impl NatDriver {
         let owned_before =
             stream_key(event).is_some_and(|(peer, stream)| self.agent.owns_stream(peer, stream));
         let now = self.now();
-        self.agent.handle_event(event, now);
+        let handled = self.agent.handle_event_with_disposition(event, now);
         let owned_after =
             stream_key(event).is_some_and(|(peer, stream)| self.agent.owns_stream(peer, stream));
         self.pump(swarm);
-        owned_before || owned_after
+        handled || owned_before || owned_after
     }
 
     /// Advances the agent's timers and executes any resulting work.
@@ -165,17 +168,30 @@ impl NatDriver {
                     self.advertise(swarm);
                 }
             }
+            NatEvent::ReachabilityChanged {
+                confirmed_addrs, ..
+            } => {
+                if self.public_addrs != *confirmed_addrs {
+                    self.public_addrs = confirmed_addrs.clone();
+                    self.advertise(swarm);
+                }
+            }
+            NatEvent::PublicAddressesChanged { addrs } if self.public_addrs != *addrs => {
+                self.public_addrs = addrs.clone();
+                self.advertise(swarm);
+            }
             _ => {}
         }
     }
 
     fn advertise(&self, swarm: &mut Swarm<QuicEndpoint>) {
-        swarm.set_external_addresses(
-            self.reserved_relays
-                .iter()
-                .map(|(_, addr)| addr.clone())
-                .collect(),
-        );
+        let mut addrs = self.public_addrs.clone();
+        for (_, addr) in &self.reserved_relays {
+            if !addrs.contains(addr) {
+                addrs.push(addr.clone());
+            }
+        }
+        swarm.set_external_addresses(addrs);
     }
 }
 
@@ -191,5 +207,46 @@ fn stream_key(event: &SwarmEvent) -> Option<(&PeerId, StreamId)> {
         | SwarmEvent::StreamRemoteWriteClosed { peer_id, stream_id }
         | SwarmEvent::StreamClosed { peer_id, stream_id } => Some((peer_id, *stream_id)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Endpoint, NatConfig, ReachabilityState};
+
+    #[test]
+    fn confirmed_public_addresses_are_advertised_and_cleared() {
+        let mut endpoint = Endpoint::builder()
+            .nat_config(NatConfig::default())
+            .bind_quic("127.0.0.1:0")
+            .expect("bind endpoint");
+        let public: Multiaddr = "/ip4/203.0.113.9/udp/4001/quic-v1"
+            .parse()
+            .expect("public addr");
+        let Endpoint { swarm, nat, .. } = &mut endpoint;
+        let driver = nat.as_mut().expect("NAT configured");
+
+        driver.observe(
+            &NatEvent::ReachabilityChanged {
+                old: ReachabilityState::Unknown,
+                new: ReachabilityState::Public,
+                confirmed_addrs: vec![public.clone()],
+            },
+            swarm,
+        );
+        swarm.poll().expect("refresh identify addresses");
+        assert!(swarm.core().local_addresses().contains(&public));
+
+        driver.observe(
+            &NatEvent::ReachabilityChanged {
+                old: ReachabilityState::Public,
+                new: ReachabilityState::Private,
+                confirmed_addrs: Vec::new(),
+            },
+            swarm,
+        );
+        swarm.poll().expect("refresh identify addresses");
+        assert!(!swarm.core().local_addresses().contains(&public));
     }
 }
