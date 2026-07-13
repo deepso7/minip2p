@@ -22,230 +22,21 @@
 //!   |   (both peers ready to dial each other directly)        |
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::str::FromStr;
 
-use minip2p_core::{Multiaddr, PeerId, SansIoProtocol};
+use minip2p_core::{Multiaddr, SansIoProtocol};
 use minip2p_dcutr::{
     DcutrInitiator, DcutrInitiatorInput, DcutrInitiatorOutput, DcutrResponder, DcutrResponderInput,
     DcutrResponderOutput, InitiatorOutcome, ResponderEvent, decode_frame as dcutr_decode_frame,
 };
 use minip2p_identity::Ed25519Keypair;
 use minip2p_relay::{
-    FrameDecode, HopConnect, HopConnectInput, HopConnectOutput, HopMessage, HopMessageType,
-    HopReservation, HopReservationInput, HopReservationOutput, Peer, Reservation,
-    ReservationOutcome, Status, StopMessage, StopMessageType, StopResponder, StopResponderInput,
-    StopResponderOutput, decode_frame as relay_decode_frame, encode_frame as relay_encode_frame,
+    HopConnect, HopConnectInput, HopConnectOutput, HopReservation, HopReservationInput,
+    HopReservationOutput, ReservationOutcome, Status, StopResponder, StopResponderInput,
+    StopResponderOutput,
 };
-
-// ---------------------------------------------------------------------------
-// In-memory relay emulator (the absolute minimum needed to bridge the test)
-// ---------------------------------------------------------------------------
-
-/// A minimal in-memory relay that handles RESERVE and CONNECT over HOP, plus
-/// the paired STOP exchange. It owns a per-peer inbox of bytes the client
-/// would receive on their HOP stream.
-struct RelayEmulator {
-    /// HOP -> reserved peer id.
-    reservations: HashMap<PeerId, ReservationChannels>,
-    /// Events observed during processing, for test assertions.
-    events: Vec<RelayEvent>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RelayEvent {
-    ReservationStored { peer: PeerId },
-    ConnectBridgedBetween { initiator: PeerId, target: PeerId },
-    StatusOkSentToInitiator,
-}
-
-/// Channels representing a reserved peer's HOP stream (for STATUS replies)
-/// and an optional STOP stream we will open toward them on CONNECT.
-struct ReservationChannels {
-    /// Bytes the relay sends back to the reserving peer on its HOP stream.
-    hop_inbox: Vec<u8>,
-    /// Bytes the relay sends to the reserving peer on the STOP stream opened
-    /// when another peer requests a CONNECT targeting this peer.
-    stop_inbox: Vec<u8>,
-}
-
-impl RelayEmulator {
-    fn new() -> Self {
-        Self {
-            reservations: HashMap::new(),
-            events: Vec::new(),
-        }
-    }
-
-    /// The reserving peer sends raw bytes on its HOP stream. We parse them
-    /// and queue the appropriate response to the peer's HOP inbox.
-    fn on_reserve_request(
-        &mut self,
-        reserver: &PeerId,
-        bytes: &[u8],
-    ) -> Result<(), RelayEmulatorError> {
-        let msg = decode_hop_message(bytes)?;
-        if msg.kind != HopMessageType::Reserve {
-            return Err(RelayEmulatorError::Unexpected("expected RESERVE"));
-        }
-
-        // Prepare the reservation.
-        let channels = self
-            .reservations
-            .entry(reserver.clone())
-            .or_insert_with(|| ReservationChannels {
-                hop_inbox: Vec::new(),
-                stop_inbox: Vec::new(),
-            });
-
-        let response = HopMessage {
-            kind: HopMessageType::Status,
-            peer: None,
-            reservation: Some(Reservation {
-                expire: Some(9_999_999_999),
-                addrs: Vec::new(),
-                voucher: None,
-            }),
-            limit: None,
-            status: Some(Status::Ok),
-        };
-        channels
-            .hop_inbox
-            .extend(relay_encode_frame(&response.encode()));
-        self.events.push(RelayEvent::ReservationStored {
-            peer: reserver.clone(),
-        });
-        Ok(())
-    }
-
-    /// Drain queued HOP bytes for a reserved peer.
-    fn drain_hop_bytes_for(&mut self, peer: &PeerId) -> Vec<u8> {
-        self.reservations
-            .get_mut(peer)
-            .map(|r| core::mem::take(&mut r.hop_inbox))
-            .unwrap_or_default()
-    }
-
-    /// Drain queued STOP bytes for a reserved peer.
-    fn drain_stop_bytes_for(&mut self, peer: &PeerId) -> Vec<u8> {
-        self.reservations
-            .get_mut(peer)
-            .map(|r| core::mem::take(&mut r.stop_inbox))
-            .unwrap_or_default()
-    }
-
-    /// An initiator peer sends a HOP CONNECT targeting `target`. We verify
-    /// the target is reserved, then open a virtual STOP stream to them and
-    /// forward a STOP CONNECT message.
-    ///
-    /// The initiator's responses (STATUS after the target acks) are tracked
-    /// via `pending_initiator_responses`.
-    fn on_connect_request(
-        &mut self,
-        initiator: &PeerId,
-        bytes: &[u8],
-        pending_initiator_responses: &mut Vec<u8>,
-    ) -> Result<(), RelayEmulatorError> {
-        let msg = decode_hop_message(bytes)?;
-        if msg.kind != HopMessageType::Connect {
-            return Err(RelayEmulatorError::Unexpected("expected CONNECT"));
-        }
-        let target_bytes = msg
-            .peer
-            .as_ref()
-            .map(|p| p.id.clone())
-            .ok_or(RelayEmulatorError::Unexpected("missing peer field"))?;
-
-        let target = PeerId::from_bytes(&target_bytes)
-            .map_err(|_| RelayEmulatorError::Unexpected("invalid target peer id"))?;
-
-        if !self.reservations.contains_key(&target) {
-            let refusal = HopMessage {
-                kind: HopMessageType::Status,
-                peer: None,
-                reservation: None,
-                limit: None,
-                status: Some(Status::NoReservation),
-            };
-            pending_initiator_responses.extend(relay_encode_frame(&refusal.encode()));
-            return Ok(());
-        }
-
-        // Open a STOP stream to the target: queue a STOP CONNECT with the
-        // initiator's peer id as the source.
-        let stop_connect = StopMessage {
-            kind: StopMessageType::Connect,
-            peer: Some(Peer {
-                id: initiator.to_bytes(),
-                addrs: Vec::new(),
-            }),
-            limit: None,
-            status: None,
-        };
-        self.reservations
-            .get_mut(&target)
-            .expect("checked above")
-            .stop_inbox
-            .extend(relay_encode_frame(&stop_connect.encode()));
-
-        self.events.push(RelayEvent::ConnectBridgedBetween {
-            initiator: initiator.clone(),
-            target,
-        });
-
-        Ok(())
-    }
-
-    /// The target peer replies on its STOP stream with STATUS:OK. We forward
-    /// a HOP STATUS:OK to the initiator.
-    fn on_stop_ack_from_target(
-        &mut self,
-        bytes: &[u8],
-        initiator_inbox: &mut Vec<u8>,
-    ) -> Result<(), RelayEmulatorError> {
-        let msg = decode_stop_message(bytes)?;
-        if msg.kind != StopMessageType::Status || msg.status != Some(Status::Ok) {
-            return Err(RelayEmulatorError::Unexpected("expected STOP STATUS:OK"));
-        }
-
-        let ok = HopMessage {
-            kind: HopMessageType::Status,
-            peer: None,
-            reservation: None,
-            limit: None,
-            status: Some(Status::Ok),
-        };
-        initiator_inbox.extend(relay_encode_frame(&ok.encode()));
-        self.events.push(RelayEvent::StatusOkSentToInitiator);
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-#[allow(dead_code)] // the &'static str is only for diagnostic messages surfaced via Debug.
-enum RelayEmulatorError {
-    Unexpected(&'static str),
-}
-
-/// Parse a single HOP frame from the front of `bytes` and return the decoded message.
-fn decode_hop_message(bytes: &[u8]) -> Result<HopMessage, RelayEmulatorError> {
-    match relay_decode_frame(bytes) {
-        FrameDecode::Complete { payload, .. } => {
-            HopMessage::decode(payload).map_err(|_| RelayEmulatorError::Unexpected("bad HOP"))
-        }
-        _ => Err(RelayEmulatorError::Unexpected("incomplete HOP frame")),
-    }
-}
-
-/// Parse a single STOP frame from the front of `bytes` and return the decoded message.
-fn decode_stop_message(bytes: &[u8]) -> Result<StopMessage, RelayEmulatorError> {
-    match relay_decode_frame(bytes) {
-        FrameDecode::Complete { payload, .. } => {
-            StopMessage::decode(payload).map_err(|_| RelayEmulatorError::Unexpected("bad STOP"))
-        }
-        _ => Err(RelayEmulatorError::Unexpected("incomplete STOP frame")),
-    }
-}
+use minip2p_test_support::{ConnectRequestOutcome, RelayEmulator, RelayEvent};
 
 // ---------------------------------------------------------------------------
 // The actual test
@@ -267,7 +58,12 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
 
     // B sends RESERVE. Relay stores reservation and responds with STATUS:OK.
     let reserve_bytes = reserve_flush(&mut b_reservation);
-    relay.on_reserve_request(&peer_b, &reserve_bytes).unwrap();
+    assert!(
+        relay
+            .on_reserve_request(&peer_b, &reserve_bytes)
+            .unwrap()
+            .is_empty()
+    );
 
     // B receives the relay's response on its HOP stream.
     let relay_to_b = relay.drain_hop_bytes_for(&peer_b);
@@ -294,9 +90,14 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
     // The relay forwards a STOP CONNECT to B and remembers to send A a
     // STATUS:OK once B acks.
     let mut initiator_inbox: Vec<u8> = Vec::new();
-    relay
+    let connect_request = relay
         .on_connect_request(&peer_a, &connect_bytes, &mut initiator_inbox)
         .unwrap();
+    assert!(matches!(
+        connect_request,
+        ConnectRequestOutcome::Bridging { target, trailing }
+            if target == peer_b && trailing.is_empty()
+    ));
     assert_eq!(initiator_inbox, Vec::<u8>::new(), "no refusal expected");
 
     // ---- Step 3: B receives STOP CONNECT, accepts, relay bridges ---------
@@ -311,9 +112,10 @@ fn full_relay_plus_hole_punch_flow_succeeds() {
     let b_stop_ok = stop_accept_flush(&mut b_stop);
 
     // Relay forwards the ack to A as HOP STATUS:OK.
-    relay
+    let stop_trailing = relay
         .on_stop_ack_from_target(&b_stop_ok, &mut initiator_inbox)
         .unwrap();
+    assert!(stop_trailing.is_empty());
 
     // A receives the HOP STATUS:OK: the stream is now bridged.
     let connect_outcome = connect_feed(&mut a_connect, initiator_inbox);
@@ -413,9 +215,13 @@ fn connect_refused_when_target_not_reserved() {
     let connect_bytes = connect_flush(&mut a_connect);
 
     let mut initiator_inbox: Vec<u8> = Vec::new();
-    relay
+    let connect_request = relay
         .on_connect_request(&peer_a, &connect_bytes, &mut initiator_inbox)
         .unwrap();
+    assert!(matches!(
+        connect_request,
+        ConnectRequestOutcome::Refused { trailing } if trailing.is_empty()
+    ));
 
     let outcome = connect_feed(&mut a_connect, initiator_inbox);
 

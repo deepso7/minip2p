@@ -27,3 +27,6 @@ minip2p-relay = { path = "../relay", default-features = false }
 minip2p-swarm = { path = "../swarm", default-features = false }
 minip2p-transport = { path = "../transport", default-features = false }
 thiserror = { version = "2.0.18", default-features = false }
+
+[dev-dependencies]
+minip2p-test-support = { path = "../test-support" }

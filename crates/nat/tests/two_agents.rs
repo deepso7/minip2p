@@ -13,11 +13,9 @@ use common::{LISTEN_ADDR, at, drain_events, maddr, peer};
 
 use minip2p_core::{PeerAddr, PeerId};
 use minip2p_nat::{ConnectId, NatAction, NatAgent, NatConfig, NatEvent, Path, ReservationPolicy};
-use minip2p_relay::{
-    FrameDecode, HOP_PROTOCOL_ID, HopMessage, HopMessageType, Peer, Reservation, STOP_PROTOCOL_ID,
-    Status, StopMessage, StopMessageType, decode_frame, encode_frame,
-};
+use minip2p_relay::{HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 use minip2p_swarm::SwarmEvent;
+use minip2p_test_support::{ConnectRequestOutcome, RelayEmulator};
 use minip2p_transport::{ConnectionId, StreamId};
 
 const A_LISTEN: &str = "/ip4/198.51.100.10/udp/4100/quic-v1";
@@ -49,8 +47,7 @@ struct World {
     now: u64,
     next_stream: u64,
     next_conn: u64,
-    /// Peers holding a reservation on the emulated relay.
-    reservations: Vec<PeerId>,
+    relay_emulator: RelayEmulator,
     /// Roles of relay-facing streams, per side.
     streams: Vec<(Side, StreamId, EmuStream)>,
     /// (A's bridge stream, B's stop stream) once the STOP handshake ran.
@@ -101,7 +98,7 @@ impl World {
             now: 0,
             next_stream: 0,
             next_conn: 0,
-            reservations: Vec::new(),
+            relay_emulator: RelayEmulator::new(),
             streams: Vec::new(),
             bridge: None,
             bridged: false,
@@ -240,90 +237,65 @@ impl World {
             .find(|(s, id, _)| *s == side && *id == stream)
             .map(|(_, _, role)| *role);
         match role {
-            Some(EmuStream::Hop) => {
-                let FrameDecode::Complete { payload, consumed } = decode_frame(&data) else {
-                    panic!("agents write whole frames");
-                };
-                let msg = HopMessage::decode(payload).expect("valid HOP frame");
-                let trailing = data[consumed..].to_vec();
-                match msg.kind {
-                    HopMessageType::Reserve => {
-                        self.reservations.push(self.peer_of(side));
-                        let response = HopMessage {
-                            kind: HopMessageType::Status,
-                            peer: None,
-                            reservation: Some(Reservation {
-                                expire: Some(9_999_999_999),
-                                addrs: Vec::new(),
-                                voucher: None,
-                            }),
-                            limit: None,
-                            status: Some(Status::Ok),
-                        };
-                        self.deliver(side, stream, encode_frame(&response.encode()));
-                    }
-                    HopMessageType::Connect => {
-                        let target = PeerId::from_bytes(&msg.peer.expect("target").id)
-                            .expect("valid target peer id");
-                        assert!(
-                            self.reservations.contains(&target),
-                            "HOP CONNECT requires the target's reservation"
-                        );
-                        assert_eq!(side, Side::A, "only A connects in this scenario");
-                        // Mark A's stream as the relay side of the bridge
-                        // and open the STOP stream toward B.
-                        self.set_role(side, stream, EmuStream::HopBridge);
-                        self.next_stream += 1;
-                        let stop_stream = StreamId::new(self.next_stream);
-                        self.streams.push((Side::B, stop_stream, EmuStream::Stop));
-                        self.bridge = Some((stream, stop_stream));
-
-                        let relay = self.relay_id.clone();
-                        self.b.handle_event(
-                            &SwarmEvent::StreamReady {
-                                peer_id: relay,
-                                stream_id: stop_stream,
-                                protocol_id: STOP_PROTOCOL_ID.to_string(),
-                                initiated_locally: false,
-                            },
-                            at(self.now),
-                        );
-                        let connect = StopMessage {
-                            kind: StopMessageType::Connect,
-                            peer: Some(Peer {
-                                id: self.a_id.to_bytes(),
-                                addrs: Vec::new(),
-                            }),
-                            limit: None,
-                            status: None,
-                        };
-                        self.deliver(Side::B, stop_stream, encode_frame(&connect.encode()));
-                        assert!(trailing.is_empty(), "no pipelining before the bridge");
-                    }
-                    HopMessageType::Status => panic!("clients never send HOP STATUS"),
+            Some(EmuStream::Hop) => match side {
+                Side::B => {
+                    let reserver = self.peer_of(side);
+                    let trailing = self
+                        .relay_emulator
+                        .on_reserve_request(&reserver, &data)
+                        .expect("valid RESERVE request");
+                    assert!(trailing.is_empty(), "no bytes follow RESERVE");
+                    let response = self.relay_emulator.drain_hop_bytes_for(&reserver);
+                    self.deliver(side, stream, response);
                 }
-            }
+                Side::A => {
+                    let initiator = self.peer_of(side);
+                    let mut initiator_inbox = Vec::new();
+                    let outcome = self
+                        .relay_emulator
+                        .on_connect_request(&initiator, &data, &mut initiator_inbox)
+                        .expect("valid CONNECT request");
+                    let ConnectRequestOutcome::Bridging { target, trailing } = outcome else {
+                        panic!("B must already hold a reservation");
+                    };
+                    assert_eq!(target, self.b_id);
+                    assert!(trailing.is_empty(), "no pipelining before the bridge");
+                    assert!(initiator_inbox.is_empty(), "bridge awaits STOP ack");
+
+                    // Mark A's stream as the relay side of the bridge and
+                    // open the queued STOP stream toward B.
+                    self.set_role(side, stream, EmuStream::HopBridge);
+                    self.next_stream += 1;
+                    let stop_stream = StreamId::new(self.next_stream);
+                    self.streams.push((Side::B, stop_stream, EmuStream::Stop));
+                    self.bridge = Some((stream, stop_stream));
+
+                    let relay = self.relay_id.clone();
+                    self.b.handle_event(
+                        &SwarmEvent::StreamReady {
+                            peer_id: relay,
+                            stream_id: stop_stream,
+                            protocol_id: STOP_PROTOCOL_ID.to_string(),
+                            initiated_locally: false,
+                        },
+                        at(self.now),
+                    );
+                    let stop_connect = self.relay_emulator.drain_stop_bytes_for(&target);
+                    self.deliver(Side::B, stop_stream, stop_connect);
+                }
+            },
             Some(EmuStream::Stop) if !self.bridged => {
                 // B's answer to STOP CONNECT.
-                let FrameDecode::Complete { payload, consumed } = decode_frame(&data) else {
-                    panic!("whole frame expected");
-                };
-                let msg = StopMessage::decode(payload).expect("valid STOP frame");
-                assert_eq!(msg.kind, StopMessageType::Status);
-                assert_eq!(msg.status, Some(Status::Ok), "B auto-accepts");
+                let mut initiator_inbox = Vec::new();
+                let trailing = self
+                    .relay_emulator
+                    .on_stop_ack_from_target(&data, &mut initiator_inbox)
+                    .expect("B auto-accepts with STOP STATUS:OK");
                 self.bridged = true;
                 let (a_bridge, _) = self.bridge.expect("bridge pending");
-                let status = HopMessage {
-                    kind: HopMessageType::Status,
-                    peer: None,
-                    reservation: None,
-                    limit: None,
-                    status: Some(Status::Ok),
-                };
-                self.deliver(Side::A, a_bridge, encode_frame(&status.encode()));
+                self.deliver(Side::A, a_bridge, initiator_inbox);
                 // Anything B pipelined behind its STATUS already belongs to
                 // the bridge.
-                let trailing = data[consumed..].to_vec();
                 if !trailing.is_empty() {
                     self.deliver(Side::A, a_bridge, trailing);
                 }

@@ -814,6 +814,7 @@ dependencies = [
  "minip2p-dcutr",
  "minip2p-relay",
  "minip2p-swarm",
+ "minip2p-test-support",
  "minip2p-transport",
  "thiserror",
 ]
@@ -885,8 +886,17 @@ dependencies = [
  "minip2p-multistream-select",
  "minip2p-ping",
  "minip2p-relay",
+ "minip2p-test-support",
  "minip2p-transport",
  "thiserror",
+]
+
+[[package]]
+name = "minip2p-test-support"
+version = "0.1.0"
+dependencies = [
+ "minip2p-core",
+ "minip2p-relay",
 ]
 
 [[package]]
