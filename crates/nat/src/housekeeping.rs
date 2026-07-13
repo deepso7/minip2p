@@ -348,10 +348,18 @@ impl Prober {
         _now: Now,
     ) -> bool {
         let (sample, sample_addrs) = match reachability {
-            Reachability::Public { addrs, .. } => (
-                true,
-                select_direct_candidates(addrs, None, None).into_addrs(),
-            ),
+            Reachability::Public { addrs, .. } => {
+                let selected = select_direct_candidates(addrs, None, None);
+                // A successful dial-back is useful public evidence only when
+                // it leaves the application with an address this QUIC-only
+                // stack can actually advertise and accept. Counting an empty
+                // selection could release a WhenPrivate reservation while
+                // providing no direct replacement path.
+                if selected.is_empty() {
+                    return false;
+                }
+                (true, selected.into_addrs())
+            }
             Reachability::Private { .. } => (false, Vec::new()),
             // No signal: never move the window on an inconclusive probe.
             Reachability::Unknown { .. } => return false,
@@ -683,6 +691,13 @@ impl ReservationManager {
             }
             ResState::Acquiring { relay, .. } if relay.peer_id() == peer => {
                 // Do not reset the retired stream id on the new connection.
+                // A renewal keeps the old reservation in `held` while its
+                // replacement exchange runs. Superseding the relay connection
+                // invalidates that reservation even though the exchange did
+                // not fail through the normal stream path.
+                if let Some(held) = self.held.take() {
+                    shared.push_event(NatEvent::RelayReservationLost { relay: held });
+                }
                 self.relay_idx += 1;
                 self.state = ResState::Backoff {
                     until: now.mono_ms + shared.config.reservation_retry_backoff_ms,
@@ -1025,7 +1040,7 @@ impl Housekeeping {
                 self.reservations
                     .on_stream_input(stream, input, shared, now);
             }
-            StreamRole::HopConnect(_) | StreamRole::StopInbound(_) => {}
+            StreamRole::HopConnect(_) | StreamRole::StopInbound(_) | StreamRole::RejectedStop => {}
         }
     }
 

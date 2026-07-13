@@ -220,16 +220,35 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
     );
 
     assert!(handled, "rejected NAT control streams stay internal");
-    assert!(!h.agent.owns_stream(&attacker, stream));
+    assert!(
+        h.agent.owns_stream(&attacker, stream),
+        "rejected stream remains owned until terminal close"
+    );
     assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
-    h.agent.handle_event(
+
+    assert!(h.agent.handle_event_with_disposition(
         &SwarmEvent::StreamData {
-            peer_id: attacker,
+            peer_id: attacker.clone(),
             stream_id: stream,
             data: stop_connect(&h.target),
         },
         at(1),
-    );
+    ));
+    assert!(h.agent.handle_event_with_disposition(
+        &SwarmEvent::StreamRemoteWriteClosed {
+            peer_id: attacker.clone(),
+            stream_id: stream,
+        },
+        at(2),
+    ));
+    assert!(h.agent.handle_event_with_disposition(
+        &SwarmEvent::StreamClosed {
+            peer_id: attacker.clone(),
+            stream_id: stream,
+        },
+        at(3),
+    ));
+    assert!(!h.agent.owns_stream(&attacker, stream));
     assert!(drain_actions(&mut h.agent).is_empty());
     assert!(drain_events(&mut h.agent).is_empty());
 }

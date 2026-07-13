@@ -124,7 +124,11 @@ impl Hk {
 
     /// Completes a probe exchange whose `OpenStream` is already queued.
     /// Responds public or private and returns the events it produced.
-    fn finish_probe(&mut self, public: bool, t: u64) -> Vec<NatEvent> {
+    fn finish_probe_with_addrs(
+        &mut self,
+        public_addrs: Option<&[minip2p_core::Multiaddr]>,
+        t: u64,
+    ) -> Vec<NatEvent> {
         let server = self.server.clone();
         let actions = drain_actions(&mut self.agent);
         let token = open_stream_token_for(&actions, &server);
@@ -133,10 +137,14 @@ impl Hk {
         self.stream_ready(&server.clone(), stream, AUTONAT_PROTOCOL_ID, at(t + 1));
         let actions = drain_actions(&mut self.agent);
         let request = sent_data_on(&actions, stream);
-        let public_addrs = [maddr(LISTEN_ADDR)];
-        let response = autonat_response(&request, public.then_some(&public_addrs[..]));
+        let response = autonat_response(&request, public_addrs);
         self.stream_data(&server, stream, response, at(t + 2));
         drain_events(&mut self.agent)
+    }
+
+    fn finish_probe(&mut self, public: bool, t: u64) -> Vec<NatEvent> {
+        let public_addrs = [maddr(LISTEN_ADDR)];
+        self.finish_probe_with_addrs(public.then_some(&public_addrs), t)
     }
 
     /// Ticks to start the next probe (the server session must be ready),
@@ -255,6 +263,48 @@ fn confidence_threshold_above_window_clamps_to_unanimity() {
             ..
         }]
     ));
+}
+
+#[test]
+fn public_probe_without_a_usable_quic_addr_is_inconclusive() {
+    let mut hk = build_with_config(ReservationPolicy::WhenPrivate, 1, 1, |config| {
+        config.confidence_window = 1;
+        config.confidence_threshold = 1;
+    });
+
+    // Establish both housekeeping sessions, then hold a relay reservation
+    // while reachability is still Unknown.
+    hk.agent.handle_tick(at(0));
+    let actions = drain_actions(&mut hk.agent);
+    let relay_dial = dial_token_for(&actions, &hk.relay);
+    let server_dial = dial_token_for(&actions, &hk.server);
+    hk.agent
+        .dial_result(relay_dial, Ok(ConnectionId::new(60)), at(1));
+    hk.agent
+        .dial_result(server_dial, Ok(ConnectionId::new(61)), at(1));
+    let relay = hk.relay.clone();
+    hk.session_ready(&relay, &[HOP_PROTOCOL_ID], at(2));
+    let (events, _) = hk.finish_reserve(hop_reserve_ok(None), at(3));
+    assert!(matches!(
+        events.as_slice(),
+        [NatEvent::RelayReserved { .. }]
+    ));
+    assert!(hk.agent.active_reservation().is_some());
+
+    let server = hk.server.clone();
+    hk.session_ready(&server, &[AUTONAT_PROTOCOL_ID], at(4));
+    let wildcard_only = [maddr("/ip4/0.0.0.0/udp/4001/quic-v1")];
+    let events = hk.finish_probe_with_addrs(Some(&wildcard_only), 5);
+
+    assert!(
+        events.is_empty(),
+        "unusable public evidence is inconclusive"
+    );
+    assert_eq!(hk.agent.reachability(), ReachabilityState::Unknown);
+    assert!(
+        hk.agent.active_reservation().is_some(),
+        "WhenPrivate must retain its only advertised path"
+    );
 }
 
 #[test]
@@ -445,6 +495,43 @@ fn lost_relay_connection_emits_lost_and_reacquires() {
     hk.agent.handle_tick(at(5_600));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(dial_count_for(&actions, &hk.relay), 1);
+}
+
+#[test]
+fn relay_supersede_during_renewal_emits_reservation_lost() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(Some(1_900)), at_unix(10, 1_000));
+    assert!(matches!(
+        events.as_slice(),
+        [NatEvent::RelayReserved { .. }]
+    ));
+    drain_actions(&mut hk.agent); // completed exchange's close-write
+
+    // Start renewal, then replace the relay connection before the new
+    // reservation exchange completes. The old reservation died with the
+    // retired connection and must be withdrawn immediately.
+    let renew_at = 10 + 780 * 1_000;
+    hk.agent.handle_tick(at_unix(renew_at, 1_790));
+    let relay = hk.relay.clone();
+    hk.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            peer_id: relay.clone(),
+        },
+        at_unix(renew_at + 1, 1_790),
+    );
+
+    let events = drain_events(&mut hk.agent);
+    assert!(matches!(
+        events.as_slice(),
+        [NatEvent::RelayReservationLost { relay: lost }] if *lost == relay
+    ));
+    assert!(hk.agent.active_reservation().is_none());
+    assert!(
+        !drain_actions(&mut hk.agent)
+            .iter()
+            .any(|action| matches!(action, NatAction::ResetStream { .. })),
+        "supersede cleanup must not reset a stream id on the replacement connection"
+    );
 }
 
 #[test]

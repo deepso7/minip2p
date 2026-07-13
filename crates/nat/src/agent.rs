@@ -28,6 +28,9 @@ pub(crate) enum StreamRole {
     AutonatProbe,
     /// Inbound STOP stream from a relay (responder-side circuit).
     StopInbound(u64),
+    /// Inbound STOP stream from an untrusted peer. Kept owned until terminal
+    /// close so its reset lifecycle cannot leak into the application.
+    RejectedStop,
 }
 
 /// What a pending `Dial` / `OpenStream` token was issued for.
@@ -364,6 +367,8 @@ impl NatAgent {
                             peer: peer_id.clone(),
                             stream_id: *stream_id,
                         });
+                        self.shared
+                            .own_stream(peer_id, *stream_id, StreamRole::RejectedStop);
                         handled = true;
                     } else {
                         // A relay is bridging an inbound circuit to us: claim
@@ -578,6 +583,7 @@ impl NatAgent {
                     circuit.on_stream_input(stream, input, &mut self.shared, now);
                 }
             }
+            StreamRole::RejectedStop => {}
         }
         true
     }
