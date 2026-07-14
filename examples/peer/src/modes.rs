@@ -563,12 +563,7 @@ pub fn run_dial(
             }
         }
         Path::DirectDialed | Path::DirectPunched => {
-            let stream = open_echo_stream(&mut endpoint, &peer, Instant::now() + SETUP_DEADLINE)?;
-            Channel {
-                send_peer: peer.clone(),
-                stream,
-                direct: true,
-            }
+            establish_direct_channel(&mut endpoint, &peer, &BTreeSet::new(), None, start)?
         }
     };
 
@@ -601,9 +596,78 @@ fn open_echo_stream(
             Event::StreamReady {
                 peer_id, stream_id, ..
             } if peer_id == peer && *stream_id == stream => return Ok(stream),
+            Event::ConnectionEstablished { peer_id } if peer_id == peer => {
+                print_event("dial", &event);
+                // A second punch connection just replaced the one this
+                // stream was opened on — the swarm keeps the newcomer and
+                // silently drops the stream, so its `StreamReady` will
+                // never arrive. Abandon it and let the caller retry on the
+                // settled connection. (A stale buffered establishment
+                // trips this too; the retry is cheap either way.)
+                let _ = endpoint.reset_stream(peer, stream);
+                return Err("connection replaced during echo stream setup".into());
+            }
             _ => print_event("dial", &event),
         }
     }
+}
+
+/// [`open_direct_channel`] with retries: a hole punch is a connection race,
+/// and the losing connection can take a just-opened stream down with it —
+/// mid-setup or right after. Each retry runs on whatever connection
+/// survived.
+fn establish_direct_channel(
+    endpoint: &mut Endpoint,
+    peer: &PeerId,
+    outstanding: &BTreeSet<u64>,
+    drain_deadline: Option<Instant>,
+    start: Instant,
+) -> Result<Channel, Box<dyn Error>> {
+    let mut attempts = 5u32;
+    loop {
+        match open_direct_channel(endpoint, peer, outstanding, drain_deadline, start) {
+            Ok(channel) => return Ok(channel),
+            Err(e) if attempts > 0 => {
+                attempts -= 1;
+                eprintln!("[dial] direct channel setup failed ({e}); retrying");
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Opens (or reopens) the direct echo channel and resends every
+/// outstanding seq with a fresh timestamp, so the sequence stays unbroken
+/// and RTTs stay honest. During the post-count drain the grace period
+/// bounds the setup, and the new stream is immediately half-closed —
+/// the final counted ping already went out.
+fn open_direct_channel(
+    endpoint: &mut Endpoint,
+    peer: &PeerId,
+    outstanding: &BTreeSet<u64>,
+    drain_deadline: Option<Instant>,
+    start: Instant,
+) -> Result<Channel, Box<dyn Error>> {
+    let setup = Instant::now() + SETUP_DEADLINE;
+    let deadline = drain_deadline.map_or(setup, |drain| drain.min(setup));
+    let stream = open_echo_stream(endpoint, peer, deadline)?;
+    let channel = Channel {
+        send_peer: peer.clone(),
+        stream,
+        direct: true,
+    };
+    for &missing in outstanding {
+        let frame = encode_frame(missing, millis_since(start));
+        endpoint
+            .send_stream(&channel.send_peer, channel.stream, frame.to_vec())
+            .map_err(|e| format!("resend on direct channel: {e}"))?;
+    }
+    if drain_deadline.is_some() {
+        endpoint
+            .close_stream_write(&channel.send_peer, channel.stream)
+            .map_err(|e| format!("close after channel switch: {e}"))?;
+    }
+    Ok(channel)
 }
 
 /// The dialer's steady state: one ping per second, pongs measured as they
@@ -622,6 +686,11 @@ fn ping_loop(
     let mut next_ping = Instant::now();
     // Set once the final counted ping went out; the loop then only drains.
     let mut drain_deadline: Option<Instant> = None;
+    // A hole punch is a connection race: when both simultaneous-open dials
+    // land, the swarm keeps the last connection and a stream opened on the
+    // first dies moments after the upgrade. Reopening is routine, but cap
+    // it so a genuinely broken peer cannot loop us forever.
+    let mut reopens_left: u32 = 3;
 
     loop {
         for nat_event in endpoint.take_nat_events() {
@@ -631,16 +700,17 @@ fn ping_loop(
                 && !channel.direct
             {
                 // The old bridge is already reset by the agent — never
-                // touch it again. Pongs in flight on it are gone; resend
-                // their seqs on the new stream with fresh timestamps so
-                // the sequence stays unbroken and RTTs stay honest.
+                // touch it again. Pongs in flight on it are gone; the
+                // reopen resends their seqs on the new stream.
                 frames.clear();
-                // During the post-count drain the grace period bounds the
-                // switch too; a slow setup must not outlive it.
-                let setup = Instant::now() + SETUP_DEADLINE;
-                let deadline = drain_deadline.map_or(setup, |drain| drain.min(setup));
-                let stream = match open_echo_stream(endpoint, peer, deadline) {
-                    Ok(stream) => stream,
+                channel = match establish_direct_channel(
+                    endpoint,
+                    peer,
+                    &outstanding,
+                    drain_deadline,
+                    start,
+                ) {
+                    Ok(channel) => channel,
                     Err(e) if drain_deadline.is_some() => {
                         // The remaining pongs could only have arrived on
                         // the replacement stream; the run is over.
@@ -650,25 +720,6 @@ fn ping_loop(
                     }
                     Err(e) => return Err(e),
                 };
-                channel = Channel {
-                    send_peer: peer.clone(),
-                    stream,
-                    direct: true,
-                };
-                for &missing in &outstanding {
-                    let frame = encode_frame(missing, millis_since(start));
-                    endpoint
-                        .send_stream(&channel.send_peer, channel.stream, frame.to_vec())
-                        .map_err(|e| format!("resend on upgraded channel: {e}"))?;
-                }
-                if drain_deadline.is_some() {
-                    // The final counted ping already went out; half-close
-                    // the replacement stream so the listener sees EOF and
-                    // mirrors it, same as the pre-upgrade channel did.
-                    endpoint
-                        .close_stream_write(&channel.send_peer, channel.stream)
-                        .map_err(|e| format!("close after channel switch: {e}"))?;
-                }
                 println!(
                     "[dial] channel-switched path=direct outstanding-resent={}",
                     outstanding.len()
@@ -690,11 +741,40 @@ fn ping_loop(
                 continue;
             }
             seq += 1;
-            let frame = encode_frame(seq, millis_since(start));
-            endpoint
-                .send_stream(&channel.send_peer, channel.stream, frame.to_vec())
-                .map_err(|e| format!("ping send: {e}"))?;
             outstanding.insert(seq);
+            let frame = encode_frame(seq, millis_since(start));
+            if let Err(e) = endpoint.send_stream(&channel.send_peer, channel.stream, frame.to_vec())
+            {
+                if !channel.direct || reopens_left == 0 {
+                    stats.print_summary();
+                    return Err(format!("ping send: {e}").into());
+                }
+                // A punch race can supersede the direct connection moments
+                // after the upgrade; the stream dies silently and this send
+                // is the first to notice. Reopen on the surviving connection
+                // — the reopen resends every outstanding seq, this one
+                // included.
+                eprintln!("[dial] ping send failed ({e}); reopening the channel");
+                reopens_left -= 1;
+                frames.clear();
+                channel = match establish_direct_channel(
+                    endpoint,
+                    peer,
+                    &outstanding,
+                    drain_deadline,
+                    start,
+                ) {
+                    Ok(channel) => channel,
+                    Err(e) => {
+                        stats.print_summary();
+                        return Err(e);
+                    }
+                };
+                println!(
+                    "[dial] channel-reopened path=direct outstanding-resent={}",
+                    outstanding.len()
+                );
+            }
             stats.sent += 1;
             println!("[dial] ping seq={seq} path={}", channel.name());
             // Schedule from the actual send time. Long-lived event handling
@@ -747,10 +827,35 @@ fn ping_loop(
                 if *peer_id == channel.send_peer && *stream_id == channel.stream =>
             {
                 print_event("dial", &event);
-                stats.print_summary();
                 if drain_deadline.is_some() {
+                    stats.print_summary();
                     return Ok(());
                 }
+                if channel.direct && reopens_left > 0 {
+                    // Same punch race as the send-failure path, noticed via
+                    // the stream event instead of a failed write.
+                    reopens_left -= 1;
+                    frames.clear();
+                    channel = match establish_direct_channel(
+                        endpoint,
+                        peer,
+                        &outstanding,
+                        drain_deadline,
+                        start,
+                    ) {
+                        Ok(channel) => channel,
+                        Err(e) => {
+                            stats.print_summary();
+                            return Err(e);
+                        }
+                    };
+                    println!(
+                        "[dial] channel-reopened path=direct outstanding-resent={}",
+                        outstanding.len()
+                    );
+                    continue;
+                }
+                stats.print_summary();
                 return Err("ping channel closed".into());
             }
             Event::ConnectionClosed { peer_id } if *peer_id == channel.send_peer => {
