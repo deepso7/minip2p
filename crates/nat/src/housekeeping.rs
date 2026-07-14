@@ -128,14 +128,14 @@ impl Prober {
                 self.next_probe_at = Some(now.mono_ms + shared.config.probe_interval_unsettled_ms);
                 return;
             }
-        } else if shared.connected.contains(&server_peer) {
+        } else if shared.connected.contains(&server_peer)
+            || shared.session_dial_pending(&server_peer, now)
+        {
+            // Connected, or another machine is already dialing this peer
+            // (an AutoNAT server can double as the configured relay).
             ExchangeStage::WaitPeerReady
         } else {
-            let token = shared.alloc_token(TokenPurpose::ProbeDial);
-            shared.push_action(NatAction::Dial {
-                token,
-                addr: server.clone(),
-            });
+            shared.push_session_dial(TokenPurpose::ProbeDial, server.clone(), now);
             ExchangeStage::WaitPeerReady
         };
 
@@ -595,14 +595,14 @@ impl ReservationManager {
                 self.fail_acquire(shared, now);
                 return;
             }
-        } else if shared.connected.contains(&relay_peer) {
+        } else if shared.connected.contains(&relay_peer)
+            || shared.session_dial_pending(&relay_peer, now)
+        {
+            // Connected, or a connect attempt's relay leg is already dialing
+            // this relay: share that connection instead of superseding it.
             ExchangeStage::WaitPeerReady
         } else {
-            let token = shared.alloc_token(TokenPurpose::ReserveDial);
-            shared.push_action(NatAction::Dial {
-                token,
-                addr: relay.clone(),
-            });
+            shared.push_session_dial(TokenPurpose::ReserveDial, relay.clone(), now);
             ExchangeStage::WaitPeerReady
         };
 

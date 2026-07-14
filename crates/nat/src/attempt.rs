@@ -454,11 +454,14 @@ impl ConnectAttempt {
                     NatError::Protocol("relay does not advertise the HOP protocol".into()),
                 );
             }
-        } else if shared.connected.contains(&relay_peer) {
+        } else if shared.connected.contains(&relay_peer)
+            || shared.session_dial_pending(&relay_peer, now)
+        {
+            // Connected, or another machine (reservation, probe) is already
+            // dialing this relay: wait for `PeerReady` on that connection.
             self.leg = RelayLeg::WaitRelayReady;
         } else {
-            let token = shared.alloc_token(TokenPurpose::RelayDial(self.id));
-            shared.push_action(NatAction::Dial { token, addr: relay });
+            shared.push_session_dial(TokenPurpose::RelayDial(self.id), relay, now);
             self.leg = RelayLeg::WaitRelayReady;
         }
     }

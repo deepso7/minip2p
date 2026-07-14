@@ -2,7 +2,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId, select_direct_candidates};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId, select_direct_candidates};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -109,6 +109,14 @@ pub(crate) struct Shared {
     /// reporting peer disconnects, which keeps the map bounded by the
     /// configured-peer count.
     observed_addrs: BTreeMap<PeerId, Multiaddr>,
+    /// Session dials in flight: relay-leg, reservation, and probe dials whose
+    /// connection has not yet established. Concurrent machines targeting the
+    /// same infrastructure peer wait on the first dial instead of issuing
+    /// their own — a second connection to the same peer supersedes the first,
+    /// and the supersede scrubs the winner's streams. Values carry the dialed
+    /// peer and an expiry (`mono_ms`) so a handshake that never completes
+    /// cannot suppress dialing forever.
+    pending_session_dials: BTreeMap<NatToken, (PeerId, u64)>,
 }
 
 impl Shared {
@@ -121,6 +129,30 @@ impl Shared {
 
     pub(crate) fn push_action(&mut self, action: NatAction) {
         self.actions.push_back(action);
+    }
+
+    /// Issues a session dial: allocates the token, records the in-flight
+    /// entry consulted by [`Shared::session_dial_pending`], and pushes the
+    /// `Dial` action. Punch dials must not go through here — simultaneous
+    /// open intentionally dials a peer that is about to be connected.
+    pub(crate) fn push_session_dial(&mut self, purpose: TokenPurpose, addr: PeerAddr, now: Now) {
+        // Expired entries only accumulate when handshakes silently die;
+        // prune them here so the map stays bounded without a timer.
+        self.pending_session_dials
+            .retain(|_, (_, expires)| *expires > now.mono_ms);
+        let token = self.alloc_token(purpose);
+        let expires = now.mono_ms + self.config.relay_leg_deadline_ms;
+        self.pending_session_dials
+            .insert(token, (addr.peer_id().clone(), expires));
+        self.push_action(NatAction::Dial { token, addr });
+    }
+
+    /// Whether a session dial toward `peer` is still in flight (issued, not
+    /// yet established, expiry not passed).
+    pub(crate) fn session_dial_pending(&self, peer: &PeerId, now: Now) -> bool {
+        self.pending_session_dials
+            .values()
+            .any(|(dialed, expires)| dialed == peer && *expires > now.mono_ms)
     }
 
     pub(crate) fn push_event(&mut self, event: NatEvent) {
@@ -260,6 +292,7 @@ impl NatAgent {
                 released_bridges: BTreeMap::new(),
                 listen_addrs: Vec::new(),
                 observed_addrs: BTreeMap::new(),
+                pending_session_dials: BTreeMap::new(),
             },
             attempts: BTreeMap::new(),
             housekeeping,
@@ -330,6 +363,12 @@ impl NatAgent {
         match event {
             SwarmEvent::ConnectionEstablished { peer_id } => {
                 touched_state = true;
+                // Any session dial toward this peer has done its job (ours
+                // landed, or another machine's did — either way the peer is
+                // reachable now and further dials would supersede).
+                self.shared
+                    .pending_session_dials
+                    .retain(|_, (dialed, _)| dialed != peer_id);
                 let superseded = !self.shared.connected.insert(peer_id.clone());
                 if superseded {
                     // The swarm's last-connection-wins policy emits a second
@@ -381,6 +420,9 @@ impl NatAgent {
                 self.shared.registry.remove(peer_id);
                 self.shared.released_bridges.remove(peer_id);
                 self.shared.observed_addrs.remove(peer_id);
+                self.shared
+                    .pending_session_dials
+                    .retain(|_, (dialed, _)| dialed != peer_id);
             }
             SwarmEvent::IdentifyReceived { peer_id, info } => {
                 // The remote reports the transport address it sees us from.
@@ -506,6 +548,11 @@ impl NatAgent {
         let Some(purpose) = self.shared.tokens.remove(&token) else {
             return;
         };
+        if result.is_err() {
+            // A rejected session dial is no longer in flight; waiters fall
+            // back to their own deadlines.
+            self.shared.pending_session_dials.remove(&token);
+        }
         match &purpose {
             TokenPurpose::ProbeDial => {
                 self.housekeeping
