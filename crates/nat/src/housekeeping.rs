@@ -135,7 +135,8 @@ impl Prober {
             // (an AutoNAT server can double as the configured relay).
             ExchangeStage::WaitPeerReady
         } else {
-            shared.push_session_dial(TokenPurpose::ProbeDial, server.clone(), now);
+            let deadline_ms = shared.config.probe_deadline_ms;
+            shared.push_session_dial(TokenPurpose::ProbeDial, server.clone(), now, deadline_ms);
             ExchangeStage::WaitPeerReady
         };
 
@@ -602,7 +603,8 @@ impl ReservationManager {
             // this relay: share that connection instead of superseding it.
             ExchangeStage::WaitPeerReady
         } else {
-            shared.push_session_dial(TokenPurpose::ReserveDial, relay.clone(), now);
+            let deadline_ms = shared.config.relay_leg_deadline_ms;
+            shared.push_session_dial(TokenPurpose::ReserveDial, relay.clone(), now, deadline_ms);
             ExchangeStage::WaitPeerReady
         };
 

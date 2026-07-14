@@ -132,13 +132,24 @@ impl Shared {
     /// entry consulted by [`Shared::session_dial_pending`], and pushes the
     /// `Dial` action. Punch dials must not go through here — simultaneous
     /// open intentionally dials a peer that is about to be connected.
-    pub(crate) fn push_session_dial(&mut self, purpose: TokenPurpose, addr: PeerAddr, now: Now) {
+    ///
+    /// `deadline_ms` is the owning machine's flight deadline for this dial.
+    /// The entry must stay visible for as long as the owner is still
+    /// legitimately waiting — expiring earlier re-opens the duplicate-dial
+    /// window this map exists to close.
+    pub(crate) fn push_session_dial(
+        &mut self,
+        purpose: TokenPurpose,
+        addr: PeerAddr,
+        now: Now,
+        deadline_ms: u64,
+    ) {
         // Expired entries only accumulate when handshakes silently die;
         // prune them here so the map stays bounded without a timer.
         self.pending_session_dials
             .retain(|_, (_, expires)| *expires > now.mono_ms);
         let token = self.alloc_token(purpose);
-        let expires = now.mono_ms + self.config.relay_leg_deadline_ms;
+        let expires = now.mono_ms + deadline_ms;
         self.pending_session_dials
             .insert(token, (addr.peer_id().clone(), expires));
         self.push_action(NatAction::Dial { token, addr });
@@ -545,10 +556,21 @@ impl NatAgent {
         let Some(purpose) = self.shared.tokens.remove(&token) else {
             return;
         };
-        if result.is_err() {
-            // A rejected session dial is no longer in flight; waiters fall
-            // back to their own deadlines.
-            self.shared.pending_session_dials.remove(&token);
+        if result.is_err()
+            && let Some((peer, _)) = self.shared.pending_session_dials.remove(&token)
+        {
+            // A rejected session dial is no longer in flight. Attempts that
+            // were sharing it must issue their own dial now: nothing else
+            // re-enters a waiting relay leg, so they would otherwise burn
+            // their leg deadline on a dial that already failed. The owner
+            // learns through its own routing below, and housekeeping
+            // waiters fall back to their acquire/probe deadlines.
+            let owner = purpose.connect_id();
+            for (id, attempt) in self.attempts.iter_mut() {
+                if owner.as_ref() != Some(id) {
+                    attempt.on_session_dial_failed(&peer, &mut self.shared, now);
+                }
+            }
         }
         match &purpose {
             TokenPurpose::ProbeDial => {

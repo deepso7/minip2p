@@ -289,6 +289,28 @@ impl ConnectAttempt {
         }
     }
 
+    /// A shared session dial toward this attempt's relay — owned by another
+    /// machine — failed while this attempt was waiting on it. Re-issue the
+    /// dial: nothing else re-enters the relay leg, so waiting out the leg
+    /// deadline would forfeit the relay path over a dial that already
+    /// failed. The pending-dial gate collapses simultaneous re-dials from
+    /// several waiters back into one.
+    pub(crate) fn on_session_dial_failed(&mut self, peer: &PeerId, shared: &mut Shared, now: Now) {
+        if self.done || self.leg != RelayLeg::WaitRelayReady || !self.is_relay_peer(peer) {
+            return;
+        }
+        if shared.connected.contains(peer) || shared.session_dial_pending(peer, now) {
+            // The shared connection landed anyway, or an earlier-woken
+            // waiter already re-dialed; keep waiting on that.
+            return;
+        }
+        let Some(relay) = self.relay.clone() else {
+            return;
+        };
+        let deadline_ms = shared.config.relay_leg_deadline_ms;
+        shared.push_session_dial(TokenPurpose::RelayDial(self.id), relay, now, deadline_ms);
+    }
+
     pub(crate) fn on_dial_result(
         &mut self,
         purpose: &TokenPurpose,
@@ -461,7 +483,8 @@ impl ConnectAttempt {
             // dialing this relay: wait for `PeerReady` on that connection.
             self.leg = RelayLeg::WaitRelayReady;
         } else {
-            shared.push_session_dial(TokenPurpose::RelayDial(self.id), relay, now);
+            let deadline_ms = shared.config.relay_leg_deadline_ms;
+            shared.push_session_dial(TokenPurpose::RelayDial(self.id), relay, now, deadline_ms);
             self.leg = RelayLeg::WaitRelayReady;
         }
     }
