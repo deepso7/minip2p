@@ -102,11 +102,12 @@ pub(crate) struct Shared {
     released_bridges: BTreeMap<PeerId, BTreeMap<StreamId, ConnectId>>,
     /// Our validated external/listen addresses, advertised in DCUtR CONNECT.
     pub(crate) listen_addrs: Vec<Multiaddr>,
-    /// Our transport address as observed by each connected peer (Identify's
-    /// `observedAddr`). Behind a NAT this is the public mapping of our QUIC
-    /// socket — the address that makes cross-NAT hole punching possible.
-    /// Entries are dropped when the reporting peer disconnects, which keeps
-    /// the map bounded by the connection count.
+    /// Our transport address as observed by trusted reporters (Identify's
+    /// `observedAddr` from configured relays and AutoNAT servers). Behind a
+    /// NAT this is the public mapping of our QUIC socket — the address that
+    /// makes cross-NAT hole punching possible. Entries are dropped when the
+    /// reporting peer disconnects, which keeps the map bounded by the
+    /// configured-peer count.
     observed_addrs: BTreeMap<PeerId, Multiaddr>,
 }
 
@@ -177,6 +178,33 @@ impl Shared {
 
     pub(crate) fn forget_released_bridge(&mut self, peer: &PeerId, stream: StreamId) {
         let _ = self.take_released_bridge(peer, stream);
+    }
+
+    /// Records `reporter`'s Identify claim of our transport address.
+    ///
+    /// Punch candidates are advertised to third parties, who dial them and
+    /// blast random UDP at them during a punch — so only operator-configured
+    /// peers (relays and AutoNAT servers) are believed. An arbitrary
+    /// connected peer must not be able to plant an attacker-chosen address
+    /// here; observed addresses are never dial-back verified the way AutoNAT
+    /// addresses are.
+    fn record_observed_addr(&mut self, reporter: &PeerId, observed: Option<&[u8]>) {
+        let trusted = self
+            .config
+            .relays
+            .iter()
+            .chain(self.config.autonat_servers.iter())
+            .any(|peer| peer.peer_id() == reporter);
+        if !trusted {
+            return;
+        }
+        let Some(Ok(addr)) = observed.map(Multiaddr::from_bytes) else {
+            return;
+        };
+        let validated = select_direct_candidates(&[], Some(addr), None);
+        if let Some(addr) = validated.into_addrs().pop() {
+            self.observed_addrs.insert(reporter.clone(), addr);
+        }
     }
 
     /// Addresses advertised in DCUtR exchanges: the validated listen/external
@@ -361,12 +389,8 @@ impl NatAgent {
                 // The event stays application-visible (`handled` = false),
                 // and nothing here can complete a machine (`touched_state`
                 // stays false).
-                if let Some(Ok(addr)) = info.observed_addr.as_deref().map(Multiaddr::from_bytes) {
-                    let validated = select_direct_candidates(&[], Some(addr), None);
-                    if let Some(addr) = validated.into_addrs().pop() {
-                        self.shared.observed_addrs.insert(peer_id.clone(), addr);
-                    }
-                }
+                self.shared
+                    .record_observed_addr(peer_id, info.observed_addr.as_deref());
             }
             SwarmEvent::PeerReady { peer_id, protocols } => {
                 touched_state = true;
