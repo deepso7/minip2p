@@ -975,10 +975,12 @@ impl QuicTransport {
                     self.pending_datagrams.pop_front();
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    return Err(TransportError::PollError {
-                        reason: format!("queued udp send failed: {e}"),
-                    });
+                // Queued datagrams may target different destinations, so a
+                // dead route for one must neither abort the poll nor block
+                // the rest: drop the packet (loss recovery retransmits
+                // anything that mattered) and keep flushing.
+                Err(_) => {
+                    self.pending_datagrams.pop_front();
                 }
             }
         }
@@ -1935,7 +1937,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_events_survive_an_errored_poll() {
+    fn poisoned_queued_datagram_is_dropped_without_failing_the_poll() {
         let mut transport =
             QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
         let addr = transport.local_multiaddr().expect("multiaddr");
@@ -1943,30 +1945,25 @@ mod tests {
             .pending_events
             .push(TransportEvent::Listening { addr: addr.clone() });
 
-        // An IPv6 destination on an IPv4 socket makes the datagram flush fail
-        // with a hard error before any events would be returned.
+        // An IPv6 destination on an IPv4 socket makes the datagram send fail
+        // with a hard error. A dead route affects only that packet's
+        // destination, so the poll must drop it and carry on rather than
+        // abort the whole endpoint.
         let bad_destination: SocketAddr = "[::1]:9".parse().expect("socket addr");
         transport.queue_datagram_best_effort(&[0u8; 4], bad_destination);
+        let good_destination = transport.local_addr().expect("local addr");
+        transport.queue_datagram_best_effort(&[0u8; 4], good_destination);
 
-        let error = transport
-            .poll()
-            .expect_err("hard send failure must surface");
-        assert!(matches!(error, TransportError::PollError { .. }));
-        assert!(
-            transport
-                .pending_events
-                .iter()
-                .any(|event| matches!(event, TransportEvent::Listening { addr: a } if *a == addr)),
-            "events queued before the failed poll must remain queued"
-        );
-
-        // Once the poisoned datagram is gone the next poll delivers the batch.
-        transport.pending_datagrams.clear();
         let events = transport.poll().expect("poll");
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, TransportEvent::Listening { addr: a } if *a == addr))
+                .any(|event| matches!(event, TransportEvent::Listening { addr: a } if *a == addr)),
+            "events queued before the poisoned datagram must still be delivered"
+        );
+        assert!(
+            transport.pending_datagrams.is_empty(),
+            "the poisoned datagram must be dropped and the one behind it sent"
         );
     }
 

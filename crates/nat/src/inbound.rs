@@ -1,24 +1,25 @@
 //! Responder-side hole punching: a NAT'd listener holding a relay
 //! reservation accepts inbound STOP circuits, answers the initiator's DCUtR
-//! exchange, and punches back — dialing the initiator's observed addresses
-//! and blasting random UDP datagrams to open its own NAT mapping.
+//! exchange, and blasts random UDP datagrams at the initiator's observed
+//! addresses to open its own NAT mapping. Only the initiator dials (DCUtR
+//! for QUIC): the blasts make that dial land.
 //!
 //! ```text
 //! relay opens STOP stream ──▶ CONNECT ──▶ auto-Accept (STATUS:OK)
 //!   ──▶ DCUtR CONNECT arrives ──▶ reply with our observed addresses
-//!   ──▶ SYNC arrives ──▶ dial initiator's addrs + schedule UDP blasts,
+//!   ──▶ SYNC arrives ──▶ schedule UDP blasts,
 //!       release the bridge to the app (InboundRelayCircuit)
-//! direct connection appears ──▶ cancel blasts, InboundDirectUpgrade
+//! initiator's dial lands ──▶ cancel blasts, InboundDirectUpgrade
 //! ```
 
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol, select_direct_candidates};
+use minip2p_core::{Multiaddr, PeerId, SansIoProtocol, select_direct_candidates};
 use minip2p_dcutr::{DcutrResponder, DcutrResponderInput, DcutrResponderOutput, ResponderEvent};
 use minip2p_relay::{Status, StopResponder, StopResponderInput, StopResponderOutput};
 use minip2p_transport::StreamId;
 
-use crate::agent::{Shared, StreamInput, TokenPurpose};
+use crate::agent::{Shared, StreamInput};
 use crate::events::{NatAction, NatEvent};
 use crate::types::Now;
 
@@ -30,7 +31,7 @@ struct BlastSchedule {
 }
 
 /// One inbound relay circuit: STOP acceptance, DCUtR responder exchange,
-/// and the punch-back (dials + UDP blasts).
+/// and the punch-window UDP blasts.
 pub(crate) struct InboundCircuit {
     /// The peer that opened the STOP stream to us (the relay).
     relay: PeerId,
@@ -264,24 +265,20 @@ impl InboundCircuit {
         }
     }
 
-    /// SYNC arrived: punch back (simultaneous dials + UDP blasts) and hand
+    /// SYNC arrived: open our NAT mapping with random-UDP blasts and hand
     /// the bridge to the application.
+    ///
+    /// Per the DCUtR spec for QUIC, only the initiator dials. A responder
+    /// dial would race the initiator's — when both land (guaranteed
+    /// without NATs, common with cone NATs) the second connection
+    /// supersedes the first and the supersede scrubs every stream the
+    /// application just opened on the announced path.
     fn on_sync(&mut self, shared: &mut Shared, now: Now) {
         self.dcutr = None;
-        let Some(source) = self.source.clone() else {
+        if self.source.is_none() {
             return;
-        };
-
-        for addr in &self.remote_addrs {
-            let Ok(peer_addr) = PeerAddr::new(addr.clone(), source.clone()) else {
-                continue;
-            };
-            let token = shared.alloc_token(TokenPurpose::InboundPunchDial);
-            shared.push_action(NatAction::Dial {
-                token,
-                addr: peer_addr,
-            });
         }
+
         if !self.remote_addrs.is_empty() {
             self.blast = Some(BlastSchedule {
                 addrs: self.remote_addrs.clone(),
@@ -384,8 +381,8 @@ impl InboundCircuit {
     }
 
     /// The relay connection died. Before release the circuit is gone; after
-    /// release the app owns the (now dead) stream and the punch-back may
-    /// still land, so the circuit lingers.
+    /// release the app owns the (now dead) stream and the initiator's punch
+    /// dial may still land, so the circuit lingers.
     pub(crate) fn on_relay_disconnected(&mut self, peer: &PeerId, _shared: &mut Shared) {
         if self.done || &self.relay != peer {
             return;

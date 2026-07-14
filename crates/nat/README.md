@@ -117,9 +117,10 @@ Independent of connect attempts, the agent also runs:
 A NAT'd listener holding a reservation handles inbound circuits
 automatically: the relay's STOP CONNECT is auto-accepted, the initiator's
 DCUtR exchange is answered with our validated addresses, and on SYNC the
-agent punches back — dialing the initiator's observed addresses and
-emitting `SendRandomUdp` blasts (first after `responder_sync_delay_ms`,
-then every `blast_interval_ms` until `punch_deadline_ms`). The bridge
+agent emits `SendRandomUdp` blasts at the initiator's observed addresses
+to open its own NAT mapping (first after `responder_sync_delay_ms`, then
+every `blast_interval_ms` until `punch_deadline_ms`). Per DCUtR for QUIC
+only the initiator dials — the blasts make that dial land. The bridge
 stream is handed to the application via `InboundRelayCircuit`; a landed
 punch is announced with `InboundDirectUpgrade`.
 
@@ -129,6 +130,6 @@ punch is announced with `InboundDirectUpgrade`.
   covered by scripted no-I/O tests in `tests/arbitration.rs`.
 - Housekeeping (AutoNAT confidence aggregation, relay reservation renewal):
   implemented, covered by `tests/housekeeping.rs`.
-- Responder side (inbound STOP circuits, punch-back, UDP blasts):
+- Responder side (inbound STOP circuits, punch-window UDP blasts):
   implemented, covered by `tests/inbound.rs` plus a two-agent end-to-end
   exchange over an in-memory relay emulator (`tests/two_agents.rs`).
