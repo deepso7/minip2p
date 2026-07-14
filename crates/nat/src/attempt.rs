@@ -296,17 +296,43 @@ impl ConnectAttempt {
     /// failed. The pending-dial gate collapses simultaneous re-dials from
     /// several waiters back into one.
     pub(crate) fn on_session_dial_failed(&mut self, peer: &PeerId, shared: &mut Shared, now: Now) {
-        if self.done || self.leg != RelayLeg::WaitRelayReady || !self.is_relay_peer(peer) {
+        if self.done || !self.is_relay_peer(peer) {
             return;
         }
-        if shared.connected.contains(peer) || shared.session_dial_pending(peer, now) {
-            // The shared connection landed anyway, or an earlier-woken
-            // waiter already re-dialed; keep waiting on that.
+        self.redrive_relay_leg(shared, now);
+    }
+
+    /// Re-issues the relay dial when the leg waits on a connection that no
+    /// longer has a dial in flight — the shared dial failed, or its owner
+    /// stalled and the entry expired. No-op while a dial is still pending,
+    /// once the relay is connected, and past the leg's own deadline (the
+    /// tick is about to fail the leg; a fresh dial would only gate other
+    /// machines on a connection nobody is waiting for).
+    fn redrive_relay_leg(&mut self, shared: &mut Shared, now: Now) {
+        if self.done || self.leg != RelayLeg::WaitRelayReady {
+            return;
+        }
+        if self
+            .relay_deadline
+            .is_none_or(|deadline| now.mono_ms >= deadline)
+        {
             return;
         }
         let Some(relay) = self.relay.clone() else {
             return;
         };
+        let relay_peer = relay.peer_id();
+        if shared.connected.contains(relay_peer) || shared.session_dial_pending(relay_peer, now) {
+            // The shared connection landed anyway, or an earlier-woken
+            // waiter already re-dialed; keep waiting on that.
+            return;
+        }
+        // The entry gets the full dial-flight lifetime even when this leg's
+        // own deadline is nearer: it models the handshake in flight, not
+        // the attempt's patience. A connection landing after the leg gives
+        // up still lifts the gate (`ConnectionEstablished` clears the
+        // peer's entries), whereas a shorter lifetime would re-open the
+        // duplicate-dial window while the handshake is still under way.
         let deadline_ms = shared.config.relay_leg_deadline_ms;
         shared.push_session_dial(TokenPurpose::RelayDial(self.id), relay, now, deadline_ms);
     }
@@ -436,6 +462,12 @@ impl ConnectAttempt {
         {
             self.fail_relay_leg(shared, NatError::Timeout);
         }
+
+        // A shared dial the leg was waiting on can vanish without a result
+        // when its owner stalls: the entry expires exactly at the owner's
+        // own flight deadline, so a tick is guaranteed to run then — this
+        // re-drive is what keeps a stalled owner from stranding the leg.
+        self.redrive_relay_leg(shared, now);
 
         if let Some(deadline) = self.punch_deadline
             && now.mono_ms >= deadline

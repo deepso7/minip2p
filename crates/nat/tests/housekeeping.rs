@@ -769,6 +769,68 @@ fn waiting_attempt_redials_when_the_shared_dial_fails() {
     );
 }
 
+/// When the owner of a shared dial stalls (no result ever arrives), its
+/// entry expires at the owner's own flight deadline — and the tick running
+/// at that moment must re-drive waiting relay legs. Without the re-drive
+/// the attempt idles until its own later deadline and fails without ever
+/// dialing the relay itself.
+#[test]
+fn waiting_attempt_redials_when_the_shared_dial_expires() {
+    let mut hk = build_with_config(ReservationPolicy::Never, 1, 0, |config| {
+        config.autonat_servers =
+            vec![PeerAddr::new(maddr(RELAY_TRANSPORT_ADDR), peer(b"relay-peer")).unwrap()];
+    });
+    let relay = hk.relay.clone();
+
+    // The probe owns the dial (20s flight); the handshake stalls silently.
+    hk.agent.handle_tick(at(0));
+    let actions = drain_actions(&mut hk.agent);
+    assert_eq!(dial_count_for(&actions, &relay), 1, "{actions:?}");
+
+    // A connect joins the pending dial mid-flight.
+    hk.agent
+        .connect(peer(b"target-peer"), Vec::new(), at(15_000));
+    let actions = drain_actions(&mut hk.agent);
+    assert_eq!(dial_count_for(&actions, &relay), 0, "{actions:?}");
+
+    // The probe's flight deadline: the entry expires and the same tick must
+    // re-drive the waiting relay leg (whose own deadline, 27s, is live).
+    hk.agent.handle_tick(at(20_000));
+    let actions = drain_actions(&mut hk.agent);
+    assert_eq!(
+        dial_count_for(&actions, &relay),
+        1,
+        "the waiting attempt must re-dial when the stalled entry expires: {actions:?}"
+    );
+}
+
+/// A shared-dial failure arriving after the leg's own deadline (with no
+/// tick in between) must not trigger a re-dial: the next tick fails the
+/// leg, so a fresh entry would only gate the reservation manager's and
+/// prober's dials on a connection nobody is waiting for.
+#[test]
+fn late_shared_dial_failure_does_not_redial_a_dead_leg() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    let relay = hk.relay.clone();
+
+    hk.agent.handle_tick(at(0));
+    let actions = drain_actions(&mut hk.agent);
+    let reserve_dial = dial_token_for(&actions, &relay);
+
+    hk.agent.connect(peer(b"target-peer"), Vec::new(), at(10));
+    drain_actions(&mut hk.agent);
+
+    // The failure lands past the attempt's relay-leg deadline (10 + 12s).
+    hk.agent
+        .dial_result(reserve_dial, Err("timed out".into()), at(12_500));
+    let actions = drain_actions(&mut hk.agent);
+    assert_eq!(
+        dial_count_for(&actions, &relay),
+        0,
+        "no re-dial past the leg deadline: {actions:?}"
+    );
+}
+
 /// A session dial whose handshake never completes must not suppress dialing
 /// forever: once the reservation deadline fails the acquisition, the retry
 /// issues a fresh dial (the stale in-flight entry has expired).
