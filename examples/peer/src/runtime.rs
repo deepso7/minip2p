@@ -4,10 +4,13 @@ use std::error::Error;
 use std::fs;
 use std::path::Path;
 
-use minip2p_identity::{ED25519_SECRET_KEY_LENGTH, Ed25519Keypair};
-use minip2p_quic::{QuicEndpoint, QuicNodeConfig};
+use minip2p::Ed25519Keypair;
 
 use crate::cli::RunOptions;
+
+/// Raw Ed25519 secret length; `Ed25519Keypair::from_secret_key_bytes`
+/// enforces it at compile time via the array parameter.
+const SECRET_KEY_LENGTH: usize = 32;
 
 /// Loads a persistent key from `--key`, or generates and writes one when missing.
 pub fn load_keypair(options: &RunOptions, role: &str) -> Result<Ed25519Keypair, Box<dyn Error>> {
@@ -41,28 +44,7 @@ pub fn load_keypair(options: &RunOptions, role: &str) -> Result<Ed25519Keypair, 
     Ok(keypair)
 }
 
-/// Builds the peer CLI's QUIC transport.
-///
-/// With an explicit `--listen`, bind exactly that address. With no explicit
-/// listen address, bind IPv4 and IPv6 sockets so the demo is reachable on both
-/// address families by default.
-pub fn build_peer_transport(
-    options: &RunOptions,
-    keypair: &Ed25519Keypair,
-) -> Result<QuicEndpoint, Box<dyn Error>> {
-    let config = QuicNodeConfig::new(keypair.clone());
-    if let Some(addr) = &options.listen_addr {
-        return QuicEndpoint::bind_multiaddr(config, addr)
-            .map_err(|e| format!("quic bind {addr}: {e}").into());
-    }
-
-    QuicEndpoint::dual_stack(config).map_err(|e| format!("quic dual-stack bind: {e}").into())
-}
-
-fn write_secret(
-    path: &Path,
-    secret: &[u8; ED25519_SECRET_KEY_LENGTH],
-) -> Result<(), Box<dyn Error>> {
+fn write_secret(path: &Path, secret: &[u8; SECRET_KEY_LENGTH]) -> Result<(), Box<dyn Error>> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create key directory {}: {e}", parent.display()))?;
@@ -93,18 +75,18 @@ fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn decode_secret(input: &str) -> Result<[u8; ED25519_SECRET_KEY_LENGTH], String> {
-    if input.len() != ED25519_SECRET_KEY_LENGTH * 2 {
+fn decode_secret(input: &str) -> Result<[u8; SECRET_KEY_LENGTH], String> {
+    if input.len() != SECRET_KEY_LENGTH * 2 {
         return Err(format!(
             "expected {} hex chars, got {}",
-            ED25519_SECRET_KEY_LENGTH * 2,
+            SECRET_KEY_LENGTH * 2,
             input.len()
         ));
     }
 
-    let mut out = [0u8; ED25519_SECRET_KEY_LENGTH];
+    let mut out = [0u8; SECRET_KEY_LENGTH];
     let bytes = input.as_bytes();
-    for idx in 0..ED25519_SECRET_KEY_LENGTH {
+    for idx in 0..SECRET_KEY_LENGTH {
         let hi = hex_value(bytes[idx * 2])?;
         let lo = hex_value(bytes[idx * 2 + 1])?;
         out[idx] = (hi << 4) | lo;

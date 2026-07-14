@@ -1,15 +1,14 @@
-//! `minip2p-peer`: CLI demo exercising the full minip2p stack.
+//! `minip2p-peer`: NAT-aware echo-ping demo for the minip2p stack.
 //!
 //! See `examples/peer/README.md` for usage examples.
 //!
-//! This file is the tiny dispatch layer: parse argv via [`cli`],
-//! then hand off to one of the four mode runners. The mode runners
-//! themselves (direct listen/dial, relay listen/dial) live in their
-//! own modules so the state machines don't mix with the CLI plumbing.
+//! This file is the tiny dispatch layer: parse argv via [`cli`], then hand
+//! off to `modes::run_listen` or `modes::run_dial`. Both runners drive the
+//! NAT traversal agent, so the same two subcommands work on loopback,
+//! across the open internet, and between two NATed hosts via a relay.
 
 mod cli;
-mod direct;
-mod relay;
+mod modes;
 mod runtime;
 
 use cli::{CliError, Mode};
@@ -34,14 +33,12 @@ fn main() {
 /// Dispatches to the mode runner.
 fn run(mode: Mode) -> Result<(), Box<dyn std::error::Error>> {
     match mode {
-        Mode::DirectListen { options } => direct::run_listen(options),
-        Mode::DirectDial { target, options } => direct::run_dial(target, options),
-        Mode::RelayListen { relay, options } => relay::run_listen(relay, options),
-        Mode::RelayDial {
-            relay,
+        Mode::Listen { relay, options } => modes::run_listen(relay, options),
+        Mode::Dial {
             target,
+            relay,
+            count,
             options,
-        } => relay::run_dial(relay, target, options),
-        Mode::AutoNatServer { options } => relay::run_autonat_server(options),
+        } => modes::run_dial(target, relay, count, options),
     }
 }
