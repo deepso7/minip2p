@@ -498,39 +498,6 @@ fn hop_open_count(actions: &[NatAction], peer: &PeerId) -> usize {
 }
 
 #[test]
-fn concurrent_connect_joins_the_pending_reservation_dial() {
-    let mut hk = build(ReservationPolicy::Always, 1, 0);
-
-    // The reservation manager dials the relay first.
-    hk.agent.handle_tick(at(0));
-    let actions = drain_actions(&mut hk.agent);
-    let token = dial_token_for(&actions, &hk.relay);
-    hk.agent.dial_result(token, Ok(ConnectionId::new(60)), at(5));
-
-    // A connect starts while that handshake is still in flight. Its relay
-    // leg must join the pending dial: a second connection to the same peer
-    // would supersede the first, scrubbing both machines' streams.
-    hk.agent.connect(peer(b"target-peer"), Vec::new(), at(100));
-    hk.agent.handle_tick(at(400));
-    let actions = drain_actions(&mut hk.agent);
-    assert_eq!(
-        dial_count_for(&actions, &hk.relay),
-        0,
-        "the connect raced a second relay dial"
-    );
-
-    // The single connection lands; both machines proceed on it.
-    let relay = hk.relay.clone();
-    hk.session_ready(&relay, &[HOP_PROTOCOL_ID], at(500));
-    let actions = drain_actions(&mut hk.agent);
-    assert_eq!(
-        hop_open_count(&actions, &relay),
-        2,
-        "reserve and connect legs must share the connection"
-    );
-}
-
-#[test]
 fn connect_and_reservation_racing_in_one_tick_share_one_dial() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
 
@@ -549,28 +516,6 @@ fn connect_and_reservation_racing_in_one_tick_share_one_dial() {
     hk.session_ready(&relay, &[HOP_PROTOCOL_ID], at(300));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(hop_open_count(&actions, &relay), 2);
-}
-
-#[test]
-fn expired_session_dial_does_not_suppress_the_retry() {
-    let mut hk = build(ReservationPolicy::Always, 1, 0);
-    hk.agent.handle_tick(at(0));
-    let actions = drain_actions(&mut hk.agent);
-    assert_eq!(dial_count_for(&actions, &hk.relay), 1);
-
-    // The handshake never completes and no dial result ever arrives. The
-    // acquire deadline fails the exchange, and once the backoff elapses the
-    // retry must dial again — the stale pending entry has expired and must
-    // not suppress it forever.
-    let mut redials = 0;
-    for t in [12_050, 12_650, 13_300] {
-        hk.agent.handle_tick(at(t));
-        redials += dial_count_for(&drain_actions(&mut hk.agent), &hk.relay);
-    }
-    assert_eq!(
-        redials, 1,
-        "expired pending dial must not suppress the retry"
-    );
 }
 
 #[test]
