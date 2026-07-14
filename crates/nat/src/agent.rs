@@ -53,9 +53,6 @@ pub(crate) enum TokenPurpose {
     ReserveDial,
     /// HOP RESERVE stream open.
     OpenReserve(PeerId),
-    /// Responder-side simultaneous-open dial of an initiator's observed
-    /// address. Results are ignored; the punch window governs.
-    InboundPunchDial,
 }
 
 impl TokenPurpose {

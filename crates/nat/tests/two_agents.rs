@@ -427,15 +427,12 @@ fn two_agents_punch_to_a_direct_connection() {
         "B released the inbound bridge, got {events:?}"
     );
 
-    // B's punch-back: simultaneous dial plus UDP blasts after the sync
-    // delay.
+    // B's punch-back is blast-only (DCUtR for QUIC: the initiator dials).
+    // A responder dial would race A's — when both land, the second
+    // connection supersedes the first and scrubs its streams.
     assert_eq!(
-        world.punch_dials_from_b, 2,
-        "B dialed A's listen address and A's relay-observed public mapping"
-    );
-    assert!(
-        world.punch_dial_addrs_from_b.contains(&maddr(A_PUBLIC)),
-        "B's punch-back targets A's public mapping: {:?}",
+        world.punch_dials_from_b, 0,
+        "the responder must not dial: {:?}",
         world.punch_dial_addrs_from_b
     );
     world.advance(100);

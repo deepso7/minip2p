@@ -1,5 +1,5 @@
 //! Scripted responder-side tests: inbound STOP circuits, the DCUtR
-//! responder exchange, punch-back dials, and the UDP blast schedule.
+//! responder exchange, and the UDP blast schedule.
 
 mod common;
 
@@ -60,7 +60,7 @@ fn drive_to_sync_ready(h: &mut Harness, stream: StreamId) {
 }
 
 #[test]
-fn full_inbound_flow_punches_back_and_upgrades() {
+fn full_inbound_flow_blasts_and_upgrades() {
     let mut h = inbound_harness(NatConfig::default());
     let stream = StreamId::new(STOP_STREAM);
 
@@ -79,8 +79,9 @@ fn full_inbound_flow_punches_back_and_upgrades() {
     let actions = drain_actions(&mut h.agent);
     assert_eq!(
         dial_count_for(&actions, &h.target),
-        1,
-        "simultaneous-open dial toward the initiator's observed address"
+        0,
+        "only the initiator dials; a responder dial would race it and the \
+         superseded connection would lose its streams"
     );
     assert!(
         !h.agent.owns_stream(&h.relay, stream),
