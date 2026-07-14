@@ -81,6 +81,16 @@ fn listen_and_dial_complete_counted_ping_run() {
         );
     }
 
+    // A plain direct dial must open its echo stream on the first try: the
+    // dial's own queued `ConnectionEstablished` must not be misread as a
+    // superseding punch connection (which would reset the stream and log
+    // a spurious retry).
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("direct channel setup failed"),
+        "direct dial retried its echo stream setup; stderr:\n{stderr}",
+    );
+
     // Listener is killed on drop.
 }
 

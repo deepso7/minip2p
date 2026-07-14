@@ -602,8 +602,9 @@ fn open_echo_stream(
                 // stream was opened on — the swarm keeps the newcomer and
                 // silently drops the stream, so its `StreamReady` will
                 // never arrive. Abandon it and let the caller retry on the
-                // settled connection. (A stale buffered establishment
-                // trips this too; the retry is cheap either way.)
+                // settled connection. (The caller drained stale
+                // establishments before opening, so this only fires for a
+                // genuine replacement racing the setup.)
                 let _ = endpoint.reset_stream(peer, stream);
                 return Err("connection replaced during echo stream setup".into());
             }
@@ -650,6 +651,18 @@ fn open_direct_channel(
 ) -> Result<Channel, Box<dyn Error>> {
     let setup = Instant::now() + SETUP_DEADLINE;
     let deadline = drain_deadline.map_or(setup, |drain| drain.min(setup));
+    // `wait_path` and `PathUpgraded` report on NAT events; the connection's
+    // own `ConnectionEstablished` may still sit in the swarm queue. Drain
+    // what is already queued before opening the stream, so a stale
+    // establishment cannot masquerade as a superseding punch connection —
+    // that would burn the stream and force a needless retry on every plain
+    // direct dial.
+    while let Some(event) = endpoint
+        .next_event(Duration::ZERO)
+        .map_err(|e| format!("draining queued events: {e}"))?
+    {
+        print_event("dial", &event);
+    }
     let stream = open_echo_stream(endpoint, peer, deadline)?;
     let channel = Channel {
         send_peer: peer.clone(),
