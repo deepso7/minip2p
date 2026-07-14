@@ -214,29 +214,46 @@ fn decode_frame(frame: &[u8; FRAME_LEN]) -> (u64, u64) {
 /// may fragment or coalesce writes arbitrarily.
 struct FrameBuf {
     buf: Vec<u8>,
+    head: usize,
 }
 
 impl FrameBuf {
     fn new() -> Self {
-        Self { buf: Vec::new() }
+        Self {
+            buf: Vec::new(),
+            head: 0,
+        }
     }
 
     fn push(&mut self, data: &[u8]) {
+        // Compact at most once per transport chunk. Draining from the front
+        // for every 16-byte frame would repeatedly shift the unread suffix.
+        if self.head != 0 {
+            self.buf.copy_within(self.head.., 0);
+            self.buf.truncate(self.buf.len() - self.head);
+            self.head = 0;
+        }
         self.buf.extend_from_slice(data);
     }
 
     fn pop(&mut self) -> Option<[u8; FRAME_LEN]> {
-        if self.buf.len() < FRAME_LEN {
+        let end = self.head.checked_add(FRAME_LEN)?;
+        if end > self.buf.len() {
             return None;
         }
         let mut frame = [0u8; FRAME_LEN];
-        frame.copy_from_slice(&self.buf[..FRAME_LEN]);
-        self.buf.drain(..FRAME_LEN);
+        frame.copy_from_slice(&self.buf[self.head..end]);
+        self.head = end;
+        if self.head == self.buf.len() {
+            self.buf.clear();
+            self.head = 0;
+        }
         Some(frame)
     }
 
     fn clear(&mut self) {
         self.buf.clear();
+        self.head = 0;
     }
 }
 
@@ -680,7 +697,10 @@ fn ping_loop(
             outstanding.insert(seq);
             stats.sent += 1;
             println!("[dial] ping seq={seq} path={}", channel.name());
-            next_ping += PING_INTERVAL;
+            // Schedule from the actual send time. Long-lived event handling
+            // (notably a direct-channel upgrade) must not turn missed ticks
+            // into a burst of catch-up pings.
+            next_ping = next_ping_deadline(Instant::now());
             if count == Some(seq) {
                 // Graceful teardown: half-close so the listener echoes
                 // everything already sent, then mirrors the close.
@@ -748,4 +768,49 @@ fn ping_loop(
 
 fn millis_since(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn next_ping_deadline(sent_at: Instant) -> Instant {
+    sent_at + PING_INTERVAL
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_buffer_drains_coalesced_frames_without_per_frame_compaction() {
+        let frames = 4_096;
+        let mut input = Vec::with_capacity(frames * FRAME_LEN);
+        for seq in 0..frames as u64 {
+            input.extend_from_slice(&encode_frame(seq, seq + 1));
+        }
+
+        let mut buffer = FrameBuf::new();
+        buffer.push(&input);
+        for expected in 0..frames - 1 {
+            let frame = buffer.pop().expect("complete coalesced frame");
+            assert_eq!(decode_frame(&frame), (expected as u64, expected as u64 + 1));
+        }
+
+        // Popping advances a cursor; the allocation is not shifted or
+        // shortened once per frame.
+        assert_eq!(buffer.buf.len(), input.len());
+        assert_eq!(buffer.head, (frames - 1) * FRAME_LEN);
+
+        let last = buffer.pop().expect("last coalesced frame");
+        assert_eq!(decode_frame(&last), (frames as u64 - 1, frames as u64));
+        assert!(buffer.buf.is_empty());
+        assert_eq!(buffer.head, 0);
+    }
+
+    #[test]
+    fn delayed_ping_schedules_one_interval_from_actual_send() {
+        let old_deadline = Instant::now();
+        let delayed_send = old_deadline + PING_INTERVAL * 5;
+        let next = next_ping_deadline(delayed_send);
+
+        assert_eq!(next.duration_since(delayed_send), PING_INTERVAL);
+        assert!(next > old_deadline + PING_INTERVAL);
+    }
 }
