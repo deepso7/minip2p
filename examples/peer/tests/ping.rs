@@ -1,19 +1,20 @@
-//! CI-safe end-to-end test for `minip2p-peer` direct mode.
+//! CI-safe end-to-end test for `minip2p-peer` on loopback, relay-free.
 //!
-//! Spawns the `minip2p-peer listen` subprocess, parses its `bound=`
-//! line from stdout, then spawns `minip2p-peer dial <addr>` and asserts
-//! the dialer exits successfully with a `ping ... rtt=...ms` line on
-//! stdout. Both processes are killed on drop so a panicking assertion
-//! doesn't leave a listener bound to a UDP port on the test host.
+//! Spawns `minip2p-peer listen`, parses its `bound=` line from stdout,
+//! then spawns `minip2p-peer dial <addr> --count 3` and asserts the dialer
+//! exits successfully after a direct-dialed path, three pongs with an
+//! unbroken seq sequence, and a complete summary. Both processes are
+//! killed on drop so a panicking assertion doesn't leave a listener bound
+//! to a UDP port on the test host.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Hard cap on the entire flow. On localhost this completes in well
-/// under a second; the generous timeout absorbs CI jitter.
-const TEST_DEADLINE: Duration = Duration::from_secs(15);
+/// Hard cap on the entire flow. The dial itself takes ~3 s (three 1 s
+/// pings); the generous timeout absorbs CI jitter.
+const TEST_DEADLINE: Duration = Duration::from_secs(20);
 
 /// Child process that is killed on drop so a test panic doesn't leak
 /// a bound UDP socket.
@@ -27,7 +28,7 @@ impl Drop for KillOnDrop {
 }
 
 #[test]
-fn direct_listen_and_dial_complete_ping_round_trip() {
+fn listen_and_dial_complete_counted_ping_run() {
     let bin = env!("CARGO_BIN_EXE_minip2p-peer");
 
     // --- 1. Spawn the listener and read its peer-addr from stdout. ---
@@ -49,6 +50,8 @@ fn direct_listen_and_dial_complete_ping_round_trip() {
     let dialer = Command::new(bin)
         .arg("dial")
         .arg(&peer_addr)
+        .arg("--count")
+        .arg("3")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -66,11 +69,26 @@ fn direct_listen_and_dial_complete_ping_round_trip() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    for needle in [
+        "path-established path=direct-dialed",
+        "pong seq=1",
+        "pong seq=3",
+        "summary sent=3 received=3",
+    ] {
+        assert!(
+            stdout.lines().any(|l| l.contains(needle)),
+            "dialer stdout should contain '{needle}'; got:\n{stdout}",
+        );
+    }
+
+    // A plain direct dial must open its echo stream on the first try: the
+    // dial's own queued `ConnectionEstablished` must not be misread as a
+    // superseding punch connection (which would reset the stream and log
+    // a spurious retry).
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout
-            .lines()
-            .any(|l| l.contains("rtt=") && l.contains("ping")),
-        "dialer stdout should contain a 'ping ... rtt=...' line; got:\n{stdout}",
+        !stderr.contains("direct channel setup failed"),
+        "direct dial retried its echo stream setup; stderr:\n{stderr}",
     );
 
     // Listener is killed on drop.

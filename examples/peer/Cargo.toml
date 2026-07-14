@@ -8,24 +8,12 @@ publish = false
 [lints]
 workspace = true
 
-# Binary that exercises the full minip2p stack end-to-end: direct QUIC
-# peer-to-peer pings, and relay-coordinated hole-punch pings via Circuit
-# Relay v2 + DCUtR. See examples/peer/README.md for usage.
+# NAT-aware echo-ping demo: `listen` echoes, `dial` pings once per second
+# and tags each RTT with the current path (relayed or direct), so a mid-run
+# hole-punch upgrade is directly visible. See examples/peer/README.md.
 [[bin]]
 name = "minip2p-peer"
 path = "src/main.rs"
 
 [dependencies]
-minip2p = { path = "../../crates/minip2p" }
-minip2p-core = { path = "../../crates/core" }
-minip2p-identity = { path = "../../crates/identity" }
-minip2p-transport = { path = "../../crates/transport" }
-minip2p-swarm = { path = "../../crates/swarm" }
-minip2p-ping = { path = "../../crates/ping" }
-minip2p-identify = { path = "../../crates/identify" }
-minip2p-autonat = { path = "../../crates/autonat" }
-minip2p-relay = { path = "../../crates/relay" }
-minip2p-dcutr = { path = "../../crates/dcutr" }
-minip2p-multistream-select = { path = "../../crates/multistream-select" }
-minip2p-quic = { path = "../../transports/quic" }
-getrandom = "0.4.3"
+minip2p = { path = "../../crates/minip2p", features = ["nat"] }
