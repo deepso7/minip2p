@@ -605,12 +605,14 @@ impl QuicConnection {
                     });
                     break;
                 }
-                Err(e) => {
-                    return Err(TransportError::CloseFailed {
-                        id: self.id,
-                        reason: format!("udp send error: {e}"),
-                    });
-                }
+                // Any other send error (EHOSTUNREACH after a route flap,
+                // ICMP-driven ECONNREFUSED, ...) affects only this
+                // connection's path, so it must not abort the whole
+                // endpoint's poll. Treat the packet as lost -- quiche's
+                // loss recovery retransmits it, and a path that stays dead
+                // ends in this connection's idle timeout. Stop draining so
+                // a dead route is not hammered within one flush.
+                Err(_) => break,
             }
         }
         Ok(())
