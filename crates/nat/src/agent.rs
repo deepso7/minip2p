@@ -2,7 +2,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId};
+use minip2p_core::{Multiaddr, PeerId, select_direct_candidates};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -102,6 +102,13 @@ pub(crate) struct Shared {
     released_bridges: BTreeMap<PeerId, BTreeMap<StreamId, ConnectId>>,
     /// Our validated external/listen addresses, advertised in DCUtR CONNECT.
     pub(crate) listen_addrs: Vec<Multiaddr>,
+    /// Our transport address as observed by trusted reporters (Identify's
+    /// `observedAddr` from configured relays and AutoNAT servers). Behind a
+    /// NAT this is the public mapping of our QUIC socket — the address that
+    /// makes cross-NAT hole punching possible. Entries are dropped when the
+    /// reporting peer disconnects, which keeps the map bounded by the
+    /// configured-peer count.
+    observed_addrs: BTreeMap<PeerId, Multiaddr>,
 }
 
 impl Shared {
@@ -172,6 +179,45 @@ impl Shared {
     pub(crate) fn forget_released_bridge(&mut self, peer: &PeerId, stream: StreamId) {
         let _ = self.take_released_bridge(peer, stream);
     }
+
+    /// Records `reporter`'s Identify claim of our transport address.
+    ///
+    /// Punch candidates are advertised to third parties, who dial them and
+    /// blast random UDP at them during a punch — so only operator-configured
+    /// peers (relays and AutoNAT servers) are believed. An arbitrary
+    /// connected peer must not be able to plant an attacker-chosen address
+    /// here; observed addresses are never dial-back verified the way AutoNAT
+    /// addresses are.
+    fn record_observed_addr(&mut self, reporter: &PeerId, observed: Option<&[u8]>) {
+        let trusted = self
+            .config
+            .relays
+            .iter()
+            .chain(self.config.autonat_servers.iter())
+            .any(|peer| peer.peer_id() == reporter);
+        if !trusted {
+            return;
+        }
+        let Some(Ok(addr)) = observed.map(Multiaddr::from_bytes) else {
+            return;
+        };
+        let validated = select_direct_candidates(&[], Some(addr), None);
+        if let Some(addr) = validated.into_addrs().pop() {
+            self.observed_addrs.insert(reporter.clone(), addr);
+        }
+    }
+
+    /// Addresses advertised in DCUtR exchanges: the validated listen/external
+    /// set plus our peer-observed public mappings, deduplicated.
+    pub(crate) fn punch_candidates(&self) -> Vec<Multiaddr> {
+        let mut addrs = self.listen_addrs.clone();
+        for addr in self.observed_addrs.values() {
+            if !addrs.contains(addr) {
+                addrs.push(addr.clone());
+            }
+        }
+        addrs
+    }
 }
 
 /// Sans-I/O NAT-traversal orchestrator.
@@ -213,6 +259,7 @@ impl NatAgent {
                 ready: BTreeMap::new(),
                 released_bridges: BTreeMap::new(),
                 listen_addrs: Vec::new(),
+                observed_addrs: BTreeMap::new(),
             },
             attempts: BTreeMap::new(),
             housekeeping,
@@ -333,6 +380,17 @@ impl NatAgent {
                 // attempts have not already cleaned up.
                 self.shared.registry.remove(peer_id);
                 self.shared.released_bridges.remove(peer_id);
+                self.shared.observed_addrs.remove(peer_id);
+            }
+            SwarmEvent::IdentifyReceived { peer_id, info } => {
+                // The remote reports the transport address it sees us from.
+                // Behind a NAT that is our public mapping — the only usable
+                // DCUtR punch candidate, since bound addresses are private.
+                // The event stays application-visible (`handled` = false),
+                // and nothing here can complete a machine (`touched_state`
+                // stays false).
+                self.shared
+                    .record_observed_addr(peer_id, info.observed_addr.as_deref());
             }
             SwarmEvent::PeerReady { peer_id, protocols } => {
                 touched_state = true;

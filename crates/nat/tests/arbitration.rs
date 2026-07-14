@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 
-use minip2p_core::Multiaddr;
+use minip2p_core::{Multiaddr, PeerAddr};
 use minip2p_nat::{ConnectId, NatAction, NatConfig, NatError, NatEvent, Path};
 use minip2p_relay::Status;
 use minip2p_swarm::SwarmEvent;
@@ -761,5 +761,157 @@ fn wildcard_and_non_quic_candidates_are_filtered() {
         dial_count_for(&actions, &h.target),
         1,
         "wildcards, non-QUIC shapes, and duplicates never get dialed"
+    );
+}
+
+#[test]
+fn identify_observed_addr_joins_dcutr_connect() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    // The relay's identify tells us our public mapping before any attempt.
+    identify_observed(
+        &mut h.agent,
+        &h.relay.clone(),
+        &maddr(OUR_OBSERVED_ADDR),
+        at(0),
+    );
+
+    let (_id, stream) = drive_to_bridged(&mut h, 10);
+    let actions = drain_actions(&mut h.agent);
+    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    assert!(
+        obs.contains(&maddr(LISTEN_ADDR)),
+        "bound addresses stay in the CONNECT"
+    );
+    assert!(
+        obs.contains(&maddr(OUR_OBSERVED_ADDR)),
+        "the peer-observed public mapping must be advertised for the punch"
+    );
+}
+
+#[test]
+fn latest_observation_per_reporter_wins() {
+    let stale = "/ip4/203.0.113.77/udp/1111/quic-v1";
+    let mut h = Harness::with_relay(NatConfig::default());
+
+    // Same reporter twice: only the fresh observation survives.
+    let relay = h.relay.clone();
+    identify_observed(&mut h.agent, &relay, &maddr(stale), at(0));
+    identify_observed(&mut h.agent, &relay, &maddr(OUR_OBSERVED_ADDR), at(1));
+
+    let (_id, stream) = drive_to_bridged(&mut h, 10);
+    let actions = drain_actions(&mut h.agent);
+    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    assert!(obs.contains(&maddr(OUR_OBSERVED_ADDR)));
+    assert!(!obs.contains(&maddr(stale)), "replaced observation leaks");
+}
+
+#[test]
+fn reporter_disconnect_drops_its_observation() {
+    let departed = "/ip4/203.0.113.88/udp/2222/quic-v1";
+    let mut h = Harness::with_relay(NatConfig::default());
+
+    // The relay reports a mapping, then its connection closes; the attempt
+    // reconnects the relay, but the stale observation must not come back.
+    let relay = h.relay.clone();
+    identify_observed(&mut h.agent, &relay, &maddr(departed), at(0));
+    h.agent
+        .handle_event(&SwarmEvent::ConnectionClosed { peer_id: relay }, at(1));
+
+    let (_id, stream) = drive_to_bridged(&mut h, 10);
+    let actions = drain_actions(&mut h.agent);
+    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    assert_eq!(
+        obs,
+        vec![maddr(LISTEN_ADDR)],
+        "dropped observation leaks into the CONNECT"
+    );
+}
+
+#[test]
+fn observed_addrs_from_untrusted_peers_are_ignored() {
+    let attacker_chosen = "/ip4/198.51.100.200/udp/53/quic-v1";
+    let mut h = Harness::with_relay(NatConfig::default());
+
+    // Valid QUIC shapes, but neither reporter is a configured relay or
+    // AutoNAT server — believing them would let any connected peer aim
+    // punch-time UDP blasts at an address of its choosing.
+    let target = h.target.clone();
+    identify_observed(&mut h.agent, &target, &maddr(attacker_chosen), at(0));
+    let other = peer(b"other-peer");
+    identify_observed(&mut h.agent, &other, &maddr(attacker_chosen), at(1));
+
+    let (_id, stream) = drive_to_bridged(&mut h, 10);
+    let actions = drain_actions(&mut h.agent);
+    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    assert_eq!(
+        obs,
+        vec![maddr(LISTEN_ADDR)],
+        "untrusted observation reached the CONNECT"
+    );
+}
+
+#[test]
+fn autonat_server_is_a_trusted_reporter() {
+    let autonat = peer(b"autonat-server");
+    let autonat_addr = PeerAddr::new(maddr("/ip4/203.0.113.60/udp/4009/quic-v1"), autonat.clone())
+        .expect("valid autonat addr");
+    let mut h = Harness::with_relay(NatConfig {
+        autonat_servers: vec![autonat_addr],
+        ..NatConfig::default()
+    });
+    identify_observed(&mut h.agent, &autonat, &maddr(OUR_OBSERVED_ADDR), at(0));
+
+    let (_id, stream) = drive_to_bridged(&mut h, 10);
+    let actions = drain_actions(&mut h.agent);
+    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    assert!(
+        obs.contains(&maddr(OUR_OBSERVED_ADDR)),
+        "a configured AutoNAT server's observation must be usable"
+    );
+}
+
+#[test]
+fn undecodable_observed_addr_bytes_are_ignored() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let relay = h.relay.clone();
+    h.agent.handle_event(
+        &SwarmEvent::IdentifyReceived {
+            peer_id: relay,
+            info: minip2p_swarm::IdentifyMessage {
+                observed_addr: Some(vec![0xff, 0xff, 0xff]),
+                ..minip2p_swarm::IdentifyMessage::default()
+            },
+        },
+        at(0),
+    );
+
+    let (_id, stream) = drive_to_bridged(&mut h, 10);
+    let actions = drain_actions(&mut h.agent);
+    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    assert_eq!(
+        obs,
+        vec![maddr(LISTEN_ADDR)],
+        "only the validated bound address may be advertised"
+    );
+}
+
+#[test]
+fn non_quic_observed_addr_is_ignored() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    // Well-formed but not a dialable QUIC transport.
+    identify_observed(
+        &mut h.agent,
+        &h.relay.clone(),
+        &maddr("/ip4/203.0.113.9/udp/4001"),
+        at(0),
+    );
+
+    let (_id, stream) = drive_to_bridged(&mut h, 10);
+    let actions = drain_actions(&mut h.agent);
+    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    assert_eq!(
+        obs,
+        vec![maddr(LISTEN_ADDR)],
+        "only the validated bound address may be advertised"
     );
 }

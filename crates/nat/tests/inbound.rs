@@ -73,8 +73,8 @@ fn full_inbound_flow_punches_back_and_upgrades() {
     let events = drain_events(&mut h.agent);
     assert!(matches!(
         events.as_slice(),
-        [NatEvent::InboundRelayCircuit { peer, stream_id, .. }]
-            if *peer == h.target && *stream_id == stream
+        [NatEvent::InboundRelayCircuit { peer, relay, stream_id, .. }]
+            if *peer == h.target && *relay == h.relay && *stream_id == stream
     ));
     let actions = drain_actions(&mut h.agent);
     assert_eq!(
@@ -315,4 +315,34 @@ fn relay_disconnect_before_release_drops_the_circuit() {
     assert!(drain_events(&mut h.agent).is_empty());
     assert!(!h.agent.owns_stream(&h.relay, stream));
     assert!(h.agent.is_idle());
+}
+
+#[test]
+fn responder_reply_advertises_peer_observed_mapping() {
+    let mut h = inbound_harness(NatConfig::default());
+    // The relay's identify told us our public mapping earlier in the session.
+    let relay = h.relay.clone();
+    identify_observed(&mut h.agent, &relay, &maddr(OUR_OBSERVED_ADDR), at(0));
+
+    let stream = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stream, 1);
+    let target = h.target.clone();
+    h.stream_data(stream, stop_connect(&target), at(10));
+    drain_actions(&mut h.agent);
+
+    h.stream_data(
+        stream,
+        dcutr_connect_reply(&[maddr(REMOTE_OBSERVED_ADDR)]),
+        at(20),
+    );
+    let actions = drain_actions(&mut h.agent);
+    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    assert!(
+        obs.contains(&maddr(LISTEN_ADDR)),
+        "bound addresses stay in the reply"
+    );
+    assert!(
+        obs.contains(&maddr(OUR_OBSERVED_ADDR)),
+        "the reply must advertise our observed public mapping"
+    );
 }

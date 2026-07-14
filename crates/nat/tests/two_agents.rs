@@ -9,9 +9,9 @@
 
 mod common;
 
-use common::{LISTEN_ADDR, at, drain_events, maddr, peer};
+use common::{LISTEN_ADDR, at, drain_events, identify_observed, maddr, peer};
 
-use minip2p_core::{PeerAddr, PeerId};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId};
 use minip2p_nat::{ConnectId, NatAction, NatAgent, NatConfig, NatEvent, Path, ReservationPolicy};
 use minip2p_relay::{HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 use minip2p_swarm::SwarmEvent;
@@ -20,6 +20,9 @@ use minip2p_transport::{ConnectionId, StreamId};
 
 const A_LISTEN: &str = "/ip4/198.51.100.10/udp/4100/quic-v1";
 const RELAY_ADDR: &str = "/ip4/203.0.113.1/udp/4001/quic-v1";
+/// Each side's public NAT mapping, as the relay's identify reports it.
+const A_PUBLIC: &str = "/ip4/203.0.113.201/udp/40001/quic-v1";
+const B_PUBLIC: &str = "/ip4/203.0.113.202/udp/40002/quic-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Side {
@@ -61,6 +64,8 @@ struct World {
     blasts_from_b: usize,
     punch_dials_from_a: usize,
     punch_dials_from_b: usize,
+    punch_dial_addrs_from_a: Vec<Multiaddr>,
+    punch_dial_addrs_from_b: Vec<Multiaddr>,
 }
 
 impl World {
@@ -108,6 +113,8 @@ impl World {
             blasts_from_b: 0,
             punch_dials_from_a: 0,
             punch_dials_from_b: 0,
+            punch_dial_addrs_from_a: Vec::new(),
+            punch_dial_addrs_from_b: Vec::new(),
         }
     }
 
@@ -170,7 +177,7 @@ impl World {
                         );
                         agent.handle_event(
                             &SwarmEvent::PeerReady {
-                                peer_id: relay,
+                                peer_id: relay.clone(),
                                 protocols: vec![
                                     HOP_PROTOCOL_ID.to_string(),
                                     STOP_PROTOCOL_ID.to_string(),
@@ -178,12 +185,26 @@ impl World {
                             },
                             now,
                         );
+                        // Identify over the relay connection reports the
+                        // side's public mapping — the real-world source of
+                        // cross-NAT punch candidates.
+                        let public = match side {
+                            Side::A => A_PUBLIC,
+                            Side::B => B_PUBLIC,
+                        };
+                        identify_observed(agent, &relay, &maddr(public), now);
                     }
                 } else {
                     // A dial toward the other agent.
                     match side {
-                        Side::A => self.punch_dials_from_a += 1,
-                        Side::B => self.punch_dials_from_b += 1,
+                        Side::A => {
+                            self.punch_dials_from_a += 1;
+                            self.punch_dial_addrs_from_a.push(addr.transport().clone());
+                        }
+                        Side::B => {
+                            self.punch_dials_from_b += 1;
+                            self.punch_dial_addrs_from_b.push(addr.transport().clone());
+                        }
                     }
                     self.next_conn += 1;
                     let conn = ConnectionId::new(self.next_conn);
@@ -388,7 +409,15 @@ fn two_agents_punch_to_a_direct_connection() {
         ),
         "A settles a relayed path first, got {events:?}"
     );
-    assert_eq!(world.punch_dials_from_a, 1, "A dialed B's observed address");
+    assert_eq!(
+        world.punch_dials_from_a, 2,
+        "A dialed B's listen address and B's relay-observed public mapping"
+    );
+    assert!(
+        world.punch_dial_addrs_from_a.contains(&maddr(B_PUBLIC)),
+        "A's punch targets B's public mapping: {:?}",
+        world.punch_dial_addrs_from_a
+    );
     let events = drain_events(&mut world.b);
     assert!(
         matches!(
@@ -400,7 +429,15 @@ fn two_agents_punch_to_a_direct_connection() {
 
     // B's punch-back: simultaneous dial plus UDP blasts after the sync
     // delay.
-    assert_eq!(world.punch_dials_from_b, 1, "B dialed A's observed address");
+    assert_eq!(
+        world.punch_dials_from_b, 2,
+        "B dialed A's listen address and A's relay-observed public mapping"
+    );
+    assert!(
+        world.punch_dial_addrs_from_b.contains(&maddr(A_PUBLIC)),
+        "B's punch-back targets A's public mapping: {:?}",
+        world.punch_dial_addrs_from_b
+    );
     world.advance(100);
     assert!(world.blasts_from_b > 0, "B blasts random UDP");
 

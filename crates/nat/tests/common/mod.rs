@@ -7,19 +7,24 @@
 
 use minip2p_autonat::{AutoNatServer, AutoNatServerInput, AutoNatServerOutput, ResponseStatus};
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol};
-use minip2p_dcutr::{HolePunch, HolePunchType, encode_frame as dcutr_encode_frame};
+use minip2p_dcutr::{
+    FrameDecode, HolePunch, HolePunchType, decode_frame as dcutr_decode_frame,
+    encode_frame as dcutr_encode_frame,
+};
 use minip2p_nat::{NatAction, NatAgent, NatConfig, NatEvent, NatToken, Now, ReservationPolicy};
 use minip2p_relay::{
     HOP_PROTOCOL_ID, HopMessage, HopMessageType, Peer, Reservation, Status, StopMessage,
     StopMessageType, encode_frame as relay_encode_frame,
 };
-use minip2p_swarm::SwarmEvent;
+use minip2p_swarm::{IdentifyMessage, SwarmEvent};
 use minip2p_transport::StreamId;
 
 pub const TARGET_ADDR: &str = "/ip4/192.0.2.10/udp/4001/quic-v1";
 pub const RELAY_TRANSPORT_ADDR: &str = "/ip4/203.0.113.1/udp/4001/quic-v1";
 pub const LISTEN_ADDR: &str = "/ip4/198.51.100.5/udp/4500/quic-v1";
 pub const REMOTE_OBSERVED_ADDR: &str = "/ip4/192.0.2.99/udp/4002/quic-v1";
+/// A public mapping of our own socket, as a peer would report it.
+pub const OUR_OBSERVED_ADDR: &str = "/ip4/203.0.113.77/udp/45678/quic-v1";
 
 pub fn peer(tag: &[u8]) -> PeerId {
     PeerId::from_public_key_protobuf(tag)
@@ -147,6 +152,33 @@ pub fn autonat_response(request_bytes: &[u8], public_addrs: Option<&[Multiaddr]>
         Some(AutoNatServerOutput::Outbound(bytes)) => bytes,
         other => panic!("expected outbound response, got {other:?}"),
     }
+}
+
+/// Feeds an `IdentifyReceived` event whose `observed_addr` is `addr`'s
+/// binary encoding, as if `reporter` told us where it sees us from.
+pub fn identify_observed(agent: &mut NatAgent, reporter: &PeerId, addr: &Multiaddr, now: Now) {
+    agent.handle_event(
+        &SwarmEvent::IdentifyReceived {
+            peer_id: reporter.clone(),
+            info: IdentifyMessage {
+                observed_addr: Some(addr.to_bytes()),
+                ..IdentifyMessage::default()
+            },
+        },
+        now,
+    );
+}
+
+/// Decodes the observed addresses out of a framed DCUtR message.
+pub fn dcutr_obs_addrs(frame: &[u8]) -> Vec<Multiaddr> {
+    let FrameDecode::Complete { payload, .. } = dcutr_decode_frame(frame) else {
+        panic!("expected a complete DCUtR frame");
+    };
+    let msg = HolePunch::decode(payload).expect("valid HolePunch message");
+    msg.obs_addrs
+        .iter()
+        .map(|bytes| Multiaddr::from_bytes(bytes).expect("valid multiaddr"))
+        .collect()
 }
 
 /// Extracts the payload of the single `SendStream` action on `stream`.

@@ -42,6 +42,9 @@ pub use crate::events::{
     OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput,
     SwarmRuntimeError,
 };
+// Part of `SwarmEvent::IdentifyReceived`'s public shape; re-exported so
+// consumers can name the type without depending on `minip2p-identify`.
+pub use minip2p_identify::IdentifyMessage;
 
 #[cfg(feature = "std")]
 pub use crate::builder::SwarmBuilder;

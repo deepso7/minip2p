@@ -209,7 +209,7 @@ impl InboundCircuit {
             });
         }
 
-        self.dcutr = Some(DcutrResponder::new(&shared.listen_addrs));
+        self.dcutr = Some(DcutrResponder::new(&shared.punch_candidates()));
         if !pipelined.is_empty() {
             self.on_bridge_data(&pipelined, shared, now);
         }
@@ -309,6 +309,7 @@ impl InboundCircuit {
         if let Some(source) = &self.source {
             shared.push_event(NatEvent::InboundRelayCircuit {
                 peer: source.clone(),
+                relay: self.relay.clone(),
                 stream_id: self.stream,
                 pending_data: core::mem::take(&mut self.pending_data),
                 remote_write_closed: self.remote_write_closed,
