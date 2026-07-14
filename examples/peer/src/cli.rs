@@ -149,6 +149,7 @@ pub fn parse_dial_target(raw: &str) -> Result<DialTarget, CliError> {
     {
         let target = PeerAddr::from_str(raw)
             .map_err(|e| CliError(format!("invalid target peer-addr '{raw}': {e}")))?;
+        require_quic_transport("target", raw, &target)?;
         return Ok(DialTarget::Direct(target));
     }
 
@@ -161,6 +162,7 @@ pub fn parse_dial_target(raw: &str) -> Result<DialTarget, CliError> {
         ] if !prefix.is_empty() => {
             let relay = PeerAddr::new(Multiaddr::from_protocols(prefix.to_vec()), relay_id.clone())
                 .map_err(|e| CliError(format!("invalid relay address in '{raw}': {e}")))?;
+            require_quic_transport("circuit relay", raw, &relay)?;
             Ok(DialTarget::Circuit {
                 relay,
                 peer: peer.clone(),
@@ -195,10 +197,10 @@ impl Flags {
                     if relay.is_some() {
                         return Err(CliError("--relay specified twice".into()));
                     }
-                    relay = Some(
-                        PeerAddr::from_str(value)
-                            .map_err(|e| CliError(format!("invalid --relay '{value}': {e}")))?,
-                    );
+                    let addr = PeerAddr::from_str(value)
+                        .map_err(|e| CliError(format!("invalid --relay '{value}': {e}")))?;
+                    require_quic_transport("--relay", value, &addr)?;
+                    relay = Some(addr);
                 }
                 "--count" => {
                     let value = flag_value(args, i, key)?;
@@ -240,9 +242,11 @@ impl Flags {
                     if options.autonat.is_some() {
                         return Err(CliError("--autonat specified twice".into()));
                     }
-                    options.autonat = Some(PeerAddr::from_str(value).map_err(|e| {
+                    let addr = PeerAddr::from_str(value).map_err(|e| {
                         CliError(format!("invalid --autonat peer-addr '{value}': {e}"))
-                    })?);
+                    })?;
+                    require_quic_transport("--autonat", value, &addr)?;
+                    options.autonat = Some(addr);
                 }
                 other => {
                     return Err(CliError(format!("unknown flag '{other}'")));
@@ -262,6 +266,19 @@ impl Flags {
 fn flag_value<'a>(args: &'a [String], i: usize, key: &str) -> Result<&'a String, CliError> {
     args.get(i + 1)
         .ok_or_else(|| CliError(format!("flag '{key}' requires a value")))
+}
+
+/// Rejects peer addresses the endpoint could never dial: everything this
+/// demo connects to is QUIC, and catching the shape here turns an
+/// asynchronous NAT-agent dial failure into an immediate input error.
+fn require_quic_transport(what: &str, raw: &str, addr: &PeerAddr) -> Result<(), CliError> {
+    if addr.transport().is_quic_transport() {
+        Ok(())
+    } else {
+        Err(CliError(format!(
+            "{what} must be on a /ip4|ip6|dns|dns4|dns6/<host>/udp/<port>/quic-v1 transport, got '{raw}'"
+        )))
+    }
 }
 
 fn parse_quic_multiaddr(flag: &str, value: &str) -> Result<Multiaddr, CliError> {
@@ -524,6 +541,27 @@ mod tests {
         let raw = format!("/ip4/127.0.0.1/udp/4001/quic-v1/p2p-circuit/p2p/{PEER_ID}");
         let err = parse(v(&["dial", &raw])).unwrap_err();
         assert!(err.0.contains("p2p-circuit"));
+    }
+
+    #[test]
+    fn dial_rejects_non_quic_direct_target() {
+        let raw = format!("/ip4/127.0.0.1/udp/4001/p2p/{PEER_ID}");
+        let err = parse(v(&["dial", &raw])).unwrap_err();
+        assert!(err.0.contains("quic-v1"));
+    }
+
+    #[test]
+    fn dial_rejects_non_quic_circuit_relay() {
+        let raw = format!("/ip4/127.0.0.1/udp/4001/p2p/{PEER_ID}/p2p-circuit/p2p/{PEER_ID}");
+        let err = parse(v(&["dial", &raw])).unwrap_err();
+        assert!(err.0.contains("quic-v1"));
+    }
+
+    #[test]
+    fn relay_flag_rejects_non_quic_transport() {
+        let raw = format!("/ip4/127.0.0.1/udp/4001/p2p/{PEER_ID}");
+        let err = parse(v(&["listen", "--relay", &raw])).unwrap_err();
+        assert!(err.0.contains("quic-v1"));
     }
 
     #[test]

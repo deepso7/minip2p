@@ -546,7 +546,7 @@ pub fn run_dial(
             }
         }
         Path::DirectDialed | Path::DirectPunched => {
-            let stream = open_echo_stream(&mut endpoint, &peer)?;
+            let stream = open_echo_stream(&mut endpoint, &peer, Instant::now() + SETUP_DEADLINE)?;
             Channel {
                 send_peer: peer.clone(),
                 stream,
@@ -559,9 +559,13 @@ pub fn run_dial(
 }
 
 /// Opens the echo stream on a direct connection: identify must have
-/// completed (protocol routing) and the stream must finish negotiating.
-fn open_echo_stream(endpoint: &mut Endpoint, peer: &PeerId) -> Result<StreamId, Box<dyn Error>> {
-    let deadline = Instant::now() + SETUP_DEADLINE;
+/// completed (protocol routing) and the stream must finish negotiating,
+/// all before `deadline`.
+fn open_echo_stream(
+    endpoint: &mut Endpoint,
+    peer: &PeerId,
+    deadline: Instant,
+) -> Result<StreamId, Box<dyn Error>> {
     if !endpoint.is_peer_ready(peer) {
         endpoint
             .wait_peer_ready(peer, deadline)
@@ -614,7 +618,21 @@ fn ping_loop(
                 // their seqs on the new stream with fresh timestamps so
                 // the sequence stays unbroken and RTTs stay honest.
                 frames.clear();
-                let stream = open_echo_stream(endpoint, peer)?;
+                // During the post-count drain the grace period bounds the
+                // switch too; a slow setup must not outlive it.
+                let setup = Instant::now() + SETUP_DEADLINE;
+                let deadline = drain_deadline.map_or(setup, |drain| drain.min(setup));
+                let stream = match open_echo_stream(endpoint, peer, deadline) {
+                    Ok(stream) => stream,
+                    Err(e) if drain_deadline.is_some() => {
+                        // The remaining pongs could only have arrived on
+                        // the replacement stream; the run is over.
+                        eprintln!("[dial] channel switch during drain failed: {e}");
+                        stats.print_summary();
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                };
                 channel = Channel {
                     send_peer: peer.clone(),
                     stream,
@@ -625,6 +643,14 @@ fn ping_loop(
                     endpoint
                         .send_stream(&channel.send_peer, channel.stream, frame.to_vec())
                         .map_err(|e| format!("resend on upgraded channel: {e}"))?;
+                }
+                if drain_deadline.is_some() {
+                    // The final counted ping already went out; half-close
+                    // the replacement stream so the listener sees EOF and
+                    // mirrors it, same as the pre-upgrade channel did.
+                    endpoint
+                        .close_stream_write(&channel.send_peer, channel.stream)
+                        .map_err(|e| format!("close after channel switch: {e}"))?;
                 }
                 println!(
                     "[dial] channel-switched path=direct outstanding-resent={}",

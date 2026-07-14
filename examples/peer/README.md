@@ -32,7 +32,8 @@ USAGE:
 
 `--count n` (dial only) stops after `n` pings, prints a summary, and exits
 `0`. Without it the dialer pings until interrupted; a running summary is
-printed every tenth pong so Ctrl-C never loses the tally.
+printed every tenth pong as a periodic checkpoint (Ctrl-C itself prints
+nothing further).
 
 ## Quickstart: loopback
 
@@ -48,12 +49,12 @@ $ cargo run -p minip2p-peer -- listen
 Terminal 2 (paste the `bound=` value):
 
 ```console
-$ cargo run -p minip2p-peer -- dial /ip4/127.0.0.1/udp/64294/quic-v1/p2p/12D3KooWDEW8… --count 5
+$ cargo run -p minip2p-peer -- dial /ip4/127.0.0.1/udp/64294/quic-v1/p2p/12D3KooWDEW8… --count 3
 [dial] path-established path=direct-dialed elapsed=10ms
 [dial] ping seq=1 path=direct
 [dial] pong seq=1 rtt=0ms path=direct
 …
-[dial] summary sent=5 received=5 relayed-count=0 relayed-avg-rtt=0ms direct-count=5 direct-avg-rtt=1ms
+[dial] summary sent=3 received=3 relayed-count=0 relayed-avg-rtt=0ms direct-count=3 direct-avg-rtt=1ms
 ```
 
 This is exactly what the CI E2E test (`tests/ping.rs`) runs.
