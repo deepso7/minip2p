@@ -836,6 +836,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "minip2p-pubsub"
+version = "0.1.0"
+dependencies = [
+ "minip2p-core",
+ "minip2p-identity",
+ "thiserror",
+]
+
+[[package]]
 name = "minip2p-quic"
 version = "0.1.0"
 dependencies = [
