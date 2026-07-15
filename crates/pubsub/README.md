@@ -1,9 +1,8 @@
 # minip2p-pubsub
 
 Sans-I/O floodsub (`/floodsub/1.0.0`) for minip2p: the libp2p pubsub RPC
-wire codec with StrictSign message signing, and (upcoming) a `FloodsubAgent`
-state machine that routes published messages to subscribed peers by
-flooding.
+wire codec with StrictSign message signing, and the `FloodsubAgent` state
+machine that routes published messages to subscribed peers by flooding.
 
 `no_std + alloc`, no I/O, no clocks, no async.
 

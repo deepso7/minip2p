@@ -206,6 +206,12 @@ impl RawMessage {
     /// `signature`/`key` omitted. Upstream verifies by decoding, clearing
     /// those two fields, and re-encoding — this is that re-encoding, shared
     /// by our build and verify paths.
+    ///
+    /// Every decoded topic participates, in order. Current go treats field
+    /// 4 as singular (its re-encode keeps only the last duplicate), but no
+    /// implementation *emits* duplicate field-4 entries in signed messages,
+    /// so the rules only diverge on hand-crafted input — where including
+    /// everything fails toward rejection, the safe direction.
     pub fn sign_bytes(&self) -> Vec<u8> {
         let body = self.encode_fields(false);
         let mut out = Vec::with_capacity(SIGN_PREFIX.len() + body.len());
@@ -552,7 +558,16 @@ pub fn decode_frame(input: &[u8]) -> FrameDecode<'_> {
 }
 
 /// Encodes `payload` with a varint length prefix.
+///
+/// Callers keep payloads within [`MAX_RPC_SIZE`] — receivers reject larger
+/// frames unread. The agent's outbound paths are all bounded (publish and
+/// snapshot sizes are validated; forwards re-wrap an accepted inbound
+/// frame), so an oversized frame here is a caller bug.
 pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
+    debug_assert!(
+        payload.len() <= MAX_RPC_SIZE,
+        "frame payload exceeds MAX_RPC_SIZE"
+    );
     let mut out = Vec::with_capacity(uvarint_len(payload.len() as u64) + payload.len());
     write_uvarint(payload.len() as u64, &mut out);
     out.extend_from_slice(payload);

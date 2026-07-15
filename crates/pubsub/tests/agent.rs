@@ -1211,3 +1211,105 @@ fn oversized_publish_is_rejected_without_consuming_a_seqno() {
     a.publish("t", b"small".to_vec(), 2).unwrap();
     assert_eq!(count_open_streams(&drain_actions(&mut a)), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Review-round regressions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn oversized_remote_topics_are_skipped_and_never_stored() {
+    let mut a = agent();
+    let b = peer(2);
+    connect(&mut a, &b, 0);
+    let stream = StreamId::new(3);
+    assert!(inbound_open(&mut a, &b, stream, 1));
+
+    // One RPC with a legal topic and a topic over MAX_TOPIC_LEN.
+    let huge = "x".repeat(minip2p_pubsub::MAX_TOPIC_LEN + 1);
+    let rpc = Rpc {
+        subscriptions: vec![
+            minip2p_pubsub::SubOpts {
+                subscribe: Some(true),
+                topic_id: Some("ok".to_string()),
+            },
+            minip2p_pubsub::SubOpts {
+                subscribe: Some(true),
+                topic_id: Some(huge),
+            },
+        ],
+        publish: Vec::new(),
+    };
+    inbound_data(&mut a, &b, stream, &encode_frame(&rpc.encode()), 2);
+    let events = drain_events(&mut a);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, PubsubEvent::ProtocolViolation { .. })),
+        "skipping invalid topics is reported: {events:?}"
+    );
+    let subscribed: Vec<&PubsubEvent> = events
+        .iter()
+        .filter(|e| matches!(e, PubsubEvent::PeerSubscribed { .. }))
+        .collect();
+    assert_eq!(
+        subscribed.len(),
+        1,
+        "only the legal topic lands: {events:?}"
+    );
+    // The stream was NOT reset: the length cap is ours, not the spec's.
+    assert!(
+        !drain_actions(&mut a)
+            .iter()
+            .any(|a| matches!(a, PubsubAction::ResetStream { .. }))
+    );
+}
+
+#[test]
+fn local_subscription_set_is_bounded_to_fit_one_rpc() {
+    let mut a = agent();
+    let mut accepted = 0usize;
+    let mut hit_bound = false;
+    for i in 0..64 {
+        let topic = format!("{i:04}{}", "x".repeat(minip2p_pubsub::MAX_TOPIC_LEN - 4));
+        match a.subscribe(&topic, 0) {
+            Ok(true) => accepted += 1,
+            Err(TopicError::SetTooLarge) => {
+                hit_bound = true;
+                break;
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+    assert!(hit_bound, "the set bound must trigger");
+    assert!(
+        accepted >= 20 && accepted < 40,
+        "the bound is MAX_RPC_SIZE/2 of encoded entries, got {accepted}"
+    );
+    // A small topic still fits: the bound is about size, not count.
+    assert_eq!(a.subscribe("tiny", 0), Ok(true));
+}
+
+#[test]
+fn send_deadline_budgets_the_whole_rpc_not_each_state() {
+    let mut a = agent();
+    let b = peer(2);
+    connect_subscribed(&mut a, &b, "t", StreamId::new(3), 0);
+    a.publish("t", b"slow".to_vec(), 0).unwrap();
+    let (token, _) = open_stream_action(&drain_actions(&mut a)).expect("publish open");
+
+    // The open result lands just before the deadline; the clock must NOT
+    // restart at Negotiating.
+    a.stream_open_result(token, Ok(StreamId::new(4)), 9_999);
+    assert_eq!(
+        a.next_timeout(9_999),
+        Some(1),
+        "the original deadline still governs"
+    );
+    a.handle_tick(10_000);
+    assert!(
+        drain_events(&mut a)
+            .iter()
+            .any(|e| matches!(e, PubsubEvent::OutboundFailure { .. })),
+        "one RPC gets one send_timeout_ms, not one per state"
+    );
+}

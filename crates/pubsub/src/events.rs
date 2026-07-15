@@ -109,6 +109,11 @@ pub enum TopicError {
     /// Topics are bounded by [`MAX_TOPIC_LEN`](crate::MAX_TOPIC_LEN) bytes.
     #[error("topic exceeds the maximum length")]
     TooLong,
+    /// Adding this topic would make the encoded subscription snapshot
+    /// exceed half of [`MAX_RPC_SIZE`](crate::MAX_RPC_SIZE) — the bound
+    /// that keeps every snapshot/diff RPC inside one legal frame.
+    #[error("the subscription set would no longer fit in one RPC")]
+    SetTooLarge,
 }
 
 /// Why a publish was refused.

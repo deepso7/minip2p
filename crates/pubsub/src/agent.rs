@@ -197,11 +197,36 @@ impl FloodsubAgent {
     }
 
     /// Subscribes to `topic`. Returns `Ok(false)` when already subscribed.
+    ///
+    /// The whole subscription set is bounded so that any snapshot or diff
+    /// RPC provably fits in [`MAX_RPC_SIZE`]: a peer that had to reject an
+    /// oversized snapshot frame would silently miss our subscriptions while
+    /// the commit recorded them as delivered.
     pub fn subscribe(&mut self, topic: &str, now_ms: u64) -> Result<bool, TopicError> {
         validate_topic(topic)?;
-        if !self.topics.insert(String::from(topic)) {
+        if self.topics.contains(topic) {
             return Ok(false);
         }
+        // A full set of N subscribes and a diff of A adds + R removes are
+        // both bounded by (full set + full previous set); capping the full
+        // set's encoding at half the RPC budget keeps every diff legal.
+        let mut projected: Vec<SubOpts> = self
+            .topics
+            .iter()
+            .chain(core::iter::once(&String::from(topic)))
+            .map(|t| SubOpts {
+                subscribe: Some(true),
+                topic_id: Some(t.clone()),
+            })
+            .collect();
+        let rpc = Rpc {
+            subscriptions: core::mem::take(&mut projected),
+            publish: Vec::new(),
+        };
+        if rpc.encode().len() > MAX_RPC_SIZE / 2 {
+            return Err(TopicError::SetTooLarge);
+        }
+        self.topics.insert(String::from(topic));
         self.drive_all_senders(now_ms);
         Ok(true)
     }
@@ -329,8 +354,8 @@ impl FloodsubAgent {
         };
         let SendState::Opening {
             token: expected,
+            since_ms,
             work,
-            ..
         } = core::mem::take(&mut state.sender)
         else {
             return;
@@ -344,9 +369,12 @@ impl FloodsubAgent {
         }
         match result {
             Ok(stream_id) => {
+                // `send_timeout_ms` budgets the WHOLE RPC (open through
+                // close): keep the original timestamp, or each state
+                // transition would grant the deadline anew.
                 state.sender = SendState::Negotiating {
                     stream_id,
-                    since_ms: now_ms,
+                    since_ms,
                     work,
                 };
                 self.roles
@@ -724,10 +752,19 @@ impl FloodsubAgent {
                 return true;
             };
             let mut candidate = state.remote_topics.clone();
+            let mut skipped_invalid = false;
             for sub in &rpc.subscriptions {
                 let (Some(subscribe), Some(topic)) = (sub.subscribe, sub.topic_id.as_ref()) else {
                     continue; // be liberal: ignore incomplete entries
                 };
+                if validate_topic(topic).is_err() {
+                    // Remote topics obey the same bounds as local ones —
+                    // otherwise a peer could park megabytes of topic
+                    // strings in `remote_topics`. Skipped, not reset:
+                    // the length cap is ours, not the spec's.
+                    skipped_invalid = true;
+                    continue;
+                }
                 if subscribe {
                     candidate.insert(topic.clone());
                 } else {
@@ -748,6 +785,12 @@ impl FloodsubAgent {
                 .cloned()
                 .collect();
             state.remote_topics = candidate;
+            if skipped_invalid {
+                self.events.push_back(PubsubEvent::ProtocolViolation {
+                    peer: peer.clone(),
+                    reason: "subscription entries with invalid topics skipped".to_string(),
+                });
+            }
             for topic in added {
                 self.events.push_back(PubsubEvent::PeerSubscribed {
                     peer: peer.clone(),
