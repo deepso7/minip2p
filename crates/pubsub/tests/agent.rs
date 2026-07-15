@@ -1282,7 +1282,7 @@ fn local_subscription_set_is_bounded_to_fit_one_rpc() {
     }
     assert!(hit_bound, "the set bound must trigger");
     assert!(
-        accepted >= 20 && accepted < 40,
+        (20..40).contains(&accepted),
         "the bound is MAX_RPC_SIZE/2 of encoded entries, got {accepted}"
     );
     // A small topic still fits: the bound is about size, not count.
