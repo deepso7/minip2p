@@ -841,6 +841,8 @@ version = "0.1.0"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
+ "minip2p-swarm",
+ "minip2p-transport",
  "thiserror",
 ]
 

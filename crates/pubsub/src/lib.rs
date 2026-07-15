@@ -12,8 +12,15 @@
 
 extern crate alloc;
 
+mod agent;
+mod config;
+mod events;
 mod message;
+mod seen;
 
+pub use agent::FloodsubAgent;
+pub use config::FloodsubConfig;
+pub use events::{PublishError, PubsubAction, PubsubEvent, PubsubToken, TopicError};
 pub use message::{
     FLOODSUB_PROTOCOL_ID, FrameDecode, MAX_RPC_SIZE, MAX_TOPIC_LEN, MessageVerifyError,
     PubsubWireError, RawMessage, Rpc, SubOpts, decode_frame, encode_frame,
