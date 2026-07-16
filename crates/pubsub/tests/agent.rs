@@ -1387,3 +1387,44 @@ fn send_failure_prevents_the_commit() {
     a.send_failed(&b, StreamId::new(999), "stale", 7);
     assert!(drain_events(&mut a).is_empty(), "stale report is a no-op");
 }
+
+#[test]
+fn coalesced_frames_beyond_one_frame_cap_all_decode() {
+    // The transport may coalesce many legal frames into one data event
+    // whose total exceeds a single frame's cap; that is legal traffic,
+    // not a violation.
+    let mut a = agent();
+    a.subscribe("t", 0).unwrap();
+    let b = peer(2);
+    connect(&mut a, &b, 0);
+    let stream = StreamId::new(3);
+    assert!(inbound_open(&mut a, &b, stream, 1));
+    drain_actions(&mut a);
+
+    let mut blob = Vec::new();
+    for seqno in 0..3u64 {
+        blob.extend_from_slice(&signed_message_frame(
+            &keypair(9),
+            "t",
+            &vec![0xAB; 30_000],
+            seqno,
+        ));
+    }
+    assert!(
+        blob.len() > minip2p_pubsub::MAX_RPC_SIZE,
+        "the point is a coalesced event larger than one frame cap"
+    );
+    inbound_data(&mut a, &b, stream, &blob, 2);
+    let events = drain_events(&mut a);
+    let delivered = events
+        .iter()
+        .filter(|e| matches!(e, PubsubEvent::Message { .. }))
+        .count();
+    assert_eq!(delivered, 3, "{events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, PubsubEvent::ProtocolViolation { .. })),
+        "coalescing is not a violation: {events:?}"
+    );
+}

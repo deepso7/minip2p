@@ -105,6 +105,14 @@ pub enum PubsubWireError {
         /// Offset of the field's payload.
         offset: usize,
     },
+    /// A tag used field number zero, which protobuf reserves as illegal.
+    /// Upstream decoders reject it; silently skipping would let hostile
+    /// encoders smuggle bytes that canonical re-encoding drops.
+    #[error("illegal field number 0 at offset {offset}")]
+    InvalidFieldNumber {
+        /// Offset of the field's tag.
+        offset: usize,
+    },
 }
 
 /// Why an inbound message failed StrictSign verification.
@@ -425,10 +433,14 @@ fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, PubsubWi
     if *idx >= input.len() {
         return Ok(None);
     }
+    let offset = *idx;
     let (tag_value, used) = read_uvarint(&input[*idx..])?;
     *idx += used;
     let wire_type = (tag_value & 0x07) as u8;
     let field_number = tag_value >> 3;
+    if field_number == 0 {
+        return Err(PubsubWireError::InvalidFieldNumber { offset });
+    }
     Ok(Some((field_number, wire_type)))
 }
 
@@ -715,6 +727,25 @@ mod tests {
         assert!(matches!(
             RawMessage::decode(&encoded),
             Err(PubsubWireError::InvalidUtf8 { .. })
+        ));
+    }
+
+    #[test]
+    fn field_number_zero_is_rejected() {
+        // Tag 0x00 = field 0, wire type varint: protobuf-illegal; upstream
+        // decoders error rather than skip.
+        let encoded = [0x00, 0x01];
+        assert!(matches!(
+            RawMessage::decode(&encoded),
+            Err(PubsubWireError::InvalidFieldNumber { offset: 0 })
+        ));
+        assert!(matches!(
+            SubOpts::decode(&encoded),
+            Err(PubsubWireError::InvalidFieldNumber { offset: 0 })
+        ));
+        assert!(matches!(
+            Rpc::decode(&encoded),
+            Err(PubsubWireError::InvalidFieldNumber { offset: 0 })
         ));
     }
 

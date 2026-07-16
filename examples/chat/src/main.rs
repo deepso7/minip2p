@@ -2,7 +2,6 @@
 
 mod cli;
 mod modes;
-mod runtime;
 
 use std::process::ExitCode;
 

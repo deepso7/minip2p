@@ -630,35 +630,52 @@ impl FloodsubAgent {
             None => return false,
         }
 
-        let Some(state) = self.peers.get_mut(peer) else {
-            return true;
-        };
-        let Some(buf) = state.inbound.get_mut(&stream_id) else {
-            return true;
-        };
-        buf.extend_from_slice(data);
-        if buf.len() > MAX_RPC_SIZE + MAX_PREFIX_LEN {
-            // A frame that can never legally complete must not balloon.
-            self.violation_reset(peer, stream_id, "inbound buffer overflow");
-            return true;
-        }
+        // Feed the reassembly buffer in bounded slices, draining complete
+        // frames between top-ups. This keeps the buffer capped at one
+        // maximum frame WITHOUT rejecting legal traffic the transport
+        // coalesced (one data event may carry many frames), and never
+        // copies an oversized chunk before the bound is enforced.
+        const CAP: usize = MAX_RPC_SIZE + MAX_PREFIX_LEN;
+        let mut offset = 0;
+        while offset < data.len() {
+            {
+                let Some(state) = self.peers.get_mut(peer) else {
+                    return true;
+                };
+                let Some(buf) = state.inbound.get_mut(&stream_id) else {
+                    return true; // reset mid-drain: swallow the rest
+                };
+                let room = CAP.saturating_sub(buf.len());
+                if room == 0 {
+                    // Legal frames always complete within CAP (a declared
+                    // length over MAX_RPC_SIZE is rejected from the header
+                    // alone), so a full buffer that still decodes as
+                    // Incomplete can never legally complete.
+                    self.violation_reset(peer, stream_id, "inbound buffer overflow");
+                    return true;
+                }
+                let take = room.min(data.len() - offset);
+                buf.extend_from_slice(&data[offset..offset + take]);
+                offset += take;
+            }
 
-        while let Some(step) = self.take_frame(peer, stream_id) {
-            match step {
-                Ok(payload) => match Rpc::decode(&payload) {
-                    Ok(rpc) => {
-                        if !self.process_rpc(peer, stream_id, rpc, now_ms) {
-                            break;
+            while let Some(step) = self.take_frame(peer, stream_id) {
+                match step {
+                    Ok(payload) => match Rpc::decode(&payload) {
+                        Ok(rpc) => {
+                            if !self.process_rpc(peer, stream_id, rpc, now_ms) {
+                                return true;
+                            }
                         }
+                        Err(e) => {
+                            self.violation_reset(peer, stream_id, &format!("malformed RPC: {e}"));
+                            return true;
+                        }
+                    },
+                    Err(reason) => {
+                        self.violation_reset(peer, stream_id, &reason);
+                        return true;
                     }
-                    Err(e) => {
-                        self.violation_reset(peer, stream_id, &format!("malformed RPC: {e}"));
-                        break;
-                    }
-                },
-                Err(reason) => {
-                    self.violation_reset(peer, stream_id, &reason);
-                    break;
                 }
             }
         }

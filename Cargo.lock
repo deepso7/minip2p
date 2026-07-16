@@ -766,6 +766,7 @@ name = "minip2p-chat"
 version = "0.1.0"
 dependencies = [
  "minip2p",
+ "minip2p-example-common",
 ]
 
 [[package]]
@@ -783,6 +784,13 @@ version = "0.1.0"
 dependencies = [
  "minip2p-core",
  "thiserror",
+]
+
+[[package]]
+name = "minip2p-example-common"
+version = "0.1.0"
+dependencies = [
+ "minip2p",
 ]
 
 [[package]]
@@ -833,6 +841,7 @@ name = "minip2p-peer"
 version = "0.1.0"
 dependencies = [
  "minip2p",
+ "minip2p-example-common",
 ]
 
 [[package]]

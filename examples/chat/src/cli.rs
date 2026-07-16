@@ -292,3 +292,53 @@ NOTES:
 "
     .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RELAY: &str = "/ip4/203.0.113.7/udp/4001/quic-v1";
+    const RELAY_ID: &str = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN";
+    const PEER_ID: &str = "12D3KooWPjceQrSwdWXPyLLeABRXmuqt69Rg3sBYbU1Nft9HyQ6X";
+
+    #[test]
+    fn direct_quic_targets_parse() {
+        let raw = format!("{RELAY}/p2p/{PEER_ID}");
+        assert!(matches!(parse_join_target(&raw), Ok(JoinTarget::Direct(_))));
+    }
+
+    #[test]
+    fn valid_circuit_targets_parse() {
+        let raw = format!("{RELAY}/p2p/{RELAY_ID}/p2p-circuit/p2p/{PEER_ID}");
+        match parse_join_target(&raw) {
+            Ok(JoinTarget::Circuit { relay, peer }) => {
+                assert_eq!(relay.peer_id().to_base58(), RELAY_ID);
+                assert_eq!(peer.to_base58(), PEER_ID);
+            }
+            other => panic!("expected circuit target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_targets_are_rejected() {
+        let cases: &[String] = &[
+            // Not a multiaddr at all.
+            "not-an-address".to_string(),
+            // Direct target without a peer id.
+            RELAY.to_string(),
+            // Non-QUIC direct target.
+            format!("/ip4/203.0.113.7/tcp/4001/p2p/{PEER_ID}"),
+            // Circuit without the trailing peer.
+            format!("{RELAY}/p2p/{RELAY_ID}/p2p-circuit"),
+            // Circuit with an empty relay prefix.
+            format!("/p2p/{RELAY_ID}/p2p-circuit/p2p/{PEER_ID}"),
+            // Circuit whose relay transport is not QUIC.
+            format!("/ip4/203.0.113.7/tcp/4001/p2p/{RELAY_ID}/p2p-circuit/p2p/{PEER_ID}"),
+            // Circuit with the sections out of order.
+            format!("{RELAY}/p2p-circuit/p2p/{RELAY_ID}/p2p/{PEER_ID}"),
+        ];
+        for raw in cases {
+            assert!(parse_join_target(raw).is_err(), "'{raw}' must be rejected");
+        }
+    }
+}

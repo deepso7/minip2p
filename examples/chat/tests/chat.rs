@@ -53,9 +53,19 @@ impl Peer {
                 sink.lock().expect("line sink").push(line);
             }
         });
-        // Drain stderr so the child never blocks on a full pipe.
+        // Capture stderr into the same sink (prefixed) so a crashing child
+        // leaves its actual error in the failure output instead of a
+        // mystifying "expected line never arrived".
         let stderr = child.stderr.take().expect("stderr is piped");
-        thread::spawn(move || for _ in BufReader::new(stderr).lines() {});
+        let sink = Arc::clone(&lines);
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                let Ok(line) = line else { return };
+                sink.lock()
+                    .expect("line sink")
+                    .push(format!("[stderr] {line}"));
+            }
+        });
 
         Self {
             child: KillOnDrop(child),

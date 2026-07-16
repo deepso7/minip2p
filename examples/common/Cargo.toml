@@ -1,0 +1,12 @@
+[package]
+name = "minip2p-example-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+minip2p = { path = "../../crates/minip2p", features = ["nat"] }
