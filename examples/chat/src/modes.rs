@@ -94,8 +94,7 @@ pub fn run_host(relay: Option<PeerAddr>, options: ChatOptions) -> Result<(), Box
         .map_err(|e| format!("subscribe: {e}"))?;
     println!("[host] subscribed topic={topic} nick={nick}");
 
-    let relay = relays.first().cloned();
-    run_chat(&mut endpoint, &topic, &nick, "host", relay.as_ref())
+    run_chat(&mut endpoint, &topic, &nick, "host", relays.first())
 }
 
 /// Drives the endpoint until the relay reservation lands, printing the
