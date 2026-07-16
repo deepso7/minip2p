@@ -94,7 +94,8 @@ pub fn run_host(relay: Option<PeerAddr>, options: ChatOptions) -> Result<(), Box
         .map_err(|e| format!("subscribe: {e}"))?;
     println!("[host] subscribed topic={topic} nick={nick}");
 
-    run_chat(&mut endpoint, &topic, &nick, "host")
+    let relay = relays.first().cloned();
+    run_chat(&mut endpoint, &topic, &nick, "host", relay.as_ref())
 }
 
 /// Drives the endpoint until the relay reservation lands, printing the
@@ -195,7 +196,7 @@ pub fn run_join(
         .map_err(|e| format!("subscribe: {e}"))?;
     println!("[join] subscribed topic={topic} nick={nick}");
 
-    run_chat(&mut endpoint, &topic, &nick, "join")
+    run_chat(&mut endpoint, &topic, &nick, "join", None)
 }
 
 fn wait_for_direct_upgrade(
@@ -248,6 +249,7 @@ fn run_chat(
     topic: &str,
     nick: &str,
     role: &str,
+    relay: Option<&PeerAddr>,
 ) -> Result<(), Box<dyn Error>> {
     let input = spawn_stdin_reader();
     eprintln!("[{role}] type to chat; Ctrl-D to leave");
@@ -323,6 +325,18 @@ fn run_chat(
 
         for event in endpoint.take_nat_events() {
             print_nat_event(role, &event);
+            // A reservation that lands late (after the startup wait warned)
+            // or is re-acquired after a loss still needs its circuit
+            // address printed -- joiners have nothing to paste otherwise.
+            if let Some(relay) = relay
+                && matches!(&event, NatEvent::RelayReserved { relay: reserved, .. }
+                    if reserved == relay.peer_id())
+            {
+                println!(
+                    "[{role}] circuit={}",
+                    circuit_addr(relay, endpoint.peer_id())
+                );
+            }
         }
     }
 }

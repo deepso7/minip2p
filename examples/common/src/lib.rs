@@ -57,25 +57,35 @@ pub fn load_keypair(
 /// a window where a permissive umask exposes the key. `create_new` also
 /// closes the check-then-write race — losing that race is an error, never
 /// an overwrite.
+#[cfg(unix)]
 fn write_secret(path: &FsPath, secret: &[u8; SECRET_KEY_LENGTH]) -> Result<(), Box<dyn Error>> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create key directory {}: {e}", parent.display()))?;
     }
 
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
         .open(path)
         .map_err(|e| format!("failed to create key file {}: {e}", path.display()))?;
     file.write_all(format!("{}\n", encode_hex(secret)).as_bytes())
         .map_err(|e| format!("failed to write key file {}: {e}", path.display()))?;
     Ok(())
+}
+
+/// Only unix permissions give the owner-only guarantee a raw secret needs;
+/// refusing beats silently writing a key other principals may read.
+#[cfg(not(unix))]
+fn write_secret(path: &FsPath, _secret: &[u8; SECRET_KEY_LENGTH]) -> Result<(), Box<dyn Error>> {
+    Err(format!(
+        "refusing to create key file {}: persistent keys require unix file permissions \
+         (owner-only access cannot be guaranteed on this platform)",
+        path.display()
+    )
+    .into())
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
