@@ -746,9 +746,11 @@ dependencies = [
  "minip2p-identify",
  "minip2p-identity",
  "minip2p-nat",
+ "minip2p-pubsub",
  "minip2p-quic",
  "minip2p-swarm",
  "minip2p-transport",
+ "thiserror",
 ]
 
 [[package]]
@@ -757,6 +759,14 @@ version = "0.1.0"
 dependencies = [
  "minip2p-core",
  "thiserror",
+]
+
+[[package]]
+name = "minip2p-chat"
+version = "0.1.0"
+dependencies = [
+ "minip2p",
+ "minip2p-example-common",
 ]
 
 [[package]]
@@ -774,6 +784,13 @@ version = "0.1.0"
 dependencies = [
  "minip2p-core",
  "thiserror",
+]
+
+[[package]]
+name = "minip2p-example-common"
+version = "0.1.0"
+dependencies = [
+ "minip2p",
 ]
 
 [[package]]
@@ -824,6 +841,7 @@ name = "minip2p-peer"
 version = "0.1.0"
 dependencies = [
  "minip2p",
+ "minip2p-example-common",
 ]
 
 [[package]]
@@ -831,6 +849,17 @@ name = "minip2p-ping"
 version = "0.1.0"
 dependencies = [
  "minip2p-core",
+ "minip2p-transport",
+ "thiserror",
+]
+
+[[package]]
+name = "minip2p-pubsub"
+version = "0.1.0"
+dependencies = [
+ "minip2p-core",
+ "minip2p-identity",
+ "minip2p-swarm",
  "minip2p-transport",
  "thiserror",
 ]

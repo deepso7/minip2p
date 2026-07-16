@@ -10,15 +10,15 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::error::Error;
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, Instant};
 
-use minip2p::{
-    Endpoint, Event, Multiaddr, NatConfig, NatEvent, Path, PeerAddr, PeerId, Protocol, StreamId,
+use minip2p::{Endpoint, Event, NatConfig, NatEvent, Path, PeerAddr, PeerId, StreamId};
+
+use minip2p_example_common::{
+    circuit_addr, load_keypair, local_dialable_peer_addr, path_name, print_nat_event,
 };
 
 use crate::cli::{DialTarget, RunOptions, print_event};
-use crate::runtime::load_keypair;
 
 const AGENT: &str = "minip2p-peer/0.1.0";
 /// Echo protocol: the listener returns every byte unchanged.
@@ -47,7 +47,7 @@ fn build_endpoint(
     relays: &[PeerAddr],
     options: &RunOptions,
 ) -> Result<Endpoint, Box<dyn Error>> {
-    let keypair = load_keypair(options, role)?;
+    let keypair = load_keypair(options.key_path.as_deref(), role)?;
     let mut builder = Endpoint::builder()
         .identity(keypair)
         .agent_version(AGENT)
@@ -67,132 +67,6 @@ fn build_endpoint(
             .bind_quic_dual_stack()
             .map_err(|e| format!("quic dual-stack bind: {e}").into()),
     }
-}
-
-fn path_name(path: &Path) -> &'static str {
-    match path {
-        Path::DirectDialed => "direct-dialed",
-        Path::DirectPunched => "direct-punched",
-        Path::Relayed { .. } => "relayed",
-    }
-}
-
-/// Prints a [`NatEvent`] in the CLI's one-event-per-line format.
-fn print_nat_event(role: &str, event: &NatEvent) {
-    match event {
-        NatEvent::ReachabilityChanged {
-            old,
-            new,
-            confirmed_addrs,
-        } => {
-            let addrs = format_addrs(confirmed_addrs);
-            println!("[{role}] nat-reachability old={old:?} new={new:?} confirmed=[{addrs}]");
-        }
-        NatEvent::PublicAddressesChanged { addrs } => {
-            println!("[{role}] nat-public-addrs addrs=[{}]", format_addrs(addrs));
-        }
-        NatEvent::RelayReserved {
-            relay,
-            expires_unix_secs,
-            ..
-        } => {
-            let expires = expires_unix_secs
-                .map(|secs| secs.to_string())
-                .unwrap_or_else(|| "?".into());
-            println!("[{role}] nat-relay-reserved relay={relay} expires-unix={expires}");
-        }
-        NatEvent::RelayReservationLost { relay } => {
-            println!("[{role}] nat-relay-reservation-lost relay={relay}");
-        }
-        NatEvent::PathEstablished { peer, path, .. } => {
-            println!(
-                "[{role}] nat-path-established peer={peer} path={}",
-                path_name(path)
-            );
-        }
-        NatEvent::PathUpgraded { peer, from, to, .. } => {
-            println!(
-                "[{role}] nat-path-upgraded peer={peer} from={} to={}",
-                path_name(from),
-                path_name(to)
-            );
-        }
-        NatEvent::HolePunchFailed {
-            attempt, reason, ..
-        } => {
-            println!("[{role}] nat-holepunch-failed attempt={attempt} reason={reason}");
-        }
-        NatEvent::FellBackToRelay { peer, .. } => {
-            println!("[{role}] nat-fell-back-to-relay peer={peer}");
-        }
-        NatEvent::ConnectFailed { peer, error, .. } => {
-            println!("[{role}] nat-connect-failed peer={peer} error={error}");
-        }
-        NatEvent::InboundRelayCircuit {
-            peer,
-            relay,
-            stream_id,
-            pending_data,
-            remote_write_closed,
-        } => {
-            println!(
-                "[{role}] nat-inbound-circuit peer={peer} relay={relay} stream={stream_id} \
-                 pending-bytes={} remote-write-closed={remote_write_closed}",
-                pending_data.len()
-            );
-        }
-        NatEvent::InboundDirectUpgrade { peer } => {
-            println!("[{role}] nat-inbound-direct-upgrade peer={peer}");
-        }
-    }
-}
-
-fn format_addrs(addrs: &[Multiaddr]) -> String {
-    addrs
-        .iter()
-        .map(|addr| addr.to_string())
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// Rewrites a wildcard-bound peer-addr (`0.0.0.0` / `::`) to loopback so
-/// the printed `bound=` line is directly dialable on the same host.
-fn local_dialable_peer_addr(peer_addr: &PeerAddr) -> PeerAddr {
-    let protocols = peer_addr.transport().protocols();
-    let Some(first) = protocols.first() else {
-        return peer_addr.clone();
-    };
-
-    let replacement = match first {
-        Protocol::Ip4(bytes) if *bytes == [0, 0, 0, 0] => {
-            Some(Protocol::Ip4(Ipv4Addr::LOCALHOST.octets()))
-        }
-        Protocol::Ip6(bytes) if *bytes == [0; 16] => {
-            Some(Protocol::Ip6(Ipv6Addr::LOCALHOST.octets()))
-        }
-        _ => None,
-    };
-
-    let Some(replacement) = replacement else {
-        return peer_addr.clone();
-    };
-
-    let mut rewritten = protocols.to_vec();
-    rewritten[0] = replacement;
-    PeerAddr::new(
-        Multiaddr::from_protocols(rewritten),
-        peer_addr.peer_id().clone(),
-    )
-    .unwrap_or_else(|_| peer_addr.clone())
-}
-
-/// The circuit address a dialer pastes to reach `us` through `relay`.
-fn circuit_addr(relay: &PeerAddr, us: &PeerId) -> Multiaddr {
-    let mut protocols = relay.transport().protocols().to_vec();
-    protocols.push(Protocol::P2p(relay.peer_id().clone()));
-    protocols.push(Protocol::P2pCircuit);
-    protocols.push(Protocol::P2p(us.clone()));
-    Multiaddr::from_protocols(protocols)
 }
 
 // --- frame codec -----------------------------------------------------------

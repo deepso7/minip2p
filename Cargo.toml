@@ -11,12 +11,15 @@ members = [
     "crates/multistream-select",
     "crates/nat",
     "crates/ping",
+    "crates/pubsub",
     "crates/relay",
     "crates/swarm",
     "crates/test-support",
     "crates/tls",
     "crates/transport",
     "transports/quic",
+    "examples/chat",
+    "examples/common",
     "examples/peer",
 ]
 
