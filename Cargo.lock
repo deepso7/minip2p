@@ -762,6 +762,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "minip2p-chat"
+version = "0.1.0"
+dependencies = [
+ "minip2p",
+]
+
+[[package]]
 name = "minip2p-core"
 version = "0.1.0"
 dependencies = [

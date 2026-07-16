@@ -18,6 +18,7 @@ members = [
     "crates/tls",
     "crates/transport",
     "transports/quic",
+    "examples/chat",
     "examples/peer",
 ]
 

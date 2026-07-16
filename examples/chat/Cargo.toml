@@ -1,0 +1,16 @@
+[package]
+name = "minip2p-chat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "minip2p-chat"
+path = "src/main.rs"
+
+[dependencies]
+minip2p = { path = "../../crates/minip2p", features = ["nat", "pubsub"] }
