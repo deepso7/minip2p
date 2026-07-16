@@ -8,6 +8,8 @@
 
 #[cfg(feature = "nat")]
 mod nat;
+#[cfg(feature = "pubsub")]
+mod pubsub;
 
 pub use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
 pub use minip2p_identify::IdentifyMessage;
@@ -17,6 +19,10 @@ pub use minip2p_nat::{
     ConnectId, NatConfig, NatError, NatEvent, Path, ReachabilityState, ReservationInfo,
     ReservationPolicy,
 };
+#[cfg(feature = "pubsub")]
+pub use minip2p_pubsub::{
+    FLOODSUB_PROTOCOL_ID, FloodsubConfig, PublishError, PubsubEvent, TopicError,
+};
 pub use minip2p_quic::QuicLimits;
 use minip2p_quic::{QuicEndpoint, QuicNodeConfig};
 pub use minip2p_swarm::{
@@ -25,6 +31,8 @@ pub use minip2p_swarm::{
 };
 use minip2p_swarm::{Swarm, SwarmBuilder};
 pub use minip2p_transport::{ConnectionId, StreamId, TransportError};
+#[cfg(feature = "pubsub")]
+pub use pubsub::PubsubError;
 
 const DEFAULT_AGENT_VERSION: &str = "minip2p/0.1.0";
 
@@ -43,49 +51,51 @@ pub struct Endpoint {
     swarm: Swarm<QuicEndpoint>,
     #[cfg(feature = "nat")]
     nat: Option<nat::NatDriver>,
-    /// Application events set aside while a NAT-aware wait was driving the
-    /// endpoint; drained first by [`Endpoint::next_event`].
-    #[cfg(feature = "nat")]
+    #[cfg(feature = "pubsub")]
+    pubsub: Option<pubsub::PubsubDriver>,
+    /// Application events set aside while a driver-focused wait was driving
+    /// the endpoint; drained first by [`Endpoint::next_event`].
+    #[cfg(any(feature = "nat", feature = "pubsub"))]
     pending_events: std::collections::VecDeque<Event>,
 }
 
-/// Why one NAT-aware swarm-driving step returned.
-#[cfg(feature = "nat")]
-enum NatPollKind {
-    /// An event not owned by the NAT agent is ready for the application.
+/// Why one driver-aware swarm-driving step returned.
+#[cfg(any(feature = "nat", feature = "pubsub"))]
+enum DriverPollKind {
+    /// An event not owned by any agent is ready for the application.
     Application,
-    /// The agent produced application-visible NAT output; NAT-focused waits
-    /// should re-check its queue immediately.
+    /// An agent produced application-visible output; focused waits should
+    /// re-check their queue immediately.
     Progress,
     /// The caller's deadline elapsed.
     Deadline,
 }
 
-#[cfg(feature = "nat")]
-struct NatPoll {
-    kind: NatPollKind,
+#[cfg(any(feature = "nat", feature = "pubsub"))]
+struct DriverPoll {
+    kind: DriverPollKind,
     event: Option<Event>,
 }
 
-#[cfg(feature = "nat")]
-impl NatPoll {
+#[cfg(any(feature = "nat", feature = "pubsub"))]
+impl DriverPoll {
     fn application(event: Event) -> Self {
         Self {
-            kind: NatPollKind::Application,
+            kind: DriverPollKind::Application,
             event: Some(event),
         }
     }
 
     fn progress() -> Self {
         Self {
-            kind: NatPollKind::Progress,
+            kind: DriverPollKind::Progress,
             event: None,
         }
     }
 
     fn deadline() -> Self {
         Self {
-            kind: NatPollKind::Deadline,
+            kind: DriverPollKind::Deadline,
             event: None,
         }
     }
@@ -221,24 +231,19 @@ impl Endpoint {
     /// consumed here (never surfaced to the application); the agent's own
     /// events accumulate for `Endpoint::take_nat_events`.
     pub fn poll(&mut self) -> Result<Vec<Event>, Error> {
-        #[cfg(feature = "nat")]
+        #[cfg(any(feature = "nat", feature = "pubsub"))]
         {
             let polled = self.swarm.poll()?;
             let mut events: Vec<Event> = self.pending_events.drain(..).collect();
-            match self.nat.as_mut() {
-                Some(nat) => {
-                    for event in polled {
-                        if !nat.ingest(&event, &mut self.swarm) {
-                            events.push(event);
-                        }
-                    }
-                    nat.tick(&mut self.swarm);
+            for event in polled {
+                if !self.ingest_into_drivers(&event) {
+                    events.push(event);
                 }
-                None => events.extend(polled),
             }
+            self.tick_drivers();
             Ok(events)
         }
-        #[cfg(not(feature = "nat"))]
+        #[cfg(not(any(feature = "nat", feature = "pubsub")))]
         {
             self.swarm.poll()
         }
@@ -250,88 +255,167 @@ impl Endpoint {
     /// [`std::time::Duration`], or [`Deadline::NEVER`] to wait indefinitely.
     pub fn next_event(&mut self, deadline: impl Into<Deadline>) -> Result<Option<Event>, Error> {
         let deadline = deadline.into();
-        #[cfg(feature = "nat")]
-        if self.nat.is_some() {
-            return self.next_event_with_nat(deadline);
+        #[cfg(any(feature = "nat", feature = "pubsub"))]
+        if self.has_drivers() {
+            return self.next_event_driven(deadline);
         }
         self.swarm.poll_next(deadline)
     }
 
-    /// `next_event` with the NAT agent folded into the wait: the sleep
-    /// budget never overshoots the agent's next timer, agent-owned stream
+    /// Whether any agent driver is active on this endpoint.
+    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    fn has_drivers(&self) -> bool {
+        #[cfg(feature = "nat")]
+        if self.nat.is_some() {
+            return true;
+        }
+        #[cfg(feature = "pubsub")]
+        if self.pubsub.is_some() {
+            return true;
+        }
+        false
+    }
+
+    /// Feeds one swarm event through the active drivers, NAT first (its
+    /// control-plane streams are never pubsub-relevant; neither agent
+    /// claims connection-lifecycle or PeerReady events, so ordering only
+    /// decides who sees its own streams).
+    ///
+    /// Returns `true` when a driver claimed the event.
+    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    fn ingest_into_drivers(&mut self, event: &Event) -> bool {
+        #[cfg(feature = "nat")]
+        if let Some(nat) = self.nat.as_mut()
+            && nat.ingest(event, &mut self.swarm)
+        {
+            return true;
+        }
+        #[cfg(feature = "pubsub")]
+        if let Some(pubsub) = self.pubsub.as_mut()
+            && pubsub.ingest(event, &mut self.swarm)
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Ticks every active driver.
+    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    fn tick_drivers(&mut self) {
+        #[cfg(feature = "nat")]
+        if let Some(nat) = self.nat.as_mut() {
+            nat.tick(&mut self.swarm);
+        }
+        #[cfg(feature = "pubsub")]
+        if let Some(pubsub) = self.pubsub.as_mut() {
+            pubsub.tick(&mut self.swarm);
+        }
+    }
+
+    /// Application-visible events queued across every active driver; growth
+    /// is the focused waits' progress signal.
+    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    fn driver_events_len(&self) -> usize {
+        let mut len = 0;
+        #[cfg(feature = "nat")]
+        if let Some(nat) = self.nat.as_ref() {
+            len += nat.events.len();
+        }
+        #[cfg(feature = "pubsub")]
+        if let Some(pubsub) = self.pubsub.as_ref() {
+            len += pubsub.events.len();
+        }
+        len
+    }
+
+    /// One wait step's deadline: the caller's, shortened by whichever agent
+    /// timer is due first.
+    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    fn driver_step_deadline(&self, deadline: Deadline) -> Deadline {
+        let mut step = deadline;
+        #[cfg(feature = "nat")]
+        if let Some(nat) = self.nat.as_ref()
+            && let Some(ms) = nat.agent.next_timeout(nat.now().mono_ms)
+        {
+            step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
+        }
+        #[cfg(feature = "pubsub")]
+        if let Some(pubsub) = self.pubsub.as_ref()
+            && let Some(ms) = pubsub.agent.next_timeout(pubsub.now_ms())
+        {
+            step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
+        }
+        step
+    }
+
+    /// `next_event` with the active agents folded into the wait: the sleep
+    /// budget never overshoots an agent's next timer, agent-owned stream
     /// events are consumed instead of surfaced, and ticks run between
     /// waits.
-    #[cfg(feature = "nat")]
-    fn next_event_with_nat(&mut self, deadline: Deadline) -> Result<Option<Event>, Error> {
+    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    fn next_event_driven(&mut self, deadline: Deadline) -> Result<Option<Event>, Error> {
         if let Some(event) = self.pending_events.pop_front() {
             return Ok(Some(event));
         }
         let mut expired_poll_used = false;
         loop {
-            let poll = self.poll_new_event_with_nat(deadline, &mut expired_poll_used)?;
+            let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
             match poll.kind {
-                NatPollKind::Application => return Ok(poll.event),
-                NatPollKind::Progress => {}
-                NatPollKind::Deadline => return Ok(None),
+                DriverPollKind::Application => return Ok(poll.event),
+                DriverPollKind::Progress => {}
+                DriverPollKind::Deadline => return Ok(None),
             }
         }
     }
 
-    /// Drives the swarm and NAT agent until a newly-arrived application
-    /// event is available. Unlike [`Self::next_event_with_nat`], this never
-    /// drains `pending_events`: NAT-focused waits must leave application
-    /// events aside instead of repeatedly picking up the same one.
-    #[cfg(feature = "nat")]
-    fn poll_new_event_with_nat(
+    /// Drives the swarm and the active agents until a newly-arrived
+    /// application event is available. Unlike [`Self::next_event_driven`],
+    /// this never drains `pending_events`: focused waits must leave
+    /// application events aside instead of repeatedly picking up the same
+    /// one.
+    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    fn poll_new_event_driven(
         &mut self,
         deadline: Deadline,
         expired_poll_used: &mut bool,
-    ) -> Result<NatPoll, Error> {
+    ) -> Result<DriverPoll, Error> {
         loop {
             // `Swarm::poll_next` deliberately performs one synchronous poll
             // even for an expired deadline. That is useful for one-shot
             // callers, but repeating it here under a continuous event stream
-            // would let a NAT-focused wait run forever past its deadline.
+            // would let a focused wait run forever past its deadline.
             if deadline.has_passed() {
                 if *expired_poll_used {
-                    return Ok(NatPoll::deadline());
+                    return Ok(DriverPoll::deadline());
                 }
                 *expired_poll_used = true;
             }
-            let step = {
-                let nat = self.nat.as_ref().expect("nat checked by caller");
-                match nat.agent.next_timeout(nat.now().mono_ms) {
-                    Some(ms) => deadline
-                        .earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1)))),
-                    None => deadline,
-                }
-            };
+            let step = self.driver_step_deadline(deadline);
             let polled = self.swarm.poll_next(step)?;
             if deadline.has_passed() {
                 *expired_poll_used = true;
             }
-            let nat = self.nat.as_mut().expect("nat checked by caller");
-            let events_before = nat.events.len();
+            let events_before = self.driver_events_len();
             match polled {
                 Some(event) => {
-                    let consumed = nat.ingest(&event, &mut self.swarm);
-                    nat.tick(&mut self.swarm);
+                    let consumed = self.ingest_into_drivers(&event);
+                    self.tick_drivers();
                     if !consumed {
-                        return Ok(NatPoll::application(event));
+                        return Ok(DriverPoll::application(event));
                     }
-                    if nat.events.len() > events_before {
-                        return Ok(NatPoll::progress());
+                    if self.driver_events_len() > events_before {
+                        return Ok(DriverPoll::progress());
                     }
                 }
                 None => {
-                    nat.tick(&mut self.swarm);
-                    if nat.events.len() > events_before {
-                        return Ok(NatPoll::progress());
+                    self.tick_drivers();
+                    if self.driver_events_len() > events_before {
+                        return Ok(DriverPoll::progress());
                     }
                     // Distinguish the caller's deadline from a mere agent
                     // timer that shortened this wait step.
                     if deadline.has_passed() {
-                        return Ok(NatPoll::deadline());
+                        return Ok(DriverPoll::deadline());
                     }
                 }
             }
@@ -345,9 +429,9 @@ impl Endpoint {
         deadline: impl Into<Deadline>,
     ) -> Result<Option<Event>, Error> {
         let deadline = deadline.into();
-        #[cfg(feature = "nat")]
-        if self.nat.is_some() {
-            return self.wait_for_event_with_nat(deadline, |event| {
+        #[cfg(any(feature = "nat", feature = "pubsub"))]
+        if self.has_drivers() {
+            return self.wait_for_event_driven(deadline, |event| {
                 matches!(event, Event::PeerReady { peer_id: ready, .. } if ready == peer_id)
             });
         }
@@ -364,9 +448,9 @@ impl Endpoint {
         deadline: impl Into<Deadline>,
     ) -> Result<Option<u64>, Error> {
         let deadline = deadline.into();
-        #[cfg(feature = "nat")]
-        let event = if self.nat.is_some() {
-            self.wait_for_event_with_nat(deadline, |event| {
+        #[cfg(any(feature = "nat", feature = "pubsub"))]
+        let event = if self.has_drivers() {
+            self.wait_for_event_driven(deadline, |event| {
                 matches!(event, Event::PingRttMeasured { peer_id: ready, .. } if ready == peer_id)
             })?
         } else {
@@ -374,7 +458,7 @@ impl Endpoint {
                 matches!(event, Event::PingRttMeasured { peer_id: ready, .. } if ready == peer_id)
             })?
         };
-        #[cfg(not(feature = "nat"))]
+        #[cfg(not(any(feature = "nat", feature = "pubsub")))]
         let event = self.swarm.run_until(deadline, |event| {
             matches!(event, Event::PingRttMeasured { peer_id: ready, .. } if ready == peer_id)
         })?;
@@ -475,13 +559,13 @@ impl Endpoint {
                 }
             }
             self.ensure_pending_event_capacity()?;
-            let poll = self.poll_new_event_with_nat(deadline, &mut expired_poll_used)?;
+            let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
             match poll.kind {
-                NatPollKind::Application => self
+                DriverPollKind::Application => self
                     .pending_events
                     .push_back(poll.event.expect("application poll carries event")),
-                NatPollKind::Progress => {}
-                NatPollKind::Deadline => return Ok(None),
+                DriverPollKind::Progress => {}
+                DriverPollKind::Deadline => return Ok(None),
             }
         }
     }
@@ -515,22 +599,22 @@ impl Endpoint {
                 None => return Ok(None),
             }
             self.ensure_pending_event_capacity()?;
-            let poll = self.poll_new_event_with_nat(deadline, &mut expired_poll_used)?;
+            let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
             match poll.kind {
-                NatPollKind::Application => self
+                DriverPollKind::Application => self
                     .pending_events
                     .push_back(poll.event.expect("application poll carries event")),
-                NatPollKind::Progress => {}
-                NatPollKind::Deadline => return Ok(None),
+                DriverPollKind::Progress => {}
+                DriverPollKind::Deadline => return Ok(None),
             }
         }
     }
 
-    /// NAT-aware equivalent of `Swarm::run_until`. Every swarm event goes
-    /// through `NatDriver::ingest`, and non-matching application events are
-    /// retained for [`Endpoint::next_event`].
-    #[cfg(feature = "nat")]
-    fn wait_for_event_with_nat<F>(
+    /// Driver-aware equivalent of `Swarm::run_until`. Every swarm event
+    /// goes through the active drivers, and non-matching application events
+    /// are retained for [`Endpoint::next_event`].
+    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    fn wait_for_event_driven<F>(
         &mut self,
         deadline: Deadline,
         mut predicate: F,
@@ -544,22 +628,22 @@ impl Endpoint {
         let mut expired_poll_used = false;
         loop {
             self.ensure_pending_event_capacity()?;
-            let poll = self.poll_new_event_with_nat(deadline, &mut expired_poll_used)?;
+            let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
             match poll.kind {
-                NatPollKind::Application => {
+                DriverPollKind::Application => {
                     let event = poll.event.expect("application poll carries event");
                     if predicate(&event) {
                         return Ok(Some(event));
                     }
                     self.pending_events.push_back(event);
                 }
-                NatPollKind::Progress => {}
-                NatPollKind::Deadline => return Ok(None),
+                DriverPollKind::Progress => {}
+                DriverPollKind::Deadline => return Ok(None),
             }
         }
     }
 
-    #[cfg(feature = "nat")]
+    #[cfg(any(feature = "nat", feature = "pubsub"))]
     fn ensure_pending_event_capacity(&self) -> Result<(), Error> {
         if self.pending_events.len() >= RUN_UNTIL_SKIP_LIMIT {
             return Err(Error::EventBacklogExceeded {
@@ -586,6 +670,93 @@ impl Endpoint {
         self.nat
             .as_ref()
             .and_then(|nat| nat.agent.active_reservation().cloned())
+    }
+
+    /// Subscribes to a pubsub topic. Returns `Ok(false)` when already
+    /// subscribed. The subscription is announced to every floodsub peer.
+    ///
+    /// Errors with [`PubsubError::NotEnabled`] unless the endpoint was
+    /// built with [`EndpointBuilder::pubsub`].
+    #[cfg(feature = "pubsub")]
+    pub fn subscribe(&mut self, topic: &str) -> Result<bool, PubsubError> {
+        let Some(pubsub) = self.pubsub.as_mut() else {
+            return Err(PubsubError::NotEnabled);
+        };
+        let now_ms = pubsub.now_ms();
+        let newly = pubsub.agent.subscribe(topic, now_ms)?;
+        pubsub.pump(&mut self.swarm);
+        Ok(newly)
+    }
+
+    /// Withdraws a pubsub subscription. Returns `Ok(false)` when not
+    /// subscribed.
+    #[cfg(feature = "pubsub")]
+    pub fn unsubscribe(&mut self, topic: &str) -> Result<bool, PubsubError> {
+        let Some(pubsub) = self.pubsub.as_mut() else {
+            return Err(PubsubError::NotEnabled);
+        };
+        let now_ms = pubsub.now_ms();
+        let removed = pubsub.agent.unsubscribe(topic, now_ms);
+        pubsub.pump(&mut self.swarm);
+        Ok(removed)
+    }
+
+    /// Publishes `data` on `topic`, signed with this endpoint's identity
+    /// and flooded to every subscribed peer.
+    ///
+    /// The send is attempted synchronously before this returns; transport
+    /// failures are not synchronous errors — they surface later as
+    /// [`Event::Error`] runtime events or as
+    /// [`PubsubEvent::OutboundFailure`]. There is no self-delivery.
+    #[cfg(feature = "pubsub")]
+    pub fn publish(&mut self, topic: &str, data: impl Into<Vec<u8>>) -> Result<(), PubsubError> {
+        let Some(pubsub) = self.pubsub.as_mut() else {
+            return Err(PubsubError::NotEnabled);
+        };
+        let now_ms = pubsub.now_ms();
+        pubsub.agent.publish(topic, data.into(), now_ms)?;
+        pubsub.pump(&mut self.swarm);
+        Ok(())
+    }
+
+    /// Drains all queued pubsub events.
+    #[cfg(feature = "pubsub")]
+    pub fn take_pubsub_events(&mut self) -> Vec<PubsubEvent> {
+        match self.pubsub.as_mut() {
+            Some(pubsub) => pubsub.events.drain(..).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Returns the next pubsub event, waiting internally until `deadline`.
+    /// Application events arriving meanwhile are buffered for
+    /// [`Endpoint::next_event`].
+    #[cfg(feature = "pubsub")]
+    pub fn next_pubsub_event(
+        &mut self,
+        deadline: impl Into<Deadline>,
+    ) -> Result<Option<PubsubEvent>, PubsubError> {
+        let deadline = deadline.into();
+        let mut expired_poll_used = false;
+        loop {
+            match self.pubsub.as_mut() {
+                Some(pubsub) => {
+                    if let Some(event) = pubsub.events.pop_front() {
+                        return Ok(Some(event));
+                    }
+                }
+                None => return Err(PubsubError::NotEnabled),
+            }
+            self.ensure_pending_event_capacity()?;
+            let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
+            match poll.kind {
+                DriverPollKind::Application => self
+                    .pending_events
+                    .push_back(poll.event.expect("application poll carries event")),
+                DriverPollKind::Progress => {}
+                DriverPollKind::Deadline => return Ok(None),
+            }
+        }
     }
 
     /// Borrows the underlying swarm.
@@ -616,6 +787,10 @@ pub struct EndpointBuilder {
     relays: Vec<PeerAddr>,
     #[cfg(feature = "nat")]
     autonat_servers: Vec<PeerAddr>,
+    #[cfg(feature = "pubsub")]
+    pubsub_enabled: bool,
+    #[cfg(feature = "pubsub")]
+    pubsub_config: Option<FloodsubConfig>,
 }
 
 impl Default for EndpointBuilder {
@@ -631,6 +806,10 @@ impl Default for EndpointBuilder {
             relays: Vec::new(),
             #[cfg(feature = "nat")]
             autonat_servers: Vec::new(),
+            #[cfg(feature = "pubsub")]
+            pubsub_enabled: false,
+            #[cfg(feature = "pubsub")]
+            pubsub_config: None,
         }
     }
 }
@@ -643,6 +822,8 @@ struct BuilderParts {
     protocols: Vec<String>,
     #[cfg(feature = "nat")]
     nat_config: Option<NatConfig>,
+    #[cfg(feature = "pubsub")]
+    pubsub_config: Option<FloodsubConfig>,
 }
 
 impl EndpointBuilder {
@@ -700,6 +881,26 @@ impl EndpointBuilder {
     #[cfg(feature = "nat")]
     pub fn nat_config(mut self, config: NatConfig) -> Self {
         self.nat_config = Some(config);
+        self
+    }
+
+    /// Enables floodsub pubsub with the default configuration.
+    ///
+    /// Builder-time opt-in (rather than a lazy `subscribe`-time enable)
+    /// because `/floodsub/1.0.0` must be in Identify's advertised protocol
+    /// set from the first handshake — peers only open pubsub streams to
+    /// endpoints that advertise it.
+    #[cfg(feature = "pubsub")]
+    pub fn pubsub(mut self) -> Self {
+        self.pubsub_enabled = true;
+        self
+    }
+
+    /// Enables floodsub pubsub with an explicit configuration.
+    #[cfg(feature = "pubsub")]
+    pub fn pubsub_config(mut self, config: FloodsubConfig) -> Self {
+        self.pubsub_enabled = true;
+        self.pubsub_config = Some(config);
         self
     }
 
@@ -765,15 +966,19 @@ impl EndpointBuilder {
             protocols: self.protocols,
             #[cfg(feature = "nat")]
             nat_config,
+            #[cfg(feature = "pubsub")]
+            pubsub_config: self
+                .pubsub_enabled
+                .then(|| self.pubsub_config.unwrap_or_default()),
         })
     }
 }
 
 fn build_endpoint(parts: BuilderParts, transport: QuicEndpoint) -> Result<Endpoint, Error> {
     let mut builder = SwarmBuilder::new(&parts.keypair).agent_version(parts.agent_version);
-    #[cfg(feature = "nat")]
+    #[cfg(any(feature = "nat", feature = "pubsub"))]
     let mut protocols = parts.protocols;
-    #[cfg(not(feature = "nat"))]
+    #[cfg(not(any(feature = "nat", feature = "pubsub")))]
     let protocols = parts.protocols;
     #[cfg(feature = "nat")]
     if parts.nat_config.is_some() {
@@ -790,6 +995,15 @@ fn build_endpoint(parts: BuilderParts, transport: QuicEndpoint) -> Result<Endpoi
             }
         }
     }
+    #[cfg(feature = "pubsub")]
+    if parts.pubsub_config.is_some() {
+        // Floodsub streams route as an ordinary user protocol, and the id
+        // must be advertised by Identify from the first handshake.
+        let id = FLOODSUB_PROTOCOL_ID;
+        if !protocols.iter().any(|existing| existing == id) {
+            protocols.push(id.to_string());
+        }
+    }
     for protocol in protocols {
         builder = builder.protocol(protocol);
     }
@@ -804,11 +1018,25 @@ fn build_endpoint(parts: BuilderParts, transport: QuicEndpoint) -> Result<Endpoi
         let agent = minip2p_nat::NatAgent::new(swarm.local_peer_id().clone(), config);
         nat::NatDriver::new(agent, relay_addrs)
     });
+    #[cfg(feature = "pubsub")]
+    let pubsub = parts.pubsub_config.map(|config| {
+        // Message ids are (from, seqno); a wall-clock seed keeps restarts
+        // from reusing ids the network may still remember.
+        let initial_seqno = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let agent =
+            minip2p_pubsub::FloodsubAgent::new(parts.keypair.clone(), config, initial_seqno);
+        pubsub::PubsubDriver::new(agent)
+    });
     Ok(Endpoint {
         swarm,
         #[cfg(feature = "nat")]
         nat,
-        #[cfg(feature = "nat")]
+        #[cfg(feature = "pubsub")]
+        pubsub,
+        #[cfg(any(feature = "nat", feature = "pubsub"))]
         pending_events: std::collections::VecDeque::new(),
     })
 }

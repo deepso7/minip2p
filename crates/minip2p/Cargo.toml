@@ -10,13 +10,16 @@ workspace = true
 
 [features]
 nat = ["dep:minip2p-nat", "dep:getrandom"]
+pubsub = ["dep:minip2p-pubsub", "dep:thiserror"]
 
 [dependencies]
 minip2p-core = { path = "../core" }
 minip2p-identify = { path = "../identify" }
 minip2p-identity = { path = "../identity" }
 minip2p-nat = { path = "../nat", optional = true }
+minip2p-pubsub = { path = "../pubsub", optional = true }
 minip2p-quic = { path = "../../transports/quic" }
 minip2p-swarm = { path = "../swarm" }
 minip2p-transport = { path = "../transport" }
 getrandom = { version = "0.4.3", optional = true }
+thiserror = { version = "2.0.18", optional = true }

@@ -7,6 +7,10 @@ fmt:
 check:
     cargo check --workspace --all-targets
     cargo check --manifest-path fuzz/Cargo.toml --all-targets
+    cargo check -p minip2p
+    cargo check -p minip2p --features nat
+    cargo check -p minip2p --features pubsub
+    cargo check -p minip2p --features nat,pubsub
 
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
@@ -15,6 +19,7 @@ clippy:
 test:
     cargo test
     cargo test -p minip2p --features nat
+    cargo test -p minip2p --features nat,pubsub
 
 check-nostd:
     rustup target add thumbv7em-none-eabi

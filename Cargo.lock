@@ -746,9 +746,11 @@ dependencies = [
  "minip2p-identify",
  "minip2p-identity",
  "minip2p-nat",
+ "minip2p-pubsub",
  "minip2p-quic",
  "minip2p-swarm",
  "minip2p-transport",
+ "thiserror",
 ]
 
 [[package]]
