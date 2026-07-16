@@ -151,10 +151,6 @@ pub struct FloodsubAgent {
     topics: BTreeSet<String>,
     peers: BTreeMap<PeerId, PeerState>,
     roles: BTreeMap<PeerId, BTreeMap<StreamId, StreamRole>>,
-    tokens: BTreeMap<PubsubToken, PeerId>,
-    /// Tokens whose send timed out while still `Opening`: a late `Ok`
-    /// result must reset the stream it delivers, not leak it.
-    stale_tokens: BTreeMap<PubsubToken, PeerId>,
     next_token: u64,
     next_seqno: u64,
     seen: SeenCache,
@@ -178,8 +174,6 @@ impl FloodsubAgent {
             topics: BTreeSet::new(),
             peers: BTreeMap::new(),
             roles: BTreeMap::new(),
-            tokens: BTreeMap::new(),
-            stale_tokens: BTreeMap::new(),
             next_token: 0,
             next_seqno: initial_seqno,
             seen: SeenCache::default(),
@@ -363,39 +357,41 @@ impl FloodsubAgent {
         }
     }
 
-    /// Reports the result of a [`PubsubAction::OpenStream`].
+    /// Reports the result of a [`PubsubAction::OpenStream`]. `peer` and
+    /// `token` are the action's own fields, echoed back: carrying the peer
+    /// in the echo is what lets the agent reset a late stream for an open
+    /// it has already given up on (timeout, disconnect, supersede) without
+    /// remembering every token it ever issued.
     pub fn stream_open_result(
         &mut self,
+        peer: &PeerId,
         token: PubsubToken,
         result: Result<StreamId, String>,
         now_ms: u64,
     ) {
-        let Some(peer) = self.tokens.remove(&token) else {
-            // The send timed out while opening (or the peer is gone). A
-            // late-arriving stream must be reset, not leaked.
-            if let (Some(peer), Ok(stream_id)) = (self.stale_tokens.remove(&token), result) {
-                self.reject_stream(&peer, stream_id);
-            }
-            return;
-        };
-        let Some(state) = self.peers.get_mut(&peer) else {
-            return;
-        };
-        let SendState::Opening {
-            token: expected,
-            since_ms,
-            work,
-        } = core::mem::take(&mut state.sender)
-        else {
-            return;
-        };
-        if expected != token {
-            // A newer open superseded this one; reset the stale stream.
+        // Guard BEFORE taking (see on_stream_ready): only the echo for the
+        // token currently in `Opening` advances the sender.
+        let is_current = self.peers.get(peer).is_some_and(|state| {
+            matches!(
+                &state.sender,
+                SendState::Opening { token: expected, .. } if *expected == token
+            )
+        });
+        if !is_current {
+            // The open was retired (send timeout, disconnect, supersede) or
+            // superseded by a newer one. A late-arriving stream must be
+            // reset, not leaked.
             if let Ok(stream_id) = result {
-                self.reject_stream(&peer, stream_id);
+                self.reject_stream(peer, stream_id);
             }
             return;
         }
+        let Some(state) = self.peers.get_mut(peer) else {
+            return;
+        };
+        let SendState::Opening { since_ms, work, .. } = core::mem::take(&mut state.sender) else {
+            return;
+        };
         match result {
             Ok(stream_id) => {
                 // `send_timeout_ms` budgets the WHOLE RPC (open through
@@ -417,7 +413,7 @@ impl FloodsubAgent {
                 // The next stimulus (PeerReady, publish, subscribe, tick
                 // timeout of nothing — i.e. connection events) retries.
                 let _ = now_ms;
-                self.fail_in_flight(&peer, work, &format!("open failed: {reason}"));
+                self.fail_in_flight(peer, work, &format!("open failed: {reason}"));
             }
         }
     }
@@ -445,12 +441,7 @@ impl FloodsubAgent {
             let sender = core::mem::take(&mut state.sender);
             let work = match sender {
                 SendState::Idle => continue,
-                SendState::Opening { token, work, .. } => {
-                    if let Some(peer) = self.tokens.remove(&token) {
-                        self.stale_tokens.insert(token, peer);
-                    }
-                    work
-                }
+                SendState::Opening { work, .. } => work,
                 SendState::Negotiating {
                     stream_id, work, ..
                 }
@@ -510,7 +501,6 @@ impl FloodsubAgent {
         // re-queues ours.
         self.drop_peer_work(peer, "connection superseded");
         self.roles.remove(peer);
-        self.retire_peer_tokens(peer);
         self.peers.insert(peer.clone(), PeerState::default());
     }
 
@@ -520,7 +510,6 @@ impl FloodsubAgent {
         }
         self.drop_peer_work(peer, "connection closed");
         self.roles.remove(peer);
-        self.retire_peer_tokens(peer);
         self.peers.remove(peer);
     }
 
@@ -535,30 +524,6 @@ impl FloodsubAgent {
                 peer: peer.clone(),
                 reason: format!("{cause}; dropped {dropped} queued RPCs"),
             });
-        }
-    }
-
-    /// Retires every open-stream token addressed to `peer` when its
-    /// connection goes away. The tokens move to `stale_tokens` rather than
-    /// vanishing: a sans-I/O consumer may execute the already-queued
-    /// `OpenStream` afterwards, and its `Ok(stream)` echo must be met with
-    /// a reset instead of leaking an untracked stream. Bounded because
-    /// stale entries are only consumed by result echoes that may never
-    /// come.
-    fn retire_peer_tokens(&mut self, peer: &PeerId) {
-        const MAX_STALE_TOKENS: usize = 64;
-        let retired: Vec<PubsubToken> = self
-            .tokens
-            .iter()
-            .filter(|(_, dialed)| *dialed == peer)
-            .map(|(token, _)| *token)
-            .collect();
-        for token in retired {
-            self.tokens.remove(&token);
-            self.stale_tokens.insert(token, peer.clone());
-        }
-        while self.stale_tokens.len() > MAX_STALE_TOKENS {
-            self.stale_tokens.pop_first();
         }
     }
 
@@ -1012,7 +977,6 @@ impl FloodsubAgent {
 
         let token = PubsubToken(self.next_token);
         self.next_token += 1;
-        self.tokens.insert(token, peer.clone());
         state.sender = SendState::Opening {
             token,
             since_ms: now_ms,

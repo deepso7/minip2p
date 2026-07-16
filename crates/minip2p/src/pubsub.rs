@@ -111,7 +111,7 @@ impl PubsubDriver {
                     .open_stream(&peer, &protocol_id)
                     .map_err(|e| e.to_string());
                 let now_ms = self.now_ms();
-                self.agent.stream_open_result(token, result, now_ms);
+                self.agent.stream_open_result(&peer, token, result, now_ms);
             }
             PubsubAction::SendStream {
                 peer,

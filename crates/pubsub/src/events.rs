@@ -16,7 +16,8 @@ pub struct PubsubToken(pub(crate) u64);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PubsubAction {
     /// Call `Swarm::open_stream(&peer, &protocol_id)` and echo the result
-    /// back via `stream_open_result(token, ..)`.
+    /// back via `stream_open_result(&peer, token, ..)` — both fields of
+    /// this action, returned as-is.
     OpenStream {
         /// Token identifying this open in the result echo.
         token: PubsubToken,

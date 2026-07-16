@@ -86,7 +86,7 @@ fn negotiate_send(
     let actions = drain_actions(a);
     let (token, to) = open_stream_action(&actions)?;
     assert_eq!(&to, peer);
-    a.stream_open_result(token, Ok(stream_id), now);
+    a.stream_open_result(peer, token, Ok(stream_id), now);
     let claimed = a.handle_event(
         &SwarmEvent::StreamReady {
             peer_id: peer.clone(),
@@ -205,7 +205,7 @@ fn connect_subscribed(
     let actions = drain_actions(a);
     if let Some((token, _)) = open_stream_action(&actions) {
         let snapshot_stream = StreamId::new(901);
-        a.stream_open_result(token, Ok(snapshot_stream), now);
+        a.stream_open_result(peer, token, Ok(snapshot_stream), now);
         a.handle_event(
             &SwarmEvent::StreamReady {
                 peer_id: peer.clone(),
@@ -376,7 +376,7 @@ fn stream_closed_in_negotiating_discards_without_committing() {
     let actions = drain_actions(&mut a);
     let (token, _) = open_stream_action(&actions).expect("snapshot open");
     let stream = StreamId::new(4);
-    a.stream_open_result(token, Ok(stream), 1);
+    a.stream_open_result(&b, token, Ok(stream), 1);
     // Closed before StreamReady: the frame was never sent.
     a.handle_event(
         &SwarmEvent::StreamClosed {
@@ -923,7 +923,7 @@ fn send_timeout_discards_and_advances_in_every_state() {
             .any(|e| matches!(e, PubsubEvent::OutboundFailure { .. }))
     );
     // A late Ok for the timed-out token resets the delivered stream.
-    a.stream_open_result(token, Ok(StreamId::new(9)), 11_001);
+    a.stream_open_result(&b, token, Ok(StreamId::new(9)), 11_001);
     assert!(drain_actions(&mut a).iter().any(|a| matches!(
         a,
         PubsubAction::ResetStream { stream_id, .. } if *stream_id == StreamId::new(9)
@@ -934,7 +934,7 @@ fn send_timeout_discards_and_advances_in_every_state() {
     connect_subscribed(&mut a, &b, "t", StreamId::new(3), 0);
     a.publish("t", b"stuck".to_vec(), 1_000).unwrap();
     let (token, _) = open_stream_action(&drain_actions(&mut a)).unwrap();
-    a.stream_open_result(token, Ok(StreamId::new(4)), 1_500);
+    a.stream_open_result(&b, token, Ok(StreamId::new(4)), 1_500);
     a.handle_tick(12_000);
     let actions = drain_actions(&mut a);
     assert!(actions.iter().any(|a| matches!(
@@ -967,7 +967,7 @@ fn open_failure_discards_without_spinning_and_the_next_stimulus_retries() {
     connect(&mut a, &b, 0);
     a.subscribe("t", 1).unwrap();
     let (token, _) = open_stream_action(&drain_actions(&mut a)).expect("snapshot open");
-    a.stream_open_result(token, Err("no connection".to_string()), 2);
+    a.stream_open_result(&b, token, Err("no connection".to_string()), 2);
     assert!(
         drain_events(&mut a)
             .iter()
@@ -1299,7 +1299,7 @@ fn send_deadline_budgets_the_whole_rpc_not_each_state() {
 
     // The open result lands just before the deadline; the clock must NOT
     // restart at Negotiating.
-    a.stream_open_result(token, Ok(StreamId::new(4)), 9_999);
+    a.stream_open_result(&b, token, Ok(StreamId::new(4)), 9_999);
     assert_eq!(
         a.next_timeout(9_999),
         Some(1),
@@ -1352,7 +1352,7 @@ fn send_failure_prevents_the_commit() {
 
     // Completing the retried send delivers the same (uncommitted) snapshot.
     let retry_stream = StreamId::new(8);
-    a.stream_open_result(token, Ok(retry_stream), 4);
+    a.stream_open_result(&b, token, Ok(retry_stream), 4);
     a.handle_event(
         &SwarmEvent::StreamReady {
             peer_id: b.clone(),
@@ -1495,7 +1495,7 @@ fn late_open_result_after_disconnect_resets_the_stream() {
     drain_events(&mut a);
 
     let late = StreamId::new(9);
-    a.stream_open_result(token, Ok(late), 2);
+    a.stream_open_result(&b, token, Ok(late), 2);
     let actions = drain_actions(&mut a);
     assert!(
         actions.iter().any(|action| matches!(
@@ -1522,7 +1522,7 @@ fn late_open_result_after_supersede_resets_the_stream() {
     drain_actions(&mut a);
 
     let late = StreamId::new(9);
-    a.stream_open_result(token, Ok(late), 2);
+    a.stream_open_result(&b, token, Ok(late), 2);
     let actions = drain_actions(&mut a);
     assert!(
         actions.iter().any(|action| matches!(
@@ -1530,6 +1530,43 @@ fn late_open_result_after_supersede_resets_the_stream() {
             PubsubAction::ResetStream { peer, stream_id } if peer == &b && *stream_id == late
         )),
         "a late stream for a superseded token must be reset: {actions:?}"
+    );
+}
+
+#[test]
+fn late_open_result_still_resets_after_heavy_connection_churn() {
+    // Regression: retired tokens used to live in a bounded map whose
+    // eviction (at 64 entries) silently forgot the reset record — a late
+    // Ok for an evicted token then leaked the stream. The peer-in-echo
+    // contract retains nothing, so no amount of churn can evict anything.
+    let mut a = agent();
+    a.subscribe("t", 0).unwrap();
+    let b = peer(2);
+    connect(&mut a, &b, 0);
+    let (first_token, _) =
+        open_stream_action(&drain_actions(&mut a)).expect("snapshot open queued");
+
+    // Each supersede retires the in-flight open and queues a fresh one:
+    // enough cycles that the old bounded map would have evicted the
+    // first token's record many times over.
+    for i in 0..100u64 {
+        a.handle_event(
+            &SwarmEvent::ConnectionEstablished { peer_id: b.clone() },
+            i + 1,
+        );
+        drain_events(&mut a);
+        drain_actions(&mut a);
+    }
+
+    let late = StreamId::new(9);
+    a.stream_open_result(&b, first_token, Ok(late), 200);
+    let actions = drain_actions(&mut a);
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            PubsubAction::ResetStream { peer, stream_id } if peer == &b && *stream_id == late
+        )),
+        "a late stream must be reset regardless of churn: {actions:?}"
     );
 }
 
