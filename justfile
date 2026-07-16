@@ -19,6 +19,7 @@ clippy:
 test:
     cargo test
     cargo test -p minip2p --features nat
+    cargo test -p minip2p --features pubsub
     cargo test -p minip2p --features nat,pubsub
 
 check-nostd:

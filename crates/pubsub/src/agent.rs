@@ -334,6 +334,35 @@ impl FloodsubAgent {
         }
     }
 
+    /// Reports a synchronous failure of a [`PubsubAction::SendStream`].
+    ///
+    /// Without this feedback, the in-flight sender would sit in
+    /// `AwaitingClose` and the stream's eventual close would **commit**
+    /// work whose frame was never accepted by the swarm. The failed work
+    /// is discarded with an [`PubsubEvent::OutboundFailure`] and the
+    /// stream is reset; successful sends need no echo.
+    pub fn send_failed(&mut self, peer: &PeerId, stream_id: StreamId, reason: &str, now_ms: u64) {
+        let Some(state) = self.peers.get_mut(peer) else {
+            return;
+        };
+        match core::mem::take(&mut state.sender) {
+            SendState::AwaitingClose {
+                stream_id: expected,
+                work,
+                ..
+            } if expected == stream_id => {
+                self.reject_stream(peer, stream_id);
+                self.fail_in_flight(peer, work, &format!("send failed: {reason}"));
+                self.drive_sender(peer, now_ms);
+            }
+            other => {
+                // Not the in-flight send (stale stream): leave the sender
+                // untouched.
+                state.sender = other;
+            }
+        }
+    }
+
     /// Reports the result of a [`PubsubAction::OpenStream`].
     pub fn stream_open_result(
         &mut self,

@@ -35,6 +35,7 @@ jobs:
       - run: cargo check --no-default-features --target thumbv7em-none-eabi -p minip2p-core -p minip2p-identity -p minip2p-transport -p minip2p-tls -p minip2p-identify -p minip2p-multistream-select -p minip2p-ping -p minip2p-pubsub -p minip2p-relay -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm -p minip2p-nat
       - run: cargo test --workspace
       - run: cargo test -p minip2p --features nat
+      - run: cargo test -p minip2p --features pubsub
       - run: cargo test -p minip2p --features nat,pubsub
       - run: cargo doc --workspace --no-deps
       - run: cargo bench -p minip2p-core --bench multiaddr --no-run

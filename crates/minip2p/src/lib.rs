@@ -704,10 +704,12 @@ impl Endpoint {
     /// Publishes `data` on `topic`, signed with this endpoint's identity
     /// and flooded to every subscribed peer.
     ///
-    /// The send is attempted synchronously before this returns; transport
-    /// failures are not synchronous errors — they surface later as
-    /// [`Event::Error`] runtime events or as
-    /// [`PubsubEvent::OutboundFailure`]. There is no self-delivery.
+    /// A successful return means the message was accepted and its outbound
+    /// streams were initiated — the frames themselves go out as the
+    /// endpoint is driven (`next_event` / `poll`), so keep driving after
+    /// publishing. Delivery failures are never synchronous errors; they
+    /// surface later as [`PubsubEvent::OutboundFailure`] (or
+    /// [`Event::Error`] runtime events). There is no self-delivery.
     #[cfg(feature = "pubsub")]
     pub fn publish(&mut self, topic: &str, data: impl Into<Vec<u8>>) -> Result<(), PubsubError> {
         let Some(pubsub) = self.pubsub.as_mut() else {

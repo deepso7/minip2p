@@ -1313,3 +1313,77 @@ fn send_deadline_budgets_the_whole_rpc_not_each_state() {
         "one RPC gets one send_timeout_ms, not one per state"
     );
 }
+
+#[test]
+fn send_failure_prevents_the_commit() {
+    let mut a = agent();
+    let b = peer(2);
+    connect(&mut a, &b, 0);
+    a.subscribe("t", 1).unwrap();
+    let stream = StreamId::new(4);
+    negotiate_send(&mut a, &b, stream, 1).expect("snapshot in flight");
+
+    // The swarm rejected the write: the close that follows must not commit.
+    a.send_failed(&b, stream, "connection lost", 2);
+    let events = drain_events(&mut a);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, PubsubEvent::OutboundFailure { .. })),
+        "{events:?}"
+    );
+    // The failure resets the dead stream AND immediately re-drives the
+    // sender: sent_topics was never committed, so the diff re-derives.
+    let actions = drain_actions(&mut a);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, PubsubAction::ResetStream { .. })),
+        "{actions:?}"
+    );
+    let (token, _) = open_stream_action(&actions).expect("re-drive re-opens");
+    a.handle_event(
+        &SwarmEvent::StreamClosed {
+            peer_id: b.clone(),
+            stream_id: stream,
+        },
+        3,
+    );
+
+    // Completing the retried send delivers the same (uncommitted) snapshot.
+    let retry_stream = StreamId::new(8);
+    a.stream_open_result(token, Ok(retry_stream), 4);
+    a.handle_event(
+        &SwarmEvent::StreamReady {
+            peer_id: b.clone(),
+            stream_id: retry_stream,
+            protocol_id: FLOODSUB_PROTOCOL_ID.to_string(),
+            initiated_locally: true,
+        },
+        4,
+    );
+    let frame = drain_actions(&mut a)
+        .iter()
+        .find_map(|a| match a {
+            PubsubAction::SendStream { data, .. } => Some(data.clone()),
+            _ => None,
+        })
+        .expect("re-diffed snapshot frame");
+    assert_eq!(
+        decode_rpc(&frame).subscriptions[0].topic_id.as_deref(),
+        Some("t"),
+        "the failed snapshot must be re-sent, not committed"
+    );
+    a.handle_event(
+        &SwarmEvent::StreamClosed {
+            peer_id: b.clone(),
+            stream_id: retry_stream,
+        },
+        5,
+    );
+
+    // A stale-stream failure report must not disturb a healthy sender.
+    a.publish("t", b"x".to_vec(), 6).ok();
+    a.send_failed(&b, StreamId::new(999), "stale", 7);
+    assert!(drain_events(&mut a).is_empty(), "stale report is a no-op");
+}
