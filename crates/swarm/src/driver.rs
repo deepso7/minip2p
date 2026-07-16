@@ -423,7 +423,7 @@ impl<T: Transport> Swarm<T> {
         while let Some(output) = self.core.poll_output() {
             match output {
                 SwarmOutput::Action(action) => {
-                    self.dispatch_action(action, &mut allocated_stream, &mut open_error);
+                    self.dispatch_action(action, &mut allocated_stream, &mut open_error, &mut None);
                 }
                 SwarmOutput::Event(event) => self.event_buffer.push_back(event),
             }
@@ -460,8 +460,43 @@ impl<T: Transport> Swarm<T> {
         stream_id: StreamId,
         data: Vec<u8>,
     ) -> Result<(), DriverError> {
-        self.core.send_stream(peer_id, stream_id, data)?;
+        // Flush anything already queued first, so the capture window below
+        // contains only this call's own action cascade (same discipline as
+        // `Swarm::open_stream`).
         self.flush_actions();
+
+        self.core.send_stream(peer_id, stream_id, data)?;
+
+        // Dispatch this call's own actions synchronously, capturing a
+        // transport rejection. Callers that commit state once a stream
+        // closes (e.g. the pubsub one-shot sender) must learn that the
+        // write was never accepted -- a buffered error event carries no
+        // stream correlation to recover that from.
+        let window_start = self.event_buffer.len();
+        let mut send_error: Option<TransportError> = None;
+        while let Some(output) = self.core.poll_output() {
+            match output {
+                SwarmOutput::Action(action) => {
+                    self.dispatch_action(action, &mut None, &mut None, &mut send_error);
+                }
+                SwarmOutput::Event(event) => self.event_buffer.push_back(event),
+            }
+        }
+        self.flush_actions();
+
+        if let Some(error) = send_error {
+            // Reported synchronously through Err: drop the duplicate
+            // buffered runtime-error event this call produced.
+            if let Some(index) = (window_start..self.event_buffer.len()).find(|&i| {
+                matches!(
+                    &self.event_buffer[i],
+                    SwarmEvent::Error(e) if e.kind == SwarmErrorKind::Transport
+                )
+            }) {
+                self.event_buffer.remove(index);
+            }
+            return Err(DriverError::Transport(error));
+        }
         Ok(())
     }
 
@@ -524,7 +559,9 @@ impl<T: Transport> Swarm<T> {
         let mut events: Vec<SwarmEvent> = self.event_buffer.drain(..).collect();
         while let Some(output) = self.core.poll_output() {
             match output {
-                SwarmOutput::Action(action) => self.dispatch_action(action, &mut None, &mut None),
+                SwarmOutput::Action(action) => {
+                    self.dispatch_action(action, &mut None, &mut None, &mut None)
+                }
                 SwarmOutput::Event(event) => events.push(event),
             }
         }
@@ -710,7 +747,7 @@ impl<T: Transport> Swarm<T> {
         while let Some(output) = self.core.poll_output() {
             match output {
                 SwarmOutput::Action(action) => {
-                    self.dispatch_action(action, &mut allocated, &mut None)
+                    self.dispatch_action(action, &mut allocated, &mut None, &mut None)
                 }
                 SwarmOutput::Event(event) => self.event_buffer.push_back(event),
             }
@@ -730,6 +767,7 @@ impl<T: Transport> Swarm<T> {
         action: SwarmAction,
         captured_stream_id: &mut Option<StreamId>,
         captured_open_error: &mut Option<TransportError>,
+        captured_send_error: &mut Option<TransportError>,
     ) {
         match action {
             SwarmAction::OpenStream { conn_id, token } => match self.transport.open_stream(conn_id)
@@ -759,13 +797,15 @@ impl<T: Transport> Swarm<T> {
                 data,
             } => {
                 if let Err(e) = self.transport.send_stream(conn_id, stream_id, data) {
+                    let reason = format!(
+                        "send_stream to connection {conn_id} stream {stream_id} failed: {e}"
+                    );
+                    *captured_send_error = Some(e);
                     self.core
                         .handle_input(SwarmInput::RuntimeError(runtime_error(
                             SwarmErrorKind::Transport,
                             Some(conn_id),
-                            format!(
-                                "send_stream to connection {conn_id} stream {stream_id} failed: {e}"
-                            ),
+                            reason,
                         )));
                 }
             }
@@ -1259,6 +1299,191 @@ mod tests {
             buffered_open_failures(&swarm),
             1,
             "asynchronous failure must surface exactly once"
+        );
+    }
+
+    /// Transport that completes multistream negotiation for every locally
+    /// opened stream (identify, ping, and one user protocol) and then
+    /// rejects payload sends on the stream that negotiated the user
+    /// protocol.
+    struct FailingSendTransport {
+        events: VecDeque<TransportEvent>,
+        negotiators: BTreeMap<StreamId, MultistreamSelect>,
+        next_stream: u64,
+        user_protocol: String,
+        failing_stream: Option<StreamId>,
+    }
+
+    impl FailingSendTransport {
+        fn connected(peer_id: PeerId, user_protocol: &str) -> Self {
+            let endpoint = ConnectionEndpoint::with_peer_id(Multiaddr::new(), peer_id);
+            Self {
+                events: VecDeque::from([TransportEvent::Connected {
+                    id: ConnectionId::new(1),
+                    endpoint,
+                }]),
+                negotiators: BTreeMap::new(),
+                next_stream: 1,
+                user_protocol: user_protocol.to_string(),
+                failing_stream: None,
+            }
+        }
+    }
+
+    impl Transport for FailingSendTransport {
+        fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
+            unreachable!()
+        }
+
+        fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
+            unreachable!()
+        }
+
+        fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
+            let stream_id = StreamId::new(self.next_stream);
+            self.next_stream += 1;
+            let mut listener = MultistreamSelect::listener(vec![
+                IDENTIFY_PROTOCOL_ID.to_string(),
+                PING_PROTOCOL_ID.to_string(),
+                self.user_protocol.clone(),
+            ]);
+            listener
+                .handle_input(MultistreamInput::Start)
+                .expect("listener start");
+            self.negotiators.insert(stream_id, listener);
+            Ok(stream_id)
+        }
+
+        fn send_stream(
+            &mut self,
+            id: ConnectionId,
+            stream_id: StreamId,
+            data: Vec<u8>,
+        ) -> Result<(), TransportError> {
+            let Some(negotiator) = self.negotiators.get_mut(&stream_id) else {
+                if self.failing_stream == Some(stream_id) {
+                    return Err(TransportError::ResourceExhausted {
+                        resource: "test send capacity",
+                    });
+                }
+                // Other negotiated streams (identify, ping): swallow.
+                return Ok(());
+            };
+            negotiator
+                .handle_input(MultistreamInput::Data(data))
+                .expect("listener negotiation input");
+            let mut negotiated_protocol = None;
+            let mut outbound = Vec::new();
+            while let Some(output) = negotiator.poll_output() {
+                match output {
+                    MultistreamOutput::OutboundData(bytes) => outbound.push(bytes),
+                    MultistreamOutput::Negotiated { protocol } => {
+                        negotiated_protocol = Some(protocol);
+                    }
+                    other => panic!("unexpected multistream output: {other:?}"),
+                }
+            }
+            if let Some(protocol) = negotiated_protocol {
+                self.negotiators.remove(&stream_id);
+                if protocol == self.user_protocol {
+                    self.failing_stream = Some(stream_id);
+                }
+            }
+            for data in outbound {
+                self.events.push_back(TransportEvent::StreamData {
+                    id,
+                    stream_id,
+                    data,
+                });
+            }
+            Ok(())
+        }
+
+        fn close_stream_write(
+            &mut self,
+            _: ConnectionId,
+            _: StreamId,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn reset_stream(&mut self, _: ConnectionId, _: StreamId) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn close(&mut self, _: ConnectionId) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+            Ok(self.events.drain(..).collect())
+        }
+    }
+
+    #[test]
+    fn send_stream_transport_failure_is_a_synchronous_error() {
+        const PROTOCOL: &str = "/test/1.0.0";
+        let remote_peer = Ed25519Keypair::generate().peer_id();
+        let keypair = Ed25519Keypair::generate();
+        let identify = IdentifyConfig {
+            protocol_version: "test/1".into(),
+            agent_version: "test/1".into(),
+            protocols: vec![PROTOCOL.into()],
+            public_key: keypair.public_key().encode_protobuf(),
+        };
+        let transport = FailingSendTransport::connected(remote_peer.clone(), PROTOCOL);
+        let mut swarm = Swarm::new(
+            transport,
+            identify,
+            PingConfig::default(),
+            keypair.peer_id(),
+        );
+        swarm
+            .add_protocol(PROTOCOL)
+            .expect("test protocol id is not reserved");
+        swarm.poll().expect("process connected event");
+
+        let stream_id = swarm
+            .open_stream(&remote_peer, PROTOCOL)
+            .expect("open user stream");
+        let mut ready = false;
+        for _ in 0..5 {
+            for event in swarm.poll().expect("drive negotiation") {
+                if matches!(
+                    &event,
+                    SwarmEvent::StreamReady { stream_id: sid, initiated_locally: true, .. }
+                        if *sid == stream_id
+                ) {
+                    ready = true;
+                }
+            }
+            if ready {
+                break;
+            }
+        }
+        assert!(ready, "user stream must finish multistream negotiation");
+
+        // The transport rejects the payload write. Callers that commit
+        // state once a stream closes (the pubsub one-shot sender) must see
+        // this synchronously -- an Ok here would let a never-sent frame
+        // commit on StreamClosed.
+        let error = swarm
+            .send_stream(&remote_peer, stream_id, b"payload".to_vec())
+            .expect_err("transport must reject the payload send");
+        assert!(matches!(
+            error,
+            DriverError::Transport(TransportError::ResourceExhausted {
+                resource: "test send capacity"
+            })
+        ));
+        // Reported through Err; it must not also surface as a buffered
+        // runtime-error event.
+        assert!(
+            !swarm.event_buffer.iter().any(|event| matches!(
+                event,
+                SwarmEvent::Error(e) if e.kind == SwarmErrorKind::Transport
+            )),
+            "synchronous Err must suppress the duplicate buffered event"
         );
     }
 

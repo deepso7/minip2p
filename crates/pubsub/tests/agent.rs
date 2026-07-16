@@ -1428,3 +1428,150 @@ fn coalesced_frames_beyond_one_frame_cap_all_decode() {
         "coalescing is not a violation: {events:?}"
     );
 }
+
+#[test]
+fn unrelated_local_stream_ready_leaves_the_sender_intact() {
+    // Regression: any locally-initiated StreamReady (an app protocol on
+    // the same peer) used to reach the sender branch and `mem::take` the
+    // state before discovering the stream was unrelated, erasing an
+    // in-flight AwaitingClose send.
+    let mut a = agent();
+    let b = peer(2);
+    connect_subscribed(&mut a, &b, "t", StreamId::new(3), 0);
+
+    a.publish("t", b"hello".to_vec(), 1).unwrap();
+    let sent = StreamId::new(4);
+    negotiate_send(&mut a, &b, sent, 1).expect("publish frame in flight");
+
+    // An unrelated app stream on the same peer becomes ready. Not ours:
+    // the disposition must stay false and no actions may fire.
+    let claimed = a.handle_event(
+        &SwarmEvent::StreamReady {
+            peer_id: b.clone(),
+            stream_id: StreamId::new(77),
+            protocol_id: "/other/1.0.0".to_string(),
+            initiated_locally: true,
+        },
+        2,
+    );
+    assert!(!claimed, "a foreign app stream must not be claimed");
+    assert!(drain_actions(&mut a).is_empty());
+
+    // The in-flight send still commits normally on its own StreamClosed.
+    a.handle_event(
+        &SwarmEvent::StreamClosed {
+            peer_id: b.clone(),
+            stream_id: sent,
+        },
+        3,
+    );
+    let events = drain_events(&mut a);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, PubsubEvent::OutboundFailure { .. })),
+        "the send must survive the unrelated ready: {events:?}"
+    );
+    assert!(
+        drain_actions(&mut a).is_empty(),
+        "committed work must not be re-driven"
+    );
+}
+
+#[test]
+fn late_open_result_after_disconnect_resets_the_stream() {
+    // Regression for sans-I/O consumers that queue actions: the peer
+    // disconnects while an OpenStream is queued but not yet executed;
+    // when the consumer executes it anyway and echoes Ok, the now
+    // ownerless stream must be reset, not leaked.
+    let mut a = agent();
+    a.subscribe("t", 0).unwrap();
+    let b = peer(2);
+    connect(&mut a, &b, 0);
+    let actions = drain_actions(&mut a);
+    let (token, _) = open_stream_action(&actions).expect("snapshot open queued");
+
+    a.handle_event(&SwarmEvent::ConnectionClosed { peer_id: b.clone() }, 1);
+    drain_events(&mut a);
+
+    let late = StreamId::new(9);
+    a.stream_open_result(token, Ok(late), 2);
+    let actions = drain_actions(&mut a);
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            PubsubAction::ResetStream { peer, stream_id } if peer == &b && *stream_id == late
+        )),
+        "a late stream for a retired token must be reset: {actions:?}"
+    );
+}
+
+#[test]
+fn late_open_result_after_supersede_resets_the_stream() {
+    // Same as above, but the token is retired by a superseding
+    // connection instead of a disconnect.
+    let mut a = agent();
+    a.subscribe("t", 0).unwrap();
+    let b = peer(2);
+    connect(&mut a, &b, 0);
+    let actions = drain_actions(&mut a);
+    let (token, _) = open_stream_action(&actions).expect("snapshot open queued");
+
+    a.handle_event(&SwarmEvent::ConnectionEstablished { peer_id: b.clone() }, 1);
+    drain_events(&mut a);
+    drain_actions(&mut a);
+
+    let late = StreamId::new(9);
+    a.stream_open_result(token, Ok(late), 2);
+    let actions = drain_actions(&mut a);
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            PubsubAction::ResetStream { peer, stream_id } if peer == &b && *stream_id == late
+        )),
+        "a late stream for a superseded token must be reset: {actions:?}"
+    );
+}
+
+#[test]
+fn a_chunk_of_many_tiny_frames_decodes_through_the_cursor_path() {
+    // Regression: per-frame front-drains turned a coalesced chunk of tiny
+    // frames into quadratic buffer moves. The cursor + one-compaction path
+    // must still decode every frame correctly.
+    let mut a = agent();
+    a.subscribe("t", 0).unwrap();
+    let b = peer(2);
+    connect(&mut a, &b, 0);
+    let stream = StreamId::new(3);
+    assert!(inbound_open(&mut a, &b, stream, 1));
+    drain_actions(&mut a);
+
+    // Thousands of legal empty-RPC frames (one byte each: length 0),
+    // then a real message split across the SAME data event.
+    let empty = encode_frame(
+        &Rpc {
+            subscriptions: Vec::new(),
+            publish: Vec::new(),
+        }
+        .encode(),
+    );
+    assert_eq!(empty.len(), 1);
+    let mut blob = empty.repeat(10_000);
+    blob.extend_from_slice(&signed_message_frame(&keypair(9), "t", b"payload", 7));
+
+    inbound_data(&mut a, &b, stream, &blob, 2);
+    let events = drain_events(&mut a);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            PubsubEvent::Message { data, .. } if data.as_slice() == b"payload"
+        )),
+        "the trailing message must survive the tiny-frame flood: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, PubsubEvent::ProtocolViolation { .. })),
+        "tiny frames are legal traffic: {events:?}"
+    );
+}

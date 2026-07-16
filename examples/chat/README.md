@@ -77,7 +77,10 @@ network, mobile hotspot; VPN users: pin `--listen` to a real interface
 address if v6 default routes are hijacked).
 
 1. **Open-internet star**: `host --listen /ip4/0.0.0.0/udp/4001/quic-v1`
-   on a public box; `join <bound-addr>` from two NAT'd machines. Kill and
+   on a public box. The printed `bound=` address is rewritten to loopback
+   (it is meant for same-host joins); remote joiners build their address
+   from the `listen-addr=` line by substituting the machine's public IP:
+   `join /ip4/<public-ip>/udp/4001/quic-v1/p2p/<host-peer-id>`. Kill and
    rejoin one peer: the subscription snapshot is resent on reconnect.
 2. **NAT'd host**: host behind a NAT with `--relay <aws-relay>`, joiners
    paste the `circuit=` address and hole-punch in.

@@ -81,7 +81,14 @@ pub fn run_host(relay: Option<PeerAddr>, options: ChatOptions) -> Result<(), Box
     let first = peer_addrs
         .first()
         .ok_or("listen completed without any bound peer addresses")?;
+    // `bound=` is same-host pasteable (wildcards rewritten to loopback,
+    // which the e2e test relies on); the raw `listen-addr=` lines carry
+    // the real binds -- remote joiners substitute this machine's public
+    // address for a wildcard host.
     println!("[host] bound={}", local_dialable_peer_addr(first));
+    for addr in &peer_addrs {
+        println!("[host] listen-addr={addr}");
+    }
     println!("[host] us={}", endpoint.peer_id());
 
     if let Some(relay) = relays.first() {

@@ -510,8 +510,7 @@ impl FloodsubAgent {
         // re-queues ours.
         self.drop_peer_work(peer, "connection superseded");
         self.roles.remove(peer);
-        self.tokens.retain(|_, dialed| dialed != peer);
-        self.stale_tokens.retain(|_, dialed| dialed != peer);
+        self.retire_peer_tokens(peer);
         self.peers.insert(peer.clone(), PeerState::default());
     }
 
@@ -521,8 +520,7 @@ impl FloodsubAgent {
         }
         self.drop_peer_work(peer, "connection closed");
         self.roles.remove(peer);
-        self.tokens.retain(|_, dialed| dialed != peer);
-        self.stale_tokens.retain(|_, dialed| dialed != peer);
+        self.retire_peer_tokens(peer);
         self.peers.remove(peer);
     }
 
@@ -540,6 +538,30 @@ impl FloodsubAgent {
         }
     }
 
+    /// Retires every open-stream token addressed to `peer` when its
+    /// connection goes away. The tokens move to `stale_tokens` rather than
+    /// vanishing: a sans-I/O consumer may execute the already-queued
+    /// `OpenStream` afterwards, and its `Ok(stream)` echo must be met with
+    /// a reset instead of leaking an untracked stream. Bounded because
+    /// stale entries are only consumed by result echoes that may never
+    /// come.
+    fn retire_peer_tokens(&mut self, peer: &PeerId) {
+        const MAX_STALE_TOKENS: usize = 64;
+        let retired: Vec<PubsubToken> = self
+            .tokens
+            .iter()
+            .filter(|(_, dialed)| *dialed == peer)
+            .map(|(token, _)| *token)
+            .collect();
+        for token in retired {
+            self.tokens.remove(&token);
+            self.stale_tokens.insert(token, peer.clone());
+        }
+        while self.stale_tokens.len() > MAX_STALE_TOKENS {
+            self.stale_tokens.pop_first();
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Stream lifecycle
     // -----------------------------------------------------------------------
@@ -553,16 +575,24 @@ impl FloodsubAgent {
         now_ms: u64,
     ) -> bool {
         if initiated_locally {
+            // Guard BEFORE taking: `mem::take` on a non-matching pattern
+            // would silently destroy an Opening/AwaitingClose sender when
+            // an unrelated locally-initiated stream (any app protocol on
+            // this peer) becomes ready.
+            let is_ours = self.peers.get(peer).is_some_and(|state| {
+                matches!(
+                    &state.sender,
+                    SendState::Negotiating { stream_id: expected, .. } if *expected == stream_id
+                )
+            });
+            if !is_ours {
+                return self.owns_stream(peer, stream_id);
+            }
             let Some(state) = self.peers.get_mut(peer) else {
                 return self.owns_stream(peer, stream_id);
             };
-            if let SendState::Negotiating {
-                stream_id: expected,
-                since_ms,
-                work,
-            } = core::mem::take(&mut state.sender)
-            {
-                if expected == stream_id {
+            match core::mem::take(&mut state.sender) {
+                SendState::Negotiating { since_ms, work, .. } => {
                     self.actions.push_back(PubsubAction::SendStream {
                         peer: peer.clone(),
                         stream_id,
@@ -579,18 +609,11 @@ impl FloodsubAgent {
                             work,
                         };
                     }
-                    return true;
                 }
-                // Not ours: restore and fall through to the role check.
-                if let Some(state) = self.peers.get_mut(peer) {
-                    state.sender = SendState::Negotiating {
-                        stream_id: expected,
-                        since_ms,
-                        work,
-                    };
-                }
+                // Unreachable given the guard, but never drop sender state.
+                other => state.sender = other,
             }
-            return self.owns_stream(peer, stream_id);
+            return true;
         }
 
         if protocol_id != FLOODSUB_PROTOCOL_ID {
@@ -659,7 +682,11 @@ impl FloodsubAgent {
                 offset += take;
             }
 
-            while let Some(step) = self.take_frame(peer, stream_id) {
+            // Decode behind a cursor and compact once per top-up: draining
+            // the Vec per frame would shift the remainder for every frame,
+            // turning a chunk of many tiny frames into quadratic moves.
+            let mut head = 0;
+            while let Some(step) = self.take_frame(peer, stream_id, &mut head) {
                 match step {
                     Ok(payload) => match Rpc::decode(&payload) {
                         Ok(rpc) => {
@@ -678,22 +705,30 @@ impl FloodsubAgent {
                     }
                 }
             }
+            if head > 0
+                && let Some(state) = self.peers.get_mut(peer)
+                && let Some(buf) = state.inbound.get_mut(&stream_id)
+            {
+                buf.drain(..head);
+            }
         }
         true
     }
 
-    /// Pops the next complete frame off a stream's reassembly buffer.
+    /// Reads the next complete frame at `head`, advancing the cursor but
+    /// leaving the buffer untouched (the caller compacts once per batch).
     /// `None` = wait for more bytes; `Some(Err)` = the framing broke.
     fn take_frame(
         &mut self,
         peer: &PeerId,
         stream_id: StreamId,
+        head: &mut usize,
     ) -> Option<Result<Vec<u8>, String>> {
         let buf = self.peers.get_mut(peer)?.inbound.get_mut(&stream_id)?;
-        match decode_frame(buf) {
+        match decode_frame(&buf[*head..]) {
             FrameDecode::Complete { payload, consumed } => {
                 let payload = payload.to_vec();
-                buf.drain(..consumed);
+                *head += consumed;
                 Some(Ok(payload))
             }
             FrameDecode::Incomplete => None,
