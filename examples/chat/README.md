@@ -97,9 +97,9 @@ address if v6 default routes are hijacked).
 4. **rust-libp2p interop**: a rust-libp2p floodsub peer, with this side
    started with `--allow-unsigned`. The rust peer must include a `ping`
    behaviour (to answer this side's keepalives) or raise its
-   `idle_connection_timeout` — rust-libp2p closes connections no
-   behaviour holds open after 10 s by default, which reads as an
-   instant disconnect here.
+   `idle_connection_timeout` — by default rust-libp2p closes a
+   connection after 10 s when no behaviour keeps it alive, which reads
+   as an instant disconnect here.
 
 All four ran green on 2026-07-17: loopback sanity, an AWS-hosted
 open-internet star (hotspot + home-network leaves, kill/rejoin,
