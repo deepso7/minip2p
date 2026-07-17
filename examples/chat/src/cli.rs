@@ -55,6 +55,9 @@ pub struct ChatOptions {
     pub key_path: Option<PathBuf>,
     /// Optional QUIC listen/bind multiaddr. Defaults to dual-stack UDP/0.
     pub listen_addr: Option<Multiaddr>,
+    /// Accept unsigned messages (rust-libp2p floodsub interop; its
+    /// floodsub does not sign). Signed messages are still verified.
+    pub allow_unsigned: bool,
 }
 
 /// Parse error surfaced back to `main` so the binary exits with a readable
@@ -100,7 +103,11 @@ fn parse_join(args: Vec<String>) -> Result<Mode, CliError> {
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        if arg.starts_with("--") {
+        if arg == "--allow-unsigned" {
+            // Boolean flag: no value follows.
+            rest.push(arg.clone());
+            i += 1;
+        } else if arg.starts_with("--") {
             rest.push(arg.clone());
             let value = args
                 .get(i + 1)
@@ -181,6 +188,11 @@ impl Flags {
             let key = &args[i];
 
             match key.as_str() {
+                "--allow-unsigned" => {
+                    chat.allow_unsigned = true;
+                    i += 1;
+                    continue;
+                }
                 "--topic" => {
                     let value = flag_value(args, i, key)?;
                     if chat.topic.is_some() {
@@ -285,6 +297,10 @@ NOTES:
     --relay   relay peer-addr for NAT traversal / reservations
     --key     persistent Ed25519 raw-secret file (hex)
     --listen  bind multiaddr; default is dual-stack UDP/0
+
+    --allow-unsigned
+              accept unsigned messages (rust-libp2p floodsub interop;
+              signed messages are still verified)
 
     Type lines on stdin to chat; EOF (Ctrl-D) exits.
 

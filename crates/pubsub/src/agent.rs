@@ -268,7 +268,7 @@ impl FloodsubAgent {
         }
         self.next_seqno = self.next_seqno.wrapping_add(1);
 
-        let id: MessageId = (self.local_peer_id.to_bytes(), seqno.to_be_bytes());
+        let id: MessageId = (self.local_peer_id.to_bytes(), seqno.to_be_bytes().to_vec());
         self.seen.insert(
             id,
             now_ms,
@@ -871,7 +871,7 @@ impl FloodsubAgent {
             }
         };
 
-        let id: MessageId = (from.to_bytes(), seqno.to_be_bytes());
+        let id: MessageId = (from.to_bytes(), seqno.clone());
         if self.seen.contains(&id) {
             return; // duplicate: silent
         }

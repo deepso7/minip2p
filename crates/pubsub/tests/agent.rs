@@ -722,6 +722,32 @@ fn unsigned_messages_require_the_allow_unsigned_config() {
             .iter()
             .any(|e| matches!(e, PubsubEvent::Message { .. }))
     );
+
+    // Live-interop regression: rust-libp2p floodsub seqnos are 20 random
+    // bytes, not go's 8. They must deliver and round-trip in the event.
+    let rust_style_frame = {
+        let publisher = keypair(9);
+        let message = RawMessage {
+            from: Some(publisher.peer_id().to_bytes()),
+            data: Some(b"from rust".to_vec()),
+            seqno: Some(vec![7; 20]),
+            topic_ids: vec!["t".to_string()],
+            ..RawMessage::default()
+        };
+        let rpc = Rpc {
+            subscriptions: Vec::new(),
+            publish: vec![message],
+        };
+        encode_frame(&rpc.encode())
+    };
+    inbound_data(&mut lax, &b, StreamId::new(3), &rust_style_frame, 3);
+    assert!(
+        drain_events(&mut lax).iter().any(|e| matches!(
+            e,
+            PubsubEvent::Message { seqno, .. } if seqno.as_slice() == [7; 20]
+        )),
+        "a 20-byte seqno must deliver under allow_unsigned"
+    );
 }
 
 #[test]
