@@ -3,8 +3,8 @@
 use alloc::collections::{BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
-/// A message's dedup identity: (`from` bytes, 8-byte `seqno`).
-pub(crate) type MessageId = (Vec<u8>, [u8; 8]);
+/// A message's dedup identity: (`from` bytes, `seqno` bytes).
+pub(crate) type MessageId = (Vec<u8>, Vec<u8>);
 
 /// Dedup cache for message ids.
 ///

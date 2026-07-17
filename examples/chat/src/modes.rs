@@ -8,8 +8,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    Endpoint, Event, NatConfig, NatEvent, Path, PeerAddr, PeerId, PublishError, PubsubError,
-    PubsubEvent,
+    Endpoint, Event, FloodsubConfig, NatConfig, NatEvent, Path, PeerAddr, PeerId, PublishError,
+    PubsubError, PubsubEvent,
 };
 
 use minip2p_example_common::{
@@ -40,7 +40,10 @@ fn build_endpoint(
     let mut builder = Endpoint::builder()
         .identity(keypair)
         .agent_version(AGENT)
-        .pubsub()
+        .pubsub_config(FloodsubConfig {
+            allow_unsigned: options.allow_unsigned,
+            ..FloodsubConfig::default()
+        })
         .nat_config(NatConfig::default());
     for relay in relays {
         builder = builder.relay(relay.clone());
@@ -265,7 +268,22 @@ fn run_chat(
     // under a stdin flood.
     const MAX_LINES_PER_TICK: usize = 32;
 
+    // QUIC drops a connection after 30 s of silence (the transport's idle
+    // timeout), and a quiet room generates no traffic of its own — ping
+    // every connected peer well inside that window.
+    const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+    let mut last_keepalive = Instant::now();
+
     loop {
+        if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
+            last_keepalive = Instant::now();
+            for peer in endpoint.connected_peers() {
+                // A peer mid-disconnect can fail the ping; the close event
+                // will surface it.
+                let _ = endpoint.ping(&peer);
+            }
+        }
+
         for _ in 0..MAX_LINES_PER_TICK {
             match input.try_recv() {
                 Ok(Some(line)) => {

@@ -23,6 +23,12 @@ pub const MAX_RPC_SIZE: usize = 65536;
 /// Maximum topic length in bytes, enforced on subscribe and publish alike.
 pub const MAX_TOPIC_LEN: usize = 1024;
 
+/// Maximum accepted `seqno` length in bytes. Implementations disagree on
+/// the format (go: 8 big-endian bytes, rust-libp2p floodsub: 20 random
+/// bytes), so the seqno is treated as opaque; the cap bounds what the
+/// seen-cache stores per message id.
+pub const MAX_SEQNO_LEN: usize = 64;
+
 /// Domain-separation prefix for StrictSign signatures.
 const SIGN_PREFIX: &[u8] = b"libp2p-pubsub:";
 
@@ -124,8 +130,9 @@ pub enum MessageVerifyError {
     /// The `from` field does not parse as a peer id.
     #[error("message from field is not a valid peer id")]
     InvalidFrom,
-    /// The `seqno` field is missing or not exactly 8 bytes.
-    #[error("message seqno must be exactly 8 bytes")]
+    /// The `seqno` field is missing, empty, or longer than
+    /// [`MAX_SEQNO_LEN`] bytes.
+    #[error("message seqno must be 1..=64 bytes")]
     InvalidSeqno,
     /// The message carries no signature and unsigned messages are refused.
     #[error("message is unsigned")]
@@ -298,17 +305,20 @@ impl RawMessage {
     }
 
     /// Verifies this message per StrictSign and returns its publisher and
-    /// dedup seqno.
+    /// dedup seqno bytes.
     ///
     /// Rules (see the crate README for the interop rationale):
-    /// - `from` must parse as a peer id; `seqno` must be exactly 8 bytes —
+    /// - `from` must parse as a peer id; `seqno` must be 1..=64 bytes —
     ///   required even for unsigned messages, they form the dedup id.
+    ///   Length varies by implementation (go emits 8 big-endian bytes,
+    ///   rust-libp2p floodsub 20 random bytes), so the seqno is opaque
+    ///   bytes; the cap only bounds the seen-cache's per-id memory.
     /// - A present signature is always verified, `allow_unsigned` or not.
     /// - `key` without `signature` is invalid.
     /// - The signing key must round-trip to `from`
     ///   (`PeerId::from_public_key(key) == from`) whether it came from the
     ///   `key` field or was recovered from an inline-Ed25519 `from`.
-    pub fn verify(&self, allow_unsigned: bool) -> Result<(PeerId, u64), MessageVerifyError> {
+    pub fn verify(&self, allow_unsigned: bool) -> Result<(PeerId, Vec<u8>), MessageVerifyError> {
         let from_bytes = self
             .from
             .as_deref()
@@ -318,10 +328,10 @@ impl RawMessage {
             .seqno
             .as_deref()
             .ok_or(MessageVerifyError::InvalidSeqno)?;
-        let seqno_array: [u8; 8] = seqno_bytes
-            .try_into()
-            .map_err(|_| MessageVerifyError::InvalidSeqno)?;
-        let seqno = u64::from_be_bytes(seqno_array);
+        if seqno_bytes.is_empty() || seqno_bytes.len() > MAX_SEQNO_LEN {
+            return Err(MessageVerifyError::InvalidSeqno);
+        }
+        let seqno = seqno_bytes.to_vec();
 
         let Some(signature) = self.signature.as_deref() else {
             if self.key.is_some() {
@@ -809,7 +819,7 @@ mod tests {
         assert!(message.key.is_none(), "key must be omitted on the wire");
         let (from, seqno) = message.verify(false).expect("verify");
         assert_eq!(from, kp.peer_id());
-        assert_eq!(seqno, 42);
+        assert_eq!(seqno, 42u64.to_be_bytes().to_vec());
     }
 
     #[test]
@@ -888,16 +898,28 @@ mod tests {
         );
         let (from, seqno) = unsigned.verify(true).expect("allow_unsigned accepts");
         assert_eq!(from, kp.peer_id());
-        assert_eq!(seqno, 9);
+        assert_eq!(seqno, 9u64.to_be_bytes().to_vec());
 
-        // Even unsigned, the dedup id fields stay mandatory.
+        // Seqno length is implementation-defined: rust-libp2p floodsub
+        // emits 20 random bytes. Anything 1..=64 is accepted.
+        let mut rust_seqno = unsigned.clone();
+        rust_seqno.seqno = Some(vec![7; 20]);
+        assert!(rust_seqno.verify(true).is_ok(), "20-byte seqno verifies");
+
+        // Even unsigned, the dedup id fields stay mandatory and bounded.
         let mut no_from = unsigned.clone();
         no_from.from = None;
         assert_eq!(no_from.verify(true), Err(MessageVerifyError::MissingFrom));
-        let mut short_seqno = unsigned.clone();
-        short_seqno.seqno = Some(vec![1, 2, 3]);
+        let mut empty_seqno = unsigned.clone();
+        empty_seqno.seqno = Some(Vec::new());
         assert_eq!(
-            short_seqno.verify(true),
+            empty_seqno.verify(true),
+            Err(MessageVerifyError::InvalidSeqno)
+        );
+        let mut huge_seqno = unsigned.clone();
+        huge_seqno.seqno = Some(vec![0; MAX_SEQNO_LEN + 1]);
+        assert_eq!(
+            huge_seqno.verify(true),
             Err(MessageVerifyError::InvalidSeqno)
         );
     }

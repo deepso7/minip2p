@@ -68,7 +68,15 @@ connections is future work at the stack level.
 The payload is plain UTF-8, `"<nick>: <text>"`, formatted by the sender —
 trivially interoperable with any libp2p floodsub peer on the same topic
 (go/js sign by default and match this stack's StrictSign; rust-libp2p's
-floodsub is unsigned and needs `allow_unsigned`, not exposed by this CLI).
+floodsub is unsigned — pass `--allow-unsigned` to chat with it; signed
+messages are still verified). Seqnos are implementation-defined opaque
+bytes (go: 8 big-endian, rust: 20 random); anything 1..=64 bytes is
+accepted.
+
+A quiet room generates no traffic, and the QUIC transport drops
+connections after 30 s of silence — the chat loop pings every connected
+peer on a 10 s cadence to keep the room (and any relay reservation
+connection) alive through idle spells.
 
 ## Live-test recipes
 
@@ -86,3 +94,16 @@ address if v6 default routes are hijacked).
    paste the `circuit=` address and hole-punch in.
 3. **go-libp2p interop**: a go floodsub peer (Ed25519 identity) on the
    same topic chats both ways in strict mode.
+4. **rust-libp2p interop**: a rust-libp2p floodsub peer, with this side
+   started with `--allow-unsigned`. The rust peer must include a `ping`
+   behaviour (to answer this side's keepalives) or raise its
+   `idle_connection_timeout` — by default rust-libp2p closes a
+   connection after 10 s when no behaviour keeps it alive, which reads
+   as an instant disconnect here.
+
+All four ran green on 2026-07-17: loopback sanity, an AWS-hosted
+open-internet star (hotspot + home-network leaves, kill/rejoin,
+75 s idle survival), a NAT'd host punched into from a hotspot
+(relayed → direct-punched upgrade, then chat over the punched path),
+and both interop directions against real go-libp2p and rust-libp2p
+peers.

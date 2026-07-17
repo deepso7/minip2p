@@ -62,8 +62,10 @@ pub enum PubsubEvent {
         topics: Vec<String>,
         /// Application payload.
         data: Vec<u8>,
-        /// The publisher's sequence number.
-        seqno: u64,
+        /// The publisher's sequence number, as opaque bytes: go peers emit
+        /// 8 big-endian bytes, rust-libp2p floodsub 20 random bytes.
+        /// Together with `from` it identifies the message for dedup.
+        seqno: Vec<u8>,
     },
     /// A peer announced a subscription.
     PeerSubscribed {
