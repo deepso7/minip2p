@@ -1,78 +1,83 @@
 # minip2p
 
-A minimal [libp2p](https://libp2p.io/) implementation in Rust, built with Sans-I/O architecture, `no_std`-friendly core crates, and clear developer experience.
+A minimal [libp2p](https://libp2p.io/) implementation in Rust: small,
+portable, understandable, and pleasant to use.
 
-The project is built around four non-negotiables:
+The project is built around five non-negotiables:
 
-- **Sans-I/O architecture** for protocol and transport state machines.
-- **`no_std`-friendly core crates** (`alloc`-based where needed).
-- **Top-notch DX** with clear defaults, actionable errors, and easy local bring-up.
-- **FFI-friendly APIs** so Rust boundaries can later map cleanly to WASM/TypeScript hosts.
+- **Sans-I/O architecture**: protocol and orchestration logic are
+  deterministic state machines; sockets, clocks, and timers live only in
+  adapters.
+- **`no_std + alloc` core crates**, portable to embedded targets.
+- **No `async`/`.await`**: everything is caller-driven and
+  executor-independent.
+- **QUIC only**: one great transport adapter; others are out of scope.
+- **Top-notch DX** with clear defaults, actionable errors, and easy local
+  bring-up.
+
+`unsafe` is forbidden workspace-wide.
 
 ## Workspace status
 
-Sans-I/O core crates (`no_std + alloc`):
+Sans-I/O protocol crates (`no_std + alloc`):
 
 - `crates/identity` (`minip2p-identity`): peer identity primitives, Ed25519 keys, varint helpers.
 - `crates/core` (`minip2p-core`): transport-agnostic types (`Multiaddr`, `PeerAddr`, `Protocol`, `PeerId` re-export).
 - `crates/transport` (`minip2p-transport`): transport contract, shared lifecycle types (trait + data types only).
-- `crates/tls` (`minip2p-tls`): libp2p TLS certificate generation and peer verification, transport-agnostic.
+- `crates/tls` (`minip2p-tls`): libp2p TLS certificate generation and peer verification.
 - `crates/multistream-select` (`minip2p-multistream-select`): `/multistream/1.0.0` negotiation state machine.
 - `crates/ping` (`minip2p-ping`): `/ipfs/ping/1.0.0` state machine with RTT measurement.
 - `crates/identify` (`minip2p-identify`): `/ipfs/id/1.0.0` state machine for protocol and address exchange.
 - `crates/relay` (`minip2p-relay`): Circuit Relay v2 *client-side* state machines (`HopReservation`, `HopConnect`, `StopResponder`).
 - `crates/autonat` (`minip2p-autonat`): AutoNAT reachability probe state machines.
 - `crates/dcutr` (`minip2p-dcutr`): DCUtR hole-punch coordination state machines (`DcutrInitiator`, `DcutrResponder`).
-- `crates/swarm` (`minip2p-swarm`): `SwarmCore` Sans-I/O orchestrator that composes the protocol state machines, tracks connections and streams, drives multistream-select, and emits actions/events for the driver.
-- `crates/nat` (`minip2p-nat`): `NatAgent` Sans-I/O NAT-traversal orchestrator — races direct dials against a relayed circuit, hole-punches with DCUtR over the bridge, and reports explicit path establish/upgrade/fallback events.
+- `crates/pubsub` (`minip2p-pubsub`): floodsub (`/floodsub/1.0.0`) — the libp2p pubsub RPC wire codec with StrictSign message signing, and the `FloodsubAgent` flooding router. Interops with go-libp2p and rust-libp2p.
+
+Sans-I/O orchestrators (`no_std + alloc`):
+
+- `crates/swarm` (`minip2p-swarm`): `SwarmCore` composes the protocol state machines, tracks connections and streams, drives multistream-select, and emits actions/events for the driver. Also ships a thin `std`-gated driver `Swarm<T: Transport>`.
+- `crates/nat` (`minip2p-nat`): `NatAgent` NAT-traversal orchestrator — races direct dials against a relayed circuit, hole-punches with DCUtR over the bridge, and reports explicit path establish/upgrade/fallback events.
 
 Runtime adapters (`std`):
 
-- `crates/minip2p` (`minip2p`): app-facing facade that glues identity, QUIC, and the std swarm driver into an `Endpoint` API. The opt-in `nat` cargo feature wires the `minip2p-nat` traversal agent into `Endpoint` (`connect`/`wait_path`/`take_nat_events`, relay reservations, AutoNAT probing) with zero changes to the feature-off API.
-- `transports/quic` (`minip2p-quic`): QUIC transport adapter built on `quiche`, with libp2p TLS baked in.
-- `crates/swarm` (also ships a thin `std` driver `Swarm<T: Transport>` behind the `std` feature).
+- `crates/minip2p` (`minip2p`): app-facing facade that glues identity, QUIC, and the std swarm driver into an `Endpoint` API. Opt-in cargo features layer on without changing the base API:
+  - `nat` wires the traversal agent into `Endpoint` (`connect`/`wait_path`/`take_nat_events`, relay reservations, AutoNAT probing).
+  - `pubsub` adds floodsub (`subscribe`/`publish`/`take_pubsub_events`).
+- `transports/quic` (`minip2p-quic`): QUIC transport adapter built on `quiche`, with libp2p TLS baked in. Owns UDP and DNS; exposes deadlines instead of running timers.
+
+Examples:
+
+- `examples/peer` (`minip2p-peer`): NAT-aware echo-ping demo — `listen` echoes pings (optionally holding a relay reservation), `dial` traverses NAT and shows the RTT drop when the hole punch upgrades the path mid-run.
+- `examples/chat` (`minip2p-chat`): group chat over floodsub with NAT traversal — peers join a room by dialing one address, hole-punch direct paths where needed, and flood StrictSign-verified messages. Live-validated across real networks and against real go-libp2p and rust-libp2p peers.
 
 Current validated behavior:
 
 - Two local peers connect over QUIC in integration tests, with mutual libp2p TLS peer authentication.
 - Bidirectional stream data exchange with half-close propagation.
 - Multistream-select negotiation with spec-compliant varint framing.
-- Ping protocol round-trips with RTT measurement over negotiated streams.
-- Identify protocol exchange with observed-address plumbing from the transport.
-- Transport contract with documented lifecycle guarantees and conformance tests.
-- End-to-end stack via `minip2p::Endpoint`: QUIC transport + multistream-select + identify + ping through one app-facing facade.
-- Swarm DX events for application readiness (`PeerReady`) and typed runtime errors.
-- Pure-state-machine integration test covering Circuit Relay v2 + DCUtR (reservation, connect, stop, hole-punch coordination).
-- AutoNAT reachability probe wire logic and state machines in `minip2p-autonat`.
-- Manual cross-network test against a rust-libp2p relay validates HOP reservation, STOP circuit establishment, DCUtR coordination, IPv6 hole punching, direct ping, and relay-ping fallback.
-- NAT-traversal orchestration (`minip2p-nat`): scripted agent tests for the dialer race, housekeeping, and responder side; a two-agent relay-emulator integration test; and a loopback QUIC e2e through the `minip2p` facade's `nat` feature.
+- Ping round-trips with RTT measurement; identify exchange with observed-address plumbing.
+- End-to-end stack via `minip2p::Endpoint`: QUIC + multistream-select + identify + ping + registered app protocols through one facade.
+- NAT traversal live-validated end-to-end: relay reservation, circuit connect, DCUtR hole punch between two real NATs (home network ↔ mobile hotspot through a public relay), with explicit path events throughout.
+- Floodsub live-validated: loopback and open-internet chat stars, star-forwarding, a NAT'd host punched into through a relay, and wire interop both ways with real go-libp2p (StrictSign) and rust-libp2p (unsigned, behind an explicit allow flag) peers.
 
 ## Architecture boundaries
 
-- Core crates listed above are designed to remain `no_std + alloc`. Protocol state machines (`ping`, `identify`, `relay`, `autonat`, `dcutr`, `multistream-select`) never depend on sockets, async runtimes, or wall clocks.
-- Runtime networking concerns (UDP/TCP sockets, DNS resolution, timers) belong in transport adapter crates.
-- Transport-specific address validation belongs in transport adapters, not `crates/core`.
-- `crates/swarm` splits into a Sans-I/O `SwarmCore` (no_std) and a `std`-gated driver that owns a concrete `Transport` and reads the wall clock.
+Three layers, strictly separated:
 
-The minimal default swarm intentionally composes only Identify, Ping, and
+1. Sans-I/O protocol crates — pure state machines, one per protocol. No sockets, no async runtimes, no wall clocks; callers pump inputs and timestamps in, actions and events come out.
+2. Sans-I/O orchestrators (`swarm`, `nat`) — compose the protocol machines, still deterministic and I/O-free.
+3. `std` adapters — the QUIC transport and the `Endpoint` facade own all real I/O.
+
+The minimal default swarm intentionally composes only identify, ping, and
 registered application protocols. Relay, AutoNAT, and DCUtR remain independent
 Sans-I/O machines driven over generic streams; their dialing, retry, and
 fallback policy belongs to the host. This keeps the base library small and
 avoids hiding network policy in a monolithic swarm while still allowing
 declarative protocol registration through `SwarmBuilder::protocol` and
-`EndpointBuilder::protocol`.
-
-`transports/quic` is the optional synchronous socket adapter. It owns UDP and
-DNS I/O, but all libp2p protocol orchestration beneath it remains input/output
-driven. Hosts that own their I/O loop can use `SwarmCore` directly; the adapter
-exposes QUIC deadlines rather than creating an async runtime or timer thread.
+`EndpointBuilder::protocol`. The `nat` and `pubsub` facade features are
+pre-packaged policy for the common case, built on the same public hooks.
 
 ## Quick start
-
-Prerequisites:
-
-- Rust stable toolchain
-- Cargo
 
 Build and run tests:
 
@@ -111,22 +116,21 @@ drive `SwarmCore` and the protocol crates directly with inputs, outputs, and
 explicit timestamps; none of those layers performs I/O, reads a clock, blocks,
 or requires an async executor.
 
-Common contributor workflows are also available through `just`:
+For the full stack in action, run the chat example (see
+`examples/chat/README.md` for NAT'd and cross-implementation recipes):
 
 ```bash
-just test
-just check-nostd
-just bench
-just fuzz 30
+cargo run -p minip2p-chat -- host --nick hostess
 ```
 
-Check `no_std` builds for the core crates:
+Common contributor workflows are available through `just` (mirrors CI):
 
 ```bash
-cargo check --no-default-features -p minip2p-core -p minip2p-identity \
-    -p minip2p-transport -p minip2p-tls -p minip2p-identify \
-    -p minip2p-multistream-select -p minip2p-ping -p minip2p-relay \
-    -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm -p minip2p-nat
+just test          # cargo test + the minip2p feature matrix (nat, pubsub, nat+pubsub)
+just clippy        # -D warnings, includes the separate fuzz/ workspace
+just check-nostd   # no_std check on thumbv7em-none-eabi
+just bench
+just fuzz 30       # needs nightly + cargo-fuzz
 ```
 
 ## Documentation
@@ -142,19 +146,13 @@ cargo doc --workspace --no-deps --open
 ## Roadmap focus
 
 - [x] Local QUIC connectivity and integration coverage.
-- [x] Multistream-select with spec-compliant varint framing.
-- [x] Ping protocol with RTT measurement and timeout handling.
-- [x] End-to-end protocol stack tests (QUIC + multistream + ping).
-- [x] Rustdoc and internal comments across all crates.
-- [x] Transport contract hardening with documented guarantees and conformance tests.
-- [x] libp2p TLS peer authentication (automatic PeerId verification after handshake on the dialer side).
-- [x] Identify protocol (`/ipfs/id/1.0.0`).
+- [x] Multistream-select, ping, identify.
+- [x] libp2p TLS peer authentication (mutual: both sides learn the PeerId at handshake time).
 - [x] Swarm / connection management layer with builder DX.
 - [x] Top-level `minip2p::Endpoint` facade for app authors.
-- [x] Circuit Relay v2 client state machines.
-- [x] DCUtR hole-punching state machines.
-- [x] Runnable hole-punch CLI against a real relay.
-- [x] Mutual TLS on the QUIC transport so the listener learns the client PeerId at handshake time.
-- [ ] Additional transport adapters (TCP, WebSocket, WebRTC).
-
-See `plan.md` for the detailed execution plan and longer-term milestones.
+- [x] Circuit Relay v2 client, DCUtR, and AutoNAT state machines.
+- [x] NAT-traversal orchestration (`nat` feature), live-validated between two real NATs.
+- [x] Floodsub pubsub (`pubsub` feature) with libp2p wire interop, plus the chat example.
+- [ ] Peer exchange / discovery.
+- [ ] Gossipsub, on the same pubsub API surface.
+- [ ] A circuit transport, so relayed paths look like normal connections (today the relay bridge is a raw stream: chat requires a successful hole punch).
