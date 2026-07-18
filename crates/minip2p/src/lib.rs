@@ -1020,6 +1020,10 @@ impl EndpointBuilder {
     }
 
     /// Enables signed pubsub peer discovery with interoperable defaults.
+    ///
+    /// The discovery topic is driver-owned: subscribing to it again through
+    /// [`Endpoint::subscribe`] is redundant, and its pubsub messages and
+    /// subscription events are consumed before reaching the application.
     #[cfg(feature = "discovery")]
     pub fn discovery(mut self) -> Self {
         self.pubsub_enabled = true;
@@ -1030,6 +1034,9 @@ impl EndpointBuilder {
     /// Enables discovery with an explicitly validated configuration.
     ///
     /// Validation occurs before any transport bind can allocate a socket.
+    /// The configured topic is driver-owned: subscribing to it again through
+    /// [`Endpoint::subscribe`] is redundant, and its pubsub messages and
+    /// subscription events are consumed before reaching the application.
     #[cfg(feature = "discovery")]
     pub fn discovery_config(
         mut self,
