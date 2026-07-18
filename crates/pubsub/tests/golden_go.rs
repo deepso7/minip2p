@@ -34,9 +34,10 @@ fn go_libp2p_signed_message_decodes_and_verifies() {
 
     // StrictSign verification against go's actual signature: this is the
     // canonical-re-encode rule proving out end to end.
-    let (from, _seqno) = message
+    let (from, _seqno, signed) = message
         .verify(false)
         .expect("go-signed message must pass strict verification");
+    assert!(signed);
     let expected = include_str!("testdata/go_peer_id.txt");
     assert_eq!(from.to_base58(), expected.trim());
 }

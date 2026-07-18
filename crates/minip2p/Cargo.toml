@@ -11,9 +11,11 @@ workspace = true
 [features]
 nat = ["dep:minip2p-nat", "dep:getrandom"]
 pubsub = ["dep:minip2p-pubsub", "dep:thiserror"]
+discovery = ["nat", "pubsub", "dep:minip2p-discovery"]
 
 [dependencies]
 minip2p-core = { path = "../core" }
+minip2p-discovery = { path = "../discovery", optional = true }
 minip2p-identify = { path = "../identify" }
 minip2p-identity = { path = "../identity" }
 minip2p-nat = { path = "../nat", optional = true }

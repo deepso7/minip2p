@@ -858,7 +858,7 @@ impl FloodsubAgent {
     }
 
     fn process_message(&mut self, arrival: &PeerId, message: RawMessage, now_ms: u64) {
-        let (from, seqno) = match message.verify(self.config.allow_unsigned) {
+        let (from, seqno, signed) = match message.verify(self.config.allow_unsigned) {
             Ok(v) => v,
             Err(e) => {
                 // A bad message is dropped; the stream survives (only
@@ -888,6 +888,7 @@ impl FloodsubAgent {
                 topics: message.topic_ids.clone(),
                 data: message.data.clone().unwrap_or_default(),
                 seqno,
+                signed,
             });
         }
 

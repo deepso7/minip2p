@@ -269,8 +269,9 @@ fn subscription_snapshot_flows_on_peer_ready_and_publish_reaches_subscribers() {
     let frame = complete_send(&mut a, &b, StreamId::new(8), 30).expect("publish frame");
     let rpc = decode_rpc(&frame);
     assert_eq!(rpc.publish.len(), 1);
-    let (from, _) = rpc.publish[0].verify(false).expect("we sign our messages");
+    let (from, _, signed) = rpc.publish[0].verify(false).expect("we sign our messages");
     assert_eq!(&from, a.local_peer_id());
+    assert!(signed);
     assert_eq!(rpc.publish[0].data.as_deref(), Some(&b"hello"[..]));
 }
 
@@ -671,7 +672,7 @@ fn bad_signature_drops_the_message_but_the_stream_survives() {
     assert!(
         drain_events(&mut a)
             .iter()
-            .any(|e| matches!(e, PubsubEvent::Message { .. }))
+            .any(|e| matches!(e, PubsubEvent::Message { signed: true, .. }))
     );
 }
 
@@ -720,7 +721,7 @@ fn unsigned_messages_require_the_allow_unsigned_config() {
     assert!(
         drain_events(&mut lax)
             .iter()
-            .any(|e| matches!(e, PubsubEvent::Message { .. }))
+            .any(|e| matches!(e, PubsubEvent::Message { signed: false, .. }))
     );
 
     // Live-interop regression: rust-libp2p floodsub seqnos are 20 random

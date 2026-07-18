@@ -6,12 +6,20 @@
 //! small batteries-included API for identity, QUIC, listen/dial, ping, and
 //! event polling.
 
+#[cfg(feature = "discovery")]
+mod discovery;
 #[cfg(feature = "nat")]
 mod nat;
 #[cfg(feature = "pubsub")]
 mod pubsub;
 
+#[cfg(feature = "discovery")]
+pub use discovery::DiscoveryError;
 pub use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
+#[cfg(feature = "discovery")]
+pub use minip2p_discovery::{
+    DISCOVERY_TOPIC, DiscoveryConfig, DiscoveryConfigError, DiscoveryEvent, KnownPeer,
+};
 pub use minip2p_identify::IdentifyMessage;
 pub use minip2p_identity::Ed25519Keypair;
 #[cfg(feature = "nat")]
@@ -53,6 +61,8 @@ pub struct Endpoint {
     nat: Option<nat::NatDriver>,
     #[cfg(feature = "pubsub")]
     pubsub: Option<pubsub::PubsubDriver>,
+    #[cfg(feature = "discovery")]
+    discovery: Option<discovery::DiscoveryDriver>,
     /// Application events set aside while a driver-focused wait was driving
     /// the endpoint; drained first by [`Endpoint::next_event`].
     #[cfg(any(feature = "nat", feature = "pubsub"))]
@@ -265,6 +275,10 @@ impl Endpoint {
     /// Whether any agent driver is active on this endpoint.
     #[cfg(any(feature = "nat", feature = "pubsub"))]
     fn has_drivers(&self) -> bool {
+        #[cfg(feature = "discovery")]
+        if self.discovery.is_some() {
+            return true;
+        }
         #[cfg(feature = "nat")]
         if self.nat.is_some() {
             return true;
@@ -284,19 +298,24 @@ impl Endpoint {
     /// Returns `true` when a driver claimed the event.
     #[cfg(any(feature = "nat", feature = "pubsub"))]
     fn ingest_into_drivers(&mut self, event: &Event) -> bool {
+        #[cfg(feature = "discovery")]
+        if let Some(discovery) = self.discovery.as_mut() {
+            discovery.observe(event);
+        }
+        let mut claimed = false;
         #[cfg(feature = "nat")]
-        if let Some(nat) = self.nat.as_mut()
-            && nat.ingest(event, &mut self.swarm)
-        {
-            return true;
+        if let Some(nat) = self.nat.as_mut() {
+            claimed = nat.ingest(event, &mut self.swarm);
         }
         #[cfg(feature = "pubsub")]
-        if let Some(pubsub) = self.pubsub.as_mut()
-            && pubsub.ingest(event, &mut self.swarm)
-        {
-            return true;
+        if !claimed && let Some(pubsub) = self.pubsub.as_mut() {
+            claimed = pubsub.ingest(event, &mut self.swarm);
         }
-        false
+        #[cfg(feature = "discovery")]
+        if let Some(discovery) = self.discovery.as_mut() {
+            claimed |= discovery.ingest(event);
+        }
+        claimed
     }
 
     /// Ticks every active driver.
@@ -309,6 +328,14 @@ impl Endpoint {
         #[cfg(feature = "pubsub")]
         if let Some(pubsub) = self.pubsub.as_mut() {
             pubsub.tick(&mut self.swarm);
+        }
+        #[cfg(feature = "discovery")]
+        if let (Some(discovery), Some(pubsub), Some(nat)) = (
+            self.discovery.as_mut(),
+            self.pubsub.as_mut(),
+            self.nat.as_mut(),
+        ) {
+            discovery.sweep(pubsub, nat, &mut self.swarm);
         }
     }
 
@@ -324,6 +351,10 @@ impl Endpoint {
         #[cfg(feature = "pubsub")]
         if let Some(pubsub) = self.pubsub.as_ref() {
             len += pubsub.events.len();
+        }
+        #[cfg(feature = "discovery")]
+        if let Some(discovery) = self.discovery.as_ref() {
+            len += discovery.events.len();
         }
         len
     }
@@ -342,6 +373,12 @@ impl Endpoint {
         #[cfg(feature = "pubsub")]
         if let Some(pubsub) = self.pubsub.as_ref()
             && let Some(ms) = pubsub.agent.next_timeout(pubsub.now_ms())
+        {
+            step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
+        }
+        #[cfg(feature = "discovery")]
+        if let Some(discovery) = self.discovery.as_ref()
+            && let Some(ms) = discovery.agent.next_timeout(discovery.now_ms())
         {
             step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
         }
@@ -761,6 +798,53 @@ impl Endpoint {
         }
     }
 
+    /// Returns the current discovery address-book snapshot.
+    #[cfg(feature = "discovery")]
+    pub fn known_peers(&self) -> Vec<KnownPeer> {
+        self.discovery
+            .as_ref()
+            .map(|driver| driver.agent.known_peers())
+            .unwrap_or_default()
+    }
+
+    /// Drains all queued discovery events.
+    #[cfg(feature = "discovery")]
+    pub fn take_discovery_events(&mut self) -> Vec<DiscoveryEvent> {
+        self.discovery
+            .as_mut()
+            .map(|driver| driver.events.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// Returns the next discovery event while preserving unrelated swarm events.
+    #[cfg(feature = "discovery")]
+    pub fn next_discovery_event(
+        &mut self,
+        deadline: impl Into<Deadline>,
+    ) -> Result<Option<DiscoveryEvent>, DiscoveryError> {
+        let deadline = deadline.into();
+        let mut expired_poll_used = false;
+        loop {
+            match self.discovery.as_mut() {
+                Some(discovery) => {
+                    if let Some(event) = discovery.events.pop_front() {
+                        return Ok(Some(event));
+                    }
+                }
+                None => return Err(DiscoveryError::NotEnabled),
+            }
+            self.ensure_pending_event_capacity()?;
+            let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
+            match poll.kind {
+                DriverPollKind::Application => self
+                    .pending_events
+                    .push_back(poll.event.expect("application poll carries event")),
+                DriverPollKind::Progress => {}
+                DriverPollKind::Deadline => return Ok(None),
+            }
+        }
+    }
+
     /// Borrows the underlying swarm.
     pub fn swarm(&self) -> &Swarm<QuicEndpoint> {
         &self.swarm
@@ -773,7 +857,20 @@ impl Endpoint {
 
     /// Decomposes this endpoint into the underlying swarm.
     pub fn into_swarm(self) -> Swarm<QuicEndpoint> {
-        self.swarm
+        #[cfg(feature = "discovery")]
+        {
+            let mut endpoint = self;
+            if let (Some(discovery), Some(nat)) =
+                (endpoint.discovery.as_mut(), endpoint.nat.as_mut())
+            {
+                discovery.shutdown(nat, &mut endpoint.swarm);
+            }
+            endpoint.swarm
+        }
+        #[cfg(not(feature = "discovery"))]
+        {
+            self.swarm
+        }
     }
 }
 
@@ -793,6 +890,8 @@ pub struct EndpointBuilder {
     pubsub_enabled: bool,
     #[cfg(feature = "pubsub")]
     pubsub_config: Option<FloodsubConfig>,
+    #[cfg(feature = "discovery")]
+    discovery_config: Option<DiscoveryConfig>,
 }
 
 impl Default for EndpointBuilder {
@@ -812,6 +911,8 @@ impl Default for EndpointBuilder {
             pubsub_enabled: false,
             #[cfg(feature = "pubsub")]
             pubsub_config: None,
+            #[cfg(feature = "discovery")]
+            discovery_config: None,
         }
     }
 }
@@ -826,6 +927,8 @@ struct BuilderParts {
     nat_config: Option<NatConfig>,
     #[cfg(feature = "pubsub")]
     pubsub_config: Option<FloodsubConfig>,
+    #[cfg(feature = "discovery")]
+    discovery_config: Option<DiscoveryConfig>,
 }
 
 impl EndpointBuilder {
@@ -906,6 +1009,28 @@ impl EndpointBuilder {
         self
     }
 
+    /// Enables signed pubsub peer discovery with interoperable defaults.
+    #[cfg(feature = "discovery")]
+    pub fn discovery(mut self) -> Self {
+        self.pubsub_enabled = true;
+        self.discovery_config = Some(DiscoveryConfig::default());
+        self
+    }
+
+    /// Enables discovery with an explicitly validated configuration.
+    ///
+    /// Validation occurs before any transport bind can allocate a socket.
+    #[cfg(feature = "discovery")]
+    pub fn discovery_config(
+        mut self,
+        config: DiscoveryConfig,
+    ) -> Result<Self, DiscoveryConfigError> {
+        config.validate()?;
+        self.pubsub_enabled = true;
+        self.discovery_config = Some(config);
+        Ok(self)
+    }
+
     /// Builds an endpoint with a QUIC transport bound to `bind_addr`.
     pub fn bind_quic(self, bind_addr: impl AsRef<str>) -> Result<Endpoint, Error> {
         let parts = self.into_parts()?;
@@ -953,7 +1078,17 @@ impl EndpointBuilder {
         let nat_config = {
             let enabled = self.nat_config.is_some()
                 || !self.relays.is_empty()
-                || !self.autonat_servers.is_empty();
+                || !self.autonat_servers.is_empty()
+                || cfg!(feature = "discovery") && {
+                    #[cfg(feature = "discovery")]
+                    {
+                        self.discovery_config.is_some()
+                    }
+                    #[cfg(not(feature = "discovery"))]
+                    {
+                        false
+                    }
+                };
             enabled.then(|| {
                 let mut config = self.nat_config.unwrap_or_default();
                 config.relays.extend(self.relays);
@@ -972,6 +1107,8 @@ impl EndpointBuilder {
             pubsub_config: self
                 .pubsub_enabled
                 .then(|| self.pubsub_config.unwrap_or_default()),
+            #[cfg(feature = "discovery")]
+            discovery_config: self.discovery_config,
         })
     }
 }
@@ -1020,6 +1157,8 @@ fn build_endpoint(parts: BuilderParts, transport: QuicEndpoint) -> Result<Endpoi
         let agent = minip2p_nat::NatAgent::new(swarm.local_peer_id().clone(), config);
         nat::NatDriver::new(agent, relay_addrs)
     });
+    #[cfg(feature = "discovery")]
+    let discovery_config = parts.discovery_config;
     #[cfg(feature = "pubsub")]
     let pubsub = parts.pubsub_config.map(|config| {
         // Message ids are (from, seqno); a wall-clock seed keeps restarts
@@ -1032,12 +1171,36 @@ fn build_endpoint(parts: BuilderParts, transport: QuicEndpoint) -> Result<Endpoi
             minip2p_pubsub::FloodsubAgent::new(parts.keypair.clone(), config, initial_seqno);
         pubsub::PubsubDriver::new(agent)
     });
+    #[cfg(feature = "discovery")]
+    let mut pubsub = pubsub;
+    #[cfg(feature = "discovery")]
+    if let (Some(pubsub), Some(config)) = (pubsub.as_mut(), discovery_config.as_ref()) {
+        pubsub
+            .agent
+            .subscribe(&config.topic, 0)
+            .map_err(|_| Error::Invariant {
+                reason: "validated discovery topic was rejected by pubsub",
+            })?;
+    }
+    #[cfg(feature = "discovery")]
+    let discovery = match discovery_config {
+        Some(config) => {
+            let agent = minip2p_discovery::DiscoveryAgent::new(parts.keypair.public_key(), config)
+                .map_err(|_| Error::Invariant {
+                    reason: "validated discovery configuration was rejected",
+                })?;
+            Some(discovery::DiscoveryDriver::new(agent))
+        }
+        None => None,
+    };
     Ok(Endpoint {
         swarm,
         #[cfg(feature = "nat")]
         nat,
         #[cfg(feature = "pubsub")]
         pubsub,
+        #[cfg(feature = "discovery")]
+        discovery,
         #[cfg(any(feature = "nat", feature = "pubsub"))]
         pending_events: std::collections::VecDeque::new(),
     })
@@ -1046,6 +1209,19 @@ fn build_endpoint(parts: BuilderParts, transport: QuicEndpoint) -> Result<Endpoi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn discovery_config_is_rejected_before_binding() {
+        let config = DiscoveryConfig {
+            beacon_interval_ms: 0,
+            ..DiscoveryConfig::default()
+        };
+        assert!(matches!(
+            Endpoint::builder().discovery_config(config),
+            Err(DiscoveryConfigError::ZeroBeaconInterval)
+        ));
+    }
     #[cfg(feature = "nat")]
     use std::time::Duration;
 

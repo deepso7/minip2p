@@ -1,6 +1,7 @@
 //! The chat runner: endpoint construction, host/join startup flows, and
 //! the shared stdin-driven chat loop.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::io::BufRead;
 use std::sync::mpsc;
@@ -8,8 +9,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    Endpoint, Event, FloodsubConfig, NatConfig, NatEvent, Path, PeerAddr, PeerId, PublishError,
-    PubsubError, PubsubEvent,
+    DISCOVERY_TOPIC, DiscoveryConfig, DiscoveryEvent, Endpoint, Event, FloodsubConfig, NatConfig,
+    NatEvent, Path, PeerAddr, PeerId, PublishError, PubsubError, PubsubEvent, StreamId,
 };
 
 use minip2p_example_common::{
@@ -29,6 +30,11 @@ const PUNCH_WAIT: Duration = Duration::from_secs(30);
 /// Identify must complete before floodsub can open streams.
 const READY_DEADLINE: Duration = Duration::from_secs(15);
 
+struct ResponderBridge {
+    target_peer: PeerId,
+    cleanup_deadline: Instant,
+}
+
 // --- endpoint construction --------------------------------------------------
 
 fn build_endpoint(
@@ -37,6 +43,7 @@ fn build_endpoint(
     options: &ChatOptions,
 ) -> Result<Endpoint, Box<dyn Error>> {
     let keypair = load_keypair(options.key_path.as_deref(), role)?;
+    let nat_config = NatConfig::default();
     let mut builder = Endpoint::builder()
         .identity(keypair)
         .agent_version(AGENT)
@@ -44,7 +51,19 @@ fn build_endpoint(
             allow_unsigned: options.allow_unsigned,
             ..FloodsubConfig::default()
         })
-        .nat_config(NatConfig::default());
+        .nat_config(nat_config);
+    if !options.no_mesh {
+        let room = options
+            .topic
+            .clone()
+            .unwrap_or_else(|| DEFAULT_TOPIC.to_string());
+        builder = builder.discovery_config(DiscoveryConfig {
+            topic: format!("{room}/{DISCOVERY_TOPIC}"),
+            beacon_interval_ms: 2_000,
+            peer_ttl_ms: 10_000,
+            ..DiscoveryConfig::default()
+        })?;
+    }
     for relay in relays {
         builder = builder.relay(relay.clone());
     }
@@ -273,8 +292,23 @@ fn run_chat(
     // every connected peer well inside that window.
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
     let mut last_keepalive = Instant::now();
+    let nat_defaults = NatConfig::default();
+    let bridge_lifetime_ms = nat_defaults
+        .punch_deadline_ms
+        .saturating_mul(1 + u64::from(nat_defaults.punch_max_retries))
+        .saturating_add(1_000);
+    let mut responder_bridges: BTreeMap<(PeerId, StreamId), ResponderBridge> = BTreeMap::new();
 
     loop {
+        let expired: Vec<_> = responder_bridges
+            .iter()
+            .filter(|(_, bridge)| Instant::now() >= bridge.cleanup_deadline)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (relay_peer, stream_id) in expired {
+            let _ = endpoint.reset_stream(&relay_peer, stream_id);
+            responder_bridges.remove(&(relay_peer, stream_id));
+        }
         if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
             last_keepalive = Instant::now();
             for peer in endpoint.connected_peers() {
@@ -312,9 +346,11 @@ fn run_chat(
             match &event {
                 Event::ConnectionEstablished { peer_id } => {
                     println!("[{role}] connected peer={peer_id}");
+                    reset_responder_bridges(endpoint, &mut responder_bridges, peer_id);
                 }
                 Event::ConnectionClosed { peer_id } => {
                     println!("[{role}] disconnected peer={peer_id}");
+                    responder_bridges.retain(|(relay_peer, _), _| relay_peer != peer_id);
                 }
                 Event::Error(error) => {
                     eprintln!("[{role}] error {:?}: {}", error.kind, error.detail);
@@ -349,6 +385,27 @@ fn run_chat(
 
         for event in endpoint.take_nat_events() {
             print_nat_event(role, &event);
+            match &event {
+                NatEvent::InboundRelayCircuit {
+                    peer,
+                    relay,
+                    stream_id,
+                    ..
+                } => {
+                    responder_bridges.insert(
+                        (relay.clone(), *stream_id),
+                        ResponderBridge {
+                            target_peer: peer.clone(),
+                            cleanup_deadline: Instant::now()
+                                + Duration::from_millis(bridge_lifetime_ms),
+                        },
+                    );
+                }
+                NatEvent::InboundDirectUpgrade { peer } => {
+                    reset_responder_bridges(endpoint, &mut responder_bridges, peer);
+                }
+                _ => {}
+            }
             // A reservation that lands late (after the startup wait warned)
             // or is re-acquired after a loss still needs its circuit
             // address printed -- joiners have nothing to paste otherwise.
@@ -362,6 +419,56 @@ fn run_chat(
                 );
             }
         }
+
+        for event in endpoint.take_discovery_events() {
+            match event {
+                DiscoveryEvent::PeerDiscovered { peer, addrs } => {
+                    println!(
+                        "[{role}] discovered peer={} addrs={}",
+                        short(&peer),
+                        addrs.len()
+                    );
+                }
+                DiscoveryEvent::PeerUpdated { peer, addrs } => {
+                    println!(
+                        "[{role}] mesh-updated peer={} addrs={}",
+                        short(&peer),
+                        addrs.len()
+                    );
+                }
+                DiscoveryEvent::PeerExpired { peer } => {
+                    println!("[{role}] peer-expired peer={}", short(&peer));
+                }
+                DiscoveryEvent::DialFailed { peer, reason } => {
+                    eprintln!(
+                        "[{role}] mesh-dial-failed peer={} reason={reason}",
+                        short(&peer)
+                    );
+                }
+                DiscoveryEvent::ProtocolViolation { peer, reason } => {
+                    eprintln!(
+                        "[{role}] discovery-violation peer={} reason={reason}",
+                        short(&peer)
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn reset_responder_bridges(
+    endpoint: &mut Endpoint,
+    bridges: &mut BTreeMap<(PeerId, StreamId), ResponderBridge>,
+    target: &PeerId,
+) {
+    let matches: Vec<_> = bridges
+        .iter()
+        .filter(|(_, bridge)| &bridge.target_peer == target)
+        .map(|(key, _)| key.clone())
+        .collect();
+    for (relay, stream_id) in matches {
+        let _ = endpoint.reset_stream(&relay, stream_id);
+        bridges.remove(&(relay, stream_id));
     }
 }
 

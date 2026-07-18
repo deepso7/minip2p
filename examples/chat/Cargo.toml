@@ -13,5 +13,5 @@ name = "minip2p-chat"
 path = "src/main.rs"
 
 [dependencies]
-minip2p = { path = "../../crates/minip2p", features = ["nat", "pubsub"] }
+minip2p = { path = "../../crates/minip2p", features = ["discovery"] }
 minip2p-example-common = { path = "../common" }

@@ -4,7 +4,9 @@ use libfuzzer_sys::fuzz_target;
 use minip2p_autonat::{AutoNatClient, AutoNatClientInput, AutoNatServer, AutoNatServerInput};
 use minip2p_core::{Multiaddr, PeerId, SansIoProtocol};
 use minip2p_dcutr::{FrameDecode as DcutrFrame, HolePunch};
+use minip2p_discovery::{Beacon, DiscoveryAgent, DiscoveryConfig};
 use minip2p_identify::{IdentifyConfig, IdentifyInput, IdentifyMessage, IdentifyProtocol};
+use minip2p_identity::{KeyType, PublicKey};
 use minip2p_multistream_select::{MultistreamInput, MultistreamSelect};
 use minip2p_relay::{FrameDecode as RelayFrame, HopMessage, StopMessage};
 use minip2p_transport::StreamId;
@@ -18,6 +20,7 @@ fuzz_target!(|data: &[u8]| {
     fuzz_multistream(data);
     fuzz_identify(data);
     fuzz_autonat(data);
+    fuzz_discovery(data);
 
     if let RelayFrame::Complete { payload, .. } = minip2p_relay::decode_frame(data) {
         let _ = HopMessage::decode(payload);
@@ -41,6 +44,21 @@ fn fuzz_multistream(data: &[u8]) {
         while machine.poll_output().is_some() {}
         let _ = machine.take_remaining_buffer();
     }
+}
+
+fn fuzz_discovery(data: &[u8]) {
+    let _ = Beacon::decode(data);
+    let local = PublicKey::new(KeyType::Ed25519, vec![1; 32]);
+    let remote = PublicKey::new(KeyType::Ed25519, vec![2; 32]);
+    let remote_peer = PeerId::from_public_key(&remote);
+    let config = DiscoveryConfig {
+        auto_dial: false,
+        ..DiscoveryConfig::default()
+    };
+    let mut agent = DiscoveryAgent::new(local, config).expect("default discovery config");
+    agent.handle_beacon(&remote_peer, data, true, 0);
+    while agent.poll_action().is_some() {}
+    while agent.poll_event().is_some() {}
 }
 
 /// Exercises both the raw message decoder and the state-machine path that

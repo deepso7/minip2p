@@ -66,6 +66,8 @@ pub enum PubsubEvent {
         /// 8 big-endian bytes, rust-libp2p floodsub 20 random bytes.
         /// Together with `from` it identifies the message for dedup.
         seqno: Vec<u8>,
+        /// Whether the message carried a signature that passed verification.
+        signed: bool,
     },
     /// A peer announced a subscription.
     PeerSubscribed {

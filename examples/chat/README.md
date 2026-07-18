@@ -6,11 +6,13 @@ agent hole-punches direct paths where needed, and messages flood the room
 signed end-to-end (libp2p StrictSign).
 
 ```text
-minip2p-chat host        [--topic <t>] [--nick <n>] [--relay <relay-peer-addr>] [--key <path>] [--listen <quic-multiaddr>]
-minip2p-chat join <addr> [--topic <t>] [--nick <n>] [--relay <peer-addr>] [--key <path>] [--listen <quic-multiaddr>]
+minip2p-chat host        [--topic <t>] [--nick <n>] [--relay <relay-peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--no-mesh]
+minip2p-chat join <addr> [--topic <t>] [--nick <n>] [--relay <peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--no-mesh]
 ```
 
-Type lines on stdin to chat; Ctrl-D leaves.
+Type lines on stdin to chat; Ctrl-D leaves. By default peers advertise addresses
+on a room-scoped discovery topic and form direct leaf-to-leaf mesh edges. Pass
+`--no-mesh` in either mode to preserve the original host-forwarded star.
 
 ## Quickstart (one machine)
 
@@ -27,10 +29,17 @@ $ cargo run -p minip2p-chat -- join /ip4/127.0.0.1/udp/54321/quic-v1/p2p/12D3Koo
 $ cargo run -p minip2p-chat -- join /ip4/127.0.0.1/udp/54321/quic-v1/p2p/12D3KooW… --nick bob
 ```
 
-Lines typed by alice appear at the host and at bob — bob receives them
-*through* the host (floodsub star forwarding); alice sees her own line as a
+Lines typed by alice appear at the host and at bob. Once discovery settles,
+alice and bob have their own direct edge and keep chatting if the host exits;
+alice sees her own line as a
 local `[you]` echo only (no self-delivery). This is exactly what the CI
 e2e test (`tests/chat.rs`) runs.
+
+Discovery filters wildcard listen addresses. For a relay-free mesh, bind an
+explicitly dialable address such as `--listen /ip4/127.0.0.1/udp/0/quic-v1`
+for local testing (or a real interface address across machines). A node with
+only wildcard binds and no AutoNAT-confirmed or relay circuit address can be
+present in the room but cannot be automatically dialed.
 
 ## NAT'd host (relay + hole punch)
 

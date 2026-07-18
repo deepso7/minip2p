@@ -522,6 +522,30 @@ impl<T: Transport> Swarm<T> {
         Ok(())
     }
 
+    /// Resets and forgets a stream whose consumer will never read it again.
+    ///
+    /// This is idempotent with a previously queued reset and removes matching
+    /// events already buffered by both the Sans-I/O core and this driver.
+    pub fn abandon_stream(
+        &mut self,
+        peer_id: &PeerId,
+        stream_id: StreamId,
+    ) -> Result<(), DriverError> {
+        self.core.abandon_stream(peer_id, stream_id)?;
+        self.event_buffer.retain(|event| {
+            !matches!(
+                event,
+                SwarmEvent::StreamReady { peer_id: peer, stream_id: stream, .. }
+                    | SwarmEvent::StreamData { peer_id: peer, stream_id: stream, .. }
+                    | SwarmEvent::StreamRemoteWriteClosed { peer_id: peer, stream_id: stream }
+                    | SwarmEvent::StreamClosed { peer_id: peer, stream_id: stream }
+                    if peer == peer_id && *stream == stream_id
+            )
+        });
+        self.flush_actions();
+        Ok(())
+    }
+
     /// Drive the swarm: poll transport, feed events to core, dispatch
     /// actions, return application-visible events. Must be called repeatedly.
     ///

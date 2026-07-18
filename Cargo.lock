@@ -743,6 +743,7 @@ version = "0.1.0"
 dependencies = [
  "getrandom",
  "minip2p-core",
+ "minip2p-discovery",
  "minip2p-identify",
  "minip2p-identity",
  "minip2p-nat",
@@ -783,6 +784,15 @@ name = "minip2p-dcutr"
 version = "0.1.0"
 dependencies = [
  "minip2p-core",
+ "thiserror",
+]
+
+[[package]]
+name = "minip2p-discovery"
+version = "0.1.0"
+dependencies = [
+ "minip2p-core",
+ "minip2p-identity",
  "thiserror",
 ]
 
