@@ -12,6 +12,9 @@ The agent owns no clock, socket, stream, async task, or executor. Callers supply
 `now_ms`, drain actions/events, and report connection outcomes. Beacons must be
 carried by verified signed pubsub messages and their embedded public key must
 derive the publisher peer id.
+Variable-length libp2p public keys, including RSA keys, are accepted up to the
+overall beacon payload budget; identities that cannot fit are rejected when the
+agent is constructed.
 
 Current limitations: the facade NAT policy uses only its first configured relay;
 wildcard IP listen addresses are not announced unless Identify/AutoNAT supplies a

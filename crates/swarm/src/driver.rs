@@ -531,9 +531,10 @@ impl<T: Transport> Swarm<T> {
         peer_id: &PeerId,
         stream_id: StreamId,
     ) -> Result<(), DriverError> {
-        self.core.abandon_stream(peer_id, stream_id)?;
+        let result = self.core.abandon_stream(peer_id, stream_id);
         self.event_buffer
             .retain(|event| !stream_event_matches(event, peer_id, stream_id));
+        result?;
         self.flush_actions();
         Ok(())
     }

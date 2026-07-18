@@ -12,8 +12,10 @@ pub const MAX_BEACON_SIZE: usize = 8192;
 pub const MAX_BEACON_ADDRS: usize = 64;
 /// Maximum bytes in one encoded multiaddr.
 pub const MAX_ADDR_LEN: usize = 1024;
-/// Maximum bytes in the protobuf-encoded public key.
-pub const MAX_PUBLIC_KEY_LEN: usize = 128;
+/// Maximum bytes in a protobuf-encoded public key that can fill a beacon by itself.
+///
+/// The three remaining bytes encode the field tag and its two-byte length prefix.
+pub const MAX_PUBLIC_KEY_LEN: usize = MAX_BEACON_SIZE - 3;
 
 const WIRE_VARINT: u64 = 0;
 const WIRE_64: u64 = 1;
@@ -255,15 +257,6 @@ mod tests {
         }
         .encode();
         assert!(Beacon::decode(&key).is_ok());
-        let key = Beacon {
-            public_key: vec![0; MAX_PUBLIC_KEY_LEN + 1],
-            addrs: vec![],
-        }
-        .encode();
-        assert_eq!(
-            Beacon::decode(&key),
-            Err(DiscoveryWireError::PublicKeyTooLarge)
-        );
         let addr = Beacon {
             public_key: vec![],
             addrs: vec![vec![0; MAX_ADDR_LEN + 1]],
@@ -282,5 +275,17 @@ mod tests {
             Beacon::decode(&many),
             Err(DiscoveryWireError::TooManyAddresses)
         );
+    }
+
+    #[test]
+    fn accepts_variable_length_public_keys_within_the_beacon_budget() {
+        let key = Beacon {
+            // Large enough to cover ordinary RSA public-key protobufs and to
+            // regress the former 128-byte wire limit.
+            public_key: vec![7; 1_024],
+            addrs: vec![],
+        };
+
+        assert_eq!(Beacon::decode(&key.encode()).unwrap(), key);
     }
 }

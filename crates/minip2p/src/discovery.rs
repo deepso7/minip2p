@@ -834,6 +834,65 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_abandon_stream_purges_focused_wait_buffer_and_future_events() {
+        const PROTOCOL: &str = "/test/endpoint-abandon/1";
+        let (mut owner, mut remote, stream_id) = connected_user_stream(PROTOCOL);
+        let remote_peer = remote.peer_id().clone();
+
+        remote
+            .send_stream(owner.peer_id(), stream_id, b"buffer me".to_vec())
+            .expect("remote sends stream data");
+        let buffer_deadline = Instant::now() + Duration::from_secs(2);
+        while !owner
+            .pending_events
+            .iter()
+            .any(|event| is_stream_event(event, &remote_peer, stream_id))
+        {
+            assert!(
+                Instant::now() < buffer_deadline,
+                "focused wait did not buffer the stream event"
+            );
+            let _ = remote
+                .next_event(Duration::from_millis(10))
+                .expect("remote drives");
+            let _ = owner
+                .next_discovery_event(Duration::from_millis(10))
+                .expect("focused wait drives owner");
+        }
+
+        owner
+            .abandon_stream(&remote_peer, stream_id)
+            .expect("owner abandons stream");
+        assert!(
+            !owner.pending_events.iter().any(|event| is_stream_event(
+                event,
+                &remote_peer,
+                stream_id
+            )),
+            "abandon must purge the endpoint-focused-wait buffer"
+        );
+
+        remote
+            .close_stream_write(owner.peer_id(), stream_id)
+            .expect("remote closes stream write side");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            let _ = remote
+                .next_event(Duration::from_millis(10))
+                .expect("remote drives");
+            if let Some(event) = owner
+                .next_event(Duration::from_millis(10))
+                .expect("owner drives")
+            {
+                assert!(
+                    !is_stream_event(&event, &remote_peer, stream_id),
+                    "abandoned stream event leaked through Endpoint: {event:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn topic_bound_stays_in_lockstep_with_pubsub() {
         assert_eq!(
             minip2p_discovery::MAX_TOPIC_LEN,

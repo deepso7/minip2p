@@ -12,6 +12,7 @@ use minip2p_identity::PublicKey;
 
 use crate::{
     Beacon, DiscoveryAction, DiscoveryConfig, DiscoveryConfigError, DiscoveryEvent, KnownPeer,
+    MAX_PUBLIC_KEY_LEN,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,15 +43,19 @@ pub struct DiscoveryAgent {
 }
 
 impl DiscoveryAgent {
-    /// Constructs an agent after validating its configuration.
+    /// Constructs an agent after validating its configuration and identity size.
     pub fn new(
         public_key: PublicKey,
         config: DiscoveryConfig,
     ) -> Result<Self, DiscoveryConfigError> {
         config.validate()?;
+        let public_key = public_key.encode_protobuf();
+        if public_key.len() > MAX_PUBLIC_KEY_LEN {
+            return Err(DiscoveryConfigError::LocalPublicKeyTooLarge);
+        }
         Ok(Self {
-            local_peer_id: PeerId::from_public_key(&public_key),
-            public_key: public_key.encode_protobuf(),
+            local_peer_id: PeerId::from_public_key_protobuf(&public_key),
+            public_key,
             config,
             local_addrs: Vec::new(),
             next_beacon_at_ms: 0,
@@ -346,6 +351,9 @@ fn normalize_addrs(from: &PeerId, raw: Vec<Vec<u8>>, cap: usize) -> Vec<Multiadd
             Some(Protocol::P2p(_)) => continue,
             _ => addr,
         };
+        if !is_supported_addr(&addr) {
+            continue;
+        }
         if !normalized.contains(&addr) {
             normalized.push(addr);
             if normalized.len() == cap {
@@ -354,6 +362,25 @@ fn normalize_addrs(from: &PeerId, raw: Vec<Vec<u8>>, cap: usize) -> Vec<Multiadd
         }
     }
     normalized
+}
+
+fn is_supported_addr(addr: &Multiaddr) -> bool {
+    if is_wildcard_addr(addr) || addr.is_empty() {
+        return false;
+    }
+    if addr.is_quic_transport() {
+        return true;
+    }
+
+    // Keep canonical relay circuit addresses. They intentionally trigger the
+    // NAT agent's relay leg even though they are not direct QUIC candidates.
+    let protocols = addr.protocols();
+    protocols.len() == 5
+        && protocols[0].is_host()
+        && matches!(protocols[1], Protocol::Udp(_))
+        && matches!(protocols[2], Protocol::QuicV1)
+        && matches!(protocols[3], Protocol::P2p(_))
+        && matches!(protocols[4], Protocol::P2pCircuit)
 }
 
 fn is_wildcard_addr(addr: &Multiaddr) -> bool {
@@ -411,6 +438,27 @@ mod tests {
         assert!(matches!(
             agent.poll_event(),
             Some(DiscoveryEvent::PeerDiscovered { .. })
+        ));
+    }
+
+    #[test]
+    fn variable_length_keys_interoperate_and_oversized_local_keys_are_rejected() {
+        let remote_key = PublicKey::new(KeyType::Rsa, vec![7; 1_024]);
+        let remote = PeerId::from_public_key(&remote_key);
+        let payload = Beacon {
+            public_key: remote_key.encode_protobuf(),
+            addrs: vec![],
+        }
+        .encode();
+        let mut agent = agent_with(DiscoveryConfig::default(), 1);
+
+        agent.handle_beacon(&remote, &payload, true, 1);
+        assert_eq!(agent.known_peers()[0].peer, remote);
+
+        let oversized = PublicKey::new(KeyType::Rsa, vec![0; MAX_PUBLIC_KEY_LEN]);
+        assert!(matches!(
+            DiscoveryAgent::new(oversized, DiscoveryConfig::default()),
+            Err(DiscoveryConfigError::LocalPublicKeyTooLarge)
         ));
     }
 
@@ -654,6 +702,63 @@ mod tests {
         .encode();
         agent.handle_beacon(&remote, &beacon, true, 1);
         assert_eq!(agent.known_peers()[0].addrs.len(), 1);
+    }
+
+    #[test]
+    fn empty_non_quic_and_wildcard_addresses_behave_as_presence() {
+        let mut agent = agent_with(DiscoveryConfig::default(), 1);
+        let remote_key = key(2);
+        let remote = PeerId::from_public_key(&remote_key);
+        let mut non_quic = Multiaddr::from_str("/ip4/127.0.0.1/udp/9").unwrap();
+        non_quic.push(Protocol::P2p(remote.clone()));
+        let mut wildcard = Multiaddr::from_str("/ip4/0.0.0.0/udp/9/quic-v1").unwrap();
+        wildcard.push(Protocol::P2p(remote.clone()));
+        let beacon = Beacon {
+            public_key: remote_key.encode_protobuf(),
+            addrs: vec![vec![], non_quic.to_bytes(), wildcard.to_bytes()],
+        }
+        .encode();
+
+        agent.handle_beacon(&remote, &beacon, true, 1);
+
+        assert!(agent.poll_action().is_none());
+        assert!(matches!(
+            agent.poll_event(),
+            Some(DiscoveryEvent::PeerDiscovered { peer, addrs })
+                if peer == remote && addrs.is_empty()
+        ));
+        assert!(agent.known_peers()[0].addrs.is_empty());
+    }
+
+    #[test]
+    fn canonical_circuit_address_still_triggers_the_relay_leg() {
+        let mut agent = agent_with(DiscoveryConfig::default(), 1);
+        let remote_key = key(2);
+        let remote = PeerId::from_public_key(&remote_key);
+        let relay = PeerId::from_public_key(&key(3));
+        let circuit = Multiaddr::from_protocols(vec![
+            Protocol::Ip4([127, 0, 0, 1]),
+            Protocol::Udp(9),
+            Protocol::QuicV1,
+            Protocol::P2p(relay),
+            Protocol::P2pCircuit,
+            Protocol::P2p(remote.clone()),
+        ]);
+        let beacon = Beacon {
+            public_key: remote_key.encode_protobuf(),
+            addrs: vec![circuit.to_bytes()],
+        }
+        .encode();
+
+        agent.handle_beacon(&remote, &beacon, true, 1);
+
+        assert!(matches!(
+            agent.poll_action(),
+            Some(DiscoveryAction::Dial { peer, addrs })
+                if peer == remote
+                    && addrs.len() == 1
+                    && matches!(addrs[0].protocols().last(), Some(Protocol::P2pCircuit))
+        ));
     }
 
     #[test]

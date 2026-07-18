@@ -65,7 +65,7 @@ impl DiscoveryConfig {
     }
 }
 
-/// Why a [`DiscoveryConfig`] is invalid.
+/// Why a discovery agent cannot be constructed from its configuration and identity.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum DiscoveryConfigError {
     /// The configured pubsub topic is empty.
@@ -86,4 +86,7 @@ pub enum DiscoveryConfigError {
     /// The per-peer address cap must fit the wire-format bound.
     #[error("maximum addresses per peer must be between 1 and MAX_BEACON_ADDRS")]
     InvalidMaxAddrs,
+    /// The local identity cannot fit in a discovery beacon.
+    #[error("local public key exceeds the discovery beacon payload budget")]
+    LocalPublicKeyTooLarge,
 }

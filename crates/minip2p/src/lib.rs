@@ -235,6 +235,19 @@ impl Endpoint {
         self.swarm.reset_stream(peer_id, stream_id)
     }
 
+    /// Resets and forgets an application stream that will no longer be consumed.
+    ///
+    /// Unlike [`Endpoint::reset_stream`], this also discards matching events
+    /// already buffered by the endpoint and suppresses later data, EOF, and
+    /// close events for the stream. Repeated calls are idempotent.
+    pub fn abandon_stream(&mut self, peer_id: &PeerId, stream_id: StreamId) -> Result<(), Error> {
+        let result = self.swarm.abandon_stream(peer_id, stream_id);
+        #[cfg(any(feature = "nat", feature = "pubsub"))]
+        self.pending_events
+            .retain(|event| !event_matches_stream(event, peer_id, stream_id));
+        result
+    }
+
     /// Polls the endpoint once and returns all currently available events.
     ///
     /// With NAT configured, events belonging to the traversal agent are
@@ -882,6 +895,32 @@ impl Endpoint {
             self.swarm
         }
     }
+}
+
+#[cfg(any(feature = "nat", feature = "pubsub"))]
+fn event_matches_stream(event: &Event, peer_id: &PeerId, stream_id: StreamId) -> bool {
+    matches!(
+        event,
+        Event::StreamReady {
+            peer_id: event_peer,
+            stream_id: event_stream,
+            ..
+        }
+            | Event::StreamData {
+                peer_id: event_peer,
+                stream_id: event_stream,
+                ..
+            }
+            | Event::StreamRemoteWriteClosed {
+                peer_id: event_peer,
+                stream_id: event_stream,
+            }
+            | Event::StreamClosed {
+                peer_id: event_peer,
+                stream_id: event_stream,
+            }
+            if event_peer == peer_id && *event_stream == stream_id
+    )
 }
 
 /// Builder for [`Endpoint`].

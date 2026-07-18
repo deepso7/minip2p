@@ -341,7 +341,7 @@ fn run_chat(
             .map(|(key, _)| key.clone())
             .collect();
         for (relay_peer, stream_id) in expired {
-            let _ = endpoint.reset_stream(&relay_peer, stream_id);
+            let _ = endpoint.abandon_stream(&relay_peer, stream_id);
             responder_bridges.remove(&(relay_peer, stream_id));
         }
         if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
@@ -381,7 +381,7 @@ fn run_chat(
             match &event {
                 Event::ConnectionEstablished { peer_id } => {
                     println!("[{role}] connected peer={peer_id}");
-                    reset_responder_bridges(endpoint, &mut responder_bridges, peer_id);
+                    abandon_responder_bridges(endpoint, &mut responder_bridges, peer_id);
                 }
                 Event::ConnectionClosed { peer_id } => {
                     println!("[{role}] disconnected peer={peer_id}");
@@ -436,7 +436,7 @@ fn run_chat(
                     );
                 }
                 NatEvent::InboundDirectUpgrade { peer } => {
-                    reset_responder_bridges(endpoint, &mut responder_bridges, peer);
+                    abandon_responder_bridges(endpoint, &mut responder_bridges, peer);
                 }
                 _ => {}
             }
@@ -490,7 +490,7 @@ fn run_chat(
     }
 }
 
-fn reset_responder_bridges(
+fn abandon_responder_bridges(
     endpoint: &mut Endpoint,
     bridges: &mut BTreeMap<(PeerId, StreamId), ResponderBridge>,
     target: &PeerId,
@@ -501,7 +501,7 @@ fn reset_responder_bridges(
         .map(|(key, _)| key.clone())
         .collect();
     for (relay, stream_id) in matches {
-        let _ = endpoint.reset_stream(&relay, stream_id);
+        let _ = endpoint.abandon_stream(&relay, stream_id);
         bridges.remove(&(relay, stream_id));
     }
 }
