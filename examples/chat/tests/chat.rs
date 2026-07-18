@@ -136,6 +136,12 @@ impl Peer {
         writeln!(stdin, "{text}").expect("write to child stdin");
     }
 
+    fn kill(&mut self) {
+        drop(self.stdin.take());
+        self.child.0.kill().expect("kill child");
+        let _ = self.child.0.wait();
+    }
+
     /// Closes stdin (EOF) and waits for a clean exit.
     fn leave(mut self, deadline: Instant) {
         drop(self.stdin.take());
@@ -169,13 +175,13 @@ fn three_peer_star_chats_end_to_end() {
     let deadline = Instant::now() + TEST_DEADLINE;
 
     // --- 1. Host binds and prints its join address. ---
-    let host = Peer::spawn("host", &["host", "--nick", "hostess"]);
+    let host = Peer::spawn("host", &["host", "--nick", "hostess", "--no-mesh"]);
     let bound = host.wait_line(deadline, |line| line.starts_with("[host] bound="));
     let addr = bound.trim_start_matches("[host] bound=").to_string();
 
     // --- 2. Two joiners dial the host; nobody knows anybody else. ---
-    let mut alice = Peer::spawn("alice", &["join", &addr, "--nick", "alice"]);
-    let mut bob = Peer::spawn("bob", &["join", &addr, "--nick", "bob"]);
+    let mut alice = Peer::spawn("alice", &["join", &addr, "--nick", "alice", "--no-mesh"]);
+    let mut bob = Peer::spawn("bob", &["join", &addr, "--nick", "bob", "--no-mesh"]);
 
     // --- 3. Subscription handshakes settle (floodsub has no history:
     //        publishing earlier would vanish). ---
@@ -214,4 +220,57 @@ fn three_peer_star_chats_end_to_end() {
     alice.leave(deadline);
     bob.leave(deadline);
     host.leave(deadline);
+}
+
+#[test]
+fn three_peer_mesh_survives_host_death() {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let listen = "/ip4/127.0.0.1/udp/0/quic-v1";
+    let mut host = Peer::spawn("host", &["host", "--nick", "hostess", "--listen", listen]);
+    let addr = host
+        .wait_line(deadline, |line| line.starts_with("[host] bound="))
+        .trim_start_matches("[host] bound=")
+        .to_string();
+
+    let mut alice = Peer::spawn(
+        "alice",
+        &["join", &addr, "--nick", "alice", "--listen", listen],
+    );
+    let mut bob = Peer::spawn("bob", &["join", &addr, "--nick", "bob", "--listen", listen]);
+    let alice_id = alice
+        .wait_line(deadline, |line| line.starts_with("[join] us="))
+        .trim_start_matches("[join] us=")
+        .to_string();
+    let bob_id = bob
+        .wait_line(deadline, |line| line.starts_with("[join] us="))
+        .trim_start_matches("[join] us=")
+        .to_string();
+
+    alice.wait_line(deadline, |line| {
+        line.contains("connected peer=") && line.contains(&bob_id)
+    });
+    bob.wait_line(deadline, |line| {
+        line.contains("connected peer=") && line.contains(&alice_id)
+    });
+    alice.wait_line(deadline, |line| {
+        line.contains("peer-subscribed") && line.contains(&bob_id) && line.contains("minip2p-chat")
+    });
+    bob.wait_line(deadline, |line| {
+        line.contains("peer-subscribed")
+            && line.contains(&alice_id)
+            && line.contains("minip2p-chat")
+    });
+
+    host.kill();
+    alice.say("still here");
+    bob.wait_line(deadline, |line| line.contains("alice: still here"));
+    assert_eq!(
+        bob.count_lines(|line| line.contains("alice: still here")),
+        1
+    );
+    bob.say("mesh lives");
+    alice.wait_line(deadline, |line| line.contains("bob: mesh lives"));
+
+    alice.leave(deadline);
+    bob.leave(deadline);
 }

@@ -131,7 +131,7 @@ pub enum MessageVerifyError {
     #[error("message from field is not a valid peer id")]
     InvalidFrom,
     /// The `seqno` field is missing, empty, or longer than
-    /// [`MAX_SEQNO_LEN`] bytes.
+    /// `MAX_SEQNO_LEN` bytes (currently 64).
     #[error("message seqno must be 1..=64 bytes")]
     InvalidSeqno,
     /// The message carries no signature and unsigned messages are refused.
@@ -304,8 +304,8 @@ impl RawMessage {
         Ok(message)
     }
 
-    /// Verifies this message per StrictSign and returns its publisher and
-    /// dedup seqno bytes.
+    /// Verifies this message per StrictSign and returns its publisher,
+    /// dedup seqno bytes, and whether it carried a verified signature.
     ///
     /// Rules (see the crate README for the interop rationale):
     /// - `from` must parse as a peer id; `seqno` must be 1..=64 bytes —
@@ -318,7 +318,10 @@ impl RawMessage {
     /// - The signing key must round-trip to `from`
     ///   (`PeerId::from_public_key(key) == from`) whether it came from the
     ///   `key` field or was recovered from an inline-Ed25519 `from`.
-    pub fn verify(&self, allow_unsigned: bool) -> Result<(PeerId, Vec<u8>), MessageVerifyError> {
+    pub fn verify(
+        &self,
+        allow_unsigned: bool,
+    ) -> Result<(PeerId, Vec<u8>, bool), MessageVerifyError> {
         let from_bytes = self
             .from
             .as_deref()
@@ -338,7 +341,7 @@ impl RawMessage {
                 return Err(MessageVerifyError::KeyWithoutSignature);
             }
             if allow_unsigned {
-                return Ok((from, seqno));
+                return Ok((from, seqno, false));
             }
             return Err(MessageVerifyError::MissingSignature);
         };
@@ -364,7 +367,7 @@ impl RawMessage {
         public_key
             .verify(&self.sign_bytes(), signature)
             .map_err(|_| MessageVerifyError::SignatureInvalid)?;
-        Ok((from, seqno))
+        Ok((from, seqno, true))
     }
 }
 
@@ -817,9 +820,10 @@ mod tests {
         let kp = keypair();
         let message = RawMessage::build_signed(&kp, "chat", b"hello".to_vec(), 42);
         assert!(message.key.is_none(), "key must be omitted on the wire");
-        let (from, seqno) = message.verify(false).expect("verify");
+        let (from, seqno, signed) = message.verify(false).expect("verify");
         assert_eq!(from, kp.peer_id());
         assert_eq!(seqno, 42u64.to_be_bytes().to_vec());
+        assert!(signed);
     }
 
     #[test]
@@ -896,9 +900,10 @@ mod tests {
             unsigned.verify(false),
             Err(MessageVerifyError::MissingSignature)
         );
-        let (from, seqno) = unsigned.verify(true).expect("allow_unsigned accepts");
+        let (from, seqno, signed) = unsigned.verify(true).expect("allow_unsigned accepts");
         assert_eq!(from, kp.peer_id());
         assert_eq!(seqno, 9u64.to_be_bytes().to_vec());
+        assert!(!signed);
 
         // Seqno length is implementation-defined: rust-libp2p floodsub
         // emits 20 random bytes. Anything 1..=64 is accepted.

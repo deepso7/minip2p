@@ -1,0 +1,18 @@
+[package]
+name = "minip2p-discovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = ["std"]
+std = ["minip2p-core/std", "minip2p-identity/std", "thiserror/std"]
+
+[dependencies]
+minip2p-core = { path = "../core", default-features = false }
+minip2p-identity = { path = "../identity", default-features = false }
+thiserror = { version = "2.0.18", default-features = false }

@@ -19,3 +19,7 @@ machine that routes published messages to subscribed peers by flooding.
 - minip2p emits exactly one topic per published message (current go-libp2p
   singular `topic` field); the repeated `topic_ids` form is decoded for
   legacy compatibility.
+Delivered message events include a `signed` flag. It is `true` only when a
+signature was present and verified; accepted unsigned interoperability messages
+carry `false`, allowing higher-level protocols such as peer discovery to require
+authentication independently of application-message policy.

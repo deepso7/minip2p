@@ -26,6 +26,17 @@ Event waits (`next_event`, `wait_peer_ready`, `wait_ping_rtt`) accept an
 `Instant` (absolute deadline), a `Duration` (relative timeout), or
 `minip2p::Deadline::NEVER` to block until the event arrives.
 
+When an application permanently relinquishes a stream, `Endpoint::abandon_stream`
+resets it, purges already-buffered events, and suppresses later stream events.
+Use `Endpoint::reset_stream` when those terminal events should remain visible.
+
+With the `discovery` feature, `.discovery()` enables signed pubsub presence
+beacons, a bounded TTL address book, and caller-driven automatic NAT connects.
+It implies the `nat` and `pubsub` features. Applications can inspect
+`known_peers`, drain `DiscoveryEvent`s, or pass a validated `DiscoveryConfig`
+to select a room-scoped topic and policy. Unsigned discovery beacons are always
+rejected even if unsigned application pubsub messages are allowed.
+
 Built-in protocol ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see
 `minip2p::RESERVED_PROTOCOL_IDS`) belong to the endpoint's own handlers;
 registering one via `EndpointBuilder::protocol` makes the `bind_quic*` step

@@ -5,6 +5,7 @@ members = [
     "crates/autonat",
     "crates/core",
     "crates/dcutr",
+    "crates/discovery",
     "crates/identify",
     "crates/identity",
     "crates/minip2p",

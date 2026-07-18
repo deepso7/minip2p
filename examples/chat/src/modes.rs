@@ -1,6 +1,7 @@
 //! The chat runner: endpoint construction, host/join startup flows, and
 //! the shared stdin-driven chat loop.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::io::BufRead;
 use std::sync::mpsc;
@@ -8,8 +9,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    Endpoint, Event, FloodsubConfig, NatConfig, NatEvent, Path, PeerAddr, PeerId, PublishError,
-    PubsubError, PubsubEvent,
+    DISCOVERY_TOPIC, DiscoveryConfig, DiscoveryEvent, Endpoint, Event, FloodsubConfig, NatConfig,
+    NatEvent, Path, PeerAddr, PeerId, PublishError, PubsubError, PubsubEvent, StreamId,
 };
 
 use minip2p_example_common::{
@@ -29,14 +30,26 @@ const PUNCH_WAIT: Duration = Duration::from_secs(30);
 /// Identify must complete before floodsub can open streams.
 const READY_DEADLINE: Duration = Duration::from_secs(15);
 
+struct ResponderBridge {
+    target_peer: PeerId,
+    cleanup_deadline: Instant,
+}
+
+struct ChatEndpoint {
+    endpoint: Endpoint,
+    responder_bridge_lifetime: Duration,
+}
+
 // --- endpoint construction --------------------------------------------------
 
 fn build_endpoint(
     role: &str,
     relays: &[PeerAddr],
     options: &ChatOptions,
-) -> Result<Endpoint, Box<dyn Error>> {
+) -> Result<ChatEndpoint, Box<dyn Error>> {
     let keypair = load_keypair(options.key_path.as_deref(), role)?;
+    let nat_config = NatConfig::default();
+    let responder_bridge_lifetime = responder_bridge_lifetime(&nat_config);
     let mut builder = Endpoint::builder()
         .identity(keypair)
         .agent_version(AGENT)
@@ -44,18 +57,43 @@ fn build_endpoint(
             allow_unsigned: options.allow_unsigned,
             ..FloodsubConfig::default()
         })
-        .nat_config(NatConfig::default());
+        .nat_config(nat_config);
+    if !options.no_mesh {
+        let room = options
+            .topic
+            .clone()
+            .unwrap_or_else(|| DEFAULT_TOPIC.to_string());
+        builder = builder.discovery_config(DiscoveryConfig {
+            topic: format!("{room}/{DISCOVERY_TOPIC}"),
+            beacon_interval_ms: 2_000,
+            peer_ttl_ms: 10_000,
+            ..DiscoveryConfig::default()
+        })?;
+    }
     for relay in relays {
         builder = builder.relay(relay.clone());
     }
-    match &options.listen_addr {
+    let endpoint = match &options.listen_addr {
         Some(addr) => builder
             .bind_quic_multiaddr(addr)
-            .map_err(|e| format!("quic bind {addr}: {e}").into()),
+            .map_err(|e| format!("quic bind {addr}: {e}"))?,
         None => builder
             .bind_quic_dual_stack()
-            .map_err(|e| format!("quic dual-stack bind: {e}").into()),
-    }
+            .map_err(|e| format!("quic dual-stack bind: {e}"))?,
+    };
+    Ok(ChatEndpoint {
+        endpoint,
+        responder_bridge_lifetime,
+    })
+}
+
+fn responder_bridge_lifetime(config: &NatConfig) -> Duration {
+    Duration::from_millis(
+        config
+            .punch_deadline_ms
+            .saturating_mul(1 + u64::from(config.punch_max_retries))
+            .saturating_add(1_000),
+    )
 }
 
 fn topic_and_nick(options: &ChatOptions, endpoint: &Endpoint) -> (String, String) {
@@ -77,7 +115,10 @@ fn topic_and_nick(options: &ChatOptions, endpoint: &Endpoint) -> (String, String
 /// joiners use.
 pub fn run_host(relay: Option<PeerAddr>, options: ChatOptions) -> Result<(), Box<dyn Error>> {
     let relays: Vec<PeerAddr> = relay.into_iter().collect();
-    let mut endpoint = build_endpoint("host", &relays, &options)?;
+    let ChatEndpoint {
+        mut endpoint,
+        responder_bridge_lifetime,
+    } = build_endpoint("host", &relays, &options)?;
     let peer_addrs = endpoint
         .listen_all()
         .map_err(|e| format!("listen failed: {e}"))?;
@@ -104,7 +145,14 @@ pub fn run_host(relay: Option<PeerAddr>, options: ChatOptions) -> Result<(), Box
         .map_err(|e| format!("subscribe: {e}"))?;
     println!("[host] subscribed topic={topic} nick={nick}");
 
-    run_chat(&mut endpoint, &topic, &nick, "host", relays.first())
+    run_chat(
+        &mut endpoint,
+        &topic,
+        &nick,
+        "host",
+        relays.first(),
+        responder_bridge_lifetime,
+    )
 }
 
 /// Drives the endpoint until the relay reservation lands, printing the
@@ -151,7 +199,10 @@ pub fn run_join(
         relays.push(extra);
     }
 
-    let mut endpoint = build_endpoint("join", &relays, &options)?;
+    let ChatEndpoint {
+        mut endpoint,
+        responder_bridge_lifetime,
+    } = build_endpoint("join", &relays, &options)?;
     // Listening seeds the agent's bound addresses — the local half of the
     // DCUtR candidate set.
     endpoint
@@ -205,7 +256,14 @@ pub fn run_join(
         .map_err(|e| format!("subscribe: {e}"))?;
     println!("[join] subscribed topic={topic} nick={nick}");
 
-    run_chat(&mut endpoint, &topic, &nick, "join", None)
+    run_chat(
+        &mut endpoint,
+        &topic,
+        &nick,
+        "join",
+        None,
+        responder_bridge_lifetime,
+    )
 }
 
 fn wait_for_direct_upgrade(
@@ -259,6 +317,7 @@ fn run_chat(
     nick: &str,
     role: &str,
     relay: Option<&PeerAddr>,
+    responder_bridge_lifetime: Duration,
 ) -> Result<(), Box<dyn Error>> {
     let input = spawn_stdin_reader();
     eprintln!("[{role}] type to chat; Ctrl-D to leave");
@@ -273,8 +332,18 @@ fn run_chat(
     // every connected peer well inside that window.
     const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
     let mut last_keepalive = Instant::now();
+    let mut responder_bridges: BTreeMap<(PeerId, StreamId), ResponderBridge> = BTreeMap::new();
 
     loop {
+        let expired: Vec<_> = responder_bridges
+            .iter()
+            .filter(|(_, bridge)| Instant::now() >= bridge.cleanup_deadline)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (relay_peer, stream_id) in expired {
+            let _ = endpoint.abandon_stream(&relay_peer, stream_id);
+            responder_bridges.remove(&(relay_peer, stream_id));
+        }
         if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
             last_keepalive = Instant::now();
             for peer in endpoint.connected_peers() {
@@ -312,9 +381,11 @@ fn run_chat(
             match &event {
                 Event::ConnectionEstablished { peer_id } => {
                     println!("[{role}] connected peer={peer_id}");
+                    abandon_responder_bridges(endpoint, &mut responder_bridges, peer_id);
                 }
                 Event::ConnectionClosed { peer_id } => {
                     println!("[{role}] disconnected peer={peer_id}");
+                    responder_bridges.retain(|(relay_peer, _), _| relay_peer != peer_id);
                 }
                 Event::Error(error) => {
                     eprintln!("[{role}] error {:?}: {}", error.kind, error.detail);
@@ -349,6 +420,26 @@ fn run_chat(
 
         for event in endpoint.take_nat_events() {
             print_nat_event(role, &event);
+            match &event {
+                NatEvent::InboundRelayCircuit {
+                    peer,
+                    relay,
+                    stream_id,
+                    ..
+                } => {
+                    responder_bridges.insert(
+                        (relay.clone(), *stream_id),
+                        ResponderBridge {
+                            target_peer: peer.clone(),
+                            cleanup_deadline: Instant::now() + responder_bridge_lifetime,
+                        },
+                    );
+                }
+                NatEvent::InboundDirectUpgrade { peer } => {
+                    abandon_responder_bridges(endpoint, &mut responder_bridges, peer);
+                }
+                _ => {}
+            }
             // A reservation that lands late (after the startup wait warned)
             // or is re-acquired after a loss still needs its circuit
             // address printed -- joiners have nothing to paste otherwise.
@@ -362,9 +453,78 @@ fn run_chat(
                 );
             }
         }
+
+        for event in endpoint.take_discovery_events() {
+            match event {
+                DiscoveryEvent::PeerDiscovered { peer, addrs } => {
+                    println!(
+                        "[{role}] discovered peer={} addrs={}",
+                        short(&peer),
+                        addrs.len()
+                    );
+                }
+                DiscoveryEvent::PeerUpdated { peer, addrs } => {
+                    println!(
+                        "[{role}] mesh-updated peer={} addrs={}",
+                        short(&peer),
+                        addrs.len()
+                    );
+                }
+                DiscoveryEvent::PeerExpired { peer } => {
+                    println!("[{role}] peer-expired peer={}", short(&peer));
+                }
+                DiscoveryEvent::DialFailed { peer, reason } => {
+                    eprintln!(
+                        "[{role}] mesh-dial-failed peer={} reason={reason}",
+                        short(&peer)
+                    );
+                }
+                DiscoveryEvent::ProtocolViolation { peer, reason } => {
+                    eprintln!(
+                        "[{role}] discovery-violation peer={} reason={reason}",
+                        short(&peer)
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn abandon_responder_bridges(
+    endpoint: &mut Endpoint,
+    bridges: &mut BTreeMap<(PeerId, StreamId), ResponderBridge>,
+    target: &PeerId,
+) {
+    let matches: Vec<_> = bridges
+        .iter()
+        .filter(|(_, bridge)| &bridge.target_peer == target)
+        .map(|(key, _)| key.clone())
+        .collect();
+    for (relay, stream_id) in matches {
+        let _ = endpoint.abandon_stream(&relay, stream_id);
+        bridges.remove(&(relay, stream_id));
     }
 }
 
 fn short(peer: &PeerId) -> String {
     peer.to_base58().chars().take(8).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn responder_bridge_lifetime_comes_from_the_endpoint_nat_config() {
+        let config = NatConfig {
+            punch_deadline_ms: 7,
+            punch_max_retries: 4,
+            ..NatConfig::default()
+        };
+
+        assert_eq!(
+            responder_bridge_lifetime(&config),
+            Duration::from_millis(1_035)
+        );
+    }
 }

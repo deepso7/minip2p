@@ -18,7 +18,8 @@
 //! 1. perform one mutation (`handle_input` or an application-facing method
 //!    such as `ping`);
 //! 2. drain [`SwarmOutput`] values from [`SwarmCore::poll_output`], executing
-//!    each action and feeding driver results back through `handle_input`;
+//!    each action and feeding driver results back through `handle_input` (or
+//!    [`SwarmCore::reset_stream_failed`] when a reset action is rejected);
 //! 3. repeat output draining until no new outputs are produced.
 //!
 //! After a full drain, [`SwarmCore::is_idle`] returns `true`. Treating that as
@@ -95,6 +96,21 @@ struct PendingOpen {
     target: ProtocolKind,
 }
 
+pub(crate) fn stream_event_matches(
+    event: &SwarmEvent,
+    peer_id: &PeerId,
+    stream_id: StreamId,
+) -> bool {
+    matches!(
+        event,
+        SwarmEvent::StreamReady { peer_id: peer, stream_id: stream, .. }
+            | SwarmEvent::StreamData { peer_id: peer, stream_id: stream, .. }
+            | SwarmEvent::StreamRemoteWriteClosed { peer_id: peer, stream_id: stream }
+            | SwarmEvent::StreamClosed { peer_id: peer, stream_id: stream }
+            if peer == peer_id && *stream == stream_id
+    )
+}
+
 // ---------------------------------------------------------------------------
 // SwarmCore
 // ---------------------------------------------------------------------------
@@ -127,6 +143,10 @@ pub struct SwarmCore {
     outbound_negotiators: BTreeMap<(ConnectionId, StreamId), PendingOutbound>,
     /// Streams that completed negotiation: maps to the owning protocol.
     stream_owner: BTreeMap<(ConnectionId, StreamId), ProtocolKind>,
+    /// User streams for which a reset has already been queued.
+    reset_pending: BTreeSet<(ConnectionId, StreamId)>,
+    /// Streams deliberately forgotten by their consumer until transport close.
+    abandoned_streams: BTreeSet<(ConnectionId, StreamId)>,
     /// Outstanding OpenStream requests keyed by token; populated when the
     /// core emits `SwarmAction::OpenStream` and drained when the driver
     /// reports the allocated stream id back via [`SwarmInput::StreamOpened`].
@@ -190,6 +210,8 @@ impl SwarmCore {
             inbound_negotiators: BTreeMap::new(),
             outbound_negotiators: BTreeMap::new(),
             stream_owner: BTreeMap::new(),
+            reset_pending: BTreeSet::new(),
+            abandoned_streams: BTreeSet::new(),
             pending_opens: BTreeMap::new(),
             next_open_token: 1,
             supported_protocols,
@@ -436,8 +458,65 @@ impl SwarmCore {
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
         let conn_id = self.require_stream_conn(peer_id, stream_id)?;
-        self.actions
-            .push_back(SwarmAction::ResetStream { conn_id, stream_id });
+        if self.reset_pending.insert((conn_id, stream_id)) {
+            self.actions
+                .push_back(SwarmAction::ResetStream { conn_id, stream_id });
+        }
+        Ok(())
+    }
+
+    /// Reports that the transport rejected a queued stream reset.
+    ///
+    /// A driver must call this after executing a [`SwarmAction::ResetStream`]
+    /// action unsuccessfully. The acknowledgment clears the pending marker so
+    /// a later [`reset_stream`](Self::reset_stream) or
+    /// [`abandon_stream`](Self::abandon_stream) call can queue another reset.
+    /// Successful resets need no acknowledgment; their marker is cleared when
+    /// the transport reports that the stream or connection closed.
+    pub fn reset_stream_failed(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
+        self.reset_pending.remove(&(conn_id, stream_id));
+    }
+
+    /// Resets and forgets a stream whose consumer will never read it again.
+    ///
+    /// A reset is queued at most once. Already-buffered events and all later
+    /// data, EOF, and close events for the stream are suppressed.
+    pub fn abandon_stream(
+        &mut self,
+        peer_id: &PeerId,
+        stream_id: StreamId,
+    ) -> Result<(), SwarmError> {
+        // Ownership is relinquished even if the transport has already closed
+        // and forgotten the stream. In that case there is nothing left to
+        // reset, but a terminal event may still be queued for the consumer.
+        self.events
+            .retain(|event| !stream_event_matches(event, peer_id, stream_id));
+        if let Some(key) = self
+            .abandoned_streams
+            .iter()
+            .find(|(conn_id, sid)| {
+                *sid == stream_id && self.conn_to_peer.get(conn_id) == Some(peer_id)
+            })
+            .copied()
+        {
+            if self.reset_pending.insert(key) {
+                self.actions.push_back(SwarmAction::ResetStream {
+                    conn_id: key.0,
+                    stream_id: key.1,
+                });
+            }
+            return Ok(());
+        }
+        let conn_id = self.require_stream_conn(peer_id, stream_id)?;
+        let key = (conn_id, stream_id);
+        if self.reset_pending.insert(key) {
+            self.actions
+                .push_back(SwarmAction::ResetStream { conn_id, stream_id });
+        }
+        self.abandoned_streams.insert(key);
+        self.stream_owner.remove(&key);
+        self.inbound_negotiators.remove(&key);
+        self.outbound_negotiators.remove(&key);
         Ok(())
     }
 
@@ -894,6 +973,8 @@ impl SwarmCore {
         }
         self.conn_to_remote_addr.remove(&old_id);
         self.stream_owner.retain(|(cid, _), _| *cid != old_id);
+        self.reset_pending.retain(|(cid, _)| *cid != old_id);
+        self.abandoned_streams.retain(|(cid, _)| *cid != old_id);
         self.inbound_negotiators
             .retain(|(cid, _), _| *cid != old_id);
         self.outbound_negotiators
@@ -1123,6 +1204,13 @@ impl SwarmCore {
     fn handle_stream_closed(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
         let key = (conn_id, stream_id);
 
+        self.reset_pending.remove(&key);
+        if self.abandoned_streams.remove(&key) {
+            self.inbound_negotiators.remove(&key);
+            self.outbound_negotiators.remove(&key);
+            return;
+        }
+
         if let Some(protocol) = self.stream_owner.remove(&key)
             && let Some(peer_id) = self.conn_to_peer.get(&conn_id).cloned()
         {
@@ -1176,6 +1264,8 @@ impl SwarmCore {
         }
 
         self.stream_owner.retain(|(cid, _), _| *cid != conn_id);
+        self.reset_pending.retain(|(cid, _)| *cid != conn_id);
+        self.abandoned_streams.retain(|(cid, _)| *cid != conn_id);
         self.inbound_negotiators
             .retain(|(cid, _), _| *cid != conn_id);
         self.outbound_negotiators
@@ -1786,6 +1876,123 @@ mod tests {
         core.on_outbound_negotiated(conn_id, stream_id, ProtocolKind::Ping, 0);
 
         assert!(core.ping.is_idle());
+        assert!(core.poll_output().is_none());
+    }
+
+    #[test]
+    fn abandon_stream_is_reset_idempotent_and_suppresses_queued_and_future_events() {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(b"abandoned-peer");
+        let conn = ConnectionId::new(44);
+        let stream = StreamId::new(9);
+        core.conn_to_peer.insert(conn, peer.clone());
+        core.peer_to_conn.insert(peer.clone(), conn);
+        core.stream_owner
+            .insert((conn, stream), ProtocolKind::User("/test/1".into()));
+        core.events.push_back(SwarmEvent::StreamData {
+            peer_id: peer.clone(),
+            stream_id: stream,
+            data: vec![1],
+        });
+
+        core.reset_stream(&peer, stream).unwrap();
+        core.abandon_stream(&peer, stream).unwrap();
+        core.abandon_stream(&peer, stream).unwrap();
+        let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|output| matches!(output, SwarmOutput::Action(SwarmAction::ResetStream { stream_id, .. }) if *stream_id == stream))
+                .count(),
+            1
+        );
+        assert!(
+            !outputs
+                .iter()
+                .any(|output| matches!(output, SwarmOutput::Event(_)))
+        );
+
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn,
+                stream_id: stream,
+                data: vec![2],
+            },
+        );
+        feed(
+            &mut core,
+            TransportEvent::StreamRemoteWriteClosed {
+                id: conn,
+                stream_id: stream,
+            },
+        );
+        feed(
+            &mut core,
+            TransportEvent::StreamClosed {
+                id: conn,
+                stream_id: stream,
+            },
+        );
+        assert!(drain_events(&mut core).is_empty());
+        assert!(!core.abandoned_streams.contains(&(conn, stream)));
+    }
+
+    #[test]
+    fn failed_reset_can_be_retried_before_and_after_abandonment() {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(b"reset-retry-peer");
+        let conn = ConnectionId::new(45);
+        let stream = StreamId::new(10);
+        core.conn_to_peer.insert(conn, peer.clone());
+        core.peer_to_conn.insert(peer.clone(), conn);
+        core.stream_owner
+            .insert((conn, stream), ProtocolKind::User("/test/1".into()));
+
+        core.reset_stream(&peer, stream).unwrap();
+        assert!(matches!(
+            core.poll_output(),
+            Some(SwarmOutput::Action(SwarmAction::ResetStream { .. }))
+        ));
+        core.reset_stream_failed(conn, stream);
+        core.reset_stream(&peer, stream).unwrap();
+        assert!(matches!(
+            core.poll_output(),
+            Some(SwarmOutput::Action(SwarmAction::ResetStream { .. }))
+        ));
+        core.reset_stream_failed(conn, stream);
+        core.abandon_stream(&peer, stream).unwrap();
+        assert!(matches!(
+            core.poll_output(),
+            Some(SwarmOutput::Action(SwarmAction::ResetStream { .. }))
+        ));
+        core.reset_stream_failed(conn, stream);
+        core.abandon_stream(&peer, stream).unwrap();
+        assert!(matches!(
+            core.poll_output(),
+            Some(SwarmOutput::Action(SwarmAction::ResetStream { .. }))
+        ));
+    }
+
+    #[test]
+    fn abandon_purges_a_terminal_event_after_the_stream_was_forgotten() {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(b"closed-before-abandon-peer");
+        let conn = ConnectionId::new(46);
+        let stream = StreamId::new(11);
+        core.conn_to_peer.insert(conn, peer.clone());
+        core.peer_to_conn.insert(peer.clone(), conn);
+        core.stream_owner
+            .insert((conn, stream), ProtocolKind::User("/test/1".into()));
+
+        feed(
+            &mut core,
+            TransportEvent::StreamClosed {
+                id: conn,
+                stream_id: stream,
+            },
+        );
+        assert!(core.abandon_stream(&peer, stream).is_err());
         assert!(core.poll_output().is_none());
     }
 

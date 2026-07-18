@@ -78,7 +78,7 @@ The core is deterministic when callers use a simple mutate-then-drain loop:
 1. Feed exactly one external input into the core with `core.handle_input(...)`, or call one application intent such as `ping`, `open_stream`, or `send_stream`.
 2. Drain `core.poll_output()`.
 3. Execute each `SwarmOutput::Action` against your transport.
-4. Feed driver results back with `SwarmInput::StreamOpened`, `SwarmInput::OpenStreamFailed`, or `SwarmInput::RuntimeError`.
+4. Feed driver results back with `SwarmInput::StreamOpened`, `SwarmInput::OpenStreamFailed`, or `SwarmInput::RuntimeError`. If executing a `SwarmAction::ResetStream` fails, also call `core.reset_stream_failed(conn_id, stream_id)` so a later reset can be retried.
 5. Hand each `SwarmOutput::Event` to the application.
 6. Before waiting on I/O again, `core.is_idle()` should be true.
 

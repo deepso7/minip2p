@@ -141,6 +141,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "minip2p-discovery"
+version = "0.1.0"
+dependencies = [
+ "minip2p-core",
+ "minip2p-identity",
+ "thiserror",
+]
+
+[[package]]
 name = "minip2p-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -148,7 +157,9 @@ dependencies = [
  "minip2p-autonat",
  "minip2p-core",
  "minip2p-dcutr",
+ "minip2p-discovery",
  "minip2p-identify",
+ "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-relay",
  "minip2p-transport",

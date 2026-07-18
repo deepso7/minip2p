@@ -3,8 +3,8 @@
 //! The grammar is:
 //!
 //! ```text
-//! minip2p-chat host        [--topic <t>] [--nick <n>] [--relay <relay-peer-addr>] [--key <path>] [--listen <quic-multiaddr>]
-//! minip2p-chat join <addr> [--topic <t>] [--nick <n>] [--relay <peer-addr>] [--key <path>] [--listen <quic-multiaddr>]
+//! minip2p-chat host        [--topic <t>] [--nick <n>] [--relay <relay-peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--no-mesh]
+//! minip2p-chat join <addr> [--topic <t>] [--nick <n>] [--relay <peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--no-mesh]
 //! ```
 //!
 //! `<addr>` is either the host's printed `bound=` peer-addr, or its
@@ -58,6 +58,8 @@ pub struct ChatOptions {
     /// Accept unsigned messages (rust-libp2p floodsub interop; its
     /// floodsub does not sign). Signed messages are still verified.
     pub allow_unsigned: bool,
+    /// Disable peer discovery and preserve the host-forwarded star topology.
+    pub no_mesh: bool,
 }
 
 /// Parse error surfaced back to `main` so the binary exits with a readable
@@ -103,7 +105,7 @@ fn parse_join(args: Vec<String>) -> Result<Mode, CliError> {
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        if arg == "--allow-unsigned" {
+        if arg == "--allow-unsigned" || arg == "--no-mesh" {
             // Boolean flag: no value follows.
             rest.push(arg.clone());
             i += 1;
@@ -190,6 +192,14 @@ impl Flags {
             match key.as_str() {
                 "--allow-unsigned" => {
                     chat.allow_unsigned = true;
+                    i += 1;
+                    continue;
+                }
+                "--no-mesh" => {
+                    if chat.no_mesh {
+                        return Err(CliError("--no-mesh specified twice".into()));
+                    }
+                    chat.no_mesh = true;
                     i += 1;
                     continue;
                 }
@@ -285,8 +295,8 @@ pub fn usage() -> String {
     "minip2p-chat -- group chat over floodsub with NAT traversal.
 
 USAGE:
-    minip2p-chat host        [--topic <t>] [--nick <n>] [--relay <relay-peer-addr>] [--key <path>] [--listen <quic-multiaddr>]
-    minip2p-chat join <addr> [--topic <t>] [--nick <n>] [--relay <peer-addr>] [--key <path>] [--listen <quic-multiaddr>]
+    minip2p-chat host        [--topic <t>] [--nick <n>] [--relay <relay-peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--no-mesh]
+    minip2p-chat join <addr> [--topic <t>] [--nick <n>] [--relay <peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--no-mesh]
 
 NOTES:
     <addr>    the host's printed `bound=` peer-addr, or its `circuit=`
@@ -301,6 +311,7 @@ NOTES:
     --allow-unsigned
               accept unsigned messages (rust-libp2p floodsub interop;
               signed messages are still verified)
+    --no-mesh preserve the host-forwarded star by disabling peer discovery
 
     Type lines on stdin to chat; EOF (Ctrl-D) exits.
 
@@ -356,5 +367,26 @@ mod tests {
         for raw in cases {
             assert!(parse_join_target(raw).is_err(), "'{raw}' must be rejected");
         }
+    }
+
+    #[test]
+    fn no_mesh_is_boolean_in_every_join_position_and_rejects_duplicates() {
+        let target = format!("{RELAY}/p2p/{PEER_ID}");
+        for args in [
+            vec!["join", "--no-mesh", target.as_str()],
+            vec!["join", target.as_str(), "--no-mesh"],
+            vec!["join", "--allow-unsigned", target.as_str(), "--no-mesh"],
+        ] {
+            let parsed = parse(args.into_iter().map(str::to_string).collect()).unwrap();
+            let Mode::Join { chat, .. } = parsed else {
+                panic!()
+            };
+            assert!(chat.no_mesh);
+        }
+        let duplicate = vec!["host", "--no-mesh", "--no-mesh"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(parse(duplicate).is_err());
     }
 }
