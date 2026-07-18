@@ -156,7 +156,9 @@ impl DiscoveryAgent {
                 addrs: addrs.clone(),
             });
         }
-        self.maybe_dial(from, now_ms);
+        if !addrs.is_empty() {
+            self.maybe_dial(from, now_ms);
+        }
     }
 
     /// Reports that the swarm has a connection to a peer.
@@ -413,6 +415,33 @@ mod tests {
     }
 
     #[test]
+    fn presence_only_beacons_refresh_without_dialing() {
+        let config = DiscoveryConfig {
+            peer_ttl_ms: 5,
+            ..DiscoveryConfig::default()
+        };
+        let mut agent = agent_with(config, 1);
+        agent.handle_tick(0);
+        let _ = agent.poll_action();
+        let (peer, presence) = payload(2, &[]);
+
+        agent.handle_beacon(&peer, &presence, true, 1);
+        assert!(agent.poll_action().is_none());
+        assert_eq!(agent.known_peers().len(), 1);
+        agent.handle_beacon(&peer, &presence, true, 4);
+        assert!(agent.poll_action().is_none());
+        assert_eq!(agent.next_timeout(4), Some(5));
+
+        let (_, with_addr) = payload(2, &["/ip4/127.0.0.1/udp/9/quic-v1"]);
+        agent.handle_beacon(&peer, &with_addr, true, 5);
+        assert!(matches!(
+            agent.poll_action(),
+            Some(DiscoveryAction::Dial { peer: got, addrs })
+                if got == peer && addrs.len() == 1
+        ));
+    }
+
+    #[test]
     fn announces_suffix_filters_wildcard_and_normalizes_snapshot() {
         let config = DiscoveryConfig {
             auto_dial: false,
@@ -479,7 +508,7 @@ mod tests {
             ..DiscoveryConfig::default()
         };
         let mut agent = agent_with(config, 1);
-        let (peer, payload) = payload(2, &[]);
+        let (peer, payload) = payload(2, &["/ip4/127.0.0.1/udp/9/quic-v1"]);
         agent.handle_beacon(&peer, &payload, true, 10);
         assert!(matches!(
             agent.poll_action(),
@@ -634,7 +663,7 @@ mod tests {
             ..DiscoveryConfig::default()
         };
         let mut agent = agent_with(config, 1);
-        let (first, first_payload) = payload(2, &[]);
+        let (first, first_payload) = payload(2, &["/ip4/127.0.0.1/udp/9/quic-v1"]);
         let (second, second_payload) = payload(3, &[]);
         agent.handle_beacon(&first, &first_payload, true, 1);
         agent.handle_beacon(&second, &second_payload, true, 2);

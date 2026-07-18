@@ -3,6 +3,8 @@
 //! Peers periodically advertise signed presence beacons. The state machine
 //! validates identities, maintains a bounded TTL address book, and emits dial
 //! actions without owning sockets, clocks, streams, or an executor.
+//! Address-less beacons refresh presence and TTL state without triggering a
+//! dial request.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 

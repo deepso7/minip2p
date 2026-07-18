@@ -5,6 +5,8 @@ and default topic are wire-compatible with js-libp2p `pubsub-peer-discovery`:
 `Peer { bytes publicKey = 1; repeated bytes addrs = 2; }` on
 `_peer-discovery._p2p._pubsub`. Policy is intentionally different: minip2p keeps
 a TTL address book and can emit automatic dial actions.
+Address-less beacons still refresh peer presence, but never trigger a dial until
+a later beacon supplies at least one normalized address.
 
 The agent owns no clock, socket, stream, async task, or executor. Callers supply
 `now_ms`, drain actions/events, and report connection outcomes. Beacons must be

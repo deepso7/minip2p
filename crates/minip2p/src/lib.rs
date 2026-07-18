@@ -1252,6 +1252,44 @@ mod tests {
             Err(PubsubError::DiscoveryTopicReserved)
         ));
     }
+
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn discovery_focused_waits_preserve_events_and_enforce_the_spin_guard() {
+        let mut endpoint = Endpoint::builder()
+            .discovery()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind discovery endpoint");
+        let unrelated = Ed25519Keypair::generate().peer_id();
+
+        endpoint.pending_events.push_back(Event::ConnectionClosed {
+            peer_id: unrelated.clone(),
+        });
+        assert!(
+            endpoint
+                .next_discovery_event(Duration::from_millis(5))
+                .expect("discovery wait")
+                .is_none(),
+            "a buffered application event must not make next_discovery_event spin"
+        );
+        assert!(matches!(
+            endpoint
+                .next_event(Duration::from_millis(1))
+                .expect("drain buffered event"),
+            Some(Event::ConnectionClosed { peer_id }) if peer_id == unrelated
+        ));
+
+        for _ in 0..RUN_UNTIL_SKIP_LIMIT {
+            endpoint.pending_events.push_back(Event::ConnectionClosed {
+                peer_id: unrelated.clone(),
+            });
+        }
+        assert!(matches!(
+            endpoint.next_discovery_event(Deadline::NEVER),
+            Err(DiscoveryError::Driver(Error::EventBacklogExceeded { limit }))
+                if limit == RUN_UNTIL_SKIP_LIMIT
+        ));
+    }
     #[cfg(feature = "nat")]
     use std::time::Duration;
 
