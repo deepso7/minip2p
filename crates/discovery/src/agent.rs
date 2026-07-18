@@ -77,6 +77,7 @@ impl DiscoveryAgent {
     }
 
     /// Replaces local addresses; an actual change schedules an immediate beacon.
+    /// Unsupported, empty, and wildcard addresses are omitted when publishing.
     pub fn set_local_addrs(&mut self, addrs: &[Multiaddr], now_ms: u64) {
         if self.local_addrs != addrs {
             self.local_addrs = addrs.to_vec();
@@ -267,7 +268,7 @@ impl DiscoveryAgent {
             addrs: Vec::new(),
         };
         for addr in &self.local_addrs {
-            if is_wildcard_addr(addr) {
+            if !is_supported_addr(addr) {
                 continue;
             }
             let mut advertised = addr.clone();
@@ -490,16 +491,26 @@ mod tests {
     }
 
     #[test]
-    fn announces_suffix_filters_wildcard_and_normalizes_snapshot() {
+    fn announces_only_supported_addresses_with_publisher_suffix() {
         let config = DiscoveryConfig {
             auto_dial: false,
             ..DiscoveryConfig::default()
         };
         let mut agent = agent_with(config, 1);
+        let relay = PeerId::from_public_key(&key(3));
         agent.set_local_addrs(
             &[
+                Multiaddr::from_protocols(vec![]),
+                Multiaddr::from_str("/ip4/127.0.0.1/udp/1").unwrap(),
                 Multiaddr::from_str("/ip4/0.0.0.0/udp/1/quic-v1").unwrap(),
                 Multiaddr::from_str("/ip4/127.0.0.1/udp/2/quic-v1").unwrap(),
+                Multiaddr::from_protocols(vec![
+                    Protocol::Ip4([127, 0, 0, 1]),
+                    Protocol::Udp(3),
+                    Protocol::QuicV1,
+                    Protocol::P2p(relay),
+                    Protocol::P2pCircuit,
+                ]),
             ],
             5,
         );
@@ -511,12 +522,21 @@ mod tests {
             panic!()
         };
         let beacon = Beacon::decode(&encoded).unwrap();
-        assert_eq!(beacon.addrs.len(), 1);
-        let advertised = Multiaddr::from_bytes(&beacon.addrs[0]).unwrap();
-        assert_eq!(
-            advertised.protocols().last(),
-            Some(&Protocol::P2p(agent.local_peer_id().clone()))
-        );
+        assert_eq!(beacon.addrs.len(), 2);
+        for advertised in beacon
+            .addrs
+            .iter()
+            .map(|bytes| Multiaddr::from_bytes(bytes).unwrap())
+        {
+            assert_eq!(
+                advertised.protocols().last(),
+                Some(&Protocol::P2p(agent.local_peer_id().clone()))
+            );
+            let without_publisher = Multiaddr::from_protocols(
+                advertised.protocols()[..advertised.protocols().len() - 1].to_vec(),
+            );
+            assert!(is_supported_addr(&without_publisher));
+        }
 
         let (peer, payload) = payload(2, &["/ip4/127.0.0.1/udp/2/quic-v1"]);
         agent.handle_beacon(&peer, &payload, true, 6);
