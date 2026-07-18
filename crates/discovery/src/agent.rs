@@ -255,7 +255,10 @@ impl DiscoveryAgent {
     }
 
     fn build_beacon(&self) -> Beacon {
-        let mut addrs = Vec::new();
+        let mut beacon = Beacon {
+            public_key: self.public_key.clone(),
+            addrs: Vec::new(),
+        };
         for addr in &self.local_addrs {
             if is_wildcard_addr(addr) {
                 continue;
@@ -263,17 +266,18 @@ impl DiscoveryAgent {
             let mut advertised = addr.clone();
             advertised.push(Protocol::P2p(self.local_peer_id.clone()));
             let bytes = advertised.to_bytes();
-            if bytes.len() <= crate::MAX_ADDR_LEN && !addrs.contains(&bytes) {
-                addrs.push(bytes);
-                if addrs.len() == self.config.max_addrs_per_peer {
+            if bytes.len() <= crate::MAX_ADDR_LEN && !beacon.addrs.contains(&bytes) {
+                beacon.addrs.push(bytes);
+                if beacon.encoded_len() > crate::MAX_BEACON_SIZE {
+                    beacon.addrs.pop();
+                    break;
+                }
+                if beacon.addrs.len() == self.config.max_addrs_per_peer {
                     break;
                 }
             }
         }
-        Beacon {
-            public_key: self.public_key.clone(),
-            addrs,
-        }
+        beacon
     }
 
     fn maybe_dial(&mut self, peer: &PeerId, now_ms: u64) {
@@ -443,6 +447,29 @@ mod tests {
             agent.known_peers()[0].addrs[0].to_string(),
             "/ip4/127.0.0.1/udp/2/quic-v1"
         );
+    }
+
+    #[test]
+    fn published_beacon_never_exceeds_decoder_limit() {
+        let mut agent = agent_with(DiscoveryConfig::default(), 1);
+        let addrs = (0..16)
+            .map(|index| {
+                Multiaddr::from_protocols(vec![
+                    Protocol::Dns(format!("{index}{}", "a".repeat(850))),
+                    Protocol::Udp(1),
+                    Protocol::QuicV1,
+                ])
+            })
+            .collect::<Vec<_>>();
+        agent.set_local_addrs(&addrs, 0);
+        agent.handle_tick(0);
+        let Some(DiscoveryAction::PublishBeacon { payload, .. }) = agent.poll_action() else {
+            panic!("expected discovery beacon");
+        };
+
+        assert!(payload.len() <= crate::MAX_BEACON_SIZE);
+        let beacon = Beacon::decode(&payload).expect("agent must publish a decodable beacon");
+        assert!(beacon.addrs.len() < addrs.len());
     }
 
     #[test]

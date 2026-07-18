@@ -24,9 +24,12 @@ pub enum DiscoveryError {
     Driver(#[from] Error),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BridgeState {
-    Live { connect_id: ConnectId },
+    Live {
+        connect_id: ConnectId,
+        target_peer: PeerId,
+    },
     Tombstone,
 }
 
@@ -209,8 +212,13 @@ impl DiscoveryDriver {
                 Path::Relayed {
                     relay, stream_id, ..
                 } => {
-                    self.bridges
-                        .insert((relay, stream_id), BridgeState::Live { connect_id });
+                    self.bridges.insert(
+                        (relay, stream_id),
+                        BridgeState::Live {
+                            connect_id,
+                            target_peer: peer,
+                        },
+                    );
                 }
             },
             NatEvent::PathUpgraded {
@@ -234,7 +242,7 @@ impl DiscoveryDriver {
                     .bridges
                     .iter()
                     .filter(|(_, state)| {
-                        matches!(state, BridgeState::Live { connect_id: id } if *id == connect_id)
+                        matches!(state, BridgeState::Live { connect_id: id, .. } if *id == connect_id)
                     })
                     .map(|(key, _)| key.clone())
                     .collect();
@@ -272,18 +280,13 @@ impl DiscoveryDriver {
             nat.pump(swarm);
             self.inflight.remove(&id);
             for state in self.bridges.values_mut() {
-                if matches!(state, BridgeState::Live { connect_id } if *connect_id == id) {
+                if matches!(state, BridgeState::Live { connect_id, .. } if *connect_id == id) {
                     *state = BridgeState::Tombstone;
                 }
             }
             return;
         }
-        let keys: Vec<_> = self
-            .bridges
-            .iter()
-            .filter(|(_, state)| matches!(state, BridgeState::Live { .. }))
-            .map(|(key, _)| key.clone())
-            .collect();
+        let keys = self.live_bridge_keys_for_peer(peer);
         for key in keys {
             if swarm.reset_stream(&key.0, key.1).is_ok() {
                 self.bridges.insert(key, BridgeState::Tombstone);
@@ -293,13 +296,23 @@ impl DiscoveryDriver {
         }
     }
 
+    fn live_bridge_keys_for_peer(&self, peer: &PeerId) -> Vec<(PeerId, StreamId)> {
+        self.bridges
+            .iter()
+            .filter(|(_, state)| {
+                matches!(state, BridgeState::Live { target_peer, .. } if target_peer == peer)
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     /// Cancels attempts and suppresses every bridge before raw-swarm handoff.
     pub(crate) fn shutdown(&mut self, nat: &mut NatDriver, swarm: &mut Swarm<QuicEndpoint>) {
         let attempts: Vec<ConnectId> = self.inflight.keys().copied().collect();
         for id in attempts {
             nat.agent.cancel(id, nat.now());
             for state in self.bridges.values_mut() {
-                if matches!(state, BridgeState::Live { connect_id } if *connect_id == id) {
+                if matches!(state, BridgeState::Live { connect_id, .. } if *connect_id == id) {
                     *state = BridgeState::Tombstone;
                 }
             }
@@ -346,7 +359,7 @@ mod tests {
         let target = Ed25519Keypair::generate().peer_id();
         let mut nat = NatAgent::new(driver.agent.local_peer_id().clone(), NatConfig::default());
         let connect_id = nat.connect(
-            target,
+            target.clone(),
             Vec::new(),
             Now {
                 mono_ms: 0,
@@ -354,9 +367,13 @@ mod tests {
             },
         );
         let stream_id = StreamId::new(7);
-        driver
-            .bridges
-            .insert((relay.clone(), stream_id), BridgeState::Live { connect_id });
+        driver.bridges.insert(
+            (relay.clone(), stream_id),
+            BridgeState::Live {
+                connect_id,
+                target_peer: target,
+            },
+        );
         assert!(driver.ingest(&SwarmEvent::StreamData {
             peer_id: relay.clone(),
             stream_id,
@@ -389,6 +406,49 @@ mod tests {
             .insert((relay.clone(), StreamId::new(2)), BridgeState::Tombstone);
         driver.observe(&SwarmEvent::ConnectionClosed { peer_id: relay });
         assert!(driver.bridges.is_empty());
+    }
+
+    #[test]
+    fn orphan_bridge_selection_is_scoped_to_target_peer() {
+        let mut driver = driver();
+        let target = Ed25519Keypair::generate().peer_id();
+        let unrelated = Ed25519Keypair::generate().peer_id();
+        let target_relay = Ed25519Keypair::generate().peer_id();
+        let unrelated_relay = Ed25519Keypair::generate().peer_id();
+        let mut nat = NatAgent::new(driver.agent.local_peer_id().clone(), NatConfig::default());
+        let target_id = nat.connect(
+            target.clone(),
+            Vec::new(),
+            Now {
+                mono_ms: 0,
+                unix_secs: None,
+            },
+        );
+        let unrelated_id = nat.connect(
+            unrelated.clone(),
+            Vec::new(),
+            Now {
+                mono_ms: 1,
+                unix_secs: None,
+            },
+        );
+        driver.bridges.insert(
+            (target_relay.clone(), StreamId::new(1)),
+            BridgeState::Live {
+                connect_id: target_id,
+                target_peer: target.clone(),
+            },
+        );
+        driver.bridges.insert(
+            (unrelated_relay, StreamId::new(2)),
+            BridgeState::Live {
+                connect_id: unrelated_id,
+                target_peer: unrelated,
+            },
+        );
+
+        let selected = driver.live_bridge_keys_for_peer(&target);
+        assert_eq!(selected, vec![(target_relay, StreamId::new(1))]);
     }
 
     #[test]

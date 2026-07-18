@@ -31,9 +31,21 @@ pub struct Beacon {
 }
 
 impl Beacon {
+    /// Returns the exact number of bytes produced by [`Self::encode`].
+    pub fn encoded_len(&self) -> usize {
+        let mut len = 0usize;
+        if !self.public_key.is_empty() {
+            len = len.saturating_add(len_field_size(self.public_key.len()));
+        }
+        for addr in &self.addrs {
+            len = len.saturating_add(len_field_size(addr.len()));
+        }
+        len
+    }
+
     /// Encodes the beacon using canonical proto3 field ordering.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(self.encoded_len());
         if !self.public_key.is_empty() {
             write_len_field(1, &self.public_key, &mut out);
         }
@@ -123,6 +135,21 @@ fn write_len_field(field: u64, value: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(value);
 }
 
+fn len_field_size(value_len: usize) -> usize {
+    1usize
+        .saturating_add(varint_size(value_len))
+        .saturating_add(value_len)
+}
+
+fn varint_size(mut value: usize) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
+}
+
 fn write_varint(mut value: u64, out: &mut Vec<u8>) {
     while value >= 0x80 {
         out.push((value as u8) | 0x80);
@@ -197,6 +224,7 @@ mod tests {
             vec![0x0a, 3, 1, 2, 3, 0x12, 2, 4, 5, 0x12, 0]
         );
         assert_eq!(Beacon::decode(&beacon.encode()).unwrap(), beacon);
+        assert_eq!(beacon.encoded_len(), beacon.encode().len());
         assert_eq!(Beacon::decode(&[]).unwrap(), Beacon::default());
     }
 

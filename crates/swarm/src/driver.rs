@@ -13,7 +13,7 @@ use minip2p_identify::{IdentifyConfig, IdentifyMessage};
 use minip2p_ping::{PING_PAYLOAD_LEN, PingConfig};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, WaitOutcome};
 
-use crate::core::SwarmCore;
+use crate::core::{SwarmCore, stream_event_matches};
 use crate::events::{
     SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput, SwarmRuntimeError,
 };
@@ -532,16 +532,8 @@ impl<T: Transport> Swarm<T> {
         stream_id: StreamId,
     ) -> Result<(), DriverError> {
         self.core.abandon_stream(peer_id, stream_id)?;
-        self.event_buffer.retain(|event| {
-            !matches!(
-                event,
-                SwarmEvent::StreamReady { peer_id: peer, stream_id: stream, .. }
-                    | SwarmEvent::StreamData { peer_id: peer, stream_id: stream, .. }
-                    | SwarmEvent::StreamRemoteWriteClosed { peer_id: peer, stream_id: stream }
-                    | SwarmEvent::StreamClosed { peer_id: peer, stream_id: stream }
-                    if peer == peer_id && *stream == stream_id
-            )
-        });
+        self.event_buffer
+            .retain(|event| !stream_event_matches(event, peer_id, stream_id));
         self.flush_actions();
         Ok(())
     }
@@ -846,6 +838,7 @@ impl<T: Transport> Swarm<T> {
             }
             SwarmAction::ResetStream { conn_id, stream_id } => {
                 if let Err(e) = self.transport.reset_stream(conn_id, stream_id) {
+                    self.core.reset_stream_failed(conn_id, stream_id);
                     self.core.handle_input(SwarmInput::RuntimeError(runtime_error(
                         SwarmErrorKind::Transport,
                         Some(conn_id),
@@ -1336,6 +1329,7 @@ mod tests {
         next_stream: u64,
         user_protocol: String,
         failing_stream: Option<StreamId>,
+        reset_calls: usize,
     }
 
     impl FailingSendTransport {
@@ -1350,6 +1344,7 @@ mod tests {
                 next_stream: 1,
                 user_protocol: user_protocol.to_string(),
                 failing_stream: None,
+                reset_calls: 0,
             }
         }
     }
@@ -1432,7 +1427,10 @@ mod tests {
         }
 
         fn reset_stream(&mut self, _: ConnectionId, _: StreamId) -> Result<(), TransportError> {
-            Ok(())
+            self.reset_calls += 1;
+            Err(TransportError::ResourceExhausted {
+                resource: "test reset capacity",
+            })
         }
 
         fn close(&mut self, _: ConnectionId) -> Result<(), TransportError> {
@@ -1444,18 +1442,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn send_stream_transport_failure_is_a_synchronous_error() {
-        const PROTOCOL: &str = "/test/1.0.0";
+    fn ready_user_swarm(protocol: &str) -> (Swarm<FailingSendTransport>, PeerId, StreamId) {
         let remote_peer = Ed25519Keypair::generate().peer_id();
         let keypair = Ed25519Keypair::generate();
         let identify = IdentifyConfig {
             protocol_version: "test/1".into(),
             agent_version: "test/1".into(),
-            protocols: vec![PROTOCOL.into()],
+            protocols: vec![protocol.into()],
             public_key: keypair.public_key().encode_protobuf(),
         };
-        let transport = FailingSendTransport::connected(remote_peer.clone(), PROTOCOL);
+        let transport = FailingSendTransport::connected(remote_peer.clone(), protocol);
         let mut swarm = Swarm::new(
             transport,
             identify,
@@ -1463,12 +1459,12 @@ mod tests {
             keypair.peer_id(),
         );
         swarm
-            .add_protocol(PROTOCOL)
+            .add_protocol(protocol)
             .expect("test protocol id is not reserved");
         swarm.poll().expect("process connected event");
 
         let stream_id = swarm
-            .open_stream(&remote_peer, PROTOCOL)
+            .open_stream(&remote_peer, protocol)
             .expect("open user stream");
         let mut ready = false;
         for _ in 0..5 {
@@ -1486,6 +1482,13 @@ mod tests {
             }
         }
         assert!(ready, "user stream must finish multistream negotiation");
+        (swarm, remote_peer, stream_id)
+    }
+
+    #[test]
+    fn send_stream_transport_failure_is_a_synchronous_error() {
+        const PROTOCOL: &str = "/test/1.0.0";
+        let (mut swarm, remote_peer, stream_id) = ready_user_swarm(PROTOCOL);
 
         // The transport rejects the payload write. Callers that commit
         // state once a stream closes (the pubsub one-shot sender) must see
@@ -1509,6 +1512,21 @@ mod tests {
             )),
             "synchronous Err must suppress the duplicate buffered event"
         );
+    }
+
+    #[test]
+    fn transport_reset_failure_remains_retryable() {
+        const PROTOCOL: &str = "/test/1.0.0";
+        let (mut swarm, remote_peer, stream_id) = ready_user_swarm(PROTOCOL);
+
+        swarm
+            .reset_stream(&remote_peer, stream_id)
+            .expect("reset dispatch is asynchronous");
+        swarm
+            .reset_stream(&remote_peer, stream_id)
+            .expect("failed reset must remain retryable");
+
+        assert_eq!(swarm.transport().reset_calls, 2);
     }
 
     /// A `StreamData` event whose stream id encodes its position, so tests

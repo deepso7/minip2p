@@ -726,9 +726,19 @@ impl Endpoint {
     }
 
     /// Withdraws a pubsub subscription. Returns `Ok(false)` when not
-    /// subscribed.
+    /// subscribed. The configured discovery topic is reserved while
+    /// discovery is enabled and returns
+    /// [`PubsubError::DiscoveryTopicReserved`].
     #[cfg(feature = "pubsub")]
     pub fn unsubscribe(&mut self, topic: &str) -> Result<bool, PubsubError> {
+        #[cfg(feature = "discovery")]
+        if self
+            .discovery
+            .as_ref()
+            .is_some_and(|discovery| discovery.agent.topic() == topic)
+        {
+            return Err(PubsubError::DiscoveryTopicReserved);
+        }
         let Some(pubsub) = self.pubsub.as_mut() else {
             return Err(PubsubError::NotEnabled);
         };
@@ -1220,6 +1230,26 @@ mod tests {
         assert!(matches!(
             Endpoint::builder().discovery_config(config),
             Err(DiscoveryConfigError::ZeroBeaconInterval)
+        ));
+    }
+
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn discovery_topic_cannot_be_unsubscribed_independently() {
+        let topic = "/minip2p/test/discovery";
+        let config = DiscoveryConfig {
+            topic: topic.into(),
+            ..DiscoveryConfig::default()
+        };
+        let mut endpoint = Endpoint::builder()
+            .discovery_config(config)
+            .expect("valid discovery configuration")
+            .bind_quic("127.0.0.1:0")
+            .expect("bind discovery endpoint");
+
+        assert!(matches!(
+            endpoint.unsubscribe(topic),
+            Err(PubsubError::DiscoveryTopicReserved)
         ));
     }
     #[cfg(feature = "nat")]

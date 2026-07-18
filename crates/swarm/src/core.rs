@@ -95,7 +95,11 @@ struct PendingOpen {
     target: ProtocolKind,
 }
 
-fn stream_event_matches(event: &SwarmEvent, peer_id: &PeerId, stream_id: StreamId) -> bool {
+pub(crate) fn stream_event_matches(
+    event: &SwarmEvent,
+    peer_id: &PeerId,
+    stream_id: StreamId,
+) -> bool {
     matches!(
         event,
         SwarmEvent::StreamReady { peer_id: peer, stream_id: stream, .. }
@@ -460,6 +464,12 @@ impl SwarmCore {
         Ok(())
     }
 
+    /// Lets the std driver retry a reset that the transport rejected.
+    #[cfg(feature = "std")]
+    pub(crate) fn reset_stream_failed(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
+        self.reset_pending.remove(&(conn_id, stream_id));
+    }
+
     /// Resets and forgets a stream whose consumer will never read it again.
     ///
     /// A reset is queued at most once. Already-buffered events and all later
@@ -469,9 +479,20 @@ impl SwarmCore {
         peer_id: &PeerId,
         stream_id: StreamId,
     ) -> Result<(), SwarmError> {
-        if self.abandoned_streams.iter().any(|(conn_id, sid)| {
-            *sid == stream_id && self.conn_to_peer.get(conn_id) == Some(peer_id)
-        }) {
+        if let Some(key) = self
+            .abandoned_streams
+            .iter()
+            .find(|(conn_id, sid)| {
+                *sid == stream_id && self.conn_to_peer.get(conn_id) == Some(peer_id)
+            })
+            .copied()
+        {
+            if self.reset_pending.insert(key) {
+                self.actions.push_back(SwarmAction::ResetStream {
+                    conn_id: key.0,
+                    stream_id: key.1,
+                });
+            }
             self.events
                 .retain(|event| !stream_event_matches(event, peer_id, stream_id));
             return Ok(());
@@ -1907,6 +1928,42 @@ mod tests {
         );
         assert!(drain_events(&mut core).is_empty());
         assert!(!core.abandoned_streams.contains(&(conn, stream)));
+    }
+
+    #[test]
+    fn failed_reset_can_be_retried_before_and_after_abandonment() {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(b"reset-retry-peer");
+        let conn = ConnectionId::new(45);
+        let stream = StreamId::new(10);
+        core.conn_to_peer.insert(conn, peer.clone());
+        core.peer_to_conn.insert(peer.clone(), conn);
+        core.stream_owner
+            .insert((conn, stream), ProtocolKind::User("/test/1".into()));
+
+        core.reset_stream(&peer, stream).unwrap();
+        assert!(matches!(
+            core.poll_output(),
+            Some(SwarmOutput::Action(SwarmAction::ResetStream { .. }))
+        ));
+        core.reset_stream_failed(conn, stream);
+        core.reset_stream(&peer, stream).unwrap();
+        assert!(matches!(
+            core.poll_output(),
+            Some(SwarmOutput::Action(SwarmAction::ResetStream { .. }))
+        ));
+        core.reset_stream_failed(conn, stream);
+        core.abandon_stream(&peer, stream).unwrap();
+        assert!(matches!(
+            core.poll_output(),
+            Some(SwarmOutput::Action(SwarmAction::ResetStream { .. }))
+        ));
+        core.reset_stream_failed(conn, stream);
+        core.abandon_stream(&peer, stream).unwrap();
+        assert!(matches!(
+            core.poll_output(),
+            Some(SwarmOutput::Action(SwarmAction::ResetStream { .. }))
+        ));
     }
 
     #[test]

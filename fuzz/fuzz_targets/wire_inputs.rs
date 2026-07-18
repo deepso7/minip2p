@@ -57,6 +57,12 @@ fn fuzz_discovery(data: &[u8]) {
     };
     let mut agent = DiscoveryAgent::new(local, config).expect("default discovery config");
     agent.handle_beacon(&remote_peer, data, true, 0);
+    let authenticated = Beacon {
+        public_key: remote.encode_protobuf(),
+        addrs: vec![data.to_vec()],
+    }
+    .encode();
+    agent.handle_beacon(&remote_peer, &authenticated, true, 1);
     while agent.poll_action().is_some() {}
     while agent.poll_event().is_some() {}
 }

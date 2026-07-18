@@ -25,6 +25,10 @@ pub enum PubsubError {
     /// ([`EndpointBuilder::pubsub`](crate::EndpointBuilder::pubsub)).
     #[error("pubsub is not enabled on this endpoint (EndpointBuilder::pubsub)")]
     NotEnabled,
+    /// The topic is owned by the active discovery driver and cannot be
+    /// withdrawn independently.
+    #[error("cannot unsubscribe from the discovery topic while discovery is enabled")]
+    DiscoveryTopicReserved,
     /// The publish was refused (topic validation, size, backpressure).
     #[error(transparent)]
     Publish(#[from] minip2p_pubsub::PublishError),
