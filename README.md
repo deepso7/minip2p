@@ -26,6 +26,7 @@ Sans-I/O protocol crates (`no_std + alloc`):
 - `crates/transport` (`minip2p-transport`): transport contract, shared lifecycle types (trait + data types only).
 - `crates/tls` (`minip2p-tls`): libp2p TLS certificate generation and peer verification.
 - `crates/noise` (`minip2p-noise`): Sans-I/O libp2p Noise XX security handshake and transport cipher.
+- `crates/yamux` (`minip2p-yamux`): bounded Sans-I/O libp2p Yamux stream multiplexer.
 - `crates/multistream-select` (`minip2p-multistream-select`): `/multistream/1.0.0` negotiation state machine.
 - `crates/ping` (`minip2p-ping`): `/ipfs/ping/1.0.0` state machine with RTT measurement.
 - `crates/identify` (`minip2p-identify`): `/ipfs/id/1.0.0` state machine for protocol and address exchange.

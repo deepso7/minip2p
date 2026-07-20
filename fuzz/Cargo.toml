@@ -24,6 +24,7 @@ minip2p-multistream-select = { path = "../crates/multistream-select" }
 minip2p-noise = { path = "../crates/noise" }
 minip2p-relay = { path = "../crates/relay" }
 minip2p-transport = { path = "../crates/transport" }
+minip2p-yamux = { path = "../crates/yamux" }
 
 [[bin]]
 name = "wire_inputs"

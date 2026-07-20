@@ -1019,6 +1019,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "minip2p-yamux"
+version = "0.1.0"
+dependencies = [
+ "minip2p-core",
+ "thiserror",
+]
+
+[[package]]
 name = "multihash"
 version = "0.19.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
