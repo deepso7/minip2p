@@ -44,6 +44,7 @@ impl CipherState {
                 },
             )
             .map_err(|_| NoiseError::Encryption)?;
+        // No ciphertext was emitted on error, so the nonce is safe to reuse on retry.
         self.nonce += 1;
         Ok(ciphertext)
     }
