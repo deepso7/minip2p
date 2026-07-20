@@ -622,10 +622,11 @@ impl YamuxSession {
     }
 
     fn valid_remote_stream_id(&self, stream: u32) -> bool {
-        match self.role {
-            YamuxRole::Client => stream.is_multiple_of(2),
-            YamuxRole::Server => !stream.is_multiple_of(2),
-        }
+        stream != 0
+            && match self.role {
+                YamuxRole::Client => stream.is_multiple_of(2),
+                YamuxRole::Server => !stream.is_multiple_of(2),
+            }
     }
 
     fn fail_protocol<T>(&mut self, error: YamuxError) -> Result<T, YamuxError> {
@@ -677,6 +678,19 @@ mod tests {
         assert_eq!(client.open_stream().unwrap(), 3);
         assert_eq!(server.open_stream().unwrap(), 2);
         assert_eq!(server.open_stream().unwrap(), 4);
+    }
+
+    #[test]
+    fn remote_stream_ids_exclude_the_reserved_session_id() {
+        let client = YamuxSession::new(YamuxRole::Client);
+        let server = YamuxSession::new(YamuxRole::Server);
+
+        assert!(!client.valid_remote_stream_id(0));
+        assert!(client.valid_remote_stream_id(2));
+        assert!(!client.valid_remote_stream_id(1));
+        assert!(!server.valid_remote_stream_id(0));
+        assert!(server.valid_remote_stream_id(1));
+        assert!(!server.valid_remote_stream_id(2));
     }
 
     #[test]
