@@ -7,6 +7,24 @@ use minip2p_noise::{NoiseConfig, NoiseInput, NoiseOutput, NoiseRole, NoiseSessio
 const FIXTURE: &str = include_str!("fixtures/libp2p-noise-0.46.1.txt");
 
 #[test]
+fn fixture_secrets_and_seed_are_complete() {
+    for (name, byte) in [
+        ("initiator_identity_secret", 11),
+        ("initiator_noise_static_secret", 31),
+        ("initiator_noise_rng_seed", 32),
+        ("responder_identity_secret", 21),
+        ("responder_static_secret", 22),
+        ("responder_ephemeral_secret", 23),
+    ] {
+        assert_eq!(
+            array(name),
+            [byte; 32],
+            "unexpected fixture value for {name}"
+        );
+    }
+}
+
+#[test]
 fn responder_completes_pinned_rust_libp2p_initiator_transcript() {
     assert_eq!(value("producer"), "libp2p-noise-0.46.1");
     let expected_peer = PeerId::from_str(value("initiator_peer")).unwrap();

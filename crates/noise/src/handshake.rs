@@ -36,7 +36,6 @@ pub(crate) struct HandshakeState {
     identity: Ed25519Keypair,
     local_static: [u8; 32],
     local_ephemeral: [u8; 32],
-    remote_static: Option<[u8; 32]>,
     remote_ephemeral: Option<[u8; 32]>,
     expected_peer: Option<PeerId>,
     symmetric: SymmetricState,
@@ -60,7 +59,6 @@ impl HandshakeState {
             identity,
             local_static,
             local_ephemeral,
-            remote_static: None,
             remote_ephemeral: None,
             expected_peer,
             symmetric: SymmetricState::new(),
@@ -147,7 +145,6 @@ impl HandshakeState {
 
         let remote_s_bytes = self.symmetric.decrypt_and_hash(&message[32..80])?;
         let remote_s = exact_array::<32>(&remote_s_bytes, "invalid remote static key")?;
-        self.remote_static = Some(remote_s);
         self.symmetric
             .mix_key(&dh(self.local_ephemeral, remote_s)?)?;
         let payload = self.symmetric.decrypt_and_hash(&message[80..])?;
@@ -175,7 +172,6 @@ impl HandshakeState {
         }
         let remote_s_bytes = self.symmetric.decrypt_and_hash(&message[..48])?;
         let remote_s = exact_array::<32>(&remote_s_bytes, "invalid remote static key")?;
-        self.remote_static = Some(remote_s);
         self.symmetric
             .mix_key(&dh(self.local_ephemeral, remote_s)?)?;
         let payload = self.symmetric.decrypt_and_hash(&message[48..])?;

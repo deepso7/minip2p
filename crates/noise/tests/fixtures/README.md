@@ -19,3 +19,5 @@ The script verifies the crates.io checksum, applies deterministic test-only key
 substitutions to the downloaded producer source, and keeps that source and its
 build output in a temporary directory. The producer also compares minip2p's
 message 2 against a fixed-key `snow` 0.9.6 responder before emitting anything.
+The generator's committed lockfile is resolved for this patched producer
+workflow, which is its supported execution path.

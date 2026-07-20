@@ -14,7 +14,14 @@ archive="$temp_dir/libp2p-noise.crate"
 curl -fsSL \
   "https://static.crates.io/crates/libp2p-noise/libp2p-noise-$version.crate" \
   -o "$archive"
-actual=$(shasum -a 256 "$archive" | awk '{print $1}')
+if command -v sha256sum >/dev/null 2>&1; then
+  actual=$(sha256sum "$archive" | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+  actual=$(shasum -a 256 "$archive" | awk '{print $1}')
+else
+  echo "sha256sum or shasum is required to verify the producer crate" >&2
+  exit 1
+fi
 if [ "$actual" != "$checksum" ]; then
   echo "libp2p-noise checksum mismatch: expected $checksum, got $actual" >&2
   exit 1
@@ -24,13 +31,13 @@ tar -xzf "$archive" -C "$temp_dir"
 producer="$temp_dir/libp2p-noise-$version"
 protocol="$producer/src/protocol.rs"
 
-perl -0pi -e \
+perl -0777pi -e \
   's/let mut sk_bytes = \[0u8; 32\];\n        rand::thread_rng\(\)\.fill\(&mut sk_bytes\);/let mut sk_bytes = [31u8; 32];/' \
   "$protocol"
-perl -0pi -e \
+perl -0777pi -e \
   's/rand::rngs::StdRng::from_entropy\(\)/rand::rngs::StdRng::from_seed([32u8; 32])/' \
   "$protocol"
-perl -0pi -e \
+perl -0777pi -e \
   's/use rand::\{Rng as _, SeedableRng\};/use rand::SeedableRng;/' \
   "$protocol"
 
@@ -43,4 +50,4 @@ fi
 
 CARGO_BUILD_JOBS=1 CARGO_TARGET_DIR="$temp_dir/target" cargo \
   --config "patch.crates-io.libp2p-noise.path='$producer'" \
-  run --quiet --manifest-path "$fixture_dir/generate-libp2p/Cargo.toml"
+  run --locked --quiet --manifest-path "$fixture_dir/generate-libp2p/Cargo.toml"

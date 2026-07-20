@@ -49,6 +49,10 @@ impl NoiseHandshakePayload {
             let field = tag >> 3;
             let wire = tag & 7;
 
+            if field == 0 {
+                return Err(NoiseError::InvalidPayload("invalid field number zero"));
+            }
+
             if matches!(field, 1 | 2 | 4) {
                 if wire != 2 {
                     return Err(NoiseError::InvalidPayload(
@@ -145,5 +149,20 @@ mod tests {
     #[test]
     fn rejects_truncated_payload() {
         assert!(NoiseHandshakePayload::decode(&[0x0a, 0x20, 1]).is_err());
+    }
+
+    #[test]
+    fn rejects_field_number_zero() {
+        let key = Ed25519Keypair::from_secret_key_bytes([3; 32]).public_key();
+        let encoded = NoiseHandshakePayload::new(key, [7; 64]).encode();
+
+        for invalid_field in [[0x00, 0x00], [0x02, 0x00]] {
+            let mut payload = invalid_field.to_vec();
+            payload.extend_from_slice(&encoded);
+            assert_eq!(
+                NoiseHandshakePayload::decode(&payload),
+                Err(NoiseError::InvalidPayload("invalid field number zero"))
+            );
+        }
     }
 }

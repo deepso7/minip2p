@@ -176,11 +176,35 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 fn protobuf_bytes(field: u8, value: &[u8], output: &mut Vec<u8>) {
     output.push((field << 3) | 2);
-    output.push(value.len() as u8);
+    protobuf_uvarint(value.len() as u64, output);
     output.extend_from_slice(value);
+}
+
+fn protobuf_uvarint(mut value: u64, output: &mut Vec<u8>) {
+    while value >= 0x80 {
+        output.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
 }
 
 fn x25519_public(secret: [u8; 32]) -> [u8; 32] {
     use x25519_dalek::{PublicKey, StaticSecret};
     PublicKey::from(&StaticSecret::from(secret)).to_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::protobuf_bytes;
+
+    #[test]
+    fn protobuf_bytes_varint_encodes_multibyte_lengths() {
+        let value = vec![0xaa; 128];
+        let mut encoded = Vec::new();
+
+        protobuf_bytes(2, &value, &mut encoded);
+
+        assert_eq!(&encoded[..3], &[0x12, 0x80, 0x01]);
+        assert_eq!(&encoded[3..], value);
+    }
 }
