@@ -8,6 +8,7 @@ use minip2p_discovery::{Beacon, DiscoveryAgent, DiscoveryConfig};
 use minip2p_identify::{IdentifyConfig, IdentifyInput, IdentifyMessage, IdentifyProtocol};
 use minip2p_identity::{KeyType, PublicKey};
 use minip2p_multistream_select::{MultistreamInput, MultistreamSelect};
+use minip2p_noise::{NoiseConfig, NoiseHandshakePayload, NoiseInput, NoiseRole, NoiseSession};
 use minip2p_relay::{FrameDecode as RelayFrame, HopMessage, StopMessage};
 use minip2p_transport::StreamId;
 
@@ -21,6 +22,7 @@ fuzz_target!(|data: &[u8]| {
     fuzz_identify(data);
     fuzz_autonat(data);
     fuzz_discovery(data);
+    fuzz_noise(data);
 
     if let RelayFrame::Complete { payload, .. } = minip2p_relay::decode_frame(data) {
         let _ = HopMessage::decode(payload);
@@ -111,4 +113,23 @@ fn fuzz_autonat(data: &[u8]) {
 
 fn fuzz_peer_id() -> PeerId {
     PeerId::from_public_key_protobuf(b"minip2p-fuzz-peer")
+}
+
+/// Exercises framing, both XX roles, payload protobuf decoding, and handshake
+/// parsing with arbitrary wire bytes.
+fn fuzz_noise(data: &[u8]) {
+    let _ = NoiseHandshakePayload::decode(data);
+    for role in [NoiseRole::Initiator, NoiseRole::Responder] {
+        let identity = minip2p_identity::Ed25519Keypair::from_secret_key_bytes([1; 32]);
+        let mut session = NoiseSession::new(NoiseConfig {
+            role,
+            identity,
+            static_secret: [2; 32],
+            ephemeral_secret: [3; 32],
+            expected_peer: None,
+        });
+        let _ = session.handle_input(NoiseInput::Start);
+        let _ = session.handle_input(NoiseInput::Data(data.to_vec()));
+        while session.poll_output().is_some() {}
+    }
 }

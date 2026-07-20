@@ -21,6 +21,7 @@ minip2p-discovery = { path = "../crates/discovery", default-features = false }
 minip2p-identity = { path = "../crates/identity", default-features = false }
 minip2p-identify = { path = "../crates/identify" }
 minip2p-multistream-select = { path = "../crates/multistream-select" }
+minip2p-noise = { path = "../crates/noise" }
 minip2p-relay = { path = "../crates/relay" }
 minip2p-transport = { path = "../crates/transport" }
 
