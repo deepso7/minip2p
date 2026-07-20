@@ -243,13 +243,12 @@ impl YamuxSession {
     /// Immediately resets a stream and emits [`YamuxOutput::StreamClosed`].
     pub fn reset(&mut self, stream: u32) -> Result<(), YamuxError> {
         self.ensure_active()?;
-        let mut state = self
+        let state = self
             .streams
             .remove(&stream)
             .ok_or(YamuxError::UnknownStream(stream))?;
         self.total_buffered_send -= state.buffered_send;
-        let flags = state.take_open_flag() | FLAG_RST;
-        self.queue_frame(Frame::data(stream, flags, Vec::new())?);
+        self.queue_frame(Frame::data(stream, FLAG_RST, Vec::new())?);
         self.pending.push_back(YamuxOutput::StreamClosed { stream });
         Ok(())
     }
@@ -266,6 +265,11 @@ impl YamuxSession {
     }
 
     /// Feeds ordered bytes received from the underlying connection.
+    ///
+    /// A protocol error fails the session closed: queued outputs are replaced
+    /// by a protocol GoAway followed by terminal events for tracked streams.
+    /// A caller must therefore tolerate [`YamuxOutput::StreamClosed`] for a
+    /// stream whose queued [`YamuxOutput::IncomingStream`] was discarded.
     pub fn handle_data(&mut self, bytes: &[u8]) -> Result<(), YamuxError> {
         if self.failed {
             return Err(YamuxError::Failed);
@@ -394,6 +398,9 @@ impl YamuxSession {
                 .expect("stream was inserted or checked above");
             if flags & FLAG_ACK != 0 && state.locally_opened {
                 state.acknowledged = true;
+            }
+            if state.remote_write_closed && !frame.payload().is_empty() {
+                return Err(YamuxError::Protocol("data after FIN"));
             }
             let payload_len = frame.value();
             if payload_len > state.receive_window {
@@ -869,7 +876,7 @@ mod tests {
 
         let reset_stream = session.open_stream().unwrap();
         session.reset(reset_stream).unwrap();
-        assert_eq!(decode(&outbound(&mut session)).flags(), FLAG_SYN | FLAG_RST);
+        assert_eq!(decode(&outbound(&mut session)).flags(), FLAG_RST);
         assert_eq!(
             session.poll_output(),
             Some(YamuxOutput::StreamClosed {
@@ -930,6 +937,52 @@ mod tests {
         assert_eq!(go_away.frame_type(), FrameType::GoAway);
         assert_eq!(go_away.value(), 1);
         assert_eq!(server.handle_data(&[]), Err(YamuxError::Failed));
+    }
+
+    #[test]
+    fn non_empty_data_after_remote_fin_is_a_protocol_error() {
+        let mut server = YamuxSession::new(YamuxRole::Server);
+        server
+            .handle_data(
+                &Frame::data(1, FLAG_SYN | FLAG_FIN, b"final".to_vec())
+                    .unwrap()
+                    .encode(),
+            )
+            .unwrap();
+        assert_eq!(
+            server.poll_output(),
+            Some(YamuxOutput::IncomingStream { stream: 1 })
+        );
+        assert_eq!(
+            server.poll_output(),
+            Some(YamuxOutput::Data {
+                stream: 1,
+                data: b"final".to_vec()
+            })
+        );
+        assert_eq!(
+            server.poll_output(),
+            Some(YamuxOutput::RemoteWriteClosed { stream: 1 })
+        );
+
+        server
+            .handle_data(&Frame::data(1, 0, Vec::new()).unwrap().encode())
+            .unwrap();
+        server
+            .handle_data(&Frame::window_update(1, 0, 1).unwrap().encode())
+            .unwrap();
+
+        assert_eq!(
+            server.handle_data(&Frame::data(1, 0, b"late".to_vec()).unwrap().encode()),
+            Err(YamuxError::Protocol("data after FIN"))
+        );
+        let go_away = decode(&outbound(&mut server));
+        assert_eq!(go_away.frame_type(), FrameType::GoAway);
+        assert_eq!(go_away.value(), 1);
+        assert_eq!(
+            server.poll_output(),
+            Some(YamuxOutput::StreamClosed { stream: 1 })
+        );
     }
 
     #[test]

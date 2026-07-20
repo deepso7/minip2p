@@ -1,4 +1,6 @@
-use minip2p_yamux::{FLAG_FIN, FLAG_SYN, FrameDecoder, FrameType, YamuxError};
+use minip2p_yamux::{
+    FLAG_FIN, FLAG_SYN, FrameDecoder, FrameType, YamuxError, YamuxOutput, YamuxRole, YamuxSession,
+};
 
 const FIXTURE: &str = include_str!("fixtures/yamux-0.13.8.txt");
 
@@ -28,6 +30,39 @@ fn decodes_and_reencodes_pinned_upstream_transcript() {
 
     let encoded = [opening.encode(), close.encode(), go_away.encode()].concat();
     assert_eq!(encoded, transcript);
+}
+
+#[test]
+fn session_consumes_pinned_upstream_transcript() {
+    let mut session = YamuxSession::new(YamuxRole::Server);
+    session
+        .handle_data(&hex(value("client_transcript")))
+        .unwrap();
+
+    assert_eq!(
+        session.poll_output(),
+        Some(YamuxOutput::IncomingStream { stream: 1 })
+    );
+    assert_eq!(
+        session.poll_output(),
+        Some(YamuxOutput::Data {
+            stream: 1,
+            data: b"fixture-data".to_vec(),
+        })
+    );
+    assert_eq!(
+        session.poll_output(),
+        Some(YamuxOutput::RemoteWriteClosed { stream: 1 })
+    );
+    assert_eq!(
+        session.poll_output(),
+        Some(YamuxOutput::GoAwayReceived { code: 0 })
+    );
+    assert_eq!(
+        session.poll_output(),
+        Some(YamuxOutput::StreamClosed { stream: 1 })
+    );
+    assert_eq!(session.poll_output(), None);
 }
 
 fn value(name: &str) -> &str {
