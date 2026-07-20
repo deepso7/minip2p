@@ -93,6 +93,15 @@ The environment mirrors `examples/peer`'s live runs (AWS relay, home
 network, mobile hotspot; VPN users: pin `--listen` to a real interface
 address if v6 default routes are hijacked).
 
+Two deployment details surfaced during live validation:
+
+- EC2 hairpin NAT can make a chat host colocated with its relay appear at its
+  VPC-private address. Remote peers cannot use that address for DCUtR; run the
+  chat host and relay on separate boxes, or have peers join the host directly.
+- A rust-libp2p relay listening on `/ip6/::/udp/<port>/quic-v1` is IPv6-only;
+  it rejects IPv4-mapped traffic. Configure an explicit IPv4 listener as well
+  when IPv4 clients must reach the relay.
+
 1. **Open-internet star**: `host --listen /ip4/0.0.0.0/udp/4001/quic-v1`
    on a public box. The printed `bound=` address is rewritten to loopback
    (it is meant for same-host joins); remote joiners build their address
