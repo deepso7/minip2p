@@ -507,12 +507,29 @@ fn abandon_responder_bridges(
 }
 
 fn short(peer: &PeerId) -> String {
-    peer.to_base58().chars().take(8).collect()
+    const DISPLAY_LEN: usize = 8;
+
+    let encoded = peer.to_base58();
+    // Base58 is ASCII, so this byte offset is always a character boundary.
+    encoded[encoded.len().saturating_sub(DISPLAY_LEN)..].to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minip2p::Ed25519Keypair;
+
+    #[test]
+    fn short_peer_ids_use_the_distinguishing_suffix() {
+        let first = Ed25519Keypair::from_secret_key_bytes([1; 32]).peer_id();
+        let second = Ed25519Keypair::from_secret_key_bytes([2; 32]).peer_id();
+
+        assert_eq!(short(&first).len(), 8);
+        assert_eq!(short(&second).len(), 8);
+        assert_ne!(short(&first), short(&second));
+        assert!(first.to_base58().ends_with(&short(&first)));
+        assert!(second.to_base58().ends_with(&short(&second)));
+    }
 
     #[test]
     fn responder_bridge_lifetime_comes_from_the_endpoint_nat_config() {
