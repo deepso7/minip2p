@@ -26,7 +26,7 @@ test:
 
 check-nostd:
     rustup target add thumbv7em-none-eabi
-    cargo check --no-default-features --target thumbv7em-none-eabi -p minip2p-core -p minip2p-identity -p minip2p-transport -p minip2p-tls -p minip2p-noise -p minip2p-identify -p minip2p-multistream-select -p minip2p-ping -p minip2p-pubsub -p minip2p-discovery -p minip2p-relay -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm -p minip2p-nat
+    cargo check --no-default-features --target thumbv7em-none-eabi -p minip2p-core -p minip2p-identity -p minip2p-transport -p minip2p-tls -p minip2p-noise -p minip2p-yamux -p minip2p-identify -p minip2p-multistream-select -p minip2p-ping -p minip2p-pubsub -p minip2p-discovery -p minip2p-relay -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm -p minip2p-nat
 
 peer-ping:
     cargo test -p minip2p-peer --test ping

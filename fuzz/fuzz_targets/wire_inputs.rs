@@ -11,6 +11,7 @@ use minip2p_multistream_select::{MultistreamInput, MultistreamSelect};
 use minip2p_noise::{NoiseConfig, NoiseHandshakePayload, NoiseInput, NoiseRole, NoiseSession};
 use minip2p_relay::{FrameDecode as RelayFrame, HopMessage, StopMessage};
 use minip2p_transport::StreamId;
+use minip2p_yamux::{FrameDecoder as YamuxFrameDecoder, YamuxRole, YamuxSession};
 
 fuzz_target!(|data: &[u8]| {
     let _ = Multiaddr::from_bytes(data);
@@ -23,6 +24,7 @@ fuzz_target!(|data: &[u8]| {
     fuzz_autonat(data);
     fuzz_discovery(data);
     fuzz_noise(data);
+    fuzz_yamux(data);
 
     if let RelayFrame::Complete { payload, .. } = minip2p_relay::decode_frame(data) {
         let _ = HopMessage::decode(payload);
@@ -130,6 +132,19 @@ fn fuzz_noise(data: &[u8]) {
         });
         let _ = session.handle_input(NoiseInput::Start);
         let _ = session.handle_input(NoiseInput::Data(data.to_vec()));
+        while session.poll_output().is_some() {}
+    }
+}
+
+/// Exercises the bounded frame decoder and both stream-ID roles.
+fn fuzz_yamux(data: &[u8]) {
+    let mut decoder = YamuxFrameDecoder::new(64 * 1024);
+    decoder.push(data);
+    while matches!(decoder.next_frame(), Ok(Some(_))) {}
+
+    for role in [YamuxRole::Client, YamuxRole::Server] {
+        let mut session = YamuxSession::new(role);
+        let _ = session.handle_data(data);
         while session.poll_output().is_some() {}
     }
 }

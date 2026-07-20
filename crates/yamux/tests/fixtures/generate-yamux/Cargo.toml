@@ -1,0 +1,12 @@
+[workspace]
+
+[package]
+name = "generate-yamux-fixture"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+futures = "=0.3.31"
+yamux = "=0.13.8"

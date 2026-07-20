@@ -299,6 +299,7 @@ dependencies = [
  "minip2p-noise",
  "minip2p-relay",
  "minip2p-transport",
+ "minip2p-yamux",
 ]
 
 [[package]]
@@ -353,6 +354,14 @@ dependencies = [
 
 [[package]]
 name = "minip2p-transport"
+version = "0.1.0"
+dependencies = [
+ "minip2p-core",
+ "thiserror",
+]
+
+[[package]]
+name = "minip2p-yamux"
 version = "0.1.0"
 dependencies = [
  "minip2p-core",

@@ -19,6 +19,7 @@ members = [
     "crates/test-support",
     "crates/tls",
     "crates/transport",
+    "crates/yamux",
     "transports/quic",
     "examples/chat",
     "examples/common",
