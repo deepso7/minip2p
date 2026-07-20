@@ -114,7 +114,10 @@ pub enum NoiseError {
     /// The state machine has already been started.
     #[error("Noise session has already been started")]
     AlreadyStarted,
-    /// An input does not apply to the session's current state.
+    /// An input cannot be handled in the session's current phase.
+    #[error("invalid Noise input: {0}")]
+    InvalidInput(&'static str),
+    /// The session reached an internally inconsistent state.
     #[error("invalid Noise state: {0}")]
     InvalidState(&'static str),
     /// A handshake message arrived in the wrong order.
@@ -152,7 +155,17 @@ pub enum NoiseError {
     Failed,
 }
 
+impl NoiseError {
+    fn is_terminal(&self) -> bool {
+        !matches!(self, Self::AlreadyStarted | Self::InvalidInput(_))
+    }
+}
+
 /// Caller-driven libp2p Noise XX handshake and transport cipher.
+///
+/// Protocol and cryptographic errors permanently fail the session and discard
+/// queued output. Caller-misuse errors ([`NoiseError::AlreadyStarted`] and
+/// [`NoiseError::InvalidInput`]) leave both the session and its output intact.
 pub struct NoiseSession {
     handshake: Option<HandshakeState>,
     send_cipher: Option<CipherState>,
@@ -207,7 +220,7 @@ impl NoiseSession {
 
     fn receive(&mut self, bytes: &[u8]) -> Result<(), NoiseError> {
         if !self.started {
-            return Err(NoiseError::InvalidState("session has not been started"));
+            return Err(NoiseError::InvalidInput("session has not been started"));
         }
         self.decoder.push(bytes);
         while let Some(message) = self.decoder.next_frame() {
@@ -251,7 +264,7 @@ impl NoiseSession {
         let cipher = self
             .send_cipher
             .as_mut()
-            .ok_or(NoiseError::InvalidState("handshake is not complete"))?;
+            .ok_or(NoiseError::InvalidInput("handshake is not complete"))?;
         if plaintext.is_empty() {
             let ciphertext = cipher.encrypt_with_ad(b"", plaintext)?;
             self.pending
@@ -281,7 +294,7 @@ impl SansIoProtocol for NoiseSession {
             NoiseInput::Data(bytes) => self.receive(&bytes),
             NoiseInput::Encrypt(plaintext) => self.encrypt(&plaintext),
         };
-        if result.is_err() {
+        if result.as_ref().is_err_and(NoiseError::is_terminal) {
             self.failed = true;
             self.pending.clear();
         }
@@ -398,6 +411,43 @@ mod tests {
     }
 
     #[test]
+    fn caller_misuse_preserves_pending_output_and_session_usability() {
+        let mut pair = Pair::new();
+
+        assert_eq!(
+            pair.initiator
+                .handle_input(NoiseInput::Encrypt(b"too early".to_vec())),
+            Err(NoiseError::InvalidInput("handshake is not complete"))
+        );
+        assert_eq!(
+            pair.responder.handle_input(NoiseInput::Data(Vec::new())),
+            Err(NoiseError::InvalidInput("session has not been started"))
+        );
+
+        pair.initiator.handle_input(NoiseInput::Start).unwrap();
+        assert_eq!(
+            pair.initiator.handle_input(NoiseInput::Start),
+            Err(NoiseError::AlreadyStarted)
+        );
+        let message1 = outbound(&mut pair.initiator);
+
+        pair.responder.handle_input(NoiseInput::Start).unwrap();
+        pair.responder
+            .handle_input(NoiseInput::Data(message1))
+            .unwrap();
+        let message2 = outbound(&mut pair.responder);
+        pair.initiator
+            .handle_input(NoiseInput::Data(message2))
+            .unwrap();
+        let message3 = outbound(&mut pair.initiator);
+        assert_eq!(handshake_peer(&mut pair.initiator), pair.responder_peer);
+        pair.responder
+            .handle_input(NoiseInput::Data(message3))
+            .unwrap();
+        assert_eq!(handshake_peer(&mut pair.responder), pair.initiator_peer);
+    }
+
+    #[test]
     fn accepts_one_byte_drip_fragmentation() {
         let mut pair = Pair::new();
         pair.initiator.handle_input(NoiseInput::Start).unwrap();
@@ -458,6 +508,10 @@ mod tests {
             Err(NoiseError::NonContributory)
         );
         assert!(responder.poll_output().is_none());
+        assert_eq!(
+            responder.handle_input(NoiseInput::Start),
+            Err(NoiseError::Failed)
+        );
     }
 
     #[test]
