@@ -379,11 +379,11 @@ fn run_chat(
 
         if let Some(event) = endpoint.next_event(Duration::from_millis(100))? {
             match &event {
-                Event::ConnectionEstablished { peer_id } => {
+                Event::ConnectionEstablished { peer_id, .. } => {
                     println!("[{role}] connected peer={peer_id}");
                     abandon_responder_bridges(endpoint, &mut responder_bridges, peer_id);
                 }
-                Event::ConnectionClosed { peer_id } => {
+                Event::ConnectionClosed { peer_id, .. } => {
                     println!("[{role}] disconnected peer={peer_id}");
                     responder_bridges.retain(|(relay_peer, _), _| relay_peer != peer_id);
                 }

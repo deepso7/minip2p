@@ -47,6 +47,7 @@ fn drain_events(a: &mut FloodsubAgent) -> Vec<PubsubEvent> {
 fn connect(a: &mut FloodsubAgent, peer: &PeerId, now: u64) {
     a.handle_event(
         &SwarmEvent::ConnectionEstablished {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: peer.clone(),
         },
         now,
@@ -89,6 +90,7 @@ fn negotiate_send(
     a.stream_open_result(peer, token, Ok(stream_id), now);
     let claimed = a.handle_event(
         &SwarmEvent::StreamReady {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: peer.clone(),
             stream_id,
             protocol_id: FLOODSUB_PROTOCOL_ID.to_string(),
@@ -121,6 +123,7 @@ fn complete_send(
     let frame = negotiate_send(a, peer, stream_id, now)?;
     a.handle_event(
         &SwarmEvent::StreamClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: peer.clone(),
             stream_id,
         },
@@ -133,6 +136,7 @@ fn complete_send(
 fn inbound_open(a: &mut FloodsubAgent, peer: &PeerId, stream_id: StreamId, now: u64) -> bool {
     a.handle_event(
         &SwarmEvent::StreamReady {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: peer.clone(),
             stream_id,
             protocol_id: FLOODSUB_PROTOCOL_ID.to_string(),
@@ -145,6 +149,7 @@ fn inbound_open(a: &mut FloodsubAgent, peer: &PeerId, stream_id: StreamId, now: 
 fn inbound_data(a: &mut FloodsubAgent, peer: &PeerId, stream_id: StreamId, data: &[u8], now: u64) {
     let claimed = a.handle_event(
         &SwarmEvent::StreamData {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: peer.clone(),
             stream_id,
             data: data.to_vec(),
@@ -208,6 +213,7 @@ fn connect_subscribed(
         a.stream_open_result(peer, token, Ok(snapshot_stream), now);
         a.handle_event(
             &SwarmEvent::StreamReady {
+                conn_id: minip2p_transport::ConnectionId::new(1),
                 peer_id: peer.clone(),
                 stream_id: snapshot_stream,
                 protocol_id: FLOODSUB_PROTOCOL_ID.to_string(),
@@ -217,6 +223,7 @@ fn connect_subscribed(
         );
         a.handle_event(
             &SwarmEvent::StreamClosed {
+                conn_id: minip2p_transport::ConnectionId::new(1),
                 peer_id: peer.clone(),
                 stream_id: snapshot_stream,
             },
@@ -313,6 +320,7 @@ fn mid_flight_subscription_change_commits_the_sent_snapshot_only() {
     // Close commits the {a} snapshot, then the next RPC diffs {a} -> {b}.
     a.handle_event(
         &SwarmEvent::StreamClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
             stream_id: stream,
         },
@@ -347,6 +355,7 @@ fn second_publish_waits_for_stream_closed_not_remote_write_closed() {
     // Remote half-close alone must not advance the queue.
     a.handle_event(
         &SwarmEvent::StreamRemoteWriteClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
             stream_id: stream,
         },
@@ -357,6 +366,7 @@ fn second_publish_waits_for_stream_closed_not_remote_write_closed() {
     // The terminal close does.
     a.handle_event(
         &SwarmEvent::StreamClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
             stream_id: stream,
         },
@@ -381,6 +391,7 @@ fn stream_closed_in_negotiating_discards_without_committing() {
     // Closed before StreamReady: the frame was never sent.
     a.handle_event(
         &SwarmEvent::StreamClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
             stream_id: stream,
         },
@@ -586,6 +597,7 @@ fn malformed_rpc_resets_the_stream_and_keeps_owning_it() {
     // Late events on the rejected stream stay claimed and quiet.
     assert!(a.handle_event(
         &SwarmEvent::StreamData {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
             stream_id: stream,
             data: vec![1, 2, 3],
@@ -594,6 +606,7 @@ fn malformed_rpc_resets_the_stream_and_keeps_owning_it() {
     ));
     assert!(a.handle_event(
         &SwarmEvent::StreamClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
             stream_id: stream,
         },
@@ -878,6 +891,7 @@ fn inbound_eof_half_closes_locally_and_keeps_the_role_until_the_close() {
     // Clean EOF: we close our write half so the transport can finish.
     assert!(a.handle_event(
         &SwarmEvent::StreamRemoteWriteClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
             stream_id: stream,
         },
@@ -892,6 +906,7 @@ fn inbound_eof_half_closes_locally_and_keeps_the_role_until_the_close() {
     assert!(a.owns_stream(&b, stream));
     assert!(a.handle_event(
         &SwarmEvent::StreamClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
             stream_id: stream,
         },
@@ -912,6 +927,7 @@ fn eof_inside_a_frame_is_a_violation() {
     inbound_data(&mut a, &b, stream, &frame[..frame.len() - 1], 2);
     assert!(a.handle_event(
         &SwarmEvent::StreamRemoteWriteClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
             stream_id: stream,
         },
@@ -1027,7 +1043,13 @@ fn disconnect_and_supersede_emit_one_aggregated_failure() {
     drain_actions(&mut a);
 
     // Supersede: repeat ConnectionEstablished.
-    a.handle_event(&SwarmEvent::ConnectionEstablished { peer_id: b.clone() }, 2);
+    a.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: minip2p_transport::ConnectionId::new(1),
+            peer_id: b.clone(),
+        },
+        2,
+    );
     let events = drain_events(&mut a);
     let failures: Vec<&PubsubEvent> = events
         .iter()
@@ -1047,7 +1069,13 @@ fn disconnect_and_supersede_emit_one_aggregated_failure() {
     connect_subscribed(&mut a, &b, "t", StreamId::new(3), 0);
     a.publish("t", b"one".to_vec(), 1).unwrap();
     drain_actions(&mut a);
-    a.handle_event(&SwarmEvent::ConnectionClosed { peer_id: b.clone() }, 2);
+    a.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
+            peer_id: b.clone(),
+        },
+        2,
+    );
     assert_eq!(
         drain_events(&mut a)
             .iter()
@@ -1062,7 +1090,13 @@ fn peer_ready_after_inbound_traffic_preserves_state() {
     let mut a = agent();
     let b = peer(2);
     // Inbound traffic creates the peer state before PeerReady runs.
-    a.handle_event(&SwarmEvent::ConnectionEstablished { peer_id: b.clone() }, 0);
+    a.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: minip2p_transport::ConnectionId::new(1),
+            peer_id: b.clone(),
+        },
+        0,
+    );
     let stream = StreamId::new(3);
     assert!(inbound_open(&mut a, &b, stream, 1));
     inbound_data(&mut a, &b, stream, &remote_subscribe_frame("t"), 2);
@@ -1182,6 +1216,7 @@ fn foreign_streams_and_events_are_not_claimed() {
     connect(&mut a, &b, 0);
     assert!(!a.handle_event(
         &SwarmEvent::StreamReady {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
             stream_id: StreamId::new(40),
             protocol_id: "/some/app/1".to_string(),
@@ -1191,6 +1226,7 @@ fn foreign_streams_and_events_are_not_claimed() {
     ));
     assert!(!a.handle_event(
         &SwarmEvent::StreamData {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
             stream_id: StreamId::new(40),
             data: vec![1],
@@ -1199,6 +1235,7 @@ fn foreign_streams_and_events_are_not_claimed() {
     ));
     assert!(!a.handle_event(
         &SwarmEvent::StreamClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
             stream_id: StreamId::new(40),
         },
@@ -1371,6 +1408,7 @@ fn send_failure_prevents_the_commit() {
     let (token, _) = open_stream_action(&actions).expect("re-drive re-opens");
     a.handle_event(
         &SwarmEvent::StreamClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
             stream_id: stream,
         },
@@ -1382,6 +1420,7 @@ fn send_failure_prevents_the_commit() {
     a.stream_open_result(&b, token, Ok(retry_stream), 4);
     a.handle_event(
         &SwarmEvent::StreamReady {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
             stream_id: retry_stream,
             protocol_id: FLOODSUB_PROTOCOL_ID.to_string(),
@@ -1403,6 +1442,7 @@ fn send_failure_prevents_the_commit() {
     );
     a.handle_event(
         &SwarmEvent::StreamClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
             stream_id: retry_stream,
         },
@@ -1474,6 +1514,7 @@ fn unrelated_local_stream_ready_leaves_the_sender_intact() {
     // the disposition must stay false and no actions may fire.
     let claimed = a.handle_event(
         &SwarmEvent::StreamReady {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
             stream_id: StreamId::new(77),
             protocol_id: "/other/1.0.0".to_string(),
@@ -1487,6 +1528,7 @@ fn unrelated_local_stream_ready_leaves_the_sender_intact() {
     // The in-flight send still commits normally on its own StreamClosed.
     a.handle_event(
         &SwarmEvent::StreamClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
             stream_id: sent,
         },
@@ -1518,7 +1560,13 @@ fn late_open_result_after_disconnect_resets_the_stream() {
     let actions = drain_actions(&mut a);
     let (token, _) = open_stream_action(&actions).expect("snapshot open queued");
 
-    a.handle_event(&SwarmEvent::ConnectionClosed { peer_id: b.clone() }, 1);
+    a.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
+            peer_id: b.clone(),
+        },
+        1,
+    );
     drain_events(&mut a);
 
     let late = StreamId::new(9);
@@ -1544,7 +1592,13 @@ fn late_open_result_after_supersede_resets_the_stream() {
     let actions = drain_actions(&mut a);
     let (token, _) = open_stream_action(&actions).expect("snapshot open queued");
 
-    a.handle_event(&SwarmEvent::ConnectionEstablished { peer_id: b.clone() }, 1);
+    a.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: minip2p_transport::ConnectionId::new(1),
+            peer_id: b.clone(),
+        },
+        1,
+    );
     drain_events(&mut a);
     drain_actions(&mut a);
 
@@ -1578,7 +1632,10 @@ fn late_open_result_still_resets_after_heavy_connection_churn() {
     // first token's record many times over.
     for i in 0..100u64 {
         a.handle_event(
-            &SwarmEvent::ConnectionEstablished { peer_id: b.clone() },
+            &SwarmEvent::ConnectionEstablished {
+                conn_id: minip2p_transport::ConnectionId::new(1),
+                peer_id: b.clone(),
+            },
             i + 1,
         );
         drain_events(&mut a);

@@ -914,10 +914,12 @@ fn event_matches_stream(event: &Event, peer_id: &PeerId, stream_id: StreamId) ->
             | Event::StreamRemoteWriteClosed {
                 peer_id: event_peer,
                 stream_id: event_stream,
+                ..
             }
             | Event::StreamClosed {
                 peer_id: event_peer,
                 stream_id: event_stream,
+                ..
             }
             if event_peer == peer_id && *event_stream == stream_id
     )
@@ -1310,6 +1312,7 @@ mod tests {
 
         endpoint.pending_events.push_back(Event::ConnectionClosed {
             peer_id: unrelated.clone(),
+            conn_id: ConnectionId::new(1),
         });
         assert!(
             endpoint
@@ -1322,12 +1325,13 @@ mod tests {
             endpoint
                 .next_event(Duration::from_millis(1))
                 .expect("drain buffered event"),
-            Some(Event::ConnectionClosed { peer_id }) if peer_id == unrelated
+            Some(Event::ConnectionClosed { peer_id, .. }) if peer_id == unrelated
         ));
 
         for _ in 0..RUN_UNTIL_SKIP_LIMIT {
             endpoint.pending_events.push_back(Event::ConnectionClosed {
                 peer_id: unrelated.clone(),
+                conn_id: ConnectionId::new(1),
             });
         }
         assert!(matches!(
@@ -1420,6 +1424,7 @@ mod tests {
 
         endpoint.pending_events.push_back(Event::ConnectionClosed {
             peer_id: unrelated.clone(),
+            conn_id: ConnectionId::new(1),
         });
         assert!(
             endpoint
@@ -1432,7 +1437,7 @@ mod tests {
             endpoint
                 .next_event(Duration::from_millis(1))
                 .expect("drain buffered event"),
-            Some(Event::ConnectionClosed { peer_id }) if peer_id == unrelated
+            Some(Event::ConnectionClosed { peer_id, .. }) if peer_id == unrelated
         ));
 
         let id = endpoint
@@ -1448,6 +1453,7 @@ mod tests {
             .clear();
         endpoint.pending_events.push_back(Event::ConnectionClosed {
             peer_id: unrelated.clone(),
+            conn_id: ConnectionId::new(1),
         });
         assert!(
             endpoint
@@ -1460,12 +1466,13 @@ mod tests {
             endpoint
                 .next_event(Duration::from_millis(1))
                 .expect("drain buffered event"),
-            Some(Event::ConnectionClosed { peer_id }) if peer_id == unrelated
+            Some(Event::ConnectionClosed { peer_id, .. }) if peer_id == unrelated
         ));
 
         for _ in 0..RUN_UNTIL_SKIP_LIMIT {
             endpoint.pending_events.push_back(Event::ConnectionClosed {
                 peer_id: unrelated.clone(),
+                conn_id: ConnectionId::new(1),
             });
         }
         assert!(matches!(

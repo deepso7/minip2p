@@ -105,9 +105,29 @@ pub(crate) fn stream_event_matches(
         event,
         SwarmEvent::StreamReady { peer_id: peer, stream_id: stream, .. }
             | SwarmEvent::StreamData { peer_id: peer, stream_id: stream, .. }
-            | SwarmEvent::StreamRemoteWriteClosed { peer_id: peer, stream_id: stream }
-            | SwarmEvent::StreamClosed { peer_id: peer, stream_id: stream }
+            | SwarmEvent::StreamRemoteWriteClosed { peer_id: peer, stream_id: stream, .. }
+            | SwarmEvent::StreamClosed { peer_id: peer, stream_id: stream, .. }
             if peer == peer_id && *stream == stream_id
+    )
+}
+
+fn stream_action_matches(action: &SwarmAction, conn_id: ConnectionId, stream_id: StreamId) -> bool {
+    matches!(
+        action,
+        SwarmAction::SendStream {
+            conn_id: action_conn,
+            stream_id: action_stream,
+            ..
+        }
+            | SwarmAction::CloseStreamWrite {
+                conn_id: action_conn,
+                stream_id: action_stream,
+            }
+            | SwarmAction::ResetStream {
+                conn_id: action_conn,
+                stream_id: action_stream,
+            }
+            if *action_conn == conn_id && *action_stream == stream_id
     )
 }
 
@@ -190,6 +210,10 @@ pub struct SwarmCore {
     // --- Output queues ---
     events: VecDeque<SwarmEvent>,
     actions: VecDeque<SwarmAction>,
+    /// Actions that must not execute until already-queued application events
+    /// have been surfaced. Supersession uses this to expose the old
+    /// connection's eager close before asking the transport to close it.
+    after_event_actions: VecDeque<SwarmAction>,
 }
 
 impl SwarmCore {
@@ -225,6 +249,7 @@ impl SwarmCore {
             established_peers: BTreeSet::new(),
             events: VecDeque::new(),
             actions: VecDeque::new(),
+            after_event_actions: VecDeque::new(),
         }
     }
 
@@ -272,14 +297,20 @@ impl SwarmCore {
 
     /// Returns the next core output, if any.
     ///
-    /// Actions are prioritized over application events because executing an
-    /// action can feed more input back into the core. Once no actions remain,
-    /// events are yielded in FIFO order.
+    /// Actions are normally prioritized over application events because
+    /// executing an action can feed more input back into the core. Connection
+    /// supersession is the one exception: its transport close is deferred
+    /// until the eager old-connection event has been yielded.
     pub fn poll_output(&mut self) -> Option<SwarmOutput> {
         if let Some(action) = self.actions.pop_front() {
             return Some(SwarmOutput::Action(action));
         }
-        self.events.pop_front().map(SwarmOutput::Event)
+        if let Some(event) = self.events.pop_front() {
+            return Some(SwarmOutput::Event(event));
+        }
+        self.after_event_actions
+            .pop_front()
+            .map(SwarmOutput::Action)
     }
 
     /// Returns true when the core has no pending driver actions or
@@ -289,7 +320,7 @@ impl SwarmCore {
     /// have fully drained the core before waiting on sockets, timers, or
     /// application input again.
     pub fn is_idle(&self) -> bool {
-        self.actions.is_empty() && self.events.is_empty()
+        self.actions.is_empty() && self.events.is_empty() && self.after_event_actions.is_empty()
     }
 
     /// Returns the milliseconds from `now_ms` until the earliest internal
@@ -475,6 +506,27 @@ impl SwarmCore {
     /// the transport reports that the stream or connection closed.
     pub fn reset_stream_failed(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
         self.reset_pending.remove(&(conn_id, stream_id));
+    }
+
+    /// Forgets all swarm bookkeeping for a transport stream.
+    ///
+    /// Unlike [`abandon_stream`](Self::abandon_stream), this does not reset
+    /// the stream and does not remove application events that are already
+    /// queued. Pending send, half-close, and reset actions for the stream are
+    /// discarded so ownership transfers without a later swarm-side mutation.
+    /// It is intended for callers that transfer ownership of a raw stream to
+    /// another Sans-I/O protocol layer.
+    pub fn forget_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
+        let key = (conn_id, stream_id);
+        self.stream_owner.remove(&key);
+        self.inbound_negotiators.remove(&key);
+        self.outbound_negotiators.remove(&key);
+        self.reset_pending.remove(&key);
+        self.abandoned_streams.remove(&key);
+        self.actions
+            .retain(|action| !stream_action_matches(action, conn_id, stream_id));
+        self.after_event_actions
+            .retain(|action| !stream_action_matches(action, conn_id, stream_id));
     }
 
     /// Resets and forgets a stream whose consumer will never read it again.
@@ -920,6 +972,7 @@ impl SwarmCore {
             self.established_peers.insert(peer_id.clone());
             self.events.push_back(SwarmEvent::ConnectionEstablished {
                 peer_id: peer_id.clone(),
+                conn_id: id,
             });
 
             // Auto-open identify.
@@ -954,6 +1007,10 @@ impl SwarmCore {
 
     fn supersede_connection(&mut self, old_id: ConnectionId) {
         if let Some(peer_id) = self.conn_to_peer.remove(&old_id) {
+            self.events.push_back(SwarmEvent::ConnectionClosed {
+                peer_id: peer_id.clone(),
+                conn_id: old_id,
+            });
             let pending_ping = self.pending_pings.remove(&peer_id);
             let _ = self.ping.handle_input(PingInput::RemovePeer {
                 peer_id: peer_id.clone(),
@@ -980,7 +1037,7 @@ impl SwarmCore {
         self.outbound_negotiators
             .retain(|(cid, _), _| *cid != old_id);
         self.pending_opens.retain(|_, p| p.conn_id != old_id);
-        self.actions
+        self.after_event_actions
             .push_back(SwarmAction::CloseConnection { conn_id: old_id });
     }
 
@@ -1027,6 +1084,7 @@ impl SwarmCore {
 
         self.events.push_back(SwarmEvent::ConnectionEstablished {
             peer_id: new_peer_id.clone(),
+            conn_id,
         });
 
         self.try_emit_peer_ready(&new_peer_id);
@@ -1050,8 +1108,8 @@ impl SwarmCore {
     fn migrate_buffered_events(&mut self, old: &PeerId, new: &PeerId) {
         for event in &mut self.events {
             match event {
-                SwarmEvent::ConnectionEstablished { peer_id }
-                | SwarmEvent::ConnectionClosed { peer_id }
+                SwarmEvent::ConnectionEstablished { peer_id, .. }
+                | SwarmEvent::ConnectionClosed { peer_id, .. }
                 | SwarmEvent::PingTimeout { peer_id } => {
                     if peer_id == old {
                         *peer_id = new.clone();
@@ -1166,6 +1224,7 @@ impl SwarmCore {
             ProtocolKind::User(_) => {
                 self.events.push_back(SwarmEvent::StreamData {
                     peer_id,
+                    conn_id,
                     stream_id,
                     data,
                 });
@@ -1195,8 +1254,11 @@ impl SwarmCore {
             }
             ProtocolKind::IdentifyResponder => {}
             ProtocolKind::User(_) => {
-                self.events
-                    .push_back(SwarmEvent::StreamRemoteWriteClosed { peer_id, stream_id });
+                self.events.push_back(SwarmEvent::StreamRemoteWriteClosed {
+                    peer_id,
+                    conn_id,
+                    stream_id,
+                });
             }
         }
     }
@@ -1228,8 +1290,11 @@ impl SwarmCore {
                     self.drain_identify_outputs();
                 }
                 ProtocolKind::User(_) => {
-                    self.events
-                        .push_back(SwarmEvent::StreamClosed { peer_id, stream_id });
+                    self.events.push_back(SwarmEvent::StreamClosed {
+                        peer_id,
+                        conn_id,
+                        stream_id,
+                    });
                 }
             }
         }
@@ -1259,7 +1324,7 @@ impl SwarmCore {
                 self.ready_peers.remove(&peer_id);
                 self.established_peers.remove(&peer_id);
                 self.events
-                    .push_back(SwarmEvent::ConnectionClosed { peer_id });
+                    .push_back(SwarmEvent::ConnectionClosed { peer_id, conn_id });
             }
         }
 
@@ -1516,6 +1581,7 @@ impl SwarmCore {
             );
             self.events.push_back(SwarmEvent::StreamReady {
                 peer_id,
+                conn_id,
                 stream_id,
                 protocol_id: protocol.to_string(),
                 initiated_locally: false,
@@ -1582,6 +1648,7 @@ impl SwarmCore {
             ProtocolKind::User(protocol_id) => {
                 self.events.push_back(SwarmEvent::StreamReady {
                     peer_id,
+                    conn_id,
                     stream_id,
                     protocol_id,
                     initiated_locally: true,
@@ -1891,6 +1958,7 @@ mod tests {
             .insert((conn, stream), ProtocolKind::User("/test/1".into()));
         core.events.push_back(SwarmEvent::StreamData {
             peer_id: peer.clone(),
+            conn_id: conn,
             stream_id: stream,
             data: vec![1],
         });
@@ -2123,6 +2191,118 @@ mod tests {
             err,
             SwarmError::StreamNotFound { peer_id: p, stream_id: s }
                 if p == peer_id && s == stream_id
+        ));
+    }
+
+    #[test]
+    fn superseding_connection_reports_old_close_before_new_establishment() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"superseded-peer");
+        let original = ConnectionId::new(20);
+        let replacement = ConnectionId::new(21);
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: original,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+        );
+        let _ = drain_events(&mut core);
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: replacement,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            },
+        );
+        let outputs: Vec<_> = core::iter::from_fn(|| core.poll_output()).collect();
+        let lifecycle: Vec<_> = outputs
+            .iter()
+            .filter_map(|output| match output {
+                SwarmOutput::Event(event @ SwarmEvent::ConnectionEstablished { .. })
+                | SwarmOutput::Event(event @ SwarmEvent::ConnectionClosed { .. }) => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert!(matches!(
+            lifecycle.as_slice(),
+            [
+                SwarmEvent::ConnectionClosed { conn_id: closed, .. },
+                SwarmEvent::ConnectionEstablished { conn_id: second, .. },
+            ] if *closed == original && *second == replacement
+        ));
+        let closed_position = outputs
+            .iter()
+            .position(|output| matches!(output, SwarmOutput::Event(SwarmEvent::ConnectionClosed { conn_id, .. }) if *conn_id == original))
+            .expect("eager close event");
+        let close_action_position = outputs
+            .iter()
+            .position(|output| matches!(output, SwarmOutput::Action(SwarmAction::CloseConnection { conn_id }) if *conn_id == original))
+            .expect("transport close action");
+        assert!(closed_position < close_action_position);
+    }
+
+    #[test]
+    fn forget_stream_drops_bookkeeping_without_reset_or_event_purge() {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(b"transferred-stream-peer");
+        let conn = ConnectionId::new(30);
+        let stream = StreamId::new(7);
+        let key = (conn, stream);
+        core.conn_to_peer.insert(conn, peer.clone());
+        core.peer_to_conn.insert(peer.clone(), conn);
+        core.stream_owner
+            .insert(key, ProtocolKind::User("/test/1".into()));
+        core.inbound_negotiators
+            .insert(key, MultistreamSelect::listener(["/test/1".to_string()]));
+        core.outbound_negotiators.insert(
+            key,
+            PendingOutbound {
+                negotiator: MultistreamSelect::dialer("/test/1"),
+                target: ProtocolKind::User("/test/1".into()),
+            },
+        );
+        core.reset_stream(&peer, stream)
+            .expect("active user stream can be reset");
+        core.abandoned_streams.insert(key);
+        core.actions.push_back(SwarmAction::SendStream {
+            conn_id: conn,
+            stream_id: stream,
+            data: vec![2],
+        });
+        core.actions.push_back(SwarmAction::CloseStreamWrite {
+            conn_id: conn,
+            stream_id: stream,
+        });
+        let other_stream = StreamId::new(8);
+        core.actions.push_back(SwarmAction::ResetStream {
+            conn_id: conn,
+            stream_id: other_stream,
+        });
+        core.events.push_back(SwarmEvent::StreamData {
+            peer_id: peer.clone(),
+            conn_id: conn,
+            stream_id: stream,
+            data: vec![1],
+        });
+
+        core.forget_stream(conn, stream);
+
+        assert!(!core.stream_owner.contains_key(&key));
+        assert!(!core.inbound_negotiators.contains_key(&key));
+        assert!(!core.outbound_negotiators.contains_key(&key));
+        assert!(!core.reset_pending.contains(&key));
+        assert!(!core.abandoned_streams.contains(&key));
+        assert_eq!(core.actions.len(), 1);
+        assert!(matches!(
+            core.actions.front(),
+            Some(SwarmAction::ResetStream { conn_id, stream_id })
+                if *conn_id == conn && *stream_id == other_stream
+        ));
+        assert!(matches!(
+            core.events.front(),
+            Some(SwarmEvent::StreamData { conn_id, stream_id, .. })
+                if *conn_id == conn && *stream_id == stream
         ));
     }
 

@@ -63,13 +63,13 @@ impl DiscoveryDriver {
     pub(crate) fn observe(&mut self, event: &SwarmEvent) {
         let now = self.now_ms();
         match event {
-            SwarmEvent::ConnectionEstablished { peer_id } => {
+            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 // A second establishment supersedes the relay connection that
                 // owned any tracked stream ids.
                 self.bridges.retain(|(relay, _), _| relay != peer_id);
                 self.agent.peer_connected(peer_id, now);
             }
-            SwarmEvent::ConnectionClosed { peer_id } => {
+            SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 self.bridges.retain(|(relay, _), _| relay != peer_id);
                 self.agent.peer_disconnected(peer_id, now);
             }
@@ -83,10 +83,12 @@ impl DiscoveryDriver {
             SwarmEvent::StreamData {
                 peer_id, stream_id, ..
             }
-            | SwarmEvent::StreamRemoteWriteClosed { peer_id, stream_id }
-            | SwarmEvent::StreamClosed { peer_id, stream_id } => {
-                Some((peer_id.clone(), *stream_id))
+            | SwarmEvent::StreamRemoteWriteClosed {
+                peer_id, stream_id, ..
             }
+            | SwarmEvent::StreamClosed {
+                peer_id, stream_id, ..
+            } => Some((peer_id.clone(), *stream_id)),
             _ => None,
         };
         let Some(key) = key else {
@@ -416,8 +418,8 @@ mod tests {
             event,
             Event::StreamReady { peer_id, stream_id: got, .. }
                 | Event::StreamData { peer_id, stream_id: got, .. }
-                | Event::StreamRemoteWriteClosed { peer_id, stream_id: got }
-                | Event::StreamClosed { peer_id, stream_id: got }
+                | Event::StreamRemoteWriteClosed { peer_id, stream_id: got, .. }
+                | Event::StreamClosed { peer_id, stream_id: got, .. }
                 if peer_id == peer && *got == stream_id
         )
     }
@@ -446,15 +448,18 @@ mod tests {
         );
         assert!(driver.ingest(&SwarmEvent::StreamData {
             peer_id: relay.clone(),
+            conn_id: minip2p_transport::ConnectionId::new(1),
             stream_id,
             data: vec![1],
         }));
         assert!(driver.ingest(&SwarmEvent::StreamRemoteWriteClosed {
             peer_id: relay.clone(),
+            conn_id: minip2p_transport::ConnectionId::new(1),
             stream_id,
         }));
         assert!(driver.ingest(&SwarmEvent::StreamClosed {
             peer_id: relay,
+            conn_id: minip2p_transport::ConnectionId::new(1),
             stream_id,
         }));
         assert!(driver.bridges.is_empty());
@@ -469,12 +474,16 @@ mod tests {
             .insert((relay.clone(), StreamId::new(1)), BridgeState::Tombstone);
         driver.observe(&SwarmEvent::ConnectionEstablished {
             peer_id: relay.clone(),
+            conn_id: minip2p_transport::ConnectionId::new(1),
         });
         assert!(driver.bridges.is_empty());
         driver
             .bridges
             .insert((relay.clone(), StreamId::new(2)), BridgeState::Tombstone);
-        driver.observe(&SwarmEvent::ConnectionClosed { peer_id: relay });
+        driver.observe(&SwarmEvent::ConnectionClosed {
+            peer_id: relay,
+            conn_id: minip2p_transport::ConnectionId::new(1),
+        });
         assert!(driver.bridges.is_empty());
     }
 

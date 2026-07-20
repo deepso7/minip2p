@@ -211,6 +211,7 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
     let stream = StreamId::new(88);
     let handled = h.agent.handle_event_with_disposition(
         &SwarmEvent::StreamReady {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: attacker.clone(),
             stream_id: stream,
             protocol_id: minip2p_relay::STOP_PROTOCOL_ID.to_string(),
@@ -228,6 +229,7 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
 
     assert!(h.agent.handle_event_with_disposition(
         &SwarmEvent::StreamData {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: attacker.clone(),
             stream_id: stream,
             data: stop_connect(&h.target),
@@ -236,6 +238,7 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
     ));
     assert!(h.agent.handle_event_with_disposition(
         &SwarmEvent::StreamRemoteWriteClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: attacker.clone(),
             stream_id: stream,
         },
@@ -243,6 +246,7 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
     ));
     assert!(h.agent.handle_event_with_disposition(
         &SwarmEvent::StreamClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: attacker.clone(),
             stream_id: stream,
         },
@@ -261,6 +265,7 @@ fn remote_write_close_during_dcutr_releases_relay_and_keeps_direct_dials_live() 
 
     h.agent.handle_event(
         &SwarmEvent::StreamRemoteWriteClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: h.relay.clone(),
             stream_id: stream,
         },
@@ -308,6 +313,7 @@ fn relay_supersede_scrubs_old_stream_ids_without_resetting_the_new_connection() 
 
     h.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: h.relay.clone(),
         },
         at(310),
@@ -323,6 +329,7 @@ fn relay_supersede_scrubs_old_stream_ids_without_resetting_the_new_connection() 
     // must not be routed into the retired attempt.
     h.agent.handle_event(
         &SwarmEvent::StreamData {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: h.relay.clone(),
             stream_id: stream,
             data: b"new connection data".to_vec(),
@@ -341,6 +348,7 @@ fn bridge_close_before_dcutr_finishes_waits_for_live_direct_dials() {
 
     h.agent.handle_event(
         &SwarmEvent::StreamClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: h.relay.clone(),
             stream_id: stream,
         },
@@ -370,6 +378,7 @@ fn released_bridge_close_cannot_be_reported_as_a_relay_fallback() {
     // terminal event to keep the direct-upgrade race honest.
     h.agent.handle_event(
         &SwarmEvent::StreamClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: h.relay.clone(),
             stream_id: stream,
         },
@@ -633,6 +642,7 @@ fn foreign_stream_events_are_ignored_without_state_changes() {
     assert!(!h.agent.owns_stream(&h.target, stream));
     h.agent.handle_event(
         &SwarmEvent::StreamData {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: h.target.clone(),
             stream_id: stream,
             data: b"app data".to_vec(),
@@ -814,8 +824,13 @@ fn reporter_disconnect_drops_its_observation() {
     // reconnects the relay, but the stale observation must not come back.
     let relay = h.relay.clone();
     identify_observed(&mut h.agent, &relay, &maddr(departed), at(0));
-    h.agent
-        .handle_event(&SwarmEvent::ConnectionClosed { peer_id: relay }, at(1));
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
+            peer_id: relay,
+        },
+        at(1),
+    );
 
     let (_id, stream) = drive_to_bridged(&mut h, 10);
     let actions = drain_actions(&mut h.agent);

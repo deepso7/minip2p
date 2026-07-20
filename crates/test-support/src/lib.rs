@@ -2,13 +2,288 @@
 //!
 //! This crate is `publish = false` and is used only through dev-dependencies.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
+use std::time::Duration;
 
-use minip2p_core::PeerId;
+use minip2p_core::{Multiaddr, PeerAddr, PeerId};
 use minip2p_relay::{
     FrameDecode, HopMessage, HopMessageType, Peer, Reservation, Status, StopMessage,
     StopMessageType, decode_frame, encode_frame,
 };
+use minip2p_transport::{
+    ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
+    WaitOutcome,
+};
+
+/// Deterministic, connected, in-memory implementation of the transport contract.
+///
+/// A pair transfers stream events directly into its partner's poll queue. It
+/// is intentionally single-threaded and is meant for protocol wrapper tests.
+pub struct InMemoryTransport {
+    shared: Rc<RefCell<InMemoryLink>>,
+    side: usize,
+    connection: ConnectionId,
+    local_addr: Multiaddr,
+    remote_addr: Multiaddr,
+}
+
+struct InMemoryLink {
+    queues: [VecDeque<TransportEvent>; 2],
+    next_stream: [u64; 2],
+    active: bool,
+    streams: HashMap<StreamId, InMemoryStream>,
+}
+
+#[derive(Default)]
+struct InMemoryStream {
+    write_closed: [bool; 2],
+    closed: bool,
+}
+
+impl InMemoryTransport {
+    /// Creates a connected pair and queues the normal inbound/connected events.
+    pub fn pair(local_peer: PeerId, remote_peer: PeerId) -> (Self, Self) {
+        let a_addr: Multiaddr = "/ip4/192.0.2.1/udp/4001/quic-v1"
+            .parse()
+            .expect("test multiaddr");
+        let b_addr: Multiaddr = "/ip4/192.0.2.2/udp/4002/quic-v1"
+            .parse()
+            .expect("test multiaddr");
+        let connection = ConnectionId::new(1);
+        let mut queues = [VecDeque::new(), VecDeque::new()];
+        queues[0].push_back(TransportEvent::Connected {
+            id: connection,
+            endpoint: ConnectionEndpoint::with_peer_id(b_addr.clone(), remote_peer),
+        });
+        queues[1].push_back(TransportEvent::IncomingConnection {
+            id: connection,
+            endpoint: ConnectionEndpoint::new(a_addr.clone()),
+        });
+        queues[1].push_back(TransportEvent::Connected {
+            id: connection,
+            endpoint: ConnectionEndpoint::with_peer_id(a_addr.clone(), local_peer),
+        });
+        let shared = Rc::new(RefCell::new(InMemoryLink {
+            queues,
+            next_stream: [1, 2],
+            active: true,
+            streams: HashMap::new(),
+        }));
+        (
+            Self {
+                shared: shared.clone(),
+                side: 0,
+                connection,
+                local_addr: a_addr.clone(),
+                remote_addr: b_addr.clone(),
+            },
+            Self {
+                shared,
+                side: 1,
+                connection,
+                local_addr: b_addr,
+                remote_addr: a_addr,
+            },
+        )
+    }
+
+    /// Returns the sole local connection identifier.
+    pub fn connection_id(&self) -> ConnectionId {
+        self.connection
+    }
+
+    /// Queues a synthetic local event for deterministic wrapper edge cases.
+    pub fn push_event(&mut self, event: TransportEvent) {
+        self.shared.borrow_mut().queues[self.side].push_back(event);
+    }
+
+    fn ensure_connection(&self, id: ConnectionId) -> Result<(), TransportError> {
+        if self.shared.borrow().active && id == self.connection {
+            Ok(())
+        } else {
+            Err(TransportError::ConnectionNotFound { id })
+        }
+    }
+
+    fn stream_not_found(&self, stream_id: StreamId) -> TransportError {
+        TransportError::StreamNotFound {
+            id: self.connection,
+            stream_id,
+        }
+    }
+}
+
+impl Transport for InMemoryTransport {
+    fn dial(&mut self, _addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+        Err(TransportError::InvalidConfig {
+            reason: "in-memory pair is already connected".into(),
+        })
+    }
+
+    fn listen(&mut self, _addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
+        let addr = self.local_addr.clone();
+        self.shared.borrow_mut().queues[self.side]
+            .push_back(TransportEvent::Listening { addr: addr.clone() });
+        Ok(addr)
+    }
+
+    fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
+        self.ensure_connection(id)?;
+        let other = 1 - self.side;
+        let mut shared = self.shared.borrow_mut();
+        let stream_id = StreamId::new(shared.next_stream[self.side]);
+        shared.next_stream[self.side] += 2;
+        let previous = shared.streams.insert(stream_id, InMemoryStream::default());
+        debug_assert!(previous.is_none(), "stream ids are unique within a pair");
+        shared.queues[self.side].push_back(TransportEvent::StreamOpened { id, stream_id });
+        shared.queues[other].push_back(TransportEvent::IncomingStream {
+            id: self.connection,
+            stream_id,
+        });
+        Ok(stream_id)
+    }
+
+    fn send_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+        data: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        self.ensure_connection(id)?;
+        let mut shared = self.shared.borrow_mut();
+        let Some(stream) = shared.streams.get(&stream_id) else {
+            return Err(self.stream_not_found(stream_id));
+        };
+        if stream.closed {
+            return Err(self.stream_not_found(stream_id));
+        }
+        if stream.write_closed[self.side] {
+            return Err(TransportError::StreamSendFailed {
+                id,
+                stream_id,
+                reason: "write side is closed".into(),
+            });
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        shared.queues[1 - self.side].push_back(TransportEvent::StreamData {
+            id: self.connection,
+            stream_id,
+            data,
+        });
+        Ok(())
+    }
+
+    fn close_stream_write(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+    ) -> Result<(), TransportError> {
+        self.ensure_connection(id)?;
+        let other = 1 - self.side;
+        let mut shared = self.shared.borrow_mut();
+        let both_write_closed = {
+            let Some(stream) = shared.streams.get_mut(&stream_id) else {
+                return Err(self.stream_not_found(stream_id));
+            };
+            if stream.closed {
+                return Err(self.stream_not_found(stream_id));
+            }
+            if stream.write_closed[self.side] {
+                return Ok(());
+            }
+            stream.write_closed[self.side] = true;
+            let both_write_closed = stream.write_closed[other];
+            if both_write_closed {
+                stream.closed = true;
+            }
+            both_write_closed
+        };
+        shared.queues[other].push_back(TransportEvent::StreamRemoteWriteClosed {
+            id: self.connection,
+            stream_id,
+        });
+        if both_write_closed {
+            shared.queues[self.side].push_back(TransportEvent::StreamClosed { id, stream_id });
+            shared.queues[other].push_back(TransportEvent::StreamClosed {
+                id: self.connection,
+                stream_id,
+            });
+        }
+        Ok(())
+    }
+
+    fn reset_stream(
+        &mut self,
+        id: ConnectionId,
+        stream_id: StreamId,
+    ) -> Result<(), TransportError> {
+        self.ensure_connection(id)?;
+        let other = 1 - self.side;
+        let mut shared = self.shared.borrow_mut();
+        let Some(stream) = shared.streams.get_mut(&stream_id) else {
+            return Err(self.stream_not_found(stream_id));
+        };
+        if stream.closed {
+            return Ok(());
+        }
+        stream.closed = true;
+        shared.queues[self.side].push_back(TransportEvent::StreamClosed { id, stream_id });
+        shared.queues[other].push_back(TransportEvent::StreamClosed {
+            id: self.connection,
+            stream_id,
+        });
+        Ok(())
+    }
+
+    fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
+        self.ensure_connection(id)?;
+        let other = 1 - self.side;
+        let mut shared = self.shared.borrow_mut();
+        shared.active = false;
+        for stream in shared.streams.values_mut() {
+            stream.closed = true;
+        }
+        shared.queues[self.side].push_back(TransportEvent::Closed { id });
+        shared.queues[other].push_back(TransportEvent::Closed {
+            id: self.connection,
+        });
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+        Ok(self.shared.borrow_mut().queues[self.side]
+            .drain(..)
+            .collect())
+    }
+
+    fn next_timeout(&self) -> Option<Duration> {
+        (!self.shared.borrow().queues[self.side].is_empty()).then_some(Duration::ZERO)
+    }
+
+    fn wait_for_input(&mut self, _timeout: Duration) -> WaitOutcome {
+        if self.shared.borrow().queues[self.side].is_empty() {
+            WaitOutcome::Unsupported
+        } else {
+            WaitOutcome::Ready
+        }
+    }
+
+    fn local_addresses(&self) -> Vec<Multiaddr> {
+        vec![self.local_addr.clone()]
+    }
+
+    fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
+        if self.side == 1 && self.shared.borrow().active {
+            vec![self.remote_addr.clone()]
+        } else {
+            Vec::new()
+        }
+    }
+}
 
 /// Result of handling one HOP CONNECT request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -265,6 +540,150 @@ mod tests {
 
     fn peer(tag: &[u8]) -> PeerId {
         PeerId::from_public_key_protobuf(tag)
+    }
+
+    fn transport_pair() -> (InMemoryTransport, InMemoryTransport) {
+        InMemoryTransport::pair(peer(b"transport-a"), peer(b"transport-b"))
+    }
+
+    fn drain_startup(a: &mut InMemoryTransport, b: &mut InMemoryTransport) {
+        assert!(matches!(
+            a.poll().unwrap().as_slice(),
+            [TransportEvent::Connected { .. }]
+        ));
+        assert!(matches!(
+            b.poll().unwrap().as_slice(),
+            [
+                TransportEvent::IncomingConnection { .. },
+                TransportEvent::Connected { .. }
+            ]
+        ));
+    }
+
+    #[test]
+    fn in_memory_listen_emits_the_resolved_address() {
+        let (mut transport, mut peer) = transport_pair();
+        drain_startup(&mut transport, &mut peer);
+        let requested: Multiaddr = "/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap();
+
+        let resolved = transport.listen(&requested).unwrap();
+
+        assert_eq!(
+            transport.poll().unwrap(),
+            [TransportEvent::Listening {
+                addr: resolved.clone()
+            }]
+        );
+        assert_eq!(resolved, transport.local_addr);
+    }
+
+    #[test]
+    fn in_memory_rejects_unknown_stream_writes() {
+        let (mut a, mut b) = transport_pair();
+        drain_startup(&mut a, &mut b);
+        let id = a.connection_id();
+        let stream_id = StreamId::new(99);
+
+        assert_eq!(
+            a.send_stream(id, stream_id, vec![1, 2, 3]),
+            Err(TransportError::StreamNotFound { id, stream_id })
+        );
+        assert!(b.poll().unwrap().is_empty());
+    }
+
+    #[test]
+    fn in_memory_half_close_is_idempotent_and_closes_after_both_fins() {
+        let (mut a, mut b) = transport_pair();
+        drain_startup(&mut a, &mut b);
+        let id = a.connection_id();
+        let stream_id = a.open_stream(id).unwrap();
+        a.poll().unwrap();
+        b.poll().unwrap();
+
+        a.close_stream_write(id, stream_id).unwrap();
+        a.close_stream_write(id, stream_id).unwrap();
+        assert_eq!(
+            b.poll().unwrap(),
+            [TransportEvent::StreamRemoteWriteClosed { id, stream_id }]
+        );
+        assert!(matches!(
+            a.send_stream(id, stream_id, vec![1]),
+            Err(TransportError::StreamSendFailed { .. })
+        ));
+
+        b.close_stream_write(id, stream_id).unwrap();
+        assert_eq!(
+            a.poll().unwrap(),
+            [
+                TransportEvent::StreamRemoteWriteClosed { id, stream_id },
+                TransportEvent::StreamClosed { id, stream_id }
+            ]
+        );
+        assert_eq!(
+            b.poll().unwrap(),
+            [TransportEvent::StreamClosed { id, stream_id }]
+        );
+        assert_eq!(
+            b.send_stream(id, stream_id, vec![1]),
+            Err(TransportError::StreamNotFound { id, stream_id })
+        );
+    }
+
+    #[test]
+    fn in_memory_reset_is_idempotent_and_tombstones_the_stream() {
+        let (mut a, mut b) = transport_pair();
+        drain_startup(&mut a, &mut b);
+        let id = a.connection_id();
+        let stream_id = a.open_stream(id).unwrap();
+        a.poll().unwrap();
+        b.poll().unwrap();
+
+        a.reset_stream(id, stream_id).unwrap();
+        a.reset_stream(id, stream_id).unwrap();
+
+        assert_eq!(
+            a.poll().unwrap(),
+            [TransportEvent::StreamClosed { id, stream_id }]
+        );
+        assert_eq!(
+            b.poll().unwrap(),
+            [TransportEvent::StreamClosed { id, stream_id }]
+        );
+        assert_eq!(
+            a.send_stream(id, stream_id, vec![1]),
+            Err(TransportError::StreamNotFound { id, stream_id })
+        );
+        assert_eq!(
+            b.close_stream_write(id, stream_id),
+            Err(TransportError::StreamNotFound { id, stream_id })
+        );
+    }
+
+    #[test]
+    fn in_memory_close_disables_both_endpoints_before_closed_is_polled() {
+        let (mut a, mut b) = transport_pair();
+        drain_startup(&mut a, &mut b);
+        let id = a.connection_id();
+        let stream_id = a.open_stream(id).unwrap();
+        a.poll().unwrap();
+        b.poll().unwrap();
+
+        a.close(id).unwrap();
+
+        assert_eq!(
+            b.open_stream(id),
+            Err(TransportError::ConnectionNotFound { id })
+        );
+        assert_eq!(
+            b.send_stream(id, stream_id, vec![1]),
+            Err(TransportError::ConnectionNotFound { id })
+        );
+        assert_eq!(b.close(id), Err(TransportError::ConnectionNotFound { id }));
+        assert!(b.active_inbound_connection_sources().is_empty());
+        assert_eq!(a.poll().unwrap(), [TransportEvent::Closed { id }]);
+        assert_eq!(b.poll().unwrap(), [TransportEvent::Closed { id }]);
+        assert!(a.poll().unwrap().is_empty());
+        assert!(b.poll().unwrap().is_empty());
     }
 
     fn reserve(relay: &mut RelayEmulator, target: &PeerId) {

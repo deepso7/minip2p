@@ -111,7 +111,7 @@ fn swarm_ping_roundtrip_with_auto_identify() {
 
         for event in client_events {
             match event {
-                SwarmEvent::ConnectionEstablished { ref peer_id } => {
+                SwarmEvent::ConnectionEstablished { ref peer_id, .. } => {
                     assert_eq!(peer_id, &server_peer_id);
                     client_connected = true;
                 }
@@ -196,7 +196,7 @@ fn inbound_connection_does_not_collide_with_later_outbound_dial() {
             drive_three(&mut inbound_peer, &mut middle, &mut outbound_peer);
 
         let inbound_connected = inbound_events.iter().any(
-            |event| matches!(event, SwarmEvent::ConnectionEstablished { peer_id } if peer_id == &middle_peer_id),
+            |event| matches!(event, SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == &middle_peer_id),
         );
         middle_saw_inbound |= middle_events
             .iter()
@@ -221,7 +221,7 @@ fn inbound_connection_does_not_collide_with_later_outbound_dial() {
             drive_three(&mut inbound_peer, &mut middle, &mut outbound_peer);
 
         if middle_events.iter().any(
-            |event| matches!(event, SwarmEvent::ConnectionEstablished { peer_id } if peer_id == &outbound_peer_id),
+            |event| matches!(event, SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == &outbound_peer_id),
         ) {
             return;
         }
@@ -261,6 +261,7 @@ fn swarm_user_protocol_round_trip() {
                     ref peer_id,
                     stream_id,
                     ref data,
+                    ..
                 } if !server_echo_sent => {
                     // Echo the data back on the same stream.
                     server
@@ -290,6 +291,7 @@ fn swarm_user_protocol_round_trip() {
                     stream_id,
                     ref protocol_id,
                     initiated_locally,
+                    ..
                 } => {
                     assert_eq!(peer_id, &server_peer_id);
                     assert_eq!(protocol_id, USER_PROTOCOL_ID);

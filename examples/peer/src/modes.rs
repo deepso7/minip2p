@@ -253,6 +253,7 @@ fn handle_listen_event(
             stream_id,
             protocol_id,
             initiated_locally: false,
+            ..
         } if protocol_id == ECHO_PROTOCOL => {
             echo_streams.insert((peer_id.clone(), *stream_id));
         }
@@ -260,16 +261,19 @@ fn handle_listen_event(
             peer_id,
             stream_id,
             data,
+            ..
         } if echo_streams.contains(&(peer_id.clone(), *stream_id)) => {
             echo_bytes(endpoint, peer_id, *stream_id, data, echo_streams);
         }
-        Event::StreamRemoteWriteClosed { peer_id, stream_id }
-            if echo_streams.contains(&(peer_id.clone(), *stream_id)) =>
-        {
+        Event::StreamRemoteWriteClosed {
+            peer_id, stream_id, ..
+        } if echo_streams.contains(&(peer_id.clone(), *stream_id)) => {
             let _ = endpoint.close_stream_write(peer_id, *stream_id);
             echo_streams.remove(&(peer_id.clone(), *stream_id));
         }
-        Event::StreamClosed { peer_id, stream_id } => {
+        Event::StreamClosed {
+            peer_id, stream_id, ..
+        } => {
             echo_streams.remove(&(peer_id.clone(), *stream_id));
         }
         _ => {}
@@ -470,7 +474,7 @@ fn open_echo_stream(
             Event::StreamReady {
                 peer_id, stream_id, ..
             } if peer_id == peer && *stream_id == stream => return Ok(stream),
-            Event::ConnectionEstablished { peer_id } if peer_id == peer => {
+            Event::ConnectionEstablished { peer_id, .. } if peer_id == peer => {
                 print_event("dial", &event);
                 // A second punch connection just replaced the one this
                 // stream was opened on — the swarm keeps the newcomer and
@@ -684,6 +688,7 @@ fn ping_loop(
                 peer_id,
                 stream_id,
                 data,
+                ..
             } if *peer_id == channel.send_peer && *stream_id == channel.stream => {
                 frames.push(data);
                 while let Some(frame) = frames.pop() {
@@ -709,10 +714,12 @@ fn ping_loop(
                     return Ok(());
                 }
             }
-            Event::StreamRemoteWriteClosed { peer_id, stream_id }
-            | Event::StreamClosed { peer_id, stream_id }
-                if *peer_id == channel.send_peer && *stream_id == channel.stream =>
-            {
+            Event::StreamRemoteWriteClosed {
+                peer_id, stream_id, ..
+            }
+            | Event::StreamClosed {
+                peer_id, stream_id, ..
+            } if *peer_id == channel.send_peer && *stream_id == channel.stream => {
                 print_event("dial", &event);
                 if drain_deadline.is_some() {
                     stats.print_summary();
@@ -745,7 +752,7 @@ fn ping_loop(
                 stats.print_summary();
                 return Err("ping channel closed".into());
             }
-            Event::ConnectionClosed { peer_id } if *peer_id == channel.send_peer => {
+            Event::ConnectionClosed { peer_id, .. } if *peer_id == channel.send_peer => {
                 print_event("dial", &event);
                 stats.print_summary();
                 if drain_deadline.is_some() {
