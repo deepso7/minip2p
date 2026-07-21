@@ -36,6 +36,8 @@ From the diff only:
 
 ### 2. Micro-agents (parallel)
 
+Specialists inherit the parent model — omit `model` on Task unless the user names one.
+
 Each specialist gets: worktree path, exact `base...head`, changed-file list, planner blast-radius notes, and **only its charter** (see `reference.md`).
 
 Every finding **must** be structured:
