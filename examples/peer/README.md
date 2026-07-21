@@ -126,9 +126,9 @@ If the punch cannot land (e.g. UDP blocked between the peers), you'll see
   big-endian seq followed by an 8-byte send timestamp. The listener never
   parses them — it echoes raw bytes, which also exercises frame
   fragmentation/coalescing on the dialer's reassembly path.
-- A relayed path is a raw bridged stream, not a full connection: no
-  identify or ping runs across it, and both ends must speak minip2p (the
-  bridge carries this demo's echo frames, not multistream-select).
+- A relayed path is an end-to-end Noise connection multiplexed with Yamux.
+  Identify, ping, and the echo protocol use the same negotiated stream APIs
+  as a direct connection.
 - Exit paths: `--count` is the graceful shutdown (half-close, 3 s drain,
   summary); Ctrl-C is the blunt one. The listener runs until interrupted.
 - The previous `direct`/`relay`/`autonat` modes (hand-rolled protocol

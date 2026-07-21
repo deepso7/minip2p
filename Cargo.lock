@@ -795,6 +795,7 @@ name = "minip2p"
 version = "0.1.0"
 dependencies = [
  "getrandom",
+ "minip2p-circuit",
  "minip2p-core",
  "minip2p-discovery",
  "minip2p-identify",

@@ -565,11 +565,18 @@ fn relay_supersede_during_renewal_emits_reservation_lost() {
     hk.agent.handle_tick(at_unix(renew_at, 1_790));
     let relay = hk.relay.clone();
     hk.agent.handle_event(
-        &SwarmEvent::ConnectionEstablished {
+        &SwarmEvent::ConnectionClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: relay.clone(),
         },
         at_unix(renew_at + 1, 1_790),
+    );
+    hk.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: minip2p_transport::ConnectionId::new(2),
+            peer_id: relay.clone(),
+        },
+        at_unix(renew_at + 2, 1_790),
     );
 
     let events = drain_events(&mut hk.agent);

@@ -33,16 +33,29 @@ pub use minip2p_pubsub::{
 };
 pub use minip2p_quic::QuicLimits;
 use minip2p_quic::{QuicEndpoint, QuicNodeConfig};
+use minip2p_swarm::SwarmBuilder;
 pub use minip2p_swarm::{
-    Deadline, DriverError as Error, RESERVED_PROTOCOL_IDS, RUN_UNTIL_SKIP_LIMIT, SwarmError,
+    Deadline, DriverError as Error, RESERVED_PROTOCOL_IDS, RUN_UNTIL_SKIP_LIMIT, Swarm, SwarmError,
     SwarmEvent as Event,
 };
-use minip2p_swarm::{Swarm, SwarmBuilder};
 pub use minip2p_transport::{ConnectionId, StreamId, TransportError};
 #[cfg(feature = "pubsub")]
 pub use pubsub::PubsubError;
 
 const DEFAULT_AGENT_VERSION: &str = "minip2p/0.1.0";
+
+/// Transport used by [`Endpoint`]. With NAT enabled, relay bridges are
+/// promoted into ordinary Noise/Yamux connections by `CircuitTransport`.
+#[cfg(feature = "nat")]
+pub type EndpointTransport =
+    minip2p_circuit::CircuitTransport<QuicEndpoint, minip2p_circuit::OsEntropy>;
+
+/// Transport used by [`Endpoint`] when NAT traversal is not compiled in.
+#[cfg(not(feature = "nat"))]
+pub type EndpointTransport = QuicEndpoint;
+
+/// Concrete swarm type owned by [`Endpoint`].
+pub type EndpointSwarm = Swarm<EndpointTransport>;
 
 /// App-facing minip2p endpoint over the default QUIC transport.
 ///
@@ -56,7 +69,7 @@ const DEFAULT_AGENT_VERSION: &str = "minip2p/0.1.0";
 /// see `Endpoint::connect`, `Endpoint::wait_path`, and
 /// `Endpoint::take_nat_events`.
 pub struct Endpoint {
-    swarm: Swarm<QuicEndpoint>,
+    swarm: EndpointSwarm,
     #[cfg(feature = "nat")]
     nat: Option<nat::NatDriver>,
     #[cfg(feature = "pubsub")]
@@ -157,17 +170,17 @@ impl Endpoint {
     /// IPv6 dials are started when both families are available. Use
     /// [`Endpoint::dial_ip4`] or [`Endpoint::dial_ip6`] to force one family.
     pub fn dial(&mut self, addr: &PeerAddr) -> Result<Vec<ConnectionId>, Error> {
-        Ok(self.swarm.transport_mut().dial_all(addr)?)
+        Ok(self.quic_mut().dial_all(addr)?)
     }
 
     /// Dials a remote peer using IPv4.
     pub fn dial_ip4(&mut self, addr: &PeerAddr) -> Result<ConnectionId, Error> {
-        Ok(self.swarm.transport_mut().dial_ip4(addr)?)
+        Ok(self.quic_mut().dial_ip4(addr)?)
     }
 
     /// Dials a remote peer using IPv6.
     pub fn dial_ip6(&mut self, addr: &PeerAddr) -> Result<ConnectionId, Error> {
-        Ok(self.swarm.transport_mut().dial_ip6(addr)?)
+        Ok(self.quic_mut().dial_ip6(addr)?)
     }
 
     /// Sends a ping to `peer_id`.
@@ -313,7 +326,7 @@ impl Endpoint {
     fn ingest_into_drivers(&mut self, event: &Event) -> bool {
         #[cfg(feature = "discovery")]
         if let Some(discovery) = self.discovery.as_mut() {
-            discovery.observe(event);
+            discovery.observe(event, &self.swarm);
         }
         let mut claimed = false;
         #[cfg(feature = "nat")]
@@ -869,17 +882,17 @@ impl Endpoint {
     }
 
     /// Borrows the underlying swarm.
-    pub fn swarm(&self) -> &Swarm<QuicEndpoint> {
+    pub fn swarm(&self) -> &EndpointSwarm {
         &self.swarm
     }
 
     /// Mutably borrows the underlying swarm.
-    pub fn swarm_mut(&mut self) -> &mut Swarm<QuicEndpoint> {
+    pub fn swarm_mut(&mut self) -> &mut EndpointSwarm {
         &mut self.swarm
     }
 
     /// Decomposes this endpoint into the underlying swarm.
-    pub fn into_swarm(self) -> Swarm<QuicEndpoint> {
+    pub fn into_swarm(self) -> EndpointSwarm {
         #[cfg(feature = "discovery")]
         {
             let mut endpoint = self;
@@ -894,6 +907,18 @@ impl Endpoint {
         {
             self.swarm
         }
+    }
+}
+
+impl Endpoint {
+    #[cfg(feature = "nat")]
+    fn quic_mut(&mut self) -> &mut QuicEndpoint {
+        self.swarm.transport_mut().inner_mut()
+    }
+
+    #[cfg(not(feature = "nat"))]
+    fn quic_mut(&mut self) -> &mut QuicEndpoint {
+        self.swarm.transport_mut()
     }
 }
 
@@ -1204,6 +1229,8 @@ fn build_endpoint(parts: BuilderParts, transport: QuicEndpoint) -> Result<Endpoi
     for protocol in protocols {
         builder = builder.protocol(protocol);
     }
+    #[cfg(feature = "nat")]
+    let transport = minip2p_circuit::CircuitTransport::new_os(transport, parts.keypair.clone());
     let swarm = builder.build(transport)?;
     #[cfg(feature = "nat")]
     let nat = parts.nat_config.map(|config| {

@@ -13,7 +13,7 @@ use crate::config::NatConfig;
 use crate::events::{NatAction, NatEvent};
 use crate::housekeeping::Housekeeping;
 use crate::inbound::InboundCircuit;
-use crate::types::{ConnectId, NatToken, Now, ReachabilityState, ReservationInfo};
+use crate::types::{ConnectId, NatToken, Now, PromoteError, ReachabilityState, ReservationInfo};
 
 /// Roles a stream owned by the agent can play. Streams not in the registry
 /// belong to the application (`Released` is modeled as removal).
@@ -53,6 +53,10 @@ pub(crate) enum TokenPurpose {
     ReserveDial,
     /// HOP RESERVE stream open.
     OpenReserve(PeerId),
+    /// Relay bridge promotion for an outbound connect attempt.
+    PromoteAttempt(ConnectId),
+    /// Relay bridge promotion for an inbound circuit.
+    PromoteInbound(u64),
 }
 
 impl TokenPurpose {
@@ -61,7 +65,8 @@ impl TokenPurpose {
             Self::DirectDial(id)
             | Self::RelayDial(id)
             | Self::PunchDial(id)
-            | Self::OpenHop(id, _) => Some(*id),
+            | Self::OpenHop(id, _)
+            | Self::PromoteAttempt(id) => Some(*id),
             _ => None,
         }
     }
@@ -87,16 +92,17 @@ pub(crate) struct Shared {
     pub(crate) registry: BTreeMap<PeerId, BTreeMap<StreamId, StreamRole>>,
     pub(crate) tokens: BTreeMap<NatToken, TokenPurpose>,
     next_token: u64,
-    /// Peers with an established (identity-verified) connection. A QUIC
-    /// supersede re-emits `ConnectionEstablished` and the retired connection
-    /// emits no `ConnectionClosed`, so set semantics absorb both.
-    pub(crate) connected: BTreeSet<PeerId>,
+    /// Established connections per peer. Connection ids preserve concurrent
+    /// lifecycle provenance across eager supersession events.
+    pub(crate) connected: BTreeMap<PeerId, BTreeSet<ConnectionId>>,
+    /// Established connections classified as direct by the driver.
+    pub(crate) direct_connections: BTreeSet<ConnectionId>,
     /// Peers that reached `PeerReady`, with their advertised protocols.
     pub(crate) ready: BTreeMap<PeerId, Vec<String>>,
-    /// Bridges released to the application but still participating in a
-    /// direct-upgrade race. Data on these streams belongs to the app; only a
-    /// terminal close is routed back to the owning attempt.
-    released_bridges: BTreeMap<PeerId, BTreeMap<StreamId, ConnectId>>,
+    /// Exact connection provenance for agent-owned streams. Locally opened
+    /// streams enter the peer-scoped registry first and are bound here by
+    /// their `StreamReady` event before any bridge can be promoted.
+    stream_connections: BTreeMap<(PeerId, StreamId), ConnectionId>,
     /// Our validated external/listen addresses, advertised in DCUtR CONNECT.
     pub(crate) listen_addrs: Vec<Multiaddr>,
     /// Our transport address as observed by trusted reporters (Identify's
@@ -117,6 +123,16 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    pub(crate) fn is_connected(&self, peer: &PeerId) -> bool {
+        self.connected.get(peer).is_some_and(|ids| !ids.is_empty())
+    }
+
+    pub(crate) fn is_directly_connected(&self, peer: &PeerId) -> bool {
+        self.connected
+            .get(peer)
+            .is_some_and(|ids| ids.iter().any(|id| self.direct_connections.contains(id)))
+    }
+
     pub(crate) fn alloc_token(&mut self, purpose: TokenPurpose) -> NatToken {
         let token = NatToken(self.next_token);
         self.next_token += 1;
@@ -183,41 +199,32 @@ impl Shared {
                 self.registry.remove(peer);
             }
         }
+        self.stream_connections.remove(&(peer.clone(), stream));
     }
 
-    pub(crate) fn track_released_bridge(
+    pub(crate) fn bind_stream(
         &mut self,
         peer: &PeerId,
         stream: StreamId,
-        attempt: ConnectId,
-    ) {
-        self.released_bridges
-            .entry(peer.clone())
-            .or_default()
-            .insert(stream, attempt);
-    }
-
-    pub(crate) fn take_released_bridge(
-        &mut self,
-        peer: &PeerId,
-        stream: StreamId,
-    ) -> Option<ConnectId> {
-        let attempt = self
-            .released_bridges
-            .get_mut(peer)
-            .and_then(|streams| streams.remove(&stream));
-        if self
-            .released_bridges
-            .get(peer)
-            .is_some_and(BTreeMap::is_empty)
-        {
-            self.released_bridges.remove(peer);
+        conn_id: ConnectionId,
+    ) -> bool {
+        match self.stream_connections.entry((peer.clone(), stream)) {
+            alloc::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(conn_id);
+                true
+            }
+            alloc::collections::btree_map::Entry::Occupied(entry) => *entry.get() == conn_id,
         }
-        attempt
     }
 
-    pub(crate) fn forget_released_bridge(&mut self, peer: &PeerId, stream: StreamId) {
-        let _ = self.take_released_bridge(peer, stream);
+    pub(crate) fn stream_connection(
+        &self,
+        peer: &PeerId,
+        stream: StreamId,
+    ) -> Option<ConnectionId> {
+        self.stream_connections
+            .get(&(peer.clone(), stream))
+            .copied()
     }
 
     /// Records `reporter`'s Identify claim of our transport address.
@@ -295,9 +302,10 @@ impl NatAgent {
                 registry: BTreeMap::new(),
                 tokens: BTreeMap::new(),
                 next_token: 0,
-                connected: BTreeSet::new(),
+                connected: BTreeMap::new(),
+                direct_connections: BTreeSet::new(),
                 ready: BTreeMap::new(),
-                released_bridges: BTreeMap::new(),
+                stream_connections: BTreeMap::new(),
                 listen_addrs: Vec::new(),
                 observed_addrs: BTreeMap::new(),
                 pending_session_dials: BTreeMap::new(),
@@ -328,7 +336,7 @@ impl NatAgent {
         // A connection that is already identity-verified is the best path
         // available. Do not manufacture a new race which can only waste
         // work (and, with no candidates or relay, falsely report failure).
-        if self.shared.connected.contains(&peer) {
+        if self.shared.is_directly_connected(&peer) {
             self.shared.push_event(NatEvent::PathEstablished {
                 connect_id: id,
                 peer,
@@ -366,10 +374,22 @@ impl NatAgent {
     /// control plane even when the event did not leave a stream registered.
     /// Drivers use this to consume rejected inbound control streams.
     pub fn handle_event_with_disposition(&mut self, event: &SwarmEvent, now: Now) -> bool {
+        self.handle_event_with_disposition_classified(event, false, now)
+    }
+
+    /// Feeds one swarm event with the driver's transport classification.
+    /// Circuit connection lifecycle events are correlated with promotions;
+    /// direct events continue to drive the direct-first race.
+    pub fn handle_event_with_disposition_classified(
+        &mut self,
+        event: &SwarmEvent,
+        is_circuit: bool,
+        now: Now,
+    ) -> bool {
         let mut handled = false;
         let mut touched_state = false;
         match event {
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
                 touched_state = true;
                 // Any session dial toward this peer has done its job (ours
                 // landed, or another machine's did — either way the peer is
@@ -377,56 +397,61 @@ impl NatAgent {
                 self.shared
                     .pending_session_dials
                     .retain(|_, (dialed, _)| dialed != peer_id);
-                let superseded = !self.shared.connected.insert(peer_id.clone());
-                if superseded {
-                    // The swarm's last-connection-wins policy emits a second
-                    // establishment without closing the retired connection.
-                    // Stream ids are peer-scoped here, so scrub them before
-                    // any event from the replacement connection can collide.
-                    self.shared.ready.remove(peer_id);
-                    self.shared.registry.remove(peer_id);
-                    self.shared.released_bridges.remove(peer_id);
-                    self.shared.tokens.retain(|_, purpose| {
-                        !matches!(
-                            purpose,
-                            TokenPurpose::OpenHop(_, peer)
-                                | TokenPurpose::OpenProbe(peer)
-                                | TokenPurpose::OpenReserve(peer)
-                                if peer == peer_id
-                        )
-                    });
-                    for attempt in self.attempts.values_mut() {
-                        attempt.on_peer_superseded(peer_id, &mut self.shared, now);
-                    }
-                    self.housekeeping
-                        .on_peer_superseded(peer_id, &mut self.shared, now);
-                    for circuit in self.inbound.values_mut() {
-                        circuit.on_relay_disconnected(peer_id, &mut self.shared);
-                    }
+                self.shared
+                    .connected
+                    .entry(peer_id.clone())
+                    .or_default()
+                    .insert(*conn_id);
+                if !is_circuit {
+                    self.shared.direct_connections.insert(*conn_id);
                 }
                 for attempt in self.attempts.values_mut() {
-                    attempt.on_peer_connected(peer_id, &mut self.shared, now);
+                    attempt.on_connection_established(
+                        peer_id,
+                        *conn_id,
+                        is_circuit,
+                        &mut self.shared,
+                        now,
+                    );
                 }
                 for circuit in self.inbound.values_mut() {
-                    circuit.on_peer_connected(peer_id, &mut self.shared, now);
+                    circuit.on_connection_established(
+                        peer_id,
+                        *conn_id,
+                        is_circuit,
+                        &mut self.shared,
+                        now,
+                    );
                 }
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+            SwarmEvent::ConnectionClosed { peer_id, conn_id } => {
                 touched_state = true;
-                self.shared.connected.remove(peer_id);
-                self.shared.ready.remove(peer_id);
+                self.shared.direct_connections.remove(conn_id);
+                if let Some(ids) = self.shared.connected.get_mut(peer_id) {
+                    ids.remove(conn_id);
+                    if ids.is_empty() {
+                        self.shared.connected.remove(peer_id);
+                        self.shared.ready.remove(peer_id);
+                    }
+                }
                 for attempt in self.attempts.values_mut() {
-                    attempt.on_peer_disconnected(peer_id, &mut self.shared, now);
+                    attempt.on_connection_closed(peer_id, *conn_id, &mut self.shared, now);
                 }
                 self.housekeeping
                     .on_peer_disconnected(peer_id, &mut self.shared, now);
                 for circuit in self.inbound.values_mut() {
-                    circuit.on_relay_disconnected(peer_id, &mut self.shared);
+                    circuit.on_connection_closed(peer_id, *conn_id, &mut self.shared);
                 }
-                // Streams on the closed connection are gone; drop any the
-                // attempts have not already cleaned up.
-                self.shared.registry.remove(peer_id);
-                self.shared.released_bridges.remove(peer_id);
+                let closed_streams: Vec<_> = self
+                    .shared
+                    .stream_connections
+                    .iter()
+                    .filter(|(_, owner)| **owner == *conn_id)
+                    .map(|((peer, stream), _)| (peer.clone(), *stream))
+                    .collect();
+                for (peer, stream) in closed_streams {
+                    self.shared.release_stream(&peer, stream);
+                }
                 self.shared.observed_addrs.remove(peer_id);
                 self.shared
                     .pending_session_dials
@@ -452,6 +477,7 @@ impl NatAgent {
                     .on_peer_ready(peer_id, protocols, &mut self.shared, now);
             }
             SwarmEvent::StreamReady {
+                conn_id,
                 peer_id,
                 stream_id,
                 protocol_id,
@@ -459,6 +485,16 @@ impl NatAgent {
                 ..
             } => {
                 if !initiated_locally && protocol_id == STOP_PROTOCOL_ID {
+                    if !self.shared.bind_stream(peer_id, *stream_id, *conn_id) {
+                        // An old connection still owns this peer-scoped id.
+                        // Reject the colliding replacement stream without
+                        // overwriting the old stream's exact provenance.
+                        self.shared.push_action(NatAction::ResetStream {
+                            peer: peer_id.clone(),
+                            stream_id: *stream_id,
+                        });
+                        return true;
+                    }
                     // STOP is a relay control protocol, but registration of
                     // its id makes it possible for any connected peer to
                     // negotiate it. Only relays explicitly configured by
@@ -492,44 +528,68 @@ impl NatAgent {
                             .own_stream(peer_id, *stream_id, StreamRole::StopInbound(id));
                         self.inbound.insert(
                             id,
-                            InboundCircuit::new(peer_id.clone(), *stream_id, &self.shared, now),
+                            InboundCircuit::new(
+                                id,
+                                *conn_id,
+                                peer_id.clone(),
+                                *stream_id,
+                                &self.shared,
+                                now,
+                            ),
                         );
                         handled = true;
                     }
                 } else {
-                    handled = self.route_stream(peer_id, *stream_id, StreamInput::Ready, now);
+                    if self.owns_stream(peer_id, *stream_id)
+                        && self.shared.bind_stream(peer_id, *stream_id, *conn_id)
+                    {
+                        handled = self.route_stream(
+                            *conn_id,
+                            peer_id,
+                            *stream_id,
+                            StreamInput::Ready,
+                            now,
+                        );
+                    }
                 }
                 touched_state = handled;
             }
             SwarmEvent::StreamData {
+                conn_id,
                 peer_id,
                 stream_id,
                 data,
                 ..
             } => {
-                handled = self.route_stream(peer_id, *stream_id, StreamInput::Data(data), now);
+                handled =
+                    self.route_stream(*conn_id, peer_id, *stream_id, StreamInput::Data(data), now);
                 touched_state = handled;
             }
             SwarmEvent::StreamRemoteWriteClosed {
-                peer_id, stream_id, ..
+                conn_id,
+                peer_id,
+                stream_id,
+                ..
             } => {
-                handled =
-                    self.route_stream(peer_id, *stream_id, StreamInput::RemoteWriteClosed, now);
+                handled = self.route_stream(
+                    *conn_id,
+                    peer_id,
+                    *stream_id,
+                    StreamInput::RemoteWriteClosed,
+                    now,
+                );
                 touched_state = handled;
             }
             SwarmEvent::StreamClosed {
-                peer_id, stream_id, ..
+                conn_id,
+                peer_id,
+                stream_id,
+                ..
             } => {
-                if let Some(id) = self.shared.take_released_bridge(peer_id, *stream_id) {
-                    handled = true;
-                    if let Some(attempt) = self.attempts.get_mut(&id) {
-                        attempt.on_released_bridge_closed(*stream_id, &mut self.shared, now);
-                    }
-                } else {
-                    handled = self.route_stream(peer_id, *stream_id, StreamInput::Closed, now);
-                    if handled {
-                        self.shared.release_stream(peer_id, *stream_id);
-                    }
+                handled =
+                    self.route_stream(*conn_id, peer_id, *stream_id, StreamInput::Closed, now);
+                if handled {
+                    self.shared.release_stream(peer_id, *stream_id);
                 }
                 touched_state = handled;
             }
@@ -641,6 +701,33 @@ impl NatAgent {
         }
     }
 
+    /// Reports the result of a [`NatAction::PromoteBridge`] executed by the
+    /// driver.
+    pub fn promote_result(
+        &mut self,
+        token: NatToken,
+        result: Result<ConnectionId, PromoteError>,
+        now: Now,
+    ) {
+        let Some(purpose) = self.shared.tokens.remove(&token) else {
+            return;
+        };
+        match purpose {
+            TokenPurpose::PromoteAttempt(id) => {
+                if let Some(attempt) = self.attempts.get_mut(&id) {
+                    attempt.on_promote_result(result, &mut self.shared, now);
+                }
+            }
+            TokenPurpose::PromoteInbound(id) => {
+                if let Some(circuit) = self.inbound.get_mut(&id) {
+                    circuit.on_promote_result(result, &mut self.shared, now);
+                }
+            }
+            _ => {}
+        }
+        self.reap_done();
+    }
+
     /// Returns the next queued command for the driver.
     pub fn poll_action(&mut self) -> Option<NatAction> {
         self.shared.actions.pop_front()
@@ -701,6 +788,7 @@ impl NatAgent {
 
     fn route_stream(
         &mut self,
+        conn_id: ConnectionId,
         peer: &PeerId,
         stream: StreamId,
         input: StreamInput<'_>,
@@ -713,10 +801,13 @@ impl NatAgent {
         let Some(role) = streams.get(&stream).copied() else {
             return false;
         };
+        if self.shared.stream_connection(peer, stream) != Some(conn_id) {
+            return false;
+        }
         match role {
             StreamRole::HopConnect(id) => {
                 if let Some(attempt) = self.attempts.get_mut(&id) {
-                    attempt.on_stream_input(stream, input, &mut self.shared, now);
+                    attempt.on_stream_input(conn_id, stream, input, &mut self.shared, now);
                 }
             }
             StreamRole::HopReserve | StreamRole::AutonatProbe => {
@@ -725,7 +816,7 @@ impl NatAgent {
             }
             StreamRole::StopInbound(id) => {
                 if let Some(circuit) = self.inbound.get_mut(&id) {
-                    circuit.on_stream_input(stream, input, &mut self.shared, now);
+                    circuit.on_stream_input(conn_id, stream, input, &mut self.shared, now);
                 }
             }
             StreamRole::RejectedStop => {}

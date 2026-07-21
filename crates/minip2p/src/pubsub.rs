@@ -10,8 +10,9 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use minip2p_pubsub::{FloodsubAgent, PubsubAction, PubsubEvent};
-use minip2p_quic::QuicEndpoint;
-use minip2p_swarm::{Swarm, SwarmEvent};
+use minip2p_swarm::SwarmEvent;
+
+use crate::EndpointSwarm;
 
 use crate::Error;
 
@@ -68,7 +69,7 @@ impl PubsubDriver {
     ///
     /// Returns `true` when the event belongs to a floodsub stream and must
     /// not be forwarded to the application.
-    pub(crate) fn ingest(&mut self, event: &SwarmEvent, swarm: &mut Swarm<QuicEndpoint>) -> bool {
+    pub(crate) fn ingest(&mut self, event: &SwarmEvent, swarm: &mut EndpointSwarm) -> bool {
         let handled = self.agent.handle_event(event, self.now_ms());
         self.pump(swarm);
         handled
@@ -76,7 +77,7 @@ impl PubsubDriver {
 
     /// Advances timers only when the agent reports a due deadline, then
     /// executes any resulting work.
-    pub(crate) fn tick(&mut self, swarm: &mut Swarm<QuicEndpoint>) {
+    pub(crate) fn tick(&mut self, swarm: &mut EndpointSwarm) {
         let now_ms = self.now_ms();
         if self.agent.next_timeout(now_ms) != Some(0) {
             return;
@@ -87,7 +88,7 @@ impl PubsubDriver {
 
     /// Drains agent actions into swarm calls (echoing synchronous results
     /// back) and collects application-visible pubsub events.
-    pub(crate) fn pump(&mut self, swarm: &mut Swarm<QuicEndpoint>) {
+    pub(crate) fn pump(&mut self, swarm: &mut EndpointSwarm) {
         loop {
             let mut progressed = false;
             while let Some(action) = self.agent.poll_action() {
@@ -104,7 +105,7 @@ impl PubsubDriver {
         }
     }
 
-    fn execute(&mut self, action: PubsubAction, swarm: &mut Swarm<QuicEndpoint>) {
+    fn execute(&mut self, action: PubsubAction, swarm: &mut EndpointSwarm) {
         match action {
             PubsubAction::OpenStream {
                 token,

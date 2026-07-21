@@ -186,19 +186,6 @@ pub fn print_nat_event(role: &str, event: &NatEvent) {
         NatEvent::ConnectFailed { peer, error, .. } => {
             println!("[{role}] nat-connect-failed peer={peer} error={error}");
         }
-        NatEvent::InboundRelayCircuit {
-            peer,
-            relay,
-            stream_id,
-            pending_data,
-            remote_write_closed,
-        } => {
-            println!(
-                "[{role}] nat-inbound-circuit peer={peer} relay={relay} stream={stream_id} \
-                 pending-bytes={} remote-write-closed={remote_write_closed}",
-                pending_data.len()
-            );
-        }
         NatEvent::InboundDirectUpgrade { peer } => {
             println!("[{role}] nat-inbound-direct-upgrade peer={peer}");
         }

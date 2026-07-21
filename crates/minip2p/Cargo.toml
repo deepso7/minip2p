@@ -9,12 +9,13 @@ readme = "README.md"
 workspace = true
 
 [features]
-nat = ["dep:minip2p-nat", "dep:getrandom"]
+nat = ["dep:minip2p-circuit", "dep:minip2p-nat", "dep:getrandom"]
 pubsub = ["dep:minip2p-pubsub", "dep:thiserror"]
 discovery = ["nat", "pubsub", "dep:minip2p-discovery"]
 
 [dependencies]
 minip2p-core = { path = "../core" }
+minip2p-circuit = { path = "../circuit", optional = true }
 minip2p-discovery = { path = "../discovery", optional = true }
 minip2p-identify = { path = "../identify" }
 minip2p-identity = { path = "../identity" }

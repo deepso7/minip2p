@@ -54,23 +54,18 @@ $ minip2p-chat host --relay /ip6/…/udp/4001/quic-v1/p2p/<relay-id>
 ```
 
 A joiner pastes the circuit address; the NAT agent connects through the
-relay, runs DCUtR, and the chat starts once the hole punch lands:
+relay and chat starts immediately on the promoted relayed connection while
+DCUtR attempts a direct upgrade in the background:
 
 ```console
 $ minip2p-chat join '<circuit-addr>' --nick alice
 [join] path=relayed
-[join] waiting for the hole punch (chat needs a direct path)
-[join] nat-path-upgraded … to=direct-punched
 [join] subscribed topic=minip2p-chat nick=alice
 ```
 
-### Known v1 limitation: no chat over the relay bridge
-
-The relayed path is a raw bridge stream — no multistream negotiation runs
-over it, so floodsub cannot open its streams there. If the hole punch
-fails, `join` exits with an error instead of silently sitting in a dead
-room. A circuit transport that makes relayed paths look like normal
-connections is future work at the stack level.
+Pass `--relay-only` to skip direct dialing and DCUtR entirely. This gives a
+deterministic way to exercise Noise, Yamux, Identify, discovery, and floodsub
+over the relay circuit.
 
 ## Message format
 

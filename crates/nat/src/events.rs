@@ -6,6 +6,15 @@ use minip2p_transport::StreamId;
 
 use crate::types::{ConnectId, NatError, NatToken, Path, ReachabilityState};
 
+/// Local role used when promoting a relay bridge into a circuit connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BridgeRole {
+    /// The local endpoint initiated the HOP CONNECT request.
+    Initiator,
+    /// The local endpoint accepted the STOP CONNECT request.
+    Responder,
+}
+
 /// Commands the agent asks its driver to execute against the swarm.
 ///
 /// `Dial` and `OpenStream` are synchronous swarm calls; the driver echoes
@@ -44,6 +53,23 @@ pub enum NatAction {
         target: Multiaddr,
         payload_len: usize,
     },
+    /// Relinquish a negotiated relay bridge to the circuit transport and
+    /// report the synchronous adoption result with `token`.
+    PromoteBridge {
+        token: NatToken,
+        inner_conn: minip2p_transport::ConnectionId,
+        relay: PeerId,
+        stream_id: StreamId,
+        remote_peer: PeerId,
+        role: BridgeRole,
+        pending_data: Vec<u8>,
+        remote_write_closed: bool,
+    },
+    /// Close a promoted circuit connection. Closing an already-gone circuit
+    /// is successful cleanup.
+    CloseCircuit {
+        conn_id: minip2p_transport::ConnectionId,
+    },
 }
 
 /// Events the agent surfaces to the application.
@@ -80,8 +106,7 @@ pub enum NatEvent {
         path: Path,
     },
     /// A better path replaced the previously announced one. When `from` was
-    /// [`Path::Relayed`], its bridge stream has been reset and must no
-    /// longer be used.
+    /// [`Path::Relayed`], its circuit connection is closed automatically.
     PathUpgraded {
         connect_id: ConnectId,
         peer: PeerId,
@@ -96,32 +121,14 @@ pub enum NatEvent {
         attempt: u32,
         reason: String,
     },
-    /// All punch windows are exhausted; the relayed path announced earlier
-    /// remains the final path for this attempt, and its bridge stream now
-    /// belongs entirely to the application.
+    /// All punch windows are exhausted; the established relayed connection
+    /// remains the final path for this attempt.
     FellBackToRelay { connect_id: ConnectId, peer: PeerId },
     /// The attempt ended with no usable path.
     ConnectFailed {
         connect_id: ConnectId,
         peer: PeerId,
         error: NatError,
-    },
-    /// A remote peer opened a relay circuit to us (responder side). The
-    /// stream is a raw bridge; `pending_data` holds any bytes that arrived
-    /// pipelined behind the circuit setup.
-    InboundRelayCircuit {
-        /// The initiating peer on the far end of the circuit.
-        peer: PeerId,
-        /// The relay the bridge runs through. The bridge stream lives on the
-        /// connection to this peer: `send_stream` / `close_stream_write` on
-        /// `stream_id` must address `relay`, not `peer`.
-        relay: PeerId,
-        stream_id: StreamId,
-        pending_data: Vec<u8>,
-        /// `true` when the remote write half reached EOF before handoff. The
-        /// original swarm event was consumed by the NAT control plane and
-        /// will not be emitted again for the application.
-        remote_write_closed: bool,
     },
     /// An inbound circuit's hole punch succeeded; the peer is now directly
     /// connected.

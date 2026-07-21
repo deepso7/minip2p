@@ -247,6 +247,23 @@ impl World {
                     self.blasts_from_b += 1;
                 }
             }
+            NatAction::PromoteBridge {
+                token, remote_peer, ..
+            } => {
+                self.next_conn += 1;
+                let conn_id = ConnectionId::new((1 << 63) | self.next_conn);
+                let agent = self.agent(side);
+                agent.promote_result(token, Ok(conn_id), now);
+                agent.handle_event_with_disposition_classified(
+                    &SwarmEvent::ConnectionEstablished {
+                        peer_id: remote_peer,
+                        conn_id,
+                    },
+                    true,
+                    now,
+                );
+            }
+            NatAction::CloseCircuit { .. } => {}
             NatAction::CloseStreamWrite { .. }
             | NatAction::ResetStream { .. }
             | NatAction::Disconnect { .. } => {}
@@ -432,13 +449,9 @@ fn two_agents_punch_to_a_direct_connection() {
         "A's punch targets B's public mapping: {:?}",
         world.punch_dial_addrs_from_a
     );
-    let events = drain_events(&mut world.b);
     assert!(
-        matches!(
-            events.as_slice(),
-            [NatEvent::InboundRelayCircuit { peer, .. }] if *peer == world.a_id
-        ),
-        "B released the inbound bridge, got {events:?}"
+        drain_events(&mut world.b).is_empty(),
+        "inbound circuits surface through normal swarm lifecycle events"
     );
 
     // B's punch-back is blast-only (DCUtR for QUIC: the initiator dials).

@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! minip2p-chat host        [--topic <t>] [--nick <n>] [--relay <relay-peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--no-mesh]
-//! minip2p-chat join <addr> [--topic <t>] [--nick <n>] [--relay <peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--no-mesh]
+//! minip2p-chat join <addr> [--topic <t>] [--nick <n>] [--relay <peer-addr>] [--relay-only] [--key <path>] [--listen <quic-multiaddr>] [--no-mesh]
 //! ```
 //!
 //! `<addr>` is either the host's printed `bound=` peer-addr, or its
@@ -60,6 +60,8 @@ pub struct ChatOptions {
     pub allow_unsigned: bool,
     /// Disable peer discovery and preserve the host-forwarded star topology.
     pub no_mesh: bool,
+    /// Skip direct dialing and DCUtR so relay-only behavior is deterministic.
+    pub relay_only: bool,
 }
 
 /// Parse error surfaced back to `main` so the binary exits with a readable
@@ -105,7 +107,7 @@ fn parse_join(args: Vec<String>) -> Result<Mode, CliError> {
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        if arg == "--allow-unsigned" || arg == "--no-mesh" {
+        if arg == "--allow-unsigned" || arg == "--no-mesh" || arg == "--relay-only" {
             // Boolean flag: no value follows.
             rest.push(arg.clone());
             i += 1;
@@ -203,6 +205,14 @@ impl Flags {
                     i += 1;
                     continue;
                 }
+                "--relay-only" => {
+                    if chat.relay_only {
+                        return Err(CliError("--relay-only specified twice".into()));
+                    }
+                    chat.relay_only = true;
+                    i += 1;
+                    continue;
+                }
                 "--topic" => {
                     let value = flag_value(args, i, key)?;
                     if chat.topic.is_some() {
@@ -296,12 +306,12 @@ pub fn usage() -> String {
 
 USAGE:
     minip2p-chat host        [--topic <t>] [--nick <n>] [--relay <relay-peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--no-mesh]
-    minip2p-chat join <addr> [--topic <t>] [--nick <n>] [--relay <peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--no-mesh]
+    minip2p-chat join <addr> [--topic <t>] [--nick <n>] [--relay <peer-addr>] [--relay-only] [--key <path>] [--listen <quic-multiaddr>] [--no-mesh]
 
 NOTES:
     <addr>    the host's printed `bound=` peer-addr, or its `circuit=`
               address (/…/p2p/<relay>/p2p-circuit/p2p/<peer>) when the host
-              is behind a NAT (joiners then hole-punch a direct path)
+              is behind a NAT
     --topic   chat room name (default: minip2p-chat)
     --nick    display name (default: first 8 chars of the peer id)
     --relay   relay peer-addr for NAT traversal / reservations
@@ -312,6 +322,9 @@ NOTES:
               accept unsigned messages (rust-libp2p floodsub interop;
               signed messages are still verified)
     --no-mesh preserve the host-forwarded star by disabling peer discovery
+    --relay-only
+              skip direct dialing and hole punching; use the promoted relay
+              circuit for deterministic relay-only testing
 
     Type lines on stdin to chat; EOF (Ctrl-D) exits.
 
@@ -384,6 +397,26 @@ mod tests {
             assert!(chat.no_mesh);
         }
         let duplicate = vec!["host", "--no-mesh", "--no-mesh"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert!(parse(duplicate).is_err());
+    }
+
+    #[test]
+    fn relay_only_is_a_boolean_join_flag() {
+        let target = format!("{RELAY}/p2p/{PEER_ID}");
+        for args in [
+            vec!["join", "--relay-only", target.as_str()],
+            vec!["join", target.as_str(), "--relay-only"],
+        ] {
+            let parsed = parse(args.into_iter().map(str::to_string).collect()).unwrap();
+            let Mode::Join { chat, .. } = parsed else {
+                panic!()
+            };
+            assert!(chat.relay_only);
+        }
+        let duplicate = vec!["join", target.as_str(), "--relay-only", "--relay-only"]
             .into_iter()
             .map(str::to_string)
             .collect();

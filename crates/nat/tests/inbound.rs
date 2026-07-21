@@ -71,13 +71,18 @@ fn full_inbound_flow_blasts_and_upgrades() {
     drive_to_sync_ready(&mut h, stream);
 
     h.stream_data(stream, dcutr_sync(), at(30));
-    let events = drain_events(&mut h.agent);
-    assert!(matches!(
-        events.as_slice(),
-        [NatEvent::InboundRelayCircuit { peer, relay, stream_id, .. }]
-            if *peer == h.target && *relay == h.relay && *stream_id == stream
-    ));
     let actions = drain_actions(&mut h.agent);
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        NatAction::PromoteBridge {
+            relay,
+            stream_id,
+            remote_peer,
+            ..
+        } if relay == &h.relay && *stream_id == stream && remote_peer == &h.target
+    )));
+    let target = h.target.clone();
+    complete_promotion(&mut h.agent, &target, &actions, at(31));
     assert_eq!(
         dial_count_for(&actions, &h.target),
         0,
@@ -86,7 +91,7 @@ fn full_inbound_flow_blasts_and_upgrades() {
     );
     assert!(
         !h.agent.owns_stream(&h.relay, stream),
-        "bridge belongs to the app after SYNC"
+        "bridge belongs to the circuit transport after SYNC"
     );
 
     // First blast waits out the configured sync delay (50ms after SYNC).
@@ -120,6 +125,58 @@ fn full_inbound_flow_blasts_and_upgrades() {
 }
 
 #[test]
+fn force_relay_promotes_immediately_after_stop_acceptance() {
+    let mut h = inbound_harness(NatConfig {
+        force_relay: true,
+        ..NatConfig::default()
+    });
+    let stream = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stream, 0);
+    let target = h.target.clone();
+    h.stream_data(stream, stop_connect(&target), at(10));
+    let actions = drain_actions(&mut h.agent);
+    assert_eq!(
+        send_stream_count(&actions),
+        1,
+        "only STOP STATUS:OK is sent"
+    );
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        NatAction::PromoteBridge {
+            role: minip2p_nat::BridgeRole::Responder,
+            ..
+        }
+    )));
+    complete_promotion(&mut h.agent, &target, &actions, at(11));
+    assert!(h.agent.is_idle());
+}
+
+#[test]
+fn stalled_inbound_circuit_handshake_is_closed_at_its_deadline() {
+    let mut h = inbound_harness(NatConfig {
+        force_relay: true,
+        circuit_handshake_timeout_ms: 5,
+        ..NatConfig::default()
+    });
+    let stream = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stream, 0);
+    let target = h.target.clone();
+    h.stream_data(stream, stop_connect(&target), at(10));
+    let actions = drain_actions(&mut h.agent);
+    let conn_id = minip2p_transport::ConnectionId::new(TEST_CIRCUIT_ID);
+    h.agent
+        .promote_result(promote_token(&actions), Ok(conn_id), at(11));
+
+    h.agent.handle_tick(at(16));
+    assert!(
+        drain_actions(&mut h.agent).iter().any(
+            |action| matches!(action, NatAction::CloseCircuit { conn_id: id } if *id == conn_id)
+        )
+    );
+    assert!(h.agent.is_idle());
+}
+
+#[test]
 fn sync_coalesced_with_application_data_preserves_the_bridge_remainder() {
     let mut h = inbound_harness(NatConfig::default());
     let stream = StreamId::new(STOP_STREAM);
@@ -131,16 +188,8 @@ fn sync_coalesced_with_application_data_preserves_the_bridge_remainder() {
     coalesced.extend_from_slice(&app_data);
     h.stream_data(stream, coalesced, at(30));
 
-    let events = drain_events(&mut h.agent);
-    assert!(matches!(
-        events.as_slice(),
-        [NatEvent::InboundRelayCircuit {
-            peer,
-            stream_id,
-            pending_data,
-            ..
-        }] if *peer == h.target && *stream_id == stream && *pending_data == app_data
-    ));
+    let actions = drain_actions(&mut h.agent);
+    assert_eq!(promoted_pending_data(&actions), app_data);
 }
 
 #[test]
@@ -204,15 +253,17 @@ fn stalled_exchange_still_releases_the_bridge() {
     // The initiator never starts DCUtR; at the exchange deadline the
     // accepted bridge goes to the app punch-less.
     h.agent.handle_tick(at(12_000));
-    let events = drain_events(&mut h.agent);
-    assert!(matches!(
-        events.as_slice(),
-        [NatEvent::InboundRelayCircuit { peer, .. }] if *peer == h.target
-    ));
     let actions = drain_actions(&mut h.agent);
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, NatAction::PromoteBridge { .. }))
+    );
     assert_eq!(dial_count_for(&actions, &h.target), 0);
     assert_eq!(blast_count(&actions), 0);
     assert!(!h.agent.owns_stream(&h.relay, stream));
+    let target = h.target.clone();
+    complete_promotion(&mut h.agent, &target, &actions, at(12_001));
     assert!(h.agent.is_idle());
 }
 
@@ -239,14 +290,8 @@ fn remote_write_close_keeps_an_accepted_bridge_alive_until_handoff() {
     // The half-close does not kill the local write half; hand the accepted
     // bridge to the app once the DCUtR exchange deadline expires.
     h.agent.handle_tick(at(12_000));
-    assert!(matches!(
-        drain_events(&mut h.agent).as_slice(),
-        [NatEvent::InboundRelayCircuit {
-            peer,
-            remote_write_closed: true,
-            ..
-        }] if *peer == h.target
-    ));
+    let actions = drain_actions(&mut h.agent);
+    assert!(promotion_remote_write_closed(&actions));
 }
 
 #[test]
