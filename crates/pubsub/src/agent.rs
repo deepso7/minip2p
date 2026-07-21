@@ -657,7 +657,7 @@ impl FloodsubAgent {
             let mut head = 0;
             while let Some(step) = self.take_frame(peer, stream_id, &mut head) {
                 match step {
-                    Ok(payload) => match Rpc::decode(&payload) {
+                    Ok(payload) => match Rpc::decode_floodsub(&payload) {
                         Ok(rpc) => {
                             if !self.process_rpc(peer, stream_id, rpc, now_ms) {
                                 return true;

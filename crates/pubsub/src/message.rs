@@ -652,6 +652,18 @@ impl Rpc {
 
     /// Decodes an RPC body.
     pub fn decode(input: &[u8]) -> Result<Self, PubsubWireError> {
+        Self::decode_inner(input, true)
+    }
+
+    /// Decodes the floodsub fields of an RPC while treating meshsub control
+    /// as an opaque length-delimited extension. Floodsub never consumes
+    /// field 3, so parsing its nested lists would only allocate attacker-
+    /// controlled state that the router immediately discards.
+    pub(crate) fn decode_floodsub(input: &[u8]) -> Result<Self, PubsubWireError> {
+        Self::decode_inner(input, false)
+    }
+
+    fn decode_inner(input: &[u8], decode_control: bool) -> Result<Self, PubsubWireError> {
         let mut rpc = Self::default();
         let mut idx = 0;
         while let Some((field, wire_type)) = read_tag(input, &mut idx)? {
@@ -666,9 +678,11 @@ impl Rpc {
                 }
                 (3, WIRE_LEN) => {
                     let nested = read_len_delimited(input, &mut idx)?;
-                    rpc.control
-                        .get_or_insert_with(ControlMessage::default)
-                        .merge_from(nested)?;
+                    if decode_control {
+                        rpc.control
+                            .get_or_insert_with(ControlMessage::default)
+                            .merge_from(nested)?;
+                    }
                 }
                 (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
             }
@@ -1059,6 +1073,33 @@ mod tests {
                 .as_deref(),
             Some("t")
         );
+    }
+
+    #[test]
+    fn floodsub_decode_skips_control_without_parsing_it() {
+        // The nested field-zero tag is malformed protobuf. The shared
+        // meshsub-aware decoder rejects it, while floodsub treats the whole
+        // control body as an opaque extension and still decodes later fields.
+        let mut encoded = Vec::new();
+        encode_nested_field(&mut encoded, tag_byte(3, WIRE_LEN), &[0x00, 0x01]);
+        encode_nested_field(
+            &mut encoded,
+            tag_byte(1, WIRE_LEN),
+            &SubOpts {
+                subscribe: Some(true),
+                topic_id: Some(String::from("t")),
+            }
+            .encode(),
+        );
+
+        assert!(matches!(
+            Rpc::decode(&encoded),
+            Err(PubsubWireError::InvalidFieldNumber { .. })
+        ));
+        let floodsub = Rpc::decode_floodsub(&encoded).unwrap();
+        assert_eq!(floodsub.control, None);
+        assert_eq!(floodsub.subscriptions.len(), 1);
+        assert_eq!(floodsub.subscriptions[0].topic_id.as_deref(), Some("t"));
     }
 
     #[test]
