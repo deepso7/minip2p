@@ -131,6 +131,30 @@ fn stream_action_matches(action: &SwarmAction, conn_id: ConnectionId, stream_id:
     )
 }
 
+fn connection_action_matches(action: &SwarmAction, conn_id: ConnectionId) -> bool {
+    match action {
+        SwarmAction::OpenStream {
+            conn_id: action_conn,
+            ..
+        }
+        | SwarmAction::SendStream {
+            conn_id: action_conn,
+            ..
+        }
+        | SwarmAction::CloseStreamWrite {
+            conn_id: action_conn,
+            ..
+        }
+        | SwarmAction::ResetStream {
+            conn_id: action_conn,
+            ..
+        }
+        | SwarmAction::CloseConnection {
+            conn_id: action_conn,
+        } => *action_conn == conn_id,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SwarmCore
 // ---------------------------------------------------------------------------
@@ -1037,6 +1061,10 @@ impl SwarmCore {
         self.outbound_negotiators
             .retain(|(cid, _), _| *cid != old_id);
         self.pending_opens.retain(|_, p| p.conn_id != old_id);
+        self.actions
+            .retain(|action| !connection_action_matches(action, old_id));
+        self.after_event_actions
+            .retain(|action| !connection_action_matches(action, old_id));
         self.after_event_actions
             .push_back(SwarmAction::CloseConnection { conn_id: old_id });
     }
@@ -2191,6 +2219,59 @@ mod tests {
             err,
             SwarmError::StreamNotFound { peer_id: p, stream_id: s }
                 if p == peer_id && s == stream_id
+        ));
+    }
+
+    #[test]
+    fn superseding_connection_discards_undrained_old_actions() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"undrained-superseded-peer");
+        let original = ConnectionId::new(12);
+        let replacement = ConnectionId::new(13);
+        let stream = StreamId::new(8);
+
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: original,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+        );
+        core.stream_owner.insert(
+            (original, stream),
+            ProtocolKind::User("/minip2p/test/1.0.0".into()),
+        );
+        core.send_stream(&peer_id, stream, b"stale".to_vec())
+            .expect("old connection stream should initially be active");
+        core.close_stream_write(&peer_id, stream)
+            .expect("old connection stream should initially be active");
+        core.reset_stream(&peer_id, stream)
+            .expect("old connection stream should initially be active");
+
+        // Supersede before draining the original connection's automatic
+        // Identify open or the application-requested stream actions.
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: replacement,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            },
+        );
+
+        assert!(
+            core.actions
+                .iter()
+                .all(|action| !connection_action_matches(action, original)),
+            "no ordinary action for the superseded connection may reach the driver"
+        );
+        assert!(
+            core.pending_opens
+                .values()
+                .all(|pending| pending.conn_id != original)
+        );
+        assert!(matches!(
+            core.after_event_actions.as_slices(),
+            ([SwarmAction::CloseConnection { conn_id }], []) if *conn_id == original
         ));
     }
 

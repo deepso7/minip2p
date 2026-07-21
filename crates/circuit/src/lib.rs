@@ -34,6 +34,11 @@ use thiserror::Error;
 /// Marker bit reserved for circuit connection identifiers.
 pub const CIRCUIT_ID_BIT: u64 = 1 << 63;
 
+// A retired bridge suppresses late inner-transport events after the circuit's
+// public `Closed`. Keep this finite because a peer may never finish closing
+// its half of a gracefully closed bridge.
+const MAX_RETIRED_BRIDGES: usize = 1024;
+
 fn is_circuit_id(id: ConnectionId) -> bool {
     id.as_u64() & CIRCUIT_ID_BIT != 0
 }
@@ -179,6 +184,7 @@ pub struct CircuitTransport<T, E> {
     circuits: BTreeMap<ConnectionId, Circuit>,
     bridge_index: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
     retired_bridges: BTreeSet<(ConnectionId, StreamId)>,
+    retired_bridge_order: VecDeque<(ConnectionId, StreamId)>,
     active_inner: BTreeSet<ConnectionId>,
     direct_by_peer: BTreeMap<PeerId, BTreeSet<ConnectionId>>,
     direct_by_conn: BTreeMap<ConnectionId, PeerId>,
@@ -197,6 +203,7 @@ impl<T, E> CircuitTransport<T, E> {
             circuits: BTreeMap::new(),
             bridge_index: BTreeMap::new(),
             retired_bridges: BTreeSet::new(),
+            retired_bridge_order: VecDeque::new(),
             active_inner: BTreeSet::new(),
             direct_by_peer: BTreeMap::new(),
             direct_by_conn: BTreeMap::new(),
@@ -390,7 +397,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
     /// Reports that a bridge stream fully closed or reset.
     pub fn inject_bridge_closed(&mut self, inner_conn: ConnectionId, bridge_stream: StreamId) {
         let key = (inner_conn, bridge_stream);
-        self.retired_bridges.remove(&key);
+        self.release_retired_bridge(key);
         if let Some(id) = self.bridge_index.get(&key).copied() {
             let pre_ready = self.circuits.get(&id).is_some_and(|c| !c.is_ready());
             self.fail_circuit(id, "relay bridge closed".to_string(), pre_ready);
@@ -409,6 +416,30 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         let result = operation(self, &mut circuit);
         self.circuits.insert(id, circuit);
         result
+    }
+
+    fn retire_bridge(&mut self, key: (ConnectionId, StreamId)) {
+        if !self.retired_bridges.insert(key) {
+            return;
+        }
+        self.retired_bridge_order.push_back(key);
+        if self.retired_bridge_order.len() > MAX_RETIRED_BRIDGES
+            && let Some(expired) = self.retired_bridge_order.pop_front()
+        {
+            self.retired_bridges.remove(&expired);
+        }
+    }
+
+    fn release_retired_bridge(&mut self, key: (ConnectionId, StreamId)) {
+        if self.retired_bridges.remove(&key) {
+            self.retired_bridge_order
+                .retain(|candidate| *candidate != key);
+        }
+    }
+
+    fn release_retired_bridges_for_connection(&mut self, id: ConnectionId) {
+        self.retired_bridges.retain(|(conn, _)| *conn != id);
+        self.retired_bridge_order.retain(|(conn, _)| *conn != id);
     }
 
     fn start_phase(&mut self, circuit: &Circuit, phase: Phase) -> Result<Phase, String> {
@@ -742,7 +773,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         };
         let key = circuit.bridge_key();
         self.bridge_index.remove(&key);
-        self.retired_bridges.insert(key);
+        self.retire_bridge(key);
         let _ = self
             .inner
             .reset_stream(circuit.inner_conn, circuit.bridge_stream);
@@ -904,14 +935,17 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                         .is_some_and(|circuit| !circuit.is_ready());
                     self.fail_circuit(circuit_id, "relay connection closed".to_string(), pre_ready);
                 }
-                self.retired_bridges.retain(|(conn, _)| *conn != id);
+                self.release_retired_bridges_for_connection(id);
                 self.pending.push_back(TransportEvent::Closed { id });
             }
             other => self.pending.push_back(other),
         }
     }
 
-    fn circuit_stream(id: ConnectionId, stream_id: StreamId) -> Result<u32, TransportError> {
+    fn circuit_stream(&self, id: ConnectionId, stream_id: StreamId) -> Result<u32, TransportError> {
+        if !self.circuits.contains_key(&id) {
+            return Err(TransportError::ConnectionNotFound { id });
+        }
         u32::try_from(stream_id.as_u64())
             .map_err(|_| TransportError::StreamNotFound { id, stream_id })
     }
@@ -957,7 +991,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         stream_id: StreamId,
         data: Vec<u8>,
     ) -> Result<(), TransportError> {
-        let stream = Self::circuit_stream(id, stream_id)?;
+        let stream = self.circuit_stream(id, stream_id)?;
         let mut circuit = self
             .circuits
             .remove(&id)
@@ -1055,7 +1089,7 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         if !is_circuit_id(id) {
             return self.inner.close_stream_write(id, stream_id);
         }
-        let stream = Self::circuit_stream(id, stream_id)?;
+        let stream = self.circuit_stream(id, stream_id)?;
         match self.operate_ready(id, |yamux| yamux.close_write(stream)) {
             Ok(()) => Ok(()),
             Err(error @ TransportError::ConnectionNotFound { .. })
@@ -1076,7 +1110,7 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         if !is_circuit_id(id) {
             return self.inner.reset_stream(id, stream_id);
         }
-        let stream = Self::circuit_stream(id, stream_id)?;
+        let stream = self.circuit_stream(id, stream_id)?;
         match self.operate_ready(id, |yamux| yamux.reset(stream)) {
             Ok(()) => Ok(()),
             Err(error @ TransportError::ConnectionNotFound { .. })
@@ -1099,7 +1133,7 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
             .ok_or(TransportError::ConnectionNotFound { id })?;
         let key = circuit.bridge_key();
         self.bridge_index.remove(&key);
-        self.retired_bridges.insert(key);
+        self.retire_bridge(key);
         let ready = circuit.is_ready();
         let mut graceful = false;
         if let Some(Phase::Ready {
@@ -1653,6 +1687,26 @@ mod tests {
             })
         );
 
+        let oversized_stream = StreamId::new(u64::from(u32::MAX) + 1);
+        assert_eq!(
+            a.send_stream(unknown_connection, oversized_stream, vec![1]),
+            Err(TransportError::ConnectionNotFound {
+                id: unknown_connection,
+            })
+        );
+        assert_eq!(
+            a.close_stream_write(unknown_connection, oversized_stream),
+            Err(TransportError::ConnectionNotFound {
+                id: unknown_connection,
+            })
+        );
+        assert_eq!(
+            a.reset_stream(unknown_connection, oversized_stream),
+            Err(TransportError::ConnectionNotFound {
+                id: unknown_connection,
+            })
+        );
+
         assert!(matches!(
             a.send_stream(circuit_id, stream, vec![1]),
             Err(TransportError::StreamSendFailed { id, stream_id, .. })
@@ -2015,6 +2069,28 @@ mod tests {
             "unexpected peer close events: {peer_events:?}"
         );
         assert!(b.poll().expect("terminal peer state").is_empty());
+    }
+
+    #[test]
+    fn gracefully_closed_bridge_tombstones_are_bounded() {
+        let (mut a, mut b, circuit_id, bridge, a_peer, b_peer) = setup_close_observed_pair();
+        complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
+        let inner_conn = ConnectionId::new(1);
+
+        a.close(circuit_id).expect("graceful circuit close");
+        let _ = a.poll().expect("local close event");
+        assert!(a.retired_bridges.contains(&(inner_conn, bridge)));
+
+        for index in 0..MAX_RETIRED_BRIDGES {
+            a.retire_bridge((
+                inner_conn,
+                StreamId::new(10_000 + u64::try_from(index).expect("usize fits u64")),
+            ));
+        }
+
+        assert_eq!(a.retired_bridges.len(), MAX_RETIRED_BRIDGES);
+        assert_eq!(a.retired_bridge_order.len(), MAX_RETIRED_BRIDGES);
+        assert!(!a.retired_bridges.contains(&(inner_conn, bridge)));
     }
 
     #[test]

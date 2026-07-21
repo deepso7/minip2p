@@ -40,6 +40,7 @@ struct InMemoryLink {
 struct InMemoryStream {
     write_closed: [bool; 2],
     closed: bool,
+    close_delivered: [bool; 2],
 }
 
 impl InMemoryTransport {
@@ -244,9 +245,7 @@ impl Transport for InMemoryTransport {
         let other = 1 - self.side;
         let mut shared = self.shared.borrow_mut();
         shared.active = false;
-        for stream in shared.streams.values_mut() {
-            stream.closed = true;
-        }
+        shared.streams.clear();
         shared.queues[self.side].push_back(TransportEvent::Closed { id });
         shared.queues[other].push_back(TransportEvent::Closed {
             id: self.connection,
@@ -255,9 +254,31 @@ impl Transport for InMemoryTransport {
     }
 
     fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
-        Ok(self.shared.borrow_mut().queues[self.side]
-            .drain(..)
-            .collect())
+        let mut shared = self.shared.borrow_mut();
+        let events = shared.queues[self.side].drain(..).collect::<Vec<_>>();
+        let mut fully_delivered = Vec::new();
+        for event in &events {
+            let stream_id = match event {
+                TransportEvent::StreamClosed { id, stream_id } if *id == self.connection => {
+                    *stream_id
+                }
+                _ => continue,
+            };
+            let Some(stream) = shared.streams.get_mut(&stream_id) else {
+                continue;
+            };
+            if !stream.closed {
+                continue;
+            }
+            stream.close_delivered[self.side] = true;
+            if stream.close_delivered == [true, true] {
+                fully_delivered.push(stream_id);
+            }
+        }
+        for stream_id in fully_delivered {
+            shared.streams.remove(&stream_id);
+        }
+        Ok(events)
     }
 
     fn next_timeout(&self) -> Option<Duration> {
@@ -623,6 +644,7 @@ mod tests {
             b.poll().unwrap(),
             [TransportEvent::StreamClosed { id, stream_id }]
         );
+        assert!(a.shared.borrow().streams.is_empty());
         assert_eq!(
             b.send_stream(id, stream_id, vec![1]),
             Err(TransportError::StreamNotFound { id, stream_id })
@@ -660,6 +682,34 @@ mod tests {
     }
 
     #[test]
+    fn in_memory_reclaims_terminal_streams_after_both_close_events_are_delivered() {
+        let (mut a, mut b) = transport_pair();
+        drain_startup(&mut a, &mut b);
+        let id = a.connection_id();
+
+        for _ in 0..128 {
+            let stream_id = a.open_stream(id).unwrap();
+            a.poll().unwrap();
+            b.poll().unwrap();
+
+            a.reset_stream(id, stream_id).unwrap();
+            a.reset_stream(id, stream_id).unwrap();
+            assert_eq!(a.shared.borrow().streams.len(), 1);
+
+            assert_eq!(
+                a.poll().unwrap(),
+                [TransportEvent::StreamClosed { id, stream_id }]
+            );
+            assert_eq!(a.shared.borrow().streams.len(), 1);
+            assert_eq!(
+                b.poll().unwrap(),
+                [TransportEvent::StreamClosed { id, stream_id }]
+            );
+            assert!(a.shared.borrow().streams.is_empty());
+        }
+    }
+
+    #[test]
     fn in_memory_close_disables_both_endpoints_before_closed_is_polled() {
         let (mut a, mut b) = transport_pair();
         drain_startup(&mut a, &mut b);
@@ -669,6 +719,8 @@ mod tests {
         b.poll().unwrap();
 
         a.close(id).unwrap();
+
+        assert!(a.shared.borrow().streams.is_empty());
 
         assert_eq!(
             b.open_stream(id),
