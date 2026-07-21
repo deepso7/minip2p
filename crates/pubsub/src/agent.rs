@@ -23,7 +23,7 @@ use crate::message::{
     FLOODSUB_PROTOCOL_ID, FrameDecode, MAX_RPC_SIZE, MAX_TOPIC_LEN, RawMessage, Rpc, SubOpts,
     decode_frame, encode_frame,
 };
-use crate::seen::{MessageId, SeenCache};
+use crate::seen::{SeenCache, message_id};
 
 /// Longest possible frame prefix; bounds the inbound reassembly buffers.
 const MAX_PREFIX_LEN: usize = 10;
@@ -85,12 +85,14 @@ enum SendState {
     },
     /// Stream allocated; waiting for multistream negotiation.
     Negotiating {
+        send_token: PubsubToken,
         stream_id: StreamId,
         since_ms: u64,
         work: OutboundWork,
     },
     /// Frame written and write half closed; waiting for the close.
     AwaitingClose {
+        send_token: PubsubToken,
         stream_id: StreamId,
         since_ms: u64,
         work: OutboundWork,
@@ -270,7 +272,7 @@ impl FloodsubAgent {
         }
         self.next_seqno = self.next_seqno.wrapping_add(1);
 
-        let id: MessageId = (self.local_peer_id.to_bytes(), seqno.to_be_bytes().to_vec());
+        let id = message_id(&self.local_peer_id.to_bytes(), &seqno.to_be_bytes());
         self.seen.insert(
             id,
             now_ms,
@@ -332,33 +334,40 @@ impl FloodsubAgent {
         }
     }
 
-    /// Reports a synchronous failure of a [`PubsubAction::SendStream`].
-    ///
-    /// Without this feedback, the in-flight sender would sit in
-    /// `AwaitingClose` and the stream's eventual close would **commit**
-    /// work whose frame was never accepted by the swarm. The failed work
-    /// is discarded with an [`PubsubEvent::OutboundFailure`] and the
-    /// stream is reset; successful sends need no echo.
-    pub fn send_failed(&mut self, peer: &PeerId, stream_id: StreamId, reason: &str, now_ms: u64) {
+    /// Echoes the synchronous result of a [`PubsubAction::SendStream`].
+    /// Stale stream/token pairs are ignored. A matching success needs no
+    /// state transition for floodsub; close remains its commit point.
+    pub fn send_result(
+        &mut self,
+        peer: &PeerId,
+        stream_id: StreamId,
+        token: PubsubToken,
+        result: Result<(), String>,
+        now_ms: u64,
+    ) {
+        let is_current = self.peers.get(peer).is_some_and(|state| {
+            matches!(
+                &state.sender,
+                SendState::AwaitingClose {
+                    send_token,
+                    stream_id: expected,
+                    ..
+                } if *expected == stream_id && *send_token == token
+            )
+        });
+        if !is_current || result.is_ok() {
+            return;
+        }
+        let reason = result.expect_err("checked error");
         let Some(state) = self.peers.get_mut(peer) else {
             return;
         };
-        match core::mem::take(&mut state.sender) {
-            SendState::AwaitingClose {
-                stream_id: expected,
-                work,
-                ..
-            } if expected == stream_id => {
-                self.reject_stream(peer, stream_id);
-                self.fail_in_flight(peer, work, &format!("send failed: {reason}"));
-                self.drive_sender(peer, now_ms);
-            }
-            other => {
-                // Not the in-flight send (stale stream): leave the sender
-                // untouched.
-                state.sender = other;
-            }
-        }
+        let SendState::AwaitingClose { work, .. } = core::mem::take(&mut state.sender) else {
+            return;
+        };
+        self.reject_stream(peer, stream_id);
+        self.fail_in_flight(peer, work, &format!("send failed: {reason}"));
+        self.drive_sender(peer, now_ms);
     }
 
     /// Reports the result of a [`PubsubAction::OpenStream`]. `peer` and
@@ -393,7 +402,12 @@ impl FloodsubAgent {
         let Some(state) = self.peers.get_mut(peer) else {
             return;
         };
-        let SendState::Opening { since_ms, work, .. } = core::mem::take(&mut state.sender) else {
+        let SendState::Opening {
+            token: send_token,
+            since_ms,
+            work,
+        } = core::mem::take(&mut state.sender)
+        else {
             return;
         };
         match result {
@@ -402,6 +416,7 @@ impl FloodsubAgent {
                 // close): keep the original timestamp, or each state
                 // transition would grant the deadline anew.
                 state.sender = SendState::Negotiating {
+                    send_token,
                     stream_id,
                     since_ms,
                     work,
@@ -561,8 +576,14 @@ impl FloodsubAgent {
                 return self.owns_stream(peer, stream_id);
             };
             match core::mem::take(&mut state.sender) {
-                SendState::Negotiating { since_ms, work, .. } => {
+                SendState::Negotiating {
+                    send_token,
+                    since_ms,
+                    work,
+                    ..
+                } => {
                     self.actions.push_back(PubsubAction::SendStream {
+                        token: send_token,
                         peer: peer.clone(),
                         stream_id,
                         data: work.frame().to_vec(),
@@ -573,6 +594,7 @@ impl FloodsubAgent {
                     });
                     if let Some(state) = self.peers.get_mut(peer) {
                         state.sender = SendState::AwaitingClose {
+                            send_token,
                             stream_id,
                             since_ms,
                             work,
@@ -875,7 +897,7 @@ impl FloodsubAgent {
             }
         };
 
-        let id: MessageId = (from.to_bytes(), seqno.clone());
+        let id = message_id(&from.to_bytes(), &seqno);
         if self.seen.contains(&id) {
             return; // duplicate: silent
         }

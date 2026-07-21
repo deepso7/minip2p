@@ -84,6 +84,15 @@ fn negotiate_send(
     stream_id: StreamId,
     now: u64,
 ) -> Option<Vec<u8>> {
+    negotiate_send_with_token(a, peer, stream_id, now).map(|(frame, _)| frame)
+}
+
+fn negotiate_send_with_token(
+    a: &mut FloodsubAgent,
+    peer: &PeerId,
+    stream_id: StreamId,
+    now: u64,
+) -> Option<(Vec<u8>, minip2p_pubsub::PubsubToken)> {
     let actions = drain_actions(a);
     let (token, to) = open_stream_action(&actions)?;
     assert_eq!(&to, peer);
@@ -100,8 +109,8 @@ fn negotiate_send(
     );
     assert!(claimed, "our outbound StreamReady must be claimed");
     let actions = drain_actions(a);
-    let frame = actions.iter().find_map(|a| match a {
-        PubsubAction::SendStream { data, .. } => Some(data.clone()),
+    let (frame, send_token) = actions.iter().find_map(|a| match a {
+        PubsubAction::SendStream { token, data, .. } => Some((data.clone(), *token)),
         _ => None,
     })?;
     assert!(
@@ -110,7 +119,7 @@ fn negotiate_send(
             .any(|a| matches!(a, PubsubAction::CloseStreamWrite { .. })),
         "one-shot send must half-close: {actions:?}"
     );
-    Some(frame)
+    Some((frame, send_token))
 }
 
 /// Full one-shot send cycle: open → send → close. Returns the sent frame.
@@ -1392,10 +1401,17 @@ fn send_failure_prevents_the_commit() {
     connect(&mut a, &b, 0);
     a.subscribe("t", 1).unwrap();
     let stream = StreamId::new(4);
-    negotiate_send(&mut a, &b, stream, 1).expect("snapshot in flight");
+    let (_, send_token) =
+        negotiate_send_with_token(&mut a, &b, stream, 1).expect("snapshot in flight");
 
     // The swarm rejected the write: the close that follows must not commit.
-    a.send_failed(&b, stream, "connection lost", 2);
+    a.send_result(
+        &b,
+        stream,
+        send_token,
+        Err("connection lost".to_string()),
+        2,
+    );
     let events = drain_events(&mut a);
     assert!(
         events
@@ -1458,8 +1474,50 @@ fn send_failure_prevents_the_commit() {
 
     // A stale-stream failure report must not disturb a healthy sender.
     a.publish("t", b"x".to_vec(), 6).ok();
-    a.send_failed(&b, StreamId::new(999), "stale", 7);
+    a.send_result(
+        &b,
+        StreamId::new(999),
+        send_token,
+        Err("stale".to_string()),
+        7,
+    );
     assert!(drain_events(&mut a).is_empty(), "stale report is a no-op");
+
+    // The right stream with an old token is stale too.
+    a.subscribe("u", 8).unwrap();
+    let (open_token, _) = open_stream_action(&drain_actions(&mut a)).expect("new diff open");
+    let current_stream = StreamId::new(12);
+    a.stream_open_result(&b, open_token, Ok(current_stream), 8);
+    a.handle_event(
+        &SwarmEvent::StreamReady {
+            conn_id: minip2p_transport::ConnectionId::new(1),
+            peer_id: b.clone(),
+            stream_id: current_stream,
+            protocol_id: FLOODSUB_PROTOCOL_ID.to_string(),
+            initiated_locally: true,
+        },
+        8,
+    );
+    let current = drain_actions(&mut a);
+    let current_token = current
+        .iter()
+        .find_map(|action| match action {
+            PubsubAction::SendStream { token, .. } => Some(*token),
+            _ => None,
+        })
+        .expect("current send token");
+    assert_ne!(current_token, send_token);
+    a.send_result(
+        &b,
+        current_stream,
+        send_token,
+        Err("stale token".to_string()),
+        9,
+    );
+    assert!(drain_events(&mut a).is_empty());
+    assert!(drain_actions(&mut a).is_empty());
+    a.send_result(&b, current_stream, current_token, Ok(()), 9);
+    assert!(drain_events(&mut a).is_empty());
 }
 
 #[test]
