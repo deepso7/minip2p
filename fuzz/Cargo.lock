@@ -312,6 +312,7 @@ dependencies = [
  "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-noise",
+ "minip2p-pubsub",
  "minip2p-relay",
  "minip2p-transport",
  "minip2p-yamux",
@@ -360,10 +361,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "minip2p-ping"
+version = "0.1.0"
+dependencies = [
+ "minip2p-core",
+ "minip2p-transport",
+ "thiserror",
+]
+
+[[package]]
+name = "minip2p-pubsub"
+version = "0.1.0"
+dependencies = [
+ "minip2p-core",
+ "minip2p-identity",
+ "minip2p-swarm",
+ "minip2p-transport",
+ "thiserror",
+]
+
+[[package]]
 name = "minip2p-relay"
 version = "0.1.0"
 dependencies = [
  "minip2p-core",
+ "thiserror",
+]
+
+[[package]]
+name = "minip2p-swarm"
+version = "0.1.0"
+dependencies = [
+ "minip2p-core",
+ "minip2p-identify",
+ "minip2p-identity",
+ "minip2p-multistream-select",
+ "minip2p-ping",
+ "minip2p-transport",
  "thiserror",
 ]
 

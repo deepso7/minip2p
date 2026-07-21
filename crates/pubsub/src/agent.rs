@@ -216,6 +216,7 @@ impl FloodsubAgent {
         let rpc = Rpc {
             subscriptions: core::mem::take(&mut projected),
             publish: Vec::new(),
+            control: None,
         };
         if rpc.encode().len() > MAX_RPC_SIZE / 2 {
             return Err(TopicError::SetTooLarge);
@@ -261,6 +262,7 @@ impl FloodsubAgent {
         let rpc = Rpc {
             subscriptions: Vec::new(),
             publish: alloc::vec![message],
+            control: None,
         };
         let body = rpc.encode();
         if body.len() > MAX_RPC_SIZE {
@@ -899,6 +901,7 @@ impl FloodsubAgent {
         let rpc = Rpc {
             subscriptions: Vec::new(),
             publish: alloc::vec![message.clone()],
+            control: None,
         };
         let frame = encode_frame(&rpc.encode());
         let recipients: Vec<PeerId> = self
@@ -965,6 +968,7 @@ impl FloodsubAgent {
             let rpc = Rpc {
                 subscriptions,
                 publish: Vec::new(),
+                control: None,
             };
             OutboundWork::Subscriptions {
                 frame: encode_frame(&rpc.encode()),

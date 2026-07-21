@@ -22,6 +22,8 @@ pub use agent::FloodsubAgent;
 pub use config::FloodsubConfig;
 pub use events::{PublishError, PubsubAction, PubsubEvent, PubsubToken, TopicError};
 pub use message::{
-    FLOODSUB_PROTOCOL_ID, FrameDecode, MAX_RPC_SIZE, MAX_TOPIC_LEN, MessageVerifyError,
-    PubsubWireError, RawMessage, Rpc, SubOpts, decode_frame, encode_frame,
+    ControlGraft, ControlIHave, ControlIWant, ControlMessage, ControlPrune, FLOODSUB_PROTOCOL_ID,
+    FrameDecode, MAX_RPC_SIZE, MAX_TOPIC_LEN, MESHSUB_PROTOCOL_ID_V10, MESHSUB_PROTOCOL_ID_V11,
+    MessageVerifyError, PeerInfo, PubsubWireError, RawMessage, Rpc, SubOpts, decode_frame,
+    encode_frame,
 };

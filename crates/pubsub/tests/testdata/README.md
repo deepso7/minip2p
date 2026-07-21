@@ -20,3 +20,8 @@ Facts the capture confirmed about what current go emits:
 `[7u8; 32]`, so re-running the harness reproduces the same identity; the
 seqno and therefore the signature bytes differ per run — that's fine, the
 Rust test verifies signatures, it does not compare them).
+
+`go_control_rpc.hex` is an unframed RPC body marshaled by the same pinned Go
+module. It contains IHAVE, IWANT, GRAFT, and PRUNE, including v1.1 peer
+exchange and backoff fields. Unlike the signed publish fixture it is fully
+deterministic; the Rust test requires a byte-identical decode/re-encode.

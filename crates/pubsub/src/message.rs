@@ -1,4 +1,4 @@
-//! Wire codec for the libp2p pubsub RPC as spoken on `/floodsub/1.0.0`:
+//! Wire codec for the libp2p pubsub RPC as spoken by floodsub and meshsub:
 //! protobuf encode/decode, varint-length-prefixed stream framing, and
 //! StrictSign message signing/verification.
 //!
@@ -16,6 +16,12 @@ use minip2p_identity::{Ed25519Keypair, PublicKey};
 
 /// Protocol id negotiated for floodsub RPC streams.
 pub const FLOODSUB_PROTOCOL_ID: &str = "/floodsub/1.0.0";
+
+/// Protocol id for gossipsub v1.0 RPC streams.
+pub const MESHSUB_PROTOCOL_ID_V10: &str = "/meshsub/1.0.0";
+
+/// Protocol id for gossipsub v1.1 RPC streams.
+pub const MESHSUB_PROTOCOL_ID_V11: &str = "/meshsub/1.1.0";
 
 /// Maximum encoded RPC size accepted or produced (libp2p pubsub default).
 pub const MAX_RPC_SIZE: usize = 65536;
@@ -42,6 +48,66 @@ pub struct Rpc {
     pub subscriptions: Vec<SubOpts>,
     /// Field 2: published (or forwarded) messages.
     pub publish: Vec<RawMessage>,
+    /// Field 3: gossipsub mesh and gossip control messages.
+    pub control: Option<ControlMessage>,
+}
+
+/// Gossipsub control messages carried by field 3 of an [`Rpc`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ControlMessage {
+    /// Field 1: advertisements of cached message ids.
+    pub ihave: Vec<ControlIHave>,
+    /// Field 2: requests for advertised message ids.
+    pub iwant: Vec<ControlIWant>,
+    /// Field 3: requests to join topic meshes.
+    pub graft: Vec<ControlGraft>,
+    /// Field 4: requests to leave topic meshes.
+    pub prune: Vec<ControlPrune>,
+}
+
+/// An IHAVE advertisement for recent messages on a topic.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ControlIHave {
+    /// Field 1: topic whose cached ids are advertised.
+    pub topic_id: Option<String>,
+    /// Field 2: opaque message ids. Despite the protobuf `string` type,
+    /// upstream implementations permit arbitrary bytes here.
+    pub message_ids: Vec<Vec<u8>>,
+}
+
+/// An IWANT request for advertised messages.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ControlIWant {
+    /// Field 1: opaque message ids requested from the peer.
+    pub message_ids: Vec<Vec<u8>>,
+}
+
+/// A GRAFT request to join a topic mesh.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ControlGraft {
+    /// Field 1: topic whose mesh should include the sender.
+    pub topic_id: Option<String>,
+}
+
+/// A PRUNE request to leave a topic mesh.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ControlPrune {
+    /// Field 1: topic whose mesh should exclude the sender.
+    pub topic_id: Option<String>,
+    /// Field 2: peer-exchange entries. minip2p preserves these on decode
+    /// even when the router elects not to use PX.
+    pub peers: Vec<PeerInfo>,
+    /// Field 3: v1.1 prune backoff in seconds.
+    pub backoff: Option<u64>,
+}
+
+/// Peer-exchange information embedded in a [`ControlPrune`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PeerInfo {
+    /// Field 1: binary libp2p peer id.
+    pub peer_id: Option<Vec<u8>>,
+    /// Field 2: signed peer record envelope.
+    pub signed_peer_record: Option<Vec<u8>>,
 }
 
 /// One subscription change inside an RPC.
@@ -371,6 +437,211 @@ impl RawMessage {
     }
 }
 
+impl ControlMessage {
+    /// Encodes the ControlMessage body (without its enclosing RPC field).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for ihave in &self.ihave {
+            encode_nested_field(&mut out, tag_byte(1, WIRE_LEN), &ihave.encode());
+        }
+        for iwant in &self.iwant {
+            encode_nested_field(&mut out, tag_byte(2, WIRE_LEN), &iwant.encode());
+        }
+        for graft in &self.graft {
+            encode_nested_field(&mut out, tag_byte(3, WIRE_LEN), &graft.encode());
+        }
+        for prune in &self.prune {
+            encode_nested_field(&mut out, tag_byte(4, WIRE_LEN), &prune.encode());
+        }
+        out
+    }
+
+    /// Decodes a ControlMessage body.
+    pub fn decode(input: &[u8]) -> Result<Self, PubsubWireError> {
+        let mut control = Self::default();
+        control.merge_from(input)?;
+        Ok(control)
+    }
+
+    /// Applies protobuf message-merge semantics to another encoded
+    /// ControlMessage occurrence: repeated fields append in wire order.
+    fn merge_from(&mut self, input: &[u8]) -> Result<(), PubsubWireError> {
+        let mut idx = 0;
+        while let Some((field, wire_type)) = read_tag(input, &mut idx)? {
+            match (field, wire_type) {
+                (1, WIRE_LEN) => {
+                    self.ihave
+                        .push(ControlIHave::decode(read_len_delimited(input, &mut idx)?)?);
+                }
+                (2, WIRE_LEN) => {
+                    self.iwant
+                        .push(ControlIWant::decode(read_len_delimited(input, &mut idx)?)?);
+                }
+                (3, WIRE_LEN) => {
+                    self.graft
+                        .push(ControlGraft::decode(read_len_delimited(input, &mut idx)?)?);
+                }
+                (4, WIRE_LEN) => {
+                    self.prune
+                        .push(ControlPrune::decode(read_len_delimited(input, &mut idx)?)?);
+                }
+                (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ControlIHave {
+    /// Encodes the ControlIHave message body.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(topic_id) = &self.topic_id {
+            encode_bytes_field(&mut out, tag_byte(1, WIRE_LEN), topic_id.as_bytes());
+        }
+        for message_id in &self.message_ids {
+            encode_bytes_field(&mut out, tag_byte(2, WIRE_LEN), message_id);
+        }
+        out
+    }
+
+    /// Decodes a ControlIHave message body.
+    pub fn decode(input: &[u8]) -> Result<Self, PubsubWireError> {
+        let mut message = Self::default();
+        let mut idx = 0;
+        while let Some((field, wire_type)) = read_tag(input, &mut idx)? {
+            match (field, wire_type) {
+                (1, WIRE_LEN) => {
+                    message.topic_id = Some(read_string(input, &mut idx)?);
+                }
+                (2, WIRE_LEN) => {
+                    message
+                        .message_ids
+                        .push(read_len_delimited(input, &mut idx)?.to_vec());
+                }
+                (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
+            }
+        }
+        Ok(message)
+    }
+}
+
+impl ControlIWant {
+    /// Encodes the ControlIWant message body.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for message_id in &self.message_ids {
+            encode_bytes_field(&mut out, tag_byte(1, WIRE_LEN), message_id);
+        }
+        out
+    }
+
+    /// Decodes a ControlIWant message body.
+    pub fn decode(input: &[u8]) -> Result<Self, PubsubWireError> {
+        let mut message = Self::default();
+        let mut idx = 0;
+        while let Some((field, wire_type)) = read_tag(input, &mut idx)? {
+            match (field, wire_type) {
+                (1, WIRE_LEN) => message
+                    .message_ids
+                    .push(read_len_delimited(input, &mut idx)?.to_vec()),
+                (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
+            }
+        }
+        Ok(message)
+    }
+}
+
+impl ControlGraft {
+    /// Encodes the ControlGraft message body.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(topic_id) = &self.topic_id {
+            encode_bytes_field(&mut out, tag_byte(1, WIRE_LEN), topic_id.as_bytes());
+        }
+        out
+    }
+
+    /// Decodes a ControlGraft message body.
+    pub fn decode(input: &[u8]) -> Result<Self, PubsubWireError> {
+        let mut message = Self::default();
+        let mut idx = 0;
+        while let Some((field, wire_type)) = read_tag(input, &mut idx)? {
+            match (field, wire_type) {
+                (1, WIRE_LEN) => message.topic_id = Some(read_string(input, &mut idx)?),
+                (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
+            }
+        }
+        Ok(message)
+    }
+}
+
+impl ControlPrune {
+    /// Encodes the ControlPrune message body.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(topic_id) = &self.topic_id {
+            encode_bytes_field(&mut out, tag_byte(1, WIRE_LEN), topic_id.as_bytes());
+        }
+        for peer in &self.peers {
+            encode_nested_field(&mut out, tag_byte(2, WIRE_LEN), &peer.encode());
+        }
+        if let Some(backoff) = self.backoff {
+            encode_varint_field(&mut out, tag_byte(3, WIRE_VARINT), backoff);
+        }
+        out
+    }
+
+    /// Decodes a ControlPrune message body.
+    pub fn decode(input: &[u8]) -> Result<Self, PubsubWireError> {
+        let mut message = Self::default();
+        let mut idx = 0;
+        while let Some((field, wire_type)) = read_tag(input, &mut idx)? {
+            match (field, wire_type) {
+                (1, WIRE_LEN) => message.topic_id = Some(read_string(input, &mut idx)?),
+                (2, WIRE_LEN) => message
+                    .peers
+                    .push(PeerInfo::decode(read_len_delimited(input, &mut idx)?)?),
+                (3, WIRE_VARINT) => message.backoff = Some(read_varint_value(input, &mut idx)?),
+                (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
+            }
+        }
+        Ok(message)
+    }
+}
+
+impl PeerInfo {
+    /// Encodes the PeerInfo message body.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some(peer_id) = &self.peer_id {
+            encode_bytes_field(&mut out, tag_byte(1, WIRE_LEN), peer_id);
+        }
+        if let Some(record) = &self.signed_peer_record {
+            encode_bytes_field(&mut out, tag_byte(2, WIRE_LEN), record);
+        }
+        out
+    }
+
+    /// Decodes a PeerInfo message body.
+    pub fn decode(input: &[u8]) -> Result<Self, PubsubWireError> {
+        let mut peer = Self::default();
+        let mut idx = 0;
+        while let Some((field, wire_type)) = read_tag(input, &mut idx)? {
+            match (field, wire_type) {
+                (1, WIRE_LEN) => {
+                    peer.peer_id = Some(read_len_delimited(input, &mut idx)?.to_vec());
+                }
+                (2, WIRE_LEN) => {
+                    peer.signed_peer_record = Some(read_len_delimited(input, &mut idx)?.to_vec());
+                }
+                (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
+            }
+        }
+        Ok(peer)
+    }
+}
+
 impl Rpc {
     /// Encodes the RPC body (without length prefix).
     pub fn encode(&self) -> Vec<u8> {
@@ -380,6 +651,9 @@ impl Rpc {
         }
         for message in &self.publish {
             encode_nested_field(&mut out, tag_byte(2, WIRE_LEN), &message.to_wire());
+        }
+        if let Some(control) = &self.control {
+            encode_nested_field(&mut out, tag_byte(3, WIRE_LEN), &control.encode());
         }
         out
     }
@@ -397,6 +671,12 @@ impl Rpc {
                 (2, WIRE_LEN) => {
                     let nested = read_len_delimited(input, &mut idx)?;
                     rpc.publish.push(RawMessage::decode(nested)?);
+                }
+                (3, WIRE_LEN) => {
+                    let nested = read_len_delimited(input, &mut idx)?;
+                    rpc.control
+                        .get_or_insert_with(ControlMessage::default)
+                        .merge_from(nested)?;
                 }
                 (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
             }
@@ -473,6 +753,14 @@ fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], 
     let value = &input[*idx..*idx + length];
     *idx += length;
     Ok(value)
+}
+
+/// Reads a UTF-8 string field, reporting the payload offset on failure.
+fn read_string(input: &[u8], idx: &mut usize) -> Result<String, PubsubWireError> {
+    let offset = *idx;
+    let bytes = read_len_delimited(input, idx)?;
+    let value = core::str::from_utf8(bytes).map_err(|_| PubsubWireError::InvalidUtf8 { offset })?;
+    Ok(String::from(value))
 }
 
 /// Reads a varint field value.
@@ -636,6 +924,7 @@ mod tests {
                 },
             ],
             publish: Vec::new(),
+            control: None,
         };
         assert_eq!(Rpc::decode(&rpc.encode()).unwrap(), rpc);
     }
@@ -646,6 +935,7 @@ mod tests {
         let rpc = Rpc {
             subscriptions: Vec::new(),
             publish: vec![message.clone()],
+            control: None,
         };
         let decoded = Rpc::decode(&rpc.encode()).unwrap();
         assert_eq!(decoded.publish.len(), 1);
@@ -661,6 +951,122 @@ mod tests {
         };
         let decoded = RawMessage::decode(&message.encode_fields(true)).unwrap();
         assert_eq!(decoded.topic_ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn control_golden_vector_matches_hand_encoding() {
+        let expected: &[u8] = &[
+            0x1a, 0x27, // RPC.control: 39-byte ControlMessage
+            0x0a, 0x0a, // ihave: 10-byte ControlIHave
+            0x0a, 0x01, b't', // topic_id = "t"
+            0x12, 0x02, 0xaa, 0xbb, // message_ids[0]
+            0x12, 0x01, 0xff, // message_ids[1] (arbitrary non-UTF-8 bytes)
+            0x12, 0x04, // iwant: 4-byte ControlIWant
+            0x0a, 0x02, 0x01, 0x02, // message_ids[0]
+            0x1a, 0x03, // graft: 3-byte ControlGraft
+            0x0a, 0x01, b't', // topic_id = "t"
+            0x22, 0x0e, // prune: 14-byte ControlPrune
+            0x0a, 0x01, b't', // topic_id = "t"
+            0x12, 0x07, // peers: 7-byte PeerInfo
+            0x0a, 0x02, 0x01, 0x02, // peer_id
+            0x12, 0x01, 0x03, // signed_peer_record
+            0x18, 0x3c, // backoff = 60
+        ];
+        let control = ControlMessage {
+            ihave: vec![ControlIHave {
+                topic_id: Some(String::from("t")),
+                message_ids: vec![vec![0xaa, 0xbb], vec![0xff]],
+            }],
+            iwant: vec![ControlIWant {
+                message_ids: vec![vec![1, 2]],
+            }],
+            graft: vec![ControlGraft {
+                topic_id: Some(String::from("t")),
+            }],
+            prune: vec![ControlPrune {
+                topic_id: Some(String::from("t")),
+                peers: vec![PeerInfo {
+                    peer_id: Some(vec![1, 2]),
+                    signed_peer_record: Some(vec![3]),
+                }],
+                backoff: Some(60),
+            }],
+        };
+        let rpc = Rpc {
+            subscriptions: Vec::new(),
+            publish: Vec::new(),
+            control: Some(control.clone()),
+        };
+        assert_eq!(rpc.encode(), expected);
+        assert_eq!(Rpc::decode(expected).unwrap().control, Some(control));
+    }
+
+    #[test]
+    fn repeated_rpc_control_fields_merge() {
+        let first = ControlMessage {
+            graft: vec![ControlGraft {
+                topic_id: Some(String::from("a")),
+            }],
+            ..ControlMessage::default()
+        };
+        let second = ControlMessage {
+            prune: vec![ControlPrune {
+                topic_id: Some(String::from("b")),
+                backoff: Some(30),
+                ..ControlPrune::default()
+            }],
+            ..ControlMessage::default()
+        };
+        let mut encoded = Vec::new();
+        encode_nested_field(&mut encoded, tag_byte(3, WIRE_LEN), &first.encode());
+        encode_nested_field(&mut encoded, tag_byte(3, WIRE_LEN), &second.encode());
+
+        let merged = Rpc::decode(&encoded).unwrap().control.unwrap();
+        assert_eq!(merged.graft, first.graft);
+        assert_eq!(merged.prune, second.prune);
+        let reencoded = Rpc {
+            control: Some(merged),
+            ..Rpc::default()
+        }
+        .encode();
+        assert_eq!(reencoded.first(), Some(&tag_byte(3, WIRE_LEN)));
+        assert_eq!(
+            Rpc::decode(&reencoded)
+                .unwrap()
+                .control
+                .unwrap()
+                .graft
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_and_unknown_control_fields_follow_codec_rules() {
+        let truncated_prune = [tag_byte(1, WIRE_LEN), 4, b't'];
+        assert!(matches!(
+            ControlPrune::decode(&truncated_prune),
+            Err(PubsubWireError::FieldOverflow { .. })
+        ));
+
+        let field_zero = [0x00, 0x01];
+        assert!(matches!(
+            ControlMessage::decode(&field_zero),
+            Err(PubsubWireError::InvalidFieldNumber { offset: 0 })
+        ));
+
+        let mut with_unknown = ControlGraft {
+            topic_id: Some(String::from("t")),
+        }
+        .encode();
+        with_unknown.extend_from_slice(&[tag_byte(15, WIRE_LEN), 1, 0xff]);
+        assert_eq!(
+            ControlGraft::decode(&with_unknown)
+                .unwrap()
+                .topic_id
+                .as_deref(),
+            Some("t")
+        );
     }
 
     #[test]
@@ -690,6 +1096,7 @@ mod tests {
                 topic_ids: vec![String::from("t")],
                 ..RawMessage::default()
             }],
+            control: None,
         };
         assert_eq!(rpc.encode(), expected);
         let decoded = Rpc::decode(expected).unwrap();

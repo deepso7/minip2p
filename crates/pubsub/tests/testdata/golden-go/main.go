@@ -14,6 +14,7 @@
 //
 // Outputs (stdout):
 //
+//	control=<hex of the unframed control RPC body>
 //	peer=<host A base58 peer id>
 //	rpc=<hex of the full varint-length-prefixed publish RPC frame>
 package main
@@ -29,8 +30,10 @@ import (
 	"os"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
 	"github.com/libp2p/go-libp2p"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -50,6 +53,12 @@ func main() {
 }
 
 func run() error {
+	control, err := proto.Marshal(controlFixture())
+	if err != nil {
+		return err
+	}
+	fmt.Printf("control=%s\n", hex.EncodeToString(control))
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -128,6 +137,27 @@ func run() error {
 			return fmt.Errorf("no publish frame observed within deadline")
 		}
 	}
+}
+
+// controlFixture covers every gossipsub v1.0 control type plus the v1.1
+// PeerInfo and backoff additions to ControlPrune.
+func controlFixture() *pb.RPC {
+	return &pb.RPC{Control: &pb.ControlMessage{
+		Ihave: []*pb.ControlIHave{{
+			TopicID:    proto.String("minip2p-golden"),
+			MessageIDs: []string{"have-1", string([]byte{0xff, 0x00})},
+		}},
+		Iwant: []*pb.ControlIWant{{MessageIDs: []string{"want-1", "want-2"}}},
+		Graft: []*pb.ControlGraft{{TopicID: proto.String("minip2p-golden")}},
+		Prune: []*pb.ControlPrune{{
+			TopicID: proto.String("minip2p-golden"),
+			Peers: []*pb.PeerInfo{{
+				PeerID:           []byte{0x00, 0x01, 0x02},
+				SignedPeerRecord: []byte{0xaa, 0xbb, 0xcc},
+			}},
+			Backoff: proto.Uint64(60),
+		}},
+	}}
 }
 
 // readFrame reads one varint-length-prefixed frame.

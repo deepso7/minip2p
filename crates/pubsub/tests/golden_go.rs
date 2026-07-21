@@ -41,3 +41,33 @@ fn go_libp2p_signed_message_decodes_and_verifies() {
     let expected = include_str!("testdata/go_peer_id.txt");
     assert_eq!(from.to_base58(), expected.trim());
 }
+
+#[test]
+fn go_libp2p_control_rpc_round_trips_byte_identically() {
+    let bytes = decode_hex(include_str!("testdata/go_control_rpc.hex"));
+    let rpc = Rpc::decode(&bytes).expect("go control RPC must decode");
+    let control = rpc.control.as_ref().expect("control field");
+
+    assert_eq!(control.ihave.len(), 1);
+    assert_eq!(control.ihave[0].topic_id.as_deref(), Some("minip2p-golden"));
+    assert_eq!(
+        control.ihave[0].message_ids,
+        vec![b"have-1".to_vec(), vec![0xff, 0x00]]
+    );
+    assert_eq!(
+        control.iwant[0].message_ids,
+        vec![b"want-1".to_vec(), b"want-2".to_vec()]
+    );
+    assert_eq!(control.graft[0].topic_id.as_deref(), Some("minip2p-golden"));
+    let prune = &control.prune[0];
+    assert_eq!(prune.topic_id.as_deref(), Some("minip2p-golden"));
+    assert_eq!(prune.backoff, Some(60));
+    assert_eq!(prune.peers.len(), 1);
+    assert_eq!(prune.peers[0].peer_id.as_deref(), Some(&[0, 1, 2][..]));
+    assert_eq!(
+        prune.peers[0].signed_peer_record.as_deref(),
+        Some(&[0xaa, 0xbb, 0xcc][..])
+    );
+
+    assert_eq!(rpc.encode(), bytes, "canonical encoders must agree");
+}
