@@ -11,6 +11,7 @@ use minip2p_transport::{ConnectionId, StreamId};
 
 use crate::agent::{Shared, StreamInput, StreamRole, TokenPurpose};
 use crate::events::{BridgeRole, NatAction, NatEvent};
+use crate::inbound::select_global_punch_candidates;
 use crate::types::{ConnectId, NatError, Now, Path, PromoteError};
 
 /// Progress of the relay leg of a connect attempt.
@@ -279,15 +280,22 @@ impl ConnectAttempt {
         if self.promoted == Some(conn_id) {
             self.promoted = None;
             self.bridge_alive = false;
-            if self.best.is_none() && self.direct_live == 0 {
-                self.fail(
-                    shared,
-                    NatError::DialFailed("promoted circuit closed".into()),
-                );
-            }
+            self.last_error = Some(NatError::DialFailed("promoted circuit closed".into()));
+            self.settle_after_punch(shared);
             return;
         }
         if !self.is_relay_peer(peer) || self.bridge_inner_conn.is_some_and(|id| id != conn_id) {
+            return;
+        }
+        // Waiting for relay readiness and issuing OpenStream are peer-scoped,
+        // so a connection close has no exact ownership signal. In particular,
+        // Swarm reports Closed(old) before Established(new) for a QUIC
+        // supersede. Keep both pre-allocation phases alive: PeerReady or the
+        // open result continues them on the replacement, while a real loss is
+        // still bounded by the relay deadline (and usually an open error).
+        // Allocated stream phases retain conservative teardown until
+        // StreamReady records exact ownership in `bridge_inner_conn`.
+        if matches!(self.leg, RelayLeg::WaitRelayReady | RelayLeg::OpeningHop) {
             return;
         }
         match self.leg {
@@ -525,6 +533,9 @@ impl ConnectAttempt {
         }
 
         if !self.done && now.mono_ms >= self.connect_deadline {
+            // Accepted direct dials that never produced a connection are no
+            // longer viable past the overall attempt deadline.
+            self.direct_live = 0;
             if self.best.is_some() {
                 // A relayed path exists but the punch never resolved; settle
                 // on the relay.
@@ -847,7 +858,10 @@ impl ConnectAttempt {
         shared: &mut Shared,
         now: Now,
     ) {
-        self.punch_addrs = select_direct_candidates(&remote_addrs, None, None).into_addrs();
+        // Unlike caller-configured direct candidates, these addresses are
+        // supplied by the remote peer. Restrict them to global IP QUIC
+        // endpoints before allowing either a dial or UDP punch traffic.
+        self.punch_addrs = select_global_punch_candidates(&remote_addrs);
 
         // Per the spec the initiator dials first, then signals SYNC.
         if !self.punch_addrs.is_empty() {
@@ -962,6 +976,17 @@ impl ConnectAttempt {
                     self.done = true;
                 }
             }
+        } else if self.best.is_some() {
+            // PathEstablished is terminal success for this connect id. If
+            // the promoted circuit is subsequently lost, a still-live
+            // direct leg may upgrade that result, but the loss must never
+            // turn the already-reported success into ConnectFailed.
+            if self.direct_live == 0 && self.punch_deadline.is_none() {
+                self.done = true;
+            }
+        } else if self.direct_live > 0 || self.punch_deadline.is_some() {
+            // The relay leg is gone, but a direct candidate or an active
+            // punch window can still establish the first usable path.
         } else {
             let error = self
                 .last_error

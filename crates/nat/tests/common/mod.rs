@@ -24,7 +24,7 @@ pub const TEST_CIRCUIT_ID: u64 = (1 << 63) | 77;
 pub const TARGET_ADDR: &str = "/ip4/192.0.2.10/udp/4001/quic-v1";
 pub const RELAY_TRANSPORT_ADDR: &str = "/ip4/203.0.113.1/udp/4001/quic-v1";
 pub const LISTEN_ADDR: &str = "/ip4/198.51.100.5/udp/4500/quic-v1";
-pub const REMOTE_OBSERVED_ADDR: &str = "/ip4/192.0.2.99/udp/4002/quic-v1";
+pub const REMOTE_OBSERVED_ADDR: &str = "/ip4/8.8.8.8/udp/4002/quic-v1";
 /// A public mapping of our own socket, as a peer would report it.
 pub const OUR_OBSERVED_ADDR: &str = "/ip4/203.0.113.77/udp/45678/quic-v1";
 

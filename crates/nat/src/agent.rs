@@ -6,7 +6,9 @@ use minip2p_core::{Multiaddr, PeerAddr, PeerId, select_direct_candidates};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};
 
-use minip2p_relay::STOP_PROTOCOL_ID;
+use minip2p_autonat::AUTONAT_PROTOCOL_ID;
+use minip2p_dcutr::DCUTR_PROTOCOL_ID;
+use minip2p_relay::{HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 
 use crate::attempt::ConnectAttempt;
 use crate::config::NatConfig;
@@ -28,9 +30,9 @@ pub(crate) enum StreamRole {
     AutonatProbe,
     /// Inbound STOP stream from a relay (responder-side circuit).
     StopInbound(u64),
-    /// Inbound STOP stream from an untrusted peer. Kept owned until terminal
-    /// close so its reset lifecycle cannot leak into the application.
-    RejectedStop,
+    /// Inbound NAT control stream this node does not serve. Kept owned until
+    /// terminal close so its reset lifecycle cannot leak into the application.
+    RejectedControl,
 }
 
 /// What a pending `Dial` / `OpenStream` token was issued for.
@@ -285,6 +287,12 @@ pub struct NatAgent {
     attempts: BTreeMap<ConnectId, ConnectAttempt>,
     housekeeping: Housekeeping,
     inbound: BTreeMap<u64, InboundCircuit>,
+    /// Peers whose last known connection closed. Swarm reports an eager
+    /// `ConnectionClosed(old)` before `ConnectionEstablished(replacement)`
+    /// during supersession, so peer-scoped housekeeping is first staged and
+    /// reconciled only if a second tick arrives without the replacement.
+    pending_peer_disconnects: BTreeSet<PeerId>,
+    reconcile_peer_disconnects: BTreeSet<PeerId>,
     next_connect_id: u64,
     next_inbound_id: u64,
 }
@@ -313,6 +321,8 @@ impl NatAgent {
             attempts: BTreeMap::new(),
             housekeeping,
             inbound: BTreeMap::new(),
+            pending_peer_disconnects: BTreeSet::new(),
+            reconcile_peer_disconnects: BTreeSet::new(),
             next_connect_id: 0,
             next_inbound_id: 0,
         }
@@ -391,6 +401,8 @@ impl NatAgent {
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
                 touched_state = true;
+                self.pending_peer_disconnects.remove(peer_id);
+                self.reconcile_peer_disconnects.remove(peer_id);
                 // Any session dial toward this peer has done its job (ours
                 // landed, or another machine's did — either way the peer is
                 // reachable now and further dials would supersede).
@@ -427,9 +439,11 @@ impl NatAgent {
             SwarmEvent::ConnectionClosed { peer_id, conn_id } => {
                 touched_state = true;
                 self.shared.direct_connections.remove(conn_id);
+                let mut peer_disconnected = false;
                 if let Some(ids) = self.shared.connected.get_mut(peer_id) {
                     ids.remove(conn_id);
-                    if ids.is_empty() {
+                    peer_disconnected = ids.is_empty();
+                    if peer_disconnected {
                         self.shared.connected.remove(peer_id);
                         self.shared.ready.remove(peer_id);
                     }
@@ -437,8 +451,9 @@ impl NatAgent {
                 for attempt in self.attempts.values_mut() {
                     attempt.on_connection_closed(peer_id, *conn_id, &mut self.shared, now);
                 }
-                self.housekeeping
-                    .on_peer_disconnected(peer_id, &mut self.shared, now);
+                if peer_disconnected {
+                    self.pending_peer_disconnects.insert(peer_id.clone());
+                }
                 for circuit in self.inbound.values_mut() {
                     circuit.on_connection_closed(peer_id, *conn_id, &mut self.shared);
                 }
@@ -452,7 +467,6 @@ impl NatAgent {
                 for (peer, stream) in closed_streams {
                     self.shared.release_stream(&peer, stream);
                 }
-                self.shared.observed_addrs.remove(peer_id);
                 self.shared
                     .pending_session_dials
                     .retain(|_, (dialed, _)| dialed != peer_id);
@@ -484,7 +498,15 @@ impl NatAgent {
                 initiated_locally,
                 ..
             } => {
-                if !initiated_locally && protocol_id == STOP_PROTOCOL_ID {
+                if !initiated_locally
+                    && matches!(
+                        protocol_id.as_str(),
+                        HOP_PROTOCOL_ID
+                            | STOP_PROTOCOL_ID
+                            | DCUTR_PROTOCOL_ID
+                            | AUTONAT_PROTOCOL_ID
+                    )
+                {
                     if !self.shared.bind_stream(peer_id, *stream_id, *conn_id) {
                         // An old connection still owns this peer-scoped id.
                         // Reject the colliding replacement stream without
@@ -495,29 +517,26 @@ impl NatAgent {
                         });
                         return true;
                     }
-                    // STOP is a relay control protocol, but registration of
-                    // its id makes it possible for any connected peer to
-                    // negotiate it. Only relays explicitly configured by
-                    // the application are trusted to request an inbound
-                    // circuit; otherwise a peer could make us punch its
-                    // chosen addresses.
-                    if !self
-                        .shared
-                        .config
-                        .relays
-                        .iter()
-                        .any(|relay| relay.peer_id() == peer_id)
-                    {
-                        // STOP is registered only for the NAT control plane.
-                        // Reject untrusted opens here instead of leaking them
-                        // to the application and leaving their stream credit
-                        // occupied until the remote closes them.
+                    let trusted_stop = protocol_id == STOP_PROTOCOL_ID
+                        && self
+                            .shared
+                            .config
+                            .relays
+                            .iter()
+                            .any(|relay| relay.peer_id() == peer_id);
+                    if !trusted_stop {
+                        // All four ids are registered so the client-side NAT
+                        // machines can negotiate outbound streams and advertise
+                        // support through Identify. This node serves only STOP,
+                        // and only for explicitly configured relays; accepting
+                        // the other inbound control protocols would leak them as
+                        // application streams despite reserving their ids.
                         self.shared.push_action(NatAction::ResetStream {
                             peer: peer_id.clone(),
                             stream_id: *stream_id,
                         });
                         self.shared
-                            .own_stream(peer_id, *stream_id, StreamRole::RejectedStop);
+                            .own_stream(peer_id, *stream_id, StreamRole::RejectedControl);
                         handled = true;
                     } else {
                         // A relay is bridging an inbound circuit to us: claim
@@ -607,6 +626,19 @@ impl NatAgent {
     /// Advances time-based state: stagger expiry, leg deadlines, punch
     /// windows, connect deadlines.
     pub fn handle_tick(&mut self, now: Now) {
+        // The std driver may tick after each individual event. Age newly
+        // closed peers for one complete tick so an eager Close(old) can be
+        // followed by Established(replacement) on the next poll turn.
+        let disconnected = core::mem::take(&mut self.reconcile_peer_disconnects);
+        for peer in disconnected {
+            if !self.shared.is_connected(&peer) {
+                self.housekeeping
+                    .on_peer_disconnected(&peer, &mut self.shared, now);
+                self.shared.observed_addrs.remove(&peer);
+            }
+        }
+        self.reconcile_peer_disconnects
+            .append(&mut self.pending_peer_disconnects);
         for attempt in self.attempts.values_mut() {
             attempt.on_tick(&mut self.shared, now);
         }
@@ -741,6 +773,10 @@ impl NatAgent {
     /// Milliseconds until the earliest pending deadline, if any. Drivers
     /// fold this into their poll budget, mirroring `SwarmCore::next_timeout`.
     pub fn next_timeout(&self, now_ms: u64) -> Option<u64> {
+        if !self.pending_peer_disconnects.is_empty() || !self.reconcile_peer_disconnects.is_empty()
+        {
+            return Some(0);
+        }
         self.attempts
             .values()
             .filter_map(ConnectAttempt::next_deadline)
@@ -783,6 +819,8 @@ impl NatAgent {
             && self.shared.events.is_empty()
             && self.attempts.is_empty()
             && self.inbound.is_empty()
+            && self.pending_peer_disconnects.is_empty()
+            && self.reconcile_peer_disconnects.is_empty()
             && self.housekeeping.is_quiet()
     }
 
@@ -819,7 +857,7 @@ impl NatAgent {
                     circuit.on_stream_input(conn_id, stream, input, &mut self.shared, now);
                 }
             }
-            StreamRole::RejectedStop => {}
+            StreamRole::RejectedControl => {}
         }
         true
     }

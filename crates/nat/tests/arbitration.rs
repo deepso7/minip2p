@@ -7,7 +7,7 @@ use common::*;
 
 use minip2p_core::{Multiaddr, PeerAddr};
 use minip2p_nat::{ConnectId, NatAction, NatConfig, NatError, NatEvent, Path};
-use minip2p_relay::Status;
+use minip2p_relay::{HOP_PROTOCOL_ID, Status};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -458,6 +458,81 @@ fn relay_supersede_scrubs_old_stream_ids_without_resetting_the_new_connection() 
 }
 
 #[test]
+fn relay_supersede_does_not_abort_waiting_for_peer_ready() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    h.agent.connect(h.target.clone(), Vec::new(), at(0));
+    drain_actions(&mut h.agent); // relay dial
+
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: ConnectionId::new(1),
+            peer_id: h.relay.clone(),
+        },
+        at(10),
+    );
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            conn_id: ConnectionId::new(1),
+            peer_id: h.relay.clone(),
+        },
+        at(11),
+    );
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: ConnectionId::new(2),
+            peer_id: h.relay.clone(),
+        },
+        at(12),
+    );
+    assert!(drain_events(&mut h.agent).is_empty());
+
+    h.agent.handle_event(
+        &SwarmEvent::PeerReady {
+            peer_id: h.relay.clone(),
+            protocols: vec![HOP_PROTOCOL_ID.into()],
+        },
+        at(13),
+    );
+    assert!(
+        has_hop_open(&drain_actions(&mut h.agent)),
+        "the replacement relay session must continue the waiting leg"
+    );
+}
+
+#[test]
+fn relay_supersede_does_not_abort_an_open_hop_request() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    h.agent.connect(h.target.clone(), Vec::new(), at(0));
+    drain_actions(&mut h.agent); // relay dial
+    h.relay_session_ready(at(10));
+    let open = drain_actions(&mut h.agent);
+    let open_token = open_stream_token(&open);
+
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            conn_id: ConnectionId::new(1),
+            peer_id: h.relay.clone(),
+        },
+        at(11),
+    );
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: ConnectionId::new(2),
+            peer_id: h.relay.clone(),
+        },
+        at(12),
+    );
+    assert!(drain_events(&mut h.agent).is_empty());
+
+    let stream = StreamId::new(19);
+    h.agent.stream_open_result(open_token, Ok(stream), at(13));
+    assert!(
+        h.agent.owns_stream(&h.relay, stream),
+        "the HOP open result must remain owned after relay supersession"
+    );
+}
+
+#[test]
 fn bridge_close_before_dcutr_finishes_waits_for_live_direct_dials() {
     let mut h = Harness::with_relay(NatConfig::default());
     let (id, stream) = drive_to_bridged(&mut h, 0);
@@ -482,7 +557,7 @@ fn bridge_close_before_dcutr_finishes_waits_for_live_direct_dials() {
 }
 
 #[test]
-fn released_bridge_close_cannot_be_reported_as_a_relay_fallback() {
+fn established_relay_loss_never_turns_success_into_connect_failed() {
     let mut h = Harness::with_relay(NatConfig {
         punch_max_retries: 0,
         ..NatConfig::default()
@@ -505,16 +580,92 @@ fn released_bridge_close_cannot_be_reported_as_a_relay_fallback() {
     let events = drain_events(&mut h.agent);
     assert!(matches!(
         events.as_slice(),
-        [
-            NatEvent::HolePunchFailed { .. },
-            NatEvent::ConnectFailed { connect_id, .. },
-        ] if *connect_id == id
+        [NatEvent::HolePunchFailed { connect_id, .. }] if *connect_id == id
     ));
     assert!(
         !events
             .iter()
             .any(|event| matches!(event, NatEvent::FellBackToRelay { .. }))
     );
+
+    // Once the still-live original dial expires there is nothing left to
+    // upgrade, but PathEstablished remains the terminal result for this id.
+    h.agent.handle_tick(at(60_000));
+    assert!(drain_events(&mut h.agent).is_empty());
+    assert!(h.agent.is_idle());
+}
+
+#[test]
+fn peer_already_direct_promotion_error_waits_for_the_direct_connection() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, stream) = drive_to_bridged(&mut h, 0);
+    drain_actions(&mut h.agent); // DCUtR CONNECT
+    h.stream_data(
+        stream,
+        dcutr_connect_reply(&[maddr(REMOTE_OBSERVED_ADDR)]),
+        at(350),
+    );
+    let promotion = drain_actions(&mut h.agent);
+
+    // The swarm already knows a direct session won, but the NatAgent has
+    // not consumed its ConnectionEstablished event yet.
+    let token = promote_token(&promotion);
+    h.agent.promote_result(
+        token,
+        Err(minip2p_nat::PromoteError::PeerAlreadyDirect),
+        at(351),
+    );
+    assert!(drain_actions(&mut h.agent).is_empty());
+    assert!(drain_events(&mut h.agent).is_empty());
+
+    h.target_connected(at(352));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::PathEstablished {
+            connect_id,
+            path: Path::DirectDialed,
+            ..
+        }] if *connect_id == id
+    ));
+    assert!(h.agent.is_idle());
+
+    // The driver echo is tokenized exactly once; duplicates stay inert.
+    h.agent.promote_result(
+        token,
+        Err(minip2p_nat::PromoteError::PeerAlreadyDirect),
+        at(353),
+    );
+    assert!(drain_actions(&mut h.agent).is_empty());
+    assert!(drain_events(&mut h.agent).is_empty());
+}
+
+#[test]
+fn initiator_dials_only_global_ip_targets_from_peer_dcutr_reply() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (_, stream) = drive_to_bridged(&mut h, 0);
+    drain_actions(&mut h.agent); // DCUtR CONNECT
+    let global = maddr("/ip4/9.9.9.9/udp/4002/quic-v1");
+    h.stream_data(
+        stream,
+        dcutr_connect_reply(&[
+            maddr("/ip4/10.0.0.7/udp/4002/quic-v1"),
+            maddr("/dns4/attacker.invalid/udp/4002/quic-v1"),
+            maddr("/ip4/192.0.2.7/udp/4002/quic-v1"),
+            global.clone(),
+        ]),
+        at(350),
+    );
+
+    let dials: Vec<_> = drain_actions(&mut h.agent)
+        .into_iter()
+        .filter_map(|action| match action {
+            NatAction::Dial { addr, .. } if addr.peer_id() == &h.target => {
+                Some(addr.transport().clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dials, vec![global]);
 }
 
 #[test]
@@ -953,6 +1104,13 @@ fn reporter_disconnect_drops_its_observation() {
     // The relay reports a mapping, then its connection closes; the attempt
     // reconnects the relay, but the stale observation must not come back.
     let relay = h.relay.clone();
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: ConnectionId::new(1),
+            peer_id: relay.clone(),
+        },
+        at(0),
+    );
     identify_observed(&mut h.agent, &relay, &maddr(departed), at(0));
     h.agent.handle_event(
         &SwarmEvent::ConnectionClosed {
@@ -961,6 +1119,8 @@ fn reporter_disconnect_drops_its_observation() {
         },
         at(1),
     );
+    h.agent.handle_tick(at(1));
+    h.agent.handle_tick(at(1));
 
     let (_id, stream) = drive_to_bridged(&mut h, 10);
     let actions = drain_actions(&mut h.agent);

@@ -21,8 +21,8 @@ use minip2p_transport::{ConnectionId, StreamId};
 const A_LISTEN: &str = "/ip4/198.51.100.10/udp/4100/quic-v1";
 const RELAY_ADDR: &str = "/ip4/203.0.113.1/udp/4001/quic-v1";
 /// Each side's public NAT mapping, as the relay's identify reports it.
-const A_PUBLIC: &str = "/ip4/203.0.113.201/udp/40001/quic-v1";
-const B_PUBLIC: &str = "/ip4/203.0.113.202/udp/40002/quic-v1";
+const A_PUBLIC: &str = "/ip4/8.8.4.4/udp/40001/quic-v1";
+const B_PUBLIC: &str = "/ip4/1.1.1.1/udp/40002/quic-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Side {
@@ -445,8 +445,8 @@ fn two_agents_punch_to_a_direct_connection() {
         "A settles a relayed path first, got {events:?}"
     );
     assert_eq!(
-        world.punch_dials_from_a, 2,
-        "A dialed B's listen address and B's relay-observed public mapping"
+        world.punch_dials_from_a, 1,
+        "A dialed only B's global relay-observed public mapping"
     );
     assert!(
         world.punch_dial_addrs_from_a.contains(&maddr(B_PUBLIC)),

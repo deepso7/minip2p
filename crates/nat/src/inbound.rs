@@ -14,7 +14,7 @@
 
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId, SansIoProtocol, select_direct_candidates};
+use minip2p_core::{Multiaddr, PeerId, Protocol, SansIoProtocol, select_direct_candidates};
 use minip2p_dcutr::{DcutrResponder, DcutrResponderInput, DcutrResponderOutput, ResponderEvent};
 use minip2p_relay::{Status, StopResponder, StopResponderInput, StopResponderOutput};
 use minip2p_transport::{ConnectionId, StreamId};
@@ -231,6 +231,11 @@ impl InboundCircuit {
         }
 
         if shared.config.force_relay {
+            // STOP yields the CONNECT request before the bytes trailing its
+            // frame. In force-relay mode there is no DCUtR machine to consume
+            // that remainder: it is already circuit transport data and must
+            // cross the ownership boundary with the promoted bridge.
+            self.pending_data = pipelined;
             self.promote(shared);
             return;
         }
@@ -275,8 +280,7 @@ impl InboundCircuit {
                     remote_addrs,
                     ..
                 }) => {
-                    self.remote_addrs =
-                        select_direct_candidates(&remote_addrs, None, None).into_addrs();
+                    self.remote_addrs = select_global_punch_candidates(&remote_addrs);
                 }
                 DcutrResponderOutput::Event(ResponderEvent::SyncReceived) => {
                     sync_received = true;
@@ -483,4 +487,79 @@ impl InboundCircuit {
             Err(_) => self.done = true,
         }
     }
+}
+
+/// Selects peer-supplied DCUtR targets that are safe to dial or blast.
+///
+/// The general direct-candidate selector intentionally accepts DNS and LAN
+/// addresses because those are useful when configured by the local
+/// application. DCUtR addresses instead come from an untrusted remote peer:
+/// resolving or sending traffic to private/special-use targets would turn the
+/// NAT agent into an SSRF primitive. Keep only strict QUIC-v1 addresses whose
+/// first component is a globally routable unicast IP.
+pub(crate) fn select_global_punch_candidates(addrs: &[Multiaddr]) -> Vec<Multiaddr> {
+    select_direct_candidates(addrs, None, None)
+        .into_addrs()
+        .into_iter()
+        .filter(is_global_unicast_quic)
+        .collect()
+}
+
+fn is_global_unicast_quic(addr: &Multiaddr) -> bool {
+    match addr.protocols().first() {
+        Some(Protocol::Ip4(octets)) => is_global_unicast_v4(*octets),
+        Some(Protocol::Ip6(octets)) => is_global_unicast_v6(*octets),
+        Some(Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_)) | None => false,
+        Some(_) => false,
+    }
+}
+
+fn is_global_unicast_v4([a, b, c, d]: [u8; 4]) -> bool {
+    !(a == 0
+        // RFC 1918 private space.
+        || a == 10
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+        // RFC 6598 shared carrier-grade NAT space.
+        || (a == 100 && (64..=127).contains(&b))
+        || a == 127
+        || (a == 169 && b == 254)
+        // IETF protocol assignments. .9 and .10 are globally reachable
+        // anycast addresses and therefore remain eligible.
+        || (a == 192 && b == 0 && c == 0 && d != 9 && d != 10)
+        // Documentation ranges.
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        // Benchmarking, multicast, reserved, and broadcast space.
+        || (a == 198 && (b == 18 || b == 19))
+        || a >= 224)
+}
+
+fn is_global_unicast_v6(octets: [u8; 16]) -> bool {
+    let segments = core::net::Ipv6Addr::from(octets).segments();
+    // The currently allocated global-unicast block is 2000::/3.
+    if segments[0] & 0xe000 != 0x2000 {
+        return false;
+    }
+
+    // Special-purpose allocations within 2000::/3 are not ordinary global
+    // unicast destinations. Keep the small set explicitly designated global
+    // by IANA inside 2001::/23.
+    if segments[0] == 0x2001 && segments[1] < 0x0200 {
+        let value = u128::from_be_bytes(octets);
+        let globally_reachable_exception = value == 0x2001_0001_0000_0000_0000_0000_0000_0001
+            || value == 0x2001_0001_0000_0000_0000_0000_0000_0002
+            || segments[1] == 0x0003
+            || (segments[1] == 0x0004 && segments[2] == 0x0112)
+            || (0x0020..=0x003f).contains(&segments[1]);
+        if !globally_reachable_exception {
+            return false;
+        }
+    }
+
+    // 6to4 and documentation ranges are not globally reachable endpoints.
+    segments[0] != 0x2002
+        && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+        && !(segments[0] == 0x3fff && segments[1] & 0xf000 == 0)
 }

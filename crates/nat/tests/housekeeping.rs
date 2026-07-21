@@ -535,6 +535,22 @@ fn lost_relay_connection_emits_lost_and_reacquires() {
         },
         at(5_000),
     );
+    assert_eq!(
+        hk.agent.next_timeout(5_000),
+        Some(0),
+        "the possible peer disconnect must be reconciled promptly"
+    );
+    assert!(
+        drain_events(&mut hk.agent).is_empty(),
+        "peer-scoped loss waits for same-batch replacements"
+    );
+    hk.agent.handle_tick(at(5_000));
+    assert!(
+        drain_events(&mut hk.agent).is_empty(),
+        "the first driver tick only stages peer-disconnect reconciliation"
+    );
+    assert_eq!(hk.agent.next_timeout(5_000), Some(0));
+    hk.agent.handle_tick(at(5_000));
     let events = drain_events(&mut hk.agent);
     assert!(matches!(
         events.as_slice(),
@@ -549,7 +565,46 @@ fn lost_relay_connection_emits_lost_and_reacquires() {
 }
 
 #[test]
-fn relay_supersede_during_renewal_emits_reservation_lost() {
+fn retiring_one_relay_connection_keeps_reservation_on_live_replacement() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(None), at_unix(10, 1_000));
+    assert!(matches!(
+        events.as_slice(),
+        [NatEvent::RelayReserved { .. }]
+    ));
+    drain_actions(&mut hk.agent); // completed exchange's close-write
+
+    // The replacement is already known before the retired connection's
+    // terminal event arrives. Losing one connection id must not be treated
+    // as losing the relay peer itself.
+    let relay = hk.relay.clone();
+    hk.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: ConnectionId::new(2),
+            peer_id: relay.clone(),
+        },
+        at(20),
+    );
+    hk.agent.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            conn_id: ConnectionId::new(1),
+            peer_id: relay,
+        },
+        at(21),
+    );
+
+    assert!(drain_events(&mut hk.agent).is_empty());
+    assert!(hk.agent.active_reservation().is_some());
+    hk.agent.handle_tick(at(1_000));
+    assert_eq!(
+        dial_count_for(&drain_actions(&mut hk.agent), &hk.relay),
+        0,
+        "a live replacement must not trigger reservation reacquisition"
+    );
+}
+
+#[test]
+fn close_then_establish_relay_supersede_preserves_the_reservation() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);
     let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(Some(1_900)), at_unix(10, 1_000));
     assert!(matches!(
@@ -559,8 +614,9 @@ fn relay_supersede_during_renewal_emits_reservation_lost() {
     drain_actions(&mut hk.agent); // completed exchange's close-write
 
     // Start renewal, then replace the relay connection before the new
-    // reservation exchange completes. The old reservation died with the
-    // retired connection and must be withdrawn immediately.
+    // reservation exchange completes. Swarm exposes the eager close before
+    // the replacement establishment; that ordering must not manufacture a
+    // peer disconnect while the replacement session is live.
     let renew_at = 10 + 780 * 1_000;
     hk.agent.handle_tick(at_unix(renew_at, 1_790));
     let relay = hk.relay.clone();
@@ -571,6 +627,11 @@ fn relay_supersede_during_renewal_emits_reservation_lost() {
         },
         at_unix(renew_at + 1, 1_790),
     );
+    // `Endpoint::poll_new_event_driven` ticks immediately after this one
+    // close event, before it asks Swarm for the buffered replacement.
+    hk.agent.handle_tick(at_unix(renew_at + 1, 1_790));
+    assert!(drain_events(&mut hk.agent).is_empty());
+    assert_eq!(hk.agent.next_timeout(renew_at + 1), Some(0));
     hk.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
             conn_id: minip2p_transport::ConnectionId::new(2),
@@ -578,13 +639,9 @@ fn relay_supersede_during_renewal_emits_reservation_lost() {
         },
         at_unix(renew_at + 2, 1_790),
     );
+    hk.agent.handle_tick(at_unix(renew_at + 2, 1_790));
 
-    let events = drain_events(&mut hk.agent);
-    assert!(matches!(
-        events.as_slice(),
-        [NatEvent::RelayReservationLost { relay: lost }] if *lost == relay
-    ));
-    assert!(hk.agent.active_reservation().is_none());
+    assert!(drain_events(&mut hk.agent).is_empty());
     assert!(
         !drain_actions(&mut hk.agent)
             .iter()
