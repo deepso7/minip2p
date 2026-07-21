@@ -425,6 +425,49 @@ fn heartbeat_repairs_mesh_and_received_prune_blocks_regraft() {
 }
 
 #[test]
+fn prune_backoff_is_recorded_before_local_subscription() {
+    let mut agent = agent();
+    let remote = peer(2);
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+    assert!(
+        make_ready(
+            &mut agent,
+            &remote,
+            StreamId::new(4),
+            MESHSUB_PROTOCOL_ID_V11,
+            0,
+        )
+        .is_empty()
+    );
+    inbound_open(&mut agent, &remote, StreamId::new(5), 0);
+    remote_subscribe(&mut agent, &remote, StreamId::new(5), "future", 0);
+    drain_events(&mut agent);
+    inbound_rpc(
+        &mut agent,
+        &remote,
+        StreamId::new(5),
+        Rpc {
+            control: Some(ControlMessage {
+                prune: vec![ControlPrune {
+                    topic_id: Some("future".to_string()),
+                    peers: Vec::new(),
+                    backoff: Some(120),
+                }],
+                ..ControlMessage::default()
+            }),
+            ..Rpc::default()
+        },
+        1,
+    );
+
+    agent.subscribe("future", 2).unwrap();
+    assert!(
+        agent.mesh_peers("future").is_empty(),
+        "the pre-subscription PRUNE backoff gates immediate GRAFT"
+    );
+}
+
+#[test]
 fn ihave_deduplicates_and_obeys_per_heartbeat_budgets() {
     let config = GossipsubConfig {
         max_ihave_messages_per_heartbeat: 1,

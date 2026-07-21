@@ -148,6 +148,10 @@ impl ControlBuffer {
             return None;
         }
         let mut items = Vec::new();
+        // Re-encoding is deliberately exact across nested protobuf-varint
+        // boundaries. The configured control budgets bound this quadratic
+        // packing pass; replace it with size accounting only if profiling
+        // shows it matters.
         while let Some(item) = self.pop_first() {
             items.push(item);
             let body = encode_control_items(&items, version);
@@ -259,12 +263,18 @@ struct PeerState {
 }
 
 impl PeerState {
-    fn queued_work(&self, topics: &BTreeSet<String>) -> usize {
-        self.pending_messages.len()
-            + self.pending_control.len()
-            + usize::from(
-                self.acknowledged_topics != *topics || !self.subscription_queue.is_empty(),
-            )
+    fn queued_work(&self) -> usize {
+        // Subscription resync is connection-scoped bookkeeping rather than
+        // dropped application/control payload. Messages remain at the queue
+        // front while in flight; only control moves into the commit record.
+        let in_flight_control = match &self.sender {
+            SendState::Ready {
+                in_flight: Some((_, FrameCommit::Control(items))),
+                ..
+            } => items.len(),
+            _ => 0,
+        };
+        self.pending_messages.len() + self.pending_control.len() + in_flight_control
     }
 }
 
@@ -698,7 +708,7 @@ impl GossipsubAgent {
 
     fn remove_peer(&mut self, peer: &PeerId, cause: &str) {
         if let Some(state) = self.peers.get(peer) {
-            let dropped = state.queued_work(&self.topics);
+            let dropped = state.queued_work();
             if dropped > 0 {
                 self.events.push_back(PubsubEvent::OutboundFailure {
                     peer: peer.clone(),
@@ -1050,6 +1060,10 @@ impl GossipsubAgent {
                     now_ms,
                 );
             } else {
+                // GRAFT itself asserts mesh interest. Spec-following peers
+                // announce the subscription first; an unannounced GRAFT is
+                // accepted optimistically and heartbeat eligibility later
+                // reconciles it.
                 self.mesh.entry(topic).or_default().insert(peer.clone());
             }
         }
@@ -1057,7 +1071,7 @@ impl GossipsubAgent {
             let Some(topic) = prune.topic_id else {
                 continue;
             };
-            if validate_topic(&topic).is_err() || !self.topics.contains(&topic) {
+            if validate_topic(&topic).is_err() {
                 continue;
             }
             if let Some(mesh) = self.mesh.get_mut(&topic) {
@@ -1367,6 +1381,10 @@ impl GossipsubAgent {
             .is_some_and(|state| !state.subscription_queue.is_empty())
         {
             let mut subscriptions = Vec::new();
+            // Subscription and control commits intentionally occupy separate
+            // RPCs. This keeps each acknowledgement atomic at the cost of one
+            // extra write after a reopen; each category is still packed
+            // greedily to the exact wire limit.
             while let Some(next) = self
                 .peers
                 .get(peer)
