@@ -248,11 +248,7 @@ impl SubOpts {
                     opts.subscribe = Some(read_varint_value(input, &mut idx)? != 0);
                 }
                 (2, WIRE_LEN) => {
-                    let offset = idx;
-                    let bytes = read_len_delimited(input, &mut idx)?;
-                    let topic = core::str::from_utf8(bytes)
-                        .map_err(|_| PubsubWireError::InvalidUtf8 { offset })?;
-                    opts.topic_id = Some(String::from(topic));
+                    opts.topic_id = Some(read_string(input, &mut idx)?);
                 }
                 (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
             }
@@ -354,11 +350,7 @@ impl RawMessage {
                     message.seqno = Some(read_len_delimited(input, &mut idx)?.to_vec());
                 }
                 (4, WIRE_LEN) => {
-                    let offset = idx;
-                    let bytes = read_len_delimited(input, &mut idx)?;
-                    let topic = core::str::from_utf8(bytes)
-                        .map_err(|_| PubsubWireError::InvalidUtf8 { offset })?;
-                    message.topic_ids.push(String::from(topic));
+                    message.topic_ids.push(read_string(input, &mut idx)?);
                 }
                 (5, WIRE_LEN) => {
                     message.signature = Some(read_len_delimited(input, &mut idx)?.to_vec());

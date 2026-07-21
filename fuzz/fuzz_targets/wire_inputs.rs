@@ -50,7 +50,8 @@ fn fuzz_pubsub(data: &[u8]) {
         let _ = rpc.encode();
     }
     if let Ok(rpc) = Rpc::decode(data) {
-        let _ = rpc.encode();
+        let encoded = rpc.encode();
+        assert_eq!(Rpc::decode(&encoded), Ok(rpc));
     }
     if let Ok(message) = RawMessage::decode(data) {
         let _ = message.to_wire();
