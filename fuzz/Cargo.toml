@@ -23,6 +23,7 @@ minip2p-identity = { path = "../crates/identity", default-features = false }
 minip2p-identify = { path = "../crates/identify" }
 minip2p-multistream-select = { path = "../crates/multistream-select" }
 minip2p-noise = { path = "../crates/noise" }
+minip2p-pubsub = { path = "../crates/pubsub", default-features = false }
 minip2p-relay = { path = "../crates/relay" }
 minip2p-transport = { path = "../crates/transport" }
 minip2p-yamux = { path = "../crates/yamux" }

@@ -10,6 +10,7 @@ use minip2p_identify::{IdentifyConfig, IdentifyInput, IdentifyMessage, IdentifyP
 use minip2p_identity::{KeyType, PublicKey};
 use minip2p_multistream_select::{MultistreamInput, MultistreamSelect};
 use minip2p_noise::{NoiseConfig, NoiseHandshakePayload, NoiseInput, NoiseRole, NoiseSession};
+use minip2p_pubsub::{FrameDecode as PubsubFrame, RawMessage, Rpc};
 use minip2p_relay::{FrameDecode as RelayFrame, HopMessage, StopMessage};
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
@@ -27,6 +28,7 @@ fuzz_target!(|data: &[u8]| {
     fuzz_autonat(data);
     fuzz_discovery(data);
     fuzz_noise(data);
+    fuzz_pubsub(data);
     fuzz_yamux(data);
     fuzz_circuit(data);
 
@@ -38,6 +40,25 @@ fuzz_target!(|data: &[u8]| {
         let _ = HolePunch::decode(payload);
     }
 });
+
+/// Exercises pubsub framing, RPC/control decoding, canonical re-encoding,
+/// and StrictSign validation with arbitrary wire bytes.
+fn fuzz_pubsub(data: &[u8]) {
+    if let PubsubFrame::Complete { payload, .. } = minip2p_pubsub::decode_frame(data)
+        && let Ok(rpc) = Rpc::decode(payload)
+    {
+        let _ = rpc.encode();
+    }
+    if let Ok(rpc) = Rpc::decode(data) {
+        let encoded = rpc.encode();
+        assert_eq!(Rpc::decode(&encoded), Ok(rpc));
+    }
+    if let Ok(message) = RawMessage::decode(data) {
+        let _ = message.to_wire();
+        let _ = message.verify(false);
+        let _ = message.verify(true);
+    }
+}
 
 /// Feeds the input to both negotiation roles so `decode_message` and the
 /// per-state handlers see attacker-controlled bytes.

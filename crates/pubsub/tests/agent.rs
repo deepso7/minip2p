@@ -178,6 +178,7 @@ fn remote_subscribe_frame(topic: &str) -> Vec<u8> {
             topic_id: Some(topic.to_string()),
         }],
         publish: Vec::new(),
+        control: None,
     };
     encode_frame(&rpc.encode())
 }
@@ -192,6 +193,7 @@ fn signed_message_frame(signer: &Ed25519Keypair, topic: &str, data: &[u8], seqno
             data.to_vec(),
             seqno,
         )],
+        control: None,
     };
     encode_frame(&rpc.encode())
 }
@@ -655,6 +657,7 @@ fn bad_signature_drops_the_message_but_the_stream_survives() {
     let rpc = Rpc {
         subscriptions: Vec::new(),
         publish: vec![message],
+        control: None,
     };
     inbound_data(&mut a, &b, stream, &encode_frame(&rpc.encode()), 2);
     let events = drain_events(&mut a);
@@ -703,6 +706,7 @@ fn unsigned_messages_require_the_allow_unsigned_config() {
         let rpc = Rpc {
             subscriptions: Vec::new(),
             publish: vec![message],
+            control: None,
         };
         encode_frame(&rpc.encode())
     };
@@ -751,6 +755,7 @@ fn unsigned_messages_require_the_allow_unsigned_config() {
         let rpc = Rpc {
             subscriptions: Vec::new(),
             publish: vec![message],
+            control: None,
         };
         encode_frame(&rpc.encode())
     };
@@ -785,6 +790,7 @@ fn subscription_overflow_is_transactional() {
             })
             .collect(),
         publish: Vec::new(),
+        control: None,
     };
     inbound_data(&mut a, &b, stream, &encode_frame(&rpc.encode()), 2);
     let events = drain_events(&mut a);
@@ -1302,6 +1308,7 @@ fn oversized_remote_topics_are_skipped_and_never_stored() {
             },
         ],
         publish: Vec::new(),
+        control: None,
     };
     inbound_data(&mut a, &b, stream, &encode_frame(&rpc.encode()), 2);
     let events = drain_events(&mut a);
@@ -1673,6 +1680,7 @@ fn a_chunk_of_many_tiny_frames_decodes_through_the_cursor_path() {
         &Rpc {
             subscriptions: Vec::new(),
             publish: Vec::new(),
+            control: None,
         }
         .encode(),
     );
