@@ -1,7 +1,4 @@
-use alloc::vec::Vec;
-
 use minip2p_core::PeerId;
-use minip2p_transport::StreamId;
 
 /// Clock sample supplied by the driver with every input.
 ///
@@ -60,28 +57,10 @@ pub enum Path {
     /// A direct QUIC connection established by a DCUtR hole punch. Use the
     /// ordinary swarm APIs with the peer id.
     DirectPunched,
-    /// A raw bridged relay stream.
-    ///
-    /// **This is not a full swarm connection.** No identify, ping, or
-    /// multistream-select negotiation runs over the circuit; the application
-    /// exchanges raw bytes on `stream_id` (addressed to `relay`) with
-    /// `Swarm::send_stream` and receives them as ordinary `StreamData`
-    /// events. A circuit transport that makes a relayed path look like any
-    /// other connection is future work.
+    /// A full Noise- and Yamux-protected connection through a relay.
     Relayed {
-        /// The relay peer the bridge stream runs through.
+        /// The relay carrying the circuit connection.
         relay: PeerId,
-        /// The bridged stream (originally the HOP CONNECT stream).
-        stream_id: StreamId,
-        /// Application bytes received in the same transport read after the
-        /// final initiator-side DCUtR frame. Consume these before waiting for
-        /// later `StreamData` events; they are surfaced exactly once on the
-        /// original relayed `PathEstablished` event.
-        pending_data: Vec<u8>,
-        /// Whether the remote write half reached EOF while the NAT control
-        /// plane still owned the bridge. When true, the original stream event
-        /// was consumed and will not be delivered again.
-        remote_write_closed: bool,
     },
 }
 
@@ -135,4 +114,18 @@ pub enum NatError {
     /// The relay refused the circuit.
     #[error("relay refused: {0}")]
     RelayRefused(alloc::string::String),
+}
+
+/// Failure reported by the driver while promoting a relay bridge.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum PromoteError {
+    /// A verified direct connection won the race before promotion.
+    #[error("peer already has a direct connection")]
+    PeerAlreadyDirect,
+    /// The wrapped relay connection disappeared before adoption.
+    #[error("wrapped relay connection is unknown")]
+    UnknownConnection,
+    /// The bridge could not be adopted.
+    #[error("bridge promotion failed: {0}")]
+    Failed(alloc::string::String),
 }

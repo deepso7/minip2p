@@ -535,7 +535,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                     peer,
                 };
                 for plaintext in decrypted {
-                    phase = self.feed_decrypted_yamux_select(circuit, phase, plaintext)?;
+                    phase = self.feed_decrypted_transport(circuit, phase, plaintext)?;
                 }
                 Ok(phase)
             }
@@ -557,7 +557,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                     peer,
                 };
                 for plaintext in decrypted {
-                    phase = self.feed_decrypted_yamux_select(circuit, phase, plaintext)?;
+                    phase = self.feed_decrypted_transport(circuit, phase, plaintext)?;
                 }
                 Ok(phase)
             }
@@ -580,6 +580,34 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                 }
                 Ok(Phase::Ready { noise, yamux, peer })
             }
+        }
+    }
+
+    /// Routes plaintext Noise transport messages across the exact Yamux
+    /// phase boundary. One bridge read may decrypt both the selection reply
+    /// and immediately-pipelined Yamux frames, so later plaintexts must use
+    /// the `Ready` state produced by an earlier one in the same batch.
+    fn feed_decrypted_transport(
+        &mut self,
+        circuit: &Circuit,
+        phase: Phase,
+        plaintext: Vec<u8>,
+    ) -> Result<Phase, String> {
+        match phase {
+            phase @ Phase::SelectYamux { .. } => {
+                self.feed_decrypted_yamux_select(circuit, phase, plaintext)
+            }
+            Phase::Ready {
+                mut noise,
+                mut yamux,
+                peer,
+            } => {
+                let result = yamux.handle_input(YamuxInput::Data(plaintext));
+                self.drain_yamux(circuit, &mut noise, &mut yamux)?;
+                result.map_err(|error| format!("Yamux protocol failed: {error}"))?;
+                Ok(Phase::Ready { noise, yamux, peer })
+            }
+            _ => Err("decrypted transport data arrived before Yamux selection".to_string()),
         }
     }
 
@@ -1902,6 +1930,73 @@ mod tests {
         }
 
         complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
+    }
+
+    #[test]
+    fn decrypt_batch_crosses_yamux_selection_into_ready_frames() {
+        let (mut a, mut b, circuit_id, bridge, _a_peer, _b_peer) = setup_pair();
+
+        // Stop immediately after B reaches Ready. Its encrypted Yamux
+        // selection confirmation is now queued for A, which is still in
+        // SelectYamux and has not consumed that ciphertext yet.
+        for _ in 0..32 {
+            let _ = a.poll().expect("drive initiator toward Yamux selection");
+            let _ = b.poll().expect("drive responder toward Yamux selection");
+            let a_selecting = matches!(
+                a.circuits.get(&circuit_id).and_then(|c| c.phase.as_ref()),
+                Some(Phase::SelectYamux { .. })
+            );
+            let b_ready = matches!(
+                b.circuits.get(&circuit_id).and_then(|c| c.phase.as_ref()),
+                Some(Phase::Ready { .. })
+            );
+            if a_selecting && b_ready {
+                break;
+            }
+        }
+        assert!(matches!(
+            a.circuits.get(&circuit_id).and_then(|c| c.phase.as_ref()),
+            Some(Phase::SelectYamux { .. })
+        ));
+        assert!(matches!(
+            b.circuits.get(&circuit_id).and_then(|c| c.phase.as_ref()),
+            Some(Phase::Ready { .. })
+        ));
+
+        // Queue a Yamux SYN behind the already-encrypted selection reply,
+        // then combine both Noise transport frames into one bridge read.
+        // Noise decrypts them as two plaintexts in one output batch: the
+        // first transitions A to Ready and the second must be routed through
+        // that newly-created Ready state.
+        let opened = b.open_stream(circuit_id).expect("open responder stream");
+        let raw = a.inner_mut().poll().expect("read encrypted bridge batch");
+        let chunks: Vec<_> = raw
+            .into_iter()
+            .filter_map(|event| match event {
+                TransportEvent::StreamData {
+                    stream_id, data, ..
+                } if stream_id == bridge => Some(data),
+                _ => None,
+            })
+            .collect();
+        assert!(chunks.len() >= 2, "expected selection and Yamux frames");
+        let coalesced = chunks.into_iter().flatten().collect();
+        let inner_conn = a
+            .circuits
+            .get(&circuit_id)
+            .expect("initiator circuit")
+            .inner_conn;
+        a.inject_bridge_data(inner_conn, bridge, coalesced);
+
+        let events = a.poll().expect("drain cross-boundary outputs");
+        assert!(events.iter().any(
+            |event| matches!(event, TransportEvent::Connected { id, .. } if *id == circuit_id)
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TransportEvent::IncomingStream { id, stream_id }
+                if *id == circuit_id && *stream_id == opened
+        )));
     }
 
     fn assert_pre_ready_bridge_failure(events: &[TransportEvent], circuit_id: ConnectionId) {

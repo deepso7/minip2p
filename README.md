@@ -162,4 +162,4 @@ cargo doc --workspace --no-deps --open
 - [x] Floodsub pubsub (`pubsub` feature) with libp2p wire interop, plus the chat example.
 - [x] Signed pubsub peer discovery (`discovery` feature), including automatic mesh dialing and host-death survival.
 - [ ] Gossipsub, on the same pubsub API surface.
-- [ ] A circuit transport, so relayed paths look like normal connections (today the relay bridge is a raw stream: chat requires a successful hole punch).
+- [x] A circuit transport, so relayed paths are end-to-end encrypted, multiplexed normal connections.

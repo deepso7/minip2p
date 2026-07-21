@@ -156,14 +156,14 @@ pub fn run_listen(relay: Option<PeerAddr>, options: RunOptions) -> Result<(), Bo
     let mut echo_streams: HashSet<(PeerId, StreamId)> = HashSet::new();
 
     if let Some(relay) = relays.first() {
-        wait_for_reservation(&mut endpoint, relay, &mut echo_streams)?;
+        wait_for_reservation(&mut endpoint, relay)?;
     }
     eprintln!("[listen] echoing on {ECHO_PROTOCOL} (Ctrl-C to stop)");
 
     loop {
         for nat_event in endpoint.take_nat_events() {
             print_nat_event("listen", &nat_event);
-            handle_listen_nat_event(&mut endpoint, &nat_event, relays.first(), &mut echo_streams);
+            handle_listen_nat_event(&mut endpoint, &nat_event, relays.first());
         }
         let Some(event) = endpoint
             .next_event(Duration::from_millis(200))
@@ -179,11 +179,7 @@ pub fn run_listen(relay: Option<PeerAddr>, options: RunOptions) -> Result<(), Bo
 /// Pumps NAT events until the first reservation confirms (printing the
 /// paste-ready `circuit=` line) or the deadline passes with a warning; the
 /// agent keeps retrying either way and renewals re-print via the main loop.
-fn wait_for_reservation(
-    endpoint: &mut Endpoint,
-    relay: &PeerAddr,
-    echo_streams: &mut HashSet<(PeerId, StreamId)>,
-) -> Result<(), Box<dyn Error>> {
+fn wait_for_reservation(endpoint: &mut Endpoint, relay: &PeerAddr) -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + RESERVATION_DEADLINE;
     loop {
         let Some(event) = endpoint
@@ -198,47 +194,21 @@ fn wait_for_reservation(
         };
         print_nat_event("listen", &event);
         let reserved = matches!(event, NatEvent::RelayReserved { .. });
-        handle_listen_nat_event(endpoint, &event, Some(relay), echo_streams);
+        handle_listen_nat_event(endpoint, &event, Some(relay));
         if reserved {
             return Ok(());
         }
     }
 }
 
-fn handle_listen_nat_event(
-    endpoint: &mut Endpoint,
-    event: &NatEvent,
-    relay: Option<&PeerAddr>,
-    echo_streams: &mut HashSet<(PeerId, StreamId)>,
-) {
-    match event {
-        NatEvent::RelayReserved { .. } => {
-            if let Some(relay) = relay {
-                println!(
-                    "[listen] circuit={}",
-                    circuit_addr(relay, endpoint.peer_id())
-                );
-            }
-        }
-        NatEvent::InboundRelayCircuit {
-            relay,
-            stream_id,
-            pending_data,
-            remote_write_closed,
-            ..
-        } => {
-            echo_streams.insert((relay.clone(), *stream_id));
-            // Bytes pipelined behind the circuit setup are surfaced exactly
-            // once here and never reappear as `StreamData`.
-            if !pending_data.is_empty() {
-                echo_bytes(endpoint, relay, *stream_id, pending_data, echo_streams);
-            }
-            if *remote_write_closed {
-                let _ = endpoint.close_stream_write(relay, *stream_id);
-                echo_streams.remove(&(relay.clone(), *stream_id));
-            }
-        }
-        _ => {}
+fn handle_listen_nat_event(endpoint: &mut Endpoint, event: &NatEvent, relay: Option<&PeerAddr>) {
+    if let NatEvent::RelayReserved { .. } = event
+        && let Some(relay) = relay
+    {
+        println!(
+            "[listen] circuit={}",
+            circuit_addr(relay, endpoint.peer_id())
+        );
     }
 }
 
@@ -422,28 +392,11 @@ pub fn run_dial(
         start.elapsed().as_millis()
     );
 
-    let mut frames = FrameBuf::new();
-    let channel = match path {
-        Path::Relayed {
-            relay,
-            stream_id,
-            pending_data,
-            remote_write_closed,
-        } => {
-            if remote_write_closed {
-                return Err("relay bridge arrived already write-closed".into());
-            }
-            frames.push(&pending_data);
-            Channel {
-                send_peer: relay,
-                stream: stream_id,
-                direct: false,
-            }
-        }
-        Path::DirectDialed | Path::DirectPunched => {
-            establish_direct_channel(&mut endpoint, &peer, &BTreeSet::new(), None, start)?
-        }
-    };
+    let relayed = matches!(path, Path::Relayed { .. });
+    let frames = FrameBuf::new();
+    let mut channel =
+        establish_direct_channel(&mut endpoint, &peer, &BTreeSet::new(), None, start)?;
+    channel.direct = !relayed;
 
     ping_loop(&mut endpoint, &peer, channel, frames, count, start)
 }

@@ -5,12 +5,11 @@ use std::time::Instant;
 
 use minip2p_core::PeerId;
 use minip2p_discovery::{DiscoveryAction, DiscoveryAgent, DiscoveryEvent};
-use minip2p_nat::{ConnectId, NatEvent, Path};
+use minip2p_nat::{ConnectId, NatEvent};
 use minip2p_pubsub::PubsubEvent;
-use minip2p_quic::QuicEndpoint;
-use minip2p_swarm::{Swarm, SwarmEvent};
-use minip2p_transport::StreamId;
+use minip2p_swarm::SwarmEvent;
 
+use crate::EndpointSwarm;
 use crate::{Error, nat::NatDriver, pubsub::PubsubDriver};
 
 /// Errors from discovery-focused endpoint waits.
@@ -24,22 +23,12 @@ pub enum DiscoveryError {
     Driver(#[from] Error),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum BridgeState {
-    Live {
-        connect_id: ConnectId,
-        target_peer: PeerId,
-    },
-    Tombstone,
-}
-
-/// Coordinates beacon traffic, automatic NAT connects, and released bridges.
+/// Coordinates beacon traffic and automatic NAT connects.
 pub(crate) struct DiscoveryDriver {
     pub(crate) agent: DiscoveryAgent,
     pub(crate) events: VecDeque<DiscoveryEvent>,
     epoch: Instant,
     pub(crate) inflight: BTreeMap<ConnectId, PeerId>,
-    pub(crate) bridges: BTreeMap<(PeerId, StreamId), BridgeState>,
     last_local_addrs: Vec<minip2p_core::Multiaddr>,
 }
 
@@ -50,7 +39,6 @@ impl DiscoveryDriver {
             events: VecDeque::new(),
             epoch: Instant::now(),
             inflight: BTreeMap::new(),
-            bridges: BTreeMap::new(),
             last_local_addrs: Vec::new(),
         }
     }
@@ -60,47 +48,22 @@ impl DiscoveryDriver {
     }
 
     /// Observes lifecycle events regardless of which protocol driver claims them.
-    pub(crate) fn observe(&mut self, event: &SwarmEvent) {
+    pub(crate) fn observe(&mut self, event: &SwarmEvent, swarm: &EndpointSwarm) {
         let now = self.now_ms();
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                // A second establishment supersedes the relay connection that
-                // owned any tracked stream ids.
-                self.bridges.retain(|(relay, _), _| relay != peer_id);
                 self.agent.peer_connected(peer_id, now);
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                self.bridges.retain(|(relay, _), _| relay != peer_id);
+            SwarmEvent::ConnectionClosed { peer_id, .. }
+                if swarm.core().conn_for(peer_id).is_none() =>
+            {
+                // Eager supersession surfaces Closed(old) before
+                // Established(new), but the core has already installed the
+                // replacement. Preserve discovery continuity in that case.
                 self.agent.peer_disconnected(peer_id, now);
             }
             _ => {}
         }
-    }
-
-    /// Claims data and terminal events for released bridges discovery owns.
-    pub(crate) fn ingest(&mut self, event: &SwarmEvent) -> bool {
-        let key = match event {
-            SwarmEvent::StreamData {
-                peer_id, stream_id, ..
-            }
-            | SwarmEvent::StreamRemoteWriteClosed {
-                peer_id, stream_id, ..
-            }
-            | SwarmEvent::StreamClosed {
-                peer_id, stream_id, ..
-            } => Some((peer_id.clone(), *stream_id)),
-            _ => None,
-        };
-        let Some(key) = key else {
-            return false;
-        };
-        if !self.bridges.contains_key(&key) {
-            return false;
-        }
-        if matches!(event, SwarmEvent::StreamClosed { .. }) {
-            self.bridges.remove(&key);
-        }
-        true
     }
 
     /// Runs all cross-driver work until no new work is produced.
@@ -108,7 +71,7 @@ impl DiscoveryDriver {
         &mut self,
         pubsub: &mut PubsubDriver,
         nat: &mut NatDriver,
-        swarm: &mut Swarm<QuicEndpoint>,
+        swarm: &mut EndpointSwarm,
     ) {
         loop {
             let mut progressed = false;
@@ -155,7 +118,7 @@ impl DiscoveryDriver {
                 let connect_id = nat_connect_id(&event);
                 if connect_id.is_some_and(|id| self.inflight.contains_key(&id)) {
                     progressed = true;
-                    self.handle_nat_event(event, nat, swarm, now);
+                    self.handle_nat_event(event, now);
                 } else {
                     retained.push_back(event);
                 }
@@ -194,70 +157,17 @@ impl DiscoveryDriver {
         }
     }
 
-    fn handle_nat_event(
-        &mut self,
-        event: NatEvent,
-        _nat: &mut NatDriver,
-        swarm: &mut Swarm<QuicEndpoint>,
-        now: u64,
-    ) {
+    fn handle_nat_event(&mut self, event: NatEvent, now: u64) {
         match event {
             NatEvent::PathEstablished {
-                connect_id,
-                peer,
-                path,
-            } => match path {
-                Path::DirectDialed | Path::DirectPunched => {
-                    self.inflight.remove(&connect_id);
-                    self.agent.dial_succeeded(&peer, now);
-                }
-                Path::Relayed {
-                    relay, stream_id, ..
-                } => {
-                    self.bridges.insert(
-                        (relay, stream_id),
-                        BridgeState::Live {
-                            connect_id,
-                            target_peer: peer,
-                        },
-                    );
-                }
-            },
-            NatEvent::PathUpgraded {
-                connect_id,
-                peer,
-                from,
-                ..
-            } => {
-                if let Path::Relayed {
-                    relay, stream_id, ..
-                } = from
-                {
-                    self.bridges
-                        .insert((relay, stream_id), BridgeState::Tombstone);
-                }
+                connect_id, peer, ..
+            }
+            | NatEvent::PathUpgraded {
+                connect_id, peer, ..
+            }
+            | NatEvent::FellBackToRelay { connect_id, peer } => {
                 self.inflight.remove(&connect_id);
                 self.agent.dial_succeeded(&peer, now);
-            }
-            NatEvent::FellBackToRelay { connect_id, peer } => {
-                let keys: Vec<_> = self
-                    .bridges
-                    .iter()
-                    .filter(|(_, state)| {
-                        matches!(state, BridgeState::Live { connect_id: id, .. } if *id == connect_id)
-                    })
-                    .map(|(key, _)| key.clone())
-                    .collect();
-                for key in keys {
-                    if swarm.reset_stream(&key.0, key.1).is_ok() {
-                        self.bridges.insert(key, BridgeState::Tombstone);
-                    } else {
-                        self.bridges.remove(&key);
-                    }
-                }
-                self.inflight.remove(&connect_id);
-                self.agent
-                    .dial_failed(&peer, "relayed only; direct path required", now);
             }
             NatEvent::ConnectFailed {
                 connect_id,
@@ -268,14 +178,14 @@ impl DiscoveryDriver {
                 self.agent.dial_failed(&peer, &error.to_string(), now);
             }
             NatEvent::HolePunchFailed { .. } => {}
-            // `sweep` currently calls this only for variants selected by
+            // `sweep` calls this only for variants selected by
             // `nat_connect_id`. Ignore future correlated variants rather
-            // than turning a harmless facade-version skew into a panic.
+            // than turning harmless facade-version skew into a panic.
             _ => {}
         }
     }
 
-    fn cancel_peer(&mut self, peer: &PeerId, nat: &mut NatDriver, swarm: &mut Swarm<QuicEndpoint>) {
+    fn cancel_peer(&mut self, peer: &PeerId, nat: &mut NatDriver, swarm: &mut EndpointSwarm) {
         let active = self
             .inflight
             .iter()
@@ -284,51 +194,17 @@ impl DiscoveryDriver {
             nat.agent.cancel(id, nat.now());
             nat.pump(swarm);
             self.inflight.remove(&id);
-            for state in self.bridges.values_mut() {
-                if matches!(state, BridgeState::Live { connect_id, .. } if *connect_id == id) {
-                    *state = BridgeState::Tombstone;
-                }
-            }
-            return;
-        }
-        let keys = self.live_bridge_keys_for_peer(peer);
-        for key in keys {
-            if swarm.reset_stream(&key.0, key.1).is_ok() {
-                self.bridges.insert(key, BridgeState::Tombstone);
-            } else {
-                self.bridges.remove(&key);
-            }
         }
     }
 
-    fn live_bridge_keys_for_peer(&self, peer: &PeerId) -> Vec<(PeerId, StreamId)> {
-        self.bridges
-            .iter()
-            .filter(|(_, state)| {
-                matches!(state, BridgeState::Live { target_peer, .. } if target_peer == peer)
-            })
-            .map(|(key, _)| key.clone())
-            .collect()
-    }
-
-    /// Cancels attempts and suppresses every bridge before raw-swarm handoff.
-    pub(crate) fn shutdown(&mut self, nat: &mut NatDriver, swarm: &mut Swarm<QuicEndpoint>) {
+    /// Cancels all discovery-owned attempts before raw-swarm handoff.
+    pub(crate) fn shutdown(&mut self, nat: &mut NatDriver, swarm: &mut EndpointSwarm) {
         let attempts: Vec<ConnectId> = self.inflight.keys().copied().collect();
         for id in attempts {
             nat.agent.cancel(id, nat.now());
-            for state in self.bridges.values_mut() {
-                if matches!(state, BridgeState::Live { connect_id, .. } if *connect_id == id) {
-                    *state = BridgeState::Tombstone;
-                }
-            }
         }
         self.inflight.clear();
         nat.pump(swarm);
-        let bridges: Vec<_> = self.bridges.keys().cloned().collect();
-        for (relay, stream_id) in bridges {
-            let _ = swarm.abandon_stream(&relay, stream_id);
-        }
-        self.bridges.clear();
         self.events.clear();
     }
 }
@@ -346,19 +222,74 @@ fn nat_connect_id(event: &NatEvent) -> Option<ConnectId> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::cell::Cell;
     use std::time::{Duration, Instant};
 
-    use crate::{Endpoint, Event};
-    use minip2p_discovery::DiscoveryConfig;
-    use minip2p_identity::Ed25519Keypair;
-    use minip2p_nat::{NatAgent, NatConfig, Now};
+    use minip2p_discovery::{DiscoveryAction, DiscoveryConfig};
+    use minip2p_identity::{Ed25519Keypair, PeerId as IdentityPeerId, PublicKey};
+    use minip2p_nat::{NatAgent, NatConfig, Now, Path};
+    use minip2p_transport::StreamId;
 
-    fn driver() -> DiscoveryDriver {
-        let keypair = Ed25519Keypair::generate();
-        let agent = DiscoveryAgent::new(keypair.public_key(), DiscoveryConfig::default()).unwrap();
-        DiscoveryDriver::new(agent)
+    use super::*;
+    use crate::{Endpoint, Event};
+
+    fn discovery_beacon(keypair: &Ed25519Keypair) -> (PeerId, Vec<u8>) {
+        let mut agent = DiscoveryAgent::new(
+            PublicKey::from(keypair),
+            DiscoveryConfig {
+                auto_dial: false,
+                ..DiscoveryConfig::default()
+            },
+        )
+        .expect("valid remote discovery agent");
+        agent.set_local_addrs(
+            &["/ip4/127.0.0.1/udp/4001/quic-v1"
+                .parse()
+                .expect("valid beacon address")],
+            0,
+        );
+        agent.handle_tick(0);
+        let payload = loop {
+            match agent.poll_action() {
+                Some(DiscoveryAction::PublishBeacon { payload, .. }) => break payload,
+                Some(_) => continue,
+                None => panic!("beacon was not published"),
+            }
+        };
+        (IdentityPeerId::from(keypair), payload)
+    }
+
+    fn discovery_with_inflight() -> (DiscoveryDriver, ConnectId, PeerId, PeerId) {
+        let local_key = Ed25519Keypair::from_secret_key_bytes([91; 32]);
+        let remote_key = Ed25519Keypair::from_secret_key_bytes([92; 32]);
+        let local = IdentityPeerId::from(&local_key);
+        let (remote, payload) = discovery_beacon(&remote_key);
+        let mut driver = DiscoveryDriver::new(
+            DiscoveryAgent::new(
+                PublicKey::from(&local_key),
+                DiscoveryConfig {
+                    dial_tie_break: false,
+                    ..DiscoveryConfig::default()
+                },
+            )
+            .expect("valid discovery agent"),
+        );
+        driver.agent.handle_beacon(&remote, &payload, true, 1);
+        assert!(matches!(
+            driver.agent.poll_event(),
+            Some(DiscoveryEvent::PeerDiscovered { peer, .. }) if peer == remote
+        ));
+        assert!(matches!(
+            driver.agent.poll_action(),
+            Some(DiscoveryAction::Dial { peer, .. }) if peer == remote
+        ));
+
+        let mut nat = NatAgent::new(local, NatConfig::default());
+        let connect_id = nat.connect(remote.clone(), Vec::new(), Now::from_mono(0));
+        driver.inflight.insert(connect_id, remote.clone());
+        let relay = PeerId::from_public_key_protobuf(
+            &PublicKey::from(&Ed25519Keypair::from_secret_key_bytes([93; 32])).encode_protobuf(),
+        );
+        (driver, connect_id, remote, relay)
     }
 
     fn endpoint_with_protocol(protocol: &str) -> Endpoint {
@@ -425,424 +356,6 @@ mod tests {
     }
 
     #[test]
-    fn bridge_events_are_claimed_through_terminal_close() {
-        let mut driver = driver();
-        let relay = Ed25519Keypair::generate().peer_id();
-        let target = Ed25519Keypair::generate().peer_id();
-        let mut nat = NatAgent::new(driver.agent.local_peer_id().clone(), NatConfig::default());
-        let connect_id = nat.connect(
-            target.clone(),
-            Vec::new(),
-            Now {
-                mono_ms: 0,
-                unix_secs: None,
-            },
-        );
-        let stream_id = StreamId::new(7);
-        driver.bridges.insert(
-            (relay.clone(), stream_id),
-            BridgeState::Live {
-                connect_id,
-                target_peer: target,
-            },
-        );
-        assert!(driver.ingest(&SwarmEvent::StreamData {
-            peer_id: relay.clone(),
-            conn_id: minip2p_transport::ConnectionId::new(1),
-            stream_id,
-            data: vec![1],
-        }));
-        assert!(driver.ingest(&SwarmEvent::StreamRemoteWriteClosed {
-            peer_id: relay.clone(),
-            conn_id: minip2p_transport::ConnectionId::new(1),
-            stream_id,
-        }));
-        assert!(driver.ingest(&SwarmEvent::StreamClosed {
-            peer_id: relay,
-            conn_id: minip2p_transport::ConnectionId::new(1),
-            stream_id,
-        }));
-        assert!(driver.bridges.is_empty());
-    }
-
-    #[test]
-    fn relay_lifecycle_clears_live_and_tombstone_stream_ids() {
-        let mut driver = driver();
-        let relay = Ed25519Keypair::generate().peer_id();
-        driver
-            .bridges
-            .insert((relay.clone(), StreamId::new(1)), BridgeState::Tombstone);
-        driver.observe(&SwarmEvent::ConnectionEstablished {
-            peer_id: relay.clone(),
-            conn_id: minip2p_transport::ConnectionId::new(1),
-        });
-        assert!(driver.bridges.is_empty());
-        driver
-            .bridges
-            .insert((relay.clone(), StreamId::new(2)), BridgeState::Tombstone);
-        driver.observe(&SwarmEvent::ConnectionClosed {
-            peer_id: relay,
-            conn_id: minip2p_transport::ConnectionId::new(1),
-        });
-        assert!(driver.bridges.is_empty());
-    }
-
-    #[test]
-    fn orphan_bridge_selection_is_scoped_to_target_peer() {
-        let mut driver = driver();
-        let target = Ed25519Keypair::generate().peer_id();
-        let unrelated = Ed25519Keypair::generate().peer_id();
-        let target_relay = Ed25519Keypair::generate().peer_id();
-        let unrelated_relay = Ed25519Keypair::generate().peer_id();
-        let mut nat = NatAgent::new(driver.agent.local_peer_id().clone(), NatConfig::default());
-        let target_id = nat.connect(
-            target.clone(),
-            Vec::new(),
-            Now {
-                mono_ms: 0,
-                unix_secs: None,
-            },
-        );
-        let unrelated_id = nat.connect(
-            unrelated.clone(),
-            Vec::new(),
-            Now {
-                mono_ms: 1,
-                unix_secs: None,
-            },
-        );
-        driver.bridges.insert(
-            (target_relay.clone(), StreamId::new(1)),
-            BridgeState::Live {
-                connect_id: target_id,
-                target_peer: target.clone(),
-            },
-        );
-        driver.bridges.insert(
-            (unrelated_relay, StreamId::new(2)),
-            BridgeState::Live {
-                connect_id: unrelated_id,
-                target_peer: unrelated,
-            },
-        );
-
-        let selected = driver.live_bridge_keys_for_peer(&target);
-        assert_eq!(selected, vec![(target_relay, StreamId::new(1))]);
-    }
-
-    #[test]
-    fn fallback_and_both_cancel_arms_update_bridge_ownership() {
-        let mut endpoint = endpoint_with_protocol("/test/discovery-driver/1");
-        let relay = Ed25519Keypair::generate().peer_id();
-        let target = Ed25519Keypair::generate().peer_id();
-        let fallback_id = endpoint.nat.as_mut().expect("NAT enabled").agent.connect(
-            target.clone(),
-            Vec::new(),
-            Now::from_mono(0),
-        );
-        {
-            let Endpoint {
-                swarm,
-                nat,
-                discovery,
-                ..
-            } = &mut endpoint;
-            let nat = nat.as_mut().expect("NAT enabled");
-            let discovery = discovery.as_mut().expect("discovery enabled");
-            discovery.inflight.insert(fallback_id, target.clone());
-            discovery.bridges.insert(
-                (relay.clone(), StreamId::new(10)),
-                BridgeState::Live {
-                    connect_id: fallback_id,
-                    target_peer: target.clone(),
-                },
-            );
-            discovery.handle_nat_event(
-                NatEvent::FellBackToRelay {
-                    connect_id: fallback_id,
-                    peer: target.clone(),
-                },
-                nat,
-                swarm,
-                1,
-            );
-            assert!(!discovery.inflight.contains_key(&fallback_id));
-            assert!(
-                !discovery
-                    .bridges
-                    .contains_key(&(relay.clone(), StreamId::new(10))),
-                "a synchronous reset failure must drop the bridge"
-            );
-        }
-
-        let active_target = Ed25519Keypair::generate().peer_id();
-        let active_id = endpoint.nat.as_mut().expect("NAT enabled").agent.connect(
-            active_target.clone(),
-            Vec::new(),
-            Now::from_mono(2),
-        );
-        {
-            let Endpoint {
-                swarm,
-                nat,
-                discovery,
-                ..
-            } = &mut endpoint;
-            let nat = nat.as_mut().expect("NAT enabled");
-            let discovery = discovery.as_mut().expect("discovery enabled");
-            discovery.inflight.insert(active_id, active_target.clone());
-            discovery.bridges.insert(
-                (relay.clone(), StreamId::new(11)),
-                BridgeState::Live {
-                    connect_id: active_id,
-                    target_peer: active_target.clone(),
-                },
-            );
-            discovery.cancel_peer(&active_target, nat, swarm);
-            assert!(!discovery.inflight.contains_key(&active_id));
-            assert_eq!(
-                discovery.bridges.get(&(relay.clone(), StreamId::new(11))),
-                Some(&BridgeState::Tombstone),
-                "the NAT attempt owns the active bridge reset"
-            );
-        }
-
-        let orphan_target = Ed25519Keypair::generate().peer_id();
-        let orphan_id = endpoint.nat.as_mut().expect("NAT enabled").agent.connect(
-            orphan_target.clone(),
-            Vec::new(),
-            Now::from_mono(3),
-        );
-        let Endpoint {
-            swarm,
-            nat,
-            discovery,
-            ..
-        } = &mut endpoint;
-        let nat = nat.as_mut().expect("NAT enabled");
-        let discovery = discovery.as_mut().expect("discovery enabled");
-        discovery.bridges.insert(
-            (relay.clone(), StreamId::new(12)),
-            BridgeState::Live {
-                connect_id: orphan_id,
-                target_peer: orphan_target.clone(),
-            },
-        );
-        discovery.cancel_peer(&orphan_target, nat, swarm);
-        assert!(
-            !discovery.bridges.contains_key(&(relay, StreamId::new(12))),
-            "an orphan bridge with a rejected reset must be dropped"
-        );
-    }
-
-    #[test]
-    fn relayed_path_upgrade_tombstones_the_released_bridge() {
-        let mut endpoint = endpoint_with_protocol("/test/discovery-upgrade/1");
-        let relay = Ed25519Keypair::generate().peer_id();
-        let target = Ed25519Keypair::generate().peer_id();
-        let stream_id = StreamId::new(20);
-        let connect_id = endpoint.nat.as_mut().expect("NAT enabled").agent.connect(
-            target.clone(),
-            Vec::new(),
-            Now::from_mono(0),
-        );
-        let relayed = Path::Relayed {
-            relay: relay.clone(),
-            stream_id,
-            pending_data: Vec::new(),
-            remote_write_closed: false,
-        };
-        let Endpoint {
-            swarm,
-            nat,
-            discovery,
-            ..
-        } = &mut endpoint;
-        let nat = nat.as_mut().expect("NAT enabled");
-        let discovery = discovery.as_mut().expect("discovery enabled");
-        discovery.inflight.insert(connect_id, target.clone());
-        discovery.handle_nat_event(
-            NatEvent::PathEstablished {
-                connect_id,
-                peer: target.clone(),
-                path: relayed.clone(),
-            },
-            nat,
-            swarm,
-            0,
-        );
-        assert!(matches!(
-            discovery.bridges.get(&(relay.clone(), stream_id)),
-            Some(BridgeState::Live { .. })
-        ));
-
-        discovery.handle_nat_event(
-            NatEvent::PathUpgraded {
-                connect_id,
-                peer: target,
-                from: relayed,
-                to: Path::DirectPunched,
-            },
-            nat,
-            swarm,
-            1,
-        );
-        assert!(!discovery.inflight.contains_key(&connect_id));
-        assert_eq!(
-            discovery.bridges.get(&(relay, stream_id)),
-            Some(&BridgeState::Tombstone)
-        );
-    }
-
-    #[test]
-    fn real_bridge_fallback_resets_and_claims_terminal_events() {
-        const PROTOCOL: &str = "/test/discovery-real-bridge/1";
-        let (mut owner, mut remote, stream_id) = connected_user_stream(PROTOCOL);
-        let relay = remote.peer_id().clone();
-        let target = Ed25519Keypair::generate().peer_id();
-        let connect_id = owner.nat.as_mut().expect("NAT enabled").agent.connect(
-            target.clone(),
-            Vec::new(),
-            Now::from_mono(0),
-        );
-
-        {
-            let Endpoint {
-                swarm,
-                nat,
-                discovery,
-                ..
-            } = &mut owner;
-            let nat = nat.as_mut().expect("NAT enabled");
-            let discovery = discovery.as_mut().expect("discovery enabled");
-            discovery.inflight.insert(connect_id, target.clone());
-            discovery.handle_nat_event(
-                NatEvent::PathEstablished {
-                    connect_id,
-                    peer: target.clone(),
-                    path: Path::Relayed {
-                        relay: relay.clone(),
-                        stream_id,
-                        pending_data: Vec::new(),
-                        remote_write_closed: false,
-                    },
-                },
-                nat,
-                swarm,
-                0,
-            );
-        }
-        remote
-            .send_stream(owner.peer_id(), stream_id, b"bridge payload".to_vec())
-            .expect("remote sends bridge data");
-        remote
-            .close_stream_write(owner.peer_id(), stream_id)
-            .expect("remote closes bridge write side");
-        {
-            let Endpoint {
-                swarm,
-                nat,
-                discovery,
-                ..
-            } = &mut owner;
-            let nat = nat.as_mut().expect("NAT enabled");
-            let discovery = discovery.as_mut().expect("discovery enabled");
-            discovery.handle_nat_event(
-                NatEvent::FellBackToRelay {
-                    connect_id,
-                    peer: target,
-                },
-                nat,
-                swarm,
-                1,
-            );
-            assert_eq!(
-                discovery.bridges.get(&(relay.clone(), stream_id)),
-                Some(&BridgeState::Tombstone),
-                "the real stream reset must succeed"
-            );
-        }
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            let _ = remote
-                .next_event(Duration::from_millis(10))
-                .expect("remote drives");
-            if let Some(event) = owner
-                .next_event(Duration::from_millis(10))
-                .expect("owner drives")
-            {
-                assert!(
-                    !is_stream_event(&event, &relay, stream_id),
-                    "bridge event leaked after designation: {event:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn into_swarm_suppresses_queued_and_future_bridge_events() {
-        const PROTOCOL: &str = "/test/discovery-into-swarm/1";
-        let (mut owner, mut remote, stream_id) = connected_user_stream(PROTOCOL);
-        let relay = remote.peer_id().clone();
-        let target = Ed25519Keypair::generate().peer_id();
-        let connect_id = owner.nat.as_mut().expect("NAT enabled").agent.connect(
-            target.clone(),
-            Vec::new(),
-            Now::from_mono(0),
-        );
-        owner
-            .discovery
-            .as_mut()
-            .expect("discovery enabled")
-            .bridges
-            .insert(
-                (relay.clone(), stream_id),
-                BridgeState::Live {
-                    connect_id,
-                    target_peer: target,
-                },
-            );
-
-        remote
-            .send_stream(owner.peer_id(), stream_id, b"queued bridge data".to_vec())
-            .expect("remote sends queued data");
-        let saw_queued_stream_event = Cell::new(false);
-        owner
-            .swarm_mut()
-            .run_until(Instant::now() + Duration::from_millis(500), |event| {
-                if is_stream_event(event, &relay, stream_id) {
-                    saw_queued_stream_event.set(true);
-                }
-                false
-            })
-            .expect("queue raw stream event");
-        assert!(
-            saw_queued_stream_event.get(),
-            "the handoff test must begin with a queued bridge event"
-        );
-
-        let owner_peer = owner.peer_id().clone();
-        let mut swarm = owner.into_swarm();
-        let _ = remote.close_stream_write(&owner_peer, stream_id);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            let _ = remote
-                .next_event(Duration::from_millis(10))
-                .expect("remote drives");
-            if let Some(event) = swarm
-                .poll_next(Duration::from_millis(10))
-                .expect("raw swarm drives")
-            {
-                assert!(
-                    !is_stream_event(&event, &relay, stream_id),
-                    "abandoned bridge event leaked after handoff: {event:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn endpoint_abandon_stream_purges_focused_wait_buffer_and_future_events() {
         const PROTOCOL: &str = "/test/endpoint-abandon/1";
         let (mut owner, mut remote, stream_id) = connected_user_stream(PROTOCOL);
@@ -906,6 +419,92 @@ mod tests {
         assert_eq!(
             minip2p_discovery::MAX_TOPIC_LEN,
             minip2p_pubsub::MAX_TOPIC_LEN
+        );
+    }
+
+    #[test]
+    fn relayed_success_variants_complete_discovery_owned_dials() {
+        for fell_back in [false, true] {
+            let (mut driver, connect_id, remote, relay) = discovery_with_inflight();
+            let event = if fell_back {
+                NatEvent::FellBackToRelay {
+                    connect_id,
+                    peer: remote.clone(),
+                }
+            } else {
+                NatEvent::PathEstablished {
+                    connect_id,
+                    peer: remote.clone(),
+                    path: Path::Relayed { relay },
+                }
+            };
+            driver.handle_nat_event(event, 2);
+
+            assert!(!driver.inflight.contains_key(&connect_id));
+            driver.agent.dial_failed(&remote, "must already be idle", 3);
+            assert!(
+                driver.agent.poll_event().is_none(),
+                "successful relayed completion must collapse the discovery dial state"
+            );
+        }
+    }
+
+    #[test]
+    fn eager_supersede_close_preserves_discovery_connectivity() {
+        let a_key = Ed25519Keypair::from_secret_key_bytes([94; 32]);
+        let b_key = Ed25519Keypair::from_secret_key_bytes([95; 32]);
+        let (b_peer, beacon) = discovery_beacon(&b_key);
+        let config = DiscoveryConfig {
+            dial_tie_break: false,
+            beacon_interval_ms: 100,
+            peer_ttl_ms: 2_000,
+            ..DiscoveryConfig::default()
+        };
+        let mut a = Endpoint::builder()
+            .identity(a_key)
+            .discovery_config(config.clone())
+            .expect("valid discovery config")
+            .bind_quic("127.0.0.1:0")
+            .expect("bind a");
+        let mut b = Endpoint::builder()
+            .identity(b_key)
+            .discovery_config(config)
+            .expect("valid discovery config")
+            .bind_quic("127.0.0.1:0")
+            .expect("bind b");
+        a.listen().expect("a listens");
+        let b_addr = b.listen().expect("b listens");
+        a.dial(&b_addr).expect("first dial");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !a.connected_peers().contains(&b_peer) {
+            assert!(Instant::now() < deadline, "first connection timed out");
+            let _ = a.next_event(Duration::from_millis(20)).expect("drive a");
+            let _ = b.next_event(Duration::from_millis(20)).expect("drive b");
+        }
+        let discovery = a.discovery.as_mut().expect("discovery enabled");
+        discovery.agent.handle_beacon(&b_peer, &beacon, true, 1);
+        while discovery.agent.poll_event().is_some() {}
+        assert!(discovery.agent.poll_action().is_none());
+
+        a.dial(&b_addr).expect("replacement dial");
+        let mut saw_old_close = false;
+        while !saw_old_close {
+            assert!(Instant::now() < deadline, "replacement timed out");
+            if let Some(Event::ConnectionClosed { peer_id, .. }) =
+                a.next_event(Duration::from_millis(20)).expect("drive a")
+            {
+                saw_old_close = peer_id == b_peer;
+            }
+            let _ = b.next_event(Duration::from_millis(20)).expect("drive b");
+        }
+        assert!(a.swarm.core().conn_for(&b_peer).is_some());
+
+        let discovery = a.discovery.as_mut().expect("discovery enabled");
+        discovery.agent.handle_beacon(&b_peer, &beacon, true, 2);
+        assert!(
+            discovery.agent.poll_action().is_none(),
+            "Closed(old) must not make discovery redial while new is installed"
         );
     }
 }

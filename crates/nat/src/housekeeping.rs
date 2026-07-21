@@ -128,7 +128,7 @@ impl Prober {
                 self.next_probe_at = Some(now.mono_ms + shared.config.probe_interval_unsettled_ms);
                 return;
             }
-        } else if shared.connected.contains(&server_peer)
+        } else if shared.is_connected(&server_peer)
             || shared.session_dial_pending(&server_peer, now)
         {
             // Connected, or another machine is already dialing this peer
@@ -179,19 +179,14 @@ impl Prober {
         if let Some(flight) = &self.flight
             && flight.server.peer_id() == peer
         {
-            self.abort_flight(shared, now);
-        }
-    }
-
-    fn on_peer_superseded(&mut self, peer: &PeerId, shared: &mut Shared, now: Now) {
-        if self
-            .flight
-            .as_ref()
-            .is_some_and(|flight| flight.server.peer_id() == peer)
-        {
-            // The old connection's stream ids are invalid, but resetting
-            // them would target the replacement connection.
-            self.flight = None;
+            if let Some(flight) = self.flight.take()
+                && let Some(stream) = flight.stage.stream()
+            {
+                // The owning connection is already gone. Releasing local
+                // bookkeeping is sufficient; a peer-scoped reset could hit
+                // a replacement connection that reused the stream id.
+                shared.release_stream(peer, stream);
+            }
             self.server_idx += 1;
             self.next_probe_at = Some(now.mono_ms + shared.config.probe_interval_unsettled_ms);
         }
@@ -596,8 +591,7 @@ impl ReservationManager {
                 self.fail_acquire(shared, now);
                 return;
             }
-        } else if shared.connected.contains(&relay_peer)
-            || shared.session_dial_pending(&relay_peer, now)
+        } else if shared.is_connected(&relay_peer) || shared.session_dial_pending(&relay_peer, now)
         {
             // Connected, or a connect attempt's relay leg is already dialing
             // this relay: share that connection instead of superseding it.
@@ -680,29 +674,15 @@ impl ReservationManager {
                 };
             }
             ResState::Acquiring { relay, .. } if relay.peer_id() == peer => {
-                self.fail_acquire(shared, now);
-            }
-            _ => {}
-        }
-    }
-
-    fn on_peer_superseded(&mut self, peer: &PeerId, shared: &mut Shared, now: Now) {
-        match &self.state {
-            ResState::Reserved { relay, .. } if relay.peer_id() == peer => {
-                shared.push_event(NatEvent::RelayReservationLost {
-                    relay: peer.clone(),
-                });
-                self.relay_idx += 1;
-                self.state = ResState::Backoff {
-                    until: now.mono_ms + shared.config.reservation_retry_backoff_ms,
-                };
-            }
-            ResState::Acquiring { relay, .. } if relay.peer_id() == peer => {
-                // Do not reset the retired stream id on the new connection.
-                // A renewal keeps the old reservation in `held` while its
-                // replacement exchange runs. Superseding the relay connection
-                // invalidates that reservation even though the exchange did
-                // not fail through the normal stream path.
+                if let ResState::Acquiring { stage, .. } =
+                    core::mem::replace(&mut self.state, ResState::Idle)
+                    && let Some(stream) = stage.stream()
+                {
+                    // As above, the connection is terminal. Never reset by
+                    // peer after eager supersession has installed a
+                    // replacement connection.
+                    shared.release_stream(peer, stream);
+                }
                 if let Some(held) = self.held.take() {
                     shared.push_event(NatEvent::RelayReservationLost { relay: held });
                 }
@@ -984,11 +964,6 @@ impl Housekeeping {
         self.reservations.on_peer_disconnected(peer, shared, now);
     }
 
-    pub(crate) fn on_peer_superseded(&mut self, peer: &PeerId, shared: &mut Shared, now: Now) {
-        self.prober.on_peer_superseded(peer, shared, now);
-        self.reservations.on_peer_superseded(peer, shared, now);
-    }
-
     pub(crate) fn on_probe_dial_result(
         &mut self,
         result: &Result<ConnectionId, String>,
@@ -1049,7 +1024,9 @@ impl Housekeeping {
                 self.reservations
                     .on_stream_input(stream, input, shared, now);
             }
-            StreamRole::HopConnect(_) | StreamRole::StopInbound(_) | StreamRole::RejectedStop => {}
+            StreamRole::HopConnect(_)
+            | StreamRole::StopInbound(_)
+            | StreamRole::RejectedControl => {}
         }
     }
 

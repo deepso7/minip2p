@@ -8,20 +8,21 @@
 //! relay opens STOP stream ──▶ CONNECT ──▶ auto-Accept (STATUS:OK)
 //!   ──▶ DCUtR CONNECT arrives ──▶ reply with our observed addresses
 //!   ──▶ SYNC arrives ──▶ schedule UDP blasts,
-//!       release the bridge to the app (InboundRelayCircuit)
+//!       promote the bridge into a circuit connection
 //! initiator's dial lands ──▶ cancel blasts, InboundDirectUpgrade
 //! ```
 
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId, SansIoProtocol, select_direct_candidates};
+use minip2p_core::{Multiaddr, PeerId, Protocol, SansIoProtocol, select_direct_candidates};
 use minip2p_dcutr::{DcutrResponder, DcutrResponderInput, DcutrResponderOutput, ResponderEvent};
 use minip2p_relay::{Status, StopResponder, StopResponderInput, StopResponderOutput};
-use minip2p_transport::StreamId;
+use minip2p_transport::{ConnectionId, StreamId};
 
+use crate::agent::TokenPurpose;
 use crate::agent::{Shared, StreamInput};
-use crate::events::{NatAction, NatEvent};
-use crate::types::Now;
+use crate::events::{BridgeRole, NatAction, NatEvent};
+use crate::types::{Now, PromoteError};
 
 /// Responder-side UDP blast schedule during the punch window.
 struct BlastSchedule {
@@ -33,6 +34,8 @@ struct BlastSchedule {
 /// One inbound relay circuit: STOP acceptance, DCUtR responder exchange,
 /// and the punch-window UDP blasts.
 pub(crate) struct InboundCircuit {
+    id: u64,
+    inner_conn: ConnectionId,
     /// The peer that opened the STOP stream to us (the relay).
     relay: PeerId,
     stream: StreamId,
@@ -42,7 +45,7 @@ pub(crate) struct InboundCircuit {
     dcutr: Option<DcutrResponder>,
     remote_addrs: Vec<Multiaddr>,
     /// Application bytes received after the final DCUtR SYNC frame in the
-    /// same stream read. These must accompany the raw bridge handoff.
+    /// same stream read. These must accompany circuit promotion.
     pending_data: Vec<u8>,
     /// The remote write half reached EOF while the control plane still owned
     /// the bridge. The transport will not repeat that event after handoff.
@@ -54,15 +57,26 @@ pub(crate) struct InboundCircuit {
     /// Keep the circuit alive for upgrade detection until this instant
     /// (covers the initiator's full retry window, not just our blasts).
     linger_until: Option<u64>,
-    /// The bridge stream has been handed to the application.
+    /// The bridge stream has been handed to the circuit transport.
     released: bool,
+    promoted: Option<ConnectionId>,
+    handshake_deadline: Option<u64>,
     done: bool,
 }
 
 impl InboundCircuit {
     /// Claims a freshly negotiated inbound STOP stream.
-    pub(crate) fn new(relay: PeerId, stream: StreamId, shared: &Shared, now: Now) -> Self {
+    pub(crate) fn new(
+        id: u64,
+        inner_conn: ConnectionId,
+        relay: PeerId,
+        stream: StreamId,
+        shared: &Shared,
+        now: Now,
+    ) -> Self {
         Self {
+            id,
+            inner_conn,
             relay,
             stream,
             source: None,
@@ -75,6 +89,8 @@ impl InboundCircuit {
             blast: None,
             linger_until: None,
             released: false,
+            promoted: None,
+            handshake_deadline: None,
             done: false,
         }
     }
@@ -98,17 +114,21 @@ impl InboundCircuit {
         if let Some(linger) = self.linger_until {
             due = Some(due.map_or(linger, |d| d.min(linger)));
         }
+        if let Some(handshake) = self.handshake_deadline {
+            due = Some(due.map_or(handshake, |d| d.min(handshake)));
+        }
         due
     }
 
     pub(crate) fn on_stream_input(
         &mut self,
+        conn_id: ConnectionId,
         stream: StreamId,
         input: StreamInput<'_>,
         shared: &mut Shared,
         now: Now,
     ) {
-        if self.done || stream != self.stream {
+        if self.done || conn_id != self.inner_conn || stream != self.stream {
             return;
         }
         match input {
@@ -210,6 +230,15 @@ impl InboundCircuit {
             });
         }
 
+        if shared.config.force_relay {
+            // STOP yields the CONNECT request before the bytes trailing its
+            // frame. In force-relay mode there is no DCUtR machine to consume
+            // that remainder: it is already circuit transport data and must
+            // cross the ownership boundary with the promoted bridge.
+            self.pending_data = pipelined;
+            self.promote(shared);
+            return;
+        }
         self.dcutr = Some(DcutrResponder::new(&shared.punch_candidates()));
         if !pipelined.is_empty() {
             self.on_bridge_data(&pipelined, shared, now);
@@ -230,7 +259,7 @@ impl InboundCircuit {
             // oversized reply), but the bridge itself is fine: hand it to
             // the app without punching.
             self.dcutr = None;
-            self.release_to_app(shared);
+            self.promote(shared);
             return;
         }
         let mut outputs = Vec::new();
@@ -251,8 +280,7 @@ impl InboundCircuit {
                     remote_addrs,
                     ..
                 }) => {
-                    self.remote_addrs =
-                        select_direct_candidates(&remote_addrs, None, None).into_addrs();
+                    self.remote_addrs = select_global_punch_candidates(&remote_addrs);
                 }
                 DcutrResponderOutput::Event(ResponderEvent::SyncReceived) => {
                     sync_received = true;
@@ -293,27 +321,28 @@ impl InboundCircuit {
         let window =
             shared.config.punch_deadline_ms * (1 + u64::from(shared.config.punch_max_retries));
         self.linger_until = Some(now.mono_ms + window);
-        self.release_to_app(shared);
+        self.promote(shared);
     }
 
-    /// Hands the bridge stream to the application, exactly once.
-    fn release_to_app(&mut self, shared: &mut Shared) {
+    /// Hands the exact bridge stream to the circuit transport, exactly once.
+    fn promote(&mut self, shared: &mut Shared) {
         if self.released {
             return;
         }
         self.released = true;
         shared.release_stream(&self.relay, self.stream);
         if let Some(source) = &self.source {
-            shared.push_event(NatEvent::InboundRelayCircuit {
-                peer: source.clone(),
+            let token = shared.alloc_token(TokenPurpose::PromoteInbound(self.id));
+            shared.push_action(NatAction::PromoteBridge {
+                token,
+                inner_conn: self.inner_conn,
                 relay: self.relay.clone(),
                 stream_id: self.stream,
+                remote_peer: source.clone(),
+                role: BridgeRole::Responder,
                 pending_data: core::mem::take(&mut self.pending_data),
                 remote_write_closed: self.remote_write_closed,
             });
-        }
-        if self.blast.is_none() && self.linger_until.is_none() {
-            self.done = true;
         }
     }
 
@@ -326,7 +355,7 @@ impl InboundCircuit {
                 // The punch exchange stalled, but the accepted bridge is
                 // perfectly usable: give it to the app without punching.
                 self.dcutr = None;
-                self.release_to_app(shared);
+                self.promote(shared);
             } else {
                 // The relay never even sent CONNECT.
                 self.abandon(shared, true);
@@ -364,12 +393,35 @@ impl InboundCircuit {
                 self.done = true;
             }
         }
+        if let Some(deadline) = self.handshake_deadline
+            && now.mono_ms >= deadline
+        {
+            self.handshake_deadline = None;
+            if let Some(conn_id) = self.promoted.take() {
+                shared.push_action(NatAction::CloseCircuit { conn_id });
+            }
+            self.done = true;
+        }
     }
 
-    /// The initiator's (or our) punch landed: the peer is directly
-    /// connected.
-    pub(crate) fn on_peer_connected(&mut self, peer: &PeerId, shared: &mut Shared, _now: Now) {
+    pub(crate) fn on_connection_established(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        is_circuit: bool,
+        shared: &mut Shared,
+        _now: Now,
+    ) {
         if self.done || self.source.as_ref() != Some(peer) {
+            return;
+        }
+        if is_circuit {
+            if self.promoted == Some(conn_id) {
+                self.handshake_deadline = None;
+                if self.blast.is_none() && self.linger_until.is_none() {
+                    self.done = true;
+                }
+            }
             return;
         }
         self.blast = None;
@@ -383,8 +435,20 @@ impl InboundCircuit {
     /// The relay connection died. Before release the circuit is gone; after
     /// release the app owns the (now dead) stream and the initiator's punch
     /// dial may still land, so the circuit lingers.
-    pub(crate) fn on_relay_disconnected(&mut self, peer: &PeerId, _shared: &mut Shared) {
-        if self.done || &self.relay != peer {
+    pub(crate) fn on_connection_closed(
+        &mut self,
+        peer: &PeerId,
+        conn_id: ConnectionId,
+        _shared: &mut Shared,
+    ) {
+        if self.done {
+            return;
+        }
+        if self.promoted == Some(conn_id) {
+            self.done = true;
+            return;
+        }
+        if &self.relay != peer || conn_id != self.inner_conn {
             return;
         }
         if !self.released {
@@ -407,4 +471,95 @@ impl InboundCircuit {
         }
         self.done = true;
     }
+
+    pub(crate) fn on_promote_result(
+        &mut self,
+        result: Result<ConnectionId, PromoteError>,
+        shared: &mut Shared,
+        now: Now,
+    ) {
+        match result {
+            Ok(conn_id) => {
+                self.promoted = Some(conn_id);
+                self.handshake_deadline =
+                    Some(now.mono_ms + shared.config.circuit_handshake_timeout_ms);
+            }
+            Err(_) => self.done = true,
+        }
+    }
+}
+
+/// Selects peer-supplied DCUtR targets that are safe to dial or blast.
+///
+/// The general direct-candidate selector intentionally accepts DNS and LAN
+/// addresses because those are useful when configured by the local
+/// application. DCUtR addresses instead come from an untrusted remote peer:
+/// resolving or sending traffic to private/special-use targets would turn the
+/// NAT agent into an SSRF primitive. Keep only strict QUIC-v1 addresses whose
+/// first component is a globally routable unicast IP.
+pub(crate) fn select_global_punch_candidates(addrs: &[Multiaddr]) -> Vec<Multiaddr> {
+    select_direct_candidates(addrs, None, None)
+        .into_addrs()
+        .into_iter()
+        .filter(is_global_unicast_quic)
+        .collect()
+}
+
+fn is_global_unicast_quic(addr: &Multiaddr) -> bool {
+    match addr.protocols().first() {
+        Some(Protocol::Ip4(octets)) => is_global_unicast_v4(*octets),
+        Some(Protocol::Ip6(octets)) => is_global_unicast_v6(*octets),
+        Some(Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_)) | None => false,
+        Some(_) => false,
+    }
+}
+
+fn is_global_unicast_v4([a, b, c, d]: [u8; 4]) -> bool {
+    !(a == 0
+        // RFC 1918 private space.
+        || a == 10
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+        // RFC 6598 shared carrier-grade NAT space.
+        || (a == 100 && (64..=127).contains(&b))
+        || a == 127
+        || (a == 169 && b == 254)
+        // IETF protocol assignments. .9 and .10 are globally reachable
+        // anycast addresses and therefore remain eligible.
+        || (a == 192 && b == 0 && c == 0 && d != 9 && d != 10)
+        // Documentation ranges.
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        // Benchmarking, multicast, reserved, and broadcast space.
+        || (a == 198 && (b == 18 || b == 19))
+        || a >= 224)
+}
+
+fn is_global_unicast_v6(octets: [u8; 16]) -> bool {
+    let segments = core::net::Ipv6Addr::from(octets).segments();
+    // The currently allocated global-unicast block is 2000::/3.
+    if segments[0] & 0xe000 != 0x2000 {
+        return false;
+    }
+
+    // Special-purpose allocations within 2000::/3 are not ordinary global
+    // unicast destinations. Keep the small set explicitly designated global
+    // by IANA inside 2001::/23.
+    if segments[0] == 0x2001 && segments[1] < 0x0200 {
+        let value = u128::from_be_bytes(octets);
+        let globally_reachable_exception = value == 0x2001_0001_0000_0000_0000_0000_0000_0001
+            || value == 0x2001_0001_0000_0000_0000_0000_0000_0002
+            || segments[1] == 0x0003
+            || (segments[1] == 0x0004 && segments[2] == 0x0112)
+            || (0x0020..=0x003f).contains(&segments[1]);
+        if !globally_reachable_exception {
+            return false;
+        }
+    }
+
+    // 6to4 and documentation ranges are not globally reachable endpoints.
+    segments[0] != 0x2002
+        && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+        && !(segments[0] == 0x3fff && segments[1] & 0xf000 == 0)
 }

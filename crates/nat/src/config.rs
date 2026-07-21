@@ -37,6 +37,12 @@ pub struct NatConfig {
     pub relay_stagger_ms: u64,
     /// Overall deadline for a connect attempt.
     pub connect_deadline_ms: u64,
+    /// Deadline for an inbound promoted circuit to finish its Noise and
+    /// Yamux handshake. The deadline is disarmed once the circuit connection
+    /// is established.
+    pub circuit_handshake_timeout_ms: u64,
+    /// Use relayed circuits without racing direct dials or attempting DCUtR.
+    pub force_relay: bool,
     /// Deadline for the relay leg to reach `Bridged` (measured from when the
     /// leg starts, i.e. after the stagger).
     pub relay_leg_deadline_ms: u64,
@@ -83,6 +89,8 @@ impl Default for NatConfig {
             autonat_servers: Vec::new(),
             relay_stagger_ms: 200,
             connect_deadline_ms: 60_000,
+            circuit_handshake_timeout_ms: 20_000,
+            force_relay: false,
             relay_leg_deadline_ms: 12_000,
             punch_deadline_ms: 3_000,
             punch_max_retries: 2,

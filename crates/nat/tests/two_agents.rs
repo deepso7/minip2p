@@ -21,8 +21,8 @@ use minip2p_transport::{ConnectionId, StreamId};
 const A_LISTEN: &str = "/ip4/198.51.100.10/udp/4100/quic-v1";
 const RELAY_ADDR: &str = "/ip4/203.0.113.1/udp/4001/quic-v1";
 /// Each side's public NAT mapping, as the relay's identify reports it.
-const A_PUBLIC: &str = "/ip4/203.0.113.201/udp/40001/quic-v1";
-const B_PUBLIC: &str = "/ip4/203.0.113.202/udp/40002/quic-v1";
+const A_PUBLIC: &str = "/ip4/8.8.4.4/udp/40001/quic-v1";
+const B_PUBLIC: &str = "/ip4/1.1.1.1/udp/40002/quic-v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Side {
@@ -247,6 +247,23 @@ impl World {
                     self.blasts_from_b += 1;
                 }
             }
+            NatAction::PromoteBridge {
+                token, remote_peer, ..
+            } => {
+                self.next_conn += 1;
+                let conn_id = ConnectionId::new((1 << 63) | self.next_conn);
+                let agent = self.agent(side);
+                agent.promote_result(token, Ok(conn_id), now);
+                agent.handle_event_with_disposition_classified(
+                    &SwarmEvent::ConnectionEstablished {
+                        peer_id: remote_peer,
+                        conn_id,
+                    },
+                    true,
+                    now,
+                );
+            }
+            NatAction::CloseCircuit { .. } => {}
             NatAction::CloseStreamWrite { .. }
             | NatAction::ResetStream { .. }
             | NatAction::Disconnect { .. } => {}
@@ -418,27 +435,27 @@ fn two_agents_punch_to_a_direct_connection() {
     assert!(
         matches!(
             events.as_slice(),
-            [NatEvent::PathEstablished { connect_id, path: Path::Relayed { .. }, .. }]
-                if *connect_id == id
+            [NatEvent::PathEstablished {
+                connect_id,
+                peer,
+                path: Path::Relayed { relay },
+            }]
+                if *connect_id == id && peer == &world.b_id && relay == &world.relay_id
         ),
         "A settles a relayed path first, got {events:?}"
     );
     assert_eq!(
-        world.punch_dials_from_a, 2,
-        "A dialed B's listen address and B's relay-observed public mapping"
+        world.punch_dials_from_a, 1,
+        "A dialed only B's global relay-observed public mapping"
     );
     assert!(
         world.punch_dial_addrs_from_a.contains(&maddr(B_PUBLIC)),
         "A's punch targets B's public mapping: {:?}",
         world.punch_dial_addrs_from_a
     );
-    let events = drain_events(&mut world.b);
     assert!(
-        matches!(
-            events.as_slice(),
-            [NatEvent::InboundRelayCircuit { peer, .. }] if *peer == world.a_id
-        ),
-        "B released the inbound bridge, got {events:?}"
+        drain_events(&mut world.b).is_empty(),
+        "inbound circuits surface through normal swarm lifecycle events"
     );
 
     // B's punch-back is blast-only (DCUtR for QUIC: the initiator dials).
@@ -462,10 +479,12 @@ fn two_agents_punch_to_a_direct_connection() {
         matches!(
             events.as_slice(),
             [NatEvent::PathUpgraded {
-                from: Path::Relayed { .. },
+                connect_id,
+                peer,
+                from: Path::Relayed { relay },
                 to: Path::DirectPunched,
-                ..
             }]
+                if *connect_id == id && peer == &world.b_id && relay == &world.relay_id
         ),
         "A upgrades explicitly, got {events:?}"
     );

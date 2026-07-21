@@ -54,23 +54,18 @@ $ minip2p-chat host --relay /ip6/…/udp/4001/quic-v1/p2p/<relay-id>
 ```
 
 A joiner pastes the circuit address; the NAT agent connects through the
-relay, runs DCUtR, and the chat starts once the hole punch lands:
+relay and chat starts immediately on the promoted relayed connection while
+DCUtR attempts a direct upgrade in the background:
 
 ```console
 $ minip2p-chat join '<circuit-addr>' --nick alice
 [join] path=relayed
-[join] waiting for the hole punch (chat needs a direct path)
-[join] nat-path-upgraded … to=direct-punched
 [join] subscribed topic=minip2p-chat nick=alice
 ```
 
-### Known v1 limitation: no chat over the relay bridge
-
-The relayed path is a raw bridge stream — no multistream negotiation runs
-over it, so floodsub cannot open its streams there. If the hole punch
-fails, `join` exits with an error instead of silently sitting in a dead
-room. A circuit transport that makes relayed paths look like normal
-connections is future work at the stack level.
+Pass `--relay-only` to skip direct dialing and DCUtR entirely. This gives a
+deterministic way to exercise Noise, Yamux, Identify, discovery, and floodsub
+over the relay circuit.
 
 ## Message format
 
@@ -108,8 +103,13 @@ Two deployment details surfaced during live validation:
    from the `listen-addr=` line by substituting the machine's public IP:
    `join /ip4/<public-ip>/udp/4001/quic-v1/p2p/<host-peer-id>`. Kill and
    rejoin one peer: the subscription snapshot is resent on reconnect.
-2. **NAT'd host**: host behind a NAT with `--relay <aws-relay>`, joiners
-   paste the `circuit=` address and hole-punch in.
+2. **Relay-only room**: start the NAT'd host with
+   `host --relay <aws-relay> --relay-only`, then have joiners paste its
+   `circuit=` address and run
+   `join '<circuit-addr>' --relay-only --nick alice`. Verify both sides
+   report subscriptions and exchange messages while `path=relayed`; cutting
+   the relay must disconnect the room. Remove `--relay-only` from both peers
+   in a second run to validate the relayed → direct-punched upgrade.
 3. **go-libp2p interop**: a go floodsub peer (Ed25519 identity) on the
    same topic chats both ways in strict mode.
 4. **rust-libp2p interop**: a rust-libp2p floodsub peer, with this side
@@ -124,4 +124,5 @@ open-internet star (hotspot + home-network leaves, kill/rejoin,
 75 s idle survival), a NAT'd host punched into from a hotspot
 (relayed → direct-punched upgrade, then chat over the punched path),
 and both interop directions against real go-libp2p and rust-libp2p
-peers.
+peers. The deterministic relay-only room is also covered by the loopback
+binary e2e test in `tests/chat.rs`.

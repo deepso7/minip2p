@@ -14,7 +14,8 @@
 //! t0+δ    relay leg (stagger δ, 0 = fully parallel):
 //!           ensure relay session → HOP CONNECT(target)
 //!           → Bridged ⇒ start a DCUtR punch over the bridge
-//!           → after SYNC, release bridge ⇒ PathEstablished(Relayed)
+//!           → after SYNC, promote bridge through Noise + Yamux
+//!           → circuit Connected ⇒ PathEstablished(Relayed)
 //! first usable path wins; a better path later ⇒ explicit PathUpgraded
 //! "fallback" is not a phase — it is what remains when the punch leg
 //! exhausts (FellBackToRelay)
@@ -26,9 +27,10 @@
 //! (or any equivalent runtime). Events for streams the agent does not own
 //! cost one map lookup and zero clones.
 //!
-//! The relayed path is a **raw bridge stream**, not a full swarm connection:
-//! no identify, ping, or multistream-select runs over it. See
-//! [`Path::Relayed`].
+//! The driver executes [`NatAction::PromoteBridge`] against a circuit
+//! transport. Relayed paths are therefore ordinary identity-verified swarm
+//! connections: identify, ping, pubsub, and application protocols use the
+//! same stream APIs as direct paths.
 //!
 //! `no_std` + `alloc` compatible.
 
@@ -46,8 +48,10 @@ mod types;
 
 pub use agent::NatAgent;
 pub use config::{NatConfig, ReservationPolicy};
-pub use events::{NatAction, NatEvent};
-pub use types::{ConnectId, NatError, NatToken, Now, Path, ReachabilityState, ReservationInfo};
+pub use events::{BridgeRole, NatAction, NatEvent};
+pub use types::{
+    ConnectId, NatError, NatToken, Now, Path, PromoteError, ReachabilityState, ReservationInfo,
+};
 
 // Protocol ids for everything the agent drives, so a driver can register
 // them without depending on each protocol crate.

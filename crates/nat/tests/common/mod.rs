@@ -17,12 +17,14 @@ use minip2p_relay::{
     StopMessageType, encode_frame as relay_encode_frame,
 };
 use minip2p_swarm::{IdentifyMessage, SwarmEvent};
-use minip2p_transport::StreamId;
+use minip2p_transport::{ConnectionId, StreamId};
+
+pub const TEST_CIRCUIT_ID: u64 = (1 << 63) | 77;
 
 pub const TARGET_ADDR: &str = "/ip4/192.0.2.10/udp/4001/quic-v1";
 pub const RELAY_TRANSPORT_ADDR: &str = "/ip4/203.0.113.1/udp/4001/quic-v1";
 pub const LISTEN_ADDR: &str = "/ip4/198.51.100.5/udp/4500/quic-v1";
-pub const REMOTE_OBSERVED_ADDR: &str = "/ip4/192.0.2.99/udp/4002/quic-v1";
+pub const REMOTE_OBSERVED_ADDR: &str = "/ip4/8.8.8.8/udp/4002/quic-v1";
 /// A public mapping of our own socket, as a peer would report it.
 pub const OUR_OBSERVED_ADDR: &str = "/ip4/203.0.113.77/udp/45678/quic-v1";
 
@@ -257,6 +259,57 @@ pub fn has_reset_for(actions: &[NatAction], stream: StreamId) -> bool {
     actions.iter().any(
         |action| matches!(action, NatAction::ResetStream { stream_id, .. } if *stream_id == stream),
     )
+}
+
+pub fn promote_token(actions: &[NatAction]) -> NatToken {
+    let mut tokens = actions.iter().filter_map(|action| match action {
+        NatAction::PromoteBridge { token, .. } => Some(*token),
+        _ => None,
+    });
+    let token = tokens.next().expect("expected PromoteBridge action");
+    assert!(tokens.next().is_none(), "more than one promotion action");
+    token
+}
+
+pub fn promoted_pending_data(actions: &[NatAction]) -> &[u8] {
+    actions
+        .iter()
+        .find_map(|action| match action {
+            NatAction::PromoteBridge { pending_data, .. } => Some(pending_data.as_slice()),
+            _ => None,
+        })
+        .expect("expected PromoteBridge action")
+}
+
+pub fn promotion_remote_write_closed(actions: &[NatAction]) -> bool {
+    actions.iter().any(|action| {
+        matches!(
+            action,
+            NatAction::PromoteBridge {
+                remote_write_closed: true,
+                ..
+            }
+        )
+    })
+}
+
+pub fn complete_promotion(
+    agent: &mut NatAgent,
+    target: &PeerId,
+    actions: &[NatAction],
+    now: Now,
+) -> ConnectionId {
+    let conn_id = ConnectionId::new(TEST_CIRCUIT_ID);
+    agent.promote_result(promote_token(actions), Ok(conn_id), now);
+    agent.handle_event_with_disposition_classified(
+        &SwarmEvent::ConnectionEstablished {
+            peer_id: target.clone(),
+            conn_id,
+        },
+        true,
+        now,
+    );
+    conn_id
 }
 
 /// Scripted world around one agent: a local node, a target peer, and one
