@@ -317,6 +317,7 @@ impl Harness {
     pub fn relay_session_ready(&mut self, now: Now) {
         self.agent.handle_event(
             &SwarmEvent::ConnectionEstablished {
+                conn_id: minip2p_transport::ConnectionId::new(1),
                 peer_id: self.relay.clone(),
             },
             now,
@@ -333,6 +334,7 @@ impl Harness {
     pub fn stream_ready(&mut self, stream: StreamId, now: Now) {
         self.agent.handle_event(
             &SwarmEvent::StreamReady {
+                conn_id: minip2p_transport::ConnectionId::new(1),
                 peer_id: self.relay.clone(),
                 stream_id: stream,
                 protocol_id: HOP_PROTOCOL_ID.to_string(),
@@ -345,6 +347,7 @@ impl Harness {
     pub fn stream_data(&mut self, stream: StreamId, data: Vec<u8>, now: Now) {
         self.agent.handle_event(
             &SwarmEvent::StreamData {
+                conn_id: minip2p_transport::ConnectionId::new(1),
                 peer_id: self.relay.clone(),
                 stream_id: stream,
                 data,
@@ -356,6 +359,7 @@ impl Harness {
     pub fn target_connected(&mut self, now: Now) {
         self.agent.handle_event(
             &SwarmEvent::ConnectionEstablished {
+                conn_id: minip2p_transport::ConnectionId::new(1),
                 peer_id: self.target.clone(),
             },
             now,

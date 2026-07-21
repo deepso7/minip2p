@@ -824,6 +824,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "minip2p-circuit"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "minip2p-core",
+ "minip2p-identity",
+ "minip2p-multistream-select",
+ "minip2p-noise",
+ "minip2p-test-support",
+ "minip2p-transport",
+ "minip2p-yamux",
+ "thiserror",
+]
+
+[[package]]
 name = "minip2p-core"
 version = "0.1.0"
 dependencies = [
@@ -990,6 +1005,7 @@ version = "0.1.0"
 dependencies = [
  "minip2p-core",
  "minip2p-relay",
+ "minip2p-transport",
 ]
 
 [[package]]

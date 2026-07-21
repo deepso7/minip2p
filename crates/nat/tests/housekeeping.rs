@@ -86,6 +86,7 @@ impl Hk {
     fn session_ready(&mut self, peer: &PeerId, protocols: &[&str], now: Now) {
         self.agent.handle_event(
             &SwarmEvent::ConnectionEstablished {
+                conn_id: minip2p_transport::ConnectionId::new(1),
                 peer_id: peer.clone(),
             },
             now,
@@ -102,6 +103,7 @@ impl Hk {
     fn stream_ready(&mut self, peer: &PeerId, stream: StreamId, protocol: &str, now: Now) {
         self.agent.handle_event(
             &SwarmEvent::StreamReady {
+                conn_id: minip2p_transport::ConnectionId::new(1),
                 peer_id: peer.clone(),
                 stream_id: stream,
                 protocol_id: protocol.to_string(),
@@ -114,6 +116,7 @@ impl Hk {
     fn stream_data(&mut self, peer: &PeerId, stream: StreamId, data: Vec<u8>, now: Now) {
         self.agent.handle_event(
             &SwarmEvent::StreamData {
+                conn_id: minip2p_transport::ConnectionId::new(1),
                 peer_id: peer.clone(),
                 stream_id: stream,
                 data,
@@ -527,6 +530,7 @@ fn lost_relay_connection_emits_lost_and_reacquires() {
     let relay = hk.relay.clone();
     hk.agent.handle_event(
         &SwarmEvent::ConnectionClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: relay.clone(),
         },
         at(5_000),
@@ -562,6 +566,7 @@ fn relay_supersede_during_renewal_emits_reservation_lost() {
     let relay = hk.relay.clone();
     hk.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: relay.clone(),
         },
         at_unix(renew_at + 1, 1_790),

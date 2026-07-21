@@ -2,7 +2,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use minip2p_autonat::{AutoNatClient, AutoNatClientInput, AutoNatServer, AutoNatServerInput};
-use minip2p_core::{Multiaddr, PeerId, SansIoProtocol};
+use minip2p_circuit::{BridgeAdoption, CircuitRole, CircuitTransport, EntropyError, EntropySource};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol};
 use minip2p_dcutr::{FrameDecode as DcutrFrame, HolePunch};
 use minip2p_discovery::{Beacon, DiscoveryAgent, DiscoveryConfig};
 use minip2p_identify::{IdentifyConfig, IdentifyInput, IdentifyMessage, IdentifyProtocol};
@@ -10,7 +11,9 @@ use minip2p_identity::{KeyType, PublicKey};
 use minip2p_multistream_select::{MultistreamInput, MultistreamSelect};
 use minip2p_noise::{NoiseConfig, NoiseHandshakePayload, NoiseInput, NoiseRole, NoiseSession};
 use minip2p_relay::{FrameDecode as RelayFrame, HopMessage, StopMessage};
-use minip2p_transport::StreamId;
+use minip2p_transport::{
+    ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
+};
 use minip2p_yamux::{FrameDecoder as YamuxFrameDecoder, YamuxRole, YamuxSession};
 
 fuzz_target!(|data: &[u8]| {
@@ -25,6 +28,7 @@ fuzz_target!(|data: &[u8]| {
     fuzz_discovery(data);
     fuzz_noise(data);
     fuzz_yamux(data);
+    fuzz_circuit(data);
 
     if let RelayFrame::Complete { payload, .. } = minip2p_relay::decode_frame(data) {
         let _ = HopMessage::decode(payload);
@@ -47,6 +51,119 @@ fn fuzz_multistream(data: &[u8]) {
         let _ = machine.handle_input(MultistreamInput::Data(data.to_vec()));
         while machine.poll_output().is_some() {}
         let _ = machine.take_remaining_buffer();
+    }
+}
+
+struct FixedEntropy;
+
+impl EntropySource for FixedEntropy {
+    fn fill(&mut self, destination: &mut [u8]) -> Result<(), EntropyError> {
+        destination.fill(7);
+        Ok(())
+    }
+}
+
+struct FuzzTransport {
+    initial: Option<TransportEvent>,
+}
+
+impl FuzzTransport {
+    fn new(relay: PeerId) -> Self {
+        Self {
+            initial: Some(TransportEvent::Connected {
+                id: ConnectionId::new(1),
+                endpoint: ConnectionEndpoint::with_peer_id(
+                    "/ip4/192.0.2.1/udp/4001/quic-v1"
+                        .parse()
+                        .expect("static fuzz address"),
+                    relay,
+                ),
+            }),
+        }
+    }
+}
+
+impl Transport for FuzzTransport {
+    fn dial(&mut self, _addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+        Err(TransportError::InvalidConfig {
+            reason: "fuzz transport does not dial".into(),
+        })
+    }
+
+    fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
+        Ok(addr.clone())
+    }
+
+    fn open_stream(&mut self, _id: ConnectionId) -> Result<StreamId, TransportError> {
+        Ok(StreamId::new(1))
+    }
+
+    fn send_stream(
+        &mut self,
+        _id: ConnectionId,
+        _stream_id: StreamId,
+        _data: Vec<u8>,
+    ) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    fn close_stream_write(
+        &mut self,
+        _id: ConnectionId,
+        _stream_id: StreamId,
+    ) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    fn reset_stream(
+        &mut self,
+        _id: ConnectionId,
+        _stream_id: StreamId,
+    ) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    fn close(&mut self, _id: ConnectionId) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+        Ok(self.initial.take().into_iter().collect())
+    }
+}
+
+/// Drives attacker-controlled bridge bytes through circuit negotiation.
+fn fuzz_circuit(data: &[u8]) {
+    // A valid fragmented multistream-select exchange advances both roles into
+    // the Noise decoder before attacker-controlled bytes begin.
+    const NOISE_SELECTION: &[u8] = b"\x13/multistream/1.0.0\n\x07/noise\n";
+    let relay = fuzz_peer_id();
+    let remote = PeerId::from_public_key_protobuf(b"minip2p-fuzz-circuit-remote");
+    let chunk_len = data.first().map_or(1, |byte| usize::from(byte % 16) + 1);
+    for role in [CircuitRole::Initiator, CircuitRole::Responder] {
+        let identity = minip2p_identity::Ed25519Keypair::from_secret_key_bytes([5; 32]);
+        let mut transport =
+            CircuitTransport::new(FuzzTransport::new(relay.clone()), identity, FixedEntropy);
+        let _ = transport.poll();
+        let _ = transport.adopt_bridge(BridgeAdoption {
+            inner_conn: ConnectionId::new(1),
+            bridge_stream: StreamId::new(1),
+            relay: relay.clone(),
+            remote_peer: remote.clone(),
+            role,
+            pending_data: NOISE_SELECTION[..1].to_vec(),
+            remote_write_closed: false,
+        });
+        for chunk in NOISE_SELECTION[1..].chunks(chunk_len) {
+            transport.inject_bridge_data(ConnectionId::new(1), StreamId::new(1), chunk.to_vec());
+        }
+        for chunk in data.chunks(chunk_len) {
+            transport.inject_bridge_data(ConnectionId::new(1), StreamId::new(1), chunk.to_vec());
+        }
+        transport.inject_bridge_remote_write_closed(ConnectionId::new(1), StreamId::new(1));
+        transport.inject_bridge_closed(ConnectionId::new(1), StreamId::new(1));
+        transport.inject_bridge_data(ConnectionId::new(1), StreamId::new(1), data.to_vec());
+        let _ = transport.poll();
     }
 }
 

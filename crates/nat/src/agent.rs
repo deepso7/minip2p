@@ -369,7 +369,7 @@ impl NatAgent {
         let mut handled = false;
         let mut touched_state = false;
         match event {
-            SwarmEvent::ConnectionEstablished { peer_id } => {
+            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 touched_state = true;
                 // Any session dial toward this peer has done its job (ours
                 // landed, or another machine's did — either way the peer is
@@ -411,7 +411,7 @@ impl NatAgent {
                     circuit.on_peer_connected(peer_id, &mut self.shared, now);
                 }
             }
-            SwarmEvent::ConnectionClosed { peer_id } => {
+            SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 touched_state = true;
                 self.shared.connected.remove(peer_id);
                 self.shared.ready.remove(peer_id);
@@ -456,6 +456,7 @@ impl NatAgent {
                 stream_id,
                 protocol_id,
                 initiated_locally,
+                ..
             } => {
                 if !initiated_locally && protocol_id == STOP_PROTOCOL_ID {
                     // STOP is a relay control protocol, but registration of
@@ -504,16 +505,21 @@ impl NatAgent {
                 peer_id,
                 stream_id,
                 data,
+                ..
             } => {
                 handled = self.route_stream(peer_id, *stream_id, StreamInput::Data(data), now);
                 touched_state = handled;
             }
-            SwarmEvent::StreamRemoteWriteClosed { peer_id, stream_id } => {
+            SwarmEvent::StreamRemoteWriteClosed {
+                peer_id, stream_id, ..
+            } => {
                 handled =
                     self.route_stream(peer_id, *stream_id, StreamInput::RemoteWriteClosed, now);
                 touched_state = handled;
             }
-            SwarmEvent::StreamClosed { peer_id, stream_id } => {
+            SwarmEvent::StreamClosed {
+                peer_id, stream_id, ..
+            } => {
                 if let Some(id) = self.shared.take_released_bridge(peer_id, *stream_id) {
                     handled = true;
                     if let Some(attempt) = self.attempts.get_mut(&id) {

@@ -186,6 +186,12 @@ pub struct Swarm<T: Transport> {
     /// when the buffer drains.
     event_buffer: VecDeque<SwarmEvent>,
 
+    /// Transport actions ordered after application events by the Sans-I/O
+    /// core. They are dispatched only after the buffered events have been
+    /// returned to the application. In particular, supersession must expose
+    /// `ConnectionClosed` before closing the old transport connection.
+    after_event_actions: VecDeque<SwarmAction>,
+
     /// Externally validated addresses advertised through Identify in
     /// addition to the transport's bound set. See
     /// [`Swarm::set_external_addresses`].
@@ -233,6 +239,7 @@ impl<T: Transport> Swarm<T> {
             core: SwarmCore::new(identify_config, ping_config),
             local_peer_id,
             event_buffer: VecDeque::new(),
+            after_event_actions: VecDeque::new(),
             external_addresses: Vec::new(),
             clock,
         }
@@ -522,6 +529,14 @@ impl<T: Transport> Swarm<T> {
         Ok(())
     }
 
+    /// Forgets swarm bookkeeping for a stream without touching the transport.
+    ///
+    /// This is used when ownership of a negotiated stream moves to another
+    /// protocol layer. Already-buffered events are intentionally preserved.
+    pub fn forget_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
+        self.core.forget_stream(conn_id, stream_id);
+    }
+
     /// Resets and forgets a stream whose consumer will never read it again.
     ///
     /// This is idempotent with a previously queued reset and removes matching
@@ -548,6 +563,12 @@ impl<T: Transport> Swarm<T> {
     pub fn poll(&mut self) -> Result<Vec<SwarmEvent>, DriverError> {
         let now_ms = self.now_ms();
 
+        // Actions deferred by the previous poll are now safe to dispatch if
+        // every event that preceded them has been returned to the caller.
+        // Do this before reading more transport input so superseded
+        // connections cannot produce another batch ahead of their close.
+        self.flush_actions();
+
         // 0. Refresh the core's snapshot of our listening addresses so
         //    Identify advertises the current bound set plus any validated
         //    external addresses. Cheap -- a handful of multiaddrs at most.
@@ -572,17 +593,10 @@ impl<T: Transport> Swarm<T> {
         // 3. Execute all queued actions (may cascade -- see flush_actions).
         self.flush_actions();
 
-        // 4. Return the application's events.
-        let mut events: Vec<SwarmEvent> = self.event_buffer.drain(..).collect();
-        while let Some(output) = self.core.poll_output() {
-            match output {
-                SwarmOutput::Action(action) => {
-                    self.dispatch_action(action, &mut None, &mut None, &mut None)
-                }
-                SwarmOutput::Event(event) => events.push(event),
-            }
-        }
-        Ok(events)
+        // 4. Return the application's events. `flush_actions` fully drained
+        //    the core; any action ordered after these events is held in the
+        //    driver's `after_event_actions` queue until a later call.
+        Ok(self.event_buffer.drain(..).collect())
     }
 
     /// Returns the next swarm event, sleeping internally until one arrives
@@ -761,12 +775,33 @@ impl<T: Transport> Swarm<T> {
     /// reported back).
     fn flush_actions(&mut self) {
         let mut allocated: Option<StreamId> = None;
+
+        // A buffered event has not yet been delivered by `poll_next`, so its
+        // dependent actions must remain deferred. `poll()` drains this buffer
+        // into its return value; the next driver call may then dispatch them.
+        if self.event_buffer.is_empty() {
+            while let Some(action) = self.after_event_actions.pop_front() {
+                self.dispatch_action(action, &mut allocated, &mut None, &mut None);
+            }
+        }
+
+        // Only events drained in this pass gate the actions that follow them.
+        // Pre-existing buffered events may be unrelated (for example, a
+        // failed reset's error before a synchronous retry), so they must not
+        // defer new caller-initiated work.
+        let mut saw_event = false;
         while let Some(output) = self.core.poll_output() {
             match output {
+                SwarmOutput::Action(action) if saw_event => {
+                    self.after_event_actions.push_back(action);
+                }
                 SwarmOutput::Action(action) => {
                     self.dispatch_action(action, &mut allocated, &mut None, &mut None)
                 }
-                SwarmOutput::Event(event) => self.event_buffer.push_back(event),
+                SwarmOutput::Event(event) => {
+                    saw_event = true;
+                    self.event_buffer.push_back(event);
+                }
             }
         }
     }
@@ -961,6 +996,101 @@ mod tests {
         }
     }
 
+    /// Deterministic transport that surfaces two connections to the same
+    /// peer on consecutive polls and records when the driver closes one.
+    struct SupersessionTransport {
+        event_batches: VecDeque<Vec<TransportEvent>>,
+        next_stream: u64,
+        close_calls: Vec<ConnectionId>,
+    }
+
+    impl SupersessionTransport {
+        fn new(peer_id: PeerId, original: ConnectionId, replacement: ConnectionId) -> Self {
+            let endpoint = || ConnectionEndpoint::with_peer_id(Multiaddr::new(), peer_id.clone());
+            Self {
+                event_batches: VecDeque::from([
+                    vec![TransportEvent::Connected {
+                        id: original,
+                        endpoint: endpoint(),
+                    }],
+                    vec![TransportEvent::Connected {
+                        id: replacement,
+                        endpoint: endpoint(),
+                    }],
+                ]),
+                next_stream: 1,
+                close_calls: Vec::new(),
+            }
+        }
+    }
+
+    impl Transport for SupersessionTransport {
+        fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
+            unreachable!()
+        }
+
+        fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
+            unreachable!()
+        }
+
+        fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
+            let stream_id = StreamId::new(self.next_stream);
+            self.next_stream += 1;
+            Ok(stream_id)
+        }
+
+        fn send_stream(
+            &mut self,
+            _: ConnectionId,
+            _: StreamId,
+            _: Vec<u8>,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn close_stream_write(
+            &mut self,
+            _: ConnectionId,
+            _: StreamId,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn reset_stream(&mut self, _: ConnectionId, _: StreamId) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn close(&mut self, conn_id: ConnectionId) -> Result<(), TransportError> {
+            self.close_calls.push(conn_id);
+            Ok(())
+        }
+
+        fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+            Ok(self.event_batches.pop_front().unwrap_or_default())
+        }
+    }
+
+    fn supersession_swarm(
+        remote_peer: PeerId,
+        original: ConnectionId,
+        replacement: ConnectionId,
+    ) -> Swarm<SupersessionTransport> {
+        let keypair = Ed25519Keypair::generate();
+        let transport = SupersessionTransport::new(remote_peer, original, replacement);
+        let identify = IdentifyConfig {
+            protocol_version: "test/1".into(),
+            agent_version: "test/1".into(),
+            protocols: Vec::new(),
+            public_key: keypair.public_key().encode_protobuf(),
+        };
+        Swarm::new(
+            transport,
+            identify,
+            PingConfig::default(),
+            keypair.peer_id(),
+        )
+    }
+
     /// Transport whose `open_stream` fails on exactly one (1-based) call and
     /// succeeds otherwise, returning the call index as the stream id.
     struct FailingUserOpenTransport {
@@ -1071,6 +1201,74 @@ mod tests {
     }
 
     #[test]
+    fn superseded_connection_closes_after_public_event_is_returned() {
+        let remote_peer = Ed25519Keypair::generate().peer_id();
+        let original = ConnectionId::new(41);
+        let replacement = ConnectionId::new(42);
+        let mut swarm = supersession_swarm(remote_peer.clone(), original, replacement);
+
+        let first = swarm.poll().expect("original connection poll");
+        assert!(matches!(
+            first.as_slice(),
+            [SwarmEvent::ConnectionEstablished { conn_id, .. }] if *conn_id == original
+        ));
+
+        let superseded = swarm.poll().expect("replacement connection poll");
+        assert!(matches!(
+            superseded.as_slice(),
+            [
+                SwarmEvent::ConnectionClosed { conn_id: closed, .. },
+                SwarmEvent::ConnectionEstablished { conn_id: established, .. },
+            ] if *closed == original && *established == replacement
+        ));
+        assert!(
+            swarm.transport().close_calls.is_empty(),
+            "the old transport must remain open until the close event is returned"
+        );
+
+        let later = swarm.poll().expect("post-delivery poll");
+        assert!(later.is_empty());
+        assert_eq!(swarm.transport().close_calls, vec![original]);
+        assert_eq!(swarm.connected_peers(), vec![remote_peer]);
+    }
+
+    #[test]
+    fn superseded_connection_close_waits_for_buffered_poll_next_events() {
+        let remote_peer = Ed25519Keypair::generate().peer_id();
+        let original = ConnectionId::new(51);
+        let replacement = ConnectionId::new(52);
+        let mut swarm = supersession_swarm(remote_peer, original, replacement);
+
+        let _ = swarm.poll().expect("original connection poll");
+        let closed = swarm
+            .poll_next(Duration::ZERO)
+            .expect("replacement connection poll")
+            .expect("eager close event");
+        assert!(matches!(
+            closed,
+            SwarmEvent::ConnectionClosed { conn_id, .. } if conn_id == original
+        ));
+        assert!(swarm.transport().close_calls.is_empty());
+
+        // `poll_next` still owns the establishment event buffered from the
+        // same core turn, so it must return that event before dispatching the
+        // dependent close action.
+        let established = swarm
+            .poll_next(Duration::ZERO)
+            .expect("buffered replacement event")
+            .expect("replacement established event");
+        assert!(matches!(
+            established,
+            SwarmEvent::ConnectionEstablished { conn_id, .. } if conn_id == replacement
+        ));
+        assert!(swarm.transport().close_calls.is_empty());
+
+        let later = swarm.poll().expect("post-delivery poll");
+        assert!(later.is_empty());
+        assert_eq!(swarm.transport().close_calls, vec![original]);
+    }
+
+    #[test]
     fn deadline_earliest_picks_the_sooner_deadline() {
         let soon = Deadline::from(Duration::from_millis(10));
         let later = Deadline::from(Duration::from_secs(60));
@@ -1109,6 +1307,7 @@ mod tests {
             .event_buffer
             .push_back(SwarmEvent::ConnectionEstablished {
                 peer_id: peer_id.clone(),
+                conn_id: ConnectionId::new(1),
             });
 
         let event = swarm
@@ -1117,7 +1316,7 @@ mod tests {
             .expect("buffered event");
         assert!(matches!(
             event,
-            SwarmEvent::ConnectionEstablished { peer_id: p } if p == peer_id
+            SwarmEvent::ConnectionEstablished { peer_id: p, .. } if p == peer_id
         ));
     }
 
@@ -1129,6 +1328,7 @@ mod tests {
             .event_buffer
             .push_back(SwarmEvent::ConnectionEstablished {
                 peer_id: target_peer_id.clone(),
+                conn_id: ConnectionId::new(1),
             });
         swarm.event_buffer.push_back(SwarmEvent::PeerReady {
             peer_id: target_peer_id.clone(),
@@ -1149,7 +1349,7 @@ mod tests {
             .expect("restored event");
         assert!(matches!(
             restored,
-            SwarmEvent::ConnectionEstablished { peer_id } if peer_id == target_peer_id
+            SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == target_peer_id
         ));
     }
 
@@ -1161,6 +1361,7 @@ mod tests {
             .event_buffer
             .push_back(SwarmEvent::ConnectionEstablished {
                 peer_id: peer_id.clone(),
+                conn_id: ConnectionId::new(1),
             });
         swarm.event_buffer.push_back(SwarmEvent::PeerReady {
             peer_id,
@@ -1197,6 +1398,7 @@ mod tests {
             .event_buffer
             .push_back(SwarmEvent::ConnectionEstablished {
                 peer_id: peer_id.clone(),
+                conn_id: ConnectionId::new(1),
             });
         swarm.event_buffer.push_back(SwarmEvent::PeerReady {
             peer_id: peer_id.clone(),
@@ -1218,7 +1420,7 @@ mod tests {
         assert_eq!(swarm.event_buffer.len(), 1);
         assert!(matches!(
             swarm.event_buffer.front(),
-            Some(SwarmEvent::ConnectionEstablished { peer_id: restored }) if *restored == peer_id
+            Some(SwarmEvent::ConnectionEstablished { peer_id: restored, .. }) if *restored == peer_id
         ));
     }
 
@@ -1535,6 +1737,7 @@ mod tests {
     fn indexed_stream_data(peer_id: &PeerId, index: u64) -> SwarmEvent {
         SwarmEvent::StreamData {
             peer_id: peer_id.clone(),
+            conn_id: ConnectionId::new(1),
             stream_id: StreamId::new(index),
             data: vec![0u8; 8],
         }

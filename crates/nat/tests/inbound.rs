@@ -28,6 +28,7 @@ fn inbound_harness(mut config: NatConfig) -> Harness {
 fn inbound_stop_stream(h: &mut Harness, stream: StreamId, t: u64) {
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: h.relay.clone(),
             stream_id: stream,
             protocol_id: STOP_PROTOCOL_ID.to_string(),
@@ -226,6 +227,7 @@ fn remote_write_close_keeps_an_accepted_bridge_alive_until_handoff() {
 
     h.agent.handle_event(
         &SwarmEvent::StreamRemoteWriteClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: h.relay.clone(),
             stream_id: stream,
         },
@@ -286,6 +288,7 @@ fn inbound_application_streams_are_never_claimed() {
     let stream = StreamId::new(STOP_STREAM);
     h.agent.handle_event(
         &SwarmEvent::StreamReady {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: h.relay.clone(),
             stream_id: stream,
             protocol_id: "/my-app/1.0.0".to_string(),
@@ -309,6 +312,7 @@ fn relay_disconnect_before_release_drops_the_circuit() {
 
     h.agent.handle_event(
         &SwarmEvent::ConnectionClosed {
+            conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: h.relay.clone(),
         },
         at(20),

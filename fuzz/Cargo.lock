@@ -260,6 +260,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "minip2p-circuit"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "minip2p-core",
+ "minip2p-identity",
+ "minip2p-multistream-select",
+ "minip2p-noise",
+ "minip2p-transport",
+ "minip2p-yamux",
+ "thiserror",
+]
+
+[[package]]
 name = "minip2p-core"
 version = "0.1.0"
 dependencies = [
@@ -290,6 +304,7 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "minip2p-autonat",
+ "minip2p-circuit",
  "minip2p-core",
  "minip2p-dcutr",
  "minip2p-discovery",

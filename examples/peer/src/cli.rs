@@ -298,10 +298,10 @@ fn parse_quic_multiaddr(flag: &str, value: &str) -> Result<Multiaddr, CliError> 
 /// (`listen` or `dial`).
 pub fn print_event(role: &str, event: &Event) {
     match event {
-        Event::ConnectionEstablished { peer_id } => {
+        Event::ConnectionEstablished { peer_id, .. } => {
             println!("[{role}] connected peer={peer_id}");
         }
-        Event::ConnectionClosed { peer_id } => {
+        Event::ConnectionClosed { peer_id, .. } => {
             println!("[{role}] disconnected peer={peer_id}");
         }
         Event::IdentifyReceived { peer_id, info } => {
@@ -337,6 +337,7 @@ pub fn print_event(role: &str, event: &Event) {
             stream_id,
             protocol_id,
             initiated_locally,
+            ..
         } => {
             let dir = if *initiated_locally {
                 "outbound"
@@ -352,16 +353,21 @@ pub fn print_event(role: &str, event: &Event) {
             peer_id,
             stream_id,
             data,
+            ..
         } => {
             println!(
                 "[{role}] user-stream-data peer={peer_id} stream={stream_id} bytes={}",
                 data.len()
             );
         }
-        Event::StreamRemoteWriteClosed { peer_id, stream_id } => {
+        Event::StreamRemoteWriteClosed {
+            peer_id, stream_id, ..
+        } => {
             println!("[{role}] user-stream-remote-write-closed peer={peer_id} stream={stream_id}");
         }
-        Event::StreamClosed { peer_id, stream_id } => {
+        Event::StreamClosed {
+            peer_id, stream_id, ..
+        } => {
             println!("[{role}] user-stream-closed peer={peer_id} stream={stream_id}");
         }
         Event::Error(error) => {

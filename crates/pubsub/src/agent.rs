@@ -290,11 +290,11 @@ impl FloodsubAgent {
     /// floodsub control plane and must not reach the application.
     pub fn handle_event(&mut self, event: &SwarmEvent, now_ms: u64) -> bool {
         match event {
-            SwarmEvent::ConnectionEstablished { peer_id } => {
+            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 self.on_connection_established(peer_id, now_ms);
                 false
             }
-            SwarmEvent::ConnectionClosed { peer_id } => {
+            SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 self.on_connection_closed(peer_id);
                 false
             }
@@ -312,18 +312,20 @@ impl FloodsubAgent {
                 stream_id,
                 protocol_id,
                 initiated_locally,
+                ..
             } => self.on_stream_ready(peer_id, *stream_id, protocol_id, *initiated_locally, now_ms),
             SwarmEvent::StreamData {
                 peer_id,
                 stream_id,
                 data,
+                ..
             } => self.on_stream_data(peer_id, *stream_id, data, now_ms),
-            SwarmEvent::StreamRemoteWriteClosed { peer_id, stream_id } => {
-                self.on_stream_remote_write_closed(peer_id, *stream_id)
-            }
-            SwarmEvent::StreamClosed { peer_id, stream_id } => {
-                self.on_stream_closed(peer_id, *stream_id, now_ms)
-            }
+            SwarmEvent::StreamRemoteWriteClosed {
+                peer_id, stream_id, ..
+            } => self.on_stream_remote_write_closed(peer_id, *stream_id),
+            SwarmEvent::StreamClosed {
+                peer_id, stream_id, ..
+            } => self.on_stream_closed(peer_id, *stream_id, now_ms),
             _ => false,
         }
     }

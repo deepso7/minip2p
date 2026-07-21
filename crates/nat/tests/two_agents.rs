@@ -171,6 +171,7 @@ impl World {
                         let agent = self.agent(side);
                         agent.handle_event(
                             &SwarmEvent::ConnectionEstablished {
+                                conn_id: minip2p_transport::ConnectionId::new(1),
                                 peer_id: relay.clone(),
                             },
                             now,
@@ -229,6 +230,7 @@ impl World {
                 agent.stream_open_result(token, Ok(stream), now);
                 agent.handle_event(
                     &SwarmEvent::StreamReady {
+                        conn_id: minip2p_transport::ConnectionId::new(1),
                         peer_id: relay,
                         stream_id: stream,
                         protocol_id,
@@ -300,6 +302,7 @@ impl World {
                     let relay = self.relay_id.clone();
                     self.b.handle_event(
                         &SwarmEvent::StreamReady {
+                            conn_id: minip2p_transport::ConnectionId::new(1),
                             peer_id: relay,
                             stream_id: stop_stream,
                             protocol_id: STOP_PROTOCOL_ID.to_string(),
@@ -356,6 +359,7 @@ impl World {
         let now = at(self.now);
         self.agent(side).handle_event(
             &SwarmEvent::StreamData {
+                conn_id: minip2p_transport::ConnectionId::new(1),
                 peer_id: relay,
                 stream_id: stream,
                 data,
@@ -368,10 +372,20 @@ impl World {
     fn establish_direct(&mut self) {
         let (a_id, b_id) = (self.a_id.clone(), self.b_id.clone());
         let now = at(self.now);
-        self.a
-            .handle_event(&SwarmEvent::ConnectionEstablished { peer_id: b_id }, now);
-        self.b
-            .handle_event(&SwarmEvent::ConnectionEstablished { peer_id: a_id }, now);
+        self.a.handle_event(
+            &SwarmEvent::ConnectionEstablished {
+                conn_id: minip2p_transport::ConnectionId::new(1),
+                peer_id: b_id,
+            },
+            now,
+        );
+        self.b.handle_event(
+            &SwarmEvent::ConnectionEstablished {
+                conn_id: minip2p_transport::ConnectionId::new(1),
+                peer_id: a_id,
+            },
+            now,
+        );
     }
 
     /// B acquires its reservation through the emulated relay.

@@ -16,9 +16,15 @@ use minip2p_transport::{ConnectionId, StreamId, TransportEvent};
 #[derive(Clone, Debug)]
 pub enum SwarmEvent {
     /// A new connection was established and identity verified.
-    ConnectionEstablished { peer_id: PeerId },
+    ConnectionEstablished {
+        peer_id: PeerId,
+        conn_id: ConnectionId,
+    },
     /// A connection was closed.
-    ConnectionClosed { peer_id: PeerId },
+    ConnectionClosed {
+        peer_id: PeerId,
+        conn_id: ConnectionId,
+    },
     /// Identify information received from a remote peer.
     IdentifyReceived {
         peer_id: PeerId,
@@ -43,6 +49,7 @@ pub enum SwarmEvent {
     /// when the remote peer did.
     StreamReady {
         peer_id: PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
         protocol_id: String,
         initiated_locally: bool,
@@ -50,17 +57,20 @@ pub enum SwarmEvent {
     /// Raw data arrived on a negotiated user stream.
     StreamData {
         peer_id: PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
         data: Vec<u8>,
     },
     /// The remote closed its write side on a user stream.
     StreamRemoteWriteClosed {
         peer_id: PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
     },
     /// A user stream was fully closed.
     StreamClosed {
         peer_id: PeerId,
+        conn_id: ConnectionId,
         stream_id: StreamId,
     },
     /// A non-fatal runtime error occurred.

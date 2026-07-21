@@ -3,6 +3,7 @@ resolver = "3"
 exclude = ["fuzz"]
 members = [
     "crates/autonat",
+    "crates/circuit",
     "crates/core",
     "crates/dcutr",
     "crates/discovery",

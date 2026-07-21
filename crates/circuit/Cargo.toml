@@ -1,0 +1,35 @@
+[package]
+name = "minip2p-circuit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = ["std"]
+std = [
+    "dep:getrandom",
+    "minip2p-core/std",
+    "minip2p-identity/std",
+    "minip2p-multistream-select/std",
+    "minip2p-noise/std",
+    "minip2p-transport/std",
+    "minip2p-yamux/std",
+    "thiserror/std",
+]
+
+[dependencies]
+getrandom = { version = "0.4.3", default-features = false, optional = true }
+minip2p-core = { path = "../core", default-features = false }
+minip2p-identity = { path = "../identity", default-features = false, features = ["ed25519"] }
+minip2p-multistream-select = { path = "../multistream-select", default-features = false }
+minip2p-noise = { path = "../noise", default-features = false }
+minip2p-transport = { path = "../transport", default-features = false }
+minip2p-yamux = { path = "../yamux", default-features = false }
+thiserror = { version = "2.0.18", default-features = false }
+
+[dev-dependencies]
+minip2p-test-support = { path = "../test-support" }
