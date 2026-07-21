@@ -1,0 +1,70 @@
+---
+description: Generic high-depth PR review — use when reviewing diffs, PRs, or Bugbot custom instructions
+alwaysApply: false
+---
+
+# PR review
+
+Review like a strong staff engineer with unlimited patience: find real bugs in the diff, not style. Be **generic** (reason about *this* change), not a scavenger hunt for past bugs. Prefer **recall of true bugs** over a short “important-only” list — finish the whole method before stopping.
+
+## Severity
+
+- **P0**: panics, definitively wrong results, or tests/fixtures that cannot work as written
+- **P1**: correctness or security bug likely to hit real users/peers
+- **P2**: contract/lifecycle/resource bugs; clear holes where tests/fuzz/CI won’t catch failure
+- **P3**: concrete maintainability or portability with a real failure mode (skip pure taste)
+
+Confidence ≥ 8 only. If unsure, dig deeper or drop — don’t pad.
+
+## Output
+
+1. `**N issues found** across X files` (or no issues)
+2. Table: Severity | Location (`file:line`) | Finding
+3. Each finding: `P{N}: <what breaks + who is hurt>. <fix direction>.`
+4. **Copy block** (Cubic-style) — after the table, one fenced `text` block the user can paste into an agent:
+
+```text
+Check if these issues are valid — if so, understand the root cause of each and fix them.
+
+<file name="path/to/file.rs">
+<violation number="1" location="path/to/file.rs:LINE">
+P{N}: …finding text…
+</violation>
+</file>
+```
+
+Group violations by file. Keep the whole copy block in one fence so it copies in one shot.
+
+## Method (do all of it — do not stop after the first P0/P1)
+
+Work the **diff**, reading surrounding code when needed. For every nontrivial hunk, ask: *what inputs, interleavings, retries, or partial failures make this wrong?*
+
+### 1. Spec & state
+- What invariants does this type/protocol/API claim (docs, names, error variants, prior code)?
+- Can close/reset/retry/reorder/duplicate calls break those invariants?
+- After failure or close, can events still fire or buffers still grow?
+
+### 2. Data & parsing
+- Lengths, encodings, endianness, off-by-one, truncation, overflow in size math
+- New/changed fixtures and golden files: values must match what parsers/tests assume (sizes, counts, encodings). If tests don’t load a field, still flag corrupt fixtures — silent rot is a bug
+- Reject/accept paths for untrusted input: do we validate before expensive work or state changes?
+
+### 3. Resources & control flow
+- Loops over network/timers/events: can they spin, starve timers, or skip deadlines?
+- Buffers and collections: unbounded growth, or **superlinear** work on coalesced/normal batch sizes (shifts, repeated `drain`/`remove(0)`, copies in a loop)
+- Error paths: do they leak, double-free logically (double close), or mark success after failure?
+
+### 4. Tests, CI, and claims
+- Do new behaviors have tests that would fail if the bug existed?
+- Did CI/scripts/`no_std`/fuzz wiring lose coverage when files were renamed or crates split?
+- Do READMEs/comments claim behavior the code no longer implements?
+
+### 5. Project constraints (only when the diff touches them)
+Enforce repo architecture docs (e.g. AGENTS.md): sans-I/O, `no_std`, unsafe policy, transport scope, no async in core — as **correctness/policy bugs**, not style.
+
+## Bar vs typical AI review
+
+- **Better than a quick skim:** complete sections 1–4 on the full diff; don’t exit early because you already have “enough” findings
+- **Better than nit bots:** no formatting/import churn; every finding needs a failure story
+- **Generic:** same method on any PR; no memorized bug list from old reviews
+- When practical, run focused tests for touched packages and treat failures (or suspiciously green tests that never load broken data) as evidence
