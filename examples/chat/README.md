@@ -118,11 +118,3 @@ Two deployment details surfaced during live validation:
    `idle_connection_timeout` — by default rust-libp2p closes a
    connection after 10 s when no behaviour keeps it alive, which reads
    as an instant disconnect here.
-
-All four ran green on 2026-07-17: loopback sanity, an AWS-hosted
-open-internet star (hotspot + home-network leaves, kill/rejoin,
-75 s idle survival), a NAT'd host punched into from a hotspot
-(relayed → direct-punched upgrade, then chat over the punched path),
-and both interop directions against real go-libp2p and rust-libp2p
-peers. The deterministic relay-only room is also covered by the loopback
-binary e2e test in `tests/chat.rs`.
