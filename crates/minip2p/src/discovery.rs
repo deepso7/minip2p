@@ -66,10 +66,6 @@ impl DiscoveryDriver {
         }
     }
 
-    pub(crate) fn ingest(&mut self, _event: &SwarmEvent) -> bool {
-        false
-    }
-
     /// Runs all cross-driver work until no new work is produced.
     pub(crate) fn sweep(
         &mut self,
@@ -228,11 +224,73 @@ fn nat_connect_id(event: &NatEvent) -> Option<ConnectId> {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use minip2p_discovery::DiscoveryConfig;
+    use minip2p_discovery::{DiscoveryAction, DiscoveryConfig};
+    use minip2p_identity::{Ed25519Keypair, PeerId as IdentityPeerId, PublicKey};
+    use minip2p_nat::{NatAgent, NatConfig, Now, Path};
     use minip2p_transport::StreamId;
 
     use super::*;
     use crate::{Endpoint, Event};
+
+    fn discovery_beacon(keypair: &Ed25519Keypair) -> (PeerId, Vec<u8>) {
+        let mut agent = DiscoveryAgent::new(
+            PublicKey::from(keypair),
+            DiscoveryConfig {
+                auto_dial: false,
+                ..DiscoveryConfig::default()
+            },
+        )
+        .expect("valid remote discovery agent");
+        agent.set_local_addrs(
+            &["/ip4/127.0.0.1/udp/4001/quic-v1"
+                .parse()
+                .expect("valid beacon address")],
+            0,
+        );
+        agent.handle_tick(0);
+        let payload = loop {
+            match agent.poll_action() {
+                Some(DiscoveryAction::PublishBeacon { payload, .. }) => break payload,
+                Some(_) => continue,
+                None => panic!("beacon was not published"),
+            }
+        };
+        (IdentityPeerId::from(keypair), payload)
+    }
+
+    fn discovery_with_inflight() -> (DiscoveryDriver, ConnectId, PeerId, PeerId) {
+        let local_key = Ed25519Keypair::from_secret_key_bytes([91; 32]);
+        let remote_key = Ed25519Keypair::from_secret_key_bytes([92; 32]);
+        let local = IdentityPeerId::from(&local_key);
+        let (remote, payload) = discovery_beacon(&remote_key);
+        let mut driver = DiscoveryDriver::new(
+            DiscoveryAgent::new(
+                PublicKey::from(&local_key),
+                DiscoveryConfig {
+                    dial_tie_break: false,
+                    ..DiscoveryConfig::default()
+                },
+            )
+            .expect("valid discovery agent"),
+        );
+        driver.agent.handle_beacon(&remote, &payload, true, 1);
+        assert!(matches!(
+            driver.agent.poll_event(),
+            Some(DiscoveryEvent::PeerDiscovered { peer, .. }) if peer == remote
+        ));
+        assert!(matches!(
+            driver.agent.poll_action(),
+            Some(DiscoveryAction::Dial { peer, .. }) if peer == remote
+        ));
+
+        let mut nat = NatAgent::new(local, NatConfig::default());
+        let connect_id = nat.connect(remote.clone(), Vec::new(), Now::from_mono(0));
+        driver.inflight.insert(connect_id, remote.clone());
+        let relay = PeerId::from_public_key_protobuf(
+            &PublicKey::from(&Ed25519Keypair::from_secret_key_bytes([93; 32])).encode_protobuf(),
+        );
+        (driver, connect_id, remote, relay)
+    }
 
     fn endpoint_with_protocol(protocol: &str) -> Endpoint {
         Endpoint::builder()
@@ -361,6 +419,92 @@ mod tests {
         assert_eq!(
             minip2p_discovery::MAX_TOPIC_LEN,
             minip2p_pubsub::MAX_TOPIC_LEN
+        );
+    }
+
+    #[test]
+    fn relayed_success_variants_complete_discovery_owned_dials() {
+        for fell_back in [false, true] {
+            let (mut driver, connect_id, remote, relay) = discovery_with_inflight();
+            let event = if fell_back {
+                NatEvent::FellBackToRelay {
+                    connect_id,
+                    peer: remote.clone(),
+                }
+            } else {
+                NatEvent::PathEstablished {
+                    connect_id,
+                    peer: remote.clone(),
+                    path: Path::Relayed { relay },
+                }
+            };
+            driver.handle_nat_event(event, 2);
+
+            assert!(!driver.inflight.contains_key(&connect_id));
+            driver.agent.dial_failed(&remote, "must already be idle", 3);
+            assert!(
+                driver.agent.poll_event().is_none(),
+                "successful relayed completion must collapse the discovery dial state"
+            );
+        }
+    }
+
+    #[test]
+    fn eager_supersede_close_preserves_discovery_connectivity() {
+        let a_key = Ed25519Keypair::from_secret_key_bytes([94; 32]);
+        let b_key = Ed25519Keypair::from_secret_key_bytes([95; 32]);
+        let (b_peer, beacon) = discovery_beacon(&b_key);
+        let config = DiscoveryConfig {
+            dial_tie_break: false,
+            beacon_interval_ms: 100,
+            peer_ttl_ms: 2_000,
+            ..DiscoveryConfig::default()
+        };
+        let mut a = Endpoint::builder()
+            .identity(a_key)
+            .discovery_config(config.clone())
+            .expect("valid discovery config")
+            .bind_quic("127.0.0.1:0")
+            .expect("bind a");
+        let mut b = Endpoint::builder()
+            .identity(b_key)
+            .discovery_config(config)
+            .expect("valid discovery config")
+            .bind_quic("127.0.0.1:0")
+            .expect("bind b");
+        a.listen().expect("a listens");
+        let b_addr = b.listen().expect("b listens");
+        a.dial(&b_addr).expect("first dial");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !a.connected_peers().contains(&b_peer) {
+            assert!(Instant::now() < deadline, "first connection timed out");
+            let _ = a.next_event(Duration::from_millis(20)).expect("drive a");
+            let _ = b.next_event(Duration::from_millis(20)).expect("drive b");
+        }
+        let discovery = a.discovery.as_mut().expect("discovery enabled");
+        discovery.agent.handle_beacon(&b_peer, &beacon, true, 1);
+        while discovery.agent.poll_event().is_some() {}
+        assert!(discovery.agent.poll_action().is_none());
+
+        a.dial(&b_addr).expect("replacement dial");
+        let mut saw_old_close = false;
+        while !saw_old_close {
+            assert!(Instant::now() < deadline, "replacement timed out");
+            if let Some(Event::ConnectionClosed { peer_id, .. }) =
+                a.next_event(Duration::from_millis(20)).expect("drive a")
+            {
+                saw_old_close = peer_id == b_peer;
+            }
+            let _ = b.next_event(Duration::from_millis(20)).expect("drive b");
+        }
+        assert!(a.swarm.core().conn_for(&b_peer).is_some());
+
+        let discovery = a.discovery.as_mut().expect("discovery enabled");
+        discovery.agent.handle_beacon(&b_peer, &beacon, true, 2);
+        assert!(
+            discovery.agent.poll_action().is_none(),
+            "Closed(old) must not make discovery redial while new is installed"
         );
     }
 }

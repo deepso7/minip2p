@@ -337,10 +337,6 @@ impl Endpoint {
         if !claimed && let Some(pubsub) = self.pubsub.as_mut() {
             claimed = pubsub.ingest(event, &mut self.swarm);
         }
-        #[cfg(feature = "discovery")]
-        if let Some(discovery) = self.discovery.as_mut() {
-            claimed |= discovery.ingest(event);
-        }
         claimed
     }
 

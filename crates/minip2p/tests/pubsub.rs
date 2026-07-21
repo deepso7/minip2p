@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 
 use minip2p::{Endpoint, Event, PubsubError, PubsubEvent};
 
+#[cfg(feature = "nat")]
+#[path = "../../../tests/support/relay.rs"]
+mod relay_support;
+
 const TOPIC: &str = "loopback-chat";
 
 fn pubsub_endpoint() -> Endpoint {
@@ -245,4 +249,131 @@ fn next_pubsub_event_buffers_application_events() {
         }
     }
     assert!(saw_connect, "application events must be buffered, not lost");
+}
+
+#[cfg(feature = "nat")]
+#[test]
+fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
+    use minip2p::{NatConfig, NatEvent, Path, ReservationPolicy};
+
+    let relay = relay_support::RelayServer::spawn();
+    let relay_addr = relay.addr().clone();
+    let mut b = Endpoint::builder()
+        .pubsub()
+        .relay(relay_addr.clone())
+        .nat_config(NatConfig {
+            force_relay: true,
+            reservation_policy: ReservationPolicy::Always,
+            ..NatConfig::default()
+        })
+        .bind_quic("127.0.0.1:0")
+        .expect("bind responder");
+    let b_addr = b.listen().expect("responder listens");
+    let b_peer = b.peer_id().clone();
+    b.subscribe(TOPIC).expect("responder subscribes");
+
+    let reserve_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < reserve_deadline, "reservation timed out");
+        let _ = b
+            .next_event(Duration::from_millis(20))
+            .expect("drive reservation");
+        if b.take_nat_events().iter().any(
+            |event| matches!(event, NatEvent::RelayReserved { relay, .. } if relay == relay_addr.peer_id()),
+        ) {
+            break;
+        }
+        relay.assert_healthy();
+    }
+
+    let mut a = Endpoint::builder()
+        .pubsub()
+        .relay(relay_addr)
+        .nat_config(NatConfig {
+            force_relay: true,
+            reservation_policy: ReservationPolicy::Never,
+            ..NatConfig::default()
+        })
+        .bind_quic("127.0.0.1:0")
+        .expect("bind initiator");
+    a.listen().expect("initiator listens");
+    a.subscribe(TOPIC).expect("initiator subscribes");
+    let connect_id = a.connect(&b_peer).expect("relay-only connect");
+
+    drive_until(&mut [&mut a, &mut b], Duration::from_secs(15), |all| {
+        saw_subscription(&all[0], TOPIC) && saw_subscription(&all[1], TOPIC)
+    });
+    let nat = a.take_nat_events();
+    assert!(nat.iter().any(|event| matches!(
+        event,
+        NatEvent::PathEstablished {
+            connect_id: found,
+            peer,
+            path: Path::Relayed { relay: found_relay },
+        } if *found == connect_id && peer == &b_peer && found_relay == relay.addr().peer_id()
+    )));
+    let circuit_id = *a
+        .swarm()
+        .transport()
+        .circuit_ids()
+        .first()
+        .expect("active circuit");
+
+    a.publish(TOPIC, b"over relay").expect("publish over relay");
+    drive_until(&mut [&mut a, &mut b], Duration::from_secs(10), |all| {
+        saw_message(&all[1], b"over relay")
+    });
+
+    // A direct connection supersedes the ready circuit. The public sequence
+    // must close the old id before establishing the replacement, and the
+    // floodsub driver must re-open and re-announce subscriptions.
+    a.dial(&b_addr).expect("manual direct upgrade");
+    let upgrade_deadline = Instant::now() + Duration::from_secs(15);
+    let mut a_sequence = Vec::new();
+    let mut a_resubscribed = false;
+    let mut b_resubscribed = false;
+    while !a_resubscribed || !b_resubscribed {
+        assert!(
+            Instant::now() < upgrade_deadline,
+            "pubsub did not recover after supersede: {a_sequence:?}"
+        );
+        if let Some(event) = a
+            .next_event(Duration::from_millis(20))
+            .expect("drive initiator upgrade")
+        {
+            match event {
+                Event::ConnectionClosed { peer_id, conn_id } if peer_id == b_peer => {
+                    a_sequence.push(("closed", conn_id));
+                }
+                Event::ConnectionEstablished { peer_id, conn_id } if peer_id == b_peer => {
+                    a_sequence.push(("established", conn_id));
+                }
+                _ => {}
+            }
+        }
+        let _ = b
+            .next_event(Duration::from_millis(20))
+            .expect("drive responder upgrade");
+        a_resubscribed |= a.take_pubsub_events().iter().any(
+            |event| matches!(event, PubsubEvent::PeerSubscribed { topic, .. } if topic == TOPIC),
+        );
+        b_resubscribed |= b.take_pubsub_events().iter().any(
+            |event| matches!(event, PubsubEvent::PeerSubscribed { topic, .. } if topic == TOPIC),
+        );
+        relay.assert_healthy();
+    }
+    assert!(
+        matches!(
+            a_sequence.as_slice(),
+            [("closed", closed), ("established", direct), ..]
+                if *closed == circuit_id && direct.as_u64() & (1 << 63) == 0
+        ),
+        "supersede ordering: {a_sequence:?}"
+    );
+    assert!(a.swarm().transport().circuit_ids().is_empty());
+    a.publish(TOPIC, b"after upgrade")
+        .expect("publish after upgrade");
+    drive_until(&mut [&mut a, &mut b], Duration::from_secs(10), |all| {
+        saw_message(&all[1], b"after upgrade")
+    });
 }

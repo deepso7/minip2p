@@ -11,6 +11,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "../../../tests/support/relay.rs"]
+mod relay_support;
+
+use relay_support::RelayServer;
+
 /// Hard cap on the entire flow; loopback runs finish in a few seconds.
 const TEST_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -220,6 +225,54 @@ fn three_peer_star_chats_end_to_end() {
     alice.leave(deadline);
     bob.leave(deadline);
     host.leave(deadline);
+}
+
+#[test]
+fn relay_only_room_chats_over_a_real_circuit() {
+    let deadline = Instant::now() + TEST_DEADLINE;
+    let relay = RelayServer::spawn();
+    let relay_addr = relay.addr().to_string();
+
+    let mut host = Peer::spawn(
+        "relay-host",
+        &[
+            "host",
+            "--relay",
+            &relay_addr,
+            "--nick",
+            "hostess",
+            "--relay-only",
+            "--no-mesh",
+        ],
+    );
+    let circuit = host
+        .wait_line(deadline, |line| line.starts_with("[host] circuit="))
+        .trim_start_matches("[host] circuit=")
+        .to_string();
+
+    let mut alice = Peer::spawn(
+        "relay-alice",
+        &[
+            "join",
+            &circuit,
+            "--nick",
+            "alice",
+            "--relay-only",
+            "--no-mesh",
+        ],
+    );
+    alice.wait_line(deadline, |line| line == "[join] path=relayed");
+    alice.wait_line(deadline, |line| line.contains("peer-subscribed"));
+    host.wait_line(deadline, |line| line.contains("peer-subscribed"));
+
+    alice.say("through the relay");
+    host.wait_line(deadline, |line| line.contains("alice: through the relay"));
+    host.say("relay reply");
+    alice.wait_line(deadline, |line| line.contains("hostess: relay reply"));
+
+    alice.leave(deadline);
+    host.leave(deadline);
+    relay.assert_healthy();
 }
 
 #[test]

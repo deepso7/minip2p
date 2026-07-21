@@ -803,7 +803,9 @@ dependencies = [
  "minip2p-nat",
  "minip2p-pubsub",
  "minip2p-quic",
+ "minip2p-relay",
  "minip2p-swarm",
+ "minip2p-test-support",
  "minip2p-transport",
  "thiserror",
 ]
@@ -822,6 +824,8 @@ version = "0.1.0"
 dependencies = [
  "minip2p",
  "minip2p-example-common",
+ "minip2p-relay",
+ "minip2p-test-support",
 ]
 
 [[package]]

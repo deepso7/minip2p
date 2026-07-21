@@ -535,7 +535,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                     peer,
                 };
                 for plaintext in decrypted {
-                    phase = self.feed_decrypted_yamux_select(circuit, phase, plaintext)?;
+                    phase = self.feed_decrypted_transport(circuit, phase, plaintext)?;
                 }
                 Ok(phase)
             }
@@ -557,7 +557,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                     peer,
                 };
                 for plaintext in decrypted {
-                    phase = self.feed_decrypted_yamux_select(circuit, phase, plaintext)?;
+                    phase = self.feed_decrypted_transport(circuit, phase, plaintext)?;
                 }
                 Ok(phase)
             }
@@ -580,6 +580,34 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                 }
                 Ok(Phase::Ready { noise, yamux, peer })
             }
+        }
+    }
+
+    /// Routes plaintext Noise transport messages across the exact Yamux
+    /// phase boundary. One bridge read may decrypt both the selection reply
+    /// and immediately-pipelined Yamux frames, so later plaintexts must use
+    /// the `Ready` state produced by an earlier one in the same batch.
+    fn feed_decrypted_transport(
+        &mut self,
+        circuit: &Circuit,
+        phase: Phase,
+        plaintext: Vec<u8>,
+    ) -> Result<Phase, String> {
+        match phase {
+            phase @ Phase::SelectYamux { .. } => {
+                self.feed_decrypted_yamux_select(circuit, phase, plaintext)
+            }
+            Phase::Ready {
+                mut noise,
+                mut yamux,
+                peer,
+            } => {
+                let result = yamux.handle_input(YamuxInput::Data(plaintext));
+                self.drain_yamux(circuit, &mut noise, &mut yamux)?;
+                result.map_err(|error| format!("Yamux protocol failed: {error}"))?;
+                Ok(Phase::Ready { noise, yamux, peer })
+            }
+            _ => Err("decrypted transport data arrived before Yamux selection".to_string()),
         }
     }
 

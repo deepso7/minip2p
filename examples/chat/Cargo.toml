@@ -15,3 +15,7 @@ path = "src/main.rs"
 [dependencies]
 minip2p = { path = "../../crates/minip2p", features = ["discovery"] }
 minip2p-example-common = { path = "../common" }
+
+[dev-dependencies]
+minip2p-relay = { path = "../../crates/relay" }
+minip2p-test-support = { path = "../../crates/test-support" }

@@ -177,6 +177,32 @@ fn stalled_inbound_circuit_handshake_is_closed_at_its_deadline() {
 }
 
 #[test]
+fn established_inbound_circuit_disarms_its_handshake_deadline() {
+    let mut h = inbound_harness(NatConfig {
+        force_relay: true,
+        circuit_handshake_timeout_ms: 5,
+        ..NatConfig::default()
+    });
+    let stream = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stream, 0);
+    let target = h.target.clone();
+    h.stream_data(stream, stop_connect(&target), at(10));
+    let actions = drain_actions(&mut h.agent);
+    let conn_id = complete_promotion(&mut h.agent, &target, &actions, at(11));
+    drain_events(&mut h.agent);
+    drain_actions(&mut h.agent);
+
+    h.agent.handle_tick(at(100));
+    assert!(
+        !drain_actions(&mut h.agent).iter().any(
+            |action| matches!(action, NatAction::CloseCircuit { conn_id: id } if *id == conn_id)
+        ),
+        "a ready inbound circuit must not be reclaimed by its old handshake deadline"
+    );
+    assert!(h.agent.is_idle());
+}
+
+#[test]
 fn sync_coalesced_with_application_data_preserves_the_bridge_remainder() {
     let mut h = inbound_harness(NatConfig::default());
     let stream = StreamId::new(STOP_STREAM);

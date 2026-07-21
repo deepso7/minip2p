@@ -625,6 +625,7 @@ impl ConnectAttempt {
         while let Some(output) = hop.poll_output() {
             outputs.push(output);
         }
+        self.capture_force_relay_bridge_data(&outputs, shared);
         // `HopConnect` yields `Outcome(Bridged)` before any `BridgeData`, so
         // pipelined peer bytes reach the DCUtR machine created below inside
         // this same cascade — before any later `StreamData` event.
@@ -650,7 +651,9 @@ impl ConnectAttempt {
                     return;
                 }
                 HopConnectOutput::BridgeData(bytes) => {
-                    self.on_bridge_data(stream, &bytes, shared, now);
+                    if !shared.config.force_relay {
+                        self.on_bridge_data(stream, &bytes, shared, now);
+                    }
                 }
             }
         }
@@ -717,6 +720,20 @@ impl ConnectAttempt {
         self.drain_dcutr_outputs(stream, shared, now);
     }
 
+    /// In relay-only mode promotion happens as soon as HOP accepts. Capture
+    /// bytes coalesced behind STATUS:OK before processing the preceding
+    /// `Outcome(Bridged)`, which queues the promotion action.
+    fn capture_force_relay_bridge_data(&mut self, outputs: &[HopConnectOutput], shared: &Shared) {
+        if !shared.config.force_relay {
+            return;
+        }
+        for output in outputs {
+            if let HopConnectOutput::BridgeData(bytes) = output {
+                self.bridge_pending_data.extend_from_slice(bytes);
+            }
+        }
+    }
+
     fn drain_dcutr_outputs(&mut self, stream: StreamId, shared: &mut Shared, now: Now) {
         let Some(dcutr) = self.dcutr.as_mut() else {
             return;
@@ -760,6 +777,7 @@ impl ConnectAttempt {
         while let Some(output) = hop.poll_output() {
             outputs.push(output);
         }
+        self.capture_force_relay_bridge_data(&outputs, shared);
         for output in outputs {
             match output {
                 HopConnectOutput::Outbound(data) => {
@@ -782,7 +800,9 @@ impl ConnectAttempt {
                     return;
                 }
                 HopConnectOutput::BridgeData(bytes) => {
-                    self.on_bridge_data(stream, &bytes, shared, now);
+                    if !shared.config.force_relay {
+                        self.on_bridge_data(stream, &bytes, shared, now);
+                    }
                 }
             }
         }

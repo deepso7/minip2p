@@ -435,8 +435,12 @@ fn two_agents_punch_to_a_direct_connection() {
     assert!(
         matches!(
             events.as_slice(),
-            [NatEvent::PathEstablished { connect_id, path: Path::Relayed { .. }, .. }]
-                if *connect_id == id
+            [NatEvent::PathEstablished {
+                connect_id,
+                peer,
+                path: Path::Relayed { relay },
+            }]
+                if *connect_id == id && peer == &world.b_id && relay == &world.relay_id
         ),
         "A settles a relayed path first, got {events:?}"
     );
@@ -475,10 +479,12 @@ fn two_agents_punch_to_a_direct_connection() {
         matches!(
             events.as_slice(),
             [NatEvent::PathUpgraded {
-                from: Path::Relayed { .. },
+                connect_id,
+                peer,
+                from: Path::Relayed { relay },
                 to: Path::DirectPunched,
-                ..
             }]
+                if *connect_id == id && peer == &world.b_id && relay == &world.relay_id
         ),
         "A upgrades explicitly, got {events:?}"
     );

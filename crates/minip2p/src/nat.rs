@@ -32,6 +32,8 @@ pub(crate) struct NatDriver {
     public_addrs: Vec<Multiaddr>,
     /// Exact adopted bridge keys mapped to their promoted circuit ids.
     promoted: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
+    #[cfg(test)]
+    bridge_reset_attempts: Vec<(ConnectionId, StreamId)>,
 }
 
 impl NatDriver {
@@ -44,6 +46,8 @@ impl NatDriver {
             relay_addrs,
             public_addrs: Vec::new(),
             promoted: BTreeMap::new(),
+            #[cfg(test)]
+            bridge_reset_attempts: Vec::new(),
         }
     }
 
@@ -206,6 +210,8 @@ impl NatDriver {
                         };
                         self.agent.promote_result(token, Err(promote_error), now);
                         if !matches!(error, AdoptError::UnknownConnection) {
+                            #[cfg(test)]
+                            self.bridge_reset_attempts.push((inner_conn, stream_id));
                             let _ = swarm
                                 .transport_mut()
                                 .inner_mut()
@@ -316,7 +322,209 @@ impl NatDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Endpoint, NatConfig, ReachabilityState};
+    use crate::{Ed25519Keypair, Endpoint, Event, NatConfig, ReachabilityState};
+    use minip2p_nat::{NatToken, ReservationPolicy};
+    use minip2p_relay::{HOP_PROTOCOL_ID, HopMessage, HopMessageType, Status, encode_frame};
+
+    struct BridgePair {
+        local: Endpoint,
+        relay: Endpoint,
+        local_addr: minip2p_core::PeerAddr,
+        relay_addr: minip2p_core::PeerAddr,
+        inner_conn: ConnectionId,
+        stream: StreamId,
+    }
+
+    fn negotiated_bridge() -> BridgePair {
+        let mut relay = Endpoint::builder()
+            .identity(Ed25519Keypair::from_secret_key_bytes([72; 32]))
+            .protocol(HOP_PROTOCOL_ID)
+            .bind_quic("127.0.0.1:0")
+            .expect("bind relay");
+        let relay_addr = relay.listen().expect("relay listens");
+        let mut local = Endpoint::builder()
+            .identity(Ed25519Keypair::from_secret_key_bytes([71; 32]))
+            .protocol(HOP_PROTOCOL_ID)
+            .bind_quic("127.0.0.1:0")
+            .expect("bind local");
+        let local_addr = local.listen().expect("local listens");
+        local.dial(&relay_addr).expect("dial relay");
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let mut inner_conn = None;
+        let mut local_ready = false;
+        let mut relay_ready = false;
+        while !local_ready || !relay_ready {
+            assert!(
+                Instant::now() < deadline,
+                "relay session did not become ready"
+            );
+            if let Some(event) = local
+                .next_event(std::time::Duration::from_millis(10))
+                .expect("drive local")
+            {
+                match event {
+                    Event::ConnectionEstablished { peer_id, conn_id }
+                        if peer_id == *relay_addr.peer_id() =>
+                    {
+                        inner_conn = Some(conn_id);
+                    }
+                    Event::PeerReady { peer_id, .. } if peer_id == *relay_addr.peer_id() => {
+                        local_ready = true;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(Event::PeerReady { peer_id, .. }) = relay
+                .next_event(std::time::Duration::from_millis(10))
+                .expect("drive relay")
+                && peer_id == *local.peer_id()
+            {
+                relay_ready = true;
+            }
+        }
+        let inner_conn = inner_conn.expect("local connection id");
+        let stream = local
+            .open_stream(relay_addr.peer_id(), HOP_PROTOCOL_ID)
+            .expect("open bridge stream");
+        let mut local_stream_ready = false;
+        let mut relay_stream_ready = false;
+        while !local_stream_ready || !relay_stream_ready {
+            assert!(Instant::now() < deadline, "bridge stream did not negotiate");
+            if let Some(Event::StreamReady { stream_id, .. }) = local
+                .next_event(std::time::Duration::from_millis(10))
+                .expect("drive local stream")
+                && stream_id == stream
+            {
+                local_stream_ready = true;
+            }
+            if let Some(Event::StreamReady { stream_id, .. }) = relay
+                .next_event(std::time::Duration::from_millis(10))
+                .expect("drive relay stream")
+                && stream_id == stream
+            {
+                relay_stream_ready = true;
+            }
+        }
+        BridgePair {
+            local,
+            relay,
+            local_addr,
+            relay_addr,
+            inner_conn,
+            stream,
+        }
+    }
+
+    fn drain_actions(agent: &mut NatAgent) -> Vec<NatAction> {
+        core::iter::from_fn(|| agent.poll_action()).collect()
+    }
+
+    fn only_dial_token(actions: &[NatAction]) -> NatToken {
+        actions
+            .iter()
+            .find_map(|action| match action {
+                NatAction::Dial { token, .. } => Some(*token),
+                _ => None,
+            })
+            .expect("dial token")
+    }
+
+    fn only_open_token(actions: &[NatAction]) -> NatToken {
+        actions
+            .iter()
+            .find_map(|action| match action {
+                NatAction::OpenStream { token, .. } => Some(*token),
+                _ => None,
+            })
+            .expect("open token")
+    }
+
+    fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver, NatAction) {
+        let target = Ed25519Keypair::from_secret_key_bytes([73; 32]).peer_id();
+        let relay_peer = pair.relay_addr.peer_id().clone();
+        let config = NatConfig {
+            relays: vec![pair.relay_addr.clone()],
+            force_relay: true,
+            reservation_policy: ReservationPolicy::Never,
+            ..NatConfig::default()
+        };
+        let mut agent = NatAgent::new(pair.local.peer_id().clone(), config);
+        agent.connect(target, Vec::new(), Now::from_mono(0));
+        let dial = drain_actions(&mut agent);
+        agent.dial_result(
+            only_dial_token(&dial),
+            Ok(pair.inner_conn),
+            Now::from_mono(1),
+        );
+        agent.handle_event(
+            &SwarmEvent::ConnectionEstablished {
+                peer_id: relay_peer.clone(),
+                conn_id: pair.inner_conn,
+            },
+            Now::from_mono(2),
+        );
+        agent.handle_event(
+            &SwarmEvent::PeerReady {
+                peer_id: relay_peer.clone(),
+                protocols: vec![HOP_PROTOCOL_ID.to_string()],
+            },
+            Now::from_mono(3),
+        );
+        let open = drain_actions(&mut agent);
+        agent.stream_open_result(only_open_token(&open), Ok(pair.stream), Now::from_mono(4));
+        agent.handle_event(
+            &SwarmEvent::StreamReady {
+                peer_id: relay_peer.clone(),
+                conn_id: pair.inner_conn,
+                stream_id: pair.stream,
+                protocol_id: HOP_PROTOCOL_ID.to_string(),
+                initiated_locally: true,
+            },
+            Now::from_mono(5),
+        );
+        drain_actions(&mut agent); // HOP CONNECT
+        let status = HopMessage {
+            kind: HopMessageType::Status,
+            peer: None,
+            reservation: None,
+            limit: None,
+            status: Some(Status::Ok),
+        };
+        agent.handle_event(
+            &SwarmEvent::StreamData {
+                peer_id: relay_peer.clone(),
+                conn_id: pair.inner_conn,
+                stream_id: pair.stream,
+                data: encode_frame(&status.encode()),
+            },
+            Now::from_mono(6),
+        );
+        let mut promotion = drain_actions(&mut agent)
+            .into_iter()
+            .find(|action| matches!(action, NatAction::PromoteBridge { .. }))
+            .expect("promotion action");
+        if let NatAction::PromoteBridge {
+            remote_write_closed: closed,
+            ..
+        } = &mut promotion
+        {
+            *closed = remote_write_closed;
+        }
+        let driver = NatDriver::new(
+            agent,
+            vec![(relay_peer, pair.relay_addr.transport().clone())],
+        );
+        (driver, promotion)
+    }
+
+    fn execute(driver: &mut NatDriver, action: NatAction, endpoint: &mut Endpoint) {
+        driver.execute(action, &mut endpoint.swarm);
+    }
+
+    fn circuit_id(driver: &NatDriver, key: (ConnectionId, StreamId)) -> ConnectionId {
+        *driver.promoted.get(&key).expect("promoted bridge entry")
+    }
 
     #[test]
     fn confirmed_public_addresses_are_advertised_and_cleared() {
@@ -351,5 +559,222 @@ mod tests {
         );
         swarm.poll().expect("refresh identify addresses");
         assert!(!swarm.core().local_addresses().contains(&public));
+    }
+
+    #[test]
+    fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently() {
+        let mut pair = negotiated_bridge();
+        let key = (pair.inner_conn, pair.stream);
+        let (mut driver, promotion) = promotion_driver(&pair, false);
+        let duplicate = promotion.clone();
+
+        execute(&mut driver, promotion, &mut pair.local);
+        let promoted = circuit_id(&driver, key);
+        assert_eq!(pair.local.swarm.transport().circuit_ids(), vec![promoted]);
+
+        execute(&mut driver, duplicate, &mut pair.local);
+        assert_eq!(driver.promoted.len(), 1);
+        assert_eq!(pair.local.swarm.transport().circuit_ids(), vec![promoted]);
+        assert!(driver.bridge_reset_attempts.is_empty());
+
+        let mut header = vec![19];
+        header.extend_from_slice(b"/multistream/1.0.0\n");
+        assert!(driver.ingest(
+            &SwarmEvent::StreamData {
+                peer_id: pair.relay_addr.peer_id().clone(),
+                conn_id: pair.inner_conn,
+                stream_id: pair.stream,
+                data: header,
+            },
+            &mut pair.local.swarm,
+        ));
+        assert!(driver.promoted.contains_key(&key));
+        assert!(!driver.ingest(
+            &SwarmEvent::StreamData {
+                peer_id: pair.relay_addr.peer_id().clone(),
+                conn_id: ConnectionId::new(pair.inner_conn.as_u64() + 100),
+                stream_id: pair.stream,
+                data: vec![1],
+            },
+            &mut pair.local.swarm,
+        ));
+
+        execute(
+            &mut driver,
+            NatAction::CloseCircuit { conn_id: promoted },
+            &mut pair.local,
+        );
+        execute(
+            &mut driver,
+            NatAction::CloseCircuit { conn_id: promoted },
+            &mut pair.local,
+        );
+        assert!(driver.promoted.is_empty());
+        assert!(pair.local.swarm.transport().circuit_ids().is_empty());
+        let _ = pair.relay.next_event(std::time::Duration::from_millis(10));
+    }
+
+    #[test]
+    fn promotion_uses_action_connection_after_same_batch_relay_supersede() {
+        let mut pair = negotiated_bridge();
+        let old_conn = pair.inner_conn;
+        let stream = pair.stream;
+        let relay_peer = pair.relay_addr.peer_id().clone();
+        let (mut driver, promotion) = promotion_driver(&pair, false);
+
+        // Establish a replacement relay connection, but stop as soon as both
+        // public Established events have been delivered. At this seam the
+        // core points at B while its eager close of A is still deferred.
+        pair.relay
+            .dial(&pair.local_addr)
+            .expect("relay dials replacement");
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let mut replacement = None;
+        let mut relay_established = false;
+        while replacement.is_none() || !relay_established {
+            assert!(Instant::now() < deadline, "replacement did not establish");
+            if replacement.is_none()
+                && let Some(Event::ConnectionEstablished { peer_id, conn_id }) = pair
+                    .local
+                    .next_event(std::time::Duration::from_millis(10))
+                    .expect("drive local replacement")
+                && peer_id == relay_peer
+                && conn_id != old_conn
+            {
+                replacement = Some(conn_id);
+            }
+            if !relay_established
+                && let Some(Event::ConnectionEstablished { peer_id, .. }) = pair
+                    .relay
+                    .next_event(std::time::Duration::from_millis(10))
+                    .expect("drive relay replacement")
+                && peer_id == *pair.local.peer_id()
+            {
+                relay_established = true;
+            }
+        }
+        let replacement = replacement.expect("replacement connection id");
+        assert_eq!(
+            pair.local.swarm.core().conn_for(&relay_peer),
+            Some(replacement)
+        );
+
+        execute(&mut driver, promotion, &mut pair.local);
+        assert!(driver.promoted.contains_key(&(old_conn, stream)));
+        assert!(!driver.promoted.contains_key(&(replacement, stream)));
+        assert!(!driver.ingest(
+            &SwarmEvent::StreamData {
+                peer_id: relay_peer,
+                conn_id: replacement,
+                stream_id: stream,
+                data: vec![1],
+            },
+            &mut pair.local.swarm,
+        ));
+    }
+
+    #[test]
+    fn driver_resets_failed_adoptions_but_not_unknown_connections() {
+        let mut failed_pair = negotiated_bridge();
+        let failed_key = (failed_pair.inner_conn, failed_pair.stream);
+        let (mut failed, action) = promotion_driver(&failed_pair, true);
+        execute(&mut failed, action, &mut failed_pair.local);
+        assert!(failed.promoted.is_empty());
+        assert_eq!(failed.bridge_reset_attempts, vec![failed_key]);
+
+        let mut unknown_pair = negotiated_bridge();
+        let (mut unknown, mut action) = promotion_driver(&unknown_pair, false);
+        let missing = ConnectionId::new(9_999);
+        if let NatAction::PromoteBridge { inner_conn, .. } = &mut action {
+            *inner_conn = missing;
+        }
+        execute(&mut unknown, action, &mut unknown_pair.local);
+        assert!(unknown.promoted.is_empty());
+        assert!(unknown.bridge_reset_attempts.is_empty());
+        assert!(
+            unknown_pair
+                .local
+                .swarm
+                .transport()
+                .circuit_ids()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn driver_prunes_promotions_on_every_external_cleanup_path() {
+        // A remote bridge FIN is routed through the promoted transport even
+        // though the raw stream was forgotten by the swarm at adoption.
+        let mut fin_pair = negotiated_bridge();
+        let (mut fin, action) = promotion_driver(&fin_pair, false);
+        execute(&mut fin, action, &mut fin_pair.local);
+        assert!(fin.ingest(
+            &SwarmEvent::StreamRemoteWriteClosed {
+                peer_id: fin_pair.relay_addr.peer_id().clone(),
+                conn_id: fin_pair.inner_conn,
+                stream_id: fin_pair.stream,
+            },
+            &mut fin_pair.local.swarm,
+        ));
+
+        // Exact bridge closure is terminal and removes the keyed adoption.
+        let mut closed_pair = negotiated_bridge();
+        let closed_key = (closed_pair.inner_conn, closed_pair.stream);
+        let (mut closed, action) = promotion_driver(&closed_pair, false);
+        execute(&mut closed, action, &mut closed_pair.local);
+        assert!(closed.ingest(
+            &SwarmEvent::StreamClosed {
+                peer_id: closed_pair.relay_addr.peer_id().clone(),
+                conn_id: closed_pair.inner_conn,
+                stream_id: closed_pair.stream,
+            },
+            &mut closed_pair.local.swarm,
+        ));
+        assert!(!closed.promoted.contains_key(&closed_key));
+
+        // An inner relay connection close drops every circuit riding it.
+        let mut inner_pair = negotiated_bridge();
+        let inner_key = (inner_pair.inner_conn, inner_pair.stream);
+        let (mut inner, action) = promotion_driver(&inner_pair, false);
+        execute(&mut inner, action, &mut inner_pair.local);
+        inner.ingest(
+            &SwarmEvent::ConnectionClosed {
+                peer_id: inner_pair.relay_addr.peer_id().clone(),
+                conn_id: inner_pair.inner_conn,
+            },
+            &mut inner_pair.local.swarm,
+        );
+        assert!(!inner.promoted.contains_key(&inner_key));
+
+        // A circuit lifecycle close also removes its reverse map entry.
+        let mut circuit_pair = negotiated_bridge();
+        let circuit_key = (circuit_pair.inner_conn, circuit_pair.stream);
+        let (mut circuit, action) = promotion_driver(&circuit_pair, false);
+        execute(&mut circuit, action, &mut circuit_pair.local);
+        let promoted = circuit_id(&circuit, circuit_key);
+        circuit.ingest(
+            &SwarmEvent::ConnectionClosed {
+                peer_id: Ed25519Keypair::from_secret_key_bytes([73; 32]).peer_id(),
+                conn_id: promoted,
+            },
+            &mut circuit_pair.local.swarm,
+        );
+        assert!(!circuit.promoted.contains_key(&circuit_key));
+
+        // Reconciliation catches transport-side removal even if no lifecycle
+        // event passed through the driver.
+        let mut swept_pair = negotiated_bridge();
+        let swept_key = (swept_pair.inner_conn, swept_pair.stream);
+        let (mut swept, action) = promotion_driver(&swept_pair, false);
+        execute(&mut swept, action, &mut swept_pair.local);
+        let promoted = circuit_id(&swept, swept_key);
+        swept_pair
+            .local
+            .swarm
+            .transport_mut()
+            .close(promoted)
+            .expect("transport-side close");
+        swept.pump(&mut swept_pair.local.swarm);
+        assert!(swept.promoted.is_empty());
     }
 }

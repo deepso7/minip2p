@@ -196,6 +196,35 @@ fn force_relay_skips_direct_dials_and_dcutr() {
 }
 
 #[test]
+fn force_relay_preserves_bytes_coalesced_behind_hop_success() {
+    let mut h = Harness::with_relay(NatConfig {
+        force_relay: true,
+        ..NatConfig::default()
+    });
+    h.agent
+        .connect(h.target.clone(), vec![maddr(TARGET_ADDR)], at(0));
+    let actions = drain_actions(&mut h.agent);
+    let relay_token = dial_token_for(&actions, &h.relay);
+    h.agent
+        .dial_result(relay_token, Ok(ConnectionId::new(2)), at(5));
+    h.relay_session_ready(at(10));
+    let open = drain_actions(&mut h.agent);
+    let open_token = open_stream_token(&open);
+    let stream = StreamId::new(41);
+    h.agent.stream_open_result(open_token, Ok(stream), at(15));
+    h.stream_ready(stream, at(20));
+    drain_actions(&mut h.agent);
+
+    let first_circuit_bytes = b"first noise-selection bytes".to_vec();
+    let mut coalesced = hop_status(Status::Ok);
+    coalesced.extend_from_slice(&first_circuit_bytes);
+    h.stream_data(stream, coalesced, at(30));
+
+    let promotion = drain_actions(&mut h.agent);
+    assert_eq!(promoted_pending_data(&promotion), first_circuit_bytes);
+}
+
+#[test]
 fn stalled_promoted_outbound_circuit_is_closed_at_connect_deadline() {
     let mut h = Harness::with_relay(NatConfig {
         connect_deadline_ms: 1_000,
@@ -691,6 +720,13 @@ fn initiator_reply_coalesced_with_application_data_preserves_remainder() {
             ..
         }] if *connect_id == id
     ));
+    let actions = drain_actions(&mut h.agent);
+    assert!(
+        actions.iter().any(
+            |action| matches!(action, NatAction::CloseCircuit { conn_id } if conn_id.as_u64() == TEST_CIRCUIT_ID)
+        ),
+        "the punched direct connection must retire the promoted circuit"
+    );
 }
 
 #[test]
@@ -934,6 +970,22 @@ fn reporter_disconnect_drops_its_observation() {
         vec![maddr(LISTEN_ADDR)],
         "dropped observation leaks into the CONNECT"
     );
+}
+
+#[test]
+fn untracked_connection_close_is_ignored() {
+    let mut h = Harness::without_relay(NatConfig::default());
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            conn_id: ConnectionId::new(999),
+            peer_id: peer(b"untracked-peer"),
+        },
+        at(1),
+    );
+
+    assert!(drain_events(&mut h.agent).is_empty());
+    assert!(drain_actions(&mut h.agent).is_empty());
+    assert!(h.agent.is_idle());
 }
 
 #[test]
