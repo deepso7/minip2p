@@ -28,7 +28,8 @@ pub enum MultistreamOutput {
     OutboundData(Vec<u8>),
     /// Protocol negotiation succeeded.
     Negotiated { protocol: String },
-    /// The remote peer does not support the requested protocol.
+    /// A protocol proposal was unavailable: either the listener rejected the
+    /// dialer's proposal or the dialer received `na` from the listener.
     NotAvailable,
     /// A protocol-level error occurred; negotiation is terminated.
     ProtocolError { reason: String },
@@ -254,7 +255,11 @@ fn handle_message(
                 )
             } else {
                 (
-                    State::Done,
+                    // A dialer may propose another protocol on the same
+                    // stream after `na` (for example rust-libp2p tries
+                    // meshsub 1.2 before falling back to 1.1). Keep the
+                    // listener alive for that next proposal.
+                    State::WaitingForProtocolRequest,
                     vec![
                         MultistreamOutput::OutboundData(encode_message(NOT_AVAILABLE)),
                         MultistreamOutput::NotAvailable,
@@ -438,6 +443,33 @@ mod tests {
                 MultistreamOutput::NotAvailable
             ]
         );
+        assert!(!listener.is_done());
+    }
+
+    #[test]
+    fn listener_accepts_fallback_after_unsupported_proposal() {
+        const MESHSUB_V1_2: &str = "/meshsub/1.2.0";
+        const MESHSUB_V1_1: &str = "/meshsub/1.1.0";
+
+        let mut listener = MultistreamSelect::listener([MESHSUB_V1_1.to_string()]);
+        let _ = listener.start();
+
+        let mut pipelined = encode_message(MULTISTREAM_PROTOCOL_ID);
+        pipelined.extend_from_slice(&encode_message(MESHSUB_V1_2));
+        pipelined.extend_from_slice(&encode_message(MESHSUB_V1_1));
+
+        assert_eq!(
+            listener.receive(&pipelined),
+            vec![
+                MultistreamOutput::OutboundData(encode_message("na")),
+                MultistreamOutput::NotAvailable,
+                MultistreamOutput::OutboundData(encode_message(MESHSUB_V1_1)),
+                MultistreamOutput::Negotiated {
+                    protocol: MESHSUB_V1_1.to_string()
+                }
+            ]
+        );
+        assert!(listener.is_done());
     }
 
     #[test]

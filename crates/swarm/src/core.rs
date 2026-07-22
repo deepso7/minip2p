@@ -1524,7 +1524,11 @@ impl SwarmCore {
                 *negotiated_protocol = Some(protocol);
                 false
             }
-            MultistreamOutput::NotAvailable => true,
+            // Inbound listeners remain open after replying `na` so dialers
+            // can offer their next protocol on the same stream. Outbound
+            // dialers handle `NotAvailable` as terminal in
+            // `feed_outbound_negotiator` above.
+            MultistreamOutput::NotAvailable => false,
             MultistreamOutput::ProtocolError { reason } => {
                 self.emit_error(
                     SwarmErrorKind::Multistream,
@@ -1859,6 +1863,7 @@ mod tests {
     use core::str::FromStr;
 
     use minip2p_identify::IdentifyConfig;
+    use minip2p_multistream_select::MULTISTREAM_PROTOCOL_ID;
     use minip2p_ping::PingConfig;
     use minip2p_transport::{ConnectionEndpoint, ConnectionId, StreamId, TransportEvent};
 
@@ -1906,6 +1911,18 @@ mod tests {
         events
     }
 
+    fn multistream_frame(protocol: &str) -> Vec<u8> {
+        let payload_len = protocol.len() + 1;
+        assert!(
+            payload_len < 128,
+            "test helper only encodes one-byte lengths"
+        );
+        let mut frame = vec![payload_len as u8];
+        frame.extend_from_slice(protocol.as_bytes());
+        frame.push(b'\n');
+        frame
+    }
+
     #[test]
     fn swarm_core_implements_common_sans_io_protocol_trait() {
         fn drive_idle<S: SansIoProtocol<Input = SwarmInput, Output = SwarmOutput>>(engine: &mut S) {
@@ -1935,6 +1952,93 @@ mod tests {
         core.add_protocol("/myapp/1.0.0")
             .expect("application ids must be accepted");
         assert!(core.user_protocols.iter().any(|p| p == "/myapp/1.0.0"));
+    }
+
+    #[test]
+    fn inbound_multistream_accepts_fallback_after_na_on_same_stream() {
+        const MESHSUB_V1_2: &str = "/meshsub/1.2.0";
+        const MESHSUB_V1_1: &str = "/meshsub/1.1.0";
+
+        let mut core = test_core();
+        core.add_protocol(MESHSUB_V1_1)
+            .expect("register meshsub 1.1");
+        let peer_id = PeerId::from_public_key_protobuf(b"fallback-peer");
+        let conn_id = ConnectionId::new(7);
+        let stream_id = StreamId::new(3);
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+
+        feed(
+            &mut core,
+            TransportEvent::IncomingStream {
+                id: conn_id,
+                stream_id,
+            },
+        );
+        core.actions.clear(); // listener's multistream header
+
+        let mut first_offer = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+        first_offer.extend_from_slice(&multistream_frame(MESHSUB_V1_2));
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn_id,
+                stream_id,
+                data: first_offer,
+            },
+        );
+
+        assert!(core.inbound_negotiators.contains_key(&(conn_id, stream_id)));
+        assert!(matches!(
+            core.actions.pop_front(),
+            Some(SwarmAction::SendStream {
+                conn_id: action_conn,
+                stream_id: action_stream,
+                data,
+            }) if action_conn == conn_id
+                && action_stream == stream_id
+                && data == multistream_frame("na")
+        ));
+        assert!(core.actions.is_empty(), "unsupported offer must not reset");
+
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn_id,
+                stream_id,
+                data: multistream_frame(MESHSUB_V1_1),
+            },
+        );
+
+        assert!(!core.inbound_negotiators.contains_key(&(conn_id, stream_id)));
+        assert_eq!(
+            core.stream_owner.get(&(conn_id, stream_id)),
+            Some(&ProtocolKind::User(MESHSUB_V1_1.to_string()))
+        );
+        assert!(matches!(
+            core.actions.pop_front(),
+            Some(SwarmAction::SendStream {
+                conn_id: action_conn,
+                stream_id: action_stream,
+                data,
+            }) if action_conn == conn_id
+                && action_stream == stream_id
+                && data == multistream_frame(MESHSUB_V1_1)
+        ));
+        assert!(core.actions.is_empty());
+        assert!(matches!(
+            core.events.pop_front(),
+            Some(SwarmEvent::StreamReady {
+                peer_id: ready_peer,
+                conn_id: ready_conn,
+                stream_id: ready_stream,
+                protocol_id,
+                initiated_locally: false,
+            }) if ready_peer == peer_id
+                && ready_conn == conn_id
+                && ready_stream == stream_id
+                && protocol_id == MESHSUB_V1_1
+        ));
     }
 
     #[test]
