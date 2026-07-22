@@ -1,7 +1,7 @@
 //! CI-safe end-to-end test for `minip2p-chat` on loopback, relay-free.
 //!
 //! Spawns a host and two joiners in a star (the joiners only know the
-//! host), waits for the floodsub subscription handshakes, then proves the
+//! host), waits for the gossipsub subscription handshakes, then proves the
 //! product loop: a line typed on one peer's stdin reaches every other peer
 //! — including leaf-to-leaf THROUGH the host — and stdin EOF exits cleanly.
 
@@ -188,10 +188,10 @@ fn three_peer_star_chats_end_to_end() {
     let mut alice = Peer::spawn("alice", &["join", &addr, "--nick", "alice", "--no-mesh"]);
     let mut bob = Peer::spawn("bob", &["join", &addr, "--nick", "bob", "--no-mesh"]);
 
-    // --- 3. Subscription handshakes settle (floodsub has no history:
-    //        publishing earlier would vanish). ---
+    // --- 3. Each joiner gates stdin on the host's topic announcement, and
+    //        the hub eagerly admits both leaves before its first heartbeat. ---
     for peer in [&alice, &bob] {
-        peer.wait_line(deadline, |line| line.contains("peer-subscribed"));
+        peer.wait_line(deadline, |line| line.contains("pubsub-ready"));
     }
     host.wait_count(deadline, 2, |line| line.contains("peer-subscribed"));
 
@@ -313,6 +313,8 @@ fn three_peer_mesh_survives_host_death() {
             && line.contains(&alice_id)
             && line.contains("minip2p-chat")
     });
+    // Subscription exchange now performs low-watermark mesh admission, so
+    // direct peers are routable without a heartbeat-sized sleep.
 
     host.kill();
     alice.say("still here");

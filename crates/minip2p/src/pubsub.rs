@@ -1,4 +1,4 @@
-//! Std wiring that pumps a sans-I/O [`FloodsubAgent`] against the
+//! Std wiring that pumps a sans-I/O [`PubsubAgent`] against the
 //! endpoint's swarm: clock sampling, action execution, and stream-event
 //! interception. Mirrors the NAT driver (`crate::nat`).
 //!
@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use minip2p_pubsub::{FloodsubAgent, PubsubAction, PubsubEvent};
+use minip2p_pubsub::{PubsubAction, PubsubAgent, PubsubEvent};
 use minip2p_swarm::SwarmEvent;
 
 use crate::EndpointSwarm;
@@ -41,9 +41,9 @@ pub enum PubsubError {
     Driver(#[from] Error),
 }
 
-/// Drives a [`FloodsubAgent`] against the endpoint's swarm.
+/// Drives the configured [`PubsubAgent`] against the endpoint's swarm.
 pub(crate) struct PubsubDriver {
-    pub(crate) agent: FloodsubAgent,
+    pub(crate) agent: PubsubAgent,
     /// Pubsub events awaiting the application (drained via
     /// `Endpoint::take_pubsub_events` / `next_pubsub_event`).
     pub(crate) events: VecDeque<PubsubEvent>,
@@ -52,7 +52,7 @@ pub(crate) struct PubsubDriver {
 }
 
 impl PubsubDriver {
-    pub(crate) fn new(agent: FloodsubAgent) -> Self {
+    pub(crate) fn new(agent: PubsubAgent) -> Self {
         Self {
             agent,
             events: VecDeque::new(),
@@ -67,7 +67,7 @@ impl PubsubDriver {
 
     /// Feeds one swarm event to the agent and executes its cascade.
     ///
-    /// Returns `true` when the event belongs to a floodsub stream and must
+    /// Returns `true` when the event belongs to a pubsub stream and must
     /// not be forwarded to the application.
     pub(crate) fn ingest(&mut self, event: &SwarmEvent, swarm: &mut EndpointSwarm) -> bool {
         let handled = self.agent.handle_event(event, self.now_ms());

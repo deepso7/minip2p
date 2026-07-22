@@ -480,7 +480,71 @@ fn unannounced_or_excess_graft_is_pruned_immediately() {
 }
 
 #[test]
-fn empty_mesh_publish_falls_back_without_grafting() {
+fn new_remote_subscriptions_graft_and_relay_before_heartbeat() {
+    let mut agent = agent_with(GossipsubConfig {
+        d: 2,
+        d_low: 2,
+        d_high: 4,
+        heartbeat_interval_ms: 100_000,
+        ..GossipsubConfig::default()
+    });
+    agent.subscribe("room", 0).unwrap();
+    let first = peer(2);
+    let second = peer(3);
+    for (remote, outbound, inbound) in [
+        (&first, StreamId::new(4), StreamId::new(5)),
+        (&second, StreamId::new(6), StreamId::new(7)),
+    ] {
+        connect(&mut agent, remote, &[MESHSUB_PROTOCOL_ID_V11], 1);
+        let subscription = make_ready(&mut agent, remote, outbound, MESHSUB_PROTOCOL_ID_V11, 1);
+        ack(&mut agent, remote, &subscription, 1);
+        drain_actions(&mut agent);
+        inbound_open(&mut agent, remote, inbound, 1);
+        remote_subscribe(&mut agent, remote, inbound, "room", 1);
+
+        assert!(agent.mesh_peers("room").contains(remote));
+        let graft = drain_actions(&mut agent);
+        let control = decode_rpc(&sent(&graft).expect("eager GRAFT").0)
+            .control
+            .expect("control frame");
+        assert_eq!(control.graft[0].topic_id.as_deref(), Some("room"));
+        ack(&mut agent, remote, &graft, 1);
+        drain_actions(&mut agent);
+    }
+    drain_events(&mut agent);
+
+    inbound_rpc(
+        &mut agent,
+        &first,
+        StreamId::new(5),
+        Rpc {
+            publish: vec![RawMessage::build_signed(
+                &keypair(2),
+                "room",
+                b"before heartbeat".to_vec(),
+                1,
+            )],
+            ..Rpc::default()
+        },
+        2,
+    );
+    let relay = drain_actions(&mut agent);
+    let (relay_peer, frame) = relay
+        .iter()
+        .find_map(|action| match action {
+            PubsubAction::SendStream { peer, data, .. } => Some((peer, data)),
+            _ => None,
+        })
+        .expect("relay before first heartbeat");
+    assert_eq!(relay_peer, &second);
+    assert_eq!(
+        decode_rpc(frame).publish[0].data.as_deref(),
+        Some(&b"before heartbeat"[..])
+    );
+}
+
+#[test]
+fn prune_in_subscription_rpc_blocks_opportunistic_graft() {
     let mut agent = agent();
     agent.subscribe("room", 0).unwrap();
     let remote = peer(2);
@@ -495,20 +559,33 @@ fn empty_mesh_publish_falls_back_without_grafting() {
     ack(&mut agent, &remote, &subscription, 1);
     drain_actions(&mut agent);
     inbound_open(&mut agent, &remote, StreamId::new(5), 1);
-    remote_subscribe(&mut agent, &remote, StreamId::new(5), "room", 1);
-    drain_events(&mut agent);
 
-    agent
-        .publish("room", b"before heartbeat".to_vec(), 2)
-        .unwrap();
-    assert!(agent.mesh_peers("room").is_empty());
-    let publish = drain_actions(&mut agent);
-    let rpc = decode_rpc(&sent(&publish).unwrap().0);
-    assert_eq!(
-        rpc.publish[0].data.as_deref(),
-        Some(&b"before heartbeat"[..])
+    inbound_rpc(
+        &mut agent,
+        &remote,
+        StreamId::new(5),
+        Rpc {
+            subscriptions: vec![SubOpts {
+                subscribe: Some(true),
+                topic_id: Some("room".to_string()),
+            }],
+            control: Some(ControlMessage {
+                prune: vec![ControlPrune {
+                    topic_id: Some("room".to_string()),
+                    peers: Vec::new(),
+                    backoff: Some(120),
+                }],
+                ..ControlMessage::default()
+            }),
+            ..Rpc::default()
+        },
+        2,
     );
-    assert!(rpc.control.is_none(), "fallback does not implicitly GRAFT");
+
+    assert!(agent.mesh_peers("room").is_empty());
+    assert!(drain_actions(&mut agent).is_empty());
+    agent.handle_tick(1_002);
+    assert!(agent.mesh_peers("room").is_empty());
 }
 
 #[test]
@@ -835,6 +912,212 @@ fn stream_reopen_resyncs_an_acked_unsubscribe() {
 }
 
 #[test]
+fn disconnect_preserves_backoff_and_supersede_reannounces_subscriptions() {
+    let mut agent = agent();
+    agent.subscribe("room", 0).unwrap();
+    let remote = peer(2);
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+    let subscription = make_ready(
+        &mut agent,
+        &remote,
+        StreamId::new(4),
+        MESHSUB_PROTOCOL_ID_V11,
+        0,
+    );
+    ack(&mut agent, &remote, &subscription, 0);
+    drain_actions(&mut agent);
+    inbound_open(&mut agent, &remote, StreamId::new(5), 0);
+    remote_subscribe(&mut agent, &remote, StreamId::new(5), "room", 1);
+    drain_events(&mut agent);
+    let graft = drain_actions(&mut agent);
+    ack(&mut agent, &remote, &graft, 1);
+    drain_actions(&mut agent);
+
+    inbound_rpc(
+        &mut agent,
+        &remote,
+        StreamId::new(5),
+        Rpc {
+            control: Some(ControlMessage {
+                prune: vec![ControlPrune {
+                    topic_id: Some("room".to_string()),
+                    peers: Vec::new(),
+                    backoff: Some(120),
+                }],
+                ..ControlMessage::default()
+            }),
+            ..Rpc::default()
+        },
+        2,
+    );
+    assert!(agent.mesh_peers("room").is_empty());
+
+    agent.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            peer_id: remote.clone(),
+            conn_id: ConnectionId::new(1),
+        },
+        3,
+    );
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 4);
+    let reconnected = make_ready(
+        &mut agent,
+        &remote,
+        StreamId::new(8),
+        MESHSUB_PROTOCOL_ID_V11,
+        4,
+    );
+    let rpc = decode_rpc(
+        &sent(&reconnected)
+            .expect("reconnect subscription snapshot")
+            .0,
+    );
+    assert_eq!(rpc.subscriptions.len(), 1);
+    assert_eq!(rpc.subscriptions[0].subscribe, Some(true));
+    assert_eq!(rpc.subscriptions[0].topic_id.as_deref(), Some("room"));
+    ack(&mut agent, &remote, &reconnected, 4);
+    drain_actions(&mut agent);
+    inbound_open(&mut agent, &remote, StreamId::new(9), 4);
+    remote_subscribe(&mut agent, &remote, StreamId::new(9), "room", 5);
+    assert!(
+        agent.mesh_peers("room").is_empty(),
+        "disconnect must not erase the peer's topic backoff"
+    );
+    assert!(drain_actions(&mut agent).is_empty());
+
+    agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            peer_id: remote.clone(),
+            conn_id: ConnectionId::new(2),
+        },
+        6,
+    );
+    agent.handle_event(
+        &SwarmEvent::PeerReady {
+            peer_id: remote.clone(),
+            protocols: vec![MESHSUB_PROTOCOL_ID_V11.to_string()],
+        },
+        6,
+    );
+    let superseded = make_ready(
+        &mut agent,
+        &remote,
+        StreamId::new(12),
+        MESHSUB_PROTOCOL_ID_V11,
+        6,
+    );
+    let rpc = decode_rpc(
+        &sent(&superseded)
+            .expect("supersede subscription snapshot")
+            .0,
+    );
+    assert_eq!(rpc.subscriptions.len(), 1);
+    assert_eq!(rpc.subscriptions[0].subscribe, Some(true));
+    assert_eq!(rpc.subscriptions[0].topic_id.as_deref(), Some("room"));
+    ack(&mut agent, &remote, &superseded, 6);
+    drain_actions(&mut agent);
+    inbound_open(&mut agent, &remote, StreamId::new(13), 6);
+    remote_subscribe(&mut agent, &remote, StreamId::new(13), "room", 7);
+    assert!(
+        agent.mesh_peers("room").is_empty(),
+        "supersede must rebuild peer state without erasing backoff"
+    );
+    assert!(drain_actions(&mut agent).is_empty());
+}
+
+#[test]
+fn queued_prune_reencodes_for_v10_after_stream_reopen() {
+    let mut agent = agent();
+    agent.subscribe("room", 0).unwrap();
+    let remote = peer(2);
+    connect(
+        &mut agent,
+        &remote,
+        &[MESHSUB_PROTOCOL_ID_V11, MESHSUB_PROTOCOL_ID_V10],
+        0,
+    );
+    let subscription = make_ready(
+        &mut agent,
+        &remote,
+        StreamId::new(4),
+        MESHSUB_PROTOCOL_ID_V11,
+        0,
+    );
+    ack(&mut agent, &remote, &subscription, 0);
+    drain_actions(&mut agent);
+    inbound_open(&mut agent, &remote, StreamId::new(5), 0);
+    remote_subscribe(&mut agent, &remote, StreamId::new(5), "room", 1);
+    drain_events(&mut agent);
+    let graft = drain_actions(&mut agent);
+    ack(&mut agent, &remote, &graft, 1);
+    drain_actions(&mut agent);
+
+    agent.unsubscribe("room", 2);
+    let unsubscribe = drain_actions(&mut agent);
+    ack(&mut agent, &remote, &unsubscribe, 2);
+    let v11_prune = drain_actions(&mut agent);
+    assert_eq!(
+        decode_rpc(&sent(&v11_prune).expect("v1.1 PRUNE in flight").0)
+            .control
+            .expect("control frame")
+            .prune[0]
+            .backoff,
+        Some(10)
+    );
+
+    agent.handle_event(
+        &SwarmEvent::StreamClosed {
+            peer_id: remote.clone(),
+            conn_id: ConnectionId::new(1),
+            stream_id: StreamId::new(4),
+        },
+        3,
+    );
+    agent.handle_event(
+        &SwarmEvent::PeerReady {
+            peer_id: remote.clone(),
+            protocols: vec![MESHSUB_PROTOCOL_ID_V10.to_string()],
+        },
+        4,
+    );
+    let opening = drain_actions(&mut agent);
+    let token = opening
+        .iter()
+        .find_map(|action| match action {
+            PubsubAction::OpenStream {
+                token, protocol_id, ..
+            } if protocol_id == MESHSUB_PROTOCOL_ID_V10 => Some(*token),
+            _ => None,
+        })
+        .expect("reopen requests meshsub 1.0");
+    let stream = StreamId::new(8);
+    agent.stream_open_result(&remote, token, Ok(stream), 4);
+    agent.handle_event(
+        &SwarmEvent::StreamReady {
+            peer_id: remote.clone(),
+            conn_id: ConnectionId::new(1),
+            stream_id: stream,
+            protocol_id: MESHSUB_PROTOCOL_ID_V10.to_string(),
+            initiated_locally: true,
+        },
+        4,
+    );
+    let resync = drain_actions(&mut agent);
+    let rpc = decode_rpc(&sent(&resync).expect("unsubscribe resync").0);
+    assert_eq!(rpc.subscriptions.len(), 1);
+    assert_eq!(rpc.subscriptions[0].subscribe, Some(false));
+    ack(&mut agent, &remote, &resync, 4);
+
+    let v10_prune = drain_actions(&mut agent);
+    let prune = &decode_rpc(&sent(&v10_prune).expect("re-encoded PRUNE").0)
+        .control
+        .expect("control frame")
+        .prune[0];
+    assert_eq!(prune.topic_id.as_deref(), Some("room"));
+    assert_eq!(prune.backoff, None);
+}
+
+#[test]
 fn valid_message_delivers_once_and_invalid_signature_never_delivers() {
     let mut agent = agent();
     agent.subscribe("room", 0).unwrap();
@@ -976,6 +1259,9 @@ fn v11_leave_prune_carries_backoff() {
     inbound_open(&mut agent, &remote, StreamId::new(5), 1);
     remote_subscribe(&mut agent, &remote, StreamId::new(5), "room", 1);
     drain_events(&mut agent);
+    let graft = drain_actions(&mut agent);
+    ack(&mut agent, &remote, &graft, 1);
+    drain_actions(&mut agent);
     inbound_rpc(
         &mut agent,
         &remote,
@@ -1107,6 +1393,9 @@ fn disconnect_and_supersede_aggregate_queued_failures() {
         drain_actions(&mut agent);
         inbound_open(&mut agent, remote, inbound, 0);
         remote_subscribe(&mut agent, remote, inbound, "room", 0);
+        let graft = drain_actions(&mut agent);
+        ack(&mut agent, remote, &graft, 0);
+        drain_actions(&mut agent);
     }
     drain_events(&mut agent);
     agent.publish("room", b"queued".to_vec(), 1).unwrap();
@@ -1163,6 +1452,9 @@ fn publish_backpressure_is_all_or_nothing_across_mesh_peers() {
         drain_actions(&mut agent);
         inbound_open(&mut agent, remote, inbound, 0);
         remote_subscribe(&mut agent, remote, inbound, "room", 0);
+        let graft = drain_actions(&mut agent);
+        ack(&mut agent, remote, &graft, 0);
+        drain_actions(&mut agent);
     }
     drain_events(&mut agent);
     agent.publish("room", b"first".to_vec(), 1).unwrap();
@@ -1200,6 +1492,11 @@ fn zero_gossip_degree_emits_no_ihave() {
         drain_actions(&mut agent);
         inbound_open(&mut agent, remote, inbound, 0);
         remote_subscribe(&mut agent, remote, inbound, "room", 0);
+        let graft = drain_actions(&mut agent);
+        if sent(&graft).is_some() {
+            ack(&mut agent, remote, &graft, 0);
+            drain_actions(&mut agent);
+        }
     }
     drain_events(&mut agent);
     inbound_rpc(

@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    DISCOVERY_TOPIC, DiscoveryConfig, DiscoveryEvent, Endpoint, Event, FloodsubConfig, NatConfig,
+    DISCOVERY_TOPIC, DiscoveryConfig, DiscoveryEvent, Endpoint, Event, GossipsubConfig, NatConfig,
     NatEvent, PeerAddr, PeerId, PublishError, PubsubError, PubsubEvent,
 };
 
@@ -24,7 +24,7 @@ const DEFAULT_TOPIC: &str = "minip2p-chat";
 const CONNECT_DEADLINE: Duration = Duration::from_secs(65);
 /// How long the host waits for its relay reservation before warning.
 const RESERVATION_DEADLINE: Duration = Duration::from_secs(30);
-/// Identify must complete before floodsub can open streams.
+/// Identify must complete before gossipsub can open streams.
 const READY_DEADLINE: Duration = Duration::from_secs(15);
 
 struct ChatEndpoint {
@@ -46,9 +46,9 @@ fn build_endpoint(
     let mut builder = Endpoint::builder()
         .identity(keypair)
         .agent_version(AGENT)
-        .pubsub_config(FloodsubConfig {
+        .pubsub_config(GossipsubConfig {
             allow_unsigned: options.allow_unsigned,
-            ..FloodsubConfig::default()
+            ..GossipsubConfig::default()
         })
         .nat_config(nat_config);
     if !options.no_mesh {
@@ -215,8 +215,42 @@ pub fn run_join(
         .subscribe(&topic)
         .map_err(|e| format!("subscribe: {e}"))?;
     println!("[join] subscribed topic={topic} nick={nick}");
+    wait_for_topic_peer(&mut endpoint, &host_peer, &topic, "join")?;
 
     run_chat(&mut endpoint, &topic, &nick, "join", None)
+}
+
+/// Waits until the host's topic announcement has been applied. The
+/// gossipsub agent immediately admits an eligible new subscriber while the
+/// local mesh is below its low watermark, so observing this event means the
+/// joiner has a routing peer before stdin is consumed.
+fn wait_for_topic_peer(
+    endpoint: &mut Endpoint,
+    expected_peer: &PeerId,
+    expected_topic: &str,
+    role: &str,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + READY_DEADLINE;
+    loop {
+        let Some(event) = endpoint
+            .next_pubsub_event(deadline)
+            .map_err(|e| format!("waiting for pubsub readiness: {e}"))?
+        else {
+            return Err(
+                format!("peer {expected_peer} did not announce topic {expected_topic}").into(),
+            );
+        };
+        let ready = matches!(
+            &event,
+            PubsubEvent::PeerSubscribed { peer, topic }
+                if peer == expected_peer && topic == expected_topic
+        );
+        print_pubsub_event(role, event);
+        if ready {
+            println!("[{role}] pubsub-ready peer={expected_peer} topic={expected_topic}");
+            return Ok(());
+        }
+    }
 }
 
 // --- the chat loop ----------------------------------------------------------
@@ -309,27 +343,7 @@ fn run_chat(
         }
 
         for event in endpoint.take_pubsub_events() {
-            match event {
-                PubsubEvent::Message { data, from, .. } => {
-                    println!(
-                        "[chat] {} ({})",
-                        String::from_utf8_lossy(&data),
-                        short(&from)
-                    );
-                }
-                PubsubEvent::PeerSubscribed { peer, topic } => {
-                    println!("[{role}] peer-subscribed peer={peer} topic={topic}");
-                }
-                PubsubEvent::PeerUnsubscribed { peer, topic } => {
-                    println!("[{role}] peer-unsubscribed peer={peer} topic={topic}");
-                }
-                PubsubEvent::OutboundFailure { peer, reason } => {
-                    eprintln!("[{role}] outbound-failure peer={peer} reason={reason}");
-                }
-                PubsubEvent::ProtocolViolation { peer, reason } => {
-                    eprintln!("[{role}] violation peer={peer} reason={reason}");
-                }
-            }
+            print_pubsub_event(role, event);
         }
 
         for event in endpoint.take_nat_events() {
@@ -380,6 +394,30 @@ fn run_chat(
                     );
                 }
             }
+        }
+    }
+}
+
+fn print_pubsub_event(role: &str, event: PubsubEvent) {
+    match event {
+        PubsubEvent::Message { data, from, .. } => {
+            println!(
+                "[chat] {} ({})",
+                String::from_utf8_lossy(&data),
+                short(&from)
+            );
+        }
+        PubsubEvent::PeerSubscribed { peer, topic } => {
+            println!("[{role}] peer-subscribed peer={peer} topic={topic}");
+        }
+        PubsubEvent::PeerUnsubscribed { peer, topic } => {
+            println!("[{role}] peer-unsubscribed peer={peer} topic={topic}");
+        }
+        PubsubEvent::OutboundFailure { peer, reason } => {
+            eprintln!("[{role}] outbound-failure peer={peer} reason={reason}");
+        }
+        PubsubEvent::ProtocolViolation { peer, reason } => {
+            eprintln!("[{role}] violation peer={peer} reason={reason}");
         }
     }
 }

@@ -1,4 +1,4 @@
-//! `minip2p-chat` — group chat over floodsub, NAT traversal included.
+//! `minip2p-chat` — group chat over gossipsub, NAT traversal included.
 
 mod cli;
 mod modes;
