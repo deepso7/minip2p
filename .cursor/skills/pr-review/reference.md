@@ -9,6 +9,7 @@ Shared constraints for every specialist:
   `{"reasoning","severity","confidence","path","line","finding"}`
 - Omit anything with confidence &lt; 0.8
 - Finish your charter; do not stop after the first finding
+- Read in-diff hunks for owned files before following out-of-diff callers
 
 ## State
 
@@ -22,7 +23,7 @@ Out-of-diff: callers of changed state-transition functions.
 
 Focus: bytes in / structured values out.
 
-Hunt: length/truncation/overflow; endianness; fixture/golden size mismatches (even if tests skip the field); accept paths that skip validation; decode that drops trailing coalesced data.
+Hunt: length/truncation/overflow; endianness; fixture/golden size mismatches (even if tests skip the field); accept paths that skip validation; decode that drops trailing coalesced data; rewrites that rebuild maps/structs and drop fields the old path preserved.
 
 Out-of-diff: other parsers/encoders of the same format in-repo.
 

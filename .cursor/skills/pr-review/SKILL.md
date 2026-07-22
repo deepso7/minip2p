@@ -31,7 +31,7 @@ From the diff only:
 
 1. List changed paths and a one-line blast radius (what can break)
 2. Note symbols/APIs whose **callers outside the diff** must be checked (out-of-diff)
-3. Pick which specialists to run (default: all five below on nontrivial PRs; drop Editorial-only if zero docs)
+3. Pick which specialists to run (default: all five on nontrivial PRs; drop a specialist only if its charter has zero touch surface)
 4. Emit a short plan; then launch specialists **in parallel** (separate subagents / Task calls)
 
 ### 2. Micro-agents (parallel)
@@ -49,14 +49,14 @@ Every finding **must** be structured:
 Charters:
 
 | Agent | Owns |
-|---|---|
+| --- | --- |
 | **State** | Invariants, lifecycle, close/reset/retry, event ordering, post-close behavior |
 | **Parse** | Lengths, encodings, fixtures/goldens, validate-before-side-effects |
 | **Security** | Untrusted peers/input, authz, spoofing, expensive work before reject |
 | **Flow** | Spins, starvation, deadlines, unbounded/superlinear buffers, error-path leaks |
 | **Verify** | Tests/CI/fuzz/`no_std` gaps, README/doc lies, AGENTS.md policy on touched code |
 
-Specialists must: stay in charter; read out-of-diff callers when the planner flagged symbols; not stop after one hit; confidence &lt; 0.8 → omit.
+Specialists must: stay in charter; read changed hunks in their files before out-of-diff callers; not stop after one hit; confidence &lt; 0.8 → omit.
 
 ### 3. Merge (you)
 
@@ -64,13 +64,13 @@ Specialists must: stay in charter; read out-of-diff callers when the planner fla
 2. Dedupe near-duplicates (same root cause → keep highest severity / clearest)
 3. Drop nits / pure style even if a specialist emitted them
 4. Optional: run focused `cargo test -p <touched>` once; fold hard evidence in
-5. Output per `pr-review.mdc`: summary line, table, short evidence per finding, severity counts, and one Cubic-style **copy block** (single fenced `text` with `<file>` / `<violation>` prompts grouped by file) so the user can paste into an agent
+5. Output per `pr-review.mdc`: summary line, table, short evidence per finding, severity counts, and one Cubic-style **copy block** (single fenced `text` with `<file>` / `<violation>` prompts grouped by file)
 6. Do not fix code unless asked
 
 ## Modes
 
 - **normal** (default): all specialists, thorough but time-bounded
-- **ultra**: same agents + explicit out-of-diff pass on every public/changed symbol the planner listed; prefer deeper reads over skimming; use when user says ultra or PR is large/risky
+- **ultra**: same agents + explicit out-of-diff pass on every public/changed symbol the planner listed — after in-diff coverage; use when user says ultra or PR is large/risky
 
 ## Examples
 

@@ -9,12 +9,12 @@ Review like a strong staff engineer with unlimited patience: find real bugs in t
 
 ## Severity
 
-- **P0**: panics, definitively wrong results, or tests/fixtures that cannot work as written
+- **P0**: hangs, panics, definitively wrong results, or tests/fixtures that cannot work as written
 - **P1**: correctness or security bug likely to hit real users/peers
 - **P2**: contract/lifecycle/resource bugs; clear holes where tests/fuzz/CI won’t catch failure
 - **P3**: concrete maintainability or portability with a real failure mode (skip pure taste)
 
-Confidence ≥ 8 only. If unsure, dig deeper or drop — don’t pad.
+Confidence ≥ 0.8 only (0–1 scale; same bar as “≥ 8 / 10”). If unsure, dig deeper or drop — don’t pad.
 
 ## Output
 
@@ -47,6 +47,7 @@ Work the **diff**, reading surrounding code when needed. For every nontrivial hu
 ### 2. Data & parsing
 - Lengths, encodings, endianness, off-by-one, truncation, overflow in size math
 - New/changed fixtures and golden files: values must match what parsers/tests assume (sizes, counts, encodings). If tests don’t load a field, still flag corrupt fixtures — silent rot is a bug
+- Rewrites that rebuild maps/structs: do they drop fields the old path preserved?
 - Reject/accept paths for untrusted input: do we validate before expensive work or state changes?
 
 ### 3. Resources & control flow
