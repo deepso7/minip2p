@@ -49,7 +49,7 @@ pub struct GossipsubConfig {
     pub seen_ttl_ms: u64,
     /// Hard cap on seen-cache entries.
     pub max_seen_messages: usize,
-    /// Hard cap on queued message RPCs per peer.
+    /// Hard cap on queued message RPCs and logical control items per peer.
     pub max_pending_per_peer: usize,
     /// Hard cap on remote subscriptions tracked per peer.
     pub max_topics_per_peer: usize,

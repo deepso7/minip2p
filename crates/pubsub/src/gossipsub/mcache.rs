@@ -11,28 +11,31 @@ use crate::seen::MessageId;
 struct CacheEntry {
     message: RawMessage,
     topics: Vec<String>,
+    generation: u64,
 }
 
 /// Recent validated messages, indexed for IHAVE and IWANT.
 #[derive(Debug)]
 pub(super) struct MessageCache {
     messages: BTreeMap<MessageId, CacheEntry>,
-    history: VecDeque<Vec<MessageId>>,
-    insertion_order: VecDeque<MessageId>,
+    history: VecDeque<BTreeMap<MessageId, u64>>,
+    insertion_order: VecDeque<(MessageId, u64)>,
     history_len: usize,
     max_messages: usize,
+    next_generation: u64,
 }
 
 impl MessageCache {
     pub(super) fn new(history_len: usize, max_messages: usize) -> Self {
         let mut history = VecDeque::new();
-        history.push_front(Vec::new());
+        history.push_front(BTreeMap::new());
         Self {
             messages: BTreeMap::new(),
             history,
             insertion_order: VecDeque::new(),
             history_len,
             max_messages,
+            next_generation: 0,
         }
     }
 
@@ -40,18 +43,27 @@ impl MessageCache {
         if self.messages.contains_key(&id) {
             return;
         }
-        self.messages
-            .insert(id.clone(), CacheEntry { message, topics });
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.messages.insert(
+            id.clone(),
+            CacheEntry {
+                message,
+                topics,
+                generation,
+            },
+        );
         self.history
             .front_mut()
             .expect("message cache always has a current window")
-            .push(id.clone());
-        self.insertion_order.push_back(id);
+            .insert(id.clone(), generation);
+        self.insertion_order.push_back((id, generation));
         while self.messages.len() > self.max_messages {
-            if let Some(oldest) = self.insertion_order.pop_front() {
-                self.remove(&oldest);
+            if let Some((oldest, generation)) = self.insertion_order.pop_front() {
+                self.remove_generation(&oldest, generation);
             }
         }
+        self.discard_stale_order_front();
     }
 
     pub(super) fn get(&self, id: &MessageId) -> Option<&RawMessage> {
@@ -60,12 +72,11 @@ impl MessageCache {
 
     pub(super) fn gossip_ids(&self, topic: &str, windows: usize) -> Vec<MessageId> {
         let mut unique = BTreeSet::new();
-        for id in self.history.iter().take(windows).flatten() {
-            if self
-                .messages
-                .get(id)
-                .is_some_and(|entry| entry.topics.iter().any(|candidate| candidate == topic))
-            {
+        for (id, generation) in self.history.iter().take(windows).flatten() {
+            if self.messages.get(id).is_some_and(|entry| {
+                entry.generation == *generation
+                    && entry.topics.iter().any(|candidate| candidate == topic)
+            }) {
                 unique.insert(id.clone());
             }
         }
@@ -73,21 +84,52 @@ impl MessageCache {
     }
 
     pub(super) fn shift(&mut self) {
-        self.history.push_front(Vec::new());
+        self.history.push_front(BTreeMap::new());
         while self.history.len() > self.history_len {
             if let Some(expired) = self.history.pop_back() {
-                for id in expired {
-                    self.remove(&id);
+                for (id, generation) in expired {
+                    if self
+                        .messages
+                        .get(&id)
+                        .is_some_and(|entry| entry.generation == generation)
+                    {
+                        self.messages.remove(&id);
+                    }
                 }
+            }
+        }
+        self.discard_stale_order_front();
+    }
+
+    fn remove_generation(&mut self, id: &MessageId, generation: u64) {
+        if !self
+            .messages
+            .get(id)
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            return;
+        }
+        self.messages.remove(id);
+        for window in &mut self.history {
+            if window.get(id) == Some(&generation) {
+                window.remove(id);
+                break;
             }
         }
     }
 
-    fn remove(&mut self, id: &MessageId) {
-        self.messages.remove(id);
-        self.insertion_order.retain(|candidate| candidate != id);
-        for window in &mut self.history {
-            window.retain(|candidate| candidate != id);
+    fn discard_stale_order_front(&mut self) {
+        while self
+            .insertion_order
+            .front()
+            .is_some_and(|(id, generation)| {
+                !self
+                    .messages
+                    .get(id)
+                    .is_some_and(|entry| entry.generation == *generation)
+            })
+        {
+            self.insertion_order.pop_front();
         }
     }
 }
@@ -124,5 +166,21 @@ mod tests {
         assert!(cache.get(&vec![1]).is_none());
         assert!(!cache.gossip_ids("t", 5).contains(&vec![1]));
         assert!(cache.get(&vec![2]).is_some());
+    }
+
+    #[test]
+    fn stale_windows_do_not_evict_a_reinserted_id() {
+        let mut cache = MessageCache::new(2, 1);
+        cache.put(vec![1], message(1), vec![String::from("t")]);
+        cache.put(vec![2], message(2), vec![String::from("t")]);
+        cache.put(vec![1], message(3), vec![String::from("t")]);
+
+        cache.shift();
+        assert_eq!(
+            cache.get(&vec![1]).map(|message| message.raw.as_slice()),
+            Some(&[3][..])
+        );
+        cache.shift();
+        assert!(cache.get(&vec![1]).is_none());
     }
 }

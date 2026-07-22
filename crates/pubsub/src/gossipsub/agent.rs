@@ -5,7 +5,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_core::PeerId;
+use minip2p_core::{PeerId, uvarint_len};
 use minip2p_identity::Ed25519Keypair;
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::StreamId;
@@ -83,30 +83,96 @@ impl ControlBuffer {
             + self.iwant.len()
     }
 
-    fn push(&mut self, item: ControlItem) {
+    /// Inserts newer logical work with last-writer-wins topology semantics.
+    /// Returns `false` only when a new item would exceed `max_items`.
+    fn insert(&mut self, item: ControlItem, max_items: usize) -> bool {
         match item {
             ControlItem::Graft(topic) => {
-                if !self.prune.contains_key(&topic) {
-                    self.graft.insert(topic);
+                if self.graft.contains(&topic) {
+                    return true;
                 }
+                if self.prune.remove(&topic).is_some() {
+                    self.graft.insert(topic);
+                    return true;
+                }
+                if self.len() >= max_items {
+                    return false;
+                }
+                self.graft.insert(topic);
             }
             ControlItem::Prune { topic, backoff_ms } => {
-                self.graft.remove(&topic);
+                if let Some(existing) = self.prune.get_mut(&topic) {
+                    *existing = backoff_ms;
+                    return true;
+                }
+                if self.graft.remove(&topic) {
+                    self.prune.insert(topic, backoff_ms);
+                    return true;
+                }
+                if self.len() >= max_items {
+                    return false;
+                }
                 self.prune.insert(topic, backoff_ms);
             }
             ControlItem::IHave { topic, id } => {
+                if self.ihave.get(&topic).is_some_and(|ids| ids.contains(&id)) {
+                    return true;
+                }
+                if self.len() >= max_items {
+                    return false;
+                }
                 self.ihave.entry(topic).or_default().insert(id);
             }
             ControlItem::IWant(id) => {
+                if self.iwant.contains(&id) {
+                    return true;
+                }
+                if self.len() >= max_items {
+                    return false;
+                }
                 self.iwant.insert(id);
             }
         }
+        true
     }
 
-    fn merge(&mut self, items: Vec<ControlItem>) {
+    /// Restores failed in-flight items ahead of the newer pending buffer.
+    /// Newer topology decisions therefore win when the two are coalesced.
+    fn restore_older(&mut self, items: Vec<ControlItem>, max_items: usize) -> usize {
+        let mut newer = core::mem::take(self);
+        let mut merged = Self::default();
+        let mut dropped = 0;
         for item in items {
-            self.push(item);
+            dropped += usize::from(!merged.insert(item, max_items));
         }
+        while let Some(item) = newer.pop_first() {
+            dropped += usize::from(!merged.insert(item, max_items));
+        }
+        *self = merged;
+        dropped
+    }
+
+    /// Evicts one low-priority gossip id to make room for topology control.
+    fn evict_gossip(&mut self) -> bool {
+        if let Some(id) = self.iwant.iter().next_back().cloned() {
+            self.iwant.remove(&id);
+            return true;
+        }
+        let Some((topic, id)) = self.ihave.iter().next_back().and_then(|(topic, ids)| {
+            ids.iter()
+                .next_back()
+                .cloned()
+                .map(|id| (topic.clone(), id))
+        }) else {
+            return false;
+        };
+        if let Some(ids) = self.ihave.get_mut(&topic) {
+            ids.remove(&id);
+            if ids.is_empty() {
+                self.ihave.remove(&topic);
+            }
+        }
+        true
     }
 
     fn pop_first(&mut self) -> Option<ControlItem> {
@@ -148,26 +214,84 @@ impl ControlBuffer {
             return None;
         }
         let mut items = Vec::new();
-        // Re-encoding is deliberately exact across nested protobuf-varint
-        // boundaries. The configured control budgets bound this quadratic
-        // packing pass; replace it with size accounting only if profiling
-        // shows it matters.
+        let mut size = ControlFrameSize::default();
         while let Some(item) = self.pop_first() {
-            items.push(item);
-            let body = encode_control_items(&items, version);
-            if body.len() > MAX_RPC_SIZE {
-                let item = items.pop().expect("just pushed");
-                self.push(item);
+            let mut next_size = size.clone();
+            next_size.add(&item, version);
+            if next_size.rpc_len() > MAX_RPC_SIZE {
+                debug_assert!(self.insert(item, usize::MAX));
                 break;
             }
+            size = next_size;
+            items.push(item);
         }
         if items.is_empty() {
             // This can only be reached for a hostile, nearly-frame-sized
             // message id. Such ids are filtered before entering the buffer.
             return None;
         }
-        Some((encode_control_items(&items, version), items))
+        let body = encode_control_items(&items, version);
+        debug_assert_eq!(body.len(), size.rpc_len());
+        Some((body, items))
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ControlFrameSize {
+    control_body: usize,
+    ihave_topic: Option<String>,
+    ihave_body: usize,
+    iwant_body: usize,
+}
+
+impl ControlFrameSize {
+    fn add(&mut self, item: &ControlItem, version: MeshsubVersion) {
+        match item {
+            ControlItem::Graft(topic) => {
+                self.control_body += nested_field_len(bytes_field_len(topic.len()));
+            }
+            ControlItem::Prune { topic, backoff_ms } => {
+                let mut body = bytes_field_len(topic.len());
+                if version == MeshsubVersion::V11 {
+                    let seconds = backoff_ms.saturating_add(999) / 1_000;
+                    body += 1 + uvarint_len(seconds);
+                }
+                self.control_body += nested_field_len(body);
+            }
+            ControlItem::IHave { topic, id } => {
+                if self.ihave_topic.as_deref() == Some(topic.as_str()) {
+                    let old = nested_field_len(self.ihave_body);
+                    self.ihave_body += bytes_field_len(id.len());
+                    self.control_body += nested_field_len(self.ihave_body) - old;
+                } else {
+                    self.ihave_topic = Some(topic.clone());
+                    self.ihave_body = bytes_field_len(topic.len()) + bytes_field_len(id.len());
+                    self.control_body += nested_field_len(self.ihave_body);
+                }
+            }
+            ControlItem::IWant(id) => {
+                let old = (self.iwant_body != 0).then(|| nested_field_len(self.iwant_body));
+                self.iwant_body += bytes_field_len(id.len());
+                self.control_body += nested_field_len(self.iwant_body) - old.unwrap_or(0);
+            }
+        }
+    }
+
+    fn rpc_len(&self) -> usize {
+        if self.control_body == 0 {
+            0
+        } else {
+            nested_field_len(self.control_body)
+        }
+    }
+}
+
+fn bytes_field_len(len: usize) -> usize {
+    1 + uvarint_len(len as u64) + len
+}
+
+fn nested_field_len(body_len: usize) -> usize {
+    bytes_field_len(body_len)
 }
 
 fn encode_control_items(items: &[ControlItem], version: MeshsubVersion) -> Vec<u8> {
@@ -253,7 +377,10 @@ struct PeerState {
     sender: SendState,
     pending_messages: VecDeque<Vec<u8>>,
     acknowledged_topics: BTreeSet<String>,
-    announced_topics: BTreeSet<String>,
+    /// Recently acknowledged unsubscriptions replayed after stream reopen.
+    /// Bounded by `max_topics_per_peer`; active subscriptions are derived
+    /// from the agent's current topic set and need no history here.
+    unsubscribe_tombstones: BTreeSet<String>,
     subscription_queue: VecDeque<SubOpts>,
     inbound: BTreeMap<StreamId, Vec<u8>>,
     remote_topics: BTreeSet<String>,
@@ -275,6 +402,13 @@ impl PeerState {
             _ => 0,
         };
         self.pending_messages.len() + self.pending_control.len() + in_flight_control
+    }
+
+    fn record_unsubscribe(&mut self, topic: String, max_topics: usize) {
+        self.unsubscribe_tombstones.insert(topic);
+        while self.unsubscribe_tombstones.len() > max_topics {
+            self.unsubscribe_tombstones.pop_first();
+        }
     }
 }
 
@@ -385,10 +519,13 @@ impl GossipsubAgent {
             }
         }
         self.fanout_last_pub.remove(topic);
-        for peer in &selected {
-            self.queue_control(peer, ControlItem::Graft(String::from(topic)), now_ms);
+        let mut joined = BTreeSet::new();
+        for peer in selected {
+            if self.queue_control(&peer, ControlItem::Graft(String::from(topic)), now_ms) {
+                joined.insert(peer);
+            }
         }
-        self.mesh.insert(String::from(topic), selected);
+        self.mesh.insert(String::from(topic), joined);
         self.drive_all_senders(now_ms);
         Ok(true)
     }
@@ -757,7 +894,7 @@ impl GossipsubAgent {
                     });
                 }
                 let withdrawals: Vec<String> = state
-                    .announced_topics
+                    .unsubscribe_tombstones
                     .difference(&self.topics)
                     .cloned()
                     .collect();
@@ -1049,7 +1186,22 @@ impl GossipsubAgent {
             if !self.topics.contains(&topic) {
                 continue;
             }
-            if self.is_backed_off(&topic, peer, now_ms) {
+            let remote_subscribed = self
+                .peers
+                .get(peer)
+                .is_some_and(|state| state.remote_topics.contains(&topic));
+            let (already_meshed, mesh_len) = self
+                .mesh
+                .get(&topic)
+                .map(|mesh| (mesh.contains(peer), mesh.len()))
+                .unwrap_or((false, 0));
+            if already_meshed {
+                continue;
+            }
+            if !remote_subscribed
+                || self.is_backed_off(&topic, peer, now_ms)
+                || mesh_len >= self.config.d_high
+            {
                 self.record_backoff(&topic, peer, self.config.prune_backoff_ms, now_ms);
                 self.queue_control(
                     peer,
@@ -1060,10 +1212,6 @@ impl GossipsubAgent {
                     now_ms,
                 );
             } else {
-                // GRAFT itself asserts mesh interest. Spec-following peers
-                // announce the subscription first; an unannounced GRAFT is
-                // accepted optimistically and heartbeat eligibility later
-                // reconciles it.
                 self.mesh.entry(topic).or_default().insert(peer.clone());
             }
         }
@@ -1086,6 +1234,12 @@ impl GossipsubAgent {
             self.record_backoff(&topic, peer, backoff, now_ms);
         }
         for ihave in control.ihave {
+            let Some(topic) = ihave.topic_id.as_deref() else {
+                continue;
+            };
+            if validate_topic(topic).is_err() || !self.topics.contains(topic) {
+                continue;
+            }
             let count = self.ihave_budget.entry(peer.clone()).or_default();
             if *count >= self.config.max_ihave_messages_per_heartbeat {
                 continue;
@@ -1136,6 +1290,20 @@ impl GossipsubAgent {
     }
 
     fn process_message(&mut self, arrival: &PeerId, message: RawMessage, now_ms: u64) {
+        let (dedup_from, dedup_seqno) = match message.source_and_seqno() {
+            Ok(value) => value,
+            Err(error) => {
+                self.events.push_back(PubsubEvent::ProtocolViolation {
+                    peer: arrival.clone(),
+                    reason: format!("message rejected: {error}"),
+                });
+                return;
+            }
+        };
+        let id = message_id(&dedup_from.to_bytes(), &dedup_seqno);
+        if self.seen.contains(&id) {
+            return;
+        }
         let (from, seqno, signed) = match message.verify(self.config.allow_unsigned) {
             Ok(value) => value,
             Err(error) => {
@@ -1146,8 +1314,15 @@ impl GossipsubAgent {
                 return;
             }
         };
-        let id = message_id(&from.to_bytes(), &seqno);
-        if self.seen.contains(&id) {
+        debug_assert_eq!(from, dedup_from);
+        debug_assert_eq!(seqno, dedup_seqno);
+        let interested_topics: Vec<String> = message
+            .topic_ids
+            .iter()
+            .filter(|topic| self.topics.contains(*topic))
+            .cloned()
+            .collect();
+        if interested_topics.is_empty() {
             return;
         }
         self.seen.insert(
@@ -1156,22 +1331,15 @@ impl GossipsubAgent {
             self.config.seen_ttl_ms,
             self.config.max_seen_messages,
         );
-        if message
-            .topic_ids
-            .iter()
-            .any(|topic| self.topics.contains(topic))
-        {
-            self.events.push_back(PubsubEvent::Message {
-                from: from.clone(),
-                topics: message.topic_ids.clone(),
-                data: message.data.clone().unwrap_or_default(),
-                seqno,
-                signed,
-            });
-        }
+        self.events.push_back(PubsubEvent::Message {
+            from: from.clone(),
+            topics: message.topic_ids.clone(),
+            data: message.data.clone().unwrap_or_default(),
+            seqno,
+            signed,
+        });
 
-        let recipients: BTreeSet<PeerId> = message
-            .topic_ids
+        let recipients: BTreeSet<PeerId> = interested_topics
             .iter()
             .filter_map(|topic| self.mesh.get(topic))
             .flatten()
@@ -1191,7 +1359,7 @@ impl GossipsubAgent {
                 self.drive_sender(&peer, now_ms);
             }
         }
-        self.mcache.put(id, message.clone(), message.topic_ids);
+        self.mcache.put(id, message, interested_topics);
     }
 
     fn heartbeat(&mut self, now_ms: u64) {
@@ -1221,7 +1389,20 @@ impl GossipsubAgent {
                 .into_iter()
                 .collect();
             let mut current = self.mesh.remove(&topic).unwrap_or_default();
+            let stripped: Vec<PeerId> = current.difference(&eligible).cloned().collect();
             current.retain(|peer| eligible.contains(peer));
+            for peer in stripped {
+                if self.queue_control(
+                    &peer,
+                    ControlItem::Prune {
+                        topic: topic.clone(),
+                        backoff_ms: self.config.prune_backoff_ms,
+                    },
+                    now_ms,
+                ) {
+                    self.record_backoff(&topic, &peer, self.config.prune_backoff_ms, now_ms);
+                }
+            }
             if current.len() < self.config.d_low {
                 let candidates = eligible
                     .iter()
@@ -1231,8 +1412,9 @@ impl GossipsubAgent {
                 for peer in
                     self.select_peers(candidates, self.config.d.saturating_sub(current.len()))
                 {
-                    current.insert(peer.clone());
-                    self.queue_control(&peer, ControlItem::Graft(topic.clone()), now_ms);
+                    if self.queue_control(&peer, ControlItem::Graft(topic.clone()), now_ms) {
+                        current.insert(peer);
+                    }
                 }
             } else if current.len() > self.config.d_high {
                 let retained: BTreeSet<PeerId> = self
@@ -1240,17 +1422,18 @@ impl GossipsubAgent {
                     .into_iter()
                     .collect();
                 let pruned: Vec<PeerId> = current.difference(&retained).cloned().collect();
-                current = retained;
                 for peer in pruned {
-                    self.record_backoff(&topic, &peer, self.config.prune_backoff_ms, now_ms);
-                    self.queue_control(
+                    if self.queue_control(
                         &peer,
                         ControlItem::Prune {
                             topic: topic.clone(),
                             backoff_ms: self.config.prune_backoff_ms,
                         },
                         now_ms,
-                    );
+                    ) {
+                        current.remove(&peer);
+                        self.record_backoff(&topic, &peer, self.config.prune_backoff_ms, now_ms);
+                    }
                 }
             }
             self.mesh.insert(topic, current);
@@ -1381,6 +1564,7 @@ impl GossipsubAgent {
             .is_some_and(|state| !state.subscription_queue.is_empty())
         {
             let mut subscriptions = Vec::new();
+            let mut body_len = 0;
             // Subscription and control commits intentionally occupy separate
             // RPCs. This keeps each acknowledgement atomic at the cost of one
             // extra write after a reopen; each category is still packed
@@ -1390,17 +1574,12 @@ impl GossipsubAgent {
                 .get(peer)
                 .and_then(|state| state.subscription_queue.front().cloned())
             {
-                subscriptions.push(next);
-                let body = Rpc {
-                    subscriptions: subscriptions.clone(),
-                    publish: Vec::new(),
-                    control: None,
-                }
-                .encode();
-                if body.len() > MAX_RPC_SIZE {
-                    subscriptions.pop();
+                let next_len = nested_field_len(next.encode().len());
+                if body_len + next_len > MAX_RPC_SIZE {
                     break;
                 }
+                body_len += next_len;
+                subscriptions.push(next);
                 self.peers
                     .get_mut(peer)
                     .expect("peer exists")
@@ -1413,6 +1592,7 @@ impl GossipsubAgent {
                 control: None,
             }
             .encode();
+            debug_assert_eq!(body.len(), body_len);
             Some((
                 encode_frame(&body),
                 FrameCommit::Subscriptions(subscriptions),
@@ -1485,10 +1665,10 @@ impl GossipsubAgent {
                     };
                     if subscribe {
                         state.acknowledged_topics.insert(topic.clone());
-                        state.announced_topics.insert(topic);
+                        state.unsubscribe_tombstones.remove(&topic);
                     } else {
                         state.acknowledged_topics.remove(&topic);
-                        state.announced_topics.insert(topic);
+                        state.record_unsubscribe(topic, self.config.max_topics_per_peer);
                     }
                 }
             }
@@ -1503,14 +1683,32 @@ impl GossipsubAgent {
         if let FrameCommit::Control(items) = commit
             && let Some(state) = self.peers.get_mut(peer)
         {
-            state.pending_control.merge(items);
+            state
+                .pending_control
+                .restore_older(items, self.config.max_pending_per_peer);
         }
     }
 
-    fn queue_control(&mut self, peer: &PeerId, item: ControlItem, _now_ms: u64) {
-        if let Some(state) = self.peers.get_mut(peer) {
-            state.pending_control.push(item);
+    fn queue_control(&mut self, peer: &PeerId, item: ControlItem, _now_ms: u64) -> bool {
+        let Some(state) = self.peers.get_mut(peer) else {
+            return false;
+        };
+        let topology = matches!(item, ControlItem::Graft(_) | ControlItem::Prune { .. });
+        if state
+            .pending_control
+            .insert(item.clone(), self.config.max_pending_per_peer)
+        {
+            return true;
         }
+        if topology
+            && state.pending_control.evict_gossip()
+            && state
+                .pending_control
+                .insert(item, self.config.max_pending_per_peer)
+        {
+            return true;
+        }
+        false
     }
 
     fn queue_message(&mut self, peer: &PeerId, frame: Vec<u8>) -> bool {
@@ -1672,26 +1870,68 @@ mod tests {
     #[test]
     fn in_flight_control_ownership_preserves_later_aliases() {
         let mut buffer = ControlBuffer::default();
-        buffer.push(ControlItem::Graft(String::from("topic")));
+        assert!(buffer.insert(ControlItem::Graft(String::from("topic")), usize::MAX));
         let (_, in_flight) = buffer.take_frame(MeshsubVersion::V11).unwrap();
-        buffer.push(ControlItem::Graft(String::from("topic")));
+        assert!(buffer.insert(ControlItem::Graft(String::from("topic")), usize::MAX));
         assert_eq!(buffer.len(), 1, "later alias remains independently queued");
 
         // Failure merges the owned item back and deterministically coalesces
         // it with the later alias.
-        buffer.merge(in_flight);
+        assert_eq!(buffer.restore_older(in_flight, usize::MAX), 0);
         assert_eq!(buffer.len(), 1);
 
         let (_, in_flight) = buffer.take_frame(MeshsubVersion::V11).unwrap();
-        buffer.push(ControlItem::Prune {
-            topic: String::from("topic"),
-            backoff_ms: 10_000,
-        });
-        buffer.merge(in_flight);
+        assert!(buffer.insert(
+            ControlItem::Prune {
+                topic: String::from("topic"),
+                backoff_ms: 10_000,
+            },
+            usize::MAX,
+        ));
+        assert_eq!(buffer.restore_older(in_flight, usize::MAX), 0);
         let (body, _) = buffer.take_frame(MeshsubVersion::V11).unwrap();
         let control = Rpc::decode(&body).unwrap().control.unwrap();
         assert!(control.graft.is_empty());
         assert_eq!(control.prune.len(), 1, "later PRUNE supersedes GRAFT");
+    }
+
+    #[test]
+    fn later_graft_cancels_pending_prune() {
+        let mut buffer = ControlBuffer::default();
+        assert!(buffer.insert(
+            ControlItem::Prune {
+                topic: String::from("topic"),
+                backoff_ms: 10_000,
+            },
+            usize::MAX,
+        ));
+        assert!(buffer.insert(ControlItem::Graft(String::from("topic")), usize::MAX));
+
+        let (body, _) = buffer.take_frame(MeshsubVersion::V11).unwrap();
+        let control = Rpc::decode(&body).unwrap().control.unwrap();
+        assert_eq!(control.graft.len(), 1);
+        assert!(control.prune.is_empty());
+    }
+
+    #[test]
+    fn control_buffer_is_bounded_and_topology_evicts_gossip() {
+        let mut buffer = ControlBuffer::default();
+        assert!(buffer.insert(ControlItem::IWant(vec![1]), 2));
+        assert!(buffer.insert(ControlItem::IWant(vec![2]), 2));
+        assert!(!buffer.insert(ControlItem::IWant(vec![3]), 2));
+        assert!(buffer.evict_gossip());
+        assert!(buffer.insert(ControlItem::Graft(String::from("topic")), 2));
+        assert_eq!(buffer.len(), 2);
+    }
+
+    #[test]
+    fn unsubscribe_tombstones_are_bounded() {
+        let mut state = PeerState::default();
+        state.record_unsubscribe(String::from("a"), 2);
+        state.record_unsubscribe(String::from("b"), 2);
+        state.record_unsubscribe(String::from("c"), 2);
+        assert_eq!(state.unsubscribe_tombstones.len(), 2);
+        assert!(!state.unsubscribe_tombstones.contains("a"));
     }
 
     #[test]
@@ -1700,7 +1940,7 @@ mod tests {
         for index in 0..3_000u32 {
             let mut id = alloc::vec![0xA5; 32];
             id[..4].copy_from_slice(&index.to_be_bytes());
-            buffer.push(ControlItem::IWant(id));
+            assert!(buffer.insert(ControlItem::IWant(id), usize::MAX));
         }
 
         let mut frames = 0;

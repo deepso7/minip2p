@@ -157,6 +157,32 @@ fn sent(actions: &[PubsubAction]) -> Option<(Vec<u8>, minip2p_pubsub::PubsubToke
     })
 }
 
+fn open_for(
+    actions: &[PubsubAction],
+    expected_peer: &PeerId,
+) -> Option<minip2p_pubsub::PubsubToken> {
+    actions.iter().find_map(|action| match action {
+        PubsubAction::OpenStream { token, peer, .. } if peer == expected_peer => Some(*token),
+        _ => None,
+    })
+}
+
+fn ack_peer(agent: &mut GossipsubAgent, peer: &PeerId, actions: &[PubsubAction], now_ms: u64) {
+    let (token, stream_id) = actions
+        .iter()
+        .find_map(|action| match action {
+            PubsubAction::SendStream {
+                token,
+                peer: sent_peer,
+                stream_id,
+                ..
+            } if sent_peer == peer => Some((*token, *stream_id)),
+            _ => None,
+        })
+        .expect("send action for peer");
+    agent.send_result(peer, stream_id, token, Ok(()), now_ms);
+}
+
 fn ack(agent: &mut GossipsubAgent, peer: &PeerId, actions: &[PubsubAction], now_ms: u64) {
     let (_, token, stream_id) = sent(actions).expect("send action");
     agent.send_result(peer, stream_id, token, Ok(()), now_ms);
@@ -340,6 +366,120 @@ fn unknown_graft_is_ignored_without_amplification() {
 }
 
 #[test]
+fn unannounced_or_excess_graft_is_pruned_immediately() {
+    let config = GossipsubConfig {
+        d: 1,
+        d_low: 1,
+        d_high: 1,
+        ..GossipsubConfig::default()
+    };
+    let mut agent = agent_with(config);
+    agent.subscribe("room", 0).unwrap();
+
+    let first = peer(2);
+    connect(&mut agent, &first, &[MESHSUB_PROTOCOL_ID_V11], 1);
+    let subscription = make_ready(
+        &mut agent,
+        &first,
+        StreamId::new(4),
+        MESHSUB_PROTOCOL_ID_V11,
+        1,
+    );
+    ack(&mut agent, &first, &subscription, 1);
+    drain_actions(&mut agent);
+    inbound_open(&mut agent, &first, StreamId::new(5), 1);
+    remote_subscribe(&mut agent, &first, StreamId::new(5), "room", 1);
+    drain_events(&mut agent);
+    inbound_rpc(
+        &mut agent,
+        &first,
+        StreamId::new(5),
+        Rpc {
+            control: Some(ControlMessage {
+                graft: vec![ControlGraft {
+                    topic_id: Some("room".to_string()),
+                }],
+                ..ControlMessage::default()
+            }),
+            ..Rpc::default()
+        },
+        2,
+    );
+    assert_eq!(agent.mesh_peers("room"), vec![first.clone()]);
+
+    let excess = peer(3);
+    connect(&mut agent, &excess, &[MESHSUB_PROTOCOL_ID_V11], 3);
+    let subscription = make_ready(
+        &mut agent,
+        &excess,
+        StreamId::new(6),
+        MESHSUB_PROTOCOL_ID_V11,
+        3,
+    );
+    ack(&mut agent, &excess, &subscription, 3);
+    drain_actions(&mut agent);
+    inbound_open(&mut agent, &excess, StreamId::new(7), 3);
+    remote_subscribe(&mut agent, &excess, StreamId::new(7), "room", 3);
+    drain_events(&mut agent);
+    inbound_rpc(
+        &mut agent,
+        &excess,
+        StreamId::new(7),
+        Rpc {
+            control: Some(ControlMessage {
+                graft: vec![ControlGraft {
+                    topic_id: Some("room".to_string()),
+                }],
+                ..ControlMessage::default()
+            }),
+            ..Rpc::default()
+        },
+        4,
+    );
+    assert_eq!(agent.mesh_peers("room"), vec![first]);
+    let prune = drain_actions(&mut agent);
+    let control = decode_rpc(&sent(&prune).unwrap().0).control.unwrap();
+    assert_eq!(control.prune.len(), 1);
+
+    let unannounced = peer(4);
+    connect(&mut agent, &unannounced, &[MESHSUB_PROTOCOL_ID_V11], 5);
+    let subscription = make_ready(
+        &mut agent,
+        &unannounced,
+        StreamId::new(8),
+        MESHSUB_PROTOCOL_ID_V11,
+        5,
+    );
+    ack(&mut agent, &unannounced, &subscription, 5);
+    drain_actions(&mut agent);
+    inbound_open(&mut agent, &unannounced, StreamId::new(9), 5);
+    inbound_rpc(
+        &mut agent,
+        &unannounced,
+        StreamId::new(9),
+        Rpc {
+            control: Some(ControlMessage {
+                graft: vec![ControlGraft {
+                    topic_id: Some("room".to_string()),
+                }],
+                ..ControlMessage::default()
+            }),
+            ..Rpc::default()
+        },
+        6,
+    );
+    let prune = drain_actions(&mut agent);
+    assert_eq!(
+        decode_rpc(&sent(&prune).unwrap().0)
+            .control
+            .unwrap()
+            .prune
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn empty_mesh_publish_falls_back_without_grafting() {
     let mut agent = agent();
     agent.subscribe("room", 0).unwrap();
@@ -475,15 +615,18 @@ fn ihave_deduplicates_and_obeys_per_heartbeat_budgets() {
         ..GossipsubConfig::default()
     };
     let mut agent = agent_with(config);
+    agent.subscribe("room", 0).unwrap();
     let remote = peer(2);
     connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
-    make_ready(
+    let subscription = make_ready(
         &mut agent,
         &remote,
         StreamId::new(4),
         MESHSUB_PROTOCOL_ID_V11,
         0,
     );
+    ack(&mut agent, &remote, &subscription, 0);
+    drain_actions(&mut agent);
     inbound_open(&mut agent, &remote, StreamId::new(5), 0);
     let ihave = |ids: Vec<Vec<u8>>| Rpc {
         control: Some(ControlMessage {
@@ -495,6 +638,23 @@ fn ihave_deduplicates_and_obeys_per_heartbeat_budgets() {
         }),
         ..Rpc::default()
     };
+    inbound_rpc(
+        &mut agent,
+        &remote,
+        StreamId::new(5),
+        Rpc {
+            control: Some(ControlMessage {
+                ihave: vec![ControlIHave {
+                    topic_id: Some("other".to_string()),
+                    message_ids: vec![vec![0]],
+                }],
+                ..ControlMessage::default()
+            }),
+            ..Rpc::default()
+        },
+        1,
+    );
+    assert!(drain_actions(&mut agent).is_empty());
     inbound_rpc(
         &mut agent,
         &remote,
@@ -692,22 +852,32 @@ fn valid_message_delivers_once_and_invalid_signature_never_delivers() {
     inbound_open(&mut agent, &remote, StreamId::new(5), 0);
     let signer = keypair(9);
     let valid = RawMessage::build_signed(&signer, "room", b"hello".to_vec(), 1);
+    let mut replay_with_bad_signature = valid.clone();
+    replay_with_bad_signature.signature.as_mut().unwrap()[0] ^= 1;
+    replay_with_bad_signature.raw = Vec::new();
     inbound_rpc(
         &mut agent,
         &remote,
         StreamId::new(5),
         Rpc {
-            publish: vec![valid.clone(), valid],
+            publish: vec![valid, replay_with_bad_signature],
             ..Rpc::default()
         },
         1,
     );
+    let events = drain_events(&mut agent);
     assert_eq!(
-        drain_events(&mut agent)
-            .into_iter()
+        events
+            .iter()
             .filter(|event| matches!(event, PubsubEvent::Message { .. }))
             .count(),
         1
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, PubsubEvent::ProtocolViolation { .. })),
+        "a known replay is discarded before signature verification"
     );
 
     let mut invalid = RawMessage::build_signed(&signer, "room", b"bad".to_vec(), 2);
@@ -737,6 +907,58 @@ fn valid_message_delivers_once_and_invalid_signature_never_delivers() {
 }
 
 #[test]
+fn off_topic_message_is_not_cached_as_seen() {
+    let mut agent = agent();
+    let remote = peer(2);
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+    assert!(
+        make_ready(
+            &mut agent,
+            &remote,
+            StreamId::new(4),
+            MESHSUB_PROTOCOL_ID_V11,
+            0,
+        )
+        .is_empty()
+    );
+    inbound_open(&mut agent, &remote, StreamId::new(5), 0);
+    let message = RawMessage::build_signed(&keypair(9), "room", b"hello".to_vec(), 1);
+    inbound_rpc(
+        &mut agent,
+        &remote,
+        StreamId::new(5),
+        Rpc {
+            publish: vec![message.clone()],
+            ..Rpc::default()
+        },
+        1,
+    );
+    assert!(drain_events(&mut agent).is_empty());
+
+    agent.subscribe("room", 2).unwrap();
+    let subscription = drain_actions(&mut agent);
+    ack(&mut agent, &remote, &subscription, 2);
+    drain_actions(&mut agent);
+    inbound_rpc(
+        &mut agent,
+        &remote,
+        StreamId::new(5),
+        Rpc {
+            publish: vec![message],
+            ..Rpc::default()
+        },
+        3,
+    );
+    assert_eq!(
+        drain_events(&mut agent)
+            .into_iter()
+            .filter(|event| matches!(event, PubsubEvent::Message { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn v11_leave_prune_carries_backoff() {
     let mut agent = agent();
     agent.subscribe("room", 0).unwrap();
@@ -752,6 +974,8 @@ fn v11_leave_prune_carries_backoff() {
     ack(&mut agent, &remote, &subscription, 1);
     drain_actions(&mut agent);
     inbound_open(&mut agent, &remote, StreamId::new(5), 1);
+    remote_subscribe(&mut agent, &remote, StreamId::new(5), "room", 1);
+    drain_events(&mut agent);
     inbound_rpc(
         &mut agent,
         &remote,
@@ -806,4 +1030,245 @@ fn large_subscription_resync_is_split_without_dropping_entries() {
         actions = drain_actions(&mut agent);
     }
     assert_eq!(announced, 80);
+}
+
+#[test]
+fn open_failure_and_establishment_timeout_retry_only_after_stimulus() {
+    let config = GossipsubConfig {
+        heartbeat_interval_ms: 100_000,
+        send_timeout_ms: 10,
+        ..GossipsubConfig::default()
+    };
+    let mut agent = agent_with(config.clone());
+    agent.subscribe("room", 0).unwrap();
+    let remote = peer(2);
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+    let opening = drain_actions(&mut agent);
+    let token = open_for(&opening, &remote).unwrap();
+    agent.stream_open_result(&remote, token, Err("refused".to_string()), 1);
+    assert!(
+        drain_actions(&mut agent).is_empty(),
+        "failure must not spin-retry"
+    );
+    assert!(drain_events(&mut agent).iter().any(|event| matches!(
+        event,
+        PubsubEvent::OutboundFailure { reason, .. } if reason.contains("open failed")
+    )));
+    agent.handle_event(
+        &SwarmEvent::PeerReady {
+            peer_id: remote.clone(),
+            protocols: vec![MESHSUB_PROTOCOL_ID_V11.to_string()],
+        },
+        2,
+    );
+    assert!(open_for(&drain_actions(&mut agent), &remote).is_some());
+
+    let mut agent = agent_with(config);
+    agent.subscribe("room", 0).unwrap();
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+    let opening = drain_actions(&mut agent);
+    let token = open_for(&opening, &remote).unwrap();
+    agent.stream_open_result(&remote, token, Ok(StreamId::new(4)), 0);
+    agent.handle_tick(10);
+    let timeout_actions = drain_actions(&mut agent);
+    assert!(timeout_actions.iter().any(|action| matches!(
+        action,
+        PubsubAction::ResetStream { stream_id, .. } if *stream_id == StreamId::new(4)
+    )));
+    assert!(open_for(&timeout_actions, &remote).is_none());
+    assert!(drain_events(&mut agent).iter().any(|event| matches!(
+        event,
+        PubsubEvent::OutboundFailure { reason, .. }
+            if reason.contains("establishment timed out")
+    )));
+    agent.handle_event(
+        &SwarmEvent::PeerReady {
+            peer_id: remote.clone(),
+            protocols: vec![MESHSUB_PROTOCOL_ID_V11.to_string()],
+        },
+        11,
+    );
+    assert!(open_for(&drain_actions(&mut agent), &remote).is_some());
+}
+
+#[test]
+fn disconnect_and_supersede_aggregate_queued_failures() {
+    let mut agent = agent();
+    agent.subscribe("room", 0).unwrap();
+    let first = peer(2);
+    let second = peer(3);
+    for (remote, outbound, inbound) in [
+        (&first, StreamId::new(4), StreamId::new(5)),
+        (&second, StreamId::new(6), StreamId::new(7)),
+    ] {
+        connect(&mut agent, remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+        let subscription = make_ready(&mut agent, remote, outbound, MESHSUB_PROTOCOL_ID_V11, 0);
+        ack(&mut agent, remote, &subscription, 0);
+        drain_actions(&mut agent);
+        inbound_open(&mut agent, remote, inbound, 0);
+        remote_subscribe(&mut agent, remote, inbound, "room", 0);
+    }
+    drain_events(&mut agent);
+    agent.publish("room", b"queued".to_vec(), 1).unwrap();
+    drain_actions(&mut agent);
+
+    agent.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            peer_id: first.clone(),
+            conn_id: ConnectionId::new(1),
+        },
+        2,
+    );
+    agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            peer_id: second.clone(),
+            conn_id: ConnectionId::new(2),
+        },
+        2,
+    );
+    let failures: Vec<_> = drain_events(&mut agent)
+        .into_iter()
+        .filter_map(|event| match event {
+            PubsubEvent::OutboundFailure { peer, reason } => Some((peer, reason)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failures.len(), 2);
+    assert!(failures.iter().any(|(peer, reason)| {
+        peer == &first && reason.contains("connection closed; dropped 1 queued items")
+    }));
+    assert!(failures.iter().any(|(peer, reason)| {
+        peer == &second && reason.contains("connection superseded; dropped 1 queued items")
+    }));
+}
+
+#[test]
+fn publish_backpressure_is_all_or_nothing_across_mesh_peers() {
+    let config = GossipsubConfig {
+        d: 2,
+        max_pending_per_peer: 1,
+        ..GossipsubConfig::default()
+    };
+    let mut agent = agent_with(config);
+    agent.subscribe("room", 0).unwrap();
+    let first = peer(2);
+    let second = peer(3);
+    for (remote, outbound, inbound) in [
+        (&first, StreamId::new(4), StreamId::new(5)),
+        (&second, StreamId::new(6), StreamId::new(7)),
+    ] {
+        connect(&mut agent, remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+        let subscription = make_ready(&mut agent, remote, outbound, MESHSUB_PROTOCOL_ID_V11, 0);
+        ack(&mut agent, remote, &subscription, 0);
+        drain_actions(&mut agent);
+        inbound_open(&mut agent, remote, inbound, 0);
+        remote_subscribe(&mut agent, remote, inbound, "room", 0);
+    }
+    drain_events(&mut agent);
+    agent.publish("room", b"first".to_vec(), 1).unwrap();
+    let first_publish = drain_actions(&mut agent);
+    ack_peer(&mut agent, &first, &first_publish, 1);
+    drain_actions(&mut agent);
+
+    assert!(agent.publish("room", b"rejected".to_vec(), 2).is_err());
+    assert!(
+        drain_actions(&mut agent).is_empty(),
+        "the peer with capacity must not receive a partial publish"
+    );
+}
+
+#[test]
+fn zero_gossip_degree_emits_no_ihave() {
+    let config = GossipsubConfig {
+        d: 1,
+        d_low: 1,
+        d_high: 2,
+        d_lazy: 0,
+        ..GossipsubConfig::default()
+    };
+    let mut agent = agent_with(config);
+    agent.subscribe("room", 0).unwrap();
+    let mesh_peer = peer(2);
+    let gossip_peer = peer(3);
+    for (remote, outbound, inbound) in [
+        (&mesh_peer, StreamId::new(4), StreamId::new(5)),
+        (&gossip_peer, StreamId::new(6), StreamId::new(7)),
+    ] {
+        connect(&mut agent, remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+        let subscription = make_ready(&mut agent, remote, outbound, MESHSUB_PROTOCOL_ID_V11, 0);
+        ack(&mut agent, remote, &subscription, 0);
+        drain_actions(&mut agent);
+        inbound_open(&mut agent, remote, inbound, 0);
+        remote_subscribe(&mut agent, remote, inbound, "room", 0);
+    }
+    drain_events(&mut agent);
+    inbound_rpc(
+        &mut agent,
+        &mesh_peer,
+        StreamId::new(5),
+        Rpc {
+            control: Some(ControlMessage {
+                graft: vec![ControlGraft {
+                    topic_id: Some("room".to_string()),
+                }],
+                ..ControlMessage::default()
+            }),
+            ..Rpc::default()
+        },
+        1,
+    );
+    agent.publish("room", b"cached".to_vec(), 2).unwrap();
+    let publish = drain_actions(&mut agent);
+    ack_peer(&mut agent, &mesh_peer, &publish, 2);
+    drain_actions(&mut agent);
+    agent.handle_tick(1_000);
+    assert!(drain_actions(&mut agent).is_empty());
+}
+
+#[test]
+fn zero_fanout_ttl_reselects_for_each_publish() {
+    let config = GossipsubConfig {
+        d: 1,
+        fanout_ttl_ms: 0,
+        ..GossipsubConfig::default()
+    };
+    let mut agent = agent_with(config);
+    let first = peer(2);
+    let second = peer(3);
+    for (remote, outbound, inbound) in [
+        (&first, StreamId::new(4), StreamId::new(5)),
+        (&second, StreamId::new(6), StreamId::new(7)),
+    ] {
+        connect(&mut agent, remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+        assert!(make_ready(&mut agent, remote, outbound, MESHSUB_PROTOCOL_ID_V11, 0,).is_empty());
+        inbound_open(&mut agent, remote, inbound, 0);
+        remote_subscribe(&mut agent, remote, inbound, "room", 0);
+    }
+    drain_events(&mut agent);
+
+    agent.publish("room", b"first".to_vec(), 1).unwrap();
+    let sent_first = drain_actions(&mut agent);
+    let selected = sent_first
+        .iter()
+        .find_map(|action| match action {
+            PubsubAction::SendStream { peer, .. } => Some(peer.clone()),
+            _ => None,
+        })
+        .unwrap();
+    ack_peer(&mut agent, &selected, &sent_first, 1);
+    drain_actions(&mut agent);
+
+    agent.publish("room", b"second".to_vec(), 2).unwrap();
+    let sent_second = drain_actions(&mut agent);
+    let reselected = sent_second
+        .iter()
+        .find_map(|action| match action {
+            PubsubAction::SendStream { peer, .. } => Some(peer.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_ne!(
+        reselected, selected,
+        "the fixed RNG seed demonstrates that a zero TTL starts a fresh selection"
+    );
 }
