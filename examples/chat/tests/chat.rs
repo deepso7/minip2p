@@ -188,13 +188,12 @@ fn three_peer_star_chats_end_to_end() {
     let mut alice = Peer::spawn("alice", &["join", &addr, "--nick", "alice", "--no-mesh"]);
     let mut bob = Peer::spawn("bob", &["join", &addr, "--nick", "bob", "--no-mesh"]);
 
-    // --- 3. Subscription handshakes settle, then one heartbeat admits the
-    //        announced peers into each topic mesh. ---
+    // --- 3. Each joiner gates stdin on the host's topic announcement, and
+    //        the hub eagerly admits both leaves before its first heartbeat. ---
     for peer in [&alice, &bob] {
-        peer.wait_line(deadline, |line| line.contains("peer-subscribed"));
+        peer.wait_line(deadline, |line| line.contains("pubsub-ready"));
     }
     host.wait_count(deadline, 2, |line| line.contains("peer-subscribed"));
-    thread::sleep(Duration::from_millis(1_500));
 
     // --- 4. Alice speaks: the host hears it directly, bob hears it
     //        THROUGH the host (they share no connection). ---
@@ -314,10 +313,8 @@ fn three_peer_mesh_survives_host_death() {
             && line.contains(&alice_id)
             && line.contains("minip2p-chat")
     });
-    // Direct connectivity and subscription exchange precede gossipsub's
-    // heartbeat-paced mesh admission. Do not kill the hub until that mesh
-    // has had one full repair cycle.
-    thread::sleep(Duration::from_millis(1_500));
+    // Subscription exchange now performs low-watermark mesh admission, so
+    // direct peers are routable without a heartbeat-sized sleep.
 
     host.kill();
     alice.say("still here");

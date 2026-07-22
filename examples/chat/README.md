@@ -69,12 +69,13 @@ over the relay circuit.
 
 ## Message format
 
-The payload is plain UTF-8, `"<nick>: <text>"`, formatted by the sender and
-interoperable with libp2p gossipsub peers on the same topic. go-libp2p and
-rust-libp2p gossipsub both sign by default and match this stack's StrictSign;
-`--allow-unsigned` is only needed for a peer explicitly configured to emit
-unsigned messages. Seqnos are implementation-defined opaque bytes (go: 8
-big-endian, rust: 20 random); anything 1..=64 bytes is accepted.
+The payload is plain UTF-8, `"<nick>: <text>"`, formatted by the sender. This
+stack uses libp2p StrictSign; configure other gossipsub peers for signed
+message authenticity and strict validation. `--allow-unsigned` is only needed
+when the remote intentionally emits unsigned messages. Seqnos are opaque:
+minip2p, go-libp2p gossipsub, and signed rust-libp2p gossipsub currently emit
+8-byte big-endian counters, while this implementation accepts any 1..=64-byte
+value.
 
 A quiet room generates no traffic, and the QUIC transport drops
 connections after 30 s of silence — the chat loop pings every connected
@@ -109,11 +110,13 @@ Two deployment details surfaced during live validation:
    report subscriptions and exchange messages while `path=relayed`; cutting
    the relay must disconnect the room. Remove `--relay-only` from both peers
    in a second run to validate the relayed → direct-punched upgrade.
-3. **go-libp2p interop**: an Ed25519 go peer using
-   `pubsub.NewGossipSub` on the same topic chats both ways in strict mode.
-4. **rust-libp2p interop**: a rust-libp2p gossipsub peer using its signed
-   default message-authenticity mode. The rust peer must include a `ping`
-   behaviour (to answer this side's keepalives) or raise its
-   `idle_connection_timeout` — by default rust-libp2p closes a
-   connection after 10 s when no behaviour keeps it alive, which reads
-   as an instant disconnect here.
+3. **Manual go-libp2p interop check (not covered by CI)**: configure an
+   Ed25519 go peer using `pubsub.NewGossipSub` for strict signing on the same
+   topic, then verify messages travel in both directions.
+4. **Manual rust-libp2p interop check (not covered by CI)**: configure a
+   rust-libp2p gossipsub peer with `MessageAuthenticity::Signed` and strict
+   validation, then verify messages travel in both directions. The rust peer
+   must include a `ping` behaviour (to answer this side's keepalives) or raise
+   its `idle_connection_timeout` — by default rust-libp2p closes a connection
+   after 10 s when no behaviour keeps it alive, which reads as an instant
+   disconnect here.

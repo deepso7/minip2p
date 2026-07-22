@@ -1096,15 +1096,17 @@ impl GossipsubAgent {
     }
 
     fn process_rpc(&mut self, peer: &PeerId, stream_id: StreamId, rpc: Rpc, now_ms: u64) -> bool {
-        if !self.apply_subscriptions(peer, stream_id, &rpc.subscriptions) {
+        let Some(added_topics) = self.apply_subscriptions(peer, stream_id, &rpc.subscriptions)
+        else {
             return false;
-        }
+        };
         for message in rpc.publish {
             self.process_message(peer, message, now_ms);
         }
         if let Some(control) = rpc.control {
             self.process_control(peer, control, now_ms);
         }
+        self.graft_new_subscriptions(peer, added_topics, now_ms);
         self.drive_sender(peer, now_ms);
         true
     }
@@ -1114,12 +1116,12 @@ impl GossipsubAgent {
         peer: &PeerId,
         stream_id: StreamId,
         subscriptions: &[SubOpts],
-    ) -> bool {
+    ) -> Option<Vec<String>> {
         if subscriptions.is_empty() {
-            return true;
+            return Some(Vec::new());
         }
         let Some(state) = self.peers.get_mut(peer) else {
-            return true;
+            return Some(Vec::new());
         };
         let mut candidate = state.remote_topics.clone();
         let mut invalid = false;
@@ -1139,7 +1141,7 @@ impl GossipsubAgent {
         }
         if candidate.len() > self.config.max_topics_per_peer {
             self.violation_reset(peer, stream_id, "subscription set exceeds the bound");
-            return false;
+            return None;
         }
         let added: Vec<String> = candidate
             .difference(&state.remote_topics)
@@ -1157,10 +1159,10 @@ impl GossipsubAgent {
                 reason: "subscription entries with invalid topics skipped".to_string(),
             });
         }
-        for topic in added {
+        for topic in &added {
             self.events.push_back(PubsubEvent::PeerSubscribed {
                 peer: peer.clone(),
-                topic,
+                topic: topic.clone(),
             });
         }
         for topic in removed {
@@ -1175,7 +1177,21 @@ impl GossipsubAgent {
                 topic,
             });
         }
-        true
+        Some(added)
+    }
+
+    fn graft_new_subscriptions(&mut self, peer: &PeerId, topics: Vec<String>, now_ms: u64) {
+        for topic in topics {
+            let should_graft = self.topics.contains(&topic)
+                && self
+                    .mesh
+                    .get(&topic)
+                    .is_none_or(|mesh| mesh.len() < self.config.d_low && !mesh.contains(peer))
+                && self.peer_is_eligible(peer, &topic, now_ms);
+            if should_graft && self.queue_control(peer, ControlItem::Graft(topic.clone()), now_ms) {
+                self.mesh.entry(topic).or_default().insert(peer.clone());
+            }
+        }
     }
 
     fn process_control(&mut self, peer: &PeerId, control: ControlMessage, now_ms: u64) {

@@ -93,13 +93,6 @@ fn saw_subscription(events: &[PubsubEvent], topic: &str) -> bool {
         .any(|e| matches!(e, PubsubEvent::PeerSubscribed { topic: got, .. } if got == topic))
 }
 
-fn drive_for(endpoints: &mut [&mut Endpoint], duration: Duration) {
-    let until = Instant::now() + duration;
-    while Instant::now() < until {
-        let _ = drive(endpoints);
-    }
-}
-
 #[test]
 fn two_endpoints_exchange_messages_over_real_quic() {
     let mut a = pubsub_endpoint();
@@ -160,13 +153,6 @@ fn star_center_forwards_between_leaves() {
                 && saw_subscription(&all[1], TOPIC)
                 && saw_subscription(&all[2], TOPIC)
         },
-    );
-
-    // Gossipsub admits newly discovered topic peers on heartbeat. Let the
-    // star form before asserting leaf-to-leaf forwarding through the hub.
-    drive_for(
-        &mut [&mut hub, &mut alice, &mut bob],
-        Duration::from_millis(1_100),
     );
 
     // Alice's message reaches bob THROUGH the hub (they are not connected),
