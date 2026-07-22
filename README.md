@@ -72,7 +72,7 @@ Current validated behavior:
 - Ping round-trips with RTT measurement; identify exchange with observed-address plumbing.
 - End-to-end stack via `minip2p::Endpoint`: QUIC + multistream-select + identify + ping + registered app protocols through one facade.
 - NAT traversal live-validated end-to-end: relay reservation, circuit connect, DCUtR hole punch between two real NATs (home network ↔ mobile hotspot through a public relay), with explicit path events throughout.
-- Pubsub is covered by real-QUIC loopback tests under the default gossipsub engine and explicit floodsub selection; floodsub also retains its prior live go-libp2p and rust-libp2p wire validation.
+- Gossipsub live-validated: signed interop both ways with real go-libp2p (`NewGossipSub`, v0.15.0) and rust-libp2p (gossipsub 0.49.5) peers over QUIC, a relay-only room through a public relay, and a relayed → direct-punched upgrade with the mesh surviving the connection supersede; floodsub retains its prior live wire validation and explicit-selection regression tests.
 - Pubsub peer discovery live-validated across a public host, home NAT, and mobile hotspot: automatic mesh formation, one-sided dial initiation, address updates, graceful punch-failure degradation, and leaf-to-leaf chat survival after host death.
 
 ## Architecture boundaries
