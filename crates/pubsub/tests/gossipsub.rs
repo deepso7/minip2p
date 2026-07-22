@@ -912,6 +912,212 @@ fn stream_reopen_resyncs_an_acked_unsubscribe() {
 }
 
 #[test]
+fn disconnect_preserves_backoff_and_supersede_reannounces_subscriptions() {
+    let mut agent = agent();
+    agent.subscribe("room", 0).unwrap();
+    let remote = peer(2);
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+    let subscription = make_ready(
+        &mut agent,
+        &remote,
+        StreamId::new(4),
+        MESHSUB_PROTOCOL_ID_V11,
+        0,
+    );
+    ack(&mut agent, &remote, &subscription, 0);
+    drain_actions(&mut agent);
+    inbound_open(&mut agent, &remote, StreamId::new(5), 0);
+    remote_subscribe(&mut agent, &remote, StreamId::new(5), "room", 1);
+    drain_events(&mut agent);
+    let graft = drain_actions(&mut agent);
+    ack(&mut agent, &remote, &graft, 1);
+    drain_actions(&mut agent);
+
+    inbound_rpc(
+        &mut agent,
+        &remote,
+        StreamId::new(5),
+        Rpc {
+            control: Some(ControlMessage {
+                prune: vec![ControlPrune {
+                    topic_id: Some("room".to_string()),
+                    peers: Vec::new(),
+                    backoff: Some(120),
+                }],
+                ..ControlMessage::default()
+            }),
+            ..Rpc::default()
+        },
+        2,
+    );
+    assert!(agent.mesh_peers("room").is_empty());
+
+    agent.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            peer_id: remote.clone(),
+            conn_id: ConnectionId::new(1),
+        },
+        3,
+    );
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 4);
+    let reconnected = make_ready(
+        &mut agent,
+        &remote,
+        StreamId::new(8),
+        MESHSUB_PROTOCOL_ID_V11,
+        4,
+    );
+    let rpc = decode_rpc(
+        &sent(&reconnected)
+            .expect("reconnect subscription snapshot")
+            .0,
+    );
+    assert_eq!(rpc.subscriptions.len(), 1);
+    assert_eq!(rpc.subscriptions[0].subscribe, Some(true));
+    assert_eq!(rpc.subscriptions[0].topic_id.as_deref(), Some("room"));
+    ack(&mut agent, &remote, &reconnected, 4);
+    drain_actions(&mut agent);
+    inbound_open(&mut agent, &remote, StreamId::new(9), 4);
+    remote_subscribe(&mut agent, &remote, StreamId::new(9), "room", 5);
+    assert!(
+        agent.mesh_peers("room").is_empty(),
+        "disconnect must not erase the peer's topic backoff"
+    );
+    assert!(drain_actions(&mut agent).is_empty());
+
+    agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            peer_id: remote.clone(),
+            conn_id: ConnectionId::new(2),
+        },
+        6,
+    );
+    agent.handle_event(
+        &SwarmEvent::PeerReady {
+            peer_id: remote.clone(),
+            protocols: vec![MESHSUB_PROTOCOL_ID_V11.to_string()],
+        },
+        6,
+    );
+    let superseded = make_ready(
+        &mut agent,
+        &remote,
+        StreamId::new(12),
+        MESHSUB_PROTOCOL_ID_V11,
+        6,
+    );
+    let rpc = decode_rpc(
+        &sent(&superseded)
+            .expect("supersede subscription snapshot")
+            .0,
+    );
+    assert_eq!(rpc.subscriptions.len(), 1);
+    assert_eq!(rpc.subscriptions[0].subscribe, Some(true));
+    assert_eq!(rpc.subscriptions[0].topic_id.as_deref(), Some("room"));
+    ack(&mut agent, &remote, &superseded, 6);
+    drain_actions(&mut agent);
+    inbound_open(&mut agent, &remote, StreamId::new(13), 6);
+    remote_subscribe(&mut agent, &remote, StreamId::new(13), "room", 7);
+    assert!(
+        agent.mesh_peers("room").is_empty(),
+        "supersede must rebuild peer state without erasing backoff"
+    );
+    assert!(drain_actions(&mut agent).is_empty());
+}
+
+#[test]
+fn queued_prune_reencodes_for_v10_after_stream_reopen() {
+    let mut agent = agent();
+    agent.subscribe("room", 0).unwrap();
+    let remote = peer(2);
+    connect(
+        &mut agent,
+        &remote,
+        &[MESHSUB_PROTOCOL_ID_V11, MESHSUB_PROTOCOL_ID_V10],
+        0,
+    );
+    let subscription = make_ready(
+        &mut agent,
+        &remote,
+        StreamId::new(4),
+        MESHSUB_PROTOCOL_ID_V11,
+        0,
+    );
+    ack(&mut agent, &remote, &subscription, 0);
+    drain_actions(&mut agent);
+    inbound_open(&mut agent, &remote, StreamId::new(5), 0);
+    remote_subscribe(&mut agent, &remote, StreamId::new(5), "room", 1);
+    drain_events(&mut agent);
+    let graft = drain_actions(&mut agent);
+    ack(&mut agent, &remote, &graft, 1);
+    drain_actions(&mut agent);
+
+    agent.unsubscribe("room", 2);
+    let unsubscribe = drain_actions(&mut agent);
+    ack(&mut agent, &remote, &unsubscribe, 2);
+    let v11_prune = drain_actions(&mut agent);
+    assert_eq!(
+        decode_rpc(&sent(&v11_prune).expect("v1.1 PRUNE in flight").0)
+            .control
+            .expect("control frame")
+            .prune[0]
+            .backoff,
+        Some(10)
+    );
+
+    agent.handle_event(
+        &SwarmEvent::StreamClosed {
+            peer_id: remote.clone(),
+            conn_id: ConnectionId::new(1),
+            stream_id: StreamId::new(4),
+        },
+        3,
+    );
+    agent.handle_event(
+        &SwarmEvent::PeerReady {
+            peer_id: remote.clone(),
+            protocols: vec![MESHSUB_PROTOCOL_ID_V10.to_string()],
+        },
+        4,
+    );
+    let opening = drain_actions(&mut agent);
+    let token = opening
+        .iter()
+        .find_map(|action| match action {
+            PubsubAction::OpenStream {
+                token, protocol_id, ..
+            } if protocol_id == MESHSUB_PROTOCOL_ID_V10 => Some(*token),
+            _ => None,
+        })
+        .expect("reopen requests meshsub 1.0");
+    let stream = StreamId::new(8);
+    agent.stream_open_result(&remote, token, Ok(stream), 4);
+    agent.handle_event(
+        &SwarmEvent::StreamReady {
+            peer_id: remote.clone(),
+            conn_id: ConnectionId::new(1),
+            stream_id: stream,
+            protocol_id: MESHSUB_PROTOCOL_ID_V10.to_string(),
+            initiated_locally: true,
+        },
+        4,
+    );
+    let resync = drain_actions(&mut agent);
+    let rpc = decode_rpc(&sent(&resync).expect("unsubscribe resync").0);
+    assert_eq!(rpc.subscriptions.len(), 1);
+    assert_eq!(rpc.subscriptions[0].subscribe, Some(false));
+    ack(&mut agent, &remote, &resync, 4);
+
+    let v10_prune = drain_actions(&mut agent);
+    let prune = &decode_rpc(&sent(&v10_prune).expect("re-encoded PRUNE").0)
+        .control
+        .expect("control frame")
+        .prune[0];
+    assert_eq!(prune.topic_id.as_deref(), Some("room"));
+    assert_eq!(prune.backoff, None);
+}
+
+#[test]
 fn valid_message_delivers_once_and_invalid_signature_never_delivers() {
     let mut agent = agent();
     agent.subscribe("room", 0).unwrap();
