@@ -119,6 +119,7 @@ impl PubsubDriver {
                 self.agent.stream_open_result(&peer, token, result, now_ms);
             }
             PubsubAction::SendStream {
+                token,
                 peer,
                 stream_id,
                 data,
@@ -126,11 +127,12 @@ impl PubsubDriver {
                 // A synchronously rejected write must reach the agent:
                 // otherwise the stream's eventual close would commit work
                 // whose frame was never accepted.
-                if let Err(e) = swarm.send_stream(&peer, stream_id, data) {
-                    let now_ms = self.now_ms();
-                    self.agent
-                        .send_failed(&peer, stream_id, &e.to_string(), now_ms);
-                }
+                let result = swarm
+                    .send_stream(&peer, stream_id, data)
+                    .map_err(|e| e.to_string());
+                let now_ms = self.now_ms();
+                self.agent
+                    .send_result(&peer, stream_id, token, result, now_ms);
             }
             // A failed half-close after an accepted write is left to the
             // send deadline / close machinery: the frame may well have

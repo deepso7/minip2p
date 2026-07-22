@@ -3,8 +3,16 @@
 use alloc::collections::{BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
-/// A message's dedup identity: (`from` bytes, `seqno` bytes).
-pub(crate) type MessageId = (Vec<u8>, Vec<u8>);
+/// A message's wire-compatible dedup identity: publisher bytes followed by
+/// sequence-number bytes, matching the default gossipsub message-id rule.
+pub(crate) type MessageId = Vec<u8>;
+
+pub(crate) fn message_id(from: &[u8], seqno: &[u8]) -> MessageId {
+    let mut id = Vec::with_capacity(from.len() + seqno.len());
+    id.extend_from_slice(from);
+    id.extend_from_slice(seqno);
+    id
+}
 
 /// Dedup cache for message ids.
 ///

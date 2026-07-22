@@ -362,6 +362,24 @@ impl RawMessage {
         Ok(message)
     }
 
+    /// Parses only the fields needed for the default dedup id. Routers use
+    /// this cheap path to discard known replays before signature verification;
+    /// unseen messages still pass through [`Self::verify`] before acceptance.
+    pub(crate) fn source_and_seqno(&self) -> Result<(PeerId, Vec<u8>), MessageVerifyError> {
+        let from_bytes = self
+            .from
+            .as_deref()
+            .ok_or(MessageVerifyError::MissingFrom)?;
+        let from = PeerId::from_bytes(from_bytes).map_err(|_| MessageVerifyError::InvalidFrom)?;
+        let seqno = self
+            .seqno
+            .as_deref()
+            .filter(|seqno| !seqno.is_empty() && seqno.len() <= MAX_SEQNO_LEN)
+            .ok_or(MessageVerifyError::InvalidSeqno)?
+            .to_vec();
+        Ok((from, seqno))
+    }
+
     /// Verifies this message per StrictSign and returns its publisher,
     /// dedup seqno bytes, and whether it carried a verified signature.
     ///
@@ -380,19 +398,7 @@ impl RawMessage {
         &self,
         allow_unsigned: bool,
     ) -> Result<(PeerId, Vec<u8>, bool), MessageVerifyError> {
-        let from_bytes = self
-            .from
-            .as_deref()
-            .ok_or(MessageVerifyError::MissingFrom)?;
-        let from = PeerId::from_bytes(from_bytes).map_err(|_| MessageVerifyError::InvalidFrom)?;
-        let seqno_bytes = self
-            .seqno
-            .as_deref()
-            .ok_or(MessageVerifyError::InvalidSeqno)?;
-        if seqno_bytes.is_empty() || seqno_bytes.len() > MAX_SEQNO_LEN {
-            return Err(MessageVerifyError::InvalidSeqno);
-        }
-        let seqno = seqno_bytes.to_vec();
+        let (from, seqno) = self.source_and_seqno()?;
 
         let Some(signature) = self.signature.as_deref() else {
             if self.key.is_some() {

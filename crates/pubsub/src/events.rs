@@ -7,8 +7,7 @@ use alloc::vec::Vec;
 use minip2p_core::PeerId;
 use minip2p_transport::StreamId;
 
-/// Correlates a [`PubsubAction::OpenStream`] with its
-/// [`FloodsubAgent::stream_open_result`](crate::FloodsubAgent::stream_open_result) echo.
+/// Correlates an outbound open or write with its agent result echo.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PubsubToken(pub(crate) u64);
 
@@ -23,11 +22,15 @@ pub enum PubsubAction {
         token: PubsubToken,
         /// The peer to open toward.
         peer: PeerId,
-        /// Always [`FLOODSUB_PROTOCOL_ID`](crate::FLOODSUB_PROTOCOL_ID).
+        /// Engine-selected protocol id: floodsub or a meshsub version.
         protocol_id: String,
     },
-    /// Call `Swarm::send_stream(&peer, stream_id, data)`. Fire-and-forget.
+    /// Call `Swarm::send_stream(&peer, stream_id, data)` and synchronously
+    /// echo its result through `send_result`.
     SendStream {
+        /// Token the host echoes through `send_result` after attempting the
+        /// synchronous write.
+        token: PubsubToken,
         /// The stream's peer.
         peer: PeerId,
         /// The stream to write to.
@@ -83,10 +86,10 @@ pub enum PubsubEvent {
         /// The topic it unsubscribed from.
         topic: String,
     },
-    /// Already-accepted outbound work was discarded: per item for open
-    /// failures, send timeouts, and streams closed before the frame went
-    /// out; one aggregated event per peer when a disconnect or supersede
-    /// drops the queue (the reason names the dropped count).
+    /// Outbound work that never reached an accepted stream write was
+    /// discarded: per item for establishment failures/timeouts, or one
+    /// aggregate when a disconnect/supersede drops queued work. An accepted
+    /// write is committed; later delivery cannot be observed here.
     OutboundFailure {
         /// The peer the work was addressed to.
         peer: PeerId,
@@ -114,9 +117,8 @@ pub enum TopicError {
     /// Topics are bounded by [`MAX_TOPIC_LEN`](crate::MAX_TOPIC_LEN) bytes.
     #[error("topic exceeds the maximum length")]
     TooLong,
-    /// Adding this topic would make the encoded subscription snapshot
-    /// exceed half of [`MAX_RPC_SIZE`](crate::MAX_RPC_SIZE) — the bound
-    /// that keeps every snapshot/diff RPC inside one legal frame.
+    /// Floodsub only: adding this topic would make its single-frame encoded
+    /// subscription snapshot exceed half of [`MAX_RPC_SIZE`](crate::MAX_RPC_SIZE).
     #[error("the subscription set would no longer fit in one RPC")]
     SetTooLarge,
 }

@@ -10,8 +10,12 @@ use minip2p_identify::{IdentifyConfig, IdentifyInput, IdentifyMessage, IdentifyP
 use minip2p_identity::{KeyType, PublicKey};
 use minip2p_multistream_select::{MultistreamInput, MultistreamSelect};
 use minip2p_noise::{NoiseConfig, NoiseHandshakePayload, NoiseInput, NoiseRole, NoiseSession};
-use minip2p_pubsub::{FrameDecode as PubsubFrame, RawMessage, Rpc};
+use minip2p_pubsub::{
+    FrameDecode as PubsubFrame, GossipsubAgent, GossipsubConfig, MESHSUB_PROTOCOL_ID_V11,
+    RawMessage, Rpc,
+};
 use minip2p_relay::{FrameDecode as RelayFrame, HopMessage, StopMessage};
+use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
 };
@@ -58,6 +62,49 @@ fn fuzz_pubsub(data: &[u8]) {
         let _ = message.verify(false);
         let _ = message.verify(true);
     }
+
+    // Exercise the bounded incremental framing and RPC/control processing
+    // paths after a valid meshsub connection setup.
+    let identity = minip2p_identity::Ed25519Keypair::from_secret_key_bytes([11; 32]);
+    let remote = fuzz_peer_id();
+    let stream_id = StreamId::new(1);
+    let mut agent = GossipsubAgent::new(identity, GossipsubConfig::default(), 1, 7);
+    let _ = agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            peer_id: remote.clone(),
+            conn_id: ConnectionId::new(1),
+        },
+        0,
+    );
+    let _ = agent.handle_event(
+        &SwarmEvent::PeerReady {
+            peer_id: remote.clone(),
+            protocols: vec![MESHSUB_PROTOCOL_ID_V11.to_string()],
+        },
+        0,
+    );
+    let _ = agent.handle_event(
+        &SwarmEvent::StreamReady {
+            peer_id: remote.clone(),
+            conn_id: ConnectionId::new(1),
+            stream_id,
+            protocol_id: MESHSUB_PROTOCOL_ID_V11.to_string(),
+            initiated_locally: false,
+        },
+        0,
+    );
+    let _ = agent.handle_event(
+        &SwarmEvent::StreamData {
+            peer_id: remote,
+            conn_id: ConnectionId::new(1),
+            stream_id,
+            data: data.to_vec(),
+        },
+        1,
+    );
+    agent.handle_tick(1_000);
+    while agent.poll_action().is_some() {}
+    while agent.poll_event().is_some() {}
 }
 
 /// Feeds the input to both negotiation roles so `decode_message` and the

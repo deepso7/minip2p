@@ -314,6 +314,7 @@ dependencies = [
  "minip2p-noise",
  "minip2p-pubsub",
  "minip2p-relay",
+ "minip2p-swarm",
  "minip2p-transport",
  "minip2p-yamux",
 ]
