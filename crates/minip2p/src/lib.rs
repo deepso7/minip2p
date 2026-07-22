@@ -1260,14 +1260,22 @@ fn build_endpoint(parts: BuilderParts, transport: QuicEndpoint) -> Result<Endpoi
         .pubsub_config
         .map(|config| -> Result<pubsub::PubsubDriver, Error> {
             // Message ids are (from, seqno); a wall-clock seed keeps restarts
-            // from reusing ids the network may still remember. Fold both halves
-            // of the timestamp into the deterministic peer-selection seed.
+            // from reusing ids the network may still remember. Mix the local
+            // identity into the peer-selection seed so endpoints created in the
+            // same clock tick do not walk the same deterministic sequence.
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_nanos())
                 .unwrap_or(0);
             let initial_seqno = timestamp as u64;
-            let entropy_seed = initial_seqno ^ (timestamp >> 64) as u64;
+            let entropy_seed = parts
+                .keypair
+                .peer_id()
+                .digest_bytes()
+                .iter()
+                .fold(initial_seqno ^ (timestamp >> 64) as u64, |seed, byte| {
+                    seed.rotate_left(5) ^ u64::from(*byte)
+                });
             let agent = minip2p_pubsub::PubsubAgent::new(
                 parts.keypair.clone(),
                 config,
