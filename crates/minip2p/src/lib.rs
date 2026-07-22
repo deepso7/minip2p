@@ -5,6 +5,11 @@
 //! Sans-I/O / `no_std + alloc` surface, while [`Endpoint`] gives applications a
 //! small batteries-included API for identity, QUIC, listen/dial, ping, and
 //! event polling.
+//!
+//! With the `pubsub` feature, `EndpointBuilder::pubsub` selects gossipsub by
+//! default. `EndpointBuilder::pubsub_config` accepts either a
+//! `GossipsubConfig` or `FloodsubConfig`; the selected engine controls which
+//! pubsub protocol ids are advertised.
 
 #[cfg(feature = "discovery")]
 mod discovery;
@@ -29,7 +34,9 @@ pub use minip2p_nat::{
 };
 #[cfg(feature = "pubsub")]
 pub use minip2p_pubsub::{
-    FLOODSUB_PROTOCOL_ID, FloodsubConfig, PublishError, PubsubEvent, TopicError,
+    FLOODSUB_PROTOCOL_ID, FloodsubConfig, GossipsubConfig, MESHSUB_PROTOCOL_ID_V10,
+    MESHSUB_PROTOCOL_ID_V11, PublishError, PubsubConfig, PubsubConfigError, PubsubEvent,
+    TopicError,
 };
 pub use minip2p_quic::QuicLimits;
 use minip2p_quic::{QuicEndpoint, QuicNodeConfig};
@@ -732,7 +739,8 @@ impl Endpoint {
     }
 
     /// Subscribes to a pubsub topic. Returns `Ok(false)` when already
-    /// subscribed. The subscription is announced to every floodsub peer.
+    /// subscribed. The subscription is announced through the configured
+    /// pubsub routing engine.
     ///
     /// Errors with [`PubsubError::NotEnabled`] unless the endpoint was
     /// built with [`EndpointBuilder::pubsub`].
@@ -770,8 +778,8 @@ impl Endpoint {
         Ok(removed)
     }
 
-    /// Publishes `data` on `topic`, signed with this endpoint's identity
-    /// and flooded to every subscribed peer.
+    /// Publishes `data` on `topic`, signed with this endpoint's identity and
+    /// routed through the configured pubsub engine.
     ///
     /// A successful return means the message was accepted and its outbound
     /// streams were initiated — the frames themselves go out as the
@@ -959,9 +967,7 @@ pub struct EndpointBuilder {
     #[cfg(feature = "nat")]
     autonat_servers: Vec<PeerAddr>,
     #[cfg(feature = "pubsub")]
-    pubsub_enabled: bool,
-    #[cfg(feature = "pubsub")]
-    pubsub_config: Option<FloodsubConfig>,
+    pubsub_config: Option<PubsubConfig>,
     #[cfg(feature = "discovery")]
     discovery_config: Option<DiscoveryConfig>,
 }
@@ -980,8 +986,6 @@ impl Default for EndpointBuilder {
             #[cfg(feature = "nat")]
             autonat_servers: Vec::new(),
             #[cfg(feature = "pubsub")]
-            pubsub_enabled: false,
-            #[cfg(feature = "pubsub")]
             pubsub_config: None,
             #[cfg(feature = "discovery")]
             discovery_config: None,
@@ -998,7 +1002,7 @@ struct BuilderParts {
     #[cfg(feature = "nat")]
     nat_config: Option<NatConfig>,
     #[cfg(feature = "pubsub")]
-    pubsub_config: Option<FloodsubConfig>,
+    pubsub_config: Option<PubsubConfig>,
     #[cfg(feature = "discovery")]
     discovery_config: Option<DiscoveryConfig>,
 }
@@ -1061,23 +1065,26 @@ impl EndpointBuilder {
         self
     }
 
-    /// Enables floodsub pubsub with the default configuration.
+    /// Enables pubsub with the default gossipsub configuration.
     ///
     /// Builder-time opt-in (rather than a lazy `subscribe`-time enable)
-    /// because `/floodsub/1.0.0` must be in Identify's advertised protocol
-    /// set from the first handshake — peers only open pubsub streams to
-    /// endpoints that advertise it.
+    /// because the selected engine's protocol ids must be in Identify's
+    /// advertised set from the first handshake.
     #[cfg(feature = "pubsub")]
     pub fn pubsub(mut self) -> Self {
-        self.pubsub_enabled = true;
+        self.pubsub_config.get_or_insert_with(PubsubConfig::default);
         self
     }
 
-    /// Enables floodsub pubsub with an explicit configuration.
+    /// Enables pubsub with an explicit gossipsub or floodsub configuration.
+    ///
+    /// [`GossipsubConfig`] and [`FloodsubConfig`] both convert into
+    /// [`PubsubConfig`]. The selected engine determines which protocol ids
+    /// the endpoint advertises. Invalid gossipsub relationships or zero
+    /// bounds fail the later `bind_quic*` call before a socket is allocated.
     #[cfg(feature = "pubsub")]
-    pub fn pubsub_config(mut self, config: FloodsubConfig) -> Self {
-        self.pubsub_enabled = true;
-        self.pubsub_config = Some(config);
+    pub fn pubsub_config(mut self, config: impl Into<PubsubConfig>) -> Self {
+        self.pubsub_config = Some(config.into());
         self
     }
 
@@ -1088,7 +1095,7 @@ impl EndpointBuilder {
     /// subscription events are consumed before reaching the application.
     #[cfg(feature = "discovery")]
     pub fn discovery(mut self) -> Self {
-        self.pubsub_enabled = true;
+        self.pubsub_config.get_or_insert_with(PubsubConfig::default);
         self.discovery_config = Some(DiscoveryConfig::default());
         self
     }
@@ -1105,7 +1112,7 @@ impl EndpointBuilder {
         config: DiscoveryConfig,
     ) -> Result<Self, DiscoveryConfigError> {
         config.validate()?;
-        self.pubsub_enabled = true;
+        self.pubsub_config.get_or_insert_with(PubsubConfig::default);
         self.discovery_config = Some(config);
         Ok(self)
     }
@@ -1153,6 +1160,14 @@ impl EndpointBuilder {
             }
             .into());
         }
+        #[cfg(feature = "pubsub")]
+        if let Some(config) = &self.pubsub_config {
+            config
+                .validate()
+                .map_err(|error| TransportError::InvalidConfig {
+                    reason: error.to_string(),
+                })?;
+        }
         #[cfg(feature = "nat")]
         let nat_config = {
             let enabled = self.nat_config.is_some()
@@ -1183,9 +1198,7 @@ impl EndpointBuilder {
             #[cfg(feature = "nat")]
             nat_config,
             #[cfg(feature = "pubsub")]
-            pubsub_config: self
-                .pubsub_enabled
-                .then(|| self.pubsub_config.unwrap_or_default()),
+            pubsub_config: self.pubsub_config,
             #[cfg(feature = "discovery")]
             discovery_config: self.discovery_config,
         })
@@ -1214,12 +1227,14 @@ fn build_endpoint(parts: BuilderParts, transport: QuicEndpoint) -> Result<Endpoi
         }
     }
     #[cfg(feature = "pubsub")]
-    if parts.pubsub_config.is_some() {
-        // Floodsub streams route as an ordinary user protocol, and the id
-        // must be advertised by Identify from the first handshake.
-        let id = FLOODSUB_PROTOCOL_ID;
-        if !protocols.iter().any(|existing| existing == id) {
-            protocols.push(id.to_string());
+    if let Some(config) = &parts.pubsub_config {
+        // Pubsub streams route as ordinary user protocols, and the selected
+        // engine's ids must be advertised by Identify from the first
+        // handshake.
+        for id in config.protocol_ids() {
+            if !protocols.iter().any(|existing| existing == id) {
+                protocols.push((*id).to_string());
+            }
         }
     }
     for protocol in protocols {
@@ -1241,17 +1256,30 @@ fn build_endpoint(parts: BuilderParts, transport: QuicEndpoint) -> Result<Endpoi
     #[cfg(feature = "discovery")]
     let discovery_config = parts.discovery_config;
     #[cfg(feature = "pubsub")]
-    let pubsub = parts.pubsub_config.map(|config| {
-        // Message ids are (from, seqno); a wall-clock seed keeps restarts
-        // from reusing ids the network may still remember.
-        let initial_seqno = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        let agent =
-            minip2p_pubsub::FloodsubAgent::new(parts.keypair.clone(), config, initial_seqno);
-        pubsub::PubsubDriver::new(agent)
-    });
+    let pubsub = parts
+        .pubsub_config
+        .map(|config| -> Result<pubsub::PubsubDriver, Error> {
+            // Message ids are (from, seqno); a wall-clock seed keeps restarts
+            // from reusing ids the network may still remember. Fold both halves
+            // of the timestamp into the deterministic peer-selection seed.
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            let initial_seqno = timestamp as u64;
+            let entropy_seed = initial_seqno ^ (timestamp >> 64) as u64;
+            let agent = minip2p_pubsub::PubsubAgent::new(
+                parts.keypair.clone(),
+                config,
+                initial_seqno,
+                entropy_seed,
+            )
+            .map_err(|error| TransportError::InvalidConfig {
+                reason: error.to_string(),
+            })?;
+            Ok(pubsub::PubsubDriver::new(agent))
+        })
+        .transpose()?;
     #[cfg(feature = "discovery")]
     let mut pubsub = pubsub;
     #[cfg(feature = "discovery")]

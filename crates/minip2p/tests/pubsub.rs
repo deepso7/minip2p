@@ -1,12 +1,14 @@
 //! Loopback e2e for the `pubsub` feature: real QUIC endpoints exchanging
-//! floodsub RPCs. Agent-level edge cases live in `crates/pubsub/tests`;
-//! these prove the facade wiring (driver, event interception, API).
+//! pubsub RPCs. Agent-level edge cases live in `crates/pubsub/tests`; these
+//! prove default gossipsub and explicit floodsub facade wiring.
 
 #![cfg(feature = "pubsub")]
 
 use std::time::{Duration, Instant};
 
-use minip2p::{Endpoint, Event, PubsubError, PubsubEvent};
+use minip2p::{
+    Endpoint, Event, FloodsubConfig, GossipsubConfig, PubsubError, PubsubEvent, TransportError,
+};
 
 #[cfg(feature = "nat")]
 #[path = "../../../tests/support/relay.rs"]
@@ -21,8 +23,24 @@ fn pubsub_endpoint() -> Endpoint {
         .expect("bind loopback endpoint")
 }
 
+fn floodsub_endpoint() -> Endpoint {
+    Endpoint::builder()
+        .pubsub_config(FloodsubConfig::default())
+        .bind_quic("127.0.0.1:0")
+        .expect("bind loopback floodsub endpoint")
+}
+
+fn is_pubsub_protocol(protocol_id: &str) -> bool {
+    matches!(
+        protocol_id,
+        minip2p::FLOODSUB_PROTOCOL_ID
+            | minip2p::MESHSUB_PROTOCOL_ID_V10
+            | minip2p::MESHSUB_PROTOCOL_ID_V11
+    )
+}
+
 /// Drives all endpoints once with a short budget, collecting pubsub events
-/// and asserting no floodsub stream events leak to the application.
+/// and asserting no pubsub stream events leak to the application.
 fn drive(endpoints: &mut [&mut Endpoint]) -> Vec<Vec<PubsubEvent>> {
     let mut collected = vec![Vec::new(); endpoints.len()];
     for (i, endpoint) in endpoints.iter_mut().enumerate() {
@@ -34,9 +52,9 @@ fn drive(endpoints: &mut [&mut Endpoint]) -> Vec<Vec<PubsubEvent>> {
                 !matches!(
                     &event,
                     Event::StreamReady { protocol_id, .. }
-                        if protocol_id == minip2p::FLOODSUB_PROTOCOL_ID
+                        if is_pubsub_protocol(protocol_id)
                 ),
-                "floodsub streams must be invisible to the app: {event:?}"
+                "pubsub streams must be invisible to the app: {event:?}"
             );
         }
         collected[i].extend(endpoint.take_pubsub_events());
@@ -75,6 +93,13 @@ fn saw_subscription(events: &[PubsubEvent], topic: &str) -> bool {
         .any(|e| matches!(e, PubsubEvent::PeerSubscribed { topic: got, .. } if got == topic))
 }
 
+fn drive_for(endpoints: &mut [&mut Endpoint], duration: Duration) {
+    let until = Instant::now() + duration;
+    while Instant::now() < until {
+        let _ = drive(endpoints);
+    }
+}
+
 #[test]
 fn two_endpoints_exchange_messages_over_real_quic() {
     let mut a = pubsub_endpoint();
@@ -86,8 +111,7 @@ fn two_endpoints_exchange_messages_over_real_quic() {
     b.subscribe(TOPIC).expect("b subscribes");
     a.dial(&b_addr).expect("a dials b");
 
-    // Both sides learn of each other's subscription first (floodsub has no
-    // history: publishing before that would vanish).
+    // Both sides learn of each other's subscription first.
     drive_until(&mut [&mut a, &mut b], Duration::from_secs(15), |all| {
         saw_subscription(&all[0], TOPIC) && saw_subscription(&all[1], TOPIC)
     });
@@ -136,6 +160,13 @@ fn star_center_forwards_between_leaves() {
                 && saw_subscription(&all[1], TOPIC)
                 && saw_subscription(&all[2], TOPIC)
         },
+    );
+
+    // Gossipsub admits newly discovered topic peers on heartbeat. Let the
+    // star form before asserting leaf-to-leaf forwarding through the hub.
+    drive_for(
+        &mut [&mut hub, &mut alice, &mut bob],
+        Duration::from_millis(1_100),
     );
 
     // Alice's message reaches bob THROUGH the hub (they are not connected),
@@ -210,6 +241,99 @@ fn pubsub_methods_error_when_not_enabled() {
         Err(PubsubError::NotEnabled)
     ));
     assert!(plain.take_pubsub_events().is_empty());
+}
+
+#[test]
+fn invalid_gossipsub_config_fails_before_transport_bind() {
+    let error = Endpoint::builder()
+        .pubsub_config(GossipsubConfig {
+            heartbeat_interval_ms: 0,
+            ..GossipsubConfig::default()
+        })
+        .bind_quic("not a socket address")
+        .err()
+        .expect("invalid pubsub config");
+    assert!(matches!(
+        error,
+        minip2p::Error::Transport(TransportError::InvalidConfig { ref reason })
+            if reason.contains("heartbeat_interval_ms")
+    ));
+}
+
+#[test]
+fn explicit_floodsub_endpoints_still_exchange_messages() {
+    let mut a = floodsub_endpoint();
+    let mut b = floodsub_endpoint();
+    let b_addr = b.listen().expect("b listens");
+    a.listen().expect("a listens");
+    a.subscribe(TOPIC).expect("a subscribes");
+    b.subscribe(TOPIC).expect("b subscribes");
+    a.dial(&b_addr).expect("a dials b");
+    drive_until(&mut [&mut a, &mut b], Duration::from_secs(15), |all| {
+        saw_subscription(&all[0], TOPIC) && saw_subscription(&all[1], TOPIC)
+    });
+
+    a.publish(TOPIC, b"explicit floodsub").expect("a publishes");
+    drive_until(&mut [&mut a, &mut b], Duration::from_secs(15), |all| {
+        saw_message(&all[1], b"explicit floodsub")
+    });
+}
+
+#[test]
+fn gossipsub_and_floodsub_do_not_claim_compatibility() {
+    let mut gossip = pubsub_endpoint();
+    let mut flood = floodsub_endpoint();
+    let flood_addr = flood.listen().expect("floodsub endpoint listens");
+    let gossip_peer = gossip.peer_id().clone();
+    let flood_peer = flood.peer_id().clone();
+    gossip.listen().expect("gossipsub endpoint listens");
+    gossip.subscribe(TOPIC).expect("gossipsub subscribes");
+    flood.subscribe(TOPIC).expect("floodsub subscribes");
+    gossip.dial(&flood_addr).expect("transport connects");
+
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    let mut advertised_by_gossip = None;
+    let mut advertised_by_flood = None;
+    while advertised_by_gossip.is_none() || advertised_by_flood.is_none() {
+        assert!(Instant::now() < ready_deadline, "identify did not complete");
+        if let Some(Event::PeerReady { peer_id, protocols }) = gossip
+            .next_event(Duration::from_millis(20))
+            .expect("gossipsub endpoint drives")
+            && peer_id == flood_peer
+        {
+            advertised_by_flood = Some(protocols);
+        }
+        if let Some(Event::PeerReady { peer_id, protocols }) = flood
+            .next_event(Duration::from_millis(20))
+            .expect("floodsub endpoint drives")
+            && peer_id == gossip_peer
+        {
+            advertised_by_gossip = Some(protocols);
+        }
+    }
+    let advertised_by_gossip = advertised_by_gossip.unwrap();
+    assert!(advertised_by_gossip.contains(&minip2p::MESHSUB_PROTOCOL_ID_V11.to_string()));
+    assert!(advertised_by_gossip.contains(&minip2p::MESHSUB_PROTOCOL_ID_V10.to_string()));
+    assert!(!advertised_by_gossip.contains(&minip2p::FLOODSUB_PROTOCOL_ID.to_string()));
+    let advertised_by_flood = advertised_by_flood.unwrap();
+    assert!(advertised_by_flood.contains(&minip2p::FLOODSUB_PROTOCOL_ID.to_string()));
+    assert!(!advertised_by_flood.contains(&minip2p::MESHSUB_PROTOCOL_ID_V11.to_string()));
+    assert!(!advertised_by_flood.contains(&minip2p::MESHSUB_PROTOCOL_ID_V10.to_string()));
+
+    let mut events = vec![Vec::new(), Vec::new()];
+    let until = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < until {
+        for (all, new) in events.iter_mut().zip(drive(&mut [&mut gossip, &mut flood])) {
+            all.extend(new);
+        }
+    }
+    assert!(
+        events.iter().flatten().all(|event| !matches!(
+            event,
+            PubsubEvent::PeerSubscribed { .. } | PubsubEvent::Message { .. }
+        )),
+        "engines with no common protocol must not exchange pubsub state: {events:?}"
+    );
 }
 
 #[test]
@@ -326,7 +450,7 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
 
     // A direct connection supersedes the ready circuit. The public sequence
     // must close the old id before establishing the replacement, and the
-    // floodsub driver must re-open and re-announce subscriptions.
+    // pubsub driver must re-open and re-announce subscriptions.
     a.dial(&b_addr).expect("manual direct upgrade");
     let upgrade_deadline = Instant::now() + Duration::from_secs(15);
     let mut a_sequence = Vec::new();

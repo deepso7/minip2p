@@ -1,9 +1,9 @@
 # minip2p-chat
 
-Group chat over floodsub with NAT traversal: the "finished product" demo
+Group chat over gossipsub with NAT traversal: the "finished product" demo
 for the minip2p stack. Peers join a room by dialing one address, the NAT
-agent hole-punches direct paths where needed, and messages flood the room
-signed end-to-end (libp2p StrictSign).
+agent hole-punches direct paths where needed, and messages flow through a
+bounded pubsub mesh signed end-to-end (libp2p StrictSign).
 
 ```text
 minip2p-chat host        [--topic <t>] [--nick <n>] [--relay <relay-peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--no-mesh]
@@ -64,18 +64,17 @@ $ minip2p-chat join '<circuit-addr>' --nick alice
 ```
 
 Pass `--relay-only` to skip direct dialing and DCUtR entirely. This gives a
-deterministic way to exercise Noise, Yamux, Identify, discovery, and floodsub
+deterministic way to exercise Noise, Yamux, Identify, discovery, and gossipsub
 over the relay circuit.
 
 ## Message format
 
-The payload is plain UTF-8, `"<nick>: <text>"`, formatted by the sender —
-trivially interoperable with any libp2p floodsub peer on the same topic
-(go/js sign by default and match this stack's StrictSign; rust-libp2p's
-floodsub is unsigned — pass `--allow-unsigned` to chat with it; signed
-messages are still verified). Seqnos are implementation-defined opaque
-bytes (go: 8 big-endian, rust: 20 random); anything 1..=64 bytes is
-accepted.
+The payload is plain UTF-8, `"<nick>: <text>"`, formatted by the sender and
+interoperable with libp2p gossipsub peers on the same topic. go-libp2p and
+rust-libp2p gossipsub both sign by default and match this stack's StrictSign;
+`--allow-unsigned` is only needed for a peer explicitly configured to emit
+unsigned messages. Seqnos are implementation-defined opaque bytes (go: 8
+big-endian, rust: 20 random); anything 1..=64 bytes is accepted.
 
 A quiet room generates no traffic, and the QUIC transport drops
 connections after 30 s of silence — the chat loop pings every connected
@@ -110,10 +109,10 @@ Two deployment details surfaced during live validation:
    report subscriptions and exchange messages while `path=relayed`; cutting
    the relay must disconnect the room. Remove `--relay-only` from both peers
    in a second run to validate the relayed → direct-punched upgrade.
-3. **go-libp2p interop**: a go floodsub peer (Ed25519 identity) on the
-   same topic chats both ways in strict mode.
-4. **rust-libp2p interop**: a rust-libp2p floodsub peer, with this side
-   started with `--allow-unsigned`. The rust peer must include a `ping`
+3. **go-libp2p interop**: an Ed25519 go peer using
+   `pubsub.NewGossipSub` on the same topic chats both ways in strict mode.
+4. **rust-libp2p interop**: a rust-libp2p gossipsub peer using its signed
+   default message-authenticity mode. The rust peer must include a `ping`
    behaviour (to answer this side's keepalives) or raise its
    `idle_connection_timeout` — by default rust-libp2p closes a
    connection after 10 s when no behaviour keeps it alive, which reads

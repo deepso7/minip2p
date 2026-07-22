@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    DISCOVERY_TOPIC, DiscoveryConfig, DiscoveryEvent, Endpoint, Event, FloodsubConfig, NatConfig,
+    DISCOVERY_TOPIC, DiscoveryConfig, DiscoveryEvent, Endpoint, Event, GossipsubConfig, NatConfig,
     NatEvent, PeerAddr, PeerId, PublishError, PubsubError, PubsubEvent,
 };
 
@@ -24,7 +24,7 @@ const DEFAULT_TOPIC: &str = "minip2p-chat";
 const CONNECT_DEADLINE: Duration = Duration::from_secs(65);
 /// How long the host waits for its relay reservation before warning.
 const RESERVATION_DEADLINE: Duration = Duration::from_secs(30);
-/// Identify must complete before floodsub can open streams.
+/// Identify must complete before gossipsub can open streams.
 const READY_DEADLINE: Duration = Duration::from_secs(15);
 
 struct ChatEndpoint {
@@ -46,9 +46,9 @@ fn build_endpoint(
     let mut builder = Endpoint::builder()
         .identity(keypair)
         .agent_version(AGENT)
-        .pubsub_config(FloodsubConfig {
+        .pubsub_config(GossipsubConfig {
             allow_unsigned: options.allow_unsigned,
-            ..FloodsubConfig::default()
+            ..GossipsubConfig::default()
         })
         .nat_config(nat_config);
     if !options.no_mesh {

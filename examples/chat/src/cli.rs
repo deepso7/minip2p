@@ -22,7 +22,7 @@ use minip2p::{Multiaddr, PeerAddr, PeerId, Protocol};
 pub enum Mode {
     /// Bind, optionally reserve on a relay, and print the address(es)
     /// others join with. The host is an ordinary chat participant that
-    /// also forwards between leaves (floodsub does that for free).
+    /// also relays messages while the gossipsub mesh converges.
     Host {
         relay: Option<PeerAddr>,
         chat: ChatOptions,
@@ -55,8 +55,7 @@ pub struct ChatOptions {
     pub key_path: Option<PathBuf>,
     /// Optional QUIC listen/bind multiaddr. Defaults to dual-stack UDP/0.
     pub listen_addr: Option<Multiaddr>,
-    /// Accept unsigned messages (rust-libp2p floodsub interop; its
-    /// floodsub does not sign). Signed messages are still verified.
+    /// Accept unsigned pubsub messages. Signed messages are still verified.
     pub allow_unsigned: bool,
     /// Disable peer discovery and preserve the host-forwarded star topology.
     pub no_mesh: bool,
@@ -302,7 +301,7 @@ fn require_quic_transport(what: &str, raw: &str, addr: &PeerAddr) -> Result<(), 
 
 /// Usage text printed on `--help` and parse errors.
 pub fn usage() -> String {
-    "minip2p-chat -- group chat over floodsub with NAT traversal.
+    "minip2p-chat -- group chat over gossipsub with NAT traversal.
 
 USAGE:
     minip2p-chat host        [--topic <t>] [--nick <n>] [--relay <relay-peer-addr>] [--key <path>] [--listen <quic-multiaddr>] [--no-mesh]
@@ -319,8 +318,8 @@ NOTES:
     --listen  bind multiaddr; default is dual-stack UDP/0
 
     --allow-unsigned
-              accept unsigned messages (rust-libp2p floodsub interop;
-              signed messages are still verified)
+              accept unsigned pubsub messages; signed messages are still
+              verified
     --no-mesh preserve the host-forwarded star by disabling peer discovery
     --relay-only
               skip direct dialing and hole punching; use the promoted relay
