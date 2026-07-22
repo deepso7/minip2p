@@ -24,7 +24,7 @@ Confidence ≥ 8 only. If unsure, dig deeper or drop — don’t pad.
 4. **Copy block** (Cubic-style) — after the table, one fenced `text` block the user can paste into an agent:
 
 ```text
-Check if these issues are valid — if so, understand the root cause of each and fix them.
+Check if these issues are valid — if so, understand the root cause of each and fix them. If appropriate, use sub-agents to investigate and fix each issue separately.
 
 <file name="path/to/file.rs">
 <violation number="1" location="path/to/file.rs:LINE">
