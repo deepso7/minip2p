@@ -35,6 +35,11 @@ docs:
     cargo doc --workspace --no-deps
     cargo doc -p minip2p --features nat,pubsub,discovery --no-deps
 
+docs-site:
+    cd docs && pnpm run check
+    cargo check --manifest-path docs/snippets/quickstart/Cargo.toml
+    cargo check --manifest-path docs/snippets/custom-stream/Cargo.toml
+
 bench:
     cargo bench -p minip2p-core --bench multiaddr
 

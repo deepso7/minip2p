@@ -1,0 +1,95 @@
+---
+title: Identity and addresses
+description: Manage Ed25519 peer identity and distinguish bind addresses, direct peer addresses, and relay circuit addresses.
+---
+
+Every authenticated connection binds a transport address to an Ed25519
+identity.
+
+## Ephemeral identity
+
+When no key is supplied, binding generates a fresh Ed25519 keypair:
+
+```rust
+let node = minip2p::Endpoint::builder()
+    .bind_quic("127.0.0.1:0")?;
+
+println!("peer={}", node.peer_id());
+```
+
+This is convenient for tests and short-lived tools. The `PeerId` changes on
+every run, so previously shared peer and circuit addresses stop identifying
+the restarted node.
+
+## Persistent identity
+
+Load 32 secret bytes from secure application storage and provide the
+reconstructed keypair:
+
+```rust
+use minip2p::{Ed25519Keypair, Endpoint};
+
+let secret: [u8; 32] = load_secret_from_secure_storage()?;
+let identity = Ed25519Keypair::from_secret_key_bytes(secret);
+
+let node = Endpoint::builder()
+    .identity(identity)
+    .bind_quic_dual_stack()?;
+```
+
+Persist `Ed25519Keypair::secret_key_bytes()` with owner-only permissions or an
+operating-system secret store. Never log or transmit the secret.
+
+## Address vocabulary
+
+### Bind multiaddr
+
+Chooses a local socket but does not identify a peer:
+
+```text
+/ip4/0.0.0.0/udp/4001/quic-v1
+```
+
+Pass it to `bind_quic_multiaddr`.
+
+### Direct PeerAddr
+
+Adds the authenticated peer identity as the terminal component:
+
+```text
+/ip4/203.0.113.10/udp/4001/quic-v1/p2p/12D3KooW…
+/ip6/2001:db8::10/udp/4001/quic-v1/p2p/12D3KooW…
+/dns4/node.example.com/udp/4001/quic-v1/p2p/12D3KooW…
+```
+
+Pass a `PeerAddr` to `dial`, `connect_addr`, or builder methods that name a
+relay or AutoNAT server.
+
+### Circuit address
+
+Names a target reached through a Circuit Relay v2 server:
+
+```text
+/ip4/198.51.100.5/udp/4001/quic-v1/p2p/<relay-id>/p2p-circuit/p2p/<target-id>
+```
+
+The relay must already hold a reservation for the target.
+
+## Supported host components
+
+The QUIC adapter accepts `/ip4`, `/ip6`, `/dns`, `/dns4`, and `/dns6`,
+followed by `/udp/<port>/quic-v1`. A direct `PeerAddr` then adds exactly one
+terminal `/p2p/<peer-id>`.
+
+`PeerAddr::from_str` rejects a missing, repeated, or non-terminal peer ID.
+Transport-specific dialing can also reject an address that parses but is not
+a supported QUIC shape.
+
+## Wildcards are not advertisements
+
+`0.0.0.0` and `::` mean “bind all local interfaces.” They are not routable
+remote destinations. Replace a wildcard with a real interface or public
+address before sharing it, or advertise a relay circuit address when the node
+is private.
+
+For automatic address sharing and dialing, see [Peer discovery](/guides/discovery).

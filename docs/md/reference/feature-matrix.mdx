@@ -1,0 +1,81 @@
+---
+title: Feature matrix
+description: Compare compiled APIs, builder activation, active drivers, application methods, and required network infrastructure.
+---
+
+Cargo features control what code is available. Builder methods control what
+runs inside an endpoint. External network infrastructure determines which
+paths are actually usable.
+
+| Capability | Cargo selection | Builder activation | Active behavior | Infrastructure |
+| --- | --- | --- | --- | --- |
+| Direct QUIC, Identify, Ping, custom streams | Base | None required | Base swarm driver | A mutually reachable UDP path |
+| Reachability probing | `nat` | `.autonat_server(server)` or a `NatConfig` with probe servers | NAT driver and AutoNAT probes | Reachable AutoNAT server |
+| Relayed connections and DCUtR | `nat` | `.relay(relay)` or relay-bearing `.nat_config(...)` | NAT driver, reservations, relay races, hole punching | Reachable Circuit Relay v2 server |
+| Gossipsub | `pubsub` | `.pubsub()` or gossipsub `.pubsub_config(...)` | Pubsub driver | At least one compatible mesh peer |
+| Floodsub | `pubsub` | `.pubsub_config(FloodsubConfig::default())` | Pubsub driver | At least one floodsub peer |
+| Signed discovery | `discovery` | `.discovery()` or `.discovery_config(...)` | Discovery, default pubsub, and NAT drivers | A connected discovery peer; relay optional for direct-only addresses |
+
+## Base facade
+
+Always available:
+
+- Bind: `bind_quic`, `bind_quic_multiaddr`, `bind_quic_dual_stack`
+- Address publication: `listen`, `listen_all`
+- Direct connections: `dial`, `dial_ip4`, `dial_ip6`, `disconnect`
+- State: `peer_id`, `connected_peers`, `is_peer_ready`, `peer_info`
+- Streams: `add_protocol`, `open_stream`, `send_stream`,
+  `close_stream_write`, `reset_stream`, `abandon_stream`
+- Driving: `poll`, `next_event`, `wait_peer_ready`, `wait_ping_rtt`
+
+## NAT facade
+
+Compiled with `features = ["nat"]`:
+
+- Activation: `relay`, `autonat_server`, `nat_config`
+- Attempts: `connect`, `connect_addr`, `connect_with_addrs`,
+  `cancel_connect`, `wait_path`
+- Events: `take_nat_events`, `next_nat_event`
+- State: `reachability`, `active_reservation`
+
+:::warning
+An AutoNAT server activates the driver but does not supply a relay path.
+Configure a relay for circuits, reservations, and relay-assisted DCUtR.
+:::
+
+## Pubsub facade
+
+Compiled with `features = ["pubsub"]`:
+
+- Activation: `pubsub`, `pubsub_config`
+- Topics: `subscribe`, `unsubscribe`, `publish`
+- Events: `take_pubsub_events`, `next_pubsub_event`
+
+Gossipsub is the default. Floodsub is an explicit engine selection.
+
+## Discovery facade
+
+Compiled with `features = ["discovery"]`, which includes the `nat` and
+`pubsub` Cargo features:
+
+- Activation: `discovery`, `discovery_config`
+- State: `known_peers`
+- Events: `take_discovery_events`, `next_discovery_event`
+
+Activating discovery also activates default pubsub and the NAT agent. A relay
+remains optional for direct discovery, but required for relayed paths and
+relay-assisted punching.
+
+## Exhaustive API docs
+
+Until the crates are published, generate rustdoc locally:
+
+```bash
+cargo doc --workspace --no-deps --open
+```
+
+To include every facade feature:
+
+```bash
+cargo doc -p minip2p --features nat,pubsub,discovery --no-deps --open
+```

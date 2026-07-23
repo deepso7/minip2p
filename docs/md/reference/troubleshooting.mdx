@@ -1,0 +1,68 @@
+---
+title: Troubleshooting
+description: Diagnose connection, address, stream, NAT, pubsub, discovery, and event-loop problems by symptom.
+---
+
+Start from the observable symptom. minip2p returns synchronous API errors
+directly and reports later runtime or protocol failures through events.
+
+## Common problems
+
+| Symptom | Likely cause | Corrective action |
+| --- | --- | --- |
+| `PeerAddr` fails to parse | Missing or non-terminal `/p2p/<peer-id>` | Copy the complete peer address, including its terminal identity. |
+| An address parses but dialing fails immediately | The transport is not a supported host + UDP + QUIC v1 shape | Use `/ip4`, `/ip6`, `/dns*`, then `/udp/<port>/quic-v1`. |
+| A remote peer cannot dial a printed wildcard address | `0.0.0.0` or `::` is a bind wildcard | Advertise a real interface/public address or a relay circuit address. |
+| `ConnectionEstablished` appears but the app protocol cannot open | Identify has not completed | Wait for `PeerReady` before `open_stream`. |
+| `ProtocolNotRegistered` | The local endpoint never registered the ID | Add `.protocol("/app/name/1.0.0")` on the builder or call `add_protocol`. |
+| `ReservedProtocol` | The app tried to register Identify or Ping | Choose an application-owned, versioned protocol ID. |
+| `RemoteDoesNotSupport` | Identify completed and the remote did not advertise the protocol | Register the same protocol version on both peers. |
+| NAT, pubsub, or discovery reports “not enabled” | Cargo compiled the API but the builder did not activate the driver | Add the corresponding builder activation from the feature matrix. |
+| AutoNAT reports reachability but `connect` has no relay path | Only `.autonat_server(...)` was configured | Add a Circuit Relay v2 server with `.relay(...)` or `NatConfig::relays`. |
+| No relay reservation appears | Relay unreachable, incompatible, or policy does not currently reserve | Check the relay address, connection events, reachability state, and `ReservationPolicy`. |
+| Hole punching fails | UDP paths or observed addresses are unusable | Keep the relay path, inspect `HolePunchFailed`, and verify both sides keep driving. |
+| Pubsub receives no local copy | Self-delivery is intentionally disabled | Apply the local action directly and treat pubsub as remote delivery. |
+| Unsigned pubsub message is rejected | `allow_unsigned` defaults to `false` | Enable it only when the remote intentionally sends unsigned application messages. |
+| Discovery rejects an unsigned beacon | Discovery always requires signed beacons | Fix the remote discovery publisher; application `allow_unsigned` does not relax discovery. |
+| Unsubscribing the discovery topic fails | The topic is driver-owned | Leave its lifecycle to discovery; use a separate topic for application messages. |
+| A quiet connection closes | The QUIC idle timeout elapsed | Send appropriate application traffic or Ping on a cadence suited to the app. |
+| A focused wait returns `EventBacklogExceeded` | Too many unrelated events were preserved during the wait | Drain ordinary events with `poll` or `next_event`, handle the busy source, then retry. |
+
+## Event response cheat sheet
+
+| Event | Typical response |
+| --- | --- |
+| `Event::PeerReady` | Open application streams or record the peer as usable. |
+| `Event::StreamReady` | Attach the stream to the matching protocol handler; outbound streams may now write. |
+| `Event::StreamData` | Feed bytes into the application's framing/decoder. |
+| `Event::StreamRemoteWriteClosed` | Finish decoding and optionally half-close the local write side. |
+| `Event::Error` | Log structured context and decide whether the affected operation should retry. |
+| `NatEvent::PathEstablished` | Begin traffic on the peer's ordinary stream APIs. |
+| `NatEvent::PathUpgraded` | Update metrics/UI; stream APIs continue to address the same peer. |
+| `NatEvent::ConnectFailed` | Inspect `NatError`, correct infrastructure or candidates, then start a new attempt. |
+| `PubsubEvent::OutboundFailure` | Record or retry at the application layer if delivery semantics require it. |
+| `DiscoveryEvent::DialFailed` | Keep discovery running; unchanged beacons retry after configured backoff. |
+
+## Debug in layers
+
+<Steps>
+  <Step title="Confirm the endpoint is being driven">
+    Both peers must keep calling `poll`, `next_event`, or focused waits.
+  </Step>
+  <Step title="Confirm identity and address shape">
+    Log the complete `PeerAddr`, local `PeerId`, and relevant bind addresses.
+  </Step>
+  <Step title="Confirm the readiness milestone">
+    Distinguish authenticated QUIC establishment from `PeerReady`.
+  </Step>
+  <Step title="Confirm feature activation">
+    Check both the Cargo feature and the builder method.
+  </Step>
+  <Step title="Inspect the right event queue">
+    Driver-owned NAT, pubsub, and discovery work appears in their focused
+    queues, not as raw application stream events.
+  </Step>
+</Steps>
+
+For exhaustive variants and fields, generate local
+[rustdoc](/reference/feature-matrix#exhaustive-api-docs).

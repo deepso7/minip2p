@@ -1,0 +1,115 @@
+---
+title: Peer discovery
+description: Activate signed presence beacons, a bounded peer address book, and automatic direct or NAT-aware dialing.
+---
+
+Discovery layers signed presence beacons and dialing policy over pubsub and
+the NAT agent.
+
+## Compile and activate discovery
+
+```toml
+[dependencies]
+minip2p = {
+  git = "https://github.com/deepso7/minip2p",
+  features = ["discovery"]
+}
+```
+
+The Cargo feature includes the `nat` and `pubsub` APIs. Runtime activation is
+separate:
+
+```rust
+let mut node = minip2p::Endpoint::builder()
+    .discovery()
+    .bind_quic_dual_stack()?;
+
+node.listen_all()?;
+```
+
+`.discovery()` activates three coordinated pieces: the discovery driver,
+default gossipsub, and the NAT agent. `.discovery_config(...)` does the same
+with caller-selected discovery policy.
+
+Discovery can dial direct addresses announced by other peers without a relay.
+A configured relay is still required for relay circuits, reservations, and
+relay-assisted hole punching:
+
+```rust
+let node = minip2p::Endpoint::builder()
+    .relay(relay)
+    .discovery()
+    .bind_quic_dual_stack()?;
+```
+
+## How peers appear
+
+Each endpoint periodically publishes a signed beacon containing its current
+dialable address snapshot. The driver:
+
+1. verifies the beacon identity and signature;
+2. normalizes and bounds the advertised addresses;
+3. updates the TTL-based known-peer book;
+4. starts or cancels NAT-aware dials according to discovery policy.
+
+Address-less beacons can refresh peer presence without starting a dial.
+Wildcard listen addresses are filtered because another peer cannot dial them.
+
+## Observe the address book
+
+```rust
+for peer in node.known_peers() {
+    println!(
+        "peer={} connected={} addresses={:?}",
+        peer.peer,
+        peer.connected,
+        peer.addrs,
+    );
+}
+
+for event in node.take_discovery_events() {
+    println!("{event:?}");
+}
+```
+
+`DiscoveryEvent` reports peers being discovered, updated, or expired, plus
+automatic dial failures and rejected beacons. Use
+`next_discovery_event(deadline)` when a synchronous loop wants one focused
+event.
+
+## Customize policy
+
+```rust
+use minip2p::{DiscoveryConfig, Endpoint};
+
+let config = DiscoveryConfig {
+    topic: "my-app/discovery/v1".into(),
+    max_known_peers: 256,
+    ..DiscoveryConfig::default()
+};
+
+let node = Endpoint::builder()
+    .discovery_config(config)?
+    .bind_quic_dual_stack()?;
+```
+
+Configuration also controls beacon cadence, peer TTL, addresses per peer,
+automatic dialing, peer-ID tie breaking, and retry backoff. Invalid bounds are
+rejected before a socket is allocated.
+
+:::warning
+Discovery beacons are always required to be signed. Unsigned discovery
+beacons are rejected even when application pubsub was configured with
+`allow_unsigned: true`.
+:::
+
+:::note
+The discovery topic is driver-owned. Manually subscribing is redundant, and
+its pubsub messages are consumed before reaching application pubsub events.
+Calling `unsubscribe` for that topic returns
+`PubsubError::DiscoveryTopicReserved`.
+:::
+
+For a complete mesh demonstration, use the existing
+[`minip2p-chat` example](https://github.com/deepso7/minip2p/tree/main/examples/chat).
+It combines discovery, gossipsub, relay circuits, and direct upgrades.

@@ -1,8 +1,106 @@
 ---
-title: Introduction
-description: Get started with the SDK.
+title: Small enough to understand. Complete enough to connect.
+description: minip2p is a minimal, caller-driven libp2p implementation for Rust applications that want QUIC, clear control flow, and no async runtime.
 ---
 
-# Introduction
+`minip2p` gives applications one synchronous [`Endpoint`](/getting-started/mental-model#endpoint)
+for identity, QUIC connections, built-in Identify and Ping, and application
+protocol streams. Optional features add NAT traversal, pubsub, and peer
+discovery without changing the base API.
 
-Install the SDK and make your first call. See [Installation](/installation).
+```rust
+use minip2p::Endpoint;
+
+fn main() -> Result<(), minip2p::Error> {
+    let mut node = Endpoint::builder()
+        .agent_version("my-app/0.1.0")
+        .bind_quic_dual_stack()?;
+
+    for address in node.listen_all()? {
+        println!("{address}");
+    }
+
+    Ok(())
+}
+```
+
+<CardGroup cols={2}>
+  <Card
+    title="Install minip2p"
+    href="/getting-started/installation"
+    icon="package-plus"
+  >
+    Add the pre-release Git dependency and choose only the features you need.
+  </Card>
+  <Card
+    title="Connect two peers"
+    href="/getting-started/quickstart"
+    icon="unplug"
+  >
+    Run a listener and dialer locally, then measure a real libp2p ping.
+  </Card>
+  <Card
+    title="Understand the model"
+    href="/getting-started/mental-model"
+    icon="waypoints"
+  >
+    Learn peer identities, addresses, events, and when to dial or connect.
+  </Card>
+  <Card
+    title="Choose features"
+    href="/reference/feature-matrix"
+    icon="table-properties"
+  >
+    Compare compiled APIs, active drivers, and network prerequisites.
+  </Card>
+</CardGroup>
+
+## The shape of minip2p
+
+- **QUIC only.** One transport, with mutual libp2p TLS authentication built in.
+- **No async runtime.** Your application calls `poll`, `next_event`, or a
+  focused wait when it wants the endpoint to make progress.
+- **Pre-1.0.** Breaking API changes are possible, and the crates are not yet
+  published to crates.io.
+- **Interoperable protocols.** Identify, Ping, Circuit Relay v2 client flows,
+  AutoNAT probes, DCUtR, gossipsub, floodsub, and signed discovery use libp2p
+  wire formats.
+- **Sans-I/O underneath.** Protocol logic remains deterministic; sockets,
+  clocks, and blocking waits live in the adapters.
+
+:::note
+These docs begin with the app-facing `minip2p::Endpoint`. Lower-level
+Sans-I/O crates remain available, but their narrative guides are planned for a
+later documentation pass.
+:::
+
+## A good reading path
+
+<Steps>
+  <Step title="Install from GitHub">
+    Pick the base facade or enable `nat`, `pubsub`, or `discovery`.
+  </Step>
+  <Step title="Make one local connection">
+    The quickstart uses direct QUIC dialing and a built-in Ping round trip.
+  </Step>
+  <Step title="Add your protocol">
+    Register an application protocol and exchange bytes over negotiated
+    streams.
+  </Step>
+  <Step title="Layer on network policy">
+    Add NAT traversal, pubsub, or discovery only when the application needs
+    it.
+  </Step>
+</Steps>
+
+## Current constraints
+
+| Constraint | What it means |
+| --- | --- |
+| Rust 1.88+ | This is the workspace's minimum supported Rust version. |
+| QUIC transport | TCP, WebSocket, and WebTransport adapters are out of scope. |
+| Ed25519 identity | Endpoint identities and signed application messages use Ed25519. |
+| Caller-driven | There is no executor or hidden async task driving the node. |
+| Relay client only | Bring a Circuit Relay v2 server when a relayed path is required. |
+
+Ready to run code? Continue to [Installation](/getting-started/installation).

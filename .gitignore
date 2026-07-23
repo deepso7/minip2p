@@ -1,4 +1,5 @@
 /target
+/.pnpm-store/
 # Docker linux cross-compile output (examples deployed to test boxes).
 /target-linux
 .DS_Store

@@ -1,0 +1,117 @@
+---
+title: Listen and connect
+description: Bind a QUIC endpoint, publish dialable peer addresses, connect directly over IPv4, IPv6, or DNS, and wait for readiness.
+---
+
+This guide covers direct QUIC connectivity with the base facade. For relay
+races and hole punching, use the separate [NAT traversal guide](/guides/nat).
+
+## Bind an endpoint
+
+Choose the bind method that matches the host:
+
+| Method | Use it when |
+| --- | --- |
+| `bind_quic("127.0.0.1:0")` | You want one socket address, commonly for local tests. |
+| `bind_quic_multiaddr(&addr)` | Configuration already uses a QUIC `Multiaddr`. |
+| `bind_quic_dual_stack()` | The application should bind separate IPv4 and IPv6 wildcard sockets. |
+
+Port `0` asks the operating system to choose an available UDP port.
+
+```rust
+use minip2p::Endpoint;
+
+let mut node = Endpoint::builder()
+    .agent_version("my-app/0.1.0")
+    .bind_quic_dual_stack()?;
+
+for address in node.listen_all()? {
+    println!("listen={address}");
+}
+```
+
+`listen()` publishes the first already-bound address. `listen_all()` publishes
+every bound address, which is normally the right choice for a dual-stack
+endpoint.
+
+:::warning
+An address containing `/ip4/0.0.0.0` or `/ip6/::` describes where the socket
+is bound, not an address another machine can dial. Advertise a real interface,
+public, or relay circuit address to remote peers.
+:::
+
+## Dial a known peer
+
+Parse a complete `PeerAddr`, including its terminal `/p2p/<peer-id>`:
+
+```rust
+use std::str::FromStr;
+
+use minip2p::{Endpoint, PeerAddr};
+
+let target = PeerAddr::from_str(
+    "/dns4/node.example.com/udp/4001/quic-v1/p2p/12D3KooW…",
+)?;
+
+let mut node = Endpoint::builder().bind_quic_dual_stack()?;
+let connection_ids = node.dial(&target)?;
+println!("started {} dial(s)", connection_ids.len());
+```
+
+`dial` starts every applicable local address family. For a DNS target on a
+dual-stack endpoint, it can return both IPv4 and IPv6 connection IDs. Use
+`dial_ip4` or `dial_ip6` when policy requires one family.
+
+## Wait for PeerReady
+
+A successful dial still has two useful milestones:
+
+1. `Event::ConnectionEstablished` — QUIC is connected and the peer identity is
+   authenticated.
+2. `Event::PeerReady` — the first Identify exchange has completed, so the
+   endpoint knows which protocols the peer supports.
+
+```rust
+use std::time::Duration;
+
+let ready = node.wait_peer_ready(
+    target.peer_id(),
+    Duration::from_secs(10),
+)?;
+
+if ready.is_none() {
+    eprintln!("peer connected but did not become ready before the deadline");
+}
+```
+
+Wait for `PeerReady` before opening an application protocol stream. Calling
+`open_stream` after readiness lets minip2p reject unsupported protocols
+immediately and clearly.
+
+## Inspect and disconnect
+
+```rust
+if node.is_peer_ready(target.peer_id()) {
+    if let Some(info) = node.peer_info(target.peer_id()) {
+        println!("agent={}", info.agent_version);
+    }
+}
+
+for peer in node.connected_peers() {
+    println!("connected={peer}");
+}
+
+node.disconnect(target.peer_id())?;
+```
+
+`disconnect` closes the active connection. A later connection closure appears
+as `Event::ConnectionClosed`.
+
+## Direct dialing is deliberately direct
+
+`dial*` does not reserve on a relay, establish a circuit, or start DCUtR. When
+the application has enabled the `nat` feature and configured its NAT driver,
+use `connect*` plus `wait_path` instead.
+
+Next, [register a custom protocol](/guides/custom-protocols) or read the
+[identity and address guide](/guides/identity-and-addresses).

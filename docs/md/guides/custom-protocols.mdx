@@ -1,0 +1,123 @@
+---
+title: Custom protocols and streams
+description: Register an application protocol, negotiate streams, exchange bytes, and close or abandon stream state intentionally.
+---
+
+Application protocols use libp2p multistream-select negotiation over an
+authenticated connection. Both peers must register the same versioned
+protocol ID.
+
+```rust
+const ECHO_PROTOCOL: &str = "/my-app/echo/1.0.0";
+
+let mut node = minip2p::Endpoint::builder()
+    .protocol(ECHO_PROTOCOL)
+    .bind_quic_dual_stack()?;
+```
+
+You can also call `add_protocol` after binding. Registration affects inbound
+and outbound negotiation.
+
+:::warning
+`/ipfs/id/1.0.0` and `/ipfs/ping/1.0.0` are owned by the endpoint. Registering
+an ID in `RESERVED_PROTOCOL_IDS` fails with `SwarmError::ReservedProtocol`.
+:::
+
+## Open an outbound stream
+
+Wait for `PeerReady`, then request a stream:
+
+```rust
+use std::time::Duration;
+
+node.wait_peer_ready(&peer_id, Duration::from_secs(10))?
+    .ok_or("peer did not become ready")?;
+
+let stream_id = node.open_stream(&peer_id, ECHO_PROTOCOL)?;
+```
+
+`open_stream` starts negotiation and returns the allocated stream ID. Wait for
+the matching `Event::StreamReady` before writing:
+
+```rust
+loop {
+    let event = node
+        .next_event(Duration::from_secs(10))?
+        .ok_or("stream negotiation timed out")?;
+
+    if let minip2p::Event::StreamReady {
+        peer_id: peer,
+        stream_id: ready,
+        protocol_id,
+        ..
+    } = event
+        && peer == peer_id
+        && ready == stream_id
+        && protocol_id == ECHO_PROTOCOL
+    {
+        node.send_stream(&peer_id, stream_id, b"hello".to_vec())?;
+        node.close_stream_write(&peer_id, stream_id)?;
+        break;
+    }
+}
+```
+
+QUIC is a byte stream: writes can be fragmented or coalesced. Add framing when
+one application message must be distinguishable from the next.
+
+## Accept an inbound stream
+
+Inbound negotiation produces the same `StreamReady` event with
+`initiated_locally: false`. Track accepted stream IDs so later `StreamData`
+can be routed to the correct handler:
+
+```rust
+use std::collections::HashSet;
+
+use minip2p::{Event, PeerId, StreamId};
+
+let mut echo_streams: HashSet<(PeerId, StreamId)> = HashSet::new();
+
+match event {
+    Event::StreamReady {
+        peer_id,
+        stream_id,
+        protocol_id,
+        initiated_locally: false,
+        ..
+    } if protocol_id == ECHO_PROTOCOL => {
+        echo_streams.insert((peer_id, stream_id));
+    }
+    Event::StreamData {
+        peer_id,
+        stream_id,
+        data,
+        ..
+    } if echo_streams.contains(&(peer_id.clone(), stream_id)) => {
+        node.send_stream(&peer_id, stream_id, data)?;
+        node.close_stream_write(&peer_id, stream_id)?;
+        echo_streams.remove(&(peer_id, stream_id));
+    }
+    _ => {}
+}
+```
+
+## Close, reset, or abandon
+
+| Operation | Meaning |
+| --- | --- |
+| `close_stream_write` | Gracefully half-close the local write side; reads may continue. |
+| `reset_stream` | Abruptly terminate the stream while keeping terminal stream events visible. |
+| `abandon_stream` | Reset the stream, purge buffered matching events, and suppress later matching stream events. |
+
+Use `abandon_stream` when an application has permanently stopped consuming a
+stream. It is idempotent and prevents an ignored stream from filling focused
+wait buffers.
+
+## Driver-owned streams
+
+When NAT, pubsub, or discovery drivers are active, they register and consume
+their own control-plane streams. Those events do not surface as application
+`StreamData`; use the matching NAT, pubsub, or discovery event APIs instead.
+
+Continue with [Events and timeouts](/guides/events-and-timeouts).
