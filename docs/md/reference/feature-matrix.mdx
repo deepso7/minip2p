@@ -16,7 +16,7 @@ paths are actually usable.
 | Floodsub | `pubsub` | `.pubsub_config(FloodsubConfig::default())` | Pubsub driver | At least one floodsub peer |
 | Signed discovery | `discovery` | `.discovery()` or `.discovery_config(...)` | Discovery, default pubsub, and NAT drivers | A connected discovery peer; relay optional for direct-only addresses |
 
-## Base facade
+## Base API
 
 Always available:
 
@@ -28,7 +28,7 @@ Always available:
   `close_stream_write`, `reset_stream`, `abandon_stream`
 - Driving: `poll`, `next_event`, `wait_peer_ready`, `wait_ping_rtt`
 
-## NAT facade
+## NAT API
 
 Compiled with `features = ["nat"]`:
 
@@ -43,7 +43,7 @@ An AutoNAT server activates the driver but does not supply a relay path.
 Configure a relay for circuits, reservations, and relay-assisted DCUtR.
 :::
 
-## Pubsub facade
+## Pubsub API
 
 Compiled with `features = ["pubsub"]`:
 
@@ -53,7 +53,7 @@ Compiled with `features = ["pubsub"]`:
 
 Gossipsub is the default. Floodsub is an explicit engine selection.
 
-## Discovery facade
+## Discovery API
 
 Compiled with `features = ["discovery"]`, which includes the `nat` and
 `pubsub` Cargo features:
@@ -74,7 +74,7 @@ Until the crates are published, generate rustdoc locally:
 cargo doc --workspace --no-deps --open
 ```
 
-To include every facade feature:
+To include every optional feature:
 
 ```bash
 cargo doc -p minip2p --features nat,pubsub,discovery --no-deps --open

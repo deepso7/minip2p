@@ -1,12 +1,12 @@
 ---
-title: Installation
-description: Add minip2p from GitHub, choose facade features, and activate the drivers your application needs.
+title: Install
+description: Add minip2p from GitHub, choose features, and activate the drivers your application needs.
 ---
 
 minip2p requires **Rust 1.88 or newer**. The crates are not published to
 crates.io yet, so applications install the current pre-release from GitHub.
 
-## Add the base facade
+## Add the dependency
 
 <Tabs>
   <Tab title="cargo add">
@@ -26,7 +26,7 @@ crates.io yet, so applications install the current pre-release from GitHub.
   </Tab>
 </Tabs>
 
-The base facade includes QUIC, mutual peer authentication, Identify, Ping, and
+The base crate includes QUIC, mutual peer authentication, Identify, Ping, and
 registered application protocols.
 
 :::tip

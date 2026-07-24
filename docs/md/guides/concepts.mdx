@@ -1,9 +1,10 @@
 ---
-title: Mental model
-description: Understand endpoints, peer identities, addresses, events, and the difference between direct dialing and NAT-aware connecting.
+title: Concepts
+description: Endpoint, PeerId, PeerAddr, PeerReady, dial versus connect, and where events go.
 ---
 
-Five ideas explain most application code built on minip2p.
+An `Endpoint` is the main application API. Five ideas explain most code built
+on it.
 
 ## Endpoint
 
@@ -25,7 +26,7 @@ flowchart TB
 
 :::note
 Protocol and orchestration logic underneath `Endpoint` is Sans-I/O. The
-facade supplies sockets and clocks so application code can stay small, while
+library supplies sockets and clocks so application code can stay small, while
 custom runtimes can use the deterministic lower layers directly.
 :::
 
@@ -52,7 +53,8 @@ A `PeerAddr` pairs that transport with a terminal peer identity:
 ```
 
 Use `Multiaddr` when choosing where to bind. Use `PeerAddr` when dialing a
-specific authenticated peer.
+specific authenticated peer. See [Identity](/guides/identity) for circuit
+addresses and wildcards.
 
 ## Connection readiness
 
@@ -87,7 +89,7 @@ lands.
 
 :::warning
 Compiling a Cargo feature only exposes its API. Activate the corresponding
-driver on `EndpointBuilder`; see [Installation](/quickstart/installation#compiled-is-not-enabled).
+driver on `EndpointBuilder`; see [Install](/quickstart/install#compiled-is-not-enabled).
 :::
 
 ## Where events go
@@ -100,5 +102,5 @@ streams and expose focused queues:
 - `take_pubsub_events` / `next_pubsub_event`;
 - `take_discovery_events` / `next_discovery_event`.
 
-Continue with [Listen and connect](/guides/listen-and-connect) or compare all
-features in the [feature matrix](/reference/feature-matrix).
+Continue with [Listen and dial](/guides/listen-and-dial) or the
+[glossary](/reference/glossary).

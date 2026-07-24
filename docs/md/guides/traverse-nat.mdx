@@ -1,7 +1,16 @@
 ---
-title: NAT traversal
-description: Configure relay and AutoNAT infrastructure, establish the first usable path, and observe direct upgrades or relay fallback.
+title: Traverse NAT
+description: Configure relay and AutoNAT, establish the first usable path, and observe direct upgrades or relay fallback.
 ---
+
+**Goal:** Activate the NAT driver, connect through a relay race, and observe
+path establish / upgrade / fallback events.
+
+**Assumes:** [Listen and dial](/guides/listen-and-dial) and
+[Concepts](/guides/concepts#dial-versus-connect). You need a reachable Circuit
+Relay v2 server for relayed paths.
+
+<Badge>pre-1.0</Badge> <Badge>needs external relay</Badge>
 
 The `nat` feature adds an orchestrator that can race direct QUIC dials against
 a Circuit Relay v2 path and attempt a DCUtR direct upgrade.

@@ -3,15 +3,13 @@ title: Introduction
 description: A minimal, caller-driven libp2p implementation for Rust applications that want QUIC, clear control flow, and no async runtime.
 ---
 
-Small enough to understand. Complete enough to connect.
-
-`minip2p` gives applications one synchronous [`Endpoint`](/guides/mental-model#endpoint)
-for identity, QUIC connections, built-in Identify and Ping, and application
-protocol streams. Optional features add NAT traversal, pubsub, and peer
-discovery without changing the base API.
+minip2p establishes authenticated QUIC connections with a synchronous
+`Endpoint`. Your application drives progress with `poll` and `next_event` —
+there is no async runtime. Optional features layer on NAT traversal, pubsub,
+and peer discovery without changing the base API.
 
 ```rust
-use minip2p::Endpoint;
+use minip2p::{Deadline, Endpoint};
 
 fn main() -> Result<(), minip2p::Error> {
     let mut node = Endpoint::builder()
@@ -20,87 +18,93 @@ fn main() -> Result<(), minip2p::Error> {
 
     println!("listen={}", node.listen()?);
 
+    while let Some(event) = node.next_event(Deadline::NEVER)? {
+        println!("{event:?}");
+    }
+
     Ok(())
 }
 ```
 
+## Get started
+
+*learn by doing*
+
 <CardGroup cols={2}>
-  <Card
-    title="Install minip2p"
-    href="/quickstart/installation"
-    icon="package-plus"
-  >
-    Add the pre-release Git dependency and choose only the features you need.
+  <Card title="Install" href="/quickstart/install" icon="package-plus">
+    Add the Git dependency and pick `nat`, `pubsub`, or `discovery` features.
   </Card>
-  <Card
-    title="Connect two peers"
-    href="/quickstart/connect-peers"
-    icon="unplug"
-  >
-    Run a listener and dialer locally, then measure a real libp2p ping.
-  </Card>
-  <Card
-    title="Understand the model"
-    href="/guides/mental-model"
-    icon="waypoints"
-  >
-    Learn peer identities, addresses, events, and when to dial or connect.
-  </Card>
-  <Card
-    title="Choose features"
-    href="/reference/feature-matrix"
-    icon="table-properties"
-  >
-    Compare compiled APIs, active drivers, and network prerequisites.
+  <Card title="Connect two peers" href="/quickstart/connect-peers" icon="unplug">
+    In about 10 minutes, print a dialable `PeerAddr` and a Ping RTT.
   </Card>
 </CardGroup>
 
-## The shape of minip2p
+## Understand
 
-- **QUIC only.** One transport, with mutual libp2p TLS authentication built in.
-- **No async runtime.** Your application calls `poll`, `next_event`, or a
-  focused wait when it wants the endpoint to make progress.
-- **Pre-1.0.** Breaking API changes are possible, and the crates are not yet
-  published to crates.io.
-- **libp2p wire formats.** Identify, Ping, Circuit Relay v2 client flows,
-  AutoNAT probes, DCUtR, gossipsub, floodsub, and signed discovery speak the
-  protocol wire formats those stacks expect.
-- **Sans-I/O underneath.** Protocol logic remains deterministic; sockets,
-  clocks, and blocking waits live in the adapters.
+*understand this*
 
-:::note
-These docs begin with the app-facing `minip2p::Endpoint`. Lower-level
-Sans-I/O crates remain available, but their narrative guides are planned for a
-later documentation pass.
-:::
+<CardGroup cols={2}>
+  <Card title="Concepts" href="/guides/concepts" icon="waypoints">
+    Endpoint, PeerId, PeerAddr, PeerReady, and dial versus connect.
+  </Card>
+  <Card title="Identity" href="/guides/identity" icon="key-round">
+    Ephemeral keys, persistent Ed25519 identity, and address shapes.
+  </Card>
+</CardGroup>
 
-## A good reading path
+## Do next
 
-<Steps>
-  <Step title="Install from GitHub">
-    Pick the base facade or enable `nat`, `pubsub`, or `discovery`.
-  </Step>
-  <Step title="Make one local connection">
-    The quickstart uses direct QUIC dialing and a built-in Ping round trip.
-  </Step>
-  <Step title="Add your protocol">
-    Register an application protocol and exchange bytes over negotiated
-    streams.
-  </Step>
-  <Step title="Layer on network policy">
-    Add NAT traversal, pubsub, or discovery only when the application needs
-    it.
-  </Step>
-</Steps>
+*do this specific thing*
 
-## Current constraints
+<CardGroup cols={2}>
+  <Card
+    title="Register a protocol"
+    href="/guides/register-a-protocol"
+    icon="waypoints"
+  >
+    Negotiate streams, exchange bytes, and half-close or abandon cleanly.
+  </Card>
+  <Card title="Traverse NAT" href="/guides/traverse-nat" icon="network">
+    Race direct dials against a relay and upgrade with DCUtR.
+  </Card>
+  <Card title="Publish with pubsub" href="/guides/pubsub" icon="megaphone">
+    Subscribe, publish signed gossipsub messages, or select floodsub.
+  </Card>
+  <Card title="Discover peers" href="/guides/discover-peers" icon="radar">
+    Signed presence beacons and automatic dialing over pubsub + NAT.
+  </Card>
+</CardGroup>
 
-| Constraint | What it means |
+## Look up
+
+*look this up*
+
+<CardGroup cols={3}>
+  <Card
+    title="Feature matrix"
+    href="/reference/feature-matrix"
+    icon="table-properties"
+  >
+    Compiled APIs versus builder-activated drivers.
+  </Card>
+  <Card title="Glossary" href="/reference/glossary" icon="book-open">
+    PeerId, Multiaddr, PeerReady, Path, Sans-I/O, and more.
+  </Card>
+  <Card
+    title="Troubleshooting"
+    href="/reference/troubleshooting"
+    icon="life-buoy"
+  >
+    Symptom → cause → fix for common connection failures.
+  </Card>
+</CardGroup>
+
+## Constraints
+
+| | |
 | --- | --- |
-| Rust 1.88+ | This is the workspace's minimum supported Rust version. |
-| QUIC transport | TCP, WebSocket, and WebTransport adapters are out of scope. |
-| Ed25519 identity | Endpoint identities and signed application messages use Ed25519. |
-| Caller-driven | There is no executor or hidden async task driving the node. |
-| Relay client only | Bring a Circuit Relay v2 server when a relayed path is required. |
-
-Ready to run code? Continue to [Installation](/quickstart/installation).
+| <Badge>pre-1.0</Badge> | APIs may change; crates are not on crates.io yet. |
+| <Badge>QUIC only</Badge> | TCP, WebSocket, and WebTransport are out of scope. |
+| <Badge>Rust 1.88+</Badge> | Workspace MSRV. |
+| <Badge>Caller-driven</Badge> | No executor or hidden async task drives the node. |
+| <Badge>Relay client</Badge> | Bring a Circuit Relay v2 server when a relayed path is required. |

@@ -1,10 +1,16 @@
 ---
-title: Listen and connect
-description: Bind a QUIC endpoint, publish dialable peer addresses, connect directly over IPv4, IPv6, or DNS, and wait for readiness.
+title: Listen and dial
+description: Bind a QUIC endpoint, publish dialable peer addresses, dial over IPv4, IPv6, or DNS, and wait for PeerReady.
 ---
 
-This guide covers direct QUIC connectivity with the base facade. For relay
-races and hole punching, use the separate [NAT traversal guide](/guides/nat).
+**Goal:** Bind, publish a dialable address, dial a known peer, and wait for
+`PeerReady`.
+
+**Assumes:** [Connect two peers](/quickstart/connect-peers) and
+[Concepts](/guides/concepts) (dial versus connect).
+
+This guide covers direct QUIC connectivity with the base Endpoint API. For relay
+races and hole punching, use [Traverse NAT](/guides/traverse-nat).
 
 ## Bind an endpoint
 
@@ -124,7 +130,8 @@ as `Event::ConnectionClosed`.
 
 `dial*` does not reserve on a relay, establish a circuit, or start DCUtR. When
 the application has enabled the `nat` feature and configured its NAT driver,
-use `connect*` plus `wait_path` instead.
+use `connect*` plus `wait_path` instead — see
+[Traverse NAT](/guides/traverse-nat).
 
-Next, [register a custom protocol](/guides/custom-protocols) or read the
-[identity and address guide](/guides/identity-and-addresses).
+Next: [Register a protocol](/guides/register-a-protocol) or
+[Identity](/guides/identity).

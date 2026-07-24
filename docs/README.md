@@ -21,7 +21,8 @@ Run the complete docs check before opening a pull request:
 pnpm check
 ```
 
-This runs Blume's project diagnostics, production build, and link validation.
+This runs Blume's project diagnostics, an isolated production build (safe
+alongside `pnpm dev`), and link validation.
 From the repository root, the same check is available as:
 
 ```bash

@@ -1,9 +1,15 @@
 ---
-title: Pubsub
+title: Publish with pubsub
 description: Enable gossipsub, subscribe and publish signed messages, consume pubsub events, or select floodsub explicitly.
 ---
 
-The `pubsub` feature exposes one facade for gossipsub and floodsub.
+**Goal:** Activate gossipsub (or floodsub), subscribe to a topic, publish
+signed messages, and consume pubsub events.
+
+**Assumes:** [Drive events](/guides/drive-events). A second peer on the same
+topic is required to observe delivery.
+
+The `pubsub` feature exposes one API for gossipsub and floodsub.
 `EndpointBuilder::pubsub()` selects gossipsub by default.
 
 ## Enable gossipsub
@@ -128,4 +134,4 @@ The selected engine controls advertised protocol IDs. Gossipsub advertises
 stream with each other.
 
 For automatic peer address exchange on a signed pubsub topic, continue to
-[Peer discovery](/guides/discovery).
+[Discover peers](/guides/discover-peers).

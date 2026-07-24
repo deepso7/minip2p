@@ -1,7 +1,13 @@
 ---
-title: Events and timeouts
-description: Choose between non-blocking polling, blocking event waits, and focused waits without losing unrelated application events.
+title: Drive events
+description: Choose between poll, next_event, and focused waits without losing unrelated application events.
 ---
+
+**Goal:** Drive the endpoint with the right wait, handle deadlines, and shut
+streams and connections down cleanly.
+
+**Assumes:** [Concepts](/guides/concepts#where-events-go) and preferably
+[Register a protocol](/guides/register-a-protocol).
 
 minip2p remains caller-driven at every layer. The application chooses when to
 poll, how long to wait, and which event queue to consume.

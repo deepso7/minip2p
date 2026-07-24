@@ -1,11 +1,16 @@
 ---
-title: Connect two local peers
-description: Run a listener and dialer in separate terminals, wait for Identify, and measure a libp2p Ping round trip.
+title: Connect two peers
+description: In about 10 minutes, print a dialable PeerAddr and measure a libp2p Ping RTT between two local processes.
 ---
+
+In about 10 minutes you will print a dialable `PeerAddr` and a Ping RTT.
 
 This quickstart creates one small Cargo project with two binaries. The
 listener prints a paste-ready peer address; the dialer connects to it and
-measures a real Ping RTT.
+measures a real Ping round trip.
+
+**Assumes:** [Install](/quickstart/install) is done (Rust 1.88+ and the Git
+dependency).
 
 ## Create the project
 
@@ -139,5 +144,5 @@ listening on both wildcard sockets.
   </AccordionItem>
 </Accordion>
 
-Next, learn [how the endpoint model fits together](/guides/mental-model)
-or [open an application protocol stream](/guides/custom-protocols).
+Next: [Concepts](/guides/concepts) or
+[Register a protocol](/guides/register-a-protocol).

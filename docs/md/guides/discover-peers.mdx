@@ -1,7 +1,15 @@
 ---
-title: Peer discovery
+title: Discover peers
 description: Activate signed presence beacons, a bounded peer address book, and automatic direct or NAT-aware dialing.
 ---
+
+**Goal:** Turn on discovery, observe the known-peer book, and let the driver
+dial peers from signed beacons.
+
+**Assumes:** [Publish with pubsub](/guides/pubsub). Relayed paths still need a
+configured relay — see [Traverse NAT](/guides/traverse-nat).
+
+<Badge>pre-1.0</Badge> <Badge>implies nat + pubsub</Badge>
 
 Discovery layers signed presence beacons and dialing policy over pubsub and
 the NAT agent.

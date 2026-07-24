@@ -1,7 +1,13 @@
 ---
-title: Custom protocols and streams
+title: Register a protocol
 description: Register an application protocol, negotiate streams, exchange bytes, and close or abandon stream state on purpose.
 ---
+
+**Goal:** Register a versioned protocol ID, open or accept streams, exchange
+bytes, and shut streams down cleanly.
+
+**Assumes:** [Connect two peers](/quickstart/connect-peers) and
+[PeerReady](/guides/concepts#connection-readiness).
 
 Application protocols use libp2p multistream-select negotiation over an
 authenticated connection. Both peers must register the same versioned
@@ -119,7 +125,7 @@ fully forgotten, a later call returns an error.
 The complete two-peer echo used in CI lives in
 [`docs/snippets/custom-stream`](https://github.com/deepso7/minip2p/tree/main/docs/snippets/custom-stream).
 That fixture rewrites wildcard listen addresses to loopback before printing
-them, the same way the [quickstart](/quickstart/connect-peers) does.
+them, the same way [Connect two peers](/quickstart/connect-peers) does.
 
 ## Driver-owned streams
 
@@ -127,4 +133,4 @@ When NAT, pubsub, or discovery drivers are active, they register and consume
 their own control-plane streams. Those events do not surface as application
 `StreamData`; use the matching NAT, pubsub, or discovery event APIs instead.
 
-Continue with [Events and timeouts](/guides/events-and-timeouts).
+Next: [Drive events](/guides/drive-events).

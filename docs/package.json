@@ -8,7 +8,7 @@
     "build": "blume build",
     "doctor": "blume doctor",
     "validate": "blume validate",
-    "check": "pnpm run doctor && pnpm run build && pnpm run validate"
+    "check": "pnpm run doctor && blume build --isolated && pnpm run validate"
   },
   "dependencies": {
     "blume": "1.1.3"

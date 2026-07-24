@@ -1,7 +1,12 @@
 ---
-title: Identity and addresses
+title: Identity
 description: Manage Ed25519 peer identity and distinguish bind addresses, direct peer addresses, and relay circuit addresses.
 ---
+
+**Goal:** Choose ephemeral or persistent identity and pick the right address
+shape for bind, dial, and relay.
+
+**Assumes:** [Concepts](/guides/concepts#peeraddr-and-multiaddr).
 
 Every authenticated connection binds a transport address to an Ed25519
 identity.
@@ -94,4 +99,5 @@ remote destinations. Replace a wildcard with a real interface or public
 address before sharing it, or advertise a relay circuit address when the node
 is private.
 
-For automatic address sharing and dialing, see [Peer discovery](/guides/discovery).
+For automatic address sharing and dialing, see
+[Discover peers](/guides/discover-peers).
