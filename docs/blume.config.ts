@@ -50,7 +50,7 @@ export default defineConfig({
     },
   },
   theme: {
-    accent: "teal",
+    accent: "orange",
     radius: "sm",
     mode: "system",
   },

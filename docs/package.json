@@ -11,6 +11,6 @@
     "check": "pnpm run doctor && blume build --isolated && pnpm run validate"
   },
   "dependencies": {
-    "blume": "1.1.3"
+    "blume": "1.1.4"
   }
 }
