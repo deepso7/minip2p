@@ -5,7 +5,7 @@ lives in `md/`; `.blume/` and `dist/` are generated and must not be edited.
 
 ## Requirements
 
-- Node.js 22.12 or newer
+- Node.js 22.13 or newer
 - pnpm 11.10.0
 
 ## Work locally
