@@ -1,0 +1,137 @@
+---
+title: Listen and dial
+description: Bind a QUIC endpoint, publish dialable peer addresses, dial over IPv4, IPv6, or DNS, and wait for PeerReady.
+---
+
+**Goal:** Bind, publish a dialable address, dial a known peer, and wait for
+`PeerReady`.
+
+**Assumes:** [Connect two peers](/quickstart/connect-peers) and
+[Concepts](/guides/concepts) (dial versus connect).
+
+This guide covers direct QUIC connectivity with the base Endpoint API. For relay
+races and hole punching, use [Traverse NAT](/guides/traverse-nat).
+
+## Bind an endpoint
+
+Choose the bind method that matches the host:
+
+| Method | Use it when |
+| --- | --- |
+| `bind_quic("127.0.0.1:0")` | You want one socket address, commonly for local tests. |
+| `bind_quic_multiaddr(&addr)` | Configuration already uses a QUIC `Multiaddr`. |
+| `bind_quic_dual_stack()` | The application should bind separate IPv4 and IPv6 wildcard sockets. |
+
+Port `0` asks the operating system to choose an available UDP port.
+
+```rust
+use minip2p::{Endpoint, PeerAddr};
+
+let mut node = Endpoint::builder()
+    .agent_version("my-app/0.1.0")
+    .bind_quic_dual_stack()?;
+
+for address in node.listen_all()? {
+    // Wildcards describe the bind socket; rewrite before sharing locally.
+    println!("listen={}", local_dialable(&address));
+}
+
+fn local_dialable(address: &PeerAddr) -> String {
+    address
+        .to_string()
+        .replace("/ip4/0.0.0.0/", "/ip4/127.0.0.1/")
+        .replace("/ip6/::/", "/ip6/::1/")
+}
+```
+
+`listen()` publishes the first already-bound address. `listen_all()` publishes
+every bound address, which is normally the right choice for a dual-stack
+endpoint.
+
+:::warning
+An address containing `/ip4/0.0.0.0` or `/ip6/::` describes where the socket
+is bound, not an address another machine can dial. Advertise a real interface,
+public, or relay circuit address to remote peers.
+:::
+
+## Dial a known peer
+
+Parse a complete `PeerAddr`, including its terminal `/p2p/<peer-id>`:
+
+```rust
+use std::str::FromStr;
+
+use minip2p::{Endpoint, PeerAddr};
+
+let target = PeerAddr::from_str(
+    "/dns/node.example.com/udp/4001/quic-v1/p2p/12D3KooW…",
+)?;
+
+let mut node = Endpoint::builder().bind_quic_dual_stack()?;
+let connection_ids = node.dial(&target)?;
+println!("started {} dial(s)", connection_ids.len());
+```
+
+`dial` starts every applicable local address family. For a `/dns/...` target on
+a dual-stack endpoint, that can mean both IPv4 and IPv6 connection IDs.
+`/dns4/...` and `/dns6/...` stay single-family. Use `dial_ip4` or `dial_ip6`
+when policy requires one family.
+
+## Wait for PeerReady
+
+A successful dial still has two useful milestones:
+
+1. `Event::ConnectionEstablished` — QUIC is connected and the peer identity is
+   authenticated.
+2. `Event::PeerReady` — the first Identify exchange has completed, so the
+   endpoint knows which protocols the peer supports.
+
+```rust
+use std::time::Duration;
+
+let ready = node.wait_peer_ready(
+    target.peer_id(),
+    Duration::from_secs(10),
+)?;
+
+if ready.is_none() {
+    eprintln!("peer connected but did not become ready before the deadline");
+}
+```
+
+Wait for `PeerReady` before opening an application protocol stream. After
+Identify completes, `open_stream` can reject an unsupported protocol
+immediately with
+`minip2p::Error::Swarm(minip2p::SwarmError::RemoteDoesNotSupport { .. })`.
+
+## Inspect and disconnect
+
+```rust
+if node.is_peer_ready(target.peer_id()) {
+    if let Some(info) = node.peer_info(target.peer_id()) {
+        println!(
+            "agent={}",
+            info.agent_version.as_deref().unwrap_or("<none>")
+        );
+    }
+}
+
+for peer in node.connected_peers() {
+    println!("connected={peer}");
+}
+
+node.disconnect(target.peer_id())?;
+```
+
+`disconnect` closes the active connection. A later connection closure appears
+as `Event::ConnectionClosed`.
+
+## `dial` is direct-only
+
+`dial*` does not reserve on a relay, establish a circuit, or start DCUtR. When
+the application has enabled the `nat` feature and configured its NAT driver,
+use `connect*` plus `wait_path` instead — see
+[Traverse NAT](/guides/traverse-nat).
+
+Next: [Register a protocol](/guides/register-a-protocol) or
+[Identity](/guides/identity).

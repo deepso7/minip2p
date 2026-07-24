@@ -1,0 +1,122 @@
+---
+title: Install
+description: Add minip2p from GitHub, choose features, and activate the drivers your application needs.
+---
+
+minip2p requires **Rust 1.88 or newer**. The crates are not published to
+crates.io yet, so applications install the current pre-release from GitHub.
+
+## Add the dependency
+
+<Tabs>
+  <Tab title="cargo add">
+
+    ```bash
+    cargo add minip2p --git https://github.com/deepso7/minip2p
+    ```
+
+  </Tab>
+  <Tab title="Cargo.toml">
+
+    ```toml
+    [dependencies]
+    minip2p = { git = "https://github.com/deepso7/minip2p" }
+    ```
+
+  </Tab>
+</Tabs>
+
+The base crate includes QUIC, mutual peer authentication, Identify, Ping, and
+registered application protocols.
+
+:::tip
+For applications, commit `Cargo.lock`. Cargo records the exact Git revision,
+so a later change to `main` does not silently change an existing locked build.
+Libraries that need a fixed source revision can add `rev = "<commit>"`.
+:::
+
+## Choose optional features
+
+Features expose APIs at compile time. Builder methods decide which drivers run
+inside a particular endpoint.
+
+<Tabs>
+  <Tab title="NAT">
+
+    ```toml
+    minip2p = {
+      git = "https://github.com/deepso7/minip2p",
+      features = ["nat"]
+    }
+    ```
+
+    Then activate the NAT driver with `.relay(...)`,
+    `.autonat_server(...)`, or `.nat_config(...)`.
+
+  </Tab>
+  <Tab title="Pubsub">
+
+    ```toml
+    minip2p = {
+      git = "https://github.com/deepso7/minip2p",
+      features = ["pubsub"]
+    }
+    ```
+
+    Then activate pubsub with `.pubsub()` or `.pubsub_config(...)`.
+
+  </Tab>
+  <Tab title="Discovery">
+
+    ```toml
+    minip2p = {
+      git = "https://github.com/deepso7/minip2p",
+      features = ["discovery"]
+    }
+    ```
+
+    The `discovery` Cargo feature includes the `nat` and `pubsub` APIs.
+    Calling `.discovery()` or `.discovery_config(...)` activates discovery,
+    default pubsub, and the NAT agent together.
+
+  </Tab>
+</Tabs>
+
+:::warning
+`.autonat_server(...)` by itself enables reachability probing, not a complete
+traversal path. Configure a relay when the endpoint must establish relayed
+connections or perform relay-assisted hole punching.
+:::
+
+## Compiled is not enabled
+
+| Cargo selection | Builder activation | Result |
+| --- | --- | --- |
+| Base | None required | QUIC, Identify, Ping, custom protocols |
+| `features = ["nat"]` | `.relay`, `.autonat_server`, or `.nat_config` | NAT driver runs with the supplied capabilities |
+| `features = ["pubsub"]` | `.pubsub` or `.pubsub_config` | Gossipsub or floodsub driver runs |
+| `features = ["discovery"]` | `.discovery` or `.discovery_config` | Discovery, default pubsub, and NAT coordination run |
+
+See the [feature matrix](/reference/feature-matrix) for the methods, events,
+and infrastructure each option adds.
+
+## Check the installation
+
+```rust
+use minip2p::Endpoint;
+
+fn main() -> Result<(), minip2p::Error> {
+    let node = Endpoint::builder().bind_quic("127.0.0.1:0")?;
+    println!("local peer: {}", node.peer_id());
+    Ok(())
+}
+```
+
+Run it with:
+
+```bash
+cargo run
+```
+
+The endpoint generates an ephemeral Ed25519 identity when no identity is
+provided. Continue to [Connect two peers](/quickstart/connect-peers).

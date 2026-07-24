@@ -1,0 +1,24 @@
+---
+title: Glossary
+description: Short definitions for Endpoint, PeerId, Multiaddr, PeerAddr, PeerReady, Path, Sans-I/O, and driving methods.
+---
+
+Definitions only. For recipes, follow the linked guides.
+
+| Term | Meaning |
+| --- | --- |
+| **Endpoint** | App-facing entrypoint that owns identity, QUIC, and the synchronous swarm driver. See [Concepts](/guides/concepts#endpoint). |
+| **PeerId** | Authenticated public-key identity of a peer. |
+| **Multiaddr** | Transport address components without a peer identity (for example `/ip4/…/udp/…/quic-v1`). |
+| **PeerAddr** | A `Multiaddr` plus a terminal `/p2p/<peer-id>`. Required for dialing a specific peer. |
+| **PeerReady** | Event after the first Identify exchange; safer milestone than `ConnectionEstablished` before opening app streams. |
+| **Path** | NAT result: `DirectDialed`, `DirectPunched`, or `Relayed`. See [Traverse NAT](/guides/traverse-nat). |
+| **Sans-I/O** | Deterministic protocol/orchestration state machines; sockets and clocks live in adapters. |
+| **`poll`** | One non-blocking drive step; returns currently available application events. |
+| **`next_event`** | Drives until one ordinary application event or a deadline. |
+| **Focused wait** | Drives until a specific result (`wait_peer_ready`, `wait_path`, `next_pubsub_event`, …) while buffering unrelated events. |
+| **Compiled vs enabled** | A Cargo feature unlocks APIs; a builder method activates the driver. See [Install](/quickstart/install#compiled-is-not-enabled). |
+| **Circuit address** | `/…/p2p/<relay>/p2p-circuit/p2p/<target>` — reach a peer through a Circuit Relay v2 reservation. |
+
+For symptom-driven fixes, see [Troubleshooting](/reference/troubleshooting).
+For API surface by feature, see the [feature matrix](/reference/feature-matrix).

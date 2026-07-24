@@ -1,0 +1,110 @@
+---
+title: Introduction
+description: A minimal, caller-driven libp2p implementation for Rust applications that want QUIC, clear control flow, and no async runtime.
+---
+
+minip2p establishes authenticated QUIC connections with a synchronous
+`Endpoint`. Your application drives progress with `poll` and `next_event` —
+there is no async runtime. Optional features layer on NAT traversal, pubsub,
+and peer discovery without changing the base API.
+
+```rust
+use minip2p::{Deadline, Endpoint};
+
+fn main() -> Result<(), minip2p::Error> {
+    let mut node = Endpoint::builder()
+        .agent_version("my-app/0.1.0")
+        .bind_quic("127.0.0.1:0")?;
+
+    println!("listen={}", node.listen()?);
+
+    while let Some(event) = node.next_event(Deadline::NEVER)? {
+        println!("{event:?}");
+    }
+
+    Ok(())
+}
+```
+
+## Get started
+
+*learn by doing*
+
+<CardGroup cols={2}>
+  <Card title="Install" href="/quickstart/install" icon="package-plus">
+    Add the Git dependency and pick `nat`, `pubsub`, or `discovery` features.
+  </Card>
+  <Card title="Connect two peers" href="/quickstart/connect-peers" icon="unplug">
+    In about 10 minutes, print a dialable `PeerAddr` and a Ping RTT.
+  </Card>
+</CardGroup>
+
+## Understand
+
+*understand this*
+
+<CardGroup cols={2}>
+  <Card title="Concepts" href="/guides/concepts" icon="waypoints">
+    Endpoint, PeerId, PeerAddr, PeerReady, and dial versus connect.
+  </Card>
+  <Card title="Identity" href="/guides/identity" icon="key-round">
+    Ephemeral keys, persistent Ed25519 identity, and address shapes.
+  </Card>
+</CardGroup>
+
+## Do next
+
+*do this specific thing*
+
+<CardGroup cols={2}>
+  <Card
+    title="Register a protocol"
+    href="/guides/register-a-protocol"
+    icon="waypoints"
+  >
+    Negotiate streams, exchange bytes, and half-close or abandon cleanly.
+  </Card>
+  <Card title="Traverse NAT" href="/guides/traverse-nat" icon="network">
+    Race direct dials against a relay and upgrade with DCUtR.
+  </Card>
+  <Card title="Publish with pubsub" href="/guides/pubsub" icon="megaphone">
+    Subscribe, publish signed gossipsub messages, or select floodsub.
+  </Card>
+  <Card title="Discover peers" href="/guides/discover-peers" icon="radar">
+    Signed presence beacons and automatic dialing over pubsub + NAT.
+  </Card>
+</CardGroup>
+
+## Look up
+
+*look this up*
+
+<CardGroup cols={3}>
+  <Card
+    title="Feature matrix"
+    href="/reference/feature-matrix"
+    icon="table-properties"
+  >
+    Compiled APIs versus builder-activated drivers.
+  </Card>
+  <Card title="Glossary" href="/reference/glossary" icon="book-open">
+    PeerId, Multiaddr, PeerReady, Path, Sans-I/O, and more.
+  </Card>
+  <Card
+    title="Troubleshooting"
+    href="/reference/troubleshooting"
+    icon="life-buoy"
+  >
+    Symptom → cause → fix for common connection failures.
+  </Card>
+</CardGroup>
+
+## Constraints
+
+| | |
+| --- | --- |
+| <Badge>pre-1.0</Badge> | APIs may change; crates are not on crates.io yet. |
+| <Badge>QUIC only</Badge> | TCP, WebSocket, and WebTransport are out of scope. |
+| <Badge>Rust 1.88+</Badge> | Workspace MSRV. |
+| <Badge>Caller-driven</Badge> | No executor or hidden async task drives the node. |
+| <Badge>Relay client</Badge> | Bring a Circuit Relay v2 server when a relayed path is required. |

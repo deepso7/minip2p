@@ -1,0 +1,148 @@
+---
+title: Connect two peers
+description: In about 10 minutes, print a dialable PeerAddr and measure a libp2p Ping RTT between two local processes.
+---
+
+In about 10 minutes you will print a dialable `PeerAddr` and a Ping RTT.
+
+This quickstart creates one small Cargo project with two binaries. The
+listener prints a paste-ready peer address; the dialer connects to it and
+measures a real Ping round trip.
+
+**Assumes:** [Install](/quickstart/install) is done (Rust 1.88+ and the Git
+dependency).
+
+## Create the project
+
+<Steps>
+  <Step title="Create a binary package">
+
+    ```bash
+    cargo new minip2p-hello
+    cd minip2p-hello
+    cargo add minip2p --git https://github.com/deepso7/minip2p
+    mkdir -p src/bin
+    ```
+
+  </Step>
+  <Step title="Add the listener">
+
+    Create `src/bin/listener.rs`:
+
+    ```rust
+    use minip2p::{Deadline, Endpoint, PeerAddr};
+
+    fn main() -> Result<(), minip2p::Error> {
+        let mut node = Endpoint::builder()
+            .agent_version("minip2p-hello/listener")
+            .bind_quic_dual_stack()?;
+
+        println!("peer={}", node.peer_id());
+        for address in node.listen_all()? {
+            println!("listen={}", local_dialable(&address));
+        }
+
+        while let Some(event) = node.next_event(Deadline::NEVER)? {
+            println!("{event:?}");
+        }
+
+        Ok(())
+    }
+
+    fn local_dialable(address: &PeerAddr) -> String {
+        address
+            .to_string()
+            .replace("/ip4/0.0.0.0/", "/ip4/127.0.0.1/")
+            .replace("/ip6/::/", "/ip6/::1/")
+    }
+    ```
+
+  </Step>
+  <Step title="Add the dialer">
+
+    Create `src/bin/dialer.rs`:
+
+    ```rust
+    use std::{str::FromStr, time::Duration};
+
+    use minip2p::{Endpoint, PeerAddr};
+
+    fn main() -> Result<(), Box<dyn std::error::Error>> {
+        let target = std::env::args()
+            .nth(1)
+            .ok_or("usage: dialer <peer-address>")?;
+        let target = PeerAddr::from_str(&target)?;
+
+        let mut node = Endpoint::builder()
+            .agent_version("minip2p-hello/dialer")
+            .bind_quic_dual_stack()?;
+
+        node.dial(&target)?;
+        let ready = node.wait_peer_ready(
+            target.peer_id(),
+            Duration::from_secs(10),
+        )?;
+        if ready.is_none() {
+            return Err("peer did not become ready within 10 seconds".into());
+        }
+
+        node.ping(target.peer_id())?;
+        let rtt = node
+            .wait_ping_rtt(target.peer_id(), Duration::from_secs(5))?
+            .ok_or("ping timed out")?;
+
+        println!("peer={} rtt={}ms", target.peer_id(), rtt);
+        Ok(())
+    }
+    ```
+
+  </Step>
+</Steps>
+
+## Run it
+
+In terminal one:
+
+```console
+$ cargo run --bin listener
+peer=12D3KooW…
+listen=/ip4/127.0.0.1/udp/54321/quic-v1/p2p/12D3KooW…
+listen=/ip6/::1/udp/54322/quic-v1/p2p/12D3KooW…
+```
+
+Keep the listener running. In terminal two, paste one complete `listen=`
+value:
+
+```console
+$ cargo run --bin dialer -- /ip4/127.0.0.1/udp/54321/quic-v1/p2p/12D3KooW…
+peer=12D3KooW… rtt=2ms
+```
+
+`wait_peer_ready` waits for the authenticated QUIC connection and the first
+Identify exchange. Only after that point does the dialer issue Ping.
+
+`bind_quic_dual_stack` binds wildcard sockets. The listener rewrites only the
+printed local-demo addresses to loopback; the endpoint itself continues
+listening on both wildcard sockets.
+
+## If it does not connect
+
+<Accordion>
+  <AccordionItem title="The address fails to parse">
+    Copy the entire value after `listen=`. A `PeerAddr` needs the terminal
+    `/p2p/<peer-id>` component as well as the QUIC transport address.
+  </AccordionItem>
+  <AccordionItem title="The peer never becomes ready">
+    Keep the listener process running. minip2p is caller-driven, so the
+    listener must continue calling `next_event` to accept the connection,
+    complete Identify, and answer Ping.
+  </AccordionItem>
+  <AccordionItem title="The IPv6 address does not work">
+    Use the printed IPv4 loopback address instead. `bind_quic_dual_stack`
+    binds separate IPv4 and IPv6 sockets, but the host still needs the
+    corresponding address family available.
+  </AccordionItem>
+</Accordion>
+
+Next: [Concepts](/guides/concepts) or
+[Register a protocol](/guides/register-a-protocol).

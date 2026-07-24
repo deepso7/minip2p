@@ -1,0 +1,16 @@
+{
+  "name": "minip2p-docs",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.10.0",
+  "scripts": {
+    "dev": "blume dev",
+    "build": "blume build",
+    "doctor": "blume doctor",
+    "validate": "blume validate",
+    "check": "pnpm run doctor && blume build --isolated && pnpm run validate"
+  },
+  "dependencies": {
+    "blume": "1.1.4"
+  }
+}

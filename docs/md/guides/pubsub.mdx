@@ -1,0 +1,137 @@
+---
+title: Publish with pubsub
+description: Enable gossipsub, subscribe and publish signed messages, consume pubsub events, or select floodsub explicitly.
+---
+
+**Goal:** Activate gossipsub (or floodsub), subscribe to a topic, publish
+signed messages, and consume pubsub events.
+
+**Assumes:** [Drive events](/guides/drive-events). A second peer on the same
+topic is required to observe delivery.
+
+The `pubsub` feature exposes one API for gossipsub and floodsub.
+`EndpointBuilder::pubsub()` selects gossipsub by default.
+
+## Enable gossipsub
+
+```toml
+[dependencies]
+minip2p = {
+  git = "https://github.com/deepso7/minip2p",
+  features = ["pubsub"]
+}
+```
+
+Then activate it on the endpoint:
+
+```rust
+let mut node = minip2p::Endpoint::builder()
+    .pubsub()
+    .bind_quic_dual_stack()?;
+
+node.subscribe("news")?;
+```
+
+The Cargo feature alone only compiles the APIs. Calling `subscribe` on an
+endpoint that was not built with `.pubsub()` or `.pubsub_config(...)` returns
+`PubsubError::NotEnabled`.
+
+## Publish and keep driving
+
+```rust
+node.publish("news", b"hello mesh".to_vec())?;
+
+loop {
+    if let Some(event) =
+        node.next_pubsub_event(std::time::Duration::from_secs(5))?
+    {
+        println!("{event:?}");
+        break;
+    }
+}
+```
+
+A successful `publish` means the message passed validation and outbound work
+was accepted. The endpoint must continue being driven to open streams and
+send frames.
+
+There is no self-delivery. If the local application needs immediate feedback,
+handle its submitted value locally rather than waiting to receive its own
+message.
+
+Later delivery problems appear as `PubsubEvent::OutboundFailure` or ordinary
+`Event::Error` runtime events; they are not returned synchronously from an
+already accepted `publish`.
+
+## Handle messages
+
+```rust
+use minip2p::PubsubEvent;
+
+for event in node.take_pubsub_events() {
+    match event {
+        PubsubEvent::Message {
+            from,
+            topics,
+            data,
+            signed,
+            ..
+        } => {
+            println!(
+                "from={from} topics={topics:?} signed={signed} data={:?}",
+                String::from_utf8_lossy(&data),
+            );
+        }
+        PubsubEvent::ProtocolViolation { peer, reason } => {
+            eprintln!("peer={peer} violated pubsub: {reason}");
+        }
+        _ => {}
+    }
+}
+```
+
+Use `subscribe` and `unsubscribe` to change local topic membership. Both
+return `false` when the requested state already held.
+
+## Signing and unsigned compatibility
+
+Published messages are signed with the endpoint identity. By default,
+gossipsub also rejects unsigned inbound messages—StrictSign-style behavior,
+without a separate public `StrictSign` type.
+
+Only relax inbound acceptance when interoperating with a peer that
+intentionally sends unsigned messages:
+
+```rust
+use minip2p::{Endpoint, GossipsubConfig};
+
+let config = GossipsubConfig {
+    allow_unsigned: true,
+    ..GossipsubConfig::default()
+};
+
+let node = Endpoint::builder()
+    .pubsub_config(config)
+    .bind_quic_dual_stack()?;
+```
+
+Messages that include a signature are still verified. `allow_unsigned` does
+not make local publications unsigned.
+
+## Select floodsub explicitly
+
+```rust
+use minip2p::{Endpoint, FloodsubConfig};
+
+let node = Endpoint::builder()
+    .pubsub_config(FloodsubConfig::default())
+    .bind_quic_dual_stack()?;
+```
+
+The selected engine controls advertised protocol IDs. Gossipsub advertises
+`/meshsub/1.1.0` and `/meshsub/1.0.0`; floodsub advertises
+`/floodsub/1.0.0`. Peers using different engines do not negotiate a pubsub
+stream with each other.
+
+For automatic peer address exchange on a signed pubsub topic, continue to
+[Discover peers](/guides/discover-peers).

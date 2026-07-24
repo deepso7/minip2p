@@ -12,6 +12,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  docs-site:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Blume's lastModified metadata reads page history.
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22.13.0"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "11.10.0"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+      - run: pnpm install --frozen-lockfile
+        working-directory: docs
+      - run: pnpm run check
+        working-directory: docs
+      - run: cargo check --manifest-path docs/snippets/quickstart/Cargo.toml
+      - run: cargo check --manifest-path docs/snippets/custom-stream/Cargo.toml
+
   quality:
     runs-on: ubuntu-latest
     steps:

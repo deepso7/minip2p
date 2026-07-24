@@ -1,0 +1,104 @@
+---
+title: Drive events
+description: Choose between poll, next_event, and focused waits without losing unrelated application events.
+---
+
+**Goal:** Drive the endpoint with the right wait, handle deadlines, and shut
+streams and connections down cleanly.
+
+**Assumes:** [Concepts](/guides/concepts#where-events-go) and preferably
+[Register a protocol](/guides/register-a-protocol).
+
+minip2p remains caller-driven at every layer. The application chooses when to
+poll, how long to wait, and which event queue to consume.
+
+## Pick a driving method
+
+| Method | Behavior | Good fit |
+| --- | --- | --- |
+| `poll()` | Performs one non-blocking drive and returns all currently available application events. | Existing game, UI, or reactor loops |
+| `next_event(deadline)` | Drives until one ordinary application event or the deadline. | Simple synchronous command loops |
+| `wait_peer_ready` | Drives until one peer completes Identify. | Connection setup |
+| `wait_ping_rtt` | Drives until one peer's Ping finishes. | Health checks and measurements |
+| Feature-focused waits | Drive until a NAT, pubsub, or discovery result. | Feature-specific workflows |
+
+## Deadline forms
+
+Every endpoint wait accepts `impl Into<Deadline>`:
+
+```rust
+use std::time::{Duration, Instant};
+
+use minip2p::Deadline;
+
+let relative = Duration::from_secs(5);
+let absolute = Instant::now() + Duration::from_secs(5);
+let forever = Deadline::NEVER;
+```
+
+An expired deadline still permits the endpoint to inspect events that are
+already synchronously available, but it will not sleep or poll repeatedly
+past the deadline.
+
+## Build a straightforward event loop
+
+```rust
+use minip2p::{Deadline, Endpoint, Event};
+
+fn run(mut node: Endpoint) -> Result<(), minip2p::Error> {
+    while let Some(event) = node.next_event(Deadline::NEVER)? {
+        match event {
+            Event::PeerReady { peer_id, .. } => {
+                println!("ready={peer_id}");
+            }
+            Event::Error(error) => {
+                eprintln!("runtime error: {error:?}");
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+```
+
+Synchronous method failures are returned as `minip2p::Error`. Non-fatal
+problems that occur later while driving appear as `Event::Error` or a
+feature-specific failure event.
+
+## Focused waits preserve other events
+
+Suppose `wait_path` is waiting for a NAT result while an application stream
+receives data. The stream event is retained and becomes available through a
+later `next_event`; it is not discarded by the NAT wait.
+
+That retained backlog is bounded by `RUN_UNTIL_SKIP_LIMIT` (currently 1024
+events). If a focused wait cannot find its result while unrelated events keep
+arriving, it returns:
+
+```text
+minip2p::Error::EventBacklogExceeded { limit: RUN_UNTIL_SKIP_LIMIT }
+```
+
+Drain ordinary application events with `next_event` or `poll`, handle the
+high-volume source, and then retry the focused wait.
+
+:::tip
+Avoid calling `Deadline::NEVER` on a narrow predicate while ignoring a busy
+stream. Either consume those stream events in the main loop or use a finite
+deadline and alternate consumers.
+:::
+
+## Stream and connection shutdown
+
+- Call `close_stream_write` after the final byte for a graceful half-close.
+- Call `reset_stream` when the peer should observe abrupt termination and the
+  application still wants terminal events.
+- Call `abandon_stream` when no matching buffered or future events should be
+  delivered.
+- Call `disconnect` to close the active peer connection.
+
+`Endpoint` does not run a background shutdown sequence after it is dropped.
+Drive any graceful application-level close exchanges before leaving scope.
+
+See [Troubleshooting](/reference/troubleshooting) for common event symptoms and
+responses.
