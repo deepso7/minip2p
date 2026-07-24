@@ -39,39 +39,6 @@ export default defineConfig({
     sitemap: true,
     structuredData: true,
   },
-  navigation: {
-    sidebar: {
-      display: "group",
-      items: [
-        "/",
-        {
-          label: "Quickstart",
-          items: ["/quickstart/install", "/quickstart/connect-peers"],
-        },
-        {
-          label: "Guides",
-          items: [
-            "/guides/concepts",
-            "/guides/listen-and-dial",
-            "/guides/register-a-protocol",
-            "/guides/drive-events",
-            "/guides/identity",
-            "/guides/traverse-nat",
-            "/guides/pubsub",
-            "/guides/discover-peers",
-          ],
-        },
-        {
-          label: "Reference",
-          items: [
-            "/reference/feature-matrix",
-            "/reference/glossary",
-            "/reference/troubleshooting",
-          ],
-        },
-      ],
-    },
-  },
   theme: {
     accent: "orange",
     radius: "sm",
