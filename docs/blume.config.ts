@@ -38,6 +38,7 @@ export default defineConfig({
     robots: true,
     sitemap: true,
     structuredData: true,
+    x: { creator: "@deepso7", handle: "@deepso7" },
   },
   theme: {
     accent: "orange",
