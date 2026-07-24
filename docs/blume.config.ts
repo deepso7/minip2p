@@ -16,6 +16,29 @@ export default defineConfig({
   content: {
     root: "md",
   },
+  ai: {
+    llmsTxt: {
+      enabled: true,
+      openapi: false,
+    },
+  },
+  seo: {
+    agentReadability: true,
+    contentSignals: {
+      search: true,
+      aiInput: true,
+      aiTrain: true,
+    },
+    og: {
+      enabled: true,
+      palette: {
+        accent: "orange",
+      },
+    },
+    robots: true,
+    sitemap: true,
+    structuredData: true,
+  },
   navigation: {
     sidebar: {
       display: "group",
