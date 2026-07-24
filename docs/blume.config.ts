@@ -58,4 +58,7 @@ export default defineConfig({
     dir: "docs",
   },
   lastModified: true,
+  deployment: {
+    adapter: "cloudflare",
+  },
 });
