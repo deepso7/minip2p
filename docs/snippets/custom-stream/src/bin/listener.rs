@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use minip2p::{Deadline, Endpoint, Event, PeerId, StreamId};
+use minip2p::{Deadline, Endpoint, Event, PeerAddr, PeerId, StreamId};
 
 const ECHO_PROTOCOL: &str = "/my-app/echo/1.0.0";
 
@@ -11,7 +11,7 @@ fn main() -> Result<(), minip2p::Error> {
         .bind_quic_dual_stack()?;
 
     for address in node.listen_all()? {
-        println!("listen={address}");
+        println!("listen={}", local_dialable(&address));
     }
 
     let mut echo_streams: HashSet<(PeerId, StreamId)> = HashSet::new();
@@ -53,4 +53,11 @@ fn main() -> Result<(), minip2p::Error> {
     }
 
     Ok(())
+}
+
+fn local_dialable(address: &PeerAddr) -> String {
+    address
+        .to_string()
+        .replace("/ip4/0.0.0.0/", "/ip4/127.0.0.1/")
+        .replace("/ip6/::/", "/ip6/::1/")
 }

@@ -3,3 +3,4 @@ dist/
 snippets/**/Cargo.lock
 snippets/**/target/
 node_modules/
+.blume-verify/

@@ -29,6 +29,7 @@ reconstructed keypair:
 ```rust
 use minip2p::{Ed25519Keypair, Endpoint};
 
+// Load 32 secret bytes from your own secure storage.
 let secret: [u8; 32] = load_secret_from_secure_storage()?;
 let identity = Ed25519Keypair::from_secret_key_bytes(secret);
 
@@ -37,6 +38,7 @@ let node = Endpoint::builder()
     .bind_quic_dual_stack()?;
 ```
 
+`load_secret_from_secure_storage` is application code, not a minip2p API.
 Persist `Ed25519Keypair::secret_key_bytes()` with owner-only permissions or an
 operating-system secret store. Never log or transmit the secret.
 

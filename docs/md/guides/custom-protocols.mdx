@@ -1,6 +1,6 @@
 ---
 title: Custom protocols and streams
-description: Register an application protocol, negotiate streams, exchange bytes, and close or abandon stream state intentionally.
+description: Register an application protocol, negotiate streams, exchange bytes, and close or abandon stream state on purpose.
 ---
 
 Application protocols use libp2p multistream-select negotiation over an
@@ -20,7 +20,8 @@ and outbound negotiation.
 
 :::warning
 `/ipfs/id/1.0.0` and `/ipfs/ping/1.0.0` are owned by the endpoint. Registering
-an ID in `RESERVED_PROTOCOL_IDS` fails with `SwarmError::ReservedProtocol`.
+an ID in `RESERVED_PROTOCOL_IDS` fails with
+`minip2p::Error::Swarm(minip2p::SwarmError::ReservedProtocol { .. })`.
 :::
 
 ## Open an outbound stream
@@ -111,8 +112,14 @@ match event {
 | `abandon_stream` | Reset the stream, purge buffered matching events, and suppress later matching stream events. |
 
 Use `abandon_stream` when an application has permanently stopped consuming a
-stream. It is idempotent and prevents an ignored stream from filling focused
-wait buffers.
+stream. Calling it again while the abandon/reset is still pending is safe and
+keeps an ignored stream from filling focused wait buffers. After the stream is
+fully forgotten, a later call returns an error.
+
+The complete two-peer echo used in CI lives in
+[`docs/snippets/custom-stream`](https://github.com/deepso7/minip2p/tree/main/docs/snippets/custom-stream).
+That fixture rewrites wildcard listen addresses to loopback before printing
+them, the same way the [quickstart](/quickstart/connect-peers) does.
 
 ## Driver-owned streams
 

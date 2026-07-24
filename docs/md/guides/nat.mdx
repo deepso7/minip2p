@@ -58,17 +58,35 @@ connections, inbound reservations, and relay-assisted hole punching.
 ```rust
 use std::time::Duration;
 
-let connect_id = node.connect_addr(&target)?;
-let path = node
-    .wait_path(connect_id, Duration::from_secs(60))?
-    .ok_or("no usable path before the deadline")?;
+use minip2p::NatEvent;
 
-println!("connected via {path:?}");
+let connect_id = node.connect_addr(&target)?;
+match node.wait_path(connect_id, Duration::from_secs(60))? {
+    Some(path) => println!("connected via {path:?}"),
+    None => {
+        let failed = node.take_nat_events().into_iter().find(|event| {
+            matches!(
+                event,
+                NatEvent::ConnectFailed { connect_id: id, .. } if *id == connect_id
+            )
+        });
+        match failed {
+            Some(NatEvent::ConnectFailed { error, .. }) => {
+                eprintln!("connect failed: {error:?}");
+            }
+            _ => eprintln!("no usable path before the deadline"),
+        }
+    }
+}
 ```
 
-`wait_path` consumes the matching `NatEvent::PathEstablished`. If the attempt
-fails, it returns `None` and leaves `NatEvent::ConnectFailed` queued so the
-application can inspect the reason with `take_nat_events`.
+`wait_path` returns `Ok(Some(path))` when it consumes the matching
+`NatEvent::PathEstablished`. It returns `Ok(None)` in two cases:
+
+- the attempt failed — `NatEvent::ConnectFailed` stays queued for
+  `take_nat_events`;
+- the deadline expired before either outcome — no `ConnectFailed` is
+  synthesized.
 
 ## Path selection and upgrade
 

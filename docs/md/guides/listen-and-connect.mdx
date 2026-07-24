@@ -19,14 +19,22 @@ Choose the bind method that matches the host:
 Port `0` asks the operating system to choose an available UDP port.
 
 ```rust
-use minip2p::Endpoint;
+use minip2p::{Endpoint, PeerAddr};
 
 let mut node = Endpoint::builder()
     .agent_version("my-app/0.1.0")
     .bind_quic_dual_stack()?;
 
 for address in node.listen_all()? {
-    println!("listen={address}");
+    // Wildcards describe the bind socket; rewrite before sharing locally.
+    println!("listen={}", local_dialable(&address));
+}
+
+fn local_dialable(address: &PeerAddr) -> String {
+    address
+        .to_string()
+        .replace("/ip4/0.0.0.0/", "/ip4/127.0.0.1/")
+        .replace("/ip6/::/", "/ip6/::1/")
 }
 ```
 
@@ -50,7 +58,7 @@ use std::str::FromStr;
 use minip2p::{Endpoint, PeerAddr};
 
 let target = PeerAddr::from_str(
-    "/dns4/node.example.com/udp/4001/quic-v1/p2p/12D3KooW…",
+    "/dns/node.example.com/udp/4001/quic-v1/p2p/12D3KooW…",
 )?;
 
 let mut node = Endpoint::builder().bind_quic_dual_stack()?;
@@ -58,9 +66,10 @@ let connection_ids = node.dial(&target)?;
 println!("started {} dial(s)", connection_ids.len());
 ```
 
-`dial` starts every applicable local address family. For a DNS target on a
-dual-stack endpoint, it can return both IPv4 and IPv6 connection IDs. Use
-`dial_ip4` or `dial_ip6` when policy requires one family.
+`dial` starts every applicable local address family. For a `/dns/...` target on
+a dual-stack endpoint, that can mean both IPv4 and IPv6 connection IDs.
+`/dns4/...` and `/dns6/...` stay single-family. Use `dial_ip4` or `dial_ip6`
+when policy requires one family.
 
 ## Wait for PeerReady
 
@@ -84,16 +93,20 @@ if ready.is_none() {
 }
 ```
 
-Wait for `PeerReady` before opening an application protocol stream. Calling
-`open_stream` after readiness lets minip2p reject unsupported protocols
-immediately and clearly.
+Wait for `PeerReady` before opening an application protocol stream. After
+Identify completes, `open_stream` can reject an unsupported protocol
+immediately with
+`minip2p::Error::Swarm(minip2p::SwarmError::RemoteDoesNotSupport { .. })`.
 
 ## Inspect and disconnect
 
 ```rust
 if node.is_peer_ready(target.peer_id()) {
     if let Some(info) = node.peer_info(target.peer_id()) {
-        println!("agent={}", info.agent_version);
+        println!(
+            "agent={}",
+            info.agent_version.as_deref().unwrap_or("<none>")
+        );
     }
 }
 
@@ -107,7 +120,7 @@ node.disconnect(target.peer_id())?;
 `disconnect` closes the active connection. A later connection closure appears
 as `Event::ConnectionClosed`.
 
-## Direct dialing is deliberately direct
+## `dial` is direct-only
 
 `dial*` does not reserve on a relay, establish a circuit, or start DCUtR. When
 the application has enabled the `nat` feature and configured its NAT driver,

@@ -8,7 +8,7 @@ export default defineConfig({
     content: "minip2p is pre-1.0 and not yet published to crates.io.",
     link: {
       text: "Install from GitHub",
-      href: "/getting-started/installation",
+      href: "/quickstart/installation",
     },
     dismissible: true,
     id: "minip2p-pre-1.0",
@@ -22,16 +22,13 @@ export default defineConfig({
       items: [
         "/",
         {
-          label: "Start Here",
-          items: [
-            "/getting-started/installation",
-            "/getting-started/quickstart",
-            "/getting-started/mental-model",
-          ],
+          label: "Quickstart",
+          items: ["/quickstart/installation", "/quickstart/connect-peers"],
         },
         {
           label: "Core Guides",
           items: [
+            "/guides/mental-model",
             "/guides/listen-and-connect",
             "/guides/custom-protocols",
             "/guides/events-and-timeouts",
@@ -40,18 +37,11 @@ export default defineConfig({
         },
         {
           label: "Network Features",
-          items: [
-            "/guides/nat",
-            "/guides/pubsub",
-            "/guides/discovery",
-          ],
+          items: ["/guides/nat", "/guides/pubsub", "/guides/discovery"],
         },
         {
           label: "Reference",
-          items: [
-            "/reference/feature-matrix",
-            "/reference/troubleshooting",
-          ],
+          items: ["/reference/feature-matrix", "/reference/troubleshooting"],
         },
       ],
     },
