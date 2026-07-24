@@ -60,5 +60,6 @@ export default defineConfig({
   lastModified: true,
   deployment: {
     adapter: "cloudflare",
+    site: "https://minip2p.com",
   },
 });
