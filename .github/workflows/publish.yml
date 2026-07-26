@@ -40,27 +40,44 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "minip2p-rs") | .version')"
+          metadata="$(cargo metadata --no-deps --format-version 1)"
+          version="$(jq -r '.packages[] | select(.name == "minip2p-rs") | .version' <<<"$metadata")"
           if [[ "$RELEASE_TAG" != "v$version" ]]; then
             echo "::error::Release tag $RELEASE_TAG does not match workspace version $version (expected v$version)"
             exit 1
           fi
 
+          mismatched_versions="$(
+            jq -r --arg version "$version" '
+              .packages[]
+              | select(
+                  (.name == "minip2p-rs" or (.name | startswith("minip2p-")))
+                  and .publish != []
+                  and .version != $version
+                )
+              | "\(.name) is \(.version), expected \($version)"
+            ' <<<"$metadata"
+          )"
+          if [[ -n "$mismatched_versions" ]]; then
+            echo "::error::All published minip2p crates must use the same version:"
+            echo "$mismatched_versions"
+            exit 1
+          fi
+
           mismatched_dependencies="$(
-            cargo metadata --no-deps --format-version 1 |
-              jq -r --arg requirement "^$version" '
-                .packages[]
-                | select(.publish != [])
-                | .name as $package
-                | .dependencies[]
-                | select(
-                    .source == null
-                    and .kind != "dev"
-                    and (.name | startswith("minip2p"))
-                    and .req != $requirement
-                  )
-                | "\($package) -> \(.name) uses \(.req), expected \($requirement)"
-              '
+            jq -r --arg requirement "^$version" '
+              .packages[]
+              | select(.publish != [])
+              | .name as $package
+              | .dependencies[]
+              | select(
+                  .source == null
+                  and .kind != "dev"
+                  and (.name | startswith("minip2p"))
+                  and .req != $requirement
+                )
+              | "\($package) -> \(.name) uses \(.req), expected \($requirement)"
+            ' <<<"$metadata"
           )"
           if [[ -n "$mismatched_dependencies" ]]; then
             echo "::error::Publishable local dependencies do not match workspace version:"
@@ -117,5 +134,18 @@ jobs:
               exit 1
             fi
 
-            cargo publish --package "$crate"
+            for attempt in {1..6}; do
+              if cargo publish --package "$crate"; then
+                break
+              fi
+
+              if [[ "$attempt" == 6 ]]; then
+                echo "::error::Failed to publish $crate after $attempt attempts"
+                exit 1
+              fi
+
+              delay=$((attempt * 10))
+              echo "Publish attempt $attempt for $crate failed; retrying in ${delay}s while crates.io indexes dependencies"
+              sleep "$delay"
+            done
           done

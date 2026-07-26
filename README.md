@@ -168,29 +168,10 @@ Generate the full API docs with:
 cargo doc --workspace --no-deps --open
 ```
 
-## Publishing
+## Versioning
 
-Publishing is handled by `.github/workflows/publish.yml`. Before the first
-release:
-
-1. Confirm that every `minip2p*` crate name in the publish workflow is
-   available on crates.io.
-2. Publish the initial version of every runtime crate manually, in the order
-   listed in the workflow. crates.io requires this one-time bootstrap before
-   trusted publishing can be configured.
-3. Configure this repository as a trusted publisher for every published crate,
-   using workflow `publish.yml` and GitHub environment `crates.io`.
-
-For a release, update the workspace version and all versioned local
-dependencies, merge the release commit, then publish a GitHub release tagged
-`v<version>` (for example, `v0.1.0`). The workflow verifies the tag and
-dependency versions, runs the release test suite and docs build, and publishes
-all runtime crates in dependency order because crates.io must be able to
-resolve every direct and transitive dependency of the `minip2p-rs` facade.
-Examples, test support, fuzzing, and documentation packages are not published.
-Reruns are safe after a partial failure: versions already present on crates.io
-are skipped. GitHub Actions authenticates through crates.io Trusted Publishing
-with a short-lived OIDC token; no permanent registry token is stored in GitHub.
+All minip2p crates use lockstep versioning. Each release publishes every
+runtime crate at the same version, including crates without code changes.
 
 ## Roadmap focus
 

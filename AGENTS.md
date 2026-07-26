@@ -26,6 +26,8 @@ just fuzz 30       # needs nightly + cargo-fuzz
 
 Single test: `cargo test -p minip2p-ping test_name`. Facade features: `cargo test -p minip2p-rs --features nat` (or `pubsub`, `nat,pubsub`). `fuzz/` is outside the workspace — use `--manifest-path fuzz/Cargo.toml`.
 
+Publishing: bump the workspace version and all versioned local dependencies in lockstep, update `Cargo.lock`, run the standard checks, push the release commit, then publish a GitHub release tagged `v<version>`; the workflow publishes every runtime crate.
+
 ## Architecture
 
 Three layers, strictly separated:
