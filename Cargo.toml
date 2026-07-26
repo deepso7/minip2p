@@ -34,6 +34,8 @@ rust-version = "1.88"
 license = "MIT"
 homepage = "https://github.com/deepso7/minip2p"
 repository = "https://github.com/deepso7/minip2p"
+keywords = ["libp2p", "peer-to-peer", "p2p", "networking", "sans-io"]
+categories = ["network-programming"]
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
