@@ -14,15 +14,6 @@ export default defineConfig({
     image: "/logo.svg",
     text: "minip2p",
   },
-  banner: {
-    content: "minip2p is pre-1.0 and not yet published to crates.io.",
-    link: {
-      text: "Install from GitHub",
-      href: "/quickstart/install",
-    },
-    dismissible: true,
-    id: "minip2p-pre-1.0",
-  },
   content: {
     root: "md",
   },

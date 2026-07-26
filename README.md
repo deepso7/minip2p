@@ -109,7 +109,7 @@ Build an app endpoint with the top-level facade:
 
 ```toml
 [dependencies]
-minip2p = { package = "minip2p-rs", version = "0.1" }
+minip2p-rs = "0.1.1"
 ```
 
 ```rust

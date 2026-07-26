@@ -1,10 +1,10 @@
 ---
 title: Install
-description: Add minip2p from GitHub, choose features, and activate the drivers your application needs.
+description: Add minip2p from crates.io, choose features, and activate the drivers your application needs.
 ---
 
-minip2p requires **Rust 1.88 or newer**. The crates are not published to
-crates.io yet, so applications install the current pre-release from GitHub.
+minip2p requires **Rust 1.88 or newer**. The application-facing crate is
+published to crates.io as `minip2p-rs` and imported in Rust code as `minip2p`.
 
 ## Add the dependency
 
@@ -12,7 +12,7 @@ crates.io yet, so applications install the current pre-release from GitHub.
   <Tab title="cargo add">
 
     ```bash
-    cargo add minip2p
+    cargo add minip2p-rs
     ```
 
   </Tab>
@@ -20,7 +20,7 @@ crates.io yet, so applications install the current pre-release from GitHub.
 
     ```toml
     [dependencies]
-    minip2p = { git = "https://github.com/deepso7/minip2p" }
+    minip2p-rs = "0.1.1"
     ```
 
   </Tab>
@@ -28,12 +28,6 @@ crates.io yet, so applications install the current pre-release from GitHub.
 
 The base crate includes QUIC, mutual peer authentication, Identify, Ping, and
 registered application protocols.
-
-:::tip
-For applications, commit `Cargo.lock`. Cargo records the exact Git revision,
-so a later change to `main` does not silently change an existing locked build.
-Libraries that need a fixed source revision can add `rev = "<commit>"`.
-:::
 
 ## Choose optional features
 
@@ -44,8 +38,8 @@ inside a particular endpoint.
   <Tab title="NAT">
 
     ```toml
-    minip2p = {
-      git = "https://github.com/deepso7/minip2p",
+    minip2p-rs = {
+      version = "0.1.1",
       features = ["nat"]
     }
     ```
@@ -57,8 +51,8 @@ inside a particular endpoint.
   <Tab title="Pubsub">
 
     ```toml
-    minip2p = {
-      git = "https://github.com/deepso7/minip2p",
+    minip2p-rs = {
+      version = "0.1.1",
       features = ["pubsub"]
     }
     ```
@@ -69,8 +63,8 @@ inside a particular endpoint.
   <Tab title="Discovery">
 
     ```toml
-    minip2p = {
-      git = "https://github.com/deepso7/minip2p",
+    minip2p-rs = {
+      version = "0.1.1",
       features = ["discovery"]
     }
     ```
