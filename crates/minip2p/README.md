@@ -1,6 +1,14 @@
-# minip2p
+# minip2p-rs
 
 App-facing facade for minip2p.
+
+```toml
+[dependencies]
+minip2p = { package = "minip2p-rs", version = "0.1" }
+```
+
+The package is named `minip2p-rs` on crates.io and its library target remains
+`minip2p`, so application imports stay concise:
 
 This crate glues identity, QUIC transport, and the std swarm driver into a
 small `Endpoint` API. Lower crates remain available directly for Sans-I/O and

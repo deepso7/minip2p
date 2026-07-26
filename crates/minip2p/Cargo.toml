@@ -1,5 +1,5 @@
 [package]
-name = "minip2p"
+name = "minip2p-rs"
 description = "A minimal caller-driven libp2p implementation"
 version.workspace = true
 edition.workspace = true
@@ -8,6 +8,9 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 readme = "README.md"
+
+[lib]
+name = "minip2p"
 
 [lints]
 workspace = true

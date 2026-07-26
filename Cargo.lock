@@ -791,26 +791,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
-name = "minip2p"
-version = "0.1.0"
-dependencies = [
- "getrandom",
- "minip2p-circuit",
- "minip2p-core",
- "minip2p-discovery",
- "minip2p-identify",
- "minip2p-identity",
- "minip2p-nat",
- "minip2p-pubsub",
- "minip2p-quic",
- "minip2p-relay",
- "minip2p-swarm",
- "minip2p-test-support",
- "minip2p-transport",
- "thiserror",
-]
-
-[[package]]
 name = "minip2p-autonat"
 version = "0.1.0"
 dependencies = [
@@ -822,9 +802,9 @@ dependencies = [
 name = "minip2p-chat"
 version = "0.1.0"
 dependencies = [
- "minip2p",
  "minip2p-example-common",
  "minip2p-relay",
+ "minip2p-rs",
  "minip2p-test-support",
 ]
 
@@ -873,7 +853,7 @@ dependencies = [
 name = "minip2p-example-common"
 version = "0.1.0"
 dependencies = [
- "minip2p",
+ "minip2p-rs",
 ]
 
 [[package]]
@@ -936,8 +916,8 @@ dependencies = [
 name = "minip2p-peer"
 version = "0.1.0"
 dependencies = [
- "minip2p",
  "minip2p-example-common",
+ "minip2p-rs",
 ]
 
 [[package]]
@@ -984,6 +964,26 @@ name = "minip2p-relay"
 version = "0.1.0"
 dependencies = [
  "minip2p-core",
+ "thiserror",
+]
+
+[[package]]
+name = "minip2p-rs"
+version = "0.1.0"
+dependencies = [
+ "getrandom",
+ "minip2p-circuit",
+ "minip2p-core",
+ "minip2p-discovery",
+ "minip2p-identify",
+ "minip2p-identity",
+ "minip2p-nat",
+ "minip2p-pubsub",
+ "minip2p-quic",
+ "minip2p-relay",
+ "minip2p-swarm",
+ "minip2p-test-support",
+ "minip2p-transport",
  "thiserror",
 ]
 

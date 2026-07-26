@@ -24,7 +24,7 @@ just check-nostd   # no_std check on thumbv7em-none-eabi
 just fuzz 30       # needs nightly + cargo-fuzz
 ```
 
-Single test: `cargo test -p minip2p-ping test_name`. Facade features: `cargo test -p minip2p --features nat` (or `pubsub`, `nat,pubsub`). `fuzz/` is outside the workspace — use `--manifest-path fuzz/Cargo.toml`.
+Single test: `cargo test -p minip2p-ping test_name`. Facade features: `cargo test -p minip2p-rs --features nat` (or `pubsub`, `nat,pubsub`). `fuzz/` is outside the workspace — use `--manifest-path fuzz/Cargo.toml`.
 
 ## Architecture
 

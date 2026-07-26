@@ -13,7 +13,7 @@ name = "minip2p-chat"
 path = "src/main.rs"
 
 [dependencies]
-minip2p = { path = "../../crates/minip2p", features = ["discovery"] }
+minip2p = { package = "minip2p-rs", path = "../../crates/minip2p", features = ["discovery"] }
 minip2p-example-common = { path = "../common" }
 
 [dev-dependencies]

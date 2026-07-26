@@ -40,7 +40,7 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "minip2p") | .version')"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "minip2p-rs") | .version')"
           if [[ "$RELEASE_TAG" != "v$version" ]]; then
             echo "::error::Release tag $RELEASE_TAG does not match workspace version $version (expected v$version)"
             exit 1
@@ -73,7 +73,7 @@ jobs:
       - name: Test release commit
         run: |
           cargo test --workspace --locked
-          cargo test -p minip2p --features nat,pubsub,discovery --locked
+          cargo test -p minip2p-rs --features nat,pubsub,discovery --locked
           cargo doc --workspace --no-deps --locked
 
       - name: Publish crates in dependency order
@@ -101,19 +101,19 @@ jobs:
             minip2p-nat
             minip2p-pubsub
             minip2p-quic
-            minip2p
+            minip2p-rs
           )
 
           for crate in "${crates[@]}"; do
-            status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            crate_http_code="$(curl --silent --output /dev/null --write-out '%{http_code}' \
               "https://crates.io/api/v1/crates/$crate/$CRATE_VERSION")"
 
-            if [[ "$status" == "200" ]]; then
+            if [[ "$crate_http_code" == "200" ]]; then
               echo "$crate $CRATE_VERSION is already published; skipping"
               continue
             fi
-            if [[ "$status" != "404" ]]; then
-              echo "::error::crates.io returned HTTP $status while checking $crate $CRATE_VERSION"
+            if [[ "$crate_http_code" != "404" ]]; then
+              echo "::error::crates.io returned HTTP $crate_http_code while checking $crate $CRATE_VERSION"
               exit 1
             fi
 

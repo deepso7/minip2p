@@ -7,11 +7,11 @@ fmt:
 check:
     cargo check --workspace --all-targets
     cargo check --manifest-path fuzz/Cargo.toml --all-targets
-    cargo check -p minip2p
-    cargo check -p minip2p --features nat
-    cargo check -p minip2p --features pubsub
-    cargo check -p minip2p --features nat,pubsub
-    cargo check -p minip2p --features discovery
+    cargo check -p minip2p-rs
+    cargo check -p minip2p-rs --features nat
+    cargo check -p minip2p-rs --features pubsub
+    cargo check -p minip2p-rs --features nat,pubsub
+    cargo check -p minip2p-rs --features discovery
 
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
@@ -19,10 +19,10 @@ clippy:
 
 test:
     cargo test
-    cargo test -p minip2p --features nat
-    cargo test -p minip2p --features pubsub
-    cargo test -p minip2p --features nat,pubsub
-    cargo test -p minip2p --features discovery
+    cargo test -p minip2p-rs --features nat
+    cargo test -p minip2p-rs --features pubsub
+    cargo test -p minip2p-rs --features nat,pubsub
+    cargo test -p minip2p-rs --features discovery
 
 check-nostd:
     rustup target add thumbv7em-none-eabi
@@ -33,7 +33,7 @@ peer-ping:
 
 docs:
     cargo doc --workspace --no-deps
-    cargo doc -p minip2p --features nat,pubsub,discovery --no-deps
+    cargo doc -p minip2p-rs --features nat,pubsub,discovery --no-deps
 
 docs-site:
     cd docs && pnpm run check

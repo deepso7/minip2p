@@ -57,7 +57,7 @@ Sans-I/O orchestrators (`no_std + alloc`):
 
 Runtime adapters (`std`):
 
-- `crates/minip2p` (`minip2p`): app-facing facade that glues identity, QUIC, and the std swarm driver into an `Endpoint` API. Opt-in cargo features layer on without changing the base API:
+- `crates/minip2p` (`minip2p-rs`, imported as `minip2p`): app-facing facade that glues identity, QUIC, and the std swarm driver into an `Endpoint` API. Opt-in cargo features layer on without changing the base API:
   - `nat` wires the traversal agent into `Endpoint` (`connect`/`wait_path`/`take_nat_events`, relay reservations, AutoNAT probing).
   - `pubsub` adds gossipsub by default (`subscribe`/`publish`/`take_pubsub_events`), with explicit floodsub selection available.
   - `discovery` composes `nat` and `pubsub` into signed peer discovery (`known_peers`/`next_discovery_event`), with coordinated dialing and bridge cleanup.
@@ -106,6 +106,11 @@ cargo test
 ```
 
 Build an app endpoint with the top-level facade:
+
+```toml
+[dependencies]
+minip2p = { package = "minip2p-rs", version = "0.1" }
+```
 
 ```rust
 use minip2p::{Deadline, Endpoint, Event};
@@ -181,7 +186,7 @@ dependencies, merge the release commit, then publish a GitHub release tagged
 `v<version>` (for example, `v0.1.0`). The workflow verifies the tag and
 dependency versions, runs the release test suite and docs build, and publishes
 all runtime crates in dependency order because crates.io must be able to
-resolve every direct and transitive dependency of the `minip2p` facade.
+resolve every direct and transitive dependency of the `minip2p-rs` facade.
 Examples, test support, fuzzing, and documentation packages are not published.
 Reruns are safe after a partial failure: versions already present on crates.io
 are skipped. GitHub Actions authenticates through crates.io Trusted Publishing
