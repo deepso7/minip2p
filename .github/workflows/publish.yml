@@ -123,6 +123,7 @@ jobs:
 
           for crate in "${crates[@]}"; do
             crate_http_code="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+              --user-agent 'minip2p-release-workflow (https://github.com/deepso7/minip2p)' \
               "https://crates.io/api/v1/crates/$crate/$CRATE_VERSION")"
 
             if [[ "$crate_http_code" == "200" ]]; then
