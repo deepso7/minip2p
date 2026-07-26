@@ -1,5 +1,6 @@
 [package]
 name = "minip2p-pubsub"
+description = "Bounded Sans-I/O libp2p gossipsub and floodsub"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "minip2p-core"
+description = "Core transport-agnostic types for minip2p"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

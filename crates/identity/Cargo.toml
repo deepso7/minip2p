@@ -1,5 +1,6 @@
 [package]
 name = "minip2p-identity"
+description = "Peer identity, keys, and signatures for minip2p"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

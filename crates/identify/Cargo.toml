@@ -1,5 +1,6 @@
 [package]
 name = "minip2p-identify"
+description = "Sans-I/O libp2p identify protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

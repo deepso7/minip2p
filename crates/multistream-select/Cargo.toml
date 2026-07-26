@@ -1,5 +1,6 @@
 [package]
 name = "minip2p-multistream-select"
+description = "Sans-I/O libp2p multistream-select protocol negotiation"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "minip2p-ping"
+description = "Sans-I/O libp2p ping protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

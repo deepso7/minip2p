@@ -1,5 +1,6 @@
 [package]
 name = "minip2p-yamux"
+description = "Bounded Sans-I/O libp2p Yamux stream multiplexer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

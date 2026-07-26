@@ -1,5 +1,6 @@
 [package]
 name = "minip2p-swarm"
+description = "Caller-driven protocol and connection orchestration for minip2p"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

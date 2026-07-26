@@ -1,5 +1,6 @@
 [package]
 name = "minip2p-circuit"
+description = "Sans-I/O encrypted and multiplexed libp2p circuit transport"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

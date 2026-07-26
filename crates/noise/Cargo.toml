@@ -1,5 +1,6 @@
 [package]
 name = "minip2p-noise"
+description = "Sans-I/O libp2p Noise XX security transport"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

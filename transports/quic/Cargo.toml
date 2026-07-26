@@ -1,5 +1,6 @@
 [package]
 name = "minip2p-quic"
+description = "Caller-driven QUIC transport adapter for minip2p"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

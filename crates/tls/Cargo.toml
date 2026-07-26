@@ -1,5 +1,6 @@
 [package]
 name = "minip2p-tls"
+description = "libp2p TLS certificate generation and peer verification"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

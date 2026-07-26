@@ -1,5 +1,6 @@
 [package]
 name = "minip2p-discovery"
+description = "Authenticated pubsub peer discovery for minip2p"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

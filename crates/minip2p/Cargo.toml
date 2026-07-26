@@ -1,5 +1,6 @@
 [package]
 name = "minip2p"
+description = "A minimal caller-driven libp2p implementation"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
