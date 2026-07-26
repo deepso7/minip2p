@@ -1,0 +1,38 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 960 640"
+  role="img"
+  aria-labelledby="minip2p-logo-title"
+  shape-rendering="crispEdges"
+>
+  <title id="minip2p-logo-title">minip2p</title>
+  <g fill="#e8721c">
+    <!-- Peer nodes -->
+    <path
+      fill-rule="evenodd"
+      d="M58 23h100v105H58V23Zm28 31v44h42V54H86Z"
+    />
+    <path
+      fill-rule="evenodd"
+      d="M227 152h105v108H227V152Zm30 31v45h45v-45h-45Z"
+    />
+    <path
+      fill-rule="evenodd"
+      d="M20 238h98v101H20V238Zm30 29v42h40v-42H50Z"
+    />
+
+    <!-- Pixel-stepped peer links -->
+    <path d="M157 107h9v8h15v9h15v14h16v14h15v15h-15v-14h-16v-10h-15v-8h-15v-11h-9v-17Z" />
+    <path d="M241 255h16v21h-14v13h-15v17h-16v17h-16v17h-16v12h-16v-17h16v-24h16v-17h16v-17h15v-17h14v-5Z" />
+    <path d="M118 273h31v9h8v21h-8v-9h-31v-21Z" />
+
+    <!-- Dinosaur -->
+    <path
+      fill-rule="evenodd"
+      d="
+        M149 339
+        h51v53h29v32h107v-32h56v-53h47v-37h38v-38h53v-36h63v-52h45v-60h37V79h182v52h72v97h-36v37H702v37h64v36h-64v54h101v53h52v55h-51v-55h-51v55h-51v-55h-49v-78h-51v110h-46v-32h-64v36h51v49h50v52h50v53h-50v-53h-50v53h-51v-53h-50v53h-51v-53h51v-50h-50v-16H230v-34h-51v-34h-30V339Zm604-208v54h51v-54h-51Z
+      "
+    />
+  </g>
+</svg>

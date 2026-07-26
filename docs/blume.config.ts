@@ -4,6 +4,10 @@ export default defineConfig({
   title: "minip2p",
   description:
     "A minimal, caller-driven libp2p implementation in Rust, built around QUIC and Sans-I/O state machines.",
+  logo: {
+    image: "/logo.svg",
+    text: "minip2p",
+  },
   banner: {
     content: "minip2p is pre-1.0 and not yet published to crates.io.",
     link: {
@@ -31,8 +35,9 @@ export default defineConfig({
     },
     og: {
       enabled: true,
+      logo: "/logo.svg",
       palette: {
-        accent: "orange",
+        accent: "#e8721c",
       },
     },
     robots: true,
