@@ -3,6 +3,10 @@ name = "minip2p-dcutr"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
 
 [lints]
 workspace = true
@@ -15,5 +19,5 @@ std = [
 ]
 
 [dependencies]
-minip2p-core = { path = "../core", default-features = false }
+minip2p-core = { path = "../core", version = "0.1.0", default-features = false }
 thiserror = { version = "2.0.18", default-features = false }

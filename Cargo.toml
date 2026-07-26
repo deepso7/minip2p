@@ -31,6 +31,9 @@ members = [
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+license = "MIT"
+homepage = "https://github.com/deepso7/minip2p"
+repository = "https://github.com/deepso7/minip2p"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
