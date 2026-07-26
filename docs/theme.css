@@ -1,3 +1,65 @@
+:root {
+  --minip2p-orange: oklch(0.61 0.112 47);
+  --minip2p-black: oklch(0.2 0.008 50);
+  --minip2p-white: oklch(0.98 0.006 60);
+
+  --blume-background: var(--minip2p-white);
+  --blume-foreground: var(--minip2p-black);
+  --blume-muted: color-mix(
+    in oklch,
+    var(--minip2p-black) 5%,
+    var(--minip2p-white)
+  );
+  --blume-muted-foreground: color-mix(
+    in oklch,
+    var(--minip2p-black) 64%,
+    var(--minip2p-white)
+  );
+  --blume-border: color-mix(
+    in oklch,
+    var(--minip2p-black) 15%,
+    var(--minip2p-white)
+  );
+  --blume-accent: var(--minip2p-orange);
+  --blume-accent-foreground: var(--minip2p-black);
+  --blume-action: var(--minip2p-orange);
+  --blume-action-foreground: var(--minip2p-black);
+  --blume-code-background: color-mix(
+    in oklch,
+    var(--minip2p-black) 3%,
+    var(--minip2p-white)
+  );
+}
+
+:root[data-theme="dark"] {
+  --blume-background: var(--minip2p-black);
+  --blume-foreground: var(--minip2p-white);
+  --blume-muted: color-mix(
+    in oklch,
+    var(--minip2p-white) 6%,
+    var(--minip2p-black)
+  );
+  --blume-muted-foreground: color-mix(
+    in oklch,
+    var(--minip2p-white) 64%,
+    var(--minip2p-black)
+  );
+  --blume-border: color-mix(
+    in oklch,
+    var(--minip2p-white) 16%,
+    var(--minip2p-black)
+  );
+  --blume-accent: var(--minip2p-orange);
+  --blume-accent-foreground: var(--minip2p-black);
+  --blume-action: var(--minip2p-orange);
+  --blume-action-foreground: var(--minip2p-black);
+  --blume-code-background: color-mix(
+    in oklch,
+    var(--minip2p-white) 4%,
+    var(--minip2p-black)
+  );
+}
+
 * {
   scrollbar-color: color-mix(
       in oklch,
