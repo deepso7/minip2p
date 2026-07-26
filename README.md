@@ -21,7 +21,7 @@ The project is built around five non-negotiables:
 
 `unsafe` is forbidden workspace-wide.
 
-## Unreleased
+## 0.1.1 — 2026-07-27
 
 - The `pubsub` facade now selects gossipsub by default. This is a pre-1.0
   behavior change: `EndpointBuilder::pubsub_config` accepts either
