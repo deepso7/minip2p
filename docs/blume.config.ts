@@ -2,8 +2,8 @@ import { defineConfig } from "blume";
 
 const brand = {
   orange: "oklch(0.610 0.112 47)",
-  black: "oklch(0.200 0.008 50)",
-  white: "oklch(0.980 0.006 60)",
+  black: "oklch(0.170 0.008 250)",
+  white: "oklch(0.950 0.006 60)",
 } as const;
 
 export default defineConfig({
