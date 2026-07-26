@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/public/logo.svg" width="320" alt="minip2p logo">
+</p>
+
 # minip2p
 
 A minimal [libp2p](https://libp2p.io/) implementation in Rust: small,
