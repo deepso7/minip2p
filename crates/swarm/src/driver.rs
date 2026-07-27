@@ -44,6 +44,9 @@ pub enum DriverError {
         "run_until skipped {limit} events without a match; drain the event buffer with poll_next"
     )]
     EventBacklogExceeded { limit: usize },
+    /// The operating system's entropy source failed.
+    #[error("system entropy source failed")]
+    Entropy,
 }
 
 /// Fallback sleep cadence when [`Swarm::poll_next`] idles over a transport
@@ -376,7 +379,7 @@ impl<T: Transport> Swarm<T> {
     /// fires when the stream becomes ready. The resulting RTT is delivered
     /// via [`SwarmEvent::PingRttMeasured`] on the next `poll()`.
     pub fn ping(&mut self, peer_id: &PeerId) -> Result<(), DriverError> {
-        let payload = rand_ping_payload();
+        let payload = rand_ping_payload()?;
         self.core.ping(peer_id, payload, self.now_ms())?;
         self.flush_actions();
         Ok(())
@@ -905,25 +908,14 @@ fn runtime_error(
     }
 }
 
-/// Generates a random 32-byte ping payload using OS randomness, falling
-/// back to a deterministic-but-non-repeating pattern seeded from the wall
-/// clock if the CSPRNG is unavailable.
-fn rand_ping_payload() -> [u8; PING_PAYLOAD_LEN] {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
+/// Generates a random 32-byte ping payload using OS randomness.
+///
+/// Fails with [`DriverError::Entropy`] if the CSPRNG is unavailable; a
+/// predictable fallback payload would silently weaken the ping nonce.
+fn rand_ping_payload() -> Result<[u8; PING_PAYLOAD_LEN], DriverError> {
     let mut payload = [0u8; PING_PAYLOAD_LEN];
-    if getrandom::fill(&mut payload).is_ok() {
-        return payload;
-    }
-
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    for (i, byte) in payload.iter_mut().enumerate() {
-        *byte = ((seed >> (i % 8)) as u8) ^ (i as u8);
-    }
-    payload
+    getrandom::fill(&mut payload).map_err(|_| DriverError::Entropy)?;
+    Ok(payload)
 }
 
 #[cfg(test)]
