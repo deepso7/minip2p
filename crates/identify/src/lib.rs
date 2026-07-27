@@ -147,9 +147,6 @@ pub enum IdentifyError {
     /// The peer already has an active identify exchange on this role.
     #[error("identify stream already registered for peer {peer_id}")]
     StreamAlreadyRegistered { peer_id: PeerId },
-    /// No outbound identify stream registered for this peer.
-    #[error("no outbound identify stream for peer {peer_id}")]
-    NoOutboundStream { peer_id: PeerId },
 }
 
 // ---------------------------------------------------------------------------

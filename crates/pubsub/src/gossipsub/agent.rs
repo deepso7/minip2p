@@ -482,11 +482,6 @@ impl GossipsubAgent {
         &self.local_peer_id
     }
 
-    /// Our current subscriptions.
-    pub fn subscriptions(&self) -> Vec<String> {
-        self.topics.iter().cloned().collect()
-    }
-
     /// Current mesh peers for `topic`, in deterministic peer-id order.
     pub fn mesh_peers(&self, topic: &str) -> Vec<PeerId> {
         self.mesh

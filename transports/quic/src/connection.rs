@@ -7,7 +7,6 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
-use minip2p_core::PeerId;
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, ConnectionState, StreamId, TransportError, TransportEvent,
 };
@@ -168,10 +167,6 @@ impl QuicConnection {
 
     pub fn is_server(&self) -> bool {
         self.conn.is_server()
-    }
-
-    pub fn set_peer_id(&mut self, peer_id: PeerId) {
-        self.endpoint.set_peer_id(peer_id);
     }
 
     pub fn is_closed(&self) -> bool {

@@ -82,11 +82,6 @@ impl PeerId {
         &self.multihash
     }
 
-    /// Consumes the peer id and returns the typed multihash value.
-    pub fn into_multihash(self) -> PeerMultihash {
-        self.multihash
-    }
-
     /// Encodes this peer id into multihash bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
         self.multihash.to_bytes()

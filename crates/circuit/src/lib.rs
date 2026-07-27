@@ -54,13 +54,6 @@ pub trait EntropySource {
 #[error("entropy source failed: {0}")]
 pub struct EntropyError(&'static str);
 
-impl EntropyError {
-    /// Creates an entropy failure with source-specific diagnostic context.
-    pub const fn new(message: &'static str) -> Self {
-        Self(message)
-    }
-}
-
 /// Entropy source backed by the operating system.
 #[cfg(feature = "std")]
 #[derive(Clone, Copy, Debug, Default)]

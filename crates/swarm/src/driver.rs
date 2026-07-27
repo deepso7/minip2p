@@ -415,8 +415,7 @@ impl<T: Transport> Swarm<T> {
 
         // The core emits a Pending OpenStream action; we drain it now so
         // the transport.open_stream call happens synchronously and we can
-        // return the allocated StreamId to the caller (for DX symmetry
-        // with the previous API).
+        // return the allocated StreamId to the caller.
         self.core.open_stream(peer_id, protocol_id)?;
 
         // Flush all actions, capturing the stream id allocated for this

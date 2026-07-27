@@ -328,11 +328,6 @@ impl NatAgent {
         }
     }
 
-    /// The local peer id the agent was constructed with.
-    pub fn local_peer_id(&self) -> &PeerId {
-        &self.shared.local_peer_id
-    }
-
     /// Starts a connect attempt toward `peer`.
     ///
     /// `direct_addrs` are candidate transport addresses for the peer (from

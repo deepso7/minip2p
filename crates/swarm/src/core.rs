@@ -27,8 +27,6 @@
 //! machine deterministic and avoids leaving protocol bytes buffered inside the
 //! core.
 
-extern crate alloc;
-
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -626,11 +624,6 @@ impl SwarmCore {
     /// Returns whether `peer_id` has reached the application-ready state.
     pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
         self.ready_peers.contains(peer_id)
-    }
-
-    /// Returns the peer id currently mapped to `conn_id`, if any.
-    pub fn peer_for(&self, conn_id: ConnectionId) -> Option<&PeerId> {
-        self.conn_to_peer.get(&conn_id)
     }
 
     // -----------------------------------------------------------------------

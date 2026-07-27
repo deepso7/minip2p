@@ -187,11 +187,6 @@ impl FloodsubAgent {
         &self.local_peer_id
     }
 
-    /// Our current subscriptions.
-    pub fn subscriptions(&self) -> Vec<String> {
-        self.topics.iter().cloned().collect()
-    }
-
     /// Subscribes to `topic`. Returns `Ok(false)` when already subscribed.
     ///
     /// The whole subscription set is bounded so that any snapshot or diff

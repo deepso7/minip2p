@@ -61,11 +61,6 @@ impl PublicKey {
         &self.data
     }
 
-    /// Consumes the key and returns key bytes.
-    pub fn into_data(self) -> Vec<u8> {
-        self.data
-    }
-
     /// Encodes this key as deterministic protobuf bytes.
     ///
     /// Encoding order is fixed: field `Type` (tag 1), then `Data` (tag 2).

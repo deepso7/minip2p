@@ -6,7 +6,7 @@
 //!
 //! Both verification and generation are `no_std + alloc` compatible. The
 //! `std` feature adds a convenience wrapper ([`generate_certificate`]) that
-//! uses OS randomness and a default validity window, plus PEM encoding helpers.
+//! uses OS randomness and a default validity window.
 //!
 //! Certificate generation currently uses Ed25519 host identities. Verification
 //! parses other libp2p public-key extensions for test-vector coverage, but only
@@ -18,14 +18,12 @@ extern crate alloc;
 
 mod error;
 mod generate;
-mod pem;
 mod verify;
 
 pub use error::TlsError;
 #[cfg(feature = "std")]
 pub use generate::generate_certificate;
 pub use generate::generate_certificate_with_rng;
-pub use pem::{cert_to_pem, private_key_to_pem};
 pub use verify::verify_libp2p_certificate;
 pub use x509_cert::time::Validity;
 

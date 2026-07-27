@@ -96,22 +96,6 @@ impl PubsubAgent {
         })
     }
 
-    /// The peer id this agent publishes as.
-    pub fn local_peer_id(&self) -> &PeerId {
-        match self {
-            Self::Gossipsub(agent) => agent.local_peer_id(),
-            Self::Floodsub(agent) => agent.local_peer_id(),
-        }
-    }
-
-    /// Our current subscriptions.
-    pub fn subscriptions(&self) -> Vec<String> {
-        match self {
-            Self::Gossipsub(agent) => agent.subscriptions(),
-            Self::Floodsub(agent) => agent.subscriptions(),
-        }
-    }
-
     /// Subscribes to a topic.
     pub fn subscribe(&mut self, topic: &str, now_ms: u64) -> Result<bool, TopicError> {
         match self {
@@ -202,14 +186,6 @@ impl PubsubAgent {
         match self {
             Self::Gossipsub(agent) => agent.poll_event(),
             Self::Floodsub(agent) => agent.poll_event(),
-        }
-    }
-
-    /// Whether this engine owns a stream lifecycle.
-    pub fn owns_stream(&self, peer: &PeerId, stream_id: StreamId) -> bool {
-        match self {
-            Self::Gossipsub(agent) => agent.owns_stream(peer, stream_id),
-            Self::Floodsub(agent) => agent.owns_stream(peer, stream_id),
         }
     }
 }

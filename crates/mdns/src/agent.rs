@@ -122,16 +122,6 @@ impl MdnsAgent {
         })
     }
 
-    /// Returns the local peer identity used for self-suppression.
-    pub fn local_peer_id(&self) -> &PeerId {
-        &self.peer_id
-    }
-
-    /// Returns the random DNS label used as this process's PTR target.
-    pub fn peer_name(&self) -> &str {
-        &self.peer_name
-    }
-
     /// Replaces interface snapshots and restarts startup probing on a real change.
     pub fn set_interfaces(&mut self, ifaces: &[InterfaceSnapshot], now_ms: u64) {
         if self.closed {

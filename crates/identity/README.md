@@ -19,7 +19,6 @@ Small, `no_std`-friendly libp2p identity crate focused on public key protobuf en
 - Ed25519 signatures (`ed25519` feature):
   - `Ed25519Keypair::sign(...)` for message signing.
   - `PublicKey::verify(...)` for signature verification with typed errors.
-  - `SignedBytes` helper for bundled `{ public_key, payload, signature }` verification.
 
 ## Usage
 
@@ -72,18 +71,6 @@ keypair.public_key().verify(message, &signature)?;
 // Recommended for protocol payloads: sign a domain-separated byte string,
 // e.g. b"/minip2p/ping/1" || payload.
 # Ok::<(), VerifyError>(())
-```
-
-Sign and verify a bundled payload:
-
-```rust
-use minip2p_identity::{Ed25519Keypair, SignedBytes};
-
-let keypair = Ed25519Keypair::from_secret_key_bytes([7u8; 32]);
-let signed = SignedBytes::sign_ed25519(&keypair, b"payload");
-
-signed.verify()?;
-# Ok::<(), minip2p_identity::VerifyError>(())
 ```
 
 ## Error semantics

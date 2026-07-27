@@ -40,11 +40,6 @@ impl BeaconAgent {
         })
     }
 
-    /// Returns the identity advertised by this agent.
-    pub fn local_peer_id(&self) -> &PeerId {
-        &self.local_peer_id
-    }
-
     /// Returns the configured pubsub discovery topic.
     pub fn topic(&self) -> &str {
         &self.config.topic
@@ -279,7 +274,7 @@ mod tests {
         let advertised = Multiaddr::from_bytes(&beacon.addrs[0]).unwrap();
         assert_eq!(
             advertised.protocols().last(),
-            Some(&Protocol::P2p(agent.local_peer_id().clone()))
+            Some(&Protocol::P2p(PeerId::from_public_key(&key(1))))
         );
     }
 

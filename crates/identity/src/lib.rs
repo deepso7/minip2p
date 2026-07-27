@@ -12,8 +12,6 @@ extern crate alloc;
 mod ed25519;
 mod key;
 mod peer_id;
-#[cfg(feature = "ed25519")]
-mod signed;
 
 #[cfg(feature = "ed25519")]
 pub use ed25519::{
@@ -26,5 +24,3 @@ pub use peer_id::{
     PEER_ID_MULTIHASH_SIZE, PeerId, PeerIdError, PeerMultihash, VarintError, read_uvarint,
     uvarint_len, write_uvarint,
 };
-#[cfg(feature = "ed25519")]
-pub use signed::SignedBytes;

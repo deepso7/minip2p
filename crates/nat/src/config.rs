@@ -22,8 +22,8 @@ pub enum ReservationPolicy {
 
 /// Tuning knobs for [`NatAgent`](crate::NatAgent).
 ///
-/// The defaults mirror the hand-rolled orchestration in `examples/peer` and
-/// common go-libp2p practice; every value can be overridden.
+/// The defaults follow common go-libp2p practice; every value can be
+/// overridden.
 #[derive(Clone, Debug)]
 pub struct NatConfig {
     /// Relays available for circuit legs and reservations, in preference

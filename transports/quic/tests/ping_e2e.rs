@@ -157,8 +157,8 @@ impl PingHarness {
             Self::wait_for_connection(&mut server, &mut client, client_conn_id, &peer_addr, 250)
                 .expect("server should observe connection");
 
-        // Identity is now auto-verified from the TLS certificate. No manual
-        // verify_connection_peer_id call needed.
+        // Mutual TLS binds the peer identity to the connection automatically
+        // during the handshake; no manual verification step is needed.
 
         // Open stream and negotiate multistream-select for ping.
         let client_stream = client

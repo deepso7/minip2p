@@ -955,30 +955,6 @@ impl Endpoint {
         }
         result
     }
-
-    /// Decomposes this endpoint into the underlying swarm.
-    pub fn into_swarm(self) -> EndpointSwarm {
-        #[cfg(feature = "mdns")]
-        {
-            let mut endpoint = self;
-            let _ = endpoint.shutdown();
-            endpoint.swarm
-        }
-        #[cfg(all(not(feature = "mdns"), feature = "discovery"))]
-        {
-            let mut endpoint = self;
-            if let (Some(discovery), Some(nat)) =
-                (endpoint.discovery.as_mut(), endpoint.nat.as_mut())
-            {
-                discovery.shutdown(nat, &mut endpoint.swarm);
-            }
-            endpoint.swarm
-        }
-        #[cfg(not(any(feature = "discovery", feature = "mdns")))]
-        {
-            self.swarm
-        }
-    }
 }
 
 impl Endpoint {

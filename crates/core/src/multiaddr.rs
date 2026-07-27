@@ -50,13 +50,6 @@ impl Multiaddr {
         self.protocols.is_empty()
     }
 
-    /// Returns `true` if any component is `/quic-v1`.
-    pub fn has_quic_v1(&self) -> bool {
-        self.protocols
-            .iter()
-            .any(|protocol| matches!(protocol, Protocol::QuicV1))
-    }
-
     /// Returns the first `/p2p` peer id, if present.
     pub fn peer_id(&self) -> Option<&PeerId> {
         self.protocols.iter().find_map(|protocol| match protocol {

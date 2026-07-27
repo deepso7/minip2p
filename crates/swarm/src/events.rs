@@ -3,8 +3,6 @@
 //! Kept in a dedicated module so both the Sans-I/O core and the std driver
 //! reference the same concrete types.
 
-extern crate alloc;
-
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -104,8 +102,6 @@ pub enum SwarmErrorKind {
     Identify,
     /// Ping protocol failed.
     Ping,
-    /// User-protocol stream failed.
-    UserProtocol { protocol_id: String },
     /// Identify stream setup was rejected.
     IdentifyStreamRejected,
     /// Outbound stream opening failed.
