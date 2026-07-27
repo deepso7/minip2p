@@ -151,6 +151,15 @@ automatically.
 or feature-focused waits afterward so DCUtR, reservation renewal, and
 connection events continue to progress.
 
+## Custom entropy without `std`
+
+Most applications do not configure circuit entropy: the `Endpoint` facade's
+default `std` transport uses the operating system's random source. When
+embedding `minip2p-circuit` with default features disabled, provide an
+`EntropySource` that never substitutes predictable bytes on failure — see the
+[`minip2p-circuit` README](https://github.com/deepso7/minip2p/blob/main/crates/circuit/README.md)
+for the trait contract and a custom-source example.
+
 For a complete live demonstration, use the existing
 [`minip2p-peer` example](https://github.com/deepso7/minip2p/tree/main/examples/peer).
 It shows loopback, relay reservations, relay fallback, and RTT changes after a
