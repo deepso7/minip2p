@@ -55,7 +55,12 @@ application pubsub messages are allowed.
 With the `mdns` feature, `.mdns()` enables zero-configuration local-link
 discovery on `_p2p._udp.local` without enabling pubsub. It implies `nat`, uses
 the same bounded peer book and dial state as signed discovery when both are
-enabled, and exposes per-address provenance through `KnownPeer`. Call
+enabled, and exposes per-address provenance through `KnownPeer`. Use
+`.mdns_config(...)` for mDNS timing and packet policy, and
+`.peer_discovery_config(...)` for the shared book and dial policy. Applications
+can inspect `known_peers` and drain the same `DiscoveryEvent` queue used by
+signed discovery. Because mDNS claims are unauthenticated, their automatic
+dials are direct-only and never activate configured relays. Call
 `Endpoint::shutdown()` to send TTL-zero goodbyes and stop mDNS while keeping
 QUIC usable; drop performs the same sends best-effort.
 

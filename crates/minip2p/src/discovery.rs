@@ -156,15 +156,7 @@ impl DiscoveryDriver {
             if let Some(mdns) = mdns.as_deref_mut() {
                 while let Some(event) = mdns.events.pop_front() {
                     progressed = true;
-                    match event {
-                        MdnsEvent::PeerObserved { peer, addrs } => {
-                            self.book.observe_mdns(peer, addrs, now);
-                        }
-                        MdnsEvent::ProtocolViolation { peer, reason } => {
-                            self.book
-                                .report_violation(peer, DiscoverySource::Mdns, &reason);
-                        }
-                    }
+                    self.handle_mdns_event(event, now);
                 }
             }
 
@@ -224,8 +216,19 @@ impl DiscoveryDriver {
             while let Some(action) = self.book.poll_action() {
                 progressed = true;
                 match action {
-                    DiscoveryAction::Dial { peer, addrs } => {
-                        let id = nat.agent.connect(peer.clone(), addrs, nat.now());
+                    DiscoveryAction::Dial {
+                        peer,
+                        addrs,
+                        source,
+                    } => {
+                        let id = match source {
+                            DiscoverySource::SignedBeacon => {
+                                nat.agent.connect(peer.clone(), addrs, nat.now())
+                            }
+                            DiscoverySource::Mdns => {
+                                nat.agent.connect_direct(peer.clone(), addrs, nat.now())
+                            }
+                        };
                         nat.pump(swarm);
                         self.inflight.insert(id, peer);
                     }
@@ -265,6 +268,19 @@ impl DiscoveryDriver {
         }
     }
 
+    #[cfg(feature = "mdns")]
+    fn handle_mdns_event(&mut self, event: MdnsEvent, now: u64) {
+        match event {
+            MdnsEvent::PeerObserved { peer, addrs } => {
+                self.book.observe_mdns(peer, addrs, now);
+            }
+            MdnsEvent::ProtocolViolation { peer, reason } => {
+                self.book
+                    .report_violation(peer, DiscoverySource::Mdns, &reason);
+            }
+        }
+    }
+
     fn cancel_peer(&mut self, peer: &PeerId, nat: &mut NatDriver, swarm: &mut EndpointSwarm) {
         let active = self
             .inflight
@@ -284,6 +300,7 @@ impl DiscoveryDriver {
             nat.agent.cancel(id, nat.now());
         }
         self.inflight.clear();
+        self.book.reset_dials();
         nat.pump(swarm);
     }
 }
@@ -296,5 +313,76 @@ fn nat_connect_id(event: &NatEvent) -> Option<ConnectId> {
         | NatEvent::FellBackToRelay { connect_id, .. }
         | NatEvent::ConnectFailed { connect_id, .. } => Some(*connect_id),
         _ => None,
+    }
+}
+
+#[cfg(all(test, feature = "mdns"))]
+mod tests {
+    use super::*;
+    use core::str::FromStr;
+    use minip2p_core::Multiaddr;
+    use minip2p_discovery::{DiscoveryEvent, PeerDiscoveryConfig};
+    use minip2p_identity::{KeyType, PublicKey};
+
+    fn peer(byte: u8) -> PeerId {
+        PeerId::from_public_key(&PublicKey::new(KeyType::Ed25519, vec![byte; 32]))
+    }
+
+    #[test]
+    fn mdns_events_feed_the_shared_book_without_multicast_io() {
+        let config = PeerDiscoveryConfig {
+            dial_tie_break: false,
+            ..PeerDiscoveryConfig::default()
+        };
+        let book = PeerDiscoveryAgent::new(peer(1), config).expect("valid policy");
+        let mut driver = DiscoveryDriver::new(
+            book,
+            #[cfg(feature = "discovery")]
+            None,
+        );
+        let remote = peer(2);
+        let addr = Multiaddr::from_str("/ip4/192.0.2.2/udp/4001/quic-v1")
+            .expect("valid transport address");
+
+        driver.handle_mdns_event(
+            MdnsEvent::PeerObserved {
+                peer: remote.clone(),
+                addrs: vec![(addr.clone(), 1_000)],
+            },
+            0,
+        );
+
+        assert!(matches!(
+            driver.book.poll_event(),
+            Some(DiscoveryEvent::PeerDiscovered {
+                peer,
+                addrs,
+                source: DiscoverySource::Mdns,
+            }) if peer == remote && addrs == vec![addr]
+        ));
+        assert!(matches!(
+            driver.book.poll_action(),
+            Some(DiscoveryAction::Dial {
+                peer,
+                source: DiscoverySource::Mdns,
+                ..
+            }) if peer == remote
+        ));
+
+        driver.handle_mdns_event(
+            MdnsEvent::ProtocolViolation {
+                peer: Some(remote.clone()),
+                reason: "invalid claim".into(),
+            },
+            1,
+        );
+        assert!(matches!(
+            driver.book.poll_event(),
+            Some(DiscoveryEvent::ProtocolViolation {
+                peer: Some(peer),
+                source: DiscoverySource::Mdns,
+                ..
+            }) if peer == remote
+        ));
     }
 }

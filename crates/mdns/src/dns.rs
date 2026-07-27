@@ -226,7 +226,7 @@ pub(crate) struct ResponseSpec {
 }
 
 pub(crate) fn encode_response_segments(spec: ResponseSpec) -> Vec<Vec<u8>> {
-    let base = |txt_values: &[Vec<u8>]| DnsMessage {
+    let base = |txt_values: &[Vec<u8>], txt_cache_flush: bool| DnsMessage {
         id: spec.id,
         flags: FLAG_QR | FLAG_AA,
         questions: spec.question.clone().into_iter().collect(),
@@ -244,12 +244,7 @@ pub(crate) fn encode_response_segments(spec: ResponseSpec) -> Vec<Vec<u8>> {
             .map(|value| DnsRecord {
                 name: spec.ptr_target.clone(),
                 rr_type: TYPE_TXT,
-                class: CLASS_IN
-                    | if spec.txt_cache_flush {
-                        CLASS_HIGH_BIT
-                    } else {
-                        0
-                    },
+                class: CLASS_IN | if txt_cache_flush { CLASS_HIGH_BIT } else { 0 },
                 ttl: spec.ttl_seconds,
                 data: DnsRecordData::Txt(vec![value]),
             })
@@ -257,21 +252,21 @@ pub(crate) fn encode_response_segments(spec: ResponseSpec) -> Vec<Vec<u8>> {
     };
 
     if spec.txt_values.is_empty() {
-        return encode_message(&base(&[]))
+        return encode_message(&base(&[], false))
             .filter(|packet| packet.len() <= spec.max_packet_bytes)
             .into_iter()
             .collect();
     }
 
-    let mut packets = Vec::new();
-    let mut current = Vec::new();
+    let mut groups = Vec::new();
+    let mut current: Vec<Vec<u8>> = Vec::new();
     for value in &spec.txt_values {
         if value.len() > u8::MAX as usize {
             continue;
         }
         let mut candidate = current.clone();
         candidate.push(value.clone());
-        let encoded = encode_message(&base(&candidate));
+        let encoded = encode_message(&base(&candidate, false));
         if encoded
             .as_ref()
             .is_some_and(|packet| packet.len() <= spec.max_packet_bytes)
@@ -279,34 +274,30 @@ pub(crate) fn encode_response_segments(spec: ResponseSpec) -> Vec<Vec<u8>> {
             current = candidate;
             continue;
         }
-        if !current.is_empty()
-            && let Some(packet) = encode_message(&base(&current))
-            && packet.len() <= spec.max_packet_bytes
-        {
-            packets.push(packet);
+        if !current.is_empty() {
+            groups.push(core::mem::take(&mut current));
         }
-        current.clear();
         let one = vec![value.clone()];
-        if encode_message(&base(&one))
+        if encode_message(&base(&one, false))
             .as_ref()
             .is_some_and(|packet| packet.len() <= spec.max_packet_bytes)
         {
             current = one;
         }
     }
-    if !current.is_empty()
-        && let Some(packet) = encode_message(&base(&current))
-        && packet.len() <= spec.max_packet_bytes
-    {
-        packets.push(packet);
+    if !current.is_empty() {
+        groups.push(current);
     }
-    if packets.is_empty()
-        && let Some(packet) = encode_message(&base(&[]))
-        && packet.len() <= spec.max_packet_bytes
-    {
-        packets.push(packet);
-    }
-    packets
+
+    // Cache-flush applies to a complete unique RRset. When the set is split
+    // across datagrams, setting it on every fragment makes compliant caches
+    // discard values learned from earlier fragments.
+    let txt_cache_flush = spec.txt_cache_flush && groups.len() == 1;
+    groups
+        .into_iter()
+        .filter_map(|values| encode_message(&base(&values, txt_cache_flush)))
+        .filter(|packet| packet.len() <= spec.max_packet_bytes)
+        .collect()
 }
 
 fn decode_records(
@@ -628,9 +619,61 @@ mod tests {
                 decoded
                     .additionals
                     .iter()
-                    .all(|record| record.class == 0x8001)
+                    .all(|record| record.class == CLASS_IN)
             );
         }
+    }
+
+    #[test]
+    fn complete_txt_rrset_keeps_cache_flush() {
+        let packets = encode_response_segments(ResponseSpec {
+            id: 0,
+            question: None,
+            ptr_owner: SERVICE_NAME.to_string(),
+            ptr_target: "fixed._p2p._udp.local".to_string(),
+            txt_values: vec![b"dnsaddr=/ip4/192.0.2.1/udp/1/quic-v1".to_vec()],
+            ttl_seconds: 120,
+            txt_cache_flush: true,
+            max_packet_bytes: 512,
+        });
+        assert_eq!(packets.len(), 1);
+        let decoded = DnsMessage::decode(&packets[0]).unwrap();
+        assert!(decoded.additionals.iter().all(DnsRecord::cache_flush));
+    }
+
+    #[test]
+    fn oversized_txt_does_not_degrade_to_ptr_only() {
+        let packets = encode_response_segments(ResponseSpec {
+            id: 0,
+            question: None,
+            ptr_owner: SERVICE_NAME.to_string(),
+            ptr_target: "fixed._p2p._udp.local".to_string(),
+            txt_values: vec![vec![b'x'; 255]],
+            ttl_seconds: 120,
+            txt_cache_flush: true,
+            max_packet_bytes: 256,
+        });
+        assert!(packets.is_empty());
+    }
+
+    #[test]
+    fn minimum_packet_limit_fits_worst_case_uncompressed_claim() {
+        let target = format!("{}.{}", "x".repeat(63), SERVICE_NAME);
+        let packets = encode_response_segments(ResponseSpec {
+            id: 0,
+            question: None,
+            ptr_owner: SERVICE_NAME.to_string(),
+            ptr_target: target,
+            txt_values: vec![vec![b'x'; 255]],
+            ttl_seconds: 120,
+            txt_cache_flush: true,
+            max_packet_bytes: 512,
+        });
+        assert_eq!(packets.len(), 1);
+        assert!(packets[0].len() <= 512);
+        let decoded = DnsMessage::decode(&packets[0]).unwrap();
+        assert_eq!(decoded.answers.len(), 1);
+        assert_eq!(decoded.additionals.len(), 1);
     }
 
     #[test]

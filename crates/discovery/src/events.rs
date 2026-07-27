@@ -56,6 +56,11 @@ pub enum DiscoveryAction {
         peer: PeerId,
         /// Normalized transport-shaped candidates in source preference order.
         addrs: Vec<Multiaddr>,
+        /// Observation source that triggered this attempt.
+        ///
+        /// Adapters use this trust boundary to keep unauthenticated sources
+        /// from enabling connection paths that require authenticated intent.
+        source: DiscoverySource,
     },
     /// Cancel queued or in-flight dialing because the peer was removed.
     CancelDial {

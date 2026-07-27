@@ -26,13 +26,16 @@ const MDNS_PORT: u16 = 5353;
 const MIN_RESPONSE_JITTER_MS: u64 = 20;
 const RESPONSE_JITTER_SPAN_MS: u64 = 101;
 const TXT_PREFIX: &[u8] = b"dnsaddr=";
+const MAX_SCHEDULED_RESPONSES: usize = 128;
+const MAX_PENDING_ACTIONS: usize = 256;
+const MAX_RESPONSE_ACTIONS_PER_TICK: usize = 128;
 
 #[derive(Clone, Debug)]
 struct ScheduledResponse {
     due_at_ms: u64,
     interface: InterfaceId,
     target: MdnsTarget,
-    payloads: Vec<Vec<u8>>,
+    payloads: VecDeque<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -140,17 +143,29 @@ impl MdnsAgent {
             .cloned()
             .collect();
         if self.interfaces != filtered {
+            // Even a stable id can have a changed address set. Encoded
+            // responses capture the old expansion, so all prior interface
+            // work becomes stale on any snapshot change.
+            self.scheduled.clear();
+            self.actions.clear();
             self.interfaces = filtered;
             self.restart_fast_phase(now_ms);
         }
     }
 
     /// Replaces local QUIC listen addresses and restarts startup probing on a change.
-    pub fn set_local_addrs(&mut self, addrs: &[Multiaddr], now_ms: u64) {
-        if !self.closed && self.local_addrs != addrs {
-            self.local_addrs = addrs.to_vec();
-            self.restart_fast_phase(now_ms);
+    ///
+    /// Returns whether the address snapshot changed. Any encoded work based
+    /// on the previous snapshot is discarded.
+    pub fn set_local_addrs(&mut self, addrs: &[Multiaddr], now_ms: u64) -> bool {
+        if self.closed || self.local_addrs == addrs {
+            return false;
         }
+        self.scheduled.clear();
+        self.actions.clear();
+        self.local_addrs = addrs.to_vec();
+        self.restart_fast_phase(now_ms);
+        true
     }
 
     /// Handles one datagram received on a known interface/family socket.
@@ -195,25 +210,34 @@ impl MdnsAgent {
             return;
         }
 
-        let mut pending = Vec::new();
-        for response in self.scheduled.drain(..) {
-            if response.due_at_ms <= now_ms {
-                for payload in response.payloads {
-                    self.actions.push_back(MdnsAction::Send {
-                        interface: response.interface,
-                        target: response.target,
-                        payload,
-                    });
-                }
-            } else {
-                pending.push(response);
+        let mut emitted = 0usize;
+        for response in &mut self.scheduled {
+            if response.due_at_ms > now_ms {
+                continue;
+            }
+            while emitted < MAX_RESPONSE_ACTIONS_PER_TICK
+                && self.actions.len() < MAX_PENDING_ACTIONS
+            {
+                let Some(payload) = response.payloads.pop_front() else {
+                    break;
+                };
+                self.actions.push_back(MdnsAction::Send {
+                    interface: response.interface,
+                    target: response.target,
+                    payload,
+                });
+                emitted += 1;
             }
         }
-        self.scheduled = pending;
+        self.scheduled
+            .retain(|response| !response.payloads.is_empty());
 
         if now_ms >= self.next_query_at_ms {
             let payload = encode_query();
             for iface in &self.interfaces {
+                if self.actions.len() >= MAX_PENDING_ACTIONS {
+                    break;
+                }
                 self.actions.push_back(MdnsAction::Send {
                     interface: iface.id,
                     target: MdnsTarget::Multicast,
@@ -240,6 +264,7 @@ impl MdnsAgent {
         }
         self.closed = true;
         self.scheduled.clear();
+        self.actions.clear();
         for iface in &self.interfaces {
             for payload in self.response_packets(iface.id, 0, 0, None, false) {
                 self.actions.push_back(MdnsAction::Send {
@@ -308,6 +333,9 @@ impl MdnsAgent {
         let ttl_seconds = wire_ttl_seconds(self.config.ttl_ms, legacy);
         let question_copy = legacy.then(|| question.clone());
         let meta = names_equal(&question.name, META_QUERY_NAME);
+        if self.scheduled.len() == MAX_SCHEDULED_RESPONSES {
+            return;
+        }
         let payloads = if meta {
             encode_response_segments(ResponseSpec {
                 id: if legacy { message.id } else { 0 },
@@ -328,12 +356,15 @@ impl MdnsAgent {
                 !legacy,
             )
         };
+        if payloads.is_empty() {
+            return;
+        }
         let jitter = MIN_RESPONSE_JITTER_MS + self.rng.next_u64() % RESPONSE_JITTER_SPAN_MS;
         self.scheduled.push(ScheduledResponse {
             due_at_ms: now_ms.saturating_add(jitter),
             interface: iface,
             target,
-            payloads,
+            payloads: payloads.into(),
         });
     }
 
@@ -855,5 +886,84 @@ mod tests {
         agent.handle_tick(2);
         assert!(agent.poll_action().is_none());
         assert_eq!(agent.next_timeout(2), None);
+    }
+
+    #[test]
+    fn query_flood_keeps_response_and_action_queues_bounded() {
+        let mut agent = MdnsAgent::new(peer(1), MdnsConfig::default(), [7; 32]).unwrap();
+        agent.set_interfaces(&[iface(1)], 0);
+        agent.set_local_addrs(&[local_addr()], 0);
+        agent.handle_tick(0);
+        while agent.poll_action().is_some() {}
+
+        let query = encode_query();
+        let from = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 2), MDNS_PORT).into();
+        for _ in 0..1_000 {
+            agent.handle_packet(InterfaceId::new(1), from, &query, 1);
+        }
+        assert_eq!(agent.scheduled.len(), MAX_SCHEDULED_RESPONSES);
+
+        agent.handle_tick(1_000);
+        assert!(agent.actions.len() <= MAX_PENDING_ACTIONS);
+
+        for _ in 0..1_000 {
+            agent.handle_packet(InterfaceId::new(1), from, &query, 1_001);
+        }
+        agent.handle_tick(2_000);
+        assert_eq!(agent.actions.len(), MAX_PENDING_ACTIONS);
+
+        for _ in 0..1_000 {
+            agent.handle_packet(InterfaceId::new(1), from, &query, 2_001);
+        }
+        agent.handle_tick(3_000);
+        assert_eq!(agent.actions.len(), MAX_PENDING_ACTIONS);
+        assert_eq!(agent.scheduled.len(), MAX_SCHEDULED_RESPONSES);
+    }
+
+    #[test]
+    fn interface_change_discards_work_for_retired_ids() {
+        let mut agent = MdnsAgent::new(peer(1), MdnsConfig::default(), [7; 32]).unwrap();
+        agent.set_interfaces(&[iface(1)], 0);
+        agent.set_local_addrs(&[local_addr()], 0);
+        agent.handle_tick(0);
+
+        let query = encode_query();
+        let from = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 2), MDNS_PORT).into();
+        agent.handle_packet(InterfaceId::new(1), from, &query, 1);
+        assert!(!agent.scheduled.is_empty());
+        assert!(!agent.actions.is_empty());
+
+        agent.set_interfaces(&[iface(2)], 2);
+        assert!(agent.scheduled.is_empty());
+        assert!(agent.actions.is_empty());
+        agent.handle_tick(2);
+        assert!(
+            core::iter::from_fn(|| agent.poll_action()).all(|action| matches!(
+                action,
+                MdnsAction::Send {
+                    interface,
+                    ..
+                } if interface == InterfaceId::new(2)
+            ))
+        );
+    }
+
+    #[test]
+    fn local_address_change_discards_stale_encoded_work() {
+        let mut agent = MdnsAgent::new(peer(1), MdnsConfig::default(), [7; 32]).unwrap();
+        agent.set_interfaces(&[iface(1)], 0);
+        agent.set_local_addrs(&[local_addr()], 0);
+        agent.handle_tick(0);
+
+        let query = encode_query();
+        let from = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 2), MDNS_PORT).into();
+        agent.handle_packet(InterfaceId::new(1), from, &query, 1);
+        assert!(!agent.scheduled.is_empty());
+        assert!(!agent.actions.is_empty());
+
+        let replacement = "/ip4/192.168.1.10/udp/5001/quic-v1".parse().unwrap();
+        assert!(agent.set_local_addrs(&[replacement], 2));
+        assert!(agent.scheduled.is_empty());
+        assert!(agent.actions.is_empty());
     }
 }

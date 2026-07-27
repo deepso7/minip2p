@@ -17,14 +17,17 @@ Additional constraints: `unsafe` is forbidden workspace-wide; sockets, clocks, a
 `just` mirrors CI (`.github/workflows/ci.yml`):
 
 ```bash
-just test          # cargo test + minip2p feature matrix (nat, pubsub, nat+pubsub)
-just clippy        # -D warnings, includes the separate fuzz/ workspace
+just test          # cargo test + facade feature matrix through discovery + mDNS
+just clippy        # -D warnings, facade discovery/mDNS variants, and fuzz/
 just fmt           # also formats fuzz/
-just check-nostd   # no_std check on thumbv7em-none-eabi
+just check-nostd   # all no_std crates on thumbv7em-none-eabi
 just fuzz 30       # needs nightly + cargo-fuzz
 ```
 
-Single test: `cargo test -p minip2p-ping test_name`. Facade features: `cargo test -p minip2p-rs --features nat` (or `pubsub`, `nat,pubsub`). `fuzz/` is outside the workspace — use `--manifest-path fuzz/Cargo.toml`.
+Single test: `cargo test -p minip2p-ping test_name`. Facade features:
+`cargo test -p minip2p-rs --features mdns` (or `discovery`,
+`discovery,mdns`; see `justfile` for the full matrix). `fuzz/` is outside the
+workspace — use `--manifest-path fuzz/Cargo.toml`.
 
 Publishing: bump the workspace version and all versioned local dependencies in lockstep, update `Cargo.lock`, run the standard checks, push the release commit, then publish a GitHub release tagged `v<version>`; the workflow publishes every runtime crate.
 

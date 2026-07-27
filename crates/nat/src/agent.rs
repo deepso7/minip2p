@@ -341,6 +341,31 @@ impl NatAgent {
     /// [`minip2p_core::select_direct_candidates`]. The relay leg uses the
     /// first configured relay in [`NatConfig::relays`].
     pub fn connect(&mut self, peer: PeerId, direct_addrs: Vec<Multiaddr>, now: Now) -> ConnectId {
+        self.connect_with_relay_policy(peer, direct_addrs, true, now)
+    }
+
+    /// Starts a direct-only connect attempt toward `peer`.
+    ///
+    /// Candidates are validated identically to [`NatAgent::connect`], but
+    /// configured relays are never dialed and no HOP CONNECT is attempted.
+    /// This is suitable for unauthenticated discovery hints whose authority
+    /// must not extend to relay use.
+    pub fn connect_direct(
+        &mut self,
+        peer: PeerId,
+        direct_addrs: Vec<Multiaddr>,
+        now: Now,
+    ) -> ConnectId {
+        self.connect_with_relay_policy(peer, direct_addrs, false, now)
+    }
+
+    fn connect_with_relay_policy(
+        &mut self,
+        peer: PeerId,
+        direct_addrs: Vec<Multiaddr>,
+        allow_relay: bool,
+        now: Now,
+    ) -> ConnectId {
         let id = ConnectId(self.next_connect_id);
         self.next_connect_id += 1;
         // A connection that is already identity-verified is the best path
@@ -354,7 +379,8 @@ impl NatAgent {
             });
             return id;
         }
-        if let Some(attempt) = ConnectAttempt::start(id, peer, direct_addrs, &mut self.shared, now)
+        if let Some(attempt) =
+            ConnectAttempt::start(id, peer, direct_addrs, allow_relay, &mut self.shared, now)
         {
             self.attempts.insert(id, attempt);
         }

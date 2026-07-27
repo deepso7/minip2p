@@ -359,6 +359,19 @@ impl PeerDiscoveryAgent {
         }
     }
 
+    /// Drops queued dial work and makes every in-flight book entry retryable.
+    ///
+    /// Drivers must call this when abandoning their owned attempts because a
+    /// silent transport-side cancellation cannot produce a later dial result.
+    pub fn reset_dials(&mut self) {
+        self.actions.clear();
+        for entry in self.book.values_mut() {
+            if matches!(entry.dial, DialState::InFlight) {
+                entry.dial = DialState::Idle;
+            }
+        }
+    }
+
     /// Expires stale source records.
     pub fn handle_tick(&mut self, now_ms: u64) {
         let peers: Vec<PeerId> = self.book.keys().cloned().collect();
@@ -652,6 +665,7 @@ impl PeerDiscoveryAgent {
         self.actions.push_back(DiscoveryAction::Dial {
             peer: peer.clone(),
             addrs,
+            source,
         });
     }
 
@@ -1046,6 +1060,27 @@ mod tests {
         agent.handle_tick(100);
         assert!(agent.pending.is_empty());
         assert!(agent.order.is_empty());
+    }
+
+    #[test]
+    fn reset_dials_drops_queued_work_and_restores_retryability() {
+        let mut agent = agent(PeerDiscoveryConfig::default());
+        let remote = peer(2);
+        let candidate = addr(1);
+        agent.observe_mdns(remote.clone(), vec![(candidate.clone(), 100)], 0);
+
+        agent.reset_dials();
+        assert!(agent.poll_action().is_none());
+
+        agent.observe_mdns(remote.clone(), vec![(candidate, 100)], 1);
+        assert!(matches!(
+            agent.poll_action(),
+            Some(DiscoveryAction::Dial {
+                peer,
+                source: DiscoverySource::Mdns,
+                ..
+            }) if peer == remote
+        ));
     }
 
     #[test]

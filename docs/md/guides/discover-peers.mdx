@@ -1,15 +1,17 @@
 ---
 title: Discover peers
-description: Activate signed presence beacons, a bounded peer address book, and automatic direct or NAT-aware dialing.
+description: Activate signed presence beacons or local-link mDNS with a bounded peer book and automatic dialing.
 ---
 
-**Goal:** Turn on discovery, observe the known-peer book, and let the driver
-dial peers from signed beacons.
+**Goal:** Turn on signed or local-link discovery, observe the known-peer book,
+and let the driver dial peers from accepted observations.
 
-**Assumes:** [Publish with pubsub](/guides/pubsub). Relayed paths still need a
-configured relay — see [Traverse NAT](/guides/traverse-nat).
+**Assumes:** [Publish with pubsub](/guides/pubsub) for signed discovery. Signed
+observations can use a configured relay — see [Traverse NAT](/guides/traverse-nat).
+mDNS observations are unauthenticated and automatic dials from them are always
+direct-only.
 
-<Badge>pre-1.0</Badge> <Badge>implies nat + pubsub</Badge>
+<Badge>pre-1.0</Badge> <Badge>signed: nat + pubsub</Badge> <Badge>mDNS: nat</Badge>
 
 Discovery layers signed presence beacons and dialing policy over pubsub and
 the NAT agent.

@@ -15,6 +15,7 @@ paths are actually usable.
 | Gossipsub | `pubsub` | `.pubsub()` or gossipsub `.pubsub_config(...)` | Pubsub driver | At least one compatible mesh peer |
 | Floodsub | `pubsub` | `.pubsub_config(FloodsubConfig::default())` | Pubsub driver | At least one floodsub peer |
 | Signed discovery | `discovery` | `.discovery()` or `.discovery_config(...)` | Discovery, default pubsub, and NAT drivers | A connected discovery peer; relay optional for direct-only addresses |
+| Local-link discovery | `mdns` | `.mdns()` or `.mdns_config(...)` | mDNS socket driver, shared discovery book, and NAT driver | Multicast-capable local network and interface |
 
 ## Base API
 
@@ -59,12 +60,32 @@ Compiled with `features = ["discovery"]`, which includes the `nat` and
 `pubsub` Cargo features:
 
 - Activation: `discovery`, `discovery_config`
+- Shared policy: `peer_discovery_config`
 - State: `known_peers`
 - Events: `take_discovery_events`, `next_discovery_event`
 
 Activating discovery also activates default pubsub and the NAT agent. A relay
 remains optional for direct discovery, but required for relayed paths and
 relay-assisted punching.
+
+## mDNS API
+
+Compiled with `features = ["mdns"]`, which includes the `nat` Cargo feature
+but not `pubsub`:
+
+- Activation: `mdns`, `mdns_config`
+- Shared policy: `peer_discovery_config`
+- State: `known_peers`
+- Events: `take_discovery_events`, `next_discovery_event`
+- Lifecycle: `shutdown`
+
+mDNS discovers peers only on multicast-capable local links. Its address claims
+remain unauthenticated until QUIC/TLS verifies the peer identity. Automatic
+mDNS-triggered attempts are therefore direct-only and never activate a
+configured relay or HOP CONNECT.
+`Endpoint::shutdown` sends TTL-zero goodbyes and permanently stops mDNS while
+leaving QUIC usable. With both `discovery` and `mdns` enabled, both sources use
+one bounded peer book and one automatic-dial state.
 
 ## Exhaustive API docs
 
@@ -77,5 +98,5 @@ cargo doc --workspace --no-deps --open
 To include every optional feature:
 
 ```bash
-cargo doc -p minip2p-rs --features nat,pubsub,discovery --no-deps --open
+cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns --no-deps --open
 ```

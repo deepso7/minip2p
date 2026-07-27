@@ -74,6 +74,22 @@ inside a particular endpoint.
     default pubsub, and the NAT agent together.
 
   </Tab>
+  <Tab title="mDNS">
+
+    ```toml
+    minip2p-rs = {
+      version = "0.1.1",
+      features = ["mdns"]
+    }
+    ```
+
+    The `mdns` Cargo feature includes the `nat` APIs but does not include
+    pubsub. Calling `.mdns()` or `.mdns_config(...)` activates local-link
+    multicast discovery and the shared peer book. Use
+    `.peer_discovery_config(...)` to tune that book and its automatic-dial
+    policy.
+
+  </Tab>
 </Tabs>
 
 :::warning
@@ -90,6 +106,7 @@ connections or perform relay-assisted hole punching.
 | `features = ["nat"]` | `.relay`, `.autonat_server`, or `.nat_config` | NAT driver runs with the supplied capabilities |
 | `features = ["pubsub"]` | `.pubsub` or `.pubsub_config` | Gossipsub or floodsub driver runs |
 | `features = ["discovery"]` | `.discovery` or `.discovery_config` | Discovery, default pubsub, and NAT coordination run |
+| `features = ["mdns"]` | `.mdns` or `.mdns_config` | Local-link mDNS, shared discovery-book, and NAT coordination run |
 
 See the [feature matrix](/reference/feature-matrix) for the methods, events,
 and infrastructure each option adds.

@@ -17,6 +17,7 @@ check:
 
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy -p minip2p-rs --features discovery --all-targets -- -D warnings
     cargo clippy -p minip2p-rs --features mdns --all-targets -- -D warnings
     cargo clippy -p minip2p-rs --features discovery,mdns --all-targets -- -D warnings
     cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings

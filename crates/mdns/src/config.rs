@@ -9,7 +9,7 @@ pub struct MdnsConfig {
     pub ttl_ms: u64,
     /// Steady-state query interval after exponential startup probing.
     pub query_interval_ms: u64,
-    /// Maximum DNS/UDP payload emitted by the encoder.
+    /// Maximum DNS/UDP payload emitted by the encoder, from 512 through 4096 bytes.
     pub max_packet_bytes: usize,
     /// Maximum local addresses announced in one response burst.
     pub max_announced_addrs: usize,
@@ -42,7 +42,7 @@ impl MdnsConfig {
         if self.query_interval_ms == 0 {
             return Err(MdnsConfigError::ZeroQueryInterval);
         }
-        if !(256..=4_096).contains(&self.max_packet_bytes) {
+        if !(512..=4_096).contains(&self.max_packet_bytes) {
             return Err(MdnsConfigError::InvalidMaxPacketBytes);
         }
         if self.max_announced_addrs == 0 {
@@ -67,8 +67,8 @@ pub enum MdnsConfigError {
     /// A zero query interval would livelock the caller's driver loop.
     #[error("mDNS query interval must be non-zero")]
     ZeroQueryInterval,
-    /// Interoperable DNS payloads must be between 256 and 4096 bytes.
-    #[error("mDNS maximum packet size must be between 256 and 4096 bytes")]
+    /// Interoperable DNS payloads must be between 512 and 4096 bytes.
+    #[error("mDNS maximum packet size must be between 512 and 4096 bytes")]
     InvalidMaxPacketBytes,
     /// At least one local address must be eligible for announcement.
     #[error("mDNS maximum announced addresses must be non-zero")]
@@ -79,4 +79,24 @@ pub enum MdnsConfigError {
     /// Socket polling must use a non-zero interval.
     #[error("mDNS socket poll interval must be non-zero")]
     ZeroSocketPollInterval,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_limit_covers_one_worst_case_uncompressed_claim() {
+        let mut config = MdnsConfig {
+            max_packet_bytes: 511,
+            ..MdnsConfig::default()
+        };
+        assert_eq!(
+            config.validate(),
+            Err(MdnsConfigError::InvalidMaxPacketBytes)
+        );
+
+        config.max_packet_bytes = 512;
+        assert_eq!(config.validate(), Ok(()));
+    }
 }

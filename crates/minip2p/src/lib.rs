@@ -10,6 +10,14 @@
 //! default. `EndpointBuilder::pubsub_config` accepts either a
 //! `GossipsubConfig` or `FloodsubConfig`; the selected engine controls which
 //! pubsub protocol ids are advertised.
+//!
+//! The `nat` feature exposes relay, AutoNAT, and DCUtR coordination. The
+//! `discovery` feature includes `nat` and `pubsub`, adding signed presence
+//! beacons plus a bounded peer book. The `mdns` feature includes `nat` but not
+//! `pubsub`, and adds caller-driven local-link multicast discovery. Enable
+//! both discovery sources to feed one shared peer book and automatic-dial
+//! state. Cargo features expose these APIs; the corresponding builder methods
+//! activate their drivers.
 
 #[cfg(any(feature = "discovery", feature = "mdns"))]
 mod discovery;
