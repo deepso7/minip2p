@@ -15,7 +15,54 @@ export default defineConfig({
     text: "minip2p",
   },
   content: {
-    root: "md",
+    sources: [
+      {
+        type: "filesystem",
+        root: "md",
+      },
+      {
+        type: "github-releases",
+        prefix: "changelog",
+        owner: "deepso7",
+        repo: "minip2p",
+        limit: 50,
+      },
+    ],
+  },
+  navigation: {
+    tabs: [
+      { label: "Docs", path: "/" },
+      { label: "Changelog", path: "/changelog" },
+    ],
+    sidebar: [
+      "/",
+      {
+        label: "Quickstart",
+        items: ["/quickstart/install", "/quickstart/connect-peers"],
+      },
+      {
+        label: "Guides",
+        items: [
+          "/guides/concepts",
+          "/guides/discover-peers",
+          "/guides/drive-events",
+          "/guides/identity",
+          "/guides/listen-and-dial",
+          "/guides/pubsub",
+          "/guides/register-a-protocol",
+          "/guides/traverse-nat",
+        ],
+      },
+      {
+        label: "Reference",
+        items: [
+          "/reference/feature-matrix",
+          "/reference/glossary",
+          "/reference/troubleshooting",
+        ],
+      },
+      { label: "Changelog", href: "/changelog" },
+    ],
   },
   ai: {
     llmsTxt: {
