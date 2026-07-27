@@ -2,7 +2,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, select_direct_candidates};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId, select_direct_addrs};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -250,8 +250,8 @@ impl Shared {
         let Some(Ok(addr)) = observed.map(Multiaddr::from_bytes) else {
             return;
         };
-        let validated = select_direct_candidates(&[], Some(addr), None);
-        if let Some(addr) = validated.into_addrs().pop() {
+        let mut validated = select_direct_addrs(&[], Some(addr), None);
+        if let Some(addr) = validated.pop() {
             self.observed_addrs.insert(reporter.clone(), addr);
         }
     }
@@ -333,7 +333,7 @@ impl NatAgent {
     /// `direct_addrs` are candidate transport addresses for the peer (from
     /// discovery, config, or out-of-band exchange); they are validated and
     /// deduplicated with the same policy as
-    /// [`minip2p_core::select_direct_candidates`]. The relay leg uses the
+    /// [`minip2p_core::select_direct_addrs`]. The relay leg uses the
     /// first configured relay in [`NatConfig::relays`].
     pub fn connect(&mut self, peer: PeerId, direct_addrs: Vec<Multiaddr>, now: Now) -> ConnectId {
         self.connect_with_relay_policy(peer, direct_addrs, true, now)

@@ -15,10 +15,7 @@ mod peer_addr;
 mod protocol;
 mod sans_io;
 
-pub use candidates::{
-    DirectCandidate, DirectCandidateRejectReason, DirectCandidateRejection,
-    DirectCandidateSelection, DirectCandidateSource, select_direct_candidates,
-};
+pub use candidates::select_direct_addrs;
 pub use error::{MultiaddrError, PeerAddrError};
 pub use minip2p_identity::PeerId;
 pub use minip2p_identity::{VarintError, read_uvarint, uvarint_len, write_uvarint};

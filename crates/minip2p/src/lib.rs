@@ -181,8 +181,7 @@ impl Endpoint {
         if let Some(nat) = self.nat.as_mut() {
             let transports: Vec<Multiaddr> =
                 addrs.iter().map(|addr| addr.transport().clone()).collect();
-            let validated =
-                minip2p_core::select_direct_candidates(&transports, None, None).into_addrs();
+            let validated = minip2p_core::select_direct_addrs(&transports, None, None);
             nat.agent.set_listen_addrs(&validated);
         }
     }

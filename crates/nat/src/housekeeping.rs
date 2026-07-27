@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use minip2p_autonat::{
     AUTONAT_PROTOCOL_ID, AutoNatClient, AutoNatClientInput, AutoNatClientOutput, Reachability,
 };
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol, select_direct_candidates};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol, select_direct_addrs};
 use minip2p_relay::{
     HOP_PROTOCOL_ID, HopReservation, HopReservationInput, HopReservationOutput, ReservationOutcome,
 };
@@ -345,7 +345,7 @@ impl Prober {
     ) -> bool {
         let (sample, sample_addrs) = match reachability {
             Reachability::Public { addrs, .. } => {
-                let selected = select_direct_candidates(addrs, None, None);
+                let selected = select_direct_addrs(addrs, None, None);
                 // A successful dial-back is useful public evidence only when
                 // it leaves the application with an address this QUIC-only
                 // stack can actually advertise and accept. Counting an empty
@@ -354,7 +354,7 @@ impl Prober {
                 if selected.is_empty() {
                     return false;
                 }
-                (true, selected.into_addrs())
+                (true, selected)
             }
             Reachability::Private { .. } => (false, Vec::new()),
             // No signal: never move the window on an inconclusive probe.
