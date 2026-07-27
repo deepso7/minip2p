@@ -54,6 +54,16 @@ pub trait EntropySource {
 #[error("entropy source failed: {0}")]
 pub struct EntropyError(&'static str);
 
+impl EntropyError {
+    /// Creates an entropy failure with a static description.
+    ///
+    /// This is the only way for external [`EntropySource`] implementations
+    /// to construct the trait's error type.
+    pub fn new(reason: &'static str) -> Self {
+        Self(reason)
+    }
+}
+
 /// Entropy source backed by the operating system.
 #[cfg(feature = "std")]
 #[derive(Clone, Copy, Debug, Default)]
@@ -62,7 +72,7 @@ pub struct OsEntropy;
 #[cfg(feature = "std")]
 impl EntropySource for OsEntropy {
     fn fill(&mut self, destination: &mut [u8]) -> Result<(), EntropyError> {
-        getrandom::fill(destination).map_err(|_| EntropyError("OS randomness unavailable"))
+        getrandom::fill(destination).map_err(|_| EntropyError::new("OS randomness unavailable"))
     }
 }
 
@@ -1243,7 +1253,7 @@ mod tests {
 
     impl EntropySource for FailingEntropy {
         fn fill(&mut self, _destination: &mut [u8]) -> Result<(), EntropyError> {
-            Err(EntropyError("injected failure"))
+            Err(EntropyError::new("injected failure"))
         }
     }
 
