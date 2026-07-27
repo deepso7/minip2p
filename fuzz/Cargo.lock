@@ -310,6 +310,7 @@ dependencies = [
  "minip2p-discovery",
  "minip2p-identify",
  "minip2p-identity",
+ "minip2p-mdns",
  "minip2p-multistream-select",
  "minip2p-noise",
  "minip2p-pubsub",
@@ -337,6 +338,15 @@ dependencies = [
  "multihash",
  "rand_core",
  "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "minip2p-mdns"
+version = "0.1.1"
+dependencies = [
+ "minip2p-core",
+ "minip2p-identity",
  "thiserror",
 ]
 

@@ -6,7 +6,7 @@ description: A minimal, caller-driven libp2p implementation for Rust application
 minip2p establishes authenticated QUIC connections with a synchronous
 `Endpoint`. Your application drives progress with `poll` and `next_event` —
 there is no async runtime. Optional features layer on NAT traversal, pubsub,
-and peer discovery without changing the base API.
+signed peer discovery, and local-link mDNS without changing the base API.
 
 ```rust
 use minip2p::{Deadline, Endpoint};
@@ -32,7 +32,7 @@ fn main() -> Result<(), minip2p::Error> {
 
 <CardGroup cols={2}>
   <Card title="Install" href="/quickstart/install" icon="package-plus">
-    Add the Git dependency and pick `nat`, `pubsub`, or `discovery` features.
+    Add the dependency and pick `nat`, `pubsub`, `discovery`, or `mdns`.
   </Card>
   <Card title="Connect two peers" href="/quickstart/connect-peers" icon="unplug">
     In about 10 minutes, print a dialable `PeerAddr` and a Ping RTT.
@@ -71,7 +71,7 @@ fn main() -> Result<(), minip2p::Error> {
     Subscribe, publish signed gossipsub messages, or select floodsub.
   </Card>
   <Card title="Discover peers" href="/guides/discover-peers" icon="radar">
-    Signed presence beacons and automatic dialing over pubsub + NAT.
+    Signed presence beacons or zero-configuration local-link mDNS.
   </Card>
 </CardGroup>
 

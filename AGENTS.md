@@ -17,14 +17,17 @@ Additional constraints: `unsafe` is forbidden workspace-wide; sockets, clocks, a
 `just` mirrors CI (`.github/workflows/ci.yml`):
 
 ```bash
-just test          # cargo test + minip2p feature matrix (nat, pubsub, nat+pubsub)
-just clippy        # -D warnings, includes the separate fuzz/ workspace
+just test          # cargo test + facade feature matrix through discovery + mDNS
+just clippy        # -D warnings, facade discovery/mDNS variants, and fuzz/
 just fmt           # also formats fuzz/
-just check-nostd   # no_std check on thumbv7em-none-eabi
+just check-nostd   # all no_std crates on thumbv7em-none-eabi
 just fuzz 30       # needs nightly + cargo-fuzz
 ```
 
-Single test: `cargo test -p minip2p-ping test_name`. Facade features: `cargo test -p minip2p-rs --features nat` (or `pubsub`, `nat,pubsub`). `fuzz/` is outside the workspace — use `--manifest-path fuzz/Cargo.toml`.
+Single test: `cargo test -p minip2p-ping test_name`. Facade features:
+`cargo test -p minip2p-rs --features mdns` (or `discovery`,
+`discovery,mdns`; see `justfile` for the full matrix). `fuzz/` is outside the
+workspace — use `--manifest-path fuzz/Cargo.toml`.
 
 Publishing: bump the workspace version and all versioned local dependencies in lockstep, update `Cargo.lock`, run the standard checks, push the release commit, then publish a GitHub release tagged `v<version>`; the workflow publishes every runtime crate.
 
@@ -32,9 +35,9 @@ Publishing: bump the workspace version and all versioned local dependencies in l
 
 Three layers, strictly separated:
 
-1. **Sans-I/O protocol crates** (`no_std + alloc`), one per protocol: `multistream-select`, `ping`, `identify`, `relay`, `autonat`, `dcutr`, `pubsub`; plus `identity`, `core`, `tls`, and `transport` (trait contract only).
-2. **Sans-I/O orchestrators**: `crates/swarm` (`SwarmCore`; also a `std`-gated `Swarm<T>` driver) and `crates/nat` (`NatAgent`: direct-dial vs. relay race + DCUtR hole punching).
-3. **`std` adapters**: `transports/quic` (quiche-based, owns UDP/DNS, exposes deadlines) and `crates/minip2p` — the `Endpoint` facade; features `nat`/`pubsub` layer on without changing the base API.
+1. **Sans-I/O protocol crates** (`no_std + alloc`), one per protocol: `multistream-select`, `ping`, `identify`, `relay`, `autonat`, `dcutr`, `pubsub`, `mdns`; plus `identity`, `core`, `tls`, and `transport` (trait contract only).
+2. **Sans-I/O orchestrators**: `crates/swarm` (`SwarmCore`; also a `std`-gated `Swarm<T>` driver), `crates/nat` (`NatAgent`: direct-dial vs. relay race + DCUtR hole punching), and `crates/discovery` (`BeaconAgent` + `PeerDiscoveryAgent`: signed beacons and the shared multi-source book/dial policy).
+3. **`std` adapters**: `transports/quic` (quiche-based, owns UDP/DNS, exposes deadlines), the `std`-gated mDNS socket driver, and `crates/minip2p` — the `Endpoint` facade; features layer on without changing the base API.
 
 The default swarm composes only identify + ping + protocols registered via `SwarmBuilder::protocol`/`EndpointBuilder::protocol`; relay/AutoNAT/DCUtR policy belongs to the host. `code-ref/` is read-only reference checkouts, not part of the build.
 

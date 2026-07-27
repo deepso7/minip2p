@@ -17,7 +17,7 @@ directly and reports later runtime or protocol failures through events.
 | `ProtocolNotRegistered` | The local endpoint never registered the ID | Add `.protocol("/app/name/1.0.0")` on the builder or call `add_protocol`. |
 | `ReservedProtocol` | The app tried to register Identify or Ping | Choose an application-owned, versioned protocol ID. |
 | `RemoteDoesNotSupport` | Identify completed and the remote did not advertise the protocol | Register the same protocol version on both peers. |
-| NAT, pubsub, or discovery reports “not enabled” | Cargo compiled the API but the builder did not activate the driver | Add the corresponding builder activation from the feature matrix. |
+| NAT, pubsub, discovery, or mDNS reports “not enabled” | Cargo compiled the API but the builder did not activate the driver | Add the corresponding builder activation from the feature matrix. |
 | AutoNAT reports reachability but `connect` has no relay path | Only `.autonat_server(...)` was configured | Add a Circuit Relay v2 server with `.relay(...)` or `NatConfig::relays`. |
 | No relay reservation appears | Relay unreachable, incompatible, or policy does not currently reserve | Check the relay address, connection events, reachability state, and `ReservationPolicy`. |
 | Hole punching fails | UDP paths or observed addresses are unusable | Keep the relay path, inspect `HolePunchFailed`, and verify both sides keep driving. |
@@ -25,6 +25,7 @@ directly and reports later runtime or protocol failures through events.
 | Unsigned pubsub message is rejected | `allow_unsigned` defaults to `false` | Enable it only when the remote intentionally sends unsigned application messages. |
 | Discovery rejects an unsigned beacon | Discovery always requires signed beacons | Fix the remote discovery publisher; application `allow_unsigned` does not relax discovery. |
 | Unsubscribing the discovery topic fails | The topic is driver-owned | Leave its lifecycle to discovery; use a separate topic for application messages. |
+| mDNS discovers no local peers | The network blocks multicast, the interfaces do not share a link, or `.mdns()` was not activated | Confirm both endpoints keep driving, use a multicast-capable local network, and activate mDNS on both peers. |
 | A quiet connection closes | The QUIC idle timeout elapsed | Send appropriate application traffic or Ping on a cadence suited to the app. |
 | A focused wait returns `EventBacklogExceeded` | Too many unrelated events were preserved during the wait | Drain ordinary events with `poll` or `next_event`, handle the busy source, then retry. |
 

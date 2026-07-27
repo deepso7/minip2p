@@ -48,12 +48,13 @@ Sans-I/O protocol crates (`no_std + alloc`):
 - `crates/autonat` (`minip2p-autonat`): AutoNAT reachability probe state machines.
 - `crates/dcutr` (`minip2p-dcutr`): DCUtR hole-punch coordination state machines (`DcutrInitiator`, `DcutrResponder`).
 - `crates/pubsub` (`minip2p-pubsub`): shared StrictSign pubsub RPC/control codec plus bounded gossipsub (`/meshsub/1.1.0`, `/meshsub/1.0.0`) and floodsub (`/floodsub/1.0.0`) routing engines.
+- `crates/mdns` (`minip2p-mdns`): Sans-I/O mDNS codec and discovery agent, plus an optional synchronous `std` multicast socket driver.
 
 Sans-I/O orchestrators (`no_std + alloc`):
 
 - `crates/swarm` (`minip2p-swarm`): `SwarmCore` composes the protocol state machines, tracks connections and streams, drives multistream-select, and emits actions/events for the driver. Also ships a thin `std`-gated driver `Swarm<T: Transport>`.
 - `crates/nat` (`minip2p-nat`): `NatAgent` NAT-traversal orchestrator — races direct dials against a relayed circuit, hole-punches with DCUtR over the bridge, and reports explicit path establish/upgrade/fallback events.
-- `crates/discovery` (`minip2p-discovery`): signed pubsub presence-beacon codec and discovery agent — maintains a TTL address book, validates authenticated announcements, and emits deterministic dial and cancellation actions.
+- `crates/discovery` (`minip2p-discovery`): signed pubsub presence-beacon agent plus a bounded multi-source address book and deterministic dial policy shared with mDNS.
 
 Runtime adapters (`std`):
 
@@ -61,6 +62,7 @@ Runtime adapters (`std`):
   - `nat` wires the traversal agent into `Endpoint` (`connect`/`wait_path`/`take_nat_events`, relay reservations, AutoNAT probing).
   - `pubsub` adds gossipsub by default (`subscribe`/`publish`/`take_pubsub_events`), with explicit floodsub selection available.
   - `discovery` composes `nat` and `pubsub` into signed peer discovery (`known_peers`/`next_discovery_event`), with coordinated dialing and bridge cleanup.
+  - `mdns` composes `nat` with local-link multicast discovery (`mdns`/`known_peers`/`next_discovery_event`) without pulling in pubsub.
 - `transports/quic` (`minip2p-quic`): QUIC transport adapter built on `quiche`, with libp2p TLS baked in. Owns UDP and DNS; exposes deadlines instead of running timers.
 
 Examples:
@@ -78,14 +80,15 @@ Current validated behavior:
 - NAT traversal live-validated end-to-end: relay reservation, circuit connect, DCUtR hole punch between two real NATs (home network ↔ mobile hotspot through a public relay), with explicit path events throughout.
 - Gossipsub live-validated: signed interop both ways with real go-libp2p (`NewGossipSub`, v0.15.0) and rust-libp2p (gossipsub 0.49.5) peers over QUIC, a relay-only room through a public relay, and a relayed → direct-punched upgrade with the mesh surviving the connection supersede; floodsub retains its prior live wire validation and explicit-selection regression tests.
 - Pubsub peer discovery live-validated across a public host, home NAT, and mobile hotspot: automatic mesh formation, one-sided dial initiation, address updates, graceful punch-failure degradation, and leaf-to-leaf chat survival after host death.
+- mDNS live-validated between two local endpoints: multicast discovery and automatic authenticated QUIC connection without bootstrap addresses.
 
 ## Architecture boundaries
 
 Three layers, strictly separated:
 
 1. Sans-I/O protocol crates — pure state machines, one per protocol. No sockets, no async runtimes, no wall clocks; callers pump inputs and timestamps in, actions and events come out.
-2. Sans-I/O orchestrators (`swarm`, `nat`) — compose the protocol machines, still deterministic and I/O-free.
-3. `std` adapters — the QUIC transport and the `Endpoint` facade own all real I/O.
+2. Sans-I/O orchestrators (`swarm`, `nat`, `discovery`) — compose protocol and policy state machines, still deterministic and I/O-free.
+3. `std` adapters — the QUIC transport, mDNS socket driver, and `Endpoint` facade own all real I/O.
 
 The minimal default swarm intentionally composes only identify, ping, and
 registered application protocols. Relay, AutoNAT, and DCUtR remain independent
@@ -93,7 +96,7 @@ Sans-I/O machines driven over generic streams; their dialing, retry, and
 fallback policy belongs to the host. This keeps the base library small and
 avoids hiding network policy in a monolithic swarm while still allowing
 declarative protocol registration through `SwarmBuilder::protocol` and
-`EndpointBuilder::protocol`. The `nat`, `pubsub`, and `discovery` facade
+`EndpointBuilder::protocol`. The `nat`, `pubsub`, `discovery`, and `mdns` facade
 features are pre-packaged policy for the common case, built on the same public
 hooks.
 
@@ -151,9 +154,9 @@ cargo run -p minip2p-chat -- host --nick hostess
 Common contributor workflows are available through `just` (mirrors CI):
 
 ```bash
-just test          # cargo test + the minip2p feature matrix (nat, pubsub, nat+pubsub, discovery)
-just clippy        # -D warnings, includes the separate fuzz/ workspace
-just check-nostd   # no_std check on thumbv7em-none-eabi
+just test          # cargo test + facade feature matrix through discovery + mDNS
+just clippy        # -D warnings, facade discovery/mDNS variants, and fuzz/
+just check-nostd   # all no_std crates on thumbv7em-none-eabi
 just bench
 just fuzz 30       # needs nightly + cargo-fuzz
 ```
@@ -184,5 +187,6 @@ runtime crate at the same version, including crates without code changes.
 - [x] NAT-traversal orchestration (`nat` feature), live-validated between two real NATs.
 - [x] Floodsub pubsub engine with libp2p wire interop and explicit facade selection.
 - [x] Signed pubsub peer discovery (`discovery` feature), including automatic mesh dialing and host-death survival.
+- [x] Local-link mDNS discovery (`mdns` feature) with a shared bounded peer book and automatic dialing.
 - [x] Gossipsub, on the same pubsub API surface and selected by default.
 - [x] A circuit transport, so relayed paths are end-to-end encrypted, multiplexed normal connections.

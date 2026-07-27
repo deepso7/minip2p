@@ -1035,6 +1035,40 @@ fn no_candidates_and_no_relay_fails_immediately() {
 }
 
 #[test]
+fn direct_only_connect_never_arms_a_configured_relay() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let id = h.agent.connect_direct(h.target.clone(), Vec::new(), at(0));
+
+    assert!(drain_actions(&mut h.agent).is_empty());
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::ConnectFailed {
+            connect_id,
+            error: NatError::NoPathAvailable,
+            ..
+        }] if *connect_id == id
+    ));
+    h.agent.handle_tick(at(1_000));
+    assert!(drain_actions(&mut h.agent).is_empty());
+    assert!(h.agent.is_idle());
+}
+
+#[test]
+fn direct_only_connect_dials_candidates_without_relay_fallback() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    h.agent
+        .connect_direct(h.target.clone(), vec![maddr(TARGET_ADDR)], at(0));
+    let actions = drain_actions(&mut h.agent);
+    assert_eq!(dial_count_for(&actions, &h.target), 1);
+    assert_eq!(dial_count_for(&actions, &h.relay), 0);
+
+    h.agent.handle_tick(at(1_000));
+    let actions = drain_actions(&mut h.agent);
+    assert_eq!(dial_count_for(&actions, &h.relay), 0);
+    assert!(!has_hop_open(&actions));
+}
+
+#[test]
 fn wildcard_and_non_quic_candidates_are_filtered() {
     let mut h = Harness::without_relay(NatConfig::default());
     h.agent.connect(

@@ -5,9 +5,15 @@ use minip2p_autonat::{AutoNatClient, AutoNatClientInput, AutoNatServer, AutoNatS
 use minip2p_circuit::{BridgeAdoption, CircuitRole, CircuitTransport, EntropyError, EntropySource};
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol};
 use minip2p_dcutr::{FrameDecode as DcutrFrame, HolePunch};
-use minip2p_discovery::{Beacon, DiscoveryAgent, DiscoveryConfig};
+use minip2p_discovery::{
+    Beacon, BeaconAgent, BeaconConfig, BeaconEvent, DiscoverySource, Observation,
+    PeerDiscoveryAgent, PeerDiscoveryConfig,
+};
 use minip2p_identify::{IdentifyConfig, IdentifyInput, IdentifyMessage, IdentifyProtocol};
 use minip2p_identity::{KeyType, PublicKey};
+use minip2p_mdns::{
+    DnsMessage, InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAgent, MdnsConfig,
+};
 use minip2p_multistream_select::{MultistreamInput, MultistreamSelect};
 use minip2p_noise::{NoiseConfig, NoiseHandshakePayload, NoiseInput, NoiseRole, NoiseSession};
 use minip2p_pubsub::{
@@ -31,6 +37,7 @@ fuzz_target!(|data: &[u8]| {
     fuzz_identify(data);
     fuzz_autonat(data);
     fuzz_discovery(data);
+    fuzz_mdns(data);
     fuzz_noise(data);
     fuzz_pubsub(data);
     fuzz_yamux(data);
@@ -239,19 +246,108 @@ fn fuzz_discovery(data: &[u8]) {
     let _ = Beacon::decode(data);
     let local = PublicKey::new(KeyType::Ed25519, vec![1; 32]);
     let remote = PublicKey::new(KeyType::Ed25519, vec![2; 32]);
+    let local_peer = PeerId::from_public_key(&local);
     let remote_peer = PeerId::from_public_key(&remote);
-    let config = DiscoveryConfig {
-        auto_dial: false,
-        ..DiscoveryConfig::default()
-    };
-    let mut agent = DiscoveryAgent::new(local, config).expect("default discovery config");
-    agent.handle_beacon(&remote_peer, data, true, 0);
+    let mut beacon =
+        BeaconAgent::new(local, BeaconConfig::default()).expect("default beacon config");
+    let mut book = PeerDiscoveryAgent::new(
+        local_peer,
+        PeerDiscoveryConfig {
+            max_known_peers: 2,
+            max_addrs_per_peer: 2,
+            max_observed_ttl_ms: 1_000,
+            mdns_dial_window_ms: 100,
+            max_mdns_dials_per_window: 2,
+            max_mdns_dials_per_window_global: 2,
+            max_pending_violations: 2,
+            dial_tie_break: false,
+            ..PeerDiscoveryConfig::default()
+        },
+    )
+    .expect("bounded fuzz discovery config");
+
+    beacon.handle_beacon(&remote_peer, data, true);
     let authenticated = Beacon {
         public_key: remote.encode_protobuf(),
         addrs: vec![data.to_vec()],
     }
     .encode();
-    agent.handle_beacon(&remote_peer, &authenticated, true, 1);
+    beacon.handle_beacon(&remote_peer, &authenticated, true);
+    while let Some(event) = beacon.poll_event() {
+        match event {
+            BeaconEvent::Observation(observation) => book.observe_beacon(observation, 0),
+            BeaconEvent::ProtocolViolation { peer, reason } => {
+                book.report_violation(Some(peer), DiscoverySource::SignedBeacon, &reason)
+            }
+        }
+    }
+
+    let mut beacon_addrs = vec![
+        "/ip4/127.0.0.1/udp/4001/quic-v1"
+            .parse()
+            .expect("static fuzz address"),
+    ];
+    if let Ok(addr) = Multiaddr::from_bytes(data) {
+        beacon_addrs.push(addr);
+    }
+    book.observe_beacon(
+        Observation {
+            peer: remote_peer.clone(),
+            addrs: beacon_addrs,
+        },
+        1,
+    );
+
+    let ttl_ms = data.first().map_or(0, |byte| u64::from(*byte) * 8);
+    book.observe_mdns(
+        remote_peer.clone(),
+        vec![(
+            "/ip4/127.0.0.1/udp/4002/quic-v1"
+                .parse()
+                .expect("static fuzz address"),
+            ttl_ms,
+        )],
+        2,
+    );
+    let reason = core::str::from_utf8(data).unwrap_or("non-UTF-8 fuzz input");
+    book.report_violation(Some(remote_peer.clone()), DiscoverySource::Mdns, reason);
+    book.dial_failed(&remote_peer, reason, 3);
+    if data.get(1).is_some_and(|byte| byte & 1 == 0) {
+        book.peer_connected(&remote_peer, 4);
+        book.peer_disconnected(&remote_peer, 5);
+    }
+    book.handle_tick(2_u64.saturating_add(ttl_ms));
+    let _ = book.next_timeout(6);
+    let _ = book.known_peers();
+    while book.poll_action().is_some() {}
+    while book.poll_event().is_some() {}
+    while beacon.poll_action().is_some() {}
+}
+
+fn fuzz_mdns(data: &[u8]) {
+    let _ = DnsMessage::decode(data);
+    let local = fuzz_peer_id();
+    let mut agent =
+        MdnsAgent::new(local, MdnsConfig::default(), [7; 32]).expect("default mDNS config");
+    agent.set_interfaces(
+        &[InterfaceSnapshot {
+            id: InterfaceId::new(1),
+            index: 1,
+            family: IpFamily::V4,
+            addrs: vec![
+                IpNet::new(core::net::IpAddr::V4(core::net::Ipv4Addr::LOCALHOST), 8)
+                    .expect("valid loopback prefix"),
+            ],
+        }],
+        0,
+    );
+    agent.handle_packet(
+        InterfaceId::new(1),
+        core::net::SocketAddr::from(([127, 0, 0, 1], 5353)),
+        data,
+        1,
+    );
+    agent.handle_tick(1);
     while agent.poll_action().is_some() {}
     while agent.poll_event().is_some() {}
 }

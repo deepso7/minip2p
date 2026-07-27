@@ -91,6 +91,7 @@ impl ConnectAttempt {
         id: ConnectId,
         peer: PeerId,
         direct_addrs: Vec<Multiaddr>,
+        allow_relay: bool,
         shared: &mut Shared,
         now: Now,
     ) -> Option<Self> {
@@ -99,7 +100,9 @@ impl ConnectAttempt {
         } else {
             select_direct_candidates(&direct_addrs, None, None).into_addrs()
         };
-        let relay = shared.config.relays.first().cloned();
+        let relay = allow_relay
+            .then(|| shared.config.relays.first().cloned())
+            .flatten();
 
         if candidates.is_empty() && relay.is_none() {
             shared.push_event(NatEvent::ConnectFailed {

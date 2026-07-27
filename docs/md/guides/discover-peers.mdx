@@ -1,18 +1,34 @@
 ---
 title: Discover peers
-description: Activate signed presence beacons, a bounded peer address book, and automatic direct or NAT-aware dialing.
+description: Activate signed presence beacons or local-link mDNS with a bounded peer book and automatic dialing.
 ---
 
-**Goal:** Turn on discovery, observe the known-peer book, and let the driver
-dial peers from signed beacons.
+**Goal:** Turn on signed or local-link discovery, observe the known-peer book,
+and let the driver dial peers from accepted observations.
 
-**Assumes:** [Publish with pubsub](/guides/pubsub). Relayed paths still need a
-configured relay — see [Traverse NAT](/guides/traverse-nat).
+**Assumes:** [Publish with pubsub](/guides/pubsub) for signed discovery. Signed
+observations can use a configured relay — see [Traverse NAT](/guides/traverse-nat).
+mDNS observations are unauthenticated and automatic dials from them are always
+direct-only.
 
-<Badge>pre-1.0</Badge> <Badge>implies nat + pubsub</Badge>
+<Badge>pre-1.0</Badge> <Badge>signed: nat + pubsub</Badge> <Badge>mDNS: nat</Badge>
 
 Discovery layers signed presence beacons and dialing policy over pubsub and
 the NAT agent.
+
+For zero-configuration LAN discovery without pubsub, enable the `mdns` Cargo
+feature and call `.mdns()`. Enabling both sources feeds one address book and
+one dial state:
+
+```rust
+let node = minip2p::Endpoint::builder()
+    .discovery()
+    .mdns()
+    .bind_quic_dual_stack()?;
+```
+
+mDNS addresses are unauthenticated until QUIC/TLS verifies the remote peer.
+`KnownPeer::beacon_addrs` and `KnownPeer::mdns_addrs` expose their provenance.
 
 ## Compile and activate discovery
 
@@ -37,7 +53,8 @@ node.listen_all()?;
 
 `.discovery()` activates three coordinated pieces: the discovery driver,
 default gossipsub, and the NAT agent. `.discovery_config(...)` does the same
-with caller-selected discovery policy.
+with a caller-selected `BeaconConfig` (topic, cadence, announcement cap).
+Tune the shared address book and dial policy with `.peer_discovery_config(...)`.
 
 Discovery can dial direct addresses announced by other peers without a relay.
 A configured relay is still required for relay circuits, reservations, and
@@ -88,22 +105,28 @@ event.
 ## Customize policy
 
 ```rust
-use minip2p::{DiscoveryConfig, Endpoint};
+use minip2p::{BeaconConfig, Endpoint, PeerDiscoveryConfig};
 
-let config = DiscoveryConfig {
+let beacon = BeaconConfig {
     topic: "my-app/discovery/v1".into(),
+    ..BeaconConfig::default()
+};
+let policy = PeerDiscoveryConfig {
     max_known_peers: 256,
-    ..DiscoveryConfig::default()
+    ..PeerDiscoveryConfig::default()
 };
 
 let node = Endpoint::builder()
-    .discovery_config(config)?
+    .discovery_config(beacon)?
+    .peer_discovery_config(policy)?
     .bind_quic_dual_stack()?;
 ```
 
-Configuration also controls beacon cadence, peer TTL, addresses per peer,
-automatic dialing, peer-ID tie breaking, and retry backoff. Invalid bounds are
-rejected before a socket is allocated.
+`BeaconConfig` controls the pubsub topic, cadence, and local announcement cap.
+`PeerDiscoveryConfig` is shared by signed discovery and mDNS; it controls peer
+and address bounds, source TTLs, automatic dialing, tie breaking, retry
+backoff, and mDNS dial-rate limits. Invalid bounds are rejected before a socket
+is allocated.
 
 :::warning
 Discovery beacons are always required to be signed. Unsigned discovery

@@ -9,6 +9,7 @@ members = [
     "crates/discovery",
     "crates/identify",
     "crates/identity",
+    "crates/mdns",
     "crates/minip2p",
     "crates/multistream-select",
     "crates/nat",
