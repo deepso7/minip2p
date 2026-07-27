@@ -913,8 +913,17 @@ fn runtime_error(
 /// Fails with [`DriverError::Entropy`] if the CSPRNG is unavailable; a
 /// predictable fallback payload would silently weaken the ping nonce.
 fn rand_ping_payload() -> Result<[u8; PING_PAYLOAD_LEN], DriverError> {
+    ping_payload_from(|buf| getrandom::fill(buf).map_err(|_| ()))
+}
+
+/// Builds the ping payload from `fill`, mapping failure to
+/// [`DriverError::Entropy`]. Split out so tests can exercise the failure
+/// path without faking the OS RNG.
+fn ping_payload_from(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), ()>,
+) -> Result<[u8; PING_PAYLOAD_LEN], DriverError> {
     let mut payload = [0u8; PING_PAYLOAD_LEN];
-    getrandom::fill(&mut payload).map_err(|_| DriverError::Entropy)?;
+    fill(&mut payload).map_err(|_| DriverError::Entropy)?;
     Ok(payload)
 }
 
@@ -930,6 +939,24 @@ mod tests {
     use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, MultistreamSelect};
     use minip2p_ping::PING_PROTOCOL_ID;
     use minip2p_transport::{ConnectionEndpoint, TransportEvent};
+
+    #[test]
+    fn ping_payload_entropy_failure_is_an_error() {
+        assert!(matches!(
+            ping_payload_from(|_| Err(())),
+            Err(DriverError::Entropy)
+        ));
+    }
+
+    #[test]
+    fn ping_payload_returns_filled_bytes() {
+        let payload = ping_payload_from(|buf| {
+            buf.fill(0xAB);
+            Ok(())
+        })
+        .expect("fill succeeds");
+        assert_eq!(payload, [0xAB; PING_PAYLOAD_LEN]);
+    }
 
     /// Transport that never produces events; counts `poll()` calls so tests
     /// can assert how often an expired wait touches the transport.

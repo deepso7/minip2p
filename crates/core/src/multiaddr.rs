@@ -373,6 +373,40 @@ mod tests {
     }
 
     #[test]
+    fn detects_relay_circuit_transport_shape() {
+        for host in [
+            "/ip4/203.0.113.7",
+            "/ip6/2001:db8::1",
+            "/dns4/relay.example.com",
+        ] {
+            let input = format!("{host}/udp/4001/quic-v1/p2p/{PEER_ID}/p2p-circuit");
+            let parsed = Multiaddr::from_str(&input).expect("must parse");
+            assert!(parsed.is_relay_circuit_transport(), "{input}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_circuit_transport_shapes() {
+        let near_misses = [
+            // Direct QUIC address, no relay suffix.
+            "/ip4/203.0.113.7/udp/4001/quic-v1".to_string(),
+            // Relay address without the circuit marker.
+            format!("/ip4/203.0.113.7/udp/4001/quic-v1/p2p/{PEER_ID}"),
+            // Circuit marker without the relay peer id (four components).
+            "/ip4/203.0.113.7/udp/4001/quic-v1/p2p-circuit".to_string(),
+            // Circuit marker before the relay peer id (five components, wrong order).
+            format!("/ip4/203.0.113.7/udp/4001/quic-v1/p2p-circuit/p2p/{PEER_ID}"),
+            // Destination peer appended after the circuit marker (six components).
+            format!("/ip4/203.0.113.7/udp/4001/quic-v1/p2p/{PEER_ID}/p2p-circuit/p2p/{PEER_ID}"),
+        ];
+        for input in near_misses {
+            let parsed = Multiaddr::from_str(&input).expect("must parse");
+            assert!(!parsed.is_relay_circuit_transport(), "{input}");
+        }
+        assert!(!Multiaddr::default().is_relay_circuit_transport());
+    }
+
+    #[test]
     fn rejects_unknown_protocol() {
         let err = Multiaddr::from_str("/ip4/127.0.0.1/tcp/1234").expect_err("must fail");
         assert!(matches!(err, MultiaddrError::UnknownProtocol { .. }));
