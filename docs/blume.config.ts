@@ -61,7 +61,6 @@ export default defineConfig({
           "/reference/troubleshooting",
         ],
       },
-      { label: "Changelog", href: "/changelog" },
     ],
   },
   ai: {
