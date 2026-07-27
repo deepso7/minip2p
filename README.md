@@ -201,3 +201,4 @@ runtime crate at the same version, including crates without code changes.
 - [x] Local-link mDNS discovery (`mdns` feature) with a shared bounded peer book and automatic dialing.
 - [x] Gossipsub, on the same pubsub API surface and selected by default.
 - [x] A circuit transport, so relayed paths are end-to-end encrypted, multiplexed normal connections.
+- [x] Interoperability testing with other libp2p implementations in reference to transport, gossipsub, performance monitoring and hole punching.
