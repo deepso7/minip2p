@@ -174,7 +174,7 @@ impl QuicConnection {
     }
 
     /// Returns the duration until quiche next needs timer service.
-    pub fn timeout(&self) -> Option<Duration> {
+    pub(crate) fn timeout(&self) -> Option<Duration> {
         self.conn.timeout()
     }
 

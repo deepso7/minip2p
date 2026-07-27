@@ -30,8 +30,8 @@ pub use x509_cert::time::Validity;
 /// OID for the libp2p Public Key Extension: `1.3.6.1.4.1.53594.1.1`.
 ///
 /// Allocated by IANA to the libp2p project at Protocol Labs.
-pub const LIBP2P_EXTENSION_OID: const_oid::ObjectIdentifier =
+pub(crate) const LIBP2P_EXTENSION_OID: const_oid::ObjectIdentifier =
     const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.4.1.53594.1.1");
 
 /// Prefix prepended to the SubjectPublicKeyInfo before signing with the host key.
-pub const SIGNATURE_PREFIX: &[u8] = b"libp2p-tls-handshake:";
+pub(crate) const SIGNATURE_PREFIX: &[u8] = b"libp2p-tls-handshake:";

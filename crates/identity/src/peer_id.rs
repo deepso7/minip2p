@@ -11,11 +11,11 @@ use thiserror::Error;
 use crate::PublicKey;
 
 /// Multihash code for identity (inline) hashing.
-pub const IDENTITY_MULTIHASH_CODE: u64 = 0x00;
+const IDENTITY_MULTIHASH_CODE: u64 = 0x00;
 /// Multihash code for SHA-256 hashing.
-pub const SHA256_MULTIHASH_CODE: u64 = 0x12;
+const SHA256_MULTIHASH_CODE: u64 = 0x12;
 /// CIDv1 multicodec value for `libp2p-key`.
-pub const LIBP2P_KEY_MULTICODEC: u64 = 0x72;
+const LIBP2P_KEY_MULTICODEC: u64 = 0x72;
 
 /// Public keys with protobuf encoding at or below this size are inlined
 /// using identity multihash; larger keys are SHA-256 hashed.

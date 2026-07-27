@@ -123,9 +123,7 @@ impl SwarmBuilder {
     }
 
     /// Returns the underlying [`IdentifyConfig`] assembled from the builder.
-    ///
-    /// Primarily useful for callers that want to construct the transport
-    /// separately but keep the same Identify defaults.
+    #[cfg(test)]
     pub fn into_identify_config(self) -> IdentifyConfig {
         IdentifyConfig {
             protocol_version: self.protocol_version,

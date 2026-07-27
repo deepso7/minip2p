@@ -29,16 +29,16 @@ pub const YAMUX_PROTOCOL_ID: &str = "/yamux/1.0.0";
 pub const DEFAULT_RECEIVE_WINDOW: u32 = 256 * 1024;
 
 /// Default maximum payload accepted in one inbound data frame (1 MiB).
-pub const DEFAULT_MAX_FRAME_LEN: u32 = 1024 * 1024;
+const DEFAULT_MAX_FRAME_LEN: u32 = 1024 * 1024;
 
 /// Default maximum number of simultaneously tracked streams.
-pub const DEFAULT_MAX_STREAMS: usize = 256;
+const DEFAULT_MAX_STREAMS: usize = 256;
 
 /// Default per-stream cap for data queued behind the remote window.
-pub const DEFAULT_MAX_BUFFERED_SEND: usize = 256 * 1024;
+const DEFAULT_MAX_BUFFERED_SEND: usize = 256 * 1024;
 
 /// Default aggregate cap for data queued behind remote windows.
-pub const DEFAULT_MAX_TOTAL_BUFFERED_SEND: usize = 4 * 1024 * 1024;
+const DEFAULT_MAX_TOTAL_BUFFERED_SEND: usize = 4 * 1024 * 1024;
 
 /// Role of this side of a Yamux session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

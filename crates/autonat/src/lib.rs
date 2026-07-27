@@ -37,7 +37,7 @@ const TAG_RESPONSE_ADDRS: u8 = (3 << 3) | WIRE_LEN;
 
 /// Top-level AutoNAT message type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MessageType {
+pub(crate) enum MessageType {
     /// Request that the service dial the supplied peer addresses.
     Dial = 0,
     /// Service result for a dial request.

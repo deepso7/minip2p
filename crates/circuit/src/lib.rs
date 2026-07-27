@@ -206,6 +206,7 @@ impl<T, E> CircuitTransport<T, E> {
     }
 
     /// Replaces the Yamux limits used by subsequently adopted circuits.
+    #[cfg(test)]
     pub fn set_yamux_config(&mut self, config: YamuxConfig) {
         self.yamux_config = config;
     }

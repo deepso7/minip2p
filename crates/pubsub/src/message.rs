@@ -33,7 +33,7 @@ pub const MAX_TOPIC_LEN: usize = 1024;
 /// the format (go: 8 big-endian bytes, rust-libp2p floodsub: 20 random
 /// bytes), so the seqno is treated as opaque; the cap bounds what the
 /// seen-cache stores per message id.
-pub const MAX_SEQNO_LEN: usize = 64;
+pub(crate) const MAX_SEQNO_LEN: usize = 64;
 
 /// Domain-separation prefix for StrictSign signatures.
 const SIGN_PREFIX: &[u8] = b"libp2p-pubsub:";
@@ -125,8 +125,8 @@ pub struct SubOpts {
 /// the `Message` submessage; forwarding embeds `raw` verbatim so a relayed
 /// message reaches downstream verifiers byte-identical. The decoded fields
 /// are for local routing and verification only — verification re-encodes
-/// them canonically (see [`RawMessage::sign_bytes`]) rather than trusting
-/// `raw`, matching upstream libp2p behavior.
+/// them canonically (via the internal `RawMessage::sign_bytes`) rather than
+/// trusting `raw`, matching upstream libp2p behavior.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RawMessage {
     /// The exact wire encoding of this message submessage.
@@ -289,7 +289,7 @@ impl RawMessage {
     /// implementation *emits* duplicate field-4 entries in signed messages,
     /// so the rules only diverge on hand-crafted input — where including
     /// everything fails toward rejection, the safe direction.
-    pub fn sign_bytes(&self) -> Vec<u8> {
+    pub(crate) fn sign_bytes(&self) -> Vec<u8> {
         let body = self.encode_fields(false);
         let mut out = Vec::with_capacity(SIGN_PREFIX.len() + body.len());
         out.extend_from_slice(SIGN_PREFIX);

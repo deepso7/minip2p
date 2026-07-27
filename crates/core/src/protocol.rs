@@ -16,23 +16,23 @@ use crate::MultiaddrError;
 // or absent).
 
 /// Multicodec code for `/ip4/<a.b.c.d>`. 4 raw bytes.
-pub const IP4_CODE: u64 = 0x04;
+const IP4_CODE: u64 = 0x04;
 /// Multicodec code for `/ip6/<address>`. 16 raw bytes.
-pub const IP6_CODE: u64 = 0x29;
+const IP6_CODE: u64 = 0x29;
 /// Multicodec code for `/dns/<name>`. Varint-length-prefixed UTF-8.
-pub const DNS_CODE: u64 = 0x35;
+const DNS_CODE: u64 = 0x35;
 /// Multicodec code for `/dns4/<name>`. Varint-length-prefixed UTF-8.
-pub const DNS4_CODE: u64 = 0x36;
+const DNS4_CODE: u64 = 0x36;
 /// Multicodec code for `/dns6/<name>`. Varint-length-prefixed UTF-8.
-pub const DNS6_CODE: u64 = 0x37;
+const DNS6_CODE: u64 = 0x37;
 /// Multicodec code for `/udp/<port>`. 2 raw bytes (big-endian).
-pub const UDP_CODE: u64 = 0x0111;
+const UDP_CODE: u64 = 0x0111;
 /// Multicodec code for `/quic-v1`. No value.
-pub const QUIC_V1_CODE: u64 = 0x01cd;
+const QUIC_V1_CODE: u64 = 0x01cd;
 /// Multicodec code for `/p2p/<peer-id>`. Varint-length-prefixed multihash.
-pub const P2P_CODE: u64 = 0x01a5;
+const P2P_CODE: u64 = 0x01a5;
 /// Multicodec code for `/p2p-circuit`. No value.
-pub const P2P_CIRCUIT_CODE: u64 = 0x0122;
+const P2P_CIRCUIT_CODE: u64 = 0x0122;
 
 /// A single component of a multiaddr.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

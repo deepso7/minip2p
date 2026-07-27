@@ -87,11 +87,6 @@ impl Deadline {
     /// for `run_until`, when the predicate matches).
     pub const NEVER: Deadline = Deadline(None);
 
-    /// Absolute deadline. Equivalent to `Deadline::from(instant)`.
-    pub fn at(instant: Instant) -> Self {
-        Deadline(Some(instant))
-    }
-
     /// Whether the deadline has already passed. [`Deadline::NEVER`] never
     /// passes.
     pub fn has_passed(self) -> bool {
@@ -1294,7 +1289,7 @@ mod tests {
         assert_eq!(Deadline::NEVER.remaining_at(Instant::now()), None);
 
         // An Instant behaves as an absolute deadline.
-        let past = Deadline::at(Instant::now());
+        let past = Deadline::from(Instant::now());
         assert!(past.is_expired_at(Instant::now() + Duration::from_millis(1)));
     }
 

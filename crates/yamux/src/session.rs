@@ -315,16 +315,19 @@ impl YamuxSession {
     }
 
     /// Returns the number of currently tracked streams.
+    #[cfg(test)]
     pub fn stream_count(&self) -> usize {
         self.streams.len()
     }
 
     /// Returns aggregate bytes queued behind remote flow-control windows.
+    #[cfg(test)]
     pub fn total_buffered_send(&self) -> usize {
         self.total_buffered_send
     }
 
     /// Returns whether the stream-opening `SYN` has been acknowledged.
+    #[cfg(test)]
     pub fn is_acknowledged(&self, stream: u32) -> Result<bool, YamuxError> {
         self.streams
             .get(&stream)

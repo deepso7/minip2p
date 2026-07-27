@@ -604,12 +604,6 @@ impl PingProtocol {
         actions
     }
 
-    /// Drains and returns all pending events.
-    #[cfg(test)]
-    fn poll_events(&mut self) -> Vec<PingEvent> {
-        self.pending_events.drain(..).collect()
-    }
-
     /// Emits a ProtocolViolation event and returns a ResetStream action.
     fn protocol_violation(
         &mut self,
@@ -702,6 +696,13 @@ mod tests {
     use core::str::FromStr;
 
     use super::*;
+
+    impl PingProtocol {
+        /// Drains and returns all pending events (test helper).
+        fn poll_events(&mut self) -> Vec<PingEvent> {
+            self.pending_events.drain(..).collect()
+        }
+    }
 
     fn peer(id: &str) -> PeerId {
         PeerId::from_str(id).expect("peer id")

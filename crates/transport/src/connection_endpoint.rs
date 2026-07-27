@@ -45,6 +45,7 @@ impl ConnectionEndpoint {
     }
 
     /// Converts to a [`PeerAddr`], returning `None` if no peer id is set.
+    #[cfg(test)]
     pub fn to_peer_addr(&self) -> Option<PeerAddr> {
         let peer_id = self.peer_id.as_ref()?.clone();
         PeerAddr::new(self.transport.clone(), peer_id).ok()

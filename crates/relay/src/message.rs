@@ -650,31 +650,25 @@ impl StopMessage {
 // Status name helper
 // ---------------------------------------------------------------------------
 
-impl Status {
-    /// Returns a human-readable name for this status.
-    pub fn as_name(&self) -> &'static str {
-        match self {
-            Status::Unused => "UNUSED",
-            Status::Ok => "OK",
-            Status::ReservationRefused => "RESERVATION_REFUSED",
-            Status::ResourceLimitExceeded => "RESOURCE_LIMIT_EXCEEDED",
-            Status::PermissionDenied => "PERMISSION_DENIED",
-            Status::ConnectionFailed => "CONNECTION_FAILED",
-            Status::NoReservation => "NO_RESERVATION",
-            Status::MalformedMessage => "MALFORMED_MESSAGE",
-            Status::UnexpectedMessage => "UNEXPECTED_MESSAGE",
-        }
-    }
-}
-
 /// Builds a human-readable description of a non-OK status response.
-pub fn describe_status(status: Status) -> String {
+pub(crate) fn describe_status(status: Status) -> String {
     use alloc::string::ToString;
     match status {
         Status::Ok => "OK".to_string(),
         other => {
             use alloc::format;
-            format!("{} ({})", other.as_name(), other as u16)
+            let name = match other {
+                Status::Unused => "UNUSED",
+                Status::Ok => "OK",
+                Status::ReservationRefused => "RESERVATION_REFUSED",
+                Status::ResourceLimitExceeded => "RESOURCE_LIMIT_EXCEEDED",
+                Status::PermissionDenied => "PERMISSION_DENIED",
+                Status::ConnectionFailed => "CONNECTION_FAILED",
+                Status::NoReservation => "NO_RESERVATION",
+                Status::MalformedMessage => "MALFORMED_MESSAGE",
+                Status::UnexpectedMessage => "UNEXPECTED_MESSAGE",
+            };
+            format!("{} ({})", name, other as u16)
         }
     }
 }

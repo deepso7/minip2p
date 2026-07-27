@@ -45,6 +45,7 @@ impl FrameDecoder {
     }
 
     /// Returns the number of bytes currently buffered, including a partial header.
+    #[cfg(test)]
     pub fn buffered_len(&self) -> usize {
         self.buffer.len() - self.offset
     }

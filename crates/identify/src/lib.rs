@@ -403,12 +403,6 @@ impl IdentifyProtocol {
             }
         }
     }
-
-    /// Drain buffered events.
-    #[cfg(test)]
-    fn poll_events(&mut self) -> Vec<IdentifyEvent> {
-        self.events.drain(..).collect()
-    }
 }
 
 impl SansIoProtocol for IdentifyProtocol {
@@ -514,6 +508,13 @@ fn decode_length_prefixed(buf: &[u8]) -> Result<&[u8], message::IdentifyMessageE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl IdentifyProtocol {
+        /// Drain buffered events (test helper).
+        fn poll_events(&mut self) -> Vec<IdentifyEvent> {
+            self.events.drain(..).collect()
+        }
+    }
 
     fn sample_config() -> IdentifyConfig {
         IdentifyConfig {
