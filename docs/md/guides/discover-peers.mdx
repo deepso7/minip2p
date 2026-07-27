@@ -14,6 +14,20 @@ configured relay — see [Traverse NAT](/guides/traverse-nat).
 Discovery layers signed presence beacons and dialing policy over pubsub and
 the NAT agent.
 
+For zero-configuration LAN discovery without pubsub, enable the `mdns` Cargo
+feature and call `.mdns()`. Enabling both sources feeds one address book and
+one dial state:
+
+```rust
+let node = minip2p::Endpoint::builder()
+    .discovery()
+    .mdns()
+    .bind_quic_dual_stack()?;
+```
+
+mDNS addresses are unauthenticated until QUIC/TLS verifies the remote peer.
+`KnownPeer::beacon_addrs` and `KnownPeer::mdns_addrs` expose their provenance.
+
 ## Compile and activate discovery
 
 ```toml
@@ -88,22 +102,28 @@ event.
 ## Customize policy
 
 ```rust
-use minip2p::{DiscoveryConfig, Endpoint};
+use minip2p::{BeaconConfig, Endpoint, PeerDiscoveryConfig};
 
-let config = DiscoveryConfig {
+let beacon = BeaconConfig {
     topic: "my-app/discovery/v1".into(),
+    ..BeaconConfig::default()
+};
+let policy = PeerDiscoveryConfig {
     max_known_peers: 256,
-    ..DiscoveryConfig::default()
+    ..PeerDiscoveryConfig::default()
 };
 
 let node = Endpoint::builder()
-    .discovery_config(config)?
+    .discovery_config(beacon)?
+    .peer_discovery_config(policy)?
     .bind_quic_dual_stack()?;
 ```
 
-Configuration also controls beacon cadence, peer TTL, addresses per peer,
-automatic dialing, peer-ID tie breaking, and retry backoff. Invalid bounds are
-rejected before a socket is allocated.
+`BeaconConfig` controls the pubsub topic, cadence, and local announcement cap.
+`PeerDiscoveryConfig` is shared by signed discovery and mDNS; it controls peer
+and address bounds, source TTLs, automatic dialing, tie breaking, retry
+backoff, and mDNS dial-rate limits. Invalid bounds are rejected before a socket
+is allocated.
 
 :::warning
 Discovery beacons are always required to be signed. Unsigned discovery

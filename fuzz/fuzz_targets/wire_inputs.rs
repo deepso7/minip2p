@@ -5,9 +5,12 @@ use minip2p_autonat::{AutoNatClient, AutoNatClientInput, AutoNatServer, AutoNatS
 use minip2p_circuit::{BridgeAdoption, CircuitRole, CircuitTransport, EntropyError, EntropySource};
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol};
 use minip2p_dcutr::{FrameDecode as DcutrFrame, HolePunch};
-use minip2p_discovery::{Beacon, DiscoveryAgent, DiscoveryConfig};
+use minip2p_discovery::{Beacon, BeaconAgent, BeaconConfig};
 use minip2p_identify::{IdentifyConfig, IdentifyInput, IdentifyMessage, IdentifyProtocol};
 use minip2p_identity::{KeyType, PublicKey};
+use minip2p_mdns::{
+    DnsMessage, InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAgent, MdnsConfig,
+};
 use minip2p_multistream_select::{MultistreamInput, MultistreamSelect};
 use minip2p_noise::{NoiseConfig, NoiseHandshakePayload, NoiseInput, NoiseRole, NoiseSession};
 use minip2p_pubsub::{
@@ -31,6 +34,7 @@ fuzz_target!(|data: &[u8]| {
     fuzz_identify(data);
     fuzz_autonat(data);
     fuzz_discovery(data);
+    fuzz_mdns(data);
     fuzz_noise(data);
     fuzz_pubsub(data);
     fuzz_yamux(data);
@@ -240,18 +244,43 @@ fn fuzz_discovery(data: &[u8]) {
     let local = PublicKey::new(KeyType::Ed25519, vec![1; 32]);
     let remote = PublicKey::new(KeyType::Ed25519, vec![2; 32]);
     let remote_peer = PeerId::from_public_key(&remote);
-    let config = DiscoveryConfig {
-        auto_dial: false,
-        ..DiscoveryConfig::default()
-    };
-    let mut agent = DiscoveryAgent::new(local, config).expect("default discovery config");
-    agent.handle_beacon(&remote_peer, data, true, 0);
+    let mut agent =
+        BeaconAgent::new(local, BeaconConfig::default()).expect("default beacon config");
+    agent.handle_beacon(&remote_peer, data, true);
     let authenticated = Beacon {
         public_key: remote.encode_protobuf(),
         addrs: vec![data.to_vec()],
     }
     .encode();
-    agent.handle_beacon(&remote_peer, &authenticated, true, 1);
+    agent.handle_beacon(&remote_peer, &authenticated, true);
+    while agent.poll_action().is_some() {}
+    while agent.poll_event().is_some() {}
+}
+
+fn fuzz_mdns(data: &[u8]) {
+    let _ = DnsMessage::decode(data);
+    let local = fuzz_peer_id();
+    let mut agent =
+        MdnsAgent::new(local, MdnsConfig::default(), [7; 32]).expect("default mDNS config");
+    agent.set_interfaces(
+        &[InterfaceSnapshot {
+            id: InterfaceId::new(1),
+            index: 1,
+            family: IpFamily::V4,
+            addrs: vec![
+                IpNet::new(core::net::IpAddr::V4(core::net::Ipv4Addr::LOCALHOST), 8)
+                    .expect("valid loopback prefix"),
+            ],
+        }],
+        0,
+    );
+    agent.handle_packet(
+        InterfaceId::new(1),
+        core::net::SocketAddr::from(([127, 0, 0, 1], 5353)),
+        data,
+        1,
+    );
+    agent.handle_tick(1);
     while agent.poll_action().is_some() {}
     while agent.poll_event().is_some() {}
 }

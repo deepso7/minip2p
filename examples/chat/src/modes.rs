@@ -8,8 +8,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    DISCOVERY_TOPIC, DiscoveryConfig, DiscoveryEvent, Endpoint, Event, GossipsubConfig, NatConfig,
-    NatEvent, PeerAddr, PeerId, PublishError, PubsubError, PubsubEvent,
+    BeaconConfig, DISCOVERY_TOPIC, DiscoveryEvent, Endpoint, Event, GossipsubConfig, NatConfig,
+    NatEvent, PeerAddr, PeerDiscoveryConfig, PeerId, PublishError, PubsubError, PubsubEvent,
 };
 
 use minip2p_example_common::{
@@ -56,12 +56,16 @@ fn build_endpoint(
             .topic
             .clone()
             .unwrap_or_else(|| DEFAULT_TOPIC.to_string());
-        builder = builder.discovery_config(DiscoveryConfig {
-            topic: format!("{room}/{DISCOVERY_TOPIC}"),
-            beacon_interval_ms: 2_000,
-            peer_ttl_ms: 10_000,
-            ..DiscoveryConfig::default()
-        })?;
+        builder = builder
+            .discovery_config(BeaconConfig {
+                topic: format!("{room}/{DISCOVERY_TOPIC}"),
+                beacon_interval_ms: 2_000,
+                ..BeaconConfig::default()
+            })?
+            .peer_discovery_config(PeerDiscoveryConfig {
+                beacon_peer_ttl_ms: 10_000,
+                ..PeerDiscoveryConfig::default()
+            })?;
     }
     for relay in relays {
         builder = builder.relay(relay.clone());
@@ -364,16 +368,24 @@ fn run_chat(
 
         for event in endpoint.take_discovery_events() {
             match event {
-                DiscoveryEvent::PeerDiscovered { peer, addrs } => {
+                DiscoveryEvent::PeerDiscovered {
+                    peer,
+                    addrs,
+                    source,
+                } => {
                     println!(
-                        "[{role}] discovered peer={} addrs={}",
+                        "[{role}] discovered peer={} source={source:?} addrs={}",
                         short(&peer),
                         addrs.len()
                     );
                 }
-                DiscoveryEvent::PeerUpdated { peer, addrs } => {
+                DiscoveryEvent::PeerUpdated {
+                    peer,
+                    addrs,
+                    source,
+                } => {
                     println!(
-                        "[{role}] mesh-updated peer={} addrs={}",
+                        "[{role}] discovery-updated peer={} source={source:?} addrs={}",
                         short(&peer),
                         addrs.len()
                     );
@@ -387,10 +399,16 @@ fn run_chat(
                         short(&peer)
                     );
                 }
-                DiscoveryEvent::ProtocolViolation { peer, reason } => {
+                DiscoveryEvent::ProtocolViolation {
+                    peer,
+                    source,
+                    reason,
+                    suppressed,
+                } => {
+                    let peer = peer.as_ref().map(short).unwrap_or_else(|| "unknown".into());
                     eprintln!(
-                        "[{role}] discovery-violation peer={} reason={reason}",
-                        short(&peer)
+                        "[{role}] discovery-violation peer={peer} source={source:?} \
+                         suppressed={suppressed} reason={reason}"
                     );
                 }
             }

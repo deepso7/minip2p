@@ -47,9 +47,17 @@ protocols use ordinary streams on direct and relayed paths alike.
 With the `discovery` feature, `.discovery()` enables signed pubsub presence
 beacons, a bounded TTL address book, and caller-driven automatic NAT connects.
 It implies the `nat` and `pubsub` features. Applications can inspect
-`known_peers`, drain `DiscoveryEvent`s, or pass a validated `DiscoveryConfig`
-to select a room-scoped topic and policy. Unsigned discovery beacons are always
-rejected even if unsigned application pubsub messages are allowed.
+`known_peers`, drain `DiscoveryEvent`s, pass a validated `BeaconConfig` to
+select a room-scoped topic, and use `PeerDiscoveryConfig` for shared book and
+dial policy. Unsigned discovery beacons are always rejected even if unsigned
+application pubsub messages are allowed.
+
+With the `mdns` feature, `.mdns()` enables zero-configuration local-link
+discovery on `_p2p._udp.local` without enabling pubsub. It implies `nat`, uses
+the same bounded peer book and dial state as signed discovery when both are
+enabled, and exposes per-address provenance through `KnownPeer`. Call
+`Endpoint::shutdown()` to send TTL-zero goodbyes and stop mDNS while keeping
+QUIC usable; drop performs the same sends best-effort.
 
 With the `pubsub` feature, `.pubsub()` enables gossipsub by default and
 advertises `/meshsub/1.1.0` plus `/meshsub/1.0.0`. Pass a

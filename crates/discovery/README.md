@@ -1,23 +1,30 @@
 # minip2p-discovery
 
-Sans-I/O peer discovery using signed pubsub presence beacons. The beacon protobuf
-and default topic are wire-compatible with js-libp2p `pubsub-peer-discovery`:
-`Peer { bytes publicKey = 1; repeated bytes addrs = 2; }` on
-`_peer-discovery._p2p._pubsub`. Policy is intentionally different: minip2p keeps
-a TTL address book and can emit automatic dial actions.
-Address-less beacons still refresh peer presence, but never trigger a dial until
-a later beacon supplies at least one normalized address.
+Sans-I/O discovery policy shared by signed pubsub beacons and local-link mDNS.
+`PeerDiscoveryAgent` owns one bounded address book, expiry policy, dial state,
+backoff, rate limits, provenance, and coalesced application events.
+`BeaconAgent` separately validates and schedules wire-compatible
+js-libp2p `pubsub-peer-discovery` beacons on
+`_peer-discovery._p2p._pubsub`.
 
-The agent owns no clock, socket, stream, async task, or executor. Callers supply
-`now_ms`, drain actions/events, and report connection outcomes. Beacons must be
-carried by verified signed pubsub messages and their embedded public key must
-derive the publisher peer id.
-Variable-length libp2p public keys, including RSA keys, are accepted up to the
-overall beacon payload budget; identities that cannot fit are rejected when the
-agent is constructed.
+The split keeps the book independent of pubsub and DNS. Callers feed validated
+signed `Observation`s through `observe_beacon` and unauthenticated address/TTL
+claims through `observe_mdns`, then execute `Dial` and `CancelDial` actions.
+Neither agent owns sockets, clocks, streams, tasks, or an executor.
 
-Current limitations: the facade NAT policy uses only its first configured relay;
-wildcard IP listen addresses are not announced unless Identify/AutoNAT supplies a
-usable external or circuit address. At the default 10-second cadence and the
-pubsub 120-second seen TTL, the 4096-entry seen cache supports roughly 340 peers
-(about 12 entries per peer).
+Signed-beacon addresses are authenticated by the embedded public key and rank
+ahead of mDNS candidates. A valid address-less beacon is still represented as
+authenticated presence: it refreshes the beacon TTL and may produce a
+provenance update, but does not itself trigger a dial.
+
+mDNS records are unauthenticated claims. QUIC/TLS detects a peer-id mismatch
+only after packets reach the claimed address, so the book bounds retained
+addresses and peer identities, applies per-peer and global mDNS dial budgets,
+and prevents mDNS-only observations from evicting beacon-backed entries.
+`KnownPeer` exposes the merged dial order and both source-specific subsets and
+timestamps so applications do not have to guess provenance.
+
+Pending state is structurally bounded. Peer transitions and dial failures
+coalesce by peer in causal FIFO order, while protocol violations occupy a fixed
+number of slots and count suppressed overflow. The bound depends only on
+`PeerDiscoveryConfig`, not traffic volume or elapsed time.

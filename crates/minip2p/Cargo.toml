@@ -20,6 +20,7 @@ workspace = true
 nat = ["dep:minip2p-circuit", "dep:minip2p-nat", "dep:getrandom"]
 pubsub = ["dep:minip2p-pubsub", "dep:thiserror"]
 discovery = ["nat", "pubsub", "dep:minip2p-discovery"]
+mdns = ["nat", "dep:minip2p-mdns", "dep:minip2p-discovery", "dep:thiserror"]
 
 [dependencies]
 minip2p-core = { path = "../core", version = "0.1.1" }
@@ -27,6 +28,7 @@ minip2p-circuit = { path = "../circuit", version = "0.1.1", optional = true }
 minip2p-discovery = { path = "../discovery", version = "0.1.1", optional = true }
 minip2p-identify = { path = "../identify", version = "0.1.1" }
 minip2p-identity = { path = "../identity", version = "0.1.1" }
+minip2p-mdns = { path = "../mdns", version = "0.1.1", optional = true }
 minip2p-nat = { path = "../nat", version = "0.1.1", optional = true }
 minip2p-pubsub = { path = "../pubsub", version = "0.1.1", optional = true }
 minip2p-quic = { path = "../../transports/quic", version = "0.1.1" }

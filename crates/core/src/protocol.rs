@@ -35,7 +35,7 @@ pub const P2P_CODE: u64 = 0x01a5;
 pub const P2P_CIRCUIT_CODE: u64 = 0x0122;
 
 /// A single component of a multiaddr.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Protocol {
     Ip4([u8; 4]),
     Ip6([u8; 16]),

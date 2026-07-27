@@ -9,7 +9,7 @@ use crate::{MultiaddrError, Protocol};
 ///
 /// Parse from a string with [`FromStr`] or build programmatically with
 /// [`from_protocols`](Multiaddr::from_protocols).
-#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Multiaddr {
     protocols: Vec<Protocol>,
 }

@@ -11,22 +11,28 @@
 //! `GossipsubConfig` or `FloodsubConfig`; the selected engine controls which
 //! pubsub protocol ids are advertised.
 
-#[cfg(feature = "discovery")]
+#[cfg(any(feature = "discovery", feature = "mdns"))]
 mod discovery;
+#[cfg(feature = "mdns")]
+mod mdns;
 #[cfg(feature = "nat")]
 mod nat;
 #[cfg(feature = "pubsub")]
 mod pubsub;
 
-#[cfg(feature = "discovery")]
+#[cfg(any(feature = "discovery", feature = "mdns"))]
 pub use discovery::DiscoveryError;
 pub use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
 #[cfg(feature = "discovery")]
+pub use minip2p_discovery::{BeaconConfig, DISCOVERY_TOPIC};
+#[cfg(any(feature = "discovery", feature = "mdns"))]
 pub use minip2p_discovery::{
-    DISCOVERY_TOPIC, DiscoveryConfig, DiscoveryConfigError, DiscoveryEvent, KnownPeer,
+    DiscoveryConfigError, DiscoveryEvent, DiscoverySource, KnownPeer, PeerDiscoveryConfig,
 };
 pub use minip2p_identify::IdentifyMessage;
 pub use minip2p_identity::Ed25519Keypair;
+#[cfg(feature = "mdns")]
+pub use minip2p_mdns::{MdnsConfig, MdnsConfigError};
 #[cfg(feature = "nat")]
 pub use minip2p_nat::{
     ConnectId, NatConfig, NatError, NatEvent, Path, ReachabilityState, ReservationInfo,
@@ -81,8 +87,10 @@ pub struct Endpoint {
     nat: Option<nat::NatDriver>,
     #[cfg(feature = "pubsub")]
     pubsub: Option<pubsub::PubsubDriver>,
-    #[cfg(feature = "discovery")]
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
     discovery: Option<discovery::DiscoveryDriver>,
+    #[cfg(feature = "mdns")]
+    mdns: Option<mdns::MdnsDriver>,
     /// Application events set aside while a driver-focused wait was driving
     /// the endpoint; drained first by [`Endpoint::next_event`].
     #[cfg(any(feature = "nat", feature = "pubsub"))]
@@ -283,7 +291,7 @@ impl Endpoint {
                     events.push(event);
                 }
             }
-            self.tick_drivers();
+            self.tick_drivers()?;
             Ok(events)
         }
         #[cfg(not(any(feature = "nat", feature = "pubsub")))]
@@ -308,8 +316,12 @@ impl Endpoint {
     /// Whether any agent driver is active on this endpoint.
     #[cfg(any(feature = "nat", feature = "pubsub"))]
     fn has_drivers(&self) -> bool {
-        #[cfg(feature = "discovery")]
+        #[cfg(any(feature = "discovery", feature = "mdns"))]
         if self.discovery.is_some() {
+            return true;
+        }
+        #[cfg(feature = "mdns")]
+        if self.mdns.is_some() {
             return true;
         }
         #[cfg(feature = "nat")]
@@ -331,7 +343,7 @@ impl Endpoint {
     /// Returns `true` when a driver claimed the event.
     #[cfg(any(feature = "nat", feature = "pubsub"))]
     fn ingest_into_drivers(&mut self, event: &Event) -> bool {
-        #[cfg(feature = "discovery")]
+        #[cfg(any(feature = "discovery", feature = "mdns"))]
         if let Some(discovery) = self.discovery.as_mut() {
             discovery.observe(event, &self.swarm);
         }
@@ -349,7 +361,7 @@ impl Endpoint {
 
     /// Ticks every active driver.
     #[cfg(any(feature = "nat", feature = "pubsub"))]
-    fn tick_drivers(&mut self) {
+    fn tick_drivers(&mut self) -> Result<(), Error> {
         #[cfg(feature = "nat")]
         if let Some(nat) = self.nat.as_mut() {
             nat.tick(&mut self.swarm);
@@ -358,14 +370,23 @@ impl Endpoint {
         if let Some(pubsub) = self.pubsub.as_mut() {
             pubsub.tick(&mut self.swarm);
         }
-        #[cfg(feature = "discovery")]
-        if let (Some(discovery), Some(pubsub), Some(nat)) = (
-            self.discovery.as_mut(),
-            self.pubsub.as_mut(),
-            self.nat.as_mut(),
-        ) {
-            discovery.sweep(pubsub, nat, &mut self.swarm);
+        #[cfg(feature = "mdns")]
+        if let Some(mdns) = self.mdns.as_mut() {
+            mdns.tick(self.swarm.core().local_addresses())
+                .map_err(mdns_driver_error)?;
         }
+        #[cfg(any(feature = "discovery", feature = "mdns"))]
+        if let (Some(discovery), Some(nat)) = (self.discovery.as_mut(), self.nat.as_mut()) {
+            discovery.sweep(
+                #[cfg(feature = "discovery")]
+                self.pubsub.as_mut(),
+                #[cfg(feature = "mdns")]
+                self.mdns.as_mut(),
+                nat,
+                &mut self.swarm,
+            );
+        }
+        Ok(())
     }
 
     /// Application-visible events queued across every active driver; growth
@@ -381,9 +402,9 @@ impl Endpoint {
         if let Some(pubsub) = self.pubsub.as_ref() {
             len += pubsub.events.len();
         }
-        #[cfg(feature = "discovery")]
+        #[cfg(any(feature = "discovery", feature = "mdns"))]
         if let Some(discovery) = self.discovery.as_ref() {
-            len += discovery.events.len();
+            len += discovery.book.pending_event_count();
         }
         len
     }
@@ -405,9 +426,15 @@ impl Endpoint {
         {
             step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
         }
-        #[cfg(feature = "discovery")]
+        #[cfg(any(feature = "discovery", feature = "mdns"))]
         if let Some(discovery) = self.discovery.as_ref()
-            && let Some(ms) = discovery.agent.next_timeout(discovery.now_ms())
+            && let Some(ms) = discovery.next_timeout(discovery.now_ms())
+        {
+            step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
+        }
+        #[cfg(feature = "mdns")]
+        if let Some(mdns) = self.mdns.as_ref()
+            && let Some(ms) = mdns.next_timeout(mdns.now_ms())
         {
             step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
         }
@@ -465,7 +492,7 @@ impl Endpoint {
             match polled {
                 Some(event) => {
                     let consumed = self.ingest_into_drivers(&event);
-                    self.tick_drivers();
+                    self.tick_drivers()?;
                     if !consumed {
                         return Ok(DriverPoll::application(event));
                     }
@@ -474,7 +501,7 @@ impl Endpoint {
                     }
                 }
                 None => {
-                    self.tick_drivers();
+                    self.tick_drivers()?;
                     if self.driver_events_len() > events_before {
                         return Ok(DriverPoll::progress());
                     }
@@ -765,7 +792,7 @@ impl Endpoint {
         if self
             .discovery
             .as_ref()
-            .is_some_and(|discovery| discovery.agent.topic() == topic)
+            .is_some_and(|discovery| discovery.topic() == Some(topic))
         {
             return Err(PubsubError::DiscoveryTopicReserved);
         }
@@ -839,25 +866,31 @@ impl Endpoint {
     }
 
     /// Returns the current discovery address-book snapshot.
-    #[cfg(feature = "discovery")]
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
     pub fn known_peers(&self) -> Vec<KnownPeer> {
         self.discovery
             .as_ref()
-            .map(|driver| driver.agent.known_peers())
+            .map(|driver| driver.book.known_peers())
             .unwrap_or_default()
     }
 
     /// Drains all queued discovery events.
-    #[cfg(feature = "discovery")]
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
     pub fn take_discovery_events(&mut self) -> Vec<DiscoveryEvent> {
         self.discovery
             .as_mut()
-            .map(|driver| driver.events.drain(..).collect())
+            .map(|driver| {
+                let mut events = Vec::new();
+                while let Some(event) = driver.book.poll_event() {
+                    events.push(event);
+                }
+                events
+            })
             .unwrap_or_default()
     }
 
     /// Returns the next discovery event while preserving unrelated swarm events.
-    #[cfg(feature = "discovery")]
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
     pub fn next_discovery_event(
         &mut self,
         deadline: impl Into<Deadline>,
@@ -867,7 +900,7 @@ impl Endpoint {
         loop {
             match self.discovery.as_mut() {
                 Some(discovery) => {
-                    if let Some(event) = discovery.events.pop_front() {
+                    if let Some(event) = discovery.book.poll_event() {
                         return Ok(Some(event));
                     }
                 }
@@ -895,9 +928,35 @@ impl Endpoint {
         &mut self.swarm
     }
 
+    /// Sends mDNS goodbyes once and cancels discovery-owned dial attempts.
+    ///
+    /// mDNS becomes permanently inactive, while QUIC and the rest of the
+    /// endpoint remain usable. Every interface send and every cancellation is
+    /// attempted; the first mDNS socket error is returned afterwards.
+    #[cfg(feature = "mdns")]
+    pub fn shutdown(&mut self) -> Result<(), Error> {
+        let result = self
+            .mdns
+            .as_mut()
+            .map(mdns::MdnsDriver::shutdown)
+            .transpose()
+            .map(|_| ())
+            .map_err(mdns_driver_error);
+        if let (Some(discovery), Some(nat)) = (self.discovery.as_mut(), self.nat.as_mut()) {
+            discovery.shutdown(nat, &mut self.swarm);
+        }
+        result
+    }
+
     /// Decomposes this endpoint into the underlying swarm.
     pub fn into_swarm(self) -> EndpointSwarm {
-        #[cfg(feature = "discovery")]
+        #[cfg(feature = "mdns")]
+        {
+            let mut endpoint = self;
+            let _ = endpoint.shutdown();
+            endpoint.swarm
+        }
+        #[cfg(all(not(feature = "mdns"), feature = "discovery"))]
         {
             let mut endpoint = self;
             if let (Some(discovery), Some(nat)) =
@@ -907,7 +966,7 @@ impl Endpoint {
             }
             endpoint.swarm
         }
-        #[cfg(not(feature = "discovery"))]
+        #[cfg(not(any(feature = "discovery", feature = "mdns")))]
         {
             self.swarm
         }
@@ -924,6 +983,33 @@ impl Endpoint {
     fn quic_mut(&mut self) -> &mut QuicEndpoint {
         self.swarm.transport_mut()
     }
+}
+
+#[cfg(feature = "mdns")]
+fn mdns_driver_error(error: minip2p_mdns::MdnsError) -> Error {
+    TransportError::PollError {
+        reason: error.to_string(),
+    }
+    .into()
+}
+
+#[cfg(feature = "mdns")]
+fn mdns_seed(keypair: &Ed25519Keypair) -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    let peer_id = keypair.peer_id();
+    let digest = peer_id.digest_bytes();
+    for (index, byte) in digest.iter().enumerate() {
+        seed[index % seed.len()] ^= *byte;
+    }
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+        .to_le_bytes();
+    for (index, byte) in seed.iter_mut().enumerate() {
+        *byte ^= timestamp[index % timestamp.len()];
+    }
+    seed
 }
 
 #[cfg(any(feature = "nat", feature = "pubsub"))]
@@ -969,7 +1055,11 @@ pub struct EndpointBuilder {
     #[cfg(feature = "pubsub")]
     pubsub_config: Option<PubsubConfig>,
     #[cfg(feature = "discovery")]
-    discovery_config: Option<DiscoveryConfig>,
+    discovery_config: Option<BeaconConfig>,
+    #[cfg(feature = "mdns")]
+    mdns_config: Option<MdnsConfig>,
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
+    peer_discovery_config: PeerDiscoveryConfig,
 }
 
 impl Default for EndpointBuilder {
@@ -989,6 +1079,10 @@ impl Default for EndpointBuilder {
             pubsub_config: None,
             #[cfg(feature = "discovery")]
             discovery_config: None,
+            #[cfg(feature = "mdns")]
+            mdns_config: None,
+            #[cfg(any(feature = "discovery", feature = "mdns"))]
+            peer_discovery_config: PeerDiscoveryConfig::default(),
         }
     }
 }
@@ -1004,7 +1098,11 @@ struct BuilderParts {
     #[cfg(feature = "pubsub")]
     pubsub_config: Option<PubsubConfig>,
     #[cfg(feature = "discovery")]
-    discovery_config: Option<DiscoveryConfig>,
+    discovery_config: Option<BeaconConfig>,
+    #[cfg(feature = "mdns")]
+    mdns_config: Option<MdnsConfig>,
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
+    peer_discovery_config: PeerDiscoveryConfig,
 }
 
 impl EndpointBuilder {
@@ -1096,7 +1194,7 @@ impl EndpointBuilder {
     #[cfg(feature = "discovery")]
     pub fn discovery(mut self) -> Self {
         self.pubsub_config.get_or_insert_with(PubsubConfig::default);
-        self.discovery_config = Some(DiscoveryConfig::default());
+        self.discovery_config = Some(BeaconConfig::default());
         self
     }
 
@@ -1107,13 +1205,40 @@ impl EndpointBuilder {
     /// [`Endpoint::subscribe`] is redundant, and its pubsub messages and
     /// subscription events are consumed before reaching the application.
     #[cfg(feature = "discovery")]
-    pub fn discovery_config(
-        mut self,
-        config: DiscoveryConfig,
-    ) -> Result<Self, DiscoveryConfigError> {
+    pub fn discovery_config(mut self, config: BeaconConfig) -> Result<Self, DiscoveryConfigError> {
         config.validate()?;
         self.pubsub_config.get_or_insert_with(PubsubConfig::default);
         self.discovery_config = Some(config);
+        Ok(self)
+    }
+
+    /// Enables local-link mDNS discovery with interoperable defaults.
+    #[cfg(feature = "mdns")]
+    pub fn mdns(mut self) -> Self {
+        self.mdns_config = Some(MdnsConfig::default());
+        self
+    }
+
+    /// Enables local-link mDNS discovery with an explicitly validated configuration.
+    ///
+    /// Validation occurs before the QUIC or mDNS sockets are allocated.
+    #[cfg(feature = "mdns")]
+    pub fn mdns_config(mut self, config: MdnsConfig) -> Result<Self, MdnsConfigError> {
+        config.validate()?;
+        self.mdns_config = Some(config);
+        Ok(self)
+    }
+
+    /// Overrides the shared address-book and automatic-dial policy.
+    ///
+    /// This policy is shared by every enabled discovery source.
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
+    pub fn peer_discovery_config(
+        mut self,
+        config: PeerDiscoveryConfig,
+    ) -> Result<Self, DiscoveryConfigError> {
+        config.validate()?;
+        self.peer_discovery_config = config;
         Ok(self)
     }
 
@@ -1182,6 +1307,16 @@ impl EndpointBuilder {
                     {
                         false
                     }
+                }
+                || cfg!(feature = "mdns") && {
+                    #[cfg(feature = "mdns")]
+                    {
+                        self.mdns_config.is_some()
+                    }
+                    #[cfg(not(feature = "mdns"))]
+                    {
+                        false
+                    }
                 };
             enabled.then(|| {
                 let mut config = self.nat_config.unwrap_or_default();
@@ -1201,6 +1336,10 @@ impl EndpointBuilder {
             pubsub_config: self.pubsub_config,
             #[cfg(feature = "discovery")]
             discovery_config: self.discovery_config,
+            #[cfg(feature = "mdns")]
+            mdns_config: self.mdns_config,
+            #[cfg(any(feature = "discovery", feature = "mdns"))]
+            peer_discovery_config: self.peer_discovery_config,
         })
     }
 }
@@ -1255,6 +1394,10 @@ fn build_endpoint(parts: BuilderParts, transport: QuicEndpoint) -> Result<Endpoi
     });
     #[cfg(feature = "discovery")]
     let discovery_config = parts.discovery_config;
+    #[cfg(feature = "mdns")]
+    let mdns_config = parts.mdns_config;
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
+    let peer_discovery_config = parts.peer_discovery_config;
     #[cfg(feature = "pubsub")]
     let pubsub = parts
         .pubsub_config
@@ -1300,15 +1443,61 @@ fn build_endpoint(parts: BuilderParts, transport: QuicEndpoint) -> Result<Endpoi
             })?;
     }
     #[cfg(feature = "discovery")]
-    let discovery = match discovery_config {
+    let beacon = match discovery_config {
+        Some(config) => Some(
+            minip2p_discovery::BeaconAgent::new(parts.keypair.public_key(), config).map_err(
+                |_| Error::Invariant {
+                    reason: "validated beacon configuration was rejected",
+                },
+            )?,
+        ),
+        None => None,
+    };
+    #[cfg(feature = "mdns")]
+    let mdns = match mdns_config {
         Some(config) => {
-            let agent = minip2p_discovery::DiscoveryAgent::new(parts.keypair.public_key(), config)
-                .map_err(|_| Error::Invariant {
-                    reason: "validated discovery configuration was rejected",
-                })?;
-            Some(discovery::DiscoveryDriver::new(agent))
+            let agent = minip2p_mdns::MdnsAgent::new(
+                parts.keypair.peer_id(),
+                config.clone(),
+                mdns_seed(&parts.keypair),
+            )
+            .map_err(|error| TransportError::InvalidConfig {
+                reason: error.to_string(),
+            })?;
+            let sockets = minip2p_mdns::MdnsSockets::new(&config).map_err(|error| {
+                TransportError::ListenFailed {
+                    reason: error.to_string(),
+                }
+            })?;
+            Some(mdns::MdnsDriver::new(agent, sockets, &config))
         }
         None => None,
+    };
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
+    let discovery_enabled = {
+        let enabled = false;
+        #[cfg(feature = "discovery")]
+        let enabled = enabled || beacon.is_some();
+        #[cfg(feature = "mdns")]
+        let enabled = enabled || mdns.is_some();
+        enabled
+    };
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
+    let discovery = if discovery_enabled {
+        let book = minip2p_discovery::PeerDiscoveryAgent::new(
+            parts.keypair.peer_id(),
+            peer_discovery_config,
+        )
+        .map_err(|_| Error::Invariant {
+            reason: "validated discovery configuration was rejected",
+        })?;
+        Some(discovery::DiscoveryDriver::new(
+            book,
+            #[cfg(feature = "discovery")]
+            beacon,
+        ))
+    } else {
+        None
     };
     Ok(Endpoint {
         swarm,
@@ -1316,8 +1505,10 @@ fn build_endpoint(parts: BuilderParts, transport: QuicEndpoint) -> Result<Endpoi
         nat,
         #[cfg(feature = "pubsub")]
         pubsub,
-        #[cfg(feature = "discovery")]
+        #[cfg(any(feature = "discovery", feature = "mdns"))]
         discovery,
+        #[cfg(feature = "mdns")]
+        mdns,
         #[cfg(any(feature = "nat", feature = "pubsub"))]
         pending_events: std::collections::VecDeque::new(),
     })
@@ -1330,9 +1521,9 @@ mod tests {
     #[cfg(feature = "discovery")]
     #[test]
     fn discovery_config_is_rejected_before_binding() {
-        let config = DiscoveryConfig {
+        let config = BeaconConfig {
             beacon_interval_ms: 0,
-            ..DiscoveryConfig::default()
+            ..BeaconConfig::default()
         };
         assert!(matches!(
             Endpoint::builder().discovery_config(config),
@@ -1340,13 +1531,47 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "mdns")]
+    #[test]
+    fn mdns_config_is_rejected_before_binding() {
+        let config = MdnsConfig {
+            max_packet_bytes: 4_097,
+            ..MdnsConfig::default()
+        };
+        assert!(matches!(
+            Endpoint::builder().mdns_config(config),
+            Err(MdnsConfigError::InvalidMaxPacketBytes)
+        ));
+    }
+
+    #[cfg(feature = "mdns")]
+    #[test]
+    fn mdns_shutdown_is_idempotent_and_leaves_quic_usable() {
+        let mut endpoint = Endpoint::builder()
+            .mdns()
+            .peer_discovery_config(PeerDiscoveryConfig {
+                auto_dial: false,
+                ..PeerDiscoveryConfig::default()
+            })
+            .expect("valid peer discovery policy")
+            .bind_quic("127.0.0.1:0")
+            .expect("bind mDNS endpoint");
+        endpoint.listen().expect("QUIC listens");
+        endpoint.shutdown().expect("first mDNS shutdown");
+        endpoint.shutdown().expect("second mDNS shutdown");
+        assert!(
+            endpoint.poll().is_ok(),
+            "QUIC remains usable after shutdown"
+        );
+    }
+
     #[cfg(feature = "discovery")]
     #[test]
     fn discovery_topic_cannot_be_unsubscribed_independently() {
         let topic = "/minip2p/test/discovery";
-        let config = DiscoveryConfig {
+        let config = BeaconConfig {
             topic: topic.into(),
-            ..DiscoveryConfig::default()
+            ..BeaconConfig::default()
         };
         let mut endpoint = Endpoint::builder()
             .discovery_config(config)

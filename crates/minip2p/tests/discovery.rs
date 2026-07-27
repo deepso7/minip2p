@@ -4,20 +4,27 @@
 
 use std::time::{Duration, Instant};
 
-use minip2p::{DiscoveryConfig, DiscoveryEvent, Endpoint, Event, GossipsubConfig, PubsubEvent};
+use minip2p::{
+    BeaconConfig, DiscoveryEvent, Endpoint, Event, GossipsubConfig, PeerDiscoveryConfig,
+    PubsubEvent,
+};
 
 const DISCOVERY_TOPIC: &str = "/minip2p/test/loopback-discovery";
 
 fn discovery_endpoint() -> Endpoint {
     Endpoint::builder()
-        .discovery_config(DiscoveryConfig {
+        .discovery_config(BeaconConfig {
             topic: DISCOVERY_TOPIC.into(),
             beacon_interval_ms: 100,
-            peer_ttl_ms: 2_000,
-            auto_dial: false,
-            ..DiscoveryConfig::default()
+            ..BeaconConfig::default()
         })
         .expect("valid discovery config")
+        .peer_discovery_config(PeerDiscoveryConfig {
+            beacon_peer_ttl_ms: 2_000,
+            auto_dial: false,
+            ..PeerDiscoveryConfig::default()
+        })
+        .expect("valid peer discovery config")
         .bind_quic("127.0.0.1:0")
         .expect("bind loopback endpoint")
 }
@@ -28,14 +35,18 @@ fn slow_heartbeat_discovery_endpoint() -> Endpoint {
             heartbeat_interval_ms: 60_000,
             ..GossipsubConfig::default()
         })
-        .discovery_config(DiscoveryConfig {
+        .discovery_config(BeaconConfig {
             topic: DISCOVERY_TOPIC.into(),
             beacon_interval_ms: 100,
-            peer_ttl_ms: 2_000,
-            auto_dial: false,
-            ..DiscoveryConfig::default()
+            ..BeaconConfig::default()
         })
         .expect("valid discovery config")
+        .peer_discovery_config(PeerDiscoveryConfig {
+            beacon_peer_ttl_ms: 2_000,
+            auto_dial: false,
+            ..PeerDiscoveryConfig::default()
+        })
+        .expect("valid peer discovery config")
         .bind_quic("127.0.0.1:0")
         .expect("bind loopback endpoint")
 }

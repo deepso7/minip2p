@@ -1,44 +1,60 @@
-//! Facade wiring for pubsub discovery and NAT traversal.
+//! Facade coordination for discovery sources and NAT traversal.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
 use minip2p_core::PeerId;
-use minip2p_discovery::{DiscoveryAction, DiscoveryAgent, DiscoveryEvent};
+#[cfg(feature = "discovery")]
+use minip2p_discovery::{BeaconAction, BeaconAgent, BeaconEvent};
+use minip2p_discovery::{DiscoveryAction, DiscoverySource, PeerDiscoveryAgent};
+#[cfg(feature = "mdns")]
+use minip2p_mdns::MdnsEvent;
 use minip2p_nat::{ConnectId, NatEvent};
+#[cfg(feature = "discovery")]
 use minip2p_pubsub::PubsubEvent;
 use minip2p_swarm::SwarmEvent;
 
 use crate::EndpointSwarm;
-use crate::{Error, nat::NatDriver, pubsub::PubsubDriver};
+#[cfg(feature = "mdns")]
+use crate::mdns::MdnsDriver;
+#[cfg(feature = "discovery")]
+use crate::pubsub::PubsubDriver;
+use crate::{Error, nat::NatDriver};
 
 /// Errors from discovery-focused endpoint waits.
 #[derive(Debug, thiserror::Error)]
 pub enum DiscoveryError {
-    /// Discovery was not enabled with the endpoint builder.
-    #[error("discovery is not enabled on this endpoint (EndpointBuilder::discovery)")]
+    /// No discovery source was enabled with the endpoint builder.
+    #[error("discovery is not enabled on this endpoint")]
     NotEnabled,
     /// The endpoint failed while driving the swarm.
     #[error(transparent)]
     Driver(#[from] Error),
 }
 
-/// Coordinates beacon traffic and automatic NAT connects.
+/// Coordinates source observations, the shared peer book, and automatic connects.
 pub(crate) struct DiscoveryDriver {
-    pub(crate) agent: DiscoveryAgent,
-    pub(crate) events: VecDeque<DiscoveryEvent>,
+    pub(crate) book: PeerDiscoveryAgent,
+    #[cfg(feature = "discovery")]
+    pub(crate) beacon: Option<BeaconAgent>,
     epoch: Instant,
     pub(crate) inflight: BTreeMap<ConnectId, PeerId>,
+    #[cfg(feature = "discovery")]
     last_local_addrs: Vec<minip2p_core::Multiaddr>,
 }
 
 impl DiscoveryDriver {
-    pub(crate) fn new(agent: DiscoveryAgent) -> Self {
+    pub(crate) fn new(
+        book: PeerDiscoveryAgent,
+        #[cfg(feature = "discovery")] beacon: Option<BeaconAgent>,
+    ) -> Self {
         Self {
-            agent,
-            events: VecDeque::new(),
+            book,
+            #[cfg(feature = "discovery")]
+            beacon,
             epoch: Instant::now(),
             inflight: BTreeMap::new(),
+            #[cfg(feature = "discovery")]
             last_local_addrs: Vec::new(),
         }
     }
@@ -47,20 +63,38 @@ impl DiscoveryDriver {
         self.epoch.elapsed().as_millis() as u64
     }
 
+    #[cfg(feature = "discovery")]
+    pub(crate) fn topic(&self) -> Option<&str> {
+        self.beacon.as_ref().map(BeaconAgent::topic)
+    }
+
+    pub(crate) fn next_timeout(&self, now_ms: u64) -> Option<u64> {
+        #[allow(unused_mut)]
+        let mut timeout = self.book.next_timeout(now_ms);
+        #[cfg(feature = "discovery")]
+        if let Some(beacon) = self.beacon.as_ref()
+            && let Some(beacon_timeout) = beacon.next_timeout(now_ms)
+        {
+            timeout = Some(
+                timeout
+                    .map(|book_timeout| book_timeout.min(beacon_timeout))
+                    .unwrap_or(beacon_timeout),
+            );
+        }
+        timeout
+    }
+
     /// Observes lifecycle events regardless of which protocol driver claims them.
     pub(crate) fn observe(&mut self, event: &SwarmEvent, swarm: &EndpointSwarm) {
         let now = self.now_ms();
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                self.agent.peer_connected(peer_id, now);
+                self.book.peer_connected(peer_id, now);
             }
             SwarmEvent::ConnectionClosed { peer_id, .. }
                 if swarm.core().conn_for(peer_id).is_none() =>
             {
-                // Eager supersession surfaces Closed(old) before
-                // Established(new), but the core has already installed the
-                // replacement. Preserve discovery continuity in that case.
-                self.agent.peer_disconnected(peer_id, now);
+                self.book.peer_disconnected(peer_id, now);
             }
             _ => {}
         }
@@ -69,7 +103,8 @@ impl DiscoveryDriver {
     /// Runs all cross-driver work until no new work is produced.
     pub(crate) fn sweep(
         &mut self,
-        pubsub: &mut PubsubDriver,
+        #[cfg(feature = "discovery")] mut pubsub: Option<&mut PubsubDriver>,
+        #[cfg(feature = "mdns")] mut mdns: Option<&mut MdnsDriver>,
         nat: &mut NatDriver,
         swarm: &mut EndpointSwarm,
     ) {
@@ -77,41 +112,61 @@ impl DiscoveryDriver {
             let mut progressed = false;
             let now = self.now_ms();
 
-            let local_addrs = swarm.core().local_addresses();
-            if self.last_local_addrs != local_addrs {
-                self.last_local_addrs = local_addrs.to_vec();
-                self.agent.set_local_addrs(local_addrs, now);
-                progressed = true;
-            }
-
-            let mut retained = VecDeque::new();
-            while let Some(event) = pubsub.events.pop_front() {
-                let consumed = match &event {
-                    PubsubEvent::Message {
-                        from,
-                        topics,
-                        data,
-                        signed,
-                        ..
-                    } if topics.iter().any(|topic| topic == self.agent.topic()) => {
-                        self.agent.handle_beacon(from, data, *signed, now);
-                        true
-                    }
-                    PubsubEvent::PeerSubscribed { topic, .. }
-                    | PubsubEvent::PeerUnsubscribed { topic, .. }
-                        if topic == self.agent.topic() =>
-                    {
-                        true
-                    }
-                    _ => false,
-                };
-                if consumed {
+            #[cfg(feature = "discovery")]
+            if let Some(beacon) = self.beacon.as_mut() {
+                let local_addrs = swarm.core().local_addresses();
+                if self.last_local_addrs != local_addrs {
+                    self.last_local_addrs = local_addrs.to_vec();
+                    beacon.set_local_addrs(local_addrs, now);
                     progressed = true;
-                } else {
-                    retained.push_back(event);
+                }
+                if let Some(pubsub) = pubsub.as_deref_mut() {
+                    let mut retained = VecDeque::new();
+                    while let Some(event) = pubsub.events.pop_front() {
+                        let consumed = match &event {
+                            PubsubEvent::Message {
+                                from,
+                                topics,
+                                data,
+                                signed,
+                                ..
+                            } if topics.iter().any(|topic| topic == beacon.topic()) => {
+                                beacon.handle_beacon(from, data, *signed);
+                                true
+                            }
+                            PubsubEvent::PeerSubscribed { topic, .. }
+                            | PubsubEvent::PeerUnsubscribed { topic, .. }
+                                if topic == beacon.topic() =>
+                            {
+                                true
+                            }
+                            _ => false,
+                        };
+                        if consumed {
+                            progressed = true;
+                        } else {
+                            retained.push_back(event);
+                        }
+                    }
+                    pubsub.events = retained;
                 }
             }
-            pubsub.events = retained;
+
+            #[cfg(feature = "mdns")]
+            if let Some(mdns) = mdns.as_deref_mut() {
+                while let Some(event) = mdns.events.pop_front() {
+                    progressed = true;
+                    match event {
+                        MdnsEvent::PeerObserved { peer, addrs } => {
+                            self.book.observe_mdns(peer, addrs, now);
+                        }
+                        MdnsEvent::ProtocolViolation { peer, reason } => {
+                            self.book
+                                .report_violation(peer, DiscoverySource::Mdns, &reason);
+                        }
+                    }
+                }
+            }
 
             let mut retained = VecDeque::new();
             while let Some(event) = nat.events.pop_front() {
@@ -125,18 +180,50 @@ impl DiscoveryDriver {
             }
             nat.events = retained;
 
-            if self.agent.next_timeout(now) == Some(0) {
-                self.agent.handle_tick(now);
+            #[cfg(feature = "discovery")]
+            if let Some(beacon) = self.beacon.as_mut()
+                && beacon.next_timeout(now) == Some(0)
+            {
+                beacon.handle_tick(now);
+                progressed = true;
+            }
+            if self.book.next_timeout(now) == Some(0) {
+                self.book.handle_tick(now);
                 progressed = true;
             }
 
-            while let Some(action) = self.agent.poll_action() {
+            #[cfg(feature = "discovery")]
+            if let Some(beacon) = self.beacon.as_mut() {
+                while let Some(event) = beacon.poll_event() {
+                    progressed = true;
+                    match event {
+                        BeaconEvent::Observation(observation) => {
+                            self.book.observe_beacon(observation, now);
+                        }
+                        BeaconEvent::ProtocolViolation { peer, reason } => {
+                            self.book.report_violation(
+                                Some(peer),
+                                DiscoverySource::SignedBeacon,
+                                &reason,
+                            );
+                        }
+                    }
+                }
+                while let Some(action) = beacon.poll_action() {
+                    progressed = true;
+                    match action {
+                        BeaconAction::PublishBeacon { topic, payload } => {
+                            if let Some(pubsub) = pubsub.as_deref_mut() {
+                                let _ = pubsub.agent.publish(&topic, payload, pubsub.now_ms());
+                                pubsub.pump(swarm);
+                            }
+                        }
+                    }
+                }
+            }
+            while let Some(action) = self.book.poll_action() {
                 progressed = true;
                 match action {
-                    DiscoveryAction::PublishBeacon { topic, payload } => {
-                        let _ = pubsub.agent.publish(&topic, payload, pubsub.now_ms());
-                        pubsub.pump(swarm);
-                    }
                     DiscoveryAction::Dial { peer, addrs } => {
                         let id = nat.agent.connect(peer.clone(), addrs, nat.now());
                         nat.pump(swarm);
@@ -146,10 +233,6 @@ impl DiscoveryDriver {
                         self.cancel_peer(&peer, nat, swarm);
                     }
                 }
-            }
-            while let Some(event) = self.agent.poll_event() {
-                progressed = true;
-                self.events.push_back(event);
             }
             if !progressed {
                 break;
@@ -167,7 +250,7 @@ impl DiscoveryDriver {
             }
             | NatEvent::FellBackToRelay { connect_id, peer } => {
                 self.inflight.remove(&connect_id);
-                self.agent.dial_succeeded(&peer, now);
+                self.book.dial_succeeded(&peer, now);
             }
             NatEvent::ConnectFailed {
                 connect_id,
@@ -175,12 +258,9 @@ impl DiscoveryDriver {
                 error,
             } => {
                 self.inflight.remove(&connect_id);
-                self.agent.dial_failed(&peer, &error.to_string(), now);
+                self.book.dial_failed(&peer, &error.to_string(), now);
             }
             NatEvent::HolePunchFailed { .. } => {}
-            // `sweep` calls this only for variants selected by
-            // `nat_connect_id`. Ignore future correlated variants rather
-            // than turning harmless facade-version skew into a panic.
             _ => {}
         }
     }
@@ -205,7 +285,6 @@ impl DiscoveryDriver {
         }
         self.inflight.clear();
         nat.pump(swarm);
-        self.events.clear();
     }
 }
 
@@ -217,294 +296,5 @@ fn nat_connect_id(event: &NatEvent) -> Option<ConnectId> {
         | NatEvent::FellBackToRelay { connect_id, .. }
         | NatEvent::ConnectFailed { connect_id, .. } => Some(*connect_id),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::{Duration, Instant};
-
-    use minip2p_discovery::{DiscoveryAction, DiscoveryConfig};
-    use minip2p_identity::{Ed25519Keypair, PeerId as IdentityPeerId, PublicKey};
-    use minip2p_nat::{NatAgent, NatConfig, Now, Path};
-    use minip2p_transport::StreamId;
-
-    use super::*;
-    use crate::{Endpoint, Event};
-
-    fn discovery_beacon(keypair: &Ed25519Keypair) -> (PeerId, Vec<u8>) {
-        let mut agent = DiscoveryAgent::new(
-            PublicKey::from(keypair),
-            DiscoveryConfig {
-                auto_dial: false,
-                ..DiscoveryConfig::default()
-            },
-        )
-        .expect("valid remote discovery agent");
-        agent.set_local_addrs(
-            &["/ip4/127.0.0.1/udp/4001/quic-v1"
-                .parse()
-                .expect("valid beacon address")],
-            0,
-        );
-        agent.handle_tick(0);
-        let payload = loop {
-            match agent.poll_action() {
-                Some(DiscoveryAction::PublishBeacon { payload, .. }) => break payload,
-                Some(_) => continue,
-                None => panic!("beacon was not published"),
-            }
-        };
-        (IdentityPeerId::from(keypair), payload)
-    }
-
-    fn discovery_with_inflight() -> (DiscoveryDriver, ConnectId, PeerId, PeerId) {
-        let local_key = Ed25519Keypair::from_secret_key_bytes([91; 32]);
-        let remote_key = Ed25519Keypair::from_secret_key_bytes([92; 32]);
-        let local = IdentityPeerId::from(&local_key);
-        let (remote, payload) = discovery_beacon(&remote_key);
-        let mut driver = DiscoveryDriver::new(
-            DiscoveryAgent::new(
-                PublicKey::from(&local_key),
-                DiscoveryConfig {
-                    dial_tie_break: false,
-                    ..DiscoveryConfig::default()
-                },
-            )
-            .expect("valid discovery agent"),
-        );
-        driver.agent.handle_beacon(&remote, &payload, true, 1);
-        assert!(matches!(
-            driver.agent.poll_event(),
-            Some(DiscoveryEvent::PeerDiscovered { peer, .. }) if peer == remote
-        ));
-        assert!(matches!(
-            driver.agent.poll_action(),
-            Some(DiscoveryAction::Dial { peer, .. }) if peer == remote
-        ));
-
-        let mut nat = NatAgent::new(local, NatConfig::default());
-        let connect_id = nat.connect(remote.clone(), Vec::new(), Now::from_mono(0));
-        driver.inflight.insert(connect_id, remote.clone());
-        let relay = PeerId::from_public_key_protobuf(
-            &PublicKey::from(&Ed25519Keypair::from_secret_key_bytes([93; 32])).encode_protobuf(),
-        );
-        (driver, connect_id, remote, relay)
-    }
-
-    fn endpoint_with_protocol(protocol: &str) -> Endpoint {
-        Endpoint::builder()
-            .protocol(protocol)
-            .discovery_config(DiscoveryConfig {
-                auto_dial: false,
-                beacon_interval_ms: 100,
-                peer_ttl_ms: 2_000,
-                ..DiscoveryConfig::default()
-            })
-            .expect("valid discovery config")
-            .bind_quic("127.0.0.1:0")
-            .expect("bind endpoint")
-    }
-
-    fn connected_user_stream(protocol: &str) -> (Endpoint, Endpoint, StreamId) {
-        let mut a = endpoint_with_protocol(protocol);
-        let mut b = endpoint_with_protocol(protocol);
-        a.listen().expect("a listens");
-        let b_addr = b.listen().expect("b listens");
-        let a_peer = a.peer_id().clone();
-        let b_peer = b.peer_id().clone();
-        a.dial(&b_addr).expect("a dials b");
-
-        let connection_deadline = Instant::now() + Duration::from_secs(10);
-        while !a.connected_peers().contains(&b_peer) || !b.connected_peers().contains(&a_peer) {
-            assert!(Instant::now() < connection_deadline, "connection timed out");
-            let _ = a.next_event(Duration::from_millis(20)).expect("a drives");
-            let _ = b.next_event(Duration::from_millis(20)).expect("b drives");
-        }
-
-        let stream_id = a.open_stream(&b_peer, protocol).expect("open user stream");
-        let ready_deadline = Instant::now() + Duration::from_secs(10);
-        let mut a_ready = false;
-        let mut b_ready = false;
-        while !a_ready || !b_ready {
-            assert!(Instant::now() < ready_deadline, "stream setup timed out");
-            if let Some(event) = a.next_event(Duration::from_millis(20)).expect("a drives") {
-                a_ready |= matches!(
-                    event,
-                    Event::StreamReady { stream_id: got, .. } if got == stream_id
-                );
-            }
-            if let Some(event) = b.next_event(Duration::from_millis(20)).expect("b drives") {
-                b_ready |= matches!(
-                    event,
-                    Event::StreamReady { stream_id: got, .. } if got == stream_id
-                );
-            }
-        }
-        (a, b, stream_id)
-    }
-
-    fn is_stream_event(event: &Event, peer: &PeerId, stream_id: StreamId) -> bool {
-        matches!(
-            event,
-            Event::StreamReady { peer_id, stream_id: got, .. }
-                | Event::StreamData { peer_id, stream_id: got, .. }
-                | Event::StreamRemoteWriteClosed { peer_id, stream_id: got, .. }
-                | Event::StreamClosed { peer_id, stream_id: got, .. }
-                if peer_id == peer && *got == stream_id
-        )
-    }
-
-    #[test]
-    fn endpoint_abandon_stream_purges_focused_wait_buffer_and_future_events() {
-        const PROTOCOL: &str = "/test/endpoint-abandon/1";
-        let (mut owner, mut remote, stream_id) = connected_user_stream(PROTOCOL);
-        let remote_peer = remote.peer_id().clone();
-
-        remote
-            .send_stream(owner.peer_id(), stream_id, b"buffer me".to_vec())
-            .expect("remote sends stream data");
-        let buffer_deadline = Instant::now() + Duration::from_secs(2);
-        while !owner
-            .pending_events
-            .iter()
-            .any(|event| is_stream_event(event, &remote_peer, stream_id))
-        {
-            assert!(
-                Instant::now() < buffer_deadline,
-                "focused wait did not buffer the stream event"
-            );
-            let _ = remote
-                .next_event(Duration::from_millis(10))
-                .expect("remote drives");
-            let _ = owner
-                .next_discovery_event(Duration::from_millis(10))
-                .expect("focused wait drives owner");
-        }
-
-        owner
-            .abandon_stream(&remote_peer, stream_id)
-            .expect("owner abandons stream");
-        assert!(
-            !owner.pending_events.iter().any(|event| is_stream_event(
-                event,
-                &remote_peer,
-                stream_id
-            )),
-            "abandon must purge the endpoint-focused-wait buffer"
-        );
-
-        remote
-            .close_stream_write(owner.peer_id(), stream_id)
-            .expect("remote closes stream write side");
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline {
-            let _ = remote
-                .next_event(Duration::from_millis(10))
-                .expect("remote drives");
-            if let Some(event) = owner
-                .next_event(Duration::from_millis(10))
-                .expect("owner drives")
-            {
-                assert!(
-                    !is_stream_event(&event, &remote_peer, stream_id),
-                    "abandoned stream event leaked through Endpoint: {event:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn topic_bound_stays_in_lockstep_with_pubsub() {
-        assert_eq!(
-            minip2p_discovery::MAX_TOPIC_LEN,
-            minip2p_pubsub::MAX_TOPIC_LEN
-        );
-    }
-
-    #[test]
-    fn relayed_success_variants_complete_discovery_owned_dials() {
-        for fell_back in [false, true] {
-            let (mut driver, connect_id, remote, relay) = discovery_with_inflight();
-            let event = if fell_back {
-                NatEvent::FellBackToRelay {
-                    connect_id,
-                    peer: remote.clone(),
-                }
-            } else {
-                NatEvent::PathEstablished {
-                    connect_id,
-                    peer: remote.clone(),
-                    path: Path::Relayed { relay },
-                }
-            };
-            driver.handle_nat_event(event, 2);
-
-            assert!(!driver.inflight.contains_key(&connect_id));
-            driver.agent.dial_failed(&remote, "must already be idle", 3);
-            assert!(
-                driver.agent.poll_event().is_none(),
-                "successful relayed completion must collapse the discovery dial state"
-            );
-        }
-    }
-
-    #[test]
-    fn eager_supersede_close_preserves_discovery_connectivity() {
-        let a_key = Ed25519Keypair::from_secret_key_bytes([94; 32]);
-        let b_key = Ed25519Keypair::from_secret_key_bytes([95; 32]);
-        let (b_peer, beacon) = discovery_beacon(&b_key);
-        let config = DiscoveryConfig {
-            dial_tie_break: false,
-            beacon_interval_ms: 100,
-            peer_ttl_ms: 2_000,
-            ..DiscoveryConfig::default()
-        };
-        let mut a = Endpoint::builder()
-            .identity(a_key)
-            .discovery_config(config.clone())
-            .expect("valid discovery config")
-            .bind_quic("127.0.0.1:0")
-            .expect("bind a");
-        let mut b = Endpoint::builder()
-            .identity(b_key)
-            .discovery_config(config)
-            .expect("valid discovery config")
-            .bind_quic("127.0.0.1:0")
-            .expect("bind b");
-        a.listen().expect("a listens");
-        let b_addr = b.listen().expect("b listens");
-        a.dial(&b_addr).expect("first dial");
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !a.connected_peers().contains(&b_peer) {
-            assert!(Instant::now() < deadline, "first connection timed out");
-            let _ = a.next_event(Duration::from_millis(20)).expect("drive a");
-            let _ = b.next_event(Duration::from_millis(20)).expect("drive b");
-        }
-        let discovery = a.discovery.as_mut().expect("discovery enabled");
-        discovery.agent.handle_beacon(&b_peer, &beacon, true, 1);
-        while discovery.agent.poll_event().is_some() {}
-        assert!(discovery.agent.poll_action().is_none());
-
-        a.dial(&b_addr).expect("replacement dial");
-        let mut saw_old_close = false;
-        while !saw_old_close {
-            assert!(Instant::now() < deadline, "replacement timed out");
-            if let Some(Event::ConnectionClosed { peer_id, .. }) =
-                a.next_event(Duration::from_millis(20)).expect("drive a")
-            {
-                saw_old_close = peer_id == b_peer;
-            }
-            let _ = b.next_event(Duration::from_millis(20)).expect("drive b");
-        }
-        assert!(a.swarm.core().conn_for(&b_peer).is_some());
-
-        let discovery = a.discovery.as_mut().expect("discovery enabled");
-        discovery.agent.handle_beacon(&b_peer, &beacon, true, 2);
-        assert!(
-            discovery.agent.poll_action().is_none(),
-            "Closed(old) must not make discovery redial while new is installed"
-        );
     }
 }
