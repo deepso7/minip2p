@@ -53,7 +53,8 @@ node.listen_all()?;
 
 `.discovery()` activates three coordinated pieces: the discovery driver,
 default gossipsub, and the NAT agent. `.discovery_config(...)` does the same
-with caller-selected discovery policy.
+with a caller-selected `BeaconConfig` (topic, cadence, announcement cap).
+Tune the shared address book and dial policy with `.peer_discovery_config(...)`.
 
 Discovery can dial direct addresses announced by other peers without a relay.
 A configured relay is still required for relay circuits, reservations, and

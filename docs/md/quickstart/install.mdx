@@ -71,7 +71,9 @@ inside a particular endpoint.
 
     The `discovery` Cargo feature includes the `nat` and `pubsub` APIs.
     Calling `.discovery()` or `.discovery_config(...)` activates discovery,
-    default pubsub, and the NAT agent together.
+    default pubsub, and the NAT agent together. Use
+    `.peer_discovery_config(...)` to tune the shared peer book and automatic-dial
+    policy.
 
   </Tab>
   <Tab title="mDNS">
