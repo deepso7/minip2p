@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use crate::{Multiaddr, Protocol};
+use crate::Multiaddr;
 
 /// Selects dialable direct-connect addresses in deterministic priority order.
 ///
@@ -35,7 +35,7 @@ pub fn select_direct_addrs(
 }
 
 fn push_candidate(accepted: &mut Vec<Multiaddr>, addr: Multiaddr) {
-    if is_wildcard_addr(&addr) {
+    if addr.is_wildcard_host() {
         return;
     }
     if !addr.is_quic_transport() {
@@ -46,15 +46,6 @@ fn push_candidate(accepted: &mut Vec<Multiaddr>, addr: Multiaddr) {
     }
 
     accepted.push(addr);
-}
-
-/// Returns true when the multiaddr starts with a wildcard IP host.
-fn is_wildcard_addr(addr: &Multiaddr) -> bool {
-    match addr.protocols().first() {
-        Some(Protocol::Ip4(bytes)) => *bytes == [0, 0, 0, 0],
-        Some(Protocol::Ip6(bytes)) => *bytes == [0; 16],
-        _ => false,
-    }
 }
 
 #[cfg(test)]

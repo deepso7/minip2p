@@ -75,6 +75,26 @@ pub enum SwarmEvent {
     Error(SwarmRuntimeError),
 }
 
+impl SwarmEvent {
+    /// Returns `true` if this is a stream-scoped event
+    /// ([`StreamReady`](Self::StreamReady), [`StreamData`](Self::StreamData),
+    /// [`StreamRemoteWriteClosed`](Self::StreamRemoteWriteClosed), or
+    /// [`StreamClosed`](Self::StreamClosed)) for the given peer and stream id.
+    ///
+    /// Useful for filtering queued events that belong to a stream being torn
+    /// down.
+    pub fn matches_stream(&self, peer_id: &PeerId, stream_id: StreamId) -> bool {
+        matches!(
+            self,
+            Self::StreamReady { peer_id: peer, stream_id: stream, .. }
+                | Self::StreamData { peer_id: peer, stream_id: stream, .. }
+                | Self::StreamRemoteWriteClosed { peer_id: peer, stream_id: stream, .. }
+                | Self::StreamClosed { peer_id: peer, stream_id: stream, .. }
+                if peer == peer_id && *stream == stream_id
+        )
+    }
+}
+
 /// Structured runtime error emitted through [`SwarmEvent::Error`].
 ///
 /// This keeps the Sans-I/O core testable without string matching while still

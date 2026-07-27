@@ -94,21 +94,6 @@ struct PendingOpen {
     target: ProtocolKind,
 }
 
-pub(crate) fn stream_event_matches(
-    event: &SwarmEvent,
-    peer_id: &PeerId,
-    stream_id: StreamId,
-) -> bool {
-    matches!(
-        event,
-        SwarmEvent::StreamReady { peer_id: peer, stream_id: stream, .. }
-            | SwarmEvent::StreamData { peer_id: peer, stream_id: stream, .. }
-            | SwarmEvent::StreamRemoteWriteClosed { peer_id: peer, stream_id: stream, .. }
-            | SwarmEvent::StreamClosed { peer_id: peer, stream_id: stream, .. }
-            if peer == peer_id && *stream == stream_id
-    )
-}
-
 fn stream_action_matches(action: &SwarmAction, conn_id: ConnectionId, stream_id: StreamId) -> bool {
     matches!(
         action,
@@ -564,7 +549,7 @@ impl SwarmCore {
         // and forgotten the stream. In that case there is nothing left to
         // reset, but a terminal event may still be queued for the consumer.
         self.events
-            .retain(|event| !stream_event_matches(event, peer_id, stream_id));
+            .retain(|event| !event.matches_stream(peer_id, stream_id));
         if let Some(key) = self
             .abandoned_streams
             .iter()

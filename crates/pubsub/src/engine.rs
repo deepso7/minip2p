@@ -90,7 +90,6 @@ impl PubsubAgent {
                 entropy_seed,
             )),
             PubsubConfig::Floodsub(config) => {
-                let _ = entropy_seed;
                 Self::Floodsub(FloodsubAgent::new(keypair, config, initial_seqno))
             }
         })

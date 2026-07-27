@@ -293,14 +293,12 @@ impl NatDriver {
                 }
             }
             NatEvent::ReachabilityChanged {
-                confirmed_addrs, ..
-            } => {
-                if self.public_addrs != *confirmed_addrs {
-                    self.public_addrs = confirmed_addrs.clone();
-                    self.advertise(swarm);
-                }
+                confirmed_addrs: addrs,
+                ..
             }
-            NatEvent::PublicAddressesChanged { addrs } if self.public_addrs != *addrs => {
+            | NatEvent::PublicAddressesChanged { addrs }
+                if self.public_addrs != *addrs =>
+            {
                 self.public_addrs = addrs.clone();
                 self.advertise(swarm);
             }

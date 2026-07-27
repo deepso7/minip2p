@@ -96,8 +96,7 @@ pub struct YamuxSession {
 impl YamuxSession {
     /// Creates a session with [`YamuxConfig::default`].
     pub fn new(role: YamuxRole) -> Self {
-        Self::with_config(role, YamuxConfig::default())
-            .expect("the default Yamux configuration is valid")
+        Self::from_validated_config(role, YamuxConfig::default())
     }
 
     /// Creates a session with explicit resource limits.
@@ -112,11 +111,17 @@ impl YamuxSession {
                 "max_frame_len must be greater than zero",
             ));
         }
+        Ok(Self::from_validated_config(role, config))
+    }
+
+    /// Builds the session state from a config that already passed (or, for
+    /// the default config, statically satisfies) the limit checks.
+    fn from_validated_config(role: YamuxRole, config: YamuxConfig) -> Self {
         let next_stream_id = Some(match role {
             YamuxRole::Client => 1,
             YamuxRole::Server => 2,
         });
-        Ok(Self {
+        Self {
             role,
             decoder: FrameDecoder::new(config.max_frame_len),
             config,
@@ -127,7 +132,7 @@ impl YamuxSession {
             failed: false,
             local_go_away: false,
             remote_go_away: false,
-        })
+        }
     }
 
     /// Opens a local stream and returns its role-partitioned identifier.

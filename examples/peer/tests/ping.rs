@@ -12,20 +12,11 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use minip2p_example_common::KillOnDrop;
+
 /// Hard cap on the entire flow. The dial itself takes ~3 s (three 1 s
 /// pings); the generous timeout absorbs CI jitter.
 const TEST_DEADLINE: Duration = Duration::from_secs(20);
-
-/// Child process that is killed on drop so a test panic doesn't leak
-/// a bound UDP socket.
-struct KillOnDrop(Child);
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
 
 #[test]
 fn listen_and_dial_complete_counted_ping_run() {

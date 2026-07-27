@@ -63,16 +63,6 @@ struct StreamRuntimeState {
 }
 
 impl StreamRuntimeState {
-    /// Marks the local write side as closed.
-    fn on_local_write_closed(&mut self) {
-        self.local_write_closed = true;
-    }
-
-    /// Marks the remote write side as closed.
-    fn on_remote_write_closed(&mut self) {
-        self.remote_write_closed = true;
-    }
-
     /// Returns true if both sides have closed their write side.
     fn is_fully_closed(&self) -> bool {
         self.local_write_closed && self.remote_write_closed
@@ -424,7 +414,7 @@ impl QuicConnection {
             });
         }
 
-        state.on_local_write_closed();
+        state.local_write_closed = true;
         state.pending_writes.push_back(PendingStreamWrite::fin());
 
         self.drain_send_queue(events)?;
@@ -535,7 +525,7 @@ impl QuicConnection {
 
                         if fin {
                             if let Some(state) = self.stream_states.get_mut(&raw_stream_id) {
-                                state.on_remote_write_closed();
+                                state.remote_write_closed = true;
                             }
 
                             events.push(TransportEvent::StreamRemoteWriteClosed {

@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use minip2p::{Multiaddr, PeerAddr, PeerId, Protocol};
+use minip2p_example_common::{CliError, flag_value, require_quic_transport};
 
 /// The modes the CLI dispatches to.
 #[derive(Clone, Debug)]
@@ -62,19 +63,6 @@ pub struct ChatOptions {
     /// Skip direct dialing and DCUtR so relay-only behavior is deterministic.
     pub relay_only: bool,
 }
-
-/// Parse error surfaced back to `main` so the binary exits with a readable
-/// message rather than a panic.
-#[derive(Clone, Debug)]
-pub struct CliError(pub String);
-
-impl std::fmt::Display for CliError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for CliError {}
 
 /// Parse argv (exclusive of the binary name) into a [`Mode`].
 pub fn parse(mut args: Vec<String>) -> Result<Mode, CliError> {
@@ -278,24 +266,6 @@ impl Flags {
         }
 
         Ok(Self { relay, chat })
-    }
-}
-
-fn flag_value<'a>(args: &'a [String], i: usize, key: &str) -> Result<&'a String, CliError> {
-    args.get(i + 1)
-        .ok_or_else(|| CliError(format!("flag '{key}' requires a value")))
-}
-
-/// Rejects peer addresses the endpoint could never dial: everything this
-/// demo connects to is QUIC, and catching the shape here turns an
-/// asynchronous dial failure into an immediate input error.
-fn require_quic_transport(what: &str, raw: &str, addr: &PeerAddr) -> Result<(), CliError> {
-    if addr.transport().is_quic_transport() {
-        Ok(())
-    } else {
-        Err(CliError(format!(
-            "{what} must be on a /ip4|ip6|dns|dns4|dns6/<host>/udp/<port>/quic-v1 transport, got '{raw}'"
-        )))
     }
 }
 

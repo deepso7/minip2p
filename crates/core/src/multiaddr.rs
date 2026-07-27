@@ -90,6 +90,35 @@ impl Multiaddr {
         is_quic_transport_slice(&self.protocols)
     }
 
+    /// Returns `true` if the first component is a wildcard IP host
+    /// (`/ip4/0.0.0.0` or `/ip6/::`).
+    ///
+    /// Wildcard hosts are valid bind addresses but are not dialable, so
+    /// address candidates and advertisements typically filter them out.
+    pub fn is_wildcard_host(&self) -> bool {
+        match self.protocols.first() {
+            Some(Protocol::Ip4(bytes)) => *bytes == [0; 4],
+            Some(Protocol::Ip6(bytes)) => *bytes == [0; 16],
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if this is a relay circuit transport address:
+    /// exactly host + udp + quic-v1 + `/p2p/<relay>` + `/p2p-circuit`.
+    ///
+    /// This is the shape produced by relay reservations: the QUIC
+    /// address of the relay, the relay's peer id, and the circuit
+    /// marker. Anything longer or shorter (including a direct QUIC
+    /// address) returns `false`.
+    pub fn is_relay_circuit_transport(&self) -> bool {
+        self.protocols.len() == 5
+            && self.protocols[0].is_host()
+            && matches!(self.protocols[1], Protocol::Udp(_))
+            && matches!(self.protocols[2], Protocol::QuicV1)
+            && matches!(self.protocols[3], Protocol::P2p(_))
+            && matches!(self.protocols[4], Protocol::P2pCircuit)
+    }
+
     /// Encodes this multiaddr to its binary multicodec wire form.
     ///
     /// Shape: for each component, a varint multicodec code followed by

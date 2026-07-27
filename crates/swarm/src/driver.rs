@@ -13,7 +13,7 @@ use minip2p_identify::{IdentifyConfig, IdentifyMessage};
 use minip2p_ping::{PING_PAYLOAD_LEN, PingConfig};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, WaitOutcome};
 
-use crate::core::{SwarmCore, stream_event_matches};
+use crate::core::SwarmCore;
 use crate::events::{
     SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput, SwarmRuntimeError,
 };
@@ -545,7 +545,7 @@ impl<T: Transport> Swarm<T> {
     ) -> Result<(), DriverError> {
         let result = self.core.abandon_stream(peer_id, stream_id);
         self.event_buffer
-            .retain(|event| !stream_event_matches(event, peer_id, stream_id));
+            .retain(|event| !event.matches_stream(peer_id, stream_id));
         result?;
         self.flush_actions();
         Ok(())

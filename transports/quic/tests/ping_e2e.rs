@@ -6,22 +6,11 @@ use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, Multistrea
 use minip2p_ping::{
     PING_PAYLOAD_LEN, PING_PROTOCOL_ID, PingAction, PingEvent, PingInput, PingOutput, PingProtocol,
 };
-use minip2p_quic::{QuicNodeConfig, QuicTransport};
+use minip2p_quic::QuicTransport;
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportEvent};
 
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-fn drive_pair_once(
-    server: &mut QuicTransport,
-    client: &mut QuicTransport,
-) -> (Vec<TransportEvent>, Vec<TransportEvent>) {
-    std::thread::sleep(std::time::Duration::from_millis(5));
-    let server_events = server.poll().expect("server poll");
-    let client_events = client.poll().expect("client poll");
-    (server_events, client_events)
-}
+mod common;
+use common::{drive_pair_once, setup_pair};
 
 fn apply_ping_actions(
     transport: &mut QuicTransport,
@@ -141,13 +130,7 @@ struct PingHarness {
 impl PingHarness {
     /// Create a connected, verified, and multistream-negotiated ping pair.
     fn new(client_conn_id_raw: u64) -> Self {
-        let mut server =
-            QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server bind");
-        let mut client =
-            QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("client bind");
-
-        server.listen_on_bound_addr().expect("server listen");
-        let peer_addr = server.local_peer_addr().expect("peer addr");
+        let (mut server, mut client, peer_addr) = setup_pair();
 
         // Connect.
         let _ = client_conn_id_raw;

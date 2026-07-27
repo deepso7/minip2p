@@ -22,6 +22,9 @@ use thiserror::Error;
 pub const PING_PROTOCOL_ID: &str = "/ipfs/ping/1.0.0";
 /// Required ping payload size in bytes.
 pub const PING_PAYLOAD_LEN: usize = 32;
+/// Most inbound ping streams accepted per peer before excess streams are
+/// reset.
+const MAX_INBOUND_STREAMS: usize = 2;
 
 /// Configuration for the ping protocol.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -273,12 +276,12 @@ impl PingProtocol {
             return Vec::new();
         }
 
-        if peer.inbound_streams.len() >= 2 {
+        if peer.inbound_streams.len() >= MAX_INBOUND_STREAMS {
             self.pending_events
                 .push_back(PingEvent::StreamLimitExceeded {
                     peer_id: peer_id.clone(),
                     stream_id,
-                    limit: 2,
+                    limit: MAX_INBOUND_STREAMS,
                 });
 
             return vec![PingAction::ResetStream { peer_id, stream_id }];

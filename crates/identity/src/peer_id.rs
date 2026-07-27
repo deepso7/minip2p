@@ -451,21 +451,8 @@ fn base32_value(c: char) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::decode_hex;
     use crate::{KeyType, PublicKey};
-
-    fn decode_hex(input: &str) -> Vec<u8> {
-        assert_eq!(input.len() % 2, 0);
-        let mut out = Vec::with_capacity(input.len() / 2);
-        let bytes = input.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            let hi = (bytes[i] as char).to_digit(16).expect("invalid hex") as u8;
-            let lo = (bytes[i + 1] as char).to_digit(16).expect("invalid hex") as u8;
-            out.push((hi << 4) | lo);
-            i += 2;
-        }
-        out
-    }
 
     #[test]
     fn computes_ed25519_peer_id_from_spec_vector() {

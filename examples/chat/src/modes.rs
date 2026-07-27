@@ -136,20 +136,23 @@ pub fn run_host(relay: Option<PeerAddr>, options: ChatOptions) -> Result<(), Box
 fn wait_for_reservation(endpoint: &mut Endpoint, relay: &PeerAddr) -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + RESERVATION_DEADLINE;
     loop {
-        for event in endpoint.take_nat_events() {
-            print_nat_event("host", &event);
-            if matches!(&event, NatEvent::RelayReserved { relay: reserved, .. }
-                if reserved == relay.peer_id())
-            {
-                println!("[host] circuit={}", circuit_addr(relay, endpoint.peer_id()));
-                return Ok(());
-            }
-        }
-        if Instant::now() >= deadline {
-            eprintln!("[host] warning: no relay reservation within 30s; still retrying");
+        let Some(event) = endpoint
+            .next_nat_event(deadline)
+            .map_err(|e| format!("swarm poll: {e}"))?
+        else {
+            eprintln!(
+                "[host] warning: no relay reservation within {}s; still retrying",
+                RESERVATION_DEADLINE.as_secs()
+            );
+            return Ok(());
+        };
+        print_nat_event("host", &event);
+        if matches!(&event, NatEvent::RelayReserved { relay: reserved, .. }
+            if reserved == relay.peer_id())
+        {
+            println!("[host] circuit={}", circuit_addr(relay, endpoint.peer_id()));
             return Ok(());
         }
-        let _ = endpoint.next_event(Duration::from_millis(200))?;
     }
 }
 
