@@ -21,6 +21,17 @@ The project is built around five non-negotiables:
 
 `unsafe` is forbidden workspace-wide.
 
+## 0.2.0 — 2026-07-28
+
+- Consolidated varint-length-prefixed framing in `minip2p-core` and reduced
+  duplicated protocol codec code.
+- Simplified direct-address selection to `select_direct_addrs` and moved
+  reusable multiaddr and stream-event predicates onto their owning types.
+- Tightened entropy handling: ping generation now fails explicitly if OS
+  randomness is unavailable, and custom circuit entropy sources can report
+  backend failures through `EntropyError::new`.
+- Removed unused pre-1.0 APIs and test-only surface across the workspace.
+
 ## 0.1.1 — 2026-07-27
 
 - The `pubsub` facade now selects gossipsub by default. This is a pre-1.0
@@ -112,7 +123,7 @@ Build an app endpoint with the top-level facade:
 
 ```toml
 [dependencies]
-minip2p-rs = "0.1.1"
+minip2p-rs = "0.2.0"
 ```
 
 ```rust
