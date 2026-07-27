@@ -4,7 +4,7 @@
 
 # minip2p
 
-A minimal [libp2p](https://libp2p.io/) implementation in Rust: small,
+A minimal [libp2p](https://libp2p.io/) implementation in [Rust](https://en.wikipedia.org/wiki/Rust_(programming_language): small,
 portable, understandable, and pleasant to use.
 
 The project is built around five non-negotiables:
