@@ -90,7 +90,7 @@ jobs:
       - name: Test release commit
         run: |
           cargo test --workspace --locked
-          cargo test -p minip2p-rs --features nat,pubsub,discovery --locked
+          cargo test -p minip2p-rs --features nat,pubsub,discovery,mdns --locked
           cargo doc --workspace --no-deps --locked
 
       - name: Publish crates in dependency order
@@ -113,6 +113,7 @@ jobs:
             minip2p-autonat
             minip2p-dcutr
             minip2p-discovery
+            minip2p-mdns
             minip2p-swarm
             minip2p-circuit
             minip2p-nat
