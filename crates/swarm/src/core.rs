@@ -27,8 +27,6 @@
 //! machine deterministic and avoids leaving protocol bytes buffered inside the
 //! core.
 
-extern crate alloc;
-
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -94,21 +92,6 @@ struct PendingOpen {
     conn_id: ConnectionId,
     protocol: String,
     target: ProtocolKind,
-}
-
-pub(crate) fn stream_event_matches(
-    event: &SwarmEvent,
-    peer_id: &PeerId,
-    stream_id: StreamId,
-) -> bool {
-    matches!(
-        event,
-        SwarmEvent::StreamReady { peer_id: peer, stream_id: stream, .. }
-            | SwarmEvent::StreamData { peer_id: peer, stream_id: stream, .. }
-            | SwarmEvent::StreamRemoteWriteClosed { peer_id: peer, stream_id: stream, .. }
-            | SwarmEvent::StreamClosed { peer_id: peer, stream_id: stream, .. }
-            if peer == peer_id && *stream == stream_id
-    )
 }
 
 fn stream_action_matches(action: &SwarmAction, conn_id: ConnectionId, stream_id: StreamId) -> bool {
@@ -566,7 +549,7 @@ impl SwarmCore {
         // and forgotten the stream. In that case there is nothing left to
         // reset, but a terminal event may still be queued for the consumer.
         self.events
-            .retain(|event| !stream_event_matches(event, peer_id, stream_id));
+            .retain(|event| !event.matches_stream(peer_id, stream_id));
         if let Some(key) = self
             .abandoned_streams
             .iter()
@@ -626,11 +609,6 @@ impl SwarmCore {
     /// Returns whether `peer_id` has reached the application-ready state.
     pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
         self.ready_peers.contains(peer_id)
-    }
-
-    /// Returns the peer id currently mapped to `conn_id`, if any.
-    pub fn peer_for(&self, conn_id: ConnectionId) -> Option<&PeerId> {
-        self.conn_to_peer.get(&conn_id)
     }
 
     // -----------------------------------------------------------------------

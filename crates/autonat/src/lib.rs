@@ -13,9 +13,7 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_core::{
-    Multiaddr, PeerId, SansIoProtocol, VarintError, read_uvarint, uvarint_len, write_uvarint,
-};
+use minip2p_core::{Multiaddr, PeerId, SansIoProtocol, VarintError, read_uvarint, write_uvarint};
 
 /// Protocol id for AutoNAT v1.
 pub const AUTONAT_PROTOCOL_ID: &str = "/libp2p/autonat/1.0.0";
@@ -37,7 +35,7 @@ const TAG_RESPONSE_ADDRS: u8 = (3 << 3) | WIRE_LEN;
 
 /// Top-level AutoNAT message type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MessageType {
+pub(crate) enum MessageType {
     /// Request that the service dial the supplied peer addresses.
     Dial = 0,
     /// Service result for a dial request.
@@ -200,7 +198,7 @@ pub enum AutoNatError {
     MessageTooLarge { len: usize },
     /// Frame prefix declared a message larger than the configured maximum size.
     #[error("AutoNAT frame length exceeds maximum size ({len} > {MAX_MESSAGE_SIZE})")]
-    FrameTooLarge { len: usize },
+    FrameTooLarge { len: u64 },
     /// A varint could not be decoded.
     #[error("varint error: {0}")]
     Varint(#[from] VarintError),
@@ -524,49 +522,14 @@ impl Default for AutoNatServer {
     }
 }
 
-/// Frame decode result for varint-length-prefixed AutoNAT messages.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum FrameDecode<'a> {
-    /// A complete frame is available.
-    Complete { payload: &'a [u8], consumed: usize },
-    /// More bytes are needed.
-    Incomplete,
-    /// Declared payload length exceeds [`MAX_MESSAGE_SIZE`].
-    TooLarge { len: usize },
-    /// The frame length varint was malformed.
-    Error(VarintError),
-}
-
-/// Encodes a protobuf message body with a varint length prefix.
-pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(uvarint_len(payload.len() as u64) + payload.len());
-    write_uvarint(payload.len() as u64, &mut out);
-    out.extend_from_slice(payload);
-    out
-}
+pub use minip2p_core::{FrameDecode, encode_frame};
 
 /// Decodes a varint-length-prefixed frame from `input`.
+///
+/// A declared payload length greater than [`MAX_MESSAGE_SIZE`] is rejected
+/// with [`FrameDecode::TooLarge`].
 pub fn decode_frame(input: &[u8]) -> FrameDecode<'_> {
-    let (len, used) = match read_uvarint(input) {
-        Ok(v) => v,
-        Err(VarintError::BufferTooShort) => return FrameDecode::Incomplete,
-        Err(e) => return FrameDecode::Error(e),
-    };
-    let len = match usize::try_from(len) {
-        Ok(len) => len,
-        Err(_) => return FrameDecode::Error(VarintError::Overflow),
-    };
-    if len > MAX_MESSAGE_SIZE {
-        return FrameDecode::TooLarge { len };
-    }
-    let end = used.saturating_add(len);
-    if input.len() < end {
-        return FrameDecode::Incomplete;
-    }
-    FrameDecode::Complete {
-        payload: &input[used..end],
-        consumed: end,
-    }
+    minip2p_core::decode_frame(input, MAX_MESSAGE_SIZE)
 }
 
 impl Message {
@@ -901,7 +864,7 @@ mod tests {
         assert_eq!(
             decode_frame(&frame),
             FrameDecode::TooLarge {
-                len: MAX_MESSAGE_SIZE + 1
+                len: (MAX_MESSAGE_SIZE + 1) as u64
             }
         );
     }
@@ -944,5 +907,126 @@ mod tests {
                 if addrs == vec![addr]
         ));
         assert!(client.is_idle());
+    }
+}
+
+/// Golden equivalence tests for the varint-length-prefixed frame codec.
+///
+/// The fixed vectors pin the exact wire behavior of the codec this crate
+/// originally implemented locally; after consolidation into `minip2p-core`
+/// they exercise the shared codec through this crate's wrappers and must
+/// keep passing byte for byte.
+#[cfg(test)]
+mod frame_golden {
+    use super::*;
+
+    #[test]
+    fn golden_empty_payload() {
+        assert_eq!(encode_frame(&[]), [0x00]);
+        assert!(matches!(
+            decode_frame(&[0x00]),
+            FrameDecode::Complete { payload, consumed: 1 } if payload.is_empty()
+        ));
+    }
+
+    #[test]
+    fn golden_single_byte_payload() {
+        assert_eq!(encode_frame(b"\xab"), [0x01, 0xab]);
+        assert!(matches!(
+            decode_frame(&[0x01, 0xab]),
+            FrameDecode::Complete { payload, consumed: 2 } if payload == b"\xab"
+        ));
+    }
+
+    #[test]
+    fn golden_payload_at_max_len() {
+        let payload = vec![0x5au8; MAX_MESSAGE_SIZE];
+        let framed = encode_frame(&payload);
+        // 8192 as a minimal uvarint.
+        assert_eq!(framed[..2], [0x80, 0x40]);
+        assert_eq!(framed.len(), MAX_MESSAGE_SIZE + 2);
+        assert!(matches!(
+            decode_frame(&framed),
+            FrameDecode::Complete { payload: p, consumed }
+                if p == payload.as_slice() && consumed == MAX_MESSAGE_SIZE + 2
+        ));
+    }
+
+    #[test]
+    fn golden_declared_len_above_max_too_large() {
+        // 8193 as a minimal uvarint; rejected from the header alone.
+        assert!(matches!(
+            decode_frame(&[0x81, 0x40]),
+            FrameDecode::TooLarge { len } if len as u128 == 8193
+        ));
+    }
+
+    #[test]
+    fn golden_declared_len_u64_max_too_large() {
+        // u64::MAX as a 10-byte uvarint, followed by a garbage byte.
+        let input = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x22,
+        ];
+        assert!(matches!(
+            decode_frame(&input),
+            FrameDecode::TooLarge { len } if len as u128 == u128::from(u64::MAX)
+        ));
+    }
+
+    #[test]
+    fn golden_truncated_header_incomplete() {
+        assert!(matches!(decode_frame(&[]), FrameDecode::Incomplete));
+        // Continuation bit set with no following byte.
+        assert!(matches!(decode_frame(&[0x80]), FrameDecode::Incomplete));
+    }
+
+    #[test]
+    fn golden_truncated_payload_incomplete() {
+        // Declares 5 bytes, only 2 buffered.
+        assert!(matches!(
+            decode_frame(&[0x05, 0xaa, 0xbb]),
+            FrameDecode::Incomplete
+        ));
+        let framed = encode_frame(b"hello");
+        assert!(matches!(
+            decode_frame(&framed[..framed.len() - 1]),
+            FrameDecode::Incomplete
+        ));
+    }
+
+    #[test]
+    fn golden_oversized_varint_header_error() {
+        // Ten continuation bytes overflow u64 before the varint terminates.
+        assert!(matches!(
+            decode_frame(&[0xff; 10]),
+            FrameDecode::Error(VarintError::Overflow)
+        ));
+    }
+
+    #[test]
+    fn golden_non_minimal_length_rejected() {
+        // Length 1 encoded in two bytes ([0x81, 0x00]) is non-canonical.
+        assert!(matches!(
+            decode_frame(&[0x81, 0x00, 0xaa]),
+            FrameDecode::Error(VarintError::NonCanonical)
+        ));
+    }
+
+    #[test]
+    fn golden_multi_frame_consumed() {
+        let mut buf = encode_frame(b"first");
+        buf.extend_from_slice(&encode_frame(b"second"));
+        let consumed = match decode_frame(&buf) {
+            FrameDecode::Complete { payload, consumed } => {
+                assert_eq!(payload, b"first");
+                assert_eq!(consumed, 6);
+                consumed
+            }
+            _ => panic!("expected first frame"),
+        };
+        assert!(matches!(
+            decode_frame(&buf[consumed..]),
+            FrameDecode::Complete { payload, consumed: 7 } if payload == b"second"
+        ));
     }
 }

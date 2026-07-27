@@ -11,11 +11,11 @@ use thiserror::Error;
 use crate::PublicKey;
 
 /// Multihash code for identity (inline) hashing.
-pub const IDENTITY_MULTIHASH_CODE: u64 = 0x00;
+const IDENTITY_MULTIHASH_CODE: u64 = 0x00;
 /// Multihash code for SHA-256 hashing.
-pub const SHA256_MULTIHASH_CODE: u64 = 0x12;
+const SHA256_MULTIHASH_CODE: u64 = 0x12;
 /// CIDv1 multicodec value for `libp2p-key`.
-pub const LIBP2P_KEY_MULTICODEC: u64 = 0x72;
+const LIBP2P_KEY_MULTICODEC: u64 = 0x72;
 
 /// Public keys with protobuf encoding at or below this size are inlined
 /// using identity multihash; larger keys are SHA-256 hashed.
@@ -80,11 +80,6 @@ impl PeerId {
     /// Returns the underlying typed multihash value.
     pub fn multihash(&self) -> &PeerMultihash {
         &self.multihash
-    }
-
-    /// Consumes the peer id and returns the typed multihash value.
-    pub fn into_multihash(self) -> PeerMultihash {
-        self.multihash
     }
 
     /// Encodes this peer id into multihash bytes.
@@ -456,21 +451,8 @@ fn base32_value(c: char) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::decode_hex;
     use crate::{KeyType, PublicKey};
-
-    fn decode_hex(input: &str) -> Vec<u8> {
-        assert_eq!(input.len() % 2, 0);
-        let mut out = Vec::with_capacity(input.len() / 2);
-        let bytes = input.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            let hi = (bytes[i] as char).to_digit(16).expect("invalid hex") as u8;
-            let lo = (bytes[i + 1] as char).to_digit(16).expect("invalid hex") as u8;
-            out.push((hi << 4) | lo);
-            i += 2;
-        }
-        out
-    }
 
     #[test]
     fn computes_ed25519_peer_id_from_spec_vector() {

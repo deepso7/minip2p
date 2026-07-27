@@ -27,6 +27,5 @@ sha2 = "0.11.0"
 [dev-dependencies]
 minip2p-multistream-select = { path = "../../crates/multistream-select" }
 minip2p-ping = { path = "../../crates/ping" }
-minip2p-identify = { path = "../../crates/identify" }
 minip2p-swarm = { path = "../../crates/swarm" }
 minip2p-identity = { path = "../../crates/identity" }

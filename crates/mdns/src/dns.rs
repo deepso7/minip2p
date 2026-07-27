@@ -7,17 +7,17 @@ use alloc::{
 };
 
 /// libp2p mDNS service name.
-pub const SERVICE_NAME: &str = "_p2p._udp.local";
+pub(crate) const SERVICE_NAME: &str = "_p2p._udp.local";
 /// DNS-SD meta-query name.
-pub const META_QUERY_NAME: &str = "_services._dns-sd._udp.local";
+pub(crate) const META_QUERY_NAME: &str = "_services._dns-sd._udp.local";
 /// DNS class IN.
-pub const CLASS_IN: u16 = 1;
+pub(crate) const CLASS_IN: u16 = 1;
 /// DNS PTR record type.
-pub const TYPE_PTR: u16 = 12;
+pub(crate) const TYPE_PTR: u16 = 12;
 /// DNS TXT record type.
-pub const TYPE_TXT: u16 = 16;
+pub(crate) const TYPE_TXT: u16 = 16;
 /// Largest datagram accepted by the decoder.
-pub const MDNS_MAX_DECODE_BYTES: usize = 9_000;
+pub(crate) const MDNS_MAX_DECODE_BYTES: usize = 9_000;
 
 const FLAG_QR: u16 = 0x8000;
 const FLAG_AA: u16 = 0x0400;

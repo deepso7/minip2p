@@ -6,10 +6,12 @@
 //! — including leaf-to-leaf THROUGH the host — and stdin EOF exits cleanly.
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use minip2p_example_common::KillOnDrop;
 
 #[path = "../../../tests/support/relay.rs"]
 mod relay_support;
@@ -18,17 +20,6 @@ use relay_support::RelayServer;
 
 /// Hard cap on the entire flow; loopback runs finish in a few seconds.
 const TEST_DEADLINE: Duration = Duration::from_secs(30);
-
-/// Child process killed on drop so a panicking assertion doesn't leak
-/// bound UDP sockets.
-struct KillOnDrop(Child);
-
-impl Drop for KillOnDrop {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
 
 /// A spawned chat peer with its collected stdout lines.
 struct Peer {

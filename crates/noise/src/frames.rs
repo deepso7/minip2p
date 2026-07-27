@@ -6,10 +6,16 @@ use crate::NoiseError;
 pub const MAX_FRAME_LEN: usize = u16::MAX as usize;
 
 /// Incremental decoder for two-byte big-endian length-prefixed Noise frames.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FrameDecoder {
     buffer: Vec<u8>,
     offset: usize,
+}
+
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FrameDecoder {
@@ -45,6 +51,7 @@ impl FrameDecoder {
     }
 
     /// Returns the number of bytes currently buffered, including a partial header.
+    #[cfg(test)]
     pub fn buffered_len(&self) -> usize {
         self.buffer.len() - self.offset
     }

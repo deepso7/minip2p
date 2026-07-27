@@ -161,6 +161,7 @@ impl Endpoint {
     /// Starts listening on the transport's first already-bound address.
     pub fn listen(&mut self) -> Result<PeerAddr, Error> {
         let addr = self.swarm.listen_on_bound_addr()?;
+        #[cfg(feature = "nat")]
         self.sync_nat_listen_addrs(std::slice::from_ref(&addr));
         Ok(addr)
     }
@@ -168,21 +169,20 @@ impl Endpoint {
     /// Starts listening on all transport-bound addresses.
     pub fn listen_all(&mut self) -> Result<Vec<PeerAddr>, Error> {
         let addrs = self.swarm.listen_on_bound_addrs()?;
+        #[cfg(feature = "nat")]
         self.sync_nat_listen_addrs(&addrs);
         Ok(addrs)
     }
 
     /// Seeds the NAT agent's advertised addresses from the bound set
-    /// (wildcards and non-QUIC shapes filtered out). No-op without the
-    /// `nat` feature or when NAT is not configured.
-    #[allow(unused_variables)]
+    /// (wildcards and non-QUIC shapes filtered out). No-op when NAT is
+    /// not configured.
+    #[cfg(feature = "nat")]
     fn sync_nat_listen_addrs(&mut self, addrs: &[PeerAddr]) {
-        #[cfg(feature = "nat")]
         if let Some(nat) = self.nat.as_mut() {
             let transports: Vec<Multiaddr> =
                 addrs.iter().map(|addr| addr.transport().clone()).collect();
-            let validated =
-                minip2p_core::select_direct_candidates(&transports, None, None).into_addrs();
+            let validated = minip2p_core::select_direct_addrs(&transports, None, None);
             nat.agent.set_listen_addrs(&validated);
         }
     }
@@ -280,7 +280,7 @@ impl Endpoint {
         let result = self.swarm.abandon_stream(peer_id, stream_id);
         #[cfg(any(feature = "nat", feature = "pubsub"))]
         self.pending_events
-            .retain(|event| !event_matches_stream(event, peer_id, stream_id));
+            .retain(|event| !event.matches_stream(peer_id, stream_id));
         result
     }
 
@@ -956,32 +956,6 @@ impl Endpoint {
         result
     }
 
-    /// Decomposes this endpoint into the underlying swarm.
-    pub fn into_swarm(self) -> EndpointSwarm {
-        #[cfg(feature = "mdns")]
-        {
-            let mut endpoint = self;
-            let _ = endpoint.shutdown();
-            endpoint.swarm
-        }
-        #[cfg(all(not(feature = "mdns"), feature = "discovery"))]
-        {
-            let mut endpoint = self;
-            if let (Some(discovery), Some(nat)) =
-                (endpoint.discovery.as_mut(), endpoint.nat.as_mut())
-            {
-                discovery.shutdown(nat, &mut endpoint.swarm);
-            }
-            endpoint.swarm
-        }
-        #[cfg(not(any(feature = "discovery", feature = "mdns")))]
-        {
-            self.swarm
-        }
-    }
-}
-
-impl Endpoint {
     #[cfg(feature = "nat")]
     fn quic_mut(&mut self) -> &mut QuicEndpoint {
         self.swarm.transport_mut().inner_mut()
@@ -1018,34 +992,6 @@ fn mdns_seed(keypair: &Ed25519Keypair) -> [u8; 32] {
         *byte ^= timestamp[index % timestamp.len()];
     }
     seed
-}
-
-#[cfg(any(feature = "nat", feature = "pubsub"))]
-fn event_matches_stream(event: &Event, peer_id: &PeerId, stream_id: StreamId) -> bool {
-    matches!(
-        event,
-        Event::StreamReady {
-            peer_id: event_peer,
-            stream_id: event_stream,
-            ..
-        }
-            | Event::StreamData {
-                peer_id: event_peer,
-                stream_id: event_stream,
-                ..
-            }
-            | Event::StreamRemoteWriteClosed {
-                peer_id: event_peer,
-                stream_id: event_stream,
-                ..
-            }
-            | Event::StreamClosed {
-                peer_id: event_peer,
-                stream_id: event_stream,
-                ..
-            }
-            if event_peer == peer_id && *event_stream == stream_id
-    )
 }
 
 /// Builder for [`Endpoint`].
@@ -1306,7 +1252,7 @@ impl EndpointBuilder {
             let enabled = self.nat_config.is_some()
                 || !self.relays.is_empty()
                 || !self.autonat_servers.is_empty()
-                || cfg!(feature = "discovery") && {
+                || {
                     #[cfg(feature = "discovery")]
                     {
                         self.discovery_config.is_some()
@@ -1316,7 +1262,7 @@ impl EndpointBuilder {
                         false
                     }
                 }
-                || cfg!(feature = "mdns") && {
+                || {
                     #[cfg(feature = "mdns")]
                     {
                         self.mdns_config.is_some()
@@ -1483,12 +1429,23 @@ fn build_endpoint(parts: BuilderParts, transport: QuicEndpoint) -> Result<Endpoi
     };
     #[cfg(any(feature = "discovery", feature = "mdns"))]
     let discovery_enabled = {
-        let enabled = false;
         #[cfg(feature = "discovery")]
-        let enabled = enabled || beacon.is_some();
+        {
+            beacon.is_some()
+        }
+        #[cfg(not(feature = "discovery"))]
+        {
+            false
+        }
+    } || {
         #[cfg(feature = "mdns")]
-        let enabled = enabled || mdns.is_some();
-        enabled
+        {
+            mdns.is_some()
+        }
+        #[cfg(not(feature = "mdns"))]
+        {
+            false
+        }
     };
     #[cfg(any(feature = "discovery", feature = "mdns"))]
     let discovery = if discovery_enabled {

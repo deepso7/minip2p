@@ -122,16 +122,6 @@ impl MdnsAgent {
         })
     }
 
-    /// Returns the local peer identity used for self-suppression.
-    pub fn local_peer_id(&self) -> &PeerId {
-        &self.peer_id
-    }
-
-    /// Returns the random DNS label used as this process's PTR target.
-    pub fn peer_name(&self) -> &str {
-        &self.peer_name
-    }
-
     /// Replaces interface snapshots and restarts startup probing on a real change.
     pub fn set_interfaces(&mut self, ifaces: &[InterfaceSnapshot], now_ms: u64) {
         if self.closed {
@@ -534,20 +524,9 @@ fn wire_ttl_seconds(ttl_ms: u64, legacy: bool) -> u32 {
 
 fn is_supported_transport(addr: &Multiaddr) -> bool {
     if addr.is_quic_transport() {
-        return !is_wildcard(addr);
+        return !addr.is_wildcard_host();
     }
-    let protocols = addr.protocols();
-    protocols.len() == 5
-        && protocols[0].is_host()
-        && matches!(protocols[1], Protocol::Udp(_))
-        && matches!(protocols[2], Protocol::QuicV1)
-        && matches!(protocols[3], Protocol::P2p(_))
-        && matches!(protocols[4], Protocol::P2pCircuit)
-}
-
-fn is_wildcard(addr: &Multiaddr) -> bool {
-    matches!(addr.protocols().first(), Some(Protocol::Ip4(ip)) if *ip == [0; 4])
-        || matches!(addr.protocols().first(), Some(Protocol::Ip6(ip)) if *ip == [0; 16])
+    addr.is_relay_circuit_transport()
 }
 
 fn expand_addresses(

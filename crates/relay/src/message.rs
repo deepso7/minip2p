@@ -27,7 +27,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{VarintError, read_uvarint, uvarint_len, write_uvarint};
+use minip2p_core::{VarintError, read_uvarint, write_uvarint};
 use thiserror::Error;
 
 use crate::MAX_MESSAGE_SIZE;
@@ -325,25 +325,7 @@ fn skip_unknown_field(
 // Length-prefixed framing
 // ---------------------------------------------------------------------------
 
-/// Result of attempting to decode a single length-prefixed frame.
-pub enum FrameDecode<'a> {
-    /// A complete frame was decoded.
-    Complete {
-        /// The payload bytes (without the length prefix).
-        payload: &'a [u8],
-        /// Total number of bytes consumed from the input (length prefix + payload).
-        consumed: usize,
-    },
-    /// Not enough bytes are buffered yet to decode a complete frame.
-    Incomplete,
-    /// The declared payload length exceeds [`MAX_MESSAGE_SIZE`].
-    TooLarge {
-        /// The declared payload length from the frame header.
-        len: u64,
-    },
-    /// The frame header is malformed.
-    Error(VarintError),
-}
+pub use minip2p_core::{FrameDecode, encode_frame};
 
 /// Attempts to decode one varint-length-prefixed frame from `input`.
 ///
@@ -352,40 +334,7 @@ pub enum FrameDecode<'a> {
 /// [`FrameDecode::TooLarge`], so callers never buffer towards a frame that
 /// can never legally complete.
 pub fn decode_frame(input: &[u8]) -> FrameDecode<'_> {
-    if input.is_empty() {
-        return FrameDecode::Incomplete;
-    }
-
-    let (length, used) = match read_uvarint(input) {
-        Ok(v) => v,
-        Err(VarintError::BufferTooShort) => return FrameDecode::Incomplete,
-        Err(e) => return FrameDecode::Error(e),
-    };
-
-    // Check the declared length as u64 BEFORE any usize conversion so the
-    // rejection is identical on 32-bit and 64-bit targets.
-    if length > MAX_MESSAGE_SIZE as u64 {
-        return FrameDecode::TooLarge { len: length };
-    }
-    // Cannot truncate: `length <= MAX_MESSAGE_SIZE` holds here.
-    let length = length as usize;
-    if length > input.len().saturating_sub(used) {
-        return FrameDecode::Incomplete;
-    }
-    let total = used + length;
-
-    FrameDecode::Complete {
-        payload: &input[used..total],
-        consumed: total,
-    }
-}
-
-/// Encodes `payload` with a varint length prefix.
-pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(uvarint_len(payload.len() as u64) + payload.len());
-    write_uvarint(payload.len() as u64, &mut out);
-    out.extend_from_slice(payload);
-    out
+    minip2p_core::decode_frame(input, MAX_MESSAGE_SIZE)
 }
 
 // ---------------------------------------------------------------------------
@@ -650,31 +599,25 @@ impl StopMessage {
 // Status name helper
 // ---------------------------------------------------------------------------
 
-impl Status {
-    /// Returns a human-readable name for this status.
-    pub fn as_name(&self) -> &'static str {
-        match self {
-            Status::Unused => "UNUSED",
-            Status::Ok => "OK",
-            Status::ReservationRefused => "RESERVATION_REFUSED",
-            Status::ResourceLimitExceeded => "RESOURCE_LIMIT_EXCEEDED",
-            Status::PermissionDenied => "PERMISSION_DENIED",
-            Status::ConnectionFailed => "CONNECTION_FAILED",
-            Status::NoReservation => "NO_RESERVATION",
-            Status::MalformedMessage => "MALFORMED_MESSAGE",
-            Status::UnexpectedMessage => "UNEXPECTED_MESSAGE",
-        }
-    }
-}
-
 /// Builds a human-readable description of a non-OK status response.
-pub fn describe_status(status: Status) -> String {
+pub(crate) fn describe_status(status: Status) -> String {
     use alloc::string::ToString;
     match status {
         Status::Ok => "OK".to_string(),
         other => {
             use alloc::format;
-            format!("{} ({})", other.as_name(), other as u16)
+            let name = match other {
+                Status::Unused => "UNUSED",
+                Status::Ok => "OK",
+                Status::ReservationRefused => "RESERVATION_REFUSED",
+                Status::ResourceLimitExceeded => "RESOURCE_LIMIT_EXCEEDED",
+                Status::PermissionDenied => "PERMISSION_DENIED",
+                Status::ConnectionFailed => "CONNECTION_FAILED",
+                Status::NoReservation => "NO_RESERVATION",
+                Status::MalformedMessage => "MALFORMED_MESSAGE",
+                Status::UnexpectedMessage => "UNEXPECTED_MESSAGE",
+            };
+            format!("{} ({})", name, other as u16)
         }
     }
 }
@@ -907,5 +850,126 @@ mod tests {
         // Should only contain the `data` field (tag 2, varint value 100).
         // Tag byte = (2 << 3) | 0 = 0x10
         assert_eq!(encoded, vec![0x10, 100]);
+    }
+}
+
+/// Golden equivalence tests for the varint-length-prefixed frame codec.
+///
+/// The fixed vectors pin the exact wire behavior of the codec this crate
+/// originally implemented locally; after consolidation into `minip2p-core`
+/// they exercise the shared codec through this crate's wrappers and must
+/// keep passing byte for byte.
+#[cfg(test)]
+mod frame_golden {
+    use super::*;
+
+    #[test]
+    fn golden_empty_payload() {
+        assert_eq!(encode_frame(&[]), [0x00]);
+        assert!(matches!(
+            decode_frame(&[0x00]),
+            FrameDecode::Complete { payload, consumed: 1 } if payload.is_empty()
+        ));
+    }
+
+    #[test]
+    fn golden_single_byte_payload() {
+        assert_eq!(encode_frame(b"\xab"), [0x01, 0xab]);
+        assert!(matches!(
+            decode_frame(&[0x01, 0xab]),
+            FrameDecode::Complete { payload, consumed: 2 } if payload == b"\xab"
+        ));
+    }
+
+    #[test]
+    fn golden_payload_at_max_len() {
+        let payload = vec![0x5au8; MAX_MESSAGE_SIZE];
+        let framed = encode_frame(&payload);
+        // 8192 as a minimal uvarint.
+        assert_eq!(framed[..2], [0x80, 0x40]);
+        assert_eq!(framed.len(), MAX_MESSAGE_SIZE + 2);
+        assert!(matches!(
+            decode_frame(&framed),
+            FrameDecode::Complete { payload: p, consumed }
+                if p == payload.as_slice() && consumed == MAX_MESSAGE_SIZE + 2
+        ));
+    }
+
+    #[test]
+    fn golden_declared_len_above_max_too_large() {
+        // 8193 as a minimal uvarint; rejected from the header alone.
+        assert!(matches!(
+            decode_frame(&[0x81, 0x40]),
+            FrameDecode::TooLarge { len } if u128::from(len) == 8193
+        ));
+    }
+
+    #[test]
+    fn golden_declared_len_u64_max_too_large() {
+        // u64::MAX as a 10-byte uvarint, followed by a garbage byte.
+        let input = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x22,
+        ];
+        assert!(matches!(
+            decode_frame(&input),
+            FrameDecode::TooLarge { len } if u128::from(len) == u128::from(u64::MAX)
+        ));
+    }
+
+    #[test]
+    fn golden_truncated_header_incomplete() {
+        assert!(matches!(decode_frame(&[]), FrameDecode::Incomplete));
+        // Continuation bit set with no following byte.
+        assert!(matches!(decode_frame(&[0x80]), FrameDecode::Incomplete));
+    }
+
+    #[test]
+    fn golden_truncated_payload_incomplete() {
+        // Declares 5 bytes, only 2 buffered.
+        assert!(matches!(
+            decode_frame(&[0x05, 0xaa, 0xbb]),
+            FrameDecode::Incomplete
+        ));
+        let framed = encode_frame(b"hello");
+        assert!(matches!(
+            decode_frame(&framed[..framed.len() - 1]),
+            FrameDecode::Incomplete
+        ));
+    }
+
+    #[test]
+    fn golden_oversized_varint_header_error() {
+        // Ten continuation bytes overflow u64 before the varint terminates.
+        assert!(matches!(
+            decode_frame(&[0xff; 10]),
+            FrameDecode::Error(VarintError::Overflow)
+        ));
+    }
+
+    #[test]
+    fn golden_non_minimal_length_rejected() {
+        // Length 1 encoded in two bytes ([0x81, 0x00]) is non-canonical.
+        assert!(matches!(
+            decode_frame(&[0x81, 0x00, 0xaa]),
+            FrameDecode::Error(VarintError::NonCanonical)
+        ));
+    }
+
+    #[test]
+    fn golden_multi_frame_consumed() {
+        let mut buf = encode_frame(b"first");
+        buf.extend_from_slice(&encode_frame(b"second"));
+        let consumed = match decode_frame(&buf) {
+            FrameDecode::Complete { payload, consumed } => {
+                assert_eq!(payload, b"first");
+                assert_eq!(consumed, 6);
+                consumed
+            }
+            _ => panic!("expected first frame"),
+        };
+        assert!(matches!(
+            decode_frame(&buf[consumed..]),
+            FrameDecode::Complete { payload, consumed: 7 } if payload == b"second"
+        ));
     }
 }

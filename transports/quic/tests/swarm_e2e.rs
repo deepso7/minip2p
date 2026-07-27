@@ -366,16 +366,14 @@ fn open_stream_fails_fast_when_peer_did_not_advertise_protocol() {
 /// that parses back into a valid QUIC transport multiaddr.
 ///
 /// This covers the prior behavior where `SwarmCore` passed an empty
-/// `observed_addr` byte vector into the Identify responder (the TODO at
-/// the former `crates/swarm/src/core.rs:982`). The fix plumbs the
-/// transport endpoint cached on `TransportEvent::Connected` /
+/// `observed_addr` byte vector into the Identify responder. The fix plumbs
+/// the transport endpoint cached on `TransportEvent::Connected` /
 /// `IncomingConnection` into `IdentifyInput::RegisterOutboundStream`.
 ///
-/// Note: we intentionally only assert the client-observed direction.
-/// The symmetric server-observed case requires the server to learn the
-/// client's real PeerId at handshake time so it can open its own Identify
-/// initiator stream -- that is the Milestone 6 mutual-TLS work and is not
-/// what this test covers.
+/// Note: we intentionally only assert the client-observed direction. The
+/// symmetric server-observed case (the server learning the client's PeerId
+/// via mutual TLS and opening its own Identify initiator stream) is not
+/// covered by this test.
 #[test]
 fn identify_exchange_carries_observed_addr() {
     let mut server = make_swarm(Ed25519Keypair::generate());

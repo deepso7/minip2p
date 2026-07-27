@@ -7,7 +7,6 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
-use minip2p_core::PeerId;
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, ConnectionState, StreamId, TransportError, TransportEvent,
 };
@@ -64,16 +63,6 @@ struct StreamRuntimeState {
 }
 
 impl StreamRuntimeState {
-    /// Marks the local write side as closed.
-    fn on_local_write_closed(&mut self) {
-        self.local_write_closed = true;
-    }
-
-    /// Marks the remote write side as closed.
-    fn on_remote_write_closed(&mut self) {
-        self.remote_write_closed = true;
-    }
-
     /// Returns true if both sides have closed their write side.
     fn is_fully_closed(&self) -> bool {
         self.local_write_closed && self.remote_write_closed
@@ -170,16 +159,12 @@ impl QuicConnection {
         self.conn.is_server()
     }
 
-    pub fn set_peer_id(&mut self, peer_id: PeerId) {
-        self.endpoint.set_peer_id(peer_id);
-    }
-
     pub fn is_closed(&self) -> bool {
         self.conn.is_closed()
     }
 
     /// Returns the duration until quiche next needs timer service.
-    pub fn timeout(&self) -> Option<Duration> {
+    pub(crate) fn timeout(&self) -> Option<Duration> {
         self.conn.timeout()
     }
 
@@ -429,7 +414,7 @@ impl QuicConnection {
             });
         }
 
-        state.on_local_write_closed();
+        state.local_write_closed = true;
         state.pending_writes.push_back(PendingStreamWrite::fin());
 
         self.drain_send_queue(events)?;
@@ -540,7 +525,7 @@ impl QuicConnection {
 
                         if fin {
                             if let Some(state) = self.stream_states.get_mut(&raw_stream_id) {
-                                state.on_remote_write_closed();
+                                state.remote_write_closed = true;
                             }
 
                             events.push(TransportEvent::StreamRemoteWriteClosed {

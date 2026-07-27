@@ -22,7 +22,5 @@ pub use events::{
     BeaconAction, BeaconEvent, DiscoveryAction, DiscoveryEvent, DiscoverySource, KnownPeer,
     Observation,
 };
-pub use message::{
-    Beacon, DISCOVERY_TOPIC, DiscoveryWireError, MAX_ADDR_LEN, MAX_BEACON_ADDRS, MAX_BEACON_SIZE,
-    MAX_PUBLIC_KEY_LEN, MAX_TOPIC_LEN,
-};
+pub use message::{Beacon, DISCOVERY_TOPIC, DiscoveryWireError, MAX_BEACON_ADDRS, MAX_BEACON_SIZE};
+pub(crate) use message::{MAX_ADDR_LEN, MAX_PUBLIC_KEY_LEN, MAX_TOPIC_LEN};

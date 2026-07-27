@@ -2,7 +2,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol, select_direct_candidates};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol, select_direct_addrs};
 use minip2p_dcutr::{DcutrInitiator, DcutrInitiatorInput, DcutrInitiatorOutput, InitiatorOutcome};
 use minip2p_relay::{
     ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopConnectInput, HopConnectOutput,
@@ -98,7 +98,7 @@ impl ConnectAttempt {
         let candidates = if shared.config.force_relay {
             Vec::new()
         } else {
-            select_direct_candidates(&direct_addrs, None, None).into_addrs()
+            select_direct_addrs(&direct_addrs, None, None)
         };
         let relay = allow_relay
             .then(|| shared.config.relays.first().cloned())

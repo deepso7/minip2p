@@ -241,6 +241,7 @@ impl FrameDecoder {
     }
 
     /// Returns unread buffered bytes, including a partial header or payload.
+    #[cfg(test)]
     pub fn buffered_len(&self) -> usize {
         self.buffer.len() - self.offset
     }

@@ -40,11 +40,6 @@ impl BeaconAgent {
         })
     }
 
-    /// Returns the identity advertised by this agent.
-    pub fn local_peer_id(&self) -> &PeerId {
-        &self.local_peer_id
-    }
-
     /// Returns the configured pubsub discovery topic.
     pub fn topic(&self) -> &str {
         &self.config.topic
@@ -190,25 +185,11 @@ fn normalize_addrs(from: &PeerId, raw: Vec<Vec<u8>>, cap: usize) -> Vec<Multiadd
 }
 
 pub(crate) fn is_supported_addr(addr: &Multiaddr) -> bool {
-    if is_wildcard_addr(addr) || addr.is_empty() {
+    if addr.is_wildcard_host() || addr.is_empty() {
         return false;
     }
-    if addr.is_quic_transport() {
-        return true;
-    }
 
-    let protocols = addr.protocols();
-    protocols.len() == 5
-        && protocols[0].is_host()
-        && matches!(protocols[1], Protocol::Udp(_))
-        && matches!(protocols[2], Protocol::QuicV1)
-        && matches!(protocols[3], Protocol::P2p(_))
-        && matches!(protocols[4], Protocol::P2pCircuit)
-}
-
-fn is_wildcard_addr(addr: &Multiaddr) -> bool {
-    matches!(addr.protocols().first(), Some(Protocol::Ip4(ip)) if *ip == [0, 0, 0, 0])
-        || matches!(addr.protocols().first(), Some(Protocol::Ip6(ip)) if *ip == [0; 16])
+    addr.is_quic_transport() || addr.is_relay_circuit_transport()
 }
 
 #[cfg(test)]
@@ -279,7 +260,7 @@ mod tests {
         let advertised = Multiaddr::from_bytes(&beacon.addrs[0]).unwrap();
         assert_eq!(
             advertised.protocols().last(),
-            Some(&Protocol::P2p(agent.local_peer_id().clone()))
+            Some(&Protocol::P2p(PeerId::from_public_key(&key(1))))
         );
     }
 

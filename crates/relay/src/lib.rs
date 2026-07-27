@@ -22,9 +22,10 @@ use alloc::vec::Vec;
 
 use minip2p_core::SansIoProtocol;
 
+pub(crate) use message::describe_status;
 pub use message::{
     FrameDecode, HopMessage, HopMessageType, Limit, Peer, RelayMessageError, Reservation, Status,
-    StopMessage, StopMessageType, decode_frame, describe_status, encode_frame,
+    StopMessage, StopMessageType, decode_frame, encode_frame,
 };
 
 /// Protocol id for the HOP subprotocol (client <-> relay).

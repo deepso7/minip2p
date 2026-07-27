@@ -61,11 +61,6 @@ impl PublicKey {
         &self.data
     }
 
-    /// Consumes the key and returns key bytes.
-    pub fn into_data(self) -> Vec<u8> {
-        self.data
-    }
-
     /// Encodes this key as deterministic protobuf bytes.
     ///
     /// Encoding order is fixed: field `Type` (tag 1), then `Data` (tag 2).
@@ -214,20 +209,7 @@ mod tests {
 
     #[cfg(feature = "ed25519")]
     use crate::Ed25519Keypair;
-
-    fn decode_hex(input: &str) -> Vec<u8> {
-        assert_eq!(input.len() % 2, 0);
-        let mut out = Vec::with_capacity(input.len() / 2);
-        let bytes = input.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            let hi = (bytes[i] as char).to_digit(16).expect("invalid hex") as u8;
-            let lo = (bytes[i + 1] as char).to_digit(16).expect("invalid hex") as u8;
-            out.push((hi << 4) | lo);
-            i += 2;
-        }
-        out
-    }
+    use crate::test_util::decode_hex;
 
     #[test]
     fn encodes_and_decodes_public_key_protobuf() {

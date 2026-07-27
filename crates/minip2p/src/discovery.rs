@@ -293,7 +293,8 @@ impl DiscoveryDriver {
         }
     }
 
-    /// Cancels all discovery-owned attempts before raw-swarm handoff.
+    /// Cancels all discovery-owned attempts during endpoint shutdown.
+    #[cfg(feature = "mdns")]
     pub(crate) fn shutdown(&mut self, nat: &mut NatDriver, swarm: &mut EndpointSwarm) {
         let attempts: Vec<ConnectId> = self.inflight.keys().copied().collect();
         for id in attempts {

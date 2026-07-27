@@ -147,9 +147,6 @@ pub enum IdentifyError {
     /// The peer already has an active identify exchange on this role.
     #[error("identify stream already registered for peer {peer_id}")]
     StreamAlreadyRegistered { peer_id: PeerId },
-    /// No outbound identify stream registered for this peer.
-    #[error("no outbound identify stream for peer {peer_id}")]
-    NoOutboundStream { peer_id: PeerId },
 }
 
 // ---------------------------------------------------------------------------
@@ -406,12 +403,6 @@ impl IdentifyProtocol {
             }
         }
     }
-
-    /// Drain buffered events.
-    #[cfg(test)]
-    fn poll_events(&mut self) -> Vec<IdentifyEvent> {
-        self.events.drain(..).collect()
-    }
 }
 
 impl SansIoProtocol for IdentifyProtocol {
@@ -517,6 +508,13 @@ fn decode_length_prefixed(buf: &[u8]) -> Result<&[u8], message::IdentifyMessageE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl IdentifyProtocol {
+        /// Drain buffered events (test helper).
+        fn poll_events(&mut self) -> Vec<IdentifyEvent> {
+            self.events.drain(..).collect()
+        }
+    }
 
     fn sample_config() -> IdentifyConfig {
         IdentifyConfig {

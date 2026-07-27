@@ -64,13 +64,6 @@ pub enum Path {
     },
 }
 
-impl Path {
-    /// Returns `true` for direct (dialed or punched) paths.
-    pub fn is_direct(&self) -> bool {
-        !matches!(self, Self::Relayed { .. })
-    }
-}
-
 /// Our current view of this node's reachability from the public internet.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReachabilityState {

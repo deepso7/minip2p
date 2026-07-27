@@ -8,19 +8,8 @@ use minip2p_core::{PeerAddr, Protocol};
 use minip2p_quic::{QuicEndpoint, QuicLimits, QuicNodeConfig, QuicTransport};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, TransportEvent};
 
-// ---------------------------------------------------------------------------
-// Helpers (shared with two_peer.rs; duplicated to keep test files independent)
-// ---------------------------------------------------------------------------
-
-fn setup_pair() -> (QuicTransport, QuicTransport, PeerAddr) {
-    let mut server = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server");
-    let client = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("client");
-
-    server.listen_on_bound_addr().expect("listen");
-    let peer_addr = server.local_peer_addr().expect("peer addr");
-
-    (server, client, peer_addr)
-}
+mod common;
+use common::{drive_pair_once, setup_pair};
 
 fn setup_pair_with_client_limits(limits: QuicLimits) -> (QuicTransport, QuicTransport, PeerAddr) {
     let mut server = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server");
@@ -52,16 +41,6 @@ fn dual_stack_endpoint_exposes_ipv4_and_ipv6_local_addresses() {
             .any(|addr| matches!(addr.protocols().first(), Some(Protocol::Ip6(_)))),
         "dual-stack endpoint should expose an IPv6 address: {addrs:?}"
     );
-}
-
-fn drive_pair_once(
-    server: &mut QuicTransport,
-    client: &mut QuicTransport,
-) -> (Vec<TransportEvent>, Vec<TransportEvent>) {
-    std::thread::sleep(std::time::Duration::from_millis(5));
-    let s = server.poll().expect("server poll");
-    let c = client.poll().expect("client poll");
-    (s, c)
 }
 
 /// Drives the pair until both sides report Connected, collecting all events.

@@ -11,3 +11,20 @@ wrapped transport IDs unchanged. Callers adopt HOP/STOP bridge streams with
 
 Default features enable OS entropy. Disable default features for
 `no_std + alloc` and provide an `EntropySource` explicitly.
+
+A custom source must fill the entire destination with cryptographically
+unpredictable bytes. If its backend fails, return `EntropyError::new(...)`
+rather than substitute predictable bytes:
+
+```rust,ignore
+use minip2p_circuit::{EntropyError, EntropySource};
+
+struct PlatformEntropy;
+
+impl EntropySource for PlatformEntropy {
+    fn fill(&mut self, destination: &mut [u8]) -> Result<(), EntropyError> {
+        platform_rng_fill(destination)
+            .map_err(|_| EntropyError::new("platform RNG unavailable"))
+    }
+}
+```

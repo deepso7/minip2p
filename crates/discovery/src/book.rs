@@ -178,11 +178,6 @@ impl PeerDiscoveryAgent {
         })
     }
 
-    /// Returns the local identity used by deterministic dial tie-breaking.
-    pub fn local_peer_id(&self) -> &PeerId {
-        &self.local_peer_id
-    }
-
     /// Incorporates an authenticated signed-beacon observation.
     ///
     /// An empty address list still creates or refreshes authenticated presence.

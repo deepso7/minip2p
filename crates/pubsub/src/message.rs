@@ -11,7 +11,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{PeerId, VarintError, read_uvarint, uvarint_len, write_uvarint};
+use minip2p_core::{PeerId, VarintError, read_uvarint, write_uvarint};
 use minip2p_identity::{Ed25519Keypair, PublicKey};
 
 /// Protocol id negotiated for floodsub RPC streams.
@@ -33,7 +33,7 @@ pub const MAX_TOPIC_LEN: usize = 1024;
 /// the format (go: 8 big-endian bytes, rust-libp2p floodsub: 20 random
 /// bytes), so the seqno is treated as opaque; the cap bounds what the
 /// seen-cache stores per message id.
-pub const MAX_SEQNO_LEN: usize = 64;
+pub(crate) const MAX_SEQNO_LEN: usize = 64;
 
 /// Domain-separation prefix for StrictSign signatures.
 const SIGN_PREFIX: &[u8] = b"libp2p-pubsub:";
@@ -125,8 +125,8 @@ pub struct SubOpts {
 /// the `Message` submessage; forwarding embeds `raw` verbatim so a relayed
 /// message reaches downstream verifiers byte-identical. The decoded fields
 /// are for local routing and verification only — verification re-encodes
-/// them canonically (see [`RawMessage::sign_bytes`]) rather than trusting
-/// `raw`, matching upstream libp2p behavior.
+/// them canonically (via the internal `RawMessage::sign_bytes`) rather than
+/// trusting `raw`, matching upstream libp2p behavior.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RawMessage {
     /// The exact wire encoding of this message submessage.
@@ -289,7 +289,7 @@ impl RawMessage {
     /// implementation *emits* duplicate field-4 entries in signed messages,
     /// so the rules only diverge on hand-crafted input — where including
     /// everything fails toward rejection, the safe direction.
-    pub fn sign_bytes(&self) -> Vec<u8> {
+    pub(crate) fn sign_bytes(&self) -> Vec<u8> {
         let body = self.encode_fields(false);
         let mut out = Vec::with_capacity(SIGN_PREFIX.len() + body.len());
         out.extend_from_slice(SIGN_PREFIX);
@@ -827,25 +827,7 @@ fn skip_unknown_field(input: &[u8], idx: &mut usize, wire_type: u8) -> Result<()
 // Length-prefixed framing
 // ---------------------------------------------------------------------------
 
-/// Result of attempting to decode a single length-prefixed RPC frame.
-pub enum FrameDecode<'a> {
-    /// A complete frame was decoded.
-    Complete {
-        /// The payload bytes (without the length prefix).
-        payload: &'a [u8],
-        /// Total bytes consumed from the input (prefix + payload).
-        consumed: usize,
-    },
-    /// Not enough bytes are buffered yet to decode a complete frame.
-    Incomplete,
-    /// The declared payload length exceeds [`MAX_RPC_SIZE`].
-    TooLarge {
-        /// The declared payload length from the frame header.
-        len: u64,
-    },
-    /// The frame header is malformed.
-    Error(VarintError),
-}
+pub use minip2p_core::FrameDecode;
 
 /// Attempts to decode one varint-length-prefixed frame from `input`.
 ///
@@ -854,32 +836,7 @@ pub enum FrameDecode<'a> {
 /// any buffering, so callers never buffer toward a frame that can never
 /// legally complete.
 pub fn decode_frame(input: &[u8]) -> FrameDecode<'_> {
-    if input.is_empty() {
-        return FrameDecode::Incomplete;
-    }
-
-    let (length, used) = match read_uvarint(input) {
-        Ok(v) => v,
-        Err(VarintError::BufferTooShort) => return FrameDecode::Incomplete,
-        Err(e) => return FrameDecode::Error(e),
-    };
-
-    // Check the declared length as u64 BEFORE any usize conversion so the
-    // rejection is identical on 32-bit and 64-bit targets.
-    if length > MAX_RPC_SIZE as u64 {
-        return FrameDecode::TooLarge { len: length };
-    }
-    // Cannot truncate: `length <= MAX_RPC_SIZE` holds here.
-    let length = length as usize;
-    if length > input.len().saturating_sub(used) {
-        return FrameDecode::Incomplete;
-    }
-    let total = used + length;
-
-    FrameDecode::Complete {
-        payload: &input[used..total],
-        consumed: total,
-    }
+    minip2p_core::decode_frame(input, MAX_RPC_SIZE)
 }
 
 /// Encodes `payload` with a varint length prefix.
@@ -893,10 +850,7 @@ pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
         payload.len() <= MAX_RPC_SIZE,
         "frame payload exceeds MAX_RPC_SIZE"
     );
-    let mut out = Vec::with_capacity(uvarint_len(payload.len() as u64) + payload.len());
-    write_uvarint(payload.len() as u64, &mut out);
-    out.extend_from_slice(payload);
-    out
+    minip2p_core::encode_frame(payload)
 }
 
 #[cfg(test)]
@@ -1410,5 +1364,127 @@ mod tests {
             "unknown fields are not part of the canonical sign bytes"
         );
         assert_eq!(decoded.to_wire(), wire, "forwarding embeds raw verbatim");
+    }
+}
+
+/// Golden equivalence tests for the varint-length-prefixed frame codec.
+///
+/// The fixed vectors pin the exact wire behavior of the codec this crate
+/// originally implemented locally; after consolidation into `minip2p-core`
+/// they exercise the shared codec through this crate's wrappers and must
+/// keep passing byte for byte.
+#[cfg(test)]
+mod frame_golden {
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn golden_empty_payload() {
+        assert_eq!(encode_frame(&[]), [0x00]);
+        assert!(matches!(
+            decode_frame(&[0x00]),
+            FrameDecode::Complete { payload, consumed: 1 } if payload.is_empty()
+        ));
+    }
+
+    #[test]
+    fn golden_single_byte_payload() {
+        assert_eq!(encode_frame(b"\xab"), [0x01, 0xab]);
+        assert!(matches!(
+            decode_frame(&[0x01, 0xab]),
+            FrameDecode::Complete { payload, consumed: 2 } if payload == b"\xab"
+        ));
+    }
+
+    #[test]
+    fn golden_payload_at_max_len() {
+        let payload = vec![0x5au8; MAX_RPC_SIZE];
+        let framed = encode_frame(&payload);
+        // 65536 as a minimal uvarint.
+        assert_eq!(framed[..3], [0x80, 0x80, 0x04]);
+        assert_eq!(framed.len(), MAX_RPC_SIZE + 3);
+        assert!(matches!(
+            decode_frame(&framed),
+            FrameDecode::Complete { payload: p, consumed }
+                if p == payload.as_slice() && consumed == MAX_RPC_SIZE + 3
+        ));
+    }
+
+    #[test]
+    fn golden_declared_len_above_max_too_large() {
+        // 65537 as a minimal uvarint; rejected from the header alone.
+        assert!(matches!(
+            decode_frame(&[0x81, 0x80, 0x04]),
+            FrameDecode::TooLarge { len } if u128::from(len) == 65537
+        ));
+    }
+
+    #[test]
+    fn golden_declared_len_u64_max_too_large() {
+        // u64::MAX as a 10-byte uvarint, followed by a garbage byte.
+        let input = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x22,
+        ];
+        assert!(matches!(
+            decode_frame(&input),
+            FrameDecode::TooLarge { len } if u128::from(len) == u128::from(u64::MAX)
+        ));
+    }
+
+    #[test]
+    fn golden_truncated_header_incomplete() {
+        assert!(matches!(decode_frame(&[]), FrameDecode::Incomplete));
+        // Continuation bit set with no following byte.
+        assert!(matches!(decode_frame(&[0x80]), FrameDecode::Incomplete));
+    }
+
+    #[test]
+    fn golden_truncated_payload_incomplete() {
+        // Declares 5 bytes, only 2 buffered.
+        assert!(matches!(
+            decode_frame(&[0x05, 0xaa, 0xbb]),
+            FrameDecode::Incomplete
+        ));
+        let framed = encode_frame(b"hello");
+        assert!(matches!(
+            decode_frame(&framed[..framed.len() - 1]),
+            FrameDecode::Incomplete
+        ));
+    }
+
+    #[test]
+    fn golden_oversized_varint_header_error() {
+        // Ten continuation bytes overflow u64 before the varint terminates.
+        assert!(matches!(
+            decode_frame(&[0xff; 10]),
+            FrameDecode::Error(VarintError::Overflow)
+        ));
+    }
+
+    #[test]
+    fn golden_non_minimal_length_rejected() {
+        // Length 1 encoded in two bytes ([0x81, 0x00]) is non-canonical.
+        assert!(matches!(
+            decode_frame(&[0x81, 0x00, 0xaa]),
+            FrameDecode::Error(VarintError::NonCanonical)
+        ));
+    }
+
+    #[test]
+    fn golden_multi_frame_consumed() {
+        let mut buf = encode_frame(b"first");
+        buf.extend_from_slice(&encode_frame(b"second"));
+        let consumed = match decode_frame(&buf) {
+            FrameDecode::Complete { payload, consumed } => {
+                assert_eq!(payload, b"first");
+                assert_eq!(consumed, 6);
+                consumed
+            }
+            _ => panic!("expected first frame"),
+        };
+        assert!(matches!(
+            decode_frame(&buf[consumed..]),
+            FrameDecode::Complete { payload, consumed: 7 } if payload == b"second"
+        ));
     }
 }

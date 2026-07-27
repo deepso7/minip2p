@@ -10,7 +10,8 @@
 mod cli;
 mod modes;
 
-use cli::{CliError, Mode};
+use cli::Mode;
+use minip2p_example_common::CliError;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

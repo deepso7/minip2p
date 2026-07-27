@@ -14,7 +14,7 @@
 
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId, Protocol, SansIoProtocol, select_direct_candidates};
+use minip2p_core::{Multiaddr, PeerId, Protocol, SansIoProtocol, select_direct_addrs};
 use minip2p_dcutr::{DcutrResponder, DcutrResponderInput, DcutrResponderOutput, ResponderEvent};
 use minip2p_relay::{Status, StopResponder, StopResponderInput, StopResponderOutput};
 use minip2p_transport::{ConnectionId, StreamId};
@@ -498,8 +498,7 @@ impl InboundCircuit {
 /// NAT agent into an SSRF primitive. Keep only strict QUIC-v1 addresses whose
 /// first component is a globally routable unicast IP.
 pub(crate) fn select_global_punch_candidates(addrs: &[Multiaddr]) -> Vec<Multiaddr> {
-    select_direct_candidates(addrs, None, None)
-        .into_addrs()
+    select_direct_addrs(addrs, None, None)
         .into_iter()
         .filter(is_global_unicast_quic)
         .collect()

@@ -44,20 +44,11 @@ impl ConnectionEndpoint {
         self.peer_id = Some(peer_id);
     }
 
-    /// Removes the peer identity.
-    pub fn clear_peer_id(&mut self) {
-        self.peer_id = None;
-    }
-
     /// Converts to a [`PeerAddr`], returning `None` if no peer id is set.
+    #[cfg(test)]
     pub fn to_peer_addr(&self) -> Option<PeerAddr> {
         let peer_id = self.peer_id.as_ref()?.clone();
         PeerAddr::new(self.transport.clone(), peer_id).ok()
-    }
-
-    /// Consumes this value and returns the transport address and optional peer id.
-    pub fn into_parts(self) -> (Multiaddr, Option<PeerId>) {
-        (self.transport, self.peer_id)
     }
 }
 

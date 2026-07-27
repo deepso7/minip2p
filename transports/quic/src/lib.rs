@@ -867,42 +867,6 @@ impl QuicTransport {
             .unwrap_or_default()
     }
 
-    /// Binds a peer identity to a connection, emitting a `PeerIdentityVerified` event.
-    pub fn verify_connection_peer_id(
-        &mut self,
-        id: ConnectionId,
-        peer_id: PeerId,
-    ) -> Result<(), TransportError> {
-        let (previous_peer_id, endpoint) = {
-            let conn = self
-                .connections
-                .get_mut(&id)
-                .ok_or(TransportError::ConnectionNotFound { id })?;
-
-            let previous_peer_id = conn.endpoint().peer_id().cloned();
-            if previous_peer_id.as_ref() == Some(&peer_id) {
-                return Ok(());
-            }
-
-            conn.set_peer_id(peer_id.clone());
-            (previous_peer_id, conn.endpoint().clone())
-        };
-
-        if let Some(previous) = previous_peer_id.as_ref() {
-            self.remove_peer_connection(previous, id);
-        }
-
-        self.index_peer_connection(peer_id, id);
-        self.pending_events
-            .push(TransportEvent::PeerIdentityVerified {
-                id,
-                endpoint,
-                previous_peer_id,
-            });
-
-        Ok(())
-    }
-
     /// Allocates the next unused connection id, skipping 0 and wrapping on overflow.
     fn allocate_connection_id(&mut self) -> Result<ConnectionId, TransportError> {
         let start = self.next_connection_id;

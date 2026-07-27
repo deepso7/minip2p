@@ -32,10 +32,6 @@ pub enum TlsError {
     #[error("DER encoding/decoding error: {0}")]
     Der(String),
 
-    /// The expected PeerId does not match the one derived from the certificate.
-    #[error("peer id mismatch: expected {expected}, got {actual}")]
-    PeerIdMismatch { expected: String, actual: String },
-
     /// Certificate generation failed.
     #[error("certificate generation failed: {0}")]
     CertificateGeneration(String),

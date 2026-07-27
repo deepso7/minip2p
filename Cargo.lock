@@ -969,7 +969,6 @@ dependencies = [
  "getrandom",
  "hmac",
  "minip2p-core",
- "minip2p-identify",
  "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-ping",

@@ -8,8 +8,53 @@ use std::fs;
 use std::io::Write as _;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path as FsPath;
+use std::process::Child;
 
 use minip2p::{Ed25519Keypair, Multiaddr, NatEvent, Path, PeerAddr, PeerId, Protocol};
+
+/// CLI parse error surfaced back to the examples' `main` so the binary
+/// exits with a readable message rather than a panic.
+#[derive(Clone, Debug)]
+pub struct CliError(pub String);
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CliError {}
+
+/// Returns the value following the flag at index `i`, or a "requires a
+/// value" [`CliError`] naming `key`.
+pub fn flag_value<'a>(args: &'a [String], i: usize, key: &str) -> Result<&'a String, CliError> {
+    args.get(i + 1)
+        .ok_or_else(|| CliError(format!("flag '{key}' requires a value")))
+}
+
+/// Rejects peer addresses the endpoint could never dial: everything the
+/// examples connect to is QUIC, and catching the shape here turns an
+/// asynchronous dial failure into an immediate input error.
+pub fn require_quic_transport(what: &str, raw: &str, addr: &PeerAddr) -> Result<(), CliError> {
+    if addr.transport().is_quic_transport() {
+        Ok(())
+    } else {
+        Err(CliError(format!(
+            "{what} must be on a /ip4|ip6|dns|dns4|dns6/<host>/udp/<port>/quic-v1 transport, got '{raw}'"
+        )))
+    }
+}
+
+/// Child process that is killed on drop so a panicking test assertion
+/// doesn't leak a bound UDP socket.
+pub struct KillOnDrop(pub Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 /// Raw Ed25519 secret length; `Ed25519Keypair::from_secret_key_bytes`
 /// enforces it at compile time via the array parameter.

@@ -134,6 +134,7 @@ impl MultistreamSelect {
     }
 
     /// Returns `true` if negotiation has completed (successfully or with an error).
+    #[cfg(test)]
     pub fn is_done(&self) -> bool {
         self.state == State::Done
     }

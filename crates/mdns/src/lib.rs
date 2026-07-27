@@ -17,10 +17,7 @@ mod socket;
 
 pub use agent::MdnsAgent;
 pub use config::{MdnsConfig, MdnsConfigError};
-pub use dns::{
-    CLASS_IN, DnsCodecError, DnsMessage, DnsQuestion, DnsRecord, DnsRecordData,
-    MDNS_MAX_DECODE_BYTES, META_QUERY_NAME, SERVICE_NAME, TYPE_PTR, TYPE_TXT,
-};
+pub use dns::{DnsCodecError, DnsMessage, DnsQuestion, DnsRecord, DnsRecordData};
 pub use events::{
     InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAction, MdnsEvent, MdnsTarget,
 };

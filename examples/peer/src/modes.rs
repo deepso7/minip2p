@@ -86,19 +86,13 @@ fn decode_frame(frame: &[u8; FRAME_LEN]) -> (u64, u64) {
 
 /// Reassembles fixed-size frames out of a QUIC byte stream: the transport
 /// may fragment or coalesce writes arbitrarily.
+#[derive(Default)]
 struct FrameBuf {
     buf: Vec<u8>,
     head: usize,
 }
 
 impl FrameBuf {
-    fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            head: 0,
-        }
-    }
-
     fn push(&mut self, data: &[u8]) {
         // Compact at most once per transport chunk. Draining from the front
         // for every 16-byte frame would repeatedly shift the unread suffix.
@@ -300,6 +294,7 @@ impl RttBucket {
     }
 }
 
+#[derive(Default)]
 struct PingStats {
     sent: u64,
     received: u64,
@@ -308,15 +303,6 @@ struct PingStats {
 }
 
 impl PingStats {
-    fn new() -> Self {
-        Self {
-            sent: 0,
-            received: 0,
-            relayed: RttBucket::default(),
-            direct: RttBucket::default(),
-        }
-    }
-
     fn print_summary(&self) {
         println!(
             "[dial] summary sent={} received={} relayed-count={} relayed-avg-rtt={}ms \
@@ -393,7 +379,7 @@ pub fn run_dial(
     );
 
     let relayed = matches!(path, Path::Relayed { .. });
-    let frames = FrameBuf::new();
+    let frames = FrameBuf::default();
     let mut channel =
         establish_direct_channel(&mut endpoint, &peer, &BTreeSet::new(), None, start)?;
     channel.direct = !relayed;
@@ -524,7 +510,7 @@ fn ping_loop(
     count: Option<u64>,
     start: Instant,
 ) -> Result<(), Box<dyn Error>> {
-    let mut stats = PingStats::new();
+    let mut stats = PingStats::default();
     let mut outstanding: BTreeSet<u64> = BTreeSet::new();
     let mut seq: u64 = 0;
     let mut next_ping = Instant::now();
@@ -738,7 +724,7 @@ mod tests {
             input.extend_from_slice(&encode_frame(seq, seq + 1));
         }
 
-        let mut buffer = FrameBuf::new();
+        let mut buffer = FrameBuf::default();
         buffer.push(&input);
         for expected in 0..frames - 1 {
             let frame = buffer.pop().expect("complete coalesced frame");

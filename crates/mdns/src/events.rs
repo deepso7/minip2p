@@ -14,11 +14,6 @@ impl InterfaceId {
     pub const fn new(value: u32) -> Self {
         Self(value)
     }
-
-    /// Returns the numeric handle for diagnostics and adapter bookkeeping.
-    pub const fn get(self) -> u32 {
-        self.0
-    }
 }
 
 /// IP address family represented by an [`InterfaceId`].

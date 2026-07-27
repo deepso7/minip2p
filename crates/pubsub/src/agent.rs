@@ -182,14 +182,10 @@ impl FloodsubAgent {
         }
     }
 
-    /// The peer id this agent publishes as.
+    /// The peer id this agent publishes as. Exposed for test support.
+    #[doc(hidden)]
     pub fn local_peer_id(&self) -> &PeerId {
         &self.local_peer_id
-    }
-
-    /// Our current subscriptions.
-    pub fn subscriptions(&self) -> Vec<String> {
-        self.topics.iter().cloned().collect()
     }
 
     /// Subscribes to `topic`. Returns `Ok(false)` when already subscribed.

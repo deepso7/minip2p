@@ -50,13 +50,6 @@ impl Multiaddr {
         self.protocols.is_empty()
     }
 
-    /// Returns `true` if any component is `/quic-v1`.
-    pub fn has_quic_v1(&self) -> bool {
-        self.protocols
-            .iter()
-            .any(|protocol| matches!(protocol, Protocol::QuicV1))
-    }
-
     /// Returns the first `/p2p` peer id, if present.
     pub fn peer_id(&self) -> Option<&PeerId> {
         self.protocols.iter().find_map(|protocol| match protocol {
@@ -95,6 +88,35 @@ impl Multiaddr {
     /// Returns `true` if this is a valid QUIC transport address (host + udp + quic-v1).
     pub fn is_quic_transport(&self) -> bool {
         is_quic_transport_slice(&self.protocols)
+    }
+
+    /// Returns `true` if the first component is a wildcard IP host
+    /// (`/ip4/0.0.0.0` or `/ip6/::`).
+    ///
+    /// Wildcard hosts are valid bind addresses but are not dialable, so
+    /// address candidates and advertisements typically filter them out.
+    pub fn is_wildcard_host(&self) -> bool {
+        match self.protocols.first() {
+            Some(Protocol::Ip4(bytes)) => *bytes == [0; 4],
+            Some(Protocol::Ip6(bytes)) => *bytes == [0; 16],
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if this is a relay circuit transport address:
+    /// exactly host + udp + quic-v1 + `/p2p/<relay>` + `/p2p-circuit`.
+    ///
+    /// This is the shape produced by relay reservations: the QUIC
+    /// address of the relay, the relay's peer id, and the circuit
+    /// marker. Anything longer or shorter (including a direct QUIC
+    /// address) returns `false`.
+    pub fn is_relay_circuit_transport(&self) -> bool {
+        self.protocols.len() == 5
+            && self.protocols[0].is_host()
+            && matches!(self.protocols[1], Protocol::Udp(_))
+            && matches!(self.protocols[2], Protocol::QuicV1)
+            && matches!(self.protocols[3], Protocol::P2p(_))
+            && matches!(self.protocols[4], Protocol::P2pCircuit)
     }
 
     /// Encodes this multiaddr to its binary multicodec wire form.
@@ -348,6 +370,40 @@ mod tests {
             parsed.peer_id().expect("peer id should exist").to_string(),
             PEER_ID
         );
+    }
+
+    #[test]
+    fn detects_relay_circuit_transport_shape() {
+        for host in [
+            "/ip4/203.0.113.7",
+            "/ip6/2001:db8::1",
+            "/dns4/relay.example.com",
+        ] {
+            let input = format!("{host}/udp/4001/quic-v1/p2p/{PEER_ID}/p2p-circuit");
+            let parsed = Multiaddr::from_str(&input).expect("must parse");
+            assert!(parsed.is_relay_circuit_transport(), "{input}");
+        }
+    }
+
+    #[test]
+    fn rejects_non_circuit_transport_shapes() {
+        let near_misses = [
+            // Direct QUIC address, no relay suffix.
+            "/ip4/203.0.113.7/udp/4001/quic-v1".to_string(),
+            // Relay address without the circuit marker.
+            format!("/ip4/203.0.113.7/udp/4001/quic-v1/p2p/{PEER_ID}"),
+            // Circuit marker without the relay peer id (four components).
+            "/ip4/203.0.113.7/udp/4001/quic-v1/p2p-circuit".to_string(),
+            // Circuit marker before the relay peer id (five components, wrong order).
+            format!("/ip4/203.0.113.7/udp/4001/quic-v1/p2p-circuit/p2p/{PEER_ID}"),
+            // Destination peer appended after the circuit marker (six components).
+            format!("/ip4/203.0.113.7/udp/4001/quic-v1/p2p/{PEER_ID}/p2p-circuit/p2p/{PEER_ID}"),
+        ];
+        for input in near_misses {
+            let parsed = Multiaddr::from_str(&input).expect("must parse");
+            assert!(!parsed.is_relay_circuit_transport(), "{input}");
+        }
+        assert!(!Multiaddr::default().is_relay_circuit_transport());
     }
 
     #[test]

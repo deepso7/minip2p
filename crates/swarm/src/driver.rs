@@ -13,7 +13,7 @@ use minip2p_identify::{IdentifyConfig, IdentifyMessage};
 use minip2p_ping::{PING_PAYLOAD_LEN, PingConfig};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, WaitOutcome};
 
-use crate::core::{SwarmCore, stream_event_matches};
+use crate::core::SwarmCore;
 use crate::events::{
     SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput, SwarmRuntimeError,
 };
@@ -44,6 +44,9 @@ pub enum DriverError {
         "run_until skipped {limit} events without a match; drain the event buffer with poll_next"
     )]
     EventBacklogExceeded { limit: usize },
+    /// The operating system's entropy source failed.
+    #[error("system entropy source failed")]
+    Entropy,
 }
 
 /// Fallback sleep cadence when [`Swarm::poll_next`] idles over a transport
@@ -86,11 +89,6 @@ impl Deadline {
     /// Wait indefinitely; the call returns only when an event arrives (or,
     /// for `run_until`, when the predicate matches).
     pub const NEVER: Deadline = Deadline(None);
-
-    /// Absolute deadline. Equivalent to `Deadline::from(instant)`.
-    pub fn at(instant: Instant) -> Self {
-        Deadline(Some(instant))
-    }
 
     /// Whether the deadline has already passed. [`Deadline::NEVER`] never
     /// passes.
@@ -381,7 +379,7 @@ impl<T: Transport> Swarm<T> {
     /// fires when the stream becomes ready. The resulting RTT is delivered
     /// via [`SwarmEvent::PingRttMeasured`] on the next `poll()`.
     pub fn ping(&mut self, peer_id: &PeerId) -> Result<(), DriverError> {
-        let payload = rand_ping_payload();
+        let payload = rand_ping_payload()?;
         self.core.ping(peer_id, payload, self.now_ms())?;
         self.flush_actions();
         Ok(())
@@ -415,8 +413,7 @@ impl<T: Transport> Swarm<T> {
 
         // The core emits a Pending OpenStream action; we drain it now so
         // the transport.open_stream call happens synchronously and we can
-        // return the allocated StreamId to the caller (for DX symmetry
-        // with the previous API).
+        // return the allocated StreamId to the caller.
         self.core.open_stream(peer_id, protocol_id)?;
 
         // Flush all actions, capturing the stream id allocated for this
@@ -548,7 +545,7 @@ impl<T: Transport> Swarm<T> {
     ) -> Result<(), DriverError> {
         let result = self.core.abandon_stream(peer_id, stream_id);
         self.event_buffer
-            .retain(|event| !stream_event_matches(event, peer_id, stream_id));
+            .retain(|event| !event.matches_stream(peer_id, stream_id));
         result?;
         self.flush_actions();
         Ok(())
@@ -911,25 +908,23 @@ fn runtime_error(
     }
 }
 
-/// Generates a random 32-byte ping payload using OS randomness, falling
-/// back to a deterministic-but-non-repeating pattern seeded from the wall
-/// clock if the CSPRNG is unavailable.
-fn rand_ping_payload() -> [u8; PING_PAYLOAD_LEN] {
-    use std::time::{SystemTime, UNIX_EPOCH};
+/// Generates a random 32-byte ping payload using OS randomness.
+///
+/// Fails with [`DriverError::Entropy`] if the CSPRNG is unavailable; a
+/// predictable fallback payload would silently weaken the ping nonce.
+fn rand_ping_payload() -> Result<[u8; PING_PAYLOAD_LEN], DriverError> {
+    ping_payload_from(|buf| getrandom::fill(buf).map_err(|_| ()))
+}
 
+/// Builds the ping payload from `fill`, mapping failure to
+/// [`DriverError::Entropy`]. Split out so tests can exercise the failure
+/// path without faking the OS RNG.
+fn ping_payload_from(
+    fill: impl FnOnce(&mut [u8]) -> Result<(), ()>,
+) -> Result<[u8; PING_PAYLOAD_LEN], DriverError> {
     let mut payload = [0u8; PING_PAYLOAD_LEN];
-    if getrandom::fill(&mut payload).is_ok() {
-        return payload;
-    }
-
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    for (i, byte) in payload.iter_mut().enumerate() {
-        *byte = ((seed >> (i % 8)) as u8) ^ (i as u8);
-    }
-    payload
+    fill(&mut payload).map_err(|_| DriverError::Entropy)?;
+    Ok(payload)
 }
 
 #[cfg(test)]
@@ -944,6 +939,24 @@ mod tests {
     use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, MultistreamSelect};
     use minip2p_ping::PING_PROTOCOL_ID;
     use minip2p_transport::{ConnectionEndpoint, TransportEvent};
+
+    #[test]
+    fn ping_payload_entropy_failure_is_an_error() {
+        assert!(matches!(
+            ping_payload_from(|_| Err(())),
+            Err(DriverError::Entropy)
+        ));
+    }
+
+    #[test]
+    fn ping_payload_returns_filled_bytes() {
+        let payload = ping_payload_from(|buf| {
+            buf.fill(0xAB);
+            Ok(())
+        })
+        .expect("fill succeeds");
+        assert_eq!(payload, [0xAB; PING_PAYLOAD_LEN]);
+    }
 
     /// Transport that never produces events; counts `poll()` calls so tests
     /// can assert how often an expired wait touches the transport.
@@ -1295,7 +1308,7 @@ mod tests {
         assert_eq!(Deadline::NEVER.remaining_at(Instant::now()), None);
 
         // An Instant behaves as an absolute deadline.
-        let past = Deadline::at(Instant::now());
+        let past = Deadline::from(Instant::now());
         assert!(past.is_expired_at(Instant::now() + Duration::from_millis(1)));
     }
 

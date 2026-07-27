@@ -90,26 +90,9 @@ impl PubsubAgent {
                 entropy_seed,
             )),
             PubsubConfig::Floodsub(config) => {
-                let _ = entropy_seed;
                 Self::Floodsub(FloodsubAgent::new(keypair, config, initial_seqno))
             }
         })
-    }
-
-    /// The peer id this agent publishes as.
-    pub fn local_peer_id(&self) -> &PeerId {
-        match self {
-            Self::Gossipsub(agent) => agent.local_peer_id(),
-            Self::Floodsub(agent) => agent.local_peer_id(),
-        }
-    }
-
-    /// Our current subscriptions.
-    pub fn subscriptions(&self) -> Vec<String> {
-        match self {
-            Self::Gossipsub(agent) => agent.subscriptions(),
-            Self::Floodsub(agent) => agent.subscriptions(),
-        }
     }
 
     /// Subscribes to a topic.
@@ -202,14 +185,6 @@ impl PubsubAgent {
         match self {
             Self::Gossipsub(agent) => agent.poll_event(),
             Self::Floodsub(agent) => agent.poll_event(),
-        }
-    }
-
-    /// Whether this engine owns a stream lifecycle.
-    pub fn owns_stream(&self, peer: &PeerId, stream_id: StreamId) -> bool {
-        match self {
-            Self::Gossipsub(agent) => agent.owns_stream(peer, stream_id),
-            Self::Floodsub(agent) => agent.owns_stream(peer, stream_id),
         }
     }
 }

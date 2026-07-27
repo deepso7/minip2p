@@ -61,7 +61,7 @@ impl HandshakeState {
             local_ephemeral,
             remote_ephemeral: None,
             expected_peer,
-            symmetric: SymmetricState::new(),
+            symmetric: SymmetricState::with_prologue(b""),
         }
     }
 
@@ -238,10 +238,6 @@ struct SymmetricState {
 }
 
 impl SymmetricState {
-    fn new() -> Self {
-        Self::with_prologue(b"")
-    }
-
     fn with_prologue(prologue: &[u8]) -> Self {
         let mut initial = [0u8; 32];
         if PROTOCOL_NAME.len() <= initial.len() {
