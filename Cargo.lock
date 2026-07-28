@@ -1123,6 +1123,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "minip2p-platform"
+version = "0.2.0"
+dependencies = [
+ "getrandom",
+ "thiserror",
+]
+
+[[package]]
 name = "minip2p-pubsub"
 version = "0.3.1"
 dependencies = [

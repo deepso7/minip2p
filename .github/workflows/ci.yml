@@ -29,7 +29,7 @@ jobs:
           version: "11.10.0"
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.88"
+          toolchain: "1.91"
       - run: pnpm install --frozen-lockfile
         working-directory: docs
       - run: pnpm run check
@@ -58,7 +58,7 @@ jobs:
       - run: cargo clippy -p minip2p-rs --features mdns --all-targets -- -D warnings
       - run: cargo clippy -p minip2p-rs --features discovery,mdns --all-targets -- -D warnings
       - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
-      - run: cargo check --no-default-features --target thumbv7em-none-eabi -p minip2p-core -p minip2p-identity -p minip2p-transport -p minip2p-tls -p minip2p-noise -p minip2p-yamux -p minip2p-circuit -p minip2p-identify -p minip2p-multistream-select -p minip2p-ping -p minip2p-pubsub -p minip2p-discovery -p minip2p-mdns -p minip2p-relay -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm -p minip2p-nat
+      - run: cargo check --no-default-features --target thumbv7em-none-eabi -p minip2p-core -p minip2p-platform -p minip2p-identity -p minip2p-transport -p minip2p-tls -p minip2p-noise -p minip2p-yamux -p minip2p-circuit -p minip2p-identify -p minip2p-multistream-select -p minip2p-ping -p minip2p-pubsub -p minip2p-discovery -p minip2p-mdns -p minip2p-relay -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm -p minip2p-nat
       - run: cargo test --workspace
       - run: cargo test -p minip2p-rs --features nat
       - run: cargo test -p minip2p-rs --features pubsub
@@ -73,9 +73,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable # 1.88 (workspace rust-version) via the toolchain input
+      - uses: dtolnay/rust-toolchain@stable # 1.91 (workspace rust-version) via the toolchain input
         with:
-          toolchain: "1.88"
+          toolchain: "1.91"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
 

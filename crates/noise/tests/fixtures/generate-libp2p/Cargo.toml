@@ -4,7 +4,7 @@
 name = "generate-libp2p-noise-fixture"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.91"
 publish = false
 
 [dependencies]
