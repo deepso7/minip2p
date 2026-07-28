@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use minip2p::{EndpointWake, Error, NatEvent};
 
-use crate::endpoint::{Lifecycle, Shared};
+use crate::endpoint::{EndpointState, Lifecycle, Shared};
 use crate::events::{convert_discovery, convert_nat, convert_pubsub, convert_swarm};
 use crate::{DriverFailureKind, P2pEvent, P2pEventListener};
 
@@ -174,6 +174,7 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             state.stats.dropped = state.stats.dropped.saturating_add(carry.len() as u64);
             return Ok(());
         }
+        service_keepalive(&mut state, &mut next_keepalive_at);
         if !carry.is_empty() || overflow.pending != 0 {
             let cancelled = carry.suppress_cancelled(&state.cancelled_connect_ids);
             state.stats.dropped = state.stats.dropped.saturating_add(cancelled as u64);
@@ -187,6 +188,7 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             for event in delivery.batch {
                 let should_dispatch = {
                     let mut state = guard.shared.lock_state();
+                    service_keepalive(&mut state, &mut next_keepalive_at);
                     let cancelled = p2p_connect_id(&event)
                         .is_some_and(|id| state.cancelled_connect_ids.contains(&id));
                     record_source_dispatch(cancelled, &mut state.stats)
@@ -209,15 +211,6 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             ..
         } = &mut *state;
         let endpoint = endpoint.as_mut().expect("running endpoint exists");
-        if Instant::now() >= next_keepalive_at {
-            advance_keepalive_deadline(&mut next_keepalive_at, Instant::now());
-            let peers = endpoint.connected_peers();
-            for peer in keepalive_targets(&peers) {
-                // A peer may disconnect between the snapshot and ping.
-                // Its close/timeout event is the authoritative signal.
-                let _ = endpoint.ping(peer);
-            }
-        }
         let wake = endpoint.next_wake(deadline)?;
         if matches!(wake, EndpointWake::Interrupted) {
             drop(state);
@@ -268,6 +261,23 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         );
         stats.carry_high_water = stats.carry_high_water.max(carry.len());
         stats.iterations = stats.iterations.saturating_add(1);
+    }
+}
+
+fn service_keepalive(state: &mut EndpointState, next_at: &mut Instant) {
+    let now = Instant::now();
+    if now < *next_at {
+        return;
+    }
+    advance_keepalive_deadline(next_at, now);
+    let Some(endpoint) = state.endpoint.as_mut() else {
+        return;
+    };
+    let peers = endpoint.connected_peers();
+    for peer in keepalive_targets(&peers) {
+        // A peer may disconnect between the snapshot and ping. Its
+        // close/timeout event is the authoritative signal.
+        let _ = endpoint.ping(peer);
     }
 }
 

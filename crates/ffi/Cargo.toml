@@ -22,3 +22,7 @@ minip2p-pubsub = { path = "../pubsub" }
 thiserror = "2.0.18"
 # Must remain paired with ubrn and @ubjs/core 0.31.0-3.
 uniffi = "=0.31.0"
+
+[dev-dependencies]
+minip2p-relay = { path = "../relay" }
+minip2p-test-support = { path = "../test-support" }

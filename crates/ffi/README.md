@@ -34,7 +34,10 @@ The native driver owns connection keepalive. Every 10 seconds it pings every
 currently connected peer, keeping quiet connections inside QUIC's default
 30-second idle timeout. Successful replies and timeouts surface normally as
 `PingRttMeasured` and `PingTimeout` events; hosts should not run a second
-keepalive loop.
+keepalive loop. Keepalive is serviced between callback deliveries while
+draining a backlog. One listener callback that blocks for roughly the entire
+QUIC idle window can still cause connection loss, so callbacks must return
+promptly and hand expensive work to the host runtime.
 
 Native callback carry is capped at 4096 source events and delivered in batches
 of at most 512. Overflow discards oldest message events first, then oldest
