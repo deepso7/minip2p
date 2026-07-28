@@ -51,13 +51,7 @@ fn parse_direct_quic_peer_addr(address: &str) -> Result<PeerAddr, FfiError> {
     let relay = PeerAddr::from_str(address).map_err(|error| FfiError::InvalidAddress {
         detail: error.to_string(),
     })?;
-    if !relay.transport().is_quic_transport()
-        || relay
-            .transport()
-            .protocols()
-            .iter()
-            .any(|protocol| matches!(protocol, Protocol::P2pCircuit))
-    {
+    if !relay.transport().is_quic_transport() {
         return Err(FfiError::InvalidAddress {
             detail: "relay address must be a direct QUIC-v1 peer address".into(),
         });
