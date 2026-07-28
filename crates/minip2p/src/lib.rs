@@ -52,12 +52,12 @@ pub use minip2p_pubsub::{
     MESHSUB_PROTOCOL_ID_V11, PublishError, PubsubConfig, PubsubConfigError, PubsubEvent,
     TopicError,
 };
-pub use minip2p_quic::QuicLimits;
 use minip2p_quic::{QuicEndpoint, QuicNodeConfig};
+pub use minip2p_quic::{QuicLimits, QuicWaitHandle};
 use minip2p_swarm::SwarmBuilder;
 pub use minip2p_swarm::{
-    Deadline, DriverError as Error, RESERVED_PROTOCOL_IDS, RUN_UNTIL_SKIP_LIMIT, Swarm, SwarmError,
-    SwarmEvent as Event,
+    Deadline, DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, RUN_UNTIL_SKIP_LIMIT, Swarm,
+    SwarmError, SwarmEvent as Event,
 };
 pub use minip2p_transport::{ConnectionId, StreamId, TransportError};
 #[cfg(feature = "pubsub")]
@@ -123,6 +123,8 @@ pub enum EndpointWake {
     /// must drain every non-empty agent queue counted by this notification;
     /// otherwise the next call returns `DriverProgress` immediately again.
     DriverProgress,
+    /// The transport wait was interrupted by an external wait handle.
+    Interrupted,
     /// The caller's deadline elapsed without an application event or agent
     /// progress.
     Deadline,
@@ -136,6 +138,8 @@ enum DriverPollKind {
     /// An agent produced application-visible output; focused waits should
     /// re-check their queue immediately.
     Progress,
+    /// The transport wait was interrupted externally.
+    Interrupted,
     /// The caller's deadline elapsed.
     Deadline,
 }
@@ -168,9 +172,22 @@ impl DriverPoll {
             event: None,
         }
     }
+
+    fn interrupted() -> Self {
+        Self {
+            kind: DriverPollKind::Interrupted,
+            event: None,
+        }
+    }
 }
 
 impl Endpoint {
+    /// Returns a cloneable handle that can interrupt a blocking endpoint wait
+    /// from another thread.
+    pub fn wait_handle(&self) -> QuicWaitHandle {
+        self.quic().wait_handle()
+    }
+
     /// Starts building an endpoint.
     pub fn builder() -> EndpointBuilder {
         EndpointBuilder::default()
@@ -341,7 +358,13 @@ impl Endpoint {
         if self.has_drivers() {
             return self.next_event_driven(deadline);
         }
-        self.swarm.poll_next(deadline)
+        loop {
+            match self.swarm.poll_next_interruptible(deadline)? {
+                PollNext::Event(event) => return Ok(Some(event)),
+                PollNext::Deadline => return Ok(None),
+                PollNext::Interrupted => {}
+            }
+        }
     }
 
     /// Drives the endpoint until an application event, agent progress, or the
@@ -376,13 +399,17 @@ impl Endpoint {
                     EndpointWake::Event(poll.event.expect("application poll carries event"))
                 }
                 DriverPollKind::Progress => EndpointWake::DriverProgress,
+                DriverPollKind::Interrupted => EndpointWake::Interrupted,
                 DriverPollKind::Deadline => EndpointWake::Deadline,
             });
         }
-        self.swarm.poll_next(deadline).map(|event| match event {
-            Some(event) => EndpointWake::Event(event),
-            None => EndpointWake::Deadline,
-        })
+        self.swarm
+            .poll_next_interruptible(deadline)
+            .map(|event| match event {
+                PollNext::Event(event) => EndpointWake::Event(event),
+                PollNext::Deadline => EndpointWake::Deadline,
+                PollNext::Interrupted => EndpointWake::Interrupted,
+            })
     }
 
     /// Whether any agent driver is active on this endpoint.
@@ -528,6 +555,7 @@ impl Endpoint {
             match poll.kind {
                 DriverPollKind::Application => return Ok(poll.event),
                 DriverPollKind::Progress => {}
+                DriverPollKind::Interrupted => {}
                 DriverPollKind::Deadline => return Ok(None),
             }
         }
@@ -556,13 +584,13 @@ impl Endpoint {
                 *expired_poll_used = true;
             }
             let step = self.driver_step_deadline(deadline);
-            let polled = self.swarm.poll_next(step)?;
+            let polled = self.swarm.poll_next_interruptible(step)?;
             if deadline.has_passed() {
                 *expired_poll_used = true;
             }
             let events_before = self.driver_events_len();
             match polled {
-                Some(event) => {
+                PollNext::Event(event) => {
                     let consumed = self.ingest_into_drivers(&event);
                     self.tick_drivers()?;
                     if !consumed {
@@ -572,7 +600,7 @@ impl Endpoint {
                         return Ok(DriverPoll::progress());
                     }
                 }
-                None => {
+                PollNext::Deadline => {
                     self.tick_drivers()?;
                     if self.driver_events_len() > events_before {
                         return Ok(DriverPoll::progress());
@@ -583,6 +611,7 @@ impl Endpoint {
                         return Ok(DriverPoll::deadline());
                     }
                 }
+                PollNext::Interrupted => return Ok(DriverPoll::interrupted()),
             }
         }
     }
@@ -730,6 +759,7 @@ impl Endpoint {
                     .pending_events
                     .push_back(poll.event.expect("application poll carries event")),
                 DriverPollKind::Progress => {}
+                DriverPollKind::Interrupted => {}
                 DriverPollKind::Deadline => return Ok(None),
             }
         }
@@ -770,6 +800,7 @@ impl Endpoint {
                     .pending_events
                     .push_back(poll.event.expect("application poll carries event")),
                 DriverPollKind::Progress => {}
+                DriverPollKind::Interrupted => {}
                 DriverPollKind::Deadline => return Ok(None),
             }
         }
@@ -803,6 +834,7 @@ impl Endpoint {
                     self.pending_events.push_back(event);
                 }
                 DriverPollKind::Progress => {}
+                DriverPollKind::Interrupted => {}
                 DriverPollKind::Deadline => return Ok(None),
             }
         }
@@ -932,6 +964,7 @@ impl Endpoint {
                     .pending_events
                     .push_back(poll.event.expect("application poll carries event")),
                 DriverPollKind::Progress => {}
+                DriverPollKind::Interrupted => {}
                 DriverPollKind::Deadline => return Ok(None),
             }
         }
@@ -999,6 +1032,7 @@ impl Endpoint {
                     .pending_events
                     .push_back(poll.event.expect("application poll carries event")),
                 DriverPollKind::Progress => {}
+                DriverPollKind::Interrupted => {}
                 DriverPollKind::Deadline => return Ok(None),
             }
         }
@@ -1032,6 +1066,16 @@ impl Endpoint {
             discovery.shutdown(nat, &mut self.swarm);
         }
         result
+    }
+
+    #[cfg(feature = "nat")]
+    fn quic(&self) -> &QuicEndpoint {
+        self.swarm.transport().inner()
+    }
+
+    #[cfg(not(feature = "nat"))]
+    fn quic(&self) -> &QuicEndpoint {
+        self.swarm.transport()
     }
 
     #[cfg(feature = "nat")]
@@ -1583,6 +1627,19 @@ mod tests {
         assert!(matches!(
             endpoint.next_wake(Duration::ZERO).expect("poll endpoint"),
             EndpointWake::Deadline
+        ));
+    }
+
+    #[test]
+    fn next_wake_reports_interrupt_without_active_drivers() {
+        let mut endpoint = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind loopback endpoint");
+        endpoint.wait_handle().interrupt();
+
+        assert!(matches!(
+            endpoint.next_wake(Deadline::NEVER).expect("poll endpoint"),
+            EndpointWake::Interrupted
         ));
     }
 

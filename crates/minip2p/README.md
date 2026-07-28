@@ -41,6 +41,11 @@ Progress is level-triggered across all active agents: drain every non-empty
 agent queue before calling `next_wake` again, or it will immediately report
 `DriverProgress` again.
 
+Background drivers can clone `Endpoint::wait_handle()` and interrupt a blocked
+`next_wake` from another thread. The wake is reported as
+`EndpointWake::Interrupted`; legacy event-specific waits consume interruptions
+and continue waiting until their event or deadline.
+
 When an application permanently relinquishes a stream, `Endpoint::abandon_stream`
 resets it, purges already-buffered events, and suppresses later stream events.
 Use `Endpoint::reset_stream` when those terminal events should remain visible.

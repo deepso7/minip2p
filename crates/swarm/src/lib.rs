@@ -49,4 +49,4 @@ pub use minip2p_identify::IdentifyMessage;
 #[cfg(feature = "std")]
 pub use crate::builder::SwarmBuilder;
 #[cfg(feature = "std")]
-pub use crate::driver::{Clock, Deadline, DriverError, RUN_UNTIL_SKIP_LIMIT, Swarm};
+pub use crate::driver::{Clock, Deadline, DriverError, PollNext, RUN_UNTIL_SKIP_LIMIT, Swarm};

@@ -10,6 +10,11 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 pub enum WaitOutcome {
     /// Input may be ready; the caller should poll now.
     Ready,
+    /// An external handle interrupted the wait.
+    ///
+    /// Runtime drivers should return control to their caller without treating
+    /// this as transport input or a timer expiry.
+    Interrupted,
     /// The timeout elapsed without input arriving.
     TimedOut,
     /// The transport cannot wait for readiness; the caller should fall back

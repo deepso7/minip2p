@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,6 +18,7 @@ use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
     WaitOutcome,
 };
+use mio::{Events, Interest, Poll, Token, Waker};
 use quiche::ConnectionId as QuicConnectionId;
 use sha2::Sha256;
 
@@ -42,6 +44,8 @@ const DEFAULT_IPV6_BIND: &str = "[::]:0";
 /// Leftover packets stay queued in the kernel buffer, and `wait_for_input`
 /// reports them as ready so the driver polls again immediately.
 const MAX_DATAGRAMS_PER_POLL: usize = 128;
+const SOCKET_READY_TOKEN: Token = Token(0);
+const INTERRUPT_TOKEN: Token = Token(1);
 const RETRY_TOKEN_VERSION: u8 = 1;
 const RETRY_TOKEN_LIFETIME_SECS: u64 = 10;
 const RETRY_TOKEN_MAC_LEN: usize = 32;
@@ -424,6 +428,9 @@ fn build_quiche_config(node_config: &QuicNodeConfig) -> Result<quiche::Config, T
 pub struct QuicTransport {
     /// Non-blocking UDP socket for all QUIC traffic.
     socket: UdpSocket,
+    /// Poll registration used to wait for socket readability or an external
+    /// driver interrupt without consuming a datagram.
+    readiness: ReadinessWait,
     /// Shared quiche configuration for all connections.
     quiche_config: quiche::Config,
     /// Active connections keyed by connection id.
@@ -460,6 +467,80 @@ pub enum QuicEndpoint {
 pub struct DualQuicTransport {
     ipv4: QuicTransport,
     ipv6: QuicTransport,
+    interrupt_lock: Arc<Mutex<()>>,
+}
+
+struct ReadinessWait {
+    poll: Poll,
+    events: Events,
+    _socket: mio::net::UdpSocket,
+    waker: Arc<Waker>,
+}
+
+impl ReadinessWait {
+    fn new(socket: &UdpSocket) -> std::io::Result<Self> {
+        let poll = Poll::new()?;
+        let mut registered = mio::net::UdpSocket::from_std(socket.try_clone()?);
+        poll.registry()
+            .register(&mut registered, SOCKET_READY_TOKEN, Interest::READABLE)?;
+        let waker = Arc::new(Waker::new(poll.registry(), INTERRUPT_TOKEN)?);
+        Ok(Self {
+            poll,
+            events: Events::with_capacity(2),
+            _socket: registered,
+            waker,
+        })
+    }
+
+    fn wait(&mut self, timeout: Duration) -> WaitOutcome {
+        self.events.clear();
+        if self.poll.poll(&mut self.events, Some(timeout)).is_err() {
+            return WaitOutcome::Ready;
+        }
+        if self
+            .events
+            .iter()
+            .any(|event| event.token() == INTERRUPT_TOKEN)
+        {
+            return WaitOutcome::Interrupted;
+        }
+        if self
+            .events
+            .iter()
+            .any(|event| event.token() == SOCKET_READY_TOKEN)
+        {
+            WaitOutcome::Ready
+        } else {
+            WaitOutcome::TimedOut
+        }
+    }
+
+    fn consume_pending_interrupt(&mut self) {
+        self.events.clear();
+        let _ = self.poll.poll(&mut self.events, Some(Duration::ZERO));
+        self.events.clear();
+    }
+}
+
+/// Cloneable handle that interrupts a QUIC endpoint's current readiness wait.
+#[derive(Clone)]
+pub struct QuicWaitHandle {
+    wakers: Vec<Arc<Waker>>,
+    interrupt_lock: Arc<Mutex<()>>,
+}
+
+impl QuicWaitHandle {
+    /// Interrupts any current wait. Calling this when no wait is active makes
+    /// the next wait return immediately.
+    pub fn interrupt(&self) {
+        let _guard = self
+            .interrupt_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for waker in &self.wakers {
+            let _ = waker.wake();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -564,6 +645,28 @@ impl QuicEndpoint {
             Self::Dual(transport) => transport.send_raw_udp(target, payload),
         }
     }
+
+    /// Returns a cloneable handle that can interrupt this endpoint's current
+    /// readiness wait from another thread.
+    pub fn wait_handle(&self) -> QuicWaitHandle {
+        let (wakers, interrupt_lock) = match self {
+            Self::Single(transport) => (
+                vec![Arc::clone(&transport.readiness.waker)],
+                Arc::new(Mutex::new(())),
+            ),
+            Self::Dual(transport) => (
+                vec![
+                    Arc::clone(&transport.ipv4.readiness.waker),
+                    Arc::clone(&transport.ipv6.readiness.waker),
+                ],
+                Arc::clone(&transport.interrupt_lock),
+            ),
+        };
+        QuicWaitHandle {
+            wakers,
+            interrupt_lock,
+        }
+    }
 }
 
 fn single_dial_family(
@@ -592,7 +695,11 @@ impl DualQuicTransport {
     pub fn new(node_config: QuicNodeConfig) -> Result<Self, TransportError> {
         let ipv4 = QuicTransport::new(node_config.clone(), DEFAULT_IPV4_BIND)?;
         let ipv6 = QuicTransport::new(node_config, DEFAULT_IPV6_BIND)?;
-        Ok(Self { ipv4, ipv6 })
+        Ok(Self {
+            ipv4,
+            ipv6,
+            interrupt_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     /// Sends a raw UDP packet to `target`, bypassing QUIC.
@@ -778,6 +885,9 @@ impl QuicTransport {
                 reason: format!("failed to set nonblocking: {e}"),
             })?;
 
+        let readiness = ReadinessWait::new(&socket).map_err(|e| TransportError::ListenFailed {
+            reason: format!("failed to create readiness poll: {e}"),
+        })?;
         let quiche_config = build_quiche_config(&node_config)?;
         let mut retry_secret = [0u8; 32];
         getrandom::fill(&mut retry_secret).map_err(|e| TransportError::InvalidConfig {
@@ -786,6 +896,7 @@ impl QuicTransport {
 
         Ok(Self {
             socket,
+            readiness,
             quiche_config,
             connections: HashMap::new(),
             cid_to_connection: HashMap::new(),
@@ -992,50 +1103,6 @@ fn socket_has_queued_input(socket: &UdpSocket) -> bool {
         Ok(_) => true,
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
         Err(_) => true,
-    }
-}
-
-/// Blocks until `socket` has a readable datagram or `timeout` elapses.
-///
-/// Temporarily switches the socket to blocking mode with a read timeout and
-/// peeks one byte, so no input is consumed. Errors other than a timeout map
-/// to `Ready` so the next `poll()` can surface them. A zero timeout degrades
-/// to a non-blocking probe, so already-queued input is still reported.
-fn wait_for_socket_input(socket: &UdpSocket, timeout: Duration) -> WaitOutcome {
-    if timeout.is_zero() {
-        return if socket_has_queued_input(socket) {
-            WaitOutcome::Ready
-        } else {
-            WaitOutcome::TimedOut
-        };
-    }
-
-    // Arm the read timeout before entering blocking mode so a failure here
-    // can never leave the peek blocking indefinitely.
-    if socket.set_read_timeout(Some(timeout)).is_err() || socket.set_nonblocking(false).is_err() {
-        let _ = socket.set_nonblocking(true);
-        let _ = socket.set_read_timeout(None);
-        return WaitOutcome::Ready;
-    }
-
-    let mut probe = [0u8; 1];
-    let result = socket.peek_from(&mut probe);
-
-    // Restore non-blocking mode even when the peek failed.
-    let _ = socket.set_nonblocking(true);
-    let _ = socket.set_read_timeout(None);
-
-    match result {
-        Ok(_) => WaitOutcome::Ready,
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) =>
-        {
-            WaitOutcome::TimedOut
-        }
-        Err(_) => WaitOutcome::Ready,
     }
 }
 
@@ -1492,7 +1559,11 @@ impl Transport for QuicTransport {
     }
 
     fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-        wait_for_socket_input(&self.socket, timeout)
+        if socket_has_queued_input(&self.socket) {
+            WaitOutcome::Ready
+        } else {
+            self.readiness.wait(timeout)
+        }
     }
 }
 
@@ -1686,7 +1757,7 @@ impl Transport for DualQuicTransport {
 
     fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
         // Two independent sockets and no shared readiness primitive, so
-        // alternate short blocking peeks on each family; a packet on either
+        // alternate short readiness waits on each family; a packet on either
         // socket wakes the driver within one slice.
         const SLICE: Duration = Duration::from_millis(10);
 
@@ -1706,7 +1777,7 @@ impl Transport for DualQuicTransport {
         // represents; an unrepresentable deadline means "no deadline".
         let deadline = std::time::Instant::now().checked_add(timeout);
         loop {
-            for (family, transport) in [(0, &self.ipv4), (1, &self.ipv6)] {
+            for family in 0..2 {
                 let remaining = match deadline {
                     Some(deadline) => {
                         let remaining =
@@ -1726,8 +1797,31 @@ impl Transport for DualQuicTransport {
                 if family == 0 {
                     slice = slice.min(remaining / 2);
                 }
-                if wait_for_socket_input(&transport.socket, slice) == WaitOutcome::Ready {
-                    return WaitOutcome::Ready;
+                let outcome = if family == 0 {
+                    self.ipv4.readiness.wait(slice)
+                } else {
+                    self.ipv6.readiness.wait(slice)
+                };
+                match outcome {
+                    WaitOutcome::Ready => return WaitOutcome::Ready,
+                    WaitOutcome::Interrupted => {
+                        // One logical interrupt wakes both family polls. The
+                        // wait above consumed this family's token. Synchronize
+                        // with the handle so both wake calls have completed,
+                        // then consume the sibling token too so it cannot
+                        // escape as a second `Interrupted` outcome.
+                        let _guard = self
+                            .interrupt_lock
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if family == 0 {
+                            self.ipv6.readiness.consume_pending_interrupt();
+                        } else {
+                            self.ipv4.readiness.consume_pending_interrupt();
+                        }
+                        return WaitOutcome::Interrupted;
+                    }
+                    WaitOutcome::TimedOut | WaitOutcome::Unsupported => {}
                 }
             }
         }
@@ -1973,19 +2067,62 @@ mod tests {
         // still reports Ready.
         assert_eq!(transport.wait_for_input(Duration::ZERO), WaitOutcome::Ready);
 
-        // The peek must not consume the datagram, and the socket must be back
-        // in non-blocking mode afterwards.
+        // Readiness polling must not consume the datagram.
         let mut buf = [0u8; 16];
         let (len, _) = transport
             .socket
             .recv_from(&mut buf)
             .expect("datagram must still be queued");
         assert_eq!(&buf[..len], &[1, 2, 3]);
-        let error = transport
-            .socket
-            .recv_from(&mut buf)
-            .expect_err("socket must be restored to non-blocking");
-        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn wait_handle_interrupts_a_blocking_wait() {
+        let mut endpoint =
+            QuicEndpoint::bind(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+        let handle = endpoint.wait_handle();
+        let waiter = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let outcome = endpoint.wait_for_input(Duration::from_secs(5));
+            (outcome, started.elapsed())
+        });
+
+        std::thread::sleep(Duration::from_millis(25));
+        handle.interrupt();
+
+        let (outcome, elapsed) = waiter.join().expect("waiter");
+        assert_eq!(outcome, WaitOutcome::Interrupted);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "interrupt took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn dual_stack_wait_consumes_one_interrupt_once() {
+        let mut endpoint =
+            QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("dual-stack bind");
+        let handle = endpoint.wait_handle();
+        let waiter = std::thread::spawn(move || {
+            let interrupted = endpoint.wait_for_input(Duration::from_secs(1));
+            let next = endpoint.wait_for_input(Duration::from_millis(10));
+            (interrupted, next)
+        });
+
+        std::thread::sleep(Duration::from_millis(25));
+        handle.interrupt();
+
+        let (interrupted, next) = waiter.join().expect("waiter");
+        assert_eq!(
+            interrupted,
+            WaitOutcome::Interrupted,
+            "the active dual-stack wait must observe the interrupt"
+        );
+        assert_eq!(
+            next,
+            WaitOutcome::TimedOut,
+            "one logical interrupt must not leak from the sibling family poll"
+        );
     }
 
     #[test]

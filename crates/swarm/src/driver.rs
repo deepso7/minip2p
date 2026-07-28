@@ -199,6 +199,18 @@ pub struct Swarm<T: Transport> {
     clock: Arc<dyn Clock>,
 }
 
+/// Result of an interruptible swarm wait.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Preserve event ownership without a heap allocation.
+pub enum PollNext {
+    /// A fresh swarm event is ready.
+    Event(SwarmEvent),
+    /// The caller's deadline elapsed.
+    Deadline,
+    /// The transport wait was interrupted externally.
+    Interrupted,
+}
+
 impl<T: Transport> Swarm<T> {
     /// Creates a swarm driver around the given transport, identify config,
     /// and ping config.
@@ -611,8 +623,24 @@ impl<T: Transport> Swarm<T> {
     ) -> Result<Option<SwarmEvent>, DriverError> {
         let deadline = deadline.into();
         loop {
+            match self.poll_next_interruptible(deadline)? {
+                PollNext::Event(event) => return Ok(Some(event)),
+                PollNext::Deadline => return Ok(None),
+                PollNext::Interrupted => {}
+            }
+        }
+    }
+
+    /// Returns the next event while preserving an external wait interruption
+    /// as distinct from the caller's deadline.
+    pub fn poll_next_interruptible(
+        &mut self,
+        deadline: impl Into<Deadline>,
+    ) -> Result<PollNext, DriverError> {
+        let deadline = deadline.into();
+        loop {
             if let Some(ev) = self.event_buffer.pop_front() {
-                return Ok(Some(ev));
+                return Ok(PollNext::Event(ev));
             }
             // Always poll at least once -- even if we're already past the
             // deadline -- so a caller using a short or elapsed deadline
@@ -620,11 +648,11 @@ impl<T: Transport> Swarm<T> {
             let events = self.poll()?;
             self.event_buffer.extend(events);
             if let Some(ev) = self.event_buffer.pop_front() {
-                return Ok(Some(ev));
+                return Ok(PollNext::Event(ev));
             }
             let now = Instant::now();
             if deadline.is_expired_at(now) {
-                return Ok(None);
+                return Ok(PollNext::Deadline);
             }
             // Budget: never sleep past the caller's deadline, the
             // transport's next protocol timer, or the core's next internal
@@ -643,8 +671,10 @@ impl<T: Transport> Swarm<T> {
             // Prefer a real readiness wait so idle loops don't burn CPU on a
             // fixed cadence; fall back to a short sleep for transports that
             // can't wait.
-            if self.transport.wait_for_input(budget) == WaitOutcome::Unsupported {
-                std::thread::sleep(budget.min(POLL_IDLE_SLEEP));
+            match self.transport.wait_for_input(budget) {
+                WaitOutcome::Interrupted => return Ok(PollNext::Interrupted),
+                WaitOutcome::Unsupported => std::thread::sleep(budget.min(POLL_IDLE_SLEEP)),
+                WaitOutcome::Ready | WaitOutcome::TimedOut => {}
             }
         }
     }
@@ -683,10 +713,11 @@ impl<T: Transport> Swarm<T> {
         let mut result = Ok(None);
 
         // Phase 1: before the deadline, wait for fresh events normally.
-        // `poll_next` sleeps between transport polls with a bounded budget.
+        // An external interruption only wakes the readiness wait; it does
+        // not satisfy this event predicate or expire the caller's deadline.
         let mut polled_past_deadline = false;
         while !deadline.is_expired_at(Instant::now()) {
-            match self.poll_next(deadline) {
+            match self.poll_next_interruptible(deadline) {
                 Err(error) => {
                     result = Err(error);
                     break;
@@ -694,11 +725,12 @@ impl<T: Transport> Swarm<T> {
                 // Deadline expired while idle. `poll_next` has already done
                 // its final "at least once" transport poll and found the
                 // buffer empty, so the drain below must not poll again.
-                Ok(None) => {
+                Ok(PollNext::Deadline) => {
                     polled_past_deadline = true;
                     break;
                 }
-                Ok(Some(ev)) => {
+                Ok(PollNext::Interrupted) => continue,
+                Ok(PollNext::Event(ev)) => {
                     if predicate(&ev) {
                         result = Ok(Some(ev));
                         break;
@@ -963,6 +995,8 @@ mod tests {
     #[derive(Default)]
     struct IdleTransport {
         poll_calls: usize,
+        wait_outcomes: VecDeque<WaitOutcome>,
+        wait_calls: usize,
     }
 
     impl Transport for IdleTransport {
@@ -1006,6 +1040,13 @@ mod tests {
         fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
             self.poll_calls += 1;
             Ok(Vec::new())
+        }
+
+        fn wait_for_input(&mut self, _: Duration) -> WaitOutcome {
+            self.wait_calls += 1;
+            self.wait_outcomes
+                .pop_front()
+                .unwrap_or(WaitOutcome::TimedOut)
         }
     }
 
@@ -1364,6 +1405,25 @@ mod tests {
             restored,
             SwarmEvent::ConnectionEstablished { peer_id, .. } if peer_id == target_peer_id
         ));
+    }
+
+    #[test]
+    fn run_until_does_not_treat_interrupt_as_deadline() {
+        let mut swarm = idle_swarm();
+        swarm
+            .transport_mut()
+            .wait_outcomes
+            .push_back(WaitOutcome::Interrupted);
+
+        let found = swarm
+            .run_until(Duration::from_millis(1), |_| false)
+            .expect("wait");
+
+        assert!(found.is_none());
+        assert!(
+            swarm.transport().wait_calls > 1,
+            "the wait must resume after consuming the interrupt"
+        );
     }
 
     #[test]
