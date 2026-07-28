@@ -48,12 +48,18 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 ///
 /// ## Time
 ///
-/// Adapters never read a clock. The host samples time once per drive
-/// iteration and passes that [`Now`] to `poll()`, so every transport, agent,
-/// and runtime in one iteration observes the same instant. Adapters that need
-/// to schedule work retain the last sample they were given and report the
-/// resulting [`Deadline`] from
+/// The host samples time once per drive iteration and passes that [`Now`] to
+/// `poll()`, so every transport, agent, and runtime in one iteration observes
+/// the same instant. Adapters that need to schedule work retain the last
+/// sample they were given and report the resulting [`Deadline`] from
 /// [`next_deadline`](Transport::next_deadline).
+///
+/// A portable adapter should read no clock of its own. An adapter wrapping a
+/// library that keeps its own internal clock (minip2p's QUIC adapter wraps
+/// quiche, which does) may still do so, but everything it reports to the host
+/// -- deadlines above all -- must be expressed on the timeline of the samples
+/// it was given, never on the wrapped library's. Such an adapter is
+/// inherently `std`-only.
 pub trait Transport {
     /// Initiate an outbound connection and return its allocated connection id.
     ///

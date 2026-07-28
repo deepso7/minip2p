@@ -58,6 +58,28 @@ dialer.send_stream(conn_id, stream_id, b"hello".to_vec())?;
 This crate is a concrete transport adapter and depends on `std`.
 For Sans-I/O contracts and shared types, use `minip2p-transport`.
 
+## Clocks
+
+Unlike the portable transports, this adapter does not run purely on the host's
+time sample. quiche keeps its own clock: it reads `Instant::now()` internally
+to drive loss detection and to answer `conn.timeout()`. Converting it to
+caller-supplied time would mean forking or wrapping quiche's timer handling,
+which is out of scope, so the dual clock is deliberate and this adapter is
+`std`-only.
+
+What the adapter *does* guarantee is that nothing quiche's clock touches leaks
+into what the host sees:
+
+- `poll(now)` retains the sample purely to anchor `next_deadline()` on the
+  host's timeline, so a host driving several transports can still compare
+  their deadlines.
+- quiche measures its timeout from an `Instant::now()` at or after that
+  sample, so anchoring rounds the deadline slightly early — an extra harmless
+  wakeup, never a missed timer.
+- Sub-millisecond timeouts (common on loopback) are rounded *up* to a whole
+  millisecond rather than truncated to zero. Truncation would report "already
+  due" and spin a driver's budget loop until wall time caught up.
+
 `quiche 0.29` exposes its TLS builder using `boring` 4.x types, so this crate
 intentionally uses the newest compatible `boring` 4.x release rather than the
 incompatible 5.x major.

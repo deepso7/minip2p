@@ -16,6 +16,7 @@ use minip2p_mdns::{
 };
 use minip2p_multistream_select::{MultistreamInput, MultistreamSelect};
 use minip2p_noise::{NoiseConfig, NoiseHandshakePayload, NoiseInput, NoiseRole, NoiseSession};
+use minip2p_platform::Now;
 use minip2p_pubsub::{
     FrameDecode as PubsubFrame, GossipsubAgent, GossipsubConfig, MESHSUB_PROTOCOL_ID_V11,
     RawMessage, Rpc,
@@ -202,7 +203,7 @@ impl Transport for FuzzTransport {
         Ok(())
     }
 
-    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+    fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {
         Ok(self.initial.take().into_iter().collect())
     }
 }
@@ -219,7 +220,7 @@ fn fuzz_circuit(data: &[u8]) {
         let identity = minip2p_identity::Ed25519Keypair::from_secret_key_bytes([5; 32]);
         let mut transport =
             CircuitTransport::new(FuzzTransport::new(relay.clone()), identity, FixedEntropy);
-        let _ = transport.poll();
+        let _ = transport.poll(Now::from_millis(0));
         let _ = transport.adopt_bridge(BridgeAdoption {
             inner_conn: ConnectionId::new(1),
             bridge_stream: StreamId::new(1),
@@ -238,7 +239,7 @@ fn fuzz_circuit(data: &[u8]) {
         transport.inject_bridge_remote_write_closed(ConnectionId::new(1), StreamId::new(1));
         transport.inject_bridge_closed(ConnectionId::new(1), StreamId::new(1));
         transport.inject_bridge_data(ConnectionId::new(1), StreamId::new(1), data.to_vec());
-        let _ = transport.poll();
+        let _ = transport.poll(Now::from_millis(0));
     }
 }
 

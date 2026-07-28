@@ -1487,9 +1487,6 @@ impl Transport for QuicTransport {
     }
 
     fn next_deadline(&self) -> Option<Deadline> {
-        // No sample yet means no timeline to answer on.
-        let now = self.last_now?;
-
         // Datagrams stuck on socket writability can't be woken by a
         // readable peek; return a near deadline so the driver retries the
         // flush soon. (A `flush` blocked mid-connection always leaves its
@@ -1498,21 +1495,48 @@ impl Transport for QuicTransport {
         // only progress when a peer packet arrives -- which wakes
         // `wait_for_input` -- or a QUIC timer fires, so they fall through
         // to the real timers and never force a busy-poll.
+        //
+        // Checked before the retained sample: `dial` queues datagrams before
+        // the first `poll`, and a host that idled on `None` there would never
+        // come back to flush them. `IMMEDIATE` is due on any timeline.
         if !self.pending_datagrams.is_empty() {
-            return Some(now.deadline_after(1));
+            return Some(
+                self.last_now
+                    .map_or(Deadline::IMMEDIATE, |now| now.deadline_after(1)),
+            );
         }
 
-        // quiche measures its timeouts from its own `Instant::now()`, which is
-        // at or after the sample taken at the top of `poll`. Anchoring to the
-        // sample therefore rounds the deadline slightly early -- an extra
-        // harmless wakeup, never a missed timer.
+        // No sample yet means no timeline to answer on.
+        let now = self.last_now?;
+
         let timeout = self
             .connections
             .values()
             .filter_map(QuicConnection::timeout)
             .min()?;
-        Some(now.deadline_after(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)))
+        Some(deadline_for_timeout(now, timeout))
     }
+}
+
+/// Converts a quiche timeout into a deadline on the host's timeline.
+///
+/// quiche measures its timeouts from its own `Instant::now()`, at or after the
+/// sample taken at the top of `poll`, so anchoring to that sample rounds
+/// slightly early -- an extra harmless wakeup, never a missed timer.
+///
+/// [`Deadline`] has millisecond granularity while quiche's timeouts routinely
+/// land under a millisecond on loopback. Truncating those to zero would report
+/// "already due", which drives the swarm's budget loop to a zero-length sleep
+/// and spins the thread until wall time catches up. Any non-zero timeout is
+/// therefore rounded *up* to the next millisecond; the sub-millisecond delay
+/// that adds sits well inside the driver's own 1ms idle cadence.
+fn deadline_for_timeout(now: Now, timeout: Duration) -> Deadline {
+    if timeout.is_zero() {
+        // Genuinely due: let the driver poll again without idling.
+        return now.as_deadline();
+    }
+    let millis = u64::try_from(timeout.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX);
+    now.deadline_after(millis.max(1))
 }
 
 impl BlockingTransport for QuicTransport {
@@ -1972,6 +1996,64 @@ mod tests {
         assert!(
             transport.pending_datagrams.is_empty(),
             "the poisoned datagram must be dropped and the one behind it sent"
+        );
+    }
+
+    #[test]
+    fn sub_millisecond_timeouts_never_report_as_already_due() {
+        let now = Now::from_millis(10_000);
+
+        // The regression: truncating to whole milliseconds turned "due in
+        // 300us" into "due now", so the driver took a zero-length budget and
+        // span until wall time caught up.
+        for timeout in [
+            Duration::from_nanos(1),
+            Duration::from_micros(1),
+            Duration::from_micros(300),
+            Duration::from_micros(999),
+            Duration::from_millis(1),
+        ] {
+            let deadline = deadline_for_timeout(now, timeout);
+            assert_eq!(
+                deadline.millis_until(now),
+                1,
+                "{timeout:?} must round up to a whole millisecond"
+            );
+        }
+
+        // Partial milliseconds round up rather than truncating down.
+        assert_eq!(
+            deadline_for_timeout(now, Duration::from_micros(1_500)).millis_until(now),
+            2
+        );
+        assert_eq!(
+            deadline_for_timeout(now, Duration::from_millis(5)).millis_until(now),
+            5
+        );
+
+        // Zero really is due now: the driver should re-poll without idling.
+        assert_eq!(
+            deadline_for_timeout(now, Duration::ZERO).millis_until(now),
+            0
+        );
+        assert!(deadline_for_timeout(now, Duration::ZERO).is_expired_at(now));
+    }
+
+    #[test]
+    fn queued_datagrams_are_reported_before_the_first_poll() {
+        let mut transport =
+            QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+        assert_eq!(transport.next_deadline(), None, "idle and never polled");
+
+        // `dial` can queue a datagram before any poll has taken a sample. A
+        // host that idled on `None` here would never flush it.
+        let destination = transport.local_addr().expect("local addr");
+        transport.queue_datagram_best_effort(&[0u8; 4], destination);
+
+        let deadline = transport.next_deadline().expect("queued work must be due");
+        assert!(
+            deadline.is_expired_at(Now::from_millis(0)),
+            "with no retained sample the deadline must be due on any timeline"
         );
     }
 

@@ -1051,6 +1051,13 @@ mod tests {
         deadline: Option<minip2p_platform::Deadline>,
         /// Every budget the driver handed to `wait_for_input`.
         wait_budgets: Vec<Duration>,
+        /// Events returned by the first `poll`, so a test can make the core
+        /// emit actions during the polls it is counting.
+        initial_events: Vec<TransportEvent>,
+        /// Stream ids handed out by `open_stream`.
+        next_stream_id: u64,
+        /// Streams the driver opened while dispatching actions.
+        opened_streams: usize,
     }
 
     impl Transport for IdleTransport {
@@ -1063,7 +1070,9 @@ mod tests {
         }
 
         fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
-            unreachable!()
+            self.next_stream_id += 1;
+            self.opened_streams += 1;
+            Ok(StreamId::new(self.next_stream_id))
         }
 
         fn send_stream(
@@ -1072,7 +1081,7 @@ mod tests {
             _: StreamId,
             _: Vec<u8>,
         ) -> Result<(), TransportError> {
-            unreachable!()
+            Ok(())
         }
 
         fn close_stream_write(
@@ -1080,7 +1089,7 @@ mod tests {
             _: ConnectionId,
             _: StreamId,
         ) -> Result<(), TransportError> {
-            unreachable!()
+            Ok(())
         }
 
         fn reset_stream(&mut self, _: ConnectionId, _: StreamId) -> Result<(), TransportError> {
@@ -1094,7 +1103,7 @@ mod tests {
         fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
             self.poll_calls += 1;
             self.samples.push(now);
-            Ok(Vec::new())
+            Ok(std::mem::take(&mut self.initial_events))
         }
 
         fn next_deadline(&self) -> Option<minip2p_platform::Deadline> {
@@ -1312,8 +1321,23 @@ mod tests {
             protocols: Vec::new(),
             public_key: keypair.public_key().encode_protobuf(),
         };
+        // A Connected event makes the core start Identify, which emits an
+        // OpenStream action. Without it the counted poll dispatches nothing
+        // and the assertion below cannot see per-action re-sampling at all.
+        let transport = IdleTransport {
+            initial_events: vec![TransportEvent::Connected {
+                id: ConnectionId::new(1),
+                endpoint: ConnectionEndpoint::with_peer_id(
+                    "/ip4/198.51.100.4/udp/4001/quic-v1"
+                        .parse()
+                        .expect("endpoint"),
+                    Ed25519Keypair::generate().peer_id(),
+                ),
+            }],
+            ..IdleTransport::default()
+        };
         let mut swarm = Swarm::with_clock(
-            IdleTransport::default(),
+            transport,
             identify,
             PingConfig::default(),
             keypair.peer_id(),
@@ -1321,17 +1345,21 @@ mod tests {
         );
 
         swarm.poll().expect("poll");
+        assert!(
+            swarm.transport().opened_streams > 0,
+            "fixture must dispatch an action for this test to mean anything"
+        );
         assert_eq!(
             reads.load(Ordering::SeqCst),
             1,
-            "the transport, the core's tick, and action dispatch must share \
-             one sample; a second read means they can disagree about now"
+            "the transport, the core's tick, and every dispatched action must \
+             share one sample; a second read means they can disagree about now"
         );
 
         swarm.poll().expect("poll");
         assert_eq!(reads.load(Ordering::SeqCst), 2);
 
-        // The transport saw the same instants the core was ticked with.
+        // The transport saw exactly the instants the core was ticked with.
         let samples: Vec<u64> = swarm
             .transport()
             .samples
@@ -1339,42 +1367,6 @@ mod tests {
             .map(|sample| sample.monotonic_ms)
             .collect();
         assert_eq!(samples, vec![1_000, 2_000]);
-    }
-
-    #[test]
-    fn driver_hands_its_own_clock_sample_to_the_transport() {
-        let clock = Arc::new(TestClock::default());
-        clock.advance(7_000);
-
-        let keypair = Ed25519Keypair::generate();
-        let identify = IdentifyConfig {
-            protocol_version: "test/1".into(),
-            agent_version: "test/1".into(),
-            protocols: Vec::new(),
-            public_key: keypair.public_key().encode_protobuf(),
-        };
-        let mut swarm = Swarm::with_clock(
-            IdleTransport::default(),
-            identify,
-            PingConfig::default(),
-            keypair.peer_id(),
-            Box::new(SharedClock(clock.clone())),
-        );
-
-        swarm.poll().expect("poll");
-        clock.advance(1_500);
-        swarm.poll().expect("poll");
-
-        // The transport reads no clock of its own: it sees exactly what the
-        // driver sampled, so every component in one iteration shares an
-        // instant.
-        let samples: Vec<u64> = swarm
-            .transport()
-            .samples
-            .iter()
-            .map(|sample| sample.monotonic_ms)
-            .collect();
-        assert_eq!(samples, vec![7_000, 8_500]);
     }
 
     #[test]
