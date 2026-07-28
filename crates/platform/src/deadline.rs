@@ -52,8 +52,13 @@ impl Deadline {
     /// Returns the milliseconds remaining until this deadline, or zero if it
     /// has already expired.
     ///
-    /// [`NEVER`](Self::NEVER) reports `u64::MAX` remaining.
+    /// [`NEVER`](Self::NEVER) always reports `u64::MAX` remaining, however far
+    /// monotonic time has advanced, so it stays consistent with
+    /// [`is_expired_at`](Self::is_expired_at) never reporting it as due.
     pub const fn millis_until(self, now: Now) -> u64 {
+        if self.is_never() {
+            return u64::MAX;
+        }
         self.0.saturating_sub(now.monotonic_ms)
     }
 
@@ -120,12 +125,31 @@ mod tests {
     fn never_does_not_expire_at_end_of_timeline() {
         assert!(Deadline::NEVER.is_never());
         assert!(!Deadline::NEVER.is_expired_at(Now::from_millis(u64::MAX)));
-        assert_eq!(Deadline::NEVER.millis_until(Now::from_millis(0)), u64::MAX);
+    }
+
+    #[test]
+    fn never_reports_full_remaining_time_however_far_now_has_advanced() {
+        // A plain saturating subtraction would shrink this toward zero as time
+        // passes while `is_expired_at` still reported "not due", so a host
+        // idling for `millis_until` would wake early for no reason.
+        for now in [0, 1, 1_000_000, u64::MAX / 2, u64::MAX - 1, u64::MAX] {
+            let now = Now::from_millis(now);
+            assert_eq!(
+                Deadline::NEVER.millis_until(now),
+                u64::MAX,
+                "millis_until disagreed with is_expired_at at {now:?}"
+            );
+            assert!(!Deadline::NEVER.is_expired_at(now));
+        }
     }
 
     #[test]
     fn remaining_time_saturates_at_zero() {
-        let deadline = Deadline::from_millis(100);
+        // Raw millis are read back as an instant, not a duration.
+        let deadline = Deadline::from(100u64);
+        assert_eq!(deadline.as_millis(), 100);
+        assert_eq!(u64::from(deadline), 100);
+
         assert_eq!(deadline.millis_until(Now::from_millis(40)), 60);
         assert_eq!(deadline.millis_until(Now::from_millis(100)), 0);
         assert_eq!(deadline.millis_until(Now::from_millis(500)), 0);
@@ -189,11 +213,5 @@ mod tests {
     fn display_names_the_never_sentinel() {
         assert_eq!(format!("{}", Deadline::from_millis(25)), "25ms");
         assert_eq!(format!("{}", Deadline::NEVER), "never");
-    }
-
-    #[test]
-    fn converts_to_and_from_raw_millis() {
-        assert_eq!(Deadline::from(25u64).as_millis(), 25);
-        assert_eq!(u64::from(Deadline::from_millis(25)), 25);
     }
 }

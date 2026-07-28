@@ -38,10 +38,6 @@ use thiserror::Error;
 // its half of a gracefully closed bridge.
 const MAX_RETIRED_BRIDGES: usize = 1024;
 
-fn is_circuit_id(id: ConnectionId) -> bool {
-    id.is_circuit()
-}
-
 /// Supplies fresh cryptographic entropy for one circuit adoption.
 pub trait EntropySource {
     /// Fills `destination` with unpredictable bytes.
@@ -191,7 +187,7 @@ pub struct CircuitTransport<T, E> {
     direct_by_peer: BTreeMap<PeerId, BTreeSet<ConnectionId>>,
     direct_by_conn: BTreeMap<ConnectionId, PeerId>,
     pending: VecDeque<TransportEvent>,
-    circuit_ids: ConnectionIdAllocator,
+    circuit_id_allocator: ConnectionIdAllocator,
 }
 
 impl<T, E> CircuitTransport<T, E> {
@@ -210,7 +206,7 @@ impl<T, E> CircuitTransport<T, E> {
             direct_by_peer: BTreeMap::new(),
             direct_by_conn: BTreeMap::new(),
             pending: VecDeque::new(),
-            circuit_ids: ConnectionIdAllocator::new(ConnectionNamespace::CIRCUIT),
+            circuit_id_allocator: ConnectionIdAllocator::new(ConnectionNamespace::CIRCUIT),
         }
     }
 
@@ -222,7 +218,7 @@ impl<T, E> CircuitTransport<T, E> {
 
     /// Returns whether an identifier belongs to a circuit connection.
     pub fn is_circuit(id: ConnectionId) -> bool {
-        is_circuit_id(id)
+        id.is_circuit()
     }
 
     /// Returns the active circuit connection identifiers.
@@ -278,7 +274,10 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             return Err(AdoptError::PeerAlreadyDirect);
         }
 
-        let id = self.circuit_ids.peek().ok_or(AdoptError::IdsExhausted)?;
+        let id = self
+            .circuit_id_allocator
+            .peek()
+            .ok_or(AdoptError::IdsExhausted)?;
 
         let mut static_secret = [0u8; 32];
         let mut ephemeral_secret = [0u8; 32];
@@ -314,7 +313,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
 
         // Consume the sequence only here: an adoption that failed above
         // (entropy, validation) must leave the id space untouched.
-        let consumed = self.circuit_ids.allocate();
+        let consumed = self.circuit_id_allocator.allocate();
         debug_assert_eq!(consumed, Ok(id), "peeked id must match the allocated one");
 
         self.bridge_index.insert(key, id);
@@ -863,7 +862,8 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         let _ = self.inner.close(id);
         self.pending.push_back(TransportEvent::Error {
             id,
-            message: "wrapped transport used the circuit connection-ID bit".to_string(),
+            message: "wrapped transport allocated in the circuit connection-ID namespace"
+                .to_string(),
         });
     }
 
@@ -881,7 +881,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             | TransportEvent::PeerIdentityVerified { id, .. } => Some(*id),
             TransportEvent::Listening { .. } => None,
         };
-        if event_id.is_some_and(is_circuit_id) {
+        if event_id.is_some_and(ConnectionId::is_circuit) {
             self.reject_inner_collision(event_id.expect("checked above"));
             return;
         }
@@ -1075,11 +1075,12 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
 impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
     fn dial(&mut self, address: &minip2p_core::PeerAddr) -> Result<ConnectionId, TransportError> {
         let id = self.inner.dial(address)?;
-        if is_circuit_id(id) {
+        if id.is_circuit() {
             let _ = self.inner.close(id);
             return Err(TransportError::DialFailed {
                 id,
-                reason: "wrapped transport used the circuit connection-ID bit".to_string(),
+                reason: "wrapped transport allocated in the circuit connection-ID namespace"
+                    .to_string(),
             });
         }
         Ok(id)
@@ -1090,7 +1091,7 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
     }
 
     fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
-        if !is_circuit_id(id) {
+        if !id.is_circuit() {
             return self.inner.open_stream(id);
         }
         let stream = self.operate_ready(id, YamuxSession::open_stream)?;
@@ -1106,7 +1107,7 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         stream_id: StreamId,
         data: Vec<u8>,
     ) -> Result<(), TransportError> {
-        if !is_circuit_id(id) {
+        if !id.is_circuit() {
             return self.inner.send_stream(id, stream_id, data);
         }
         self.send_circuit(id, stream_id, data)
@@ -1117,7 +1118,7 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
-        if !is_circuit_id(id) {
+        if !id.is_circuit() {
             return self.inner.close_stream_write(id, stream_id);
         }
         let stream = self.circuit_stream(id, stream_id)?;
@@ -1138,7 +1139,7 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
-        if !is_circuit_id(id) {
+        if !id.is_circuit() {
             return self.inner.reset_stream(id, stream_id);
         }
         let stream = self.circuit_stream(id, stream_id)?;
@@ -1155,7 +1156,7 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
     }
 
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
-        if !is_circuit_id(id) {
+        if !id.is_circuit() {
             return self.inner.close(id);
         }
         let mut circuit = self
@@ -2409,11 +2410,22 @@ mod tests {
             pending_data: Vec::new(),
             remote_write_closed: false,
         };
+        // Adoption peeks the next id up front but must only consume it after
+        // every fallible step, so a failure leaves the id space untouched. A
+        // peek/allocate ordering regression would silently burn a sequence
+        // number per failed adoption, which only this assertion catches.
+        let unconsumed = transport
+            .circuit_id_allocator
+            .peek()
+            .expect("fresh allocator");
+
         assert!(matches!(
             transport.adopt_bridge(adoption.clone()),
             Err(AdoptError::Entropy(_))
         ));
         assert!(transport.circuit_ids().is_empty());
+        assert_eq!(transport.circuit_id_allocator.peek(), Some(unconsumed));
+
         assert_eq!(
             transport.adopt_bridge(BridgeAdoption {
                 remote_write_closed: true,
@@ -2422,7 +2434,9 @@ mod tests {
             Err(AdoptError::RemoteWriteClosed)
         );
         assert!(transport.circuit_ids().is_empty());
-        transport.circuit_ids = ConnectionIdAllocator::starting_at(
+        assert_eq!(transport.circuit_id_allocator.peek(), Some(unconsumed));
+
+        transport.circuit_id_allocator = ConnectionIdAllocator::starting_at(
             ConnectionNamespace::CIRCUIT,
             ConnectionId::MAX_SEQUENCE + 1,
         );
@@ -2461,7 +2475,8 @@ mod tests {
             events,
             vec![TransportEvent::Error {
                 id: collision,
-                message: "wrapped transport used the circuit connection-ID bit".to_string(),
+                message: "wrapped transport allocated in the circuit connection-ID namespace"
+                    .to_string(),
             }]
         );
         assert!(transport.circuit_ids().is_empty());

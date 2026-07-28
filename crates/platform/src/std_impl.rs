@@ -131,18 +131,45 @@ mod tests {
     }
 
     #[test]
-    fn shared_epoch_keeps_clocks_on_one_timeline() {
+    fn samples_are_measured_from_the_injected_epoch() {
+        const OFFSET_MS: u64 = 5_000;
+
+        let epoch = Instant::now();
+        let mut shared = StdClock::with_epoch(epoch);
+        // An epoch further in the past must read as further along the
+        // timeline, by exactly the offset between the two epochs.
+        let mut older = StdClock::with_epoch(epoch - Duration::from_millis(OFFSET_MS));
+
+        let from_shared = shared.now().monotonic_ms;
+        let from_older = older.now().monotonic_ms;
+
+        let delta = from_older
+            .checked_sub(from_shared)
+            .expect("older epoch must read further along the timeline");
+        assert!(
+            delta.abs_diff(OFFSET_MS) < 1_000,
+            "expected ~{OFFSET_MS}ms between epochs, got {delta}ms"
+        );
+    }
+
+    #[test]
+    fn clocks_sharing_an_epoch_produce_comparable_samples() {
         let epoch = Instant::now();
         let mut first = StdClock::with_epoch(epoch);
         let mut second = StdClock::with_epoch(epoch);
         assert_eq!(first.epoch(), second.epoch());
 
+        let before = first.now().monotonic_ms;
         sleep(Duration::from_millis(5));
-        let from_first = first.now();
-        let from_second = second.now();
-        // Same epoch, so the samples are directly comparable.
-        assert!(from_second.monotonic_ms >= from_first.monotonic_ms);
-        assert!(from_second.monotonic_ms - from_first.monotonic_ms < 1_000);
+        let after = second.now().monotonic_ms;
+
+        // Read across two clocks, the sleep must be visible as elapsed time on
+        // the shared timeline.
+        assert!(
+            after >= before + 5,
+            "sleep not observable across clocks: {before} -> {after}"
+        );
+        assert!(after - before < 1_000);
     }
 
     #[test]
@@ -155,13 +182,25 @@ mod tests {
 
     #[test]
     fn entropy_fills_the_whole_buffer() {
+        // Random bytes may legitimately be zero, so "was this byte written?"
+        // can't be asked of one byte. Pre-fill with a sentinel and require
+        // every window to contain a non-sentinel byte: a partial fill leaves a
+        // run of untouched bytes, while a fully-written window surviving as
+        // all-sentinel has probability 256^-WINDOW.
+        const SENTINEL: u8 = 0x5a;
+        const WINDOW: usize = 16;
+
         let mut entropy = StdEntropy::new();
-        let mut buffer = [0u8; 64];
+        let mut buffer = [SENTINEL; 256];
         entropy.fill_bytes(&mut buffer).expect("os entropy");
-        assert!(
-            buffer.iter().any(|&byte| byte != 0),
-            "buffer left untouched"
-        );
+
+        for (index, window) in buffer.windows(WINDOW).enumerate() {
+            assert!(
+                window.iter().any(|&byte| byte != SENTINEL),
+                "bytes {index}..{} were left unwritten",
+                index + WINDOW
+            );
+        }
     }
 
     #[test]

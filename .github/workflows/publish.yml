@@ -354,6 +354,7 @@ jobs:
           }
 
           crates=(
+            minip2p-platform
             minip2p-identity
             minip2p-core
             minip2p-transport

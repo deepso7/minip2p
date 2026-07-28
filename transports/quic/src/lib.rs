@@ -2197,10 +2197,6 @@ mod tests {
         assert_ne!(from_ipv4, from_ipv6);
         assert_eq!(from_ipv4.namespace(), ConnectionNamespace::QUIC_IPV4);
         assert_eq!(from_ipv6.namespace(), ConnectionNamespace::QUIC_IPV6);
-
-        // Neither half's ids can be mistaken for a relay circuit's.
-        assert!(!from_ipv4.is_circuit());
-        assert!(!from_ipv6.is_circuit());
     }
 
     #[test]

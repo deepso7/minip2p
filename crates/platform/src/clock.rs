@@ -134,11 +134,6 @@ mod tests {
         assert_eq!(now.as_deadline(), Deadline::from_millis(10));
     }
 
-    #[test]
-    fn ordering_follows_monotonic_time() {
-        assert!(Now::from_millis(1) < Now::from_millis(2));
-    }
-
     struct Fake(u64);
 
     impl Clock for Fake {

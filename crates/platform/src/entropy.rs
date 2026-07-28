@@ -141,23 +141,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn constructors_match_their_variants() {
-        assert_eq!(
-            EntropyError::unavailable("no hardware rng"),
-            EntropyError::Unavailable {
-                reason: "no hardware rng"
-            }
-        );
-        assert_eq!(
-            EntropyError::failed("busy"),
-            EntropyError::Failed {
-                reason: "busy",
-                code: None
-            }
-        );
-    }
-
     /// Generic over `E: EntropySource`, so passing `&mut Counter` exercises the
     /// blanket impl rather than auto-deref.
     fn draw<E: EntropySource>(mut source: E, buffer: &mut [u8]) -> Result<u64, EntropyError> {

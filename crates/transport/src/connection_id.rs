@@ -311,6 +311,8 @@ mod tests {
 
     #[test]
     fn every_base_transport_namespace_leaves_the_top_bit_clear() {
+        const TOP_BIT: u64 = 1 << 63;
+
         for namespace in [
             ConnectionNamespace::UNSPECIFIED,
             ConnectionNamespace::QUIC_IPV4,
@@ -318,10 +320,39 @@ mod tests {
             ConnectionNamespace::TCP_IPV4,
             ConnectionNamespace::TCP_IPV6,
         ] {
+            // Assert the packing itself, not just `is_circuit()`: hosts and
+            // wire logs may still read the top bit directly.
             let id =
                 ConnectionId::namespaced(namespace, ConnectionId::MAX_SEQUENCE).expect("in range");
+            assert_eq!(
+                id.as_u64() & TOP_BIT,
+                0,
+                "{namespace} set the reserved top bit"
+            );
             assert!(!id.is_circuit(), "{namespace} must not look like a circuit");
         }
+    }
+
+    #[test]
+    fn only_the_circuit_namespace_counts_as_a_circuit() {
+        // `CIRCUIT` is 0x80, so every namespace above it also has the top bit
+        // set. Before namespacing, circuits were identified by that bit alone;
+        // a regression back to a bit-mask test would misread these as circuits.
+        for tag in [0x81u8, 0x90, 0xc0, 0xff] {
+            let namespace = ConnectionNamespace::new(tag);
+            let id = ConnectionId::namespaced(namespace, 1).expect("in range");
+
+            assert_ne!(id.as_u64() & (1 << 63), 0, "expected the top bit set");
+            assert!(!namespace.is_circuit(), "0x{tag:x} is not the circuit tag");
+            assert!(!id.is_circuit(), "0x{tag:x} must not be read as a circuit");
+        }
+
+        assert!(ConnectionNamespace::CIRCUIT.is_circuit());
+        assert!(
+            ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 1)
+                .expect("in range")
+                .is_circuit()
+        );
     }
 
     #[test]
