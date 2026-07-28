@@ -1,6 +1,6 @@
 //! Detached background endpoint driver.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -43,6 +43,65 @@ struct OverflowDiagnostic {
 struct Delivery {
     diagnostic: Option<P2pEvent>,
     batch: Vec<P2pEvent>,
+}
+
+#[derive(Default)]
+struct Carry {
+    events: BTreeMap<u64, P2pEvent>,
+    message_ids: VecDeque<u64>,
+    next_id: u64,
+}
+
+impl Carry {
+    fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    fn push(&mut self, event: P2pEvent) -> bool {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        if matches!(event, P2pEvent::Message { .. }) {
+            self.message_ids.push_back(id);
+        }
+        self.events.insert(id, event);
+        if self.events.len() <= MAX_CARRY_EVENTS {
+            return false;
+        }
+        if let Some(message_id) = self.message_ids.pop_front() {
+            self.events.remove(&message_id);
+        } else {
+            self.events.pop_first();
+        }
+        true
+    }
+
+    fn take(&mut self, limit: usize) -> Vec<P2pEvent> {
+        let ids: Vec<_> = self.events.keys().take(limit).copied().collect();
+        let mut batch = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(event) = self.events.remove(&id) {
+                batch.push(event);
+            }
+        }
+        self.prune_message_ids();
+        batch
+    }
+
+    fn suppress_cancelled(&mut self, cancelled: &BTreeSet<u64>) -> usize {
+        let before = self.events.len();
+        self.events
+            .retain(|_, event| p2p_connect_id(event).is_none_or(|id| !cancelled.contains(&id)));
+        self.prune_message_ids();
+        before - self.events.len()
+    }
+
+    fn prune_message_ids(&mut self) {
+        self.message_ids.retain(|id| self.events.contains_key(id));
+    }
 }
 
 struct ExitGuard {
@@ -105,7 +164,7 @@ pub(crate) fn run(shared: Arc<Shared>, listener: Arc<dyn P2pEventListener>) {
 }
 
 fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
-    let mut carry = VecDeque::new();
+    let mut carry = Carry::default();
     let mut overflow = OverflowDiagnostic::default();
     loop {
         let mut state = guard.shared.lock_state();
@@ -114,6 +173,8 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             return Ok(());
         }
         if !carry.is_empty() || overflow.pending != 0 {
+            let cancelled = carry.suppress_cancelled(&state.cancelled_connect_ids);
+            state.stats.dropped = state.stats.dropped.saturating_add(cancelled as u64);
             let delivery = take_delivery(&mut carry, &mut overflow, &mut state.stats);
             state.stats.iterations = state.stats.iterations.saturating_add(1);
             drop(state);
@@ -122,7 +183,14 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
                 dispatch(listener, event);
             }
             for event in delivery.batch {
-                dispatch(listener, event);
+                let should_dispatch = {
+                    let mut state = guard.shared.lock_state();
+                    let cancelled = state.cancelled_connect_ids.clone();
+                    record_source_dispatch(&event, &cancelled, &mut state.stats)
+                };
+                if should_dispatch {
+                    dispatch(listener, event);
+                }
             }
             continue;
         }
@@ -191,23 +259,24 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
 
 fn ingest(
     events: impl IntoIterator<Item = P2pEvent>,
-    carry: &mut VecDeque<P2pEvent>,
+    carry: &mut Carry,
     overflow: &mut OverflowDiagnostic,
     stats: &mut DriverStats,
 ) {
-    let before = carry.len();
-    carry.extend(events);
-    stats.converted = stats
-        .converted
-        .saturating_add(carry.len().saturating_sub(before) as u64);
-    let dropped = trim_carry(carry) as u64;
+    let mut converted = 0_u64;
+    let mut dropped = 0_u64;
+    for event in events {
+        converted = converted.saturating_add(1);
+        dropped = dropped.saturating_add(u64::from(carry.push(event)));
+    }
+    stats.converted = stats.converted.saturating_add(converted);
     stats.dropped = stats.dropped.saturating_add(dropped);
     overflow.pending = overflow.pending.saturating_add(dropped);
     overflow.total = overflow.total.saturating_add(dropped);
 }
 
 fn take_delivery(
-    carry: &mut VecDeque<P2pEvent>,
+    carry: &mut Carry,
     overflow: &mut OverflowDiagnostic,
     stats: &mut DriverStats,
 ) -> Delivery {
@@ -220,35 +289,8 @@ fn take_delivery(
         stats.dispatch_attempted_synthetic = stats.dispatch_attempted_synthetic.saturating_add(1);
         event
     });
-    let batch: Vec<_> = carry.drain(..carry.len().min(MAX_BATCH_PER_ITER)).collect();
-    stats.dispatch_attempted = stats.dispatch_attempted.saturating_add(batch.len() as u64);
+    let batch = carry.take(MAX_BATCH_PER_ITER);
     Delivery { diagnostic, batch }
-}
-
-fn trim_carry(carry: &mut VecDeque<P2pEvent>) -> usize {
-    let excess = carry.len().saturating_sub(MAX_CARRY_EVENTS);
-    if excess == 0 {
-        return 0;
-    }
-    let messages_to_drop = excess.min(
-        carry
-            .iter()
-            .filter(|event| matches!(event, P2pEvent::Message { .. }))
-            .count(),
-    );
-    let mut dropped_messages = 0;
-    carry.retain(|event| {
-        if dropped_messages < messages_to_drop && matches!(event, P2pEvent::Message { .. }) {
-            dropped_messages += 1;
-            false
-        } else {
-            true
-        }
-    });
-    for _ in 0..excess - messages_to_drop {
-        carry.pop_front();
-    }
-    excess
 }
 
 fn nat_connect_id(event: &NatEvent) -> Option<u64> {
@@ -263,6 +305,31 @@ fn nat_connect_id(event: &NatEvent) -> Option<u64> {
         | NatEvent::RelayReserved { .. }
         | NatEvent::RelayReservationLost { .. }
         | NatEvent::InboundDirectUpgrade { .. } => None,
+    }
+}
+
+fn p2p_connect_id(event: &P2pEvent) -> Option<u64> {
+    match event {
+        P2pEvent::PathEstablished { connect_id, .. }
+        | P2pEvent::PathUpgraded { connect_id, .. }
+        | P2pEvent::HolePunchFailed { connect_id, .. }
+        | P2pEvent::FellBackToRelay { connect_id, .. }
+        | P2pEvent::ConnectFailed { connect_id, .. } => Some(*connect_id),
+        _ => None,
+    }
+}
+
+fn record_source_dispatch(
+    event: &P2pEvent,
+    cancelled: &BTreeSet<u64>,
+    stats: &mut DriverStats,
+) -> bool {
+    if p2p_connect_id(event).is_some_and(|id| cancelled.contains(&id)) {
+        stats.dropped = stats.dropped.saturating_add(1);
+        false
+    } else {
+        stats.dispatch_attempted = stats.dispatch_attempted.saturating_add(1);
+        true
     }
 }
 
@@ -300,30 +367,34 @@ mod tests {
             peer_id: "peer".into(),
             protocols: Vec::new(),
         };
-        let mut carry = VecDeque::from([lifecycle.clone()]);
-        carry.extend((0..=MAX_CARRY_EVENTS).map(|index| message(index as u8)));
-
-        let dropped = trim_carry(&mut carry);
+        let mut carry = Carry::default();
+        assert!(!carry.push(lifecycle.clone()));
+        let dropped = (0..=MAX_CARRY_EVENTS)
+            .filter(|index| carry.push(message(*index as u8)))
+            .count();
 
         assert_eq!(dropped, 2);
         assert_eq!(carry.len(), MAX_CARRY_EVENTS);
-        assert_eq!(carry.front(), Some(&lifecycle));
-        assert_eq!(carry.get(1), Some(&message(2)));
+        let retained = carry.take(MAX_CARRY_EVENTS);
+        assert_eq!(retained.first(), Some(&lifecycle));
+        assert_eq!(retained.get(1), Some(&message(2)));
     }
 
     #[test]
     fn carry_cap_falls_back_to_oldest_event_when_no_messages_exist() {
-        let mut carry = VecDeque::new();
+        let mut carry = Carry::default();
+        let mut dropped = 0;
         for index in 0..=MAX_CARRY_EVENTS {
-            carry.push_back(P2pEvent::PingTimeout {
+            dropped += usize::from(carry.push(P2pEvent::PingTimeout {
                 peer_id: index.to_string(),
-            });
+            }));
         }
 
-        assert_eq!(trim_carry(&mut carry), 1);
+        assert_eq!(dropped, 1);
         assert_eq!(carry.len(), MAX_CARRY_EVENTS);
+        let retained = carry.take(MAX_CARRY_EVENTS);
         assert_eq!(
-            carry.front(),
+            retained.first(),
             Some(&P2pEvent::PingTimeout {
                 peer_id: "1".into()
             })
@@ -332,7 +403,7 @@ mod tests {
 
     #[test]
     fn overflow_diagnostic_batch_limit_and_stats_accounting_close() {
-        let mut carry = VecDeque::new();
+        let mut carry = Carry::default();
         let mut overflow = OverflowDiagnostic::default();
         let mut stats = DriverStats::default();
         ingest(
@@ -352,15 +423,60 @@ mod tests {
             })
         );
         assert_eq!(stats.dispatch_attempted_synthetic, 1);
+        for event in &first.batch {
+            assert!(record_source_dispatch(event, &BTreeSet::new(), &mut stats));
+        }
 
         while !carry.is_empty() {
             let delivery = take_delivery(&mut carry, &mut overflow, &mut stats);
             assert!(delivery.batch.len() <= MAX_BATCH_PER_ITER);
             assert!(delivery.diagnostic.is_none());
+            for event in &delivery.batch {
+                assert!(record_source_dispatch(event, &BTreeSet::new(), &mut stats));
+            }
         }
 
         assert_eq!(stats.converted, stats.dispatch_attempted + stats.dropped);
         assert_eq!(stats.converted, (MAX_CARRY_EVENTS + 10) as u64);
         assert_eq!(stats.dropped, 10);
+    }
+
+    #[test]
+    fn live_cancellation_suppresses_events_already_in_carry() {
+        let mut carry = Carry::default();
+        carry.push(P2pEvent::ConnectFailed {
+            connect_id: 7,
+            peer_id: "peer".into(),
+            kind: crate::NatErrorKind::NoPathAvailable,
+            detail: "no path".into(),
+        });
+        carry.push(P2pEvent::PingTimeout {
+            peer_id: "other".into(),
+        });
+
+        let suppressed = carry.suppress_cancelled(&BTreeSet::from([7]));
+        let retained = carry.take(MAX_BATCH_PER_ITER);
+
+        assert_eq!(suppressed, 1);
+        assert_eq!(
+            retained,
+            vec![P2pEvent::PingTimeout {
+                peer_id: "other".into()
+            }]
+        );
+
+        let extracted = P2pEvent::PathEstablished {
+            connect_id: 7,
+            peer_id: "peer".into(),
+            path: crate::PathKind::DirectDialed,
+        };
+        let mut stats = DriverStats::default();
+        assert!(!record_source_dispatch(
+            &extracted,
+            &BTreeSet::from([7]),
+            &mut stats
+        ));
+        assert_eq!(stats.dropped, 1);
+        assert_eq!(stats.dispatch_attempted, 0);
     }
 }

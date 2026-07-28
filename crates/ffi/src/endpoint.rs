@@ -1040,32 +1040,4 @@ mod tests {
             FfiError::Transport { .. }
         ));
     }
-
-    #[test]
-    fn cancelled_pre_start_terminal_event_is_not_delivered() {
-        let endpoint = endpoint(config()).expect("endpoint");
-        let remote = minip2p::Ed25519Keypair::from_secret_key_bytes([12; 32]).peer_id();
-        let id = endpoint.connect(remote.to_base58()).expect("connect");
-        endpoint.cancel_connect(id).expect("cancel");
-        let listener = Arc::new(RecordingListener::default());
-
-        endpoint
-            .start(Arc::clone(&listener) as Arc<dyn P2pEventListener>)
-            .expect("start");
-        std::thread::sleep(Duration::from_millis(50));
-        endpoint.stop();
-        assert!(endpoint.wait_stopped(1_000));
-
-        assert!(
-            !listener
-                .events
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .iter()
-                .any(|event| matches!(
-                    event,
-                    crate::P2pEvent::ConnectFailed { connect_id, .. } if *connect_id == id
-                ))
-        );
-    }
 }

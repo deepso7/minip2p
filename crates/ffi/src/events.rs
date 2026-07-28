@@ -643,4 +643,63 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn nat_error_categories_are_exhaustively_converted() {
+        for (error, expected) in [
+            (NatError::NoPathAvailable, NatErrorKind::NoPathAvailable),
+            (NatError::Timeout, NatErrorKind::Timeout),
+            (
+                NatError::DialFailed("dial".into()),
+                NatErrorKind::DialFailed,
+            ),
+            (
+                NatError::Protocol("protocol".into()),
+                NatErrorKind::Protocol,
+            ),
+            (
+                NatError::RelayRefused("relay".into()),
+                NatErrorKind::RelayRefused,
+            ),
+        ] {
+            assert_eq!(convert_nat_error_kind(&error), expected);
+        }
+    }
+
+    #[test]
+    fn discovery_terminal_and_failure_events_preserve_fields() {
+        let remote = peer(8);
+        assert_eq!(
+            convert_discovery(DiscoveryEvent::PeerExpired {
+                peer: remote.clone()
+            }),
+            P2pEvent::PeerExpired {
+                peer_id: remote.to_base58()
+            }
+        );
+        assert_eq!(
+            convert_discovery(DiscoveryEvent::DialFailed {
+                peer: remote.clone(),
+                reason: "offline".into(),
+            }),
+            P2pEvent::DiscoveryDialFailed {
+                peer_id: remote.to_base58(),
+                reason: "offline".into(),
+            }
+        );
+        assert_eq!(
+            convert_discovery(DiscoveryEvent::ProtocolViolation {
+                peer: Some(remote.clone()),
+                source: UpstreamDiscoverySource::Mdns,
+                reason: "bad claim".into(),
+                suppressed: 3,
+            }),
+            P2pEvent::DiscoveryProtocolViolation {
+                peer_id: Some(remote.to_base58()),
+                source: DiscoverySource::Mdns,
+                reason: "bad claim".into(),
+                suppressed: 3,
+            }
+        );
+    }
 }
