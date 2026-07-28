@@ -14,9 +14,10 @@ use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
 use boring::x509::X509;
 use hmac::{Hmac, KeyInit, Mac};
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
+use minip2p_platform::{Deadline, Now};
 use minip2p_transport::{
-    ConnectionEndpoint, ConnectionId, ConnectionIdAllocator, ConnectionNamespace, StreamId,
-    Transport, TransportError, TransportEvent, WaitOutcome,
+    BlockingTransport, ConnectionEndpoint, ConnectionId, ConnectionIdAllocator,
+    ConnectionNamespace, StreamId, Transport, TransportError, TransportEvent, WaitOutcome,
 };
 use mio::{Events, Interest, Poll, Token, Waker};
 use quiche::ConnectionId as QuicConnectionId;
@@ -452,6 +453,9 @@ pub struct QuicTransport {
     node_config: QuicNodeConfig,
     /// Per-process secret used to authenticate stateless Retry tokens.
     retry_secret: [u8; 32],
+    /// Most recent host time sample, retained so `next_deadline` can answer on
+    /// the host's timeline. `None` until the first `poll`.
+    last_now: Option<Now>,
 }
 
 /// QUIC endpoint that can be backed by one socket or a dual-stack pair.
@@ -856,6 +860,7 @@ impl QuicTransport {
             pending_datagrams: VecDeque::new(),
             listen_addr: None,
             connection_ids: ConnectionIdAllocator::new(namespace),
+            last_now: None,
             node_config,
             retry_secret,
         })
@@ -1247,7 +1252,10 @@ impl Transport for QuicTransport {
             .collect()
     }
 
-    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+    fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
+        // quiche keeps its own clock, so the sample is retained purely to
+        // anchor `next_deadline` on the host's timeline.
+        self.last_now = Some(now);
         // Events accumulate in `self.pending_events` for the whole poll and
         // are only taken at the very end, so any error path leaves the batch
         // queued for the next call instead of dropping it.
@@ -1478,9 +1486,12 @@ impl Transport for QuicTransport {
         Ok(std::mem::take(&mut self.pending_events))
     }
 
-    fn next_timeout(&self) -> Option<Duration> {
+    fn next_deadline(&self) -> Option<Deadline> {
+        // No sample yet means no timeline to answer on.
+        let now = self.last_now?;
+
         // Datagrams stuck on socket writability can't be woken by a
-        // readable peek; return a short duration so the driver retries the
+        // readable peek; return a near deadline so the driver retries the
         // flush soon. (A `flush` blocked mid-connection always leaves its
         // packet queued here, so this also covers packets still in quiche.)
         // Stream writes queued on QUIC flow-control credit, by contrast,
@@ -1488,15 +1499,23 @@ impl Transport for QuicTransport {
         // `wait_for_input` -- or a QUIC timer fires, so they fall through
         // to the real timers and never force a busy-poll.
         if !self.pending_datagrams.is_empty() {
-            return Some(Duration::from_millis(1));
+            return Some(now.deadline_after(1));
         }
 
-        self.connections
+        // quiche measures its timeouts from its own `Instant::now()`, which is
+        // at or after the sample taken at the top of `poll`. Anchoring to the
+        // sample therefore rounds the deadline slightly early -- an extra
+        // harmless wakeup, never a missed timer.
+        let timeout = self
+            .connections
             .values()
             .filter_map(QuicConnection::timeout)
-            .min()
+            .min()?;
+        Some(now.deadline_after(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)))
     }
+}
 
+impl BlockingTransport for QuicTransport {
     fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
         if socket_has_queued_input(&self.socket) {
             WaitOutcome::Ready
@@ -1569,24 +1588,17 @@ impl Transport for QuicEndpoint {
         }
     }
 
-    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+    fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
         match self {
-            Self::Single(transport) => transport.poll(),
-            Self::Dual(transport) => transport.poll(),
+            Self::Single(transport) => transport.poll(now),
+            Self::Dual(transport) => transport.poll(now),
         }
     }
 
-    fn next_timeout(&self) -> Option<Duration> {
+    fn next_deadline(&self) -> Option<Deadline> {
         match self {
-            Self::Single(transport) => transport.next_timeout(),
-            Self::Dual(transport) => transport.next_timeout(),
-        }
-    }
-
-    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-        match self {
-            Self::Single(transport) => transport.wait_for_input(timeout),
-            Self::Dual(transport) => transport.wait_for_input(timeout),
+            Self::Single(transport) => transport.next_deadline(),
+            Self::Dual(transport) => transport.next_deadline(),
         }
     }
 
@@ -1601,6 +1613,15 @@ impl Transport for QuicEndpoint {
         match self {
             Self::Single(transport) => transport.active_inbound_connection_sources(),
             Self::Dual(transport) => transport.active_inbound_connection_sources(),
+        }
+    }
+}
+
+impl BlockingTransport for QuicEndpoint {
+    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
+        match self {
+            Self::Single(transport) => transport.wait_for_input(timeout),
+            Self::Dual(transport) => transport.wait_for_input(timeout),
         }
     }
 }
@@ -1659,9 +1680,9 @@ impl Transport for DualQuicTransport {
         self.transport_mut(family).close(id)
     }
 
-    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
-        let ipv4_events = self.ipv4.poll()?;
-        let ipv6_events = match self.ipv6.poll() {
+    fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
+        let ipv4_events = self.ipv4.poll(now)?;
+        let ipv6_events = match self.ipv6.poll(now) {
             Ok(events) => events,
             Err(e) => {
                 // Requeue the already-taken IPv4 batch (ahead of anything
@@ -1678,14 +1699,24 @@ impl Transport for DualQuicTransport {
         Ok(events)
     }
 
-    fn next_timeout(&self) -> Option<Duration> {
-        match (self.ipv4.next_timeout(), self.ipv6.next_timeout()) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(timeout), None) | (None, Some(timeout)) => Some(timeout),
-            (None, None) => None,
-        }
+    fn next_deadline(&self) -> Option<Deadline> {
+        Deadline::earliest_opt(self.ipv4.next_deadline(), self.ipv6.next_deadline())
     }
 
+    fn local_addresses(&self) -> Vec<Multiaddr> {
+        let mut addrs = self.ipv4.local_addresses();
+        addrs.extend(self.ipv6.local_addresses());
+        addrs
+    }
+
+    fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
+        let mut addrs = self.ipv4.active_inbound_connection_sources();
+        addrs.extend(self.ipv6.active_inbound_connection_sources());
+        addrs
+    }
+}
+
+impl BlockingTransport for DualQuicTransport {
     fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
         // Two independent sockets and no shared readiness primitive, so
         // alternate short readiness waits on each family; a packet on either
@@ -1756,18 +1787,6 @@ impl Transport for DualQuicTransport {
                 }
             }
         }
-    }
-
-    fn local_addresses(&self) -> Vec<Multiaddr> {
-        let mut addrs = self.ipv4.local_addresses();
-        addrs.extend(self.ipv6.local_addresses());
-        addrs
-    }
-
-    fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
-        let mut addrs = self.ipv4.active_inbound_connection_sources();
-        addrs.extend(self.ipv6.active_inbound_connection_sources());
-        addrs
     }
 }
 
@@ -1908,7 +1927,7 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(50));
 
-        transport.poll().expect("poll");
+        transport.poll(Now::from_millis(0)).expect("poll");
         assert!(
             socket_has_queued_input(&transport.socket),
             "one poll must leave datagrams beyond the per-poll bound in the kernel buffer"
@@ -1921,7 +1940,7 @@ mod tests {
                 start.elapsed() < Duration::from_secs(1),
                 "overflow never drained"
             );
-            transport.poll().expect("poll");
+            transport.poll(Now::from_millis(0)).expect("poll");
         }
     }
 
@@ -1943,7 +1962,7 @@ mod tests {
         let good_destination = transport.local_addr().expect("local addr");
         transport.queue_datagram_best_effort(&[0u8; 4], good_destination);
 
-        let events = transport.poll().expect("poll");
+        let events = transport.poll(Now::from_millis(0)).expect("poll");
         assert!(
             events
                 .iter()
@@ -1957,16 +1976,25 @@ mod tests {
     }
 
     #[test]
-    fn next_timeout_is_short_while_outbound_work_is_queued() {
+    fn next_deadline_is_near_while_outbound_work_is_queued() {
         let mut transport =
             QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
-        assert_eq!(transport.next_timeout(), None);
+        // Never polled, so there is no host timeline to answer on yet.
+        assert_eq!(transport.next_deadline(), None);
+
+        let now = Now::from_millis(10_000);
+        transport.poll(now).expect("poll");
+        assert_eq!(
+            transport.next_deadline(),
+            None,
+            "an idle transport arms no timer"
+        );
 
         let destination = transport.local_addr().expect("local addr");
         transport.queue_datagram_best_effort(&[0u8; 4], destination);
         assert_eq!(
-            transport.next_timeout(),
-            Some(Duration::from_millis(1)),
+            transport.next_deadline(),
+            Some(now.deadline_after(1)),
             "queued datagrams must keep the driver polling"
         );
     }
@@ -2129,7 +2157,7 @@ mod tests {
 
         for _ in 0..50 {
             std::thread::sleep(Duration::from_millis(2));
-            let events = server.poll().expect("poll");
+            let events = server.poll(Now::from_millis(0)).expect("poll");
             assert!(
                 !events
                     .iter()

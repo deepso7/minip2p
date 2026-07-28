@@ -1,26 +1,9 @@
 use alloc::vec::Vec;
-use core::time::Duration;
 
 use minip2p_core::{Multiaddr, PeerAddr};
+use minip2p_platform::{Deadline, Now};
 
 use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
-
-/// Result of [`Transport::wait_for_input`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WaitOutcome {
-    /// Input may be ready; the caller should poll now.
-    Ready,
-    /// An external handle interrupted the wait.
-    ///
-    /// Runtime drivers should return control to their caller without treating
-    /// this as transport input or a timer expiry.
-    Interrupted,
-    /// The timeout elapsed without input arriving.
-    TimedOut,
-    /// The transport cannot wait for readiness; the caller should fall back
-    /// to sleeping between polls.
-    Unsupported,
-}
 
 /// The core transport abstraction.
 ///
@@ -62,6 +45,15 @@ pub enum WaitOutcome {
 ///   single `poll()` call.
 /// - Events across different connections have no ordering guarantee.
 /// - `poll()` never blocks. It returns an empty vec when idle.
+///
+/// ## Time
+///
+/// Adapters never read a clock. The host samples time once per drive
+/// iteration and passes that [`Now`] to `poll()`, so every transport, agent,
+/// and runtime in one iteration observes the same instant. Adapters that need
+/// to schedule work retain the last sample they were given and report the
+/// resulting [`Deadline`] from
+/// [`next_deadline`](Transport::next_deadline).
 pub trait Transport {
     /// Initiate an outbound connection and return its allocated connection id.
     ///
@@ -121,35 +113,26 @@ pub trait Transport {
     ///
     /// Must be called regularly. Never blocks -- returns an empty vec when
     /// there is no work to do.
-    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError>;
+    ///
+    /// `now` is the host's time sample for this drive iteration. Adapters must
+    /// use it instead of reading a clock, and should retain it to answer
+    /// [`next_deadline`](Transport::next_deadline).
+    fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError>;
 
-    /// Returns the duration until the transport next needs to be polled for a
-    /// protocol timer, if it has one.
+    /// Returns when the transport next needs polling for a protocol timer, if
+    /// it has one.
     ///
-    /// Runtime drivers can combine this with socket readiness instead of using
-    /// a fixed polling cadence. Returning zero means the timer is already due.
+    /// The deadline is on the timeline of the [`Now`] samples passed to
+    /// [`poll`](Transport::poll); a transport that has never been polled has
+    /// no timeline to answer on and should return `None`. Runtime drivers
+    /// combine this with socket readiness instead of polling on a fixed
+    /// cadence. A deadline that has already expired means "poll now".
     ///
-    /// Adapters with queued outbound work that is waiting on socket
-    /// writability should return a short duration here so drivers keep
-    /// polling until the queue drains.
-    fn next_timeout(&self) -> Option<Duration> {
+    /// Adapters with queued outbound work waiting on socket writability
+    /// should report a near deadline so drivers keep polling until the queue
+    /// drains.
+    fn next_deadline(&self) -> Option<Deadline> {
         None
-    }
-
-    /// Block the calling thread until new transport input may be available or
-    /// `timeout` elapses, whichever comes first.
-    ///
-    /// Adapters that own a socket should override this with a real readiness
-    /// wait (e.g. a blocking peek with a read timeout) so idle drivers can
-    /// sleep for the full timer budget instead of polling on a fixed cadence.
-    /// Implementations must not consume input and must tolerate spurious
-    /// wakeups; callers always follow up with [`poll`](Transport::poll).
-    ///
-    /// The default returns [`WaitOutcome::Unsupported`], telling the driver to
-    /// fall back to short sleeps between polls.
-    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-        let _ = timeout;
-        WaitOutcome::Unsupported
     }
 
     /// Returns the transport multiaddrs this node is currently listening

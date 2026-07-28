@@ -26,6 +26,13 @@ impl Deadline {
     /// [`Now::deadline_after`](Now::deadline_after) with a huge delay.
     pub const NEVER: Self = Self(u64::MAX);
 
+    /// A deadline that has already expired.
+    ///
+    /// Expired at every point on every timeline, so a component with work
+    /// buffered can report "poll me again without idling" without knowing what
+    /// the host's clock currently reads.
+    pub const IMMEDIATE: Self = Self(0);
+
     /// Creates a deadline that expires when monotonic time reaches `millis`.
     pub const fn from_millis(millis: u64) -> Self {
         Self(millis)
@@ -141,6 +148,23 @@ mod tests {
             );
             assert!(!Deadline::NEVER.is_expired_at(now));
         }
+    }
+
+    #[test]
+    fn immediate_is_always_due() {
+        for now in [0, 1, 1_000_000, u64::MAX] {
+            let now = Now::from_millis(now);
+            assert!(
+                Deadline::IMMEDIATE.is_expired_at(now),
+                "IMMEDIATE must be due at {now:?}"
+            );
+            assert_eq!(Deadline::IMMEDIATE.millis_until(now), 0);
+        }
+        // Sorts ahead of any real deadline when folding subsystem deadlines.
+        assert_eq!(
+            Deadline::IMMEDIATE.earliest(Deadline::from_millis(5)),
+            Deadline::IMMEDIATE
+        );
     }
 
     #[test]

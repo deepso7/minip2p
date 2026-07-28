@@ -120,7 +120,7 @@ fn listen_returns_the_resolved_listen_address_and_event_matches() {
     let resolved = listener.listen(&requested).expect("listen");
     assert_eq!(resolved, requested);
 
-    let events = listener.poll().expect("poll");
+    let events = listener.poll(common::now()).expect("poll");
     assert!(
         events
             .iter()
@@ -244,7 +244,9 @@ fn local_stream_limit_is_released_after_stream_gc() {
     client
         .reset_stream(client_conn, first)
         .expect("reset first");
-    client.poll().expect("collect and gc reset stream");
+    client
+        .poll(common::now())
+        .expect("collect and gc reset stream");
 
     let second = client
         .open_stream(client_conn)
@@ -431,7 +433,7 @@ fn quic_deadline_is_exposed_and_driven_without_socket_input() {
     let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
     let (_, conn_id, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
     assert!(
-        client.next_timeout().is_some(),
+        client.next_deadline().is_some(),
         "connected QUIC session must arm a timer"
     );
 
@@ -439,7 +441,7 @@ fn quic_deadline_is_exposed_and_driven_without_socket_input() {
     let mut closed = false;
     while std::time::Instant::now() < deadline {
         closed |= client
-            .poll()
+            .poll(common::now())
             .expect("poll")
             .into_iter()
             .any(|event| matches!(event, TransportEvent::Closed { id, .. } if id == conn_id));
@@ -447,7 +449,8 @@ fn quic_deadline_is_exposed_and_driven_without_socket_input() {
             break;
         }
         let sleep = client
-            .next_timeout()
+            .next_deadline()
+            .map(|deadline| std::time::Duration::from_millis(deadline.millis_until(common::now())))
             .unwrap_or(std::time::Duration::from_millis(1))
             .min(std::time::Duration::from_millis(5));
         if !sleep.is_zero() {
@@ -495,7 +498,7 @@ fn open_stream_emits_stream_opened() {
     assert!(
         found
             || client
-                .poll()
+                .poll(common::now())
                 .unwrap()
                 .iter()
                 .any(|e| matches!(e, TransportEvent::StreamOpened { .. })),
@@ -587,7 +590,7 @@ fn reset_stream_emits_stream_closed() {
     client.reset_stream(client_conn, stream_id).expect("reset");
 
     let mut saw_closed = false;
-    let events = client.poll().unwrap();
+    let events = client.poll(common::now()).unwrap();
     if events.iter().any(|e| {
         matches!(e, TransportEvent::StreamClosed { id, stream_id: sid } if *id == client_conn && *sid == stream_id)
     }) {
@@ -639,6 +642,6 @@ fn poll_returns_empty_when_idle() {
     let mut transport =
         QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
 
-    let events = transport.poll().expect("poll");
+    let events = transport.poll(common::now()).expect("poll");
     assert!(events.is_empty(), "idle poll must return empty vec");
 }

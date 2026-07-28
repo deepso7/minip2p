@@ -986,6 +986,7 @@ dependencies = [
  "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-noise",
+ "minip2p-platform",
  "minip2p-test-support",
  "minip2p-transport",
  "minip2p-yamux",
@@ -1152,6 +1153,7 @@ dependencies = [
  "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-ping",
+ "minip2p-platform",
  "minip2p-swarm",
  "minip2p-tls",
  "minip2p-transport",
@@ -1200,6 +1202,7 @@ dependencies = [
  "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-ping",
+ "minip2p-platform",
  "minip2p-relay",
  "minip2p-test-support",
  "minip2p-transport",
@@ -1211,6 +1214,7 @@ name = "minip2p-test-support"
 version = "0.3.1"
 dependencies = [
  "minip2p-core",
+ "minip2p-platform",
  "minip2p-relay",
  "minip2p-transport",
 ]
@@ -1238,6 +1242,7 @@ name = "minip2p-transport"
 version = "0.3.1"
 dependencies = [
  "minip2p-core",
+ "minip2p-platform",
  "thiserror",
 ]
 

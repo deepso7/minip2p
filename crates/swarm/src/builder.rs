@@ -151,6 +151,7 @@ mod tests {
     use super::*;
     use crate::{DriverError, RESERVED_PROTOCOL_IDS};
     use minip2p_core::{Multiaddr, PeerAddr};
+    use minip2p_platform::Now;
     use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportEvent};
 
     struct NoopTransport;
@@ -193,7 +194,7 @@ mod tests {
             unreachable!()
         }
 
-        fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+        fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {
             Ok(Vec::new())
         }
     }

@@ -234,7 +234,7 @@ fn listener_rejects_dialer_without_mtls_identity() {
     for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(5));
 
-        for event in server.poll().expect("server poll") {
+        for event in server.poll(common::now()).expect("server poll") {
             saw_connected |= matches!(event, TransportEvent::Connected { .. });
             saw_verified |= matches!(event, TransportEvent::PeerIdentityVerified { .. });
         }
@@ -277,8 +277,8 @@ fn dialer_rejects_listener_with_unexpected_peer_id() {
 
     for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let _ = listener_a.poll().expect("listener a poll");
-        let events = dialer.poll().expect("dialer poll");
+        let _ = listener_a.poll(common::now()).expect("listener a poll");
+        let events = dialer.poll(common::now()).expect("dialer poll");
 
         saw_mismatch |= events.iter().any(|event| {
             matches!(event, TransportEvent::Error { message, .. } if message.contains("peer id mismatch"))
@@ -325,7 +325,7 @@ fn listener_rejects_dialer_with_invalid_libp2p_cert() {
     for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(5));
 
-        for event in server.poll().expect("server poll") {
+        for event in server.poll(common::now()).expect("server poll") {
             saw_incoming |= matches!(event, TransportEvent::IncomingConnection { .. });
             saw_cert_error |= matches!(
                 event,
@@ -452,7 +452,9 @@ fn listen_rejects_address_mismatch_with_bound_socket() {
         }
     ));
 
-    let events = transport.poll().expect("poll should still work");
+    let events = transport
+        .poll(common::now())
+        .expect("poll should still work");
     assert!(
         !events
             .iter()

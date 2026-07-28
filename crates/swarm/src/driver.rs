@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 use minip2p_core::{Multiaddr, PeerAddr, PeerId};
 use minip2p_identify::{IdentifyConfig, IdentifyMessage};
 use minip2p_ping::{PING_PAYLOAD_LEN, PingConfig};
-use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, WaitOutcome};
+use minip2p_platform::Now;
+use minip2p_transport::{
+    BlockingTransport, ConnectionId, StreamId, Transport, TransportError, WaitOutcome,
+};
 
 use crate::core::SwarmCore;
 use crate::events::{
@@ -55,7 +58,7 @@ pub enum DriverError {
 /// 1ms is short enough that single-digit-millisecond RTTs are
 /// observable on loopback (two wakeups bound RTT, so ~2ms floor)
 /// without noticeably burning CPU on idle. Transports that implement
-/// [`Transport::wait_for_input`] skip this entirely and block until
+/// [`BlockingTransport::wait_for_input`] skip this entirely and block until
 /// input arrives or the timer budget elapses.
 const POLL_IDLE_SLEEP: Duration = Duration::from_millis(1);
 
@@ -608,7 +611,7 @@ impl<T: Transport> Swarm<T> {
         self.core.set_local_addresses(local_addresses);
 
         // 1. Feed transport events to the core.
-        let events = self.transport.poll()?;
+        let events = self.transport.poll(Now::from_millis(now_ms))?;
         for event in events {
             self.core
                 .handle_input(SwarmInput::Transport { event, now_ms });
@@ -625,7 +628,14 @@ impl<T: Transport> Swarm<T> {
         //    driver's `after_event_actions` queue until a later call.
         Ok(self.event_buffer.drain(..).collect())
     }
+}
 
+/// Blocking drive loops.
+///
+/// These idle the calling thread between polls, so they need a transport that
+/// can wait on readiness. `poll` and the intent methods above stay available
+/// to any [`Transport`], including on hosts with no thread to block.
+impl<T: BlockingTransport> Swarm<T> {
     /// Returns the next swarm event, sleeping internally until one arrives
     /// or `deadline` is reached.
     ///
@@ -677,8 +687,9 @@ impl<T: Transport> Swarm<T> {
             // timer (e.g. a ping timeout, which only fires when a Tick is
             // fed into the core by `poll()`).
             let mut budget = deadline.remaining_at(now).unwrap_or(MAX_IDLE_WAIT);
-            if let Some(timeout) = self.transport.next_timeout() {
-                budget = budget.min(timeout);
+            if let Some(deadline) = self.transport.next_deadline() {
+                let remaining = deadline.millis_until(Now::from_millis(self.now_ms()));
+                budget = budget.min(Duration::from_millis(remaining));
             }
             if let Some(timeout_ms) = self.core.next_timeout(self.now_ms()) {
                 budget = budget.min(Duration::from_millis(timeout_ms));
@@ -806,7 +817,9 @@ impl<T: Transport> Swarm<T> {
         }
         result
     }
+}
 
+impl<T: Transport> Swarm<T> {
     // -----------------------------------------------------------------------
     // Internals
     // -----------------------------------------------------------------------
@@ -1021,6 +1034,12 @@ mod tests {
         poll_calls: usize,
         wait_outcomes: VecDeque<WaitOutcome>,
         wait_calls: usize,
+        /// Every time sample the driver handed to `poll`.
+        samples: Vec<Now>,
+        /// Reported verbatim from `next_deadline`.
+        deadline: Option<minip2p_platform::Deadline>,
+        /// Every budget the driver handed to `wait_for_input`.
+        wait_budgets: Vec<Duration>,
     }
 
     impl Transport for IdleTransport {
@@ -1061,13 +1080,21 @@ mod tests {
             unreachable!()
         }
 
-        fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+        fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
             self.poll_calls += 1;
+            self.samples.push(now);
             Ok(Vec::new())
         }
 
-        fn wait_for_input(&mut self, _: Duration) -> WaitOutcome {
+        fn next_deadline(&self) -> Option<minip2p_platform::Deadline> {
+            self.deadline
+        }
+    }
+
+    impl BlockingTransport for IdleTransport {
+        fn wait_for_input(&mut self, budget: Duration) -> WaitOutcome {
             self.wait_calls += 1;
+            self.wait_budgets.push(budget);
             self.wait_outcomes
                 .pop_front()
                 .unwrap_or(WaitOutcome::TimedOut)
@@ -1143,10 +1170,12 @@ mod tests {
             Ok(())
         }
 
-        fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+        fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {
             Ok(self.event_batches.pop_front().unwrap_or_default())
         }
     }
+
+    impl BlockingTransport for SupersessionTransport {}
 
     fn supersession_swarm(
         remote_peer: PeerId,
@@ -1236,10 +1265,12 @@ mod tests {
             Ok(())
         }
 
-        fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+        fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {
             Ok(self.events.drain(..).collect())
         }
     }
+
+    impl BlockingTransport for FailingUserOpenTransport {}
 
     /// Swarm over an [`IdleTransport`] with throwaway identity and defaults.
     fn idle_swarm() -> Swarm<IdleTransport> {
@@ -1256,6 +1287,86 @@ mod tests {
             PingConfig::default(),
             keypair.peer_id(),
         )
+    }
+
+    #[test]
+    fn driver_hands_its_own_clock_sample_to_the_transport() {
+        let clock = Arc::new(TestClock::default());
+        clock.advance(7_000);
+
+        let keypair = Ed25519Keypair::generate();
+        let identify = IdentifyConfig {
+            protocol_version: "test/1".into(),
+            agent_version: "test/1".into(),
+            protocols: Vec::new(),
+            public_key: keypair.public_key().encode_protobuf(),
+        };
+        let mut swarm = Swarm::with_clock(
+            IdleTransport::default(),
+            identify,
+            PingConfig::default(),
+            keypair.peer_id(),
+            clock.clone(),
+        );
+
+        swarm.poll().expect("poll");
+        clock.advance(1_500);
+        swarm.poll().expect("poll");
+
+        // The transport reads no clock of its own: it sees exactly what the
+        // driver sampled, so every component in one iteration shares an
+        // instant.
+        let samples: Vec<u64> = swarm
+            .transport()
+            .samples
+            .iter()
+            .map(|sample| sample.monotonic_ms)
+            .collect();
+        assert_eq!(samples, vec![7_000, 8_500]);
+    }
+
+    #[test]
+    fn transport_deadline_caps_the_idle_wait_budget() {
+        const DEADLINE_MS: u64 = 40;
+
+        let clock = Arc::new(TestClock::default());
+        clock.advance(1_000);
+
+        let keypair = Ed25519Keypair::generate();
+        let identify = IdentifyConfig {
+            protocol_version: "test/1".into(),
+            agent_version: "test/1".into(),
+            protocols: Vec::new(),
+            public_key: keypair.public_key().encode_protobuf(),
+        };
+        let transport = IdleTransport {
+            // Absolute, on the driver's timeline: 40ms past the current sample.
+            deadline: Some(minip2p_platform::Deadline::from_millis(1_000 + DEADLINE_MS)),
+            wait_outcomes: VecDeque::from([WaitOutcome::Interrupted]),
+            ..IdleTransport::default()
+        };
+
+        let mut swarm = Swarm::with_clock(
+            transport,
+            identify,
+            PingConfig::default(),
+            keypair.peer_id(),
+            clock.clone(),
+        );
+
+        // A far-off caller deadline must not stop the transport's nearer
+        // timer from bounding the sleep.
+        let outcome = swarm
+            .poll_next_interruptible(Duration::from_secs(30))
+            .expect("interruptible wait");
+        assert!(matches!(outcome, PollNext::Interrupted));
+
+        // Without the transport's deadline the driver would have slept on the
+        // caller's 30s deadline instead.
+        assert_eq!(
+            swarm.transport().wait_budgets,
+            vec![Duration::from_millis(DEADLINE_MS)]
+        );
     }
 
     #[test]
@@ -1737,10 +1848,12 @@ mod tests {
             Ok(())
         }
 
-        fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+        fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {
             Ok(self.events.drain(..).collect())
         }
     }
+
+    impl BlockingTransport for FailingSendTransport {}
 
     fn ready_user_swarm(protocol: &str) -> (Swarm<FailingSendTransport>, PeerId, StreamId) {
         let remote_peer = Ed25519Keypair::generate().peer_id();
@@ -2060,10 +2173,12 @@ mod tests {
             Ok(())
         }
 
-        fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+        fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {
             Ok(self.events.drain(..).collect())
         }
+    }
 
+    impl BlockingTransport for NeverRespondTransport {
         fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
             self.waits.push(timeout);
             self.clock.advance(self.advance_per_wait_ms);

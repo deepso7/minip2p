@@ -16,7 +16,6 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::time::Duration;
 
 use minip2p_core::{Multiaddr, Protocol, SansIoProtocol};
 use minip2p_identity::{Ed25519Keypair, PeerId};
@@ -24,9 +23,10 @@ use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, Multistrea
 use minip2p_noise::{
     NOISE_PROTOCOL_ID, NoiseConfig, NoiseInput, NoiseOutput, NoiseRole, NoiseSession,
 };
+use minip2p_platform::{Deadline, Now};
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, ConnectionIdAllocator, ConnectionNamespace, StreamId,
-    Transport, TransportError, TransportEvent, WaitOutcome,
+    Transport, TransportError, TransportEvent,
 };
 use minip2p_yamux::{
     YAMUX_PROTOCOL_ID, YamuxConfig, YamuxError, YamuxInput, YamuxOutput, YamuxRole, YamuxSession,
@@ -1190,29 +1190,23 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         Ok(())
     }
 
-    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+    fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
         if !self.pending.is_empty() {
             return Ok(self.drain_pending_events());
         }
-        for event in self.inner.poll()? {
+        for event in self.inner.poll(now)? {
             self.handle_inner_event(event);
         }
         Ok(self.drain_pending_events())
     }
 
-    fn next_timeout(&self) -> Option<Duration> {
+    fn next_deadline(&self) -> Option<Deadline> {
         if self.pending.is_empty() {
-            self.inner.next_timeout()
+            self.inner.next_deadline()
         } else {
-            Some(Duration::ZERO)
-        }
-    }
-
-    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-        if self.pending.is_empty() {
-            self.inner.wait_for_input(timeout)
-        } else {
-            WaitOutcome::Ready
+            // Buffered circuit events are due regardless of what the host's
+            // clock reads, so this needs no retained time sample.
+            Some(Deadline::IMMEDIATE)
         }
     }
 
@@ -1222,6 +1216,19 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
 
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
         self.inner.active_inbound_connection_sources()
+    }
+}
+
+#[cfg(feature = "std")]
+impl<T: minip2p_transport::BlockingTransport, E: EntropySource> minip2p_transport::BlockingTransport
+    for CircuitTransport<T, E>
+{
+    fn wait_for_input(&mut self, timeout: core::time::Duration) -> minip2p_transport::WaitOutcome {
+        if self.pending.is_empty() {
+            self.inner.wait_for_input(timeout)
+        } else {
+            minip2p_transport::WaitOutcome::Ready
+        }
     }
 }
 
@@ -1329,16 +1336,12 @@ mod tests {
             self.inner.close(id)
         }
 
-        fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
-            self.inner.poll()
+        fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
+            self.inner.poll(now)
         }
 
-        fn next_timeout(&self) -> Option<Duration> {
-            self.inner.next_timeout()
-        }
-
-        fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-            self.inner.wait_for_input(timeout)
+        fn next_deadline(&self) -> Option<Deadline> {
+            self.inner.next_deadline()
         }
 
         fn local_addresses(&self) -> Vec<Multiaddr> {
@@ -1390,11 +1393,11 @@ mod tests {
             b.set_yamux_config(config);
         }
 
-        let _ = a.poll().expect("initial A events");
-        let _ = b.poll().expect("initial B events");
+        let _ = a.poll(Now::from_millis(0)).expect("initial A events");
+        let _ = b.poll(Now::from_millis(0)).expect("initial B events");
         let bridge = a.inner_mut().open_stream(inner_conn).expect("bridge open");
-        let _ = a.poll().expect("local bridge event");
-        let _ = b.poll().expect("remote bridge event");
+        let _ = a.poll(Now::from_millis(0)).expect("local bridge event");
+        let _ = b.poll(Now::from_millis(0)).expect("remote bridge event");
 
         let a_id = a
             .adopt_bridge(BridgeAdoption {
@@ -1422,7 +1425,7 @@ mod tests {
         // pair helpers refer to both deterministic IDs with one value.
         assert_eq!(a_id, b_id);
         assert!(CircuitTransport::<InMemoryTransport, CounterEntropy>::is_circuit(a_id));
-        let incoming = b.poll().expect("responder incoming");
+        let incoming = b.poll(Now::from_millis(0)).expect("responder incoming");
         assert!(matches!(
             incoming.as_slice(),
             [TransportEvent::IncomingConnection { id, endpoint }]
@@ -1456,11 +1459,11 @@ mod tests {
             CounterEntropy(10),
         );
         let mut b = CircuitTransport::new(inner_b, b_identity, CounterEntropy(20));
-        let _ = a.poll().expect("initial A events");
-        let _ = b.poll().expect("initial B events");
+        let _ = a.poll(Now::from_millis(0)).expect("initial A events");
+        let _ = b.poll(Now::from_millis(0)).expect("initial B events");
         let bridge = a.inner_mut().open_stream(inner_conn).expect("bridge open");
-        let _ = a.poll().expect("local bridge event");
-        let _ = b.poll().expect("remote bridge event");
+        let _ = a.poll(Now::from_millis(0)).expect("local bridge event");
+        let _ = b.poll(Now::from_millis(0)).expect("remote bridge event");
         let a_id = a
             .adopt_bridge(BridgeAdoption {
                 inner_conn,
@@ -1487,7 +1490,7 @@ mod tests {
         // pair helpers refer to both deterministic IDs with one value.
         assert_eq!(a_id, b_id);
         assert!(matches!(
-            b.poll().expect("responder incoming").as_slice(),
+            b.poll(Now::from_millis(0)).expect("responder incoming").as_slice(),
             [TransportEvent::IncomingConnection { id, .. }] if *id == b_id
         ));
         (a, b, a_id, bridge, a_peer, b_peer)
@@ -1508,7 +1511,7 @@ mod tests {
         let mut a_connected = false;
         let mut b_connected = false;
         for _ in 0..32 {
-            for event in a.poll().expect("drive initiator") {
+            for event in a.poll(Now::from_millis(0)).expect("drive initiator") {
                 if let TransportEvent::Connected { id, endpoint } = event
                     && id == circuit_id
                 {
@@ -1516,7 +1519,7 @@ mod tests {
                     a_connected = true;
                 }
             }
-            for event in b.poll().expect("drive responder") {
+            for event in b.poll(Now::from_millis(0)).expect("drive responder") {
                 if let TransportEvent::Connected { id, endpoint } = event
                     && id == circuit_id
                 {
@@ -1539,11 +1542,11 @@ mod tests {
         let stream = a.open_stream(circuit_id).expect("open circuit stream");
         assert_eq!(stream.as_u64() % 2, 1, "initiator streams are odd");
         assert!(a
-            .poll()
+            .poll(Now::from_millis(0))
             .expect("opened")
             .iter()
             .any(|event| matches!(event, TransportEvent::StreamOpened { id, stream_id } if *id == circuit_id && *stream_id == stream)));
-        let incoming = b.poll().expect("incoming stream");
+        let incoming = b.poll(Now::from_millis(0)).expect("incoming stream");
         assert!(incoming.iter().any(|event| matches!(event,
             TransportEvent::IncomingStream { id, stream_id }
                 if *id == circuit_id && *stream_id == stream
@@ -1551,27 +1554,27 @@ mod tests {
 
         a.send_stream(circuit_id, stream, b"hello".to_vec())
             .expect("send");
-        let data = b.poll().expect("data");
+        let data = b.poll(Now::from_millis(0)).expect("data");
         assert!(data.iter().any(|event| matches!(event,
             TransportEvent::StreamData { id, stream_id, data }
                 if *id == circuit_id && *stream_id == stream && data == b"hello"
         )));
 
         a.close_stream_write(circuit_id, stream).expect("FIN");
-        let eof = b.poll().expect("remote FIN");
+        let eof = b.poll(Now::from_millis(0)).expect("remote FIN");
         assert!(eof.iter().any(|event| matches!(event,
             TransportEvent::StreamRemoteWriteClosed { id, stream_id }
                 if *id == circuit_id && *stream_id == stream
         )));
         b.send_stream(circuit_id, stream, b"reply".to_vec())
             .expect("reverse send remains open");
-        let reply = a.poll().expect("reply");
+        let reply = a.poll(Now::from_millis(0)).expect("reply");
         assert!(reply.iter().any(|event| matches!(event,
             TransportEvent::StreamData { data, .. } if data == b"reply"
         )));
 
         b.reset_stream(circuit_id, stream).expect("reset");
-        let local_closed = b.poll().expect("local reset close");
+        let local_closed = b.poll(Now::from_millis(0)).expect("local reset close");
         assert_eq!(
             local_closed
                 .iter()
@@ -1579,7 +1582,7 @@ mod tests {
                 .count(),
             1
         );
-        let remote_closed = a.poll().expect("remote reset close");
+        let remote_closed = a.poll(Now::from_millis(0)).expect("remote reset close");
         assert!(remote_closed.iter().any(|event| matches!(event,
             TransportEvent::StreamClosed { id, stream_id }
                 if *id == circuit_id && *stream_id == stream
@@ -1592,8 +1595,8 @@ mod tests {
         let mut a_events = Vec::new();
         let mut b_events = Vec::new();
         for _ in 0..32 {
-            a_events.extend(a.poll().expect("drive initiator"));
-            b_events.extend(b.poll().expect("drive responder"));
+            a_events.extend(a.poll(Now::from_millis(0)).expect("drive initiator"));
+            b_events.extend(b.poll(Now::from_millis(0)).expect("drive responder"));
             let a_connected = a_events.iter().any(
                 |event| matches!(event, TransportEvent::Connected { id, .. } if *id == circuit_id),
             );
@@ -1632,20 +1635,30 @@ mod tests {
                     if *id == circuit_id
             )));
         }
-        assert!(a.poll().expect("idle initiator").is_empty());
-        assert!(b.poll().expect("idle responder").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("idle initiator")
+                .is_empty()
+        );
+        assert!(
+            b.poll(Now::from_millis(0))
+                .expect("idle responder")
+                .is_empty()
+        );
 
         let stream = a.open_stream(circuit_id).expect("open stream");
         a.send_stream(circuit_id, stream, b"ordered".to_vec())
             .expect("send immediately after open");
         assert_eq!(
-            a.poll().expect("local stream event"),
+            a.poll(Now::from_millis(0)).expect("local stream event"),
             [TransportEvent::StreamOpened {
                 id: circuit_id,
                 stream_id: stream,
             }]
         );
-        let inbound = b.poll().expect("coalesced stream open and data");
+        let inbound = b
+            .poll(Now::from_millis(0))
+            .expect("coalesced stream open and data");
         let incoming = inbound
             .iter()
             .position(|event| {
@@ -1668,22 +1681,27 @@ mod tests {
 
         a.reset_stream(circuit_id, stream).expect("reset stream");
         assert_eq!(
-            a.poll().expect("immediate local terminal event"),
+            a.poll(Now::from_millis(0))
+                .expect("immediate local terminal event"),
             [TransportEvent::StreamClosed {
                 id: circuit_id,
                 stream_id: stream,
             }]
         );
         assert_eq!(
-            b.poll().expect("remote terminal event"),
+            b.poll(Now::from_millis(0)).expect("remote terminal event"),
             [TransportEvent::StreamClosed {
                 id: circuit_id,
                 stream_id: stream,
             }]
         );
-        assert!(a.poll().expect("no events after local terminal").is_empty());
         assert!(
-            b.poll()
+            a.poll(Now::from_millis(0))
+                .expect("no events after local terminal")
+                .is_empty()
+        );
+        assert!(
+            b.poll(Now::from_millis(0))
                 .expect("no events after remote terminal")
                 .is_empty()
         );
@@ -1768,11 +1786,11 @@ mod tests {
         let inner_conn = inner_a.connection_id();
         let mut a = CircuitTransport::new(inner_a, a_identity, CounterEntropy(10));
         let mut b = CircuitTransport::new(inner_b, b_identity, CounterEntropy(20));
-        let _ = a.poll().expect("initial A events");
-        let _ = b.poll().expect("initial B events");
+        let _ = a.poll(Now::from_millis(0)).expect("initial A events");
+        let _ = b.poll(Now::from_millis(0)).expect("initial B events");
         let bridge = a.inner_mut().open_stream(inner_conn).expect("bridge open");
-        let _ = a.poll().expect("local bridge event");
-        let _ = b.poll().expect("remote bridge event");
+        let _ = a.poll(Now::from_millis(0)).expect("local bridge event");
+        let _ = b.poll(Now::from_millis(0)).expect("remote bridge event");
         let circuit_id = a
             .adopt_bridge(BridgeAdoption {
                 inner_conn,
@@ -1786,7 +1804,7 @@ mod tests {
             .expect("initiator adoption");
         let header = b
             .inner_mut()
-            .poll()
+            .poll(Now::from_millis(0))
             .expect("read pipelined header")
             .into_iter()
             .find_map(|event| match event {
@@ -1806,7 +1824,9 @@ mod tests {
         })
         .expect("responder adoption with partial pending data");
         assert!(matches!(
-            b.poll().expect("incoming event").as_slice(),
+            b.poll(Now::from_millis(0))
+                .expect("incoming event")
+                .as_slice(),
             [TransportEvent::IncomingConnection { .. }]
         ));
         b.inject_bridge_data(inner_conn, bridge, header[split..].to_vec());
@@ -1824,11 +1844,11 @@ mod tests {
         let inner_conn = inner_a.connection_id();
         let mut a = CircuitTransport::new(inner_a, a_identity.clone(), CounterEntropy(10));
         let mut b = CircuitTransport::new(inner_b, b_identity, CounterEntropy(20));
-        let _ = a.poll().expect("initial A events");
-        let _ = b.poll().expect("initial B events");
+        let _ = a.poll(Now::from_millis(0)).expect("initial A events");
+        let _ = b.poll(Now::from_millis(0)).expect("initial B events");
         let bridge = a.inner_mut().open_stream(inner_conn).expect("bridge open");
-        let _ = a.poll().expect("local bridge event");
-        let _ = b.poll().expect("remote bridge event");
+        let _ = a.poll(Now::from_millis(0)).expect("local bridge event");
+        let _ = b.poll(Now::from_millis(0)).expect("remote bridge event");
 
         let mut select = MultistreamSelect::dialer(NOISE_PROTOCOL_ID);
         select
@@ -1885,7 +1905,9 @@ mod tests {
                 remote_write_closed: false,
             })
             .expect("responder adopts pipelined selection and Noise msg1");
-        let responder_events = b.poll().expect("responder incoming event");
+        let responder_events = b
+            .poll(Now::from_millis(0))
+            .expect("responder incoming event");
         assert!(
             matches!(
                 responder_events.as_slice(),
@@ -1910,19 +1932,27 @@ mod tests {
         // The responder already consumed the scripted copy of the dialer's
         // selection and msg1, so discard the identical selection emitted by
         // the real initiator before letting it consume the responder reply.
-        let duplicate_selection = b.inner_mut().poll().expect("duplicate selection");
+        let duplicate_selection = b
+            .inner_mut()
+            .poll(Now::from_millis(0))
+            .expect("duplicate selection");
         assert!(
             duplicate_selection
                 .iter()
                 .any(|event| matches!(event, TransportEvent::StreamData { .. }))
         );
-        let _ = a.poll().expect("initiator consumes pipelined response");
+        let _ = a
+            .poll(Now::from_millis(0))
+            .expect("initiator consumes pipelined response");
 
         // Receiving the real selection reply emits the duplicate protocol
         // proposal and Noise msg1 before msg3 and the encrypted Yamux
         // selection. Drop those first two data events, then route the
         // remaining bridge events through the wrapper.
-        let mut real_followup = b.inner_mut().poll().expect("real Noise follow-up");
+        let mut real_followup = b
+            .inner_mut()
+            .poll(Now::from_millis(0))
+            .expect("real Noise follow-up");
         for expected in ["protocol proposal", "Noise msg1"] {
             let duplicate = real_followup
                 .iter()
@@ -1945,8 +1975,12 @@ mod tests {
         // selection confirmation is now queued for A, which is still in
         // SelectYamux and has not consumed that ciphertext yet.
         for _ in 0..32 {
-            let _ = a.poll().expect("drive initiator toward Yamux selection");
-            let _ = b.poll().expect("drive responder toward Yamux selection");
+            let _ = a
+                .poll(Now::from_millis(0))
+                .expect("drive initiator toward Yamux selection");
+            let _ = b
+                .poll(Now::from_millis(0))
+                .expect("drive responder toward Yamux selection");
             let a_selecting = matches!(
                 a.circuits.get(&circuit_id).and_then(|c| c.phase.as_ref()),
                 Some(Phase::SelectYamux { .. })
@@ -1974,7 +2008,10 @@ mod tests {
         // first transitions A to Ready and the second must be routed through
         // that newly-created Ready state.
         let opened = b.open_stream(circuit_id).expect("open responder stream");
-        let raw = a.inner_mut().poll().expect("read encrypted bridge batch");
+        let raw = a
+            .inner_mut()
+            .poll(Now::from_millis(0))
+            .expect("read encrypted bridge batch");
         let chunks: Vec<_> = raw
             .into_iter()
             .filter_map(|event| match event {
@@ -1993,7 +2030,9 @@ mod tests {
             .inner_conn;
         a.inject_bridge_data(inner_conn, bridge, coalesced);
 
-        let events = a.poll().expect("drain cross-boundary outputs");
+        let events = a
+            .poll(Now::from_millis(0))
+            .expect("drain cross-boundary outputs");
         assert!(events.iter().any(
             |event| matches!(event, TransportEvent::Connected { id, .. } if *id == circuit_id)
         ));
@@ -2024,14 +2063,22 @@ mod tests {
         let inner_conn = ConnectionId::new(1);
 
         a.inject_bridge_closed(inner_conn, bridge);
-        let events = a.poll().expect("pre-ready bridge reset");
+        let events = a.poll(Now::from_millis(0)).expect("pre-ready bridge reset");
         assert_pre_ready_bridge_failure(&events, circuit_id);
-        assert!(a.poll().expect("consume reset acknowledgement").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("consume reset acknowledgement")
+                .is_empty()
+        );
 
         a.inject_bridge_data(inner_conn, bridge, b"late".to_vec());
         a.inject_bridge_remote_write_closed(inner_conn, bridge);
         a.inject_bridge_closed(inner_conn, bridge);
-        assert!(a.poll().expect("nothing follows terminal close").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("nothing follows terminal close")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2040,12 +2087,20 @@ mod tests {
         let inner_conn = ConnectionId::new(1);
 
         a.inject_bridge_remote_write_closed(inner_conn, bridge);
-        let events = a.poll().expect("pre-ready bridge FIN");
+        let events = a.poll(Now::from_millis(0)).expect("pre-ready bridge FIN");
         assert_pre_ready_bridge_failure(&events, circuit_id);
-        assert!(a.poll().expect("consume reset acknowledgement").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("consume reset acknowledgement")
+                .is_empty()
+        );
 
         a.inject_bridge_data(inner_conn, bridge, b"late".to_vec());
-        assert!(a.poll().expect("post-close data is ignored").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("post-close data is ignored")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2090,7 +2145,7 @@ mod tests {
         );
         complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
         a.close(circuit_id).expect("graceful close");
-        let events = a.poll().expect("closed event");
+        let events = a.poll(Now::from_millis(0)).expect("closed event");
         assert_eq!(events, vec![TransportEvent::Closed { id: circuit_id }]);
         assert!(matches!(
             a.open_stream(circuit_id),
@@ -2099,7 +2154,11 @@ mod tests {
         a.inject_bridge_data(ConnectionId::new(1), bridge, b"late".to_vec());
         a.inject_bridge_remote_write_closed(ConnectionId::new(1), bridge);
         a.inject_bridge_closed(ConnectionId::new(1), bridge);
-        assert!(a.poll().expect("late bridge events are dropped").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("late bridge events are dropped")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2107,9 +2166,9 @@ mod tests {
         let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) = setup_close_observed_pair();
         complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
         let stream = a.open_stream(circuit_id).expect("open stream before close");
-        let _ = a.poll().expect("local stream open");
-        let _ = b.poll().expect("remote stream open");
-        let _ = a.poll().expect("stream acknowledgement");
+        let _ = a.poll(Now::from_millis(0)).expect("local stream open");
+        let _ = b.poll(Now::from_millis(0)).expect("remote stream open");
+        let _ = a.poll(Now::from_millis(0)).expect("stream acknowledgement");
         a.send_stream(circuit_id, stream, b"queued-before-close".to_vec())
             .expect("queue application data before close");
 
@@ -2117,7 +2176,7 @@ mod tests {
         assert_eq!(a.inner().close_write_calls, 1);
         assert_eq!(a.inner().reset_calls, 0);
         assert_eq!(
-            a.poll().expect("local close event"),
+            a.poll(Now::from_millis(0)).expect("local close event"),
             [
                 TransportEvent::StreamClosed {
                     id: circuit_id,
@@ -2127,7 +2186,10 @@ mod tests {
             ]
         );
 
-        let peer_wire = b.inner_mut().poll().expect("peer bridge events");
+        let peer_wire = b
+            .inner_mut()
+            .poll(Now::from_millis(0))
+            .expect("peer bridge events");
         let data_positions: Vec<_> = peer_wire
             .iter()
             .enumerate()
@@ -2154,7 +2216,9 @@ mod tests {
         for event in peer_wire {
             b.handle_inner_event(event);
         }
-        let peer_events = b.poll().expect("peer observes data then GoAway");
+        let peer_events = b
+            .poll(Now::from_millis(0))
+            .expect("peer observes data then GoAway");
         assert!(
             matches!(
                 peer_events.as_slice(),
@@ -2168,7 +2232,11 @@ mod tests {
             ),
             "unexpected peer close events: {peer_events:?}"
         );
-        assert!(b.poll().expect("terminal peer state").is_empty());
+        assert!(
+            b.poll(Now::from_millis(0))
+                .expect("terminal peer state")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2178,7 +2246,7 @@ mod tests {
         let inner_conn = ConnectionId::new(1);
 
         a.close(circuit_id).expect("graceful circuit close");
-        let _ = a.poll().expect("local close event");
+        let _ = a.poll(Now::from_millis(0)).expect("local close event");
         assert!(a.retired_bridges.contains(&(inner_conn, bridge)));
 
         for index in 0..MAX_RETIRED_BRIDGES {
@@ -2203,11 +2271,14 @@ mod tests {
         assert_eq!(a.inner().close_write_calls, 1);
         assert_eq!(a.inner().reset_calls, 1);
         assert_eq!(
-            a.poll().expect("local close event"),
+            a.poll(Now::from_millis(0)).expect("local close event"),
             [TransportEvent::Closed { id: circuit_id }]
         );
 
-        let peer_wire = b.inner_mut().poll().expect("peer bridge events");
+        let peer_wire = b
+            .inner_mut()
+            .poll(Now::from_millis(0))
+            .expect("peer bridge events");
         assert!(
             peer_wire
                 .iter()
@@ -2227,7 +2298,8 @@ mod tests {
             b.handle_inner_event(event);
         }
         assert_eq!(
-            b.poll().expect("peer observes terminal close"),
+            b.poll(Now::from_millis(0))
+                .expect("peer observes terminal close"),
             [TransportEvent::Closed { id: circuit_id }]
         );
     }
@@ -2241,16 +2313,24 @@ mod tests {
         assert_eq!(a.inner().close_write_calls, 0);
         assert_eq!(a.inner().reset_calls, 1);
         assert_eq!(
-            a.poll().expect("pre-ready close event"),
+            a.poll(Now::from_millis(0)).expect("pre-ready close event"),
             [TransportEvent::Closed { id: circuit_id }]
         );
         assert_eq!(
             a.close(circuit_id),
             Err(TransportError::ConnectionNotFound { id: circuit_id })
         );
-        assert!(a.poll().expect("consume reset acknowledgement").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("consume reset acknowledgement")
+                .is_empty()
+        );
         a.inject_bridge_data(inner_conn, bridge, b"late".to_vec());
-        assert!(a.poll().expect("post-close data is ignored").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("post-close data is ignored")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2260,13 +2340,13 @@ mod tests {
         let stream = a
             .open_stream(circuit_id)
             .expect("open stream before relay loss");
-        let _ = a.poll().expect("local stream open");
-        let _ = b.poll().expect("remote stream open");
+        let _ = a.poll(Now::from_millis(0)).expect("local stream open");
+        let _ = b.poll(Now::from_millis(0)).expect("remote stream open");
 
         a.inner_mut()
             .close(ConnectionId::new(1))
             .expect("relay connection closes");
-        let events = a.poll().expect("relay close mapping");
+        let events = a.poll(Now::from_millis(0)).expect("relay close mapping");
         assert_eq!(
             events
                 .iter()
@@ -2283,7 +2363,11 @@ mod tests {
             TransportEvent::StreamClosed { id, stream_id }
                 if *id == circuit_id && *stream_id == stream
         )));
-        assert!(a.poll().expect("relay close is terminal").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("relay close is terminal")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2303,8 +2387,8 @@ mod tests {
 
         let initiator_stream = a.open_stream(circuit_id).expect("initiator stream");
         assert_eq!(initiator_stream.as_u64() % 2, 1);
-        let _ = a.poll().expect("local open");
-        let _ = b.poll().expect("remote open");
+        let _ = a.poll(Now::from_millis(0)).expect("local open");
+        let _ = b.poll(Now::from_millis(0)).expect("remote open");
 
         let error = a
             .send_stream(
@@ -2316,10 +2400,15 @@ mod tests {
         assert!(matches!(error, TransportError::StreamSendFailed { .. }));
         a.send_stream(circuit_id, initiator_stream, b"still-alive".to_vec())
             .expect("backpressure must not poison the stream");
-        assert!(b.poll().expect("small data").iter().any(|event| matches!(
-            event,
-            TransportEvent::StreamData { data, .. } if data == b"still-alive"
-        )));
+        assert!(
+            b.poll(Now::from_millis(0))
+                .expect("small data")
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    TransportEvent::StreamData { data, .. } if data == b"still-alive"
+                ))
+        );
 
         let responder_stream = b.open_stream(circuit_id).expect("responder stream");
         assert_eq!(responder_stream.as_u64() % 2, 0);
@@ -2354,7 +2443,9 @@ mod tests {
         let relay = identity(9).peer_id();
         let (inner, _) = InMemoryTransport::pair(local.peer_id(), remote.clone());
         let mut direct_first = CircuitTransport::new(inner, local, CounterEntropy(1));
-        let _ = direct_first.poll().expect("record direct connection");
+        let _ = direct_first
+            .poll(Now::from_millis(0))
+            .expect("record direct connection");
         assert_eq!(
             direct_first.adopt_bridge(BridgeAdoption {
                 inner_conn: ConnectionId::new(1),
@@ -2378,7 +2469,9 @@ mod tests {
                 b_peer,
             ),
         });
-        let events = a.poll().expect("direct connection arrives");
+        let events = a
+            .poll(Now::from_millis(0))
+            .expect("direct connection arrives");
         assert!(events.iter().any(|event| matches!(
             event,
             TransportEvent::Error { id, .. } if *id == circuit_id
@@ -2400,7 +2493,9 @@ mod tests {
         let relay = identity(9).peer_id();
         let (inner, _) = InMemoryTransport::pair(local.peer_id(), relay.clone());
         let mut transport = CircuitTransport::new(inner, local, FailingEntropy);
-        let _ = transport.poll().expect("activate wrapped connection");
+        let _ = transport
+            .poll(Now::from_millis(0))
+            .expect("activate wrapped connection");
         let adoption = BridgeAdoption {
             inner_conn: ConnectionId::new(1),
             bridge_stream: StreamId::new(7),
@@ -2455,7 +2550,9 @@ mod tests {
         let relay = identity(9).peer_id();
         let (inner, _) = InMemoryTransport::pair(local.peer_id(), relay);
         let mut transport = CircuitTransport::new(inner, local, CounterEntropy(1));
-        let _ = transport.poll().expect("initial direct event");
+        let _ = transport
+            .poll(Now::from_millis(0))
+            .expect("initial direct event");
         // InMemoryTransport::dial is intentionally stubbed, so this fixture
         // covers polled collisions; dial-return collisions need a dial fake.
         let collision = ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 77)
@@ -2470,7 +2567,9 @@ mod tests {
                         .expect("collision endpoint"),
                 ),
             });
-        let events = transport.poll().expect("collision event");
+        let events = transport
+            .poll(Now::from_millis(0))
+            .expect("collision event");
         assert_eq!(
             events,
             vec![TransportEvent::Error {

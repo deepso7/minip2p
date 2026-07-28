@@ -2,7 +2,7 @@
 
 Synchronous QUIC transport adapter for minip2p, powered by [quiche](https://github.com/cloudflare/quiche).
 
-No async runtime required. The host drives the transport by calling `poll()`.
+No async runtime required. The host drives the transport by calling `poll(now)` with its own time sample.
 
 ## Features
 
@@ -20,9 +20,9 @@ No async runtime required. The host drives the transport by calling `poll()`.
 - `QuicNodeConfig` is identity-first: constructing a transport requires an Ed25519 host keypair.
 - Dial supports `/ip4`, `/ip6`, `/dns`, `/dns4`, `/dns6` QUIC transport addresses.
 - `QuicEndpoint::dual_stack` binds separate IPv4 and IPv6 wildcard sockets for the common "listen on both" case.
-- QUIC deadlines are exposed through `Transport::next_timeout()` and processed
+- QUIC deadlines are exposed through `Transport::next_deadline()` and processed
   by `poll()`; no async runtime or hidden timer thread is used. Idle drivers
-  block on `Transport::wait_for_input()` (a readiness peek on the UDP socket)
+  block on `BlockingTransport::wait_for_input()` (a readiness peek on the UDP socket)
   instead of polling on a fixed cadence.
 - Stateless Retry authenticates source addresses before inbound connection
   allocation. Configurable limits bound connections, streams, queued stream

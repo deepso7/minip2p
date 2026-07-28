@@ -6,7 +6,7 @@ This crate defines the transport abstraction that concrete adapters (QUIC, WebSo
 
 ## Features
 
-- `Transport` trait with a `poll()`-based event model.
+- `Transport` trait with a `poll(now)`-based event model; adapters never read a clock.
 - `ConnectionId` and `StreamId` identifiers, with `ConnectionNamespace` keeping each transport's id space disjoint.
 - Connection lifecycle events (`Connected`, `Closed`, `IncomingConnection`, `PeerIdentityVerified`, `Listening`).
 - Stream lifecycle events (`StreamOpened`, `IncomingStream`, `StreamData`, `StreamRemoteWriteClosed`, `StreamClosed`).
@@ -36,8 +36,8 @@ The registered namespaces (`QUIC_IPV4`, `QUIC_IPV6`, `TCP_IPV4`, `TCP_IPV6`, `CI
 Implement the `Transport` trait for your adapter:
 
 ```rust
-use core::time::Duration;
 use minip2p_core::{Multiaddr, PeerAddr};
+use minip2p_platform::{Deadline, Now};
 use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, TransportEvent};
 
 struct MyTransport;
@@ -80,11 +80,11 @@ impl Transport for MyTransport {
         todo!("close connection")
     }
 
-    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
-        todo!("drive transport and emit events")
+    fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
+        todo!("drive transport and emit events using the caller's time sample")
     }
 
-    fn next_timeout(&self) -> Option<Duration> {
+    fn next_deadline(&self) -> Option<Deadline> {
         todo!("return the next protocol deadline, if any")
     }
 
@@ -94,10 +94,26 @@ impl Transport for MyTransport {
 }
 ```
 
-Adapters that own a socket should also override `wait_for_input(timeout)`
-with a real readiness wait (e.g. a blocking peek with a read timeout) so
-idle drivers can sleep for the full timer budget instead of polling on a
-fixed cadence; the default returns `WaitOutcome::Unsupported`.
+## Time
+
+Adapters never read a clock. The host samples time once per drive iteration and passes that `Now` to `poll()`, so every transport, agent, and runtime in one iteration observes the same instant. An adapter that schedules work retains the last sample it was given and reports the resulting absolute `Deadline` from `next_deadline()`, which the host uses to decide how long it may idle.
+
+## Blocking waits (`std` only)
+
+Blocking a thread needs an OS to block on, so it is not part of the portable contract. Adapters that own a socket implement the `std`-gated `BlockingTransport` extension with a real readiness wait (e.g. a blocking peek with a read timeout) so idle drivers sleep for the whole timer budget instead of spinning on a fixed cadence:
+
+```rust
+use std::time::Duration;
+use minip2p_transport::{BlockingTransport, WaitOutcome};
+
+impl BlockingTransport for MyTransport {
+    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
+        todo!("wait for socket readiness without consuming input")
+    }
+}
+```
+
+The default implementation returns `WaitOutcome::Unsupported`, so `impl BlockingTransport for MyTransport {}` is enough to opt a transport into blocking drivers with a sleep fallback. A `no_std` host skips this entirely and idles however its platform allows, using `next_deadline()` to decide for how long.
 
 ## no_std
 

@@ -7,6 +7,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "std")]
+mod blocking;
 mod connection_endpoint;
 mod connection_id;
 mod connection_state;
@@ -21,4 +23,7 @@ pub use connection_state::ConnectionState;
 pub use error::TransportError;
 pub use event::TransportEvent;
 pub use stream_id::StreamId;
-pub use transport::{Transport, WaitOutcome};
+pub use transport::Transport;
+
+#[cfg(feature = "std")]
+pub use blocking::{BlockingTransport, WaitOutcome};
