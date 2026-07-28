@@ -2,7 +2,9 @@
 //!
 //! The wrapper performs multistream-select, Noise XX, and Yamux without
 //! owning sockets, clocks, or an executor. Wrapped transport connection IDs
-//! pass through unchanged; circuit IDs have [`CIRCUIT_ID_BIT`] set.
+//! pass through unchanged; circuit IDs are allocated in
+//! [`ConnectionNamespace::CIRCUIT`], which keeps them disjoint from every base
+//! transport's ids.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
@@ -23,16 +25,13 @@ use minip2p_noise::{
     NOISE_PROTOCOL_ID, NoiseConfig, NoiseInput, NoiseOutput, NoiseRole, NoiseSession,
 };
 use minip2p_transport::{
-    ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
-    WaitOutcome,
+    ConnectionEndpoint, ConnectionId, ConnectionIdAllocator, ConnectionNamespace, StreamId,
+    Transport, TransportError, TransportEvent, WaitOutcome,
 };
 use minip2p_yamux::{
     YAMUX_PROTOCOL_ID, YamuxConfig, YamuxError, YamuxInput, YamuxOutput, YamuxRole, YamuxSession,
 };
 use thiserror::Error;
-
-/// Marker bit reserved for circuit connection identifiers.
-pub const CIRCUIT_ID_BIT: u64 = 1 << 63;
 
 // A retired bridge suppresses late inner-transport events after the circuit's
 // public `Closed`. Keep this finite because a peer may never finish closing
@@ -40,7 +39,7 @@ pub const CIRCUIT_ID_BIT: u64 = 1 << 63;
 const MAX_RETIRED_BRIDGES: usize = 1024;
 
 fn is_circuit_id(id: ConnectionId) -> bool {
-    id.as_u64() & CIRCUIT_ID_BIT != 0
+    id.is_circuit()
 }
 
 /// Supplies fresh cryptographic entropy for one circuit adoption.
@@ -192,7 +191,7 @@ pub struct CircuitTransport<T, E> {
     direct_by_peer: BTreeMap<PeerId, BTreeSet<ConnectionId>>,
     direct_by_conn: BTreeMap<ConnectionId, PeerId>,
     pending: VecDeque<TransportEvent>,
-    next_circuit_id: Option<u64>,
+    circuit_ids: ConnectionIdAllocator,
 }
 
 impl<T, E> CircuitTransport<T, E> {
@@ -211,7 +210,7 @@ impl<T, E> CircuitTransport<T, E> {
             direct_by_peer: BTreeMap::new(),
             direct_by_conn: BTreeMap::new(),
             pending: VecDeque::new(),
-            next_circuit_id: Some(1),
+            circuit_ids: ConnectionIdAllocator::new(ConnectionNamespace::CIRCUIT),
         }
     }
 
@@ -279,17 +278,13 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             return Err(AdoptError::PeerAlreadyDirect);
         }
 
-        let sequence = self.next_circuit_id.ok_or(AdoptError::IdsExhausted)?;
-        let next = sequence
-            .checked_add(1)
-            .filter(|value| *value < CIRCUIT_ID_BIT);
+        let id = self.circuit_ids.peek().ok_or(AdoptError::IdsExhausted)?;
 
         let mut static_secret = [0u8; 32];
         let mut ephemeral_secret = [0u8; 32];
         self.entropy.fill(&mut static_secret)?;
         self.entropy.fill(&mut ephemeral_secret)?;
 
-        let id = ConnectionId::new(CIRCUIT_ID_BIT | sequence);
         let noise = NoiseSession::new(NoiseConfig {
             role: match adoption.role {
                 CircuitRole::Initiator => NoiseRole::Initiator,
@@ -317,7 +312,11 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             }),
         };
 
-        self.next_circuit_id = next;
+        // Consume the sequence only here: an adoption that failed above
+        // (entropy, validation) must leave the id space untouched.
+        let consumed = self.circuit_ids.allocate();
+        debug_assert_eq!(consumed, Ok(id), "peeked id must match the allocated one");
+
         self.bridge_index.insert(key, id);
         if adoption.role == CircuitRole::Responder {
             self.pending.push_back(TransportEvent::IncomingConnection {
@@ -1693,7 +1692,8 @@ mod tests {
     fn wrapper_transport_contract_rejects_unknown_connection_and_stream_ids() {
         let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) = setup_pair();
         complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
-        let unknown_connection = ConnectionId::new(CIRCUIT_ID_BIT | 999);
+        let unknown_connection = ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 999)
+            .expect("circuit id in range");
         let stream = StreamId::new(99);
 
         assert!(matches!(
@@ -2422,7 +2422,10 @@ mod tests {
             Err(AdoptError::RemoteWriteClosed)
         );
         assert!(transport.circuit_ids().is_empty());
-        transport.next_circuit_id = None;
+        transport.circuit_ids = ConnectionIdAllocator::starting_at(
+            ConnectionNamespace::CIRCUIT,
+            ConnectionId::MAX_SEQUENCE + 1,
+        );
         assert_eq!(
             transport.adopt_bridge(BridgeAdoption {
                 remote_write_closed: false,
@@ -2441,7 +2444,8 @@ mod tests {
         let _ = transport.poll().expect("initial direct event");
         // InMemoryTransport::dial is intentionally stubbed, so this fixture
         // covers polled collisions; dial-return collisions need a dial fake.
-        let collision = ConnectionId::new(CIRCUIT_ID_BIT | 77);
+        let collision = ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 77)
+            .expect("circuit id in range");
         transport
             .inner_mut()
             .push_event(TransportEvent::IncomingConnection {

@@ -16,7 +16,7 @@ mod stream_id;
 mod transport;
 
 pub use connection_endpoint::ConnectionEndpoint;
-pub use connection_id::ConnectionId;
+pub use connection_id::{ConnectionId, ConnectionIdAllocator, ConnectionNamespace};
 pub use connection_state::ConnectionState;
 pub use error::TransportError;
 pub use event::TransportEvent;

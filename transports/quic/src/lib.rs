@@ -15,8 +15,8 @@ use boring::x509::X509;
 use hmac::{Hmac, KeyInit, Mac};
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
 use minip2p_transport::{
-    ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
-    WaitOutcome,
+    ConnectionEndpoint, ConnectionId, ConnectionIdAllocator, ConnectionNamespace, StreamId,
+    Transport, TransportError, TransportEvent, WaitOutcome,
 };
 use mio::{Events, Interest, Poll, Token, Waker};
 use quiche::ConnectionId as QuicConnectionId;
@@ -445,8 +445,9 @@ pub struct QuicTransport {
     pending_datagrams: VecDeque<PendingDatagram>,
     /// The socket address we're listening on, if any.
     listen_addr: Option<SocketAddr>,
-    /// Auto-incrementing connection id counter.
-    next_connection_id: u64,
+    /// Connection ids for this socket, namespaced by the family it is bound to
+    /// so a dual-stack pair's two id spaces stay disjoint.
+    connection_ids: ConnectionIdAllocator,
     /// Retained node configuration.
     node_config: QuicNodeConfig,
     /// Per-process secret used to authenticate stateless Retry tokens.
@@ -730,7 +731,7 @@ impl DualQuicTransport {
         let mut last_err = None;
         for (family, addr) in targets {
             match self.transport_mut(family).dial(&addr) {
-                Ok(id) => ids.push(Self::external_id(family, id)),
+                Ok(id) => ids.push(id),
                 Err(err) => last_err = Some(err),
             }
         }
@@ -761,8 +762,7 @@ impl DualQuicTransport {
             });
         };
 
-        let id = self.transport_mut(family).dial(&addr)?;
-        Ok(Self::external_id(family, id))
+        self.transport_mut(family).dial(&addr)
     }
 
     fn dial_targets(
@@ -796,78 +796,18 @@ impl DualQuicTransport {
         }
     }
 
-    fn external_id(family: AddressFamily, id: ConnectionId) -> ConnectionId {
-        let raw = id.as_u64();
-        match family {
-            AddressFamily::Ipv4 => ConnectionId::new(raw.saturating_mul(2).saturating_sub(1)),
-            AddressFamily::Ipv6 => ConnectionId::new(raw.saturating_mul(2)),
-        }
-    }
-
-    fn internal_id(id: ConnectionId) -> (AddressFamily, ConnectionId) {
-        let raw = id.as_u64();
-        if raw.is_multiple_of(2) {
-            (AddressFamily::Ipv6, ConnectionId::new(raw / 2))
+    /// Routes an id back to the socket that minted it.
+    ///
+    /// Each half allocates in its own [`ConnectionNamespace`], so the id needs
+    /// no rewriting on the way in or out.
+    fn family_for_id(id: ConnectionId) -> Result<AddressFamily, TransportError> {
+        let namespace = id.namespace();
+        if namespace == ConnectionNamespace::QUIC_IPV4 {
+            Ok(AddressFamily::Ipv4)
+        } else if namespace == ConnectionNamespace::QUIC_IPV6 {
+            Ok(AddressFamily::Ipv6)
         } else {
-            (AddressFamily::Ipv4, ConnectionId::new(raw.div_ceil(2)))
-        }
-    }
-
-    fn map_event(family: AddressFamily, event: TransportEvent) -> TransportEvent {
-        let map = |id| Self::external_id(family, id);
-        match event {
-            TransportEvent::Connected { id, endpoint } => TransportEvent::Connected {
-                id: map(id),
-                endpoint,
-            },
-            TransportEvent::StreamOpened { id, stream_id } => TransportEvent::StreamOpened {
-                id: map(id),
-                stream_id,
-            },
-            TransportEvent::IncomingStream { id, stream_id } => TransportEvent::IncomingStream {
-                id: map(id),
-                stream_id,
-            },
-            TransportEvent::StreamData {
-                id,
-                stream_id,
-                data,
-            } => TransportEvent::StreamData {
-                id: map(id),
-                stream_id,
-                data,
-            },
-            TransportEvent::StreamRemoteWriteClosed { id, stream_id } => {
-                TransportEvent::StreamRemoteWriteClosed {
-                    id: map(id),
-                    stream_id,
-                }
-            }
-            TransportEvent::StreamClosed { id, stream_id } => TransportEvent::StreamClosed {
-                id: map(id),
-                stream_id,
-            },
-            TransportEvent::Closed { id } => TransportEvent::Closed { id: map(id) },
-            TransportEvent::Error { id, message } => TransportEvent::Error {
-                id: map(id),
-                message,
-            },
-            TransportEvent::IncomingConnection { id, endpoint } => {
-                TransportEvent::IncomingConnection {
-                    id: map(id),
-                    endpoint,
-                }
-            }
-            TransportEvent::PeerIdentityVerified {
-                id,
-                endpoint,
-                previous_peer_id,
-            } => TransportEvent::PeerIdentityVerified {
-                id: map(id),
-                endpoint,
-                previous_peer_id,
-            },
-            TransportEvent::Listening { addr } => TransportEvent::Listening { addr },
+            Err(TransportError::ConnectionNotFound { id })
         }
     }
 }
@@ -888,6 +828,17 @@ impl QuicTransport {
         let readiness = ReadinessWait::new(&socket).map_err(|e| TransportError::ListenFailed {
             reason: format!("failed to create readiness poll: {e}"),
         })?;
+        // The bound family fixes this socket's id namespace, so the two halves
+        // of a dual-stack pair mint disjoint ids without any remapping.
+        let local_addr = socket
+            .local_addr()
+            .map_err(|e| TransportError::ListenFailed {
+                reason: format!("failed to get local addr: {e}"),
+            })?;
+        let namespace = match family_for_socket_addr(local_addr) {
+            AddressFamily::Ipv4 => ConnectionNamespace::QUIC_IPV4,
+            AddressFamily::Ipv6 => ConnectionNamespace::QUIC_IPV6,
+        };
         let quiche_config = build_quiche_config(&node_config)?;
         let mut retry_secret = [0u8; 32];
         getrandom::fill(&mut retry_secret).map_err(|e| TransportError::InvalidConfig {
@@ -904,7 +855,7 @@ impl QuicTransport {
             pending_events: Vec::new(),
             pending_datagrams: VecDeque::new(),
             listen_addr: None,
-            next_connection_id: 1,
+            connection_ids: ConnectionIdAllocator::new(namespace),
             node_config,
             retry_secret,
         })
@@ -978,29 +929,17 @@ impl QuicTransport {
             .unwrap_or_default()
     }
 
-    /// Allocates the next unused connection id, skipping 0 and wrapping on overflow.
+    /// Allocates the next connection id in this socket's namespace.
+    ///
+    /// Sequence numbers are never reused, so there is no need to check the
+    /// live connection table for a collision.
     fn allocate_connection_id(&mut self) -> Result<ConnectionId, TransportError> {
-        let start = self.next_connection_id;
-
-        loop {
-            let raw = self.next_connection_id;
-            self.next_connection_id = self.next_connection_id.wrapping_add(1);
-
-            if raw != 0 {
-                let id = ConnectionId::new(raw);
-                if !self.connections.contains_key(&id) {
-                    return Ok(id);
-                }
-            }
-
-            if self.next_connection_id == start {
-                break;
-            }
-        }
-
-        Err(TransportError::ResourceExhausted {
-            resource: "connection ids",
-        })
+        let id = self.connection_ids.allocate()?;
+        debug_assert!(
+            !self.connections.contains_key(&id),
+            "allocator handed out a live connection id"
+        );
+        Ok(id)
     }
 
     /// Generates a random QUIC source connection id using OS randomness.
@@ -1674,8 +1613,7 @@ impl Transport for DualQuicTransport {
                 reason: "no usable ipv4 or ipv6 dial target".into(),
             }
         })?;
-        let id = self.transport_mut(family).dial(&addr)?;
-        Ok(Self::external_id(family, id))
+        self.transport_mut(family).dial(&addr)
     }
 
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
@@ -1684,7 +1622,7 @@ impl Transport for DualQuicTransport {
     }
 
     fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
-        let (family, id) = Self::internal_id(id);
+        let family = Self::family_for_id(id)?;
         self.transport_mut(family).open_stream(id)
     }
 
@@ -1694,7 +1632,7 @@ impl Transport for DualQuicTransport {
         stream_id: StreamId,
         data: Vec<u8>,
     ) -> Result<(), TransportError> {
-        let (family, id) = Self::internal_id(id);
+        let family = Self::family_for_id(id)?;
         self.transport_mut(family).send_stream(id, stream_id, data)
     }
 
@@ -1703,7 +1641,7 @@ impl Transport for DualQuicTransport {
         id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
-        let (family, id) = Self::internal_id(id);
+        let family = Self::family_for_id(id)?;
         self.transport_mut(family).close_stream_write(id, stream_id)
     }
 
@@ -1712,12 +1650,12 @@ impl Transport for DualQuicTransport {
         id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
-        let (family, id) = Self::internal_id(id);
+        let family = Self::family_for_id(id)?;
         self.transport_mut(family).reset_stream(id, stream_id)
     }
 
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
-        let (family, id) = Self::internal_id(id);
+        let family = Self::family_for_id(id)?;
         self.transport_mut(family).close(id)
     }
 
@@ -1735,15 +1673,8 @@ impl Transport for DualQuicTransport {
             }
         };
 
-        let mut events: Vec<TransportEvent> = ipv4_events
-            .into_iter()
-            .map(|event| Self::map_event(AddressFamily::Ipv4, event))
-            .collect();
-        events.extend(
-            ipv6_events
-                .into_iter()
-                .map(|event| Self::map_event(AddressFamily::Ipv6, event)),
-        );
+        let mut events = ipv4_events;
+        events.extend(ipv6_events);
         Ok(events)
     }
 
@@ -2239,12 +2170,52 @@ mod tests {
 
         assert_eq!(ids.len(), families.len());
         assert_eq!(
-            ids.iter().any(|id| !id.as_u64().is_multiple_of(2)),
+            ids.iter()
+                .any(|id| id.namespace() == ConnectionNamespace::QUIC_IPV4),
             families.contains(&AddressFamily::Ipv4)
         );
         assert_eq!(
-            ids.iter().any(|id| id.as_u64().is_multiple_of(2)),
+            ids.iter()
+                .any(|id| id.namespace() == ConnectionNamespace::QUIC_IPV6),
             families.contains(&AddressFamily::Ipv6)
+        );
+    }
+
+    #[test]
+    fn dual_stack_halves_allocate_disjoint_ids_from_the_same_sequence() {
+        // Both halves start their sequence at 1. Before namespacing, keeping
+        // them apart needed an odd/even rewrite on every id and event.
+        let mut ipv4 =
+            QuicTransport::new(QuicNodeConfig::generate(), DEFAULT_IPV4_BIND).expect("bind ipv4");
+        let mut ipv6 =
+            QuicTransport::new(QuicNodeConfig::generate(), DEFAULT_IPV6_BIND).expect("bind ipv6");
+
+        let from_ipv4 = ipv4.allocate_connection_id().expect("ipv4 id");
+        let from_ipv6 = ipv6.allocate_connection_id().expect("ipv6 id");
+
+        assert_eq!(from_ipv4.sequence(), from_ipv6.sequence());
+        assert_ne!(from_ipv4, from_ipv6);
+        assert_eq!(from_ipv4.namespace(), ConnectionNamespace::QUIC_IPV4);
+        assert_eq!(from_ipv6.namespace(), ConnectionNamespace::QUIC_IPV6);
+
+        // Neither half's ids can be mistaken for a relay circuit's.
+        assert!(!from_ipv4.is_circuit());
+        assert!(!from_ipv6.is_circuit());
+    }
+
+    #[test]
+    fn dual_stack_rejects_ids_from_another_transport() {
+        let mut endpoint = DualQuicTransport::new(QuicNodeConfig::generate()).expect("bind");
+        let foreign =
+            ConnectionId::namespaced(ConnectionNamespace::TCP_IPV4, 1).expect("id in range");
+
+        assert_eq!(
+            endpoint.open_stream(foreign),
+            Err(TransportError::ConnectionNotFound { id: foreign })
+        );
+        assert_eq!(
+            endpoint.close(foreign),
+            Err(TransportError::ConnectionNotFound { id: foreign })
         );
     }
 
@@ -2256,13 +2227,13 @@ mod tests {
         if families.contains(&AddressFamily::Ipv4) {
             let mut endpoint = QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("bind");
             let id = endpoint.dial_ip4(&peer_addr).expect("dial ipv4");
-            assert!(!id.as_u64().is_multiple_of(2));
+            assert_eq!(id.namespace(), ConnectionNamespace::QUIC_IPV4);
         }
 
         if families.contains(&AddressFamily::Ipv6) {
             let mut endpoint = QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("bind");
             let id = endpoint.dial_ip6(&peer_addr).expect("dial ipv6");
-            assert!(id.as_u64().is_multiple_of(2));
+            assert_eq!(id.namespace(), ConnectionNamespace::QUIC_IPV6);
         }
     }
 
