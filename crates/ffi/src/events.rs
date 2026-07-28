@@ -225,7 +225,8 @@ pub enum P2pEvent {
     /// An accepted pubsub message arrived.
     ///
     /// When unsigned messages are enabled, `signed` can be `false`; hosts
-    /// requiring authenticated publishers must check it before using `data`.
+    /// must treat both `from_peer_id` and `data` as unauthenticated unless
+    /// `signed` is `true`.
     Message {
         /// Publisher identity.
         from_peer_id: String,
@@ -500,7 +501,7 @@ pub(crate) fn convert_discovery(event: DiscoveryEvent) -> P2pEvent {
     }
 }
 
-fn convert_reachability(state: ReachabilityState) -> Reachability {
+pub(crate) fn convert_reachability(state: ReachabilityState) -> Reachability {
     match state {
         ReachabilityState::Unknown => Reachability::Unknown,
         ReachabilityState::Public => Reachability::Public,

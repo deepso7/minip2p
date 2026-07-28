@@ -1029,6 +1029,7 @@ dependencies = [
 name = "minip2p-ffi"
 version = "0.2.0"
 dependencies = [
+ "minip2p-pubsub",
  "minip2p-rs",
  "minip2p-swarm",
  "thiserror",

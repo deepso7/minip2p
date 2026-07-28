@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use minip2p::{EndpointWake, Error};
+use minip2p::{EndpointWake, Error, NatEvent};
 
 use crate::endpoint::{Lifecycle, Shared};
 use crate::events::{convert_discovery, convert_nat, convert_pubsub, convert_swarm};
@@ -79,6 +79,7 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         } else {
             DRIVER_IDLE_POLL
         };
+        let cancelled_connect_ids = state.cancelled_connect_ids.clone();
         let endpoint = state.endpoint.as_mut().expect("running endpoint exists");
         let wake = endpoint.next_wake(deadline)?;
         if matches!(wake, EndpointWake::Interrupted) {
@@ -94,7 +95,15 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             events.extend(convert_swarm(event));
         }
         events.extend(endpoint.poll()?.into_iter().filter_map(convert_swarm));
-        events.extend(endpoint.take_nat_events().into_iter().map(convert_nat));
+        let nat_events = endpoint.take_nat_events();
+        events.extend(
+            nat_events
+                .into_iter()
+                .filter(|event| {
+                    nat_connect_id(event).is_none_or(|id| !cancelled_connect_ids.contains(&id))
+                })
+                .map(convert_nat),
+        );
         events.extend(
             endpoint
                 .take_pubsub_events()
@@ -113,6 +122,21 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         for event in events {
             dispatch(listener, event);
         }
+    }
+}
+
+fn nat_connect_id(event: &NatEvent) -> Option<u64> {
+    match event {
+        NatEvent::PathEstablished { connect_id, .. }
+        | NatEvent::PathUpgraded { connect_id, .. }
+        | NatEvent::HolePunchFailed { connect_id, .. }
+        | NatEvent::FellBackToRelay { connect_id, .. }
+        | NatEvent::ConnectFailed { connect_id, .. } => Some(connect_id.as_u64()),
+        NatEvent::ReachabilityChanged { .. }
+        | NatEvent::PublicAddressesChanged { .. }
+        | NatEvent::RelayReserved { .. }
+        | NatEvent::RelayReservationLost { .. }
+        | NatEvent::InboundDirectUpgrade { .. } => None,
     }
 }
 

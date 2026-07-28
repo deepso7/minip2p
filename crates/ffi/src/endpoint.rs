@@ -1,17 +1,19 @@
 //! Foreign-facing endpoint object and construction.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BeaconConfig, Endpoint, GossipsubConfig, Multiaddr, NatConfig, PeerDiscoveryConfig,
-    QuicWaitHandle, TransportError,
+    BeaconConfig, Endpoint, GossipsubConfig, Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId,
+    PublishError, PubsubError, QuicWaitHandle, TopicError, TransportError,
 };
 
 use crate::{
-    EndpointConfig, FfiError, P2pEventListener, keypair_from_bytes, parse_direct_quic_peer_addr,
+    EndpointConfig, FfiError, KnownPeerInfo, P2pEventListener, RelayReservationInfo,
+    keypair_from_bytes, parse_direct_quic_peer_addr,
 };
 
 /// A minip2p endpoint owned by a foreign runtime.
@@ -35,6 +37,8 @@ pub(crate) struct EndpointState {
     pub(crate) endpoint: Option<Endpoint>,
     pub(crate) active: bool,
     pub(crate) driver_thread_id: Option<std::thread::ThreadId>,
+    connect_ids: BTreeMap<u64, minip2p::ConnectId>,
+    pub(crate) cancelled_connect_ids: BTreeSet<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,13 +84,11 @@ impl P2pEndpoint {
             )
             .pubsub_config(pubsub);
 
-        if !relays.is_empty() || config.force_relay {
-            builder = builder.nat_config(NatConfig {
-                relays,
-                force_relay: config.force_relay,
-                ..NatConfig::default()
-            });
-        }
+        builder = builder.nat_config(NatConfig {
+            relays,
+            force_relay: config.force_relay,
+            ..NatConfig::default()
+        });
 
         if let Some(discovery) = config.discovery {
             let beacon = BeaconConfig {
@@ -138,6 +140,8 @@ impl P2pEndpoint {
                     endpoint: Some(endpoint),
                     active: false,
                     driver_thread_id: None,
+                    connect_ids: BTreeMap::new(),
+                    cancelled_connect_ids: BTreeSet::new(),
                 }),
                 stopped_cv: Condvar::new(),
                 wait_handle,
@@ -162,8 +166,11 @@ impl P2pEndpoint {
     /// Returns peers with an established QUIC or circuit connection.
     pub fn connected_peers(&self) -> Result<Vec<String>, FfiError> {
         let _pending = PendingCommand::new(&self.shared);
-        self.shared
-            .lock_state()
+        let state = self.shared.lock_state();
+        if matches!(state.lifecycle, Lifecycle::Stopping | Lifecycle::Stopped) {
+            return Err(FfiError::Stopped);
+        }
+        state
             .endpoint
             .as_ref()
             .map(|endpoint| {
@@ -173,9 +180,7 @@ impl P2pEndpoint {
                     .map(|peer| peer.to_base58())
                     .collect()
             })
-            .ok_or_else(|| FfiError::InvalidState {
-                detail: "endpoint is stopped".into(),
-            })
+            .ok_or(FfiError::Stopped)
     }
 
     /// Selects active or idle driver polling without changing delivery semantics.
@@ -281,6 +286,129 @@ impl P2pEndpoint {
             }
         }
     }
+
+    /// Subscribes to a pubsub topic.
+    pub fn subscribe(&self, topic: String) -> Result<bool, FfiError> {
+        self.with_endpoint_mut(|endpoint| endpoint.subscribe(&topic).map_err(map_pubsub_error))
+    }
+
+    /// Withdraws a pubsub subscription.
+    pub fn unsubscribe(&self, topic: String) -> Result<bool, FfiError> {
+        self.with_endpoint_mut(|endpoint| endpoint.unsubscribe(&topic).map_err(map_pubsub_error))
+    }
+
+    /// Publishes one application payload.
+    pub fn publish(&self, topic: String, data: Vec<u8>) -> Result<(), FfiError> {
+        if data.len() > minip2p_pubsub::MAX_RPC_SIZE {
+            return Err(FfiError::MessageTooLarge);
+        }
+        self.with_endpoint_mut(|endpoint| endpoint.publish(&topic, data).map_err(map_pubsub_error))
+    }
+
+    /// Starts a connection attempt toward a peer without known direct addresses.
+    pub fn connect(&self, peer_id: String) -> Result<u64, FfiError> {
+        let peer = PeerId::from_str(&peer_id).map_err(|error| FfiError::InvalidPeerId {
+            detail: error.to_string(),
+        })?;
+        let _pending = PendingCommand::new(&self.shared);
+        let mut state = self.shared.lock_state();
+        ensure_accepting_commands(&state)?;
+        let id = state
+            .endpoint
+            .as_mut()
+            .ok_or(FfiError::Stopped)?
+            .connect(&peer)
+            .map_err(map_driver_error)?;
+        state.connect_ids.insert(id.as_u64(), id);
+        Ok(id.as_u64())
+    }
+
+    /// Starts a connection attempt toward a direct QUIC peer address.
+    pub fn connect_addr(&self, address: String) -> Result<u64, FfiError> {
+        let address = parse_direct_quic_peer_addr(&address)?;
+        let _pending = PendingCommand::new(&self.shared);
+        let mut state = self.shared.lock_state();
+        ensure_accepting_commands(&state)?;
+        let id = state
+            .endpoint
+            .as_mut()
+            .ok_or(FfiError::Stopped)?
+            .connect_addr(&address)
+            .map_err(map_driver_error)?;
+        state.connect_ids.insert(id.as_u64(), id);
+        Ok(id.as_u64())
+    }
+
+    /// Cancels a known connection attempt; unknown ids are an idempotent no-op.
+    pub fn cancel_connect(&self, id: u64) -> Result<(), FfiError> {
+        let _pending = PendingCommand::new(&self.shared);
+        let mut state = self.shared.lock_state();
+        ensure_accepting_commands(&state)?;
+        let connect_id = state.connect_ids.get(&id).copied();
+        let endpoint = state.endpoint.as_mut().ok_or(FfiError::Stopped)?;
+        if let Some(connect_id) = connect_id {
+            endpoint.cancel_connect(connect_id);
+            state.cancelled_connect_ids.insert(id);
+        }
+        Ok(())
+    }
+
+    /// Returns the shared discovery address-book snapshot.
+    pub fn known_peers(&self) -> Result<Vec<KnownPeerInfo>, FfiError> {
+        self.with_endpoint(|endpoint| {
+            let now = endpoint.discovery_now_ms();
+            endpoint
+                .known_peers()
+                .into_iter()
+                .map(|peer| KnownPeerInfo {
+                    peer_id: peer.peer.to_base58(),
+                    addrs: display_addrs(peer.addrs),
+                    beacon_addrs: display_addrs(peer.beacon_addrs),
+                    mdns_addrs: display_addrs(peer.mdns_addrs),
+                    beacon_last_seen_age_ms: age(now, peer.beacon_last_seen_ms),
+                    mdns_last_seen_age_ms: age(now, peer.mdns_last_seen_ms),
+                    connected: peer.connected,
+                })
+                .collect()
+        })
+    }
+
+    /// Returns the current AutoNAT reachability verdict.
+    pub fn reachability(&self) -> Result<crate::Reachability, FfiError> {
+        self.with_endpoint(|endpoint| crate::events::convert_reachability(endpoint.reachability()))
+    }
+
+    /// Returns the active inbound relay reservation.
+    pub fn active_reservation(&self) -> Result<Option<RelayReservationInfo>, FfiError> {
+        self.with_endpoint(|endpoint| {
+            endpoint
+                .active_reservation()
+                .map(|reservation| RelayReservationInfo {
+                    relay_peer_id: reservation.relay.to_base58(),
+                    expires_unix_secs: reservation.expires_unix_secs,
+                })
+        })
+    }
+}
+
+impl P2pEndpoint {
+    fn with_endpoint<T>(&self, operation: impl FnOnce(&Endpoint) -> T) -> Result<T, FfiError> {
+        let _pending = PendingCommand::new(&self.shared);
+        let state = self.shared.lock_state();
+        ensure_accepting_commands(&state)?;
+        let endpoint = state.endpoint.as_ref().ok_or(FfiError::Stopped)?;
+        Ok(operation(endpoint))
+    }
+
+    fn with_endpoint_mut<T>(
+        &self,
+        operation: impl FnOnce(&mut Endpoint) -> Result<T, FfiError>,
+    ) -> Result<T, FfiError> {
+        let _pending = PendingCommand::new(&self.shared);
+        let mut state = self.shared.lock_state();
+        ensure_accepting_commands(&state)?;
+        operation(state.endpoint.as_mut().ok_or(FfiError::Stopped)?)
+    }
 }
 
 impl Drop for P2pEndpoint {
@@ -336,6 +464,58 @@ fn map_constructor_error(error: minip2p::Error) -> FfiError {
         _ => FfiError::Internal {
             detail: error.to_string(),
         },
+    }
+}
+
+fn map_pubsub_error(error: PubsubError) -> FfiError {
+    match error {
+        PubsubError::DiscoveryTopicReserved => FfiError::NotPermitted {
+            detail: error.to_string(),
+        },
+        PubsubError::Publish(PublishError::TooLarge) => FfiError::MessageTooLarge,
+        PubsubError::Publish(PublishError::Backpressure) => FfiError::Backpressure,
+        PubsubError::Publish(PublishError::Topic(error)) | PubsubError::Topic(error) => {
+            map_topic_error(error)
+        }
+        PubsubError::Driver(error) => map_driver_error(error),
+        PubsubError::NotEnabled => FfiError::Internal {
+            detail: error.to_string(),
+        },
+    }
+}
+
+fn map_topic_error(error: TopicError) -> FfiError {
+    FfiError::InvalidTopic {
+        detail: error.to_string(),
+    }
+}
+
+fn map_driver_error(error: minip2p::Error) -> FfiError {
+    match error {
+        minip2p::Error::Transport(_) => FfiError::Transport {
+            detail: error.to_string(),
+        },
+        _ => FfiError::Internal {
+            detail: error.to_string(),
+        },
+    }
+}
+
+fn display_addrs(addrs: Vec<Multiaddr>) -> Vec<String> {
+    addrs
+        .into_iter()
+        .map(|address| address.to_string())
+        .collect()
+}
+
+fn age(now: Option<u64>, last_seen: Option<u64>) -> Option<u64> {
+    Some(now?.saturating_sub(last_seen?))
+}
+
+fn ensure_accepting_commands(state: &EndpointState) -> Result<(), FfiError> {
+    match state.lifecycle {
+        Lifecycle::Created | Lifecycle::Running => Ok(()),
+        Lifecycle::Stopping | Lifecycle::Stopped => Err(FfiError::Stopped),
     }
 }
 
@@ -532,6 +712,7 @@ mod tests {
         for address in [
             format!("/ip4/127.0.0.1/udp/4001/p2p/{relay}"),
             format!("/ip4/127.0.0.1/udp/4001/quic-v1/p2p-circuit/p2p/{relay}"),
+            format!("/ip4/0.0.0.0/udp/4001/quic-v1/p2p/{relay}"),
         ] {
             let mut config = config();
             config.relays.push(address);
@@ -547,10 +728,7 @@ mod tests {
         let endpoint = endpoint(config()).expect("endpoint");
         endpoint.stop();
 
-        assert!(matches!(
-            endpoint.connected_peers(),
-            Err(FfiError::InvalidState { .. })
-        ));
+        assert!(matches!(endpoint.connected_peers(), Err(FfiError::Stopped)));
     }
 
     #[test]
@@ -724,5 +902,161 @@ mod tests {
             .shared
             .driver_running
             .store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn pre_start_commands_and_queries_are_deterministic() {
+        let endpoint = endpoint(config()).expect("endpoint");
+        let remote = minip2p::Ed25519Keypair::from_secret_key_bytes([7; 32]).peer_id();
+
+        assert!(endpoint.subscribe("room".into()).expect("subscribe"));
+        assert!(!endpoint.subscribe("room".into()).expect("idempotent"));
+        endpoint
+            .publish("room".into(), b"hello".to_vec())
+            .expect("publish");
+        assert!(endpoint.unsubscribe("room".into()).expect("unsubscribe"));
+        assert!(endpoint.connected_peers().expect("peers").is_empty());
+        assert!(endpoint.known_peers().expect("known peers").is_empty());
+        assert_eq!(
+            endpoint.reachability().expect("reachability"),
+            crate::Reachability::Unknown
+        );
+        assert!(
+            endpoint
+                .active_reservation()
+                .expect("reservation")
+                .is_none()
+        );
+        let connect_id = endpoint
+            .connect(remote.to_base58())
+            .expect("connection attempt");
+        {
+            let state = endpoint.shared.lock_state();
+            assert!(state.connect_ids.contains_key(&connect_id));
+        }
+        endpoint.cancel_connect(connect_id).expect("known cancel");
+        assert!(
+            endpoint
+                .shared
+                .lock_state()
+                .cancelled_connect_ids
+                .contains(&connect_id)
+        );
+        endpoint.cancel_connect(u64::MAX).expect("unknown cancel");
+    }
+
+    #[test]
+    fn command_inputs_and_stopped_state_are_typed() {
+        let endpoint = endpoint(config()).expect("endpoint");
+
+        assert!(matches!(
+            endpoint.subscribe(String::new()),
+            Err(FfiError::InvalidTopic { .. })
+        ));
+        assert!(matches!(
+            endpoint.connect("not-a-peer".into()),
+            Err(FfiError::InvalidPeerId { .. })
+        ));
+        assert!(matches!(
+            endpoint.connect_addr("not-an-address".into()),
+            Err(FfiError::InvalidAddress { .. })
+        ));
+
+        endpoint.stop();
+        assert!(matches!(
+            endpoint.publish("room".into(), Vec::new()),
+            Err(FfiError::Stopped)
+        ));
+        assert!(matches!(endpoint.known_peers(), Err(FfiError::Stopped)));
+    }
+
+    #[test]
+    fn source_age_uses_saturating_discovery_clock_math() {
+        assert_eq!(age(Some(100), Some(40)), Some(60));
+        assert_eq!(age(Some(40), Some(100)), Some(0));
+        assert_eq!(age(None, Some(10)), None);
+        assert_eq!(age(Some(10), None), None);
+    }
+
+    #[test]
+    fn commands_reject_stopping_and_oversized_payloads() {
+        let endpoint = endpoint(config()).expect("endpoint");
+        assert!(matches!(
+            endpoint.publish("room".into(), vec![0; minip2p_pubsub::MAX_RPC_SIZE + 1]),
+            Err(FfiError::MessageTooLarge)
+        ));
+
+        endpoint.shared.lock_state().lifecycle = Lifecycle::Stopping;
+        assert!(matches!(
+            endpoint.subscribe("room".into()),
+            Err(FfiError::Stopped)
+        ));
+        assert!(matches!(
+            endpoint.publish("room".into(), Vec::new()),
+            Err(FfiError::Stopped)
+        ));
+        assert!(matches!(endpoint.cancel_connect(0), Err(FfiError::Stopped)));
+    }
+
+    #[test]
+    fn pubsub_and_transport_errors_map_by_context() {
+        let mut discovery = config();
+        discovery.discovery = Some(crate::DiscoveryOptions {
+            topic: "presence".into(),
+            beacon_interval_ms: 10_000,
+            peer_ttl_ms: 35_000,
+            auto_dial: false,
+        });
+        let endpoint = endpoint(discovery).expect("endpoint");
+        assert!(matches!(
+            endpoint.unsubscribe("presence".into()),
+            Err(FfiError::NotPermitted { .. })
+        ));
+
+        assert!(matches!(
+            map_pubsub_error(PubsubError::Publish(PublishError::TooLarge)),
+            FfiError::MessageTooLarge
+        ));
+        assert!(matches!(
+            map_pubsub_error(PubsubError::Publish(PublishError::Backpressure)),
+            FfiError::Backpressure
+        ));
+        assert!(matches!(
+            map_driver_error(
+                TransportError::PollError {
+                    reason: "test".into()
+                }
+                .into()
+            ),
+            FfiError::Transport { .. }
+        ));
+    }
+
+    #[test]
+    fn cancelled_pre_start_terminal_event_is_not_delivered() {
+        let endpoint = endpoint(config()).expect("endpoint");
+        let remote = minip2p::Ed25519Keypair::from_secret_key_bytes([12; 32]).peer_id();
+        let id = endpoint.connect(remote.to_base58()).expect("connect");
+        endpoint.cancel_connect(id).expect("cancel");
+        let listener = Arc::new(RecordingListener::default());
+
+        endpoint
+            .start(Arc::clone(&listener) as Arc<dyn P2pEventListener>)
+            .expect("start");
+        std::thread::sleep(Duration::from_millis(50));
+        endpoint.stop();
+        assert!(endpoint.wait_stopped(1_000));
+
+        assert!(
+            !listener
+                .events
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    crate::P2pEvent::ConnectFailed { connect_id, .. } if *connect_id == id
+                ))
+        );
     }
 }

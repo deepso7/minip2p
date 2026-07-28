@@ -33,6 +33,30 @@ pub enum FfiError {
         /// Human-readable parse detail.
         detail: String,
     },
+    /// A pubsub topic failed validation.
+    #[error("invalid topic: {detail}")]
+    InvalidTopic {
+        /// Human-readable validation detail.
+        detail: String,
+    },
+    /// The operation is valid but reserved by another endpoint subsystem.
+    #[error("operation not permitted: {detail}")]
+    NotPermitted {
+        /// Human-readable refusal detail.
+        detail: String,
+    },
+    /// A bounded outbound queue is full.
+    #[error("outbound backpressure")]
+    Backpressure,
+    /// A pubsub message exceeds the protocol limit.
+    #[error("message too large")]
+    MessageTooLarge,
+    /// A synchronous transport operation failed.
+    #[error("transport error: {detail}")]
+    Transport {
+        /// Human-readable transport detail.
+        detail: String,
+    },
     /// The operation is unavailable in the endpoint's current lifecycle state.
     #[error("invalid endpoint state: {detail}")]
     InvalidState {

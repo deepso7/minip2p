@@ -10,7 +10,7 @@ mod events;
 
 use std::str::FromStr;
 
-pub use config::{DiscoveryOptions, EndpointConfig};
+pub use config::{DiscoveryOptions, EndpointConfig, KnownPeerInfo, RelayReservationInfo};
 pub use endpoint::P2pEndpoint;
 pub use error::FfiError;
 pub use events::{
@@ -57,7 +57,7 @@ fn parse_direct_quic_peer_addr(address: &str) -> Result<PeerAddr, FfiError> {
     let relay = PeerAddr::from_str(address).map_err(|error| FfiError::InvalidAddress {
         detail: error.to_string(),
     })?;
-    if !relay.transport().is_quic_transport() {
+    if !relay.transport().is_quic_transport() || relay.transport().is_wildcard_host() {
         return Err(FfiError::InvalidAddress {
             detail: "relay address must be a direct QUIC-v1 peer address".into(),
         });

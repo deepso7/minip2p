@@ -44,6 +44,34 @@ pub struct EndpointConfig {
     pub discovery: Option<DiscoveryOptions>,
 }
 
+/// One peer in the shared discovery address book.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct KnownPeerInfo {
+    /// Discovered peer.
+    pub peer_id: String,
+    /// Merged dial-order addresses.
+    pub addrs: Vec<String>,
+    /// Addresses authenticated by signed beacons.
+    pub beacon_addrs: Vec<String>,
+    /// Addresses learned from unauthenticated mDNS.
+    pub mdns_addrs: Vec<String>,
+    /// Age of the most recent signed beacon.
+    pub beacon_last_seen_age_ms: Option<u64>,
+    /// Age of the most recent mDNS observation.
+    pub mdns_last_seen_age_ms: Option<u64>,
+    /// Whether the endpoint currently has a connection to this peer.
+    pub connected: bool,
+}
+
+/// Snapshot of the active inbound relay reservation.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct RelayReservationInfo {
+    /// Relay holding the reservation.
+    pub relay_peer_id: String,
+    /// Absolute relay-reported expiry, when present.
+    pub expires_unix_secs: Option<u64>,
+}
+
 impl fmt::Debug for EndpointConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
