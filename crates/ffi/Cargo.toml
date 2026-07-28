@@ -1,0 +1,22 @@
+[package]
+name = "minip2p-ffi"
+description = "UniFFI bindings for embedding minip2p in mobile applications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+minip2p = { package = "minip2p-rs", path = "../minip2p", features = ["discovery"] }
+thiserror = "2.0.18"
+# Must remain paired with ubrn and @ubjs/core 0.31.0-3.
+uniffi = "=0.31.0"
