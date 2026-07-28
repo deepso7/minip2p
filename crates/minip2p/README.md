@@ -33,6 +33,13 @@ configurable through `EndpointBuilder::quic_limits`.
 Event waits (`next_event`, `wait_peer_ready`, `wait_ping_rtt`) accept an
 `Instant` (absolute deadline), a `Duration` (relative timeout), or
 `minip2p::Deadline::NEVER` to block until the event arrives.
+`next_wake` additionally returns on NAT, pubsub, or discovery queue progress,
+including events already queued when the call begins. Its `Event` result
+transfers ownership of one application event; `DriverProgress` leaves agent
+events in their focused queues for the corresponding `take_*_events` method.
+Progress is level-triggered across all active agents: drain every non-empty
+agent queue before calling `next_wake` again, or it will immediately report
+`DriverProgress` again.
 
 When an application permanently relinquishes a stream, `Endpoint::abandon_stream`
 resets it, purges already-buffered events, and suppresses later stream events.
@@ -63,6 +70,10 @@ signed discovery. Because mDNS claims are unauthenticated, their automatic
 dials are direct-only and never activate configured relays. Call
 `Endpoint::shutdown()` to send TTL-zero goodbyes and stop mDNS while keeping
 QUIC usable; drop performs the same sends best-effort.
+
+Discovery source timestamps use a driver-private monotonic epoch. Compute
+their ages from `Endpoint::discovery_now_ms()`; an independently created
+`Instant` does not share that origin.
 
 With the `pubsub` feature, `.pubsub()` enables gossipsub by default and
 advertises `/meshsub/1.1.0` plus `/meshsub/1.0.0`. Pass a

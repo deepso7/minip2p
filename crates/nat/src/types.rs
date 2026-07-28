@@ -30,6 +30,17 @@ impl Now {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ConnectId(pub(crate) u64);
 
+impl ConnectId {
+    /// Returns the endpoint-local numeric correlation value.
+    ///
+    /// Each [`NatAgent`](crate::NatAgent) numbers its own connect attempts, so
+    /// this value is not unique across endpoints and is not stable across
+    /// process restarts or library versions.
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
 /// Opaque correlation token for a pending [`NatAction::Dial`] or
 /// [`NatAction::OpenStream`].
 ///

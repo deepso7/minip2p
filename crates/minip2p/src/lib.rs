@@ -105,6 +105,29 @@ pub struct Endpoint {
     pending_events: std::collections::VecDeque<Event>,
 }
 
+/// Why one [`Endpoint::next_wake`] call returned.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Preserve Event ownership without a heap allocation.
+#[must_use = "handle the wake reason and drain every non-empty agent queue after DriverProgress"]
+pub enum EndpointWake {
+    /// An application event not owned by an active agent.
+    ///
+    /// The event has been removed from the endpoint and belongs to the
+    /// caller.
+    Event(Event),
+    /// At least one agent queue contains an event.
+    ///
+    /// Drain the enabled queues with `Endpoint::take_nat_events`,
+    /// `Endpoint::take_pubsub_events`, or `Endpoint::take_discovery_events`,
+    /// as applicable. Before calling [`Endpoint::next_wake`] again, callers
+    /// must drain every non-empty agent queue counted by this notification;
+    /// otherwise the next call returns `DriverProgress` immediately again.
+    DriverProgress,
+    /// The caller's deadline elapsed without an application event or agent
+    /// progress.
+    Deadline,
+}
+
 /// Why one driver-aware swarm-driving step returned.
 #[cfg(any(feature = "nat", feature = "pubsub"))]
 enum DriverPollKind {
@@ -319,6 +342,47 @@ impl Endpoint {
             return self.next_event_driven(deadline);
         }
         self.swarm.poll_next(deadline)
+    }
+
+    /// Drives the endpoint until an application event, agent progress, or the
+    /// caller's deadline.
+    ///
+    /// Unlike [`Endpoint::next_event`], this returns as soon as an active NAT,
+    /// pubsub, or discovery agent has queued application-visible output. It
+    /// also reports already-queued agent output immediately. An
+    /// [`EndpointWake::Event`] has been removed from the endpoint; agent
+    /// events remain in their focused queues for the corresponding `take_*`
+    /// method.
+    ///
+    /// `DriverProgress` is level-triggered across all active agents. Before
+    /// calling `next_wake` again, drain every non-empty enabled agent queue,
+    /// not just the queue currently relevant to the application. Leaving any
+    /// such queue non-empty makes subsequent calls return immediately and can
+    /// busy-spin a caller that expected the supplied deadline to block.
+    pub fn next_wake(&mut self, deadline: impl Into<Deadline>) -> Result<EndpointWake, Error> {
+        let deadline = deadline.into();
+        #[cfg(any(feature = "nat", feature = "pubsub"))]
+        if self.has_drivers() {
+            if let Some(event) = self.pending_events.pop_front() {
+                return Ok(EndpointWake::Event(event));
+            }
+            if self.driver_events_len() > 0 {
+                return Ok(EndpointWake::DriverProgress);
+            }
+            let mut expired_poll_used = false;
+            let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
+            return Ok(match poll.kind {
+                DriverPollKind::Application => {
+                    EndpointWake::Event(poll.event.expect("application poll carries event"))
+                }
+                DriverPollKind::Progress => EndpointWake::DriverProgress,
+                DriverPollKind::Deadline => EndpointWake::Deadline,
+            });
+        }
+        self.swarm.poll_next(deadline).map(|event| match event {
+            Some(event) => EndpointWake::Event(event),
+            None => EndpointWake::Deadline,
+        })
     }
 
     /// Whether any agent driver is active on this endpoint.
@@ -880,6 +944,20 @@ impl Endpoint {
             .as_ref()
             .map(|driver| driver.book.known_peers())
             .unwrap_or_default()
+    }
+
+    /// Returns the discovery driver's current monotonic timestamp.
+    ///
+    /// This uses the same private clock origin as
+    /// `KnownPeer::beacon_last_seen_ms` and `KnownPeer::mdns_last_seen_ms`.
+    /// Callers computing source ages must use this value rather than an
+    /// independently created clock. Returns `None` when no discovery source
+    /// is active.
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
+    pub fn discovery_now_ms(&self) -> Option<u64> {
+        self.discovery
+            .as_ref()
+            .map(discovery::DiscoveryDriver::now_ms)
     }
 
     /// Drains all queued discovery events.
@@ -1496,6 +1574,199 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn next_wake_reports_deadline_without_active_drivers() {
+        let mut endpoint = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind loopback endpoint");
+
+        assert!(matches!(
+            endpoint.next_wake(Duration::ZERO).expect("poll endpoint"),
+            EndpointWake::Deadline
+        ));
+    }
+
+    #[cfg(feature = "nat")]
+    #[test]
+    fn next_wake_transfers_buffered_application_event_ownership() {
+        let mut endpoint = Endpoint::builder()
+            .nat_config(NatConfig::default())
+            .bind_quic("127.0.0.1:0")
+            .expect("bind NAT endpoint");
+        let peer_id = Ed25519Keypair::generate().peer_id();
+        endpoint.pending_events.push_back(Event::ConnectionClosed {
+            peer_id: peer_id.clone(),
+            conn_id: ConnectionId::new(7),
+        });
+
+        assert!(matches!(
+            endpoint.next_wake(Deadline::NEVER).expect("wake"),
+            EndpointWake::Event(Event::ConnectionClosed {
+                peer_id: returned,
+                ..
+            }) if returned == peer_id
+        ));
+        assert!(endpoint.pending_events.is_empty());
+    }
+
+    #[cfg(feature = "nat")]
+    #[test]
+    fn next_wake_reports_already_queued_driver_progress_without_consuming_it() {
+        let mut endpoint = Endpoint::builder()
+            .nat_config(NatConfig::default())
+            .bind_quic("127.0.0.1:0")
+            .expect("bind NAT endpoint");
+        endpoint
+            .connect(&Ed25519Keypair::generate().peer_id())
+            .expect("start endpoint-local connect");
+
+        assert!(matches!(
+            endpoint.next_wake(Deadline::NEVER).expect("wake"),
+            EndpointWake::DriverProgress
+        ));
+        assert_eq!(endpoint.take_nat_events().len(), 1);
+    }
+
+    #[cfg(feature = "pubsub")]
+    #[test]
+    fn next_wake_reports_queued_pubsub_progress_without_consuming_it() {
+        let mut endpoint = Endpoint::builder()
+            .pubsub()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind pubsub endpoint");
+        let peer = Ed25519Keypair::generate().peer_id();
+        endpoint
+            .pubsub
+            .as_mut()
+            .expect("pubsub configured")
+            .events
+            .push_back(PubsubEvent::PeerSubscribed {
+                peer: peer.clone(),
+                topic: "test".into(),
+            });
+
+        assert!(matches!(
+            endpoint.next_wake(Deadline::NEVER).expect("wake"),
+            EndpointWake::DriverProgress
+        ));
+        assert!(matches!(
+            endpoint.take_pubsub_events().as_slice(),
+            [PubsubEvent::PeerSubscribed {
+                peer: returned,
+                topic
+            }] if returned == &peer && topic == "test"
+        ));
+    }
+
+    #[cfg(feature = "nat")]
+    #[test]
+    fn next_wake_honors_expired_deadline_with_active_driver() {
+        let mut endpoint = Endpoint::builder()
+            .nat_config(NatConfig::default())
+            .bind_quic("127.0.0.1:0")
+            .expect("bind NAT endpoint");
+
+        assert!(matches!(
+            endpoint.next_wake(Duration::ZERO).expect("expired wake"),
+            EndpointWake::Deadline
+        ));
+    }
+
+    #[cfg(feature = "nat")]
+    #[test]
+    fn next_wake_returns_application_event_produced_during_driver_poll() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut endpoint = Endpoint::builder()
+            .nat_config(NatConfig::default())
+            .bind_quic("127.0.0.1:0")
+            .expect("bind driven endpoint");
+        let mut remote = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind remote endpoint");
+        endpoint.listen().expect("driven endpoint listens");
+        let remote_addr = remote.listen().expect("remote listens");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let remote_stop = Arc::clone(&stop);
+        let remote_thread = std::thread::spawn(move || {
+            while !remote_stop.load(Ordering::Relaxed) {
+                remote
+                    .next_event(Duration::from_millis(20))
+                    .expect("drive remote");
+            }
+        });
+
+        endpoint.dial(&remote_addr).expect("dial remote");
+        let wake = endpoint
+            .next_wake(Duration::from_secs(5))
+            .expect("wait for application event");
+        stop.store(true, Ordering::Relaxed);
+        remote_thread.join().expect("remote driver exits");
+
+        assert!(matches!(
+            wake,
+            EndpointWake::Event(Event::ConnectionEstablished { peer_id, .. })
+                if peer_id == *remote_addr.peer_id()
+        ));
+    }
+
+    #[cfg(feature = "nat")]
+    #[test]
+    fn next_wake_returns_driver_progress_produced_by_timer_during_poll() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mut endpoint = Endpoint::builder()
+            .nat_config(NatConfig {
+                connect_deadline_ms: 20,
+                ..NatConfig::default()
+            })
+            .bind_quic("127.0.0.1:0")
+            .expect("bind NAT endpoint");
+        let unreachable = PeerAddr::quic_v1(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            9,
+            Ed25519Keypair::generate().peer_id(),
+        );
+        endpoint
+            .connect_addr(&unreachable)
+            .expect("start timed connect");
+        assert!(endpoint.take_nat_events().is_empty());
+
+        assert!(matches!(
+            endpoint
+                .next_wake(Duration::from_secs(1))
+                .expect("wait for connect deadline"),
+            EndpointWake::DriverProgress
+        ));
+        assert!(matches!(
+            endpoint.take_nat_events().as_slice(),
+            [NatEvent::ConnectFailed { .. }]
+        ));
+    }
+
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
+    #[test]
+    fn discovery_clock_is_present_only_for_an_active_source() {
+        let inactive = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind plain endpoint");
+        assert_eq!(inactive.discovery_now_ms(), None);
+
+        let builder = Endpoint::builder();
+        #[cfg(feature = "discovery")]
+        let builder = builder.discovery();
+        #[cfg(all(feature = "mdns", not(feature = "discovery")))]
+        let builder = builder.mdns();
+        let active = builder
+            .bind_quic("127.0.0.1:0")
+            .expect("bind discovery endpoint");
+        let first = active.discovery_now_ms().expect("discovery clock");
+        let second = active.discovery_now_ms().expect("discovery clock");
+        assert!(second >= first);
+    }
+
     #[cfg(feature = "mdns")]
     #[test]
     fn mdns_config_is_rejected_before_binding() {
@@ -1589,7 +1860,6 @@ mod tests {
                 if limit == RUN_UNTIL_SKIP_LIMIT
         ));
     }
-    #[cfg(feature = "nat")]
     use std::time::Duration;
 
     const PROTOCOL: &str = "/myapp/1.0.0";
@@ -1727,6 +1997,46 @@ mod tests {
         assert!(matches!(
             endpoint.next_nat_event(Deadline::NEVER),
             Err(Error::EventBacklogExceeded { limit }) if limit == RUN_UNTIL_SKIP_LIMIT
+        ));
+    }
+
+    #[cfg(feature = "pubsub")]
+    #[test]
+    fn pubsub_focused_waits_do_not_repoll_buffered_application_events() {
+        let mut endpoint = Endpoint::builder()
+            .pubsub()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind endpoint");
+        let unrelated = Ed25519Keypair::generate().peer_id();
+
+        endpoint.pending_events.push_back(Event::ConnectionClosed {
+            peer_id: unrelated.clone(),
+            conn_id: ConnectionId::new(1),
+        });
+        assert!(
+            endpoint
+                .next_pubsub_event(Duration::ZERO)
+                .expect("pubsub wait")
+                .is_none(),
+            "a buffered application event must not make next_pubsub_event spin"
+        );
+        assert!(matches!(
+            endpoint
+                .next_event(Duration::ZERO)
+                .expect("drain buffered event"),
+            Some(Event::ConnectionClosed { peer_id, .. }) if peer_id == unrelated
+        ));
+
+        for _ in 0..RUN_UNTIL_SKIP_LIMIT {
+            endpoint.pending_events.push_back(Event::ConnectionClosed {
+                peer_id: unrelated.clone(),
+                conn_id: ConnectionId::new(1),
+            });
+        }
+        assert!(matches!(
+            endpoint.next_pubsub_event(Deadline::NEVER),
+            Err(PubsubError::Driver(Error::EventBacklogExceeded { limit }))
+                if limit == RUN_UNTIL_SKIP_LIMIT
         ));
     }
 }
