@@ -1,7 +1,7 @@
 //! Foreign-facing endpoint object and construction.
 
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -10,7 +10,9 @@ use minip2p::{
     QuicWaitHandle, TransportError,
 };
 
-use crate::{EndpointConfig, FfiError, keypair_from_bytes, parse_direct_quic_peer_addr};
+use crate::{
+    EndpointConfig, FfiError, P2pEventListener, keypair_from_bytes, parse_direct_quic_peer_addr,
+};
 
 /// A minip2p endpoint owned by a foreign runtime.
 #[derive(uniffi::Object)]
@@ -20,23 +22,26 @@ pub struct P2pEndpoint {
     listen_addrs: Vec<String>,
 }
 
-struct Shared {
+pub(crate) struct Shared {
     state: Mutex<EndpointState>,
-    stopped_cv: Condvar,
+    pub(crate) stopped_cv: Condvar,
     wait_handle: QuicWaitHandle,
-    pending_commands: AtomicUsize,
+    pub(crate) pending_commands: AtomicUsize,
+    pub(crate) driver_running: AtomicBool,
 }
 
-struct EndpointState {
-    lifecycle: Lifecycle,
-    endpoint: Option<Endpoint>,
-    active: bool,
+pub(crate) struct EndpointState {
+    pub(crate) lifecycle: Lifecycle,
+    pub(crate) endpoint: Option<Endpoint>,
+    pub(crate) active: bool,
+    pub(crate) driver_thread_id: Option<std::thread::ThreadId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Lifecycle {
+pub(crate) enum Lifecycle {
     Created,
     Running,
+    Stopping,
     Stopped,
 }
 
@@ -132,10 +137,12 @@ impl P2pEndpoint {
                     lifecycle: Lifecycle::Created,
                     endpoint: Some(endpoint),
                     active: false,
+                    driver_thread_id: None,
                 }),
                 stopped_cv: Condvar::new(),
                 wait_handle,
                 pending_commands: AtomicUsize::new(0),
+                driver_running: AtomicBool::new(false),
             }),
             peer_id,
             listen_addrs,
@@ -154,6 +161,7 @@ impl P2pEndpoint {
 
     /// Returns peers with an established QUIC or circuit connection.
     pub fn connected_peers(&self) -> Result<Vec<String>, FfiError> {
+        let _pending = PendingCommand::new(&self.shared);
         self.shared
             .lock_state()
             .endpoint
@@ -176,9 +184,39 @@ impl P2pEndpoint {
         self.shared.lock_state().active = active;
     }
 
-    /// Returns whether the background driver is currently running.
+    /// Returns whether the background driver is accepting work.
+    ///
+    /// This becomes `false` when shutdown is requested. Use
+    /// [`P2pEndpoint::wait_stopped`] to observe complete driver exit.
     pub fn is_running(&self) -> bool {
+        let _pending = PendingCommand::new(&self.shared);
         self.shared.lock_state().lifecycle == Lifecycle::Running
+    }
+
+    /// Starts the detached background endpoint driver.
+    pub fn start(&self, listener: Arc<dyn P2pEventListener>) -> Result<(), FfiError> {
+        let mut state = self.shared.lock_state();
+        match state.lifecycle {
+            Lifecycle::Created => {}
+            Lifecycle::Running => return Err(FfiError::AlreadyStarted),
+            Lifecycle::Stopping | Lifecycle::Stopped => return Err(FfiError::Stopped),
+        }
+
+        let shared = Arc::clone(&self.shared);
+        std::thread::Builder::new()
+            .name("minip2p-driver".into())
+            .spawn(move || crate::driver::run(shared, listener))
+            .map_err(|error| {
+                state.lifecycle = Lifecycle::Stopped;
+                state.endpoint.take();
+                self.shared.stopped_cv.notify_all();
+                FfiError::Internal {
+                    detail: format!("failed to spawn endpoint driver: {error}"),
+                }
+            })?;
+        state.lifecycle = Lifecycle::Running;
+        self.shared.driver_running.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Requests shutdown without waiting for an in-flight callback.
@@ -187,11 +225,15 @@ impl P2pEndpoint {
         let endpoint = {
             let mut state = self.shared.lock_state();
             match state.lifecycle {
-                Lifecycle::Created | Lifecycle::Running => {
+                Lifecycle::Created => {
                     state.lifecycle = Lifecycle::Stopped;
                     state.endpoint.take()
                 }
-                Lifecycle::Stopped => None,
+                Lifecycle::Running => {
+                    state.lifecycle = Lifecycle::Stopping;
+                    None
+                }
+                Lifecycle::Stopping | Lifecycle::Stopped => None,
             }
         };
         drop(endpoint);
@@ -205,11 +247,21 @@ impl P2pEndpoint {
     /// Waits up to `timeout_ms` for the endpoint to reach the stopped state.
     ///
     /// A newly created endpoint still owns bound sockets, so this returns
-    /// `false` until either a driver exits or [`P2pEndpoint::stop`] is called.
+    /// `false` until `stop` releases it. For a running endpoint, `stop` only
+    /// requests shutdown and this waits for the driver exit cleanup.
+    ///
+    /// Calling this from a listener callback would wait on the callback's own
+    /// driver thread, so that case returns `false` immediately.
     pub fn wait_stopped(&self, timeout_ms: u64) -> bool {
         let timeout = Duration::from_millis(timeout_ms);
         let started = Instant::now();
         let mut state = self.shared.lock_state();
+        if state.lifecycle == Lifecycle::Stopped {
+            return true;
+        }
+        if state.driver_thread_id == Some(std::thread::current().id()) {
+            return false;
+        }
         loop {
             if state.lifecycle == Lifecycle::Stopped {
                 return true;
@@ -238,26 +290,32 @@ impl Drop for P2pEndpoint {
 }
 
 impl Shared {
-    fn lock_state(&self) -> MutexGuard<'_, EndpointState> {
+    pub(crate) fn lock_state(&self) -> MutexGuard<'_, EndpointState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 struct PendingCommand<'a> {
     shared: &'a Shared,
+    engaged: bool,
 }
 
 impl<'a> PendingCommand<'a> {
     fn new(shared: &'a Shared) -> Self {
-        shared.pending_commands.fetch_add(1, Ordering::AcqRel);
-        shared.wait_handle.interrupt();
-        Self { shared }
+        let engaged = shared.driver_running.load(Ordering::Acquire);
+        if engaged {
+            shared.pending_commands.fetch_add(1, Ordering::AcqRel);
+            shared.wait_handle.interrupt();
+        }
+        Self { shared, engaged }
     }
 }
 
 impl Drop for PendingCommand<'_> {
     fn drop(&mut self) {
-        self.shared.pending_commands.fetch_sub(1, Ordering::AcqRel);
+        if self.engaged {
+            self.shared.pending_commands.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -284,6 +342,42 @@ fn map_constructor_error(error: minip2p::Error) -> FfiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoopListener;
+
+    impl P2pEventListener for NoopListener {
+        fn on_event(&self, _event: crate::P2pEvent) {}
+    }
+
+    #[derive(Default)]
+    struct RecordingListener {
+        events: Mutex<Vec<crate::P2pEvent>>,
+    }
+
+    impl P2pEventListener for RecordingListener {
+        fn on_event(&self, event: crate::P2pEvent) {
+            self.events
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(event);
+        }
+    }
+
+    struct WaitingListener {
+        endpoint: std::sync::Weak<P2pEndpoint>,
+        result: Mutex<Option<bool>>,
+    }
+
+    impl P2pEventListener for WaitingListener {
+        fn on_event(&self, _event: crate::P2pEvent) {
+            let result = self
+                .endpoint
+                .upgrade()
+                .expect("endpoint")
+                .wait_stopped(60_000);
+            *self.result.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
+        }
+    }
 
     fn config() -> EndpointConfig {
         EndpointConfig {
@@ -502,22 +596,108 @@ mod tests {
     }
 
     #[test]
-    fn stop_finishes_a_synthetic_running_state() {
+    fn stop_finishes_a_running_driver() {
         let endpoint = endpoint(config()).expect("endpoint");
-        endpoint.shared.lock_state().lifecycle = Lifecycle::Running;
+        endpoint.start(Arc::new(NoopListener)).expect("start");
+        assert!(endpoint.is_running());
 
         endpoint.stop();
 
-        let state = endpoint.shared.lock_state();
-        assert_eq!(state.lifecycle, Lifecycle::Stopped);
-        assert!(state.endpoint.is_none());
-        drop(state);
+        assert!(endpoint.wait_stopped(1_000));
+        assert!(!endpoint.is_running());
+        assert!(endpoint.shared.lock_state().endpoint.is_none());
+    }
+
+    #[test]
+    fn start_rejects_double_start_and_restart_after_stop() {
+        let endpoint = endpoint(config()).expect("endpoint");
+        endpoint.start(Arc::new(NoopListener)).expect("start");
+
+        assert!(matches!(
+            endpoint.start(Arc::new(NoopListener)),
+            Err(FfiError::AlreadyStarted)
+        ));
+        endpoint.stop();
+        assert!(endpoint.wait_stopped(1_000));
+        assert!(matches!(
+            endpoint.start(Arc::new(NoopListener)),
+            Err(FfiError::Stopped)
+        ));
+    }
+
+    #[test]
+    fn fatal_driver_panic_is_reported_before_stopped() {
+        let endpoint = endpoint(config()).expect("endpoint");
+        let listener = Arc::new(RecordingListener::default());
+        {
+            let mut state = endpoint.shared.lock_state();
+            state.lifecycle = Lifecycle::Running;
+            state.endpoint = None;
+        }
+        endpoint
+            .shared
+            .driver_running
+            .store(true, Ordering::Release);
+
+        crate::driver::run(
+            Arc::clone(&endpoint.shared),
+            Arc::clone(&listener) as Arc<dyn P2pEventListener>,
+        );
+
+        assert!(matches!(
+            listener
+                .events
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_slice(),
+            [crate::P2pEvent::DriverFailed {
+                kind: crate::DriverFailureKind::Panic,
+                ..
+            }]
+        ));
         assert!(endpoint.wait_stopped(0));
+    }
+
+    #[test]
+    fn wait_stopped_from_driver_callback_returns_immediately() {
+        let endpoint = endpoint(config()).expect("endpoint");
+        let listener = Arc::new(WaitingListener {
+            endpoint: Arc::downgrade(&endpoint),
+            result: Mutex::new(None),
+        });
+        {
+            let mut state = endpoint.shared.lock_state();
+            state.lifecycle = Lifecycle::Running;
+            state.endpoint = None;
+        }
+        endpoint
+            .shared
+            .driver_running
+            .store(true, Ordering::Release);
+
+        let started = Instant::now();
+        crate::driver::run(
+            Arc::clone(&endpoint.shared),
+            Arc::clone(&listener) as Arc<dyn P2pEventListener>,
+        );
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            *listener
+                .result
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            Some(false)
+        );
     }
 
     #[test]
     fn pending_command_interrupts_a_waiter_and_balances_the_counter() {
         let endpoint = endpoint(config()).expect("endpoint");
+        endpoint
+            .shared
+            .driver_running
+            .store(true, Ordering::Release);
         let shared = Arc::clone(&endpoint.shared);
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
@@ -540,5 +720,9 @@ mod tests {
         }
         waiter.join().expect("waiter exits after interrupt");
         assert_eq!(endpoint.shared.pending_commands.load(Ordering::Acquire), 0);
+        endpoint
+            .shared
+            .driver_running
+            .store(false, Ordering::Release);
     }
 }

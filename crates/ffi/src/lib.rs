@@ -3,14 +3,20 @@
 #![warn(missing_docs)]
 
 mod config;
+mod driver;
 mod endpoint;
 mod error;
+mod events;
 
 use std::str::FromStr;
 
 pub use config::{DiscoveryOptions, EndpointConfig};
 pub use endpoint::P2pEndpoint;
 pub use error::FfiError;
+pub use events::{
+    DiscoverySource, DriverFailureKind, EndpointErrorKind, NatErrorKind, P2pEvent,
+    P2pEventListener, PathKind, Reachability,
+};
 use minip2p::{Ed25519Keypair, Multiaddr, PeerAddr, PeerId, Protocol};
 
 const SECRET_KEY_LENGTH: usize = 32;

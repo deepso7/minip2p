@@ -17,6 +17,7 @@ workspace = true
 
 [dependencies]
 minip2p = { package = "minip2p-rs", path = "../minip2p", features = ["discovery"] }
+minip2p-swarm = { path = "../swarm" }
 thiserror = "2.0.18"
 # Must remain paired with ubrn and @ubjs/core 0.31.0-3.
 uniffi = "=0.31.0"

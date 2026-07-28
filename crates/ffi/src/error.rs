@@ -3,6 +3,12 @@
 /// An error returned by a synchronous FFI operation.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum FfiError {
+    /// The endpoint's background driver was already started.
+    #[error("endpoint driver already started")]
+    AlreadyStarted,
+    /// The endpoint has stopped and cannot be restarted.
+    #[error("endpoint is stopped")]
+    Stopped,
     /// Endpoint configuration was internally inconsistent.
     #[error("invalid endpoint configuration: {detail}")]
     InvalidConfig {
