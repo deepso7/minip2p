@@ -25,7 +25,16 @@ immediately.
 Connection-attempt IDs are retained in an endpoint-lifetime map so cancellation
 remains valid after an initial path event. This assumes chat-scale connection
 volume; a long-lived service issuing unbounded attempts should periodically
-recreate its endpoint until a bounded retirement policy is added.
+recreate its endpoint until a bounded retirement policy is added. Cancellation
+suppresses queued connection-attempt events on a best-effort basis; an event
+whose callback already won the dispatch race may still be observed after
+`cancel_connect` returns.
+
+The native driver owns connection keepalive. Every 10 seconds it pings every
+currently connected peer, keeping quiet connections inside QUIC's default
+30-second idle timeout. Successful replies and timeouts surface normally as
+`PingRttMeasured` and `PingTimeout` events; hosts should not run a second
+keepalive loop.
 
 Native callback carry is capped at 4096 source events and delivered in batches
 of at most 512. Overflow discards oldest message events first, then oldest

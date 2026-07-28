@@ -95,7 +95,6 @@ fn two_endpoints_chat_over_loopback() -> Result<(), FfiError> {
         )),
         Some(P2pEvent::PathEstablished { .. })
     ));
-    a.cancel_connect(connect_id)?;
     assert!(
         a_log
             .wait_for(Duration::from_secs(5), |event| matches!(

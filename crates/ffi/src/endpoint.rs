@@ -342,6 +342,9 @@ impl P2pEndpoint {
     }
 
     /// Cancels a known connection attempt; unknown ids are an idempotent no-op.
+    ///
+    /// Queued connection events are suppressed when possible. A listener
+    /// callback that already won the dispatch race may still arrive.
     pub fn cancel_connect(&self, id: u64) -> Result<(), FfiError> {
         let _pending = PendingCommand::new(&self.shared);
         let mut state = self.shared.lock_state();

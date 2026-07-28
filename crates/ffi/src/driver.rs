@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use minip2p::{EndpointWake, Error, NatEvent};
 
@@ -14,6 +14,7 @@ use crate::{DriverFailureKind, P2pEvent, P2pEventListener};
 
 const DRIVER_POLL: Duration = Duration::from_millis(25);
 const DRIVER_IDLE_POLL: Duration = Duration::from_millis(500);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_BATCH_PER_ITER: usize = 512;
 const MAX_CARRY_EVENTS: usize = 4096;
 
@@ -166,6 +167,7 @@ pub(crate) fn run(shared: Arc<Shared>, listener: Arc<dyn P2pEventListener>) {
 fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
     let mut carry = Carry::default();
     let mut overflow = OverflowDiagnostic::default();
+    let mut next_keepalive_at = Instant::now() + KEEPALIVE_INTERVAL;
     loop {
         let mut state = guard.shared.lock_state();
         if state.lifecycle != Lifecycle::Running {
@@ -185,8 +187,9 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             for event in delivery.batch {
                 let should_dispatch = {
                     let mut state = guard.shared.lock_state();
-                    let cancelled = state.cancelled_connect_ids.clone();
-                    record_source_dispatch(&event, &cancelled, &mut state.stats)
+                    let cancelled = p2p_connect_id(&event)
+                        .is_some_and(|id| state.cancelled_connect_ids.contains(&id));
+                    record_source_dispatch(cancelled, &mut state.stats)
                 };
                 if should_dispatch {
                     dispatch(listener, event);
@@ -199,11 +202,22 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         } else {
             DRIVER_IDLE_POLL
         };
-        let cancelled_connect_ids = state.cancelled_connect_ids.clone();
         let crate::endpoint::EndpointState {
-            endpoint, stats, ..
+            endpoint,
+            cancelled_connect_ids,
+            stats,
+            ..
         } = &mut *state;
         let endpoint = endpoint.as_mut().expect("running endpoint exists");
+        if Instant::now() >= next_keepalive_at {
+            advance_keepalive_deadline(&mut next_keepalive_at, Instant::now());
+            let peers = endpoint.connected_peers();
+            for peer in keepalive_targets(&peers) {
+                // A peer may disconnect between the snapshot and ping.
+                // Its close/timeout event is the authoritative signal.
+                let _ = endpoint.ping(peer);
+            }
+        }
         let wake = endpoint.next_wake(deadline)?;
         if matches!(wake, EndpointWake::Interrupted) {
             drop(state);
@@ -255,6 +269,16 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         stats.carry_high_water = stats.carry_high_water.max(carry.len());
         stats.iterations = stats.iterations.saturating_add(1);
     }
+}
+
+fn advance_keepalive_deadline(deadline: &mut Instant, now: Instant) {
+    while *deadline <= now {
+        *deadline += KEEPALIVE_INTERVAL;
+    }
+}
+
+fn keepalive_targets<T>(peers: &[T]) -> &[T] {
+    peers
 }
 
 fn ingest(
@@ -319,12 +343,8 @@ fn p2p_connect_id(event: &P2pEvent) -> Option<u64> {
     }
 }
 
-fn record_source_dispatch(
-    event: &P2pEvent,
-    cancelled: &BTreeSet<u64>,
-    stats: &mut DriverStats,
-) -> bool {
-    if p2p_connect_id(event).is_some_and(|id| cancelled.contains(&id)) {
+fn record_source_dispatch(cancelled: bool, stats: &mut DriverStats) -> bool {
+    if cancelled {
         stats.dropped = stats.dropped.saturating_add(1);
         false
     } else {
@@ -423,16 +443,16 @@ mod tests {
             })
         );
         assert_eq!(stats.dispatch_attempted_synthetic, 1);
-        for event in &first.batch {
-            assert!(record_source_dispatch(event, &BTreeSet::new(), &mut stats));
+        for _ in &first.batch {
+            assert!(record_source_dispatch(false, &mut stats));
         }
 
         while !carry.is_empty() {
             let delivery = take_delivery(&mut carry, &mut overflow, &mut stats);
             assert!(delivery.batch.len() <= MAX_BATCH_PER_ITER);
             assert!(delivery.diagnostic.is_none());
-            for event in &delivery.batch {
-                assert!(record_source_dispatch(event, &BTreeSet::new(), &mut stats));
+            for _ in &delivery.batch {
+                assert!(record_source_dispatch(false, &mut stats));
             }
         }
 
@@ -471,12 +491,29 @@ mod tests {
             path: crate::PathKind::DirectDialed,
         };
         let mut stats = DriverStats::default();
-        assert!(!record_source_dispatch(
-            &extracted,
-            &BTreeSet::from([7]),
-            &mut stats
-        ));
+        let cancelled = p2p_connect_id(&extracted).is_some_and(|id| id == 7);
+        assert!(!record_source_dispatch(cancelled, &mut stats));
         assert_eq!(stats.dropped, 1);
         assert_eq!(stats.dispatch_attempted, 0);
+    }
+
+    #[test]
+    fn keepalive_deadline_advances_from_its_previous_schedule() {
+        let start = Instant::now();
+        let mut deadline = start + KEEPALIVE_INTERVAL;
+
+        advance_keepalive_deadline(
+            &mut deadline,
+            start + KEEPALIVE_INTERVAL + Duration::from_secs(25),
+        );
+
+        assert_eq!(deadline, start + Duration::from_secs(40));
+    }
+
+    #[test]
+    fn keepalive_targets_include_every_connected_peer() {
+        let peers: Vec<_> = (0..32).collect();
+
+        assert_eq!(keepalive_targets(&peers), peers);
     }
 }
