@@ -11,6 +11,7 @@ mod events;
 use std::str::FromStr;
 
 pub use config::{DiscoveryOptions, EndpointConfig, KnownPeerInfo, RelayReservationInfo};
+pub use driver::DriverStats;
 pub use endpoint::P2pEndpoint;
 pub use error::FfiError;
 pub use events::{

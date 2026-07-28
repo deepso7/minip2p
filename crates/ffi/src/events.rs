@@ -93,6 +93,13 @@ pub enum DriverFailureKind {
 #[derive(Clone, Debug, Eq, PartialEq, uniffi::Enum)]
 #[allow(clippy::large_enum_variant)]
 pub enum P2pEvent {
+    /// Native event carry overflow discarded source events.
+    EventsDropped {
+        /// Events discarded since the previous diagnostic.
+        dropped: u64,
+        /// Events discarded since this driver started.
+        total_dropped: u64,
+    },
     /// The background driver terminated after a fatal failure.
     DriverFailed {
         /// Machine-readable failure category.

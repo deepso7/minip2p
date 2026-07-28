@@ -12,7 +12,7 @@ use minip2p::{
 };
 
 use crate::{
-    EndpointConfig, FfiError, KnownPeerInfo, P2pEventListener, RelayReservationInfo,
+    DriverStats, EndpointConfig, FfiError, KnownPeerInfo, P2pEventListener, RelayReservationInfo,
     keypair_from_bytes, parse_direct_quic_peer_addr,
 };
 
@@ -39,6 +39,7 @@ pub(crate) struct EndpointState {
     pub(crate) driver_thread_id: Option<std::thread::ThreadId>,
     connect_ids: BTreeMap<u64, minip2p::ConnectId>,
     pub(crate) cancelled_connect_ids: BTreeSet<u64>,
+    pub(crate) stats: DriverStats,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,6 +143,7 @@ impl P2pEndpoint {
                     driver_thread_id: None,
                     connect_ids: BTreeMap::new(),
                     cancelled_connect_ids: BTreeSet::new(),
+                    stats: DriverStats::default(),
                 }),
                 stopped_cv: Condvar::new(),
                 wait_handle,
@@ -392,6 +394,13 @@ impl P2pEndpoint {
 }
 
 impl P2pEndpoint {
+    /// Returns Rust-side background-driver diagnostics.
+    ///
+    /// This method is intentionally outside the UniFFI export block.
+    pub fn driver_stats(&self) -> DriverStats {
+        self.shared.lock_state().stats
+    }
+
     fn with_endpoint<T>(&self, operation: impl FnOnce(&Endpoint) -> T) -> Result<T, FfiError> {
         let _pending = PendingCommand::new(&self.shared);
         let state = self.shared.lock_state();

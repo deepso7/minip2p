@@ -27,6 +27,12 @@ remains valid after an initial path event. This assumes chat-scale connection
 volume; a long-lived service issuing unbounded attempts should periodically
 recreate its endpoint until a bounded retirement policy is added.
 
+Native callback carry is capped at 4096 source events and delivered in batches
+of at most 512. Overflow discards oldest message events first, then oldest
+remaining events, and reports the loss through a dedicated `EventsDropped`
+diagnostic. Rust-side tests can inspect exact accounting through
+`P2pEndpoint::driver_stats`; this diagnostic method is not exported by UniFFI.
+
 Android currently pins `boring` and `boring-sys` to the immutable fix proposed
 in [cloudflare/boring#518](https://github.com/cloudflare/boring/pull/518).
 Remove the workspace patch when an upstream crates.io release contains that
