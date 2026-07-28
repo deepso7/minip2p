@@ -37,6 +37,9 @@ Event waits (`next_event`, `wait_peer_ready`, `wait_ping_rtt`) accept an
 including events already queued when the call begins. Its `Event` result
 transfers ownership of one application event; `DriverProgress` leaves agent
 events in their focused queues for the corresponding `take_*_events` method.
+Progress is level-triggered across all active agents: drain every non-empty
+agent queue before calling `next_wake` again, or it will immediately report
+`DriverProgress` again.
 
 When an application permanently relinquishes a stream, `Endpoint::abandon_stream`
 resets it, purges already-buffered events, and suppresses later stream events.

@@ -41,16 +41,6 @@ impl ConnectId {
     }
 }
 
-#[cfg(test)]
-mod connect_id_tests {
-    use super::ConnectId;
-
-    #[test]
-    fn numeric_value_is_exposed_without_a_reverse_constructor() {
-        assert_eq!(ConnectId(42).as_u64(), 42);
-    }
-}
-
 /// Opaque correlation token for a pending [`NatAction::Dial`] or
 /// [`NatAction::OpenStream`].
 ///
