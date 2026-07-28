@@ -59,6 +59,7 @@ Work the **diff**, reading surrounding code when needed. For every nontrivial hu
 - Do new behaviors have tests that would fail if the bug existed?
 - Did CI/scripts/`no_std`/fuzz wiring lose coverage when files were renamed or crates split?
 - Do READMEs/comments claim behavior the code no longer implements?
+- Hollow or checklist-duplicate tests that create false confidence — treat as P2/P3 maintainability when you can cite a concrete `file:line` and state what regression the proof would miss; not pure taste.
 
 ### 5. Project constraints (only when the diff touches them)
 Enforce repo architecture docs (e.g. AGENTS.md): sans-I/O, `no_std`, unsafe policy, transport scope, no async in core — as **correctness/policy bugs**, not style.
