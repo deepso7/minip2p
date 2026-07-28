@@ -27,4 +27,16 @@ pub enum FfiError {
         /// Human-readable parse detail.
         detail: String,
     },
+    /// The operation is unavailable in the endpoint's current lifecycle state.
+    #[error("invalid endpoint state: {detail}")]
+    InvalidState {
+        /// Human-readable state detail.
+        detail: String,
+    },
+    /// An internal invariant or unexpected construction path failed.
+    #[error("internal error: {detail}")]
+    Internal {
+        /// Human-readable failure detail.
+        detail: String,
+    },
 }

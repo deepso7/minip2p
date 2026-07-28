@@ -2,10 +2,14 @@
 
 #![warn(missing_docs)]
 
+mod config;
+mod endpoint;
 mod error;
 
 use std::str::FromStr;
 
+pub use config::{DiscoveryOptions, EndpointConfig};
+pub use endpoint::P2pEndpoint;
 pub use error::FfiError;
 use minip2p::{Ed25519Keypair, Multiaddr, PeerAddr, PeerId, Protocol};
 
@@ -31,7 +35,20 @@ pub fn peer_id_from_secret_key(secret_key: Vec<u8>) -> Result<String, FfiError> 
 /// Builds a circuit multiaddress for `peer_id` through `relay_addr`.
 #[uniffi::export]
 pub fn circuit_address(relay_addr: String, peer_id: String) -> Result<String, FfiError> {
-    let relay = PeerAddr::from_str(&relay_addr).map_err(|error| FfiError::InvalidAddress {
+    let relay = parse_direct_quic_peer_addr(&relay_addr)?;
+    let target = PeerId::from_str(&peer_id).map_err(|error| FfiError::InvalidPeerId {
+        detail: error.to_string(),
+    })?;
+
+    let mut protocols = relay.transport().protocols().to_vec();
+    protocols.push(Protocol::P2p(relay.peer_id().clone()));
+    protocols.push(Protocol::P2pCircuit);
+    protocols.push(Protocol::P2p(target));
+    Ok(Multiaddr::from_protocols(protocols).to_string())
+}
+
+fn parse_direct_quic_peer_addr(address: &str) -> Result<PeerAddr, FfiError> {
+    let relay = PeerAddr::from_str(address).map_err(|error| FfiError::InvalidAddress {
         detail: error.to_string(),
     })?;
     if !relay.transport().is_quic_transport()
@@ -45,15 +62,7 @@ pub fn circuit_address(relay_addr: String, peer_id: String) -> Result<String, Ff
             detail: "relay address must be a direct QUIC-v1 peer address".into(),
         });
     }
-    let target = PeerId::from_str(&peer_id).map_err(|error| FfiError::InvalidPeerId {
-        detail: error.to_string(),
-    })?;
-
-    let mut protocols = relay.transport().protocols().to_vec();
-    protocols.push(Protocol::P2p(relay.peer_id().clone()));
-    protocols.push(Protocol::P2pCircuit);
-    protocols.push(Protocol::P2p(target));
-    Ok(Multiaddr::from_protocols(protocols).to_string())
+    Ok(relay)
 }
 
 fn keypair_from_bytes(secret_key: Vec<u8>) -> Result<Ed25519Keypair, FfiError> {
@@ -153,15 +162,15 @@ mod tests {
 
         for invalid in [
             format!("/ip4/127.0.0.1/udp/4001/p2p/{relay}"),
-            format!("/ip4/127.0.0.1/udp/4001/quic-v1/p2p/{relay}/p2p-circuit/p2p/{relay}"),
+            format!("/ip4/127.0.0.1/udp/4001/quic-v1/p2p-circuit/p2p/{relay}"),
         ] {
-            assert!(
-                matches!(
-                    circuit_address(invalid, target.to_base58()),
-                    Err(FfiError::InvalidAddress { .. })
-                ),
-                "invalid relay shape must be rejected"
-            );
+            let error = circuit_address(invalid, target.to_base58())
+                .expect_err("invalid relay shape must be rejected");
+            assert!(matches!(
+                error,
+                FfiError::InvalidAddress { ref detail }
+                    if detail == "relay address must be a direct QUIC-v1 peer address"
+            ));
         }
     }
 }
