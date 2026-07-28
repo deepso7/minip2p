@@ -5,13 +5,12 @@
 //! the Sans-I/O core's actions and concrete transport calls.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use minip2p_core::{Multiaddr, PeerAddr, PeerId};
 use minip2p_identify::{IdentifyConfig, IdentifyMessage};
 use minip2p_ping::{PING_PAYLOAD_LEN, PingConfig};
-use minip2p_platform::Now;
+use minip2p_platform::{Clock, Now, StdClock};
 use minip2p_transport::{
     BlockingTransport, ConnectionId, StreamId, Transport, TransportError, WaitOutcome,
 };
@@ -85,6 +84,16 @@ pub const RUN_UNTIL_SKIP_LIMIT: usize = 1024;
 /// - an [`Instant`] -- absolute deadline,
 /// - a [`Duration`] -- relative timeout from now,
 /// - [`Deadline::NEVER`] -- wait indefinitely.
+///
+/// # Not [`minip2p_platform::Deadline`]
+///
+/// The two are deliberately distinct despite the shared name. This one is how
+/// long a *caller* is prepared to block, so it is measured in real time and
+/// deliberately independent of the driver's injected [`Clock`]: a test that
+/// freezes the clock to exercise protocol timers still wants its own waits to
+/// end. The platform type is when a *component* next needs attention, on the
+/// monotonic timeline of the samples the driver hands out, and is what
+/// [`Transport::next_deadline`] reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deadline(Option<Instant>);
 
@@ -137,34 +146,6 @@ impl From<Duration> for Deadline {
     }
 }
 
-/// Clock source used by the std swarm driver.
-///
-/// The Sans-I/O core remains clockless; the driver reads this clock and passes
-/// milliseconds into the core. Tests can inject a deterministic clock while
-/// normal callers use the default system monotonic clock.
-pub trait Clock: Send + Sync {
-    /// Returns monotonic milliseconds since an arbitrary start point.
-    fn now_ms(&self) -> u64;
-}
-
-struct SystemClock {
-    start: Instant,
-}
-
-impl SystemClock {
-    fn new() -> Self {
-        Self {
-            start: Instant::now(),
-        }
-    }
-}
-
-impl Clock for SystemClock {
-    fn now_ms(&self) -> u64 {
-        self.start.elapsed().as_millis() as u64
-    }
-}
-
 /// Thin std driver wrapping [`SwarmCore`] and a concrete [`Transport`].
 ///
 /// Preserves the one-call DX built on top of the core:
@@ -199,7 +180,7 @@ pub struct Swarm<T: Transport> {
     external_addresses: Vec<Multiaddr>,
 
     /// Logical clock used to drive Sans-I/O timers.
-    clock: Arc<dyn Clock>,
+    clock: Box<dyn Clock + Send + Sync>,
 }
 
 /// Result of an interruptible swarm wait.
@@ -231,7 +212,7 @@ impl<T: Transport> Swarm<T> {
             identify_config,
             ping_config,
             local_peer_id,
-            Arc::new(SystemClock::new()),
+            Box::new(StdClock::new()),
         )
     }
 
@@ -245,7 +226,7 @@ impl<T: Transport> Swarm<T> {
         identify_config: IdentifyConfig,
         ping_config: PingConfig,
         local_peer_id: PeerId,
-        clock: Arc<dyn Clock>,
+        clock: Box<dyn Clock + Send + Sync>,
     ) -> Self {
         Self {
             transport,
@@ -395,15 +376,17 @@ impl<T: Transport> Swarm<T> {
     /// via [`SwarmEvent::PingRttMeasured`] on the next `poll()`.
     pub fn ping(&mut self, peer_id: &PeerId) -> Result<(), DriverError> {
         let payload = rand_ping_payload()?;
-        self.core.ping(peer_id, payload, self.now_ms())?;
-        self.flush_actions();
+        let now_ms = self.now_ms();
+        self.core.ping(peer_id, payload, now_ms)?;
+        self.flush_actions(now_ms);
         Ok(())
     }
 
     /// Close the connection to a peer.
     pub fn disconnect(&mut self, peer_id: &PeerId) -> Result<(), DriverError> {
         self.core.disconnect(peer_id)?;
-        self.flush_actions();
+        let now_ms = self.now_ms();
+        self.flush_actions(now_ms);
         Ok(())
     }
 
@@ -434,7 +417,8 @@ impl<T: Transport> Swarm<T> {
         // contains only this call's own action cascade. A failure from an
         // unrelated, previously queued open must surface asynchronously as
         // SwarmEvent::Error -- not as this caller's synchronous error.
-        self.flush_actions();
+        let now_ms = self.now_ms();
+        self.flush_actions(now_ms);
 
         // The core emits a Pending OpenStream action; we drain it now so
         // the transport.open_stream call happens synchronously and we can
@@ -458,7 +442,13 @@ impl<T: Transport> Swarm<T> {
         while let Some(output) = self.core.poll_output() {
             match output {
                 SwarmOutput::Action(action) => {
-                    self.dispatch_action(action, &mut allocated_stream, &mut open_error, &mut None);
+                    self.dispatch_action(
+                        action,
+                        now_ms,
+                        &mut allocated_stream,
+                        &mut open_error,
+                        &mut None,
+                    );
                 }
                 SwarmOutput::Event(event) => self.event_buffer.push_back(event),
             }
@@ -466,7 +456,8 @@ impl<T: Transport> Swarm<T> {
 
         // Any cascade from dispatch_action (e.g. MSS header SendStream) is
         // already in the core's action queue. Drain those too.
-        self.flush_actions();
+        let now_ms = self.now_ms();
+        self.flush_actions(now_ms);
 
         if let Some(error) = open_error {
             // The failure is reported synchronously through Err, so drop the
@@ -500,7 +491,8 @@ impl<T: Transport> Swarm<T> {
         // Flush anything already queued first, so the capture window below
         // contains only this call's own action cascade (same discipline as
         // `Swarm::open_stream`).
-        self.flush_actions();
+        let now_ms = self.now_ms();
+        self.flush_actions(now_ms);
 
         self.core.send_stream(peer_id, stream_id, data)?;
 
@@ -514,12 +506,13 @@ impl<T: Transport> Swarm<T> {
         while let Some(output) = self.core.poll_output() {
             match output {
                 SwarmOutput::Action(action) => {
-                    self.dispatch_action(action, &mut None, &mut None, &mut send_error);
+                    self.dispatch_action(action, now_ms, &mut None, &mut None, &mut send_error);
                 }
                 SwarmOutput::Event(event) => self.event_buffer.push_back(event),
             }
         }
-        self.flush_actions();
+        let now_ms = self.now_ms();
+        self.flush_actions(now_ms);
 
         if let Some(error) = send_error {
             // Reported synchronously through Err: drop the duplicate
@@ -544,7 +537,8 @@ impl<T: Transport> Swarm<T> {
         stream_id: StreamId,
     ) -> Result<(), DriverError> {
         self.core.close_stream_write(peer_id, stream_id)?;
-        self.flush_actions();
+        let now_ms = self.now_ms();
+        self.flush_actions(now_ms);
         Ok(())
     }
 
@@ -555,7 +549,8 @@ impl<T: Transport> Swarm<T> {
         stream_id: StreamId,
     ) -> Result<(), DriverError> {
         self.core.reset_stream(peer_id, stream_id)?;
-        self.flush_actions();
+        let now_ms = self.now_ms();
+        self.flush_actions(now_ms);
         Ok(())
     }
 
@@ -580,7 +575,8 @@ impl<T: Transport> Swarm<T> {
         self.event_buffer
             .retain(|event| !event.matches_stream(peer_id, stream_id));
         result?;
-        self.flush_actions();
+        let now_ms = self.now_ms();
+        self.flush_actions(now_ms);
         Ok(())
     }
 
@@ -591,13 +587,14 @@ impl<T: Transport> Swarm<T> {
     /// [`Swarm::poll_next`] or [`Swarm::run_until`], which internally
     /// call this in a sleep/poll loop and return one event at a time.
     pub fn poll(&mut self) -> Result<Vec<SwarmEvent>, DriverError> {
-        let now_ms = self.now_ms();
+        let now = self.sample_now();
+        let now_ms = now.monotonic_ms;
 
         // Actions deferred by the previous poll are now safe to dispatch if
         // every event that preceded them has been returned to the caller.
         // Do this before reading more transport input so superseded
         // connections cannot produce another batch ahead of their close.
-        self.flush_actions();
+        self.flush_actions(now_ms);
 
         // 0. Refresh the core's snapshot of our listening addresses so
         //    Identify advertises the current bound set plus any validated
@@ -611,7 +608,7 @@ impl<T: Transport> Swarm<T> {
         self.core.set_local_addresses(local_addresses);
 
         // 1. Feed transport events to the core.
-        let events = self.transport.poll(Now::from_millis(now_ms))?;
+        let events = self.transport.poll(now)?;
         for event in events {
             self.core
                 .handle_input(SwarmInput::Transport { event, now_ms });
@@ -621,7 +618,7 @@ impl<T: Transport> Swarm<T> {
         self.core.handle_input(SwarmInput::Tick { now_ms });
 
         // 3. Execute all queued actions (may cascade -- see flush_actions).
-        self.flush_actions();
+        self.flush_actions(now_ms);
 
         // 4. Return the application's events. `flush_actions` fully drained
         //    the core; any action ordered after these events is held in the
@@ -687,11 +684,11 @@ impl<T: BlockingTransport> Swarm<T> {
             // timer (e.g. a ping timeout, which only fires when a Tick is
             // fed into the core by `poll()`).
             let mut budget = deadline.remaining_at(now).unwrap_or(MAX_IDLE_WAIT);
+            let now = self.sample_now();
             if let Some(deadline) = self.transport.next_deadline() {
-                let remaining = deadline.millis_until(Now::from_millis(self.now_ms()));
-                budget = budget.min(Duration::from_millis(remaining));
+                budget = budget.min(Duration::from_millis(deadline.millis_until(now)));
             }
-            if let Some(timeout_ms) = self.core.next_timeout(self.now_ms()) {
+            if let Some(timeout_ms) = self.core.next_timeout(now.monotonic_ms) {
                 budget = budget.min(Duration::from_millis(timeout_ms));
             }
             if budget.is_zero() {
@@ -824,8 +821,16 @@ impl<T: Transport> Swarm<T> {
     // Internals
     // -----------------------------------------------------------------------
 
-    fn now_ms(&self) -> u64 {
-        self.clock.now_ms()
+    /// Samples the injected clock.
+    ///
+    /// Callers that drive several subsystems in one iteration should sample
+    /// once and pass the result down, so they all observe the same instant.
+    fn sample_now(&mut self) -> Now {
+        self.clock.now()
+    }
+
+    fn now_ms(&mut self) -> u64 {
+        self.sample_now().monotonic_ms
     }
 
     /// Drains all actions from the core and dispatches each to the
@@ -833,7 +838,11 @@ impl<T: Transport> Swarm<T> {
     /// cascades where executing an action causes the core to emit more
     /// (e.g. `OpenStream` leading to `SendStream` once the stream id is
     /// reported back).
-    fn flush_actions(&mut self) {
+    ///
+    /// `now_ms` is the caller's time sample, threaded through so a single
+    /// drive iteration reports one instant to the core no matter how many
+    /// actions cascade.
+    fn flush_actions(&mut self, now_ms: u64) {
         let mut allocated: Option<StreamId> = None;
 
         // A buffered event has not yet been delivered by `poll_next`, so its
@@ -841,7 +850,7 @@ impl<T: Transport> Swarm<T> {
         // into its return value; the next driver call may then dispatch them.
         if self.event_buffer.is_empty() {
             while let Some(action) = self.after_event_actions.pop_front() {
-                self.dispatch_action(action, &mut allocated, &mut None, &mut None);
+                self.dispatch_action(action, now_ms, &mut allocated, &mut None, &mut None);
             }
         }
 
@@ -856,7 +865,7 @@ impl<T: Transport> Swarm<T> {
                     self.after_event_actions.push_back(action);
                 }
                 SwarmOutput::Action(action) => {
-                    self.dispatch_action(action, &mut allocated, &mut None, &mut None)
+                    self.dispatch_action(action, now_ms, &mut allocated, &mut None, &mut None)
                 }
                 SwarmOutput::Event(event) => {
                     saw_event = true;
@@ -877,6 +886,7 @@ impl<T: Transport> Swarm<T> {
     fn dispatch_action(
         &mut self,
         action: SwarmAction,
+        now_ms: u64,
         captured_stream_id: &mut Option<StreamId>,
         captured_open_error: &mut Option<TransportError>,
         captured_send_error: &mut Option<TransportError>,
@@ -890,7 +900,7 @@ impl<T: Transport> Swarm<T> {
                         conn_id,
                         stream_id,
                         token,
-                        now_ms: self.now_ms(),
+                        now_ms,
                     });
                 }
                 Err(e) => {
@@ -899,7 +909,7 @@ impl<T: Transport> Swarm<T> {
                     self.core.handle_input(SwarmInput::OpenStreamFailed {
                         token,
                         reason,
-                        now_ms: self.now_ms(),
+                        now_ms,
                     });
                 }
             },
@@ -1008,6 +1018,7 @@ mod tests {
     use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, MultistreamSelect};
     use minip2p_ping::PING_PROTOCOL_ID;
     use minip2p_transport::{ConnectionEndpoint, TransportEvent};
+    use std::sync::Arc;
 
     #[test]
     fn ping_payload_entropy_failure_is_an_error() {
@@ -1290,6 +1301,47 @@ mod tests {
     }
 
     #[test]
+    fn one_drive_iteration_takes_one_clock_sample() {
+        let clock = CountingClock::default();
+        let reads = clock.reads.clone();
+
+        let keypair = Ed25519Keypair::generate();
+        let identify = IdentifyConfig {
+            protocol_version: "test/1".into(),
+            agent_version: "test/1".into(),
+            protocols: Vec::new(),
+            public_key: keypair.public_key().encode_protobuf(),
+        };
+        let mut swarm = Swarm::with_clock(
+            IdleTransport::default(),
+            identify,
+            PingConfig::default(),
+            keypair.peer_id(),
+            Box::new(clock),
+        );
+
+        swarm.poll().expect("poll");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "the transport, the core's tick, and action dispatch must share \
+             one sample; a second read means they can disagree about now"
+        );
+
+        swarm.poll().expect("poll");
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+
+        // The transport saw the same instants the core was ticked with.
+        let samples: Vec<u64> = swarm
+            .transport()
+            .samples
+            .iter()
+            .map(|sample| sample.monotonic_ms)
+            .collect();
+        assert_eq!(samples, vec![1_000, 2_000]);
+    }
+
+    #[test]
     fn driver_hands_its_own_clock_sample_to_the_transport() {
         let clock = Arc::new(TestClock::default());
         clock.advance(7_000);
@@ -1306,7 +1358,7 @@ mod tests {
             identify,
             PingConfig::default(),
             keypair.peer_id(),
-            clock.clone(),
+            Box::new(SharedClock(clock.clone())),
         );
 
         swarm.poll().expect("poll");
@@ -1351,7 +1403,7 @@ mod tests {
             identify,
             PingConfig::default(),
             keypair.peer_id(),
-            clock.clone(),
+            Box::new(SharedClock(clock.clone())),
         );
 
         // A far-off caller deadline must not stop the transport's nearer
@@ -2059,11 +2111,37 @@ mod tests {
         fn advance(&self, ms: u64) {
             self.now_ms.fetch_add(ms, Ordering::SeqCst);
         }
-    }
 
-    impl Clock for TestClock {
         fn now_ms(&self) -> u64 {
             self.now_ms.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Clock that jumps a full second on every read and counts reads, so a
+    /// test can tell one sample per drive iteration from several.
+    #[derive(Clone, Default)]
+    struct CountingClock {
+        reads: Arc<AtomicU64>,
+    }
+
+    impl Clock for CountingClock {
+        fn now(&mut self) -> Now {
+            let read = self.reads.fetch_add(1, Ordering::SeqCst);
+            Now::from_millis((read + 1) * 1_000)
+        }
+    }
+
+    /// Adapts a shared [`TestClock`] to the platform [`Clock`] trait.
+    ///
+    /// `Clock::now` takes `&mut self`, so the swarm owns one of these while
+    /// the test (and any mock transport) keeps its own handle on the same
+    /// underlying timeline.
+    #[derive(Clone)]
+    struct SharedClock(Arc<TestClock>);
+
+    impl Clock for SharedClock {
+        fn now(&mut self) -> Now {
+            Now::from_millis(self.0.now_ms())
         }
     }
 
@@ -2213,7 +2291,7 @@ mod tests {
                 request_timeout_ms: PING_TIMEOUT_MS,
             },
             keypair.peer_id(),
-            clock.clone(),
+            Box::new(SharedClock(clock.clone())),
         );
 
         // Settle connection setup and identify stream negotiation, then get

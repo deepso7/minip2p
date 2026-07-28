@@ -49,4 +49,8 @@ pub use minip2p_identify::IdentifyMessage;
 #[cfg(feature = "std")]
 pub use crate::builder::SwarmBuilder;
 #[cfg(feature = "std")]
-pub use crate::driver::{Clock, Deadline, DriverError, PollNext, RUN_UNTIL_SKIP_LIMIT, Swarm};
+pub use crate::driver::{Deadline, DriverError, PollNext, RUN_UNTIL_SKIP_LIMIT, Swarm};
+// Re-exported so callers of `Swarm::with_clock` need not depend on the
+// platform crate directly.
+#[cfg(feature = "std")]
+pub use minip2p_platform::{Clock, Now, StdClock};
