@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use minip2p_ffi::{EndpointConfig, FfiError, P2pEndpoint, P2pEvent, P2pEventListener, PathKind};
 
+static LOOPBACK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[derive(Default)]
 struct EventLog {
     events: Mutex<Vec<P2pEvent>>,
@@ -93,6 +95,55 @@ struct SlowListener {
     log: Arc<EventLog>,
 }
 
+#[derive(Default)]
+struct CallbackGate {
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+impl CallbackGate {
+    fn wait_until_entered(&self, timeout: Duration) -> bool {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |(entered, _)| !*entered)
+            .unwrap_or_else(PoisonError::into_inner);
+        state.0
+    }
+
+    fn release(&self) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
+        self.changed.notify_all();
+    }
+}
+
+struct BlockingListener {
+    log: Arc<EventLog>,
+    gate: Arc<CallbackGate>,
+}
+
+impl P2pEventListener for BlockingListener {
+    fn on_event(&self, event: P2pEvent) {
+        if matches!(event, P2pEvent::Message { .. }) {
+            let mut state = self
+                .gate
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            state.0 = true;
+            self.gate.changed.notify_all();
+            while !state.1 {
+                state = self
+                    .gate
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        }
+        self.log.on_event(event);
+    }
+}
+
 impl P2pEventListener for SlowListener {
     fn on_event(&self, event: P2pEvent) {
         if matches!(event, P2pEvent::Message { .. }) {
@@ -134,6 +185,9 @@ fn stop(endpoint: &P2pEndpoint) {
 
 #[test]
 fn two_endpoints_chat_over_loopback() -> Result<(), FfiError> {
+    let _serial = LOOPBACK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let a = endpoint(21);
     let b = endpoint(22);
     let a_log = Arc::new(EventLog::default());
@@ -223,6 +277,9 @@ fn two_endpoints_chat_over_loopback() -> Result<(), FfiError> {
 
 #[test]
 fn panicking_listener_does_not_kill_driver() -> Result<(), FfiError> {
+    let _serial = LOOPBACK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let a = endpoint(23);
     let b = endpoint(24);
     let a_log = Arc::new(EventLog::default());
@@ -272,9 +329,64 @@ fn panicking_listener_does_not_kill_driver() -> Result<(), FfiError> {
 }
 
 #[test]
-fn bounded_load_preserves_accounting_and_query_handoff() -> Result<(), FfiError> {
+fn query_completes_while_listener_callback_is_in_flight() -> Result<(), FfiError> {
+    let _serial = LOOPBACK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let a = endpoint(27);
+    let b = endpoint(28);
+    let a_log = Arc::new(EventLog::default());
+    let b_log = Arc::new(EventLog::default());
+    let gate = Arc::new(CallbackGate::default());
+    let a_peer = a.peer_id();
+
+    a.start(Arc::new(BlockingListener {
+        log: a_log,
+        gate: Arc::clone(&gate),
+    }))?;
+    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventListener>)?;
+    a.subscribe("handoff-room".into())?;
+    b.subscribe("handoff-room".into())?;
+    a.connect_addr(b.listen_addrs()[0].clone())?;
+    assert!(
+        b_log
+            .wait_for(Duration::from_secs(5), |event| matches!(
+                event,
+                P2pEvent::PeerSubscribed { peer_id, topic }
+                    if peer_id == &a_peer && topic == "handoff-room"
+            ))
+            .is_some()
+    );
+
+    b.publish("handoff-room".into(), b"block callback".to_vec())?;
+    assert!(
+        gate.wait_until_entered(Duration::from_secs(5)),
+        "listener callback did not start"
+    );
+
+    let query_endpoint = Arc::clone(&a);
+    let (sent, received) = std::sync::mpsc::sync_channel(1);
+    let query = std::thread::spawn(move || {
+        sent.send(query_endpoint.connected_peers().is_ok())
+            .expect("query result receiver");
+    });
+    let query_completed = received.recv_timeout(Duration::from_secs(1));
+    gate.release();
+    query.join().expect("query worker");
+    assert!(query_completed.expect("query blocked behind listener callback"));
+
+    stop(&a);
+    stop(&b);
+    Ok(())
+}
+
+#[test]
+fn bounded_load_preserves_order_and_accounting() -> Result<(), FfiError> {
     const MESSAGE_COUNT: usize = 600;
 
+    let _serial = LOOPBACK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let a = endpoint(25);
     let b = endpoint(26);
     let a_log = Arc::new(EventLog::default());
@@ -298,22 +410,6 @@ fn bounded_load_preserves_accounting_and_query_handoff() -> Result<(), FfiError>
             .is_some()
     );
 
-    let query_endpoint = Arc::clone(&a);
-    let keep_querying = Arc::new(AtomicBool::new(true));
-    let query_running = Arc::clone(&keep_querying);
-    let queries = std::thread::spawn(move || {
-        let mut maximum = Duration::ZERO;
-        let mut count = 0_u64;
-        while query_running.load(Ordering::Acquire) {
-            let started = Instant::now();
-            let _ = query_endpoint.connected_peers();
-            maximum = maximum.max(started.elapsed());
-            count += 1;
-            std::thread::yield_now();
-        }
-        (count, maximum)
-    });
-
     for index in 0..MESSAGE_COUNT {
         let payload = (index as u32).to_be_bytes().to_vec();
         loop {
@@ -329,14 +425,6 @@ fn bounded_load_preserves_accounting_and_query_handoff() -> Result<(), FfiError>
         .map(|index| (index as u32).to_be_bytes().to_vec())
         .collect();
     assert_eq!(messages, expected);
-
-    keep_querying.store(false, Ordering::Release);
-    let (query_count, maximum_query) = queries.join().expect("query worker");
-    assert!(query_count > 0, "query worker did not run");
-    assert!(
-        maximum_query < Duration::from_millis(500),
-        "sync query starvation: max={maximum_query:?}"
-    );
 
     stop(&a);
     stop(&b);
