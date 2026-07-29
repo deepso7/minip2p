@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use minip2p::{
     BeaconConfig, Endpoint, FloodsubConfig, GossipsubConfig, MdnsConfig, Multiaddr, NatConfig,
-    PeerDiscoveryConfig, PeerId, PublishError, PubsubConfig, PubsubError, QuicWaitHandle, StreamId,
-    TopicError, TransportError,
+    PeerDiscoveryConfig, PeerId, PublishError, PubsubConfig, PubsubError, StreamId, TopicError,
+    TransportError, WaitHandle,
 };
 
 use crate::{
@@ -28,7 +28,7 @@ pub struct P2pEndpoint {
 pub(crate) struct Shared {
     state: Mutex<EndpointState>,
     pub(crate) stopped_cv: Condvar,
-    wait_handle: QuicWaitHandle,
+    wait_handle: WaitHandle,
     pub(crate) pending_commands: AtomicUsize,
     pub(crate) driver_running: AtomicBool,
 }
