@@ -117,6 +117,8 @@ impl BlockingTransport for MyTransport {
 
 The default implementation returns `WaitOutcome::Unsupported`, so `impl BlockingTransport for MyTransport {}` is enough to opt a transport into blocking drivers with a sleep fallback. A `no_std` host skips this entirely and idles however its platform allows, using `next_deadline()` to decide for how long.
 
+`BlockingTransport::wait_handle()` returns a cloneable, transport-neutral `WaitHandle` that interrupts a wait from another thread — a background task nudging a blocked drive loop after queueing work. Interrupting when no wait is active makes the *next* wait return immediately, so a handle cannot lose a wakeup to a race. `WaitHandle::combined` folds several into one for hosts driving more than one transport, and the default `WaitHandle::noop()` is inert for adapters with nothing to wake (that costs latency, never correctness).
+
 ## no_std
 
 Disable default features:

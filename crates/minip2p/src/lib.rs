@@ -52,14 +52,14 @@ pub use minip2p_pubsub::{
     MESHSUB_PROTOCOL_ID_V11, PublishError, PubsubConfig, PubsubConfigError, PubsubEvent,
     TopicError,
 };
+pub use minip2p_quic::QuicLimits;
 use minip2p_quic::{QuicEndpoint, QuicNodeConfig};
-pub use minip2p_quic::{QuicLimits, QuicWaitHandle};
 use minip2p_swarm::SwarmBuilder;
 pub use minip2p_swarm::{
     Deadline, DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, RUN_UNTIL_SKIP_LIMIT, Swarm,
     SwarmError, SwarmEvent as Event,
 };
-pub use minip2p_transport::{ConnectionId, StreamId, TransportError};
+pub use minip2p_transport::{ConnectionId, StreamId, TransportError, WaitHandle};
 #[cfg(feature = "pubsub")]
 pub use pubsub::PubsubError;
 
@@ -184,7 +184,7 @@ impl DriverPoll {
 impl Endpoint {
     /// Returns a cloneable handle that can interrupt a blocking endpoint wait
     /// from another thread.
-    pub fn wait_handle(&self) -> QuicWaitHandle {
+    pub fn wait_handle(&self) -> WaitHandle {
         self.quic().wait_handle()
     }
 

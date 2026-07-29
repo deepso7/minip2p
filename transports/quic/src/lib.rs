@@ -17,7 +17,8 @@ use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
 use minip2p_platform::{Deadline, Now};
 use minip2p_transport::{
     BlockingTransport, ConnectionEndpoint, ConnectionId, ConnectionIdAllocator,
-    ConnectionNamespace, StreamId, Transport, TransportError, TransportEvent, WaitOutcome,
+    ConnectionNamespace, StreamId, Transport, TransportError, TransportEvent, WaitHandle,
+    WaitOutcome,
 };
 use mio::{Events, Interest, Poll, Token, Waker};
 use quiche::ConnectionId as QuicConnectionId;
@@ -527,25 +528,19 @@ impl ReadinessWait {
     }
 }
 
-/// Cloneable handle that interrupts a QUIC endpoint's current readiness wait.
-#[derive(Clone)]
-pub struct QuicWaitHandle {
-    wakers: Vec<Arc<Waker>>,
-    interrupt_lock: Arc<Mutex<()>>,
-}
-
-impl QuicWaitHandle {
-    /// Interrupts any current wait. Calling this when no wait is active makes
-    /// the next wait return immediately.
-    pub fn interrupt(&self) {
-        let _guard = self
-            .interrupt_lock
+/// Builds a [`WaitHandle`] that wakes every mio waker behind one lock.
+///
+/// The lock keeps a dual-stack interrupt atomic with respect to the alternating
+/// per-family waits, so neither socket can miss the wakeup.
+fn quic_wait_handle(wakers: Vec<Arc<Waker>>, interrupt_lock: Arc<Mutex<()>>) -> WaitHandle {
+    WaitHandle::new(move || {
+        let _guard = interrupt_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for waker in &self.wakers {
+        for waker in &wakers {
             let _ = waker.wake();
         }
-    }
+    })
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -653,24 +648,8 @@ impl QuicEndpoint {
 
     /// Returns a cloneable handle that can interrupt this endpoint's current
     /// readiness wait from another thread.
-    pub fn wait_handle(&self) -> QuicWaitHandle {
-        let (wakers, interrupt_lock) = match self {
-            Self::Single(transport) => (
-                vec![Arc::clone(&transport.readiness.waker)],
-                Arc::new(Mutex::new(())),
-            ),
-            Self::Dual(transport) => (
-                vec![
-                    Arc::clone(&transport.ipv4.readiness.waker),
-                    Arc::clone(&transport.ipv6.readiness.waker),
-                ],
-                Arc::clone(&transport.interrupt_lock),
-            ),
-        };
-        QuicWaitHandle {
-            wakers,
-            interrupt_lock,
-        }
+    pub fn wait_handle(&self) -> WaitHandle {
+        BlockingTransport::wait_handle(self)
     }
 }
 
@@ -1547,6 +1526,13 @@ impl BlockingTransport for QuicTransport {
             self.readiness.wait(timeout)
         }
     }
+
+    fn wait_handle(&self) -> WaitHandle {
+        quic_wait_handle(
+            vec![Arc::clone(&self.readiness.waker)],
+            Arc::new(Mutex::new(())),
+        )
+    }
 }
 
 impl Transport for QuicEndpoint {
@@ -1648,6 +1634,13 @@ impl BlockingTransport for QuicEndpoint {
             Self::Dual(transport) => transport.wait_for_input(timeout),
         }
     }
+
+    fn wait_handle(&self) -> WaitHandle {
+        match self {
+            Self::Single(transport) => BlockingTransport::wait_handle(&**transport),
+            Self::Dual(transport) => BlockingTransport::wait_handle(&**transport),
+        }
+    }
 }
 
 impl Transport for DualQuicTransport {
@@ -1741,6 +1734,16 @@ impl Transport for DualQuicTransport {
 }
 
 impl BlockingTransport for DualQuicTransport {
+    fn wait_handle(&self) -> WaitHandle {
+        quic_wait_handle(
+            vec![
+                Arc::clone(&self.ipv4.readiness.waker),
+                Arc::clone(&self.ipv6.readiness.waker),
+            ],
+            Arc::clone(&self.interrupt_lock),
+        )
+    }
+
     fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
         // Two independent sockets and no shared readiness primitive, so
         // alternate short readiness waits on each family; a packet on either

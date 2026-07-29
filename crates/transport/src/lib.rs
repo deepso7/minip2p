@@ -26,4 +26,4 @@ pub use stream_id::StreamId;
 pub use transport::Transport;
 
 #[cfg(feature = "std")]
-pub use blocking::{BlockingTransport, WaitOutcome};
+pub use blocking::{BlockingTransport, WaitHandle, WaitOutcome};
