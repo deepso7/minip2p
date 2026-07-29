@@ -1,6 +1,6 @@
 //! Connection and protocol orchestration for minip2p.
 //!
-//! This crate provides two layers:
+//! This crate provides three layers:
 //!
 //! - [`SwarmCore`] -- pure Sans-I/O state machine. `no_std + alloc`
 //!   compatible. Callers feed it [`SwarmInput`] values through

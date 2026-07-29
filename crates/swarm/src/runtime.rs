@@ -509,12 +509,19 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     /// [`poll`](Self::poll). Hosts idle until this deadline rather than
     /// polling on a fixed cadence.
     pub fn next_deadline(&self, now: Now) -> Option<Deadline> {
-        let transport = self.transport.next_deadline();
-        let core = self
-            .core
-            .next_timeout(now.monotonic_ms)
-            .map(Deadline::from_millis);
-        Deadline::earliest_opt(transport, core)
+        // Work already queued needs another drive iteration whatever the
+        // timers say. `poll` defers actions ordered after an event until the
+        // application has seen that event, so a supersession's
+        // `CloseConnection` can be sitting here with no timer to wake it.
+        if !self.after_event_actions.is_empty() || !self.event_buffer.is_empty() {
+            return Some(Deadline::IMMEDIATE);
+        }
+
+        fold_deadlines(
+            now,
+            self.transport.next_deadline(),
+            self.core.next_timeout(now.monotonic_ms),
+        )
     }
 }
 
@@ -677,6 +684,25 @@ fn runtime_error(
     }
 }
 
+/// Folds a transport deadline together with the core's next protocol timer.
+///
+/// [`SwarmCore::next_timeout`] reports milliseconds *remaining*, while
+/// [`Deadline`] is an absolute point on the host's timeline, so the core's
+/// value has to be anchored to `now` rather than used directly. Getting that
+/// wrong makes timers read as long expired once uptime exceeds the timeout,
+/// which busy-spins a blocking driver and can hang a host that sleeps for
+/// `millis_until`.
+///
+/// Split out so the unit conversion is testable without arming a real timer.
+fn fold_deadlines(
+    now: Now,
+    transport: Option<Deadline>,
+    core_remaining_ms: Option<u64>,
+) -> Option<Deadline> {
+    let core = core_remaining_ms.map(|remaining| now.deadline_after(remaining));
+    Deadline::earliest_opt(transport, core)
+}
+
 /// Builds the ping payload from `fill`, mapping failure to
 /// [`DriverError::Entropy`]. Split out so tests can exercise the failure
 /// path without faking the OS RNG.
@@ -787,9 +813,9 @@ mod tests {
         )
     }
 
-    /// The whole point of the extraction: this drives a full connection
-    /// lifecycle with no clock, no OS entropy, and no `std` wrapper -- the
-    /// same path an embedded host takes.
+    /// The whole point of the extraction: this drives a connection open and
+    /// close with no clock, no OS entropy, and no `std` wrapper -- the same
+    /// path an embedded host takes.
     #[test]
     fn runtime_drives_without_a_clock_or_os_entropy() {
         let peer = Ed25519Keypair::generate().peer_id();
@@ -805,41 +831,108 @@ mod tests {
 
         let events = runtime.poll(Now::from_millis(5_000)).expect("poll");
         assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, SwarmEvent::ConnectionEstablished { .. })),
+            events.iter().any(|event| matches!(
+                event,
+                SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == peer
+            )),
             "expected the connection to surface: {events:?}"
         );
         // Identify started, so an action really was dispatched to the
         // transport during that poll.
         assert!(runtime.transport().opened > 0);
+        assert!(runtime.connected_peers().contains(&peer));
+        assert!(runtime.core().is_idle(), "core must settle after the open");
+
+        // ...and the close half of the lifecycle, on the same timeline.
+        runtime.transport_mut().initial = vec![TransportEvent::Closed {
+            id: ConnectionId::new(1),
+        }];
+        let events = runtime.poll(Now::from_millis(6_000)).expect("poll");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                SwarmEvent::ConnectionClosed { peer_id, .. } if *peer_id == peer
+            )),
+            "expected the close to surface: {events:?}"
+        );
+        assert!(runtime.connected_peers().is_empty());
+    }
+
+    #[test]
+    fn core_timers_are_anchored_to_now_not_used_as_absolute() {
+        // `SwarmCore::next_timeout` reports remaining milliseconds. Using it
+        // as an absolute deadline reads as long expired once uptime exceeds
+        // the timeout, so pin the conversion at a realistic uptime where the
+        // two interpretations differ wildly.
+        let now = Now::from_millis(3_600_000);
+
+        assert_eq!(
+            fold_deadlines(now, None, Some(500)),
+            Some(Deadline::from_millis(3_600_500)),
+            "core timers must be anchored to now"
+        );
+        assert_eq!(
+            fold_deadlines(now, None, Some(500))
+                .expect("armed")
+                .millis_until(now),
+            500,
+            "a timer 500ms out must not read as already due"
+        );
+
+        // A past-due core timer reports zero remaining, which really is due.
+        assert_eq!(fold_deadlines(now, None, Some(0)), Some(now.as_deadline()));
     }
 
     #[test]
     fn next_deadline_folds_transport_and_core_timers() {
         let now = Now::from_millis(1_000);
-        let mut runtime = runtime(Vec::new());
+        let transport = Deadline::from_millis(1_400);
 
-        // Idle: neither side has a timer armed.
+        // Whichever needs attention first wins.
+        assert_eq!(fold_deadlines(now, Some(transport), None), Some(transport));
+        assert_eq!(
+            fold_deadlines(now, Some(transport), Some(100)),
+            Some(Deadline::from_millis(1_100)),
+            "the nearer core timer must win"
+        );
+        assert_eq!(
+            fold_deadlines(now, Some(transport), Some(900)),
+            Some(transport),
+            "the nearer transport timer must win"
+        );
+        assert_eq!(fold_deadlines(now, None, None), None);
+
+        // And the runtime reports its transport's deadline through the fold.
+        let mut runtime = runtime(Vec::new());
+        runtime.poll(now).expect("poll");
+        assert_eq!(runtime.next_deadline(now), None);
+        runtime.transport_mut().deadline = Some(transport);
+        assert_eq!(runtime.next_deadline(now), Some(transport));
+    }
+
+    #[test]
+    fn queued_work_is_reported_as_immediately_due() {
+        let now = Now::from_millis(1_000);
+        let mut runtime = runtime(Vec::new());
         runtime.poll(now).expect("poll");
         assert_eq!(runtime.next_deadline(now), None);
 
-        // With only the transport armed, its deadline is reported verbatim.
-        runtime.transport_mut().deadline = Some(Deadline::from_millis(1_400));
-        assert_eq!(
-            runtime.next_deadline(now),
-            Some(Deadline::from_millis(1_400))
-        );
+        // A deferred action has no timer of its own; without this a host
+        // would idle until unrelated I/O happened to wake it.
+        runtime
+            .after_event_actions
+            .push_back(SwarmAction::CloseConnection {
+                conn_id: ConnectionId::new(1),
+            });
+        assert_eq!(runtime.next_deadline(now), Some(Deadline::IMMEDIATE));
 
-        // The core's timers are on the same timeline, so the fold is a plain
-        // minimum -- whichever needs attention first wins.
-        let core_deadline = runtime
-            .core()
-            .next_timeout(now.monotonic_ms)
-            .map(Deadline::from_millis);
-        assert_eq!(core_deadline, None, "no core timer armed in this fixture");
-
-        runtime.transport_mut().deadline = Some(Deadline::IMMEDIATE);
+        runtime.after_event_actions.clear();
+        runtime
+            .event_buffer
+            .push_back(SwarmEvent::ConnectionClosed {
+                peer_id: Ed25519Keypair::generate().peer_id(),
+                conn_id: ConnectionId::new(1),
+            });
         assert_eq!(runtime.next_deadline(now), Some(Deadline::IMMEDIATE));
     }
 
@@ -857,8 +950,17 @@ mod tests {
         }]);
         runtime.poll(Now::from_millis(0)).expect("poll");
 
+        let before = runtime.entropy.0;
         // Reaches the core rather than failing for want of an OS RNG.
         runtime.ping(&peer, 1_000).expect("ping queues");
+
+        // The nonce came from the injected source, not `getrandom`: the
+        // counter advanced by exactly one payload.
+        assert_eq!(
+            runtime.entropy.0,
+            before.wrapping_add(PING_PAYLOAD_LEN as u8),
+            "ping must consume PING_PAYLOAD_LEN bytes of injected entropy"
+        );
     }
 
     #[test]
