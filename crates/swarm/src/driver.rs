@@ -9,47 +9,13 @@ use std::time::{Duration, Instant};
 
 use minip2p_core::{Multiaddr, PeerAddr, PeerId};
 use minip2p_identify::{IdentifyConfig, IdentifyMessage};
-use minip2p_ping::{PING_PAYLOAD_LEN, PingConfig};
-use minip2p_platform::{Clock, Now, StdClock};
-use minip2p_transport::{
-    BlockingTransport, ConnectionId, StreamId, Transport, TransportError, WaitOutcome,
-};
+use minip2p_ping::PingConfig;
+use minip2p_platform::{Clock, Now, StdClock, StdEntropy};
+use minip2p_transport::{BlockingTransport, ConnectionId, StreamId, Transport, WaitOutcome};
 
 use crate::core::SwarmCore;
-use crate::events::{
-    SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput, SwarmRuntimeError,
-};
-
-/// Errors returned synchronously by the std swarm driver.
-///
-/// Protocol-state rejections remain distinguishable from transport failures;
-/// callers no longer need to recover their meaning from a flattened string.
-#[derive(Debug, thiserror::Error)]
-pub enum DriverError {
-    /// The underlying transport rejected the operation.
-    #[error(transparent)]
-    Transport(#[from] TransportError),
-    /// The Sans-I/O swarm core rejected the operation.
-    #[error(transparent)]
-    Swarm(#[from] SwarmError),
-    /// The driver and core violated their internal action contract.
-    #[error("swarm driver invariant violated: {reason}")]
-    Invariant { reason: &'static str },
-    /// [`Swarm::run_until`] set aside [`RUN_UNTIL_SKIP_LIMIT`] non-matching
-    /// events without finding a match.
-    ///
-    /// The skipped events were restored to the event buffer in their
-    /// original order; drain them with [`Swarm::poll_next`] before waiting
-    /// again, or use a predicate that matches (and thereby consumes) the
-    /// high-volume events.
-    #[error(
-        "run_until skipped {limit} events without a match; drain the event buffer with poll_next"
-    )]
-    EventBacklogExceeded { limit: usize },
-    /// The operating system's entropy source failed.
-    #[error("system entropy source failed")]
-    Entropy,
-}
+use crate::events::SwarmEvent;
+use crate::runtime::{DriverError, SwarmRuntime};
 
 /// Fallback sleep cadence when [`Swarm::poll_next`] idles over a transport
 /// that cannot wait for socket readiness ([`WaitOutcome::Unsupported`]).
@@ -146,43 +112,6 @@ impl From<Duration> for Deadline {
     }
 }
 
-/// Thin std driver wrapping [`SwarmCore`] and a concrete [`Transport`].
-///
-/// Preserves the one-call DX built on top of the core:
-/// - `dial(addr) -> ConnectionId` delegates connection-id allocation to the transport.
-/// - `poll()` reads the wall clock internally; callers need not thread
-///   `now_ms` through every call.
-/// - `ping(peer)` opens a ping stream if needed and fires the payload as
-///   soon as negotiation completes.
-pub struct Swarm<T: Transport> {
-    transport: T,
-    core: SwarmCore,
-
-    /// Our own `PeerId`. Cached from the [`crate::SwarmBuilder`]'s keypair
-    /// so applications don't have to drill into the transport to get it.
-    local_peer_id: PeerId,
-
-    /// Buffer of events yielded by [`Swarm::poll`] that haven't yet been
-    /// consumed by [`Swarm::poll_next`]. Each `poll()` returns a batch;
-    /// `poll_next` hands them out one at a time and calls `poll()` again
-    /// when the buffer drains.
-    event_buffer: VecDeque<SwarmEvent>,
-
-    /// Transport actions ordered after application events by the Sans-I/O
-    /// core. They are dispatched only after the buffered events have been
-    /// returned to the application. In particular, supersession must expose
-    /// `ConnectionClosed` before closing the old transport connection.
-    after_event_actions: VecDeque<SwarmAction>,
-
-    /// Externally validated addresses advertised through Identify in
-    /// addition to the transport's bound set. See
-    /// [`Swarm::set_external_addresses`].
-    external_addresses: Vec<Multiaddr>,
-
-    /// Logical clock used to drive Sans-I/O timers.
-    clock: Box<dyn Clock + Send + Sync>,
-}
-
 /// Result of an interruptible swarm wait.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)] // Preserve event ownership without a heap allocation.
@@ -195,12 +124,23 @@ pub enum PollNext {
     Interrupted,
 }
 
+/// Std driver: a [`SwarmRuntime`] plus a clock and blocking drive loops.
+///
+/// This is the DX-friendly entrypoint for applications. It samples the clock
+/// itself, so callers need not thread `now_ms` through every call, and it can
+/// idle the calling thread between polls.
+///
+/// Hosts without a thread to block -- embedded boards, single-threaded event
+/// loops -- should drive [`SwarmRuntime`] directly instead.
+pub struct Swarm<T: Transport> {
+    runtime: SwarmRuntime<T, StdEntropy>,
+    /// Logical clock used to drive Sans-I/O timers.
+    clock: Box<dyn Clock + Send + Sync>,
+}
+
 impl<T: Transport> Swarm<T> {
     /// Creates a swarm driver around the given transport, identify config,
     /// and ping config.
-    ///
-    /// Most callers should construct via `crate::SwarmBuilder` instead,
-    /// which derives `local_peer_id` from the keypair automatically.
     pub fn new(
         transport: T,
         identify_config: IdentifyConfig,
@@ -229,182 +169,133 @@ impl<T: Transport> Swarm<T> {
         clock: Box<dyn Clock + Send + Sync>,
     ) -> Self {
         Self {
-            transport,
-            core: SwarmCore::new(identify_config, ping_config),
-            local_peer_id,
-            event_buffer: VecDeque::new(),
-            after_event_actions: VecDeque::new(),
-            external_addresses: Vec::new(),
+            runtime: SwarmRuntime::new(
+                transport,
+                identify_config,
+                ping_config,
+                local_peer_id,
+                StdEntropy::new(),
+            ),
             clock,
         }
     }
 
-    /// Sets externally validated addresses (e.g. AutoNAT-confirmed public
-    /// addresses or relay circuit addresses) to advertise through Identify
-    /// alongside the transport's bound addresses.
-    ///
-    /// Replaces the previous external set; pass an empty vector to stop
-    /// advertising extras. Duplicates of transport-bound addresses are
-    /// dropped.
+    /// Returns the portable runtime this driver wraps.
+    pub fn runtime(&self) -> &SwarmRuntime<T, StdEntropy> {
+        &self.runtime
+    }
+
+    /// Returns the portable runtime this driver wraps.
+    pub fn runtime_mut(&mut self) -> &mut SwarmRuntime<T, StdEntropy> {
+        &mut self.runtime
+    }
+
+    fn sample_now(&mut self) -> Now {
+        self.clock.now()
+    }
+
+    fn now_ms(&mut self) -> u64 {
+        self.sample_now().monotonic_ms
+    }
+
+    // --- clock-free delegations ------------------------------------------
+
+    /// See [`SwarmRuntime::set_external_addresses`].
     pub fn set_external_addresses(&mut self, addrs: Vec<Multiaddr>) {
-        self.external_addresses = addrs;
+        self.runtime.set_external_addresses(addrs);
     }
 
-    /// Returns a reference to the underlying transport.
+    /// See [`SwarmRuntime::transport`].
     pub fn transport(&self) -> &T {
-        &self.transport
+        self.runtime.transport()
     }
 
-    /// Returns a mutable reference to the underlying transport.
+    /// See [`SwarmRuntime::transport_mut`].
     pub fn transport_mut(&mut self) -> &mut T {
-        &mut self.transport
+        self.runtime.transport_mut()
     }
 
-    /// Returns a reference to the Sans-I/O core (for advanced introspection).
+    /// See [`SwarmRuntime::core`].
     pub fn core(&self) -> &SwarmCore {
-        &self.core
+        self.runtime.core()
     }
 
-    /// Crate-internal mutable access to the Sans-I/O core.
-    ///
-    /// Used by [`crate::SwarmBuilder`] to register user protocols during
-    /// `build()`. Not public: mutating the core without flushing its
-    /// actions would desynchronize the driver.
     pub(crate) fn core_mut(&mut self) -> &mut SwarmCore {
-        &mut self.core
+        self.runtime.core_mut()
     }
 
-    /// Returns peers currently surfaced through `ConnectionEstablished` and not yet closed.
+    /// See [`SwarmRuntime::connected_peers`].
     pub fn connected_peers(&self) -> Vec<PeerId> {
-        self.core.connected_peers()
+        self.runtime.connected_peers()
     }
 
-    /// Returns the latest Identify information received for `peer_id`.
+    /// See [`SwarmRuntime::peer_info`].
     pub fn peer_info(&self, peer_id: &PeerId) -> Option<&IdentifyMessage> {
-        self.core.peer_info(peer_id)
+        self.runtime.peer_info(peer_id)
     }
 
-    /// Returns whether `peer_id` has emitted `PeerReady`.
+    /// See [`SwarmRuntime::is_peer_ready`].
     pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
-        self.core.is_peer_ready(peer_id)
+        self.runtime.is_peer_ready(peer_id)
     }
 
-    /// Returns this node's own `PeerId`.
-    ///
-    /// This accessor is infallible because the [`crate::SwarmBuilder`] requires
-    /// a keypair at construction time.
+    /// See [`SwarmRuntime::local_peer_id`].
     pub fn local_peer_id(&self) -> &PeerId {
-        &self.local_peer_id
+        self.runtime.local_peer_id()
     }
 
-    /// Registers an application protocol id for inbound acceptance and
-    /// outbound opens.
-    ///
-    /// Built-in ids ([`crate::RESERVED_PROTOCOL_IDS`]) are rejected with
-    /// [`SwarmError::ReservedProtocol`]; the swarm's own handlers already
-    /// own them.
+    /// See [`SwarmRuntime::add_protocol`].
     pub fn add_protocol(&mut self, protocol_id: impl Into<String>) -> Result<(), DriverError> {
-        self.core.add_protocol(protocol_id)?;
-        Ok(())
+        self.runtime.add_protocol(protocol_id)
     }
 
-    /// Start listening on the given multiaddr and return the resolved local address.
+    /// See [`SwarmRuntime::listen`].
     pub fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, DriverError> {
-        Ok(self.transport.listen(addr)?)
+        self.runtime.listen(addr)
     }
 
-    /// Start listening on the transport's already-bound local addresses.
-    ///
-    /// Transports that know their bound addresses expose them via
-    /// `Transport::local_addresses()`. Multi-socket transports such as a
-    /// dual-stack QUIC endpoint can therefore advertise every bound address
-    /// without forcing callers to pick one.
+    /// See [`SwarmRuntime::listen_on_bound_addrs`].
     pub fn listen_on_bound_addrs(&mut self) -> Result<Vec<PeerAddr>, DriverError> {
-        let addrs = self.transport.local_addresses();
-        if addrs.is_empty() {
-            return Err(TransportError::InvalidConfig {
-                reason: "transport does not expose a bound local address".into(),
-            }
-            .into());
-        }
-
-        let mut resolved = Vec::with_capacity(addrs.len());
-        for addr in addrs {
-            let addr = self.transport.listen(&addr)?;
-            let peer_addr = PeerAddr::new(addr, self.local_peer_id.clone()).map_err(|e| {
-                TransportError::InvalidConfig {
-                    reason: format!("failed to build local PeerAddr: {e}"),
-                }
-            })?;
-            resolved.push(peer_addr);
-        }
-        Ok(resolved)
+        self.runtime.listen_on_bound_addrs()
     }
 
-    /// Start listening on the transport's first already-bound local address.
-    ///
-    /// Prefer [`Swarm::listen_on_bound_addrs`] for transports that may bind
-    /// more than one socket.
+    /// See [`SwarmRuntime::listen_on_bound_addr`].
     pub fn listen_on_bound_addr(&mut self) -> Result<PeerAddr, DriverError> {
-        let addr = self
-            .transport
-            .local_addresses()
-            .into_iter()
-            .next()
-            .ok_or_else(|| TransportError::InvalidConfig {
-                reason: "transport does not expose a bound local address".into(),
-            })?;
-        let addr = self.transport.listen(&addr)?;
-        Ok(
-            PeerAddr::new(addr, self.local_peer_id.clone()).map_err(|e| {
-                TransportError::InvalidConfig {
-                    reason: format!("failed to build local PeerAddr: {e}"),
-                }
-            })?,
-        )
+        self.runtime.listen_on_bound_addr()
     }
 
-    /// Dial a remote peer. The transport allocates the connection id.
+    /// See [`SwarmRuntime::dial`].
     pub fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, DriverError> {
-        Ok(self.transport.dial(addr)?)
+        self.runtime.dial(addr)
     }
 
-    /// Pings a peer, sending a random 32-byte payload and measuring RTT.
-    ///
-    /// If a ping stream isn't yet negotiated the payload is queued and
-    /// fires when the stream becomes ready. The resulting RTT is delivered
-    /// via [`SwarmEvent::PingRttMeasured`] on the next `poll()`.
+    /// See [`SwarmRuntime::forget_stream`].
+    pub fn forget_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
+        self.runtime.forget_stream(conn_id, stream_id);
+    }
+
+    // --- delegations that supply the clock sample -------------------------
+
+    /// See [`SwarmRuntime::ping`].
     pub fn ping(&mut self, peer_id: &PeerId) -> Result<(), DriverError> {
-        let payload = rand_ping_payload()?;
         let now_ms = self.now_ms();
-        self.core.ping(peer_id, payload, now_ms)?;
-        self.flush_actions(now_ms);
-        Ok(())
+        self.runtime.ping(peer_id, now_ms)
     }
 
-    /// Close the connection to a peer.
+    /// See [`SwarmRuntime::disconnect`].
     pub fn disconnect(&mut self, peer_id: &PeerId) -> Result<(), DriverError> {
-        self.core.disconnect(peer_id)?;
         let now_ms = self.now_ms();
-        self.flush_actions(now_ms);
-        Ok(())
+        self.runtime.disconnect(peer_id, now_ms)
     }
 
-    /// Opens a new outbound stream and negotiates `protocol_id` via
-    /// multistream-select.
-    ///
-    /// The protocol must have been registered via
-    /// [`Swarm::add_protocol`] first. When negotiation completes the
-    /// [`SwarmEvent::StreamReady`] event fires with the allocated
-    /// stream id; subsequent stream data arrives as
-    /// [`SwarmEvent::StreamData`].
+    /// See [`SwarmRuntime::open_stream`].
     pub fn open_stream(
         &mut self,
         peer_id: &PeerId,
         protocol_id: &str,
     ) -> Result<StreamId, DriverError> {
-        self.open_stream_with_connection(peer_id, protocol_id)
-            .map(|(_, stream_id)| stream_id)
+        let now_ms = self.now_ms();
+        self.runtime.open_stream(peer_id, protocol_id, now_ms)
     }
 
     /// Opens an application stream and returns its full transport identity.
@@ -413,225 +304,61 @@ impl<T: Transport> Swarm<T> {
         peer_id: &PeerId,
         protocol_id: &str,
     ) -> Result<(ConnectionId, StreamId), DriverError> {
-        // Flush anything already queued first, so the capture window below
-        // contains only this call's own action cascade. A failure from an
-        // unrelated, previously queued open must surface asynchronously as
-        // SwarmEvent::Error -- not as this caller's synchronous error.
         let now_ms = self.now_ms();
-        self.flush_actions(now_ms);
-
-        // The core emits a Pending OpenStream action; we drain it now so
-        // the transport.open_stream call happens synchronously and we can
-        // return the allocated StreamId to the caller.
-        self.core.open_stream(peer_id, protocol_id)?;
-        let conn_id = self
-            .core
-            .connection_id(peer_id)
-            .ok_or_else(|| SwarmError::NotConnected {
-                peer_id: peer_id.clone(),
-            })?;
-
-        // Flush all actions, capturing the stream id allocated for this
-        // user-protocol open. We inspect actions as we execute them.
-        // `window_start` marks where this call's events begin in the buffer
-        // so a synchronously reported failure can suppress its duplicate
-        // buffered event below.
-        let window_start = self.event_buffer.len();
-        let mut allocated_stream: Option<StreamId> = None;
-        let mut open_error: Option<TransportError> = None;
-        while let Some(output) = self.core.poll_output() {
-            match output {
-                SwarmOutput::Action(action) => {
-                    self.dispatch_action(
-                        action,
-                        now_ms,
-                        &mut allocated_stream,
-                        &mut open_error,
-                        &mut None,
-                    );
-                }
-                SwarmOutput::Event(event) => self.event_buffer.push_back(event),
-            }
-        }
-
-        // Any cascade from dispatch_action (e.g. MSS header SendStream) is
-        // already in the core's action queue. Drain those too.
-        let now_ms = self.now_ms();
-        self.flush_actions(now_ms);
-
-        if let Some(error) = open_error {
-            // The failure is reported synchronously through Err, so drop the
-            // OpenStreamFailed event this call buffered -- applications must
-            // not observe the same failure twice. Failures outside a
-            // synchronous call keep flowing as SwarmEvent::Error.
-            if let Some(index) = (window_start..self.event_buffer.len()).find(|&i| {
-                matches!(
-                    &self.event_buffer[i],
-                    SwarmEvent::Error(e) if e.kind == SwarmErrorKind::OpenStreamFailed
-                )
-            }) {
-                self.event_buffer.remove(index);
-            }
-            return Err(DriverError::Transport(error));
-        }
-        allocated_stream
-            .map(|stream_id| (conn_id, stream_id))
-            .ok_or(DriverError::Invariant {
-                reason: "core did not allocate a stream id for open_stream",
-            })
+        self.runtime
+            .open_stream_with_connection(peer_id, protocol_id, now_ms)
     }
 
-    /// Sends raw bytes on a negotiated user stream.
+    /// See [`SwarmRuntime::send_stream`].
     pub fn send_stream(
         &mut self,
         peer_id: &PeerId,
         stream_id: StreamId,
         data: Vec<u8>,
     ) -> Result<(), DriverError> {
-        // Flush anything already queued first, so the capture window below
-        // contains only this call's own action cascade (same discipline as
-        // `Swarm::open_stream`).
         let now_ms = self.now_ms();
-        self.flush_actions(now_ms);
-
-        self.core.send_stream(peer_id, stream_id, data)?;
-
-        // Dispatch this call's own actions synchronously, capturing a
-        // transport rejection. Callers that commit state once a stream
-        // closes (e.g. the pubsub one-shot sender) must learn that the
-        // write was never accepted -- a buffered error event carries no
-        // stream correlation to recover that from.
-        let window_start = self.event_buffer.len();
-        let mut send_error: Option<TransportError> = None;
-        while let Some(output) = self.core.poll_output() {
-            match output {
-                SwarmOutput::Action(action) => {
-                    self.dispatch_action(action, now_ms, &mut None, &mut None, &mut send_error);
-                }
-                SwarmOutput::Event(event) => self.event_buffer.push_back(event),
-            }
-        }
-        let now_ms = self.now_ms();
-        self.flush_actions(now_ms);
-
-        if let Some(error) = send_error {
-            // Reported synchronously through Err: drop the duplicate
-            // buffered runtime-error event this call produced.
-            if let Some(index) = (window_start..self.event_buffer.len()).find(|&i| {
-                matches!(
-                    &self.event_buffer[i],
-                    SwarmEvent::Error(e) if e.kind == SwarmErrorKind::Transport
-                )
-            }) {
-                self.event_buffer.remove(index);
-            }
-            return Err(DriverError::Transport(error));
-        }
-        Ok(())
+        self.runtime.send_stream(peer_id, stream_id, data, now_ms)
     }
 
-    /// Half-closes the write side of a user stream.
+    /// See [`SwarmRuntime::close_stream_write`].
     pub fn close_stream_write(
         &mut self,
         peer_id: &PeerId,
         stream_id: StreamId,
     ) -> Result<(), DriverError> {
-        self.core.close_stream_write(peer_id, stream_id)?;
         let now_ms = self.now_ms();
-        self.flush_actions(now_ms);
-        Ok(())
+        self.runtime.close_stream_write(peer_id, stream_id, now_ms)
     }
 
-    /// Resets (abruptly closes) a user stream.
+    /// See [`SwarmRuntime::reset_stream`].
     pub fn reset_stream(
         &mut self,
         peer_id: &PeerId,
         stream_id: StreamId,
     ) -> Result<(), DriverError> {
-        self.core.reset_stream(peer_id, stream_id)?;
         let now_ms = self.now_ms();
-        self.flush_actions(now_ms);
-        Ok(())
+        self.runtime.reset_stream(peer_id, stream_id, now_ms)
     }
 
-    /// Forgets swarm bookkeeping for a stream without touching the transport.
-    ///
-    /// This is used when ownership of a negotiated stream moves to another
-    /// protocol layer. Already-buffered events are intentionally preserved.
-    pub fn forget_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
-        self.core.forget_stream(conn_id, stream_id);
-    }
-
-    /// Resets and forgets a stream whose consumer will never read it again.
-    ///
-    /// This is idempotent with a previously queued reset and removes matching
-    /// events already buffered by both the Sans-I/O core and this driver.
+    /// See [`SwarmRuntime::abandon_stream`].
     pub fn abandon_stream(
         &mut self,
         peer_id: &PeerId,
         stream_id: StreamId,
     ) -> Result<(), DriverError> {
-        let result = self.core.abandon_stream(peer_id, stream_id);
-        self.event_buffer
-            .retain(|event| !event.matches_stream(peer_id, stream_id));
-        result?;
         let now_ms = self.now_ms();
-        self.flush_actions(now_ms);
-        Ok(())
+        self.runtime.abandon_stream(peer_id, stream_id, now_ms)
     }
 
-    /// Drive the swarm: poll transport, feed events to core, dispatch
-    /// actions, return application-visible events. Must be called repeatedly.
+    /// Drives the swarm one iteration, sampling the clock for the caller.
     ///
-    /// Most event-loop code can be simpler to write against
-    /// [`Swarm::poll_next`] or [`Swarm::run_until`], which internally
-    /// call this in a sleep/poll loop and return one event at a time.
+    /// See [`SwarmRuntime::poll`].
     pub fn poll(&mut self) -> Result<Vec<SwarmEvent>, DriverError> {
         let now = self.sample_now();
-        let now_ms = now.monotonic_ms;
-
-        // Actions deferred by the previous poll are now safe to dispatch if
-        // every event that preceded them has been returned to the caller.
-        // Do this before reading more transport input so superseded
-        // connections cannot produce another batch ahead of their close.
-        self.flush_actions(now_ms);
-
-        // 0. Refresh the core's snapshot of our listening addresses so
-        //    Identify advertises the current bound set plus any validated
-        //    external addresses. Cheap -- a handful of multiaddrs at most.
-        let mut local_addresses = self.transport.local_addresses();
-        for addr in &self.external_addresses {
-            if !local_addresses.contains(addr) {
-                local_addresses.push(addr.clone());
-            }
-        }
-        self.core.set_local_addresses(local_addresses);
-
-        // 1. Feed transport events to the core.
-        let events = self.transport.poll(now)?;
-        for event in events {
-            self.core
-                .handle_input(SwarmInput::Transport { event, now_ms });
-        }
-
-        // 2. Advance timers.
-        self.core.handle_input(SwarmInput::Tick { now_ms });
-
-        // 3. Execute all queued actions (may cascade -- see flush_actions).
-        self.flush_actions(now_ms);
-
-        // 4. Return the application's events. `flush_actions` fully drained
-        //    the core; any action ordered after these events is held in the
-        //    driver's `after_event_actions` queue until a later call.
-        Ok(self.event_buffer.drain(..).collect())
+        self.runtime.poll(now)
     }
 }
 
-/// Blocking drive loops.
-///
-/// These idle the calling thread between polls, so they need a transport that
-/// can wait on readiness. `poll` and the intent methods above stay available
-/// to any [`Transport`], including on hosts with no thread to block.
 impl<T: BlockingTransport> Swarm<T> {
     /// Returns the next swarm event, sleeping internally until one arrives
     /// or `deadline` is reached.
@@ -664,15 +391,15 @@ impl<T: BlockingTransport> Swarm<T> {
     ) -> Result<PollNext, DriverError> {
         let deadline = deadline.into();
         loop {
-            if let Some(ev) = self.event_buffer.pop_front() {
+            if let Some(ev) = self.runtime.event_buffer.pop_front() {
                 return Ok(PollNext::Event(ev));
             }
             // Always poll at least once -- even if we're already past the
             // deadline -- so a caller using a short or elapsed deadline
             // still sees any events the transport has already produced.
             let events = self.poll()?;
-            self.event_buffer.extend(events);
-            if let Some(ev) = self.event_buffer.pop_front() {
+            self.runtime.event_buffer.extend(events);
+            if let Some(ev) = self.runtime.event_buffer.pop_front() {
                 return Ok(PollNext::Event(ev));
             }
             let now = Instant::now();
@@ -684,12 +411,11 @@ impl<T: BlockingTransport> Swarm<T> {
             // timer (e.g. a ping timeout, which only fires when a Tick is
             // fed into the core by `poll()`).
             let mut budget = deadline.remaining_at(now).unwrap_or(MAX_IDLE_WAIT);
+            // The runtime folds the transport's timer together with the
+            // core's protocol timers onto one timeline.
             let now = self.sample_now();
-            if let Some(deadline) = self.transport.next_deadline() {
-                budget = budget.min(Duration::from_millis(deadline.millis_until(now)));
-            }
-            if let Some(timeout_ms) = self.core.next_timeout(now.monotonic_ms) {
-                budget = budget.min(Duration::from_millis(timeout_ms));
+            if let Some(next) = self.runtime.next_deadline(now) {
+                budget = budget.min(Duration::from_millis(next.millis_until(now)));
             }
             if budget.is_zero() {
                 continue;
@@ -697,7 +423,7 @@ impl<T: BlockingTransport> Swarm<T> {
             // Prefer a real readiness wait so idle loops don't burn CPU on a
             // fixed cadence; fall back to a short sleep for transports that
             // can't wait.
-            match self.transport.wait_for_input(budget) {
+            match self.runtime.transport_mut().wait_for_input(budget) {
                 WaitOutcome::Interrupted => return Ok(PollNext::Interrupted),
                 WaitOutcome::Unsupported => std::thread::sleep(budget.min(POLL_IDLE_SLEEP)),
                 WaitOutcome::Ready | WaitOutcome::TimedOut => {}
@@ -777,7 +503,7 @@ impl<T: BlockingTransport> Swarm<T> {
         // transport poll.
         if matches!(result, Ok(None)) {
             loop {
-                let Some(ev) = self.event_buffer.pop_front() else {
+                let Some(ev) = self.runtime.event_buffer.pop_front() else {
                     if polled_past_deadline {
                         break;
                     }
@@ -788,7 +514,7 @@ impl<T: BlockingTransport> Swarm<T> {
                             break;
                         }
                         Ok(events) => {
-                            self.event_buffer.extend(events);
+                            self.runtime.event_buffer.extend(events);
                             continue;
                         }
                     }
@@ -810,200 +536,10 @@ impl<T: BlockingTransport> Swarm<T> {
         // Restore skipped events in their original order -- on a match, on
         // deadline expiry, and on error alike.
         for event in skipped.into_iter().rev() {
-            self.event_buffer.push_front(event);
+            self.runtime.event_buffer.push_front(event);
         }
         result
     }
-}
-
-impl<T: Transport> Swarm<T> {
-    // -----------------------------------------------------------------------
-    // Internals
-    // -----------------------------------------------------------------------
-
-    /// Samples the injected clock.
-    ///
-    /// Callers that drive several subsystems in one iteration should sample
-    /// once and pass the result down, so they all observe the same instant.
-    fn sample_now(&mut self) -> Now {
-        self.clock.now()
-    }
-
-    fn now_ms(&mut self) -> u64 {
-        self.sample_now().monotonic_ms
-    }
-
-    /// Drains all actions from the core and dispatches each to the
-    /// transport, repeating until the core has nothing left. This handles
-    /// cascades where executing an action causes the core to emit more
-    /// (e.g. `OpenStream` leading to `SendStream` once the stream id is
-    /// reported back).
-    ///
-    /// `now_ms` is the caller's time sample, threaded through so a single
-    /// drive iteration reports one instant to the core no matter how many
-    /// actions cascade.
-    fn flush_actions(&mut self, now_ms: u64) {
-        let mut allocated: Option<StreamId> = None;
-
-        // A buffered event has not yet been delivered by `poll_next`, so its
-        // dependent actions must remain deferred. `poll()` drains this buffer
-        // into its return value; the next driver call may then dispatch them.
-        if self.event_buffer.is_empty() {
-            while let Some(action) = self.after_event_actions.pop_front() {
-                self.dispatch_action(action, now_ms, &mut allocated, &mut None, &mut None);
-            }
-        }
-
-        // Only events drained in this pass gate the actions that follow them.
-        // Pre-existing buffered events may be unrelated (for example, a
-        // failed reset's error before a synchronous retry), so they must not
-        // defer new caller-initiated work.
-        let mut saw_event = false;
-        while let Some(output) = self.core.poll_output() {
-            match output {
-                SwarmOutput::Action(action) if saw_event => {
-                    self.after_event_actions.push_back(action);
-                }
-                SwarmOutput::Action(action) => {
-                    self.dispatch_action(action, now_ms, &mut allocated, &mut None, &mut None)
-                }
-                SwarmOutput::Event(event) => {
-                    saw_event = true;
-                    self.event_buffer.push_back(event);
-                }
-            }
-        }
-    }
-
-    /// Executes a single action against the transport and feeds any result
-    /// back into the core.
-    ///
-    /// `captured_stream_id` is used by [`Swarm::open_stream`] to
-    /// synchronously recover the stream id for the caller. The driver
-    /// remembers the **last** stream id allocated during the flush, which
-    /// is accurate because `open_stream` triggers exactly one
-    /// `OpenStream` action per call.
-    fn dispatch_action(
-        &mut self,
-        action: SwarmAction,
-        now_ms: u64,
-        captured_stream_id: &mut Option<StreamId>,
-        captured_open_error: &mut Option<TransportError>,
-        captured_send_error: &mut Option<TransportError>,
-    ) {
-        match action {
-            SwarmAction::OpenStream { conn_id, token } => match self.transport.open_stream(conn_id)
-            {
-                Ok(stream_id) => {
-                    *captured_stream_id = Some(stream_id);
-                    self.core.handle_input(SwarmInput::StreamOpened {
-                        conn_id,
-                        stream_id,
-                        token,
-                        now_ms,
-                    });
-                }
-                Err(e) => {
-                    let reason = format!("{e}");
-                    *captured_open_error = Some(e);
-                    self.core.handle_input(SwarmInput::OpenStreamFailed {
-                        token,
-                        reason,
-                        now_ms,
-                    });
-                }
-            },
-            SwarmAction::SendStream {
-                conn_id,
-                stream_id,
-                data,
-            } => {
-                if let Err(e) = self.transport.send_stream(conn_id, stream_id, data) {
-                    let reason = format!(
-                        "send_stream to connection {conn_id} stream {stream_id} failed: {e}"
-                    );
-                    *captured_send_error = Some(e);
-                    self.core
-                        .handle_input(SwarmInput::RuntimeError(runtime_error(
-                            SwarmErrorKind::Transport,
-                            Some(conn_id),
-                            Some(stream_id),
-                            reason,
-                        )));
-                }
-            }
-            SwarmAction::CloseStreamWrite { conn_id, stream_id } => {
-                if let Err(e) = self.transport.close_stream_write(conn_id, stream_id) {
-                    self.core.handle_input(SwarmInput::RuntimeError(runtime_error(
-                        SwarmErrorKind::Transport,
-                        Some(conn_id),
-                        Some(stream_id),
-                        format!(
-                            "close_stream_write on connection {conn_id} stream {stream_id} failed: {e}"
-                        ),
-                    )));
-                }
-            }
-            SwarmAction::ResetStream { conn_id, stream_id } => {
-                if let Err(e) = self.transport.reset_stream(conn_id, stream_id) {
-                    self.core.reset_stream_failed(conn_id, stream_id);
-                    self.core.handle_input(SwarmInput::RuntimeError(runtime_error(
-                        SwarmErrorKind::Transport,
-                        Some(conn_id),
-                        Some(stream_id),
-                        format!(
-                            "reset_stream on connection {conn_id} stream {stream_id} failed: {e}"
-                        ),
-                    )));
-                }
-            }
-            SwarmAction::CloseConnection { conn_id } => {
-                if let Err(e) = self.transport.close(conn_id) {
-                    self.core
-                        .handle_input(SwarmInput::RuntimeError(runtime_error(
-                            SwarmErrorKind::Transport,
-                            Some(conn_id),
-                            None,
-                            format!("close on connection {conn_id} failed: {e}"),
-                        )));
-                }
-            }
-        }
-    }
-}
-
-fn runtime_error(
-    kind: SwarmErrorKind,
-    conn_id: Option<ConnectionId>,
-    stream_id: Option<StreamId>,
-    detail: String,
-) -> SwarmRuntimeError {
-    SwarmRuntimeError {
-        kind,
-        peer_id: None,
-        conn_id,
-        stream_id,
-        detail,
-    }
-}
-
-/// Generates a random 32-byte ping payload using OS randomness.
-///
-/// Fails with [`DriverError::Entropy`] if the CSPRNG is unavailable; a
-/// predictable fallback payload would silently weaken the ping nonce.
-fn rand_ping_payload() -> Result<[u8; PING_PAYLOAD_LEN], DriverError> {
-    ping_payload_from(|buf| getrandom::fill(buf).map_err(|_| ()))
-}
-
-/// Builds the ping payload from `fill`, mapping failure to
-/// [`DriverError::Entropy`]. Split out so tests can exercise the failure
-/// path without faking the OS RNG.
-fn ping_payload_from(
-    fill: impl FnOnce(&mut [u8]) -> Result<(), ()>,
-) -> Result<[u8; PING_PAYLOAD_LEN], DriverError> {
-    let mut payload = [0u8; PING_PAYLOAD_LEN];
-    fill(&mut payload).map_err(|_| DriverError::Entropy)?;
-    Ok(payload)
 }
 
 #[cfg(test)]
@@ -1012,31 +548,14 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+    use crate::events::SwarmErrorKind;
     use minip2p_core::SansIoProtocol;
     use minip2p_identify::IDENTIFY_PROTOCOL_ID;
     use minip2p_identity::Ed25519Keypair;
     use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, MultistreamSelect};
     use minip2p_ping::PING_PROTOCOL_ID;
-    use minip2p_transport::{ConnectionEndpoint, TransportEvent};
+    use minip2p_transport::{ConnectionEndpoint, TransportError, TransportEvent};
     use std::sync::Arc;
-
-    #[test]
-    fn ping_payload_entropy_failure_is_an_error() {
-        assert!(matches!(
-            ping_payload_from(|_| Err(())),
-            Err(DriverError::Entropy)
-        ));
-    }
-
-    #[test]
-    fn ping_payload_returns_filled_bytes() {
-        let payload = ping_payload_from(|buf| {
-            buf.fill(0xAB);
-            Ok(())
-        })
-        .expect("fill succeeds");
-        assert_eq!(payload, [0xAB; PING_PAYLOAD_LEN]);
-    }
 
     /// Transport that never produces events; counts `poll()` calls so tests
     /// can assert how often an expired wait touches the transport.
@@ -1537,6 +1056,7 @@ mod tests {
         let peer_id = Ed25519Keypair::generate().peer_id();
         let mut swarm = idle_swarm();
         swarm
+            .runtime
             .event_buffer
             .push_back(SwarmEvent::ConnectionEstablished {
                 peer_id: peer_id.clone(),
@@ -1558,12 +1078,13 @@ mod tests {
         let target_peer_id = Ed25519Keypair::generate().peer_id();
         let mut swarm = idle_swarm();
         swarm
+            .runtime
             .event_buffer
             .push_back(SwarmEvent::ConnectionEstablished {
                 peer_id: target_peer_id.clone(),
                 conn_id: ConnectionId::new(1),
             });
-        swarm.event_buffer.push_back(SwarmEvent::PeerReady {
+        swarm.runtime.event_buffer.push_back(SwarmEvent::PeerReady {
             peer_id: target_peer_id.clone(),
             protocols: Vec::new(),
         });
@@ -1610,12 +1131,13 @@ mod tests {
         let peer_id = Ed25519Keypair::generate().peer_id();
         let mut swarm = idle_swarm();
         swarm
+            .runtime
             .event_buffer
             .push_back(SwarmEvent::ConnectionEstablished {
                 peer_id: peer_id.clone(),
                 conn_id: ConnectionId::new(1),
             });
-        swarm.event_buffer.push_back(SwarmEvent::PeerReady {
+        swarm.runtime.event_buffer.push_back(SwarmEvent::PeerReady {
             peer_id,
             protocols: Vec::new(),
         });
@@ -1631,13 +1153,17 @@ mod tests {
             1,
             "an expired wait must poll the transport at most once"
         );
-        assert_eq!(swarm.event_buffer.len(), 2, "events must be preserved");
+        assert_eq!(
+            swarm.runtime.event_buffer.len(),
+            2,
+            "events must be preserved"
+        );
         assert!(matches!(
-            swarm.event_buffer.front(),
+            swarm.runtime.event_buffer.front(),
             Some(SwarmEvent::ConnectionEstablished { .. })
         ));
         assert!(matches!(
-            swarm.event_buffer.back(),
+            swarm.runtime.event_buffer.back(),
             Some(SwarmEvent::PeerReady { .. })
         ));
     }
@@ -1647,12 +1173,13 @@ mod tests {
         let peer_id = Ed25519Keypair::generate().peer_id();
         let mut swarm = idle_swarm();
         swarm
+            .runtime
             .event_buffer
             .push_back(SwarmEvent::ConnectionEstablished {
                 peer_id: peer_id.clone(),
                 conn_id: ConnectionId::new(1),
             });
-        swarm.event_buffer.push_back(SwarmEvent::PeerReady {
+        swarm.runtime.event_buffer.push_back(SwarmEvent::PeerReady {
             peer_id: peer_id.clone(),
             protocols: Vec::new(),
         });
@@ -1669,9 +1196,9 @@ mod tests {
         assert!(matches!(found, SwarmEvent::PeerReady { .. }));
 
         // The skipped event is restored in order and no extra events appear.
-        assert_eq!(swarm.event_buffer.len(), 1);
+        assert_eq!(swarm.runtime.event_buffer.len(), 1);
         assert!(matches!(
-            swarm.event_buffer.front(),
+            swarm.runtime.event_buffer.front(),
             Some(SwarmEvent::ConnectionEstablished { peer_id: restored, .. }) if *restored == peer_id
         ));
     }
@@ -1707,6 +1234,7 @@ mod tests {
 
     fn buffered_open_failures(swarm: &Swarm<FailingUserOpenTransport>) -> usize {
         swarm
+            .runtime
             .event_buffer
             .iter()
             .filter(|event| {
@@ -1734,7 +1262,7 @@ mod tests {
                 resource: "test stream capacity"
             })
         ));
-        assert!(swarm.core.is_idle(), "failed open must clear core state");
+        assert!(swarm.core().is_idle(), "failed open must clear core state");
         // The failure is reported synchronously via Err; it must not be
         // double-reported through a buffered SwarmEvent::Error.
         assert_eq!(
@@ -1756,6 +1284,7 @@ mod tests {
         // driver's flush, so it is still pending when the application call
         // arrives.
         swarm
+            .runtime
             .core
             .open_stream(&remote_peer, PROTOCOL)
             .expect("queue stale open");
@@ -1963,7 +1492,7 @@ mod tests {
         // Reported through Err; it must not also surface as a buffered
         // runtime-error event.
         assert!(
-            !swarm.event_buffer.iter().any(|event| matches!(
+            !swarm.runtime.event_buffer.iter().any(|event| matches!(
                 event,
                 SwarmEvent::Error(e) if e.kind == SwarmErrorKind::Transport
             )),
@@ -1999,11 +1528,11 @@ mod tests {
 
     fn assert_indexed_order(swarm: &Swarm<IdleTransport>, expected_len: usize) {
         assert_eq!(
-            swarm.event_buffer.len(),
+            swarm.runtime.event_buffer.len(),
             expected_len,
             "every skipped event must be restored"
         );
-        for (i, event) in swarm.event_buffer.iter().enumerate() {
+        for (i, event) in swarm.runtime.event_buffer.iter().enumerate() {
             assert!(
                 matches!(
                     event,
@@ -2021,6 +1550,7 @@ mod tests {
         let total = RUN_UNTIL_SKIP_LIMIT + 5;
         for i in 0..total {
             swarm
+                .runtime
                 .event_buffer
                 .push_back(indexed_stream_data(&peer_id, i as u64));
         }
@@ -2047,6 +1577,7 @@ mod tests {
         let total = RUN_UNTIL_SKIP_LIMIT + 3;
         for i in 0..total {
             swarm
+                .runtime
                 .event_buffer
                 .push_back(indexed_stream_data(&peer_id, i as u64));
         }
@@ -2072,10 +1603,11 @@ mod tests {
         let mut swarm = idle_swarm();
         for i in 0..RUN_UNTIL_SKIP_LIMIT - 1 {
             swarm
+                .runtime
                 .event_buffer
                 .push_back(indexed_stream_data(&peer_id, i as u64));
         }
-        swarm.event_buffer.push_back(SwarmEvent::PeerReady {
+        swarm.runtime.event_buffer.push_back(SwarmEvent::PeerReady {
             peer_id: peer_id.clone(),
             protocols: Vec::new(),
         });
@@ -2302,7 +1834,7 @@ mod tests {
         );
 
         // Drop setup events (ConnectionEstablished, ...) so poll_next blocks.
-        swarm.event_buffer.clear();
+        swarm.runtime.event_buffer.clear();
         let event = swarm
             .poll_next(Deadline::NEVER)
             .expect("poll")

@@ -10,15 +10,22 @@
 //!   for the application to observe. No sockets, no async runtime, no clock
 //!   reads.
 //!
-//! - [`Swarm`] -- std driver that owns a concrete
-//!   [`Transport`](minip2p_transport::Transport) and a
-//!   monotonic clock ([`std::time::Instant`]), and preserves the one-call
-//!   DX (`swarm.dial(addr)`, `swarm.ping(peer)`, `swarm.open_stream`)
-//!   by shuttling events and actions between the transport and the core.
+//! - [`SwarmRuntime`] -- `no_std + alloc` action pump. It owns a concrete
+//!   [`Transport`](minip2p_transport::Transport) and shuttles events and
+//!   actions between it and the core, but reads no clock and draws no
+//!   randomness: the caller passes a [`Now`] sample into
+//!   [`SwarmRuntime::poll`] and injects an
+//!   [`EntropySource`]. It reports its next timer through
+//!   [`SwarmRuntime::next_deadline`] so a host can idle instead of spinning.
+//!
+//! - [`Swarm`] -- `std` wrapper adding a monotonic clock and blocking drive
+//!   loops (`poll_next`, `run_until`) on top of the runtime, preserving the
+//!   one-call DX (`swarm.dial(addr)`, `swarm.ping(peer)`,
+//!   `swarm.open_stream`) without threading `now_ms` through every call.
 //!
 //! Most applications want [`Swarm`] and the [`SwarmBuilder`] convenience
-//! constructor. Embedded or exotic runtimes that cannot depend on `std`
-//! can use [`SwarmCore`] directly.
+//! constructor. Hosts with no thread to block -- embedded boards,
+//! single-threaded event loops -- drive [`SwarmRuntime`] directly.
 //!
 //! Protocols baked into the core:
 //! - `/ipfs/ping/1.0.0` (ping RTT measurement)
@@ -31,6 +38,7 @@ extern crate alloc;
 
 mod core;
 mod events;
+mod runtime;
 
 #[cfg(feature = "std")]
 mod builder;
@@ -42,6 +50,7 @@ pub use crate::events::{
     OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput,
     SwarmRuntimeError,
 };
+pub use crate::runtime::{DriverError, SwarmRuntime};
 // Part of `SwarmEvent::IdentifyReceived`'s public shape; re-exported so
 // consumers can name the type without depending on `minip2p-identify`.
 pub use minip2p_identify::IdentifyMessage;
@@ -49,8 +58,8 @@ pub use minip2p_identify::IdentifyMessage;
 #[cfg(feature = "std")]
 pub use crate::builder::SwarmBuilder;
 #[cfg(feature = "std")]
-pub use crate::driver::{Deadline, DriverError, PollNext, RUN_UNTIL_SKIP_LIMIT, Swarm};
-// Re-exported so callers of `Swarm::with_clock` need not depend on the
-// platform crate directly.
+pub use crate::driver::{Deadline, PollNext, RUN_UNTIL_SKIP_LIMIT, Swarm};
+// Re-exported so callers need not depend on the platform crate directly.
 #[cfg(feature = "std")]
-pub use minip2p_platform::{Clock, Now, StdClock};
+pub use minip2p_platform::{Clock, StdClock};
+pub use minip2p_platform::{Deadline as PollDeadline, EntropySource, Now};
