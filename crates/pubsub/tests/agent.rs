@@ -779,6 +779,45 @@ fn unsigned_messages_require_the_allow_unsigned_config() {
 }
 
 #[test]
+fn unsigned_message_cannot_suppress_later_signed_message_with_same_id() {
+    let mut agent = agent_with(FloodsubConfig {
+        allow_unsigned: true,
+        ..FloodsubConfig::default()
+    });
+    agent.subscribe("t", 0).unwrap();
+    let arrival = peer(2);
+    connect(&mut agent, &arrival, 0);
+    assert!(inbound_open(&mut agent, &arrival, StreamId::new(3), 1));
+
+    let signer = keypair(9);
+    let signed = RawMessage::build_signed(&signer, "t", b"authentic".to_vec(), 5);
+    let mut unsigned = signed.clone();
+    unsigned.data = Some(b"forged".to_vec());
+    unsigned.signature = None;
+    unsigned.key = None;
+    unsigned.raw = Vec::new();
+    let frame = |message| {
+        encode_frame(
+            &Rpc {
+                publish: vec![message],
+                ..Rpc::default()
+            }
+            .encode(),
+        )
+    };
+
+    inbound_data(&mut agent, &arrival, StreamId::new(3), &frame(unsigned), 2);
+    assert!(drain_events(&mut agent).iter().any(
+        |event| matches!(event, PubsubEvent::Message { signed: false, data, .. } if data == b"forged")
+    ));
+
+    inbound_data(&mut agent, &arrival, StreamId::new(3), &frame(signed), 3);
+    assert!(drain_events(&mut agent).iter().any(
+        |event| matches!(event, PubsubEvent::Message { signed: true, data, .. } if data == b"authentic")
+    ));
+}
+
+#[test]
 fn subscription_overflow_is_transactional() {
     let mut a = agent_with(FloodsubConfig {
         max_topics_per_peer: 2,

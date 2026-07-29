@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use minip2p::{EndpointWake, Error, NatEvent};
 
-use crate::endpoint::{EndpointState, Lifecycle, Shared};
+use crate::endpoint::{Lifecycle, Shared};
 use crate::events::{convert_discovery, convert_nat, convert_pubsub, convert_swarm};
 use crate::{DriverFailureKind, P2pEvent, P2pEventListener};
 
@@ -169,12 +169,12 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
     let mut overflow = OverflowDiagnostic::default();
     let mut next_keepalive_at = Instant::now() + KEEPALIVE_INTERVAL;
     loop {
+        service_keepalive(&guard.shared, &mut next_keepalive_at);
         let mut state = guard.shared.lock_state();
         if state.lifecycle != Lifecycle::Running {
             state.stats.dropped = state.stats.dropped.saturating_add(carry.len() as u64);
             return Ok(());
         }
-        service_keepalive(&mut state, &mut next_keepalive_at);
         if !carry.is_empty() || overflow.pending != 0 {
             let cancelled = carry.suppress_cancelled(&state.cancelled_connect_ids);
             state.stats.dropped = state.stats.dropped.saturating_add(cancelled as u64);
@@ -186,9 +186,9 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
                 dispatch(listener, event);
             }
             for event in delivery.batch {
+                service_keepalive(&guard.shared, &mut next_keepalive_at);
                 let should_dispatch = {
                     let mut state = guard.shared.lock_state();
-                    service_keepalive(&mut state, &mut next_keepalive_at);
                     let cancelled = p2p_connect_id(&event)
                         .is_some_and(|id| state.cancelled_connect_ids.contains(&id));
                     record_source_dispatch(cancelled, &mut state.stats)
@@ -264,17 +264,30 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
     }
 }
 
-fn service_keepalive(state: &mut EndpointState, next_at: &mut Instant) {
+fn service_keepalive(shared: &Shared, next_at: &mut Instant) {
     let now = Instant::now();
     if now < *next_at {
         return;
     }
     advance_keepalive_deadline(next_at, now);
-    let Some(endpoint) = state.endpoint.as_mut() else {
-        return;
+    let peers = {
+        let state = shared.lock_state();
+        if state.lifecycle != Lifecycle::Running {
+            return;
+        }
+        let Some(endpoint) = state.endpoint.as_ref() else {
+            return;
+        };
+        endpoint.connected_peers()
     };
-    let peers = endpoint.connected_peers();
     for peer in keepalive_targets(&peers) {
+        let mut state = shared.lock_state();
+        if state.lifecycle != Lifecycle::Running {
+            return;
+        }
+        let Some(endpoint) = state.endpoint.as_mut() else {
+            return;
+        };
         // A peer may disconnect between the snapshot and ping. Its
         // close/timeout event is the authoritative signal.
         let _ = endpoint.ping(peer);

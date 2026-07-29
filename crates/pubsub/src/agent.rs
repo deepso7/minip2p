@@ -23,7 +23,7 @@ use crate::message::{
     FLOODSUB_PROTOCOL_ID, FrameDecode, MAX_RPC_SIZE, MAX_TOPIC_LEN, RawMessage, Rpc, SubOpts,
     decode_frame, encode_frame,
 };
-use crate::seen::{SeenCache, message_id};
+use crate::seen::{SeenCache, seen_message_id};
 
 /// Longest possible frame prefix; bounds the inbound reassembly buffers.
 const MAX_PREFIX_LEN: usize = 10;
@@ -268,7 +268,7 @@ impl FloodsubAgent {
         }
         self.next_seqno = self.next_seqno.wrapping_add(1);
 
-        let id = message_id(&self.local_peer_id.to_bytes(), &seqno.to_be_bytes());
+        let id = seen_message_id(&self.local_peer_id.to_bytes(), &seqno.to_be_bytes(), true);
         self.seen.insert(
             id,
             now_ms,
@@ -893,7 +893,7 @@ impl FloodsubAgent {
             }
         };
 
-        let id = message_id(&from.to_bytes(), &seqno);
+        let id = seen_message_id(&from.to_bytes(), &seqno, signed);
         if self.seen.contains(&id) {
             return; // duplicate: silent
         }

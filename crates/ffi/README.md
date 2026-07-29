@@ -47,17 +47,21 @@ callbacks run on the native driver thread and must not block waiting for that
 same driver to stop; `wait_stopped` called from a listener returns `false`
 immediately.
 
-Connection-attempt IDs are retained in an endpoint-lifetime map so cancellation
-remains valid after an initial path event. This assumes chat-scale connection
-volume; a long-lived service issuing unbounded attempts should periodically
-recreate its endpoint until a bounded retirement policy is added. Cancellation
-suppresses queued connection-attempt events on a best-effort basis; an event
-whose callback already won the dispatch race may still be observed after
-`cancel_connect` returns.
+Connection-attempt IDs are retained in an endpoint-lifetime map. This assumes
+chat-scale connection volume; a long-lived service issuing unbounded attempts
+should periodically recreate its endpoint until a bounded retirement policy is
+added. Cancellation suppresses queued connection-attempt events on a
+best-effort basis; an event whose callback already won the dispatch race may
+still be observed after `cancel_connect` returns. Cancellation cannot retract a
+transport connection that completed concurrently. A host that wants cancel to
+also mean "close any resulting session" must call `disconnect` for the target
+peer.
 
 The native driver owns connection keepalive. Every 10 seconds it pings every
 currently connected peer, keeping quiet connections inside QUIC's default
-30-second idle timeout. Successful replies and timeouts surface normally as
+30-second idle timeout. The driver releases its shared endpoint mutex between
+peer pings so commands can interleave with a large keepalive pass. Successful
+replies and timeouts surface normally as
 `PingRttMeasured` and `PingTimeout` events; hosts should not run a second
 keepalive loop. Keepalive is serviced between callback deliveries while
 draining a backlog. One listener callback that blocks for roughly the entire

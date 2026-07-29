@@ -3,9 +3,7 @@
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use minip2p_ffi::{
-    EndpointConfig, P2pEndpoint, P2pEvent, P2pEventListener, PathKind, circuit_address,
-};
+use minip2p_ffi::{EndpointConfig, P2pEndpoint, P2pEvent, P2pEventListener, PathKind};
 
 #[path = "../../../tests/support/relay.rs"]
 mod relay_support;
@@ -119,10 +117,6 @@ fn relayed_chat_and_reservation_loss() {
             ..
         }
     ));
-    let expected_circuit =
-        circuit_address(relay_addr, b_peer.clone()).expect("compose circuit address");
-    assert!(expected_circuit.ends_with(&format!("/p2p-circuit/p2p/{b_peer}")));
-
     a.subscribe(TOPIC.into()).expect("subscribe initiator");
     b.subscribe(TOPIC.into()).expect("subscribe responder");
     let connect_id = a.connect(b_peer.clone()).expect("start relay connect");

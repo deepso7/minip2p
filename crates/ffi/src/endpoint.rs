@@ -342,6 +342,19 @@ impl P2pEndpoint {
         Ok(())
     }
 
+    /// Closes the active connection to `peer_id`.
+    ///
+    /// Cancelling a connection attempt suppresses that attempt's progress
+    /// events, but cannot retract a transport connection that has already
+    /// completed. Call this method when cancellation must also close an
+    /// established connection.
+    pub fn disconnect(&self, peer_id: String) -> Result<(), FfiError> {
+        let peer = PeerId::from_str(&peer_id).map_err(|error| FfiError::InvalidPeerId {
+            detail: error.to_string(),
+        })?;
+        self.with_endpoint_mut(|endpoint| endpoint.disconnect(&peer).map_err(map_driver_error))
+    }
+
     /// Returns the shared discovery address-book snapshot.
     pub fn known_peers(&self) -> Result<Vec<KnownPeerInfo>, FfiError> {
         self.with_endpoint(|endpoint| {
@@ -1074,6 +1087,16 @@ mod tests {
                 .contains(&connect_id)
         );
         endpoint.cancel_connect(u64::MAX).expect("unknown cancel");
+    }
+
+    #[test]
+    fn disconnect_validates_the_peer_id() {
+        let endpoint = endpoint(config()).expect("endpoint");
+
+        assert!(matches!(
+            endpoint.disconnect("not-a-peer-id".into()),
+            Err(FfiError::InvalidPeerId { .. })
+        ));
     }
 
     #[test]
