@@ -1,0 +1,28 @@
+diff --git a/crates/ubrn_cli/templates/jsi/android/CMakeLists.txt b/crates/ubrn_cli/templates/jsi/android/CMakeLists.txt
+index c40f2cf1a40a851cdd374fe02f9bb519e4a128fa..dde0c65124d38df8b05a1ed484e9456477f52cfb 100644
+--- a/crates/ubrn_cli/templates/jsi/android/CMakeLists.txt
++++ b/crates/ubrn_cli/templates/jsi/android/CMakeLists.txt
+@@ -15,13 +15,10 @@ set (CMAKE_CXX_STANDARD 17)
+ 
+ # Resolve the path to the uniffi-bindgen-react-native package
+ execute_process(
+-    COMMAND node -p "require.resolve('uniffi-bindgen-react-native/package.json')"
++    COMMAND node -p "require('path').resolve(require.resolve('uniffi-bindgen-react-native'), '../../../..')"
+     OUTPUT_VARIABLE UNIFFI_BINDGEN_PATH
+     OUTPUT_STRIP_TRAILING_WHITESPACE
+ )
+-# Get the directory; get_filename_component and cmake_path will normalize
+-# paths with Windows path separators.
+-get_filename_component(UNIFFI_BINDGEN_PATH "${UNIFFI_BINDGEN_PATH}" DIRECTORY)
+ 
+ # Specifies a path to native header files.
+ include_directories(
+@@ -55,7 +52,7 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size
+ 
+ cmake_path(
+   SET MY_RUST_LIB
+-  ${CMAKE_SOURCE_DIR}/{{ jni_libs_dir }}/${ANDROID_ABI}/{{ self.config.rust_crate.library_file(Some("android"), Some(*self.config.project.android.use_shared_library)) }}
++  ${CMAKE_CURRENT_LIST_DIR}/{{ jni_libs_dir }}/${ANDROID_ABI}/{{ self.config.rust_crate.library_file(Some("android"), Some(*self.config.project.android.use_shared_library)) }}
+   NORMALIZE
+ )
+ 

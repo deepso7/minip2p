@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["fuzz"]
+exclude = ["fuzz", "bindings"]
 members = [
     "crates/autonat",
     "crates/circuit",

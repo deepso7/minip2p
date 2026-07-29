@@ -1,0 +1,62 @@
+react-native-minip2p third-party notices
+=========================================
+
+This package statically links or generates bindings from the components below.
+The versions are the versions resolved by Cargo.lock and pnpm-lock.yaml.
+
+quiche 0.29.2
+-------------
+
+Copyright (C) 2018-2019, Cloudflare, Inc.
+All rights reserved.
+
+Licensed under the BSD 2-Clause License:
+https://github.com/cloudflare/quiche/blob/0.29.2/COPYING
+
+boring 4.22.0 and boring-sys 4.22.0
+-----------------------------------
+
+Copyright 2011-2017 Google Inc.
+          2013 Jack Lloyd
+          2013-2014 Steven Fackler
+          2020 Ivan Nikulin
+
+Licensed under the Apache License, Version 2.0:
+https://www.apache.org/licenses/LICENSE-2.0
+
+The crates are temporarily patched to
+https://github.com/deepso7/boring/commit/de6ec29406df54911ea50dec47f40d6b6e4d6ef7
+while https://github.com/cloudflare/boring/pull/518 is under review.
+
+BoringSSL
+---------
+
+BoringSSL is a fork of OpenSSL. Its compiled libraries contain code under the
+OpenSSL License, the original SSLeay License, the ISC License, and the MIT
+License used by fiat-crypto. The authoritative license text distributed with
+the pinned source is:
+https://github.com/google/boringssl/blob/44b3df6f03d85c901767250329c571db405122d5/LICENSE
+
+Required acknowledgements:
+
+This product includes software developed by the OpenSSL Project for use in the
+OpenSSL Toolkit (http://www.openssl.org/).
+
+This product includes cryptographic software written by Eric Young
+(eay@cryptsoft.com).
+
+UniFFI 0.31.0
+-------------
+
+Copyright Mozilla and UniFFI contributors.
+
+Licensed under the Mozilla Public License, Version 2.0:
+https://github.com/mozilla/uniffi-rs/blob/v0.31.0/LICENSE
+
+uniffi-bindgen-react-native 0.31.0-3 and @ubjs/core 0.31.0-3
+----------------------------------------------------------------
+
+Copyright James Hugman and contributors.
+
+Licensed under the Mozilla Public License, Version 2.0:
+https://github.com/jhugman/uniffi-bindgen-react-native/blob/v0.31.0-3/LICENSE

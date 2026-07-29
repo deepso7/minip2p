@@ -1,0 +1,43 @@
+name: React Native bindings
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "bindings/**"
+      - "crates/ffi/**"
+      - ".github/workflows/bindings.yml"
+      - ".github/workflows/bindings-native.yml"
+  pull_request:
+    paths:
+      - "bindings/**"
+      - "crates/ffi/**"
+      - ".github/workflows/bindings.yml"
+      - ".github/workflows/bindings-native.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  generated-and-typescript:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bindings/react-native
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.12.0"
+      - uses: pnpm/action-setup@v6
+        with:
+          version: "11.18.0"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm prepare
+      - run: pnpm ubrn:generate
+      - name: Generated files are current
+        run: test -z "$(git status --porcelain)"

@@ -1,0 +1,30 @@
+---
+rust:
+  directory: ../..
+  manifestPath: crates/ffi/Cargo.toml
+
+bindings:
+  cpp: cpp/generated
+  ts: src/generated
+
+android:
+  directory: android
+  targets:
+    - arm64-v8a
+    - x86_64
+  apiLevel: 24
+  jniLibs: src/main/jniLibs
+  useSharedLibrary: true
+
+ios:
+  directory: ios
+  targets:
+    - aarch64-apple-ios
+    - aarch64-apple-ios-sim
+  frameworkName: build/Minip2pFfi
+
+turboModule:
+  cpp: cpp
+  ts: src
+  spec: NativeMinip2p
+  entrypoint: src/native.tsx

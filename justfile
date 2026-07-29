@@ -47,6 +47,20 @@ docs-site:
     cargo check --manifest-path docs/snippets/quickstart/Cargo.toml
     cargo check --manifest-path docs/snippets/custom-stream/Cargo.toml
 
+bindings-check:
+    cd bindings/react-native && pnpm typecheck
+    cd bindings/react-native && pnpm lint
+    cd bindings/react-native && pnpm prepare
+
+bindings-generate:
+    cd bindings/react-native && pnpm ubrn:generate
+
+bindings-ios:
+    cd bindings/react-native && pnpm ubrn:ios
+
+bindings-android:
+    cd bindings/react-native && pnpm ubrn:android
+
 bench:
     cargo bench -p minip2p-core --bench multiaddr
 
