@@ -1230,6 +1230,15 @@ impl<T: minip2p_transport::BlockingTransport, E: EntropySource> minip2p_transpor
             minip2p_transport::WaitOutcome::Ready
         }
     }
+
+    /// Forwards to the wrapped transport, which owns the socket that
+    /// `wait_for_input` actually blocks on.
+    ///
+    /// Inheriting the inert default would hand callers a handle that silently
+    /// does nothing while the wait still blocks inside the inner transport.
+    fn wait_handle(&self) -> minip2p_transport::WaitHandle {
+        self.inner.wait_handle()
+    }
 }
 
 #[cfg(feature = "std")]
@@ -1269,6 +1278,103 @@ mod tests {
         fail_close_write: bool,
         close_write_calls: usize,
         reset_calls: usize,
+    }
+
+    /// Leaf transport whose wait handle records interrupts, so a test can
+    /// prove one reached the bottom of a decorator stack.
+    struct WakeableTransport {
+        inner: InMemoryTransport,
+        interrupts: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
+    }
+
+    impl Transport for WakeableTransport {
+        fn dial(&mut self, addr: &minip2p_core::PeerAddr) -> Result<ConnectionId, TransportError> {
+            self.inner.dial(addr)
+        }
+
+        fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
+            self.inner.listen(addr)
+        }
+
+        fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
+            self.inner.open_stream(id)
+        }
+
+        fn send_stream(
+            &mut self,
+            id: ConnectionId,
+            stream_id: StreamId,
+            data: Vec<u8>,
+        ) -> Result<(), TransportError> {
+            self.inner.send_stream(id, stream_id, data)
+        }
+
+        fn close_stream_write(
+            &mut self,
+            id: ConnectionId,
+            stream_id: StreamId,
+        ) -> Result<(), TransportError> {
+            self.inner.close_stream_write(id, stream_id)
+        }
+
+        fn reset_stream(
+            &mut self,
+            id: ConnectionId,
+            stream_id: StreamId,
+        ) -> Result<(), TransportError> {
+            self.inner.reset_stream(id, stream_id)
+        }
+
+        fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
+            self.inner.close(id)
+        }
+
+        fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
+            self.inner.poll(now)
+        }
+    }
+
+    impl minip2p_transport::BlockingTransport for WakeableTransport {
+        fn wait_handle(&self) -> minip2p_transport::WaitHandle {
+            let interrupts = alloc::sync::Arc::clone(&self.interrupts);
+            minip2p_transport::WaitHandle::new(move || {
+                interrupts.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            })
+        }
+    }
+
+    /// A decorator that forwards `wait_for_input` but inherits the inert
+    /// default `wait_handle` hands callers a handle that does nothing while
+    /// the wait still blocks in the transport underneath.
+    #[test]
+    fn wait_handle_reaches_through_the_circuit_wrapper() {
+        use minip2p_transport::BlockingTransport;
+
+        let local = identity(1);
+        let relay = identity(9).peer_id();
+        let (inner, _) = InMemoryTransport::pair(local.peer_id(), relay);
+        let interrupts = alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let transport = CircuitTransport::new(
+            WakeableTransport {
+                inner,
+                interrupts: alloc::sync::Arc::clone(&interrupts),
+            },
+            local,
+            CounterEntropy(1),
+        );
+
+        let handle = BlockingTransport::wait_handle(&transport);
+        assert!(
+            !handle.is_noop(),
+            "the wrapper must not report an inert handle over a wakeable transport"
+        );
+
+        handle.interrupt();
+        assert_eq!(
+            interrupts.load(core::sync::atomic::Ordering::SeqCst),
+            1,
+            "interrupt must reach the transport that owns the wait"
+        );
     }
 
     impl<T> CloseObservingTransport<T> {

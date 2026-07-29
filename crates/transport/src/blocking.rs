@@ -99,6 +99,15 @@ pub enum WaitOutcome {
 /// fixed cadence. The default implementation reports
 /// [`WaitOutcome::Unsupported`], so `impl BlockingTransport for MyTransport {}`
 /// is enough to opt a transport into blocking drivers with a sleep fallback.
+///
+/// # Decorators must forward both methods
+///
+/// The defaults are only correct together, for a leaf transport with nothing
+/// to wake. A transport that wraps another and forwards
+/// [`wait_for_input`](Self::wait_for_input) must also forward
+/// [`wait_handle`](Self::wait_handle): otherwise callers get an inert handle
+/// while the wait still blocks inside the inner transport, and interrupting
+/// silently does nothing.
 pub trait BlockingTransport: Transport {
     /// Blocks until new transport input may be available or `timeout` elapses,
     /// whichever comes first.
@@ -114,6 +123,9 @@ pub trait BlockingTransport: Transport {
     ///
     /// The default cannot interrupt anything; adapters that own a wakeable
     /// primitive should override it so hosts can nudge a blocked drive loop.
+    /// A transport wrapping another must forward this whenever it forwards
+    /// [`wait_for_input`](Self::wait_for_input) -- the handle has to reach
+    /// whichever transport actually blocks.
     fn wait_handle(&self) -> WaitHandle {
         WaitHandle::noop()
     }

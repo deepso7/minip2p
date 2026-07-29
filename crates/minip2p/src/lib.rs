@@ -184,8 +184,12 @@ impl DriverPoll {
 impl Endpoint {
     /// Returns a cloneable handle that can interrupt a blocking endpoint wait
     /// from another thread.
+    ///
+    /// Taken through the transport trait rather than the concrete QUIC
+    /// endpoint, so it stays correct once the endpoint drives more than one
+    /// transport.
     pub fn wait_handle(&self) -> WaitHandle {
-        self.quic().wait_handle()
+        minip2p_transport::BlockingTransport::wait_handle(self.swarm.transport())
     }
 
     /// Starts building an endpoint.
@@ -1085,16 +1089,6 @@ impl Endpoint {
             discovery.shutdown(nat, &mut self.swarm);
         }
         result
-    }
-
-    #[cfg(feature = "nat")]
-    fn quic(&self) -> &QuicEndpoint {
-        self.swarm.transport().inner()
-    }
-
-    #[cfg(not(feature = "nat"))]
-    fn quic(&self) -> &QuicEndpoint {
-        self.swarm.transport()
     }
 
     #[cfg(feature = "nat")]
