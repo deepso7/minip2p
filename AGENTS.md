@@ -37,7 +37,7 @@ Three layers, strictly separated:
 
 1. **Sans-I/O protocol crates** (`no_std + alloc`), one per protocol: `multistream-select`, `ping`, `identify`, `relay`, `autonat`, `dcutr`, `pubsub`, `mdns`; plus `identity`, `core`, `tls`, and `transport` (trait contract only).
 2. **Sans-I/O orchestrators**: `crates/swarm` (`SwarmCore`; also a `std`-gated `Swarm<T>` driver), `crates/nat` (`NatAgent`: direct-dial vs. relay race + DCUtR hole punching), and `crates/discovery` (`BeaconAgent` + `PeerDiscoveryAgent`: signed beacons and the shared multi-source book/dial policy).
-3. **`std` adapters**: `transports/quic` (quiche-based, owns UDP/DNS, exposes deadlines), the `std`-gated mDNS socket driver, and `crates/minip2p` — the `Endpoint` facade; features layer on without changing the base API.
+3. **`std` adapters**: `transports/quic` (quiche-based, owns UDP/DNS, exposes deadlines), the `std`-gated mDNS socket driver, `crates/minip2p` — the `Endpoint` facade whose features layer on without changing the base API — and `crates/ffi`, the UniFFI endpoint/driver adapter for foreign runtimes.
 
 The default swarm composes only identify + ping + protocols registered via `SwarmBuilder::protocol`/`EndpointBuilder::protocol`; relay/AutoNAT/DCUtR policy belongs to the host. `code-ref/` is read-only reference checkouts, not part of the build.
 

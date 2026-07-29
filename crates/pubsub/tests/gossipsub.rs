@@ -1190,6 +1190,62 @@ fn valid_message_delivers_once_and_invalid_signature_never_delivers() {
 }
 
 #[test]
+fn unsigned_message_cannot_suppress_later_signed_message_with_same_id() {
+    let mut agent = agent_with(GossipsubConfig {
+        allow_unsigned: true,
+        ..GossipsubConfig::default()
+    });
+    agent.subscribe("room", 0).unwrap();
+    let remote = peer(2);
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+    let subscription = make_ready(
+        &mut agent,
+        &remote,
+        StreamId::new(4),
+        MESHSUB_PROTOCOL_ID_V11,
+        0,
+    );
+    ack(&mut agent, &remote, &subscription, 0);
+    drain_actions(&mut agent);
+    inbound_open(&mut agent, &remote, StreamId::new(5), 0);
+
+    let signer = keypair(9);
+    let signed = RawMessage::build_signed(&signer, "room", b"authentic".to_vec(), 1);
+    let mut unsigned = signed.clone();
+    unsigned.data = Some(b"forged".to_vec());
+    unsigned.signature = None;
+    unsigned.key = None;
+    unsigned.raw = Vec::new();
+    inbound_rpc(
+        &mut agent,
+        &remote,
+        StreamId::new(5),
+        Rpc {
+            publish: vec![unsigned],
+            ..Rpc::default()
+        },
+        1,
+    );
+    assert!(drain_events(&mut agent).iter().any(
+        |event| matches!(event, PubsubEvent::Message { signed: false, data, .. } if data == b"forged")
+    ));
+
+    inbound_rpc(
+        &mut agent,
+        &remote,
+        StreamId::new(5),
+        Rpc {
+            publish: vec![signed],
+            ..Rpc::default()
+        },
+        2,
+    );
+    assert!(drain_events(&mut agent).iter().any(
+        |event| matches!(event, PubsubEvent::Message { signed: true, data, .. } if data == b"authentic")
+    ));
+}
+
+#[test]
 fn off_topic_message_is_not_cached_as_seen() {
     let mut agent = agent();
     let remote = peer(2);

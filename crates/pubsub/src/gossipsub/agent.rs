@@ -18,7 +18,7 @@ use crate::message::{
     MAX_RPC_SIZE, MAX_TOPIC_LEN, MESHSUB_PROTOCOL_ID_V10, MESHSUB_PROTOCOL_ID_V11, RawMessage, Rpc,
     SubOpts, decode_frame, encode_frame,
 };
-use crate::seen::{MessageId, SeenCache, message_id};
+use crate::seen::{MessageId, SeenCache, message_id, seen_message_id, seen_message_id_from_wire};
 
 const MAX_PREFIX_LEN: usize = 10;
 
@@ -587,7 +587,7 @@ impl GossipsubAgent {
         self.next_seqno = self.next_seqno.wrapping_add(1);
         let id = message_id(&self.local_peer_id.to_bytes(), &seqno.to_be_bytes());
         self.seen.insert(
-            id.clone(),
+            seen_message_id(&self.local_peer_id.to_bytes(), &seqno.to_be_bytes(), true),
             now_ms,
             self.config.seen_ttl_ms,
             self.config.max_seen_messages,
@@ -1268,7 +1268,9 @@ impl GossipsubAgent {
                 if self.iwant_requested.len() >= self.config.max_iwant_ids_per_heartbeat {
                     break;
                 }
-                if self.seen.contains(&id) || self.iwant_requested.contains(&id) {
+                if self.seen.contains(&seen_message_id_from_wire(&id, true))
+                    || self.iwant_requested.contains(&id)
+                {
                     continue;
                 }
                 if !control_item_fits(&ControlItem::IWant(id.clone())) {
@@ -1314,8 +1316,9 @@ impl GossipsubAgent {
                 return;
             }
         };
-        let id = message_id(&dedup_from.to_bytes(), &dedup_seqno);
-        if self.seen.contains(&id) {
+        let signed_claim = message.signature.is_some();
+        let seen_id = seen_message_id(&dedup_from.to_bytes(), &dedup_seqno, signed_claim);
+        if self.seen.contains(&seen_id) {
             return;
         }
         let (from, seqno, signed) = match message.verify(self.config.allow_unsigned) {
@@ -1330,6 +1333,8 @@ impl GossipsubAgent {
         };
         debug_assert_eq!(from, dedup_from);
         debug_assert_eq!(seqno, dedup_seqno);
+        debug_assert_eq!(signed, signed_claim);
+        let id = message_id(&dedup_from.to_bytes(), &dedup_seqno);
         let interested_topics: Vec<String> = message
             .topic_ids
             .iter()
@@ -1340,7 +1345,7 @@ impl GossipsubAgent {
             return;
         }
         self.seen.insert(
-            id.clone(),
+            seen_id,
             now_ms,
             self.config.seen_ttl_ms,
             self.config.max_seen_messages,

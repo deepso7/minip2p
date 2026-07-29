@@ -14,6 +14,24 @@ pub(crate) fn message_id(from: &[u8], seqno: &[u8]) -> MessageId {
     id
 }
 
+/// A cache-local message id that keeps authenticated and unauthenticated
+/// claims in separate namespaces.
+///
+/// The wire-visible gossipsub id remains [`message_id`]. This variant is only
+/// used by the seen cache so an unsigned message cannot reserve a signed
+/// publisher's `(from, seqno)` pair before the authentic publish arrives.
+pub(crate) fn seen_message_id(from: &[u8], seqno: &[u8], signed: bool) -> MessageId {
+    let id = message_id(from, seqno);
+    seen_message_id_from_wire(&id, signed)
+}
+
+pub(crate) fn seen_message_id_from_wire(id: &[u8], signed: bool) -> MessageId {
+    let mut namespaced = Vec::with_capacity(1 + id.len());
+    namespaced.push(u8::from(signed));
+    namespaced.extend_from_slice(id);
+    namespaced
+}
+
 /// Dedup cache for message ids.
 ///
 /// `order` is append-ordered by expiry because `now_ms` is monotonic, so
