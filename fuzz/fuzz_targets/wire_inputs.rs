@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 use minip2p_autonat::{AutoNatClient, AutoNatClientInput, AutoNatServer, AutoNatServerInput};
 use minip2p_circuit::{BridgeAdoption, CircuitRole, CircuitTransport, EntropyError, EntropySource};
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol, SansIoProtocol, TransportKind};
 use minip2p_dcutr::{FrameDecode as DcutrFrame, HolePunch};
 use minip2p_discovery::{
     Beacon, BeaconAgent, BeaconConfig, BeaconEvent, DiscoverySource, Observation,
@@ -205,6 +205,18 @@ impl Transport for FuzzTransport {
     }
 }
 
+/// Independent oracle for [`Multiaddr::transport_kind`].
+///
+/// Reads the protocol slice directly, so a divergence between the documented
+/// address shapes and the classification helpers shows up as a mismatch.
+fn expected_transport_kind(addr: &Multiaddr) -> Option<TransportKind> {
+    match addr.protocols() {
+        [host, Protocol::Tcp(_)] if host.is_host() => Some(TransportKind::Tcp),
+        [host, Protocol::Udp(_), Protocol::QuicV1] if host.is_host() => Some(TransportKind::Quic),
+        _ => None,
+    }
+}
+
 /// Drives attacker-controlled bytes through both multiaddr codecs.
 fn fuzz_multiaddr(data: &[u8]) {
     if let Ok(addr) = Multiaddr::from_bytes(data) {
@@ -226,12 +238,11 @@ fn fuzz_multiaddr(data: &[u8]) {
             assert_eq!(parsed, addr);
         }
 
-        // Classification must agree with itself whichever way it is asked.
-        match addr.transport_kind() {
-            Some(minip2p_core::TransportKind::Tcp) => assert!(addr.is_tcp_transport()),
-            Some(minip2p_core::TransportKind::Quic) => assert!(addr.is_quic_transport()),
-            None => assert!(!addr.is_tcp_transport() && !addr.is_quic_transport()),
-        }
+        // Classification must match the shape rules, checked here against the
+        // protocol slice directly rather than through the same helpers
+        // `transport_kind` is built from -- otherwise the assertion is
+        // entailed by the implementation and cannot fail.
+        assert_eq!(addr.transport_kind(), expected_transport_kind(&addr));
     }
 
     if let Ok(addr) = core::str::from_utf8(data)

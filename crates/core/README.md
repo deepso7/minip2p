@@ -66,9 +66,10 @@ assert_eq!(decoded, addr);
 ```
 
 Wire layout: each component is `<varint(multicodec)><value>`. Value
-shape depends on the protocol: fixed-size bytes for ip4/ip6/udp,
+shape depends on the protocol: fixed-size bytes for ip4/ip6 and for the
+tcp/udp ports (both two bytes, big-endian),
 varint-length-prefixed UTF-8 for dns*, varint-length-prefixed
-multihash for p2p, absent for quic-v1. See
+multihash for p2p, absent for quic-v1 and p2p-circuit. See
 <https://github.com/multiformats/multiaddr> for the full spec.
 
 Work with peer-qualified addresses:

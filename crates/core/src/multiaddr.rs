@@ -447,6 +447,11 @@ mod tests {
             format!("/ip4/203.0.113.7/udp/4001/quic-v1/p2p-circuit/p2p/{PEER_ID}"),
             // Destination peer appended after the circuit marker (six components).
             format!("/ip4/203.0.113.7/udp/4001/quic-v1/p2p/{PEER_ID}/p2p-circuit/p2p/{PEER_ID}"),
+            // A TCP circuit has the right five-component *arity* but a TCP
+            // base. Circuits stay QUIC-only until relay is generalized, so
+            // widening this predicate ahead of that must fail here.
+            format!("/ip4/203.0.113.7/tcp/4001/p2p/{PEER_ID}/p2p-circuit"),
+            format!("/dns4/relay.example.com/tcp/4001/p2p/{PEER_ID}/p2p-circuit"),
         ];
         for input in near_misses {
             let parsed = Multiaddr::from_str(&input).expect("must parse");
@@ -603,15 +608,34 @@ mod tests {
     }
 
     #[test]
-    fn binary_and_text_decoders_accept_the_same_dns_names() {
-        // Whatever one codec accepts, the other must too, and the value must
-        // survive a round trip through both.
+    fn binary_and_text_decoders_agree_on_dns_names() {
+        // Parity in both directions: the codecs must accept the same names and
+        // reject the same names, or a name means one thing on the wire and
+        // another in text.
         for name in ["example.test", "a.b.c.d", "xn--bcher-kva.example", "host-1"] {
             let text = alloc::format!("/dns4/{name}/tcp/4001");
             let parsed = Multiaddr::from_str(&text).expect("text must parse");
             let decoded = Multiaddr::from_bytes(&parsed.to_bytes()).expect("binary must decode");
             assert_eq!(decoded, parsed);
             assert_eq!(decoded.to_string(), text);
+        }
+
+        for name in ["a/b", "a b", "a\u{7f}b", "\u{0}", ""] {
+            // Text side.
+            let text = alloc::format!("/dns4/{name}");
+            assert!(
+                Multiaddr::from_str(&text).is_err(),
+                "text parser accepted {name:?}"
+            );
+
+            // Binary side, hand-built so the encoder cannot launder it.
+            let body = name.as_bytes();
+            let mut bytes = alloc::vec![0x36u8, body.len() as u8];
+            bytes.extend_from_slice(body);
+            assert!(
+                Multiaddr::from_bytes(&bytes).is_err(),
+                "binary decoder accepted {name:?}"
+            );
         }
     }
 
