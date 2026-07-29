@@ -1,30 +1,34 @@
+/* oxlint-disable func-style, no-use-before-define, promise/avoid-new, unicorn/no-array-sort -- The executable smoke suite uses hoisted test helpers, Promise adapters for event waits and delays, and sorts a fresh latency sample in place. */
+
 import {
   MiniP2p,
   P2pEvent_Tags,
   generateSecretKey,
-  type MiniP2pConfig,
-  type MiniP2pEvent,
-  type P2pEvent,
-} from 'react-native-minip2p';
+} from "react-native-minip2p";
+import type {
+  MiniP2pConfig,
+  MiniP2pEvent,
+  P2pEvent,
+} from "react-native-minip2p";
 
-declare const TextEncoder: {
-  new (): { encode(input: string): Uint8Array };
+declare const TextEncoder: new () => {
+  encode: (input: string) => Uint8Array;
 };
 
 declare const performance: {
-  now(): number;
+  now: () => number;
 };
 
-const TOPIC = '/minip2p/react-native-smoke/1';
+const TOPIC = "/minip2p/react-native-smoke/1";
 const WAIT_MS = 10_000;
 const LARGE_PAYLOAD_BYTES = 60 * 1024;
 const CYCLE_COUNT = 50;
 
-export type SmokeResult = {
+export interface SmokeResult {
   readonly name: string;
   readonly passed: boolean;
   readonly detail?: string;
-};
+}
 
 export type SmokeReport = (result: SmokeResult) => void;
 
@@ -43,7 +47,7 @@ export async function runSmokeSuite(
 
     check(
       first.listenAddrs().length === 1 && second.listenAddrs().length === 1,
-      'construct-two-endpoints',
+      "construct-two-endpoints",
       `${shortPeer(firstPeer)} ↔ ${shortPeer(secondPeer)}`,
       report
     );
@@ -59,7 +63,7 @@ export async function runSmokeSuite(
       }
       if (isNativeEvent(event, P2pEvent_Tags.Message)) {
         throwingHandlerRan = true;
-        throw new Error('intentional smoke-listener exception');
+        throw new Error("intentional smoke-listener exception");
       }
     });
     first.on((event) => {
@@ -75,7 +79,7 @@ export async function runSmokeSuite(
       (event) =>
         isNativeEvent(event, P2pEvent_Tags.PeerReady) &&
         event.inner.peerId === secondPeer &&
-        event.inner.protocols.some((protocol) => protocol.includes('meshsub')),
+        event.inner.protocols.some((protocol) => protocol.includes("meshsub")),
       WAIT_MS
     );
     const secondReady = second.waitFor(
@@ -104,18 +108,18 @@ export async function runSmokeSuite(
 
     check(
       isNativeEvent(path, P2pEvent_Tags.PathEstablished),
-      'direct-loopback-path',
+      "direct-loopback-path",
       `connectId=${connectId}`,
       report
     );
     check(
       reentrantPeerSeen,
-      'callback-reentrancy',
-      'connectedPeers() succeeded inside PathEstablished',
+      "callback-reentrancy",
+      "connectedPeers() succeeded inside PathEstablished",
       report
     );
 
-    const unicode = 'minip2p says नमस्ते, こんにちは, and 👋';
+    const unicode = "minip2p says नमस्ते, こんにちは, and 👋";
     const unicodeBytes = encodeUtf8(unicode);
     const unicodeMessage = first.waitFor(
       (event) =>
@@ -125,7 +129,7 @@ export async function runSmokeSuite(
     );
     second.publish(TOPIC, unicode);
     await unicodeMessage;
-    check(true, 'unicode-message', `${unicodeBytes.byteLength} bytes`, report);
+    check(true, "unicode-message", `${unicodeBytes.byteLength} bytes`, report);
 
     const large = new Uint8Array(LARGE_PAYLOAD_BYTES);
     for (let index = 0; index < large.length; index += 1) {
@@ -141,14 +145,14 @@ export async function runSmokeSuite(
     await largeMessage;
     check(
       true,
-      'large-message',
+      "large-message",
       `${LARGE_PAYLOAD_BYTES} bytes preserved`,
       report
     );
     check(
       throwingHandlerRan && observingHandlerMessages >= 2,
-      'throwing-handler-contained',
-      'second subscriber and waiters continued receiving',
+      "throwing-handler-contained",
+      "second subscriber and waiters continued receiving",
       report
     );
 
@@ -161,14 +165,14 @@ export async function runSmokeSuite(
     const foregroundSignal = elapsed(() => first?.setActive(true));
     const foregroundQuery = elapsed(() => first?.connectedPeers());
     report({
-      name: 'contention-latency',
-      passed: true,
       detail:
         `active p50=${percentile(activeSamples, 0.5).toFixed(1)}ms ` +
         `p95=${percentile(activeSamples, 0.95).toFixed(1)}ms; ` +
         `idle=${idleQuery.toFixed(1)}ms; setActive=${foregroundSignal.toFixed(
           1
         )}ms; next=${foregroundQuery.toFixed(1)}ms`,
+      name: "contention-latency",
+      passed: true,
     });
 
     let closedDuringCallback = false;
@@ -176,7 +180,7 @@ export async function runSmokeSuite(
       first?.on((event) => {
         if (
           isNativeEvent(event, P2pEvent_Tags.Message) &&
-          sameBytes(event.inner.data, encodeUtf8('close-during-delivery'))
+          sameBytes(event.inner.data, encodeUtf8("close-during-delivery"))
         ) {
           closedDuringCallback = true;
           first?.close();
@@ -185,12 +189,12 @@ export async function runSmokeSuite(
         }
       });
     });
-    second.publish(TOPIC, 'close-during-delivery');
-    await withTimeout(closeObserved, WAIT_MS, 'close callback');
+    second.publish(TOPIC, "close-during-delivery");
+    await withTimeout(closeObserved, WAIT_MS, "close callback");
     check(
       closedDuringCallback && !first.isRunning(),
-      'close-during-delivery',
-      'queued tail suppressed without unwinding into Rust',
+      "close-during-delivery",
+      "queued tail suppressed without unwinding into Rust",
       report
     );
     first = undefined;
@@ -206,7 +210,7 @@ export async function runSmokeSuite(
     }
     check(
       true,
-      'create-close-cycles',
+      "create-close-cycles",
       `${CYCLE_COUNT} consecutive cycles completed`,
       report
     );
@@ -217,7 +221,7 @@ export async function runSmokeSuite(
     liveEndpoints.delete(fourth);
     third.close();
     liveEndpoints.delete(third);
-    check(true, 'reverse-close-order', 'second endpoint closed first', report);
+    check(true, "reverse-close-order", "second endpoint closed first", report);
   } finally {
     if (first !== undefined) {
       first.close();
@@ -232,12 +236,12 @@ export async function runSmokeSuite(
 
 function createEndpoint(liveEndpoints: Set<MiniP2p>): MiniP2p {
   const config: MiniP2pConfig = {
-    secretKey: generateSecretKey(),
-    agentVersion: 'minip2p-react-native-smoke',
-    relays: [],
-    listenAddr: '/ip4/127.0.0.1/udp/0/quic-v1',
-    forceRelay: false,
+    agentVersion: "minip2p-react-native-smoke",
     allowUnsigned: false,
+    forceRelay: false,
+    listenAddr: "/ip4/127.0.0.1/udp/0/quic-v1",
+    relays: [],
+    secretKey: generateSecretKey(),
   };
   const endpoint = MiniP2p.create(config);
   liveEndpoints.add(endpoint);
@@ -248,7 +252,7 @@ function isNativeEvent<Tag extends P2pEvent_Tags>(
   event: MiniP2pEvent,
   tag: Tag
 ): event is Extract<P2pEvent, { tag: Tag }> {
-  return 'tag' in event && event.tag === tag;
+  return "tag" in event && event.tag === tag;
 }
 
 function encodeUtf8(value: string): Uint8Array {
@@ -268,11 +272,8 @@ function sameBytes(actual: ArrayBuffer, expected: Uint8Array): boolean {
   return true;
 }
 
-function sampleLatencies(
-  count: number,
-  operation: () => unknown
-): Array<number> {
-  const samples: Array<number> = [];
+function sampleLatencies(count: number, operation: () => unknown): number[] {
+  const samples: number[] = [];
   for (let index = 0; index < count; index += 1) {
     samples.push(elapsed(operation));
   }
@@ -285,7 +286,7 @@ function elapsed(operation: () => unknown): number {
   return performance.now() - started;
 }
 
-function percentile(samples: ReadonlyArray<number>, quantile: number): number {
+function percentile(samples: readonly number[], quantile: number): number {
   if (samples.length === 0) {
     return 0;
   }
@@ -330,7 +331,7 @@ function check(
   detail: string,
   report: SmokeReport
 ): asserts condition {
-  report({ name, passed: condition, detail });
+  report({ detail, name, passed: condition });
   if (!condition) {
     throw new Error(`${name}: ${detail}`);
   }

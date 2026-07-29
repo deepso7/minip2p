@@ -52,6 +52,9 @@ bindings-check:
     cd bindings/react-native && pnpm lint
     cd bindings/react-native && pnpm prepare
 
+bindings-format:
+    cd bindings/react-native && pnpm format
+
 bindings-generate:
     cd bindings/react-native && pnpm ubrn:generate
 

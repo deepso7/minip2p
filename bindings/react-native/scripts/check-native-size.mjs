@@ -1,32 +1,28 @@
-import { readFileSync, statSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
-import process from 'node:process';
+/* oxlint-disable func-style -- The script uses a hoisted formatting helper below its main flow. */
 
-const platform = process.argv[2];
-if (platform !== 'android' && platform !== 'ios') {
-  throw new Error('usage: check-native-size.mjs <android|ios>');
+import { readFileSync, statSync } from "node:fs";
+import path from "node:path";
+import process from "node:process";
+
+const [platform] = process.argv.slice(2);
+if (platform !== "android" && platform !== "ios") {
+  throw new Error("usage: check-native-size.mjs <android|ios>");
 }
 
-const packageRoot = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  '..'
-);
+const packageRoot = path.resolve(import.meta.dirname, "..");
 const baseline = JSON.parse(
-  readFileSync(path.join(packageRoot, 'native-size-baseline.json'), 'utf8')
+  readFileSync(path.join(packageRoot, "native-size-baseline.json"), "utf-8")
 );
 const artifacts =
-  platform === 'android'
+  platform === "android"
     ? {
-        'arm64-v8a':
-          'android/src/main/jniLibs/arm64-v8a/libminip2p_ffi.so',
-        x86_64: 'android/src/main/jniLibs/x86_64/libminip2p_ffi.so',
+        "arm64-v8a": "android/src/main/jniLibs/arm64-v8a/libminip2p_ffi.so",
+        x86_64: "android/src/main/jniLibs/x86_64/libminip2p_ffi.so",
       }
     : {
-        'ios-arm64':
-          'build/Minip2pFfi.xcframework/ios-arm64/libminip2p_ffi.a',
-        'ios-arm64-simulator':
-          'build/Minip2pFfi.xcframework/ios-arm64-simulator/libminip2p_ffi.a',
+        "ios-arm64": "build/Minip2pFfi.xcframework/ios-arm64/libminip2p_ffi.a",
+        "ios-arm64-simulator":
+          "build/Minip2pFfi.xcframework/ios-arm64-simulator/libminip2p_ffi.a",
       };
 
 for (const [name, relativePath] of Object.entries(artifacts)) {
@@ -44,5 +40,5 @@ for (const [name, relativePath] of Object.entries(artifacts)) {
 }
 
 function formatChange(change) {
-  return `${change >= 0 ? '+' : ''}${change.toFixed(1)}%`;
+  return `${change >= 0 ? "+" : ""}${change.toFixed(1)}%`;
 }

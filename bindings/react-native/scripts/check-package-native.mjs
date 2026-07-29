@@ -1,23 +1,19 @@
-import { statSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
+import { statSync } from "node:fs";
+import path from "node:path";
 
-const packageRoot = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  '..'
-);
+const packageRoot = path.resolve(import.meta.dirname, "..");
 const requiredArtifacts = [
-  'android/src/main/jniLibs/arm64-v8a/libminip2p_ffi.so',
-  'android/src/main/jniLibs/x86_64/libminip2p_ffi.so',
-  'build/Minip2pFfi.xcframework/ios-arm64/libminip2p_ffi.a',
-  'build/Minip2pFfi.xcframework/ios-arm64-simulator/libminip2p_ffi.a',
+  "android/src/main/jniLibs/arm64-v8a/libminip2p_ffi.so",
+  "android/src/main/jniLibs/x86_64/libminip2p_ffi.so",
+  "build/Minip2pFfi.xcframework/ios-arm64/libminip2p_ffi.a",
+  "build/Minip2pFfi.xcframework/ios-arm64-simulator/libminip2p_ffi.a",
 ];
 
 for (const relativePath of requiredArtifacts) {
   const artifact = path.join(packageRoot, relativePath);
   let size;
   try {
-    size = statSync(artifact).size;
+    ({ size } = statSync(artifact));
   } catch {
     throw new Error(
       `Missing ${relativePath}; run pnpm ubrn:android and pnpm ubrn:ios before packaging`

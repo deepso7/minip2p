@@ -1,5 +1,7 @@
-import { StatusBar } from 'expo-status-bar';
-import { useCallback, useEffect, useRef, useState } from 'react';
+/* oxlint-disable no-use-before-define, react/style-prop-object -- Styles conventionally follow the component, and React Native accepts conditional style arrays. */
+
+import { StatusBar } from "expo-status-bar";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AppState,
   Pressable,
@@ -8,16 +10,17 @@ import {
   StyleSheet,
   Text,
   View,
-} from 'react-native';
-import { type MiniP2p } from 'react-native-minip2p';
+} from "react-native";
+import type { MiniP2p } from "react-native-minip2p";
 
-import { runSmokeSuite, type SmokeReport, type SmokeResult } from './src/smoke';
+import { runSmokeSuite } from "./src/smoke";
+import type { SmokeReport, SmokeResult } from "./src/smoke";
 
 export default function App() {
   const endpoints = useRef(new Set<MiniP2p>());
   const running = useRef(false);
-  const [results, setResults] = useState<Array<SmokeResult>>([]);
-  const [status, setStatus] = useState('ready');
+  const [results, setResults] = useState<SmokeResult[]>([]);
+  const [status, setStatus] = useState("ready");
 
   const run = useCallback(async () => {
     if (running.current) {
@@ -25,7 +28,7 @@ export default function App() {
     }
     running.current = true;
     setResults([]);
-    setStatus('running');
+    setStatus("running");
 
     const report: SmokeReport = (result) => {
       setResults((current) => [...current, result]);
@@ -33,14 +36,14 @@ export default function App() {
 
     try {
       await runSmokeSuite(report, endpoints.current);
-      setStatus('passed');
+      setStatus("passed");
     } catch (error) {
       report({
-        name: 'suite',
-        passed: false,
         detail: error instanceof Error ? error.message : String(error),
+        name: "suite",
+        passed: false,
       });
-      setStatus('failed');
+      setStatus("failed");
     } finally {
       running.current = false;
     }
@@ -48,15 +51,18 @@ export default function App() {
 
   useEffect(() => {
     const registry = endpoints.current;
-    const appState = AppState.addEventListener('change', (state) => {
-      const active = state === 'active';
+    const appState = AppState.addEventListener("change", (state) => {
+      const active = state === "active";
       for (const endpoint of registry) {
         endpoint.setActive(active);
       }
     });
 
-    run().catch(() => {});
+    const startTimer = setTimeout(() => {
+      void run();
+    }, 0);
     return () => {
+      clearTimeout(startTimer);
       appState.remove();
       for (const endpoint of registry) {
         endpoint.close();
@@ -79,8 +85,8 @@ export default function App() {
           <View
             style={[
               styles.status,
-              status === 'passed' && styles.statusPassed,
-              status === 'failed' && styles.statusFailed,
+              status === "passed" && styles.statusPassed,
+              status === "failed" && styles.statusFailed,
             ]}
           >
             <Text style={styles.statusText}>{status.toUpperCase()}</Text>
@@ -94,7 +100,7 @@ export default function App() {
             results.map((result, index) => (
               <View key={`${result.name}-${index}`} style={styles.result}>
                 <Text style={result.passed ? styles.pass : styles.fail}>
-                  {result.passed ? 'PASS' : 'FAIL'}
+                  {result.passed ? "PASS" : "FAIL"}
                 </Text>
                 <View style={styles.resultBody}>
                   <Text style={styles.resultName}>{result.name}</Text>
@@ -111,16 +117,16 @@ export default function App() {
 
         <Pressable
           accessibilityRole="button"
-          disabled={status === 'running'}
+          disabled={status === "running"}
           onPress={run}
           style={({ pressed }) => [
             styles.button,
             pressed && styles.buttonPressed,
-            status === 'running' && styles.buttonDisabled,
+            status === "running" && styles.buttonDisabled,
           ]}
         >
           <Text style={styles.buttonText}>
-            {status === 'running' ? 'Running…' : 'Run again'}
+            {status === "running" ? "Running…" : "Run again"}
           </Text>
         </Pressable>
       </ScrollView>
@@ -130,121 +136,121 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: '#f4f1e9',
+  button: {
+    alignItems: "center",
+    backgroundColor: "#171713",
+    borderRadius: 12,
+    marginTop: 18,
+    paddingVertical: 14,
+  },
+  buttonDisabled: {
+    opacity: 0.45,
+  },
+  buttonPressed: {
+    opacity: 0.8,
+  },
+  buttonText: {
+    color: "#fffdf8",
+    fontSize: 14,
+    fontWeight: "700",
   },
   container: {
-    paddingHorizontal: 22,
     paddingBottom: 40,
+    paddingHorizontal: 22,
   },
-  eyebrow: {
-    marginTop: 18,
-    marginBottom: 8,
-    color: '#716c5f',
-    fontSize: 11,
-    fontWeight: '700',
-    letterSpacing: 1.5,
-  },
-  headingRow: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    justifyContent: 'space-between',
-    gap: 12,
-    marginBottom: 24,
-  },
-  title: {
-    color: '#171713',
-    fontSize: 27,
-    fontWeight: '700',
-  },
-  subtitle: {
-    maxWidth: 290,
-    marginTop: 6,
-    color: '#716c5f',
-    fontSize: 13,
-    lineHeight: 18,
-  },
-  status: {
-    marginTop: 5,
-    borderRadius: 999,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    backgroundColor: '#d9d4c8',
-  },
-  statusPassed: {
-    backgroundColor: '#bce5c5',
-  },
-  statusFailed: {
-    backgroundColor: '#f1bbb5',
-  },
-  statusText: {
-    color: '#29271f',
-    fontSize: 10,
-    fontWeight: '800',
-    letterSpacing: 0.7,
-  },
-  results: {
-    overflow: 'hidden',
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: '#c8c2b5',
-    borderRadius: 14,
-    backgroundColor: '#fffdf8',
+  detail: {
+    color: "#716c5f",
+    fontSize: 12,
+    lineHeight: 17,
+    marginTop: 3,
   },
   empty: {
+    color: "#716c5f",
     padding: 18,
-    color: '#716c5f',
+  },
+  eyebrow: {
+    color: "#716c5f",
+    fontSize: 11,
+    fontWeight: "700",
+    letterSpacing: 1.5,
+    marginBottom: 8,
+    marginTop: 18,
+  },
+  fail: {
+    color: "#a12b2b",
+    fontSize: 11,
+    fontWeight: "800",
+    width: 34,
+  },
+  headingRow: {
+    alignItems: "flex-start",
+    flexDirection: "row",
+    gap: 12,
+    justifyContent: "space-between",
+    marginBottom: 24,
+  },
+  pass: {
+    color: "#18753b",
+    fontSize: 11,
+    fontWeight: "800",
+    width: 34,
   },
   result: {
-    flexDirection: 'row',
+    borderBottomColor: "#ddd7cb",
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    flexDirection: "row",
     gap: 12,
     paddingHorizontal: 14,
     paddingVertical: 12,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#ddd7cb',
-  },
-  pass: {
-    width: 34,
-    color: '#18753b',
-    fontSize: 11,
-    fontWeight: '800',
-  },
-  fail: {
-    width: 34,
-    color: '#a12b2b',
-    fontSize: 11,
-    fontWeight: '800',
   },
   resultBody: {
     flex: 1,
   },
   resultName: {
-    color: '#171713',
+    color: "#171713",
     fontSize: 14,
-    fontWeight: '600',
+    fontWeight: "600",
   },
-  detail: {
-    marginTop: 3,
-    color: '#716c5f',
-    fontSize: 12,
-    lineHeight: 17,
+  results: {
+    backgroundColor: "#fffdf8",
+    borderColor: "#c8c2b5",
+    borderRadius: 14,
+    borderWidth: StyleSheet.hairlineWidth,
+    overflow: "hidden",
   },
-  button: {
-    alignItems: 'center',
-    marginTop: 18,
-    borderRadius: 12,
-    paddingVertical: 14,
-    backgroundColor: '#171713',
+  safeArea: {
+    backgroundColor: "#f4f1e9",
+    flex: 1,
   },
-  buttonPressed: {
-    opacity: 0.8,
+  status: {
+    backgroundColor: "#d9d4c8",
+    borderRadius: 999,
+    marginTop: 5,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
   },
-  buttonDisabled: {
-    opacity: 0.45,
+  statusFailed: {
+    backgroundColor: "#f1bbb5",
   },
-  buttonText: {
-    color: '#fffdf8',
-    fontSize: 14,
-    fontWeight: '700',
+  statusPassed: {
+    backgroundColor: "#bce5c5",
+  },
+  statusText: {
+    color: "#29271f",
+    fontSize: 10,
+    fontWeight: "800",
+    letterSpacing: 0.7,
+  },
+  subtitle: {
+    color: "#716c5f",
+    fontSize: 13,
+    lineHeight: 18,
+    marginTop: 6,
+    maxWidth: 290,
+  },
+  title: {
+    color: "#171713",
+    fontSize: 27,
+    fontWeight: "700",
   },
 });

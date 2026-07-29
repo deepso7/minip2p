@@ -3,7 +3,7 @@
     "name": "minip2p example",
     "slug": "minip2p-example",
     "version": "0.0.1",
-    "plugins": ["./plugins/withMinip2pBuild"],
+    "plugins": ["./plugins/with-minip2p-build"],
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",

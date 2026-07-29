@@ -1,4 +1,4 @@
-export * from './generated/minip2p_ffi';
+export * from "./generated/minip2p_ffi";
 export {
   BackpressureError,
   ClosedError,
@@ -12,4 +12,4 @@ export {
   type P2pEvent,
   type QueueOverflowEvent,
   type Unsubscribe,
-} from './wrapper';
+} from "./wrapper";
