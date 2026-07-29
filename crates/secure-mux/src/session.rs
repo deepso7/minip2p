@@ -637,3 +637,166 @@ impl SecureMuxSession {
 fn yamux_stream(stream: StreamId) -> Result<u32, SessionError> {
     u32::try_from(stream.as_u64()).map_err(|_| SessionError::UnknownStream { stream })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minip2p_yamux::Frame;
+
+    /// Runs two raw Noise sessions through their handshake, returning both in
+    /// transport mode with their nonces in step.
+    ///
+    /// Driving Noise directly, rather than through two `SecureMuxSession`s,
+    /// is what lets the test encrypt a message the peer never sent: a session
+    /// auto-sends its Yamux confirmation, and dropping that ciphertext would
+    /// desync the nonces.
+    fn noise_pair(
+        initiator_key: Ed25519Keypair,
+        responder_key: Ed25519Keypair,
+    ) -> (NoiseSession, NoiseSession) {
+        let responder_peer = responder_key.peer_id();
+        let mut initiator = NoiseSession::new(NoiseConfig {
+            role: NoiseRole::Initiator,
+            identity: initiator_key,
+            static_secret: [1; 32],
+            ephemeral_secret: [2; 32],
+            expected_peer: Some(responder_peer),
+        });
+        let mut responder = NoiseSession::new(NoiseConfig {
+            role: NoiseRole::Responder,
+            identity: responder_key,
+            static_secret: [3; 32],
+            ephemeral_secret: [4; 32],
+            expected_peer: None,
+        });
+        initiator.handle_input(NoiseInput::Start).expect("start");
+        responder.handle_input(NoiseInput::Start).expect("start");
+
+        // Takes everything `from` has queued and delivers it to `to`, reporting
+        // whether anything moved and whether `to` finished its handshake.
+        fn shuttle(from: &mut NoiseSession, to: &mut NoiseSession) -> (bool, bool) {
+            let mut batch = Vec::new();
+            while let Some(output) = from.poll_output() {
+                match output {
+                    NoiseOutput::Outbound(bytes) => batch.extend_from_slice(&bytes),
+                    NoiseOutput::HandshakeComplete { .. } => {}
+                    NoiseOutput::Decrypted(_) => panic!("no data during handshake"),
+                }
+            }
+            if batch.is_empty() {
+                return (false, false);
+            }
+            to.handle_input(NoiseInput::Data(batch)).expect("handshake");
+            (true, false)
+        }
+
+        fn completed(session: &mut NoiseSession) -> bool {
+            // Peeking for completion would consume queued outbound bytes, so
+            // ask the session instead of draining it.
+            session.is_handshake_complete()
+        }
+
+        for _ in 0..16 {
+            let (moved_forward, _) = shuttle(&mut initiator, &mut responder);
+            let (moved_back, _) = shuttle(&mut responder, &mut initiator);
+            if !moved_forward && !moved_back {
+                break;
+            }
+        }
+        assert!(
+            completed(&mut initiator) && completed(&mut responder),
+            "handshake must complete"
+        );
+
+        (initiator, responder)
+    }
+
+    /// Builds a dialer select that has exchanged multistream headers and sent
+    /// its `/yamux/1.0.0` proposal, plus the exact echo the peer replies with.
+    ///
+    /// The echo is the message that completes negotiation, so anything a peer
+    /// packs after it in the same write is what
+    /// `take_remaining_buffer` hands to Yamux.
+    fn dialer_awaiting_echo() -> (MultistreamSelect, Vec<u8>) {
+        const MULTISTREAM_HEADER: &[u8] = b"\x13/multistream/1.0.0\n";
+
+        let mut select = MultistreamSelect::dialer(YAMUX_PROTOCOL_ID);
+        select.handle_input(MultistreamInput::Start).expect("start");
+        while select.poll_output().is_some() {}
+
+        // The header echo makes the dialer send its protocol proposal; the
+        // peer echoes that same line back to confirm.
+        select
+            .handle_input(MultistreamInput::Data(MULTISTREAM_HEADER.to_vec()))
+            .expect("header echo");
+        let mut echo = Vec::new();
+        while let Some(output) = select.poll_output() {
+            if let MultistreamOutput::OutboundData(bytes) = output {
+                echo.extend_from_slice(&bytes);
+            }
+        }
+        assert!(!echo.is_empty(), "dialer must propose a protocol");
+
+        (select, echo)
+    }
+
+    /// A peer that writes its Yamux confirmation and its first frames in one
+    /// socket write lands both in a single Noise plaintext, so the
+    /// confirmation's `take_remaining_buffer` carries those frames. If they
+    /// are fatal the upgrade never completed, and `Established` must not be
+    /// left pollable -- a host draining outputs after the error would read a
+    /// dead session as a live one.
+    ///
+    /// A `SecureMuxSession` emits the two as separate plaintexts, so this
+    /// packs them by hand. That needs crate internals, which is why the test
+    /// lives here rather than in `tests/`.
+    #[test]
+    fn a_fatal_pipelined_remainder_never_announces_establishment() {
+        let dialer_key = Ed25519Keypair::generate();
+        let listener_key = Ed25519Keypair::generate();
+        let listener_peer = listener_key.peer_id();
+        let (dialer_noise, mut listener_noise) = noise_pair(dialer_key, listener_key);
+        let (select, echo) = dialer_awaiting_echo();
+
+        let mut dialer = SecureMuxSession {
+            role: SessionRole::Initiator,
+            yamux_config: YamuxConfig::default(),
+            phase: Some(Phase::SelectYamux {
+                noise: dialer_noise,
+                select,
+                peer: listener_peer,
+            }),
+            outputs: VecDeque::new(),
+        };
+
+        // One plaintext: the confirming echo followed by a fatal GoAway.
+        let mut packed = echo;
+        packed.extend_from_slice(&Frame::go_away(1).encode());
+        listener_noise
+            .handle_input(NoiseInput::Encrypt(packed))
+            .expect("encrypt the packed plaintext");
+        let mut ciphertext = Vec::new();
+        while let Some(output) = listener_noise.poll_output() {
+            if let NoiseOutput::Outbound(bytes) = output {
+                ciphertext.extend_from_slice(&bytes);
+            }
+        }
+        assert!(!ciphertext.is_empty(), "packed plaintext must encrypt");
+
+        let result = dialer.handle_input(ciphertext);
+
+        assert!(
+            matches!(result, Err(SessionError::Protocol(_))),
+            "a fatal remainder must fail the upgrade: {result:?}"
+        );
+        assert!(!dialer.is_established());
+
+        let outputs: Vec<SessionOutput> = core::iter::from_fn(|| dialer.poll_output()).collect();
+        assert!(
+            !outputs
+                .iter()
+                .any(|output| matches!(output, SessionOutput::Established { .. })),
+            "a failed upgrade must not leave Established pollable: {outputs:?}"
+        );
+    }
+}
