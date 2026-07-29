@@ -317,6 +317,7 @@ dependencies = [
  "minip2p-platform",
  "minip2p-pubsub",
  "minip2p-relay",
+ "minip2p-secure-mux",
  "minip2p-swarm",
  "minip2p-transport",
  "minip2p-yamux",
@@ -406,6 +407,19 @@ name = "minip2p-relay"
 version = "0.3.1"
 dependencies = [
  "minip2p-core",
+ "thiserror",
+]
+
+[[package]]
+name = "minip2p-secure-mux"
+version = "0.2.0"
+dependencies = [
+ "minip2p-core",
+ "minip2p-identity",
+ "minip2p-multistream-select",
+ "minip2p-noise",
+ "minip2p-transport",
+ "minip2p-yamux",
  "thiserror",
 ]
 

@@ -88,6 +88,12 @@ pub enum SessionError {
     /// A stream operation was attempted before the upgrade completed.
     #[error("session is still negotiating")]
     NotEstablished,
+    /// The stream id does not name a substream of this session.
+    #[error("unknown substream {stream}")]
+    UnknownStream {
+        /// The id that was passed in.
+        stream: StreamId,
+    },
     /// Yamux rejected the operation.
     ///
     /// Kept distinct so callers can tell a full send buffer from a fatal
@@ -220,19 +226,19 @@ impl SecureMuxSession {
 
     /// Writes to a substream.
     pub fn send(&mut self, stream: StreamId, data: Vec<u8>) -> Result<(), SessionError> {
-        let stream = yamux_stream(stream);
+        let stream = yamux_stream(stream)?;
         self.with_yamux(move |yamux| yamux.send(stream, data))
     }
 
     /// Half-closes the local write side of a substream.
     pub fn close_stream_write(&mut self, stream: StreamId) -> Result<(), SessionError> {
-        let stream = yamux_stream(stream);
+        let stream = yamux_stream(stream)?;
         self.with_yamux(move |yamux| yamux.close_write(stream))
     }
 
     /// Abruptly closes a substream in both directions.
     pub fn reset_stream(&mut self, stream: StreamId) -> Result<(), SessionError> {
-        let stream = yamux_stream(stream);
+        let stream = yamux_stream(stream)?;
         self.with_yamux(move |yamux| yamux.reset(stream))
     }
 
@@ -249,20 +255,22 @@ impl SecureMuxSession {
         &mut self,
         operation: impl FnOnce(&mut YamuxSession) -> Result<R, YamuxError>,
     ) -> Result<R, SessionError> {
-        let Some(Phase::Ready {
-            mut noise,
-            mut yamux,
-            peer,
-        }) = self.phase.take()
-        else {
-            // Put back whatever phase we found; the session is still usable.
-            return Err(SessionError::NotEstablished);
+        // Only `Ready` runs stream operations, but every other phase is still
+        // a live session mid-upgrade: put it back, or a stray early call would
+        // strand the connection.
+        let (mut noise, mut yamux, peer) = match self.phase.take() {
+            Some(Phase::Ready { noise, yamux, peer }) => (noise, yamux, peer),
+            other => {
+                self.phase = other;
+                return Err(SessionError::NotEstablished);
+            }
         };
 
         let result = operation(&mut yamux);
-        let drain = self.drain_yamux(&mut noise, &mut yamux);
+        // A failed drain is fatal, exactly as in `handle_input`: leave the
+        // phase taken so the session cannot be used again.
+        self.drain_yamux(&mut noise, &mut yamux)?;
         self.phase = Some(Phase::Ready { noise, yamux, peer });
-        drain?;
         result.map_err(SessionError::Yamux)
     }
 
@@ -496,11 +504,11 @@ impl SecureMuxSession {
         )
         .map_err(|error| SessionError::protocol(format!("invalid Yamux configuration: {error}")))?;
 
-        // Ordered before any stream output from the pipelined remainder, so a
-        // caller applying connection policy sees the peer first.
-        self.outputs
-            .push_back(SessionOutput::Established { peer: peer.clone() });
-
+        // Handle the pipelined remainder first, then insert `Established`
+        // ahead of whatever it produced. Announcing up front would leave a
+        // pollable `Established` behind when the remainder fails, and a host
+        // that drains outputs after an error would treat a dead session as up.
+        let established_at = self.outputs.len();
         if !remaining.is_empty() {
             let result = yamux.handle_input(YamuxInput::Data(remaining));
             self.drain_yamux(&mut noise, &mut yamux)?;
@@ -508,6 +516,10 @@ impl SecureMuxSession {
                 SessionError::protocol(format!("Yamux protocol failed: {error}"))
             })?;
         }
+        self.outputs.insert(
+            established_at,
+            SessionOutput::Established { peer: peer.clone() },
+        );
         Ok(Phase::Ready { noise, yamux, peer })
     }
 
@@ -619,9 +631,9 @@ impl SecureMuxSession {
 
 /// Narrows a transport stream id to Yamux's 32-bit stream id.
 ///
-/// Ids only ever originate from Yamux itself (widened in `drain_yamux`), so
-/// the value always fits; a caller passing a fabricated id gets a truncated
-/// one that Yamux rejects as unknown.
-fn yamux_stream(stream: StreamId) -> u32 {
-    stream.as_u64() as u32
+/// Rejects anything that does not fit rather than truncating: a fabricated id
+/// congruent to a live stream modulo 2^32 would otherwise alias onto it and
+/// operate on somebody else's substream.
+fn yamux_stream(stream: StreamId) -> Result<u32, SessionError> {
+    u32::try_from(stream.as_u64()).map_err(|_| SessionError::UnknownStream { stream })
 }

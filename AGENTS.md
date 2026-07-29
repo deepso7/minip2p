@@ -46,7 +46,7 @@ leaves the full matrix to GitHub to avoid running it twice; use
 
 Three layers, strictly separated:
 
-1. **Sans-I/O protocol crates** (`no_std + alloc`), one per protocol: `multistream-select`, `ping`, `identify`, `relay`, `autonat`, `dcutr`, `pubsub`, `mdns`; plus `identity`, `core`, `tls`, `platform` (`Clock`/`Now`/`Deadline`/`EntropySource` contracts), and `transport` (trait contract only).
+1. **Sans-I/O protocol crates** (`no_std + alloc`), one per protocol: `multistream-select`, `ping`, `identify`, `relay`, `autonat`, `dcutr`, `pubsub`, `mdns`; plus `identity`, `core`, `tls`, `platform` (`Clock`/`Now`/`Deadline`/`EntropySource` contracts), `secure-mux` (multistream-select + Noise XX + Yamux over an ordered byte stream, shared by circuit and TCP), and `transport` (trait contract only).
 2. **Sans-I/O orchestrators**: `crates/swarm` (`SwarmCore`; also a `std`-gated `Swarm<T>` driver), `crates/nat` (`NatAgent`: direct-dial vs. relay race + DCUtR hole punching), and `crates/discovery` (`BeaconAgent` + `PeerDiscoveryAgent`: signed beacons and the shared multi-source book/dial policy).
 3. **`std` adapters**: `transports/quic` (quiche-based, owns UDP/DNS, exposes deadlines), the `std`-gated mDNS socket driver, `crates/minip2p` — the application-facing `Endpoint` API whose features layer on without changing the base API — and `crates/ffi`, the UniFFI endpoint/driver adapter for foreign runtimes.
 

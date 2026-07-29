@@ -22,6 +22,9 @@ use minip2p_pubsub::{
     RawMessage, Rpc,
 };
 use minip2p_relay::{FrameDecode as RelayFrame, HopMessage, StopMessage};
+use minip2p_secure_mux::{
+    SecureMuxSession, SessionConfig, SessionOutput, SessionRole, YamuxConfig,
+};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
@@ -39,6 +42,7 @@ fuzz_target!(|data: &[u8]| {
     fuzz_noise(data);
     fuzz_pubsub(data);
     fuzz_yamux(data);
+    fuzz_secure_mux(data);
     fuzz_circuit(data);
 
     if let RelayFrame::Complete { payload, .. } = minip2p_relay::decode_frame(data) {
@@ -251,6 +255,51 @@ fn fuzz_multiaddr(data: &[u8]) {
     {
         let _ = addr.to_bytes();
         let _ = addr.transport_kind();
+    }
+}
+
+/// Drives attacker-controlled bytes through the secure-mux upgrade.
+///
+/// `handle_input` decodes peer-supplied bytes at every phase of the stack, so
+/// it gets the same fuzz treatment as the wire decoders underneath it. Both
+/// roles are driven, and the bytes are also fed in chunks so a frame split
+/// across reads exercises the partial-buffer paths.
+fn fuzz_secure_mux(data: &[u8]) {
+    let chunk_len = usize::from(data.first().copied().unwrap_or(1)).max(1);
+
+    for role in [SessionRole::Initiator, SessionRole::Responder] {
+        let identity = minip2p_identity::Ed25519Keypair::from_secret_key_bytes([7; 32]);
+        let mut session = SecureMuxSession::new(SessionConfig {
+            role,
+            identity,
+            static_secret: [11; 32],
+            ephemeral_secret: [13; 32],
+            expected_peer: None,
+            yamux: YamuxConfig::default(),
+        });
+        if session.start().is_err() {
+            continue;
+        }
+
+        let mut established = false;
+        for chunk in data.chunks(chunk_len) {
+            if session.handle_input(chunk.to_vec()).is_err() {
+                break;
+            }
+            while let Some(output) = session.poll_output() {
+                if matches!(output, SessionOutput::Established { .. }) {
+                    established = true;
+                }
+            }
+        }
+
+        // An unauthenticated peer must never reach the established state from
+        // arbitrary bytes: that would mean the Noise handshake was skippable.
+        assert!(
+            !established,
+            "arbitrary bytes must not complete the upgrade"
+        );
+        assert!(!session.is_established());
     }
 }
 

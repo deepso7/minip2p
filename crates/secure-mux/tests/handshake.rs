@@ -16,6 +16,15 @@ fn session(
     identity: Ed25519Keypair,
     expected: Option<&Ed25519Keypair>,
 ) -> SecureMuxSession {
+    session_with(role, identity, expected, YamuxConfig::default())
+}
+
+fn session_with(
+    role: SessionRole,
+    identity: Ed25519Keypair,
+    expected: Option<&Ed25519Keypair>,
+    yamux: YamuxConfig,
+) -> SecureMuxSession {
     let seed = match role {
         SessionRole::Initiator => 1u8,
         SessionRole::Responder => 2,
@@ -26,7 +35,7 @@ fn session(
         static_secret: [seed; 32],
         ephemeral_secret: [seed.wrapping_add(0x10); 32],
         expected_peer: expected.map(|keypair| keypair.peer_id()),
-        yamux: YamuxConfig::default(),
+        yamux,
     })
 }
 
@@ -127,30 +136,103 @@ fn two_sessions_complete_the_upgrade_and_authenticate_each_other() {
     assert_eq!(listener.peer(), Some(&dialer_peer));
 }
 
+/// Feeds every write `from` has queued to `to` as one input, so `to` decrypts
+/// the whole batch in a single `handle_input`.
+fn flush_batched(from: &mut SecureMuxSession, to: &mut SecureMuxSession) -> Vec<SessionOutput> {
+    let mut batch = Vec::new();
+    let mut events = Vec::new();
+    while let Some(output) = from.poll_output() {
+        match output {
+            SessionOutput::Write(bytes) => batch.extend_from_slice(&bytes),
+            other => events.push(other),
+        }
+    }
+    if !batch.is_empty() {
+        to.handle_input(batch).expect("peer accepts the batch");
+    }
+    events
+}
+
 #[test]
 fn established_is_reported_before_any_stream_output() {
-    let (_dialer, _listener, _, _) = upgraded_pair();
-
     let dialer_key = Ed25519Keypair::generate();
     let listener_key = Ed25519Keypair::generate();
     let mut dialer = session(SessionRole::Initiator, dialer_key, Some(&listener_key));
     let mut listener = session(SessionRole::Responder, listener_key, None);
     dialer.start().expect("start");
     listener.start().expect("start");
-    let (_, listener_events) = exchange(&mut dialer, &mut listener);
+
+    // Drive only dialer -> listener until the listener finishes its upgrade,
+    // leaving its replies unread by the dialer.
+    for _ in 0..32 {
+        let _ = flush_batched(&mut dialer, &mut listener);
+        if listener.is_established() {
+            break;
+        }
+        // The listener's reply is needed for the dialer to make progress.
+        let mut batch = Vec::new();
+        while let Some(output) = listener.poll_output() {
+            if let SessionOutput::Write(bytes) = output {
+                batch.extend_from_slice(&bytes);
+            }
+        }
+        if batch.is_empty() {
+            break;
+        }
+        dialer.handle_input(batch).expect("dialer accepts");
+    }
+    assert!(listener.is_established(), "listener must finish first");
+
+    // Now the listener opens a substream and sends before the dialer has read
+    // its Yamux confirmation, so the dialer decrypts the confirmation and the
+    // frames in one batch -- the pipelined path.
+    let stream = listener.open_stream().expect("open substream");
+    listener.send(stream, b"pipelined".to_vec()).expect("send");
+
+    let dialer_events = {
+        let mut batch = Vec::new();
+        while let Some(output) = listener.poll_output() {
+            if let SessionOutput::Write(bytes) = output {
+                batch.extend_from_slice(&bytes);
+            }
+        }
+        dialer
+            .handle_input(batch)
+            .expect("dialer accepts the batch");
+        let mut events = Vec::new();
+        while let Some(output) = dialer.poll_output() {
+            if !matches!(output, SessionOutput::Write(_)) {
+                events.push(output);
+            }
+        }
+        events
+    };
+
+    // The batch really did carry both, or this test proves nothing.
+    let established = dialer_events
+        .iter()
+        .position(|event| matches!(event, SessionOutput::Established { .. }))
+        .expect("dialer established in this batch");
+    let first_stream = dialer_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                SessionOutput::IncomingStream { .. } | SessionOutput::StreamData { .. }
+            )
+        })
+        .expect("pipelined stream output in the same batch");
 
     // A caller applying connection policy on `Established` must see it before
     // it has to decide anything about a stream.
-    let established = listener_events
-        .iter()
-        .position(|event| matches!(event, SessionOutput::Established { .. }))
-        .expect("listener established");
-    if let Some(first_other) = listener_events
-        .iter()
-        .position(|event| !matches!(event, SessionOutput::Established { .. }))
-    {
-        assert!(established < first_other, "Established must come first");
-    }
+    assert!(
+        established < first_stream,
+        "Established must precede stream output: {dialer_events:?}"
+    );
+    assert_eq!(
+        stream_payloads(&dialer_events),
+        vec![b"pipelined".as_slice()]
+    );
 }
 
 #[test]
@@ -250,7 +332,9 @@ fn a_mismatched_expected_peer_fails_the_handshake() {
 fn stream_operations_before_the_upgrade_are_rejected() {
     let dialer_key = Ed25519Keypair::generate();
     let listener_key = Ed25519Keypair::generate();
+    let listener_peer = listener_key.peer_id();
     let mut dialer = session(SessionRole::Initiator, dialer_key, Some(&listener_key));
+    let mut listener = session(SessionRole::Responder, listener_key, None);
 
     assert!(matches!(
         dialer.open_stream(),
@@ -260,6 +344,117 @@ fn stream_operations_before_the_upgrade_are_rejected() {
         dialer.send(StreamId::new(1), b"x".to_vec()),
         Err(SessionError::NotEstablished)
     ));
+    assert!(matches!(
+        dialer.close_stream_write(StreamId::new(1)),
+        Err(SessionError::NotEstablished)
+    ));
+    assert!(matches!(
+        dialer.reset_stream(StreamId::new(1)),
+        Err(SessionError::NotEstablished)
+    ));
     assert!(!dialer.is_established());
     assert_eq!(dialer.peer(), None);
+
+    // Rejecting an early call must not consume the session: it is still
+    // mid-upgrade and has to be able to finish.
+    dialer.start().expect("start after rejected calls");
+    listener.start().expect("start");
+    let _ = exchange(&mut dialer, &mut listener);
+    assert!(
+        dialer.is_established(),
+        "a rejected early call must leave the session usable"
+    );
+    assert_eq!(dialer.peer(), Some(&listener_peer));
+}
+
+#[test]
+fn out_of_range_stream_ids_are_rejected_rather_than_truncated() {
+    let (mut dialer, _listener, _, _) = upgraded_pair();
+    let stream = dialer.open_stream().expect("open substream");
+
+    // Congruent to a live stream modulo 2^32: truncation would alias onto it
+    // and operate on somebody else's substream.
+    let aliased = StreamId::new(stream.as_u64() + (1u64 << 32));
+    assert!(matches!(
+        dialer.send(aliased, b"x".to_vec()),
+        Err(SessionError::UnknownStream { .. })
+    ));
+    assert!(matches!(
+        dialer.reset_stream(aliased),
+        Err(SessionError::UnknownStream { .. })
+    ));
+
+    // The real stream still works, so the rejection cost nothing.
+    dialer.send(stream, b"ok".to_vec()).expect("real stream");
+}
+
+#[test]
+fn a_session_that_fails_mid_batch_is_dead_and_stays_dead() {
+    // One batch can carry the Yamux confirmation and pipelined frames. If a
+    // frame is fatal, `handle_input` must report it and the session must be
+    // unusable afterwards rather than half-alive.
+    let dialer_key = Ed25519Keypair::generate();
+    let listener_key = Ed25519Keypair::generate();
+
+    // The dialer refuses frames larger than 64 bytes; the listener, on default
+    // limits, will pipeline a much larger one.
+    let strict = YamuxConfig {
+        max_frame_len: 64,
+        ..YamuxConfig::default()
+    };
+    let mut dialer = session_with(
+        SessionRole::Initiator,
+        dialer_key,
+        Some(&listener_key),
+        strict,
+    );
+    let mut listener = session(SessionRole::Responder, listener_key, None);
+    dialer.start().expect("start");
+    listener.start().expect("start");
+
+    // Drive until the listener is up, leaving its confirmation unread.
+    for _ in 0..32 {
+        let _ = flush_batched(&mut dialer, &mut listener);
+        if listener.is_established() {
+            break;
+        }
+        let mut batch = Vec::new();
+        while let Some(output) = listener.poll_output() {
+            if let SessionOutput::Write(bytes) = output {
+                batch.extend_from_slice(&bytes);
+            }
+        }
+        if batch.is_empty() {
+            break;
+        }
+        dialer.handle_input(batch).expect("dialer accepts");
+    }
+    assert!(listener.is_established());
+
+    let stream = listener.open_stream().expect("open substream");
+    listener
+        .send(stream, vec![0u8; 4096])
+        .expect("queue an oversized frame");
+
+    let mut batch = Vec::new();
+    while let Some(output) = listener.poll_output() {
+        if let SessionOutput::Write(bytes) = output {
+            batch.extend_from_slice(&bytes);
+        }
+    }
+    let result = dialer.handle_input(batch);
+
+    assert!(
+        matches!(result, Err(SessionError::Protocol(_))),
+        "an oversized frame must fail the session: {result:?}"
+    );
+    assert!(
+        !dialer.is_established(),
+        "a failed session is not established"
+    );
+
+    // The phase was consumed, so every later call fails rather than operating
+    // on a half-torn-down session.
+    assert!(dialer.handle_input(b"more".to_vec()).is_err());
+    assert!(dialer.open_stream().is_err());
 }
