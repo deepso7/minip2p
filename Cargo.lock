@@ -987,9 +987,9 @@ dependencies = [
  "minip2p-multistream-select",
  "minip2p-noise",
  "minip2p-platform",
+ "minip2p-secure-mux",
  "minip2p-test-support",
  "minip2p-transport",
- "minip2p-yamux",
  "thiserror",
 ]
 

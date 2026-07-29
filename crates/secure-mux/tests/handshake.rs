@@ -291,6 +291,48 @@ fn half_close_and_reset_reach_the_remote() {
 }
 
 #[test]
+fn go_away_closes_local_substreams_and_ends_the_remote_session() {
+    let (mut dialer, mut listener, _, _) = upgraded_pair();
+    let stream = dialer.open_stream().expect("open substream");
+    let (_, listener_events) = exchange(&mut dialer, &mut listener);
+    assert!(
+        listener_events.iter().any(|event| matches!(
+            event,
+            SessionOutput::IncomingStream { stream: incoming } if *incoming == stream
+        )),
+        "the substream must be live before the shutdown: {listener_events:?}"
+    );
+
+    dialer
+        .go_away(0)
+        .expect("an established session shuts down");
+
+    let mut wire = Vec::new();
+    let mut local = Vec::new();
+    while let Some(output) = dialer.poll_output() {
+        match output {
+            SessionOutput::Write(bytes) => wire.extend_from_slice(&bytes),
+            other => local.push(other),
+        }
+    }
+    assert_eq!(
+        local,
+        vec![SessionOutput::StreamClosed { stream }],
+        "shutting down must close every open substream"
+    );
+    assert!(!wire.is_empty(), "the GoAway frame must reach the wire");
+
+    // The remote learns this was an orderly end, not a protocol fault, so it
+    // can close quietly rather than report a failure the dialer never made.
+    let result = listener.handle_input(wire);
+    assert!(
+        matches!(result, Err(SessionError::GoAway { code: 0 })),
+        "an orderly shutdown must be reported as such: {result:?}"
+    );
+    assert!(!listener.is_established());
+}
+
+#[test]
 fn a_mismatched_expected_peer_fails_the_handshake() {
     let dialer_key = Ed25519Keypair::generate();
     let listener_key = Ed25519Keypair::generate();
@@ -350,6 +392,10 @@ fn stream_operations_before_the_upgrade_are_rejected() {
     ));
     assert!(matches!(
         dialer.reset_stream(StreamId::new(1)),
+        Err(SessionError::NotEstablished)
+    ));
+    assert!(matches!(
+        dialer.go_away(0),
         Err(SessionError::NotEstablished)
     ));
     assert!(!dialer.is_established());

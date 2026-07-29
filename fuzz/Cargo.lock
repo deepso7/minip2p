@@ -266,11 +266,9 @@ dependencies = [
  "getrandom",
  "minip2p-core",
  "minip2p-identity",
- "minip2p-multistream-select",
- "minip2p-noise",
  "minip2p-platform",
+ "minip2p-secure-mux",
  "minip2p-transport",
- "minip2p-yamux",
  "thiserror",
 ]
 

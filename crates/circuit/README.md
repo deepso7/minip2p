@@ -1,11 +1,13 @@
 # minip2p-circuit
 
 `minip2p-circuit` turns an already-negotiated relay bridge stream into a
-regular minip2p `Transport` connection. It is fully Sans-I/O: multistream
-selection, Noise, and Yamux are driven over the bridge while the wrapped
-transport remains responsible for actual I/O.
+regular minip2p `Transport` connection. It is fully Sans-I/O: the upgrade runs
+in a [`minip2p-secure-mux`](../secure-mux) session driven over the bridge, while
+the wrapped transport remains responsible for actual I/O. This crate contributes
+the bridge plumbing on top of that session: circuit identifiers, bridge
+lifecycle, and arbitration against direct connections.
 
-The wrapper assigns circuit connections IDs with the high bit set, leaving
+The wrapper assigns circuit connections IDs in the `CIRCUIT` namespace, leaving
 wrapped transport IDs unchanged. Callers adopt HOP/STOP bridge streams with
 `CircuitTransport::adopt_bridge` and then use the ordinary `Transport` API.
 

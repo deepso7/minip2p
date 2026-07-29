@@ -94,6 +94,17 @@ pub enum SessionError {
         /// The id that was passed in.
         stream: StreamId,
     },
+    /// The remote ended the session with a Yamux `GoAway`.
+    ///
+    /// Fatal like [`SessionError::Protocol`], but kept separate because a
+    /// `code` of 0 is an orderly shutdown rather than a fault: a caller that
+    /// surfaces failures to its host can close quietly instead of reporting an
+    /// error the remote never made.
+    #[error("remote closed the Yamux session with code {code}")]
+    GoAway {
+        /// Yamux `GoAway` code; 0 is a normal shutdown.
+        code: u32,
+    },
     /// Yamux rejected the operation.
     ///
     /// Kept distinct so callers can tell a full send buffer from a fatal
@@ -240,6 +251,23 @@ impl SecureMuxSession {
     pub fn reset_stream(&mut self, stream: StreamId) -> Result<(), SessionError> {
         let stream = yamux_stream(stream)?;
         self.with_yamux(move |yamux| yamux.reset(stream))
+    }
+
+    /// Ends the session cleanly, queueing a Yamux `GoAway` with `code`.
+    ///
+    /// Every open substream closes, so expect a
+    /// [`SessionOutput::StreamClosed`] for each alongside the
+    /// [`SessionOutput::Write`] carrying the frame. Draining and writing that
+    /// output is the caller's job, as is closing the underlying stream
+    /// afterwards; the session neither owns it nor knows when the bytes land.
+    ///
+    /// [`SessionError::NotEstablished`] means there is no Yamux session to
+    /// shut down, so the caller should simply drop the underlying stream.
+    pub fn go_away(&mut self, code: u32) -> Result<(), SessionError> {
+        self.with_yamux(|yamux| {
+            yamux.go_away(code);
+            Ok(())
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -594,13 +622,8 @@ impl SecureMuxSession {
                         stream: StreamId::new(u64::from(stream)),
                     });
                 }
-                YamuxOutput::GoAwayReceived { code: 0 } => {
-                    return Err(SessionError::protocol("remote closed the Yamux session"));
-                }
                 YamuxOutput::GoAwayReceived { code } => {
-                    return Err(SessionError::protocol(format!(
-                        "remote closed Yamux with error code {code}"
-                    )));
+                    return Err(SessionError::GoAway { code });
                 }
             }
         }
@@ -786,7 +809,7 @@ mod tests {
         let result = dialer.handle_input(ciphertext);
 
         assert!(
-            matches!(result, Err(SessionError::Protocol(_))),
+            matches!(result, Err(SessionError::GoAway { code: 1 })),
             "a fatal remainder must fail the upgrade: {result:?}"
         );
         assert!(!dialer.is_established());
