@@ -361,6 +361,7 @@ jobs:
             minip2p-tls
             minip2p-noise
             minip2p-yamux
+            minip2p-secure-mux
             minip2p-multistream-select
             minip2p-identify
             minip2p-ping
