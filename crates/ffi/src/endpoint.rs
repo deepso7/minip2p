@@ -202,28 +202,12 @@ impl P2pEndpoint {
 
     /// Starts the detached background endpoint driver.
     pub fn start(&self, listener: Arc<dyn P2pEventListener>) -> Result<(), FfiError> {
-        let mut state = self.shared.lock_state();
-        match state.lifecycle {
-            Lifecycle::Created => {}
-            Lifecycle::Running => return Err(FfiError::AlreadyStarted),
-            Lifecycle::Stopping | Lifecycle::Stopped => return Err(FfiError::Stopped),
-        }
-
-        let shared = Arc::clone(&self.shared);
-        std::thread::Builder::new()
-            .name("minip2p-driver".into())
-            .spawn(move || crate::driver::run(shared, listener))
-            .map_err(|error| {
-                state.lifecycle = Lifecycle::Stopped;
-                state.endpoint.take();
-                self.shared.stopped_cv.notify_all();
-                FfiError::Internal {
-                    detail: format!("failed to spawn endpoint driver: {error}"),
-                }
-            })?;
-        state.lifecycle = Lifecycle::Running;
-        self.shared.driver_running.store(true, Ordering::Release);
-        Ok(())
+        self.start_with(listener, |shared, listener| {
+            std::thread::Builder::new()
+                .name("minip2p-driver".into())
+                .spawn(move || crate::driver::run(shared, listener))
+                .map(drop)
+        })
     }
 
     /// Requests shutdown without waiting for an in-flight callback.
@@ -397,6 +381,31 @@ impl P2pEndpoint {
 }
 
 impl P2pEndpoint {
+    fn start_with(
+        &self,
+        listener: Arc<dyn P2pEventListener>,
+        spawn: impl FnOnce(Arc<Shared>, Arc<dyn P2pEventListener>) -> std::io::Result<()>,
+    ) -> Result<(), FfiError> {
+        let mut state = self.shared.lock_state();
+        match state.lifecycle {
+            Lifecycle::Created => {}
+            Lifecycle::Running => return Err(FfiError::AlreadyStarted),
+            Lifecycle::Stopping | Lifecycle::Stopped => return Err(FfiError::Stopped),
+        }
+
+        let shared = Arc::clone(&self.shared);
+        spawn(shared, listener).map_err(|error| {
+            state.lifecycle = Lifecycle::Stopped;
+            state.endpoint.take();
+            self.shared.stopped_cv.notify_all();
+            FfiError::Internal {
+                detail: format!("failed to spawn endpoint driver: {error}"),
+            }
+        })?;
+        state.lifecycle = Lifecycle::Running;
+        self.shared.driver_running.store(true, Ordering::Release);
+        Ok(())
+    }
     /// Returns Rust-side background-driver diagnostics.
     ///
     /// This method is intentionally outside the UniFFI export block.
@@ -534,6 +543,7 @@ fn ensure_accepting_commands(state: &EndpointState) -> Result<(), FfiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     struct NoopListener;
 
@@ -552,6 +562,23 @@ mod tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(event);
+        }
+    }
+
+    struct DropTrackingListener {
+        callbacks: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl P2pEventListener for DropTrackingListener {
+        fn on_event(&self, _event: crate::P2pEvent) {
+            self.callbacks.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl Drop for DropTrackingListener {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
         }
     }
 
@@ -813,6 +840,98 @@ mod tests {
             endpoint.start(Arc::new(NoopListener)),
             Err(FfiError::Stopped)
         ));
+    }
+
+    #[test]
+    fn spawn_failure_stops_and_releases_endpoint() {
+        let endpoint = endpoint(config()).expect("endpoint");
+
+        let error = endpoint
+            .start_with(Arc::new(NoopListener), |_, _| {
+                Err(std::io::Error::other("injected spawn failure"))
+            })
+            .expect_err("spawn must fail");
+
+        assert!(matches!(error, FfiError::Internal { .. }));
+        assert!(endpoint.wait_stopped(0));
+        let state = endpoint.shared.lock_state();
+        assert_eq!(state.lifecycle, Lifecycle::Stopped);
+        assert!(state.endpoint.is_none());
+    }
+
+    #[test]
+    fn wait_stopped_releases_listener_before_returning() {
+        let endpoint = endpoint(config()).expect("endpoint");
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        endpoint
+            .start(Arc::new(DropTrackingListener {
+                callbacks: Arc::clone(&callbacks),
+                dropped: Arc::clone(&dropped),
+            }))
+            .expect("start");
+
+        endpoint.stop();
+        assert!(endpoint.wait_stopped(1_000));
+
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn drop_without_explicit_stop_releases_listener() {
+        let endpoint = endpoint(config()).expect("endpoint");
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        endpoint
+            .start(Arc::new(DropTrackingListener {
+                callbacks,
+                dropped: Arc::clone(&dropped),
+            }))
+            .expect("start");
+
+        drop(endpoint);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !dropped.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn concurrent_commands_queries_and_stop_complete() {
+        let endpoint = endpoint(config()).expect("endpoint");
+        endpoint.start(Arc::new(NoopListener)).expect("start");
+        let mut workers = Vec::new();
+
+        for worker in 0..4 {
+            let endpoint = Arc::clone(&endpoint);
+            workers.push(std::thread::spawn(move || {
+                for index in 0..250 {
+                    match worker {
+                        0 => {
+                            let _ = endpoint.connected_peers();
+                        }
+                        1 => endpoint.set_active(index % 2 == 0),
+                        2 => {
+                            let _ = endpoint.publish("room".into(), vec![index as u8]);
+                        }
+                        _ => {
+                            let _ = endpoint.cancel_connect(u64::MAX);
+                        }
+                    }
+                }
+            }));
+        }
+
+        std::thread::yield_now();
+        endpoint.stop();
+        for worker in workers {
+            worker.join().expect("worker must not panic");
+        }
+
+        assert!(endpoint.wait_stopped(5_000));
+        assert!(!endpoint.is_running());
     }
 
     #[test]
