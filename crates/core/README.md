@@ -20,9 +20,24 @@ This crate focuses on typed address handling and peer-qualified endpoint types.
 - `/dns/<name>`
 - `/dns4/<name>`
 - `/dns6/<name>`
+- `/tcp/<port>`
 - `/udp/<port>`
 - `/quic-v1`
 - `/p2p/<peer-id>`
+
+DNS names are validated identically by the text and binary codecs: a name may not be empty or contain `/`, whitespace, or control characters. Without that, a binary name containing `/` would print as several components and re-parse into a *different* address.
+
+## Transport classification
+
+`Multiaddr::transport_kind()` reports which base transport can dial an address, which is what a multi-transport host routes on:
+
+| Shape | `transport_kind()` |
+| --- | --- |
+| `/<host>/tcp/<port>` | `Some(TransportKind::Tcp)` |
+| `/<host>/udp/<port>/quic-v1` | `Some(TransportKind::Quic)` |
+| anything else | `None` |
+
+A trailing `/p2p/<peer-id>` makes an address a *peer* address rather than a transport address, so it classifies as `None`; strip it with `PeerAddr::transport()` first. `is_tcp_transport()` and `is_quic_transport()` answer the same question for one transport.
 
 ## Usage
 

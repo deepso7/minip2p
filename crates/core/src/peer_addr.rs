@@ -44,6 +44,16 @@ impl PeerAddr {
         Self { transport, peer_id }
     }
 
+    /// Builds the common `/ip4|ip6/<addr>/tcp/<port>/p2p/<peer-id>` shape.
+    pub fn tcp(ip: IpAddr, tcp_port: u16, peer_id: PeerId) -> Self {
+        let host = match ip {
+            IpAddr::V4(v4) => Protocol::Ip4(v4.octets()),
+            IpAddr::V6(v6) => Protocol::Ip6(v6.octets()),
+        };
+        let transport = Multiaddr::from_protocols(vec![host, Protocol::Tcp(tcp_port)]);
+        Self { transport, peer_id }
+    }
+
     /// Extracts a peer address from a multiaddr with a terminal `/p2p/<peer-id>`.
     pub fn from_multiaddr(multiaddr: &Multiaddr) -> Result<Self, PeerAddrError> {
         let protocols = multiaddr.protocols();
@@ -192,6 +202,30 @@ mod tests {
             peer_addr.to_string(),
             format!("/ip4/127.0.0.1/udp/4001/quic-v1/p2p/{PEER_ID}")
         );
+    }
+
+    #[test]
+    fn tcp_constructor_builds_peer_addrs() {
+        let peer_id = PeerId::from_str(PEER_ID).expect("peer id must parse");
+        let v4 = PeerAddr::tcp(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            4001,
+            peer_id.clone(),
+        );
+        assert_eq!(v4.transport().to_string(), "/ip4/192.0.2.1/tcp/4001");
+        assert!(v4.transport().is_tcp_transport());
+        assert_eq!(
+            v4.to_multiaddr().to_string(),
+            format!("/ip4/192.0.2.1/tcp/4001/p2p/{peer_id}")
+        );
+
+        let v6 = PeerAddr::tcp(IpAddr::V6(Ipv6Addr::LOCALHOST), 4001, peer_id);
+        assert_eq!(v6.transport().to_string(), "/ip6/::1/tcp/4001");
+        assert!(v6.transport().is_tcp_transport());
+
+        // Round-trips back out of the combined form.
+        let parsed = PeerAddr::from_multiaddr(&v6.to_multiaddr()).expect("round trip");
+        assert_eq!(parsed, v6);
     }
 
     #[test]

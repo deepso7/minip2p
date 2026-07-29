@@ -29,10 +29,7 @@ use minip2p_transport::{
 use minip2p_yamux::{FrameDecoder as YamuxFrameDecoder, YamuxRole, YamuxSession};
 
 fuzz_target!(|data: &[u8]| {
-    let _ = Multiaddr::from_bytes(data);
-    if let Ok(text) = core::str::from_utf8(data) {
-        let _ = text.parse::<Multiaddr>();
-    }
+    fuzz_multiaddr(data);
 
     fuzz_multistream(data);
     fuzz_identify(data);
@@ -205,6 +202,44 @@ impl Transport for FuzzTransport {
 
     fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {
         Ok(self.initial.take().into_iter().collect())
+    }
+}
+
+/// Drives attacker-controlled bytes through both multiaddr codecs.
+fn fuzz_multiaddr(data: &[u8]) {
+    if let Ok(addr) = Multiaddr::from_bytes(data) {
+        // Anything that decodes must re-encode and print back identically:
+        // a decoder accepting a shape the encoder cannot reproduce is a
+        // round-trip hole.
+        let reencoded = addr.to_bytes();
+        let decoded = Multiaddr::from_bytes(&reencoded).expect("re-decode own encoding");
+        assert_eq!(decoded, addr);
+
+        // The empty multiaddr is the one shape whose text form does not
+        // round-trip: `from_bytes(&[])` accepts it and it prints as "", but
+        // the text parser rejects "" as `EmptyInput`. That asymmetry predates
+        // `/tcp`; exclude it rather than assert a contract the library does
+        // not make.
+        if !addr.protocols().is_empty() {
+            let text = addr.to_string();
+            let parsed: Multiaddr = text.parse().expect("re-parse own text");
+            assert_eq!(parsed, addr);
+        }
+
+        // Classification must agree with itself whichever way it is asked.
+        match addr.transport_kind() {
+            Some(minip2p_core::TransportKind::Tcp) => assert!(addr.is_tcp_transport()),
+            Some(minip2p_core::TransportKind::Quic) => assert!(addr.is_quic_transport()),
+            None => assert!(!addr.is_tcp_transport() && !addr.is_quic_transport()),
+        }
+    }
+
+    if let Ok(addr) = core::str::from_utf8(data)
+        .map_err(|_| ())
+        .and_then(|text| text.parse::<Multiaddr>().map_err(|_| ()))
+    {
+        let _ = addr.to_bytes();
+        let _ = addr.transport_kind();
     }
 }
 
