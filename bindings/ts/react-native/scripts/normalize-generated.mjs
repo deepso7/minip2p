@@ -141,7 +141,7 @@ import android.net.wifi.WifiManager
 }
 
 function guardWaitStoppedDuringCallbacks() {
-  replaceOnce(
+  replaceRequired(
     "cpp/generated/minip2p_ffi.cpp",
     `namespace react = facebook::react;
 namespace jsi = facebook::jsi;
@@ -172,7 +172,7 @@ bool active() noexcept {
 } // namespace minip2p_callback_context
 `
   );
-  replaceOnce(
+  replaceRequired(
     "cpp/generated/minip2p_ffi.cpp",
     `        auto js_event = uniffi::minip2p_ffi::Bridging<RustBuffer>::toJs(rt, callInvoker, rs_event);
 
@@ -184,7 +184,7 @@ bool active() noexcept {
         // Now we are ready to call the callback.
 `
   );
-  replaceOnce(
+  replaceRequired(
     "cpp/generated/minip2p_ffi.cpp",
     `jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_wait_stopped(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
@@ -192,12 +192,32 @@ bool active() noexcept {
     `jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_wait_stopped(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         if (minip2p_callback_context::active()) {
             RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+            // clonePointer creates a per-call Arc handle that Rust normally consumes.
+            // This early return must release that clone without calling wait_stopped.
+            uniffi_minip2p_ffi_fn_free_p2pendpoint(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), &status);
             uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
             return uniffi_jsi::Bridging<int8_t>::toJs(rt, callInvoker, int8_t{0});
         }
         RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
 `
   );
+}
+
+function replaceRequired(relativePath, needle, replacement) {
+  const target = path.join(packageRoot, relativePath);
+  if (!existsSync(target)) {
+    throw new Error(`Required generated file is missing: ${relativePath}`);
+  }
+  const source = readFileSync(target, "utf-8");
+  if (source.includes(replacement)) {
+    return;
+  }
+  if (!source.includes(needle)) {
+    throw new Error(
+      `Required generated patch no longer matches ${relativePath}; update normalize-generated.mjs for the current generator output`
+    );
+  }
+  writeFileSync(target, source.replace(needle, replacement));
 }
 
 function replaceOnce(relativePath, needle, replacement) {

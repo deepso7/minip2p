@@ -3,6 +3,7 @@
 import type { MiniP2pBackend } from "./backend.js";
 import {
   ClosedError,
+  ConnectCancelledError,
   DriverFailedError,
   PeerDisconnectedError,
   TimeoutError,
@@ -26,6 +27,8 @@ declare const TextEncoder: new () => {
 
 const QUEUE_CAP = 4096;
 const FLUSH_BATCH = 256;
+const CONNECT_RESULT_CAP = 1024;
+const CANCELLED_CONNECT_CAP = 1024;
 const REPLACEABLE_EVENTS = new Set<P2pEvent_Tags>([
   P2pEvent_Tags.ReachabilityChanged,
   P2pEvent_Tags.PublicAddressesChanged,
@@ -33,6 +36,7 @@ const REPLACEABLE_EVENTS = new Set<P2pEvent_Tags>([
 
 type EventHandler = (event: MiniP2pEvent) => void;
 interface Waiter {
+  connectId?: number;
   predicate: (event: MiniP2pEvent) => boolean;
   resolve: (event: MiniP2pEvent) => void;
   reject: (error: Error) => void;
@@ -179,6 +183,7 @@ export class MiniP2pBase {
     | P2pEventByTag<P2pEvent_Tags.PathEstablished>
     | P2pEventByTag<P2pEvent_Tags.ConnectFailed>
   >();
+  readonly #cancelledConnectIds = new Set<number>();
   #overflowDropped = 0;
   #flushScheduled = false;
   #closed = false;
@@ -225,11 +230,29 @@ export class MiniP2pBase {
     predicate: (event: MiniP2pEvent) => boolean,
     timeoutMs = 65_000
   ): Promise<MiniP2pEvent> {
+    return this.#waitFor(predicate, timeoutMs);
+  }
+
+  #waitFor<EventType extends MiniP2pEvent>(
+    predicate: (event: MiniP2pEvent) => event is EventType,
+    timeoutMs: number,
+    connectId?: number
+  ): Promise<EventType>;
+  #waitFor(
+    predicate: (event: MiniP2pEvent) => boolean,
+    timeoutMs: number,
+    connectId?: number
+  ): Promise<MiniP2pEvent>;
+  #waitFor(
+    predicate: (event: MiniP2pEvent) => boolean,
+    timeoutMs: number,
+    connectId?: number
+  ): Promise<MiniP2pEvent> {
     this.#assertOpen();
     assertSafeUnsignedInteger(timeoutMs, "timeoutMs");
 
     return new Promise((resolve, reject) => {
-      const waiter: Waiter = { predicate, reject, resolve };
+      const waiter: Waiter = { connectId, predicate, reject, resolve };
       if (timeoutMs > 0) {
         waiter.timer = setTimeout(() => {
           this.#waiters.delete(waiter);
@@ -248,6 +271,7 @@ export class MiniP2pBase {
     this.#closed = true;
     this.#queue.clear();
     this.#connectResults.clear();
+    this.#cancelledConnectIds.clear();
     this.#overflowDropped = 0;
     this.#handlers.clear();
     for (const waiter of this.#waiters) {
@@ -365,7 +389,7 @@ export class MiniP2pBase {
     peerId: string,
     timeoutMs = 65_000
   ): Promise<P2pEventByTag<P2pEvent_Tags.PeerReady>> {
-    const info = this.peerInfo(peerId);
+    const info = this.isPeerReady(peerId) ? this.peerInfo(peerId) : undefined;
     if (info !== undefined) {
       return Promise.resolve({
         inner: { peerId, protocols: info.protocols },
@@ -381,7 +405,9 @@ export class MiniP2pBase {
         "tag" in event &&
         (event.tag === P2pEvent_Tags.PeerReady ||
           event.tag === P2pEvent_Tags.ConnectionClosed) &&
-        event.inner.peerId === peerId,
+        event.inner.peerId === peerId &&
+        (event.tag === P2pEvent_Tags.PeerReady ||
+          !this.#backend.connectedPeers().includes(peerId)),
       timeoutMs
     ).then((event) => {
       if (event.tag === P2pEvent_Tags.ConnectionClosed) {
@@ -467,11 +493,15 @@ export class MiniP2pBase {
   > {
     assertSafeUnsignedInteger(connectId, "connectId");
     this.#assertOpen();
+    if (this.#cancelledConnectIds.has(connectId)) {
+      return Promise.reject(new ConnectCancelledError(connectId));
+    }
     const result = this.#connectResults.get(connectId);
     if (result !== undefined) {
+      this.#connectResults.delete(connectId);
       return Promise.resolve(result);
     }
-    return this.waitFor(
+    return this.#waitFor(
       (
         event
       ): event is
@@ -481,7 +511,8 @@ export class MiniP2pBase {
         (event.tag === P2pEvent_Tags.PathEstablished ||
           event.tag === P2pEvent_Tags.ConnectFailed) &&
         event.inner.connectId === connectId,
-      timeoutMs
+      timeoutMs,
+      connectId
     );
   }
 
@@ -514,6 +545,16 @@ export class MiniP2pBase {
     this.#assertOpen();
     assertSafeUnsignedInteger(id, "connectId");
     this.#backend.cancelConnect(id);
+    this.#connectResults.delete(id);
+    rememberBoundedSet(this.#cancelledConnectIds, id, CANCELLED_CONNECT_CAP);
+    for (const waiter of [...this.#waiters]) {
+      if (waiter.connectId !== id) {
+        continue;
+      }
+      this.#waiters.delete(waiter);
+      clearWaiterTimer(waiter);
+      waiter.reject(new ConnectCancelledError(id));
+    }
   }
 
   /** Closes an established connection to a peer. */
@@ -586,7 +627,15 @@ export class MiniP2pBase {
       (event.tag === P2pEvent_Tags.PathEstablished ||
         event.tag === P2pEvent_Tags.ConnectFailed)
     ) {
-      this.#connectResults.set(event.inner.connectId, event);
+      if (this.#cancelledConnectIds.has(event.inner.connectId)) {
+        return;
+      }
+      rememberBoundedMap(
+        this.#connectResults,
+        event.inner.connectId,
+        event,
+        CONNECT_RESULT_CAP
+      );
     }
 
     if ("tag" in event && event.tag === P2pEvent_Tags.DriverFailed) {
@@ -607,6 +656,9 @@ export class MiniP2pBase {
       if (matched) {
         this.#waiters.delete(waiter);
         clearWaiterTimer(waiter);
+        if (waiter.connectId !== undefined) {
+          this.#connectResults.delete(waiter.connectId);
+        }
         waiter.resolve(event);
       }
     }
@@ -624,6 +676,7 @@ export class MiniP2pBase {
     this.#closed = true;
     this.#queue.clear();
     this.#connectResults.clear();
+    this.#cancelledConnectIds.clear();
     this.#overflowDropped = 0;
     const handlers = [...this.#handlers];
     this.#handlers.clear();
@@ -642,6 +695,37 @@ export class MiniP2pBase {
       }
     }
     this.#backend.close();
+  }
+}
+
+function rememberBoundedMap<Value>(
+  map: Map<number, Value>,
+  key: number,
+  value: Value,
+  capacity: number
+): void {
+  map.delete(key);
+  map.set(key, value);
+  if (map.size > capacity) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) {
+      map.delete(oldest);
+    }
+  }
+}
+
+function rememberBoundedSet(
+  set: Set<number>,
+  value: number,
+  capacity: number
+): void {
+  set.delete(value);
+  set.add(value);
+  if (set.size > capacity) {
+    const oldest = set.values().next().value;
+    if (oldest !== undefined) {
+      set.delete(oldest);
+    }
   }
 }
 

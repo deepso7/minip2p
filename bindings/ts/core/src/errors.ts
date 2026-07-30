@@ -42,6 +42,17 @@ export class ClosedError extends Error {
   }
 }
 
+/** A connection-result wait was cancelled by the host. */
+export class ConnectCancelledError extends Error {
+  readonly connectId: number;
+
+  constructor(connectId: number) {
+    super(`Connection attempt ${connectId} was cancelled`);
+    this.name = "ConnectCancelledError";
+    this.connectId = connectId;
+  }
+}
+
 /** The native background driver terminated with a fatal failure. */
 export class DriverFailedError extends Error {
   readonly kind: DriverFailureKind;

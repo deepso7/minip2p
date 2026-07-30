@@ -9,6 +9,7 @@ if (ndk === undefined) {
   throw new Error("ANDROID_NDK_HOME is required");
 }
 
+const packageRoot = path.resolve(import.meta.dirname, "..");
 const readelf = path.join(
   ndk,
   "toolchains",
@@ -21,6 +22,7 @@ const readelf = path.join(
 const libraries = ["arm64-v8a", "x86_64"].map((abi) => ({
   abi,
   path: path.join(
+    packageRoot,
     "android",
     "src",
     "main",

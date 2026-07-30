@@ -1,6 +1,7 @@
 export {
   BackpressureError,
   ClosedError,
+  ConnectCancelledError,
   DriverFailedError,
   MessageTooLargeError,
   NotPermittedError,

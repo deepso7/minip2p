@@ -6,6 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import {
   ClosedError,
+  ConnectCancelledError,
   DriverFailedError,
   DriverFailureKind,
   MiniP2pBase,
@@ -13,6 +14,7 @@ import {
   P2pEvent_Tags,
   PathKind_Tags,
   PeerDisconnectedError,
+  TimeoutError,
 } from "../dist/index.js";
 
 class MockBackend {
@@ -20,6 +22,7 @@ class MockBackend {
   closed = false;
   published;
   reservation;
+  streamCalls = [];
 
   start(listener) {
     this.listener = listener;
@@ -106,13 +109,26 @@ class MockBackend {
     return 3;
   }
 
-  sendStream() {}
+  sendStream(peerId, streamId, data) {
+    this.streamCalls.push({
+      data: [...data],
+      operation: "send",
+      peerId,
+      streamId,
+    });
+  }
 
-  closeStreamWrite() {}
+  closeStreamWrite(peerId, streamId) {
+    this.streamCalls.push({ operation: "closeWrite", peerId, streamId });
+  }
 
-  resetStream() {}
+  resetStream(peerId, streamId) {
+    this.streamCalls.push({ operation: "reset", peerId, streamId });
+  }
 
-  abandonStream() {}
+  abandonStream(peerId, streamId) {
+    this.streamCalls.push({ operation: "abandon", peerId, streamId });
+  }
 
   connect() {
     return 1;
@@ -225,6 +241,46 @@ test("typed waits, identify queries, and streams use the shared backend", async 
   endpoint.closeStreamWrite("peer", 3);
   endpoint.resetStream("peer", 3);
   endpoint.abandonStream("peer", 3);
+  assert.deepEqual(backend.streamCalls, [
+    {
+      data: [104, 101, 108, 108, 111],
+      operation: "send",
+      peerId: "peer",
+      streamId: 3,
+    },
+    { operation: "closeWrite", peerId: "peer", streamId: 3 },
+    { operation: "reset", peerId: "peer", streamId: 3 },
+    { operation: "abandon", peerId: "peer", streamId: 3 },
+  ]);
+  endpoint.close();
+});
+
+test("waitPeerReady ignores stale Identify snapshots", async () => {
+  const backend = new MockBackend();
+  backend.isPeerReady = () => false;
+  backend.peerInfo = () => ({
+    listenAddrs: ["/ip4/127.0.0.1/udp/1/quic-v1"],
+    protocols: ["/stale/1"],
+  });
+  const endpoint = new TestMiniP2p(backend);
+  await Promise.resolve();
+  const waiting = endpoint.waitPeerReady("peer", 1000);
+  let settled = false;
+  const observation = (async () => {
+    const ready = await waiting;
+    settled = true;
+    return ready;
+  })();
+
+  await Promise.resolve();
+  assert.equal(settled, false);
+  backend.emit({
+    inner: { peerId: "peer", protocols: ["/current/1"] },
+    tag: P2pEvent_Tags.PeerReady,
+  });
+
+  const ready = await observation;
+  assert.deepEqual(ready.inner.protocols, ["/current/1"]);
   endpoint.close();
 });
 
@@ -240,6 +296,27 @@ test("waitPeerReady rejects when the peer disconnects first", async () => {
   });
 
   await assert.rejects(waiting, PeerDisconnectedError);
+  endpoint.close();
+});
+
+test("waitPeerReady survives a superseded connection closing", async () => {
+  const backend = new MockBackend();
+  backend.connectedPeers = () => ["remote-peer"];
+  const endpoint = new TestMiniP2p(backend);
+  await Promise.resolve();
+  const waiting = endpoint.waitPeerReady("remote-peer", 1000);
+
+  backend.emit({
+    inner: { connId: 7, peerId: "remote-peer" },
+    tag: P2pEvent_Tags.ConnectionClosed,
+  });
+  backend.emit({
+    inner: { peerId: "remote-peer", protocols: ["/replacement/1"] },
+    tag: P2pEvent_Tags.PeerReady,
+  });
+
+  const ready = await waiting;
+  assert.deepEqual(ready.inner.protocols, ["/replacement/1"]);
   endpoint.close();
 });
 
@@ -272,6 +349,67 @@ test("connection terminal events remain available to late waiters", async () => 
   const failure = await endpoint.waitConnectResult(43, 0);
   assert.equal(failure.tag, P2pEvent_Tags.ConnectFailed);
   assert.equal(failure.inner.detail, "no usable path");
+  endpoint.close();
+});
+
+test("cancelConnect rejects its pending result wait and suppresses queued terminals", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMiniP2p(backend);
+  await Promise.resolve();
+  const waiting = endpoint.waitConnectResult(42, 0);
+
+  backend.emit({
+    inner: {
+      connectId: 42,
+      path: { tag: PathKind_Tags.DirectDialed },
+      peerId: "remote-peer",
+    },
+    tag: P2pEvent_Tags.PathEstablished,
+  });
+  endpoint.cancelConnect(42);
+
+  await assert.rejects(
+    waiting,
+    (error) =>
+      error instanceof ConnectCancelledError &&
+      error.connectId === 42 &&
+      error.message === "Connection attempt 42 was cancelled"
+  );
+  await assert.rejects(
+    endpoint.waitConnectResult(42, 0),
+    ConnectCancelledError
+  );
+  endpoint.close();
+});
+
+test("cached connection results are consumed and bounded", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMiniP2p(backend);
+  await Promise.resolve();
+  let delivered = 0;
+  endpoint.on((event) => {
+    if ("tag" in event && event.tag === P2pEvent_Tags.ConnectFailed) {
+      delivered += 1;
+    }
+  });
+
+  for (let connectId = 0; connectId <= 1024; connectId += 1) {
+    backend.emit({
+      inner: {
+        connectId,
+        detail: "no usable path",
+        kind: NatErrorKind.NoPathAvailable,
+        peerId: "remote-peer",
+      },
+      tag: P2pEvent_Tags.ConnectFailed,
+    });
+  }
+  await waitUntil(() => delivered === 1025);
+
+  const latest = await endpoint.waitConnectResult(1024, 0);
+  assert.equal(latest.inner.connectId, 1024);
+  await assert.rejects(endpoint.waitConnectResult(1024, 10), TimeoutError);
+  await assert.rejects(endpoint.waitConnectResult(0, 10), TimeoutError);
   endpoint.close();
 });
 

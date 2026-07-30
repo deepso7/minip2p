@@ -52,6 +52,8 @@ bindings-check:
     cd bindings/ts && pnpm test
     cd bindings/ts && pnpm lint
     cd bindings/ts && pnpm build
+    cd bindings/ts && pnpm rn:generate
+    test -z "$(git status --porcelain)"
 
 bindings-format:
     cd bindings/ts && pnpm format

@@ -1,4 +1,4 @@
-/* oxlint-disable func-style, no-use-before-define, promise/avoid-new, unicorn/no-array-sort -- The executable smoke suite uses hoisted test helpers, Promise adapters for event waits and delays, and sorts a fresh latency sample in place. */
+/* oxlint-disable func-style, no-await-in-loop, no-use-before-define, promise/avoid-new, unicorn/no-array-sort -- The executable smoke suite uses sequential native lifecycle checks, hoisted test helpers, Promise adapters for event waits and delays, and sorts a fresh latency sample in place. */
 
 import {
   DiscoverySource,
@@ -26,6 +26,9 @@ const WAIT_MS = 10_000;
 const MDNS_WAIT_MS = 20_000;
 const LARGE_PAYLOAD_BYTES = 60 * 1024;
 const CYCLE_COUNT = 50;
+// This is a smoke-regression gate based on the concurrency spike, not an API
+// latency guarantee.
+const MAX_SYNC_CALL_LATENCY_MS = 50;
 
 export interface SmokeResult {
   readonly name: string;
@@ -212,16 +215,21 @@ export async function runSmokeSuite(
     await delay(650);
     const foregroundSignal = elapsed(() => first?.setActive(true));
     const foregroundQuery = elapsed(() => first?.connectedPeers());
-    report({
-      detail:
-        `active p50=${percentile(activeSamples, 0.5).toFixed(1)}ms ` +
-        `p95=${percentile(activeSamples, 0.95).toFixed(1)}ms; ` +
+    const activeP95 = percentile(activeSamples, 0.95);
+    check(
+      activeP95 <= MAX_SYNC_CALL_LATENCY_MS &&
+        idleQuery <= MAX_SYNC_CALL_LATENCY_MS &&
+        foregroundSignal <= MAX_SYNC_CALL_LATENCY_MS &&
+        foregroundQuery <= MAX_SYNC_CALL_LATENCY_MS,
+      "contention-latency",
+      `active p50=${percentile(activeSamples, 0.5).toFixed(1)}ms ` +
+        `p95=${activeP95.toFixed(1)}ms; ` +
         `idle=${idleQuery.toFixed(1)}ms; setActive=${foregroundSignal.toFixed(
           1
-        )}ms; next=${foregroundQuery.toFixed(1)}ms`,
-      name: "contention-latency",
-      passed: true,
-    });
+        )}ms; next=${foregroundQuery.toFixed(1)}ms; ` +
+        `budget=${MAX_SYNC_CALL_LATENCY_MS}ms`,
+      report
+    );
 
     let closedDuringCallback = false;
     const closeObserved = new Promise<void>((resolve) => {
@@ -253,15 +261,27 @@ export async function runSmokeSuite(
 
     await runMdnsDiscoveryCheck(report, liveEndpoints);
 
+    let endpoint = createEndpoint(liveEndpoints);
+    let reboundCycles = 0;
     for (let cycle = 0; cycle < CYCLE_COUNT; cycle += 1) {
-      const endpoint = createEndpoint(liveEndpoints);
+      const releasedAddr = transportAddress(
+        endpoint.listenAddrs()[0] as string
+      );
       endpoint.close();
       liveEndpoints.delete(endpoint);
+      endpoint = await createEndpointAtAddress(
+        liveEndpoints,
+        releasedAddr,
+        WAIT_MS
+      );
+      reboundCycles += 1;
     }
+    endpoint.close();
+    liveEndpoints.delete(endpoint);
     check(
-      true,
+      reboundCycles === CYCLE_COUNT,
       "create-close-cycles",
-      `${CYCLE_COUNT} consecutive cycles completed`,
+      `${reboundCycles} cycles released and rebound the same native UDP socket`,
       report
     );
 
@@ -271,7 +291,12 @@ export async function runSmokeSuite(
     liveEndpoints.delete(fourth);
     third.close();
     liveEndpoints.delete(third);
-    check(true, "reverse-close-order", "second endpoint closed first", report);
+    check(
+      !third.isRunning() && !fourth.isRunning(),
+      "reverse-close-order",
+      "second endpoint closed first and both stopped",
+      report
+    );
   } finally {
     if (first !== undefined) {
       first.close();
@@ -284,12 +309,15 @@ export async function runSmokeSuite(
   }
 }
 
-function createEndpoint(liveEndpoints: Set<MiniP2p>): MiniP2p {
+function createEndpoint(
+  liveEndpoints: Set<MiniP2p>,
+  listenAddr = "/ip4/127.0.0.1/udp/0/quic-v1"
+): MiniP2p {
   const config: MiniP2pConfig = {
     agentVersion: "minip2p-react-native-smoke",
     allowUnsigned: false,
     forceRelay: false,
-    listenAddr: "/ip4/127.0.0.1/udp/0/quic-v1",
+    listenAddr,
     protocols: [STREAM_PROTOCOL],
     relays: [],
     secretKey: generateSecretKey(),
@@ -297,6 +325,34 @@ function createEndpoint(liveEndpoints: Set<MiniP2p>): MiniP2p {
   const endpoint = MiniP2p.create(config);
   liveEndpoints.add(endpoint);
   return endpoint;
+}
+
+async function createEndpointAtAddress(
+  liveEndpoints: Set<MiniP2p>,
+  listenAddr: string,
+  timeoutMs: number
+): Promise<MiniP2p> {
+  const deadline = performance.now() + timeoutMs;
+  let lastError: unknown;
+  while (performance.now() < deadline) {
+    try {
+      return createEndpoint(liveEndpoints, listenAddr);
+    } catch (error) {
+      lastError = error;
+      await delay(10);
+    }
+  }
+  throw new Error(
+    `native socket was not released for ${listenAddr}: ${String(lastError)}`
+  );
+}
+
+function transportAddress(peerAddress: string): string {
+  const peerSuffix = peerAddress.lastIndexOf("/p2p/");
+  if (peerSuffix === -1) {
+    throw new Error(`listen address has no peer ID: ${peerAddress}`);
+  }
+  return peerAddress.slice(0, peerSuffix);
 }
 
 async function runMdnsDiscoveryCheck(

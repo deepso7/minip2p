@@ -3659,6 +3659,9 @@ jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_unsubs
 jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_wait_stopped(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         if (minip2p_callback_context::active()) {
             RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+            // clonePointer creates a per-call Arc handle that Rust normally consumes.
+            // This early return must release that clone without calling wait_stopped.
+            uniffi_minip2p_ffi_fn_free_p2pendpoint(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), &status);
             uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
             return uniffi_jsi::Bridging<int8_t>::toJs(rt, callInvoker, int8_t{0});
         }
