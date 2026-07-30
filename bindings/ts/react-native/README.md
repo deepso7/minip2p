@@ -92,7 +92,7 @@ The pnpm patch in `patches/` fixes two ubrn 0.31 Android generator issues: packa
 
 Native binaries are build outputs and are not committed: `android/src/main/jniLibs/` and `build/*.xcframework`. Release packaging must run both native builds first; `pnpm pack` includes the resulting Android libraries and `build/Minip2pFfi.xcframework`.
 
-Per-PR CI checks the frozen pnpm install, types, Ultracite's Oxlint/Oxfmt rules, package build, and a whole-worktree regeneration diff. A weekly and manually dispatchable native workflow builds both Android ABIs and both iOS slices, validates Android 16 KiB ELF/APK alignment and allocator-hook visibility, checks the XCFramework slices, and uploads the artifacts. Native sizes are compared with `native-size-baseline.json`; growth over 20% emits a warning rather than failing the build.
+Per-PR CI checks the frozen pnpm install, types, Ultracite's Oxlint/Oxfmt rules, package build, and a whole-worktree regeneration diff. A weekly and manually dispatchable native workflow builds both Android ABIs and both iOS slices, validates Android 16 KiB ELF/APK alignment and requires the allocator-hook symbols to be either optimized away or exactly three defined `LOCAL OBJECT` symbols, checks the XCFramework slices, and uploads the artifacts. Native sizes are compared with `native-size-baseline.json`; growth over 20% emits a warning rather than failing the build.
 
 ## Example development build
 

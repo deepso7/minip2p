@@ -83,7 +83,7 @@ Language bindings:
 - `bindings/ts/core` (`@minip2p/core`): platform-neutral TypeScript SDK,
   public types, errors, event buffering, waits, and the native backend
   contract.
-- `bindings/ts/react-native` (`react-native-minip2p`): UniFFI + TurboModule
+- `bindings/ts/react-native` (`@minip2p/react-native`): UniFFI + TurboModule
   implementation of the TypeScript backend, with an Expo development-build
   example.
 - `bindings/ts/node` (`@minip2p/node`): napi-rs adapter scaffold. It remains
