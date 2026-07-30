@@ -5,7 +5,13 @@
   "keywords": [
     "android",
     "ios",
-    "react-native"
+    "libp2p",
+    "p2p",
+    "peer-to-peer",
+    "quic",
+    "react-native",
+    "rust",
+    "uniffi"
   ],
   "homepage": "https://github.com/deepso7/minip2p#readme",
   "bugs": {
