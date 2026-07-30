@@ -1231,6 +1231,7 @@ dependencies = [
  "minip2p-platform",
  "minip2p-secure-mux",
  "minip2p-transport",
+ "mio",
  "thiserror",
 ]
 

@@ -16,6 +16,7 @@ workspace = true
 [features]
 default = ["std"]
 std = [
+    "dep:mio",
     "minip2p-core/std",
     "minip2p-identity/std",
     "minip2p-platform/std",
@@ -30,6 +31,7 @@ minip2p-identity = { path = "../../crates/identity", version = "0.2.0", default-
 minip2p-platform = { path = "../../crates/platform", version = "0.2.0", default-features = false }
 minip2p-secure-mux = { path = "../../crates/secure-mux", version = "0.2.0", default-features = false }
 minip2p-transport = { path = "../../crates/transport", version = "0.2.0", default-features = false }
+mio = { version = "1.0", features = ["net", "os-poll"], optional = true }
 thiserror = { version = "2.0.18", default-features = false }
 
 [dev-dependencies]

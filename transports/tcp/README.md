@@ -16,6 +16,17 @@ That split is the point: the same transport runs on hosted sockets and on an
 embedded network stack, and only the provider changes. `no_std + alloc`; disable
 default features and supply a provider and an `EntropySource`.
 
+## Providers
+
+`StdTcpProvider` is the hosted one: OS sockets driven by `mio`, `/dns*`
+resolution, and a real readiness wait. Implementing `BlockingTcpProvider` is
+what makes `TcpTransport` a `BlockingTransport`, so an idle driver parks on the
+sockets rather than polling on a timer. It needs the `std` feature (on by
+default).
+
+Embedded hosts implement `TcpProvider` over their own stack. Nothing above the
+seam changes.
+
 ## Writing a provider
 
 A provider hands out ordered, reliable byte streams and reports what it observed

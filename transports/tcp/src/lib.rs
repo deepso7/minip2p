@@ -14,6 +14,15 @@
 //!
 //! [`TransportEvent`]: minip2p_transport::TransportEvent
 //!
+//! # Providers
+//!
+//! [`StdTcpProvider`] is the hosted one: operating-system sockets driven by
+//! `mio`, with `/dns*` resolution and a real readiness wait, which makes
+//! [`TcpTransport`] a [`BlockingTransport`](minip2p_transport::BlockingTransport)
+//! so an idle driver sleeps instead of spinning. It needs the `std` feature.
+//! Embedded hosts implement [`TcpProvider`] over their own stack; nothing above
+//! the seam changes.
+//!
 //! # Backpressure
 //!
 //! A session produces bytes whether or not the socket will take them, so the
@@ -43,10 +52,18 @@
 
 extern crate alloc;
 
+#[cfg(feature = "std")]
+mod blocking;
 mod config;
 mod provider;
+#[cfg(feature = "std")]
+mod std_provider;
 mod transport;
 
+#[cfg(feature = "std")]
+pub use blocking::BlockingTcpProvider;
 pub use config::TcpConfig;
 pub use provider::{SocketHandle, TcpError, TcpEvent, TcpProvider};
+#[cfg(feature = "std")]
+pub use std_provider::StdTcpProvider;
 pub use transport::TcpTransport;
