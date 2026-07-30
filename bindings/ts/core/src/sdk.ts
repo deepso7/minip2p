@@ -1,7 +1,12 @@
-/* oxlint-disable func-style, no-use-before-define, promise/avoid-new, promise/prefer-await-to-then, unicorn/no-useless-spread -- The SDK uses hoisted helpers and Promise adapters, schedules same-tick events on a microtask, and snapshots observer sets before callbacks mutate them. */
+/* oxlint-disable func-style, max-classes-per-file, no-use-before-define, promise/avoid-new, promise/prefer-await-to-then, unicorn/no-useless-spread -- The SDK uses a private queue class, hoisted helpers and Promise adapters, schedules same-tick events on a microtask, and snapshots observer sets before callbacks mutate them. */
 
 import type { MiniP2pBackend } from "./backend.js";
-import { ClosedError, TimeoutError } from "./errors.js";
+import {
+  ClosedError,
+  DriverFailedError,
+  PeerDisconnectedError,
+  TimeoutError,
+} from "./errors.js";
 import { P2pEvent_Tags } from "./types.js";
 import type {
   Bytes,
@@ -34,6 +39,129 @@ interface Waiter {
   timer?: ReturnType<typeof setTimeout>;
 }
 
+interface EventNode {
+  readonly event: P2pEvent;
+  previous?: EventNode;
+  next?: EventNode;
+}
+
+/**
+ * A bounded FIFO with constant-time front removal and payload eviction.
+ *
+ * Replaceable-event indexes let overflow compaction visit only candidates
+ * that can actually be discarded rather than rebuilding the entire queue.
+ */
+class EventQueue {
+  readonly #payloads = new Set<EventNode>();
+  readonly #replaceable = new Map<P2pEvent_Tags, Set<EventNode>>();
+  #head?: EventNode;
+  #tail?: EventNode;
+  #size = 0;
+
+  get size(): number {
+    return this.#size;
+  }
+
+  clear(): void {
+    this.#head = undefined;
+    this.#tail = undefined;
+    this.#size = 0;
+    this.#payloads.clear();
+    this.#replaceable.clear();
+  }
+
+  push(event: P2pEvent): number {
+    let dropped = 0;
+    if (this.#size >= QUEUE_CAP) {
+      dropped += this.#compactReplaceable();
+    }
+    if (this.#size >= QUEUE_CAP) {
+      const payload = this.#payloads.values().next().value;
+      if (payload === undefined) {
+        this.shift();
+      } else {
+        this.#remove(payload);
+      }
+      dropped += 1;
+    }
+
+    const node: EventNode = { event, previous: this.#tail };
+    if (this.#tail === undefined) {
+      this.#head = node;
+    } else {
+      this.#tail.next = node;
+    }
+    this.#tail = node;
+    this.#size += 1;
+    this.#index(node);
+    return dropped;
+  }
+
+  shift(): P2pEvent | undefined {
+    const node = this.#head;
+    if (node === undefined) {
+      return undefined;
+    }
+    this.#remove(node);
+    return node.event;
+  }
+
+  #compactReplaceable(): number {
+    let dropped = 0;
+    for (const nodes of this.#replaceable.values()) {
+      if (nodes.size < 2) {
+        continue;
+      }
+      const latest = [...nodes].at(-1);
+      for (const node of [...nodes]) {
+        if (node !== latest) {
+          this.#remove(node);
+          dropped += 1;
+        }
+      }
+    }
+    return dropped;
+  }
+
+  #index(node: EventNode): void {
+    if (
+      node.event.tag === P2pEvent_Tags.Message ||
+      node.event.tag === P2pEvent_Tags.StreamData
+    ) {
+      this.#payloads.add(node);
+    }
+    if (REPLACEABLE_EVENTS.has(node.event.tag)) {
+      let nodes = this.#replaceable.get(node.event.tag);
+      if (nodes === undefined) {
+        nodes = new Set();
+        this.#replaceable.set(node.event.tag, nodes);
+      }
+      nodes.add(node);
+    }
+  }
+
+  #remove(node: EventNode): void {
+    if (node.previous === undefined) {
+      this.#head = node.next;
+    } else {
+      node.previous.next = node.next;
+    }
+    if (node.next === undefined) {
+      this.#tail = node.previous;
+    } else {
+      node.next.previous = node.previous;
+    }
+
+    this.#payloads.delete(node);
+    const replaceable = this.#replaceable.get(node.event.tag);
+    replaceable?.delete(node);
+    if (replaceable?.size === 0) {
+      this.#replaceable.delete(node.event.tag);
+    }
+    this.#size -= 1;
+  }
+}
+
 /**
  * Platform-neutral owner for one native minip2p endpoint.
  *
@@ -45,7 +173,12 @@ export class MiniP2pBase {
   readonly #relayAddrs: readonly string[];
   readonly #handlers = new Set<EventHandler>();
   readonly #waiters = new Set<Waiter>();
-  readonly #queue: P2pEvent[] = [];
+  readonly #queue = new EventQueue();
+  readonly #connectResults = new Map<
+    number,
+    | P2pEventByTag<P2pEvent_Tags.PathEstablished>
+    | P2pEventByTag<P2pEvent_Tags.ConnectFailed>
+  >();
   #overflowDropped = 0;
   #flushScheduled = false;
   #closed = false;
@@ -113,7 +246,8 @@ export class MiniP2pBase {
       return;
     }
     this.#closed = true;
-    this.#queue.length = 0;
+    this.#queue.clear();
+    this.#connectResults.clear();
     this.#overflowDropped = 0;
     this.#handlers.clear();
     for (const waiter of this.#waiters) {
@@ -239,12 +373,22 @@ export class MiniP2pBase {
       });
     }
     return this.waitFor(
-      (event): event is P2pEventByTag<P2pEvent_Tags.PeerReady> =>
+      (
+        event
+      ): event is
+        | P2pEventByTag<P2pEvent_Tags.PeerReady>
+        | P2pEventByTag<P2pEvent_Tags.ConnectionClosed> =>
         "tag" in event &&
-        event.tag === P2pEvent_Tags.PeerReady &&
+        (event.tag === P2pEvent_Tags.PeerReady ||
+          event.tag === P2pEvent_Tags.ConnectionClosed) &&
         event.inner.peerId === peerId,
       timeoutMs
-    );
+    ).then((event) => {
+      if (event.tag === P2pEvent_Tags.ConnectionClosed) {
+        throw new PeerDisconnectedError(peerId);
+      }
+      return event;
+    });
   }
 
   /** Waits for the next explicit or keepalive ping RTT for `peerId`. */
@@ -322,6 +466,11 @@ export class MiniP2pBase {
     | P2pEventByTag<P2pEvent_Tags.ConnectFailed>
   > {
     assertSafeUnsignedInteger(connectId, "connectId");
+    this.#assertOpen();
+    const result = this.#connectResults.get(connectId);
+    if (result !== undefined) {
+      return Promise.resolve(result);
+    }
     return this.waitFor(
       (
         event
@@ -383,46 +532,8 @@ export class MiniP2pBase {
     if (this.#closed) {
       return;
     }
-    if (this.#queue.length >= QUEUE_CAP) {
-      this.#compactReplaceableEvents();
-    }
-    if (this.#queue.length >= QUEUE_CAP) {
-      const payloadIndex = this.#queue.findIndex(
-        (queued) =>
-          queued.tag === P2pEvent_Tags.Message ||
-          queued.tag === P2pEvent_Tags.StreamData
-      );
-      if (payloadIndex === -1) {
-        this.#queue.shift();
-      } else {
-        this.#queue.splice(payloadIndex, 1);
-      }
-      this.#overflowDropped += 1;
-    }
-    this.#queue.push(event);
+    this.#overflowDropped += this.#queue.push(event);
     this.#scheduleFlush();
-  }
-
-  #compactReplaceableEvents(): void {
-    const latest = new Set<P2pEvent_Tags>();
-    const compacted: P2pEvent[] = [];
-    for (let index = this.#queue.length - 1; index >= 0; index -= 1) {
-      const event = this.#queue[index];
-      if (event === undefined) {
-        continue;
-      }
-      if (REPLACEABLE_EVENTS.has(event.tag)) {
-        if (latest.has(event.tag)) {
-          this.#overflowDropped += 1;
-          continue;
-        }
-        latest.add(event.tag);
-      }
-      compacted.push(event);
-    }
-    compacted.reverse();
-    this.#queue.length = 0;
-    this.#queue.push(...compacted);
   }
 
   #scheduleFlush(): void {
@@ -461,7 +572,7 @@ export class MiniP2pBase {
       }
     }
 
-    if (this.#queue.length > 0 || this.#overflowDropped > 0) {
+    if (this.#queue.size > 0 || this.#overflowDropped > 0) {
       this.#flushScheduled = true;
       setTimeout(() => {
         this.#flush();
@@ -470,12 +581,17 @@ export class MiniP2pBase {
   }
 
   #dispatch(event: MiniP2pEvent): void {
-    for (const handler of [...this.#handlers]) {
-      try {
-        handler(event);
-      } catch {
-        // One host handler cannot interrupt fan-out or unwind into Rust.
-      }
+    if (
+      "tag" in event &&
+      (event.tag === P2pEvent_Tags.PathEstablished ||
+        event.tag === P2pEvent_Tags.ConnectFailed)
+    ) {
+      this.#connectResults.set(event.inner.connectId, event);
+    }
+
+    if ("tag" in event && event.tag === P2pEvent_Tags.DriverFailed) {
+      this.#terminateDriver(event);
+      return;
     }
 
     for (const waiter of [...this.#waiters]) {
@@ -494,6 +610,38 @@ export class MiniP2pBase {
         waiter.resolve(event);
       }
     }
+
+    for (const handler of [...this.#handlers]) {
+      try {
+        handler(event);
+      } catch {
+        // One host handler cannot interrupt fan-out or unwind into Rust.
+      }
+    }
+  }
+
+  #terminateDriver(event: P2pEventByTag<P2pEvent_Tags.DriverFailed>): void {
+    this.#closed = true;
+    this.#queue.clear();
+    this.#connectResults.clear();
+    this.#overflowDropped = 0;
+    const handlers = [...this.#handlers];
+    this.#handlers.clear();
+    const failure = new DriverFailedError(event.inner.kind, event.inner.detail);
+    for (const waiter of this.#waiters) {
+      clearWaiterTimer(waiter);
+      waiter.reject(failure);
+    }
+    this.#waiters.clear();
+
+    for (const handler of handlers) {
+      try {
+        handler(event);
+      } catch {
+        // One host handler cannot interrupt fan-out or unwind into Rust.
+      }
+    }
+    this.#backend.close();
   }
 }
 

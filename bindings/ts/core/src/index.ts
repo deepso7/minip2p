@@ -1,8 +1,10 @@
 export {
   BackpressureError,
   ClosedError,
+  DriverFailedError,
   MessageTooLargeError,
   NotPermittedError,
+  PeerDisconnectedError,
   TimeoutError,
 } from "./errors.js";
 export { MiniP2pBase } from "./sdk.js";

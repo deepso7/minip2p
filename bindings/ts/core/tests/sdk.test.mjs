@@ -1,9 +1,19 @@
-/* oxlint-disable class-methods-use-this, max-classes-per-file, no-empty-function -- The contract-complete fake backend uses intentionally inert methods and a tiny SDK test subclass. */
+/* oxlint-disable class-methods-use-this, max-classes-per-file, no-await-in-loop, no-empty-function -- The contract-complete fake backend uses intentionally inert methods, a tiny SDK test subclass, and bounded polling for asynchronous queue drains. */
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
-import { ClosedError, MiniP2pBase, P2pEvent_Tags } from "../dist/index.js";
+import {
+  ClosedError,
+  DriverFailedError,
+  DriverFailureKind,
+  MiniP2pBase,
+  NatErrorKind,
+  P2pEvent_Tags,
+  PathKind_Tags,
+  PeerDisconnectedError,
+} from "../dist/index.js";
 
 class MockBackend {
   listener;
@@ -178,6 +188,30 @@ test("event subscribers and waiters observe the same event", async () => {
   endpoint.close();
 });
 
+test("matching waiters settle before a handler closes the endpoint", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMiniP2p(backend);
+  await Promise.resolve();
+  const waiting = endpoint.waitFor(
+    (event) =>
+      "tag" in event && event.tag === P2pEvent_Tags.ConnectionEstablished
+  );
+  endpoint.on((event) => {
+    if ("tag" in event && event.tag === P2pEvent_Tags.ConnectionEstablished) {
+      endpoint.close();
+    }
+  });
+
+  backend.emit({
+    inner: { connId: 7, peerId: "remote-peer" },
+    tag: P2pEvent_Tags.ConnectionEstablished,
+  });
+
+  const event = await waiting;
+  assert.equal(event.tag, P2pEvent_Tags.ConnectionEstablished);
+  assert.equal(backend.closed, true);
+});
+
 test("typed waits, identify queries, and streams use the shared backend", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMiniP2p(backend);
@@ -191,6 +225,119 @@ test("typed waits, identify queries, and streams use the shared backend", async 
   endpoint.closeStreamWrite("peer", 3);
   endpoint.resetStream("peer", 3);
   endpoint.abandonStream("peer", 3);
+  endpoint.close();
+});
+
+test("waitPeerReady rejects when the peer disconnects first", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMiniP2p(backend);
+  await Promise.resolve();
+  const waiting = endpoint.waitPeerReady("remote-peer", 1000);
+
+  backend.emit({
+    inner: { connId: 7, peerId: "remote-peer" },
+    tag: P2pEvent_Tags.ConnectionClosed,
+  });
+
+  await assert.rejects(waiting, PeerDisconnectedError);
+  endpoint.close();
+});
+
+test("connection terminal events remain available to late waiters", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMiniP2p(backend);
+  await Promise.resolve();
+  backend.emit({
+    inner: {
+      connectId: 42,
+      path: { tag: PathKind_Tags.DirectDialed },
+      peerId: "remote-peer",
+    },
+    tag: P2pEvent_Tags.PathEstablished,
+  });
+  backend.emit({
+    inner: {
+      connectId: 43,
+      detail: "no usable path",
+      kind: NatErrorKind.NoPathAvailable,
+      peerId: "other-peer",
+    },
+    tag: P2pEvent_Tags.ConnectFailed,
+  });
+  await Promise.resolve();
+
+  const result = await endpoint.waitConnectResult(42, 0);
+  assert.equal(result.tag, P2pEvent_Tags.PathEstablished);
+  assert.equal(result.inner.peerId, "remote-peer");
+  const failure = await endpoint.waitConnectResult(43, 0);
+  assert.equal(failure.tag, P2pEvent_Tags.ConnectFailed);
+  assert.equal(failure.inner.detail, "no usable path");
+  endpoint.close();
+});
+
+test("DriverFailed rejects waits and permanently closes the SDK", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMiniP2p(backend);
+  await Promise.resolve();
+  const events = [];
+  endpoint.on((event) => {
+    events.push(event);
+    assert.equal(endpoint.isRunning(), false);
+  });
+  const waiting = endpoint.waitFor(() => false, 1000);
+
+  backend.emit({
+    inner: {
+      detail: "native driver stopped",
+      kind: DriverFailureKind.Transport,
+    },
+    tag: P2pEvent_Tags.DriverFailed,
+  });
+
+  await assert.rejects(
+    waiting,
+    (error) =>
+      error instanceof DriverFailedError &&
+      error.kind === DriverFailureKind.Transport &&
+      error.message === "native driver stopped"
+  );
+  assert.equal(events.at(-1)?.tag, P2pEvent_Tags.DriverFailed);
+  assert.equal(backend.closed, true);
+  assert.throws(() => endpoint.waitFor(() => true), ClosedError);
+  assert.throws(() => endpoint.peerId(), ClosedError);
+});
+
+test("bounded queue preserves newest payloads with exact drop accounting", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMiniP2p(backend);
+  await Promise.resolve();
+  const delivered = [];
+  let dropped = 0;
+  endpoint.on((event) => {
+    if ("tag" in event && event.tag === P2pEvent_Tags.Message) {
+      delivered.push(new Uint32Array(event.inner.seqno)[0]);
+    } else if (event.type === "queueOverflow") {
+      dropped += event.dropped;
+    }
+  });
+
+  for (let index = 0; index < 5000; index += 1) {
+    backend.emit({
+      inner: {
+        data: new ArrayBuffer(0),
+        fromPeerId: "remote-peer",
+        seqno: new Uint32Array([index]).buffer,
+        signed: true,
+        topics: ["/minip2p/test"],
+      },
+      tag: P2pEvent_Tags.Message,
+    });
+  }
+
+  await waitUntil(() => delivered.length === 4096);
+  assert.equal(dropped, 904);
+  assert.equal(delivered[0], 904);
+  assert.equal(delivered.at(-1), 4999);
   endpoint.close();
 });
 
@@ -208,6 +355,16 @@ test("text publishing uses UTF-8 and close rejects pending waits", async () => {
   await assert.rejects(waiting, ClosedError);
   assert.equal(backend.closed, true);
 });
+
+const waitUntil = async (predicate, timeoutMs = 2000) => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) {
+      assert.fail(`condition was not met within ${timeoutMs} ms`);
+    }
+    await delay(1);
+  }
+};
 
 test("a backend that fails to start is released", () => {
   const backend = new MockBackend();

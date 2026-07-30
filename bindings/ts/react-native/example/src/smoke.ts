@@ -1,6 +1,7 @@
 /* oxlint-disable func-style, no-use-before-define, promise/avoid-new, unicorn/no-array-sort -- The executable smoke suite uses hoisted test helpers, Promise adapters for event waits and delays, and sorts a fresh latency sample in place. */
 
 import {
+  DiscoverySource,
   MiniP2p,
   P2pEvent_Tags,
   generateSecretKey,
@@ -22,6 +23,7 @@ declare const performance: {
 const TOPIC = "/minip2p/react-native-smoke/1";
 const STREAM_PROTOCOL = "/minip2p/react-native-smoke-stream/1";
 const WAIT_MS = 10_000;
+const MDNS_WAIT_MS = 20_000;
 const LARGE_PAYLOAD_BYTES = 60 * 1024;
 const CYCLE_COUNT = 50;
 
@@ -249,6 +251,8 @@ export async function runSmokeSuite(
     liveEndpoints.delete(second);
     second = undefined;
 
+    await runMdnsDiscoveryCheck(report, liveEndpoints);
+
     for (let cycle = 0; cycle < CYCLE_COUNT; cycle += 1) {
       const endpoint = createEndpoint(liveEndpoints);
       endpoint.close();
@@ -291,6 +295,70 @@ function createEndpoint(liveEndpoints: Set<MiniP2p>): MiniP2p {
     secretKey: generateSecretKey(),
   };
   const endpoint = MiniP2p.create(config);
+  liveEndpoints.add(endpoint);
+  return endpoint;
+}
+
+async function runMdnsDiscoveryCheck(
+  report: SmokeReport,
+  liveEndpoints: Set<MiniP2p>
+): Promise<void> {
+  let first: MiniP2p | undefined;
+  let second: MiniP2p | undefined;
+
+  try {
+    first = createMdnsEndpoint(liveEndpoints);
+    const discoveredSecond = first.waitFor(
+      (event) =>
+        isNativeEvent(event, P2pEvent_Tags.PeerDiscovered) &&
+        event.inner.source === DiscoverySource.Mdns &&
+        event.inner.peerId === second?.peerId() &&
+        event.inner.addrs.length > 0,
+      MDNS_WAIT_MS
+    );
+    second = createMdnsEndpoint(liveEndpoints);
+
+    const discovered = await discoveredSecond;
+    if (!isNativeEvent(discovered, P2pEvent_Tags.PeerDiscovered)) {
+      throw new Error("mDNS waiter returned an unexpected event");
+    }
+    const known = first
+      .knownPeers()
+      .find((peer) => peer.peerId === second?.peerId());
+    check(
+      known !== undefined &&
+        known.mdnsAddrs.length > 0 &&
+        discovered.inner.addrs.length > 0,
+      "mdns-discovery",
+      `${discovered.inner.addrs.length} event addrs; ${known?.mdnsAddrs.length ?? 0} known addrs`,
+      report
+    );
+  } finally {
+    if (first !== undefined) {
+      first.close();
+      liveEndpoints.delete(first);
+    }
+    if (second !== undefined) {
+      second.close();
+      liveEndpoints.delete(second);
+    }
+  }
+}
+
+function createMdnsEndpoint(liveEndpoints: Set<MiniP2p>): MiniP2p {
+  const endpoint = MiniP2p.create({
+    agentVersion: "minip2p-react-native-mdns-smoke",
+    allowUnsigned: false,
+    forceRelay: false,
+    mdns: {
+      autoDial: false,
+      queryIntervalMs: 1000,
+      socketPollIntervalMs: 50,
+    },
+    protocols: [],
+    relays: [],
+    secretKey: generateSecretKey(),
+  });
   liveEndpoints.add(endpoint);
   return endpoint;
 }

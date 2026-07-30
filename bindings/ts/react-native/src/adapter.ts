@@ -12,6 +12,8 @@ import type {
   IdentifyInfo,
   KnownPeerInfo,
   MiniP2pConfig,
+  MiniP2pDiscoveryOptions,
+  MiniP2pMdnsOptions,
   P2pEvent,
   Reachability,
   RelayReservationInfo,
@@ -324,7 +326,7 @@ function toNativeConfig(config: MiniP2pConfig): NativeEndpointConfig {
     mdnsOptions === undefined || mdnsOptions === false
       ? undefined
       : {
-          autoDial: mdnsOptions.autoDial ?? true,
+          autoDial: resolveMdnsAutoDial(mdnsOptions, config.discovery),
           enableIpv6: mdnsOptions.enableIpv6 ?? false,
           interfaceRefreshMs: numberToU64(
             mdnsOptions.interfaceRefreshMs ?? 10_000,
@@ -361,6 +363,13 @@ function toNativeConfig(config: MiniP2pConfig): NativeEndpointConfig {
       PubsubRouter.Gossipsub) as NativeEndpointConfig["pubsubRouter"],
     relays: [...(config.relays ?? [])],
   };
+}
+
+function resolveMdnsAutoDial(
+  mdns: MiniP2pMdnsOptions,
+  discovery: MiniP2pDiscoveryOptions | undefined
+): boolean {
+  return mdns.autoDial ?? discovery?.autoDial ?? true;
 }
 
 function normalizeEvent(event: NativeP2pEvent): P2pEvent {

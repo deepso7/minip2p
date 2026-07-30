@@ -12,6 +12,28 @@
 namespace react = facebook::react;
 namespace jsi = facebook::jsi;
 
+namespace minip2p_callback_context {
+thread_local unsigned int depth = 0;
+
+class Scope final {
+ public:
+  Scope() noexcept {
+    depth += 1;
+  }
+
+  ~Scope() {
+    depth -= 1;
+  }
+
+  Scope(const Scope&) = delete;
+  Scope& operator=(const Scope&) = delete;
+};
+
+bool active() noexcept {
+  return depth != 0;
+}
+} // namespace minip2p_callback_context
+
 // Calling into Rust.
 extern "C" {
     typedef void
@@ -2282,6 +2304,7 @@ namespace uniffi::minip2p_ffi::cb::callbackinterfacep2peventlistenermethod0::vta
         // We'll use the Bridging class to do this…
         auto js_uniffiHandle = uniffi_jsi::Bridging<uint64_t>::toJs(rt, callInvoker, rs_uniffiHandle);
         auto js_event = uniffi::minip2p_ffi::Bridging<RustBuffer>::toJs(rt, callInvoker, rs_event);
+        minip2p_callback_context::Scope callbackScope;
 
         // Now we are ready to call the callback.
         // We are already on the JS thread, because this `body` function was
@@ -3634,6 +3657,11 @@ jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_unsubs
         return uniffi_jsi::Bridging<int8_t>::toJs(rt, callInvoker, value);
 }
 jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_wait_stopped(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        if (minip2p_callback_context::active()) {
+            RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+            uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+            return uniffi_jsi::Bridging<int8_t>::toJs(rt, callInvoker, int8_t{0});
+        }
         RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
         auto value = uniffi_minip2p_ffi_fn_method_p2pendpoint_wait_stopped(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi_jsi::Bridging<uint64_t>::fromJs(rt, callInvoker, args[1]),
             &status

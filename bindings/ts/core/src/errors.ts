@@ -1,5 +1,7 @@
 /* oxlint-disable max-classes-per-file -- The small public SDK error family is intentionally colocated and exported from one module. */
 
+import type { DriverFailureKind } from "./types.js";
+
 /** The native pubsub queue rejected work because it is full. */
 export class BackpressureError extends Error {
   constructor() {
@@ -37,5 +39,27 @@ export class ClosedError extends Error {
   constructor() {
     super("The minip2p endpoint is closed");
     this.name = "ClosedError";
+  }
+}
+
+/** The native background driver terminated with a fatal failure. */
+export class DriverFailedError extends Error {
+  readonly kind: DriverFailureKind;
+
+  constructor(kind: DriverFailureKind, detail: string) {
+    super(detail.length > 0 ? detail : "The minip2p driver failed");
+    this.name = "DriverFailedError";
+    this.kind = kind;
+  }
+}
+
+/** A peer disconnected before the awaited operation could complete. */
+export class PeerDisconnectedError extends Error {
+  readonly peerId: string;
+
+  constructor(peerId: string) {
+    super(`Peer ${peerId} disconnected before becoming ready`);
+    this.name = "PeerDisconnectedError";
+    this.peerId = peerId;
   }
 }

@@ -31,13 +31,11 @@
   "exports": {
     ".": {
       "minip2p-source": "./src/index.ts",
-      "react-native": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
     "./backend": {
       "minip2p-source": "./src/backend.ts",
-      "react-native": "./src/backend.ts",
       "types": "./dist/backend.d.ts",
       "default": "./dist/backend.js"
     },

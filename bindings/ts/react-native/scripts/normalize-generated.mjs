@@ -33,6 +33,7 @@ const generatedPaths = [
 
 ensureAndroidMdnsPermissions();
 customizeTurboModuleForMdns();
+guardWaitStoppedDuringCallbacks();
 
 for (const relativePath of generatedPaths) {
   normalizePath(path.join(packageRoot, relativePath));
@@ -135,6 +136,66 @@ import android.net.wifi.WifiManager
 }
 
 - (NSNumber *)cleanupRustCrate {
+`
+  );
+}
+
+function guardWaitStoppedDuringCallbacks() {
+  replaceOnce(
+    "cpp/generated/minip2p_ffi.cpp",
+    `namespace react = facebook::react;
+namespace jsi = facebook::jsi;
+`,
+    `namespace react = facebook::react;
+namespace jsi = facebook::jsi;
+
+namespace minip2p_callback_context {
+thread_local unsigned int depth = 0;
+
+class Scope final {
+ public:
+  Scope() noexcept {
+    depth += 1;
+  }
+
+  ~Scope() {
+    depth -= 1;
+  }
+
+  Scope(const Scope&) = delete;
+  Scope& operator=(const Scope&) = delete;
+};
+
+bool active() noexcept {
+  return depth != 0;
+}
+} // namespace minip2p_callback_context
+`
+  );
+  replaceOnce(
+    "cpp/generated/minip2p_ffi.cpp",
+    `        auto js_event = uniffi::minip2p_ffi::Bridging<RustBuffer>::toJs(rt, callInvoker, rs_event);
+
+        // Now we are ready to call the callback.
+`,
+    `        auto js_event = uniffi::minip2p_ffi::Bridging<RustBuffer>::toJs(rt, callInvoker, rs_event);
+        minip2p_callback_context::Scope callbackScope;
+
+        // Now we are ready to call the callback.
+`
+  );
+  replaceOnce(
+    "cpp/generated/minip2p_ffi.cpp",
+    `jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_wait_stopped(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+`,
+    `jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_wait_stopped(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        if (minip2p_callback_context::active()) {
+            RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+            uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+            return uniffi_jsi::Bridging<int8_t>::toJs(rt, callInvoker, int8_t{0});
+        }
+        RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
 `
   );
 }
