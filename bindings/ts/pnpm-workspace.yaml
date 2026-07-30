@@ -1,5 +1,8 @@
 packages:
-  - example
+  - core
+  - node
+  - react-native
+  - react-native/example
 
 minimumReleaseAgeExclude:
   - "@expo/cli@56.1.22"
@@ -13,4 +16,4 @@ onlyBuiltDependencies:
   - esbuild
 
 patchedDependencies:
-  uniffi-bindgen-react-native@0.31.0-3: patches/uniffi-bindgen-react-native@0.31.0-3.patch
+  uniffi-bindgen-react-native@0.31.0-3: react-native/patches/uniffi-bindgen-react-native@0.31.0-3.patch

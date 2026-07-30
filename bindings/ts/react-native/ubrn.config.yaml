@@ -1,6 +1,6 @@
 ---
 rust:
-  directory: ../..
+  directory: ../../..
   manifestPath: crates/ffi/Cargo.toml
 
 bindings:

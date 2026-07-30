@@ -1,6 +1,6 @@
 # react-native-minip2p
 
-React Native TurboModule bindings for minip2p, generated with UniFFI and `uniffi-bindgen-react-native`.
+React Native adapter for the platform-neutral `@minip2p/core` SDK, backed by a TurboModule generated with UniFFI and `uniffi-bindgen-react-native`.
 
 The package is pre-1.0. Its JavaScript API, generated types, native ABI, and event variants may change between releases.
 
@@ -58,7 +58,7 @@ unsubscribe();
 endpoint.close();
 ```
 
-`MiniP2p.create` constructs and starts the native driver. Attach handlers in the same synchronous JavaScript turn; immediate native callbacks are buffered until the next microtask.
+`MiniP2p.create` constructs and starts the native driver. Event buffering, waits, typed errors, and the rest of the public SDK behavior come from `@minip2p/core`; this package owns only React Native loading and conversion. Attach handlers in the same synchronous JavaScript turn; immediate native callbacks are buffered until the next microtask.
 
 ## Wrapper contracts
 
@@ -67,7 +67,7 @@ endpoint.close();
 - Wrapper overflow is delivered out of band as `{ type: 'queueOverflow', dropped }`. Native `EventsDropped` remains a normal generated event. On either signal, refresh connected peers, known peers, reachability, and the active reservation from queries.
 - Path events are advisory because the native API has no per-peer current-path query. Reset path badges to unknown after overflow.
 - Event subscribers and `waitFor` observers do not consume events from each other. An exception in one handler does not interrupt other handlers or unwind through the Rust callback.
-- `close` rejects pending waits, suppresses queued callbacks, requests native shutdown, and destroys the UniFFI object. A host needing the native stopped barrier should use the generated low-level API directly.
+- `close` rejects pending waits, suppresses queued callbacks, requests native shutdown, and destroys the UniFFI object. A host needing the native stopped barrier can import the generated low-level API from `react-native-minip2p/native`.
 - Unsigned pubsub messages are explicitly untrusted. When `signed` is false, both payload and `fromPeerId` are attacker-controlled.
 
 ## Generation

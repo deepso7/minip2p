@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 60
     defaults:
       run:
-        working-directory: bindings/react-native
+        working-directory: bindings/ts
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -44,24 +44,24 @@ jobs:
           targets: aarch64-linux-android,x86_64-linux-android
       - uses: Swatinem/rust-cache@v2
       - run: pnpm install --frozen-lockfile
-      - run: pnpm ubrn:android
+      - run: pnpm rn:android
       - name: Validate Android ELF alignment and allocator hooks
-        run: node scripts/check-android-elf.mjs
+        run: node react-native/scripts/check-android-elf.mjs
       - run: pnpm example prebuild
       - name: Build both Android ABIs
-        working-directory: bindings/react-native/example/android
+        working-directory: bindings/ts/react-native/example/android
         run: ./gradlew :app:assembleDebug -PreactNativeArchitectures=arm64-v8a,x86_64
       - name: Validate 16 KiB APK zip alignment
         run: |
           "$ANDROID_HOME/build-tools/36.0.0/zipalign" \
             -c -P 16 -v 4 \
-            example/android/app/build/outputs/apk/debug/app-debug.apk
+            react-native/example/android/app/build/outputs/apk/debug/app-debug.apk
       - name: Monitor native sizes
-        run: node scripts/check-native-size.mjs android
+        run: node react-native/scripts/check-native-size.mjs android
       - uses: actions/upload-artifact@v6
         with:
           name: minip2p-android-debug
-          path: bindings/react-native/example/android/app/build/outputs/apk/debug/app-debug.apk
+          path: bindings/ts/react-native/example/android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
 
   ios:
@@ -69,7 +69,7 @@ jobs:
     timeout-minutes: 60
     defaults:
       run:
-        working-directory: bindings/react-native
+        working-directory: bindings/ts
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -83,15 +83,15 @@ jobs:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
       - uses: Swatinem/rust-cache@v2
       - run: pnpm install --frozen-lockfile
-      - run: pnpm ubrn:ios
+      - run: pnpm rn:ios
       - name: Validate XCFramework slices
         run: |
-          lipo -info build/Minip2pFfi.xcframework/ios-arm64/libminip2p_ffi.a
-          lipo -info build/Minip2pFfi.xcframework/ios-arm64-simulator/libminip2p_ffi.a
+          lipo -info react-native/build/Minip2pFfi.xcframework/ios-arm64/libminip2p_ffi.a
+          lipo -info react-native/build/Minip2pFfi.xcframework/ios-arm64-simulator/libminip2p_ffi.a
       - name: Monitor native sizes
-        run: node scripts/check-native-size.mjs ios
+        run: node react-native/scripts/check-native-size.mjs ios
       - uses: actions/upload-artifact@v6
         with:
           name: minip2p-ios-xcframework
-          path: bindings/react-native/build/Minip2pFfi.xcframework
+          path: bindings/ts/react-native/build/Minip2pFfi.xcframework
           if-no-files-found: error

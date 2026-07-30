@@ -5,7 +5,8 @@ import path from "node:path";
 import process from "node:process";
 
 const packageRoot = path.resolve(import.meta.dirname, "..");
-const rustRoot = path.resolve(packageRoot, "../..");
+const workspaceRoot = path.resolve(packageRoot, "..");
+const rustRoot = path.resolve(packageRoot, "../../..");
 const libraryExtension =
   {
     darwin: "dylib",
@@ -18,7 +19,7 @@ const library = path.join(
   `libminip2p_ffi.${libraryExtension}`
 );
 const ubrn = path.join(
-  packageRoot,
+  workspaceRoot,
   "node_modules",
   ".bin",
   process.platform === "win32" ? "ubrn.cmd" : "ubrn"
@@ -61,6 +62,12 @@ run(
     "ubrn.config.yaml",
     "minip2p_ffi",
   ],
+  packageRoot,
+  environment
+);
+run(
+  process.execPath,
+  [path.join(packageRoot, "scripts/generate-codegen.mjs")],
   packageRoot,
   environment
 );

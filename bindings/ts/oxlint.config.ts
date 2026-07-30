@@ -6,10 +6,11 @@ export default defineConfig({
   extends: [core, react],
   ignorePatterns: [
     ...(core.ignorePatterns ?? []),
-    "lib",
-    "example/android",
-    "example/ios",
-    "src/NativeMinip2p.ts",
-    "src/native.tsx",
+    "**/dist",
+    "**/lib",
+    "react-native/example/android",
+    "react-native/example/ios",
+    "react-native/src/NativeMinip2p.ts",
+    "react-native/src/native.tsx",
   ],
 });

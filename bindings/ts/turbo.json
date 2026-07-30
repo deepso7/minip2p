@@ -3,6 +3,11 @@
   "globalDependencies": [".nvmrc", "pnpm-lock.yaml", "pnpm-workspace.yaml"],
   "globalEnv": ["NODE_ENV"],
   "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "inputs": ["$TURBO_DEFAULT$", "tsconfig.build.json"],
+      "outputs": ["dist/**", "lib/**"]
+    },
     "build:android": {
       "env": ["ANDROID_HOME", "ORG_GRADLE_PROJECT_newArchEnabled"],
       "inputs": [
@@ -37,6 +42,18 @@
         "!example/ios/build",
         "!example/ios/Pods"
       ],
+      "outputs": []
+    },
+    "clean": {
+      "cache": false
+    },
+    "test": {
+      "inputs": ["$TURBO_DEFAULT$", "tests/**"],
+      "outputs": []
+    },
+    "typecheck": {
+      "dependsOn": ["^typecheck"],
+      "inputs": ["$TURBO_DEFAULT$", "tsconfig.json"],
       "outputs": []
     }
   }

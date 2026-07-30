@@ -1,0 +1,38 @@
+{
+  "name": "@minip2p/node",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node.js bindings for minip2p",
+  "keywords": [
+    "libp2p",
+    "napi-rs",
+    "node",
+    "p2p",
+    "peer-to-peer",
+    "quic",
+    "rust"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "del-cli dist && tsc -p tsconfig.build.json",
+    "clean": "del-cli dist",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@minip2p/core": "workspace:*"
+  },
+  "devDependencies": {
+    "del-cli": "^7.0.0",
+    "typescript": "^6.0.3"
+  }
+}

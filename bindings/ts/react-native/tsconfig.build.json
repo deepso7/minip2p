@@ -1,4 +1,7 @@
 {
   "extends": "./tsconfig",
+  "compilerOptions": {
+    "customConditions": ["react-native-strict-api"]
+  },
   "exclude": ["example", "lib", "oxfmt.config.ts", "oxlint.config.ts"]
 }

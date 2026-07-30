@@ -75,6 +75,19 @@ Runtime adapters (`std`):
   - `discovery` composes `nat` and `pubsub` into signed peer discovery (`known_peers`/`next_discovery_event`), with coordinated dialing and bridge cleanup.
   - `mdns` composes `nat` with local-link multicast discovery (`mdns`/`known_peers`/`next_discovery_event`) without pulling in pubsub.
 - `transports/quic` (`minip2p-quic`): QUIC transport adapter built on `quiche`, with libp2p TLS baked in. Owns UDP and DNS; exposes deadlines instead of running timers.
+- `crates/ffi` (`minip2p-ffi`): foreign-runtime endpoint and detached driver
+  exposed through UniFFI. The React Native adapter consumes this crate.
+
+Language bindings:
+
+- `bindings/ts/core` (`@minip2p/core`): platform-neutral TypeScript SDK,
+  public types, errors, event buffering, waits, and the native backend
+  contract.
+- `bindings/ts/react-native` (`react-native-minip2p`): UniFFI + TurboModule
+  implementation of the TypeScript backend, with an Expo development-build
+  example.
+- `bindings/ts/node` (`@minip2p/node`): napi-rs adapter scaffold. It remains
+  private until the native Node backend is implemented.
 
 Examples:
 

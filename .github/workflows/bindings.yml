@@ -1,4 +1,4 @@
-name: React Native bindings
+name: TypeScript bindings
 
 on:
   push:
@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: bindings/react-native
+        working-directory: bindings/ts
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -36,8 +36,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+      - run: pnpm test
       - run: pnpm lint
-      - run: pnpm prepare
-      - run: pnpm ubrn:generate
+      - run: pnpm build
+      - run: pnpm rn:generate
       - name: Generated files are current
         run: test -z "$(git status --porcelain)"

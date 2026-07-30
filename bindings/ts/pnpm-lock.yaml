@@ -10,7 +10,50 @@ patchedDependencies:
 importers:
 
   .:
+    devDependencies:
+      oxfmt:
+        specifier: 0.61.0
+        version: 0.61.0
+      oxlint:
+        specifier: 1.76.0
+        version: 1.76.0
+      turbo:
+        specifier: ^2.9.16
+        version: 2.10.7
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
+      ultracite:
+        specifier: 7.9.4
+        version: 7.9.4(eslint@10.8.0(supports-color@8.1.1))(oxfmt@0.61.0)(oxlint@1.76.0)(supports-color@8.1.1)(typescript@6.0.3)
+
+  core:
+    devDependencies:
+      del-cli:
+        specifier: ^7.0.0
+        version: 7.0.0
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
+
+  node:
     dependencies:
+      '@minip2p/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      del-cli:
+        specifier: ^7.0.0
+        version: 7.0.0
+      typescript:
+        specifier: ^6.0.3
+        version: 6.0.3
+
+  react-native:
+    dependencies:
+      '@minip2p/core':
+        specifier: workspace:*
+        version: link:../core
       '@ubjs/core':
         specifier: 0.31.0-3
         version: 0.31.0-3
@@ -33,12 +76,6 @@ importers:
       del-cli:
         specifier: ^7.0.0
         version: 7.0.0
-      oxfmt:
-        specifier: 0.61.0
-        version: 0.61.0
-      oxlint:
-        specifier: 1.76.0
-        version: 1.76.0
       react:
         specifier: 19.2.3
         version: 19.2.3
@@ -48,9 +85,6 @@ importers:
       react-native-builder-bob:
         specifier: ^0.43.0
         version: 0.43.0(supports-color@8.1.1)
-      turbo:
-        specifier: ^2.9.16
-        version: 2.10.7
       typescript:
         specifier: ^6.0.3
         version: 6.0.3
@@ -58,7 +92,7 @@ importers:
         specifier: 7.9.4
         version: 7.9.4(eslint@10.8.0(supports-color@8.1.1))(oxfmt@0.61.0)(oxlint@1.76.0)(supports-color@8.1.1)(typescript@6.0.3)
 
-  example:
+  react-native/example:
     dependencies:
       expo:
         specifier: ~56.0.18

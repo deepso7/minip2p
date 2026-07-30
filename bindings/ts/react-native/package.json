@@ -21,7 +21,8 @@
   "author": "Deepso <deeps.o7o8.y@gmail.com> (https://github.com/deepso7)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/deepso7/minip2p.git"
+    "url": "git+https://github.com/deepso7/minip2p.git",
+    "directory": "bindings/ts/react-native"
   },
   "files": [
     "src",
@@ -52,6 +53,11 @@
       "types": "./lib/typescript/src/index.d.ts",
       "default": "./lib/module/index.js"
     },
+    "./native": {
+      "react-native-minip2p-source": "./src/low-level.ts",
+      "types": "./lib/typescript/src/low-level.d.ts",
+      "default": "./lib/module/low-level.js"
+    },
     "./package.json": "./package.json"
   },
   "publishConfig": {
@@ -60,16 +66,17 @@
   "scripts": {
     "example": "pnpm --filter react-native-minip2p-example",
     "ubrn:generate": "node scripts/generate-bindings.mjs",
-    "ubrn:ios": "IPHONEOS_DEPLOYMENT_TARGET=15.1 ubrn build ios --config ubrn.config.yaml --and-generate && node scripts/normalize-generated.mjs",
-    "ubrn:android": "env -u LIBCLANG_PATH ANDROID_HOME=${ANDROID_HOME:-$HOME/Library/Android/sdk} ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-$HOME/Library/Android/sdk/ndk/28.2.13676358} ubrn build android --config ubrn.config.yaml --and-generate && node scripts/normalize-generated.mjs",
-    "clean": "del-cli android/build example/android/build example/android/app/build example/ios/build lib",
-    "prepack": "node scripts/check-package-native.mjs",
-    "prepare": "bob build && node scripts/normalize-generated.mjs",
+    "ubrn:ios": "IPHONEOS_DEPLOYMENT_TARGET=15.1 ubrn build ios --config ubrn.config.yaml --and-generate && node scripts/generate-codegen.mjs && node scripts/normalize-generated.mjs",
+    "ubrn:android": "env -u LIBCLANG_PATH ANDROID_HOME=${ANDROID_HOME:-$HOME/Library/Android/sdk} ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-$HOME/Library/Android/sdk/ndk/28.2.13676358} ubrn build android --config ubrn.config.yaml --and-generate && node scripts/generate-codegen.mjs && node scripts/normalize-generated.mjs",
+    "clean": "del-cli android/.cxx android/build example/android/build example/android/app/build example/ios/build lib",
+    "build": "bob build && node scripts/normalize-generated.mjs",
+    "prepack": "pnpm build && node scripts/check-package-native.mjs",
     "typecheck": "tsc",
     "lint": "ultracite check",
     "format": "ultracite fix"
   },
   "dependencies": {
+    "@minip2p/core": "workspace:*",
     "@ubjs/core": "0.31.0-3",
     "uniffi-bindgen-react-native": "0.31.0-3"
   },
@@ -79,12 +86,9 @@
     "@react-native/typescript-config": "0.85.3",
     "@types/react": "^19.2.0",
     "del-cli": "^7.0.0",
-    "oxfmt": "0.61.0",
-    "oxlint": "1.76.0",
     "react": "19.2.3",
     "react-native": "0.85.3",
     "react-native-builder-bob": "^0.43.0",
-    "turbo": "^2.9.16",
     "typescript": "^6.0.3",
     "ultracite": "7.9.4"
   },
@@ -92,7 +96,6 @@
     "react": "*",
     "react-native": "*"
   },
-  "packageManager": "pnpm@11.18.0+sha512.33d83c77da82f49fba836925c6f1b841181ec3132b670639bd012f7075f5c7cf634c5f870147c19aae7478fac01df09d8892e880454896edd23ee9b33757563c",
   "codegenConfig": {
     "name": "Minip2pSpec",
     "type": "modules",
@@ -127,8 +130,7 @@
         {
           "project": "tsconfig.build.json"
         }
-      ],
-      "codegen"
+      ]
     ]
   }
 }

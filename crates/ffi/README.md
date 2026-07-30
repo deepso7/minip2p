@@ -32,8 +32,10 @@ with `false` when called from the driver callback itself.
 Dropping the final native `P2pEndpoint` reference requests the same shutdown as
 `stop`; it does not synchronously join the detached thread. UniFFI object
 destruction therefore does not replace `stop` plus `wait_stopped` when the host
-needs an observable native shutdown barrier. The future TypeScript wrapper owns
-its separate handler-suppression and close semantics.
+needs an observable native shutdown barrier. The platform-neutral SDK in
+`bindings/ts/core` owns separate handler-suppression and close semantics; the
+React Native adapter in `bindings/ts/react-native` translates this UniFFI
+surface into that SDK backend contract.
 
 The endpoint and its driver share one mutex. Synchronous commands interrupt an
 in-flight transport wait before acquiring it, and the driver yields ownership
