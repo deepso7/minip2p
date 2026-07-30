@@ -20,6 +20,7 @@ declare const performance: {
 };
 
 const TOPIC = "/minip2p/react-native-smoke/1";
+const STREAM_PROTOCOL = "/minip2p/react-native-smoke-stream/1";
 const WAIT_MS = 10_000;
 const LARGE_PAYLOAD_BYTES = 60 * 1024;
 const CYCLE_COUNT = 50;
@@ -97,13 +98,7 @@ export async function runSmokeSuite(
     );
 
     const connectId = first.connectAddr(second.listenAddrs()[0] as string);
-    const path = await first.waitFor(
-      (event) =>
-        isNativeEvent(event, P2pEvent_Tags.PathEstablished) &&
-        event.inner.connectId === connectId &&
-        event.inner.peerId === secondPeer,
-      WAIT_MS
-    );
+    const path = await first.waitConnectResult(connectId, WAIT_MS);
     await Promise.all([firstReady, secondReady, subscription]);
 
     check(
@@ -116,6 +111,57 @@ export async function runSmokeSuite(
       reentrantPeerSeen,
       "callback-reentrancy",
       "connectedPeers() succeeded inside PathEstablished",
+      report
+    );
+    check(
+      first.peerInfo(secondPeer)?.protocols.includes(STREAM_PROTOCOL) === true,
+      "identify-snapshot",
+      "custom protocol present in peerInfo()",
+      report
+    );
+
+    const pingRtt = first.waitPingRtt(secondPeer, WAIT_MS);
+    first.ping(secondPeer);
+    const ping = await pingRtt;
+    check(
+      ping.inner.rttMs >= 0,
+      "explicit-ping",
+      `rtt=${ping.inner.rttMs}ms`,
+      report
+    );
+
+    const localStreamReady = first.waitFor(
+      (event) =>
+        isNativeEvent(event, P2pEvent_Tags.StreamReady) &&
+        event.inner.peerId === secondPeer &&
+        event.inner.protocolId === STREAM_PROTOCOL &&
+        event.inner.initiatedLocally,
+      WAIT_MS
+    );
+    const remoteStreamReady = second.waitFor(
+      (event) =>
+        isNativeEvent(event, P2pEvent_Tags.StreamReady) &&
+        event.inner.peerId === firstPeer &&
+        event.inner.protocolId === STREAM_PROTOCOL &&
+        !event.inner.initiatedLocally,
+      WAIT_MS
+    );
+    const streamId = first.openStream(secondPeer, STREAM_PROTOCOL);
+    await Promise.all([localStreamReady, remoteStreamReady]);
+    const streamPayload = encodeUtf8("custom stream through UniFFI");
+    const streamData = second.waitFor(
+      (event) =>
+        isNativeEvent(event, P2pEvent_Tags.StreamData) &&
+        sameBytes(event.inner.data, streamPayload),
+      WAIT_MS
+    );
+    first.sendStream(secondPeer, streamId, streamPayload);
+    first.closeStreamWrite(secondPeer, streamId);
+    await streamData;
+    check(
+      true,
+      "custom-protocol-stream",
+      `${streamPayload.byteLength} bytes preserved`,
       report
     );
 
@@ -240,6 +286,7 @@ function createEndpoint(liveEndpoints: Set<MiniP2p>): MiniP2p {
     allowUnsigned: false,
     forceRelay: false,
     listenAddr: "/ip4/127.0.0.1/udp/0/quic-v1",
+    protocols: [STREAM_PROTOCOL],
     relays: [],
     secretKey: generateSecretKey(),
   };

@@ -16,7 +16,7 @@ crate-type = ["lib", "staticlib", "cdylib"]
 workspace = true
 
 [dependencies]
-minip2p = { package = "minip2p-rs", path = "../minip2p", features = ["discovery"] }
+minip2p = { package = "minip2p-rs", path = "../minip2p", features = ["discovery", "mdns"] }
 minip2p-swarm = { path = "../swarm" }
 minip2p-pubsub = { path = "../pubsub" }
 thiserror = "2.0.18"

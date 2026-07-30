@@ -37,6 +37,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (NSNumber *)installRustCrate;
 - (NSNumber *)cleanupRustCrate;
+- (void)setMdnsEnabled:(BOOL)enabled;
 
 @end
 

@@ -18,6 +18,9 @@ namespace uniffi_generated {
         uint8_t result = minip2p::installRustCrate(rt, jsInvoker);
         return facebook::jsi::Value(rt, result);
     }
+    static facebook::jsi::Value __hostFunction_Minip2p_setMdnsEnabled(facebook::jsi::Runtime& rt, TurboModule &turboModule, const facebook::jsi::Value* args, size_t count) {
+        return facebook::jsi::Value::undefined();
+    }
     static facebook::jsi::Value __hostFunction_Minip2p_cleanupRustCrate(facebook::jsi::Runtime& rt, TurboModule &turboModule, const facebook::jsi::Value* args, size_t count) {
         uint8_t result = minip2p::cleanupRustCrate(rt);
         return facebook::jsi::Value(rt, result);
@@ -26,6 +29,7 @@ namespace uniffi_generated {
     NativeMinip2pSpecJSI::NativeMinip2pSpecJSI(const ObjCTurboModule::InitParams &params)
         : ObjCTurboModule(params), callInvoker(params.jsInvoker) {
             this->methodMap_["installRustCrate"] = MethodMetadata {1, __hostFunction_Minip2p_installRustCrate};
+            this->methodMap_["setMdnsEnabled"] = MethodMetadata {1, __hostFunction_Minip2p_setMdnsEnabled};
             this->methodMap_["cleanupRustCrate"] = MethodMetadata {1, __hostFunction_Minip2p_cleanupRustCrate};
     }
 } // namespace uniffi_generated
@@ -48,6 +52,9 @@ RCT_EXPORT_MODULE()
     @throw [NSException exceptionWithName:@"UnreachableException"
                         reason:@"This method should never be called."
                         userInfo:nil];
+}
+
+- (void)setMdnsEnabled:(BOOL)enabled {
 }
 
 - (NSNumber *)cleanupRustCrate {

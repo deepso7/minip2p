@@ -10,6 +10,8 @@ The TypeScript workspace is a pnpm monorepo orchestrated by Turborepo.
 
 Platform packages implement the backend contract from `@minip2p/core` and re-export the same SDK-facing types. Platform-neutral behavior belongs in `core`; native loading, generated bindings, and FFI error conversion belong in the platform adapter.
 
+See [FEATURES.md](./FEATURES.md) for the Rust-facade-to-TypeScript capability mapping.
+
 ```sh
 pnpm install --frozen-lockfile
 pnpm typecheck

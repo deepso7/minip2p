@@ -22,10 +22,16 @@ static facebook::jsi::Value __hostFunction_NativeMinip2pSpecJSI_cleanupRustCrate
   return static_cast<JavaTurboModule &>(turboModule).invokeJavaMethod(rt, BooleanKind, "cleanupRustCrate", "()Z", args, count, cachedMethodId);
 }
 
+static facebook::jsi::Value __hostFunction_NativeMinip2pSpecJSI_setMdnsEnabled(facebook::jsi::Runtime& rt, TurboModule &turboModule, const facebook::jsi::Value* args, size_t count) {
+  static jmethodID cachedMethodId = nullptr;
+  return static_cast<JavaTurboModule &>(turboModule).invokeJavaMethod(rt, VoidKind, "setMdnsEnabled", "(Z)V", args, count, cachedMethodId);
+}
+
 NativeMinip2pSpecJSI::NativeMinip2pSpecJSI(const JavaTurboModule::InitParams &params)
   : JavaTurboModule(params) {
   methodMap_["installRustCrate"] = MethodMetadata {0, __hostFunction_NativeMinip2pSpecJSI_installRustCrate};
   methodMap_["cleanupRustCrate"] = MethodMetadata {0, __hostFunction_NativeMinip2pSpecJSI_cleanupRustCrate};
+  methodMap_["setMdnsEnabled"] = MethodMetadata {1, __hostFunction_NativeMinip2pSpecJSI_setMdnsEnabled};
 }
 
 std::shared_ptr<TurboModule> Minip2pSpec_ModuleProvider(const std::string &moduleName, const JavaTurboModule::InitParams &params) {

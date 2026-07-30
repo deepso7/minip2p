@@ -24,6 +24,7 @@ protected:
   NativeMinip2pCxxSpec(std::shared_ptr<CallInvoker> jsInvoker) : TurboModule(std::string{NativeMinip2pCxxSpec::kModuleName}, jsInvoker) {
     methodMap_["installRustCrate"] = MethodMetadata {.argCount = 0, .invoker = __installRustCrate};
     methodMap_["cleanupRustCrate"] = MethodMetadata {.argCount = 0, .invoker = __cleanupRustCrate};
+    methodMap_["setMdnsEnabled"] = MethodMetadata {.argCount = 1, .invoker = __setMdnsEnabled};
   }
 
 private:
@@ -39,6 +40,14 @@ private:
       bridging::getParameterCount(&T::cleanupRustCrate) == 1,
       "Expected cleanupRustCrate(...) to have 1 parameters");
     return bridging::callFromJs<bool>(rt, &T::cleanupRustCrate,  static_cast<NativeMinip2pCxxSpec*>(&turboModule)->jsInvoker_, static_cast<T*>(&turboModule));
+  }
+
+  static jsi::Value __setMdnsEnabled(jsi::Runtime &rt, TurboModule &turboModule, const jsi::Value* args, size_t count) {
+    static_assert(
+      bridging::getParameterCount(&T::setMdnsEnabled) == 2,
+      "Expected setMdnsEnabled(...) to have 2 parameters");
+    bridging::callFromJs<void>(rt, &T::setMdnsEnabled,  static_cast<NativeMinip2pCxxSpec*>(&turboModule)->jsInvoker_, static_cast<T*>(&turboModule),
+      count <= 0 ? throw jsi::JSError(rt, "Expected argument in position 0 to be passed") : args[0].asBool());return jsi::Value::undefined();
   }
 };
 

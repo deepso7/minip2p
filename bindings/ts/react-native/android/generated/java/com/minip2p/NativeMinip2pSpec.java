@@ -38,4 +38,8 @@ public abstract class NativeMinip2pSpec extends ReactContextBaseJavaModule imple
   @ReactMethod(isBlockingSynchronousMethod = true)
   @DoNotStrip
   public abstract boolean cleanupRustCrate();
+
+  @ReactMethod
+  @DoNotStrip
+  public abstract void setMdnsEnabled(boolean enabled);
 }

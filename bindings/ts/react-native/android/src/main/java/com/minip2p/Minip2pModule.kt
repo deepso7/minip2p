@@ -4,10 +4,15 @@ package com.minip2p
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.module.annotations.ReactModule
 import com.facebook.react.turbomodule.core.interfaces.CallInvokerHolder
+import android.content.Context
+import android.net.wifi.WifiManager
 
 @ReactModule(name = Minip2pModule.NAME)
 class Minip2pModule(reactContext: ReactApplicationContext) :
   NativeMinip2pSpec(reactContext) {
+
+  private var mdnsUsers = 0
+  private var multicastLock: WifiManager.MulticastLock? = null
 
   override fun getName(): String {
     return NAME
@@ -27,7 +32,31 @@ class Minip2pModule(reactContext: ReactApplicationContext) :
     )
   }
 
+  @Synchronized
+  override fun setMdnsEnabled(enabled: Boolean) {
+    if (enabled) {
+      mdnsUsers += 1
+      if (multicastLock?.isHeld != true) {
+        val wifi = reactApplicationContext.applicationContext
+          .getSystemService(Context.WIFI_SERVICE) as WifiManager
+        multicastLock = wifi.createMulticastLock("minip2p-mdns").apply {
+          setReferenceCounted(false)
+          acquire()
+        }
+      }
+    } else if (mdnsUsers > 0) {
+      mdnsUsers -= 1
+      if (mdnsUsers == 0) {
+        multicastLock?.takeIf { it.isHeld }?.release()
+        multicastLock = null
+      }
+    }
+  }
+
   override fun cleanupRustCrate(): Boolean {
+    mdnsUsers = 0
+    multicastLock?.takeIf { it.isHeld }?.release()
+    multicastLock = null
     return nativeCleanupRustCrate(
       this.reactApplicationContext.javaScriptContextHolder!!.get()
     )

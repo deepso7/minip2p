@@ -34,6 +34,10 @@ namespace facebook::react {
       return static_cast<ObjCTurboModule&>(turboModule).invokeObjCMethod(rt, BooleanKind, "cleanupRustCrate", @selector(cleanupRustCrate), args, count);
     }
 
+    static facebook::jsi::Value __hostFunction_NativeMinip2pSpecJSI_setMdnsEnabled(facebook::jsi::Runtime& rt, TurboModule &turboModule, const facebook::jsi::Value* args, size_t count) {
+      return static_cast<ObjCTurboModule&>(turboModule).invokeObjCMethod(rt, VoidKind, "setMdnsEnabled", @selector(setMdnsEnabled:), args, count);
+    }
+
   NativeMinip2pSpecJSI::NativeMinip2pSpecJSI(const ObjCTurboModule::InitParams &params)
     : ObjCTurboModule(params) {
 
@@ -41,6 +45,9 @@ namespace facebook::react {
 
 
         methodMap_["cleanupRustCrate"] = MethodMetadata {0, __hostFunction_NativeMinip2pSpecJSI_cleanupRustCrate};
+
+
+        methodMap_["setMdnsEnabled"] = MethodMetadata {1, __hostFunction_NativeMinip2pSpecJSI_setMdnsEnabled};
 
   }
 } // namespace facebook::react

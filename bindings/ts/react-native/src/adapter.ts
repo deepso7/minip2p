@@ -5,9 +5,11 @@ import {
   MessageTooLargeError,
   MiniP2pBase,
   NotPermittedError,
+  PubsubRouter,
 } from "@minip2p/core";
 import type {
   Bytes,
+  IdentifyInfo,
   KnownPeerInfo,
   MiniP2pConfig,
   P2pEvent,
@@ -29,21 +31,39 @@ import {
 import type {
   DiscoveryOptions as NativeDiscoveryOptions,
   EndpointConfig as NativeEndpointConfig,
+  IdentifyInfo as NativeIdentifyInfo,
   KnownPeerInfo as NativeKnownPeerInfo,
+  MdnsOptions as NativeMdnsOptions,
   P2pEvent as NativeP2pEvent,
   P2pEventListener,
   RelayReservationInfo as NativeRelayReservationInfo,
 } from "./native";
+import nativeModule from "./NativeMinip2p";
 
 class ReactNativeBackend implements MiniP2pBackend {
   readonly #endpoint: P2pEndpoint;
+  readonly #mdnsEnabled: boolean;
   #listener: P2pEventListener | undefined;
 
   constructor(config: MiniP2pConfig) {
-    this.#endpoint = translateErrors(
-      () =>
-        new P2pEndpoint(toArrayBuffer(config.secretKey), toNativeConfig(config))
-    );
+    this.#mdnsEnabled = config.mdns !== undefined && config.mdns !== false;
+    if (this.#mdnsEnabled) {
+      nativeModule.setMdnsEnabled(true);
+    }
+    try {
+      this.#endpoint = translateErrors(
+        () =>
+          new P2pEndpoint(
+            toArrayBuffer(config.secretKey),
+            toNativeConfig(config)
+          )
+      );
+    } catch (error) {
+      if (this.#mdnsEnabled) {
+        nativeModule.setMdnsEnabled(false);
+      }
+      throw error;
+    }
   }
 
   start(listener: (event: P2pEvent) => void): void {
@@ -62,9 +82,15 @@ class ReactNativeBackend implements MiniP2pBackend {
   }
 
   close(): void {
-    this.#endpoint.stop();
-    this.#endpoint.uniffiDestroy();
-    this.#listener = undefined;
+    try {
+      this.#endpoint.stop();
+      this.#endpoint.uniffiDestroy();
+      this.#listener = undefined;
+    } finally {
+      if (this.#mdnsEnabled) {
+        nativeModule.setMdnsEnabled(false);
+      }
+    }
   }
 
   peerId(): string {
@@ -79,10 +105,24 @@ class ReactNativeBackend implements MiniP2pBackend {
     return translateErrors(() => this.#endpoint.connectedPeers());
   }
 
+  isPeerReady(peerId: string): boolean {
+    return translateErrors(() => this.#endpoint.isPeerReady(peerId));
+  }
+
+  peerInfo(peerId: string): IdentifyInfo | undefined {
+    const info = translateErrors(() => this.#endpoint.peerInfo(peerId));
+    return info === undefined ? undefined : normalizeIdentifyInfo(info);
+  }
+
   knownPeers(): KnownPeerInfo[] {
     return translateErrors(() =>
       this.#endpoint.knownPeers().map(normalizeKnownPeer)
     );
+  }
+
+  discoveryNowMs(): number | undefined {
+    const now = translateErrors(() => this.#endpoint.discoveryNowMs());
+    return now === undefined ? undefined : u64ToNumber(now, "discoveryNowMs");
   }
 
   activeReservation(): RelayReservationInfo | undefined {
@@ -124,9 +164,68 @@ class ReactNativeBackend implements MiniP2pBackend {
     });
   }
 
+  ping(peerId: string): void {
+    translateErrors(() => {
+      this.#endpoint.ping(peerId);
+    });
+  }
+
+  addProtocol(protocolId: string): void {
+    translateErrors(() => {
+      this.#endpoint.addProtocol(protocolId);
+    });
+  }
+
+  openStream(peerId: string, protocolId: string): number {
+    return u64ToNumber(
+      translateErrors(() => this.#endpoint.openStream(peerId, protocolId)),
+      "streamId"
+    );
+  }
+
+  sendStream(peerId: string, streamId: number, data: Uint8Array): void {
+    translateErrors(() => {
+      this.#endpoint.sendStream(
+        peerId,
+        numberToU64(streamId, "streamId"),
+        toArrayBuffer(data)
+      );
+    });
+  }
+
+  closeStreamWrite(peerId: string, streamId: number): void {
+    translateErrors(() => {
+      this.#endpoint.closeStreamWrite(
+        peerId,
+        numberToU64(streamId, "streamId")
+      );
+    });
+  }
+
+  resetStream(peerId: string, streamId: number): void {
+    translateErrors(() => {
+      this.#endpoint.resetStream(peerId, numberToU64(streamId, "streamId"));
+    });
+  }
+
+  abandonStream(peerId: string, streamId: number): void {
+    translateErrors(() => {
+      this.#endpoint.abandonStream(peerId, numberToU64(streamId, "streamId"));
+    });
+  }
+
   connect(peerId: string): number {
     return u64ToNumber(
       translateErrors(() => this.#endpoint.connect(peerId)),
+      "connectId"
+    );
+  }
+
+  connectWithAddrs(peerId: string, addresses: readonly string[]): number {
+    return u64ToNumber(
+      translateErrors(() =>
+        this.#endpoint.connectWithAddrs(peerId, [...addresses])
+      ),
       "connectId"
     );
   }
@@ -135,6 +234,26 @@ class ReactNativeBackend implements MiniP2pBackend {
     return u64ToNumber(
       translateErrors(() => this.#endpoint.connectAddr(address)),
       "connectId"
+    );
+  }
+
+  dial(address: string): number[] {
+    return translateErrors(() => this.#endpoint.dial(address)).map((id) =>
+      u64ToNumber(id, "connectionId")
+    );
+  }
+
+  dialIp4(address: string): number {
+    return u64ToNumber(
+      translateErrors(() => this.#endpoint.dialIp4(address)),
+      "connectionId"
+    );
+  }
+
+  dialIp6(address: string): number {
+    return u64ToNumber(
+      translateErrors(() => this.#endpoint.dialIp6(address)),
+      "connectionId"
     );
   }
 
@@ -168,7 +287,7 @@ export class MiniP2p extends MiniP2pBase {
 
   /** Constructs and starts a React Native endpoint. */
   static create(config: MiniP2pConfig): MiniP2p {
-    return new MiniP2p(backendFactory.create(config), config.relays);
+    return new MiniP2p(backendFactory.create(config), config.relays ?? []);
   }
 }
 
@@ -200,13 +319,47 @@ function toNativeConfig(config: MiniP2pConfig): NativeEndpointConfig {
           peerTtlMs: numberToU64(config.discovery.peerTtlMs, "peerTtlMs"),
           topic: config.discovery.topic,
         };
+  const mdnsOptions = config.mdns === true ? {} : config.mdns;
+  const mdns: NativeMdnsOptions | undefined =
+    mdnsOptions === undefined || mdnsOptions === false
+      ? undefined
+      : {
+          autoDial: mdnsOptions.autoDial ?? true,
+          enableIpv6: mdnsOptions.enableIpv6 ?? false,
+          interfaceRefreshMs: numberToU64(
+            mdnsOptions.interfaceRefreshMs ?? 10_000,
+            "interfaceRefreshMs"
+          ),
+          maxAnnouncedAddrs: numberToU32(
+            mdnsOptions.maxAnnouncedAddrs ?? 16,
+            "maxAnnouncedAddrs"
+          ),
+          maxPacketBytes: numberToU32(
+            mdnsOptions.maxPacketBytes ?? 1400,
+            "maxPacketBytes"
+          ),
+          queryIntervalMs: numberToU64(
+            mdnsOptions.queryIntervalMs ?? 300_000,
+            "queryIntervalMs"
+          ),
+          socketPollIntervalMs: numberToU64(
+            mdnsOptions.socketPollIntervalMs ?? 100,
+            "socketPollIntervalMs"
+          ),
+          ttlMs: numberToU64(mdnsOptions.ttlMs ?? 120_000, "ttlMs"),
+        };
   return {
     agentVersion: config.agentVersion,
-    allowUnsigned: config.allowUnsigned,
+    allowUnsigned: config.allowUnsigned ?? false,
+    autonatServers: [...(config.autonatServers ?? [])],
     discovery,
-    forceRelay: config.forceRelay,
+    forceRelay: config.forceRelay ?? false,
     listenAddr: config.listenAddr,
-    relays: [...config.relays],
+    mdns,
+    protocols: [...(config.protocols ?? [])],
+    pubsubRouter: (config.pubsubRouter ??
+      PubsubRouter.Gossipsub) as NativeEndpointConfig["pubsubRouter"],
+    relays: [...(config.relays ?? [])],
   };
 }
 
@@ -219,6 +372,10 @@ function normalizeEvent(event: NativeP2pEvent): P2pEvent {
 
 function normalizeKnownPeer(peer: NativeKnownPeerInfo): KnownPeerInfo {
   return normalizeBigInts(peer) as KnownPeerInfo;
+}
+
+function normalizeIdentifyInfo(info: NativeIdentifyInfo): IdentifyInfo {
+  return normalizeBigInts(info) as IdentifyInfo;
 }
 
 function normalizeReservation(
@@ -255,6 +412,14 @@ function toArrayBuffer(value: Bytes): ArrayBuffer {
 function numberToU64(value: number, name: string): bigint {
   assertSafeUnsignedInteger(value, name);
   return BigInt(value);
+}
+
+function numberToU32(value: number, name: string): number {
+  assertSafeUnsignedInteger(value, name);
+  if (value > 0xff_ff_ff_ff) {
+    throw new RangeError(`${name} exceeds the unsigned 32-bit range`);
+  }
+  return value;
 }
 
 function u64ToNumber(value: bigint, name: string): number {

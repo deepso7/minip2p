@@ -34,9 +34,8 @@ import {
 
 const endpoint = MiniP2p.create({
   secretKey: generateSecretKey(),
-  relays: [],
-  forceRelay: false,
-  allowUnsigned: false,
+  mdns: true,
+  protocols: ["/example/files/1"],
 });
 
 const unsubscribe = endpoint.on((event) => {
@@ -50,6 +49,11 @@ const unsubscribe = endpoint.on((event) => {
 endpoint.subscribe("/example/chat/1");
 endpoint.publish("/example/chat/1", "hello from React Native");
 
+endpoint.ping("remote-peer-id");
+const streamId = endpoint.openStream("remote-peer-id", "/example/files/1");
+endpoint.sendStream("remote-peer-id", streamId, new Uint8Array([1, 2, 3]));
+endpoint.closeStreamWrite("remote-peer-id", streamId);
+
 // Signal AppState changes before foreground queries or reconnect work.
 endpoint.setActive(false);
 endpoint.setActive(true);
@@ -60,10 +64,12 @@ endpoint.close();
 
 `MiniP2p.create` constructs and starts the native driver. Event buffering, waits, typed errors, and the rest of the public SDK behavior come from `@minip2p/core`; this package owns only React Native loading and conversion. Attach handlers in the same synchronous JavaScript turn; immediate native callbacks are buffered until the next microtask.
 
+Configuration defaults to gossipsub, signed messages, no relay, and no discovery. Set `pubsubRouter` to `PubsubRouter.Floodsub` when interoperability requires floodsub. mDNS requires local-network/multicast permissions in the host app; Expo Go cannot provide the native module, so use the included Expo development-build workflow.
+
 ## Wrapper contracts
 
 - Generated Rust `u64` values are checked before conversion from `bigint` to JavaScript `number`. Values outside the safe integer range throw.
-- Native events are delivered FIFO through a 4096-entry host queue, in batches of 256. Overflow first coalesces replaceable state, then discards the oldest message, and only then discards another lifecycle event.
+- Native events are delivered FIFO through a 4096-entry host queue, in batches of 256. Overflow first coalesces replaceable state, then discards the oldest pubsub-message or stream-data payload, and only then discards another lifecycle event.
 - Wrapper overflow is delivered out of band as `{ type: 'queueOverflow', dropped }`. Native `EventsDropped` remains a normal generated event. On either signal, refresh connected peers, known peers, reachability, and the active reservation from queries.
 - Path events are advisory because the native API has no per-peer current-path query. Reset path badges to unknown after overflow.
 - Event subscribers and `waitFor` observers do not consume events from each other. An exception in one handler does not interrupt other handlers or unwind through the Rust callback.

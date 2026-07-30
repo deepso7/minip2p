@@ -27,6 +27,37 @@ impl fmt::Debug for DiscoveryOptions {
     }
 }
 
+/// Local-link mDNS discovery configuration.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct MdnsOptions {
+    /// Whether IPv6 interfaces and advertisements are enabled.
+    pub enable_ipv6: bool,
+    /// Positive record lifetime advertised on the wire, in milliseconds.
+    pub ttl_ms: u64,
+    /// Steady-state query interval, in milliseconds.
+    pub query_interval_ms: u64,
+    /// Maximum DNS/UDP payload emitted by the encoder.
+    pub max_packet_bytes: u32,
+    /// Maximum local addresses announced in one response burst.
+    pub max_announced_addrs: u32,
+    /// Interface re-enumeration interval, in milliseconds.
+    pub interface_refresh_ms: u64,
+    /// Maximum blocking wait before polling mDNS sockets again.
+    pub socket_poll_interval_ms: u64,
+    /// Whether accepted mDNS observations may trigger automatic dials.
+    pub auto_dial: bool,
+}
+
+/// Pubsub routing engine selected at endpoint construction.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, uniffi::Enum)]
+pub enum PubsubRouter {
+    /// Mesh-based gossipsub routing.
+    #[default]
+    Gossipsub,
+    /// Flood-to-all-subscribers floodsub routing.
+    Floodsub,
+}
+
 /// Configuration used to construct an FFI endpoint.
 #[derive(Clone, uniffi::Record)]
 pub struct EndpointConfig {
@@ -34,14 +65,22 @@ pub struct EndpointConfig {
     pub agent_version: Option<String>,
     /// Relay peer addresses.
     pub relays: Vec<String>,
+    /// AutoNAT server peer addresses.
+    pub autonat_servers: Vec<String>,
     /// QUIC listen multiaddress, or dual-stack wildcard binding when absent.
     pub listen_addr: Option<String>,
     /// Whether connection attempts must remain relayed.
     pub force_relay: bool,
     /// Whether unsigned pubsub messages are accepted.
     pub allow_unsigned: bool,
+    /// Pubsub routing engine.
+    pub pubsub_router: PubsubRouter,
+    /// Application protocol ids registered before the endpoint starts.
+    pub protocols: Vec<String>,
     /// Signed-discovery settings, or no discovery when absent.
     pub discovery: Option<DiscoveryOptions>,
+    /// Local-link mDNS settings, or no mDNS discovery when absent.
+    pub mdns: Option<MdnsOptions>,
 }
 
 /// One peer in the shared discovery address book.
@@ -78,10 +117,14 @@ impl fmt::Debug for EndpointConfig {
             .debug_struct("EndpointConfig")
             .field("agent_version", &self.agent_version)
             .field("relays", &self.relays)
+            .field("autonat_servers", &self.autonat_servers)
             .field("listen_addr", &self.listen_addr)
             .field("force_relay", &self.force_relay)
             .field("allow_unsigned", &self.allow_unsigned)
+            .field("pubsub_router", &self.pubsub_router)
+            .field("protocols", &self.protocols)
             .field("discovery", &self.discovery)
+            .field("mdns", &self.mdns)
             .finish()
     }
 }

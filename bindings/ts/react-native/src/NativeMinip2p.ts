@@ -5,6 +5,7 @@ import { TurboModuleRegistry } from 'react-native';
 export interface Spec extends TurboModule {
   installRustCrate(): boolean;
   cleanupRustCrate(): boolean;
+  setMdnsEnabled(enabled: boolean): void;
 }
 
 export default TurboModuleRegistry.getEnforcing<Spec>('Minip2p');

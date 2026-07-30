@@ -10,10 +10,11 @@ connected-peer query. Secret key bytes are passed separately to the constructor
 so the host-visible configuration record cannot stringify them. The lifecycle
 surface includes detached background driving, listener callbacks, activity
 hints, running-state inspection, flag-only stop, and bounded stopped-state
-waits. Swarm, NAT, pubsub, and signed-discovery events are converted to the
-flattened `P2pEvent` model. The command surface covers pubsub and NAT connection
-attempts; live queries cover connected and discovered peers, reachability, and
-the active relay reservation.
+waits. Swarm, custom-stream, NAT, pubsub, signed-discovery, and mDNS events are
+converted to the flattened `P2pEvent` model. The command surface covers ping,
+pubsub, custom protocols and streams, and NAT connection attempts; live queries
+cover connected and ready peers, Identify snapshots, discovered peers,
+reachability, and the active relay reservation.
 
 ## Lifecycle and ownership
 
@@ -42,9 +43,9 @@ in-flight transport wait before acquiring it, and the driver yields ownership
 while commands are pending. Listener callbacks never run while that mutex is
 held.
 
-`IdentifyReceived` is represented by the later `PeerReady` event, so the raw
-Identify event is not delivered. User-stream events are omitted because the v1
-FFI exposes neither user-protocol registration nor stream commands. Listener
+Identify snapshots and custom-stream lifecycle/data events are delivered
+directly. Protocol ids can be registered in endpoint configuration or through
+`add_protocol`; stream ids remain opaque endpoint-local integers. Listener
 callbacks run on the native driver thread and must not block waiting for that
 same driver to stop; `wait_stopped` called from a listener returns `false`
 immediately.
@@ -77,10 +78,11 @@ addresses are not automatically remotely dialable. Public observations arrive
 through `PublicAddressesChanged`; a relay circuit address is composed from
 `active_reservation` and `circuit_address`.
 
-The v1 crate enables signed-beacon discovery but not mDNS. Consequently mDNS
-address fields are empty today, while their explicit provenance remains in the
-API for a future opt-in implementation. Mobile mDNS permissions, background
-socket operation, and iOS background networking are outside the v1 contract.
+Signed-beacon discovery and local-link mDNS are independent opt-ins that feed
+one address book. mDNS observations are unauthenticated and retain explicit
+source provenance. Applications must add the platform multicast/local-network
+permissions required by Android and Apple platforms. Background socket
+operation and iOS background networking are outside the v1 contract.
 
 Events preserve FIFO order within each upstream source. There is no total order
 across swarm, NAT, pubsub, and discovery queues because their original
@@ -90,9 +92,9 @@ subscriptions, and paths independently.
 ## Queue and memory policy
 
 Native callback carry is capped at 4096 source events and delivered in batches
-of at most 512. Overflow discards oldest message events first, then oldest
-remaining events, and reports the loss through a dedicated `EventsDropped`
-diagnostic. Rust-side tests can inspect exact accounting through
+of at most 512. Overflow discards oldest pubsub-message or stream-data events
+first, then oldest remaining events, and reports the loss through a dedicated
+`EventsDropped` diagnostic. Rust-side tests can inspect exact accounting through
 `P2pEndpoint::driver_stats`; this diagnostic method is not exported by UniFFI.
 
 The upstream audit is:
@@ -116,10 +118,12 @@ The upstream audit is:
 ## Stability and exclusions
 
 The entire FFI ABI and generated binding shape are unstable before 1.0.
-Regenerate downstream bindings after every change to this crate. v1 deliberately
-does not expose arbitrary user protocols/streams, `connect_with_addrs`, mDNS,
-standalone Swift/Kotlin packages, authoritative per-peer path queries, or
-background-networking guarantees.
+Regenerate downstream bindings after every change to this crate. The
+background driver is the foreign-runtime equivalent of the Rust facade's
+caller-driven `poll`/`next_wake` methods. v1 deliberately does not expose
+`swarm`/`swarm_mut` implementation escape hatches, standalone Swift/Kotlin
+packages, authoritative per-peer path queries, or background-networking
+guarantees.
 
 Android currently pins `boring` and `boring-sys` to the immutable fix proposed
 in [cloudflare/boring#518](https://github.com/cloudflare/boring/pull/518).

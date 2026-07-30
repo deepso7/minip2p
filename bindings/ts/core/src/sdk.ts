@@ -5,9 +5,11 @@ import { ClosedError, TimeoutError } from "./errors.js";
 import { P2pEvent_Tags } from "./types.js";
 import type {
   Bytes,
+  IdentifyInfo,
   KnownPeerInfo,
   MiniP2pEvent,
   P2pEvent,
+  P2pEventByTag,
   Reachability,
   RelayReservationInfo,
   Unsubscribe,
@@ -25,7 +27,6 @@ const REPLACEABLE_EVENTS = new Set<P2pEvent_Tags>([
 ]);
 
 type EventHandler = (event: MiniP2pEvent) => void;
-
 interface Waiter {
   predicate: (event: MiniP2pEvent) => boolean;
   resolve: (event: MiniP2pEvent) => void;
@@ -79,6 +80,14 @@ export class MiniP2pBase {
   }
 
   /** Resolves with the first event matching `predicate`. */
+  waitFor<EventType extends MiniP2pEvent>(
+    predicate: (event: MiniP2pEvent) => event is EventType,
+    timeoutMs?: number
+  ): Promise<EventType>;
+  waitFor(
+    predicate: (event: MiniP2pEvent) => boolean,
+    timeoutMs?: number
+  ): Promise<MiniP2pEvent>;
   waitFor(
     predicate: (event: MiniP2pEvent) => boolean,
     timeoutMs = 65_000
@@ -133,10 +142,28 @@ export class MiniP2pBase {
     return this.#backend.connectedPeers();
   }
 
+  /** Returns whether Identify has completed for a connected peer. */
+  isPeerReady(peerId: string): boolean {
+    this.#assertOpen();
+    return this.#backend.isPeerReady(peerId);
+  }
+
+  /** Returns the latest Identify snapshot for a connected peer. */
+  peerInfo(peerId: string): IdentifyInfo | undefined {
+    this.#assertOpen();
+    return this.#backend.peerInfo(peerId);
+  }
+
   /** Returns the normalized discovery address book. */
   knownPeers(): KnownPeerInfo[] {
     this.#assertOpen();
     return this.#backend.knownPeers();
+  }
+
+  /** Returns the native discovery monotonic clock, when discovery is enabled. */
+  discoveryNowMs(): number | undefined {
+    this.#assertOpen();
+    return this.#backend.discoveryNowMs();
   }
 
   /** Returns the active relay reservation, if one exists. */
@@ -193,16 +220,144 @@ export class MiniP2pBase {
     this.#backend.publish(topic, toUint8Array(data));
   }
 
+  /** Sends an explicit ping; the result is emitted as a ping event. */
+  ping(peerId: string): void {
+    this.#assertOpen();
+    this.#backend.ping(peerId);
+  }
+
+  /** Waits until Identify completes for `peerId`. */
+  waitPeerReady(
+    peerId: string,
+    timeoutMs = 65_000
+  ): Promise<P2pEventByTag<P2pEvent_Tags.PeerReady>> {
+    const info = this.peerInfo(peerId);
+    if (info !== undefined) {
+      return Promise.resolve({
+        inner: { peerId, protocols: info.protocols },
+        tag: P2pEvent_Tags.PeerReady,
+      });
+    }
+    return this.waitFor(
+      (event): event is P2pEventByTag<P2pEvent_Tags.PeerReady> =>
+        "tag" in event &&
+        event.tag === P2pEvent_Tags.PeerReady &&
+        event.inner.peerId === peerId,
+      timeoutMs
+    );
+  }
+
+  /** Waits for the next explicit or keepalive ping RTT for `peerId`. */
+  waitPingRtt(
+    peerId: string,
+    timeoutMs = 65_000
+  ): Promise<P2pEventByTag<P2pEvent_Tags.PingRttMeasured>> {
+    return this.waitFor(
+      (event): event is P2pEventByTag<P2pEvent_Tags.PingRttMeasured> =>
+        "tag" in event &&
+        event.tag === P2pEvent_Tags.PingRttMeasured &&
+        event.inner.peerId === peerId,
+      timeoutMs
+    );
+  }
+
+  /** Registers an application protocol at runtime. */
+  addProtocol(protocolId: string): void {
+    this.#assertOpen();
+    this.#backend.addProtocol(protocolId);
+  }
+
+  /** Opens a negotiated custom-protocol stream. */
+  openStream(peerId: string, protocolId: string): number {
+    this.#assertOpen();
+    return this.#backend.openStream(peerId, protocolId);
+  }
+
+  /** Sends UTF-8 text or bytes on a custom-protocol stream. */
+  sendStream(peerId: string, streamId: number, data: string | Bytes): void {
+    this.#assertOpen();
+    assertSafeUnsignedInteger(streamId, "streamId");
+    this.#backend.sendStream(peerId, streamId, toUint8Array(data));
+  }
+
+  /** Half-closes the local write side of a stream. */
+  closeStreamWrite(peerId: string, streamId: number): void {
+    this.#assertOpen();
+    assertSafeUnsignedInteger(streamId, "streamId");
+    this.#backend.closeStreamWrite(peerId, streamId);
+  }
+
+  /** Resets a stream while retaining later close events. */
+  resetStream(peerId: string, streamId: number): void {
+    this.#assertOpen();
+    assertSafeUnsignedInteger(streamId, "streamId");
+    this.#backend.resetStream(peerId, streamId);
+  }
+
+  /** Resets and forgets a stream, suppressing later stream events. */
+  abandonStream(peerId: string, streamId: number): void {
+    this.#assertOpen();
+    assertSafeUnsignedInteger(streamId, "streamId");
+    this.#backend.abandonStream(peerId, streamId);
+  }
+
   /** Starts a connection attempt and returns its endpoint-local ID. */
   connect(peerId: string): number {
     this.#assertOpen();
     return this.#backend.connect(peerId);
   }
 
+  /** Starts a NAT connection attempt using an explicit ordered address set. */
+  connectWithAddrs(peerId: string, addresses: readonly string[]): number {
+    this.#assertOpen();
+    return this.#backend.connectWithAddrs(peerId, addresses);
+  }
+
+  /** Waits for a connection attempt's first usable path or terminal failure. */
+  waitConnectResult(
+    connectId: number,
+    timeoutMs = 65_000
+  ): Promise<
+    | P2pEventByTag<P2pEvent_Tags.PathEstablished>
+    | P2pEventByTag<P2pEvent_Tags.ConnectFailed>
+  > {
+    assertSafeUnsignedInteger(connectId, "connectId");
+    return this.waitFor(
+      (
+        event
+      ): event is
+        | P2pEventByTag<P2pEvent_Tags.PathEstablished>
+        | P2pEventByTag<P2pEvent_Tags.ConnectFailed> =>
+        "tag" in event &&
+        (event.tag === P2pEvent_Tags.PathEstablished ||
+          event.tag === P2pEvent_Tags.ConnectFailed) &&
+        event.inner.connectId === connectId,
+      timeoutMs
+    );
+  }
+
   /** Starts a direct-address connection attempt. */
   connectAddr(address: string): number {
     this.#assertOpen();
     return this.#backend.connectAddr(address);
+  }
+
+  /** Dials a direct address on every applicable local address family. */
+  dial(address: string): number[] {
+    this.#assertOpen();
+    return this.#backend.dial(address);
+  }
+
+  /** Dials a direct address using IPv4. */
+  dialIp4(address: string): number {
+    this.#assertOpen();
+    return this.#backend.dialIp4(address);
+  }
+
+  /** Dials a direct address using IPv6. */
+  dialIp6(address: string): number {
+    this.#assertOpen();
+    return this.#backend.dialIp6(address);
   }
 
   /** Suppresses future events for a known connection attempt. */
@@ -232,13 +387,15 @@ export class MiniP2pBase {
       this.#compactReplaceableEvents();
     }
     if (this.#queue.length >= QUEUE_CAP) {
-      const messageIndex = this.#queue.findIndex(
-        (queued) => queued.tag === P2pEvent_Tags.Message
+      const payloadIndex = this.#queue.findIndex(
+        (queued) =>
+          queued.tag === P2pEvent_Tags.Message ||
+          queued.tag === P2pEvent_Tags.StreamData
       );
-      if (messageIndex === -1) {
+      if (payloadIndex === -1) {
         this.#queue.shift();
       } else {
-        this.#queue.splice(messageIndex, 1);
+        this.#queue.splice(payloadIndex, 1);
       }
       this.#overflowDropped += 1;
     }

@@ -67,6 +67,12 @@ run(
 );
 run(
   process.execPath,
+  [path.join(packageRoot, "scripts/normalize-generated.mjs")],
+  packageRoot,
+  environment
+);
+run(
+  process.execPath,
   [path.join(packageRoot, "scripts/generate-codegen.mjs")],
   packageRoot,
   environment

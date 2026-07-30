@@ -13,6 +13,24 @@ export interface MiniP2pDiscoveryOptions {
   readonly autoDial: boolean;
 }
 
+/** Local-link mDNS discovery settings. Omitted fields use Rust defaults. */
+export interface MiniP2pMdnsOptions {
+  readonly enableIpv6?: boolean;
+  readonly ttlMs?: number;
+  readonly queryIntervalMs?: number;
+  readonly maxPacketBytes?: number;
+  readonly maxAnnouncedAddrs?: number;
+  readonly interfaceRefreshMs?: number;
+  readonly socketPollIntervalMs?: number;
+  readonly autoDial?: boolean;
+}
+
+/** Pubsub routing engine. */
+export enum PubsubRouter {
+  Gossipsub = 0,
+  Floodsub = 1,
+}
+
 /** Configuration accepted by a platform minip2p endpoint. */
 export interface MiniP2pConfig {
   /** Raw 32-byte Ed25519 secret key material. */
@@ -20,15 +38,23 @@ export interface MiniP2pConfig {
   /** Identify agent version, or the native default when absent. */
   readonly agentVersion?: string;
   /** Direct QUIC relay peer addresses. */
-  readonly relays: readonly string[];
+  readonly relays?: readonly string[];
+  /** Direct QUIC peers used as AutoNAT reachability servers. */
+  readonly autonatServers?: readonly string[];
   /** QUIC listen multiaddress, or dual-stack wildcard binding when absent. */
   readonly listenAddr?: string;
   /** Whether connection attempts must remain relayed. */
-  readonly forceRelay: boolean;
+  readonly forceRelay?: boolean;
   /** Whether unsigned pubsub messages are accepted. */
-  readonly allowUnsigned: boolean;
+  readonly allowUnsigned?: boolean;
+  /** Pubsub router; defaults to gossipsub. */
+  readonly pubsubRouter?: PubsubRouter;
+  /** Custom application protocols registered before startup. */
+  readonly protocols?: readonly string[];
   /** Signed-discovery settings, or no discovery when absent. */
   readonly discovery?: MiniP2pDiscoveryOptions;
+  /** Enables mDNS with defaults (`true`) or explicit settings. */
+  readonly mdns?: boolean | MiniP2pMdnsOptions;
 }
 
 /** Coarse local reachability state. */
@@ -96,8 +122,13 @@ export enum P2pEvent_Tags {
   ConnectionEstablished = "ConnectionEstablished",
   ConnectionClosed = "ConnectionClosed",
   PeerReady = "PeerReady",
+  IdentifyReceived = "IdentifyReceived",
   PingRttMeasured = "PingRttMeasured",
   PingTimeout = "PingTimeout",
+  StreamReady = "StreamReady",
+  StreamData = "StreamData",
+  StreamRemoteWriteClosed = "StreamRemoteWriteClosed",
+  StreamClosed = "StreamClosed",
   EndpointError = "EndpointError",
   ReachabilityChanged = "ReachabilityChanged",
   PublicAddressesChanged = "PublicAddressesChanged",
@@ -126,6 +157,16 @@ interface Event<Tag extends P2pEvent_Tags, Inner> {
   readonly inner: Readonly<Inner>;
 }
 
+/** Latest Identify information advertised by a remote peer. */
+export interface IdentifyInfo {
+  readonly publicKey?: ArrayBuffer;
+  readonly listenAddrs: readonly string[];
+  readonly protocols: readonly string[];
+  readonly observedAddr?: string;
+  readonly protocolVersion?: string;
+  readonly agentVersion?: string;
+}
+
 /** A platform-independent event emitted by the minip2p driver. */
 export type P2pEvent =
   | Event<
@@ -145,8 +186,34 @@ export type P2pEvent =
       P2pEvent_Tags.PeerReady,
       { peerId: string; protocols: readonly string[] }
     >
+  | Event<
+      P2pEvent_Tags.IdentifyReceived,
+      { peerId: string; info: IdentifyInfo }
+    >
   | Event<P2pEvent_Tags.PingRttMeasured, { peerId: string; rttMs: number }>
   | Event<P2pEvent_Tags.PingTimeout, { peerId: string }>
+  | Event<
+      P2pEvent_Tags.StreamReady,
+      {
+        peerId: string;
+        connId: number;
+        streamId: number;
+        protocolId: string;
+        initiatedLocally: boolean;
+      }
+    >
+  | Event<
+      P2pEvent_Tags.StreamData,
+      { peerId: string; connId: number; streamId: number; data: ArrayBuffer }
+    >
+  | Event<
+      P2pEvent_Tags.StreamRemoteWriteClosed,
+      { peerId: string; connId: number; streamId: number }
+    >
+  | Event<
+      P2pEvent_Tags.StreamClosed,
+      { peerId: string; connId: number; streamId: number }
+    >
   | Event<
       P2pEvent_Tags.EndpointError,
       {
@@ -232,6 +299,12 @@ export type P2pEvent =
         suppressed: number;
       }
     >;
+
+/** Extracts one native event variant by its tag. */
+export type P2pEventByTag<Tag extends P2pEvent_Tags> = Extract<
+  P2pEvent,
+  { tag: Tag }
+>;
 
 /** One peer in the shared discovery address book. */
 export interface KnownPeerInfo {

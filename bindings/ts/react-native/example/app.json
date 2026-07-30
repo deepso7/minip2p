@@ -9,10 +9,18 @@
     "userInterfaceStyle": "light",
     "ios": {
       "bundleIdentifier": "dev.deepso.minip2p.example",
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSBonjourServices": ["_p2p._udp"],
+        "NSLocalNetworkUsageDescription": "Discover nearby minip2p peers on your local network."
+      }
     },
     "android": {
       "package": "dev.deepso.minip2p.example",
+      "permissions": [
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.CHANGE_WIFI_MULTICAST_STATE"
+      ],
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
