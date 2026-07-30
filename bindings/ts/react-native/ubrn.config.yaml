@@ -1,4 +1,6 @@
 ---
+name: react-native-minip2p
+
 rust:
   directory: ../../..
   manifestPath: crates/ffi/Cargo.toml

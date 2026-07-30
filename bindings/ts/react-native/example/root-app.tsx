@@ -1,5 +1,6 @@
 /* oxlint-disable no-use-before-define, react/style-prop-object -- Styles conventionally follow the component, and React Native accepts conditional style arrays. */
 
+import type { MiniP2p } from "@minip2p/react-native";
 import { StatusBar } from "expo-status-bar";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -11,7 +12,6 @@ import {
   Text,
   View,
 } from "react-native";
-import type { MiniP2p } from "react-native-minip2p";
 
 import { runSmokeSuite } from "./src/smoke";
 import type { SmokeReport, SmokeResult } from "./src/smoke";

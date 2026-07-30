@@ -10,9 +10,9 @@
     "lint": "ultracite check",
     "test": "turbo run test",
     "typecheck": "turbo run typecheck",
-    "rn:android": "pnpm --filter react-native-minip2p ubrn:android",
-    "rn:generate": "pnpm --filter react-native-minip2p ubrn:generate",
-    "rn:ios": "pnpm --filter react-native-minip2p ubrn:ios"
+    "rn:android": "pnpm --filter @minip2p/react-native ubrn:android",
+    "rn:generate": "pnpm --filter @minip2p/react-native ubrn:generate",
+    "rn:ios": "pnpm --filter @minip2p/react-native ubrn:ios"
   },
   "devDependencies": {
     "oxfmt": "0.61.0",

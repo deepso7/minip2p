@@ -1,4 +1,4 @@
-# react-native-minip2p
+# @minip2p/react-native
 
 React Native adapter for the platform-neutral `@minip2p/core` SDK, backed by a TurboModule generated with UniFFI and `uniffi-bindgen-react-native`.
 
@@ -18,7 +18,7 @@ The example uses Expo SDK 56 and `expo-dev-client`. Expo Go is not supported: it
 ## Installation
 
 ```sh
-pnpm add react-native-minip2p
+pnpm add @minip2p/react-native
 ```
 
 The ubrn runtime packages are regular dependencies of this package and are version-locked to the compatible UniFFI 0.31 toolchain.
@@ -30,7 +30,7 @@ import {
   MiniP2p,
   generateSecretKey,
   P2pEvent_Tags,
-} from "react-native-minip2p";
+} from "@minip2p/react-native";
 
 const endpoint = MiniP2p.create({
   secretKey: generateSecretKey(),
@@ -73,7 +73,7 @@ Configuration defaults to gossipsub, signed messages, no relay, and no discovery
 - Wrapper overflow is delivered out of band as `{ type: 'queueOverflow', dropped }`. Native `EventsDropped` remains a normal generated event. On either signal, refresh connected peers, known peers, reachability, and the active reservation from queries.
 - Path events are advisory because the native API has no per-peer current-path query. Reset path badges to unknown after overflow.
 - Event subscribers and `waitFor` observers do not consume events from each other. An exception in one handler does not interrupt other handlers or unwind through the Rust callback.
-- `close` rejects pending waits, suppresses queued callbacks, requests native shutdown, and destroys the UniFFI object. A host needing the native stopped barrier can import the generated low-level API from `react-native-minip2p/native`.
+- `close` rejects pending waits, suppresses queued callbacks, requests native shutdown, and destroys the UniFFI object. A host needing the native stopped barrier can import the generated low-level API from `@minip2p/react-native/native`.
 - Unsigned pubsub messages are explicitly untrusted. When `signed` is false, both payload and `fromPeerId` are attacker-controlled.
 
 ## Generation

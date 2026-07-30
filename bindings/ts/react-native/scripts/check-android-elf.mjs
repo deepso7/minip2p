@@ -52,22 +52,23 @@ for (const library of libraries) {
     .filter((line) =>
       /OPENSSL_memory_(?:alloc|free|get_size)$/u.test(line.trim())
     );
-  if (
-    symbols.length !== 3 ||
-    symbols.some(
-      (line) =>
-        !/\bOBJECT\b/u.test(line) ||
-        !/\bLOCAL\b/u.test(line) ||
-        /\bUND\b/u.test(line)
-    )
-  ) {
+  const hasInvalidHooks =
+    symbols.length !== 0 &&
+    (symbols.length !== 3 ||
+      symbols.some(
+        (line) =>
+          !/\bOBJECT\b/u.test(line) ||
+          !/\bLOCAL\b/u.test(line) ||
+          /\bUND\b/u.test(line)
+      ));
+  if (hasInvalidHooks) {
     throw new Error(
-      `${library.abi} allocator hooks are not three defined LOCAL OBJECT symbols`
+      `${library.abi} allocator hooks are neither optimized away nor three defined LOCAL OBJECT symbols`
     );
   }
 
   console.log(
-    `${library.abi}: LOAD=${[...new Set(alignments)].join(",")} allocator-hooks=LOCAL`
+    `${library.abi}: LOAD=${[...new Set(alignments)].join(",")} allocator-hooks=${symbols.length === 0 ? "optimized-away" : "LOCAL"}`
   );
 }
 

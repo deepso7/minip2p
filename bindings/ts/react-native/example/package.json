@@ -12,12 +12,12 @@
     "web": "expo start --web"
   },
   "dependencies": {
+    "@minip2p/react-native": "workspace:*",
     "expo": "~56.0.18",
     "expo-dev-client": "~56.0.24",
     "expo-status-bar": "~56.0.4",
     "react": "19.2.3",
-    "react-native": "0.85.3",
-    "react-native-minip2p": "workspace:*"
+    "react-native": "0.85.3"
   },
   "devDependencies": {
     "@types/react": "~19.2.2",

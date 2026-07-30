@@ -5,12 +5,12 @@ import {
   MiniP2p,
   P2pEvent_Tags,
   generateSecretKey,
-} from "react-native-minip2p";
+} from "@minip2p/react-native";
 import type {
   MiniP2pConfig,
   MiniP2pEvent,
   P2pEvent,
-} from "react-native-minip2p";
+} from "@minip2p/react-native";
 
 declare const TextEncoder: new () => {
   encode: (input: string) => Uint8Array;

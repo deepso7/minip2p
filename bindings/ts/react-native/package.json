@@ -1,6 +1,6 @@
 {
-  "name": "react-native-minip2p",
-  "version": "0.1.0",
+  "name": "@minip2p/react-native",
+  "version": "0.1.1",
   "description": "React Native bindings for minip2p",
   "keywords": [
     "android",
@@ -61,13 +61,14 @@
     "./package.json": "./package.json"
   },
   "publishConfig": {
+    "access": "public",
     "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
     "example": "pnpm --filter react-native-minip2p-example",
     "ubrn:generate": "node scripts/generate-bindings.mjs",
-    "ubrn:ios": "IPHONEOS_DEPLOYMENT_TARGET=15.1 ubrn build ios --config ubrn.config.yaml --and-generate && node scripts/normalize-generated.mjs && node scripts/generate-codegen.mjs && node scripts/normalize-generated.mjs",
-    "ubrn:android": "env -u LIBCLANG_PATH ANDROID_HOME=${ANDROID_HOME:-$HOME/Library/Android/sdk} ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-$HOME/Library/Android/sdk/ndk/28.2.13676358} ubrn build android --config ubrn.config.yaml --and-generate && node scripts/normalize-generated.mjs && node scripts/generate-codegen.mjs && node scripts/normalize-generated.mjs",
+    "ubrn:ios": "IPHONEOS_DEPLOYMENT_TARGET=15.1 ubrn build ios --release --config ubrn.config.yaml --and-generate && node scripts/normalize-generated.mjs && node scripts/generate-codegen.mjs && node scripts/normalize-generated.mjs",
+    "ubrn:android": "env -u LIBCLANG_PATH ANDROID_HOME=${ANDROID_HOME:-$HOME/Library/Android/sdk} ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-$HOME/Library/Android/sdk/ndk/28.2.13676358} ubrn build android --release --config ubrn.config.yaml --and-generate && node scripts/normalize-generated.mjs && node scripts/generate-codegen.mjs && node scripts/normalize-generated.mjs",
     "clean": "del-cli android/.cxx android/build example/android/build example/android/app/build example/ios/build lib",
     "build": "bob build && node scripts/normalize-generated.mjs",
     "prepack": "pnpm build && node scripts/check-package-native.mjs",

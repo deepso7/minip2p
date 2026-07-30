@@ -17,7 +17,7 @@ ext {
 }
 `;
     const withoutPreviousBlock = project.modResults.contents.replace(
-      new RegExp(`${escapeRegExp(MARKER)}[\\s\\S]*?\\n}\\n`, "mu"),
+      new RegExp(`${escapeRegExp(MARKER)}[\\s\\S]*?\\n\\}\\n`, "mu"),
       ""
     );
     project.modResults.contents = `${block}\n${withoutPreviousBlock}`;
