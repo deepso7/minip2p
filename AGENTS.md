@@ -8,7 +8,7 @@ minip2p is a minimal libp2p implementation in Rust: small, portable, understanda
 - Sans-I/O: keep core logic deterministic; I/O belongs in adapters.
 - `no_std + alloc` core crates.
 - No `async`/`.await`; remain caller-driven and executor-independent.
-- QUIC only; other transport adapters are out of scope.
+- TCP and QUIC side by side: TCP is portable down to `no_std`, QUIC stays `std`-only.
 
 Additional constraints: `unsafe` is forbidden workspace-wide; sockets, clocks, and timers live only in adapters/drivers; pre-1.0, breaking API changes are fine.
 

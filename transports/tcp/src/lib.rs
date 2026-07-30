@@ -17,13 +17,19 @@
 //! # Backpressure
 //!
 //! A session produces bytes whether or not the socket will take them, so the
-//! transport buffers per connection and retries on
-//! [`TcpEvent::Writable`] or on the next
-//! [`poll`](minip2p_transport::Transport::poll). While anything is buffered,
+//! transport buffers per connection and retries on every
+//! [`poll`](minip2p_transport::Transport::poll) -- there is one flush point,
+//! not a separate path for [`TcpEvent::Writable`], so a provider that reports
+//! readiness coarsely still drains.
+//!
+//! While a socket is still accepting,
 //! [`next_deadline`](minip2p_transport::Transport::next_deadline) reports
-//! immediate so a driver keeps coming back. A peer that stops reading
-//! altogether is bounded by [`TcpConfig::max_buffered_send`], which fails that
-//! connection rather than growing without limit.
+//! immediate so a driver keeps coming back. Once one refuses everything, it
+//! reports when the stall turns fatal instead: claiming urgency against a
+//! socket that takes nothing would spin a deadline-driven host for as long as
+//! the peer stayed silent. Two limits bound the damage --
+//! [`TcpConfig::max_buffered_send`] on how much may queue, and
+//! [`TcpConfig::send_stall_timeout_ms`] on how long it may sit there.
 //!
 //! # Identity
 //!

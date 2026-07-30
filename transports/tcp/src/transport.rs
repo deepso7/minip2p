@@ -64,6 +64,11 @@ struct Connection {
     session: SecureMuxSession,
     /// Bytes the session has produced that the socket has not accepted yet.
     outbound: VecDeque<u8>,
+    /// When the socket last refused everything, while bytes were still queued.
+    ///
+    /// `None` means the last flush made progress. Cleared the moment the
+    /// socket accepts anything again.
+    stalled_since: Option<u64>,
 }
 
 impl Connection {
@@ -238,8 +243,9 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
 
     /// Writes as much of the outbound buffer as the socket takes.
     ///
-    /// Stops at the first write the socket does not fully accept and keeps the
-    /// remainder, which a later `Writable` or `poll` retries. A dialed socket
+    /// Stops at the first write the socket refuses and keeps the remainder,
+    /// which the next [`poll`](Transport::poll) retries -- that is the only
+    /// flush point, so no separate readiness path can miss it. A dialed socket
     /// that has not linked yet holds everything, since writing before the
     /// stream is up is not allowed.
     fn flush(&mut self, connection: &mut Connection) -> Result<(), Teardown> {
@@ -433,6 +439,7 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                 linked: true,
                 session,
                 outbound: VecDeque::new(),
+                stalled_since: None,
             },
         );
         self.pending.push_back(TransportEvent::IncomingConnection {
@@ -473,6 +480,14 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
             resource: "tcp connection ids",
         })?;
         let session = self.new_session(SessionRole::Initiator, Some(addr.peer_id().clone()))?;
+
+        // Spend the id before the first failure that names it. `DialFailed`
+        // carries this id, so handing it back for a later dial to reuse would
+        // point two outcomes at one id -- the same reason `accept` allocates up
+        // front. Entropy failures above name no id, so they cost nothing.
+        let consumed = self.ids.allocate();
+        debug_assert_eq!(consumed, Ok(id), "peeked id must match the allocated one");
+
         let socket = self
             .provider
             .connect(target)
@@ -480,9 +495,6 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
                 id,
                 reason: error.to_string(),
             })?;
-
-        let consumed = self.ids.allocate();
-        debug_assert_eq!(consumed, Ok(id), "peeked id must match the allocated one");
 
         self.by_socket.insert(socket, id);
         self.connections.insert(
@@ -496,6 +508,7 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
                 linked: false,
                 session,
                 outbound: VecDeque::new(),
+                stalled_since: None,
             },
         );
         Ok(id)
@@ -624,18 +637,48 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         }
         // Retry buffered writes even without a `Writable` event, so a provider
         // that only reports readiness coarsely still drains.
+        let timeout = self.config.send_stall_timeout_ms;
         for id in self.connections.keys().copied().collect::<Vec<_>>() {
-            let buffered = self
+            let Some(before) = self
                 .connections
                 .get(&id)
-                .is_some_and(|connection| !connection.outbound.is_empty());
-            if !buffered {
+                .map(|connection| connection.outbound.len())
+            else {
+                continue;
+            };
+            if before == 0 {
+                // Fully drained, so nothing is stalled. Leaving a stale mark
+                // here would make the next socketful look like the tail of an
+                // old stall and fail the connection on the spot.
+                if let Some(connection) = self.connections.get_mut(&id) {
+                    connection.stalled_since = None;
+                }
                 continue;
             }
             if let Err(teardown) =
                 self.with_connection(id, |this, connection| this.flush(connection))
             {
                 self.fail_connection(id, teardown.message, true);
+                continue;
+            }
+
+            let stalled_for = {
+                let Some(connection) = self.connections.get_mut(&id) else {
+                    continue;
+                };
+                if connection.outbound.len() < before {
+                    connection.stalled_since = None;
+                    continue;
+                }
+                let since = *connection.stalled_since.get_or_insert(now.monotonic_ms);
+                now.saturating_millis_since(Now::from_millis(since))
+            };
+            if timeout.is_some_and(|limit| stalled_for >= limit) {
+                self.fail_connection(
+                    id,
+                    format!("socket accepted nothing for {stalled_for}ms; peer is not reading"),
+                    true,
+                );
             }
         }
         Ok(self.drain_pending_events())
@@ -647,16 +690,29 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
             // reads, so this needs no retained time sample.
             return Some(Deadline::IMMEDIATE);
         }
-        if self
-            .connections
-            .values()
-            .any(|connection| !connection.outbound.is_empty())
-        {
-            // Queued writes are waiting on socket writability; keep the driver
-            // coming back until they drain.
-            return Some(Deadline::IMMEDIATE);
+        let mut stall = None;
+        for connection in self.connections.values() {
+            if connection.outbound.is_empty() {
+                continue;
+            }
+            let Some(since) = connection.stalled_since else {
+                // The socket is still taking bytes, so coming straight back
+                // makes progress.
+                return Some(Deadline::IMMEDIATE);
+            };
+            // It is not, and spinning would not change that. Sleep until the
+            // stall becomes fatal; the provider's own readiness reporting is
+            // what wakes us sooner if the peer starts reading again.
+            let Some(timeout) = self.config.send_stall_timeout_ms else {
+                continue;
+            };
+            let deadline = Deadline::from_millis(since.saturating_add(timeout));
+            stall = Some(match stall {
+                Some(earliest) => Deadline::earliest(earliest, deadline),
+                None => deadline,
+            });
         }
-        self.provider.next_deadline()
+        Deadline::earliest_opt(stall, self.provider.next_deadline())
     }
 
     fn local_addresses(&self) -> Vec<Multiaddr> {

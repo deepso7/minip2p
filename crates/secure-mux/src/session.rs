@@ -538,11 +538,22 @@ impl SecureMuxSession {
         // that drains outputs after an error would treat a dead session as up.
         let established_at = self.outputs.len();
         if !remaining.is_empty() {
-            let result = yamux.handle_input(YamuxInput::Data(remaining));
-            self.drain_yamux(&mut noise, &mut yamux)?;
-            result.map_err(|error| {
-                SessionError::protocol(format!("Yamux protocol failed: {error}"))
-            })?;
+            let handled = yamux.handle_input(YamuxInput::Data(remaining));
+            let drained = self.drain_yamux(&mut noise, &mut yamux);
+            let outcome = drained.and_then(|()| {
+                handled.map_err(|error| {
+                    SessionError::protocol(format!("Yamux protocol failed: {error}"))
+                })
+            });
+            if let Err(error) = outcome {
+                // The upgrade never completed, so nothing the remainder
+                // produced may be published either. Callers drain outputs even
+                // when the input failed, to flush bytes the session had already
+                // queued; without this they would also see substream traffic on
+                // a connection they were never told came up.
+                self.outputs.truncate(established_at);
+                return Err(error);
+            }
         }
         self.outputs.insert(
             established_at,
@@ -664,7 +675,7 @@ fn yamux_stream(stream: StreamId) -> Result<u32, SessionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minip2p_yamux::Frame;
+    use minip2p_yamux::{FLAG_SYN, Frame};
 
     /// Runs two raw Noise sessions through their handshake, returning both in
     /// transport mode with their nonces in step.
@@ -766,15 +777,23 @@ mod tests {
     /// A peer that writes its Yamux confirmation and its first frames in one
     /// socket write lands both in a single Noise plaintext, so the
     /// confirmation's `take_remaining_buffer` carries those frames. If they
-    /// are fatal the upgrade never completed, and `Established` must not be
-    /// left pollable -- a host draining outputs after the error would read a
-    /// dead session as a live one.
+    /// are fatal the upgrade never completed, and nothing the remainder
+    /// produced may be left pollable -- neither `Established` nor the
+    /// substream traffic that preceded the failure. Callers drain outputs even
+    /// after an error, to flush bytes the session had already queued, so
+    /// anything left behind is something they will act on.
     ///
     /// A `SecureMuxSession` emits the two as separate plaintexts, so this
     /// packs them by hand. That needs crate internals, which is why the test
     /// lives here rather than in `tests/`.
-    #[test]
-    fn a_fatal_pipelined_remainder_never_announces_establishment() {
+    /// Builds a dialer awaiting its Yamux confirmation, and hands it one Noise
+    /// plaintext holding that confirmation followed by `trailing` frames.
+    ///
+    /// Packing them by hand is the point: a real peer usually sends them as
+    /// separate Noise messages, and those are handled after the phase is
+    /// already `Ready`, so they never race the announcement. Only a single
+    /// packed plaintext reaches `take_remaining_buffer`.
+    fn feed_packed_remainder(trailing: Vec<u8>) -> (SecureMuxSession, Result<(), SessionError>) {
         let dialer_key = Ed25519Keypair::generate();
         let listener_key = Ed25519Keypair::generate();
         let listener_peer = listener_key.peer_id();
@@ -792,9 +811,8 @@ mod tests {
             outputs: VecDeque::new(),
         };
 
-        // One plaintext: the confirming echo followed by a fatal GoAway.
         let mut packed = echo;
-        packed.extend_from_slice(&Frame::go_away(1).encode());
+        packed.extend_from_slice(&trailing);
         listener_noise
             .handle_input(NoiseInput::Encrypt(packed))
             .expect("encrypt the packed plaintext");
@@ -807,6 +825,53 @@ mod tests {
         assert!(!ciphertext.is_empty(), "packed plaintext must encrypt");
 
         let result = dialer.handle_input(ciphertext);
+        (dialer, result)
+    }
+
+    fn syn_with_data() -> Vec<u8> {
+        Frame::data(2, FLAG_SYN, b"pipelined".to_vec())
+            .expect("well-formed frame")
+            .encode()
+    }
+
+    /// The sound twin of the test below: substream traffic packed alongside the
+    /// confirmation must still queue behind `Established`, so a host applying
+    /// connection policy sees the peer before it has to decide anything about a
+    /// stream.
+    #[test]
+    fn a_sound_pipelined_remainder_queues_behind_establishment() {
+        let (mut dialer, result) = feed_packed_remainder(syn_with_data());
+        result.expect("a sound remainder must complete the upgrade");
+        assert!(dialer.is_established());
+
+        let outputs: Vec<SessionOutput> = core::iter::from_fn(|| dialer.poll_output()).collect();
+        let established = outputs
+            .iter()
+            .position(|output| matches!(output, SessionOutput::Established { .. }))
+            .expect("the upgrade completed");
+        let first_stream = outputs
+            .iter()
+            .position(|output| {
+                matches!(
+                    output,
+                    SessionOutput::IncomingStream { .. } | SessionOutput::StreamData { .. }
+                )
+            })
+            .expect("the packed frames must surface, or this proves nothing");
+        assert!(
+            established < first_stream,
+            "Established must precede the remainder's stream output: {outputs:?}"
+        );
+    }
+
+    #[test]
+    fn a_fatal_pipelined_remainder_publishes_nothing_at_all() {
+        // The confirming echo, then a substream carrying data, then a fatal
+        // GoAway. The frames before the GoAway are what the drain turns into
+        // pollable stream outputs before it fails.
+        let mut trailing = syn_with_data();
+        trailing.extend_from_slice(&Frame::go_away(1).encode());
+        let (mut dialer, result) = feed_packed_remainder(trailing);
 
         assert!(
             matches!(result, Err(SessionError::GoAway { code: 1 })),
@@ -816,10 +881,10 @@ mod tests {
 
         let outputs: Vec<SessionOutput> = core::iter::from_fn(|| dialer.poll_output()).collect();
         assert!(
-            !outputs
+            outputs
                 .iter()
-                .any(|output| matches!(output, SessionOutput::Established { .. })),
-            "a failed upgrade must not leave Established pollable: {outputs:?}"
+                .all(|output| matches!(output, SessionOutput::Write(_))),
+            "a failed upgrade may leave only queued writes behind: {outputs:?}"
         );
     }
 }

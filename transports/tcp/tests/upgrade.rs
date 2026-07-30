@@ -163,19 +163,60 @@ fn two_nodes_complete_the_upgrade_and_authenticate_each_other() {
         pair.listener_events
     );
 
-    // The contract forbids stream events before Connected, on both sides.
+    // The contract forbids stream events before Connected. Nothing about a
+    // substream may surface from an upgrade at all -- if the session ever
+    // leaked what a pipelined remainder produced, it would show up here.
     for events in [&pair.dialer_events, &pair.listener_events] {
-        let connected = position(events, |event| {
-            matches!(event, TransportEvent::Connected { .. })
-        })
-        .expect("upgrade completed");
-        if let Some(first_stream) = position(events, is_stream_event) {
-            assert!(
-                connected < first_stream,
-                "no stream event may precede Connected: {events:?}"
-            );
+        assert!(
+            !events.iter().any(is_stream_event),
+            "an upgrade must publish nothing about substreams: {events:?}"
+        );
+    }
+}
+
+#[test]
+fn connected_precedes_the_substream_a_peer_opens_immediately() {
+    let net = VirtualNetwork::new();
+    let dialer_key = identity(1);
+    let listener_key = identity(2);
+    let listener_peer = listener_key.peer_id();
+    let mut dialer = node(&net, dialer_key, 10);
+    let mut listener = node(&net, listener_key, 20);
+    listener.listen(&addr(LISTEN_ADDR)).expect("listener binds");
+
+    let target = PeerAddr::new(addr(LISTEN_ADDR), listener_peer).expect("dial target");
+    let id = dialer.dial(&target).expect("dial starts");
+
+    // Stop as soon as the listener is up, while the dialer has not yet read
+    // the confirmation that would finish its own upgrade.
+    let mut settled = false;
+    for _ in 0..64 {
+        let _ = dialer.poll(Now::from_millis(0)).expect("drive dialer");
+        let _ = listener.poll(Now::from_millis(0)).expect("drive listener");
+        if !listener.connection_ids().is_empty() && listener.open_stream(id).is_ok() {
+            settled = true;
+            break;
         }
     }
+    assert!(settled, "the listener must establish first");
+
+    // Its substream frames now sit behind that unread confirmation, so the
+    // dialer decrypts both together and must still report Connected first.
+    listener
+        .send_stream(id, StreamId::new(2), b"eager".to_vec())
+        .expect("send on the fresh substream");
+    let (dialer_events, _) = drive(&net, &mut dialer, &mut listener);
+
+    let connected = position(&dialer_events, |event| {
+        matches!(event, TransportEvent::Connected { .. })
+    })
+    .expect("the dialer completes its upgrade");
+    let first_stream = position(&dialer_events, is_stream_event)
+        .expect("the peer's substream must arrive in this batch, or this proves nothing");
+    assert!(
+        connected < first_stream,
+        "no stream event may precede Connected: {dialer_events:?}"
+    );
 }
 
 #[test]
@@ -279,6 +320,41 @@ fn a_mismatched_expected_peer_fails_the_dial() {
 }
 
 #[test]
+fn a_dial_that_fails_outright_never_hands_its_id_to_another_connection() {
+    let net = VirtualNetwork::new();
+    let listener_key = identity(2);
+    let listener_peer = listener_key.peer_id();
+    let mut dialer = node(&net, identity(1), 10);
+    let mut listener = node(&net, listener_key, 20);
+    listener.listen(&addr(LISTEN_ADDR)).expect("listener binds");
+
+    let target = PeerAddr::new(addr(LISTEN_ADDR), listener_peer).expect("dial target");
+    dialer.provider_mut().fail_connect(true);
+    let failed = match dialer.dial(&target) {
+        Err(TransportError::DialFailed { id, .. }) => id,
+        other => panic!("expected the dial to fail outright, got {other:?}"),
+    };
+    assert!(dialer.connection_ids().is_empty());
+
+    // That id already named a failure the caller was told about, so a later
+    // dial must not answer to it as well.
+    dialer.provider_mut().fail_connect(false);
+    let second = dialer.dial(&target).expect("second dial starts");
+    assert_ne!(
+        second, failed,
+        "an id that named a failed dial must not be reused"
+    );
+
+    let (dialer_events, _) = drive(&net, &mut dialer, &mut listener);
+    assert!(
+        dialer_events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Connected { id, .. } if *id == second)),
+        "the second dial must still succeed: {dialer_events:?}"
+    );
+}
+
+#[test]
 fn a_refused_connect_reports_error_then_closed() {
     let net = VirtualNetwork::new();
     let mut dialer = node(&net, identity(1), 10);
@@ -349,7 +425,11 @@ fn a_full_socket_buffers_and_drains_as_the_peer_reads() {
             stream_id: stream
         }]
     );
-    assert_eq!(dialer.next_deadline(), Some(Deadline::IMMEDIATE));
+    assert_eq!(
+        dialer.next_deadline(),
+        Some(Deadline::IMMEDIATE),
+        "a socket still taking bytes must keep the driver coming back"
+    );
 
     let (_, listener_events) = drive(&net, &mut dialer, &mut listener);
     let received: Vec<u8> = listener_events
@@ -437,6 +517,133 @@ fn closing_a_socket_that_cannot_flush_aborts_instead_of_truncating() {
         pair.dialer.provider().abort_calls(),
         aborts_before + 1,
         "the socket must be discarded instead"
+    );
+    assert!(pair.dialer.connection_ids().is_empty());
+}
+
+#[test]
+fn a_stalled_socket_stops_claiming_urgency_and_recovers() {
+    let mut pair = upgraded_pair();
+    let id = pair.connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    // The peer stops reading. What is queued stays well under the ceiling, so
+    // the connection lives on -- and must not keep telling the driver to come
+    // straight back, which would spin for as long as the peer stays silent.
+    pair.dialer.provider_mut().set_in_flight_capacity(Some(0));
+    pair.dialer
+        .send_stream(id, stream, vec![3u8; 1024])
+        .expect("queue bytes the socket will refuse");
+    let _ = pair
+        .dialer
+        .poll(Now::from_millis(0))
+        .expect("attempt a flush");
+
+    assert_eq!(
+        pair.dialer.next_deadline(),
+        Some(Deadline::from_millis(30_000)),
+        "a refused socket must be waited on, not spun on"
+    );
+    assert_eq!(
+        pair.dialer.connection_ids(),
+        vec![id],
+        "a stall well inside the timeout is not fatal"
+    );
+
+    // The peer reads again, so the stall clears and the bytes go out.
+    pair.dialer.provider_mut().set_in_flight_capacity(None);
+    let (_, listener_events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+    let delivered: usize = listener_events
+        .iter()
+        .filter_map(|event| match event {
+            TransportEvent::StreamData { data, .. } => Some(data.len()),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(delivered, 1024, "the queued payload must survive the stall");
+    assert_eq!(pair.dialer.next_deadline(), None);
+}
+
+#[test]
+fn a_stall_is_measured_from_when_it_started_not_from_an_older_one() {
+    let mut pair = upgraded_pair();
+    let id = pair.connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    // Stall early.
+    pair.dialer.provider_mut().set_in_flight_capacity(Some(0));
+    pair.dialer
+        .send_stream(id, stream, vec![1u8; 512])
+        .expect("queue bytes");
+    let _ = pair.dialer.poll(Now::from_millis(0)).expect("first stall");
+
+    // Recover through a send rather than a poll, so the backlog drains inside
+    // that call and no poll ever observes the buffer shrinking. Only noticing
+    // the drained buffer itself clears the mark on this path.
+    pair.dialer.provider_mut().set_in_flight_capacity(None);
+    pair.dialer
+        .send_stream(id, stream, vec![9u8; 16])
+        .expect("this send flushes the backlog too");
+    let _ = pair
+        .dialer
+        .poll(Now::from_millis(1_000))
+        .expect("observe the drained buffer");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    // Long after that first stall would have expired, stall again. The clock
+    // for the new one starts now; carrying the old mark forward would fail the
+    // connection on its very first refused write.
+    let much_later = Now::from_millis(10 * 60 * 1000);
+    pair.dialer.provider_mut().set_in_flight_capacity(Some(0));
+    pair.dialer
+        .send_stream(id, stream, vec![2u8; 512])
+        .expect("queue more bytes");
+    let events = pair.dialer.poll(much_later).expect("second stall");
+
+    assert!(
+        events.is_empty(),
+        "a fresh stall must not be treated as an expired one: {events:?}"
+    );
+    assert_eq!(pair.dialer.connection_ids(), vec![id]);
+    assert_eq!(
+        pair.dialer.next_deadline(),
+        Some(Deadline::from_millis(10 * 60 * 1000 + 30_000))
+    );
+}
+
+#[test]
+fn a_socket_that_never_recovers_fails_once_the_stall_timeout_passes() {
+    let mut pair = upgraded_pair();
+    let id = pair.connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    pair.dialer.provider_mut().set_in_flight_capacity(Some(0));
+    pair.dialer
+        .send_stream(id, stream, vec![4u8; 512])
+        .expect("queue bytes");
+    let _ = pair
+        .dialer
+        .poll(Now::from_millis(1_000))
+        .expect("stall starts");
+    assert_eq!(pair.dialer.connection_ids(), vec![id]);
+
+    // Still refusing a full timeout later: the peer is gone, not busy.
+    let events = pair
+        .dialer
+        .poll(Now::from_millis(1_000 + 30_000))
+        .expect("stall expires");
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                TransportEvent::Error { id: failed, message },
+                TransportEvent::Closed { id: closed },
+            ] if *failed == id && *closed == id && message.contains("not reading")
+        ),
+        "an unrecoverable stall must be reported, then closed: {events:?}"
     );
     assert!(pair.dialer.connection_ids().is_empty());
 }

@@ -147,6 +147,9 @@ pub enum TcpEvent {
 ///   follows it.
 /// - [`TcpEvent::Closed`] is terminal: no further events for that handle, and
 ///   the handle is never reused.
+/// - [`TcpEvent::Writable`] is a hint, not a requirement. The transport retries
+///   buffered writes on every poll regardless, so a provider whose readiness
+///   reporting is coarse still drains; emitting it lets a host wake sooner.
 /// - After [`abort`](Self::abort), the provider emits nothing further for that
 ///   handle -- the caller asked for the teardown and needs no confirmation.
 /// - Events for one stream are in causal order within a single `poll`.
@@ -170,8 +173,12 @@ pub trait TcpProvider {
     /// how many leading bytes were accepted.
     ///
     /// A short write is normal, not an error: the caller keeps the remainder
-    /// and retries when [`TcpEvent::Writable`] arrives. Accepting nothing is a
-    /// valid short write. `data` is never empty.
+    /// and retries on its next poll. Accepting nothing is a valid short write.
+    /// `data` is never empty.
+    ///
+    /// A socket that keeps accepting nothing eventually fails the connection,
+    /// so a provider that can tell a busy peer from a dead one should report
+    /// the dead one as [`TcpEvent::Closed`] rather than refuse writes forever.
     fn send(&mut self, socket: SocketHandle, data: &[u8]) -> Result<usize, TcpError>;
 
     /// Half-closes the local write side once buffered bytes are flushed.

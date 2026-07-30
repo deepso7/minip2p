@@ -34,17 +34,21 @@ Three details are easy to get wrong, and the transport depends on all three:
   after `abort` the provider emits nothing further for it — the caller asked for
   the teardown and needs no confirmation.
 
-`TcpProvider`'s rustdoc has the full contract. Providers that report writability
-only coarsely still work: the transport retries buffered writes on every `poll`,
-not only on `TcpEvent::Writable`.
+`TcpProvider`'s rustdoc has the full contract. `TcpEvent::Writable` is a hint
+rather than a requirement: the transport retries buffered writes on every
+`poll`, so a provider whose readiness reporting is coarse still drains.
 
 ## Backpressure
 
 A session produces bytes whether or not the socket will take them, so the
-transport buffers per connection. While anything is buffered, `next_deadline`
-reports immediate, so a driver keeps coming back instead of sleeping. A peer that
-stops reading altogether is bounded by `TcpConfig::max_buffered_send`, which
-fails that connection rather than growing without limit.
+transport buffers per connection. While the socket is still accepting,
+`next_deadline` reports immediate so a driver keeps coming back. Once it refuses
+everything, that becomes the point at which the stall turns fatal instead —
+claiming urgency against a socket taking nothing would spin a deadline-driven
+host for as long as the peer stayed silent. `TcpConfig::max_buffered_send`
+bounds how much may queue and `TcpConfig::send_stall_timeout_ms` how long it may
+sit there, so a peer that stops reading for good loses its connection rather
+than pinning memory.
 
 ## Identity
 

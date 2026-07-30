@@ -101,6 +101,8 @@ struct Net {
     /// Nodes that never emit `Writable`, standing in for a provider whose
     /// readiness reporting is coarser than the contract's.
     silent_nodes: BTreeMap<usize, bool>,
+    /// Nodes whose `connect` fails synchronously.
+    failing_connect: BTreeMap<usize, bool>,
     /// Per node: how many times each teardown call was made.
     close_write_calls: BTreeMap<usize, usize>,
     abort_calls: BTreeMap<usize, usize>,
@@ -190,6 +192,17 @@ impl VirtualProvider {
         }
     }
 
+    /// Makes `connect` fail outright rather than asynchronously.
+    ///
+    /// A real provider does this when the address is unusable before any packet
+    /// goes out -- no route to host, no file descriptors left.
+    pub fn fail_connect(&mut self, failing: bool) {
+        self.net
+            .borrow_mut()
+            .failing_connect
+            .insert(self.node, failing);
+    }
+
     /// Stops this node's provider from ever emitting `TcpEvent::Writable`.
     ///
     /// The contract asks providers to emit it after a partial write, but a real
@@ -266,6 +279,17 @@ impl TcpProvider for VirtualProvider {
 
     fn connect(&mut self, addr: &Multiaddr) -> Result<SocketHandle, TcpError> {
         let mut net = self.net.borrow_mut();
+        if net
+            .failing_connect
+            .get(&self.node)
+            .copied()
+            .unwrap_or(false)
+        {
+            return Err(TcpError::Io {
+                operation: "connect",
+                reason: "injected connect failure".to_string(),
+            });
+        }
         let client = net.next_handle;
         net.next_handle += 1;
 
