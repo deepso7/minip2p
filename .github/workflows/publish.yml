@@ -375,6 +375,7 @@ jobs:
             minip2p-nat
             minip2p-pubsub
             minip2p-quic
+            minip2p-tcp
             minip2p-rs
           )
 

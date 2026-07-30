@@ -26,6 +26,7 @@ members = [
     "crates/transport",
     "crates/yamux",
     "transports/quic",
+    "transports/tcp",
     "examples/chat",
     "examples/common",
     "examples/peer",
