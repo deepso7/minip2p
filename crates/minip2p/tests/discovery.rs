@@ -1,4 +1,4 @@
-//! Loopback facade coverage for pubsub peer discovery.
+//! Loopback endpoint coverage for pubsub peer discovery.
 
 #![cfg(feature = "discovery")]
 

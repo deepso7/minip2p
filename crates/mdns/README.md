@@ -7,7 +7,7 @@ outgoing actions and observations.
 
 mDNS claims are unauthenticated. A successful QUIC/TLS handshake verifies the
 remote peer identity later, while the shared discovery book bounds retained
-claims and automatic dial traffic. Facade automatic dials from mDNS are
+claims and automatic dial traffic. Endpoint automatic dials from mDNS are
 direct-only: an unauthenticated claim never authorizes a configured relay or
 HOP CONNECT.
 

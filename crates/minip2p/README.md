@@ -1,6 +1,6 @@
 # minip2p-rs
 
-App-facing facade for minip2p.
+Application-facing `Endpoint` API for minip2p.
 
 ```toml
 [dependencies]
@@ -55,6 +55,10 @@ With the `nat` feature, `EndpointTransport` is a
 resulting concrete swarm type. Relay bridges are promoted through end-to-end
 Noise and Yamux before `wait_path` returns `Path::Relayed`, so application
 protocols use ordinary streams on direct and relayed paths alike.
+`Endpoint::path(peer)` returns the current NAT-orchestrated path independently
+of whether the corresponding event was drained. It is updated before path
+events are queued and cleared only after the peer's final usable connection
+closes.
 
 With the `discovery` feature, `.discovery()` enables signed pubsub presence
 beacons, a bounded TTL address book, and caller-driven automatic NAT connects.

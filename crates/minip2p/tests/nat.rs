@@ -1,4 +1,4 @@
-//! End-to-end coverage for the `nat` facade over direct QUIC and a real
+//! End-to-end coverage for the `nat` endpoint API over direct QUIC and a real
 //! loopback Circuit Relay v2 bridge.
 
 #![cfg(feature = "nat")]
@@ -55,6 +55,21 @@ fn direct_candidate_wins_over_loopback() {
     }
     assert!(matches!(path, Some(Path::DirectDialed)));
     assert!(a.connected_peers().contains(b_addr.peer_id()));
+    assert!(
+        matches!(a.path(b_addr.peer_id()), Some(Path::DirectDialed)),
+        "the path query must survive PathEstablished event consumption"
+    );
+
+    a.disconnect(b_addr.peer_id()).expect("disconnect starts");
+    while a.connected_peers().contains(b_addr.peer_id()) {
+        assert!(Instant::now() < deadline, "disconnect timed out");
+        let _ = a.next_event(Duration::from_millis(20)).expect("a drives");
+        let _ = b.next_event(Duration::from_millis(20)).expect("b drives");
+    }
+    assert!(
+        a.path(b_addr.peer_id()).is_none(),
+        "the path query must clear after the final connection closes"
+    );
 }
 
 #[test]
@@ -121,7 +136,7 @@ fn wait_peer_ready_drives_nat_agent() {
     let b_addr = b.listen().expect("b listens");
     a.listen().expect("a listens");
 
-    // The facade wait drives only `a`, so keep the remote's socket serviced
+    // The endpoint wait drives only `a`, so keep the remote's socket serviced
     // concurrently. `wait_peer_ready` must feed ConnectionEstablished to
     // the NAT agent on the way to the matching PeerReady event.
     let (stop_remote, remote_stop) = std::sync::mpsc::channel();

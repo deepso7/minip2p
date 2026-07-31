@@ -34,34 +34,6 @@ export default defineConfig({
       { label: "Docs", path: "/" },
       { label: "Changelog", path: "/changelog" },
     ],
-    sidebar: [
-      "/",
-      {
-        label: "Quickstart",
-        items: ["/quickstart/install", "/quickstart/connect-peers"],
-      },
-      {
-        label: "Guides",
-        items: [
-          "/guides/concepts",
-          "/guides/discover-peers",
-          "/guides/drive-events",
-          "/guides/identity",
-          "/guides/listen-and-dial",
-          "/guides/pubsub",
-          "/guides/register-a-protocol",
-          "/guides/traverse-nat",
-        ],
-      },
-      {
-        label: "Reference",
-        items: [
-          "/reference/feature-matrix",
-          "/reference/glossary",
-          "/reference/troubleshooting",
-        ],
-      },
-    ],
   },
   ai: {
     llmsTxt: {

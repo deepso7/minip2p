@@ -107,6 +107,11 @@ pub struct SwarmRuntimeError {
     pub peer_id: Option<PeerId>,
     /// Transport connection involved, if known.
     pub conn_id: Option<ConnectionId>,
+    /// Transport stream involved, if known.
+    ///
+    /// Outbound open and multistream negotiation failures populate this so
+    /// callers can correlate an asynchronous error with the exact open.
+    pub stream_id: Option<StreamId>,
     /// Human-readable context for logs and diagnostics.
     pub detail: String,
 }

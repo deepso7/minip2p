@@ -1,9 +1,9 @@
 ---
 title: Troubleshooting
-description: Diagnose connection, address, stream, NAT, pubsub, discovery, and event-loop problems by symptom.
+description: Diagnose Rust and React Native connection, stream, lifecycle, discovery, and event problems by symptom.
 ---
 
-Start from the observable symptom. minip2p returns synchronous API errors
+Start from the observable symptom. The Rust API returns synchronous errors
 directly and reports later runtime or protocol failures through events.
 
 ## Common problems
@@ -67,3 +67,33 @@ directly and reports later runtime or protocol failures through events.
 
 For exhaustive variants and fields, generate local
 [rustdoc](/reference/feature-matrix#exhaustive-api-docs).
+
+## React Native
+
+React Native errors are public classes re-exported from
+`@minip2p/react-native`. Use `instanceof` for application recovery and inspect
+typed `kind` fields for diagnostics.
+
+| Symptom | Likely cause | Corrective action |
+| --- | --- | --- |
+| The package cannot load in Expo Go | Expo Go does not contain the minip2p TurboModule or native Rust libraries | Use `expo-dev-client`, run `expo prebuild`, then `expo run:ios` or `expo run:android`. |
+| The native module is missing after installation | The development build predates the package or native autolinking did not run | Run `expo prebuild` and rebuild with `expo run:ios` or `expo run:android`; for bare React Native, clean and rebuild the native project. |
+| The hook remains `starting` briefly | Endpoint construction is intentionally deferred until the component commits | Render the starting state; read `endpoint` only when `status === "running"`. |
+| A hook endpoint changes polling behavior in the background | `useMinip2p` mirrors `AppState` by design | Keep the hook mounted; it resumes foreground behavior when AppState becomes `active`. |
+| A manually created endpoint stays in foreground mode | Nothing is forwarding React Native `AppState` | Call `bindAppState(endpoint)` and invoke its unsubscribe before closing. |
+| A Promise rejects with `TimeoutError` | No matching result arrived within `timeoutMs` | Confirm the peer and infrastructure, then choose a timeout appropriate to the UI. Avoid `timeoutMs: 0` unless an unbounded wait is intentional. |
+| A Promise rejects with `AbortError` | Its `AbortSignal` fired, or a split-phase attempt was cancelled | Treat cancellation as expected control flow; create a new controller for a retry. |
+| `waitPeerReady` rejects with `PeerDisconnectedError` | The last connection closed before Identify completed | Reconnect, keep both drivers alive, and wait again. |
+| `openStream` rejects with `OpenStreamError` | The peer is not ready, the protocol is unsupported, or negotiation failed | Wait for `peerReady`, inspect `peerInfo(peerId)?.protocols`, and register the same version on both peers. |
+| An inbound stream closes immediately | No named `"stream"` handler or waiter claimed its live handle | Subscribe to `endpoint.on("stream", ...)`; catch-all `inboundStream` is metadata only. |
+| `read()` rejects after adding a `data` handler | Pull and flowing modes were mixed | Pick one read mode for the stream's entire lifetime. |
+| `dataOverflow` fires | Pull-mode bytes accumulated faster than the app consumed them | Reset or abandon the stream and recover at the application protocol layer. |
+| `BackpressureError` is thrown by `publish` | The bounded native pubsub queue is full | Slow or batch publishers and retry only according to application delivery rules. |
+| An unsigned message has an unexpected peer ID | `allowUnsigned: true` accepts unauthenticated sender claims | Treat both `fromPeerId` and payload as attacker-controlled whenever `signed` is false. |
+| mDNS finds no peers on iOS or Android | Host permissions are missing, multicast is blocked, or peers do not share a link | Add the documented local-network/multicast configuration and test on a multicast-capable network. |
+| AutoNAT reports state but `connect` cannot relay | `autonatServers` probes reachability but does not provide traversal | Add a reachable direct QUIC relay peer address to `relays`. |
+| `queueOverflow` fires | JavaScript did not drain the bounded native event queue quickly enough | Refresh `connectedPeers`, `knownPeers`, paths, reachability, and reservation state; reduce slow event handlers. |
+| The hook enters `failed` | The native driver stopped unexpectedly | Use `isDriverFailure(state)`, log its typed kind, recreate at an application-owned boundary, and do not reuse the closed endpoint. |
+
+See the [React Native API reference](/reference/react-native-api#public-errors)
+for the complete public error taxonomy.

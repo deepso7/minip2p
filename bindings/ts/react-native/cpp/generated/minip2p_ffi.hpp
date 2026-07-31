@@ -44,6 +44,7 @@ class NativeMinip2pFfi : public jsi::HostObject {
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_known_peers(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_listen_addrs(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_open_stream(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_path(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_peer_id(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_peer_info(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_ping(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
@@ -86,6 +87,7 @@ class NativeMinip2pFfi : public jsi::HostObject {
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_known_peers(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_listen_addrs(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_open_stream(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_path(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_peer_id(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_peer_info(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_ping(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);

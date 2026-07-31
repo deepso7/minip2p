@@ -94,7 +94,8 @@ interface NativeModuleInterface {
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_is_running(uniffiSelf: bigint, uniffi_out_err: UniffiRustCallStatus): number;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_known_peers(uniffiSelf: bigint, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_listen_addrs(uniffiSelf: bigint, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
-    ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_open_stream(uniffiSelf: bigint, peerId: Uint8Array, protocolId: Uint8Array, uniffi_out_err: UniffiRustCallStatus): bigint;
+    ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_open_stream(uniffiSelf: bigint, peerId: Uint8Array, protocolId: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
+    ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_path(uniffiSelf: bigint, peerId: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_peer_id(uniffiSelf: bigint, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_peer_info(uniffiSelf: bigint, peerId: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_ping(uniffiSelf: bigint, peerId: Uint8Array, uniffi_out_err: UniffiRustCallStatus): void;
@@ -133,6 +134,7 @@ interface NativeModuleInterface {
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_known_peers(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_listen_addrs(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_open_stream(): number;
+    ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_path(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_peer_id(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_peer_info(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_ping(): number;

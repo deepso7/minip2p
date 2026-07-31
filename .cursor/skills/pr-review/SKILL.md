@@ -88,7 +88,7 @@ Charters:
 | **Security** | Untrusted peers/input, authz, spoofing, expensive work before reject |
 | **Flow** | Spins, starvation, deadlines, unbounded/superlinear buffers, error-path leaks |
 | **Verify** | *Missing* tests for new failure modes; CI/just/`no_std`/fuzz gaps; README/doc lies; AGENTS.md policy |
-| **Quality** | *Hollow* proof and LLM-shaped test/docs padding; internal no-policy wrappers — not intentional public/layer facades |
+| **Quality** | *Hollow* proof and LLM-shaped test/docs padding; internal no-policy wrappers — not intentional public/layer boundaries |
 
 Specialists must: stay in charter; read every in-diff hunk relevant to that charter before following out-of-diff callers; not stop after one hit; confidence &lt; 0.8 → omit. Charters partition **failure modes, not files** — two specialists reading the same file is expected, and the merge dedupes.
 
@@ -99,7 +99,7 @@ Specialists must: stay in charter; read every in-diff hunk relevant to that char
 3. Drop nits / pure style even if a specialist emitted them — including Quality naming taste or “sounds like an LLM” without an artifact. **Quality floor:** a finding that names a specific `file:line` artifact and states what bug or regression it would fail to catch is **not** a nit — keep it
 4. Apply the `reference.md` allowlist:
    - **Test-shaped** entries (white-box queue injection, timeout-driven integration outcomes, feature-matrix twins): drop the finding **unless** the new test is strictly weaker than in-file peers covering the same claim
-   - **Facade / one-line public API** entries: drop unconditionally — those are intentional layer boundaries, not “weaker peers”
+   - **One-line public API** entries: drop unconditionally — those are intentional layer boundaries, not “weaker peers”
 5. **Confirm before publishing.** Specialist confidence is self-reported and uncalibrated — for every surviving P0/P1, open the cited `file:line` yourself and re-derive the failure story from the code, not from the specialist's summary. Drop what you cannot reproduce; fix the line number if it drifted. Do the same for any P2 two specialists describe differently
 6. Optional: run focused `cargo test -p <touched>` once; fold hard evidence in
 7. Output **exactly** per `.cursor/rules/pr-review.mdc` Output section (summary line, table, per-finding evidence, copy block). Include Quality findings in the table and copy block when they survive. If nothing survives, say `**No issues found** across X files` and emit **no** copy block. Do **not** add undeclared sections (no separate severity-count block)

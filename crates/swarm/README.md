@@ -79,6 +79,11 @@ The core is deterministic when callers use a simple mutate-then-drain loop:
 2. Drain `core.poll_output()`.
 3. Execute each `SwarmOutput::Action` against your transport.
 4. Feed driver results back with `SwarmInput::StreamOpened`, `SwarmInput::OpenStreamFailed`, or `SwarmInput::RuntimeError`. If executing a `SwarmAction::ResetStream` fails, also call `core.reset_stream_failed(conn_id, stream_id)` so a later reset can be retried.
+
+`SwarmRuntimeError` carries `peer_id`, `conn_id`, and `stream_id` whenever the
+corresponding identity is known. In particular, asynchronous outbound
+multistream and unsupported-protocol failures retain the stream id needed by
+hosts to correlate an open request.
 5. Hand each `SwarmOutput::Event` to the application.
 6. Before waiting on I/O again, `core.is_idle()` should be true.
 

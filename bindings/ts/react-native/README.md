@@ -26,33 +26,27 @@ The ubrn runtime packages are regular dependencies of this package and are versi
 ## Usage
 
 ```ts
-import {
-  MiniP2p,
-  generateSecretKey,
-  P2pEvent_Tags,
-} from "@minip2p/react-native";
+import { Minip2p, generateSecretKey } from "@minip2p/react-native";
 
-const endpoint = MiniP2p.create({
+const endpoint = Minip2p.create({
   secretKey: generateSecretKey(),
   mdns: true,
   protocols: ["/example/files/1"],
 });
 
-const unsubscribe = endpoint.on((event) => {
-  if ("type" in event) {
-    console.warn(`wrapper queue dropped ${event.dropped} events`);
-  } else if (event.tag === P2pEvent_Tags.PeerReady) {
-    console.log("peer ready", event.inner.peerId);
-  }
+const unsubscribe = endpoint.on("peerReady", ({ peerId, protocols }) => {
+  console.log("peer ready", peerId, protocols);
 });
 
 endpoint.subscribe("/example/chat/1");
 endpoint.publish("/example/chat/1", "hello from React Native");
 
-endpoint.ping("remote-peer-id");
-const streamId = endpoint.openStream("remote-peer-id", "/example/files/1");
-endpoint.sendStream("remote-peer-id", streamId, new Uint8Array([1, 2, 3]));
-endpoint.closeStreamWrite("remote-peer-id", streamId);
+const result = await endpoint.connectAddr(remoteListenAddr);
+await endpoint.waitPeerReady(result.peerId);
+const rttMs = await endpoint.ping(result.peerId);
+const stream = await endpoint.openStream(result.peerId, "/example/files/1");
+stream.write(new Uint8Array([1, 2, 3]));
+stream.closeWrite();
 
 // Signal AppState changes before foreground queries or reconnect work.
 endpoint.setActive(false);
@@ -62,18 +56,18 @@ unsubscribe();
 endpoint.close();
 ```
 
-`MiniP2p.create` constructs and starts the native driver. Event buffering, waits, typed errors, and the rest of the public SDK behavior come from `@minip2p/core`; this package owns only React Native loading and conversion. Attach handlers in the same synchronous JavaScript turn; immediate native callbacks are buffered until the next microtask.
+`Minip2p.create` constructs and starts the native driver. Event buffering, typed waits, Promise operations, Stream handles, and public errors come from `@minip2p/core`; this package owns React Native loading and conversion. `useMinip2p` owns an endpoint for a committed component lifetime and `bindAppState` mirrors the current AppState immediately.
 
 Configuration defaults to gossipsub, signed messages, no relay, and no discovery. Set `pubsubRouter` to `PubsubRouter.Floodsub` when interoperability requires floodsub. mDNS requires local-network/multicast permissions in the host app; Expo Go cannot provide the native module, so use the included Expo development-build workflow.
 
 ## Wrapper contracts
 
 - Generated Rust `u64` values are checked before conversion from `bigint` to JavaScript `number`. Values outside the safe integer range throw.
-- Native events are delivered FIFO through a 4096-entry host queue, in batches of 256. Overflow first coalesces replaceable state, then discards the oldest pubsub-message or stream-data payload, and only then discards another lifecycle event.
-- Wrapper overflow is delivered out of band as `{ type: 'queueOverflow', dropped }`. Native `EventsDropped` remains a normal generated event. On either signal, refresh connected peers, known peers, reachability, and the active reservation from queries.
-- Path events are advisory because the native API has no per-peer current-path query. Reset path badges to unknown after overflow.
-- Event subscribers and `waitFor` observers do not consume events from each other. An exception in one handler does not interrupt other handlers or unwind through the Rust callback.
-- `close` rejects pending waits, suppresses queued callbacks, requests native shutdown, and destroys the UniFFI object. A host needing the native stopped barrier can import the generated low-level API from `@minip2p/react-native/native`.
+- Native events are delivered FIFO through a bounded host queue. Overflow is a typed `queueOverflow` event; refresh queryable state when it occurs.
+- Named event handlers receive flattened payloads. Catch-all handlers receive flattened discriminated events and safe inbound-stream metadata only.
+- `handlerError` is queued after fan-out when an event handler throws.
+- `path(peerId)` is authoritative for NAT-orchestrated paths and independent of event consumption.
+- `close` rejects pending work, closes streams, destroys the UniFFI object, and then fires `onClose` once. A host needing the native stopped barrier can import the generated low-level API from `@minip2p/react-native/native`.
 - Unsigned pubsub messages are explicitly untrusted. When `signed` is false, both payload and `fromPeerId` are attacker-controlled.
 
 ## Generation

@@ -1,0 +1,158 @@
+---
+title: Start with React Native
+description: Create a native endpoint, follow its component lifecycle, connect to a peer, and measure a Ping RTT.
+---
+
+This guide creates one minip2p endpoint for a committed React component,
+connects to a full peer multiaddress, and displays the usable network path and
+Ping RTT.
+
+## Install
+
+<Tabs>
+  <Tab title="npm">
+
+    ```bash
+    npm install @minip2p/react-native
+    ```
+
+  </Tab>
+  <Tab title="pnpm">
+
+    ```bash
+    pnpm add @minip2p/react-native
+    ```
+
+  </Tab>
+  <Tab title="yarn">
+
+    ```bash
+    yarn add @minip2p/react-native
+    ```
+
+  </Tab>
+  <Tab title="bun">
+
+    ```bash
+    bun add @minip2p/react-native
+    ```
+
+  </Tab>
+</Tabs>
+
+Because this package contains native code, rebuild the app after installing it.
+See [Install for React Native](/quickstart/install#react-native) for platform
+requirements and development-build commands. Expo Go is not supported.
+
+## Own the endpoint
+
+`useMinip2p` constructs the endpoint after the component commits, mirrors React
+Native `AppState`, and closes the native driver during cleanup.
+
+```tsx
+import {
+  generateSecretKey,
+  useMinip2p,
+} from "@minip2p/react-native";
+import { useCallback, useMemo, useState } from "react";
+import { Button, Text, View } from "react-native";
+
+export function PeerScreen({ remoteAddress }: { remoteAddress: string }) {
+  const secretKey = useMemo(() => generateSecretKey(), []);
+  const createConfig = useCallback(
+    () => ({
+      agentVersion: "my-app/0.1.0",
+      secretKey,
+    }),
+    [secretKey]
+  );
+  const node = useMinip2p(createConfig);
+  const endpoint = node.status === "running" ? node.endpoint : undefined;
+  const [result, setResult] = useState("Not connected");
+
+  const connect = useCallback(async () => {
+    if (endpoint === undefined) return;
+
+    try {
+      const connected = await endpoint.connectAddr(remoteAddress, {
+        timeoutMs: 10_000,
+      });
+      await endpoint.waitPeerReady(connected.peerId, {
+        timeoutMs: 10_000,
+      });
+      const rttMs = await endpoint.ping(connected.peerId, {
+        timeoutMs: 5_000,
+      });
+      setResult(`${connected.path.kind} · ${rttMs} ms`);
+    } catch (error) {
+      setResult(error instanceof Error ? error.message : String(error));
+    }
+  }, [endpoint, remoteAddress]);
+
+  if (node.status === "starting") return <Text>Starting minip2p…</Text>;
+  if (node.status === "failed") return <Text>Failed: {String(node.error)}</Text>;
+  if (node.status === "closed") return <Text>Endpoint closed</Text>;
+
+  return (
+    <View>
+      <Text selectable>{node.peerId}</Text>
+      <Text selectable>{node.listenAddrs.join("\n")}</Text>
+      <Button title="Connect and ping" onPress={() => void connect()} />
+      <Text>{result}</Text>
+    </View>
+  );
+}
+```
+
+Keep `createConfig` pure and stable for this component lifetime. The hook
+captures it once; changing the callback does not replace a running endpoint.
+
+:::note
+`generateSecretKey()` creates a new 32-byte Ed25519 identity. The memoized key
+above lasts only as long as this component instance. A real app should load the
+same secret bytes from its secure persistent storage when it needs a stable
+`PeerId`.
+:::
+
+## Understand the result
+
+`connectAddr` expects a complete peer multiaddress, including the terminal
+`/p2p/<peer-id>` component. It resolves when the first usable path is ready:
+
+| `path.kind` | Meaning |
+| --- | --- |
+| `directDialed` | A supplied QUIC address connected directly. |
+| `directPunched` | Relay-assisted DCUtR produced a direct connection. |
+| `relayed` | Traffic is using a Circuit Relay v2 path; `relayPeerId` identifies the relay. |
+
+`waitPeerReady` is a separate milestone: it waits for Identify and returns the
+remote protocol list. Wait for it before opening a custom protocol stream.
+
+`endpoint.path(peerId)` is the authoritative current path. A relayed result may
+later upgrade to `directPunched`.
+
+## Stop work safely
+
+All Promise-first operations accept `timeoutMs` and `signal`. The default
+timeout is 65 seconds; `timeoutMs: 0` disables it.
+
+```ts
+const controller = new AbortController();
+
+try {
+  const result = await endpoint.connectAddr(remoteAddress, {
+    signal: controller.signal,
+    timeoutMs: 10_000,
+  });
+  console.log(result.path);
+} finally {
+  controller.abort();
+}
+```
+
+Aborting a Promise rejects it with `AbortError`. A timed-out Promise rejects
+with `TimeoutError`. For `connect*`, cancellation also cancels that native
+connection attempt.
+
+Next: [Endpoint lifecycle](//react-native/lifecycle) or
+[Connections and streams](//react-native/connections-and-streams).

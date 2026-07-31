@@ -23,6 +23,15 @@ pub struct IdentifyInfo {
     pub agent_version: Option<String>,
 }
 
+/// Full identity allocated for an outbound application stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct OpenStreamResult {
+    /// Transport connection carrying the stream.
+    pub conn_id: u64,
+    /// Opaque stream id.
+    pub stream_id: u64,
+}
+
 /// Coarse local reachability state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum Reachability {
@@ -214,6 +223,8 @@ pub enum P2pEvent {
         peer_id: Option<String>,
         /// Transport connection, when known.
         conn_id: Option<u64>,
+        /// Transport stream, when known.
+        stream_id: Option<u64>,
         /// Human-readable diagnostic detail.
         detail: String,
     },
@@ -461,6 +472,7 @@ pub(crate) fn convert_swarm(event: Event) -> Option<P2pEvent> {
             kind: convert_swarm_error_kind(error.kind),
             peer_id: error.peer_id.map(|peer| peer.to_base58()),
             conn_id: error.conn_id.map(|id| id.as_u64()),
+            stream_id: error.stream_id.map(|id| id.as_u64()),
             detail: error.detail,
         },
     })
@@ -643,7 +655,7 @@ pub(crate) fn convert_reachability(state: ReachabilityState) -> Reachability {
     }
 }
 
-fn convert_path(path: Path) -> PathKind {
+pub(crate) fn convert_path(path: Path) -> PathKind {
     match path {
         Path::DirectDialed => PathKind::DirectDialed,
         Path::DirectPunched => PathKind::DirectPunched,
@@ -754,6 +766,27 @@ mod tests {
                 conn_id: 8,
                 stream_id: 12,
                 data: vec![1, 2, 3],
+            })
+        );
+    }
+
+    #[test]
+    fn endpoint_error_conversion_preserves_stream_identity() {
+        let remote = peer(9);
+        assert_eq!(
+            convert_swarm(Event::Error(minip2p_swarm::SwarmRuntimeError {
+                kind: SwarmErrorKind::UnsupportedProtocol,
+                peer_id: Some(remote.clone()),
+                conn_id: Some(ConnectionId::new(23)),
+                stream_id: Some(StreamId::new(42)),
+                detail: "unsupported protocol".into(),
+            })),
+            Some(P2pEvent::EndpointError {
+                kind: EndpointErrorKind::UnsupportedProtocol,
+                peer_id: Some(remote.to_base58()),
+                conn_id: Some(23),
+                stream_id: Some(42),
+                detail: "unsupported protocol".into(),
             })
         );
     }

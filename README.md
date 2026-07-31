@@ -34,7 +34,7 @@ The project is built around five non-negotiables:
 
 ## 0.1.1 — 2026-07-27
 
-- The `pubsub` facade now selects gossipsub by default. This is a pre-1.0
+- The `Endpoint` pubsub API now selects gossipsub by default. This is a pre-1.0
   behavior change: `EndpointBuilder::pubsub_config` accepts either
   `GossipsubConfig` or `FloodsubConfig` through `PubsubConfig`; applications
   that require the old engine must pass `FloodsubConfig::default()`
@@ -69,7 +69,7 @@ Sans-I/O orchestrators (`no_std + alloc`):
 
 Runtime adapters (`std`):
 
-- `crates/minip2p` (`minip2p-rs`, imported as `minip2p`): app-facing facade that glues identity, QUIC, and the std swarm driver into an `Endpoint` API. Opt-in cargo features layer on without changing the base API:
+- `crates/minip2p` (`minip2p-rs`, imported as `minip2p`): application-facing crate that combines identity, QUIC, and the std swarm driver in an `Endpoint` API. Opt-in cargo features layer on without changing the base API:
   - `nat` wires the traversal agent into `Endpoint` (`connect`/`wait_path`/`take_nat_events`, relay reservations, AutoNAT probing).
   - `pubsub` adds gossipsub by default (`subscribe`/`publish`/`take_pubsub_events`), with explicit floodsub selection available.
   - `discovery` composes `nat` and `pubsub` into signed peer discovery (`known_peers`/`next_discovery_event`), with coordinated dialing and bridge cleanup.
@@ -100,7 +100,7 @@ Current validated behavior:
 - Bidirectional stream data exchange with half-close propagation.
 - Multistream-select negotiation with spec-compliant varint framing.
 - Ping round-trips with RTT measurement; identify exchange with observed-address plumbing.
-- End-to-end stack via `minip2p::Endpoint`: QUIC + multistream-select + identify + ping + registered app protocols through one facade.
+- End-to-end stack via `minip2p::Endpoint`: QUIC + multistream-select + identify + ping + registered app protocols through one API.
 - NAT traversal live-validated end-to-end: relay reservation, circuit connect, DCUtR hole punch between two real NATs (home network ↔ mobile hotspot through a public relay), with explicit path events throughout.
 - Gossipsub live-validated: signed interop both ways with real go-libp2p (`NewGossipSub`, v0.15.0) and rust-libp2p (gossipsub 0.49.5) peers over QUIC, a relay-only room through a public relay, and a relayed → direct-punched upgrade with the mesh surviving the connection supersede; floodsub retains its prior live wire validation and explicit-selection regression tests.
 - Pubsub peer discovery live-validated across a public host, home NAT, and mobile hotspot: automatic mesh formation, one-sided dial initiation, address updates, graceful punch-failure degradation, and leaf-to-leaf chat survival after host death.
@@ -112,7 +112,7 @@ Three layers, strictly separated:
 
 1. Sans-I/O protocol crates — pure state machines, one per protocol. No sockets, no async runtimes, no wall clocks; callers pump inputs and timestamps in, actions and events come out.
 2. Sans-I/O orchestrators (`swarm`, `nat`, `discovery`) — compose protocol and policy state machines, still deterministic and I/O-free.
-3. `std` adapters — the QUIC transport, mDNS socket driver, and `Endpoint` facade own all real I/O.
+3. `std` adapters — the QUIC transport, mDNS socket driver, and `Endpoint` own all real I/O.
 
 The minimal default swarm intentionally composes only identify, ping, and
 registered application protocols. Relay, AutoNAT, and DCUtR remain independent
@@ -120,7 +120,7 @@ Sans-I/O machines driven over generic streams; their dialing, retry, and
 fallback policy belongs to the host. This keeps the base library small and
 avoids hiding network policy in a monolithic swarm while still allowing
 declarative protocol registration through `SwarmBuilder::protocol` and
-`EndpointBuilder::protocol`. The `nat`, `pubsub`, `discovery`, and `mdns` facade
+`EndpointBuilder::protocol`. The `nat`, `pubsub`, `discovery`, and `mdns` endpoint
 features are pre-packaged policy for the common case, built on the same public
 hooks.
 
@@ -132,7 +132,7 @@ Build and run tests:
 cargo test
 ```
 
-Build an app endpoint with the top-level facade:
+Build an application endpoint with the top-level API:
 
 ```toml
 [dependencies]
@@ -163,7 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`Endpoint` is the batteries-included synchronous facade. Custom runtimes can
+`Endpoint` is the batteries-included synchronous application API. Custom runtimes can
 drive `SwarmCore` and the protocol crates directly with inputs, outputs, and
 explicit timestamps; none of those layers performs I/O, reads a clock, blocks,
 or requires an async executor.
@@ -178,8 +178,8 @@ cargo run -p minip2p-chat -- host --nick hostess
 Common contributor workflows are available through `just` (mirrors CI):
 
 ```bash
-just test          # cargo test + facade feature matrix through discovery + mDNS
-just clippy        # -D warnings, facade discovery/mDNS variants, and fuzz/
+just test          # cargo test + Endpoint feature matrix through discovery + mDNS
+just clippy        # -D warnings, Endpoint discovery/mDNS variants, and fuzz/
 just check-nostd   # all no_std crates on thumbv7em-none-eabi
 just bench
 just fuzz 30       # needs nightly + cargo-fuzz
@@ -206,10 +206,10 @@ runtime crate at the same version, including crates without code changes.
 - [x] Multistream-select, ping, identify.
 - [x] libp2p TLS peer authentication (mutual: both sides learn the PeerId at handshake time).
 - [x] Swarm / connection management layer with builder DX.
-- [x] Top-level `minip2p::Endpoint` facade for app authors.
+- [x] Top-level `minip2p::Endpoint` API for app authors.
 - [x] Circuit Relay v2 client, DCUtR, and AutoNAT state machines.
 - [x] NAT-traversal orchestration (`nat` feature), live-validated between two real NATs.
-- [x] Floodsub pubsub engine with libp2p wire interop and explicit facade selection.
+- [x] Floodsub pubsub engine with libp2p wire interop and explicit endpoint selection.
 - [x] Signed pubsub peer discovery (`discovery` feature), including automatic mesh dialing and host-death survival.
 - [x] Local-link mDNS discovery (`mdns` feature) with a shared bounded peer book and automatic dialing.
 - [x] Gossipsub, on the same pubsub API surface and selected by default.
