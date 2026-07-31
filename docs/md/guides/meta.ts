@@ -1,6 +1,7 @@
 import { defineMeta } from "blume";
 
 export default defineMeta({
+  icon: "book-open",
   order: 2,
   pages: [
     "concepts",
