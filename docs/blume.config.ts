@@ -9,7 +9,7 @@ const brand = {
 export default defineConfig({
   title: "minip2p",
   description:
-    "A minimal libp2p implementation for Rust and React Native, built around QUIC and Sans-I/O state machines.",
+    "A minimal, caller-driven libp2p implementation in Rust, built around QUIC and Sans-I/O state machines.",
   logo: {
     image: "/logo.svg",
     text: "minip2p",
@@ -33,44 +33,6 @@ export default defineConfig({
     tabs: [
       { label: "Docs", path: "/" },
       { label: "Changelog", path: "/changelog" },
-    ],
-    sidebar: [
-      "/",
-      {
-        label: "Quickstart",
-        items: ["/quickstart/install", "/quickstart/connect-peers"],
-      },
-      {
-        label: "Guides",
-        items: [
-          "/guides/concepts",
-          "/guides/discover-peers",
-          "/guides/drive-events",
-          "/guides/identity",
-          "/guides/listen-and-dial",
-          "/guides/pubsub",
-          "/guides/register-a-protocol",
-          "/guides/traverse-nat",
-        ],
-      },
-      {
-        label: "React Native",
-        items: [
-          "/guides/react-native/start",
-          "/guides/react-native/lifecycle",
-          "/guides/react-native/connections-and-streams",
-          "/guides/react-native/networking-and-events",
-        ],
-      },
-      {
-        label: "Reference",
-        items: [
-          "/reference/feature-matrix",
-          "/reference/glossary",
-          "/reference/react-native-api",
-          "/reference/troubleshooting",
-        ],
-      },
     ],
   },
   ai: {
