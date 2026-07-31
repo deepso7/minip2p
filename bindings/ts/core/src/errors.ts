@@ -6,6 +6,7 @@ import type {
   NatErrorKind,
 } from "./types.js";
 
+/** Pubsub rejected a publish because its bounded native queue is full. */
 export class BackpressureError extends Error {
   constructor() {
     super("The native pubsub queue is full");
@@ -13,6 +14,7 @@ export class BackpressureError extends Error {
   }
 }
 
+/** A payload exceeds the native protocol size limit. */
 export class MessageTooLargeError extends Error {
   constructor() {
     super("The message exceeds the native pubsub size limit");
@@ -20,6 +22,7 @@ export class MessageTooLargeError extends Error {
   }
 }
 
+/** Native policy rejected an otherwise valid operation. */
 export class NotPermittedError extends Error {
   constructor(message = "The operation is not permitted") {
     super(message);
@@ -35,7 +38,9 @@ export class AbortError extends Error {
   }
 }
 
+/** A Promise-based SDK operation exceeded its configured timeout. */
 export class TimeoutError extends Error {
+  /** Configured timeout in milliseconds, when known. */
   readonly timeoutMs?: number;
 
   constructor(timeoutMs?: number) {
@@ -49,6 +54,7 @@ export class TimeoutError extends Error {
   }
 }
 
+/** The endpoint or stream is already closed. */
 export class ClosedError extends Error {
   constructor() {
     super("The minip2p endpoint is closed");
@@ -56,7 +62,9 @@ export class ClosedError extends Error {
   }
 }
 
+/** The native background driver stopped unexpectedly. */
 export class DriverFailedError extends Error {
+  /** Native subsystem that caused the terminal failure. */
   readonly kind: DriverFailureKind;
 
   constructor(kind: DriverFailureKind, detail: string) {
@@ -66,9 +74,13 @@ export class DriverFailedError extends Error {
   }
 }
 
+/** A NAT-orchestrated connection attempt ended without a usable path. */
 export class ConnectFailedError extends Error {
+  /** Endpoint-local connection-attempt identifier. */
   readonly connectId: number;
+  /** Target peer ID. */
   readonly peerId: string;
+  /** Machine-readable terminal failure category. */
   readonly kind: NatErrorKind;
 
   constructor(
@@ -85,6 +97,7 @@ export class ConnectFailedError extends Error {
   }
 }
 
+/** A connection result is unknown, already awaited, or already consumed. */
 export class ConnectResultUnavailableError extends Error {
   readonly connectId: number;
 
@@ -95,6 +108,7 @@ export class ConnectResultUnavailableError extends Error {
   }
 }
 
+/** A peer disconnected before an operation could complete. */
 export class PeerDisconnectedError extends Error {
   readonly peerId: string;
   readonly operation?: string;
@@ -111,11 +125,17 @@ export class PeerDisconnectedError extends Error {
   }
 }
 
+/** Outbound stream opening or protocol negotiation failed. */
 export class OpenStreamError extends Error {
+  /** Machine-readable native error category, or a synchronous adapter error. */
   readonly kind: EndpointErrorKind | "synchronous";
+  /** Target peer ID. */
   readonly peerId: string;
+  /** Connection carrying the attempted stream, when allocated. */
   readonly connId?: number;
+  /** Native stream identifier, when allocated. */
   readonly streamId?: number;
+  /** Human-readable native or adapter diagnostic. */
   readonly detail: string;
 
   constructor(options: {
@@ -135,6 +155,7 @@ export class OpenStreamError extends Error {
   }
 }
 
+/** A stream closed before outbound negotiation completed. */
 export class StreamClosedError extends Error {
   constructor(message = "The stream closed before it became ready") {
     super(message);

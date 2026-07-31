@@ -6,30 +6,44 @@ export type Bytes = ArrayBuffer | Uint8Array;
 
 /** Signed-discovery settings. The topic is intentionally application-scoped. */
 export interface Minip2pDiscoveryOptions {
+  /** Application-scoped signed-beacon topic. */
   readonly topic: string;
+  /** Beacon broadcast interval in milliseconds. */
   readonly beaconIntervalMs?: number;
+  /** Time without observations before a peer expires. */
   readonly peerTtlMs?: number;
+  /** Whether newly discovered peers should be dialed automatically. */
   readonly autoDial?: boolean;
 }
 
 /** Local-link mDNS discovery settings. Omitted fields use native defaults. */
 export interface Minip2pMdnsOptions {
+  /** Enables IPv6 multicast in addition to IPv4. */
   readonly enableIpv6?: boolean;
+  /** TTL advertised in mDNS records. */
   readonly ttlMs?: number;
+  /** Period between discovery queries. */
   readonly queryIntervalMs?: number;
+  /** Maximum encoded DNS packet size. */
   readonly maxPacketBytes?: number;
+  /** Maximum addresses advertised per response. */
   readonly maxAnnouncedAddrs?: number;
+  /** Period between network-interface refreshes. */
   readonly interfaceRefreshMs?: number;
+  /** Socket polling interval used by the native driver. */
   readonly socketPollIntervalMs?: number;
+  /** Whether newly discovered peers should be dialed automatically. */
   readonly autoDial?: boolean;
 }
 
+/** Available pubsub routing strategies. */
 export const PubsubRouter = {
   Floodsub: 1,
   Gossipsub: 0,
 } as const;
 export type PubsubRouter = (typeof PubsubRouter)[keyof typeof PubsubRouter];
 
+/** Coarse local reachability states. */
 export const Reachability = {
   Private: 2,
   Public: 1,
@@ -37,6 +51,7 @@ export const Reachability = {
 } as const;
 export type Reachability = (typeof Reachability)[keyof typeof Reachability];
 
+/** Sources contributing peer-discovery observations. */
 export const DiscoverySource = {
   Mdns: 1,
   SignedBeacon: 0,
@@ -44,6 +59,7 @@ export const DiscoverySource = {
 export type DiscoverySource =
   (typeof DiscoverySource)[keyof typeof DiscoverySource];
 
+/** Fatal native-driver failure categories. */
 export const DriverFailureKind = {
   Invariant: 2,
   Panic: 3,
@@ -53,6 +69,7 @@ export const DriverFailureKind = {
 export type DriverFailureKind =
   (typeof DriverFailureKind)[keyof typeof DriverFailureKind];
 
+/** Non-fatal endpoint runtime error categories. */
 export const EndpointErrorKind = {
   Driver: 7,
   Identify: 2,
@@ -66,6 +83,7 @@ export const EndpointErrorKind = {
 export type EndpointErrorKind =
   (typeof EndpointErrorKind)[keyof typeof EndpointErrorKind];
 
+/** Terminal NAT connection failure categories. */
 export const NatErrorKind = {
   DialFailed: 2,
   NoPathAvailable: 0,
@@ -77,29 +95,47 @@ export type NatErrorKind = (typeof NatErrorKind)[keyof typeof NatErrorKind];
 
 /** Configuration accepted by a platform minip2p endpoint. */
 export interface Minip2pConfig {
+  /** Raw 32-byte Ed25519 secret key. */
   readonly secretKey: Bytes;
+  /** Agent version advertised through Identify. */
   readonly agentVersion?: string;
+  /** Direct QUIC relay peer multiaddresses. */
   readonly relays?: readonly string[];
+  /** AutoNAT server peer multiaddresses. */
   readonly autonatServers?: readonly string[];
+  /** Local QUIC listen multiaddress; native defaults apply when omitted. */
   readonly listenAddr?: string;
+  /** Routes outbound connectivity through relays only. */
   readonly forceRelay?: boolean;
+  /** Accepts unsigned pubsub messages. */
   readonly allowUnsigned?: boolean;
+  /** Pubsub router to enable. */
   readonly pubsubRouter?: PubsubRouter;
+  /** Application protocol IDs accepted on inbound streams. */
   readonly protocols?: readonly string[];
+  /** Signed-beacon discovery configuration. */
   readonly discovery?: Minip2pDiscoveryOptions;
+  /** Enables mDNS with defaults or explicit options. */
   readonly mdns?: boolean | Minip2pMdnsOptions;
 }
 
 /** Latest Identify information advertised by a remote peer. */
 export interface IdentifyInfo {
+  /** Protobuf-encoded remote public key, when supplied. */
   readonly publicKey?: ArrayBuffer;
+  /** Listen addresses advertised by the remote peer. */
   readonly listenAddrs: readonly string[];
+  /** Protocols advertised by the remote peer. */
   readonly protocols: readonly string[];
+  /** Address at which the remote observed this endpoint. */
   readonly observedAddr?: string;
+  /** Remote libp2p protocol version. */
   readonly protocolVersion?: string;
+  /** Remote agent version. */
   readonly agentVersion?: string;
 }
 
+/** Merged discovery information for one peer. */
 export interface KnownPeerInfo {
   readonly peerId: string;
   readonly addrs: readonly string[];
@@ -110,6 +146,7 @@ export interface KnownPeerInfo {
   readonly connected: boolean;
 }
 
+/** Active relay reservation metadata. */
 export interface RelayReservationInfo {
   readonly relayPeerId: string;
   readonly expiresUnixSecs?: number;
@@ -121,6 +158,7 @@ export type Path =
   | { readonly kind: "directPunched" }
   | { readonly kind: "relayed"; readonly relayPeerId: string };
 
+/** Serializable metadata for an inbound stream catch-all event. */
 export interface InboundStreamMeta {
   readonly peerId: string;
   readonly protocolId: string;
@@ -129,6 +167,7 @@ export interface InboundStreamMeta {
   readonly initiatedLocally: boolean;
 }
 
+/** Payload types keyed by high-level SDK event name. */
 export interface Minip2pNamedEventMap {
   eventsDropped: { readonly dropped: number; readonly totalDropped: number };
   driverFailed: {
@@ -221,6 +260,7 @@ export interface Minip2pNamedEventMap {
   };
 }
 
+/** Events available to the catch-all endpoint subscriber. */
 export type Minip2pCatchAllEventMap = Omit<
   Minip2pNamedEventMap,
   "stream" | "handlerError"
@@ -229,29 +269,38 @@ export type Minip2pCatchAllEventMap = Omit<
   handlerError: Minip2pNamedEventMap["handlerError"];
 };
 
+/** Discriminated union emitted to catch-all endpoint subscribers. */
 export type Minip2pEvent = {
   [Kind in keyof Minip2pCatchAllEventMap]: {
     readonly type: Kind;
   } & Minip2pCatchAllEventMap[Kind];
 }[keyof Minip2pCatchAllEventMap];
 
+/** Timeout and cancellation controls shared by Promise-based operations. */
 export interface OpOptions {
+  /** Timeout in milliseconds; `0` disables the timeout. */
   readonly timeoutMs?: number;
+  /** Abort signal that cancels only this caller's wait. */
   readonly signal?: AbortSignal;
 }
 
+/** Options accepted by {@link Minip2pBase.once}. */
 export type OnceOptions = OpOptions;
 
+/** Options accepted by {@link Minip2pBase.waitFor}. */
 export interface WaitForOptions<Event> extends OpOptions {
+  /** Optional filter applied before resolving the waiter. */
   readonly predicate?: (event: Event) => boolean;
 }
 
+/** First usable path produced by a connection attempt. */
 export interface ConnectResult {
   readonly connectId: number;
   readonly peerId: string;
   readonly path: Path;
 }
 
+/** Reason reported to endpoint close observers. */
 export type CloseReason =
   | { readonly reason: "close" }
   | {
@@ -259,6 +308,7 @@ export type CloseReason =
       readonly error: DriverFailedError;
     };
 
+/** Idempotent callback that removes a subscription. */
 export type Unsubscribe = () => void;
 
 /** Raw backend-only path tags. */

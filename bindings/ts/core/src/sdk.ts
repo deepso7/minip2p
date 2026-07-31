@@ -155,10 +155,15 @@ class BoundedQueue<Item> {
 
 /** A negotiated custom-protocol stream with exclusive pull or flowing reads. */
 export class Stream {
+  /** Remote peer that owns the other end of this stream. */
   readonly peerId: string;
+  /** Negotiated multistream protocol identifier. */
   readonly protocolId: string;
+  /** Endpoint-local transport stream identifier. */
   readonly streamId: number;
+  /** Endpoint-local connection carrying this stream. */
   readonly connId: number;
+  /** Whether this endpoint initiated the stream. */
   readonly initiatedLocally: boolean;
   readonly #backend: Minip2pBackend;
   readonly #onTerminal: () => void;
@@ -187,6 +192,7 @@ export class Stream {
     this.initiatedLocally = meta.initiatedLocally;
   }
 
+  /** Subscribes to stream lifecycle or data events. */
   on<Kind extends keyof StreamEventMap>(
     type: Kind,
     handler: (payload: StreamEventMap[Kind]) => void
@@ -220,6 +226,10 @@ export class Stream {
     };
   }
 
+  /**
+   * Reads the next buffered chunk, or `undefined` after the remote write side
+   * closes. Pull reads and flowing `data` handlers are mutually exclusive.
+   */
   read(): Promise<Uint8Array | undefined> {
     if (this.#mode === "flowing") {
       return Promise.reject(
@@ -242,6 +252,7 @@ export class Stream {
     });
   }
 
+  /** Writes UTF-8 text or bytes to the stream. */
   write(data: string | Bytes): void {
     if (this.#closed) {
       throw new ClosedError();
@@ -249,12 +260,14 @@ export class Stream {
     this.#backend.sendStream(this.peerId, this.streamId, toUint8Array(data));
   }
 
+  /** Half-closes the local write side while keeping reads available. */
   closeWrite(): void {
     if (!this.#closed) {
       this.#backend.closeStreamWrite(this.peerId, this.streamId);
     }
   }
 
+  /** Abruptly resets the stream and emits `closed`. */
   reset(): void {
     if (!this.#closed) {
       this.#backend.resetStream(this.peerId, this.streamId);
@@ -262,6 +275,7 @@ export class Stream {
     }
   }
 
+  /** Resets and relinquishes the stream, suppressing later native events. */
   abandon(): void {
     if (!this.#closed) {
       this.#backend.abandonStream(this.peerId, this.streamId);
@@ -370,10 +384,15 @@ export class Stream {
   }
 }
 
+/** Events emitted by a negotiated {@link Stream}. */
 export interface StreamEventMap {
+  /** A received binary chunk. */
   data: Uint8Array;
+  /** The remote peer half-closed its write side. */
   remoteWriteClosed: void;
+  /** The stream reached a terminal state. */
   closed: void;
+  /** Incoming data exceeded the bounded pull-read buffer. */
   dataOverflow: {
     readonly droppedChunks: number;
     readonly droppedBytes: number;
@@ -420,10 +439,12 @@ export class Minip2pBase {
     }
   }
 
+  /** Subscribes to one named event and returns an idempotent unsubscribe. */
   on<Kind extends EventKind>(
     type: Kind,
     handler: NamedHandler<Kind>
   ): Unsubscribe;
+  /** Subscribes to the catch-all metadata event stream. */
   on(handler: CatchAllHandler): Unsubscribe;
   on<Kind extends EventKind>(
     typeOrHandler: Kind | CatchAllHandler,
@@ -444,6 +465,7 @@ export class Minip2pBase {
     );
   }
 
+  /** Resolves with the next event of `type`. */
   once<Kind extends EventKind>(
     type: Kind,
     options?: OnceOptions
@@ -451,6 +473,7 @@ export class Minip2pBase {
     return this.waitFor(type, { ...options });
   }
 
+  /** Resolves with the next event of `type` accepted by `predicate`. */
   waitFor<Kind extends EventKind>(
     type: Kind,
     options: WaitForOptions<
@@ -493,6 +516,7 @@ export class Minip2pBase {
     });
   }
 
+  /** Registers a one-shot endpoint shutdown observer. */
   onClose(handler: (reason: CloseReason) => void): Unsubscribe {
     if (this.#closed) {
       return () => {};
@@ -500,6 +524,7 @@ export class Minip2pBase {
     return subscribe(this.#closeHandlers, handler);
   }
 
+  /** Idempotently stops the endpoint and rejects outstanding operations. */
   close(): void {
     this.#teardown({ reason: "close" }, new ClosedError());
   }
@@ -508,46 +533,55 @@ export class Minip2pBase {
     this.close();
   }
 
+  /** Returns this endpoint's base58 peer ID. */
   peerId(): string {
     this.#assertOpen();
     return this.#backend.peerId();
   }
 
+  /** Returns the currently bound peer multiaddresses. */
   listenAddrs(): string[] {
     this.#assertOpen();
     return this.#backend.listenAddrs();
   }
 
+  /** Returns peer IDs with live transport connections. */
   connectedPeers(): string[] {
     this.#assertOpen();
     return this.#backend.connectedPeers();
   }
 
+  /** Returns whether Identify completed for a connected peer. */
   isPeerReady(peerId: string): boolean {
     this.#assertOpen();
     return this.#backend.isPeerReady(peerId);
   }
 
+  /** Returns the latest Identify snapshot for `peerId`. */
   peerInfo(peerId: string): IdentifyInfo | undefined {
     this.#assertOpen();
     return this.#backend.peerInfo(peerId);
   }
 
+  /** Returns the normalized multi-source discovery address book. */
   knownPeers(): KnownPeerInfo[] {
     this.#assertOpen();
     return this.#backend.knownPeers();
   }
 
+  /** Returns the discovery monotonic clock when discovery is enabled. */
   discoveryNowMs(): number | undefined {
     this.#assertOpen();
     return this.#backend.discoveryNowMs();
   }
 
+  /** Returns the active relay reservation, if any. */
   activeReservation(): RelayReservationInfo | undefined {
     this.#assertOpen();
     return this.#backend.activeReservation();
   }
 
+  /** Returns this endpoint's usable circuit address, if reserved. */
   get circuitAddress(): string | undefined {
     const reservation = this.activeReservation();
     if (reservation === undefined) {
@@ -561,46 +595,55 @@ export class Minip2pBase {
       : this.#backend.circuitAddress(relay, this.peerId());
   }
 
+  /** Returns the latest AutoNAT reachability verdict. */
   reachability(): Reachability {
     this.#assertOpen();
     return this.#backend.reachability();
   }
 
+  /** Returns the authoritative active path to `peerId`, if connected. */
   path(peerId: string): Path | undefined {
     this.#assertOpen();
     const path = this.#backend.path(peerId);
     return path === undefined ? undefined : normalizePath(path);
   }
 
+  /** Returns whether the native driver is accepting work. */
   isRunning(): boolean {
     return !this.#closed && this.#backend.isRunning();
   }
 
+  /** Selects foreground or idle native polling behavior. */
   setActive(active: boolean): void {
     this.#assertOpen();
     this.#backend.setActive(active);
   }
 
+  /** Subscribes to a pubsub topic; returns whether the set changed. */
   subscribe(topic: string): boolean {
     this.#assertOpen();
     return this.#backend.subscribe(topic);
   }
 
+  /** Unsubscribes from a pubsub topic; returns whether the set changed. */
   unsubscribe(topic: string): boolean {
     this.#assertOpen();
     return this.#backend.unsubscribe(topic);
   }
 
+  /** Publishes UTF-8 text or bytes to a subscribed pubsub topic. */
   publish(topic: string, data: string | Bytes): void {
     this.#assertOpen();
     this.#backend.publish(topic, toUint8Array(data));
   }
 
+  /** Registers an application protocol for future inbound streams. */
   addProtocol(protocolId: string): void {
     this.#assertOpen();
     this.#backend.addProtocol(protocolId);
   }
 
+  /** Waits for Identify readiness or rejects if the peer disconnects. */
   waitPeerReady(
     peerId: string,
     options: OpOptions = {}
@@ -639,6 +682,7 @@ export class Minip2pBase {
     });
   }
 
+  /** Measures round-trip latency in milliseconds, coalescing concurrent calls. */
   ping(peerId: string, options: OpOptions = {}): Promise<number> {
     this.#assertOpen();
     let operation = this.#pings.get(peerId);
@@ -663,6 +707,7 @@ export class Minip2pBase {
     });
   }
 
+  /** Opens and negotiates an application-protocol stream. */
   openStream(
     peerId: string,
     protocolId: string,
@@ -721,11 +766,13 @@ export class Minip2pBase {
     });
   }
 
+  /** Starts an advanced NAT-orchestrated connection attempt. */
   startConnect(peerId: string): number {
     this.#assertOpen();
     return this.#rememberConnect(this.#backend.connect(peerId));
   }
 
+  /** Starts a connection attempt with an explicit ordered address set. */
   startConnectWithAddrs(peerId: string, addresses: readonly string[]): number {
     this.#assertOpen();
     return this.#rememberConnect(
@@ -733,15 +780,18 @@ export class Minip2pBase {
     );
   }
 
+  /** Starts a connection attempt from one full peer multiaddress. */
   startConnectAddr(address: string): number {
     this.#assertOpen();
     return this.#rememberConnect(this.#backend.connectAddr(address));
   }
 
+  /** Connects to a known peer and resolves with its first usable path. */
   connect(peerId: string, options: OpOptions = {}): Promise<ConnectResult> {
     return this.#primaryConnect(this.startConnect(peerId), options);
   }
 
+  /** Connects using an explicit ordered address set. */
   connectWithAddrs(
     peerId: string,
     addresses: readonly string[],
@@ -753,6 +803,7 @@ export class Minip2pBase {
     );
   }
 
+  /** Connects using one full peer multiaddress. */
   connectAddr(
     address: string,
     options: OpOptions = {}
@@ -760,6 +811,7 @@ export class Minip2pBase {
     return this.#primaryConnect(this.startConnectAddr(address), options);
   }
 
+  /** Consumes the terminal result for a `startConnect*` attempt. */
   waitConnectResult(
     connectId: number,
     options: OpOptions = {}
@@ -789,6 +841,7 @@ export class Minip2pBase {
     });
   }
 
+  /** Cancels an in-flight advanced connection attempt. */
   cancelConnect(connectId: number): void {
     this.#assertOpen();
     assertId(connectId, "connectId");
@@ -799,21 +852,25 @@ export class Minip2pBase {
     this.#terminalConnects.delete(connectId);
   }
 
+  /** Starts direct transport dials for every applicable local address family. */
   dial(address: string): number[] {
     this.#assertOpen();
     return this.#backend.dial(address);
   }
 
+  /** Starts a direct IPv4 transport dial. */
   dialIp4(address: string): number {
     this.#assertOpen();
     return this.#backend.dialIp4(address);
   }
 
+  /** Starts a direct IPv6 transport dial. */
   dialIp6(address: string): number {
     this.#assertOpen();
     return this.#backend.dialIp6(address);
   }
 
+  /** Closes the active connection to `peerId`. */
   disconnect(peerId: string): void {
     this.#assertOpen();
     this.#backend.disconnect(peerId);

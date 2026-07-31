@@ -9,6 +9,7 @@ import { AppState } from "react-native";
 import { Minip2p } from "./adapter";
 import { bindAppStateSource, mountEndpointLifecycle } from "./hook-lifecycle";
 
+/** Lifecycle state returned by {@link useMinip2p}. */
 export type Minip2pHookState =
   | {
       readonly status: "starting";
@@ -39,7 +40,9 @@ export type Minip2pHookState =
       readonly error: unknown;
     };
 
+/** Hook lifecycle state plus an idempotent endpoint shutdown callback. */
 export type UseMinip2pResult = Minip2pHookState & {
+  /** Closes the currently owned endpoint, if one exists. */
   readonly close: () => void;
 };
 
