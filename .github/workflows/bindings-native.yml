@@ -58,7 +58,7 @@ jobs:
             react-native/example/android/app/build/outputs/apk/debug/app-debug.apk
       - name: Monitor native sizes
         run: node react-native/scripts/check-native-size.mjs android
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: minip2p-android-debug
           path: bindings/ts/react-native/example/android/app/build/outputs/apk/debug/app-debug.apk
@@ -90,7 +90,7 @@ jobs:
           lipo -info react-native/build/Minip2pFfi.xcframework/ios-arm64-simulator/libminip2p_ffi.a
       - name: Monitor native sizes
         run: node react-native/scripts/check-native-size.mjs ios
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: minip2p-ios-xcframework
           path: bindings/ts/react-native/build/Minip2pFfi.xcframework
