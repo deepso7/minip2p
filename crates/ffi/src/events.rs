@@ -1,10 +1,27 @@
 //! Foreign-facing event model and upstream event conversion.
 
 use minip2p::{
-    DiscoveryEvent, DiscoverySource as UpstreamDiscoverySource, Event, NatError, NatEvent, Path,
-    PubsubEvent, ReachabilityState,
+    DiscoveryEvent, DiscoverySource as UpstreamDiscoverySource, Event, IdentifyMessage, Multiaddr,
+    NatError, NatEvent, Path, PubsubEvent, ReachabilityState,
 };
 use minip2p_swarm::SwarmErrorKind;
+
+/// Foreign-friendly snapshot of a peer's Identify message.
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct IdentifyInfo {
+    /// Protobuf-encoded libp2p public key, when supplied.
+    pub public_key: Option<Vec<u8>>,
+    /// Listen addresses advertised by the peer.
+    pub listen_addrs: Vec<String>,
+    /// Protocol ids advertised by the peer.
+    pub protocols: Vec<String>,
+    /// Address the peer observed for this endpoint, when supplied.
+    pub observed_addr: Option<String>,
+    /// Remote libp2p protocol version, when supplied.
+    pub protocol_version: Option<String>,
+    /// Remote agent version, when supplied.
+    pub agent_version: Option<String>,
+}
 
 /// Coarse local reachability state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
@@ -128,6 +145,13 @@ pub enum P2pEvent {
         /// Protocols advertised by the peer.
         protocols: Vec<String>,
     },
+    /// A peer supplied a new Identify snapshot.
+    IdentifyReceived {
+        /// Remote peer.
+        peer_id: String,
+        /// Decoded Identify information.
+        info: IdentifyInfo,
+    },
     /// A ping round-trip measurement completed.
     PingRttMeasured {
         /// Remote peer.
@@ -139,6 +163,48 @@ pub enum P2pEvent {
     PingTimeout {
         /// Remote peer.
         peer_id: String,
+    },
+    /// A custom application stream completed protocol negotiation.
+    StreamReady {
+        /// Remote peer.
+        peer_id: String,
+        /// Transport connection carrying the stream.
+        conn_id: u64,
+        /// Opaque stream id.
+        stream_id: u64,
+        /// Negotiated application protocol.
+        protocol_id: String,
+        /// Whether this endpoint initiated the stream.
+        initiated_locally: bool,
+    },
+    /// Bytes arrived on a custom application stream.
+    StreamData {
+        /// Remote peer.
+        peer_id: String,
+        /// Transport connection carrying the stream.
+        conn_id: u64,
+        /// Opaque stream id.
+        stream_id: u64,
+        /// Received bytes.
+        data: Vec<u8>,
+    },
+    /// The remote peer half-closed its stream write side.
+    StreamRemoteWriteClosed {
+        /// Remote peer.
+        peer_id: String,
+        /// Transport connection carrying the stream.
+        conn_id: u64,
+        /// Opaque stream id.
+        stream_id: u64,
+    },
+    /// A custom application stream fully closed.
+    StreamClosed {
+        /// Remote peer.
+        peer_id: String,
+        /// Transport connection that carried the stream.
+        conn_id: u64,
+        /// Opaque stream id.
+        stream_id: u64,
     },
     /// A non-fatal endpoint error occurred.
     EndpointError {
@@ -334,11 +400,10 @@ pub(crate) fn convert_swarm(event: Event) -> Option<P2pEvent> {
             peer_id: peer_id.to_base58(),
             conn_id: conn_id.as_u64(),
         },
-        Event::IdentifyReceived { .. }
-        | Event::StreamReady { .. }
-        | Event::StreamData { .. }
-        | Event::StreamRemoteWriteClosed { .. }
-        | Event::StreamClosed { .. } => return None,
+        Event::IdentifyReceived { peer_id, info } => P2pEvent::IdentifyReceived {
+            peer_id: peer_id.to_base58(),
+            info: convert_identify(&info),
+        },
         Event::PeerReady { peer_id, protocols } => P2pEvent::PeerReady {
             peer_id: peer_id.to_base58(),
             protocols,
@@ -350,6 +415,48 @@ pub(crate) fn convert_swarm(event: Event) -> Option<P2pEvent> {
         Event::PingTimeout { peer_id } => P2pEvent::PingTimeout {
             peer_id: peer_id.to_base58(),
         },
+        Event::StreamReady {
+            peer_id,
+            conn_id,
+            stream_id,
+            protocol_id,
+            initiated_locally,
+        } => P2pEvent::StreamReady {
+            peer_id: peer_id.to_base58(),
+            conn_id: conn_id.as_u64(),
+            stream_id: stream_id.as_u64(),
+            protocol_id,
+            initiated_locally,
+        },
+        Event::StreamData {
+            peer_id,
+            conn_id,
+            stream_id,
+            data,
+        } => P2pEvent::StreamData {
+            peer_id: peer_id.to_base58(),
+            conn_id: conn_id.as_u64(),
+            stream_id: stream_id.as_u64(),
+            data,
+        },
+        Event::StreamRemoteWriteClosed {
+            peer_id,
+            conn_id,
+            stream_id,
+        } => P2pEvent::StreamRemoteWriteClosed {
+            peer_id: peer_id.to_base58(),
+            conn_id: conn_id.as_u64(),
+            stream_id: stream_id.as_u64(),
+        },
+        Event::StreamClosed {
+            peer_id,
+            conn_id,
+            stream_id,
+        } => P2pEvent::StreamClosed {
+            peer_id: peer_id.to_base58(),
+            conn_id: conn_id.as_u64(),
+            stream_id: stream_id.as_u64(),
+        },
         Event::Error(error) => P2pEvent::EndpointError {
             kind: convert_swarm_error_kind(error.kind),
             peer_id: error.peer_id.map(|peer| peer.to_base58()),
@@ -357,6 +464,26 @@ pub(crate) fn convert_swarm(event: Event) -> Option<P2pEvent> {
             detail: error.detail,
         },
     })
+}
+
+pub(crate) fn convert_identify(info: &IdentifyMessage) -> IdentifyInfo {
+    IdentifyInfo {
+        public_key: info.public_key.clone(),
+        listen_addrs: info
+            .listen_addrs
+            .iter()
+            .filter_map(|address| Multiaddr::from_bytes(address).ok())
+            .map(|address| address.to_string())
+            .collect(),
+        protocols: info.protocols.clone(),
+        observed_addr: info
+            .observed_addr
+            .as_deref()
+            .and_then(|address| Multiaddr::from_bytes(address).ok())
+            .map(|address| address.to_string()),
+        protocol_version: info.protocol_version.clone(),
+        agent_version: info.agent_version.clone(),
+    }
 }
 
 pub(crate) fn convert_nat(event: NatEvent) -> P2pEvent {
@@ -566,7 +693,7 @@ fn display_addrs(addrs: Vec<minip2p::Multiaddr>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minip2p::{ConnectionId, Ed25519Keypair, PeerId};
+    use minip2p::{ConnectionId, Ed25519Keypair, PeerId, StreamId};
     use std::str::FromStr;
 
     fn peer(seed: u8) -> PeerId {
@@ -590,14 +717,44 @@ mod tests {
     }
 
     #[test]
-    fn internal_swarm_events_are_deliberately_not_exported() {
+    fn identify_and_stream_events_are_exported() {
         let remote = peer(4);
-        assert!(
+        let address =
+            minip2p::Multiaddr::from_str("/ip4/127.0.0.1/udp/7/quic-v1").expect("address");
+        assert_eq!(
             convert_swarm(Event::IdentifyReceived {
-                peer_id: remote,
-                info: minip2p::IdentifyMessage::default(),
+                peer_id: remote.clone(),
+                info: minip2p::IdentifyMessage {
+                    listen_addrs: vec![address.to_bytes()],
+                    protocols: vec!["/example/1".into()],
+                    ..minip2p::IdentifyMessage::default()
+                },
+            }),
+            Some(P2pEvent::IdentifyReceived {
+                peer_id: remote.to_base58(),
+                info: IdentifyInfo {
+                    public_key: None,
+                    listen_addrs: vec![address.to_string()],
+                    protocols: vec!["/example/1".into()],
+                    observed_addr: None,
+                    protocol_version: None,
+                    agent_version: None,
+                },
             })
-            .is_none()
+        );
+        assert_eq!(
+            convert_swarm(Event::StreamData {
+                peer_id: remote.clone(),
+                conn_id: ConnectionId::new(8),
+                stream_id: StreamId::new(12),
+                data: vec![1, 2, 3],
+            }),
+            Some(P2pEvent::StreamData {
+                peer_id: remote.to_base58(),
+                conn_id: 8,
+                stream_id: 12,
+                data: vec![1, 2, 3],
+            })
         );
     }
 

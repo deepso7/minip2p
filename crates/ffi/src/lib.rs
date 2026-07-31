@@ -10,12 +10,15 @@ mod events;
 
 use std::str::FromStr;
 
-pub use config::{DiscoveryOptions, EndpointConfig, KnownPeerInfo, RelayReservationInfo};
+pub use config::{
+    DiscoveryOptions, EndpointConfig, KnownPeerInfo, MdnsOptions, PubsubRouter,
+    RelayReservationInfo,
+};
 pub use driver::DriverStats;
 pub use endpoint::P2pEndpoint;
 pub use error::FfiError;
 pub use events::{
-    DiscoverySource, DriverFailureKind, EndpointErrorKind, NatErrorKind, P2pEvent,
+    DiscoverySource, DriverFailureKind, EndpointErrorKind, IdentifyInfo, NatErrorKind, P2pEvent,
     P2pEventListener, PathKind, Reachability,
 };
 use minip2p::{Ed25519Keypair, Multiaddr, PeerAddr, PeerId, Protocol};

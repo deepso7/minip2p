@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# Expo
+.expo/
+dist/
+web-build/
+expo-env.d.ts
+
+# Native projects are reproduced by `pnpm prebuild`.
+/ios
+/android
+
+# Local credentials and build state
+.kotlin/
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+*.pem
+*.tsbuildinfo
+.env*.local
+.metro-health-check*
+pnpm-debug.*
+.DS_Store

@@ -7,13 +7,14 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BeaconConfig, Endpoint, GossipsubConfig, Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId,
-    PublishError, PubsubError, QuicWaitHandle, TopicError, TransportError,
+    BeaconConfig, Endpoint, FloodsubConfig, GossipsubConfig, MdnsConfig, Multiaddr, NatConfig,
+    PeerDiscoveryConfig, PeerId, PublishError, PubsubConfig, PubsubError, QuicWaitHandle, StreamId,
+    TopicError, TransportError,
 };
 
 use crate::{
-    DriverStats, EndpointConfig, FfiError, KnownPeerInfo, P2pEventListener, RelayReservationInfo,
-    keypair_from_bytes, parse_direct_quic_peer_addr,
+    DriverStats, EndpointConfig, FfiError, IdentifyInfo, KnownPeerInfo, P2pEventListener,
+    PubsubRouter, RelayReservationInfo, keypair_from_bytes, parse_direct_quic_peer_addr,
 };
 
 /// A minip2p endpoint owned by a foreign runtime.
@@ -64,15 +65,26 @@ impl P2pEndpoint {
             .iter()
             .map(|address| parse_direct_quic_peer_addr(address))
             .collect::<Result<Vec<_>, _>>()?;
+        let autonat_servers = config
+            .autonat_servers
+            .iter()
+            .map(|address| parse_direct_quic_peer_addr(address))
+            .collect::<Result<Vec<_>, _>>()?;
         if config.force_relay && relays.is_empty() {
             return Err(FfiError::InvalidConfig {
                 detail: "force_relay requires at least one relay".into(),
             });
         }
 
-        let pubsub = GossipsubConfig {
-            allow_unsigned: config.allow_unsigned,
-            ..GossipsubConfig::default()
+        let pubsub = match config.pubsub_router {
+            PubsubRouter::Gossipsub => PubsubConfig::Gossipsub(GossipsubConfig {
+                allow_unsigned: config.allow_unsigned,
+                ..GossipsubConfig::default()
+            }),
+            PubsubRouter::Floodsub => PubsubConfig::Floodsub(FloodsubConfig {
+                allow_unsigned: config.allow_unsigned,
+                ..FloodsubConfig::default()
+            }),
         };
         pubsub.validate().map_err(invalid_config)?;
 
@@ -84,13 +96,18 @@ impl P2pEndpoint {
                     .unwrap_or_else(|| format!("minip2p-rn/{}", env!("CARGO_PKG_VERSION"))),
             )
             .pubsub_config(pubsub);
+        for protocol in config.protocols {
+            builder = builder.protocol(protocol);
+        }
 
         builder = builder.nat_config(NatConfig {
             relays,
+            autonat_servers,
             force_relay: config.force_relay,
             ..NatConfig::default()
         });
 
+        let signed_auto_dial = config.discovery.as_ref().map(|options| options.auto_dial);
         if let Some(discovery) = config.discovery {
             let beacon = BeaconConfig {
                 topic: discovery.topic,
@@ -109,6 +126,32 @@ impl P2pEndpoint {
                 .map_err(invalid_config)?
                 .peer_discovery_config(peer_discovery)
                 .map_err(invalid_config)?;
+        }
+        if let Some(mdns) = config.mdns {
+            if signed_auto_dial.is_some_and(|auto_dial| auto_dial != mdns.auto_dial) {
+                return Err(FfiError::InvalidConfig {
+                    detail: "signed discovery and mDNS must use the same auto_dial policy".into(),
+                });
+            }
+            let mdns_config = MdnsConfig {
+                enable_ipv6: mdns.enable_ipv6,
+                ttl_ms: mdns.ttl_ms,
+                query_interval_ms: mdns.query_interval_ms,
+                max_packet_bytes: mdns.max_packet_bytes as usize,
+                max_announced_addrs: mdns.max_announced_addrs as usize,
+                interface_refresh_ms: mdns.interface_refresh_ms,
+                socket_poll_interval_ms: mdns.socket_poll_interval_ms,
+            };
+            mdns_config.validate().map_err(invalid_config)?;
+            builder = builder.mdns_config(mdns_config).map_err(invalid_config)?;
+            if signed_auto_dial.is_none() {
+                builder = builder
+                    .peer_discovery_config(PeerDiscoveryConfig {
+                        auto_dial: mdns.auto_dial,
+                        ..PeerDiscoveryConfig::default()
+                    })
+                    .map_err(invalid_config)?;
+            }
         }
 
         let mut endpoint = match config.listen_addr {
@@ -183,6 +226,22 @@ impl P2pEndpoint {
                     .collect()
             })
             .ok_or(FfiError::Stopped)
+    }
+
+    /// Returns whether Identify has completed for `peer_id`.
+    pub fn is_peer_ready(&self, peer_id: String) -> Result<bool, FfiError> {
+        let peer = parse_peer_id(&peer_id)?;
+        self.with_endpoint(|endpoint| endpoint.is_peer_ready(&peer))
+    }
+
+    /// Returns the latest Identify snapshot for `peer_id`.
+    pub fn peer_info(&self, peer_id: String) -> Result<Option<IdentifyInfo>, FfiError> {
+        let peer = parse_peer_id(&peer_id)?;
+        self.with_endpoint(|endpoint| {
+            endpoint
+                .peer_info(&peer)
+                .map(crate::events::convert_identify)
+        })
     }
 
     /// Selects active or idle driver polling without changing delivery semantics.
@@ -291,6 +350,75 @@ impl P2pEndpoint {
         self.with_endpoint_mut(|endpoint| endpoint.publish(&topic, data).map_err(map_pubsub_error))
     }
 
+    /// Sends an explicit ping; completion arrives as a ping event.
+    pub fn ping(&self, peer_id: String) -> Result<(), FfiError> {
+        let peer = parse_peer_id(&peer_id)?;
+        self.with_endpoint_mut(|endpoint| endpoint.ping(&peer).map_err(map_driver_error))
+    }
+
+    /// Registers an application protocol.
+    pub fn add_protocol(&self, protocol_id: String) -> Result<(), FfiError> {
+        self.with_endpoint_mut(|endpoint| {
+            endpoint.add_protocol(protocol_id).map_err(map_driver_error)
+        })
+    }
+
+    /// Opens a negotiated application stream and returns its opaque id.
+    pub fn open_stream(&self, peer_id: String, protocol_id: String) -> Result<u64, FfiError> {
+        let peer = parse_peer_id(&peer_id)?;
+        self.with_endpoint_mut(|endpoint| {
+            endpoint
+                .open_stream(&peer, &protocol_id)
+                .map(|stream| stream.as_u64())
+                .map_err(map_driver_error)
+        })
+    }
+
+    /// Sends one byte chunk on an application stream.
+    pub fn send_stream(
+        &self,
+        peer_id: String,
+        stream_id: u64,
+        data: Vec<u8>,
+    ) -> Result<(), FfiError> {
+        let peer = parse_peer_id(&peer_id)?;
+        self.with_endpoint_mut(|endpoint| {
+            endpoint
+                .send_stream(&peer, StreamId::new(stream_id), data)
+                .map_err(map_driver_error)
+        })
+    }
+
+    /// Half-closes the local write side of an application stream.
+    pub fn close_stream_write(&self, peer_id: String, stream_id: u64) -> Result<(), FfiError> {
+        let peer = parse_peer_id(&peer_id)?;
+        self.with_endpoint_mut(|endpoint| {
+            endpoint
+                .close_stream_write(&peer, StreamId::new(stream_id))
+                .map_err(map_driver_error)
+        })
+    }
+
+    /// Resets an application stream while retaining later close events.
+    pub fn reset_stream(&self, peer_id: String, stream_id: u64) -> Result<(), FfiError> {
+        let peer = parse_peer_id(&peer_id)?;
+        self.with_endpoint_mut(|endpoint| {
+            endpoint
+                .reset_stream(&peer, StreamId::new(stream_id))
+                .map_err(map_driver_error)
+        })
+    }
+
+    /// Resets and forgets an application stream.
+    pub fn abandon_stream(&self, peer_id: String, stream_id: u64) -> Result<(), FfiError> {
+        let peer = parse_peer_id(&peer_id)?;
+        self.with_endpoint_mut(|endpoint| {
+            endpoint
+                .abandon_stream(&peer, StreamId::new(stream_id))
+                .map_err(map_driver_error)
+        })
+    }
+
     /// Starts a connection attempt toward a peer without known direct addresses.
     pub fn connect(&self, peer_id: String) -> Result<u64, FfiError> {
         let peer = PeerId::from_str(&peer_id).map_err(|error| FfiError::InvalidPeerId {
@@ -304,6 +432,39 @@ impl P2pEndpoint {
             .as_mut()
             .ok_or(FfiError::Stopped)?
             .connect(&peer)
+            .map_err(map_driver_error)?;
+        state.connect_ids.insert(id.as_u64(), id);
+        Ok(id.as_u64())
+    }
+
+    /// Starts a NAT connection attempt using an explicit ordered address set.
+    pub fn connect_with_addrs(
+        &self,
+        peer_id: String,
+        addresses: Vec<String>,
+    ) -> Result<u64, FfiError> {
+        let peer = parse_peer_id(&peer_id)?;
+        let addresses = addresses
+            .iter()
+            .map(|address| parse_direct_quic_peer_addr(address))
+            .collect::<Result<Vec<_>, _>>()?;
+        if addresses.iter().any(|address| address.peer_id() != &peer) {
+            return Err(FfiError::InvalidAddress {
+                detail: "every connection address must end in the requested peer id".into(),
+            });
+        }
+        let direct_addrs = addresses
+            .into_iter()
+            .map(|address| address.transport().clone())
+            .collect();
+        let _pending = PendingCommand::new(&self.shared);
+        let mut state = self.shared.lock_state();
+        ensure_accepting_commands(&state)?;
+        let id = state
+            .endpoint
+            .as_mut()
+            .ok_or(FfiError::Stopped)?
+            .connect_with_addrs(peer, direct_addrs)
             .map_err(map_driver_error)?;
         state.connect_ids.insert(id.as_u64(), id);
         Ok(id.as_u64())
@@ -323,6 +484,39 @@ impl P2pEndpoint {
             .map_err(map_driver_error)?;
         state.connect_ids.insert(id.as_u64(), id);
         Ok(id.as_u64())
+    }
+
+    /// Dials a direct peer address on every applicable local address family.
+    pub fn dial(&self, address: String) -> Result<Vec<u64>, FfiError> {
+        let address = parse_direct_quic_peer_addr(&address)?;
+        self.with_endpoint_mut(|endpoint| {
+            endpoint
+                .dial(&address)
+                .map(|ids| ids.into_iter().map(|id| id.as_u64()).collect())
+                .map_err(map_driver_error)
+        })
+    }
+
+    /// Dials a direct peer address using IPv4.
+    pub fn dial_ip4(&self, address: String) -> Result<u64, FfiError> {
+        let address = parse_direct_quic_peer_addr(&address)?;
+        self.with_endpoint_mut(|endpoint| {
+            endpoint
+                .dial_ip4(&address)
+                .map(|id| id.as_u64())
+                .map_err(map_driver_error)
+        })
+    }
+
+    /// Dials a direct peer address using IPv6.
+    pub fn dial_ip6(&self, address: String) -> Result<u64, FfiError> {
+        let address = parse_direct_quic_peer_addr(&address)?;
+        self.with_endpoint_mut(|endpoint| {
+            endpoint
+                .dial_ip6(&address)
+                .map(|id| id.as_u64())
+                .map_err(map_driver_error)
+        })
     }
 
     /// Cancels a known connection attempt; unknown ids are an idempotent no-op.
@@ -373,6 +567,11 @@ impl P2pEndpoint {
                 })
                 .collect()
         })
+    }
+
+    /// Returns the discovery driver's monotonic clock in milliseconds.
+    pub fn discovery_now_ms(&self) -> Result<Option<u64>, FfiError> {
+        self.with_endpoint(|endpoint| endpoint.discovery_now_ms())
     }
 
     /// Returns the current AutoNAT reachability verdict.
@@ -485,6 +684,12 @@ fn invalid_config(error: impl std::fmt::Display) -> FfiError {
     FfiError::InvalidConfig {
         detail: error.to_string(),
     }
+}
+
+fn parse_peer_id(peer_id: &str) -> Result<PeerId, FfiError> {
+    PeerId::from_str(peer_id).map_err(|error| FfiError::InvalidPeerId {
+        detail: error.to_string(),
+    })
 }
 
 fn map_constructor_error(error: minip2p::Error) -> FfiError {
@@ -615,10 +820,14 @@ mod tests {
         EndpointConfig {
             agent_version: None,
             relays: Vec::new(),
+            autonat_servers: Vec::new(),
             listen_addr: Some("/ip4/127.0.0.1/udp/0/quic-v1".into()),
             force_relay: false,
             allow_unsigned: false,
+            pubsub_router: PubsubRouter::Gossipsub,
+            protocols: Vec::new(),
             discovery: None,
+            mdns: None,
         }
     }
 
@@ -755,6 +964,44 @@ mod tests {
         });
 
         endpoint(config).expect("discovery endpoint");
+    }
+
+    #[test]
+    fn constructor_accepts_mdns_and_floodsub_configuration() {
+        let mut config = config();
+        config.pubsub_router = PubsubRouter::Floodsub;
+        config.mdns = Some(crate::MdnsOptions {
+            enable_ipv6: false,
+            ttl_ms: 120_000,
+            query_interval_ms: 300_000,
+            max_packet_bytes: 1_400,
+            max_announced_addrs: 16,
+            interface_refresh_ms: 10_000,
+            socket_poll_interval_ms: 100,
+            auto_dial: true,
+        });
+
+        endpoint(config).expect("mDNS + floodsub endpoint");
+    }
+
+    #[test]
+    fn constructor_rejects_invalid_mdns_configuration() {
+        let mut config = config();
+        config.mdns = Some(crate::MdnsOptions {
+            enable_ipv6: false,
+            ttl_ms: 0,
+            query_interval_ms: 300_000,
+            max_packet_bytes: 1_400,
+            max_announced_addrs: 16,
+            interface_refresh_ms: 10_000,
+            socket_poll_interval_ms: 100,
+            auto_dial: true,
+        });
+
+        assert!(matches!(
+            endpoint(config),
+            Err(FfiError::InvalidConfig { .. })
+        ));
     }
 
     #[test]

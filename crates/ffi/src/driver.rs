@@ -49,7 +49,7 @@ struct Delivery {
 #[derive(Default)]
 struct Carry {
     events: BTreeMap<u64, P2pEvent>,
-    message_ids: VecDeque<u64>,
+    payload_ids: VecDeque<u64>,
     next_id: u64,
 }
 
@@ -65,15 +65,15 @@ impl Carry {
     fn push(&mut self, event: P2pEvent) -> bool {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        if matches!(event, P2pEvent::Message { .. }) {
-            self.message_ids.push_back(id);
+        if is_payload_event(&event) {
+            self.payload_ids.push_back(id);
         }
         self.events.insert(id, event);
         if self.events.len() <= MAX_CARRY_EVENTS {
             return false;
         }
-        if let Some(message_id) = self.message_ids.pop_front() {
-            self.events.remove(&message_id);
+        if let Some(payload_id) = self.payload_ids.pop_front() {
+            self.events.remove(&payload_id);
         } else {
             self.events.pop_first();
         }
@@ -88,7 +88,7 @@ impl Carry {
                 batch.push(event);
             }
         }
-        self.prune_message_ids();
+        self.prune_payload_ids();
         batch
     }
 
@@ -96,13 +96,20 @@ impl Carry {
         let before = self.events.len();
         self.events
             .retain(|_, event| p2p_connect_id(event).is_none_or(|id| !cancelled.contains(&id)));
-        self.prune_message_ids();
+        self.prune_payload_ids();
         before - self.events.len()
     }
 
-    fn prune_message_ids(&mut self) {
-        self.message_ids.retain(|id| self.events.contains_key(id));
+    fn prune_payload_ids(&mut self) {
+        self.payload_ids.retain(|id| self.events.contains_key(id));
     }
+}
+
+fn is_payload_event(event: &P2pEvent) -> bool {
+    matches!(
+        event,
+        P2pEvent::Message { .. } | P2pEvent::StreamData { .. }
+    )
 }
 
 struct ExitGuard {
@@ -421,6 +428,21 @@ mod tests {
         let retained = carry.take(MAX_CARRY_EVENTS);
         assert_eq!(retained.first(), Some(&lifecycle));
         assert_eq!(retained.get(1), Some(&message(2)));
+    }
+
+    #[test]
+    fn stream_data_uses_the_payload_overflow_class() {
+        assert!(is_payload_event(&P2pEvent::StreamData {
+            peer_id: "peer".into(),
+            conn_id: 1,
+            stream_id: 2,
+            data: vec![3],
+        }));
+        assert!(!is_payload_event(&P2pEvent::StreamClosed {
+            peer_id: "peer".into(),
+            conn_id: 1,
+            stream_id: 2,
+        }));
     }
 
     #[test]

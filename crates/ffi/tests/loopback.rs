@@ -167,10 +167,14 @@ fn config() -> EndpointConfig {
     EndpointConfig {
         agent_version: Some("minip2p-ffi-loopback-test".into()),
         relays: Vec::new(),
+        autonat_servers: Vec::new(),
         listen_addr: Some("/ip4/127.0.0.1/udp/0/quic-v1".into()),
         force_relay: false,
         allow_unsigned: false,
+        pubsub_router: minip2p_ffi::PubsubRouter::Gossipsub,
+        protocols: Vec::new(),
         discovery: None,
+        mdns: None,
     }
 }
 
@@ -272,6 +276,90 @@ fn two_endpoints_chat_over_loopback() -> Result<(), FfiError> {
     stop(&b);
     assert!(!a.is_running());
     assert!(!b.is_running());
+    Ok(())
+}
+
+#[test]
+fn identify_ping_and_custom_streams_cross_the_ffi_boundary() -> Result<(), FfiError> {
+    let _serial = LOOPBACK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let a = endpoint(23);
+    let b = endpoint(24);
+    let a_log = Arc::new(EventLog::default());
+    let b_log = Arc::new(EventLog::default());
+    let protocol = "/minip2p/ffi-test/1";
+    let b_peer = b.peer_id();
+
+    a.add_protocol(protocol.into())?;
+    b.add_protocol(protocol.into())?;
+    a.start(Arc::clone(&a_log) as Arc<dyn P2pEventListener>)?;
+    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventListener>)?;
+    a.connect_with_addrs(b_peer.clone(), vec![b.listen_addrs()[0].clone()])?;
+
+    assert!(
+        a_log
+            .wait_for(Duration::from_secs(5), |event| matches!(
+                event,
+                P2pEvent::PeerReady { peer_id, protocols }
+                    if peer_id == &b_peer && protocols.iter().any(|id| id == protocol)
+            ))
+            .is_some()
+    );
+    assert!(a.is_peer_ready(b_peer.clone())?);
+    let info = a
+        .peer_info(b_peer.clone())?
+        .expect("ready peer has Identify info");
+    assert!(info.protocols.iter().any(|id| id == protocol));
+    assert!(!info.listen_addrs.is_empty());
+    assert!(
+        a_log
+            .wait_for(Duration::from_secs(5), |event| matches!(
+                event,
+                P2pEvent::IdentifyReceived { peer_id, info }
+                    if peer_id == &b_peer && info.protocols.iter().any(|id| id == protocol)
+            ))
+            .is_some()
+    );
+
+    a.ping(b_peer.clone())?;
+    assert!(
+        a_log
+            .wait_for(Duration::from_secs(5), |event| matches!(
+                event,
+                P2pEvent::PingRttMeasured { peer_id, .. } if peer_id == &b_peer
+            ))
+            .is_some()
+    );
+
+    let stream_id = a.open_stream(b_peer.clone(), protocol.into())?;
+    assert!(
+        a_log
+            .wait_for(Duration::from_secs(5), |event| matches!(
+                event,
+                P2pEvent::StreamReady {
+                    peer_id,
+                    stream_id: observed,
+                    protocol_id,
+                    initiated_locally: true,
+                    ..
+                } if peer_id == &b_peer && *observed == stream_id && protocol_id == protocol
+            ))
+            .is_some()
+    );
+    a.send_stream(b_peer.clone(), stream_id, b"stream payload".to_vec())?;
+    a.close_stream_write(b_peer, stream_id)?;
+    assert!(
+        b_log
+            .wait_for(Duration::from_secs(5), |event| matches!(
+                event,
+                P2pEvent::StreamData { data, .. } if data == b"stream payload"
+            ))
+            .is_some()
+    );
+
+    stop(&a);
+    stop(&b);
     Ok(())
 }
 

@@ -47,6 +47,26 @@ docs-site:
     cargo check --manifest-path docs/snippets/quickstart/Cargo.toml
     cargo check --manifest-path docs/snippets/custom-stream/Cargo.toml
 
+bindings-check:
+    cd bindings/ts && pnpm typecheck
+    cd bindings/ts && pnpm test
+    cd bindings/ts && pnpm lint
+    cd bindings/ts && pnpm build
+    cd bindings/ts && pnpm rn:generate
+    test -z "$(git status --porcelain)"
+
+bindings-format:
+    cd bindings/ts && pnpm format
+
+bindings-generate:
+    cd bindings/ts && pnpm rn:generate
+
+bindings-ios:
+    cd bindings/ts && pnpm rn:ios
+
+bindings-android:
+    cd bindings/ts && pnpm rn:android
+
 bench:
     cargo bench -p minip2p-core --bench multiaddr
 

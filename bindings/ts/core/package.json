@@ -1,0 +1,58 @@
+{
+  "name": "@minip2p/core",
+  "version": "0.1.0",
+  "description": "Platform-neutral TypeScript SDK for minip2p",
+  "keywords": [
+    "libp2p",
+    "p2p",
+    "peer-to-peer",
+    "quic",
+    "typescript"
+  ],
+  "homepage": "https://github.com/deepso7/minip2p#readme",
+  "bugs": {
+    "url": "https://github.com/deepso7/minip2p/issues"
+  },
+  "license": "MIT",
+  "author": "Deepso <deeps.o7o8.y@gmail.com> (https://github.com/deepso7)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deepso7/minip2p.git",
+    "directory": "bindings/ts/core"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "minip2p-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./backend": {
+      "minip2p-source": "./src/backend.ts",
+      "types": "./dist/backend.d.ts",
+      "default": "./dist/backend.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "build": "del-cli dist && tsc -p tsconfig.build.json",
+    "clean": "del-cli dist",
+    "test": "pnpm build && node --test tests/*.test.mjs",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "del-cli": "^7.0.0",
+    "typescript": "^6.0.3"
+  }
+}

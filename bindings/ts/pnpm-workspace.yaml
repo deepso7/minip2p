@@ -1,0 +1,19 @@
+packages:
+  - core
+  - node
+  - react-native
+  - react-native/example
+
+minimumReleaseAgeExclude:
+  - "@expo/cli@56.1.22"
+  - "@expo/inline-modules@0.0.15"
+  - "@expo/local-build-cache-provider@56.0.11"
+  - expo@56.0.18
+
+nodeLinker: hoisted
+
+onlyBuiltDependencies:
+  - esbuild
+
+patchedDependencies:
+  uniffi-bindgen-react-native@0.31.0-3: react-native/patches/uniffi-bindgen-react-native@0.31.0-3.patch

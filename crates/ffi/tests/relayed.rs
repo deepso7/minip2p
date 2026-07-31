@@ -68,10 +68,14 @@ fn endpoint(seed: u8, relay: String) -> Arc<P2pEndpoint> {
         EndpointConfig {
             agent_version: Some("minip2p-ffi-relay-test".into()),
             relays: vec![relay],
+            autonat_servers: Vec::new(),
             listen_addr: Some("/ip4/127.0.0.1/udp/0/quic-v1".into()),
             force_relay: true,
             allow_unsigned: false,
+            pubsub_router: minip2p_ffi::PubsubRouter::Gossipsub,
+            protocols: Vec::new(),
             discovery: None,
+            mdns: None,
         },
     )
     .expect("construct relay endpoint")

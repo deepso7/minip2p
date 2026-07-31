@@ -1,0 +1,36 @@
+{
+  "expo": {
+    "name": "minip2p example",
+    "slug": "minip2p-example",
+    "version": "0.0.1",
+    "plugins": ["./plugins/with-minip2p-build"],
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "bundleIdentifier": "dev.deepso.minip2p.example",
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSBonjourServices": ["_p2p._udp"],
+        "NSLocalNetworkUsageDescription": "Discover nearby minip2p peers on your local network."
+      }
+    },
+    "android": {
+      "package": "dev.deepso.minip2p.example",
+      "permissions": [
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.CHANGE_WIFI_MULTICAST_STATE"
+      ],
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    }
+  }
+}
