@@ -484,12 +484,24 @@ fn a_lost_segment_is_retransmitted_on_the_deadline_the_transport_reported() {
         connected(&dropped.listener_events),
         Some(&dropped.dialer_peer)
     );
+    let dial_timeout = SmoltcpConfig::default()
+        .connect_timeout_ms
+        .expect("a default dial timeout");
     assert!(
         dropped.elapsed > clean.elapsed,
         "recovering from loss has to wait for a retransmit timer, \
          but the lossy run took {}ms against {}ms clean",
         dropped.elapsed,
         clean.elapsed
+    );
+    // And it has to be the retransmit that recovered it, on a retransmit's
+    // timescale. Reaching the dial timeout would mean the connection was
+    // rebuilt from scratch rather than repaired, which is a different thing
+    // passing for the same result.
+    assert!(
+        dropped.elapsed < dial_timeout,
+        "loss should cost retransmits, not a whole dial timeout: {}ms of {dial_timeout}ms",
+        dropped.elapsed
     );
 }
 
@@ -895,6 +907,106 @@ mod provider {
         );
     }
 
+    /// Shorter than the default, so a test can wait one out.
+    const BRIEF_TIMEOUT: u64 = 1_000;
+
+    #[test]
+    fn a_dial_made_after_a_long_idle_is_not_born_expired() {
+        let mut duo = Duo::new();
+        let bound = duo
+            .listener
+            .listen(&host_port(LISTENER_IP4, 0))
+            .expect("listener binds");
+        duo.drain();
+
+        // The host had nothing to do for far longer than a dial is allowed to
+        // take, and then dialled -- without polling first, which nothing
+        // requires it to do. A countdown dated from the last poll's time sample
+        // would already have run out before this dial reached the wire.
+        duo.now = 10
+            * SmoltcpConfig::default()
+                .connect_timeout_ms
+                .expect("a default dial timeout");
+        let socket = duo.dialer.connect(&bound).expect("dial starts");
+        duo.drain();
+
+        assert!(
+            duo.dialer_events.iter().any(|event| matches!(
+                event,
+                TcpEvent::Connected { socket: found, .. } if *found == socket
+            )),
+            "the dial should complete rather than expire on arrival: {:?}",
+            duo.dialer_events
+        );
+    }
+
+    #[test]
+    fn an_inbound_attempt_that_dies_before_it_is_accepted_is_never_mentioned() {
+        let mut duo = Duo::with_config(SmoltcpConfig {
+            connect_timeout_ms: Some(BRIEF_TIMEOUT),
+            ..SmoltcpConfig::default()
+        });
+        let bound = duo
+            .listener
+            .listen(&host_port(LISTENER_IP4, 0))
+            .expect("listener binds");
+        duo.drain();
+        duo.forget();
+
+        // A peer that sends a `SYN` and never acknowledges the reply. No handle
+        // was ever handed over for it, so the listener has nothing to say: not
+        // an `Accepted` for a connection that never existed, and not a `Closed`
+        // against a handle its caller has never seen.
+        duo.wire.lose_from_dialer(1, 1);
+        duo.dialer.connect(&bound).expect("dial starts");
+        duo.drain();
+        duo.now += BRIEF_TIMEOUT + 1;
+        duo.drain();
+
+        assert!(
+            duo.listener_events.is_empty(),
+            "a stream that never came up is not the caller's to hear about: {:?}",
+            duo.listener_events
+        );
+    }
+
+    #[test]
+    fn abandoned_inbound_handshakes_do_not_exhaust_the_socket_budget() {
+        let mut duo = Duo::with_config(SmoltcpConfig {
+            max_sockets: 4,
+            backlog: 1,
+            connect_timeout_ms: Some(BRIEF_TIMEOUT),
+            ..SmoltcpConfig::default()
+        });
+        let bound = duo
+            .listener
+            .listen(&host_port(LISTENER_IP4, 0))
+            .expect("listener binds");
+
+        // Six peers that open a connection and walk away mid-handshake.
+        // smoltcp retransmits its `SYN-ACK` for as long as the socket exists,
+        // so a listener with no countdown of its own spends its entire socket
+        // budget on connections that will never be -- and never gets it back.
+        for _ in 0..6 {
+            duo.wire.lose_from_dialer(1, 1);
+            duo.dialer.connect(&bound).expect("dial starts");
+            duo.drain();
+            duo.now += BRIEF_TIMEOUT + 1;
+            duo.drain();
+            duo.forget();
+        }
+
+        duo.dialer.connect(&bound).expect("dial starts");
+        duo.drain();
+        assert!(
+            duo.listener_events
+                .iter()
+                .any(|event| matches!(event, TcpEvent::Accepted { .. })),
+            "the listener should still be answering, got {:?}",
+            duo.listener_events
+        );
+    }
+
     #[test]
     fn a_retired_connection_gives_its_port_back() {
         let mut duo = Duo::with_config(SmoltcpConfig {
@@ -911,6 +1023,42 @@ mod provider {
         duo.dialer
             .connect(&bound)
             .expect("the port comes back with the connection");
+    }
+
+    #[test]
+    fn a_port_is_not_reused_while_time_wait_still_holds_it() {
+        let mut duo = Duo::with_config(SmoltcpConfig {
+            // One port, so whether it is free is observable rather than
+            // statistical.
+            ephemeral_ports: 51000..=51000,
+            ..SmoltcpConfig::default()
+        });
+        let socket = duo.connect();
+        let peer = duo
+            .listener_events
+            .iter()
+            .find_map(|event| match event {
+                TcpEvent::Accepted { socket, .. } => Some(*socket),
+                _ => None,
+            })
+            .expect("the listener's handle");
+
+        // Close from this end first, which is what leaves it in `TIME-WAIT`
+        // holding the four-tuple.
+        duo.dialer.close_write(socket).expect("half-closes");
+        duo.drain();
+        duo.listener.close_write(peer).expect("peer half-closes");
+        duo.drain();
+
+        // The connection is over as far as the caller is concerned, but the
+        // stack is still absorbing what the old one might retransmit. Handing
+        // its port to a fresh dial would put two connections on one tuple.
+        let bound = duo.listener.local_addresses()[0].clone();
+        let error = duo
+            .dialer
+            .connect(&bound)
+            .expect_err("the port is not free yet");
+        assert!(error.to_string().contains("ephemeral ports"), "got {error}");
     }
 
     #[test]

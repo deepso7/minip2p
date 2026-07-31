@@ -55,17 +55,26 @@ pub struct SmoltcpConfig {
     /// stops listeners refilling their backlog, rather than allocating past
     /// what the host budgeted.
     pub max_sockets: usize,
-    /// How long a dial may go unanswered before it is abandoned, or `None` to
-    /// keep retransmitting the SYN indefinitely.
+    /// How long a handshake may hang before it is abandoned, or `None` to keep
+    /// retransmitting indefinitely.
     ///
-    /// smoltcp retransmits a SYN for as long as the socket lives, so without
-    /// this a dial to an address nothing answers at never finishes and never
-    /// fails.
+    /// Applies in both directions, because smoltcp gives up on neither: it
+    /// retransmits for as long as the socket lives. Without this a dial to an
+    /// address nothing answers at never finishes and never fails, and an
+    /// inbound `SYN` that is never acknowledged holds a socket for good --
+    /// which is the whole budget away from a peer that opens connections and
+    /// walks off.
+    ///
+    /// Measured from the first [`poll`](TcpProvider::poll) that sees the
+    /// stream, since that is the first time this provider is told what time it
+    /// is.
     pub connect_timeout_ms: Option<u64>,
     /// Local ports dials are drawn from.
     ///
-    /// Allocated round-robin and returned when the connection is retired, so a
-    /// port is not reused while the peer might still be talking to it.
+    /// Allocated round-robin, and returned only once the socket using it is
+    /// gone -- which is after `TIME-WAIT`, not when the connection is reported
+    /// closed, so a port is never reused while the old connection still owns
+    /// the four-tuple.
     pub ephemeral_ports: RangeInclusive<u16>,
 }
 
@@ -92,22 +101,56 @@ enum Role {
     Outbound,
 }
 
+/// Where a stream is between being asked for and carrying bytes.
+///
+/// One state rather than a flag plus a deadline, so a countdown cannot outlive
+/// the handshake it was bounding: an established connection is `Open`, and
+/// `Open` carries no deadline to report.
+///
+/// A handshake nothing answers is not self-limiting -- smoltcp retransmits for
+/// as long as the socket exists -- so it needs a countdown of its own. Without
+/// one a dial to a silent address never finishes and never fails, and an
+/// inbound `SYN` never acknowledged holds a socket for good, which is a
+/// device's whole budget away from a peer that opens connections and walks off.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Phase {
+    /// Coming up, not yet timed.
+    ///
+    /// The countdown starts at the first poll to see the stream rather than at
+    /// the call that created it, because this provider has no clock: the only
+    /// time it holds between polls is the last poll's sample, and after an idle
+    /// spell that is arbitrarily long ago. Dating a dial from it would start it
+    /// already expired.
+    Opening,
+    /// Coming up, given up on at this monotonic millisecond.
+    OpeningUntil(u64),
+    /// Coming up, waited on indefinitely, because the host asked for no timeout.
+    OpeningForever,
+    /// Announced, so events may be reported against it.
+    Open,
+}
+
 struct Entry {
     inner: SmoltcpHandle,
     role: Role,
-    /// Held only by a dial, and returned to the pool when the entry retires.
-    /// A listener's port is shared by every connection it accepts, so those
-    /// carry none.
+    /// Held only by a dial, and returned to the pool once the socket is
+    /// reclaimed. A listener's port is shared by every connection it accepts,
+    /// so those carry none.
     ephemeral_port: Option<u16>,
-    /// The stream has been announced, so events may be reported against it.
-    announced: bool,
     /// The remote's end-of-stream has already been reported.
     read_closed: bool,
     /// A send was refused in part, so a [`TcpEvent::Writable`] is owed once
     /// there is room again.
     send_blocked: bool,
-    /// When an unanswered dial is abandoned.
-    connect_deadline: Option<u64>,
+    phase: Phase,
+}
+
+/// A socket whose stream is over, waiting on smoltcp to finish with it.
+struct Reclaim {
+    socket: SmoltcpHandle,
+    /// Released only when the socket is finally gone, so a port is never handed
+    /// to a new dial while `TIME-WAIT` still holds the old connection on it.
+    port: Option<u16>,
 }
 
 struct Listener {
@@ -192,7 +235,7 @@ pub struct SmoltcpTcpProvider<D: Device> {
     used_ports: BTreeSet<u16>,
     /// Sockets finished with, kept until smoltcp has dispatched their last
     /// packet and reached `Closed`.
-    reclaiming: Vec<SmoltcpHandle>,
+    reclaiming: Vec<Reclaim>,
     /// The `now` from the last poll, so operations between polls can be
     /// timestamped without this provider reading a clock.
     now_ms: u64,
@@ -205,7 +248,11 @@ pub struct SmoltcpTcpProvider<D: Device> {
 }
 
 fn instant(millis: u64) -> Instant {
-    Instant::from_millis(i64::try_from(millis).unwrap_or(i64::MAX))
+    // smoltcp keeps time as microseconds in an `i64`, so the largest
+    // millisecond value it can hold is a thousandth of `i64::MAX`. Saturating
+    // at `i64::MAX` itself would overflow the multiplication inside.
+    let ceiling = i64::MAX / 1000;
+    Instant::from_millis(i64::try_from(millis).unwrap_or(ceiling).min(ceiling))
 }
 
 /// Turns an endpoint into the `/ipX/tcp/port` multiaddr for it.
@@ -338,15 +385,16 @@ impl<D: Device> SmoltcpTcpProvider<D> {
     /// Drops an entry, releasing its port and queueing its socket for reclaim.
     ///
     /// The socket itself outlives this, until [`reclaim`](Self::reclaim) finds
-    /// it has nothing left to say.
+    /// it has nothing left to say -- and so does its port, because a connection
+    /// in `TIME-WAIT` still owns the four-tuple it was using.
     fn retire(&mut self, handle: SocketHandle) {
         let Some(entry) = self.entries.remove(&handle) else {
             return;
         };
-        if let Some(port) = entry.ephemeral_port {
-            self.used_ports.remove(&port);
-        }
-        self.reclaiming.push(entry.inner);
+        self.reclaiming.push(Reclaim {
+            socket: entry.inner,
+            port: entry.ephemeral_port,
+        });
     }
 
     /// Removes sockets that have finished closing down.
@@ -358,14 +406,16 @@ impl<D: Device> SmoltcpTcpProvider<D> {
     /// [`egress_pending`](Self::next_deadline) makes sure happens; this only
     /// collects what has said it.
     fn reclaim(&mut self) {
-        let sockets = &mut self.sockets;
-        self.reclaiming.retain(|inner| {
-            if sockets.get::<tcp::Socket>(*inner).state() == tcp::State::Closed {
-                sockets.remove(*inner);
-                false
-            } else {
-                true
+        let (sockets, used_ports) = (&mut self.sockets, &mut self.used_ports);
+        self.reclaiming.retain(|pending| {
+            if sockets.get::<tcp::Socket>(pending.socket).state() != tcp::State::Closed {
+                return true;
             }
+            sockets.remove(pending.socket);
+            if let Some(port) = pending.port {
+                used_ports.remove(&port);
+            }
+            false
         });
     }
 
@@ -389,17 +439,15 @@ impl<D: Device> SmoltcpTcpProvider<D> {
                                 inner,
                                 role: Role::Inbound,
                                 ephemeral_port: None,
-                                announced: false,
                                 read_closed: false,
                                 send_blocked: false,
-                                connect_deadline: None,
+                                phase: Phase::Opening,
                             },
                         );
                     }
                 }
             }
             self.listeners[index].armed = kept;
-            self.arm_listener(index);
         }
     }
 
@@ -433,7 +481,7 @@ impl<D: Device> SmoltcpTcpProvider<D> {
             return;
         };
         let inner = entry.inner;
-        if !entry.announced && !self.announce(handle) {
+        if entry.phase != Phase::Open && !self.announce(handle) {
             return;
         }
 
@@ -489,20 +537,49 @@ impl<D: Device> SmoltcpTcpProvider<D> {
         }
     }
 
+    /// Starts a stream's countdown if it has not started already,
+    /// and reports where it stands.
+    ///
+    /// This is the only place a handshake is given a deadline, and it runs from
+    /// inside a poll, so the deadline is measured from a time sample the host
+    /// just took. Both roles get one: a dial nothing answers and an inbound
+    /// `SYN` never acknowledged are the same stalled socket from opposite ends,
+    /// and smoltcp abandons neither on its own.
+    fn start_countdown(&mut self, handle: SocketHandle) -> Phase {
+        let timeout = self.config.connect_timeout_ms;
+        let now = self.now_ms;
+        let Some(entry) = self.entries.get_mut(&handle) else {
+            return Phase::OpeningForever;
+        };
+        if entry.phase == Phase::Opening {
+            entry.phase = match timeout {
+                Some(timeout) => Phase::OpeningUntil(now.saturating_add(timeout)),
+                None => Phase::OpeningForever,
+            };
+        }
+        entry.phase
+    }
+
     /// Announces a stream once its handshake finishes, or gives up on it.
     ///
     /// Returns whether the stream is now announced and worth servicing.
     fn announce(&mut self, handle: SocketHandle) -> bool {
+        let phase = self.start_countdown(handle);
         let Some(entry) = self.entries.get(&handle) else {
             return false;
         };
-        let (inner, role, deadline) = (entry.inner, entry.role, entry.connect_deadline);
+        let (inner, role) = (entry.inner, entry.role);
         let socket = self.sockets.get::<tcp::Socket>(inner);
 
         if !socket.may_send() {
-            let gave_up = if !socket.is_open() {
+            // A reset in `SYN-RECEIVED` puts a socket back into `Listen` rather
+            // than closing it, so a stream can end by its socket becoming
+            // somebody else's again. Either way this one is over, and keeping
+            // an entry that names a socket no longer carrying it would hold a
+            // slot against a stream that does not exist.
+            let gave_up = if !socket.is_open() || socket.is_listening() {
                 Some("the connection attempt failed")
-            } else if deadline.is_some_and(|deadline| self.now_ms >= deadline) {
+            } else if matches!(phase, Phase::OpeningUntil(deadline) if self.now_ms >= deadline) {
                 Some("the connection attempt timed out")
             } else {
                 None
@@ -536,8 +613,7 @@ impl<D: Device> SmoltcpTcpProvider<D> {
         let Some(entry) = self.entries.get_mut(&handle) else {
             return false;
         };
-        entry.announced = true;
-        entry.connect_deadline = None;
+        entry.phase = Phase::Open;
         self.ready.push_back(match role {
             Role::Inbound => TcpEvent::Accepted {
                 socket: handle,
@@ -648,13 +724,9 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
                 inner,
                 role: Role::Outbound,
                 ephemeral_port: Some(local),
-                announced: false,
                 read_closed: false,
                 send_blocked: false,
-                connect_deadline: self
-                    .config
-                    .connect_timeout_ms
-                    .map(|timeout| self.now_ms.saturating_add(timeout)),
+                phase: Phase::Opening,
             },
         );
         // The SYN is queued, not sent.
@@ -727,6 +799,15 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
         }
 
         self.reclaim();
+        // After the reclaim, not before: a connection that ended during this
+        // poll frees a socket, and a listener refilled ahead of that would miss
+        // it and finish the poll with an empty backlog. A `SYN` arriving before
+        // the next poll is then lost, and the peer waits out a retransmit to
+        // get in -- so this is a poll leaving the provider ready rather than
+        // one poll behind.
+        for index in 0..self.listeners.len() {
+            self.arm_listener(index);
+        }
 
         self.poll_at = self
             .iface
@@ -743,7 +824,12 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
         let connects = self
             .entries
             .values()
-            .filter_map(|entry| entry.connect_deadline)
+            .filter_map(|entry| match entry.phase {
+                Phase::OpeningUntil(deadline) => Some(deadline),
+                // A stream still waiting for its first poll was created since
+                // the last one, which `egress_pending` has already made urgent.
+                Phase::Opening | Phase::OpeningForever | Phase::Open => None,
+            })
             .min()
             .map(Deadline::from_millis);
         Deadline::earliest_opt(self.poll_at.map(Deadline::from_millis), connects)

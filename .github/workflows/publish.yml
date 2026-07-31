@@ -115,7 +115,9 @@ jobs:
         run: |
           cargo test --workspace --locked
           cargo test -p minip2p-rs --features nat,pubsub,discovery,mdns --locked
+          cargo test -p minip2p-tcp --features smoltcp --locked
           cargo doc --workspace --no-deps --locked
+          cargo doc -p minip2p-tcp --features smoltcp --no-deps --locked
 
   android-native:
     name: Build Android release artifacts
