@@ -424,7 +424,7 @@ fn an_idle_wait_times_out_and_input_wakes_it() {
 }
 
 #[test]
-fn a_drained_socket_wakes_a_driver_waiting_to_write() {
+fn a_driver_with_buffered_writes_wakes_when_the_peer_acts() {
     let mut pair = upgraded_pair();
     let id = pair.dialer_connection;
     let stream = pair.dialer.open_stream(id).expect("open substream");
@@ -449,11 +449,18 @@ fn a_drained_socket_wakes_a_driver_waiting_to_write() {
         "a full socket with an idle peer is nothing to wake for"
     );
 
-    // The peer now reads, and the dialer must wake promptly rather than sleep
-    // out its budget. Which readiness does it -- the socket having room again,
-    // or the peer's Yamux acknowledgement arriving -- is not pinned here;
-    // loopback buffering makes a socket that stays full unreliable to arrange.
-    let _ = pair.listener.poll(Now::from_millis(0)).expect("peer reads");
+    // The peer now acts, and the dialer must wake promptly rather than sleep out
+    // its budget. Which readiness does it -- the socket having room again, or
+    // the peer's Yamux acknowledgement arriving -- is deliberately not claimed:
+    // loopback buffering makes a socket that stays full unreliable to arrange,
+    // so writability cannot be isolated from the bytes coming back.
+    // One poll only takes a bounded bite, so keep the peer reading until it has
+    // actually consumed enough to matter.
+    let draining = Instant::now();
+    while draining.elapsed() < Duration::from_millis(200) {
+        let _ = pair.listener.poll(Now::from_millis(0)).expect("peer reads");
+        thread::sleep(Duration::from_millis(1));
+    }
     let began = Instant::now();
     assert_eq!(
         pair.dialer.wait_for_input(PATIENCE),
@@ -517,4 +524,409 @@ fn queued_events_are_never_slept_through() {
             .as_slice(),
         [TransportEvent::StreamOpened { stream_id, .. }] if *stream_id == StreamId::new(1)
     ));
+}
+
+/// Tests that drive `StdTcpProvider` directly.
+///
+/// Some of what a provider owes its caller cannot be seen through a
+/// `TcpTransport`: an orderly shutdown of both halves, an interrupt that lands
+/// between waits, and the shape of the addresses it will accept.
+mod provider {
+    use super::*;
+    use minip2p_tcp::{BlockingTcpProvider, SocketHandle, TcpError, TcpEvent, TcpProvider};
+    use std::io::Write;
+
+    /// Polls both providers until `found` matches, collecting everything seen.
+    fn pump_until(
+        a: &mut StdTcpProvider,
+        b: &mut StdTcpProvider,
+        a_seen: &mut Vec<TcpEvent>,
+        b_seen: &mut Vec<TcpEvent>,
+        mut found: impl FnMut(&[TcpEvent], &[TcpEvent]) -> bool,
+    ) {
+        let start = Instant::now();
+        loop {
+            a_seen.extend(a.poll(Now::from_millis(0)).expect("poll a"));
+            b_seen.extend(b.poll(Now::from_millis(0)).expect("poll b"));
+            if found(a_seen, b_seen) {
+                return;
+            }
+            assert!(
+                start.elapsed() < PATIENCE,
+                "timed out\n  a: {a_seen:?}\n  b: {b_seen:?}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Connects two providers, returning both ends of the stream.
+    fn linked() -> (StdTcpProvider, SocketHandle, StdTcpProvider, SocketHandle) {
+        let mut server = StdTcpProvider::new().expect("server");
+        let mut client = StdTcpProvider::new().expect("client");
+        let bound = server
+            .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
+            .expect("bind");
+        let outbound = client.connect(&bound).expect("connect starts");
+
+        let (mut server_seen, mut client_seen) = (Vec::new(), Vec::new());
+        pump_until(
+            &mut server,
+            &mut client,
+            &mut server_seen,
+            &mut client_seen,
+            |server, client| {
+                server
+                    .iter()
+                    .any(|event| matches!(event, TcpEvent::Accepted { .. }))
+                    && client
+                        .iter()
+                        .any(|event| matches!(event, TcpEvent::Connected { .. }))
+            },
+        );
+        let accepted = server_seen
+            .iter()
+            .find_map(|event| match event {
+                TcpEvent::Accepted { socket, .. } => Some(*socket),
+                _ => None,
+            })
+            .expect("accepted");
+        (server, accepted, client, outbound)
+    }
+
+    #[test]
+    fn a_stream_closed_from_both_ends_is_retired() {
+        let (mut server, server_socket, mut client, client_socket) = linked();
+
+        // Each side shuts its write half. Once a socket has read the peer's FIN
+        // and shut its own, nothing can arrive on it again -- so the provider
+        // has to let go of the descriptor rather than hold it for a caller that
+        // has already been told the stream ended.
+        client.close_write(client_socket).expect("client FIN");
+        let (mut server_seen, mut client_seen) = (Vec::new(), Vec::new());
+        pump_until(
+            &mut server,
+            &mut client,
+            &mut server_seen,
+            &mut client_seen,
+            |server, _| {
+                server
+                    .iter()
+                    .any(|event| matches!(event, TcpEvent::RemoteWriteClosed { .. }))
+            },
+        );
+
+        server.close_write(server_socket).expect("server FIN");
+        pump_until(
+            &mut server,
+            &mut client,
+            &mut server_seen,
+            &mut client_seen,
+            |server, client| {
+                server
+                    .iter()
+                    .any(|event| matches!(event, TcpEvent::Closed { .. }))
+                    && client
+                        .iter()
+                        .any(|event| matches!(event, TcpEvent::Closed { .. }))
+            },
+        );
+
+        // Both retirements are orderly, not faults.
+        for seen in [&server_seen, &client_seen] {
+            assert!(
+                seen.iter()
+                    .any(|event| matches!(event, TcpEvent::Closed { reason: None, .. })),
+                "an orderly shutdown must not be reported as a failure: {seen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_interrupt_absorbed_by_a_poll_is_not_lost() {
+        let (mut server, _server_socket, mut client, _client_socket) = linked();
+
+        // Nudge the client while nobody is waiting, then poll -- which is what
+        // absorbs the wake. The next wait still has to honour it, or a handle
+        // could lose its wakeup to that race.
+        client.wait_handle().interrupt();
+        let _ = client.poll(Now::from_millis(0)).expect("poll absorbs it");
+        let _ = server
+            .poll(Now::from_millis(0))
+            .expect("keep the peer quiet");
+
+        let began = Instant::now();
+        assert_eq!(
+            client.wait_for_input(Duration::from_secs(5)),
+            WaitOutcome::Interrupted,
+            "an interrupt absorbed by a poll must still end the next wait"
+        );
+        assert!(began.elapsed() < Duration::from_secs(5));
+
+        // And it is consumed, not sticky.
+        assert_eq!(
+            client.wait_for_input(Duration::from_millis(50)),
+            WaitOutcome::TimedOut,
+            "the interrupt must not fire twice"
+        );
+    }
+
+    #[test]
+    fn bytes_already_delivered_survive_the_retirement_that_follows() {
+        let (mut server, server_socket, mut client, client_socket) = linked();
+
+        // The server has already finished writing, so the client's FIN is the
+        // last thing the socket is waiting on: reading it retires the stream in
+        // the same pass that delivered the bytes ahead of it.
+        server.close_write(server_socket).expect("server FIN");
+        let payload = b"the last thing said".to_vec();
+        let mut offset = 0;
+        while offset < payload.len() {
+            offset += client
+                .send(client_socket, &payload[offset..])
+                .expect("send");
+        }
+        client.close_write(client_socket).expect("client FIN");
+
+        let (mut server_seen, mut client_seen) = (Vec::new(), Vec::new());
+        pump_until(
+            &mut server,
+            &mut client,
+            &mut server_seen,
+            &mut client_seen,
+            |server, _| {
+                server
+                    .iter()
+                    .any(|event| matches!(event, TcpEvent::Closed { .. }))
+            },
+        );
+
+        let received: Vec<u8> = server_seen
+            .iter()
+            .filter_map(|event| match event {
+                TcpEvent::Received { data, .. } => Some(data.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(
+            received, payload,
+            "a stream that ends still handed over what it delivered: {server_seen:?}"
+        );
+
+        let position = |wanted: fn(&TcpEvent) -> bool| {
+            server_seen
+                .iter()
+                .position(&wanted)
+                .unwrap_or_else(|| panic!("missing event in {server_seen:?}"))
+        };
+        let data = position(|event| matches!(event, TcpEvent::Received { .. }));
+        let fin = position(|event| matches!(event, TcpEvent::RemoteWriteClosed { .. }));
+        let closed = position(|event| matches!(event, TcpEvent::Closed { .. }));
+        assert!(data < fin && fin < closed, "out of order: {server_seen:?}");
+    }
+
+    /// Fills a socket's buffers without reading, and reports how much went in.
+    fn stuff(peer: &mut std::net::TcpStream) -> usize {
+        peer.set_nonblocking(true).expect("non-blocking");
+        let chunk = vec![0u8; 64 * 1024];
+        let mut total = 0;
+        loop {
+            match peer.write(&chunk) {
+                Ok(0) => break,
+                Ok(written) => total += written,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn one_busy_socket_cannot_monopolise_a_poll() {
+        let mut server = StdTcpProvider::new().expect("server");
+        let bound = server
+            .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
+            .expect("bind");
+        let port = bound
+            .to_string()
+            .rsplit('/')
+            .next()
+            .expect("port")
+            .to_string();
+        let mut peer = std::net::TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
+
+        let start = Instant::now();
+        while server
+            .poll(Now::from_millis(0))
+            .expect("poll")
+            .iter()
+            .all(|event| !matches!(event, TcpEvent::Accepted { .. }))
+        {
+            assert!(
+                start.elapsed() < PATIENCE,
+                "the connection was never accepted"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        // The peer writes as much as the kernel will hold and then stops, so
+        // nothing further will announce itself: whatever the provider does not
+        // take now has to be remembered rather than waited for.
+        let buffered = stuff(&mut peer);
+        assert!(
+            buffered > 128 * 1024,
+            "the kernel held only {buffered} bytes, too little to outlast one poll's budget"
+        );
+        thread::sleep(Duration::from_millis(50));
+
+        let batch = server.poll(Now::from_millis(0)).expect("poll");
+        let taken: usize = batch
+            .iter()
+            .map(|event| match event {
+                TcpEvent::Received { data, .. } => data.len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(taken > 0, "the poll must make progress");
+        assert!(
+            taken <= 128 * 1024,
+            "one poll took {taken} bytes, past its budget"
+        );
+        assert!(taken < buffered, "the budget must actually have bitten");
+
+        // Readiness has nothing left to say, so a driver that parked here would
+        // strand the remainder.
+        assert_eq!(
+            server.wait_for_input(Duration::from_secs(5)),
+            WaitOutcome::Ready,
+            "work held back by the budget must not be slept through"
+        );
+
+        // And the rest arrives on the polls that follow.
+        let mut rest = 0;
+        while rest + taken < buffered {
+            let more: usize = server
+                .poll(Now::from_millis(0))
+                .expect("poll")
+                .iter()
+                .map(|event| match event {
+                    TcpEvent::Received { data, .. } => data.len(),
+                    _ => 0,
+                })
+                .sum();
+            rest += more;
+            assert!(start.elapsed() < PATIENCE, "the remainder never arrived");
+        }
+    }
+
+    #[test]
+    fn a_burst_of_connections_cannot_monopolise_a_poll() {
+        let mut server = StdTcpProvider::new().expect("server");
+        let bound = server
+            .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
+            .expect("bind");
+        let port = bound
+            .to_string()
+            .rsplit('/')
+            .next()
+            .expect("port")
+            .to_string();
+
+        // One more than a poll will take, so the backlog has to outlive it.
+        let burst = 40;
+        let peers: Vec<_> = (0..burst)
+            .map(|_| std::net::TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect"))
+            .collect();
+        thread::sleep(Duration::from_millis(100));
+
+        let accepted = server
+            .poll(Now::from_millis(0))
+            .expect("poll")
+            .iter()
+            .filter(|event| matches!(event, TcpEvent::Accepted { .. }))
+            .count();
+        assert!(accepted > 0, "the poll must make progress");
+        assert!(
+            accepted <= 32,
+            "one poll accepted {accepted} connections, past its budget"
+        );
+        assert_eq!(
+            server.wait_for_input(Duration::from_secs(5)),
+            WaitOutcome::Ready,
+            "a backlog held back by the budget must not be slept through"
+        );
+        drop(peers);
+    }
+
+    #[test]
+    fn a_dns4_dial_reaches_an_ipv4_address() {
+        let mut server = StdTcpProvider::new().expect("server");
+        let mut client = StdTcpProvider::new().expect("client");
+        let bound = server
+            .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
+            .expect("bind");
+        let port = bound
+            .to_string()
+            .rsplit('/')
+            .next()
+            .expect("port")
+            .to_string();
+
+        let named: Multiaddr = format!("/dns4/localhost/tcp/{port}").parse().expect("addr");
+        let _ = client
+            .connect(&named)
+            .expect("a dns4 name resolves and dials");
+
+        let (mut server_seen, mut client_seen) = (Vec::new(), Vec::new());
+        pump_until(
+            &mut server,
+            &mut client,
+            &mut server_seen,
+            &mut client_seen,
+            |_, client| {
+                client
+                    .iter()
+                    .any(|event| matches!(event, TcpEvent::Connected { .. }))
+            },
+        );
+
+        let reached = client_seen
+            .iter()
+            .find_map(|event| match event {
+                TcpEvent::Connected { remote, .. } => Some(remote.clone()),
+                _ => None,
+            })
+            .expect("connected");
+        // The filter is the point: `/dns4` must not settle on a v6 answer.
+        assert!(
+            reached.to_string().starts_with("/ip4/"),
+            "a /dns4 dial must reach an IPv4 address, got {reached}"
+        );
+    }
+
+    #[test]
+    fn addresses_must_be_a_bare_host_and_port() {
+        let mut provider = StdTcpProvider::new().expect("provider");
+        // A trailing component means the address is not this provider's to
+        // dial; connecting anyway would reach somewhere the caller did not ask
+        // for.
+        let suffixed: Multiaddr =
+            "/ip4/127.0.0.1/tcp/1/p2p/QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N"
+                .parse()
+                .expect("addr");
+        assert!(matches!(
+            provider.connect(&suffixed),
+            Err(TcpError::Address { .. })
+        ));
+        assert!(matches!(
+            provider.listen(&suffixed),
+            Err(TcpError::Address { .. })
+        ));
+
+        // A bare host with no port is equally not dialable.
+        assert!(matches!(
+            provider.connect(&"/ip4/127.0.0.1".parse().expect("addr")),
+            Err(TcpError::Address { .. })
+        ));
+    }
 }

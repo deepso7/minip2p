@@ -24,6 +24,14 @@ const WAKER_TOKEN: Token = Token(0);
 /// syscall overhead, small enough not to hold a big buffer per provider.
 const READ_CHUNK: usize = 16 * 1024;
 
+/// Reads one socket may take from a single poll before the rest wait their
+/// turn -- 128 KiB at [`READ_CHUNK`] apiece. Without a bound, one fast peer
+/// starves every other socket and the host's timers along with it.
+const MAX_READS_PER_POLL: usize = 8;
+
+/// Connections accepted in a single poll, for the same reason.
+const MAX_ACCEPTS_PER_POLL: usize = 32;
+
 fn io_error(operation: &'static str, error: &dyn core::fmt::Display) -> TcpError {
     TcpError::Io {
         operation,
@@ -48,19 +56,21 @@ fn socket_addr_to_multiaddr(addr: SocketAddr) -> Multiaddr {
 /// Splits a `/tcp` multiaddr into its host and port components.
 fn host_and_port(addr: &Multiaddr, context: &'static str) -> Result<(Protocol, u16), TcpError> {
     let protocols = addr.protocols();
-    let host = protocols
-        .first()
-        .filter(|protocol| protocol.is_host())
-        .ok_or_else(|| TcpError::Address {
-            context,
-            reason: format!("{addr} has no host component"),
-        })?;
-    let Some(Protocol::Tcp(port)) = protocols.get(1) else {
+    // Exactly host + port. Anything trailing -- a `/p2p` suffix, a `/p2p-circuit`
+    // -- means the address is not this provider's to dial, and silently
+    // ignoring it would connect somewhere the caller did not ask for.
+    let [host, Protocol::Tcp(port)] = protocols else {
         return Err(TcpError::Address {
             context,
-            reason: format!("{addr} has no /tcp port"),
+            reason: format!("{addr} is not a bare /host/tcp/port address"),
         });
     };
+    if !host.is_host() {
+        return Err(TcpError::Address {
+            context,
+            reason: format!("{addr} has no host component"),
+        });
+    }
     Ok((host.clone(), *port))
 }
 
@@ -88,18 +98,20 @@ fn listen_addr(addr: &Multiaddr) -> Result<SocketAddr, TcpError> {
 /// address.
 fn dial_addr(addr: &Multiaddr) -> Result<SocketAddr, TcpError> {
     let (host, port) = host_and_port(addr, "tcp dial")?;
+    // `(name, port)` rather than a reassembled `"name:port"`: the string form
+    // has to be parsed back apart, and a name carrying a colon would be split
+    // in the wrong place.
     let resolve = |name: &str, want: fn(&SocketAddr) -> bool| -> Result<SocketAddr, TcpError> {
-        let query = format!("{name}:{port}");
-        query
+        (name, port)
             .to_socket_addrs()
             .map_err(|error| TcpError::Address {
                 context: "tcp dial",
-                reason: format!("resolving {query} failed: {error}"),
+                reason: format!("resolving {name} failed: {error}"),
             })?
             .find(want)
             .ok_or_else(|| TcpError::Address {
                 context: "tcp dial",
-                reason: format!("{query} resolved to no usable address"),
+                reason: format!("{name} resolved to no usable address"),
             })
     };
     match host {
@@ -154,6 +166,8 @@ struct Socket {
     watching_writable: bool,
     /// The remote's FIN has already been reported.
     read_closed: bool,
+    /// The local write side has been shut down.
+    write_closed: bool,
 }
 
 /// A [`TcpProvider`] over operating-system sockets, driven by `mio`.
@@ -180,6 +194,16 @@ pub struct StdTcpProvider {
     /// can never be mistaken for another.
     next_id: u64,
     read_buffer: Vec<u8>,
+    /// A wake that arrived while nobody was waiting.
+    ///
+    /// `poll` absorbs readiness too, so an interrupt can land there instead of
+    /// in a wait. Remembering it is what stops a handle losing the wakeup to
+    /// that race, which is what [`WaitHandle`] promises.
+    pending_interrupt: bool,
+    /// A per-poll cap was reached, so sockets still have work the caller has
+    /// not seen. Readiness alone will not report it again, so a wait must not
+    /// park on it.
+    deferred_work: bool,
 }
 
 impl StdTcpProvider {
@@ -199,6 +223,8 @@ impl StdTcpProvider {
             ready: VecDeque::new(),
             next_id: 1,
             read_buffer: vec![0; READ_CHUNK],
+            pending_interrupt: false,
+            deferred_work: false,
         })
     }
 
@@ -242,14 +268,15 @@ impl StdTcpProvider {
 
     /// Folds a `mio` poll into the per-socket readiness flags.
     ///
-    /// Returns whether the waker fired and whether anything else did, which is
-    /// all [`BlockingTcpProvider::wait_for_input`] needs to classify the wait.
-    fn absorb_readiness(&mut self, timeout: Duration) -> Result<(bool, bool), TcpError> {
+    /// Returns whether anything other than the waker fired. A wake is recorded
+    /// in `pending_interrupt` instead of returned, because it has to survive
+    /// being absorbed by a `poll` that nobody was waiting on.
+    fn absorb_readiness(&mut self, timeout: Duration) -> Result<bool, TcpError> {
         self.events.clear();
         match self.poll.poll(&mut self.events, Some(timeout)) {
             Ok(()) => {}
             // A signal cut the wait short; the caller polls regardless.
-            Err(error) if error.kind() == ErrorKind::Interrupted => return Ok((false, true)),
+            Err(error) if error.kind() == ErrorKind::Interrupted => return Ok(true),
             Err(error) => return Err(io_error("waiting for readiness", &error)),
         }
 
@@ -261,12 +288,11 @@ impl StdTcpProvider {
             .map(|event| (event.token(), event.is_readable(), event.is_writable()))
             .collect();
 
-        let mut woken = false;
         let mut ready = false;
         let mut drained = Vec::new();
         for (token, readable, writable) in observed {
             if token == WAKER_TOKEN {
-                woken = true;
+                self.pending_interrupt = true;
                 continue;
             }
             ready = true;
@@ -294,18 +320,27 @@ impl StdTcpProvider {
             self.watch_writable(handle, false);
             self.ready.push_back(TcpEvent::Writable { socket: handle });
         }
-        Ok((woken, ready))
+        Ok(ready)
     }
 
-    /// Accepts everything each listener has queued.
+    /// Accepts what each listener has queued, up to this poll's budget.
     fn accept_all(&mut self) {
         let tokens: Vec<usize> = self.listeners.keys().copied().collect();
+        let mut budget = MAX_ACCEPTS_PER_POLL;
         for token in tokens {
             while let Some(accepted) = self
                 .listeners
                 .get(&token)
                 .map(|listener| listener.listener.accept())
             {
+                if budget == 0 {
+                    // A flood must not hold the poll open; the backlog keeps
+                    // until the next one, which a wait is told not to sleep
+                    // through.
+                    self.deferred_work = true;
+                    return;
+                }
+                budget -= 1;
                 match accepted {
                     Ok((stream, peer)) => {
                         if let Err(error) = self.adopt(stream, socket_addr_to_multiaddr(peer)) {
@@ -350,6 +385,7 @@ impl StdTcpProvider {
                 writable: true,
                 watching_writable: false,
                 read_closed: false,
+                write_closed: false,
             },
         );
         self.ready.push_back(TcpEvent::Accepted {
@@ -364,7 +400,7 @@ impl StdTcpProvider {
         let Some(socket) = self.sockets.get_mut(&handle) else {
             return;
         };
-        if !matches!(socket.phase, Phase::Connecting) || !socket.writable {
+        if !matches!(socket.phase, Phase::Connecting) {
             return;
         }
 
@@ -381,10 +417,12 @@ impl StdTcpProvider {
             }
             Ok(None) => {}
         }
-        // Not connected yet: on some platforms writability is reported before
-        // the handshake finishes, and `peer_addr` is what tells them apart.
+        // Not connected yet. Writability can be reported before the handshake
+        // finishes, and `peer_addr` is what tells the two apart. Every poll
+        // retries rather than waiting for another edge: under edge-triggered
+        // readiness the edge that arrived early may be the only one, and a dial
+        // that parked on it would never complete.
         let Ok(peer) = socket.stream.peer_addr() else {
-            socket.writable = false;
             return;
         };
 
@@ -399,8 +437,9 @@ impl StdTcpProvider {
         });
     }
 
-    /// Reads until the socket has nothing more to give.
+    /// Reads until the socket has nothing more to give, or the budget runs out.
     fn read_all(&mut self, handle: SocketHandle) {
+        let mut budget = MAX_READS_PER_POLL;
         loop {
             let Some(socket) = self.sockets.get_mut(&handle) else {
                 return;
@@ -408,12 +447,21 @@ impl StdTcpProvider {
             if !socket.readable || socket.read_closed || !matches!(socket.phase, Phase::Open) {
                 return;
             }
+            if budget == 0 {
+                // Leave `readable` set so the next poll picks up where this one
+                // stopped. Readiness will not announce it again -- nothing
+                // changed at the socket -- so a wait is told not to park.
+                self.deferred_work = true;
+                return;
+            }
+            budget -= 1;
             match socket.stream.read(&mut self.read_buffer) {
                 Ok(0) => {
                     socket.read_closed = true;
                     socket.readable = false;
                     self.ready
                         .push_back(TcpEvent::RemoteWriteClosed { socket: handle });
+                    self.retire_if_finished(handle);
                     return;
                 }
                 Ok(read) => {
@@ -437,13 +485,32 @@ impl StdTcpProvider {
         }
     }
 
-    /// Retires a socket and reports it, discarding anything else queued for it.
+    /// Retires a socket once neither direction can carry anything more.
+    ///
+    /// Without this a gracefully closed connection -- the local write side shut
+    /// down, the remote's FIN read -- would sit in the map with its descriptor
+    /// held, because the caller has been told the stream ended and will not ask
+    /// again.
+    fn retire_if_finished(&mut self, handle: SocketHandle) {
+        let finished = self
+            .sockets
+            .get(&handle)
+            .is_some_and(|socket| socket.read_closed && socket.write_closed);
+        if finished {
+            self.close(handle, None);
+        }
+    }
+
+    /// Retires a socket and reports it.
+    ///
+    /// Events already queued for it stay: those are bytes the socket really
+    /// delivered, and they are ordered before the `Closed` that follows. A
+    /// stream that fails after handing over data still handed over that data.
     fn close(&mut self, handle: SocketHandle, reason: Option<String>) {
         let Some(mut socket) = self.sockets.remove(&handle) else {
             return;
         };
         let _ = self.poll.registry().deregister(&mut socket.stream);
-        self.discard_queued(handle);
         self.ready.push_back(TcpEvent::Closed {
             socket: handle,
             reason,
@@ -515,6 +582,7 @@ impl TcpProvider for StdTcpProvider {
                 // this one starts watching and stops once it has.
                 watching_writable: true,
                 read_closed: false,
+                write_closed: false,
             },
         );
         Ok(handle)
@@ -561,10 +629,15 @@ impl TcpProvider for StdTcpProvider {
             .sockets
             .get_mut(&socket)
             .ok_or(TcpError::UnknownSocket { socket })?;
-        entry
+        entry.write_closed = true;
+        let result = entry
             .stream
             .shutdown(Shutdown::Write)
-            .map_err(|error| io_error("half-closing a stream", &error))
+            .map_err(|error| io_error("half-closing a stream", &error));
+        // The remote may already have finished, in which case this was the last
+        // thing keeping the socket alive.
+        self.retire_if_finished(socket);
+        result
     }
 
     fn abort(&mut self, socket: SocketHandle) {
@@ -580,6 +653,7 @@ impl TcpProvider for StdTcpProvider {
     }
 
     fn poll(&mut self, _now: Now) -> Result<Vec<TcpEvent>, TcpError> {
+        self.deferred_work = false;
         self.absorb_readiness(Duration::ZERO)?;
         self.accept_all();
 
@@ -600,14 +674,32 @@ impl TcpProvider for StdTcpProvider {
 
 impl BlockingTcpProvider for StdTcpProvider {
     fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
+        if core::mem::take(&mut self.pending_interrupt) {
+            // A wake that landed while nobody was waiting, possibly absorbed by
+            // a `poll`. Honouring it here is what keeps a handle from losing
+            // the race against the waiter.
+            return WaitOutcome::Interrupted;
+        }
+        if self.deferred_work || self.sockets.values().any(|socket| socket.readable) {
+            // Sockets still hold bytes this provider has not handed over.
+            // Readiness will not mention them again, so parking would strand
+            // them.
+            return WaitOutcome::Ready;
+        }
+
         // Readiness is folded into the sockets rather than discarded, so the
         // `poll` that follows still sees what this wait learned.
-        match self.absorb_readiness(timeout) {
+        let ready = match self.absorb_readiness(timeout) {
             // A failed wait is not a reason to sleep; let the caller poll.
-            Err(_) => WaitOutcome::Ready,
-            Ok((true, _)) => WaitOutcome::Interrupted,
-            Ok((false, true)) => WaitOutcome::Ready,
-            Ok((false, false)) => WaitOutcome::TimedOut,
+            Err(_) => return WaitOutcome::Ready,
+            Ok(ready) => ready,
+        };
+        if core::mem::take(&mut self.pending_interrupt) {
+            WaitOutcome::Interrupted
+        } else if ready {
+            WaitOutcome::Ready
+        } else {
+            WaitOutcome::TimedOut
         }
     }
 
