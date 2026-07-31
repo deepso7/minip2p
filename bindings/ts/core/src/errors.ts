@@ -162,3 +162,11 @@ export class StreamClosedError extends Error {
     this.name = "StreamClosedError";
   }
 }
+
+/** Native event loss made an in-flight operation's result unknowable. */
+export class EventQueueOverflowError extends Error {
+  constructor() {
+    super("The native event queue overflowed before the operation completed");
+    this.name = "EventQueueOverflowError";
+  }
+}

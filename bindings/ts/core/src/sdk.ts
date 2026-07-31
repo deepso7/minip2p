@@ -7,6 +7,7 @@ import {
   ConnectFailedError,
   ConnectResultUnavailableError,
   DriverFailedError,
+  EventQueueOverflowError,
   OpenStreamError,
   PeerDisconnectedError,
   StreamClosedError,
@@ -42,8 +43,6 @@ const DEFAULT_TIMEOUT_MS = 65_000;
 const EVENT_QUEUE_CAP = 4096;
 const EVENT_FLUSH_BATCH = 256;
 const CONNECT_TERMINAL_CAP = 1024;
-const LATE_OPEN_CAP = 1024;
-const LATE_OPEN_TTL_MS = 65_000;
 const STREAM_CHUNK_CAP = 64;
 const STREAM_BYTE_CAP = 1024 * 1024;
 
@@ -122,17 +121,17 @@ class BoundedQueue<Item> {
     return this.#size;
   }
 
-  push(item: Item): boolean {
-    const dropped = this.#size === this.#items.length;
-    if (dropped) {
+  push(item: Item): Item | undefined {
+    if (this.#size === this.#items.length) {
+      const dropped = this.#items[this.#head];
       this.#items[this.#head] = item;
       this.#head = (this.#head + 1) % this.#items.length;
-      return true;
+      return dropped;
     }
     const tail = (this.#head + this.#size) % this.#items.length;
     this.#items[tail] = item;
     this.#size += 1;
-    return false;
+    return undefined;
   }
 
   shift(): Item | undefined {
@@ -335,8 +334,15 @@ export class Stream {
     if (this.#closed) {
       return;
     }
+    this.#closed = true;
+    this.#fifo.length = 0;
+    this.#fifoBytes = 0;
+    for (const read of this.#reads.splice(0)) {
+      read.reject(error);
+    }
     this.#emit("closed");
-    this.#finish(error);
+    this.#listeners.clear();
+    this.#onTerminal();
   }
 
   #flushFlowing(): void {
@@ -367,20 +373,6 @@ export class Stream {
         // Stream handlers are isolated from native callbacks and one another.
       }
     }
-  }
-
-  #finish(error: unknown = new ClosedError()): void {
-    if (this.#closed) {
-      return;
-    }
-    this.#closed = true;
-    this.#fifo.length = 0;
-    this.#fifoBytes = 0;
-    for (const read of this.#reads.splice(0)) {
-      read.reject(error);
-    }
-    this.#listeners.clear();
-    this.#onTerminal();
   }
 }
 
@@ -416,8 +408,6 @@ export class Minip2pBase {
   readonly #terminalConnects = new Set<number>();
   readonly #streams = new Map<string, Stream>();
   readonly #pendingOpens = new Map<string, PendingOpen>();
-  readonly #lateOpens = new Set<string>();
-  readonly #lateOpenTimers = new Map<string, ReturnType<typeof setTimeout>>();
   readonly #pings = new Map<string, PingOperation>();
   #dropped = 0;
   #flushScheduled = false;
@@ -946,12 +936,41 @@ export class Minip2pBase {
     }
   }
 
+  #handleQueueOverflow(): void {
+    const error = new EventQueueOverflowError();
+    for (const waiter of [...this.#waiters]) {
+      this.#settleWaiter(waiter, error);
+    }
+    for (const ping of this.#pings.values()) {
+      ping.cancel(error);
+    }
+    this.#pings.clear();
+    for (const [connectId, attempt] of [...this.#connects]) {
+      if (attempt.terminal === undefined) {
+        attempt.reject?.(error);
+        this.#connects.delete(connectId);
+        this.#terminalConnects.delete(connectId);
+      }
+    }
+    for (const pending of this.#pendingOpens.values()) {
+      clearPendingOpen(pending);
+      pending.reject(error);
+      try {
+        this.#backend.abandonStream(pending.peerId, pending.streamId);
+      } catch {
+        // The operation is already failed; native cleanup is best effort.
+      }
+    }
+    this.#pendingOpens.clear();
+  }
+
   #enqueueNative(event: P2pEvent): void {
     if (this.#closed) {
       return;
     }
-    if (this.#queue.push({ event, source: "native" })) {
+    if (this.#queue.push({ event, source: "native" }) !== undefined) {
       this.#dropped += 1;
+      this.#handleQueueOverflow();
     }
     this.#scheduleFlush();
   }
@@ -963,8 +982,9 @@ export class Minip2pBase {
     if (this.#closed) {
       return;
     }
-    if (this.#queue.push({ payload, source: "high", type })) {
+    if (this.#queue.push({ payload, source: "high", type }) !== undefined) {
       this.#dropped += 1;
+      this.#handleQueueOverflow();
     }
     this.#scheduleFlush();
   }
@@ -1090,12 +1110,12 @@ export class Minip2pBase {
     }
 
     const handlers = [...(this.#named.get(type) ?? [])];
-    if (type === "stream" && handlers.length > 0) {
-      claimed = true;
-    }
     for (const handler of handlers) {
       try {
         handler(payload as AnyPayload);
+        if (type === "stream") {
+          claimed = true;
+        }
       } catch (error) {
         this.#handlerFailed(type, payload, error);
       }
@@ -1131,13 +1151,6 @@ export class Minip2pBase {
   }
 
   #streamReady(meta: InboundStreamMeta): void {
-    const lateKey = lateOpenKey(meta.peerId, meta.connId, meta.streamId);
-    if (this.#lateOpens.delete(lateKey)) {
-      clearTimeout(this.#lateOpenTimers.get(lateKey));
-      this.#lateOpenTimers.delete(lateKey);
-      this.#backend.abandonStream(meta.peerId, meta.streamId);
-      return;
-    }
     const key = streamKey(meta.peerId, meta.connId, meta.streamId);
     const stream = new Stream(this.#backend, meta, () => {
       this.#streams.delete(key);
@@ -1149,6 +1162,10 @@ export class Minip2pBase {
       this.#pendingOpens.delete(pendingKey);
       clearPendingOpen(pending);
       pending.resolve(stream);
+      return;
+    }
+    if (meta.initiatedLocally) {
+      stream.abandon();
       return;
     }
     const claimed = this.#dispatch("stream", stream, undefined as never);
@@ -1329,36 +1346,10 @@ export class Minip2pBase {
     this.#pendingOpens.delete(key);
     clearPendingOpen(pending);
     pending.reject(error);
-    const lateKey = lateOpenKey(
-      pending.peerId,
-      pending.connId,
-      pending.streamId
-    );
-    this.#rememberLateOpen(lateKey);
     try {
       this.#backend.abandonStream(pending.peerId, pending.streamId);
     } catch {
       // Cleanup failure must not replace the caller's timeout or abort.
-    } finally {
-      const timer = setTimeout(() => {
-        this.#lateOpens.delete(lateKey);
-        this.#lateOpenTimers.delete(lateKey);
-      }, LATE_OPEN_TTL_MS);
-      this.#lateOpenTimers.set(lateKey, timer);
-    }
-  }
-
-  #rememberLateOpen(key: string): void {
-    this.#lateOpens.delete(key);
-    this.#lateOpens.add(key);
-    while (this.#lateOpens.size > LATE_OPEN_CAP) {
-      const oldest = this.#lateOpens.values().next().value;
-      if (oldest === undefined) {
-        break;
-      }
-      this.#lateOpens.delete(oldest);
-      clearTimeout(this.#lateOpenTimers.get(oldest));
-      this.#lateOpenTimers.delete(oldest);
     }
   }
 
@@ -1393,11 +1384,6 @@ export class Minip2pBase {
       pending.reject(error);
     }
     this.#pendingOpens.clear();
-    for (const timer of this.#lateOpenTimers.values()) {
-      clearTimeout(timer);
-    }
-    this.#lateOpenTimers.clear();
-    this.#lateOpens.clear();
     for (const stream of this.#streams.values()) {
       stream.terminal(error);
     }
@@ -1517,10 +1503,6 @@ function pendingOpenKey(
   connId: number,
   streamId: number
 ): string {
-  return streamKey(peerId, connId, streamId);
-}
-
-function lateOpenKey(peerId: string, connId: number, streamId: number): string {
   return streamKey(peerId, connId, streamId);
 }
 

@@ -1,5 +1,6 @@
 /* oxlint-disable promise/prefer-await-to-callbacks -- This module coordinates synchronous lifecycle callbacks. */
 
+import { ClosedError } from "@minip2p/core";
 import type { CloseReason, Unsubscribe } from "@minip2p/core";
 
 export interface HookEndpoint {
@@ -23,11 +24,33 @@ export const bindAppStateSource = (
   endpoint: Pick<HookEndpoint, "setActive">,
   source: AppStateSource
 ): Unsubscribe => {
-  endpoint.setActive(source.currentState === "active");
+  let active = true;
+  try {
+    endpoint.setActive(source.currentState === "active");
+  } catch (error) {
+    if (error instanceof ClosedError) {
+      return () => {
+        active = false;
+      };
+    }
+    throw error;
+  }
   const subscription = source.addEventListener("change", (state) => {
-    endpoint.setActive(state === "active");
+    if (!active) {
+      return;
+    }
+    try {
+      endpoint.setActive(state === "active");
+    } catch (error) {
+      if (!(error instanceof ClosedError)) {
+        throw error;
+      }
+      active = false;
+      subscription.remove();
+    }
   });
   return () => {
+    active = false;
     subscription.remove();
   };
 };

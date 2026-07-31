@@ -1,41 +1,89 @@
 ---
 title: Introduction
-description: A minimal, caller-driven libp2p implementation for Rust applications that want QUIC, clear control flow, and no async runtime.
+description: A minimal libp2p implementation for Rust and React Native applications that want QUIC, clear control flow, and a small API.
 ---
 
-minip2p establishes authenticated QUIC connections with a synchronous
-`Endpoint`. Your application drives progress with `poll` and `next_event` —
-there is no async runtime. Optional features layer on NAT traversal, pubsub,
-signed peer discovery, and local-link mDNS without changing the base API.
+## Install
 
-```rust
-use minip2p::{Deadline, Endpoint};
+<Tabs>
+  <Tab title="Rust">
 
-fn main() -> Result<(), minip2p::Error> {
-    let mut node = Endpoint::builder()
-        .agent_version("my-app/0.1.0")
-        .bind_quic("127.0.0.1:0")?;
+    ```bash
+    cargo add minip2p-rs
+    ```
 
-    println!("listen={}", node.listen()?);
+  </Tab>
+  <Tab title="React Native">
 
-    while let Some(event) = node.next_event(Deadline::NEVER)? {
-        println!("{event:?}");
+    ```bash
+    npm install @minip2p/react-native
+    ```
+
+  </Tab>
+</Tabs>
+
+minip2p establishes authenticated QUIC connections from Rust and React Native.
+The Rust `Endpoint` is synchronous and caller-driven, with no async runtime.
+The React Native SDK owns the native driver and presents typed events,
+cancellable Promises, and `Stream` handles to JavaScript.
+
+<Tabs>
+  <Tab title="Rust">
+
+    ```rust
+    use minip2p::{Deadline, Endpoint};
+
+    fn main() -> Result<(), minip2p::Error> {
+        let mut node = Endpoint::builder()
+            .agent_version("my-app/0.1.0")
+            .bind_quic("127.0.0.1:0")?;
+
+        println!("listen={}", node.listen()?);
+
+        while let Some(event) = node.next_event(Deadline::NEVER)? {
+            println!("{event:?}");
+        }
+
+        Ok(())
     }
+    ```
 
-    Ok(())
-}
-```
+  </Tab>
+  <Tab title="React Native">
+
+    ```ts
+    import {
+      Minip2p,
+      generateSecretKey,
+    } from "@minip2p/react-native";
+
+    const endpoint = Minip2p.create({
+      secretKey: generateSecretKey(),
+    });
+
+    console.log(endpoint.peerId(), endpoint.listenAddrs());
+    endpoint.close();
+    ```
+
+  </Tab>
+</Tabs>
+
+Optional capabilities add custom streams, NAT traversal, pubsub, signed peer
+discovery, and local-link mDNS.
 
 ## Get started
 
 *learn by doing*
 
 <CardGroup cols={2}>
-  <Card title="Install" href="/quickstart/install" icon="package-plus">
-    Add the dependency and pick `nat`, `pubsub`, `discovery`, or `mdns`.
+  <Card title="Install for Rust" href="/quickstart/install#rust" icon="package-plus">
+    Add `minip2p-rs` and choose the network features your endpoint needs.
   </Card>
   <Card title="Connect two peers" href="/quickstart/connect-peers" icon="unplug">
-    In about 10 minutes, print a dialable `PeerAddr` and a Ping RTT.
+    Connect two Rust processes and measure a Ping RTT.
+  </Card>
+  <Card title="React Native quickstart" href="/guides/react-native/start" icon="waypoints">
+    Own an endpoint with a hook, connect, and Ping from a native app.
   </Card>
 </CardGroup>
 
@@ -106,5 +154,5 @@ fn main() -> Result<(), minip2p::Error> {
 | <Badge>pre-1.0</Badge> | APIs may change before the first stable release. |
 | <Badge>QUIC only</Badge> | TCP, WebSocket, and WebTransport are out of scope. |
 | <Badge>Rust 1.88+</Badge> | Workspace MSRV. |
-| <Badge>Caller-driven</Badge> | No executor or hidden async task drives the node. |
+| <Badge>Caller-driven Rust</Badge> | Rust applications drive progress; the React Native adapter owns its native driver. |
 | <Badge>Relay client</Badge> | Bring a Circuit Relay v2 server when a relayed path is required. |

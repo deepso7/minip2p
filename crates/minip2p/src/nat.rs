@@ -580,6 +580,66 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_path_tracks_establishment_outbound_upgrade_and_inbound_upgrade() {
+        let mut endpoint = Endpoint::builder()
+            .nat_config(NatConfig::default())
+            .bind_quic("127.0.0.1:0")
+            .expect("bind endpoint");
+        let peer = Ed25519Keypair::from_secret_key_bytes([74; 32]).peer_id();
+        let inbound = Ed25519Keypair::from_secret_key_bytes([75; 32]).peer_id();
+        let relay = Ed25519Keypair::from_secret_key_bytes([76; 32]).peer_id();
+
+        {
+            let Endpoint { swarm, nat, .. } = &mut endpoint;
+            let driver = nat.as_mut().expect("NAT configured");
+            let connect_id = driver
+                .agent
+                .connect(peer.clone(), Vec::new(), Now::from_mono(0));
+            driver.observe(
+                &NatEvent::PathEstablished {
+                    connect_id,
+                    peer: peer.clone(),
+                    path: Path::Relayed {
+                        relay: relay.clone(),
+                    },
+                },
+                swarm,
+            );
+        }
+        assert_eq!(
+            endpoint.path(&peer),
+            Some(Path::Relayed {
+                relay: relay.clone()
+            })
+        );
+
+        {
+            let Endpoint { swarm, nat, .. } = &mut endpoint;
+            let driver = nat.as_mut().expect("NAT configured");
+            let connect_id = driver
+                .agent
+                .connect(peer.clone(), Vec::new(), Now::from_mono(1));
+            driver.observe(
+                &NatEvent::PathUpgraded {
+                    connect_id,
+                    peer: peer.clone(),
+                    from: Path::Relayed { relay },
+                    to: Path::DirectPunched,
+                },
+                swarm,
+            );
+            driver.observe(
+                &NatEvent::InboundDirectUpgrade {
+                    peer: inbound.clone(),
+                },
+                swarm,
+            );
+        }
+        assert_eq!(endpoint.path(&peer), Some(Path::DirectPunched));
+        assert_eq!(endpoint.path(&inbound), Some(Path::DirectPunched));
+    }
+
+    #[test]
     fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently() {
         let mut pair = negotiated_bridge();
         let key = (pair.inner_conn, pair.stream);

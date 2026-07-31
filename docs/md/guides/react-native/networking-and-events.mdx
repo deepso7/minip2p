@@ -1,0 +1,193 @@
+---
+title: Networking and events
+description: Use typed events, pubsub, signed discovery, mDNS, and relay-assisted NAT traversal from React Native.
+---
+
+The React Native package starts its native driver inside `Minip2p.create`.
+Configuration selects the network agents that driver coordinates; JavaScript
+receives normalized, high-level events rather than raw UniFFI unions.
+
+## Prefer named events
+
+Named subscriptions are typed by event name and receive a flattened payload:
+
+```ts
+const removeReady = endpoint.on("peerReady", ({ peerId, protocols }) => {
+  console.log("ready", peerId, protocols);
+});
+
+const removePath = endpoint.on("pathUpgraded", ({ peerId, from, to }) => {
+  console.log("upgraded", peerId, from.kind, "→", to.kind);
+});
+
+removeReady();
+removePath();
+```
+
+For one result, use a Promise:
+
+```ts
+const message = await endpoint.waitFor("message", {
+  predicate: (event) => event.topics.includes("/example/chat/1"),
+  timeoutMs: 10_000,
+});
+```
+
+`once(name, options?)` is the same pattern without a predicate.
+
+Use the catch-all form for logging and diagnostics:
+
+```ts
+const removeLog = endpoint.on((event) => {
+  console.log(event.type, event);
+});
+```
+
+Catch-all events are a discriminated union with a `type` field. Inbound streams
+appear there as safe `inboundStream` metadata only. Subscribe specifically to
+`"stream"` to receive and claim a live `Stream`.
+
+Handler exceptions are isolated from native callbacks and from other handlers.
+The endpoint emits `handlerError` afterward with safe metadata and the thrown
+value.
+
+:::warning
+Native events cross a bounded FIFO host queue. If `queueOverflow` is emitted,
+some event history was lost. Refresh queryable state such as `connectedPeers()`,
+`knownPeers()`, `path(peerId)`, `reachability()`, and `activeReservation()`.
+:::
+
+## Pubsub
+
+Gossipsub is enabled by default. Messages published by this endpoint are signed,
+and inbound validation rejects unsigned messages by default.
+
+```ts
+const topic = "/example/chat/1";
+
+endpoint.subscribe(topic);
+const removeMessages = endpoint.on("message", (message) => {
+  if (message.topics.includes(topic)) {
+    console.log(new TextDecoder().decode(message.data));
+  }
+});
+
+endpoint.publish(topic, "hello from React Native");
+
+// Later:
+removeMessages();
+endpoint.unsubscribe(topic);
+```
+
+There is no self-delivery. Apply the local UI action directly and use the event
+for remote messages. Native queue pressure throws `BackpressureError`
+synchronously; later forwarding failures arrive as `pubsubOutboundFailure`.
+
+Select floodsub only for interoperability:
+
+```ts
+import { PubsubRouter } from "@minip2p/react-native";
+
+const endpoint = Minip2p.create({
+  secretKey,
+  pubsubRouter: PubsubRouter.Floodsub,
+});
+```
+
+`allowUnsigned: true` accepts unsigned inbound application messages. When
+`message.signed` is `false`, both the bytes and `fromPeerId` are
+attacker-controlled; do not treat either as authenticated identity.
+
+## Signed discovery
+
+Enable application-scoped signed beacons with a topic:
+
+```ts
+const endpoint = Minip2p.create({
+  secretKey,
+  discovery: {
+    topic: "/example/peer-discovery/1",
+    autoDial: true,
+  },
+});
+```
+
+Discovery maintains a bounded, multi-source peer book and can automatically
+dial advertised direct addresses. Inspect it with `knownPeers()` and observe
+`peerDiscovered`, `peerUpdated`, `peerExpired`, and `discoveryDialFailed`.
+
+Discovery beacons stay signed even when `allowUnsigned` is true for application
+pubsub messages.
+
+## Local-link mDNS
+
+Use mDNS to find peers on the same multicast-capable network:
+
+```ts
+const endpoint = Minip2p.create({
+  secretKey,
+  mdns: {
+    autoDial: true,
+    enableIpv6: false,
+  },
+});
+```
+
+`mdns: true` uses native defaults. mDNS observations join the same
+`knownPeers()` book as signed discovery. The event `source` distinguishes
+`DiscoverySource.Mdns` from `DiscoverySource.SignedBeacon`.
+
+Host apps must include the [iOS local-network and Android multicast
+permissions](/quickstart/install#local-network-permissions). Discovery stays
+local to the link and depends on the network allowing multicast.
+
+## Relay and NAT traversal
+
+minip2p is a Circuit Relay v2 **client** and traversal orchestrator. Supply a
+reachable relay server as a direct QUIC peer multiaddress:
+
+```ts
+const endpoint = Minip2p.create({
+  secretKey,
+  relays: [relayAddress],
+  autonatServers: [probeServerAddress],
+});
+```
+
+| Configuration | What it adds |
+| --- | --- |
+| `relays` | Reservations, relayed connections, direct/relay races, and relay-assisted DCUtR. |
+| `autonatServers` | Reachability probing only. It does not create a traversal path. |
+| `forceRelay: true` | Routes outbound connectivity through configured relays. |
+
+Use `connect*` to run NAT orchestration. `dial*` remains direct-only.
+
+```ts
+const result = await endpoint.connectAddr(remoteAddress);
+
+if (result.path.kind === "relayed") {
+  console.log("relay", result.path.relayPeerId);
+}
+
+console.log(endpoint.reachability());
+console.log(endpoint.activeReservation());
+console.log(endpoint.circuitAddress);
+```
+
+`circuitAddress` is available after a usable reservation matches one of the
+configured relay addresses. The exported `circuitAddress(relayAddress,
+peerId)` helper builds the same address explicitly.
+
+Watch `relayReserved`, `relayReservationLost`, `pathEstablished`,
+`pathUpgraded`, `holePunchFailed`, `fellBackToRelay`, and `connectFailed` for
+diagnostics and UI state. Keep using ordinary peer and stream APIs when a path
+upgrades—the peer identity does not change.
+
+:::note
+Discovery can connect peers directly from advertised addresses without a
+relay. A relay is still required for relayed connectivity and relay-assisted
+hole punching.
+:::
+
+See the [React Native API reference](/reference/react-native-api) for the full
+configuration and event-family map.

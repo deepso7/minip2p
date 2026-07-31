@@ -5,6 +5,7 @@ export {
   ConnectFailedError,
   ConnectResultUnavailableError,
   DriverFailedError,
+  EventQueueOverflowError,
   MessageTooLargeError,
   NotPermittedError,
   OpenStreamError,

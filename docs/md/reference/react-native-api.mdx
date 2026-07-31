@@ -1,0 +1,168 @@
+---
+title: React Native API
+description: Concise reference for the high-level React Native configuration, endpoint methods, streams, events, and public errors.
+---
+
+Import application APIs from the platform package:
+
+```ts
+import {
+  Minip2p,
+  PubsubRouter,
+  bindAppState,
+  circuitAddress,
+  generateSecretKey,
+  peerIdFromSecretKey,
+  useMinip2p,
+} from "@minip2p/react-native";
+```
+
+The platform package re-exports public types and errors from
+`@minip2p/core`.
+
+## Configuration
+
+`Minip2p.create(config)` constructs and starts an endpoint.
+
+| `Minip2pConfig` field | Type | Purpose |
+| --- | --- | --- |
+| `secretKey` | `ArrayBuffer \| Uint8Array` | Required 32-byte Ed25519 secret key. |
+| `agentVersion` | `string` | Identify agent string. |
+| `listenAddr` | `string` | Local QUIC listen multiaddress; native defaults apply when omitted. |
+| `protocols` | `readonly string[]` | Custom protocols accepted on inbound streams. |
+| `relays` | `readonly string[]` | Direct QUIC relay peer addresses. |
+| `autonatServers` | `readonly string[]` | Reachability probe-server addresses. |
+| `forceRelay` | `boolean` | Route outbound connectivity through relays only. |
+| `pubsubRouter` | `PubsubRouter` | `Gossipsub` by default; choose `Floodsub` explicitly. |
+| `allowUnsigned` | `boolean` | Accept unsigned inbound application pubsub messages; default `false`. |
+| `discovery` | `Minip2pDiscoveryOptions` | Signed-beacon topic, timing, and auto-dial policy. |
+| `mdns` | `boolean \| Minip2pMdnsOptions` | Enable local-link discovery with defaults or explicit options. |
+
+`discovery.topic` is required when signed discovery is enabled. Both discovery
+options objects accept `autoDial`; remaining timing and capacity fields are
+typed in the exported declarations and use native defaults when omitted.
+
+## Identity and lifecycle
+
+| API | Result |
+| --- | --- |
+| `generateSecretKey()` | New `Uint8Array` containing a 32-byte Ed25519 secret. |
+| `peerIdFromSecretKey(secretKey)` | Base58 peer ID without starting an endpoint. |
+| `Minip2p.create(config)` | Started `Minip2p` endpoint. |
+| `useMinip2p(createConfig)` | Hook state plus an idempotent `close` callback. |
+| `bindAppState(endpoint)` | Idempotent unsubscribe for manual lifecycle ownership. |
+| `endpoint.close()` | Terminal, idempotent shutdown. |
+| `endpoint.onClose(handler)` | One-shot close observer unsubscribe. |
+| `endpoint.isRunning()` | Whether the native driver still accepts work. |
+| `endpoint.setActive(active)` | Select foreground or idle driver behavior. |
+
+## State queries
+
+| API | Result |
+| --- | --- |
+| `peerId()` | Local peer ID. |
+| `listenAddrs()` | Currently bound peer multiaddresses. |
+| `connectedPeers()` | Peer IDs with live transport connections. |
+| `isPeerReady(peerId)` | Whether Identify completed. |
+| `peerInfo(peerId)` | Latest remote Identify snapshot, if known. |
+| `knownPeers()` | Multi-source discovery address book. |
+| `discoveryNowMs()` | Discovery monotonic time, when enabled. |
+| `path(peerId)` | Authoritative current `Path`, if connected. |
+| `reachability()` | Latest AutoNAT reachability verdict. |
+| `activeReservation()` | Active relay reservation metadata. |
+| `circuitAddress` | Usable local circuit address, when reserved. |
+
+## Operations
+
+Promise operations use `{ timeoutMs?, signal? }`. Their default timeout is 65
+seconds; `timeoutMs: 0` disables it.
+
+| API | Result |
+| --- | --- |
+| `connect(peerId, options?)` | First usable path to a known peer. |
+| `connectWithAddrs(peerId, addrs, options?)` | First usable path from explicit candidates. |
+| `connectAddr(addr, options?)` | First usable path from a complete peer address. |
+| `startConnect*` / `waitConnectResult` | Split-phase connection flow using a `connectId`. |
+| `cancelConnect(connectId)` | Cancel a split-phase attempt. |
+| `dial` / `dialIp4` / `dialIp6` | Start direct-only QUIC dialing and return connection IDs. |
+| `waitPeerReady(peerId, options?)` | Peer ID and advertised protocol list after Identify. |
+| `ping(peerId, options?)` | RTT in milliseconds. |
+| `openStream(peerId, protocol, options?)` | Negotiated `Stream`. |
+| `disconnect(peerId)` | Close the active peer connection. |
+
+## Pubsub and protocols
+
+| API | Result |
+| --- | --- |
+| `subscribe(topic)` | Whether the subscription set changed. |
+| `unsubscribe(topic)` | Whether the subscription set changed. |
+| `publish(topic, stringOrBytes)` | Queue an application pubsub message. |
+| `addProtocol(protocolId)` | Accept future inbound streams for a protocol. |
+| `circuitAddress(relayAddress, peerId)` | Build a relay circuit multiaddress. |
+
+## Stream
+
+| Member | Meaning |
+| --- | --- |
+| `peerId`, `protocolId` | Remote identity and negotiated protocol. |
+| `streamId`, `connId` | Endpoint-local numeric identifiers. |
+| `initiatedLocally` | Whether this endpoint opened the stream. |
+| `read()` | Next `Uint8Array`, or `undefined` after remote half-close. |
+| `on("data", handler)` | Flowing read mode; mutually exclusive with `read()`. |
+| `write(stringOrBytes)` | Send UTF-8 text or bytes. |
+| `closeWrite()` | Graceful local half-close. |
+| `reset()` | Abrupt reset. |
+| `abandon()` | Reset and relinquish the handle. |
+
+Stream events are `data`, `remoteWriteClosed`, `closed`, and `dataOverflow`.
+
+## Events
+
+`on(name, handler)` is the typed application path. `once` and `waitFor` expose
+the same named map as Promises. `on(handler)` receives catch-all metadata with a
+discriminating `type`.
+
+| Family | Named events |
+| --- | --- |
+| Driver and queue | `eventsDropped`, `queueOverflow`, `driverFailed`, `handlerError`, `endpointError` |
+| Connection and Identify | `connectionEstablished`, `connectionClosed`, `peerReady`, `identifyReceived` |
+| Ping and streams | `pingRttMeasured`, `pingTimeout`, `stream` |
+| Relay and NAT | `reachabilityChanged`, `publicAddressesChanged`, `relayReserved`, `relayReservationLost`, `pathEstablished`, `pathUpgraded`, `holePunchFailed`, `fellBackToRelay`, `connectFailed`, `inboundDirectUpgrade` |
+| Pubsub | `message`, `peerSubscribed`, `peerUnsubscribed`, `pubsubOutboundFailure`, `pubsubProtocolViolation` |
+| Discovery | `peerDiscovered`, `peerUpdated`, `peerExpired`, `discoveryDialFailed`, `discoveryProtocolViolation` |
+
+The catch-all stream uses `inboundStream` metadata instead of the live `stream`
+handle.
+
+## Public errors
+
+Use `instanceof` for control flow and the typed `kind` fields for telemetry.
+
+| Error | Meaning |
+| --- | --- |
+| `AbortError` | This caller's wait was cancelled. |
+| `TimeoutError` | A Promise operation exceeded its timeout. |
+| `EventQueueOverflowError` | Native event loss made an in-flight result unknowable. Retry the operation after handling `queueOverflow`. |
+| `ClosedError` | The endpoint or stream is already closed. |
+| `DriverFailedError` | The native driver stopped; `kind` identifies the subsystem. |
+| `ConnectFailedError` | NAT orchestration ended without a path; includes `connectId`, `peerId`, and `kind`. |
+| `ConnectResultUnavailableError` | A split-phase result is unknown, already awaited, or consumed. |
+| `PeerDisconnectedError` | The peer disconnected during a pending operation. |
+| `OpenStreamError` | Opening or negotiation failed, with structured peer/stream context. |
+| `StreamClosedError` | A stream closed before outbound negotiation completed. |
+| `BackpressureError` | The bounded native pubsub queue is full. |
+| `MessageTooLargeError` | A payload exceeds the native protocol limit. |
+| `NotPermittedError` | Native policy rejected the operation. |
+
+## High-level versus backend APIs
+
+Application code should stay on `@minip2p/react-native`. The following exports
+exist for adapter and host integration work:
+
+| Import | Audience |
+| --- | --- |
+| `@minip2p/core/backend` | Platform adapter authors implementing `Minip2pBackend`. |
+| `@minip2p/react-native/native` | Generated UniFFI/TurboModule integration and native stopped barriers. |
+
+These low-level modules use raw `{ tag, inner }` unions and native ownership
+rules. They are not an alternative application API.

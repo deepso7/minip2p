@@ -334,9 +334,9 @@ fn identify_ping_and_custom_streams_cross_the_ffi_boundary() -> Result<(), FfiEr
 
     let opened = a.open_stream(b_peer.clone(), protocol.into())?;
     let stream_id = opened.stream_id;
-    assert!(
-        a_log
-            .wait_for(Duration::from_secs(5), |event| matches!(
+    let ready = a_log
+        .wait_for(Duration::from_secs(5), |event| {
+            matches!(
                 event,
                 P2pEvent::StreamReady {
                     peer_id,
@@ -345,9 +345,13 @@ fn identify_ping_and_custom_streams_cross_the_ffi_boundary() -> Result<(), FfiEr
                     initiated_locally: true,
                     ..
                 } if peer_id == &b_peer && *observed == stream_id && protocol_id == protocol
-            ))
-            .is_some()
-    );
+            )
+        })
+        .expect("outbound stream becomes ready");
+    assert!(matches!(
+        ready,
+        P2pEvent::StreamReady { conn_id, .. } if conn_id == opened.conn_id
+    ));
     a.send_stream(b_peer.clone(), stream_id, b"stream payload".to_vec())?;
     a.close_stream_write(b_peer, stream_id)?;
     assert!(

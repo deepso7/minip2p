@@ -1,6 +1,7 @@
 /* oxlint-disable func-style, no-await-in-loop, no-use-before-define -- This is an executable sequential native smoke suite. */
 
 import {
+  ClosedError,
   DiscoverySource,
   Minip2p,
   generateSecretKey,
@@ -10,6 +11,18 @@ import type { Minip2pConfig } from "@minip2p/react-native";
 const TOPIC = "/minip2p/react-native-smoke/1";
 const STREAM_PROTOCOL = "/minip2p/react-native-smoke-stream/1";
 const WAIT_MS = 10_000;
+const STREAM_PAYLOAD = "custom stream through UniFFI";
+const UNICODE_PAYLOAD = "minip2p says नमस्ते, こんにちは, and 👋";
+const STREAM_PAYLOAD_BYTES = new Uint8Array([
+  99, 117, 115, 116, 111, 109, 32, 115, 116, 114, 101, 97, 109, 32, 116, 104,
+  114, 111, 117, 103, 104, 32, 85, 110, 105, 70, 70, 73,
+]);
+const UNICODE_PAYLOAD_BYTES = new Uint8Array([
+  109, 105, 110, 105, 112, 50, 112, 32, 115, 97, 121, 115, 32, 224, 164, 168,
+  224, 164, 174, 224, 164, 184, 224, 165, 141, 224, 164, 164, 224, 165, 135, 44,
+  32, 227, 129, 147, 227, 130, 147, 227, 129, 171, 227, 129, 161, 227, 129, 175,
+  44, 32, 97, 110, 100, 32, 240, 159, 145, 139,
+]);
 
 export interface SmokeResult {
   readonly name: string;
@@ -69,13 +82,13 @@ export async function runSmokeSuite(
       timeoutMs: WAIT_MS,
     });
     const remote = await inbound;
-    outbound.write("custom stream through UniFFI");
+    outbound.write(STREAM_PAYLOAD);
     outbound.closeWrite();
     const chunk = await remote.read();
     report({
       detail: `${chunk?.byteLength ?? 0} bytes preserved`,
       name: "custom-protocol-stream",
-      passed: chunk !== undefined && chunk.byteLength > 0,
+      passed: chunk !== undefined && bytesEqual(chunk, STREAM_PAYLOAD_BYTES),
     });
     outbound.abandon();
     remote.abandon();
@@ -84,12 +97,12 @@ export async function runSmokeSuite(
       predicate: (event) => event.fromPeerId === secondPeer,
       timeoutMs: WAIT_MS,
     });
-    second.publish(TOPIC, "minip2p says नमस्ते, こんにちは, and 👋");
+    second.publish(TOPIC, UNICODE_PAYLOAD);
     const received = await message;
     report({
       detail: `${received.data.byteLength} bytes`,
       name: "unicode-message",
-      passed: received.data.byteLength > 0,
+      passed: bytesEqual(new Uint8Array(received.data), UNICODE_PAYLOAD_BYTES),
     });
 
     first.close();
@@ -162,19 +175,42 @@ async function runCreateCloseCycles(
   report: SmokeReport,
   liveEndpoints: Set<Minip2p>
 ): Promise<void> {
-  let cycles = 0;
+  let cleanLifetimes = 0;
   for (let index = 0; index < 10; index += 1) {
     const endpoint = createEndpoint(liveEndpoints);
+    let closeReason: string | undefined;
+    endpoint.onClose((reason) => {
+      closeReason = reason.reason;
+    });
     endpoint.close();
     liveEndpoints.delete(endpoint);
-    cycles += 1;
+    let closedMethodRejected = false;
+    try {
+      endpoint.peerId();
+    } catch (error) {
+      closedMethodRejected = error instanceof ClosedError;
+    }
+    if (
+      closeReason === "close" &&
+      !endpoint.isRunning() &&
+      closedMethodRejected
+    ) {
+      cleanLifetimes += 1;
+    }
     await Promise.resolve();
   }
   report({
-    detail: `${cycles} clean lifetimes`,
+    detail: `${cleanLifetimes}/10 endpoints reported and enforced closure`,
     name: "create-close-cycles",
-    passed: cycles === 10,
+    passed: cleanLifetimes === 10,
   });
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+  return (
+    left.byteLength === right.byteLength &&
+    left.every((value, index) => value === right[index])
+  );
 }
 
 function shortPeer(peerId: string): string {

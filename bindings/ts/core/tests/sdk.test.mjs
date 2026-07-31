@@ -12,6 +12,7 @@ import {
   DriverFailedError,
   DriverFailureKind,
   EndpointErrorKind,
+  EventQueueOverflowError,
   Minip2pBase,
   NatErrorKind,
   OpenStreamError,
@@ -29,6 +30,7 @@ class MockBackend {
   nextConnectId = 1;
   nextStreamId = 3;
   openResults = [];
+  abandonError;
   operations = [];
 
   start(listener) {
@@ -124,6 +126,9 @@ class MockBackend {
 
   abandonStream(peerId, streamId) {
     this.operations.push(["abandon", peerId, streamId]);
+    if (this.abandonError !== undefined) {
+      throw this.abandonError;
+    }
   }
 
   connect() {
@@ -204,8 +209,15 @@ test("catch-all stream events expose metadata, while named handlers get handles"
   await tick();
 
   assert.ok(handle instanceof Stream);
-  assert.equal(caught.type, "inboundStream");
-  assert.equal(caught.streamId, handle.streamId);
+  assert.deepEqual(caught, {
+    connId: 2,
+    initiatedLocally: false,
+    peerId: "peer",
+    protocolId: "/test/1",
+    streamId: 3,
+    type: "inboundStream",
+  });
+  assert.equal("read" in caught, false);
   assert.equal("write" in caught, false);
   handle.abandon();
   endpoint.close();
@@ -264,7 +276,11 @@ test("handler failures fan out first and enqueue safe handlerError metadata", as
 
   assert.deepEqual(order, ["throw", "second", "error"]);
   assert.equal(handlerError.eventType, "message");
-  assert.equal("data" in handlerError.metadata, false);
+  assert.deepEqual(handlerError.metadata, {
+    fromPeerId: "peer",
+    signed: true,
+    topics: ["/chat"],
+  });
   endpoint.close();
 });
 
@@ -308,7 +324,14 @@ test("connect failure, timeout and abort cancel and clear attempts", async () =>
     },
     tag: P2pEvent_Tags.ConnectFailed,
   });
-  await assert.rejects(failed, ConnectFailedError);
+  await assert.rejects(failed, (error) => {
+    assert.ok(error instanceof ConnectFailedError);
+    assert.equal(error.connectId, 1);
+    assert.equal(error.peerId, "peer");
+    assert.equal(error.kind, NatErrorKind.NoPathAvailable);
+    assert.equal(error.message, "no path");
+    return true;
+  });
 
   await assert.rejects(
     endpoint.connect("peer", { timeoutMs: 1 }),
@@ -362,6 +385,35 @@ test("ping coalescing recovers after its last waiter leaves and rejects on teard
   await assert.rejects(retry, ClosedError);
 });
 
+test("queue overflow rejects operations whose native terminals may be lost", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const ping = endpoint.ping("peer", { timeoutMs: 0 });
+  const connect = endpoint.connect("peer", { timeoutMs: 0 });
+  backend.emit({
+    inner: { peerId: "peer", rttMs: 7 },
+    tag: P2pEvent_Tags.PingRttMeasured,
+  });
+  backend.emit({
+    inner: {
+      connectId: 1,
+      path: { tag: PathKind_Tags.DirectDialed },
+      peerId: "peer",
+    },
+    tag: P2pEvent_Tags.PathEstablished,
+  });
+  for (let index = 0; index < 4095; index += 1) {
+    backend.emit({
+      inner: { peerId: `flood-${index}`, protocols: [] },
+      tag: P2pEvent_Tags.PeerReady,
+    });
+  }
+
+  await assert.rejects(ping, EventQueueOverflowError);
+  await assert.rejects(connect, EventQueueOverflowError);
+  endpoint.close();
+});
+
 test("stream FIFO counts only queued data and cleans up after terminal", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
@@ -408,12 +460,16 @@ test("local stream reset and abandon emit closed exactly once", async () => {
     let closed = 0;
     stream.on("closed", () => {
       closed += 1;
+      assert.throws(() => stream.write("late"), ClosedError);
+      stream.reset();
+      stream.abandon();
     });
 
     stream[operation]();
     stream[operation]();
 
     assert.equal(closed, 1);
+    assert.deepEqual(backend.operations, [[operation, "peer", 3]]);
     endpoint.close();
   }
 });
@@ -461,6 +517,7 @@ test("openStream correlates full available identity and abandons late ready", as
   await assert.rejects(opening, (error) => {
     assert.ok(error instanceof OpenStreamError);
     assert.equal(error.kind, EndpointErrorKind.UnsupportedProtocol);
+    assert.equal(error.connId, 2);
     assert.equal(error.streamId, 3);
     assert.equal(error.detail, "unsupported");
     return true;
@@ -471,6 +528,112 @@ test("openStream correlates full available identity and abandons late ready", as
   backend.emit(streamReady({ initiatedLocally: true, streamId: 4 }));
   await tick();
   assert.deepEqual(backend.operations.at(-1), ["abandon", "peer", 4]);
+  endpoint.close();
+});
+
+test("orphaned locally initiated streams are durably abandoned", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  let claimed = 0;
+  endpoint.on("stream", () => {
+    claimed += 1;
+  });
+
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 99 }));
+  await tick();
+
+  assert.equal(claimed, 0);
+  assert.deepEqual(backend.operations, [["abandon", "peer", 99]]);
+  endpoint.close();
+});
+
+test("a throwing inbound stream handler does not claim ownership", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  endpoint.on("stream", () => {
+    throw new Error("reject stream");
+  });
+
+  backend.emit(streamReady({ streamId: 88 }));
+  await tick();
+  await tick();
+
+  assert.deepEqual(backend.operations, [["abandon", "peer", 88]]);
+  endpoint.close();
+});
+
+test("openStream preserves timeout when native abandon throws", async () => {
+  const backend = new MockBackend();
+  backend.abandonError = new Error("native abandon failed");
+  const endpoint = new TestMinip2p(backend);
+
+  await assert.rejects(
+    endpoint.openStream("peer", "/test/1", { timeoutMs: 1 }),
+    TimeoutError
+  );
+  const controller = new AbortController();
+  const aborted = endpoint.openStream("peer", "/test/1", {
+    signal: controller.signal,
+    timeoutMs: 0,
+  });
+  controller.abort();
+  await assert.rejects(aborted, AbortError);
+  endpoint.close();
+});
+
+test("openStream rejects an overwritten identity before reusing it", async () => {
+  const backend = new MockBackend();
+  backend.openResults.push(
+    { connId: 2, streamId: 7 },
+    { connId: 2, streamId: 7 }
+  );
+  const endpoint = new TestMinip2p(backend);
+  const overwritten = endpoint.openStream("peer", "/test/1", {
+    timeoutMs: 1000,
+  });
+  const replacement = endpoint.openStream("peer", "/test/1", {
+    timeoutMs: 1000,
+  });
+
+  await assert.rejects(overwritten, (error) => {
+    assert.ok(error instanceof OpenStreamError);
+    assert.equal(error.kind, "synchronous");
+    assert.equal(error.connId, 2);
+    assert.equal(error.streamId, 7);
+    assert.match(error.detail, /reused an in-flight stream identity/u);
+    return true;
+  });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 7 }));
+  assert.equal((await replacement).streamId, 7);
+  endpoint.close();
+});
+
+test("unwatched connect terminal cache evicts its oldest result", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const ids = [];
+  for (let index = 0; index < 1025; index += 1) {
+    const connectId = endpoint.startConnect(`peer-${index}`);
+    ids.push(connectId);
+    backend.emit({
+      inner: {
+        connectId,
+        path: { tag: PathKind_Tags.DirectDialed },
+        peerId: `peer-${index}`,
+      },
+      tag: P2pEvent_Tags.PathEstablished,
+    });
+    await tick();
+  }
+
+  await assert.rejects(
+    endpoint.waitConnectResult(ids[0], { timeoutMs: 0 }),
+    ConnectResultUnavailableError
+  );
+  assert.equal(
+    (await endpoint.waitConnectResult(ids.at(-1), { timeoutMs: 0 })).connectId,
+    ids.at(-1)
+  );
   endpoint.close();
 });
 

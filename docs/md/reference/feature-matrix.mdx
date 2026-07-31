@@ -1,7 +1,9 @@
 ---
 title: Feature matrix
-description: Compare compiled APIs, builder activation, active drivers, application methods, and required network infrastructure.
+description: Compare Rust feature activation and React Native configuration with the network infrastructure each capability needs.
 ---
+
+## Rust facade
 
 Cargo features control what code is available. Builder methods control what
 runs inside an endpoint. External network infrastructure determines which
@@ -37,7 +39,7 @@ Compiled with `features = ["nat"]`:
 - Attempts: `connect`, `connect_addr`, `connect_with_addrs`,
   `cancel_connect`, `wait_path`
 - Events: `take_nat_events`, `next_nat_event`
-- State: `reachability`, `active_reservation`
+- State: `reachability`, `active_reservation`, `path`
 
 :::warning
 An AutoNAT server activates the driver but does not supply a relay path.
@@ -87,9 +89,28 @@ configured relay or HOP CONNECT.
 leaving QUIC usable. With both `discovery` and `mdns` enabled, both sources use
 one bounded peer book and one automatic-dial state.
 
+## React Native
+
+The React Native native library includes these capabilities. `Minip2pConfig`
+selects the agents and infrastructure used by an endpoint.
+
+| Capability | Configuration | Active behavior | Infrastructure |
+| --- | --- | --- | --- |
+| Direct QUIC, Identify, Ping, custom streams | `secretKey`; optional `listenAddr` and `protocols` | Native driver starts in `Minip2p.create` | A mutually reachable UDP path |
+| Gossipsub | Default, or `pubsubRouter: PubsubRouter.Gossipsub` | Signed outbound pubsub and strict inbound validation | At least one compatible mesh peer |
+| Floodsub | `pubsubRouter: PubsubRouter.Floodsub` | Floodsub routing | At least one floodsub peer |
+| Signed discovery | `discovery: { topic, ... }` | Signed beacons, shared peer book, optional auto-dial | A connected discovery peer |
+| Local-link discovery | `mdns: true` or options | mDNS, shared peer book, optional auto-dial | Host permissions and a multicast-capable local network |
+| Reachability probing | `autonatServers: [...]` | AutoNAT probes | Reachable AutoNAT server |
+| Relayed paths and DCUtR | `relays: [...]` | Reservations, relay race, fallback, hole punching | Reachable Circuit Relay v2 server |
+
+An AutoNAT server still does not provide a relay path. Discovery and mDNS can
+dial advertised direct addresses without a relay. See [Networking and
+events](/guides/react-native/networking-and-events) for configuration examples.
+
 ## Exhaustive API docs
 
-Until the crates are published, generate rustdoc locally:
+Generate rustdoc locally:
 
 ```bash
 cargo doc --workspace --no-deps --open

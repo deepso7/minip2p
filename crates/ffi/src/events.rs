@@ -771,6 +771,27 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_error_conversion_preserves_stream_identity() {
+        let remote = peer(9);
+        assert_eq!(
+            convert_swarm(Event::Error(minip2p_swarm::SwarmRuntimeError {
+                kind: SwarmErrorKind::UnsupportedProtocol,
+                peer_id: Some(remote.clone()),
+                conn_id: Some(ConnectionId::new(23)),
+                stream_id: Some(StreamId::new(42)),
+                detail: "unsupported protocol".into(),
+            })),
+            Some(P2pEvent::EndpointError {
+                kind: EndpointErrorKind::UnsupportedProtocol,
+                peer_id: Some(remote.to_base58()),
+                conn_id: Some(23),
+                stream_id: Some(42),
+                detail: "unsupported protocol".into(),
+            })
+        );
+    }
+
+    #[test]
     fn pubsub_message_conversion_preserves_binary_fields() {
         let remote = peer(5);
         let event = convert_pubsub(PubsubEvent::Message {

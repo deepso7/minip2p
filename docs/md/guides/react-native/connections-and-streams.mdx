@@ -1,0 +1,200 @@
+---
+title: Connections and streams
+description: Connect with cancellable Promises, inspect direct or relayed paths, and exchange bytes over custom protocol streams.
+---
+
+The React Native SDK separates *finding a usable network path* from *opening an
+application protocol*. Connect first, wait for Identify readiness, then open a
+negotiated stream.
+
+## Connect with a Promise
+
+Use `connectAddr` when you have one complete peer multiaddress:
+
+```ts
+const result = await endpoint.connectAddr(remoteAddress, {
+  timeoutMs: 15_000,
+});
+
+await endpoint.waitPeerReady(result.peerId, {
+  timeoutMs: 10_000,
+});
+
+console.log(result.connectId, result.path);
+```
+
+| Input you have | Method |
+| --- | --- |
+| Peer ID already in the discovery book | `connect(peerId, options?)` |
+| Peer ID plus an ordered candidate list | `connectWithAddrs(peerId, addresses, options?)` |
+| One address ending in `/p2p/<peer-id>` | `connectAddr(address, options?)` |
+
+All three resolve with `{ connectId, peerId, path }`. The first path may be
+`directDialed`, `directPunched`, or `relayed`. Call `path(peerId)` when you need
+the current answer; a relayed connection can upgrade after the original Promise
+resolves.
+
+The lower-level `dial`, `dialIp4`, and `dialIp6` methods only start direct QUIC
+dials and return connection IDs immediately. They do not run the relay race or
+return a `Path`. Observe `peerReady` or call `waitPeerReady` afterward.
+
+## Timeouts and cancellation
+
+`connect*`, `waitPeerReady`, `ping`, `openStream`, `once`, and `waitFor` accept:
+
+```ts
+interface OpOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+```
+
+The default timeout is 65 seconds. Set `timeoutMs: 0` only when a caller truly
+wants an unbounded wait.
+
+```ts
+const controller = new AbortController();
+
+const connectPromise = endpoint.connectAddr(remoteAddress, {
+  signal: controller.signal,
+  timeoutMs: 20_000,
+});
+
+// A screen transition or user action can stop this attempt.
+controller.abort();
+await connectPromise; // rejects with AbortError
+```
+
+For a `connect*` Promise, an abort or timeout cancels the underlying connection
+attempt. Concurrent `ping` calls to the same peer share one native Ping while
+each caller keeps its own timeout and abort signal.
+
+Use the split-phase API when the UI must retain the connection-attempt ID:
+
+```ts
+const connectId = endpoint.startConnectAddr(remoteAddress);
+const resultPromise = endpoint.waitConnectResult(connectId, {
+  timeoutMs: 20_000,
+});
+
+// A separate UI action can cancel by ID.
+cancelButton.onclick = () => endpoint.cancelConnect(connectId);
+
+const result = await resultPromise;
+console.log(result.path);
+```
+
+One terminal result can be consumed once. Waiting twice, or waiting for an
+unknown attempt, rejects with `ConnectResultUnavailableError`.
+
+## Register a protocol
+
+Protocol IDs are versioned strings owned by your application. Register them in
+the initial configuration or before a remote peer opens an inbound stream.
+
+```ts
+const endpoint = Minip2p.create({
+  secretKey,
+  protocols: ["/example/files/1"],
+});
+
+endpoint.addProtocol("/example/chat/1");
+```
+
+Both peers must support the same ID. Wait for `peerReady` before opening so the
+remote Identify snapshot is available.
+
+## Open and write
+
+```ts
+const stream = await endpoint.openStream(
+  peerId,
+  "/example/files/1",
+  { timeoutMs: 10_000 }
+);
+
+stream.write("header\n");
+stream.write(new Uint8Array([1, 2, 3]));
+stream.closeWrite();
+```
+
+`write` accepts UTF-8 text, `Uint8Array`, or `ArrayBuffer`. `closeWrite()`
+half-closes only the local write side; reads stay available until the remote
+half-closes or the stream terminates.
+
+## Claim inbound streams
+
+A named `stream` handler receives the live handle:
+
+```ts
+const removeInbound = endpoint.on("stream", (stream) => {
+  if (stream.protocolId !== "/example/files/1") {
+    stream.abandon();
+    return;
+  }
+
+  void receiveFile(stream);
+});
+```
+
+Unclaimed inbound streams are abandoned. A catch-all event subscriber receives
+only `inboundStream` metadata and cannot claim the live handle.
+
+## Choose one read mode
+
+Pull mode is natural for framed or sequential decoders:
+
+```ts
+import type { Stream } from "@minip2p/react-native";
+
+async function receiveFile(stream: Stream) {
+  try {
+    for (;;) {
+      const chunk = await stream.read();
+      if (chunk === undefined) break;
+      consume(chunk);
+    }
+    stream.closeWrite();
+  } catch (error) {
+    stream.reset();
+    throw error;
+  }
+}
+```
+
+Flowing mode delivers chunks to a handler:
+
+```ts
+const removeData = stream.on("data", (chunk) => consume(chunk));
+const removeRemoteClose = stream.on("remoteWriteClosed", () => {
+  removeData();
+  finishIncomingMessage();
+});
+
+// Call this if the owner unmounts first; both callbacks are idempotent.
+const stopFlowing = () => {
+  removeData();
+  removeRemoteClose();
+};
+```
+
+Pull reads and flowing `data` handlers are mutually exclusive. Calling
+`read()` after subscribing to `data`, or subscribing to `data` after the first
+`read()`, rejects or throws.
+
+## End a stream deliberately
+
+| Operation | Result |
+| --- | --- |
+| `closeWrite()` | Graceful local half-close; reading remains possible. |
+| `reset()` | Abruptly reset the stream and emit `closed`. |
+| `abandon()` | Reset, relinquish the handle, and suppress later native events. |
+| `stream[Symbol.dispose]()` | Equivalent to `abandon()`. |
+
+`remoteWriteClosed` means no more inbound bytes will arrive. `closed` is the
+terminal lifecycle event. Pull reads use a bounded buffer; if the application
+does not keep up, `dataOverflow` reports dropped chunks and bytes. Treat that as
+a protocol-level recovery condition rather than silently continuing a framed
+transfer.
+
+Next: [Networking and events](/guides/react-native/networking-and-events).

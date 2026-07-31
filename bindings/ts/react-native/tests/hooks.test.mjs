@@ -3,6 +3,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { ClosedError } from "@minip2p/core";
+
 import {
   bindAppStateSource,
   mountEndpointLifecycle,
@@ -11,8 +13,10 @@ import {
 class FakeEndpoint {
   closeHandlers = new Set();
   log = [];
+  closed = false;
 
   close() {
+    this.closed = true;
     this.log.push("close");
   }
 
@@ -33,10 +37,14 @@ class FakeEndpoint {
   }
 
   setActive(active) {
+    if (this.closed) {
+      throw new ClosedError();
+    }
     this.log.push(["active", active]);
   }
 
   terminal(reason) {
+    this.closed = true;
     for (const handler of [...this.closeHandlers]) {
       handler(reason);
     }
@@ -66,6 +74,28 @@ test("bindAppState mirrors current state and stops future updates", () => {
     ["active", false],
     ["active", true],
   ]);
+  assert.equal(removed, true);
+});
+
+test("bindAppState ignores a queued change after endpoint close", () => {
+  const endpoint = new FakeEndpoint();
+  let handler;
+  let removed = false;
+  const source = {
+    addEventListener(_type, next) {
+      handler = next;
+      return {
+        remove() {
+          removed = true;
+        },
+      };
+    },
+    currentState: "active",
+  };
+  bindAppStateSource(endpoint, source);
+  endpoint.closed = true;
+
+  assert.doesNotThrow(() => handler("background"));
   assert.equal(removed, true);
 });
 
@@ -132,5 +162,7 @@ test("running state and unmount ordering are deterministic", () => {
 
   assert.equal(states[0].status, "running");
   assert.equal(states[0].endpoint, endpoint);
+  assert.equal(states[0].peerId, "peer");
+  assert.deepEqual(states[0].listenAddrs, ["/test"]);
   assert.deepEqual(endpoint.log, ["unbindClose", "unbindAppState", "close"]);
 });
