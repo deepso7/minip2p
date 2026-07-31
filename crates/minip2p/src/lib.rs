@@ -258,6 +258,16 @@ impl Endpoint {
         self.swarm.disconnect(peer_id)
     }
 
+    /// Returns the current usable NAT-orchestrated path to `peer_id`.
+    ///
+    /// The map is updated before the corresponding NAT event is queued, is
+    /// independent of event consumption, and is cleared after the peer's last
+    /// usable connection closes. Raw `dial*` connections are not tracked.
+    #[cfg(feature = "nat")]
+    pub fn path(&self, peer_id: &PeerId) -> Option<Path> {
+        self.nat.as_ref().and_then(|nat| nat.path(peer_id))
+    }
+
     /// Returns peers with an established connection.
     pub fn connected_peers(&self) -> Vec<PeerId> {
         self.swarm.connected_peers()
@@ -285,6 +295,15 @@ impl Endpoint {
     /// Opens an application stream after negotiating `protocol_id`.
     pub fn open_stream(&mut self, peer_id: &PeerId, protocol_id: &str) -> Result<StreamId, Error> {
         self.swarm.open_stream(peer_id, protocol_id)
+    }
+
+    /// Opens an application stream and returns its connection and stream ids.
+    pub fn open_stream_with_connection(
+        &mut self,
+        peer_id: &PeerId,
+        protocol_id: &str,
+    ) -> Result<(ConnectionId, StreamId), Error> {
+        self.swarm.open_stream_with_connection(peer_id, protocol_id)
     }
 
     /// Sends bytes on a negotiated application stream.

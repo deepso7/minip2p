@@ -417,6 +417,16 @@ impl<T: Transport> Swarm<T> {
         peer_id: &PeerId,
         protocol_id: &str,
     ) -> Result<StreamId, DriverError> {
+        self.open_stream_with_connection(peer_id, protocol_id)
+            .map(|(_, stream_id)| stream_id)
+    }
+
+    /// Opens an application stream and returns its full transport identity.
+    pub fn open_stream_with_connection(
+        &mut self,
+        peer_id: &PeerId,
+        protocol_id: &str,
+    ) -> Result<(ConnectionId, StreamId), DriverError> {
         // Flush anything already queued first, so the capture window below
         // contains only this call's own action cascade. A failure from an
         // unrelated, previously queued open must surface asynchronously as
@@ -427,6 +437,12 @@ impl<T: Transport> Swarm<T> {
         // the transport.open_stream call happens synchronously and we can
         // return the allocated StreamId to the caller.
         self.core.open_stream(peer_id, protocol_id)?;
+        let conn_id = self
+            .core
+            .connection_id(peer_id)
+            .ok_or_else(|| SwarmError::NotConnected {
+                peer_id: peer_id.clone(),
+            })?;
 
         // Flush all actions, capturing the stream id allocated for this
         // user-protocol open. We inspect actions as we execute them.
@@ -464,9 +480,11 @@ impl<T: Transport> Swarm<T> {
             }
             return Err(DriverError::Transport(error));
         }
-        allocated_stream.ok_or(DriverError::Invariant {
-            reason: "core did not allocate a stream id for open_stream",
-        })
+        allocated_stream
+            .map(|stream_id| (conn_id, stream_id))
+            .ok_or(DriverError::Invariant {
+                reason: "core did not allocate a stream id for open_stream",
+            })
     }
 
     /// Sends raw bytes on a negotiated user stream.
@@ -886,6 +904,7 @@ impl<T: Transport> Swarm<T> {
                         .handle_input(SwarmInput::RuntimeError(runtime_error(
                             SwarmErrorKind::Transport,
                             Some(conn_id),
+                            Some(stream_id),
                             reason,
                         )));
                 }
@@ -895,6 +914,7 @@ impl<T: Transport> Swarm<T> {
                     self.core.handle_input(SwarmInput::RuntimeError(runtime_error(
                         SwarmErrorKind::Transport,
                         Some(conn_id),
+                        Some(stream_id),
                         format!(
                             "close_stream_write on connection {conn_id} stream {stream_id} failed: {e}"
                         ),
@@ -907,6 +927,7 @@ impl<T: Transport> Swarm<T> {
                     self.core.handle_input(SwarmInput::RuntimeError(runtime_error(
                         SwarmErrorKind::Transport,
                         Some(conn_id),
+                        Some(stream_id),
                         format!(
                             "reset_stream on connection {conn_id} stream {stream_id} failed: {e}"
                         ),
@@ -919,6 +940,7 @@ impl<T: Transport> Swarm<T> {
                         .handle_input(SwarmInput::RuntimeError(runtime_error(
                             SwarmErrorKind::Transport,
                             Some(conn_id),
+                            None,
                             format!("close on connection {conn_id} failed: {e}"),
                         )));
                 }
@@ -930,12 +952,14 @@ impl<T: Transport> Swarm<T> {
 fn runtime_error(
     kind: SwarmErrorKind,
     conn_id: Option<ConnectionId>,
+    stream_id: Option<StreamId>,
     detail: String,
 ) -> SwarmRuntimeError {
     SwarmRuntimeError {
         kind,
         peer_id: None,
         conn_id,
+        stream_id,
         detail,
     }
 }

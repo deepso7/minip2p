@@ -2,14 +2,20 @@ import type {
   Bytes,
   IdentifyInfo,
   KnownPeerInfo,
-  MiniP2pConfig,
+  Minip2pConfig,
+  PathKind,
   P2pEvent,
   Reachability,
   RelayReservationInfo,
 } from "./types.js";
 
 /** Native endpoint operations required by the platform-neutral SDK. */
-export interface MiniP2pBackend {
+export interface BackendOpenStream {
+  readonly connId: number;
+  readonly streamId: number;
+}
+
+export interface Minip2pBackend {
   start: (listener: (event: P2pEvent) => void) => void;
   close: () => void;
   peerId: () => string;
@@ -20,6 +26,7 @@ export interface MiniP2pBackend {
   knownPeers: () => KnownPeerInfo[];
   discoveryNowMs: () => number | undefined;
   activeReservation: () => RelayReservationInfo | undefined;
+  path: (peerId: string) => PathKind | undefined;
   circuitAddress: (relayAddress: string, peerId: string) => string;
   reachability: () => Reachability;
   isRunning: () => boolean;
@@ -29,7 +36,7 @@ export interface MiniP2pBackend {
   publish: (topic: string, data: Uint8Array) => void;
   ping: (peerId: string) => void;
   addProtocol: (protocolId: string) => void;
-  openStream: (peerId: string, protocolId: string) => number;
+  openStream: (peerId: string, protocolId: string) => BackendOpenStream;
   sendStream: (peerId: string, streamId: number, data: Uint8Array) => void;
   closeStreamWrite: (peerId: string, streamId: number) => void;
   resetStream: (peerId: string, streamId: number) => void;
@@ -44,9 +51,17 @@ export interface MiniP2pBackend {
   disconnect: (peerId: string) => void;
 }
 
+export {
+  P2pEvent_Tags,
+  PathKind_Tags,
+  type P2pEvent,
+  type P2pEventByTag,
+  type PathKind,
+} from "./types.js";
+
 /** Platform implementation used to construct endpoints and identity helpers. */
-export interface MiniP2pBackendFactory {
-  create: (config: MiniP2pConfig) => MiniP2pBackend;
+export interface Minip2pBackendFactory {
+  create: (config: Minip2pConfig) => Minip2pBackend;
   generateSecretKey: () => Uint8Array;
   peerIdFromSecretKey: (secretKey: Bytes) => string;
   circuitAddress: (relayAddress: string, peerId: string) => string;

@@ -1,6 +1,6 @@
 /* oxlint-disable no-use-before-define, react/style-prop-object -- Styles conventionally follow the component, and React Native accepts conditional style arrays. */
 
-import type { MiniP2p } from "@minip2p/react-native";
+import type { Minip2p } from "@minip2p/react-native";
 import { StatusBar } from "expo-status-bar";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -17,7 +17,7 @@ import { runSmokeSuite } from "./src/smoke";
 import type { SmokeReport, SmokeResult } from "./src/smoke";
 
 export default function App() {
-  const endpoints = useRef(new Set<MiniP2p>());
+  const endpoints = useRef(new Set<Minip2p>());
   const running = useRef(false);
   const [results, setResults] = useState<SmokeResult[]>([]);
   const [status, setStatus] = useState("ready");

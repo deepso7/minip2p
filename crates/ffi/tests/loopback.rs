@@ -332,7 +332,8 @@ fn identify_ping_and_custom_streams_cross_the_ffi_boundary() -> Result<(), FfiEr
             .is_some()
     );
 
-    let stream_id = a.open_stream(b_peer.clone(), protocol.into())?;
+    let opened = a.open_stream(b_peer.clone(), protocol.into())?;
+    let stream_id = opened.stream_id;
     assert!(
         a_log
             .wait_for(Duration::from_secs(5), |event| matches!(

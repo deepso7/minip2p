@@ -10,7 +10,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use minip2p_circuit::{AdoptError, BridgeAdoption, CircuitRole, CircuitTransport};
 use minip2p_core::{Multiaddr, PeerId, Protocol};
-use minip2p_nat::{BridgeRole, NatAction, NatAgent, NatEvent, Now, PromoteError};
+use minip2p_nat::{BridgeRole, NatAction, NatAgent, NatEvent, Now, Path, PromoteError};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId, Transport};
 
@@ -32,6 +32,8 @@ pub(crate) struct NatDriver {
     public_addrs: Vec<Multiaddr>,
     /// Exact adopted bridge keys mapped to their promoted circuit ids.
     promoted: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
+    /// Authoritative usable NAT-orchestrated path by remote peer.
+    paths: BTreeMap<PeerId, Path>,
     #[cfg(test)]
     bridge_reset_attempts: Vec<(ConnectionId, StreamId)>,
 }
@@ -46,6 +48,7 @@ impl NatDriver {
             relay_addrs,
             public_addrs: Vec::new(),
             promoted: BTreeMap::new(),
+            paths: BTreeMap::new(),
             #[cfg(test)]
             bridge_reset_attempts: Vec::new(),
         }
@@ -84,9 +87,12 @@ impl NatDriver {
         let handled = self
             .agent
             .handle_event_with_disposition_classified(event, is_circuit, now);
-        if let SwarmEvent::ConnectionClosed { conn_id, .. } = event {
+        if let SwarmEvent::ConnectionClosed { peer_id, conn_id } = event {
             self.promoted
                 .retain(|(inner_conn, _), circuit| inner_conn != conn_id && circuit != conn_id);
+            if !swarm.connected_peers().contains(peer_id) {
+                self.paths.remove(peer_id);
+            }
         }
         self.pump(swarm);
         handled
@@ -123,6 +129,11 @@ impl NatDriver {
         }
         let active: BTreeSet<_> = swarm.transport().circuit_ids().into_iter().collect();
         self.promoted.retain(|_, id| active.contains(id));
+    }
+
+    /// Returns the latest usable NAT-orchestrated path for `peer`.
+    pub(crate) fn path(&self, peer: &PeerId) -> Option<Path> {
+        self.paths.get(peer).cloned()
     }
 
     fn execute(&mut self, action: NatAction, swarm: &mut EndpointSwarm) {
@@ -272,6 +283,15 @@ impl NatDriver {
     /// held reservation advertises `<relay>/p2p/<relay-id>/p2p-circuit`.
     fn observe(&mut self, event: &NatEvent, swarm: &mut EndpointSwarm) {
         match event {
+            NatEvent::PathEstablished { peer, path, .. } => {
+                self.paths.insert(peer.clone(), path.clone());
+            }
+            NatEvent::PathUpgraded { peer, to, .. } => {
+                self.paths.insert(peer.clone(), to.clone());
+            }
+            NatEvent::InboundDirectUpgrade { peer } => {
+                self.paths.insert(peer.clone(), Path::DirectPunched);
+            }
             NatEvent::RelayReserved { relay, .. } => {
                 if self.reserved_relays.iter().any(|(peer, _)| peer == relay) {
                     return; // renewal — already advertised

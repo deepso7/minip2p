@@ -364,12 +364,19 @@ impl P2pEndpoint {
     }
 
     /// Opens a negotiated application stream and returns its opaque id.
-    pub fn open_stream(&self, peer_id: String, protocol_id: String) -> Result<u64, FfiError> {
+    pub fn open_stream(
+        &self,
+        peer_id: String,
+        protocol_id: String,
+    ) -> Result<crate::OpenStreamResult, FfiError> {
         let peer = parse_peer_id(&peer_id)?;
         self.with_endpoint_mut(|endpoint| {
             endpoint
-                .open_stream(&peer, &protocol_id)
-                .map(|stream| stream.as_u64())
+                .open_stream_with_connection(&peer, &protocol_id)
+                .map(|(conn_id, stream_id)| crate::OpenStreamResult {
+                    conn_id: conn_id.as_u64(),
+                    stream_id: stream_id.as_u64(),
+                })
                 .map_err(map_driver_error)
         })
     }
@@ -547,6 +554,14 @@ impl P2pEndpoint {
             detail: error.to_string(),
         })?;
         self.with_endpoint_mut(|endpoint| endpoint.disconnect(&peer).map_err(map_driver_error))
+    }
+
+    /// Returns the current usable NAT-orchestrated path to `peer_id`.
+    pub fn path(&self, peer_id: String) -> Result<Option<crate::PathKind>, FfiError> {
+        let peer = PeerId::from_str(&peer_id).map_err(|error| FfiError::InvalidPeerId {
+            detail: error.to_string(),
+        })?;
+        self.with_endpoint(|endpoint| endpoint.path(&peer).map(crate::events::convert_path))
     }
 
     /// Returns the shared discovery address-book snapshot.

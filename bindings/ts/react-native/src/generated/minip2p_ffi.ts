@@ -607,6 +607,58 @@ const FfiConverterTypeKnownPeerInfo = (() => {
 })();
 
 /**
+ * Full identity allocated for an outbound application stream.
+ */
+export type OpenStreamResult = {
+    /**
+     * Transport connection carrying the stream.
+     */
+    connId: bigint,
+    /**
+     * Opaque stream id.
+     */
+    streamId: bigint
+}
+
+/**
+ * Generated factory for {@link OpenStreamResult} record objects.
+ */
+export const OpenStreamResult = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<OpenStreamResult, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<OpenStreamResult>,
+    });
+})();
+
+const FfiConverterTypeOpenStreamResult = (() => {
+    type TypeName = OpenStreamResult;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                connId: FfiConverterUInt64.read(from),
+                streamId: FfiConverterUInt64.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterUInt64.write(value.connId, into);
+            FfiConverterUInt64.write(value.streamId, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterUInt64.allocationSize(value.connId) +
+             FfiConverterUInt64.allocationSize(value.streamId);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
  * Snapshot of the active inbound relay reservation.
  */
 export type RelayReservationInfo = {
@@ -2271,7 +2323,7 @@ inner: {peerId: string; connId: bigint; streamId: bigint }): StreamClosed_ {
     type EndpointError__interface = {
         tag: P2pEvent_Tags.EndpointError;
         inner:
-Readonly<{kind: EndpointErrorKind; peerId?: string; connId?: bigint; detail: string}>
+Readonly<{kind: EndpointErrorKind; peerId?: string; connId?: bigint; streamId?: bigint; detail: string}>
     };
     /**
      * A non-fatal endpoint error occurred.
@@ -2284,15 +2336,15 @@ Readonly<{kind: EndpointErrorKind; peerId?: string; connId?: bigint; detail: str
         readonly [uniffiTypeNameSymbol] = "P2pEvent";
         readonly tag = P2pEvent_Tags.EndpointError;
         readonly inner:
-Readonly<{kind: EndpointErrorKind; peerId?: string; connId?: bigint; detail: string}>;
+Readonly<{kind: EndpointErrorKind; peerId?: string; connId?: bigint; streamId?: bigint; detail: string}>;
         constructor(
-inner: {kind: EndpointErrorKind; peerId?: string; connId?: bigint; detail: string }) {
+inner: {kind: EndpointErrorKind; peerId?: string; connId?: bigint; streamId?: bigint; detail: string }) {
             super("P2pEvent", "EndpointError");
 
             this.inner = Object.freeze(inner);
         }
         static new(
-inner: {kind: EndpointErrorKind; peerId?: string; connId?: bigint; detail: string }): EndpointError_ {
+inner: {kind: EndpointErrorKind; peerId?: string; connId?: bigint; streamId?: bigint; detail: string }): EndpointError_ {
             return new EndpointError_(inner);
         }
 
@@ -3054,7 +3106,7 @@ const FfiConverterTypeP2pEvent = (() => {
                 case 10: return new P2pEvent.StreamData({peerId: FfiConverterString.read(from), connId: FfiConverterUInt64.read(from), streamId: FfiConverterUInt64.read(from), data: FfiConverterArrayBuffer.read(from) });
                 case 11: return new P2pEvent.StreamRemoteWriteClosed({peerId: FfiConverterString.read(from), connId: FfiConverterUInt64.read(from), streamId: FfiConverterUInt64.read(from) });
                 case 12: return new P2pEvent.StreamClosed({peerId: FfiConverterString.read(from), connId: FfiConverterUInt64.read(from), streamId: FfiConverterUInt64.read(from) });
-                case 13: return new P2pEvent.EndpointError({kind: FfiConverterTypeEndpointErrorKind.read(from), peerId: FfiConverterOptionalString.read(from), connId: FfiConverterOptionalUInt64.read(from), detail: FfiConverterString.read(from) });
+                case 13: return new P2pEvent.EndpointError({kind: FfiConverterTypeEndpointErrorKind.read(from), peerId: FfiConverterOptionalString.read(from), connId: FfiConverterOptionalUInt64.read(from), streamId: FfiConverterOptionalUInt64.read(from), detail: FfiConverterString.read(from) });
                 case 14: return new P2pEvent.ReachabilityChanged({previous: FfiConverterTypeReachability.read(from), current: FfiConverterTypeReachability.read(from), confirmedAddrs: FfiConverterSequenceString.read(from) });
                 case 15: return new P2pEvent.PublicAddressesChanged({addrs: FfiConverterSequenceString.read(from) });
                 case 16: return new P2pEvent.RelayReserved({relayPeerId: FfiConverterString.read(from), expiresUnixSecs: FfiConverterOptionalUInt64.read(from) });
@@ -3176,6 +3228,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     FfiConverterTypeEndpointErrorKind.write(inner.kind, into);
                     FfiConverterOptionalString.write(inner.peerId, into);
                     FfiConverterOptionalUInt64.write(inner.connId, into);
+                    FfiConverterOptionalUInt64.write(inner.streamId, into);
                     FfiConverterString.write(inner.detail, into);
                     return;
                 }
@@ -3432,6 +3485,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     size += FfiConverterTypeEndpointErrorKind.allocationSize(inner.kind);
                     size += FfiConverterOptionalString.allocationSize(inner.peerId);
                     size += FfiConverterOptionalUInt64.allocationSize(inner.connId);
+                    size += FfiConverterOptionalUInt64.allocationSize(inner.streamId);
                     size += FfiConverterString.allocationSize(inner.detail);
                     return size;
                 }
@@ -3842,7 +3896,11 @@ export interface P2pEndpointLike {
 /**
  * Opens a negotiated application stream and returns its opaque id.
  */
-    openStream(peerId: string, protocolId: string) /*throws*/: bigint;
+    openStream(peerId: string, protocolId: string) /*throws*/: OpenStreamResult;
+/**
+ * Returns the current usable NAT-orchestrated path to `peer_id`.
+ */
+    path(peerId: string) /*throws*/: PathKind | undefined;
 /**
  * Returns the local peer ID as legacy base58 text.
  */
@@ -4266,14 +4324,42 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
 /**
  * Opens a negotiated application stream and returns its opaque id.
  */
-    openStream(peerId: string, protocolId: string): bigint /*throws*/ {
-    return FfiConverterUInt64.lift(uniffiCaller.rustCallWithError(
+    openStream(peerId: string, protocolId: string): OpenStreamResult /*throws*/ {
+    return ((__rb: Uint8Array) => {
+        try {
+            return FfiConverterTypeOpenStreamResult.lift(__rb);
+        } finally {
+            nativeModule().rustbuffer_free(__rb);
+        }
+    })(uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
             /*caller:*/ (callStatus) => {
                 return nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_open_stream(
                 uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
         FfiConverterString.lower(peerId, nativeModule().rustbuffer_alloc),
         FfiConverterString.lower(protocolId, nativeModule().rustbuffer_alloc),
+                callStatus);
+            },
+            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
+    ));
+    }
+
+/**
+ * Returns the current usable NAT-orchestrated path to `peer_id`.
+ */
+    path(peerId: string): PathKind | undefined /*throws*/ {
+    return ((__rb: Uint8Array) => {
+        try {
+            return FfiConverterOptionalTypePathKind.lift(__rb);
+        } finally {
+            nativeModule().rustbuffer_free(__rb);
+        }
+    })(uniffiCaller.rustCallWithError(
+            /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
+            /*caller:*/ (callStatus) => {
+                return nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_path(
+                uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
+        FfiConverterString.lower(peerId, nativeModule().rustbuffer_alloc),
                 callStatus);
             },
             /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
@@ -4593,6 +4679,9 @@ const FfiConverterSequenceUInt64 = new FfiConverterArray(FfiConverterUInt64);
 // FfiConverter for Array<KnownPeerInfo>
 const FfiConverterSequenceTypeKnownPeerInfo = new FfiConverterArray(FfiConverterTypeKnownPeerInfo);
 
+// FfiConverter for PathKind | undefined
+const FfiConverterOptionalTypePathKind = new FfiConverterOptional(FfiConverterTypePathKind);
+
 // FfiConverter for IdentifyInfo | undefined
 const FfiConverterOptionalTypeIdentifyInfo = new FfiConverterOptional(FfiConverterTypeIdentifyInfo);
 
@@ -4681,8 +4770,11 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_listen_addrs() !== 19812) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_listen_addrs");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_open_stream() !== 21297) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_open_stream() !== 18245) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_open_stream");
+    }
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_path() !== 58210) {
+        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_path");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_peer_id() !== 34289) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_peer_id");
@@ -4743,6 +4835,7 @@ export default Object.freeze({
     FfiConverterTypeKnownPeerInfo,
     FfiConverterTypeMdnsOptions,
     FfiConverterTypeNatErrorKind,
+    FfiConverterTypeOpenStreamResult,
     FfiConverterTypeP2pEndpoint,
     FfiConverterTypeP2pEvent,
     FfiConverterTypeP2pEventListener,

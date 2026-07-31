@@ -89,6 +89,11 @@ across swarm, NAT, pubsub, and discovery queues because their original
 cross-source production order is not observable. Hosts must track readiness,
 subscriptions, and paths independently.
 
+`P2pEndpoint::path(peer_id)` exposes the facade's authoritative current
+NAT-orchestrated path. `EndpointError` also preserves a `stream_id` when the
+swarm can identify the failed stream, allowing Promise-based hosts to
+correlate asynchronous open and negotiation failures.
+
 ## Queue and memory policy
 
 Native callback carry is capped at 4096 source events and delivered in batches
@@ -122,8 +127,7 @@ Regenerate downstream bindings after every change to this crate. The
 background driver is the foreign-runtime equivalent of the Rust facade's
 caller-driven `poll`/`next_wake` methods. v1 deliberately does not expose
 `swarm`/`swarm_mut` implementation escape hatches, standalone Swift/Kotlin
-packages, authoritative per-peer path queries, or background-networking
-guarantees.
+packages, or background-networking guarantees.
 
 Android currently pins `boring` and `boring-sys` to the immutable fix proposed
 in [cloudflare/boring#518](https://github.com/cloudflare/boring/pull/518).

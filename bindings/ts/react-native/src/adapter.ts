@@ -1,9 +1,9 @@
-/* oxlint-disable class-methods-use-this, func-style, max-classes-per-file, no-use-before-define -- The adapter keeps its contract-complete native endpoint and public SDK subclass together, and uses hoisted conversion helpers. */
+/* oxlint-disable class-methods-use-this, complexity, func-style, max-classes-per-file, no-use-before-define -- The adapter keeps its contract-complete native endpoint and public SDK subclass together, and uses hoisted conversion helpers. */
 
 import {
   BackpressureError,
   MessageTooLargeError,
-  MiniP2pBase,
+  Minip2pBase,
   NotPermittedError,
   PubsubRouter,
 } from "@minip2p/core";
@@ -11,16 +11,18 @@ import type {
   Bytes,
   IdentifyInfo,
   KnownPeerInfo,
-  MiniP2pConfig,
-  MiniP2pDiscoveryOptions,
-  MiniP2pMdnsOptions,
-  P2pEvent,
+  Minip2pConfig,
+  Minip2pDiscoveryOptions,
+  Minip2pMdnsOptions,
   Reachability,
   RelayReservationInfo,
 } from "@minip2p/core";
 import type {
-  MiniP2pBackend,
-  MiniP2pBackendFactory,
+  Minip2pBackend,
+  Minip2pBackendFactory,
+  BackendOpenStream,
+  P2pEvent,
+  PathKind,
 } from "@minip2p/core/backend";
 
 import {
@@ -42,12 +44,12 @@ import type {
 } from "./native";
 import nativeModule from "./NativeMinip2p";
 
-class ReactNativeBackend implements MiniP2pBackend {
+class ReactNativeBackend implements Minip2pBackend {
   readonly #endpoint: P2pEndpoint;
   readonly #mdnsEnabled: boolean;
   #listener: P2pEventListener | undefined;
 
-  constructor(config: MiniP2pConfig) {
+  constructor(config: Minip2pConfig) {
     this.#mdnsEnabled = config.mdns !== undefined && config.mdns !== false;
     if (this.#mdnsEnabled) {
       nativeModule.setMdnsEnabled(true);
@@ -136,6 +138,13 @@ class ReactNativeBackend implements MiniP2pBackend {
       : normalizeReservation(reservation);
   }
 
+  path(peerId: string): PathKind | undefined {
+    const path = translateErrors(() => this.#endpoint.path(peerId));
+    return path === undefined
+      ? undefined
+      : (normalizeBigInts(path) as PathKind);
+  }
+
   circuitAddress(relayAddress: string, peerId: string): string {
     return translateErrors(() => nativeCircuitAddress(relayAddress, peerId));
   }
@@ -178,11 +187,14 @@ class ReactNativeBackend implements MiniP2pBackend {
     });
   }
 
-  openStream(peerId: string, protocolId: string): number {
-    return u64ToNumber(
-      translateErrors(() => this.#endpoint.openStream(peerId, protocolId)),
-      "streamId"
+  openStream(peerId: string, protocolId: string): BackendOpenStream {
+    const result = translateErrors(() =>
+      this.#endpoint.openStream(peerId, protocolId)
     );
+    return {
+      connId: u64ToNumber(result.connId, "connId"),
+      streamId: u64ToNumber(result.streamId, "streamId"),
+    };
   }
 
   sendStream(peerId: string, streamId: number, data: Uint8Array): void {
@@ -272,7 +284,7 @@ class ReactNativeBackend implements MiniP2pBackend {
   }
 }
 
-const backendFactory: MiniP2pBackendFactory = {
+const backendFactory: Minip2pBackendFactory = {
   circuitAddress: (relayAddress, peerId) =>
     translateErrors(() => nativeCircuitAddress(relayAddress, peerId)),
   create: (config) => new ReactNativeBackend(config),
@@ -282,14 +294,14 @@ const backendFactory: MiniP2pBackendFactory = {
 };
 
 /** High-level React Native owner for one native minip2p endpoint. */
-export class MiniP2p extends MiniP2pBase {
-  private constructor(backend: MiniP2pBackend, relays: readonly string[]) {
+export class Minip2p extends Minip2pBase {
+  private constructor(backend: Minip2pBackend, relays: readonly string[]) {
     super(backend, relays);
   }
 
   /** Constructs and starts a React Native endpoint. */
-  static create(config: MiniP2pConfig): MiniP2p {
-    return new MiniP2p(backendFactory.create(config), config.relays ?? []);
+  static create(config: Minip2pConfig): Minip2p {
+    return new Minip2p(backendFactory.create(config), config.relays ?? []);
   }
 }
 
@@ -308,17 +320,20 @@ export function circuitAddress(relayAddress: string, peerId: string): string {
   return backendFactory.circuitAddress(relayAddress, peerId);
 }
 
-function toNativeConfig(config: MiniP2pConfig): NativeEndpointConfig {
+function toNativeConfig(config: Minip2pConfig): NativeEndpointConfig {
   const discovery: NativeDiscoveryOptions | undefined =
     config.discovery === undefined
       ? undefined
       : {
-          autoDial: config.discovery.autoDial,
+          autoDial: config.discovery.autoDial ?? true,
           beaconIntervalMs: numberToU64(
-            config.discovery.beaconIntervalMs,
+            config.discovery.beaconIntervalMs ?? 10_000,
             "beaconIntervalMs"
           ),
-          peerTtlMs: numberToU64(config.discovery.peerTtlMs, "peerTtlMs"),
+          peerTtlMs: numberToU64(
+            config.discovery.peerTtlMs ?? 35_000,
+            "peerTtlMs"
+          ),
           topic: config.discovery.topic,
         };
   const mdnsOptions = config.mdns === true ? {} : config.mdns;
@@ -366,8 +381,8 @@ function toNativeConfig(config: MiniP2pConfig): NativeEndpointConfig {
 }
 
 function resolveMdnsAutoDial(
-  mdns: MiniP2pMdnsOptions,
-  discovery: MiniP2pDiscoveryOptions | undefined
+  mdns: Minip2pMdnsOptions,
+  discovery: Minip2pDiscoveryOptions | undefined
 ): boolean {
   return mdns.autoDial ?? discovery?.autoDial ?? true;
 }

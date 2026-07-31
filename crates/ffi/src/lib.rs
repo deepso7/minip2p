@@ -18,8 +18,8 @@ pub use driver::DriverStats;
 pub use endpoint::P2pEndpoint;
 pub use error::FfiError;
 pub use events::{
-    DiscoverySource, DriverFailureKind, EndpointErrorKind, IdentifyInfo, NatErrorKind, P2pEvent,
-    P2pEventListener, PathKind, Reachability,
+    DiscoverySource, DriverFailureKind, EndpointErrorKind, IdentifyInfo, NatErrorKind,
+    OpenStreamResult, P2pEvent, P2pEventListener, PathKind, Reachability,
 };
 use minip2p::{Ed25519Keypair, Multiaddr, PeerAddr, PeerId, Protocol};
 

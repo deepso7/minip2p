@@ -566,7 +566,18 @@ impl SwarmCore {
             }
             return Ok(());
         }
-        let conn_id = self.require_stream_conn(peer_id, stream_id)?;
+        let conn_id = self
+            .outbound_negotiators
+            .keys()
+            .find_map(|(conn_id, sid)| {
+                (*sid == stream_id && self.conn_to_peer.get(conn_id) == Some(peer_id))
+                    .then_some(*conn_id)
+            })
+            .or_else(|| self.require_stream_conn(peer_id, stream_id).ok())
+            .ok_or_else(|| SwarmError::StreamNotFound {
+                peer_id: peer_id.clone(),
+                stream_id,
+            })?;
         let key = (conn_id, stream_id);
         if self.reset_pending.insert(key) {
             self.actions
@@ -609,6 +620,11 @@ impl SwarmCore {
     /// Returns whether `peer_id` has reached the application-ready state.
     pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
         self.ready_peers.contains(peer_id)
+    }
+
+    /// Returns the active transport connection selected for `peer_id`.
+    pub fn connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
+        self.peer_to_conn.get(peer_id).copied()
     }
 
     // -----------------------------------------------------------------------
@@ -732,10 +748,11 @@ impl SwarmCore {
 
         let mut negotiator = MultistreamSelect::dialer(pending.protocol.as_str());
         if let Err(error) = negotiator.handle_input(MultistreamInput::Start) {
-            self.emit_error(
+            self.emit_error_for_stream(
                 SwarmErrorKind::Multistream,
                 self.established_peer_for_conn(conn_id),
                 Some(conn_id),
+                Some(stream_id),
                 format!("multistream start failed on outbound stream {stream_id}: {error}"),
             );
         }
@@ -844,10 +861,22 @@ impl SwarmCore {
         conn_id: Option<ConnectionId>,
         detail: impl Into<String>,
     ) {
+        self.emit_error_for_stream(kind, peer_id, conn_id, None, detail);
+    }
+
+    fn emit_error_for_stream(
+        &mut self,
+        kind: SwarmErrorKind,
+        peer_id: Option<PeerId>,
+        conn_id: Option<ConnectionId>,
+        stream_id: Option<StreamId>,
+        detail: impl Into<String>,
+    ) {
         self.events.push_back(SwarmEvent::Error(SwarmRuntimeError {
             kind,
             peer_id,
             conn_id,
+            stream_id,
             detail: detail.into(),
         }));
     }
@@ -1363,10 +1392,11 @@ impl SwarmCore {
 
         let mut negotiated_protocol = None;
         if let Err(error) = negotiator.handle_input(MultistreamInput::Data(data.to_vec())) {
-            self.emit_error(
+            self.emit_error_for_stream(
                 SwarmErrorKind::Multistream,
                 self.established_peer_for_conn(conn_id),
                 Some(conn_id),
+                Some(stream_id),
                 format!("multistream input failed on inbound stream {stream_id}: {error}"),
             );
             self.inbound_negotiators.remove(&key);
@@ -1422,10 +1452,11 @@ impl SwarmCore {
             .negotiator
             .handle_input(MultistreamInput::Data(data.to_vec()))
         {
-            self.emit_error(
+            self.emit_error_for_stream(
                 SwarmErrorKind::Multistream,
                 self.established_peer_for_conn(conn_id),
                 Some(conn_id),
+                Some(stream_id),
                 format!("multistream input failed on outbound stream {stream_id}: {error}"),
             );
             self.outbound_negotiators.remove(&key);
@@ -1444,10 +1475,11 @@ impl SwarmCore {
             match output {
                 MultistreamOutput::Negotiated { .. } => negotiated = true,
                 MultistreamOutput::NotAvailable => {
-                    self.emit_error(
+                    self.emit_error_for_stream(
                         SwarmErrorKind::UnsupportedProtocol,
                         self.established_peer_for_conn(conn_id),
                         Some(conn_id),
+                        Some(stream_id),
                         format!("remote peer does not support protocol for stream {stream_id}"),
                     );
                     self.outbound_negotiators.remove(&key);
@@ -1508,10 +1540,11 @@ impl SwarmCore {
             // `feed_outbound_negotiator` above.
             MultistreamOutput::NotAvailable => false,
             MultistreamOutput::ProtocolError { reason } => {
-                self.emit_error(
+                self.emit_error_for_stream(
                     SwarmErrorKind::Multistream,
                     self.established_peer_for_conn(conn_id),
                     Some(conn_id),
+                    Some(stream_id),
                     format!("multistream error on stream {stream_id}: {reason}"),
                 );
                 true
@@ -1902,6 +1935,41 @@ mod tests {
     }
 
     #[test]
+    fn outbound_not_available_error_preserves_stream_id() {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(b"unsupported-peer");
+        let conn = ConnectionId::new(48);
+        let stream = StreamId::new(13);
+        core.conn_to_peer.insert(conn, peer.clone());
+        core.peer_to_conn.insert(peer.clone(), conn);
+        let mut negotiator = MultistreamSelect::dialer("/test/1");
+        negotiator
+            .handle_input(MultistreamInput::Start)
+            .expect("dialer starts");
+        while negotiator.poll_output().is_some() {}
+        core.outbound_negotiators.insert(
+            (conn, stream),
+            PendingOutbound {
+                negotiator,
+                target: ProtocolKind::User("/test/1".into()),
+            },
+        );
+
+        core.feed_outbound_negotiator(conn, stream, &multistream_frame(MULTISTREAM_PROTOCOL_ID), 0);
+        while core.poll_output().is_some() {}
+        core.feed_outbound_negotiator(conn, stream, &multistream_frame("na"), 0);
+
+        assert!(drain_events(&mut core).iter().any(|event| matches!(
+            event,
+            SwarmEvent::Error(SwarmRuntimeError {
+                kind: SwarmErrorKind::UnsupportedProtocol,
+                stream_id: Some(id),
+                ..
+            }) if *id == stream
+        )));
+    }
+
+    #[test]
     fn swarm_core_implements_common_sans_io_protocol_trait() {
         fn drive_idle<S: SansIoProtocol<Input = SwarmInput, Output = SwarmOutput>>(engine: &mut S) {
             let _ = engine.handle_input(SwarmInput::Tick { now_ms: 0 });
@@ -2114,6 +2182,36 @@ mod tests {
         );
         assert!(drain_events(&mut core).is_empty());
         assert!(!core.abandoned_streams.contains(&(conn, stream)));
+    }
+
+    #[test]
+    fn abandon_stream_reclaims_an_outbound_negotiator_before_ready() {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(b"pending-outbound-peer");
+        let conn = ConnectionId::new(47);
+        let stream = StreamId::new(12);
+        let key = (conn, stream);
+        core.conn_to_peer.insert(conn, peer.clone());
+        core.peer_to_conn.insert(peer.clone(), conn);
+        core.outbound_negotiators.insert(
+            key,
+            PendingOutbound {
+                negotiator: MultistreamSelect::dialer("/test/1"),
+                target: ProtocolKind::User("/test/1".into()),
+            },
+        );
+
+        core.abandon_stream(&peer, stream).unwrap();
+
+        assert!(!core.outbound_negotiators.contains_key(&key));
+        assert!(core.abandoned_streams.contains(&key));
+        assert!(matches!(
+            core.poll_output(),
+            Some(SwarmOutput::Action(SwarmAction::ResetStream {
+                conn_id,
+                stream_id
+            })) if conn_id == conn && stream_id == stream
+        ));
     }
 
     #[test]

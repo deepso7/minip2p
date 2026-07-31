@@ -72,6 +72,7 @@
     "clean": "del-cli android/.cxx android/build example/android/build example/android/app/build example/ios/build lib",
     "build": "bob build && node scripts/normalize-generated.mjs",
     "prepack": "pnpm build && node scripts/check-package-native.mjs",
+    "test": "pnpm build && node --test tests/*.test.mjs",
     "typecheck": "tsc",
     "lint": "ultracite check",
     "format": "ultracite fix"
