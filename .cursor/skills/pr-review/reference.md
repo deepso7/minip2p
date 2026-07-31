@@ -86,7 +86,7 @@ Out-of-diff: peer tests in the same file and sibling test modules covering the s
 
 - Formatting, naming taste, “could use a match”
 - “Sounds like an LLM” without a concrete artifact
-- **Intentional public / layer facades** that *are* the API or architectural boundary: `Endpoint` → `Swarm`, `Swarm` → `SwarmCore` (+ `flush_actions` where that is the policy), circuit decorator non-circuit arms → `inner`, sans-I/O `*Action`/`*Event` enums, std driver adapters, feature-gated type aliases/shims, newtype ID accessors
+- **Intentional public / layer boundaries** that *are* the API or architectural boundary: `Endpoint` → `Swarm`, `Swarm` → `SwarmCore` (+ `flush_actions` where that is the policy), circuit decorator non-circuit arms → `inner`, sans-I/O `*Action`/`*Event` enums, std driver adapters, feature-gated type aliases/shims, newtype ID accessors
 
 **Allowlist (intentional — do not flag by default)**
 
@@ -96,7 +96,7 @@ Test-shaped (merge may re-raise if the new test is strictly weaker than in-file 
 - Real timeout-driven integration tests when they assert a specific protocol outcome (not a slack timing bound alone)
 - Feature-matrix twins when each twin is required by a stated merge gate *and* asserts a distinct type/error path (not a copy with only the feature name changed)
 
-Facade-shaped (unconditional — not subject to the “weaker peers” clause):
+Boundary-shaped (unconditional — not subject to the “weaker peers” clause):
 
 - One-line public methods that exist so callers don’t reach through layers
-- Intentional layer facades listed under **Do not hunt**
+- Intentional layer boundaries listed under **Do not hunt**

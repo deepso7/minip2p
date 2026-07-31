@@ -15,7 +15,7 @@ pub struct MdnsConfig {
     pub max_announced_addrs: usize,
     /// Interface re-enumeration interval used by the `std` adapter.
     pub interface_refresh_ms: u64,
-    /// Maximum blocking wait before the facade polls mDNS sockets again.
+    /// Maximum blocking wait before the endpoint polls mDNS sockets again.
     pub socket_poll_interval_ms: u64,
 }
 

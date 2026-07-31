@@ -1,4 +1,4 @@
-//! App-facing facade for minip2p.
+//! Application-facing `Endpoint` API for minip2p.
 //!
 //! This crate is the ergonomic std entrypoint. It composes the lower-level
 //! crates without hiding them: protocol crates and `SwarmCore` remain the

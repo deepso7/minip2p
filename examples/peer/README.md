@@ -1,7 +1,7 @@
 # minip2p-peer
 
 A NAT-aware echo-ping demo for the full minip2p stack, built entirely on the
-`minip2p` facade (`features = ["nat"]`). Two subcommands:
+`minip2p` `Endpoint` API (`features = ["nat"]`). Two subcommands:
 
 - **`listen`** — bind QUIC, echo every inbound ping stream byte for byte.
   With `--relay`, hold a Circuit Relay v2 reservation and print a

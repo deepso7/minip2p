@@ -1,6 +1,6 @@
 //! Loopback e2e for the `pubsub` feature: real QUIC endpoints exchanging
 //! pubsub RPCs. Agent-level edge cases live in `crates/pubsub/tests`; these
-//! prove default gossipsub and explicit floodsub facade wiring.
+//! prove default gossipsub and explicit floodsub endpoint wiring.
 
 #![cfg(feature = "pubsub")]
 

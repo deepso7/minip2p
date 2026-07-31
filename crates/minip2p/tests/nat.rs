@@ -1,4 +1,4 @@
-//! End-to-end coverage for the `nat` facade over direct QUIC and a real
+//! End-to-end coverage for the `nat` endpoint API over direct QUIC and a real
 //! loopback Circuit Relay v2 bridge.
 
 #![cfg(feature = "nat")]
@@ -136,7 +136,7 @@ fn wait_peer_ready_drives_nat_agent() {
     let b_addr = b.listen().expect("b listens");
     a.listen().expect("a listens");
 
-    // The facade wait drives only `a`, so keep the remote's socket serviced
+    // The endpoint wait drives only `a`, so keep the remote's socket serviced
     // concurrently. `wait_peer_ready` must feed ConnectionEstablished to
     // the NAT agent on the way to the matching PeerReady event.
     let (stop_remote, remote_stop) = std::sync::mpsc::channel();

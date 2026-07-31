@@ -86,7 +86,7 @@ loop {
 }
 ```
 
-The `minip2p` facade (cargo feature `nat`) wires exactly this loop into
+The `minip2p` crate (cargo feature `nat`) wires exactly this loop into
 `Endpoint` so applications get `connect(&peer)` / `wait_path(...)` /
 `take_nat_events()` without touching the pump:
 

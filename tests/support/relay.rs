@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-//! Loopback Circuit Relay v2 service used by facade and example tests.
+//! Loopback Circuit Relay v2 service used by endpoint and example tests.
 //!
 //! This is deliberately an application built from public `minip2p` APIs:
 //! HOP and STOP are negotiated as ordinary protocols, relay messages are

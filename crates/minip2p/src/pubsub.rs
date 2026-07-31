@@ -18,7 +18,7 @@ use crate::Error;
 
 /// Errors from the [`Endpoint`](crate::Endpoint) pubsub methods.
 ///
-/// The facade's [`Error`] is a re-exported swarm type and cannot grow
+/// The endpoint's [`Error`] is a re-exported swarm type and cannot grow
 /// variants, so pubsub failures get their own enum wrapping it.
 #[derive(Debug, thiserror::Error)]
 pub enum PubsubError {

@@ -1,4 +1,4 @@
-//! Facade coordination for discovery sources and NAT traversal.
+//! Endpoint coordination for discovery sources and NAT traversal.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;

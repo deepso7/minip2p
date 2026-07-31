@@ -1,4 +1,4 @@
-//! Facade driver for the synchronous mDNS socket adapter.
+//! Endpoint driver for the synchronous mDNS socket adapter.
 
 use std::time::Instant;
 

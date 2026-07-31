@@ -89,7 +89,7 @@ across swarm, NAT, pubsub, and discovery queues because their original
 cross-source production order is not observable. Hosts must track readiness,
 subscriptions, and paths independently.
 
-`P2pEndpoint::path(peer_id)` exposes the facade's authoritative current
+`P2pEndpoint::path(peer_id)` exposes the endpoint's authoritative current
 NAT-orchestrated path. `EndpointError` also preserves a `stream_id` when the
 swarm can identify the failed stream, allowing Promise-based hosts to
 correlate asynchronous open and negotiation failures.
@@ -124,7 +124,7 @@ The upstream audit is:
 
 The entire FFI ABI and generated binding shape are unstable before 1.0.
 Regenerate downstream bindings after every change to this crate. The
-background driver is the foreign-runtime equivalent of the Rust facade's
+background driver is the foreign-runtime equivalent of the Rust endpoint's
 caller-driven `poll`/`next_wake` methods. v1 deliberately does not expose
 `swarm`/`swarm_mut` implementation escape hatches, standalone Swift/Kotlin
 packages, or background-networking guarantees.

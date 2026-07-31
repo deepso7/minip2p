@@ -2,7 +2,7 @@
 
 `@minip2p/core` describes the portable host API. React Native implements that contract through UniFFI; Node and WASM adapters can implement the same contract without changing application code.
 
-| Rust facade capability | TypeScript SDK |
+| Rust `Endpoint` capability | TypeScript SDK |
 | --- | --- |
 | Identity, peer ID, bound addresses | `@minip2p/react-native` exports `generateSecretKey` and `peerIdFromSecretKey`; the portable `@minip2p/core` endpoint API exposes `peerId` and `listenAddrs` |
 | QUIC direct dial (dual family, IPv4, IPv6) | `dial`, `dialIp4`, `dialIp6` |

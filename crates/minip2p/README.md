@@ -1,6 +1,6 @@
 # minip2p-rs
 
-App-facing facade for minip2p.
+Application-facing `Endpoint` API for minip2p.
 
 ```toml
 [dependencies]
