@@ -139,6 +139,7 @@ impl<P, E> TcpTransport<P, E> {
     /// [`poll`](Transport::poll).
     ///
     /// A blocking driver must not sleep while these are waiting.
+    #[cfg(feature = "std")]
     pub(crate) fn has_pending_events(&self) -> bool {
         !self.pending.is_empty()
     }

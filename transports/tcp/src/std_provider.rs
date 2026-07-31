@@ -15,7 +15,7 @@ use minip2p_transport::{WaitHandle, WaitOutcome};
 use mio::{Events, Interest, Poll, Token, Waker};
 
 use crate::blocking::BlockingTcpProvider;
-use crate::provider::{SocketHandle, TcpError, TcpEvent, TcpProvider};
+use crate::provider::{SocketHandle, TcpError, TcpEvent, TcpProvider, host_and_port};
 
 /// Reserved for the interrupt waker, so no registration may use it.
 const WAKER_TOKEN: Token = Token(0);
@@ -51,27 +51,6 @@ fn socket_addr_to_multiaddr(addr: SocketAddr) -> Multiaddr {
             Protocol::Tcp(v6.port()),
         ]),
     }
-}
-
-/// Splits a `/tcp` multiaddr into its host and port components.
-fn host_and_port(addr: &Multiaddr, context: &'static str) -> Result<(Protocol, u16), TcpError> {
-    let protocols = addr.protocols();
-    // Exactly host + port. Anything trailing -- a `/p2p` suffix, a `/p2p-circuit`
-    // -- means the address is not this provider's to dial, and silently
-    // ignoring it would connect somewhere the caller did not ask for.
-    let [host, Protocol::Tcp(port)] = protocols else {
-        return Err(TcpError::Address {
-            context,
-            reason: format!("{addr} is not a bare /host/tcp/port address"),
-        });
-    };
-    if !host.is_host() {
-        return Err(TcpError::Address {
-            context,
-            reason: format!("{addr} has no host component"),
-        });
-    }
-    Ok((host.clone(), *port))
 }
 
 /// Resolves a bind address, rejecting names.

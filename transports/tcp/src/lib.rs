@@ -20,8 +20,13 @@
 //! `mio`, with `/dns*` resolution and a real readiness wait, which makes
 //! [`TcpTransport`] a [`BlockingTransport`](minip2p_transport::BlockingTransport)
 //! so an idle driver sleeps instead of spinning. It needs the `std` feature.
-//! Embedded hosts implement [`TcpProvider`] over their own stack; nothing above
-//! the seam changes.
+//!
+//! `SmoltcpTcpProvider` is the embedded one, over a [smoltcp] interface the
+//! host configures and a link it supplies. It needs the `smoltcp` feature and
+//! no operating system. Hosts with neither implement [`TcpProvider`] over their
+//! own stack; nothing above the seam changes.
+//!
+//! [smoltcp]: https://docs.rs/smoltcp
 //!
 //! # Backpressure
 //!
@@ -56,14 +61,21 @@ extern crate alloc;
 mod blocking;
 mod config;
 mod provider;
+#[cfg(feature = "smoltcp")]
+mod smoltcp_provider;
 #[cfg(feature = "std")]
 mod std_provider;
 mod transport;
+
+#[cfg(feature = "smoltcp")]
+pub use smoltcp;
 
 #[cfg(feature = "std")]
 pub use blocking::BlockingTcpProvider;
 pub use config::TcpConfig;
 pub use provider::{SocketHandle, TcpError, TcpEvent, TcpProvider};
+#[cfg(feature = "smoltcp")]
+pub use smoltcp_provider::{SmoltcpConfig, SmoltcpTcpProvider};
 #[cfg(feature = "std")]
 pub use std_provider::StdTcpProvider;
 pub use transport::TcpTransport;

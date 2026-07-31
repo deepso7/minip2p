@@ -24,8 +24,20 @@ what makes `TcpTransport` a `BlockingTransport`, so an idle driver parks on the
 sockets rather than polling on a timer. It needs the `std` feature (on by
 default).
 
-Embedded hosts implement `TcpProvider` over their own stack. Nothing above the
-seam changes.
+`SmoltcpTcpProvider` is the embedded one, over [smoltcp] — a TCP/IP stack, not
+an operating system. It needs the `smoltcp` feature and nothing else: the host
+builds the `Interface` and supplies the link, and this drives sockets on it.
+`/ip4` and `/ip6` only, since resolving a name is I/O it does not do.
+
+smoltcp is timer-driven, so `next_deadline` matters more here than it does with
+readiness: honouring it is what lets a device sleep between packets instead of
+polling to find out nothing happened.
+
+Hosts with neither implement `TcpProvider` over their own stack. Nothing above
+the seam changes — the same tests that drive the transport over OS sockets
+drive it over smoltcp, and only the provider differs.
+
+[smoltcp]: https://docs.rs/smoltcp
 
 ## Writing a provider
 

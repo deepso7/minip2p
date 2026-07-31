@@ -120,6 +120,37 @@ pub enum TcpEvent {
     },
 }
 
+/// Splits a `/tcp` multiaddr into its host and port components.
+///
+/// Shared by every provider so they agree on what a dialable address looks
+/// like, and reject the same things for the same reasons.
+#[cfg(any(feature = "std", feature = "smoltcp"))]
+pub(crate) fn host_and_port(
+    addr: &Multiaddr,
+    context: &'static str,
+) -> Result<(minip2p_core::Protocol, u16), TcpError> {
+    use alloc::format;
+    use minip2p_core::Protocol;
+
+    let protocols = addr.protocols();
+    // Exactly host + port. Anything trailing -- a `/p2p` suffix, a `/p2p-circuit`
+    // -- means the address is not this provider's to dial, and silently
+    // ignoring it would connect somewhere the caller did not ask for.
+    let [host, Protocol::Tcp(port)] = protocols else {
+        return Err(TcpError::Address {
+            context,
+            reason: format!("{addr} is not a bare /host/tcp/port address"),
+        });
+    };
+    if !host.is_host() {
+        return Err(TcpError::Address {
+            context,
+            reason: format!("{addr} has no host component"),
+        });
+    }
+    Ok((host.clone(), *port))
+}
+
 /// Supplies ordered, reliable byte streams to [`TcpTransport`](crate::TcpTransport).
 ///
 /// This is the transport's only I/O seam. Everything above it -- the upgrade,
@@ -140,8 +171,13 @@ pub enum TcpEvent {
 /// # Contract
 ///
 /// - Exactly one [`TcpEvent::Accepted`] or [`TcpEvent::Connected`] is emitted
-///   per stream, before any other event for it. A handle returned by
-///   [`connect`](Self::connect) is not writable until its `Connected` arrives.
+///   per stream that comes up, before any other event for it. A handle returned
+///   by [`connect`](Self::connect) is not writable until its `Connected`
+///   arrives. A stream that never comes up is the one exception: a
+///   [`connect`](Self::connect) that fails reports [`TcpEvent::Closed`] alone,
+///   because the handle is already the caller's and has to be retired somehow,
+///   and an inbound attempt that dies before it is established reports nothing
+///   at all, because no handle was ever handed over.
 /// - [`TcpEvent::Received`] carries bytes in stream order and is never empty.
 /// - [`TcpEvent::RemoteWriteClosed`] is emitted at most once, and no `Received`
 ///   follows it.

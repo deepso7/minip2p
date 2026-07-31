@@ -24,6 +24,9 @@ std = [
     "minip2p-transport/std",
     "thiserror/std",
 ]
+# The embedded provider. `medium-ip` is the minimum a link can speak; a host on
+# Ethernet adds `smoltcp/medium-ethernet` from its own manifest.
+smoltcp = ["dep:smoltcp"]
 
 [dependencies]
 minip2p-core = { path = "../../crates/core", version = "0.2.0", default-features = false }
@@ -32,7 +35,17 @@ minip2p-platform = { path = "../../crates/platform", version = "0.2.0", default-
 minip2p-secure-mux = { path = "../../crates/secure-mux", version = "0.2.0", default-features = false }
 minip2p-transport = { path = "../../crates/transport", version = "0.2.0", default-features = false }
 mio = { version = "1.0", features = ["net", "os-poll"], optional = true }
+smoltcp = { version = "0.13.1", default-features = false, features = [
+    "alloc",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+], optional = true }
 thiserror = { version = "2.0.18", default-features = false }
 
 [dev-dependencies]
 minip2p-identity = { path = "../../crates/identity", features = ["ed25519", "std"] }
+
+[package.metadata.docs.rs]
+all-features = true
