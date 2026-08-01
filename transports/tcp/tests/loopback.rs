@@ -349,6 +349,28 @@ fn is_connected_event(event: &TransportEvent) -> bool {
 }
 
 #[test]
+fn listening_again_on_a_bound_address_is_the_same_listener() {
+    let mut transport = node(identity(1));
+    let bound = transport
+        .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
+        .expect("the first listen binds");
+
+    // Hosts bind first and then listen on what they bound -- the swarm's own
+    // bind-then-listen does exactly that -- so the second call names a socket
+    // this transport already owns. Binding a fresh one there would fail with
+    // the address in use, on a request that had already been granted.
+    let again = transport
+        .listen(&bound)
+        .expect("the second listen is a no-op");
+    assert_eq!(again, bound);
+    assert_eq!(
+        transport.local_addresses(),
+        vec![bound],
+        "one request, one listener"
+    );
+}
+
+#[test]
 fn listening_needs_a_concrete_host_but_dialing_may_use_a_name() {
     let mut transport = node(identity(1));
     assert!(matches!(

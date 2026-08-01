@@ -3,8 +3,18 @@
 //! This crate is the ergonomic std entrypoint. It composes the lower-level
 //! crates without hiding them: protocol crates and `SwarmCore` remain the
 //! Sans-I/O / `no_std + alloc` surface, while [`Endpoint`] gives applications a
-//! small batteries-included API for identity, QUIC, listen/dial, ping, and
-//! event polling.
+//! small batteries-included API for identity, transports, listen/dial, ping,
+//! and event polling.
+//!
+//! # Transports
+//!
+//! An endpoint brings up whatever it was asked to bind --
+//! [`EndpointBuilder::quic`], [`EndpointBuilder::quic_dual_stack`],
+//! [`EndpointBuilder::tcp`], in any combination -- and routes by address from
+//! then on: a `/tcp` peer is reached over TCP and a `/udp/…/quic-v1` one over
+//! QUIC without the caller choosing, and without anything above the endpoint
+//! knowing there is more than one. `bind_quic`, `bind_quic_multiaddr`,
+//! `bind_quic_dual_stack`, and `bind_tcp` are the one-transport shorthands.
 //!
 //! With the `pubsub` feature, `EndpointBuilder::pubsub` selects gossipsub by
 //! default. `EndpointBuilder::pubsub_config` accepts either a
@@ -60,7 +70,10 @@ pub use minip2p_swarm::{
     Deadline, DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, RUN_UNTIL_SKIP_LIMIT, Swarm,
     SwarmError, SwarmEvent as Event,
 };
+pub use minip2p_tcp::TcpConfig;
+use minip2p_tcp::{StdTcpProvider, TcpTransport};
 pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet, WaitHandle};
+use minip2p_transport::{ConnectionNamespace, Transport};
 #[cfg(feature = "pubsub")]
 pub use pubsub::PubsubError;
 
@@ -1161,11 +1174,34 @@ fn mdns_seed(keypair: &Ed25519Keypair) -> [u8; 32] {
     seed
 }
 
+/// One socket an endpoint is asked to bring up.
+///
+/// Held as a request rather than a socket so nothing is allocated until the
+/// configuration has been validated: a builder that failed after binding would
+/// leave a port taken by an endpoint that never existed.
+enum Bind {
+    Quic(QuicBind),
+    Tcp(TcpBind),
+}
+
+enum QuicBind {
+    Addr(String),
+    Multiaddr(Multiaddr),
+    DualStack,
+}
+
+enum TcpBind {
+    Addr(String),
+    Multiaddr(Multiaddr),
+}
+
 /// Builder for [`Endpoint`].
 pub struct EndpointBuilder {
     keypair: Option<Ed25519Keypair>,
     agent_version: String,
     quic_limits: QuicLimits,
+    tcp_config: TcpConfig,
+    binds: Vec<Bind>,
     protocols: Vec<String>,
     #[cfg(feature = "nat")]
     nat_config: Option<NatConfig>,
@@ -1189,6 +1225,8 @@ impl Default for EndpointBuilder {
             keypair: None,
             agent_version: DEFAULT_AGENT_VERSION.to_string(),
             quic_limits: QuicLimits::default(),
+            tcp_config: TcpConfig::default(),
+            binds: Vec::new(),
             protocols: Vec::new(),
             #[cfg(feature = "nat")]
             nat_config: None,
@@ -1213,6 +1251,8 @@ struct BuilderParts {
     keypair: Ed25519Keypair,
     agent_version: String,
     quic_limits: QuicLimits,
+    tcp_config: TcpConfig,
+    binds: Vec<Bind>,
     protocols: Vec<String>,
     #[cfg(feature = "nat")]
     nat_config: Option<NatConfig>,
@@ -1242,6 +1282,48 @@ impl EndpointBuilder {
     /// Overrides QUIC connection, stream, queue, and timeout limits.
     pub fn quic_limits(mut self, limits: QuicLimits) -> Self {
         self.quic_limits = limits;
+        self
+    }
+
+    /// Overrides TCP connection, buffer, and timeout limits, and the
+    /// connection-id namespace the TCP transport allocates in.
+    pub fn tcp_config(mut self, config: TcpConfig) -> Self {
+        self.tcp_config = config;
+        self
+    }
+
+    /// Adds a QUIC socket bound to `bind_addr`, e.g. `"0.0.0.0:4001"`.
+    pub fn quic(mut self, bind_addr: impl Into<String>) -> Self {
+        self.binds
+            .push(Bind::Quic(QuicBind::Addr(bind_addr.into())));
+        self
+    }
+
+    /// Adds a QUIC socket bound to a `/ip4|ip6/udp/<port>/quic-v1` multiaddr.
+    pub fn quic_multiaddr(mut self, addr: &Multiaddr) -> Self {
+        self.binds
+            .push(Bind::Quic(QuicBind::Multiaddr(addr.clone())));
+        self
+    }
+
+    /// Adds separate IPv4 and IPv6 wildcard QUIC sockets.
+    pub fn quic_dual_stack(mut self) -> Self {
+        self.binds.push(Bind::Quic(QuicBind::DualStack));
+        self
+    }
+
+    /// Adds a TCP listener bound to `bind_addr`, e.g. `"0.0.0.0:4001"`.
+    ///
+    /// One TCP transport serves `/ip4` and `/ip6` alike, so a host that wants
+    /// both listens twice on the one member rather than running two.
+    pub fn tcp(mut self, bind_addr: impl Into<String>) -> Self {
+        self.binds.push(Bind::Tcp(TcpBind::Addr(bind_addr.into())));
+        self
+    }
+
+    /// Adds a TCP listener bound to a `/ip4|ip6/tcp/<port>` multiaddr.
+    pub fn tcp_multiaddr(mut self, addr: &Multiaddr) -> Self {
+        self.binds.push(Bind::Tcp(TcpBind::Multiaddr(addr.clone())));
         self
     }
 
@@ -1363,25 +1445,37 @@ impl EndpointBuilder {
         Ok(self)
     }
 
-    /// Builds an endpoint with a QUIC transport bound to `bind_addr`.
-    pub fn bind_quic(self, bind_addr: impl AsRef<str>) -> Result<Endpoint, Error> {
+    /// Builds the endpoint, bringing up every transport it was given.
+    ///
+    /// A `/tcp` address is then dialed over TCP and a `/udp/…/quic-v1` one
+    /// over QUIC, decided from the address rather than by the caller. An
+    /// endpoint with nothing to bind is refused: it could neither dial nor be
+    /// reached, and failing here says so more clearly than every later call
+    /// would.
+    pub fn bind(self) -> Result<Endpoint, Error> {
         let parts = self.into_parts()?;
-        let transport = QuicEndpoint::bind(quic_config(&parts), bind_addr.as_ref())?;
-        build_endpoint(parts, quic_set(transport)?)
+        let transport = bind_transports(&parts)?;
+        build_endpoint(parts, transport)
+    }
+
+    /// Builds an endpoint with a QUIC transport bound to `bind_addr`.
+    pub fn bind_quic(self, bind_addr: impl Into<String>) -> Result<Endpoint, Error> {
+        self.quic(bind_addr).bind()
     }
 
     /// Builds an endpoint with a QUIC transport bound to a QUIC multiaddr.
     pub fn bind_quic_multiaddr(self, addr: &Multiaddr) -> Result<Endpoint, Error> {
-        let parts = self.into_parts()?;
-        let transport = QuicEndpoint::bind_multiaddr(quic_config(&parts), addr)?;
-        build_endpoint(parts, quic_set(transport)?)
+        self.quic_multiaddr(addr).bind()
     }
 
     /// Builds an endpoint with separate IPv4 and IPv6 wildcard QUIC sockets.
     pub fn bind_quic_dual_stack(self) -> Result<Endpoint, Error> {
-        let parts = self.into_parts()?;
-        let transport = QuicEndpoint::dual_stack(quic_config(&parts))?;
-        build_endpoint(parts, quic_set(transport)?)
+        self.quic_dual_stack().bind()
+    }
+
+    /// Builds an endpoint with a TCP transport listening on `bind_addr`.
+    pub fn bind_tcp(self, bind_addr: impl Into<String>) -> Result<Endpoint, Error> {
+        self.tcp(bind_addr).bind()
     }
 
     /// Validates the static configuration and decomposes the builder.
@@ -1444,6 +1538,8 @@ impl EndpointBuilder {
             keypair: self.keypair.unwrap_or_else(Ed25519Keypair::generate),
             agent_version: self.agent_version,
             quic_limits: self.quic_limits,
+            tcp_config: self.tcp_config,
+            binds: self.binds,
             protocols: self.protocols,
             #[cfg(feature = "nat")]
             nat_config,
@@ -1459,23 +1555,101 @@ impl EndpointBuilder {
     }
 }
 
-fn quic_config(parts: &BuilderParts) -> QuicNodeConfig {
-    QuicNodeConfig::new(parts.keypair.clone()).with_limits(parts.quic_limits.clone())
+/// Reads a `host:port` bind spec as a `/tcp` multiaddr.
+///
+/// The same shape `bind_quic` accepts, so a host does not have to know that one
+/// transport speaks socket addresses and the other multiaddrs.
+fn tcp_bind_addr(spec: &str) -> Result<Multiaddr, Error> {
+    use std::net::ToSocketAddrs;
+
+    let addr = spec
+        .to_socket_addrs()
+        .map_err(|error| TransportError::InvalidAddress {
+            context: "tcp bind address",
+            reason: format!("{spec} is not a bindable address: {error}"),
+        })?
+        .next()
+        .ok_or_else(|| TransportError::InvalidAddress {
+            context: "tcp bind address",
+            reason: format!("{spec} resolved to no address"),
+        })?;
+    let host = match addr.ip() {
+        std::net::IpAddr::V4(v4) => Protocol::Ip4(v4.octets()),
+        std::net::IpAddr::V6(v6) => Protocol::Ip6(v6.octets()),
+    };
+    Ok(Multiaddr::from_protocols(vec![
+        host,
+        Protocol::Tcp(addr.port()),
+    ]))
 }
 
-/// Puts a bound QUIC endpoint behind the set the endpoint drives.
+/// Brings up every requested transport behind one set.
 ///
-/// The namespaces come from the endpoint itself -- one socket mints ids in the
-/// family it bound, a dual-stack pair in both -- so the claim cannot drift from
-/// what the transport actually allocates.
-fn quic_set(transport: QuicEndpoint) -> Result<TransportSet, Error> {
+/// Each member claims the address shape it serves and the namespaces its
+/// allocator stamps -- taken from the transport itself, so a claim cannot
+/// drift from what it actually mints. Asking for two of one shape is refused
+/// here rather than producing a set that routes by coin toss.
+fn bind_transports(parts: &BuilderParts) -> Result<TransportSet, Error> {
     let mut set = TransportSet::new();
-    let namespaces = transport.namespaces();
-    set.insert(TransportKind::Quic, namespaces, Box::new(transport))
-        .map_err(|rejected| TransportError::InvalidConfig {
-            reason: rejected.error().to_string(),
-        })?;
+    for bind in &parts.binds {
+        match bind {
+            Bind::Quic(spec) => {
+                let config = QuicNodeConfig::new(parts.keypair.clone())
+                    .with_limits(parts.quic_limits.clone());
+                let transport = match spec {
+                    QuicBind::Addr(addr) => QuicEndpoint::bind(config, addr)?,
+                    QuicBind::Multiaddr(addr) => QuicEndpoint::bind_multiaddr(config, addr)?,
+                    QuicBind::DualStack => QuicEndpoint::dual_stack(config)?,
+                };
+                let namespaces = transport.namespaces();
+                insert_member(&mut set, TransportKind::Quic, namespaces, transport)?;
+            }
+            Bind::Tcp(spec) => {
+                let addr = match spec {
+                    TcpBind::Addr(addr) => tcp_bind_addr(addr)?,
+                    TcpBind::Multiaddr(addr) => addr.clone(),
+                };
+                let provider =
+                    StdTcpProvider::new().map_err(|error| TransportError::ListenFailed {
+                        reason: error.to_string(),
+                    })?;
+                let mut transport = TcpTransport::with_config(
+                    provider,
+                    parts.keypair.clone(),
+                    minip2p_platform::StdEntropy::new(),
+                    parts.tcp_config.clone(),
+                );
+                // Bound here, like a QUIC socket is: `Endpoint::listen` then
+                // listens on what is already bound, and a caller that asked
+                // for port 0 learns which port it got before the first event.
+                transport.listen(&addr)?;
+                let namespace = parts.tcp_config.namespace;
+                insert_member(&mut set, TransportKind::Tcp, [namespace], transport)?;
+            }
+        }
+    }
+    if set.is_empty() {
+        return Err(TransportError::InvalidConfig {
+            reason: "an endpoint needs at least one transport to bind".into(),
+        }
+        .into());
+    }
     Ok(set)
+}
+
+fn insert_member<T: minip2p_transport::BlockingTransport + Send + 'static>(
+    set: &mut TransportSet,
+    kind: TransportKind,
+    namespaces: impl IntoIterator<Item = ConnectionNamespace>,
+    transport: T,
+) -> Result<(), Error> {
+    set.insert(kind, namespaces, Box::new(transport))
+        .map_err(|rejected| {
+            TransportError::InvalidConfig {
+                reason: rejected.error().to_string(),
+            }
+            .into()
+        })
 }
 
 fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoint, Error> {
@@ -1674,6 +1848,108 @@ mod tests {
             Endpoint::builder().discovery_config(config),
             Err(DiscoveryConfigError::ZeroBeaconInterval)
         ));
+    }
+
+    #[test]
+    fn an_endpoint_with_nothing_to_bind_is_refused() {
+        // It could neither dial nor be reached; failing here says that once,
+        // where the mistake is, instead of at every later call.
+        let Err(error) = Endpoint::builder().bind() else {
+            panic!("an endpoint with no transport must not build");
+        };
+        assert!(
+            format!("{error}").contains("at least one transport"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn one_address_shape_cannot_be_bound_twice() {
+        // Two members serving one shape would make routing a guess, and a
+        // guess delivers a connection's events to the wrong transport.
+        let Err(error) = Endpoint::builder()
+            .quic("127.0.0.1:0")
+            .quic("127.0.0.1:0")
+            .bind()
+        else {
+            panic!("one shape must not have two members");
+        };
+        assert!(format!("{error}").contains("Quic"), "got {error}");
+    }
+
+    #[test]
+    fn a_tcp_endpoint_reports_the_port_it_was_given() {
+        let mut endpoint = Endpoint::builder()
+            .bind_tcp("127.0.0.1:0")
+            .expect("bind tcp endpoint");
+
+        // Bound at build time like a QUIC socket, so a caller that asked for
+        // port 0 can learn which port it got without driving anything first.
+        let addrs = endpoint.listen_all().expect("listen");
+        assert_eq!(addrs.len(), 1, "one transport, one address: {addrs:?}");
+        let protocols = addrs[0].transport().protocols().to_vec();
+        assert!(
+            matches!(protocols[1], Protocol::Tcp(port) if port != 0),
+            "an ephemeral bind has to report the port it actually got: {protocols:?}"
+        );
+    }
+
+    #[test]
+    fn a_peer_is_reached_over_the_transport_its_address_names() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // One peer per transport: the swarm keeps a single connection per
+        // peer, so two paths to one host would be the second superseding the
+        // first rather than a test of which path each address took.
+        let mut over_tcp = Endpoint::builder()
+            .bind_tcp("127.0.0.1:0")
+            .expect("bind tcp peer");
+        let mut over_quic = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind quic peer");
+        let tcp_addr = over_tcp.listen().expect("tcp peer listens");
+        let quic_addr = over_quic.listen().expect("quic peer listens");
+
+        let mut dialer = Endpoint::builder()
+            .quic("127.0.0.1:0")
+            .tcp("127.0.0.1:0")
+            .bind()
+            .expect("bind dialer");
+        let stop = Arc::new(AtomicBool::new(false));
+        let listener_stop = Arc::clone(&stop);
+        let listener_thread = std::thread::spawn(move || {
+            while !listener_stop.load(Ordering::Relaxed) {
+                over_tcp
+                    .next_event(Duration::from_millis(20))
+                    .expect("drive tcp peer");
+                over_quic
+                    .next_event(Duration::from_millis(20))
+                    .expect("drive quic peer");
+            }
+        });
+
+        // The address decides the transport, and nothing above the endpoint
+        // had to choose: the namespace on the connection id says which one
+        // actually carried it.
+        for (addr, expected) in [
+            (&tcp_addr, ConnectionNamespace::TCP_IPV4),
+            (&quic_addr, ConnectionNamespace::QUIC_IPV4),
+        ] {
+            dialer.dial(addr).expect("dial");
+            let event = dialer
+                .next_event(Duration::from_secs(10))
+                .expect("drive dialer");
+            let established = matches!(&event, Some(Event::ConnectionEstablished { peer_id, conn_id })
+                if peer_id == addr.peer_id() && conn_id.namespace() == expected);
+            assert!(
+                established,
+                "{} should have connected over {expected}, got {event:?}",
+                addr.transport()
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        listener_thread.join().expect("listener driver exits");
     }
 
     #[test]

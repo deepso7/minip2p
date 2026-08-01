@@ -554,12 +554,20 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
                 reason: format!("{addr} is not a /tcp transport address"),
             });
         }
-        let bound = self
-            .provider
-            .listen(addr)
-            .map_err(|error| TransportError::ListenFailed {
-                reason: error.to_string(),
-            })?;
+        // Listening again on an address already bound is the same listener,
+        // not a second one. Hosts announce what they bound and then listen on
+        // it -- the swarm's own bind-then-listen does exactly that -- and
+        // binding a fresh socket there would fail with the address in use, on
+        // a request that had already been granted.
+        let bound = if self.provider.local_addresses().iter().any(|a| a == addr) {
+            addr.clone()
+        } else {
+            self.provider
+                .listen(addr)
+                .map_err(|error| TransportError::ListenFailed {
+                    reason: error.to_string(),
+                })?
+        };
         self.pending.push_back(TransportEvent::Listening {
             addr: bound.clone(),
         });

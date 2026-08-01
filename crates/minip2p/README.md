@@ -10,7 +10,7 @@ minip2p = { package = "minip2p-rs", version = "0.1" }
 The package is named `minip2p-rs` on crates.io and its library target remains
 `minip2p`, so application imports stay concise:
 
-This crate glues identity, QUIC transport, and the std swarm driver into a
+This crate glues identity, the transports, and the std swarm driver into a
 small `Endpoint` API. Lower crates remain available directly for Sans-I/O and
 `no_std + alloc` users.
 
@@ -26,9 +26,34 @@ for address in endpoint.listen_all()? {
 # Ok::<(), minip2p::Error>(())
 ```
 
+## Transports
+
+An endpoint brings up whatever it was asked to bind and routes by address from
+then on. `quic`, `quic_dual_stack`, and `tcp` add sockets; `bind` brings them
+all up:
+
+```rust
+let mut endpoint = minip2p::Endpoint::builder()
+    .quic("0.0.0.0:4001")
+    .tcp("0.0.0.0:4001")
+    .bind()?;
+# Ok::<(), minip2p::Error>(())
+```
+
+A `/tcp` peer is then reached over TCP and a `/udp/<port>/quic-v1` one over
+QUIC, decided from the address rather than by the caller — nothing above the
+endpoint knows there is more than one transport. `bind_quic`,
+`bind_quic_multiaddr`, `bind_quic_dual_stack`, and `bind_tcp` are the
+one-transport shorthands, and an endpoint with nothing to bind is refused
+rather than built unusable.
+
+`dial` resolves a `/dns*` target and dials one address per family, so a
+dual-stack peer is tried both ways; `dial_ip4` and `dial_ip6` force one.
+
 `minip2p::Error` preserves transport failures, Sans-I/O state rejections, and
-driver-invariant failures as separate variants. QUIC resource limits are
-configurable through `EndpointBuilder::quic_limits`.
+driver-invariant failures as separate variants. Resource limits are
+configurable through `EndpointBuilder::quic_limits` and
+`EndpointBuilder::tcp_config`.
 
 Event waits (`next_event`, `wait_peer_ready`, `wait_ping_rtt`) accept an
 `Instant` (absolute deadline), a `Duration` (relative timeout), or
