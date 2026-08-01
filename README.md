@@ -136,7 +136,7 @@ Build an application endpoint with the top-level API:
 
 ```toml
 [dependencies]
-minip2p-rs = "0.2.0"
+minip2p-rs = "0.3.0"
 ```
 
 ```rust
