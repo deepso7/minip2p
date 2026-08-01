@@ -469,7 +469,7 @@ jobs:
               exit 1
             fi
 
-            npm publish "$tarball" --access public
+            npm publish "./$tarball" --access public
           }
 
           publish_package \
