@@ -10,8 +10,8 @@ use minip2p_secure_mux::{
     SecureMuxSession, SessionConfig, SessionError, SessionOutput, SessionRole,
 };
 use minip2p_transport::{
-    ConnectionEndpoint, ConnectionId, ConnectionIdAllocator, ConnectionState, StreamId, Transport,
-    TransportError, TransportEvent,
+    ConnectionEndpoint, ConnectionId, ConnectionIdAllocator, ConnectionNamespace, ConnectionState,
+    StreamId, Transport, TransportError, TransportEvent,
 };
 
 use crate::config::TcpConfig;
@@ -141,6 +141,16 @@ impl<P, E> TcpTransport<P, E> {
     /// The local peer identity this transport proves during the upgrade.
     pub fn local_peer_id(&self) -> PeerId {
         self.identity.peer_id()
+    }
+
+    /// The namespace this transport's connection ids carry.
+    ///
+    /// A host routing several transports needs this to say which ids are
+    /// TCP's -- see [`TransportSet`](minip2p_transport::TransportSet). It is
+    /// [`TcpConfig::namespace`], read back from the allocator that actually
+    /// mints the ids.
+    pub fn namespace(&self) -> ConnectionNamespace {
+        self.ids.namespace()
     }
 
     /// Whether events are already queued for the next
@@ -559,15 +569,20 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         // it -- the swarm's own bind-then-listen does exactly that -- and
         // binding a fresh socket there would fail with the address in use, on
         // a request that had already been granted.
-        let bound = if self.provider.local_addresses().iter().any(|a| a == addr) {
-            addr.clone()
-        } else {
-            self.provider
-                .listen(addr)
-                .map_err(|error| TransportError::ListenFailed {
-                    reason: error.to_string(),
-                })?
-        };
+        //
+        // Nothing is announced the second time either: the address was
+        // reported when it was bound, and repeating it would have every
+        // re-listen add an event the host has already seen -- growing the
+        // queue for as long as a caller keeps asking.
+        if self.provider.local_addresses().iter().any(|a| a == addr) {
+            return Ok(addr.clone());
+        }
+        let bound = self
+            .provider
+            .listen(addr)
+            .map_err(|error| TransportError::ListenFailed {
+                reason: error.to_string(),
+            })?;
         self.pending.push_back(TransportEvent::Listening {
             addr: bound.clone(),
         });

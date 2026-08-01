@@ -57,6 +57,7 @@ pub use minip2p_nat::{
     ConnectId, NatConfig, NatError, NatEvent, Path, ReachabilityState, ReservationInfo,
     ReservationPolicy,
 };
+use minip2p_platform::StdEntropy;
 #[cfg(feature = "pubsub")]
 pub use minip2p_pubsub::{
     FLOODSUB_PROTOCOL_ID, FloodsubConfig, GossipsubConfig, MESHSUB_PROTOCOL_ID_V10,
@@ -97,11 +98,18 @@ pub type EndpointTransport = TransportSet;
 /// Concrete swarm type owned by [`Endpoint`].
 pub type EndpointSwarm = Swarm<EndpointTransport>;
 
-/// App-facing minip2p endpoint over the default QUIC transport.
+/// App-facing minip2p endpoint over the transports it was asked to bind.
 ///
-/// `Endpoint` owns identity, transport, and the std swarm driver. Advanced
+/// `Endpoint` owns identity, transports, and the std swarm driver. Advanced
 /// users can still borrow the underlying [`Swarm`] with [`Endpoint::swarm`]
 /// and [`Endpoint::swarm_mut`].
+///
+/// QUIC, TCP, or both -- see [`EndpointBuilder::quic`],
+/// [`EndpointBuilder::tcp`], and [`EndpointBuilder::bind`]. They live behind
+/// one [`TransportSet`], which routes each address to the transport that
+/// serves its shape, so nothing here or above changes with the second one:
+/// [`dial`](Self::dial) takes the same [`PeerAddr`], [`listen`](Self::listen)
+/// arms every bound address, and the events are the same events.
 ///
 /// With the `nat` cargo feature and a NAT configuration
 /// (`EndpointBuilder::relay` / `EndpointBuilder::nat_config`), the endpoint
@@ -221,12 +229,19 @@ impl Endpoint {
         self.swarm.local_peer_id()
     }
 
-    /// Starts listening on the transport's first already-bound address.
+    /// Starts listening on every bound address and returns the first.
+    ///
+    /// Every one of them, not only the address returned: an endpoint that
+    /// bound two transports would otherwise report a listen success while one
+    /// of them accepted nothing, and which one that was would depend on the
+    /// order the sockets happened to be asked for. Use
+    /// [`listen_all`](Self::listen_all) to see them all.
     pub fn listen(&mut self) -> Result<PeerAddr, Error> {
-        let addr = self.swarm.listen_on_bound_addr()?;
-        #[cfg(feature = "nat")]
-        self.sync_nat_listen_addrs(std::slice::from_ref(&addr));
-        Ok(addr)
+        let mut addrs = self.listen_all()?;
+        // `listen_all` fails rather than return nothing, so there is one here.
+        addrs.drain(..).next().ok_or(Error::Invariant {
+            reason: "a successful listen reported no address",
+        })
     }
 
     /// Starts listening on all transport-bound addresses.
@@ -1555,32 +1570,56 @@ impl EndpointBuilder {
     }
 }
 
-/// Reads a `host:port` bind spec as a `/tcp` multiaddr.
+/// Reads a `host:port` bind spec as the `/tcp` addresses it names.
 ///
 /// The same shape `bind_quic` accepts, so a host does not have to know that one
 /// transport speaks socket addresses and the other multiaddrs.
-fn tcp_bind_addr(spec: &str) -> Result<Multiaddr, Error> {
+///
+/// A name that answers with more than one address gives more than one: a host
+/// that asked to be reachable as `localhost` means both families, and listening
+/// on whichever the resolver happened to put first would leave half of that
+/// silently unserved. One TCP transport holds them all.
+fn tcp_bind_addrs(spec: &str) -> Result<Vec<Multiaddr>, Error> {
     use std::net::ToSocketAddrs;
 
-    let addr = spec
+    let resolved = spec
         .to_socket_addrs()
         .map_err(|error| TransportError::InvalidAddress {
             context: "tcp bind address",
             reason: format!("{spec} is not a bindable address: {error}"),
-        })?
-        .next()
-        .ok_or_else(|| TransportError::InvalidAddress {
+        })?;
+    let addrs = tcp_addrs_of(resolved);
+    if addrs.is_empty() {
+        return Err(TransportError::InvalidAddress {
             context: "tcp bind address",
             reason: format!("{spec} resolved to no address"),
-        })?;
-    let host = match addr.ip() {
-        std::net::IpAddr::V4(v4) => Protocol::Ip4(v4.octets()),
-        std::net::IpAddr::V6(v6) => Protocol::Ip6(v6.octets()),
-    };
-    Ok(Multiaddr::from_protocols(vec![
-        host,
-        Protocol::Tcp(addr.port()),
-    ]))
+        }
+        .into());
+    }
+    Ok(addrs)
+}
+
+/// The `/tcp` multiaddrs for resolved socket addresses, in order, without
+/// repeats.
+///
+/// Split from resolution so what is kept can be tested without a resolver: no
+/// test can make a name answer with two families on demand, and "keeps every
+/// answer" is exactly the part that was wrong when it kept only the first.
+fn tcp_addrs_of(resolved: impl IntoIterator<Item = std::net::SocketAddr>) -> Vec<Multiaddr> {
+    let mut addrs: Vec<Multiaddr> = Vec::new();
+    for addr in resolved {
+        let host = match addr.ip() {
+            std::net::IpAddr::V4(v4) => Protocol::Ip4(v4.octets()),
+            std::net::IpAddr::V6(v6) => Protocol::Ip6(v6.octets()),
+        };
+        let addr = Multiaddr::from_protocols(vec![host, Protocol::Tcp(addr.port())]);
+        // A resolver may answer with the same address twice; binding it twice
+        // would fail the second time with the address in use.
+        if !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+    }
+    addrs
 }
 
 /// Brings up every requested transport behind one set.
@@ -1589,8 +1628,14 @@ fn tcp_bind_addr(spec: &str) -> Result<Multiaddr, Error> {
 /// allocator stamps -- taken from the transport itself, so a claim cannot
 /// drift from what it actually mints. Asking for two of one shape is refused
 /// here rather than producing a set that routes by coin toss.
+///
+/// Every `/tcp` address asked for lands on **one** TCP member, listening on
+/// each: a transport claims an address shape rather than an address family, so
+/// two of them would be two claims on one shape -- and a host asking for IPv4
+/// and IPv6 is asking for two sockets, not two transports.
 fn bind_transports(parts: &BuilderParts) -> Result<TransportSet, Error> {
     let mut set = TransportSet::new();
+    let mut tcp_bound = false;
     for bind in &parts.binds {
         match bind {
             Bind::Quic(spec) => {
@@ -1604,26 +1649,14 @@ fn bind_transports(parts: &BuilderParts) -> Result<TransportSet, Error> {
                 let namespaces = transport.namespaces();
                 insert_member(&mut set, TransportKind::Quic, namespaces, transport)?;
             }
-            Bind::Tcp(spec) => {
-                let addr = match spec {
-                    TcpBind::Addr(addr) => tcp_bind_addr(addr)?,
-                    TcpBind::Multiaddr(addr) => addr.clone(),
-                };
-                let provider =
-                    StdTcpProvider::new().map_err(|error| TransportError::ListenFailed {
-                        reason: error.to_string(),
-                    })?;
-                let mut transport = TcpTransport::with_config(
-                    provider,
-                    parts.keypair.clone(),
-                    minip2p_platform::StdEntropy::new(),
-                    parts.tcp_config.clone(),
-                );
-                // Bound here, like a QUIC socket is: `Endpoint::listen` then
-                // listens on what is already bound, and a caller that asked
-                // for port 0 learns which port it got before the first event.
-                transport.listen(&addr)?;
-                let namespace = parts.tcp_config.namespace;
+            // Handled together at the first one, in the position the host put
+            // it, so the order addresses are reported in follows the order they
+            // were asked for.
+            Bind::Tcp(_) if tcp_bound => {}
+            Bind::Tcp(_) => {
+                tcp_bound = true;
+                let transport = bind_tcp_member(parts)?;
+                let namespace = transport.namespace();
                 insert_member(&mut set, TransportKind::Tcp, [namespace], transport)?;
             }
         }
@@ -1635,6 +1668,54 @@ fn bind_transports(parts: &BuilderParts) -> Result<TransportSet, Error> {
         .into());
     }
     Ok(set)
+}
+
+/// Builds the one TCP transport, listening on every `/tcp` address asked for.
+fn bind_tcp_member(
+    parts: &BuilderParts,
+) -> Result<TcpTransport<StdTcpProvider, StdEntropy>, Error> {
+    // Checked before a socket exists: the namespace is what routes a connection
+    // id back to the transport that minted it, so a TCP transport tagged as
+    // something else hands out ids that name the wrong carrier -- and would
+    // take a claim a QUIC member needs.
+    let namespace = parts.tcp_config.namespace;
+    if namespace != ConnectionNamespace::TCP_IPV4 && namespace != ConnectionNamespace::TCP_IPV6 {
+        return Err(TransportError::InvalidConfig {
+            reason: format!(
+                "a tcp transport must allocate in a tcp namespace, not {namespace}; \
+                 see TcpConfig::namespace"
+            ),
+        }
+        .into());
+    }
+
+    let provider = StdTcpProvider::new().map_err(|error| TransportError::ListenFailed {
+        reason: error.to_string(),
+    })?;
+    let mut transport = TcpTransport::with_config(
+        provider,
+        parts.keypair.clone(),
+        StdEntropy::new(),
+        parts.tcp_config.clone(),
+    );
+    for bind in &parts.binds {
+        let Bind::Tcp(spec) = bind else { continue };
+        match spec {
+            TcpBind::Addr(spec) => {
+                for addr in tcp_bind_addrs(spec)? {
+                    // Bound here, like a QUIC socket is: `Endpoint::listen`
+                    // then listens on what is already bound, and a caller that
+                    // asked for port 0 learns which port it got before the
+                    // first event.
+                    transport.listen(&addr)?;
+                }
+            }
+            TcpBind::Multiaddr(addr) => {
+                transport.listen(addr)?;
+            }
+        }
+    }
+    Ok(transport)
 }
 
 fn insert_member<T: minip2p_transport::BlockingTransport + Send + 'static>(
@@ -1836,6 +1917,80 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Drives `endpoint` on a thread until the returned guard is dropped.
+    ///
+    /// A peer that is not being driven answers nothing, so anything asserting
+    /// on a connection needs the other end alive for as long as the assertion
+    /// takes.
+    struct Driven {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Driven {
+        fn new(mut endpoint: Endpoint) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    endpoint
+                        .next_event(Duration::from_millis(20))
+                        .expect("drive peer");
+                }
+            });
+            Self {
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for Driven {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Drives `endpoint` until an event `wanted` accepts, or gives up.
+    ///
+    /// A connection produces more than the event a test is waiting for --
+    /// identify, ping, readiness -- and an earlier connection keeps producing
+    /// them, so taking whatever arrives next is a race rather than an
+    /// assertion.
+    fn wait_for(
+        endpoint: &mut Endpoint,
+        what: &str,
+        mut wanted: impl FnMut(&Event) -> bool,
+    ) -> Event {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut seen = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let Some(event) = endpoint
+                .next_event(Duration::from_millis(50))
+                .expect("drive endpoint")
+            else {
+                continue;
+            };
+            if wanted(&event) {
+                return event;
+            }
+            seen.push(event);
+        }
+        panic!("no {what} arrived; saw {seen:?}");
+    }
+
+    fn tcp_port(addr: &PeerAddr) -> u16 {
+        match addr.transport().protocols() {
+            [_, Protocol::Tcp(port)] => *port,
+            other => panic!("not a /tcp address: {other:?}"),
+        }
+    }
 
     #[cfg(feature = "discovery")]
     #[test]
@@ -1874,7 +2029,12 @@ mod tests {
         else {
             panic!("one shape must not have two members");
         };
-        assert!(format!("{error}").contains("Quic"), "got {error}");
+        assert_eq!(
+            format!("{error}"),
+            "invalid transport configuration: this set already has a transport \
+             for Quic addresses",
+            "the refusal should name the shape that was already claimed"
+        );
     }
 
     #[test]
@@ -1887,18 +2047,118 @@ mod tests {
         // port 0 can learn which port it got without driving anything first.
         let addrs = endpoint.listen_all().expect("listen");
         assert_eq!(addrs.len(), 1, "one transport, one address: {addrs:?}");
-        let protocols = addrs[0].transport().protocols().to_vec();
+        let port = tcp_port(&addrs[0]);
+        assert_ne!(
+            port, 0,
+            "an ephemeral bind reports the port it actually got"
+        );
+        assert_eq!(
+            addrs[0].transport().to_string(),
+            format!("/ip4/127.0.0.1/tcp/{port}"),
+            "the host asked for is the host reported, and nothing is added to it"
+        );
+        assert_eq!(addrs[0].peer_id(), endpoint.peer_id());
+    }
+
+    #[test]
+    fn every_bound_transport_reports_where_it_listens() {
+        let mut endpoint = Endpoint::builder()
+            .quic("127.0.0.1:0")
+            .tcp("127.0.0.1:0")
+            .bind()
+            .expect("bind both");
+
+        // A host announces where it can be reached. Leaving a transport out
+        // would make half of those ways invisible to peers, and the host would
+        // have no way to tell.
+        let reported: Vec<String> = endpoint
+            .listen_all()
+            .expect("listen")
+            .iter()
+            .map(|addr| addr.transport().to_string())
+            .collect();
+        assert_eq!(reported.len(), 2, "one per transport: {reported:?}");
         assert!(
-            matches!(protocols[1], Protocol::Tcp(port) if port != 0),
-            "an ephemeral bind has to report the port it actually got: {protocols:?}"
+            reported.iter().any(|addr| addr.contains("/quic-v1")),
+            "{reported:?}"
+        );
+        assert!(
+            reported.iter().any(|addr| addr.contains("/tcp/")),
+            "{reported:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_tcp_address_joins_the_transport_that_already_serves_tcp() {
+        let mut endpoint = Endpoint::builder()
+            .tcp("127.0.0.1:0")
+            .tcp("127.0.0.1:0")
+            .bind()
+            .expect("both tcp addresses bind");
+        let addrs = endpoint.listen_all().expect("listen");
+        assert_eq!(addrs.len(), 2, "both addresses are listening: {addrs:?}");
+        assert_ne!(
+            tcp_port(&addrs[0]),
+            tcp_port(&addrs[1]),
+            "two binds, two sockets"
+        );
+
+        // A transport claims an address shape, not an address family, so
+        // asking for two /tcp addresses asks for two sockets on one transport
+        // -- not a second one, which the set would refuse.
+        let second = addrs[1].clone();
+        let _driver = Driven::new(endpoint);
+        let mut dialer = Endpoint::builder()
+            .bind_tcp("127.0.0.1:0")
+            .expect("bind dialer");
+        dialer.dial(&second).expect("dial the second address");
+        wait_for(
+            &mut dialer,
+            "connection",
+            |event| matches!(event, Event::ConnectionEstablished { peer_id, .. } if peer_id == second.peer_id()),
+        );
+    }
+
+    #[test]
+    fn listening_arms_every_bound_transport_not_just_the_first() {
+        // TCP first, so the transport that still needs arming is the one
+        // `listen` does not return. An endpoint that reported success while
+        // QUIC accepted nothing would look bound and be unreachable.
+        let mut listener = Endpoint::builder()
+            .tcp("127.0.0.1:0")
+            .quic("127.0.0.1:0")
+            .bind()
+            .expect("bind both");
+        // Read straight off the bound sockets, so nothing here arms anything:
+        // `listen` below is the only call that does.
+        let bound = listener
+            .swarm()
+            .transport()
+            .local_addresses()
+            .into_iter()
+            .find(|addr| addr.to_string().contains("quic"))
+            .expect("a bound quic socket");
+        let quic_addr = PeerAddr::new(bound, listener.peer_id().clone()).expect("target");
+        let first = listener.listen().expect("listen returns the first address");
+        assert!(
+            first.transport().to_string().contains("/tcp/"),
+            "the returned address is the first bound one: {first:?}"
+        );
+        let _driver = Driven::new(listener);
+
+        let mut dialer = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind dialer");
+        dialer.dial(&quic_addr).expect("dial");
+        wait_for(
+            &mut dialer,
+            "connection",
+            |event| matches!(event, Event::ConnectionEstablished { peer_id, .. } if peer_id == quic_addr.peer_id()),
         );
     }
 
     #[test]
     fn a_peer_is_reached_over_the_transport_its_address_names() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
         // One peer per transport: the swarm keeps a single connection per
         // peer, so two paths to one host would be the second superseding the
         // first rather than a test of which path each address took.
@@ -1916,40 +2176,123 @@ mod tests {
             .tcp("127.0.0.1:0")
             .bind()
             .expect("bind dialer");
-        let stop = Arc::new(AtomicBool::new(false));
-        let listener_stop = Arc::clone(&stop);
-        let listener_thread = std::thread::spawn(move || {
-            while !listener_stop.load(Ordering::Relaxed) {
-                over_tcp
-                    .next_event(Duration::from_millis(20))
-                    .expect("drive tcp peer");
-                over_quic
-                    .next_event(Duration::from_millis(20))
-                    .expect("drive quic peer");
-            }
-        });
+        let _drivers = (Driven::new(over_tcp), Driven::new(over_quic));
 
         // The address decides the transport, and nothing above the endpoint
         // had to choose: the namespace on the connection id says which one
-        // actually carried it.
+        // actually carried it. Each connection is waited for by name, since
+        // the one before it keeps producing events of its own.
         for (addr, expected) in [
             (&tcp_addr, ConnectionNamespace::TCP_IPV4),
             (&quic_addr, ConnectionNamespace::QUIC_IPV4),
         ] {
             dialer.dial(addr).expect("dial");
-            let event = dialer
-                .next_event(Duration::from_secs(10))
-                .expect("drive dialer");
-            let established = matches!(&event, Some(Event::ConnectionEstablished { peer_id, conn_id })
-                if peer_id == addr.peer_id() && conn_id.namespace() == expected);
-            assert!(
-                established,
-                "{} should have connected over {expected}, got {event:?}",
+            let event = wait_for(
+                &mut dialer,
+                "connection",
+                |event| matches!(event, Event::ConnectionEstablished { peer_id, .. } if peer_id == addr.peer_id()),
+            );
+            let Event::ConnectionEstablished { conn_id, .. } = event else {
+                unreachable!("the predicate matched a connection")
+            };
+            assert_eq!(
+                conn_id.namespace(),
+                expected,
+                "{} should have been carried by {expected}",
                 addr.transport()
             );
         }
-        stop.store(true, Ordering::Relaxed);
-        listener_thread.join().expect("listener driver exits");
+    }
+
+    #[test]
+    fn tcp_limits_and_namespace_reach_the_transport() {
+        let mut endpoint = Endpoint::builder()
+            .tcp_config(TcpConfig {
+                namespace: ConnectionNamespace::TCP_IPV6,
+                ..TcpConfig::default()
+            })
+            .bind_tcp("127.0.0.1:0")
+            .expect("bind tcp endpoint");
+        let target = PeerAddr::new(
+            "/ip4/127.0.0.1/tcp/1".parse().expect("address"),
+            Ed25519Keypair::generate().peer_id(),
+        )
+        .expect("target");
+
+        // The id a dial hands back is minted by the transport, so its
+        // namespace is what the configuration actually reached -- whether
+        // anything answers is beside the point.
+        let ids = endpoint.dial(&target).expect("the dial starts");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].namespace(), ConnectionNamespace::TCP_IPV6);
+    }
+
+    #[test]
+    fn a_tcp_transport_tagged_for_another_carrier_is_refused() {
+        // The namespace routes a connection id back to the transport that
+        // minted it. Tagged as QUIC's, TCP's ids would name the wrong carrier
+        // and take a claim the QUIC member needs.
+        let Err(error) = Endpoint::builder()
+            .tcp_config(TcpConfig {
+                namespace: ConnectionNamespace::QUIC_IPV4,
+                ..TcpConfig::default()
+            })
+            .bind_tcp("127.0.0.1:0")
+        else {
+            panic!("a tcp transport must not claim another transport's ids");
+        };
+        assert!(
+            format!("{error}").contains("must allocate in a tcp namespace"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn a_bind_spec_keeps_every_address_it_named() {
+        let resolved: Vec<std::net::SocketAddr> = vec![
+            "127.0.0.1:4001".parse().expect("v4"),
+            "[::1]:4001".parse().expect("v6"),
+            "127.0.0.1:4001".parse().expect("v4 again"),
+        ];
+
+        // A host that asked to be reachable as a name meant every address that
+        // name answers with; listening on whichever the resolver happened to
+        // put first would leave the rest silently unserved. Repeats are not
+        // extra sockets, though -- binding one twice fails the second time.
+        assert_eq!(
+            tcp_addrs_of(resolved)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["/ip4/127.0.0.1/tcp/4001", "/ip6/::1/tcp/4001"]
+        );
+    }
+
+    #[test]
+    fn a_tcp_multiaddr_binds_and_a_wrong_shape_is_refused() {
+        let mut endpoint = Endpoint::builder()
+            .tcp_multiaddr(&"/ip4/127.0.0.1/tcp/0".parse().expect("address"))
+            .bind()
+            .expect("bind by multiaddr");
+        let addrs = endpoint.listen_all().expect("listen");
+        assert_eq!(
+            addrs[0].transport().to_string(),
+            format!("/ip4/127.0.0.1/tcp/{}", tcp_port(&addrs[0]))
+        );
+
+        // A QUIC address handed to the TCP transport is a mistake worth
+        // reporting, not a socket worth guessing at.
+        let Err(error) = Endpoint::builder()
+            .tcp_multiaddr(&"/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("address"))
+            .bind()
+        else {
+            panic!("a /udp address is not a tcp bind address");
+        };
+        assert!(
+            matches!(&error, Error::Transport(TransportError::InvalidAddress { reason, .. })
+                if reason.contains("not a /tcp transport address")),
+            "got {error:?}"
+        );
     }
 
     #[test]

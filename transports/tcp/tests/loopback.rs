@@ -354,19 +354,35 @@ fn listening_again_on_a_bound_address_is_the_same_listener() {
     let bound = transport
         .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
         .expect("the first listen binds");
+    let mut events = transport.poll(Now::from_millis(0)).expect("poll");
 
     // Hosts bind first and then listen on what they bound -- the swarm's own
     // bind-then-listen does exactly that -- so the second call names a socket
     // this transport already owns. Binding a fresh one there would fail with
     // the address in use, on a request that had already been granted.
-    let again = transport
-        .listen(&bound)
-        .expect("the second listen is a no-op");
-    assert_eq!(again, bound);
+    for _ in 0..3 {
+        transport
+            .listen(&bound)
+            .expect("listening again is not a second listener");
+    }
     assert_eq!(
         transport.local_addresses(),
-        vec![bound],
-        "one request, one listener"
+        vec![bound.clone()],
+        "one address, one listener, however many times it was asked for"
+    );
+
+    // And announced once. Repeating it would have every re-listen add an event
+    // the host has already seen, growing the queue for as long as a caller
+    // keeps asking.
+    events.extend(transport.poll(Now::from_millis(1)).expect("poll"));
+    let announced: Vec<&TransportEvent> = events
+        .iter()
+        .filter(|event| matches!(event, TransportEvent::Listening { .. }))
+        .collect();
+    assert_eq!(
+        announced,
+        vec![&TransportEvent::Listening { addr: bound }],
+        "the address is announced when it is bound, and not again"
     );
 }
 
