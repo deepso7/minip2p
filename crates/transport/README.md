@@ -13,6 +13,17 @@ This crate defines the transport abstraction that concrete adapters implement �
 - Host intents via trait methods: `dial`, `listen`, `open_stream`, `send_stream`, `close_stream_write`, `reset_stream`, `close`.
 - Typed error model with transport, connection, and stream context.
 
+## Running several transports at once
+
+`TransportSet` is a `Transport` that owns several and routes between them, so a host speaks TCP and QUIC at once without the swarm above it knowing there is more than one of anything. It owns no I/O: every decision it makes is a lookup, and both lookups use information the types already carry.
+
+- **Which member dials this address?** `Multiaddr::transport_kind()` says whether an address is `/tcp` or `/udp/quic-v1`, and each member claims one shape.
+- **Which member owns this connection?** `ConnectionId` carries the namespace its allocator stamped, and each member claims the namespaces it allocates in.
+
+Both claims are checked when a member joins, so neither question can have two answers by the time it is asked. A member claims an address *shape* rather than an address family — one TCP transport serves `/ip4` and `/ip6` alike, matching how the adapters are actually built — and a member that splits by family internally, as the dual-stack QUIC transport does, claims both of its namespaces and keeps that split to itself.
+
+Under `std` a member must also implement `BlockingTransport`, so the set can park a driver instead of spinning; since every method of that trait has a default, `impl BlockingTransport for MyTransport {}` is the whole of it.
+
 ## Connection id namespaces
 
 A host can run TCP and QUIC at once, each split per address family, with relay circuits layered on top — and every one of them hands connection ids to the same swarm. `ConnectionId` packs an 8-bit `ConnectionNamespace` alongside a 56-bit sequence number so those id spaces are disjoint by construction: a router can tell which transport an id belongs to just by looking at it, and no transport has to remap another's ids.
