@@ -28,4 +28,4 @@ minip2p-core = { path = "../core", version = "0.3.0", default-features = false }
 minip2p-identity = { path = "../identity", version = "0.3.0", default-features = false }
 thiserror = { version = "2.0.18", default-features = false }
 socket2 = { version = "0.6.5", features = ["all"], optional = true }
-if-addrs = { version = "0.14.0", optional = true }
+if-addrs = { version = "0.15.0", optional = true }
