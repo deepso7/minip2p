@@ -19,8 +19,13 @@ use crate::{
 /// park a driver rather than spin. That costs a member nothing it was not
 /// already paying: every method of that trait has a default, so
 /// `impl BlockingTransport for MyTransport {}` is the whole of it.
+///
+/// `Send` comes with it, for the same reason blocking does: a hosted driver
+/// lives on a thread, and an endpoint that could not be moved onto one would
+/// be useless there. A `no_std` host has no thread to move anything to, so it
+/// asks for neither.
 #[cfg(feature = "std")]
-type BoxedTransport = Box<dyn crate::BlockingTransport>;
+type BoxedTransport = Box<dyn crate::BlockingTransport + Send>;
 #[cfg(not(feature = "std"))]
 type BoxedTransport = Box<dyn Transport>;
 
@@ -351,6 +356,14 @@ impl Transport for TransportSet {
         self.for_id(id)?.close(id)
     }
 
+    fn send_datagram(&mut self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
+        // Routed by shape like a dial: a hole punch has to leave the socket the
+        // connection it is opening will arrive on, so the member that would
+        // dial this address is the only one it can come from.
+        let index = self.index_for_addr(target, "datagram target")?;
+        self.members[index].transport.send_datagram(target, payload)
+    }
+
     fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
         // Events a failing poll held back are delivered before any member is
         // polled again. That bounds what this queue holds to a single round
@@ -545,10 +558,15 @@ mod blocking_set {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::rc::Rc;
     use alloc::string::{String, ToString};
     use alloc::vec;
-    use core::cell::RefCell;
+
+    /// A fake's shared state, held the way its host would have to hold it: a
+    /// `std` member is `Send`, so nothing behind it may be a bare `Rc`.
+    #[cfg(feature = "std")]
+    type Shared = alloc::sync::Arc<std::sync::Mutex<Log>>;
+    #[cfg(not(feature = "std"))]
+    type Shared = alloc::rc::Rc<core::cell::RefCell<Log>>;
 
     /// What a member was asked to do, so routing can be asserted on the member
     /// that actually received the call rather than on a return value that
@@ -583,9 +601,9 @@ mod tests {
         /// The namespace `dial` stamps its ids with, which a test can put out
         /// of step with what the member claimed.
         namespace: ConnectionNamespace,
-        log: Rc<RefCell<Log>>,
-        /// Interrupts this member has been handed and not yet reported.
-        /// Shared with its [`WaitHandle`], so it has to outlive `Rc`.
+        shared: Shared,
+        /// Interrupts this member has been handed and not yet reported. Held
+        /// apart from the log because its [`WaitHandle`] outlives any borrow.
         #[cfg(feature = "std")]
         interrupts: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
     }
@@ -595,31 +613,44 @@ mod tests {
             Self {
                 name,
                 namespace,
-                log: Rc::new(RefCell::new(Log::default())),
+                shared: Shared::new(Log::default().into()),
                 #[cfg(feature = "std")]
                 interrupts: alloc::sync::Arc::default(),
             }
+        }
+
+        /// The shared log, however this build has to reach it.
+        #[cfg(feature = "std")]
+        fn log(&self) -> std::sync::MutexGuard<'_, Log> {
+            self.shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        #[cfg(not(feature = "std"))]
+        fn log(&self) -> core::cell::RefMut<'_, Log> {
+            self.shared.borrow_mut()
         }
 
         /// A member that can park on readiness, and so hands out a real
         /// handle. Set before joining, since joining is when the set takes it.
         #[cfg(feature = "std")]
         fn waking(self) -> Self {
-            self.log.borrow_mut().can_wait = true;
+            self.log().can_wait = true;
             self
         }
 
         fn record(&self, call: &str) {
-            self.log.borrow_mut().calls.push(call.to_string());
+            self.log().calls.push(call.to_string());
         }
 
         fn calls(&self) -> Vec<String> {
-            self.log.borrow().calls.clone()
+            self.log().calls.clone()
         }
 
         #[cfg(feature = "std")]
         fn waits(&self) -> Vec<core::time::Duration> {
-            self.log.borrow().waits.clone()
+            self.log().waits.clone()
         }
 
         /// Interrupts handed to this member and not yet reported.
@@ -682,26 +713,35 @@ mod tests {
             Ok(())
         }
 
+        fn send_datagram(
+            &mut self,
+            _target: &Multiaddr,
+            _payload: &[u8],
+        ) -> Result<(), TransportError> {
+            self.record("send_datagram");
+            Ok(())
+        }
+
         fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {
             self.record("poll");
-            if self.log.borrow().fails_poll {
+            if self.log().fails_poll {
                 return Err(TransportError::PollError {
                     reason: self.name.to_string(),
                 });
             }
-            Ok(core::mem::take(&mut self.log.borrow_mut().events))
+            Ok(core::mem::take(&mut self.log().events))
         }
 
         fn next_deadline(&self) -> Option<Deadline> {
-            self.log.borrow().deadline
+            self.log().deadline
         }
 
         fn local_addresses(&self) -> Vec<Multiaddr> {
-            self.log.borrow().addresses.clone()
+            self.log().addresses.clone()
         }
 
         fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
-            self.log.borrow().inbound.clone()
+            self.log().inbound.clone()
         }
     }
 
@@ -710,7 +750,7 @@ mod tests {
         fn wait_for_input(&mut self, timeout: core::time::Duration) -> crate::WaitOutcome {
             use core::sync::atomic::Ordering;
 
-            self.log.borrow_mut().waits.push(timeout);
+            self.log().waits.push(timeout);
             // An interrupt outranks everything else, as it does in the mio
             // waits the real adapters are built on, and consumes its token.
             if self.interrupts.load(Ordering::SeqCst) > 0 {
@@ -718,7 +758,7 @@ mod tests {
                 return crate::WaitOutcome::Interrupted;
             }
             let (can_wait, ready) = {
-                let log = self.log.borrow();
+                let log = self.log();
                 (log.can_wait, log.ready)
             };
             if !can_wait {
@@ -734,7 +774,7 @@ mod tests {
         }
 
         fn wait_handle(&self) -> crate::WaitHandle {
-            if !self.log.borrow().can_wait {
+            if !self.log().can_wait {
                 return crate::WaitHandle::noop();
             }
             let interrupts = alloc::sync::Arc::clone(&self.interrupts);
@@ -882,6 +922,26 @@ mod tests {
             "a member owns every namespace it claimed, not just the first"
         );
         assert!(tcp.calls().is_empty());
+    }
+
+    #[test]
+    fn a_datagram_leaves_from_the_member_that_would_dial_its_target() {
+        let (mut set, tcp, quic) = duo();
+
+        // A hole punch has to leave the socket the connection it is opening
+        // will arrive on. Sending it from a sibling transport would open a
+        // binding for packets that never come.
+        set.send_datagram(&quic_addr(), b"punch").expect("sent");
+        assert_eq!(quic.calls(), vec!["send_datagram"]);
+        assert!(tcp.calls().is_empty());
+
+        let error = set
+            .send_datagram(&addr("/ip4/127.0.0.1/tcp/4001/p2p-circuit"), b"punch")
+            .expect_err("not a transport address");
+        assert!(
+            matches!(error, TransportError::InvalidAddress { .. }),
+            "got {error:?}"
+        );
     }
 
     #[test]
@@ -1034,8 +1094,8 @@ mod tests {
         let tcp_id = ConnectionId::namespaced(ConnectionNamespace::TCP_IPV4, 1).expect("in range");
         let quic_id =
             ConnectionId::namespaced(ConnectionNamespace::QUIC_IPV4, 1).expect("in range");
-        tcp.log.borrow_mut().events = vec![TransportEvent::Closed { id: tcp_id }];
-        quic.log.borrow_mut().events = vec![TransportEvent::Closed { id: quic_id }];
+        tcp.log().events = vec![TransportEvent::Closed { id: tcp_id }];
+        quic.log().events = vec![TransportEvent::Closed { id: quic_id }];
 
         // Both connections, each exactly once: a count alone would pass on a
         // set that reported one member's event twice and lost the other's.
@@ -1057,8 +1117,8 @@ mod tests {
             ConnectionId::namespaced(ConnectionNamespace::QUIC_IPV4, 1).expect("in range");
         // The failure comes first, so a set that gave up on the first error
         // would never reach the member with something to report.
-        tcp.log.borrow_mut().fails_poll = true;
-        quic.log.borrow_mut().events = vec![TransportEvent::Closed { id: quic_id }];
+        tcp.log().fails_poll = true;
+        quic.log().events = vec![TransportEvent::Closed { id: quic_id }];
 
         let error = set
             .poll(Now::from_millis(0))
@@ -1071,7 +1131,7 @@ mod tests {
 
         // QUIC's connection did nothing wrong. Dropping its events because a
         // sibling transport failed would lose a close nobody could recover.
-        tcp.log.borrow_mut().fails_poll = false;
+        tcp.log().fails_poll = false;
         let events = set.poll(Now::from_millis(0)).expect("the next poll");
         assert_eq!(
             events,
@@ -1085,14 +1145,14 @@ mod tests {
         let (mut set, tcp, quic) = duo();
         let quic_id =
             ConnectionId::namespaced(ConnectionNamespace::QUIC_IPV4, 1).expect("in range");
-        tcp.log.borrow_mut().fails_poll = true;
+        tcp.log().fails_poll = true;
 
         // A transport can stay broken. Holding a healthy member's events until
         // every member succeeds would mean a host never seeing them again, and
         // a queue that only grows.
         let mut delivered = 0;
         for _ in 0..6 {
-            quic.log.borrow_mut().events = vec![TransportEvent::Closed { id: quic_id }];
+            quic.log().events = vec![TransportEvent::Closed { id: quic_id }];
             if let Ok(events) = set.poll(Now::from_millis(0)) {
                 delivered += events.len();
             }
@@ -1107,8 +1167,8 @@ mod tests {
     fn held_back_events_are_due_immediately() {
         let (mut set, tcp, quic) = duo();
         let tcp_id = ConnectionId::namespaced(ConnectionNamespace::TCP_IPV4, 1).expect("in range");
-        tcp.log.borrow_mut().events = vec![TransportEvent::Closed { id: tcp_id }];
-        quic.log.borrow_mut().fails_poll = true;
+        tcp.log().events = vec![TransportEvent::Closed { id: tcp_id }];
+        quic.log().fails_poll = true;
         let _ = set.poll(Now::from_millis(0));
 
         // A host that slept here would sit on an event it has never seen.
@@ -1124,8 +1184,8 @@ mod tests {
         // set owes the host the soonest of them, not whichever member it
         // happens to reach first.
         for (first, second) in [(300, 900), (900, 300)] {
-            tcp.log.borrow_mut().deadline = Some(Deadline::from_millis(first));
-            quic.log.borrow_mut().deadline = Some(Deadline::from_millis(second));
+            tcp.log().deadline = Some(Deadline::from_millis(first));
+            quic.log().deadline = Some(Deadline::from_millis(second));
             assert_eq!(
                 set.next_deadline(),
                 Some(Deadline::from_millis(300)),
@@ -1133,7 +1193,7 @@ mod tests {
             );
         }
 
-        tcp.log.borrow_mut().deadline = None;
+        tcp.log().deadline = None;
         assert_eq!(
             set.next_deadline(),
             Some(Deadline::from_millis(300)),
@@ -1144,15 +1204,15 @@ mod tests {
     #[test]
     fn addresses_are_reported_from_every_member() {
         let (set, tcp, quic) = duo();
-        tcp.log.borrow_mut().addresses = vec![tcp_addr()];
-        quic.log.borrow_mut().addresses = vec![quic_addr()];
+        tcp.log().addresses = vec![tcp_addr()];
+        quic.log().addresses = vec![quic_addr()];
         // Where peers reached us is a different question from where we are
         // bound, and each member answers both. Asking one for the other would
         // advertise an address nothing is listening on.
         let tcp_source = addr("/ip4/198.51.100.7/tcp/4001");
         let quic_source = addr("/ip4/198.51.100.9/udp/4001/quic-v1");
-        tcp.log.borrow_mut().inbound = vec![tcp_source.clone()];
-        quic.log.borrow_mut().inbound = vec![quic_source.clone()];
+        tcp.log().inbound = vec![tcp_source.clone()];
+        quic.log().inbound = vec![quic_source.clone()];
 
         // A host announces where it can be reached; leaving out a transport
         // would make half of those ways invisible to peers.
@@ -1179,7 +1239,7 @@ mod tests {
         #[test]
         fn input_on_any_member_is_reported_before_blocking_on_another() {
             let (mut set, tcp, quic) = waking_duo();
-            quic.log.borrow_mut().ready = true;
+            quic.log().ready = true;
 
             let started = std::time::Instant::now();
             assert_eq!(
@@ -1251,6 +1311,17 @@ mod tests {
                 0,
                 "and the set still answers that interrupt exactly once"
             );
+        }
+
+        #[test]
+        fn a_set_goes_where_its_driver_goes() {
+            let (set, ..) = waking_duo();
+
+            // A hosted driver runs on a thread, and applications move an
+            // endpoint onto one. A member that could not come along would make
+            // the whole set unusable there -- which is a compile error here,
+            // not a runtime one.
+            std::thread::spawn(move || drop(set)).join().expect("moved");
         }
 
         #[test]

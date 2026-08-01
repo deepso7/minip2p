@@ -177,7 +177,7 @@ impl NatDriver {
             } => {
                 let mut payload = vec![0u8; payload_len];
                 if getrandom::fill(&mut payload).is_ok() {
-                    let _ = swarm.transport().inner().send_raw_udp(&target, &payload);
+                    let _ = swarm.transport_mut().send_datagram(&target, &payload);
                 }
             }
             NatAction::PromoteBridge {

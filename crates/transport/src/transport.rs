@@ -168,4 +168,102 @@ pub trait Transport {
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
         Vec::new()
     }
+
+    /// Sends one datagram to `target` outside any connection.
+    ///
+    /// This exists for hole punching: DCUtR's simultaneous open needs packets
+    /// that leave the socket a later connection will arrive on, before any
+    /// connection exists to carry them. Nothing is delivered reliably, nothing
+    /// is acknowledged, and no event reports the outcome.
+    ///
+    /// Default implementation returns
+    /// [`TransportError::Unsupported`], which is the honest answer for a
+    /// transport with no connectionless send of its own -- a stream transport
+    /// has nowhere to put a lone packet. Callers should treat it as "this path
+    /// is not available here" rather than as a failure.
+    fn send_datagram(&mut self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
+        let _ = (target, payload);
+        Err(TransportError::Unsupported {
+            operation: "send_datagram",
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    /// A transport that implements only what the contract requires, so the
+    /// defaults are what answers for everything else.
+    struct Minimal;
+
+    impl Transport for Minimal {
+        fn dial(&mut self, _addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+            unimplemented!("not reached: this fake exists to exercise the defaults")
+        }
+
+        fn listen(&mut self, _addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
+            unimplemented!()
+        }
+
+        fn open_stream(&mut self, _id: ConnectionId) -> Result<StreamId, TransportError> {
+            unimplemented!()
+        }
+
+        fn send_stream(
+            &mut self,
+            _id: ConnectionId,
+            _stream_id: StreamId,
+            _data: Vec<u8>,
+        ) -> Result<(), TransportError> {
+            unimplemented!()
+        }
+
+        fn close_stream_write(
+            &mut self,
+            _id: ConnectionId,
+            _stream_id: StreamId,
+        ) -> Result<(), TransportError> {
+            unimplemented!()
+        }
+
+        fn reset_stream(
+            &mut self,
+            _id: ConnectionId,
+            _stream_id: StreamId,
+        ) -> Result<(), TransportError> {
+            unimplemented!()
+        }
+
+        fn close(&mut self, _id: ConnectionId) -> Result<(), TransportError> {
+            unimplemented!()
+        }
+
+        fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_transport_with_no_datagram_of_its_own_says_so() {
+        let target: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().expect("address");
+
+        // "Not available here" rather than "this failed": a caller choosing
+        // between transports has to be able to tell those apart, and a stream
+        // transport has nowhere to put a lone packet.
+        let error = Minimal
+            .send_datagram(&target, b"punch")
+            .expect_err("no datagram here");
+        assert_eq!(
+            error,
+            TransportError::Unsupported {
+                operation: "send_datagram"
+            }
+        );
+        assert!(Minimal.local_addresses().is_empty());
+        assert!(Minimal.active_inbound_connection_sources().is_empty());
+        assert_eq!(Minimal.next_deadline(), None);
+        assert_eq!(Minimal.poll(Now::from_millis(0)), Ok(vec![]));
+    }
 }

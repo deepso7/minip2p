@@ -19,6 +19,7 @@
 //! state. Cargo features expose these APIs; the corresponding builder methods
 //! activate their drivers.
 
+mod dial;
 #[cfg(any(feature = "discovery", feature = "mdns"))]
 mod discovery;
 #[cfg(feature = "mdns")]
@@ -30,7 +31,7 @@ mod pubsub;
 
 #[cfg(any(feature = "discovery", feature = "mdns"))]
 pub use discovery::DiscoveryError;
-pub use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
+pub use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol, TransportKind};
 #[cfg(feature = "discovery")]
 pub use minip2p_discovery::{BeaconConfig, DISCOVERY_TOPIC};
 #[cfg(any(feature = "discovery", feature = "mdns"))]
@@ -59,7 +60,7 @@ pub use minip2p_swarm::{
     Deadline, DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, RUN_UNTIL_SKIP_LIMIT, Swarm,
     SwarmError, SwarmEvent as Event,
 };
-pub use minip2p_transport::{ConnectionId, StreamId, TransportError, WaitHandle};
+pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet, WaitHandle};
 #[cfg(feature = "pubsub")]
 pub use pubsub::PubsubError;
 
@@ -67,13 +68,18 @@ const DEFAULT_AGENT_VERSION: &str = "minip2p/0.1.0";
 
 /// Transport used by [`Endpoint`]. With NAT enabled, relay bridges are
 /// promoted into ordinary Noise/Yamux connections by `CircuitTransport`.
+///
+/// The endpoint always holds a [`TransportSet`], even with one member in it:
+/// what an address is dialed over is then a routing decision the set makes
+/// from the address itself, and adding a second transport changes nothing
+/// above this line.
 #[cfg(feature = "nat")]
 pub type EndpointTransport =
-    minip2p_circuit::CircuitTransport<QuicEndpoint, minip2p_platform::StdEntropy>;
+    minip2p_circuit::CircuitTransport<TransportSet, minip2p_platform::StdEntropy>;
 
 /// Transport used by [`Endpoint`] when NAT traversal is not compiled in.
 #[cfg(not(feature = "nat"))]
-pub type EndpointTransport = QuicEndpoint;
+pub type EndpointTransport = TransportSet;
 
 /// Concrete swarm type owned by [`Endpoint`].
 pub type EndpointSwarm = Swarm<EndpointTransport>;
@@ -233,21 +239,57 @@ impl Endpoint {
 
     /// Dials a remote peer on every applicable local address family.
     ///
-    /// For dual-stack endpoints, `/dns` targets are resolved and both IPv4 and
-    /// IPv6 dials are started when both families are available. Use
+    /// `/dns` targets are resolved first, and a name that answers with both
+    /// families is dialed over both. The address shape decides which transport
+    /// carries each dial, so a `/tcp` target goes to TCP and a
+    /// `/udp/quic-v1` one to QUIC without the caller choosing. Use
     /// [`Endpoint::dial_ip4`] or [`Endpoint::dial_ip6`] to force one family.
+    ///
+    /// Fails only if every address failed; the returned ids are the dials that
+    /// started.
     pub fn dial(&mut self, addr: &PeerAddr) -> Result<Vec<ConnectionId>, Error> {
-        Ok(self.quic_mut().dial_all(addr)?)
+        let targets = dial::targets(addr)?;
+        let mut ids = Vec::with_capacity(targets.len());
+        let mut failure = None;
+        for (_, target) in targets {
+            match self.swarm.dial(&target) {
+                Ok(id) => ids.push(id),
+                // One family being unreachable is not the dial failing: the
+                // other may still connect, and reporting the first error would
+                // hide a path that worked.
+                Err(error) => failure = failure.or(Some(error)),
+            }
+        }
+        match failure {
+            Some(error) if ids.is_empty() => Err(error),
+            _ => Ok(ids),
+        }
     }
 
     /// Dials a remote peer using IPv4.
     pub fn dial_ip4(&mut self, addr: &PeerAddr) -> Result<ConnectionId, Error> {
-        Ok(self.quic_mut().dial_ip4(addr)?)
+        self.dial_family(addr, dial::Family::V4)
     }
 
     /// Dials a remote peer using IPv6.
     pub fn dial_ip6(&mut self, addr: &PeerAddr) -> Result<ConnectionId, Error> {
-        Ok(self.quic_mut().dial_ip6(addr)?)
+        self.dial_family(addr, dial::Family::V6)
+    }
+
+    fn dial_family(
+        &mut self,
+        addr: &PeerAddr,
+        family: dial::Family,
+    ) -> Result<ConnectionId, Error> {
+        let target = dial::targets(addr)?
+            .into_iter()
+            .find(|(candidate, _)| *candidate == family)
+            .map(|(_, target)| target)
+            .ok_or_else(|| TransportError::InvalidAddress {
+                context: "dial target",
+                reason: format!("{} names no {family:?} address", addr.transport()),
+            })?;
+        self.swarm.dial(&target)
     }
 
     /// Sends a ping to `peer_id`.
@@ -1090,16 +1132,6 @@ impl Endpoint {
         }
         result
     }
-
-    #[cfg(feature = "nat")]
-    fn quic_mut(&mut self) -> &mut QuicEndpoint {
-        self.swarm.transport_mut().inner_mut()
-    }
-
-    #[cfg(not(feature = "nat"))]
-    fn quic_mut(&mut self) -> &mut QuicEndpoint {
-        self.swarm.transport_mut()
-    }
 }
 
 #[cfg(feature = "mdns")]
@@ -1334,28 +1366,22 @@ impl EndpointBuilder {
     /// Builds an endpoint with a QUIC transport bound to `bind_addr`.
     pub fn bind_quic(self, bind_addr: impl AsRef<str>) -> Result<Endpoint, Error> {
         let parts = self.into_parts()?;
-        let config =
-            QuicNodeConfig::new(parts.keypair.clone()).with_limits(parts.quic_limits.clone());
-        let transport = QuicEndpoint::bind(config, bind_addr.as_ref())?;
-        build_endpoint(parts, transport)
+        let transport = QuicEndpoint::bind(quic_config(&parts), bind_addr.as_ref())?;
+        build_endpoint(parts, quic_set(transport)?)
     }
 
     /// Builds an endpoint with a QUIC transport bound to a QUIC multiaddr.
     pub fn bind_quic_multiaddr(self, addr: &Multiaddr) -> Result<Endpoint, Error> {
         let parts = self.into_parts()?;
-        let config =
-            QuicNodeConfig::new(parts.keypair.clone()).with_limits(parts.quic_limits.clone());
-        let transport = QuicEndpoint::bind_multiaddr(config, addr)?;
-        build_endpoint(parts, transport)
+        let transport = QuicEndpoint::bind_multiaddr(quic_config(&parts), addr)?;
+        build_endpoint(parts, quic_set(transport)?)
     }
 
     /// Builds an endpoint with separate IPv4 and IPv6 wildcard QUIC sockets.
     pub fn bind_quic_dual_stack(self) -> Result<Endpoint, Error> {
         let parts = self.into_parts()?;
-        let config =
-            QuicNodeConfig::new(parts.keypair.clone()).with_limits(parts.quic_limits.clone());
-        let transport = QuicEndpoint::dual_stack(config)?;
-        build_endpoint(parts, transport)
+        let transport = QuicEndpoint::dual_stack(quic_config(&parts))?;
+        build_endpoint(parts, quic_set(transport)?)
     }
 
     /// Validates the static configuration and decomposes the builder.
@@ -1433,7 +1459,26 @@ impl EndpointBuilder {
     }
 }
 
-fn build_endpoint(parts: BuilderParts, transport: QuicEndpoint) -> Result<Endpoint, Error> {
+fn quic_config(parts: &BuilderParts) -> QuicNodeConfig {
+    QuicNodeConfig::new(parts.keypair.clone()).with_limits(parts.quic_limits.clone())
+}
+
+/// Puts a bound QUIC endpoint behind the set the endpoint drives.
+///
+/// The namespaces come from the endpoint itself -- one socket mints ids in the
+/// family it bound, a dual-stack pair in both -- so the claim cannot drift from
+/// what the transport actually allocates.
+fn quic_set(transport: QuicEndpoint) -> Result<TransportSet, Error> {
+    let mut set = TransportSet::new();
+    let namespaces = transport.namespaces();
+    set.insert(TransportKind::Quic, namespaces, Box::new(transport))
+        .map_err(|rejected| TransportError::InvalidConfig {
+            reason: rejected.error().to_string(),
+        })?;
+    Ok(set)
+}
+
+fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoint, Error> {
     let mut builder = SwarmBuilder::new(&parts.keypair).agent_version(parts.agent_version);
     #[cfg(any(feature = "nat", feature = "pubsub"))]
     let mut protocols = parts.protocols;
@@ -1629,6 +1674,69 @@ mod tests {
             Endpoint::builder().discovery_config(config),
             Err(DiscoveryConfigError::ZeroBeaconInterval)
         ));
+    }
+
+    #[test]
+    fn an_address_no_bound_transport_serves_is_refused_by_name() {
+        let mut endpoint = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind loopback endpoint");
+        let target = PeerAddr::new(
+            "/ip4/127.0.0.1/tcp/4001".parse().expect("address"),
+            Ed25519Keypair::generate().peer_id(),
+        )
+        .expect("target");
+
+        // A QUIC-only endpoint has no business guessing a transport for a
+        // /tcp address, and the error has to say which is missing rather than
+        // read as "that host refused you".
+        let error = endpoint
+            .dial(&target)
+            .expect_err("nothing serves /tcp here");
+        assert!(
+            format!("{error}").contains("Tcp"),
+            "the error should name the missing transport, got {error}"
+        );
+    }
+
+    #[test]
+    fn a_dial_reaches_a_peer_on_the_transport_its_address_names() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut listener = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind listener");
+        let listen_addr = listener.listen().expect("listen");
+        let mut dialer = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind dialer");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let listener_stop = Arc::clone(&stop);
+        let listener_thread = std::thread::spawn(move || {
+            while !listener_stop.load(Ordering::Relaxed) {
+                listener
+                    .next_event(Duration::from_millis(20))
+                    .expect("drive listener");
+            }
+        });
+
+        // Routing the dial through a set, and resolving families above it,
+        // must leave an ordinary dial doing exactly what it did.
+        let ids = dialer.dial(&listen_addr).expect("dial");
+        assert_eq!(ids.len(), 1, "one address, one dial: {ids:?}");
+        let connected = dialer
+            .next_event(Duration::from_secs(5))
+            .expect("drive dialer");
+        stop.store(true, Ordering::Relaxed);
+        listener_thread.join().expect("listener driver exits");
+
+        assert!(
+            matches!(&connected, Some(Event::ConnectionEstablished { peer_id, .. })
+                if peer_id == listen_addr.peer_id()),
+            "got {connected:?}"
+        );
     }
 
     #[test]

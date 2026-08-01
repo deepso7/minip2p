@@ -845,6 +845,12 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
         self.inner.active_inbound_connection_sources()
     }
+
+    /// Forwards to the wrapped transport, which owns the socket a hole punch
+    /// has to leave from. A circuit has no datagram of its own to send.
+    fn send_datagram(&mut self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
+        self.inner.send_datagram(target, payload)
+    }
 }
 
 #[cfg(feature = "std")]

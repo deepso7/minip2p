@@ -24,7 +24,7 @@ Both claims are checked when a member joins, so neither question can have two an
 
 A member that fails a `poll` does not cost its siblings the events they produced in the same round — those are delivered by the next `poll`, before any member is driven again, so a transport that stays broken cannot bury a healthy one's events or grow a queue behind itself.
 
-Under `std` a member must also implement `BlockingTransport`, so the set can park a driver instead of spinning; since every method of that trait has a default, `impl BlockingTransport for MyTransport {}` is the whole of it. The set alternates short readiness waits across the members that can park — a member that reports `Unsupported` is probed once and then left out of the budget — and its `WaitHandle` wakes all of them, reading the member list when it fires rather than when it was taken, so a handle survives a member joining later. One `interrupt` is worth one `Interrupted`: the members that lost the race are drained before the set answers, so a single wake cannot come back several times over.
+Under `std` a member must also implement `BlockingTransport` and be `Send`, so the set can park a driver instead of spinning and a host can move an endpoint onto the thread that drives it; since every method of that trait has a default, `impl BlockingTransport for MyTransport {}` is the whole of the first part. The set alternates short readiness waits across the members that can park — a member that reports `Unsupported` is probed once and then left out of the budget — and its `WaitHandle` wakes all of them, reading the member list when it fires rather than when it was taken, so a handle survives a member joining later. One `interrupt` is worth one `Interrupted`: the members that lost the race are drained before the set answers, so a single wake cannot come back several times over.
 
 ## Connection id namespaces
 
@@ -106,6 +106,13 @@ impl Transport for MyTransport {
     }
 }
 ```
+
+`send_datagram` is the one method most adapters should leave alone. It sends a
+single packet outside any connection, which is what DCUtR's simultaneous open
+needs before a connection exists to carry one, and the default answer is
+`TransportError::Unsupported` — the honest one for a stream transport, which has
+nowhere to put a lone packet. Callers read that as "not available here" rather
+than as a failed send.
 
 ## Time
 

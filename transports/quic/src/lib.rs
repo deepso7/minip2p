@@ -651,6 +651,22 @@ impl QuicEndpoint {
     pub fn wait_handle(&self) -> WaitHandle {
         BlockingTransport::wait_handle(self)
     }
+
+    /// The [`ConnectionNamespace`]s this endpoint allocates connection ids in.
+    ///
+    /// One socket mints ids in the namespace of the family it is bound to; a
+    /// dual-stack pair mints in both and keeps the split to itself. A host
+    /// routing several transports needs this to say which ids are QUIC's --
+    /// see `minip2p_transport::TransportSet`.
+    pub fn namespaces(&self) -> Vec<ConnectionNamespace> {
+        match self {
+            Self::Single(transport) => vec![transport.namespace()],
+            Self::Dual(_) => vec![
+                ConnectionNamespace::QUIC_IPV4,
+                ConnectionNamespace::QUIC_IPV6,
+            ],
+        }
+    }
 }
 
 fn single_dial_family(
@@ -870,6 +886,12 @@ impl QuicTransport {
                 reason: format!("raw udp send to {addr} failed: {e}"),
             })?;
         Ok(())
+    }
+
+    /// The namespace this socket's connection ids carry, fixed by the family
+    /// it is bound to.
+    pub fn namespace(&self) -> ConnectionNamespace {
+        self.connection_ids.namespace()
     }
 
     /// Exposes the bound local socket address as a multiaddr for external use.
@@ -1229,6 +1251,12 @@ impl Transport for QuicTransport {
             .filter(|conn| conn.is_server())
             .map(|conn| conn.endpoint().transport().clone())
             .collect()
+    }
+
+    fn send_datagram(&mut self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
+        // The socket a hole punch has to leave from is this one: the binding it
+        // opens is only useful for QUIC packets arriving back on it.
+        self.send_raw_udp(target, payload)
     }
 
     fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
@@ -1635,6 +1663,10 @@ impl Transport for QuicEndpoint {
             Self::Dual(transport) => transport.active_inbound_connection_sources(),
         }
     }
+
+    fn send_datagram(&mut self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
+        self.send_raw_udp(target, payload)
+    }
 }
 
 impl BlockingTransport for QuicEndpoint {
@@ -1740,6 +1772,10 @@ impl Transport for DualQuicTransport {
         let mut addrs = self.ipv4.active_inbound_connection_sources();
         addrs.extend(self.ipv6.active_inbound_connection_sources());
         addrs
+    }
+
+    fn send_datagram(&mut self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
+        self.send_raw_udp(target, payload)
     }
 }
 
