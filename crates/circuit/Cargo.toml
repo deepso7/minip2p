@@ -16,7 +16,6 @@ workspace = true
 [features]
 default = ["std"]
 std = [
-    "dep:getrandom",
     "minip2p-core/std",
     "minip2p-identity/std",
     "minip2p-platform/std",
@@ -26,7 +25,6 @@ std = [
 ]
 
 [dependencies]
-getrandom = { version = "0.4.3", default-features = false, optional = true }
 minip2p-core = { path = "../core", version = "0.3.1", default-features = false }
 minip2p-identity = { path = "../identity", version = "0.3.1", default-features = false, features = ["ed25519"] }
 minip2p-platform = { path = "../platform", version = "0.3.1", default-features = false }
@@ -39,4 +37,7 @@ thiserror = { version = "2.0.18", default-features = false }
 # bridge, which the transport itself no longer touches directly.
 minip2p-multistream-select = { path = "../multistream-select" }
 minip2p-noise = { path = "../noise" }
+# Proves one `EntropySource` adapter drives both transports; see
+# `tests/shared_entropy.rs`.
+minip2p-tcp = { path = "../../transports/tcp" }
 minip2p-test-support = { path = "../test-support" }

@@ -2,7 +2,7 @@
 
 Sans-IO transport trait and connection/stream types for minip2p. `no_std` + `alloc` compatible.
 
-This crate defines the transport abstraction that concrete adapters (QUIC, WebSocket, etc.) implement. It contains no runtime or networking code.
+This crate defines the transport abstraction that concrete adapters implement — TCP and QUIC today, anything ordered and multiplexed in principle. It contains no runtime or networking code.
 
 ## Features
 
@@ -132,4 +132,4 @@ minip2p-transport = { path = "crates/transport", default-features = false }
 
 ## Scope
 
-This crate defines the transport contract only. Concrete runtime adapters live in separate crates (e.g. `minip2p-quic`).
+This crate defines the transport contract only. Concrete adapters live in separate crates: `minip2p-tcp` (`no_std + alloc`, over a pluggable byte-stream provider) and `minip2p-quic` (`std`-only, quiche-based).

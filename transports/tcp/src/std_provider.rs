@@ -151,11 +151,19 @@ struct Socket {
 
 /// A [`TcpProvider`] over operating-system sockets, driven by `mio`.
 ///
-/// Non-blocking throughout: [`poll`](TcpProvider::poll) services whatever is
-/// ready and returns, and [`BlockingTcpProvider::wait_for_input`] is the only
-/// call that ever blocks. Readiness is edge-triggered, so every socket is read
-/// and written until it reports `WouldBlock` -- anything less would leave bytes
+/// Non-blocking on the drive path: [`poll`](TcpProvider::poll),
+/// [`send`](TcpProvider::send), [`close_write`](TcpProvider::close_write), and
+/// [`abort`](TcpProvider::abort) service whatever is ready and return, so
+/// [`BlockingTcpProvider::wait_for_input`] is the only call a driven loop makes
+/// that ever blocks. Readiness is edge-triggered, so every socket is read and
+/// written until it reports `WouldBlock` -- anything less would leave bytes
 /// sitting in a kernel buffer with no further notification coming.
+///
+/// The exception is [`connect`](TcpProvider::connect) to a `/dns*` address,
+/// which blocks for the name lookup before the connect starts; see
+/// [Names](#names). Dialing an `/ip4` or `/ip6` address never blocks, and the
+/// connect itself is asynchronous either way -- it completes on a later
+/// [`poll`](TcpProvider::poll) as [`TcpEvent::Connected`].
 ///
 /// # Names
 ///
@@ -183,6 +191,11 @@ pub struct StdTcpProvider {
     /// not seen. Readiness alone will not report it again, so a wait must not
     /// park on it.
     deferred_work: bool,
+    /// Which listener leads the next round of accepts.
+    ///
+    /// Rotating the start is what keeps a flooded listener from starving the
+    /// ones after it; see [`accept_all`](Self::accept_all).
+    accept_cursor: usize,
 }
 
 impl StdTcpProvider {
@@ -204,6 +217,7 @@ impl StdTcpProvider {
             read_buffer: vec![0; READ_CHUNK],
             pending_interrupt: false,
             deferred_work: false,
+            accept_cursor: 0,
         })
     }
 
@@ -303,25 +317,40 @@ impl StdTcpProvider {
     }
 
     /// Accepts what each listener has queued, up to this poll's budget.
+    ///
+    /// Listeners are visited round-robin from a cursor that advances every
+    /// poll. Walking them in `BTreeMap` order instead would let a sustained
+    /// flood on the lowest-token listener spend the whole budget every time
+    /// and starve every later bind indefinitely; rotating the start costs one
+    /// index and guarantees each listener leads a poll in turn.
     fn accept_all(&mut self) {
         let tokens: Vec<usize> = self.listeners.keys().copied().collect();
+        if tokens.is_empty() {
+            return;
+        }
+        let start = self.accept_cursor % tokens.len();
+        // Whoever led this poll goes last in the next one.
+        self.accept_cursor = start.wrapping_add(1);
+
         let mut budget = MAX_ACCEPTS_PER_POLL;
-        for token in tokens {
-            while let Some(accepted) = self
-                .listeners
-                .get(&token)
-                .map(|listener| listener.listener.accept())
-            {
+        for offset in 0..tokens.len() {
+            let token = tokens[(start + offset) % tokens.len()];
+            loop {
                 if budget == 0 {
                     // A flood must not hold the poll open; the backlog keeps
                     // until the next one, which a wait is told not to sleep
-                    // through.
+                    // through. Checked before `accept`, because a connection
+                    // taken off the kernel's queue and then dropped is that
+                    // peer's connection killed rather than deferred.
                     self.deferred_work = true;
                     return;
                 }
-                budget -= 1;
-                match accepted {
+                let Some(listener) = self.listeners.get(&token) else {
+                    break;
+                };
+                match listener.listener.accept() {
                     Ok((stream, peer)) => {
+                        budget -= 1;
                         if let Err(error) = self.adopt(stream, socket_addr_to_multiaddr(peer)) {
                             // Nothing names this stream yet, so there is no
                             // handle to report the failure against; dropping it
@@ -330,7 +359,12 @@ impl StdTcpProvider {
                         }
                     }
                     Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {
+                        // Charged even though nothing was accepted, so a storm
+                        // of signals cannot hold the poll open either.
+                        budget -= 1;
+                        continue;
+                    }
                     // One bad accept must not take the listener down; the next
                     // poll tries again.
                     Err(_) => break,

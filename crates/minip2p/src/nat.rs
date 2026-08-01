@@ -80,7 +80,7 @@ impl NatDriver {
             SwarmEvent::ConnectionEstablished { conn_id, .. }
             | SwarmEvent::ConnectionClosed { conn_id, .. } => CircuitTransport::<
                 minip2p_quic::QuicEndpoint,
-                minip2p_circuit::OsEntropy,
+                minip2p_platform::StdEntropy,
             >::is_circuit(*conn_id),
             _ => false,
         };

@@ -9,6 +9,11 @@
 //! Wrapped transport connection IDs pass through unchanged; circuit IDs are
 //! allocated in [`ConnectionNamespace::CIRCUIT`], which keeps them disjoint
 //! from every base transport's ids.
+//!
+//! Fresh Noise key material comes from a [`minip2p_platform::EntropySource`]
+//! the host injects — the same seam every other minip2p transport draws from,
+//! so one adapter over a board's RNG serves a circuit transport and a TCP
+//! transport at once.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
@@ -23,7 +28,9 @@ use alloc::vec::Vec;
 
 use minip2p_core::{Multiaddr, Protocol};
 use minip2p_identity::{Ed25519Keypair, PeerId};
-use minip2p_platform::{Deadline, Now};
+#[cfg(feature = "std")]
+use minip2p_platform::StdEntropy;
+use minip2p_platform::{Deadline, EntropyError, EntropySource, Now};
 use minip2p_secure_mux::{
     SecureMuxSession, SessionConfig, SessionError, SessionOutput, SessionRole, YamuxConfig,
 };
@@ -37,39 +44,6 @@ use thiserror::Error;
 // public `Closed`. Keep this finite because a peer may never finish closing
 // its half of a gracefully closed bridge.
 const MAX_RETIRED_BRIDGES: usize = 1024;
-
-/// Supplies fresh cryptographic entropy for one circuit adoption.
-pub trait EntropySource {
-    /// Fills `destination` with unpredictable bytes.
-    fn fill(&mut self, destination: &mut [u8]) -> Result<(), EntropyError>;
-}
-
-/// Failure to obtain cryptographic entropy.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[error("entropy source failed: {0}")]
-pub struct EntropyError(&'static str);
-
-impl EntropyError {
-    /// Creates an entropy failure with a static description.
-    ///
-    /// This is the only way for external [`EntropySource`] implementations
-    /// to construct the trait's error type.
-    pub fn new(reason: &'static str) -> Self {
-        Self(reason)
-    }
-}
-
-/// Entropy source backed by the operating system.
-#[cfg(feature = "std")]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct OsEntropy;
-
-#[cfg(feature = "std")]
-impl EntropySource for OsEntropy {
-    fn fill(&mut self, destination: &mut [u8]) -> Result<(), EntropyError> {
-        getrandom::fill(destination).map_err(|_| EntropyError::new("OS randomness unavailable"))
-    }
-}
 
 /// Which endpoint initiated the relayed connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -287,8 +261,8 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
 
         let mut static_secret = [0u8; 32];
         let mut ephemeral_secret = [0u8; 32];
-        self.entropy.fill(&mut static_secret)?;
-        self.entropy.fill(&mut ephemeral_secret)?;
+        self.entropy.fill_bytes(&mut static_secret)?;
+        self.entropy.fill_bytes(&mut ephemeral_secret)?;
 
         let session = SecureMuxSession::new(SessionConfig {
             role: match adoption.role {
@@ -912,10 +886,10 @@ fn stream_error(
 }
 
 #[cfg(feature = "std")]
-impl<T> CircuitTransport<T, OsEntropy> {
+impl<T> CircuitTransport<T, StdEntropy> {
     /// Wraps a transport using operating-system entropy.
     pub fn new_os(inner: T, identity: Ed25519Keypair) -> Self {
-        Self::new(inner, identity, OsEntropy)
+        Self::new(inner, identity, StdEntropy::new())
     }
 }
 
@@ -933,9 +907,9 @@ mod tests {
     struct CounterEntropy(u8);
 
     impl EntropySource for CounterEntropy {
-        fn fill(&mut self, destination: &mut [u8]) -> Result<(), EntropyError> {
+        fn fill_bytes(&mut self, output: &mut [u8]) -> Result<(), EntropyError> {
             self.0 = self.0.wrapping_add(1);
-            destination.fill(self.0);
+            output.fill(self.0);
             Ok(())
         }
     }
@@ -943,8 +917,8 @@ mod tests {
     struct FailingEntropy;
 
     impl EntropySource for FailingEntropy {
-        fn fill(&mut self, _destination: &mut [u8]) -> Result<(), EntropyError> {
-            Err(EntropyError::new("injected failure"))
+        fn fill_bytes(&mut self, _output: &mut [u8]) -> Result<(), EntropyError> {
+            Err(EntropyError::failed("injected failure"))
         }
     }
 

@@ -5,8 +5,12 @@
 //! transport implementation.
 
 use minip2p_core::{PeerAddr, Protocol};
+use minip2p_platform::Now;
 use minip2p_quic::{QuicEndpoint, QuicLimits, QuicNodeConfig, QuicTransport};
-use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, TransportEvent};
+use minip2p_transport::{
+    BlockingTransport, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
+    WaitOutcome,
+};
 
 mod common;
 use common::{drive_pair_once, setup_pair};
@@ -635,6 +639,75 @@ fn send_on_unknown_connection_returns_not_found() {
         .send_stream(ConnectionId::new(999), 0.into(), b"data".to_vec())
         .expect_err("must fail");
     assert!(matches!(err, TransportError::ConnectionNotFound { .. }));
+}
+
+/// Events queued between polls must present as work: a host that calls
+/// `listen` and then consults the transport before its first `poll` has to be
+/// told to come back, or the `Listening` event sits undelivered until some
+/// unrelated packet happens to wake the driver.
+#[test]
+fn events_buffered_outside_poll_report_as_due_work() {
+    let mut transport =
+        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+    transport.listen_on_bound_addr().expect("listen");
+
+    // No time sample has been taken (no `poll` yet) and no datagram is
+    // queued, so the buffered event is the only thing that can answer here.
+    let deadline = transport
+        .next_deadline()
+        .expect("a queued event must arm a deadline before the first poll");
+    assert!(
+        deadline.is_expired_at(Now::from_millis(0)),
+        "a buffered event is due on any timeline, got {deadline:?}"
+    );
+    assert_eq!(
+        transport.wait_for_input(std::time::Duration::ZERO),
+        WaitOutcome::Ready,
+        "wait_for_input must not park while an event is buffered"
+    );
+
+    // And the event really is there to collect.
+    let events = transport.poll(common::now()).expect("poll");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Listening { .. })),
+        "the promised work must be the buffered Listening event: {events:?}"
+    );
+
+    // Once drained, the idle transport goes back to reporting no work.
+    assert_eq!(
+        transport.wait_for_input(std::time::Duration::ZERO),
+        WaitOutcome::TimedOut,
+        "a drained, idle transport must be free to park"
+    );
+}
+
+/// The dual-stack endpoint does not delegate to the per-family
+/// `wait_for_input`, so it needs the same guarantee wired up separately.
+#[test]
+fn dual_stack_endpoint_reports_buffered_events_as_due_work() {
+    let mut endpoint =
+        QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("dual stack bind");
+    let listen_addr = endpoint
+        .local_addresses()
+        .into_iter()
+        .next()
+        .expect("bound address");
+    endpoint.listen(&listen_addr).expect("listen");
+
+    let deadline = endpoint
+        .next_deadline()
+        .expect("a queued event must arm a deadline before the first poll");
+    assert!(
+        deadline.is_expired_at(Now::from_millis(0)),
+        "a buffered event is due on any timeline, got {deadline:?}"
+    );
+    assert_eq!(
+        endpoint.wait_for_input(std::time::Duration::ZERO),
+        WaitOutcome::Ready,
+        "wait_for_input must not park while either family has an event buffered"
+    );
 }
 
 #[test]

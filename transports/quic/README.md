@@ -23,7 +23,10 @@ No async runtime required. The host drives the transport by calling `poll(now)` 
 - QUIC deadlines are exposed through `Transport::next_deadline()` and processed
   by `poll()`; no async runtime or hidden timer thread is used. Idle drivers
   block on `BlockingTransport::wait_for_input()` (a readiness peek on the UDP socket)
-  instead of polling on a fixed cadence.
+  instead of polling on a fixed cadence. Both report immediately-due work when
+  events are already buffered, so calls made between polls -- `listen`,
+  `open_stream`, and the stream operations -- never leave a host asleep on an
+  undelivered event.
 - Stateless Retry authenticates source addresses before inbound connection
   allocation. Configurable limits bound connections, streams, queued stream
   bytes, queued UDP datagrams, and idle time.

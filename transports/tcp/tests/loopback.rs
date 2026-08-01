@@ -534,7 +534,7 @@ fn queued_events_are_never_slept_through() {
 mod provider {
     use super::*;
     use minip2p_tcp::{BlockingTcpProvider, SocketHandle, TcpError, TcpEvent, TcpProvider};
-    use std::io::Write;
+    use std::io::{Read, Write};
 
     /// Polls both providers until `found` matches, collecting everything seen.
     fn pump_until(
@@ -856,6 +856,242 @@ mod provider {
             "a backlog held back by the budget must not be slept through"
         );
         drop(peers);
+    }
+
+    /// The port of a bound `/ipX/tcp/port` address.
+    fn port_of(addr: &Multiaddr) -> u16 {
+        addr.to_string()
+            .rsplit('/')
+            .next()
+            .expect("port")
+            .parse()
+            .expect("a numeric port")
+    }
+
+    /// Counts the connections one poll accepted.
+    fn accepted_in(provider: &mut StdTcpProvider) -> usize {
+        provider
+            .poll(Now::from_millis(0))
+            .expect("poll")
+            .iter()
+            .filter(|event| matches!(event, TcpEvent::Accepted { .. }))
+            .count()
+    }
+
+    /// Whether the far side has closed this connection.
+    ///
+    /// The server under test never writes, so anything other than `WouldBlock`
+    /// means the connection ended rather than that bytes arrived.
+    fn peer_saw_the_end(peer: &mut std::net::TcpStream) -> bool {
+        peer.set_nonblocking(true).expect("non-blocking");
+        let mut byte = [0u8; 1];
+        match peer.read(&mut byte) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(_) => true,
+        }
+    }
+
+    #[test]
+    fn a_connection_past_the_accept_budget_is_deferred_not_dropped() {
+        let mut server = StdTcpProvider::new().expect("server");
+        let bound = server
+            .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
+            .expect("bind");
+        let target = format!("127.0.0.1:{}", port_of(&bound));
+
+        // More than one poll's budget, so the backlog has to outlive the poll
+        // that fills it.
+        let burst = 40;
+        let mut peers: Vec<std::net::TcpStream> = (0..burst)
+            .map(|_| std::net::TcpStream::connect(&target).expect("connect"))
+            .collect();
+        thread::sleep(Duration::from_millis(200));
+
+        let first = accepted_in(&mut server);
+        assert_eq!(
+            first, 32,
+            "the budget has to have bitten for this test to prove anything"
+        );
+
+        // What the budget held back is still queued. A connection taken off the
+        // kernel's queue and then dropped is one peer's dial killed for
+        // somebody else's flood, which is not what deferring work means.
+        thread::sleep(Duration::from_millis(50));
+        for (index, peer) in peers.iter_mut().enumerate() {
+            assert!(
+                !peer_saw_the_end(peer),
+                "peer {index} had its connection torn down rather than deferred"
+            );
+        }
+
+        let start = Instant::now();
+        let mut total = first;
+        while total < burst {
+            total += accepted_in(&mut server);
+            assert!(
+                start.elapsed() < PATIENCE,
+                "only {total} of {burst} connections were ever accepted"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(total, burst, "every queued connection is owed an accept");
+    }
+
+    #[test]
+    fn a_flooded_listener_cannot_starve_a_later_bind() {
+        let mut server = StdTcpProvider::new().expect("server");
+        // Bound first, so it is the one a naive walk over the listeners always
+        // reaches first.
+        let busy = server
+            .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
+            .expect("bind the busy listener");
+        let quiet = server
+            .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
+            .expect("bind the quiet listener");
+        let busy_target = format!("127.0.0.1:{}", port_of(&busy));
+
+        // One lonely dial at the listener that bound second. The kernel tells
+        // the server which ephemeral port it came from, which is how the
+        // accepted connection is recognised.
+        let lonely = std::net::TcpStream::connect(format!("127.0.0.1:{}", port_of(&quiet)))
+            .expect("dial the quiet listener");
+        let lonely_source = format!("/tcp/{}", lonely.local_addr().expect("local addr").port());
+
+        let mut served = false;
+        for _ in 0..6 {
+            // Replenish the busy listener past a whole poll's budget every
+            // round, so it never stops being a flood. The client ends are let
+            // go of immediately: the handshake is complete, so the connection
+            // sits in the kernel's accept queue regardless, and holding 240
+            // sockets open would only risk the process's descriptor limit.
+            for _ in 0..40 {
+                let _ = std::net::TcpStream::connect(&busy_target).expect("flood connect");
+            }
+            thread::sleep(Duration::from_millis(50));
+
+            let batch = server.poll(Now::from_millis(0)).expect("poll");
+            served = batch.iter().any(|event| {
+                matches!(event, TcpEvent::Accepted { remote, .. }
+                    if remote.to_string().ends_with(&lonely_source))
+            });
+            if served {
+                break;
+            }
+            // Let go of the flood, so a starvation test cannot itself run out
+            // of descriptors.
+            for event in &batch {
+                if let TcpEvent::Accepted { socket, .. } = event {
+                    server.abort(*socket);
+                }
+            }
+        }
+
+        assert!(
+            served,
+            "a listener bound after a flooded one was never given a turn"
+        );
+        drop(lonely);
+    }
+
+    #[test]
+    fn an_aborted_stream_is_never_mentioned_again_but_the_peer_still_finds_out() {
+        let (mut server, server_socket, mut client, client_socket) = linked();
+
+        // Something in flight, so this is a teardown mid-conversation rather
+        // than an idle handle being tidied away.
+        client.send(client_socket, b"never mind").expect("send");
+        client.abort(client_socket);
+
+        let (mut server_seen, mut client_seen) = (Vec::new(), Vec::new());
+        pump_until(
+            &mut server,
+            &mut client,
+            &mut server_seen,
+            &mut client_seen,
+            |server, _| {
+                server.iter().any(|event| {
+                    matches!(
+                        event,
+                        TcpEvent::RemoteWriteClosed { .. } | TcpEvent::Closed { .. }
+                    )
+                })
+            },
+        );
+        // Give a late event somewhere to turn up before claiming there is none.
+        for _ in 0..50 {
+            client_seen.extend(client.poll(Now::from_millis(0)).expect("poll client"));
+            server_seen.extend(server.poll(Now::from_millis(0)).expect("poll server"));
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(
+            client_seen.is_empty(),
+            "an aborted handle is owed nothing further, got {client_seen:?}"
+        );
+
+        // The teardown still has to reach the peer, or an abort is a leak on
+        // the other end rather than a close.
+        assert!(
+            server_seen.iter().any(|event| matches!(
+                event,
+                TcpEvent::RemoteWriteClosed { socket } if *socket == server_socket
+            )),
+            "the peer must observe the stream ending: {server_seen:?}"
+        );
+
+        // And the peer's own half then retires normally, so nothing is left
+        // holding a descriptor for a stream that is gone.
+        server.close_write(server_socket).expect("peer FIN");
+        pump_until(
+            &mut server,
+            &mut client,
+            &mut server_seen,
+            &mut client_seen,
+            |server, _| {
+                server.iter().any(
+                    |event| matches!(event, TcpEvent::Closed { socket, .. } if *socket == server_socket),
+                )
+            },
+        );
+        let error = server
+            .send(server_socket, b"gone")
+            .expect_err("a retired handle takes nothing");
+        assert!(error.to_string().contains("is not open"), "got {error}");
+    }
+
+    #[test]
+    fn an_abort_that_races_a_retirement_discards_it_too() {
+        let (mut server, server_socket, mut client, client_socket) = linked();
+
+        // The peer finishes first, so the client's own `close_write` is what
+        // retires the stream -- queueing a `Closed` the caller has not
+        // collected yet.
+        server.close_write(server_socket).expect("peer FIN");
+        let (mut server_seen, mut client_seen) = (Vec::new(), Vec::new());
+        pump_until(
+            &mut server,
+            &mut client,
+            &mut server_seen,
+            &mut client_seen,
+            |_, client| {
+                client
+                    .iter()
+                    .any(|event| matches!(event, TcpEvent::RemoteWriteClosed { .. }))
+            },
+        );
+        client.close_write(client_socket).expect("client FIN");
+
+        // The caller aborts before collecting that retirement. It asked for the
+        // teardown, so it is owed no report of it -- including one already
+        // sitting in the queue.
+        client.abort(client_socket);
+        let after = client.poll(Now::from_millis(0)).expect("poll");
+        assert!(
+            after.is_empty(),
+            "an aborted handle is owed nothing further, got {after:?}"
+        );
     }
 
     #[test]

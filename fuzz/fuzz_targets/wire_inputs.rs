@@ -2,7 +2,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use minip2p_autonat::{AutoNatClient, AutoNatClientInput, AutoNatServer, AutoNatServerInput};
-use minip2p_circuit::{BridgeAdoption, CircuitRole, CircuitTransport, EntropyError, EntropySource};
+use minip2p_circuit::{BridgeAdoption, CircuitRole, CircuitTransport};
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol, SansIoProtocol, TransportKind};
 use minip2p_dcutr::{FrameDecode as DcutrFrame, HolePunch};
 use minip2p_discovery::{
@@ -16,7 +16,7 @@ use minip2p_mdns::{
 };
 use minip2p_multistream_select::{MultistreamInput, MultistreamSelect};
 use minip2p_noise::{NoiseConfig, NoiseHandshakePayload, NoiseInput, NoiseRole, NoiseSession};
-use minip2p_platform::Now;
+use minip2p_platform::{EntropyError, EntropySource, Now};
 use minip2p_pubsub::{
     FrameDecode as PubsubFrame, GossipsubAgent, GossipsubConfig, MESHSUB_PROTOCOL_ID_V11,
     RawMessage, Rpc,
@@ -134,8 +134,8 @@ fn fuzz_multistream(data: &[u8]) {
 struct FixedEntropy;
 
 impl EntropySource for FixedEntropy {
-    fn fill(&mut self, destination: &mut [u8]) -> Result<(), EntropyError> {
-        destination.fill(7);
+    fn fill_bytes(&mut self, output: &mut [u8]) -> Result<(), EntropyError> {
+        output.fill(7);
         Ok(())
     }
 }

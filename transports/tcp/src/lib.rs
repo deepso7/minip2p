@@ -45,6 +45,15 @@
 //! [`TcpConfig::max_buffered_send`] on how much may queue, and
 //! [`TcpConfig::send_stall_timeout_ms`] on how long it may sit there.
 //!
+//! # Limits
+//!
+//! A connection holds a session -- Noise state, Yamux, buffers -- from the
+//! moment the byte stream comes up, which is before the peer has proved
+//! anything. [`TcpConfig::max_connections`] bounds how many exist at once, and
+//! [`TcpConfig::handshake_timeout_ms`] bounds how long one may sit there
+//! unauthenticated, so a peer that connects and then says nothing cannot hold
+//! a slot indefinitely.
+//!
 //! # Identity
 //!
 //! The upgrade authenticates both ends, so

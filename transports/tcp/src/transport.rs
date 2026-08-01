@@ -69,6 +69,14 @@ struct Connection {
     /// `None` means the last flush made progress. Cleared the moment the
     /// socket accepts anything again.
     stalled_since: Option<u64>,
+    /// When this connection stops being given time to authenticate.
+    ///
+    /// Stamped by the first poll to see it rather than by the call that made
+    /// it: a transport owns no clock, so between polls the only time it holds
+    /// is the last poll's sample, and after an idle spell that is arbitrarily
+    /// long ago. Dating a dial from it would start it already expired. `None`
+    /// once the session is established, or if the host set no timeout.
+    authenticate_by: Option<u64>,
 }
 
 impl Connection {
@@ -415,6 +423,14 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
     }
 
     fn accept(&mut self, socket: SocketHandle, remote: Multiaddr) {
+        // Shed before naming. An inbound connection at the ceiling is refused
+        // where it stands: nothing has been announced about it, so there is
+        // nobody to report a failure to, and spending an id on it would burn
+        // the namespace at whatever rate a peer chose to knock.
+        if self.connections.len() >= self.config.max_connections {
+            self.provider.abort(socket);
+            return;
+        }
         // Name the connection up front, even though what follows may reject it.
         // The id is what an `Error` would refer to, so it has to be spent
         // either way: reusing it later would point two outcomes at one id.
@@ -449,6 +465,7 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
                 session,
                 outbound: VecDeque::new(),
                 stalled_since: None,
+                authenticate_by: None,
             },
         );
         self.pending.push_back(TransportEvent::IncomingConnection {
@@ -483,8 +500,14 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
                 reason: format!("{target} is not a /tcp transport address"),
             });
         }
-        // Peek before anything with a side effect, so an exhausted namespace
-        // cannot leave a connected socket with no id to name it.
+        // Both checks come before anything with a side effect, so a refused
+        // dial leaves nothing behind: no spent id, and no connected socket
+        // without an id to name it.
+        if self.connections.len() >= self.config.max_connections {
+            return Err(TransportError::ResourceExhausted {
+                resource: "tcp connections",
+            });
+        }
         let id = self.ids.peek().ok_or(TransportError::ResourceExhausted {
             resource: "tcp connection ids",
         })?;
@@ -518,6 +541,7 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
                 session,
                 outbound: VecDeque::new(),
                 stalled_since: None,
+                authenticate_by: None,
             },
         );
         Ok(id)
@@ -644,6 +668,40 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         for event in events {
             self.handle_provider_event(event);
         }
+        // A connection that has not authenticated is on a clock. The ceiling
+        // alone would not hold: a peer that opens a byte stream and then says
+        // nothing keeps its slot for as long as the socket lives, so a few
+        // silent peers could fill the ceiling and keep it full.
+        for id in self.connections.keys().copied().collect::<Vec<_>>() {
+            let overdue = {
+                let Some(connection) = self.connections.get_mut(&id) else {
+                    continue;
+                };
+                if connection.session.is_established() {
+                    // Authenticated, so there is nothing left to time.
+                    connection.authenticate_by = None;
+                    continue;
+                }
+                let Some(limit) = self.config.handshake_timeout_ms else {
+                    continue;
+                };
+                // Stamped here, from this poll's sample, rather than when the
+                // connection was made: between polls a transport holds no
+                // current time, only the last one it was given.
+                let deadline = *connection
+                    .authenticate_by
+                    .get_or_insert(now.monotonic_ms.saturating_add(limit));
+                (now.monotonic_ms >= deadline).then_some(limit)
+            };
+            if let Some(limit) = overdue {
+                self.fail_connection(
+                    id,
+                    format!("the upgrade did not complete within {limit}ms"),
+                    true,
+                );
+            }
+        }
+
         // Retry buffered writes even without a `Writable` event, so a provider
         // that only reports readiness coarsely still drains.
         let timeout = self.config.send_stall_timeout_ms;
@@ -701,6 +759,13 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         }
         let mut stall = None;
         for connection in self.connections.values() {
+            // An unauthenticated connection has to be revisited when its
+            // patience runs out, whether or not it has anything queued.
+            if let Some(deadline) = connection.authenticate_by {
+                let deadline = Deadline::from_millis(deadline);
+                stall =
+                    Some(stall.map_or(deadline, |earliest| Deadline::earliest(earliest, deadline)));
+            }
             if connection.outbound.is_empty() {
                 continue;
             }

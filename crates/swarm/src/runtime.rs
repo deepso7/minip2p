@@ -254,8 +254,15 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     /// If a ping stream isn't yet negotiated the payload is queued and
     /// fires when the stream becomes ready. The resulting RTT is delivered
     /// via [`SwarmEvent::PingRttMeasured`] on the next `poll()`.
+    ///
+    /// A failed entropy draw refuses the ping with [`DriverError::Entropy`].
+    /// There is no fallback: a predictable nonce lets a remote pre-compute the
+    /// reply, so a ping that cannot be random must not be sent at all.
     pub fn ping(&mut self, peer_id: &PeerId, now_ms: u64) -> Result<(), DriverError> {
-        let payload = ping_payload_from(|buf| self.entropy.fill_bytes(buf).map_err(|_| ()))?;
+        let mut payload = [0u8; PING_PAYLOAD_LEN];
+        self.entropy
+            .fill_bytes(&mut payload)
+            .map_err(|_| DriverError::Entropy)?;
         self.core.ping(peer_id, payload, now_ms)?;
         self.flush_actions(now_ms);
         Ok(())
@@ -703,23 +710,19 @@ fn fold_deadlines(
     Deadline::earliest_opt(transport, core)
 }
 
-/// Builds the ping payload from `fill`, mapping failure to
-/// [`DriverError::Entropy`]. Split out so tests can exercise the failure
-/// path without faking the OS RNG.
-fn ping_payload_from(
-    fill: impl FnOnce(&mut [u8]) -> Result<(), ()>,
-) -> Result<[u8; PING_PAYLOAD_LEN], DriverError> {
-    let mut payload = [0u8; PING_PAYLOAD_LEN];
-    fill(&mut payload).map_err(|_| DriverError::Entropy)?;
-    Ok(payload)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::collections::BTreeMap;
+    use alloc::string::ToString;
     use alloc::vec;
 
+    use minip2p_core::SansIoProtocol;
+    use minip2p_identify::IDENTIFY_PROTOCOL_ID;
     use minip2p_identity::Ed25519Keypair;
+    use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, MultistreamSelect};
+    use minip2p_ping::PING_PROTOCOL_ID;
+    use minip2p_platform::EntropyError;
     use minip2p_transport::{ConnectionEndpoint, TransportEvent};
 
     /// Counter-based entropy: no OS, no `getrandom`, fully deterministic.
@@ -735,6 +738,20 @@ mod tests {
         }
     }
 
+    /// Entropy source with nothing to give -- an embedded target with no RNG,
+    /// or a hardware RNG that failed its health check.
+    struct BrokenEntropy;
+
+    impl EntropySource for BrokenEntropy {
+        fn fill_bytes(&mut self, output: &mut [u8]) -> Result<(), EntropyError> {
+            // Partially written and then failed: per the `EntropySource`
+            // contract the buffer holds no entropy, so this is exactly the
+            // payload a driver that ignored the error would put on the wire.
+            output.fill(0);
+            Err(EntropyError::unavailable("no RNG in this test"))
+        }
+    }
+
     /// Transport that replays a scripted batch and records opened streams.
     #[derive(Default)]
     struct ScriptedTransport {
@@ -742,6 +759,26 @@ mod tests {
         next_stream_id: u64,
         opened: usize,
         deadline: Option<Deadline>,
+        /// When set, every locally opened stream gets a multistream-select
+        /// listener that answers the dialer, so identify and ping streams
+        /// actually reach the negotiated state and carry payloads.
+        negotiate: bool,
+        /// Listeners for streams still negotiating, keyed by stream id.
+        negotiators: BTreeMap<StreamId, MultistreamSelect>,
+        /// Protocol frames written after negotiation completed. This is the
+        /// wire as the remote peer would see it.
+        sent: Vec<(StreamId, Vec<u8>)>,
+    }
+
+    impl ScriptedTransport {
+        /// Frames the size of a ping payload that reached the wire.
+        fn ping_frames(&self) -> Vec<&[u8]> {
+            self.sent
+                .iter()
+                .map(|(_, data)| data.as_slice())
+                .filter(|data| data.len() == PING_PAYLOAD_LEN)
+                .collect()
+        }
     }
 
     impl Transport for ScriptedTransport {
@@ -756,15 +793,57 @@ mod tests {
         fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
             self.next_stream_id += 1;
             self.opened += 1;
-            Ok(StreamId::new(self.next_stream_id))
+            let stream_id = StreamId::new(self.next_stream_id);
+            if self.negotiate {
+                let mut listener = MultistreamSelect::listener(vec![
+                    IDENTIFY_PROTOCOL_ID.to_string(),
+                    PING_PROTOCOL_ID.to_string(),
+                ]);
+                listener
+                    .handle_input(MultistreamInput::Start)
+                    .expect("listener start");
+                self.negotiators.insert(stream_id, listener);
+            }
+            Ok(stream_id)
         }
 
         fn send_stream(
             &mut self,
-            _: ConnectionId,
-            _: StreamId,
-            _: Vec<u8>,
+            id: ConnectionId,
+            stream_id: StreamId,
+            data: Vec<u8>,
         ) -> Result<(), TransportError> {
+            let Some(negotiator) = self.negotiators.get_mut(&stream_id) else {
+                // Negotiation is done (or was never scripted): this is
+                // protocol payload, which is what tests assert on.
+                self.sent.push((stream_id, data));
+                return Ok(());
+            };
+
+            negotiator
+                .handle_input(MultistreamInput::Data(data))
+                .expect("listener negotiation input");
+            let mut negotiated = false;
+            let mut outbound = Vec::new();
+            while let Some(output) = negotiator.poll_output() {
+                match output {
+                    MultistreamOutput::OutboundData(bytes) => outbound.push(bytes),
+                    MultistreamOutput::Negotiated { .. } => negotiated = true,
+                    other => panic!("unexpected multistream output: {other:?}"),
+                }
+            }
+            if negotiated {
+                self.negotiators.remove(&stream_id);
+            }
+            // The dialer only learns the protocol was accepted on its next
+            // poll, so hand the answer back as inbound stream data.
+            for data in outbound {
+                self.initial.push(TransportEvent::StreamData {
+                    id,
+                    stream_id,
+                    data,
+                });
+            }
             Ok(())
         }
 
@@ -794,6 +873,20 @@ mod tests {
     }
 
     fn runtime(initial: Vec<TransportEvent>) -> SwarmRuntime<ScriptedTransport, SeqEntropy> {
+        runtime_with(
+            ScriptedTransport {
+                initial,
+                ..ScriptedTransport::default()
+            },
+            SeqEntropy(1),
+        )
+    }
+
+    /// Same runtime, with the transport and entropy source chosen by the test.
+    fn runtime_with<E: EntropySource>(
+        transport: ScriptedTransport,
+        entropy: E,
+    ) -> SwarmRuntime<ScriptedTransport, E> {
         let keypair = Ed25519Keypair::generate();
         let identify = IdentifyConfig {
             protocol_version: "test/1".into(),
@@ -802,15 +895,40 @@ mod tests {
             public_key: keypair.public_key().encode_protobuf(),
         };
         SwarmRuntime::new(
-            ScriptedTransport {
-                initial,
-                ..ScriptedTransport::default()
-            },
+            transport,
             identify,
             PingConfig::default(),
             keypair.peer_id(),
-            SeqEntropy(1),
+            entropy,
         )
+    }
+
+    /// A transport already holding a connection to `peer`, whose
+    /// multistream-select listener answers so protocol streams negotiate.
+    fn negotiating_transport(peer: &PeerId) -> ScriptedTransport {
+        ScriptedTransport {
+            initial: vec![TransportEvent::Connected {
+                id: ConnectionId::new(1),
+                endpoint: ConnectionEndpoint::with_peer_id(
+                    "/ip4/198.51.100.7/udp/4001/quic-v1"
+                        .parse()
+                        .expect("endpoint"),
+                    peer.clone(),
+                ),
+            }],
+            negotiate: true,
+            ..ScriptedTransport::default()
+        }
+    }
+
+    /// Drives the runtime far enough for a queued ping to finish negotiating
+    /// its stream and reach the transport.
+    fn settle<E: EntropySource>(runtime: &mut SwarmRuntime<ScriptedTransport, E>, from_ms: u64) {
+        for step in 0..8 {
+            runtime
+                .poll(Now::from_millis(from_ms + step))
+                .expect("poll");
+        }
     }
 
     /// The whole point of the extraction: this drives a connection open and
@@ -963,21 +1081,55 @@ mod tests {
         );
     }
 
+    /// A ping nonce that an attacker can predict lets them pre-compute the
+    /// reply, so a failed draw must refuse the ping outright -- never fall
+    /// back to whatever the buffer happened to contain.
     #[test]
-    fn ping_payload_entropy_failure_is_an_error() {
-        assert!(matches!(
-            ping_payload_from(|_| Err(())),
-            Err(DriverError::Entropy)
-        ));
+    fn ping_is_refused_when_the_entropy_source_fails() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let mut runtime = runtime_with(negotiating_transport(&peer), BrokenEntropy);
+        runtime.poll(Now::from_millis(0)).expect("poll");
+        assert!(
+            runtime.connected_peers().contains(&peer),
+            "the peer must be connected, so the ping fails for entropy alone"
+        );
+
+        let error = runtime
+            .ping(&peer, 1_000)
+            .expect_err("a ping must not be sent with a payload the RNG never produced");
+        assert!(
+            matches!(error, DriverError::Entropy),
+            "expected DriverError::Entropy, got {error:?}"
+        );
+
+        // And nothing weak escaped: driving the runtime on cannot flush a
+        // payload the caller was told was never generated.
+        settle(&mut runtime, 2_000);
+        assert!(
+            runtime.transport().ping_frames().is_empty(),
+            "no ping payload may reach the wire: {:?}",
+            runtime.transport().ping_frames()
+        );
     }
 
+    /// The positive direction, observed on the wire rather than through the
+    /// helper: the bytes the source produced are the bytes that get sent.
     #[test]
-    fn ping_payload_returns_filled_bytes() {
-        let payload = ping_payload_from(|buf| {
-            buf.fill(0xAB);
-            Ok(())
-        })
-        .expect("fill succeeds");
-        assert_eq!(payload, [0xAB; PING_PAYLOAD_LEN]);
+    fn ping_sends_the_payload_the_entropy_source_produced() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let mut runtime = runtime_with(negotiating_transport(&peer), SeqEntropy(0xA0));
+        runtime.poll(Now::from_millis(0)).expect("poll");
+
+        runtime.ping(&peer, 1_000).expect("ping queues");
+        settle(&mut runtime, 2_000);
+
+        // SeqEntropy(0xA0) hands out 0xA0, 0xA1, ... one byte at a time.
+        let expected: [u8; PING_PAYLOAD_LEN] =
+            core::array::from_fn(|i| 0xA0u8.wrapping_add(i as u8));
+        assert_eq!(
+            runtime.transport().ping_frames(),
+            vec![expected.as_slice()],
+            "the ping payload on the wire must be exactly the drawn bytes"
+        );
     }
 }

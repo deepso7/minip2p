@@ -948,3 +948,164 @@ fn an_idle_transport_reports_no_deadline_of_its_own() {
         "a drained connection has nothing pending"
     );
 }
+
+#[test]
+fn a_dial_past_the_ceiling_is_refused_and_costs_nothing() {
+    let net = VirtualNetwork::new();
+    let second_addr = addr("/ip4/127.0.0.1/tcp/4002");
+    let mut listener = node(&net, identity(2), 20);
+    listener.listen(&addr(LISTEN_ADDR)).expect("listener binds");
+    listener.listen(&second_addr).expect("listener binds again");
+
+    let mut dialer = node_with(
+        &net,
+        identity(1),
+        10,
+        TcpConfig {
+            max_connections: 1,
+            ..TcpConfig::default()
+        },
+    );
+    let listener_peer = identity(2).peer_id();
+    dialer
+        .dial(&PeerAddr::new(addr(LISTEN_ADDR), listener_peer.clone()).expect("target"))
+        .expect("the first dial fits");
+
+    let error = dialer
+        .dial(&PeerAddr::new(second_addr, listener_peer).expect("target"))
+        .expect_err("the ceiling holds");
+    assert!(
+        matches!(
+            &error,
+            TransportError::ResourceExhausted { resource } if resource.contains("connections")
+        ),
+        "a refused dial should say what ran out, got {error:?}"
+    );
+    // The check comes before anything with a side effect, so nothing is spent
+    // on a dial that was never going to happen.
+    assert_eq!(
+        dialer.connection_ids().len(),
+        1,
+        "a refused dial must leave no connection behind"
+    );
+}
+
+#[test]
+fn an_inbound_connection_past_the_ceiling_is_refused_without_a_word() {
+    let net = VirtualNetwork::new();
+    let mut listener = node_with(
+        &net,
+        identity(2),
+        20,
+        TcpConfig {
+            max_connections: 1,
+            ..TcpConfig::default()
+        },
+    );
+    listener.listen(&addr(LISTEN_ADDR)).expect("listener binds");
+    let listener_peer = identity(2).peer_id();
+
+    let mut first = node(&net, identity(1), 10);
+    let mut second = node(&net, identity(3), 30);
+    for dialer in [&mut first, &mut second] {
+        dialer
+            .dial(&PeerAddr::new(addr(LISTEN_ADDR), listener_peer.clone()).expect("target"))
+            .expect("dial starts");
+    }
+
+    let mut announced = Vec::new();
+    for _ in 0..512 {
+        announced.extend(listener.poll(Now::from_millis(0)).expect("poll listener"));
+        let _ = first.poll(Now::from_millis(0)).expect("poll first");
+        let _ = second.poll(Now::from_millis(0)).expect("poll second");
+        if net.is_quiet() && listener.next_deadline().is_none() {
+            break;
+        }
+    }
+
+    // One peer gets in; the other is shed where it stands. Nothing was ever
+    // announced about it, so there is no id to report a failure against --
+    // saying anything would name a connection the host has never heard of.
+    let inbound = announced
+        .iter()
+        .filter(|event| matches!(event, TransportEvent::IncomingConnection { .. }))
+        .count();
+    assert_eq!(inbound, 1, "one connection past the ceiling: {announced:?}");
+    assert_eq!(
+        listener.connection_ids().len(),
+        1,
+        "the ceiling bounds what is held, not just what is announced"
+    );
+}
+
+#[test]
+fn a_connection_that_never_authenticates_is_dropped_on_its_deadline() {
+    const PATIENCE: u64 = 5_000;
+    let net = VirtualNetwork::new();
+    // Bound, so the byte stream comes up -- and then never polled, so the peer
+    // takes the connection and says nothing. That is the shape that a ceiling
+    // alone cannot handle: the slot is held for as long as the socket lives.
+    let mut silent = node(&net, identity(2), 20);
+    silent.listen(&addr(LISTEN_ADDR)).expect("listener binds");
+
+    let mut dialer = node_with(
+        &net,
+        identity(1),
+        10,
+        TcpConfig {
+            handshake_timeout_ms: Some(PATIENCE),
+            ..TcpConfig::default()
+        },
+    );
+    let id = dialer
+        .dial(&PeerAddr::new(addr(LISTEN_ADDR), identity(2).peer_id()).expect("target"))
+        .expect("dial starts");
+
+    let _ = dialer.poll(Now::from_millis(0)).expect("the first poll");
+    assert_eq!(
+        dialer.next_deadline(),
+        Some(Deadline::from_millis(PATIENCE)),
+        "an unauthenticated connection has to bring the host back to enforce it"
+    );
+
+    let events = dialer
+        .poll(Now::from_millis(PATIENCE))
+        .expect("poll on the deadline");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TransportEvent::Error { id: failed, message }
+                if *failed == id && message.contains("did not complete")
+        )),
+        "the host should be told why: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Closed { id: closed } if *closed == id)),
+        "and that the connection is gone: {events:?}"
+    );
+    assert!(
+        dialer.connection_ids().is_empty(),
+        "the slot has to come back, or the ceiling fills with silent peers"
+    );
+}
+
+#[test]
+fn an_established_connection_is_no_longer_on_the_handshake_clock() {
+    let pair = upgraded_pair_with(
+        TcpConfig {
+            handshake_timeout_ms: Some(5_000),
+            ..TcpConfig::default()
+        },
+        TcpConfig::default(),
+    );
+    // The countdown bounds the upgrade, not the connection. A transport that
+    // kept it running would tear down healthy connections on a timer, and wake
+    // an idle host to do it.
+    assert_eq!(
+        pair.dialer.next_deadline(),
+        None,
+        "an authenticated connection has nothing outstanding"
+    );
+}

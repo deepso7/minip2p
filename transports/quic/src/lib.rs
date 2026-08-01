@@ -1466,6 +1466,14 @@ impl Transport for QuicTransport {
     }
 
     fn next_deadline(&self) -> Option<Deadline> {
+        // Events buffered outside a poll -- `listen`, `open_stream`,
+        // `send_stream`, `close_stream_write` and `reset_stream` all queue
+        // here between polls -- are due regardless of what the clock reads,
+        // and nothing else would wake a host idling on `None`.
+        if !self.pending_events.is_empty() {
+            return Some(Deadline::IMMEDIATE);
+        }
+
         // Datagrams stuck on socket writability can't be woken by a
         // readable peek; return a near deadline so the driver retries the
         // flush soon. (A `flush` blocked mid-connection always leaves its
@@ -1520,7 +1528,9 @@ fn deadline_for_timeout(now: Now, timeout: Duration) -> Deadline {
 
 impl BlockingTransport for QuicTransport {
     fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-        if socket_has_queued_input(&self.socket) {
+        // Buffered events are work the host has yet to see; parking on socket
+        // readiness would sleep on them until an unrelated packet arrived.
+        if !self.pending_events.is_empty() || socket_has_queued_input(&self.socket) {
             WaitOutcome::Ready
         } else {
             self.readiness.wait(timeout)
@@ -1753,8 +1763,13 @@ impl BlockingTransport for DualQuicTransport {
         // Already-queued input must be reported before blocking anywhere:
         // otherwise a short budget could be consumed entirely by the empty
         // family while the other has a packet waiting, returning `TimedOut`
-        // despite input being available.
-        if socket_has_queued_input(&self.ipv4.socket) || socket_has_queued_input(&self.ipv6.socket)
+        // despite input being available. Events either family buffered
+        // outside a poll count the same -- this path does not delegate to the
+        // per-family `wait_for_input`, so it has to check them itself.
+        if !self.ipv4.pending_events.is_empty()
+            || !self.ipv6.pending_events.is_empty()
+            || socket_has_queued_input(&self.ipv4.socket)
+            || socket_has_queued_input(&self.ipv6.socket)
         {
             return WaitOutcome::Ready;
         }

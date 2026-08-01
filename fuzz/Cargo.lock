@@ -263,7 +263,6 @@ dependencies = [
 name = "minip2p-circuit"
 version = "0.3.1"
 dependencies = [
- "getrandom",
  "minip2p-core",
  "minip2p-identity",
  "minip2p-platform",

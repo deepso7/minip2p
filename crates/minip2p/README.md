@@ -51,7 +51,7 @@ resets it, purges already-buffered events, and suppresses later stream events.
 Use `Endpoint::reset_stream` when those terminal events should remain visible.
 
 With the `nat` feature, `EndpointTransport` is a
-`CircuitTransport<QuicEndpoint, OsEntropy>` and `EndpointSwarm` names the
+`CircuitTransport<QuicEndpoint, StdEntropy>` and `EndpointSwarm` names the
 resulting concrete swarm type. Relay bridges are promoted through end-to-end
 Noise and Yamux before `wait_path` returns `Path::Relayed`, so application
 protocols use ordinary streams on direct and relayed paths alike.

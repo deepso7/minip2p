@@ -1058,13 +1058,13 @@ dependencies = [
 name = "minip2p-circuit"
 version = "0.3.1"
 dependencies = [
- "getrandom",
  "minip2p-core",
  "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-noise",
  "minip2p-platform",
  "minip2p-secure-mux",
+ "minip2p-tcp",
  "minip2p-test-support",
  "minip2p-transport",
  "thiserror",
@@ -1259,6 +1259,7 @@ dependencies = [
  "minip2p-identity",
  "minip2p-mdns",
  "minip2p-nat",
+ "minip2p-platform",
  "minip2p-pubsub",
  "minip2p-quic",
  "minip2p-relay",

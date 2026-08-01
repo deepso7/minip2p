@@ -69,7 +69,7 @@ const DEFAULT_AGENT_VERSION: &str = "minip2p/0.1.0";
 /// promoted into ordinary Noise/Yamux connections by `CircuitTransport`.
 #[cfg(feature = "nat")]
 pub type EndpointTransport =
-    minip2p_circuit::CircuitTransport<QuicEndpoint, minip2p_circuit::OsEntropy>;
+    minip2p_circuit::CircuitTransport<QuicEndpoint, minip2p_platform::StdEntropy>;
 
 /// Transport used by [`Endpoint`] when NAT traversal is not compiled in.
 #[cfg(not(feature = "nat"))]
