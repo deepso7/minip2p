@@ -1,16 +1,14 @@
 # minip2p TypeScript
 
-The TypeScript workspace is a pnpm monorepo orchestrated by Turborepo.
+TypeScript bindings for [minip2p](https://minip2p.com).
 
 | Package | Purpose |
 | --- | --- |
-| [`@minip2p/core`](./core) | Platform-neutral SDK, public types, errors, event delivery, and native backend contract |
-| [`@minip2p/react-native`](./react-native) | React Native TurboModule backend and Expo development app |
-| [`@minip2p/node`](./node) | Node.js adapter scaffold; the napi-rs backend is the next implementation slice |
+| [`@minip2p/core`](./core) | Platform-neutral SDK, types, events, and backend contract |
+| [`@minip2p/react-native`](./react-native) | Published React Native adapter with Android and iOS libraries |
+| [`@minip2p/node`](./node) | Private Node.js adapter scaffold |
 
-Platform packages implement the backend contract from `@minip2p/core` and re-export the same SDK-facing types. Platform-neutral behavior belongs in `core`; native loading, generated bindings, and FFI error conversion belong in the platform adapter.
-
-See [FEATURES.md](./FEATURES.md) for the Rust-Endpoint-to-TypeScript capability mapping.
+Platform adapters implement `@minip2p/core/backend` and re-export the public SDK types. See [FEATURES.md](./FEATURES.md) for the Rust-to-TypeScript capability map.
 
 ```sh
 pnpm install --frozen-lockfile
@@ -19,5 +17,3 @@ pnpm test
 pnpm lint
 pnpm build
 ```
-
-Future TypeScript-hosted targets such as WASM belong beside the current adapters at `bindings/ts/wasm`. Bindings for other language ecosystems remain top-level siblings, such as `bindings/python`, `bindings/swift`, and `bindings/kotlin`.

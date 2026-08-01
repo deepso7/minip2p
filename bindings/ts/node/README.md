@@ -1,5 +1,5 @@
 # @minip2p/node
 
-Node.js adapter for the minip2p TypeScript SDK.
+Private Node.js adapter scaffold for [minip2p](https://minip2p.com).
 
-This package currently establishes the workspace and public dependency on `@minip2p/core`. The napi-rs native backend is the next implementation slice, so the package remains private until it can construct a working endpoint.
+The package is not published yet; a native napi-rs backend is still required before it can construct an endpoint.
