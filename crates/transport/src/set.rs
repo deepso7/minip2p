@@ -2,6 +2,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::vec::Vec;
+use core::fmt;
 
 use minip2p_core::{Multiaddr, PeerAddr, TransportKind};
 use minip2p_platform::{Deadline, Now};
@@ -44,6 +45,56 @@ pub enum TransportSetError {
     NoNamespace,
 }
 
+/// A transport a [`TransportSet`] refused, handed back with the reason.
+///
+/// A transport owns things a host still needs -- a bound socket, a listener,
+/// live connections -- so a rejected join returns it rather than dropping it
+/// where the caller cannot reach it. The host can claim differently and try
+/// again, or shut it down deliberately.
+pub struct RejectedTransport {
+    error: TransportSetError,
+    transport: BoxedTransport,
+}
+
+impl RejectedTransport {
+    /// Why the set refused this transport.
+    pub fn error(&self) -> &TransportSetError {
+        &self.error
+    }
+
+    /// Takes the refused transport back.
+    pub fn into_transport(self) -> BoxedTransport {
+        self.transport
+    }
+
+    /// Splits into the reason and the transport it refused.
+    pub fn into_parts(self) -> (TransportSetError, BoxedTransport) {
+        (self.error, self.transport)
+    }
+}
+
+impl fmt::Debug for RejectedTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A boxed transport is not `Debug`, and the reason is the whole of
+        // what a failed `expect` needs to say.
+        f.debug_struct("RejectedTransport")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for RejectedTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl core::error::Error for RejectedTransport {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 struct Member {
     /// The address shape this member dials and listens on.
     kind: TransportKind,
@@ -83,6 +134,15 @@ struct Member {
 /// split by family internally, as the dual-stack QUIC transport does, claims
 /// both of its namespaces and keeps that split to itself.
 ///
+/// # One member's fault
+///
+/// A member that fails a [`poll`](Transport::poll) does not cost its siblings
+/// what they produced in the same round: those events are handed over by the
+/// next poll, before any member is driven again. So a transport that stays
+/// broken reports its fault every time without burying a healthy member's
+/// events behind it, and the queue that makes that possible holds one round
+/// rather than growing.
+///
 /// A host composes one with [`insert`](Self::insert), naming each member's
 /// address shape and the namespaces its allocator stamps -- for a TCP
 /// transport, [`TransportKind::Tcp`] and whichever of
@@ -94,6 +154,12 @@ pub struct TransportSet {
     /// Events collected from members that a failing member kept this poll from
     /// returning. Drained by the next one.
     pending: VecDeque<TransportEvent>,
+    /// Every member's interrupt handle, shared with the handles this set hands
+    /// out so a member joining later is still reachable through one taken
+    /// earlier. Also the lock that makes an interrupt atomic with respect to
+    /// the waits it has to wake.
+    #[cfg(feature = "std")]
+    wakers: alloc::sync::Arc<std::sync::Mutex<Vec<crate::WaitHandle>>>,
 }
 
 impl TransportSet {
@@ -110,29 +176,28 @@ impl TransportSet {
     ///
     /// Rejects a claim another member already holds: two members answering one
     /// question would make routing a guess, and a guess here delivers a
-    /// connection's events to the wrong transport.
+    /// connection's events to the wrong transport. A refused transport comes
+    /// back with the reason, inside [`RejectedTransport`], rather than being
+    /// dropped somewhere the caller cannot reach it.
+    ///
+    /// The namespaces named here must be every namespace this transport
+    /// allocates ids in. An id from one it did not claim could not be routed
+    /// back, so a dial that produces one is refused rather than handed out.
     pub fn insert(
         &mut self,
         kind: TransportKind,
         namespaces: impl IntoIterator<Item = ConnectionNamespace>,
         transport: BoxedTransport,
-    ) -> Result<(), TransportSetError> {
+    ) -> Result<(), RejectedTransport> {
         let namespaces: Vec<ConnectionNamespace> = namespaces.into_iter().collect();
-        if namespaces.is_empty() {
-            return Err(TransportSetError::NoNamespace);
+        if let Some(error) = self.conflict(kind, &namespaces) {
+            return Err(RejectedTransport { error, transport });
         }
-        if self.members.iter().any(|member| member.kind == kind) {
-            return Err(TransportSetError::DuplicateKind { kind });
-        }
-        for namespace in &namespaces {
-            if self
-                .members
-                .iter()
-                .any(|member| member.namespaces.contains(namespace))
-            {
-                return Err(TransportSetError::DuplicateNamespace {
-                    namespace: *namespace,
-                });
+        #[cfg(feature = "std")]
+        {
+            let handle = transport.wait_handle();
+            if !handle.is_noop() {
+                self.wakers().push(handle);
             }
         }
         self.members.push(Member {
@@ -141,6 +206,40 @@ impl TransportSet {
             transport,
         });
         Ok(())
+    }
+
+    /// Why this claim cannot be granted, if it cannot.
+    fn conflict(
+        &self,
+        kind: TransportKind,
+        namespaces: &[ConnectionNamespace],
+    ) -> Option<TransportSetError> {
+        if namespaces.is_empty() {
+            return Some(TransportSetError::NoNamespace);
+        }
+        if self.members.iter().any(|member| member.kind == kind) {
+            return Some(TransportSetError::DuplicateKind { kind });
+        }
+        namespaces
+            .iter()
+            .find(|namespace| {
+                self.members
+                    .iter()
+                    .any(|member| member.namespaces.contains(namespace))
+            })
+            .map(|namespace| TransportSetError::DuplicateNamespace {
+                namespace: *namespace,
+            })
+    }
+
+    /// The shared handle list, past a poisoned lock: a panic while pushing a
+    /// handle leaves the list usable, and refusing to wake anything would be
+    /// worse than waking one member twice.
+    #[cfg(feature = "std")]
+    fn wakers(&self) -> std::sync::MutexGuard<'_, Vec<crate::WaitHandle>> {
+        self.wakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Whether the set can dial anything at all.
@@ -153,22 +252,26 @@ impl TransportSet {
         self.members.iter().map(|member| member.kind).collect()
     }
 
-    fn for_id(&mut self, id: ConnectionId) -> Result<&mut BoxedTransport, TransportError> {
+    fn index_for_id(&self, id: ConnectionId) -> Result<usize, TransportError> {
         let namespace = id.namespace();
         self.members
-            .iter_mut()
-            .find(|member| member.namespaces.contains(&namespace))
-            .map(|member| &mut member.transport)
+            .iter()
+            .position(|member| member.namespaces.contains(&namespace))
             // An id from a namespace nobody claims names no connection here,
             // which is the same thing as a connection that does not exist.
             .ok_or(TransportError::ConnectionNotFound { id })
     }
 
-    fn for_addr(
-        &mut self,
+    fn for_id(&mut self, id: ConnectionId) -> Result<&mut BoxedTransport, TransportError> {
+        let index = self.index_for_id(id)?;
+        Ok(&mut self.members[index].transport)
+    }
+
+    fn index_for_addr(
+        &self,
         addr: &Multiaddr,
         context: &'static str,
-    ) -> Result<&mut BoxedTransport, TransportError> {
+    ) -> Result<usize, TransportError> {
         let kind = addr
             .transport_kind()
             .ok_or_else(|| TransportError::InvalidAddress {
@@ -176,9 +279,8 @@ impl TransportSet {
                 reason: format!("{addr} is not a transport address"),
             })?;
         self.members
-            .iter_mut()
-            .find(|member| member.kind == kind)
-            .map(|member| &mut member.transport)
+            .iter()
+            .position(|member| member.kind == kind)
             .ok_or_else(|| TransportError::InvalidAddress {
                 context,
                 reason: format!("this set has no {kind:?} transport for {addr}"),
@@ -189,11 +291,31 @@ impl TransportSet {
 impl Transport for TransportSet {
     fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
         let target = addr.transport().clone();
-        self.for_addr(&target, "dial target")?.dial(addr)
+        let index = self.index_for_addr(&target, "dial target")?;
+        let member = &mut self.members[index];
+        let id = member.transport.dial(addr)?;
+        // A member that stamps an id in a namespace it did not claim hands
+        // back an id this set cannot route: every later call on it would look
+        // for an owner and find none, and the connection would be unreachable
+        // while still costing the member everything a connection costs. Fail
+        // the dial where the mis-claim is visible, and close what it opened.
+        if !member.namespaces.contains(&id.namespace()) {
+            let _ = member.transport.close(id);
+            return Err(TransportError::DialFailed {
+                id,
+                reason: format!(
+                    "the {:?} member allocated {id} in {}, a namespace it did not claim",
+                    member.kind,
+                    id.namespace()
+                ),
+            });
+        }
+        Ok(id)
     }
 
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
-        self.for_addr(addr, "listen address")?.listen(addr)
+        let index = self.index_for_addr(addr, "listen address")?;
+        self.members[index].transport.listen(addr)
     }
 
     fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
@@ -230,6 +352,15 @@ impl Transport for TransportSet {
     }
 
     fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
+        // Events a failing poll held back are delivered before any member is
+        // polled again. That bounds what this queue holds to a single round
+        // and, more importantly, means a member that fails every time cannot
+        // keep a healthy sibling's events queued behind it forever: the host
+        // alternates between hearing the fault and draining what still works.
+        if !self.pending.is_empty() {
+            return Ok(self.pending.drain(..).collect());
+        }
+
         // Every member is polled, even after one fails: a member that has
         // events ready is not answerable for another one's fault, and the
         // failing member has already told the host what went wrong through the
@@ -287,6 +418,37 @@ mod blocking_set {
     /// long enough that a set of quiet members is not a spin loop.
     const SLICE: Duration = Duration::from_millis(10);
 
+    impl TransportSet {
+        /// Answers one logical interrupt once.
+        ///
+        /// The handle wakes every member, so the members that did not win the
+        /// race are each left holding a token of the same interrupt. Consuming
+        /// them here is what keeps one call to
+        /// [`WaitHandle::interrupt`](crate::WaitHandle::interrupt) worth one
+        /// `Interrupted`: left behind, each would surface as another wake, and
+        /// would do it from the non-blocking probe at the top of the next
+        /// wait, ahead of a member with real input to hand over.
+        ///
+        /// A sibling that reports `Ready` while being drained loses nothing:
+        /// readiness outlives this call, and a driver polls the transport after
+        /// an interrupt anyway.
+        fn settle_interrupt(&mut self, woken: usize) -> WaitOutcome {
+            // Taken while draining so an interrupt still fanning out cannot
+            // land on a member this loop has already passed. The handle holds
+            // the same lock for the whole of its fan-out.
+            let wakers = alloc::sync::Arc::clone(&self.wakers);
+            let _fanout = wakers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for index in 0..self.members.len() {
+                if index != woken {
+                    self.members[index].transport.wait_for_input(Duration::ZERO);
+                }
+            }
+            WaitOutcome::Interrupted
+        }
+    }
+
     impl BlockingTransport for TransportSet {
         fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
             // Events a failed poll held back are input the caller has not seen.
@@ -297,16 +459,18 @@ mod blocking_set {
             // Probe every member without blocking before blocking on any of
             // them: a budget spent waiting on a quiet member would report
             // `TimedOut` while another already had something to hand over.
-            let mut anyone_can_wait = false;
-            for member in &mut self.members {
-                match member.transport.wait_for_input(Duration::ZERO) {
+            // The probe also says which members can park at all, and only
+            // those are worth a slice of the budget.
+            let mut waiters = Vec::new();
+            for index in 0..self.members.len() {
+                match self.members[index].transport.wait_for_input(Duration::ZERO) {
                     WaitOutcome::Ready => return WaitOutcome::Ready,
-                    WaitOutcome::Interrupted => return WaitOutcome::Interrupted,
-                    WaitOutcome::TimedOut => anyone_can_wait = true,
+                    WaitOutcome::Interrupted => return self.settle_interrupt(index),
+                    WaitOutcome::TimedOut => waiters.push(index),
                     WaitOutcome::Unsupported => {}
                 }
             }
-            if !anyone_can_wait {
+            if waiters.is_empty() {
                 // No member can park on readiness, so neither can the set. The
                 // caller has to sleep on its own clock instead of reading a
                 // prompt return as "nothing happened yet".
@@ -320,7 +484,7 @@ mod blocking_set {
             // represents; an unrepresentable deadline means "no deadline".
             let deadline = std::time::Instant::now().checked_add(timeout);
             loop {
-                for index in 0..self.members.len() {
+                for (turn, &index) in waiters.iter().enumerate() {
                     let remaining = match deadline {
                         Some(deadline) => {
                             let left =
@@ -332,17 +496,18 @@ mod blocking_set {
                         }
                         None => SLICE,
                     };
-                    // Every member has to get a turn within this call, so what
-                    // is left is divided among the members still to come
-                    // rather than spent on the first. A budget too small to
-                    // divide degrades to a non-blocking probe, which is still
-                    // a turn.
-                    let share = u32::try_from(self.members.len() - index)
+                    // Every member that can park has to get a turn within this
+                    // call, so what is left is divided among those still to
+                    // come -- and only those: counting a member that answers
+                    // instantly would hand the budget to nobody and shorten
+                    // every real wait. A share too small to divide degrades to
+                    // a non-blocking probe, which is still a turn.
+                    let share = u32::try_from(waiters.len() - turn)
                         .map_or(remaining, |left| remaining / left);
                     let slice = SLICE.min(remaining).min(share);
                     match self.members[index].transport.wait_for_input(slice) {
                         WaitOutcome::Ready => return WaitOutcome::Ready,
-                        WaitOutcome::Interrupted => return WaitOutcome::Interrupted,
+                        WaitOutcome::Interrupted => return self.settle_interrupt(index),
                         WaitOutcome::TimedOut | WaitOutcome::Unsupported => {}
                     }
                 }
@@ -354,17 +519,22 @@ mod blocking_set {
             // and a caller cannot know which. Nudging all of them is what makes
             // one handle interrupt the set rather than whichever member
             // happened to be next.
-            let handles: Vec<WaitHandle> = self
-                .members
-                .iter()
-                .map(|member| member.transport.wait_handle())
-                .filter(|handle| !handle.is_noop())
-                .collect();
-            if handles.is_empty() {
+            //
+            // The list is the set's own and is read when the handle fires, not
+            // when it is taken, so a member that joins later is woken by a
+            // handle a host already holds. Only a set with nothing wakeable in
+            // it at all reports an inert handle.
+            if self.wakers().is_empty() {
                 return WaitHandle::noop();
             }
+            let wakers = alloc::sync::Arc::clone(&self.wakers);
             WaitHandle::new(move || {
-                for handle in &handles {
+                // Held across the whole fan-out so a wait draining its
+                // siblings sees either all of this interrupt or none of it.
+                let handles = wakers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for handle in handles.iter() {
                     handle.interrupt();
                 }
             })
@@ -389,14 +559,35 @@ mod tests {
         events: Vec<TransportEvent>,
         deadline: Option<Deadline>,
         addresses: Vec<Multiaddr>,
+        /// Reported separately from `addresses`: a set that answered both
+        /// questions from one member method would look right against a fake
+        /// that did the same.
+        inbound: Vec<Multiaddr>,
         fails_poll: bool,
+        /// Every timeout this member was asked to wait for, in order, so a
+        /// test can see what share of a budget it was given.
+        #[cfg(feature = "std")]
+        waits: Vec<core::time::Duration>,
+        /// Whether a wait finds input ready.
+        #[cfg(feature = "std")]
+        ready: bool,
+        /// Whether this member can park at all. Set before joining a set: a
+        /// member's handle is taken when it joins.
+        #[cfg(feature = "std")]
+        can_wait: bool,
     }
 
     #[derive(Clone)]
     struct Fake {
         name: &'static str,
+        /// The namespace `dial` stamps its ids with, which a test can put out
+        /// of step with what the member claimed.
         namespace: ConnectionNamespace,
         log: Rc<RefCell<Log>>,
+        /// Interrupts this member has been handed and not yet reported.
+        /// Shared with its [`WaitHandle`], so it has to outlive `Rc`.
+        #[cfg(feature = "std")]
+        interrupts: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
     }
 
     impl Fake {
@@ -405,7 +596,17 @@ mod tests {
                 name,
                 namespace,
                 log: Rc::new(RefCell::new(Log::default())),
+                #[cfg(feature = "std")]
+                interrupts: alloc::sync::Arc::default(),
             }
+        }
+
+        /// A member that can park on readiness, and so hands out a real
+        /// handle. Set before joining, since joining is when the set takes it.
+        #[cfg(feature = "std")]
+        fn waking(self) -> Self {
+            self.log.borrow_mut().can_wait = true;
+            self
         }
 
         fn record(&self, call: &str) {
@@ -414,6 +615,17 @@ mod tests {
 
         fn calls(&self) -> Vec<String> {
             self.log.borrow().calls.clone()
+        }
+
+        #[cfg(feature = "std")]
+        fn waits(&self) -> Vec<core::time::Duration> {
+            self.log.borrow().waits.clone()
+        }
+
+        /// Interrupts handed to this member and not yet reported.
+        #[cfg(feature = "std")]
+        fn pending_interrupts(&self) -> usize {
+            self.interrupts.load(core::sync::atomic::Ordering::SeqCst)
         }
 
         fn boxed(&self) -> BoxedTransport {
@@ -489,12 +701,48 @@ mod tests {
         }
 
         fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
-            self.log.borrow().addresses.clone()
+            self.log.borrow().inbound.clone()
         }
     }
 
     #[cfg(feature = "std")]
-    impl crate::BlockingTransport for Fake {}
+    impl crate::BlockingTransport for Fake {
+        fn wait_for_input(&mut self, timeout: core::time::Duration) -> crate::WaitOutcome {
+            use core::sync::atomic::Ordering;
+
+            self.log.borrow_mut().waits.push(timeout);
+            // An interrupt outranks everything else, as it does in the mio
+            // waits the real adapters are built on, and consumes its token.
+            if self.interrupts.load(Ordering::SeqCst) > 0 {
+                self.interrupts.fetch_sub(1, Ordering::SeqCst);
+                return crate::WaitOutcome::Interrupted;
+            }
+            let (can_wait, ready) = {
+                let log = self.log.borrow();
+                (log.can_wait, log.ready)
+            };
+            if !can_wait {
+                return crate::WaitOutcome::Unsupported;
+            }
+            if ready {
+                return crate::WaitOutcome::Ready;
+            }
+            // Spend the budget, as a real readiness wait would: a fake that
+            // returned instantly would make a slice's length unobservable.
+            std::thread::sleep(timeout);
+            crate::WaitOutcome::TimedOut
+        }
+
+        fn wait_handle(&self) -> crate::WaitHandle {
+            if !self.log.borrow().can_wait {
+                return crate::WaitHandle::noop();
+            }
+            let interrupts = alloc::sync::Arc::clone(&self.interrupts);
+            crate::WaitHandle::new(move || {
+                interrupts.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            })
+        }
+    }
 
     fn addr(text: &str) -> Multiaddr {
         text.parse().expect("test address parses")
@@ -512,20 +760,24 @@ mod tests {
     fn duo() -> (TransportSet, Fake, Fake) {
         let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV4);
         let quic = Fake::new("quic", ConnectionNamespace::QUIC_IPV4);
+        (set_of(&[&tcp, &quic]), tcp, quic)
+    }
+
+    /// A set of the given fakes, TCP first, each claiming the namespace it
+    /// dials in.
+    fn set_of(members: &[&Fake]) -> TransportSet {
         let mut set = TransportSet::new();
-        set.insert(
-            TransportKind::Tcp,
-            [ConnectionNamespace::TCP_IPV4],
-            tcp.boxed(),
-        )
-        .expect("tcp joins");
-        set.insert(
-            TransportKind::Quic,
-            [ConnectionNamespace::QUIC_IPV4],
-            quic.boxed(),
-        )
-        .expect("quic joins");
-        (set, tcp, quic)
+        for member in members {
+            let kind = match member.namespace {
+                ConnectionNamespace::QUIC_IPV4 | ConnectionNamespace::QUIC_IPV6 => {
+                    TransportKind::Quic
+                }
+                _ => TransportKind::Tcp,
+            };
+            set.insert(kind, [member.namespace], member.boxed())
+                .expect("a fresh claim");
+        }
+        set
     }
 
     fn peer() -> minip2p_core::PeerId {
@@ -593,6 +845,46 @@ mod tests {
     }
 
     #[test]
+    fn a_member_that_claims_two_namespaces_owns_ids_from_both() {
+        // What a transport that splits by family internally looks like from
+        // out here: the dual-stack QUIC transport allocates in two namespaces
+        // and keeps the split to itself, so both have to route to it.
+        let dual = Fake::new("quic", ConnectionNamespace::QUIC_IPV4);
+        let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV4);
+        let mut set = TransportSet::new();
+        set.insert(
+            TransportKind::Tcp,
+            [ConnectionNamespace::TCP_IPV4],
+            tcp.boxed(),
+        )
+        .expect("tcp joins");
+        set.insert(
+            TransportKind::Quic,
+            [
+                ConnectionNamespace::QUIC_IPV4,
+                ConnectionNamespace::QUIC_IPV6,
+            ],
+            dual.boxed(),
+        )
+        .expect("quic joins");
+
+        for namespace in [
+            ConnectionNamespace::QUIC_IPV4,
+            ConnectionNamespace::QUIC_IPV6,
+        ] {
+            let id = ConnectionId::namespaced(namespace, 9).expect("in range");
+            set.close(id)
+                .unwrap_or_else(|error| panic!("{namespace}: {error}"));
+        }
+        assert_eq!(
+            dual.calls(),
+            vec!["close", "close"],
+            "a member owns every namespace it claimed, not just the first"
+        );
+        assert!(tcp.calls().is_empty());
+    }
+
+    #[test]
     fn an_id_from_a_namespace_nobody_claims_names_no_connection() {
         let (mut set, ..) = duo();
         let id = ConnectionId::namespaced(ConnectionNamespace::TCP_IPV6, 1).expect("in range");
@@ -605,8 +897,11 @@ mod tests {
     }
 
     #[test]
-    fn an_address_shape_with_no_member_is_refused_by_name() {
-        let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV4);
+    fn a_dial_landing_outside_the_members_claim_is_refused_and_closed() {
+        // The member allocates in TCP_IPV6 but joined claiming only TCP_IPV4,
+        // so its ids route nowhere. Handing one back would give the host a
+        // connection every later call reports as not found.
+        let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV6);
         let mut set = TransportSet::new();
         set.insert(
             TransportKind::Tcp,
@@ -614,6 +909,25 @@ mod tests {
             tcp.boxed(),
         )
         .expect("tcp joins");
+
+        let error = set
+            .dial(&PeerAddr::new(tcp_addr(), peer()).expect("target"))
+            .expect_err("the id is unroutable");
+        assert!(
+            matches!(&error, TransportError::DialFailed { reason, .. } if reason.contains("did not claim")),
+            "the error should name the mis-claim, got {error:?}"
+        );
+        assert_eq!(
+            tcp.calls(),
+            vec!["dial", "close"],
+            "a connection nobody can reach must not be left open"
+        );
+    }
+
+    #[test]
+    fn an_address_shape_with_no_member_is_refused_by_name() {
+        let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV4);
+        let mut set = set_of(&[&tcp]);
 
         let error = set.listen(&quic_addr()).expect_err("no quic here");
         assert!(
@@ -641,7 +955,7 @@ mod tests {
         let (mut set, ..) = duo();
         let other = Fake::new("tcp2", ConnectionNamespace::TCP_IPV6);
 
-        let error = set
+        let rejected = set
             .insert(
                 TransportKind::Tcp,
                 [ConnectionNamespace::TCP_IPV6],
@@ -649,8 +963,8 @@ mod tests {
             )
             .expect_err("TCP is taken");
         assert_eq!(
-            error,
-            TransportSetError::DuplicateKind {
+            rejected.error(),
+            &TransportSetError::DuplicateKind {
                 kind: TransportKind::Tcp
             }
         );
@@ -658,19 +972,13 @@ mod tests {
 
     #[test]
     fn one_namespace_cannot_have_two_members() {
-        let mut set = TransportSet::new();
         let first = Fake::new("a", ConnectionNamespace::TCP_IPV4);
         let second = Fake::new("b", ConnectionNamespace::TCP_IPV4);
-        set.insert(
-            TransportKind::Tcp,
-            [ConnectionNamespace::TCP_IPV4],
-            first.boxed(),
-        )
-        .expect("first joins");
+        let mut set = set_of(&[&first]);
 
         // Different shape, same namespace: ids would be ambiguous, and an
         // ambiguous id delivers a connection's work to the wrong transport.
-        let error = set
+        let rejected = set
             .insert(
                 TransportKind::Quic,
                 [ConnectionNamespace::TCP_IPV4],
@@ -678,8 +986,8 @@ mod tests {
             )
             .expect_err("the namespace is taken");
         assert_eq!(
-            error,
-            TransportSetError::DuplicateNamespace {
+            rejected.error(),
+            &TransportSetError::DuplicateNamespace {
                 namespace: ConnectionNamespace::TCP_IPV4
             }
         );
@@ -692,9 +1000,32 @@ mod tests {
         // Nothing it returned could ever be routed back to it.
         assert_eq!(
             set.insert(TransportKind::Tcp, [], fake.boxed())
-                .expect_err("no namespace"),
-            TransportSetError::NoNamespace
+                .expect_err("no namespace")
+                .error(),
+            &TransportSetError::NoNamespace
         );
+    }
+
+    #[test]
+    fn a_refused_transport_is_handed_back() {
+        let (mut set, ..) = duo();
+        let other = Fake::new("tcp2", ConnectionNamespace::TCP_IPV6);
+
+        // A transport owns a bound socket by the time it is offered. Dropping
+        // it inside a rejected insert would close a listener the host still
+        // believes it has, with nothing left to close it deliberately.
+        let mut returned = set
+            .insert(
+                TransportKind::Tcp,
+                [ConnectionNamespace::TCP_IPV6],
+                other.boxed(),
+            )
+            .expect_err("TCP is taken")
+            .into_transport();
+        returned
+            .close(ConnectionId::namespaced(ConnectionNamespace::TCP_IPV6, 1).expect("id"))
+            .expect("the refused transport is still usable");
+        assert_eq!(other.calls(), vec!["close"]);
     }
 
     #[test]
@@ -706,30 +1037,69 @@ mod tests {
         tcp.log.borrow_mut().events = vec![TransportEvent::Closed { id: tcp_id }];
         quic.log.borrow_mut().events = vec![TransportEvent::Closed { id: quic_id }];
 
+        // Both connections, each exactly once: a count alone would pass on a
+        // set that reported one member's event twice and lost the other's.
         let events = set.poll(Now::from_millis(0)).expect("poll");
-        assert_eq!(events.len(), 2, "both members are polled: {events:?}");
+        assert_eq!(
+            events,
+            vec![
+                TransportEvent::Closed { id: tcp_id },
+                TransportEvent::Closed { id: quic_id },
+            ],
+            "both members are polled"
+        );
     }
 
     #[test]
     fn a_failing_member_does_not_cost_a_healthy_one_its_events() {
         let (mut set, tcp, quic) = duo();
-        let tcp_id = ConnectionId::namespaced(ConnectionNamespace::TCP_IPV4, 1).expect("in range");
-        tcp.log.borrow_mut().events = vec![TransportEvent::Closed { id: tcp_id }];
-        quic.log.borrow_mut().fails_poll = true;
+        let quic_id =
+            ConnectionId::namespaced(ConnectionNamespace::QUIC_IPV4, 1).expect("in range");
+        // The failure comes first, so a set that gave up on the first error
+        // would never reach the member with something to report.
+        tcp.log.borrow_mut().fails_poll = true;
+        quic.log.borrow_mut().events = vec![TransportEvent::Closed { id: quic_id }];
 
         let error = set
             .poll(Now::from_millis(0))
             .expect_err("the failing member is reported");
         assert!(matches!(error, TransportError::PollError { .. }));
+        assert!(
+            quic.calls().contains(&"poll".to_string()),
+            "a member after the failing one still gets polled"
+        );
 
-        // TCP's connection did nothing wrong. Dropping its events because a
+        // QUIC's connection did nothing wrong. Dropping its events because a
         // sibling transport failed would lose a close nobody could recover.
-        quic.log.borrow_mut().fails_poll = false;
+        tcp.log.borrow_mut().fails_poll = false;
         let events = set.poll(Now::from_millis(0)).expect("the next poll");
         assert_eq!(
             events,
-            vec![TransportEvent::Closed { id: tcp_id }],
+            vec![TransportEvent::Closed { id: quic_id }],
             "events held back by a failed poll have to survive it"
+        );
+    }
+
+    #[test]
+    fn a_member_that_never_recovers_does_not_bury_its_siblings_events() {
+        let (mut set, tcp, quic) = duo();
+        let quic_id =
+            ConnectionId::namespaced(ConnectionNamespace::QUIC_IPV4, 1).expect("in range");
+        tcp.log.borrow_mut().fails_poll = true;
+
+        // A transport can stay broken. Holding a healthy member's events until
+        // every member succeeds would mean a host never seeing them again, and
+        // a queue that only grows.
+        let mut delivered = 0;
+        for _ in 0..6 {
+            quic.log.borrow_mut().events = vec![TransportEvent::Closed { id: quic_id }];
+            if let Ok(events) = set.poll(Now::from_millis(0)) {
+                delivered += events.len();
+            }
+        }
+        assert!(
+            delivered >= 2,
+            "the healthy member's events kept coming: {delivered} delivered over six polls"
         );
     }
 
@@ -776,13 +1146,151 @@ mod tests {
         let (set, tcp, quic) = duo();
         tcp.log.borrow_mut().addresses = vec![tcp_addr()];
         quic.log.borrow_mut().addresses = vec![quic_addr()];
+        // Where peers reached us is a different question from where we are
+        // bound, and each member answers both. Asking one for the other would
+        // advertise an address nothing is listening on.
+        let tcp_source = addr("/ip4/198.51.100.7/tcp/4001");
+        let quic_source = addr("/ip4/198.51.100.9/udp/4001/quic-v1");
+        tcp.log.borrow_mut().inbound = vec![tcp_source.clone()];
+        quic.log.borrow_mut().inbound = vec![quic_source.clone()];
 
         // A host announces where it can be reached; leaving out a transport
         // would make half of those ways invisible to peers.
         assert_eq!(set.local_addresses(), vec![tcp_addr(), quic_addr()]);
         assert_eq!(
             set.active_inbound_connection_sources(),
-            vec![tcp_addr(), quic_addr()]
+            vec![tcp_source, quic_source]
         );
+    }
+
+    #[cfg(feature = "std")]
+    mod waiting {
+        use super::*;
+        use crate::{BlockingTransport, WaitOutcome};
+        use core::time::Duration;
+
+        /// A set of two members that can both park.
+        fn waking_duo() -> (TransportSet, Fake, Fake) {
+            let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV4).waking();
+            let quic = Fake::new("quic", ConnectionNamespace::QUIC_IPV4).waking();
+            (set_of(&[&tcp, &quic]), tcp, quic)
+        }
+
+        #[test]
+        fn input_on_any_member_is_reported_before_blocking_on_another() {
+            let (mut set, tcp, quic) = waking_duo();
+            quic.log.borrow_mut().ready = true;
+
+            let started = std::time::Instant::now();
+            assert_eq!(
+                set.wait_for_input(Duration::from_secs(30)),
+                WaitOutcome::Ready
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "a budget must not be spent on a quiet member while another has input"
+            );
+            assert_eq!(
+                tcp.waits(),
+                vec![Duration::ZERO],
+                "the quiet member is probed, never blocked on"
+            );
+        }
+
+        #[test]
+        fn one_interrupt_wakes_the_set_once() {
+            let (mut set, ..) = waking_duo();
+            let handle = set.wait_handle();
+            assert!(!handle.is_noop(), "a set of wakeable members is wakeable");
+
+            handle.interrupt();
+            assert_eq!(
+                set.wait_for_input(Duration::from_millis(50)),
+                WaitOutcome::Interrupted
+            );
+            // The handle woke every member, so every member is holding a token
+            // of the same interrupt. A second `Interrupted` would be a wake
+            // nobody asked for -- and, coming from the probe at the top, would
+            // arrive ahead of a member with real input.
+            assert_eq!(
+                set.wait_for_input(Duration::ZERO),
+                WaitOutcome::TimedOut,
+                "one interrupt is worth one wake"
+            );
+        }
+
+        #[test]
+        fn a_handle_taken_early_wakes_a_member_that_joined_later() {
+            let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV4).waking();
+            let quic = Fake::new("quic", ConnectionNamespace::QUIC_IPV4).waking();
+            let mut set = set_of(&[&tcp]);
+            // Taken while the set was still being composed, which is exactly
+            // when a host wires its wakeup path.
+            let handle = set.wait_handle();
+            set.insert(
+                TransportKind::Quic,
+                [ConnectionNamespace::QUIC_IPV4],
+                quic.boxed(),
+            )
+            .expect("quic joins");
+
+            handle.interrupt();
+            // The wait parks inside whichever member has the slice, so a
+            // handle that missed one of them can leave the set asleep in it.
+            assert_eq!(
+                quic.pending_interrupts(),
+                1,
+                "a handle the host already holds has to reach a member that joined after it"
+            );
+            assert_eq!(
+                set.wait_for_input(Duration::from_millis(50)),
+                WaitOutcome::Interrupted
+            );
+            assert_eq!(
+                quic.pending_interrupts(),
+                0,
+                "and the set still answers that interrupt exactly once"
+            );
+        }
+
+        #[test]
+        fn a_set_that_cannot_park_says_so() {
+            let (mut set, tcp, quic) = duo();
+
+            // Neither member can wait, so a prompt return here means "I cannot
+            // do this", not "nothing happened yet" -- the caller has to sleep
+            // on its own clock rather than spin.
+            assert_eq!(
+                set.wait_for_input(Duration::from_secs(30)),
+                WaitOutcome::Unsupported
+            );
+            assert!(set.wait_handle().is_noop());
+            assert_eq!(tcp.waits(), vec![Duration::ZERO]);
+            assert_eq!(quic.waits(), vec![Duration::ZERO]);
+        }
+
+        #[test]
+        fn only_members_that_can_park_are_given_a_share_of_the_budget() {
+            let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV4);
+            let quic = Fake::new("quic", ConnectionNamespace::QUIC_IPV4).waking();
+            let mut set = set_of(&[&tcp, &quic]);
+
+            assert_eq!(
+                set.wait_for_input(Duration::from_millis(8)),
+                WaitOutcome::TimedOut
+            );
+            assert_eq!(
+                tcp.waits(),
+                vec![Duration::ZERO],
+                "a member that cannot park is probed once and left alone"
+            );
+            let blocking = quic.waits();
+            assert_eq!(blocking.first(), Some(&Duration::ZERO), "probed first");
+            assert!(
+                blocking[1] >= Duration::from_millis(6),
+                "the only member that can park gets the whole budget, not a \
+                 share of it split with one that cannot: {blocking:?}"
+            );
+        }
     }
 }
