@@ -23,7 +23,8 @@
   "files": [
     "dist",
     "src",
-    "README.md"
+    "README.md",
+    "!**/.*"
   ],
   "type": "module",
   "main": "./dist/index.js",

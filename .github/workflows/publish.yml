@@ -1,4 +1,4 @@
-name: Publish crates
+name: Publish release
 
 on:
   release:
@@ -6,20 +6,22 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
-  group: crates-io-${{ github.event.release.tag_name }}
+  group: release-${{ github.event.release.tag_name }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  NODE_VERSION: "24.13.0"
+  PNPM_VERSION: "11.18.0"
 
 jobs:
-  publish:
-    name: Publish to crates.io
+  verify-release:
+    name: Verify release
     runs-on: ubuntu-latest
-    environment: crates.io
+    outputs:
+      version: ${{ steps.release.outputs.version }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -29,13 +31,8 @@ jobs:
         with:
           toolchain: "1.88"
 
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Authenticate with crates.io
-        id: crates-io-auth
-        uses: rust-lang/crates-io-auth-action@v1
-
-      - name: Verify release tag and workspace version
+      - name: Verify release tag and package versions
+        id: release
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
@@ -85,19 +82,274 @@ jobs:
             exit 1
           fi
 
-          echo "CRATE_VERSION=$version" >> "$GITHUB_ENV"
+          core_version="$(jq -r '.version' bindings/ts/core/package.json)"
+          react_native_version="$(jq -r '.version' bindings/ts/react-native/package.json)"
+          if [[ "$core_version" != "$version" || "$react_native_version" != "$version" ]]; then
+            echo "::error::Rust and public TypeScript packages must use $version; core=$core_version react-native=$react_native_version"
+            exit 1
+          fi
+          if [[ "$(jq -r '.private' bindings/ts/node/package.json)" != "true" ]]; then
+            echo "::error::@minip2p/node must remain private until its native backend is implemented"
+            exit 1
+          fi
+          if [[ "$(jq -r '.dependencies["@minip2p/core"]' bindings/ts/react-native/package.json)" != "workspace:*" ]]; then
+            echo "::error::@minip2p/react-native must depend on @minip2p/core through workspace:*"
+            exit 1
+          fi
 
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  test-rust:
+    name: Test Rust release
+    needs: verify-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
       - name: Test release commit
         run: |
           cargo test --workspace --locked
           cargo test -p minip2p-rs --features nat,pubsub,discovery,mdns --locked
           cargo doc --workspace --no-deps --locked
 
+  android-native:
+    name: Build Android release artifacts
+    needs: verify-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: bindings/ts
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v4
+      - name: Install Android SDK 36 and NDK r28c
+        run: |
+          sdkmanager \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;28.2.13676358"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm rn:android
+      - name: Validate Android ELF alignment and allocator hooks
+        run: node react-native/scripts/check-android-elf.mjs
+      - run: pnpm example prebuild
+      - name: Build both Android ABIs
+        working-directory: bindings/ts/react-native/example/android
+        run: ./gradlew :app:assembleDebug -PreactNativeArchitectures=arm64-v8a,x86_64
+      - name: Validate 16 KiB APK zip alignment
+        run: |
+          "$ANDROID_HOME/build-tools/36.0.0/zipalign" \
+            -c -P 16 -v 4 \
+            react-native/example/android/app/build/outputs/apk/debug/app-debug.apk
+      - name: Enforce native size budget
+        run: node react-native/scripts/check-native-size.mjs android
+        env:
+          NATIVE_SIZE_STRICT: "1"
+      - name: Archive Android libraries
+        run: |
+          tar \
+            -C react-native/android/src/main \
+            -czf "$RUNNER_TEMP/minip2p-android-native.tar.gz" \
+            jniLibs
+      - uses: actions/upload-artifact@v7
+        with:
+          name: minip2p-android-native
+          path: ${{ runner.temp }}/minip2p-android-native.tar.gz
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  ios-native:
+    name: Build iOS release artifacts
+    needs: verify-release
+    runs-on: macos-26
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: bindings/ts
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm rn:ios
+      - name: Validate XCFramework slices
+        run: |
+          lipo -info react-native/build/Minip2pFfi.xcframework/ios-arm64/libminip2p_ffi.a
+          lipo -info react-native/build/Minip2pFfi.xcframework/ios-arm64-simulator/libminip2p_ffi.a
+      - name: Enforce native size budget
+        run: node react-native/scripts/check-native-size.mjs ios
+        env:
+          NATIVE_SIZE_STRICT: "1"
+      - name: Archive iOS XCFramework
+        run: |
+          tar \
+            -C react-native/build \
+            -czf "$RUNNER_TEMP/minip2p-ios-native.tar.gz" \
+            Minip2pFfi.xcframework
+      - uses: actions/upload-artifact@v7
+        with:
+          name: minip2p-ios-native
+          path: ${{ runner.temp }}/minip2p-ios-native.tar.gz
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  package-typescript:
+    name: Assemble TypeScript packages
+    needs: [verify-release, android-native, ios-native]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: bindings/ts
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: android-actions/setup-android@v4
+      - name: Install Android NDK r28c for package validation
+        run: |
+          sdkmanager "ndk;28.2.13676358"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm lint
+      - run: pnpm build
+      - run: pnpm rn:generate
+      - name: Generated files are current
+        run: test -z "$(git status --porcelain)"
+      - uses: actions/download-artifact@v8
+        with:
+          name: minip2p-android-native
+          path: ${{ runner.temp }}/native
+      - uses: actions/download-artifact@v8
+        with:
+          name: minip2p-ios-native
+          path: ${{ runner.temp }}/native
+      - name: Restore native artifacts
+        run: |
+          mkdir -p react-native/build
+          tar -xzf "$RUNNER_TEMP/native/minip2p-android-native.tar.gz" \
+            -C react-native/android/src/main
+          tar -xzf "$RUNNER_TEMP/native/minip2p-ios-native.tar.gz" \
+            -C react-native/build
+      - name: Pack public packages
+        run: |
+          mkdir -p release-packages
+          pnpm --filter @minip2p/core pack \
+            --pack-destination "$PWD/release-packages"
+          pnpm --filter @minip2p/react-native pack \
+            --pack-destination "$PWD/release-packages"
+      - name: Verify packed contents and dependency versions
+        env:
+          RELEASE_VERSION: ${{ needs.verify-release.outputs.version }}
+        run: |
+          node scripts/verify-release-packages.mjs \
+            "$RELEASE_VERSION" \
+            "release-packages/minip2p-core-$RELEASE_VERSION.tgz" \
+            "release-packages/minip2p-react-native-$RELEASE_VERSION.tgz" \
+            react-native
+      - name: Smoke-test installation from tarballs
+        env:
+          RELEASE_VERSION: ${{ needs.verify-release.outputs.version }}
+        run: |
+          consumer="$(mktemp -d)"
+          npm install \
+            --prefix "$consumer" \
+            --ignore-scripts \
+            --legacy-peer-deps \
+            "$PWD/release-packages/minip2p-core-$RELEASE_VERSION.tgz" \
+            "$PWD/release-packages/minip2p-react-native-$RELEASE_VERSION.tgz"
+          node scripts/smoke-release-install.mjs "$consumer"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: minip2p-npm-packages
+          path: bindings/ts/release-packages/*.tgz
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: [verify-release, test-rust, package-typescript]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: crates.io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - name: Authenticate with crates.io
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@v1
       - name: Publish crates in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+          CRATE_VERSION: ${{ needs.verify-release.outputs.version }}
         run: |
           set -euo pipefail
+
+          crate_http_code() {
+            curl \
+              --silent \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --retry 2 \
+              --user-agent 'minip2p-release-workflow (https://github.com/deepso7/minip2p)' \
+              "https://crates.io/api/v1/crates/$1/$CRATE_VERSION"
+          }
 
           crates=(
             minip2p-identity
@@ -123,16 +375,14 @@ jobs:
           )
 
           for crate in "${crates[@]}"; do
-            crate_http_code="$(curl --silent --output /dev/null --write-out '%{http_code}' \
-              --user-agent 'minip2p-release-workflow (https://github.com/deepso7/minip2p)' \
-              "https://crates.io/api/v1/crates/$crate/$CRATE_VERSION")"
+            status="$(crate_http_code "$crate")"
 
-            if [[ "$crate_http_code" == "200" ]]; then
+            if [[ "$status" == "200" ]]; then
               echo "$crate $CRATE_VERSION is already published; skipping"
               continue
             fi
-            if [[ "$crate_http_code" != "404" ]]; then
-              echo "::error::crates.io returned HTTP $crate_http_code while checking $crate $CRATE_VERSION"
+            if [[ "$status" != "404" ]]; then
+              echo "::error::crates.io returned HTTP $status while checking $crate $CRATE_VERSION"
               exit 1
             fi
 
@@ -141,13 +391,88 @@ jobs:
                 break
               fi
 
+              delay=$((attempt * 10))
+              echo "Publish attempt $attempt for $crate failed; checking the registry in ${delay}s"
+              sleep "$delay"
+
+              status="$(crate_http_code "$crate")"
+              if [[ "$status" == "200" ]]; then
+                echo "$crate $CRATE_VERSION reached crates.io despite the publish error; continuing"
+                break
+              fi
+              if [[ "$status" != "404" ]]; then
+                echo "::error::crates.io returned HTTP $status while checking $crate $CRATE_VERSION"
+                exit 1
+              fi
               if [[ "$attempt" == 6 ]]; then
                 echo "::error::Failed to publish $crate after $attempt attempts"
                 exit 1
               fi
 
-              delay=$((attempt * 10))
-              echo "Publish attempt $attempt for $crate failed; retrying in ${delay}s while crates.io indexes dependencies"
-              sleep "$delay"
+              echo "$crate $CRATE_VERSION is not visible yet; retrying publication"
             done
           done
+
+  publish-typescript:
+    name: Publish to npm
+    needs: [verify-release, publish-crates]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: minip2p-npm-packages
+          path: packages
+      - name: Check npm trusted publishing support
+        run: |
+          npm_version="$(npm --version)"
+          node -e '
+            const [major, minor] = process.argv[1].split(".").map(Number);
+            if (major < 11 || (major === 11 && minor < 5)) process.exit(1);
+          ' "$npm_version"
+          echo "npm $npm_version supports trusted publishing"
+      - name: Publish public TypeScript packages
+        env:
+          RELEASE_VERSION: ${{ needs.verify-release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          publish_package() {
+            package_name="$1"
+            tarball="$2"
+            encoded_name="${package_name/@/%40}"
+            encoded_name="${encoded_name/\//%2f}"
+            package_http_code="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --retry 2 \
+              --user-agent 'minip2p-release-workflow (https://github.com/deepso7/minip2p)' \
+              "https://registry.npmjs.org/$encoded_name/$RELEASE_VERSION")"
+
+            if [[ "$package_http_code" == "200" ]]; then
+              echo "$package_name $RELEASE_VERSION is already published; skipping"
+              return
+            fi
+            if [[ "$package_http_code" != "404" ]]; then
+              echo "::error::npm returned HTTP $package_http_code while checking $package_name@$RELEASE_VERSION"
+              exit 1
+            fi
+
+            npm publish "$tarball" --access public
+          }
+
+          publish_package \
+            "@minip2p/core" \
+            "packages/minip2p-core-$RELEASE_VERSION.tgz"
+          publish_package \
+            "@minip2p/react-native" \
+            "packages/minip2p-react-native-$RELEASE_VERSION.tgz"

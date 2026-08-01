@@ -28,14 +28,28 @@ const artifacts =
 for (const [name, relativePath] of Object.entries(artifacts)) {
   const bytes = statSync(path.join(packageRoot, relativePath)).size;
   const expected = baseline[platform][name];
+  if (
+    typeof expected !== "number" ||
+    !Number.isFinite(expected) ||
+    expected <= 0
+  ) {
+    throw new Error(
+      `Invalid native size baseline for ${platform}/${name}: ${String(expected)}`
+    );
+  }
+  if (bytes <= 0) {
+    throw new Error(`Native artifact is empty: ${platform}/${name}`);
+  }
   const change = ((bytes - expected) / expected) * 100;
   console.log(
     `${platform}/${name}: ${bytes} bytes (${formatChange(change)} vs baseline)`
   );
   if (change > 20) {
-    console.log(
-      `::warning title=Native size regression::${platform}/${name} grew ${change.toFixed(1)}% above its ${expected}-byte baseline`
-    );
+    const message = `${platform}/${name} grew ${change.toFixed(1)}% above its ${expected}-byte baseline`;
+    if (process.env.NATIVE_SIZE_STRICT === "1") {
+      throw new Error(message);
+    }
+    console.log(`::warning title=Native size regression::${message}`);
   }
 }
 

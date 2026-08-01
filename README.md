@@ -195,10 +195,10 @@ Generate the full API docs with:
 cargo doc --workspace --no-deps --open
 ```
 
-## Versioning
+## Versioning and releases
 
-All minip2p crates use lockstep versioning. Each release publishes every
-runtime crate at the same version, including crates without code changes.
+All published Rust and TypeScript packages share one version. Each release also
+includes freshly built Android and iOS libraries for React Native.
 
 ## Roadmap focus
 

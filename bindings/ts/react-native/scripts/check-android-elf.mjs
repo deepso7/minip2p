@@ -9,7 +9,10 @@ if (ndk === undefined) {
   throw new Error("ANDROID_NDK_HOME is required");
 }
 
-const packageRoot = path.resolve(import.meta.dirname, "..");
+const packageRoot =
+  process.argv[2] === undefined
+    ? path.resolve(import.meta.dirname, "..")
+    : path.resolve(process.argv[2]);
 const readelf = path.join(
   ndk,
   "toolchains",
@@ -19,8 +22,15 @@ const readelf = path.join(
   "bin",
   "llvm-readelf"
 );
-const libraries = ["arm64-v8a", "x86_64"].map((abi) => ({
+const libraries = [
+  { abi: "arm64-v8a", machine: /Machine:\s+AArch64\b/u },
+  {
+    abi: "x86_64",
+    machine: /Machine:\s+(?:Advanced Micro Devices )?X86-64\b/u,
+  },
+].map(({ abi, machine }) => ({
   abi,
+  machine,
   path: path.join(
     packageRoot,
     "android",
@@ -33,6 +43,11 @@ const libraries = ["arm64-v8a", "x86_64"].map((abi) => ({
 }));
 
 for (const library of libraries) {
+  const fileHeader = run(readelf, ["-hW", library.path]);
+  if (!library.machine.test(fileHeader)) {
+    throw new Error(`${library.abi} has an unexpected ELF machine`);
+  }
+
   const programHeaders = run(readelf, ["-lW", library.path]);
   const alignments = programHeaders
     .split("\n")
