@@ -154,7 +154,7 @@ impl DiscoveryDriver {
 
             #[cfg(feature = "mdns")]
             if let Some(mdns) = mdns.as_deref_mut() {
-                while let Some(event) = mdns.events.pop_front() {
+                while let Some(event) = mdns.poll_event() {
                     progressed = true;
                     self.handle_mdns_event(event, now);
                 }
