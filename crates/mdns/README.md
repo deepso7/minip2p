@@ -35,7 +35,10 @@ arriving by DHCP or SLAAC reaches the agent.
 
 Nothing moves in a stack like that except when it is driven, so `next_deadline`
 matters more here than it does with sockets: honouring it is what lets a device
-sleep between packets instead of polling to find out nothing happened.
+sleep between packets instead of polling to find out nothing happened. It is
+also why the send rings fill — a burst is queued long before anything drains
+them — so a send with no room left drives the stack itself and tries again,
+and reports `Congested` only if the link still will not take it.
 
 Hosts with neither implement `MdnsIo` over their own stack. Nothing above the
 seam changes: the agent, the driver, the budgets, and the on-link check are the
@@ -63,6 +66,10 @@ Three details matter:
   than the largest datagram mDNS will act on, so filling it is how truncation is
   recognised; capping a read at some smaller length of your own would hand over
   a truncated claim wearing a plausible length.
+- **A full send buffer is `Congested`, not a failure.** The driver sends up to
+  128 datagrams a turn, so a burst can outrun a queue that drains only when the
+  stack is driven. Saying so parks the datagram until the next turn; reporting a
+  general failure instead ends mDNS for good over a moment's backpressure.
 
 `poll` defaults to doing nothing, which is right for a socket an operating
 system services. A stack running in this process needs it: the driver calls it

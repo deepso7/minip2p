@@ -37,12 +37,17 @@ pub const MAX_ACTIONS_PER_TICK: usize = 128;
 ///
 /// # Failure
 ///
-/// A send or receive that fails for any reason other than a vanished
-/// interface ends mDNS: the agent is shut down, the I/O is released, and every
-/// later tick is a no-op. A stack that cannot carry datagrams cannot
-/// participate, and a driver that kept trying would produce the same error
-/// forever while the peers' view of it went stale anyway. Events already
-/// observed are still drainable afterwards.
+/// A send or receive that fails ends mDNS: the agent is shut down, the I/O is
+/// released, and every later tick is a no-op. A stack that cannot carry
+/// datagrams cannot participate, and a driver that kept trying would produce
+/// the same error forever while the peers' view of it went stale anyway.
+/// Events already observed are still drainable afterwards.
+///
+/// Two things are not failures. A vanished interface takes its packet with it,
+/// because there is nowhere left to send it. A full send buffer
+/// ([`MdnsError::Congested`]) parks the packet instead, because the carrier
+/// will have drained by the next turn -- a device that spoke faster than its
+/// link could carry has a backlog, not a fault.
 pub struct MdnsDriver<I: MdnsIo> {
     agent: MdnsAgent,
     io: Option<I>,
@@ -139,10 +144,18 @@ impl<I: MdnsIo> MdnsDriver<I> {
         }
 
         let mut sent = 0usize;
+        let mut congested = false;
         if let Some(action) = self.pending_action.take() {
             match self.io.as_mut().expect("checked above").send(&action) {
                 Ok(()) => sent = 1,
                 Err(MdnsError::UnknownInterface { .. }) => {}
+                // Still no room. Put it back where it was rather than lose it,
+                // and do not queue anything behind it: the carrier is full, and
+                // what would go next has to wait for the same drain.
+                Err(MdnsError::Congested { .. }) => {
+                    self.pending_action = Some(action);
+                    congested = true;
+                }
                 Err(error) => return Err(self.fail(error, now_ms)),
             }
         }
@@ -152,9 +165,13 @@ impl<I: MdnsIo> MdnsDriver<I> {
             Err(error) => return Err(self.fail(error, now_ms)),
         };
         self.agent.handle_tick(now_ms);
-        let action_backlog = match self.send_batch(MAX_ACTIONS_PER_TICK.saturating_sub(sent)) {
-            Ok(backlog) => backlog,
-            Err(error) => return Err(self.fail(error, now_ms)),
+        let action_backlog = if congested {
+            true
+        } else {
+            match self.send_batch(MAX_ACTIONS_PER_TICK.saturating_sub(sent)) {
+                Ok(backlog) => backlog,
+                Err(error) => return Err(self.fail(error, now_ms)),
+            }
         };
 
         // And again on the way out, so what was just sent leaves now rather
@@ -287,6 +304,14 @@ impl<I: MdnsIo> MdnsDriver<I> {
                 // its packet with it. Nothing is wrong here, and there is
                 // nowhere to send it.
                 Ok(()) | Err(MdnsError::UnknownInterface { .. }) => {}
+                // A full send buffer is a moment, not a fault. Park what did
+                // not fit and stop here: the next turn begins with a drain, so
+                // the burst is delayed rather than lost -- and mDNS does not
+                // end because a device spoke faster than its link could carry.
+                Err(MdnsError::Congested { .. }) => {
+                    self.pending_action = Some(action);
+                    return Ok(true);
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -349,6 +374,8 @@ mod tests {
         vanished: Vec<InterfaceId>,
         /// Whether sending fails outright.
         send_fails: bool,
+        /// How many more datagrams the carrier has room for.
+        room: Option<usize>,
         receive_fails: bool,
         refresh_fails: bool,
         /// How many times `refresh` was asked, and what it reports.
@@ -441,6 +468,14 @@ mod tests {
             }
             if self.send_fails {
                 return Err(MdnsError::io("send", "network is down"));
+            }
+            if let Some(room) = self.room.as_mut() {
+                if *room == 0 {
+                    return Err(MdnsError::Congested {
+                        interface: *interface,
+                    });
+                }
+                *room -= 1;
             }
             self.sent.borrow_mut().push(action.clone());
             Ok(())
@@ -591,6 +626,67 @@ mod tests {
         driver.tick(1, &[]).expect("second tick");
         assert_eq!(sent.borrow().len(), MAX_ACTIONS_PER_TICK + 2);
         assert!(driver.pending_action.is_none());
+    }
+
+    #[test]
+    fn a_full_carrier_delays_a_datagram_instead_of_ending_mdns() {
+        let mut io = FakeIo::with_interfaces(3);
+        // Room for one of the three announcements. A carrier that only moves
+        // bytes when it is driven fills up like this inside a single tick,
+        // which is exactly when a burst is queued.
+        io.room = Some(1);
+        let sent = io.sent.clone();
+        let mut driver = driver(io);
+
+        driver
+            .tick(0, &[])
+            .expect("a full send buffer is a moment, not a fault");
+        assert!(
+            driver.is_active(),
+            "mDNS must not end because a device spoke faster than its link could carry"
+        );
+        assert_eq!(sent.borrow().len(), 1, "what fit went out");
+        let parked = driver
+            .pending_action
+            .clone()
+            .expect("what did not fit is held, not dropped");
+        assert_eq!(
+            driver.next_timeout(0),
+            Some(0),
+            "and it is due as soon as the carrier can take it"
+        );
+
+        // The carrier drains between turns, and the parked datagram is the
+        // first thing said on the next one -- so a burst is delayed, never
+        // lost.
+        driver.io.as_mut().expect("still running").room = None;
+        driver.tick(1, &[]).expect("tick");
+        assert_eq!(sent.borrow().get(1), Some(&parked));
+        assert_eq!(sent.borrow().len(), 3, "and the rest follow it");
+        assert!(driver.pending_action.is_none());
+    }
+
+    #[test]
+    fn a_carrier_still_full_on_the_next_turn_keeps_holding_the_datagram() {
+        let mut io = FakeIo::with_interfaces(2);
+        io.room = Some(0);
+        let sent = io.sent.clone();
+        let mut driver = driver(io);
+
+        driver.tick(0, &[]).expect("tick");
+        let parked = driver.pending_action.clone().expect("nothing fit");
+        driver
+            .tick(1, &[])
+            .expect("a link that is still full is not a fault");
+
+        assert!(driver.is_active());
+        assert!(sent.borrow().is_empty(), "nothing got through");
+        assert_eq!(
+            driver.pending_action.as_ref(),
+            Some(&parked),
+            "the same datagram is still first in line"
+        );
+        assert_eq!(driver.next_timeout(1), Some(0));
     }
 
     #[test]

@@ -32,6 +32,17 @@ pub enum MdnsError {
         /// Missing interface handle.
         interface: InterfaceId,
     },
+    /// The carrier has no room for another datagram right now.
+    ///
+    /// Not a fault either: a stack that moves bytes only when it is driven
+    /// fills up between polls, and what did not fit is still worth sending.
+    /// The driver parks the action and comes back for it on its next turn
+    /// rather than ending mDNS over a full buffer.
+    #[error("mDNS interface {interface:?} cannot take another datagram yet")]
+    Congested {
+        /// The interface whose buffer is full.
+        interface: InterfaceId,
+    },
     /// The stable interface-id counter was exhausted.
     #[error("mDNS interface id space is exhausted")]
     InterfaceIdsExhausted,
@@ -114,9 +125,13 @@ pub struct MdnsDatagram {
 /// owns: the mDNS group differs by family, and IPv6 needs the interface's
 /// scope. An action naming an interface that has gone away is
 /// [`MdnsError::UnknownInterface`], which the driver treats as a drop rather
-/// than a failure. Any other error stops mDNS: a stack that cannot send cannot
-/// participate, and retrying into it would only produce the same error with
-/// the peer's view of us going stale either way.
+/// than a failure. A send buffer with no room left for it is
+/// [`MdnsError::Congested`], which the driver treats as "not yet": the action
+/// is parked and retried on the next turn, once the carrier has had a chance
+/// to drain. Report that rather than a general failure whenever the datagram
+/// would fit at a calmer moment. Any other error stops mDNS: a stack that
+/// cannot send cannot participate, and retrying into it would only produce the
+/// same error with the peer's view of us going stale either way.
 pub trait MdnsIo {
     /// The interfaces mDNS is currently running on.
     fn interfaces(&self) -> &[InterfaceSnapshot];

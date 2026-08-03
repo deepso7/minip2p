@@ -95,6 +95,15 @@ struct Family {
 /// [`next_deadline`](MdnsIo::next_deadline) is what lets it sleep in between
 /// rather than poll to find out nothing happened.
 ///
+/// That is also why the send rings fill: a burst is queued long before
+/// anything drains them. A [`send`](MdnsIo::send) with no room left drives the
+/// stack itself and tries once more, and only reports
+/// [`MdnsError::Congested`] if the link still will not take it -- which the
+/// driver treats as a backlog, not a fault. Sizing
+/// [`packet_slots`](SmoltcpMdnsConfig::packet_slots) and
+/// [`tx_payload_bytes`](SmoltcpMdnsConfig::tx_payload_bytes) generously buys
+/// throughput, not correctness.
+///
 /// [smoltcp]: https://docs.rs/smoltcp
 pub struct SmoltcpMdnsIo<D: Device> {
     device: D,
@@ -226,6 +235,21 @@ impl<D: Device> SmoltcpMdnsIo<D> {
             })
             .collect()
     }
+
+    /// Moves whatever is waiting in either direction, and records when smoltcp
+    /// next wants driving.
+    ///
+    /// Separate from [`poll`](MdnsIo::poll) because a send that finds no room
+    /// needs the same drain without the caller having asked for one.
+    fn drive(&mut self, now_ms: u64) {
+        let timestamp = instant(now_ms);
+        self.iface
+            .poll(timestamp, &mut self.device, &mut self.sockets);
+        self.poll_at_ms = self
+            .iface
+            .poll_at(timestamp, &self.sockets)
+            .map(|at| u64::try_from(at.total_millis()).unwrap_or(0));
+    }
 }
 
 fn instant(millis: u64) -> Instant {
@@ -313,10 +337,19 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
             target,
             payload,
         } = action;
+        // Resolved against what the interface currently holds, not against the
+        // sockets that outlive it: a family whose last address went away is an
+        // interface mDNS can no longer speak on, and saying so is what lets the
+        // driver drop the packet rather than hand smoltcp one it has no source
+        // for.
+        let known = self
+            .snapshots
+            .iter()
+            .any(|snapshot| snapshot.id == *interface);
         let family = self
             .families
             .iter()
-            .find(|family| family.id == *interface)
+            .find(|family| known && family.id == *interface)
             .ok_or(MdnsError::UnknownInterface {
                 interface: *interface,
             })?;
@@ -325,22 +358,39 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
             MdnsTarget::Unicast { to } => socket_addr_to_endpoint(*to),
         };
         let handle = family.socket;
-        let socket = self.sockets.get_mut::<udp::Socket>(handle);
-        socket
-            .send_slice(payload, UdpMetadata::from(destination))
-            .map_err(|error| MdnsError::io("queueing an mDNS datagram", DisplayError(error)))?;
-        Ok(())
+        let queue = |io: &mut Self| {
+            io.sockets
+                .get_mut::<udp::Socket>(handle)
+                .send_slice(payload, UdpMetadata::from(destination))
+        };
+        match queue(self) {
+            Ok(()) => Ok(()),
+            // The ring empties only when the stack is driven, so a burst fills
+            // it well inside a single tick. Draining it here is the difference
+            // between a datagram delayed and the end of mDNS.
+            Err(udp::SendError::BufferFull) => {
+                let now_ms = self.now_ms;
+                self.drive(now_ms);
+                queue(self).map_err(|error| match error {
+                    // Still nothing: the link itself is not taking frames.
+                    // That is a backlog rather than a fault, and the driver
+                    // holds the datagram until it drains.
+                    udp::SendError::BufferFull => MdnsError::Congested {
+                        interface: *interface,
+                    },
+                    error => MdnsError::io("queueing an mDNS datagram", DisplayError(error)),
+                })
+            }
+            Err(error) => Err(MdnsError::io(
+                "queueing an mDNS datagram",
+                DisplayError(error),
+            )),
+        }
     }
 
     fn poll(&mut self, now_ms: u64) -> Result<(), MdnsError> {
         self.now_ms = now_ms;
-        let timestamp = instant(now_ms);
-        self.iface
-            .poll(timestamp, &mut self.device, &mut self.sockets);
-        self.poll_at_ms = self
-            .iface
-            .poll_at(timestamp, &self.sockets)
-            .map(|at| u64::try_from(at.total_millis()).unwrap_or(0));
+        self.drive(now_ms);
         Ok(())
     }
 

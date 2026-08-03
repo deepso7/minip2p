@@ -12,8 +12,9 @@
 
 #![cfg(feature = "smoltcp")]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::net::{IpAddr, Ipv4Addr};
 use std::rc::Rc;
 
 use minip2p_core::{Multiaddr, PeerId};
@@ -23,8 +24,8 @@ use minip2p_mdns::smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, Tx
 use minip2p_mdns::smoltcp::time::Instant;
 use minip2p_mdns::smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
 use minip2p_mdns::{
-    InterfaceId, MdnsAction, MdnsAgent, MdnsConfig, MdnsDriver, MdnsEvent, MdnsIo, MdnsTarget,
-    SmoltcpMdnsConfig, SmoltcpMdnsIo,
+    InterfaceId, MdnsAction, MdnsAgent, MdnsConfig, MdnsDriver, MdnsError, MdnsEvent, MdnsIo,
+    MdnsTarget, SmoltcpMdnsConfig, SmoltcpMdnsIo,
 };
 
 /// Enough ticks for several announcement rounds; short enough that a livelock
@@ -37,6 +38,10 @@ const STEP_MS: u64 = 5;
 // ---------------------------------------------------------------- the link
 
 type Frames = Rc<RefCell<VecDeque<Vec<u8>>>>;
+
+/// Whether a node's link is currently refusing frames, shared so a test can
+/// stall one that has already been handed to a driver.
+type Link = Rc<Cell<bool>>;
 
 /// A shared bus: whatever one node sends, every other node receives.
 ///
@@ -56,6 +61,7 @@ impl Bus {
         BusDevice {
             bus: self.clone(),
             inbox,
+            blocked: Link::default(),
         }
     }
 
@@ -89,6 +95,10 @@ impl Bus {
 struct BusDevice {
     bus: Bus,
     inbox: Frames,
+    /// A link that will not take a frame right now -- a radio mid-transmit, a
+    /// driver with no descriptor free. Nothing about mDNS is broken while this
+    /// is set; the frames simply have to wait.
+    blocked: Link,
 }
 
 struct RxFrame(Vec<u8>);
@@ -129,6 +139,9 @@ impl Device for BusDevice {
     }
 
     fn transmit(&mut self, _now: Instant) -> Option<TxSink> {
+        if self.blocked.get() {
+            return None;
+        }
         Some(self.sink())
     }
 
@@ -147,6 +160,17 @@ impl BusDevice {
             inbox: Rc::clone(&self.inbox),
         }
     }
+
+    /// A handle on whether this link is taking frames, still usable once the
+    /// device has been handed over.
+    fn link(&self) -> Link {
+        Rc::clone(&self.blocked)
+    }
+
+    /// Stops or resumes taking frames.
+    fn block(&self, blocked: bool) {
+        self.blocked.set(blocked);
+    }
 }
 
 // ------------------------------------------------------------- the nodes
@@ -161,8 +185,8 @@ fn addr(text: &str) -> Multiaddr {
     text.parse().expect("test address parses")
 }
 
-/// A bare carrier on the bus, holding exactly `address`.
-fn carrier(bus: &Bus, address: Ipv4Address) -> SmoltcpMdnsIo<BusDevice> {
+/// A bare carrier on the bus, holding exactly the addresses given.
+fn carrier(bus: &Bus, addresses: &[Ipv4Address]) -> SmoltcpMdnsIo<BusDevice> {
     let mut device = bus.attach();
     let mut iface = Interface::new(
         Config::new(HardwareAddress::Ip),
@@ -170,7 +194,9 @@ fn carrier(bus: &Bus, address: Ipv4Address) -> SmoltcpMdnsIo<BusDevice> {
         Instant::from_millis(0),
     );
     iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::new(address.into(), 24));
+        for address in addresses {
+            let _ = addrs.push(IpCidr::new((*address).into(), 24));
+        }
     });
     SmoltcpMdnsIo::new(
         device,
@@ -183,17 +209,33 @@ fn carrier(bus: &Bus, address: Ipv4Address) -> SmoltcpMdnsIo<BusDevice> {
     .expect("the interface takes the mDNS group")
 }
 
+/// The one interface a `SmoltcpMdnsIo` reports for IPv4.
+const IPV4: InterfaceId = InterfaceId::new(1);
+
+/// Something to put on the wire, small enough that only the slot count can
+/// run out.
+fn datagram() -> MdnsAction {
+    MdnsAction::Send {
+        interface: IPV4,
+        target: MdnsTarget::Multicast,
+        payload: vec![0x00; 12],
+    }
+}
+
 /// One node on the bus: its driver, what it listens on, and what it has seen.
 struct Node {
     driver: Driver,
     addrs: Vec<Multiaddr>,
     events: Vec<MdnsEvent>,
+    /// Whether this node's link is taking frames.
+    link: Link,
 }
 
 impl Node {
     /// A node holding exactly `address`, announcing a QUIC listener on it.
     fn new(bus: &Bus, address: Ipv4Address, seed: u8) -> Self {
         let mut device = bus.attach();
+        let link = device.link();
         let mut iface = Interface::new(
             Config::new(HardwareAddress::Ip),
             &mut device,
@@ -219,6 +261,7 @@ impl Node {
             driver: MdnsDriver::new(agent, io, &MdnsConfig::default()),
             addrs: vec![addr(&format!("/ip4/{address}/udp/4001/quic-v1"))],
             events: Vec::new(),
+            link,
         }
     }
 
@@ -312,39 +355,81 @@ fn a_node_that_leaves_says_so_on_the_wire() {
 #[test]
 fn an_idle_link_lets_the_host_sleep() {
     let bus = Bus::default();
-    let mut only = Node::new(&bus, Ipv4Address::new(192, 168, 1, 1), 1);
+    let mut first = Node::new(&bus, Ipv4Address::new(192, 168, 1, 1), 1);
+    let mut second = Node::new(&bus, Ipv4Address::new(192, 168, 1, 2), 2);
 
     // Drive until nothing is left on the wire, then ask what is owed. A
     // device that runs on a battery sleeps between packets, and this is the
-    // number that lets it: the soonest of the agent's own schedule and
-    // whatever smoltcp still owes.
+    // number that lets it.
+    let mut idle_at = None;
     for step in 0..200u64 {
         let now = step * STEP_MS;
-        only.tick(now);
-        if bus.is_quiet() && only.driver.next_timeout(now).unwrap_or(0) > 0 {
-            return;
+        first.tick(now);
+        second.tick(now);
+        if bus.is_quiet() {
+            idle_at = Some(now);
+            break;
         }
     }
-    panic!("the link never went quiet enough to sleep on");
+    let now = idle_at.expect("the link never went quiet");
+
+    // With the carrier owing nothing, the answer is exactly what mDNS itself
+    // owes: its own poll interval, its next interface re-enumeration, or the
+    // agent's next scheduled word, whichever comes first. Asserting the
+    // number rather than "more than zero" is what makes this a bound -- a
+    // carrier that claimed a deadline it did not have would shorten it, and a
+    // driver that ignored the carrier's deadlines would not be caught here at
+    // all, which is what the next test is for.
+    let config = MdnsConfig::default();
+    let mut expected = config
+        .socket_poll_interval_ms
+        .min(config.interface_refresh_ms - now);
+    if let Some(agent) = first.driver.agent().next_timeout(now) {
+        expected = expected.min(agent);
+    }
+    assert!(expected > 0, "an idle host has something to sleep on");
+    assert_eq!(first.driver.next_timeout(now), Some(expected));
+}
+
+#[test]
+fn a_carrier_that_still_owes_work_keeps_the_host_awake() {
+    let bus = Bus::default();
+    let mut only = Node::new(&bus, Ipv4Address::new(192, 168, 1, 1), 1);
+
+    // A link that will not take a frame. The announcement is queued inside
+    // smoltcp and goes nowhere, which is precisely when a host must not be
+    // told it may sleep: nothing in this stack moves while it does.
+    only.link.set(true);
+    only.tick(0);
+    assert_eq!(
+        only.driver.next_timeout(0),
+        Some(0),
+        "a datagram stuck in the carrier is owed a poll now"
+    );
+
+    // And once it drains, the host is back to sleeping on mDNS's own schedule
+    // -- so the zero above came from the carrier and not from something the
+    // driver always says.
+    only.link.set(false);
+    only.tick(1);
+    assert!(
+        only.driver.next_timeout(1).unwrap_or(0) > 0,
+        "with nothing left in the carrier there is something to sleep on"
+    );
 }
 
 #[test]
 fn a_datagram_queued_but_not_yet_on_the_wire_is_owed_now() {
     let bus = Bus::default();
     // A second node, so there is an inbox for a frame to arrive in.
-    let _listener = carrier(&bus, Ipv4Address::new(192, 168, 1, 2));
-    let mut io = carrier(&bus, Ipv4Address::new(192, 168, 1, 1));
+    let _listener = carrier(&bus, &[Ipv4Address::new(192, 168, 1, 2)]);
+    let mut io = carrier(&bus, &[Ipv4Address::new(192, 168, 1, 1)]);
     // Joining a group is itself something to say on the wire; this test is
     // about what happens after that.
     io.poll(0).expect("poll");
     bus.drain();
 
-    io.send(&MdnsAction::Send {
-        interface: InterfaceId::new(1),
-        target: MdnsTarget::Multicast,
-        payload: vec![0x00; 12],
-    })
-    .expect("queue a datagram");
+    io.send(&datagram()).expect("queue a datagram");
 
     // Queued is not sent: nothing leaves a stack like this until it is
     // driven, so a host told it could sleep would sleep on an unsent packet.
@@ -357,4 +442,90 @@ fn a_datagram_queued_but_not_yet_on_the_wire_is_owed_now() {
 
     io.poll(0).expect("poll");
     assert!(!bus.is_quiet(), "the poll is what puts it on the wire");
+}
+
+#[test]
+fn a_send_ring_with_no_room_is_a_backlog_and_not_the_end_of_mdns() {
+    let bus = Bus::default();
+    let _listener = carrier(&bus, &[Ipv4Address::new(192, 168, 1, 2)]);
+    let mut io = carrier(&bus, &[Ipv4Address::new(192, 168, 1, 1)]);
+    io.poll(0).expect("poll");
+
+    // A stack like this drains only when it is driven, so a burst queued
+    // inside one tick fills the ring long before anything empties it. The
+    // driver sends up to 128 datagrams a turn into four slots.
+    io.device_mut().block(true);
+    let slots = SmoltcpMdnsConfig::default().packet_slots;
+    for slot in 0..slots {
+        io.send(&datagram())
+            .unwrap_or_else(|error| panic!("slot {slot} of {slots} should be free: {error}"));
+    }
+
+    let error = io.send(&datagram()).expect_err("the ring is full");
+    assert_eq!(
+        error,
+        MdnsError::Congested { interface: IPV4 },
+        "a full ring is 'not yet', not 'never': anything else here ends mDNS \
+         because a device spoke faster than its link could carry"
+    );
+
+    // And the datagram that would not fit fits once the link takes frames
+    // again -- without the caller having polled, because a send that finds no
+    // room drains the ring itself before giving up.
+    io.device_mut().block(false);
+    io.send(&datagram())
+        .expect("the drain inside the send made room");
+    assert!(!bus.is_quiet(), "and the burst went out");
+}
+
+#[test]
+fn an_address_that_arrives_later_reaches_the_agent() {
+    let bus = Bus::default();
+    // An interface with nothing on it yet, which is where a host that waits
+    // for DHCP or SLAAC starts.
+    let mut io = carrier(&bus, &[]);
+
+    // Not an interface mDNS can speak on: no source to claim, and nothing
+    // on-link to accept.
+    assert!(io.interfaces().is_empty());
+    assert_eq!(
+        io.send(&datagram())
+            .expect_err("there is nowhere to send from"),
+        MdnsError::UnknownInterface { interface: IPV4 },
+        "a family with no address is gone as far as the driver is concerned, \
+         and saying so is what makes it drop the packet instead of stopping"
+    );
+
+    // The lease lands. Nothing tells mDNS about it but the next refresh.
+    io.interface_mut().update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(Ipv4Address::new(192, 168, 1, 5).into(), 24));
+    });
+    assert!(
+        io.refresh().expect("refresh"),
+        "an address that arrived is a change the agent has to hear about"
+    );
+    assert_eq!(io.interfaces().len(), 1);
+    let snapshot = &io.interfaces()[0];
+    assert_eq!(snapshot.id, IPV4, "and it is the same interface it was");
+    assert_eq!(snapshot.addrs.len(), 1);
+    assert_eq!(
+        snapshot.addrs[0].ip(),
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5))
+    );
+    assert_eq!(snapshot.addrs[0].prefix_len(), 24);
+    io.send(&datagram())
+        .expect("now there is somewhere to send from");
+    assert!(
+        !io.refresh().expect("refresh"),
+        "and an interface that did not move is not a change"
+    );
+
+    // A lease that expires is the same story backwards.
+    io.interface_mut().update_ip_addrs(|addrs| addrs.clear());
+    assert!(io.refresh().expect("refresh"));
+    assert!(io.interfaces().is_empty());
+    assert_eq!(
+        io.send(&datagram()).expect_err("the address went away"),
+        MdnsError::UnknownInterface { interface: IPV4 }
+    );
 }
