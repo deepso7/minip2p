@@ -422,7 +422,6 @@ mod tests {
         MdnsDriver::new(agent(), io, &MdnsConfig::default())
     }
 
-    /// A query for the libp2p service, which any interface answers.
     /// A recognisable libp2p mDNS name, malformed as a whole message.
     ///
     /// The agent reacts to it -- with a `ProtocolViolation` -- which makes it
@@ -653,6 +652,33 @@ mod tests {
         );
         assert_eq!(sent.borrow().len(), announced, "and not sent either");
         assert_eq!(driver.io.as_ref().expect("still running").refreshes, 1);
+    }
+
+    #[test]
+    fn a_changed_listen_address_drops_work_encoded_before_it() {
+        let io = FakeIo::with_interfaces(u32::try_from(MAX_ACTIONS_PER_TICK).expect("fits") + 2);
+        let sent = io.sent.clone();
+        let mut driver = driver(io);
+        driver.tick(0, &[]).expect("tick");
+        let stale = driver
+            .pending_action
+            .clone()
+            .expect("the budget parked one");
+        let announced = sent.borrow().len();
+
+        // What mDNS advertises is where this host listens, and the parked
+        // packet says what that was a moment ago. The parked one goes out
+        // first on the next turn, so if it survived a change it would be the
+        // first thing said -- announcing an address the host no longer has.
+        let addr: Multiaddr = "/ip4/192.168.1.1/udp/4001/quic-v1"
+            .parse()
+            .expect("test address");
+        driver.tick(1, &[addr]).expect("tick");
+        assert_ne!(
+            sent.borrow().get(announced),
+            Some(&stale),
+            "work encoded against the old listen addresses must not be sent after they change"
+        );
     }
 
     #[test]

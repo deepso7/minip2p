@@ -1,6 +1,6 @@
 [package]
 name = "minip2p-mdns"
-description = "Sans-I/O libp2p mDNS with an optional synchronous socket driver"
+description = "Sans-I/O libp2p mDNS with a portable driver and an optional socket adapter"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -66,8 +66,11 @@ pub struct MdnsDatagram {
     pub from: SocketAddr,
     /// How many leading bytes of the caller's buffer it filled.
     ///
-    /// A datagram larger than the buffer reports its true length, so a caller
-    /// can tell a truncated read from a short one and drop it.
+    /// Never more: a stack that truncates on the way in reports what it wrote,
+    /// which is all most of them can say. Truncation is still visible, because
+    /// the buffer the driver passes is one byte longer than
+    /// [`MAX_DATAGRAM_BYTES`] -- so a datagram that reaches the end of it was
+    /// too big to act on either way.
     pub len: usize,
 }
 
@@ -96,9 +99,13 @@ pub struct MdnsDatagram {
 /// than drain one first -- a busy interface would otherwise starve a quiet one
 /// of a caller's budget.
 ///
-/// A datagram bigger than the buffer is not an error: report its true length
-/// and the driver drops it, since [`MAX_DATAGRAM_BYTES`] is as far as mDNS
-/// will read anyway.
+/// Fill the buffer and report how much was written -- never more, whatever the
+/// datagram's true size was. A datagram too big to fit is not an error and
+/// needs no special report: the driver's buffer is one byte longer than
+/// [`MAX_DATAGRAM_BYTES`], so filling it is itself the signal, and the driver
+/// drops what it finds there. Do not silently cap a read at some smaller
+/// length of your own, though -- that would hand over a truncated claim
+/// wearing a plausible length.
 ///
 /// # Sending
 ///

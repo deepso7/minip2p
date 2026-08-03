@@ -67,12 +67,18 @@ struct SocketPair {
 }
 
 /// Per-interface mDNS receive/send socket collection.
+///
+/// The sockets are a list rather than a map: there are a handful of them, a
+/// receive happens up to a full budget's worth per tick, and walking a short
+/// list beats allocating anything at all on that path.
 #[derive(Debug)]
 pub struct MdnsSockets {
     enable_ipv6: bool,
     registry: InterfaceRegistry,
     snapshots: Vec<InterfaceSnapshot>,
-    pairs: BTreeMap<InterfaceId, SocketPair>,
+    pairs: Vec<SocketPair>,
+    /// Where the next receive starts looking, so one talkative interface
+    /// cannot spend a whole budget while a quiet one waits.
     next_receive_offset: usize,
 }
 
@@ -90,7 +96,7 @@ impl MdnsSockets {
                 enable_ipv6: config.enable_ipv6,
                 registry: InterfaceRegistry::default(),
                 snapshots: Vec::new(),
-                pairs: BTreeMap::new(),
+                pairs: Vec::new(),
                 next_receive_offset: 0,
             };
             sockets.refresh_interfaces()?;
@@ -106,13 +112,20 @@ impl MdnsSockets {
         }
 
         let mut old = core::mem::take(&mut self.pairs);
-        let mut pairs = BTreeMap::new();
+        let mut pairs = Vec::with_capacity(snapshots.len());
         for snapshot in &snapshots {
-            let pair = match old.remove(&snapshot.id) {
-                Some(pair) if pair.snapshot == *snapshot => pair,
-                _ => SocketPair::new(snapshot.clone())?,
+            // An interface that is still here with the same addresses keeps
+            // its sockets: rebuilding one would drop the multicast membership
+            // and lose whatever had arrived on it.
+            let existing = old
+                .iter()
+                .position(|pair| pair.snapshot == *snapshot)
+                .map(|index| old.swap_remove(index));
+            let pair = match existing {
+                Some(pair) => pair,
+                None => SocketPair::new(snapshot.clone())?,
             };
-            pairs.insert(snapshot.id, pair);
+            pairs.push(pair);
         }
         self.snapshots = snapshots;
         self.pairs = pairs;
@@ -131,24 +144,21 @@ impl MdnsIo for MdnsSockets {
     }
 
     fn receive(&mut self, buffer: &mut [u8]) -> Result<Option<MdnsDatagram>, MdnsError> {
-        if self.pairs.is_empty() {
+        let count = self.pairs.len();
+        if count == 0 {
             return Ok(None);
         }
-        let ids: Vec<InterfaceId> = self.pairs.keys().copied().collect();
-        // Starts where the last read stopped, so one talkative interface
-        // cannot spend a caller's whole budget while a quiet one waits.
-        for offset in 0..ids.len() {
-            let index = (self.next_receive_offset + offset) % ids.len();
-            let id = ids[index];
-            let pair = self
-                .pairs
-                .get_mut(&id)
-                .expect("ids are collected from the pair map");
+        // Starts where the last read stopped, and allocates nothing: this runs
+        // once per datagram, so a flood would pay for anything done here a
+        // budget's worth of times per tick.
+        for step in 0..count {
+            let index = (self.next_receive_offset + step) % count;
+            let pair = &mut self.pairs[index];
             match pair.receive.recv_from(buffer) {
                 Ok((len, from)) => {
-                    self.next_receive_offset = (index + 1) % ids.len();
+                    self.next_receive_offset = (index + 1) % count;
                     return Ok(Some(MdnsDatagram {
-                        interface: id,
+                        interface: pair.snapshot.id,
                         from,
                         len,
                     }));
@@ -168,7 +178,8 @@ impl MdnsIo for MdnsSockets {
         } = action;
         let pair = self
             .pairs
-            .get(interface)
+            .iter()
+            .find(|pair| pair.snapshot.id == *interface)
             .ok_or(MdnsError::UnknownInterface {
                 interface: *interface,
             })?;
@@ -350,11 +361,92 @@ fn primary_v6(snapshot: &InterfaceSnapshot) -> Result<Ipv6Addr, MdnsError> {
 }
 
 #[cfg(test)]
+impl MdnsSockets {
+    /// Builds a collection over sockets a test bound itself.
+    ///
+    /// The real constructor needs multicast membership on a real interface,
+    /// which a test machine may not have; the rotation between sockets is
+    /// ordinary logic that plain loopback sockets exercise just as well.
+    fn from_pairs(pairs: Vec<SocketPair>) -> Self {
+        Self {
+            enable_ipv6: false,
+            registry: InterfaceRegistry::default(),
+            snapshots: pairs.iter().map(|pair| pair.snapshot.clone()).collect(),
+            pairs,
+            next_receive_offset: 0,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn net(ip: IpAddr, prefix: u8) -> IpNet {
         IpNet::new(ip, prefix).unwrap()
+    }
+
+    /// A pair whose receive socket is a plain loopback UDP socket.
+    fn loopback_pair(id: u32) -> (SocketPair, SocketAddr) {
+        let receive = UdpSocket::bind("127.0.0.1:0").expect("a loopback socket");
+        receive.set_nonblocking(true).expect("nonblocking");
+        let addr = receive.local_addr().expect("bound address");
+        let send = UdpSocket::bind("127.0.0.1:0").expect("a loopback socket");
+        let snapshot = InterfaceSnapshot {
+            id: InterfaceId::new(id),
+            index: id,
+            family: IpFamily::V4,
+            addrs: vec![net(IpAddr::V4(Ipv4Addr::LOCALHOST), 8)],
+        };
+        (
+            SocketPair {
+                snapshot,
+                receive,
+                send,
+            },
+            addr,
+        )
+    }
+
+    /// Reads one datagram, giving the kernel a moment to deliver it.
+    fn next_interface(sockets: &mut MdnsSockets) -> InterfaceId {
+        let mut buffer = [0u8; 64];
+        for _ in 0..1_000 {
+            if let Some(datagram) = sockets.receive(&mut buffer).expect("receive") {
+                return datagram.interface;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("a datagram sent on loopback never arrived");
+    }
+
+    #[test]
+    fn receiving_rotates_between_interfaces() {
+        let (first, first_addr) = loopback_pair(1);
+        let (second, second_addr) = loopback_pair(2);
+        let mut sockets = MdnsSockets::from_pairs(vec![first, second]);
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("a loopback socket");
+
+        // Two waiting on one interface and one on the other. Draining the
+        // first would spend a caller's budget on whichever interface happened
+        // to be talking most, and a quiet one could wait indefinitely.
+        sender.send_to(b"a", first_addr).expect("send");
+        sender.send_to(b"a", first_addr).expect("send");
+        sender.send_to(b"b", second_addr).expect("send");
+
+        assert_eq!(
+            [
+                next_interface(&mut sockets),
+                next_interface(&mut sockets),
+                next_interface(&mut sockets),
+            ],
+            [
+                InterfaceId::new(1),
+                InterfaceId::new(2),
+                InterfaceId::new(1)
+            ],
+            "each read starts where the last one stopped"
+        );
     }
 
     #[test]
