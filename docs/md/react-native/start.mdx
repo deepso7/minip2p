@@ -1,6 +1,6 @@
 ---
 title: Start with React Native
-description: Create a native endpoint, follow its component lifecycle, connect to a peer, and measure a Ping RTT.
+description: Install and configure the native package, create an endpoint, connect to a peer, and measure a Ping RTT.
 ---
 
 This guide creates one minip2p endpoint for a committed React component,
@@ -40,9 +40,82 @@ Ping RTT.
   </Tab>
 </Tabs>
 
-Because this package contains native code, rebuild the app after installing it.
-See [Install for React Native](/quickstart/install#react-native) for platform
-requirements and development-build commands. Expo Go is not supported.
+The adapter is a native package and requires React Native's New Architecture
+and Hermes.
+
+| Toolchain | Current requirement |
+| --- | --- |
+| React Native | 0.85, New Architecture, Hermes |
+| Node.js | 22 or newer |
+| Android | SDK 36 and NDK 28.2.13676358 |
+| iOS | Xcode 26 and deployment target 15.1 or newer |
+
+### Create a development build
+
+After adding the package, rebuild the native application so React Native can
+autolink its TurboModule and bundled Rust libraries. **Expo Go is not
+supported** because it cannot load custom native code.
+
+Expo SDK 56 applications should use `expo-dev-client`:
+
+```bash
+npx expo install expo-dev-client
+npx expo prebuild
+```
+
+Then build and start the target platform:
+
+<Tabs>
+  <Tab title="iOS">
+
+    ```bash
+    npx expo run:ios
+    npx expo start --dev-client
+    ```
+
+  </Tab>
+  <Tab title="Android">
+
+    ```bash
+    npx expo run:android
+    npx expo start --dev-client
+    ```
+
+  </Tab>
+</Tabs>
+
+Bare React Native applications can use their normal iOS or Android build after
+installing the package. Ensure the project uses the required deployment target,
+SDK, and NDK versions above.
+
+### Local-network permissions
+
+Only applications that enable mDNS need local multicast setup.
+
+<Tabs>
+  <Tab title="iOS / Expo config">
+
+    ```json
+    {
+      "ios": {
+        "infoPlist": {
+          "NSBonjourServices": ["_p2p._udp"],
+          "NSLocalNetworkUsageDescription": "Discover nearby peers."
+        }
+      }
+    }
+    ```
+
+  </Tab>
+  <Tab title="Android manifest">
+
+    ```xml
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    ```
+
+  </Tab>
+</Tabs>
 
 ## Own the endpoint
 
@@ -154,5 +227,5 @@ Aborting a Promise rejects it with `AbortError`. A timed-out Promise rejects
 with `TimeoutError`. For `connect*`, cancellation also cancels that native
 connection attempt.
 
-Next: [Endpoint lifecycle](//react-native/lifecycle) or
-[Connections and streams](//react-native/connections-and-streams).
+Next: [Endpoint lifecycle](/react-native/lifecycle) or
+[Connections and streams](/react-native/connections-and-streams).
