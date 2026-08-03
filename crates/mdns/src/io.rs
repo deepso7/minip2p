@@ -133,6 +133,30 @@ pub trait MdnsIo {
 
     /// Sends one encoded datagram out of the interface the action names.
     fn send(&mut self, action: &MdnsAction) -> Result<(), MdnsError>;
+
+    /// Moves whatever is waiting, in either direction.
+    ///
+    /// An operating system does this on its own, so the default does nothing.
+    /// A stack running in this process does not: nothing arrives or leaves
+    /// except when it is driven, and it needs to be told the time to do it.
+    /// The driver calls this before reading and again after writing, so
+    /// neither direction waits a whole tick.
+    fn poll(&mut self, now_ms: u64) -> Result<(), MdnsError> {
+        let _ = now_ms;
+        Ok(())
+    }
+
+    /// How long the host may idle before this needs [`poll`](Self::poll)
+    /// again, in milliseconds from `now_ms`.
+    ///
+    /// A stack of its own has timers -- retransmits, group memberships to
+    /// renew -- that no amount of mDNS quiet makes unnecessary. `None`, the
+    /// default, means the carrier needs nothing on a timer, which is the
+    /// truth for a socket the operating system services.
+    fn next_deadline(&self, now_ms: u64) -> Option<u64> {
+        let _ = now_ms;
+        None
+    }
 }
 
 /// Whether `source` is on one of the networks this interface holds.
@@ -185,6 +209,7 @@ mod tests {
     use super::*;
     use crate::IpFamily;
     use alloc::vec;
+    use alloc::vec::Vec;
     use core::net::{Ipv4Addr, Ipv6Addr};
 
     fn net(ip: IpAddr, prefix: u8) -> IpNet {

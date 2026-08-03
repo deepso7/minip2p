@@ -408,16 +408,32 @@ mod tests {
         )
     }
 
-    /// Reads one datagram, giving the kernel a moment to deliver it.
     fn next_interface(sockets: &mut MdnsSockets) -> InterfaceId {
         let mut buffer = [0u8; 64];
-        for _ in 0..1_000 {
-            if let Some(datagram) = sockets.receive(&mut buffer).expect("receive") {
-                return datagram.interface;
+        sockets
+            .receive(&mut buffer)
+            .expect("receive")
+            .expect("a datagram was waiting")
+            .interface
+    }
+
+    /// Waits until every socket has something waiting.
+    ///
+    /// Loopback delivery is prompt but not synchronous, and reading before it
+    /// lands would test the kernel's timing rather than the rotation.
+    fn wait_until_all_ready(sockets: &MdnsSockets) {
+        for pair in &sockets.pairs {
+            let mut peek = [0u8; 1];
+            let mut ready = false;
+            for _ in 0..1_000 {
+                if pair.receive.peek_from(&mut peek).is_ok() {
+                    ready = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            assert!(ready, "a datagram sent on loopback never arrived");
         }
-        panic!("a datagram sent on loopback never arrived");
     }
 
     #[test]
@@ -433,6 +449,7 @@ mod tests {
         sender.send_to(b"a", first_addr).expect("send");
         sender.send_to(b"a", first_addr).expect("send");
         sender.send_to(b"b", second_addr).expect("send");
+        wait_until_all_ready(&sockets);
 
         assert_eq!(
             [

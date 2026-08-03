@@ -113,6 +113,11 @@ impl<I: MdnsIo> MdnsDriver<I> {
         if self.io.is_none() {
             return Ok(());
         }
+        // Anything waiting to come in has to be in before it can be read: a
+        // carrier that moves bytes only when driven holds them until now.
+        if let Err(error) = self.io.as_mut().expect("checked above").poll(now_ms) {
+            return Err(self.fail(error, now_ms));
+        }
         if now_ms >= self.next_interface_refresh_ms {
             let changed = match self.io.as_mut().expect("checked above").refresh() {
                 Ok(changed) => changed,
@@ -152,6 +157,12 @@ impl<I: MdnsIo> MdnsDriver<I> {
             Err(error) => return Err(self.fail(error, now_ms)),
         };
 
+        // And again on the way out, so what was just sent leaves now rather
+        // than waiting for whatever wakes the host next.
+        if let Err(error) = self.io.as_mut().expect("checked above").poll(now_ms) {
+            return Err(self.fail(error, now_ms));
+        }
+
         self.backlog = receive_backlog || action_backlog;
         self.drain_events();
         Ok(())
@@ -162,7 +173,7 @@ impl<I: MdnsIo> MdnsDriver<I> {
     /// `None` once mDNS has stopped, so a host can drop it from its timeline
     /// rather than wake for something that will do nothing.
     pub fn next_timeout(&self, now_ms: u64) -> Option<u64> {
-        self.io.as_ref()?;
+        let io = self.io.as_ref()?;
         if self.backlog {
             // Work was left on the floor by this tick's budget, so the next
             // one is due regardless of what any timer says.
@@ -173,6 +184,12 @@ impl<I: MdnsIo> MdnsDriver<I> {
             .min(self.next_interface_refresh_ms.saturating_sub(now_ms));
         if let Some(agent) = self.agent.next_timeout(now_ms) {
             timeout = timeout.min(agent);
+        }
+        // The carrier's own timers count too: a stack running in this process
+        // gets nothing done between ticks, so a host that slept past one of
+        // its deadlines would stall it.
+        if let Some(carrier) = io.next_deadline(now_ms) {
+            timeout = timeout.min(carrier);
         }
         Some(timeout)
     }
@@ -204,6 +221,15 @@ impl<I: MdnsIo> MdnsDriver<I> {
             {
                 first_error = Some(error);
             }
+        }
+        // The carrier is about to be dropped, so this is its last chance to
+        // put those on the wire. A stack that moves bytes only when driven
+        // would otherwise take every goodbye with it -- and a goodbye that
+        // never left is the exact thing it exists to prevent.
+        if let Err(error) = io.poll(now_ms)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
         self.drain_events();
         match first_error {
@@ -328,9 +354,15 @@ mod tests {
         /// How many times `refresh` was asked, and what it reports.
         refreshes: usize,
         refresh_changes: bool,
+        /// What this was asked to do, in order. Shared for the same reason
+        /// `sent` is: a shutdown drops the io before a test can read it.
+        ops: Ops,
+        /// What `next_deadline` reports.
+        carrier_deadline: Option<u64>,
     }
 
     type Sent = alloc::rc::Rc<core::cell::RefCell<Vec<MdnsAction>>>;
+    type Ops = alloc::rc::Rc<core::cell::RefCell<Vec<&'static str>>>;
 
     impl FakeIo {
         fn with_interfaces(count: u32) -> Self {
@@ -365,6 +397,15 @@ mod tests {
             &self.interfaces
         }
 
+        fn poll(&mut self, _now_ms: u64) -> Result<(), MdnsError> {
+            self.ops.borrow_mut().push("poll");
+            Ok(())
+        }
+
+        fn next_deadline(&self, _now_ms: u64) -> Option<u64> {
+            self.carrier_deadline
+        }
+
         fn refresh(&mut self) -> Result<bool, MdnsError> {
             self.refreshes += 1;
             if self.refresh_fails {
@@ -374,6 +415,7 @@ mod tests {
         }
 
         fn receive(&mut self, buffer: &mut [u8]) -> Result<Option<MdnsDatagram>, MdnsError> {
+            self.ops.borrow_mut().push("receive");
             if self.receive_fails {
                 return Err(MdnsError::io("receive", "socket is gone"));
             }
@@ -390,6 +432,7 @@ mod tests {
         }
 
         fn send(&mut self, action: &MdnsAction) -> Result<(), MdnsError> {
+            self.ops.borrow_mut().push("send");
             let MdnsAction::Send { interface, .. } = action;
             if self.vanished.contains(interface) {
                 return Err(MdnsError::UnknownInterface {
@@ -682,6 +725,44 @@ mod tests {
     }
 
     #[test]
+    fn the_carrier_is_driven_before_reading_and_after_writing() {
+        let mut io = FakeIo::with_interfaces(1);
+        io.queue(1, CLAIM);
+        let ops = io.ops.clone();
+        let mut driver = driver(io);
+
+        driver.tick(0, &[]).expect("tick");
+        let ops = ops.borrow();
+
+        // A stack running in this process moves nothing on its own. Reading
+        // before driving it would find an empty link however much had
+        // arrived, and sending without driving it afterwards would leave the
+        // datagram sitting until whatever wakes the host next.
+        assert_eq!(ops.first(), Some(&"poll"), "{ops:?}");
+        assert_eq!(ops.last(), Some(&"poll"), "{ops:?}");
+        let first_receive = ops.iter().position(|op| *op == "receive").expect("a read");
+        let last_send = ops.iter().rposition(|op| *op == "send").expect("a write");
+        assert!(first_receive > 0 && last_send < ops.len() - 1, "{ops:?}");
+    }
+
+    #[test]
+    fn a_carrier_with_its_own_timers_is_on_the_hosts_timeline() {
+        let mut io = FakeIo::with_interfaces(1);
+        io.carrier_deadline = Some(5);
+        let mut driver = driver(io);
+        driver.tick(0, &[]).expect("tick");
+
+        // A stack of its own gets nothing done between ticks, so a host that
+        // slept through one of its deadlines would stall it -- retransmits
+        // included.
+        assert_eq!(
+            driver.next_timeout(0),
+            Some(5),
+            "the soonest of everything on the timeline, not just mDNS's own"
+        );
+    }
+
+    #[test]
     fn a_shutdown_says_every_goodbye_once() {
         let io = FakeIo::with_interfaces(3);
         let sent = io.sent.clone();
@@ -707,6 +788,29 @@ mod tests {
             sent.borrow().len(),
             after_goodbye,
             "a goodbye is said once, not once per call"
+        );
+    }
+
+    #[test]
+    fn a_goodbye_is_driven_out_before_the_carrier_is_let_go() {
+        let io = FakeIo::with_interfaces(2);
+        let ops = io.ops.clone();
+        let mut driver = driver(io);
+        driver.tick(0, &[]).expect("tick");
+        ops.borrow_mut().clear();
+
+        // The carrier is dropped at the end of a shutdown, so this is its
+        // last chance to put the goodbyes on the wire. A stack that moves
+        // bytes only when driven would take every one of them with it --
+        // and a goodbye that never left is the exact thing it exists to
+        // prevent.
+        driver.shutdown(10).expect("goodbye");
+        let ops = ops.borrow();
+        assert!(ops.contains(&"send"), "{ops:?}");
+        assert_eq!(
+            ops.last(),
+            Some(&"poll"),
+            "the goodbyes are driven out after they are queued: {ops:?}"
         );
     }
 

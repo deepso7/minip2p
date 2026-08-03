@@ -15,8 +15,12 @@
 //!
 //! With the default `std` feature, [`MdnsSockets`] is the hosted [`MdnsIo`]:
 //! per-interface multicast sockets over `socket2`, with interface enumeration.
-//! A host without an operating system implements [`MdnsIo`] over its own
-//! stack; nothing above that seam changes.
+//! `SmoltcpMdnsIo` is the embedded one, over a [smoltcp] interface the host
+//! configures; it needs the `smoltcp` feature and no operating system. Hosts
+//! with neither implement [`MdnsIo`] over their own stack; nothing above that
+//! seam changes.
+//!
+//! [smoltcp]: https://docs.rs/smoltcp
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -28,8 +32,13 @@ mod dns;
 mod driver;
 mod events;
 mod io;
+#[cfg(feature = "smoltcp")]
+mod smoltcp_io;
 #[cfg(feature = "std")]
 mod socket;
+
+#[cfg(feature = "smoltcp")]
+pub use smoltcp;
 
 pub use agent::MdnsAgent;
 pub use config::{MdnsConfig, MdnsConfigError};
@@ -39,5 +48,7 @@ pub use events::{
     InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAction, MdnsEvent, MdnsTarget,
 };
 pub use io::{MAX_DATAGRAM_BYTES, MdnsDatagram, MdnsError, MdnsIo};
+#[cfg(feature = "smoltcp")]
+pub use smoltcp_io::{MAX_USEFUL_PAYLOAD_BYTES, SmoltcpMdnsConfig, SmoltcpMdnsIo};
 #[cfg(feature = "std")]
 pub use socket::MdnsSockets;

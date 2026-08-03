@@ -1144,6 +1144,7 @@ dependencies = [
  "if-addrs",
  "minip2p-core",
  "minip2p-identity",
+ "smoltcp",
  "socket2",
  "thiserror",
 ]

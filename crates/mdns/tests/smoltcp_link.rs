@@ -1,0 +1,360 @@
+//! Drives two `MdnsDriver`s over real multicast, on a stack with no operating
+//! system underneath it.
+//!
+//! The driver's own tests pin it against an `MdnsIo` written to satisfy it.
+//! These pin it against one that was not: smoltcp does its own group
+//! memberships, addressing, and framing, and the only thing between it and the
+//! driver is `SmoltcpMdnsIo`. Whatever the seam actually promises rather than
+//! merely describes has to hold here.
+//!
+//! The link is a shared bus of frames, so datagrams are real, multicast
+//! delivery is real, and time is whatever the harness says it is.
+
+#![cfg(feature = "smoltcp")]
+
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::rc::Rc;
+
+use minip2p_core::{Multiaddr, PeerId};
+use minip2p_identity::{KeyType, PublicKey};
+use minip2p_mdns::smoltcp::iface::{Config, Interface};
+use minip2p_mdns::smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use minip2p_mdns::smoltcp::time::Instant;
+use minip2p_mdns::smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
+use minip2p_mdns::{
+    InterfaceId, MdnsAction, MdnsAgent, MdnsConfig, MdnsDriver, MdnsEvent, MdnsIo, MdnsTarget,
+    SmoltcpMdnsConfig, SmoltcpMdnsIo,
+};
+
+/// Enough ticks for several announcement rounds; short enough that a livelock
+/// fails rather than hangs.
+const MAX_STEPS: usize = 4_000;
+
+/// How far the harness clock moves per step.
+const STEP_MS: u64 = 5;
+
+// ---------------------------------------------------------------- the link
+
+type Frames = Rc<RefCell<VecDeque<Vec<u8>>>>;
+
+/// A shared bus: whatever one node sends, every other node receives.
+///
+/// Point-to-point queues would not do -- mDNS is multicast, and the thing
+/// worth testing is that a datagram addressed to a group reaches a host that
+/// joined it and nothing else.
+#[derive(Clone, Default)]
+struct Bus {
+    inboxes: Rc<RefCell<Vec<Frames>>>,
+}
+
+impl Bus {
+    /// Attaches a node, returning the device it drives.
+    fn attach(&self) -> BusDevice {
+        let inbox: Frames = Frames::default();
+        self.inboxes.borrow_mut().push(Rc::clone(&inbox));
+        BusDevice {
+            bus: self.clone(),
+            inbox,
+        }
+    }
+
+    fn broadcast(&self, from: &Frames, frame: Vec<u8>) {
+        for inbox in self.inboxes.borrow().iter() {
+            // Not back to the sender: a real link does not hand a host its own
+            // frame back, and an mDNS agent that heard itself would answer
+            // its own queries.
+            if Rc::ptr_eq(inbox, from) {
+                continue;
+            }
+            inbox.borrow_mut().push_back(frame.clone());
+        }
+    }
+
+    /// Throws away whatever is in flight, so a test can start from silence.
+    fn drain(&self) {
+        for inbox in self.inboxes.borrow().iter() {
+            inbox.borrow_mut().clear();
+        }
+    }
+
+    fn is_quiet(&self) -> bool {
+        self.inboxes
+            .borrow()
+            .iter()
+            .all(|inbox| inbox.borrow().is_empty())
+    }
+}
+
+struct BusDevice {
+    bus: Bus,
+    inbox: Frames,
+}
+
+struct RxFrame(Vec<u8>);
+
+impl RxToken for RxFrame {
+    fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
+        f(&self.0)
+    }
+}
+
+struct TxSink {
+    bus: Bus,
+    inbox: Frames,
+}
+
+impl TxToken for TxSink {
+    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+        let mut frame = vec![0u8; len];
+        let result = f(&mut frame);
+        self.bus.broadcast(&self.inbox, frame);
+        result
+    }
+}
+
+impl Device for BusDevice {
+    type RxToken<'a>
+        = RxFrame
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = TxSink
+    where
+        Self: 'a;
+
+    fn receive(&mut self, _now: Instant) -> Option<(RxFrame, TxSink)> {
+        let frame = self.inbox.borrow_mut().pop_front()?;
+        Some((RxFrame(frame), self.sink()))
+    }
+
+    fn transmit(&mut self, _now: Instant) -> Option<TxSink> {
+        Some(self.sink())
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut capabilities = DeviceCapabilities::default();
+        capabilities.medium = Medium::Ip;
+        capabilities.max_transmission_unit = 1500;
+        capabilities
+    }
+}
+
+impl BusDevice {
+    fn sink(&self) -> TxSink {
+        TxSink {
+            bus: self.bus.clone(),
+            inbox: Rc::clone(&self.inbox),
+        }
+    }
+}
+
+// ------------------------------------------------------------- the nodes
+
+type Driver = MdnsDriver<SmoltcpMdnsIo<BusDevice>>;
+
+fn peer(seed: u8) -> PeerId {
+    PeerId::from_public_key(&PublicKey::new(KeyType::Ed25519, vec![seed; 32]))
+}
+
+fn addr(text: &str) -> Multiaddr {
+    text.parse().expect("test address parses")
+}
+
+/// A bare carrier on the bus, holding exactly `address`.
+fn carrier(bus: &Bus, address: Ipv4Address) -> SmoltcpMdnsIo<BusDevice> {
+    let mut device = bus.attach();
+    let mut iface = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut device,
+        Instant::from_millis(0),
+    );
+    iface.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(address.into(), 24));
+    });
+    SmoltcpMdnsIo::new(
+        device,
+        iface,
+        SmoltcpMdnsConfig {
+            enable_ipv6: false,
+            ..SmoltcpMdnsConfig::default()
+        },
+    )
+    .expect("the interface takes the mDNS group")
+}
+
+/// One node on the bus: its driver, what it listens on, and what it has seen.
+struct Node {
+    driver: Driver,
+    addrs: Vec<Multiaddr>,
+    events: Vec<MdnsEvent>,
+}
+
+impl Node {
+    /// A node holding exactly `address`, announcing a QUIC listener on it.
+    fn new(bus: &Bus, address: Ipv4Address, seed: u8) -> Self {
+        let mut device = bus.attach();
+        let mut iface = Interface::new(
+            Config::new(HardwareAddress::Ip),
+            &mut device,
+            Instant::from_millis(0),
+        );
+        iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(address.into(), 24));
+        });
+        let io = SmoltcpMdnsIo::new(
+            device,
+            iface,
+            SmoltcpMdnsConfig {
+                // IPv4 only: the bus carries whatever smoltcp puts on it, and
+                // one family is enough to pin the seam.
+                enable_ipv6: false,
+                ..SmoltcpMdnsConfig::default()
+            },
+        )
+        .expect("the interface takes the mDNS group");
+        let agent = MdnsAgent::new(peer(seed), MdnsConfig::default(), [seed; 32])
+            .expect("a valid configuration");
+        Self {
+            driver: MdnsDriver::new(agent, io, &MdnsConfig::default()),
+            addrs: vec![addr(&format!("/ip4/{address}/udp/4001/quic-v1"))],
+            events: Vec::new(),
+        }
+    }
+
+    fn tick(&mut self, now_ms: u64) {
+        self.driver.tick(now_ms, &self.addrs).expect("tick");
+        while let Some(event) = self.driver.poll_event() {
+            self.events.push(event);
+        }
+    }
+
+    /// What this node learned about `wanted`, if anything.
+    fn observed(&self, wanted: &PeerId) -> Option<Vec<(Multiaddr, u64)>> {
+        self.events.iter().find_map(|event| match event {
+            MdnsEvent::PeerObserved { peer, addrs } if peer == wanted => Some(addrs.clone()),
+            _ => None,
+        })
+    }
+}
+
+/// Ticks both nodes until `done`, or panics with what was seen.
+fn run_until(first: &mut Node, second: &mut Node, mut done: impl FnMut(&Node, &Node) -> bool) {
+    for step in 0..MAX_STEPS {
+        let now = step as u64 * STEP_MS;
+        first.tick(now);
+        second.tick(now);
+        if done(first, second) {
+            return;
+        }
+    }
+    panic!(
+        "nothing happened in {MAX_STEPS} steps:\n  {:?}\n  {:?}",
+        first.events, second.events
+    );
+}
+
+// ----------------------------------------------------------------- tests
+
+#[test]
+fn two_nodes_find_each_other_over_multicast() {
+    let bus = Bus::default();
+    let mut first = Node::new(&bus, Ipv4Address::new(192, 168, 1, 1), 1);
+    let mut second = Node::new(&bus, Ipv4Address::new(192, 168, 1, 2), 2);
+
+    run_until(&mut first, &mut second, |a, b| {
+        a.observed(&peer(2)).is_some() && b.observed(&peer(1)).is_some()
+    });
+
+    // What each learned is what the other actually listens on -- the whole
+    // point of the exchange, and the part no fake could have got right by
+    // accident.
+    for (learner, subject, id) in [(&first, &second, peer(2)), (&second, &first, peer(1))] {
+        let learned = learner.observed(&id).expect("the other node was observed");
+        assert!(
+            learned
+                .iter()
+                .any(|(addr, ttl)| *addr == subject.addrs[0] && *ttl > 0),
+            "expected {:?}, got {learned:?}",
+            subject.addrs[0]
+        );
+    }
+}
+
+#[test]
+fn a_node_that_leaves_says_so_on_the_wire() {
+    let bus = Bus::default();
+    let mut first = Node::new(&bus, Ipv4Address::new(192, 168, 1, 1), 1);
+    let mut second = Node::new(&bus, Ipv4Address::new(192, 168, 1, 2), 2);
+    run_until(&mut first, &mut second, |a, _| {
+        a.observed(&peer(2)).is_some()
+    });
+
+    // A goodbye is a claim with a zero TTL, and it has to reach the peer: an
+    // unsent one costs it a full TTL of pointing at a host that has gone.
+    // The carrier is dropped as the shutdown ends, so anything still queued
+    // in it then is lost.
+    second.driver.shutdown(1_000).expect("goodbye");
+    first.events.clear();
+    for step in 0..200u64 {
+        first.tick(1_000 + step * STEP_MS);
+        let said_goodbye = first.events.iter().any(|event| {
+            matches!(event, MdnsEvent::PeerObserved { peer: p, addrs }
+                if *p == peer(2) && addrs.iter().all(|(_, ttl)| *ttl == 0))
+        });
+        if said_goodbye {
+            return;
+        }
+    }
+    panic!("no goodbye arrived: {:?}", first.events);
+}
+
+#[test]
+fn an_idle_link_lets_the_host_sleep() {
+    let bus = Bus::default();
+    let mut only = Node::new(&bus, Ipv4Address::new(192, 168, 1, 1), 1);
+
+    // Drive until nothing is left on the wire, then ask what is owed. A
+    // device that runs on a battery sleeps between packets, and this is the
+    // number that lets it: the soonest of the agent's own schedule and
+    // whatever smoltcp still owes.
+    for step in 0..200u64 {
+        let now = step * STEP_MS;
+        only.tick(now);
+        if bus.is_quiet() && only.driver.next_timeout(now).unwrap_or(0) > 0 {
+            return;
+        }
+    }
+    panic!("the link never went quiet enough to sleep on");
+}
+
+#[test]
+fn a_datagram_queued_but_not_yet_on_the_wire_is_owed_now() {
+    let bus = Bus::default();
+    // A second node, so there is an inbox for a frame to arrive in.
+    let _listener = carrier(&bus, Ipv4Address::new(192, 168, 1, 2));
+    let mut io = carrier(&bus, Ipv4Address::new(192, 168, 1, 1));
+    // Joining a group is itself something to say on the wire; this test is
+    // about what happens after that.
+    io.poll(0).expect("poll");
+    bus.drain();
+
+    io.send(&MdnsAction::Send {
+        interface: InterfaceId::new(1),
+        target: MdnsTarget::Multicast,
+        payload: vec![0x00; 12],
+    })
+    .expect("queue a datagram");
+
+    // Queued is not sent: nothing leaves a stack like this until it is
+    // driven, so a host told it could sleep would sleep on an unsent packet.
+    assert_eq!(
+        io.next_deadline(0),
+        Some(0),
+        "a queued datagram is owed a poll now, whatever smoltcp's own timers say"
+    );
+    assert!(bus.is_quiet(), "and it has not gone anywhere yet");
+
+    io.poll(0).expect("poll");
+    assert!(!bus.is_quiet(), "the poll is what puts it on the wire");
+}
