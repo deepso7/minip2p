@@ -7,211 +7,126 @@
 A minimal [libp2p](https://libp2p.io/) implementation in Rust: small,
 portable, understandable, and pleasant to use.
 
-The project is built around five non-negotiables:
+minip2p is built around a few deliberate constraints:
 
-- **Sans-I/O architecture**: protocol and orchestration logic are
-  deterministic state machines; sockets, clocks, and timers live only in
-  adapters.
-- **`no_std + alloc` core crates**, portable to embedded targets.
-- **No `async`/`.await`**: everything is caller-driven and
-  executor-independent.
-- **QUIC only**: one great transport adapter; others are out of scope.
-- **Top-notch DX** with clear defaults, actionable errors, and easy local
-  bring-up.
+- Protocol and orchestration logic is Sans-I/O and deterministic.
+- Core crates support `no_std + alloc`.
+- There is no `async`/`.await`; callers choose the executor and drive progress.
+- QUIC is the only transport adapter.
+- `unsafe` is forbidden across the workspace.
 
-`unsafe` is forbidden workspace-wide.
-
-## 0.2.0 — 2026-07-28
-
-- Consolidated varint-length-prefixed framing in `minip2p-core` and reduced
-  duplicated protocol codec code.
-- Simplified direct-address selection to `select_direct_addrs` and moved
-  reusable multiaddr and stream-event predicates onto their owning types.
-- Tightened entropy handling: ping generation now fails explicitly if OS
-  randomness is unavailable, and custom circuit entropy sources can report
-  backend failures through `EntropyError::new`.
-- Removed unused pre-1.0 APIs and test-only surface across the workspace.
-
-## 0.1.1 — 2026-07-27
-
-- The `Endpoint` pubsub API now selects gossipsub by default. This is a pre-1.0
-  behavior change: `EndpointBuilder::pubsub_config` accepts either
-  `GossipsubConfig` or `FloodsubConfig` through `PubsubConfig`; applications
-  that require the old engine must pass `FloodsubConfig::default()`
-  explicitly. Each engine advertises only its own protocol ids, so mixed
-  gossipsub/floodsub endpoints intentionally do not exchange pubsub traffic.
-
-## Workspace status
-
-Sans-I/O protocol crates (`no_std + alloc`):
-
-- `crates/identity` (`minip2p-identity`): peer identity primitives, Ed25519 keys, varint helpers.
-- `crates/core` (`minip2p-core`): transport-agnostic types (`Multiaddr`, `PeerAddr`, `Protocol`, `PeerId` re-export).
-- `crates/transport` (`minip2p-transport`): transport contract, shared lifecycle types (trait + data types only).
-- `crates/tls` (`minip2p-tls`): libp2p TLS certificate generation and peer verification.
-- `crates/noise` (`minip2p-noise`): Sans-I/O libp2p Noise XX security handshake and transport cipher.
-- `crates/yamux` (`minip2p-yamux`): bounded Sans-I/O libp2p Yamux stream multiplexer.
-- `crates/circuit` (`minip2p-circuit`): Sans-I/O transport wrapper that promotes relay bridge streams through Noise + Yamux into ordinary transport connections.
-- `crates/multistream-select` (`minip2p-multistream-select`): `/multistream/1.0.0` negotiation state machine.
-- `crates/ping` (`minip2p-ping`): `/ipfs/ping/1.0.0` state machine with RTT measurement.
-- `crates/identify` (`minip2p-identify`): `/ipfs/id/1.0.0` state machine for protocol and address exchange.
-- `crates/relay` (`minip2p-relay`): Circuit Relay v2 *client-side* state machines (`HopReservation`, `HopConnect`, `StopResponder`).
-- `crates/autonat` (`minip2p-autonat`): AutoNAT reachability probe state machines.
-- `crates/dcutr` (`minip2p-dcutr`): DCUtR hole-punch coordination state machines (`DcutrInitiator`, `DcutrResponder`).
-- `crates/pubsub` (`minip2p-pubsub`): shared StrictSign pubsub RPC/control codec plus bounded gossipsub (`/meshsub/1.1.0`, `/meshsub/1.0.0`) and floodsub (`/floodsub/1.0.0`) routing engines.
-- `crates/mdns` (`minip2p-mdns`): Sans-I/O mDNS codec and discovery agent, plus an optional synchronous `std` multicast socket driver.
-
-Sans-I/O orchestrators (`no_std + alloc`):
-
-- `crates/swarm` (`minip2p-swarm`): `SwarmCore` composes the protocol state machines, tracks connections and streams, drives multistream-select, and emits actions/events for the driver. Also ships a thin `std`-gated driver `Swarm<T: Transport>`.
-- `crates/nat` (`minip2p-nat`): `NatAgent` NAT-traversal orchestrator — races direct dials against a relayed circuit, hole-punches with DCUtR over the bridge, and reports explicit path establish/upgrade/fallback events.
-- `crates/discovery` (`minip2p-discovery`): signed pubsub presence-beacon agent plus a bounded multi-source address book and deterministic dial policy shared with mDNS.
-
-Runtime adapters (`std`):
-
-- `crates/minip2p` (`minip2p-rs`, imported as `minip2p`): application-facing crate that combines identity, QUIC, and the std swarm driver in an `Endpoint` API. Opt-in cargo features layer on without changing the base API:
-  - `nat` wires the traversal agent into `Endpoint` (`connect`/`wait_path`/`take_nat_events`, relay reservations, AutoNAT probing).
-  - `pubsub` adds gossipsub by default (`subscribe`/`publish`/`take_pubsub_events`), with explicit floodsub selection available.
-  - `discovery` composes `nat` and `pubsub` into signed peer discovery (`known_peers`/`next_discovery_event`), with coordinated dialing and bridge cleanup.
-  - `mdns` composes `nat` with local-link multicast discovery (`mdns`/`known_peers`/`next_discovery_event`) without pulling in pubsub.
-- `transports/quic` (`minip2p-quic`): QUIC transport adapter built on `quiche`, with libp2p TLS baked in. Owns UDP and DNS; exposes deadlines instead of running timers.
-- `crates/ffi` (`minip2p-ffi`): foreign-runtime endpoint and detached driver
-  exposed through UniFFI. The React Native adapter consumes this crate.
-
-Language bindings:
-
-- `bindings/ts/core` (`@minip2p/core`): platform-neutral TypeScript SDK,
-  public types, errors, event buffering, waits, and the native backend
-  contract.
-- `bindings/ts/react-native` (`@minip2p/react-native`): UniFFI + TurboModule
-  implementation of the TypeScript backend, with an Expo development-build
-  example.
-- `bindings/ts/node` (`@minip2p/node`): napi-rs adapter scaffold. It remains
-  private until the native Node backend is implemented.
-
-Examples:
-
-- `examples/peer` (`minip2p-peer`): NAT-aware echo-ping demo — `listen` echoes pings (optionally holding a relay reservation), `dial` traverses NAT and shows the RTT drop when the hole punch upgrades the path mid-run.
-- `examples/chat` (`minip2p-chat`): group chat over gossipsub with NAT traversal — peers join a room by dialing one address, hole-punch direct paths where needed, and route StrictSign-verified messages through the topic mesh.
-
-Current validated behavior:
-
-- Two local peers connect over QUIC in integration tests, with mutual libp2p TLS peer authentication.
-- Bidirectional stream data exchange with half-close propagation.
-- Multistream-select negotiation with spec-compliant varint framing.
-- Ping round-trips with RTT measurement; identify exchange with observed-address plumbing.
-- End-to-end stack via `minip2p::Endpoint`: QUIC + multistream-select + identify + ping + registered app protocols through one API.
-- NAT traversal live-validated end-to-end: relay reservation, circuit connect, DCUtR hole punch between two real NATs (home network ↔ mobile hotspot through a public relay), with explicit path events throughout.
-- Gossipsub live-validated: signed interop both ways with real go-libp2p (`NewGossipSub`, v0.15.0) and rust-libp2p (gossipsub 0.49.5) peers over QUIC, a relay-only room through a public relay, and a relayed → direct-punched upgrade with the mesh surviving the connection supersede; floodsub retains its prior live wire validation and explicit-selection regression tests.
-- Pubsub peer discovery live-validated across a public host, home NAT, and mobile hotspot: automatic mesh formation, one-sided dial initiation, address updates, graceful punch-failure degradation, and leaf-to-leaf chat survival after host death.
-- mDNS live-validated between two local endpoints: multicast discovery and automatic authenticated QUIC connection without bootstrap addresses.
-
-## Architecture boundaries
-
-Three layers, strictly separated:
-
-1. Sans-I/O protocol crates — pure state machines, one per protocol. No sockets, no async runtimes, no wall clocks; callers pump inputs and timestamps in, actions and events come out.
-2. Sans-I/O orchestrators (`swarm`, `nat`, `discovery`) — compose protocol and policy state machines, still deterministic and I/O-free.
-3. `std` adapters — the QUIC transport, mDNS socket driver, and `Endpoint` own all real I/O.
-
-The minimal default swarm intentionally composes only identify, ping, and
-registered application protocols. Relay, AutoNAT, and DCUtR remain independent
-Sans-I/O machines driven over generic streams; their dialing, retry, and
-fallback policy belongs to the host. This keeps the base library small and
-avoids hiding network policy in a monolithic swarm while still allowing
-declarative protocol registration through `SwarmBuilder::protocol` and
-`EndpointBuilder::protocol`. The `nat`, `pubsub`, `discovery`, and `mdns` endpoint
-features are pre-packaged policy for the common case, built on the same public
-hooks.
+The result is a set of reusable protocol state machines and a synchronous
+`Endpoint` API for applications that want sensible defaults.
 
 ## Quick start
 
-Build and run tests:
-
-```bash
-cargo test
-```
-
-Build an application endpoint with the top-level API:
+Install minip2p:
 
 ```toml
 [dependencies]
 minip2p-rs = "0.3.0"
 ```
 
+The package is named `minip2p-rs` on crates.io and imported as `minip2p`:
+
 ```rust
 use minip2p::{Deadline, Endpoint, Event};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut node = Endpoint::builder()
+    let mut endpoint = Endpoint::builder()
         .agent_version("my-app/0.1.0")
         .bind_quic_dual_stack()?;
 
-    let addrs = node.listen_all()?;
-    println!("listening on {addrs:?}");
+    for address in endpoint.listen_all()? {
+        println!("listening on {address}");
+    }
 
-    // `next_event` also accepts an `Instant` or a relative `Duration`
-    // when a wait needs a timeout.
-    while let Some(event) = node.next_event(Deadline::NEVER)? {
+    while let Some(event) = endpoint.next_event(Deadline::NEVER)? {
         println!("{event:?}");
         if matches!(event, Event::ConnectionEstablished { .. }) {
-            // The endpoint remains entirely caller-driven: keep polling,
-            // or integrate `poll()` and transport deadlines in your host loop.
+            // Open streams, ping the peer, or continue polling for events.
         }
     }
+
     Ok(())
 }
 ```
 
-`Endpoint` is the batteries-included synchronous application API. Custom runtimes can
-drive `SwarmCore` and the protocol crates directly with inputs, outputs, and
-explicit timestamps; none of those layers performs I/O, reads a clock, blocks,
-or requires an async executor.
+`Endpoint` is caller-driven: it owns sockets, but it does not start a runtime or
+background task. Event waits accept an absolute `Instant`, a relative
+`Duration`, or `Deadline::NEVER`.
 
-For the full stack in action, run the chat example (see
-`examples/chat/README.md` for NAT'd and cross-implementation recipes):
+For a complete application, run the gossipsub chat example:
 
 ```bash
 cargo run -p minip2p-chat -- host --nick hostess
 ```
 
-Common contributor workflows are available through `just` (mirrors CI):
+See [the chat guide](examples/chat/README.md) for NAT and cross-implementation
+recipes. The [peer example](examples/peer/README.md) demonstrates relay
+reservations and direct-path upgrades with DCUtR.
+
+## Features
+
+The base `Endpoint` includes QUIC, multistream-select, identify, ping, and
+application protocols registered with `EndpointBuilder::protocol`.
+
+| Feature | Adds |
+| --- | --- |
+| `nat` | Circuit Relay v2, AutoNAT, and DCUtR traversal policy |
+| `pubsub` | StrictSign gossipsub by default, with explicit floodsub selection |
+| `discovery` | Signed pubsub presence beacons and coordinated dialing; implies `nat` and `pubsub` |
+| `mdns` | Local-link discovery and coordinated direct dialing; implies `nat` |
+
+Features layer onto the same API. Lower-level users can instead drive
+`SwarmCore` and individual protocol crates directly with explicit inputs,
+outputs, timestamps, and deadlines.
+
+## Architecture
+
+The workspace has three strictly separated layers:
+
+1. **Sans-I/O protocols** — identity, TLS, Noise, Yamux,
+   multistream-select, ping, identify, relay, AutoNAT, DCUtR, pubsub, and mDNS.
+   These crates contain state machines and wire codecs, not sockets or clocks.
+2. **Sans-I/O orchestration** — `SwarmCore`, `NatAgent`, `BeaconAgent`, and
+   `PeerDiscoveryAgent` compose protocols and policy while remaining
+   deterministic and I/O-free.
+3. **`std` adapters** — the quiche-based QUIC transport, mDNS socket driver,
+   application-facing `Endpoint`, and UniFFI adapter own real I/O.
+
+The default swarm intentionally includes only identify, ping, and registered
+application protocols. Relay, traversal, pubsub, and discovery policy stay
+opt-in so the base remains small and predictable.
+
+TypeScript bindings live under `bindings/ts`: `@minip2p/core` defines the
+platform-neutral API, and `@minip2p/react-native` provides its UniFFI-backed
+React Native implementation. The Node adapter is currently a private scaffold.
+
+Every crate has its own README with API-specific details.
+
+## Development
+
+[`just`](https://github.com/casey/just) commands mirror CI:
 
 ```bash
-just test          # cargo test + Endpoint feature matrix through discovery + mDNS
-just clippy        # -D warnings, Endpoint discovery/mDNS variants, and fuzz/
-just check-nostd   # all no_std crates on thumbv7em-none-eabi
+just test          # workspace tests and Endpoint feature matrix
+just clippy        # warnings-as-errors, feature variants, and fuzz crate
+just fmt           # format the workspace and fuzz crate
+just check-nostd   # no_std crates on thumbv7em-none-eabi
 just bench
-just fuzz 30       # needs nightly + cargo-fuzz
+just fuzz 30       # requires nightly and cargo-fuzz
 ```
 
-## Documentation
-
-Every crate has a README and rustdoc on all public APIs. Internal methods and types are commented for contributor onboarding.
-
-Generate the full API docs with:
+Generate local API documentation with:
 
 ```bash
 cargo doc --workspace --no-deps --open
 ```
 
-## Versioning and releases
+All published Rust and TypeScript packages share one version. Releases also
+include freshly built Android and iOS libraries for React Native.
 
-All published Rust and TypeScript packages share one version. Each release also
-includes freshly built Android and iOS libraries for React Native.
+## License
 
-## Roadmap focus
-
-- [x] Local QUIC connectivity and integration coverage.
-- [x] Multistream-select, ping, identify.
-- [x] libp2p TLS peer authentication (mutual: both sides learn the PeerId at handshake time).
-- [x] Swarm / connection management layer with builder DX.
-- [x] Top-level `minip2p::Endpoint` API for app authors.
-- [x] Circuit Relay v2 client, DCUtR, and AutoNAT state machines.
-- [x] NAT-traversal orchestration (`nat` feature), live-validated between two real NATs.
-- [x] Floodsub pubsub engine with libp2p wire interop and explicit endpoint selection.
-- [x] Signed pubsub peer discovery (`discovery` feature), including automatic mesh dialing and host-death survival.
-- [x] Local-link mDNS discovery (`mdns` feature) with a shared bounded peer book and automatic dialing.
-- [x] Gossipsub, on the same pubsub API surface and selected by default.
-- [x] A circuit transport, so relayed paths are end-to-end encrypted, multiplexed normal connections.
-- [x] Interoperability testing with other libp2p implementations in reference to transport, gossipsub, performance monitoring and hole punching.
+[MIT](LICENSE)
