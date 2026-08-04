@@ -90,7 +90,8 @@ cross-source production order is not observable. Hosts must track readiness,
 subscriptions, and paths independently.
 
 `P2pEndpoint::path(peer_id)` exposes the endpoint's authoritative current
-NAT-orchestrated path. `EndpointError` also preserves a `stream_id` when the
+NAT-orchestrated path for outbound and inbound connections. `EndpointError`
+also preserves a `stream_id` when the
 swarm can identify the failed stream, allowing Promise-based hosts to
 correlate asynchronous open and negotiation failures.
 

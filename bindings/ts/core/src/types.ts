@@ -204,6 +204,10 @@ export interface Minip2pNamedEventMap {
     readonly peerId: string;
     readonly path: Path;
   };
+  inboundPathEstablished: {
+    readonly peerId: string;
+    readonly path: Path;
+  };
   pathUpgraded: {
     readonly connectId: number;
     readonly peerId: string;
@@ -340,6 +344,7 @@ export const P2pEvent_Tags = {
   HolePunchFailed: "HolePunchFailed",
   IdentifyReceived: "IdentifyReceived",
   InboundDirectUpgrade: "InboundDirectUpgrade",
+  InboundPathEstablished: "InboundPathEstablished",
   Message: "Message",
   PathEstablished: "PathEstablished",
   PathUpgraded: "PathUpgraded",
@@ -435,6 +440,10 @@ export type P2pEvent =
   | RawEvent<
       typeof P2pEvent_Tags.PathEstablished,
       { connectId: number; peerId: string; path: PathKind }
+    >
+  | RawEvent<
+      typeof P2pEvent_Tags.InboundPathEstablished,
+      { peerId: string; path: PathKind }
     >
   | RawEvent<
       typeof P2pEvent_Tags.PathUpgraded,

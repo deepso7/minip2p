@@ -7,7 +7,7 @@ use common::*;
 
 use minip2p_core::PeerAddr;
 use minip2p_nat::{
-    AUTONAT_PROTOCOL_ID, DCUTR_PROTOCOL_ID, HOP_PROTOCOL_ID, NatAction, NatConfig, NatEvent,
+    AUTONAT_PROTOCOL_ID, DCUTR_PROTOCOL_ID, HOP_PROTOCOL_ID, NatAction, NatConfig, NatEvent, Path,
     STOP_PROTOCOL_ID,
 };
 use minip2p_swarm::SwarmEvent;
@@ -85,6 +85,14 @@ fn full_inbound_flow_blasts_and_upgrades() {
     )));
     let target = h.target.clone();
     complete_promotion(&mut h.agent, &target, &actions, at(31));
+    let events = drain_events(&mut h.agent);
+    assert!(matches!(
+        events.as_slice(),
+        [NatEvent::InboundPathEstablished {
+            peer,
+            path: Path::Relayed { relay },
+        }] if *peer == h.target && *relay == h.relay
+    ));
     assert_eq!(
         dial_count_for(&actions, &h.target),
         0,
@@ -150,6 +158,7 @@ fn force_relay_promotes_immediately_after_stop_acceptance() {
         }
     )));
     complete_promotion(&mut h.agent, &target, &actions, at(11));
+    drain_events(&mut h.agent);
     assert!(h.agent.is_idle());
 }
 
@@ -220,6 +229,68 @@ fn established_inbound_circuit_disarms_its_handshake_deadline() {
         ),
         "a ready inbound circuit must not be reclaimed by its old handshake deadline"
     );
+    assert!(h.agent.is_idle());
+}
+
+#[test]
+fn direct_connection_before_circuit_handshake_does_not_downgrade_the_path() {
+    let mut h = inbound_harness(NatConfig::default());
+    let stream = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stream, 0);
+    drive_to_sync_ready(&mut h, stream);
+
+    // The punch lands before SYNC releases the relay bridge.
+    h.target_connected(at(25));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::InboundDirectUpgrade { peer }] if *peer == h.target
+    ));
+
+    h.stream_data(stream, dcutr_sync(), at(30));
+    let actions = drain_actions(&mut h.agent);
+    let target = h.target.clone();
+    complete_promotion(&mut h.agent, &target, &actions, at(31));
+
+    assert!(
+        drain_events(&mut h.agent).is_empty(),
+        "the inferior relay path must not be announced after direct wins"
+    );
+    assert!(h.agent.is_idle());
+}
+
+#[test]
+fn linger_expiry_does_not_reap_a_promoted_circuit_before_connected() {
+    let mut h = inbound_harness(NatConfig::default());
+    let stream = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stream, 0);
+    drive_to_sync_ready(&mut h, stream);
+    h.stream_data(stream, dcutr_sync(), at(30));
+    let actions = drain_actions(&mut h.agent);
+    let conn_id = minip2p_transport::ConnectionId::new(TEST_CIRCUIT_ID);
+    h.agent
+        .promote_result(promote_token(&actions), Ok(conn_id), at(31));
+
+    // The 9-second punch linger ends before the 20-second circuit handshake
+    // deadline, but the pending promotion must remain correlated.
+    h.agent.handle_tick(at(9_030));
+    drain_actions(&mut h.agent);
+    assert!(!h.agent.is_idle());
+    h.agent.handle_event_with_disposition_classified(
+        &SwarmEvent::ConnectionEstablished {
+            peer_id: h.target.clone(),
+            conn_id,
+        },
+        true,
+        at(9_031),
+    );
+
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::InboundPathEstablished {
+            peer,
+            path: Path::Relayed { relay },
+        }] if *peer == h.target && *relay == h.relay
+    ));
     assert!(h.agent.is_idle());
 }
 
@@ -355,6 +426,7 @@ fn stalled_exchange_still_releases_the_bridge() {
     assert!(!h.agent.owns_stream(&h.relay, stream));
     let target = h.target.clone();
     complete_promotion(&mut h.agent, &target, &actions, at(12_001));
+    drain_events(&mut h.agent);
     assert!(h.agent.is_idle());
 }
 

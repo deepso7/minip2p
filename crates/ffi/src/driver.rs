@@ -358,6 +358,7 @@ fn nat_connect_id(event: &NatEvent) -> Option<u64> {
         | NatEvent::PublicAddressesChanged { .. }
         | NatEvent::RelayReserved { .. }
         | NatEvent::RelayReservationLost { .. }
+        | NatEvent::InboundPathEstablished { .. }
         | NatEvent::InboundDirectUpgrade { .. } => None,
     }
 }

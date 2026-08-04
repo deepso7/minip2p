@@ -105,6 +105,8 @@ pub enum NatEvent {
         peer: PeerId,
         path: Path,
     },
+    /// An inbound relay circuit became a usable path to the peer.
+    InboundPathEstablished { peer: PeerId, path: Path },
     /// A better path replaced the previously announced one. When `from` was
     /// [`Path::Relayed`], its circuit connection is closed automatically.
     PathUpgraded {

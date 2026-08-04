@@ -16,6 +16,7 @@
 //!           → Bridged ⇒ start a DCUtR punch over the bridge
 //!           → after SYNC, promote bridge through Noise + Yamux
 //!           → circuit Connected ⇒ PathEstablished(Relayed)
+//! inbound STOP circuit Connected ⇒ InboundPathEstablished(Relayed)
 //! first usable path wins; a better path later ⇒ explicit PathUpgraded
 //! "fallback" is not a phase — it is what remains when the punch leg
 //! exhausts (FellBackToRelay)

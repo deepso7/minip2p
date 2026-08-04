@@ -57,8 +57,8 @@ Noise and Yamux before `wait_path` returns `Path::Relayed`, so application
 protocols use ordinary streams on direct and relayed paths alike.
 `Endpoint::path(peer)` returns the current NAT-orchestrated path independently
 of whether the corresponding event was drained. It is updated before path
-events are queued and cleared only after the peer's final usable connection
-closes.
+events are queued for both outbound connects and accepted inbound circuits,
+and cleared only after the peer's final usable connection closes.
 
 With the `discovery` feature, `.discovery()` enables signed pubsub presence
 beacons, a bounded TTL address book, and caller-driven automatic NAT connects.

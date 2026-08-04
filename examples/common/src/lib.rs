@@ -213,6 +213,12 @@ pub fn print_nat_event(role: &str, event: &NatEvent) {
                 path_name(path)
             );
         }
+        NatEvent::InboundPathEstablished { peer, path } => {
+            println!(
+                "[{role}] nat-inbound-path-established peer={peer} path={}",
+                path_name(path)
+            );
+        }
         NatEvent::PathUpgraded { peer, from, to, .. } => {
             println!(
                 "[{role}] nat-path-upgraded peer={peer} from={} to={}",

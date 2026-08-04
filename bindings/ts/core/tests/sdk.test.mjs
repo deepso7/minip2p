@@ -191,6 +191,33 @@ test("named and catch-all subscribers receive flattened events", async () => {
   endpoint.close();
 });
 
+test("inbound relayed path events preserve relay provenance", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const events = [];
+  endpoint.on("inboundPathEstablished", (event) => events.push(event));
+
+  backend.emit({
+    inner: {
+      path: {
+        inner: { relayPeerId: "relay" },
+        tag: PathKind_Tags.Relayed,
+      },
+      peerId: "peer",
+    },
+    tag: P2pEvent_Tags.InboundPathEstablished,
+  });
+  await tick();
+
+  assert.deepEqual(events, [
+    {
+      path: { kind: "relayed", relayPeerId: "relay" },
+      peerId: "peer",
+    },
+  ]);
+  endpoint.close();
+});
+
 test("catch-all stream events expose metadata, while named handlers get handles", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);

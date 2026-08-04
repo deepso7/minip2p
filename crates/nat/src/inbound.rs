@@ -9,6 +9,7 @@
 //!   ──▶ DCUtR CONNECT arrives ──▶ reply with our observed addresses
 //!   ──▶ SYNC arrives ──▶ schedule UDP blasts,
 //!       promote the bridge into a circuit connection
+//!   ──▶ circuit Connected ──▶ InboundPathEstablished(Relayed)
 //! initiator's dial lands ──▶ cancel blasts, InboundDirectUpgrade
 //! ```
 
@@ -61,6 +62,8 @@ pub(crate) struct InboundCircuit {
     released: bool,
     promoted: Option<ConnectionId>,
     handshake_deadline: Option<u64>,
+    /// Whether the usable inbound relay path was announced.
+    path_announced: bool,
     done: bool,
 }
 
@@ -91,6 +94,7 @@ impl InboundCircuit {
             released: false,
             promoted: None,
             handshake_deadline: None,
+            path_announced: false,
             done: false,
         }
     }
@@ -389,7 +393,9 @@ impl InboundCircuit {
         {
             self.linger_until = None;
             self.blast = None;
-            if self.released {
+            // A promoted circuit awaiting ConnectionEstablished remains
+            // correlated until its separate handshake deadline.
+            if self.released && (self.path_announced || self.handshake_deadline.is_none()) {
                 self.done = true;
             }
         }
@@ -418,7 +424,21 @@ impl InboundCircuit {
         if is_circuit {
             if self.promoted == Some(conn_id) {
                 self.handshake_deadline = None;
-                if self.blast.is_none() && self.linger_until.is_none() {
+                let directly_connected = shared.is_directly_connected(peer);
+                if !self.path_announced && !directly_connected {
+                    self.path_announced = true;
+                    shared.push_event(NatEvent::InboundPathEstablished {
+                        peer: peer.clone(),
+                        path: crate::Path::Relayed {
+                            relay: self.relay.clone(),
+                        },
+                    });
+                }
+                if directly_connected {
+                    self.blast = None;
+                    self.linger_until = None;
+                    self.done = true;
+                } else if self.blast.is_none() && self.linger_until.is_none() {
                     self.done = true;
                 }
             }

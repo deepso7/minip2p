@@ -286,6 +286,9 @@ impl NatDriver {
             NatEvent::PathEstablished { peer, path, .. } => {
                 self.paths.insert(peer.clone(), path.clone());
             }
+            NatEvent::InboundPathEstablished { peer, path } => {
+                self.paths.insert(peer.clone(), path.clone());
+            }
             NatEvent::PathUpgraded { peer, to, .. } => {
                 self.paths.insert(peer.clone(), to.clone());
             }
@@ -580,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_path_tracks_establishment_outbound_upgrade_and_inbound_upgrade() {
+    fn endpoint_path_tracks_outbound_and_inbound_establishment_and_upgrade() {
         let mut endpoint = Endpoint::builder()
             .nat_config(NatConfig::default())
             .bind_quic("127.0.0.1:0")
@@ -623,11 +626,33 @@ mod tests {
                 &NatEvent::PathUpgraded {
                     connect_id,
                     peer: peer.clone(),
-                    from: Path::Relayed { relay },
+                    from: Path::Relayed {
+                        relay: relay.clone(),
+                    },
                     to: Path::DirectPunched,
                 },
                 swarm,
             );
+            driver.observe(
+                &NatEvent::InboundPathEstablished {
+                    peer: inbound.clone(),
+                    path: Path::Relayed {
+                        relay: relay.clone(),
+                    },
+                },
+                swarm,
+            );
+        }
+        assert_eq!(
+            endpoint.path(&inbound),
+            Some(Path::Relayed {
+                relay: relay.clone()
+            })
+        );
+
+        {
+            let Endpoint { swarm, nat, .. } = &mut endpoint;
+            let driver = nat.as_mut().expect("NAT configured");
             driver.observe(
                 &NatEvent::InboundDirectUpgrade {
                     peer: inbound.clone(),

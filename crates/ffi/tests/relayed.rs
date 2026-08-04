@@ -95,6 +95,7 @@ fn relayed_chat_and_reservation_loss() {
     let b = endpoint(32, relay_addr.clone());
     let a_log = Arc::new(EventLog::default());
     let b_log = Arc::new(EventLog::default());
+    let a_peer = a.peer_id();
     let b_peer = b.peer_id();
 
     a.start(Arc::clone(&a_log) as Arc<dyn P2pEventListener>)
@@ -137,8 +138,23 @@ fn relayed_chat_and_reservation_loss() {
     b_log.wait_for(|event| {
         matches!(
             event,
+            P2pEvent::InboundPathEstablished {
+                peer_id,
+                path: PathKind::Relayed { relay_peer_id },
+            } if peer_id == &a_peer && relay_peer_id == &relay_peer
+        )
+    });
+    assert_eq!(
+        b.path(a_peer.clone()).expect("query responder path"),
+        Some(PathKind::Relayed {
+            relay_peer_id: relay_peer.clone(),
+        })
+    );
+    b_log.wait_for(|event| {
+        matches!(
+            event,
             P2pEvent::PeerSubscribed { peer_id, topic }
-                if peer_id == &a.peer_id() && topic == TOPIC
+                if peer_id == &a_peer && topic == TOPIC
         )
     });
 
@@ -152,7 +168,7 @@ fn relayed_chat_and_reservation_loss() {
                 data,
                 signed: true,
                 ..
-            } if from_peer_id == &a.peer_id() && data == b"through relay"
+            } if from_peer_id == &a_peer && data == b"through relay"
         )
     });
 
@@ -166,10 +182,22 @@ fn relayed_chat_and_reservation_loss() {
             P2pEvent::RelayReservationLost { relay_peer_id } if relay_peer_id == &relay_peer
         )
     });
+    b_log.wait_for_with_timeout(RELAY_LOSS_TIMEOUT, |event| {
+        matches!(
+            event,
+            P2pEvent::ConnectionClosed { peer_id, .. } if peer_id == &a_peer
+        )
+    });
     assert!(
         b.active_reservation()
             .expect("reservation query after loss")
             .is_none()
+    );
+    assert!(
+        b.path(a_peer)
+            .expect("query responder path after loss")
+            .is_none(),
+        "the inbound path must clear after its final connection closes"
     );
 
     stop(&a);

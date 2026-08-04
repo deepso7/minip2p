@@ -453,9 +453,16 @@ fn two_agents_punch_to_a_direct_connection() {
         "A's punch targets B's public mapping: {:?}",
         world.punch_dial_addrs_from_a
     );
+    let events = drain_events(&mut world.b);
     assert!(
-        drain_events(&mut world.b).is_empty(),
-        "inbound circuits surface through normal swarm lifecycle events"
+        matches!(
+            events.as_slice(),
+            [NatEvent::InboundPathEstablished {
+                peer,
+                path: Path::Relayed { relay },
+            }] if peer == &world.a_id && relay == &world.relay_id
+        ),
+        "B records the inbound relayed path, got {events:?}"
     );
 
     // B's punch-back is blast-only (DCUtR for QUIC: the initiator dials).

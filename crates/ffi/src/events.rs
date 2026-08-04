@@ -263,6 +263,13 @@ pub enum P2pEvent {
         /// Established path.
         path: PathKind,
     },
+    /// An inbound relay circuit became a usable path.
+    InboundPathEstablished {
+        /// Remote peer.
+        peer_id: String,
+        /// Established relayed path.
+        path: PathKind,
+    },
     /// A better path replaced an earlier path.
     PathUpgraded {
         /// Endpoint-local connection-attempt id.
@@ -529,6 +536,10 @@ pub(crate) fn convert_nat(event: NatEvent) -> P2pEvent {
             path,
         } => P2pEvent::PathEstablished {
             connect_id: connect_id.as_u64(),
+            peer_id: peer.to_base58(),
+            path: convert_path(path),
+        },
+        NatEvent::InboundPathEstablished { peer, path } => P2pEvent::InboundPathEstablished {
             peer_id: peer.to_base58(),
             path: convert_path(path),
         },
@@ -854,6 +865,27 @@ mod tests {
         ] {
             assert_eq!(convert_nat_error_kind(&error), expected);
         }
+    }
+
+    #[test]
+    fn inbound_path_conversion_preserves_relay_provenance() {
+        let remote = peer(10);
+        let relay = peer(11);
+
+        assert_eq!(
+            convert_nat(NatEvent::InboundPathEstablished {
+                peer: remote.clone(),
+                path: Path::Relayed {
+                    relay: relay.clone(),
+                },
+            }),
+            P2pEvent::InboundPathEstablished {
+                peer_id: remote.to_base58(),
+                path: PathKind::Relayed {
+                    relay_peer_id: relay.to_base58(),
+                },
+            }
+        );
     }
 
     #[test]

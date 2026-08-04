@@ -19,6 +19,7 @@ t0+δ    relay leg (stagger δ, default 200 ms; 0 = fully parallel):
           → Bridged ⇒ DCUtR punch starts over the bridge
           → after SYNC, promote bridge through Noise + Yamux
           → circuit Connected ⇒ PathEstablished(Relayed)
+inbound STOP circuit Connected ⇒ InboundPathEstablished(Relayed)
 first usable path wins
 a better path later  ⇒ PathUpgraded { from, to }  (+ the circuit closes)
 punch exhausted      ⇒ FellBackToRelay            (the circuit stays usable)
@@ -31,8 +32,9 @@ Ranking: `DirectDialed` ≈ `DirectPunched` > `Relayed`.
 
 `Path::Relayed { relay }` is metadata describing how the peer was reached.
 The bridge itself is promoted through end-to-end Noise XX and Yamux before
-`PathEstablished` is emitted. Identify, ping, pubsub, and application
-protocols can therefore use the ordinary swarm stream APIs without knowing
+`PathEstablished` (outbound) or `InboundPathEstablished` (inbound) is emitted.
+Identify, ping, pubsub, and application protocols can therefore use the
+ordinary swarm stream APIs without knowing
 whether the selected connection is direct or relayed.
 
 Set `NatConfig::force_relay` to skip direct candidates and DCUtR entirely.

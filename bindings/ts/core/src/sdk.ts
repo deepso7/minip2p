@@ -1447,6 +1447,7 @@ function normalizeEvent(
     [P2pEvent_Tags.RelayReserved]: "relayReserved",
     [P2pEvent_Tags.RelayReservationLost]: "relayReservationLost",
     [P2pEvent_Tags.PathEstablished]: "pathEstablished",
+    [P2pEvent_Tags.InboundPathEstablished]: "inboundPathEstablished",
     [P2pEvent_Tags.PathUpgraded]: "pathUpgraded",
     [P2pEvent_Tags.HolePunchFailed]: "holePunchFailed",
     [P2pEvent_Tags.FellBackToRelay]: "fellBackToRelay",
@@ -1469,6 +1470,8 @@ function normalizeEvent(
   }
   let payload: unknown = event.inner;
   if (event.tag === P2pEvent_Tags.PathEstablished) {
+    payload = { ...event.inner, path: normalizePath(event.inner.path) };
+  } else if (event.tag === P2pEvent_Tags.InboundPathEstablished) {
     payload = { ...event.inner, path: normalizePath(event.inner.path) };
   } else if (event.tag === P2pEvent_Tags.PathUpgraded) {
     payload = {
