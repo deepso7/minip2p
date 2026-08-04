@@ -118,20 +118,26 @@ impl Multiaddr {
         }
     }
 
-    /// Returns `true` if this is a relay circuit transport address:
-    /// exactly host + udp + quic-v1 + `/p2p/<relay>` + `/p2p-circuit`.
+    /// Returns `true` if this is a relay circuit transport address: a
+    /// dialable address for the relay, then `/p2p/<relay>` and
+    /// `/p2p-circuit`.
     ///
-    /// This is the shape produced by relay reservations: the QUIC
-    /// address of the relay, the relay's peer id, and the circuit
-    /// marker. Anything longer or shorter (including a direct QUIC
-    /// address) returns `false`.
+    /// This is the shape produced by relay reservations, and the leg that
+    /// reaches the relay is an ordinary transport address -- whichever
+    /// transport that is. A circuit is carried over an established connection
+    /// to the relay, so how that connection was made is the relay's business
+    /// and not the circuit's.
+    ///
+    /// Anything longer or shorter (including a direct address, or one with a
+    /// trailing `/p2p/<target>`) returns `false`.
     pub fn is_relay_circuit_transport(&self) -> bool {
-        self.protocols.len() == 5
-            && self.protocols[0].is_host()
-            && matches!(self.protocols[1], Protocol::Udp(_))
-            && matches!(self.protocols[2], Protocol::QuicV1)
-            && matches!(self.protocols[3], Protocol::P2p(_))
-            && matches!(self.protocols[4], Protocol::P2pCircuit)
+        let Some((Protocol::P2pCircuit, head)) = self.protocols.split_last() else {
+            return false;
+        };
+        let Some((Protocol::P2p(_), leg)) = head.split_last() else {
+            return false;
+        };
+        transport_kind_of(leg).is_some()
     }
 
     /// Encodes this multiaddr to its binary multicodec wire form.
@@ -428,9 +434,14 @@ mod tests {
             "/ip6/2001:db8::1",
             "/dns4/relay.example.com",
         ] {
-            let input = format!("{host}/udp/4001/quic-v1/p2p/{PEER_ID}/p2p-circuit");
-            let parsed = Multiaddr::from_str(&input).expect("must parse");
-            assert!(parsed.is_relay_circuit_transport(), "{input}");
+            // Either leg: a circuit rides an established connection to the
+            // relay, so how that connection was made is the relay's business.
+            // A TCP-only device has no other kind to offer.
+            for leg in ["/udp/4001/quic-v1", "/tcp/4001"] {
+                let input = format!("{host}{leg}/p2p/{PEER_ID}/p2p-circuit");
+                let parsed = Multiaddr::from_str(&input).expect("must parse");
+                assert!(parsed.is_relay_circuit_transport(), "{input}");
+            }
         }
     }
 
@@ -447,11 +458,11 @@ mod tests {
             format!("/ip4/203.0.113.7/udp/4001/quic-v1/p2p-circuit/p2p/{PEER_ID}"),
             // Destination peer appended after the circuit marker (six components).
             format!("/ip4/203.0.113.7/udp/4001/quic-v1/p2p/{PEER_ID}/p2p-circuit/p2p/{PEER_ID}"),
-            // A TCP circuit has the right five-component *arity* but a TCP
-            // base. Circuits stay QUIC-only until relay is generalized, so
-            // widening this predicate ahead of that must fail here.
-            format!("/ip4/203.0.113.7/tcp/4001/p2p/{PEER_ID}/p2p-circuit"),
-            format!("/dns4/relay.example.com/tcp/4001/p2p/{PEER_ID}/p2p-circuit"),
+            // The leg has to be a whole transport address, not a bare host or
+            // half of one: a circuit is reached by dialing the relay, and
+            // there is no dialing this.
+            format!("/ip4/203.0.113.7/p2p/{PEER_ID}/p2p-circuit"),
+            format!("/ip4/203.0.113.7/udp/4001/p2p/{PEER_ID}/p2p-circuit"),
         ];
         for input in near_misses {
             let parsed = Multiaddr::from_str(&input).expect("must parse");

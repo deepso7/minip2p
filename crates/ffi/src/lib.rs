@@ -45,7 +45,7 @@ pub fn peer_id_from_secret_key(secret_key: Vec<u8>) -> Result<String, FfiError> 
 /// Builds a circuit multiaddress for `peer_id` through `relay_addr`.
 #[uniffi::export]
 pub fn circuit_address(relay_addr: String, peer_id: String) -> Result<String, FfiError> {
-    let relay = parse_direct_quic_peer_addr(&relay_addr)?;
+    let relay = parse_direct_peer_addr(&relay_addr)?;
     let target = PeerId::from_str(&peer_id).map_err(|error| FfiError::InvalidPeerId {
         detail: error.to_string(),
     })?;
@@ -57,13 +57,18 @@ pub fn circuit_address(relay_addr: String, peer_id: String) -> Result<String, Ff
     Ok(Multiaddr::from_protocols(protocols).to_string())
 }
 
-fn parse_direct_quic_peer_addr(address: &str) -> Result<PeerAddr, FfiError> {
+/// Parses a peer address that names a host something can dial directly.
+///
+/// A circuit is carried over an established connection to the relay, so which
+/// transport made that connection is the relay's business: a `/tcp` relay
+/// carries one as well as a `/quic-v1` relay does.
+fn parse_direct_peer_addr(address: &str) -> Result<PeerAddr, FfiError> {
     let relay = PeerAddr::from_str(address).map_err(|error| FfiError::InvalidAddress {
         detail: error.to_string(),
     })?;
-    if !relay.transport().is_quic_transport() || relay.transport().is_wildcard_host() {
+    if relay.transport().transport_kind().is_none() || relay.transport().is_wildcard_host() {
         return Err(FfiError::InvalidAddress {
-            detail: "relay address must be a direct QUIC-v1 peer address".into(),
+            detail: "relay address must be a direct /tcp or /quic-v1 peer address".into(),
         });
     }
     Ok(relay)
@@ -160,21 +165,48 @@ mod tests {
     }
 
     #[test]
-    fn circuit_address_rejects_non_quic_and_existing_circuit_relays() {
+    fn circuit_address_rejects_undialable_and_existing_circuit_relays() {
         let relay = Ed25519Keypair::from_secret_key_bytes([1; SECRET_KEY_LENGTH]).peer_id();
         let target = Ed25519Keypair::from_secret_key_bytes([2; SECRET_KEY_LENGTH]).peer_id();
 
         for invalid in [
+            // Half a QUIC address: nothing dials this.
             format!("/ip4/127.0.0.1/udp/4001/p2p/{relay}"),
+            // Already a circuit, so it is not a relay to build one through.
             format!("/ip4/127.0.0.1/udp/4001/quic-v1/p2p-circuit/p2p/{relay}"),
+            // A bind address, not a destination.
+            format!("/ip4/0.0.0.0/tcp/4001/p2p/{relay}"),
         ] {
-            let error = circuit_address(invalid, target.to_base58())
+            let error = circuit_address(invalid.clone(), target.to_base58())
                 .expect_err("invalid relay shape must be rejected");
-            assert!(matches!(
-                error,
-                FfiError::InvalidAddress { ref detail }
-                    if detail == "relay address must be a direct QUIC-v1 peer address"
-            ));
+            assert!(
+                matches!(
+                    error,
+                    FfiError::InvalidAddress { ref detail }
+                        if detail == "relay address must be a direct /tcp or /quic-v1 peer address"
+                ),
+                "{invalid}: {error:?}"
+            );
         }
+    }
+
+    #[test]
+    fn a_tcp_relay_carries_a_circuit_like_any_other() {
+        let relay = Ed25519Keypair::from_secret_key_bytes([1; SECRET_KEY_LENGTH]).peer_id();
+        let target = Ed25519Keypair::from_secret_key_bytes([2; SECRET_KEY_LENGTH]).peer_id();
+
+        // A circuit rides an established connection to the relay, so the
+        // transport that made it is the relay's business. A device with no
+        // QUIC has nothing else to offer, and refusing it here would put
+        // relaying out of reach of every one of them.
+        let built = circuit_address(
+            format!("/ip4/198.51.100.7/tcp/4001/p2p/{relay}"),
+            target.to_base58(),
+        )
+        .expect("a TCP relay is a relay");
+        assert_eq!(
+            built,
+            format!("/ip4/198.51.100.7/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{target}")
+        );
     }
 }

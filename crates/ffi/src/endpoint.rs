@@ -14,7 +14,7 @@ use minip2p::{
 
 use crate::{
     DriverStats, EndpointConfig, FfiError, IdentifyInfo, KnownPeerInfo, P2pEventListener,
-    PubsubRouter, RelayReservationInfo, keypair_from_bytes, parse_direct_quic_peer_addr,
+    PubsubRouter, RelayReservationInfo, keypair_from_bytes, parse_direct_peer_addr,
 };
 
 /// A minip2p endpoint owned by a foreign runtime.
@@ -63,12 +63,12 @@ impl P2pEndpoint {
         let relays = config
             .relays
             .iter()
-            .map(|address| parse_direct_quic_peer_addr(address))
+            .map(|address| parse_direct_peer_addr(address))
             .collect::<Result<Vec<_>, _>>()?;
         let autonat_servers = config
             .autonat_servers
             .iter()
-            .map(|address| parse_direct_quic_peer_addr(address))
+            .map(|address| parse_direct_peer_addr(address))
             .collect::<Result<Vec<_>, _>>()?;
         if config.force_relay && relays.is_empty() {
             return Err(FfiError::InvalidConfig {
@@ -453,7 +453,7 @@ impl P2pEndpoint {
         let peer = parse_peer_id(&peer_id)?;
         let addresses = addresses
             .iter()
-            .map(|address| parse_direct_quic_peer_addr(address))
+            .map(|address| parse_direct_peer_addr(address))
             .collect::<Result<Vec<_>, _>>()?;
         if addresses.iter().any(|address| address.peer_id() != &peer) {
             return Err(FfiError::InvalidAddress {
@@ -479,7 +479,7 @@ impl P2pEndpoint {
 
     /// Starts a connection attempt toward a direct QUIC peer address.
     pub fn connect_addr(&self, address: String) -> Result<u64, FfiError> {
-        let address = parse_direct_quic_peer_addr(&address)?;
+        let address = parse_direct_peer_addr(&address)?;
         let _pending = PendingCommand::new(&self.shared);
         let mut state = self.shared.lock_state();
         ensure_accepting_commands(&state)?;
@@ -495,7 +495,7 @@ impl P2pEndpoint {
 
     /// Dials a direct peer address on every applicable local address family.
     pub fn dial(&self, address: String) -> Result<Vec<u64>, FfiError> {
-        let address = parse_direct_quic_peer_addr(&address)?;
+        let address = parse_direct_peer_addr(&address)?;
         self.with_endpoint_mut(|endpoint| {
             endpoint
                 .dial(&address)
@@ -506,7 +506,7 @@ impl P2pEndpoint {
 
     /// Dials a direct peer address using IPv4.
     pub fn dial_ip4(&self, address: String) -> Result<u64, FfiError> {
-        let address = parse_direct_quic_peer_addr(&address)?;
+        let address = parse_direct_peer_addr(&address)?;
         self.with_endpoint_mut(|endpoint| {
             endpoint
                 .dial_ip4(&address)
@@ -517,7 +517,7 @@ impl P2pEndpoint {
 
     /// Dials a direct peer address using IPv6.
     pub fn dial_ip6(&self, address: String) -> Result<u64, FfiError> {
-        let address = parse_direct_quic_peer_addr(&address)?;
+        let address = parse_direct_peer_addr(&address)?;
         self.with_endpoint_mut(|endpoint| {
             endpoint
                 .dial_ip6(&address)

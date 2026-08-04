@@ -184,12 +184,18 @@ fn normalize_addrs(from: &PeerId, raw: Vec<Vec<u8>>, cap: usize) -> Vec<Multiadd
     normalized
 }
 
+/// Whether an address is worth carrying in a beacon.
+///
+/// Anything a transport can dial, plus a circuit through a relay. Which of
+/// those the receiving host can actually use is its own business: it dials
+/// what it has a transport for and ignores the rest, which is what lets a TCP
+/// device and a QUIC one share a beacon.
 pub(crate) fn is_supported_addr(addr: &Multiaddr) -> bool {
     if addr.is_wildcard_host() || addr.is_empty() {
         return false;
     }
 
-    addr.is_quic_transport() || addr.is_relay_circuit_transport()
+    addr.transport_kind().is_some() || addr.is_relay_circuit_transport()
 }
 
 #[cfg(test)]
@@ -261,6 +267,39 @@ mod tests {
         assert_eq!(
             advertised.protocols().last(),
             Some(&Protocol::P2p(PeerId::from_public_key(&key(1))))
+        );
+    }
+
+    #[test]
+    fn announces_a_tcp_listener_the_way_it_announces_a_quic_one() {
+        let mut agent = BeaconAgent::new(key(1), BeaconConfig::default()).unwrap();
+        // A device with no operating system has no QUIC to offer. A beacon
+        // that carried only QUIC would let it publish nothing at all, so it
+        // would be discoverable and unreachable in the same breath.
+        agent.set_local_addrs(
+            &[
+                Multiaddr::from_str("/ip4/192.0.2.5/tcp/4001").unwrap(),
+                Multiaddr::from_str("/ip4/0.0.0.0/tcp/4001").unwrap(),
+            ],
+            5,
+        );
+        agent.handle_tick(5);
+        let Some(BeaconAction::PublishBeacon { payload, .. }) = agent.poll_action() else {
+            panic!("beacon not published");
+        };
+        let beacon = Beacon::decode(&payload).unwrap();
+        let advertised: Vec<_> = beacon
+            .addrs
+            .iter()
+            .map(|bytes| Multiaddr::from_bytes(bytes).unwrap().to_string())
+            .collect();
+        assert_eq!(
+            advertised,
+            vec![format!(
+                "/ip4/192.0.2.5/tcp/4001/p2p/{}",
+                PeerId::from_public_key(&key(1))
+            )],
+            "the bind address is still not a destination"
         );
     }
 

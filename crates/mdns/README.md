@@ -76,8 +76,14 @@ system services. A stack running in this process needs it: the driver calls it
 before reading, after writing, and once more before releasing the carrier at
 shutdown — that last one is what gets the goodbyes onto the wire.
 
-mDNS claims are unauthenticated. A successful QUIC/TLS handshake verifies the
-remote peer identity later, while the shared discovery book bounds retained
+A claim carries whatever the host listens on — `/tcp`, `/quic-v1`, or a
+circuit through a relay — because a device with no operating system has only
+the first of those, and mDNS that could not say so would find peers on the link
+and leave them no way back.
+
+mDNS claims are unauthenticated. The transport's own handshake (TLS over QUIC,
+Noise over TCP) verifies the remote peer identity later, while the shared
+discovery book bounds retained
 claims and automatic dial traffic. Endpoint automatic dials from mDNS are
 direct-only: an unauthenticated claim never authorizes a configured relay or
 HOP CONNECT.

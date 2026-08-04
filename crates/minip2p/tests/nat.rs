@@ -409,6 +409,219 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
     }
 }
 
+#[test]
+fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
+    // Everything above the transport is the same code: HOP and STOP are
+    // ordinary streams on an established connection to the relay, and the
+    // circuit rides that connection. A device with no operating system has
+    // only TCP, so if relaying were QUIC-shaped anywhere above the dial, it
+    // would be out of reach of every one of them.
+    let relay = relay_support::RelayServer::spawn_tcp();
+    let relay_addr = relay.addr().clone();
+    assert!(
+        relay_addr.transport().is_tcp_transport(),
+        "the relay itself is reached over TCP: {relay_addr}"
+    );
+
+    let mut responder = Endpoint::builder()
+        .protocol(ECHO_PROTOCOL)
+        .relay(relay_addr.clone())
+        .nat_config(NatConfig {
+            force_relay: true,
+            reservation_policy: ReservationPolicy::Always,
+            ..NatConfig::default()
+        })
+        .bind_tcp("127.0.0.1:0")
+        .expect("bind responder");
+    responder.listen().expect("responder listens");
+    let responder_peer = responder.peer_id().clone();
+
+    let reservation_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            Instant::now() < reservation_deadline,
+            "responder did not reserve on the TCP relay"
+        );
+        let _ = responder
+            .next_event(Duration::from_millis(20))
+            .expect("drive responder reservation");
+        if responder.take_nat_events().iter().any(
+            |event| matches!(event, NatEvent::RelayReserved { relay, .. } if relay == relay_addr.peer_id()),
+        ) {
+            break;
+        }
+        relay.assert_healthy();
+    }
+
+    let mut initiator = Endpoint::builder()
+        .protocol(ECHO_PROTOCOL)
+        .relay(relay_addr)
+        .nat_config(NatConfig {
+            force_relay: true,
+            reservation_policy: ReservationPolicy::Never,
+            ..NatConfig::default()
+        })
+        .bind_tcp("127.0.0.1:0")
+        .expect("bind initiator");
+    initiator.listen().expect("initiator listens");
+    let initiator_peer = initiator.peer_id().clone();
+    let connect_id = initiator
+        .connect(&responder_peer)
+        .expect("start relay-only connect");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut path = None;
+    let mut initiator_circuit = None;
+    let mut responder_circuit = None;
+    let mut initiator_ready = false;
+    let mut responder_ready = false;
+    while path.is_none() || !initiator_ready || !responder_ready {
+        assert!(
+            Instant::now() < deadline,
+            "circuit over a TCP relay did not become ready:\nrelay={:#?}",
+            relay.trace(),
+        );
+        if let Some(event) = initiator
+            .next_event(Duration::from_millis(20))
+            .expect("drive initiator")
+        {
+            observe_circuit_event(
+                event,
+                &responder_peer,
+                &mut initiator_circuit,
+                &mut initiator_ready,
+            );
+        }
+        if let Some(event) = responder
+            .next_event(Duration::from_millis(20))
+            .expect("drive responder")
+        {
+            observe_circuit_event(
+                event,
+                &initiator_peer,
+                &mut responder_circuit,
+                &mut responder_ready,
+            );
+        }
+        for event in initiator.take_nat_events() {
+            if let NatEvent::PathEstablished {
+                connect_id: found,
+                peer,
+                path: found_path,
+            } = event
+                && found == connect_id
+                && peer == responder_peer
+            {
+                path = Some(found_path);
+            }
+        }
+        let _ = responder.take_nat_events();
+        relay.assert_healthy();
+    }
+
+    assert_eq!(
+        path,
+        Some(Path::Relayed {
+            relay: relay.addr().peer_id().clone()
+        })
+    );
+    // The high bit is the circuit namespace: these are circuit connections,
+    // not the TCP ones underneath them.
+    assert_ne!(
+        initiator_circuit.expect("initiator circuit id").as_u64() & (1 << 63),
+        0
+    );
+    assert_ne!(
+        responder_circuit.expect("responder circuit id").as_u64() & (1 << 63),
+        0
+    );
+
+    // The responder advertises the reservation as a circuit through a TCP
+    // relay, and it crossed the wire in identify -- the address shape that
+    // was rejected outright before this stage, on the leg that was the whole
+    // reason for rejecting it.
+    let advertised: Vec<_> = initiator
+        .peer_info(&responder_peer)
+        .expect("identify completed over the circuit")
+        .listen_addrs
+        .iter()
+        .filter_map(|bytes| minip2p::Multiaddr::from_bytes(bytes).ok())
+        .filter(|addr| addr.is_relay_circuit_transport())
+        .collect();
+    assert!(
+        advertised
+            .iter()
+            .any(|addr| addr.to_string().contains("/tcp/")),
+        "expected a circuit through a TCP relay, got {advertised:?}"
+    );
+
+    // And it carries application traffic, which is the only thing that
+    // proves the whole stack negotiated over it rather than merely opened.
+    let stream = initiator
+        .open_stream(&responder_peer, ECHO_PROTOCOL)
+        .expect("open echo stream over circuit");
+    let payload = b"echo across a circuit on a TCP relay".to_vec();
+    let echo_deadline = Instant::now() + Duration::from_secs(5);
+    let mut responder_stream = None;
+    let mut echoed = None;
+    while echoed.is_none() {
+        assert!(Instant::now() < echo_deadline, "circuit echo timed out");
+        if let Some(event) = initiator
+            .next_event(Duration::from_millis(20))
+            .expect("drive initiator echo")
+        {
+            match event {
+                Event::StreamReady {
+                    peer_id,
+                    stream_id,
+                    initiated_locally: true,
+                    ..
+                } if peer_id == responder_peer && stream_id == stream => {
+                    initiator
+                        .send_stream(&responder_peer, stream, payload.clone())
+                        .expect("send echo payload");
+                }
+                Event::StreamData {
+                    peer_id,
+                    stream_id,
+                    data,
+                    ..
+                } if peer_id == responder_peer && stream_id == stream => echoed = Some(data),
+                _ => {}
+            }
+        }
+        if let Some(event) = responder
+            .next_event(Duration::from_millis(20))
+            .expect("drive responder echo")
+        {
+            match event {
+                Event::StreamReady {
+                    peer_id,
+                    stream_id,
+                    initiated_locally: false,
+                    protocol_id,
+                    ..
+                } if peer_id == initiator_peer && protocol_id == ECHO_PROTOCOL => {
+                    responder_stream = Some(stream_id);
+                }
+                Event::StreamData {
+                    peer_id,
+                    stream_id,
+                    data,
+                    ..
+                } if peer_id == initiator_peer && Some(stream_id) == responder_stream => {
+                    responder
+                        .send_stream(&initiator_peer, stream_id, data)
+                        .expect("echo payload");
+                }
+                _ => {}
+            }
+        }
+        relay.assert_healthy();
+    }
+    assert_eq!(echoed, Some(payload));
+}
+
 fn observe_circuit_event(
     event: Event,
     remote: &PeerId,
