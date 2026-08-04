@@ -1,5 +1,7 @@
 # Micro-agent charters (pr-review)
 
+Bugbot is **not** a charter here — launch/merge rules live in `SKILL.md`. This file only defines State / Parse / Security / Flow / Verify / Quality.
+
 Shared constraints for every specialist:
 
 - Worktree + `git diff <base>...HEAD` only (plus necessary surrounding / out-of-diff callers), including files the orchestrator lists as untracked/added

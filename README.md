@@ -27,7 +27,7 @@ Install minip2p:
 minip2p-rs = "0.3.0"
 ```
 
-The package is named `minip2p-rs` on crates.io and imported as `minip2p`:
+Then create an endpoint:
 
 ```rust
 use minip2p::{Deadline, Endpoint, Event};
