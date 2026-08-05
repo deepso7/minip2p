@@ -197,7 +197,7 @@ impl MdnsIo for MdnsSockets {
         };
         pair.send
             .send_to(payload, destination)
-            .map_err(|error| MdnsError::io("sending an mDNS datagram", error))?;
+            .map_err(|error| send_error(*interface, error))?;
         Ok(())
     }
 }
@@ -314,6 +314,21 @@ fn create_send_socket(snapshot: &InterfaceSnapshot) -> Result<UdpSocket, MdnsErr
 
 /// Names what every socket option failure has in common: the socket could not
 /// be set up for multicast, and mDNS cannot run on it.
+/// What a failed send means.
+///
+/// These sockets are non-blocking, so a full kernel send buffer reports itself
+/// rather than waiting. That is backpressure and not a broken socket: the
+/// driver parks the datagram and comes back for it once the buffer has
+/// drained. Calling it an I/O failure would end mDNS for good over a moment of
+/// it -- which is the same distinction an embedded stack draws when its
+/// transmit ring fills.
+fn send_error(interface: InterfaceId, error: io::Error) -> MdnsError {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return MdnsError::Congested { interface };
+    }
+    MdnsError::io("sending an mDNS datagram", error)
+}
+
 fn setup<T>(result: io::Result<T>) -> Result<T, MdnsError> {
     result.map_err(|error| MdnsError::io("configuring an mDNS socket", error))
 }
@@ -434,6 +449,31 @@ mod tests {
             }
             assert!(ready, "a datagram sent on loopback never arrived");
         }
+    }
+
+    #[test]
+    fn a_full_send_buffer_is_backpressure_and_not_a_broken_socket() {
+        // Kernel send-buffer pressure is not something a test can conjure on
+        // demand, so the decision is checked where it is made. What it costs
+        // to get wrong is not small: the driver ends mDNS on an I/O failure,
+        // so one busy moment would take the host off the link for good.
+        assert_eq!(
+            send_error(
+                InterfaceId::new(1),
+                io::Error::from(io::ErrorKind::WouldBlock)
+            ),
+            MdnsError::Congested {
+                interface: InterfaceId::new(1)
+            }
+        );
+        // Anything else is what it says it is.
+        assert!(matches!(
+            send_error(
+                InterfaceId::new(1),
+                io::Error::from(io::ErrorKind::PermissionDenied)
+            ),
+            MdnsError::Io { .. }
+        ));
     }
 
     #[test]

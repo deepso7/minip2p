@@ -72,15 +72,17 @@ pub(crate) fn targets(addr: &PeerAddr) -> Result<Vec<(Family, PeerAddr)>, Transp
         })
         .ok_or_else(|| invalid("a dns dial target needs a /tcp or /udp port to resolve"))?;
 
-    let query = format!("{name}:{port}");
-    let resolved = query
+    // `(name, port)` rather than a reassembled `"name:port"`: the string form
+    // has to be parsed back apart, and a name carrying a colon would be split
+    // in the wrong place. This is the same resolution the TCP provider does.
+    let resolved = (name.as_str(), port)
         .to_socket_addrs()
-        .map_err(|error| invalid(format!("dns resolution failed for {query}: {error}")))?;
+        .map_err(|error| invalid(format!("dns resolution failed for {name}: {error}")))?;
 
     let targets = rebuild(addr, rest, resolved, filter)?;
     if targets.is_empty() {
         return Err(invalid(format!(
-            "dns resolution returned no usable address for {query}"
+            "dns resolution returned no usable address for {name}"
         )));
     }
     Ok(targets)
@@ -177,6 +179,21 @@ mod tests {
             );
             assert_eq!(target.peer_id(), addr.peer_id());
         }
+    }
+
+    #[test]
+    fn a_dns_component_is_resolved_as_a_name_and_not_as_an_address() {
+        // The whole `/dns` component is the query. Reassembling it into
+        // `"name:port"` and handing that to the resolver hands over something
+        // that is parsed as an address first, so a bracketed IP literal in a
+        // `/dns` component would resolve -- an address wearing a name's
+        // clothes, taking the path meant for names. The TCP provider resolves
+        // the same way, and this is the endpoint agreeing with it.
+        let addr = peer_addr("/dns/[::1]/tcp/4001");
+        assert!(
+            matches!(targets(&addr), Err(TransportError::InvalidAddress { .. })),
+            "an IP literal is not a name to look up"
+        );
     }
 
     #[test]

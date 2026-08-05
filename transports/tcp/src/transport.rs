@@ -441,25 +441,22 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
             self.provider.abort(socket);
             return;
         }
-        // Name the connection up front, even though what follows may reject it.
-        // The id is what an `Error` would refer to, so it has to be spent
-        // either way: reusing it later would point two outcomes at one id.
-        // An exhausted namespace leaves nothing to report against, so the
-        // socket just goes.
-        let Ok(id) = self.ids.allocate() else {
+        // Build the session before naming the connection. `Error` is an error
+        // *on a connection*, and nothing has been announced about this socket
+        // yet -- so an `Error` here would name an id the caller never saw, with
+        // no `Closed` behind it to end a lifecycle that never began. The same
+        // reasoning as the shed above: it goes where it stands. A dial that
+        // cannot build a session still reports it, because there the caller
+        // asked.
+        let Ok(session) = self.new_session(SessionRole::Responder, None) else {
             self.provider.abort(socket);
             return;
         };
-        let session = match self.new_session(SessionRole::Responder, None) {
-            Ok(session) => session,
-            Err(error) => {
-                self.provider.abort(socket);
-                self.pending.push_back(TransportEvent::Error {
-                    id,
-                    message: format!("inbound connection rejected: {error}"),
-                });
-                return;
-            }
+        // Named only now that it will exist. An exhausted namespace leaves
+        // nothing to report against, so the socket just goes.
+        let Ok(id) = self.ids.allocate() else {
+            self.provider.abort(socket);
+            return;
         };
 
         self.by_socket.insert(socket, id);

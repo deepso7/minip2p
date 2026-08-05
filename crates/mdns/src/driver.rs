@@ -19,6 +19,14 @@ pub const MAX_DATAGRAMS_PER_TICK: usize = 128;
 /// Datagrams sent in one [`tick`](MdnsDriver::tick), for the same reason.
 pub const MAX_ACTIONS_PER_TICK: usize = 128;
 
+/// How many times a shutdown drains the carrier for a goodbye that did not
+/// fit.
+///
+/// A tick would park it and try again next turn, but a shutdown has no next
+/// turn -- so it drains here instead, and gives up rather than hold a host
+/// that wants to exit against a carrier that will not take anything.
+const SHUTDOWN_DRAIN_ATTEMPTS: usize = 4;
+
 /// Drives [`MdnsAgent`] against an [`MdnsIo`].
 ///
 /// The agent decides what to say and when; this decides how much of that to
@@ -232,7 +240,22 @@ impl<I: MdnsIo> MdnsDriver<I> {
         // will be said, and an unsent one costs a peer a full TTL of pointing
         // at a host that has gone.
         while let Some(action) = self.agent.poll_action() {
-            if let Err(error) = io.send(&action)
+            let mut result = io.send(&action);
+            // There is no next turn to park a congested goodbye until, so the
+            // draining a tick would have done has to happen here. Bounded,
+            // because a carrier that will not drain must not hold a shutdown
+            // open forever -- a host waiting to exit gets to.
+            for _ in 0..SHUTDOWN_DRAIN_ATTEMPTS {
+                if !matches!(result, Err(MdnsError::Congested { .. })) {
+                    break;
+                }
+                if let Err(error) = io.poll(now_ms) {
+                    result = Err(error);
+                    break;
+                }
+                result = io.send(&action);
+            }
+            if let Err(error) = result
                 && !matches!(error, MdnsError::UnknownInterface { .. })
                 && first_error.is_none()
             {
@@ -376,6 +399,9 @@ mod tests {
         send_fails: bool,
         /// How many more datagrams the carrier has room for.
         room: Option<usize>,
+        /// How much room a `poll` frees up. Zero is a carrier that will not
+        /// drain at all.
+        room_per_poll: usize,
         receive_fails: bool,
         refresh_fails: bool,
         /// How many times `refresh` was asked, and what it reports.
@@ -426,6 +452,11 @@ mod tests {
 
         fn poll(&mut self, _now_ms: u64) -> Result<(), MdnsError> {
             self.ops.borrow_mut().push("poll");
+            // A carrier drains when it is driven, which is what makes a
+            // congested send worth trying again after one.
+            if let Some(room) = self.room.as_mut() {
+                *room += self.room_per_poll;
+            }
             Ok(())
         }
 
@@ -907,6 +938,52 @@ mod tests {
             ops.last(),
             Some(&"poll"),
             "the goodbyes are driven out after they are queued: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn a_goodbye_that_did_not_fit_is_driven_out_rather_than_lost() {
+        let mut io = FakeIo::with_interfaces(3);
+        io.room = Some(3);
+        // A carrier with room for the announcements and nothing left for the
+        // goodbyes, which drains a datagram's worth each time it is driven.
+        io.room_per_poll = 1;
+        let sent = io.sent.clone();
+        let mut driver = driver(io);
+        driver.tick(0, &[]).expect("tick");
+        let announced = sent.borrow().len();
+
+        // A tick would park a congested datagram and come back for it. A
+        // shutdown has no next turn, so it drains here instead -- and an
+        // unsent goodbye costs a peer a full TTL of pointing at a host that
+        // has gone, which is the whole reason a shutdown says one.
+        driver.shutdown(10).expect("goodbye");
+        assert_eq!(
+            sent.borrow().len() - announced,
+            3,
+            "every goodbye still went: {:?}",
+            sent.borrow()
+        );
+    }
+
+    #[test]
+    fn a_carrier_that_will_not_drain_does_not_hold_a_shutdown_open() {
+        let mut io = FakeIo::with_interfaces(2);
+        io.room = Some(0);
+        // Nothing this carrier is asked to do frees anything up.
+        io.room_per_poll = 0;
+        let ops = io.ops.clone();
+        let mut driver = driver(io);
+
+        // Reported rather than retried forever: a host that wants to exit
+        // gets to, and it is told the goodbye did not make it.
+        let error = driver.shutdown(10).expect_err("the goodbye never got out");
+        assert!(matches!(error, MdnsError::Congested { .. }), "{error:?}");
+        assert!(!driver.is_active());
+        let polls = ops.borrow().iter().filter(|op| **op == "poll").count();
+        assert!(
+            polls <= (SHUTDOWN_DRAIN_ATTEMPTS + 1) * 2 + 1,
+            "the drain is bounded, not a spin: {polls} polls"
         );
     }
 

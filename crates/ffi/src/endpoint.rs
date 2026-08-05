@@ -53,7 +53,11 @@ pub(crate) enum Lifecycle {
 
 #[uniffi::export]
 impl P2pEndpoint {
-    /// Validates the secret key and `config`, binds QUIC, and creates an endpoint.
+    /// Validates the secret key and `config`, binds a transport, and creates
+    /// an endpoint.
+    ///
+    /// A `/tcp` [`listen_addr`](EndpointConfig::listen_addr) binds TCP and a
+    /// `/quic-v1` one binds QUIC; with none given, QUIC on both families.
     ///
     /// The endpoint begins in the created state and owns its bound sockets,
     /// but does not run a background driver until explicitly started.
@@ -160,9 +164,22 @@ impl P2pEndpoint {
                     Multiaddr::from_str(&address).map_err(|error| FfiError::InvalidAddress {
                         detail: error.to_string(),
                     })?;
-                builder
-                    .bind_quic_multiaddr(&address)
-                    .map_err(map_constructor_error)?
+                // The address decides the transport, the same way it does for
+                // every dial through here: a foreign runtime that hands over
+                // a `/tcp` listener gets TCP, and one that hands over
+                // `/quic-v1` gets QUIC. Accepting `/tcp` peers to dial while
+                // refusing to listen on one would leave a device that has
+                // only TCP able to call out and never be called.
+                if address.is_tcp_transport() {
+                    builder
+                        .tcp_multiaddr(&address)
+                        .bind()
+                        .map_err(map_constructor_error)?
+                } else {
+                    builder
+                        .bind_quic_multiaddr(&address)
+                        .map_err(map_constructor_error)?
+                }
             }
             None => builder
                 .bind_quic_dual_stack()
@@ -477,7 +494,8 @@ impl P2pEndpoint {
         Ok(id.as_u64())
     }
 
-    /// Starts a connection attempt toward a direct QUIC peer address.
+    /// Starts a connection attempt toward a direct `/tcp` or `/quic-v1` peer
+    /// address.
     pub fn connect_addr(&self, address: String) -> Result<u64, FfiError> {
         let address = parse_direct_peer_addr(&address)?;
         let _pending = PendingCommand::new(&self.shared);

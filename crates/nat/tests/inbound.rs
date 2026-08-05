@@ -671,3 +671,48 @@ fn responder_reply_advertises_peer_observed_mapping() {
         "the reply must advertise our observed public mapping"
     );
 }
+
+#[test]
+fn our_own_tcp_listener_is_not_offered_as_a_punch_target() {
+    let mut h = inbound_harness(NatConfig::default());
+    // A host that bound both. The direct-candidate selector accepts both,
+    // because both are dialable -- but only one of them is punchable.
+    let tcp = maddr("/ip4/198.51.100.5/tcp/4001");
+    h.agent.set_listen_addrs(&[maddr(LISTEN_ADDR), tcp.clone()]);
+    // Same for a mapping a trusted peer observed for us: the relay watching
+    // us arrive over TCP says nothing about where we can be punched.
+    let relay = h.relay.clone();
+    let observed_tcp = maddr("/ip4/203.0.113.77/tcp/45678");
+    identify_observed(&mut h.agent, &relay, &observed_tcp, at(0));
+
+    let stream = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stream, 1);
+    let target = h.target.clone();
+    h.stream_data(stream, stop_connect(&target), at(10));
+    drain_actions(&mut h.agent);
+    h.stream_data(
+        stream,
+        dcutr_connect_reply(&[maddr(REMOTE_OBSERVED_ADDR)]),
+        at(20),
+    );
+
+    let actions = drain_actions(&mut h.agent);
+    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    assert!(
+        obs.contains(&maddr(LISTEN_ADDR)),
+        "the QUIC listener is still offered: {obs:?}"
+    );
+    assert!(
+        !obs.contains(&tcp),
+        // What goes into a CONNECT is an invitation to blast UDP at us. A
+        // `/tcp` listener cannot be punched, so offering one only spends the
+        // peer's punch window on an address that will never open -- and the
+        // peer filters it on arrival anyway, so it was never anything but
+        // noise on the wire.
+        "a TCP listener is not a punch target: {obs:?}"
+    );
+    assert!(
+        !obs.contains(&observed_tcp),
+        "nor is a TCP mapping someone observed for us: {obs:?}"
+    );
+}

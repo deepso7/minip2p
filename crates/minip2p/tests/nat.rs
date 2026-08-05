@@ -555,6 +555,29 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
         "expected a circuit through a TCP relay, got {advertised:?}"
     );
 
+    // Ping over the circuit, because identify and ping are what the default
+    // swarm runs on every connection: if the stack above the dial were not
+    // shared, this is where it would show.
+    initiator
+        .ping(&responder_peer)
+        .expect("ping over a circuit on a TCP relay");
+    let ping_deadline = Instant::now() + Duration::from_secs(5);
+    let mut ping_rtt = None;
+    while ping_rtt.is_none() {
+        assert!(Instant::now() < ping_deadline, "circuit ping timed out");
+        if let Some(Event::PingRttMeasured { peer_id, .. }) = initiator
+            .next_event(Duration::from_millis(20))
+            .expect("drive initiator ping")
+            && peer_id == responder_peer
+        {
+            ping_rtt = Some(());
+        }
+        let _ = responder
+            .next_event(Duration::from_millis(20))
+            .expect("drive responder ping");
+        relay.assert_healthy();
+    }
+
     // And it carries application traffic, which is the only thing that
     // proves the whole stack negotiated over it rather than merely opened.
     let stream = initiator
@@ -620,6 +643,37 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
         relay.assert_healthy();
     }
     assert_eq!(echoed, Some(payload));
+
+    // A circuit is only as alive as the connection carrying it, and on a TCP
+    // relay that connection is a TCP one. Cutting it has to close the circuit
+    // on both sides rather than leave either holding a connection to a peer
+    // it can no longer reach.
+    relay.cut_all();
+    let close_deadline = Instant::now() + Duration::from_secs(5);
+    let mut initiator_closed = false;
+    let mut responder_closed = false;
+    while !initiator_closed || !responder_closed {
+        assert!(
+            Instant::now() < close_deadline,
+            "circuit did not close after the TCP relay was cut"
+        );
+        if let Some(Event::ConnectionClosed { peer_id, conn_id }) = initiator
+            .next_event(Duration::from_millis(20))
+            .expect("drive initiator close")
+            && peer_id == responder_peer
+            && Some(conn_id) == initiator_circuit
+        {
+            initiator_closed = true;
+        }
+        if let Some(Event::ConnectionClosed { peer_id, conn_id }) = responder
+            .next_event(Duration::from_millis(20))
+            .expect("drive responder close")
+            && peer_id == initiator_peer
+            && Some(conn_id) == responder_circuit
+        {
+            responder_closed = true;
+        }
+    }
 }
 
 fn observe_circuit_event(

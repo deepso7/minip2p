@@ -253,8 +253,8 @@ impl Endpoint {
     }
 
     /// Seeds the NAT agent's advertised addresses from the bound set
-    /// (wildcards and non-QUIC shapes filtered out). No-op when NAT is
-    /// not configured.
+    /// (wildcards and anything no transport can dial filtered out). No-op when
+    /// NAT is not configured.
     #[cfg(feature = "nat")]
     fn sync_nat_listen_addrs(&mut self, addrs: &[PeerAddr]) {
         if let Some(nat) = self.nat.as_mut() {

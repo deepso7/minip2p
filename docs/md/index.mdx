@@ -152,7 +152,8 @@ discovery, and local-link mDNS.
 | | |
 | --- | --- |
 | <Badge>pre-1.0</Badge> | APIs may change before the first stable release. |
-| <Badge>QUIC only</Badge> | TCP, WebSocket, and WebTransport are out of scope. |
-| <Badge>Rust 1.88+</Badge> | Workspace MSRV. |
+| <Badge>TCP and QUIC</Badge> | The address decides which carries a peer. WebSocket and WebTransport are out of scope. |
+| <Badge>QUIC-only punching</Badge> | DCUtR hole punching needs QUIC; a TCP-only peer reaches NATed peers through a relay. |
+| <Badge>Rust 1.91+</Badge> | Workspace MSRV. |
 | <Badge>Caller-driven Rust</Badge> | Rust applications drive progress; the React Native adapter owns its native driver. |
 | <Badge>Relay client</Badge> | Bring a Circuit Relay v2 server when a relayed path is required. |

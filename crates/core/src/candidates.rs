@@ -100,8 +100,12 @@ mod tests {
             "/ip4/203.0.113.7/udp/4001",
             // A host with no transport on it.
             "/ip4/203.0.113.7",
-            // A circuit, which is reached through a relay rather than dialed.
-            "/ip4/203.0.113.7/tcp/4001/p2p-circuit",
+            // A whole, valid circuit address: reached by dialing the relay and
+            // asking it to connect, which is not the same as dialing this.
+            "/ip4/203.0.113.7/tcp/4001/p2p/12D3KooWA8EXV3KjBxEU9NMLC4ksHy4Zi8Kj9Y9Wq6ZFVvhFTa9J/p2p-circuit",
+            // A dialable address wearing someone's peer id, which belongs to a
+            // `PeerAddr` rather than to a transport candidate.
+            "/ip4/203.0.113.7/tcp/4001/p2p/12D3KooWA8EXV3KjBxEU9NMLC4ksHy4Zi8Kj9Y9Wq6ZFVvhFTa9J",
         ] {
             let bad = addr(bad);
             let selected = select_direct_addrs(core::slice::from_ref(&bad), None, None);

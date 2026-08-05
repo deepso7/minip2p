@@ -795,7 +795,7 @@ fn a_truncated_stream_is_a_fault_not_an_orderly_close() {
 }
 
 #[test]
-fn a_rejected_inbound_connection_is_reported_and_never_reuses_its_id() {
+fn an_inbound_connection_that_cannot_be_secured_goes_where_it_stands() {
     let net = VirtualNetwork::new();
     let listener_key = identity(2);
     let listener_peer = listener_key.peer_id();
@@ -814,23 +814,22 @@ fn a_rejected_inbound_connection_is_reported_and_never_reuses_its_id() {
     dialer.dial(&target).expect("first dial starts");
     let (_, listener_events) = drive(&net, &mut dialer, &mut listener);
 
-    let refused = listener_events
-        .iter()
-        .find_map(|event| match event {
-            TransportEvent::Error { id, message } if message.contains("rejected") => Some(*id),
-            _ => None,
-        })
-        .expect("the refusal must be reported: {listener_events:?}");
+    // Nothing was ever said about this socket, so there is nothing to correct:
+    // an `Error` is an error on a connection, and an id the host never saw
+    // names none -- with no `Closed` behind it, it would read as a connection
+    // still open. It goes the way a connection past the ceiling goes.
     assert!(
-        !listener_events
-            .iter()
-            .any(|event| matches!(event, TransportEvent::IncomingConnection { .. })),
-        "a connection the listener cannot secure must never be announced: {listener_events:?}"
+        listener_events.iter().all(|event| !matches!(
+            event,
+            TransportEvent::IncomingConnection { .. }
+                | TransportEvent::Error { .. }
+                | TransportEvent::Closed { .. }
+        )),
+        "a connection the listener cannot secure is refused in silence: {listener_events:?}"
     );
     assert!(listener.connection_ids().is_empty());
 
-    // The refused id was already spent on an event the host saw, so the next
-    // connection must not answer to it as well.
+    // And the listener keeps listening: one refusal is not the end of it.
     dialer.dial(&target).expect("second dial starts");
     let (_, listener_events) = drive(&net, &mut dialer, &mut listener);
     let accepted = listener_events
@@ -840,10 +839,6 @@ fn a_rejected_inbound_connection_is_reported_and_never_reuses_its_id() {
             _ => None,
         })
         .expect("the second connection is accepted");
-    assert_ne!(
-        accepted, refused,
-        "an id that named a failure must not be reused"
-    );
     assert_eq!(listener.connection_ids(), vec![accepted]);
 }
 
