@@ -29,11 +29,11 @@ std = [
 smoltcp = ["dep:smoltcp"]
 
 [dependencies]
-minip2p-core = { path = "../../crates/core", version = "0.2.0", default-features = false }
-minip2p-identity = { path = "../../crates/identity", version = "0.2.0", default-features = false, features = ["ed25519"] }
-minip2p-platform = { path = "../../crates/platform", version = "0.2.0", default-features = false }
-minip2p-secure-mux = { path = "../../crates/secure-mux", version = "0.2.0", default-features = false }
-minip2p-transport = { path = "../../crates/transport", version = "0.2.0", default-features = false }
+minip2p-core = { path = "../../crates/core", version = "0.3.1", default-features = false }
+minip2p-identity = { path = "../../crates/identity", version = "0.3.1", default-features = false, features = ["ed25519"] }
+minip2p-platform = { path = "../../crates/platform", version = "0.3.1", default-features = false }
+minip2p-secure-mux = { path = "../../crates/secure-mux", version = "0.3.1", default-features = false }
+minip2p-transport = { path = "../../crates/transport", version = "0.3.1", default-features = false }
 mio = { version = "1.0", features = ["net", "os-poll"], optional = true }
 smoltcp = { version = "0.13.1", default-features = false, features = [
     "alloc",

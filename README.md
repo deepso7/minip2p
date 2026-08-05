@@ -12,7 +12,8 @@ minip2p is built around a few deliberate constraints:
 - Protocol and orchestration logic is Sans-I/O and deterministic.
 - Core crates support `no_std + alloc`.
 - There is no `async`/`.await`; callers choose the executor and drive progress.
-- QUIC is the only transport adapter.
+- TCP and QUIC sit side by side, and the address decides which carries a peer.
+  TCP is portable down to `no_std`; QUIC stays `std`-only.
 - `unsafe` is forbidden across the workspace.
 
 The result is a set of reusable protocol state machines and a synchronous
@@ -68,8 +69,9 @@ reservations and direct-path upgrades with DCUtR.
 
 ## Features
 
-The base `Endpoint` includes QUIC, multistream-select, identify, ping, and
-application protocols registered with `EndpointBuilder::protocol`.
+The base `Endpoint` includes the transports you ask it to bind — TCP, QUIC, or
+both — plus multistream-select, identify, ping, and application protocols
+registered with `EndpointBuilder::protocol`.
 
 | Feature | Adds |
 | --- | --- |
@@ -84,7 +86,7 @@ outputs, timestamps, and deadlines.
 
 ## Architecture
 
-The workspace has three strictly separated layers:
+The workspace has four strictly separated layers:
 
 1. **Sans-I/O protocols** — identity, TLS, Noise, Yamux,
    multistream-select, ping, identify, relay, AutoNAT, DCUtR, pubsub, and mDNS.
@@ -92,8 +94,20 @@ The workspace has three strictly separated layers:
 2. **Sans-I/O orchestration** — `SwarmCore`, `NatAgent`, `BeaconAgent`, and
    `PeerDiscoveryAgent` compose protocols and policy while remaining
    deterministic and I/O-free.
-3. **`std` adapters** — the quiche-based QUIC transport, mDNS socket driver,
-   application-facing `Endpoint`, and UniFFI adapter own real I/O.
+3. **Transport adapters** — `minip2p-tcp` over a pluggable `TcpProvider`
+   byte-stream seam (`no_std + alloc`), and the quiche-based `minip2p-quic`
+   over UDP (`std`-only). `TransportSet` puts several behind one contract and
+   routes by address.
+4. **`std` adapters** — the mDNS socket driver, the application-facing
+   `Endpoint`, and the UniFFI adapter: the hosted end of the I/O seams.
+
+The seams below layer 3 — `TcpProvider` and `MdnsIo` — are what let TCP and
+mDNS run on a device with no operating system. `StdTcpProvider` and
+`MdnsSockets` are the hosted implementations; `SmoltcpTcpProvider` and
+`SmoltcpMdnsIo` are the [smoltcp] ones. Everything above them is the same code
+either way.
+
+[smoltcp]: https://docs.rs/smoltcp
 
 The default swarm intentionally includes only identify, ping, and registered
 application protocols. Relay, traversal, pubsub, and discovery policy stay
