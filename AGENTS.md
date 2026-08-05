@@ -29,12 +29,18 @@ Single test: `cargo test -p minip2p-ping test_name`. Endpoint features:
 `discovery,mdns`; see `justfile` for the full matrix). `fuzz/` is outside the
 workspace — use `--manifest-path fuzz/Cargo.toml`.
 
-Publishing: bump the workspace version, all versioned local dependencies, and
-the public TypeScript packages in lockstep; update `Cargo.lock` and the pnpm
-lockfile; run the standard checks; push the release commit; then publish a
-GitHub release tagged `v<version>`. The workflow publishes every runtime crate,
-`@minip2p/core`, and `@minip2p/react-native` with freshly built Android and iOS
-libraries.
+Publish a release end to end with:
+
+```bash
+just release 0.3.2
+```
+
+The command bumps every public package and local dependency, regenerates
+lockfiles, waits for push CI, publishes the GitHub release, waits for the native
+build and registry workflow, and verifies crates.io and npm. The default path
+leaves the full matrix to GitHub to avoid running it twice; use
+`just release 0.3.2 --full-local` to run it locally before pushing as well.
+
 
 ## Architecture
 

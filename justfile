@@ -72,3 +72,6 @@ bench:
 
 fuzz seconds="30":
     cargo +nightly fuzz run wire_inputs -- -max_total_time={{seconds}}
+
+release version *args:
+    ./scripts/release.sh "{{version}}" {{args}}
