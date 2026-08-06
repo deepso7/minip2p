@@ -1,6 +1,6 @@
 //! Std wiring that pumps a sans-I/O [`PubsubAgent`] against the
 //! endpoint's swarm: clock sampling, action execution, and stream-event
-//! interception. Mirrors the NAT driver (`crate::nat`).
+//! interception. Mirrors the endpoint's NAT driver.
 //!
 //! Available behind the `pubsub` cargo feature; see the pubsub methods on
 //! [`Endpoint`](crate::Endpoint) and
