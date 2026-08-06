@@ -57,6 +57,7 @@ pub use minip2p_nat::{
     ConnectId, NatConfig, NatError, NatEvent, Path, ReachabilityState, ReservationInfo,
     ReservationPolicy,
 };
+#[cfg(any(feature = "nat", feature = "tcp"))]
 use minip2p_platform::StdEntropy;
 #[cfg(feature = "pubsub")]
 pub use minip2p_pubsub::{
@@ -71,10 +72,14 @@ pub use minip2p_swarm::{
     Deadline, DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, RUN_UNTIL_SKIP_LIMIT, Swarm,
     SwarmError, SwarmEvent as Event,
 };
+#[cfg(feature = "tcp")]
 pub use minip2p_tcp::TcpConfig;
+#[cfg(feature = "tcp")]
 use minip2p_tcp::{StdTcpProvider, TcpTransport};
+use minip2p_transport::ConnectionNamespace;
+#[cfg(feature = "tcp")]
+use minip2p_transport::Transport;
 pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet, WaitHandle};
-use minip2p_transport::{ConnectionNamespace, Transport};
 #[cfg(feature = "pubsub")]
 pub use pubsub::PubsubError;
 
@@ -1196,6 +1201,7 @@ fn mdns_seed(keypair: &Ed25519Keypair) -> [u8; 32] {
 /// leave a port taken by an endpoint that never existed.
 enum Bind {
     Quic(QuicBind),
+    #[cfg(feature = "tcp")]
     Tcp(TcpBind),
 }
 
@@ -1205,6 +1211,7 @@ enum QuicBind {
     DualStack,
 }
 
+#[cfg(feature = "tcp")]
 enum TcpBind {
     Addr(String),
     Multiaddr(Multiaddr),
@@ -1215,6 +1222,7 @@ pub struct EndpointBuilder {
     keypair: Option<Ed25519Keypair>,
     agent_version: String,
     quic_limits: QuicLimits,
+    #[cfg(feature = "tcp")]
     tcp_config: TcpConfig,
     binds: Vec<Bind>,
     protocols: Vec<String>,
@@ -1240,6 +1248,7 @@ impl Default for EndpointBuilder {
             keypair: None,
             agent_version: DEFAULT_AGENT_VERSION.to_string(),
             quic_limits: QuicLimits::default(),
+            #[cfg(feature = "tcp")]
             tcp_config: TcpConfig::default(),
             binds: Vec::new(),
             protocols: Vec::new(),
@@ -1266,6 +1275,7 @@ struct BuilderParts {
     keypair: Ed25519Keypair,
     agent_version: String,
     quic_limits: QuicLimits,
+    #[cfg(feature = "tcp")]
     tcp_config: TcpConfig,
     binds: Vec<Bind>,
     protocols: Vec<String>,
@@ -1302,6 +1312,7 @@ impl EndpointBuilder {
 
     /// Overrides TCP connection, buffer, and timeout limits, and the
     /// connection-id namespace the TCP transport allocates in.
+    #[cfg(feature = "tcp")]
     pub fn tcp_config(mut self, config: TcpConfig) -> Self {
         self.tcp_config = config;
         self
@@ -1331,12 +1342,14 @@ impl EndpointBuilder {
     ///
     /// One TCP transport serves `/ip4` and `/ip6` alike, so a host that wants
     /// both listens twice on the one member rather than running two.
+    #[cfg(feature = "tcp")]
     pub fn tcp(mut self, bind_addr: impl Into<String>) -> Self {
         self.binds.push(Bind::Tcp(TcpBind::Addr(bind_addr.into())));
         self
     }
 
     /// Adds a TCP listener bound to a `/ip4|ip6/tcp/<port>` multiaddr.
+    #[cfg(feature = "tcp")]
     pub fn tcp_multiaddr(mut self, addr: &Multiaddr) -> Self {
         self.binds.push(Bind::Tcp(TcpBind::Multiaddr(addr.clone())));
         self
@@ -1489,6 +1502,7 @@ impl EndpointBuilder {
     }
 
     /// Builds an endpoint with a TCP transport listening on `bind_addr`.
+    #[cfg(feature = "tcp")]
     pub fn bind_tcp(self, bind_addr: impl Into<String>) -> Result<Endpoint, Error> {
         self.tcp(bind_addr).bind()
     }
@@ -1553,6 +1567,7 @@ impl EndpointBuilder {
             keypair: self.keypair.unwrap_or_else(Ed25519Keypair::generate),
             agent_version: self.agent_version,
             quic_limits: self.quic_limits,
+            #[cfg(feature = "tcp")]
             tcp_config: self.tcp_config,
             binds: self.binds,
             protocols: self.protocols,
@@ -1579,6 +1594,7 @@ impl EndpointBuilder {
 /// that asked to be reachable as `localhost` means both families, and listening
 /// on whichever the resolver happened to put first would leave half of that
 /// silently unserved. One TCP transport holds them all.
+#[cfg(feature = "tcp")]
 fn tcp_bind_addrs(spec: &str) -> Result<Vec<Multiaddr>, Error> {
     use std::net::ToSocketAddrs;
 
@@ -1605,6 +1621,7 @@ fn tcp_bind_addrs(spec: &str) -> Result<Vec<Multiaddr>, Error> {
 /// Split from resolution so what is kept can be tested without a resolver: no
 /// test can make a name answer with two families on demand, and "keeps every
 /// answer" is exactly the part that was wrong when it kept only the first.
+#[cfg(feature = "tcp")]
 fn tcp_addrs_of(resolved: impl IntoIterator<Item = std::net::SocketAddr>) -> Vec<Multiaddr> {
     let mut addrs: Vec<Multiaddr> = Vec::new();
     for addr in resolved {
@@ -1635,6 +1652,7 @@ fn tcp_addrs_of(resolved: impl IntoIterator<Item = std::net::SocketAddr>) -> Vec
 /// and IPv6 is asking for two sockets, not two transports.
 fn bind_transports(parts: &BuilderParts) -> Result<TransportSet, Error> {
     let mut set = TransportSet::new();
+    #[cfg(feature = "tcp")]
     let mut tcp_bound = false;
     for bind in &parts.binds {
         match bind {
@@ -1652,7 +1670,9 @@ fn bind_transports(parts: &BuilderParts) -> Result<TransportSet, Error> {
             // Handled together at the first one, in the position the host put
             // it, so the order addresses are reported in follows the order they
             // were asked for.
+            #[cfg(feature = "tcp")]
             Bind::Tcp(_) if tcp_bound => {}
+            #[cfg(feature = "tcp")]
             Bind::Tcp(_) => {
                 tcp_bound = true;
                 let transport = bind_tcp_member(parts)?;
@@ -1671,6 +1691,7 @@ fn bind_transports(parts: &BuilderParts) -> Result<TransportSet, Error> {
 }
 
 /// Builds the one TCP transport, listening on every `/tcp` address asked for.
+#[cfg(feature = "tcp")]
 fn bind_tcp_member(
     parts: &BuilderParts,
 ) -> Result<TcpTransport<StdTcpProvider, StdEntropy>, Error> {
@@ -1917,7 +1938,9 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "tcp")]
     use std::sync::Arc;
+    #[cfg(feature = "tcp")]
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Drives `endpoint` on a thread until the returned guard is dropped.
@@ -1925,11 +1948,13 @@ mod tests {
     /// A peer that is not being driven answers nothing, so anything asserting
     /// on a connection needs the other end alive for as long as the assertion
     /// takes.
+    #[cfg(feature = "tcp")]
     struct Driven {
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
+    #[cfg(feature = "tcp")]
     impl Driven {
         fn new(mut endpoint: Endpoint) -> Self {
             let stop = Arc::new(AtomicBool::new(false));
@@ -1948,6 +1973,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tcp")]
     impl Drop for Driven {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
@@ -1963,6 +1989,7 @@ mod tests {
     /// identify, ping, readiness -- and an earlier connection keeps producing
     /// them, so taking whatever arrives next is a race rather than an
     /// assertion.
+    #[cfg(feature = "tcp")]
     fn wait_for(
         endpoint: &mut Endpoint,
         what: &str,
@@ -1985,6 +2012,7 @@ mod tests {
         panic!("no {what} arrived; saw {seen:?}");
     }
 
+    #[cfg(feature = "tcp")]
     fn tcp_port(addr: &PeerAddr) -> u16 {
         match addr.transport().protocols() {
             [_, Protocol::Tcp(port)] => *port,
@@ -2037,6 +2065,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn a_tcp_endpoint_reports_the_port_it_was_given() {
         let mut endpoint = Endpoint::builder()
@@ -2060,6 +2089,7 @@ mod tests {
         assert_eq!(addrs[0].peer_id(), endpoint.peer_id());
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn every_bound_transport_reports_where_it_listens() {
         let mut endpoint = Endpoint::builder()
@@ -2088,6 +2118,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn a_second_tcp_address_joins_the_transport_that_already_serves_tcp() {
         let mut endpoint = Endpoint::builder()
@@ -2119,6 +2150,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn listening_arms_every_bound_transport_not_just_the_first() {
         // TCP first, so the transport that still needs arming is the one
@@ -2157,6 +2189,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn a_peer_is_reached_over_the_transport_its_address_names() {
         // One peer per transport: the swarm keeps a single connection per
@@ -2204,6 +2237,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn tcp_limits_and_namespace_reach_the_transport() {
         let mut endpoint = Endpoint::builder()
@@ -2227,6 +2261,7 @@ mod tests {
         assert_eq!(ids[0].namespace(), ConnectionNamespace::TCP_IPV6);
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn a_tcp_transport_tagged_for_another_carrier_is_refused() {
         // The namespace routes a connection id back to the transport that
@@ -2247,6 +2282,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn a_bind_spec_keeps_every_address_it_named() {
         let resolved: Vec<std::net::SocketAddr> = vec![
@@ -2268,6 +2304,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tcp")]
     #[test]
     fn a_tcp_multiaddr_binds_and_a_wrong_shape_is_refused() {
         let mut endpoint = Endpoint::builder()

@@ -114,7 +114,7 @@ jobs:
       - name: Test release commit
         run: |
           cargo test --workspace --locked
-          cargo test -p minip2p-rs --features nat,pubsub,discovery,mdns --locked
+          cargo test -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp --locked
           cargo test -p minip2p-tcp --features smoltcp --locked
           cargo test -p minip2p-mdns --features smoltcp --locked
           cargo doc --workspace --no-deps --locked

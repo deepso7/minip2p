@@ -14,6 +14,8 @@ check:
     cargo check -p minip2p-rs --features discovery
     cargo check -p minip2p-rs --features mdns
     cargo check -p minip2p-rs --features discovery,mdns
+    cargo check -p minip2p-rs --features tcp
+    cargo check -p minip2p-rs --features discovery,mdns,tcp
     cargo check -p minip2p-tcp --features smoltcp --all-targets
     cargo check -p minip2p-mdns --features smoltcp --all-targets
 
@@ -22,6 +24,8 @@ clippy:
     cargo clippy -p minip2p-rs --features discovery --all-targets -- -D warnings
     cargo clippy -p minip2p-rs --features mdns --all-targets -- -D warnings
     cargo clippy -p minip2p-rs --features discovery,mdns --all-targets -- -D warnings
+    cargo clippy -p minip2p-rs --features tcp --all-targets -- -D warnings
+    cargo clippy -p minip2p-rs --features discovery,mdns,tcp --all-targets -- -D warnings
     cargo clippy -p minip2p-tcp --features smoltcp --all-targets -- -D warnings
     cargo clippy -p minip2p-mdns --features smoltcp --all-targets -- -D warnings
     cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
@@ -34,6 +38,8 @@ test:
     cargo test -p minip2p-rs --features discovery
     cargo test -p minip2p-rs --features mdns
     cargo test -p minip2p-rs --features discovery,mdns
+    cargo test -p minip2p-rs --features tcp
+    cargo test -p minip2p-rs --features discovery,mdns,tcp
     cargo test -p minip2p-tcp --features smoltcp
     cargo test -p minip2p-mdns --features smoltcp
 
@@ -47,7 +53,7 @@ peer-ping:
 
 docs:
     cargo doc --workspace --no-deps
-    cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns --no-deps
+    cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp --no-deps
     cargo doc -p minip2p-tcp --features smoltcp --no-deps
     cargo doc -p minip2p-mdns --features smoltcp --no-deps
 

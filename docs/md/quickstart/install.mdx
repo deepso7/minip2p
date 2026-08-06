@@ -41,6 +41,20 @@ Features expose APIs at compile time. Builder methods decide which drivers run
 inside a particular endpoint.
 
 <Tabs>
+  <Tab title="TCP">
+
+    ```toml
+    minip2p-rs = {
+      version = "0.3.1",
+      features = ["tcp"]
+    }
+    ```
+
+    This adds the TCP transport and its `tcp`, `tcp_multiaddr`, `bind_tcp`,
+    and `tcp_config` builder methods. Without it, QUIC-only applications do
+    not link the TCP security, muxing, or socket stack.
+
+  </Tab>
   <Tab title="NAT">
 
     ```toml

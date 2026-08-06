@@ -17,16 +17,16 @@ Additional constraints: `unsafe` is forbidden workspace-wide; sockets, clocks, a
 `just` mirrors CI (`.github/workflows/ci.yml`):
 
 ```bash
-just test          # cargo test + Endpoint feature matrix through discovery + mDNS
-just clippy        # -D warnings, Endpoint discovery/mDNS variants, and fuzz/
+just test          # cargo test + Endpoint feature matrix through TCP, discovery, and mDNS
+just clippy        # -D warnings, Endpoint TCP/discovery/mDNS variants, and fuzz/
 just fmt           # also formats fuzz/
 just check-nostd   # all no_std crates on thumbv7em-none-eabi
 just fuzz 30       # needs nightly + cargo-fuzz
 ```
 
 Single test: `cargo test -p minip2p-ping test_name`. Endpoint features:
-`cargo test -p minip2p-rs --features mdns` (or `discovery`,
-`discovery,mdns`; see `justfile` for the full matrix). `fuzz/` is outside the
+`cargo test -p minip2p-rs --features tcp` (or `mdns`, `discovery`,
+`discovery,mdns,tcp`; see `justfile` for the full matrix). `fuzz/` is outside the
 workspace — use `--manifest-path fuzz/Cargo.toml`.
 
 Publish a release end to end with:

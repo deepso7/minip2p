@@ -28,6 +28,10 @@ for address in endpoint.listen_all()? {
 
 ## Transports
 
+QUIC is always available. TCP support is opt-in through the `tcp` Cargo
+feature, so a QUIC-only application does not link the TCP upgrade and socket
+stack. Enable it with `minip2p-rs = { version = "0.3.1", features = ["tcp"] }`.
+
 An endpoint brings up whatever it was asked to bind and routes by address from
 then on. `quic`, `quic_dual_stack`, and `tcp` add sockets; `bind` brings them
 all up:

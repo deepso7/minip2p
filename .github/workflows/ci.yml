@@ -57,6 +57,8 @@ jobs:
       - run: cargo clippy -p minip2p-rs --features discovery --all-targets -- -D warnings
       - run: cargo clippy -p minip2p-rs --features mdns --all-targets -- -D warnings
       - run: cargo clippy -p minip2p-rs --features discovery,mdns --all-targets -- -D warnings
+      - run: cargo clippy -p minip2p-rs --features tcp --all-targets -- -D warnings
+      - run: cargo clippy -p minip2p-rs --features discovery,mdns,tcp --all-targets -- -D warnings
       - run: cargo clippy -p minip2p-tcp --features smoltcp --all-targets -- -D warnings
       - run: cargo clippy -p minip2p-mdns --features smoltcp --all-targets -- -D warnings
       - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
@@ -69,6 +71,8 @@ jobs:
       - run: cargo test -p minip2p-rs --features discovery
       - run: cargo test -p minip2p-rs --features mdns
       - run: cargo test -p minip2p-rs --features discovery,mdns
+      - run: cargo test -p minip2p-rs --features tcp
+      - run: cargo test -p minip2p-rs --features discovery,mdns,tcp
       - run: cargo test -p minip2p-tcp --features smoltcp
       - run: cargo test -p minip2p-mdns --features smoltcp
       - run: cargo doc --workspace --no-deps

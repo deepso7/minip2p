@@ -409,6 +409,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
     }
 }
 
+#[cfg(feature = "tcp")]
 #[test]
 fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
     // Everything above the transport is the same code: HOP and STOP are
