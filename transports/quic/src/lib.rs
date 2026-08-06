@@ -23,6 +23,7 @@ use minip2p_transport::{
 use mio::{Events, Interest, Poll, Token, Waker};
 use quiche::ConnectionId as QuicConnectionId;
 use sha2::Sha256;
+use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 
 /// UDP packet retained after a non-blocking socket reports `WouldBlock`.
 pub(crate) struct PendingDatagram {
@@ -727,7 +728,7 @@ impl DualQuicTransport {
         ipv6_bind: &str,
     ) -> Result<Self, TransportError> {
         let ipv4 = QuicTransport::new(node_config.clone(), ipv4_bind)?;
-        let ipv6 = QuicTransport::new(node_config, ipv6_bind)?;
+        let ipv6 = QuicTransport::new_ipv6_only(node_config, ipv6_bind)?;
         if ipv4.namespace() != ConnectionNamespace::QUIC_IPV4
             || ipv6.namespace() != ConnectionNamespace::QUIC_IPV6
         {
@@ -858,6 +859,37 @@ impl QuicTransport {
             reason: format!("failed to bind udp socket: {e}"),
         })?;
 
+        Self::from_socket(node_config, socket)
+    }
+
+    fn new_ipv6_only(node_config: QuicNodeConfig, bind_addr: &str) -> Result<Self, TransportError> {
+        let bind_addr =
+            bind_addr
+                .parse::<SocketAddr>()
+                .map_err(|e| TransportError::InvalidAddress {
+                    context: "ipv6 bind address",
+                    reason: e.to_string(),
+                })?;
+        if !bind_addr.is_ipv6() {
+            return Err(TransportError::InvalidAddress {
+                context: "ipv6 bind address",
+                reason: "expected an IPv6 socket address".into(),
+            });
+        }
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(SocketProtocol::UDP))
+            .and_then(|socket| {
+                socket.set_only_v6(true)?;
+                socket.bind(&bind_addr.into())?;
+                Ok(socket.into())
+            })
+            .map_err(|e| TransportError::ListenFailed {
+                reason: format!("failed to bind ipv6-only udp socket: {e}"),
+            })?;
+
+        Self::from_socket(node_config, socket)
+    }
+
+    fn from_socket(node_config: QuicNodeConfig, socket: UdpSocket) -> Result<Self, TransportError> {
         socket
             .set_nonblocking(true)
             .map_err(|e| TransportError::ListenFailed {
@@ -2258,6 +2290,24 @@ mod tests {
             WaitOutcome::TimedOut,
             "one logical interrupt must not leak from the sibling family poll"
         );
+    }
+
+    #[test]
+    fn explicit_dual_stack_wildcards_can_share_one_port() {
+        let reservation = UdpSocket::bind("0.0.0.0:0").expect("reserve port");
+        let port = reservation.local_addr().expect("reserved addr").port();
+        drop(reservation);
+        let ipv4 = format!("/ip4/0.0.0.0/udp/{port}/quic-v1")
+            .parse::<Multiaddr>()
+            .expect("ipv4 multiaddr");
+        let ipv6 = format!("/ip6/::/udp/{port}/quic-v1")
+            .parse::<Multiaddr>()
+            .expect("ipv6 multiaddr");
+
+        let endpoint = QuicEndpoint::bind_dual_multiaddr(QuicNodeConfig::generate(), &ipv4, &ipv6)
+            .expect("same-port wildcard pair");
+
+        assert_eq!(endpoint.local_addresses().len(), 2);
     }
 
     #[test]

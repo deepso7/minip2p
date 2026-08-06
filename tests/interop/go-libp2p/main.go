@@ -18,9 +18,10 @@ import (
 )
 
 const (
-	echoProtocol = "/minip2p/interop/echo/1.0.0"
-	echoTimeout  = 10 * time.Second
-	maxEchoBytes = 1 << 20
+	echoProtocol    = "/minip2p/interop/echo/1.0.0"
+	echoTimeout     = 10 * time.Second
+	maxEchoBytes    = 1 << 20
+	maxCommandBytes = 8 * maxEchoBytes
 )
 
 type command struct {
@@ -57,6 +58,7 @@ func main() {
 	emit(event{Event: "ready", PeerID: node.ID().String(), Addr: readyAddr.String()})
 
 	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 64*1024), maxCommandBytes)
 	for scanner.Scan() {
 		var cmd command
 		if err := json.Unmarshal(scanner.Bytes(), &cmd); err != nil {

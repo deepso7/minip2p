@@ -2,7 +2,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak, mpsc};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use minip2p_ffi::{
@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 const ECHO_PROTOCOL: &str = "/minip2p/interop/echo/1.0.0";
 const PAYLOAD_FROM_MINIP2P: &[u8] = b"hello from minip2p";
-const PAYLOAD_FROM_GO: &str = "hello from go-libp2p";
+const PAYLOAD_FROM_GO_BYTES: usize = 128 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 struct GoPeer {
@@ -99,14 +99,9 @@ impl Drop for GoPeer {
 struct EventLog {
     events: Mutex<Vec<P2pEvent>>,
     changed: Condvar,
-    endpoint: Mutex<Weak<P2pEndpoint>>,
 }
 
 impl EventLog {
-    fn attach(&self, endpoint: &Arc<P2pEndpoint>) {
-        *self.endpoint.lock().unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(endpoint);
-    }
-
     fn wait_for(&self, predicate: impl Fn(&P2pEvent) -> bool) -> P2pEvent {
         let events = self.events.lock().unwrap_or_else(PoisonError::into_inner);
         let (events, _) = self
@@ -119,30 +114,23 @@ impl EventLog {
             .cloned()
             .expect("expected minip2p event")
     }
+
+    fn take_for(&self, predicate: impl Fn(&P2pEvent) -> bool) -> P2pEvent {
+        let events = self.events.lock().unwrap_or_else(PoisonError::into_inner);
+        let (mut events, _) = self
+            .changed
+            .wait_timeout_while(events, TIMEOUT, |events| !events.iter().any(&predicate))
+            .unwrap_or_else(PoisonError::into_inner);
+        let index = events
+            .iter()
+            .position(predicate)
+            .expect("expected minip2p event");
+        events.remove(index)
+    }
 }
 
 impl P2pEventListener for EventLog {
     fn on_event(&self, event: P2pEvent) {
-        if let P2pEvent::StreamData {
-            peer_id,
-            stream_id,
-            data,
-            ..
-        } = &event
-            && data.as_slice() == PAYLOAD_FROM_GO.as_bytes()
-            && let Some(endpoint) = self
-                .endpoint
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .upgrade()
-        {
-            endpoint
-                .send_stream(peer_id.clone(), *stream_id, data.clone())
-                .expect("echo go payload");
-            endpoint
-                .close_stream_write(peer_id.clone(), *stream_id)
-                .expect("half-close echoed stream");
-        }
         self.events
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -174,6 +162,7 @@ fn config() -> EndpointConfig {
 #[test]
 #[ignore = "requires Go and the go-libp2p module"]
 fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<(), FfiError> {
+    let payload_from_go = "g".repeat(PAYLOAD_FROM_GO_BYTES);
     let mut go = GoPeer::spawn();
     let ready = go.event("ready");
     let go_peer = ready["peer_id"].as_str().expect("go peer id").to_owned();
@@ -181,7 +170,6 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
 
     let endpoint = P2pEndpoint::new(vec![77; 32], config())?;
     let log = Arc::new(EventLog::default());
-    log.attach(&endpoint);
     endpoint.start(Arc::clone(&log) as Arc<dyn P2pEventListener>)?;
 
     endpoint.connect_addr(go_addr)?;
@@ -238,7 +226,7 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
     go.command(json!({
         "op": "echo",
         "addr": endpoint_addr,
-        "payload": PAYLOAD_FROM_GO,
+        "payload": &payload_from_go,
     }));
     let reverse_conn = match log.wait_for(|event| {
         matches!(event, P2pEvent::ConnectionEstablished { peer_id, conn_id }
@@ -247,16 +235,47 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
         P2pEvent::ConnectionEstablished { conn_id, .. } => conn_id,
         _ => unreachable!("predicate pins the event variant"),
     };
-    log.wait_for(|event| {
+    let reverse_stream = match log.wait_for(|event| {
         matches!(event, P2pEvent::StreamReady {
             conn_id,
             protocol_id,
             initiated_locally: false,
             ..
         } if *conn_id == reverse_conn && protocol_id == ECHO_PROTOCOL)
-    });
+    }) {
+        P2pEvent::StreamReady { stream_id, .. } => stream_id,
+        _ => unreachable!("predicate pins the event variant"),
+    };
+    let mut received = Vec::with_capacity(payload_from_go.len());
+    loop {
+        let event = log.take_for(|event| {
+            matches!(event,
+                P2pEvent::StreamData { conn_id, stream_id, .. }
+                    | P2pEvent::StreamRemoteWriteClosed { conn_id, stream_id, .. }
+                    if *conn_id == reverse_conn && *stream_id == reverse_stream)
+        });
+        match event {
+            P2pEvent::StreamData {
+                peer_id,
+                stream_id,
+                data,
+                ..
+            } => {
+                received.extend_from_slice(&data);
+                endpoint.send_stream(peer_id, stream_id, data)?;
+            }
+            P2pEvent::StreamRemoteWriteClosed {
+                peer_id, stream_id, ..
+            } => {
+                endpoint.close_stream_write(peer_id, stream_id)?;
+                break;
+            }
+            _ => unreachable!("predicate pins the event variants"),
+        }
+    }
+    assert_eq!(received, payload_from_go.as_bytes());
     let echoed = go.event("echo");
-    assert_eq!(echoed["payload"], PAYLOAD_FROM_GO);
+    assert_eq!(echoed["payload"], payload_from_go);
 
     endpoint.stop();
     assert!(endpoint.wait_stopped(5_000), "minip2p driver stopped");
