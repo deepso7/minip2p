@@ -604,6 +604,30 @@ impl QuicEndpoint {
         Self::bind(node_config, &bind.to_string())
     }
 
+    /// Binds one IPv4 and one IPv6 QUIC socket to exact multiaddresses.
+    pub fn bind_dual_multiaddr(
+        node_config: QuicNodeConfig,
+        first: &Multiaddr,
+        second: &Multiaddr,
+    ) -> Result<Self, TransportError> {
+        let first = extract_listen_socket_addr(first, "first dual-stack bind address")?;
+        let second = extract_listen_socket_addr(second, "second dual-stack bind address")?;
+        let (ipv4, ipv6) = match (
+            family_for_socket_addr(first),
+            family_for_socket_addr(second),
+        ) {
+            (AddressFamily::Ipv4, AddressFamily::Ipv6) => (first, second),
+            (AddressFamily::Ipv6, AddressFamily::Ipv4) => (second, first),
+            _ => {
+                return Err(TransportError::InvalidConfig {
+                    reason: "dual-stack QUIC requires one IPv4 and one IPv6 bind address".into(),
+                });
+            }
+        };
+        DualQuicTransport::bind(node_config, &ipv4.to_string(), &ipv6.to_string())
+            .map(|transport| Self::Dual(Box::new(transport)))
+    }
+
     /// Binds IPv4 and IPv6 wildcard UDP sockets.
     pub fn dual_stack(node_config: QuicNodeConfig) -> Result<Self, TransportError> {
         DualQuicTransport::new(node_config).map(|transport| Self::Dual(Box::new(transport)))
@@ -693,8 +717,24 @@ fn single_dial_family(
 impl DualQuicTransport {
     /// Binds IPv4 and IPv6 wildcard UDP sockets.
     pub fn new(node_config: QuicNodeConfig) -> Result<Self, TransportError> {
-        let ipv4 = QuicTransport::new(node_config.clone(), DEFAULT_IPV4_BIND)?;
-        let ipv6 = QuicTransport::new(node_config, DEFAULT_IPV6_BIND)?;
+        Self::bind(node_config, DEFAULT_IPV4_BIND, DEFAULT_IPV6_BIND)
+    }
+
+    /// Binds exact IPv4 and IPv6 socket addresses as one dual transport.
+    pub fn bind(
+        node_config: QuicNodeConfig,
+        ipv4_bind: &str,
+        ipv6_bind: &str,
+    ) -> Result<Self, TransportError> {
+        let ipv4 = QuicTransport::new(node_config.clone(), ipv4_bind)?;
+        let ipv6 = QuicTransport::new(node_config, ipv6_bind)?;
+        if ipv4.namespace() != ConnectionNamespace::QUIC_IPV4
+            || ipv6.namespace() != ConnectionNamespace::QUIC_IPV6
+        {
+            return Err(TransportError::InvalidConfig {
+                reason: "dual-stack QUIC requires IPv4 then IPv6 bind addresses".into(),
+            });
+        }
         Ok(Self {
             ipv4,
             ipv6,

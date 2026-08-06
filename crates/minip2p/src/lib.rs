@@ -1208,6 +1208,7 @@ enum Bind {
 enum QuicBind {
     Addr(String),
     Multiaddr(Multiaddr),
+    DualMultiaddr(Multiaddr, Multiaddr),
     DualStack,
 }
 
@@ -1329,6 +1330,15 @@ impl EndpointBuilder {
     pub fn quic_multiaddr(mut self, addr: &Multiaddr) -> Self {
         self.binds
             .push(Bind::Quic(QuicBind::Multiaddr(addr.clone())));
+        self
+    }
+
+    /// Adds one dual QUIC member bound to exact IPv4 and IPv6 multiaddresses.
+    pub fn quic_dual_multiaddr(mut self, first: &Multiaddr, second: &Multiaddr) -> Self {
+        self.binds.push(Bind::Quic(QuicBind::DualMultiaddr(
+            first.clone(),
+            second.clone(),
+        )));
         self
     }
 
@@ -1662,6 +1672,9 @@ fn bind_transports(parts: &BuilderParts) -> Result<TransportSet, Error> {
                 let transport = match spec {
                     QuicBind::Addr(addr) => QuicEndpoint::bind(config, addr)?,
                     QuicBind::Multiaddr(addr) => QuicEndpoint::bind_multiaddr(config, addr)?,
+                    QuicBind::DualMultiaddr(first, second) => {
+                        QuicEndpoint::bind_dual_multiaddr(config, first, second)?
+                    }
                     QuicBind::DualStack => QuicEndpoint::dual_stack(config)?,
                 };
                 let namespaces = transport.namespaces();

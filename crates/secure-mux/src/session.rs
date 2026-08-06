@@ -333,6 +333,7 @@ impl SecureMuxSession {
                         {
                             negotiated = true;
                         }
+                        MultistreamOutput::NotAvailable if self.role == SessionRole::Responder => {}
                         MultistreamOutput::Negotiated { .. } | MultistreamOutput::NotAvailable => {
                             return Err(SessionError::protocol("remote did not negotiate Noise"));
                         }
@@ -510,6 +511,7 @@ impl SecureMuxSession {
                 MultistreamOutput::Negotiated { protocol } if protocol == YAMUX_PROTOCOL_ID => {
                     negotiated = true;
                 }
+                MultistreamOutput::NotAvailable if self.role == SessionRole::Responder => {}
                 MultistreamOutput::Negotiated { .. } | MultistreamOutput::NotAvailable => {
                     return Err(SessionError::protocol("remote did not negotiate Yamux"));
                 }
@@ -694,6 +696,35 @@ mod tests {
     use super::*;
     use minip2p_yamux::{FLAG_SYN, Frame};
 
+    #[test]
+    fn responder_allows_fallback_before_noise() {
+        let mut responder = SecureMuxSession::new(SessionConfig {
+            role: SessionRole::Responder,
+            identity: Ed25519Keypair::generate(),
+            static_secret: [1; 32],
+            ephemeral_secret: [2; 32],
+            expected_peer: None,
+            yamux: YamuxConfig::default(),
+        });
+        responder.start().expect("start responder");
+        while responder.poll_output().is_some() {}
+
+        let mut proposals = b"\x13/multistream/1.0.0\n\x0b/tls/1.0.0\n\x07/noise\n".to_vec();
+        responder
+            .handle_input(core::mem::take(&mut proposals))
+            .expect("reject TLS and accept Noise on the same negotiation");
+
+        assert!(matches!(responder.phase, Some(Phase::Noise { .. })));
+        let writes = core::iter::from_fn(|| responder.poll_output())
+            .filter_map(|output| match output {
+                SessionOutput::Write(bytes) => Some(bytes),
+                _ => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(writes, b"\x03na\n\x07/noise\n");
+    }
+
     /// Runs two raw Noise sessions through their handshake, returning both in
     /// transport mode with their nonces in step.
     ///
@@ -760,6 +791,57 @@ mod tests {
         );
 
         (initiator, responder)
+    }
+
+    #[test]
+    fn responder_allows_fallback_before_yamux() {
+        let initiator_key = Ed25519Keypair::generate();
+        let initiator_peer = initiator_key.peer_id();
+        let (mut initiator_noise, responder_noise) =
+            noise_pair(initiator_key, Ed25519Keypair::generate());
+        let mut select = MultistreamSelect::listener([YAMUX_PROTOCOL_ID.to_string()]);
+        select.handle_input(MultistreamInput::Start).expect("start");
+        while select.poll_output().is_some() {}
+
+        let mut responder = SecureMuxSession {
+            role: SessionRole::Responder,
+            yamux_config: YamuxConfig::default(),
+            phase: Some(Phase::SelectYamux {
+                noise: responder_noise,
+                select,
+                peer: initiator_peer,
+            }),
+            outputs: VecDeque::new(),
+        };
+        let proposals = b"\x13/multistream/1.0.0\n\x0d/mplex/6.7.0\n\x0d/yamux/1.0.0\n".to_vec();
+        initiator_noise
+            .handle_input(NoiseInput::Encrypt(proposals))
+            .expect("encrypt proposals");
+        let ciphertext = core::iter::from_fn(|| initiator_noise.poll_output())
+            .filter_map(|output| match output {
+                NoiseOutput::Outbound(bytes) => Some(bytes),
+                NoiseOutput::HandshakeComplete { .. } | NoiseOutput::Decrypted(_) => None,
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+
+        responder
+            .handle_input(ciphertext)
+            .expect("reject mplex and accept Yamux on the same negotiation");
+
+        assert!(matches!(responder.phase, Some(Phase::Ready { .. })));
+        assert!(matches!(
+            responder.poll_output(),
+            Some(SessionOutput::Write(_))
+        ));
+        assert!(matches!(
+            responder.poll_output(),
+            Some(SessionOutput::Write(_))
+        ));
+        assert!(matches!(
+            responder.poll_output(),
+            Some(SessionOutput::Established { .. })
+        ));
     }
 
     /// Builds a dialer select that has exchanged multistream headers and sent

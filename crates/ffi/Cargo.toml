@@ -26,3 +26,4 @@ uniffi = "=0.31.0"
 [dev-dependencies]
 minip2p-relay = { path = "../relay" }
 minip2p-test-support = { path = "../test-support" }
+serde_json = "1.0.149"

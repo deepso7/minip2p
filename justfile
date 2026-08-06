@@ -51,6 +51,10 @@ check-nostd:
 peer-ping:
     cargo test -p minip2p-peer --test ping
 
+# Live foreign-implementation gate: TCP + Noise XX + Yamux in both directions.
+interop-go:
+    cargo test -p minip2p-ffi --test go_interop -- --ignored --nocapture
+
 docs:
     cargo doc --workspace --no-deps
     cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp --no-deps

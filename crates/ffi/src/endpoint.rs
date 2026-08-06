@@ -38,6 +38,7 @@ fn configure_transports(
                 }
                 let mut has_ipv4 = false;
                 let mut has_ipv6 = false;
+                let mut parsed = Vec::with_capacity(addresses.len());
                 for address in addresses {
                     let address = parse_listen_addr(&address, "QUIC")?;
                     if !address.is_quic_transport() {
@@ -61,8 +62,13 @@ fn configure_transports(
                             ),
                         });
                     }
-                    builder = builder.quic_multiaddr(&address);
+                    parsed.push(address);
                 }
+                builder = match parsed.as_slice() {
+                    [address] => builder.quic_multiaddr(address),
+                    [first, second] => builder.quic_dual_multiaddr(first, second),
+                    _ => unreachable!("validation permits at most one address per IP family"),
+                };
             }
         }
     }
@@ -1051,6 +1057,32 @@ mod tests {
         let endpoint = endpoint(config).expect("dual-stack endpoint");
 
         assert!(!endpoint.listen_addrs().is_empty());
+    }
+
+    #[test]
+    fn constructor_accepts_exact_dual_stack_quic_addresses() {
+        let mut config = config();
+        config.quic = Some(TransportOptions {
+            listen_addrs: Some(vec![
+                "/ip4/127.0.0.1/udp/0/quic-v1".into(),
+                "/ip6/::1/udp/0/quic-v1".into(),
+            ]),
+        });
+
+        let endpoint = endpoint(config).expect("exact dual-stack endpoint");
+        let addresses = endpoint.listen_addrs();
+
+        assert_eq!(addresses.len(), 2);
+        assert!(
+            addresses
+                .iter()
+                .any(|address| address.starts_with("/ip4/127.0.0.1/"))
+        );
+        assert!(
+            addresses
+                .iter()
+                .any(|address| address.starts_with("/ip6/::1/"))
+        );
     }
 
     #[test]
