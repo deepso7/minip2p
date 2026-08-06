@@ -536,6 +536,26 @@ fn a_datagram_bigger_than_the_send_buffer_is_never_going_to_fit() {
 }
 
 #[test]
+fn a_socket_with_no_packet_slots_is_permanently_unable_to_send() {
+    let bus = Bus::default();
+    let mut io = carrier_with(
+        &bus,
+        &[Ipv4Address::new(192, 168, 1, 1)],
+        SmoltcpMdnsConfig {
+            packet_slots: 0,
+            enable_ipv6: false,
+            ..SmoltcpMdnsConfig::default()
+        },
+    );
+    io.poll(0).expect("poll");
+
+    assert!(
+        matches!(io.send(&datagram()), Err(MdnsError::Oversized { .. })),
+        "a zero-slot ring can never drain into room and must not be reported as temporary congestion"
+    );
+}
+
+#[test]
 fn a_send_buffer_below_this_hosts_own_claim_does_not_spin_the_driver() {
     // One node: what it cannot send, nobody has to receive.
     let bus = Bus::default();

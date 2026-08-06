@@ -109,6 +109,16 @@ struct Member {
     transport: BoxedTransport,
 }
 
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct WakeState {
+    handles: Vec<crate::WaitHandle>,
+    /// An interrupt sent before any wakeable member joined. The first member
+    /// that can park inherits it, preserving [`WaitHandle`]'s next-wait
+    /// guarantee across set composition.
+    pending: bool,
+}
+
 /// Several transports behind one [`Transport`].
 ///
 /// This is what lets a host speak TCP and QUIC at once without the swarm above
@@ -164,7 +174,7 @@ pub struct TransportSet {
     /// earlier. Also the lock that makes an interrupt atomic with respect to
     /// the waits it has to wake.
     #[cfg(feature = "std")]
-    wakers: alloc::sync::Arc<std::sync::Mutex<Vec<crate::WaitHandle>>>,
+    wakers: alloc::sync::Arc<std::sync::Mutex<WakeState>>,
 }
 
 impl TransportSet {
@@ -202,7 +212,12 @@ impl TransportSet {
         {
             let handle = transport.wait_handle();
             if !handle.is_noop() {
-                self.wakers().push(handle);
+                let mut wake = self.wakers();
+                if wake.pending {
+                    handle.interrupt();
+                    wake.pending = false;
+                }
+                wake.handles.push(handle);
             }
         }
         self.members.push(Member {
@@ -241,7 +256,7 @@ impl TransportSet {
     /// handle leaves the list usable, and refusing to wake anything would be
     /// worse than waking one member twice.
     #[cfg(feature = "std")]
-    fn wakers(&self) -> std::sync::MutexGuard<'_, Vec<crate::WaitHandle>> {
+    fn wakers(&self) -> std::sync::MutexGuard<'_, WakeState> {
         self.wakers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -545,10 +560,13 @@ mod blocking_set {
             WaitHandle::new(move || {
                 // Held across the whole fan-out so a wait draining its
                 // siblings sees either all of this interrupt or none of it.
-                let handles = wakers
+                let mut handles = wakers
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                for handle in handles.iter() {
+                if handles.handles.is_empty() {
+                    handles.pending = true;
+                }
+                for handle in &handles.handles {
                     handle.interrupt();
                 }
             })
@@ -1347,6 +1365,32 @@ mod tests {
             assert_eq!(
                 set.wait_for_input(Duration::from_secs(30)),
                 WaitOutcome::Interrupted
+            );
+        }
+
+        #[test]
+        fn an_interrupt_before_the_first_wakeable_member_reaches_its_next_wait() {
+            let mut set = TransportSet::new();
+            let handle = set.wait_handle();
+            handle.interrupt();
+
+            let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV4).waking();
+            set.insert(
+                TransportKind::Tcp,
+                [ConnectionNamespace::TCP_IPV4],
+                tcp.boxed(),
+            )
+            .expect("tcp joins");
+
+            assert_eq!(
+                set.wait_for_input(Duration::from_secs(30)),
+                WaitOutcome::Interrupted,
+                "an early interrupt is retained until a member can receive it"
+            );
+            assert_eq!(
+                set.wait_for_input(Duration::ZERO),
+                WaitOutcome::TimedOut,
+                "the retained interrupt is consumed exactly once"
             );
         }
 

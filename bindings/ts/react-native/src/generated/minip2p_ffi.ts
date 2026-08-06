@@ -21,6 +21,8 @@ const uniffiIsDebug =
 
 /**
  * Builds a circuit multiaddress for `peer_id` through `relay_addr`.
+ *
+ * `relay_addr` is any direct `/tcp` or `/quic-v1` peer address.
  */
 export function circuitAddress(relayAddr: string, peerId: string): string /*throws*/ {
     return ((__rb: Uint8Array) => {
@@ -348,7 +350,8 @@ export type EndpointConfig = {
      */
     autonatServers: Array<string>,
     /**
-     * QUIC listen multiaddress, or dual-stack wildcard binding when absent.
+     * TCP or QUIC listen multiaddress, or dual-stack wildcard binding when
+     * absent.
      */
     listenAddr?: string,
     /**
@@ -3889,7 +3892,8 @@ export interface P2pEndpointLike {
  */
     connect(peerId: string) /*throws*/: bigint;
 /**
- * Starts a connection attempt toward a direct QUIC peer address.
+ * Starts a connection attempt toward a direct `/tcp` or `/quic-v1` peer
+ * address.
  */
     connectAddr(address: string) /*throws*/: bigint;
 /**
@@ -3897,7 +3901,7 @@ export interface P2pEndpointLike {
  */
     connectWithAddrs(peerId: string, addresses: Array<string>) /*throws*/: bigint;
 /**
- * Returns peers with an established QUIC or circuit connection.
+ * Returns peers with an established TCP, QUIC, or circuit connection.
  */
     connectedPeers() /*throws*/: Array<string>;
 /**
@@ -3941,7 +3945,7 @@ export interface P2pEndpointLike {
  */
     knownPeers() /*throws*/: Array<KnownPeerInfo>;
 /**
- * Returns the bound QUIC peer addresses.
+ * Returns the bound TCP or QUIC peer addresses.
  */
     listenAddrs(): Array<string>;
 /**
@@ -4027,7 +4031,11 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     readonly [destructorGuardSymbol]: UniffiGcObject;
     readonly [pointerLiteralSymbol]: UniffiHandle;
 /**
- * Validates the secret key and `config`, binds QUIC, and creates an endpoint.
+ * Validates the secret key and `config`, binds a transport, and creates
+ * an endpoint.
+ *
+ * A `/tcp` [`listen_addr`](EndpointConfig::listen_addr) binds TCP and a
+ * `/quic-v1` one binds QUIC; with none given, QUIC on both families.
  *
  * The endpoint begins in the created state and owns its bound sockets,
  * but does not run a background driver until explicitly started.
@@ -4151,7 +4159,8 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Starts a connection attempt toward a direct QUIC peer address.
+ * Starts a connection attempt toward a direct `/tcp` or `/quic-v1` peer
+ * address.
  */
     connectAddr(address: string): bigint /*throws*/ {
     return FfiConverterUInt64.lift(uniffiCaller.rustCallWithError(
@@ -4184,7 +4193,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns peers with an established QUIC or circuit connection.
+ * Returns peers with an established TCP, QUIC, or circuit connection.
  */
     connectedPeers(): Array<string> /*throws*/ {
     return ((__rb: Uint8Array) => {
@@ -4353,7 +4362,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns the bound QUIC peer addresses.
+ * Returns the bound TCP or QUIC peer addresses.
  */
     listenAddrs(): Array<string> {
     return ((__rb: Uint8Array) => {
@@ -4755,7 +4764,7 @@ function uniffiEnsureInitialized() {
     if (bindingsContractVersion !== scaffoldingContractVersion) {
         throw new UniffiInternalError.ContractVersionMismatch(scaffoldingContractVersion, bindingsContractVersion);
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_func_circuit_address() !== 35260) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_func_circuit_address() !== 18077) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_func_circuit_address");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_func_generate_secret_key() !== 44400) {
@@ -4764,7 +4773,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_func_peer_id_from_secret_key() !== 8962) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_func_peer_id_from_secret_key");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new() !== 6140) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new() !== 56618) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_abandon_stream() !== 60482) {
@@ -4785,13 +4794,13 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect() !== 60427) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr() !== 53710) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr() !== 15782) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs() !== 44153) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers() !== 10075) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers() !== 52578) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial() !== 47576) {
@@ -4818,7 +4827,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_known_peers() !== 27328) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_known_peers");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_listen_addrs() !== 19812) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_listen_addrs() !== 60889) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_listen_addrs");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_open_stream() !== 18245) {

@@ -531,7 +531,12 @@ impl<D: Device> SmoltcpTcpProvider<D> {
     /// unbounded amount of work, as smoltcp's own warning on it says. Nothing
     /// preempts that on a device with no operating system, so the ingress is
     /// budgeted the way the hosted provider budgets reads and accepts, and
-    /// what did not fit is reported as due now.
+    /// what may not have fit is reported as due now. Hitting the cap cannot
+    /// prove that another frame is queued: `Device` has no non-consuming peek,
+    /// and `poll_ingress_single` would process the probe itself. The immediate
+    /// follow-up is therefore deliberately conservative. It costs one extra
+    /// poll when the queue held exactly the budget, while probing would merely
+    /// move the same ambiguity to exactly `budget + 1` frames.
     fn drive(&mut self, timestamp: Instant) {
         self.iface.poll_maintenance(timestamp);
 

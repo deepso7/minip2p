@@ -274,7 +274,10 @@ impl<I: MdnsIo> MdnsDriver<I> {
                 result = io.send(&action);
             }
             if let Err(error) = result
-                && !matches!(error, MdnsError::UnknownInterface { .. })
+                && !matches!(
+                    error,
+                    MdnsError::UnknownInterface { .. } | MdnsError::Oversized { .. }
+                )
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -1024,6 +1027,18 @@ mod tests {
             "every goodbye still went: {:?}",
             sent.borrow()
         );
+    }
+
+    #[test]
+    fn an_oversized_goodbye_is_dropped_without_failing_shutdown() {
+        let mut io = FakeIo::with_interfaces(1);
+        io.max_payload = Some(0);
+        let mut driver = driver(io);
+
+        driver
+            .shutdown(10)
+            .expect("an unsendable goodbye is a dropped datagram, not a shutdown failure");
+        assert!(!driver.is_active());
     }
 
     #[test]

@@ -368,11 +368,9 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
         // a momentarily full one is, so it has to be recognised before the
         // attempt: the driver parks congestion and comes back for it, which
         // for this one would be forever.
-        let capacity = self
-            .sockets
-            .get::<udp::Socket>(handle)
-            .payload_send_capacity();
-        if payload.len() > capacity {
+        let socket = self.sockets.get::<udp::Socket>(handle);
+        let capacity = socket.payload_send_capacity();
+        if payload.len() > capacity || socket.packet_send_capacity() == 0 {
             return Err(MdnsError::Oversized {
                 interface: *interface,
                 len: payload.len(),
