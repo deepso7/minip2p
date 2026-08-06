@@ -18,12 +18,12 @@
 //!   [`EntropySource`]. It reports its next timer through
 //!   [`SwarmRuntime::next_deadline`] so a host can idle instead of spinning.
 //!
-//! - [`Swarm`] -- `std` wrapper adding a monotonic clock and blocking drive
+//! - `Swarm` -- `std` wrapper adding a monotonic clock and blocking drive
 //!   loops (`poll_next`, `run_until`) on top of the runtime, preserving the
 //!   one-call DX (`swarm.dial(addr)`, `swarm.ping(peer)`,
 //!   `swarm.open_stream`) without threading `now_ms` through every call.
 //!
-//! Most applications want [`Swarm`] and the [`SwarmBuilder`] convenience
+//! Most `std` applications want `Swarm` and the [`SwarmBuilder`] convenience
 //! constructor. Hosts with no thread to block -- embedded boards,
 //! single-threaded event loops -- drive [`SwarmRuntime`] directly.
 //!
@@ -40,7 +40,6 @@ mod core;
 mod events;
 mod runtime;
 
-#[cfg(feature = "std")]
 mod builder;
 #[cfg(feature = "std")]
 mod driver;
@@ -55,7 +54,6 @@ pub use crate::runtime::{DriverError, SwarmRuntime};
 // consumers can name the type without depending on `minip2p-identify`.
 pub use minip2p_identify::IdentifyMessage;
 
-#[cfg(feature = "std")]
 pub use crate::builder::SwarmBuilder;
 #[cfg(feature = "std")]
 pub use crate::driver::{Deadline, PollNext, RUN_UNTIL_SKIP_LIMIT, Swarm};

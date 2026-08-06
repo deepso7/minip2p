@@ -35,11 +35,11 @@ pub enum DriverError {
     /// The driver and core violated their internal action contract.
     #[error("swarm driver invariant violated: {reason}")]
     Invariant { reason: &'static str },
-    /// [`Swarm::run_until`](crate::Swarm::run_until) set aside [`RUN_UNTIL_SKIP_LIMIT`](crate::RUN_UNTIL_SKIP_LIMIT) non-matching
-    /// events without finding a match.
+    /// The std-only `Swarm::run_until` set aside its maximum number of
+    /// non-matching events without finding a match.
     ///
     /// The skipped events were restored to the event buffer in their
-    /// original order; drain them with [`Swarm::poll_next`](crate::Swarm::poll_next) before waiting
+    /// original order; drain them with `Swarm::poll_next` before waiting
     /// again, or use a predicate that matches (and thereby consumes) the
     /// high-volume events.
     #[error(
@@ -149,7 +149,6 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     /// Mutable core access for [`SwarmBuilder`](crate::SwarmBuilder), which
     /// registers protocols before the runtime is handed to the application
     /// and wants the core's own error type rather than [`DriverError`].
-    #[cfg(feature = "std")]
     pub(crate) fn core_mut(&mut self) -> &mut SwarmCore {
         &mut self.core
     }
@@ -467,9 +466,9 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     /// Drive the swarm: poll transport, feed events to core, dispatch
     /// actions, return application-visible events. Must be called repeatedly.
     ///
-    /// Most event-loop code can be simpler to write against
-    /// [`Swarm::poll_next`](crate::Swarm::poll_next) or [`Swarm::run_until`](crate::Swarm::run_until), which internally
-    /// call this in a sleep/poll loop and return one event at a time.
+    /// Std event-loop code can instead use `Swarm::poll_next` or
+    /// `Swarm::run_until`, which call this in a sleep/poll loop and return one
+    /// event at a time.
     pub fn poll(&mut self, now: Now) -> Result<Vec<SwarmEvent>, DriverError> {
         let now_ms = now.monotonic_ms;
 

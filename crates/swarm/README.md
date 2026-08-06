@@ -103,7 +103,10 @@ Disable default features:
 minip2p-swarm = { path = "crates/swarm", default-features = false }
 ```
 
-The `no_std` build omits the `Swarm<T>` wrapper and `SwarmBuilder`, which need a clock and a thread to block. `SwarmCore`, `SwarmRuntime`, and the event / action / error types all remain.
+The `no_std` build omits only the blocking `Swarm<T>` wrapper. `SwarmBuilder`
+remains available: call `build_runtime(transport, entropy)` to construct a
+portable `SwarmRuntime`. `SwarmCore`, the event / action / error types, and the
+full caller-driven runtime all remain available without `std`.
 
 ## Scope
 
