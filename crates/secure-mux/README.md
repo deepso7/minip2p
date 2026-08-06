@@ -59,7 +59,11 @@ Peer *verification* is not policy and is not optional: set `expected_peer` and N
 
 ## Errors
 
-`SessionError::Protocol` is fatal — tear the connection down. `SessionError::NotEstablished` means a substream operation ran before the upgrade completed. `SessionError::Yamux` is passed through so callers can distinguish a full send buffer (retry later) from a fatal failure.
+- `SessionError::Protocol` is fatal — tear the connection down.
+- `SessionError::GoAway` is fatal too, but the remote ended the session deliberately: a `code` of 0 is an orderly shutdown, so a caller that surfaces failures to its host should close quietly rather than report an error the remote never made. Every open substream goes with it, so drain outputs after the error to collect a `StreamClosed` for each.
+- `SessionError::NotEstablished` means a substream operation ran before the upgrade completed. The session is untouched and still mid-upgrade; from `go_away` it means there is nothing to shut down, so just drop the underlying stream.
+- `SessionError::UnknownStream` means the id does not name a substream of this session. Ids are rejected rather than truncated, so a fabricated one can never alias onto somebody else's substream. The session stays usable.
+- `SessionError::Yamux` is passed through so callers can distinguish a full send buffer (retry later) from a fatal failure.
 
 ## no_std
 

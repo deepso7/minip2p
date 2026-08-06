@@ -764,8 +764,15 @@ fn close_shuts_the_peer_down_without_reporting_an_error() {
     let (_, listener_events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
     assert_eq!(
         listener_events,
-        [TransportEvent::Closed { id }],
-        "an orderly shutdown is not an error on the peer: {listener_events:?}"
+        [
+            TransportEvent::StreamClosed {
+                id,
+                stream_id: stream
+            },
+            TransportEvent::Closed { id },
+        ],
+        "the peer sees the same pair the closing side did, and no error: \
+         {listener_events:?}"
     );
     assert!(pair.listener.connection_ids().is_empty());
 }

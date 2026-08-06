@@ -43,6 +43,8 @@ pub fn peer_id_from_secret_key(secret_key: Vec<u8>) -> Result<String, FfiError> 
 }
 
 /// Builds a circuit multiaddress for `peer_id` through `relay_addr`.
+///
+/// `relay_addr` is any direct `/tcp` or `/quic-v1` peer address.
 #[uniffi::export]
 pub fn circuit_address(relay_addr: String, peer_id: String) -> Result<String, FfiError> {
     let relay = parse_direct_peer_addr(&relay_addr)?;

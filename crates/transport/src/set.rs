@@ -535,11 +535,12 @@ mod blocking_set {
             //
             // The list is the set's own and is read when the handle fires, not
             // when it is taken, so a member that joins later is woken by a
-            // handle a host already holds. Only a set with nothing wakeable in
-            // it at all reports an inert handle.
-            if self.wakers().is_empty() {
-                return WaitHandle::noop();
-            }
+            // handle a host already holds. That is why nothing wakeable in the
+            // list yet is not grounds for an inert handle either: a host wires
+            // its wakeup path while composing the set, and a handle that had
+            // answered "inert" then would leave the set asleep inside every
+            // member that filled it afterwards. An empty list simply reaches
+            // nobody, for as long as it stays empty.
             let wakers = alloc::sync::Arc::clone(&self.wakers);
             WaitHandle::new(move || {
                 // Held across the whole fan-out so a wait draining its
@@ -1314,6 +1315,42 @@ mod tests {
         }
 
         #[test]
+        fn a_handle_taken_before_anything_wakeable_wakes_what_joins_after_it() {
+            let mut set = TransportSet::new();
+            // Nothing in the set can be woken yet -- and a host wires its
+            // wakeup path here, while composing, before it binds a thing.
+            let handle = set.wait_handle();
+            let unwakeable = Fake::new("smoltcp", ConnectionNamespace::TCP_IPV6);
+            set.insert(
+                TransportKind::Tcp,
+                [ConnectionNamespace::TCP_IPV6],
+                unwakeable.boxed(),
+            )
+            .expect("the unwakeable member joins");
+            let quic = Fake::new("quic", ConnectionNamespace::QUIC_IPV4).waking();
+            set.insert(
+                TransportKind::Quic,
+                [ConnectionNamespace::QUIC_IPV4],
+                quic.boxed(),
+            )
+            .expect("quic joins");
+
+            handle.interrupt();
+            assert_eq!(
+                quic.pending_interrupts(),
+                1,
+                "a handle taken before there was anything to wake still has to \
+                 reach the members that arrived after it"
+            );
+            // Otherwise the set parks inside that member for the whole budget
+            // with a host holding a handle it believes wakes it.
+            assert_eq!(
+                set.wait_for_input(Duration::from_secs(30)),
+                WaitOutcome::Interrupted
+            );
+        }
+
+        #[test]
         fn a_set_goes_where_its_driver_goes() {
             let (set, ..) = waking_duo();
 
@@ -1335,7 +1372,12 @@ mod tests {
                 set.wait_for_input(Duration::from_secs(30)),
                 WaitOutcome::Unsupported
             );
-            assert!(set.wait_handle().is_noop());
+            // The handle is still live, though, and interrupting it reaches
+            // nobody rather than panicking: membership can grow, and a wakeable
+            // member joining later has to be reachable through a handle the
+            // host already holds. `Unsupported` is what says the set cannot
+            // park -- that is the answer a driver acts on.
+            set.wait_handle().interrupt();
             assert_eq!(tcp.waits(), vec![Duration::ZERO]);
             assert_eq!(quic.waits(), vec![Duration::ZERO]);
         }

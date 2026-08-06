@@ -187,6 +187,22 @@ fn addr(text: &str) -> Multiaddr {
 
 /// A bare carrier on the bus, holding exactly the addresses given.
 fn carrier(bus: &Bus, addresses: &[Ipv4Address]) -> SmoltcpMdnsIo<BusDevice> {
+    carrier_with(
+        bus,
+        addresses,
+        SmoltcpMdnsConfig {
+            enable_ipv6: false,
+            ..SmoltcpMdnsConfig::default()
+        },
+    )
+}
+
+/// The same, for a test that has something to say about how it is sized.
+fn carrier_with(
+    bus: &Bus,
+    addresses: &[Ipv4Address],
+    config: SmoltcpMdnsConfig,
+) -> SmoltcpMdnsIo<BusDevice> {
     let mut device = bus.attach();
     let mut iface = Interface::new(
         Config::new(HardwareAddress::Ip),
@@ -198,15 +214,7 @@ fn carrier(bus: &Bus, addresses: &[Ipv4Address]) -> SmoltcpMdnsIo<BusDevice> {
             let _ = addrs.push(IpCidr::new((*address).into(), 24));
         }
     });
-    SmoltcpMdnsIo::new(
-        device,
-        iface,
-        SmoltcpMdnsConfig {
-            enable_ipv6: false,
-            ..SmoltcpMdnsConfig::default()
-        },
-    )
-    .expect("the interface takes the mDNS group")
+    SmoltcpMdnsIo::new(device, iface, config).expect("the interface takes the mDNS group")
 }
 
 /// The one interface a `SmoltcpMdnsIo` reports for IPv4.
@@ -373,19 +381,28 @@ fn an_idle_link_lets_the_host_sleep() {
     }
     let now = idle_at.expect("the link never went quiet");
 
-    // With the carrier owing nothing, the answer is exactly what mDNS itself
-    // owes: its own poll interval, its next interface re-enumeration, or the
-    // agent's next scheduled word, whichever comes first. Asserting the
-    // number rather than "more than zero" is what makes this a bound -- a
-    // carrier that claimed a deadline it did not have would shorten it, and a
-    // driver that ignored the carrier's deadlines would not be caught here at
-    // all, which is what the next test is for.
+    // The answer is the soonest of everything the driver combines: its own
+    // poll interval, its next interface re-enumeration, the agent's next
+    // scheduled word, and whatever the carrier owes -- nothing, on an idle
+    // link, but taken from the carrier rather than assumed, so a carrier that
+    // claimed a deadline it did not have is caught shortening this instead of
+    // breaking the comparison. Asserting the number rather than "more than
+    // zero" is what makes this a bound; a driver that ignored the carrier's
+    // deadlines would not be caught here at all, which is what the next test
+    // is for.
     let config = MdnsConfig::default();
     let mut expected = config
         .socket_poll_interval_ms
         .min(config.interface_refresh_ms - now);
     if let Some(agent) = first.driver.agent().next_timeout(now) {
         expected = expected.min(agent);
+    }
+    if let Some(carrier) = first
+        .driver
+        .io()
+        .and_then(|carrier| carrier.next_deadline(now))
+    {
+        expected = expected.min(carrier);
     }
     assert!(expected > 0, "an idle host has something to sleep on");
     assert_eq!(first.driver.next_timeout(now), Some(expected));
@@ -476,6 +493,82 @@ fn a_send_ring_with_no_room_is_a_backlog_and_not_the_end_of_mdns() {
     io.send(&datagram())
         .expect("the drain inside the send made room");
     assert!(!bus.is_quiet(), "and the burst went out");
+}
+
+#[test]
+fn a_datagram_bigger_than_the_send_buffer_is_never_going_to_fit() {
+    let bus = Bus::default();
+    let _listener = carrier(&bus, &[Ipv4Address::new(192, 168, 1, 2)]);
+    // A device that shrank its buffers below what its own claims need. The
+    // documented cost of that is a dropped claim, and the only thing that
+    // makes it one is saying so differently from a ring that is merely full:
+    // the driver comes back for congestion, so this would be retried forever.
+    let mut io = carrier_with(
+        &bus,
+        &[Ipv4Address::new(192, 168, 1, 1)],
+        SmoltcpMdnsConfig {
+            tx_payload_bytes: 8,
+            enable_ipv6: false,
+            ..SmoltcpMdnsConfig::default()
+        },
+    );
+    io.poll(0).expect("poll");
+
+    let oversized = MdnsError::Oversized {
+        interface: IPV4,
+        len: 12,
+        capacity: 8,
+    };
+    assert_eq!(
+        io.send(&datagram()).expect_err("it will never fit"),
+        oversized,
+        "a buffer that could never hold it is not a buffer that is momentarily full"
+    );
+
+    // And a drain says nothing new about it, which is the whole difference: an
+    // empty ring is exactly what a parked datagram would be waiting for.
+    io.poll(1).expect("poll");
+    assert_eq!(
+        io.send(&datagram())
+            .expect_err("an empty ring is no bigger"),
+        oversized
+    );
+}
+
+#[test]
+fn a_send_buffer_below_this_hosts_own_claim_does_not_spin_the_driver() {
+    // One node: what it cannot send, nobody has to receive.
+    let bus = Bus::default();
+    let io = carrier_with(
+        &bus,
+        &[Ipv4Address::new(192, 168, 1, 1)],
+        SmoltcpMdnsConfig {
+            // Smaller than any claim this host can encode, which is the
+            // shrunk-to-fit device the configuration invites.
+            tx_payload_bytes: 32,
+            enable_ipv6: false,
+            ..SmoltcpMdnsConfig::default()
+        },
+    );
+    let agent =
+        MdnsAgent::new(peer(1), MdnsConfig::default(), [1; 32]).expect("a valid configuration");
+    let mut driver = MdnsDriver::new(agent, io, &MdnsConfig::default());
+    let addrs = vec![addr("/ip4/192.168.1.1/udp/4001/quic-v1")];
+
+    // The promise is a dropped claim, not a broken host: the driver keeps
+    // running and, once the link is quiet, has something to sleep on. A
+    // datagram parked as congestion instead would be handed back to the same
+    // buffer every turn and keep this at zero for good.
+    for step in 0..200u64 {
+        let now = step * STEP_MS;
+        driver
+            .tick(now, &addrs)
+            .expect("a claim that will never fit is not a fault");
+        if bus.is_quiet() && driver.next_timeout(now).unwrap_or(0) > 0 {
+            return;
+        }
+    }
+    panic!("the driver never settled: an unsendable claim kept it awake");
 }
 
 #[test]

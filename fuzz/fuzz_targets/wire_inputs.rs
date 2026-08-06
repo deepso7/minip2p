@@ -295,6 +295,10 @@ fn fuzz_secure_mux(data: &[u8]) {
 
         // An unauthenticated peer must never reach the established state from
         // arbitrary bytes: that would mean the Noise handshake was skippable.
+        // Establishing is gated on decrypting an AEAD-protected Yamux
+        // selection under a key derived from statics this harness never puts
+        // on the wire, so the assertion cannot fire on a lucky mutation --
+        // reaching it at all is the defect it is looking for.
         assert!(
             !established,
             "arbitrary bytes must not complete the upgrade"

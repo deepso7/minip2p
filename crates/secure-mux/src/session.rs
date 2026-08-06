@@ -100,6 +100,11 @@ pub enum SessionError {
     /// `code` of 0 is an orderly shutdown rather than a fault: a caller that
     /// surfaces failures to its host can close quietly instead of reporting an
     /// error the remote never made.
+    ///
+    /// The shutdown takes every open substream with it, so draining outputs
+    /// after this error yields a [`SessionOutput::StreamClosed`] for each --
+    /// the same lifecycle notification a local
+    /// [`go_away`](SecureMuxSession::go_away) produces.
     #[error("remote closed the Yamux session with code {code}")]
     GoAway {
         /// Yamux `GoAway` code; 0 is a normal shutdown.
@@ -603,11 +608,19 @@ impl SecureMuxSession {
         Ok((peer, decrypted))
     }
 
+    /// Publishes everything Yamux has queued, then reports a remote `GoAway`.
+    ///
+    /// A `GoAway` is followed by the terminal events for the substreams it
+    /// closed, so failing on sight would swallow them: the phase stays taken
+    /// after the error, and nothing would ever drain the rest. The error is
+    /// held back until the queue is empty instead, which both keeps the
+    /// lifecycle notifications and still kills the session.
     fn drain_yamux(
         &mut self,
         noise: &mut NoiseSession,
         yamux: &mut YamuxSession,
     ) -> Result<(), SessionError> {
+        let mut go_away = None;
         while let Some(output) = yamux.poll_output() {
             match output {
                 YamuxOutput::Outbound(bytes) => self.encrypt(noise, bytes)?,
@@ -634,11 +647,15 @@ impl SecureMuxSession {
                     });
                 }
                 YamuxOutput::GoAwayReceived { code } => {
-                    return Err(SessionError::GoAway { code });
+                    // Keep the first code: it is the one that ended the session.
+                    go_away.get_or_insert(code);
                 }
             }
         }
-        Ok(())
+        match go_away {
+            Some(code) => Err(SessionError::GoAway { code }),
+            None => Ok(()),
+        }
     }
 
     fn encrypt(

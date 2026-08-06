@@ -39,12 +39,14 @@ impl Heartbeat {
 }
 
 let mut clock = StdClock::new();
+
+// The only sample of this drive iteration; everything below is derived from it.
+let now = clock.now();
 let mut heartbeat = Heartbeat {
     interval_ms: 15_000,
-    next: clock.now().as_deadline(),
+    next: now.as_deadline(),
 };
 
-let now = clock.now();
 assert!(heartbeat.poll(now));
 assert!(!heartbeat.poll(now));
 
@@ -57,11 +59,11 @@ assert_eq!(idle_ms, Some(15_000));
 
 ## Wall-clock time is optional
 
-`Now::unix_seconds` is `None` on platforms with no wall clock, such as an embedded board without an RTC or NTP sync. Components that need real time — signed beacon freshness, certificate validity — must handle its absence explicitly. Substituting monotonic time is never correct: monotonic epochs are arbitrary and not comparable between peers.
+`Now::unix_seconds` is `None` whenever the platform has no usable wall-clock reading: an embedded board without an RTC or NTP sync has none at all, and a host whose clock is set before the Unix epoch has none that can be reported. Components that need real time — signed beacon freshness, certificate validity — must handle its absence explicitly. Substituting monotonic time is never correct: monotonic epochs are arbitrary and not comparable between peers.
 
 ## `no_std`
 
-Build without the `std` feature and supply your own implementations:
+Build without the `std` feature and supply your own implementations. A `Clock` must never let `monotonic_ms` decrease, and must saturate at `Now::MAX_MONOTONIC_MS` — `u64::MAX` is reserved for `Deadline::NEVER`, so it is not a usable instant:
 
 ```rust
 use minip2p_platform::{Clock, EntropyError, EntropySource, Now};

@@ -167,6 +167,26 @@ impl From<ConnectionId> for u64 {
 /// never name a different connection than it did before. Allocation fails once
 /// the namespace is exhausted instead of wrapping onto live ids.
 ///
+/// # One allocator per namespace
+///
+/// That guarantee belongs to the namespace, not to the allocator, and it only
+/// holds while a namespace has exactly one. So this is deliberately not
+/// [`Clone`]: a copy would carry the same next sequence, both would mint the
+/// same ids for different connections, and every call naming one of those ids
+/// would reach whichever connection the router found first.
+///
+/// ```compile_fail
+/// use minip2p_transport::{ConnectionIdAllocator, ConnectionNamespace};
+///
+/// fn duplicate<T: Clone>(value: &T) -> T {
+///     value.clone()
+/// }
+///
+/// let ids = ConnectionIdAllocator::new(ConnectionNamespace::TCP_IPV4);
+/// // Two allocators in one namespace would hand out the same ids twice.
+/// let _second = duplicate(&ids);
+/// ```
+///
 /// # Example
 ///
 /// ```
@@ -180,7 +200,7 @@ impl From<ConnectionId> for u64 {
 /// assert_eq!(first.namespace(), ConnectionNamespace::TCP_IPV4);
 /// assert_eq!(first.to_string(), "tcp/ip4#1");
 /// ```
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct ConnectionIdAllocator {
     namespace: ConnectionNamespace,
     next: u64,

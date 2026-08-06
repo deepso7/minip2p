@@ -19,9 +19,9 @@ provenance update, but does not itself trigger a dial.
 
 mDNS records are unauthenticated claims. The transport's own handshake detects
 a peer-id mismatch only after packets reach the claimed address, so the book
-bounds retained
-addresses and peer identities, applies per-peer and global mDNS dial budgets,
-and prevents mDNS-only observations from evicting beacon-backed entries.
+bounds retained addresses and peer identities, applies per-peer and global mDNS
+dial budgets, and prevents mDNS-only observations from evicting beacon-backed
+entries.
 `KnownPeer` exposes the merged dial order and both source-specific subsets and
 timestamps so applications do not have to guess provenance.
 

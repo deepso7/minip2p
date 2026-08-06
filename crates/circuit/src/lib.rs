@@ -2009,15 +2009,24 @@ mod tests {
         let peer_events = b
             .poll(Now::from_millis(0))
             .expect("peer observes data then GoAway");
+        // The remote GoAway tears the substreams down the same way the local
+        // close does: a `StreamClosed` each, then `Closed`. Both ends of a
+        // graceful shutdown see the same sequence.
         assert!(
             matches!(
                 peer_events.as_slice(),
                 [
                     TransportEvent::StreamData { id, stream_id, data },
+                    TransportEvent::StreamClosed {
+                        id: stream_closed_id,
+                        stream_id: closed_stream,
+                    },
                     TransportEvent::Closed { id: closed_id },
                 ] if *id == circuit_id
                     && *stream_id == stream
                     && data == b"queued-before-close"
+                    && *stream_closed_id == circuit_id
+                    && *closed_stream == stream
                     && *closed_id == circuit_id
             ),
             "unexpected peer close events: {peer_events:?}"

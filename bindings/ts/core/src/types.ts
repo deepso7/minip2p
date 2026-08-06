@@ -99,11 +99,13 @@ export interface Minip2pConfig {
   readonly secretKey: Bytes;
   /** Agent version advertised through Identify. */
   readonly agentVersion?: string;
-  /** Direct QUIC relay peer multiaddresses. */
+  /** Direct TCP or QUIC relay peer multiaddresses. */
   readonly relays?: readonly string[];
   /** AutoNAT server peer multiaddresses. */
   readonly autonatServers?: readonly string[];
-  /** Local QUIC listen multiaddress; native defaults apply when omitted. */
+  /**
+   * Local TCP or QUIC listen multiaddress; native defaults apply when omitted.
+   */
   readonly listenAddr?: string;
   /** Routes outbound connectivity through relays only. */
   readonly forceRelay?: boolean;

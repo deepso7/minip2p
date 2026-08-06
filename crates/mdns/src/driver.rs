@@ -51,11 +51,13 @@ const SHUTDOWN_DRAIN_ATTEMPTS: usize = 4;
 /// the same error forever while the peers' view of it went stale anyway.
 /// Events already observed are still drainable afterwards.
 ///
-/// Two things are not failures. A vanished interface takes its packet with it,
-/// because there is nowhere left to send it. A full send buffer
-/// ([`MdnsError::Congested`]) parks the packet instead, because the carrier
-/// will have drained by the next turn -- a device that spoke faster than its
-/// link could carry has a backlog, not a fault.
+/// Three things are not failures. A vanished interface takes its packet with
+/// it, because there is nowhere left to send it. A datagram the carrier can
+/// never hold ([`MdnsError::Oversized`]) goes the same way, because waiting
+/// does not shrink it. A full send buffer ([`MdnsError::Congested`]) parks the
+/// packet instead, because the carrier will have drained by the next turn -- a
+/// device that spoke faster than its link could carry has a backlog, not a
+/// fault.
 pub struct MdnsDriver<I: MdnsIo> {
     agent: MdnsAgent,
     io: Option<I>,
@@ -102,6 +104,20 @@ impl<I: MdnsIo> MdnsDriver<I> {
     /// The agent this driver runs, mutably.
     pub fn agent_mut(&mut self) -> &mut MdnsAgent {
         &mut self.agent
+    }
+
+    /// The carrier this driver runs on, or `None` once mDNS has stopped.
+    pub fn io(&self) -> Option<&I> {
+        self.io.as_ref()
+    }
+
+    /// The carrier this driver runs on, mutably.
+    ///
+    /// A host that has to reconfigure the thing underneath -- a smoltcp
+    /// interface whose addresses arrive by DHCP, say -- reaches it here, since
+    /// handing it over is what put it out of reach.
+    pub fn io_mut(&mut self) -> Option<&mut I> {
+        self.io.as_mut()
     }
 
     /// Takes the next observation, if any.
@@ -156,7 +172,9 @@ impl<I: MdnsIo> MdnsDriver<I> {
         if let Some(action) = self.pending_action.take() {
             match self.io.as_mut().expect("checked above").send(&action) {
                 Ok(()) => sent = 1,
-                Err(MdnsError::UnknownInterface { .. }) => {}
+                // Nowhere to send it, or nothing that could ever carry it:
+                // either way holding on to it only delays the next word.
+                Err(MdnsError::UnknownInterface { .. } | MdnsError::Oversized { .. }) => {}
                 // Still no room. Put it back where it was rather than lose it,
                 // and do not queue anything behind it: the carrier is full, and
                 // what would go next has to wait for the same drain.
@@ -325,8 +343,10 @@ impl<I: MdnsIo> MdnsDriver<I> {
             match io.send(&action) {
                 // An interface that left between the encode and the send takes
                 // its packet with it. Nothing is wrong here, and there is
-                // nowhere to send it.
-                Ok(()) | Err(MdnsError::UnknownInterface { .. }) => {}
+                // nowhere to send it. A datagram bigger than the carrier will
+                // ever hold is dropped for the mirror-image reason: parking it
+                // would retry an impossible send on every turn from now on.
+                Ok(()) | Err(MdnsError::UnknownInterface { .. } | MdnsError::Oversized { .. }) => {}
                 // A full send buffer is a moment, not a fault. Park what did
                 // not fit and stop here: the next turn begins with a drain, so
                 // the burst is delayed rather than lost -- and mDNS does not
@@ -399,6 +419,9 @@ mod tests {
         send_fails: bool,
         /// How many more datagrams the carrier has room for.
         room: Option<usize>,
+        /// The largest datagram this carrier could ever hold, if it is smaller
+        /// than what the agent encodes.
+        max_payload: Option<usize>,
         /// How much room a `poll` frees up. Zero is a carrier that will not
         /// drain at all.
         room_per_poll: usize,
@@ -491,10 +514,21 @@ mod tests {
 
         fn send(&mut self, action: &MdnsAction) -> Result<(), MdnsError> {
             self.ops.borrow_mut().push("send");
-            let MdnsAction::Send { interface, .. } = action;
+            let MdnsAction::Send {
+                interface, payload, ..
+            } = action;
             if self.vanished.contains(interface) {
                 return Err(MdnsError::UnknownInterface {
                     interface: *interface,
+                });
+            }
+            if let Some(capacity) = self.max_payload
+                && payload.len() > capacity
+            {
+                return Err(MdnsError::Oversized {
+                    interface: *interface,
+                    len: payload.len(),
+                    capacity,
                 });
             }
             if self.send_fails {
@@ -718,6 +752,32 @@ mod tests {
             "the same datagram is still first in line"
         );
         assert_eq!(driver.next_timeout(1), Some(0));
+    }
+
+    #[test]
+    fn a_datagram_the_carrier_can_never_hold_is_dropped_rather_than_held() {
+        let mut io = FakeIo::with_interfaces(2);
+        // A send buffer smaller than an announcement. Draining cannot make
+        // room that does not exist, so parking this would hand the same
+        // datagram back to the same carrier on every turn from now on.
+        io.max_payload = Some(0);
+        let sent = io.sent.clone();
+        let mut driver = driver(io);
+
+        driver
+            .tick(0, &[])
+            .expect("a datagram that will never fit is not a fault either");
+        assert!(driver.is_active());
+        assert!(sent.borrow().is_empty(), "nothing could go");
+        assert!(
+            driver.pending_action.is_none(),
+            "an impossible send is dropped, not queued for a drain that cannot help"
+        );
+        assert!(
+            driver.next_timeout(0).unwrap_or(0) > 0,
+            "and the tick that dropped it is owed nothing now: holding it would \
+             spin on one datagram instead of sleeping until the next word"
+        );
     }
 
     #[test]

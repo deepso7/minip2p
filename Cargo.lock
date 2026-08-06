@@ -1288,7 +1288,6 @@ dependencies = [
 name = "minip2p-swarm"
 version = "0.3.1"
 dependencies = [
- "getrandom",
  "minip2p-core",
  "minip2p-dcutr",
  "minip2p-identify",

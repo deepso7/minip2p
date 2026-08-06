@@ -24,7 +24,6 @@ std = [
     "minip2p-platform/std",
     "minip2p-transport/std",
     "thiserror/std",
-    "dep:getrandom",
 ]
 
 [dependencies]
@@ -36,7 +35,6 @@ minip2p-ping = { path = "../ping", version = "0.3.1", default-features = false }
 minip2p-platform = { path = "../platform", version = "0.3.1", default-features = false }
 minip2p-transport = { path = "../transport", version = "0.3.1", default-features = false }
 thiserror = { version = "2.0.18", default-features = false }
-getrandom = { version = "0.4.3", optional = true }
 
 [dev-dependencies]
 minip2p-relay = { path = "../relay" }

@@ -8,7 +8,9 @@ use core::ops::RangeInclusive;
 
 use minip2p_core::{Multiaddr, Protocol};
 use minip2p_platform::{Deadline, Now};
-use smoltcp::iface::{Interface, SocketHandle as SmoltcpHandle, SocketSet};
+use smoltcp::iface::{
+    Interface, PollIngressSingleResult, PollResult, SocketHandle as SmoltcpHandle, SocketSet,
+};
 use smoltcp::phy::Device;
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
@@ -21,6 +23,14 @@ use crate::provider::{SocketHandle, TcpError, TcpEvent, TcpProvider, host_and_po
 /// One buffer serves every socket, so it is sized to drain a typical ring in a
 /// single call without scaling with a host that configures a very large one.
 const MAX_READ_CHUNK: usize = 16 * 1024;
+
+/// Packets one poll takes off the link before the rest wait their turn.
+///
+/// A host with no operating system has nothing to preempt a poll, so a link
+/// that keeps delivering must not be able to hold one open -- which is what
+/// [`Interface::poll`] does, and says so. Whatever is left over makes the next
+/// poll immediate rather than waiting on a timer.
+const MAX_INGRESS_PER_POLL: usize = 32;
 
 /// Limits for a [`SmoltcpTcpProvider`].
 ///
@@ -165,8 +175,7 @@ struct Listener {
 ///
 /// The whole transport above this -- the upgrade, multiplexing, the
 /// [`Transport`](minip2p_transport::Transport) contract -- is the same code the
-/// hosted [`StdTcpProvider`](crate::StdTcpProvider) runs under. This is the
-/// other end of that seam.
+/// hosted `StdTcpProvider` runs under. This is the other end of that seam.
 ///
 /// # Ownership
 ///
@@ -207,6 +216,10 @@ struct Listener {
 /// [`listen`](TcpProvider::listen) reports one of them and
 /// [`local_addresses`](TcpProvider::local_addresses) reports them all.
 ///
+/// Two addresses may name the same port, because smoltcp matches a segment on
+/// the local address as well as the port; a wildcard is what collides with
+/// everything on its port, since it answers for every address there.
+///
 /// # Driving it
 ///
 /// smoltcp is timer-driven -- retransmits, delayed acknowledgements, closing
@@ -231,7 +244,11 @@ pub struct SmoltcpTcpProvider<D: Device> {
     /// Where the next ephemeral port search starts, so dials cycle the range
     /// rather than reusing the port just released.
     next_port: u16,
-    /// Ports spoken for, by a listener or a live dial.
+    /// Ports drawn from the pool and not yet given back: a live dial's, and a
+    /// listener's when it asked for any port. A listener that named its own
+    /// port is not in here -- what makes that one taken is the listener
+    /// itself, which [`listen_conflict`](Self::listen_conflict) is what
+    /// consults.
     used_ports: BTreeSet<u16>,
     /// Sockets finished with, kept until smoltcp has dispatched their last
     /// packet and reached `Closed`.
@@ -241,6 +258,9 @@ pub struct SmoltcpTcpProvider<D: Device> {
     now_ms: u64,
     /// Bytes were queued since the last poll and have not been put on the wire.
     egress_pending: bool,
+    /// The last poll spent its ingress budget, so the link still holds packets
+    /// nothing else will announce.
+    ingress_pending: bool,
     /// smoltcp's own answer to when it next needs driving, captured during
     /// `poll` because computing it needs the interface mutably.
     poll_at: Option<u64>,
@@ -313,6 +333,7 @@ impl<D: Device> SmoltcpTcpProvider<D> {
             reclaiming: Vec::new(),
             now_ms: 0,
             egress_pending: false,
+            ingress_pending: false,
             poll_at: None,
             read_buffer,
         }
@@ -375,11 +396,39 @@ impl<D: Device> SmoltcpTcpProvider<D> {
         for _ in 0..=(end - start) {
             let port = self.next_port;
             self.next_port = if port == end { start } else { port + 1 };
-            if self.used_ports.insert(port) {
+            // A listener's port is passed over even though a dial could safely
+            // share it -- smoltcp tells the two apart by the four-tuple -- so
+            // that a port has one owner and a reservation means one thing.
+            if !self.listen_conflict(None, port) && self.used_ports.insert(port) {
                 return Ok(port);
             }
         }
         Err(exhausted)
+    }
+
+    /// Returns a port to the pool, if there was one to return.
+    fn release(&mut self, port: Option<u16>) {
+        if let Some(port) = port {
+            self.used_ports.remove(&port);
+        }
+    }
+
+    /// Whether a listen endpoint overlaps one this provider already holds.
+    ///
+    /// Two listeners on one port collide only when a segment could belong to
+    /// either: the same address, or a wildcard on either side. Distinct
+    /// addresses are distinct endpoints to smoltcp, which matches the local
+    /// address as well as the port, so refusing them would turn a listener per
+    /// address into a listener per port -- and a host binding one address per
+    /// family on a fixed port would get its second bind refused.
+    fn listen_conflict(&self, address: Option<IpAddress>, port: u16) -> bool {
+        self.listeners.iter().any(|listener| {
+            listener.endpoint.port == port
+                && match (listener.endpoint.addr, address) {
+                    (Some(bound), Some(wanted)) => bound == wanted,
+                    _ => true,
+                }
+        })
     }
 
     /// Drops an entry, releasing its port and queueing its socket for reclaim.
@@ -473,6 +522,42 @@ impl<D: Device> SmoltcpTcpProvider<D> {
             }
             self.listeners[index].armed.push(inner);
         }
+    }
+
+    /// Runs the interface for one poll: maintenance, ingress, then egress.
+    ///
+    /// Deliberately not [`Interface::poll`], which processes every packet the
+    /// link has queued and so runs for as long as they keep arriving -- an
+    /// unbounded amount of work, as smoltcp's own warning on it says. Nothing
+    /// preempts that on a device with no operating system, so the ingress is
+    /// budgeted the way the hosted provider budgets reads and accepts, and
+    /// what did not fit is reported as due now.
+    fn drive(&mut self, timestamp: Instant) {
+        self.iface.poll_maintenance(timestamp);
+
+        let mut budget = MAX_INGRESS_PER_POLL;
+        self.ingress_pending = loop {
+            if budget == 0 {
+                break true;
+            }
+            budget -= 1;
+            if self
+                .iface
+                .poll_ingress_single(timestamp, &mut self.device, &mut self.sockets)
+                == PollIngressSingleResult::None
+            {
+                break false;
+            }
+        };
+
+        // After the ingress, so what just arrived is acknowledged in the same
+        // poll. Bounded by the transmit rings rather than by the link, which is
+        // why this one drains rather than counting.
+        while self
+            .iface
+            .poll_egress(timestamp, &mut self.device, &mut self.sockets)
+            == PollResult::SocketStateChanged
+        {}
     }
 
     /// Turns one socket's state into events.
@@ -639,10 +724,14 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
             });
         }
 
+        let endpoint = IpListenEndpoint {
+            addr: (!wildcard).then_some(address),
+            port: 0,
+        };
         let port = if requested == 0 {
             self.allocate_port()?
         } else {
-            if !self.used_ports.insert(requested) {
+            if self.listen_conflict(endpoint.addr, requested) {
                 return Err(TcpError::Address {
                     context: "tcp listen",
                     reason: format!("port {requested} is already in use"),
@@ -650,6 +739,9 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
             }
             requested
         };
+        // Only a port this call drew from the pool is handed back on failure;
+        // a port the caller named was never taken out of it.
+        let drawn = (requested == 0).then_some(port);
 
         // A wildcard has to resolve to something concrete, and on an interface
         // with no address at all there is nothing to resolve it to.
@@ -661,7 +753,7 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
             match first {
                 Ok(cidr) => address_to_multiaddr(cidr.address(), port),
                 Err(error) => {
-                    self.used_ports.remove(&port);
+                    self.release(drawn);
                     return Err(error);
                 }
             }
@@ -672,16 +764,13 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
         let index = self.listeners.len();
         self.listeners.push(Listener {
             bound: bound.clone(),
-            endpoint: IpListenEndpoint {
-                addr: (!wildcard).then_some(address),
-                port,
-            },
+            endpoint: IpListenEndpoint { port, ..endpoint },
             armed: Vec::new(),
         });
         self.arm_listener(index);
         if self.listeners[index].armed.is_empty() {
             self.listeners.pop();
-            self.used_ports.remove(&port);
+            self.release(drawn);
             return Err(TcpError::Exhausted {
                 resource: "tcp sockets",
             });
@@ -789,8 +878,7 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
     fn poll(&mut self, now: Now) -> Result<Vec<TcpEvent>, TcpError> {
         self.now_ms = now.monotonic_ms;
         let timestamp = instant(now.monotonic_ms);
-        self.iface
-            .poll(timestamp, &mut self.device, &mut self.sockets);
+        self.drive(timestamp);
         self.egress_pending = false;
 
         self.harvest_listeners();
@@ -817,8 +905,9 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
     }
 
     fn next_deadline(&self) -> Option<Deadline> {
-        if self.egress_pending {
-            // Something is queued and will not leave until the next poll.
+        if self.egress_pending || self.ingress_pending {
+            // Something is queued -- ours to send, or the link's for us to take
+            // in -- and will not move until the next poll.
             return Some(Deadline::IMMEDIATE);
         }
         let connects = self

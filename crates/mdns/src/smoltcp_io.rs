@@ -31,7 +31,8 @@ const IPV6_INTERFACE: InterfaceId = InterfaceId::new(2);
 /// The defaults are sized for a link where mDNS is a background conversation
 /// among a handful of peers. A device with less to spare can shrink them: the
 /// cost of a payload buffer too small for a claim is that the claim is
-/// dropped, not that anything breaks.
+/// dropped -- on the way in by smoltcp, on the way out as
+/// [`MdnsError::Oversized`] -- not that anything breaks.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SmoltcpMdnsConfig {
     /// Bytes held for datagrams waiting to be read.
@@ -70,8 +71,7 @@ struct Family {
 ///
 /// Everything above this -- the agent's scheduling and validation, the
 /// driver's budgets and its on-link check -- is the code the hosted
-/// [`MdnsSockets`](crate::MdnsSockets) runs under. This is the other end of
-/// that seam.
+/// `MdnsSockets` runs under. This is the other end of that seam.
 ///
 /// # Ownership
 ///
@@ -103,6 +103,12 @@ struct Family {
 /// [`packet_slots`](SmoltcpMdnsConfig::packet_slots) and
 /// [`tx_payload_bytes`](SmoltcpMdnsConfig::tx_payload_bytes) generously buys
 /// throughput, not correctness.
+///
+/// A datagram larger than `tx_payload_bytes` altogether is a different answer:
+/// [`MdnsError::Oversized`], because draining cannot make room that does not
+/// exist. The driver drops it, which is what keeps a buffer sized below this
+/// host's own claims a lost claim rather than a tick that spins on one
+/// datagram forever.
 ///
 /// [smoltcp]: https://docs.rs/smoltcp
 pub struct SmoltcpMdnsIo<D: Device> {
@@ -358,6 +364,21 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
             MdnsTarget::Unicast { to } => socket_addr_to_endpoint(*to),
         };
         let handle = family.socket;
+        // A datagram larger than the whole send buffer is refused the same way
+        // a momentarily full one is, so it has to be recognised before the
+        // attempt: the driver parks congestion and comes back for it, which
+        // for this one would be forever.
+        let capacity = self
+            .sockets
+            .get::<udp::Socket>(handle)
+            .payload_send_capacity();
+        if payload.len() > capacity {
+            return Err(MdnsError::Oversized {
+                interface: *interface,
+                len: payload.len(),
+                capacity,
+            });
+        }
         let queue = |io: &mut Self| {
             io.sockets
                 .get_mut::<udp::Socket>(handle)

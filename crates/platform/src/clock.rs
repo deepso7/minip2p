@@ -11,25 +11,37 @@ use crate::Deadline;
 /// [`monotonic_ms`](Self::monotonic_ms) counts milliseconds from an epoch
 /// chosen by the [`Clock`] that produced it. The epoch is arbitrary and carries
 /// no meaning across clocks: only differences between samples from the *same*
-/// clock are meaningful. Samples from one clock never decrease.
+/// clock are meaningful. Samples from one clock never decrease, and never
+/// exceed [`MAX_MONOTONIC_MS`](Self::MAX_MONOTONIC_MS).
 ///
 /// # Wall-clock time
 ///
-/// [`unix_seconds`](Self::unix_seconds) is `None` on platforms with no
-/// wall-clock source, such as an embedded board without an RTC or NTP sync.
-/// Components that need real time (signed beacon freshness, certificate
-/// validity) must handle its absence explicitly rather than substituting
-/// monotonic time, which is not comparable across peers.
+/// [`unix_seconds`](Self::unix_seconds) is `None` when the platform offers no
+/// usable wall-clock reading: it has no wall-clock source at all, such as an
+/// embedded board without an RTC or NTP sync, or its source currently reads
+/// before the Unix epoch. Components that need real time (signed beacon
+/// freshness, certificate validity) must handle its absence explicitly rather
+/// than substituting monotonic time, which is not comparable across peers.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Now {
-    /// Milliseconds since this clock's arbitrary epoch. Never decreases.
+    /// Milliseconds since this clock's arbitrary epoch. Never decreases, and
+    /// never exceeds [`MAX_MONOTONIC_MS`](Self::MAX_MONOTONIC_MS).
     pub monotonic_ms: u64,
-    /// Seconds since the Unix epoch, or `None` if the platform has no
-    /// wall clock.
+    /// Seconds since the Unix epoch, or `None` if the platform has no usable
+    /// wall-clock reading.
     pub unix_seconds: Option<u64>,
 }
 
 impl Now {
+    /// The largest monotonic value a clock may report.
+    ///
+    /// `u64::MAX` is reserved as the end of the timeline: it is the value
+    /// [`Deadline::NEVER`] occupies, so an instant there could not be expressed
+    /// as a deadline that is due. Clocks saturate here instead, which at
+    /// millisecond resolution costs one millisecond after ~584 million years of
+    /// uptime.
+    pub const MAX_MONOTONIC_MS: u64 = u64::MAX - 1;
+
     /// Creates a sample with monotonic time only and no wall clock.
     pub const fn from_millis(monotonic_ms: u64) -> Self {
         Self {
@@ -68,7 +80,12 @@ impl Now {
         Deadline::from_millis(self.monotonic_ms.saturating_add(millis))
     }
 
-    /// Returns the deadline that expires exactly at this sample.
+    /// Returns the deadline that expires exactly at this sample, so it is due
+    /// as of `self`.
+    ///
+    /// Samples respecting [`MAX_MONOTONIC_MS`](Self::MAX_MONOTONIC_MS) always
+    /// convert; the reserved `u64::MAX` is the one value that cannot, and
+    /// yields [`Deadline::NEVER`].
     pub const fn as_deadline(self) -> Deadline {
         Deadline::from_millis(self.monotonic_ms)
     }
@@ -84,9 +101,12 @@ impl Now {
 ///
 /// # Contract
 ///
-/// - `monotonic_ms` never decreases across successive calls.
-/// - `unix_seconds` is `None` if and only if the platform has no wall clock;
-///   an implementation must not fabricate one from monotonic time.
+/// - `monotonic_ms` never decreases across successive calls, and saturates at
+///   [`Now::MAX_MONOTONIC_MS`] rather than reaching the reserved `u64::MAX`.
+/// - `unix_seconds` is `None` whenever no usable wall-clock reading is
+///   available — either the platform has no wall clock, or its clock reads
+///   before the Unix epoch. An implementation must not fabricate one from
+///   monotonic time.
 pub trait Clock {
     /// Samples the current time.
     fn now(&mut self) -> Now;
@@ -132,6 +152,21 @@ mod tests {
         assert_eq!(now.deadline_after(5), Deadline::from_millis(15));
         assert_eq!(now.deadline_after(u64::MAX), Deadline::NEVER);
         assert_eq!(now.as_deadline(), Deadline::from_millis(10));
+    }
+
+    #[test]
+    fn every_permitted_sample_converts_to_a_deadline_that_is_due() {
+        for millis in [0, 1, 1_000_000, u64::MAX / 2, Now::MAX_MONOTONIC_MS] {
+            let now = Now::from_millis(millis);
+            assert!(
+                now.as_deadline().is_expired_at(now),
+                "as_deadline was not due at {now:?}"
+            );
+        }
+        // `u64::MAX` is reserved for `Deadline::NEVER`, which is why clocks
+        // stop one millisecond short of it.
+        assert_eq!(Now::MAX_MONOTONIC_MS, u64::MAX - 1);
+        assert_eq!(Now::from_millis(u64::MAX).as_deadline(), Deadline::NEVER);
     }
 
     struct Fake(u64);

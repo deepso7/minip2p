@@ -49,12 +49,13 @@ loopback pair for `MdnsSockets`, a shared frame bus for `SmoltcpMdnsIo`.
 
 ## Writing an `MdnsIo`
 
-Four operations, of which two have defaults: which interfaces exist and what
-addresses they hold, one waiting datagram, one datagram out of a chosen
-interface, and — for a stack that runs in this process — `poll` and
-`next_deadline`.
+Six operations, of which two have defaults: which interfaces exist and what
+addresses they hold (`interfaces`), a re-read of them that says whether they
+moved (`refresh` — the path an address arriving by DHCP or SLAAC takes), one
+waiting datagram (`receive`), one datagram out of a chosen interface (`send`),
+and — for a stack that runs in this process — `poll` and `next_deadline`.
 
-Three details matter:
+Four details matter:
 
 - **`InterfaceId`s must be stable** while an interface is up, and must never be
   reused for a different one: the agent tracks per-interface state against them.
@@ -69,7 +70,10 @@ Three details matter:
 - **A full send buffer is `Congested`, not a failure.** The driver sends up to
   128 datagrams a turn, so a burst can outrun a queue that drains only when the
   stack is driven. Saying so parks the datagram until the next turn; reporting a
-  general failure instead ends mDNS for good over a moment's backpressure.
+  general failure instead ends mDNS for good over a moment's backpressure. A
+  datagram the buffer could never hold is `Oversized` rather than `Congested`,
+  and the driver drops it: draining cannot make room that does not exist, so
+  parking it would retry the same impossible send forever.
 
 `poll` defaults to doing nothing, which is right for a socket an operating
 system services. A stack running in this process needs it: the driver calls it

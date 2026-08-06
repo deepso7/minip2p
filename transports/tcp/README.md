@@ -31,7 +31,11 @@ builds the `Interface` and supplies the link, and this drives sockets on it.
 
 smoltcp is timer-driven, so `next_deadline` matters more here than it does with
 readiness: honouring it is what lets a device sleep between packets instead of
-polling to find out nothing happened.
+polling to find out nothing happened. A poll takes a bounded number of packets
+off the link and reports immediate when more are waiting, so a flood cannot hold
+one open on a host that has nothing to preempt it. Listeners are told apart by
+address as well as port, so two addresses may name one port; a wildcard is what
+takes a port outright, since it answers for every address on it.
 
 Hosts with neither implement `TcpProvider` over their own stack. Nothing above
 the seam changes: the transport, the session, and the upgrade are the same code

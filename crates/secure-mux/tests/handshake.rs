@@ -153,6 +153,44 @@ fn flush_batched(from: &mut SecureMuxSession, to: &mut SecureMuxSession) -> Vec<
     events
 }
 
+/// Drains everything `session` has queued, concatenating the writes in order
+/// and discarding the rest.
+fn take_writes(session: &mut SecureMuxSession) -> Vec<u8> {
+    let mut batch = Vec::new();
+    while let Some(output) = session.poll_output() {
+        if let SessionOutput::Write(bytes) = output {
+            batch.extend_from_slice(&bytes);
+        }
+    }
+    batch
+}
+
+/// Drives the upgrade one-sidedly until the listener is up, leaving its own
+/// replies unread by the dialer.
+///
+/// That asymmetry is the point: the listener can then act as an established
+/// peer while the dialer still has its Yamux confirmation queued, so whatever
+/// the listener sends next arrives packed with that confirmation in a single
+/// batch.
+fn drive_until_listener_established(
+    dialer: &mut SecureMuxSession,
+    listener: &mut SecureMuxSession,
+) {
+    for _ in 0..32 {
+        let _ = flush_batched(dialer, listener);
+        if listener.is_established() {
+            break;
+        }
+        // The listener's reply is needed for the dialer to make progress.
+        let batch = take_writes(listener);
+        if batch.is_empty() {
+            break;
+        }
+        dialer.handle_input(batch).expect("dialer accepts");
+    }
+    assert!(listener.is_established(), "listener must finish first");
+}
+
 #[test]
 fn established_is_reported_before_any_stream_output() {
     let dialer_key = Ed25519Keypair::generate();
@@ -162,26 +200,7 @@ fn established_is_reported_before_any_stream_output() {
     dialer.start().expect("start");
     listener.start().expect("start");
 
-    // Drive only dialer -> listener until the listener finishes its upgrade,
-    // leaving its replies unread by the dialer.
-    for _ in 0..32 {
-        let _ = flush_batched(&mut dialer, &mut listener);
-        if listener.is_established() {
-            break;
-        }
-        // The listener's reply is needed for the dialer to make progress.
-        let mut batch = Vec::new();
-        while let Some(output) = listener.poll_output() {
-            if let SessionOutput::Write(bytes) = output {
-                batch.extend_from_slice(&bytes);
-            }
-        }
-        if batch.is_empty() {
-            break;
-        }
-        dialer.handle_input(batch).expect("dialer accepts");
-    }
-    assert!(listener.is_established(), "listener must finish first");
+    drive_until_listener_established(&mut dialer, &mut listener);
 
     // Now the listener opens a substream and sends before the dialer has read
     // its Yamux confirmation, so the dialer decrypts the confirmation and the
@@ -190,12 +209,7 @@ fn established_is_reported_before_any_stream_output() {
     listener.send(stream, b"pipelined".to_vec()).expect("send");
 
     let dialer_events = {
-        let mut batch = Vec::new();
-        while let Some(output) = listener.poll_output() {
-            if let SessionOutput::Write(bytes) = output {
-                batch.extend_from_slice(&bytes);
-            }
-        }
+        let batch = take_writes(&mut listener);
         dialer
             .handle_input(batch)
             .expect("dialer accepts the batch");
@@ -333,6 +347,44 @@ fn go_away_closes_local_substreams_and_ends_the_remote_session() {
 }
 
 #[test]
+fn a_remote_go_away_closes_the_substreams_it_takes_down() {
+    let (mut dialer, mut listener, _, _) = upgraded_pair();
+    dialer.open_stream().expect("open substream");
+    let (_, listener_events) = exchange(&mut dialer, &mut listener);
+    let inbound = listener_events
+        .iter()
+        .find_map(|event| match event {
+            SessionOutput::IncomingStream { stream } => Some(*stream),
+            _ => None,
+        })
+        .expect("the substream must be live before the shutdown");
+
+    dialer
+        .go_away(0)
+        .expect("an established session shuts down");
+    let result = listener.handle_input(take_writes(&mut dialer));
+    assert!(
+        matches!(result, Err(SessionError::GoAway { code: 0 })),
+        "the remote shutdown must still be reported: {result:?}"
+    );
+
+    // A remote shutdown ends the substreams exactly as a local one does, so a
+    // caller draining outputs after the error still learns to forget them
+    // rather than leaking a substream it will never hear about again.
+    let mut events = Vec::new();
+    while let Some(output) = listener.poll_output() {
+        if !matches!(output, SessionOutput::Write(_)) {
+            events.push(output);
+        }
+    }
+    assert_eq!(
+        events,
+        vec![SessionOutput::StreamClosed { stream: inbound }],
+        "the ended substream must surface as closed"
+    );
+}
+
+#[test]
 fn a_mismatched_expected_peer_fails_the_handshake() {
     let dialer_key = Ed25519Keypair::generate();
     let listener_key = Ed25519Keypair::generate();
@@ -459,36 +511,14 @@ fn a_session_that_fails_mid_batch_is_dead_and_stays_dead() {
     listener.start().expect("start");
 
     // Drive until the listener is up, leaving its confirmation unread.
-    for _ in 0..32 {
-        let _ = flush_batched(&mut dialer, &mut listener);
-        if listener.is_established() {
-            break;
-        }
-        let mut batch = Vec::new();
-        while let Some(output) = listener.poll_output() {
-            if let SessionOutput::Write(bytes) = output {
-                batch.extend_from_slice(&bytes);
-            }
-        }
-        if batch.is_empty() {
-            break;
-        }
-        dialer.handle_input(batch).expect("dialer accepts");
-    }
-    assert!(listener.is_established());
+    drive_until_listener_established(&mut dialer, &mut listener);
 
     let stream = listener.open_stream().expect("open substream");
     listener
         .send(stream, vec![0u8; 4096])
         .expect("queue an oversized frame");
 
-    let mut batch = Vec::new();
-    while let Some(output) = listener.poll_output() {
-        if let SessionOutput::Write(bytes) = output {
-            batch.extend_from_slice(&bytes);
-        }
-    }
-    let result = dialer.handle_input(batch);
+    let result = dialer.handle_input(take_writes(&mut listener));
 
     assert!(
         matches!(result, Err(SessionError::Protocol(_))),

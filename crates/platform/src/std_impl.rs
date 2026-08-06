@@ -8,7 +8,8 @@ use crate::{Clock, EntropyError, EntropySource, Now};
 /// is created, so `monotonic_ms` starts near zero and cannot go backwards.
 /// Wall-clock time comes from [`SystemTime`] and can jump in either direction
 /// as the system clock is adjusted, which is exactly why the two are reported
-/// separately.
+/// separately; a system clock set before the Unix epoch reports no wall-clock
+/// time at all rather than a nonsense timestamp.
 ///
 /// # Example
 ///
@@ -55,9 +56,12 @@ impl Default for StdClock {
 
 impl Clock for StdClock {
     fn now(&mut self) -> Now {
-        // Saturating: u64 milliseconds covers ~584 million years of uptime, so
-        // the clamp is unreachable in practice but keeps the cast total.
-        let monotonic_ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // Saturating at the last permitted instant rather than the `NEVER`
+        // sentinel: ~584 million years of uptime, so the clamp is unreachable
+        // in practice but keeps the cast total.
+        let monotonic_ms = u64::try_from(self.epoch.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+            .min(Now::MAX_MONOTONIC_MS);
         // `None` when the system clock is set before 1970 — an honest "no
         // usable wall clock" rather than a fabricated timestamp.
         let unix_seconds = SystemTime::now()
@@ -164,12 +168,13 @@ mod tests {
         let after = second.now().monotonic_ms;
 
         // Read across two clocks, the sleep must be visible as elapsed time on
-        // the shared timeline.
+        // the shared timeline. Only a lower bound: a clock with its own epoch
+        // would read near zero here, while a busy or suspended host may
+        // overshoot the sleep by any amount.
         assert!(
             after >= before + 5,
             "sleep not observable across clocks: {before} -> {after}"
         );
-        assert!(after - before < 1_000);
     }
 
     #[test]

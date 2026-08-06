@@ -43,6 +43,23 @@ pub enum MdnsError {
         /// The interface whose buffer is full.
         interface: InterfaceId,
     },
+    /// The carrier will never have room for a datagram this large.
+    ///
+    /// Not backpressure: a send buffer smaller than the datagram does not
+    /// grow, so no amount of draining makes it fit. The driver drops the
+    /// datagram rather than park it, and a host that sees this has sized its
+    /// carrier below what its own claims need.
+    #[error(
+        "mDNS interface {interface:?} cannot carry {len} bytes; its send buffer holds {capacity}"
+    )]
+    Oversized {
+        /// The interface whose send buffer is too small.
+        interface: InterfaceId,
+        /// How big the datagram was.
+        len: usize,
+        /// The largest datagram that buffer can ever hold.
+        capacity: usize,
+    },
     /// The stable interface-id counter was exhausted.
     #[error("mDNS interface id space is exhausted")]
     InterfaceIdsExhausted,
@@ -129,9 +146,13 @@ pub struct MdnsDatagram {
 /// [`MdnsError::Congested`], which the driver treats as "not yet": the action
 /// is parked and retried on the next turn, once the carrier has had a chance
 /// to drain. Report that rather than a general failure whenever the datagram
-/// would fit at a calmer moment. Any other error stops mDNS: a stack that
-/// cannot send cannot participate, and retrying into it would only produce the
-/// same error with the peer's view of us going stale either way.
+/// would fit at a calmer moment -- and [`MdnsError::Oversized`] when it never
+/// would, because a send buffer smaller than the datagram does not grow, and
+/// calling that congestion would park an impossible send and retry it forever.
+/// The driver drops an oversized datagram rather than parks it, and mDNS
+/// carries on without it. Any other error stops mDNS: a stack that cannot send
+/// cannot participate, and retrying into it would only produce the same error
+/// with the peer's view of us going stale either way.
 pub trait MdnsIo {
     /// The interfaces mDNS is currently running on.
     fn interfaces(&self) -> &[InterfaceSnapshot];

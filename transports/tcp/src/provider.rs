@@ -193,8 +193,11 @@ pub(crate) fn host_and_port(
 pub trait TcpProvider {
     /// Binds a listener and returns the address it actually bound.
     ///
-    /// A request with port 0, or a wildcard host, resolves to the concrete
-    /// address in the return value. Inbound streams then arrive as
+    /// Port 0 always resolves to the port actually taken. A wildcard host
+    /// resolves only as far as the provider knows: one that holds its own
+    /// interface addresses reports a concrete one, and one that left the
+    /// choice to an operating system reports the wildcard back, because that
+    /// is what the socket is bound to. Inbound streams then arrive as
     /// [`TcpEvent::Accepted`].
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TcpError>;
 
@@ -246,6 +249,13 @@ pub trait TcpProvider {
     }
 
     /// The addresses this provider is currently listening on.
+    ///
+    /// A wildcard bind is reported for what the provider knows it to be: every
+    /// interface address for one that holds them, the wildcard itself for one
+    /// that does not. Turning a wildcard into an address a peer can dial is
+    /// the host's business rather than a provider's -- it is the layer that
+    /// knows which interfaces are worth advertising, which is why mDNS makes
+    /// the substitution and address selection drops what is left.
     fn local_addresses(&self) -> Vec<Multiaddr> {
         Vec::new()
     }

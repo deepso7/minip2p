@@ -169,6 +169,13 @@ struct Socket {
 ///
 /// `/dns`, `/dns4`, and `/dns6` dial addresses are resolved here, with a
 /// blocking lookup. Listening requires a concrete `/ip4` or `/ip6` host.
+///
+/// A wildcard listen host binds what the operating system takes it to mean --
+/// every interface, including ones that appear later -- and is reported back
+/// as the wildcard rather than expanded, because which of a machine's
+/// addresses are worth handing to a peer is the host's decision, not a
+/// socket's. mDNS makes that substitution from its own interface list, and
+/// address selection drops what is left.
 pub struct StdTcpProvider {
     poll: Poll,
     events: Events,

@@ -13,7 +13,7 @@
 //! per turn -- which is policy, not platform work, so it is the same code
 //! wherever the datagrams come from. `no_std + alloc`.
 //!
-//! With the default `std` feature, [`MdnsSockets`] is the hosted [`MdnsIo`]:
+//! With the default `std` feature, `MdnsSockets` is the hosted [`MdnsIo`]:
 //! per-interface multicast sockets over `socket2`, with interface enumeration.
 //! `SmoltcpMdnsIo` is the embedded one, over a [smoltcp] interface the host
 //! configures; it needs the `smoltcp` feature and no operating system. Hosts

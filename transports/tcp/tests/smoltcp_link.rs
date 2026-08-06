@@ -783,6 +783,89 @@ mod provider {
     }
 
     #[test]
+    fn two_listeners_share_a_port_when_their_addresses_differ() {
+        let wire = Wire::new();
+        let mut device = wire.dialer_device();
+        let mut iface = Interface::new(
+            Config::new(HardwareAddress::Ip),
+            &mut device,
+            Instant::from_millis(0),
+        );
+        iface.update_ip_addrs(|addrs| {
+            addrs.push("192.168.1.1/24".parse().unwrap()).unwrap();
+            addrs.push("fd00::1/64".parse().unwrap()).unwrap();
+        });
+        let mut provider = SmoltcpTcpProvider::new(device, iface, SmoltcpConfig::default());
+
+        // One port per address is two endpoints, not one taken twice: smoltcp
+        // matches a segment on the local address as well as the port. A host
+        // binding a fixed port on each family would otherwise be told the
+        // second one was in use.
+        provider
+            .listen(&addr("/ip4/192.168.1.1/tcp/4001"))
+            .expect("the first address binds");
+        provider
+            .listen(&addr("/ip6/fd00::1/tcp/4001"))
+            .expect("the second address is a listener of its own");
+        assert_eq!(provider.local_addresses().len(), 2);
+
+        // A wildcard answers for every address on its port, so that one really
+        // does collide with both.
+        let error = provider
+            .listen(&addr("/ip4/0.0.0.0/tcp/4001"))
+            .expect_err("a wildcard overlaps what is already bound");
+        assert!(error.to_string().contains("already in use"), "got {error}");
+    }
+
+    #[test]
+    fn a_flooded_link_does_not_hold_a_poll_open() {
+        let wire = Wire::new();
+        let mut listener = provider(
+            wire.listener_device(),
+            &format!("{LISTENER_IP4}/24"),
+            SmoltcpConfig::default(),
+        );
+        listener
+            .listen(&host_port(LISTENER_IP4, 4001))
+            .expect("listener binds");
+
+        // Far more than one poll's worth, all of it already waiting: a poll
+        // that drained the link would be doing unbounded work with nothing on
+        // this host able to preempt it.
+        let flood = 500;
+        for _ in 0..flood {
+            wire.dialer_out.borrow_mut().push_back(vec![0xff; 64]);
+        }
+
+        listener.poll(Now::from_millis(0)).expect("poll");
+        let left = wire.dialer_out.borrow().len();
+        assert!(
+            left > 0,
+            "one poll took the whole backlog: {left} left of {flood}"
+        );
+        assert_eq!(
+            listener.next_deadline(),
+            Some(Deadline::IMMEDIATE),
+            "what did not fit is due now, or nothing would come back for it"
+        );
+
+        // And it does drain: a budget that stranded packets would be worse
+        // than the flood.
+        for step in 0..MAX_STEPS {
+            if wire.dialer_out.borrow().is_empty() {
+                break;
+            }
+            listener
+                .poll(Now::from_millis(step as u64))
+                .expect("poll again");
+        }
+        assert!(
+            wire.dialer_out.borrow().is_empty(),
+            "the backlog should clear over successive polls"
+        );
+    }
+
+    #[test]
     fn listening_on_an_address_the_interface_does_not_hold_is_refused() {
         let mut provider = lone_provider(SmoltcpConfig::default());
         // smoltcp would take the endpoint and then never match a packet,

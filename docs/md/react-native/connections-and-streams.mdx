@@ -34,9 +34,9 @@ All three resolve with `{ connectId, peerId, path }`. The first path may be
 the current answer; a relayed connection can upgrade after the original Promise
 resolves.
 
-The lower-level `dial`, `dialIp4`, and `dialIp6` methods only start direct QUIC
-dials and return connection IDs immediately. They do not run the relay race or
-return a `Path`. Observe `peerReady` or call `waitPeerReady` afterward.
+The lower-level `dial`, `dialIp4`, and `dialIp6` methods only start direct TCP
+or QUIC dials and return connection IDs immediately. They do not run the relay
+race or return a `Path`. Observe `peerReady` or call `waitPeerReady` afterward.
 
 ## Timeouts and cancellation
 
