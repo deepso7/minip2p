@@ -128,7 +128,7 @@ export async function runSmokeSuite(
 
 function createEndpoint(
   liveEndpoints: Set<Minip2p>,
-  listen = ["/ip4/127.0.0.1/udp/0/quic-v1"],
+  listen: readonly [string, ...string[]] = ["/ip4/127.0.0.1/udp/0/quic-v1"],
   mdns = false
 ): Minip2p {
   const config: Minip2pConfig = {

@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use minip2p::{
     BeaconConfig, Endpoint, EndpointBuilder, FloodsubConfig, GossipsubConfig, MdnsConfig,
-    Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, PublishError, PubsubConfig, PubsubError,
-    StreamId, TopicError, TransportError, WaitHandle,
+    Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, Protocol, PublishError, PubsubConfig,
+    PubsubError, StreamId, TopicError, TransportError, WaitHandle,
 };
 
 use crate::{
@@ -36,10 +36,30 @@ fn configure_transports(
                 if addresses.is_empty() {
                     return Err(empty_transport_list("QUIC"));
                 }
+                let mut has_ipv4 = false;
+                let mut has_ipv6 = false;
                 for address in addresses {
                     let address = parse_listen_addr(&address, "QUIC")?;
                     if !address.is_quic_transport() {
                         return Err(wrong_transport("QUIC", &address));
+                    }
+                    let already_present = match address.protocols().first() {
+                        Some(Protocol::Ip4(_)) => core::mem::replace(&mut has_ipv4, true),
+                        Some(Protocol::Ip6(_)) => core::mem::replace(&mut has_ipv6, true),
+                        _ => {
+                            return Err(FfiError::InvalidAddress {
+                                detail: format!(
+                                    "QUIC listen address `{address}` must use /ip4 or /ip6; DNS names are dial-only"
+                                ),
+                            });
+                        }
+                    };
+                    if already_present {
+                        return Err(FfiError::InvalidConfig {
+                            detail: format!(
+                                "QUIC listen addresses may contain at most one address per IP family; `{address}` repeats a family"
+                            ),
+                        });
                     }
                     builder = builder.quic_multiaddr(&address);
                 }
@@ -1070,6 +1090,18 @@ mod tests {
         });
         assert!(matches!(
             endpoint(mismatched),
+            Err(FfiError::InvalidConfig { .. })
+        ));
+
+        let mut duplicate_quic_family = config();
+        duplicate_quic_family.quic = Some(TransportOptions {
+            listen_addrs: Some(vec![
+                "/ip4/127.0.0.1/udp/0/quic-v1".into(),
+                "/ip4/0.0.0.0/udp/0/quic-v1".into(),
+            ]),
+        });
+        assert!(matches!(
+            endpoint(duplicate_quic_family),
             Err(FfiError::InvalidConfig { .. })
         ));
     }

@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, unexpected_cfgs)]
 
 //! Loopback Circuit Relay v2 service used by endpoint and example tests.
 //!

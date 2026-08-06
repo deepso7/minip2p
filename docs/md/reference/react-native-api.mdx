@@ -42,10 +42,12 @@ The platform package re-exports public types and errors from
 options objects accept `autoDial`; remaining timing and capacity fields are
 typed in the exported declarations and use native defaults when omitted.
 
-Each transport accepts `true` or `{ listen?: readonly string[] }`; omit a
+Each transport accepts `true` or
+`{ listen?: readonly [string, ...string[]] }`; omit a
 transport to disable it. `true` listens on that transport's IPv4 and IPv6
 defaults. An explicit `listen` array replaces those defaults exactly; an empty
-array is rejected. An omitted or empty `transports` object defaults to QUIC.
+array is rejected. QUIC accepts at most one explicit listener per IP family.
+An omitted or empty `transports` object defaults to QUIC.
 
 ```ts
 // QUIC only, IPv4 + IPv6 (also the default when `transports` is omitted)

@@ -96,7 +96,7 @@ export type NatErrorKind = (typeof NatErrorKind)[keyof typeof NatErrorKind];
 /** Listen configuration for one enabled transport. */
 export interface Minip2pTransportOptions {
   /** Exact listen multiaddresses. Omit to listen on IPv4 and IPv6 defaults. */
-  readonly listen?: readonly string[];
+  readonly listen?: readonly [string, ...string[]];
 }
 
 /** Transports enabled by an endpoint. */
