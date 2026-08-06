@@ -302,6 +302,7 @@ impl RelayServer {
     /// Nothing above the transport differs: a circuit rides an established
     /// connection to the relay, and HOP and STOP are ordinary streams on it.
     /// The relay is where that claim is either true or not.
+    #[cfg(feature = "tcp")]
     #[allow(dead_code)]
     pub fn spawn_tcp() -> Self {
         Self::spawn_on(|builder| builder.bind_tcp("127.0.0.1:0"))

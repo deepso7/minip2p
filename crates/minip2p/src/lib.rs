@@ -57,7 +57,7 @@ pub use minip2p_nat::{
     ConnectId, NatConfig, NatError, NatEvent, Path, ReachabilityState, ReservationInfo,
     ReservationPolicy,
 };
-#[cfg(any(feature = "nat", feature = "tcp"))]
+#[cfg(feature = "tcp")]
 use minip2p_platform::StdEntropy;
 #[cfg(feature = "pubsub")]
 pub use minip2p_pubsub::{
