@@ -202,6 +202,54 @@ const FfiConverterTypeDiscoveryOptions = (() => {
 })();
 
 /**
+ * One enabled transport and the addresses it should listen on.
+ */
+export type TransportOptions = {
+    /**
+     * Exact listen multiaddresses, or transport defaults when absent.
+     *
+     * An explicitly empty list is rejected: omit this field for defaults or
+     * disable the transport by omitting it from [`EndpointConfig`].
+     */
+    listenAddrs?: Array<string>
+}
+
+/**
+ * Generated factory for {@link TransportOptions} record objects.
+ */
+export const TransportOptions = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<TransportOptions, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<TransportOptions>,
+    });
+})();
+
+const FfiConverterTypeTransportOptions = (() => {
+    type TypeName = TransportOptions;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                listenAddrs: FfiConverterOptionalSequenceString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterOptionalSequenceString.write(value.listenAddrs, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterOptionalSequenceString.allocationSize(value.listenAddrs);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
  * Pubsub routing engine selected at endpoint construction.
  */
 export enum PubsubRouter {
@@ -350,10 +398,13 @@ export type EndpointConfig = {
      */
     autonatServers: Array<string>,
     /**
-     * TCP or QUIC listen multiaddress, or dual-stack wildcard binding when
-     * absent.
+     * QUIC configuration, or no QUIC transport when absent.
      */
-    listenAddr?: string,
+    quic?: TransportOptions,
+    /**
+     * TCP configuration, or no TCP transport when absent.
+     */
+    tcp?: TransportOptions,
     /**
      * Whether connection attempts must remain relayed.
      */
@@ -404,7 +455,8 @@ const FfiConverterTypeEndpointConfig = (() => {
                 agentVersion: FfiConverterOptionalString.read(from),
                 relays: FfiConverterSequenceString.read(from),
                 autonatServers: FfiConverterSequenceString.read(from),
-                listenAddr: FfiConverterOptionalString.read(from),
+                quic: FfiConverterOptionalTypeTransportOptions.read(from),
+                tcp: FfiConverterOptionalTypeTransportOptions.read(from),
                 forceRelay: FfiConverterBool.read(from),
                 allowUnsigned: FfiConverterBool.read(from),
                 pubsubRouter: FfiConverterTypePubsubRouter.read(from),
@@ -417,7 +469,8 @@ const FfiConverterTypeEndpointConfig = (() => {
             FfiConverterOptionalString.write(value.agentVersion, into);
             FfiConverterSequenceString.write(value.relays, into);
             FfiConverterSequenceString.write(value.autonatServers, into);
-            FfiConverterOptionalString.write(value.listenAddr, into);
+            FfiConverterOptionalTypeTransportOptions.write(value.quic, into);
+            FfiConverterOptionalTypeTransportOptions.write(value.tcp, into);
             FfiConverterBool.write(value.forceRelay, into);
             FfiConverterBool.write(value.allowUnsigned, into);
             FfiConverterTypePubsubRouter.write(value.pubsubRouter, into);
@@ -429,7 +482,8 @@ const FfiConverterTypeEndpointConfig = (() => {
             return FfiConverterOptionalString.allocationSize(value.agentVersion) +
              FfiConverterSequenceString.allocationSize(value.relays) +
              FfiConverterSequenceString.allocationSize(value.autonatServers) +
-             FfiConverterOptionalString.allocationSize(value.listenAddr) +
+             FfiConverterOptionalTypeTransportOptions.allocationSize(value.quic) +
+             FfiConverterOptionalTypeTransportOptions.allocationSize(value.tcp) +
              FfiConverterBool.allocationSize(value.forceRelay) +
              FfiConverterBool.allocationSize(value.allowUnsigned) +
              FfiConverterTypePubsubRouter.allocationSize(value.pubsubRouter) +
@@ -4031,11 +4085,8 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     readonly [destructorGuardSymbol]: UniffiGcObject;
     readonly [pointerLiteralSymbol]: UniffiHandle;
 /**
- * Validates the secret key and `config`, binds a transport, and creates
+ * Validates the secret key and `config`, binds its transports, and creates
  * an endpoint.
- *
- * A `/tcp` [`listen_addr`](EndpointConfig::listen_addr) binds TCP and a
- * `/quic-v1` one binds QUIC; with none given, QUIC on both families.
  *
  * The endpoint begins in the created state and owns its bound sockets,
  * but does not run a background driver until explicitly started.
@@ -4718,6 +4769,12 @@ const FfiConverterOptionalString = new FfiConverterOptional(FfiConverterString);
 // FfiConverter for Array<string>
 const FfiConverterSequenceString = new FfiConverterArray(FfiConverterString);
 
+// FfiConverter for Array<string> | undefined
+const FfiConverterOptionalSequenceString = new FfiConverterOptional(FfiConverterSequenceString);
+
+// FfiConverter for TransportOptions | undefined
+const FfiConverterOptionalTypeTransportOptions = new FfiConverterOptional(FfiConverterTypeTransportOptions);
+
 // FfiConverter for DiscoveryOptions | undefined
 const FfiConverterOptionalTypeDiscoveryOptions = new FfiConverterOptional(FfiConverterTypeDiscoveryOptions);
 
@@ -4773,7 +4830,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_func_peer_id_from_secret_key() !== 8962) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_func_peer_id_from_secret_key");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new() !== 56618) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new() !== 64534) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_abandon_stream() !== 60482) {
@@ -4903,5 +4960,6 @@ export default Object.freeze({
     FfiConverterTypePubsubRouter,
     FfiConverterTypeReachability,
     FfiConverterTypeRelayReservationInfo,
+    FfiConverterTypeTransportOptions,
   }
 });

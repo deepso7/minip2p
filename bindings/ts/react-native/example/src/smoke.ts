@@ -128,17 +128,17 @@ export async function runSmokeSuite(
 
 function createEndpoint(
   liveEndpoints: Set<Minip2p>,
-  listenAddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+  listen = ["/ip4/127.0.0.1/udp/0/quic-v1"],
   mdns = false
 ): Minip2p {
   const config: Minip2pConfig = {
     agentVersion: "minip2p-react-native-smoke",
-    listenAddr,
     mdns: mdns
       ? { autoDial: false, queryIntervalMs: 1000, socketPollIntervalMs: 50 }
       : undefined,
     protocols: [STREAM_PROTOCOL],
     secretKey: generateSecretKey(),
+    transports: { quic: { listen } },
   };
   const endpoint = Minip2p.create(config);
   liveEndpoints.add(endpoint);

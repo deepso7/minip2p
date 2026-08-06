@@ -168,11 +168,27 @@ fn config() -> EndpointConfig {
 }
 
 fn config_on(listen_addr: &str) -> EndpointConfig {
+    let (quic, tcp) = if listen_addr.contains("/quic-v1") {
+        (
+            Some(minip2p_ffi::TransportOptions {
+                listen_addrs: Some(vec![listen_addr.into()]),
+            }),
+            None,
+        )
+    } else {
+        (
+            None,
+            Some(minip2p_ffi::TransportOptions {
+                listen_addrs: Some(vec![listen_addr.into()]),
+            }),
+        )
+    };
     EndpointConfig {
         agent_version: Some("minip2p-ffi-loopback-test".into()),
         relays: Vec::new(),
         autonat_servers: Vec::new(),
-        listen_addr: Some(listen_addr.into()),
+        quic,
+        tcp,
         force_relay: false,
         allow_unsigned: false,
         pubsub_router: minip2p_ffi::PubsubRouter::Gossipsub,

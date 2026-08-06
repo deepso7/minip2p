@@ -105,7 +105,7 @@ selects the agents and infrastructure used by an endpoint.
 
 | Capability | Configuration | Active behavior | Infrastructure |
 | --- | --- | --- | --- |
-| Direct QUIC, Identify, Ping, custom streams | `secretKey`; optional `listenAddr` and `protocols` | Native driver starts in `Minip2p.create` | A mutually reachable UDP path |
+| Direct QUIC/TCP, Identify, Ping, custom streams | `secretKey`; optional `transports` and `protocols` | Native driver starts in `Minip2p.create`; transport default is dual-stack QUIC only | A mutually reachable UDP or TCP path |
 | Gossipsub | Default, or `pubsubRouter: PubsubRouter.Gossipsub` | Signed outbound pubsub and strict inbound validation | At least one compatible mesh peer |
 | Floodsub | `pubsubRouter: PubsubRouter.Floodsub` | Floodsub routing | At least one floodsub peer |
 | Signed discovery | `discovery: { topic, ... }` | Signed beacons, shared peer book, optional auto-dial | A connected discovery peer |

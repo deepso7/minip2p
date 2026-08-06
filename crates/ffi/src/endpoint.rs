@@ -7,15 +7,85 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BeaconConfig, Endpoint, FloodsubConfig, GossipsubConfig, MdnsConfig, Multiaddr, NatConfig,
-    PeerDiscoveryConfig, PeerId, PublishError, PubsubConfig, PubsubError, StreamId, TopicError,
-    TransportError, WaitHandle,
+    BeaconConfig, Endpoint, EndpointBuilder, FloodsubConfig, GossipsubConfig, MdnsConfig,
+    Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, PublishError, PubsubConfig, PubsubError,
+    StreamId, TopicError, TransportError, WaitHandle,
 };
 
 use crate::{
     DriverStats, EndpointConfig, FfiError, IdentifyInfo, KnownPeerInfo, P2pEventListener,
-    PubsubRouter, RelayReservationInfo, keypair_from_bytes, parse_direct_peer_addr,
+    PubsubRouter, RelayReservationInfo, TransportOptions, keypair_from_bytes,
+    parse_direct_peer_addr,
 };
+
+fn configure_transports(
+    mut builder: EndpointBuilder,
+    quic: Option<TransportOptions>,
+    tcp: Option<TransportOptions>,
+) -> Result<EndpointBuilder, FfiError> {
+    if quic.is_none() && tcp.is_none() {
+        return Err(FfiError::InvalidConfig {
+            detail: "at least one transport must be enabled".into(),
+        });
+    }
+
+    if let Some(options) = quic {
+        match options.listen_addrs {
+            None => builder = builder.quic_dual_stack(),
+            Some(addresses) => {
+                if addresses.is_empty() {
+                    return Err(empty_transport_list("QUIC"));
+                }
+                for address in addresses {
+                    let address = parse_listen_addr(&address, "QUIC")?;
+                    if !address.is_quic_transport() {
+                        return Err(wrong_transport("QUIC", &address));
+                    }
+                    builder = builder.quic_multiaddr(&address);
+                }
+            }
+        }
+    }
+
+    if let Some(options) = tcp {
+        let addresses = options
+            .listen_addrs
+            .unwrap_or_else(|| vec!["/ip4/0.0.0.0/tcp/0".into(), "/ip6/::/tcp/0".into()]);
+        if addresses.is_empty() {
+            return Err(empty_transport_list("TCP"));
+        }
+        for address in addresses {
+            let address = parse_listen_addr(&address, "TCP")?;
+            if !address.is_tcp_transport() {
+                return Err(wrong_transport("TCP", &address));
+            }
+            builder = builder.tcp_multiaddr(&address);
+        }
+    }
+
+    Ok(builder)
+}
+
+fn parse_listen_addr(address: &str, transport: &str) -> Result<Multiaddr, FfiError> {
+    Multiaddr::from_str(address).map_err(|error| FfiError::InvalidAddress {
+        detail: format!("invalid {transport} listen address `{address}`: {error}"),
+    })
+}
+
+fn empty_transport_list(transport: &str) -> FfiError {
+    FfiError::InvalidConfig {
+        detail: format!(
+            "{transport} listen cannot be empty; omit listen to use dual-stack defaults, or omit the {} transport configuration to disable it",
+            transport.to_ascii_lowercase()
+        ),
+    }
+}
+
+fn wrong_transport(transport: &str, address: &Multiaddr) -> FfiError {
+    FfiError::InvalidConfig {
+        detail: format!("{transport} listen address `{address}` does not use {transport}"),
+    }
+}
 
 /// A minip2p endpoint owned by a foreign runtime.
 #[derive(uniffi::Object)]
@@ -53,11 +123,8 @@ pub(crate) enum Lifecycle {
 
 #[uniffi::export]
 impl P2pEndpoint {
-    /// Validates the secret key and `config`, binds a transport, and creates
+    /// Validates the secret key and `config`, binds its transports, and creates
     /// an endpoint.
-    ///
-    /// A `/tcp` [`listen_addr`](EndpointConfig::listen_addr) binds TCP and a
-    /// `/quic-v1` one binds QUIC; with none given, QUIC on both families.
     ///
     /// The endpoint begins in the created state and owns its bound sockets,
     /// but does not run a background driver until explicitly started.
@@ -158,33 +225,8 @@ impl P2pEndpoint {
             }
         }
 
-        let mut endpoint = match config.listen_addr {
-            Some(address) => {
-                let address =
-                    Multiaddr::from_str(&address).map_err(|error| FfiError::InvalidAddress {
-                        detail: error.to_string(),
-                    })?;
-                // The address decides the transport, the same way it does for
-                // every dial through here: a foreign runtime that hands over
-                // a `/tcp` listener gets TCP, and one that hands over
-                // `/quic-v1` gets QUIC. Accepting `/tcp` peers to dial while
-                // refusing to listen on one would leave a device that has
-                // only TCP able to call out and never be called.
-                if address.is_tcp_transport() {
-                    builder
-                        .tcp_multiaddr(&address)
-                        .bind()
-                        .map_err(map_constructor_error)?
-                } else {
-                    builder
-                        .bind_quic_multiaddr(&address)
-                        .map_err(map_constructor_error)?
-                }
-            }
-            None => builder
-                .bind_quic_dual_stack()
-                .map_err(map_constructor_error)?,
-        };
+        builder = configure_transports(builder, config.quic, config.tcp)?;
+        let mut endpoint = builder.bind().map_err(map_constructor_error)?;
         let listen_addrs = endpoint
             .listen_all()
             .map_err(map_constructor_error)?
@@ -854,7 +896,10 @@ mod tests {
             agent_version: None,
             relays: Vec::new(),
             autonat_servers: Vec::new(),
-            listen_addr: Some("/ip4/127.0.0.1/udp/0/quic-v1".into()),
+            quic: Some(TransportOptions {
+                listen_addrs: Some(vec!["/ip4/127.0.0.1/udp/0/quic-v1".into()]),
+            }),
+            tcp: None,
             force_relay: false,
             allow_unsigned: false,
             pubsub_router: PubsubRouter::Gossipsub,
@@ -905,7 +950,9 @@ mod tests {
         ));
 
         let mut bad_listen = config();
-        bad_listen.listen_addr = Some("not-a-multiaddr".into());
+        bad_listen.quic = Some(TransportOptions {
+            listen_addrs: Some(vec!["not-a-multiaddr".into()]),
+        });
         assert!(matches!(
             endpoint(bad_listen),
             Err(FfiError::InvalidAddress { .. })
@@ -979,11 +1026,52 @@ mod tests {
     #[test]
     fn constructor_accepts_default_dual_stack_binding() {
         let mut config = config();
-        config.listen_addr = None;
+        config.quic = Some(TransportOptions { listen_addrs: None });
 
         let endpoint = endpoint(config).expect("dual-stack endpoint");
 
         assert!(!endpoint.listen_addrs().is_empty());
+    }
+
+    #[test]
+    fn constructor_accepts_quic_and_tcp_together() {
+        let mut config = config();
+        config.tcp = Some(TransportOptions {
+            listen_addrs: Some(vec!["/ip4/127.0.0.1/tcp/0".into()]),
+        });
+
+        let endpoint = endpoint(config).expect("QUIC + TCP endpoint");
+        let addresses = endpoint.listen_addrs();
+        assert!(addresses.iter().any(|address| address.contains("/quic-v1")));
+        assert!(addresses.iter().any(|address| address.contains("/tcp/")));
+    }
+
+    #[test]
+    fn constructor_rejects_disabled_empty_and_mismatched_transports() {
+        let mut disabled = config();
+        disabled.quic = None;
+        assert!(matches!(
+            endpoint(disabled),
+            Err(FfiError::InvalidConfig { .. })
+        ));
+
+        let mut empty = config();
+        empty.quic = Some(TransportOptions {
+            listen_addrs: Some(Vec::new()),
+        });
+        assert!(matches!(
+            endpoint(empty),
+            Err(FfiError::InvalidConfig { .. })
+        ));
+
+        let mut mismatched = config();
+        mismatched.quic = Some(TransportOptions {
+            listen_addrs: Some(vec!["/ip4/127.0.0.1/tcp/0".into()]),
+        });
+        assert!(matches!(
+            endpoint(mismatched),
+            Err(FfiError::InvalidConfig { .. })
+        ));
     }
 
     #[test]

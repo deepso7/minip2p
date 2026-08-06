@@ -28,7 +28,7 @@ The platform package re-exports public types and errors from
 | --- | --- | --- |
 | `secretKey` | `ArrayBuffer \| Uint8Array` | Required 32-byte Ed25519 secret key. |
 | `agentVersion` | `string` | Identify agent string. |
-| `listenAddr` | `string` | Local TCP or QUIC listen multiaddress; native defaults apply when omitted. |
+| `transports` | `Minip2pTransports` | Enabled transports. Omitted means dual-stack QUIC only. |
 | `protocols` | `readonly string[]` | Custom protocols accepted on inbound streams. |
 | `relays` | `readonly string[]` | Direct TCP or QUIC relay peer addresses. |
 | `autonatServers` | `readonly string[]` | Reachability probe-server addresses. |
@@ -41,6 +41,29 @@ The platform package re-exports public types and errors from
 `discovery.topic` is required when signed discovery is enabled. Both discovery
 options objects accept `autoDial`; remaining timing and capacity fields are
 typed in the exported declarations and use native defaults when omitted.
+
+Each transport accepts `true` or `{ listen?: readonly string[] }`; omit a
+transport to disable it. `true` listens on that transport's IPv4 and IPv6
+defaults. An explicit `listen` array replaces those defaults exactly; an empty
+array is rejected. An omitted or empty `transports` object defaults to QUIC.
+
+```ts
+// QUIC only, IPv4 + IPv6 (also the default when `transports` is omitted)
+transports: { quic: true }
+
+// QUIC + TCP, both IPv4 + IPv6
+transports: { quic: true, tcp: true }
+
+// TCP on exactly these listeners
+transports: {
+  tcp: {
+    listen: [
+      "/ip4/0.0.0.0/tcp/4001",
+      "/ip6/::/tcp/4001",
+    ],
+  },
+}
+```
 
 ## Identity and lifecycle
 

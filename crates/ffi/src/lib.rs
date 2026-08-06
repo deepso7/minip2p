@@ -12,7 +12,7 @@ use std::str::FromStr;
 
 pub use config::{
     DiscoveryOptions, EndpointConfig, KnownPeerInfo, MdnsOptions, PubsubRouter,
-    RelayReservationInfo,
+    RelayReservationInfo, TransportOptions,
 };
 pub use driver::DriverStats;
 pub use endpoint::P2pEndpoint;

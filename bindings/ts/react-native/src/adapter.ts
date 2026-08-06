@@ -14,6 +14,8 @@ import type {
   Minip2pConfig,
   Minip2pDiscoveryOptions,
   Minip2pMdnsOptions,
+  Minip2pTransportOptions,
+  Minip2pTransports,
   Reachability,
   RelayReservationInfo,
 } from "@minip2p/core";
@@ -41,6 +43,7 @@ import type {
   P2pEvent as NativeP2pEvent,
   P2pEventListener,
   RelayReservationInfo as NativeRelayReservationInfo,
+  TransportOptions as NativeTransportOptions,
 } from "./native";
 import nativeModule from "./NativeMinip2p";
 
@@ -365,18 +368,41 @@ function toNativeConfig(config: Minip2pConfig): NativeEndpointConfig {
           ),
           ttlMs: numberToU64(mdnsOptions.ttlMs ?? 120_000, "ttlMs"),
         };
+  const configuredTransports = config.transports;
+  const transports: Minip2pTransports =
+    configuredTransports === undefined ||
+    (configuredTransports.quic === undefined &&
+      configuredTransports.tcp === undefined)
+      ? { quic: true }
+      : configuredTransports;
   return {
     agentVersion: config.agentVersion,
     allowUnsigned: config.allowUnsigned ?? false,
     autonatServers: [...(config.autonatServers ?? [])],
     discovery,
     forceRelay: config.forceRelay ?? false,
-    listenAddr: config.listenAddr,
     mdns,
     protocols: [...(config.protocols ?? [])],
     pubsubRouter: (config.pubsubRouter ??
       PubsubRouter.Gossipsub) as NativeEndpointConfig["pubsubRouter"],
+    quic: toNativeTransport(transports.quic),
     relays: [...(config.relays ?? [])],
+    tcp: toNativeTransport(transports.tcp),
+  };
+}
+
+function toNativeTransport(
+  transport: true | Minip2pTransportOptions | undefined
+): NativeTransportOptions | undefined {
+  if (transport === undefined) {
+    return undefined;
+  }
+  if (transport === true) {
+    return { listenAddrs: undefined };
+  }
+  return {
+    listenAddrs:
+      transport.listen === undefined ? undefined : [...transport.listen],
   };
 }
 
