@@ -29,6 +29,7 @@ std = [
 ]
 quic = ["std", "dep:minip2p-quic"]
 tcp = ["dep:minip2p-tcp"]
+smoltcp = ["tcp", "minip2p-tcp/smoltcp"]
 nat = ["std", "dep:minip2p-circuit", "dep:minip2p-nat", "dep:getrandom"]
 pubsub = ["dep:minip2p-pubsub", "dep:thiserror"]
 discovery = ["nat", "pubsub", "dep:minip2p-discovery"]

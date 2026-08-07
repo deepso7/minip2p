@@ -86,9 +86,7 @@ pub use minip2p_swarm::{
     SwarmError, SwarmEvent as Event,
 };
 #[cfg(feature = "tcp")]
-pub use minip2p_tcp::TcpConfig;
-#[cfg(feature = "tcp")]
-use minip2p_tcp::{StdTcpProvider, TcpTransport};
+use minip2p_tcp::{StdTcpProvider, TcpConfig, TcpTransport};
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use minip2p_transport::ConnectionNamespace;
 #[cfg(feature = "tcp")]

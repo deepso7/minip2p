@@ -22,6 +22,11 @@ pub use minip2p_swarm::{
 };
 pub use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
+#[cfg(feature = "smoltcp")]
+pub use minip2p_tcp::{SmoltcpConfig, SmoltcpTcpProvider, smoltcp};
+#[cfg(feature = "tcp")]
+pub use minip2p_tcp::{TcpConfig, TcpProvider, TcpTransport};
+
 #[cfg(feature = "std")]
 mod std_endpoint;
 #[cfg(feature = "std")]

@@ -45,6 +45,15 @@ custom streams, state statistics, and consuming `shutdown(now)`. Every
 operation that advances protocol work uses a caller-provided `Now`, so the
 host controls time consistently.
 
+For an embedded TCP endpoint, enable `smoltcp` with default features disabled
+and build the endpoint over a `TcpTransport<SmoltcpTcpProvider<_>, _>`. The
+host owns the smoltcp device and interface; minip2p owns the TCP, Noise XX,
+Yamux, Identify, Ping, and application-protocol state above them:
+
+```toml
+minip2p = { package = "minip2p-rs", version = "0.3.1", default-features = false, features = ["smoltcp"] }
+```
+
 ## Transports
 
 QUIC is enabled by the default `std + quic` features. TCP support is opt-in through the `tcp` Cargo
