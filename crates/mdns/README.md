@@ -27,11 +27,12 @@ wherever the datagrams come from.
 default.
 
 `SmoltcpMdnsIo` is the embedded one, over [smoltcp] — a TCP/IP stack, not an
-operating system. It needs the `smoltcp` feature and nothing else: the host
-builds the `Interface` and supplies the link, and this owns the mDNS sockets on
-it and the group memberships they need. smoltcp has one interface, so mDNS sees
-one per family, and `refresh` re-reads its addresses — which is how an address
-arriving by DHCP or SLAAC reaches the agent.
+operating system. It needs the `smoltcp` feature and nothing else. The host can
+give it a dedicated device and interface with `new`, or install its sockets and
+group memberships into a `SmoltcpStack` shared with TCP using `on_stack`.
+smoltcp has one interface, so mDNS sees one per family, and `refresh` re-reads
+its addresses — which is how an address arriving by DHCP or SLAAC reaches the
+agent.
 
 Nothing moves in a stack like that except when it is driven, so `next_deadline`
 matters more here than it does with sockets: honouring it is what lets a device

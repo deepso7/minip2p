@@ -1145,7 +1145,7 @@ dependencies = [
  "if-addrs",
  "minip2p-core",
  "minip2p-identity",
- "smoltcp",
+ "minip2p-smoltcp",
  "socket2",
  "thiserror",
 ]
@@ -1287,6 +1287,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "minip2p-smoltcp"
+version = "0.3.1"
+dependencies = [
+ "smoltcp",
+]
+
+[[package]]
 name = "minip2p-swarm"
 version = "0.3.1"
 dependencies = [
@@ -1311,9 +1318,9 @@ dependencies = [
  "minip2p-identity",
  "minip2p-platform",
  "minip2p-secure-mux",
+ "minip2p-smoltcp",
  "minip2p-transport",
  "mio",
- "smoltcp",
  "thiserror",
 ]
 

@@ -375,6 +375,7 @@ jobs:
             minip2p-autonat
             minip2p-dcutr
             minip2p-discovery
+            minip2p-smoltcp
             minip2p-mdns
             minip2p-swarm
             minip2p-circuit

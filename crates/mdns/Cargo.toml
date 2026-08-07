@@ -16,7 +16,7 @@ workspace = true
 [features]
 default = ["std"]
 # Ethernet adds `smoltcp/medium-ethernet` from its own manifest.
-smoltcp = ["dep:smoltcp"]
+smoltcp = ["dep:minip2p-smoltcp"]
 std = [
     "minip2p-core/std",
     "minip2p-identity/std",
@@ -29,13 +29,6 @@ std = [
 minip2p-core = { path = "../core", version = "0.3.1", default-features = false }
 minip2p-identity = { path = "../identity", version = "0.3.1", default-features = false }
 thiserror = { version = "2.0.18", default-features = false }
-smoltcp = { version = "0.13.1", default-features = false, features = [
-    "alloc",
-    "medium-ip",
-    "multicast",
-    "proto-ipv4",
-    "proto-ipv6",
-    "socket-udp",
-], optional = true }
+minip2p-smoltcp = { path = "../smoltcp", version = "0.3.1", optional = true }
 socket2 = { version = "0.6.5", features = ["all"], optional = true }
 if-addrs = { version = "0.14.0", optional = true }

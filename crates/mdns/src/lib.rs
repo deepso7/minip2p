@@ -38,7 +38,7 @@ mod smoltcp_io;
 mod socket;
 
 #[cfg(feature = "smoltcp")]
-pub use smoltcp;
+pub use minip2p_smoltcp::{SmoltcpStack, smoltcp};
 
 pub use agent::MdnsAgent;
 pub use config::{MdnsConfig, MdnsConfigError};

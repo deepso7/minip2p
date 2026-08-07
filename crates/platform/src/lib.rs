@@ -58,7 +58,7 @@ mod std_impl;
 
 pub use clock::{Clock, Now};
 pub use deadline::Deadline;
-pub use entropy::{EntropyError, EntropySource};
+pub use entropy::{EntropyError, EntropySource, SharedEntropy};
 
 #[cfg(feature = "std")]
 pub use std_impl::{StdClock, StdEntropy};

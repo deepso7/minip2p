@@ -77,7 +77,7 @@ mod std_provider;
 mod transport;
 
 #[cfg(feature = "smoltcp")]
-pub use smoltcp;
+pub use minip2p_smoltcp::{SmoltcpStack, smoltcp};
 
 #[cfg(feature = "std")]
 pub use blocking::BlockingTcpProvider;

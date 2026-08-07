@@ -4,11 +4,14 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use smoltcp::iface::{Interface, SocketHandle, SocketSet};
-use smoltcp::phy::Device;
-use smoltcp::socket::udp::{self, PacketBuffer, PacketMetadata, UdpMetadata};
-use smoltcp::time::Instant;
-use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
+use minip2p_smoltcp::SmoltcpStack;
+use minip2p_smoltcp::smoltcp::iface::{
+    Interface, PollIngressSingleResult, PollResult, SocketHandle,
+};
+use minip2p_smoltcp::smoltcp::phy::Device;
+use minip2p_smoltcp::smoltcp::socket::udp::{self, PacketBuffer, PacketMetadata, UdpMetadata};
+use minip2p_smoltcp::smoltcp::time::Instant;
+use minip2p_smoltcp::smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
 use crate::io::{MAX_DATAGRAM_BYTES, MdnsDatagram, MdnsError, MdnsIo};
 use crate::{InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAction, MdnsTarget};
@@ -17,6 +20,7 @@ use crate::{InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAction, MdnsTar
 const MDNS_PORT: u16 = 5353;
 const MDNS_V4_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const MDNS_V6_GROUP: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x00fb);
+const MAX_INGRESS_PER_POLL: usize = 32;
 
 /// The one interface handle this reports for IPv4, and the one for IPv6.
 ///
@@ -75,11 +79,12 @@ struct Family {
 ///
 /// # Ownership
 ///
-/// The host builds the [`Interface`] and hands it over, because addressing is
-/// its business: which medium the link speaks and what addresses it holds.
-/// This owns the mDNS sockets on it and the multicast memberships they need,
-/// and reaches the interface through
-/// [`interface_mut`](Self::interface_mut) if the host has to reconfigure it.
+/// The host builds the [`Interface`] because addressing is its business: which
+/// medium the link speaks and what addresses it holds. [`new`](Self::new)
+/// creates a dedicated stack; [`on_stack`](Self::on_stack) installs the mDNS
+/// sockets and multicast memberships into a [`SmoltcpStack`] shared with TCP
+/// or another adapter. The host reconfigures the interface through that stack
+/// handle.
 ///
 /// # Interfaces
 ///
@@ -112,9 +117,7 @@ struct Family {
 ///
 /// [smoltcp]: https://docs.rs/smoltcp
 pub struct SmoltcpMdnsIo<D: Device> {
-    device: D,
-    iface: Interface,
-    sockets: SocketSet<'static>,
+    stack: SmoltcpStack<D>,
     families: Vec<Family>,
     snapshots: Vec<InterfaceSnapshot>,
     /// Where the next receive starts looking, so one family cannot spend a
@@ -126,6 +129,8 @@ pub struct SmoltcpMdnsIo<D: Device> {
     /// smoltcp's own answer to when it next needs driving, captured during
     /// `poll` because computing it needs the interface mutably.
     poll_at_ms: Option<u64>,
+    /// The last drive exhausted its ingress budget and must be resumed now.
+    ingress_pending: bool,
 }
 
 impl<D: Device> SmoltcpMdnsIo<D> {
@@ -134,13 +139,14 @@ impl<D: Device> SmoltcpMdnsIo<D> {
     /// Fails only if the interface will not take the memberships; an
     /// interface with no address in a family simply has no snapshot for it
     /// until one arrives.
-    pub fn new(
-        device: D,
-        mut iface: Interface,
-        config: SmoltcpMdnsConfig,
-    ) -> Result<Self, MdnsError> {
-        let mut sockets = SocketSet::new(Vec::new());
+    pub fn new(device: D, iface: Interface, config: SmoltcpMdnsConfig) -> Result<Self, MdnsError> {
+        Self::on_stack(SmoltcpStack::new(device, iface), config)
+    }
+
+    /// Opens mDNS sockets on an existing stack shared with other adapters.
+    pub fn on_stack(stack: SmoltcpStack<D>, config: SmoltcpMdnsConfig) -> Result<Self, MdnsError> {
         let mut families = Vec::new();
+        let mut shared = stack.borrow_mut();
 
         for (family, id, group) in [
             (IpFamily::V4, IPV4_INTERFACE, IpAddress::Ipv4(MDNS_V4_GROUP)),
@@ -149,9 +155,13 @@ impl<D: Device> SmoltcpMdnsIo<D> {
             if family == IpFamily::V6 && !config.enable_ipv6 {
                 continue;
             }
-            iface.join_multicast_group(group).map_err(|error| {
-                MdnsError::io("joining the mDNS multicast group", DisplayError(error))
-            })?;
+            if let Err(error) = shared.interface.join_multicast_group(group) {
+                rollback_families(&mut shared, &families);
+                return Err(MdnsError::io(
+                    "joining the mDNS multicast group",
+                    DisplayError(error),
+                ));
+            }
             let mut socket = udp::Socket::new(
                 PacketBuffer::new(
                     vec![PacketMetadata::EMPTY; config.packet_slots],
@@ -165,45 +175,42 @@ impl<D: Device> SmoltcpMdnsIo<D> {
             // Bound to the port rather than to an address: one socket serves
             // the group and any unicast reply, whichever address of this
             // family the datagram was sent to.
-            socket
-                .bind(IpListenEndpoint {
-                    addr: None,
-                    port: MDNS_PORT,
-                })
-                .map_err(|error| MdnsError::io("binding the mDNS port", DisplayError(error)))?;
+            if let Err(error) = socket.bind(IpListenEndpoint {
+                addr: None,
+                port: MDNS_PORT,
+            }) {
+                let _ = shared.interface.leave_multicast_group(group);
+                rollback_families(&mut shared, &families);
+                return Err(MdnsError::io("binding the mDNS port", DisplayError(error)));
+            }
             // mDNS is link-local by definition, and a hop limit of 255 is what
             // says so on the wire.
             socket.set_hop_limit(Some(255));
             families.push(Family {
                 id,
                 family,
-                socket: sockets.add(socket),
+                socket: shared.sockets.add(socket),
                 group,
             });
         }
 
+        drop(shared);
         let mut io = Self {
-            device,
-            iface,
-            sockets,
+            stack,
             families,
             snapshots: Vec::new(),
             next_receive: 0,
             now_ms: 0,
             poll_at_ms: None,
+            ingress_pending: false,
         };
         io.snapshots = io.read_snapshots();
         Ok(io)
     }
 
-    /// Borrows the interface, for a host that reconfigures its addresses.
-    pub fn interface_mut(&mut self) -> &mut Interface {
-        &mut self.iface
-    }
-
-    /// Borrows the link.
-    pub fn device_mut(&mut self) -> &mut D {
-        &mut self.device
+    /// Returns a handle to the network stack this adapter shares.
+    pub fn stack(&self) -> SmoltcpStack<D> {
+        self.stack.clone()
     }
 
     /// What the interface currently holds, one snapshot per family it has an
@@ -212,8 +219,9 @@ impl<D: Device> SmoltcpMdnsIo<D> {
         self.families
             .iter()
             .filter_map(|family| {
-                let addrs: Vec<IpNet> = self
-                    .iface
+                let shared = self.stack.borrow();
+                let addrs: Vec<IpNet> = shared
+                    .interface
                     .ip_addrs()
                     .iter()
                     .filter_map(|cidr| {
@@ -249,12 +257,56 @@ impl<D: Device> SmoltcpMdnsIo<D> {
     /// needs the same drain without the caller having asked for one.
     fn drive(&mut self, now_ms: u64) {
         let timestamp = instant(now_ms);
-        self.iface
-            .poll(timestamp, &mut self.device, &mut self.sockets);
-        self.poll_at_ms = self
-            .iface
-            .poll_at(timestamp, &self.sockets)
+        let mut shared = self.stack.borrow_mut();
+        let state = &mut *shared;
+        state.interface.poll_maintenance(timestamp);
+        let mut budget = MAX_INGRESS_PER_POLL;
+        self.ingress_pending = loop {
+            if budget == 0 {
+                break true;
+            }
+            budget -= 1;
+            if state
+                .interface
+                .poll_ingress_single(timestamp, &mut state.device, &mut state.sockets)
+                == PollIngressSingleResult::None
+            {
+                break false;
+            }
+        };
+        loop {
+            if state
+                .interface
+                .poll_egress(timestamp, &mut state.device, &mut state.sockets)
+                != PollResult::SocketStateChanged
+            {
+                break;
+            }
+        }
+        self.poll_at_ms = state
+            .interface
+            .poll_at(timestamp, &state.sockets)
             .map(|at| u64::try_from(at.total_millis()).unwrap_or(0));
+    }
+}
+
+fn rollback_families<D: Device>(
+    shared: &mut minip2p_smoltcp::SmoltcpStackState<D>,
+    families: &[Family],
+) {
+    for family in families {
+        shared.sockets.remove(family.socket);
+        let _ = shared.interface.leave_multicast_group(family.group);
+    }
+}
+
+impl<D: Device> Drop for SmoltcpMdnsIo<D> {
+    fn drop(&mut self) {
+        let mut shared = self.stack.borrow_mut();
+        for family in &self.families {
+            shared.sockets.remove(family.socket);
+            let _ = shared.interface.leave_multicast_group(family.group);
+        }
     }
 }
 
@@ -313,7 +365,8 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
         for step in 0..count {
             let index = (self.next_receive + step) % count;
             let family = &self.families[index];
-            let socket = self.sockets.get_mut::<udp::Socket>(family.socket);
+            let mut shared = self.stack.borrow_mut();
+            let socket = shared.sockets.get_mut::<udp::Socket>(family.socket);
             let (payload, metadata) = match socket.recv() {
                 Ok(received) => received,
                 Err(udp::RecvError::Exhausted) => continue,
@@ -368,7 +421,8 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
         // a momentarily full one is, so it has to be recognised before the
         // attempt: the driver parks congestion and comes back for it, which
         // for this one would be forever.
-        let socket = self.sockets.get::<udp::Socket>(handle);
+        let shared = self.stack.borrow();
+        let socket = shared.sockets.get::<udp::Socket>(handle);
         let capacity = socket.payload_send_capacity();
         if payload.len() > capacity || socket.packet_send_capacity() == 0 {
             return Err(MdnsError::Oversized {
@@ -377,8 +431,11 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
                 capacity,
             });
         }
+        drop(shared);
         let queue = |io: &mut Self| {
-            io.sockets
+            io.stack
+                .borrow_mut()
+                .sockets
                 .get_mut::<udp::Socket>(handle)
                 .send_slice(payload, UdpMetadata::from(destination))
         };
@@ -414,10 +471,15 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
     }
 
     fn next_deadline(&self, now_ms: u64) -> Option<u64> {
+        if self.ingress_pending {
+            return Some(0);
+        }
         // A datagram already queued leaves on the next poll, so that poll is
         // due now rather than whenever smoltcp's own timers say.
         let queued = self.families.iter().any(|family| {
-            self.sockets
+            self.stack
+                .borrow()
+                .sockets
                 .get::<udp::Socket>(family.socket)
                 .send_queue()
                 .gt(&0)

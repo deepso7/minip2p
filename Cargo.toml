@@ -20,6 +20,7 @@ members = [
     "crates/pubsub",
     "crates/relay",
     "crates/secure-mux",
+    "crates/smoltcp",
     "crates/swarm",
     "crates/test-support",
     "crates/tls",

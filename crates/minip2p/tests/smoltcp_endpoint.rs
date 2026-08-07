@@ -16,8 +16,9 @@ use minip2p::smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken
 use minip2p::smoltcp::time::Instant;
 use minip2p::smoltcp::wire::{HardwareAddress, IpCidr};
 use minip2p::{
-    Ed25519Keypair, Endpoint, EntropySource, Multiaddr, Now, PeerAddr, PeerId, PollDeadline,
-    SmoltcpConfig, SmoltcpTcpProvider, StreamId, SwarmEvent, TcpConfig, TcpTransport,
+    DiscoveryEvent, Ed25519Keypair, Endpoint, EntropySource, Multiaddr, Now, PeerAddr, PeerId,
+    PollDeadline, PortableMdnsEvent, SmoltcpConfig, SmoltcpMdnsConfig, SmoltcpStack,
+    SmoltcpTcpProvider, StreamId, SwarmEvent, TcpConfig, TcpTransport,
 };
 use minip2p_platform::EntropyError;
 
@@ -126,7 +127,7 @@ fn identity(seed: u8) -> Ed25519Keypair {
     Ed25519Keypair::from_secret_key_bytes([seed; 32])
 }
 
-fn transport(device: VirtualDevice, cidr: &str, identity: Ed25519Keypair, seed: u8) -> Transport {
+fn stack(device: VirtualDevice, cidr: &str) -> SmoltcpStack<VirtualDevice> {
     let mut device = device;
     let mut interface = Interface::new(
         Config::new(HardwareAddress::Ip),
@@ -138,8 +139,20 @@ fn transport(device: VirtualDevice, cidr: &str, identity: Ed25519Keypair, seed: 
             .push(cidr.parse::<IpCidr>().expect("valid test CIDR"))
             .expect("room for one address");
     });
+    SmoltcpStack::new(device, interface)
+}
+
+fn transport(device: VirtualDevice, cidr: &str, identity: Ed25519Keypair, seed: u8) -> Transport {
+    transport_on_stack(stack(device, cidr), identity, seed)
+}
+
+fn transport_on_stack(
+    stack: SmoltcpStack<VirtualDevice>,
+    identity: Ed25519Keypair,
+    seed: u8,
+) -> Transport {
     TcpTransport::with_config(
-        SmoltcpTcpProvider::new(device, interface, SmoltcpConfig::default()),
+        SmoltcpTcpProvider::on_stack(stack, SmoltcpConfig::default()),
         identity,
         CountingEntropy(seed),
         TcpConfig::default(),
@@ -270,4 +283,84 @@ fn portable_endpoints_complete_the_embedded_tcp_stack() {
     panic!(
         "embedded endpoint gate did not finish\n  dialer: {dialer_events:?}\n  listener: {listener_events:?}"
     );
+}
+
+#[test]
+fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
+    let wire = Wire::default();
+    let a_identity = identity(31);
+    let b_identity = identity(32);
+    let a_peer = a_identity.peer_id();
+    let b_peer = b_identity.peer_id();
+    let a_stack = stack(wire.dialer_device(), &format!("{DIALER_IP}/24"));
+    let b_stack = stack(wire.listener_device(), &format!("{LISTENER_IP}/24"));
+
+    let carrier = SmoltcpMdnsConfig {
+        enable_ipv6: false,
+        ..SmoltcpMdnsConfig::default()
+    };
+    let mut a = Endpoint::portable(&a_identity, CountingEntropy(40))
+        .smoltcp(a_stack)
+        .listen(format!("/ip4/{DIALER_IP}/tcp/4001"))
+        .mdns()
+        .mdns_carrier_config(carrier.clone())
+        .protocol(PROTOCOL)
+        .build()
+        .expect("a embedded endpoint builds");
+    let mut b = Endpoint::portable(&b_identity, CountingEntropy(50))
+        .smoltcp(b_stack)
+        .listen(format!("/ip4/{LISTENER_IP}/tcp/4001"))
+        .mdns()
+        .mdns_carrier_config(carrier)
+        .protocol(PROTOCOL)
+        .build()
+        .expect("b embedded endpoint builds");
+
+    let mut now_ms = 0;
+    let mut a_events = Vec::new();
+    let mut b_events = Vec::new();
+    let mut ping_started = false;
+    for _ in 0..MAX_STEPS {
+        let now = Now::from_millis(now_ms);
+        a_events.extend(a.poll(now).expect("a polls"));
+        b_events.extend(b.poll(now).expect("b polls"));
+
+        let a_discovered = a_events.iter().any(|event| {
+            matches!(event, PortableMdnsEvent::Discovery(DiscoveryEvent::PeerDiscovered { peer, addrs, .. })
+                if peer == &b_peer && !addrs.is_empty())
+        });
+        let b_discovered = b_events.iter().any(|event| {
+            matches!(event, PortableMdnsEvent::Discovery(DiscoveryEvent::PeerDiscovered { peer, addrs, .. })
+                if peer == &a_peer && !addrs.is_empty())
+        });
+        let a_ready = a_events.iter().any(|event| {
+            matches!(event, PortableMdnsEvent::Endpoint(SwarmEvent::PeerReady { peer_id, .. })
+                if peer_id == &b_peer)
+        });
+        let b_ready = b_events.iter().any(|event| {
+            matches!(event, PortableMdnsEvent::Endpoint(SwarmEvent::PeerReady { peer_id, .. })
+                if peer_id == &a_peer)
+        });
+        if a_ready && b_ready && !ping_started {
+            a.ping(&b_peer, now).expect("mDNS-discovered peer pings");
+            ping_started = true;
+        }
+        let ping_finished = a_events.iter().any(|event| {
+            matches!(event, PortableMdnsEvent::Endpoint(SwarmEvent::PingRttMeasured { peer_id, .. })
+                if peer_id == &b_peer)
+        });
+        if a_discovered && b_discovered && a_ready && b_ready && ping_finished {
+            assert_eq!(a.stats().ready_peers, 1);
+            assert_eq!(b.stats().ready_peers, 1);
+            return;
+        }
+
+        if wire.is_quiet() {
+            let deadline = PollDeadline::earliest_opt(a.next_deadline(now), b.next_deadline(now))
+                .unwrap_or_else(|| panic!("mDNS endpoints wedged"));
+            now_ms = now_ms.max(deadline.as_millis());
+        }
+    }
+
+    panic!("mDNS endpoint gate did not finish\n  a: {a_events:?}\n  b: {b_events:?}");
 }

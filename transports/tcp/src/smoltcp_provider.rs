@@ -8,13 +8,14 @@ use core::ops::RangeInclusive;
 
 use minip2p_core::{Multiaddr, Protocol};
 use minip2p_platform::{Deadline, Now};
-use smoltcp::iface::{
-    Interface, PollIngressSingleResult, PollResult, SocketHandle as SmoltcpHandle, SocketSet,
+use minip2p_smoltcp::SmoltcpStack;
+use minip2p_smoltcp::smoltcp::iface::{
+    Interface, PollIngressSingleResult, PollResult, SocketHandle as SmoltcpHandle,
 };
-use smoltcp::phy::Device;
-use smoltcp::socket::tcp;
-use smoltcp::time::Instant;
-use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
+use minip2p_smoltcp::smoltcp::phy::Device;
+use minip2p_smoltcp::smoltcp::socket::tcp;
+use minip2p_smoltcp::smoltcp::time::Instant;
+use minip2p_smoltcp::smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
 use crate::provider::{SocketHandle, TcpError, TcpEvent, TcpProvider, host_and_port};
 
@@ -179,18 +180,19 @@ struct Listener {
 ///
 /// # Ownership
 ///
-/// The host builds the [`Interface`] and hands it over, because addressing is
-/// its business: which medium the link speaks, what addresses it holds, whether
-/// they came from DHCP. This provider owns only sockets, and reaches the
-/// interface through [`interface_mut`](Self::interface_mut) if the host needs
-/// to reconfigure it later.
+/// The host builds the [`Interface`] because addressing is its business: which
+/// medium the link speaks, what addresses it holds, whether they came from
+/// DHCP. [`new`](Self::new) creates a dedicated stack; [`on_stack`](Self::on_stack)
+/// installs this provider's sockets into a [`SmoltcpStack`] shared with mDNS
+/// or another adapter. The host reaches the interface and device through that
+/// stack handle when either needs reconfiguration.
 ///
 /// ```no_run
 /// # use minip2p_tcp::{SmoltcpConfig, SmoltcpTcpProvider};
-/// # use smoltcp::iface::{Config, Interface};
-/// # use smoltcp::phy::Device;
-/// # use smoltcp::time::Instant;
-/// # use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
+/// # use minip2p_tcp::smoltcp::iface::{Config, Interface};
+/// # use minip2p_tcp::smoltcp::phy::Device;
+/// # use minip2p_tcp::smoltcp::time::Instant;
+/// # use minip2p_tcp::smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
 /// # fn build<D: Device>(mut device: D) -> SmoltcpTcpProvider<D> {
 /// let mut iface = Interface::new(
 ///     Config::new(HardwareAddress::Ip),
@@ -231,9 +233,7 @@ struct Listener {
 ///
 /// [smoltcp]: https://docs.rs/smoltcp
 pub struct SmoltcpTcpProvider<D: Device> {
-    device: D,
-    iface: Interface,
-    sockets: SocketSet<'static>,
+    stack: SmoltcpStack<D>,
     config: SmoltcpConfig,
     listeners: Vec<Listener>,
     entries: BTreeMap<SocketHandle, Entry>,
@@ -317,12 +317,15 @@ fn is_unspecified(address: IpAddress) -> bool {
 impl<D: Device> SmoltcpTcpProvider<D> {
     /// Creates a provider over an interface the host has already configured.
     pub fn new(device: D, iface: Interface, config: SmoltcpConfig) -> Self {
+        Self::on_stack(SmoltcpStack::new(device, iface), config)
+    }
+
+    /// Creates a provider on a stack shared with other embedded adapters.
+    pub fn on_stack(stack: SmoltcpStack<D>, config: SmoltcpConfig) -> Self {
         let read_buffer = vec![0u8; config.rx_buffer.clamp(512, MAX_READ_CHUNK)];
         let next_port = *config.ephemeral_ports.start();
         Self {
-            device,
-            iface,
-            sockets: SocketSet::new(Vec::new()),
+            stack,
             config,
             listeners: Vec::new(),
             entries: BTreeMap::new(),
@@ -339,14 +342,9 @@ impl<D: Device> SmoltcpTcpProvider<D> {
         }
     }
 
-    /// The interface, for a host that reconfigures addressing while running.
-    pub fn interface_mut(&mut self) -> &mut Interface {
-        &mut self.iface
-    }
-
-    /// The link, for a host that has to service it out of band.
-    pub fn device_mut(&mut self) -> &mut D {
-        &mut self.device
+    /// Returns a handle to the network stack this adapter shares.
+    pub fn stack(&self) -> SmoltcpStack<D> {
+        self.stack.clone()
     }
 
     fn allocate_handle(&mut self) -> SocketHandle {
@@ -376,7 +374,7 @@ impl<D: Device> SmoltcpTcpProvider<D> {
             tcp::SocketBuffer::new(vec![0u8; self.config.rx_buffer]),
             tcp::SocketBuffer::new(vec![0u8; self.config.tx_buffer]),
         );
-        Ok(self.sockets.add(socket))
+        Ok(self.stack.borrow_mut().sockets.add(socket))
     }
 
     fn allocate_port(&mut self) -> Result<u16, TcpError> {
@@ -455,7 +453,8 @@ impl<D: Device> SmoltcpTcpProvider<D> {
     /// [`egress_pending`](Self::next_deadline) makes sure happens; this only
     /// collects what has said it.
     fn reclaim(&mut self) {
-        let (sockets, used_ports) = (&mut self.sockets, &mut self.used_ports);
+        let mut stack = self.stack.borrow_mut();
+        let (sockets, used_ports) = (&mut stack.sockets, &mut self.used_ports);
         self.reclaiming.retain(|pending| {
             if sockets.get::<tcp::Socket>(pending.socket).state() != tcp::State::Closed {
                 return true;
@@ -474,7 +473,13 @@ impl<D: Device> SmoltcpTcpProvider<D> {
             let armed = core::mem::take(&mut self.listeners[index].armed);
             let mut kept = Vec::with_capacity(armed.len());
             for inner in armed {
-                match self.sockets.get::<tcp::Socket>(inner).state() {
+                let state = self
+                    .stack
+                    .borrow()
+                    .sockets
+                    .get::<tcp::Socket>(inner)
+                    .state();
+                match state {
                     tcp::State::Listen => kept.push(inner),
                     // Taken. It becomes a stream of its own, announced once the
                     // handshake finishes -- or, if it dies first, retired
@@ -512,12 +517,14 @@ impl<D: Device> SmoltcpTcpProvider<D> {
                 return;
             };
             if self
+                .stack
+                .borrow_mut()
                 .sockets
                 .get_mut::<tcp::Socket>(inner)
                 .listen(endpoint)
                 .is_err()
             {
-                self.sockets.remove(inner);
+                self.stack.borrow_mut().sockets.remove(inner);
                 return;
             }
             self.listeners[index].armed.push(inner);
@@ -538,7 +545,8 @@ impl<D: Device> SmoltcpTcpProvider<D> {
     /// poll when the queue held exactly the budget, while probing would merely
     /// move the same ambiguity to exactly `budget + 1` frames.
     fn drive(&mut self, timestamp: Instant) {
-        self.iface.poll_maintenance(timestamp);
+        let mut stack = self.stack.borrow_mut();
+        stack.interface.poll_maintenance(timestamp);
 
         let mut budget = MAX_INGRESS_PER_POLL;
         self.ingress_pending = loop {
@@ -546,9 +554,10 @@ impl<D: Device> SmoltcpTcpProvider<D> {
                 break true;
             }
             budget -= 1;
-            if self
-                .iface
-                .poll_ingress_single(timestamp, &mut self.device, &mut self.sockets)
+            let state = &mut *stack;
+            if state
+                .interface
+                .poll_ingress_single(timestamp, &mut state.device, &mut state.sockets)
                 == PollIngressSingleResult::None
             {
                 break false;
@@ -558,11 +567,16 @@ impl<D: Device> SmoltcpTcpProvider<D> {
         // After the ingress, so what just arrived is acknowledged in the same
         // poll. Bounded by the transmit rings rather than by the link, which is
         // why this one drains rather than counting.
-        while self
-            .iface
-            .poll_egress(timestamp, &mut self.device, &mut self.sockets)
-            == PollResult::SocketStateChanged
-        {}
+        loop {
+            let state = &mut *stack;
+            if state
+                .interface
+                .poll_egress(timestamp, &mut state.device, &mut state.sockets)
+                != PollResult::SocketStateChanged
+            {
+                break;
+            }
+        }
     }
 
     /// Turns one socket's state into events.
@@ -579,7 +593,8 @@ impl<D: Device> SmoltcpTcpProvider<D> {
         // and bytes left in it would have to wait for whatever wakes the host
         // next.
         loop {
-            let socket = self.sockets.get_mut::<tcp::Socket>(inner);
+            let mut stack = self.stack.borrow_mut();
+            let socket = stack.sockets.get_mut::<tcp::Socket>(inner);
             if !socket.can_recv() {
                 break;
             }
@@ -595,12 +610,14 @@ impl<D: Device> SmoltcpTcpProvider<D> {
             });
         }
 
-        let socket = self.sockets.get::<tcp::Socket>(inner);
+        let stack = self.stack.borrow();
+        let socket = stack.sockets.get::<tcp::Socket>(inner);
         // Reads are drained above, so this is genuinely the end of the stream
         // rather than a full ring.
         let ended = !socket.may_recv();
         let writable = socket.can_send();
         let finished = !socket.is_open();
+        drop(stack);
 
         let Some(entry) = self.entries.get_mut(&handle) else {
             return;
@@ -659,7 +676,8 @@ impl<D: Device> SmoltcpTcpProvider<D> {
             return false;
         };
         let (inner, role) = (entry.inner, entry.role);
-        let socket = self.sockets.get::<tcp::Socket>(inner);
+        let stack = self.stack.borrow();
+        let socket = stack.sockets.get::<tcp::Socket>(inner);
 
         if !socket.may_send() {
             // A reset in `SYN-RECEIVED` puts a socket back into `Listen` rather
@@ -680,7 +698,12 @@ impl<D: Device> SmoltcpTcpProvider<D> {
             // Forces a socket still waiting on a `SYN` to `Closed` so it can be
             // reclaimed. It sends no reset worth having: nothing answered, which
             // is the whole reason this stream is being given up on.
-            self.sockets.get_mut::<tcp::Socket>(inner).abort();
+            drop(stack);
+            self.stack
+                .borrow_mut()
+                .sockets
+                .get_mut::<tcp::Socket>(inner)
+                .abort();
             if role == Role::Outbound {
                 // The handle is already the caller's, so it has to be retired
                 // in the open. An inbound attempt was never handed over, so it
@@ -700,6 +723,7 @@ impl<D: Device> SmoltcpTcpProvider<D> {
         let Some(remote) = socket.remote_endpoint().map(endpoint_to_multiaddr) else {
             return false;
         };
+        drop(stack);
         let Some(entry) = self.entries.get_mut(&handle) else {
             return false;
         };
@@ -718,11 +742,27 @@ impl<D: Device> SmoltcpTcpProvider<D> {
     }
 }
 
+impl<D: Device> Drop for SmoltcpTcpProvider<D> {
+    fn drop(&mut self) {
+        let mut sockets = BTreeSet::new();
+        for listener in &self.listeners {
+            sockets.extend(listener.armed.iter().copied());
+        }
+        sockets.extend(self.entries.values().map(|entry| entry.inner));
+        sockets.extend(self.reclaiming.iter().map(|pending| pending.socket));
+
+        let mut shared = self.stack.borrow_mut();
+        for socket in sockets {
+            shared.sockets.remove(socket);
+        }
+    }
+}
+
 impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TcpError> {
         let (address, requested) = ip_and_port(addr, "tcp listen")?;
         let wildcard = is_unspecified(address);
-        if !wildcard && !self.iface.has_ip_addr(address) {
+        if !wildcard && !self.stack.borrow().interface.has_ip_addr(address) {
             return Err(TcpError::Address {
                 context: "tcp listen",
                 reason: format!("{addr} is not an address of this interface"),
@@ -751,15 +791,21 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
         // A wildcard has to resolve to something concrete, and on an interface
         // with no address at all there is nothing to resolve it to.
         let bound = if wildcard {
-            let first = self.iface.ip_addrs().first().ok_or(TcpError::Address {
-                context: "tcp listen",
-                reason: "the interface holds no address to listen on".into(),
-            });
-            match first {
-                Ok(cidr) => address_to_multiaddr(cidr.address(), port),
-                Err(error) => {
+            let address = self
+                .stack
+                .borrow()
+                .interface
+                .ip_addrs()
+                .first()
+                .map(|cidr| cidr.address());
+            match address {
+                Some(address) => address_to_multiaddr(address, port),
+                None => {
                     self.release(drawn);
-                    return Err(error);
+                    return Err(TcpError::Address {
+                        context: "tcp listen",
+                        reason: "the interface holds no address to listen on".into(),
+                    });
                 }
             }
         } else {
@@ -797,13 +843,17 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
         })?;
 
         let remote = IpEndpoint::new(address, port);
-        let context = self.iface.context();
-        if let Err(error) = self
-            .sockets
-            .get_mut::<tcp::Socket>(inner)
-            .connect(context, remote, local)
-        {
-            self.sockets.remove(inner);
+        let connect = {
+            let mut stack = self.stack.borrow_mut();
+            let state = &mut *stack;
+            let context = state.interface.context();
+            state
+                .sockets
+                .get_mut::<tcp::Socket>(inner)
+                .connect(context, remote, local)
+        };
+        if let Err(error) = connect {
+            self.stack.borrow_mut().sockets.remove(inner);
             self.used_ports.remove(&local);
             return Err(TcpError::Io {
                 operation: "starting a connect",
@@ -838,6 +888,8 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
         // closing, or gone. That is a socket taking nothing rather than a
         // failed write, and it is already on its way to a `Closed`.
         let accepted = self
+            .stack
+            .borrow_mut()
             .sockets
             .get_mut::<tcp::Socket>(inner)
             .send_slice(data)
@@ -862,7 +914,11 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
             .ok_or(TcpError::UnknownSocket { socket })?;
         // smoltcp sends the `FIN` behind whatever is still queued, so this
         // needs no flushing of its own -- only a poll to put it on the wire.
-        self.sockets.get_mut::<tcp::Socket>(entry.inner).close();
+        self.stack
+            .borrow_mut()
+            .sockets
+            .get_mut::<tcp::Socket>(entry.inner)
+            .close();
         self.egress_pending = true;
         Ok(())
     }
@@ -871,7 +927,11 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
         let Some(entry) = self.entries.get(&socket) else {
             return;
         };
-        self.sockets.get_mut::<tcp::Socket>(entry.inner).abort();
+        self.stack
+            .borrow_mut()
+            .sockets
+            .get_mut::<tcp::Socket>(entry.inner)
+            .abort();
         // The caller is owed nothing further, and there is nothing to take
         // back: `poll` hands over everything it produces before it returns, so
         // between polls there is never an event queued to discard.
@@ -902,9 +962,11 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
             self.arm_listener(index);
         }
 
-        self.poll_at = self
-            .iface
-            .poll_at(timestamp, &self.sockets)
+        let mut stack = self.stack.borrow_mut();
+        let state = &mut *stack;
+        self.poll_at = state
+            .interface
+            .poll_at(timestamp, &state.sockets)
             .map(|at| u64::try_from(at.total_millis()).unwrap_or(0));
         Ok(self.ready.drain(..).collect())
     }
@@ -938,7 +1000,9 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
                 // holds, so reporting only the one `listen` picked would hide
                 // most of the ways it can be reached.
                 None => self
-                    .iface
+                    .stack
+                    .borrow()
+                    .interface
                     .ip_addrs()
                     .iter()
                     .map(|cidr| address_to_multiaddr(cidr.address(), listener.endpoint.port))

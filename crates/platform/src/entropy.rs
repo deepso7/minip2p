@@ -1,3 +1,5 @@
+use alloc::rc::Rc;
+use core::cell::RefCell;
 use thiserror::Error;
 
 /// Why an [`EntropySource`] could not produce randomness.
@@ -74,6 +76,42 @@ pub trait EntropySource {
     }
 }
 
+/// Cloneable, single-threaded access to one entropy source.
+///
+/// Portable endpoint compositions use this when several independently owned
+/// protocol components must draw from the same hardware RNG. Calls remain
+/// serialized and no output is replayed or copied.
+pub struct SharedEntropy<E> {
+    inner: Rc<RefCell<E>>,
+}
+
+impl<E> SharedEntropy<E> {
+    /// Wraps an entropy source for shared ownership.
+    pub fn new(source: E) -> Self {
+        Self {
+            inner: Rc::new(RefCell::new(source)),
+        }
+    }
+}
+
+impl<E> Clone for SharedEntropy<E> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+        }
+    }
+}
+
+impl<E: EntropySource> EntropySource for SharedEntropy<E> {
+    fn fill_bytes(&mut self, output: &mut [u8]) -> Result<(), EntropyError> {
+        self.inner.borrow_mut().fill_bytes(output)
+    }
+
+    fn next_u64(&mut self) -> Result<u64, EntropyError> {
+        self.inner.borrow_mut().next_u64()
+    }
+}
+
 impl<E: EntropySource + ?Sized> EntropySource for &mut E {
     fn fill_bytes(&mut self, output: &mut [u8]) -> Result<(), EntropyError> {
         (**self).fill_bytes(output)
@@ -127,6 +165,20 @@ mod tests {
         let mut source = Counter(1);
         let value = source.next_u64().expect("draw");
         assert_eq!(value, u64::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8]));
+    }
+
+    #[test]
+    fn shared_handles_advance_one_underlying_stream() {
+        let mut first = SharedEntropy::new(Counter(1));
+        let mut second = first.clone();
+        let mut a = [0; 2];
+        let mut b = [0; 2];
+
+        first.fill_bytes(&mut a).expect("first draw");
+        second.fill_bytes(&mut b).expect("second draw");
+
+        assert_eq!(a, [1, 2]);
+        assert_eq!(b, [3, 4]);
     }
 
     #[test]

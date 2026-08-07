@@ -25,7 +25,7 @@ use minip2p_mdns::smoltcp::time::Instant;
 use minip2p_mdns::smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
 use minip2p_mdns::{
     InterfaceId, MdnsAction, MdnsAgent, MdnsConfig, MdnsDriver, MdnsError, MdnsEvent, MdnsIo,
-    MdnsTarget, SmoltcpMdnsConfig, SmoltcpMdnsIo,
+    MdnsTarget, SmoltcpMdnsConfig, SmoltcpMdnsIo, SmoltcpStack,
 };
 
 /// Enough ticks for several announcement rounds; short enough that a livelock
@@ -462,6 +462,90 @@ fn a_datagram_queued_but_not_yet_on_the_wire_is_owed_now() {
 }
 
 #[test]
+fn an_ingress_flood_is_bounded_and_keeps_the_carrier_due() {
+    let bus = Bus::default();
+    let mut receiver = carrier(&bus, &[Ipv4Address::new(192, 168, 1, 2)]);
+    let mut sender = carrier(&bus, &[Ipv4Address::new(192, 168, 1, 1)]);
+    receiver.poll(0).expect("receiver joins");
+    sender.poll(0).expect("sender joins");
+    bus.drain();
+
+    sender.send(&datagram()).expect("queue one valid frame");
+    sender.poll(1).expect("put the frame on the bus");
+    let receiver_inbox = Rc::clone(&bus.inboxes.borrow()[0]);
+    let frame = receiver_inbox
+        .borrow()
+        .front()
+        .cloned()
+        .expect("receiver got the frame");
+    for _ in 0..40 {
+        receiver_inbox.borrow_mut().push_back(frame.clone());
+    }
+
+    receiver.poll(1).expect("bounded poll");
+    assert!(
+        !receiver_inbox.borrow().is_empty(),
+        "one mDNS poll must not drain an unbounded link"
+    );
+    assert_eq!(
+        receiver.next_deadline(1),
+        Some(0),
+        "work left by the ingress budget must be resumed immediately"
+    );
+}
+
+#[test]
+fn failed_shared_stack_setup_rolls_back_memberships_and_sockets() {
+    let bus = Bus::default();
+    let mut device = bus.attach();
+    let iface = Interface::new(
+        Config::new(HardwareAddress::Ip),
+        &mut device,
+        Instant::from_millis(0),
+    );
+    let stack = SmoltcpStack::new(device, iface);
+    let retained = [
+        Ipv4Address::new(239, 0, 0, 1),
+        Ipv4Address::new(239, 0, 0, 2),
+        Ipv4Address::new(239, 0, 0, 3),
+    ];
+    {
+        let mut shared = stack.borrow_mut();
+        for group in retained {
+            shared
+                .interface
+                .join_multicast_group(group)
+                .expect("room before mDNS setup");
+        }
+    }
+
+    let error = match SmoltcpMdnsIo::on_stack(stack.clone(), SmoltcpMdnsConfig::default()) {
+        Ok(_) => panic!("IPv6 mDNS membership should exceed the final group slot"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("GroupTableFull"));
+
+    let shared = stack.borrow();
+    assert_eq!(
+        shared.sockets.iter().count(),
+        0,
+        "the IPv4 socket rolled back"
+    );
+    assert!(
+        !shared
+            .interface
+            .has_multicast_group(Ipv4Address::new(224, 0, 0, 251)),
+        "the IPv4 mDNS membership rolled back"
+    );
+    for group in retained {
+        assert!(
+            shared.interface.has_multicast_group(group),
+            "pre-existing memberships must survive rollback"
+        );
+    }
+}
+
+#[test]
 fn a_send_ring_with_no_room_is_a_backlog_and_not_the_end_of_mdns() {
     let bus = Bus::default();
     let _listener = carrier(&bus, &[Ipv4Address::new(192, 168, 1, 2)]);
@@ -471,7 +555,7 @@ fn a_send_ring_with_no_room_is_a_backlog_and_not_the_end_of_mdns() {
     // A stack like this drains only when it is driven, so a burst queued
     // inside one tick fills the ring long before anything empties it. The
     // driver sends up to 128 datagrams a turn into four slots.
-    io.device_mut().block(true);
+    io.stack().borrow_mut().device.block(true);
     let slots = SmoltcpMdnsConfig::default().packet_slots;
     for slot in 0..slots {
         io.send(&datagram())
@@ -489,7 +573,7 @@ fn a_send_ring_with_no_room_is_a_backlog_and_not_the_end_of_mdns() {
     // And the datagram that would not fit fits once the link takes frames
     // again -- without the caller having polled, because a send that finds no
     // room drains the ring itself before giving up.
-    io.device_mut().block(false);
+    io.stack().borrow_mut().device.block(false);
     io.send(&datagram())
         .expect("the drain inside the send made room");
     assert!(!bus.is_quiet(), "and the burst went out");
@@ -610,7 +694,7 @@ fn an_address_that_arrives_later_reaches_the_agent() {
     );
 
     // The lease lands. Nothing tells mDNS about it but the next refresh.
-    io.interface_mut().update_ip_addrs(|addrs| {
+    io.stack().borrow_mut().interface.update_ip_addrs(|addrs| {
         let _ = addrs.push(IpCidr::new(Ipv4Address::new(192, 168, 1, 5).into(), 24));
     });
     assert!(
@@ -634,7 +718,10 @@ fn an_address_that_arrives_later_reaches_the_agent() {
     );
 
     // A lease that expires is the same story backwards.
-    io.interface_mut().update_ip_addrs(|addrs| addrs.clear());
+    io.stack()
+        .borrow_mut()
+        .interface
+        .update_ip_addrs(|addrs| addrs.clear());
     assert!(io.refresh().expect("refresh"));
     assert!(io.interfaces().is_empty());
     assert_eq!(

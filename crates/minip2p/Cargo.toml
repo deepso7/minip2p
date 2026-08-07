@@ -20,8 +20,10 @@ workspace = true
 default = ["std", "quic"]
 std = [
     "minip2p-core/std",
+    "minip2p-discovery?/std",
     "minip2p-identify/std",
     "minip2p-identity/std",
+    "minip2p-mdns?/std",
     "minip2p-platform/std",
     "minip2p-swarm/std",
     "minip2p-transport/std",
@@ -29,7 +31,8 @@ std = [
 ]
 quic = ["std", "dep:minip2p-quic"]
 tcp = ["dep:minip2p-tcp"]
-smoltcp = ["tcp", "minip2p-tcp/smoltcp"]
+smoltcp = ["tcp", "portable-mdns", "minip2p-tcp/smoltcp", "minip2p-mdns/smoltcp"]
+portable-mdns = ["dep:minip2p-mdns", "dep:minip2p-discovery"]
 nat = ["std", "dep:minip2p-circuit", "dep:minip2p-nat", "dep:getrandom"]
 pubsub = ["dep:minip2p-pubsub", "dep:thiserror"]
 discovery = ["nat", "pubsub", "dep:minip2p-discovery"]
@@ -38,10 +41,10 @@ mdns = ["nat", "dep:minip2p-mdns", "dep:minip2p-discovery", "dep:thiserror"]
 [dependencies]
 minip2p-core = { path = "../core", version = "0.3.1", default-features = false }
 minip2p-circuit = { path = "../circuit", version = "0.3.1", optional = true }
-minip2p-discovery = { path = "../discovery", version = "0.3.1", optional = true }
+minip2p-discovery = { path = "../discovery", version = "0.3.1", default-features = false, optional = true }
 minip2p-identify = { path = "../identify", version = "0.3.1", default-features = false }
 minip2p-identity = { path = "../identity", version = "0.3.1", default-features = false, features = ["ed25519"] }
-minip2p-mdns = { path = "../mdns", version = "0.3.1", optional = true }
+minip2p-mdns = { path = "../mdns", version = "0.3.1", default-features = false, optional = true }
 minip2p-nat = { path = "../nat", version = "0.3.1", optional = true }
 minip2p-platform = { path = "../platform", version = "0.3.1", default-features = false }
 minip2p-pubsub = { path = "../pubsub", version = "0.3.1", optional = true }

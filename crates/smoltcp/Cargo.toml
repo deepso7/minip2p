@@ -1,0 +1,25 @@
+[package]
+name = "minip2p-smoltcp"
+description = "Shared smoltcp stack handle for minip2p embedded adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+smoltcp = { version = "0.13.1", default-features = false, features = [
+    "alloc",
+    "medium-ip",
+    "multicast",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+    "socket-udp",
+] }

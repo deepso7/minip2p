@@ -54,6 +54,27 @@ Yamux, Identify, Ping, and application-protocol state above them:
 minip2p = { package = "minip2p-rs", version = "0.3.1", default-features = false, features = ["smoltcp"] }
 ```
 
+The `smoltcp` feature also enables portable mDNS. Build one `SmoltcpStack`
+from the device and configured interface, then select it on the portable
+builder. TCP is implied by smoltcp and mDNS uses bounded discovery defaults:
+
+```rust,ignore
+let mut endpoint = Endpoint::portable(&identity, entropy)
+    .smoltcp(stack)
+    .listen("/ip4/0.0.0.0/tcp/4001")
+    .mdns()
+    .protocol("/myapp/1.0.0")
+    .build()?;
+```
+
+Use `tcp_config`, `smoltcp_config`, `mdns_config`,
+`mdns_carrier_config`, and `discovery_config` only when overriding defaults.
+Both adapters install sockets in the same stack, so one physical Wi-Fi or
+Ethernet link carries multicast discovery and TCP sessions. `poll(now)`
+advances both and automatically dials newly observed peers;
+`next_deadline(now)` folds both timelines. Manual provider composition remains
+available through `build(transport)` and `with_mdns(...)`.
+
 ## Transports
 
 QUIC is enabled by the default `std + quic` features. TCP support is opt-in through the `tcp` Cargo
