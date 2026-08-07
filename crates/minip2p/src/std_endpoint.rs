@@ -228,6 +228,17 @@ impl DriverPoll {
 }
 
 impl Endpoint {
+    /// Starts portable endpoint configuration with explicit identity and entropy.
+    ///
+    /// This constructs the same caller-driven, transport-generic endpoint as
+    /// a `no_std` build; the std [`Endpoint::builder`] remains unchanged.
+    pub fn portable<E: minip2p_platform::EntropySource>(
+        identity: &Ed25519Keypair,
+        entropy: E,
+    ) -> crate::PortableEndpointBuilder<E> {
+        crate::PortableEndpointBuilder::new(identity, entropy)
+    }
+
     /// Returns a cloneable handle that can interrupt a blocking endpoint wait
     /// from another thread.
     ///

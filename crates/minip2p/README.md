@@ -10,9 +10,8 @@ minip2p = { package = "minip2p-rs", version = "0.1" }
 The package is named `minip2p-rs` on crates.io and its library target remains
 `minip2p`, so application imports stay concise:
 
-This crate glues identity, the transports, and the std swarm driver into a
-small `Endpoint` API. Lower crates remain available directly for Sans-I/O and
-`no_std + alloc` users.
+This crate provides the existing batteries-included std `Endpoint` and a
+caller-driven portable endpoint behind the same entry point.
 
 ```rust
 let mut endpoint = minip2p::Endpoint::builder()
@@ -26,9 +25,29 @@ for address in endpoint.listen_all()? {
 # Ok::<(), minip2p::Error>(())
 ```
 
+## Portable endpoint
+
+Disable default features for `no_std + alloc`, then provide identity, entropy,
+and a concrete transport explicitly:
+
+```rust,ignore
+let mut endpoint = minip2p::Endpoint::portable(&identity, entropy)
+    .agent_version("my-device/0.1.0")
+    .protocol("/myapp/1.0.0")
+    .build(transport)?;
+
+let events = endpoint.poll(now)?;
+let deadline = endpoint.next_deadline(now);
+```
+
+The portable endpoint supports listening, dialing, ping, Identify inspection,
+custom streams, state statistics, and consuming `shutdown(now)`. Every
+operation that advances protocol work uses a caller-provided `Now`, so the
+host controls time consistently.
+
 ## Transports
 
-QUIC is always available. TCP support is opt-in through the `tcp` Cargo
+QUIC is enabled by the default `std + quic` features. TCP support is opt-in through the `tcp` Cargo
 feature, so a QUIC-only application does not link the TCP upgrade and socket
 stack. Enable it with `minip2p-rs = { version = "0.3.1", features = ["tcp"] }`.
 
