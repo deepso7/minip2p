@@ -51,29 +51,34 @@ host owns the smoltcp device and interface; minip2p owns the TCP, Noise XX,
 Yamux, Identify, Ping, and application-protocol state above them:
 
 ```toml
-minip2p = { package = "minip2p-rs", version = "0.3.1", default-features = false, features = ["smoltcp"] }
+minip2p = { package = "minip2p-rs", version = "0.3.1", default-features = false, features = ["smoltcp", "pubsub"] }
 ```
 
-The `smoltcp` feature also enables portable mDNS. Build one `SmoltcpStack`
-from the device and configured interface, then select it on the portable
-builder. TCP is implied by smoltcp and mDNS uses bounded discovery defaults:
+The portable smoltcp builder can compose TCP, pubsub, signed-beacon discovery,
+and mDNS into one endpoint. Build one `SmoltcpStack` from the device and
+configured interface, then select the services needed by the application.
+TCP and portable mDNS are supplied by `smoltcp`; the separate `pubsub`
+feature enables `.pubsub()` and signed `.discovery()`, which itself implies
+pubsub at runtime:
 
 ```rust,ignore
 let mut endpoint = Endpoint::portable(&identity, entropy)
     .smoltcp(stack)
     .listen("/ip4/0.0.0.0/tcp/4001")
     .mdns()
+    .discovery()
     .protocol("/myapp/1.0.0")
     .build()?;
 ```
 
 Use `tcp_config`, `smoltcp_config`, `mdns_config`,
-`mdns_carrier_config`, and `discovery_config` only when overriding defaults.
-Both adapters install sockets in the same stack, so one physical Wi-Fi or
-Ethernet link carries multicast discovery and TCP sessions. `poll(now)`
-advances both and automatically dials newly observed peers;
-`next_deadline(now)` folds both timelines. Manual provider composition remains
-available through `build(transport)` and `with_mdns(...)`.
+`mdns_carrier_config`, `pubsub_config`, `beacon_config`, and
+`discovery_config` only when overriding defaults. The endpoint installs every
+adapter on the same stack, returns TCP, pubsub, and discovery progress through
+one `SmoltcpEvent` enum, and automatically dials newly observed peers.
+`poll(now)` advances all enabled services and `next_deadline(now)` folds their
+timelines. Manual provider composition remains available through
+`build(transport)`.
 
 ## Transports
 

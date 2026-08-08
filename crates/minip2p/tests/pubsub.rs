@@ -2,7 +2,7 @@
 //! pubsub RPCs. Agent-level edge cases live in `crates/pubsub/tests`; these
 //! prove default gossipsub and explicit floodsub endpoint wiring.
 
-#![cfg(feature = "pubsub")]
+#![cfg(all(feature = "pubsub", feature = "std"))]
 
 use std::time::{Duration, Instant};
 

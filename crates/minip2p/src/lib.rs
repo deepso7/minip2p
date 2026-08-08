@@ -14,6 +14,8 @@ extern crate alloc;
 
 #[cfg(feature = "portable-mdns")]
 use alloc::collections::BTreeMap;
+#[cfg(all(feature = "smoltcp", feature = "pubsub"))]
+use alloc::collections::VecDeque;
 #[cfg(feature = "portable-mdns")]
 use alloc::string::ToString;
 use alloc::{string::String, vec::Vec};
@@ -27,11 +29,18 @@ pub use minip2p_swarm::{
 pub use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
 #[cfg(feature = "portable-mdns")]
-pub use minip2p_discovery::{DiscoveryEvent, KnownPeer, PeerDiscoveryConfig};
+pub use minip2p_discovery::{
+    BeaconConfig, DiscoveryEvent, DiscoverySource, KnownPeer, PeerDiscoveryConfig,
+};
 #[cfg(feature = "portable-mdns")]
 pub use minip2p_mdns::{MdnsConfig, MdnsConfigError, MdnsError, MdnsEvent, MdnsIo};
 #[cfg(feature = "smoltcp")]
 pub use minip2p_mdns::{SmoltcpMdnsConfig, SmoltcpMdnsIo};
+#[cfg(all(feature = "pubsub", not(feature = "std")))]
+pub use minip2p_pubsub::{
+    FloodsubConfig, GossipsubConfig, PublishError, PubsubConfig, PubsubConfigError, PubsubEvent,
+    TopicError,
+};
 #[cfg(feature = "smoltcp")]
 pub use minip2p_tcp::{SmoltcpConfig, SmoltcpStack, SmoltcpTcpProvider, smoltcp};
 #[cfg(feature = "tcp")]
@@ -610,7 +619,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
     pub fn smoltcp<D: smoltcp::phy::Device>(
         self,
         stack: SmoltcpStack<D>,
-    ) -> SmoltcpEndpointBuilder<D, E, MdnsDisabled> {
+    ) -> SmoltcpEndpointBuilder<D, E> {
         SmoltcpEndpointBuilder {
             swarm: self.swarm,
             identity: self.identity,
@@ -619,26 +628,26 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
             tcp_config: TcpConfig::default(),
             provider_config: SmoltcpConfig::default(),
             listens: Vec::new(),
-            mdns: MdnsDisabled,
+            mdns: None,
+            #[cfg(feature = "pubsub")]
+            pubsub: None,
+            #[cfg(feature = "pubsub")]
+            beacon: None,
+            discovery: PeerDiscoveryConfig::default(),
         }
     }
 }
 
-/// Type-state marker for an embedded endpoint without mDNS.
-#[cfg(feature = "smoltcp")]
-pub struct MdnsDisabled;
-
 /// Embedded mDNS and peer-discovery configuration.
 #[cfg(feature = "smoltcp")]
-pub struct MdnsEnabled {
+struct EmbeddedMdnsConfig {
     mdns: MdnsConfig,
     carrier: SmoltcpMdnsConfig,
-    discovery: PeerDiscoveryConfig,
 }
 
 /// Specialized builder for a portable endpoint over one shared smoltcp stack.
 #[cfg(feature = "smoltcp")]
-pub struct SmoltcpEndpointBuilder<D: smoltcp::phy::Device, E: EntropySource, M> {
+pub struct SmoltcpEndpointBuilder<D: smoltcp::phy::Device, E: EntropySource> {
     swarm: SwarmBuilder,
     identity: Ed25519Keypair,
     entropy: SharedEntropy<E>,
@@ -646,27 +655,449 @@ pub struct SmoltcpEndpointBuilder<D: smoltcp::phy::Device, E: EntropySource, M> 
     tcp_config: TcpConfig,
     provider_config: SmoltcpConfig,
     listens: Vec<String>,
-    mdns: M,
+    mdns: Option<EmbeddedMdnsConfig>,
+    #[cfg(feature = "pubsub")]
+    pubsub: Option<PubsubConfig>,
+    #[cfg(feature = "pubsub")]
+    beacon: Option<BeaconConfig>,
+    discovery: PeerDiscoveryConfig,
 }
 
-/// TCP-only endpoint produced by the specialized smoltcp builder.
+/// Caller-driven endpoint over one shared smoltcp stack.
 #[cfg(feature = "smoltcp")]
-pub type SmoltcpEndpoint<D, E> =
-    PortableEndpoint<TcpTransport<SmoltcpTcpProvider<D>, SharedEntropy<E>>, SharedEntropy<E>>;
+pub struct SmoltcpEndpoint<D: smoltcp::phy::Device, E: EntropySource> {
+    endpoint:
+        PortableEndpoint<TcpTransport<SmoltcpTcpProvider<D>, SharedEntropy<E>>, SharedEntropy<E>>,
+    mdns: Option<minip2p_mdns::MdnsDriver<SmoltcpMdnsIo<D>>>,
+    #[cfg(feature = "pubsub")]
+    pubsub: Option<minip2p_pubsub::PubsubAgent>,
+    #[cfg(feature = "pubsub")]
+    pending_pubsub_events: VecDeque<PubsubEvent>,
+    #[cfg(feature = "pubsub")]
+    beacon: Option<minip2p_discovery::BeaconAgent>,
+    discovery: Option<minip2p_discovery::PeerDiscoveryAgent>,
+    active_dials: BTreeMap<PeerId, ConnectionId>,
+}
 
-/// TCP and mDNS endpoint produced by the specialized smoltcp builder.
+/// Event emitted by the composed embedded endpoint.
 #[cfg(feature = "smoltcp")]
-pub type SmoltcpMdnsEndpoint<D, E> = PortableMdnsEndpoint<
-    TcpTransport<SmoltcpTcpProvider<D>, SharedEntropy<E>>,
-    SharedEntropy<E>,
-    SmoltcpMdnsIo<D>,
->;
+#[derive(Clone, Debug)]
+pub enum SmoltcpEvent {
+    /// Ordinary connection, Identify, Ping, or application-stream progress.
+    Endpoint(SwarmEvent),
+    /// Application-visible pubsub progress.
+    #[cfg(feature = "pubsub")]
+    Pubsub(PubsubEvent),
+    /// A change or violation from the shared discovery book.
+    Discovery(DiscoveryEvent),
+}
 
 #[cfg(feature = "smoltcp")]
-type SmoltcpBuildParts<D, E, M> = (SmoltcpEndpoint<D, E>, SmoltcpStack<D>, M);
+impl<D: smoltcp::phy::Device, E: EntropySource> core::ops::Deref for SmoltcpEndpoint<D, E> {
+    type Target =
+        PortableEndpoint<TcpTransport<SmoltcpTcpProvider<D>, SharedEntropy<E>>, SharedEntropy<E>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.endpoint
+    }
+}
 
 #[cfg(feature = "smoltcp")]
-impl<D: smoltcp::phy::Device, E: EntropySource, M> SmoltcpEndpointBuilder<D, E, M> {
+impl<D: smoltcp::phy::Device, E: EntropySource> core::ops::DerefMut for SmoltcpEndpoint<D, E> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.endpoint
+    }
+}
+
+#[cfg(feature = "smoltcp")]
+impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
+    /// Subscribes to an application topic.
+    #[cfg(feature = "pubsub")]
+    pub fn subscribe(&mut self, topic: &str, now: Now) -> Result<bool, SmoltcpPubsubError> {
+        let agent = self.pubsub.as_mut().ok_or(SmoltcpPubsubError::NotEnabled)?;
+        let subscribed = agent.subscribe(topic, now.monotonic_ms)?;
+        pump_embedded_pubsub(agent, &mut self.endpoint, now);
+        collect_embedded_pubsub_events(agent, &mut self.pending_pubsub_events);
+        Ok(subscribed)
+    }
+
+    /// Withdraws an application topic subscription.
+    #[cfg(feature = "pubsub")]
+    pub fn unsubscribe(&mut self, topic: &str, now: Now) -> Result<bool, SmoltcpPubsubError> {
+        if self
+            .beacon
+            .as_ref()
+            .is_some_and(|beacon| beacon.topic() == topic)
+        {
+            return Err(SmoltcpPubsubError::DiscoveryTopicReserved);
+        }
+        let agent = self.pubsub.as_mut().ok_or(SmoltcpPubsubError::NotEnabled)?;
+        let removed = agent.unsubscribe(topic, now.monotonic_ms);
+        pump_embedded_pubsub(agent, &mut self.endpoint, now);
+        collect_embedded_pubsub_events(agent, &mut self.pending_pubsub_events);
+        Ok(removed)
+    }
+
+    /// Publishes one application message.
+    #[cfg(feature = "pubsub")]
+    pub fn publish(
+        &mut self,
+        topic: &str,
+        data: impl Into<Vec<u8>>,
+        now: Now,
+    ) -> Result<(), SmoltcpPubsubError> {
+        if self
+            .beacon
+            .as_ref()
+            .is_some_and(|beacon| beacon.topic() == topic)
+        {
+            return Err(SmoltcpPubsubError::DiscoveryTopicReserved);
+        }
+        let agent = self.pubsub.as_mut().ok_or(SmoltcpPubsubError::NotEnabled)?;
+        agent.publish(topic, data.into(), now.monotonic_ms)?;
+        pump_embedded_pubsub(agent, &mut self.endpoint, now);
+        collect_embedded_pubsub_events(agent, &mut self.pending_pubsub_events);
+        Ok(())
+    }
+
+    /// Returns the bounded peer book shared by mDNS and signed beacons.
+    pub fn known_peers(&self) -> Vec<KnownPeer> {
+        self.discovery
+            .as_ref()
+            .map(minip2p_discovery::PeerDiscoveryAgent::known_peers)
+            .unwrap_or_default()
+    }
+
+    /// Advances TCP and every configured embedded service once.
+    pub fn poll(&mut self, now: Now) -> Result<Vec<SmoltcpEvent>, SmoltcpDriveError> {
+        let mut output = Vec::new();
+        self.poll_swarm(now, &mut output)?;
+        if let Some(mdns) = self.mdns.as_mut() {
+            mdns.tick(now.monotonic_ms, &self.endpoint.stats().listen_addresses)?;
+        }
+        if self.mdns.is_some() {
+            self.poll_swarm(now, &mut output)?;
+        }
+        if let Some(mdns) = self.mdns.as_mut() {
+            while let Some(event) = mdns.poll_event() {
+                if let Some(discovery) = self.discovery.as_mut() {
+                    match event {
+                        MdnsEvent::PeerObserved { peer, addrs } => {
+                            discovery.observe_mdns(peer, addrs, now.monotonic_ms);
+                        }
+                        MdnsEvent::ProtocolViolation { peer, reason } => discovery
+                            .report_violation(
+                                peer,
+                                minip2p_discovery::DiscoverySource::Mdns,
+                                &reason,
+                            ),
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "pubsub")]
+        if let Some(pubsub) = self.pubsub.as_mut() {
+            if pubsub.next_timeout(now.monotonic_ms) == Some(0) {
+                pubsub.handle_tick(now.monotonic_ms);
+            }
+            pump_embedded_pubsub(pubsub, &mut self.endpoint, now);
+        }
+        #[cfg(feature = "pubsub")]
+        self.drive_beacon(now, &mut output);
+        if let Some(discovery) = self.discovery.as_mut()
+            && discovery.next_timeout(now.monotonic_ms) == Some(0)
+        {
+            discovery.handle_tick(now.monotonic_ms);
+        }
+        self.drive_discovery_actions(now)?;
+        if let Some(discovery) = self.discovery.as_mut() {
+            while let Some(event) = discovery.poll_event() {
+                output.push(SmoltcpEvent::Discovery(event));
+            }
+        }
+        Ok(output)
+    }
+
+    fn poll_swarm(&mut self, now: Now, output: &mut Vec<SmoltcpEvent>) -> Result<(), DriverError> {
+        for event in self.endpoint.poll(now)? {
+            if let Some(discovery) = self.discovery.as_mut() {
+                match &event {
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        self.active_dials.remove(peer_id);
+                        discovery.dial_succeeded(peer_id, now.monotonic_ms);
+                        discovery.peer_connected(peer_id, now.monotonic_ms);
+                    }
+                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                        discovery.peer_disconnected(peer_id, now.monotonic_ms);
+                    }
+                    SwarmEvent::Error(error) => {
+                        if let Some(peer) = remove_failed_autodial(
+                            &mut self.active_dials,
+                            error.peer_id.as_ref(),
+                            error.conn_id,
+                        ) {
+                            discovery.dial_failed(&peer, &error.detail, now.monotonic_ms);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            #[cfg(feature = "pubsub")]
+            let claimed = self
+                .pubsub
+                .as_mut()
+                .is_some_and(|agent| agent.handle_event(&event, now.monotonic_ms));
+            #[cfg(feature = "pubsub")]
+            if let Some(agent) = self.pubsub.as_mut() {
+                pump_embedded_pubsub(agent, &mut self.endpoint, now);
+            }
+            #[cfg(not(feature = "pubsub"))]
+            let claimed = false;
+            if !claimed {
+                output.push(SmoltcpEvent::Endpoint(event));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "pubsub")]
+    fn drive_beacon(&mut self, now: Now, output: &mut Vec<SmoltcpEvent>) {
+        let Some(beacon) = self.beacon.as_mut() else {
+            if let Some(pubsub) = self.pubsub.as_mut() {
+                collect_embedded_pubsub_events(pubsub, &mut self.pending_pubsub_events);
+            }
+            output.extend(
+                self.pending_pubsub_events
+                    .drain(..)
+                    .map(SmoltcpEvent::Pubsub),
+            );
+            return;
+        };
+        beacon.set_local_addrs(&self.endpoint.stats().listen_addresses, now.monotonic_ms);
+        if beacon.next_timeout(now.monotonic_ms) == Some(0) {
+            beacon.handle_tick(now.monotonic_ms);
+        }
+        if let Some(pubsub) = self.pubsub.as_mut() {
+            collect_embedded_pubsub_events(pubsub, &mut self.pending_pubsub_events);
+            while let Some(event) = self.pending_pubsub_events.pop_front() {
+                let consumed = match &event {
+                    PubsubEvent::Message {
+                        from,
+                        topics,
+                        data,
+                        signed,
+                        ..
+                    } if topics.iter().any(|topic| topic == beacon.topic()) => {
+                        beacon.handle_beacon(from, data, *signed);
+                        true
+                    }
+                    PubsubEvent::PeerSubscribed { topic, .. }
+                    | PubsubEvent::PeerUnsubscribed { topic, .. }
+                        if topic == beacon.topic() =>
+                    {
+                        true
+                    }
+                    _ => false,
+                };
+                if !consumed {
+                    output.push(SmoltcpEvent::Pubsub(event));
+                }
+            }
+            while let Some(minip2p_discovery::BeaconAction::PublishBeacon { topic, payload }) =
+                beacon.poll_action()
+            {
+                // Beacon publication is best-effort, matching the hosted
+                // driver. Backpressure must not discard events already
+                // collected by this poll; the next interval announces again.
+                if pubsub.publish(&topic, payload, now.monotonic_ms).is_ok() {
+                    pump_embedded_pubsub(pubsub, &mut self.endpoint, now);
+                }
+            }
+            collect_embedded_pubsub_events(pubsub, &mut self.pending_pubsub_events);
+            while let Some(event) = self.pending_pubsub_events.pop_front() {
+                output.push(SmoltcpEvent::Pubsub(event));
+            }
+        }
+        if let Some(discovery) = self.discovery.as_mut() {
+            while let Some(event) = beacon.poll_event() {
+                match event {
+                    minip2p_discovery::BeaconEvent::Observation(observation) => {
+                        discovery.observe_beacon(observation, now.monotonic_ms);
+                    }
+                    minip2p_discovery::BeaconEvent::ProtocolViolation { peer, reason } => {
+                        discovery.report_violation(
+                            Some(peer),
+                            minip2p_discovery::DiscoverySource::SignedBeacon,
+                            &reason,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn drive_discovery_actions(&mut self, now: Now) -> Result<(), DriverError> {
+        let Some(discovery) = self.discovery.as_mut() else {
+            return Ok(());
+        };
+        while let Some(action) = discovery.poll_action() {
+            match action {
+                minip2p_discovery::DiscoveryAction::Dial { peer, addrs, .. } => {
+                    let mut started = None;
+                    let mut last_error = None;
+                    for address in addrs {
+                        let Ok(target) = PeerAddr::new(address, peer.clone()) else {
+                            continue;
+                        };
+                        match self.endpoint.dial(&target) {
+                            Ok(connection) => {
+                                started = Some(connection);
+                                break;
+                            }
+                            Err(error) => last_error = Some(error),
+                        }
+                    }
+                    if let Some(connection) = started {
+                        self.active_dials.insert(peer, connection);
+                    } else {
+                        let reason = last_error
+                            .map(|error| error.to_string())
+                            .unwrap_or_else(|| "discovery supplied no dialable address".into());
+                        discovery.dial_failed(&peer, &reason, now.monotonic_ms);
+                    }
+                }
+                minip2p_discovery::DiscoveryAction::CancelDial { peer } => {
+                    if let Some(connection) = self.active_dials.remove(&peer) {
+                        match self
+                            .endpoint
+                            .runtime_mut()
+                            .transport_mut()
+                            .close(connection)
+                        {
+                            Ok(())
+                            | Err(
+                                TransportError::ConnectionNotFound { .. }
+                                | TransportError::InvalidState { .. },
+                            ) => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the earliest deadline across TCP and configured services.
+    pub fn next_deadline(&self, now: Now) -> Option<PollDeadline> {
+        let mut deadline = self.endpoint.next_deadline(now);
+        let mut timeouts = Vec::new();
+        timeouts.extend(
+            self.mdns
+                .as_ref()
+                .and_then(|agent| agent.next_timeout(now.monotonic_ms)),
+        );
+        #[cfg(feature = "pubsub")]
+        {
+            if !self.pending_pubsub_events.is_empty() {
+                deadline = PollDeadline::earliest_opt(deadline, Some(PollDeadline::IMMEDIATE));
+            }
+            timeouts.extend(
+                self.pubsub
+                    .as_ref()
+                    .and_then(|agent| agent.next_timeout(now.monotonic_ms)),
+            );
+            timeouts.extend(
+                self.beacon
+                    .as_ref()
+                    .and_then(|agent| agent.next_timeout(now.monotonic_ms)),
+            );
+        }
+        timeouts.extend(
+            self.discovery
+                .as_ref()
+                .and_then(|agent| agent.next_timeout(now.monotonic_ms)),
+        );
+        for timeout in timeouts {
+            deadline = PollDeadline::earliest_opt(
+                deadline,
+                Some(PollDeadline::from_millis(
+                    now.monotonic_ms.saturating_add(timeout),
+                )),
+            );
+        }
+        deadline
+    }
+
+    /// Sends an mDNS goodbye when enabled, closes peers, and consumes the endpoint.
+    pub fn shutdown(mut self, now: Now) -> Result<Vec<SmoltcpEvent>, SmoltcpDriveError> {
+        if let Some(mdns) = self.mdns.as_mut() {
+            mdns.shutdown(now.monotonic_ms)?;
+        }
+        Ok(self
+            .endpoint
+            .shutdown(now)?
+            .into_iter()
+            .map(SmoltcpEvent::Endpoint)
+            .collect())
+    }
+}
+
+#[cfg(feature = "smoltcp")]
+#[cfg(feature = "pubsub")]
+fn pump_embedded_pubsub<D: smoltcp::phy::Device, E: EntropySource>(
+    agent: &mut minip2p_pubsub::PubsubAgent,
+    endpoint: &mut PortableEndpoint<
+        TcpTransport<SmoltcpTcpProvider<D>, SharedEntropy<E>>,
+        SharedEntropy<E>,
+    >,
+    now: Now,
+) {
+    while let Some(action) = agent.poll_action() {
+        match action {
+            minip2p_pubsub::PubsubAction::OpenStream {
+                token,
+                peer,
+                protocol_id,
+            } => {
+                let result = endpoint
+                    .open_stream(&peer, &protocol_id, now)
+                    .map_err(|e| e.to_string());
+                agent.stream_open_result(&peer, token, result, now.monotonic_ms);
+            }
+            minip2p_pubsub::PubsubAction::SendStream {
+                token,
+                peer,
+                stream_id,
+                data,
+            } => {
+                let result = endpoint
+                    .send_stream(&peer, stream_id, data, now)
+                    .map_err(|e| e.to_string());
+                agent.send_result(&peer, stream_id, token, result, now.monotonic_ms);
+            }
+            minip2p_pubsub::PubsubAction::CloseStreamWrite { peer, stream_id } => {
+                let _ = endpoint.close_stream_write(&peer, stream_id, now);
+            }
+            minip2p_pubsub::PubsubAction::ResetStream { peer, stream_id } => {
+                let _ = endpoint.reset_stream(&peer, stream_id, now);
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "smoltcp", feature = "pubsub"))]
+fn collect_embedded_pubsub_events(
+    agent: &mut minip2p_pubsub::PubsubAgent,
+    pending: &mut VecDeque<PubsubEvent>,
+) {
+    while let Some(event) = agent.poll_event() {
+        pending.push_back(event);
+    }
+}
+
+#[cfg(feature = "smoltcp")]
+impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
     /// Overrides the Identify agent-version string.
     pub fn agent_version(mut self, value: impl Into<String>) -> Self {
         self.swarm = self.swarm.agent_version(value);
@@ -697,15 +1128,83 @@ impl<D: smoltcp::phy::Device, E: EntropySource, M> SmoltcpEndpointBuilder<D, E, 
         self
     }
 
-    fn build_endpoint(self) -> Result<SmoltcpBuildParts<D, E, M>, SmoltcpBuildError> {
+    /// Enables mDNS and bounded automatic local-peer discovery with defaults.
+    pub fn mdns(self) -> Self {
+        self.mdns_config(MdnsConfig::default())
+    }
+
+    /// Enables mDNS with explicit wire and scheduling policy.
+    pub fn mdns_config(mut self, config: MdnsConfig) -> Self {
+        self.mdns = Some(EmbeddedMdnsConfig {
+            mdns: config,
+            carrier: SmoltcpMdnsConfig::default(),
+        });
+        self
+    }
+
+    /// Overrides the mDNS UDP carrier buffers and enables mDNS when needed.
+    pub fn mdns_carrier_config(mut self, config: SmoltcpMdnsConfig) -> Self {
+        self.mdns
+            .get_or_insert_with(|| EmbeddedMdnsConfig {
+                mdns: MdnsConfig::default(),
+                carrier: SmoltcpMdnsConfig::default(),
+            })
+            .carrier = config;
+        self
+    }
+
+    /// Enables pubsub with interoperable gossipsub defaults.
+    #[cfg(feature = "pubsub")]
+    pub fn pubsub(mut self) -> Self {
+        self.pubsub.get_or_insert_with(PubsubConfig::default);
+        self
+    }
+
+    /// Enables pubsub with an explicit gossipsub or floodsub configuration.
+    #[cfg(feature = "pubsub")]
+    pub fn pubsub_config(mut self, config: impl Into<PubsubConfig>) -> Self {
+        self.pubsub = Some(config.into());
+        self
+    }
+
+    /// Enables signed-beacon discovery. Pubsub is enabled automatically.
+    #[cfg(feature = "pubsub")]
+    pub fn discovery(mut self) -> Self {
+        self.pubsub.get_or_insert_with(PubsubConfig::default);
+        self.beacon.get_or_insert_with(BeaconConfig::default);
+        self
+    }
+
+    /// Enables signed-beacon discovery with explicit beacon policy.
+    #[cfg(feature = "pubsub")]
+    pub fn beacon_config(mut self, config: BeaconConfig) -> Self {
+        self.pubsub.get_or_insert_with(PubsubConfig::default);
+        self.beacon = Some(config);
+        self
+    }
+
+    /// Overrides the shared bounded peer-book and automatic-dial policy.
+    pub fn discovery_config(mut self, config: PeerDiscoveryConfig) -> Self {
+        self.discovery = config;
+        self
+    }
+
+    /// Builds the configured endpoint. Optional services share one event loop.
+    pub fn build(mut self) -> Result<SmoltcpEndpoint<D, E>, SmoltcpBuildError> {
+        #[cfg(feature = "pubsub")]
+        if let Some(config) = &self.pubsub {
+            for protocol in config.protocol_ids() {
+                self.swarm = self.swarm.protocol(*protocol);
+            }
+        }
         let transport = TcpTransport::with_config(
             SmoltcpTcpProvider::on_stack(self.stack.clone(), self.provider_config),
-            self.identity,
+            self.identity.clone(),
             self.entropy.clone(),
             self.tcp_config,
         );
         let mut endpoint = PortableEndpoint {
-            runtime: self.swarm.build_runtime(transport, self.entropy)?,
+            runtime: self.swarm.build_runtime(transport, self.entropy.clone())?,
         };
         for address in self.listens {
             let parsed =
@@ -717,62 +1216,65 @@ impl<D: smoltcp::phy::Device, E: EntropySource, M> SmoltcpEndpointBuilder<D, E, 
                     })?;
             endpoint.listen(&parsed)?;
         }
-        Ok((endpoint, self.stack, self.mdns))
-    }
-}
-
-#[cfg(feature = "smoltcp")]
-impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E, MdnsDisabled> {
-    /// Enables mDNS and bounded automatic local-peer discovery with defaults.
-    pub fn mdns(self) -> SmoltcpEndpointBuilder<D, E, MdnsEnabled> {
-        self.mdns_config(MdnsConfig::default())
-    }
-
-    /// Enables mDNS with explicit wire and scheduling policy.
-    pub fn mdns_config(self, config: MdnsConfig) -> SmoltcpEndpointBuilder<D, E, MdnsEnabled> {
-        SmoltcpEndpointBuilder {
-            swarm: self.swarm,
-            identity: self.identity,
-            entropy: self.entropy,
-            stack: self.stack,
-            tcp_config: self.tcp_config,
-            provider_config: self.provider_config,
-            listens: self.listens,
-            mdns: MdnsEnabled {
-                mdns: config,
-                carrier: SmoltcpMdnsConfig::default(),
-                discovery: PeerDiscoveryConfig::default(),
-            },
+        let mdns = if let Some(config) = self.mdns {
+            let mut seed = [0; 32];
+            self.entropy.fill_bytes(&mut seed)?;
+            let io = SmoltcpMdnsIo::on_stack(self.stack, config.carrier)?;
+            let agent =
+                minip2p_mdns::MdnsAgent::new(endpoint.peer_id().clone(), config.mdns.clone(), seed)
+                    .map_err(|error| {
+                        SmoltcpBuildError::MdnsConfig(PortableMdnsConfigError::Mdns(error))
+                    })?;
+            Some(minip2p_mdns::MdnsDriver::new(agent, io, &config.mdns))
+        } else {
+            None
+        };
+        #[cfg(feature = "pubsub")]
+        let mut pubsub = self
+            .pubsub
+            .map(|config| {
+                minip2p_pubsub::PubsubAgent::new(
+                    self.identity.clone(),
+                    config,
+                    self.entropy.next_u64()?,
+                    self.entropy.next_u64()?,
+                )
+                .map_err(SmoltcpBuildError::Pubsub)
+            })
+            .transpose()?;
+        #[cfg(feature = "pubsub")]
+        let beacon = self
+            .beacon
+            .map(|config| minip2p_discovery::BeaconAgent::new(self.identity.public_key(), config))
+            .transpose()?;
+        #[cfg(feature = "pubsub")]
+        if let (Some(pubsub), Some(beacon)) = (&mut pubsub, &beacon) {
+            pubsub.subscribe(beacon.topic(), 0)?;
         }
-    }
-
-    /// Builds a TCP-only portable endpoint.
-    pub fn build(self) -> Result<SmoltcpEndpoint<D, E>, SmoltcpBuildError> {
-        self.build_endpoint().map(|(endpoint, _, _)| endpoint)
-    }
-}
-
-#[cfg(feature = "smoltcp")]
-impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E, MdnsEnabled> {
-    /// Overrides the mDNS UDP carrier buffers and enabled address families.
-    pub fn mdns_carrier_config(mut self, config: SmoltcpMdnsConfig) -> Self {
-        self.mdns.carrier = config;
-        self
-    }
-
-    /// Overrides bounded peer-book and automatic-dial policy.
-    pub fn discovery_config(mut self, config: PeerDiscoveryConfig) -> Self {
-        self.mdns.discovery = config;
-        self
-    }
-
-    /// Builds a TCP endpoint with mDNS over the same smoltcp stack.
-    pub fn build(mut self) -> Result<SmoltcpMdnsEndpoint<D, E>, SmoltcpBuildError> {
-        let mut seed = [0; 32];
-        self.entropy.fill_bytes(&mut seed)?;
-        let (endpoint, stack, mdns) = self.build_endpoint()?;
-        let io = SmoltcpMdnsIo::on_stack(stack, mdns.carrier)?;
-        Ok(endpoint.with_mdns_config(io, mdns.mdns, mdns.discovery, seed)?)
+        #[cfg(feature = "pubsub")]
+        let discovery_enabled = mdns.is_some() || beacon.is_some();
+        #[cfg(not(feature = "pubsub"))]
+        let discovery_enabled = mdns.is_some();
+        let discovery = if discovery_enabled {
+            Some(minip2p_discovery::PeerDiscoveryAgent::new(
+                endpoint.peer_id().clone(),
+                self.discovery,
+            )?)
+        } else {
+            None
+        };
+        Ok(SmoltcpEndpoint {
+            endpoint,
+            mdns,
+            #[cfg(feature = "pubsub")]
+            pubsub,
+            #[cfg(feature = "pubsub")]
+            pending_pubsub_events: VecDeque::new(),
+            #[cfg(feature = "pubsub")]
+            beacon,
+            discovery,
+            active_dials: BTreeMap::new(),
+        })
     }
 }
 
@@ -792,6 +1294,14 @@ pub enum SmoltcpBuildError {
     Mdns(MdnsError),
     /// mDNS or bounded discovery policy was invalid.
     MdnsConfig(PortableMdnsConfigError),
+    /// Pubsub routing policy was invalid.
+    #[cfg(feature = "pubsub")]
+    Pubsub(PubsubConfigError),
+    /// The reserved discovery topic was invalid.
+    #[cfg(feature = "pubsub")]
+    Topic(TopicError),
+    /// Signed-beacon or bounded discovery policy was invalid.
+    Discovery(minip2p_discovery::DiscoveryConfigError),
 }
 
 #[cfg(feature = "smoltcp")]
@@ -824,6 +1334,19 @@ impl From<PortableMdnsConfigError> for SmoltcpBuildError {
         Self::MdnsConfig(error)
     }
 }
+#[cfg(feature = "smoltcp")]
+#[cfg(feature = "pubsub")]
+impl From<TopicError> for SmoltcpBuildError {
+    fn from(error: TopicError) -> Self {
+        Self::Topic(error)
+    }
+}
+#[cfg(feature = "smoltcp")]
+impl From<minip2p_discovery::DiscoveryConfigError> for SmoltcpBuildError {
+    fn from(error: minip2p_discovery::DiscoveryConfigError) -> Self {
+        Self::Discovery(error)
+    }
+}
 
 #[cfg(feature = "smoltcp")]
 impl core::fmt::Display for SmoltcpBuildError {
@@ -840,6 +1363,86 @@ impl core::fmt::Display for SmoltcpBuildError {
             }
             Self::Mdns(error) => error.fmt(formatter),
             Self::MdnsConfig(error) => error.fmt(formatter),
+            #[cfg(feature = "pubsub")]
+            Self::Pubsub(error) => error.fmt(formatter),
+            #[cfg(feature = "pubsub")]
+            Self::Topic(error) => error.fmt(formatter),
+            Self::Discovery(error) => error.fmt(formatter),
+        }
+    }
+}
+
+/// Failure while driving the composed smoltcp endpoint.
+#[cfg(feature = "smoltcp")]
+#[derive(Debug)]
+pub enum SmoltcpDriveError {
+    /// TCP or swarm progress failed.
+    Endpoint(DriverError),
+    /// The mDNS carrier failed.
+    Mdns(MdnsError),
+}
+
+#[cfg(feature = "smoltcp")]
+impl From<DriverError> for SmoltcpDriveError {
+    fn from(error: DriverError) -> Self {
+        Self::Endpoint(error)
+    }
+}
+#[cfg(feature = "smoltcp")]
+impl From<MdnsError> for SmoltcpDriveError {
+    fn from(error: MdnsError) -> Self {
+        Self::Mdns(error)
+    }
+}
+#[cfg(feature = "smoltcp")]
+impl core::fmt::Display for SmoltcpDriveError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Endpoint(error) => error.fmt(formatter),
+            Self::Mdns(error) => error.fmt(formatter),
+        }
+    }
+}
+
+/// Failure from an embedded pubsub operation.
+#[cfg(all(feature = "smoltcp", feature = "pubsub"))]
+#[derive(Debug, Eq, PartialEq)]
+pub enum SmoltcpPubsubError {
+    /// `.pubsub()` or `.discovery()` was not selected on the builder.
+    NotEnabled,
+    /// Signed discovery owns this subscription.
+    DiscoveryTopicReserved,
+    /// The topic was invalid.
+    Topic(TopicError),
+    /// The message could not be queued.
+    Publish(PublishError),
+}
+
+#[cfg(all(feature = "smoltcp", feature = "pubsub"))]
+impl From<TopicError> for SmoltcpPubsubError {
+    fn from(error: TopicError) -> Self {
+        Self::Topic(error)
+    }
+}
+#[cfg(all(feature = "smoltcp", feature = "pubsub"))]
+impl From<PublishError> for SmoltcpPubsubError {
+    fn from(error: PublishError) -> Self {
+        Self::Publish(error)
+    }
+}
+#[cfg(all(feature = "smoltcp", feature = "pubsub"))]
+impl core::fmt::Display for SmoltcpPubsubError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotEnabled => write!(
+                formatter,
+                "pubsub is not enabled; call .pubsub() or .discovery()"
+            ),
+            Self::DiscoveryTopicReserved => {
+                write!(formatter, "signed discovery owns this topic subscription")
+            }
+            Self::Topic(error) => error.fmt(formatter),
+            Self::Publish(error) => error.fmt(formatter),
         }
     }
 }

@@ -15,10 +15,12 @@ use minip2p::smoltcp::iface::{Config, Interface};
 use minip2p::smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use minip2p::smoltcp::time::Instant;
 use minip2p::smoltcp::wire::{HardwareAddress, IpCidr};
+#[cfg(feature = "pubsub")]
+use minip2p::{BeaconConfig, FloodsubConfig, PubsubEvent, SmoltcpPubsubError};
 use minip2p::{
     DiscoveryEvent, Ed25519Keypair, Endpoint, EntropySource, Multiaddr, Now, PeerAddr, PeerId,
-    PollDeadline, PortableMdnsEvent, SmoltcpConfig, SmoltcpMdnsConfig, SmoltcpStack,
-    SmoltcpTcpProvider, StreamId, SwarmEvent, TcpConfig, TcpTransport,
+    PollDeadline, SmoltcpConfig, SmoltcpEvent, SmoltcpMdnsConfig, SmoltcpStack, SmoltcpTcpProvider,
+    StreamId, SwarmEvent, TcpConfig, TcpTransport,
 };
 use minip2p_platform::EntropyError;
 
@@ -26,6 +28,8 @@ const DIALER_IP: &str = "192.168.1.1";
 const LISTENER_IP: &str = "192.168.1.2";
 const PROTOCOL: &str = "/minip2p/embedded-e2e/1.0.0";
 const PAYLOAD: &[u8] = b"portable endpoint over smoltcp";
+#[cfg(feature = "pubsub")]
+const TOPIC: &str = "minip2p-embedded-test";
 const MAX_STEPS: usize = 30_000;
 
 struct CountingEntropy(u8);
@@ -299,19 +303,29 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
         enable_ipv6: false,
         ..SmoltcpMdnsConfig::default()
     };
-    let mut a = Endpoint::portable(&a_identity, CountingEntropy(40))
+    let a_builder = Endpoint::portable(&a_identity, CountingEntropy(40))
         .smoltcp(a_stack)
         .listen(format!("/ip4/{DIALER_IP}/tcp/4001"))
         .mdns()
-        .mdns_carrier_config(carrier.clone())
+        .mdns_carrier_config(carrier.clone());
+    #[cfg(feature = "pubsub")]
+    let a_builder = a_builder
+        .pubsub_config(FloodsubConfig::default())
+        .discovery();
+    let mut a = a_builder
         .protocol(PROTOCOL)
         .build()
         .expect("a embedded endpoint builds");
-    let mut b = Endpoint::portable(&b_identity, CountingEntropy(50))
+    let b_builder = Endpoint::portable(&b_identity, CountingEntropy(50))
         .smoltcp(b_stack)
         .listen(format!("/ip4/{LISTENER_IP}/tcp/4001"))
         .mdns()
-        .mdns_carrier_config(carrier)
+        .mdns_carrier_config(carrier);
+    #[cfg(feature = "pubsub")]
+    let b_builder = b_builder
+        .pubsub_config(FloodsubConfig::default())
+        .discovery();
+    let mut b = b_builder
         .protocol(PROTOCOL)
         .build()
         .expect("b embedded endpoint builds");
@@ -326,19 +340,25 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
         b_events.extend(b.poll(now).expect("b polls"));
 
         let a_discovered = a_events.iter().any(|event| {
-            matches!(event, PortableMdnsEvent::Discovery(DiscoveryEvent::PeerDiscovered { peer, addrs, .. })
-                if peer == &b_peer && !addrs.is_empty())
+            matches!(event,
+                SmoltcpEvent::Discovery(
+                    DiscoveryEvent::PeerDiscovered { peer, addrs, source: minip2p::DiscoverySource::Mdns }
+                    | DiscoveryEvent::PeerUpdated { peer, addrs, source: minip2p::DiscoverySource::Mdns }
+                ) if peer == &b_peer && !addrs.is_empty())
         });
         let b_discovered = b_events.iter().any(|event| {
-            matches!(event, PortableMdnsEvent::Discovery(DiscoveryEvent::PeerDiscovered { peer, addrs, .. })
-                if peer == &a_peer && !addrs.is_empty())
+            matches!(event,
+                SmoltcpEvent::Discovery(
+                    DiscoveryEvent::PeerDiscovered { peer, addrs, source: minip2p::DiscoverySource::Mdns }
+                    | DiscoveryEvent::PeerUpdated { peer, addrs, source: minip2p::DiscoverySource::Mdns }
+                ) if peer == &a_peer && !addrs.is_empty())
         });
         let a_ready = a_events.iter().any(|event| {
-            matches!(event, PortableMdnsEvent::Endpoint(SwarmEvent::PeerReady { peer_id, .. })
+            matches!(event, SmoltcpEvent::Endpoint(SwarmEvent::PeerReady { peer_id, .. })
                 if peer_id == &b_peer)
         });
         let b_ready = b_events.iter().any(|event| {
-            matches!(event, PortableMdnsEvent::Endpoint(SwarmEvent::PeerReady { peer_id, .. })
+            matches!(event, SmoltcpEvent::Endpoint(SwarmEvent::PeerReady { peer_id, .. })
                 if peer_id == &a_peer)
         });
         if a_ready && b_ready && !ping_started {
@@ -346,10 +366,27 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
             ping_started = true;
         }
         let ping_finished = a_events.iter().any(|event| {
-            matches!(event, PortableMdnsEvent::Endpoint(SwarmEvent::PingRttMeasured { peer_id, .. })
+            matches!(event, SmoltcpEvent::Endpoint(SwarmEvent::PingRttMeasured { peer_id, .. })
                 if peer_id == &b_peer)
         });
-        if a_discovered && b_discovered && a_ready && b_ready && ping_finished {
+        #[cfg(feature = "pubsub")]
+        let a_merged = a.known_peers().iter().any(|known| {
+            known.peer == b_peer && !known.beacon_addrs.is_empty() && !known.mdns_addrs.is_empty()
+        });
+        #[cfg(feature = "pubsub")]
+        let b_merged = b.known_peers().iter().any(|known| {
+            known.peer == a_peer && !known.beacon_addrs.is_empty() && !known.mdns_addrs.is_empty()
+        });
+        #[cfg(not(feature = "pubsub"))]
+        let (a_merged, b_merged) = (true, true);
+        if a_discovered
+            && b_discovered
+            && a_ready
+            && b_ready
+            && ping_finished
+            && a_merged
+            && b_merged
+        {
             assert_eq!(a.stats().ready_peers, 1);
             assert_eq!(b.stats().ready_peers, 1);
             return;
@@ -363,4 +400,227 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
     }
 
     panic!("mDNS endpoint gate did not finish\n  a: {a_events:?}\n  b: {b_events:?}");
+}
+
+#[test]
+#[cfg(feature = "pubsub")]
+fn portable_pubsub_delivers_over_the_composed_smoltcp_endpoint() {
+    let wire = Wire::default();
+    let a_identity = identity(61);
+    let b_identity = identity(62);
+    let b_peer = b_identity.peer_id();
+    let mut a = Endpoint::portable(&a_identity, CountingEntropy(70))
+        .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
+        .pubsub_config(FloodsubConfig::default())
+        .build()
+        .expect("a endpoint builds");
+    let mut b = Endpoint::portable(&b_identity, CountingEntropy(80))
+        .smoltcp(stack(wire.listener_device(), &format!("{LISTENER_IP}/24")))
+        .listen(format!("/ip4/{LISTENER_IP}/tcp/4001"))
+        .pubsub_config(FloodsubConfig::default())
+        .build()
+        .expect("b endpoint builds");
+    a.subscribe(TOPIC, Now::from_millis(0))
+        .expect("a subscribes");
+    b.subscribe(TOPIC, Now::from_millis(0))
+        .expect("b subscribes");
+    a.dial(
+        &PeerAddr::new(
+            format!("/ip4/{LISTENER_IP}/tcp/4001").parse().unwrap(),
+            b_peer.clone(),
+        )
+        .unwrap(),
+    )
+    .expect("dial starts");
+
+    let mut now_ms = 0;
+    let mut published = false;
+    let mut a_events = Vec::new();
+    let mut b_events = Vec::new();
+    for _ in 0..MAX_STEPS {
+        let now = Now::from_millis(now_ms);
+        a_events.extend(a.poll(now).expect("a polls"));
+        b_events.extend(b.poll(now).expect("b polls"));
+        let remote_subscribed = a_events.iter().any(|event| {
+            matches!(event, SmoltcpEvent::Pubsub(PubsubEvent::PeerSubscribed { peer, topic })
+                if peer == &b_peer && topic == TOPIC)
+        });
+        if remote_subscribed && !published {
+            a.publish(TOPIC, PAYLOAD, now).expect("message publishes");
+            published = true;
+        }
+        if b_events.iter().any(|event| {
+            matches!(event, SmoltcpEvent::Pubsub(PubsubEvent::Message { topics, data, signed: true, .. })
+                if topics.iter().any(|topic| topic == TOPIC) && data == PAYLOAD)
+        }) {
+            return;
+        }
+        if wire.is_quiet() {
+            let deadline = PollDeadline::earliest_opt(a.next_deadline(now), b.next_deadline(now))
+                .unwrap_or_else(|| panic!("pubsub endpoints wedged"));
+            now_ms = now_ms.max(deadline.as_millis());
+        }
+    }
+    panic!("portable pubsub did not deliver\n  a: {a_events:?}\n  b: {b_events:?}");
+}
+
+#[test]
+#[cfg(feature = "pubsub")]
+fn signed_discovery_reserves_its_pubsub_topic() {
+    const RESERVED: &str = "/minip2p/test/reserved-discovery";
+    let identity = identity(83);
+    let mut endpoint = Endpoint::portable(&identity, CountingEntropy(84))
+        .smoltcp(stack(
+            Wire::default().dialer_device(),
+            &format!("{DIALER_IP}/24"),
+        ))
+        .pubsub_config(FloodsubConfig::default())
+        .beacon_config(BeaconConfig {
+            topic: RESERVED.into(),
+            ..BeaconConfig::default()
+        })
+        .build()
+        .expect("discovery endpoint builds");
+    let now = Now::from_millis(0);
+
+    assert_eq!(
+        endpoint.unsubscribe(RESERVED, now),
+        Err(SmoltcpPubsubError::DiscoveryTopicReserved)
+    );
+    assert_eq!(
+        endpoint.publish(RESERVED, b"not a beacon", now),
+        Err(SmoltcpPubsubError::DiscoveryTopicReserved)
+    );
+}
+
+#[test]
+#[cfg(feature = "pubsub")]
+fn beacon_backpressure_preserves_events_and_does_not_fail_poll() {
+    let wire = Wire::default();
+    let a_identity = identity(85);
+    let b_identity = identity(86);
+    let b_peer = b_identity.peer_id();
+    let flood = FloodsubConfig {
+        max_pending_per_peer: 0,
+        ..FloodsubConfig::default()
+    };
+    let beacon = BeaconConfig {
+        beacon_interval_ms: 1,
+        ..BeaconConfig::default()
+    };
+    let mut a = Endpoint::portable(&a_identity, CountingEntropy(87))
+        .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
+        .listen(format!("/ip4/{DIALER_IP}/tcp/4001"))
+        .pubsub_config(flood.clone())
+        .beacon_config(beacon.clone())
+        .build()
+        .expect("a endpoint builds");
+    let mut b = Endpoint::portable(&b_identity, CountingEntropy(88))
+        .smoltcp(stack(wire.listener_device(), &format!("{LISTENER_IP}/24")))
+        .listen(format!("/ip4/{LISTENER_IP}/tcp/4001"))
+        .pubsub_config(flood)
+        .beacon_config(beacon)
+        .build()
+        .expect("b endpoint builds");
+    a.subscribe(TOPIC, Now::from_millis(0))
+        .expect("a subscribes to application topic");
+    b.subscribe(TOPIC, Now::from_millis(0))
+        .expect("b subscribes to application topic");
+    a.dial(
+        &PeerAddr::new(
+            format!("/ip4/{LISTENER_IP}/tcp/4001").parse().unwrap(),
+            b_peer.clone(),
+        )
+        .unwrap(),
+    )
+    .expect("dial starts");
+
+    let mut now_ms = 0;
+    for _ in 0..MAX_STEPS {
+        let now = Now::from_millis(now_ms);
+        let a_events = a.poll(now).expect("beacon backpressure is best-effort");
+        let _ = b.poll(now).expect("b polls");
+        if a_events.iter().any(|event| {
+            matches!(event, SmoltcpEvent::Pubsub(PubsubEvent::PeerSubscribed { peer, topic })
+                if peer == &b_peer && topic == TOPIC)
+        }) {
+            return;
+        }
+        if wire.is_quiet() {
+            let deadline = PollDeadline::earliest_opt(a.next_deadline(now), b.next_deadline(now))
+                .expect("connected discovery endpoints retain a deadline");
+            now_ms = now_ms.max(deadline.as_millis());
+        }
+    }
+    panic!("remote subscription was lost while beacon publication was backpressured");
+}
+
+#[test]
+#[cfg(feature = "pubsub")]
+fn signed_beacons_populate_discovery_without_mdns() {
+    let wire = Wire::default();
+    let a_identity = identity(91);
+    let b_identity = identity(92);
+    let a_peer = a_identity.peer_id();
+    let b_peer = b_identity.peer_id();
+    let mut a = Endpoint::portable(&a_identity, CountingEntropy(100))
+        .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
+        .listen(format!("/ip4/{DIALER_IP}/tcp/4001"))
+        .pubsub_config(FloodsubConfig::default())
+        .discovery()
+        .build()
+        .expect("a endpoint builds");
+    let mut b = Endpoint::portable(&b_identity, CountingEntropy(110))
+        .smoltcp(stack(wire.listener_device(), &format!("{LISTENER_IP}/24")))
+        .listen(format!("/ip4/{LISTENER_IP}/tcp/4001"))
+        .pubsub_config(FloodsubConfig::default())
+        .discovery()
+        .build()
+        .expect("b endpoint builds");
+    a.dial(
+        &PeerAddr::new(
+            format!("/ip4/{LISTENER_IP}/tcp/4001").parse().unwrap(),
+            b_peer.clone(),
+        )
+        .unwrap(),
+    )
+    .expect("bootstrap dial starts");
+
+    let mut now_ms = 0;
+    let mut a_events = Vec::new();
+    let mut b_events = Vec::new();
+    for _ in 0..MAX_STEPS {
+        let now = Now::from_millis(now_ms);
+        a_events.extend(a.poll(now).expect("a polls"));
+        b_events.extend(b.poll(now).expect("b polls"));
+        let a_saw_b = a_events.iter().any(|event| {
+            matches!(event, SmoltcpEvent::Discovery(DiscoveryEvent::PeerDiscovered {
+                peer, source: minip2p::DiscoverySource::SignedBeacon, ..
+            }) if peer == &b_peer)
+        });
+        let b_saw_a = b_events.iter().any(|event| {
+            matches!(event, SmoltcpEvent::Discovery(DiscoveryEvent::PeerDiscovered {
+                peer, source: minip2p::DiscoverySource::SignedBeacon, ..
+            }) if peer == &a_peer)
+        });
+        if a_saw_b && b_saw_a {
+            assert!(a.known_peers().iter().any(|known| {
+                known.peer == b_peer
+                    && !known.beacon_addrs.is_empty()
+                    && known.mdns_addrs.is_empty()
+            }));
+            assert!(b.known_peers().iter().any(|known| {
+                known.peer == a_peer
+                    && !known.beacon_addrs.is_empty()
+                    && known.mdns_addrs.is_empty()
+            }));
+            return;
+        }
+        if wire.is_quiet() {
+            let deadline = PollDeadline::earliest_opt(a.next_deadline(now), b.next_deadline(now))
+                .unwrap_or_else(|| panic!("discovery endpoints wedged"));
+            now_ms = now_ms.max(deadline.as_millis());
+        }
+    }
+    panic!("signed discovery did not converge\n  a: {a_events:?}\n  b: {b_events:?}");
 }
