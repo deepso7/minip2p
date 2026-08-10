@@ -12,10 +12,11 @@ use minip2p::smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken
 use minip2p::smoltcp::time::Instant;
 use minip2p::smoltcp::wire::{HardwareAddress, IpCidr};
 use minip2p::{
-    Ed25519Keypair, Endpoint, EntropySource, Multiaddr, NatConfig, NatEvent, Now, Path, PeerAddr,
-    PeerId, ReservationPolicy, SmoltcpEvent, SmoltcpStack, StreamId, SwarmEvent,
+    DriverError, Ed25519Keypair, Endpoint, EntropySource, Multiaddr, NatConfig, NatEvent, Now,
+    Path, PeerAddr, PeerId, ReservationPolicy, SmoltcpEvent, SmoltcpStack, StreamId, SwarmError,
+    SwarmEvent,
 };
-use minip2p_nat::{HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
+use minip2p_nat::{AUTONAT_PROTOCOL_ID, HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 use minip2p_platform::EntropyError;
 use minip2p_test_support::{ConnectRequestOutcome, PendingConnectId, RelayEmulator};
 
@@ -438,4 +439,94 @@ fn portable_relay_rejects_udp_traversal_policy() {
         .err()
         .expect("DCUtR policy is rejected");
     assert!(error.to_string().contains("DCUtR is QUIC-only"));
+}
+
+#[test]
+fn portable_relay_and_autonat_compose_and_register_their_protocols() {
+    let bus = VirtualBus::new(1);
+    let local = identity(126);
+    let relay = identity(127);
+    let server = identity(128);
+    let remote = identity(129).peer_id();
+    let relay_addr = PeerAddr::new(
+        format!("/ip4/{RELAY_IP}/tcp/4001").parse().unwrap(),
+        relay.peer_id(),
+    )
+    .unwrap();
+    let server_addr = PeerAddr::new(
+        "/ip4/192.168.42.4/tcp/4001".parse().unwrap(),
+        server.peer_id(),
+    )
+    .unwrap();
+    let config = NatConfig {
+        relays: vec![relay_addr],
+        autonat_servers: vec![server_addr],
+        force_relay: true,
+        reservation_policy: ReservationPolicy::Always,
+        ..NatConfig::default()
+    };
+    let mut endpoint = Endpoint::portable(&local, CountingEntropy(50))
+        .smoltcp(stack(bus.device(0), A_IP))
+        .portable_nat_config(config)
+        .build()
+        .expect("relay and AutoNAT policy composes");
+
+    for protocol in [AUTONAT_PROTOCOL_ID, HOP_PROTOCOL_ID, STOP_PROTOCOL_ID] {
+        assert!(matches!(
+            endpoint.open_stream(&remote, protocol, Now::from_millis(0)),
+            Err(DriverError::Swarm(SwarmError::NotConnected { .. }))
+        ));
+    }
+}
+
+#[test]
+fn connect_relay_rejects_an_autonat_only_policy() {
+    let bus = VirtualBus::new(1);
+    let local = identity(130);
+    let server = identity(131);
+    let server_addr = PeerAddr::new(
+        "/ip4/192.168.42.4/tcp/4001".parse().unwrap(),
+        server.peer_id(),
+    )
+    .unwrap();
+    let mut endpoint = Endpoint::portable(&local, CountingEntropy(51))
+        .smoltcp(stack(bus.device(0), A_IP))
+        .autonat(server_addr)
+        .build()
+        .expect("AutoNAT-only policy builds with relay code available");
+
+    assert_eq!(
+        endpoint.connect_relay(&identity(132).peer_id(), Now::from_millis(0)),
+        Err(minip2p::SmoltcpRelayError::NotEnabled)
+    );
+}
+
+#[test]
+fn relay_preserves_an_explicit_reservation_policy() {
+    let bus = VirtualBus::new(2);
+    let local = identity(133);
+    let relay = identity(134);
+    let relay_addr = PeerAddr::new(
+        format!("/ip4/{RELAY_IP}/tcp/4001").parse().unwrap(),
+        relay.peer_id(),
+    )
+    .unwrap();
+    let config = NatConfig {
+        reservation_policy: ReservationPolicy::Always,
+        ..NatConfig::default()
+    };
+    let mut endpoint = Endpoint::portable(&local, CountingEntropy(52))
+        .smoltcp(stack(bus.device(0), A_IP))
+        .portable_nat_config(config)
+        .relay(relay_addr)
+        .build()
+        .expect("adding a relay completes the reservation policy");
+
+    let now = Now::from_millis(0);
+    endpoint.poll(now).expect("reservation schedules a dial");
+    endpoint.poll(now).expect("reservation dial drives TCP");
+    assert!(
+        !bus.is_quiet(),
+        "ReservationPolicy::Always must survive the .relay() merge"
+    );
 }

@@ -80,9 +80,33 @@ one `SmoltcpEvent` enum, and automatically dials newly observed peers.
 timelines. Manual provider composition remains available through
 `build(transport)`.
 
-Portable relay circuits are opt-in so TCP-only devices do not carry the NAT
-or circuit state machines. Enable `portable-relay` (which includes `smoltcp`),
-configure a relay, and drive connection progress through the same endpoint:
+Portable AutoNAT is opt-in, and does not pull circuit transport state into an
+AutoNAT-only binary. Enable `portable-autonat`, configure one or more trusted
+servers, and read the latest verdict from the same caller-driven endpoint:
+
+```rust,ignore
+let mut endpoint = Endpoint::portable(&identity, entropy)
+    .smoltcp(stack)
+    .listen("/ip4/0.0.0.0/tcp/4001")
+    .autonat(autonat_server)
+    .build()?;
+
+for event in endpoint.poll(now)? {
+    // ReachabilityChanged is emitted after enough server verdicts agree.
+    // Handle that and ordinary endpoint events here.
+}
+let reachability = endpoint.reachability();
+```
+
+Once at least one TCP listen address exists, the first due `poll(now)` starts a
+probe by dialing the configured server. Successful exchanges emit
+`SmoltcpEvent::Nat(NatEvent::ReachabilityChanged { .. })` after the configured
+confidence threshold is met; `reachability()` then returns that same settled
+verdict. Until a server exchange succeeds, it remains `Unknown`.
+
+Portable relay circuits remain a separate opt-in. Enable `portable-relay`
+(which includes `portable-autonat` and `smoltcp`), configure a relay, and drive
+connection progress through the same endpoint:
 
 ```rust,ignore
 let mut endpoint = Endpoint::portable(&identity, entropy)
@@ -99,9 +123,10 @@ while endpoint.path(&remote_peer).is_none() {
 ```
 
 `.relay()` selects a relay-only path and does not reserve inbound capacity.
-Use `.relay_config(...)` with `ReservationPolicy::Always` for a device that
-must remain reachable through the relay. Raw-UDP DCUtR actions are not run by
-the TCP-only portable endpoint.
+Use `.portable_nat_config(...)` (or its `.relay_config(...)` alias) to combine
+AutoNAT servers with relay policy, and `ReservationPolicy::Always` for a device
+that must remain reachable through the relay. Raw-UDP DCUtR actions are not run
+by the TCP-only portable endpoint.
 
 ## Transports
 

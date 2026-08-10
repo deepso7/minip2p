@@ -170,6 +170,128 @@ fn endpoint(device: VirtualDevice, cidr: &str, identity: &Ed25519Keypair, seed: 
         .expect("portable endpoint builds")
 }
 
+#[test]
+#[cfg(feature = "portable-autonat")]
+fn portable_autonat_builds_without_relay_state() {
+    let local = identity(120);
+    let server = identity(121);
+    let wire = Wire::default();
+    let server_addr = PeerAddr::new(
+        "/ip4/192.168.1.9/tcp/4001"
+            .parse()
+            .expect("valid AutoNAT address"),
+        server.peer_id(),
+    )
+    .expect("valid AutoNAT peer address");
+
+    let mut endpoint = Endpoint::portable(&local, CountingEntropy(122))
+        .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
+        .listen(format!("/ip4/{DIALER_IP}/tcp/4001"))
+        .autonat(server_addr)
+        .build()
+        .expect("portable AutoNAT endpoint builds");
+
+    assert_eq!(endpoint.reachability(), minip2p::ReachabilityState::Unknown);
+    assert_eq!(endpoint.stats().listen_addresses.len(), 1);
+
+    let now = Now::from_millis(0);
+    endpoint.poll(now).expect("AutoNAT schedules its probe");
+    endpoint.poll(now).expect("scheduled probe drives TCP");
+    assert!(
+        !wire.is_quiet(),
+        "AutoNAT must dial its configured server after receiving listen addresses"
+    );
+}
+
+#[test]
+#[cfg(feature = "portable-autonat")]
+fn portable_nat_rejects_an_empty_policy() {
+    let local = identity(123);
+    let result = Endpoint::portable(&local, CountingEntropy(124))
+        .smoltcp(stack(
+            Wire::default().dialer_device(),
+            &format!("{DIALER_IP}/24"),
+        ))
+        .portable_nat_config(minip2p::NatConfig::default())
+        .build();
+    let error = match result {
+        Ok(_) => panic!("empty portable NAT policy must be invalid"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("at least one relay or AutoNAT server")
+    );
+}
+
+#[test]
+#[cfg(all(feature = "portable-autonat", not(feature = "portable-relay")))]
+fn portable_autonat_rejects_relay_addresses_without_relay_support() {
+    let local = identity(125);
+    let relay = identity(126);
+    let relay_addr = PeerAddr::new(
+        "/ip4/192.168.1.10/tcp/4001".parse().unwrap(),
+        relay.peer_id(),
+    )
+    .unwrap();
+    let config = minip2p::NatConfig {
+        relays: vec![relay_addr],
+        force_relay: true,
+        reservation_policy: minip2p::ReservationPolicy::Never,
+        ..minip2p::NatConfig::default()
+    };
+
+    let result = Endpoint::portable(&local, CountingEntropy(127))
+        .smoltcp(stack(
+            Wire::default().dialer_device(),
+            &format!("{DIALER_IP}/24"),
+        ))
+        .portable_nat_config(config)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("relay addresses must require portable-relay"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("relay addresses require the portable-relay feature")
+    );
+}
+
+#[test]
+#[cfg(feature = "portable-autonat")]
+fn portable_autonat_rejects_reservation_policy_without_a_relay() {
+    let local = identity(128);
+    let server = identity(129);
+    let config = minip2p::NatConfig {
+        autonat_servers: vec![
+            PeerAddr::new(
+                "/ip4/192.168.1.9/tcp/4001".parse().unwrap(),
+                server.peer_id(),
+            )
+            .unwrap(),
+        ],
+        reservation_policy: minip2p::ReservationPolicy::Always,
+        ..minip2p::NatConfig::default()
+    };
+
+    let result = Endpoint::portable(&local, CountingEntropy(130))
+        .smoltcp(stack(
+            Wire::default().dialer_device(),
+            &format!("{DIALER_IP}/24"),
+        ))
+        .portable_nat_config(config)
+        .build();
+    let error = match result {
+        Ok(_) => panic!("reservation policy without a relay must be invalid"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("requires at least one relay"));
+}
+
 fn has_ready(events: &[SwarmEvent], peer: &PeerId) -> bool {
     events.iter().any(|event| {
         matches!(event, SwarmEvent::PeerReady { peer_id, protocols }

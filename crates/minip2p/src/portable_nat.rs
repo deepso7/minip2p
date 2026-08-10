@@ -1,18 +1,26 @@
-//! Caller-driven wiring between `NatAgent` and a portable circuit transport.
+//! Caller-driven wiring between `NatAgent` and a portable TCP endpoint.
 
-use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::collections::VecDeque;
+#[cfg(feature = "portable-relay")]
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
+#[cfg(feature = "portable-relay")]
 use minip2p_circuit::{AdoptError, BridgeAdoption, CircuitRole};
-use minip2p_core::{Multiaddr, PeerId, Protocol};
+#[cfg(feature = "portable-relay")]
+use minip2p_core::Protocol;
+use minip2p_core::{Multiaddr, PeerId};
 use minip2p_nat::{
-    BridgeRole, ConnectId, NatAction, NatAgent, NatEvent, Now as NatNow, Path, PromoteError,
-    ReservationInfo,
+    BridgeRole, NatAction, NatAgent, NatEvent, NatToken, Now as NatNow, PromoteError,
 };
+#[cfg(feature = "portable-relay")]
+use minip2p_nat::{ConnectId, Path, ReservationInfo};
 use minip2p_platform::{EntropySource, Now, SharedEntropy};
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
+use minip2p_transport::{ConnectionId, StreamId};
+#[cfg(feature = "portable-relay")]
+use minip2p_transport::{Transport, TransportError};
 
 use crate::{PortableEndpoint, SmoltcpComposedTransport, smoltcp};
 
@@ -21,22 +29,32 @@ type Endpoint<D, E> = PortableEndpoint<SmoltcpComposedTransport<D, E>, SharedEnt
 pub(crate) struct PortableNatDriver {
     pub(crate) agent: NatAgent,
     pub(crate) events: VecDeque<NatEvent>,
+    #[cfg(feature = "portable-relay")]
     relay_addrs: Vec<(PeerId, Multiaddr)>,
+    #[cfg(feature = "portable-relay")]
     reserved_relays: Vec<(PeerId, Multiaddr)>,
     public_addrs: Vec<Multiaddr>,
+    #[cfg(feature = "portable-relay")]
     promoted: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
+    #[cfg(feature = "portable-relay")]
     paths: BTreeMap<PeerId, Path>,
 }
 
 impl PortableNatDriver {
     pub(crate) fn new(agent: NatAgent, relay_addrs: Vec<(PeerId, Multiaddr)>) -> Self {
+        #[cfg(not(feature = "portable-relay"))]
+        let _ = relay_addrs;
         Self {
             agent,
             events: VecDeque::new(),
+            #[cfg(feature = "portable-relay")]
             relay_addrs,
+            #[cfg(feature = "portable-relay")]
             reserved_relays: Vec::new(),
             public_addrs: Vec::new(),
+            #[cfg(feature = "portable-relay")]
             promoted: BTreeMap::new(),
+            #[cfg(feature = "portable-relay")]
             paths: BTreeMap::new(),
         }
     }
@@ -48,18 +66,27 @@ impl PortableNatDriver {
         }
     }
 
+    #[cfg(feature = "portable-relay")]
     pub(crate) fn connect(&mut self, peer: PeerId, now: Now) -> ConnectId {
         self.agent.connect(peer, Vec::new(), Self::now(now))
     }
 
+    #[cfg(feature = "portable-relay")]
+    pub(crate) fn relay_enabled(&self) -> bool {
+        !self.relay_addrs.is_empty()
+    }
+
+    #[cfg(feature = "portable-relay")]
     pub(crate) fn cancel(&mut self, id: ConnectId, now: Now) {
         self.agent.cancel(id, Self::now(now));
     }
 
+    #[cfg(feature = "portable-relay")]
     pub(crate) fn path(&self, peer: &PeerId) -> Option<Path> {
         self.paths.get(peer).cloned()
     }
 
+    #[cfg(feature = "portable-relay")]
     pub(crate) fn active_reservation(&self) -> Option<ReservationInfo> {
         self.agent.active_reservation().cloned()
     }
@@ -83,11 +110,17 @@ impl PortableNatDriver {
             self.agent
                 .handle_event_with_disposition_classified(event, is_circuit, Self::now(now));
         if let SwarmEvent::ConnectionClosed { peer_id, conn_id } = event {
+            #[cfg(feature = "portable-relay")]
             self.promoted
                 .retain(|(inner_conn, _), circuit| inner_conn != conn_id && circuit != conn_id);
+            #[cfg(not(feature = "portable-relay"))]
+            let _ = conn_id;
+            #[cfg(feature = "portable-relay")]
             if !endpoint.connected_peers().contains(peer_id) {
                 self.paths.remove(peer_id);
             }
+            #[cfg(not(feature = "portable-relay"))]
+            let _ = peer_id;
         }
         self.pump(endpoint, now);
         handled
@@ -98,6 +131,8 @@ impl PortableNatDriver {
         endpoint: &mut Endpoint<D, E>,
         now: Now,
     ) {
+        self.agent
+            .set_listen_addrs(&endpoint.stats().listen_addresses);
         if self.agent.next_timeout(now.monotonic_ms) == Some(0) {
             self.agent.handle_tick(Self::now(now));
         }
@@ -124,13 +159,16 @@ impl PortableNatDriver {
                 break;
             }
         }
-        let active: BTreeSet<_> = endpoint
-            .runtime()
-            .transport()
-            .circuit_ids()
-            .into_iter()
-            .collect();
-        self.promoted.retain(|_, id| active.contains(id));
+        #[cfg(feature = "portable-relay")]
+        {
+            let active: BTreeSet<_> = endpoint
+                .runtime()
+                .transport()
+                .circuit_ids()
+                .into_iter()
+                .collect();
+            self.promoted.retain(|_, id| active.contains(id));
+        }
     }
 
     fn execute<D: smoltcp::phy::Device, E: EntropySource>(
@@ -184,62 +222,117 @@ impl PortableNatDriver {
                 role,
                 pending_data,
                 remote_write_closed,
-            } => {
-                let key = (inner_conn, stream_id);
-                if let Some(existing) = self.promoted.get(&key).copied() {
-                    self.agent.promote_result(token, Ok(existing), nat_now);
-                    return;
-                }
-                endpoint.runtime_mut().forget_stream(inner_conn, stream_id);
-                let adoption = BridgeAdoption {
-                    inner_conn,
-                    bridge_stream: stream_id,
-                    relay,
-                    remote_peer,
-                    role: match role {
-                        BridgeRole::Initiator => CircuitRole::Initiator,
-                        BridgeRole::Responder => CircuitRole::Responder,
-                    },
-                    pending_data,
-                    remote_write_closed,
-                };
-                match endpoint
-                    .runtime_mut()
-                    .transport_mut()
-                    .adopt_bridge(adoption)
-                {
-                    Ok(conn_id) => {
-                        self.promoted.insert(key, conn_id);
-                        self.agent.promote_result(token, Ok(conn_id), nat_now);
-                    }
-                    Err(error) => {
-                        let promoted = match &error {
-                            AdoptError::PeerAlreadyDirect => PromoteError::PeerAlreadyDirect,
-                            AdoptError::UnknownConnection => PromoteError::UnknownConnection,
-                            _ => PromoteError::Failed(error.to_string()),
-                        };
-                        self.agent.promote_result(token, Err(promoted), nat_now);
-                        if !matches!(error, AdoptError::UnknownConnection) {
-                            let _ = endpoint
-                                .runtime_mut()
-                                .transport_mut()
-                                .inner_mut()
-                                .reset_stream(inner_conn, stream_id);
-                        }
-                    }
-                }
-            }
+            } => self.promote_bridge(
+                token,
+                inner_conn,
+                relay,
+                stream_id,
+                remote_peer,
+                role,
+                pending_data,
+                remote_write_closed,
+                endpoint,
+                nat_now,
+            ),
             NatAction::CloseCircuit { conn_id } => {
-                let result = endpoint.runtime_mut().transport_mut().close(conn_id);
-                if result.is_ok()
-                    || matches!(result, Err(TransportError::ConnectionNotFound { .. }))
+                #[cfg(feature = "portable-relay")]
                 {
-                    self.promoted.retain(|_, id| *id != conn_id);
+                    let result = endpoint.runtime_mut().transport_mut().close(conn_id);
+                    if result.is_ok()
+                        || matches!(result, Err(TransportError::ConnectionNotFound { .. }))
+                    {
+                        self.promoted.retain(|_, id| *id != conn_id);
+                    }
+                }
+                #[cfg(not(feature = "portable-relay"))]
+                let _ = conn_id;
+            }
+        }
+    }
+
+    #[cfg(feature = "portable-relay")]
+    #[allow(clippy::too_many_arguments)]
+    fn promote_bridge<D: smoltcp::phy::Device, E: EntropySource>(
+        &mut self,
+        token: NatToken,
+        inner_conn: ConnectionId,
+        relay: PeerId,
+        stream_id: StreamId,
+        remote_peer: PeerId,
+        role: BridgeRole,
+        pending_data: Vec<u8>,
+        remote_write_closed: bool,
+        endpoint: &mut Endpoint<D, E>,
+        now: NatNow,
+    ) {
+        let key = (inner_conn, stream_id);
+        if let Some(existing) = self.promoted.get(&key).copied() {
+            self.agent.promote_result(token, Ok(existing), now);
+            return;
+        }
+        endpoint.runtime_mut().forget_stream(inner_conn, stream_id);
+        let adoption = BridgeAdoption {
+            inner_conn,
+            bridge_stream: stream_id,
+            relay,
+            remote_peer,
+            role: match role {
+                BridgeRole::Initiator => CircuitRole::Initiator,
+                BridgeRole::Responder => CircuitRole::Responder,
+            },
+            pending_data,
+            remote_write_closed,
+        };
+        match endpoint
+            .runtime_mut()
+            .transport_mut()
+            .adopt_bridge(adoption)
+        {
+            Ok(conn_id) => {
+                self.promoted.insert(key, conn_id);
+                self.agent.promote_result(token, Ok(conn_id), now);
+            }
+            Err(error) => {
+                let promoted = match &error {
+                    AdoptError::PeerAlreadyDirect => PromoteError::PeerAlreadyDirect,
+                    AdoptError::UnknownConnection => PromoteError::UnknownConnection,
+                    _ => PromoteError::Failed(error.to_string()),
+                };
+                self.agent.promote_result(token, Err(promoted), now);
+                if !matches!(error, AdoptError::UnknownConnection) {
+                    let _ = endpoint
+                        .runtime_mut()
+                        .transport_mut()
+                        .inner_mut()
+                        .reset_stream(inner_conn, stream_id);
                 }
             }
         }
     }
 
+    #[cfg(not(feature = "portable-relay"))]
+    #[allow(clippy::too_many_arguments)]
+    fn promote_bridge<D: smoltcp::phy::Device, E: EntropySource>(
+        &mut self,
+        token: NatToken,
+        _inner_conn: ConnectionId,
+        _relay: PeerId,
+        _stream_id: StreamId,
+        _remote_peer: PeerId,
+        _role: BridgeRole,
+        _pending_data: Vec<u8>,
+        _remote_write_closed: bool,
+        _endpoint: &mut Endpoint<D, E>,
+        now: NatNow,
+    ) {
+        self.agent.promote_result(
+            token,
+            Err(PromoteError::Failed("portable relay is not enabled".into())),
+            now,
+        );
+    }
+
+    #[cfg(feature = "portable-relay")]
     fn inject_straggler<D: smoltcp::phy::Device, E: EntropySource>(
         &mut self,
         event: &SwarmEvent,
@@ -277,22 +370,35 @@ impl PortableNatDriver {
         true
     }
 
+    #[cfg(not(feature = "portable-relay"))]
+    fn inject_straggler<D: smoltcp::phy::Device, E: EntropySource>(
+        &mut self,
+        _event: &SwarmEvent,
+        _endpoint: &mut Endpoint<D, E>,
+    ) -> bool {
+        false
+    }
+
     fn observe<D: smoltcp::phy::Device, E: EntropySource>(
         &mut self,
         event: &NatEvent,
         endpoint: &mut Endpoint<D, E>,
     ) {
         match event {
+            #[cfg(feature = "portable-relay")]
             NatEvent::PathEstablished { peer, path, .. }
             | NatEvent::InboundPathEstablished { peer, path } => {
                 self.paths.insert(peer.clone(), path.clone());
             }
+            #[cfg(feature = "portable-relay")]
             NatEvent::PathUpgraded { peer, to, .. } => {
                 self.paths.insert(peer.clone(), to.clone());
             }
+            #[cfg(feature = "portable-relay")]
             NatEvent::InboundDirectUpgrade { peer } => {
                 self.paths.insert(peer.clone(), Path::DirectPunched);
             }
+            #[cfg(feature = "portable-relay")]
             NatEvent::RelayReserved { relay, .. } => {
                 if self.reserved_relays.iter().any(|(peer, _)| peer == relay) {
                     return;
@@ -307,6 +413,7 @@ impl PortableNatDriver {
                 self.reserved_relays.push((relay.clone(), circuit));
                 self.advertise(endpoint);
             }
+            #[cfg(feature = "portable-relay")]
             NatEvent::RelayReservationLost { relay } => {
                 let before = self.reserved_relays.len();
                 self.reserved_relays.retain(|(peer, _)| peer != relay);
@@ -329,12 +436,18 @@ impl PortableNatDriver {
     }
 
     fn advertise<D: smoltcp::phy::Device, E: EntropySource>(&self, endpoint: &mut Endpoint<D, E>) {
-        let mut addrs = self.public_addrs.clone();
-        for (_, address) in &self.reserved_relays {
-            if !addrs.contains(address) {
-                addrs.push(address.clone());
+        #[cfg(feature = "portable-relay")]
+        let addrs = {
+            let mut addrs = self.public_addrs.clone();
+            for (_, address) in &self.reserved_relays {
+                if !addrs.contains(address) {
+                    addrs.push(address.clone());
+                }
             }
-        }
+            addrs
+        };
+        #[cfg(not(feature = "portable-relay"))]
+        let addrs = self.public_addrs.clone();
         endpoint.set_external_addresses(addrs);
     }
 }

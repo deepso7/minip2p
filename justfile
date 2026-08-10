@@ -18,6 +18,7 @@ check:
     cargo check -p minip2p-rs --no-default-features --features std,tcp
     cargo check -p minip2p-rs --no-default-features --features smoltcp
     cargo check -p minip2p-rs --no-default-features --features smoltcp,pubsub
+    cargo check -p minip2p-rs --no-default-features --features portable-autonat
     cargo check -p minip2p-rs --no-default-features --features portable-relay
     cargo check -p minip2p-rs --features discovery,mdns,tcp
     cargo check -p minip2p-tcp --features smoltcp --all-targets
@@ -32,6 +33,7 @@ clippy:
     cargo clippy -p minip2p-rs --no-default-features --features std,tcp --all-targets -- -D warnings
     cargo clippy -p minip2p-rs --no-default-features --features smoltcp --all-targets -- -D warnings
     cargo clippy -p minip2p-rs --no-default-features --features smoltcp,pubsub --all-targets -- -D warnings
+    cargo clippy -p minip2p-rs --no-default-features --features portable-autonat --all-targets -- -D warnings
     cargo clippy -p minip2p-rs --no-default-features --features portable-relay --all-targets -- -D warnings
     cargo clippy -p minip2p-rs --features discovery,mdns,tcp --all-targets -- -D warnings
     cargo clippy -p minip2p-tcp --features smoltcp --all-targets -- -D warnings
@@ -50,6 +52,7 @@ test:
     cargo test -p minip2p-rs --features discovery,mdns,tcp
     cargo test -p minip2p-rs --no-default-features --features smoltcp
     cargo test -p minip2p-rs --no-default-features --features smoltcp,pubsub
+    cargo test -p minip2p-rs --no-default-features --features portable-autonat
     cargo test -p minip2p-rs --no-default-features --features portable-relay
     cargo test -p minip2p-tcp --features smoltcp
     cargo test -p minip2p-mdns --features smoltcp
@@ -59,6 +62,7 @@ check-nostd:
     cargo check --no-default-features --target thumbv7em-none-eabi -p minip2p-core -p minip2p-platform -p minip2p-identity -p minip2p-transport -p minip2p-tls -p minip2p-noise -p minip2p-yamux -p minip2p-secure-mux -p minip2p-smoltcp -p minip2p-tcp -p minip2p-circuit -p minip2p-identify -p minip2p-multistream-select -p minip2p-ping -p minip2p-pubsub -p minip2p-discovery -p minip2p-mdns -p minip2p-relay -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm -p minip2p-nat -p minip2p-rs
     cargo check --no-default-features --features smoltcp --target thumbv7em-none-eabi -p minip2p-tcp -p minip2p-mdns -p minip2p-rs
     cargo check --no-default-features --features smoltcp,pubsub --target thumbv7em-none-eabi -p minip2p-rs
+    cargo check --no-default-features --features portable-autonat --target thumbv7em-none-eabi -p minip2p-rs
     cargo check --no-default-features --features portable-relay --target thumbv7em-none-eabi -p minip2p-rs
 
 peer-ping:
@@ -75,6 +79,7 @@ docs:
     cargo doc -p minip2p-mdns --features smoltcp --no-deps
     cargo doc -p minip2p-rs --no-default-features --features smoltcp --no-deps
     cargo doc -p minip2p-rs --no-default-features --features smoltcp,pubsub --no-deps
+    cargo doc -p minip2p-rs --no-default-features --features portable-autonat --no-deps
     cargo doc -p minip2p-rs --no-default-features --features portable-relay --no-deps
 
 docs-site:
