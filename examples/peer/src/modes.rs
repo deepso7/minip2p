@@ -695,14 +695,11 @@ fn ping_loop(
                 stats.print_summary();
                 return Err("ping channel closed".into());
             }
-            Event::ConnectionClosed { peer_id, .. } if *peer_id == channel.send_peer => {
-                print_event("dial", &event);
-                stats.print_summary();
-                if drain_deadline.is_some() {
-                    return Ok(());
-                }
-                return Err("connection carrying the ping channel closed".into());
-            }
+            // Connection lifecycle is connection-scoped, while this channel
+            // is peer-scoped. During QUIC supersession the old circuit can
+            // close just before the replacement direct connection is
+            // delivered. The matching StreamClosed event (or a failed send)
+            // is the authoritative signal that this channel itself died.
             _ => print_event("dial", &event),
         }
     }
