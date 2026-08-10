@@ -12,6 +12,7 @@ paths are actually usable.
 | Capability | Cargo selection | Builder activation | Active behavior | Infrastructure |
 | --- | --- | --- | --- | --- |
 | Direct QUIC, Identify, Ping, custom streams | Base | None required | Base swarm driver | A mutually reachable UDP path |
+| Direct TCP | `tcp` | `.tcp(...)`, `.tcp_multiaddr(...)`, or `.bind_tcp(...)` | Noise-authenticated Yamux streams over TCP | A mutually reachable TCP path |
 | Reachability probing | `nat` | `.autonat_server(server)` or a `NatConfig` with probe servers | NAT driver and AutoNAT probes | Reachable AutoNAT server |
 | Relayed connections and DCUtR | `nat` | `.relay(relay)` or relay-bearing `.nat_config(...)` | NAT driver, reservations, relay races, hole punching | Reachable Circuit Relay v2 server |
 | Gossipsub | `pubsub` | `.pubsub()` or gossipsub `.pubsub_config(...)` | Pubsub driver | At least one compatible mesh peer |
@@ -30,6 +31,14 @@ Always available:
 - Streams: `add_protocol`, `open_stream`, `send_stream`,
   `close_stream_write`, `reset_stream`, `abandon_stream`
 - Driving: `poll`, `next_event`, `wait_peer_ready`, `wait_ping_rtt`
+
+## TCP API
+
+Compiled with `features = ["tcp"]`:
+
+- Bind: `tcp`, `tcp_multiaddr`, `bind_tcp`
+- Configuration: `tcp_config`
+- Routing: `/tcp` dial targets are carried by TCP; QUIC targets remain on QUIC
 
 ## NAT API
 
@@ -82,7 +91,7 @@ but not `pubsub`:
 - Lifecycle: `shutdown`
 
 mDNS discovers peers only on multicast-capable local links. Its address claims
-remain unauthenticated until QUIC/TLS verifies the peer identity. Automatic
+remain unauthenticated until the selected transport verifies the peer identity. Automatic
 mDNS-triggered attempts are therefore direct-only and never activate a
 configured relay or HOP CONNECT.
 `Endpoint::shutdown` sends TTL-zero goodbyes and permanently stops mDNS while
@@ -96,7 +105,7 @@ selects the agents and infrastructure used by an endpoint.
 
 | Capability | Configuration | Active behavior | Infrastructure |
 | --- | --- | --- | --- |
-| Direct QUIC, Identify, Ping, custom streams | `secretKey`; optional `listenAddr` and `protocols` | Native driver starts in `Minip2p.create` | A mutually reachable UDP path |
+| Direct QUIC/TCP, Identify, Ping, custom streams | `secretKey`; optional `transports` and `protocols` | Native driver starts in `Minip2p.create`; transport default is dual-stack QUIC only | A mutually reachable UDP or TCP path |
 | Gossipsub | Default, or `pubsubRouter: PubsubRouter.Gossipsub` | Signed outbound pubsub and strict inbound validation | At least one compatible mesh peer |
 | Floodsub | `pubsubRouter: PubsubRouter.Floodsub` | Floodsub routing | At least one floodsub peer |
 | Signed discovery | `discovery: { topic, ... }` | Signed beacons, shared peer book, optional auto-dial | A connected discovery peer |
@@ -119,5 +128,5 @@ cargo doc --workspace --no-deps --open
 To include every optional feature:
 
 ```bash
-cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns --no-deps --open
+cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp --no-deps --open
 ```

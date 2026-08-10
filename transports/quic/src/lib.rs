@@ -14,13 +14,16 @@ use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
 use boring::x509::X509;
 use hmac::{Hmac, KeyInit, Mac};
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol};
+use minip2p_platform::{Deadline, Now};
 use minip2p_transport::{
-    ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
+    BlockingTransport, ConnectionEndpoint, ConnectionId, ConnectionIdAllocator,
+    ConnectionNamespace, StreamId, Transport, TransportError, TransportEvent, WaitHandle,
     WaitOutcome,
 };
 use mio::{Events, Interest, Poll, Token, Waker};
 use quiche::ConnectionId as QuicConnectionId;
 use sha2::Sha256;
+use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 
 /// UDP packet retained after a non-blocking socket reports `WouldBlock`.
 pub(crate) struct PendingDatagram {
@@ -445,12 +448,16 @@ pub struct QuicTransport {
     pending_datagrams: VecDeque<PendingDatagram>,
     /// The socket address we're listening on, if any.
     listen_addr: Option<SocketAddr>,
-    /// Auto-incrementing connection id counter.
-    next_connection_id: u64,
+    /// Connection ids for this socket, namespaced by the family it is bound to
+    /// so a dual-stack pair's two id spaces stay disjoint.
+    connection_ids: ConnectionIdAllocator,
     /// Retained node configuration.
     node_config: QuicNodeConfig,
     /// Per-process secret used to authenticate stateless Retry tokens.
     retry_secret: [u8; 32],
+    /// Most recent host time sample, retained so `next_deadline` can answer on
+    /// the host's timeline. `None` until the first `poll`.
+    last_now: Option<Now>,
 }
 
 /// QUIC endpoint that can be backed by one socket or a dual-stack pair.
@@ -522,25 +529,19 @@ impl ReadinessWait {
     }
 }
 
-/// Cloneable handle that interrupts a QUIC endpoint's current readiness wait.
-#[derive(Clone)]
-pub struct QuicWaitHandle {
-    wakers: Vec<Arc<Waker>>,
-    interrupt_lock: Arc<Mutex<()>>,
-}
-
-impl QuicWaitHandle {
-    /// Interrupts any current wait. Calling this when no wait is active makes
-    /// the next wait return immediately.
-    pub fn interrupt(&self) {
-        let _guard = self
-            .interrupt_lock
+/// Builds a [`WaitHandle`] that wakes every mio waker behind one lock.
+///
+/// The lock keeps a dual-stack interrupt atomic with respect to the alternating
+/// per-family waits, so neither socket can miss the wakeup.
+fn quic_wait_handle(wakers: Vec<Arc<Waker>>, interrupt_lock: Arc<Mutex<()>>) -> WaitHandle {
+    WaitHandle::new(move || {
+        let _guard = interrupt_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for waker in &self.wakers {
+        for waker in &wakers {
             let _ = waker.wake();
         }
-    }
+    })
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -604,6 +605,30 @@ impl QuicEndpoint {
         Self::bind(node_config, &bind.to_string())
     }
 
+    /// Binds one IPv4 and one IPv6 QUIC socket to exact multiaddresses.
+    pub fn bind_dual_multiaddr(
+        node_config: QuicNodeConfig,
+        first: &Multiaddr,
+        second: &Multiaddr,
+    ) -> Result<Self, TransportError> {
+        let first = extract_listen_socket_addr(first, "first dual-stack bind address")?;
+        let second = extract_listen_socket_addr(second, "second dual-stack bind address")?;
+        let (ipv4, ipv6) = match (
+            family_for_socket_addr(first),
+            family_for_socket_addr(second),
+        ) {
+            (AddressFamily::Ipv4, AddressFamily::Ipv6) => (first, second),
+            (AddressFamily::Ipv6, AddressFamily::Ipv4) => (second, first),
+            _ => {
+                return Err(TransportError::InvalidConfig {
+                    reason: "dual-stack QUIC requires one IPv4 and one IPv6 bind address".into(),
+                });
+            }
+        };
+        DualQuicTransport::bind(node_config, &ipv4.to_string(), &ipv6.to_string())
+            .map(|transport| Self::Dual(Box::new(transport)))
+    }
+
     /// Binds IPv4 and IPv6 wildcard UDP sockets.
     pub fn dual_stack(node_config: QuicNodeConfig) -> Result<Self, TransportError> {
         DualQuicTransport::new(node_config).map(|transport| Self::Dual(Box::new(transport)))
@@ -648,23 +673,23 @@ impl QuicEndpoint {
 
     /// Returns a cloneable handle that can interrupt this endpoint's current
     /// readiness wait from another thread.
-    pub fn wait_handle(&self) -> QuicWaitHandle {
-        let (wakers, interrupt_lock) = match self {
-            Self::Single(transport) => (
-                vec![Arc::clone(&transport.readiness.waker)],
-                Arc::new(Mutex::new(())),
-            ),
-            Self::Dual(transport) => (
-                vec![
-                    Arc::clone(&transport.ipv4.readiness.waker),
-                    Arc::clone(&transport.ipv6.readiness.waker),
-                ],
-                Arc::clone(&transport.interrupt_lock),
-            ),
-        };
-        QuicWaitHandle {
-            wakers,
-            interrupt_lock,
+    pub fn wait_handle(&self) -> WaitHandle {
+        BlockingTransport::wait_handle(self)
+    }
+
+    /// The [`ConnectionNamespace`]s this endpoint allocates connection ids in.
+    ///
+    /// One socket mints ids in the namespace of the family it is bound to; a
+    /// dual-stack pair mints in both and keeps the split to itself. A host
+    /// routing several transports needs this to say which ids are QUIC's --
+    /// see `minip2p_transport::TransportSet`.
+    pub fn namespaces(&self) -> Vec<ConnectionNamespace> {
+        match self {
+            Self::Single(transport) => vec![transport.namespace()],
+            Self::Dual(_) => vec![
+                ConnectionNamespace::QUIC_IPV4,
+                ConnectionNamespace::QUIC_IPV6,
+            ],
         }
     }
 }
@@ -693,8 +718,24 @@ fn single_dial_family(
 impl DualQuicTransport {
     /// Binds IPv4 and IPv6 wildcard UDP sockets.
     pub fn new(node_config: QuicNodeConfig) -> Result<Self, TransportError> {
-        let ipv4 = QuicTransport::new(node_config.clone(), DEFAULT_IPV4_BIND)?;
-        let ipv6 = QuicTransport::new(node_config, DEFAULT_IPV6_BIND)?;
+        Self::bind(node_config, DEFAULT_IPV4_BIND, DEFAULT_IPV6_BIND)
+    }
+
+    /// Binds exact IPv4 and IPv6 socket addresses as one dual transport.
+    pub fn bind(
+        node_config: QuicNodeConfig,
+        ipv4_bind: &str,
+        ipv6_bind: &str,
+    ) -> Result<Self, TransportError> {
+        let ipv4 = QuicTransport::new(node_config.clone(), ipv4_bind)?;
+        let ipv6 = QuicTransport::new_ipv6_only(node_config, ipv6_bind)?;
+        if ipv4.namespace() != ConnectionNamespace::QUIC_IPV4
+            || ipv6.namespace() != ConnectionNamespace::QUIC_IPV6
+        {
+            return Err(TransportError::InvalidConfig {
+                reason: "dual-stack QUIC requires IPv4 then IPv6 bind addresses".into(),
+            });
+        }
         Ok(Self {
             ipv4,
             ipv6,
@@ -730,7 +771,7 @@ impl DualQuicTransport {
         let mut last_err = None;
         for (family, addr) in targets {
             match self.transport_mut(family).dial(&addr) {
-                Ok(id) => ids.push(Self::external_id(family, id)),
+                Ok(id) => ids.push(id),
                 Err(err) => last_err = Some(err),
             }
         }
@@ -761,8 +802,7 @@ impl DualQuicTransport {
             });
         };
 
-        let id = self.transport_mut(family).dial(&addr)?;
-        Ok(Self::external_id(family, id))
+        self.transport_mut(family).dial(&addr)
     }
 
     fn dial_targets(
@@ -796,78 +836,18 @@ impl DualQuicTransport {
         }
     }
 
-    fn external_id(family: AddressFamily, id: ConnectionId) -> ConnectionId {
-        let raw = id.as_u64();
-        match family {
-            AddressFamily::Ipv4 => ConnectionId::new(raw.saturating_mul(2).saturating_sub(1)),
-            AddressFamily::Ipv6 => ConnectionId::new(raw.saturating_mul(2)),
-        }
-    }
-
-    fn internal_id(id: ConnectionId) -> (AddressFamily, ConnectionId) {
-        let raw = id.as_u64();
-        if raw.is_multiple_of(2) {
-            (AddressFamily::Ipv6, ConnectionId::new(raw / 2))
+    /// Routes an id back to the socket that minted it.
+    ///
+    /// Each half allocates in its own [`ConnectionNamespace`], so the id needs
+    /// no rewriting on the way in or out.
+    fn family_for_id(id: ConnectionId) -> Result<AddressFamily, TransportError> {
+        let namespace = id.namespace();
+        if namespace == ConnectionNamespace::QUIC_IPV4 {
+            Ok(AddressFamily::Ipv4)
+        } else if namespace == ConnectionNamespace::QUIC_IPV6 {
+            Ok(AddressFamily::Ipv6)
         } else {
-            (AddressFamily::Ipv4, ConnectionId::new(raw.div_ceil(2)))
-        }
-    }
-
-    fn map_event(family: AddressFamily, event: TransportEvent) -> TransportEvent {
-        let map = |id| Self::external_id(family, id);
-        match event {
-            TransportEvent::Connected { id, endpoint } => TransportEvent::Connected {
-                id: map(id),
-                endpoint,
-            },
-            TransportEvent::StreamOpened { id, stream_id } => TransportEvent::StreamOpened {
-                id: map(id),
-                stream_id,
-            },
-            TransportEvent::IncomingStream { id, stream_id } => TransportEvent::IncomingStream {
-                id: map(id),
-                stream_id,
-            },
-            TransportEvent::StreamData {
-                id,
-                stream_id,
-                data,
-            } => TransportEvent::StreamData {
-                id: map(id),
-                stream_id,
-                data,
-            },
-            TransportEvent::StreamRemoteWriteClosed { id, stream_id } => {
-                TransportEvent::StreamRemoteWriteClosed {
-                    id: map(id),
-                    stream_id,
-                }
-            }
-            TransportEvent::StreamClosed { id, stream_id } => TransportEvent::StreamClosed {
-                id: map(id),
-                stream_id,
-            },
-            TransportEvent::Closed { id } => TransportEvent::Closed { id: map(id) },
-            TransportEvent::Error { id, message } => TransportEvent::Error {
-                id: map(id),
-                message,
-            },
-            TransportEvent::IncomingConnection { id, endpoint } => {
-                TransportEvent::IncomingConnection {
-                    id: map(id),
-                    endpoint,
-                }
-            }
-            TransportEvent::PeerIdentityVerified {
-                id,
-                endpoint,
-                previous_peer_id,
-            } => TransportEvent::PeerIdentityVerified {
-                id: map(id),
-                endpoint,
-                previous_peer_id,
-            },
-            TransportEvent::Listening { addr } => TransportEvent::Listening { addr },
+            Err(TransportError::ConnectionNotFound { id })
         }
     }
 }
@@ -879,6 +859,37 @@ impl QuicTransport {
             reason: format!("failed to bind udp socket: {e}"),
         })?;
 
+        Self::from_socket(node_config, socket)
+    }
+
+    fn new_ipv6_only(node_config: QuicNodeConfig, bind_addr: &str) -> Result<Self, TransportError> {
+        let bind_addr =
+            bind_addr
+                .parse::<SocketAddr>()
+                .map_err(|e| TransportError::InvalidAddress {
+                    context: "ipv6 bind address",
+                    reason: e.to_string(),
+                })?;
+        if !bind_addr.is_ipv6() {
+            return Err(TransportError::InvalidAddress {
+                context: "ipv6 bind address",
+                reason: "expected an IPv6 socket address".into(),
+            });
+        }
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(SocketProtocol::UDP))
+            .and_then(|socket| {
+                socket.set_only_v6(true)?;
+                socket.bind(&bind_addr.into())?;
+                Ok(socket.into())
+            })
+            .map_err(|e| TransportError::ListenFailed {
+                reason: format!("failed to bind ipv6-only udp socket: {e}"),
+            })?;
+
+        Self::from_socket(node_config, socket)
+    }
+
+    fn from_socket(node_config: QuicNodeConfig, socket: UdpSocket) -> Result<Self, TransportError> {
         socket
             .set_nonblocking(true)
             .map_err(|e| TransportError::ListenFailed {
@@ -888,6 +899,17 @@ impl QuicTransport {
         let readiness = ReadinessWait::new(&socket).map_err(|e| TransportError::ListenFailed {
             reason: format!("failed to create readiness poll: {e}"),
         })?;
+        // The bound family fixes this socket's id namespace, so the two halves
+        // of a dual-stack pair mint disjoint ids without any remapping.
+        let local_addr = socket
+            .local_addr()
+            .map_err(|e| TransportError::ListenFailed {
+                reason: format!("failed to get local addr: {e}"),
+            })?;
+        let namespace = match family_for_socket_addr(local_addr) {
+            AddressFamily::Ipv4 => ConnectionNamespace::QUIC_IPV4,
+            AddressFamily::Ipv6 => ConnectionNamespace::QUIC_IPV6,
+        };
         let quiche_config = build_quiche_config(&node_config)?;
         let mut retry_secret = [0u8; 32];
         getrandom::fill(&mut retry_secret).map_err(|e| TransportError::InvalidConfig {
@@ -904,7 +926,8 @@ impl QuicTransport {
             pending_events: Vec::new(),
             pending_datagrams: VecDeque::new(),
             listen_addr: None,
-            next_connection_id: 1,
+            connection_ids: ConnectionIdAllocator::new(namespace),
+            last_now: None,
             node_config,
             retry_secret,
         })
@@ -935,6 +958,12 @@ impl QuicTransport {
                 reason: format!("raw udp send to {addr} failed: {e}"),
             })?;
         Ok(())
+    }
+
+    /// The namespace this socket's connection ids carry, fixed by the family
+    /// it is bound to.
+    pub fn namespace(&self) -> ConnectionNamespace {
+        self.connection_ids.namespace()
     }
 
     /// Exposes the bound local socket address as a multiaddr for external use.
@@ -978,29 +1007,17 @@ impl QuicTransport {
             .unwrap_or_default()
     }
 
-    /// Allocates the next unused connection id, skipping 0 and wrapping on overflow.
+    /// Allocates the next connection id in this socket's namespace.
+    ///
+    /// Sequence numbers are never reused, so there is no need to check the
+    /// live connection table for a collision.
     fn allocate_connection_id(&mut self) -> Result<ConnectionId, TransportError> {
-        let start = self.next_connection_id;
-
-        loop {
-            let raw = self.next_connection_id;
-            self.next_connection_id = self.next_connection_id.wrapping_add(1);
-
-            if raw != 0 {
-                let id = ConnectionId::new(raw);
-                if !self.connections.contains_key(&id) {
-                    return Ok(id);
-                }
-            }
-
-            if self.next_connection_id == start {
-                break;
-            }
-        }
-
-        Err(TransportError::ResourceExhausted {
-            resource: "connection ids",
-        })
+        let id = self.connection_ids.allocate()?;
+        debug_assert!(
+            !self.connections.contains_key(&id),
+            "allocator handed out a live connection id"
+        );
+        Ok(id)
     }
 
     /// Generates a random QUIC source connection id using OS randomness.
@@ -1308,7 +1325,16 @@ impl Transport for QuicTransport {
             .collect()
     }
 
-    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+    fn send_datagram(&mut self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
+        // The socket a hole punch has to leave from is this one: the binding it
+        // opens is only useful for QUIC packets arriving back on it.
+        self.send_raw_udp(target, payload)
+    }
+
+    fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
+        // quiche keeps its own clock, so the sample is retained purely to
+        // anchor `next_deadline` on the host's timeline.
+        self.last_now = Some(now);
         // Events accumulate in `self.pending_events` for the whole poll and
         // are only taken at the very end, so any error path leaves the batch
         // queued for the next call instead of dropping it.
@@ -1539,31 +1565,83 @@ impl Transport for QuicTransport {
         Ok(std::mem::take(&mut self.pending_events))
     }
 
-    fn next_timeout(&self) -> Option<Duration> {
+    fn next_deadline(&self) -> Option<Deadline> {
+        // Events buffered outside a poll -- `listen`, `open_stream`,
+        // `send_stream`, `close_stream_write` and `reset_stream` all queue
+        // here between polls -- are due regardless of what the clock reads,
+        // and nothing else would wake a host idling on `None`.
+        if !self.pending_events.is_empty() {
+            return Some(Deadline::IMMEDIATE);
+        }
+
         // Datagrams stuck on socket writability can't be woken by a
-        // readable peek; return a short duration so the driver retries the
+        // readable peek; return a near deadline so the driver retries the
         // flush soon. (A `flush` blocked mid-connection always leaves its
         // packet queued here, so this also covers packets still in quiche.)
         // Stream writes queued on QUIC flow-control credit, by contrast,
         // only progress when a peer packet arrives -- which wakes
         // `wait_for_input` -- or a QUIC timer fires, so they fall through
         // to the real timers and never force a busy-poll.
+        //
+        // Checked before the retained sample: `dial` queues datagrams before
+        // the first `poll`, and a host that idled on `None` there would never
+        // come back to flush them. `IMMEDIATE` is due on any timeline.
         if !self.pending_datagrams.is_empty() {
-            return Some(Duration::from_millis(1));
+            return Some(
+                self.last_now
+                    .map_or(Deadline::IMMEDIATE, |now| now.deadline_after(1)),
+            );
         }
 
-        self.connections
+        // No sample yet means no timeline to answer on.
+        let now = self.last_now?;
+
+        let timeout = self
+            .connections
             .values()
             .filter_map(QuicConnection::timeout)
-            .min()
+            .min()?;
+        Some(deadline_for_timeout(now, timeout))
     }
+}
 
+/// Converts a quiche timeout into a deadline on the host's timeline.
+///
+/// quiche measures its timeouts from its own `Instant::now()`, at or after the
+/// sample taken at the top of `poll`, so anchoring to that sample rounds
+/// slightly early -- an extra harmless wakeup, never a missed timer.
+///
+/// [`Deadline`] has millisecond granularity while quiche's timeouts routinely
+/// land under a millisecond on loopback. Truncating those to zero would report
+/// "already due", which drives the swarm's budget loop to a zero-length sleep
+/// and spins the thread until wall time catches up. Any non-zero timeout is
+/// therefore rounded *up* to the next millisecond; the sub-millisecond delay
+/// that adds sits well inside the driver's own 1ms idle cadence.
+fn deadline_for_timeout(now: Now, timeout: Duration) -> Deadline {
+    if timeout.is_zero() {
+        // Genuinely due: let the driver poll again without idling.
+        return now.as_deadline();
+    }
+    let millis = u64::try_from(timeout.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX);
+    now.deadline_after(millis.max(1))
+}
+
+impl BlockingTransport for QuicTransport {
     fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-        if socket_has_queued_input(&self.socket) {
+        // Buffered events are work the host has yet to see; parking on socket
+        // readiness would sleep on them until an unrelated packet arrived.
+        if !self.pending_events.is_empty() || socket_has_queued_input(&self.socket) {
             WaitOutcome::Ready
         } else {
             self.readiness.wait(timeout)
         }
+    }
+
+    fn wait_handle(&self) -> WaitHandle {
+        quic_wait_handle(
+            vec![Arc::clone(&self.readiness.waker)],
+            Arc::new(Mutex::new(())),
+        )
     }
 }
 
@@ -1630,24 +1708,17 @@ impl Transport for QuicEndpoint {
         }
     }
 
-    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+    fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
         match self {
-            Self::Single(transport) => transport.poll(),
-            Self::Dual(transport) => transport.poll(),
+            Self::Single(transport) => transport.poll(now),
+            Self::Dual(transport) => transport.poll(now),
         }
     }
 
-    fn next_timeout(&self) -> Option<Duration> {
+    fn next_deadline(&self) -> Option<Deadline> {
         match self {
-            Self::Single(transport) => transport.next_timeout(),
-            Self::Dual(transport) => transport.next_timeout(),
-        }
-    }
-
-    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-        match self {
-            Self::Single(transport) => transport.wait_for_input(timeout),
-            Self::Dual(transport) => transport.wait_for_input(timeout),
+            Self::Single(transport) => transport.next_deadline(),
+            Self::Dual(transport) => transport.next_deadline(),
         }
     }
 
@@ -1664,6 +1735,26 @@ impl Transport for QuicEndpoint {
             Self::Dual(transport) => transport.active_inbound_connection_sources(),
         }
     }
+
+    fn send_datagram(&mut self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
+        self.send_raw_udp(target, payload)
+    }
+}
+
+impl BlockingTransport for QuicEndpoint {
+    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
+        match self {
+            Self::Single(transport) => transport.wait_for_input(timeout),
+            Self::Dual(transport) => transport.wait_for_input(timeout),
+        }
+    }
+
+    fn wait_handle(&self) -> WaitHandle {
+        match self {
+            Self::Single(transport) => BlockingTransport::wait_handle(&**transport),
+            Self::Dual(transport) => BlockingTransport::wait_handle(&**transport),
+        }
+    }
 }
 
 impl Transport for DualQuicTransport {
@@ -1674,8 +1765,7 @@ impl Transport for DualQuicTransport {
                 reason: "no usable ipv4 or ipv6 dial target".into(),
             }
         })?;
-        let id = self.transport_mut(family).dial(&addr)?;
-        Ok(Self::external_id(family, id))
+        self.transport_mut(family).dial(&addr)
     }
 
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
@@ -1684,7 +1774,7 @@ impl Transport for DualQuicTransport {
     }
 
     fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
-        let (family, id) = Self::internal_id(id);
+        let family = Self::family_for_id(id)?;
         self.transport_mut(family).open_stream(id)
     }
 
@@ -1694,7 +1784,7 @@ impl Transport for DualQuicTransport {
         stream_id: StreamId,
         data: Vec<u8>,
     ) -> Result<(), TransportError> {
-        let (family, id) = Self::internal_id(id);
+        let family = Self::family_for_id(id)?;
         self.transport_mut(family).send_stream(id, stream_id, data)
     }
 
@@ -1703,7 +1793,7 @@ impl Transport for DualQuicTransport {
         id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
-        let (family, id) = Self::internal_id(id);
+        let family = Self::family_for_id(id)?;
         self.transport_mut(family).close_stream_write(id, stream_id)
     }
 
@@ -1712,18 +1802,18 @@ impl Transport for DualQuicTransport {
         id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
-        let (family, id) = Self::internal_id(id);
+        let family = Self::family_for_id(id)?;
         self.transport_mut(family).reset_stream(id, stream_id)
     }
 
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
-        let (family, id) = Self::internal_id(id);
+        let family = Self::family_for_id(id)?;
         self.transport_mut(family).close(id)
     }
 
-    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
-        let ipv4_events = self.ipv4.poll()?;
-        let ipv6_events = match self.ipv6.poll() {
+    fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
+        let ipv4_events = self.ipv4.poll(now)?;
+        let ipv6_events = match self.ipv6.poll(now) {
             Ok(events) => events,
             Err(e) => {
                 // Requeue the already-taken IPv4 batch (ahead of anything
@@ -1735,24 +1825,41 @@ impl Transport for DualQuicTransport {
             }
         };
 
-        let mut events: Vec<TransportEvent> = ipv4_events
-            .into_iter()
-            .map(|event| Self::map_event(AddressFamily::Ipv4, event))
-            .collect();
-        events.extend(
-            ipv6_events
-                .into_iter()
-                .map(|event| Self::map_event(AddressFamily::Ipv6, event)),
-        );
+        let mut events = ipv4_events;
+        events.extend(ipv6_events);
         Ok(events)
     }
 
-    fn next_timeout(&self) -> Option<Duration> {
-        match (self.ipv4.next_timeout(), self.ipv6.next_timeout()) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(timeout), None) | (None, Some(timeout)) => Some(timeout),
-            (None, None) => None,
-        }
+    fn next_deadline(&self) -> Option<Deadline> {
+        Deadline::earliest_opt(self.ipv4.next_deadline(), self.ipv6.next_deadline())
+    }
+
+    fn local_addresses(&self) -> Vec<Multiaddr> {
+        let mut addrs = self.ipv4.local_addresses();
+        addrs.extend(self.ipv6.local_addresses());
+        addrs
+    }
+
+    fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
+        let mut addrs = self.ipv4.active_inbound_connection_sources();
+        addrs.extend(self.ipv6.active_inbound_connection_sources());
+        addrs
+    }
+
+    fn send_datagram(&mut self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
+        self.send_raw_udp(target, payload)
+    }
+}
+
+impl BlockingTransport for DualQuicTransport {
+    fn wait_handle(&self) -> WaitHandle {
+        quic_wait_handle(
+            vec![
+                Arc::clone(&self.ipv4.readiness.waker),
+                Arc::clone(&self.ipv6.readiness.waker),
+            ],
+            Arc::clone(&self.interrupt_lock),
+        )
     }
 
     fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
@@ -1764,8 +1871,13 @@ impl Transport for DualQuicTransport {
         // Already-queued input must be reported before blocking anywhere:
         // otherwise a short budget could be consumed entirely by the empty
         // family while the other has a packet waiting, returning `TimedOut`
-        // despite input being available.
-        if socket_has_queued_input(&self.ipv4.socket) || socket_has_queued_input(&self.ipv6.socket)
+        // despite input being available. Events either family buffered
+        // outside a poll count the same -- this path does not delegate to the
+        // per-family `wait_for_input`, so it has to check them itself.
+        if !self.ipv4.pending_events.is_empty()
+            || !self.ipv6.pending_events.is_empty()
+            || socket_has_queued_input(&self.ipv4.socket)
+            || socket_has_queued_input(&self.ipv6.socket)
         {
             return WaitOutcome::Ready;
         }
@@ -1825,18 +1937,6 @@ impl Transport for DualQuicTransport {
                 }
             }
         }
-    }
-
-    fn local_addresses(&self) -> Vec<Multiaddr> {
-        let mut addrs = self.ipv4.local_addresses();
-        addrs.extend(self.ipv6.local_addresses());
-        addrs
-    }
-
-    fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
-        let mut addrs = self.ipv4.active_inbound_connection_sources();
-        addrs.extend(self.ipv6.active_inbound_connection_sources());
-        addrs
     }
 }
 
@@ -1977,7 +2077,7 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(50));
 
-        transport.poll().expect("poll");
+        transport.poll(Now::from_millis(0)).expect("poll");
         assert!(
             socket_has_queued_input(&transport.socket),
             "one poll must leave datagrams beyond the per-poll bound in the kernel buffer"
@@ -1990,7 +2090,7 @@ mod tests {
                 start.elapsed() < Duration::from_secs(1),
                 "overflow never drained"
             );
-            transport.poll().expect("poll");
+            transport.poll(Now::from_millis(0)).expect("poll");
         }
     }
 
@@ -2012,7 +2112,7 @@ mod tests {
         let good_destination = transport.local_addr().expect("local addr");
         transport.queue_datagram_best_effort(&[0u8; 4], good_destination);
 
-        let events = transport.poll().expect("poll");
+        let events = transport.poll(Now::from_millis(0)).expect("poll");
         assert!(
             events
                 .iter()
@@ -2026,16 +2126,83 @@ mod tests {
     }
 
     #[test]
-    fn next_timeout_is_short_while_outbound_work_is_queued() {
+    fn sub_millisecond_timeouts_never_report_as_already_due() {
+        let now = Now::from_millis(10_000);
+
+        // The regression: truncating to whole milliseconds turned "due in
+        // 300us" into "due now", so the driver took a zero-length budget and
+        // span until wall time caught up.
+        for timeout in [
+            Duration::from_nanos(1),
+            Duration::from_micros(1),
+            Duration::from_micros(300),
+            Duration::from_micros(999),
+            Duration::from_millis(1),
+        ] {
+            let deadline = deadline_for_timeout(now, timeout);
+            assert_eq!(
+                deadline.millis_until(now),
+                1,
+                "{timeout:?} must round up to a whole millisecond"
+            );
+        }
+
+        // Partial milliseconds round up rather than truncating down.
+        assert_eq!(
+            deadline_for_timeout(now, Duration::from_micros(1_500)).millis_until(now),
+            2
+        );
+        assert_eq!(
+            deadline_for_timeout(now, Duration::from_millis(5)).millis_until(now),
+            5
+        );
+
+        // Zero really is due now: the driver should re-poll without idling.
+        assert_eq!(
+            deadline_for_timeout(now, Duration::ZERO).millis_until(now),
+            0
+        );
+        assert!(deadline_for_timeout(now, Duration::ZERO).is_expired_at(now));
+    }
+
+    #[test]
+    fn queued_datagrams_are_reported_before_the_first_poll() {
         let mut transport =
             QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
-        assert_eq!(transport.next_timeout(), None);
+        assert_eq!(transport.next_deadline(), None, "idle and never polled");
+
+        // `dial` can queue a datagram before any poll has taken a sample. A
+        // host that idled on `None` here would never flush it.
+        let destination = transport.local_addr().expect("local addr");
+        transport.queue_datagram_best_effort(&[0u8; 4], destination);
+
+        let deadline = transport.next_deadline().expect("queued work must be due");
+        assert!(
+            deadline.is_expired_at(Now::from_millis(0)),
+            "with no retained sample the deadline must be due on any timeline"
+        );
+    }
+
+    #[test]
+    fn next_deadline_is_near_while_outbound_work_is_queued() {
+        let mut transport =
+            QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+        // Never polled, so there is no host timeline to answer on yet.
+        assert_eq!(transport.next_deadline(), None);
+
+        let now = Now::from_millis(10_000);
+        transport.poll(now).expect("poll");
+        assert_eq!(
+            transport.next_deadline(),
+            None,
+            "an idle transport arms no timer"
+        );
 
         let destination = transport.local_addr().expect("local addr");
         transport.queue_datagram_best_effort(&[0u8; 4], destination);
         assert_eq!(
-            transport.next_timeout(),
-            Some(Duration::from_millis(1)),
+            transport.next_deadline(),
+            Some(now.deadline_after(1)),
             "queued datagrams must keep the driver polling"
         );
     }
@@ -2126,6 +2293,24 @@ mod tests {
     }
 
     #[test]
+    fn explicit_dual_stack_wildcards_can_share_one_port() {
+        let reservation = UdpSocket::bind("0.0.0.0:0").expect("reserve port");
+        let port = reservation.local_addr().expect("reserved addr").port();
+        drop(reservation);
+        let ipv4 = format!("/ip4/0.0.0.0/udp/{port}/quic-v1")
+            .parse::<Multiaddr>()
+            .expect("ipv4 multiaddr");
+        let ipv6 = format!("/ip6/::/udp/{port}/quic-v1")
+            .parse::<Multiaddr>()
+            .expect("ipv6 multiaddr");
+
+        let endpoint = QuicEndpoint::bind_dual_multiaddr(QuicNodeConfig::generate(), &ipv4, &ipv6)
+            .expect("same-port wildcard pair");
+
+        assert_eq!(endpoint.local_addresses().len(), 2);
+    }
+
+    #[test]
     fn dual_stack_wait_reports_queued_ipv6_input_within_short_budget() {
         let mut transport = DualQuicTransport::new(QuicNodeConfig::generate()).expect("bind");
         let ipv6_port = transport
@@ -2198,7 +2383,7 @@ mod tests {
 
         for _ in 0..50 {
             std::thread::sleep(Duration::from_millis(2));
-            let events = server.poll().expect("poll");
+            let events = server.poll(Now::from_millis(0)).expect("poll");
             assert!(
                 !events
                     .iter()
@@ -2239,12 +2424,48 @@ mod tests {
 
         assert_eq!(ids.len(), families.len());
         assert_eq!(
-            ids.iter().any(|id| !id.as_u64().is_multiple_of(2)),
+            ids.iter()
+                .any(|id| id.namespace() == ConnectionNamespace::QUIC_IPV4),
             families.contains(&AddressFamily::Ipv4)
         );
         assert_eq!(
-            ids.iter().any(|id| id.as_u64().is_multiple_of(2)),
+            ids.iter()
+                .any(|id| id.namespace() == ConnectionNamespace::QUIC_IPV6),
             families.contains(&AddressFamily::Ipv6)
+        );
+    }
+
+    #[test]
+    fn dual_stack_halves_allocate_disjoint_ids_from_the_same_sequence() {
+        // Both halves start their sequence at 1. Before namespacing, keeping
+        // them apart needed an odd/even rewrite on every id and event.
+        let mut ipv4 =
+            QuicTransport::new(QuicNodeConfig::generate(), DEFAULT_IPV4_BIND).expect("bind ipv4");
+        let mut ipv6 =
+            QuicTransport::new(QuicNodeConfig::generate(), DEFAULT_IPV6_BIND).expect("bind ipv6");
+
+        let from_ipv4 = ipv4.allocate_connection_id().expect("ipv4 id");
+        let from_ipv6 = ipv6.allocate_connection_id().expect("ipv6 id");
+
+        assert_eq!(from_ipv4.sequence(), from_ipv6.sequence());
+        assert_ne!(from_ipv4, from_ipv6);
+        assert_eq!(from_ipv4.namespace(), ConnectionNamespace::QUIC_IPV4);
+        assert_eq!(from_ipv6.namespace(), ConnectionNamespace::QUIC_IPV6);
+    }
+
+    #[test]
+    fn dual_stack_rejects_ids_from_another_transport() {
+        let mut endpoint = DualQuicTransport::new(QuicNodeConfig::generate()).expect("bind");
+        let foreign =
+            ConnectionId::namespaced(ConnectionNamespace::TCP_IPV4, 1).expect("id in range");
+
+        assert_eq!(
+            endpoint.open_stream(foreign),
+            Err(TransportError::ConnectionNotFound { id: foreign })
+        );
+        assert_eq!(
+            endpoint.close(foreign),
+            Err(TransportError::ConnectionNotFound { id: foreign })
         );
     }
 
@@ -2256,13 +2477,13 @@ mod tests {
         if families.contains(&AddressFamily::Ipv4) {
             let mut endpoint = QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("bind");
             let id = endpoint.dial_ip4(&peer_addr).expect("dial ipv4");
-            assert!(!id.as_u64().is_multiple_of(2));
+            assert_eq!(id.namespace(), ConnectionNamespace::QUIC_IPV4);
         }
 
         if families.contains(&AddressFamily::Ipv6) {
             let mut endpoint = QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("bind");
             let id = endpoint.dial_ip6(&peer_addr).expect("dial ipv6");
-            assert!(id.as_u64().is_multiple_of(2));
+            assert_eq!(id.namespace(), ConnectionNamespace::QUIC_IPV6);
         }
     }
 

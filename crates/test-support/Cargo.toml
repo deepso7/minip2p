@@ -11,4 +11,5 @@ workspace = true
 [dependencies]
 minip2p-core = { path = "../core" }
 minip2p-relay = { path = "../relay" }
+minip2p-platform = { path = "../platform" }
 minip2p-transport = { path = "../transport" }

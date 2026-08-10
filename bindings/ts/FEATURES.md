@@ -5,7 +5,7 @@
 | Rust `Endpoint` capability | TypeScript SDK |
 | --- | --- |
 | Identity, peer ID, bound addresses | `@minip2p/react-native` exports `generateSecretKey` and `peerIdFromSecretKey`; the portable `@minip2p/core` endpoint API exposes `peerId` and `listenAddrs` |
-| QUIC direct dial (dual family, IPv4, IPv6) | `dial`, `dialIp4`, `dialIp6` |
+| TCP and QUIC direct dial (dual family, IPv4, IPv6) | `dial`, `dialIp4`, `dialIp6` |
 | Ping | Promise-returning `ping`, plus typed ping events |
 | Identify readiness and snapshots | `isPeerReady`, `waitPeerReady`, `peerInfo`, Identify events |
 | Custom protocol registration | `protocols` configuration, `addProtocol` |

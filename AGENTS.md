@@ -8,7 +8,7 @@ minip2p is a minimal libp2p implementation in Rust: small, portable, understanda
 - Sans-I/O: keep core logic deterministic; I/O belongs in adapters.
 - `no_std + alloc` core crates.
 - No `async`/`.await`; remain caller-driven and executor-independent.
-- QUIC only; other transport adapters are out of scope.
+- TCP and QUIC side by side: TCP is portable down to `no_std`, QUIC stays `std`-only.
 
 Additional constraints: `unsafe` is forbidden workspace-wide; sockets, clocks, and timers live only in adapters/drivers; pre-1.0, breaking API changes are fine.
 
@@ -17,16 +17,16 @@ Additional constraints: `unsafe` is forbidden workspace-wide; sockets, clocks, a
 `just` mirrors CI (`.github/workflows/ci.yml`):
 
 ```bash
-just test          # cargo test + Endpoint feature matrix through discovery + mDNS
-just clippy        # -D warnings, Endpoint discovery/mDNS variants, and fuzz/
+just test          # cargo test + Endpoint feature matrix through TCP, discovery, and mDNS
+just clippy        # -D warnings, Endpoint TCP/discovery/mDNS variants, and fuzz/
 just fmt           # also formats fuzz/
 just check-nostd   # all no_std crates on thumbv7em-none-eabi
 just fuzz 30       # needs nightly + cargo-fuzz
 ```
 
 Single test: `cargo test -p minip2p-ping test_name`. Endpoint features:
-`cargo test -p minip2p-rs --features mdns` (or `discovery`,
-`discovery,mdns`; see `justfile` for the full matrix). `fuzz/` is outside the
+`cargo test -p minip2p-rs --features tcp` (or `mdns`, `discovery`,
+`discovery,mdns,tcp`; see `justfile` for the full matrix). `fuzz/` is outside the
 workspace — use `--manifest-path fuzz/Cargo.toml`.
 
 Publish a release end to end with:
@@ -44,11 +44,12 @@ leaves the full matrix to GitHub to avoid running it twice; use
 
 ## Architecture
 
-Three layers, strictly separated:
+Four layers, strictly separated:
 
-1. **Sans-I/O protocol crates** (`no_std + alloc`), one per protocol: `multistream-select`, `ping`, `identify`, `relay`, `autonat`, `dcutr`, `pubsub`, `mdns`; plus `identity`, `core`, `tls`, and `transport` (trait contract only).
-2. **Sans-I/O orchestrators**: `crates/swarm` (`SwarmCore`; also a `std`-gated `Swarm<T>` driver), `crates/nat` (`NatAgent`: direct-dial vs. relay race + DCUtR hole punching), and `crates/discovery` (`BeaconAgent` + `PeerDiscoveryAgent`: signed beacons and the shared multi-source book/dial policy).
-3. **`std` adapters**: `transports/quic` (quiche-based, owns UDP/DNS, exposes deadlines), the `std`-gated mDNS socket driver, `crates/minip2p` — the application-facing `Endpoint` API whose features layer on without changing the base API — and `crates/ffi`, the UniFFI endpoint/driver adapter for foreign runtimes.
+1. **Sans-I/O protocol crates** (`no_std + alloc`), one per protocol: `multistream-select`, `ping`, `identify`, `relay`, `autonat`, `dcutr`, `pubsub`, `mdns` (agent plus the portable `MdnsDriver` over an `MdnsIo` seam, with `MdnsSockets` behind `std` and `SmoltcpMdnsIo` behind `smoltcp`); plus `identity`, `core`, `tls`, `platform` (`Clock`/`Now`/`Deadline`/`EntropySource` contracts), `secure-mux` (multistream-select + Noise XX + Yamux over an ordered byte stream, shared by circuit and TCP), and `transport` (the `Transport`/`BlockingTransport` contracts, plus `TransportSet`, which routes several transports behind one of them).
+2. **Sans-I/O orchestrators**: `crates/swarm` (`SwarmCore`, the `no_std` `SwarmRuntime` that drives a transport against it, and a `std`-gated `Swarm<T>` that adds a clock and a blocking wait), `crates/nat` (`NatAgent`: direct-dial vs. relay race + DCUtR hole punching), and `crates/discovery` (`BeaconAgent` + `PeerDiscoveryAgent`: signed beacons and the shared multi-source book/dial policy).
+3. **Transport adapters**: `transports/tcp` (`no_std + alloc`; `TcpTransport` over a pluggable `TcpProvider` byte-stream seam, with `StdTcpProvider` on `mio` behind `std` and `SmoltcpTcpProvider` behind `smoltcp`) and `transports/quic` (`std`-only, quiche-based, owns UDP/DNS, exposes deadlines).
+4. **`std` adapters**: `crates/minip2p` — the application-facing `Endpoint` API, which composes the transports it is asked to bind into a `TransportSet` and routes by address, and whose features layer on without changing the base API — and `crates/ffi`, the UniFFI endpoint/driver adapter for foreign runtimes.
 
 The default swarm composes only identify + ping + protocols registered via `SwarmBuilder::protocol`/`EndpointBuilder::protocol`; relay/AutoNAT/DCUtR policy belongs to the host. `code-ref/` is read-only reference checkouts, not part of the build.
 

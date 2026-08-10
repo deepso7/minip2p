@@ -90,6 +90,21 @@ impl Multiaddr {
         is_quic_transport_slice(&self.protocols)
     }
 
+    /// Returns `true` if this is a valid TCP transport address (host + tcp).
+    pub fn is_tcp_transport(&self) -> bool {
+        is_tcp_transport_slice(&self.protocols)
+    }
+
+    /// Returns which transport can dial this address, if any.
+    ///
+    /// This is the classification a multi-transport host routes on: `/tcp`
+    /// addresses go to TCP, `/udp/.../quic-v1` addresses to QUIC. Anything
+    /// else -- a bare host, a circuit address, a trailing `/p2p` -- is not a
+    /// dialable transport address and returns `None`.
+    pub fn transport_kind(&self) -> Option<TransportKind> {
+        transport_kind_of(&self.protocols)
+    }
+
     /// Returns `true` if the first component is a wildcard IP host
     /// (`/ip4/0.0.0.0` or `/ip6/::`).
     ///
@@ -103,20 +118,26 @@ impl Multiaddr {
         }
     }
 
-    /// Returns `true` if this is a relay circuit transport address:
-    /// exactly host + udp + quic-v1 + `/p2p/<relay>` + `/p2p-circuit`.
+    /// Returns `true` if this is a relay circuit transport address: a
+    /// dialable address for the relay, then `/p2p/<relay>` and
+    /// `/p2p-circuit`.
     ///
-    /// This is the shape produced by relay reservations: the QUIC
-    /// address of the relay, the relay's peer id, and the circuit
-    /// marker. Anything longer or shorter (including a direct QUIC
-    /// address) returns `false`.
+    /// This is the shape produced by relay reservations, and the leg that
+    /// reaches the relay is an ordinary transport address -- whichever
+    /// transport that is. A circuit is carried over an established connection
+    /// to the relay, so how that connection was made is the relay's business
+    /// and not the circuit's.
+    ///
+    /// Anything longer or shorter (including a direct address, or one with a
+    /// trailing `/p2p/<target>`) returns `false`.
     pub fn is_relay_circuit_transport(&self) -> bool {
-        self.protocols.len() == 5
-            && self.protocols[0].is_host()
-            && matches!(self.protocols[1], Protocol::Udp(_))
-            && matches!(self.protocols[2], Protocol::QuicV1)
-            && matches!(self.protocols[3], Protocol::P2p(_))
-            && matches!(self.protocols[4], Protocol::P2pCircuit)
+        let Some((Protocol::P2pCircuit, head)) = self.protocols.split_last() else {
+            return false;
+        };
+        let Some((Protocol::P2p(_), leg)) = head.split_last() else {
+            return false;
+        };
+        transport_kind_of(leg).is_some()
     }
 
     /// Encodes this multiaddr to its binary multicodec wire form.
@@ -172,6 +193,7 @@ impl fmt::Display for Multiaddr {
                 Protocol::Dns(value) => write!(f, "/dns/{value}")?,
                 Protocol::Dns4(value) => write!(f, "/dns4/{value}")?,
                 Protocol::Dns6(value) => write!(f, "/dns6/{value}")?,
+                Protocol::Tcp(port) => write!(f, "/tcp/{port}")?,
                 Protocol::Udp(port) => write!(f, "/udp/{port}")?,
                 Protocol::QuicV1 => f.write_str("/quic-v1")?,
                 Protocol::P2p(peer_id) => write!(f, "/p2p/{peer_id}")?,
@@ -205,6 +227,31 @@ pub(crate) fn is_quic_transport_slice(protocols: &[Protocol]) -> bool {
         && protocols[0].is_host()
         && matches!(protocols[1], Protocol::Udp(_))
         && matches!(protocols[2], Protocol::QuicV1)
+}
+
+/// Checks if a protocol slice forms a valid TCP transport (host + tcp).
+pub(crate) fn is_tcp_transport_slice(protocols: &[Protocol]) -> bool {
+    protocols.len() == 2 && protocols[0].is_host() && matches!(protocols[1], Protocol::Tcp(_))
+}
+
+/// Returns which transport can dial a protocol slice, if any.
+pub(crate) fn transport_kind_of(protocols: &[Protocol]) -> Option<TransportKind> {
+    if is_tcp_transport_slice(protocols) {
+        Some(TransportKind::Tcp)
+    } else if is_quic_transport_slice(protocols) {
+        Some(TransportKind::Quic)
+    } else {
+        None
+    }
+}
+
+/// Which base transport dials a given address shape.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum TransportKind {
+    /// `/<host>/tcp/<port>`
+    Tcp,
+    /// `/<host>/udp/<port>/quic-v1`
+    Quic,
 }
 
 /// Parses a `/`-delimited multiaddr string into protocol components.
@@ -263,14 +310,18 @@ fn parse_multiaddr(input: &str) -> Result<Multiaddr, MultiaddrError> {
                 protocols.push(parsed);
                 idx += 2;
             }
-            "udp" => {
-                let value = require_value(&segments, idx, "udp")?;
+            "tcp" | "udp" => {
+                let value = require_value(&segments, idx, protocol)?;
                 let parsed = value
                     .parse::<u16>()
                     .map_err(|_| MultiaddrError::InvalidPort {
                         value: value.to_string(),
                     })?;
-                protocols.push(Protocol::Udp(parsed));
+                protocols.push(if protocol == "tcp" {
+                    Protocol::Tcp(parsed)
+                } else {
+                    Protocol::Udp(parsed)
+                });
                 idx += 2;
             }
             "quic-v1" => {
@@ -319,7 +370,11 @@ fn require_value<'a>(
 }
 
 /// Basic DNS name validation: non-empty, no slashes, no whitespace/control chars.
-fn is_valid_dns(value: &str) -> bool {
+///
+/// Applied by both codecs. A name containing `/` would print as several
+/// components and re-parse into a *different* address; whitespace and control
+/// characters would likewise not survive a text round trip.
+pub(crate) fn is_valid_dns(value: &str) -> bool {
     !value.is_empty()
         && !value.contains('/')
         && !value
@@ -379,9 +434,14 @@ mod tests {
             "/ip6/2001:db8::1",
             "/dns4/relay.example.com",
         ] {
-            let input = format!("{host}/udp/4001/quic-v1/p2p/{PEER_ID}/p2p-circuit");
-            let parsed = Multiaddr::from_str(&input).expect("must parse");
-            assert!(parsed.is_relay_circuit_transport(), "{input}");
+            // Either leg: a circuit rides an established connection to the
+            // relay, so how that connection was made is the relay's business.
+            // A TCP-only device has no other kind to offer.
+            for leg in ["/udp/4001/quic-v1", "/tcp/4001"] {
+                let input = format!("{host}{leg}/p2p/{PEER_ID}/p2p-circuit");
+                let parsed = Multiaddr::from_str(&input).expect("must parse");
+                assert!(parsed.is_relay_circuit_transport(), "{input}");
+            }
         }
     }
 
@@ -398,6 +458,11 @@ mod tests {
             format!("/ip4/203.0.113.7/udp/4001/quic-v1/p2p-circuit/p2p/{PEER_ID}"),
             // Destination peer appended after the circuit marker (six components).
             format!("/ip4/203.0.113.7/udp/4001/quic-v1/p2p/{PEER_ID}/p2p-circuit/p2p/{PEER_ID}"),
+            // The leg has to be a whole transport address, not a bare host or
+            // half of one: a circuit is reached by dialing the relay, and
+            // there is no dialing this.
+            format!("/ip4/203.0.113.7/p2p/{PEER_ID}/p2p-circuit"),
+            format!("/ip4/203.0.113.7/udp/4001/p2p/{PEER_ID}/p2p-circuit"),
         ];
         for input in near_misses {
             let parsed = Multiaddr::from_str(&input).expect("must parse");
@@ -407,9 +472,191 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_formats_tcp_multiaddrs() {
+        // Every strict form the TCP transport accepts, round-tripped through
+        // text to catch a Display that disagrees with the parser.
+        let inputs = [
+            "/ip4/192.0.2.1/tcp/4001".to_string(),
+            "/ip6/2001:db8::1/tcp/4001".to_string(),
+            "/dns4/example.test/tcp/4001".to_string(),
+            "/dns6/example.test/tcp/4001".to_string(),
+            "/dns/example.test/tcp/4001".to_string(),
+            format!("/ip4/192.0.2.1/tcp/4001/p2p/{PEER_ID}"),
+        ];
+
+        for input in inputs {
+            let parsed = Multiaddr::from_str(&input).expect("must parse");
+            assert_eq!(parsed.to_string(), input, "canonical formatting");
+            assert_eq!(
+                Multiaddr::from_bytes(&parsed.to_bytes()).expect("must decode"),
+                parsed,
+                "binary round trip for {input}"
+            );
+        }
+    }
+
+    /// Hand-derived reference vector for `/ip4/192.0.2.1/tcp/4001`.
+    ///
+    /// - `/ip4`: varint code 0x04 -> 04, value 192.0.2.1 = C0 00 02 01
+    /// - `/tcp`: varint code 0x06 -> 06, value 4001 (big-endian) = 0F A1
+    ///
+    /// `/tcp` is a single-byte varint, unlike `/udp`'s two-byte 0x0111, so
+    /// this pins the code rather than trusting the encoder round-tripping
+    /// against itself.
+    #[test]
+    fn binary_codec_reference_vector_ip4_tcp() {
+        let addr = Multiaddr::from_str("/ip4/192.0.2.1/tcp/4001").unwrap();
+        let expected: Vec<u8> = vec![
+            0x04, 0xC0, 0x00, 0x02, 0x01, // ip4 192.0.2.1
+            0x06, 0x0F, 0xA1, // tcp 4001
+        ];
+        assert_eq!(addr.to_bytes(), expected);
+        assert_eq!(Multiaddr::from_bytes(&expected).unwrap(), addr);
+    }
+
+    #[test]
+    fn tcp_and_udp_ports_are_distinct_on_the_wire() {
+        let tcp = Multiaddr::from_str("/ip4/192.0.2.1/tcp/4001").unwrap();
+        let udp = Multiaddr::from_str("/ip4/192.0.2.1/udp/4001").unwrap();
+
+        assert_ne!(tcp, udp);
+        assert_ne!(tcp.to_bytes(), udp.to_bytes());
+        // Decoding must not confuse the two codes.
+        assert_eq!(Multiaddr::from_bytes(&tcp.to_bytes()).unwrap(), tcp);
+        assert_eq!(Multiaddr::from_bytes(&udp.to_bytes()).unwrap(), udp);
+    }
+
+    #[test]
+    fn classifies_dialable_transport_addresses() {
+        let tcp = Multiaddr::from_str("/ip4/192.0.2.1/tcp/4001").unwrap();
+        assert!(tcp.is_tcp_transport());
+        assert!(!tcp.is_quic_transport());
+        assert_eq!(tcp.transport_kind(), Some(TransportKind::Tcp));
+
+        let quic = Multiaddr::from_str("/ip4/192.0.2.1/udp/4001/quic-v1").unwrap();
+        assert!(quic.is_quic_transport());
+        assert!(!quic.is_tcp_transport());
+        assert_eq!(quic.transport_kind(), Some(TransportKind::Quic));
+
+        // Shapes a router must not treat as dialable.
+        let not_transports = [
+            "/ip4/192.0.2.1".to_string(),
+            "/tcp/4001".to_string(),
+            "/ip4/192.0.2.1/udp/4001".to_string(),
+            "/ip4/192.0.2.1/tcp/4001/quic-v1".to_string(),
+            format!("/ip4/192.0.2.1/tcp/4001/p2p/{PEER_ID}"),
+            format!("/ip4/192.0.2.1/udp/4001/quic-v1/p2p/{PEER_ID}"),
+        ];
+        for input in not_transports {
+            let parsed = Multiaddr::from_str(&input).expect("must parse");
+            assert_eq!(parsed.transport_kind(), None, "{input}");
+            assert!(!parsed.is_tcp_transport(), "{input}");
+            assert!(!parsed.is_quic_transport(), "{input}");
+        }
+        assert_eq!(Multiaddr::default().transport_kind(), None);
+    }
+
+    #[test]
+    fn rejects_malformed_tcp_ports() {
+        let err = Multiaddr::from_str("/ip4/127.0.0.1/tcp").expect_err("must fail");
+        assert!(matches!(
+            err,
+            MultiaddrError::MissingValue { protocol, .. } if protocol == "tcp"
+        ));
+
+        for bad in [
+            "/ip4/127.0.0.1/tcp/65536",
+            "/ip4/127.0.0.1/tcp/-1",
+            "/ip4/127.0.0.1/tcp/x",
+        ] {
+            let err = Multiaddr::from_str(bad).expect_err("must fail");
+            assert!(matches!(err, MultiaddrError::InvalidPort { .. }), "{bad}");
+        }
+
+        // Port 0 is a legal bind wildcard, so it must parse.
+        assert!(Multiaddr::from_str("/ip4/0.0.0.0/tcp/0").is_ok());
+    }
+
+    #[test]
+    fn truncated_tcp_port_is_rejected() {
+        // Code present, only one of the two port bytes.
+        let err = Multiaddr::from_bytes(&[0x04, 0x7F, 0x00, 0x00, 0x01, 0x06, 0x0F])
+            .expect_err("must fail");
+        assert!(matches!(
+            err,
+            MultiaddrError::TruncatedBinaryValue { protocol } if protocol == "tcp"
+        ));
+    }
+
+    #[test]
+    fn binary_decoder_rejects_dns_names_the_text_parser_would_reject() {
+        // Found by the wire_inputs fuzzer. `/dns` with a body containing `/`
+        // decoded to one component but printed as several, so re-parsing the
+        // text produced a *different* address -- one binary value with two
+        // meanings, from peer-supplied Identify/beacon addresses.
+        let mut confusable = vec![0x35, 8];
+        confusable.extend_from_slice(b"x/tcp/80");
+        let err = Multiaddr::from_bytes(&confusable).expect_err("must reject");
+        assert!(matches!(
+            err,
+            MultiaddrError::InvalidBinaryValue { protocol, .. } if protocol == "dns"
+        ));
+
+        // Control characters and whitespace likewise cannot survive a text
+        // round trip, for every dns variant.
+        for (code, label) in [(0x35u8, "dns"), (0x36, "dns4"), (0x37, "dns6")] {
+            for body in [&b"\0"[..], b" ", b"a b", b"", b"a/b"] {
+                let mut bytes = vec![code, body.len() as u8];
+                bytes.extend_from_slice(body);
+                let err = Multiaddr::from_bytes(&bytes)
+                    .expect_err(&alloc::format!("{label} {body:?} must be rejected"));
+                assert!(
+                    matches!(err, MultiaddrError::InvalidBinaryValue { .. }),
+                    "{label} {body:?} gave {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn binary_and_text_decoders_agree_on_dns_names() {
+        // Parity in both directions: the codecs must accept the same names and
+        // reject the same names, or a name means one thing on the wire and
+        // another in text.
+        for name in ["example.test", "a.b.c.d", "xn--bcher-kva.example", "host-1"] {
+            let text = alloc::format!("/dns4/{name}/tcp/4001");
+            let parsed = Multiaddr::from_str(&text).expect("text must parse");
+            let decoded = Multiaddr::from_bytes(&parsed.to_bytes()).expect("binary must decode");
+            assert_eq!(decoded, parsed);
+            assert_eq!(decoded.to_string(), text);
+        }
+
+        for name in ["a/b", "a b", "a\u{7f}b", "\u{0}", ""] {
+            // Text side.
+            let text = alloc::format!("/dns4/{name}");
+            assert!(
+                Multiaddr::from_str(&text).is_err(),
+                "text parser accepted {name:?}"
+            );
+
+            // Binary side, hand-built so the encoder cannot launder it.
+            let body = name.as_bytes();
+            let mut bytes = alloc::vec![0x36u8, body.len() as u8];
+            bytes.extend_from_slice(body);
+            assert!(
+                Multiaddr::from_bytes(&bytes).is_err(),
+                "binary decoder accepted {name:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_unknown_protocol() {
-        let err = Multiaddr::from_str("/ip4/127.0.0.1/tcp/1234").expect_err("must fail");
-        assert!(matches!(err, MultiaddrError::UnknownProtocol { .. }));
+        let err = Multiaddr::from_str("/ip4/127.0.0.1/sctp/1234").expect_err("must fail");
+        assert!(matches!(
+            err,
+            MultiaddrError::UnknownProtocol { protocol } if protocol == "sctp"
+        ));
     }
 
     #[test]

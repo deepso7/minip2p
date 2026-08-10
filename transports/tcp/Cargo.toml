@@ -1,0 +1,45 @@
+[package]
+name = "minip2p-tcp"
+description = "Sans-I/O libp2p TCP transport over a pluggable byte-stream provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[features]
+default = ["std"]
+std = [
+    "dep:mio",
+    "minip2p-core/std",
+    "minip2p-identity/std",
+    "minip2p-platform/std",
+    "minip2p-secure-mux/std",
+    "minip2p-transport/std",
+    "thiserror/std",
+]
+# The embedded provider. `medium-ip` is the minimum a link can speak; a host on
+# Ethernet adds `smoltcp/medium-ethernet` from its own manifest.
+smoltcp = ["dep:minip2p-smoltcp"]
+
+[dependencies]
+minip2p-core = { path = "../../crates/core", version = "0.3.1", default-features = false }
+minip2p-identity = { path = "../../crates/identity", version = "0.3.1", default-features = false, features = ["ed25519"] }
+minip2p-platform = { path = "../../crates/platform", version = "0.3.1", default-features = false }
+minip2p-secure-mux = { path = "../../crates/secure-mux", version = "0.3.1", default-features = false }
+minip2p-transport = { path = "../../crates/transport", version = "0.3.1", default-features = false }
+mio = { version = "1.0", features = ["net", "os-poll"], optional = true }
+minip2p-smoltcp = { path = "../../crates/smoltcp", version = "0.3.1", optional = true }
+thiserror = { version = "2.0.18", default-features = false }
+
+[dev-dependencies]
+minip2p-identity = { path = "../../crates/identity", features = ["ed25519", "std"] }
+
+[package.metadata.docs.rs]
+all-features = true

@@ -2,8 +2,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use minip2p_autonat::{AutoNatClient, AutoNatClientInput, AutoNatServer, AutoNatServerInput};
-use minip2p_circuit::{BridgeAdoption, CircuitRole, CircuitTransport, EntropyError, EntropySource};
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol};
+use minip2p_circuit::{BridgeAdoption, CircuitRole, CircuitTransport};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol, SansIoProtocol, TransportKind};
 use minip2p_dcutr::{FrameDecode as DcutrFrame, HolePunch};
 use minip2p_discovery::{
     Beacon, BeaconAgent, BeaconConfig, BeaconEvent, DiscoverySource, Observation,
@@ -16,11 +16,15 @@ use minip2p_mdns::{
 };
 use minip2p_multistream_select::{MultistreamInput, MultistreamSelect};
 use minip2p_noise::{NoiseConfig, NoiseHandshakePayload, NoiseInput, NoiseRole, NoiseSession};
+use minip2p_platform::{EntropyError, EntropySource, Now};
 use minip2p_pubsub::{
     FrameDecode as PubsubFrame, GossipsubAgent, GossipsubConfig, MESHSUB_PROTOCOL_ID_V11,
     RawMessage, Rpc,
 };
 use minip2p_relay::{FrameDecode as RelayFrame, HopMessage, StopMessage};
+use minip2p_secure_mux::{
+    SecureMuxSession, SessionConfig, SessionOutput, SessionRole, YamuxConfig,
+};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
@@ -28,10 +32,7 @@ use minip2p_transport::{
 use minip2p_yamux::{FrameDecoder as YamuxFrameDecoder, YamuxRole, YamuxSession};
 
 fuzz_target!(|data: &[u8]| {
-    let _ = Multiaddr::from_bytes(data);
-    if let Ok(text) = core::str::from_utf8(data) {
-        let _ = text.parse::<Multiaddr>();
-    }
+    fuzz_multiaddr(data);
 
     fuzz_multistream(data);
     fuzz_identify(data);
@@ -41,6 +42,7 @@ fuzz_target!(|data: &[u8]| {
     fuzz_noise(data);
     fuzz_pubsub(data);
     fuzz_yamux(data);
+    fuzz_secure_mux(data);
     fuzz_circuit(data);
 
     if let RelayFrame::Complete { payload, .. } = minip2p_relay::decode_frame(data) {
@@ -132,8 +134,8 @@ fn fuzz_multistream(data: &[u8]) {
 struct FixedEntropy;
 
 impl EntropySource for FixedEntropy {
-    fn fill(&mut self, destination: &mut [u8]) -> Result<(), EntropyError> {
-        destination.fill(7);
+    fn fill_bytes(&mut self, output: &mut [u8]) -> Result<(), EntropyError> {
+        output.fill(7);
         Ok(())
     }
 }
@@ -202,8 +204,106 @@ impl Transport for FuzzTransport {
         Ok(())
     }
 
-    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+    fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {
         Ok(self.initial.take().into_iter().collect())
+    }
+}
+
+/// Independent oracle for [`Multiaddr::transport_kind`].
+///
+/// Reads the protocol slice directly, so a divergence between the documented
+/// address shapes and the classification helpers shows up as a mismatch.
+fn expected_transport_kind(addr: &Multiaddr) -> Option<TransportKind> {
+    match addr.protocols() {
+        [host, Protocol::Tcp(_)] if host.is_host() => Some(TransportKind::Tcp),
+        [host, Protocol::Udp(_), Protocol::QuicV1] if host.is_host() => Some(TransportKind::Quic),
+        _ => None,
+    }
+}
+
+/// Drives attacker-controlled bytes through both multiaddr codecs.
+fn fuzz_multiaddr(data: &[u8]) {
+    if let Ok(addr) = Multiaddr::from_bytes(data) {
+        // Anything that decodes must re-encode and print back identically:
+        // a decoder accepting a shape the encoder cannot reproduce is a
+        // round-trip hole.
+        let reencoded = addr.to_bytes();
+        let decoded = Multiaddr::from_bytes(&reencoded).expect("re-decode own encoding");
+        assert_eq!(decoded, addr);
+
+        // The empty multiaddr is the one shape whose text form does not
+        // round-trip: `from_bytes(&[])` accepts it and it prints as "", but
+        // the text parser rejects "" as `EmptyInput`. That asymmetry predates
+        // `/tcp`; exclude it rather than assert a contract the library does
+        // not make.
+        if !addr.protocols().is_empty() {
+            let text = addr.to_string();
+            let parsed: Multiaddr = text.parse().expect("re-parse own text");
+            assert_eq!(parsed, addr);
+        }
+
+        // Classification must match the shape rules, checked here against the
+        // protocol slice directly rather than through the same helpers
+        // `transport_kind` is built from -- otherwise the assertion is
+        // entailed by the implementation and cannot fail.
+        assert_eq!(addr.transport_kind(), expected_transport_kind(&addr));
+    }
+
+    if let Ok(addr) = core::str::from_utf8(data)
+        .map_err(|_| ())
+        .and_then(|text| text.parse::<Multiaddr>().map_err(|_| ()))
+    {
+        let _ = addr.to_bytes();
+        let _ = addr.transport_kind();
+    }
+}
+
+/// Drives attacker-controlled bytes through the secure-mux upgrade.
+///
+/// `handle_input` decodes peer-supplied bytes at every phase of the stack, so
+/// it gets the same fuzz treatment as the wire decoders underneath it. Both
+/// roles are driven, and the bytes are also fed in chunks so a frame split
+/// across reads exercises the partial-buffer paths.
+fn fuzz_secure_mux(data: &[u8]) {
+    let chunk_len = usize::from(data.first().copied().unwrap_or(1)).max(1);
+
+    for role in [SessionRole::Initiator, SessionRole::Responder] {
+        let identity = minip2p_identity::Ed25519Keypair::from_secret_key_bytes([7; 32]);
+        let mut session = SecureMuxSession::new(SessionConfig {
+            role,
+            identity,
+            static_secret: [11; 32],
+            ephemeral_secret: [13; 32],
+            expected_peer: None,
+            yamux: YamuxConfig::default(),
+        });
+        if session.start().is_err() {
+            continue;
+        }
+
+        let mut established = false;
+        for chunk in data.chunks(chunk_len) {
+            if session.handle_input(chunk.to_vec()).is_err() {
+                break;
+            }
+            while let Some(output) = session.poll_output() {
+                if matches!(output, SessionOutput::Established { .. }) {
+                    established = true;
+                }
+            }
+        }
+
+        // An unauthenticated peer must never reach the established state from
+        // arbitrary bytes: that would mean the Noise handshake was skippable.
+        // Establishing is gated on decrypting an AEAD-protected Yamux
+        // selection under a key derived from statics this harness never puts
+        // on the wire, so the assertion cannot fire on a lucky mutation --
+        // reaching it at all is the defect it is looking for.
+        assert!(
+            !established,
+            "arbitrary bytes must not complete the upgrade"
+        );
+        assert!(!session.is_established());
     }
 }
 
@@ -219,7 +319,7 @@ fn fuzz_circuit(data: &[u8]) {
         let identity = minip2p_identity::Ed25519Keypair::from_secret_key_bytes([5; 32]);
         let mut transport =
             CircuitTransport::new(FuzzTransport::new(relay.clone()), identity, FixedEntropy);
-        let _ = transport.poll();
+        let _ = transport.poll(Now::from_millis(0));
         let _ = transport.adopt_bridge(BridgeAdoption {
             inner_conn: ConnectionId::new(1),
             bridge_stream: StreamId::new(1),
@@ -238,7 +338,7 @@ fn fuzz_circuit(data: &[u8]) {
         transport.inject_bridge_remote_write_closed(ConnectionId::new(1), StreamId::new(1));
         transport.inject_bridge_closed(ConnectionId::new(1), StreamId::new(1));
         transport.inject_bridge_data(ConnectionId::new(1), StreamId::new(1), data.to_vec());
-        let _ = transport.poll();
+        let _ = transport.poll(Now::from_millis(0));
     }
 }
 

@@ -16,14 +16,18 @@ members = [
     "crates/nat",
     "crates/noise",
     "crates/ping",
+    "crates/platform",
     "crates/pubsub",
     "crates/relay",
+    "crates/secure-mux",
+    "crates/smoltcp",
     "crates/swarm",
     "crates/test-support",
     "crates/tls",
     "crates/transport",
     "crates/yamux",
     "transports/quic",
+    "transports/tcp",
     "examples/chat",
     "examples/common",
     "examples/peer",
@@ -32,7 +36,7 @@ members = [
 [workspace.package]
 version = "0.3.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.91"
 license = "MIT"
 homepage = "https://github.com/deepso7/minip2p"
 repository = "https://github.com/deepso7/minip2p"

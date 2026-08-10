@@ -4,6 +4,7 @@ use alloc::vec::Vec;
 use minip2p_identity::{PeerId, read_uvarint, write_uvarint};
 
 use crate::MultiaddrError;
+use crate::multiaddr::is_valid_dns;
 
 // ---------------------------------------------------------------------------
 // Multicodec codes
@@ -25,6 +26,8 @@ const DNS_CODE: u64 = 0x35;
 const DNS4_CODE: u64 = 0x36;
 /// Multicodec code for `/dns6/<name>`. Varint-length-prefixed UTF-8.
 const DNS6_CODE: u64 = 0x37;
+/// Multicodec code for `/tcp/<port>`. 2 raw bytes (big-endian).
+const TCP_CODE: u64 = 0x06;
 /// Multicodec code for `/udp/<port>`. 2 raw bytes (big-endian).
 const UDP_CODE: u64 = 0x0111;
 /// Multicodec code for `/quic-v1`. No value.
@@ -42,6 +45,7 @@ pub enum Protocol {
     Dns(String),
     Dns4(String),
     Dns6(String),
+    Tcp(u16),
     Udp(u16),
     QuicV1,
     P2p(PeerId),
@@ -65,6 +69,7 @@ impl Protocol {
             Self::Dns(_) => DNS_CODE,
             Self::Dns4(_) => DNS4_CODE,
             Self::Dns6(_) => DNS6_CODE,
+            Self::Tcp(_) => TCP_CODE,
             Self::Udp(_) => UDP_CODE,
             Self::QuicV1 => QUIC_V1_CODE,
             Self::P2p(_) => P2P_CODE,
@@ -87,7 +92,7 @@ impl Protocol {
                 write_uvarint(body.len() as u64, out);
                 out.extend_from_slice(body);
             }
-            Self::Udp(port) => out.extend_from_slice(&port.to_be_bytes()),
+            Self::Tcp(port) | Self::Udp(port) => out.extend_from_slice(&port.to_be_bytes()),
             Self::QuicV1 | Self::P2pCircuit => {}
             Self::P2p(peer_id) => {
                 let body = peer_id.to_bytes();
@@ -115,6 +120,11 @@ impl Protocol {
                 consumed += 16;
                 Ok((Self::Ip6(value), consumed))
             }
+            TCP_CODE => {
+                let value = fixed::<2>(rest, "tcp")?;
+                consumed += 2;
+                Ok((Self::Tcp(u16::from_be_bytes(value)), consumed))
+            }
             UDP_CODE => {
                 let value = fixed::<2>(rest, "udp")?;
                 consumed += 2;
@@ -136,6 +146,17 @@ impl Protocol {
                         reason: e.to_string(),
                     })?
                     .to_string();
+                // Same validation the text parser applies. Without it the
+                // binary decoder accepts names the text form cannot represent:
+                // a name containing `/` re-parses as different components
+                // entirely, so one address would have two meanings depending
+                // on which representation a check looked at.
+                if !is_valid_dns(&name) {
+                    return Err(MultiaddrError::InvalidBinaryValue {
+                        protocol: label,
+                        reason: "invalid dns name".to_string(),
+                    });
+                }
                 let protocol = match code {
                     DNS_CODE => Self::Dns(name),
                     DNS4_CODE => Self::Dns4(name),

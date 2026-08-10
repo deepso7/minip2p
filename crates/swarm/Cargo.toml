@@ -21,9 +21,9 @@ std = [
     "minip2p-identity/std",
     "minip2p-multistream-select/std",
     "minip2p-ping/std",
+    "minip2p-platform/std",
     "minip2p-transport/std",
     "thiserror/std",
-    "dep:getrandom",
 ]
 
 [dependencies]
@@ -32,9 +32,9 @@ minip2p-identify = { path = "../identify", version = "0.3.1", default-features =
 minip2p-identity = { path = "../identity", version = "0.3.1", default-features = false, features = ["ed25519"] }
 minip2p-multistream-select = { path = "../multistream-select", version = "0.3.1", default-features = false }
 minip2p-ping = { path = "../ping", version = "0.3.1", default-features = false }
+minip2p-platform = { path = "../platform", version = "0.3.1", default-features = false }
 minip2p-transport = { path = "../transport", version = "0.3.1", default-features = false }
 thiserror = { version = "2.0.18", default-features = false }
-getrandom = { version = "0.4.3", optional = true }
 
 [dev-dependencies]
 minip2p-relay = { path = "../relay" }

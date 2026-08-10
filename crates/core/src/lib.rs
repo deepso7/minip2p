@@ -22,7 +22,7 @@ pub use error::{MultiaddrError, PeerAddrError};
 pub use frame::{FrameDecode, decode_frame, encode_frame};
 pub use minip2p_identity::PeerId;
 pub use minip2p_identity::{VarintError, read_uvarint, uvarint_len, write_uvarint};
-pub use multiaddr::Multiaddr;
+pub use multiaddr::{Multiaddr, TransportKind};
 pub use peer_addr::PeerAddr;
 pub use protocol::Protocol;
 pub use sans_io::SansIoProtocol;

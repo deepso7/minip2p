@@ -360,7 +360,7 @@ fn blast_schedule_exhausts_at_the_punch_deadline() {
 }
 
 #[test]
-fn peer_supplied_punch_targets_must_be_global_unicast_ips() {
+fn peer_supplied_punch_targets_must_be_global_unicast_quic_ips() {
     let mut h = inbound_harness(NatConfig::default());
     let stream = StreamId::new(STOP_STREAM);
     inbound_stop_stream(&mut h, stream, 0);
@@ -385,6 +385,12 @@ fn peer_supplied_punch_targets_must_be_global_unicast_ips() {
         maddr("/ip6/fe80::1/udp/4001/quic-v1"),
         maddr("/ip6/2001:db8::1/udp/4001/quic-v1"),
         maddr("/ip6/ff02::1/udp/4001/quic-v1"),
+        // Globally routable, and a perfectly good address to dial -- but a
+        // hole punch is not a dial. Blasting random UDP at a TCP port puts
+        // traffic on one whose owner never asked for it, and no amount of it
+        // opens a path, because TCP is not the transport being punched.
+        maddr("/ip4/8.8.4.4/tcp/4001"),
+        maddr("/ip6/2606:4700:4700::1112/tcp/4001"),
     ];
     h.stream_data(stream, dcutr_connect_reply(&supplied), at(20));
     drain_actions(&mut h.agent);
@@ -401,6 +407,48 @@ fn peer_supplied_punch_targets_must_be_global_unicast_ips() {
         })
         .collect();
     assert_eq!(blasted, vec![global_v4, global_v6]);
+}
+
+#[test]
+fn a_tcp_peer_can_still_be_reached_over_the_circuit_it_arrived_on() {
+    let mut h = inbound_harness(NatConfig::default());
+    let stream = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stream, 0);
+    let target = h.target.clone();
+    h.stream_data(stream, stop_connect(&target), at(10));
+    drain_actions(&mut h.agent);
+
+    // Every address the peer offers is TCP, so there is nothing to punch.
+    // That must end as a relayed path rather than as a failure: the circuit
+    // is already carrying the connection, and DCUtR was only ever an attempt
+    // to do better than it.
+    h.stream_data(
+        stream,
+        dcutr_connect_reply(&[maddr("/ip4/8.8.4.4/tcp/4001")]),
+        at(20),
+    );
+    drain_actions(&mut h.agent);
+    h.stream_data(stream, dcutr_sync(), at(30));
+    let actions = drain_actions(&mut h.agent);
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, NatAction::PromoteBridge { .. })),
+        "the relayed path still goes to the application: {actions:?}"
+    );
+    let target = h.target.clone();
+    complete_promotion(&mut h.agent, &target, &actions, at(31));
+
+    // Not one blast, ever: the punch window opens 50ms after SYNC and there
+    // was never anything in it to aim at.
+    for tick in [80u64, 180, 400] {
+        h.agent.handle_tick(at(tick));
+        assert_eq!(
+            blast_count(&drain_actions(&mut h.agent)),
+            0,
+            "there is nothing here to punch"
+        );
+    }
 }
 
 #[test]
@@ -621,5 +669,50 @@ fn responder_reply_advertises_peer_observed_mapping() {
     assert!(
         obs.contains(&maddr(OUR_OBSERVED_ADDR)),
         "the reply must advertise our observed public mapping"
+    );
+}
+
+#[test]
+fn our_own_tcp_listener_is_not_offered_as_a_punch_target() {
+    let mut h = inbound_harness(NatConfig::default());
+    // A host that bound both. The direct-candidate selector accepts both,
+    // because both are dialable -- but only one of them is punchable.
+    let tcp = maddr("/ip4/198.51.100.5/tcp/4001");
+    h.agent.set_listen_addrs(&[maddr(LISTEN_ADDR), tcp.clone()]);
+    // Same for a mapping a trusted peer observed for us: the relay watching
+    // us arrive over TCP says nothing about where we can be punched.
+    let relay = h.relay.clone();
+    let observed_tcp = maddr("/ip4/203.0.113.77/tcp/45678");
+    identify_observed(&mut h.agent, &relay, &observed_tcp, at(0));
+
+    let stream = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stream, 1);
+    let target = h.target.clone();
+    h.stream_data(stream, stop_connect(&target), at(10));
+    drain_actions(&mut h.agent);
+    h.stream_data(
+        stream,
+        dcutr_connect_reply(&[maddr(REMOTE_OBSERVED_ADDR)]),
+        at(20),
+    );
+
+    let actions = drain_actions(&mut h.agent);
+    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    assert!(
+        obs.contains(&maddr(LISTEN_ADDR)),
+        "the QUIC listener is still offered: {obs:?}"
+    );
+    assert!(
+        !obs.contains(&tcp),
+        // What goes into a CONNECT is an invitation to blast UDP at us. A
+        // `/tcp` listener cannot be punched, so offering one only spends the
+        // peer's punch window on an address that will never open -- and the
+        // peer filters it on arrival anyway, so it was never anything but
+        // noise on the wire.
+        "a TCP listener is not a punch target: {obs:?}"
+    );
+    assert!(
+        !obs.contains(&observed_tcp),
+        "nor is a TCP mapping someone observed for us: {obs:?}"
     );
 }

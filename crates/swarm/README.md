@@ -1,11 +1,12 @@
 # minip2p-swarm
 
-Orchestration layer that composes minip2p's protocol state machines into a single, DX-friendly `Swarm`. Split into a Sans-I/O core (`no_std + alloc`) and an `std`-gated driver.
+Orchestration layer that composes minip2p's protocol state machines into a single, DX-friendly `Swarm`. Split into a Sans-I/O core and a portable action pump (both `no_std + alloc`) plus an `std`-gated blocking wrapper.
 
-## Two layers
+## Three layers
 
 - **`SwarmCore`** (`no_std + alloc`): pure state machine. Consumes `SwarmInput` values through `handle_input`, emits `SwarmOutput` values through `poll_output`, and reports quiescence with `is_idle`. Outputs wrap `SwarmAction` commands for the driver and `SwarmEvent` notifications for the application. No sockets, no async runtime, no clock reads. Composes `IdentifyProtocol`, `PingProtocol`, and `MultistreamSelect`; tracks connections, streams, and pending stream opens.
-- **`Swarm<T: Transport>`** (`std` feature, default): thin driver around `SwarmCore`. Owns a concrete transport, reads `std::time::Instant` for `now_ms`, and shuttles events and actions between the transport and the core. Preserves the one-call DX (`swarm.dial`, `swarm.ping`, `swarm.open_stream`).
+- **`SwarmRuntime<T: Transport, E: EntropySource>`** (`no_std + alloc`): the action pump. Owns a concrete transport and shuttles events and actions between it and the core, but reads no clock and draws no randomness of its own — the caller passes a `Now` into `poll(now)` and injects an entropy source. `next_deadline(now)` folds the transport's timer together with the core's protocol timers so a host can idle rather than spin.
+- **`Swarm<T: Transport>`** (`std` feature, default): wraps the runtime with a monotonic clock and blocking drive loops (`poll_next`, `run_until`). Preserves the one-call DX (`swarm.dial`, `swarm.ping`, `swarm.open_stream`) without threading `now_ms` through every call.
 
 ## Features
 
@@ -102,7 +103,10 @@ Disable default features:
 minip2p-swarm = { path = "crates/swarm", default-features = false }
 ```
 
-The `no_std` build omits the `Swarm<T>` driver and `SwarmBuilder`; only `SwarmCore` and its event / action / error types remain.
+The `no_std` build omits only the blocking `Swarm<T>` wrapper. `SwarmBuilder`
+remains available: call `build_runtime(transport, entropy)` to construct a
+portable `SwarmRuntime`. `SwarmCore`, the event / action / error types, and the
+full caller-driven runtime all remain available without `std`.
 
 ## Scope
 

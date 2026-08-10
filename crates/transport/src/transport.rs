@@ -1,26 +1,9 @@
 use alloc::vec::Vec;
-use core::time::Duration;
 
 use minip2p_core::{Multiaddr, PeerAddr};
+use minip2p_platform::{Deadline, Now};
 
 use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
-
-/// Result of [`Transport::wait_for_input`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WaitOutcome {
-    /// Input may be ready; the caller should poll now.
-    Ready,
-    /// An external handle interrupted the wait.
-    ///
-    /// Runtime drivers should return control to their caller without treating
-    /// this as transport input or a timer expiry.
-    Interrupted,
-    /// The timeout elapsed without input arriving.
-    TimedOut,
-    /// The transport cannot wait for readiness; the caller should fall back
-    /// to sleeping between polls.
-    Unsupported,
-}
 
 /// The core transport abstraction.
 ///
@@ -62,6 +45,21 @@ pub enum WaitOutcome {
 ///   single `poll()` call.
 /// - Events across different connections have no ordering guarantee.
 /// - `poll()` never blocks. It returns an empty vec when idle.
+///
+/// ## Time
+///
+/// The host samples time once per drive iteration and passes that [`Now`] to
+/// `poll()`, so every transport, agent, and runtime in one iteration observes
+/// the same instant. Adapters that need to schedule work retain the last
+/// sample they were given and report the resulting [`Deadline`] from
+/// [`next_deadline`](Transport::next_deadline).
+///
+/// A portable adapter should read no clock of its own. An adapter wrapping a
+/// library that keeps its own internal clock (minip2p's QUIC adapter wraps
+/// quiche, which does) may still do so, but everything it reports to the host
+/// -- deadlines above all -- must be expressed on the timeline of the samples
+/// it was given, never on the wrapped library's. Such an adapter is
+/// inherently `std`-only.
 pub trait Transport {
     /// Initiate an outbound connection and return its allocated connection id.
     ///
@@ -121,35 +119,26 @@ pub trait Transport {
     ///
     /// Must be called regularly. Never blocks -- returns an empty vec when
     /// there is no work to do.
-    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError>;
+    ///
+    /// `now` is the host's time sample for this drive iteration. Adapters must
+    /// use it instead of reading a clock, and should retain it to answer
+    /// [`next_deadline`](Transport::next_deadline).
+    fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError>;
 
-    /// Returns the duration until the transport next needs to be polled for a
-    /// protocol timer, if it has one.
+    /// Returns when the transport next needs polling for a protocol timer, if
+    /// it has one.
     ///
-    /// Runtime drivers can combine this with socket readiness instead of using
-    /// a fixed polling cadence. Returning zero means the timer is already due.
+    /// The deadline is on the timeline of the [`Now`] samples passed to
+    /// [`poll`](Transport::poll); a transport that has never been polled has
+    /// no timeline to answer on and should return `None`. Runtime drivers
+    /// combine this with socket readiness instead of polling on a fixed
+    /// cadence. A deadline that has already expired means "poll now".
     ///
-    /// Adapters with queued outbound work that is waiting on socket
-    /// writability should return a short duration here so drivers keep
-    /// polling until the queue drains.
-    fn next_timeout(&self) -> Option<Duration> {
+    /// Adapters with queued outbound work waiting on socket writability
+    /// should report a near deadline so drivers keep polling until the queue
+    /// drains.
+    fn next_deadline(&self) -> Option<Deadline> {
         None
-    }
-
-    /// Block the calling thread until new transport input may be available or
-    /// `timeout` elapses, whichever comes first.
-    ///
-    /// Adapters that own a socket should override this with a real readiness
-    /// wait (e.g. a blocking peek with a read timeout) so idle drivers can
-    /// sleep for the full timer budget instead of polling on a fixed cadence.
-    /// Implementations must not consume input and must tolerate spurious
-    /// wakeups; callers always follow up with [`poll`](Transport::poll).
-    ///
-    /// The default returns [`WaitOutcome::Unsupported`], telling the driver to
-    /// fall back to short sleeps between polls.
-    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-        let _ = timeout;
-        WaitOutcome::Unsupported
     }
 
     /// Returns the transport multiaddrs this node is currently listening
@@ -178,5 +167,103 @@ pub trait Transport {
     /// Default implementation returns empty; adapters should override.
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
         Vec::new()
+    }
+
+    /// Sends one datagram to `target` outside any connection.
+    ///
+    /// This exists for hole punching: DCUtR's simultaneous open needs packets
+    /// that leave the socket a later connection will arrive on, before any
+    /// connection exists to carry them. Nothing is delivered reliably, nothing
+    /// is acknowledged, and no event reports the outcome.
+    ///
+    /// Default implementation returns
+    /// [`TransportError::Unsupported`], which is the honest answer for a
+    /// transport with no connectionless send of its own -- a stream transport
+    /// has nowhere to put a lone packet. Callers should treat it as "this path
+    /// is not available here" rather than as a failure.
+    fn send_datagram(&mut self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
+        let _ = (target, payload);
+        Err(TransportError::Unsupported {
+            operation: "send_datagram",
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    /// A transport that implements only what the contract requires, so the
+    /// defaults are what answers for everything else.
+    struct Minimal;
+
+    impl Transport for Minimal {
+        fn dial(&mut self, _addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+            unimplemented!("not reached: this fake exists to exercise the defaults")
+        }
+
+        fn listen(&mut self, _addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
+            unimplemented!()
+        }
+
+        fn open_stream(&mut self, _id: ConnectionId) -> Result<StreamId, TransportError> {
+            unimplemented!()
+        }
+
+        fn send_stream(
+            &mut self,
+            _id: ConnectionId,
+            _stream_id: StreamId,
+            _data: Vec<u8>,
+        ) -> Result<(), TransportError> {
+            unimplemented!()
+        }
+
+        fn close_stream_write(
+            &mut self,
+            _id: ConnectionId,
+            _stream_id: StreamId,
+        ) -> Result<(), TransportError> {
+            unimplemented!()
+        }
+
+        fn reset_stream(
+            &mut self,
+            _id: ConnectionId,
+            _stream_id: StreamId,
+        ) -> Result<(), TransportError> {
+            unimplemented!()
+        }
+
+        fn close(&mut self, _id: ConnectionId) -> Result<(), TransportError> {
+            unimplemented!()
+        }
+
+        fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_transport_with_no_datagram_of_its_own_says_so() {
+        let target: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().expect("address");
+
+        // "Not available here" rather than "this failed": a caller choosing
+        // between transports has to be able to tell those apart, and a stream
+        // transport has nowhere to put a lone packet.
+        let error = Minimal
+            .send_datagram(&target, b"punch")
+            .expect_err("no datagram here");
+        assert_eq!(
+            error,
+            TransportError::Unsupported {
+                operation: "send_datagram"
+            }
+        );
+        assert!(Minimal.local_addresses().is_empty());
+        assert!(Minimal.active_inbound_connection_sources().is_empty());
+        assert_eq!(Minimal.next_deadline(), None);
+        assert_eq!(Minimal.poll(Now::from_millis(0)), Ok(vec![]));
     }
 }

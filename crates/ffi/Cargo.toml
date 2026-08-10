@@ -16,7 +16,7 @@ crate-type = ["lib", "staticlib", "cdylib"]
 workspace = true
 
 [dependencies]
-minip2p = { package = "minip2p-rs", path = "../minip2p", features = ["discovery", "mdns"] }
+minip2p = { package = "minip2p-rs", path = "../minip2p", features = ["discovery", "mdns", "tcp"] }
 minip2p-swarm = { path = "../swarm" }
 minip2p-pubsub = { path = "../pubsub" }
 thiserror = "2.0.18"
@@ -26,3 +26,4 @@ uniffi = "=0.31.0"
 [dev-dependencies]
 minip2p-relay = { path = "../relay" }
 minip2p-test-support = { path = "../test-support" }
+serde_json = "1.0.149"

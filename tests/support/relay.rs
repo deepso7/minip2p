@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, unexpected_cfgs)]
 
 //! Loopback Circuit Relay v2 service used by endpoint and example tests.
 //!
@@ -292,12 +292,30 @@ pub struct RelayServer {
 }
 
 impl RelayServer {
+    /// A relay reachable over QUIC.
     pub fn spawn() -> Self {
-        let mut endpoint = Endpoint::builder()
-            .protocol(HOP_PROTOCOL_ID)
-            .protocol(STOP_PROTOCOL_ID)
-            .bind_quic("127.0.0.1:0")
-            .expect("bind relay endpoint");
+        Self::spawn_on(|builder| builder.bind_quic("127.0.0.1:0"))
+    }
+
+    /// A relay reachable over TCP.
+    ///
+    /// Nothing above the transport differs: a circuit rides an established
+    /// connection to the relay, and HOP and STOP are ordinary streams on it.
+    /// The relay is where that claim is either true or not.
+    #[cfg(feature = "tcp")]
+    pub fn spawn_tcp() -> Self {
+        Self::spawn_on(|builder| builder.bind_tcp("127.0.0.1:0"))
+    }
+
+    fn spawn_on(
+        bind: impl FnOnce(minip2p::EndpointBuilder) -> Result<Endpoint, minip2p::Error>,
+    ) -> Self {
+        let mut endpoint = bind(
+            Endpoint::builder()
+                .protocol(HOP_PROTOCOL_ID)
+                .protocol(STOP_PROTOCOL_ID),
+        )
+        .expect("bind relay endpoint");
         let addr = endpoint.listen().expect("relay listens");
         let (commands, receiver) = mpsc::channel();
         let failure = Arc::new(Mutex::new(None));

@@ -1,8 +1,19 @@
 //! Relay-circuit transport built from an existing ordered bridge stream.
 //!
-//! The wrapper performs multistream-select, Noise XX, and Yamux without
-//! owning sockets, clocks, or an executor. Wrapped transport connection IDs
-//! pass through unchanged; circuit IDs have [`CIRCUIT_ID_BIT`] set.
+//! Each adopted bridge drives a [`SecureMuxSession`], which runs
+//! multistream-select, Noise XX, and Yamux over it without owning sockets,
+//! clocks, or an executor. This crate supplies what that session leaves to its
+//! host: bridge lifecycle, arbitration against direct connections, and the
+//! mapping onto [`TransportEvent`]s.
+//!
+//! Wrapped transport connection IDs pass through unchanged; circuit IDs are
+//! allocated in [`ConnectionNamespace::CIRCUIT`], which keeps them disjoint
+//! from every base transport's ids.
+//!
+//! Fresh Noise key material comes from a [`minip2p_platform::EntropySource`]
+//! the host injects — the same seam every other minip2p transport draws from,
+//! so one adapter over a board's RNG serves a circuit transport and a TCP
+//! transport at once.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
@@ -14,67 +25,25 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::time::Duration;
 
-use minip2p_core::{Multiaddr, Protocol, SansIoProtocol};
+use minip2p_core::{Multiaddr, Protocol};
 use minip2p_identity::{Ed25519Keypair, PeerId};
-use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, MultistreamSelect};
-use minip2p_noise::{
-    NOISE_PROTOCOL_ID, NoiseConfig, NoiseInput, NoiseOutput, NoiseRole, NoiseSession,
+#[cfg(feature = "std")]
+use minip2p_platform::StdEntropy;
+use minip2p_platform::{Deadline, EntropyError, EntropySource, Now};
+use minip2p_secure_mux::{
+    SecureMuxSession, SessionConfig, SessionError, SessionOutput, SessionRole, YamuxConfig,
 };
 use minip2p_transport::{
-    ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
-    WaitOutcome,
-};
-use minip2p_yamux::{
-    YAMUX_PROTOCOL_ID, YamuxConfig, YamuxError, YamuxInput, YamuxOutput, YamuxRole, YamuxSession,
+    ConnectionEndpoint, ConnectionId, ConnectionIdAllocator, ConnectionNamespace, ConnectionState,
+    StreamId, Transport, TransportError, TransportEvent,
 };
 use thiserror::Error;
-
-/// Marker bit reserved for circuit connection identifiers.
-pub const CIRCUIT_ID_BIT: u64 = 1 << 63;
 
 // A retired bridge suppresses late inner-transport events after the circuit's
 // public `Closed`. Keep this finite because a peer may never finish closing
 // its half of a gracefully closed bridge.
 const MAX_RETIRED_BRIDGES: usize = 1024;
-
-fn is_circuit_id(id: ConnectionId) -> bool {
-    id.as_u64() & CIRCUIT_ID_BIT != 0
-}
-
-/// Supplies fresh cryptographic entropy for one circuit adoption.
-pub trait EntropySource {
-    /// Fills `destination` with unpredictable bytes.
-    fn fill(&mut self, destination: &mut [u8]) -> Result<(), EntropyError>;
-}
-
-/// Failure to obtain cryptographic entropy.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[error("entropy source failed: {0}")]
-pub struct EntropyError(&'static str);
-
-impl EntropyError {
-    /// Creates an entropy failure with a static description.
-    ///
-    /// This is the only way for external [`EntropySource`] implementations
-    /// to construct the trait's error type.
-    pub fn new(reason: &'static str) -> Self {
-        Self(reason)
-    }
-}
-
-/// Entropy source backed by the operating system.
-#[cfg(feature = "std")]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct OsEntropy;
-
-#[cfg(feature = "std")]
-impl EntropySource for OsEntropy {
-    fn fill(&mut self, destination: &mut [u8]) -> Result<(), EntropyError> {
-        getrandom::fill(destination).map_err(|_| EntropyError::new("OS randomness unavailable"))
-    }
-}
 
 /// Which endpoint initiated the relayed connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,24 +96,30 @@ pub enum AdoptError {
     IdsExhausted,
 }
 
-enum Phase {
-    SelectNoise {
-        select: MultistreamSelect,
-        noise: Option<NoiseSession>,
-    },
-    Noise {
-        noise: NoiseSession,
-    },
-    SelectYamux {
-        noise: NoiseSession,
-        select: MultistreamSelect,
-        peer: PeerId,
-    },
-    Ready {
-        noise: NoiseSession,
-        yamux: YamuxSession,
-        peer: PeerId,
-    },
+/// Why a circuit is being torn down.
+struct Teardown {
+    /// Text for the public [`TransportEvent::Error`], if one is emitted.
+    message: String,
+    /// The remote ended an established session cleanly rather than failing.
+    graceful: bool,
+}
+
+impl Teardown {
+    fn fault(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            graceful: false,
+        }
+    }
+}
+
+impl From<SessionError> for Teardown {
+    fn from(error: SessionError) -> Self {
+        Self {
+            graceful: matches!(error, SessionError::GoAway { code: 0 }),
+            message: error.to_string(),
+        }
+    }
 }
 
 struct Circuit {
@@ -154,7 +129,7 @@ struct Circuit {
     relay: PeerId,
     remote_peer: PeerId,
     role: CircuitRole,
-    phase: Option<Phase>,
+    session: SecureMuxSession,
 }
 
 impl Circuit {
@@ -174,7 +149,7 @@ impl Circuit {
     }
 
     fn is_ready(&self) -> bool {
-        matches!(self.phase, Some(Phase::Ready { .. }))
+        self.session.is_established()
     }
 }
 
@@ -192,7 +167,7 @@ pub struct CircuitTransport<T, E> {
     direct_by_peer: BTreeMap<PeerId, BTreeSet<ConnectionId>>,
     direct_by_conn: BTreeMap<ConnectionId, PeerId>,
     pending: VecDeque<TransportEvent>,
-    next_circuit_id: Option<u64>,
+    circuit_id_allocator: ConnectionIdAllocator,
 }
 
 impl<T, E> CircuitTransport<T, E> {
@@ -211,7 +186,7 @@ impl<T, E> CircuitTransport<T, E> {
             direct_by_peer: BTreeMap::new(),
             direct_by_conn: BTreeMap::new(),
             pending: VecDeque::new(),
-            next_circuit_id: Some(1),
+            circuit_id_allocator: ConnectionIdAllocator::new(ConnectionNamespace::CIRCUIT),
         }
     }
 
@@ -223,7 +198,7 @@ impl<T, E> CircuitTransport<T, E> {
 
     /// Returns whether an identifier belongs to a circuit connection.
     pub fn is_circuit(id: ConnectionId) -> bool {
-        is_circuit_id(id)
+        id.is_circuit()
     }
 
     /// Returns the active circuit connection identifiers.
@@ -279,31 +254,27 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             return Err(AdoptError::PeerAlreadyDirect);
         }
 
-        let sequence = self.next_circuit_id.ok_or(AdoptError::IdsExhausted)?;
-        let next = sequence
-            .checked_add(1)
-            .filter(|value| *value < CIRCUIT_ID_BIT);
+        let id = self
+            .circuit_id_allocator
+            .peek()
+            .ok_or(AdoptError::IdsExhausted)?;
 
         let mut static_secret = [0u8; 32];
         let mut ephemeral_secret = [0u8; 32];
-        self.entropy.fill(&mut static_secret)?;
-        self.entropy.fill(&mut ephemeral_secret)?;
+        self.entropy.fill_bytes(&mut static_secret)?;
+        self.entropy.fill_bytes(&mut ephemeral_secret)?;
 
-        let id = ConnectionId::new(CIRCUIT_ID_BIT | sequence);
-        let noise = NoiseSession::new(NoiseConfig {
+        let session = SecureMuxSession::new(SessionConfig {
             role: match adoption.role {
-                CircuitRole::Initiator => NoiseRole::Initiator,
-                CircuitRole::Responder => NoiseRole::Responder,
+                CircuitRole::Initiator => SessionRole::Initiator,
+                CircuitRole::Responder => SessionRole::Responder,
             },
             identity: self.identity.clone(),
             static_secret,
             ephemeral_secret,
             expected_peer: Some(adoption.remote_peer.clone()),
+            yamux: self.yamux_config.clone(),
         });
-        let select = match adoption.role {
-            CircuitRole::Initiator => MultistreamSelect::dialer(NOISE_PROTOCOL_ID),
-            CircuitRole::Responder => MultistreamSelect::listener([NOISE_PROTOCOL_ID.to_string()]),
-        };
         let circuit = Circuit {
             id,
             inner_conn: adoption.inner_conn,
@@ -311,13 +282,14 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             relay: adoption.relay,
             remote_peer: adoption.remote_peer,
             role: adoption.role,
-            phase: Some(Phase::SelectNoise {
-                select,
-                noise: Some(noise),
-            }),
+            session,
         };
 
-        self.next_circuit_id = next;
+        // Consume the sequence only here: an adoption that failed above
+        // (entropy, validation) must leave the id space untouched.
+        let consumed = self.circuit_id_allocator.allocate();
+        debug_assert_eq!(consumed, Ok(id), "peeked id must match the allocated one");
+
         self.bridge_index.insert(key, id);
         if adoption.role == CircuitRole::Responder {
             self.pending.push_back(TransportEvent::IncomingConnection {
@@ -328,16 +300,11 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         self.circuits.insert(id, circuit);
 
         let start_result = self.with_circuit(id, |this, circuit| {
-            let phase = circuit
-                .phase
-                .take()
-                .ok_or_else(|| "circuit phase unavailable".to_string())?;
-            let phase = this.start_phase(circuit, phase)?;
-            circuit.phase = Some(phase);
-            Ok(())
+            circuit.session.start()?;
+            this.pump(circuit)
         });
-        if let Err(message) = start_result {
-            self.fail_circuit(id, message, true);
+        if let Err(teardown) = start_result {
+            self.fail_circuit(id, teardown.message, true);
             return Ok(id);
         }
         if !adoption.pending_data.is_empty() {
@@ -361,23 +328,20 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         let Some(id) = self.bridge_index.get(&key).copied() else {
             return;
         };
-        // `feed_phase` temporarily takes the phase and leaves it absent on
-        // error, so capture readiness before entering it. In particular, a
-        // normal Yamux GoAway from a Ready circuit must close without being
+        // A failed session is unusable, so `is_ready` reads false afterwards:
+        // capture readiness before feeding it. In particular, a normal Yamux
+        // GoAway from an established circuit must close without being
         // misclassified as a pre-handshake protocol failure.
         let pre_ready = self.circuits.get(&id).is_some_and(|c| !c.is_ready());
         let result = self.with_circuit(id, |this, circuit| {
-            let phase = circuit
-                .phase
-                .take()
-                .ok_or_else(|| "circuit phase unavailable".to_string())?;
-            let phase = this.feed_phase(circuit, phase, data)?;
-            circuit.phase = Some(phase);
-            Ok(())
+            let fed = circuit.session.handle_input(data);
+            // Pump either way: bytes the session queued before failing, and
+            // events it already produced, are the caller's regardless.
+            let pumped = this.pump(circuit);
+            fed.map_err(Teardown::from).and(pumped)
         });
-        if let Err(message) = &result {
-            let normal_go_away = message == "remote closed the Yamux session";
-            self.fail_circuit(id, message.clone(), pre_ready || !normal_go_away);
+        if let Err(teardown) = result {
+            self.fail_circuit(id, teardown.message, pre_ready || !teardown.graceful);
         }
     }
 
@@ -411,12 +375,12 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
     fn with_circuit<R>(
         &mut self,
         id: ConnectionId,
-        operation: impl FnOnce(&mut Self, &mut Circuit) -> Result<R, String>,
-    ) -> Result<R, String> {
+        operation: impl FnOnce(&mut Self, &mut Circuit) -> Result<R, Teardown>,
+    ) -> Result<R, Teardown> {
         let mut circuit = self
             .circuits
             .remove(&id)
-            .ok_or_else(|| format!("circuit {id} is unknown"))?;
+            .ok_or_else(|| Teardown::fault(format!("circuit {id} is unknown")))?;
         let result = operation(self, &mut circuit);
         self.circuits.insert(id, circuit);
         result
@@ -446,355 +410,64 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         self.retired_bridge_order.retain(|(conn, _)| *conn != id);
     }
 
-    fn start_phase(&mut self, circuit: &Circuit, phase: Phase) -> Result<Phase, String> {
-        match phase {
-            Phase::SelectNoise { mut select, noise } => {
-                select
-                    .handle_input(MultistreamInput::Start)
-                    .map_err(|error| format!("Noise multistream start failed: {error}"))?;
-                self.drain_raw_select(circuit, &mut select)?;
-                Ok(Phase::SelectNoise { select, noise })
-            }
-            other => Ok(other),
-        }
-    }
-
-    fn feed_phase(
-        &mut self,
-        circuit: &Circuit,
-        phase: Phase,
-        data: Vec<u8>,
-    ) -> Result<Phase, String> {
-        match phase {
-            Phase::SelectNoise {
-                mut select,
-                mut noise,
-            } => {
-                select
-                    .handle_input(MultistreamInput::Data(data))
-                    .map_err(|error| format!("Noise multistream failed: {error}"))?;
-                let mut negotiated = false;
-                while let Some(output) = select.poll_output() {
-                    match output {
-                        MultistreamOutput::OutboundData(bytes) => {
-                            self.send_bridge(circuit, bytes)?;
-                        }
-                        MultistreamOutput::Negotiated { protocol }
-                            if protocol == NOISE_PROTOCOL_ID =>
-                        {
-                            negotiated = true;
-                        }
-                        MultistreamOutput::Negotiated { .. } | MultistreamOutput::NotAvailable => {
-                            return Err("remote did not negotiate Noise".to_string());
-                        }
-                        MultistreamOutput::ProtocolError { reason } => {
-                            return Err(format!("Noise multistream protocol error: {reason}"));
-                        }
-                    }
-                }
-                if !negotiated {
-                    return Ok(Phase::SelectNoise { select, noise });
-                }
-                let remaining = select.take_remaining_buffer();
-                let mut noise = noise
-                    .take()
-                    .ok_or_else(|| "Noise session unavailable".to_string())?;
-                noise
-                    .handle_input(NoiseInput::Start)
-                    .map_err(|error| format!("Noise start failed: {error}"))?;
-                let (peer, decrypted) = self.drain_noise(circuit, &mut noise)?;
-                if peer.is_some() || !decrypted.is_empty() {
-                    return Err("Noise produced transport data before input".to_string());
-                }
-                if remaining.is_empty() {
-                    Ok(Phase::Noise { noise })
-                } else {
-                    self.feed_phase(circuit, Phase::Noise { noise }, remaining)
-                }
-            }
-            Phase::Noise { mut noise } => {
-                noise
-                    .handle_input(NoiseInput::Data(data))
-                    .map_err(|error| format!("Noise handshake failed: {error}"))?;
-                let (peer, decrypted) = self.drain_noise(circuit, &mut noise)?;
-                let Some(peer) = peer else {
-                    if !decrypted.is_empty() {
-                        return Err("Noise decrypted data before authentication".to_string());
-                    }
-                    return Ok(Phase::Noise { noise });
-                };
-                let mut select = match circuit.role {
-                    CircuitRole::Initiator => MultistreamSelect::dialer(YAMUX_PROTOCOL_ID),
-                    CircuitRole::Responder => {
-                        MultistreamSelect::listener([YAMUX_PROTOCOL_ID.to_string()])
-                    }
-                };
-                select
-                    .handle_input(MultistreamInput::Start)
-                    .map_err(|error| format!("Yamux multistream start failed: {error}"))?;
-                self.drain_encrypted_select(circuit, &mut noise, &mut select)?;
-                let mut phase = Phase::SelectYamux {
-                    noise,
-                    select,
-                    peer,
-                };
-                for plaintext in decrypted {
-                    phase = self.feed_decrypted_transport(circuit, phase, plaintext)?;
-                }
-                Ok(phase)
-            }
-            Phase::SelectYamux {
-                mut noise,
-                select,
-                peer,
-            } => {
-                noise
-                    .handle_input(NoiseInput::Data(data))
-                    .map_err(|error| format!("Noise transport failed: {error}"))?;
-                let (unexpected_peer, decrypted) = self.drain_noise(circuit, &mut noise)?;
-                if unexpected_peer.is_some() {
-                    return Err("Noise authenticated twice".to_string());
-                }
-                let mut phase = Phase::SelectYamux {
-                    noise,
-                    select,
-                    peer,
-                };
-                for plaintext in decrypted {
-                    phase = self.feed_decrypted_transport(circuit, phase, plaintext)?;
-                }
-                Ok(phase)
-            }
-            Phase::Ready {
-                mut noise,
-                mut yamux,
-                peer,
-            } => {
-                noise
-                    .handle_input(NoiseInput::Data(data))
-                    .map_err(|error| format!("Noise transport failed: {error}"))?;
-                let (unexpected_peer, decrypted) = self.drain_noise(circuit, &mut noise)?;
-                if unexpected_peer.is_some() {
-                    return Err("Noise authenticated twice".to_string());
-                }
-                for plaintext in decrypted {
-                    let result = yamux.handle_input(YamuxInput::Data(plaintext));
-                    self.drain_yamux(circuit, &mut noise, &mut yamux)?;
-                    result.map_err(|error| format!("Yamux protocol failed: {error}"))?;
-                }
-                Ok(Phase::Ready { noise, yamux, peer })
-            }
-        }
-    }
-
-    /// Routes plaintext Noise transport messages across the exact Yamux
-    /// phase boundary. One bridge read may decrypt both the selection reply
-    /// and immediately-pipelined Yamux frames, so later plaintexts must use
-    /// the `Ready` state produced by an earlier one in the same batch.
-    fn feed_decrypted_transport(
-        &mut self,
-        circuit: &Circuit,
-        phase: Phase,
-        plaintext: Vec<u8>,
-    ) -> Result<Phase, String> {
-        match phase {
-            phase @ Phase::SelectYamux { .. } => {
-                self.feed_decrypted_yamux_select(circuit, phase, plaintext)
-            }
-            Phase::Ready {
-                mut noise,
-                mut yamux,
-                peer,
-            } => {
-                let result = yamux.handle_input(YamuxInput::Data(plaintext));
-                self.drain_yamux(circuit, &mut noise, &mut yamux)?;
-                result.map_err(|error| format!("Yamux protocol failed: {error}"))?;
-                Ok(Phase::Ready { noise, yamux, peer })
-            }
-            _ => Err("decrypted transport data arrived before Yamux selection".to_string()),
-        }
-    }
-
-    fn feed_decrypted_yamux_select(
-        &mut self,
-        circuit: &Circuit,
-        phase: Phase,
-        plaintext: Vec<u8>,
-    ) -> Result<Phase, String> {
-        let Phase::SelectYamux {
-            mut noise,
-            mut select,
-            peer,
-        } = phase
-        else {
-            return Err("Yamux selection completed before pipelined data".to_string());
-        };
-        select
-            .handle_input(MultistreamInput::Data(plaintext))
-            .map_err(|error| format!("Yamux multistream failed: {error}"))?;
-        let mut negotiated = false;
-        while let Some(output) = select.poll_output() {
+    /// Drains session outputs, writing bytes to the bridge and turning
+    /// everything else into public transport events.
+    ///
+    /// The session queues both in one ordered stream, so a single pass keeps
+    /// the wire and the event feed in step.
+    fn pump(&mut self, circuit: &mut Circuit) -> Result<(), Teardown> {
+        while let Some(output) = circuit.session.poll_output() {
             match output {
-                MultistreamOutput::OutboundData(bytes) => {
-                    self.encrypt_bridge(circuit, &mut noise, bytes)?;
+                SessionOutput::Write(bytes) => {
+                    self.inner
+                        .send_stream(circuit.inner_conn, circuit.bridge_stream, bytes)
+                        .map_err(|error| {
+                            Teardown::fault(format!("relay bridge send failed: {error}"))
+                        })?;
                 }
-                MultistreamOutput::Negotiated { protocol } if protocol == YAMUX_PROTOCOL_ID => {
-                    negotiated = true;
-                }
-                MultistreamOutput::Negotiated { .. } | MultistreamOutput::NotAvailable => {
-                    return Err("remote did not negotiate Yamux".to_string());
-                }
-                MultistreamOutput::ProtocolError { reason } => {
-                    return Err(format!("Yamux multistream protocol error: {reason}"));
-                }
-            }
-        }
-        if !negotiated {
-            return Ok(Phase::SelectYamux {
-                noise,
-                select,
-                peer,
-            });
-        }
-        if self
-            .direct_by_peer
-            .get(&peer)
-            .is_some_and(|connections| !connections.is_empty())
-        {
-            return Err("direct connection won circuit arbitration".to_string());
-        }
-        let remaining = select.take_remaining_buffer();
-        let mut yamux = YamuxSession::with_config(
-            match circuit.role {
-                CircuitRole::Initiator => YamuxRole::Client,
-                CircuitRole::Responder => YamuxRole::Server,
-            },
-            self.yamux_config.clone(),
-        )
-        .map_err(|error| format!("invalid Yamux configuration: {error}"))?;
-        self.pending.push_back(TransportEvent::Connected {
-            id: circuit.id,
-            endpoint: circuit.endpoint(Some(peer.clone())),
-        });
-        if !remaining.is_empty() {
-            let result = yamux.handle_input(YamuxInput::Data(remaining));
-            self.drain_yamux(circuit, &mut noise, &mut yamux)?;
-            result.map_err(|error| format!("Yamux protocol failed: {error}"))?;
-        }
-        Ok(Phase::Ready { noise, yamux, peer })
-    }
-
-    fn drain_raw_select(
-        &mut self,
-        circuit: &Circuit,
-        select: &mut MultistreamSelect,
-    ) -> Result<(), String> {
-        while let Some(output) = select.poll_output() {
-            if let MultistreamOutput::OutboundData(bytes) = output {
-                self.send_bridge(circuit, bytes)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn drain_encrypted_select(
-        &mut self,
-        circuit: &Circuit,
-        noise: &mut NoiseSession,
-        select: &mut MultistreamSelect,
-    ) -> Result<(), String> {
-        while let Some(output) = select.poll_output() {
-            if let MultistreamOutput::OutboundData(bytes) = output {
-                self.encrypt_bridge(circuit, noise, bytes)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn drain_noise(
-        &mut self,
-        circuit: &Circuit,
-        noise: &mut NoiseSession,
-    ) -> Result<(Option<PeerId>, Vec<Vec<u8>>), String> {
-        let mut peer = None;
-        let mut decrypted = Vec::new();
-        while let Some(output) = noise.poll_output() {
-            match output {
-                NoiseOutput::Outbound(bytes) => self.send_bridge(circuit, bytes)?,
-                NoiseOutput::HandshakeComplete {
-                    peer: authenticated,
-                    ..
-                } => peer = Some(authenticated),
-                NoiseOutput::Decrypted(bytes) => decrypted.push(bytes),
-            }
-        }
-        Ok((peer, decrypted))
-    }
-
-    fn drain_yamux(
-        &mut self,
-        circuit: &Circuit,
-        noise: &mut NoiseSession,
-        yamux: &mut YamuxSession,
-    ) -> Result<(), String> {
-        while let Some(output) = yamux.poll_output() {
-            match output {
-                YamuxOutput::Outbound(bytes) => self.encrypt_bridge(circuit, noise, bytes)?,
-                YamuxOutput::IncomingStream { stream } => {
-                    self.pending.push_back(TransportEvent::IncomingStream {
+                SessionOutput::Established { peer } => {
+                    // The session leaves this policy to its host, and here the
+                    // host is this wrapper: a verified direct connection
+                    // outranks a relayed one, so the circuit loses.
+                    if self
+                        .direct_by_peer
+                        .get(&peer)
+                        .is_some_and(|connections| !connections.is_empty())
+                    {
+                        return Err(Teardown::fault("direct connection won circuit arbitration"));
+                    }
+                    self.pending.push_back(TransportEvent::Connected {
                         id: circuit.id,
-                        stream_id: StreamId::new(u64::from(stream)),
+                        endpoint: circuit.endpoint(Some(peer)),
                     });
                 }
-                YamuxOutput::Data { stream, data } => {
+                SessionOutput::IncomingStream { stream } => {
+                    self.pending.push_back(TransportEvent::IncomingStream {
+                        id: circuit.id,
+                        stream_id: stream,
+                    });
+                }
+                SessionOutput::StreamData { stream, data } => {
                     self.pending.push_back(TransportEvent::StreamData {
                         id: circuit.id,
-                        stream_id: StreamId::new(u64::from(stream)),
+                        stream_id: stream,
                         data,
                     });
                 }
-                YamuxOutput::RemoteWriteClosed { stream } => {
+                SessionOutput::StreamRemoteWriteClosed { stream } => {
                     self.pending
                         .push_back(TransportEvent::StreamRemoteWriteClosed {
                             id: circuit.id,
-                            stream_id: StreamId::new(u64::from(stream)),
+                            stream_id: stream,
                         });
                 }
-                YamuxOutput::StreamClosed { stream } => {
+                SessionOutput::StreamClosed { stream } => {
                     self.pending.push_back(TransportEvent::StreamClosed {
                         id: circuit.id,
-                        stream_id: StreamId::new(u64::from(stream)),
+                        stream_id: stream,
                     });
                 }
-                YamuxOutput::GoAwayReceived { code: 0 } => {
-                    return Err("remote closed the Yamux session".to_string());
-                }
-                YamuxOutput::GoAwayReceived { code } => {
-                    return Err(format!("remote closed Yamux with error code {code}"));
-                }
             }
-        }
-        Ok(())
-    }
-
-    fn send_bridge(&mut self, circuit: &Circuit, bytes: Vec<u8>) -> Result<(), String> {
-        self.inner
-            .send_stream(circuit.inner_conn, circuit.bridge_stream, bytes)
-            .map_err(|error| format!("relay bridge send failed: {error}"))
-    }
-
-    fn encrypt_bridge(
-        &mut self,
-        circuit: &Circuit,
-        noise: &mut NoiseSession,
-        plaintext: Vec<u8>,
-    ) -> Result<(), String> {
-        noise
-            .handle_input(NoiseInput::Encrypt(plaintext))
-            .map_err(|error| format!("Noise encryption failed: {error}"))?;
-        let (peer, decrypted) = self.drain_noise(circuit, noise)?;
-        if peer.is_some() || !decrypted.is_empty() {
-            return Err("unexpected Noise output while encrypting".to_string());
         }
         Ok(())
     }
@@ -864,7 +537,8 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         let _ = self.inner.close(id);
         self.pending.push_back(TransportEvent::Error {
             id,
-            message: "wrapped transport used the circuit connection-ID bit".to_string(),
+            message: "wrapped transport allocated in the circuit connection-ID namespace"
+                .to_string(),
         });
     }
 
@@ -882,7 +556,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             | TransportEvent::PeerIdentityVerified { id, .. } => Some(*id),
             TransportEvent::Listening { .. } => None,
         };
-        if event_id.is_some_and(is_circuit_id) {
+        if event_id.is_some_and(ConnectionId::is_circuit) {
             self.reject_inner_collision(event_id.expect("checked above"));
             return;
         }
@@ -974,97 +648,55 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         }
     }
 
-    fn circuit_stream(&self, id: ConnectionId, stream_id: StreamId) -> Result<u32, TransportError> {
-        if !self.circuits.contains_key(&id) {
-            return Err(TransportError::ConnectionNotFound { id });
-        }
-        u32::try_from(stream_id.as_u64())
-            .map_err(|_| TransportError::StreamNotFound { id, stream_id })
-    }
-
-    fn operate_ready<R>(
+    /// Runs one stream operation against a circuit's session and flushes
+    /// whatever it queued.
+    ///
+    /// A failure that kills the session closes the circuit before returning.
+    /// No `Error` event goes out: the caller already learns why from the
+    /// returned error, exactly as for a locally requested [`Transport::close`].
+    fn operate_session<R>(
         &mut self,
         id: ConnectionId,
-        operation: impl FnOnce(&mut YamuxSession) -> Result<R, YamuxError>,
+        operation: impl FnOnce(&mut SecureMuxSession) -> Result<R, SessionError>,
     ) -> Result<R, TransportError> {
         let mut circuit = self
             .circuits
             .remove(&id)
             .ok_or(TransportError::ConnectionNotFound { id })?;
-        let Some(Phase::Ready {
-            mut noise,
-            mut yamux,
-            peer,
-        }) = circuit.phase.take()
-        else {
-            self.circuits.insert(id, circuit);
-            return Err(TransportError::InvalidState {
-                id,
-                state: minip2p_transport::ConnectionState::Connecting,
-                expected: minip2p_transport::ConnectionState::Connected,
-            });
-        };
-        let result = operation(&mut yamux);
-        let drain = self.drain_yamux(&circuit, &mut noise, &mut yamux);
-        circuit.phase = Some(Phase::Ready { noise, yamux, peer });
+        let result = operation(&mut circuit.session);
+        let pumped = self.pump(&mut circuit);
         self.circuits.insert(id, circuit);
-        if let Err(message) = drain {
-            self.fail_circuit(id, message.clone(), false);
-            return Err(TransportError::PollError { reason: message });
-        }
-        result.map_err(|error| TransportError::PollError {
-            reason: error.to_string(),
-        })
-    }
 
-    fn send_circuit(
-        &mut self,
-        id: ConnectionId,
-        stream_id: StreamId,
-        data: Vec<u8>,
-    ) -> Result<(), TransportError> {
-        let stream = self.circuit_stream(id, stream_id)?;
-        let mut circuit = self
-            .circuits
-            .remove(&id)
-            .ok_or(TransportError::ConnectionNotFound { id })?;
-        let Some(Phase::Ready {
-            mut noise,
-            mut yamux,
-            peer,
-        }) = circuit.phase.take()
-        else {
-            self.circuits.insert(id, circuit);
-            return Err(TransportError::InvalidState {
-                id,
-                state: minip2p_transport::ConnectionState::Connecting,
-                expected: minip2p_transport::ConnectionState::Connected,
-            });
-        };
-        let result = yamux.send(stream, data);
-        let drain = self.drain_yamux(&circuit, &mut noise, &mut yamux);
-        circuit.phase = Some(Phase::Ready { noise, yamux, peer });
-        self.circuits.insert(id, circuit);
-        if let Err(message) = drain {
-            self.fail_circuit(id, message.clone(), false);
-            return Err(TransportError::StreamSendFailed {
-                id,
-                stream_id,
-                reason: message,
+        if let Err(teardown) = pumped {
+            self.fail_circuit(id, teardown.message.clone(), false);
+            return Err(TransportError::PollError {
+                reason: teardown.message,
             });
         }
         match result {
-            Ok(()) => Ok(()),
-            Err(YamuxError::SendBufferFull { .. }) => Err(TransportError::StreamSendFailed {
+            Ok(value) => Ok(value),
+            Err(SessionError::NotEstablished) => Err(TransportError::InvalidState {
                 id,
-                stream_id,
-                reason: "Yamux send buffer is full".to_string(),
+                state: ConnectionState::Connecting,
+                expected: ConnectionState::Connected,
             }),
-            Err(error) => Err(TransportError::StreamSendFailed {
+            Err(SessionError::UnknownStream { stream }) => Err(TransportError::StreamNotFound {
                 id,
-                stream_id,
+                stream_id: stream,
+            }),
+            // Yamux refused the operation — a full send buffer, an unknown
+            // substream — but the session itself is still healthy.
+            Err(SessionError::Yamux(error)) => Err(TransportError::PollError {
                 reason: error.to_string(),
             }),
+            // Defensive: today a session only fails fatally while handling
+            // input, so a local operation cannot land here. Dropping the arm
+            // would leave a dead session in the map if that ever changed.
+            Err(fatal) => {
+                let reason = fatal.to_string();
+                self.fail_circuit(id, reason.clone(), false);
+                Err(TransportError::PollError { reason })
+            }
         }
     }
 
@@ -1076,11 +708,12 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
 impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
     fn dial(&mut self, address: &minip2p_core::PeerAddr) -> Result<ConnectionId, TransportError> {
         let id = self.inner.dial(address)?;
-        if is_circuit_id(id) {
+        if id.is_circuit() {
             let _ = self.inner.close(id);
             return Err(TransportError::DialFailed {
                 id,
-                reason: "wrapped transport used the circuit connection-ID bit".to_string(),
+                reason: "wrapped transport allocated in the circuit connection-ID namespace"
+                    .to_string(),
             });
         }
         Ok(id)
@@ -1091,11 +724,10 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
     }
 
     fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
-        if !is_circuit_id(id) {
+        if !id.is_circuit() {
             return self.inner.open_stream(id);
         }
-        let stream = self.operate_ready(id, YamuxSession::open_stream)?;
-        let stream_id = StreamId::new(u64::from(stream));
+        let stream_id = self.operate_session(id, SecureMuxSession::open_stream)?;
         self.pending
             .push_back(TransportEvent::StreamOpened { id, stream_id });
         Ok(stream_id)
@@ -1107,10 +739,17 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         stream_id: StreamId,
         data: Vec<u8>,
     ) -> Result<(), TransportError> {
-        if !is_circuit_id(id) {
+        if !id.is_circuit() {
             return self.inner.send_stream(id, stream_id, data);
         }
-        self.send_circuit(id, stream_id, data)
+        self.operate_session(id, |session| session.send(stream_id, data))
+            .map_err(|error| {
+                stream_error(error, |reason| TransportError::StreamSendFailed {
+                    id,
+                    stream_id,
+                    reason,
+                })
+            })
     }
 
     fn close_stream_write(
@@ -1118,20 +757,17 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
-        if !is_circuit_id(id) {
+        if !id.is_circuit() {
             return self.inner.close_stream_write(id, stream_id);
         }
-        let stream = self.circuit_stream(id, stream_id)?;
-        match self.operate_ready(id, |yamux| yamux.close_write(stream)) {
-            Ok(()) => Ok(()),
-            Err(error @ TransportError::ConnectionNotFound { .. })
-            | Err(error @ TransportError::InvalidState { .. }) => Err(error),
-            Err(error) => Err(TransportError::StreamCloseWriteFailed {
-                id,
-                stream_id,
-                reason: error.to_string(),
-            }),
-        }
+        self.operate_session(id, |session| session.close_stream_write(stream_id))
+            .map_err(|error| {
+                stream_error(error, |reason| TransportError::StreamCloseWriteFailed {
+                    id,
+                    stream_id,
+                    reason,
+                })
+            })
     }
 
     fn reset_stream(
@@ -1139,24 +775,21 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         id: ConnectionId,
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
-        if !is_circuit_id(id) {
+        if !id.is_circuit() {
             return self.inner.reset_stream(id, stream_id);
         }
-        let stream = self.circuit_stream(id, stream_id)?;
-        match self.operate_ready(id, |yamux| yamux.reset(stream)) {
-            Ok(()) => Ok(()),
-            Err(error @ TransportError::ConnectionNotFound { .. })
-            | Err(error @ TransportError::InvalidState { .. }) => Err(error),
-            Err(error) => Err(TransportError::StreamResetFailed {
-                id,
-                stream_id,
-                reason: error.to_string(),
-            }),
-        }
+        self.operate_session(id, |session| session.reset_stream(stream_id))
+            .map_err(|error| {
+                stream_error(error, |reason| TransportError::StreamResetFailed {
+                    id,
+                    stream_id,
+                    reason,
+                })
+            })
     }
 
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
-        if !is_circuit_id(id) {
+        if !id.is_circuit() {
             return self.inner.close(id);
         }
         let mut circuit = self
@@ -1166,22 +799,17 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         let key = circuit.bridge_key();
         self.bridge_index.remove(&key);
         self.retire_bridge(key);
-        let ready = circuit.is_ready();
-        let mut graceful = false;
-        if let Some(Phase::Ready {
-            mut noise,
-            mut yamux,
-            ..
-        }) = circuit.phase.take()
-        {
-            yamux.go_away(0);
-            graceful = self.drain_yamux(&circuit, &mut noise, &mut yamux).is_ok()
-                && self
-                    .inner
-                    .close_stream_write(circuit.inner_conn, circuit.bridge_stream)
-                    .is_ok();
-        }
-        if !ready || !graceful {
+        // A circuit still negotiating has no Yamux session to shut down, so
+        // `go_away` refuses and the bridge is reset instead.
+        let announced = circuit.session.go_away(0).is_ok();
+        let flushed = self.pump(&mut circuit).is_ok();
+        let graceful = announced
+            && flushed
+            && self
+                .inner
+                .close_stream_write(circuit.inner_conn, circuit.bridge_stream)
+                .is_ok();
+        if !graceful {
             let _ = self
                 .inner
                 .reset_stream(circuit.inner_conn, circuit.bridge_stream);
@@ -1190,29 +818,23 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         Ok(())
     }
 
-    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+    fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
         if !self.pending.is_empty() {
             return Ok(self.drain_pending_events());
         }
-        for event in self.inner.poll()? {
+        for event in self.inner.poll(now)? {
             self.handle_inner_event(event);
         }
         Ok(self.drain_pending_events())
     }
 
-    fn next_timeout(&self) -> Option<Duration> {
+    fn next_deadline(&self) -> Option<Deadline> {
         if self.pending.is_empty() {
-            self.inner.next_timeout()
+            self.inner.next_deadline()
         } else {
-            Some(Duration::ZERO)
-        }
-    }
-
-    fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-        if self.pending.is_empty() {
-            self.inner.wait_for_input(timeout)
-        } else {
-            WaitOutcome::Ready
+            // Buffered circuit events are due regardless of what the host's
+            // clock reads, so this needs no retained time sample.
+            Some(Deadline::IMMEDIATE)
         }
     }
 
@@ -1223,28 +845,77 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
         self.inner.active_inbound_connection_sources()
     }
+
+    /// Forwards to the wrapped transport, which owns the socket a hole punch
+    /// has to leave from. A circuit has no datagram of its own to send.
+    fn send_datagram(&mut self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
+        self.inner.send_datagram(target, payload)
+    }
 }
 
 #[cfg(feature = "std")]
-impl<T> CircuitTransport<T, OsEntropy> {
+impl<T: minip2p_transport::BlockingTransport, E: EntropySource> minip2p_transport::BlockingTransport
+    for CircuitTransport<T, E>
+{
+    fn wait_for_input(&mut self, timeout: core::time::Duration) -> minip2p_transport::WaitOutcome {
+        if self.pending.is_empty() {
+            self.inner.wait_for_input(timeout)
+        } else {
+            minip2p_transport::WaitOutcome::Ready
+        }
+    }
+
+    /// Forwards to the wrapped transport, which owns the socket that
+    /// `wait_for_input` actually blocks on.
+    ///
+    /// Inheriting the inert default would hand callers a handle that silently
+    /// does nothing while the wait still blocks inside the inner transport.
+    fn wait_handle(&self) -> minip2p_transport::WaitHandle {
+        self.inner.wait_handle()
+    }
+}
+
+/// Wraps a session failure as the stream error the transport contract expects.
+///
+/// Identifier and state errors pass through: they describe the request rather
+/// than the stream operation, and callers match on them.
+fn stream_error(
+    error: TransportError,
+    wrap: impl FnOnce(String) -> TransportError,
+) -> TransportError {
+    match error {
+        error @ (TransportError::ConnectionNotFound { .. }
+        | TransportError::StreamNotFound { .. }
+        | TransportError::InvalidState { .. }) => error,
+        error => wrap(error.to_string()),
+    }
+}
+
+#[cfg(feature = "std")]
+impl<T> CircuitTransport<T, StdEntropy> {
     /// Wraps a transport using operating-system entropy.
     pub fn new_os(inner: T, identity: Ed25519Keypair) -> Self {
-        Self::new(inner, identity, OsEntropy)
+        Self::new(inner, identity, StdEntropy::new())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minip2p_core::SansIoProtocol;
+    use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, MultistreamSelect};
+    use minip2p_noise::{
+        NOISE_PROTOCOL_ID, NoiseConfig, NoiseInput, NoiseOutput, NoiseRole, NoiseSession,
+    };
     use minip2p_test_support::InMemoryTransport;
 
     #[derive(Clone, Debug)]
     struct CounterEntropy(u8);
 
     impl EntropySource for CounterEntropy {
-        fn fill(&mut self, destination: &mut [u8]) -> Result<(), EntropyError> {
+        fn fill_bytes(&mut self, output: &mut [u8]) -> Result<(), EntropyError> {
             self.0 = self.0.wrapping_add(1);
-            destination.fill(self.0);
+            output.fill(self.0);
             Ok(())
         }
     }
@@ -1252,16 +923,114 @@ mod tests {
     struct FailingEntropy;
 
     impl EntropySource for FailingEntropy {
-        fn fill(&mut self, _destination: &mut [u8]) -> Result<(), EntropyError> {
-            Err(EntropyError::new("injected failure"))
+        fn fill_bytes(&mut self, _output: &mut [u8]) -> Result<(), EntropyError> {
+            Err(EntropyError::failed("injected failure"))
         }
     }
 
     struct CloseObservingTransport<T> {
         inner: T,
         fail_close_write: bool,
+        fail_send: bool,
         close_write_calls: usize,
         reset_calls: usize,
+    }
+
+    /// Leaf transport whose wait handle records interrupts, so a test can
+    /// prove one reached the bottom of a decorator stack.
+    struct WakeableTransport {
+        inner: InMemoryTransport,
+        interrupts: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
+    }
+
+    impl Transport for WakeableTransport {
+        fn dial(&mut self, addr: &minip2p_core::PeerAddr) -> Result<ConnectionId, TransportError> {
+            self.inner.dial(addr)
+        }
+
+        fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
+            self.inner.listen(addr)
+        }
+
+        fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
+            self.inner.open_stream(id)
+        }
+
+        fn send_stream(
+            &mut self,
+            id: ConnectionId,
+            stream_id: StreamId,
+            data: Vec<u8>,
+        ) -> Result<(), TransportError> {
+            self.inner.send_stream(id, stream_id, data)
+        }
+
+        fn close_stream_write(
+            &mut self,
+            id: ConnectionId,
+            stream_id: StreamId,
+        ) -> Result<(), TransportError> {
+            self.inner.close_stream_write(id, stream_id)
+        }
+
+        fn reset_stream(
+            &mut self,
+            id: ConnectionId,
+            stream_id: StreamId,
+        ) -> Result<(), TransportError> {
+            self.inner.reset_stream(id, stream_id)
+        }
+
+        fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
+            self.inner.close(id)
+        }
+
+        fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
+            self.inner.poll(now)
+        }
+    }
+
+    impl minip2p_transport::BlockingTransport for WakeableTransport {
+        fn wait_handle(&self) -> minip2p_transport::WaitHandle {
+            let interrupts = alloc::sync::Arc::clone(&self.interrupts);
+            minip2p_transport::WaitHandle::new(move || {
+                interrupts.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            })
+        }
+    }
+
+    /// A decorator that forwards `wait_for_input` but inherits the inert
+    /// default `wait_handle` hands callers a handle that does nothing while
+    /// the wait still blocks in the transport underneath.
+    #[test]
+    fn wait_handle_reaches_through_the_circuit_wrapper() {
+        use minip2p_transport::BlockingTransport;
+
+        let local = identity(1);
+        let relay = identity(9).peer_id();
+        let (inner, _) = InMemoryTransport::pair(local.peer_id(), relay);
+        let interrupts = alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let transport = CircuitTransport::new(
+            WakeableTransport {
+                inner,
+                interrupts: alloc::sync::Arc::clone(&interrupts),
+            },
+            local,
+            CounterEntropy(1),
+        );
+
+        let handle = BlockingTransport::wait_handle(&transport);
+        assert!(
+            !handle.is_noop(),
+            "the wrapper must not report an inert handle over a wakeable transport"
+        );
+
+        handle.interrupt();
+        assert_eq!(
+            interrupts.load(core::sync::atomic::Ordering::SeqCst),
+            1,
+            "interrupt must reach the transport that owns the wait"
+        );
     }
 
     impl<T> CloseObservingTransport<T> {
@@ -1269,6 +1038,7 @@ mod tests {
             Self {
                 inner,
                 fail_close_write: false,
+                fail_send: false,
                 close_write_calls: 0,
                 reset_calls: 0,
             }
@@ -1297,6 +1067,13 @@ mod tests {
             stream_id: StreamId,
             data: Vec<u8>,
         ) -> Result<(), TransportError> {
+            if self.fail_send {
+                return Err(TransportError::StreamSendFailed {
+                    id,
+                    stream_id,
+                    reason: "injected bridge send failure".to_string(),
+                });
+            }
             self.inner.send_stream(id, stream_id, data)
         }
 
@@ -1329,16 +1106,12 @@ mod tests {
             self.inner.close(id)
         }
 
-        fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
-            self.inner.poll()
+        fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
+            self.inner.poll(now)
         }
 
-        fn next_timeout(&self) -> Option<Duration> {
-            self.inner.next_timeout()
-        }
-
-        fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
-            self.inner.wait_for_input(timeout)
+        fn next_deadline(&self) -> Option<Deadline> {
+            self.inner.next_deadline()
         }
 
         fn local_addresses(&self) -> Vec<Multiaddr> {
@@ -1361,6 +1134,22 @@ mod tests {
         PeerId,
         PeerId,
     );
+
+    /// Whether a circuit has authenticated its peer but not finished the
+    /// upgrade: the exact window in which a decrypted batch can straddle the
+    /// Yamux selection boundary.
+    fn selecting_yamux<T, E>(transport: &CircuitTransport<T, E>, id: ConnectionId) -> bool {
+        transport.circuits.get(&id).is_some_and(|circuit| {
+            circuit.session.peer().is_some() && !circuit.session.is_established()
+        })
+    }
+
+    fn established<T, E>(transport: &CircuitTransport<T, E>, id: ConnectionId) -> bool {
+        transport
+            .circuits
+            .get(&id)
+            .is_some_and(|circuit| circuit.session.is_established())
+    }
 
     fn identity(seed: u8) -> Ed25519Keypair {
         Ed25519Keypair::from_secret_key_bytes([seed; 32])
@@ -1390,11 +1179,11 @@ mod tests {
             b.set_yamux_config(config);
         }
 
-        let _ = a.poll().expect("initial A events");
-        let _ = b.poll().expect("initial B events");
+        let _ = a.poll(Now::from_millis(0)).expect("initial A events");
+        let _ = b.poll(Now::from_millis(0)).expect("initial B events");
         let bridge = a.inner_mut().open_stream(inner_conn).expect("bridge open");
-        let _ = a.poll().expect("local bridge event");
-        let _ = b.poll().expect("remote bridge event");
+        let _ = a.poll(Now::from_millis(0)).expect("local bridge event");
+        let _ = b.poll(Now::from_millis(0)).expect("remote bridge event");
 
         let a_id = a
             .adopt_bridge(BridgeAdoption {
@@ -1422,7 +1211,7 @@ mod tests {
         // pair helpers refer to both deterministic IDs with one value.
         assert_eq!(a_id, b_id);
         assert!(CircuitTransport::<InMemoryTransport, CounterEntropy>::is_circuit(a_id));
-        let incoming = b.poll().expect("responder incoming");
+        let incoming = b.poll(Now::from_millis(0)).expect("responder incoming");
         assert!(matches!(
             incoming.as_slice(),
             [TransportEvent::IncomingConnection { id, endpoint }]
@@ -1456,11 +1245,11 @@ mod tests {
             CounterEntropy(10),
         );
         let mut b = CircuitTransport::new(inner_b, b_identity, CounterEntropy(20));
-        let _ = a.poll().expect("initial A events");
-        let _ = b.poll().expect("initial B events");
+        let _ = a.poll(Now::from_millis(0)).expect("initial A events");
+        let _ = b.poll(Now::from_millis(0)).expect("initial B events");
         let bridge = a.inner_mut().open_stream(inner_conn).expect("bridge open");
-        let _ = a.poll().expect("local bridge event");
-        let _ = b.poll().expect("remote bridge event");
+        let _ = a.poll(Now::from_millis(0)).expect("local bridge event");
+        let _ = b.poll(Now::from_millis(0)).expect("remote bridge event");
         let a_id = a
             .adopt_bridge(BridgeAdoption {
                 inner_conn,
@@ -1487,7 +1276,7 @@ mod tests {
         // pair helpers refer to both deterministic IDs with one value.
         assert_eq!(a_id, b_id);
         assert!(matches!(
-            b.poll().expect("responder incoming").as_slice(),
+            b.poll(Now::from_millis(0)).expect("responder incoming").as_slice(),
             [TransportEvent::IncomingConnection { id, .. }] if *id == b_id
         ));
         (a, b, a_id, bridge, a_peer, b_peer)
@@ -1508,7 +1297,7 @@ mod tests {
         let mut a_connected = false;
         let mut b_connected = false;
         for _ in 0..32 {
-            for event in a.poll().expect("drive initiator") {
+            for event in a.poll(Now::from_millis(0)).expect("drive initiator") {
                 if let TransportEvent::Connected { id, endpoint } = event
                     && id == circuit_id
                 {
@@ -1516,7 +1305,7 @@ mod tests {
                     a_connected = true;
                 }
             }
-            for event in b.poll().expect("drive responder") {
+            for event in b.poll(Now::from_millis(0)).expect("drive responder") {
                 if let TransportEvent::Connected { id, endpoint } = event
                     && id == circuit_id
                 {
@@ -1539,11 +1328,11 @@ mod tests {
         let stream = a.open_stream(circuit_id).expect("open circuit stream");
         assert_eq!(stream.as_u64() % 2, 1, "initiator streams are odd");
         assert!(a
-            .poll()
+            .poll(Now::from_millis(0))
             .expect("opened")
             .iter()
             .any(|event| matches!(event, TransportEvent::StreamOpened { id, stream_id } if *id == circuit_id && *stream_id == stream)));
-        let incoming = b.poll().expect("incoming stream");
+        let incoming = b.poll(Now::from_millis(0)).expect("incoming stream");
         assert!(incoming.iter().any(|event| matches!(event,
             TransportEvent::IncomingStream { id, stream_id }
                 if *id == circuit_id && *stream_id == stream
@@ -1551,27 +1340,27 @@ mod tests {
 
         a.send_stream(circuit_id, stream, b"hello".to_vec())
             .expect("send");
-        let data = b.poll().expect("data");
+        let data = b.poll(Now::from_millis(0)).expect("data");
         assert!(data.iter().any(|event| matches!(event,
             TransportEvent::StreamData { id, stream_id, data }
                 if *id == circuit_id && *stream_id == stream && data == b"hello"
         )));
 
         a.close_stream_write(circuit_id, stream).expect("FIN");
-        let eof = b.poll().expect("remote FIN");
+        let eof = b.poll(Now::from_millis(0)).expect("remote FIN");
         assert!(eof.iter().any(|event| matches!(event,
             TransportEvent::StreamRemoteWriteClosed { id, stream_id }
                 if *id == circuit_id && *stream_id == stream
         )));
         b.send_stream(circuit_id, stream, b"reply".to_vec())
             .expect("reverse send remains open");
-        let reply = a.poll().expect("reply");
+        let reply = a.poll(Now::from_millis(0)).expect("reply");
         assert!(reply.iter().any(|event| matches!(event,
             TransportEvent::StreamData { data, .. } if data == b"reply"
         )));
 
         b.reset_stream(circuit_id, stream).expect("reset");
-        let local_closed = b.poll().expect("local reset close");
+        let local_closed = b.poll(Now::from_millis(0)).expect("local reset close");
         assert_eq!(
             local_closed
                 .iter()
@@ -1579,7 +1368,7 @@ mod tests {
                 .count(),
             1
         );
-        let remote_closed = a.poll().expect("remote reset close");
+        let remote_closed = a.poll(Now::from_millis(0)).expect("remote reset close");
         assert!(remote_closed.iter().any(|event| matches!(event,
             TransportEvent::StreamClosed { id, stream_id }
                 if *id == circuit_id && *stream_id == stream
@@ -1592,8 +1381,8 @@ mod tests {
         let mut a_events = Vec::new();
         let mut b_events = Vec::new();
         for _ in 0..32 {
-            a_events.extend(a.poll().expect("drive initiator"));
-            b_events.extend(b.poll().expect("drive responder"));
+            a_events.extend(a.poll(Now::from_millis(0)).expect("drive initiator"));
+            b_events.extend(b.poll(Now::from_millis(0)).expect("drive responder"));
             let a_connected = a_events.iter().any(
                 |event| matches!(event, TransportEvent::Connected { id, .. } if *id == circuit_id),
             );
@@ -1632,20 +1421,30 @@ mod tests {
                     if *id == circuit_id
             )));
         }
-        assert!(a.poll().expect("idle initiator").is_empty());
-        assert!(b.poll().expect("idle responder").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("idle initiator")
+                .is_empty()
+        );
+        assert!(
+            b.poll(Now::from_millis(0))
+                .expect("idle responder")
+                .is_empty()
+        );
 
         let stream = a.open_stream(circuit_id).expect("open stream");
         a.send_stream(circuit_id, stream, b"ordered".to_vec())
             .expect("send immediately after open");
         assert_eq!(
-            a.poll().expect("local stream event"),
+            a.poll(Now::from_millis(0)).expect("local stream event"),
             [TransportEvent::StreamOpened {
                 id: circuit_id,
                 stream_id: stream,
             }]
         );
-        let inbound = b.poll().expect("coalesced stream open and data");
+        let inbound = b
+            .poll(Now::from_millis(0))
+            .expect("coalesced stream open and data");
         let incoming = inbound
             .iter()
             .position(|event| {
@@ -1668,22 +1467,27 @@ mod tests {
 
         a.reset_stream(circuit_id, stream).expect("reset stream");
         assert_eq!(
-            a.poll().expect("immediate local terminal event"),
+            a.poll(Now::from_millis(0))
+                .expect("immediate local terminal event"),
             [TransportEvent::StreamClosed {
                 id: circuit_id,
                 stream_id: stream,
             }]
         );
         assert_eq!(
-            b.poll().expect("remote terminal event"),
+            b.poll(Now::from_millis(0)).expect("remote terminal event"),
             [TransportEvent::StreamClosed {
                 id: circuit_id,
                 stream_id: stream,
             }]
         );
-        assert!(a.poll().expect("no events after local terminal").is_empty());
         assert!(
-            b.poll()
+            a.poll(Now::from_millis(0))
+                .expect("no events after local terminal")
+                .is_empty()
+        );
+        assert!(
+            b.poll(Now::from_millis(0))
                 .expect("no events after remote terminal")
                 .is_empty()
         );
@@ -1693,7 +1497,8 @@ mod tests {
     fn wrapper_transport_contract_rejects_unknown_connection_and_stream_ids() {
         let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) = setup_pair();
         complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
-        let unknown_connection = ConnectionId::new(CIRCUIT_ID_BIT | 999);
+        let unknown_connection = ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 999)
+            .expect("circuit id in range");
         let stream = StreamId::new(99);
 
         assert!(matches!(
@@ -1739,21 +1544,37 @@ mod tests {
             })
         );
 
-        assert!(matches!(
+        // An id congruent to a live substream modulo 2^32 must be rejected
+        // rather than truncated onto it, on a live circuit too.
+        let live = a.open_stream(circuit_id).expect("open a live substream");
+        let aliased = StreamId::new(live.as_u64() + (1u64 << 32));
+        for result in [
+            a.send_stream(circuit_id, aliased, vec![1]),
+            a.close_stream_write(circuit_id, aliased),
+            a.reset_stream(circuit_id, aliased),
+        ] {
+            assert_eq!(
+                result,
+                Err(TransportError::StreamNotFound {
+                    id: circuit_id,
+                    stream_id: aliased,
+                })
+            );
+        }
+
+        for result in [
             a.send_stream(circuit_id, stream, vec![1]),
-            Err(TransportError::StreamSendFailed { id, stream_id, .. })
-                if id == circuit_id && stream_id == stream
-        ));
-        assert!(matches!(
             a.close_stream_write(circuit_id, stream),
-            Err(TransportError::StreamCloseWriteFailed { id, stream_id, .. })
-                if id == circuit_id && stream_id == stream
-        ));
-        assert!(matches!(
             a.reset_stream(circuit_id, stream),
-            Err(TransportError::StreamResetFailed { id, stream_id, .. })
-                if id == circuit_id && stream_id == stream
-        ));
+        ] {
+            assert_eq!(
+                result,
+                Err(TransportError::StreamNotFound {
+                    id: circuit_id,
+                    stream_id: stream,
+                })
+            );
+        }
     }
 
     #[test]
@@ -1767,11 +1588,11 @@ mod tests {
         let inner_conn = inner_a.connection_id();
         let mut a = CircuitTransport::new(inner_a, a_identity, CounterEntropy(10));
         let mut b = CircuitTransport::new(inner_b, b_identity, CounterEntropy(20));
-        let _ = a.poll().expect("initial A events");
-        let _ = b.poll().expect("initial B events");
+        let _ = a.poll(Now::from_millis(0)).expect("initial A events");
+        let _ = b.poll(Now::from_millis(0)).expect("initial B events");
         let bridge = a.inner_mut().open_stream(inner_conn).expect("bridge open");
-        let _ = a.poll().expect("local bridge event");
-        let _ = b.poll().expect("remote bridge event");
+        let _ = a.poll(Now::from_millis(0)).expect("local bridge event");
+        let _ = b.poll(Now::from_millis(0)).expect("remote bridge event");
         let circuit_id = a
             .adopt_bridge(BridgeAdoption {
                 inner_conn,
@@ -1785,7 +1606,7 @@ mod tests {
             .expect("initiator adoption");
         let header = b
             .inner_mut()
-            .poll()
+            .poll(Now::from_millis(0))
             .expect("read pipelined header")
             .into_iter()
             .find_map(|event| match event {
@@ -1805,7 +1626,9 @@ mod tests {
         })
         .expect("responder adoption with partial pending data");
         assert!(matches!(
-            b.poll().expect("incoming event").as_slice(),
+            b.poll(Now::from_millis(0))
+                .expect("incoming event")
+                .as_slice(),
             [TransportEvent::IncomingConnection { .. }]
         ));
         b.inject_bridge_data(inner_conn, bridge, header[split..].to_vec());
@@ -1823,11 +1646,11 @@ mod tests {
         let inner_conn = inner_a.connection_id();
         let mut a = CircuitTransport::new(inner_a, a_identity.clone(), CounterEntropy(10));
         let mut b = CircuitTransport::new(inner_b, b_identity, CounterEntropy(20));
-        let _ = a.poll().expect("initial A events");
-        let _ = b.poll().expect("initial B events");
+        let _ = a.poll(Now::from_millis(0)).expect("initial A events");
+        let _ = b.poll(Now::from_millis(0)).expect("initial B events");
         let bridge = a.inner_mut().open_stream(inner_conn).expect("bridge open");
-        let _ = a.poll().expect("local bridge event");
-        let _ = b.poll().expect("remote bridge event");
+        let _ = a.poll(Now::from_millis(0)).expect("local bridge event");
+        let _ = b.poll(Now::from_millis(0)).expect("remote bridge event");
 
         let mut select = MultistreamSelect::dialer(NOISE_PROTOCOL_ID);
         select
@@ -1884,7 +1707,9 @@ mod tests {
                 remote_write_closed: false,
             })
             .expect("responder adopts pipelined selection and Noise msg1");
-        let responder_events = b.poll().expect("responder incoming event");
+        let responder_events = b
+            .poll(Now::from_millis(0))
+            .expect("responder incoming event");
         assert!(
             matches!(
                 responder_events.as_slice(),
@@ -1909,19 +1734,27 @@ mod tests {
         // The responder already consumed the scripted copy of the dialer's
         // selection and msg1, so discard the identical selection emitted by
         // the real initiator before letting it consume the responder reply.
-        let duplicate_selection = b.inner_mut().poll().expect("duplicate selection");
+        let duplicate_selection = b
+            .inner_mut()
+            .poll(Now::from_millis(0))
+            .expect("duplicate selection");
         assert!(
             duplicate_selection
                 .iter()
                 .any(|event| matches!(event, TransportEvent::StreamData { .. }))
         );
-        let _ = a.poll().expect("initiator consumes pipelined response");
+        let _ = a
+            .poll(Now::from_millis(0))
+            .expect("initiator consumes pipelined response");
 
         // Receiving the real selection reply emits the duplicate protocol
         // proposal and Noise msg1 before msg3 and the encrypted Yamux
         // selection. Drop those first two data events, then route the
         // remaining bridge events through the wrapper.
-        let mut real_followup = b.inner_mut().poll().expect("real Noise follow-up");
+        let mut real_followup = b
+            .inner_mut()
+            .poll(Now::from_millis(0))
+            .expect("real Noise follow-up");
         for expected in ["protocol proposal", "Noise msg1"] {
             let duplicate = real_followup
                 .iter()
@@ -1941,31 +1774,21 @@ mod tests {
         let (mut a, mut b, circuit_id, bridge, _a_peer, _b_peer) = setup_pair();
 
         // Stop immediately after B reaches Ready. Its encrypted Yamux
-        // selection confirmation is now queued for A, which is still in
-        // SelectYamux and has not consumed that ciphertext yet.
+        // selection confirmation is now queued for A, which has authenticated
+        // B but not yet consumed that ciphertext, so it is still selecting.
         for _ in 0..32 {
-            let _ = a.poll().expect("drive initiator toward Yamux selection");
-            let _ = b.poll().expect("drive responder toward Yamux selection");
-            let a_selecting = matches!(
-                a.circuits.get(&circuit_id).and_then(|c| c.phase.as_ref()),
-                Some(Phase::SelectYamux { .. })
-            );
-            let b_ready = matches!(
-                b.circuits.get(&circuit_id).and_then(|c| c.phase.as_ref()),
-                Some(Phase::Ready { .. })
-            );
-            if a_selecting && b_ready {
+            let _ = a
+                .poll(Now::from_millis(0))
+                .expect("drive initiator toward Yamux selection");
+            let _ = b
+                .poll(Now::from_millis(0))
+                .expect("drive responder toward Yamux selection");
+            if selecting_yamux(&a, circuit_id) && established(&b, circuit_id) {
                 break;
             }
         }
-        assert!(matches!(
-            a.circuits.get(&circuit_id).and_then(|c| c.phase.as_ref()),
-            Some(Phase::SelectYamux { .. })
-        ));
-        assert!(matches!(
-            b.circuits.get(&circuit_id).and_then(|c| c.phase.as_ref()),
-            Some(Phase::Ready { .. })
-        ));
+        assert!(selecting_yamux(&a, circuit_id));
+        assert!(established(&b, circuit_id));
 
         // Queue a Yamux SYN behind the already-encrypted selection reply,
         // then combine both Noise transport frames into one bridge read.
@@ -1973,7 +1796,10 @@ mod tests {
         // first transitions A to Ready and the second must be routed through
         // that newly-created Ready state.
         let opened = b.open_stream(circuit_id).expect("open responder stream");
-        let raw = a.inner_mut().poll().expect("read encrypted bridge batch");
+        let raw = a
+            .inner_mut()
+            .poll(Now::from_millis(0))
+            .expect("read encrypted bridge batch");
         let chunks: Vec<_> = raw
             .into_iter()
             .filter_map(|event| match event {
@@ -1992,7 +1818,9 @@ mod tests {
             .inner_conn;
         a.inject_bridge_data(inner_conn, bridge, coalesced);
 
-        let events = a.poll().expect("drain cross-boundary outputs");
+        let events = a
+            .poll(Now::from_millis(0))
+            .expect("drain cross-boundary outputs");
         assert!(events.iter().any(
             |event| matches!(event, TransportEvent::Connected { id, .. } if *id == circuit_id)
         ));
@@ -2023,14 +1851,22 @@ mod tests {
         let inner_conn = ConnectionId::new(1);
 
         a.inject_bridge_closed(inner_conn, bridge);
-        let events = a.poll().expect("pre-ready bridge reset");
+        let events = a.poll(Now::from_millis(0)).expect("pre-ready bridge reset");
         assert_pre_ready_bridge_failure(&events, circuit_id);
-        assert!(a.poll().expect("consume reset acknowledgement").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("consume reset acknowledgement")
+                .is_empty()
+        );
 
         a.inject_bridge_data(inner_conn, bridge, b"late".to_vec());
         a.inject_bridge_remote_write_closed(inner_conn, bridge);
         a.inject_bridge_closed(inner_conn, bridge);
-        assert!(a.poll().expect("nothing follows terminal close").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("nothing follows terminal close")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2039,12 +1875,20 @@ mod tests {
         let inner_conn = ConnectionId::new(1);
 
         a.inject_bridge_remote_write_closed(inner_conn, bridge);
-        let events = a.poll().expect("pre-ready bridge FIN");
+        let events = a.poll(Now::from_millis(0)).expect("pre-ready bridge FIN");
         assert_pre_ready_bridge_failure(&events, circuit_id);
-        assert!(a.poll().expect("consume reset acknowledgement").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("consume reset acknowledgement")
+                .is_empty()
+        );
 
         a.inject_bridge_data(inner_conn, bridge, b"late".to_vec());
-        assert!(a.poll().expect("post-close data is ignored").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("post-close data is ignored")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2089,7 +1933,7 @@ mod tests {
         );
         complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
         a.close(circuit_id).expect("graceful close");
-        let events = a.poll().expect("closed event");
+        let events = a.poll(Now::from_millis(0)).expect("closed event");
         assert_eq!(events, vec![TransportEvent::Closed { id: circuit_id }]);
         assert!(matches!(
             a.open_stream(circuit_id),
@@ -2098,7 +1942,11 @@ mod tests {
         a.inject_bridge_data(ConnectionId::new(1), bridge, b"late".to_vec());
         a.inject_bridge_remote_write_closed(ConnectionId::new(1), bridge);
         a.inject_bridge_closed(ConnectionId::new(1), bridge);
-        assert!(a.poll().expect("late bridge events are dropped").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("late bridge events are dropped")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2106,9 +1954,9 @@ mod tests {
         let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) = setup_close_observed_pair();
         complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
         let stream = a.open_stream(circuit_id).expect("open stream before close");
-        let _ = a.poll().expect("local stream open");
-        let _ = b.poll().expect("remote stream open");
-        let _ = a.poll().expect("stream acknowledgement");
+        let _ = a.poll(Now::from_millis(0)).expect("local stream open");
+        let _ = b.poll(Now::from_millis(0)).expect("remote stream open");
+        let _ = a.poll(Now::from_millis(0)).expect("stream acknowledgement");
         a.send_stream(circuit_id, stream, b"queued-before-close".to_vec())
             .expect("queue application data before close");
 
@@ -2116,7 +1964,7 @@ mod tests {
         assert_eq!(a.inner().close_write_calls, 1);
         assert_eq!(a.inner().reset_calls, 0);
         assert_eq!(
-            a.poll().expect("local close event"),
+            a.poll(Now::from_millis(0)).expect("local close event"),
             [
                 TransportEvent::StreamClosed {
                     id: circuit_id,
@@ -2126,7 +1974,10 @@ mod tests {
             ]
         );
 
-        let peer_wire = b.inner_mut().poll().expect("peer bridge events");
+        let peer_wire = b
+            .inner_mut()
+            .poll(Now::from_millis(0))
+            .expect("peer bridge events");
         let data_positions: Vec<_> = peer_wire
             .iter()
             .enumerate()
@@ -2153,21 +2004,36 @@ mod tests {
         for event in peer_wire {
             b.handle_inner_event(event);
         }
-        let peer_events = b.poll().expect("peer observes data then GoAway");
+        let peer_events = b
+            .poll(Now::from_millis(0))
+            .expect("peer observes data then GoAway");
+        // The remote GoAway tears the substreams down the same way the local
+        // close does: a `StreamClosed` each, then `Closed`. Both ends of a
+        // graceful shutdown see the same sequence.
         assert!(
             matches!(
                 peer_events.as_slice(),
                 [
                     TransportEvent::StreamData { id, stream_id, data },
+                    TransportEvent::StreamClosed {
+                        id: stream_closed_id,
+                        stream_id: closed_stream,
+                    },
                     TransportEvent::Closed { id: closed_id },
                 ] if *id == circuit_id
                     && *stream_id == stream
                     && data == b"queued-before-close"
+                    && *stream_closed_id == circuit_id
+                    && *closed_stream == stream
                     && *closed_id == circuit_id
             ),
             "unexpected peer close events: {peer_events:?}"
         );
-        assert!(b.poll().expect("terminal peer state").is_empty());
+        assert!(
+            b.poll(Now::from_millis(0))
+                .expect("terminal peer state")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2177,7 +2043,7 @@ mod tests {
         let inner_conn = ConnectionId::new(1);
 
         a.close(circuit_id).expect("graceful circuit close");
-        let _ = a.poll().expect("local close event");
+        let _ = a.poll(Now::from_millis(0)).expect("local close event");
         assert!(a.retired_bridges.contains(&(inner_conn, bridge)));
 
         for index in 0..MAX_RETIRED_BRIDGES {
@@ -2202,11 +2068,14 @@ mod tests {
         assert_eq!(a.inner().close_write_calls, 1);
         assert_eq!(a.inner().reset_calls, 1);
         assert_eq!(
-            a.poll().expect("local close event"),
+            a.poll(Now::from_millis(0)).expect("local close event"),
             [TransportEvent::Closed { id: circuit_id }]
         );
 
-        let peer_wire = b.inner_mut().poll().expect("peer bridge events");
+        let peer_wire = b
+            .inner_mut()
+            .poll(Now::from_millis(0))
+            .expect("peer bridge events");
         assert!(
             peer_wire
                 .iter()
@@ -2226,8 +2095,37 @@ mod tests {
             b.handle_inner_event(event);
         }
         assert_eq!(
-            b.poll().expect("peer observes terminal close"),
+            b.poll(Now::from_millis(0))
+                .expect("peer observes terminal close"),
             [TransportEvent::Closed { id: circuit_id }]
+        );
+    }
+
+    #[test]
+    fn a_dead_bridge_closes_the_circuit_without_an_error_event() {
+        let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) = setup_close_observed_pair();
+        complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
+        let stream = a.open_stream(circuit_id).expect("open stream");
+        let _ = a.poll(Now::from_millis(0)).expect("drain local events");
+
+        // The relay connection dies between polls, so flushing what the
+        // session queued fails.
+        a.inner_mut().fail_send = true;
+        assert!(matches!(
+            a.send_stream(circuit_id, stream, b"lost".to_vec()),
+            Err(TransportError::StreamSendFailed { id, stream_id, .. })
+                if id == circuit_id && stream_id == stream
+        ));
+
+        // The caller already learned why from that error, so only `Closed`
+        // goes out -- reporting it twice would be noise.
+        assert_eq!(
+            a.poll(Now::from_millis(0)).expect("teardown events"),
+            [TransportEvent::Closed { id: circuit_id }]
+        );
+        assert_eq!(
+            a.close(circuit_id),
+            Err(TransportError::ConnectionNotFound { id: circuit_id })
         );
     }
 
@@ -2240,16 +2138,24 @@ mod tests {
         assert_eq!(a.inner().close_write_calls, 0);
         assert_eq!(a.inner().reset_calls, 1);
         assert_eq!(
-            a.poll().expect("pre-ready close event"),
+            a.poll(Now::from_millis(0)).expect("pre-ready close event"),
             [TransportEvent::Closed { id: circuit_id }]
         );
         assert_eq!(
             a.close(circuit_id),
             Err(TransportError::ConnectionNotFound { id: circuit_id })
         );
-        assert!(a.poll().expect("consume reset acknowledgement").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("consume reset acknowledgement")
+                .is_empty()
+        );
         a.inject_bridge_data(inner_conn, bridge, b"late".to_vec());
-        assert!(a.poll().expect("post-close data is ignored").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("post-close data is ignored")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2259,13 +2165,13 @@ mod tests {
         let stream = a
             .open_stream(circuit_id)
             .expect("open stream before relay loss");
-        let _ = a.poll().expect("local stream open");
-        let _ = b.poll().expect("remote stream open");
+        let _ = a.poll(Now::from_millis(0)).expect("local stream open");
+        let _ = b.poll(Now::from_millis(0)).expect("remote stream open");
 
         a.inner_mut()
             .close(ConnectionId::new(1))
             .expect("relay connection closes");
-        let events = a.poll().expect("relay close mapping");
+        let events = a.poll(Now::from_millis(0)).expect("relay close mapping");
         assert_eq!(
             events
                 .iter()
@@ -2282,7 +2188,11 @@ mod tests {
             TransportEvent::StreamClosed { id, stream_id }
                 if *id == circuit_id && *stream_id == stream
         )));
-        assert!(a.poll().expect("relay close is terminal").is_empty());
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("relay close is terminal")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2302,8 +2212,8 @@ mod tests {
 
         let initiator_stream = a.open_stream(circuit_id).expect("initiator stream");
         assert_eq!(initiator_stream.as_u64() % 2, 1);
-        let _ = a.poll().expect("local open");
-        let _ = b.poll().expect("remote open");
+        let _ = a.poll(Now::from_millis(0)).expect("local open");
+        let _ = b.poll(Now::from_millis(0)).expect("remote open");
 
         let error = a
             .send_stream(
@@ -2315,10 +2225,15 @@ mod tests {
         assert!(matches!(error, TransportError::StreamSendFailed { .. }));
         a.send_stream(circuit_id, initiator_stream, b"still-alive".to_vec())
             .expect("backpressure must not poison the stream");
-        assert!(b.poll().expect("small data").iter().any(|event| matches!(
-            event,
-            TransportEvent::StreamData { data, .. } if data == b"still-alive"
-        )));
+        assert!(
+            b.poll(Now::from_millis(0))
+                .expect("small data")
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    TransportEvent::StreamData { data, .. } if data == b"still-alive"
+                ))
+        );
 
         let responder_stream = b.open_stream(circuit_id).expect("responder stream");
         assert_eq!(responder_stream.as_u64() % 2, 0);
@@ -2353,7 +2268,9 @@ mod tests {
         let relay = identity(9).peer_id();
         let (inner, _) = InMemoryTransport::pair(local.peer_id(), remote.clone());
         let mut direct_first = CircuitTransport::new(inner, local, CounterEntropy(1));
-        let _ = direct_first.poll().expect("record direct connection");
+        let _ = direct_first
+            .poll(Now::from_millis(0))
+            .expect("record direct connection");
         assert_eq!(
             direct_first.adopt_bridge(BridgeAdoption {
                 inner_conn: ConnectionId::new(1),
@@ -2377,7 +2294,9 @@ mod tests {
                 b_peer,
             ),
         });
-        let events = a.poll().expect("direct connection arrives");
+        let events = a
+            .poll(Now::from_millis(0))
+            .expect("direct connection arrives");
         assert!(events.iter().any(|event| matches!(
             event,
             TransportEvent::Error { id, .. } if *id == circuit_id
@@ -2393,13 +2312,44 @@ mod tests {
     }
 
     #[test]
+    fn a_circuit_completing_after_a_direct_connection_never_reports_connected() {
+        let (mut a, mut b, circuit_id, _bridge, _a_peer, b_peer) = setup_pair();
+        for _ in 0..32 {
+            let _ = a.poll(Now::from_millis(0)).expect("drive initiator");
+            let _ = b.poll(Now::from_millis(0)).expect("drive responder");
+            if selecting_yamux(&a, circuit_id) && established(&b, circuit_id) {
+                break;
+            }
+        }
+        assert!(selecting_yamux(&a, circuit_id));
+        assert!(established(&b, circuit_id));
+
+        // Register the direct connection without `record_direct`'s sweep of
+        // still-negotiating circuits. That sweep normally kills the loser
+        // first; arbitrating again when the session reports `Established` is
+        // the backstop that keeps the invariant — no established circuit to a
+        // peer that already has a direct connection — from resting on it.
+        let direct = ConnectionId::new(2);
+        a.direct_by_conn.insert(direct, b_peer.clone());
+        a.direct_by_peer.entry(b_peer).or_default().insert(direct);
+
+        // B's encrypted Yamux confirmation is already queued, so this poll is
+        // what carries the circuit into Ready.
+        let events = a.poll(Now::from_millis(0)).expect("complete the upgrade");
+        assert_pre_ready_bridge_failure(&events, circuit_id);
+        assert!(!a.circuits.contains_key(&circuit_id));
+    }
+
+    #[test]
     fn adoption_failures_leave_bridge_and_identifier_ownership_with_caller() {
         let local = identity(1);
         let remote = identity(2).peer_id();
         let relay = identity(9).peer_id();
         let (inner, _) = InMemoryTransport::pair(local.peer_id(), relay.clone());
         let mut transport = CircuitTransport::new(inner, local, FailingEntropy);
-        let _ = transport.poll().expect("activate wrapped connection");
+        let _ = transport
+            .poll(Now::from_millis(0))
+            .expect("activate wrapped connection");
         let adoption = BridgeAdoption {
             inner_conn: ConnectionId::new(1),
             bridge_stream: StreamId::new(7),
@@ -2409,11 +2359,22 @@ mod tests {
             pending_data: Vec::new(),
             remote_write_closed: false,
         };
+        // Adoption peeks the next id up front but must only consume it after
+        // every fallible step, so a failure leaves the id space untouched. A
+        // peek/allocate ordering regression would silently burn a sequence
+        // number per failed adoption, which only this assertion catches.
+        let unconsumed = transport
+            .circuit_id_allocator
+            .peek()
+            .expect("fresh allocator");
+
         assert!(matches!(
             transport.adopt_bridge(adoption.clone()),
             Err(AdoptError::Entropy(_))
         ));
         assert!(transport.circuit_ids().is_empty());
+        assert_eq!(transport.circuit_id_allocator.peek(), Some(unconsumed));
+
         assert_eq!(
             transport.adopt_bridge(BridgeAdoption {
                 remote_write_closed: true,
@@ -2422,7 +2383,12 @@ mod tests {
             Err(AdoptError::RemoteWriteClosed)
         );
         assert!(transport.circuit_ids().is_empty());
-        transport.next_circuit_id = None;
+        assert_eq!(transport.circuit_id_allocator.peek(), Some(unconsumed));
+
+        transport.circuit_id_allocator = ConnectionIdAllocator::starting_at(
+            ConnectionNamespace::CIRCUIT,
+            ConnectionId::MAX_SEQUENCE + 1,
+        );
         assert_eq!(
             transport.adopt_bridge(BridgeAdoption {
                 remote_write_closed: false,
@@ -2438,10 +2404,13 @@ mod tests {
         let relay = identity(9).peer_id();
         let (inner, _) = InMemoryTransport::pair(local.peer_id(), relay);
         let mut transport = CircuitTransport::new(inner, local, CounterEntropy(1));
-        let _ = transport.poll().expect("initial direct event");
+        let _ = transport
+            .poll(Now::from_millis(0))
+            .expect("initial direct event");
         // InMemoryTransport::dial is intentionally stubbed, so this fixture
         // covers polled collisions; dial-return collisions need a dial fake.
-        let collision = ConnectionId::new(CIRCUIT_ID_BIT | 77);
+        let collision = ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 77)
+            .expect("circuit id in range");
         transport
             .inner_mut()
             .push_event(TransportEvent::IncomingConnection {
@@ -2452,12 +2421,15 @@ mod tests {
                         .expect("collision endpoint"),
                 ),
             });
-        let events = transport.poll().expect("collision event");
+        let events = transport
+            .poll(Now::from_millis(0))
+            .expect("collision event");
         assert_eq!(
             events,
             vec![TransportEvent::Error {
                 id: collision,
-                message: "wrapped transport used the circuit connection-ID bit".to_string(),
+                message: "wrapped transport allocated in the circuit connection-ID namespace"
+                    .to_string(),
             }]
         );
         assert!(transport.circuit_ids().is_empty());

@@ -8,13 +8,14 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use minip2p_core::{Multiaddr, PeerAddr, PeerId};
+use minip2p_platform::{Deadline, Now};
 use minip2p_relay::{
     FrameDecode, HopMessage, HopMessageType, Peer, Reservation, Status, StopMessage,
     StopMessageType, decode_frame, encode_frame,
 };
 use minip2p_transport::{
-    ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
-    WaitOutcome,
+    BlockingTransport, ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError,
+    TransportEvent, WaitOutcome,
 };
 
 /// Deterministic, connected, in-memory implementation of the transport contract.
@@ -253,7 +254,7 @@ impl Transport for InMemoryTransport {
         Ok(())
     }
 
-    fn poll(&mut self) -> Result<Vec<TransportEvent>, TransportError> {
+    fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {
         let mut shared = self.shared.borrow_mut();
         let events = shared.queues[self.side].drain(..).collect::<Vec<_>>();
         let mut fully_delivered = Vec::new();
@@ -281,16 +282,9 @@ impl Transport for InMemoryTransport {
         Ok(events)
     }
 
-    fn next_timeout(&self) -> Option<Duration> {
-        (!self.shared.borrow().queues[self.side].is_empty()).then_some(Duration::ZERO)
-    }
-
-    fn wait_for_input(&mut self, _timeout: Duration) -> WaitOutcome {
-        if self.shared.borrow().queues[self.side].is_empty() {
-            WaitOutcome::Unsupported
-        } else {
-            WaitOutcome::Ready
-        }
+    fn next_deadline(&self) -> Option<Deadline> {
+        // Queued events are due now; no clock sample needed to say so.
+        (!self.shared.borrow().queues[self.side].is_empty()).then_some(Deadline::IMMEDIATE)
     }
 
     fn local_addresses(&self) -> Vec<Multiaddr> {
@@ -302,6 +296,18 @@ impl Transport for InMemoryTransport {
             vec![self.remote_addr.clone()]
         } else {
             Vec::new()
+        }
+    }
+}
+
+impl BlockingTransport for InMemoryTransport {
+    fn wait_for_input(&mut self, _timeout: Duration) -> WaitOutcome {
+        // No socket to wait on: report queued input, otherwise let the driver
+        // fall back to its sleep cadence.
+        if self.shared.borrow().queues[self.side].is_empty() {
+            WaitOutcome::Unsupported
+        } else {
+            WaitOutcome::Ready
         }
     }
 }
@@ -569,11 +575,11 @@ mod tests {
 
     fn drain_startup(a: &mut InMemoryTransport, b: &mut InMemoryTransport) {
         assert!(matches!(
-            a.poll().unwrap().as_slice(),
+            a.poll(Now::from_millis(0)).unwrap().as_slice(),
             [TransportEvent::Connected { .. }]
         ));
         assert!(matches!(
-            b.poll().unwrap().as_slice(),
+            b.poll(Now::from_millis(0)).unwrap().as_slice(),
             [
                 TransportEvent::IncomingConnection { .. },
                 TransportEvent::Connected { .. }
@@ -590,7 +596,7 @@ mod tests {
         let resolved = transport.listen(&requested).unwrap();
 
         assert_eq!(
-            transport.poll().unwrap(),
+            transport.poll(Now::from_millis(0)).unwrap(),
             [TransportEvent::Listening {
                 addr: resolved.clone()
             }]
@@ -609,7 +615,7 @@ mod tests {
             a.send_stream(id, stream_id, vec![1, 2, 3]),
             Err(TransportError::StreamNotFound { id, stream_id })
         );
-        assert!(b.poll().unwrap().is_empty());
+        assert!(b.poll(Now::from_millis(0)).unwrap().is_empty());
     }
 
     #[test]
@@ -618,13 +624,13 @@ mod tests {
         drain_startup(&mut a, &mut b);
         let id = a.connection_id();
         let stream_id = a.open_stream(id).unwrap();
-        a.poll().unwrap();
-        b.poll().unwrap();
+        a.poll(Now::from_millis(0)).unwrap();
+        b.poll(Now::from_millis(0)).unwrap();
 
         a.close_stream_write(id, stream_id).unwrap();
         a.close_stream_write(id, stream_id).unwrap();
         assert_eq!(
-            b.poll().unwrap(),
+            b.poll(Now::from_millis(0)).unwrap(),
             [TransportEvent::StreamRemoteWriteClosed { id, stream_id }]
         );
         assert!(matches!(
@@ -634,14 +640,14 @@ mod tests {
 
         b.close_stream_write(id, stream_id).unwrap();
         assert_eq!(
-            a.poll().unwrap(),
+            a.poll(Now::from_millis(0)).unwrap(),
             [
                 TransportEvent::StreamRemoteWriteClosed { id, stream_id },
                 TransportEvent::StreamClosed { id, stream_id }
             ]
         );
         assert_eq!(
-            b.poll().unwrap(),
+            b.poll(Now::from_millis(0)).unwrap(),
             [TransportEvent::StreamClosed { id, stream_id }]
         );
         assert!(a.shared.borrow().streams.is_empty());
@@ -657,18 +663,18 @@ mod tests {
         drain_startup(&mut a, &mut b);
         let id = a.connection_id();
         let stream_id = a.open_stream(id).unwrap();
-        a.poll().unwrap();
-        b.poll().unwrap();
+        a.poll(Now::from_millis(0)).unwrap();
+        b.poll(Now::from_millis(0)).unwrap();
 
         a.reset_stream(id, stream_id).unwrap();
         a.reset_stream(id, stream_id).unwrap();
 
         assert_eq!(
-            a.poll().unwrap(),
+            a.poll(Now::from_millis(0)).unwrap(),
             [TransportEvent::StreamClosed { id, stream_id }]
         );
         assert_eq!(
-            b.poll().unwrap(),
+            b.poll(Now::from_millis(0)).unwrap(),
             [TransportEvent::StreamClosed { id, stream_id }]
         );
         assert_eq!(
@@ -689,20 +695,20 @@ mod tests {
 
         for _ in 0..128 {
             let stream_id = a.open_stream(id).unwrap();
-            a.poll().unwrap();
-            b.poll().unwrap();
+            a.poll(Now::from_millis(0)).unwrap();
+            b.poll(Now::from_millis(0)).unwrap();
 
             a.reset_stream(id, stream_id).unwrap();
             a.reset_stream(id, stream_id).unwrap();
             assert_eq!(a.shared.borrow().streams.len(), 1);
 
             assert_eq!(
-                a.poll().unwrap(),
+                a.poll(Now::from_millis(0)).unwrap(),
                 [TransportEvent::StreamClosed { id, stream_id }]
             );
             assert_eq!(a.shared.borrow().streams.len(), 1);
             assert_eq!(
-                b.poll().unwrap(),
+                b.poll(Now::from_millis(0)).unwrap(),
                 [TransportEvent::StreamClosed { id, stream_id }]
             );
             assert!(a.shared.borrow().streams.is_empty());
@@ -715,8 +721,8 @@ mod tests {
         drain_startup(&mut a, &mut b);
         let id = a.connection_id();
         let stream_id = a.open_stream(id).unwrap();
-        a.poll().unwrap();
-        b.poll().unwrap();
+        a.poll(Now::from_millis(0)).unwrap();
+        b.poll(Now::from_millis(0)).unwrap();
 
         a.close(id).unwrap();
 
@@ -732,10 +738,16 @@ mod tests {
         );
         assert_eq!(b.close(id), Err(TransportError::ConnectionNotFound { id }));
         assert!(b.active_inbound_connection_sources().is_empty());
-        assert_eq!(a.poll().unwrap(), [TransportEvent::Closed { id }]);
-        assert_eq!(b.poll().unwrap(), [TransportEvent::Closed { id }]);
-        assert!(a.poll().unwrap().is_empty());
-        assert!(b.poll().unwrap().is_empty());
+        assert_eq!(
+            a.poll(Now::from_millis(0)).unwrap(),
+            [TransportEvent::Closed { id }]
+        );
+        assert_eq!(
+            b.poll(Now::from_millis(0)).unwrap(),
+            [TransportEvent::Closed { id }]
+        );
+        assert!(a.poll(Now::from_millis(0)).unwrap().is_empty());
+        assert!(b.poll(Now::from_millis(0)).unwrap().is_empty());
     }
 
     fn reserve(relay: &mut RelayEmulator, target: &PeerId) {

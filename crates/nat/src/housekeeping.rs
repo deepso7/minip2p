@@ -347,10 +347,10 @@ impl Prober {
             Reachability::Public { addrs, .. } => {
                 let selected = select_direct_addrs(addrs, None, None);
                 // A successful dial-back is useful public evidence only when
-                // it leaves the application with an address this QUIC-only
-                // stack can actually advertise and accept. Counting an empty
-                // selection could release a WhenPrivate reservation while
-                // providing no direct replacement path.
+                // it leaves the application with an address something can
+                // actually dial. Counting an empty selection could release a
+                // WhenPrivate reservation while providing no direct
+                // replacement path.
                 if selected.is_empty() {
                     return false;
                 }

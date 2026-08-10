@@ -1,4 +1,4 @@
-//! Std wiring that pumps a sans-I/O [`NatAgent`] against the endpoint's
+//! Std endpoint wiring that pumps a sans-I/O [`NatAgent`] against the endpoint's
 //! swarm: clock sampling, action execution, stream-event interception, and
 //! circuit-address advertising.
 //!
@@ -80,7 +80,7 @@ impl NatDriver {
             SwarmEvent::ConnectionEstablished { conn_id, .. }
             | SwarmEvent::ConnectionClosed { conn_id, .. } => CircuitTransport::<
                 minip2p_quic::QuicEndpoint,
-                minip2p_circuit::OsEntropy,
+                minip2p_platform::StdEntropy,
             >::is_circuit(*conn_id),
             _ => false,
         };
@@ -177,7 +177,7 @@ impl NatDriver {
             } => {
                 let mut payload = vec![0u8; payload_len];
                 if getrandom::fill(&mut payload).is_ok() {
-                    let _ = swarm.transport().inner().send_raw_udp(&target, &payload);
+                    let _ = swarm.transport_mut().send_datagram(&target, &payload);
                 }
             }
             NatAction::PromoteBridge {

@@ -28,9 +28,9 @@ The platform package re-exports public types and errors from
 | --- | --- | --- |
 | `secretKey` | `ArrayBuffer \| Uint8Array` | Required 32-byte Ed25519 secret key. |
 | `agentVersion` | `string` | Identify agent string. |
-| `listenAddr` | `string` | Local QUIC listen multiaddress; native defaults apply when omitted. |
+| `transports` | `Minip2pTransports` | Enabled transports. Omitted means dual-stack QUIC only. |
 | `protocols` | `readonly string[]` | Custom protocols accepted on inbound streams. |
-| `relays` | `readonly string[]` | Direct QUIC relay peer addresses. |
+| `relays` | `readonly string[]` | Direct TCP or QUIC relay peer addresses. |
 | `autonatServers` | `readonly string[]` | Reachability probe-server addresses. |
 | `forceRelay` | `boolean` | Route outbound connectivity through relays only. |
 | `pubsubRouter` | `PubsubRouter` | `Gossipsub` by default; choose `Floodsub` explicitly. |
@@ -41,6 +41,31 @@ The platform package re-exports public types and errors from
 `discovery.topic` is required when signed discovery is enabled. Both discovery
 options objects accept `autoDial`; remaining timing and capacity fields are
 typed in the exported declarations and use native defaults when omitted.
+
+Each transport accepts `true` or
+`{ listen?: readonly [string, ...string[]] }`; omit a
+transport to disable it. `true` listens on that transport's IPv4 and IPv6
+defaults. An explicit `listen` array replaces those defaults exactly; an empty
+array is rejected. QUIC accepts at most one explicit listener per IP family.
+An omitted or empty `transports` object defaults to QUIC.
+
+```ts
+// QUIC only, IPv4 + IPv6 (also the default when `transports` is omitted)
+transports: { quic: true }
+
+// QUIC + TCP, both IPv4 + IPv6
+transports: { quic: true, tcp: true }
+
+// TCP on exactly these listeners
+transports: {
+  tcp: {
+    listen: [
+      "/ip4/0.0.0.0/tcp/4001",
+      "/ip6/::/tcp/4001",
+    ],
+  },
+}
+```
 
 ## Identity and lifecycle
 
@@ -84,7 +109,7 @@ seconds; `timeoutMs: 0` disables it.
 | `connectAddr(addr, options?)` | First usable path from a complete peer address. |
 | `startConnect*` / `waitConnectResult` | Split-phase connection flow using a `connectId`. |
 | `cancelConnect(connectId)` | Cancel a split-phase attempt. |
-| `dial` / `dialIp4` / `dialIp6` | Start direct-only QUIC dialing and return connection IDs. |
+| `dial` / `dialIp4` / `dialIp6` | Start direct-only TCP or QUIC dialing and return connection IDs. |
 | `waitPeerReady(peerId, options?)` | Peer ID and advertised protocol list after Identify. |
 | `ping(peerId, options?)` | RTT in milliseconds. |
 | `openStream(peerId, protocol, options?)` | Negotiated `Stream`. |

@@ -7,15 +7,111 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BeaconConfig, Endpoint, FloodsubConfig, GossipsubConfig, MdnsConfig, Multiaddr, NatConfig,
-    PeerDiscoveryConfig, PeerId, PublishError, PubsubConfig, PubsubError, QuicWaitHandle, StreamId,
-    TopicError, TransportError,
+    BeaconConfig, Endpoint, EndpointBuilder, FloodsubConfig, GossipsubConfig, MdnsConfig,
+    Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, Protocol, PublishError, PubsubConfig,
+    PubsubError, StreamId, TopicError, TransportError, WaitHandle,
 };
 
 use crate::{
     DriverStats, EndpointConfig, FfiError, IdentifyInfo, KnownPeerInfo, P2pEventListener,
-    PubsubRouter, RelayReservationInfo, keypair_from_bytes, parse_direct_quic_peer_addr,
+    PubsubRouter, RelayReservationInfo, TransportOptions, keypair_from_bytes,
+    parse_direct_peer_addr,
 };
+
+fn configure_transports(
+    mut builder: EndpointBuilder,
+    quic: Option<TransportOptions>,
+    tcp: Option<TransportOptions>,
+) -> Result<EndpointBuilder, FfiError> {
+    if quic.is_none() && tcp.is_none() {
+        return Err(FfiError::InvalidConfig {
+            detail: "at least one transport must be enabled".into(),
+        });
+    }
+
+    if let Some(options) = quic {
+        match options.listen_addrs {
+            None => builder = builder.quic_dual_stack(),
+            Some(addresses) => {
+                if addresses.is_empty() {
+                    return Err(empty_transport_list("QUIC"));
+                }
+                let mut has_ipv4 = false;
+                let mut has_ipv6 = false;
+                let mut parsed = Vec::with_capacity(addresses.len());
+                for address in addresses {
+                    let address = parse_listen_addr(&address, "QUIC")?;
+                    if !address.is_quic_transport() {
+                        return Err(wrong_transport("QUIC", &address));
+                    }
+                    let already_present = match address.protocols().first() {
+                        Some(Protocol::Ip4(_)) => core::mem::replace(&mut has_ipv4, true),
+                        Some(Protocol::Ip6(_)) => core::mem::replace(&mut has_ipv6, true),
+                        _ => {
+                            return Err(FfiError::InvalidAddress {
+                                detail: format!(
+                                    "QUIC listen address `{address}` must use /ip4 or /ip6; DNS names are dial-only"
+                                ),
+                            });
+                        }
+                    };
+                    if already_present {
+                        return Err(FfiError::InvalidConfig {
+                            detail: format!(
+                                "QUIC listen addresses may contain at most one address per IP family; `{address}` repeats a family"
+                            ),
+                        });
+                    }
+                    parsed.push(address);
+                }
+                builder = match parsed.as_slice() {
+                    [address] => builder.quic_multiaddr(address),
+                    [first, second] => builder.quic_dual_multiaddr(first, second),
+                    _ => unreachable!("validation permits at most one address per IP family"),
+                };
+            }
+        }
+    }
+
+    if let Some(options) = tcp {
+        let addresses = options
+            .listen_addrs
+            .unwrap_or_else(|| vec!["/ip4/0.0.0.0/tcp/0".into(), "/ip6/::/tcp/0".into()]);
+        if addresses.is_empty() {
+            return Err(empty_transport_list("TCP"));
+        }
+        for address in addresses {
+            let address = parse_listen_addr(&address, "TCP")?;
+            if !address.is_tcp_transport() {
+                return Err(wrong_transport("TCP", &address));
+            }
+            builder = builder.tcp_multiaddr(&address);
+        }
+    }
+
+    Ok(builder)
+}
+
+fn parse_listen_addr(address: &str, transport: &str) -> Result<Multiaddr, FfiError> {
+    Multiaddr::from_str(address).map_err(|error| FfiError::InvalidAddress {
+        detail: format!("invalid {transport} listen address `{address}`: {error}"),
+    })
+}
+
+fn empty_transport_list(transport: &str) -> FfiError {
+    FfiError::InvalidConfig {
+        detail: format!(
+            "{transport} listen cannot be empty; omit listen to use dual-stack defaults, or omit the {} transport configuration to disable it",
+            transport.to_ascii_lowercase()
+        ),
+    }
+}
+
+fn wrong_transport(transport: &str, address: &Multiaddr) -> FfiError {
+    FfiError::InvalidConfig {
+        detail: format!("{transport} listen address `{address}` does not use {transport}"),
+    }
+}
 
 /// A minip2p endpoint owned by a foreign runtime.
 #[derive(uniffi::Object)]
@@ -28,7 +124,7 @@ pub struct P2pEndpoint {
 pub(crate) struct Shared {
     state: Mutex<EndpointState>,
     pub(crate) stopped_cv: Condvar,
-    wait_handle: QuicWaitHandle,
+    wait_handle: WaitHandle,
     pub(crate) pending_commands: AtomicUsize,
     pub(crate) driver_running: AtomicBool,
 }
@@ -53,7 +149,8 @@ pub(crate) enum Lifecycle {
 
 #[uniffi::export]
 impl P2pEndpoint {
-    /// Validates the secret key and `config`, binds QUIC, and creates an endpoint.
+    /// Validates the secret key and `config`, binds its transports, and creates
+    /// an endpoint.
     ///
     /// The endpoint begins in the created state and owns its bound sockets,
     /// but does not run a background driver until explicitly started.
@@ -63,12 +160,12 @@ impl P2pEndpoint {
         let relays = config
             .relays
             .iter()
-            .map(|address| parse_direct_quic_peer_addr(address))
+            .map(|address| parse_direct_peer_addr(address))
             .collect::<Result<Vec<_>, _>>()?;
         let autonat_servers = config
             .autonat_servers
             .iter()
-            .map(|address| parse_direct_quic_peer_addr(address))
+            .map(|address| parse_direct_peer_addr(address))
             .collect::<Result<Vec<_>, _>>()?;
         if config.force_relay && relays.is_empty() {
             return Err(FfiError::InvalidConfig {
@@ -154,20 +251,8 @@ impl P2pEndpoint {
             }
         }
 
-        let mut endpoint = match config.listen_addr {
-            Some(address) => {
-                let address =
-                    Multiaddr::from_str(&address).map_err(|error| FfiError::InvalidAddress {
-                        detail: error.to_string(),
-                    })?;
-                builder
-                    .bind_quic_multiaddr(&address)
-                    .map_err(map_constructor_error)?
-            }
-            None => builder
-                .bind_quic_dual_stack()
-                .map_err(map_constructor_error)?,
-        };
+        builder = configure_transports(builder, config.quic, config.tcp)?;
+        let mut endpoint = builder.bind().map_err(map_constructor_error)?;
         let listen_addrs = endpoint
             .listen_all()
             .map_err(map_constructor_error)?
@@ -203,12 +288,12 @@ impl P2pEndpoint {
         self.peer_id.clone()
     }
 
-    /// Returns the bound QUIC peer addresses.
+    /// Returns the bound TCP or QUIC peer addresses.
     pub fn listen_addrs(&self) -> Vec<String> {
         self.listen_addrs.clone()
     }
 
-    /// Returns peers with an established QUIC or circuit connection.
+    /// Returns peers with an established TCP, QUIC, or circuit connection.
     pub fn connected_peers(&self) -> Result<Vec<String>, FfiError> {
         let _pending = PendingCommand::new(&self.shared);
         let state = self.shared.lock_state();
@@ -453,7 +538,7 @@ impl P2pEndpoint {
         let peer = parse_peer_id(&peer_id)?;
         let addresses = addresses
             .iter()
-            .map(|address| parse_direct_quic_peer_addr(address))
+            .map(|address| parse_direct_peer_addr(address))
             .collect::<Result<Vec<_>, _>>()?;
         if addresses.iter().any(|address| address.peer_id() != &peer) {
             return Err(FfiError::InvalidAddress {
@@ -477,9 +562,10 @@ impl P2pEndpoint {
         Ok(id.as_u64())
     }
 
-    /// Starts a connection attempt toward a direct QUIC peer address.
+    /// Starts a connection attempt toward a direct `/tcp` or `/quic-v1` peer
+    /// address.
     pub fn connect_addr(&self, address: String) -> Result<u64, FfiError> {
-        let address = parse_direct_quic_peer_addr(&address)?;
+        let address = parse_direct_peer_addr(&address)?;
         let _pending = PendingCommand::new(&self.shared);
         let mut state = self.shared.lock_state();
         ensure_accepting_commands(&state)?;
@@ -495,7 +581,7 @@ impl P2pEndpoint {
 
     /// Dials a direct peer address on every applicable local address family.
     pub fn dial(&self, address: String) -> Result<Vec<u64>, FfiError> {
-        let address = parse_direct_quic_peer_addr(&address)?;
+        let address = parse_direct_peer_addr(&address)?;
         self.with_endpoint_mut(|endpoint| {
             endpoint
                 .dial(&address)
@@ -506,7 +592,7 @@ impl P2pEndpoint {
 
     /// Dials a direct peer address using IPv4.
     pub fn dial_ip4(&self, address: String) -> Result<u64, FfiError> {
-        let address = parse_direct_quic_peer_addr(&address)?;
+        let address = parse_direct_peer_addr(&address)?;
         self.with_endpoint_mut(|endpoint| {
             endpoint
                 .dial_ip4(&address)
@@ -517,7 +603,7 @@ impl P2pEndpoint {
 
     /// Dials a direct peer address using IPv6.
     pub fn dial_ip6(&self, address: String) -> Result<u64, FfiError> {
-        let address = parse_direct_quic_peer_addr(&address)?;
+        let address = parse_direct_peer_addr(&address)?;
         self.with_endpoint_mut(|endpoint| {
             endpoint
                 .dial_ip6(&address)
@@ -836,7 +922,10 @@ mod tests {
             agent_version: None,
             relays: Vec::new(),
             autonat_servers: Vec::new(),
-            listen_addr: Some("/ip4/127.0.0.1/udp/0/quic-v1".into()),
+            quic: Some(TransportOptions {
+                listen_addrs: Some(vec!["/ip4/127.0.0.1/udp/0/quic-v1".into()]),
+            }),
+            tcp: None,
             force_relay: false,
             allow_unsigned: false,
             pubsub_router: PubsubRouter::Gossipsub,
@@ -887,7 +976,9 @@ mod tests {
         ));
 
         let mut bad_listen = config();
-        bad_listen.listen_addr = Some("not-a-multiaddr".into());
+        bad_listen.quic = Some(TransportOptions {
+            listen_addrs: Some(vec!["not-a-multiaddr".into()]),
+        });
         assert!(matches!(
             endpoint(bad_listen),
             Err(FfiError::InvalidAddress { .. })
@@ -961,11 +1052,90 @@ mod tests {
     #[test]
     fn constructor_accepts_default_dual_stack_binding() {
         let mut config = config();
-        config.listen_addr = None;
+        config.quic = Some(TransportOptions { listen_addrs: None });
 
         let endpoint = endpoint(config).expect("dual-stack endpoint");
 
         assert!(!endpoint.listen_addrs().is_empty());
+    }
+
+    #[test]
+    fn constructor_accepts_exact_dual_stack_quic_addresses() {
+        let mut config = config();
+        config.quic = Some(TransportOptions {
+            listen_addrs: Some(vec![
+                "/ip4/127.0.0.1/udp/0/quic-v1".into(),
+                "/ip6/::1/udp/0/quic-v1".into(),
+            ]),
+        });
+
+        let endpoint = endpoint(config).expect("exact dual-stack endpoint");
+        let addresses = endpoint.listen_addrs();
+
+        assert_eq!(addresses.len(), 2);
+        assert!(
+            addresses
+                .iter()
+                .any(|address| address.starts_with("/ip4/127.0.0.1/"))
+        );
+        assert!(
+            addresses
+                .iter()
+                .any(|address| address.starts_with("/ip6/::1/"))
+        );
+    }
+
+    #[test]
+    fn constructor_accepts_quic_and_tcp_together() {
+        let mut config = config();
+        config.tcp = Some(TransportOptions {
+            listen_addrs: Some(vec!["/ip4/127.0.0.1/tcp/0".into()]),
+        });
+
+        let endpoint = endpoint(config).expect("QUIC + TCP endpoint");
+        let addresses = endpoint.listen_addrs();
+        assert!(addresses.iter().any(|address| address.contains("/quic-v1")));
+        assert!(addresses.iter().any(|address| address.contains("/tcp/")));
+    }
+
+    #[test]
+    fn constructor_rejects_disabled_empty_and_mismatched_transports() {
+        let mut disabled = config();
+        disabled.quic = None;
+        assert!(matches!(
+            endpoint(disabled),
+            Err(FfiError::InvalidConfig { .. })
+        ));
+
+        let mut empty = config();
+        empty.quic = Some(TransportOptions {
+            listen_addrs: Some(Vec::new()),
+        });
+        assert!(matches!(
+            endpoint(empty),
+            Err(FfiError::InvalidConfig { .. })
+        ));
+
+        let mut mismatched = config();
+        mismatched.quic = Some(TransportOptions {
+            listen_addrs: Some(vec!["/ip4/127.0.0.1/tcp/0".into()]),
+        });
+        assert!(matches!(
+            endpoint(mismatched),
+            Err(FfiError::InvalidConfig { .. })
+        ));
+
+        let mut duplicate_quic_family = config();
+        duplicate_quic_family.quic = Some(TransportOptions {
+            listen_addrs: Some(vec![
+                "/ip4/127.0.0.1/udp/0/quic-v1".into(),
+                "/ip4/0.0.0.0/udp/0/quic-v1".into(),
+            ]),
+        });
+        assert!(matches!(
+            endpoint(duplicate_quic_family),
+            Err(FfiError::InvalidConfig { .. })
+        ));
     }
 
     #[test]

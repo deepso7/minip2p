@@ -16,6 +16,11 @@ pub enum TransportError {
     InvalidConfig { reason: String },
     #[error("resource exhausted: {resource}")]
     ResourceExhausted { resource: &'static str },
+    /// The transport does not offer this operation at all, as opposed to
+    /// having tried it and failed. Callers choosing between transports read
+    /// this as "not here", not as an error to report to a user.
+    #[error("this transport does not support {operation}")]
+    Unsupported { operation: &'static str },
     #[error("connection {id} not found")]
     ConnectionNotFound { id: ConnectionId },
     #[error("connection {id} is {state}, expected {expected}")]

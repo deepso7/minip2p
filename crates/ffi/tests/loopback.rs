@@ -164,11 +164,31 @@ impl P2pEventListener for PanicOnceListener {
 }
 
 fn config() -> EndpointConfig {
+    config_on("/ip4/127.0.0.1/udp/0/quic-v1")
+}
+
+fn config_on(listen_addr: &str) -> EndpointConfig {
+    let (quic, tcp) = if listen_addr.contains("/quic-v1") {
+        (
+            Some(minip2p_ffi::TransportOptions {
+                listen_addrs: Some(vec![listen_addr.into()]),
+            }),
+            None,
+        )
+    } else {
+        (
+            None,
+            Some(minip2p_ffi::TransportOptions {
+                listen_addrs: Some(vec![listen_addr.into()]),
+            }),
+        )
+    };
     EndpointConfig {
         agent_version: Some("minip2p-ffi-loopback-test".into()),
         relays: Vec::new(),
         autonat_servers: Vec::new(),
-        listen_addr: Some("/ip4/127.0.0.1/udp/0/quic-v1".into()),
+        quic,
+        tcp,
         force_relay: false,
         allow_unsigned: false,
         pubsub_router: minip2p_ffi::PubsubRouter::Gossipsub,
@@ -185,6 +205,62 @@ fn endpoint(seed: u8) -> Arc<P2pEndpoint> {
 fn stop(endpoint: &P2pEndpoint) {
     endpoint.stop();
     assert!(endpoint.wait_stopped(5_000), "driver did not stop");
+}
+
+#[test]
+fn a_tcp_listen_address_binds_tcp_and_is_dialed_over_it() -> Result<(), FfiError> {
+    let _serial = LOOPBACK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    // A foreign runtime that hands over a `/tcp` listener gets TCP. Parsing
+    // `/tcp` peers to dial while binding only QUIC would leave a device that
+    // has only TCP able to call out and never be called -- and the address it
+    // reported would name a socket it does not have.
+    let a = P2pEndpoint::new(vec![31; 32], config_on("/ip4/127.0.0.1/tcp/0"))
+        .expect("construct a TCP endpoint");
+    let b = P2pEndpoint::new(vec![32; 32], config_on("/ip4/127.0.0.1/tcp/0"))
+        .expect("construct a TCP endpoint");
+    for endpoint in [&a, &b] {
+        let addrs = endpoint.listen_addrs();
+        assert!(
+            addrs.iter().all(|addr| addr.contains("/tcp/")),
+            "a TCP endpoint reports TCP addresses, got {addrs:?}"
+        );
+    }
+
+    let a_log = Arc::new(EventLog::default());
+    let b_log = Arc::new(EventLog::default());
+    let b_peer = b.peer_id();
+    a.start(Arc::clone(&a_log) as Arc<dyn P2pEventListener>)?;
+    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventListener>)?;
+
+    let connect_id = a.connect_addr(b.listen_addrs()[0].clone())?;
+    assert!(
+        a_log
+            .wait_for(Duration::from_secs(5), |event| matches!(
+                event,
+                P2pEvent::PathEstablished {
+                    connect_id: observed,
+                    peer_id,
+                    path: PathKind::DirectDialed,
+                } if *observed == connect_id && peer_id == &b_peer
+            ))
+            .is_some(),
+        "the TCP address was dialed and the path came up"
+    );
+    assert!(
+        a_log
+            .wait_for(Duration::from_secs(5), |event| matches!(
+                event,
+                P2pEvent::PeerReady { peer_id, .. } if peer_id == &b_peer
+            ))
+            .is_some(),
+        "and identify and ping ran over it like any other connection"
+    );
+
+    stop(&a);
+    stop(&b);
+    Ok(())
 }
 
 #[test]

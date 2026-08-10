@@ -1,12 +1,94 @@
 # minip2p-mdns
 
-Sans-I/O libp2p mDNS discovery for `_p2p._udp.local`, with an optional
-synchronous `std` socket driver. The codec and agent build with `no_std +
-alloc`; callers supply time, interface snapshots, incoming datagrams, and drain
+Sans-I/O libp2p mDNS discovery for `_p2p._udp.local`, with a driver and an
+optional `std` socket adapter. All of it is `no_std + alloc`; callers supply
+time.
+
+```text
+MdnsDriver          budgets, interface refresh, the on-link check
+  -> MdnsAgent      DNS scheduling and validation
+  -> MdnsIo         interfaces, datagrams in, datagrams out
+```
+
+`MdnsAgent` is the deterministic core: it decides what to say and when, and
+callers hand it time, interface snapshots, and incoming datagrams, then drain
 outgoing actions and observations.
 
-mDNS claims are unauthenticated. A successful QUIC/TLS handshake verifies the
-remote peer identity later, while the shared discovery book bounds retained
+`MdnsDriver` runs that agent against an `MdnsIo`. It owns the decisions about
+*how much*: how many datagrams to read and send per turn, when to re-enumerate
+interfaces, what to do when the I/O fails, and which datagrams to drop before
+the agent ever sees them. None of that is platform work, so it is the same code
+wherever the datagrams come from.
+
+## Implementations
+
+`MdnsSockets` is the hosted one: per-interface multicast sockets over
+`socket2`, with interface enumeration. It needs the `std` feature, on by
+default.
+
+`SmoltcpMdnsIo` is the embedded one, over [smoltcp] — a TCP/IP stack, not an
+operating system. It needs the `smoltcp` feature and nothing else. The host can
+give it a dedicated device and interface with `new`, or install its sockets and
+group memberships into a `SmoltcpStack` shared with TCP using `on_stack`.
+smoltcp has one interface, so mDNS sees one per family, and `refresh` re-reads
+its addresses — which is how an address arriving by DHCP or SLAAC reaches the
+agent.
+
+Nothing moves in a stack like that except when it is driven, so `next_deadline`
+matters more here than it does with sockets: honouring it is what lets a device
+sleep between packets instead of polling to find out nothing happened. It is
+also why the send rings fill — a burst is queued long before anything drains
+them — so a send with no room left drives the stack itself and tries again,
+and reports `Congested` only if the link still will not take it.
+
+Hosts with neither implement `MdnsIo` over their own stack. Nothing above the
+seam changes: the agent, the driver, the budgets, and the on-link check are the
+same code either way, and each implementation is covered by its own suite — a
+loopback pair for `MdnsSockets`, a shared frame bus for `SmoltcpMdnsIo`.
+
+[smoltcp]: https://docs.rs/smoltcp
+
+## Writing an `MdnsIo`
+
+Six operations, of which two have defaults: which interfaces exist and what
+addresses they hold (`interfaces`), a re-read of them that says whether they
+moved (`refresh` — the path an address arriving by DHCP or SLAAC takes), one
+waiting datagram (`receive`), one datagram out of a chosen interface (`send`),
+and — for a stack that runs in this process — `poll` and `next_deadline`.
+
+Four details matter:
+
+- **`InterfaceId`s must be stable** while an interface is up, and must never be
+  reused for a different one: the agent tracks per-interface state against them.
+- **`receive` never blocks.** Returning `None` means nothing is waiting, so an
+  implementation with several sockets should rotate between them rather than
+  drain one first, or a busy interface will spend the whole budget while a quiet
+  one waits.
+- **Report what you wrote, never more.** The driver's buffer is one byte longer
+  than the largest datagram mDNS will act on, so filling it is how truncation is
+  recognised; capping a read at some smaller length of your own would hand over
+  a truncated claim wearing a plausible length.
+- **A full send buffer is `Congested`, not a failure.** The driver sends up to
+  128 datagrams a turn, so a burst can outrun a queue that drains only when the
+  stack is driven. Saying so parks the datagram until the next turn; reporting a
+  general failure instead ends mDNS for good over a moment's backpressure. A
+  datagram the buffer could never hold is `Oversized` rather than `Congested`,
+  and the driver drops it: draining cannot make room that does not exist, so
+  parking it would retry the same impossible send forever.
+
+`poll` defaults to doing nothing, which is right for a socket an operating
+system services. A stack running in this process needs it: the driver calls it
+before reading, after writing, and once more before releasing the carrier at
+shutdown — that last one is what gets the goodbyes onto the wire.
+
+A claim carries whatever the host listens on — `/tcp`, `/quic-v1`, or a
+circuit through a relay — because a device with no operating system has only
+the first of those, and mDNS that could not say so would find peers on the link
+and leave them no way back.
+
+mDNS claims are unauthenticated. The transport's own handshake (TLS over QUIC,
+Noise over TCP) verifies the remote peer identity later, while the shared
+discovery book bounds retained
 claims and automatic dial traffic. Endpoint automatic dials from mDNS are
 direct-only: an unauthenticated claim never authorizes a configured relay or
 HOP CONNECT.
@@ -18,4 +100,5 @@ advertised because minip2p multiaddrs do not yet support `/ip6zone`. SRV, A, and
 AAAA records are ignored. On macOS, BSD, and Android, wildcard-bound receive
 sockets cannot expose exact ingress-interface attribution without ancillary
 packet information; the driver therefore rejects sources outside the
-interface's on-link prefix as a safe approximation.
+interface's on-link prefix as a safe approximation. That check is the driver's
+rather than an `MdnsIo`'s, so every implementation gets it.

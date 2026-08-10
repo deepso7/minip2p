@@ -9,7 +9,7 @@ Building a React Native app? Go to
 native configuration, development builds, and local-network permissions.
 :::
 
-minip2p requires **Rust 1.88 or newer**. The application-facing crate is
+minip2p requires **Rust 1.91 or newer**. The application-facing crate is
 published to crates.io as `minip2p-rs` and imported in Rust code as `minip2p`.
 
 ### Add the dependency
@@ -41,6 +41,20 @@ Features expose APIs at compile time. Builder methods decide which drivers run
 inside a particular endpoint.
 
 <Tabs>
+  <Tab title="TCP">
+
+    ```toml
+    minip2p-rs = {
+      version = "0.3.1",
+      features = ["tcp"]
+    }
+    ```
+
+    This adds the TCP transport and its `tcp`, `tcp_multiaddr`, `bind_tcp`,
+    and `tcp_config` builder methods. Without it, QUIC-only applications do
+    not link the TCP security, muxing, or socket stack.
+
+  </Tab>
   <Tab title="NAT">
 
     ```toml

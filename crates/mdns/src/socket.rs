@@ -9,14 +9,12 @@ use std::{
 use if_addrs::IfAddr;
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 
-use crate::{
-    InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAction, MdnsAgent, MdnsConfig, MdnsTarget,
-};
+use crate::io::{MdnsDatagram, MdnsError, MdnsIo};
+use crate::{InterfaceId, InterfaceSnapshot, IpFamily, IpNet, MdnsAction, MdnsConfig, MdnsTarget};
 
 const MDNS_PORT: u16 = 5353;
 const MDNS_V4_GROUP: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 251);
 const MDNS_V6_GROUP: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x00fb);
-const RECEIVE_BUFFER_BYTES: usize = 9_001;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct InterfaceKey {
@@ -68,39 +66,19 @@ struct SocketPair {
     send: UdpSocket,
 }
 
-/// Socket-adapter failures.
-#[derive(Debug, thiserror::Error)]
-pub enum MdnsError {
-    /// The current target cannot provide the required multicast socket options.
-    #[error("mDNS sockets are unsupported on this target")]
-    Unsupported,
-    /// No usable address exists for an enumerated interface/family pair.
-    #[error("mDNS interface {interface:?} has no usable address")]
-    NoInterfaceAddress {
-        /// Interface that could not be bound.
-        interface: InterfaceId,
-    },
-    /// A send action referenced an interface that has disappeared.
-    #[error("mDNS interface {interface:?} is no longer active")]
-    UnknownInterface {
-        /// Missing interface handle.
-        interface: InterfaceId,
-    },
-    /// The stable interface-id counter was exhausted.
-    #[error("mDNS interface id space is exhausted")]
-    InterfaceIdsExhausted,
-    /// An operating-system socket or interface-enumeration operation failed.
-    #[error(transparent)]
-    Io(#[from] io::Error),
-}
-
 /// Per-interface mDNS receive/send socket collection.
+///
+/// The sockets are a list rather than a map: there are a handful of them, a
+/// receive happens up to a full budget's worth per tick, and walking a short
+/// list beats allocating anything at all on that path.
 #[derive(Debug)]
 pub struct MdnsSockets {
     enable_ipv6: bool,
     registry: InterfaceRegistry,
     snapshots: Vec<InterfaceSnapshot>,
-    pairs: BTreeMap<InterfaceId, SocketPair>,
+    pairs: Vec<SocketPair>,
+    /// Where the next receive starts looking, so one talkative interface
+    /// cannot spend a whole budget while a quiet one waits.
     next_receive_offset: usize,
 }
 
@@ -118,23 +96,15 @@ impl MdnsSockets {
                 enable_ipv6: config.enable_ipv6,
                 registry: InterfaceRegistry::default(),
                 snapshots: Vec::new(),
-                pairs: BTreeMap::new(),
+                pairs: Vec::new(),
                 next_receive_offset: 0,
             };
-            sockets.refresh()?;
+            sockets.refresh_interfaces()?;
             Ok(sockets)
         }
     }
 
-    /// Returns the current stable interface/family snapshots.
-    pub fn interfaces(&self) -> &[InterfaceSnapshot] {
-        &self.snapshots
-    }
-
-    /// Re-enumerates interfaces, preserving ids and sockets for unchanged pairs.
-    ///
-    /// Returns `true` when the snapshot changed.
-    pub fn refresh(&mut self) -> Result<bool, MdnsError> {
+    fn refresh_interfaces(&mut self) -> Result<bool, MdnsError> {
         let grouped = enumerate_interfaces(self.enable_ipv6)?;
         let snapshots = self.registry.assign(&grouped)?;
         if snapshots == self.snapshots {
@@ -142,71 +112,65 @@ impl MdnsSockets {
         }
 
         let mut old = core::mem::take(&mut self.pairs);
-        let mut pairs = BTreeMap::new();
+        let mut pairs = Vec::with_capacity(snapshots.len());
         for snapshot in &snapshots {
-            let pair = match old.remove(&snapshot.id) {
-                Some(pair) if pair.snapshot == *snapshot => pair,
-                _ => SocketPair::new(snapshot.clone())?,
+            // An interface that is still here with the same addresses keeps
+            // its sockets: rebuilding one would drop the multicast membership
+            // and lose whatever had arrived on it.
+            let existing = old
+                .iter()
+                .position(|pair| pair.snapshot == *snapshot)
+                .map(|index| old.swap_remove(index));
+            let pair = match existing {
+                Some(pair) => pair,
+                None => SocketPair::new(snapshot.clone())?,
             };
-            pairs.insert(snapshot.id, pair);
+            pairs.push(pair);
         }
         self.snapshots = snapshots;
         self.pairs = pairs;
         self.next_receive_offset = 0;
         Ok(true)
     }
+}
 
-    /// Drains at most `limit` datagrams into the sans-I/O agent.
-    ///
-    /// Returns `true` when the cap was reached and the caller should re-poll
-    /// promptly. Off-link and oversized datagrams count toward the fairness cap.
-    pub fn drain_into(
-        &mut self,
-        agent: &mut MdnsAgent,
-        now_ms: u64,
-        limit: usize,
-    ) -> Result<bool, MdnsError> {
-        if limit == 0 || self.pairs.is_empty() {
-            return Ok(false);
-        }
-        let ids: Vec<InterfaceId> = self.pairs.keys().copied().collect();
-        let mut processed = 0usize;
-        while processed < limit {
-            let mut made_progress = false;
-            for offset in 0..ids.len() {
-                if processed == limit {
-                    break;
-                }
-                let index = (self.next_receive_offset + offset) % ids.len();
-                let id = ids[index];
-                let pair = self
-                    .pairs
-                    .get_mut(&id)
-                    .expect("ids are collected from the pair map");
-                let mut buffer = [0u8; RECEIVE_BUFFER_BYTES];
-                match pair.receive.recv_from(&mut buffer) {
-                    Ok((len, from)) => {
-                        processed += 1;
-                        made_progress = true;
-                        self.next_receive_offset = (index + 1) % ids.len();
-                        if len > 9_000 || !source_is_on_link(&pair.snapshot, from.ip()) {
-                            continue;
-                        }
-                        agent.handle_packet(id, from, &buffer[..len], now_ms);
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            if !made_progress {
-                break;
-            }
-        }
-        Ok(processed == limit)
+impl MdnsIo for MdnsSockets {
+    fn interfaces(&self) -> &[InterfaceSnapshot] {
+        &self.snapshots
     }
 
-    /// Sends one agent action through its selected interface socket.
-    pub fn send(&self, action: &MdnsAction) -> Result<(), MdnsError> {
+    fn refresh(&mut self) -> Result<bool, MdnsError> {
+        self.refresh_interfaces()
+    }
+
+    fn receive(&mut self, buffer: &mut [u8]) -> Result<Option<MdnsDatagram>, MdnsError> {
+        let count = self.pairs.len();
+        if count == 0 {
+            return Ok(None);
+        }
+        // Starts where the last read stopped, and allocates nothing: this runs
+        // once per datagram, so a flood would pay for anything done here a
+        // budget's worth of times per tick.
+        for step in 0..count {
+            let index = (self.next_receive_offset + step) % count;
+            let pair = &mut self.pairs[index];
+            match pair.receive.recv_from(buffer) {
+                Ok((len, from)) => {
+                    self.next_receive_offset = (index + 1) % count;
+                    return Ok(Some(MdnsDatagram {
+                        interface: pair.snapshot.id,
+                        from,
+                        len,
+                    }));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(MdnsError::io("reading an mDNS datagram", error)),
+            }
+        }
+        Ok(None)
+    }
+
+    fn send(&mut self, action: &MdnsAction) -> Result<(), MdnsError> {
         let MdnsAction::Send {
             interface,
             target,
@@ -214,7 +178,8 @@ impl MdnsSockets {
         } = action;
         let pair = self
             .pairs
-            .get(interface)
+            .iter()
+            .find(|pair| pair.snapshot.id == *interface)
             .ok_or(MdnsError::UnknownInterface {
                 interface: *interface,
             })?;
@@ -230,7 +195,9 @@ impl MdnsSockets {
             },
             MdnsTarget::Unicast { to } => *to,
         };
-        pair.send.send_to(payload, destination)?;
+        pair.send
+            .send_to(payload, destination)
+            .map_err(|error| send_error(*interface, error))?;
         Ok(())
     }
 }
@@ -251,7 +218,9 @@ fn enumerate_interfaces(
     enable_ipv6: bool,
 ) -> Result<BTreeMap<InterfaceKey, Vec<IpNet>>, MdnsError> {
     let mut grouped: BTreeMap<InterfaceKey, Vec<IpNet>> = BTreeMap::new();
-    for iface in if_addrs::get_if_addrs()? {
+    let interfaces = if_addrs::get_if_addrs()
+        .map_err(|error| MdnsError::io("enumerating network interfaces", error))?;
+    for iface in interfaces {
         let Some(index) = iface.index else {
             continue;
         };
@@ -284,31 +253,32 @@ fn create_receive_socket(snapshot: &InterfaceSnapshot) -> Result<UdpSocket, Mdns
         IpFamily::V4 => Domain::IPV4,
         IpFamily::V6 => Domain::IPV6,
     };
-    let socket = Socket::new(domain, Type::DGRAM, Some(SocketProtocol::UDP))?;
+    let socket = Socket::new(domain, Type::DGRAM, Some(SocketProtocol::UDP))
+        .map_err(|error| MdnsError::io("opening an mDNS receive socket", error))?;
     configure_reuse(&socket)?;
     if snapshot.family == IpFamily::V6 {
-        socket.set_only_v6(true)?;
+        setup(socket.set_only_v6(true))?;
     }
     let bind = match snapshot.family {
         IpFamily::V4 => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, MDNS_PORT)),
         IpFamily::V6 => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, MDNS_PORT, 0, 0)),
     };
-    socket.bind(&bind.into())?;
+    setup(socket.bind(&bind.into()))?;
 
     match snapshot.family {
         IpFamily::V4 => {
             let interface = primary_v4(snapshot)?;
             #[cfg(target_os = "linux")]
-            socket.set_multicast_all_v4(false)?;
-            socket.join_multicast_v4(&MDNS_V4_GROUP, &interface)?;
+            setup(socket.set_multicast_all_v4(false))?;
+            setup(socket.join_multicast_v4(&MDNS_V4_GROUP, &interface))?;
         }
         IpFamily::V6 => {
             #[cfg(target_os = "linux")]
-            socket.set_multicast_all_v6(false)?;
-            socket.join_multicast_v6(&MDNS_V6_GROUP, snapshot.index)?;
+            setup(socket.set_multicast_all_v6(false))?;
+            setup(socket.join_multicast_v6(&MDNS_V6_GROUP, snapshot.index))?;
         }
     }
-    socket.set_nonblocking(true)?;
+    setup(socket.set_nonblocking(true))?;
     Ok(socket.into())
 }
 
@@ -317,32 +287,54 @@ fn create_send_socket(snapshot: &InterfaceSnapshot) -> Result<UdpSocket, MdnsErr
         IpFamily::V4 => Domain::IPV4,
         IpFamily::V6 => Domain::IPV6,
     };
-    let socket = Socket::new(domain, Type::DGRAM, Some(SocketProtocol::UDP))?;
+    let socket = Socket::new(domain, Type::DGRAM, Some(SocketProtocol::UDP))
+        .map_err(|error| MdnsError::io("opening an mDNS send socket", error))?;
     configure_reuse(&socket)?;
     let bind = match snapshot.family {
         IpFamily::V4 => {
             let interface = primary_v4(snapshot)?;
-            socket.set_multicast_if_v4(&interface)?;
-            socket.set_multicast_loop_v4(true)?;
-            socket.set_multicast_ttl_v4(255)?;
+            setup(socket.set_multicast_if_v4(&interface))?;
+            setup(socket.set_multicast_loop_v4(true))?;
+            setup(socket.set_multicast_ttl_v4(255))?;
             SocketAddr::V4(SocketAddrV4::new(interface, MDNS_PORT))
         }
         IpFamily::V6 => {
-            socket.set_only_v6(true)?;
-            socket.set_multicast_if_v6(snapshot.index)?;
-            socket.set_multicast_loop_v6(true)?;
-            socket.set_multicast_hops_v6(255)?;
+            setup(socket.set_only_v6(true))?;
+            setup(socket.set_multicast_if_v6(snapshot.index))?;
+            setup(socket.set_multicast_loop_v6(true))?;
+            setup(socket.set_multicast_hops_v6(255))?;
             let interface = primary_v6(snapshot)?;
             SocketAddr::V6(SocketAddrV6::new(interface, MDNS_PORT, 0, snapshot.index))
         }
     };
-    socket.bind(&bind.into())?;
-    socket.set_nonblocking(true)?;
+    setup(socket.bind(&bind.into()))?;
+    setup(socket.set_nonblocking(true))?;
     Ok(socket.into())
 }
 
+/// Names what every socket option failure has in common: the socket could not
+/// be set up for multicast, and mDNS cannot run on it.
+/// What a failed send means.
+///
+/// These sockets are non-blocking, so a full kernel send buffer reports itself
+/// rather than waiting. That is backpressure and not a broken socket: the
+/// driver parks the datagram and comes back for it once the buffer has
+/// drained. Calling it an I/O failure would end mDNS for good over a moment of
+/// it -- which is the same distinction an embedded stack draws when its
+/// transmit ring fills.
+fn send_error(interface: InterfaceId, error: io::Error) -> MdnsError {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return MdnsError::Congested { interface };
+    }
+    MdnsError::io("sending an mDNS datagram", error)
+}
+
+fn setup<T>(result: io::Result<T>) -> Result<T, MdnsError> {
+    result.map_err(|error| MdnsError::io("configuring an mDNS socket", error))
+}
+
 fn configure_reuse(socket: &Socket) -> Result<(), MdnsError> {
-    socket.set_reuse_address(true)?;
+    setup(socket.set_reuse_address(true))?;
     #[cfg(all(
         unix,
         not(any(
@@ -353,7 +345,7 @@ fn configure_reuse(socket: &Socket) -> Result<(), MdnsError> {
             target_os = "wasi"
         ))
     ))]
-    socket.set_reuse_port(true)?;
+    setup(socket.set_reuse_port(true))?;
     Ok(())
 }
 
@@ -383,41 +375,21 @@ fn primary_v6(snapshot: &InterfaceSnapshot) -> Result<Ipv6Addr, MdnsError> {
         })
 }
 
-fn source_is_on_link(snapshot: &InterfaceSnapshot, source: IpAddr) -> bool {
-    snapshot
-        .addrs
-        .iter()
-        .any(|network| same_subnet(*network, source))
-}
-
-fn same_subnet(network: IpNet, source: IpAddr) -> bool {
-    let prefix_len = network.prefix_len();
-    match (network.ip(), source) {
-        (IpAddr::V4(network_ip), IpAddr::V4(source_ip)) => {
-            let mask = prefix_mask_u32(prefix_len);
-            u32::from(source_ip) & mask == u32::from(network_ip) & mask
+#[cfg(test)]
+impl MdnsSockets {
+    /// Builds a collection over sockets a test bound itself.
+    ///
+    /// The real constructor needs multicast membership on a real interface,
+    /// which a test machine may not have; the rotation between sockets is
+    /// ordinary logic that plain loopback sockets exercise just as well.
+    fn from_pairs(pairs: Vec<SocketPair>) -> Self {
+        Self {
+            enable_ipv6: false,
+            registry: InterfaceRegistry::default(),
+            snapshots: pairs.iter().map(|pair| pair.snapshot.clone()).collect(),
+            pairs,
+            next_receive_offset: 0,
         }
-        (IpAddr::V6(network_ip), IpAddr::V6(source_ip)) => {
-            let mask = prefix_mask_u128(prefix_len);
-            u128::from(source_ip) & mask == u128::from(network_ip) & mask
-        }
-        _ => false,
-    }
-}
-
-fn prefix_mask_u32(prefix: u8) -> u32 {
-    if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix)
-    }
-}
-
-fn prefix_mask_u128(prefix: u8) -> u128 {
-    if prefix == 0 {
-        0
-    } else {
-        u128::MAX << (128 - prefix)
     }
 }
 
@@ -427,6 +399,111 @@ mod tests {
 
     fn net(ip: IpAddr, prefix: u8) -> IpNet {
         IpNet::new(ip, prefix).unwrap()
+    }
+
+    /// A pair whose receive socket is a plain loopback UDP socket.
+    fn loopback_pair(id: u32) -> (SocketPair, SocketAddr) {
+        let receive = UdpSocket::bind("127.0.0.1:0").expect("a loopback socket");
+        receive.set_nonblocking(true).expect("nonblocking");
+        let addr = receive.local_addr().expect("bound address");
+        let send = UdpSocket::bind("127.0.0.1:0").expect("a loopback socket");
+        let snapshot = InterfaceSnapshot {
+            id: InterfaceId::new(id),
+            index: id,
+            family: IpFamily::V4,
+            addrs: vec![net(IpAddr::V4(Ipv4Addr::LOCALHOST), 8)],
+        };
+        (
+            SocketPair {
+                snapshot,
+                receive,
+                send,
+            },
+            addr,
+        )
+    }
+
+    fn next_interface(sockets: &mut MdnsSockets) -> InterfaceId {
+        let mut buffer = [0u8; 64];
+        sockets
+            .receive(&mut buffer)
+            .expect("receive")
+            .expect("a datagram was waiting")
+            .interface
+    }
+
+    /// Waits until every socket has something waiting.
+    ///
+    /// Loopback delivery is prompt but not synchronous, and reading before it
+    /// lands would test the kernel's timing rather than the rotation.
+    fn wait_until_all_ready(sockets: &MdnsSockets) {
+        for pair in &sockets.pairs {
+            let mut peek = [0u8; 1];
+            let mut ready = false;
+            for _ in 0..1_000 {
+                if pair.receive.peek_from(&mut peek).is_ok() {
+                    ready = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(ready, "a datagram sent on loopback never arrived");
+        }
+    }
+
+    #[test]
+    fn a_full_send_buffer_is_backpressure_and_not_a_broken_socket() {
+        // Kernel send-buffer pressure is not something a test can conjure on
+        // demand, so the decision is checked where it is made. What it costs
+        // to get wrong is not small: the driver ends mDNS on an I/O failure,
+        // so one busy moment would take the host off the link for good.
+        assert_eq!(
+            send_error(
+                InterfaceId::new(1),
+                io::Error::from(io::ErrorKind::WouldBlock)
+            ),
+            MdnsError::Congested {
+                interface: InterfaceId::new(1)
+            }
+        );
+        // Anything else is what it says it is.
+        assert!(matches!(
+            send_error(
+                InterfaceId::new(1),
+                io::Error::from(io::ErrorKind::PermissionDenied)
+            ),
+            MdnsError::Io { .. }
+        ));
+    }
+
+    #[test]
+    fn receiving_rotates_between_interfaces() {
+        let (first, first_addr) = loopback_pair(1);
+        let (second, second_addr) = loopback_pair(2);
+        let mut sockets = MdnsSockets::from_pairs(vec![first, second]);
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("a loopback socket");
+
+        // Two waiting on one interface and one on the other. Draining the
+        // first would spend a caller's budget on whichever interface happened
+        // to be talking most, and a quiet one could wait indefinitely.
+        sender.send_to(b"a", first_addr).expect("send");
+        sender.send_to(b"a", first_addr).expect("send");
+        sender.send_to(b"b", second_addr).expect("send");
+        wait_until_all_ready(&sockets);
+
+        assert_eq!(
+            [
+                next_interface(&mut sockets),
+                next_interface(&mut sockets),
+                next_interface(&mut sockets),
+            ],
+            [
+                InterfaceId::new(1),
+                InterfaceId::new(2),
+                InterfaceId::new(1)
+            ],
+            "each read starts where the last one stopped"
+        );
     }
 
     #[test]
@@ -451,23 +528,5 @@ mod tests {
         );
         let reappeared = registry.assign(&grouped).unwrap()[0].id;
         assert_ne!(first, reappeared);
-    }
-
-    #[test]
-    fn on_link_check_uses_checked_prefix() {
-        let snapshot = InterfaceSnapshot {
-            id: InterfaceId::new(1),
-            index: 1,
-            family: IpFamily::V4,
-            addrs: vec![net(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 24)],
-        };
-        assert!(source_is_on_link(
-            &snapshot,
-            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99))
-        ));
-        assert!(!source_is_on_link(
-            &snapshot,
-            IpAddr::V4(Ipv4Addr::new(192, 168, 2, 1))
-        ));
     }
 }

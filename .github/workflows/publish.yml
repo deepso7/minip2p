@@ -29,7 +29,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.88"
+          toolchain: "1.91"
 
       - name: Verify release tag and package versions
         id: release
@@ -109,13 +109,19 @@ jobs:
           ref: ${{ github.event.release.tag_name }}
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.88"
+          toolchain: "1.91"
       - uses: Swatinem/rust-cache@v2
       - name: Test release commit
         run: |
           cargo test --workspace --locked
-          cargo test -p minip2p-rs --features nat,pubsub,discovery,mdns --locked
+          cargo test -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp --locked
+          cargo test -p minip2p-tcp --features smoltcp --locked
+          cargo test -p minip2p-mdns --features smoltcp --locked
+          cargo test -p minip2p-rs --no-default-features --features smoltcp --locked
           cargo doc --workspace --no-deps --locked
+          cargo doc -p minip2p-tcp --features smoltcp --no-deps --locked
+          cargo doc -p minip2p-mdns --features smoltcp --no-deps --locked
+          cargo doc -p minip2p-rs --no-default-features --features smoltcp --no-deps --locked
 
   android-native:
     name: Build Android release artifacts
@@ -329,7 +335,7 @@ jobs:
           ref: ${{ github.event.release.tag_name }}
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.88"
+          toolchain: "1.91"
       - uses: Swatinem/rust-cache@v2
       - name: Authenticate with crates.io
         id: crates-io-auth
@@ -354,6 +360,7 @@ jobs:
           }
 
           crates=(
+            minip2p-platform
             minip2p-identity
             minip2p-core
             minip2p-transport
@@ -361,18 +368,21 @@ jobs:
             minip2p-noise
             minip2p-yamux
             minip2p-multistream-select
+            minip2p-secure-mux
             minip2p-identify
             minip2p-ping
             minip2p-relay
             minip2p-autonat
             minip2p-dcutr
             minip2p-discovery
+            minip2p-smoltcp
             minip2p-mdns
             minip2p-swarm
             minip2p-circuit
             minip2p-nat
             minip2p-pubsub
             minip2p-quic
+            minip2p-tcp
             minip2p-rs
           )
 

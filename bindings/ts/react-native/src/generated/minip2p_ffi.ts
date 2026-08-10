@@ -21,6 +21,8 @@ const uniffiIsDebug =
 
 /**
  * Builds a circuit multiaddress for `peer_id` through `relay_addr`.
+ *
+ * `relay_addr` is any direct `/tcp` or `/quic-v1` peer address.
  */
 export function circuitAddress(relayAddr: string, peerId: string): string /*throws*/ {
     return ((__rb: Uint8Array) => {
@@ -200,6 +202,54 @@ const FfiConverterTypeDiscoveryOptions = (() => {
 })();
 
 /**
+ * One enabled transport and the addresses it should listen on.
+ */
+export type TransportOptions = {
+    /**
+     * Exact listen multiaddresses, or transport defaults when absent.
+     *
+     * An explicitly empty list is rejected: omit this field for defaults or
+     * disable the transport by omitting it from [`EndpointConfig`].
+     */
+    listenAddrs?: Array<string>
+}
+
+/**
+ * Generated factory for {@link TransportOptions} record objects.
+ */
+export const TransportOptions = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<TransportOptions, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<TransportOptions>,
+    });
+})();
+
+const FfiConverterTypeTransportOptions = (() => {
+    type TypeName = TransportOptions;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                listenAddrs: FfiConverterOptionalSequenceString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterOptionalSequenceString.write(value.listenAddrs, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterOptionalSequenceString.allocationSize(value.listenAddrs);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
  * Pubsub routing engine selected at endpoint construction.
  */
 export enum PubsubRouter {
@@ -348,9 +398,13 @@ export type EndpointConfig = {
      */
     autonatServers: Array<string>,
     /**
-     * QUIC listen multiaddress, or dual-stack wildcard binding when absent.
+     * QUIC configuration, or no QUIC transport when absent.
      */
-    listenAddr?: string,
+    quic?: TransportOptions,
+    /**
+     * TCP configuration, or no TCP transport when absent.
+     */
+    tcp?: TransportOptions,
     /**
      * Whether connection attempts must remain relayed.
      */
@@ -401,7 +455,8 @@ const FfiConverterTypeEndpointConfig = (() => {
                 agentVersion: FfiConverterOptionalString.read(from),
                 relays: FfiConverterSequenceString.read(from),
                 autonatServers: FfiConverterSequenceString.read(from),
-                listenAddr: FfiConverterOptionalString.read(from),
+                quic: FfiConverterOptionalTypeTransportOptions.read(from),
+                tcp: FfiConverterOptionalTypeTransportOptions.read(from),
                 forceRelay: FfiConverterBool.read(from),
                 allowUnsigned: FfiConverterBool.read(from),
                 pubsubRouter: FfiConverterTypePubsubRouter.read(from),
@@ -414,7 +469,8 @@ const FfiConverterTypeEndpointConfig = (() => {
             FfiConverterOptionalString.write(value.agentVersion, into);
             FfiConverterSequenceString.write(value.relays, into);
             FfiConverterSequenceString.write(value.autonatServers, into);
-            FfiConverterOptionalString.write(value.listenAddr, into);
+            FfiConverterOptionalTypeTransportOptions.write(value.quic, into);
+            FfiConverterOptionalTypeTransportOptions.write(value.tcp, into);
             FfiConverterBool.write(value.forceRelay, into);
             FfiConverterBool.write(value.allowUnsigned, into);
             FfiConverterTypePubsubRouter.write(value.pubsubRouter, into);
@@ -426,7 +482,8 @@ const FfiConverterTypeEndpointConfig = (() => {
             return FfiConverterOptionalString.allocationSize(value.agentVersion) +
              FfiConverterSequenceString.allocationSize(value.relays) +
              FfiConverterSequenceString.allocationSize(value.autonatServers) +
-             FfiConverterOptionalString.allocationSize(value.listenAddr) +
+             FfiConverterOptionalTypeTransportOptions.allocationSize(value.quic) +
+             FfiConverterOptionalTypeTransportOptions.allocationSize(value.tcp) +
              FfiConverterBool.allocationSize(value.forceRelay) +
              FfiConverterBool.allocationSize(value.allowUnsigned) +
              FfiConverterTypePubsubRouter.allocationSize(value.pubsubRouter) +
@@ -3889,7 +3946,8 @@ export interface P2pEndpointLike {
  */
     connect(peerId: string) /*throws*/: bigint;
 /**
- * Starts a connection attempt toward a direct QUIC peer address.
+ * Starts a connection attempt toward a direct `/tcp` or `/quic-v1` peer
+ * address.
  */
     connectAddr(address: string) /*throws*/: bigint;
 /**
@@ -3897,7 +3955,7 @@ export interface P2pEndpointLike {
  */
     connectWithAddrs(peerId: string, addresses: Array<string>) /*throws*/: bigint;
 /**
- * Returns peers with an established QUIC or circuit connection.
+ * Returns peers with an established TCP, QUIC, or circuit connection.
  */
     connectedPeers() /*throws*/: Array<string>;
 /**
@@ -3941,7 +3999,7 @@ export interface P2pEndpointLike {
  */
     knownPeers() /*throws*/: Array<KnownPeerInfo>;
 /**
- * Returns the bound QUIC peer addresses.
+ * Returns the bound TCP or QUIC peer addresses.
  */
     listenAddrs(): Array<string>;
 /**
@@ -4027,7 +4085,8 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     readonly [destructorGuardSymbol]: UniffiGcObject;
     readonly [pointerLiteralSymbol]: UniffiHandle;
 /**
- * Validates the secret key and `config`, binds QUIC, and creates an endpoint.
+ * Validates the secret key and `config`, binds its transports, and creates
+ * an endpoint.
  *
  * The endpoint begins in the created state and owns its bound sockets,
  * but does not run a background driver until explicitly started.
@@ -4151,7 +4210,8 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Starts a connection attempt toward a direct QUIC peer address.
+ * Starts a connection attempt toward a direct `/tcp` or `/quic-v1` peer
+ * address.
  */
     connectAddr(address: string): bigint /*throws*/ {
     return FfiConverterUInt64.lift(uniffiCaller.rustCallWithError(
@@ -4184,7 +4244,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns peers with an established QUIC or circuit connection.
+ * Returns peers with an established TCP, QUIC, or circuit connection.
  */
     connectedPeers(): Array<string> /*throws*/ {
     return ((__rb: Uint8Array) => {
@@ -4353,7 +4413,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns the bound QUIC peer addresses.
+ * Returns the bound TCP or QUIC peer addresses.
  */
     listenAddrs(): Array<string> {
     return ((__rb: Uint8Array) => {
@@ -4709,6 +4769,12 @@ const FfiConverterOptionalString = new FfiConverterOptional(FfiConverterString);
 // FfiConverter for Array<string>
 const FfiConverterSequenceString = new FfiConverterArray(FfiConverterString);
 
+// FfiConverter for Array<string> | undefined
+const FfiConverterOptionalSequenceString = new FfiConverterOptional(FfiConverterSequenceString);
+
+// FfiConverter for TransportOptions | undefined
+const FfiConverterOptionalTypeTransportOptions = new FfiConverterOptional(FfiConverterTypeTransportOptions);
+
 // FfiConverter for DiscoveryOptions | undefined
 const FfiConverterOptionalTypeDiscoveryOptions = new FfiConverterOptional(FfiConverterTypeDiscoveryOptions);
 
@@ -4755,7 +4821,7 @@ function uniffiEnsureInitialized() {
     if (bindingsContractVersion !== scaffoldingContractVersion) {
         throw new UniffiInternalError.ContractVersionMismatch(scaffoldingContractVersion, bindingsContractVersion);
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_func_circuit_address() !== 35260) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_func_circuit_address() !== 18077) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_func_circuit_address");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_func_generate_secret_key() !== 44400) {
@@ -4764,7 +4830,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_func_peer_id_from_secret_key() !== 8962) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_func_peer_id_from_secret_key");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new() !== 6140) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new() !== 64534) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_abandon_stream() !== 60482) {
@@ -4785,13 +4851,13 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect() !== 60427) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr() !== 53710) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr() !== 15782) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs() !== 44153) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers() !== 10075) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers() !== 52578) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial() !== 47576) {
@@ -4818,7 +4884,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_known_peers() !== 27328) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_known_peers");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_listen_addrs() !== 19812) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_listen_addrs() !== 60889) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_listen_addrs");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_open_stream() !== 18245) {
@@ -4894,5 +4960,6 @@ export default Object.freeze({
     FfiConverterTypePubsubRouter,
     FfiConverterTypeReachability,
     FfiConverterTypeRelayReservationInfo,
+    FfiConverterTypeTransportOptions,
   }
 });

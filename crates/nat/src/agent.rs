@@ -251,17 +251,33 @@ impl Shared {
             return;
         };
         let mut validated = select_direct_addrs(&[], Some(addr), None);
-        if let Some(addr) = validated.pop() {
+        if let Some(addr) = validated.pop().filter(Multiaddr::is_quic_transport) {
             self.observed_addrs.insert(reporter.clone(), addr);
         }
     }
 
     /// Addresses advertised in DCUtR exchanges: the validated listen/external
     /// set plus our peer-observed public mappings, deduplicated.
+    ///
+    /// QUIC only, and for the same reason the peer's addresses are filtered on
+    /// the way in: a hole punch is not a dial. What goes into a CONNECT is an
+    /// invitation to blast UDP at us, so a `/tcp` listener has no business
+    /// there -- nothing punches it, and asking a peer to try only spends its
+    /// punch window on an address that cannot open.
+    ///
+    /// Unlike the peer's, these are not required to be globally routable: a
+    /// LAN address of ours is a perfectly good punch target for a peer on the
+    /// same LAN, and it is the receiver that decides what it is willing to
+    /// aim at.
     pub(crate) fn punch_candidates(&self) -> Vec<Multiaddr> {
-        let mut addrs = self.listen_addrs.clone();
+        let mut addrs: Vec<Multiaddr> = self
+            .listen_addrs
+            .iter()
+            .filter(|addr| addr.is_quic_transport())
+            .cloned()
+            .collect();
         for addr in self.observed_addrs.values() {
-            if !addrs.contains(addr) {
+            if addr.is_quic_transport() && !addrs.contains(addr) {
                 addrs.push(addr.clone());
             }
         }

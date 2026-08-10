@@ -20,9 +20,24 @@ This crate focuses on typed address handling and peer-qualified endpoint types.
 - `/dns/<name>`
 - `/dns4/<name>`
 - `/dns6/<name>`
+- `/tcp/<port>`
 - `/udp/<port>`
 - `/quic-v1`
 - `/p2p/<peer-id>`
+
+DNS names are validated identically by the text and binary codecs: a name may not be empty or contain `/`, whitespace, or control characters. Without that, a binary name containing `/` would print as several components and re-parse into a *different* address.
+
+## Transport classification
+
+`Multiaddr::transport_kind()` reports which base transport can dial an address, which is what a multi-transport host routes on:
+
+| Shape | `transport_kind()` |
+| --- | --- |
+| `/<host>/tcp/<port>` | `Some(TransportKind::Tcp)` |
+| `/<host>/udp/<port>/quic-v1` | `Some(TransportKind::Quic)` |
+| anything else | `None` |
+
+A trailing `/p2p/<peer-id>` makes an address a *peer* address rather than a transport address, so it classifies as `None`; strip it with `PeerAddr::transport()` first. `is_tcp_transport()` and `is_quic_transport()` answer the same question for one transport.
 
 ## Usage
 
@@ -51,9 +66,10 @@ assert_eq!(decoded, addr);
 ```
 
 Wire layout: each component is `<varint(multicodec)><value>`. Value
-shape depends on the protocol: fixed-size bytes for ip4/ip6/udp,
+shape depends on the protocol: fixed-size bytes for ip4/ip6 and for the
+tcp/udp ports (both two bytes, big-endian),
 varint-length-prefixed UTF-8 for dns*, varint-length-prefixed
-multihash for p2p, absent for quic-v1. See
+multihash for p2p, absent for quic-v1 and p2p-circuit. See
 <https://github.com/multiformats/multiaddr> for the full spec.
 
 Work with peer-qualified addresses:

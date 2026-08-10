@@ -2,7 +2,7 @@
 name = "minip2p-docs-quickstart"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.91"
 publish = false
 
 [workspace]

@@ -5,8 +5,12 @@
 //! transport implementation.
 
 use minip2p_core::{PeerAddr, Protocol};
+use minip2p_platform::Now;
 use minip2p_quic::{QuicEndpoint, QuicLimits, QuicNodeConfig, QuicTransport};
-use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError, TransportEvent};
+use minip2p_transport::{
+    BlockingTransport, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
+    WaitOutcome,
+};
 
 mod common;
 use common::{drive_pair_once, setup_pair};
@@ -120,7 +124,7 @@ fn listen_returns_the_resolved_listen_address_and_event_matches() {
     let resolved = listener.listen(&requested).expect("listen");
     assert_eq!(resolved, requested);
 
-    let events = listener.poll().expect("poll");
+    let events = listener.poll(common::now()).expect("poll");
     assert!(
         events
             .iter()
@@ -244,7 +248,9 @@ fn local_stream_limit_is_released_after_stream_gc() {
     client
         .reset_stream(client_conn, first)
         .expect("reset first");
-    client.poll().expect("collect and gc reset stream");
+    client
+        .poll(common::now())
+        .expect("collect and gc reset stream");
 
     let second = client
         .open_stream(client_conn)
@@ -431,7 +437,7 @@ fn quic_deadline_is_exposed_and_driven_without_socket_input() {
     let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
     let (_, conn_id, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
     assert!(
-        client.next_timeout().is_some(),
+        client.next_deadline().is_some(),
         "connected QUIC session must arm a timer"
     );
 
@@ -439,7 +445,7 @@ fn quic_deadline_is_exposed_and_driven_without_socket_input() {
     let mut closed = false;
     while std::time::Instant::now() < deadline {
         closed |= client
-            .poll()
+            .poll(common::now())
             .expect("poll")
             .into_iter()
             .any(|event| matches!(event, TransportEvent::Closed { id, .. } if id == conn_id));
@@ -447,7 +453,8 @@ fn quic_deadline_is_exposed_and_driven_without_socket_input() {
             break;
         }
         let sleep = client
-            .next_timeout()
+            .next_deadline()
+            .map(|deadline| std::time::Duration::from_millis(deadline.millis_until(common::now())))
             .unwrap_or(std::time::Duration::from_millis(1))
             .min(std::time::Duration::from_millis(5));
         if !sleep.is_zero() {
@@ -495,7 +502,7 @@ fn open_stream_emits_stream_opened() {
     assert!(
         found
             || client
-                .poll()
+                .poll(common::now())
                 .unwrap()
                 .iter()
                 .any(|e| matches!(e, TransportEvent::StreamOpened { .. })),
@@ -587,7 +594,7 @@ fn reset_stream_emits_stream_closed() {
     client.reset_stream(client_conn, stream_id).expect("reset");
 
     let mut saw_closed = false;
-    let events = client.poll().unwrap();
+    let events = client.poll(common::now()).unwrap();
     if events.iter().any(|e| {
         matches!(e, TransportEvent::StreamClosed { id, stream_id: sid } if *id == client_conn && *sid == stream_id)
     }) {
@@ -634,11 +641,80 @@ fn send_on_unknown_connection_returns_not_found() {
     assert!(matches!(err, TransportError::ConnectionNotFound { .. }));
 }
 
+/// Events queued between polls must present as work: a host that calls
+/// `listen` and then consults the transport before its first `poll` has to be
+/// told to come back, or the `Listening` event sits undelivered until some
+/// unrelated packet happens to wake the driver.
+#[test]
+fn events_buffered_outside_poll_report_as_due_work() {
+    let mut transport =
+        QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
+    transport.listen_on_bound_addr().expect("listen");
+
+    // No time sample has been taken (no `poll` yet) and no datagram is
+    // queued, so the buffered event is the only thing that can answer here.
+    let deadline = transport
+        .next_deadline()
+        .expect("a queued event must arm a deadline before the first poll");
+    assert!(
+        deadline.is_expired_at(Now::from_millis(0)),
+        "a buffered event is due on any timeline, got {deadline:?}"
+    );
+    assert_eq!(
+        transport.wait_for_input(std::time::Duration::ZERO),
+        WaitOutcome::Ready,
+        "wait_for_input must not park while an event is buffered"
+    );
+
+    // And the event really is there to collect.
+    let events = transport.poll(common::now()).expect("poll");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Listening { .. })),
+        "the promised work must be the buffered Listening event: {events:?}"
+    );
+
+    // Once drained, the idle transport goes back to reporting no work.
+    assert_eq!(
+        transport.wait_for_input(std::time::Duration::ZERO),
+        WaitOutcome::TimedOut,
+        "a drained, idle transport must be free to park"
+    );
+}
+
+/// The dual-stack endpoint does not delegate to the per-family
+/// `wait_for_input`, so it needs the same guarantee wired up separately.
+#[test]
+fn dual_stack_endpoint_reports_buffered_events_as_due_work() {
+    let mut endpoint =
+        QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("dual stack bind");
+    let listen_addr = endpoint
+        .local_addresses()
+        .into_iter()
+        .next()
+        .expect("bound address");
+    endpoint.listen(&listen_addr).expect("listen");
+
+    let deadline = endpoint
+        .next_deadline()
+        .expect("a queued event must arm a deadline before the first poll");
+    assert!(
+        deadline.is_expired_at(Now::from_millis(0)),
+        "a buffered event is due on any timeline, got {deadline:?}"
+    );
+    assert_eq!(
+        endpoint.wait_for_input(std::time::Duration::ZERO),
+        WaitOutcome::Ready,
+        "wait_for_input must not park while either family has an event buffered"
+    );
+}
+
 #[test]
 fn poll_returns_empty_when_idle() {
     let mut transport =
         QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
 
-    let events = transport.poll().expect("poll");
+    let events = transport.poll(common::now()).expect("poll");
     assert!(events.is_empty(), "idle poll must return empty vec");
 }

@@ -1,4 +1,4 @@
-//! Endpoint coordination for discovery sources and NAT traversal.
+//! Std endpoint coordination for discovery sources and NAT traversal.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
@@ -14,12 +14,13 @@ use minip2p_nat::{ConnectId, NatEvent};
 use minip2p_pubsub::PubsubEvent;
 use minip2p_swarm::SwarmEvent;
 
-use crate::EndpointSwarm;
 #[cfg(feature = "mdns")]
-use crate::mdns::MdnsDriver;
+use super::mdns::MdnsDriver;
+use super::nat::NatDriver;
 #[cfg(feature = "discovery")]
-use crate::pubsub::PubsubDriver;
-use crate::{Error, nat::NatDriver};
+use super::pubsub::PubsubDriver;
+use crate::EndpointSwarm;
+use crate::Error;
 
 /// Errors from discovery-focused endpoint waits.
 #[derive(Debug, thiserror::Error)]
@@ -154,7 +155,7 @@ impl DiscoveryDriver {
 
             #[cfg(feature = "mdns")]
             if let Some(mdns) = mdns.as_deref_mut() {
-                while let Some(event) = mdns.events.pop_front() {
+                while let Some(event) = mdns.poll_event() {
                     progressed = true;
                     self.handle_mdns_event(event, now);
                 }

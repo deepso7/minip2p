@@ -341,7 +341,7 @@ impl SwarmCore {
     /// Drivers should cap their wait/sleep budget with this value before
     /// blocking on external I/O, so a `Tick` is delivered promptly when the
     /// timer fires instead of only after the next transport event. The std
-    /// [`crate::Swarm`] driver already does this in its `poll_next` loop.
+    /// `Swarm` driver already does this in its std-only `poll_next` loop.
     pub fn next_timeout(&self, now_ms: u64) -> Option<u64> {
         self.ping_deadlines
             .values()

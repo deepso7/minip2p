@@ -1226,6 +1226,27 @@ fn autonat_server_is_a_trusted_reporter() {
 }
 
 #[test]
+fn tcp_observation_does_not_replace_a_trusted_quic_punch_candidate() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let relay = h.relay.clone();
+    identify_observed(&mut h.agent, &relay, &maddr(OUR_OBSERVED_ADDR), at(0));
+    identify_observed(
+        &mut h.agent,
+        &relay,
+        &maddr("/ip4/198.51.100.50/tcp/4001"),
+        at(1),
+    );
+
+    let (_id, stream) = drive_to_bridged(&mut h, 10);
+    let actions = drain_actions(&mut h.agent);
+    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    assert!(
+        obs.contains(&maddr(OUR_OBSERVED_ADDR)),
+        "a later TCP Identify observation must not evict the relay's QUIC mapping"
+    );
+}
+
+#[test]
 fn undecodable_observed_addr_bytes_are_ignored() {
     let mut h = Harness::with_relay(NatConfig::default());
     let relay = h.relay.clone();

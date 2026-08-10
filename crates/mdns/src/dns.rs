@@ -506,6 +506,7 @@ fn write_u32(out: &mut Vec<u8>, value: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::format;
 
     #[test]
     fn golden_query_is_33_bytes_with_zero_id() {

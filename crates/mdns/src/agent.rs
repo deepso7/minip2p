@@ -522,8 +522,14 @@ fn wire_ttl_seconds(ttl_ms: u64, legacy: bool) -> u32 {
     if legacy { seconds.min(10) } else { seconds }
 }
 
+/// Whether an address is worth announcing to the link.
+///
+/// Anything a transport can dial, plus a circuit through a relay. A device
+/// with no operating system has no QUIC, so a TCP listener is the only thing
+/// it has to say -- and mDNS that could not say it would find peers on the
+/// link and tell them nothing about how to reach it.
 fn is_supported_transport(addr: &Multiaddr) -> bool {
-    if addr.is_quic_transport() {
+    if addr.transport_kind().is_some() {
         return !addr.is_wildcard_host();
     }
     addr.is_relay_circuit_transport()
@@ -745,6 +751,39 @@ mod tests {
             core::str::from_utf8(&strings[0])
                 .unwrap()
                 .contains("/ip4/192.168.1.1/")
+        );
+    }
+
+    #[test]
+    fn a_tcp_listener_is_announced_and_expanded_like_any_other() {
+        let mut agent = MdnsAgent::new(peer(1), MdnsConfig::default(), [7; 32]).unwrap();
+        agent.set_interfaces(&[iface(1)], 0);
+        // The only thing a device with no operating system has to say. mDNS
+        // that could not say it would find peers on the link and leave them
+        // with no way to reach it -- which is the whole of what mDNS is for.
+        agent.set_local_addrs(&["/ip4/0.0.0.0/tcp/4001".parse().unwrap()], 0);
+        agent.handle_tick(0);
+        while agent.poll_action().is_some() {}
+
+        let query = encode_query();
+        let from = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 2), MDNS_PORT).into();
+        agent.handle_packet(InterfaceId::new(1), from, &query, 1);
+        let wait = agent.next_timeout(1).unwrap();
+        agent.handle_tick(1 + wait);
+        let Some(MdnsAction::Send { payload, .. }) = agent.poll_action() else {
+            panic!("response not emitted");
+        };
+        let decoded = DnsMessage::decode(&payload).unwrap();
+        let DnsRecordData::Txt(strings) = &decoded.additionals[0].data else {
+            panic!("expected TXT");
+        };
+        let advertised = core::str::from_utf8(&strings[0]).unwrap();
+        assert!(
+            advertised.contains("/ip4/192.168.1.1/tcp/4001/"),
+            // The wildcard is replaced by the interface's own address, the
+            // same substitution a QUIC listener gets: everything after the
+            // host is carried through untouched.
+            "expected the interface address on a /tcp listener, got {advertised}"
         );
     }
 

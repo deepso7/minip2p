@@ -2,7 +2,7 @@
 
 Synchronous QUIC transport adapter for minip2p, powered by [quiche](https://github.com/cloudflare/quiche).
 
-No async runtime required. The host drives the transport by calling `poll()`.
+No async runtime required. The host drives the transport by calling `poll(now)` with its own time sample.
 
 ## Features
 
@@ -20,10 +20,13 @@ No async runtime required. The host drives the transport by calling `poll()`.
 - `QuicNodeConfig` is identity-first: constructing a transport requires an Ed25519 host keypair.
 - Dial supports `/ip4`, `/ip6`, `/dns`, `/dns4`, `/dns6` QUIC transport addresses.
 - `QuicEndpoint::dual_stack` binds separate IPv4 and IPv6 wildcard sockets for the common "listen on both" case.
-- QUIC deadlines are exposed through `Transport::next_timeout()` and processed
+- QUIC deadlines are exposed through `Transport::next_deadline()` and processed
   by `poll()`; no async runtime or hidden timer thread is used. Idle drivers
-  block on `Transport::wait_for_input()` (a readiness peek on the UDP socket)
-  instead of polling on a fixed cadence.
+  block on `BlockingTransport::wait_for_input()` (a readiness peek on the UDP socket)
+  instead of polling on a fixed cadence. Both report immediately-due work when
+  events are already buffered, so calls made between polls -- `listen`,
+  `open_stream`, and the stream operations -- never leave a host asleep on an
+  undelivered event.
 - Stateless Retry authenticates source addresses before inbound connection
   allocation. Configurable limits bound connections, streams, queued stream
   bytes, queued UDP datagrams, and idle time.
@@ -57,6 +60,28 @@ dialer.send_stream(conn_id, stream_id, b"hello".to_vec())?;
 
 This crate is a concrete transport adapter and depends on `std`.
 For Sans-I/O contracts and shared types, use `minip2p-transport`.
+
+## Clocks
+
+Unlike the portable transports, this adapter does not run purely on the host's
+time sample. quiche keeps its own clock: it reads `Instant::now()` internally
+to drive loss detection and to answer `conn.timeout()`. Converting it to
+caller-supplied time would mean forking or wrapping quiche's timer handling,
+which is out of scope, so the dual clock is deliberate and this adapter is
+`std`-only.
+
+What the adapter *does* guarantee is that nothing quiche's clock touches leaks
+into what the host sees:
+
+- `poll(now)` retains the sample purely to anchor `next_deadline()` on the
+  host's timeline, so a host driving several transports can still compare
+  their deadlines.
+- quiche measures its timeout from an `Instant::now()` at or after that
+  sample, so anchoring rounds the deadline slightly early — an extra harmless
+  wakeup, never a missed timer.
+- Sub-millisecond timeouts (common on loopback) are rounded *up* to a whole
+  millisecond rather than truncated to zero. Truncation would report "already
+  due" and spin a driver's budget loop until wall time caught up.
 
 `quiche 0.29` exposes its TLS builder using `boring` 4.x types, so this crate
 intentionally uses the newest compatible `boring` 4.x release rather than the

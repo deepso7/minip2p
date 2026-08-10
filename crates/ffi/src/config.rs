@@ -58,6 +58,16 @@ pub enum PubsubRouter {
     Floodsub,
 }
 
+/// One enabled transport and the addresses it should listen on.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct TransportOptions {
+    /// Exact listen multiaddresses, or transport defaults when absent.
+    ///
+    /// An explicitly empty list is rejected: omit this field for defaults or
+    /// disable the transport by omitting it from [`EndpointConfig`].
+    pub listen_addrs: Option<Vec<String>>,
+}
+
 /// Configuration used to construct an FFI endpoint.
 #[derive(Clone, uniffi::Record)]
 pub struct EndpointConfig {
@@ -67,8 +77,10 @@ pub struct EndpointConfig {
     pub relays: Vec<String>,
     /// AutoNAT server peer addresses.
     pub autonat_servers: Vec<String>,
-    /// QUIC listen multiaddress, or dual-stack wildcard binding when absent.
-    pub listen_addr: Option<String>,
+    /// QUIC configuration, or no QUIC transport when absent.
+    pub quic: Option<TransportOptions>,
+    /// TCP configuration, or no TCP transport when absent.
+    pub tcp: Option<TransportOptions>,
     /// Whether connection attempts must remain relayed.
     pub force_relay: bool,
     /// Whether unsigned pubsub messages are accepted.
@@ -118,7 +130,8 @@ impl fmt::Debug for EndpointConfig {
             .field("agent_version", &self.agent_version)
             .field("relays", &self.relays)
             .field("autonat_servers", &self.autonat_servers)
-            .field("listen_addr", &self.listen_addr)
+            .field("quic", &self.quic)
+            .field("tcp", &self.tcp)
             .field("force_relay", &self.force_relay)
             .field("allow_unsigned", &self.allow_unsigned)
             .field("pubsub_router", &self.pubsub_router)
