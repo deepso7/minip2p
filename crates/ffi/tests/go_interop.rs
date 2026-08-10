@@ -217,10 +217,21 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
         PAYLOAD_FROM_MINIP2P.to_vec(),
     )?;
     endpoint.close_stream_write(go_peer.clone(), opened.stream_id)?;
-    log.wait_for(|event| {
-        matches!(event, P2pEvent::StreamData { stream_id, data, .. }
-            if *stream_id == opened.stream_id && data == PAYLOAD_FROM_MINIP2P)
-    });
+    let mut echoed_to_minip2p = Vec::with_capacity(PAYLOAD_FROM_MINIP2P.len());
+    loop {
+        let event = log.take_for(|event| {
+            matches!(event,
+                P2pEvent::StreamData { stream_id, .. }
+                    | P2pEvent::StreamRemoteWriteClosed { stream_id, .. }
+                    if *stream_id == opened.stream_id)
+        });
+        match event {
+            P2pEvent::StreamData { data, .. } => echoed_to_minip2p.extend_from_slice(&data),
+            P2pEvent::StreamRemoteWriteClosed { .. } => break,
+            _ => unreachable!("predicate pins the event variants"),
+        }
+    }
+    assert_eq!(echoed_to_minip2p, PAYLOAD_FROM_MINIP2P);
 
     let endpoint_addr = endpoint.listen_addrs()[0].clone();
     go.command(json!({

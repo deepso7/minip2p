@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	libp2p "github.com/libp2p/go-libp2p"
@@ -99,7 +100,9 @@ func echo(ctx context.Context, node host.Host, address string, payload string) (
 	// Force a fresh connection so this half of the gate exercises go-libp2p
 	// as the TCP and Noise initiator, not merely a second stream on the
 	// connection minip2p opened earlier.
-	_ = node.Network().ClosePeer(info.ID)
+	if err := node.Network().ClosePeer(info.ID); err != nil {
+		return "", fmt.Errorf("closing existing connection: %w", err)
+	}
 	if err := node.Connect(ctx, *info); err != nil {
 		return "", err
 	}
@@ -111,8 +114,12 @@ func echo(ctx context.Context, node host.Host, address string, payload string) (
 	if err := stream.SetDeadline(time.Now().Add(echoTimeout)); err != nil {
 		return "", err
 	}
-	if _, err := stream.Write([]byte(payload)); err != nil {
+	written, err := io.Copy(stream, strings.NewReader(payload))
+	if err != nil {
 		return "", err
+	}
+	if written != int64(len(payload)) {
+		return "", fmt.Errorf("short stream write: wrote %d of %d bytes", written, len(payload))
 	}
 	if err := stream.CloseWrite(); err != nil {
 		return "", err

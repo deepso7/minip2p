@@ -380,9 +380,16 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
             let len = payload.len().min(buffer.len());
             buffer[..len].copy_from_slice(&payload[..len]);
             let from = endpoint_to_socket_addr(metadata.endpoint);
+            // Both sockets wildcard-bind the mDNS port. smoltcp may therefore
+            // deliver a packet to either socket, so the receiving socket is
+            // not a reliable family marker. The source address always is.
+            let interface = match from.ip() {
+                IpAddr::V4(_) => IPV4_INTERFACE,
+                IpAddr::V6(_) => IPV6_INTERFACE,
+            };
             self.next_receive = (index + 1) % count;
             return Ok(Some(MdnsDatagram {
-                interface: family.id,
+                interface,
                 from,
                 len,
             }));

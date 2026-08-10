@@ -7,7 +7,7 @@ pub struct TcpConfig {
     /// Namespace this transport allocates its connection ids in.
     ///
     /// Namespaces exist so several transports can hand ids to one swarm without
-    /// collliding. Use [`ConnectionNamespace::TCP_IPV4`] and
+    /// colliding. Use [`ConnectionNamespace::TCP_IPV4`] and
     /// [`ConnectionNamespace::TCP_IPV6`] when you run one instance per address
     /// family; a single dual-stack instance can use either, since its own
     /// allocator already keeps its ids distinct.

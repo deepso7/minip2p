@@ -526,15 +526,15 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
             relay: relay.addr().peer_id().clone()
         })
     );
-    // The high bit is the circuit namespace: these are circuit connections,
-    // not the TCP ones underneath them.
-    assert_ne!(
-        initiator_circuit.expect("initiator circuit id").as_u64() & (1 << 63),
-        0
+    assert!(
+        initiator_circuit
+            .expect("initiator circuit id")
+            .is_circuit()
     );
-    assert_ne!(
-        responder_circuit.expect("responder circuit id").as_u64() & (1 << 63),
-        0
+    assert!(
+        responder_circuit
+            .expect("responder circuit id")
+            .is_circuit()
     );
 
     // The responder advertises the reservation as a circuit through a TCP
@@ -674,6 +674,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
         {
             responder_closed = true;
         }
+        relay.assert_healthy();
     }
 }
 

@@ -292,8 +292,14 @@ impl<P: TcpProvider, E: EntropySource> TcpTransport<P, E> {
         Ok(())
     }
 
-    /// Pumps then flushes, the pairing every session interaction needs.
+    /// Flushes old bytes, pumps new outputs, then flushes those too.
+    ///
+    /// Retrying the existing queue first matters for the buffer ceiling: a
+    /// socket may have recovered since the last poll, and newly produced bytes
+    /// must not fail a healthy connection merely because its now-writable
+    /// backlog had not yet been retried.
     fn pump_and_flush(&mut self, connection: &mut Connection) -> Result<(), Teardown> {
+        self.flush(connection)?;
         self.pump(connection)?;
         self.flush(connection)
     }

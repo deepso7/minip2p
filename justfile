@@ -49,6 +49,7 @@ test:
     cargo test -p minip2p-rs --features mdns
     cargo test -p minip2p-rs --features discovery,mdns
     cargo test -p minip2p-rs --features tcp
+    cargo test -p minip2p-rs --no-default-features --features std,tcp
     cargo test -p minip2p-rs --features discovery,mdns,tcp
     cargo test -p minip2p-rs --no-default-features --features smoltcp
     cargo test -p minip2p-rs --no-default-features --features smoltcp,pubsub

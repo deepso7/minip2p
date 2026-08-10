@@ -185,7 +185,7 @@ fn connected_precedes_the_substream_a_peer_opens_immediately() {
     listener.listen(&addr(LISTEN_ADDR)).expect("listener binds");
 
     let target = PeerAddr::new(addr(LISTEN_ADDR), listener_peer).expect("dial target");
-    let id = dialer.dial(&target).expect("dial starts");
+    let _ = dialer.dial(&target).expect("dial starts");
 
     // Stop as soon as the listener is up, while the dialer has not yet read
     // the confirmation that would finish its own upgrade.
@@ -193,7 +193,9 @@ fn connected_precedes_the_substream_a_peer_opens_immediately() {
     for _ in 0..64 {
         let _ = dialer.poll(Now::from_millis(0)).expect("drive dialer");
         let _ = listener.poll(Now::from_millis(0)).expect("drive listener");
-        if !listener.connection_ids().is_empty() && listener.open_stream(id).is_ok() {
+        if let Some(listener_id) = listener.connection_ids().into_iter().next()
+            && listener.open_stream(listener_id).is_ok()
+        {
             settled = true;
             break;
         }
@@ -202,8 +204,13 @@ fn connected_precedes_the_substream_a_peer_opens_immediately() {
 
     // Its substream frames now sit behind that unread confirmation, so the
     // dialer decrypts both together and must still report Connected first.
+    let listener_id = listener
+        .connection_ids()
+        .into_iter()
+        .next()
+        .expect("listener connection id");
     listener
-        .send_stream(id, StreamId::new(2), b"eager".to_vec())
+        .send_stream(listener_id, StreamId::new(2), b"eager".to_vec())
         .expect("send on the fresh substream");
     let (dialer_events, _) = drive(&net, &mut dialer, &mut listener);
 
@@ -683,6 +690,41 @@ fn a_peer_that_stops_reading_fails_the_connection() {
 }
 
 #[test]
+fn a_recovered_socket_drains_old_bytes_before_applying_the_buffer_ceiling() {
+    let config = TcpConfig {
+        max_buffered_send: 4096,
+        ..TcpConfig::default()
+    };
+    let mut pair = upgraded_pair_with(config, TcpConfig::default());
+    let id = pair.connection;
+    let stream = pair.dialer.open_stream(id).expect("open substream");
+    drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+
+    pair.dialer.provider_mut().set_in_flight_capacity(Some(0));
+    pair.dialer
+        .send_stream(id, stream, vec![1u8; 3000])
+        .expect("queue the first payload");
+
+    // Recovery happens between polls. The second payload would cross the
+    // ceiling if the transport counted the stale queue before retrying it.
+    pair.dialer.provider_mut().set_in_flight_capacity(None);
+    pair.dialer
+        .send_stream(id, stream, vec![2u8; 3000])
+        .expect("a recovered socket drains its backlog first");
+
+    let (_, listener_events) = drive(&pair.net, &mut pair.dialer, &mut pair.listener);
+    let delivered: usize = listener_events
+        .iter()
+        .map(|event| match event {
+            TransportEvent::StreamData { data, .. } => data.len(),
+            _ => 0,
+        })
+        .sum();
+    assert_eq!(delivered, 6000);
+    assert_eq!(pair.dialer.connection_ids(), vec![id]);
+}
+
+#[test]
 fn listen_and_dial_reject_addresses_another_transport_owns() {
     let net = VirtualNetwork::new();
     let mut transport = node(&net, identity(1), 10);
@@ -870,13 +912,15 @@ fn unknown_connections_and_substreams_are_rejected() {
         Err(TransportError::ConnectionNotFound { id: unknown })
     );
 
-    // An unknown substream on a live connection is a stream error, not a
-    // connection error.
-    assert!(matches!(
+    // An unknown substream on a live connection retains the transport's
+    // explicit not-found classification.
+    assert_eq!(
         pair.dialer.send_stream(id, stream, vec![1]),
-        Err(TransportError::StreamSendFailed { id: failed, stream_id, .. })
-            if failed == id && stream_id == stream
-    ));
+        Err(TransportError::StreamNotFound {
+            id,
+            stream_id: stream,
+        })
+    );
 
     // An id congruent to a live substream modulo 2^32 must be rejected rather
     // than truncated onto it.

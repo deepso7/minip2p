@@ -4,7 +4,7 @@ Application-facing `Endpoint` API for minip2p.
 
 ```toml
 [dependencies]
-minip2p = { package = "minip2p-rs", version = "0.1" }
+minip2p = { package = "minip2p-rs", version = "0.3.1" }
 ```
 
 The package is named `minip2p-rs` on crates.io and its library target remains

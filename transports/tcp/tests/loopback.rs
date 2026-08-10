@@ -572,7 +572,7 @@ fn queued_events_are_never_slept_through() {
 mod provider {
     use super::*;
     use minip2p_tcp::{BlockingTcpProvider, SocketHandle, TcpError, TcpEvent, TcpProvider};
-    use std::io::{Read, Write};
+    use std::io::Read;
 
     /// Polls both providers until `found` matches, collecting everything seen.
     fn pump_until(
@@ -629,6 +629,78 @@ mod provider {
             })
             .expect("accepted");
         (server, accepted, client, outbound)
+    }
+
+    #[test]
+    fn a_connecting_socket_accepts_no_bytes_before_connected() {
+        let mut server = StdTcpProvider::new().expect("server");
+        let mut client = StdTcpProvider::new().expect("client");
+        let bound = server
+            .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
+            .expect("bind");
+        let outbound = client.connect(&bound).expect("connect starts");
+
+        assert_eq!(
+            client.send(outbound, b"too early").expect("short write"),
+            0,
+            "the provider must preserve the Connected gate even if the kernel connected quickly"
+        );
+
+        let (mut server_seen, mut client_seen) = (Vec::new(), Vec::new());
+        pump_until(
+            &mut server,
+            &mut client,
+            &mut server_seen,
+            &mut client_seen,
+            |server, client| {
+                server
+                    .iter()
+                    .any(|event| matches!(event, TcpEvent::Accepted { .. }))
+                    && client
+                        .iter()
+                        .any(|event| matches!(event, TcpEvent::Connected { .. }))
+            },
+        );
+        assert!(
+            !server_seen
+                .iter()
+                .any(|event| matches!(event, TcpEvent::Received { .. })),
+            "a pre-Connected send must not reach the peer"
+        );
+    }
+
+    #[test]
+    fn a_queued_close_prevents_waiting() {
+        let (mut server, server_socket, mut client, client_socket) = linked();
+        server.close_write(server_socket).expect("server FIN");
+
+        let (mut server_seen, mut client_seen) = (Vec::new(), Vec::new());
+        pump_until(
+            &mut server,
+            &mut client,
+            &mut server_seen,
+            &mut client_seen,
+            |_, client| {
+                client
+                    .iter()
+                    .any(|event| matches!(event, TcpEvent::RemoteWriteClosed { .. }))
+            },
+        );
+        client_seen.clear();
+
+        // With the peer FIN already consumed, this retires the socket and
+        // queues Closed synchronously. A blocking driver must poll it rather
+        // than park waiting for readiness that will never come.
+        client.close_write(client_socket).expect("client FIN");
+        assert_eq!(
+            client.wait_for_input(PATIENCE),
+            WaitOutcome::Ready,
+            "a queued terminal event is immediate work"
+        );
+        assert!(matches!(
+            client.poll(Now::from_millis(0)).expect("poll").as_slice(),
+            [TcpEvent::Closed { socket, .. }] if *socket == client_socket
+        ));
     }
 
     #[test]
@@ -764,7 +836,10 @@ mod provider {
     }
 
     /// Fills a socket's buffers without reading, and reports how much went in.
+    #[cfg(target_os = "linux")]
     fn stuff(peer: &mut std::net::TcpStream) -> usize {
+        use std::io::Write as _;
+
         peer.set_nonblocking(true).expect("non-blocking");
         let chunk = vec![0u8; 64 * 1024];
         let mut total = 0;
@@ -779,6 +854,11 @@ mod provider {
         total
     }
 
+    // This test needs the loopback send buffer to exceed the provider's fixed
+    // 128 KiB read budget. Linux guarantees that in the CI configurations we
+    // exercise; default buffers on macOS and Windows can be smaller, which
+    // would test an OS tuning choice rather than provider fairness.
+    #[cfg(target_os = "linux")]
     #[test]
     fn one_busy_socket_cannot_monopolise_a_poll() {
         let mut server = StdTcpProvider::new().expect("server");

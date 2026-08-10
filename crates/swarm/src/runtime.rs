@@ -494,6 +494,10 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         for event in events {
             self.core
                 .handle_input(SwarmInput::Transport { event, now_ms });
+            // Preserve the core driver's event/action boundary within a
+            // transport batch. A later event must not observe core state that
+            // assumes an earlier event's transport actions have already run.
+            self.flush_actions(now_ms);
         }
 
         // 2. Advance timers.
@@ -973,6 +977,30 @@ mod tests {
             "expected the close to surface: {events:?}"
         );
         assert!(runtime.connected_peers().is_empty());
+    }
+
+    #[test]
+    fn actions_from_one_batched_event_run_before_the_next_event() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let id = ConnectionId::new(1);
+        let mut runtime = runtime(vec![
+            TransportEvent::Connected {
+                id,
+                endpoint: ConnectionEndpoint::with_peer_id(
+                    "/ip4/198.51.100.7/udp/4001/quic-v1"
+                        .parse()
+                        .expect("endpoint"),
+                    peer,
+                ),
+            },
+            TransportEvent::Closed { id },
+        ]);
+
+        runtime.poll(Now::from_millis(5_000)).expect("poll");
+        assert!(
+            runtime.transport().opened > 0,
+            "the Connected event's protocol opens must run before Closed mutates core state"
+        );
     }
 
     #[test]

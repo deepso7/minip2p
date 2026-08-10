@@ -251,7 +251,7 @@ impl Shared {
             return;
         };
         let mut validated = select_direct_addrs(&[], Some(addr), None);
-        if let Some(addr) = validated.pop() {
+        if let Some(addr) = validated.pop().filter(Multiaddr::is_quic_transport) {
             self.observed_addrs.insert(reporter.clone(), addr);
         }
     }

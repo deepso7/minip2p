@@ -1562,21 +1562,19 @@ mod tests {
             );
         }
 
-        assert!(matches!(
+        for result in [
             a.send_stream(circuit_id, stream, vec![1]),
-            Err(TransportError::StreamSendFailed { id, stream_id, .. })
-                if id == circuit_id && stream_id == stream
-        ));
-        assert!(matches!(
             a.close_stream_write(circuit_id, stream),
-            Err(TransportError::StreamCloseWriteFailed { id, stream_id, .. })
-                if id == circuit_id && stream_id == stream
-        ));
-        assert!(matches!(
             a.reset_stream(circuit_id, stream),
-            Err(TransportError::StreamResetFailed { id, stream_id, .. })
-                if id == circuit_id && stream_id == stream
-        ));
+        ] {
+            assert_eq!(
+                result,
+                Err(TransportError::StreamNotFound {
+                    id: circuit_id,
+                    stream_id: stream,
+                })
+            );
+        }
     }
 
     #[test]

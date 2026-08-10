@@ -60,6 +60,15 @@ pub(crate) fn targets(addr: &PeerAddr) -> Result<Vec<(Family, PeerAddr)>, Transp
         Protocol::Dns6(name) => (name, Some(Family::V6)),
         _ => return Err(invalid("dial target has no host component")),
     };
+    let literal = name
+        .strip_prefix('[')
+        .and_then(|name| name.strip_suffix(']'))
+        .unwrap_or(name.as_str());
+    if literal.parse::<IpAddr>().is_ok() {
+        return Err(invalid(
+            "a /dns component must contain a DNS name, not an IP address",
+        ));
+    }
 
     // The port belongs to whichever transport the address names, so it is read
     // from the address rather than assumed: `/tcp/4001` and `/udp/4001` are
@@ -193,6 +202,11 @@ mod tests {
         assert!(
             matches!(targets(&addr), Err(TransportError::InvalidAddress { .. })),
             "an IP literal is not a name to look up"
+        );
+        let addr = peer_addr("/dns/127.0.0.1/tcp/4001");
+        assert!(
+            matches!(targets(&addr), Err(TransportError::InvalidAddress { .. })),
+            "an IPv4 literal is not a name to look up"
         );
     }
 

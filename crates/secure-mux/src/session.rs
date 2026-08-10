@@ -242,20 +242,20 @@ impl SecureMuxSession {
 
     /// Writes to a substream.
     pub fn send(&mut self, stream: StreamId, data: Vec<u8>) -> Result<(), SessionError> {
-        let stream = yamux_stream(stream)?;
-        self.with_yamux(move |yamux| yamux.send(stream, data))
+        let yamux_stream = yamux_stream(stream)?;
+        self.with_yamux_stream(stream, move |yamux| yamux.send(yamux_stream, data))
     }
 
     /// Half-closes the local write side of a substream.
     pub fn close_stream_write(&mut self, stream: StreamId) -> Result<(), SessionError> {
-        let stream = yamux_stream(stream)?;
-        self.with_yamux(move |yamux| yamux.close_write(stream))
+        let yamux_stream = yamux_stream(stream)?;
+        self.with_yamux_stream(stream, move |yamux| yamux.close_write(yamux_stream))
     }
 
     /// Abruptly closes a substream in both directions.
     pub fn reset_stream(&mut self, stream: StreamId) -> Result<(), SessionError> {
-        let stream = yamux_stream(stream)?;
-        self.with_yamux(move |yamux| yamux.reset(stream))
+        let yamux_stream = yamux_stream(stream)?;
+        self.with_yamux_stream(stream, move |yamux| yamux.reset(yamux_stream))
     }
 
     /// Ends the session cleanly, queueing a Yamux `GoAway` with `code`.
@@ -305,6 +305,19 @@ impl SecureMuxSession {
         self.drain_yamux(&mut noise, &mut yamux)?;
         self.phase = Some(Phase::Ready { noise, yamux, peer });
         result.map_err(SessionError::Yamux)
+    }
+
+    fn with_yamux_stream<R>(
+        &mut self,
+        stream: StreamId,
+        operation: impl FnOnce(&mut YamuxSession) -> Result<R, YamuxError>,
+    ) -> Result<R, SessionError> {
+        self.with_yamux(operation).map_err(|error| match error {
+            SessionError::Yamux(YamuxError::UnknownStream(_)) => {
+                SessionError::UnknownStream { stream }
+            }
+            other => other,
+        })
     }
 
     fn take_phase(&mut self) -> Result<Phase, SessionError> {
@@ -985,5 +998,35 @@ mod tests {
                 .all(|output| matches!(output, SessionOutput::Write(_))),
             "a failed upgrade may leave only queued writes behind: {outputs:?}"
         );
+    }
+
+    #[test]
+    fn unknown_yamux_streams_preserve_the_transport_error_contract() {
+        let initiator_key = Ed25519Keypair::generate();
+        let responder_key = Ed25519Keypair::generate();
+        let peer = responder_key.peer_id();
+        let (noise, _) = noise_pair(initiator_key, responder_key);
+        let mut session = SecureMuxSession {
+            role: SessionRole::Initiator,
+            yamux_config: YamuxConfig::default(),
+            phase: Some(Phase::Ready {
+                noise,
+                yamux: YamuxSession::new(YamuxRole::Client),
+                peer,
+            }),
+            outputs: VecDeque::new(),
+        };
+        let stream = StreamId::new(77);
+
+        for result in [
+            session.send(stream, b"data".to_vec()),
+            session.close_stream_write(stream),
+            session.reset_stream(stream),
+        ] {
+            assert!(
+                matches!(result, Err(SessionError::UnknownStream { stream: id }) if id == stream),
+                "unknown stream must remain distinguishable: {result:?}"
+            );
+        }
     }
 }

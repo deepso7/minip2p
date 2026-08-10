@@ -80,6 +80,7 @@ jobs:
       - run: cargo test -p minip2p-rs --features mdns
       - run: cargo test -p minip2p-rs --features discovery,mdns
       - run: cargo test -p minip2p-rs --features tcp
+      - run: cargo test -p minip2p-rs --no-default-features --features std,tcp
       - run: cargo test -p minip2p-rs --features discovery,mdns,tcp
       - run: cargo test -p minip2p-rs --no-default-features --features smoltcp
       - run: cargo test -p minip2p-rs --no-default-features --features smoltcp,pubsub

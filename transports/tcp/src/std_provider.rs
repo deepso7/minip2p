@@ -614,6 +614,13 @@ impl TcpProvider for StdTcpProvider {
                 .sockets
                 .get_mut(&socket)
                 .ok_or(TcpError::UnknownSocket { socket })?;
+            if matches!(entry.phase, Phase::Connecting) {
+                // A connect can complete in the kernel before its readiness
+                // event is polled. Keep the provider's public Connected gate:
+                // no bytes may leave until settle_connect changes the phase
+                // and queues that event.
+                return Ok(0);
+            }
             loop {
                 match entry.stream.write(data) {
                     Ok(written) => {
@@ -700,7 +707,10 @@ impl BlockingTcpProvider for StdTcpProvider {
             // the race against the waiter.
             return WaitOutcome::Interrupted;
         }
-        if self.deferred_work || self.sockets.values().any(|socket| socket.readable) {
+        if !self.ready.is_empty()
+            || self.deferred_work
+            || self.sockets.values().any(|socket| socket.readable)
+        {
             // Sockets still hold bytes this provider has not handed over.
             // Readiness will not mention them again, so parking would strand
             // them.

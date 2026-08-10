@@ -169,6 +169,9 @@ pub struct TransportSet {
     /// Events collected from members that a failing member kept this poll from
     /// returning. Drained by the next one.
     pending: VecDeque<TransportEvent>,
+    /// Additional member failures from a round whose first failure has
+    /// already been returned to the caller.
+    failures: VecDeque<TransportError>,
     /// Every member's interrupt handle, shared with the handles this set hands
     /// out so a member joining later is still reachable through one taken
     /// earlier. Also the lock that makes an interrupt atomic with respect to
@@ -388,27 +391,29 @@ impl Transport for TransportSet {
         if !self.pending.is_empty() {
             return Ok(self.pending.drain(..).collect());
         }
+        if let Some(error) = self.failures.pop_front() {
+            return Err(error);
+        }
 
         // Every member is polled, even after one fails: a member that has
         // events ready is not answerable for another one's fault, and the
         // failing member has already told the host what went wrong through the
         // error. What has been collected so far is kept for the next poll
         // rather than dropped, so no connection loses events to a sibling.
-        let mut failure = None;
         for index in 0..self.members.len() {
             match self.members[index].transport.poll(now) {
                 Ok(events) => self.pending.extend(events),
-                Err(error) => failure = failure.or(Some(error)),
+                Err(error) => self.failures.push_back(error),
             }
         }
-        match failure {
+        match self.failures.pop_front() {
             Some(error) => Err(error),
             None => Ok(self.pending.drain(..).collect()),
         }
     }
 
     fn next_deadline(&self) -> Option<Deadline> {
-        if !self.pending.is_empty() {
+        if !self.pending.is_empty() || !self.failures.is_empty() {
             // Events a failed poll held back are due regardless of the clock.
             return Some(Deadline::IMMEDIATE);
         }
@@ -1157,6 +1162,27 @@ mod tests {
             vec![TransportEvent::Closed { id: quic_id }],
             "events held back by a failed poll have to survive it"
         );
+    }
+
+    #[test]
+    fn every_member_failure_is_reported() {
+        let (mut set, tcp, quic) = duo();
+        tcp.log().fails_poll = true;
+        quic.log().fails_poll = true;
+
+        let first = set.poll(Now::from_millis(0)).expect_err("first failure");
+        let second = set
+            .poll(Now::from_millis(0))
+            .expect_err("second member's failure must be retained");
+
+        let reasons = [first, second].map(|error| match error {
+            TransportError::PollError { reason } => reason,
+            other => panic!("unexpected error: {other:?}"),
+        });
+        assert_eq!(reasons[0], "tcp");
+        assert_eq!(reasons[1], "quic");
+        assert_eq!(tcp.calls(), vec!["poll"]);
+        assert_eq!(quic.calls(), vec!["poll"]);
     }
 
     #[test]
