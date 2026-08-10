@@ -1,4 +1,4 @@
-//! Turning one dial target into the concrete addresses to try.
+//! Turns one std endpoint dial target into the concrete addresses to try.
 //!
 //! A host can be reachable over more than one transport and more than one
 //! address family, and a `/dns` name can answer with both. Deciding which of

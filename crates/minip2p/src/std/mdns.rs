@@ -1,4 +1,4 @@
-//! Clock for the portable mDNS driver.
+//! Std clock adapter for the portable mDNS driver.
 //!
 //! Everything mDNS does is in `minip2p_mdns::MdnsDriver`, which owns no clock
 //! because a `no_std` host has none to give it. This supplies one, and nothing

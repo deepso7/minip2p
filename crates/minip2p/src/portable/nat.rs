@@ -1,4 +1,4 @@
-//! Caller-driven wiring between `NatAgent` and a portable TCP endpoint.
+//! Caller-driven NAT wiring for the portable TCP endpoint.
 
 use alloc::collections::VecDeque;
 #[cfg(feature = "portable-relay")]
@@ -22,7 +22,7 @@ use minip2p_transport::{ConnectionId, StreamId};
 #[cfg(feature = "portable-relay")]
 use minip2p_transport::{Transport, TransportError};
 
-use crate::{PortableEndpoint, SmoltcpComposedTransport, smoltcp};
+use super::{PortableEndpoint, SmoltcpComposedTransport, smoltcp};
 
 type Endpoint<D, E> = PortableEndpoint<SmoltcpComposedTransport<D, E>, SharedEntropy<E>>;
 

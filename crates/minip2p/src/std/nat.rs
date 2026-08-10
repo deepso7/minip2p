@@ -1,4 +1,4 @@
-//! Std wiring that pumps a sans-I/O [`NatAgent`] against the endpoint's
+//! Std endpoint wiring that pumps a sans-I/O [`NatAgent`] against the endpoint's
 //! swarm: clock sampling, action execution, stream-event interception, and
 //! circuit-address advertising.
 //!

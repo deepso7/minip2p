@@ -1,4 +1,4 @@
-//! Std wiring that pumps a sans-I/O [`PubsubAgent`] against the
+//! Std endpoint wiring that pumps a sans-I/O [`PubsubAgent`] against the
 //! endpoint's swarm: clock sampling, action execution, and stream-event
 //! interception. Mirrors the endpoint's NAT driver.
 //!

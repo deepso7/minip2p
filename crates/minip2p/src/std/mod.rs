@@ -29,19 +29,14 @@
 //! state. Cargo features expose these APIs; the corresponding builder methods
 //! activate their drivers.
 
-#[path = "dial.rs"]
 mod dial;
 #[cfg(any(feature = "discovery", feature = "mdns"))]
-#[path = "discovery.rs"]
 mod discovery;
 #[cfg(feature = "mdns")]
-#[path = "mdns.rs"]
 mod mdns;
 #[cfg(feature = "nat")]
-#[path = "nat.rs"]
 mod nat;
 #[cfg(feature = "pubsub")]
-#[path = "pubsub.rs"]
 mod pubsub;
 
 #[cfg(any(feature = "discovery", feature = "mdns"))]
