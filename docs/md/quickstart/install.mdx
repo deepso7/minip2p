@@ -51,8 +51,27 @@ inside a particular endpoint.
     ```
 
     This adds the TCP transport and its `tcp`, `tcp_multiaddr`, `bind_tcp`,
-    and `tcp_config` builder methods. Without it, QUIC-only applications do
-    not link the TCP security, muxing, or socket stack.
+    and `tcp_config` builder methods. Skip it if you only need QUIC — you
+    will not link the TCP stack.
+
+  </Tab>
+  <Tab title="Embedded / no_std">
+
+    ```toml
+    minip2p-rs = {
+      version = "0.4.0",
+      default-features = false,
+      features = ["smoltcp"]
+    }
+    ```
+
+    This unlocks `Endpoint::portable(...)` and the smoltcp builder. You
+    supply the network device, clock samples, and entropy; minip2p runs TCP,
+    Noise XX, Yamux, Identify, Ping, and any protocols you register — no OS
+    or async runtime. Add `pubsub`, `portable-autonat`, or `portable-relay`
+    if you need them. Continue with
+    [Embedded devices](/guides/embedded-devices) for stack setup,
+    driving, and memory budgeting.
 
   </Tab>
   <Tab title="NAT">
@@ -125,6 +144,8 @@ connections or perform relay-assisted hole punching.
 | Cargo selection | Builder activation | Result |
 | --- | --- | --- |
 | Base | None required | QUIC, Identify, Ping, custom protocols |
+| `default-features = false, features = ["smoltcp"]` | `Endpoint::portable(...).smoltcp(...).listen(...).build()` | Portable TCP on your embedded stack |
+| `features = ["tcp"]` | `.tcp(...)`, `.tcp_multiaddr(...)`, or `.bind_tcp(...)` | QUIC and TCP together, or TCP alone |
 | `features = ["nat"]` | `.relay`, `.autonat_server`, or `.nat_config` | NAT driver runs with the supplied capabilities |
 | `features = ["pubsub"]` | `.pubsub` or `.pubsub_config` | Gossipsub or floodsub driver runs |
 | `features = ["discovery"]` | `.discovery` or `.discovery_config` | Discovery, default pubsub, and NAT coordination run |

@@ -11,8 +11,8 @@
 //! An endpoint brings up whatever it was asked to bind --
 //! `EndpointBuilder::quic`, `EndpointBuilder::quic_dual_stack`,
 //! `EndpointBuilder::tcp`, in any combination -- and routes by address from
-//! then on: a `/tcp` peer is reached over TCP and a `/udp/…/quic-v1` one over
-//! QUIC without the caller choosing, and without anything above the endpoint
+//! then on: a `/udp/…/quic-v1` peer is reached over QUIC and a `/tcp` one over
+//! TCP without the caller choosing, and without anything above the endpoint
 //! knowing there is more than one. `bind_quic`, `bind_quic_multiaddr`,
 //! `bind_quic_dual_stack`, and `bind_tcp` are the one-transport shorthands.
 //!
@@ -1513,8 +1513,8 @@ impl EndpointBuilder {
 
     /// Builds the endpoint, bringing up every transport it was given.
     ///
-    /// A `/tcp` address is then dialed over TCP and a `/udp/…/quic-v1` one
-    /// over QUIC, decided from the address rather than by the caller. An
+    /// A `/udp/…/quic-v1` address is then dialed over QUIC and a `/tcp` one
+    /// over TCP, decided from the address rather than by the caller. An
     /// endpoint with nothing to bind is refused: it could neither dial nor be
     /// reached, and failing here says so more clearly than every later call
     /// would.

@@ -22,7 +22,7 @@ const uniffiIsDebug =
 /**
  * Builds a circuit multiaddress for `peer_id` through `relay_addr`.
  *
- * `relay_addr` is any direct `/tcp` or `/quic-v1` peer address.
+ * `relay_addr` is any direct `/quic-v1` or `/tcp` peer address.
  */
 export function circuitAddress(relayAddr: string, peerId: string): string /*throws*/ {
     return ((__rb: Uint8Array) => {
@@ -3946,7 +3946,7 @@ export interface P2pEndpointLike {
  */
     connect(peerId: string) /*throws*/: bigint;
 /**
- * Starts a connection attempt toward a direct `/tcp` or `/quic-v1` peer
+ * Starts a connection attempt toward a direct `/quic-v1` or `/tcp` peer
  * address.
  */
     connectAddr(address: string) /*throws*/: bigint;
@@ -3955,7 +3955,7 @@ export interface P2pEndpointLike {
  */
     connectWithAddrs(peerId: string, addresses: Array<string>) /*throws*/: bigint;
 /**
- * Returns peers with an established TCP, QUIC, or circuit connection.
+ * Returns peers with an established QUIC, TCP, or circuit connection.
  */
     connectedPeers() /*throws*/: Array<string>;
 /**
@@ -3999,7 +3999,7 @@ export interface P2pEndpointLike {
  */
     knownPeers() /*throws*/: Array<KnownPeerInfo>;
 /**
- * Returns the bound TCP or QUIC peer addresses.
+ * Returns the bound QUIC or TCP peer addresses.
  */
     listenAddrs(): Array<string>;
 /**
@@ -4210,7 +4210,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Starts a connection attempt toward a direct `/tcp` or `/quic-v1` peer
+ * Starts a connection attempt toward a direct `/quic-v1` or `/tcp` peer
  * address.
  */
     connectAddr(address: string): bigint /*throws*/ {
@@ -4244,7 +4244,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns peers with an established TCP, QUIC, or circuit connection.
+ * Returns peers with an established QUIC, TCP, or circuit connection.
  */
     connectedPeers(): Array<string> /*throws*/ {
     return ((__rb: Uint8Array) => {
@@ -4413,7 +4413,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns the bound TCP or QUIC peer addresses.
+ * Returns the bound QUIC or TCP peer addresses.
  */
     listenAddrs(): Array<string> {
     return ((__rb: Uint8Array) => {

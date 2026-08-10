@@ -30,7 +30,7 @@ The platform package re-exports public types and errors from
 | `agentVersion` | `string` | Identify agent string. |
 | `transports` | `Minip2pTransports` | Enabled transports. Omitted means dual-stack QUIC only. |
 | `protocols` | `readonly string[]` | Custom protocols accepted on inbound streams. |
-| `relays` | `readonly string[]` | Direct TCP or QUIC relay peer addresses. |
+| `relays` | `readonly string[]` | Direct QUIC or TCP relay peer addresses. |
 | `autonatServers` | `readonly string[]` | Reachability probe-server addresses. |
 | `forceRelay` | `boolean` | Route outbound connectivity through relays only. |
 | `pubsubRouter` | `PubsubRouter` | `Gossipsub` by default; choose `Floodsub` explicitly. |
@@ -109,7 +109,7 @@ seconds; `timeoutMs: 0` disables it.
 | `connectAddr(addr, options?)` | First usable path from a complete peer address. |
 | `startConnect*` / `waitConnectResult` | Split-phase connection flow using a `connectId`. |
 | `cancelConnect(connectId)` | Cancel a split-phase attempt. |
-| `dial` / `dialIp4` / `dialIp6` | Start direct-only TCP or QUIC dialing and return connection IDs. |
+| `dial` / `dialIp4` / `dialIp6` | Start direct-only QUIC or TCP dialing and return connection IDs. |
 | `waitPeerReady(peerId, options?)` | Peer ID and advertised protocol list after Identify. |
 | `ping(peerId, options?)` | RTT in milliseconds. |
 | `openStream(peerId, protocol, options?)` | Negotiated `Stream`. |

@@ -92,7 +92,9 @@ That shape mirrors the std `Swarm<T>` driver while keeping sockets, clocks, slee
 
 ## Std driver usage
 
-See `transports/quic/tests/swarm_e2e.rs` for a full round-trip example (two swarms over QUIC, auto-identify, user-protocol echo, rapid-ping regression).
+See `transports/quic/tests/swarm_e2e.rs` and
+`transports/tcp/tests/upgrade.rs` for end-to-end examples over QUIC and TCP
+(auth, muxing, Identify, and app streams).
 
 ## no_std
 
@@ -110,4 +112,4 @@ full caller-driven runtime all remain available without `std`.
 
 ## Scope
 
-This crate orchestrates the protocol state machines. It does **not** implement the protocols themselves -- see `minip2p-identify`, `minip2p-ping`, `minip2p-multistream-select`, `minip2p-relay`, `minip2p-autonat`, `minip2p-dcutr`. It does not implement transports either -- see `minip2p-transport` for the contract and `transports/quic` for a concrete adapter.
+This crate orchestrates the protocol state machines. It does **not** implement the protocols themselves -- see `minip2p-identify`, `minip2p-ping`, `minip2p-multistream-select`, `minip2p-relay`, `minip2p-autonat`, `minip2p-dcutr`. It does not implement transports either -- see `minip2p-transport` for the contract, `minip2p-quic` for the std-only QUIC adapter, and `minip2p-tcp` for the portable TCP adapter.

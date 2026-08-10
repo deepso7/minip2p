@@ -37,7 +37,7 @@ DNS names are validated identically by the text and binary codecs: a name may no
 | `/<host>/udp/<port>/quic-v1` | `Some(TransportKind::Quic)` |
 | anything else | `None` |
 
-A trailing `/p2p/<peer-id>` makes an address a *peer* address rather than a transport address, so it classifies as `None`; strip it with `PeerAddr::transport()` first. `is_tcp_transport()` and `is_quic_transport()` answer the same question for one transport.
+A trailing `/p2p/<peer-id>` makes an address a *peer* address rather than a transport address, so it classifies as `None`; strip it with `PeerAddr::transport()` first. `is_quic_transport()` and `is_tcp_transport()` answer the same question for one transport.
 
 ## Usage
 

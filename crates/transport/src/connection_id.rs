@@ -7,7 +7,7 @@ const NAMESPACE_SHIFT: u32 = 56;
 
 /// Which transport a [`ConnectionId`] was allocated by.
 ///
-/// A host may run several transports at once — TCP and QUIC side by side, each
+/// A host may run several transports at once — QUIC and TCP side by side, each
 /// possibly split per address family, plus relay circuits layered on top — and
 /// every one of them hands connection ids to the same swarm. Namespaces keep
 /// those id spaces disjoint by construction, so a router can tell which

@@ -288,12 +288,12 @@ impl P2pEndpoint {
         self.peer_id.clone()
     }
 
-    /// Returns the bound TCP or QUIC peer addresses.
+    /// Returns the bound QUIC or TCP peer addresses.
     pub fn listen_addrs(&self) -> Vec<String> {
         self.listen_addrs.clone()
     }
 
-    /// Returns peers with an established TCP, QUIC, or circuit connection.
+    /// Returns peers with an established QUIC, TCP, or circuit connection.
     pub fn connected_peers(&self) -> Result<Vec<String>, FfiError> {
         let _pending = PendingCommand::new(&self.shared);
         let state = self.shared.lock_state();
@@ -562,7 +562,7 @@ impl P2pEndpoint {
         Ok(id.as_u64())
     }
 
-    /// Starts a connection attempt toward a direct `/tcp` or `/quic-v1` peer
+    /// Starts a connection attempt toward a direct `/quic-v1` or `/tcp` peer
     /// address.
     pub fn connect_addr(&self, address: String) -> Result<u64, FfiError> {
         let address = parse_direct_peer_addr(&address)?;

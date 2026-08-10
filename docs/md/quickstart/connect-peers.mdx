@@ -118,8 +118,8 @@ $ cargo run --bin dialer -- /ip4/127.0.0.1/udp/54321/quic-v1/p2p/12D3KooW…
 peer=12D3KooW… rtt=2ms
 ```
 
-`wait_peer_ready` waits for the authenticated QUIC connection and the first
-Identify exchange. Only after that point does the dialer issue Ping.
+`wait_peer_ready` waits until the connection is authenticated and the first
+Identify exchange finishes. Only after that does the dialer issue Ping.
 
 `bind_quic_dual_stack` binds wildcard sockets. The listener rewrites only the
 printed local-demo addresses to loopback; the endpoint itself continues

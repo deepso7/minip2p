@@ -1,6 +1,6 @@
 //! The two NAT-aware runners behind `minip2p-peer listen` / `dial`.
 //!
-//! Both build the same endpoint shape: TCP or QUIC transport, the echo protocol,
+//! Both build the same endpoint shape: QUIC or TCP transport, the echo protocol,
 //! and the NAT traversal agent (always on — with no relay configured it
 //! simply resolves direct paths). The listener echoes every inbound echo
 //! stream byte for byte; the dialer sends one 16-byte ping frame per second

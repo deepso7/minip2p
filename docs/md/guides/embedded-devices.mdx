@@ -1,0 +1,198 @@
+---
+title: Embedded devices
+description: Run a no_std endpoint on your board's smoltcp stack.
+---
+
+**Goal:** Run authenticated libp2p TCP on a `no_std + alloc` target, using the
+board's network device, monotonic timer, and hardware entropy.
+
+**Assumes:** Your board already has a working
+[smoltcp](https://docs.rs/smoltcp) `Device` and configured `Interface` with an
+IP address and route. minip2p does not set up the MAC, PHY, DHCP, SLAAC, or
+interrupt controller.
+
+Same TCP, Noise XX, Yamux, Identify, Ping, and application protocols as a
+hosted TCP endpoint. Only the I/O provider and driving loop change.
+
+## Add the dependency
+
+Disable default features. `smoltcp` pulls in portable TCP and the shared
+embedded stack:
+
+```toml
+[dependencies]
+minip2p-rs = {
+  version = "0.4.0",
+  default-features = false,
+  features = ["smoltcp"]
+}
+```
+
+Add only what you need:
+
+| Feature | Adds |
+| --- | --- |
+| `pubsub` | Gossipsub or floodsub, plus optional signed-beacon discovery |
+| `portable-mdns` | Portable mDNS and the shared discovery book; already included by `smoltcp` |
+| `portable-autonat` | AutoNAT probing over the portable endpoint |
+| `portable-relay` | Relay-only circuit connections; includes portable AutoNAT |
+
+No QUIC here — the quiche adapter needs `std`. Portable relay is therefore
+relay-only; DCUtR still needs QUIC.
+
+## What you supply
+
+You own three things:
+
+1. A `smoltcp::phy::Device` and configured `smoltcp::iface::Interface`.
+2. A monotonic millisecond counter used to build `Now` values.
+3. An `EntropySource` from a cryptographically secure hardware RNG or a
+   securely seeded DRBG.
+
+Do not use a predictable PRNG. Identity, Noise, and protocol nonces all depend
+on this entropy; if it fails, the operation must fail.
+
+Wrap the network objects in one shared stack:
+
+```rust
+use minip2p::SmoltcpStack;
+
+let device = board_network_device();
+let interface = configured_smoltcp_interface(&mut device);
+let stack = SmoltcpStack::new(device, interface);
+```
+
+`SmoltcpStack` is single-threaded on purpose. Clones let the TCP and mDNS
+adapters install sockets on the same interface, but the endpoint polls them
+serially. Do not hold `stack.borrow_mut()` while calling the endpoint.
+
+## Build the endpoint
+
+Load or create an Ed25519 identity, inject entropy, add a TCP listener, and
+register application protocols before `build`:
+
+```rust
+use minip2p::Endpoint;
+
+let identity = load_device_identity()?;
+let entropy = HardwareEntropy::new(board_rng());
+
+let mut endpoint = Endpoint::portable(&identity, entropy)
+    .agent_version("sensor-node/0.1.0")
+    .smoltcp(stack)
+    .listen("/ip4/0.0.0.0/tcp/4001")
+    .protocol("/example/sensor/1.0.0")
+    .build()?;
+```
+
+Prefer a real interface address over `0.0.0.0` when Identify and discovery
+should advertise something peers can dial right away. When DHCP or SLAAC
+changes the interface addresses, update the shared smoltcp interface; the
+adapters see that on later polls.
+
+Optional services go on the same builder:
+
+```rust
+let mut endpoint = Endpoint::portable(&identity, entropy)
+    .smoltcp(stack)
+    .listen("/ip4/0.0.0.0/tcp/4001")
+    .mdns()
+    .discovery()
+    .build()?;
+```
+
+This example needs `features = ["smoltcp", "pubsub"]`. `.discovery()` turns on
+default pubsub for signed beacons; mDNS does not use pubsub.
+
+## Drive time and network progress
+
+No executor, no background thread. Sample the monotonic clock once, pass that
+same `Now` into the endpoint, handle every event, then use `next_deadline` to
+decide how long the board may sleep:
+
+```rust
+use minip2p::{Now, SmoltcpEvent};
+
+loop {
+    let now = Now::from_millis(monotonic_millis());
+
+    for event in endpoint.poll(now)? {
+        match event {
+            SmoltcpEvent::Endpoint(event) => handle_endpoint_event(event),
+            SmoltcpEvent::Discovery(event) => handle_discovery_event(event),
+            other => handle_optional_service_event(other),
+        }
+    }
+
+    let wait_ms = endpoint
+        .next_deadline(now)
+        .map(|deadline| deadline.millis_until(now));
+
+    wait_for_network_irq_or_timer(wait_ms);
+}
+```
+
+Wake early when the network driver gets a frame or transmit capacity frees up.
+`PollDeadline::IMMEDIATE` means poll again without sleeping; `None` means
+minip2p has no timer armed, but a network interrupt must still wake the loop.
+
+## Budget memory explicitly
+
+Defaults aim at small systems; they are not a promise every board can afford
+the same concurrency. Set limits before `build`:
+
+```rust
+use minip2p::{SmoltcpConfig, TcpConfig};
+
+let provider = SmoltcpConfig {
+    rx_buffer: 4 * 1024,
+    tx_buffer: 4 * 1024,
+    backlog: 1,
+    max_sockets: 4,
+    ..SmoltcpConfig::default()
+};
+
+let transport = TcpConfig {
+    max_connections: 3,
+    max_buffered_send: 16 * 1024,
+    ..TcpConfig::default()
+};
+
+let endpoint = Endpoint::portable(&identity, entropy)
+    .smoltcp(stack)
+    .smoltcp_config(provider)
+    .tcp_config(transport)
+    .listen("/ip4/0.0.0.0/tcp/4001")
+    .build()?;
+```
+
+The provider reserves `rx_buffer + tx_buffer` bytes per socket, up to
+`max_sockets`. Backlog sockets count toward that ceiling. Smaller buffers save
+RAM but hurt throughput on high-latency links; smaller socket and connection
+caps reject excess work instead of allocating past the budget.
+
+Also budget stream payloads and pubsub queues. Treat backpressure as normal:
+wait for later polls instead of spinning or growing an unbounded host queue.
+
+## Bring-up checklist
+
+- Confirm the interface can exchange ordinary IP and TCP traffic before adding
+  libp2p.
+- Keep one persistent Ed25519 secret per device when peer identity must survive
+  reboot.
+- Verify the entropy source's startup and continuous health checks.
+- Drive the endpoint after receive interrupts and at every reported deadline.
+- Advertise a real interface address, not a wildcard bind address.
+- Measure flash, static RAM, heap high-water mark, and stack use on the actual
+  target with production feature flags.
+- Test stalled peers, socket exhaustion, link loss, address changes, and long
+  idle periods.
+
+`just check-nostd` builds the portable crates for `thumbv7em-none-eabi`. The
+smoltcp end-to-end tests cover TCP, Noise XX, Yamux, Identify, Ping, streams,
+discovery, and mDNS across two in-memory network devices. Those checks prove
+portability and protocol behavior; they do not replace testing the real board
+driver, timer, RNG, and memory budget.
+
+Next: [Register a protocol](/guides/register-a-protocol) or review the
+[feature matrix](/reference/feature-matrix#portable-api).

@@ -45,7 +45,7 @@ impl WaitHandle {
 
     /// Combines several handles into one that interrupts all of them.
     ///
-    /// A host driving more than one transport -- TCP and QUIC side by side --
+    /// A host driving more than one transport -- QUIC and TCP side by side --
     /// wakes every waiter with a single call. Handles that cannot interrupt
     /// are skipped; if none can, the result is a no-op handle.
     pub fn combined(handles: impl IntoIterator<Item = Self>) -> Self {
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn combined_wakes_every_transport() {
-        // The multi-transport case: one call must reach TCP and QUIC alike.
+        // The multi-transport case: one call must reach QUIC and TCP alike.
         let (first, first_count) = counter();
         let (second, second_count) = counter();
         let combined = WaitHandle::combined(vec![first, second, WaitHandle::noop()]);

@@ -44,7 +44,7 @@ pub fn peer_id_from_secret_key(secret_key: Vec<u8>) -> Result<String, FfiError> 
 
 /// Builds a circuit multiaddress for `peer_id` through `relay_addr`.
 ///
-/// `relay_addr` is any direct `/tcp` or `/quic-v1` peer address.
+/// `relay_addr` is any direct `/quic-v1` or `/tcp` peer address.
 #[uniffi::export]
 pub fn circuit_address(relay_addr: String, peer_id: String) -> Result<String, FfiError> {
     let relay = parse_direct_peer_addr(&relay_addr)?;
@@ -70,7 +70,7 @@ fn parse_direct_peer_addr(address: &str) -> Result<PeerAddr, FfiError> {
     })?;
     if relay.transport().transport_kind().is_none() || relay.transport().is_wildcard_host() {
         return Err(FfiError::InvalidAddress {
-            detail: "relay address must be a direct /tcp or /quic-v1 peer address".into(),
+            detail: "relay address must be a direct /quic-v1 or /tcp peer address".into(),
         });
     }
     Ok(relay)
@@ -185,7 +185,7 @@ mod tests {
                 matches!(
                     error,
                     FfiError::InvalidAddress { ref detail }
-                        if detail == "relay address must be a direct /tcp or /quic-v1 peer address"
+                        if detail == "relay address must be a direct /quic-v1 or /tcp peer address"
                 ),
                 "{invalid}: {error:?}"
             );

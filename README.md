@@ -12,8 +12,8 @@ minip2p is built around a few deliberate constraints:
 - Protocol and orchestration logic is Sans-I/O and deterministic.
 - Core crates support `no_std + alloc`.
 - There is no `async`/`.await`; callers choose the executor and drive progress.
-- TCP and QUIC sit side by side, and the address decides which carries a peer.
-  TCP is portable down to `no_std`; QUIC stays `std`-only.
+- QUIC and TCP sit side by side. The dial address picks the transport.
+  QUIC is `std`-only; TCP is portable down to `no_std`.
 - `unsafe` is forbidden across the workspace.
 
 The result is a set of reusable protocol state machines and a synchronous
@@ -57,6 +57,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 background task. Event waits accept an absolute `Instant`, a relative
 `Duration`, or `Deadline::NEVER`.
 
+QUIC is the default. Turn on the `tcp` feature to listen on TCP as well, or
+TCP only. The dial address picks the transport:
+
+```toml
+minip2p-rs = { version = "0.4.0", features = ["tcp"] }
+```
+
+```rust
+let endpoint = minip2p::Endpoint::builder()
+    .quic_dual_stack()
+    .tcp("0.0.0.0:4001")
+    .bind()?;
+# Ok::<(), minip2p::Error>(())
+```
+
+On bare-metal or other `no_std` hosts, turn off default features and build with
+`Endpoint::portable(...)`, supplying time samples, entropy, and a transport.
+With `smoltcp`, you get TCP plus optional mDNS, discovery, pubsub, AutoNAT,
+and relay on one embedded stack. See the
+[`minip2p-rs` crate guide](crates/minip2p/README.md#portable-endpoint).
+
 For a complete application, run the gossipsub chat example:
 
 ```bash
@@ -69,9 +90,9 @@ reservations and direct-path upgrades with DCUtR.
 
 ## Features
 
-The base `Endpoint` includes the transports you ask it to bind — TCP, QUIC, or
-both — plus multistream-select, identify, ping, and application protocols
-registered with `EndpointBuilder::protocol`.
+The base `Endpoint` includes whatever you bind — QUIC, TCP, or both — plus
+multistream-select, identify, ping, and any protocols registered with
+`EndpointBuilder::protocol`.
 
 | Feature | Adds |
 | --- | --- |

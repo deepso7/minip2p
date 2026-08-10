@@ -3,7 +3,7 @@
 A NAT-aware echo-ping demo for the full minip2p stack, built entirely on the
 `minip2p` `Endpoint` API (`features = ["nat", "tcp"]`). Two subcommands:
 
-- **`listen`** — bind TCP or QUIC, echo every inbound ping stream byte for byte.
+- **`listen`** — bind QUIC or TCP, echo every inbound ping stream byte for byte.
   With `--relay`, hold a Circuit Relay v2 reservation and print a
   paste-ready circuit address.
 - **`dial`** — connect to a target through the NAT traversal agent and ping
@@ -118,7 +118,7 @@ If the punch cannot land (e.g. UDP blocked between the peers), you'll see
 | `--autonat <peer-addr>` | AutoNAT server for reachability probes; optional — with none configured the agent reserves whenever a relay is available |
 | `--count <n>` | dial only: stop after `n` pings with a summary and exit code 0 |
 | `--key <path>` | persistent Ed25519 secret (hex); created on first use. Keep the listener's key stable so its circuit address survives restarts |
-| `--listen <multiaddr>` | explicit TCP or QUIC bind (`/ip4/0.0.0.0/tcp/4001` or `/ip4/0.0.0.0/udp/4001/quic-v1`); default is dual-stack QUIC on UDP/0 |
+| `--listen <multiaddr>` | explicit QUIC or TCP bind (`/ip4/0.0.0.0/udp/4001/quic-v1` or `/ip4/0.0.0.0/tcp/4001`); default is dual-stack QUIC on UDP/0 |
 
 ## Notes
 

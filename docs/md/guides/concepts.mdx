@@ -8,9 +8,10 @@ on it.
 
 ## Endpoint
 
-`Endpoint` owns an Ed25519 identity, a QUIC transport, and the synchronous
-swarm driver. It is the app-facing entrypoint for listening, dialing, Ping,
-Identify, and application streams.
+`Endpoint` owns an Ed25519 identity, the transports you bound, and the
+synchronous swarm driver. It is the app-facing entrypoint for listening,
+dialing, Ping, Identify, and application streams. QUIC is on by default; add
+the `tcp` feature to use QUIC and TCP together, or bind only TCP.
 
 An endpoint does not spawn a runtime. Your code makes progress by calling:
 
@@ -21,7 +22,7 @@ An endpoint does not spawn a runtime. Your code makes progress by calling:
 ```mermaid
 flowchart TB
   A["Your caller-driven loop"] <-->|"poll / next_event · events"| B["Endpoint"]
-  B <-->|"QUIC over UDP"| C["Network"]
+  B <-->|"QUIC over UDP · Noise + Yamux over TCP"| C["Network"]
 ```
 
 :::note
@@ -32,9 +33,9 @@ custom runtimes can use the deterministic lower layers directly.
 
 ## PeerId
 
-A `PeerId` identifies a node's authenticated public key. QUIC connections use
-mutual libp2p TLS authentication, so connection events carry the verified
-remote identity rather than a caller-supplied label.
+A `PeerId` identifies a node's authenticated public key. QUIC proves it with
+mutual libp2p TLS; TCP uses Noise XX, then Yamux. Either way, connection
+events carry the verified remote identity, not a label you passed in.
 
 `Endpoint::peer_id()` returns the local identity.
 
@@ -58,9 +59,9 @@ addresses and wildcards.
 
 ## Connection readiness
 
-`ConnectionEstablished` means QUIC is authenticated and established.
-`PeerReady` comes later, after the first Identify exchange has supplied the
-peer's supported protocols and advertised addresses.
+`ConnectionEstablished` means the transport finished connecting and authenticated
+the peer. `PeerReady` comes later, after the first Identify exchange has
+supplied the peer's supported protocols and advertised addresses.
 
 Wait for `PeerReady` before opening an application stream. This avoids racing
 protocol-support discovery.
@@ -71,11 +72,11 @@ These are separate paths with different policy:
 
 | Goal | Start with | Wait for |
 | --- | --- | --- |
-| Direct QUIC to a known address | `dial`, `dial_ip4`, or `dial_ip6` | `PeerReady` |
+| Direct QUIC or TCP to a known address | `dial`, `dial_ip4`, or `dial_ip6` | `PeerReady` |
 | NAT-aware attempt with optional relay | `connect`, `connect_addr`, or `connect_with_addrs` | `wait_path` or `NatEvent` |
 
-The base `dial*` methods only start direct QUIC dials. They do not reserve on
-a relay or perform DCUtR.
+The base `dial*` methods only start direct dials. The address picks QUIC or
+TCP. They do not reserve on a relay or perform DCUtR.
 
 With the `nat` feature and an activated NAT driver, `connect*` can race direct
 candidates against a relay leg. The first usable result is:

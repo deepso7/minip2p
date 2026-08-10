@@ -7,9 +7,9 @@ Definitions only. For recipes, follow the linked guides.
 
 | Term | Meaning |
 | --- | --- |
-| **Endpoint** | App-facing entrypoint that owns identity, QUIC, and the synchronous swarm driver. See [Concepts](/guides/concepts#endpoint). |
+| **Endpoint** | App-facing entrypoint that owns identity, transports, and the swarm driver. Std form uses sockets; portable form is caller-driven. See [Concepts](/guides/concepts#endpoint). |
 | **PeerId** | Authenticated public-key identity of a peer. |
-| **Multiaddr** | Transport address components without a peer identity (for example `/ip4/…/udp/…/quic-v1`). |
+| **Multiaddr** | Transport address without a peer identity (for example `/ip4/…/udp/…/quic-v1` or `/ip4/…/tcp/…`). |
 | **PeerAddr** | A `Multiaddr` plus a terminal `/p2p/<peer-id>`. Required for dialing a specific peer. |
 | **PeerReady** | Event after the first Identify exchange; safer milestone than `ConnectionEstablished` before opening app streams. |
 | **Path** | NAT result: `DirectDialed`, `DirectPunched`, or `Relayed`. See [Traverse NAT](/guides/traverse-nat). |

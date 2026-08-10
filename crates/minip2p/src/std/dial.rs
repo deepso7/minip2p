@@ -38,7 +38,7 @@ impl Family {
 /// from the same family would be the same peer twice.
 ///
 /// Everything after the host is carried through untouched, so the shape that
-/// went in -- `/tcp`, `/udp/quic-v1`, whatever follows -- is the shape that
+/// went in -- `/udp/quic-v1`, `/tcp`, whatever follows -- is the shape that
 /// comes out, and routing it stays the set's decision.
 pub(crate) fn targets(addr: &PeerAddr) -> Result<Vec<(Family, PeerAddr)>, TransportError> {
     let protocols = addr.transport().protocols();

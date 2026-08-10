@@ -113,7 +113,7 @@ export interface Minip2pConfig {
   readonly secretKey: Bytes;
   /** Agent version advertised through Identify. */
   readonly agentVersion?: string;
-  /** Direct TCP or QUIC relay peer multiaddresses. */
+  /** Direct QUIC or TCP relay peer multiaddresses. */
   readonly relays?: readonly string[];
   /** AutoNAT server peer multiaddresses. */
   readonly autonatServers?: readonly string[];

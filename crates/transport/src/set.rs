@@ -121,7 +121,7 @@ struct WakeState {
 
 /// Several transports behind one [`Transport`].
 ///
-/// This is what lets a host speak TCP and QUIC at once without the swarm above
+/// This is what lets a host speak QUIC and TCP at once without the swarm above
 /// it knowing there is more than one of anything. It owns no I/O of its own: it
 /// is a router, and every decision it makes is a lookup.
 ///
@@ -130,7 +130,7 @@ struct WakeState {
 /// Two questions, two answers already in the types:
 ///
 /// - **Which member dials this address?** [`Multiaddr::transport_kind`] says
-///   whether an address is `/tcp` or `/udp/quic-v1`, and each member claims one
+///   whether an address is `/udp/quic-v1` or `/tcp`, and each member claims one
 ///   shape.
 /// - **Which member owns this connection?** [`ConnectionId`] carries the
 ///   [`ConnectionNamespace`] its allocator stamped, and each member claims the
@@ -820,7 +820,7 @@ mod tests {
         addr("/ip4/127.0.0.1/udp/4001/quic-v1")
     }
 
-    /// A set with one TCP member and one QUIC member, and both fakes.
+    /// A set with one QUIC member and one TCP member, and both fakes.
     fn duo() -> (TransportSet, Fake, Fake) {
         let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV4);
         let quic = Fake::new("quic", ConnectionNamespace::QUIC_IPV4);

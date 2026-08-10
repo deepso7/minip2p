@@ -1,6 +1,6 @@
 ---
 title: Introduction
-description: A minimal, caller-driven libp2p implementation in Rust for applications that want QUIC, clear control flow, and no async runtime.
+description: A minimal, caller-driven libp2p stack with QUIC, TCP, and no_std.
 ---
 
 ## Install
@@ -22,10 +22,11 @@ description: A minimal, caller-driven libp2p implementation in Rust for applicat
   </Tab>
 </Tabs>
 
-minip2p establishes authenticated QUIC connections from Rust and React Native.
-The Rust `Endpoint` is synchronous and caller-driven, with no async runtime.
-The React Native SDK owns the native driver and presents typed events,
-cancellable Promises, and `Stream` handles to JavaScript.
+minip2p opens authenticated QUIC and TCP connections from Rust and React
+Native. On `no_std + alloc`, TCP runs through a pluggable provider and
+`Endpoint::portable`. The Rust `Endpoint` is synchronous and caller-driven —
+no async runtime. The React Native SDK owns the native driver and presents
+typed events, cancellable Promises, and `Stream` handles to JavaScript.
 
 <Tabs>
   <Tab title="Rust">
@@ -121,6 +122,9 @@ discovery, and local-link mDNS.
   <Card title="Discover peers" href="/guides/discover-peers" icon="radar">
     Signed presence beacons or zero-configuration local-link mDNS.
   </Card>
+  <Card title="Embedded devices" href="/guides/embedded-devices" icon="cpu">
+    Portable TCP over smoltcp — you own I/O, time, and entropy.
+  </Card>
 </CardGroup>
 
 ## Look up
@@ -152,7 +156,8 @@ discovery, and local-link mDNS.
 | | |
 | --- | --- |
 | <Badge>pre-1.0</Badge> | APIs may change before the first stable release. |
-| <Badge>TCP and QUIC</Badge> | The address decides which carries a peer. WebSocket and WebTransport are out of scope. |
+| <Badge>QUIC and TCP</Badge> | The dial address picks the transport. WebSocket and WebTransport are out of scope. |
+| <Badge>no_std + alloc</Badge> | Protocols, orchestration, and TCP work without an OS; you supply I/O, time, and entropy. |
 | <Badge>QUIC-only punching</Badge> | DCUtR hole punching needs QUIC; a TCP-only peer reaches NATed peers through a relay. |
 | <Badge>Rust 1.91+</Badge> | Workspace MSRV. |
 | <Badge>Caller-driven Rust</Badge> | Rust applications drive progress; the React Native adapter owns its native driver. |

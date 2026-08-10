@@ -12,8 +12,8 @@ Relay v2 server for relayed paths.
 
 <Badge>pre-1.0</Badge> <Badge>needs external relay</Badge>
 
-The `nat` feature adds an orchestrator that can race direct QUIC dials against
-a Circuit Relay v2 path and attempt a DCUtR direct upgrade.
+The `nat` feature adds an orchestrator that can race a direct QUIC or TCP dial
+against a Circuit Relay v2 path. DCUtR hole punching still needs QUIC.
 
 :::warning
 minip2p ships relay client state machines and traversal policy. It does not

@@ -41,7 +41,7 @@ pub use minip2p_tcp::{TcpConfig, TcpProvider, TcpTransport};
 #[cfg(feature = "portable-autonat")]
 mod nat;
 
-/// Portable endpoint entry point when the std facade is not compiled.
+/// Portable endpoint entry point when the std `Endpoint` is not compiled.
 ///
 /// Under `std`, the batteries-included endpoint exposes the same
 /// [`Endpoint::portable`] constructor alongside `Endpoint::builder`.
@@ -61,9 +61,9 @@ impl Endpoint {
 
 /// Caller-driven endpoint over an injected transport and entropy source.
 ///
-/// This is the portable facade for embedded systems and deterministic event
-/// loops. It performs no blocking and never reads a system clock. Callers
-/// drive it with [`poll`](Self::poll) and may inspect
+/// Portable entry point for embedded systems and deterministic event loops.
+/// It performs no blocking and never reads a system clock. Callers drive it
+/// with [`poll`](Self::poll) and may inspect
 /// [`next_deadline`](Self::next_deadline) to decide how long their platform
 /// loop can idle.
 pub struct PortableEndpoint<T: Transport, E: EntropySource> {
@@ -98,7 +98,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         &mut self.runtime
     }
 
-    /// Consumes the facade and returns its underlying runtime.
+    /// Consumes the endpoint and returns its underlying runtime.
     pub fn into_runtime(self) -> SwarmRuntime<T, E> {
         self.runtime
     }

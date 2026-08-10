@@ -61,15 +61,15 @@ also mean "close any resulting session" must call `disconnect` for the target
 peer.
 
 The native driver owns connection keepalive. Every 10 seconds it pings every
-currently connected peer, keeping quiet connections inside QUIC's default
-30-second idle timeout. The driver releases its shared endpoint mutex between
+currently connected peer so quiet connections stay alive (QUIC's default idle
+timeout is 30 seconds). The driver releases its shared endpoint mutex between
 peer pings so commands can interleave with a large keepalive pass. Successful
 replies and timeouts surface normally as
 `PingRttMeasured` and `PingTimeout` events; hosts should not run a second
 keepalive loop. Keepalive is serviced between callback deliveries while
-draining a backlog. One listener callback that blocks for roughly the entire
-QUIC idle window can still cause connection loss, so callbacks must return
-promptly and hand expensive work to the host runtime.
+draining a backlog. One listener callback that blocks for roughly the full idle
+timeout can still drop the connection, so callbacks must return promptly and
+hand expensive work to the host runtime.
 
 ## Addresses, discovery, and event ordering
 

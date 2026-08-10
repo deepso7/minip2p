@@ -13,6 +13,7 @@ paths are actually usable.
 | --- | --- | --- | --- | --- |
 | Direct QUIC, Identify, Ping, custom streams | Base | None required | Base swarm driver | A mutually reachable UDP path |
 | Direct TCP | `tcp` | `.tcp(...)`, `.tcp_multiaddr(...)`, or `.bind_tcp(...)` | Noise-authenticated Yamux streams over TCP | A mutually reachable TCP path |
+| Portable TCP | `default-features = false, features = ["smoltcp"]` | `Endpoint::portable(...).smoltcp(...).listen(...).build()` | TCP, Noise XX, Yamux, Identify, Ping, and custom streams on a caller-driven loop | Your smoltcp device, interface, clock, and entropy |
 | Reachability probing | `nat` | `.autonat_server(server)` or a `NatConfig` with probe servers | NAT driver and AutoNAT probes | Reachable AutoNAT server |
 | Relayed connections and DCUtR | `nat` | `.relay(relay)` or relay-bearing `.nat_config(...)` | NAT driver, reservations, relay races, hole punching | Reachable Circuit Relay v2 server |
 | Gossipsub | `pubsub` | `.pubsub()` or gossipsub `.pubsub_config(...)` | Pubsub driver | At least one compatible mesh peer |
@@ -38,7 +39,15 @@ Compiled with `features = ["tcp"]`:
 
 - Bind: `tcp`, `tcp_multiaddr`, `bind_tcp`
 - Configuration: `tcp_config`
-- Routing: `/tcp` dial targets are carried by TCP; QUIC targets remain on QUIC
+- Routing: QUIC addresses use QUIC; `/tcp` dials use TCP
+
+## Portable API
+
+With default features off, `Endpoint::portable(identity, entropy)` takes a
+`Transport` you supply. The `smoltcp` feature builds one shared embedded stack
+and can layer TCP with portable mDNS, pubsub, signed discovery, AutoNAT, and
+relay. Drive it with `poll(now)` and sleep until `next_deadline(now)` — minip2p
+does not read a system clock or start a runtime.
 
 ## NAT API
 
@@ -94,9 +103,9 @@ mDNS discovers peers only on multicast-capable local links. Its address claims
 remain unauthenticated until the selected transport verifies the peer identity. Automatic
 mDNS-triggered attempts are therefore direct-only and never activate a
 configured relay or HOP CONNECT.
-`Endpoint::shutdown` sends TTL-zero goodbyes and permanently stops mDNS while
-leaving QUIC usable. With both `discovery` and `mdns` enabled, both sources use
-one bounded peer book and one automatic-dial state.
+`Endpoint::shutdown` sends TTL-zero goodbyes and permanently stops mDNS; QUIC
+and TCP keep working. With both `discovery` and `mdns` enabled, both sources
+use one bounded peer book and one automatic-dial state.
 
 ## React Native
 

@@ -7,6 +7,7 @@ export default defineMeta({
     "concepts",
     "discover-peers",
     "drive-events",
+    "embedded-devices",
     "identity",
     "listen-and-dial",
     "pubsub",

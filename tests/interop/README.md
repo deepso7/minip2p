@@ -34,4 +34,4 @@ separate Go module. Its dependencies are pinned in `go.mod` and `go.sum`.
 ## Still separate
 
 QUIC interoperability needs its own live gate: the upstream interop package
-currently covers TCP, WebTransport, and WebRTC Direct, not QUIC.
+does not currently cover QUIC; it covers TCP, WebTransport, and WebRTC Direct.

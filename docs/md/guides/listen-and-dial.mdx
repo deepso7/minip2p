@@ -1,6 +1,6 @@
 ---
 title: Listen and dial
-description: Bind a QUIC endpoint, publish dialable peer addresses, dial over IPv4, IPv6, or DNS, and wait for PeerReady.
+description: Bind QUIC, TCP, or both; publish dialable peer addresses; and wait for PeerReady.
 ---
 
 **Goal:** Bind, publish a dialable address, dial a known peer, and wait for
@@ -9,8 +9,9 @@ description: Bind a QUIC endpoint, publish dialable peer addresses, dial over IP
 **Assumes:** [Connect two peers](/quickstart/connect-peers) and
 [Concepts](/guides/concepts) (dial versus connect).
 
-This guide covers direct QUIC connectivity with the base Endpoint API. For relay
-races and hole punching, use [Traverse NAT](/guides/traverse-nat).
+This guide covers direct QUIC and TCP with the base Endpoint API. QUIC is on
+by default; TCP needs the `tcp` Cargo feature. For relay races and hole
+punching, use [Traverse NAT](/guides/traverse-nat).
 
 ## Bind an endpoint
 
@@ -21,8 +22,10 @@ Choose the bind method that matches the host:
 | `bind_quic("127.0.0.1:0")` | You want one socket address, commonly for local tests. |
 | `bind_quic_multiaddr(&addr)` | Configuration already uses a QUIC `Multiaddr`. |
 | `bind_quic_dual_stack()` | The application should bind separate IPv4 and IPv6 wildcard sockets. |
+| `bind_tcp("0.0.0.0:0")` | You want TCP only (`tcp` feature). |
+| `.quic_dual_stack().tcp(...).bind()` | You want one endpoint that speaks both. |
 
-Port `0` asks the operating system to choose an available UDP port.
+Port `0` asks the operating system to pick a free UDP or TCP port.
 
 ```rust
 use minip2p::{Endpoint, PeerAddr};
@@ -47,6 +50,18 @@ fn local_dialable(address: &PeerAddr) -> String {
 `listen()` publishes the first already-bound address. `listen_all()` publishes
 every bound address, which is normally the right choice for a dual-stack
 endpoint.
+
+To listen on both, chain the builder methods before `bind`:
+
+```rust
+let mut node = Endpoint::builder()
+    .quic_dual_stack()
+    .tcp("0.0.0.0:4001")
+    .bind()?;
+```
+
+`/udp/.../quic-v1` goes over QUIC; `/tcp` goes over TCP. Above that, swarm
+and app-protocol APIs look the same.
 
 :::warning
 An address containing `/ip4/0.0.0.0` or `/ip6/::` describes where the socket
@@ -81,8 +96,8 @@ when policy requires one family.
 
 A successful dial still has two useful milestones:
 
-1. `Event::ConnectionEstablished` — QUIC is connected and the peer identity is
-   authenticated.
+1. `Event::ConnectionEstablished` — the transport is up and the peer identity
+   is authenticated.
 2. `Event::PeerReady` — the first Identify exchange has completed, so the
    endpoint knows which protocols the peer supports.
 

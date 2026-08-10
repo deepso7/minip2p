@@ -97,8 +97,8 @@ impl Multiaddr {
 
     /// Returns which transport can dial this address, if any.
     ///
-    /// This is the classification a multi-transport host routes on: `/tcp`
-    /// addresses go to TCP, `/udp/.../quic-v1` addresses to QUIC. Anything
+    /// This is the classification a multi-transport host routes on:
+    /// `/udp/.../quic-v1` addresses go to QUIC, `/tcp` addresses to TCP. Anything
     /// else -- a bare host, a circuit address, a trailing `/p2p` -- is not a
     /// dialable transport address and returns `None`.
     pub fn transport_kind(&self) -> Option<TransportKind> {

@@ -4,7 +4,7 @@ Application-facing `Endpoint` API for minip2p.
 
 ```toml
 [dependencies]
-minip2p = { package = "minip2p-rs", version = "0.3.1" }
+minip2p = { package = "minip2p-rs", version = "0.4.0" }
 ```
 
 The package is named `minip2p-rs` on crates.io and its library target remains
@@ -51,7 +51,7 @@ host owns the smoltcp device and interface; minip2p owns the TCP, Noise XX,
 Yamux, Identify, Ping, and application-protocol state above them:
 
 ```toml
-minip2p = { package = "minip2p-rs", version = "0.3.1", default-features = false, features = ["smoltcp", "pubsub"] }
+minip2p = { package = "minip2p-rs", version = "0.4.0", default-features = false, features = ["smoltcp", "pubsub"] }
 ```
 
 The portable smoltcp builder can compose TCP, pubsub, signed-beacon discovery,
@@ -130,13 +130,12 @@ by the TCP-only portable endpoint.
 
 ## Transports
 
-QUIC is enabled by the default `std + quic` features. TCP support is opt-in through the `tcp` Cargo
-feature, so a QUIC-only application does not link the TCP upgrade and socket
-stack. Enable it with `minip2p-rs = { version = "0.3.1", features = ["tcp"] }`.
+QUIC comes with the default `std + quic` features. TCP is opt-in via the `tcp`
+Cargo feature, so a QUIC-only app does not pull in the TCP stack. Enable it
+with `minip2p-rs = { version = "0.4.0", features = ["tcp"] }`.
 
-An endpoint brings up whatever it was asked to bind and routes by address from
-then on. `quic`, `quic_dual_stack`, and `tcp` add sockets; `bind` brings them
-all up:
+An endpoint brings up whatever you asked it to bind, then routes by address.
+`quic`, `quic_dual_stack`, and `tcp` add sockets; `bind` brings them all up:
 
 ```rust
 let mut endpoint = minip2p::Endpoint::builder()
@@ -146,12 +145,11 @@ let mut endpoint = minip2p::Endpoint::builder()
 # Ok::<(), minip2p::Error>(())
 ```
 
-A `/tcp` peer is then reached over TCP and a `/udp/<port>/quic-v1` one over
-QUIC, decided from the address rather than by the caller — nothing above the
-endpoint knows there is more than one transport. `bind_quic`,
-`bind_quic_multiaddr`, `bind_quic_dual_stack`, and `bind_tcp` are the
-one-transport shorthands, and an endpoint with nothing to bind is refused
-rather than built unusable.
+Dial `/udp/<port>/quic-v1` and you get QUIC; dial a `/tcp` address and you get
+TCP. The address decides — nothing above the endpoint cares that there are
+two transports. `bind_quic`, `bind_quic_multiaddr`, `bind_quic_dual_stack`,
+and `bind_tcp` are the one-transport shortcuts. An endpoint with nothing to
+bind is refused rather than built empty.
 
 `dial` resolves a `/dns*` target and dials one address per family, so a
 dual-stack peer is tried both ways; `dial_ip4` and `dial_ip6` force one.

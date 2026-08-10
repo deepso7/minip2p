@@ -55,7 +55,7 @@ pub enum DialTarget {
 pub struct RunOptions {
     /// Optional persistent Ed25519 raw-secret file.
     pub key_path: Option<PathBuf>,
-    /// Optional TCP or QUIC listen/bind multiaddr. Defaults to dual-stack QUIC.
+    /// Optional QUIC or TCP listen/bind multiaddr. Defaults to dual-stack QUIC.
     pub listen_addr: Option<Multiaddr>,
     /// Optional AutoNAT server used for reachability probes.
     pub autonat: Option<PeerAddr>,
@@ -256,7 +256,7 @@ fn parse_transport_multiaddr(flag: &str, value: &str) -> Result<Multiaddr, CliEr
         .map_err(|e| CliError(format!("invalid {flag} '{value}': {e}")))?;
     if !addr.is_quic_transport() && !addr.is_tcp_transport() {
         return Err(CliError(format!(
-            "{flag} must name a TCP or QUIC transport, got '{value}'"
+            "{flag} must name a QUIC or TCP transport, got '{value}'"
         )));
     }
     Ok(addr)
@@ -267,7 +267,7 @@ fn require_supported_transport(what: &str, raw: &str, addr: &PeerAddr) -> Result
         Ok(())
     } else {
         Err(CliError(format!(
-            "{what} must name a TCP or QUIC transport, got '{raw}'"
+            "{what} must name a QUIC or TCP transport, got '{raw}'"
         )))
     }
 }
@@ -377,7 +377,7 @@ NOTES:
     --autonat          AutoNAT server used for reachability probes
     --count            dial only: stop after n pings, print a summary, exit
     --key              persistent Ed25519 raw-secret file (hex)
-    --listen           TCP or QUIC bind multiaddr; default is dual-stack QUIC on UDP/0
+    --listen           QUIC or TCP bind multiaddr; default is dual-stack QUIC on UDP/0
 
     See examples/peer/README.md for full usage examples."
         .to_string()
@@ -533,21 +533,21 @@ mod tests {
     fn dial_rejects_unsupported_direct_target() {
         let raw = format!("/ip4/127.0.0.1/udp/4001/p2p/{PEER_ID}");
         let err = parse(v(&["dial", &raw])).unwrap_err();
-        assert!(err.0.contains("TCP or QUIC"));
+        assert!(err.0.contains("QUIC or TCP"));
     }
 
     #[test]
     fn dial_rejects_unsupported_circuit_relay() {
         let raw = format!("/ip4/127.0.0.1/udp/4001/p2p/{PEER_ID}/p2p-circuit/p2p/{PEER_ID}");
         let err = parse(v(&["dial", &raw])).unwrap_err();
-        assert!(err.0.contains("TCP or QUIC"));
+        assert!(err.0.contains("QUIC or TCP"));
     }
 
     #[test]
     fn relay_flag_rejects_unsupported_transport() {
         let raw = format!("/ip4/127.0.0.1/udp/4001/p2p/{PEER_ID}");
         let err = parse(v(&["listen", "--relay", &raw])).unwrap_err();
-        assert!(err.0.contains("TCP or QUIC"));
+        assert!(err.0.contains("QUIC or TCP"));
     }
 
     #[test]

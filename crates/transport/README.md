@@ -2,7 +2,7 @@
 
 Sans-IO transport trait and connection/stream types for minip2p. `no_std` + `alloc` compatible.
 
-This crate defines the transport abstraction that concrete adapters implement — TCP and QUIC today, anything ordered and multiplexed in principle. It contains no runtime or networking code.
+This crate defines the transport abstraction that concrete adapters implement — QUIC and TCP today, anything ordered and multiplexed in principle. It contains no runtime or networking code.
 
 ## Features
 
@@ -15,9 +15,9 @@ This crate defines the transport abstraction that concrete adapters implement �
 
 ## Running several transports at once
 
-`TransportSet` is a `Transport` that owns several and routes between them, so a host speaks TCP and QUIC at once without the swarm above it knowing there is more than one of anything. It owns no I/O: every decision it makes is a lookup, and both lookups use information the types already carry.
+`TransportSet` is a `Transport` that owns several and routes between them, so a host speaks QUIC and TCP at once without the swarm above it knowing there is more than one of anything. It owns no I/O: every decision it makes is a lookup, and both lookups use information the types already carry.
 
-- **Which member dials this address?** `Multiaddr::transport_kind()` says whether an address is `/tcp` or `/udp/quic-v1`, and each member claims one shape.
+- **Which member dials this address?** `Multiaddr::transport_kind()` says whether an address is `/udp/quic-v1` or `/tcp`, and each member claims one shape.
 - **Which member owns this connection?** `ConnectionId` carries the namespace its allocator stamped, and each member claims the namespaces it allocates in.
 
 Both claims are checked when a member joins, so neither question can have two answers by the time it is asked. A member claims an address *shape* rather than an address family — one TCP transport serves `/ip4` and `/ip6` alike, matching how the adapters are actually built — and a member that splits by family internally, as the dual-stack QUIC transport does, claims both of its namespaces and keeps that split to itself. The namespaces a member names have to be every namespace it allocates in: a dial that produced an id from one it did not claim would hand back a connection nothing could route, so the set refuses and closes it instead. A refused join returns the transport with the reason, in a `RejectedTransport`, rather than dropping a bound socket where the caller can no longer reach it.
@@ -28,7 +28,7 @@ Under `std` a member must also implement `BlockingTransport` and be `Send`, so t
 
 ## Connection id namespaces
 
-A host can run TCP and QUIC at once, each split per address family, with relay circuits layered on top — and every one of them hands connection ids to the same swarm. `ConnectionId` packs an 8-bit `ConnectionNamespace` alongside a 56-bit sequence number so those id spaces are disjoint by construction: a router can tell which transport an id belongs to just by looking at it, and no transport has to remap another's ids.
+A host can run QUIC and TCP at once, each split per address family, with relay circuits layered on top — and every one of them hands connection ids to the same swarm. `ConnectionId` packs an 8-bit `ConnectionNamespace` alongside a 56-bit sequence number so those id spaces are disjoint by construction: a router can tell which transport an id belongs to just by looking at it, and no transport has to remap another's ids.
 
 Allocate ids with `ConnectionIdAllocator` rather than building them by hand. Sequence numbers are never reused, so allocation fails once a namespace is exhausted instead of wrapping onto live ids. That guarantee belongs to the namespace rather than to the allocator, so a namespace gets exactly one: the allocator is deliberately not `Clone`, since a copy would carry the same next sequence and mint every id a second time.
 

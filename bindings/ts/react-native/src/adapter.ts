@@ -318,7 +318,7 @@ export function peerIdFromSecretKey(secretKey: Bytes): string {
   return backendFactory.peerIdFromSecretKey(secretKey);
 }
 
-/** Builds a circuit multiaddress through a direct TCP or QUIC relay address. */
+/** Builds a circuit multiaddress through a direct QUIC or TCP relay address. */
 export function circuitAddress(relayAddress: string, peerId: string): string {
   return backendFactory.circuitAddress(relayAddress, peerId);
 }

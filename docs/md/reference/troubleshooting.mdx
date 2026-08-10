@@ -11,7 +11,7 @@ directly and reports later runtime or protocol failures through events.
 | Symptom | Likely cause | Corrective action |
 | --- | --- | --- |
 | `PeerAddr` fails to parse | Missing or non-terminal `/p2p/<peer-id>` | Copy the complete peer address, including its terminal identity. |
-| An address parses but dialing fails immediately | The transport is not a supported host + UDP + QUIC v1 shape | Use `/ip4`, `/ip6`, `/dns*`, then `/udp/<port>/quic-v1`. |
+| An address parses but dialing fails immediately | Wrong shape, or that transport was not compiled/bound | Use a host plus `/udp/<port>/quic-v1` or `/tcp/<port>`, and enable/bind that transport. |
 | A remote peer cannot dial a printed wildcard address | `0.0.0.0` or `::` is a bind wildcard | Advertise a real interface/public address or a relay circuit address. |
 | `ConnectionEstablished` appears but the app protocol cannot open | Identify has not completed | Wait for `PeerReady` before `open_stream`. |
 | `ProtocolNotRegistered` | The local endpoint never registered the ID | Add `.protocol("/app/name/1.0.0")` on the builder or call `add_protocol`. |
@@ -26,7 +26,7 @@ directly and reports later runtime or protocol failures through events.
 | Discovery rejects an unsigned beacon | Discovery always requires signed beacons | Fix the remote discovery publisher; application `allow_unsigned` does not relax discovery. |
 | Unsubscribing the discovery topic fails | The topic is driver-owned | Leave its lifecycle to discovery; use a separate topic for application messages. |
 | mDNS discovers no local peers | The network blocks multicast, the interfaces do not share a link, or `.mdns()` was not activated | Confirm both endpoints keep driving, use a multicast-capable local network, and activate mDNS on both peers. |
-| A quiet connection closes | The QUIC idle timeout elapsed | Send appropriate application traffic or Ping on a cadence suited to the app. |
+| A quiet connection closes | Idle timeout on the transport, peer, or something in between | Send app traffic or Ping often enough for your path. |
 | A focused wait returns `EventBacklogExceeded` | Too many unrelated events were preserved during the wait | Drain ordinary events with `poll` or `next_event`, handle the busy source, then retry. |
 
 ## Event response cheat sheet
@@ -54,7 +54,7 @@ directly and reports later runtime or protocol failures through events.
     Log the complete `PeerAddr`, local `PeerId`, and relevant bind addresses.
   </Step>
   <Step title="Confirm the readiness milestone">
-    Distinguish authenticated QUIC establishment from `PeerReady`.
+    Distinguish a finished, authenticated connection from `PeerReady`.
   </Step>
   <Step title="Confirm feature activation">
     Check both the Cargo feature and the builder method.
@@ -91,7 +91,7 @@ typed `kind` fields for diagnostics.
 | `BackpressureError` is thrown by `publish` | The bounded native pubsub queue is full | Slow or batch publishers and retry only according to application delivery rules. |
 | An unsigned message has an unexpected peer ID | `allowUnsigned: true` accepts unauthenticated sender claims | Treat both `fromPeerId` and payload as attacker-controlled whenever `signed` is false. |
 | mDNS finds no peers on iOS or Android | Host permissions are missing, multicast is blocked, or peers do not share a link | Add the documented local-network/multicast configuration and test on a multicast-capable network. |
-| AutoNAT reports state but `connect` cannot relay | `autonatServers` probes reachability but does not provide traversal | Add a reachable direct QUIC relay peer address to `relays`. |
+| AutoNAT reports state but `connect` cannot relay | `autonatServers` probes reachability but does not provide traversal | Add a reachable direct QUIC or TCP relay peer address to `relays`. |
 | `queueOverflow` fires | JavaScript did not drain the bounded native event queue quickly enough | Refresh `connectedPeers`, `knownPeers`, paths, reachability, and reservation state; reduce slow event handlers. |
 | The hook enters `failed` | The native driver stopped unexpectedly | Use `isDriverFailure(state)`, log its typed kind, recreate at an application-owned boundary, and do not reuse the closed endpoint. |
 
