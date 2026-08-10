@@ -3,8 +3,8 @@
 //! The grammar is:
 //!
 //! ```text
-//! minip2p-peer listen [--relay <relay-peer-addr>] [--autonat <peer-addr>] [--key <path>] [--listen <quic-multiaddr>]
-//! minip2p-peer dial <target> [--relay <peer-addr>] [--autonat <peer-addr>] [--count <n>] [--key <path>] [--listen <quic-multiaddr>]
+//! minip2p-peer listen [--relay <relay-peer-addr>] [--autonat <peer-addr>] [--key <path>] [--listen <transport-multiaddr>]
+//! minip2p-peer dial <target> [--relay <peer-addr>] [--autonat <peer-addr>] [--count <n>] [--key <path>] [--listen <transport-multiaddr>]
 //! ```
 //!
 //! `<target>` is either a circuit address copied from the listener's
@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use minip2p::{Event, Multiaddr, PeerAddr, PeerId, Protocol};
-use minip2p_example_common::{CliError, flag_value, require_quic_transport};
+use minip2p_example_common::{CliError, flag_value};
 
 /// The modes the CLI dispatches to.
 #[derive(Clone, Debug)]
@@ -55,7 +55,7 @@ pub enum DialTarget {
 pub struct RunOptions {
     /// Optional persistent Ed25519 raw-secret file.
     pub key_path: Option<PathBuf>,
-    /// Optional QUIC listen/bind multiaddr. Defaults to dual-stack UDP/0.
+    /// Optional TCP or QUIC listen/bind multiaddr. Defaults to dual-stack QUIC.
     pub listen_addr: Option<Multiaddr>,
     /// Optional AutoNAT server used for reachability probes.
     pub autonat: Option<PeerAddr>,
@@ -137,7 +137,7 @@ pub fn parse_dial_target(raw: &str) -> Result<DialTarget, CliError> {
     {
         let target = PeerAddr::from_str(raw)
             .map_err(|e| CliError(format!("invalid target peer-addr '{raw}': {e}")))?;
-        require_quic_transport("target", raw, &target)?;
+        require_supported_transport("target", raw, &target)?;
         return Ok(DialTarget::Direct(target));
     }
 
@@ -150,7 +150,7 @@ pub fn parse_dial_target(raw: &str) -> Result<DialTarget, CliError> {
         ] if !prefix.is_empty() => {
             let relay = PeerAddr::new(Multiaddr::from_protocols(prefix.to_vec()), relay_id.clone())
                 .map_err(|e| CliError(format!("invalid relay address in '{raw}': {e}")))?;
-            require_quic_transport("circuit relay", raw, &relay)?;
+            require_supported_transport("circuit relay", raw, &relay)?;
             Ok(DialTarget::Circuit {
                 relay,
                 peer: peer.clone(),
@@ -187,7 +187,7 @@ impl Flags {
                     }
                     let addr = PeerAddr::from_str(value)
                         .map_err(|e| CliError(format!("invalid --relay '{value}': {e}")))?;
-                    require_quic_transport("--relay", value, &addr)?;
+                    require_supported_transport("--relay", value, &addr)?;
                     relay = Some(addr);
                 }
                 "--count" => {
@@ -214,7 +214,7 @@ impl Flags {
                     if options.listen_addr.is_some() {
                         return Err(CliError("--listen specified twice".into()));
                     }
-                    let addr = parse_quic_multiaddr("--listen", value)?;
+                    let addr = parse_transport_multiaddr("--listen", value)?;
                     if !matches!(
                         addr.protocols().first(),
                         Some(Protocol::Ip4(_) | Protocol::Ip6(_))
@@ -233,7 +233,7 @@ impl Flags {
                     let addr = PeerAddr::from_str(value).map_err(|e| {
                         CliError(format!("invalid --autonat peer-addr '{value}': {e}"))
                     })?;
-                    require_quic_transport("--autonat", value, &addr)?;
+                    require_supported_transport("--autonat", value, &addr)?;
                     options.autonat = Some(addr);
                 }
                 other => {
@@ -251,15 +251,25 @@ impl Flags {
     }
 }
 
-fn parse_quic_multiaddr(flag: &str, value: &str) -> Result<Multiaddr, CliError> {
+fn parse_transport_multiaddr(flag: &str, value: &str) -> Result<Multiaddr, CliError> {
     let addr = Multiaddr::from_str(value)
         .map_err(|e| CliError(format!("invalid {flag} '{value}': {e}")))?;
-    if !addr.is_quic_transport() {
+    if !addr.is_quic_transport() && !addr.is_tcp_transport() {
         return Err(CliError(format!(
-            "{flag} must be /ip4|ip6|dns|dns4|dns6/<host>/udp/<port>/quic-v1, got '{value}'"
+            "{flag} must name a TCP or QUIC transport, got '{value}'"
         )));
     }
     Ok(addr)
+}
+
+fn require_supported_transport(what: &str, raw: &str, addr: &PeerAddr) -> Result<(), CliError> {
+    if addr.transport().is_quic_transport() || addr.transport().is_tcp_transport() {
+        Ok(())
+    } else {
+        Err(CliError(format!(
+            "{what} must name a TCP or QUIC transport, got '{raw}'"
+        )))
+    }
 }
 
 /// Prints an [`Event`] in the CLI's one-event-per-line format.
@@ -355,8 +365,8 @@ pub fn usage() -> String {
     "minip2p-peer -- NAT-aware echo-ping demo for the minip2p stack.
 
 USAGE:
-    minip2p-peer listen [--relay <relay-peer-addr>] [--autonat <peer-addr>] [--key <path>] [--listen <quic-multiaddr>]
-    minip2p-peer dial   <target> [--relay <peer-addr>] [--autonat <peer-addr>] [--count <n>] [--key <path>] [--listen <quic-multiaddr>]
+    minip2p-peer listen [--relay <relay-peer-addr>] [--autonat <peer-addr>] [--key <path>] [--listen <transport-multiaddr>]
+    minip2p-peer dial   <target> [--relay <peer-addr>] [--autonat <peer-addr>] [--count <n>] [--key <path>] [--listen <transport-multiaddr>]
 
 NOTES:
     <target>           circuit address from the listener's `circuit=` line
@@ -367,7 +377,7 @@ NOTES:
     --autonat          AutoNAT server used for reachability probes
     --count            dial only: stop after n pings, print a summary, exit
     --key              persistent Ed25519 raw-secret file (hex)
-    --listen           bind multiaddr; default is dual-stack UDP/0
+    --listen           TCP or QUIC bind multiaddr; default is dual-stack QUIC on UDP/0
 
     See examples/peer/README.md for full usage examples."
         .to_string()
@@ -520,24 +530,24 @@ mod tests {
     }
 
     #[test]
-    fn dial_rejects_non_quic_direct_target() {
+    fn dial_rejects_unsupported_direct_target() {
         let raw = format!("/ip4/127.0.0.1/udp/4001/p2p/{PEER_ID}");
         let err = parse(v(&["dial", &raw])).unwrap_err();
-        assert!(err.0.contains("quic-v1"));
+        assert!(err.0.contains("TCP or QUIC"));
     }
 
     #[test]
-    fn dial_rejects_non_quic_circuit_relay() {
+    fn dial_rejects_unsupported_circuit_relay() {
         let raw = format!("/ip4/127.0.0.1/udp/4001/p2p/{PEER_ID}/p2p-circuit/p2p/{PEER_ID}");
         let err = parse(v(&["dial", &raw])).unwrap_err();
-        assert!(err.0.contains("quic-v1"));
+        assert!(err.0.contains("TCP or QUIC"));
     }
 
     #[test]
-    fn relay_flag_rejects_non_quic_transport() {
+    fn relay_flag_rejects_unsupported_transport() {
         let raw = format!("/ip4/127.0.0.1/udp/4001/p2p/{PEER_ID}");
         let err = parse(v(&["listen", "--relay", &raw])).unwrap_err();
-        assert!(err.0.contains("quic-v1"));
+        assert!(err.0.contains("TCP or QUIC"));
     }
 
     #[test]

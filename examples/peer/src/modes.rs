@@ -1,6 +1,6 @@
 //! The two NAT-aware runners behind `minip2p-peer listen` / `dial`.
 //!
-//! Both build the same endpoint shape: QUIC transport, the echo protocol,
+//! Both build the same endpoint shape: TCP or QUIC transport, the echo protocol,
 //! and the NAT traversal agent (always on — with no relay configured it
 //! simply resolves direct paths). The listener echoes every inbound echo
 //! stream byte for byte; the dialer sends one 16-byte ping frame per second
@@ -60,9 +60,13 @@ fn build_endpoint(
         builder = builder.autonat_server(autonat.clone());
     }
     match &options.listen_addr {
+        Some(addr) if addr.is_tcp_transport() => builder
+            .tcp_multiaddr(addr)
+            .bind()
+            .map_err(|e| format!("TCP bind {addr}: {e}").into()),
         Some(addr) => builder
             .bind_quic_multiaddr(addr)
-            .map_err(|e| format!("quic bind {addr}: {e}").into()),
+            .map_err(|e| format!("QUIC bind {addr}: {e}").into()),
         None => builder
             .bind_quic_dual_stack()
             .map_err(|e| format!("quic dual-stack bind: {e}").into()),
