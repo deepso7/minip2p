@@ -25,7 +25,7 @@ Install minip2p:
 
 ```toml
 [dependencies]
-minip2p-rs = "0.3.1"
+minip2p-rs = "0.4.0"
 ```
 
 Then create an endpoint:
