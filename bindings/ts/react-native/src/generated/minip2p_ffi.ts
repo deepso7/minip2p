@@ -4821,7 +4821,7 @@ function uniffiEnsureInitialized() {
     if (bindingsContractVersion !== scaffoldingContractVersion) {
         throw new UniffiInternalError.ContractVersionMismatch(scaffoldingContractVersion, bindingsContractVersion);
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_func_circuit_address() !== 18077) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_func_circuit_address() !== 35059) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_func_circuit_address");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_func_generate_secret_key() !== 44400) {
@@ -4851,13 +4851,13 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect() !== 60427) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr() !== 15782) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr() !== 27341) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs() !== 44153) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers() !== 52578) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers() !== 49290) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial() !== 47576) {
@@ -4884,7 +4884,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_known_peers() !== 27328) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_known_peers");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_listen_addrs() !== 60889) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_listen_addrs() !== 645) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_listen_addrs");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_open_stream() !== 18245) {
