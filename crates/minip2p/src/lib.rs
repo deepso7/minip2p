@@ -36,6 +36,10 @@ pub use minip2p_discovery::{
 pub use minip2p_mdns::{MdnsConfig, MdnsConfigError, MdnsError, MdnsEvent, MdnsIo};
 #[cfg(feature = "smoltcp")]
 pub use minip2p_mdns::{SmoltcpMdnsConfig, SmoltcpMdnsIo};
+#[cfg(all(feature = "portable-relay", not(feature = "nat")))]
+pub use minip2p_nat::{
+    ConnectId, NatConfig, NatEvent, Path, ReachabilityState, ReservationInfo, ReservationPolicy,
+};
 #[cfg(all(feature = "pubsub", not(feature = "std")))]
 pub use minip2p_pubsub::{
     FloodsubConfig, GossipsubConfig, PublishError, PubsubConfig, PubsubConfigError, PubsubEvent,
@@ -50,6 +54,9 @@ pub use minip2p_tcp::{TcpConfig, TcpProvider, TcpTransport};
 mod std_endpoint;
 #[cfg(feature = "std")]
 pub use std_endpoint::*;
+
+#[cfg(feature = "portable-relay")]
+mod portable_nat;
 
 /// Portable endpoint entry point when the std facade is not compiled.
 ///
@@ -633,6 +640,8 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
             pubsub: None,
             #[cfg(feature = "pubsub")]
             beacon: None,
+            #[cfg(feature = "portable-relay")]
+            nat_config: None,
             discovery: PeerDiscoveryConfig::default(),
         }
     }
@@ -660,14 +669,25 @@ pub struct SmoltcpEndpointBuilder<D: smoltcp::phy::Device, E: EntropySource> {
     pubsub: Option<PubsubConfig>,
     #[cfg(feature = "pubsub")]
     beacon: Option<BeaconConfig>,
+    #[cfg(feature = "portable-relay")]
+    nat_config: Option<minip2p_nat::NatConfig>,
     discovery: PeerDiscoveryConfig,
 }
+
+#[cfg(feature = "smoltcp")]
+type SmoltcpTcpTransport<D, E> = TcpTransport<SmoltcpTcpProvider<D>, SharedEntropy<E>>;
+
+#[cfg(all(feature = "smoltcp", not(feature = "portable-relay")))]
+type SmoltcpComposedTransport<D, E> = SmoltcpTcpTransport<D, E>;
+
+#[cfg(feature = "portable-relay")]
+type SmoltcpComposedTransport<D, E> =
+    minip2p_circuit::CircuitTransport<SmoltcpTcpTransport<D, E>, SharedEntropy<E>>;
 
 /// Caller-driven endpoint over one shared smoltcp stack.
 #[cfg(feature = "smoltcp")]
 pub struct SmoltcpEndpoint<D: smoltcp::phy::Device, E: EntropySource> {
-    endpoint:
-        PortableEndpoint<TcpTransport<SmoltcpTcpProvider<D>, SharedEntropy<E>>, SharedEntropy<E>>,
+    endpoint: PortableEndpoint<SmoltcpComposedTransport<D, E>, SharedEntropy<E>>,
     mdns: Option<minip2p_mdns::MdnsDriver<SmoltcpMdnsIo<D>>>,
     #[cfg(feature = "pubsub")]
     pubsub: Option<minip2p_pubsub::PubsubAgent>,
@@ -675,6 +695,8 @@ pub struct SmoltcpEndpoint<D: smoltcp::phy::Device, E: EntropySource> {
     pending_pubsub_events: VecDeque<PubsubEvent>,
     #[cfg(feature = "pubsub")]
     beacon: Option<minip2p_discovery::BeaconAgent>,
+    #[cfg(feature = "portable-relay")]
+    nat: Option<portable_nat::PortableNatDriver>,
     discovery: Option<minip2p_discovery::PeerDiscoveryAgent>,
     active_dials: BTreeMap<PeerId, ConnectionId>,
 }
@@ -688,14 +710,16 @@ pub enum SmoltcpEvent {
     /// Application-visible pubsub progress.
     #[cfg(feature = "pubsub")]
     Pubsub(PubsubEvent),
+    /// Relay reservation, circuit-path, or reachability progress.
+    #[cfg(feature = "portable-relay")]
+    Nat(minip2p_nat::NatEvent),
     /// A change or violation from the shared discovery book.
     Discovery(DiscoveryEvent),
 }
 
 #[cfg(feature = "smoltcp")]
 impl<D: smoltcp::phy::Device, E: EntropySource> core::ops::Deref for SmoltcpEndpoint<D, E> {
-    type Target =
-        PortableEndpoint<TcpTransport<SmoltcpTcpProvider<D>, SharedEntropy<E>>, SharedEntropy<E>>;
+    type Target = PortableEndpoint<SmoltcpComposedTransport<D, E>, SharedEntropy<E>>;
 
     fn deref(&self) -> &Self::Target {
         &self.endpoint
@@ -711,6 +735,42 @@ impl<D: smoltcp::phy::Device, E: EntropySource> core::ops::DerefMut for SmoltcpE
 
 #[cfg(feature = "smoltcp")]
 impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
+    /// Starts a relay-only connection attempt toward `peer`.
+    #[cfg(feature = "portable-relay")]
+    pub fn connect_relay(
+        &mut self,
+        peer: &PeerId,
+        now: Now,
+    ) -> Result<minip2p_nat::ConnectId, SmoltcpRelayError> {
+        let nat = self.nat.as_mut().ok_or(SmoltcpRelayError::NotEnabled)?;
+        let id = nat.connect(peer.clone(), now);
+        nat.pump(&mut self.endpoint, now);
+        Ok(id)
+    }
+
+    /// Cancels one relay connection attempt.
+    #[cfg(feature = "portable-relay")]
+    pub fn cancel_connect(&mut self, id: minip2p_nat::ConnectId, now: Now) {
+        if let Some(nat) = self.nat.as_mut() {
+            nat.cancel(id, now);
+            nat.pump(&mut self.endpoint, now);
+        }
+    }
+
+    /// Returns the latest NAT-orchestrated path to `peer`.
+    #[cfg(feature = "portable-relay")]
+    pub fn path(&self, peer: &PeerId) -> Option<minip2p_nat::Path> {
+        self.nat.as_ref().and_then(|nat| nat.path(peer))
+    }
+
+    /// Returns the currently held relay reservation, when any.
+    #[cfg(feature = "portable-relay")]
+    pub fn active_reservation(&self) -> Option<minip2p_nat::ReservationInfo> {
+        self.nat
+            .as_ref()
+            .and_then(portable_nat::PortableNatDriver::active_reservation)
+    }
+
     /// Subscribes to an application topic.
     #[cfg(feature = "pubsub")]
     pub fn subscribe(&mut self, topic: &str, now: Now) -> Result<bool, SmoltcpPubsubError> {
@@ -804,6 +864,13 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         }
         #[cfg(feature = "pubsub")]
         self.drive_beacon(now, &mut output);
+        #[cfg(feature = "portable-relay")]
+        if let Some(nat) = self.nat.as_mut() {
+            nat.tick(&mut self.endpoint, now);
+            while let Some(event) = nat.events.pop_front() {
+                output.push(SmoltcpEvent::Nat(event));
+            }
+        }
         if let Some(discovery) = self.discovery.as_mut()
             && discovery.next_timeout(now.monotonic_ms) == Some(0)
         {
@@ -842,17 +909,23 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
                     _ => {}
                 }
             }
-            #[cfg(feature = "pubsub")]
+            #[cfg(feature = "portable-relay")]
             let claimed = self
-                .pubsub
+                .nat
                 .as_mut()
-                .is_some_and(|agent| agent.handle_event(&event, now.monotonic_ms));
+                .is_some_and(|nat| nat.ingest(&event, &mut self.endpoint, now));
+            #[cfg(not(feature = "portable-relay"))]
+            let claimed = false;
+            #[cfg(feature = "pubsub")]
+            let claimed = claimed
+                || self
+                    .pubsub
+                    .as_mut()
+                    .is_some_and(|agent| agent.handle_event(&event, now.monotonic_ms));
             #[cfg(feature = "pubsub")]
             if let Some(agent) = self.pubsub.as_mut() {
                 pump_embedded_pubsub(agent, &mut self.endpoint, now);
             }
-            #[cfg(not(feature = "pubsub"))]
-            let claimed = false;
             if !claimed {
                 output.push(SmoltcpEvent::Endpoint(event));
             }
@@ -1013,6 +1086,20 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
                     .and_then(|agent| agent.next_timeout(now.monotonic_ms)),
             );
         }
+        #[cfg(feature = "portable-relay")]
+        if let Some(nat) = self.nat.as_ref()
+            && let Some(timeout) = nat.agent.next_timeout(now.monotonic_ms)
+        {
+            deadline = PollDeadline::earliest_opt(
+                deadline,
+                Some(PollDeadline::from_millis(
+                    now.monotonic_ms.saturating_add(timeout),
+                )),
+            );
+            if !nat.events.is_empty() {
+                deadline = PollDeadline::earliest_opt(deadline, Some(PollDeadline::IMMEDIATE));
+            }
+        }
         timeouts.extend(
             self.discovery
                 .as_ref()
@@ -1047,10 +1134,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
 #[cfg(feature = "pubsub")]
 fn pump_embedded_pubsub<D: smoltcp::phy::Device, E: EntropySource>(
     agent: &mut minip2p_pubsub::PubsubAgent,
-    endpoint: &mut PortableEndpoint<
-        TcpTransport<SmoltcpTcpProvider<D>, SharedEntropy<E>>,
-        SharedEntropy<E>,
-    >,
+    endpoint: &mut PortableEndpoint<SmoltcpComposedTransport<D, E>, SharedEntropy<E>>,
     now: Now,
 ) {
     while let Some(action) = agent.poll_action() {
@@ -1189,8 +1273,51 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
         self
     }
 
+    /// Enables relay-only connectivity through one relay address.
+    #[cfg(feature = "portable-relay")]
+    pub fn relay(mut self, relay: PeerAddr) -> Self {
+        let mut config = minip2p_nat::NatConfig::default();
+        config.relays.push(relay);
+        config.force_relay = true;
+        config.reservation_policy = minip2p_nat::ReservationPolicy::Never;
+        self.nat_config = Some(config);
+        self
+    }
+
+    /// Enables portable relay orchestration with explicit policy.
+    ///
+    /// The configuration must contain a relay, set `force_relay`, and leave
+    /// `autonat_servers` empty. Portable AutoNAT is a separate future layer;
+    /// the TCP-only endpoint never pretends to perform UDP hole punching.
+    #[cfg(feature = "portable-relay")]
+    pub fn relay_config(mut self, config: minip2p_nat::NatConfig) -> Self {
+        self.nat_config = Some(config);
+        self
+    }
+
     /// Builds the configured endpoint. Optional services share one event loop.
     pub fn build(mut self) -> Result<SmoltcpEndpoint<D, E>, SmoltcpBuildError> {
+        #[cfg(feature = "portable-relay")]
+        if let Some(config) = &self.nat_config {
+            if config.relays.is_empty() {
+                return Err(SmoltcpBuildError::RelayConfig {
+                    reason: "at least one relay address is required",
+                });
+            }
+            if !config.force_relay {
+                return Err(SmoltcpBuildError::RelayConfig {
+                    reason: "portable TCP relay requires force_relay = true; DCUtR is QUIC-only",
+                });
+            }
+            if !config.autonat_servers.is_empty() {
+                return Err(SmoltcpBuildError::RelayConfig {
+                    reason: "portable AutoNAT is not enabled by the relay-only endpoint",
+                });
+            }
+            for protocol in [minip2p_nat::HOP_PROTOCOL_ID, minip2p_nat::STOP_PROTOCOL_ID] {
+                self.swarm = self.swarm.protocol(protocol);
+            }
+        }
         #[cfg(feature = "pubsub")]
         if let Some(config) = &self.pubsub {
             for protocol in config.protocol_ids() {
@@ -1202,6 +1329,12 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
             self.identity.clone(),
             self.entropy.clone(),
             self.tcp_config,
+        );
+        #[cfg(feature = "portable-relay")]
+        let transport = minip2p_circuit::CircuitTransport::new(
+            transport,
+            self.identity.clone(),
+            self.entropy.clone(),
         );
         let mut endpoint = PortableEndpoint {
             runtime: self.swarm.build_runtime(transport, self.entropy.clone())?,
@@ -1263,6 +1396,18 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
         } else {
             None
         };
+        #[cfg(feature = "portable-relay")]
+        let nat = self.nat_config.map(|config| {
+            let relay_addrs = config
+                .relays
+                .iter()
+                .map(|relay| (relay.peer_id().clone(), relay.transport().clone()))
+                .collect();
+            portable_nat::PortableNatDriver::new(
+                minip2p_nat::NatAgent::new(endpoint.peer_id().clone(), config),
+                relay_addrs,
+            )
+        });
         Ok(SmoltcpEndpoint {
             endpoint,
             mdns,
@@ -1272,6 +1417,8 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
             pending_pubsub_events: VecDeque::new(),
             #[cfg(feature = "pubsub")]
             beacon,
+            #[cfg(feature = "portable-relay")]
+            nat,
             discovery,
             active_dials: BTreeMap::new(),
         })
@@ -1302,6 +1449,9 @@ pub enum SmoltcpBuildError {
     Topic(TopicError),
     /// Signed-beacon or bounded discovery policy was invalid.
     Discovery(minip2p_discovery::DiscoveryConfigError),
+    /// Portable relay policy requested an unsupported path.
+    #[cfg(feature = "portable-relay")]
+    RelayConfig { reason: &'static str },
 }
 
 #[cfg(feature = "smoltcp")]
@@ -1368,6 +1518,10 @@ impl core::fmt::Display for SmoltcpBuildError {
             #[cfg(feature = "pubsub")]
             Self::Topic(error) => error.fmt(formatter),
             Self::Discovery(error) => error.fmt(formatter),
+            #[cfg(feature = "portable-relay")]
+            Self::RelayConfig { reason } => {
+                write!(formatter, "invalid portable relay config: {reason}")
+            }
         }
     }
 }
@@ -1400,6 +1554,23 @@ impl core::fmt::Display for SmoltcpDriveError {
         match self {
             Self::Endpoint(error) => error.fmt(formatter),
             Self::Mdns(error) => error.fmt(formatter),
+        }
+    }
+}
+
+/// Failure from a portable relay operation.
+#[cfg(feature = "portable-relay")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SmoltcpRelayError {
+    /// No relay policy was selected on the builder.
+    NotEnabled,
+}
+
+#[cfg(feature = "portable-relay")]
+impl core::fmt::Display for SmoltcpRelayError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotEnabled => write!(formatter, "relay is not enabled; call .relay()"),
         }
     }
 }

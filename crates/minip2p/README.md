@@ -80,6 +80,29 @@ one `SmoltcpEvent` enum, and automatically dials newly observed peers.
 timelines. Manual provider composition remains available through
 `build(transport)`.
 
+Portable relay circuits are opt-in so TCP-only devices do not carry the NAT
+or circuit state machines. Enable `portable-relay` (which includes `smoltcp`),
+configure a relay, and drive connection progress through the same endpoint:
+
+```rust,ignore
+let mut endpoint = Endpoint::portable(&identity, entropy)
+    .smoltcp(stack)
+    .relay(relay_addr)
+    .build()?;
+
+let connect = endpoint.connect_relay(&remote_peer, now)?;
+while endpoint.path(&remote_peer).is_none() {
+    for event in endpoint.poll(now)? {
+        // Handle SmoltcpEvent::Nat and ordinary endpoint events.
+    }
+}
+```
+
+`.relay()` selects a relay-only path and does not reserve inbound capacity.
+Use `.relay_config(...)` with `ReservationPolicy::Always` for a device that
+must remain reachable through the relay. Raw-UDP DCUtR actions are not run by
+the TCP-only portable endpoint.
+
 ## Transports
 
 QUIC is enabled by the default `std + quic` features. TCP support is opt-in through the `tcp` Cargo
