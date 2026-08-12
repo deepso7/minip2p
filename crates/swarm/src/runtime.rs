@@ -664,8 +664,9 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
                     )));
                 }
             }
-            SwarmAction::CloseConnection { conn_id } => {
-                if let Err(e) = self.transport.close(conn_id) {
+            SwarmAction::CloseConnection { conn_id } => match self.transport.close(conn_id) {
+                Ok(()) | Err(TransportError::ConnectionNotFound { .. }) => {}
+                Err(e) => {
                     self.core
                         .handle_input(SwarmInput::RuntimeError(runtime_error(
                             SwarmErrorKind::Transport,
@@ -674,7 +675,7 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
                             format!("close on connection {conn_id} failed: {e}"),
                         )));
                 }
-            }
+            },
         }
     }
 }
@@ -771,6 +772,12 @@ mod tests {
         /// Protocol frames written after negotiation completed. This is the
         /// wire as the remote peer would see it.
         sent: Vec<(StreamId, Vec<u8>)>,
+        /// How many times [`Transport::close`] was invoked.
+        close_count: usize,
+        /// When true, the second and later `close` calls return
+        /// [`TransportError::ConnectionNotFound`], matching TCP after the
+        /// connection has already been removed from the live map.
+        fail_second_close: bool,
     }
 
     impl ScriptedTransport {
@@ -862,7 +869,11 @@ mod tests {
             Ok(())
         }
 
-        fn close(&mut self, _: ConnectionId) -> Result<(), TransportError> {
+        fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
+            self.close_count += 1;
+            if self.fail_second_close && self.close_count > 1 {
+                return Err(TransportError::ConnectionNotFound { id });
+            }
             Ok(())
         }
 
@@ -1157,6 +1168,36 @@ mod tests {
             runtime.transport().ping_frames(),
             vec![expected.as_slice()],
             "the ping payload on the wire must be exactly the drawn bytes"
+        );
+    }
+
+    #[test]
+    fn a_second_close_of_the_same_connection_is_not_a_runtime_error() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let conn = ConnectionId::new(1);
+        let address = "/ip4/198.51.100.7/udp/4001/quic-v1"
+            .parse()
+            .expect("endpoint");
+        let mut runtime = runtime_with(
+            ScriptedTransport {
+                initial: vec![TransportEvent::Connected {
+                    id: conn,
+                    endpoint: ConnectionEndpoint::with_peer_id(address, peer.clone()),
+                }],
+                fail_second_close: true,
+                ..ScriptedTransport::default()
+            },
+            SeqEntropy(1),
+        );
+        runtime.poll(Now::from_millis(0)).expect("connect");
+        runtime.disconnect(&peer, 1).expect("first close");
+        runtime.disconnect(&peer, 2).expect("second close");
+        let events = runtime.poll(Now::from_millis(3)).expect("poll");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SwarmEvent::Error(_))),
+            "already-gone close must not surface as Error: {events:?}"
         );
     }
 }

@@ -1204,9 +1204,10 @@ impl Endpoint {
     /// `shutdown` already sends mDNS goodbyes without tearing down transports.
     ///
     /// `disconnect` on each established peer flushes `CONNECTION_CLOSE` /
-    /// TCP FIN through the transport. One non-blocking [`Swarm::poll`] then
-    /// surfaces locally queued close events. After this returns, `self` is
-    /// dropped: [`Drop`] repeats disconnect as a no-op for peers already
+    /// TCP FIN through the transport. A short bounded [`Swarm::poll_next`]
+    /// then waits for `ConnectionClosed` so callers (and tests) can tell
+    /// `close` did the work rather than [`Drop`]. After this returns, `self`
+    /// is dropped: [`Drop`] repeats disconnect as a no-op for peers already
     /// closing. QUIC transport `Drop` then closes any handshake still in
     /// the connection table (idempotent if already `Closing`). TCP has no
     /// `Drop` close loop — `Transport::close` already removed established
@@ -1220,15 +1221,39 @@ impl Endpoint {
         if let Err(error) = self.shutdown() {
             first_error = Some(error);
         }
+        let expected = self.swarm.connected_peers();
         if let Some(error) = self.disconnect_established()
             && first_error.is_none()
         {
             first_error = Some(error);
         }
-        let events = self.swarm.poll();
+        // QUIC may still be draining after `close()`; wait briefly so the
+        // caller can observe `ConnectionClosed` instead of relying on Drop.
+        let drain_by = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut events = Vec::new();
+        while std::time::Instant::now() < drain_by {
+            let closed_all = expected.iter().all(|peer| {
+                events.iter().any(|event| {
+                    matches!(event, Event::ConnectionClosed { peer_id, .. } if peer_id == peer)
+                })
+            });
+            if closed_all {
+                break;
+            }
+            match self.swarm.poll_next(drain_by) {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) => break,
+                Err(error) => {
+                    return match first_error {
+                        Some(first) => Err(first),
+                        None => Err(error),
+                    };
+                }
+            }
+        }
         match first_error {
             Some(error) => Err(error),
-            None => events,
+            None => Ok(events),
         }
     }
 
