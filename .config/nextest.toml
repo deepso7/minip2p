@@ -1,0 +1,20 @@
+# Integration tests that stand up real endpoints get a concurrency cap.
+#
+# Each of these spawns its own driver threads and then asserts on second-scale
+# deadlines. `cargo test` ran one binary at a time, so a suite effectively had
+# the machine to itself and those deadlines were generous. Under nextest every
+# binary runs at once, and on a 4-vCPU GitHub runner four endpoint tests
+# together starved each other badly enough to break the assumption:
+# `bounded_load_preserves_order_and_accounting` went from 1.3s to 22.5s, and the
+# 5s wait in `two_endpoints_chat_over_loopback` running beside it expired.
+#
+# Capping the group preserves the timing assumptions the tests were written
+# against instead of loosening every deadline to absorb CI scheduling noise — a
+# blown deadline should still mean something is genuinely slow. This covers 99
+# of ~1000 tests; the rest run at full width alongside the group.
+[test-groups]
+endpoint = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = 'kind(test) and (package(minip2p-ffi) or package(minip2p-rs) or package(minip2p-quic) or binary_id(minip2p-tcp::loopback))'
+test-group = 'endpoint'
