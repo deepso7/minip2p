@@ -8,8 +8,17 @@ on:
 permissions:
   contents: read
 
+# A superseded PR run proves nothing: the commit it was checking is already
+# gone. main is never cancelled, so every merged commit keeps a full result.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
+  # Pinned so a nextest release can't change test selection under us. Bump
+  # deliberately, like the other pinned tools below.
+  NEXTEST_VERSION: 0.9.143
 
 jobs:
   docs-site:
@@ -30,6 +39,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.91"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The snippets are their own workspaces; without this they rebuilt
+          # from scratch on every run.
+          workspaces: |
+            docs/snippets/quickstart
+            docs/snippets/custom-stream
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: pnpm install --frozen-lockfile
         working-directory: docs
       - run: pnpm run check
@@ -37,7 +54,10 @@ jobs:
       - run: cargo check --manifest-path docs/snippets/quickstart/Cargo.toml
       - run: cargo check --manifest-path docs/snippets/custom-stream/Cargo.toml
 
-  quality:
+  # Split from `test` so the two run on parallel runners. The feature matrix
+  # grows with every portable backend, and a single serial job grew ~4x in a
+  # month; keeping lint and test apart keeps that growth off the critical path.
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -49,6 +69,11 @@ jobs:
           # unconditionally link std.
           targets: thumbv7em-none-eabi
       - uses: Swatinem/rust-cache@v2
+        with:
+          # PR runs restore main's cache but never save their own: per-branch
+          # saves pushed the repo to the 10 GB ceiling, and the resulting
+          # evictions cost more than the occasional cold PR build.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -72,22 +97,6 @@ jobs:
       - run: cargo check --no-default-features --features smoltcp,pubsub --target thumbv7em-none-eabi -p minip2p-rs
       - run: cargo check --no-default-features --features portable-autonat --target thumbv7em-none-eabi -p minip2p-rs
       - run: cargo check --no-default-features --features portable-relay --target thumbv7em-none-eabi -p minip2p-rs
-      - run: cargo test --workspace
-      - run: cargo test -p minip2p-rs --features nat
-      - run: cargo test -p minip2p-rs --features pubsub
-      - run: cargo test -p minip2p-rs --features nat,pubsub
-      - run: cargo test -p minip2p-rs --features discovery
-      - run: cargo test -p minip2p-rs --features mdns
-      - run: cargo test -p minip2p-rs --features discovery,mdns
-      - run: cargo test -p minip2p-rs --features tcp
-      - run: cargo test -p minip2p-rs --no-default-features --features std,tcp
-      - run: cargo test -p minip2p-rs --features discovery,mdns,tcp
-      - run: cargo test -p minip2p-rs --no-default-features --features smoltcp
-      - run: cargo test -p minip2p-rs --no-default-features --features smoltcp,pubsub
-      - run: cargo test -p minip2p-rs --no-default-features --features portable-autonat
-      - run: cargo test -p minip2p-rs --no-default-features --features portable-relay
-      - run: cargo test -p minip2p-tcp --features smoltcp
-      - run: cargo test -p minip2p-mdns --features smoltcp
       - run: cargo doc --workspace --no-deps
       - run: cargo doc -p minip2p-tcp --features smoltcp --no-deps
       - run: cargo doc -p minip2p-mdns --features smoltcp --no-deps
@@ -97,6 +106,41 @@ jobs:
       - run: cargo doc -p minip2p-rs --no-default-features --features portable-relay --no-deps
       - run: cargo bench -p minip2p-core --bench multiaddr --no-run
 
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # nextest runs every test as its own process across all binaries at once.
+      # `cargo test` runs binaries one at a time, so the ffi relay test — which
+      # waits out QUIC's 30s idle timeout because Linux gives it no ICMP hint
+      # that the relay died — held the runner alone for 40s.
+      - name: Install cargo-nextest
+        run: curl -sSLf "https://get.nexte.st/$NEXTEST_VERSION/linux" | tar zxf - -C "$HOME/.cargo/bin"
+      - run: cargo nextest run --workspace
+      - run: cargo nextest run -p minip2p-rs --features nat
+      - run: cargo nextest run -p minip2p-rs --features pubsub
+      - run: cargo nextest run -p minip2p-rs --features nat,pubsub
+      - run: cargo nextest run -p minip2p-rs --features discovery
+      - run: cargo nextest run -p minip2p-rs --features mdns
+      - run: cargo nextest run -p minip2p-rs --features discovery,mdns
+      - run: cargo nextest run -p minip2p-rs --features tcp
+      - run: cargo nextest run -p minip2p-rs --no-default-features --features std,tcp
+      - run: cargo nextest run -p minip2p-rs --features discovery,mdns,tcp
+      - run: cargo nextest run -p minip2p-rs --no-default-features --features smoltcp
+      - run: cargo nextest run -p minip2p-rs --no-default-features --features smoltcp,pubsub
+      - run: cargo nextest run -p minip2p-rs --no-default-features --features portable-autonat
+      - run: cargo nextest run -p minip2p-rs --no-default-features --features portable-relay
+      - run: cargo nextest run -p minip2p-tcp --features smoltcp
+      - run: cargo nextest run -p minip2p-mdns --features smoltcp
+      # nextest does not run doctests; `cargo test --doc` still owns them.
+      - run: cargo test --workspace --doc
+
   msrv:
     runs-on: ubuntu-latest
     steps:
@@ -105,6 +149,8 @@ jobs:
         with:
           toolchain: "1.91"
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --all-targets
 
   fuzz-smoke:
@@ -121,11 +167,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Swatinem/rust-cache does not cache ~/.cargo/bin, so cargo-fuzz is
-      # rebuilt on every run (~1 min). Pinned --version + --locked keeps the
-      # tool and its dependency tree fully reproducible (same intent as the
-      # pinned nightly above); a bare --locked would still float to whatever
-      # cargo-fuzz release is newest. Bump deliberately.
+      # rebuilt whenever the runner image ships without it. Pinned --version +
+      # --locked keeps the tool and its dependency tree fully reproducible (same
+      # intent as the pinned nightly above); a bare --locked would still float
+      # to whatever cargo-fuzz release is newest. Bump deliberately.
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
       - run: cargo +$NIGHTLY_TOOLCHAIN fuzz run wire_inputs -- -max_total_time=30
       - uses: actions/upload-artifact@v7

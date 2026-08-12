@@ -18,6 +18,12 @@ on:
 permissions:
   contents: read
 
+# Matches ci.yml: a superseded PR run is checking a commit that no longer
+# exists, while main keeps a full result for every merged commit.
+concurrency:
+  group: bindings-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   generated-and-typescript:
     runs-on: ubuntu-latest
@@ -34,6 +40,8 @@ jobs:
           version: "11.18.0"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test

@@ -17,14 +17,16 @@ Additional constraints: `unsafe` is forbidden workspace-wide; sockets, clocks, a
 `just` mirrors CI (`.github/workflows/ci.yml`):
 
 ```bash
-just test          # cargo test + Endpoint feature matrix through TCP, discovery, and mDNS
+just test          # nextest + doctests over the Endpoint feature matrix; needs cargo-nextest
 just clippy        # -D warnings, Endpoint TCP/discovery/mDNS variants, and fuzz/
 just fmt           # also formats fuzz/
 just check-nostd   # all no_std crates on thumbv7em-none-eabi
 just fuzz 30       # needs nightly + cargo-fuzz
 ```
 
-Single test: `cargo test -p minip2p-ping test_name`. Endpoint features:
+Single test: `cargo test -p minip2p-ping test_name` (plain `cargo test` is fine
+for one test; the full matrix uses nextest because it runs every binary's tests
+at once instead of one binary at a time). Endpoint features:
 `cargo test -p minip2p-rs --features tcp` (or `mdns`, `discovery`,
 `discovery,mdns,tcp`; see `justfile` for the full matrix). `fuzz/` is outside the
 workspace — use `--manifest-path fuzz/Cargo.toml`.
