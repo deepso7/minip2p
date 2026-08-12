@@ -58,8 +58,10 @@ test:
     cargo nextest run -p minip2p-rs --no-default-features --features portable-relay
     cargo nextest run -p minip2p-tcp --features smoltcp
     cargo nextest run -p minip2p-mdns --features smoltcp
-    # nextest does not run doctests.
+    # nextest does not run doctests, and --workspace --doc is default-features
+    # only, so feature-gated doctests need their own line.
     cargo test --workspace --doc
+    cargo test -p minip2p-tcp --features smoltcp --doc
 
 check-nostd:
     rustup target add thumbv7em-none-eabi

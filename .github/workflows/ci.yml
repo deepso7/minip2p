@@ -138,8 +138,12 @@ jobs:
       - run: cargo nextest run -p minip2p-rs --no-default-features --features portable-relay
       - run: cargo nextest run -p minip2p-tcp --features smoltcp
       - run: cargo nextest run -p minip2p-mdns --features smoltcp
-      # nextest does not run doctests; `cargo test --doc` still owns them.
+      # nextest does not run doctests, and `--workspace --doc` only builds
+      # default features, so a doctest behind a feature gate needs its own line
+      # here. Today that is just SmoltcpTcpProvider; add a line when there are
+      # more.
       - run: cargo test --workspace --doc
+      - run: cargo test -p minip2p-tcp --features smoltcp --doc
 
   msrv:
     runs-on: ubuntu-latest
