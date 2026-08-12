@@ -1628,6 +1628,11 @@ fn deadline_for_timeout(now: Now, timeout: Duration) -> Deadline {
 
 impl Drop for QuicTransport {
     fn drop(&mut self) {
+        // Backstop for connections that never reached swarm `connected_peers`
+        // (still handshaking). Established peers are closed first by
+        // `Endpoint::close` / `Drop` via `Transport::close`; that leaves them
+        // in `Closing` here until `poll` observes `is_closed()`, so this loop
+        // is intentionally idempotent.
         let ids: Vec<ConnectionId> = self.connections.keys().copied().collect();
         for id in ids {
             let _ = self.close(id);

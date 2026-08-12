@@ -128,6 +128,15 @@ pub type EndpointSwarm = Swarm<EndpointTransport>;
 /// additionally runs the `minip2p_nat::NatAgent` traversal orchestrator:
 /// see `Endpoint::connect`, `Endpoint::wait_path`, and
 /// `Endpoint::take_nat_events`.
+///
+/// # Closing
+///
+/// [`Endpoint::close`] disconnects established peers, flushes close frames,
+/// and consumes the endpoint. Dropping without `close` still disconnects
+/// established peers as a best-effort (errors ignored, no event loop).
+/// Either path notifies a live peer promptly; neither can help after
+/// `kill -9` or a hard network partition — those wait for the transport idle
+/// timeout (30s by default on QUIC).
 pub struct Endpoint {
     swarm: EndpointSwarm,
     #[cfg(feature = "nat")]
@@ -1169,6 +1178,9 @@ impl Endpoint {
     /// mDNS becomes permanently inactive, while QUIC and the rest of the
     /// endpoint remain usable. Every interface send and every cancellation is
     /// attempted; the first mDNS socket error is returned afterwards.
+    ///
+    /// This does **not** close QUIC/TCP peers. Use [`Endpoint::close`] to
+    /// tear the endpoint down, or drop it for a best-effort disconnect.
     #[cfg(feature = "mdns")]
     pub fn shutdown(&mut self) -> Result<(), Error> {
         let result = self
@@ -1184,29 +1196,65 @@ impl Endpoint {
         result
     }
 
-    /// Gracefully closes every established peer and drives the swarm long
-    /// enough to flush transport close frames.
+    /// Gracefully closes established peers, drives close actions once, and
+    /// consumes the endpoint.
     ///
-    /// Called from [`Drop`] so abrupt endpoint teardown notifies long-lived
-    /// listeners instead of leaving their QUIC idle timers to expire.
-    fn graceful_teardown(&mut self) {
-        let peers = self.swarm.connected_peers();
-        for peer in peers {
-            let _ = self.swarm.disconnect(&peer);
+    /// This is the std counterpart of [`crate::PortableEndpoint::shutdown`].
+    /// The method is named `close` because, with the `mdns` feature,
+    /// `shutdown` already sends mDNS goodbyes without tearing down transports.
+    ///
+    /// `disconnect` on each established peer flushes `CONNECTION_CLOSE` /
+    /// TCP FIN through the transport. One non-blocking [`Swarm::poll`] then
+    /// surfaces locally queued close events. After this returns, `self` is
+    /// dropped: [`Drop`] repeats disconnect as a no-op for peers already
+    /// closing. QUIC transport `Drop` then closes any handshake still in
+    /// the connection table (idempotent if already `Closing`). TCP has no
+    /// `Drop` close loop — `Transport::close` already removed established
+    /// connections, and leftover sockets die with the provider.
+    ///
+    /// Does not wait for the remote to acknowledge. A `kill -9` or a hard
+    /// partition still falls through to the transport idle timeout.
+    pub fn close(mut self) -> Result<Vec<Event>, Error> {
+        let mut first_error = None;
+        #[cfg(feature = "mdns")]
+        if let Err(error) = self.shutdown() {
+            first_error = Some(error);
         }
-        for _ in 0..16 {
-            match self.swarm.poll() {
-                Ok(events) if events.is_empty() => break,
-                Err(_) => break,
-                Ok(_) => {}
+        if let Some(error) = self.disconnect_established()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        let events = self.swarm.poll();
+        match first_error {
+            Some(error) => Err(error),
+            None => events,
+        }
+    }
+
+    /// Best-effort close of every peer the swarm has surfaced as connected.
+    ///
+    /// Each [`Swarm::disconnect`] already executes `CloseConnection` against
+    /// the transport, so this is enough to emit QUIC `CONNECTION_CLOSE` /
+    /// TCP FIN. It does not poll, and therefore cannot hang in [`Drop`].
+    fn disconnect_established(&mut self) -> Option<Error> {
+        let mut first_error = None;
+        for peer in self.swarm.connected_peers() {
+            if let Err(error) = self.swarm.disconnect(&peer)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
             }
         }
+        first_error
     }
 }
 
 impl Drop for Endpoint {
     fn drop(&mut self) {
-        self.graceful_teardown();
+        // Errors are ignored: destructors must not panic, and a peer that
+        // is already gone is the common case after [`Endpoint::close`].
+        let _ = self.disconnect_established();
     }
 }
 
