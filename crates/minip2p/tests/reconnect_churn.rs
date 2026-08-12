@@ -9,6 +9,8 @@
 //!
 //! Out of scope: `kill -9` and hard partitions still wait for idle timeout.
 
+#![cfg(feature = "quic")]
+
 use std::time::{Duration, Instant};
 
 use minip2p::{Endpoint, PeerId};
