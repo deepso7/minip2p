@@ -128,6 +128,10 @@ pub type EndpointSwarm = Swarm<EndpointTransport>;
 /// additionally runs the `minip2p_nat::NatAgent` traversal orchestrator:
 /// see `Endpoint::connect`, `Endpoint::wait_path`, and
 /// `Endpoint::take_nat_events`.
+///
+/// [`close`](Self::close) or drop disconnects established peers so a listener
+/// is not left on the QUIC idle timeout. Neither path helps after `kill -9`
+/// or a hard partition.
 pub struct Endpoint {
     swarm: EndpointSwarm,
     #[cfg(feature = "nat")]
@@ -1169,6 +1173,8 @@ impl Endpoint {
     /// mDNS becomes permanently inactive, while QUIC and the rest of the
     /// endpoint remain usable. Every interface send and every cancellation is
     /// attempted; the first mDNS socket error is returned afterwards.
+    ///
+    /// This does not close QUIC/TCP peers; use [`close`](Self::close) or drop.
     #[cfg(feature = "mdns")]
     pub fn shutdown(&mut self) -> Result<(), Error> {
         let result = self
@@ -1182,6 +1188,79 @@ impl Endpoint {
             discovery.shutdown(nat, &mut self.swarm);
         }
         result
+    }
+
+    /// Disconnects established peers, waits briefly until none remain,
+    /// and consumes the endpoint.
+    ///
+    /// Named `close` because `shutdown` is already used for mDNS goodbyes.
+    /// Dropping without `close` still disconnects (errors ignored). Neither
+    /// notifies a peer after `kill -9` or a hard partition. A replacement
+    /// that lands while draining is disconnected too, including a handshake
+    /// still pending when the superseded connection closes.
+    pub fn close(mut self) -> Result<Vec<Event>, Error> {
+        let mut first_error = None;
+        #[cfg(feature = "mdns")]
+        if let Err(error) = self.shutdown() {
+            first_error = Some(error);
+        }
+        let drain_by = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut events = Vec::new();
+        loop {
+            if let Some(error) = self.disconnect_established()
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+            if std::time::Instant::now() >= drain_by {
+                break;
+            }
+            let polled = if self.close_drain_busy() {
+                self.swarm.poll_next(drain_by)
+            } else {
+                self.swarm.poll_next(std::time::Duration::ZERO)
+            };
+            match polled {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) => {
+                    if !self.close_drain_busy() || std::time::Instant::now() >= drain_by {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    return match first_error {
+                        Some(first) => Err(first),
+                        None => Err(error),
+                    };
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(events),
+        }
+    }
+
+    fn close_drain_busy(&self) -> bool {
+        !self.swarm.connected_peers().is_empty() || self.swarm.core().has_tracked_connections()
+    }
+
+    fn disconnect_established(&mut self) -> Option<Error> {
+        let mut first_error = None;
+        for peer in self.swarm.connected_peers() {
+            if let Err(error) = self.swarm.disconnect(&peer)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error
+    }
+}
+
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        let _ = self.disconnect_established();
     }
 }
 

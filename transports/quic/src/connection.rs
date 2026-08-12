@@ -478,6 +478,14 @@ impl QuicConnection {
         pending_datagrams: &mut VecDeque<PendingDatagram>,
         max_pending_datagrams: usize,
     ) -> Result<(), TransportError> {
+        if matches!(
+            self.state,
+            ConnectionState::Closing | ConnectionState::Closed
+        ) {
+            self.flush(socket, pending_datagrams, max_pending_datagrams)?;
+            return Ok(());
+        }
+
         match self.conn.close(true, 0x00, b"bye") {
             Ok(()) | Err(quiche::Error::Done) => {}
             Err(e) => {

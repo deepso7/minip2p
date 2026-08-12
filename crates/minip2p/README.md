@@ -154,6 +154,10 @@ bind is refused rather than built empty.
 `dial` resolves a `/dns*` target and dials one address per family, so a
 dual-stack peer is tried both ways; `dial_ip4` and `dial_ip6` force one.
 
+Dropping a std `Endpoint` (or `Endpoint::close`) disconnects established
+peers. That does not cover `kill -9` or a hard partition; those still wait
+for the QUIC idle timeout. Portable endpoints use explicit `shutdown(now)`.
+
 `minip2p::Error` preserves transport failures, Sans-I/O state rejections, and
 driver-invariant failures as separate variants. Resource limits are
 configurable through `EndpointBuilder::quic_limits` and

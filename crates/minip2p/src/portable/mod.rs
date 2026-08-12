@@ -65,7 +65,8 @@ impl Endpoint {
 /// It performs no blocking and never reads a system clock. Callers drive it
 /// with [`poll`](Self::poll) and may inspect
 /// [`next_deadline`](Self::next_deadline) to decide how long their platform
-/// loop can idle.
+/// loop can idle. Call [`shutdown`](Self::shutdown) to notify peers; there
+/// is no `Drop` disconnect (`into_runtime` moves the runtime out).
 pub struct PortableEndpoint<T: Transport, E: EntropySource> {
     runtime: SwarmRuntime<T, E>,
 }
