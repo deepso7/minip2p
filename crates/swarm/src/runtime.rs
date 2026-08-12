@@ -772,11 +772,8 @@ mod tests {
         /// Protocol frames written after negotiation completed. This is the
         /// wire as the remote peer would see it.
         sent: Vec<(StreamId, Vec<u8>)>,
-        /// How many times [`Transport::close`] was invoked.
         close_count: usize,
-        /// When true, the second and later `close` calls return
-        /// [`TransportError::ConnectionNotFound`], matching TCP after the
-        /// connection has already been removed from the live map.
+        /// Second `close` returns `ConnectionNotFound` (TCP after map removal).
         fail_second_close: bool,
     }
 

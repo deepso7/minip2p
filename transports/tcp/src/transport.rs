@@ -656,12 +656,6 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
     }
 
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
-        // Removes the connection from the live map, so a later close of the
-        // same id is `ConnectionNotFound` (a no-op for Endpoint `close` then
-        // `Drop`). There is no `Drop` impl on this type: Rust forbids extra
-        // trait bounds on `Drop`, and `TcpProvider` is required to flush.
-        // Handshakes that never became established peers are released when
-        // the provider (and its sockets) is dropped.
         let mut connection = self
             .connections
             .remove(&id)

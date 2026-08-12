@@ -478,9 +478,6 @@ impl QuicConnection {
         pending_datagrams: &mut VecDeque<PendingDatagram>,
         max_pending_datagrams: usize,
     ) -> Result<(), TransportError> {
-        // Endpoint Drop disconnects established peers (this path) and then
-        // the transport Drop closes leftovers. A second close must not fail
-        // or send a duplicate CONNECTION_CLOSE; flush anything still queued.
         if matches!(
             self.state,
             ConnectionState::Closing | ConnectionState::Closed

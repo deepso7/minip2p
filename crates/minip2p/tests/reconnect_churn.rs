@@ -1,13 +1,5 @@
-//! Regression coverage for listener state retention when dialers connect and
-//! drop without an explicit `disconnect`.
-//!
-//! The listener advertises the default 30s QUIC idle timeout. After each
-//! dialer is dropped (or `close`d), the listener must reclaim per-peer state
-//! in well under that timeout. That is the spar reconnect-churn-200 failure
-//! mode: missing `CONNECTION_CLOSE` left live quiche connections on the
-//! listener until idle expiry (~40 KB/peer RSS).
-//!
-//! Out of scope: `kill -9` and hard partitions still wait for idle timeout.
+//! Listener must reclaim per-peer state well under the default 30s QUIC idle
+//! timeout after a dialer is dropped or `close`d without `disconnect`.
 
 #![cfg(feature = "quic")]
 
@@ -94,7 +86,6 @@ fn listener_reclaims_state_after_dialer_drop_without_disconnect() {
         wait_peer_ready(&mut listener, &mut dialer, &listener_peer, &dialer_peer);
         ping_until_rtt(&mut listener, &mut dialer, &listener_peer);
 
-        // spar reconnect-churn: drop the dialer without `disconnect()`.
         drop(dialer);
 
         assert_listener_reclaimed(&mut listener, &dialer_peer, round);
@@ -113,8 +104,8 @@ fn listener_reclaims_state_after_dialer_close() {
     wait_peer_ready(&mut listener, &mut dialer, &listener_peer, &dialer_peer);
     ping_until_rtt(&mut listener, &mut dialer, &listener_peer);
 
-    // QUIC close completes only when the peer is driven; otherwise
-    // `close()` would return no events and Drop would do the real work.
+    // Drive the listener so QUIC close can complete; otherwise Drop would
+    // be the only path that notifies the peer.
     let (stop_remote, remote_stop) = std::sync::mpsc::channel();
     let remote = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -152,8 +143,7 @@ fn listener_reclaims_state_after_dialer_drop_during_handshake() {
     let dialer_peer = dialer.peer_id().clone();
     dialer.dial(&listener_addr).expect("dial listener");
 
-    // Exchange a few packets so the listener is likely holding a QUIC
-    // connection, but do not wait for Identify / PeerReady.
+    // Do not wait for Identify; the connection may still be handshaking.
     for _ in 0..8 {
         let _ = listener
             .next_event(Duration::from_millis(10))

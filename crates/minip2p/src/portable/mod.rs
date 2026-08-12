@@ -65,12 +65,8 @@ impl Endpoint {
 /// It performs no blocking and never reads a system clock. Callers drive it
 /// with [`poll`](Self::poll) and may inspect
 /// [`next_deadline`](Self::next_deadline) to decide how long their platform
-/// loop can idle.
-///
-/// Call [`shutdown`](Self::shutdown) to notify established peers before the
-/// endpoint is dropped. There is no `Drop` disconnect: this type offers
-/// [`into_runtime`](Self::into_runtime), and `Drop` cannot `poll` without a
-/// caller [`Now`]. Transport destructors still close leftover sockets.
+/// loop can idle. Call [`shutdown`](Self::shutdown) to notify peers; there
+/// is no `Drop` disconnect (`into_runtime` moves the runtime out).
 pub struct PortableEndpoint<T: Transport, E: EntropySource> {
     runtime: SwarmRuntime<T, E>,
 }
@@ -239,14 +235,6 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// transport releases listeners and in-progress connections as well as
     /// established ones. Every established peer is attempted even if an
     /// earlier close fails. The first close error wins over a later poll error.
-    ///
-    /// Portable endpoints do not implement `Drop` close: [`Self::into_runtime`]
-    /// moves the runtime out, and `Drop` cannot `poll` without a caller
-    /// `Now`. Call `shutdown` before dropping when peers should be notified.
-    /// Transport `Drop` still closes leftover TCP sockets. QUIC is std-only;
-    /// the std `Endpoint` `close`/`Drop` path covers that case.
-    /// Neither this nor std `Drop` can notify a peer after `kill -9` or a
-    /// hard partition — those wait for the transport idle timeout.
     pub fn shutdown(mut self, now: Now) -> Result<Vec<SwarmEvent>, DriverError> {
         let mut first_error = None;
         for peer_id in self.runtime.connected_peers() {
