@@ -1183,6 +1183,31 @@ impl Endpoint {
         }
         result
     }
+
+    /// Gracefully closes every established peer and drives the swarm long
+    /// enough to flush transport close frames.
+    ///
+    /// Called from [`Drop`] so abrupt endpoint teardown notifies long-lived
+    /// listeners instead of leaving their QUIC idle timers to expire.
+    fn graceful_teardown(&mut self) {
+        let peers = self.swarm.connected_peers();
+        for peer in peers {
+            let _ = self.swarm.disconnect(&peer);
+        }
+        for _ in 0..16 {
+            match self.swarm.poll() {
+                Ok(events) if events.is_empty() => break,
+                Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
+}
+
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        self.graceful_teardown();
+    }
 }
 
 #[cfg(feature = "mdns")]

@@ -828,6 +828,15 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
     }
 }
 
+impl<P, E> Drop for TcpTransport<P, E> {
+    fn drop(&mut self) {
+        let ids: Vec<ConnectionId> = self.connections.keys().copied().collect();
+        for id in ids {
+            let _ = self.close(id);
+        }
+    }
+}
+
 /// Wraps a session failure as the stream error the transport contract expects.
 ///
 /// Identifier and state errors pass through: they describe the request rather

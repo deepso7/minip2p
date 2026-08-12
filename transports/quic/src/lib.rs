@@ -1626,6 +1626,16 @@ fn deadline_for_timeout(now: Now, timeout: Duration) -> Deadline {
     now.deadline_after(millis.max(1))
 }
 
+impl Drop for QuicTransport {
+    fn drop(&mut self) {
+        let ids: Vec<ConnectionId> = self.connections.keys().copied().collect();
+        for id in ids {
+            let _ = self.close(id);
+        }
+        let _ = self.flush_pending_datagrams();
+    }
+}
+
 impl BlockingTransport for QuicTransport {
     fn wait_for_input(&mut self, timeout: Duration) -> WaitOutcome {
         // Buffered events are work the host has yet to see; parking on socket
