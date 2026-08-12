@@ -1196,7 +1196,8 @@ impl Endpoint {
     /// Named `close` because `shutdown` is already used for mDNS goodbyes.
     /// Dropping without `close` still disconnects (errors ignored). Neither
     /// notifies a peer after `kill -9` or a hard partition. A replacement
-    /// that lands while draining is disconnected too.
+    /// that lands while draining is disconnected too, including a handshake
+    /// still pending when the superseded connection closes.
     pub fn close(mut self) -> Result<Vec<Event>, Error> {
         let mut first_error = None;
         #[cfg(feature = "mdns")]
@@ -1211,15 +1212,21 @@ impl Endpoint {
             {
                 first_error = Some(error);
             }
-            if self.swarm.connected_peers().is_empty() {
-                break;
-            }
             if std::time::Instant::now() >= drain_by {
                 break;
             }
-            match self.swarm.poll_next(drain_by) {
+            let polled = if self.close_drain_busy() {
+                self.swarm.poll_next(drain_by)
+            } else {
+                self.swarm.poll_next(std::time::Duration::ZERO)
+            };
+            match polled {
                 Ok(Some(event)) => events.push(event),
-                Ok(None) => break,
+                Ok(None) => {
+                    if !self.close_drain_busy() || std::time::Instant::now() >= drain_by {
+                        break;
+                    }
+                }
                 Err(error) => {
                     return match first_error {
                         Some(first) => Err(first),
@@ -1232,6 +1239,10 @@ impl Endpoint {
             Some(error) => Err(error),
             None => Ok(events),
         }
+    }
+
+    fn close_drain_busy(&self) -> bool {
+        !self.swarm.connected_peers().is_empty() || self.swarm.core().has_tracked_connections()
     }
 
     fn disconnect_established(&mut self) -> Option<Error> {

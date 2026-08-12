@@ -612,6 +612,12 @@ impl SwarmCore {
         self.established_peers.iter().cloned().collect()
     }
 
+    /// Returns whether a transport connection is still tracked, including
+    /// inbound handshakes that have not yet emitted [`SwarmEvent::ConnectionEstablished`].
+    pub fn has_tracked_connections(&self) -> bool {
+        !self.conn_to_remote_addr.is_empty()
+    }
+
     /// Returns the latest Identify information received for `peer_id`.
     pub fn peer_info(&self, peer_id: &PeerId) -> Option<&IdentifyMessage> {
         self.peer_info.get(peer_id)
@@ -2501,6 +2507,40 @@ mod tests {
             .position(|output| matches!(output, SwarmOutput::Action(SwarmAction::CloseConnection { conn_id }) if *conn_id == original))
             .expect("transport close action");
         assert!(closed_position < close_action_position);
+    }
+
+    #[test]
+    fn incoming_connection_is_tracked_before_it_is_established() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"pending-handshake-peer");
+        let incoming = ConnectionId::new(22);
+
+        feed(
+            &mut core,
+            TransportEvent::IncomingConnection {
+                id: incoming,
+                endpoint: ConnectionEndpoint::new(loopback_transport()),
+            },
+        );
+
+        assert!(core.has_tracked_connections());
+        assert!(core.connected_peers().is_empty());
+
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: incoming,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+        );
+        let _ = drain_events(&mut core);
+        assert!(core.connected_peers().contains(&peer_id));
+        assert!(core.has_tracked_connections());
+
+        feed(&mut core, TransportEvent::Closed { id: incoming });
+        let _ = drain_events(&mut core);
+        assert!(core.connected_peers().is_empty());
+        assert!(!core.has_tracked_connections());
     }
 
     #[test]
