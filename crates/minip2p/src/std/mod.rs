@@ -1202,19 +1202,33 @@ impl Endpoint {
         if let Err(error) = self.shutdown() {
             first_error = Some(error);
         }
-        let expected = self.swarm.connected_peers();
+        let expected: Vec<(PeerId, ConnectionId)> = self
+            .swarm
+            .connected_peers()
+            .into_iter()
+            .filter_map(|peer| {
+                self.swarm
+                    .core()
+                    .conn_for(&peer)
+                    .map(|conn_id| (peer, conn_id))
+            })
+            .collect();
         if let Some(error) = self.disconnect_established()
             && first_error.is_none()
         {
             first_error = Some(error);
         }
-        // QUIC may still be draining; wait for ConnectionClosed.
+        // Wait for this connection's Closed, not a superseded one for the same peer.
         let drain_by = std::time::Instant::now() + std::time::Duration::from_millis(500);
         let mut events = Vec::new();
         while std::time::Instant::now() < drain_by {
-            let closed_all = expected.iter().all(|peer| {
+            let closed_all = expected.iter().all(|(peer, conn)| {
                 events.iter().any(|event| {
-                    matches!(event, Event::ConnectionClosed { peer_id, .. } if peer_id == peer)
+                    matches!(
+                        event,
+                        Event::ConnectionClosed { peer_id, conn_id }
+                            if peer_id == peer && conn_id == conn
+                    )
                 })
             });
             if closed_all {
