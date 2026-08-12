@@ -1190,48 +1190,31 @@ impl Endpoint {
         result
     }
 
-    /// Disconnects established peers, waits briefly for `ConnectionClosed`,
+    /// Disconnects established peers, waits briefly until none remain,
     /// and consumes the endpoint.
     ///
     /// Named `close` because `shutdown` is already used for mDNS goodbyes.
     /// Dropping without `close` still disconnects (errors ignored). Neither
-    /// notifies a peer after `kill -9` or a hard partition.
+    /// notifies a peer after `kill -9` or a hard partition. A replacement
+    /// that lands while draining is disconnected too.
     pub fn close(mut self) -> Result<Vec<Event>, Error> {
         let mut first_error = None;
         #[cfg(feature = "mdns")]
         if let Err(error) = self.shutdown() {
             first_error = Some(error);
         }
-        let expected: Vec<(PeerId, ConnectionId)> = self
-            .swarm
-            .connected_peers()
-            .into_iter()
-            .filter_map(|peer| {
-                self.swarm
-                    .core()
-                    .conn_for(&peer)
-                    .map(|conn_id| (peer, conn_id))
-            })
-            .collect();
-        if let Some(error) = self.disconnect_established()
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
-        // Wait for this connection's Closed, not a superseded one for the same peer.
         let drain_by = std::time::Instant::now() + std::time::Duration::from_millis(500);
         let mut events = Vec::new();
-        while std::time::Instant::now() < drain_by {
-            let closed_all = expected.iter().all(|(peer, conn)| {
-                events.iter().any(|event| {
-                    matches!(
-                        event,
-                        Event::ConnectionClosed { peer_id, conn_id }
-                            if peer_id == peer && conn_id == conn
-                    )
-                })
-            });
-            if closed_all {
+        loop {
+            if let Some(error) = self.disconnect_established()
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+            if self.swarm.connected_peers().is_empty() {
+                break;
+            }
+            if std::time::Instant::now() >= drain_by {
                 break;
             }
             match self.swarm.poll_next(drain_by) {

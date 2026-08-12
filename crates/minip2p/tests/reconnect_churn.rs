@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use minip2p::{Endpoint, Event, PeerId};
+use minip2p::{Ed25519Keypair, Endpoint, Event, PeerId};
 
 const CHURN_ROUNDS: usize = 50;
 /// Must stay ≪ default `QuicLimits::idle_timeout_ms` (30s).
@@ -155,4 +155,75 @@ fn listener_reclaims_state_after_dialer_drop_during_handshake() {
 
     drop(dialer);
     assert_listener_reclaimed(&mut listener, &dialer_peer, 0);
+}
+
+#[test]
+fn close_drains_replacement_connection() {
+    let mut listener = bind_loopback();
+    let listener_addr = listener.listen().expect("listener listens");
+    let listener_peer = listener.peer_id().clone();
+
+    let dialer_key = Ed25519Keypair::generate();
+    let mut dialer = Endpoint::builder()
+        .identity(dialer_key.clone())
+        .bind_quic("127.0.0.1:0")
+        .expect("bind first dialer");
+    let dialer_peer = dialer.peer_id().clone();
+    dialer.dial(&listener_addr).expect("dial listener");
+    wait_peer_ready(&mut listener, &mut dialer, &listener_peer, &dialer_peer);
+
+    // Queue a same-peer handshake without polling the listener, so close()
+    // is the first drive that can supersede and establish the replacement.
+    let mut replacement = Endpoint::builder()
+        .identity(dialer_key)
+        .bind_quic("127.0.0.1:0")
+        .expect("bind replacement dialer");
+    replacement.dial(&listener_addr).expect("redial listener");
+    for _ in 0..8 {
+        let _ = replacement
+            .next_event(Duration::from_millis(10))
+            .expect("send replacement handshake");
+    }
+
+    let (stop_remote, remote_stop) = std::sync::mpsc::channel();
+    let remote = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if remote_stop.try_recv().is_ok() {
+                break;
+            }
+            let _ = replacement
+                .next_event(Duration::from_millis(10))
+                .expect("drive replacement during close");
+        }
+        replacement
+    });
+
+    let events = listener.close().expect("close drains replacements");
+    let _ = stop_remote.send(());
+    let _replacement = remote.join().expect("replacement driver thread");
+
+    let established: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ConnectionEstablished { peer_id, conn_id } if peer_id == &dialer_peer => {
+                Some(*conn_id)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !established.is_empty(),
+        "close must observe the replacement ConnectionEstablished: {events:?}"
+    );
+    for conn_id in established {
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::ConnectionClosed { peer_id, conn_id: closed }
+                    if peer_id == &dialer_peer && *closed == conn_id
+            )),
+            "close must drain the replacement {conn_id:?}: {events:?}"
+        );
+    }
 }
