@@ -160,6 +160,16 @@ fn relayed_chat_and_reservation_loss() {
                 if peer_id == &a_peer && topic == TOPIC
         )
     });
+    // A is the publisher below, so A's view of B's subscription is what decides
+    // whether the message is forwarded at all. Waiting only on B's view above
+    // lets A publish to nobody and leaves B waiting out the full timeout.
+    a_log.wait_for(|event| {
+        matches!(
+            event,
+            P2pEvent::PeerSubscribed { peer_id, topic }
+                if peer_id == &b_peer && topic == TOPIC
+        )
+    });
 
     a.publish(TOPIC.into(), b"through relay".to_vec())
         .expect("publish over relay");

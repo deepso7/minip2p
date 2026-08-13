@@ -117,9 +117,9 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # nextest runs every test as its own process across all binaries at once.
-      # `cargo test` runs binaries one at a time, so the ffi relay test — which
-      # waits out QUIC's 30s idle timeout because Linux gives it no ICMP hint
-      # that the relay died — held the runner alone for 40s.
+      # `cargo test` runs binaries one at a time, so the ffi relay test held the
+      # runner alone for 40s waiting on relay-loss detection — a wait that costs
+      # under a second on a dev box, so it only ever showed up here.
       - name: Install cargo-nextest
         run: curl -sSLf "https://get.nexte.st/$NEXTEST_VERSION/linux" | tar zxf - -C "$HOME/.cargo/bin"
       - run: cargo nextest run --workspace
