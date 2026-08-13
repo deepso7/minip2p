@@ -40,23 +40,28 @@ clippy:
     cargo clippy -p minip2p-mdns --features smoltcp --all-targets -- -D warnings
     cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
+# Mirrors CI's `test` job. Needs cargo-nextest: https://get.nexte.st
 test:
-    cargo test
-    cargo test -p minip2p-rs --features nat
-    cargo test -p minip2p-rs --features pubsub
-    cargo test -p minip2p-rs --features nat,pubsub
-    cargo test -p minip2p-rs --features discovery
-    cargo test -p minip2p-rs --features mdns
-    cargo test -p minip2p-rs --features discovery,mdns
-    cargo test -p minip2p-rs --features tcp
-    cargo test -p minip2p-rs --no-default-features --features std,tcp
-    cargo test -p minip2p-rs --features discovery,mdns,tcp
-    cargo test -p minip2p-rs --no-default-features --features smoltcp
-    cargo test -p minip2p-rs --no-default-features --features smoltcp,pubsub
-    cargo test -p minip2p-rs --no-default-features --features portable-autonat
-    cargo test -p minip2p-rs --no-default-features --features portable-relay
-    cargo test -p minip2p-tcp --features smoltcp
-    cargo test -p minip2p-mdns --features smoltcp
+    cargo nextest run --workspace
+    cargo nextest run -p minip2p-rs --features nat
+    cargo nextest run -p minip2p-rs --features pubsub
+    cargo nextest run -p minip2p-rs --features nat,pubsub
+    cargo nextest run -p minip2p-rs --features discovery
+    cargo nextest run -p minip2p-rs --features mdns
+    cargo nextest run -p minip2p-rs --features discovery,mdns
+    cargo nextest run -p minip2p-rs --features tcp
+    cargo nextest run -p minip2p-rs --no-default-features --features std,tcp
+    cargo nextest run -p minip2p-rs --features discovery,mdns,tcp
+    cargo nextest run -p minip2p-rs --no-default-features --features smoltcp
+    cargo nextest run -p minip2p-rs --no-default-features --features smoltcp,pubsub
+    cargo nextest run -p minip2p-rs --no-default-features --features portable-autonat
+    cargo nextest run -p minip2p-rs --no-default-features --features portable-relay
+    cargo nextest run -p minip2p-tcp --features smoltcp
+    cargo nextest run -p minip2p-mdns --features smoltcp
+    # nextest does not run doctests, and --workspace --doc is default-features
+    # only, so feature-gated doctests need their own line.
+    cargo test --workspace --doc
+    cargo test -p minip2p-tcp --features smoltcp --doc
 
 check-nostd:
     rustup target add thumbv7em-none-eabi

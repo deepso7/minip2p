@@ -11,6 +11,11 @@ concurrency:
   group: release-${{ github.event.release.tag_name }}
   cancel-in-progress: false
 
+# Every rust-cache below runs with `save-if: false`. These jobs check out a tag,
+# so a save would key on that tag and never be read again — one release's worth
+# of caches was ~3.5 GB against a 10 GB repo ceiling, evicting the main-branch
+# caches that CI actually reuses. Restores still fall back to main.
+
 env:
   CARGO_TERM_COLOR: always
   NODE_VERSION: "24.13.0"
@@ -111,6 +116,8 @@ jobs:
         with:
           toolchain: "1.91"
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
       - name: Test release commit
         run: |
           cargo test --workspace --locked
@@ -159,6 +166,8 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --version 4.1.2 --locked
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
       - run: pnpm install --frozen-lockfile
       - run: pnpm rn:android
       - name: Validate Android ELF alignment and allocator hooks
@@ -212,6 +221,8 @@ jobs:
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
       - run: pnpm install --frozen-lockfile
       - run: pnpm rn:ios
       - name: Validate XCFramework slices
@@ -261,6 +272,8 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
@@ -337,6 +350,8 @@ jobs:
         with:
           toolchain: "1.91"
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
       - name: Authenticate with crates.io
         id: crates-io-auth
         uses: rust-lang/crates-io-auth-action@v1

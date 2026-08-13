@@ -319,6 +319,18 @@ fn two_endpoints_chat_over_loopback() -> Result<(), FfiError> {
             ))
             .is_some()
     );
+    // B is the publisher, so B's view of A's subscription is what decides
+    // whether the message below is forwarded at all. Waiting only on A's view
+    // above lets B publish to nobody and leaves A waiting out the full timeout.
+    assert!(
+        b_log
+            .wait_for(Duration::from_secs(5), |event| matches!(
+                event,
+                P2pEvent::PeerSubscribed { peer_id, topic }
+                    if peer_id == &a_peer && topic == "room"
+            ))
+            .is_some()
+    );
 
     b.publish("room".into(), b"hello from b".to_vec())?;
     assert!(
