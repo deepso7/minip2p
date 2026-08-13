@@ -43,21 +43,21 @@ clippy:
 # Mirrors CI's `test` job. Needs cargo-nextest: https://get.nexte.st
 test:
     cargo nextest run --workspace
-    cargo nextest run -p minip2p-rs --features nat
-    cargo nextest run -p minip2p-rs --features pubsub
-    cargo nextest run -p minip2p-rs --features nat,pubsub
-    cargo nextest run -p minip2p-rs --features discovery
-    cargo nextest run -p minip2p-rs --features mdns
-    cargo nextest run -p minip2p-rs --features discovery,mdns
-    cargo nextest run -p minip2p-rs --features tcp
-    cargo nextest run -p minip2p-rs --no-default-features --features std,tcp
-    cargo nextest run -p minip2p-rs --features discovery,mdns,tcp
-    cargo nextest run -p minip2p-rs --no-default-features --features smoltcp
-    cargo nextest run -p minip2p-rs --no-default-features --features smoltcp,pubsub
-    cargo nextest run -p minip2p-rs --no-default-features --features portable-autonat
-    cargo nextest run -p minip2p-rs --no-default-features --features portable-relay
-    cargo nextest run -p minip2p-tcp --features smoltcp
-    cargo nextest run -p minip2p-mdns --features smoltcp
+    cargo nextest run --profile variants -p minip2p-rs --features nat
+    cargo nextest run --profile variants -p minip2p-rs --features pubsub
+    cargo nextest run --profile variants -p minip2p-rs --features nat,pubsub
+    cargo nextest run --profile variants -p minip2p-rs --features discovery
+    cargo nextest run --profile variants -p minip2p-rs --features mdns
+    cargo nextest run --profile variants -p minip2p-rs --features discovery,mdns
+    cargo nextest run --profile variants -p minip2p-rs --features tcp
+    cargo nextest run --profile variants -p minip2p-rs --no-default-features --features std,tcp
+    cargo nextest run --profile variants -p minip2p-rs --features discovery,mdns,tcp
+    cargo nextest run --profile variants -p minip2p-rs --no-default-features --features smoltcp
+    cargo nextest run --profile variants -p minip2p-rs --no-default-features --features smoltcp,pubsub
+    cargo nextest run --profile variants -p minip2p-rs --no-default-features --features portable-autonat
+    cargo nextest run --profile variants -p minip2p-rs --no-default-features --features portable-relay
+    cargo nextest run --profile variants -p minip2p-tcp --features smoltcp
+    cargo nextest run --profile variants -p minip2p-mdns --features smoltcp
     # nextest does not run doctests, and --workspace --doc is default-features
     # only, so feature-gated doctests need their own line.
     cargo test --workspace --doc

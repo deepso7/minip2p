@@ -1,0 +1,22 @@
+# The `variants` profile drops one test: the reconnect-churn soak.
+#
+# It is gated on `quic` alone and does 50 connect/handshake/drop rounds to guard
+# the listener-state leak fix, so it costs ~14s and the rounds are the point —
+# shortening it would blunt what it was written to catch. The workspace run
+# covers it under default features, which is the only configuration it is gated
+# on. Re-running it once per Endpoint feature variant added ~133s per CI run for
+# no extra coverage: none of nat, pubsub, discovery, mdns, or tcp touch QUIC
+# listener state.
+#
+# The filter names that one test rather than its binary. The other four tests in
+# reconnect_churn cost ~1s combined, and the variants do enable QUIC, so
+# excluding the whole binary would drop real coverage to save a second.
+#
+# Feature variants run under this profile; the workspace run does not.
+[profile.variants]
+default-filter = '''
+  not (
+    binary_id(minip2p-rs::reconnect_churn)
+    and test(=listener_reclaims_state_after_dialer_drop_without_disconnect)
+  )
+'''
