@@ -1,6 +1,6 @@
 {
   "name": "@minip2p/core",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Platform-neutral TypeScript SDK for minip2p",
   "keywords": [
     "libp2p",

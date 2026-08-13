@@ -25,7 +25,7 @@ Install minip2p:
 
 ```toml
 [dependencies]
-minip2p-rs = "0.4.0"
+minip2p-rs = "0.4.1"
 ```
 
 Then create an endpoint:
@@ -61,7 +61,7 @@ QUIC is the default. Turn on the `tcp` feature to listen on TCP as well, or
 TCP only. The dial address picks the transport:
 
 ```toml
-minip2p-rs = { version = "0.4.0", features = ["tcp"] }
+minip2p-rs = { version = "0.4.1", features = ["tcp"] }
 ```
 
 ```rust
