@@ -123,21 +123,21 @@ jobs:
       - name: Install cargo-nextest
         run: curl -sSLf "https://get.nexte.st/$NEXTEST_VERSION/linux" | tar zxf - -C "$HOME/.cargo/bin"
       - run: cargo nextest run --workspace
-      - run: cargo nextest run -p minip2p-rs --features nat
-      - run: cargo nextest run -p minip2p-rs --features pubsub
-      - run: cargo nextest run -p minip2p-rs --features nat,pubsub
-      - run: cargo nextest run -p minip2p-rs --features discovery
-      - run: cargo nextest run -p minip2p-rs --features mdns
-      - run: cargo nextest run -p minip2p-rs --features discovery,mdns
-      - run: cargo nextest run -p minip2p-rs --features tcp
-      - run: cargo nextest run -p minip2p-rs --no-default-features --features std,tcp
-      - run: cargo nextest run -p minip2p-rs --features discovery,mdns,tcp
-      - run: cargo nextest run -p minip2p-rs --no-default-features --features smoltcp
-      - run: cargo nextest run -p minip2p-rs --no-default-features --features smoltcp,pubsub
-      - run: cargo nextest run -p minip2p-rs --no-default-features --features portable-autonat
-      - run: cargo nextest run -p minip2p-rs --no-default-features --features portable-relay
-      - run: cargo nextest run -p minip2p-tcp --features smoltcp
-      - run: cargo nextest run -p minip2p-mdns --features smoltcp
+      - run: cargo nextest run --profile variants -p minip2p-rs --features nat
+      - run: cargo nextest run --profile variants -p minip2p-rs --features pubsub
+      - run: cargo nextest run --profile variants -p minip2p-rs --features nat,pubsub
+      - run: cargo nextest run --profile variants -p minip2p-rs --features discovery
+      - run: cargo nextest run --profile variants -p minip2p-rs --features mdns
+      - run: cargo nextest run --profile variants -p minip2p-rs --features discovery,mdns
+      - run: cargo nextest run --profile variants -p minip2p-rs --features tcp
+      - run: cargo nextest run --profile variants -p minip2p-rs --no-default-features --features std,tcp
+      - run: cargo nextest run --profile variants -p minip2p-rs --features discovery,mdns,tcp
+      - run: cargo nextest run --profile variants -p minip2p-rs --no-default-features --features smoltcp
+      - run: cargo nextest run --profile variants -p minip2p-rs --no-default-features --features smoltcp,pubsub
+      - run: cargo nextest run --profile variants -p minip2p-rs --no-default-features --features portable-autonat
+      - run: cargo nextest run --profile variants -p minip2p-rs --no-default-features --features portable-relay
+      - run: cargo nextest run --profile variants -p minip2p-tcp --features smoltcp
+      - run: cargo nextest run --profile variants -p minip2p-mdns --features smoltcp
       # nextest does not run doctests, and `--workspace --doc` only builds
       # default features, so a doctest behind a feature gate needs its own line
       # here. Today that is just SmoltcpTcpProvider; add a line when there are
