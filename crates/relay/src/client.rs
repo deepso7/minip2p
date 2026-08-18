@@ -5,9 +5,9 @@ use minip2p_core::SansIoProtocol;
 
 use crate::RelayError;
 use crate::{
-    FrameDecode, HopMessage, HopMessageType, Limit, Peer, RelayMessageError, Reservation, Status,
-    StopMessage, StopMessageType, checked_outbound_frame, decode_frame, describe_status,
-    encode_frame, enforce_max_size,
+    FrameDecode, HopMessage, HopMessageType, Limit, MAX_PENDING_BRIDGE_SIZE, Peer,
+    RelayMessageError, Reservation, Status, StopMessage, StopMessageType, checked_outbound_frame,
+    decode_frame, describe_status, encode_frame, enforce_max_size,
 };
 #[cfg(test)]
 use crate::{MAX_FRAME_PREFIX_LEN, MAX_MESSAGE_SIZE};
@@ -559,6 +559,11 @@ pub enum StopResponderOutput {
 /// 4. Send resulting [`StopResponderOutput::Outbound`] bytes to the relay.
 /// 5. If accepted, the stream becomes the bridged circuit; drain
 ///    [`StopResponderOutput::BridgeData`] for any pipelined bytes.
+///
+/// Pause stream reads after the request output until supplying the decision.
+/// Additional data returns [`RelayError::DecisionPending`] without retention.
+/// Payload coalesced with CONNECT is capped by [`MAX_PENDING_BRIDGE_SIZE`]; a
+/// larger pending payload returns [`RelayError::PendingBridgeTooLarge`].
 pub struct StopResponder {
     outbound: Vec<u8>,
     recv_buf: Vec<u8>,
@@ -600,9 +605,9 @@ impl StopResponder {
     }
 
     /// Feeds incoming stream bytes from the relay.
-    fn on_data(&mut self, data: &[u8]) -> Result<(), RelayError> {
+    fn on_data(&mut self, mut data: Vec<u8>) -> Result<(), RelayError> {
         if self.state == StopState::Bridged {
-            self.bridge_bytes.extend_from_slice(data);
+            self.bridge_bytes.append(&mut data);
             return Ok(());
         }
 
@@ -610,7 +615,15 @@ impl StopResponder {
             return Ok(());
         }
 
-        self.recv_buf.extend_from_slice(data);
+        if self.state == StopState::AwaitingDecision {
+            return Err(RelayError::DecisionPending);
+        }
+
+        if self.recv_buf.is_empty() {
+            self.recv_buf = data;
+        } else {
+            self.recv_buf.append(&mut data);
+        }
         self.try_decode_connect()
     }
 
@@ -711,6 +724,12 @@ impl StopResponder {
                 return Err(RelayError::Malformed(RelayMessageError::Varint(e)));
             }
         };
+        let pending_len = self.recv_buf.len() - consumed;
+        if pending_len > MAX_PENDING_BRIDGE_SIZE {
+            self.recv_buf.clear();
+            self.state = StopState::Done;
+            return Err(RelayError::PendingBridgeTooLarge { len: pending_len });
+        }
         self.recv_buf.drain(..consumed);
 
         if msg.kind != StopMessageType::Connect {
@@ -746,7 +765,7 @@ impl SansIoProtocol for StopResponder {
     fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
         match input {
             StopResponderInput::Flush => {}
-            StopResponderInput::Data(data) => self.on_data(&data)?,
+            StopResponderInput::Data(data) => self.on_data(data)?,
             StopResponderInput::RemoteWriteClosed => self.on_remote_write_closed()?,
             StopResponderInput::Accept => self.accept()?,
             StopResponderInput::Reject(status) => self.reject(status)?,
@@ -1169,7 +1188,7 @@ mod tests {
             }),
             status: None,
         });
-        flow.on_data(&connect).unwrap();
+        flow.on_data(connect).unwrap();
 
         // We should now have a pending request.
         let request = flow.request().expect("request should be populated");
@@ -1187,7 +1206,7 @@ mod tests {
         assert_eq!(response.status, Some(Status::Ok));
 
         // Subsequent data is bridged.
-        flow.on_data(b"relayed-peer-traffic").unwrap();
+        flow.on_data(b"relayed-peer-traffic".to_vec()).unwrap();
         assert_eq!(flow.take_bridge_bytes(), b"relayed-peer-traffic");
     }
 
@@ -1205,7 +1224,7 @@ mod tests {
             status: None,
         });
         packet.extend_from_slice(b"pipelined-bytes");
-        flow.on_data(&packet).unwrap();
+        flow.on_data(packet).unwrap();
         flow.accept().unwrap();
 
         assert_eq!(flow.take_bridge_bytes(), b"pipelined-bytes");
@@ -1224,7 +1243,7 @@ mod tests {
             limit: None,
             status: None,
         });
-        flow.on_data(&connect).unwrap();
+        flow.on_data(connect).unwrap();
         flow.reject(Status::ConnectionFailed).unwrap();
 
         let outbound = flow.take_outbound();
@@ -1252,7 +1271,7 @@ mod tests {
             limit: None,
             status: None,
         });
-        let err = flow.on_data(&connect).unwrap_err();
+        let err = flow.on_data(connect).unwrap_err();
         assert!(matches!(err, RelayError::UnexpectedMessage(_)));
     }
 
@@ -1265,7 +1284,7 @@ mod tests {
             limit: None,
             status: Some(Status::Ok),
         });
-        let err = flow.on_data(&msg).unwrap_err();
+        let err = flow.on_data(msg).unwrap_err();
         assert!(matches!(err, RelayError::UnexpectedMessage(_)));
     }
 
@@ -1284,7 +1303,7 @@ mod tests {
         });
 
         for byte in &connect {
-            flow.on_data(&[*byte]).unwrap();
+            flow.on_data(vec![*byte]).unwrap();
         }
 
         assert!(flow.request().is_some());

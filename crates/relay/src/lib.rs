@@ -52,8 +52,8 @@ pub const STOP_PROTOCOL_ID: &str = "/libp2p/circuit/relay/0.2.0/stop";
 /// are protocol violations and cause relay-side machines to request a reset.
 pub const MAX_MESSAGE_SIZE: usize = 8192;
 
-/// Maximum application payload retained with a HOP CONNECT while its service
-/// decision is pending: 64 KiB.
+/// Maximum application payload retained with a HOP or STOP CONNECT while its
+/// service decision is pending: 64 KiB.
 ///
 /// This is a pre-authorization memory bound, not a circuit data limit. Once a
 /// CONNECT is accepted, bridge data is streamed without this restriction.
@@ -79,10 +79,15 @@ pub enum RelayError {
     UnexpectedMessage(String),
     /// Stream input arrived while a relay-side service decision was pending.
     ///
-    /// The driver must pause reads after receiving a HOP request and resume
+    /// The driver must pause reads after receiving a relay request and resume
     /// them only after providing the accept or reject decision.
-    #[error("HOP stream input must pause while a service decision is pending")]
+    #[error("relay stream input must pause while a service decision is pending")]
     DecisionPending,
+    /// CONNECT payload coalesced before authorization exceeded the memory cap.
+    #[error(
+        "pending relay bridge payload exceeds maximum size ({len} > {MAX_PENDING_BRIDGE_SIZE})"
+    )]
+    PendingBridgeTooLarge { len: usize },
 }
 
 /// Longest length prefix a legal frame can carry.

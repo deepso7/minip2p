@@ -5,7 +5,8 @@ use minip2p_relay::{
     HopMessage, HopMessageType, HopRequest, HopResponder, HopResponderInput, HopResponderOutput,
     Limit, MAX_MESSAGE_SIZE, MAX_PENDING_BRIDGE_SIZE, Peer, RelayError, RelayMessageError,
     Reservation, Status, StopInitiator, StopInitiatorInput, StopInitiatorOutcome,
-    StopInitiatorOutput, StopMessage, StopMessageType, decode_frame, encode_frame,
+    StopInitiatorOutput, StopMessage, StopMessageType, StopResponder, StopResponderInput,
+    StopResponderOutput, decode_frame, encode_frame,
 };
 
 fn peer() -> PeerId {
@@ -304,6 +305,67 @@ fn stop_initiator_sends_connect_then_accepts_with_pipelined_payload() {
         ))
     );
     assert!(initiator.is_done());
+}
+
+#[test]
+fn stop_responder_bounds_and_backpressures_pre_authorization_payload() {
+    let connect_frame = || {
+        stop_frame(StopMessage {
+            kind: StopMessageType::Connect,
+            peer: Some(Peer {
+                id: peer().to_bytes(),
+                addrs: Vec::new(),
+            }),
+            limit: None,
+            status: None,
+        })
+    };
+
+    let mut pending = StopResponder::new();
+    pending
+        .handle_input(StopResponderInput::Data(connect_frame()))
+        .unwrap();
+    assert!(matches!(
+        pending.poll_output(),
+        Some(StopResponderOutput::Request(_))
+    ));
+    assert_eq!(
+        pending.handle_input(StopResponderInput::Data(b"later payload".to_vec())),
+        Err(RelayError::DecisionPending)
+    );
+
+    let mut oversized_input = connect_frame();
+    oversized_input.resize(oversized_input.len() + MAX_PENDING_BRIDGE_SIZE + 1, 0xaa);
+    let mut oversized = StopResponder::new();
+    assert_eq!(
+        oversized.handle_input(StopResponderInput::Data(oversized_input)),
+        Err(RelayError::PendingBridgeTooLarge {
+            len: MAX_PENDING_BRIDGE_SIZE + 1
+        })
+    );
+    assert!(oversized.is_done());
+    assert!(oversized.poll_output().is_none());
+
+    let mut exact_input = connect_frame();
+    exact_input.resize(exact_input.len() + MAX_PENDING_BRIDGE_SIZE, 0xbb);
+    let mut exact = StopResponder::new();
+    exact
+        .handle_input(StopResponderInput::Data(exact_input))
+        .unwrap();
+    assert!(matches!(
+        exact.poll_output(),
+        Some(StopResponderOutput::Request(_))
+    ));
+    exact.handle_input(StopResponderInput::Accept).unwrap();
+    assert!(matches!(
+        exact.poll_output(),
+        Some(StopResponderOutput::Outbound(_))
+    ));
+    assert!(matches!(
+        exact.poll_output(),
+        Some(StopResponderOutput::BridgeData(data))
+            if data.len() == MAX_PENDING_BRIDGE_SIZE
+    ));
 }
 
 #[test]
