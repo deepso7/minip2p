@@ -24,7 +24,7 @@ Those service responsibilities belong above these reusable wire machines.
 
 Each machine is driven through `SansIoProtocol`: feed its role-specific inputs and drain outputs until idle. A valid request is always emitted before outputs caused by its decision. Bytes pipelined behind an accepted HOP request or STOP response are retained and emitted as bridge data only after the final `STATUS:OK` frame.
 
-Relay-side malformed handling is deterministic. A complete, well-framed message with a wrong kind or missing/invalid required field receives `UNEXPECTED_MESSAGE` or `MALFORMED_MESSAGE`, followed by a local write close. Invalid varint framing, declarations over the limit, and locally constructed responses that cannot fit request a stream reset. Remote close/reset inputs leave the machines in deterministic terminal states; `StopInitiatorOutcome` maps pre-accept closure/reset to `CONNECTION_FAILED`.
+Relay-side malformed handling is deterministic. A complete, well-framed message with a wrong kind or missing/invalid required field receives `UNEXPECTED_MESSAGE` or `MALFORMED_MESSAGE`, followed by a local write close. Invalid varint framing, declarations over the limit, and locally constructed responses that cannot fit request a stream reset. A remote write close preserves a complete request and queued handshake/bridge outputs; a HOP reset discards them. `StopInitiatorOutcome` maps close/reset before a complete STOP response to `CONNECTION_FAILED`. After decoding a STOP response, a close preserves all preceding outputs; a reset preserves semantic outcome/bridge outputs but discards unsent transport actions.
 
 ## Protocol IDs
 

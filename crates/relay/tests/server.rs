@@ -42,6 +42,15 @@ fn decoder_distinguishes_absent_and_invalid_types_and_connect_peers() {
     let invalid_peer = HopMessage::decode(&[0x08, 0x01, 0x12, 0x03, 0x0a, 0x01, 0xff]).unwrap();
     assert_eq!(missing_peer.peer, None);
     assert_eq!(invalid_peer.peer.unwrap().id, [0xff]);
+
+    assert_eq!(
+        StopMessage::decode(&[]),
+        Err(RelayMessageError::MissingType)
+    );
+    assert_eq!(
+        StopMessage::decode(&[0x08, 99]),
+        Err(RelayMessageError::InvalidMessageType { value: 99 })
+    );
 }
 
 fn hop_frame(message: HopMessage) -> Vec<u8> {
@@ -261,6 +270,92 @@ fn hop_connect_bounds_only_pre_authorization_pipelined_data() {
         exact.poll_output(),
         Some(HopResponderOutput::BridgeData(live_data))
     );
+
+    let mut malformed_input = hop_frame(HopMessage {
+        kind: HopMessageType::Connect,
+        peer: None,
+        reservation: None,
+        limit: None,
+        status: None,
+    });
+    malformed_input.resize(malformed_input.len() + MAX_PENDING_BRIDGE_SIZE + 1, 0xdd);
+    let mut malformed = HopResponder::new();
+    malformed
+        .handle_input(HopResponderInput::Data(malformed_input))
+        .unwrap();
+    assert_eq!(malformed.poll_output(), Some(HopResponderOutput::Reset));
+    assert!(malformed.poll_output().is_none());
+}
+
+#[test]
+fn hop_responder_rejects_invalid_local_decisions() {
+    let reserve = || {
+        hop_frame(HopMessage {
+            kind: HopMessageType::Reserve,
+            peer: None,
+            reservation: None,
+            limit: None,
+            status: None,
+        })
+    };
+
+    for status in [Status::Ok, Status::Unused] {
+        let mut responder = HopResponder::new();
+        responder
+            .handle_input(HopResponderInput::Data(reserve()))
+            .unwrap();
+        assert_eq!(
+            responder.poll_output(),
+            Some(HopResponderOutput::Request(HopRequest::Reserve))
+        );
+        responder
+            .handle_input(HopResponderInput::Reject(status))
+            .unwrap();
+        assert_eq!(responder.poll_output(), Some(HopResponderOutput::Reset));
+        assert!(responder.poll_output().is_none());
+    }
+
+    let mut idle_connect = HopResponder::new();
+    assert!(matches!(
+        idle_connect.handle_input(HopResponderInput::AcceptConnect { limit: None }),
+        Err(RelayError::UnexpectedMessage(_))
+    ));
+    assert!(idle_connect.poll_output().is_none());
+
+    let mut idle_reservation = HopResponder::new();
+    assert!(matches!(
+        idle_reservation.handle_input(HopResponderInput::AcceptReservation {
+            reservation: Reservation {
+                expire: None,
+                addrs: Vec::new(),
+                voucher: None,
+            },
+            limit: None,
+        }),
+        Err(RelayError::UnexpectedMessage(_))
+    ));
+    assert!(idle_reservation.poll_output().is_none());
+
+    let mut idle_reject = HopResponder::new();
+    assert!(matches!(
+        idle_reject.handle_input(HopResponderInput::Reject(Status::ReservationRefused)),
+        Err(RelayError::UnexpectedMessage(_))
+    ));
+    assert!(idle_reject.poll_output().is_none());
+
+    let mut wrong_kind = HopResponder::new();
+    wrong_kind
+        .handle_input(HopResponderInput::Data(reserve()))
+        .unwrap();
+    assert_eq!(
+        wrong_kind.poll_output(),
+        Some(HopResponderOutput::Request(HopRequest::Reserve))
+    );
+    assert!(matches!(
+        wrong_kind.handle_input(HopResponderInput::AcceptConnect { limit: None }),
+        Err(RelayError::UnexpectedMessage(_))
+    ));
+    assert!(wrong_kind.poll_output().is_none());
 }
 
 #[test]
@@ -332,6 +427,20 @@ fn stop_responder_bounds_and_backpressures_pre_authorization_payload() {
     assert_eq!(
         pending.handle_input(StopResponderInput::Data(b"later payload".to_vec())),
         Err(RelayError::DecisionPending)
+    );
+    pending.handle_input(StopResponderInput::Accept).unwrap();
+    assert!(matches!(
+        pending.poll_output(),
+        Some(StopResponderOutput::Outbound(_))
+    ));
+    assert!(pending.poll_output().is_none());
+    let live_data = vec![0xcc; MAX_PENDING_BRIDGE_SIZE + 1];
+    pending
+        .handle_input(StopResponderInput::Data(live_data.clone()))
+        .unwrap();
+    assert_eq!(
+        pending.poll_output(),
+        Some(StopResponderOutput::BridgeData(live_data))
     );
 
     let mut oversized_input = connect_frame();
@@ -528,41 +637,33 @@ fn hop_responder_accepts_fragmented_and_exact_limit_frames() {
 
 #[test]
 fn stop_refusal_preserves_exact_status_and_maps_unexpected_codes_for_hop() {
-    let mut initiator = StopInitiator::new(peer(), None);
-    let _ = initiator.poll_output();
-    initiator
-        .handle_input(StopInitiatorInput::Data(stop_frame(StopMessage {
-            kind: StopMessageType::Status,
-            peer: None,
-            limit: None,
-            status: Some(Status::Unknown(777)),
-        })))
-        .unwrap();
-
-    let Some(StopInitiatorOutput::Outcome(outcome)) = initiator.poll_output() else {
-        panic!("expected refusal outcome");
-    };
-    assert_eq!(
-        outcome,
-        StopInitiatorOutcome::Refused {
-            status: Status::Unknown(777)
-        }
-    );
-    assert_eq!(outcome.hop_status(), Status::UnexpectedMessage);
-
     for (stop_status, hop_status) in [
+        (Status::Unknown(777), Status::UnexpectedMessage),
         (Status::ResourceLimitExceeded, Status::ResourceLimitExceeded),
         (Status::PermissionDenied, Status::PermissionDenied),
         (Status::ConnectionFailed, Status::UnexpectedMessage),
         (Status::NoReservation, Status::UnexpectedMessage),
     ] {
+        let mut initiator = StopInitiator::new(peer(), None);
+        let _ = initiator.poll_output();
+        initiator
+            .handle_input(StopInitiatorInput::Data(stop_frame(StopMessage {
+                kind: StopMessageType::Status,
+                peer: None,
+                limit: None,
+                status: Some(stop_status),
+            })))
+            .unwrap();
+        let Some(StopInitiatorOutput::Outcome(outcome)) = initiator.poll_output() else {
+            panic!("expected refusal outcome");
+        };
         assert_eq!(
+            outcome,
             StopInitiatorOutcome::Refused {
-                status: stop_status
+                status: stop_status,
             }
-            .hop_status(),
-            hop_status
         );
+        assert_eq!(outcome.hop_status(), hop_status);
     }
 }
 
@@ -611,6 +712,18 @@ fn stop_semantic_error_sends_status_and_closes_while_bad_framing_resets() {
         decode_stop_frame(&frame).status,
         Some(Status::UnexpectedMessage)
     );
+    assert_eq!(
+        wrong_kind.poll_output(),
+        Some(StopInitiatorOutput::CloseWrite)
+    );
+    assert_eq!(
+        wrong_kind.poll_output(),
+        Some(StopInitiatorOutput::Outcome(
+            StopInitiatorOutcome::ProtocolError {
+                status: Status::UnexpectedMessage,
+            }
+        ))
+    );
 
     let mut invalid = StopInitiator::new(peer(), None);
     let _ = invalid.poll_output();
@@ -618,6 +731,57 @@ fn stop_semantic_error_sends_status_and_closes_while_bad_framing_resets() {
         .handle_input(StopInitiatorInput::Data(vec![0x81, 0x40]))
         .unwrap();
     assert_eq!(invalid.poll_output(), Some(StopInitiatorOutput::Reset));
+    assert_eq!(
+        invalid.poll_output(),
+        Some(StopInitiatorOutput::Outcome(
+            StopInitiatorOutcome::ProtocolError {
+                status: Status::MalformedMessage,
+            }
+        ))
+    );
+
+    let mut missing_type = StopInitiator::new(peer(), None);
+    let _ = missing_type.poll_output();
+    missing_type
+        .handle_input(StopInitiatorInput::Data(encode_frame(&[])))
+        .unwrap();
+    let Some(StopInitiatorOutput::Outbound(frame)) = missing_type.poll_output() else {
+        panic!("expected MALFORMED_MESSAGE response");
+    };
+    assert_eq!(
+        decode_stop_frame(&frame).status,
+        Some(Status::MalformedMessage)
+    );
+    assert_eq!(
+        missing_type.poll_output(),
+        Some(StopInitiatorOutput::CloseWrite)
+    );
+    assert_eq!(
+        missing_type.poll_output(),
+        Some(StopInitiatorOutput::Outcome(
+            StopInitiatorOutcome::ProtocolError {
+                status: Status::MalformedMessage,
+            }
+        ))
+    );
+
+    let mut invalid_varint = StopInitiator::new(peer(), None);
+    let _ = invalid_varint.poll_output();
+    invalid_varint
+        .handle_input(StopInitiatorInput::Data(vec![0x80; 10]))
+        .unwrap();
+    assert_eq!(
+        invalid_varint.poll_output(),
+        Some(StopInitiatorOutput::Reset)
+    );
+    assert_eq!(
+        invalid_varint.poll_output(),
+        Some(StopInitiatorOutput::Outcome(
+            StopInitiatorOutcome::ProtocolError {
+                status: Status::MalformedMessage,
+            }
+        ))
+    );
 }
 
 #[test]
@@ -634,6 +798,7 @@ fn remote_close_and_reset_make_both_machines_terminal() {
         .handle_input(HopResponderInput::RemoteReset)
         .unwrap();
     assert!(hop_reset.is_done());
+    assert!(hop_reset.poll_output().is_none());
 
     let mut stop_closed = StopInitiator::new(peer(), None);
     let _ = stop_closed.poll_output();
@@ -665,7 +830,7 @@ fn remote_close_and_reset_make_both_machines_terminal() {
 }
 
 #[test]
-fn remote_termination_discards_queued_and_future_data() {
+fn hop_remote_reset_discards_queued_and_future_data() {
     let request = hop_frame(HopMessage {
         kind: HopMessageType::Connect,
         peer: Some(Peer {
@@ -685,34 +850,6 @@ fn remote_termination_discards_queued_and_future_data() {
         .unwrap();
     assert!(hop.poll_output().is_none());
 
-    let mut closed_hop = HopResponder::new();
-    closed_hop
-        .handle_input(HopResponderInput::Data(hop_frame(HopMessage {
-            kind: HopMessageType::Reserve,
-            peer: None,
-            reservation: None,
-            limit: None,
-            status: None,
-        })))
-        .unwrap();
-    closed_hop
-        .handle_input(HopResponderInput::RemoteWriteClosed)
-        .unwrap();
-    assert!(closed_hop.poll_output().is_none());
-
-    let mut stop = StopInitiator::new(peer(), None);
-    stop.handle_input(StopInitiatorInput::Data(stop_frame(StopMessage {
-        kind: StopMessageType::Status,
-        peer: None,
-        limit: None,
-        status: Some(Status::Ok),
-    })))
-    .unwrap();
-    stop.handle_input(StopInitiatorInput::RemoteReset).unwrap();
-    stop.handle_input(StopInitiatorInput::Data(b"stale".to_vec()))
-        .unwrap();
-    assert!(stop.poll_output().is_none());
-
     let mut pending_stop = StopInitiator::new(peer(), None);
     pending_stop
         .handle_input(StopInitiatorInput::RemoteReset)
@@ -724,18 +861,169 @@ fn remote_termination_discards_queued_and_future_data() {
         ))
     );
     assert!(pending_stop.poll_output().is_none());
+}
 
-    let mut closed_stop = StopInitiator::new(peer(), None);
-    closed_stop
+#[test]
+fn hop_remote_write_close_preserves_pending_request_and_payload() {
+    let mut request = hop_frame(HopMessage {
+        kind: HopMessageType::Connect,
+        peer: Some(Peer {
+            id: peer().to_bytes(),
+            addrs: Vec::new(),
+        }),
+        reservation: None,
+        limit: None,
+        status: None,
+    });
+    request.extend_from_slice(b"source payload");
+    let mut hop = HopResponder::new();
+    hop.handle_input(HopResponderInput::Data(request)).unwrap();
+    hop.handle_input(HopResponderInput::RemoteWriteClosed)
+        .unwrap();
+    assert!(matches!(
+        hop.poll_output(),
+        Some(HopResponderOutput::Request(HopRequest::Connect { .. }))
+    ));
+    hop.handle_input(HopResponderInput::AcceptConnect { limit: None })
+        .unwrap();
+    assert!(matches!(
+        hop.poll_output(),
+        Some(HopResponderOutput::Outbound(_))
+    ));
+    assert_eq!(
+        hop.poll_output(),
+        Some(HopResponderOutput::BridgeData(b"source payload".to_vec()))
+    );
+    hop.handle_input(HopResponderInput::Data(b"after eof".to_vec()))
+        .unwrap();
+    assert!(hop.poll_output().is_none());
+
+    let mut accepted = HopResponder::new();
+    accepted
+        .handle_input(HopResponderInput::Data(hop_frame(HopMessage {
+            kind: HopMessageType::Connect,
+            peer: Some(Peer {
+                id: peer().to_bytes(),
+                addrs: Vec::new(),
+            }),
+            reservation: None,
+            limit: None,
+            status: None,
+        })))
+        .unwrap();
+    accepted
+        .handle_input(HopResponderInput::AcceptConnect { limit: None })
+        .unwrap();
+    accepted
+        .handle_input(HopResponderInput::RemoteWriteClosed)
+        .unwrap();
+    assert!(matches!(
+        accepted.poll_output(),
+        Some(HopResponderOutput::Request(HopRequest::Connect { .. }))
+    ));
+    assert!(matches!(
+        accepted.poll_output(),
+        Some(HopResponderOutput::Outbound(_))
+    ));
+    assert!(accepted.poll_output().is_none());
+}
+
+#[test]
+fn stop_remote_terminal_after_response_preserves_completed_outputs() {
+    for terminal in [
+        StopInitiatorInput::RemoteWriteClosed,
+        StopInitiatorInput::RemoteReset,
+    ] {
+        let mut stop = StopInitiator::new(peer(), None);
+        let _ = stop.poll_output();
+        let mut response = stop_frame(StopMessage {
+            kind: StopMessageType::Status,
+            peer: None,
+            limit: None,
+            status: Some(Status::Ok),
+        });
+        response.extend_from_slice(b"destination payload");
+        stop.handle_input(StopInitiatorInput::Data(response))
+            .unwrap();
+        stop.handle_input(terminal).unwrap();
+        assert_eq!(
+            stop.poll_output(),
+            Some(StopInitiatorOutput::Outcome(StopInitiatorOutcome::Accepted))
+        );
+        assert_eq!(
+            stop.poll_output(),
+            Some(StopInitiatorOutput::BridgeData(
+                b"destination payload".to_vec()
+            ))
+        );
+        assert!(stop.poll_output().is_none());
+    }
+
+    let mut malformed = StopInitiator::new(peer(), None);
+    let _ = malformed.poll_output();
+    malformed
+        .handle_input(StopInitiatorInput::Data(encode_frame(&[])))
+        .unwrap();
+    malformed
         .handle_input(StopInitiatorInput::RemoteWriteClosed)
         .unwrap();
+    assert!(matches!(
+        malformed.poll_output(),
+        Some(StopInitiatorOutput::Outbound(_))
+    ));
     assert_eq!(
-        closed_stop.poll_output(),
+        malformed.poll_output(),
+        Some(StopInitiatorOutput::CloseWrite)
+    );
+    assert_eq!(
+        malformed.poll_output(),
         Some(StopInitiatorOutput::Outcome(
-            StopInitiatorOutcome::RemoteWriteClosed
+            StopInitiatorOutcome::ProtocolError {
+                status: Status::MalformedMessage,
+            }
         ))
     );
-    assert!(closed_stop.poll_output().is_none());
+
+    let mut invalid_then_reset = StopInitiator::new(peer(), None);
+    let _ = invalid_then_reset.poll_output();
+    invalid_then_reset
+        .handle_input(StopInitiatorInput::Data(vec![0x80; 10]))
+        .unwrap();
+    invalid_then_reset
+        .handle_input(StopInitiatorInput::RemoteReset)
+        .unwrap();
+    assert_eq!(
+        invalid_then_reset.poll_output(),
+        Some(StopInitiatorOutput::Outcome(
+            StopInitiatorOutcome::ProtocolError {
+                status: Status::MalformedMessage,
+            }
+        ))
+    );
+    assert!(invalid_then_reset.poll_output().is_none());
+
+    let mut wrong_kind_then_reset = StopInitiator::new(peer(), None);
+    let _ = wrong_kind_then_reset.poll_output();
+    wrong_kind_then_reset
+        .handle_input(StopInitiatorInput::Data(stop_frame(StopMessage {
+            kind: StopMessageType::Connect,
+            peer: None,
+            limit: None,
+            status: None,
+        })))
+        .unwrap();
+    wrong_kind_then_reset
+        .handle_input(StopInitiatorInput::RemoteReset)
+        .unwrap();
+    assert_eq!(
+        wrong_kind_then_reset.poll_output(),
+        Some(StopInitiatorOutput::Outcome(
+            StopInitiatorOutcome::ProtocolError {
+                status: Status::UnexpectedMessage,
+            }
+        ))
+    );
+    assert!(wrong_kind_then_reset.poll_output().is_none());
 }
 
 #[test]
