@@ -3,9 +3,9 @@ use core::str::FromStr;
 use minip2p_core::{PeerId, SansIoProtocol};
 use minip2p_relay::{
     HopMessage, HopMessageType, HopRequest, HopResponder, HopResponderInput, HopResponderOutput,
-    Limit, MAX_MESSAGE_SIZE, Peer, RelayMessageError, Reservation, Status, StopInitiator,
-    StopInitiatorInput, StopInitiatorOutcome, StopInitiatorOutput, StopMessage, StopMessageType,
-    decode_frame, encode_frame,
+    Limit, MAX_MESSAGE_SIZE, Peer, RelayError, RelayMessageError, Reservation, Status,
+    StopInitiator, StopInitiatorInput, StopInitiatorOutcome, StopInitiatorOutput, StopMessage,
+    StopMessageType, decode_frame, encode_frame,
 };
 
 fn peer() -> PeerId {
@@ -159,6 +159,50 @@ fn hop_connect_acceptance_emits_status_before_pipelined_payload() {
         Some(HopResponderOutput::BridgeData(b"source payload".to_vec()))
     );
     assert!(responder.is_done());
+}
+
+#[test]
+fn hop_connect_backpressures_new_data_while_the_decision_is_pending() {
+    let destination = peer();
+    let mut request = hop_frame(HopMessage {
+        kind: HopMessageType::Connect,
+        peer: Some(Peer {
+            id: destination.to_bytes(),
+            addrs: Vec::new(),
+        }),
+        reservation: None,
+        limit: None,
+        status: None,
+    });
+    request.extend_from_slice(b"coalesced payload");
+    let mut responder = HopResponder::new();
+
+    responder
+        .handle_input(HopResponderInput::Data(request))
+        .unwrap();
+    assert!(matches!(
+        responder.poll_output(),
+        Some(HopResponderOutput::Request(HopRequest::Connect { .. }))
+    ));
+    assert_eq!(
+        responder.handle_input(HopResponderInput::Data(b"later payload".to_vec())),
+        Err(RelayError::DecisionPending)
+    );
+
+    responder
+        .handle_input(HopResponderInput::AcceptConnect { limit: None })
+        .unwrap();
+    assert!(matches!(
+        responder.poll_output(),
+        Some(HopResponderOutput::Outbound(_))
+    ));
+    assert_eq!(
+        responder.poll_output(),
+        Some(HopResponderOutput::BridgeData(
+            b"coalesced payload".to_vec()
+        ))
+    );
+    assert!(responder.poll_output().is_none());
 }
 
 #[test]

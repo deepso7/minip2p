@@ -75,6 +75,10 @@ enum PendingRequest {
 /// provide exactly one accept/reject decision. RESERVE and rejected requests
 /// emit a status followed by [`HopResponderOutput::CloseWrite`]. An accepted
 /// CONNECT emits its status before any [`HopResponderOutput::BridgeData`].
+/// After a request output, pause stream reads until supplying its decision;
+/// additional data returns [`RelayError::DecisionPending`] without being
+/// retained. Payload coalesced with the request frame remains available after
+/// CONNECT acceptance.
 /// Invalid framing terminates with [`HopResponderOutput::Reset`]. Inputs after
 /// a terminal error are ignored; accepted CONNECT payload remains drainable.
 pub struct HopResponder {
@@ -99,24 +103,24 @@ impl HopResponder {
         }
     }
 
-    fn on_data(&mut self, data: &[u8]) -> Result<(), RelayError> {
+    fn on_data(&mut self, mut data: Vec<u8>) -> Result<(), RelayError> {
         if self.bridged {
             if !data.is_empty() {
-                self.outputs
-                    .push_back(HopResponderOutput::BridgeData(data.to_vec()));
+                self.outputs.push_back(HopResponderOutput::BridgeData(data));
             }
             return Ok(());
         }
         if self.done {
             return Ok(());
         }
-        if let Some(pending) = self.pending_request {
-            if pending == PendingRequest::Connect {
-                self.pending_bridge.extend_from_slice(data);
-            }
-            return Ok(());
+        if self.pending_request.is_some() {
+            return Err(RelayError::DecisionPending);
         }
-        self.recv_buf.extend_from_slice(data);
+        if self.recv_buf.is_empty() {
+            self.recv_buf = data;
+        } else {
+            self.recv_buf.append(&mut data);
+        }
         let (message, consumed) = match decode_frame(&self.recv_buf) {
             FrameDecode::Complete { payload, consumed } => {
                 let decoded = HopMessage::decode(payload);
@@ -158,8 +162,9 @@ impl HopResponder {
                 return Ok(());
             }
         };
-        self.pending_bridge
-            .extend_from_slice(&self.recv_buf[consumed..]);
+        if pending_request == PendingRequest::Connect {
+            self.pending_bridge = self.recv_buf.split_off(consumed);
+        }
         self.recv_buf.clear();
         self.pending_request = Some(pending_request);
         self.outputs.push_back(HopResponderOutput::Request(request));
@@ -271,7 +276,7 @@ impl SansIoProtocol for HopResponder {
 
     fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
         match input {
-            HopResponderInput::Data(data) => self.on_data(&data),
+            HopResponderInput::Data(data) => self.on_data(data),
             HopResponderInput::RemoteWriteClosed | HopResponderInput::RemoteReset => {
                 self.remote_terminal();
                 Ok(())

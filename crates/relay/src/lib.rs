@@ -70,6 +70,12 @@ pub enum RelayError {
     /// An input or wire message was invalid for the current state.
     #[error("unexpected message: {0}")]
     UnexpectedMessage(String),
+    /// Stream input arrived while a relay-side service decision was pending.
+    ///
+    /// The driver must pause reads after receiving a HOP request and resume
+    /// them only after providing the accept or reject decision.
+    #[error("HOP stream input must pause while a service decision is pending")]
+    DecisionPending,
 }
 
 /// Longest length prefix a legal frame can carry.

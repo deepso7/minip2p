@@ -55,6 +55,13 @@ while let Some(output) = reservation.poll_output() {
 
 `HopConnect`, `StopResponder`, `HopResponder`, and `StopInitiator` follow the same input/output drain-loop shape. Relay hosts execute `Outbound`, `CloseWrite`, and `Reset` outputs against the owned stream and retain `BridgeData` for circuit forwarding.
 
+After `HopResponder` emits a request, its driver pauses reads on that HOP
+stream until it supplies the accept or reject decision. A `Data` input while
+the decision is pending returns `RelayError::DecisionPending` without retaining
+the bytes. Payload already coalesced behind the request frame is retained and
+released only after CONNECT acceptance; transport queues provide backpressure
+for bytes that arrive while policy is deciding.
+
 ## no_std
 
 Disable default features:
