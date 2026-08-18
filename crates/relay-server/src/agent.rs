@@ -119,7 +119,7 @@ enum PendingOperation {
     },
     Close {
         peer_id: PeerId,
-        circuit: Option<StreamKey>,
+        circuit: Option<(StreamKey, CircuitLeg)>,
     },
     Reset {
         peer_id: PeerId,
@@ -156,6 +156,8 @@ struct Circuit {
     bytes: CircuitByteCounts,
     source_eof: bool,
     destination_eof: bool,
+    source_write_closed: bool,
+    destination_write_closed: bool,
     source_to_destination_in_flight: bool,
     destination_to_source_in_flight: bool,
 }
@@ -697,18 +699,25 @@ impl RelayServerAgent {
         else {
             return;
         };
-        if let Err(detail) = result {
-            if let Some(source_stream) = circuit {
-                if !self.circuits.contains_key(&source_stream) {
-                    return;
+        match result {
+            Ok(()) => {
+                if let Some((source_stream, leg)) = circuit {
+                    self.circuit_close_accepted(source_stream, leg);
                 }
-                self.close_circuit(source_stream, CircuitCloseReason::InternalFailure);
             }
-            self.runtime_error(
-                RelayServerRuntimeErrorKind::CloseStream,
-                Some(peer_id),
-                detail,
-            );
+            Err(detail) => {
+                if let Some((source_stream, _)) = circuit {
+                    if !self.circuits.contains_key(&source_stream) {
+                        return;
+                    }
+                    self.close_circuit(source_stream, CircuitCloseReason::InternalFailure);
+                }
+                self.runtime_error(
+                    RelayServerRuntimeErrorKind::CloseStream,
+                    Some(peer_id),
+                    detail,
+                );
+            }
         }
     }
 
@@ -1111,6 +1120,8 @@ impl RelayServerAgent {
                 bytes: CircuitByteCounts::default(),
                 source_eof: false,
                 destination_eof: false,
+                source_write_closed: false,
+                destination_write_closed: false,
                 source_to_destination_in_flight: false,
                 destination_to_source_in_flight: false,
             },
@@ -1273,20 +1284,42 @@ impl RelayServerAgent {
         let Some(circuit) = self.circuits.get_mut(&source_stream) else {
             return;
         };
-        let (peer_id, stream) = match leg {
+        let (peer_id, stream, target_leg) = match leg {
             CircuitLeg::Source => {
+                if circuit.source_eof {
+                    return;
+                }
                 circuit.source_eof = true;
                 (
                     circuit.destination_peer_id.clone(),
                     circuit.destination_stream,
+                    CircuitLeg::Destination,
                 )
             }
             CircuitLeg::Destination => {
+                if circuit.destination_eof {
+                    return;
+                }
                 circuit.destination_eof = true;
-                (circuit.source_peer_id.clone(), circuit.source_stream)
+                (
+                    circuit.source_peer_id.clone(),
+                    circuit.source_stream,
+                    CircuitLeg::Source,
+                )
             }
         };
-        self.queue_circuit_close(peer_id, stream, source_stream);
+        self.queue_circuit_close(peer_id, stream, source_stream, target_leg);
+        self.finish_eof_if_drained(source_stream);
+    }
+
+    fn circuit_close_accepted(&mut self, source_stream: StreamKey, leg: CircuitLeg) {
+        let Some(circuit) = self.circuits.get_mut(&source_stream) else {
+            return;
+        };
+        match leg {
+            CircuitLeg::Source => circuit.source_write_closed = true,
+            CircuitLeg::Destination => circuit.destination_write_closed = true,
+        }
         self.finish_eof_if_drained(source_stream);
     }
 
@@ -1294,6 +1327,8 @@ impl RelayServerAgent {
         let finished = self.circuits.get(&source_stream).is_some_and(|circuit| {
             circuit.source_eof
                 && circuit.destination_eof
+                && circuit.source_write_closed
+                && circuit.destination_write_closed
                 && !circuit.source_to_destination_in_flight
                 && !circuit.destination_to_source_in_flight
         });
@@ -1668,11 +1703,17 @@ impl RelayServerAgent {
         peer_id: PeerId,
         stream: StreamKey,
         source_stream: StreamKey,
+        leg: CircuitLeg,
     ) {
-        self.queue_close_for(peer_id, stream, Some(source_stream));
+        self.queue_close_for(peer_id, stream, Some((source_stream, leg)));
     }
 
-    fn queue_close_for(&mut self, peer_id: PeerId, stream: StreamKey, circuit: Option<StreamKey>) {
+    fn queue_close_for(
+        &mut self,
+        peer_id: PeerId,
+        stream: StreamKey,
+        circuit: Option<(StreamKey, CircuitLeg)>,
+    ) {
         let token = self.token();
         self.pending_operations.insert(
             token,
@@ -2880,7 +2921,7 @@ mod tests {
         ));
 
         let mut forward = None;
-        let mut closed = Vec::new();
+        let mut closes = Vec::new();
         while let Some(action) = agent.poll_action() {
             match action {
                 RelayServerAction::SendStream {
@@ -2893,15 +2934,25 @@ mod tests {
                     assert_eq!(data, b"buffered");
                     forward = Some(token);
                 }
-                RelayServerAction::CloseStreamWrite { stream, .. } => closed.push(stream),
+                RelayServerAction::CloseStreamWrite { token, stream, .. } => {
+                    closes.push((token, stream));
+                }
                 action => panic!("unexpected action: {action:?}"),
             }
         }
-        assert!(closed.contains(&source_stream));
-        assert!(closed.contains(&stop_stream));
+        assert!(closes.iter().any(|(_, stream)| *stream == source_stream));
+        assert!(closes.iter().any(|(_, stream)| *stream == stop_stream));
         assert_eq!(agent.poll_event(), None, "payload remains in flight");
 
         agent.send_stream_result(forward.unwrap(), Ok(()), Now::from_millis(1));
+        assert_eq!(agent.poll_event(), None, "half closes remain in flight");
+        let close_count = closes.len();
+        for (index, (token, _)) in closes.into_iter().enumerate() {
+            agent.close_stream_write_result(token, Ok(()), Now::from_millis(1));
+            if index + 1 != close_count {
+                assert_eq!(agent.poll_event(), None, "one half close remains in flight");
+            }
+        }
         assert!(matches!(
             agent.poll_event(),
             Some(RelayServerEvent::CircuitClosed {
@@ -2912,6 +2963,45 @@ mod tests {
                 },
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn dual_pending_eof_close_failure_is_internal_failure() {
+        let (mut agent, source, destination, source_stream, stop_stream, token) =
+            pending_circuit_success(RelayServerConfig::default(), 0);
+        for (peer_id, stream) in [(source, source_stream), (destination, stop_stream)] {
+            agent.handle_event(
+                &SwarmEvent::StreamRemoteWriteClosed {
+                    peer_id,
+                    conn_id: stream.conn_id,
+                    stream_id: stream.stream_id,
+                },
+                false,
+                Now::from_millis(1),
+            );
+        }
+        agent.send_stream_result(token, Ok(()), Now::from_millis(1));
+        let _ = agent.poll_event();
+        let RelayServerAction::CloseStreamWrite { token, .. } = agent.poll_action().unwrap() else {
+            panic!("first propagated half close");
+        };
+
+        agent.close_stream_write_result(token, Err("fin rejected".into()), Now::from_millis(1));
+
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::CircuitClosed {
+                reason: CircuitCloseReason::InternalFailure,
+                ..
+            })
+        ));
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::Error(RelayServerRuntimeError {
+                kind: RelayServerRuntimeErrorKind::CloseStream,
+                ..
+            }))
         ));
     }
 
