@@ -471,12 +471,16 @@ fn portable_relay_and_autonat_compose_and_register_their_protocols() {
         .build()
         .expect("relay and AutoNAT policy composes");
 
-    for protocol in [AUTONAT_PROTOCOL_ID, HOP_PROTOCOL_ID, STOP_PROTOCOL_ID] {
+    for protocol in [AUTONAT_PROTOCOL_ID, HOP_PROTOCOL_ID] {
         assert!(matches!(
             endpoint.open_stream(&remote, protocol, Now::from_millis(0)),
             Err(DriverError::Swarm(SwarmError::NotConnected { .. }))
         ));
     }
+    assert!(matches!(
+        endpoint.open_stream(&remote, STOP_PROTOCOL_ID, Now::from_millis(0)),
+        Err(DriverError::Swarm(SwarmError::ProtocolNotRegistered { .. }))
+    ));
 }
 
 #[test]

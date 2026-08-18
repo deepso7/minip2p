@@ -1127,6 +1127,7 @@ fn disconnect_and_supersede_emit_one_aggregated_failure() {
         &SwarmEvent::ConnectionClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         2,
     );
@@ -1668,6 +1669,7 @@ fn late_open_result_after_disconnect_resets_the_stream() {
         &SwarmEvent::ConnectionClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: b.clone(),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         1,
     );

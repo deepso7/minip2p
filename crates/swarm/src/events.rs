@@ -10,6 +10,15 @@ use minip2p_core::PeerId;
 use minip2p_identify::IdentifyMessage;
 use minip2p_transport::{ConnectionId, StreamId, TransportEvent};
 
+/// Why an established connection left the Swarm's single-connection slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionCloseCause {
+    /// The transport reported loss or completed an explicit close.
+    Transport,
+    /// A newer connection to the same peer replaced this connection.
+    Superseded,
+}
+
 /// Events emitted by the swarm to the application.
 #[derive(Clone, Debug)]
 pub enum SwarmEvent {
@@ -22,6 +31,7 @@ pub enum SwarmEvent {
     ConnectionClosed {
         peer_id: PeerId,
         conn_id: ConnectionId,
+        cause: ConnectionCloseCause,
     },
     /// Identify information received from a remote peer.
     IdentifyReceived {

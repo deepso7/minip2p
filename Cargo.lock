@@ -1251,6 +1251,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "minip2p-relay-server"
+version = "0.4.1"
+dependencies = [
+ "minip2p-core",
+ "minip2p-nat",
+ "minip2p-platform",
+ "minip2p-relay",
+ "minip2p-swarm",
+ "minip2p-transport",
+ "thiserror",
+]
+
+[[package]]
 name = "minip2p-rs"
 version = "0.4.1"
 dependencies = [

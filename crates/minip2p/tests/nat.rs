@@ -389,7 +389,9 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
             Instant::now() < close_deadline,
             "circuit did not close after relay cut"
         );
-        if let Some(Event::ConnectionClosed { peer_id, conn_id }) = initiator
+        if let Some(Event::ConnectionClosed {
+            peer_id, conn_id, ..
+        }) = initiator
             .next_event(Duration::from_millis(20))
             .expect("drive initiator close")
             && peer_id == responder_peer
@@ -397,7 +399,9 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
         {
             initiator_closed = true;
         }
-        if let Some(Event::ConnectionClosed { peer_id, conn_id }) = responder
+        if let Some(Event::ConnectionClosed {
+            peer_id, conn_id, ..
+        }) = responder
             .next_event(Duration::from_millis(20))
             .expect("drive responder close")
             && peer_id == initiator_peer
@@ -658,7 +662,9 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
             Instant::now() < close_deadline,
             "circuit did not close after the TCP relay was cut"
         );
-        if let Some(Event::ConnectionClosed { peer_id, conn_id }) = initiator
+        if let Some(Event::ConnectionClosed {
+            peer_id, conn_id, ..
+        }) = initiator
             .next_event(Duration::from_millis(20))
             .expect("drive initiator close")
             && peer_id == responder_peer
@@ -666,7 +672,9 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
         {
             initiator_closed = true;
         }
-        if let Some(Event::ConnectionClosed { peer_id, conn_id }) = responder
+        if let Some(Event::ConnectionClosed {
+            peer_id, conn_id, ..
+        }) = responder
             .next_event(Duration::from_millis(20))
             .expect("drive responder close")
             && peer_id == initiator_peer

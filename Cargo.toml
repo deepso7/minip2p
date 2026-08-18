@@ -19,6 +19,7 @@ members = [
     "crates/platform",
     "crates/pubsub",
     "crates/relay",
+    "crates/relay-server",
     "crates/secure-mux",
     "crates/smoltcp",
     "crates/swarm",

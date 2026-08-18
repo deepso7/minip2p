@@ -45,7 +45,15 @@ Orchestration layer that composes minip2p's protocol state machines into a singl
   swarm.send_stream(&peer_id, stream_id, data)?;
   // receive via SwarmEvent::StreamData { ... }
   ```
-- Connection lifecycle events: `ConnectionEstablished`, `ConnectionClosed`.
+- Application registration grants independent inbound, outbound, and
+  Identify-advertised roles. Composed services can register only the roles they
+  own. Incoming negotiations snapshot inbound membership at stream arrival;
+  outbound opens consult only outbound membership, and future Identify
+  responses snapshot only advertised membership.
+- Connection lifecycle events: `ConnectionEstablished`, and
+  `ConnectionClosed` with `Transport` or `Superseded` cause. Exact remote
+  transport addresses remain queryable by `ConnectionId`, so policy never
+  accidentally inspects a last-wins replacement connection.
 - Identify lifecycle: `IdentifyReceived { peer_id, info }` with observed-addr populated from the transport endpoint.
 - Ping lifecycle: `PingRttMeasured`, `PingTimeout`.
 - User-stream lifecycle: `StreamReady`, `StreamData`, `StreamRemoteWriteClosed`, `StreamClosed`.

@@ -47,8 +47,8 @@ use minip2p_ping::{
 use minip2p_transport::{ConnectionId, StreamId, TransportEvent};
 
 use crate::events::{
-    OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput,
-    SwarmRuntimeError,
+    ConnectionCloseCause, OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent,
+    SwarmInput, SwarmOutput, SwarmRuntimeError,
 };
 
 // ---------------------------------------------------------------------------
@@ -138,6 +138,12 @@ fn connection_action_matches(action: &SwarmAction, conn_id: ConnectionId) -> boo
     }
 }
 
+fn push_unique(protocols: &mut Vec<String>, protocol_id: String) {
+    if !protocols.iter().any(|existing| existing == &protocol_id) {
+        protocols.push(protocol_id);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SwarmCore
 // ---------------------------------------------------------------------------
@@ -182,10 +188,10 @@ pub struct SwarmCore {
     next_open_token: u64,
 
     // --- Configuration ---
-    /// Protocol IDs we advertise for inbound multistream-select negotiation.
-    supported_protocols: Vec<String>,
-    /// Application-registered protocol IDs (subset of `supported_protocols`).
-    user_protocols: Vec<String>,
+    /// Protocol IDs accepted by inbound multistream-select negotiation.
+    inbound_protocols: Vec<String>,
+    /// Protocol IDs applications and composed services may open outbound.
+    outbound_protocols: Vec<String>,
 
     // --- Bookkeeping ---
     /// Peers with a pending `.ping(peer)` call: once the ping stream
@@ -226,7 +232,7 @@ pub struct SwarmCore {
 impl SwarmCore {
     /// Creates a new core with the given identify and ping configs.
     pub fn new(identify_config: IdentifyConfig, ping_config: PingConfig) -> Self {
-        let supported_protocols = vec![
+        let inbound_protocols = vec![
             IDENTIFY_PROTOCOL_ID.to_string(),
             PING_PROTOCOL_ID.to_string(),
         ];
@@ -245,8 +251,8 @@ impl SwarmCore {
             abandoned_streams: BTreeSet::new(),
             pending_opens: BTreeMap::new(),
             next_open_token: 1,
-            supported_protocols,
-            user_protocols: Vec::new(),
+            inbound_protocols,
+            outbound_protocols: Vec::new(),
             pending_pings: BTreeMap::new(),
             ping_deadlines: BTreeMap::new(),
             ping_timeout_ms,
@@ -285,16 +291,55 @@ impl SwarmCore {
     /// could never receive traffic.
     pub fn add_protocol(&mut self, protocol_id: impl Into<String>) -> Result<(), SwarmError> {
         let id = protocol_id.into();
-        if RESERVED_PROTOCOL_IDS.contains(&id.as_str()) {
-            return Err(SwarmError::ReservedProtocol { protocol_id: id });
-        }
-        if !self.user_protocols.iter().any(|p| p == &id) {
-            self.user_protocols.push(id.clone());
-        }
-        if !self.supported_protocols.iter().any(|p| p == &id) {
-            self.supported_protocols.push(id.clone());
-        }
+        Self::validate_service_protocol(&id)?;
+        push_unique(&mut self.inbound_protocols, id.clone());
+        push_unique(&mut self.outbound_protocols, id.clone());
         self.identify.add_protocol(id);
+        Ok(())
+    }
+
+    /// Registers a protocol only for inbound negotiation by a composed service.
+    #[doc(hidden)]
+    pub fn add_inbound_protocol(
+        &mut self,
+        protocol_id: impl Into<String>,
+    ) -> Result<(), SwarmError> {
+        let id = protocol_id.into();
+        Self::validate_service_protocol(&id)?;
+        push_unique(&mut self.inbound_protocols, id);
+        Ok(())
+    }
+
+    /// Registers a protocol only for outbound opens by a composed service.
+    #[doc(hidden)]
+    pub fn add_outbound_protocol(
+        &mut self,
+        protocol_id: impl Into<String>,
+    ) -> Result<(), SwarmError> {
+        let id = protocol_id.into();
+        Self::validate_service_protocol(&id)?;
+        push_unique(&mut self.outbound_protocols, id);
+        Ok(())
+    }
+
+    /// Adds a protocol only to future Identify responses for a composed service.
+    #[doc(hidden)]
+    pub fn add_advertised_protocol(
+        &mut self,
+        protocol_id: impl Into<String>,
+    ) -> Result<(), SwarmError> {
+        let id = protocol_id.into();
+        Self::validate_service_protocol(&id)?;
+        self.identify.add_protocol(id);
+        Ok(())
+    }
+
+    fn validate_service_protocol(protocol_id: &str) -> Result<(), SwarmError> {
+        if RESERVED_PROTOCOL_IDS.contains(&protocol_id) {
+            return Err(SwarmError::ReservedProtocol {
+                protocol_id: protocol_id.into(),
+            });
+        }
         Ok(())
     }
 
@@ -429,7 +474,7 @@ impl SwarmCore {
     /// for `protocol_id`. The actual stream id is not known until the driver
     /// reports back via [`SwarmInput::StreamOpened`].
     pub fn open_stream(&mut self, peer_id: &PeerId, protocol_id: &str) -> Result<(), SwarmError> {
-        if !self.user_protocols.iter().any(|p| p == protocol_id) {
+        if !self.outbound_protocols.iter().any(|p| p == protocol_id) {
             return Err(SwarmError::ProtocolNotRegistered {
                 protocol_id: protocol_id.to_string(),
             });
@@ -631,6 +676,11 @@ impl SwarmCore {
     /// Returns the active transport connection selected for `peer_id`.
     pub fn connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
         self.peer_to_conn.get(peer_id).copied()
+    }
+
+    /// Returns the remote transport address recorded for an exact connection.
+    pub fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
+        self.conn_to_remote_addr.get(&conn_id)
     }
 
     // -----------------------------------------------------------------------
@@ -1047,6 +1097,7 @@ impl SwarmCore {
             self.events.push_back(SwarmEvent::ConnectionClosed {
                 peer_id: peer_id.clone(),
                 conn_id: old_id,
+                cause: ConnectionCloseCause::Superseded,
             });
             let pending_ping = self.pending_pings.remove(&peer_id);
             let _ = self.ping.handle_input(PingInput::RemovePeer {
@@ -1185,7 +1236,7 @@ impl SwarmCore {
     // -----------------------------------------------------------------------
 
     fn handle_incoming_stream(&mut self, conn_id: ConnectionId, stream_id: StreamId) {
-        let mut listener = MultistreamSelect::listener(self.supported_protocols.clone());
+        let mut listener = MultistreamSelect::listener(self.inbound_protocols.clone());
         if let Err(error) = listener.handle_input(MultistreamInput::Start) {
             self.emit_error(
                 SwarmErrorKind::Multistream,
@@ -1364,8 +1415,11 @@ impl SwarmCore {
                 self.peer_info.remove(&peer_id);
                 self.ready_peers.remove(&peer_id);
                 self.established_peers.remove(&peer_id);
-                self.events
-                    .push_back(SwarmEvent::ConnectionClosed { peer_id, conn_id });
+                self.events.push_back(SwarmEvent::ConnectionClosed {
+                    peer_id,
+                    conn_id,
+                    cause: ConnectionCloseCause::Transport,
+                });
             }
         }
 
@@ -1623,7 +1677,7 @@ impl SwarmCore {
             return;
         }
 
-        if self.user_protocols.iter().any(|p| p == protocol) {
+        if self.inbound_protocols.iter().any(|p| p == protocol) {
             self.stream_owner.insert(
                 (conn_id, stream_id),
                 ProtocolKind::User(protocol.to_string()),
@@ -2003,7 +2057,139 @@ mod tests {
         }
         core.add_protocol("/myapp/1.0.0")
             .expect("application ids must be accepted");
-        assert!(core.user_protocols.iter().any(|p| p == "/myapp/1.0.0"));
+        assert!(core.outbound_protocols.iter().any(|p| p == "/myapp/1.0.0"));
+    }
+
+    #[test]
+    fn outbound_only_protocol_can_open_without_being_accepted_inbound() {
+        const OUTBOUND_ONLY: &str = "/minip2p/outbound-only/1.0.0";
+
+        let mut core = test_core();
+        core.add_outbound_protocol(OUTBOUND_ONLY)
+            .expect("service protocol is not reserved");
+        let peer_id = PeerId::from_public_key_protobuf(b"outbound-only-peer");
+        let conn_id = ConnectionId::new(70);
+        let inbound_stream = StreamId::new(1);
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+
+        core.open_stream(&peer_id, OUTBOUND_ONLY)
+            .expect("outbound membership permits opening");
+        assert!(matches!(
+            core.actions.pop_front(),
+            Some(SwarmAction::OpenStream { conn_id: opened, .. }) if opened == conn_id
+        ));
+
+        feed(
+            &mut core,
+            TransportEvent::IncomingStream {
+                id: conn_id,
+                stream_id: inbound_stream,
+            },
+        );
+        core.actions.clear();
+        let mut offer = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+        offer.extend_from_slice(&multistream_frame(OUTBOUND_ONLY));
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn_id,
+                stream_id: inbound_stream,
+                data: offer,
+            },
+        );
+
+        assert!(matches!(
+            core.actions.pop_front(),
+            Some(SwarmAction::SendStream { data, .. }) if data == multistream_frame("na")
+        ));
+        assert!(
+            drain_events(&mut core)
+                .iter()
+                .all(|event| !matches!(event, SwarmEvent::StreamReady { protocol_id, initiated_locally: false, .. } if protocol_id == OUTBOUND_ONLY))
+        );
+    }
+
+    #[test]
+    fn inbound_negotiation_uses_membership_snapshot_from_stream_arrival() {
+        const LATE_PROTOCOL: &str = "/minip2p/late-inbound/1.0.0";
+
+        let mut core = test_core();
+        let conn_id = ConnectionId::new(75);
+        let stream_id = StreamId::new(1);
+        let peer_id = PeerId::from_public_key_protobuf(b"inbound-snapshot-peer");
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id, conn_id);
+        feed(
+            &mut core,
+            TransportEvent::IncomingStream {
+                id: conn_id,
+                stream_id,
+            },
+        );
+        core.actions.clear();
+        core.add_inbound_protocol(LATE_PROTOCOL)
+            .expect("service protocol is not reserved");
+
+        let mut offer = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+        offer.extend_from_slice(&multistream_frame(LATE_PROTOCOL));
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn_id,
+                stream_id,
+                data: offer,
+            },
+        );
+
+        assert!(matches!(
+            core.actions.pop_front(),
+            Some(SwarmAction::SendStream { data, .. }) if data == multistream_frame("na")
+        ));
+    }
+
+    #[test]
+    fn advertised_only_protocol_appears_only_in_future_identify_responses() {
+        const ADVERTISED_ONLY: &str = "/minip2p/advertised-only/1.0.0";
+
+        let mut core = test_core();
+        let conn_id = ConnectionId::new(76);
+        let stream_id = StreamId::new(2);
+        let peer_id = PeerId::from_public_key_protobuf(b"advertised-only-peer");
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id, conn_id);
+        core.add_advertised_protocol(ADVERTISED_ONLY)
+            .expect("service protocol is not reserved");
+
+        core.on_inbound_negotiated(conn_id, stream_id, IDENTIFY_PROTOCOL_ID);
+        let data = core
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                SwarmAction::SendStream { data, .. } => Some(data),
+                _ => None,
+            })
+            .expect("Identify responder sends its current snapshot");
+        let minip2p_core::FrameDecode::Complete { payload, .. } =
+            minip2p_core::decode_frame(data, 8 * 1024)
+        else {
+            panic!("Identify response must be framed");
+        };
+        let message = IdentifyMessage::decode(payload).expect("Identify response decodes");
+
+        assert!(
+            message
+                .protocols
+                .iter()
+                .any(|protocol| protocol == ADVERTISED_ONLY)
+        );
+        assert!(matches!(
+            core.open_stream(
+                &PeerId::from_public_key_protobuf(b"advertised-only-peer"),
+                ADVERTISED_ONLY
+            ),
+            Err(SwarmError::ProtocolNotRegistered { .. })
+        ));
     }
 
     #[test]
@@ -2494,7 +2680,11 @@ mod tests {
         assert!(matches!(
             lifecycle.as_slice(),
             [
-                SwarmEvent::ConnectionClosed { conn_id: closed, .. },
+                SwarmEvent::ConnectionClosed {
+                    conn_id: closed,
+                    cause: ConnectionCloseCause::Superseded,
+                    ..
+                },
                 SwarmEvent::ConnectionEstablished { conn_id: second, .. },
             ] if *closed == original && *second == replacement
         ));
@@ -2507,6 +2697,59 @@ mod tests {
             .position(|output| matches!(output, SwarmOutput::Action(SwarmAction::CloseConnection { conn_id }) if *conn_id == original))
             .expect("transport close action");
         assert!(closed_position < close_action_position);
+    }
+
+    #[test]
+    fn transport_loss_reports_transport_close_cause() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"transport-closed-peer");
+        let conn_id = ConnectionId::new(71);
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id),
+            },
+        );
+        let _ = drain_events(&mut core);
+
+        feed(&mut core, TransportEvent::Closed { id: conn_id });
+
+        assert!(matches!(
+            drain_events(&mut core).as_slice(),
+            [SwarmEvent::ConnectionClosed {
+                conn_id: closed,
+                cause: ConnectionCloseCause::Transport,
+                ..
+            }] if *closed == conn_id
+        ));
+    }
+
+    #[test]
+    fn connection_remote_addr_is_scoped_to_exact_connection() {
+        let mut core = test_core();
+        let first = ConnectionId::new(72);
+        let second = ConnectionId::new(73);
+        let first_addr = Multiaddr::from_str("/ip4/192.0.2.1/tcp/4001").unwrap();
+        let second_addr = Multiaddr::from_str("/ip4/192.0.2.2/tcp/4002").unwrap();
+        feed(
+            &mut core,
+            TransportEvent::IncomingConnection {
+                id: first,
+                endpoint: ConnectionEndpoint::new(first_addr.clone()),
+            },
+        );
+        feed(
+            &mut core,
+            TransportEvent::IncomingConnection {
+                id: second,
+                endpoint: ConnectionEndpoint::new(second_addr.clone()),
+            },
+        );
+
+        assert_eq!(core.connection_remote_addr(first), Some(&first_addr));
+        assert_eq!(core.connection_remote_addr(second), Some(&second_addr));
+        assert_eq!(core.connection_remote_addr(ConnectionId::new(74)), None);
     }
 
     #[test]

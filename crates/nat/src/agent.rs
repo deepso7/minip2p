@@ -473,7 +473,9 @@ impl NatAgent {
                     );
                 }
             }
-            SwarmEvent::ConnectionClosed { peer_id, conn_id } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id, conn_id, ..
+            } => {
                 touched_state = true;
                 self.shared.direct_connections.remove(conn_id);
                 let mut peer_disconnected = false;

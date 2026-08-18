@@ -634,6 +634,7 @@ fn relay_disconnect_before_release_drops_the_circuit() {
         &SwarmEvent::ConnectionClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: h.relay.clone(),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         at(20),
     );
