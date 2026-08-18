@@ -15,16 +15,63 @@ use minip2p_transport::{ConnectionId, Transport};
 use crate::address::normalize_addrs;
 use crate::limiter::TokenBuckets;
 use crate::{
-    CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RelayServerAction,
-    RelayServerAddressError, RelayServerConfig, RelayServerConfigError, RelayServerEvent,
-    RelayServerRuntimeError, RelayServerRuntimeErrorKind, RelayServerToken, ReservationCloseReason,
-    StreamKey,
+    CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RateLimit,
+    RelayServerAction, RelayServerAddressError, RelayServerConfig, RelayServerConfigError,
+    RelayServerEvent, RelayServerRuntimeError, RelayServerRuntimeErrorKind, RelayServerToken,
+    ReservationCloseReason, StreamKey,
 };
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum IpKey {
     V4([u8; 4]),
     V6([u8; 16]),
+}
+
+struct AdmissionLimiters {
+    peer: Option<TokenBuckets<PeerId>>,
+    ip: Option<TokenBuckets<IpKey>>,
+}
+
+impl AdmissionLimiters {
+    fn new(peer: Option<RateLimit>, ip: Option<RateLimit>) -> Self {
+        Self {
+            peer: peer.map(TokenBuckets::new),
+            ip: ip.map(TokenBuckets::new),
+        }
+    }
+
+    fn consume(&mut self, peer_id: &PeerId, ip: Option<IpKey>, now_ms: u64) -> bool {
+        if self
+            .peer
+            .as_mut()
+            .is_some_and(|limiter| !limiter.consume(peer_id.clone(), now_ms))
+        {
+            return false;
+        }
+        if let (Some(limiter), Some(ip)) = (&mut self.ip, ip) {
+            return limiter.consume(ip, now_ms);
+        }
+        true
+    }
+
+    fn sweep(&mut self, now_ms: u64) {
+        if let Some(limiter) = &mut self.peer {
+            limiter.sweep(now_ms);
+        }
+        if let Some(limiter) = &mut self.ip {
+            limiter.sweep(now_ms);
+        }
+    }
+
+    fn next_due(&self) -> Option<u64> {
+        [
+            self.peer.as_ref().and_then(TokenBuckets::next_due),
+            self.ip.as_ref().and_then(TokenBuckets::next_due),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
 }
 
 struct Connection {
@@ -72,6 +119,7 @@ enum PendingOperation {
     },
     Close {
         peer_id: PeerId,
+        circuit: Option<StreamKey>,
     },
     Reset {
         peer_id: PeerId,
@@ -106,6 +154,8 @@ struct Circuit {
     bytes: CircuitByteCounts,
     source_eof: bool,
     destination_eof: bool,
+    source_to_destination_in_flight: bool,
+    destination_to_source_in_flight: bool,
 }
 
 /// Whole-service deterministic relay policy and forwarding state.
@@ -127,17 +177,14 @@ pub struct RelayServerAgent {
     events: VecDeque<RelayServerEvent>,
     pending_operations: BTreeMap<RelayServerToken, PendingOperation>,
     next_token: u64,
-    reservation_peer_limiter: Option<TokenBuckets<PeerId>>,
-    reservation_ip_limiter: Option<TokenBuckets<IpKey>>,
-    circuit_peer_limiter: Option<TokenBuckets<PeerId>>,
-    circuit_ip_limiter: Option<TokenBuckets<IpKey>>,
+    reservation_limiters: AdmissionLimiters,
+    circuit_limiters: AdmissionLimiters,
 }
 
 impl RelayServerAgent {
     /// Installs the relay service's static directional Swarm roles.
     ///
     /// HOP is inbound and Identify-advertised; STOP is outbound only.
-    #[doc(hidden)]
     pub fn register_swarm_roles<T, E>(swarm: &mut SwarmRuntime<T, E>) -> Result<(), DriverError>
     where
         T: Transport,
@@ -157,12 +204,14 @@ impl RelayServerAgent {
         config.validate()?;
         Ok(Self {
             local_peer_id,
-            reservation_peer_limiter: config
-                .reservation_rate_limit_per_peer
-                .map(TokenBuckets::new),
-            reservation_ip_limiter: config.reservation_rate_limit_per_ip.map(TokenBuckets::new),
-            circuit_peer_limiter: config.circuit_rate_limit_per_peer.map(TokenBuckets::new),
-            circuit_ip_limiter: config.circuit_rate_limit_per_ip.map(TokenBuckets::new),
+            reservation_limiters: AdmissionLimiters::new(
+                config.reservation_rate_limit_per_peer,
+                config.reservation_rate_limit_per_ip,
+            ),
+            circuit_limiters: AdmissionLimiters::new(
+                config.circuit_rate_limit_per_peer,
+                config.circuit_rate_limit_per_ip,
+            ),
             config,
             accepting: true,
             explicit_addrs: None,
@@ -458,18 +507,8 @@ impl RelayServerAgent {
         for key in stop_timed_out {
             self.fail_pending_connect(key, Status::ConnectionFailed);
         }
-        if let Some(limiter) = &mut self.reservation_peer_limiter {
-            limiter.sweep(now.monotonic_ms);
-        }
-        if let Some(limiter) = &mut self.reservation_ip_limiter {
-            limiter.sweep(now.monotonic_ms);
-        }
-        if let Some(limiter) = &mut self.circuit_peer_limiter {
-            limiter.sweep(now.monotonic_ms);
-        }
-        if let Some(limiter) = &mut self.circuit_ip_limiter {
-            limiter.sweep(now.monotonic_ms);
-        }
+        self.reservation_limiters.sweep(now.monotonic_ms);
+        self.circuit_limiters.sweep(now.monotonic_ms);
     }
 
     /// Reports the result of an outbound stream open.
@@ -603,8 +642,7 @@ impl RelayServerAgent {
                     SendEffect::CommitCircuit(source_stream)
                         if self.pending_circuits.contains_key(&source_stream) =>
                     {
-                        self.complete_hop(source_stream);
-                        self.abort_pending_connect(source_stream);
+                        self.abort_pending_connect_both(source_stream);
                         true
                     }
                     SendEffect::StopRequest(source_stream)
@@ -642,7 +680,24 @@ impl RelayServerAgent {
         result: Result<(), String>,
         _now: Now,
     ) {
-        self.finish_simple_operation(token, result, RelayServerRuntimeErrorKind::CloseStream);
+        let Some(PendingOperation::Close { peer_id, circuit }) =
+            self.pending_operations.remove(&token)
+        else {
+            return;
+        };
+        if let Err(detail) = result {
+            if let Some(source_stream) = circuit {
+                if !self.circuits.contains_key(&source_stream) {
+                    return;
+                }
+                self.close_circuit(source_stream, CircuitCloseReason::InternalFailure);
+            }
+            self.runtime_error(
+                RelayServerRuntimeErrorKind::CloseStream,
+                Some(peer_id),
+                detail,
+            );
+        }
     }
 
     /// Reports completion of a reset request.
@@ -652,7 +707,17 @@ impl RelayServerAgent {
         result: Result<(), String>,
         _now: Now,
     ) {
-        self.finish_simple_operation(token, result, RelayServerRuntimeErrorKind::ResetStream);
+        let peer_id = match self.pending_operations.remove(&token) {
+            Some(PendingOperation::Reset { peer_id }) => peer_id,
+            _ => return,
+        };
+        if let Err(detail) = result {
+            self.runtime_error(
+                RelayServerRuntimeErrorKind::ResetStream,
+                Some(peer_id),
+                detail,
+            );
+        }
     }
 
     /// Removes the next host I/O action in causal order.
@@ -688,18 +753,8 @@ impl RelayServerAgent {
             .filter_map(|value| value.deadline_ms)
             .min();
         let limiter = [
-            self.reservation_peer_limiter
-                .as_ref()
-                .and_then(TokenBuckets::next_due),
-            self.reservation_ip_limiter
-                .as_ref()
-                .and_then(TokenBuckets::next_due),
-            self.circuit_peer_limiter
-                .as_ref()
-                .and_then(TokenBuckets::next_due),
-            self.circuit_ip_limiter
-                .as_ref()
-                .and_then(TokenBuckets::next_due),
+            self.reservation_limiters.next_due(),
+            self.circuit_limiters.next_due(),
         ]
         .into_iter()
         .flatten()
@@ -1044,6 +1099,8 @@ impl RelayServerAgent {
                 bytes: CircuitByteCounts::default(),
                 source_eof: false,
                 destination_eof: false,
+                source_to_destination_in_flight: false,
+                destination_to_source_in_flight: false,
             },
         );
         self.events.push_back(RelayServerEvent::CircuitOpened {
@@ -1075,9 +1132,23 @@ impl RelayServerAgent {
         if data.is_empty() {
             return;
         }
-        let Some(circuit) = self.circuits.get(&source_stream) else {
+        let Some(circuit) = self.circuits.get_mut(&source_stream) else {
             return;
         };
+        let in_flight = match direction {
+            CircuitDirection::SourceToDestination => &mut circuit.source_to_destination_in_flight,
+            CircuitDirection::DestinationToSource => &mut circuit.destination_to_source_in_flight,
+        };
+        if *in_flight {
+            self.close_circuit(source_stream, CircuitCloseReason::InternalFailure);
+            self.runtime_error(
+                RelayServerRuntimeErrorKind::InternalInvariant,
+                None,
+                "same-direction forwarding send was not echoed before new input".into(),
+            );
+            return;
+        }
+        *in_flight = true;
         let (peer_id, stream) = match direction {
             CircuitDirection::SourceToDestination => (
                 circuit.destination_peer_id.clone(),
@@ -1119,11 +1190,13 @@ impl RelayServerAgent {
         };
         let total = match direction {
             CircuitDirection::SourceToDestination => {
+                circuit.source_to_destination_in_flight = false;
                 circuit.bytes.source_to_destination =
                     circuit.bytes.source_to_destination.saturating_add(bytes);
                 circuit.bytes.source_to_destination
             }
             CircuitDirection::DestinationToSource => {
+                circuit.destination_to_source_in_flight = false;
                 circuit.bytes.destination_to_source =
                     circuit.bytes.destination_to_source.saturating_add(bytes);
                 circuit.bytes.destination_to_source
@@ -1198,7 +1271,7 @@ impl RelayServerAgent {
                 )
             }
         };
-        self.queue_close(peer_id, stream);
+        self.queue_circuit_close(peer_id, stream, source_stream);
         if finished {
             self.close_circuit(source_stream, CircuitCloseReason::Eof);
         }
@@ -1303,22 +1376,12 @@ impl RelayServerAgent {
         conn_id: ConnectionId,
         now_ms: u64,
     ) -> bool {
-        if let Some(limiter) = &mut self.reservation_peer_limiter
-            && !limiter.consume(peer_id.clone(), now_ms)
-        {
-            return false;
-        }
         let ip = self
             .connections
             .get(&conn_id)
             .and_then(|connection| connection.address.as_ref())
             .and_then(first_ip);
-        if let (Some(limiter), Some(ip)) = (&mut self.reservation_ip_limiter, ip)
-            && !limiter.consume(ip, now_ms)
-        {
-            return false;
-        }
-        true
+        self.reservation_limiters.consume(peer_id, ip, now_ms)
     }
 
     fn decide_connect(&mut self, key: StreamKey, destination_peer_id: PeerId, now: Now) {
@@ -1412,22 +1475,12 @@ impl RelayServerAgent {
         conn_id: ConnectionId,
         now_ms: u64,
     ) -> bool {
-        if let Some(limiter) = &mut self.circuit_peer_limiter
-            && !limiter.consume(peer_id.clone(), now_ms)
-        {
-            return false;
-        }
         let ip = self
             .connections
             .get(&conn_id)
             .and_then(|connection| connection.address.as_ref())
             .and_then(first_ip);
-        if let (Some(limiter), Some(ip)) = (&mut self.circuit_ip_limiter, ip)
-            && !limiter.consume(ip, now_ms)
-        {
-            return false;
-        }
-        true
+        self.circuit_limiters.consume(peer_id, ip, now_ms)
     }
 
     fn peer_circuit_count(&self, peer_id: &PeerId) -> usize {
@@ -1478,6 +1531,13 @@ impl RelayServerAgent {
         if let Some(stop_stream) = circuit.stop_stream {
             self.stop_to_source.remove(&stop_stream);
             self.queue_reset(circuit.destination_peer_id, stop_stream);
+        }
+    }
+
+    fn abort_pending_connect_both(&mut self, source_stream: StreamKey) {
+        self.abort_pending_connect(source_stream);
+        if let Some(worker) = self.hop_workers.remove(&source_stream) {
+            self.queue_reset(worker.peer_id, source_stream);
         }
     }
 
@@ -1578,6 +1638,28 @@ impl RelayServerAgent {
             token,
             PendingOperation::Close {
                 peer_id: peer_id.clone(),
+                circuit: None,
+            },
+        );
+        self.actions.push_back(RelayServerAction::CloseStreamWrite {
+            token,
+            peer_id,
+            stream,
+        });
+    }
+
+    fn queue_circuit_close(
+        &mut self,
+        peer_id: PeerId,
+        stream: StreamKey,
+        source_stream: StreamKey,
+    ) {
+        let token = self.token();
+        self.pending_operations.insert(
+            token,
+            PendingOperation::Close {
+                peer_id: peer_id.clone(),
+                circuit: Some(source_stream),
             },
         );
         self.actions.push_back(RelayServerAction::CloseStreamWrite {
@@ -1600,22 +1682,6 @@ impl RelayServerAgent {
             peer_id,
             stream,
         });
-    }
-
-    fn finish_simple_operation(
-        &mut self,
-        token: RelayServerToken,
-        result: Result<(), String>,
-        kind: RelayServerRuntimeErrorKind,
-    ) {
-        let peer_id = match self.pending_operations.remove(&token) {
-            Some(PendingOperation::Close { peer_id })
-            | Some(PendingOperation::Reset { peer_id }) => peer_id,
-            _ => return,
-        };
-        if let Err(detail) = result {
-            self.runtime_error(kind, Some(peer_id), detail);
-        }
     }
 
     fn token(&mut self) -> RelayServerToken {
@@ -1741,10 +1807,17 @@ mod tests {
         }
     }
 
-    fn connected_circuit(
+    fn pending_circuit_success(
         mut config: RelayServerConfig,
         commit_ms: u64,
-    ) -> (RelayServerAgent, PeerId, PeerId, StreamKey, StreamKey) {
+    ) -> (
+        RelayServerAgent,
+        PeerId,
+        PeerId,
+        StreamKey,
+        StreamKey,
+        RelayServerToken,
+    ) {
         config.reservation_rate_limit_per_peer = None;
         config.reservation_rate_limit_per_ip = None;
         config.circuit_rate_limit_per_peer = None;
@@ -1808,6 +1881,22 @@ mod tests {
         let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap() else {
             panic!("HOP success");
         };
+        (
+            agent,
+            source,
+            destination,
+            source_stream,
+            stop_stream,
+            token,
+        )
+    }
+
+    fn connected_circuit(
+        config: RelayServerConfig,
+        commit_ms: u64,
+    ) -> (RelayServerAgent, PeerId, PeerId, StreamKey, StreamKey) {
+        let (mut agent, source, destination, source_stream, stop_stream, token) =
+            pending_circuit_success(config, commit_ms);
         agent.send_stream_result(token, Ok(()), Now::from_millis(commit_ms));
         assert!(matches!(
             agent.poll_event(),
@@ -2628,6 +2717,109 @@ mod tests {
         assert!(matches!(
             agent.poll_action(),
             Some(RelayServerAction::SendStream { .. })
+        ));
+    }
+
+    #[test]
+    fn failed_hop_success_delivery_cleans_both_precommit_legs() {
+        let (mut agent, _, _, source_stream, stop_stream, token) =
+            pending_circuit_success(RelayServerConfig::default(), 0);
+
+        agent.send_stream_result(
+            token,
+            Err("source queue failed".into()),
+            Now::from_millis(0),
+        );
+
+        assert!(!agent.owns_stream(source_stream));
+        assert!(!agent.owns_stream(stop_stream));
+        let reset_streams: Vec<_> = core::iter::from_fn(|| agent.poll_action())
+            .filter_map(|action| match action {
+                RelayServerAction::ResetStream { stream, .. } => Some(stream),
+                _ => None,
+            })
+            .collect();
+        assert!(reset_streams.contains(&source_stream));
+        assert!(reset_streams.contains(&stop_stream));
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::Error(RelayServerRuntimeError {
+                kind: RelayServerRuntimeErrorKind::SendStream,
+                ..
+            }))
+        ));
+        assert_eq!(agent.poll_event(), None, "no uncommitted lifecycle");
+    }
+
+    #[test]
+    fn a_second_same_direction_send_before_echo_fails_boundedly() {
+        let (mut agent, source, _, source_stream, _) =
+            connected_circuit(RelayServerConfig::default(), 0);
+        for data in [b"first".as_slice(), b"second".as_slice()] {
+            agent.handle_event(
+                &SwarmEvent::StreamData {
+                    peer_id: source.clone(),
+                    conn_id: source_stream.conn_id,
+                    stream_id: source_stream.stream_id,
+                    data: data.to_vec(),
+                },
+                false,
+                Now::from_millis(1),
+            );
+        }
+
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::CircuitClosed {
+                reason: CircuitCloseReason::InternalFailure,
+                ..
+            })
+        ));
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::Error(RelayServerRuntimeError {
+                kind: RelayServerRuntimeErrorKind::InternalInvariant,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn failed_eof_half_close_terminates_the_committed_circuit() {
+        let (mut agent, source, _, source_stream, _) =
+            connected_circuit(RelayServerConfig::default(), 0);
+        agent.handle_event(
+            &SwarmEvent::StreamRemoteWriteClosed {
+                peer_id: source,
+                conn_id: source_stream.conn_id,
+                stream_id: source_stream.stream_id,
+            },
+            false,
+            Now::from_millis(1),
+        );
+        let RelayServerAction::CloseStreamWrite { token, .. } = agent.poll_action().unwrap() else {
+            panic!("half close action");
+        };
+
+        agent.close_stream_write_result(
+            token,
+            Err("half close failed".into()),
+            Now::from_millis(1),
+        );
+
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::CircuitClosed {
+                reason: CircuitCloseReason::InternalFailure,
+                ..
+            })
+        ));
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::Error(RelayServerRuntimeError {
+                kind: RelayServerRuntimeErrorKind::CloseStream,
+                ..
+            }))
         ));
     }
 }

@@ -188,7 +188,6 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     }
 
     /// Registers a protocol only for inbound negotiation by a composed service.
-    #[doc(hidden)]
     pub fn add_inbound_protocol(
         &mut self,
         protocol_id: impl Into<String>,
@@ -198,7 +197,6 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     }
 
     /// Registers a protocol only for outbound opens by a composed service.
-    #[doc(hidden)]
     pub fn add_outbound_protocol(
         &mut self,
         protocol_id: impl Into<String>,
@@ -208,7 +206,6 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     }
 
     /// Adds a protocol only to future Identify responses.
-    #[doc(hidden)]
     pub fn add_advertised_protocol(
         &mut self,
         protocol_id: impl Into<String>,
