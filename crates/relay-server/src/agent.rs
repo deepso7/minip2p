@@ -1109,8 +1109,8 @@ impl RelayServerAgent {
                 destination_stream,
                 deadline_ms,
                 bytes: CircuitByteCounts::default(),
-                source_eof: pending.source_eof,
-                destination_eof: pending.destination_eof,
+                source_eof: false,
+                destination_eof: false,
                 source_to_destination_in_flight: false,
                 destination_to_source_in_flight: false,
             },
@@ -1222,6 +1222,8 @@ impl RelayServerAgent {
         };
         if self.config.max_circuit_bytes != 0 && total > self.config.max_circuit_bytes {
             self.close_circuit(source_stream, CircuitCloseReason::ByteLimit { direction });
+        } else {
+            self.finish_eof_if_drained(source_stream);
         }
     }
 
@@ -1271,25 +1273,30 @@ impl RelayServerAgent {
         let Some(circuit) = self.circuits.get_mut(&source_stream) else {
             return;
         };
-        let (peer_id, stream, finished) = match leg {
+        let (peer_id, stream) = match leg {
             CircuitLeg::Source => {
                 circuit.source_eof = true;
                 (
                     circuit.destination_peer_id.clone(),
                     circuit.destination_stream,
-                    circuit.destination_eof,
                 )
             }
             CircuitLeg::Destination => {
                 circuit.destination_eof = true;
-                (
-                    circuit.source_peer_id.clone(),
-                    circuit.source_stream,
-                    circuit.source_eof,
-                )
+                (circuit.source_peer_id.clone(), circuit.source_stream)
             }
         };
         self.queue_circuit_close(peer_id, stream, source_stream);
+        self.finish_eof_if_drained(source_stream);
+    }
+
+    fn finish_eof_if_drained(&mut self, source_stream: StreamKey) {
+        let finished = self.circuits.get(&source_stream).is_some_and(|circuit| {
+            circuit.source_eof
+                && circuit.destination_eof
+                && !circuit.source_to_destination_in_flight
+                && !circuit.destination_to_source_in_flight
+        });
         if finished {
             self.close_circuit(source_stream, CircuitCloseReason::Eof);
         }
@@ -2838,6 +2845,73 @@ mod tests {
         assert!(matches!(
             agent.poll_action(),
             Some(RelayServerAction::CloseStreamWrite { stream, .. }) if stream == source_stream
+        ));
+    }
+
+    #[test]
+    fn dual_pending_eof_propagates_both_halves_after_buffered_payload() {
+        let (mut agent, source, destination, source_stream, stop_stream, token) =
+            pending_circuit_success(RelayServerConfig::default(), 0);
+        agent.handle_event(
+            &SwarmEvent::StreamData {
+                peer_id: source.clone(),
+                conn_id: source_stream.conn_id,
+                stream_id: source_stream.stream_id,
+                data: b"buffered".to_vec(),
+            },
+            false,
+            Now::from_millis(1),
+        );
+        for (peer_id, stream) in [(source, source_stream), (destination, stop_stream)] {
+            agent.handle_event(
+                &SwarmEvent::StreamRemoteWriteClosed {
+                    peer_id,
+                    conn_id: stream.conn_id,
+                    stream_id: stream.stream_id,
+                },
+                false,
+                Now::from_millis(1),
+            );
+        }
+        agent.send_stream_result(token, Ok(()), Now::from_millis(1));
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::CircuitOpened { .. })
+        ));
+
+        let mut forward = None;
+        let mut closed = Vec::new();
+        while let Some(action) = agent.poll_action() {
+            match action {
+                RelayServerAction::SendStream {
+                    token,
+                    stream,
+                    data,
+                    ..
+                } => {
+                    assert_eq!(stream, stop_stream);
+                    assert_eq!(data, b"buffered");
+                    forward = Some(token);
+                }
+                RelayServerAction::CloseStreamWrite { stream, .. } => closed.push(stream),
+                action => panic!("unexpected action: {action:?}"),
+            }
+        }
+        assert!(closed.contains(&source_stream));
+        assert!(closed.contains(&stop_stream));
+        assert_eq!(agent.poll_event(), None, "payload remains in flight");
+
+        agent.send_stream_result(forward.unwrap(), Ok(()), Now::from_millis(1));
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::CircuitClosed {
+                reason: CircuitCloseReason::Eof,
+                bytes: CircuitByteCounts {
+                    source_to_destination: 8,
+                    destination_to_source: 0,
+                },
+                ..
+            })
         ));
     }
 
