@@ -143,6 +143,8 @@ struct PendingCircuit {
     stop_deadline_ms: Option<u64>,
     source_pipelined: Vec<u8>,
     destination_pipelined: Vec<u8>,
+    source_eof: bool,
+    destination_eof: bool,
 }
 
 struct Circuit {
@@ -381,19 +383,25 @@ impl RelayServerAgent {
                     self.circuit_eof(source_stream, CircuitLeg::Destination);
                     true
                 } else if let Some(worker) = self.hop_workers.get_mut(&key) {
+                    if let Some(circuit) = self.pending_circuits.get_mut(&key) {
+                        circuit.source_eof = true;
+                    }
                     let _ = worker
                         .responder
                         .handle_input(HopResponderInput::RemoteWriteClosed);
                     self.drain_hop(key, now);
                     true
                 } else if let Some(source_stream) = self.stop_to_source.get(&key).copied()
-                    && let Some(stop) = self
-                        .pending_circuits
-                        .get_mut(&source_stream)
-                        .and_then(|circuit| circuit.stop.as_mut())
+                    && let Some(circuit) = self.pending_circuits.get_mut(&source_stream)
+                    && let Some(stop) = circuit.stop.as_mut()
                 {
+                    circuit.destination_eof = true;
                     let _ = stop.handle_input(StopInitiatorInput::RemoteWriteClosed);
                     self.drain_stop(source_stream, now);
+                    true
+                } else if self.pending_circuits.contains_key(&key) {
+                    self.abort_pending_connect(key);
+                    self.hop_workers.remove(&key);
                     true
                 } else {
                     self.rejected_hop_streams.contains_key(&key)
@@ -432,6 +440,10 @@ impl RelayServerAgent {
                 {
                     let _ = stop.handle_input(StopInitiatorInput::RemoteReset);
                     self.drain_stop(source_stream, now);
+                    true
+                } else if self.pending_circuits.contains_key(&key) {
+                    self.abort_pending_connect(key);
+                    self.hop_workers.remove(&key);
                     true
                 } else {
                     self.hop_workers.remove(&key).is_some()
@@ -1097,8 +1109,8 @@ impl RelayServerAgent {
                 destination_stream,
                 deadline_ms,
                 bytes: CircuitByteCounts::default(),
-                source_eof: false,
-                destination_eof: false,
+                source_eof: pending.source_eof,
+                destination_eof: pending.destination_eof,
                 source_to_destination_in_flight: false,
                 destination_to_source_in_flight: false,
             },
@@ -1120,6 +1132,12 @@ impl RelayServerAgent {
                 CircuitDirection::DestinationToSource,
                 pending.destination_pipelined,
             );
+        }
+        if pending.source_eof {
+            self.circuit_eof(source_stream, CircuitLeg::Source);
+        }
+        if pending.destination_eof {
+            self.circuit_eof(source_stream, CircuitLeg::Destination);
         }
     }
 
@@ -1450,6 +1468,8 @@ impl RelayServerAgent {
                 ),
                 source_pipelined: Vec::new(),
                 destination_pipelined: Vec::new(),
+                source_eof: false,
+                destination_eof: false,
             },
         );
         let token = self.token();
@@ -1633,19 +1653,7 @@ impl RelayServerAgent {
     }
 
     fn queue_close(&mut self, peer_id: PeerId, stream: StreamKey) {
-        let token = self.token();
-        self.pending_operations.insert(
-            token,
-            PendingOperation::Close {
-                peer_id: peer_id.clone(),
-                circuit: None,
-            },
-        );
-        self.actions.push_back(RelayServerAction::CloseStreamWrite {
-            token,
-            peer_id,
-            stream,
-        });
+        self.queue_close_for(peer_id, stream, None);
     }
 
     fn queue_circuit_close(
@@ -1654,12 +1662,16 @@ impl RelayServerAgent {
         stream: StreamKey,
         source_stream: StreamKey,
     ) {
+        self.queue_close_for(peer_id, stream, Some(source_stream));
+    }
+
+    fn queue_close_for(&mut self, peer_id: PeerId, stream: StreamKey, circuit: Option<StreamKey>) {
         let token = self.token();
         self.pending_operations.insert(
             token,
             PendingOperation::Close {
                 peer_id: peer_id.clone(),
-                circuit: Some(source_stream),
+                circuit,
             },
         );
         self.actions.push_back(RelayServerAction::CloseStreamWrite {
@@ -2749,6 +2761,84 @@ mod tests {
             }))
         ));
         assert_eq!(agent.poll_event(), None, "no uncommitted lifecycle");
+    }
+
+    #[test]
+    fn source_reset_while_connect_is_pending_cleans_the_stop_leg() {
+        let (mut agent, source, _, source_stream, stop_stream, _) =
+            pending_circuit_success(RelayServerConfig::default(), 0);
+
+        agent.handle_event(
+            &SwarmEvent::StreamClosed {
+                peer_id: source,
+                conn_id: source_stream.conn_id,
+                stream_id: source_stream.stream_id,
+            },
+            false,
+            Now::from_millis(1),
+        );
+
+        assert!(agent.pending_circuits.is_empty());
+        assert!(!agent.owns_stream(source_stream));
+        assert!(!agent.owns_stream(stop_stream));
+        assert!(matches!(
+            agent.poll_action(),
+            Some(RelayServerAction::ResetStream { stream, .. }) if stream == stop_stream
+        ));
+        assert_eq!(agent.poll_action(), None);
+        assert_eq!(agent.poll_event(), None, "no uncommitted lifecycle");
+    }
+
+    #[test]
+    fn source_eof_while_connect_is_pending_propagates_after_commit() {
+        let (mut agent, source, _, source_stream, stop_stream, token) =
+            pending_circuit_success(RelayServerConfig::default(), 0);
+
+        agent.handle_event(
+            &SwarmEvent::StreamRemoteWriteClosed {
+                peer_id: source,
+                conn_id: source_stream.conn_id,
+                stream_id: source_stream.stream_id,
+            },
+            false,
+            Now::from_millis(1),
+        );
+        agent.send_stream_result(token, Ok(()), Now::from_millis(1));
+
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::CircuitOpened { .. })
+        ));
+        assert!(matches!(
+            agent.poll_action(),
+            Some(RelayServerAction::CloseStreamWrite { stream, .. }) if stream == stop_stream
+        ));
+    }
+
+    #[test]
+    fn destination_eof_while_connect_is_pending_propagates_after_commit() {
+        let (mut agent, _, destination, source_stream, stop_stream, token) =
+            pending_circuit_success(RelayServerConfig::default(), 0);
+
+        agent.handle_event(
+            &SwarmEvent::StreamRemoteWriteClosed {
+                peer_id: destination,
+                conn_id: stop_stream.conn_id,
+                stream_id: stop_stream.stream_id,
+            },
+            false,
+            Now::from_millis(1),
+        );
+        agent.send_stream_result(token, Ok(()), Now::from_millis(1));
+
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::CircuitOpened { .. })
+        ));
+        assert!(matches!(
+            agent.poll_action(),
+            Some(RelayServerAction::CloseStreamWrite { stream, .. }) if stream == source_stream
+        ));
     }
 
     #[test]
