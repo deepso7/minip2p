@@ -1,174 +1,658 @@
-# Circuit Relay v2 Relay Server for minip2p (seed draft)
+# Circuit Relay v2 Relay Server for minip2p
 
-> **Status:** Non-canonical seed for the Wayfinder effort. The map and its
-> decision tickets are authoritative for unresolved questions. Revise and mark
-> this document validated only after the map closes.
+> **Status:** Canonical implementation-ready specification, validated by the
+> [Circuit Relay v2 relay-server Wayfinder map](https://github.com/deepso7/minip2p/issues/61).
 >
 > **Reference pins:** rust-libp2p `libp2p-relay` 0.22 at
 > [`170c3c81ddd80e7c58b0500563e00a09139e8545`](https://github.com/libp2p/rust-libp2p/tree/170c3c81ddd80e7c58b0500563e00a09139e8545/protocols/relay)
-> and the Circuit Relay v2 specification at
+> and Circuit Relay v2 at
 > [`6b6203ee6f62938ce67efdb33498173f475851c0`](https://github.com/libp2p/specs/blob/6b6203ee6f62938ce67efdb33498173f475851c0/relay/circuit-v2.md).
 
-## Context
+## Goal and boundaries
 
-minip2p ships the full **client** side of Circuit Relay v2 (`HopReservation`/`HopConnect`/`StopResponder` in `crates/relay`, `CircuitTransport`, `NatAgent` orchestration), but no relay **server** — docs point users at rust-libp2p's relay. Server-ish code exists only as limit-less test fixtures (`tests/support/relay.rs` `RelayMachine`, `crates/test-support` `RelayEmulator`).
+Add an easily hosted, production-oriented Circuit Relay v2 server while
+preserving minip2p's layering: wire machines in `crates/relay`, a deterministic
+`no_std + alloc` service in a new `crates/relay-server`, and all sockets, clocks,
+waiting, and Endpoint composition in `crates/minip2p`.
 
-This adds a production relay server matching rust-libp2p `relay::Behaviour` semantics (protocols/relay v0.22.0, verified in source), layered sans-I/O like the NAT stack.
-
-**Scope decisions (confirmed):** full-stack layering with an Endpoint `relay-server` feature; no reservation voucher (`voucher: None`, like rust-libp2p); ship `examples/relay-server`; full limits parity including per-peer/per-IP rate limiters with rust-libp2p defaults.
-
-**rust-libp2p reference values:** `max_reservations=128`, `max_reservations_per_peer=4`, `reservation_duration=3600s`, `max_circuits=16`, `max_circuits_per_peer=4` (peer counted as src OR dst), `max_circuit_duration=120s`, `max_circuit_bytes=128KiB`, rate limits: reservations per-peer 30/120s + per-IP 60/60s, circuit-src same; reservations live per (peer, connection), renewed by re-RESERVE on the same connection; HOP denied on relayed (circuit) connections.
-
-A second-round review suggested further corrections; each was verified against source and adopted, adapted, or rejected as noted inline (see "Connection identity" for the main adaptation).
-
-## Crate responsibility boundary
-
-```text
-crates/relay                 One stream: what bytes should be parsed or produced?
-crates/relay-server          Whole service: should this request be accepted, which
-                             reservation owns it, which streams form the circuit,
-                             and where should data go?
-crates/minip2p/std/relay_server.rs   I/O adapter: execute agent actions against Swarm.
-```
-
-- **`crates/relay`** keeps ALL wire protocol: messages (`HopMessage`/`StopMessage`/`Reservation`/`Limit`/`Status`), protocol IDs, framing helpers, wire errors, and the per-stream state machines — existing client roles (`HopReservation`, `HopConnect`, `StopResponder`) plus new relay-side roles (`HopResponder`, `StopInitiator`). Restructure into `src/{lib.rs, message.rs, client.rs, server.rs}` (client machines move from `lib.rs` into `client.rs`, re-exported unchanged). `server.rs` means relay-side **wire roles**, not an operational server. Each machine owns exactly one HOP or STOP stream and knows nothing about reservation/circuit tables, other streams, clocks/expiry, admission policy, rate limits, capacity, byte forwarding, or swarm APIs.
-- **`crates/relay-server`** (package `minip2p-relay-server`) holds the whole sans-I/O service: `RelayServerAgent`, reservation + circuit tables, admission policy, expiry/timeouts, limits, peer/IP rate limiting, connection-scoped stream ownership, HOP↔STOP coordination, bridge-forwarding actions, byte/duration accounting, application events. Layout: `src/{lib.rs, agent.rs, config.rs, events.rs, limiter.rs, reservation.rs, circuit.rs, types.rs}` + `tests/`.
-- `HopResponder`/`StopInitiator` stay in `crates/relay` beside the client machines — reusable wire primitives, not orchestration.
-
-## Connection identity
-
-> Never route relay-server traffic by PeerId + StreamId alone when an exact ConnectionId is available.
-
-Facts verified in `crates/swarm/src/core.rs`:
-
-- Every stream-scoped `SwarmEvent` already carries `conn_id` (`events.rs:48-73`).
-- The swarm is **single-connection-per-peer, last-wins**: `register_connection` (`core.rs:994-1006`) supersedes any existing connection to the same peer; `supersede_connection` (`core.rs:1045`) synchronously emits `ConnectionClosed` for the old conn and purges its `stream_owner`/negotiator/action state. Stream lookups (`require_stream_conn`, `core.rs:811`) check the live `conn_to_peer` mapping, so a stale `(peer, stream_id)` from a superseded connection fails with `StreamNotFound` — it can never mis-route to the new connection.
-
-Consequences (adapting the review's "add `open_stream_on`/`send_stream_on`/… swarm APIs" — **not needed for correctness** given the invariants above; noted in the relay-server README so it's revisited if the swarm ever goes multi-connection):
-
-- The agent still keys everything by exact identity — that part of the review stands:
+The application happy path is intentionally small:
 
 ```rust
-pub struct StreamKey { pub conn_id: ConnectionId, pub stream_id: StreamId }
-struct ReservationKey { peer_id: PeerId, conn_id: ConnectionId }
+let endpoint = Endpoint::builder()
+    .relay_server()
+    .bind(...)?;
+```
 
-pub enum RelayServerAction {
-    OpenStream { token: RelayServerToken, dst: PeerId, conn_id: ConnectionId, protocol_id: String },
-    SendStream { stream: StreamKey, peer: PeerId, data: Vec<u8> },
-    CloseStreamWrite { stream: StreamKey, peer: PeerId },
-    ResetStream { stream: StreamKey, peer: PeerId },
+The implementation may make breaking pre-1.0 changes. Migrate affected callers
+and tests atomically; do not add compatibility shims for the old Swarm event or
+internal protocol-registration shapes.
+
+Out of scope: reservation vouchers, relay discovery/autorelay, ACLs, metrics,
+proxy-aware IP limiting, a portable/smoltcp Endpoint relay-server driver,
+Swarm-wide pre-negotiation stream caps, and replacing the existing test relay
+fixtures. `voucher` remains `None`. The last two omissions are documented, not
+silently described as parity.
+
+## Module boundary
+
+```text
+crates/relay                         One HOP or STOP stream's wire state.
+crates/swarm                         Directional protocol registration and
+                                     connection-close cause.
+crates/relay-server                  Whole sans-I/O relay service and policy.
+crates/minip2p/src/std/relay_server  I/O adapter and Endpoint composition.
+```
+
+- `crates/relay` owns protobuf messages, the 8 KiB frame boundary, protocol
+  identifiers, status encoding, and per-stream client/server machines. It owns
+  no reservation table, clock, admission policy, or forwarding policy.
+- `crates/relay-server` owns reservations, circuits, limiters, deadlines,
+  admission, forwarding actions, byte accounting, and public lifecycle events.
+  It is `no_std + alloc` and uses `minip2p_platform::Now`.
+- `crates/swarm` exposes only the deeper mechanisms shared by NAT and the relay
+  server. It does not learn relay policy.
+- `crates/minip2p` owns feature composition, the driver, address contributions,
+  blocking waits, and the application-facing API.
+
+Actions, action tokens, `StreamKey`, pending-control records, and driver plumbing
+remain public only where needed by low-level `minip2p-relay-server` embedders.
+They are not re-exported from `minip2p`.
+
+## Frozen public API
+
+### Configuration
+
+```rust
+pub struct RateLimit {
+    pub capacity: u32,
+    pub refill_interval_ms: u64,
+}
+
+pub struct RelayServerConfig {
+    pub max_reservations: usize,
+    pub reservation_duration_secs: u64,
+    pub max_circuits: usize,
+    pub max_circuits_per_peer: usize,
+    pub max_circuit_duration_secs: u64,
+    pub max_circuit_bytes: u64,
+    pub max_pending_hop_requests_per_connection: usize,
+    pub max_pending_stop_requests_per_connection: usize,
+    pub control_stream_timeout_ms: u64,
+    pub reservation_rate_limit_per_peer: Option<RateLimit>,
+    pub reservation_rate_limit_per_ip: Option<RateLimit>,
+    pub circuit_rate_limit_per_peer: Option<RateLimit>,
+    pub circuit_rate_limit_per_ip: Option<RateLimit>,
 }
 ```
 
-  (`peer` carried alongside `StreamKey` so the driver can call today's peer-keyed swarm APIs; `conn_id` is the authority for the agent's own tables and validation.)
-- A reservation dies when its exact connection closes — supersession emits that `ConnectionClosed`, so a reconnecting peer's old reservation is dropped before the new connection registers. Renewal on the same `ReservationKey` replaces (never transiently consumes an extra global/per-peer slot).
-- Opening STOP: driver uses the existing `open_stream_with_connection` (`runtime.rs:296`) and reports the returned `(conn_id, stream_id)`; the agent verifies the conn id equals the reservation's `conn_id` and treats a mismatch (supersession race window) as `NoReservation`. This closes the only real race without new swarm APIs.
-- Only swarm addition required: `SwarmCore::remote_addr(&self, ConnectionId) -> Option<&Multiaddr>` over the private `conn_to_remote_addr` map (`core.rs:164`) — for the per-IP limiter.
-- The review's "two simultaneous connections per peer" tests are not constructible in this swarm; replaced with **supersession tests** (see PR 2 tests).
+Defaults:
 
-## Staging — 4 PRs + follow-up
+| Field | Default |
+| --- | ---: |
+| `max_reservations` | 128 |
+| `reservation_duration_secs` | 3,600 |
+| `max_circuits` | 16 |
+| `max_circuits_per_peer` | 4 |
+| `max_circuit_duration_secs` | 120 |
+| `max_circuit_bytes` | 131,072 |
+| both pending HOP/STOP caps | 10 |
+| `control_stream_timeout_ms` | 60,000 |
+| reservation/circuit per-peer limiter | capacity 30, one token per 120,000 ms |
+| reservation/circuit per-IP limiter | capacity 60, one token per 60,000 ms |
 
-### PR 1 — Server wire roles in `crates/relay`
+`None` disables an individual limiter. There is no
+`max_reservations_per_peer`: the invariant is one committed reservation per
+peer.
 
-Restructure into `client.rs`/`server.rs` (pure move + re-export), then add, both `impl minip2p_core::SansIoProtocol` with `Error = RelayError`, reusing `decode_frame`/`checked_outbound_frame`/`enforce_max_size` (widen to `pub(crate)`):
+Each enabled limiter is a token bucket that starts full. An admitted check
+consumes one token; access processes every elapsed one-token refill interval up
+to `capacity`. A full bucket may be removed because a missing bucket is
+equivalent to full. An expiry-ordered refill schedule avoids full-map scans but
+does not impose a hard budget when many entries are simultaneously due.
 
-- **`HopResponder`** — one inbound HOP stream, wire-level only. States: `AwaitingRequest → AwaitingDecision(Reserve|Connect) → ResponseQueued → Done | Bridged`. Transport lifecycle stays out of the wire machine: it has no `StreamClosed` input and no transport-level `Closed` state — the *agent* consumes `StreamClosed`/`ConnectionClosed` and tracks its own ownership states (see PR 2 lifecycle).
-  - Input: `{Flush, Data(Vec<u8>), RemoteWriteClosed, AcceptReservation { reservation: Reservation, limit: Option<Limit> }, AcceptConnect { limit: Option<Limit> }, Deny(Status)}`
-  - Output: `{Request(HopRequest::{Reserve, Connect { dst_peer_id: Vec<u8> }}), Outbound(Vec<u8>), BridgeData(Vec<u8>)}`
-  - `AcceptReservation` goes through `checked_outbound_frame` (host addr list can overflow `MAX_MESSAGE_SIZE = 8192`). `AcceptConnect` releases residual `recv_buf` as `BridgeData` (same as `StopResponder::accept`); later `Data` in `Bridged` → `BridgeData`.
-- **`StopInitiator`** — outbound STOP stream, near-verbatim mirror of `HopConnect` with `StopMessage` framing. `new(src_peer_id: Vec<u8>, limit: Option<Limit>)` queues `StopMessage{CONNECT, peer:{id: src, addrs: []}, limit}` (relay never forwards src addrs). Input `{Flush, Data, RemoteWriteClosed}` → Output `{Outbound, Outcome(StopConnectOutcome::{Accepted, Refused{status, reason}}), BridgeData}`, incl. pipelined-byte capture and the `pending_error` deferred-oversize pattern.
-- **Malformed-request boundary** (one consistent rule; machine surfaces enough info for the agent to apply it):
-  - Well-formed frame, wrong kind or missing required field → send the appropriate failure status (400 malformed / 401 unexpected) via `encode_hop_status(Status) -> Vec<u8>` (exported helper), then half-close.
-  - Invalid framing, oversized declared frame, or no valid response formable → reset the stream. No overlap between the two rules.
-- **Tests:** mirror the existing 21-test style — fragmentation, pipelined bridge bytes, deny, wrong-kind, missing peer on Connect, oversized declared frame, exact-max frame, accept-before-request error, SansIoProtocol conformance, input-after-`Done` behavior, `RemoteWriteClosed` in each state.
-- **Fuzz:** `fuzz_relay_server(data)` in `fuzz/fuzz_targets/wire_inputs.rs` feeding arbitrary bytes into both machines' `handle_input`.
-- Docs: `crates/relay/README.md` + module docs → "client and server wire roles".
+`RelayServerConfig::validate()` returns `RelayServerConfigError { field,
+reason }`. Validate before binding sockets and again in `RelayServerAgent::new`.
+Reject zero reservation duration, `max_circuit_duration_secs` above the Circuit
+Relay `Limit.duration` wire bound (`u32::MAX` seconds), zero control timeout,
+and zero capacity or refill interval in an enabled limiter.
 
-### PR 2 — `crates/relay-server` (+ the one swarm accessor)
+Zero reservation/circuit/pending capacities deny new work. Zero circuit
+duration and zero circuit bytes mean unlimited and are advertised as `0`.
+Never panic or silently saturate a configured duration into the wire `u32`.
 
-`no_std + alloc`, modeled on `crates/nat`. Deps: `minip2p-core`, `minip2p-relay`, `minip2p-swarm`, `minip2p-transport`, `minip2p-platform`, `thiserror`. Re-exports `HOP_PROTOCOL_ID`/`STOP_PROTOCOL_ID`. Includes the `SwarmCore::remote_addr` accessor.
-
-**Config** (`config.rs`) — rust-libp2p defaults above, plus honestly-named stream protections:
-
-```rust
-pub max_pending_hop_requests_per_connection: usize,  // 10
-pub control_stream_timeout_ms: u64,                  // 60_000
-```
-
-These bound *accepted* (post-negotiation) HOP streams awaiting a request/decision and the HOP/STOP exchange deadline — not "in-flight negotiations". **Documented deviation:** rust-libp2p additionally bounds concurrent stream *negotiations* per connection at the handler level (pre-`StreamReady`); minip2p's equivalent would live in `crates/swarm` and is out of scope — stated in README/rustdoc rather than claiming full parity.
-
-Four `Option<RateLimit { limit: u32, interval_ms: u64 }>` fields for reservation/circuit × per-peer/per-IP. **Documented deviation:** all cap checks use consistent "would exceed ⇒ deny" (`>=`) semantics, fixing rust-libp2p's per-peer `>` off-by-one.
-
-**Rate limiter** (`limiter.rs`): token bucket — this *is* rust-libp2p's algorithm (verified: `GenericRateLimiter`, refill-on-access token bucket with a refill schedule), so "same default capacities and intervals, token-bucket semantics" is genuine parity. Keyed by `PeerId` and `IpKey::{V4([u8;4]), V6([u8;16])}` from the connection remote addr's first `Ip4`/`Ip6` component; no IP component ⇒ the IP limiter passes. **Bounded GC:** no full-map scan per request — keep an expiry-ordered schedule (mirroring rust-libp2p's `refill_schedule`) and sweep only due entries per call. Unit tests: refill, boundary at limit, GC removes only full buckets, GC cost bounded under many distinct keys.
-
-**`RelayServerAgent`** (`agent.rs`) — contract shape of `NatAgent`, time via `minip2p_platform::Now` (`monotonic_ms`, `unix_seconds: Option<u64>`):
+### Builder and Endpoint controls
 
 ```rust
-new(local_peer_id, config)
-set_listen_addrs(&[Multiaddr])
-set_enabled(bool)                       // disabled ⇒ deny RESERVATION_REFUSED
-handle_event(&SwarmEvent, is_circuit: bool, now: Now) -> bool   // true = claimed
-connection_addr(ConnectionId, Option<&Multiaddr>)
-handle_tick(now)
-stream_open_result(token, Result<(ConnectionId, StreamId), ...>, now)
-send_stream_result(stream: StreamKey, Result<(), ...>, now)
-poll_action() / poll_event() / next_timeout(now_ms) / owns_stream(StreamKey) / is_idle()
+EndpointBuilder::relay_server() -> Self
+EndpointBuilder::relay_server_config(
+    RelayServerConfig,
+) -> Result<Self, RelayServerConfigError>
+EndpointBuilder::relay_server_announce_addrs(
+    Vec<Multiaddr>,
+) -> Result<Self, RelayServerAddressError>
+
+Endpoint::set_relay_server_accepting(
+    bool,
+) -> Result<(), RelayServerControlError>
+Endpoint::set_relay_server_announce_addrs(
+    Vec<Multiaddr>,
+) -> Result<(), RelayServerControlError>
+Endpoint::take_relay_server_events() -> Vec<RelayServerEvent>
+Endpoint::next_relay_server_event(
+    impl Into<Deadline>,
+) -> Result<Option<RelayServerEvent>, Error>
 ```
 
-No endpoint-composition flags in the agent (no `reject_inbound_stop`) — composition lives in the driver layer (PR 3).
+Only `relay_server()` and `relay_server_config(...)` enable the service and its
+static HOP advertisement. Announce-address calls are order-independent with
+those methods but never enable the service. If addresses are pending at bind
+without relay-server enablement, bind fails actionably. Runtime controls on an
+absent service return `RelayServerControlError::NotConfigured`.
 
-Events: `ReservationAccepted{src, renewed}`, `ReservationDenied{src, status}`, `ReservationClosed{src}`, `CircuitDenied{src, dst, status}`, `CircuitOpened{src, dst}`, `CircuitClosed{src, dst, bytes, reason: CircuitCloseReason::{Eof, ByteLimit, DurationLimit, StreamReset, ForwardFailed, ConnectionClosed}}`.
+`set_relay_server_accepting(false)` pauses new admissions only: RESERVE returns
+`RESERVATION_REFUSED`, CONNECT returns `PERMISSION_DENIED`, HOP remains
+advertised, and existing reservations and circuits remain active. Re-enabling
+resumes admission without rebuilding state.
 
-Semantics:
+Address errors are distinct and actionable:
 
-- **Claiming:** inbound HOP `StreamReady` → own (keyed by `StreamKey`), spawn `HopResponder`, arm `control_stream_timeout_ms`. `is_circuit` ⇒ own + `Deny(PermissionDenied)`. Over `max_pending_hop_requests_per_connection` ⇒ `ResetStream` but retain ownership until terminal close (RejectedControl-style retention). Locally-initiated STOP streams in its registry → claimed. Unrelated inbound STOP → **ignored** (not claimed).
-- **RESERVE** (checks in order): enabled → rate limiters (peer, IP) → per-peer count → global count. Renewals consume rate-limit tokens but replace the existing reservation for global/per-peer **capacity** accounting (matches rust-libp2p's unconditional limiters + skipped per-peer check; deliberately fixes their global check denying renewals at capacity — pinned by test). Failure ⇒ `Deny(ResourceLimitExceeded)` (`ReservationRefused` when disabled), half-close, event. Accept ⇒ reservation-addrs helper output + `expire: now.unix_seconds.map(|s| s.saturating_add(duration))` + `Limit{duration, data}`, half-close, `renewed` from existing key. Internal expiry always on `monotonic_ms` (wire `expire` only when `unix_seconds` is available). All deadline arithmetic — reservation expiry, circuit deadlines, control-stream deadlines, limiter refill schedules — uses saturating operations. Exact-connection close (incl. supersession) or expiry ⇒ drop + `ReservationClosed`.
-- **Reservation addrs helper** (`reservation.rs`, pure + tested): start from current usable listen addrs; exclude `/p2p-circuit` addrs; exclude unspecified addrs (`0.0.0.0`, `[::]`); strip existing/conflicting trailing `/p2p/...`; append `/p2p/<local-peer-id>` exactly once; dedupe; enforce the 8 KiB encoded-response limit (drop excess addrs deterministically rather than fail).
-- **CONNECT(dst):** enabled → circuit rate limiters (src-keyed) → per-peer circuits counting src-or-dst for both endpoints, src==dst counted once → global cap ⇒ `Deny(ResourceLimitExceeded)`; dst reservation lookup ⇒ else `Deny(NoReservation)`. Then `OpenStream{dst, conn_id: reservation.conn_id, STOP_PROTOCOL_ID}` → on result, verify the swarm-selected conn id matches the reservation's (mismatch ⇒ `NoReservation`) → `StopInitiator`. `Accepted` ⇒ `AcceptConnect{limit}`, cross-flush pipelined bytes, `CircuitOpened`. Refusal/failure → HOP status mapping: ResourceLimitExceeded→201, PermissionDenied→202, open-failure/unsupported/timeout/reset→203, wrong-type→401, malformed→400; `CircuitDenied`, both streams cleaned up.
-- **Bridging & forwarding failures:** `StreamData` on one leg ⇒ `SendStream` on the other. `SendStream` is **not** fire-and-forget: send rejection is reported to the agent via `send_stream_result` and terminates both circuit legs — remove circuit accounting, `CircuitClosed{ForwardFailed}`. Buffering (documented): the agent does not retain per-circuit payload buffers after actions are pumped; accepted writes are bounded by the selected transport's configured queues and flow-control limits (QUIC stream windows / yamux windows), and `max_circuit_bytes` (default 128 KiB) bounds total forwarded volume per circuit. With `max_circuit_bytes = 0` (unlimited), relay-side memory is bounded by the transport, not the agent — documented deviation from rust-libp2p's `CopyFuture`, which gets backpressure from async writes. Half-closes propagate (`StreamRemoteWriteClosed` ⇒ `CloseStreamWrite` on the peer leg); both EOF ⇒ `Eof`; `StreamClosed` on one leg ⇒ reset the other (`StreamReset`); `ConnectionClosed` sweeps that connection's reservations, circuits, and pending streams (`ConnectionClosed` reason).
-- **Byte limit (pinned semantics):** count bytes accepted for forwarding, both directions, one saturating `u64`; check *after* accepting a chunk; the final chunk is forwarded **complete**, then the circuit closes — one-chunk overshoot allowed (matches rust-libp2p's soft cap); `max_circuit_bytes = 0` ⇒ unlimited. Tests pin: exact-boundary chunk, overshooting final chunk delivered then closed, `0` never closes.
-- **Duration limit:** deadline armed at circuit open from `max_circuit_duration_secs` (0 ⇒ unlimited) ⇒ reset both legs, `DurationLimit`.
-- **Terminal stream lifecycle (agent-side):** the agent's per-stream ownership record tracks `Active → LocalWriteClosed → Closed` and is what consumes `StreamClosed`/`ConnectionClosed` (the wire machine never sees transport lifecycle). After a reservation response or denial the stream stays owned until the terminal event, so trailing events never leak to the app and pending-stream accounting stays correct. Tests: local half-close then remote close; remote half-close; reset after response; connection closure while a response is queued.
-- **`next_timeout`:** min over reservation expiries, circuit deadlines, control-stream deadlines (all `monotonic_ms`).
+```rust
+pub struct RelayServerAddressError {
+    pub index: usize,
+    pub address: Multiaddr,
+    pub reason: RelayServerAddressErrorKind,
+}
 
-**Tests** (`crates/relay-server/tests/`, scripted `SwarmEvent` style of `crates/nat/tests/`): reservation accept/renew/expire/deny-at-cap; renewal at global capacity succeeds as replacement; connect happy path with pipelined bytes both ways; NO_RESERVATION; per-peer (src and dst accounting, src==dst no double-count) + global circuit caps; byte-limit final-chunk behavior; duration close; rate-limiter denial + bounded GC; control-stream timeout awaiting HOP request; timeout while outbound STOP negotiates; circuit-conn HOP denial; malformed boundary (status+half-close vs reset); forwarding failure on either leg; half-close propagation both directions; **supersession**: reservation on conn A → same peer reconnects (conn B) → old reservation dropped, CONNECT for that dst gets `NoReservation` until re-RESERVE on conn B; stale stream events for conn A after supersession don't corrupt agent state; STOP conn-id-mismatch verification path; closing one connection removes only its reservations/circuits; reservation addr filtering; oversized reservation response. Plus a wire-parity test: two `NatAgent` clients against a `RelayServerAgent` in memory.
+pub enum RelayServerAddressErrorKind {
+    Wildcard,
+    Circuit,
+    ConflictingPeerId { expected: PeerId, found: PeerId },
+    UnsupportedShape,
+}
 
-### PR 3 — Endpoint feature + driver + end-to-end tests
+pub enum RelayServerControlError {
+    NotConfigured,
+    InvalidAddress(RelayServerAddressError),
+}
+```
 
-- **Feature** (`crates/minip2p/Cargo.toml`): `relay-server = ["std", "dep:minip2p-relay-server"]`; `std` list gains `minip2p-relay-server?/std`. Independent of `nat`.
-- **Driver** `crates/minip2p/src/std/relay_server.rs` (template `std/nat.rs`): `RelayServerDriver { agent, events, epoch }`; `now()` → `platform::Now`; `ingest`/`tick`/`pump`/`execute`. `execute` maps actions onto the existing peer-keyed swarm APIs (`open_stream_with_connection` for STOP opens, reporting `(conn_id, stream_id)` back via `stream_open_result`; `send_stream` results via `send_stream_result`). `is_circuit` from `ConnectionId::is_circuit` (namespace `0x80`). On `ConnectionEstablished`, feed `agent.connection_addr(conn_id, swarm.core().remote_addr(conn_id))`.
-- **Driver ownership** (order **relay-server → nat → pubsub** in `ingest_into_drivers`, `std/mod.rs:563-579`; no changes to `crates/nat`):
-  - `RelayServerAgent` claims inbound HOP (always, when active); circuit connections owned + denied.
-  - It claims locally-initiated STOP streams in its registry; ignores unrelated inbound STOP.
-  - `NatDriver` claims trusted inbound STOP when configured (its `agent.rs:557-597` path untouched).
-  - When **no** STOP consumer exists (relay-server without nat), the Endpoint installs a small reserved-protocol rejector — endpoint-level, not an agent flag — that owns-and-resets inbound STOP `StreamReady`s so they never leak as application streams.
-  - Connection lifecycle + `PeerReady` observed by all drivers, claimed by none.
-- **Builder/plumbing** (`std/mod.rs`): `EndpointBuilder::relay_server()` + `relay_server_config(RelayServerConfig)`; HOP/STOP registered via the existing dedupe (`std/mod.rs:1894-1911`); widen the `any(feature = "nat", feature = "pubsub")` driver cfg gates to include `relay-server`; fold `agent.next_timeout` into `driver_step_deadline`; sync listen addrs alongside `sync_nat_listen_addrs`. Public: `Endpoint::take_relay_server_events()`; re-export `RelayServerConfig`/`RelayServerEvent`/`RateLimit` only — `StreamKey` stays in `minip2p-relay-server` actions and driver plumbing; Endpoint users see configuration and events, nothing stream-level.
-- **Integration test** `crates/minip2p/tests/relay_server.rs` (matrix row `nat,relay-server`): relay Endpoint with `.relay_server()`, two peers on the existing client stack (`.relay(addr)`, force_relay, `ReservationPolicy::Always`, same shape as `tests/nat.rs`): reserve → connect → bidirectional data; tiny `max_circuit_bytes` closes the circuit (final-chunk semantics observable); `max_reservations: 0` refusal reaches the client; connect to unreserved peer → NO_RESERVATION at the dialer; HOP over a circuit connection denied; client reconnect (supersession) requires re-reservation before it is dialable again.
-- **Portable:** agent is `no_std`-ready; std driver only here. `portable-relay-server` is an explicit follow-up; smoltcp test keeps its hand-rolled `RelayService` for now.
+The nested address error is the `source` of `InvalidAddress`. Builder
+validation returns it directly. Validate structural address rules immediately;
+if builder identity is not yet fixed, repeat the peer-ID match at bind. Runtime
+replacement validates the entire input before mutation; one invalid address
+preserves the previous override. Empty input clears the explicit override and
+returns to automatic address selection.
 
-### PR 4 — Example, docs, CI
+### Events and supporting types
 
-- `examples/relay-server` (workspace member, `publish = false`), structure of `examples/peer`: `--quic <addr>` / `--tcp <addr>`, optional `--key <path>`, limit override flags; prints its `PeerAddr`, logs `RelayServerEvent`s. Features `["relay-server", "tcp"]`.
-- Docs: `docs/md/guides/traverse-nat.mdx` (drop the "bring rust-libp2p's relay" warning; point at `.relay_server()` + example), `docs/md/reference/feature-matrix.mdx` new row, `crates/relay-server/README.md`, `crates/relay/README.md` update. Documented deviations collected in the relay-server README: `>=` cap semantics; no swarm-level negotiation caps; unlimited-bytes backpressure note; single-connection-per-peer assumption and where it's load-bearing.
-- `justfile` + `.github/workflows/ci.yml`: check/clippy/test variants `--features relay-server` and `--features nat,relay-server`; `check-nostd` gains `-p minip2p-relay-server`; docs row gains the feature. Verify `just release` picks up the new publishable crate.
+```rust
+pub enum RelayServerEvent {
+    ReservationAccepted {
+        peer_id: PeerId,
+        renewed: bool,
+        expires_unix_secs: Option<u64>,
+    },
+    ReservationDenied { peer_id: PeerId, status: Status },
+    ReservationClosed { peer_id: PeerId, reason: ReservationCloseReason },
+    CircuitDenied {
+        source_peer_id: PeerId,
+        destination_peer_id: PeerId,
+        status: Status,
+    },
+    CircuitOpened { source_peer_id: PeerId, destination_peer_id: PeerId },
+    CircuitClosed {
+        source_peer_id: PeerId,
+        destination_peer_id: PeerId,
+        bytes: CircuitByteCounts,
+        reason: CircuitCloseReason,
+    },
+    Error(RelayServerRuntimeError),
+}
 
-### PR 5 (follow-up) — retire `tests/support/relay.rs` internals
+pub enum ReservationCloseReason {
+    Expired,
+    ConnectionClosed,
+    Superseded,
+    InternalFailure,
+}
 
-Swap `RelayMachine` for a real `.relay_server()` Endpoint behind the existing `RelayServer::spawn/spawn_tcp/cut_all/assert_healthy/trace` surface (`crates/minip2p/tests/{nat,pubsub}.rs`, `crates/ffi/tests/relayed.rs`, `examples/chat/tests/` only gain a dev-dep feature). `RelayEmulator` in `crates/test-support` stays for the `crates/nat` scripted tests. Deferred so PR 3's integration test proves parity first.
+pub enum CircuitDirection { SourceToDestination, DestinationToSource }
+pub enum CircuitLeg { Source, Destination }
 
-## Review points adopted vs. adapted
+pub struct CircuitByteCounts {
+    pub source_to_destination: u64,
+    pub destination_to_source: u64,
+}
 
-- **Adopted:** crate boundary + `client.rs`/`server.rs` split; `StreamKey`/`ReservationKey` keying; renewal-as-replacement; honest pending/timeout naming + documented negotiation-cap deviation; `send_stream_result` feedback; pinned byte-limit semantics; token-bucket limiter with bounded GC; terminal stream lifecycle; reservation-addrs helper; endpoint-level STOP rejector instead of an agent flag; consistent malformed boundary.
-- **Adapted (with source evidence):** connection-targeted swarm APIs (`open_stream_on` et al.) dropped — the swarm is single-connection-per-peer with last-wins supersession that synchronously purges old-connection stream state, so peer-keyed APIs cannot mis-route; conn-identity *verification* + supersession tests replace them. "Two simultaneous connections" tests replaced by supersession tests. Backpressure knob (`max_forward_queue_bytes`) rejected as unmeasurable at this seam; replaced by an honest documented bound (transport flow control + `max_circuit_bytes`).
+pub enum CircuitCloseReason {
+    Eof,
+    ByteLimit { direction: CircuitDirection },
+    DurationLimit,
+    StreamReset { leg: CircuitLeg },
+    ForwardFailed { direction: CircuitDirection },
+    ConnectionClosed { leg: CircuitLeg, cause: ConnectionCloseCause },
+    InternalFailure,
+}
+```
 
-## Non-goals
+Denial events expose the exact `minip2p_relay::Status`, re-exported from
+`minip2p`. All event and reason types above, `RelayServerConfig`, `RateLimit`,
+the three error types, `RelayServerAddressErrorKind`,
+`RelayServerRuntimeError{,Kind}`, and `ConnectionCloseCause` are also
+re-exported.
 
-Reservation vouchers (`voucher: None` always); relay discovery/autorelay; ACLs/metrics/proxy-aware IP limits; portable (smoltcp) endpoint feature for the server; swarm-level inbound-negotiation caps (documented deviation). Included, not a non-goal: denying HOP over circuit connections.
+`RelayServerRuntimeError` follows the Swarm error pattern: public `kind`,
+optional `peer_id`, and human-readable `detail`, with no connection/stream key
+or agent token. `RelayServerRuntimeErrorKind` has stable operation categories
+`OpenStream`, `SendStream`, `CloseStream`, `ResetStream`, and
+`InternalInvariant`. Synchronous configuration/control failures use returned
+errors; asynchronous transport/driver failures use `RelayServerEvent::Error`.
+An internal failure that terminates a committed lifecycle emits both its stable
+close reason and one diagnostic error event.
 
-## Verification
+Emit each `ReservationDenied`/`CircuitDenied` once when the agent makes the
+stable denial decision. Failure to deliver that status adds one runtime error;
+it neither suppresses nor duplicates the denial event. Acceptance/open events,
+by contrast, require transport acceptance at the commit points defined below.
 
-- Per PR: `just test`, `just clippy`, `just fmt`, `just check-nostd`; `just fuzz 30` for PR 1.
-- PR 2: scripted agent tests (deterministic, no I/O) incl. the NatAgent-vs-RelayServerAgent wire-parity test and the supersession suite.
-- PR 3: endpoint integration test exercises the real client stack against the new server end to end.
-- PR 4: run `examples/relay-server` + two `examples/peer` instances locally (`--relay <addr>`, `circuit=` target), confirm data over the relayed path; optionally deploy to the AWS relay host used for live tests.
+### Low-level agent/driver seam
+
+`minip2p-relay-server` exposes the caller-driven seam needed by non-Endpoint
+hosts without lifting it into `minip2p`:
+
+```rust
+pub struct StreamKey {
+    pub conn_id: ConnectionId,
+    pub stream_id: StreamId,
+}
+
+pub enum RelayServerAction {
+    OpenStream {
+        token: RelayServerToken,
+        peer_id: PeerId,
+        expected_conn_id: ConnectionId,
+        protocol_id: String,
+    },
+    SendStream {
+        token: RelayServerToken,
+        peer_id: PeerId,
+        stream: StreamKey,
+        data: Vec<u8>,
+    },
+    CloseStreamWrite {
+        token: RelayServerToken,
+        peer_id: PeerId,
+        stream: StreamKey,
+    },
+    ResetStream {
+        token: RelayServerToken,
+        peer_id: PeerId,
+        stream: StreamKey,
+    },
+}
+```
+
+`RelayServerToken` is opaque. The driver echoes every result through the
+matching `stream_open_result`, `send_stream_result`,
+`close_stream_write_result`, or `reset_stream_result` method with `Now`;
+operation failures carry an allocated diagnostic string. Open success includes
+the actual `StreamKey`, which the agent verifies against `expected_conn_id`.
+Unknown/stale tokens are ignored after any necessary successful-open cleanup.
+
+`RelayServerAgent` exposes `new`, `set_accepting`, atomic
+`replace_announce_addrs`, `set_confirmed_addrs`, `set_listener_addrs`,
+`selected_addrs`, `connection_addr`, `handle_event`, `handle_tick`, the four
+result methods, `poll_action`, `poll_event`, `next_timeout`, `owns_stream`, and
+`is_idle`. `handle_event` receives the driver's direct-versus-circuit
+classification and returns whether the event was claimed. The driver calls
+`handle_tick(now)` before delivering any event sampled at the same `now`, which
+enforces deadline-first ordering. After each claimed input, the driver must
+drain actions and echo their synchronous results to quiescence before delivering
+the next transport event; this is the load-bearing bound that keeps payload
+backpressure in transport queues rather than an unbounded agent queue.
+
+## Swarm and Endpoint foundations
+
+### Directional protocol roles
+
+Replace the internal single protocol registry with independent inbound,
+outbound, and Identify-advertised membership. Keep
+`SwarmBuilder::protocol`/`SwarmRuntime::add_protocol` behavior unchanged by
+registering application protocols in all three sets. Add crate-internal role
+registration for composed services.
+
+| Owner | Protocol | Inbound | Outbound | Identify |
+| --- | --- | ---: | ---: | ---: |
+| relay-server | HOP | yes | no | yes |
+| relay-server | STOP | no | yes | no |
+| NAT | HOP | no | yes | no |
+| NAT | trusted STOP | yes | no | yes |
+
+Do not broaden this migration into unrelated DCUtR/AutoNAT behavior. A
+relay-server-only Endpoint owns and resets unsolicited inbound STOP. NAT-only
+clients can open HOP but neither advertise nor accept it. Incoming
+multistream-select snapshots only the inbound set; outbound opens check only
+the outbound set; future Identify responses snapshot only the advertised set.
+
+HOP on a circuit connection still negotiates, then returns
+`PERMISSION_DENIED`. This intentional rust-libp2p deviation makes the denial
+deterministic instead of failing negotiation.
+
+### Connection-close cause
+
+Make the breaking Swarm event change:
+
+```rust
+pub enum ConnectionCloseCause { Transport, Superseded }
+
+SwarmEvent::ConnectionClosed {
+    peer_id: PeerId,
+    conn_id: ConnectionId,
+    cause: ConnectionCloseCause,
+}
+```
+
+The synchronous last-wins replacement path emits `Superseded`; transport loss
+and explicit transport closure emit `Transport`. Migrate every consumer and
+fixture in Swarm, NAT, portable/std Endpoint drivers, discovery, pubsub, and
+their tests in the same PR. Relay reservation closure maps the two causes to
+`Superseded` and `ConnectionClosed` respectively.
+
+The Swarm remains single-connection-per-peer. Relay state stores exact
+`ConnectionId`s and verifies an opened STOP stream landed on the reservation's
+connection. No new connection-targeted send API is needed while that invariant
+holds; document this load-bearing assumption.
+
+### Identify address contributions
+
+The std Endpoint owns a source-keyed address book with independent NAT and
+relay-server contributions. NAT no longer calls wholesale
+`set_external_addresses` directly. After either contribution changes, Endpoint
+builds a stable first-wins union (NAT source, then relay-server source) and
+replaces the Swarm external set once. Portable Endpoint's existing caller-owned
+setter remains unchanged.
+
+Bound transport addresses remain the Swarm runtime's first Identify source.
+The contribution union follows them, with duplicates removed first-wins.
+Changes affect future Identify exchanges only; Identify Push and forced
+re-identification are out of scope.
+
+## Address and admission policy
+
+### Reservation address selection
+
+For every new reservation or renewal, choose exactly the first non-empty usable
+source:
+
+1. explicit relay-server announce-address override;
+2. AutoNAT-confirmed public direct addresses, when NAT is enabled; then
+3. concrete bound transport listeners.
+
+Never promote raw Identify observed addresses. Normalize in source order and
+deduplicate first-wins. The only accepted shapes are
+`/{ip4|ip6|dns|dns4|dns6}/.../tcp/<port>` and
+`/{ip4|ip6|dns|dns4|dns6}/.../udp/<port>/quic-v1`, each with an optional trailing
+`/p2p/<local-peer-id>`. Reject wildcard hosts, any `/p2p-circuit`, a conflicting
+peer ID, and every other protocol shape. Strip an optional matching peer ID from
+the normalized transport form, then append the local peer ID exactly once when
+encoding a RESERVE response.
+
+The normalized selected set contributes to future Identify responses. A
+RESERVE response encodes the longest source-order prefix that fits the 8 KiB
+relay control frame, dropping only trailing addresses. If no address can be
+sent, treat the source as unusable.
+
+With no usable address, deny new reservations and renewals with
+`RESERVATION_REFUSED`. A failed renewal keeps its prior reservation and
+deadline. Address changes never terminate reservations or circuits; existing
+reservations remain valid CONNECT destinations.
+
+### Reservation cardinality and lifecycle
+
+There is at most one committed reservation per peer. The record stores its
+owning connection, monotonic deadline, and optional Unix expiry metadata.
+
+- RESERVE on the owning connection is a renewal.
+- A new connection supersedes the old one first, emits one `Superseded` close,
+  and may then make a fresh reservation.
+- If a custom low-level driver reports a replacement connection without the
+  expected old-connection close, the agent defensively applies the same
+  last-wins supersession before accepting work from the replacement.
+- Every request, including renewal, consumes the peer/IP reservation limiter
+  tokens. A successful renewal replaces its capacity slot rather than consuming
+  another global slot.
+- Admission order for every syntactically valid RESERVE is: accepting and a
+  usable address set; peer limiter; IP limiter; exact global capacity; response
+  acceptance and commit. A denial at the availability step consumes no token.
+  The peer token is consumed before the IP check, and a capacity-denied attempt
+  consumes both applicable tokens but no slot. Capacity uses would-exceed
+  semantics, so equality is allowed and zero denies new work. Renewal performs
+  the same checks but treats its existing slot as replacement capacity.
+
+The IP key is the first IP4/IP6 component of the exact connection's remote
+transport address. When none exists, the IP limiter is not applicable. Failed
+availability returns `RESERVATION_REFUSED`; rate/capacity denial returns
+`RESOURCE_LIMIT_EXCEEDED`.
+
+Initial acceptance commits only after the success response is accepted by the
+transport. Then emit `ReservationAccepted { renewed: false, ... }`. A failed
+initial response creates no reservation and emits a runtime error, not a close.
+
+Renewal commits only after its response is accepted. Replace both deadlines
+from renewal time and emit `renewed: true`; do not emit a close. A failed
+renewal response preserves the previous reservation and deadline.
+
+Internal lifetime uses only `monotonic_now + reservation_duration`. Optional
+`unix_now + duration` is wire/event metadata and uses saturating arithmetic.
+When wall time is absent, omit both the wire `Reservation.expire` value and the
+event expiry while enforcing the full monotonic lifetime.
+Missing, jumping, or saturated wall time never changes expiry. At a timestamp,
+process `now >= deadline` before connection events or other inputs. A committed
+reservation emits exactly one terminal event: `Expired`, `ConnectionClosed`,
+`Superseded`, or `InternalFailure`. Never close an uncommitted/nonexistent
+reservation. Administrative pause emits no closure.
+
+### CONNECT admission
+
+CONNECT checks, in order: accepting state; source peer limiter; source IP
+limiter; both endpoints' per-peer circuit count (source equals destination
+counts once); global capacity; and the destination reservation. The IP key is
+the first IP4/IP6 component of the exact connection's remote transport address;
+when none exists, that IP limiter is not applicable. Status mapping is
+deterministic:
+
+- paused: `PERMISSION_DENIED`;
+- no live destination reservation or STOP connection mismatch: `NO_RESERVATION`;
+- capacity/rate limit: `RESOURCE_LIMIT_EXCEEDED`;
+- malformed/unexpected request: the wire statuses defined below.
+
+A CONNECT admitted through resource checks reserves its circuit slot while the
+outbound STOP exchange is pending. Refusal, timeout, or failure releases that
+slot without emitting `CircuitOpened` or `CircuitClosed`.
+
+After opening STOP, map the destination result back to HOP exactly:
+`ResourceLimitExceeded` stays `RESOURCE_LIMIT_EXCEEDED`, `PermissionDenied`
+stays `PERMISSION_DENIED`, open/unsupported/timeout/reset failures become
+`CONNECTION_FAILED`, wrong message type becomes `UNEXPECTED_MESSAGE`, and a
+well-framed malformed message becomes `MALFORMED_MESSAGE`.
+
+Existing circuits survive pause, address changes, and unrelated connection
+closure. Existing reservations remain stored while paused, but every new
+CONNECT request during the pause is denied.
+
+## Control streams, forwarding, and limits
+
+### Wire roles and malformed input
+
+Add `HopResponder` and `StopInitiator` to `crates/relay`, beside the existing
+client machines and re-export them. Both implement `SansIoProtocol` and retain
+payload pipelined with their handshake as directional bridge data.
+
+- A well-framed message with a wrong kind or missing required field receives
+  the appropriate malformed/unexpected `Status`, then the write side closes.
+- Invalid framing, oversized declarations, or inputs for which no valid status
+  can be encoded reset the stream.
+- All control frames use the existing 8 KiB maximum. The larger limit versus
+  rust-libp2p's 4 KiB is deliberate and documented.
+
+Tests distinguish absent/invalid message type, absent/invalid CONNECT peer ID,
+and unknown enum values; the decoder must preserve field presence rather than
+letting proto3 defaults turn an absent type into RESERVE.
+
+The HOP timeout runs from inbound negotiated `StreamReady` through request
+parsing, decision, and response acceptance. The STOP timeout runs from outbound
+open/negotiation through response acceptance. Separate per-connection pending
+caps apply after HOP/STOP ownership begins. Minip2p does not add rust-libp2p's
+Swarm-level pre-negotiation cap in this work.
+
+At the inbound HOP cap, own and reset the newly negotiated stream and retain
+ownership until its terminal event; no denial event exists because a request
+may not have parsed. At the outbound STOP cap for a destination connection,
+deny the source CONNECT with `RESOURCE_LIMIT_EXCEEDED` without opening STOP.
+Zero caps therefore reject every new worker. An inbound HOP timeout resets the
+stream and emits a runtime error once a request/response operation is known; an
+outbound STOP timeout maps to HOP `CONNECTION_FAILED`. All paths release their
+pending-worker count exactly once.
+
+### Circuit commit and duration
+
+After destination STOP accepts, send the HOP CONNECT success response. Commit
+the circuit and emit `CircuitOpened` only when that response is accepted by the
+source transport; then arm the duration deadline and release buffered
+pipelined payload in its correct direction. Failure before commit cleans up
+both legs and emits a diagnostic error but no opened/closed lifecycle pair.
+
+The duration deadline is `acceptance_monotonic_now + configured_duration`, so
+it covers all committed forwarding, including handshake leftovers. Zero means
+unlimited and wire `Limit.duration = 0`. At `now >= deadline`, close with
+`DurationLimit` before processing other same-timestamp inputs.
+
+### Forwarding and byte accounting
+
+Forwarding remains action-based. Every send action carries an opaque token and
+the agent serializes sends per direction. The driver reports whether the whole
+chunk was accepted by the destination transport. Transport/yamux/QUIC queues
+provide backpressure; the agent retains only bounded in-flight state.
+
+Maintain independent saturating source-to-destination and
+destination-to-source counters. The 128 KiB default applies to each direction,
+allowing up to 256 KiB aggregate payload. Count all application payload,
+including both sides' pipelined handshake leftovers, only after the destination
+transport accepts the send. Equality with the configured limit remains open.
+The first non-empty accepted chunk that makes its direction exceed the limit is
+delivered completely, included in that direction's total, and then both legs reset.
+Opposite-direction traffic consumes none of that allowance. Zero never triggers
+and wire `Limit.data = 0`.
+
+A failed crossing send contributes no bytes and closes as
+`ForwardFailed { direction }`, not `ByteLimit`. Ignore stale send/timer/stream
+results after terminal state. Every committed circuit emits exactly one
+`CircuitClosed` with both directional totals; byte-limit closure identifies the
+crossing direction. Saturation must not panic or wrap.
+
+EOF propagates half-closes and finishes as `Eof` after both directions close.
+Reset, forwarding failure, connection loss, duration, byte limit, and internal
+failure clean up the remaining leg without producing a second event.
+
+## Four-PR implementation sequence
+
+### PR 1 — Relay-side wire roles
+
+In `crates/relay`:
+
+- split the implementation into message/client/server modules without changing
+  existing client exports;
+- add `HopResponder`, `StopInitiator`, status helpers, pipelined-data handling,
+  and the malformed-input boundary;
+- update crate rustdoc and README;
+- test fragmentation, exact/oversized frames, wrong kinds, missing fields,
+  decision order, remote closes, and pipelined payload; and
+- feed arbitrary input to both new machines from `wire_inputs`.
+
+### PR 2 — Swarm foundations and sans-I/O service
+
+Land the cross-cutting Swarm work first:
+
+- independent inbound/outbound/Identify protocol roles while preserving generic
+  application registration;
+- `ConnectionCloseCause` and every consumer/test migration;
+- exact connection remote-address lookup for IP limiting; and
+- tests for outbound-only HOP, advertised inbound HOP, MSS snapshots, and both
+  close causes.
+
+Then add `minip2p-relay-server` with the frozen config, errors, events, token
+bucket limiters, address normalization, reservation/circuit tables, tokenized
+control/forward sends, monotonic scheduling, and exactly-once terminal state.
+Limiter maps use an expiry-ordered schedule and sweep only due entries; they do
+not scan all peer/IP keys per request. All deadline/refill arithmetic saturates.
+Add README/rustdoc for every public item.
+
+Scripted sans-I/O tests cover:
+
+- defaults, invalid/zero/wire-bound config, and disabled limiters;
+- limiter refill/boundaries, renewal tokens, IP extraction, and bounded cleanup;
+- reservation commit/failure, replacement, supersession, expiry priority,
+  wall-clock independence, and exactly-once closure;
+- all address precedence, validation, replacement, clearing, deduplication,
+  truncation, refusal, and renewal-preservation rules;
+- both-end circuit admission, status mapping, pause/resume, circuit HOP,
+  separate caps, and end-to-end timeouts;
+- directional pipelining, equality/overshoot, failed sends, zero wire values,
+  saturation, duration, stale terminals, and exactly-once close; and
+- a memory-only `NatAgent` client pair through `RelayServerAgent`.
+
+### PR 3 — std Endpoint feature and integration
+
+Add `relay-server = ["std", "dep:minip2p-relay-server"]`, independent of
+`nat`, and implement the action/I/O adapter. This PR owns all composition work:
+
+- complete builder/runtime API and root re-exports;
+- early/bind validation and nested error sources;
+- static relay roles and NAT outbound-only HOP;
+- trusted STOP routing and relay-only unsolicited STOP rejection;
+- std Endpoint NAT/relay source-keyed Identify address aggregation;
+- AutoNAT-confirmed selection, never raw observed addresses;
+- driver order relay-server, NAT, pubsub;
+- address recomputation without terminating live state;
+- `take_`/`next_` queues, `DriverProgress`, pending-event capacity, counts, wakes,
+  and deadlines; and
+- runtime error delivery for every failed action.
+
+Compile and integration-test `relay-server`, `nat`, and `nat,relay-server`
+with TCP and QUIC matrix variants. Two real minip2p clients reserve, advertise,
+connect, exchange bidirectional payload, hit limits, pause/resume, replace
+addresses, supersede connections, and observe typed events. Verify NAT-only
+Identify omits HOP while outbound reservation succeeds, relay-only Identify
+includes HOP, and address sources cannot clobber each other.
+
+### PR 4 — Hosting example, interoperability, docs, and CI
+
+- Add `examples/relay-server` with QUIC/TCP binds, optional persisted key,
+  explicit announce addresses, accepting toggle, practical limit flags, and
+  readable events/errors. Keep the default path as the three-line example.
+- Update the NAT traversal guide, feature matrix, top-level/crate READMEs, and
+  public rustdoc. Remove the requirement to bring an external relay.
+- Add feature-matrix test/check/clippy rows, no-std coverage, docs coverage, and
+  release-package checks.
+- Add `just interop-relay-rust` under `tests/interop`, pinned to the reference
+  rust-libp2p revision. Run a minip2p server with rust-libp2p reserving/dialing
+  clients and verify reservation, Identify/HOP, CONNECT/STOP, and bidirectional
+  bytes. Keep the foreign tool outside the workspace and the network-dependent
+  test ignored in ordinary unit runs, following the existing harness.
+
+The relay-server README contains one compatibility table covering cardinality,
+admission order, renewal, both-end circuit limits, limiter shape, static HOP,
+pause semantics, address trust/precedence/truncation, future-only Identify,
+circuit-HOP denial, frame/malformed handling, directional bytes, duration,
+lifecycles, control caps/timing, forwarding/backpressure, optional wall time,
+and `voucher: None`.
+
+## Completion gate
+
+Before each PR: `just fmt`, `just test`, `just clippy`, and `just check-nostd`;
+run `just fuzz 30` for PR 1. Before declaring the series complete, run Endpoint
+integration and `just interop-relay-rust` and record the pinned foreign result.
+
+The specification is complete only when no behavior above is left to inference,
+every deliberate upstream deviation is documented, and every public API has
+rustdoc with actionable failure semantics.
