@@ -59,8 +59,11 @@ After `HopResponder` emits a request, its driver pauses reads on that HOP
 stream until it supplies the accept or reject decision. A `Data` input while
 the decision is pending returns `RelayError::DecisionPending` without retaining
 the bytes. Payload already coalesced behind the request frame is retained and
-released only after CONNECT acceptance; transport queues provide backpressure
-for bytes that arrive while policy is deciding.
+released only after CONNECT acceptance. That pre-authorization buffer is
+limited to 64 KiB; exceeding it resets the stream. This is not a circuit data
+limit: after acceptance, bridge data streams without that restriction.
+Transport queues provide backpressure for bytes that arrive while policy is
+deciding.
 
 ## no_std
 

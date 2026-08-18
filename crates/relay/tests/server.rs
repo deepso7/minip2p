@@ -3,9 +3,9 @@ use core::str::FromStr;
 use minip2p_core::{PeerId, SansIoProtocol};
 use minip2p_relay::{
     HopMessage, HopMessageType, HopRequest, HopResponder, HopResponderInput, HopResponderOutput,
-    Limit, MAX_MESSAGE_SIZE, Peer, RelayError, RelayMessageError, Reservation, Status,
-    StopInitiator, StopInitiatorInput, StopInitiatorOutcome, StopInitiatorOutput, StopMessage,
-    StopMessageType, decode_frame, encode_frame,
+    Limit, MAX_MESSAGE_SIZE, MAX_PENDING_BRIDGE_SIZE, Peer, RelayError, RelayMessageError,
+    Reservation, Status, StopInitiator, StopInitiatorInput, StopInitiatorOutcome,
+    StopInitiatorOutput, StopMessage, StopMessageType, decode_frame, encode_frame,
 };
 
 fn peer() -> PeerId {
@@ -203,6 +203,63 @@ fn hop_connect_backpressures_new_data_while_the_decision_is_pending() {
         ))
     );
     assert!(responder.poll_output().is_none());
+}
+
+#[test]
+fn hop_connect_bounds_only_pre_authorization_pipelined_data() {
+    let connect_frame = || {
+        hop_frame(HopMessage {
+            kind: HopMessageType::Connect,
+            peer: Some(Peer {
+                id: peer().to_bytes(),
+                addrs: Vec::new(),
+            }),
+            reservation: None,
+            limit: None,
+            status: None,
+        })
+    };
+
+    let mut oversized_input = connect_frame();
+    oversized_input.resize(oversized_input.len() + MAX_PENDING_BRIDGE_SIZE + 1, 0xaa);
+    let mut oversized = HopResponder::new();
+    oversized
+        .handle_input(HopResponderInput::Data(oversized_input))
+        .unwrap();
+    assert_eq!(oversized.poll_output(), Some(HopResponderOutput::Reset));
+    assert!(oversized.poll_output().is_none());
+
+    let mut exact_input = connect_frame();
+    exact_input.resize(exact_input.len() + MAX_PENDING_BRIDGE_SIZE, 0xbb);
+    let mut exact = HopResponder::new();
+    exact
+        .handle_input(HopResponderInput::Data(exact_input))
+        .unwrap();
+    assert!(matches!(
+        exact.poll_output(),
+        Some(HopResponderOutput::Request(HopRequest::Connect { .. }))
+    ));
+    exact
+        .handle_input(HopResponderInput::AcceptConnect { limit: None })
+        .unwrap();
+    assert!(matches!(
+        exact.poll_output(),
+        Some(HopResponderOutput::Outbound(_))
+    ));
+    assert!(matches!(
+        exact.poll_output(),
+        Some(HopResponderOutput::BridgeData(data))
+            if data.len() == MAX_PENDING_BRIDGE_SIZE
+    ));
+
+    let live_data = vec![0xcc; MAX_PENDING_BRIDGE_SIZE + 1];
+    exact
+        .handle_input(HopResponderInput::Data(live_data.clone()))
+        .unwrap();
+    assert_eq!(
+        exact.poll_output(),
+        Some(HopResponderOutput::BridgeData(live_data))
+    );
 }
 
 #[test]

@@ -52,6 +52,13 @@ pub const STOP_PROTOCOL_ID: &str = "/libp2p/circuit/relay/0.2.0/stop";
 /// are protocol violations and cause relay-side machines to request a reset.
 pub const MAX_MESSAGE_SIZE: usize = 8192;
 
+/// Maximum application payload retained with a HOP CONNECT while its service
+/// decision is pending: 64 KiB.
+///
+/// This is a pre-authorization memory bound, not a circuit data limit. Once a
+/// CONNECT is accepted, bridge data is streamed without this restriction.
+pub const MAX_PENDING_BRIDGE_SIZE: usize = 64 * 1024;
+
 /// Errors returned for invalid local machine use or client-side wire failures.
 ///
 /// Relay-side wire failures are normally represented by status, close, or

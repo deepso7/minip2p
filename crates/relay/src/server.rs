@@ -4,9 +4,9 @@ use alloc::vec::Vec;
 use minip2p_core::{PeerId, SansIoProtocol};
 
 use crate::{
-    FrameDecode, HopMessage, HopMessageType, Limit, Peer, RelayError, Reservation, Status,
-    StopMessage, StopMessageType, decode_frame, encode_frame, encode_hop_status,
-    encode_stop_status,
+    FrameDecode, HopMessage, HopMessageType, Limit, MAX_PENDING_BRIDGE_SIZE, Peer, RelayError,
+    Reservation, Status, StopMessage, StopMessageType, decode_frame, encode_frame,
+    encode_hop_status, encode_stop_status,
 };
 
 /// A syntactically valid request received on an inbound HOP stream.
@@ -78,7 +78,8 @@ enum PendingRequest {
 /// After a request output, pause stream reads until supplying its decision;
 /// additional data returns [`RelayError::DecisionPending`] without being
 /// retained. Payload coalesced with the request frame remains available after
-/// CONNECT acceptance.
+/// CONNECT acceptance up to [`MAX_PENDING_BRIDGE_SIZE`]; a larger pending
+/// payload resets the stream. This bound does not apply after acceptance.
 /// Invalid framing terminates with [`HopResponderOutput::Reset`]. Inputs after
 /// a terminal error are ignored; accepted CONNECT payload remains drainable.
 pub struct HopResponder {
@@ -162,6 +163,12 @@ impl HopResponder {
                 return Ok(());
             }
         };
+        if pending_request == PendingRequest::Connect
+            && self.recv_buf.len() - consumed > MAX_PENDING_BRIDGE_SIZE
+        {
+            self.queue_reset();
+            return Ok(());
+        }
         if pending_request == PendingRequest::Connect {
             self.pending_bridge = self.recv_buf.split_off(consumed);
         }
