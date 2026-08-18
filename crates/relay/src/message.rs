@@ -77,21 +77,32 @@ impl StopMessageType {
 /// Status codes shared by HopMessage and StopMessage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Status {
-    Unused = 0,
-    Ok = 100,
-    ReservationRefused = 200,
-    ResourceLimitExceeded = 201,
-    PermissionDenied = 202,
-    ConnectionFailed = 203,
-    NoReservation = 204,
-    MalformedMessage = 400,
-    UnexpectedMessage = 401,
+    /// Proto3 default value; not a valid success or refusal status.
+    Unused,
+    /// The request succeeded.
+    Ok,
+    /// The relay refused a reservation request.
+    ReservationRefused,
+    /// The request exceeded a resource limit.
+    ResourceLimitExceeded,
+    /// The requester is not permitted to perform the operation.
+    PermissionDenied,
+    /// Establishing the requested connection failed.
+    ConnectionFailed,
+    /// The requested reservation does not exist.
+    NoReservation,
+    /// The message was well framed but malformed.
+    MalformedMessage,
+    /// The message kind was not valid in the current exchange.
+    UnexpectedMessage,
+    /// A wire value not known to this version of minip2p.
+    Unknown(u64),
 }
 
 impl Status {
     /// Convert from the raw varint value.
     ///
-    /// Unknown codes map to `Unused` (treated as "no status set").
+    /// Unknown codes are retained exactly for diagnostics and forwarding.
     pub fn from_u64(value: u64) -> Self {
         match value {
             100 => Status::Ok,
@@ -102,7 +113,24 @@ impl Status {
             204 => Status::NoReservation,
             400 => Status::MalformedMessage,
             401 => Status::UnexpectedMessage,
-            _ => Status::Unused,
+            0 => Status::Unused,
+            other => Status::Unknown(other),
+        }
+    }
+
+    /// Returns the exact protobuf enum value represented by this status.
+    pub const fn to_u64(self) -> u64 {
+        match self {
+            Status::Unused => 0,
+            Status::Ok => 100,
+            Status::ReservationRefused => 200,
+            Status::ResourceLimitExceeded => 201,
+            Status::PermissionDenied => 202,
+            Status::ConnectionFailed => 203,
+            Status::NoReservation => 204,
+            Status::MalformedMessage => 400,
+            Status::UnexpectedMessage => 401,
+            Status::Unknown(value) => value,
         }
     }
 }
@@ -476,7 +504,7 @@ impl HopMessage {
             encode_nested_field(&mut out, tag_byte(4, WIRE_LEN), &nested);
         }
         if let Some(status) = self.status {
-            encode_varint_field(&mut out, tag_byte(5, WIRE_VARINT), status as u64);
+            encode_varint_field(&mut out, tag_byte(5, WIRE_VARINT), status.to_u64());
         }
         out
     }
@@ -548,7 +576,7 @@ impl StopMessage {
             encode_nested_field(&mut out, tag_byte(3, WIRE_LEN), &nested);
         }
         if let Some(status) = self.status {
-            encode_varint_field(&mut out, tag_byte(4, WIRE_VARINT), status as u64);
+            encode_varint_field(&mut out, tag_byte(4, WIRE_VARINT), status.to_u64());
         }
         out
     }
@@ -616,8 +644,9 @@ pub(crate) fn describe_status(status: Status) -> String {
                 Status::NoReservation => "NO_RESERVATION",
                 Status::MalformedMessage => "MALFORMED_MESSAGE",
                 Status::UnexpectedMessage => "UNEXPECTED_MESSAGE",
+                Status::Unknown(_) => "UNKNOWN",
             };
-            format!("{} ({})", name, other as u16)
+            format!("{} ({})", name, other.to_u64())
         }
     }
 }
@@ -830,8 +859,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_status_maps_to_unused() {
-        assert_eq!(Status::from_u64(9999), Status::Unused);
+    fn unknown_status_is_preserved() {
+        assert_eq!(Status::from_u64(9999), Status::Unknown(9999));
     }
 
     #[test]
