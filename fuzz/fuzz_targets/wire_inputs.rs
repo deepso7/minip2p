@@ -21,7 +21,10 @@ use minip2p_pubsub::{
     FrameDecode as PubsubFrame, GossipsubAgent, GossipsubConfig, MESHSUB_PROTOCOL_ID_V11,
     RawMessage, Rpc,
 };
-use minip2p_relay::{FrameDecode as RelayFrame, HopMessage, StopMessage};
+use minip2p_relay::{
+    FrameDecode as RelayFrame, HopMessage, HopResponder, HopResponderInput, StopInitiator,
+    StopInitiatorInput, StopMessage,
+};
 use minip2p_secure_mux::{
     SecureMuxSession, SessionConfig, SessionOutput, SessionRole, YamuxConfig,
 };
@@ -44,6 +47,7 @@ fuzz_target!(|data: &[u8]| {
     fuzz_yamux(data);
     fuzz_secure_mux(data);
     fuzz_circuit(data);
+    fuzz_relay_server_machines(data);
 
     if let RelayFrame::Complete { payload, .. } = minip2p_relay::decode_frame(data) {
         let _ = HopMessage::decode(payload);
@@ -53,6 +57,20 @@ fuzz_target!(|data: &[u8]| {
         let _ = HolePunch::decode(payload);
     }
 });
+
+/// Exercises the relay-side incremental framing and terminal-action boundary.
+fn fuzz_relay_server_machines(data: &[u8]) {
+    let mut hop = HopResponder::new();
+    let _ = hop.handle_input(HopResponderInput::Data(data.to_vec()));
+    let _ = hop.handle_input(HopResponderInput::RemoteWriteClosed);
+    while hop.poll_output().is_some() {}
+
+    let mut stop = StopInitiator::new(fuzz_peer_id(), None);
+    while stop.poll_output().is_some() {}
+    let _ = stop.handle_input(StopInitiatorInput::Data(data.to_vec()));
+    let _ = stop.handle_input(StopInitiatorInput::RemoteWriteClosed);
+    while stop.poll_output().is_some() {}
+}
 
 /// Exercises pubsub framing, RPC/control decoding, canonical re-encoding,
 /// and StrictSign validation with arbitrary wire bytes.

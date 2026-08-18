@@ -1,6 +1,6 @@
 [package]
 name = "minip2p-relay"
-description = "Sans-I/O libp2p Circuit Relay v2 client protocols"
+description = "Sans-I/O libp2p Circuit Relay v2 wire protocols"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
