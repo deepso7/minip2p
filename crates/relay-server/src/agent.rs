@@ -6,8 +6,8 @@ use minip2p_core::{Multiaddr, PeerId, Protocol, SansIoProtocol};
 use minip2p_platform::Now;
 use minip2p_relay::{
     HOP_PROTOCOL_ID, HopRequest, HopResponder, HopResponderInput, HopResponderOutput, Limit,
-    Reservation, STOP_PROTOCOL_ID, Status, StopInitiator, StopInitiatorInput, StopInitiatorOutcome,
-    StopInitiatorOutput, encode_hop_status,
+    MAX_PENDING_BRIDGE_SIZE, Reservation, STOP_PROTOCOL_ID, Status, StopInitiator,
+    StopInitiatorInput, StopInitiatorOutcome, StopInitiatorOutput, encode_hop_status,
 };
 use minip2p_swarm::{ConnectionCloseCause, DriverError, SwarmEvent, SwarmRuntime};
 use minip2p_transport::{ConnectionId, Transport};
@@ -119,6 +119,7 @@ enum PendingOperation {
     },
     Close {
         peer_id: PeerId,
+        stream: StreamKey,
         circuit: Option<(StreamKey, CircuitLeg)>,
     },
     Reset {
@@ -338,7 +339,10 @@ impl RelayServerAgent {
                     conn_id: *conn_id,
                     stream_id: *stream_id,
                 };
-                if let Some(worker) = self.hop_workers.get_mut(&key) {
+                if self.pending_circuits.contains_key(&key) {
+                    self.append_pending_payload(key, CircuitDirection::SourceToDestination, data);
+                    true
+                } else if let Some(worker) = self.hop_workers.get_mut(&key) {
                     let _ = worker
                         .responder
                         .handle_input(HopResponderInput::Data(data.clone()));
@@ -448,8 +452,12 @@ impl RelayServerAgent {
                     self.hop_workers.remove(&key);
                     true
                 } else {
-                    self.hop_workers.remove(&key).is_some()
-                        || self.rejected_hop_streams.remove(&key).is_some()
+                    let owned = self.hop_workers.contains_key(&key);
+                    if owned {
+                        self.cancel_pending_hop_ops(key);
+                        self.hop_workers.remove(&key);
+                    }
+                    owned || self.rejected_hop_streams.remove(&key).is_some()
                 }
             }
             _ => false,
@@ -504,6 +512,7 @@ impl RelayServerAgent {
                 continue;
             }
             if let Some(worker) = self.hop_workers.remove(&key) {
+                self.cancel_pending_hop_ops(key);
                 self.abort_pending_connect(key);
                 self.queue_reset(worker.peer_id.clone(), key);
                 if worker.request_known {
@@ -701,8 +710,9 @@ impl RelayServerAgent {
         result: Result<(), String>,
         _now: Now,
     ) {
-        let Some(PendingOperation::Close { peer_id, circuit }) =
-            self.pending_operations.remove(&token)
+        let Some(PendingOperation::Close {
+            peer_id, circuit, ..
+        }) = self.pending_operations.remove(&token)
         else {
             return;
         };
@@ -927,21 +937,32 @@ impl RelayServerAgent {
                 },
             });
         }
-        self.hop_workers.retain(|key, _| key.conn_id != conn_id);
+        let closed_hop_streams: Vec<_> = self
+            .hop_workers
+            .keys()
+            .filter(|key| key.conn_id == conn_id)
+            .copied()
+            .collect();
+        for stream in closed_hop_streams {
+            self.cancel_pending_hop_ops(stream);
+            self.hop_workers.remove(&stream);
+        }
         self.rejected_hop_streams
             .retain(|key, _| key.conn_id != conn_id);
     }
 
     fn on_hop_ready(&mut self, peer_id: PeerId, key: StreamKey, is_circuit: bool, now: Now) {
-        if self
-            .connections
-            .get(&key.conn_id)
-            .is_none_or(|connection| connection.peer_id != peer_id)
-        {
+        let Some(connection) = self.connections.get(&key.conn_id) else {
+            self.rejected_hop_streams.insert(key, peer_id.clone());
+            self.queue_reset(peer_id, key);
+            return;
+        };
+        if connection.peer_id != peer_id {
             self.rejected_hop_streams.insert(key, peer_id.clone());
             self.queue_reset(peer_id, key);
             return;
         }
+        let is_circuit = is_circuit || connection.is_circuit;
         let count = self
             .hop_workers
             .iter()
@@ -1016,8 +1037,12 @@ impl RelayServerAgent {
                     self.queue_reset(peer_id, key);
                 }
                 HopResponderOutput::BridgeData(data) => {
-                    if let Some(circuit) = self.pending_circuits.get_mut(&key) {
-                        circuit.source_pipelined.extend_from_slice(&data);
+                    if self.pending_circuits.contains_key(&key) {
+                        self.append_pending_payload(
+                            key,
+                            CircuitDirection::SourceToDestination,
+                            &data,
+                        );
                     } else if self.circuits.contains_key(&key) {
                         self.queue_forward(key, CircuitDirection::SourceToDestination, data);
                     }
@@ -1070,9 +1095,11 @@ impl RelayServerAgent {
                     return;
                 }
                 StopInitiatorOutput::BridgeData(data) => {
-                    if let Some(circuit) = self.pending_circuits.get_mut(&source_stream) {
-                        circuit.destination_pipelined.extend_from_slice(&data);
-                    }
+                    self.append_pending_payload(
+                        source_stream,
+                        CircuitDirection::DestinationToSource,
+                        &data,
+                    );
                 }
                 StopInitiatorOutput::Outbound(data) => {
                     if let Some(circuit) = self.pending_circuits.get(&source_stream) {
@@ -1157,6 +1184,39 @@ impl RelayServerAgent {
         if pending.destination_eof {
             self.circuit_eof(source_stream, CircuitLeg::Destination);
         }
+    }
+
+    fn append_pending_payload(
+        &mut self,
+        source_stream: StreamKey,
+        direction: CircuitDirection,
+        data: &[u8],
+    ) {
+        let Some(circuit) = self.pending_circuits.get_mut(&source_stream) else {
+            return;
+        };
+        let buffer = match direction {
+            CircuitDirection::SourceToDestination => &mut circuit.source_pipelined,
+            CircuitDirection::DestinationToSource => &mut circuit.destination_pipelined,
+        };
+        if buffer
+            .len()
+            .checked_add(data.len())
+            .is_some_and(|len| len <= MAX_PENDING_BRIDGE_SIZE)
+        {
+            buffer.extend_from_slice(data);
+            return;
+        }
+        let peer_id = match direction {
+            CircuitDirection::SourceToDestination => circuit.source_peer_id.clone(),
+            CircuitDirection::DestinationToSource => circuit.destination_peer_id.clone(),
+        };
+        self.abort_pending_connect_both(source_stream);
+        self.runtime_error(
+            RelayServerRuntimeErrorKind::InternalInvariant,
+            Some(peer_id),
+            "pending circuit payload exceeded the 64 KiB directional bound".into(),
+        );
     }
 
     fn queue_forward(
@@ -1350,6 +1410,28 @@ impl RelayServerAgent {
             .reservations
             .get(&peer_id)
             .is_some_and(|reservation| reservation.conn_id == key.conn_id);
+        let pending_for_peer = self.pending_operations.values().any(|operation| {
+            matches!(
+                operation,
+                PendingOperation::Send {
+                    effect: SendEffect::CommitReservation(pending),
+                    ..
+                } if pending.peer_id == peer_id
+            )
+        });
+        let pending_initial = self
+            .pending_operations
+            .values()
+            .filter(|operation| {
+                matches!(
+                    operation,
+                    PendingOperation::Send {
+                        effect: SendEffect::CommitReservation(pending),
+                        ..
+                    } if !pending.renewed
+                )
+            })
+            .count();
         let deadline_ms = now
             .monotonic_ms
             .saturating_add(self.config.reservation_duration_secs.saturating_mul(1_000));
@@ -1365,7 +1447,10 @@ impl RelayServerAgent {
         } else if !self.consume_reservation_limits(&peer_id, key.conn_id, now.monotonic_ms) {
             Some(Status::ResourceLimitExceeded)
         } else {
-            (!renewed && self.reservations.len() >= self.config.max_reservations)
+            (pending_for_peer
+                || (!renewed
+                    && self.reservations.len().saturating_add(pending_initial)
+                        >= self.config.max_reservations))
                 .then_some(Status::ResourceLimitExceeded)
         };
         if let Some(status) = status {
@@ -1629,18 +1714,33 @@ impl RelayServerAgent {
                 matches.then_some(*token)
             })
             .collect();
-        for token in &tokens {
-            self.pending_operations.remove(token);
-        }
-        self.actions.retain(|action| {
-            let token = match action {
-                RelayServerAction::OpenStream { token, .. }
-                | RelayServerAction::SendStream { token, .. }
-                | RelayServerAction::CloseStreamWrite { token, .. }
-                | RelayServerAction::ResetStream { token, .. } => token,
-            };
-            !tokens.contains(token)
-        });
+        self.cancel_operations(&tokens);
+    }
+
+    fn cancel_pending_hop_ops(&mut self, stream: StreamKey) {
+        let tokens: Vec<_> = self
+            .pending_operations
+            .iter()
+            .filter_map(|(token, operation)| {
+                let matches = match operation {
+                    PendingOperation::Send {
+                        effect: SendEffect::CommitReservation(pending),
+                        ..
+                    } => pending.stream == stream,
+                    PendingOperation::Send {
+                        effect: SendEffect::CompleteHop(operation_stream),
+                        ..
+                    } => *operation_stream == stream,
+                    PendingOperation::Close {
+                        stream: operation_stream,
+                        ..
+                    } => *operation_stream == stream,
+                    _ => false,
+                };
+                matches.then_some(*token)
+            })
+            .collect();
+        self.cancel_operations(&tokens);
     }
 
     fn cancel_forward_ops(&mut self, source_stream: StreamKey) {
@@ -1658,7 +1758,11 @@ impl RelayServerAgent {
                 .then_some(*token)
             })
             .collect();
-        for token in &tokens {
+        self.cancel_operations(&tokens);
+    }
+
+    fn cancel_operations(&mut self, tokens: &[RelayServerToken]) {
+        for token in tokens {
             self.pending_operations.remove(token);
         }
         self.actions.retain(|action| {
@@ -1726,6 +1830,7 @@ impl RelayServerAgent {
             token,
             PendingOperation::Close {
                 peer_id: peer_id.clone(),
+                stream,
                 circuit,
             },
         );
@@ -1782,6 +1887,9 @@ fn first_ip(address: &Multiaddr) -> Option<IpKey> {
         .iter()
         .find_map(|protocol| match protocol {
             Protocol::Ip4(ip) => Some(IpKey::V4(*ip)),
+            Protocol::Ip6(ip) if ip[..12] == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] => {
+                Some(IpKey::V4([ip[12], ip[13], ip[14], ip[15]]))
+            }
             Protocol::Ip6(ip) => Some(IpKey::V6(*ip)),
             _ => None,
         })
@@ -1794,7 +1902,8 @@ mod tests {
     use minip2p_core::{Multiaddr, PeerId, Protocol};
     use minip2p_platform::Now;
     use minip2p_relay::{
-        HOP_PROTOCOL_ID, HopMessage, HopMessageType, Peer, Status, encode_frame, encode_stop_status,
+        FrameDecode, HOP_PROTOCOL_ID, HopMessage, HopMessageType, MAX_MESSAGE_SIZE,
+        MAX_PENDING_BRIDGE_SIZE, Peer, Status, decode_frame, encode_frame, encode_stop_status,
     };
     use minip2p_swarm::SwarmEvent;
     use minip2p_transport::{ConnectionId, StreamId};
@@ -2284,6 +2393,59 @@ mod tests {
     }
 
     #[test]
+    fn paused_connect_is_permission_denied_without_reserving_capacity() {
+        let mut agent = RelayServerAgent::new(
+            PeerId::from_public_key_protobuf(b"relay-paused-connect"),
+            RelayServerConfig::default(),
+        )
+        .unwrap();
+        agent.replace_announce_addrs(vec![direct_addr()]).unwrap();
+        let destination = PeerId::from_public_key_protobuf(b"paused-connect-destination");
+        let source = PeerId::from_public_key_protobuf(b"paused-connect-source");
+        reserve(
+            &mut agent,
+            &destination,
+            StreamKey {
+                conn_id: ConnectionId::new(331),
+                stream_id: StreamId::new(1),
+            },
+        );
+        establish(&mut agent, &source, ConnectionId::new(332));
+        agent.set_accepting(false);
+        feed_hop(
+            &mut agent,
+            &source,
+            StreamKey {
+                conn_id: ConnectionId::new(332),
+                stream_id: StreamId::new(1),
+            },
+            HopMessage {
+                kind: HopMessageType::Connect,
+                peer: Some(Peer {
+                    id: destination.to_bytes(),
+                    addrs: Vec::new(),
+                }),
+                reservation: None,
+                limit: None,
+                status: None,
+            },
+            &[],
+        );
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::CircuitDenied {
+                status: Status::PermissionDenied,
+                ..
+            })
+        ));
+        assert_eq!(agent.circuit_count(), 0);
+        assert!(!matches!(
+            agent.poll_action(),
+            Some(RelayServerAction::OpenStream { .. })
+        ));
+    }
+
+    #[test]
     fn full_capacity_renewal_replaces_only_after_delivery() {
         let local = PeerId::from_public_key_protobuf(b"relay-renewal");
         let remote = PeerId::from_public_key_protobuf(b"client-renewal");
@@ -2326,6 +2488,287 @@ mod tests {
         agent.send_stream_result(token, Err("backpressure".into()), Now::from_millis(10));
         assert_eq!(agent.reservation_connection(&remote), Some(renewal.conn_id));
         assert_eq!(agent.reservation_count(), 1);
+    }
+
+    #[test]
+    fn successful_full_capacity_renewal_consumes_a_rate_token() {
+        let remote = PeerId::from_public_key_protobuf(b"client-renewal-token");
+        let conn_id = ConnectionId::new(343);
+        let config = RelayServerConfig {
+            max_reservations: 1,
+            reservation_rate_limit_per_peer: Some(RateLimit {
+                capacity: 2,
+                refill_interval_ms: 1_000,
+            }),
+            reservation_rate_limit_per_ip: None,
+            ..RelayServerConfig::default()
+        };
+        let mut agent = RelayServerAgent::new(
+            PeerId::from_public_key_protobuf(b"relay-renewal-token"),
+            config,
+        )
+        .unwrap();
+        agent.replace_announce_addrs(vec![direct_addr()]).unwrap();
+        reserve(
+            &mut agent,
+            &remote,
+            StreamKey {
+                conn_id,
+                stream_id: StreamId::new(1),
+            },
+        );
+        for stream_id in [2, 3] {
+            feed_hop(
+                &mut agent,
+                &remote,
+                StreamKey {
+                    conn_id,
+                    stream_id: StreamId::new(stream_id),
+                },
+                HopMessage {
+                    kind: HopMessageType::Reserve,
+                    peer: None,
+                    reservation: None,
+                    limit: None,
+                    status: None,
+                },
+                &[],
+            );
+            if stream_id == 2 {
+                let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap()
+                else {
+                    panic!("renewal response");
+                };
+                agent.send_stream_result(token, Ok(()), Now::from_millis(10));
+                assert!(matches!(
+                    agent.poll_event(),
+                    Some(RelayServerEvent::ReservationAccepted { renewed: true, .. })
+                ));
+                let _ = agent.poll_action();
+                assert_eq!(agent.reservation_count(), 1);
+            } else {
+                assert!(matches!(
+                    agent.poll_event(),
+                    Some(RelayServerEvent::ReservationDenied {
+                        status: Status::ResourceLimitExceeded,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn pending_reservation_response_holds_peer_and_global_capacity() {
+        let config = RelayServerConfig {
+            max_reservations: 1,
+            reservation_rate_limit_per_peer: None,
+            reservation_rate_limit_per_ip: None,
+            ..RelayServerConfig::default()
+        };
+        let mut agent = RelayServerAgent::new(
+            PeerId::from_public_key_protobuf(b"relay-pending-reservation"),
+            config,
+        )
+        .unwrap();
+        agent.replace_announce_addrs(vec![direct_addr()]).unwrap();
+        let first = PeerId::from_public_key_protobuf(b"first-pending-reservation");
+        let second = PeerId::from_public_key_protobuf(b"second-pending-reservation");
+        let first_conn = ConnectionId::new(341);
+        establish(&mut agent, &first, first_conn);
+        feed_hop(
+            &mut agent,
+            &first,
+            StreamKey {
+                conn_id: first_conn,
+                stream_id: StreamId::new(1),
+            },
+            HopMessage {
+                kind: HopMessageType::Reserve,
+                peer: None,
+                reservation: None,
+                limit: None,
+                status: None,
+            },
+            &[],
+        );
+        let RelayServerAction::SendStream {
+            token: first_token, ..
+        } = agent.poll_action().unwrap()
+        else {
+            panic!("first reservation response");
+        };
+
+        for (peer_id, conn_id, stream_id) in [
+            (first.clone(), first_conn, StreamId::new(2)),
+            (second.clone(), ConnectionId::new(342), StreamId::new(1)),
+        ] {
+            if peer_id == second {
+                establish(&mut agent, &peer_id, conn_id);
+            }
+            feed_hop(
+                &mut agent,
+                &peer_id,
+                StreamKey { conn_id, stream_id },
+                HopMessage {
+                    kind: HopMessageType::Reserve,
+                    peer: None,
+                    reservation: None,
+                    limit: None,
+                    status: None,
+                },
+                &[],
+            );
+            assert!(matches!(
+                agent.poll_event(),
+                Some(RelayServerEvent::ReservationDenied {
+                    status: Status::ResourceLimitExceeded,
+                    ..
+                })
+            ));
+            let _ = agent.poll_action();
+        }
+
+        agent.send_stream_result(first_token, Ok(()), Now::from_millis(1));
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::ReservationAccepted { renewed: false, .. })
+        ));
+        assert_eq!(agent.reservation_count(), 1);
+    }
+
+    #[test]
+    fn timed_out_reservation_response_cannot_commit_from_a_stale_send_result() {
+        let config = RelayServerConfig {
+            control_stream_timeout_ms: 10,
+            reservation_rate_limit_per_peer: None,
+            reservation_rate_limit_per_ip: None,
+            ..RelayServerConfig::default()
+        };
+        let mut agent = RelayServerAgent::new(
+            PeerId::from_public_key_protobuf(b"relay-stale-reservation-response"),
+            config,
+        )
+        .unwrap();
+        agent.replace_announce_addrs(vec![direct_addr()]).unwrap();
+        let peer = PeerId::from_public_key_protobuf(b"stale-reservation-response");
+        let stream = StreamKey {
+            conn_id: ConnectionId::new(344),
+            stream_id: StreamId::new(1),
+        };
+        establish(&mut agent, &peer, stream.conn_id);
+        feed_hop(
+            &mut agent,
+            &peer,
+            stream,
+            HopMessage {
+                kind: HopMessageType::Reserve,
+                peer: None,
+                reservation: None,
+                limit: None,
+                status: None,
+            },
+            &[],
+        );
+        let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap() else {
+            panic!("reservation response");
+        };
+
+        agent.handle_tick(Now::from_millis(10));
+        agent.send_stream_result(token, Ok(()), Now::from_millis(10));
+
+        assert!(!agent.has_reservation(&peer));
+        assert!(
+            !core::iter::from_fn(|| agent.poll_event())
+                .any(|event| matches!(event, RelayServerEvent::ReservationAccepted { .. }))
+        );
+    }
+
+    #[test]
+    fn terminal_hop_cleanup_releases_pending_reservation_capacity() {
+        for close_connection in [false, true] {
+            let config = RelayServerConfig {
+                max_reservations: 1,
+                reservation_rate_limit_per_peer: None,
+                reservation_rate_limit_per_ip: None,
+                ..RelayServerConfig::default()
+            };
+            let mut agent = RelayServerAgent::new(
+                PeerId::from_public_key_protobuf(b"relay-terminal-reservation"),
+                config,
+            )
+            .unwrap();
+            agent.replace_announce_addrs(vec![direct_addr()]).unwrap();
+            let first = PeerId::from_public_key_protobuf(b"first-terminal-reservation");
+            let first_stream = StreamKey {
+                conn_id: ConnectionId::new(345),
+                stream_id: StreamId::new(1),
+            };
+            establish(&mut agent, &first, first_stream.conn_id);
+            feed_hop(
+                &mut agent,
+                &first,
+                first_stream,
+                HopMessage {
+                    kind: HopMessageType::Reserve,
+                    peer: None,
+                    reservation: None,
+                    limit: None,
+                    status: None,
+                },
+                &[],
+            );
+            let _ = agent.poll_action();
+
+            let terminal = if close_connection {
+                SwarmEvent::ConnectionClosed {
+                    peer_id: first,
+                    conn_id: first_stream.conn_id,
+                    cause: ConnectionCloseCause::Transport,
+                }
+            } else {
+                SwarmEvent::StreamClosed {
+                    peer_id: first,
+                    conn_id: first_stream.conn_id,
+                    stream_id: first_stream.stream_id,
+                }
+            };
+            agent.handle_event(&terminal, false, Now::from_millis(1));
+            while agent.poll_action().is_some() {}
+
+            let second = PeerId::from_public_key_protobuf(b"second-terminal-reservation");
+            let second_stream = StreamKey {
+                conn_id: ConnectionId::new(346),
+                stream_id: StreamId::new(1),
+            };
+            establish(&mut agent, &second, second_stream.conn_id);
+            feed_hop(
+                &mut agent,
+                &second,
+                second_stream,
+                HopMessage {
+                    kind: HopMessageType::Reserve,
+                    peer: None,
+                    reservation: None,
+                    limit: None,
+                    status: None,
+                },
+                &[],
+            );
+
+            assert!(!matches!(
+                agent.poll_event(),
+                Some(RelayServerEvent::ReservationDenied { .. })
+            ));
+            assert!(matches!(
+                agent.poll_action(),
+                Some(RelayServerAction::SendStream {
+                    peer_id,
+                    stream,
+                    ..
+                }) if peer_id == second && stream == second_stream
+            ));
+        }
     }
 
     #[test]
@@ -2469,6 +2912,50 @@ mod tests {
             agent.poll_action(),
             Some(RelayServerAction::SendStream { .. })
         ));
+    }
+
+    #[test]
+    fn stored_circuit_connection_classification_denies_reserve() {
+        let local = PeerId::from_public_key_protobuf(b"relay-stored-circuit");
+        let remote = PeerId::from_public_key_protobuf(b"client-stored-circuit");
+        let conn_id = ConnectionId::new(381);
+        let stream = StreamKey {
+            conn_id,
+            stream_id: StreamId::new(1),
+        };
+        let mut agent = RelayServerAgent::new(local, RelayServerConfig::default()).unwrap();
+        agent.replace_announce_addrs(vec![direct_addr()]).unwrap();
+        agent.handle_event(
+            &SwarmEvent::ConnectionEstablished {
+                peer_id: remote.clone(),
+                conn_id,
+            },
+            true,
+            Now::from_millis(0),
+        );
+
+        feed_hop(
+            &mut agent,
+            &remote,
+            stream,
+            HopMessage {
+                kind: HopMessageType::Reserve,
+                peer: None,
+                reservation: None,
+                limit: None,
+                status: None,
+            },
+            &[],
+        );
+
+        assert!(matches!(
+            agent.poll_event(),
+            Some(RelayServerEvent::ReservationDenied {
+                status: Status::PermissionDenied,
+                ..
+            })
+        ));
+        assert_eq!(agent.reservation_count(), 0);
     }
 
     #[test]
@@ -2873,6 +3360,68 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_mapped_ipv6_shares_the_ipv4_rate_limit_bucket() {
+        let config = RelayServerConfig {
+            reservation_rate_limit_per_peer: None,
+            reservation_rate_limit_per_ip: Some(RateLimit {
+                capacity: 1,
+                refill_interval_ms: 1_000,
+            }),
+            ..RelayServerConfig::default()
+        };
+        let mut agent =
+            RelayServerAgent::new(PeerId::from_public_key_protobuf(b"relay-mapped-ip"), config)
+                .unwrap();
+        agent.replace_announce_addrs(vec![direct_addr()]).unwrap();
+        let addresses = [
+            Multiaddr::from_protocols(vec![Protocol::Ip4([203, 0, 113, 9]), Protocol::Tcp(1)]),
+            Multiaddr::from_protocols(vec![
+                Protocol::Ip6([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 203, 0, 113, 9]),
+                Protocol::Tcp(1),
+            ]),
+        ];
+        for (index, address) in addresses.into_iter().enumerate() {
+            let peer = PeerId::from_public_key_protobuf(&[b'm', index as u8]);
+            let conn_id = ConnectionId::new(95 + index as u64);
+            establish(&mut agent, &peer, conn_id);
+            agent.set_connection_addr(conn_id, address);
+            feed_hop(
+                &mut agent,
+                &peer,
+                StreamKey {
+                    conn_id,
+                    stream_id: StreamId::new(1),
+                },
+                HopMessage {
+                    kind: HopMessageType::Reserve,
+                    peer: None,
+                    reservation: None,
+                    limit: None,
+                    status: None,
+                },
+                &[],
+            );
+            if index == 0 {
+                let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap()
+                else {
+                    panic!("IPv4 request admitted");
+                };
+                agent.send_stream_result(token, Ok(()), Now::from_millis(0));
+                let _ = agent.poll_event();
+                let _ = agent.poll_action();
+            } else {
+                assert!(matches!(
+                    agent.poll_event(),
+                    Some(RelayServerEvent::ReservationDenied {
+                        status: Status::ResourceLimitExceeded,
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn reservation_addresses_truncate_to_a_wire_prefix_and_empty_refuses() {
         let local = PeerId::from_public_key_protobuf(b"relay-address-wire");
         let mut agent = RelayServerAgent::new(local.clone(), RelayServerConfig::default()).unwrap();
@@ -2885,9 +3434,26 @@ mod tests {
             })
             .collect();
         agent.replace_announce_addrs(addrs.clone()).unwrap();
-        let (reservation, _) = agent.reservation_wire(Some(1)).unwrap();
+        let (reservation, limit) = agent.reservation_wire(Some(1)).unwrap();
         assert!(!reservation.addrs.is_empty());
         assert!(reservation.addrs.len() < addrs.len());
+        assert_eq!(reservation.voucher, None);
+        let expected: Vec<_> = addrs
+            .iter()
+            .take(reservation.addrs.len())
+            .map(|address| {
+                let mut address = address.clone();
+                address.push(Protocol::P2p(local.clone()));
+                address.to_bytes()
+            })
+            .collect();
+        assert_eq!(reservation.addrs, expected);
+        let encoded = encode_hop_status(Status::Ok, Some(reservation), Some(limit)).unwrap();
+        assert!(matches!(
+            decode_frame(&encoded),
+            FrameDecode::Complete { payload, consumed }
+                if payload.len() <= MAX_MESSAGE_SIZE && consumed == encoded.len()
+        ));
 
         let peer = PeerId::from_public_key_protobuf(b"empty-address-client");
         let stream = StreamKey {
@@ -2922,8 +3488,8 @@ mod tests {
     fn self_and_global_circuit_capacity_are_enforced() {
         let peer = PeerId::from_public_key_protobuf(b"self-circuit-peer");
         let mut config = RelayServerConfig {
-            max_circuits: 1,
-            max_circuits_per_peer: 1,
+            max_circuits: 4,
+            max_circuits_per_peer: 2,
             reservation_rate_limit_per_peer: None,
             reservation_rate_limit_per_ip: None,
             circuit_rate_limit_per_peer: None,
@@ -2944,7 +3510,7 @@ mod tests {
                 stream_id: StreamId::new(1),
             },
         );
-        for stream_id in [2, 3] {
+        for stream_id in [2, 3, 4] {
             feed_hop(
                 &mut agent,
                 &peer,
@@ -2964,7 +3530,7 @@ mod tests {
                 },
                 &[],
             );
-            if stream_id == 2 {
+            if stream_id <= 3 {
                 assert!(matches!(
                     agent.poll_action(),
                     Some(RelayServerAction::OpenStream { .. })
@@ -3024,6 +3590,57 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn zero_circuit_limits_are_advertised_and_remain_unlimited() {
+        let config = RelayServerConfig {
+            max_circuit_duration_secs: 0,
+            max_circuit_bytes: 0,
+            ..RelayServerConfig::default()
+        };
+        let mut probe = RelayServerAgent::new(
+            PeerId::from_public_key_protobuf(b"zero-limit-probe"),
+            config.clone(),
+        )
+        .unwrap();
+        probe.replace_announce_addrs(vec![direct_addr()]).unwrap();
+        let (reservation, limit) = probe.reservation_wire(None).unwrap();
+        assert_eq!(limit.duration, Some(0));
+        assert_eq!(limit.data, Some(0));
+        let encoded = encode_hop_status(Status::Ok, Some(reservation), Some(limit)).unwrap();
+        let FrameDecode::Complete { payload, .. } = decode_frame(&encoded) else {
+            panic!("zero limit response is framed");
+        };
+        let advertised = HopMessage::decode(payload).unwrap().limit.unwrap();
+        assert_eq!(advertised.duration, Some(0));
+        assert_eq!(advertised.data, Some(0));
+
+        let (mut agent, source, destination, source_stream, stop_stream) =
+            connected_circuit(config, 0);
+        for (peer_id, stream, data) in [
+            (source, source_stream, vec![1; 256]),
+            (destination, stop_stream, vec![2; 256]),
+        ] {
+            agent.handle_event(
+                &SwarmEvent::StreamData {
+                    peer_id,
+                    conn_id: stream.conn_id,
+                    stream_id: stream.stream_id,
+                    data,
+                },
+                false,
+                Now::from_millis(1),
+            );
+            let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap() else {
+                panic!("unlimited forwarding");
+            };
+            agent.send_stream_result(token, Ok(()), Now::from_millis(1));
+        }
+        agent.handle_tick(Now::from_millis(1_000_000));
+        assert!(agent.owns_stream(source_stream));
+        assert!(agent.owns_stream(stop_stream));
+        assert_eq!(agent.poll_event(), None);
     }
 
     #[test]
@@ -3112,6 +3729,75 @@ mod tests {
             }))
         ));
         assert_eq!(agent.poll_event(), None, "no uncommitted lifecycle");
+    }
+
+    #[test]
+    fn source_payload_arriving_during_stop_rtt_is_forwarded_after_commit() {
+        let (mut agent, source, destination, source_stream, stop_stream) =
+            pending_stop(RelayServerConfig::default(), 0);
+        agent.handle_event(
+            &SwarmEvent::StreamData {
+                peer_id: source,
+                conn_id: source_stream.conn_id,
+                stream_id: source_stream.stream_id,
+                data: b"during-stop-rtt".to_vec(),
+            },
+            false,
+            Now::from_millis(1),
+        );
+        agent.handle_event(
+            &SwarmEvent::StreamData {
+                peer_id: destination,
+                conn_id: stop_stream.conn_id,
+                stream_id: stop_stream.stream_id,
+                data: encode_stop_status(Status::Ok).unwrap(),
+            },
+            false,
+            Now::from_millis(1),
+        );
+        let RelayServerAction::SendStream { token, .. } = agent.poll_action().unwrap() else {
+            panic!("HOP success");
+        };
+        agent.send_stream_result(token, Ok(()), Now::from_millis(1));
+        let _ = agent.poll_event();
+        assert!(matches!(
+            agent.poll_action(),
+            Some(RelayServerAction::SendStream { stream, data, .. })
+                if stream == stop_stream && data == b"during-stop-rtt"
+        ));
+    }
+
+    #[test]
+    fn precommit_payload_is_bounded_in_both_directions() {
+        for direction in [
+            CircuitDirection::SourceToDestination,
+            CircuitDirection::DestinationToSource,
+        ] {
+            let (mut agent, source, destination, source_stream, stop_stream, token) =
+                pending_circuit_success(RelayServerConfig::default(), 0);
+            let (peer_id, stream) = match direction {
+                CircuitDirection::SourceToDestination => (source, source_stream),
+                CircuitDirection::DestinationToSource => (destination, stop_stream),
+            };
+            agent.handle_event(
+                &SwarmEvent::StreamData {
+                    peer_id,
+                    conn_id: stream.conn_id,
+                    stream_id: stream.stream_id,
+                    data: vec![0; MAX_PENDING_BRIDGE_SIZE + 1],
+                },
+                false,
+                Now::from_millis(1),
+            );
+            agent.send_stream_result(token, Ok(()), Now::from_millis(1));
+
+            assert!(!agent.owns_stream(source_stream));
+            assert!(!agent.owns_stream(stop_stream));
+            assert!(!matches!(
+                agent.poll_event(),
+                Some(RelayServerEvent::CircuitOpened { .. })
+            ));
+        }
     }
 
     #[test]

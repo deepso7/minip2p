@@ -2154,7 +2154,7 @@ mod tests {
         let stream_id = StreamId::new(2);
         let peer_id = PeerId::from_public_key_protobuf(b"advertised-only-peer");
         core.conn_to_peer.insert(conn_id, peer_id.clone());
-        core.peer_to_conn.insert(peer_id, conn_id);
+        core.peer_to_conn.insert(peer_id.clone(), conn_id);
         core.add_advertised_protocol(ADVERTISED_ONLY)
             .expect("service protocol is not reserved");
 
@@ -2187,6 +2187,42 @@ mod tests {
             ),
             Err(SwarmError::ProtocolNotRegistered { .. })
         ));
+
+        let inbound_stream = StreamId::new(3);
+        feed(
+            &mut core,
+            TransportEvent::IncomingStream {
+                id: conn_id,
+                stream_id: inbound_stream,
+            },
+        );
+        core.actions.clear();
+        let mut offer = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+        offer.extend_from_slice(&multistream_frame(ADVERTISED_ONLY));
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn_id,
+                stream_id: inbound_stream,
+                data: offer,
+            },
+        );
+
+        assert!(matches!(
+            core.actions.pop_front(),
+            Some(SwarmAction::SendStream { data, .. }) if data == multistream_frame("na")
+        ));
+        assert!(drain_events(&mut core).iter().all(|event| {
+            !matches!(
+                event,
+                SwarmEvent::StreamReady {
+                    peer_id: ready_peer,
+                    protocol_id,
+                    initiated_locally: false,
+                    ..
+                } if ready_peer == &peer_id && protocol_id == ADVERTISED_ONLY
+            )
+        }));
     }
 
     #[test]

@@ -149,10 +149,20 @@ mod tests {
     fn refill_arithmetic_saturates_at_capacity_and_timeline_end() {
         let mut limiter = TokenBuckets::new(RateLimit {
             capacity: 3,
-            refill_interval_ms: u64::MAX,
+            refill_interval_ms: 1,
         });
-        assert!(limiter.consume(1, u64::MAX - 2));
-        limiter.sweep(u64::MAX);
+
+        for _ in 0..3 {
+            assert!(limiter.consume(1, u64::MAX - 10));
+        }
+        assert!(!limiter.consume(1, u64::MAX - 10));
+
+        // Ten elapsed intervals refill only to capacity, even at the end of
+        // the monotonic timeline. Further access cannot schedule past MAX.
         assert!(limiter.consume(1, u64::MAX));
+        assert!(limiter.consume(1, u64::MAX));
+        assert!(limiter.consume(1, u64::MAX));
+        assert!(!limiter.consume(1, u64::MAX));
+        assert_eq!(limiter.next_due(), None);
     }
 }
