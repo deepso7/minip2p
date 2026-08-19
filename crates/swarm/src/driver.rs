@@ -249,6 +249,35 @@ impl<T: Transport> Swarm<T> {
         self.runtime.add_protocol(protocol_id)
     }
 
+    /// Registers a protocol only for inbound negotiation by a composed service.
+    pub fn add_inbound_protocol(
+        &mut self,
+        protocol_id: impl Into<String>,
+    ) -> Result<(), DriverError> {
+        self.runtime.add_inbound_protocol(protocol_id)
+    }
+
+    /// Registers a protocol only for outbound opens by a composed service.
+    pub fn add_outbound_protocol(
+        &mut self,
+        protocol_id: impl Into<String>,
+    ) -> Result<(), DriverError> {
+        self.runtime.add_outbound_protocol(protocol_id)
+    }
+
+    /// Adds a protocol only to future Identify responses.
+    pub fn add_advertised_protocol(
+        &mut self,
+        protocol_id: impl Into<String>,
+    ) -> Result<(), DriverError> {
+        self.runtime.add_advertised_protocol(protocol_id)
+    }
+
+    /// Returns the remote transport address recorded for an exact connection.
+    pub fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
+        self.runtime.connection_remote_addr(conn_id)
+    }
+
     /// See [`SwarmRuntime::listen`].
     pub fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, DriverError> {
         self.runtime.listen(addr)

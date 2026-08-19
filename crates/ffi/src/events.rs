@@ -414,7 +414,9 @@ pub(crate) fn convert_swarm(event: Event) -> Option<P2pEvent> {
             peer_id: peer_id.to_base58(),
             conn_id: conn_id.as_u64(),
         },
-        Event::ConnectionClosed { peer_id, conn_id } => P2pEvent::ConnectionClosed {
+        Event::ConnectionClosed {
+            peer_id, conn_id, ..
+        } => P2pEvent::ConnectionClosed {
             peer_id: peer_id.to_base58(),
             conn_id: conn_id.as_u64(),
         },

@@ -1897,11 +1897,7 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
     let protocols = parts.protocols;
     #[cfg(feature = "nat")]
     if parts.nat_config.is_some() {
-        // The traversal agent's protocols are ordinary user protocols; the
-        // swarm just needs to accept and route them.
         for id in [
-            minip2p_nat::HOP_PROTOCOL_ID,
-            minip2p_nat::STOP_PROTOCOL_ID,
             minip2p_nat::DCUTR_PROTOCOL_ID,
             minip2p_nat::AUTONAT_PROTOCOL_ID,
         ] {
@@ -1926,7 +1922,14 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
     }
     #[cfg(feature = "nat")]
     let transport = minip2p_circuit::CircuitTransport::new_os(transport, parts.keypair.clone());
-    let swarm = builder.build(transport)?;
+    #[allow(unused_mut)] // Mutated only by feature-gated composed services.
+    let mut swarm = builder.build(transport)?;
+    #[cfg(feature = "nat")]
+    if parts.nat_config.is_some() {
+        swarm.add_outbound_protocol(minip2p_nat::HOP_PROTOCOL_ID)?;
+        swarm.add_inbound_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
+        swarm.add_advertised_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
+    }
     #[cfg(feature = "nat")]
     let nat = parts.nat_config.map(|config| {
         let relay_addrs = config
@@ -2566,6 +2569,7 @@ mod tests {
         endpoint.pending_events.push_back(Event::ConnectionClosed {
             peer_id: peer_id.clone(),
             conn_id: ConnectionId::new(7),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         });
 
         assert!(matches!(
@@ -2802,6 +2806,7 @@ mod tests {
         endpoint.pending_events.push_back(Event::ConnectionClosed {
             peer_id: unrelated.clone(),
             conn_id: ConnectionId::new(1),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         });
         assert!(
             endpoint
@@ -2821,6 +2826,7 @@ mod tests {
             endpoint.pending_events.push_back(Event::ConnectionClosed {
                 peer_id: unrelated.clone(),
                 conn_id: ConnectionId::new(1),
+                cause: minip2p_swarm::ConnectionCloseCause::Transport,
             });
         }
         assert!(matches!(
@@ -2913,6 +2919,7 @@ mod tests {
         endpoint.pending_events.push_back(Event::ConnectionClosed {
             peer_id: unrelated.clone(),
             conn_id: ConnectionId::new(1),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         });
         assert!(
             endpoint
@@ -2942,6 +2949,7 @@ mod tests {
         endpoint.pending_events.push_back(Event::ConnectionClosed {
             peer_id: unrelated.clone(),
             conn_id: ConnectionId::new(1),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         });
         assert!(
             endpoint
@@ -2961,6 +2969,7 @@ mod tests {
             endpoint.pending_events.push_back(Event::ConnectionClosed {
                 peer_id: unrelated.clone(),
                 conn_id: ConnectionId::new(1),
+                cause: minip2p_swarm::ConnectionCloseCause::Transport,
             });
         }
         assert!(matches!(
@@ -2981,6 +2990,7 @@ mod tests {
         endpoint.pending_events.push_back(Event::ConnectionClosed {
             peer_id: unrelated.clone(),
             conn_id: ConnectionId::new(1),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         });
         assert!(
             endpoint
@@ -3000,6 +3010,7 @@ mod tests {
             endpoint.pending_events.push_back(Event::ConnectionClosed {
                 peer_id: unrelated.clone(),
                 conn_id: ConnectionId::new(1),
+                cause: minip2p_swarm::ConnectionCloseCause::Transport,
             });
         }
         assert!(matches!(

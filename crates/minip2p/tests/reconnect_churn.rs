@@ -220,7 +220,7 @@ fn close_drains_replacement_connection() {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                Event::ConnectionClosed { peer_id, conn_id: closed }
+                Event::ConnectionClosed { peer_id, conn_id: closed, .. }
                     if peer_id == &dialer_peer && *closed == conn_id
             )),
             "close must drain the replacement {conn_id:?}: {events:?}"
@@ -294,7 +294,7 @@ fn close_drains_pending_replacement_handshake() {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                Event::ConnectionClosed { peer_id, conn_id: closed }
+                Event::ConnectionClosed { peer_id, conn_id: closed, .. }
                     if peer_id == &dialer_peer && *closed == conn_id
             )),
             "close must drain the pending replacement {conn_id:?}: {events:?}"

@@ -112,9 +112,9 @@ The workspace has four strictly separated layers:
 1. **Sans-I/O protocols** — identity, TLS, Noise, Yamux,
    multistream-select, ping, identify, relay, AutoNAT, DCUtR, pubsub, and mDNS.
    These crates contain state machines and wire codecs, not sockets or clocks.
-2. **Sans-I/O orchestration** — `SwarmCore`, `NatAgent`, `BeaconAgent`, and
-   `PeerDiscoveryAgent` compose protocols and policy while remaining
-   deterministic and I/O-free.
+2. **Sans-I/O orchestration** — `SwarmCore`, `NatAgent`, `RelayServerAgent`,
+   `BeaconAgent`, and `PeerDiscoveryAgent` compose protocols and policy while
+   remaining deterministic and I/O-free.
 3. **Transport adapters** — `minip2p-tcp` over a pluggable `TcpProvider`
    byte-stream seam (`no_std + alloc`), and the quiche-based `minip2p-quic`
    over UDP (`std`-only). `TransportSet` puts several behind one contract and

@@ -187,6 +187,38 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         Ok(())
     }
 
+    /// Registers a protocol only for inbound negotiation by a composed service.
+    pub fn add_inbound_protocol(
+        &mut self,
+        protocol_id: impl Into<String>,
+    ) -> Result<(), DriverError> {
+        self.core.add_inbound_protocol(protocol_id)?;
+        Ok(())
+    }
+
+    /// Registers a protocol only for outbound opens by a composed service.
+    pub fn add_outbound_protocol(
+        &mut self,
+        protocol_id: impl Into<String>,
+    ) -> Result<(), DriverError> {
+        self.core.add_outbound_protocol(protocol_id)?;
+        Ok(())
+    }
+
+    /// Adds a protocol only to future Identify responses.
+    pub fn add_advertised_protocol(
+        &mut self,
+        protocol_id: impl Into<String>,
+    ) -> Result<(), DriverError> {
+        self.core.add_advertised_protocol(protocol_id)?;
+        Ok(())
+    }
+
+    /// Returns the remote transport address recorded for an exact connection.
+    pub fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
+        self.core.connection_remote_addr(conn_id)
+    }
+
     /// Start listening on the given multiaddr and return the resolved local address.
     pub fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, DriverError> {
         Ok(self.transport.listen(addr)?)
@@ -1085,6 +1117,7 @@ mod tests {
             .push_back(SwarmEvent::ConnectionClosed {
                 peer_id: Ed25519Keypair::generate().peer_id(),
                 conn_id: ConnectionId::new(1),
+                cause: crate::ConnectionCloseCause::Transport,
             });
         assert_eq!(runtime.next_deadline(now), Some(Deadline::IMMEDIATE));
     }

@@ -1345,11 +1345,6 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
                     reason: "relay addresses require the portable-relay feature",
                 });
             }
-            if !config.relays.is_empty() {
-                for protocol in [minip2p_nat::HOP_PROTOCOL_ID, minip2p_nat::STOP_PROTOCOL_ID] {
-                    self.swarm = self.swarm.protocol(protocol);
-                }
-            }
             if !config.autonat_servers.is_empty() {
                 self.swarm = self.swarm.protocol(minip2p_nat::AUTONAT_PROTOCOL_ID);
             }
@@ -1375,6 +1370,22 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
         let mut endpoint = PortableEndpoint {
             runtime: self.swarm.build_runtime(transport, self.entropy.clone())?,
         };
+        #[cfg(feature = "portable-autonat")]
+        if self
+            .nat_config
+            .as_ref()
+            .is_some_and(|config| !config.relays.is_empty())
+        {
+            endpoint
+                .runtime
+                .add_outbound_protocol(minip2p_nat::HOP_PROTOCOL_ID)?;
+            endpoint
+                .runtime
+                .add_inbound_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
+            endpoint
+                .runtime
+                .add_advertised_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
+        }
         for address in self.listens {
             let parsed =
                 address
@@ -1874,7 +1885,7 @@ mod tests {
         );
         assert!(events.iter().any(|event| matches!(
             event,
-            SwarmEvent::ConnectionClosed { peer_id, conn_id: closed_id }
+            SwarmEvent::ConnectionClosed { peer_id, conn_id: closed_id, .. }
                 if peer_id == &remote && closed_id == &conn_id
         )));
     }

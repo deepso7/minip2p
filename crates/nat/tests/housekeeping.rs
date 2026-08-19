@@ -532,6 +532,7 @@ fn lost_relay_connection_emits_lost_and_reacquires() {
         &SwarmEvent::ConnectionClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: relay.clone(),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         at(5_000),
     );
@@ -589,6 +590,7 @@ fn retiring_one_relay_connection_keeps_reservation_on_live_replacement() {
         &SwarmEvent::ConnectionClosed {
             conn_id: ConnectionId::new(1),
             peer_id: relay,
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         at(21),
     );
@@ -624,6 +626,7 @@ fn close_then_establish_relay_supersede_preserves_the_reservation() {
         &SwarmEvent::ConnectionClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: relay.clone(),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         at_unix(renew_at + 1, 1_790),
     );

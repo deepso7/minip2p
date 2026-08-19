@@ -46,8 +46,8 @@ mod driver;
 
 pub use crate::core::{RESERVED_PROTOCOL_IDS, SwarmCore};
 pub use crate::events::{
-    OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent, SwarmInput, SwarmOutput,
-    SwarmRuntimeError,
+    ConnectionCloseCause, OpenStreamToken, SwarmAction, SwarmError, SwarmErrorKind, SwarmEvent,
+    SwarmInput, SwarmOutput, SwarmRuntimeError,
 };
 pub use crate::runtime::{DriverError, SwarmRuntime};
 // Part of `SwarmEvent::IdentifyReceived`'s public shape; re-exported so

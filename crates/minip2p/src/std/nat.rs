@@ -87,7 +87,10 @@ impl NatDriver {
         let handled = self
             .agent
             .handle_event_with_disposition_classified(event, is_circuit, now);
-        if let SwarmEvent::ConnectionClosed { peer_id, conn_id } = event {
+        if let SwarmEvent::ConnectionClosed {
+            peer_id, conn_id, ..
+        } = event
+        {
             self.promoted
                 .retain(|(inner_conn, _), circuit| inner_conn != conn_id && circuit != conn_id);
             if !swarm.connected_peers().contains(peer_id) {
@@ -844,6 +847,7 @@ mod tests {
             &SwarmEvent::ConnectionClosed {
                 peer_id: inner_pair.relay_addr.peer_id().clone(),
                 conn_id: inner_pair.inner_conn,
+                cause: minip2p_swarm::ConnectionCloseCause::Transport,
             },
             &mut inner_pair.local.swarm,
         );
@@ -859,6 +863,7 @@ mod tests {
             &SwarmEvent::ConnectionClosed {
                 peer_id: Ed25519Keypair::from_secret_key_bytes([73; 32]).peer_id(),
                 conn_id: promoted,
+                cause: minip2p_swarm::ConnectionCloseCause::Transport,
             },
             &mut circuit_pair.local.swarm,
         );

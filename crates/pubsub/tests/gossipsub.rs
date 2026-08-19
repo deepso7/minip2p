@@ -956,6 +956,7 @@ fn disconnect_preserves_backoff_and_supersede_reannounces_subscriptions() {
         &SwarmEvent::ConnectionClosed {
             peer_id: remote.clone(),
             conn_id: ConnectionId::new(1),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         3,
     );
@@ -1461,6 +1462,7 @@ fn disconnect_and_supersede_aggregate_queued_failures() {
         &SwarmEvent::ConnectionClosed {
             peer_id: first.clone(),
             conn_id: ConnectionId::new(1),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         2,
     );

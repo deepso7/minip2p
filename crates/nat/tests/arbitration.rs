@@ -425,6 +425,7 @@ fn relay_supersede_scrubs_old_stream_ids_without_resetting_the_new_connection() 
         &SwarmEvent::ConnectionClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: h.relay.clone(),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         at(310),
     );
@@ -474,6 +475,7 @@ fn relay_supersede_does_not_abort_waiting_for_peer_ready() {
         &SwarmEvent::ConnectionClosed {
             conn_id: ConnectionId::new(1),
             peer_id: h.relay.clone(),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         at(11),
     );
@@ -512,6 +514,7 @@ fn relay_supersede_does_not_abort_an_open_hop_request() {
         &SwarmEvent::ConnectionClosed {
             conn_id: ConnectionId::new(1),
             peer_id: h.relay.clone(),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         at(11),
     );
@@ -572,6 +575,7 @@ fn established_relay_loss_never_turns_success_into_connect_failed() {
         &SwarmEvent::ConnectionClosed {
             conn_id: minip2p_transport::ConnectionId::new(TEST_CIRCUIT_ID),
             peer_id: h.target.clone(),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         true,
         at(400),
@@ -1150,6 +1154,7 @@ fn reporter_disconnect_drops_its_observation() {
         &SwarmEvent::ConnectionClosed {
             conn_id: minip2p_transport::ConnectionId::new(1),
             peer_id: relay,
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         at(1),
     );
@@ -1173,6 +1178,7 @@ fn untracked_connection_close_is_ignored() {
         &SwarmEvent::ConnectionClosed {
             conn_id: ConnectionId::new(999),
             peer_id: peer(b"untracked-peer"),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
         },
         at(1),
     );

@@ -452,7 +452,9 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
             .expect("drive initiator upgrade")
         {
             match event {
-                Event::ConnectionClosed { peer_id, conn_id } if peer_id == b_peer => {
+                Event::ConnectionClosed {
+                    peer_id, conn_id, ..
+                } if peer_id == b_peer => {
                     a_sequence.push(("closed", conn_id));
                 }
                 Event::ConnectionEstablished { peer_id, conn_id } if peer_id == b_peer => {

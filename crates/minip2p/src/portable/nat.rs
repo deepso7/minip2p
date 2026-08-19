@@ -109,7 +109,10 @@ impl PortableNatDriver {
         let handled =
             self.agent
                 .handle_event_with_disposition_classified(event, is_circuit, Self::now(now));
-        if let SwarmEvent::ConnectionClosed { peer_id, conn_id } = event {
+        if let SwarmEvent::ConnectionClosed {
+            peer_id, conn_id, ..
+        } = event
+        {
             #[cfg(feature = "portable-relay")]
             self.promoted
                 .retain(|(inner_conn, _), circuit| inner_conn != conn_id && circuit != conn_id);
