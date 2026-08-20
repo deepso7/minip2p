@@ -205,6 +205,16 @@ impl<T: Transport> Swarm<T> {
         self.runtime.set_external_addresses(addrs);
     }
 
+    /// See [`SwarmRuntime::external_addresses`].
+    pub fn external_addresses(&self) -> &[Multiaddr] {
+        self.runtime.external_addresses()
+    }
+
+    /// See [`SwarmRuntime::external_addresses_revision`].
+    pub fn external_addresses_revision(&self) -> u64 {
+        self.runtime.external_addresses_revision()
+    }
+
     /// See [`SwarmRuntime::transport`].
     pub fn transport(&self) -> &T {
         self.runtime.transport()
@@ -969,7 +979,11 @@ mod tests {
             .parse()
             .unwrap();
 
+        assert_eq!(swarm.external_addresses_revision(), 0);
         swarm.set_external_addresses(vec![external.clone(), circuit.clone()]);
+        assert_eq!(swarm.external_addresses_revision(), 1);
+        swarm.set_external_addresses(vec![external.clone(), circuit.clone()]);
+        assert_eq!(swarm.external_addresses_revision(), 2);
         swarm.poll().unwrap();
         // IdleTransport binds nothing, so the snapshot is exactly the
         // external set.

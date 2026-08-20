@@ -179,6 +179,38 @@ Background drivers can clone `Endpoint::wait_handle()` — a transport-neutral `
 `EndpointWake::Interrupted`; legacy event-specific waits consume interruptions
 and continue waiting until their event or deadline.
 
+## Hosting a relay server
+
+The std-only `relay-server` feature is independent of `nat`. The default
+hosting path is three lines:
+
+```rust,no_run
+let mut endpoint = minip2p::Endpoint::builder()
+    .relay_server()
+    .bind_quic("0.0.0.0:4001")?;
+# Ok::<(), minip2p::Error>(())
+```
+
+Use `relay_server_config` for validated capacity, duration, byte, control, and
+rate limits. `relay_server_announce_addrs` supplies explicit public TCP/QUIC
+addresses; it does not enable the service, and invalid shapes fail before
+binding. Runtime replacement is atomic, with an empty list returning to
+AutoNAT-confirmed addresses and then concrete listeners. Raw Identify-observed
+addresses are never promoted.
+
+`set_relay_server_accepting(false)` pauses only new reservations and circuits;
+HOP stays advertised and existing lifecycles remain active. Drain typed output
+with `take_relay_server_events`, or use `next_relay_server_event(deadline)` to
+drive the whole Endpoint while preserving unrelated application events.
+Synchronous controls return `RelayServerControlError`; failed asynchronous
+open/send/close/reset operations arrive as `RelayServerEvent::Error`.
+
+Relay-only endpoints accept and advertise inbound HOP and can open outbound
+STOP. NAT-only endpoints open outbound HOP and accept/advertise trusted STOP,
+without advertising HOP. Combined endpoints install both role sets. The Swarm
+keeps one live connection per peer; exact connection targeting by the relay
+driver relies on that invariant.
+
 When an application permanently relinquishes a stream, `Endpoint::abandon_stream`
 resets it, purges already-buffered events, and suppresses later stream events.
 Use `Endpoint::reset_stream` when those terminal events should remain visible.

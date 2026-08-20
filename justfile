@@ -11,6 +11,10 @@ check:
     cargo check -p minip2p-rs --features nat
     cargo check -p minip2p-rs --features pubsub
     cargo check -p minip2p-rs --features nat,pubsub
+    cargo check -p minip2p-rs --features relay-server
+    cargo check -p minip2p-rs --features nat,relay-server
+    cargo check -p minip2p-rs --features nat,relay-server,tcp
+    cargo check -p minip2p-rs --no-default-features --features std,tcp,relay-server
     cargo check -p minip2p-rs --features discovery
     cargo check -p minip2p-rs --features mdns
     cargo check -p minip2p-rs --features discovery,mdns
@@ -29,6 +33,10 @@ clippy:
     cargo clippy -p minip2p-rs --features discovery --all-targets -- -D warnings
     cargo clippy -p minip2p-rs --features mdns --all-targets -- -D warnings
     cargo clippy -p minip2p-rs --features discovery,mdns --all-targets -- -D warnings
+    cargo clippy -p minip2p-rs --features relay-server --all-targets -- -D warnings
+    cargo clippy -p minip2p-rs --features nat,relay-server --all-targets -- -D warnings
+    cargo clippy -p minip2p-rs --features nat,relay-server,tcp --all-targets -- -D warnings
+    cargo clippy -p minip2p-rs --no-default-features --features std,tcp,relay-server --all-targets -- -D warnings
     cargo clippy -p minip2p-rs --features tcp --all-targets -- -D warnings
     cargo clippy -p minip2p-rs --no-default-features --features std,tcp --all-targets -- -D warnings
     cargo clippy -p minip2p-rs --no-default-features --features smoltcp --all-targets -- -D warnings
@@ -49,6 +57,10 @@ test:
     cargo nextest run --profile variants -p minip2p-rs --features discovery
     cargo nextest run --profile variants -p minip2p-rs --features mdns
     cargo nextest run --profile variants -p minip2p-rs --features discovery,mdns
+    cargo nextest run --profile variants -p minip2p-rs --features relay-server
+    cargo nextest run --profile variants -p minip2p-rs --features nat,relay-server
+    cargo nextest run --profile variants -p minip2p-rs --features nat,relay-server,tcp
+    cargo nextest run --profile variants -p minip2p-rs --no-default-features --features std,tcp,relay-server
     cargo nextest run --profile variants -p minip2p-rs --features tcp
     cargo nextest run --profile variants -p minip2p-rs --no-default-features --features std,tcp
     cargo nextest run --profile variants -p minip2p-rs --features discovery,mdns,tcp
@@ -80,7 +92,7 @@ interop-go:
 
 docs:
     cargo doc --workspace --no-deps
-    cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp --no-deps
+    cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp,relay-server --no-deps
     cargo doc -p minip2p-tcp --features smoltcp --no-deps
     cargo doc -p minip2p-mdns --features smoltcp --no-deps
     cargo doc -p minip2p-rs --no-default-features --features smoltcp --no-deps
