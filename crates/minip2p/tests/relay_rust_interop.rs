@@ -37,18 +37,30 @@ fn pinned_rust_libp2p_reserves_connects_and_exchanges_bytes() {
         .parent()
         .expect("interop manifest has a parent")
         .join("target");
+    let rustc_version = Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .expect("query rustc host target");
+    assert!(rustc_version.status.success(), "rustc -vV failed");
+    let rustc_version = String::from_utf8(rustc_version.stdout).expect("rustc -vV is UTF-8");
+    let host_target = rustc_version
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("rustc -vV reports a host target");
     let build_status = Command::new("cargo")
         .args(["build", "--quiet", "--locked", "--manifest-path"])
         .arg(&manifest)
         .arg("--target-dir")
         .arg(&target_dir)
+        .arg("--target")
+        .arg(host_target)
         .status()
         .expect("build pinned rust-libp2p client");
     assert!(
         build_status.success(),
         "pinned client build failed: {build_status}"
     );
-    let binary = target_dir.join("debug").join(format!(
+    let binary = target_dir.join(host_target).join("debug").join(format!(
         "minip2p-rust-relay-interop{}",
         std::env::consts::EXE_SUFFIX
     ));
