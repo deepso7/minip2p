@@ -1280,6 +1280,7 @@ dependencies = [
  "minip2p-pubsub",
  "minip2p-quic",
  "minip2p-relay",
+ "minip2p-relay-server",
  "minip2p-swarm",
  "minip2p-tcp",
  "minip2p-test-support",

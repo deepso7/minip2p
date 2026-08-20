@@ -28,6 +28,11 @@
 //! both discovery sources to feed one shared peer book and automatic-dial
 //! state. Cargo features expose these APIs; the corresponding builder methods
 //! activate their drivers.
+//!
+//! The independent std-only `relay-server` feature enables the three-line
+//! `Endpoint::builder().relay_server().bind_*()` hosting path. Relay-only
+//! endpoints advertise inbound HOP and open outbound STOP; NAT-only endpoints
+//! install the trusted client roles, and combined endpoints compose both.
 
 mod dial;
 #[cfg(any(feature = "discovery", feature = "mdns"))]
@@ -38,12 +43,14 @@ mod mdns;
 mod nat;
 #[cfg(feature = "pubsub")]
 mod pubsub;
+#[cfg(feature = "relay-server")]
+mod relay_server;
 
 #[cfg(any(feature = "discovery", feature = "mdns"))]
 pub use discovery::DiscoveryError;
 #[allow(unused_imports)] // Only transport-less `std` builds leave this unused.
 use minip2p_core::Multiaddr;
-#[cfg(feature = "tcp")]
+#[cfg(any(feature = "tcp", feature = "relay-server"))]
 use minip2p_core::Protocol;
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use minip2p_core::TransportKind;
@@ -75,6 +82,15 @@ pub use minip2p_pubsub::{
 pub use minip2p_quic::QuicLimits;
 #[cfg(feature = "quic")]
 use minip2p_quic::{QuicEndpoint, QuicNodeConfig};
+#[cfg(feature = "relay-server")]
+pub use minip2p_relay_server::{
+    CircuitByteCounts, CircuitCloseReason, CircuitDirection, CircuitLeg, RateLimit,
+    RelayServerAddressError, RelayServerAddressErrorKind, RelayServerConfig,
+    RelayServerConfigError, RelayServerConfigErrorKind, RelayServerEvent, RelayServerRuntimeError,
+    RelayServerRuntimeErrorKind, ReservationCloseReason, Status,
+};
+#[cfg(feature = "relay-server")]
+pub use minip2p_swarm::ConnectionCloseCause;
 use minip2p_swarm::SwarmBuilder;
 pub use minip2p_swarm::{
     Deadline, DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, RUN_UNTIL_SKIP_LIMIT, Swarm,
@@ -84,13 +100,49 @@ pub use minip2p_swarm::{
 use minip2p_tcp::{StdTcpProvider, TcpConfig, TcpTransport};
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use minip2p_transport::ConnectionNamespace;
-#[cfg(feature = "tcp")]
+#[cfg(any(feature = "tcp", feature = "relay-server"))]
 use minip2p_transport::Transport;
 pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet, WaitHandle};
 #[cfg(feature = "pubsub")]
 pub use pubsub::PubsubError;
 
 const DEFAULT_AGENT_VERSION: &str = "minip2p/0.1.0";
+#[cfg(feature = "relay-server")]
+const RELAY_HOP_PROTOCOL_ID: &str = "/libp2p/circuit/relay/0.2.0/hop";
+#[cfg(feature = "relay-server")]
+const RELAY_STOP_PROTOCOL_ID: &str = "/libp2p/circuit/relay/0.2.0/stop";
+
+/// Synchronous relay-server runtime control failure.
+#[cfg(feature = "relay-server")]
+#[derive(Debug)]
+pub enum RelayServerControlError {
+    /// This endpoint was not built with relay-server enablement.
+    NotConfigured,
+    /// The complete replacement contained an invalid address and was not applied.
+    InvalidAddress(RelayServerAddressError),
+}
+
+#[cfg(feature = "relay-server")]
+impl core::fmt::Display for RelayServerControlError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotConfigured => formatter.write_str("relay server is not configured"),
+            Self::InvalidAddress(error) => {
+                write!(formatter, "invalid relay-server address: {error}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "relay-server")]
+impl std::error::Error for RelayServerControlError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidAddress(error) => Some(error),
+            Self::NotConfigured => None,
+        }
+    }
+}
 
 /// Transport used by [`Endpoint`]. With NAT enabled, relay bridges are
 /// promoted into ordinary Noise/Yamux connections by `CircuitTransport`.
@@ -134,6 +186,8 @@ pub type EndpointSwarm = Swarm<EndpointTransport>;
 /// or a hard partition.
 pub struct Endpoint {
     swarm: EndpointSwarm,
+    #[cfg(feature = "relay-server")]
+    relay_server: Option<relay_server::RelayServerDriver>,
     #[cfg(feature = "nat")]
     nat: Option<nat::NatDriver>,
     #[cfg(feature = "pubsub")]
@@ -144,7 +198,7 @@ pub struct Endpoint {
     mdns: Option<mdns::MdnsDriver>,
     /// Application events set aside while a driver-focused wait was driving
     /// the endpoint; drained first by [`Endpoint::next_event`].
-    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     pending_events: std::collections::VecDeque<Event>,
 }
 
@@ -174,7 +228,7 @@ pub enum EndpointWake {
 }
 
 /// Why one driver-aware swarm-driving step returned.
-#[cfg(any(feature = "nat", feature = "pubsub"))]
+#[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
 enum DriverPollKind {
     /// An event not owned by any agent is ready for the application.
     Application,
@@ -187,13 +241,13 @@ enum DriverPollKind {
     Deadline,
 }
 
-#[cfg(any(feature = "nat", feature = "pubsub"))]
+#[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
 struct DriverPoll {
     kind: DriverPollKind,
     event: Option<Event>,
 }
 
-#[cfg(any(feature = "nat", feature = "pubsub"))]
+#[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
 impl DriverPoll {
     fn application(event: Event) -> Self {
         Self {
@@ -438,7 +492,7 @@ impl Endpoint {
     /// close events for the stream. Repeated calls are idempotent.
     pub fn abandon_stream(&mut self, peer_id: &PeerId, stream_id: StreamId) -> Result<(), Error> {
         let result = self.swarm.abandon_stream(peer_id, stream_id);
-        #[cfg(any(feature = "nat", feature = "pubsub"))]
+        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
         self.pending_events
             .retain(|event| !event.matches_stream(peer_id, stream_id));
         result
@@ -450,7 +504,7 @@ impl Endpoint {
     /// consumed here (never surfaced to the application); the agent's own
     /// events accumulate for `Endpoint::take_nat_events`.
     pub fn poll(&mut self) -> Result<Vec<Event>, Error> {
-        #[cfg(any(feature = "nat", feature = "pubsub"))]
+        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
         {
             let polled = self.swarm.poll()?;
             let mut events: Vec<Event> = self.pending_events.drain(..).collect();
@@ -462,7 +516,7 @@ impl Endpoint {
             self.tick_drivers()?;
             Ok(events)
         }
-        #[cfg(not(any(feature = "nat", feature = "pubsub")))]
+        #[cfg(not(any(feature = "nat", feature = "pubsub", feature = "relay-server")))]
         {
             self.swarm.poll()
         }
@@ -474,7 +528,7 @@ impl Endpoint {
     /// [`std::time::Duration`], or [`Deadline::NEVER`] to wait indefinitely.
     pub fn next_event(&mut self, deadline: impl Into<Deadline>) -> Result<Option<Event>, Error> {
         let deadline = deadline.into();
-        #[cfg(any(feature = "nat", feature = "pubsub"))]
+        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
         if self.has_drivers() {
             return self.next_event_driven(deadline);
         }
@@ -504,7 +558,7 @@ impl Endpoint {
     /// busy-spin a caller that expected the supplied deadline to block.
     pub fn next_wake(&mut self, deadline: impl Into<Deadline>) -> Result<EndpointWake, Error> {
         let deadline = deadline.into();
-        #[cfg(any(feature = "nat", feature = "pubsub"))]
+        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
         if self.has_drivers() {
             if let Some(event) = self.pending_events.pop_front() {
                 return Ok(EndpointWake::Event(event));
@@ -533,8 +587,12 @@ impl Endpoint {
     }
 
     /// Whether any agent driver is active on this endpoint.
-    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     fn has_drivers(&self) -> bool {
+        #[cfg(feature = "relay-server")]
+        if self.relay_server.is_some() {
+            return true;
+        }
         #[cfg(any(feature = "discovery", feature = "mdns"))]
         if self.discovery.is_some() {
             return true;
@@ -554,33 +612,44 @@ impl Endpoint {
         false
     }
 
-    /// Feeds one swarm event through the active drivers, NAT first (its
-    /// control-plane streams are never pubsub-relevant; neither agent
-    /// claims connection-lifecycle or PeerReady events, so ordering only
-    /// decides who sees its own streams).
+    /// Feeds one swarm event through relay-server, NAT, then pubsub.
+    ///
+    /// Relay service owns inbound HOP before NAT considers its client-side
+    /// streams. Neither service claims connection lifecycle or `PeerReady`,
+    /// so both still observe the shared connection state.
     ///
     /// Returns `true` when a driver claimed the event.
-    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     fn ingest_into_drivers(&mut self, event: &Event) -> bool {
         #[cfg(any(feature = "discovery", feature = "mdns"))]
         if let Some(discovery) = self.discovery.as_mut() {
             discovery.observe(event, &self.swarm);
         }
         let mut claimed = false;
+        #[cfg(feature = "relay-server")]
+        if let Some(relay_server) = self.relay_server.as_mut() {
+            claimed = relay_server.ingest(event, &mut self.swarm);
+        }
         #[cfg(feature = "nat")]
-        if let Some(nat) = self.nat.as_mut() {
+        if !claimed && let Some(nat) = self.nat.as_mut() {
             claimed = nat.ingest(event, &mut self.swarm);
         }
         #[cfg(feature = "pubsub")]
         if !claimed && let Some(pubsub) = self.pubsub.as_mut() {
             claimed = pubsub.ingest(event, &mut self.swarm);
         }
+        #[cfg(any(feature = "nat", feature = "relay-server"))]
+        self.refresh_external_address_contributions();
         claimed
     }
 
     /// Ticks every active driver.
-    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     fn tick_drivers(&mut self) -> Result<(), Error> {
+        #[cfg(feature = "relay-server")]
+        if let Some(relay_server) = self.relay_server.as_mut() {
+            relay_server.tick(&mut self.swarm);
+        }
         #[cfg(feature = "nat")]
         if let Some(nat) = self.nat.as_mut() {
             nat.tick(&mut self.swarm);
@@ -605,14 +674,20 @@ impl Endpoint {
                 &mut self.swarm,
             );
         }
+        #[cfg(any(feature = "nat", feature = "relay-server"))]
+        self.refresh_external_address_contributions();
         Ok(())
     }
 
     /// Application-visible events queued across every active driver; growth
     /// is the focused waits' progress signal.
-    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     fn driver_events_len(&self) -> usize {
         let mut len = 0;
+        #[cfg(feature = "relay-server")]
+        if let Some(relay_server) = self.relay_server.as_ref() {
+            len += relay_server.events.len();
+        }
         #[cfg(feature = "nat")]
         if let Some(nat) = self.nat.as_ref() {
             len += nat.events.len();
@@ -630,9 +705,15 @@ impl Endpoint {
 
     /// One wait step's deadline: the caller's, shortened by whichever agent
     /// timer is due first.
-    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     fn driver_step_deadline(&self, deadline: Deadline) -> Deadline {
         let mut step = deadline;
+        #[cfg(feature = "relay-server")]
+        if let Some(relay_server) = self.relay_server.as_ref()
+            && let Some(ms) = relay_server.agent.next_timeout(relay_server.now())
+        {
+            step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
+        }
         #[cfg(feature = "nat")]
         if let Some(nat) = self.nat.as_ref()
             && let Some(ms) = nat.agent.next_timeout(nat.now().mono_ms)
@@ -664,7 +745,7 @@ impl Endpoint {
     /// budget never overshoots an agent's next timer, agent-owned stream
     /// events are consumed instead of surfaced, and ticks run between
     /// waits.
-    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     fn next_event_driven(&mut self, deadline: Deadline) -> Result<Option<Event>, Error> {
         if let Some(event) = self.pending_events.pop_front() {
             return Ok(Some(event));
@@ -686,7 +767,7 @@ impl Endpoint {
     /// this never drains `pending_events`: focused waits must leave
     /// application events aside instead of repeatedly picking up the same
     /// one.
-    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     fn poll_new_event_driven(
         &mut self,
         deadline: Deadline,
@@ -743,7 +824,7 @@ impl Endpoint {
         deadline: impl Into<Deadline>,
     ) -> Result<Option<Event>, Error> {
         let deadline = deadline.into();
-        #[cfg(any(feature = "nat", feature = "pubsub"))]
+        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
         if self.has_drivers() {
             return self.wait_for_event_driven(deadline, |event| {
                 matches!(event, Event::PeerReady { peer_id: ready, .. } if ready == peer_id)
@@ -762,7 +843,7 @@ impl Endpoint {
         deadline: impl Into<Deadline>,
     ) -> Result<Option<u64>, Error> {
         let deadline = deadline.into();
-        #[cfg(any(feature = "nat", feature = "pubsub"))]
+        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
         let event = if self.has_drivers() {
             self.wait_for_event_driven(deadline, |event| {
                 matches!(event, Event::PingRttMeasured { peer_id: ready, .. } if ready == peer_id)
@@ -772,7 +853,7 @@ impl Endpoint {
                 matches!(event, Event::PingRttMeasured { peer_id: ready, .. } if ready == peer_id)
             })?
         };
-        #[cfg(not(any(feature = "nat", feature = "pubsub")))]
+        #[cfg(not(any(feature = "nat", feature = "pubsub", feature = "relay-server")))]
         let event = self.swarm.run_until(deadline, |event| {
             matches!(event, Event::PingRttMeasured { peer_id: ready, .. } if ready == peer_id)
         })?;
@@ -885,6 +966,134 @@ impl Endpoint {
         }
     }
 
+    /// Pauses or resumes admission of new relay reservations and circuits.
+    ///
+    /// Existing reservations and circuits remain active, and HOP remains
+    /// advertised while admission is paused.
+    #[cfg(feature = "relay-server")]
+    #[allow(clippy::result_large_err)]
+    pub fn set_relay_server_accepting(
+        &mut self,
+        accepting: bool,
+    ) -> Result<(), RelayServerControlError> {
+        let relay_server = self
+            .relay_server
+            .as_mut()
+            .ok_or(RelayServerControlError::NotConfigured)?;
+        relay_server.agent.set_accepting(accepting);
+        Ok(())
+    }
+
+    /// Atomically replaces the relay server's explicit announce-address override.
+    ///
+    /// Each address must be a concrete direct TCP or QUIC address for this
+    /// endpoint's peer id. [`RelayServerControlError::InvalidAddress`] retains
+    /// the rejected input's index and reason; on error, the previous override
+    /// remains active. An empty replacement clears the override, restoring the
+    /// confirmed-NAT-then-concrete-listener fallback order.
+    #[cfg(feature = "relay-server")]
+    #[allow(clippy::result_large_err)]
+    pub fn set_relay_server_announce_addrs(
+        &mut self,
+        addrs: Vec<Multiaddr>,
+    ) -> Result<(), RelayServerControlError> {
+        let relay_server = self
+            .relay_server
+            .as_mut()
+            .ok_or(RelayServerControlError::NotConfigured)?;
+        relay_server
+            .agent
+            .replace_announce_addrs(addrs)
+            .map_err(RelayServerControlError::InvalidAddress)?;
+        self.refresh_external_address_contributions();
+        Ok(())
+    }
+
+    /// Drains only application-visible relay-server events.
+    ///
+    /// Returns an empty vector when relay service is not configured and leaves
+    /// ordinary endpoint events untouched.
+    #[cfg(feature = "relay-server")]
+    pub fn take_relay_server_events(&mut self) -> Vec<RelayServerEvent> {
+        self.relay_server
+            .as_mut()
+            .map(|driver| driver.events.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// Drives the whole endpoint until a relay-server event or caller deadline.
+    ///
+    /// Ordinary endpoint events encountered while waiting are preserved for
+    /// [`Endpoint::next_event`]. Returns `Ok(None)` when relay service is absent
+    /// or the deadline expires. It can return [`Error::EventBacklogExceeded`]
+    /// when preserving those events exhausts the bounded backlog. Transport/action
+    /// failures discovered asynchronously are returned as
+    /// [`RelayServerEvent::Error`] rather than as this method's `Err` value.
+    #[cfg(feature = "relay-server")]
+    pub fn next_relay_server_event(
+        &mut self,
+        deadline: impl Into<Deadline>,
+    ) -> Result<Option<RelayServerEvent>, Error> {
+        let deadline = deadline.into();
+        let mut expired_poll_used = false;
+        loop {
+            match self.relay_server.as_mut() {
+                Some(driver) => {
+                    if let Some(event) = driver.events.pop_front() {
+                        return Ok(Some(event));
+                    }
+                }
+                None => return Ok(None),
+            }
+            self.ensure_pending_event_capacity()?;
+            let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
+            match poll.kind {
+                DriverPollKind::Application => self
+                    .pending_events
+                    .push_back(poll.event.expect("application poll carries event")),
+                DriverPollKind::Progress | DriverPollKind::Interrupted => {}
+                DriverPollKind::Deadline => return Ok(None),
+            }
+        }
+    }
+
+    #[cfg(any(feature = "nat", feature = "relay-server"))]
+    fn refresh_external_address_contributions(&mut self) {
+        #[cfg(feature = "relay-server")]
+        {
+            let listeners = concrete_relay_listener_addrs(self.swarm.transport().local_addresses());
+            #[cfg(feature = "nat")]
+            let confirmed = self
+                .nat
+                .as_ref()
+                .map(nat::NatDriver::confirmed_public_addrs)
+                .unwrap_or_default();
+            if let Some(relay_server) = self.relay_server.as_mut() {
+                let _ = relay_server.agent.set_listener_addrs(listeners);
+                #[cfg(feature = "nat")]
+                let _ = relay_server.agent.set_confirmed_addrs(confirmed);
+            }
+        }
+        let mut addresses = Vec::new();
+        #[cfg(feature = "nat")]
+        if let Some(nat) = self.nat.as_ref() {
+            for address in nat.advertised_addrs() {
+                if !addresses.contains(&address) {
+                    addresses.push(address);
+                }
+            }
+        }
+        #[cfg(feature = "relay-server")]
+        if let Some(relay_server) = self.relay_server.as_ref() {
+            for address in relay_server.agent.selected_addrs() {
+                if !addresses.contains(address) {
+                    addresses.push(address.clone());
+                }
+            }
+        }
+        self.swarm.set_external_addresses(addresses);
+    }
+
     /// Drains all queued NAT events.
     #[cfg(feature = "nat")]
     pub fn take_nat_events(&mut self) -> Vec<NatEvent> {
@@ -929,7 +1138,7 @@ impl Endpoint {
     /// Driver-aware equivalent of `Swarm::run_until`. Every swarm event
     /// goes through the active drivers, and non-matching application events
     /// are retained for [`Endpoint::next_event`].
-    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     fn wait_for_event_driven<F>(
         &mut self,
         deadline: Deadline,
@@ -960,7 +1169,7 @@ impl Endpoint {
         }
     }
 
-    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     fn ensure_pending_event_capacity(&self) -> Result<(), Error> {
         if self.pending_events.len() >= RUN_UNTIL_SKIP_LIMIT {
             return Err(Error::EventBacklogExceeded {
@@ -1327,6 +1536,10 @@ pub struct EndpointBuilder {
     tcp_config: TcpConfig,
     binds: Vec<Bind>,
     protocols: Vec<String>,
+    #[cfg(feature = "relay-server")]
+    relay_server_config: Option<RelayServerConfig>,
+    #[cfg(feature = "relay-server")]
+    relay_server_announce_addrs: Vec<Multiaddr>,
     #[cfg(feature = "nat")]
     nat_config: Option<NatConfig>,
     #[cfg(feature = "nat")]
@@ -1354,6 +1567,10 @@ impl Default for EndpointBuilder {
             tcp_config: TcpConfig::default(),
             binds: Vec::new(),
             protocols: Vec::new(),
+            #[cfg(feature = "relay-server")]
+            relay_server_config: None,
+            #[cfg(feature = "relay-server")]
+            relay_server_announce_addrs: Vec::new(),
             #[cfg(feature = "nat")]
             nat_config: None,
             #[cfg(feature = "nat")]
@@ -1382,6 +1599,10 @@ struct BuilderParts {
     tcp_config: TcpConfig,
     binds: Vec<Bind>,
     protocols: Vec<String>,
+    #[cfg(feature = "relay-server")]
+    relay_server_config: Option<RelayServerConfig>,
+    #[cfg(feature = "relay-server")]
+    relay_server_announce_addrs: Vec<Multiaddr>,
     #[cfg(feature = "nat")]
     nat_config: Option<NatConfig>,
     #[cfg(feature = "pubsub")]
@@ -1483,6 +1704,71 @@ impl EndpointBuilder {
             self.protocols.push(id);
         }
         self
+    }
+
+    /// Enables Circuit Relay v2 service with production-oriented defaults.
+    ///
+    /// After binding, use [`Endpoint::set_relay_server_accepting`] to pause or
+    /// resume admission and [`Endpoint::next_relay_server_event`] to consume
+    /// reservation, circuit, accounting, and asynchronous failure events.
+    #[cfg(feature = "relay-server")]
+    pub fn relay_server(mut self) -> Self {
+        self.relay_server_config
+            .get_or_insert_with(RelayServerConfig::default);
+        self
+    }
+
+    /// Enables Circuit Relay v2 service with validated custom limits.
+    ///
+    /// Returns [`RelayServerConfigError`] with the invalid field path and reason
+    /// when a required value is zero or a duration exceeds the wire encoding.
+    /// A failed call leaves the builder unchanged.
+    #[cfg(feature = "relay-server")]
+    pub fn relay_server_config(
+        mut self,
+        config: RelayServerConfig,
+    ) -> Result<Self, RelayServerConfigError> {
+        config.validate()?;
+        self.relay_server_config = Some(config);
+        Ok(self)
+    }
+
+    /// Configures advertised direct addresses without enabling relay service.
+    ///
+    /// This method validates direct TCP/QUIC shape, rejects wildcard and circuit
+    /// addresses, and checks a trailing peer id against an already-fixed builder
+    /// identity. The indexed [`RelayServerAddressError`] identifies the rejected
+    /// input and reason. When identity is not fixed yet, the peer-id match is
+    /// checked again at bind. Announce addresses alone do not enable the service;
+    /// also call [`EndpointBuilder::relay_server`] or
+    /// [`EndpointBuilder::relay_server_config`].
+    #[cfg(feature = "relay-server")]
+    #[allow(clippy::result_large_err)]
+    pub fn relay_server_announce_addrs(
+        mut self,
+        addrs: Vec<Multiaddr>,
+    ) -> Result<Self, RelayServerAddressError> {
+        let validation_peer = self
+            .keypair
+            .as_ref()
+            .map(Ed25519Keypair::peer_id)
+            .or_else(|| {
+                addrs
+                    .iter()
+                    .find_map(|address| match address.iter().last() {
+                        Some(Protocol::P2p(peer_id)) => Some(peer_id.clone()),
+                        _ => None,
+                    })
+            })
+            .unwrap_or_else(|| Ed25519Keypair::generate().peer_id());
+        let mut validator = minip2p_relay_server::RelayServerAgent::new(
+            validation_peer,
+            RelayServerConfig::default(),
+        )
+        .expect("default relay-server configuration is valid");
+        validator.replace_announce_addrs(addrs.clone())?;
+        self.relay_server_announce_addrs = addrs;
+        Ok(self)
     }
 
     /// Adds a relay for NAT traversal (circuit legs and reservations), in
@@ -1683,6 +1969,13 @@ impl EndpointBuilder {
                 config
             })
         };
+        #[cfg(feature = "relay-server")]
+        if self.relay_server_config.is_none() && !self.relay_server_announce_addrs.is_empty() {
+            return Err(TransportError::InvalidConfig {
+                reason: "relay-server announce addresses were configured, but the relay server is not enabled; call EndpointBuilder::relay_server or relay_server_config".into(),
+            }
+            .into());
+        }
         Ok(BuilderParts {
             keypair: self.keypair.unwrap_or_else(Ed25519Keypair::generate),
             agent_version: self.agent_version,
@@ -1692,6 +1985,10 @@ impl EndpointBuilder {
             tcp_config: self.tcp_config,
             binds: self.binds,
             protocols: self.protocols,
+            #[cfg(feature = "relay-server")]
+            relay_server_config: self.relay_server_config,
+            #[cfg(feature = "relay-server")]
+            relay_server_announce_addrs: self.relay_server_announce_addrs,
             #[cfg(feature = "nat")]
             nat_config,
             #[cfg(feature = "pubsub")]
@@ -1924,6 +2221,12 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
     let transport = minip2p_circuit::CircuitTransport::new_os(transport, parts.keypair.clone());
     #[allow(unused_mut)] // Mutated only by feature-gated composed services.
     let mut swarm = builder.build(transport)?;
+    #[cfg(feature = "relay-server")]
+    if parts.relay_server_config.is_some() {
+        swarm.add_inbound_protocol(RELAY_HOP_PROTOCOL_ID)?;
+        swarm.add_advertised_protocol(RELAY_HOP_PROTOCOL_ID)?;
+        swarm.add_outbound_protocol(RELAY_STOP_PROTOCOL_ID)?;
+    }
     #[cfg(feature = "nat")]
     if parts.nat_config.is_some() {
         swarm.add_outbound_protocol(minip2p_nat::HOP_PROTOCOL_ID)?;
@@ -1940,6 +2243,30 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
         let agent = minip2p_nat::NatAgent::new(swarm.local_peer_id().clone(), config);
         nat::NatDriver::new(agent, relay_addrs)
     });
+    #[cfg(feature = "relay-server")]
+    let relay_server = parts
+        .relay_server_config
+        .map(|config| -> Result<relay_server::RelayServerDriver, Error> {
+            let mut agent =
+                minip2p_relay_server::RelayServerAgent::new(swarm.local_peer_id().clone(), config)
+                    .map_err(|error| TransportError::InvalidConfig {
+                        reason: error.to_string(),
+                    })?;
+            agent
+                .replace_announce_addrs(parts.relay_server_announce_addrs)
+                .map_err(|error| TransportError::InvalidConfig {
+                    reason: error.to_string(),
+                })?;
+            agent
+                .set_listener_addrs(concrete_relay_listener_addrs(
+                    swarm.transport().local_addresses(),
+                ))
+                .map_err(|error| TransportError::InvalidConfig {
+                    reason: error.to_string(),
+                })?;
+            Ok(relay_server::RelayServerDriver::new(agent))
+        })
+        .transpose()?;
     #[cfg(feature = "discovery")]
     let discovery_config = parts.discovery_config;
     #[cfg(feature = "mdns")]
@@ -2060,6 +2387,8 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
     };
     Ok(Endpoint {
         swarm,
+        #[cfg(feature = "relay-server")]
+        relay_server,
         #[cfg(feature = "nat")]
         nat,
         #[cfg(feature = "pubsub")]
@@ -2068,9 +2397,20 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
         discovery,
         #[cfg(feature = "mdns")]
         mdns,
-        #[cfg(any(feature = "nat", feature = "pubsub"))]
+        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
         pending_events: std::collections::VecDeque::new(),
     })
+}
+
+#[cfg(feature = "relay-server")]
+fn concrete_relay_listener_addrs(addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
+    addrs
+        .into_iter()
+        .filter(|address| {
+            !matches!(address.iter().next(), Some(Protocol::Ip4(ip)) if *ip == [0; 4])
+                && !matches!(address.iter().next(), Some(Protocol::Ip6(ip)) if *ip == [0; 16])
+        })
+        .collect()
 }
 
 #[cfg(all(test, feature = "quic"))]
@@ -3018,5 +3358,216 @@ mod tests {
             Err(PubsubError::Driver(Error::EventBacklogExceeded { limit }))
                 if limit == RUN_UNTIL_SKIP_LIMIT
         ));
+    }
+
+    #[cfg(all(feature = "relay-server", feature = "tcp"))]
+    #[test]
+    fn relay_server_builder_is_order_independent_and_announce_does_not_enable() {
+        let announce = vec!["/ip4/127.0.0.1/tcp/4001".parse().unwrap()];
+        let endpoint = Endpoint::builder()
+            .relay_server_announce_addrs(announce.clone())
+            .expect("valid announce address")
+            .relay_server()
+            .bind_tcp("127.0.0.1:0")
+            .expect("enabled relay server binds");
+        assert!(endpoint.relay_server.is_some());
+
+        let result = Endpoint::builder()
+            .relay_server_announce_addrs(announce)
+            .expect("valid announce address")
+            .bind_tcp("127.0.0.1:0");
+        let error = match result {
+            Ok(_) => panic!("announce addresses alone must not enable the service"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("relay server is not enabled"));
+    }
+
+    #[cfg(feature = "relay-server")]
+    #[test]
+    fn relay_server_builder_rejects_structurally_invalid_addresses_immediately() {
+        let wildcard = "/ip4/0.0.0.0/tcp/4001".parse().unwrap();
+        let error = match Endpoint::builder().relay_server_announce_addrs(vec![wildcard]) {
+            Ok(_) => panic!("wildcards are not announceable"),
+            Err(error) => error,
+        };
+        assert_eq!(error.index, 0);
+        assert_eq!(error.reason, RelayServerAddressErrorKind::Wildcard);
+    }
+
+    #[cfg(feature = "relay-server")]
+    #[test]
+    fn relay_server_builder_checks_announce_peer_against_fixed_identity_immediately() {
+        let identity = Ed25519Keypair::from_secret_key_bytes([91; 32]);
+        let other = Ed25519Keypair::from_secret_key_bytes([92; 32]).peer_id();
+        let address = format!("/ip4/127.0.0.1/udp/4001/quic-v1/p2p/{other}")
+            .parse()
+            .unwrap();
+        let error = match Endpoint::builder()
+            .identity(identity.clone())
+            .relay_server_announce_addrs(vec![address])
+        {
+            Ok(_) => panic!("conflicting peer id must fail immediately"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error.reason,
+            RelayServerAddressErrorKind::ConflictingPeerId { expected, found }
+                if expected == identity.peer_id() && found == other
+        ));
+    }
+
+    #[cfg(feature = "relay-server")]
+    #[test]
+    fn relay_server_runtime_controls_are_typed_and_address_replacement_is_atomic() {
+        let mut absent = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind endpoint");
+        assert!(matches!(
+            absent.set_relay_server_accepting(false),
+            Err(RelayServerControlError::NotConfigured)
+        ));
+
+        let original: Multiaddr = "/ip4/127.0.0.1/udp/4001/quic-v1".parse().unwrap();
+        let mut endpoint = Endpoint::builder()
+            .relay_server()
+            .relay_server_announce_addrs(vec![original.clone()])
+            .expect("valid initial address")
+            .bind_quic("127.0.0.1:0")
+            .expect("bind relay server");
+        let invalid = "/ip4/0.0.0.0/udp/4002/quic-v1".parse().unwrap();
+        let error = endpoint
+            .set_relay_server_announce_addrs(vec![invalid])
+            .expect_err("invalid replacement");
+        assert!(matches!(
+            error,
+            RelayServerControlError::InvalidAddress(RelayServerAddressError {
+                index: 0,
+                reason: RelayServerAddressErrorKind::Wildcard,
+                ..
+            })
+        ));
+        assert_eq!(
+            endpoint
+                .relay_server
+                .as_ref()
+                .unwrap()
+                .agent
+                .selected_addrs(),
+            core::slice::from_ref(&original)
+        );
+        endpoint
+            .set_relay_server_announce_addrs(Vec::new())
+            .expect("empty replacement clears override");
+        let selected = endpoint
+            .relay_server
+            .as_ref()
+            .unwrap()
+            .agent
+            .selected_addrs();
+        assert!(!selected.is_empty());
+        assert_ne!(selected, [original]);
+    }
+
+    #[cfg(feature = "relay-server")]
+    #[test]
+    fn wildcard_listener_binds_without_becoming_a_relay_announce_address() {
+        let endpoint = Endpoint::builder()
+            .relay_server()
+            .bind_quic("0.0.0.0:0")
+            .expect("wildcard listener may host once a usable address source appears");
+        assert!(
+            endpoint
+                .relay_server
+                .as_ref()
+                .unwrap()
+                .agent
+                .selected_addrs()
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "relay-server")]
+    #[test]
+    fn relay_focused_wait_preserves_unrelated_events_and_reports_queue_progress() {
+        let mut endpoint = Endpoint::builder()
+            .relay_server()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind relay server");
+        let unrelated = Ed25519Keypair::generate().peer_id();
+        endpoint.pending_events.push_back(Event::ConnectionClosed {
+            peer_id: unrelated.clone(),
+            conn_id: ConnectionId::new(1),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
+        });
+        assert!(
+            endpoint
+                .next_relay_server_event(Duration::ZERO)
+                .expect("focused wait")
+                .is_none()
+        );
+        assert!(matches!(
+            endpoint.next_event(Duration::ZERO).expect("buffered event"),
+            Some(Event::ConnectionClosed { peer_id, .. }) if peer_id == unrelated
+        ));
+
+        endpoint
+            .relay_server
+            .as_mut()
+            .unwrap()
+            .events
+            .push_back(RelayServerEvent::Error(RelayServerRuntimeError {
+                kind: RelayServerRuntimeErrorKind::InternalInvariant,
+                peer_id: None,
+                detail: "test diagnostic".into(),
+            }));
+        assert!(matches!(
+            endpoint.next_wake(Duration::ZERO).expect("queue wake"),
+            EndpointWake::DriverProgress
+        ));
+        assert_eq!(endpoint.take_relay_server_events().len(), 1);
+    }
+
+    #[cfg(all(feature = "nat", feature = "relay-server"))]
+    #[test]
+    fn nat_and_relay_address_contributions_form_a_stable_first_wins_union() {
+        let mut endpoint = Endpoint::builder()
+            .nat_config(NatConfig::default())
+            .relay_server()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind combined endpoint");
+        let nat_only: Multiaddr = "/ip4/203.0.113.1/udp/4001/quic-v1".parse().unwrap();
+        let duplicate: Multiaddr = "/ip4/203.0.113.2/udp/4002/quic-v1".parse().unwrap();
+        let relay_only: Multiaddr = "/ip4/203.0.113.3/udp/4003/quic-v1".parse().unwrap();
+        endpoint
+            .nat
+            .as_mut()
+            .unwrap()
+            .set_test_public_addrs(vec![nat_only.clone(), duplicate.clone()]);
+        endpoint
+            .relay_server
+            .as_mut()
+            .unwrap()
+            .agent
+            .replace_announce_addrs(vec![duplicate.clone(), relay_only.clone()])
+            .unwrap();
+        endpoint.refresh_external_address_contributions();
+        endpoint.swarm.poll().expect("refresh identify snapshot");
+        let advertised = endpoint.swarm.core().local_addresses();
+        let nat_index = advertised
+            .iter()
+            .position(|addr| addr == &nat_only)
+            .unwrap();
+        let duplicate_indices: Vec<_> = advertised
+            .iter()
+            .enumerate()
+            .filter_map(|(index, addr)| (addr == &duplicate).then_some(index))
+            .collect();
+        let relay_index = advertised
+            .iter()
+            .position(|addr| addr == &relay_only)
+            .unwrap();
+        assert_eq!(duplicate_indices.len(), 1);
+        assert!(nat_index < duplicate_indices[0] && duplicate_indices[0] < relay_index);
     }
 }

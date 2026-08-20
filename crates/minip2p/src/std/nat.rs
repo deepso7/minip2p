@@ -123,7 +123,7 @@ impl NatDriver {
             }
             while let Some(event) = self.agent.poll_event() {
                 progressed = true;
-                self.observe(&event, swarm);
+                self.observe(&event);
                 self.events.push_back(event);
             }
             if !progressed {
@@ -137,6 +137,26 @@ impl NatDriver {
     /// Returns the latest usable NAT-orchestrated path for `peer`.
     pub(crate) fn path(&self, peer: &PeerId) -> Option<Path> {
         self.paths.get(peer).cloned()
+    }
+
+    pub(crate) fn advertised_addrs(&self) -> Vec<Multiaddr> {
+        let mut addrs = self.public_addrs.clone();
+        for (_, addr) in &self.reserved_relays {
+            if !addrs.contains(addr) {
+                addrs.push(addr.clone());
+            }
+        }
+        addrs
+    }
+
+    #[cfg(feature = "relay-server")]
+    pub(crate) fn confirmed_public_addrs(&self) -> Vec<Multiaddr> {
+        self.public_addrs.clone()
+    }
+
+    #[cfg(all(test, feature = "relay-server"))]
+    pub(crate) fn set_test_public_addrs(&mut self, addrs: Vec<Multiaddr>) {
+        self.public_addrs = addrs;
     }
 
     fn execute(&mut self, action: NatAction, swarm: &mut EndpointSwarm) {
@@ -282,9 +302,8 @@ impl NatDriver {
         true
     }
 
-    /// Keeps Identify's advertised set in sync with reservation state: a
-    /// held reservation advertises `<relay>/p2p/<relay-id>/p2p-circuit`.
-    fn observe(&mut self, event: &NatEvent, swarm: &mut EndpointSwarm) {
+    /// Updates NAT's address contribution after a lifecycle event.
+    fn observe(&mut self, event: &NatEvent) {
         match event {
             NatEvent::PathEstablished { peer, path, .. } => {
                 self.paths.insert(peer.clone(), path.clone());
@@ -309,14 +328,9 @@ impl NatDriver {
                 circuit.push(Protocol::P2p(relay.clone()));
                 circuit.push(Protocol::P2pCircuit);
                 self.reserved_relays.push((relay.clone(), circuit));
-                self.advertise(swarm);
             }
             NatEvent::RelayReservationLost { relay } => {
-                let before = self.reserved_relays.len();
                 self.reserved_relays.retain(|(peer, _)| peer != relay);
-                if self.reserved_relays.len() != before {
-                    self.advertise(swarm);
-                }
             }
             NatEvent::ReachabilityChanged {
                 confirmed_addrs: addrs,
@@ -326,20 +340,9 @@ impl NatDriver {
                 if self.public_addrs != *addrs =>
             {
                 self.public_addrs = addrs.clone();
-                self.advertise(swarm);
             }
             _ => {}
         }
-    }
-
-    fn advertise(&self, swarm: &mut EndpointSwarm) {
-        let mut addrs = self.public_addrs.clone();
-        for (_, addr) in &self.reserved_relays {
-            if !addrs.contains(addr) {
-                addrs.push(addr.clone());
-            }
-        }
-        swarm.set_external_addresses(addrs);
     }
 }
 
@@ -559,30 +562,31 @@ mod tests {
         let public: Multiaddr = "/ip4/203.0.113.9/udp/4001/quic-v1"
             .parse()
             .expect("public addr");
-        let Endpoint { swarm, nat, .. } = &mut endpoint;
-        let driver = nat.as_mut().expect("NAT configured");
-
-        driver.observe(
-            &NatEvent::ReachabilityChanged {
+        endpoint
+            .nat
+            .as_mut()
+            .expect("NAT configured")
+            .observe(&NatEvent::ReachabilityChanged {
                 old: ReachabilityState::Unknown,
                 new: ReachabilityState::Public,
                 confirmed_addrs: vec![public.clone()],
-            },
-            swarm,
-        );
-        swarm.poll().expect("refresh identify addresses");
-        assert!(swarm.core().local_addresses().contains(&public));
+            });
+        endpoint.refresh_external_address_contributions();
+        endpoint.swarm.poll().expect("refresh identify addresses");
+        assert!(endpoint.swarm.core().local_addresses().contains(&public));
 
-        driver.observe(
-            &NatEvent::ReachabilityChanged {
+        endpoint
+            .nat
+            .as_mut()
+            .expect("NAT configured")
+            .observe(&NatEvent::ReachabilityChanged {
                 old: ReachabilityState::Public,
                 new: ReachabilityState::Private,
                 confirmed_addrs: Vec::new(),
-            },
-            swarm,
-        );
-        swarm.poll().expect("refresh identify addresses");
-        assert!(!swarm.core().local_addresses().contains(&public));
+            });
+        endpoint.refresh_external_address_contributions();
+        endpoint.swarm.poll().expect("refresh identify addresses");
+        assert!(!endpoint.swarm.core().local_addresses().contains(&public));
     }
 
     #[test]
@@ -596,21 +600,17 @@ mod tests {
         let relay = Ed25519Keypair::from_secret_key_bytes([76; 32]).peer_id();
 
         {
-            let Endpoint { swarm, nat, .. } = &mut endpoint;
-            let driver = nat.as_mut().expect("NAT configured");
+            let driver = endpoint.nat.as_mut().expect("NAT configured");
             let connect_id = driver
                 .agent
                 .connect(peer.clone(), Vec::new(), Now::from_mono(0));
-            driver.observe(
-                &NatEvent::PathEstablished {
-                    connect_id,
-                    peer: peer.clone(),
-                    path: Path::Relayed {
-                        relay: relay.clone(),
-                    },
+            driver.observe(&NatEvent::PathEstablished {
+                connect_id,
+                peer: peer.clone(),
+                path: Path::Relayed {
+                    relay: relay.clone(),
                 },
-                swarm,
-            );
+            });
         }
         assert_eq!(
             endpoint.path(&peer),
@@ -620,31 +620,24 @@ mod tests {
         );
 
         {
-            let Endpoint { swarm, nat, .. } = &mut endpoint;
-            let driver = nat.as_mut().expect("NAT configured");
+            let driver = endpoint.nat.as_mut().expect("NAT configured");
             let connect_id = driver
                 .agent
                 .connect(peer.clone(), Vec::new(), Now::from_mono(1));
-            driver.observe(
-                &NatEvent::PathUpgraded {
-                    connect_id,
-                    peer: peer.clone(),
-                    from: Path::Relayed {
-                        relay: relay.clone(),
-                    },
-                    to: Path::DirectPunched,
+            driver.observe(&NatEvent::PathUpgraded {
+                connect_id,
+                peer: peer.clone(),
+                from: Path::Relayed {
+                    relay: relay.clone(),
                 },
-                swarm,
-            );
-            driver.observe(
-                &NatEvent::InboundPathEstablished {
-                    peer: inbound.clone(),
-                    path: Path::Relayed {
-                        relay: relay.clone(),
-                    },
+                to: Path::DirectPunched,
+            });
+            driver.observe(&NatEvent::InboundPathEstablished {
+                peer: inbound.clone(),
+                path: Path::Relayed {
+                    relay: relay.clone(),
                 },
-                swarm,
-            );
+            });
         }
         assert_eq!(
             endpoint.path(&inbound),
@@ -654,14 +647,10 @@ mod tests {
         );
 
         {
-            let Endpoint { swarm, nat, .. } = &mut endpoint;
-            let driver = nat.as_mut().expect("NAT configured");
-            driver.observe(
-                &NatEvent::InboundDirectUpgrade {
-                    peer: inbound.clone(),
-                },
-                swarm,
-            );
+            let driver = endpoint.nat.as_mut().expect("NAT configured");
+            driver.observe(&NatEvent::InboundDirectUpgrade {
+                peer: inbound.clone(),
+            });
         }
         assert_eq!(endpoint.path(&peer), Some(Path::DirectPunched));
         assert_eq!(endpoint.path(&inbound), Some(Path::DirectPunched));
