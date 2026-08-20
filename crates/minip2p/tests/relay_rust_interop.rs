@@ -2,6 +2,7 @@
 
 #![cfg(all(feature = "relay-server", feature = "tcp"))]
 
+use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
@@ -30,22 +31,28 @@ fn pinned_rust_libp2p_reserves_connects_and_exchanges_bytes() {
         .bind_tcp("127.0.0.1:0")
         .unwrap();
     let relay_addr = relay.listen().unwrap().to_string();
-    let manifest = format!(
-        "{}/../../tests/interop/rust-relay-client/Cargo.toml",
-        env!("CARGO_MANIFEST_DIR")
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/interop/rust-relay-client/Cargo.toml");
+    let build_status = Command::new("cargo")
+        .args(["build", "--quiet", "--locked", "--manifest-path"])
+        .arg(&manifest)
+        .status()
+        .expect("build pinned rust-libp2p client");
+    assert!(
+        build_status.success(),
+        "pinned client build failed: {build_status}"
     );
+    let binary = manifest
+        .parent()
+        .expect("interop manifest has a parent")
+        .join("target/debug")
+        .join(format!(
+            "minip2p-rust-relay-interop{}",
+            std::env::consts::EXE_SUFFIX
+        ));
     let mut child = ChildGuard(
-        Command::new("cargo")
-            .args([
-                "run",
-                "--quiet",
-                "--manifest-path",
-                &manifest,
-                "--",
-                &relay_addr,
-                "7",
-                "2048",
-            ])
+        Command::new(binary)
+            .args([&relay_addr, "7", "2048"])
             .spawn()
             .expect("spawn pinned rust-libp2p client"),
     );
