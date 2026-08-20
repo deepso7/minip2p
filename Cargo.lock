@@ -1265,6 +1265,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "minip2p-relay-server-example"
+version = "0.4.1"
+dependencies = [
+ "minip2p-example-common",
+ "minip2p-rs",
+]
+
+[[package]]
 name = "minip2p-rs"
 version = "0.4.1"
 dependencies = [

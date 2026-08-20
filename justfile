@@ -90,6 +90,10 @@ peer-ping:
 interop-go:
     cargo test -p minip2p-ffi --test go_interop -- --ignored --nocapture
 
+# Pinned rust-libp2p relay client against the minip2p server (network/build opt-in).
+interop-relay-rust:
+    cargo test -p minip2p-rs --features relay-server,tcp --test relay_rust_interop -- --ignored --nocapture
+
 docs:
     cargo doc --workspace --no-deps
     cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp,relay-server --no-deps
@@ -99,6 +103,11 @@ docs:
     cargo doc -p minip2p-rs --no-default-features --features smoltcp,pubsub --no-deps
     cargo doc -p minip2p-rs --no-default-features --features portable-autonat --no-deps
     cargo doc -p minip2p-rs --no-default-features --features portable-relay --no-deps
+
+package-check:
+    cargo package -p minip2p-relay-server --allow-dirty --list | rg '^README.md$'
+    cargo package -p minip2p-rs --allow-dirty --list | rg '^README.md$'
+    cargo metadata --no-deps --format-version 1 | jq -e '.packages[] | select(.name == "minip2p-rs") | .features["relay-server"] == ["std", "dep:minip2p-relay-server"]'
 
 docs-site:
     cd docs && pnpm run check

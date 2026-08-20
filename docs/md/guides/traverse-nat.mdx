@@ -8,19 +8,32 @@ path establish / upgrade / fallback events.
 
 **Assumes:** [Listen and dial](/guides/listen-and-dial) and
 [Concepts](/guides/concepts#dial-versus-connect). You need a reachable Circuit
-Relay v2 server for relayed paths.
+Relay v2 server for relayed paths; minip2p can host it.
 
-<Badge>pre-1.0</Badge> <Badge>needs external relay</Badge>
+<Badge>pre-1.0</Badge>
 
 The `nat` feature adds an orchestrator that can race a direct QUIC or TCP dial
 against a Circuit Relay v2 path. DCUtR hole punching still needs QUIC.
 
-:::warning
-minip2p ships relay client state machines and traversal policy. It does not
-ship a production relay server. Bring a reachable Circuit Relay v2 server,
-such as the
-[rust-libp2p relay server example](https://github.com/libp2p/rust-libp2p/tree/master/examples/relay-server).
-:::
+## Host the relay
+
+The independent std-only `relay-server` feature hosts Circuit Relay v2 over
+QUIC, TCP, or both. The bundled operator example uses both:
+
+```bash
+cargo run -p minip2p-relay-server-example -- \
+  --key var/relay.ed25519 \
+  --announce /dns4/relay.example.com/udp/4001/quic-v1 \
+  --announce /dns4/relay.example.com/tcp/4001
+```
+
+Its default is the small `.relay_server().bind_*()` application path. Optional
+flags expose frozen resource/rate/control limits, and stdin `pause`/`resume`
+changes only new admissions. Explicit addresses are trusted operator input;
+otherwise selection prefers AutoNAT-confirmed direct addresses and then
+concrete listeners. Address changes affect future Identify responses only.
+There is no automatic relay discovery: distribute the printed peer address to
+clients explicitly. See the [hosting guide](https://github.com/deepso7/minip2p/tree/main/examples/relay-server).
 
 ## Compile and activate the driver
 

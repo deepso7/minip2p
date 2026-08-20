@@ -62,11 +62,11 @@ This is exactly what the CI E2E test (`tests/ping.rs`) runs.
 ## The real payoff: two peers behind NATs
 
 You need one publicly reachable Circuit Relay v2 server. rust-libp2p's
-[relay server example](https://github.com/libp2p/rust-libp2p/tree/master/examples/relay-server)
+[minip2p relay-server example](../relay-server/README.md)
 works:
 
 ```console
-$ cargo run -p relay-server-example -- --port 4001 --secret-key-seed 42
+$ cargo run -p minip2p-relay-server-example -- --key /tmp/minip2p-relay.key
 ```
 
 **Peer B (listener), behind its NAT** — reserve a slot and publish the

@@ -32,6 +32,7 @@ members = [
     "examples/chat",
     "examples/common",
     "examples/peer",
+    "examples/relay-server",
 ]
 
 [workspace.package]
