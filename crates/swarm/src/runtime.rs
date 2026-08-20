@@ -85,6 +85,7 @@ pub struct SwarmRuntime<T: Transport, E: EntropySource> {
     /// addition to the transport's bound set. See
     /// [`SwarmRuntime::set_external_addresses`].
     external_addresses: Vec<Multiaddr>,
+    external_addresses_revision: u64,
 
     /// Randomness for ping nonces. Injected so the pump stays deterministic
     /// and testable, and so `no_std` hosts can supply their own source.
@@ -111,6 +112,7 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
             event_buffer: VecDeque::new(),
             after_event_actions: VecDeque::new(),
             external_addresses: Vec::new(),
+            external_addresses_revision: 0,
             entropy,
         }
     }
@@ -124,12 +126,21 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     /// dropped.
     pub fn set_external_addresses(&mut self, addrs: Vec<Multiaddr>) {
         self.external_addresses = addrs;
+        self.external_addresses_revision = self.external_addresses_revision.wrapping_add(1);
     }
 
     /// Returns the externally validated addresses currently contributed to
     /// Identify, excluding transport-bound addresses.
     pub fn external_addresses(&self) -> &[Multiaddr] {
         &self.external_addresses
+    }
+
+    /// Returns the wrapping revision of the external-address replacement.
+    ///
+    /// The revision advances even when a replacement contains the same values,
+    /// allowing composed hosts to distinguish address ownership changes.
+    pub fn external_addresses_revision(&self) -> u64 {
+        self.external_addresses_revision
     }
 
     /// Returns a reference to the underlying transport.
