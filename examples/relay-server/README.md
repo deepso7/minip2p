@@ -11,7 +11,9 @@ The application path represented by that default is deliberately small:
 ```rust
 let endpoint = Endpoint::builder()
     .relay_server()
-    .bind_quic_dual_stack()?;
+    .quic("0.0.0.0:4001")
+    .tcp("0.0.0.0:4001")
+    .bind()?;
 ```
 
 The example binds both transports on `0.0.0.0:4001`, prints dialable addresses

@@ -8,6 +8,8 @@ use std::time::Duration;
 use minip2p::{Endpoint, EndpointWake, RelayServerEvent};
 use minip2p_example_common::load_keypair;
 
+const STDIN_COMMAND_CAPACITY: usize = 16;
+
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -73,7 +75,9 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
 }
 
 fn stdin_commands() -> mpsc::Receiver<String> {
-    let (sender, receiver) = mpsc::channel();
+    // Bound piped input so a producer cannot outrun the operator loop and grow
+    // the process without limit.
+    let (sender, receiver) = stdin_command_channel();
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
             match line {
@@ -87,6 +91,10 @@ fn stdin_commands() -> mpsc::Receiver<String> {
         }
     });
     receiver
+}
+
+fn stdin_command_channel() -> (mpsc::SyncSender<String>, mpsc::Receiver<String>) {
+    mpsc::sync_channel(STDIN_COMMAND_CAPACITY)
 }
 
 fn print_event(event: RelayServerEvent) {
@@ -135,5 +143,22 @@ fn print_event(event: RelayServerEvent) {
                 .map_or_else(|| "unknown".into(), |peer| peer.to_string()),
             error.detail
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdin_command_queue_applies_backpressure() {
+        let (sender, _receiver) = stdin_command_channel();
+        for index in 0..STDIN_COMMAND_CAPACITY {
+            sender.try_send(index.to_string()).unwrap();
+        }
+        assert!(matches!(
+            sender.try_send("overflow".into()),
+            Err(mpsc::TrySendError::Full(_))
+        ));
     }
 }

@@ -141,13 +141,25 @@ mod tests {
             "--paused".into(),
             "--max-circuits".into(),
             "7".into(),
+            "--reservation-peer-rate".into(),
+            "3/250".into(),
             "--circuit-ip-rate".into(),
             "off".into(),
         ])
         .unwrap();
-        assert_eq!(options.announce_addrs.len(), 1);
+        assert_eq!(
+            options.announce_addrs,
+            ["/ip4/203.0.113.4/tcp/4001".parse().unwrap()]
+        );
         assert!(!options.accepting);
         assert_eq!(options.config.max_circuits, 7);
+        assert_eq!(
+            options.config.reservation_rate_limit_per_peer,
+            Some(RateLimit {
+                capacity: 3,
+                refill_interval_ms: 250,
+            })
+        );
         assert_eq!(options.config.circuit_rate_limit_per_ip, None);
     }
 }

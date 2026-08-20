@@ -5,7 +5,7 @@
 
 use std::error::Error;
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path as FsPath;
 use std::process::Child;
@@ -74,9 +74,8 @@ pub fn load_keypair(
     };
 
     if path.exists() {
-        let raw = fs::read_to_string(path)
-            .map_err(|e| format!("failed to read key file {}: {e}", path.display()))?;
-        let secret = decode_secret(raw.trim())
+        let raw = read_secret(path)?;
+        let secret = decode_secret(raw.strip_suffix('\n').unwrap_or(&raw))
             .map_err(|e| format!("invalid key file {}: {e}", path.display()))?;
         let keypair = Ed25519Keypair::from_secret_key_bytes(secret);
         println!(
@@ -95,6 +94,79 @@ pub fn load_keypair(
         path.display()
     );
     Ok(keypair)
+}
+
+/// Opens and validates an existing key before reading at most one encoded
+/// secret plus its optional newline. Non-blocking open avoids hanging on a
+/// FIFO substituted for the requested path; metadata from the opened handle
+/// prevents a pathname replacement from bypassing the checks.
+#[cfg(unix)]
+fn read_secret(path: &FsPath) -> Result<String, Box<dyn Error>> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let path_metadata = fs::symlink_metadata(path)
+        .map_err(|e| format!("failed to inspect key file {}: {e}", path.display()))?;
+    if !path_metadata.file_type().is_file() {
+        return Err(format!("refusing key file {}: not a regular file", path.display()).into());
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
+        .open(path)
+        .map_err(|e| format!("failed to open key file {}: {e}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("failed to inspect key file {}: {e}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("refusing key file {}: not a regular file", path.display()).into());
+    }
+
+    let expected_uid = rustix::process::geteuid().as_raw();
+    if metadata.uid() != expected_uid {
+        return Err(format!(
+            "refusing key file {}: owned by uid {}, expected process uid {expected_uid}",
+            path.display(),
+            metadata.uid()
+        )
+        .into());
+    }
+    if metadata.mode() & 0o7777 != 0o600 {
+        return Err(format!("refusing key file {}: mode must be 0600", path.display()).into());
+    }
+
+    let mut bytes = Vec::with_capacity(SECRET_KEY_LENGTH * 2 + 2);
+    std::io::Read::by_ref(&mut file)
+        .take((SECRET_KEY_LENGTH * 2 + 2) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("failed to read key file {}: {e}", path.display()))?;
+    if bytes.len() > SECRET_KEY_LENGTH * 2 + 1 {
+        return Err(format!(
+            "invalid key file {}: too large (expected 64 hex chars and optional newline)",
+            path.display()
+        )
+        .into());
+    }
+    String::from_utf8(bytes).map_err(|e| format!("invalid key file {}: {e}", path.display()).into())
+}
+
+#[cfg(not(unix))]
+fn read_secret(path: &FsPath) -> Result<String, Box<dyn Error>> {
+    let mut file = fs::File::open(path)
+        .map_err(|e| format!("failed to open key file {}: {e}", path.display()))?;
+    let mut bytes = Vec::with_capacity(SECRET_KEY_LENGTH * 2 + 2);
+    std::io::Read::by_ref(&mut file)
+        .take((SECRET_KEY_LENGTH * 2 + 2) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("failed to read key file {}: {e}", path.display()))?;
+    if bytes.len() > SECRET_KEY_LENGTH * 2 + 1 {
+        return Err(format!(
+            "invalid key file {}: too large (expected 64 hex chars and optional newline)",
+            path.display()
+        )
+        .into());
+    }
+    String::from_utf8(bytes).map_err(|e| format!("invalid key file {}: {e}", path.display()).into())
 }
 
 /// Writes the raw secret into a file that is `0o600` from the moment it
@@ -289,4 +361,56 @@ pub fn circuit_addr(relay: &PeerAddr, us: &PeerId) -> Multiaddr {
     protocols.push(Protocol::P2pCircuit);
     protocols.push(Protocol::P2p(us.clone()));
     Multiaddr::from_protocols(protocols)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "minip2p-example-common-{}-{}-{name}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn existing_key_must_be_owner_only() {
+        let path = temp_path("permissive-key");
+        fs::write(&path, format!("{}\n", "00".repeat(SECRET_KEY_LENGTH))).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = load_keypair(Some(&path), "test").unwrap_err().to_string();
+
+        let _ = fs::remove_file(path);
+        assert!(error.contains("0600"), "{error}");
+    }
+
+    #[test]
+    fn existing_key_must_be_a_regular_file() {
+        let path = temp_path("key-directory");
+        fs::create_dir(&path).unwrap();
+
+        let error = load_keypair(Some(&path), "test").unwrap_err().to_string();
+
+        let _ = fs::remove_dir(path);
+        assert!(error.contains("regular file"), "{error}");
+    }
+
+    #[test]
+    fn existing_key_read_is_bounded() {
+        let path = temp_path("oversized-key");
+        fs::write(&path, "00".repeat(1024)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = load_keypair(Some(&path), "test").unwrap_err().to_string();
+
+        let _ = fs::remove_file(path);
+        assert!(error.contains("too large"), "{error}");
+    }
 }
