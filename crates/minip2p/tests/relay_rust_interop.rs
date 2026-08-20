@@ -2,10 +2,19 @@
 
 #![cfg(all(feature = "relay-server", feature = "tcp"))]
 
-use std::process::Command;
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use minip2p::{Endpoint, RelayServerConfig, RelayServerEvent};
+
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 #[test]
 #[ignore = "downloads/builds pinned rust-libp2p and opens loopback sockets"]
@@ -25,19 +34,21 @@ fn pinned_rust_libp2p_reserves_connects_and_exchanges_bytes() {
         "{}/../../tests/interop/rust-relay-client/Cargo.toml",
         env!("CARGO_MANIFEST_DIR")
     );
-    let mut child = Command::new("cargo")
-        .args([
-            "run",
-            "--quiet",
-            "--manifest-path",
-            &manifest,
-            "--",
-            &relay_addr,
-            "7",
-            "2048",
-        ])
-        .spawn()
-        .expect("spawn pinned rust-libp2p client");
+    let mut child = ChildGuard(
+        Command::new("cargo")
+            .args([
+                "run",
+                "--quiet",
+                "--manifest-path",
+                &manifest,
+                "--",
+                &relay_addr,
+                "7",
+                "2048",
+            ])
+            .spawn()
+            .expect("spawn pinned rust-libp2p client"),
+    );
 
     let deadline = Instant::now() + Duration::from_secs(180);
     let mut reserved = false;
@@ -67,7 +78,7 @@ fn pinned_rust_libp2p_reserves_connects_and_exchanges_bytes() {
                 _ => {}
             }
         }
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = child.0.try_wait().unwrap() {
             assert!(
                 status.success(),
                 "pinned rust-libp2p client failed: {status}"

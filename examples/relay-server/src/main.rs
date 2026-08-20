@@ -5,7 +5,7 @@ use std::io::BufRead as _;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use minip2p::{Endpoint, RelayServerEvent};
+use minip2p::{Endpoint, EndpointWake, RelayServerEvent};
 use minip2p_example_common::load_keypair;
 
 fn main() {
@@ -63,7 +63,10 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
                 command => eprintln!("[relay] unknown command {command:?}; use pause or resume"),
             }
         }
-        if let Some(event) = endpoint.next_relay_server_event(Duration::from_millis(250))? {
+        if let EndpointWake::Event(event) = endpoint.next_wake(Duration::from_millis(250))? {
+            println!("[endpoint] {event:?}");
+        }
+        for event in endpoint.take_relay_server_events() {
             print_event(event);
         }
     }
