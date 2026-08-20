@@ -33,23 +33,25 @@ fn pinned_rust_libp2p_reserves_connects_and_exchanges_bytes() {
     let relay_addr = relay.listen().unwrap().to_string();
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/interop/rust-relay-client/Cargo.toml");
+    let target_dir = manifest
+        .parent()
+        .expect("interop manifest has a parent")
+        .join("target");
     let build_status = Command::new("cargo")
         .args(["build", "--quiet", "--locked", "--manifest-path"])
         .arg(&manifest)
+        .arg("--target-dir")
+        .arg(&target_dir)
         .status()
         .expect("build pinned rust-libp2p client");
     assert!(
         build_status.success(),
         "pinned client build failed: {build_status}"
     );
-    let binary = manifest
-        .parent()
-        .expect("interop manifest has a parent")
-        .join("target/debug")
-        .join(format!(
-            "minip2p-rust-relay-interop{}",
-            std::env::consts::EXE_SUFFIX
-        ));
+    let binary = target_dir.join("debug").join(format!(
+        "minip2p-rust-relay-interop{}",
+        std::env::consts::EXE_SUFFIX
+    ));
     let mut child = ChildGuard(
         Command::new(binary)
             .args([&relay_addr, "7", "2048"])
