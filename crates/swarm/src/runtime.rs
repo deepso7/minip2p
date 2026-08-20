@@ -126,6 +126,12 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         self.external_addresses = addrs;
     }
 
+    /// Returns the externally validated addresses currently contributed to
+    /// Identify, excluding transport-bound addresses.
+    pub fn external_addresses(&self) -> &[Multiaddr] {
+        &self.external_addresses
+    }
+
     /// Returns a reference to the underlying transport.
     pub fn transport(&self) -> &T {
         &self.transport

@@ -200,6 +200,10 @@ pub struct Endpoint {
     /// the endpoint; drained first by [`Endpoint::next_event`].
     #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     pending_events: std::collections::VecDeque<Event>,
+    /// Addresses installed by the composed NAT and relay-server drivers on the
+    /// previous refresh, kept separate from caller-owned Swarm contributions.
+    #[cfg(any(feature = "nat", feature = "relay-server"))]
+    managed_external_addresses: Vec<Multiaddr>,
 }
 
 /// Why one [`Endpoint::next_wake`] call returned.
@@ -1074,7 +1078,14 @@ impl Endpoint {
                 let _ = relay_server.agent.set_confirmed_addrs(confirmed);
             }
         }
-        let mut addresses = Vec::new();
+        let mut addresses: Vec<_> = self
+            .swarm
+            .external_addresses()
+            .iter()
+            .filter(|address| !self.managed_external_addresses.contains(address))
+            .cloned()
+            .collect();
+        let caller_address_count = addresses.len();
         #[cfg(feature = "nat")]
         if let Some(nat) = self.nat.as_ref() {
             for address in nat.advertised_addrs() {
@@ -1091,6 +1102,7 @@ impl Endpoint {
                 }
             }
         }
+        self.managed_external_addresses = addresses[caller_address_count..].to_vec();
         self.swarm.set_external_addresses(addresses);
     }
 
@@ -2399,6 +2411,8 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
         mdns,
         #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
         pending_events: std::collections::VecDeque::new(),
+        #[cfg(any(feature = "nat", feature = "relay-server"))]
+        managed_external_addresses: Vec::new(),
     })
 }
 
@@ -3569,5 +3583,27 @@ mod tests {
             .unwrap();
         assert_eq!(duplicate_indices.len(), 1);
         assert!(nat_index < duplicate_indices[0] && duplicate_indices[0] < relay_index);
+    }
+
+    #[cfg(feature = "relay-server")]
+    #[test]
+    fn relay_refresh_preserves_caller_owned_swarm_external_addresses() {
+        let mut endpoint = Endpoint::builder()
+            .relay_server()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind relay endpoint");
+        let caller_owned: Multiaddr = "/ip4/203.0.113.8/udp/4008/quic-v1".parse().unwrap();
+        let relay_owned: Multiaddr = "/ip4/203.0.113.9/udp/4009/quic-v1".parse().unwrap();
+        endpoint
+            .swarm_mut()
+            .set_external_addresses(vec![caller_owned.clone()]);
+        endpoint
+            .set_relay_server_announce_addrs(vec![relay_owned.clone()])
+            .expect("replace relay addresses");
+        endpoint.swarm.poll().expect("refresh identify snapshot");
+
+        let advertised = endpoint.swarm.core().local_addresses();
+        assert!(advertised.contains(&caller_owned));
+        assert!(advertised.contains(&relay_owned));
     }
 }

@@ -205,6 +205,11 @@ impl<T: Transport> Swarm<T> {
         self.runtime.set_external_addresses(addrs);
     }
 
+    /// See [`SwarmRuntime::external_addresses`].
+    pub fn external_addresses(&self) -> &[Multiaddr] {
+        self.runtime.external_addresses()
+    }
+
     /// See [`SwarmRuntime::transport`].
     pub fn transport(&self) -> &T {
         self.runtime.transport()

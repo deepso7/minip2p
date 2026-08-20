@@ -8,8 +8,23 @@ use minip2p_relay_server::{
     RelayServerAction, RelayServerAgent, RelayServerEvent, RelayServerToken, StreamKey,
 };
 use minip2p_swarm::SwarmEvent;
+use minip2p_transport::ConnectionId;
 
 use crate::EndpointSwarm;
+
+fn take_pending_for_connection<T>(
+    pending: &mut BTreeMap<StreamKey, T>,
+    conn_id: ConnectionId,
+) -> Vec<T> {
+    let keys: Vec<_> = pending
+        .keys()
+        .filter(|stream| stream.conn_id == conn_id)
+        .copied()
+        .collect();
+    keys.into_iter()
+        .filter_map(|stream| pending.remove(&stream))
+        .collect()
+}
 
 pub(crate) struct RelayServerDriver {
     pub(crate) agent: RelayServerAgent,
@@ -41,6 +56,17 @@ impl RelayServerDriver {
 
     pub(crate) fn ingest(&mut self, event: &SwarmEvent, swarm: &mut EndpointSwarm) -> bool {
         let now = self.now();
+        if let SwarmEvent::ConnectionClosed { conn_id, .. } = event {
+            for token in take_pending_for_connection(&mut self.pending_opens, *conn_id) {
+                self.agent.stream_open_result(
+                    token,
+                    Err(format!(
+                        "destination connection {conn_id} closed during protocol negotiation"
+                    )),
+                    now,
+                );
+            }
+        }
         let pending_key = match event {
             SwarmEvent::StreamReady {
                 conn_id,
@@ -176,5 +202,45 @@ impl RelayServerDriver {
                 self.agent.reset_stream_result(token, result, now);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use minip2p_transport::{ConnectionId, StreamId};
+
+    #[test]
+    fn connection_cleanup_removes_only_its_pending_opens() {
+        let closed = ConnectionId::new(7);
+        let live = ConnectionId::new(8);
+        let mut pending = BTreeMap::from([
+            (
+                StreamKey {
+                    conn_id: closed,
+                    stream_id: StreamId::new(1),
+                },
+                "first",
+            ),
+            (
+                StreamKey {
+                    conn_id: live,
+                    stream_id: StreamId::new(2),
+                },
+                "live",
+            ),
+            (
+                StreamKey {
+                    conn_id: closed,
+                    stream_id: StreamId::new(3),
+                },
+                "second",
+            ),
+        ]);
+
+        let removed = take_pending_for_connection(&mut pending, closed);
+
+        assert_eq!(removed, vec!["first", "second"]);
+        assert_eq!(pending.values().copied().collect::<Vec<_>>(), vec!["live"]);
     }
 }
