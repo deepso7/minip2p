@@ -5,10 +5,21 @@ use std::io::BufRead as _;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use minip2p::{Endpoint, EndpointWake, RelayServerEvent};
+use minip2p::{Ed25519Keypair, Endpoint, EndpointWake, Multiaddr, RelayServerEvent};
 use minip2p_example_common::load_keypair;
 
 const STDIN_COMMAND_CAPACITY: usize = 16;
+const DEFAULT_IPV4_BIND: &str = "0.0.0.0:4001";
+const DEFAULT_IPV6_BIND: &str = "[::]:4001";
+const DEFAULT_IPV4_QUIC: &str = "/ip4/0.0.0.0/udp/4001/quic-v1";
+const DEFAULT_IPV6_QUIC: &str = "/ip6/::/udp/4001/quic-v1";
+
+#[derive(Clone, Copy, Debug)]
+enum AutomaticBind {
+    Both,
+    Ipv4,
+    Ipv6,
+}
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -26,17 +37,7 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     let options = cli::parse(args)?;
     let identity = load_keypair(options.key_path.as_deref(), "relay")?;
 
-    // The default is intentionally the documented three-line path; the
-    // surrounding calls only apply explicitly requested operator controls.
-    let mut builder = Endpoint::builder()
-        .identity(identity)
-        .relay_server_config(options.config)?
-        .quic(options.quic_bind)
-        .tcp(options.tcp_bind);
-    if !options.announce_addrs.is_empty() {
-        builder = builder.relay_server_announce_addrs(options.announce_addrs)?;
-    }
-    let mut endpoint = builder.bind()?;
+    let mut endpoint = bind_endpoint(&options, identity)?;
     endpoint.set_relay_server_accepting(options.accepting)?;
 
     println!(
@@ -72,6 +73,94 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
             print_event(event);
         }
     }
+}
+
+fn bind_endpoint(
+    options: &cli::Options,
+    identity: Ed25519Keypair,
+) -> Result<Endpoint, Box<dyn Error>> {
+    let automatic = [
+        AutomaticBind::Both,
+        AutomaticBind::Ipv4,
+        AutomaticBind::Ipv6,
+    ];
+    let modes: &[AutomaticBind] = if options.quic_binds.is_empty() || options.tcp_binds.is_empty() {
+        &automatic
+    } else {
+        &automatic[..1]
+    };
+    let mut last_error = None;
+
+    for &mode in modes {
+        match try_bind(options, identity.clone(), mode) {
+            Ok(endpoint) => {
+                if !matches!(mode, AutomaticBind::Both) {
+                    eprintln!("[relay] dual-stack bind unavailable; using {mode:?}");
+                }
+                return Ok(endpoint);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(last_error.expect("at least one relay bind layout is attempted"))
+}
+
+fn try_bind(
+    options: &cli::Options,
+    identity: Ed25519Keypair,
+    mode: AutomaticBind,
+) -> Result<Endpoint, Box<dyn Error>> {
+    let mut builder = Endpoint::builder()
+        .identity(identity)
+        .relay_server_config(options.config.clone())?;
+
+    if options.quic_binds.is_empty() {
+        builder = match mode {
+            AutomaticBind::Both => {
+                let ipv4: Multiaddr = DEFAULT_IPV4_QUIC.parse()?;
+                let ipv6: Multiaddr = DEFAULT_IPV6_QUIC.parse()?;
+                builder.quic_dual_multiaddr(&ipv4, &ipv6)
+            }
+            AutomaticBind::Ipv4 => builder.quic(DEFAULT_IPV4_BIND),
+            AutomaticBind::Ipv6 => builder.quic(DEFAULT_IPV6_BIND),
+        };
+    } else {
+        match options.quic_binds.as_slice() {
+            [address] => builder = builder.quic(address),
+            [first, second] => {
+                let first = quic_multiaddr(first)?;
+                let second = quic_multiaddr(second)?;
+                builder = builder.quic_dual_multiaddr(&first, &second);
+            }
+            _ => return Err("--quic accepts at most one IPv4 and one IPv6 address".into()),
+        }
+    }
+
+    if options.tcp_binds.is_empty() {
+        builder = match mode {
+            AutomaticBind::Both => builder.tcp(DEFAULT_IPV4_BIND).tcp(DEFAULT_IPV6_BIND),
+            AutomaticBind::Ipv4 => builder.tcp(DEFAULT_IPV4_BIND),
+            AutomaticBind::Ipv6 => builder.tcp(DEFAULT_IPV6_BIND),
+        };
+    } else {
+        for address in &options.tcp_binds {
+            builder = builder.tcp(address);
+        }
+    }
+
+    if !options.announce_addrs.is_empty() {
+        builder = builder.relay_server_announce_addrs(options.announce_addrs.clone())?;
+    }
+    Ok(builder.bind()?)
+}
+
+fn quic_multiaddr(address: &str) -> Result<Multiaddr, Box<dyn Error>> {
+    let address: std::net::SocketAddr = address
+        .parse()
+        .map_err(|error| format!("invalid dual-stack --quic address {address:?}: {error}"))?;
+    let family = if address.is_ipv4() { "ip4" } else { "ip6" };
+    Ok(format!("/{family}/{}/udp/{}/quic-v1", address.ip(), address.port()).parse()?)
 }
 
 fn stdin_commands() -> mpsc::Receiver<String> {

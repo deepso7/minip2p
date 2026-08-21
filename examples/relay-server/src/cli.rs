@@ -4,8 +4,10 @@ use minip2p::{Multiaddr, RateLimit, RelayServerConfig};
 
 #[derive(Debug)]
 pub struct Options {
-    pub quic_bind: String,
-    pub tcp_bind: String,
+    /// Exact QUIC binds; empty selects automatic IPv4/IPv6 binding.
+    pub quic_binds: Vec<String>,
+    /// Exact TCP binds; empty selects automatic IPv4/IPv6 binding.
+    pub tcp_binds: Vec<String>,
     pub key_path: Option<PathBuf>,
     pub announce_addrs: Vec<Multiaddr>,
     pub accepting: bool,
@@ -14,8 +16,8 @@ pub struct Options {
 
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
     let mut options = Options {
-        quic_bind: "0.0.0.0:4001".into(),
-        tcp_bind: "0.0.0.0:4001".into(),
+        quic_binds: Vec::new(),
+        tcp_binds: Vec::new(),
         key_path: None,
         announce_addrs: Vec::new(),
         accepting: true,
@@ -26,8 +28,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         let value = |args: &mut std::vec::IntoIter<String>| next_value(&flag, args);
         match flag.as_str() {
             "--help" | "-h" => return Err(usage().into()),
-            "--quic" => options.quic_bind = value(&mut args)?,
-            "--tcp" => options.tcp_bind = value(&mut args)?,
+            "--quic" => options.quic_binds.push(value(&mut args)?),
+            "--tcp" => options.tcp_binds.push(value(&mut args)?),
             "--key" => options.key_path = Some(value(&mut args)?.into()),
             "--announce" => options.announce_addrs.push(
                 value(&mut args)?
@@ -77,6 +79,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
             _ => return Err(format!("unknown option {flag}\n\n{}", usage())),
         }
     }
+    if options.quic_binds.len() > 2 {
+        return Err("--quic accepts at most one IPv4 and one IPv6 address".into());
+    }
     options
         .config
         .validate()
@@ -109,7 +114,7 @@ fn rate(flag: &str, value: String) -> Result<Option<RateLimit>, String> {
 }
 
 pub fn usage() -> &'static str {
-    "usage: minip2p-relay-server [options]\n\nDefaults bind QUIC and TCP on 0.0.0.0:4001 using RelayServerConfig::default().\n\n--quic ADDR                    QUIC socket bind\n--tcp ADDR                     TCP socket bind\n--key PATH                     load/create persistent Ed25519 identity\n--announce MULTIADDR           explicit public address (repeatable)\n--paused                       start with new admissions paused\n--max-reservations N           reservation capacity\n--reservation-duration SECS    reservation lifetime\n--max-circuits N               circuit capacity\n--max-circuits-per-peer N      per-endpoint circuit capacity\n--max-circuit-duration SECS    circuit lifetime (0 = unlimited)\n--max-circuit-bytes BYTES      per-direction bytes (0 = unlimited)\n--max-pending-hop N            pending HOP controls per connection\n--max-pending-stop N           pending STOP controls per connection\n--control-timeout-ms MS        end-to-end control timeout\n--reservation-peer-rate R      CAPACITY/REFILL_MS or off\n--reservation-ip-rate R        CAPACITY/REFILL_MS or off\n--circuit-peer-rate R          CAPACITY/REFILL_MS or off\n--circuit-ip-rate R            CAPACITY/REFILL_MS or off\n-h, --help                     show this help"
+    "usage: minip2p-relay-server [options]\n\nDefaults try QUIC and TCP on IPv4 and IPv6 port 4001, falling back to the available family.\n\n--quic ADDR                    exact QUIC socket bind (repeatable; replaces automatic binds)\n--tcp ADDR                     exact TCP socket bind (repeatable; replaces automatic binds)\n--key PATH                     load/create persistent Ed25519 identity\n--announce MULTIADDR           explicit public address (repeatable)\n--paused                       start with new admissions paused\n--max-reservations N           reservation capacity\n--reservation-duration SECS    reservation lifetime\n--max-circuits N               circuit capacity\n--max-circuits-per-peer N      per-endpoint circuit capacity\n--max-circuit-duration SECS    circuit lifetime (0 = unlimited)\n--max-circuit-bytes BYTES      per-direction bytes (0 = unlimited)\n--max-pending-hop N            pending HOP controls per connection\n--max-pending-stop N           pending STOP controls per connection\n--control-timeout-ms MS        end-to-end control timeout\n--reservation-peer-rate R      CAPACITY/REFILL_MS or off\n--reservation-ip-rate R        CAPACITY/REFILL_MS or off\n--circuit-peer-rate R          CAPACITY/REFILL_MS or off\n--circuit-ip-rate R            CAPACITY/REFILL_MS or off\n-h, --help                     show this help"
 }
 
 #[cfg(test)]
@@ -119,12 +124,45 @@ mod tests {
     #[test]
     fn defaults_keep_the_three_line_hosting_path() {
         let options = parse(Vec::<String>::new()).unwrap();
-        assert_eq!(options.quic_bind, "0.0.0.0:4001");
-        assert_eq!(options.tcp_bind, "0.0.0.0:4001");
+        assert!(options.quic_binds.is_empty());
+        assert!(options.tcp_binds.is_empty());
         assert!(options.accepting);
         assert!(options.key_path.is_none());
         assert!(options.announce_addrs.is_empty());
         assert_eq!(options.config, RelayServerConfig::default());
+    }
+
+    #[test]
+    fn accepts_repeatable_custom_transport_binds() {
+        let options = parse([
+            "--quic".into(),
+            "127.0.0.1:4101".into(),
+            "--quic".into(),
+            "[::1]:4101".into(),
+            "--tcp".into(),
+            "127.0.0.1:4201".into(),
+            "--tcp".into(),
+            "[::1]:4201".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(options.quic_binds, ["127.0.0.1:4101", "[::1]:4101"]);
+        assert_eq!(options.tcp_binds, ["127.0.0.1:4201", "[::1]:4201"]);
+    }
+
+    #[test]
+    fn rejects_more_than_two_quic_binds() {
+        let error = parse([
+            "--quic".into(),
+            "127.0.0.1:4101".into(),
+            "--quic".into(),
+            "[::1]:4101".into(),
+            "--quic".into(),
+            "127.0.0.2:4101".into(),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("at most one IPv4 and one IPv6"), "{error}");
     }
 
     #[test]

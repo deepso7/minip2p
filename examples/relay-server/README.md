@@ -11,16 +11,30 @@ The application path represented by that default is deliberately small:
 ```rust
 let endpoint = Endpoint::builder()
     .relay_server()
-    .quic("0.0.0.0:4001")
+    .quic_dual_multiaddr(
+        &"/ip4/0.0.0.0/udp/4001/quic-v1".parse()?,
+        &"/ip6/::/udp/4001/quic-v1".parse()?,
+    )
     .tcp("0.0.0.0:4001")
+    .tcp("[::]:4001")
     .bind()?;
 ```
 
-The example binds both transports on `0.0.0.0:4001`, prints dialable addresses
-with its peer identity, and renders typed reservation/circuit lifecycle events,
+The executable tries both transports on IPv4 and IPv6 port `4001`, falling back
+to whichever address family is available. It prints dialable addresses with its
+peer identity and renders typed reservation/circuit lifecycle events,
 directional byte totals, denial statuses, close causes, and operational errors.
 Type `pause` or `resume` on stdin to change admission without removing HOP from
 Identify or terminating existing reservations and circuits.
+
+Use repeatable `--quic` and `--tcp` flags to replace automatic binds with exact
+addresses:
+
+```bash
+cargo run -p minip2p-relay-server-example -- \
+  --quic 192.0.2.10:4101 --quic '[2001:db8::10]:4101' \
+  --tcp 192.0.2.10:4201 --tcp '[2001:db8::10]:4201'
+```
 
 For a stable public identity and explicit advertised addresses:
 
