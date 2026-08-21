@@ -96,7 +96,8 @@ interop-relay-rust:
 
 docs:
     cargo doc --workspace --no-deps
-    cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp,relay-server --no-deps
+    RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-relay-server --no-deps
+    RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp,relay-server --no-deps
     cargo doc -p minip2p-tcp --features smoltcp --no-deps
     cargo doc -p minip2p-mdns --features smoltcp --no-deps
     cargo doc -p minip2p-rs --no-default-features --features smoltcp --no-deps
@@ -105,8 +106,9 @@ docs:
     cargo doc -p minip2p-rs --no-default-features --features portable-relay --no-deps
 
 package-check:
-    cargo package -p minip2p-relay-server --allow-dirty --list | rg '^README.md$'
-    cargo package -p minip2p-rs --allow-dirty --list | rg '^README.md$'
+    # Every published workspace package declares and actually ships its README.
+    cargo metadata --no-deps --format-version 1 | jq -e '[.packages[] | select(.publish != []) | .readme != null] | all'
+    cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name' | while read package; do cargo package -p "$package" --allow-dirty --list | rg -q '^README.md$' || exit 1; done
     cargo metadata --no-deps --format-version 1 | jq -e '.packages[] | select(.name == "minip2p-rs") | .features["relay-server"] == ["std", "dep:minip2p-relay-server"]'
 
 docs-site:

@@ -106,7 +106,8 @@ jobs:
       - run: cargo check --no-default-features --features portable-autonat --target thumbv7em-none-eabi -p minip2p-rs
       - run: cargo check --no-default-features --features portable-relay --target thumbv7em-none-eabi -p minip2p-rs
       - run: cargo doc --workspace --no-deps
-      - run: cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp,relay-server --no-deps
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-relay-server --no-deps
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp,relay-server --no-deps
       - run: cargo doc -p minip2p-tcp --features smoltcp --no-deps
       - run: cargo doc -p minip2p-mdns --features smoltcp --no-deps
       - run: cargo doc -p minip2p-rs --no-default-features --features smoltcp --no-deps
@@ -114,9 +115,7 @@ jobs:
       - run: cargo doc -p minip2p-rs --no-default-features --features portable-autonat --no-deps
       - run: cargo doc -p minip2p-rs --no-default-features --features portable-relay --no-deps
       - run: cargo bench -p minip2p-core --bench multiaddr --no-run
-      - run: cargo package -p minip2p-relay-server --list | grep -x README.md
-      - run: cargo package -p minip2p-rs --list | grep -x README.md
-      - run: cargo metadata --no-deps --format-version 1 | jq -e '.packages[] | select(.name == "minip2p-rs") | .features["relay-server"] == ["std", "dep:minip2p-relay-server"]'
+      - run: just package-check
 
   test:
     runs-on: ubuntu-latest

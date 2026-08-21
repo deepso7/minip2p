@@ -1,7 +1,7 @@
-//! Helpers shared by the example binaries (`minip2p-peer`,
-//! `minip2p-chat`): key persistence, NAT-event rendering, and address
-//! shaping. Living in one place keeps the demos' security behavior and
-//! CLI output from drifting apart.
+//! Helpers shared by the peer, chat, and relay-server example binaries: key
+//! persistence, child-process cleanup, NAT-event rendering, and address
+//! shaping. Living in one place keeps the demos' security behavior and CLI
+//! output from drifting apart.
 
 use std::error::Error;
 use std::fs;
@@ -135,28 +135,19 @@ fn read_secret(path: &FsPath) -> Result<String, Box<dyn Error>> {
         return Err(format!("refusing key file {}: mode must be 0600", path.display()).into());
     }
 
-    let mut bytes = Vec::with_capacity(SECRET_KEY_LENGTH * 2 + 2);
-    std::io::Read::by_ref(&mut file)
-        .take((SECRET_KEY_LENGTH * 2 + 2) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("failed to read key file {}: {e}", path.display()))?;
-    if bytes.len() > SECRET_KEY_LENGTH * 2 + 1 {
-        return Err(format!(
-            "invalid key file {}: too large (expected 64 hex chars and optional newline)",
-            path.display()
-        )
-        .into());
-    }
-    String::from_utf8(bytes).map_err(|e| format!("invalid key file {}: {e}", path.display()).into())
+    read_secret_contents(&mut file, path)
 }
 
 #[cfg(not(unix))]
 fn read_secret(path: &FsPath) -> Result<String, Box<dyn Error>> {
     let mut file = fs::File::open(path)
         .map_err(|e| format!("failed to open key file {}: {e}", path.display()))?;
+    read_secret_contents(&mut file, path)
+}
+
+fn read_secret_contents(file: &mut fs::File, path: &FsPath) -> Result<String, Box<dyn Error>> {
     let mut bytes = Vec::with_capacity(SECRET_KEY_LENGTH * 2 + 2);
-    std::io::Read::by_ref(&mut file)
-        .take((SECRET_KEY_LENGTH * 2 + 2) as u64)
+    file.take((SECRET_KEY_LENGTH * 2 + 2) as u64)
         .read_to_end(&mut bytes)
         .map_err(|e| format!("failed to read key file {}: {e}", path.display()))?;
     if bytes.len() > SECRET_KEY_LENGTH * 2 + 1 {

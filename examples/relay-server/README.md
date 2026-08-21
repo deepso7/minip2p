@@ -1,12 +1,21 @@
 # Relay-server host
 
-Run a Circuit Relay v2 server on QUIC and TCP with production defaults:
+The default application path is the same three calls as any other endpoint:
+
+```rust
+let endpoint = Endpoint::builder()
+    .relay_server()
+    .bind_quic("0.0.0.0:4001")?;
+```
+
+Run the included operational host to serve QUIC and TCP on both address
+families with production defaults:
 
 ```bash
 cargo run -p minip2p-relay-server-example
 ```
 
-The application path represented by that default is deliberately small:
+The executable expands the same builder when composing all four listeners:
 
 ```rust
 let endpoint = Endpoint::builder()
