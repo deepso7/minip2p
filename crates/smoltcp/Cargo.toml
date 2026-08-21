@@ -14,7 +14,7 @@ readme = "README.md"
 workspace = true
 
 [dependencies]
-smoltcp = { version = "0.13.1", default-features = false, features = [
+smoltcp = { version = "0.14.0", default-features = false, features = [
     "alloc",
     "medium-ip",
     "multicast",
