@@ -115,7 +115,9 @@ jobs:
       - run: cargo doc -p minip2p-rs --no-default-features --features portable-autonat --no-deps
       - run: cargo doc -p minip2p-rs --no-default-features --features portable-relay --no-deps
       - run: cargo bench -p minip2p-core --bench multiaddr --no-run
-      - run: just package-check
+      - run: cargo metadata --no-deps --format-version 1 | jq -e '[.packages[] | select(.publish != []) | .readme != null] | all'
+      - run: cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name' | while read package; do cargo package -p "$package" --list | grep -q '^README.md$' || exit 1; done
+      - run: cargo metadata --no-deps --format-version 1 | jq -e '.packages[] | select(.name == "minip2p-rs") | .features["relay-server"] == ["std", "dep:minip2p-relay-server"]'
 
   test:
     runs-on: ubuntu-latest
