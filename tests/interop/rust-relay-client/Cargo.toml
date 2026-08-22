@@ -1,0 +1,12 @@
+[package]
+name = "minip2p-rust-relay-interop"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+futures = "0.3"
+libp2p = { git = "https://github.com/libp2p/rust-libp2p", rev = "170c3c81ddd80e7c58b0500563e00a09139e8545", features = ["identify", "macros", "noise", "ping", "relay", "tcp", "tokio", "yamux"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

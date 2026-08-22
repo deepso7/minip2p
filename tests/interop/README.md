@@ -31,6 +31,26 @@ combinations as interoperability coverage.
 The test is ignored by ordinary `cargo test` because it requires Go and owns a
 separate Go module. Its dependencies are pinned in `go.mod` and `go.sum`.
 
+## Circuit Relay v2 against rust-libp2p
+
+Run `just interop-relay-rust` to start a minip2p TCP relay and two independent
+rust-libp2p clients. The foreign Cargo project is outside the workspace and pins
+`libp2p-relay` 0.22 at rust-libp2p commit
+`170c3c81ddd80e7c58b0500563e00a09139e8545`; the audited Circuit Relay v2
+specification commit is `6b6203ee6f62938ce67efdb33498173f475851c0`.
+
+The gate requires a reservation, the relay's Identify HOP advertisement, HOP
+CONNECT and STOP establishment, and successful ping traffic (bytes accepted in
+both directions). It configures non-default duration and byte limits and asserts
+that rust-libp2p decodes the exact values on RESERVE and both circuit legs.
+Successful reservation proves rust-libp2p accepts minip2p's `voucher: None`.
+The gate does not assert deliberate minip2p deviations as upstream parity. It
+is ignored in ordinary tests because it downloads/builds the pinned foreign
+implementation and owns loopback sockets.
+
+Recorded environment/result: macOS arm64, Rust stable 1.91-compatible toolchain,
+`just interop-relay-rust`: success (2026-08-20).
+
 ## Still separate
 
 QUIC interoperability needs its own live gate: the upstream interop package

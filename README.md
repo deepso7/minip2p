@@ -97,6 +97,7 @@ multistream-select, identify, ping, and any protocols registered with
 | Feature | Adds |
 | --- | --- |
 | `nat` | Circuit Relay v2, AutoNAT, and DCUtR traversal policy |
+| `relay-server` | std-only Circuit Relay v2 hosting, independent of `nat` |
 | `pubsub` | StrictSign gossipsub by default, with explicit floodsub selection |
 | `discovery` | Signed pubsub presence beacons and coordinated dialing; implies `nat` and `pubsub` |
 | `mdns` | Local-link discovery and coordinated direct dialing; implies `nat` |
@@ -104,6 +105,17 @@ multistream-select, identify, ping, and any protocols registered with
 Features layer onto the same API. Lower-level users can instead drive
 `SwarmCore` and individual protocol crates directly with explicit inputs,
 outputs, timestamps, and deadlines.
+
+Host a relay on QUIC and TCP with production defaults:
+
+```bash
+cargo run -p minip2p-relay-server-example
+```
+
+The [relay-server example](examples/relay-server/README.md) adds optional
+persistent identity, explicit public announce addresses, pause/resume controls,
+resource and rate limits, and readable typed lifecycle diagnostics while keeping
+the default builder path small.
 
 ## Architecture
 

@@ -1,0 +1,17 @@
+[package]
+name = "minip2p-relay-server-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "minip2p-relay-server"
+path = "src/main.rs"
+
+[dependencies]
+minip2p = { package = "minip2p-rs", path = "../../crates/minip2p", features = ["relay-server", "tcp"] }
+minip2p-example-common = { path = "../common" }

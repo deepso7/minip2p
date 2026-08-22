@@ -46,8 +46,8 @@ struct DeterministicRng {
 impl DeterministicRng {
     fn new(seed: [u8; 32]) -> Self {
         let mut state = [0; 4];
-        for (index, chunk) in seed.chunks_exact(8).enumerate() {
-            state[index] = u64::from_le_bytes(chunk.try_into().expect("eight-byte chunk"));
+        for (index, chunk) in seed.as_chunks::<8>().0.iter().enumerate() {
+            state[index] = u64::from_le_bytes(*chunk);
         }
         if state == [0; 4] {
             state = [

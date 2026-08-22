@@ -1101,6 +1101,7 @@ name = "minip2p-example-common"
 version = "0.4.1"
 dependencies = [
  "minip2p-rs",
+ "rustix",
 ]
 
 [[package]]
@@ -1262,6 +1263,14 @@ dependencies = [
  "minip2p-swarm",
  "minip2p-transport",
  "thiserror",
+]
+
+[[package]]
+name = "minip2p-relay-server-example"
+version = "0.4.1"
+dependencies = [
+ "minip2p-example-common",
+ "minip2p-rs",
 ]
 
 [[package]]

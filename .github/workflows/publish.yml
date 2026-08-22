@@ -395,6 +395,7 @@ jobs:
             minip2p-swarm
             minip2p-circuit
             minip2p-nat
+            minip2p-relay-server
             minip2p-pubsub
             minip2p-quic
             minip2p-tcp

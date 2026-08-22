@@ -76,12 +76,20 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all -- --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+      - run: cargo check -p minip2p-rs --features relay-server
+      - run: cargo check -p minip2p-rs --features nat,relay-server
+      - run: cargo check -p minip2p-rs --features nat,relay-server,tcp
+      - run: cargo check -p minip2p-rs --no-default-features --features std,tcp,relay-server
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p minip2p-rs --features nat --all-targets -- -D warnings
       - run: cargo clippy -p minip2p-rs --features nat,pubsub --all-targets -- -D warnings
       - run: cargo clippy -p minip2p-rs --features discovery --all-targets -- -D warnings
       - run: cargo clippy -p minip2p-rs --features mdns --all-targets -- -D warnings
       - run: cargo clippy -p minip2p-rs --features discovery,mdns --all-targets -- -D warnings
+      - run: cargo clippy -p minip2p-rs --features relay-server --all-targets -- -D warnings
+      - run: cargo clippy -p minip2p-rs --features nat,relay-server --all-targets -- -D warnings
+      - run: cargo clippy -p minip2p-rs --features nat,relay-server,tcp --all-targets -- -D warnings
+      - run: cargo clippy -p minip2p-rs --no-default-features --features std,tcp,relay-server --all-targets -- -D warnings
       - run: cargo clippy -p minip2p-rs --features tcp --all-targets -- -D warnings
       - run: cargo clippy -p minip2p-rs --no-default-features --features std,tcp --all-targets -- -D warnings
       - run: cargo clippy -p minip2p-rs --no-default-features --features smoltcp --all-targets -- -D warnings
@@ -98,6 +106,8 @@ jobs:
       - run: cargo check --no-default-features --features portable-autonat --target thumbv7em-none-eabi -p minip2p-rs
       - run: cargo check --no-default-features --features portable-relay --target thumbv7em-none-eabi -p minip2p-rs
       - run: cargo doc --workspace --no-deps
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-relay-server --no-deps
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp,relay-server --no-deps
       - run: cargo doc -p minip2p-tcp --features smoltcp --no-deps
       - run: cargo doc -p minip2p-mdns --features smoltcp --no-deps
       - run: cargo doc -p minip2p-rs --no-default-features --features smoltcp --no-deps
@@ -105,6 +115,9 @@ jobs:
       - run: cargo doc -p minip2p-rs --no-default-features --features portable-autonat --no-deps
       - run: cargo doc -p minip2p-rs --no-default-features --features portable-relay --no-deps
       - run: cargo bench -p minip2p-core --bench multiaddr --no-run
+      - run: cargo metadata --no-deps --format-version 1 | jq -e '[.packages[] | select(.publish != []) | .readme != null] | all'
+      - run: cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name' | while read package; do cargo package -p "$package" --list | grep -q '^README.md$' || exit 1; done
+      - run: cargo metadata --no-deps --format-version 1 | jq -e '.packages[] | select(.name == "minip2p-rs") | .features["relay-server"] == ["std", "dep:minip2p-relay-server"]'
 
   test:
     runs-on: ubuntu-latest
@@ -129,6 +142,10 @@ jobs:
       - run: cargo nextest run --profile variants -p minip2p-rs --features discovery
       - run: cargo nextest run --profile variants -p minip2p-rs --features mdns
       - run: cargo nextest run --profile variants -p minip2p-rs --features discovery,mdns
+      - run: cargo nextest run --profile variants -p minip2p-rs --features relay-server
+      - run: cargo nextest run --profile variants -p minip2p-rs --features nat,relay-server
+      - run: cargo nextest run --profile variants -p minip2p-rs --features nat,relay-server,tcp
+      - run: cargo nextest run --profile variants -p minip2p-rs --no-default-features --features std,tcp,relay-server
       - run: cargo nextest run --profile variants -p minip2p-rs --features tcp
       - run: cargo nextest run --profile variants -p minip2p-rs --no-default-features --features std,tcp
       - run: cargo nextest run --profile variants -p minip2p-rs --features discovery,mdns,tcp

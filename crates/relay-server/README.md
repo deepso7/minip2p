@@ -18,22 +18,31 @@ replacement state.
 
 ## Compatibility contract
 
-| Area | minip2p relay-server behavior |
-| --- | --- |
-| Reservation cardinality | One committed reservation per peer; an exact-connection request renews it. |
-| Reservation admission | Availability, peer rate, IP rate, then exact capacity. Renewals consume rate tokens while replacing their existing global slot. |
-| Circuit admission | Limits apply to both endpoints, counting a self-circuit once. |
-| Static HOP and pause | HOP remains advertised. Pause returns stable denial statuses, and HOP over a relayed connection returns `PERMISSION_DENIED`. |
-| Address trust and precedence | Explicit override, AutoNAT-confirmed direct addresses, then concrete listeners; the first non-empty source is normalized and first-wins deduplicated. |
-| Address framing | The longest stable source-order prefix fitting the 8 KiB frame is sent; `voucher` is always `None`. |
-| Identify updates | Address and protocol changes affect future Identify exchanges only. |
-| Malformed control input | The relay wire machines deterministically choose the specified status or reset boundary. The 8 KiB frame limit deliberately differs from rust-libp2p's 4 KiB limit. |
-| Byte accounting | Independent directional totals count transport-accepted payload, including pipelined bytes. Equality remains open; the first crossing chunk is delivered and counted in full. |
-| Duration and zero limits | Duration starts at committed HOP success. Zero duration and zero bytes are unlimited and advertised as zero. |
-| Lifecycles | Reservations and circuits commit only after transport acceptance and terminate exactly once with typed reasons and directional totals. |
-| Control caps and timing | HOP and STOP have separate post-negotiation caps and control deadlines. No Swarm-wide pre-negotiation cap is added. |
-| Forwarding and backpressure | Forwarding is tokenized and action-based; transport queues own payload backpressure. |
-| Wall time | Unix expiry is optional, saturating metadata. Monotonic time alone governs lifetime. |
+| Area | Behavior | Classification |
+| --- | --- | --- |
+| Reservation cardinality/renewal | One committed reservation per peer; only the exact stored connection renews it. This relies on Swarm's single-live-connection-per-peer invariant for exact STOP targeting. | Deliberate minip2p deviation from rust-libp2p's connection cardinality. |
+| Reservation admission | Availability, peer rate, IP rate, then exact capacity. Renewals consume rate tokens while replacing their slot, including at capacity. | Deliberate minip2p deviation: rate-first and corrected exact capacity. |
+| Circuit admission | Limits apply to both endpoints, counting a self-circuit once. | Deliberate minip2p deviation from rust-libp2p's source-only peer cap. |
+| Limiters | Four fixed optional full-starting token buckets, each configured as capacity plus one-token refill interval. | rust-libp2p parity in defaults/algorithm; fixed public shape is a minip2p extension. |
+| Static HOP, NAT, pause | Relay enablement advertises HOP statically; NAT is outbound-HOP-only. Pause denies new work but preserves HOP and existing lifecycles. Circuit HOP negotiates then returns `PERMISSION_DENIED`. | Deliberate minip2p deviations from dynamic upstream HOP plus a minip2p control extension. |
+| Address selection | Explicit trusted override, AutoNAT-confirmed direct addresses, then concrete listeners; first non-empty source, filtering, first-wins deduplication, deterministic truncation. | minip2p extension/deviation from rust-libp2p's confirmed-address source. |
+| Identify updates | Selection changes affect future Identify exchanges only; no Identify Push or forced re-identification. | Deliberate minip2p behavior. |
+| Frames and malformed input | 8 KiB control frames; deterministic specified status/reset handling. | minip2p extension; rust-libp2p uses 4 KiB and drops some malformed HOP input. |
+| Byte accounting | Per-direction transport-accepted totals include pipelined payload. Equality remains open; a crossing chunk is delivered and counted in full. | Circuit Relay v2 parity in directionality; minip2p extension versus rust-libp2p aggregate/excluded pipelining. |
+| Duration and zero limits | Duration starts at committed HOP success, including pipelined work. Zero duration/bytes are unlimited and advertised as zero. | Circuit Relay v2 parity; deliberate deviation from rust-libp2p's zero/immediate and later start. |
+| Lifecycles | Exactly-once typed reservation/circuit events, terminal reasons, and directional totals commit only after transport acceptance. Unix expiry is optional; monotonic time governs lifetime. | minip2p extension. |
+| Control caps and timing | Separate post-negotiation HOP/STOP caps and end-to-end deadlines; no Swarm-wide pre-negotiation cap. | rust-libp2p-shaped workers with deliberate end-to-end minip2p timing. |
+| Forwarding/backpressure | Tokenized actions account only accepted writes; transport queues own backpressure. | minip2p extension. |
+| Reservation voucher | `voucher: None`. | rust-libp2p parity, while deliberately omitting the protocol recommendation. |
 
 These choices deliberately correct or differ from rust-libp2p 0.22 where the
 canonical minip2p relay-server specification says so.
+
+## Explicit non-goals
+
+The service does not provide reservation vouchers, relay discovery/autorelay,
+ACLs, metrics, proxy-aware IP limiting, a portable/smoltcp Endpoint driver,
+Swarm-wide pre-negotiation stream caps, or replacement of existing test relay
+fixtures. These omissions are not claimed as Circuit Relay v2 or rust-libp2p
+parity. Low-level portable hosts may drive this crate directly; only the
+application-facing Endpoint adapter is std-only.

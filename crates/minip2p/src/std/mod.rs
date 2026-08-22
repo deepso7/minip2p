@@ -218,11 +218,12 @@ pub enum EndpointWake {
     Event(Event),
     /// At least one agent queue contains an event.
     ///
-    /// Drain the enabled queues with `Endpoint::take_nat_events`,
-    /// `Endpoint::take_pubsub_events`, or `Endpoint::take_discovery_events`,
-    /// as applicable. Before calling [`Endpoint::next_wake`] again, callers
-    /// must drain every non-empty agent queue counted by this notification;
-    /// otherwise the next call returns `DriverProgress` immediately again.
+    /// Drain the enabled queues with `Endpoint::take_relay_server_events`,
+    /// `Endpoint::take_nat_events`, `Endpoint::take_pubsub_events`, or
+    /// `Endpoint::take_discovery_events`, as applicable. Before calling
+    /// [`Endpoint::next_wake`] again, callers must drain every non-empty agent
+    /// queue counted by this notification; otherwise the next call returns
+    /// `DriverProgress` immediately again.
     DriverProgress,
     /// The transport wait was interrupted by an external wait handle.
     Interrupted,
@@ -548,9 +549,9 @@ impl Endpoint {
     /// Drives the endpoint until an application event, agent progress, or the
     /// caller's deadline.
     ///
-    /// Unlike [`Endpoint::next_event`], this returns as soon as an active NAT,
-    /// pubsub, or discovery agent has queued application-visible output. It
-    /// also reports already-queued agent output immediately. An
+    /// Unlike [`Endpoint::next_event`], this returns as soon as an active relay
+    /// server, NAT, pubsub, or discovery agent has queued application-visible
+    /// output. It also reports already-queued agent output immediately. An
     /// [`EndpointWake::Event`] has been removed from the endpoint; agent
     /// events remain in their focused queues for the corresponding `take_*`
     /// method.

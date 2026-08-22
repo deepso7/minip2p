@@ -90,15 +90,26 @@ peer-ping:
 interop-go:
     cargo test -p minip2p-ffi --test go_interop -- --ignored --nocapture
 
+# Pinned rust-libp2p relay client against the minip2p server (network/build opt-in).
+interop-relay-rust:
+    cargo test -p minip2p-rs --features relay-server,tcp --test relay_rust_interop -- --ignored --nocapture
+
 docs:
     cargo doc --workspace --no-deps
-    cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp,relay-server --no-deps
+    RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-relay-server --no-deps
+    RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp,relay-server --no-deps
     cargo doc -p minip2p-tcp --features smoltcp --no-deps
     cargo doc -p minip2p-mdns --features smoltcp --no-deps
     cargo doc -p minip2p-rs --no-default-features --features smoltcp --no-deps
     cargo doc -p minip2p-rs --no-default-features --features smoltcp,pubsub --no-deps
     cargo doc -p minip2p-rs --no-default-features --features portable-autonat --no-deps
     cargo doc -p minip2p-rs --no-default-features --features portable-relay --no-deps
+
+package-check:
+    # Every published workspace package declares and actually ships its README.
+    cargo metadata --no-deps --format-version 1 | jq -e '[.packages[] | select(.publish != []) | .readme != null] | all'
+    cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | .name' | while read package; do cargo package -p "$package" --allow-dirty --list | rg -q '^README.md$' || exit 1; done
+    cargo metadata --no-deps --format-version 1 | jq -e '.packages[] | select(.name == "minip2p-rs") | .features["relay-server"] == ["std", "dep:minip2p-relay-server"]'
 
 docs-site:
     cd docs && pnpm run check
