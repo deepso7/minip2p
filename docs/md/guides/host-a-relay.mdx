@@ -71,19 +71,19 @@ relay identity across container replacements:
 docker run -d \
   --name minip2p-relay \
   --restart unless-stopped \
-  -p 19876:19876/tcp \
-  -p 19876:19876/udp \
+  -p 19876:19876/tcp -p 19876:19876/udp \
   -v minip2p-relay-data:/data \
-  ghcr.io/deepso7/minip2p-relay:v0.4.3 \
-  --key /data/identity.key \
-  --announce /dns/relay.example.com/tcp/19876 \
-  --announce /dns/relay.example.com/udp/19876/quic-v1
+  ghcr.io/deepso7/minip2p-relay:latest
 ```
 
-Replace `relay.example.com` with your hostname. The image runs as UID and GID
-`10001`; make a bind-mounted data directory writable by that account. Publish
-both TCP and UDP ports because the relay serves TCP and QUIC on the same port.
-Host IPv6 publication follows the Docker daemon's IPv6 configuration.
+The image stores its identity in `/data/identity.key` by default. Use `v0.4.3`
+instead of `latest` to pin the release. Pass relay options such as `--announce`
+after the image name.
+
+The image runs as UID and GID `10001`; make a bind-mounted data directory
+writable by that account. Publish both TCP and UDP ports because the relay
+serves TCP and QUIC on the same port. Host IPv6 publication follows the Docker
+daemon's IPv6 configuration.
 
 ### Run it with systemd
 
