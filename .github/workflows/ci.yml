@@ -51,6 +51,7 @@ jobs:
         working-directory: docs
       - run: pnpm run check
         working-directory: docs
+      - run: scripts/test-relay-installer.sh
       - run: cargo check --manifest-path docs/snippets/quickstart/Cargo.toml
       - run: cargo check --manifest-path docs/snippets/custom-stream/Cargo.toml
 

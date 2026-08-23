@@ -10,6 +10,7 @@ export default defineMeta({
     "embedded-devices",
     "identity",
     "listen-and-dial",
+    "host-a-relay",
     "pubsub",
     "register-a-protocol",
     "traverse-nat",

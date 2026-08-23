@@ -1271,6 +1271,7 @@ version = "0.4.2"
 dependencies = [
  "minip2p-example-common",
  "minip2p-rs",
+ "tempfile",
 ]
 
 [[package]]

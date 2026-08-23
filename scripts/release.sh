@@ -306,6 +306,19 @@ done
 
 wait_for_run "$publish_run_id" "publish workflow"
 
+echo "release: verifying relay-server assets"
+release_assets="$(gh release view "$tag" --json assets)"
+expected_relay_assets=(
+  "minip2p-relay-server-v$version-x86_64-unknown-linux-gnu.tar.gz"
+  "minip2p-relay-server-v$version-aarch64-unknown-linux-gnu.tar.gz"
+  SHA256SUMS
+)
+for asset in "${expected_relay_assets[@]}"; do
+  jq -e --arg asset "$asset" \
+    'any(.assets[]; .name == $asset and .size > 0)' \
+    <<<"$release_assets" >/dev/null || die "missing or empty GitHub release asset: $asset"
+done
+
 verify_crate() {
   local crate="$1"
   local lower path attempt found
@@ -362,5 +375,6 @@ echo
 echo "release: $tag published and verified"
 echo "release: commit $head_sha"
 echo "release: GitHub $release_url"
+echo "release: relay server ${#expected_relay_assets[@]}/${#expected_relay_assets[@]} assets"
 echo "release: crates.io ${#publishable_crates[@]}/${#publishable_crates[@]} packages"
 echo "release: npm @minip2p/core@$version and @minip2p/react-native@$version"

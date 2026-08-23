@@ -9,10 +9,10 @@ use minip2p::{Ed25519Keypair, Endpoint, EndpointWake, Multiaddr, RelayServerEven
 use minip2p_example_common::load_keypair;
 
 const STDIN_COMMAND_CAPACITY: usize = 16;
-const DEFAULT_IPV4_BIND: &str = "0.0.0.0:4001";
-const DEFAULT_IPV6_BIND: &str = "[::]:4001";
-const DEFAULT_IPV4_QUIC: &str = "/ip4/0.0.0.0/udp/4001/quic-v1";
-const DEFAULT_IPV6_QUIC: &str = "/ip6/::/udp/4001/quic-v1";
+const DEFAULT_IPV4_BIND: &str = "0.0.0.0:19876";
+const DEFAULT_IPV6_BIND: &str = "[::]:19876";
+const DEFAULT_IPV4_QUIC: &str = "/ip4/0.0.0.0/udp/19876/quic-v1";
+const DEFAULT_IPV6_QUIC: &str = "/ip6/::/udp/19876/quic-v1";
 
 #[derive(Clone, Copy, Debug)]
 enum AutomaticBind {
@@ -25,6 +25,10 @@ fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("{}", cli::usage());
+        return;
+    }
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+        println!("minip2p-relay-server {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     if let Err(error) = run(args) {

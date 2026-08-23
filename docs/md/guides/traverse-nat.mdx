@@ -21,8 +21,8 @@ QUIC, TCP, or both. The bundled operator example uses both:
 ```bash
 cargo run -p minip2p-relay-server-example -- \
   --key var/relay.ed25519 \
-  --announce /dns4/relay.example.com/udp/4001/quic-v1 \
-  --announce /dns4/relay.example.com/tcp/4001
+  --announce /dns4/relay.example.com/udp/19876/quic-v1 \
+  --announce /dns4/relay.example.com/tcp/19876
 ```
 
 Its default is the small `.relay_server().bind_*()` application path. Optional
