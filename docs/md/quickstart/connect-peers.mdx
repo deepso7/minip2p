@@ -1,16 +1,13 @@
 ---
 title: Connect two peers
-description: In about 10 minutes, print a dialable PeerAddr and measure a libp2p Ping RTT between two local processes.
+description: Print a dialable PeerAddr and measure a libp2p Ping RTT between two local processes.
 ---
-
-In about 10 minutes you will print a dialable `PeerAddr` and a Ping RTT.
 
 This quickstart creates one small Cargo project with two binaries. The
 listener prints a paste-ready peer address; the dialer connects to it and
-measures a real Ping round trip.
+measures a Ping round trip.
 
-**Assumes:** [Install](/quickstart/install) is done (Rust 1.91+ and the
-`minip2p-rs` dependency).
+Before starting, [install minip2p](/quickstart/install) with Rust 1.91 or newer.
 
 ## Create the project
 

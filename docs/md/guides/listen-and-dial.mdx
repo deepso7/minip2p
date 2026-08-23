@@ -3,15 +3,10 @@ title: Listen and dial
 description: Bind QUIC, TCP, or both; publish dialable peer addresses; and wait for PeerReady.
 ---
 
-**Goal:** Bind, publish a dialable address, dial a known peer, and wait for
-`PeerReady`.
-
-**Assumes:** [Connect two peers](/quickstart/connect-peers) and
-[Concepts](/guides/concepts) (dial versus connect).
-
 This guide covers direct QUIC and TCP with the base Endpoint API. QUIC is on
 by default; TCP needs the `tcp` Cargo feature. For relay races and hole
-punching, use [Traverse NAT](/guides/traverse-nat).
+punching, use [Traverse NAT](/guides/traverse-nat). If you have not run a local
+connection yet, start with [Connect two peers](/quickstart/connect-peers).
 
 ## Bind an endpoint
 
@@ -96,9 +91,9 @@ when policy requires one family.
 
 A successful dial still has two useful milestones:
 
-1. `Event::ConnectionEstablished` — the transport is up and the peer identity
+1. `Event::ConnectionEstablished`: the transport is up and the peer identity
    is authenticated.
-2. `Event::PeerReady` — the first Identify exchange has completed, so the
+2. `Event::PeerReady`: the first Identify exchange has completed, so the
    endpoint knows which protocols the peer supports.
 
 ```rust
@@ -145,7 +140,7 @@ as `Event::ConnectionClosed`.
 
 `dial*` does not reserve on a relay, establish a circuit, or start DCUtR. When
 the application has enabled the `nat` feature and configured its NAT driver,
-use `connect*` plus `wait_path` instead — see
+use `connect*` plus `wait_path` instead. See
 [Traverse NAT](/guides/traverse-nat).
 
 Next: [Register a protocol](/guides/register-a-protocol) or

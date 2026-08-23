@@ -81,9 +81,9 @@ TCP. They do not reserve on a relay or perform DCUtR.
 With the `nat` feature and an activated NAT driver, `connect*` can race direct
 candidates against a relay leg. The first usable result is:
 
-- `Path::DirectDialed` — a supplied direct address connected;
-- `Path::DirectPunched` — DCUtR established a direct connection;
-- `Path::Relayed { relay }` — an end-to-end protected circuit is usable.
+- `Path::DirectDialed`: a supplied direct address connected;
+- `Path::DirectPunched`: DCUtR established a direct connection;
+- `Path::Relayed { relay }`: an end-to-end protected circuit is usable.
 
 A relayed path can later emit `NatEvent::PathUpgraded` when hole punching
 lands.

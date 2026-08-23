@@ -24,8 +24,8 @@ description: A minimal, caller-driven libp2p stack with QUIC, TCP, and no_std.
 
 minip2p opens authenticated QUIC and TCP connections from Rust and React
 Native. On `no_std + alloc`, TCP runs through a pluggable provider and
-`Endpoint::portable`. The Rust `Endpoint` is synchronous and caller-driven —
-no async runtime. The React Native SDK owns the native driver and presents
+`Endpoint::portable`. The Rust `Endpoint` is synchronous and caller-driven,
+with no async runtime. The React Native SDK owns the native driver and presents
 typed events, cancellable Promises, and `Stream` handles to JavaScript.
 
 <Tabs>
@@ -74,8 +74,6 @@ discovery, and local-link mDNS.
 
 ## Get started
 
-*learn by doing*
-
 <CardGroup cols={2}>
   <Card title="Install for Rust" href="/quickstart/install#rust" icon="package-plus">
     Add `minip2p-rs` and choose the network features your endpoint needs.
@@ -90,8 +88,6 @@ discovery, and local-link mDNS.
 
 ## Understand
 
-*understand this*
-
 <CardGroup cols={2}>
   <Card title="Concepts" href="/guides/concepts" icon="waypoints">
     Endpoint, PeerId, PeerAddr, PeerReady, and dial versus connect.
@@ -102,8 +98,6 @@ discovery, and local-link mDNS.
 </CardGroup>
 
 ## Do next
-
-*do this specific thing*
 
 <CardGroup cols={2}>
   <Card
@@ -123,13 +117,11 @@ discovery, and local-link mDNS.
     Signed presence beacons or zero-configuration local-link mDNS.
   </Card>
   <Card title="Embedded devices" href="/guides/embedded-devices" icon="cpu">
-    Portable TCP over smoltcp — you own I/O, time, and entropy.
+    Portable TCP over smoltcp, with caller-supplied I/O, time, and entropy.
   </Card>
 </CardGroup>
 
 ## Look up
-
-*look this up*
 
 <CardGroup cols={3}>
   <Card

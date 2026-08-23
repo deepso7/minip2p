@@ -3,14 +3,10 @@ title: Publish with pubsub
 description: Enable gossipsub, subscribe and publish signed messages, consume pubsub events, or select floodsub explicitly.
 ---
 
-**Goal:** Activate gossipsub (or floodsub), subscribe to a topic, publish
-signed messages, and consume pubsub events.
-
-**Assumes:** [Drive events](/guides/drive-events). A second peer on the same
-topic is required to observe delivery.
-
 The `pubsub` feature exposes one API for gossipsub and floodsub.
-`EndpointBuilder::pubsub()` selects gossipsub by default.
+`EndpointBuilder::pubsub()` selects gossipsub by default. You need a second
+peer on the same topic to observe delivery. See [Drive events](/guides/drive-events)
+for the caller-driven event model.
 
 ## Enable gossipsub
 
@@ -96,7 +92,7 @@ return `false` when the requested state already held.
 ## Signing and unsigned compatibility
 
 Published messages are signed with the endpoint identity. By default,
-gossipsub also rejects unsigned inbound messages—StrictSign-style behavior,
+gossipsub also rejects unsigned inbound messages. This matches StrictSign behavior
 without a separate public `StrictSign` type.
 
 Only relax inbound acceptance when interoperating with a peer that
