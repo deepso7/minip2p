@@ -3,16 +3,15 @@ title: Embedded devices
 description: Run a no_std endpoint on your board's smoltcp stack.
 ---
 
-**Goal:** Run authenticated libp2p TCP on a `no_std + alloc` target, using the
-board's network device, monotonic timer, and hardware entropy.
-
-**Assumes:** Your board already has a working
+This guide assumes your board already has a working
 [smoltcp](https://docs.rs/smoltcp) `Device` and configured `Interface` with an
 IP address and route. minip2p does not set up the MAC, PHY, DHCP, SLAAC, or
-interrupt controller.
+interrupt controller. You supply the network device, monotonic timer, and
+hardware entropy.
 
-Same TCP, Noise XX, Yamux, Identify, Ping, and application protocols as a
-hosted TCP endpoint. Only the I/O provider and driving loop change.
+An embedded endpoint runs the same TCP, Noise XX, Yamux, Identify, Ping, and
+application protocols as a hosted TCP endpoint. Only the I/O provider and
+driving loop change.
 
 ## Add the dependency
 
@@ -37,8 +36,8 @@ Add only what you need:
 | `portable-autonat` | AutoNAT probing over the portable endpoint |
 | `portable-relay` | Relay-only circuit connections; includes portable AutoNAT |
 
-No QUIC here — the quiche adapter needs `std`. Portable relay is therefore
-relay-only; DCUtR still needs QUIC.
+The quiche adapter needs `std`, so embedded endpoints cannot use QUIC or DCUtR.
+They can still use relay circuits.
 
 ## What you supply
 

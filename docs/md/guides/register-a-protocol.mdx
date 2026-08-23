@@ -3,15 +3,10 @@ title: Register a protocol
 description: Register an application protocol, negotiate streams, exchange bytes, and close or abandon stream state on purpose.
 ---
 
-**Goal:** Register a versioned protocol ID, open or accept streams, exchange
-bytes, and shut streams down cleanly.
-
-**Assumes:** [Connect two peers](/quickstart/connect-peers) and
-[PeerReady](/guides/concepts#connection-readiness).
-
 Application protocols use libp2p multistream-select negotiation over an
 authenticated connection. Both peers must register the same versioned
-protocol ID.
+protocol ID. Before opening a stream, connect the peers and wait for
+[`PeerReady`](/guides/concepts#connection-readiness).
 
 ```rust
 const ECHO_PROTOCOL: &str = "/my-app/echo/1.0.0";

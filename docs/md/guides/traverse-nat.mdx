@@ -3,12 +3,10 @@ title: Traverse NAT
 description: Configure relay and AutoNAT, establish the first usable path, and observe direct upgrades or relay fallback.
 ---
 
-**Goal:** Activate the NAT driver, connect through a relay race, and observe
-path establish / upgrade / fallback events.
-
-**Assumes:** [Listen and dial](/guides/listen-and-dial) and
-[Concepts](/guides/concepts#dial-versus-connect). You need a reachable Circuit
-Relay v2 server for relayed paths; minip2p can host it.
+This guide starts where direct [listen and dial](/guides/listen-and-dial) leaves
+off. It configures the NAT driver, races direct and relayed paths, and tracks
+later upgrades or fallback. Relayed paths require a reachable Circuit Relay v2
+server, which minip2p can host.
 
 <Badge>pre-1.0</Badge>
 
@@ -105,9 +103,9 @@ match node.wait_path(connect_id, Duration::from_secs(60))? {
 `wait_path` returns `Ok(Some(path))` when it consumes the matching
 `NatEvent::PathEstablished`. It returns `Ok(None)` in two cases:
 
-- the attempt failed — `NatEvent::ConnectFailed` stays queued for
+- the attempt failed; `NatEvent::ConnectFailed` stays queued for
   `take_nat_events`;
-- the deadline expired before either outcome — no `ConnectFailed` is
+- the deadline expired before either outcome; no `ConnectFailed` is
   synthesized.
 
 ## Path selection and upgrade
@@ -125,9 +123,9 @@ flowchart TB
 
 The first usable path is explicit:
 
-- `Path::DirectDialed` — a direct candidate connected;
-- `Path::DirectPunched` — a DCUtR hole punch connected;
-- `Path::Relayed { relay }` — the protected relay circuit is usable.
+- `Path::DirectDialed`: a direct candidate connected;
+- `Path::DirectPunched`: a DCUtR hole punch connected;
+- `Path::Relayed { relay }`: the protected relay circuit is usable.
 
 When a relayed path upgrades later, the application receives
 `NatEvent::PathUpgraded`. If punch windows fail, it receives
@@ -169,7 +167,7 @@ connection events continue to progress.
 Most applications do not configure circuit entropy: `Endpoint` uses the
 operating system's random source by default. When
 embedding `minip2p-circuit` with default features disabled, provide an
-`EntropySource` that never substitutes predictable bytes on failure — see the
+`EntropySource` that never substitutes predictable bytes on failure. See the
 [`minip2p-circuit` README](https://github.com/deepso7/minip2p/blob/main/crates/circuit/README.md)
 for the trait contract and a custom-source example.
 
