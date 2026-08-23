@@ -216,6 +216,16 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --clobber
 
+  publish-relay-container:
+    name: Publish relay container
+    needs: [verify-release, publish-relay-server-binaries]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/relay-container.yml
+    with:
+      version: ${{ needs.verify-release.outputs.version }}
+
   android-native:
     name: Build Android release artifacts
     needs: verify-release

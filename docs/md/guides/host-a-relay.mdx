@@ -62,6 +62,29 @@ The key file fixes the peer ID across restarts. The relay creates it with mode
 `0600` on Unix and refuses files owned by another user or files with broader
 permissions.
 
+### Run it with Docker
+
+The container image supports Linux x86-64 and ARM64. A named volume keeps the
+relay identity across container replacements:
+
+```bash
+docker run -d \
+  --name minip2p-relay \
+  --restart unless-stopped \
+  -p 19876:19876/tcp -p 19876:19876/udp \
+  -v minip2p-relay-data:/data \
+  ghcr.io/deepso7/minip2p-relay:latest
+```
+
+The image stores its identity in `/data/identity.key` by default. Use `v0.4.3`
+instead of `latest` to pin the release. Pass relay options such as `--announce`
+after the image name.
+
+The image runs as UID and GID `10001`; make a bind-mounted data directory
+writable by that account. Publish both TCP and UDP ports because the relay
+serves TCP and QUIC on the same port. Host IPv6 publication follows the Docker
+daemon's IPv6 configuration.
+
 ### Run it with systemd
 
 Create a dedicated user and state directory:
