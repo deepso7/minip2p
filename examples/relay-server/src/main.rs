@@ -27,6 +27,10 @@ fn main() {
         println!("{}", cli::usage());
         return;
     }
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+        println!("minip2p-relay-server {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if let Err(error) = run(args) {
         eprintln!("relay-server: {error}");
         std::process::exit(2);

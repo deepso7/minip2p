@@ -15,6 +15,22 @@ families with production defaults:
 cargo run -p minip2p-relay-server-example
 ```
 
+Linux release archives are also available for x86-64 and ARM64 from the
+[GitHub Releases page](https://github.com/deepso7/minip2p/releases). Download
+the archive for your machine together with `SHA256SUMS`, verify it, and install
+the executable:
+
+```bash
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf minip2p-relay-server-v*-x86_64-unknown-linux-gnu.tar.gz
+sudo install -m 0755 minip2p-relay-server-v*-x86_64-unknown-linux-gnu/minip2p-relay-server /usr/local/bin/
+minip2p-relay-server --version
+```
+
+Use `aarch64-unknown-linux-gnu` instead on an ARM64 host. Running
+`minip2p-relay-server` with no options starts the same dual-stack listener as
+the Cargo command above.
+
 The executable expands the same builder when composing all four listeners:
 
 ```rust
