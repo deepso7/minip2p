@@ -1,0 +1,125 @@
+---
+title: Host a relay server
+description: Install and run the minip2p circuit relay on a Linux server.
+---
+
+The relay server runs as one process and listens on TCP and QUIC over IPv4 and
+IPv6. By default it uses port `4001` and falls back to whichever address family
+the host supports.
+
+You need a Linux x86-64 or ARM64 server with a public IP address. Allow inbound
+TCP and UDP traffic on port `4001`. TCP carries the TCP transport; UDP carries
+QUIC.
+
+:::note
+Prebuilt relay archives start with v0.4.3. The installer cannot install v0.4.2
+because that release predates the binary workflow.
+:::
+
+### Install the relay
+
+The installer selects the archive for the host architecture, verifies it with
+the release's `SHA256SUMS`, and installs the executable in `/usr/local/bin`:
+
+```bash
+curl -fsSL https://minip2p.com/install/relay.sh | sh
+```
+
+To inspect the script before running it:
+
+```bash
+curl -fsSLO https://minip2p.com/install/relay.sh
+less relay.sh
+sh relay.sh
+```
+
+Set `MINIP2P_INSTALL_DIR` to install without root, or `MINIP2P_VERSION` to
+select a release:
+
+```bash
+MINIP2P_INSTALL_DIR="$HOME/.local/bin" MINIP2P_VERSION="0.4.3" sh relay.sh
+```
+
+### Run it
+
+Create a private state directory and start the relay with a persistent
+identity:
+
+```bash
+mkdir -m 0700 -p "$HOME/.local/share/minip2p-relay"
+minip2p-relay-server \
+  --key "$HOME/.local/share/minip2p-relay/identity.key" \
+  --announce /dns/relay.example.com/tcp/4001 \
+  --announce /dns/relay.example.com/udp/4001/quic-v1
+```
+
+Replace `relay.example.com` with your hostname. Give it `A` and `AAAA` records
+when the server has both address families. If you manage DNS through
+Cloudflare, keep these records in DNS-only mode. Cloudflare Tunnel and the
+standard Cloudflare proxy do not forward arbitrary libp2p TCP and QUIC traffic.
+
+The process prints its peer ID and concrete listener addresses at startup. A
+client dials the announced address with the peer ID appended:
+
+```text
+/dns/relay.example.com/tcp/4001/p2p/12D3KooW...
+/dns/relay.example.com/udp/4001/quic-v1/p2p/12D3KooW...
+```
+
+The key file fixes the peer ID across restarts. The relay creates it with mode
+`0600` on Unix and refuses files owned by another user or files with broader
+permissions.
+
+### Run it with systemd
+
+Create a dedicated user and state directory:
+
+```bash
+sudo useradd --system --home /var/lib/minip2p-relay --shell /usr/sbin/nologin minip2p-relay
+sudo install -d -m 0700 -o minip2p-relay -g minip2p-relay /var/lib/minip2p-relay
+```
+
+Save this as `/etc/systemd/system/minip2p-relay.service`, replacing the
+hostname in both announced addresses:
+
+```ini
+[Unit]
+Description=minip2p circuit relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=minip2p-relay
+Group=minip2p-relay
+ExecStart=/usr/local/bin/minip2p-relay-server --key /var/lib/minip2p-relay/identity.key --announce /dns/relay.example.com/tcp/4001 --announce /dns/relay.example.com/udp/4001/quic-v1
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Start the service and follow its logs:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now minip2p-relay
+sudo journalctl -u minip2p-relay -f
+```
+
+### Use custom listener addresses
+
+Repeat `--tcp` or `--quic` to replace the automatic listeners. This example
+uses separate ports and explicit IPv4 and IPv6 addresses:
+
+```bash
+minip2p-relay-server \
+  --key /var/lib/minip2p-relay/identity.key \
+  --tcp 192.0.2.10:4101 \
+  --tcp '[2001:db8::10]:4101' \
+  --quic 192.0.2.10:4201 \
+  --quic '[2001:db8::10]:4201'
+```
+
+Run `minip2p-relay-server --help` for reservation, circuit, timeout, byte, and
+rate-limit options.
