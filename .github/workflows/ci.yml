@@ -55,6 +55,12 @@ jobs:
       - run: cargo check --manifest-path docs/snippets/quickstart/Cargo.toml
       - run: cargo check --manifest-path docs/snippets/custom-stream/Cargo.toml
 
+  relay-container:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: scripts/test-relay-container.sh
+
   # Split from `test` so the two run on parallel runners. The feature matrix
   # grows with every portable backend, and a single serial job grew ~4x in a
   # month; keeping lint and test apart keeps that growth off the critical path.

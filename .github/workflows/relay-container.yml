@@ -1,0 +1,104 @@
+name: Publish relay container
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Release version without the v prefix
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing release version without the v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: relay-container
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish relay container
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Verify release assets and select tags
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          case "$RELEASE_VERSION" in
+            ""|*[!0-9A-Za-z.+-]*)
+              echo "::error::Invalid release version: $RELEASE_VERSION"
+              exit 1
+              ;;
+          esac
+
+          assets="$(gh release view "v$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --json assets)"
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            asset="minip2p-relay-server-v$RELEASE_VERSION-$target.tar.gz"
+            jq -e --arg asset "$asset" \
+              'any(.assets[]; .name == $asset and .size > 0)' \
+              <<<"$assets" >/dev/null
+          done
+          jq -e 'any(.assets[]; .name == "SHA256SUMS" and .size > 0)' \
+            <<<"$assets" >/dev/null
+
+          latest_tag="$(gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --exclude-drafts \
+            --exclude-pre-releases \
+            --limit 1 \
+            --json tagName \
+            --jq '.[0].tagName')"
+          {
+            echo 'tags<<EOF'
+            echo "ghcr.io/deepso7/minip2p-relay:v$RELEASE_VERSION"
+            if [[ "$latest_tag" == "v$RELEASE_VERSION" ]]; then
+              echo "ghcr.io/deepso7/minip2p-relay:latest"
+            fi
+            echo EOF
+          } >>"$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and publish image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: MINIP2P_VERSION=${{ inputs.version }}
+          tags: ${{ steps.release.outputs.tags }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=relay-container
+          cache-to: type=gha,mode=max,scope=relay-container
+
+      - name: Verify anonymous access
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          docker logout ghcr.io
+          if ! docker buildx imagetools inspect \
+            "ghcr.io/deepso7/minip2p-relay:v$RELEASE_VERSION"; then
+            echo "::error::The relay package is not public. Set its GHCR visibility to Public, then rerun this workflow."
+            exit 1
+          fi
