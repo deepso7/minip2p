@@ -13,6 +13,7 @@ use minip2p_core::{Multiaddr, Protocol};
 use minip2p_platform::Now;
 use minip2p_transport::{WaitHandle, WaitOutcome};
 use mio::{Events, Interest, Poll, Token, Waker};
+use socket2::{Domain, Protocol as SocketProtocol, Socket as Socket2, Type};
 
 use crate::blocking::BlockingTcpProvider;
 use crate::provider::{SocketHandle, TcpError, TcpEvent, TcpProvider, host_and_port};
@@ -67,6 +68,30 @@ fn listen_addr(addr: &Multiaddr) -> Result<SocketAddr, TcpError> {
             reason: "listen needs an /ip4 or /ip6 host; names are dial-only".to_string(),
         }),
     }
+}
+
+fn bind_listener(requested: SocketAddr) -> std::io::Result<mio::net::TcpListener> {
+    let socket = Socket2::new(
+        Domain::for_address(requested),
+        Type::STREAM,
+        Some(SocketProtocol::TCP),
+    )?;
+    if requested.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&requested.into())?;
+    let backlog = if cfg!(target_os = "horizon") {
+        20
+    } else if cfg!(target_os = "haiku") {
+        32
+    } else {
+        128
+    };
+    socket.listen(backlog)?;
+    Ok(mio::net::TcpListener::from_std(socket.into()))
 }
 
 /// Resolves a dial address, performing a blocking name lookup for `/dns*`.
@@ -170,12 +195,12 @@ struct Socket {
 /// `/dns`, `/dns4`, and `/dns6` dial addresses are resolved here, with a
 /// blocking lookup. Listening requires a concrete `/ip4` or `/ip6` host.
 ///
-/// A wildcard listen host binds what the operating system takes it to mean --
-/// every interface, including ones that appear later -- and is reported back
-/// as the wildcard rather than expanded, because which of a machine's
-/// addresses are worth handing to a peer is the host's decision, not a
-/// socket's. mDNS makes that substitution from its own interface list, and
-/// address selection drops what is left.
+/// A wildcard listen host binds every interface, including ones that appear
+/// later. IPv6 listeners are IPv6-only, so explicit IPv4 and IPv6 wildcards can
+/// share a port. The bound address is reported as the wildcard rather than
+/// expanded, because which of a machine's addresses are worth handing to a
+/// peer is the host's decision, not a socket's. mDNS makes that substitution
+/// from its own interface list, and address selection drops what is left.
 pub struct StdTcpProvider {
     poll: Poll,
     events: Events,
@@ -556,8 +581,8 @@ fn event_socket(event: &TcpEvent) -> SocketHandle {
 impl TcpProvider for StdTcpProvider {
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TcpError> {
         let requested = listen_addr(addr)?;
-        let mut listener = mio::net::TcpListener::bind(requested)
-            .map_err(|error| io_error("binding a listener", &error))?;
+        let mut listener =
+            bind_listener(requested).map_err(|error| io_error("binding a listener", &error))?;
         let bound = listener
             .local_addr()
             .map_err(|error| io_error("reading the bound address", &error))?;

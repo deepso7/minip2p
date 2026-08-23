@@ -17,6 +17,7 @@ workspace = true
 default = ["std"]
 std = [
     "dep:mio",
+    "dep:socket2",
     "minip2p-core/std",
     "minip2p-identity/std",
     "minip2p-platform/std",
@@ -35,6 +36,7 @@ minip2p-platform = { path = "../../crates/platform", version = "0.4.3", default-
 minip2p-secure-mux = { path = "../../crates/secure-mux", version = "0.4.3", default-features = false }
 minip2p-transport = { path = "../../crates/transport", version = "0.4.3", default-features = false }
 mio = { version = "1.0", features = ["net", "os-poll"], optional = true }
+socket2 = { version = "0.6.5", optional = true }
 minip2p-smoltcp = { path = "../../crates/smoltcp", version = "0.4.3", optional = true }
 thiserror = { version = "2.0.18", default-features = false }
 
