@@ -12,7 +12,7 @@ binary="$3"
 output_dir="$4"
 
 [[ -x "$binary" ]] || {
-  echo "relay-server binary is not executable: $binary" >&2
+  echo "relay binary is not executable: $binary" >&2
   exit 2
 }
 [[ -n "$version" && "$version" != *[!0-9A-Za-z.+-]* ]] || {
@@ -31,7 +31,7 @@ staging="$(mktemp -d "${TMPDIR:-/tmp}/minip2p-relay-server.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
 
 mkdir "$staging/$archive_name"
-install -m 0755 "$binary" "$staging/$archive_name/minip2p-relay-server"
+install -m 0755 "$binary" "$staging/$archive_name/minip2p-relay"
 install -m 0644 "$repository/examples/relay-server/README.md" "$staging/$archive_name/README.md"
 install -m 0644 "$repository/LICENSE" "$staging/$archive_name/LICENSE"
 

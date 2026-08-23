@@ -3,6 +3,7 @@
 FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS download
 
 ARG MINIP2P_VERSION
+ARG MINIP2P_RELEASE_BASE_URL
 ARG TARGETARCH
 
 RUN set -eux; \
@@ -15,7 +16,7 @@ RUN set -eux; \
       *) echo "unsupported container architecture: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
     archive="minip2p-relay-server-v${MINIP2P_VERSION}-${target}"; \
-    release="https://github.com/deepso7/minip2p/releases/download/v${MINIP2P_VERSION}"; \
+    release="${MINIP2P_RELEASE_BASE_URL:-https://github.com/deepso7/minip2p/releases/download/v${MINIP2P_VERSION}}"; \
     mkdir /release /out; \
     curl -fsSL -o "/release/$archive.tar.gz" "$release/$archive.tar.gz"; \
     curl -fsSL -o /release/SHA256SUMS "$release/SHA256SUMS"; \
@@ -23,9 +24,9 @@ RUN set -eux; \
     cd /release; \
     sha256sum --check CHECKSUM; \
     tar -xzf "$archive.tar.gz"; \
-    install -m 0755 "$archive/minip2p-relay-server" /out/minip2p-relay-server
+    install -m 0755 "$archive/minip2p-relay" /out/minip2p-relay
 
-FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS runtime
 
 ARG MINIP2P_VERSION
 
@@ -35,8 +36,6 @@ LABEL org.opencontainers.image.title="minip2p relay server" \
       org.opencontainers.image.version="$MINIP2P_VERSION" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
-COPY --from=download --chown=10001:10001 /out/minip2p-relay-server /usr/local/bin/minip2p-relay-server
-
 RUN mkdir /data && chown 10001:10001 /data
 
 USER 10001:10001
@@ -45,5 +44,8 @@ VOLUME ["/data"]
 EXPOSE 19876/tcp 19876/udp
 STOPSIGNAL SIGTERM
 
-ENTRYPOINT ["/usr/local/bin/minip2p-relay-server"]
+ENTRYPOINT ["/usr/local/bin/minip2p-relay"]
 CMD ["--key", "/data/identity.key"]
+
+FROM runtime AS release-image
+COPY --from=download --chown=10001:10001 /out/minip2p-relay /usr/local/bin/minip2p-relay
