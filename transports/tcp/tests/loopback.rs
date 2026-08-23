@@ -11,10 +11,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use minip2p_core::{Multiaddr, PeerAddr};
+use minip2p_core::{Multiaddr, PeerAddr, Protocol};
 use minip2p_identity::{Ed25519Keypair, PeerId};
 use minip2p_platform::{Now, StdEntropy};
-use minip2p_tcp::{StdTcpProvider, TcpTransport};
+use minip2p_tcp::{StdTcpProvider, TcpProvider, TcpTransport};
 use minip2p_transport::{
     BlockingTransport, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
     WaitOutcome,
@@ -346,6 +346,26 @@ fn a_refused_connect_is_reported_and_closed() {
 
 fn is_connected_event(event: &TransportEvent) -> bool {
     matches!(event, TransportEvent::Connected { .. })
+}
+
+#[test]
+fn ipv4_and_ipv6_wildcard_listeners_can_share_a_port() {
+    let mut provider = StdTcpProvider::new().expect("a readiness registry");
+    let ipv4 = provider
+        .listen(&"/ip4/0.0.0.0/tcp/0".parse().expect("IPv4 wildcard"))
+        .expect("the IPv4 wildcard binds");
+    let port = match ipv4.protocols().get(1) {
+        Some(Protocol::Tcp(port)) => *port,
+        protocols => panic!("bound address has no TCP port: {protocols:?}"),
+    };
+    let ipv6 = format!("/ip6/::/tcp/{port}")
+        .parse()
+        .expect("IPv6 wildcard");
+
+    provider
+        .listen(&ipv6)
+        .expect("separate IPv4 and IPv6 wildcard listeners share a port");
+    assert_eq!(provider.local_addresses(), vec![ipv4, ipv6]);
 }
 
 #[test]

@@ -1346,6 +1346,7 @@ dependencies = [
  "minip2p-smoltcp",
  "minip2p-transport",
  "mio",
+ "socket2",
  "thiserror",
 ]
 
