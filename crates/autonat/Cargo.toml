@@ -18,5 +18,5 @@ default = ["std"]
 std = ["minip2p-core/std", "thiserror/std"]
 
 [dependencies]
-minip2p-core = { path = "../core", version = "0.4.2", default-features = false }
+minip2p-core = { path = "../core", version = "0.4.3", default-features = false }
 thiserror = { version = "2.0.18", default-features = false }
