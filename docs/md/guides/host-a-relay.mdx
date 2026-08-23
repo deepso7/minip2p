@@ -4,11 +4,11 @@ description: Install and run the minip2p circuit relay on a Linux server.
 ---
 
 The relay server runs as one process and listens on TCP and QUIC over IPv4 and
-IPv6. By default it uses port `4001` and falls back to whichever address family
+IPv6. By default it uses port `19876` and falls back to whichever address family
 the host supports.
 
 You need a Linux x86-64 or ARM64 server with a public IP address. Allow inbound
-TCP and UDP traffic on port `4001`. TCP carries the TCP transport; UDP carries
+TCP and UDP traffic on port `19876`. TCP carries the TCP transport; UDP carries
 QUIC.
 
 :::note
@@ -49,8 +49,8 @@ identity:
 mkdir -m 0700 -p "$HOME/.local/share/minip2p-relay"
 minip2p-relay-server \
   --key "$HOME/.local/share/minip2p-relay/identity.key" \
-  --announce /dns/relay.example.com/tcp/4001 \
-  --announce /dns/relay.example.com/udp/4001/quic-v1
+  --announce /dns/relay.example.com/tcp/19876 \
+  --announce /dns/relay.example.com/udp/19876/quic-v1
 ```
 
 Replace `relay.example.com` with your hostname. Give it `A` and `AAAA` records
@@ -62,8 +62,8 @@ The process prints its peer ID and concrete listener addresses at startup. A
 client dials the announced address with the peer ID appended:
 
 ```text
-/dns/relay.example.com/tcp/4001/p2p/12D3KooW...
-/dns/relay.example.com/udp/4001/quic-v1/p2p/12D3KooW...
+/dns/relay.example.com/tcp/19876/p2p/12D3KooW...
+/dns/relay.example.com/udp/19876/quic-v1/p2p/12D3KooW...
 ```
 
 The key file fixes the peer ID across restarts. The relay creates it with mode
@@ -91,7 +91,7 @@ Wants=network-online.target
 [Service]
 User=minip2p-relay
 Group=minip2p-relay
-ExecStart=/usr/local/bin/minip2p-relay-server --key /var/lib/minip2p-relay/identity.key --announce /dns/relay.example.com/tcp/4001 --announce /dns/relay.example.com/udp/4001/quic-v1
+ExecStart=/usr/local/bin/minip2p-relay-server --key /var/lib/minip2p-relay/identity.key --announce /dns/relay.example.com/tcp/19876 --announce /dns/relay.example.com/udp/19876/quic-v1
 Restart=on-failure
 RestartSec=5
 
