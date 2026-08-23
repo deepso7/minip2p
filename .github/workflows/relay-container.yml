@@ -28,10 +28,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Verify release assets and select tags
-        id: release
+      - name: Select container source
+        id: source
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ inputs.version }}
@@ -44,6 +42,30 @@ jobs:
               ;;
           esac
 
+          release_ref="v$RELEASE_VERSION"
+          if gh api \
+            "repos/$GITHUB_REPOSITORY/contents/Dockerfile?ref=$release_ref" \
+            >/dev/null 2>&1; then
+            echo "ref=$release_ref" >>"$GITHUB_OUTPUT"
+          elif [[ "$RELEASE_VERSION" == "0.4.3" ]]; then
+            # v0.4.3 supplied the first relay binaries but predates the image.
+            echo "ref=$GITHUB_SHA" >>"$GITHUB_OUTPUT"
+          else
+            echo "::error::Release $release_ref has no container definition"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ steps.source.outputs.ref }}
+
+      - name: Verify release assets and select tags
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
           assets="$(gh release view "v$RELEASE_VERSION" --repo "$GITHUB_REPOSITORY" --json assets)"
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
             asset="minip2p-relay-server-v$RELEASE_VERSION-$target.tar.gz"

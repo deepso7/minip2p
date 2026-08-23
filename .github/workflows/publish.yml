@@ -225,7 +225,6 @@ jobs:
     uses: ./.github/workflows/relay-container.yml
     with:
       version: ${{ needs.verify-release.outputs.version }}
-    secrets: inherit
 
   android-native:
     name: Build Android release artifacts
