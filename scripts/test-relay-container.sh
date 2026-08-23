@@ -21,9 +21,10 @@ docker build \
   "$repository"
 
 test "$(docker image inspect --format '{{.Config.User}}' "$image")" = "10001:10001"
-test "$(docker image inspect --format '{{index .Config.ExposedPorts "19876/tcp"}}' "$image")" = "{}"
-test "$(docker image inspect --format '{{index .Config.ExposedPorts "19876/udp"}}' "$image")" = "{}"
-test "$(docker image inspect --format '{{index .Config.Volumes "/data"}}' "$image")" = "{}"
+metadata="$(docker image inspect "$image")"
+jq -e '.[0].Config.ExposedPorts | has("19876/tcp")' <<<"$metadata" >/dev/null
+jq -e '.[0].Config.ExposedPorts | has("19876/udp")' <<<"$metadata" >/dev/null
+jq -e '.[0].Config.Volumes | has("/data")' <<<"$metadata" >/dev/null
 test "$(docker run --rm "$image" --version)" = "minip2p-relay-server $version"
 
 docker volume create "$volume" >/dev/null
