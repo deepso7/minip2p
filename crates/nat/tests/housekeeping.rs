@@ -467,6 +467,39 @@ fn reservation_on_clockless_host_uses_default_ttl() {
 }
 
 #[test]
+fn reservation_keep_alive_uses_synthetic_time_only_for_quic() {
+    let mut quic = build_with_config(ReservationPolicy::Always, 1, 0, |config| {
+        config.reservation_keep_alive_interval_ms = 100;
+    });
+    reserve_via_relay(&mut quic, hop_reserve_ok(None), at(10));
+    drain_actions(&mut quic.agent); // completed exchange's close-write
+
+    assert_eq!(quic.agent.next_timeout(10), Some(100));
+    quic.agent.handle_tick(at(109));
+    assert!(drain_actions(&mut quic.agent).is_empty());
+    quic.agent.handle_tick(at(110));
+    assert!(matches!(
+        drain_actions(&mut quic.agent).as_slice(),
+        [NatAction::Ping { peer }] if peer == &quic.relay
+    ));
+
+    let mut tcp = build_with_config(ReservationPolicy::Always, 1, 0, |config| {
+        let relay = config.relays[0].peer_id().clone();
+        config.relays[0] =
+            PeerAddr::new(maddr("/ip4/203.0.113.1/tcp/4001"), relay).expect("TCP relay address");
+        config.reservation_keep_alive_interval_ms = 100;
+    });
+    reserve_via_relay(&mut tcp, hop_reserve_ok(None), at(10));
+    drain_actions(&mut tcp.agent); // completed exchange's close-write
+
+    tcp.agent.handle_tick(at(110));
+    assert!(
+        drain_actions(&mut tcp.agent).is_empty(),
+        "TCP reservations do not schedule liveness traffic"
+    );
+}
+
+#[test]
 fn refused_reservation_rotates_relay_after_backoff() {
     let mut hk = build(ReservationPolicy::Always, 2, 0);
 

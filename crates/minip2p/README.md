@@ -158,6 +158,13 @@ Dropping a std `Endpoint` (or `Endpoint::close`) disconnects established
 peers. That does not cover `kill -9` or a hard partition; those still wait
 for the QUIC idle timeout. Portable endpoints use explicit `shutdown(now)`.
 
+With the `nat` feature, an endpoint holding a QUIC relay reservation sends a
+ping every `NatConfig::reservation_keep_alive_interval_ms` to stop an idle
+relay connection from reaching that timeout. The default is 15 seconds. Keep
+the interval below `QuicLimits::idle_timeout_ms`; setting it to `0` disables
+the automatic pings. TCP reservations do not send them. Each successful
+automatic ping emits the ordinary `Event::PingRttMeasured` event.
+
 `minip2p::Error` preserves transport failures, Sans-I/O state rejections, and
 driver-invariant failures as separate variants. Resource limits are
 configurable through `EndpointBuilder::quic_limits` and
