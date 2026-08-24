@@ -64,10 +64,12 @@ The Blume CLI discovers your content, builds a content graph, and generates a hi
 
 ## Full documentation
 
-This is a high-level overview. For complete, authoritative docs — configuration reference, every CLI command and flag, component APIs, content authoring, navigation, search, SEO, AI features, theming, and deployment — read the bundled docs in the installed package:
+This is a high-level overview. For complete, authoritative docs — configuration reference, every CLI command and flag, component APIs, content authoring, navigation, search, SEO, AI features, theming, and deployment — read the `docs/` directory bundled inside the installed `blume` package.
 
-```
-node_modules/blume/docs
+**Locate the package first — it is not always at the repository root.** In a workspace monorepo (pnpm especially), `blume` is installed in the depending workspace's `node_modules` (e.g. `apps/docs/node_modules/blume/docs`), not the root. From the package that depends on `blume`, this prints the exact location:
+
+```bash
+node -e "console.log(require.resolve('blume/package.json'))"
 ```
 
-Start with `node_modules/blume/docs/index.mdx` (Introduction) and `node_modules/blume/docs/01-quickstart.mdx`, then browse the `configuration/`, `content/`, `reference/`, and `advanced/` sections for specifics.
+The docs sit in `docs/` next to that `package.json`. Start with `docs/index.mdx` (Introduction) and `docs/01-quickstart.mdx`, then browse the `configuration/`, `content/`, `reference/`, and `advanced/` sections for specifics.
