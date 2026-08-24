@@ -1,5 +1,7 @@
 # Extract minip2p-ffi-core; bindings become thin shells
 
+> **Amended by [ADR 0003](0003-pull-based-event-delivery.md)**: event delivery is now pull-based on both platforms, which intentionally changes the RN UniFFI surface (listener → doorbell + drain). The regenerate-and-empty-diff check below no longer applies; the RN test suite is the extraction's safety net.
+
 `crates/ffi` mixed the embedding logic — the detached driver thread, event flattening, and endpoint lifecycle (~2,300 lines plus tests) — with the UniFFI annotations that expose it to React Native. With napi-rs chosen for Node (ADR 0001), we extract that logic into a binding-agnostic crate, `crates/ffi-core` (`minip2p-ffi-core`), and make each binding a thin shell over it: `crates/ffi` keeps UniFFI scaffolding, `#[uniffi::remote]` mirrors of the moved types, and a delegating object — its exported surface stays name- and signature-identical so the checked-in ubrn-generated React Native bindings survive a regenerate-and-empty-diff check — and the new `crates/nodejs` (`minip2p-nodejs`) is the napi-rs backend for `@minip2p/node`. Both new crates are workspace members with `publish = false`. Coupling evidence: [docs/research/ffi-uniffi-coupling.md](https://github.com/deepso7/minip2p/blob/research/ffi-uniffi-coupling/docs/research/ffi-uniffi-coupling.md).
 
 ## Considered Options
