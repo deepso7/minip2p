@@ -161,9 +161,9 @@ jobs:
           set -euo pipefail
           cargo build --release --locked -p minip2p-relay-server-example
 
-          binary="target/release/minip2p-relay-server"
+          binary="target/release/minip2p-relay"
           "$binary" --help >/dev/null
-          test "$("$binary" --version)" = "minip2p-relay-server $RELEASE_VERSION"
+          test "$("$binary" --version)" = "minip2p-relay $RELEASE_VERSION"
 
           release_dir="$RUNNER_TEMP/relay-release"
           scripts/package-relay-server.sh \
@@ -175,9 +175,9 @@ jobs:
           archive="minip2p-relay-server-v$RELEASE_VERSION-$RELEASE_TARGET"
           mkdir "$RUNNER_TEMP/relay-smoke"
           tar -xzf "$release_dir/$archive.tar.gz" -C "$RUNNER_TEMP/relay-smoke"
-          packaged="$RUNNER_TEMP/relay-smoke/$archive/minip2p-relay-server"
+          packaged="$RUNNER_TEMP/relay-smoke/$archive/minip2p-relay"
           "$packaged" --help >/dev/null
-          test "$("$packaged" --version)" = "minip2p-relay-server $RELEASE_VERSION"
+          test "$("$packaged" --version)" = "minip2p-relay $RELEASE_VERSION"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: relay-server-${{ matrix.target }}

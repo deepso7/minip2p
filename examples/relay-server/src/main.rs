@@ -1,4 +1,5 @@
 mod cli;
+mod service;
 
 use std::error::Error;
 use std::io::BufRead as _;
@@ -23,16 +24,23 @@ enum AutomaticBind {
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().is_some_and(|arg| arg == "service") {
+        if let Err(error) = service::run(args.into_iter().skip(1)) {
+            eprintln!("relay service: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("{}", cli::usage());
         return;
     }
     if args.iter().any(|arg| arg == "--version" || arg == "-V") {
-        println!("minip2p-relay-server {}", env!("CARGO_PKG_VERSION"));
+        println!("minip2p-relay {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     if let Err(error) = run(args) {
-        eprintln!("relay-server: {error}");
+        eprintln!("minip2p-relay: {error}");
         std::process::exit(2);
     }
 }

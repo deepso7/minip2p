@@ -47,7 +47,7 @@ printf '%s\n' "$checksum_line" > "$work_dir/CHECKSUM"
 )
 
 tar -xzf "$work_dir/$archive.tar.gz" -C "$work_dir"
-binary="$work_dir/$archive/minip2p-relay-server"
+binary="$work_dir/$archive/minip2p-relay"
 test -x "$binary" || fail "archive does not contain an executable relay server"
 
 install_dir="${MINIP2P_INSTALL_DIR:-/usr/local/bin}"
@@ -55,12 +55,14 @@ if [ ! -d "$install_dir" ]; then
   mkdir -p "$install_dir" 2>/dev/null || true
 fi
 if [ -w "$install_dir" ]; then
-  install -m 0755 "$binary" "$install_dir/minip2p-relay-server"
+  install -m 0755 "$binary" "$install_dir/minip2p-relay"
+  rm -f "$install_dir/minip2p-relay-server"
 elif command -v sudo >/dev/null 2>&1; then
   sudo install -d "$install_dir"
-  sudo install -m 0755 "$binary" "$install_dir/minip2p-relay-server"
+  sudo install -m 0755 "$binary" "$install_dir/minip2p-relay"
+  sudo rm -f "$install_dir/minip2p-relay-server"
 else
   fail "cannot write to $install_dir; set MINIP2P_INSTALL_DIR to a writable directory"
 fi
 
-printf 'installed minip2p-relay-server %s to %s\n' "$version" "$install_dir/minip2p-relay-server"
+printf 'installed minip2p-relay %s to %s\n' "$version" "$install_dir/minip2p-relay"

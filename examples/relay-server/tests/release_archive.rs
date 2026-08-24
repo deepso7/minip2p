@@ -12,7 +12,7 @@ fn release_archive_is_self_describing_and_runnable() {
 
     let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let status = Command::new(repository.join("scripts/package-relay-server.sh"))
-        .args([version, target, env!("CARGO_BIN_EXE_minip2p-relay-server")])
+        .args([version, target, env!("CARGO_BIN_EXE_minip2p-relay")])
         .arg(output_dir.path())
         .status()
         .unwrap();
@@ -34,7 +34,7 @@ fn release_archive_is_self_describing_and_runnable() {
     let contents = extract.join(archive_name);
     assert!(contents.join("README.md").is_file());
     assert!(contents.join("LICENSE").is_file());
-    let binary = contents.join("minip2p-relay-server");
+    let binary = contents.join("minip2p-relay");
     assert_eq!(
         std::fs::metadata(&binary).unwrap().permissions().mode() & 0o777,
         0o755
@@ -43,6 +43,8 @@ fn release_archive_is_self_describing_and_runnable() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        format!("minip2p-relay-server {version}\n")
+        format!("minip2p-relay {version}\n")
     );
+
+    assert!(!contents.join("minip2p-relay-server").exists());
 }

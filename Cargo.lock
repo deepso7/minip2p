@@ -349,6 +349,7 @@ checksum = "714a53001bf66416adb0e2ef5ac857140e7dc3a0c48fb28b2f10762fc4b5069f"
 dependencies = [
  "anstyle",
  "clap_lex",
+ "strsim",
 ]
 
 [[package]]
@@ -1269,6 +1270,7 @@ dependencies = [
 name = "minip2p-relay-server-example"
 version = "0.4.4"
 dependencies = [
+ "clap",
  "minip2p-example-common",
  "minip2p-rs",
  "tempfile",
@@ -1962,6 +1964,12 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "strsim"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "subtle"

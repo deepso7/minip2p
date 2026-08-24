@@ -23,13 +23,25 @@ the executable:
 ```bash
 sha256sum --check --ignore-missing SHA256SUMS
 tar -xzf minip2p-relay-server-v*-x86_64-unknown-linux-gnu.tar.gz
-sudo install -m 0755 minip2p-relay-server-v*-x86_64-unknown-linux-gnu/minip2p-relay-server /usr/local/bin/
-minip2p-relay-server --version
+sudo install -m 0755 \
+  minip2p-relay-server-v*-x86_64-unknown-linux-gnu/minip2p-relay \
+  /usr/local/bin/
+minip2p-relay --version
 ```
 
 Use `aarch64-unknown-linux-gnu` instead on an ARM64 host. Running
-`minip2p-relay-server` with no options starts the same dual-stack listener as
-the Cargo command above.
+`minip2p-relay` with no options starts the same dual-stack listener as the
+Cargo command above.
+
+On a Linux systemd host with standard administration tools under `/usr/bin` and
+`/usr/sbin`, install and start the service with one command:
+
+```bash
+sudo minip2p-relay service install --hostname relay.example.com
+```
+
+The command keeps the identity under `/var/lib/minip2p-relay`. Run
+`minip2p-relay service status` or `minip2p-relay service logs` to inspect it.
 
 The executable expands the same builder when composing all four listeners:
 

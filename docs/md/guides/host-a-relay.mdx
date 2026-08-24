@@ -11,11 +11,6 @@ You need a Linux x86-64 or ARM64 server with a public IP address. Allow inbound
 TCP and UDP traffic on port `19876`. TCP carries the TCP transport; UDP carries
 QUIC.
 
-:::note
-Prebuilt relay archives start with v0.4.3. The installer cannot install v0.4.2
-because that release predates the binary workflow.
-:::
-
 ### Install the relay
 
 The installer selects the archive for the host architecture, verifies it with
@@ -29,26 +24,67 @@ Set `MINIP2P_INSTALL_DIR` to install without root, or `MINIP2P_VERSION` to
 select a release:
 
 ```bash
-MINIP2P_INSTALL_DIR="$HOME/.local/bin" MINIP2P_VERSION="0.4.3" sh relay.sh
+MINIP2P_INSTALL_DIR="$HOME/.local/bin" sh relay.sh
 ```
 
-### Run it
+### Install the service
 
-Create a private state directory and start the relay with a persistent
-identity:
+The built-in service command expects systemd and the standard administration
+tools under `/usr/bin` and `/usr/sbin`. On other layouts, use the foreground
+command below or install an equivalent unit manually.
+
+Install and start the relay under systemd with your public hostname:
+
+```bash
+sudo minip2p-relay service install --hostname relay.example.com
+```
+
+The command creates a dedicated system user, stores the identity at
+`/var/lib/minip2p-relay/identity.key`, installs the systemd unit, and starts it.
+It will not replace an existing identity. To keep an identity from a manual
+installation, import it on the first run:
+
+```bash
+sudo minip2p-relay service install \
+  --hostname relay.example.com \
+  --import-key "$HOME/.local/share/minip2p-relay/identity.key"
+```
+
+Replace `relay.example.com` with your hostname. Give it `A` and `AAAA` records
+when the server has both address families. Allow inbound TCP and UDP port
+`19876` in the host firewall and cloud security group. If you manage DNS
+through Cloudflare, keep these records in DNS-only mode. Cloudflare Tunnel and
+the standard Cloudflare proxy do not forward arbitrary libp2p TCP and QUIC
+traffic.
+
+Check the service or follow its logs:
+
+```bash
+minip2p-relay service status
+minip2p-relay service logs
+```
+
+Upgrades replace the installed binary. Restart the service to run it:
+
+```bash
+curl -fsSL https://minip2p.com/install/relay.sh | sh
+sudo minip2p-relay service restart
+```
+
+`sudo minip2p-relay service uninstall` removes the unit but preserves the
+identity in `/var/lib/minip2p-relay`.
+
+### Run it in the foreground
+
+For a terminal session instead of systemd:
 
 ```bash
 mkdir -m 0700 -p "$HOME/.local/share/minip2p-relay"
-minip2p-relay-server \
+minip2p-relay \
   --key "$HOME/.local/share/minip2p-relay/identity.key" \
   --announce /dns/relay.example.com/tcp/19876 \
   --announce /dns/relay.example.com/udp/19876/quic-v1
 ```
-
-Replace `relay.example.com` with your hostname. Give it `A` and `AAAA` records
-when the server has both address families. If you manage DNS through
-Cloudflare, keep these records in DNS-only mode. Cloudflare Tunnel and the
-standard Cloudflare proxy do not forward arbitrary libp2p TCP and QUIC traffic.
 
 The process prints its peer ID and concrete listener addresses at startup. A
 client dials the announced address with the peer ID appended:
@@ -76,51 +112,13 @@ docker run -d \
   ghcr.io/deepso7/minip2p-relay:latest
 ```
 
-The image stores its identity in `/data/identity.key` by default. Use `v0.4.3`
-instead of `latest` to pin the release. Pass relay options such as `--announce`
-after the image name.
+The image stores its identity in `/data/identity.key` by default. Pass relay
+options such as `--announce` after the image name.
 
 The image runs as UID and GID `10001`; make a bind-mounted data directory
 writable by that account. Publish both TCP and UDP ports because the relay
 serves TCP and QUIC on the same port. Host IPv6 publication follows the Docker
 daemon's IPv6 configuration.
-
-### Run it with systemd
-
-Create a dedicated user and state directory:
-
-```bash
-sudo useradd --system --home /var/lib/minip2p-relay --shell /usr/sbin/nologin minip2p-relay
-sudo install -d -m 0700 -o minip2p-relay -g minip2p-relay /var/lib/minip2p-relay
-```
-
-Save this as `/etc/systemd/system/minip2p-relay.service`, replacing the
-hostname in both announced addresses:
-
-```ini
-[Unit]
-Description=minip2p circuit relay
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-User=minip2p-relay
-Group=minip2p-relay
-ExecStart=/usr/local/bin/minip2p-relay-server --key /var/lib/minip2p-relay/identity.key --announce /dns/relay.example.com/tcp/19876 --announce /dns/relay.example.com/udp/19876/quic-v1
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Start the service and follow its logs:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now minip2p-relay
-sudo journalctl -u minip2p-relay -f
-```
 
 ### Use custom listener addresses
 
@@ -128,7 +126,7 @@ Repeat `--tcp` or `--quic` to replace the automatic listeners. This example
 uses separate ports and explicit IPv4 and IPv6 addresses:
 
 ```bash
-minip2p-relay-server \
+minip2p-relay \
   --key /var/lib/minip2p-relay/identity.key \
   --tcp 192.0.2.10:4101 \
   --tcp '[2001:db8::10]:4101' \
@@ -136,5 +134,5 @@ minip2p-relay-server \
   --quic '[2001:db8::10]:4201'
 ```
 
-Run `minip2p-relay-server --help` for reservation, circuit, timeout, byte, and
+Run `minip2p-relay --help` for reservation, circuit, timeout, byte, and
 rate-limit options.

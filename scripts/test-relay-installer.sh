@@ -10,18 +10,18 @@ target="x86_64-unknown-linux-gnu"
 archive="minip2p-relay-server-v$version-$target"
 mkdir -p "$test_root/release/$archive" "$test_root/bin" "$test_root/install"
 
-cat >"$test_root/release/$archive/minip2p-relay-server" <<EOF
+cat >"$test_root/release/$archive/minip2p-relay" <<EOF
 #!/bin/sh
-printf '%s\n' 'minip2p-relay-server $version'
+printf '%s\n' 'minip2p-relay $version'
 EOF
-chmod 0755 "$test_root/release/$archive/minip2p-relay-server"
+chmod 0755 "$test_root/release/$archive/minip2p-relay"
 tar -C "$test_root/release" -czf "$test_root/release/$archive.tar.gz" "$archive"
 
 arm_target="aarch64-unknown-linux-gnu"
 arm_archive="minip2p-relay-server-v$version-$arm_target"
 mkdir "$test_root/release/$arm_archive"
-cp "$test_root/release/$archive/minip2p-relay-server" \
-  "$test_root/release/$arm_archive/minip2p-relay-server"
+cp "$test_root/release/$archive/minip2p-relay" \
+  "$test_root/release/$arm_archive/minip2p-relay"
 tar -C "$test_root/release" -czf "$test_root/release/$arm_archive.tar.gz" "$arm_archive"
 (
   cd "$test_root/release"
@@ -76,6 +76,8 @@ cp "$source" "$output"
 EOF
 chmod 0755 "$test_root/bin/curl"
 
+touch "$test_root/install/minip2p-relay-server"
+
 PATH="$test_root/bin:$PATH" \
   RELAY_INSTALLER_FIXTURE="$test_root/release" \
   RELAY_INSTALLER_EXPECT_TARGET="$target" \
@@ -83,9 +85,10 @@ PATH="$test_root/bin:$PATH" \
   MINIP2P_INSTALL_DIR="$test_root/install" \
   sh "$repository/docs/public/install/relay.sh"
 
-test -x "$test_root/install/minip2p-relay-server"
-test "$("$test_root/install/minip2p-relay-server" --version)" = \
-  "minip2p-relay-server $version"
+test -x "$test_root/install/minip2p-relay"
+test ! -e "$test_root/install/minip2p-relay-server"
+test "$("$test_root/install/minip2p-relay" --version)" = \
+  "minip2p-relay $version"
 
 mkdir "$test_root/install-latest"
 PATH="$test_root/bin:$PATH" \
@@ -96,5 +99,6 @@ PATH="$test_root/bin:$PATH" \
   MINIP2P_INSTALL_DIR="$test_root/install-latest" \
   sh "$repository/docs/public/install/relay.sh"
 
-test "$("$test_root/install-latest/minip2p-relay-server" --version)" = \
-  "minip2p-relay-server $version"
+test "$("$test_root/install-latest/minip2p-relay" --version)" = \
+  "minip2p-relay $version"
+test ! -e "$test_root/install-latest/minip2p-relay-server"
