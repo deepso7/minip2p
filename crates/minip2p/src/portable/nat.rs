@@ -212,6 +212,9 @@ impl PortableNatDriver {
             NatAction::Disconnect { peer } => {
                 let _ = endpoint.disconnect(&peer, now);
             }
+            NatAction::Ping { peer } => {
+                let _ = endpoint.ping(&peer, now);
+            }
             // The smoltcp TCP endpoint has no raw UDP transport. TCP-only
             // relay configurations never emit this; a defensive drop keeps
             // DCUtR explicitly unavailable instead of faking a punch.

@@ -472,6 +472,7 @@ enum ResState {
     Reserved {
         relay: PeerAddr,
         info: ReservationInfo,
+        keep_alive_at_mono_ms: Option<u64>,
     },
     /// Waiting out a failure/refusal before trying the (rotated) relay.
     Backoff { until: u64 },
@@ -533,6 +534,25 @@ impl ReservationManager {
                 let relay_peer = info.relay.clone();
                 self.held = Some(relay_peer);
                 self.begin_acquire(shared, now);
+            }
+            ResState::Reserved {
+                relay,
+                keep_alive_at_mono_ms: Some(due),
+                ..
+            } if now.mono_ms >= *due => {
+                shared.push_action(NatAction::Ping {
+                    peer: relay.peer_id().clone(),
+                });
+                if let ResState::Reserved {
+                    keep_alive_at_mono_ms,
+                    ..
+                } = &mut self.state
+                {
+                    *keep_alive_at_mono_ms = Some(
+                        now.mono_ms
+                            .saturating_add(shared.config.reservation_keep_alive_interval_ms),
+                    );
+                }
             }
             ResState::Acquiring { deadline, .. } if now.mono_ms >= *deadline => {
                 self.fail_acquire(shared, now);
@@ -894,7 +914,17 @@ impl ReservationManager {
             expires_unix_secs: info.expires_unix_secs,
             renew_at_mono_ms: info.renew_at_mono_ms,
         });
-        self.state = ResState::Reserved { relay, info };
+        let keep_alive_at_mono_ms = (relay.transport().is_quic_transport()
+            && shared.config.reservation_keep_alive_interval_ms > 0)
+            .then(|| {
+                now.mono_ms
+                    .saturating_add(shared.config.reservation_keep_alive_interval_ms)
+            });
+        self.state = ResState::Reserved {
+            relay,
+            info,
+            keep_alive_at_mono_ms,
+        };
     }
 
     fn active(&self) -> Option<&ReservationInfo> {
@@ -909,7 +939,15 @@ impl ReservationManager {
             ResState::Idle if self.needs_sync => Some(0),
             ResState::Idle => None,
             ResState::Acquiring { deadline, .. } => Some(*deadline),
-            ResState::Reserved { info, .. } => Some(info.renew_at_mono_ms),
+            ResState::Reserved {
+                info,
+                keep_alive_at_mono_ms,
+                ..
+            } => Some(
+                keep_alive_at_mono_ms.map_or(info.renew_at_mono_ms, |keep_alive| {
+                    keep_alive.min(info.renew_at_mono_ms)
+                }),
+            ),
             ResState::Backoff { until } => Some(*until),
         }
     }

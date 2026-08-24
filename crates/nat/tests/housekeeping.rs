@@ -372,7 +372,9 @@ fn reserve_via_relay(hk: &mut Hk, response: Vec<u8>, now: Now) -> (Vec<NatEvent>
 
 #[test]
 fn reservation_renews_at_expire_minus_margin() {
-    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    let mut hk = build_with_config(ReservationPolicy::Always, 1, 0, |config| {
+        config.reservation_keep_alive_interval_ms = 0;
+    });
 
     // Relay reports expiry at unix 1900; the clock says unix 1000 at mono 10.
     let (events, _) = reserve_via_relay(&mut hk, hop_reserve_ok(Some(1_900)), at_unix(10, 1_000));

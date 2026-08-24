@@ -266,7 +266,8 @@ impl World {
             NatAction::CloseCircuit { .. } => {}
             NatAction::CloseStreamWrite { .. }
             | NatAction::ResetStream { .. }
-            | NatAction::Disconnect { .. } => {}
+            | NatAction::Disconnect { .. }
+            | NatAction::Ping { .. } => {}
         }
     }
 

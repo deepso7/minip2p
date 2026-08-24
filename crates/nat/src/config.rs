@@ -78,6 +78,12 @@ pub struct NatConfig {
     /// Backoff before retrying (or rotating relays) after a refused or
     /// failed reservation.
     pub reservation_retry_backoff_ms: u64,
+    /// Interval between liveness pings while holding a QUIC relay
+    /// reservation. Keep this below the QUIC idle timeout. `0` disables
+    /// automatic reservation liveness traffic. TCP reservations never use
+    /// this setting. Drivers that expose ping RTT events also expose results
+    /// from these automatic pings.
+    pub reservation_keep_alive_interval_ms: u64,
     /// When to hold a relay reservation.
     pub reservation_policy: ReservationPolicy,
 }
@@ -105,6 +111,7 @@ impl Default for NatConfig {
             reservation_renewal_margin_secs: 120,
             reservation_default_ttl_secs: 3_600,
             reservation_retry_backoff_ms: 500,
+            reservation_keep_alive_interval_ms: 15_000,
             reservation_policy: ReservationPolicy::WhenPrivate,
         }
     }

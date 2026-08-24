@@ -116,7 +116,13 @@ Independent of connect attempts, the agent also runs:
   `reservation_renewal_margin_secs` before the relay-reported `expire`
   (default-TTL fallback when the relay omits it or the host has no wall
   clock), rotating relays with backoff on refusal, and reacquiring after a
-  lost relay session. `WhenPrivate` reserves while reachability is Unknown
+  lost relay session. While a QUIC reservation is held, the agent requests a
+  ping every `reservation_keep_alive_interval_ms` (15 seconds by default) so
+  an otherwise idle connection does not reach QUIC's idle timeout. Set it
+  below the configured QUIC idle timeout; `0` disables these pings. TCP
+  reservations do not schedule them. In the `minip2p` endpoint, successful
+  automatic pings emit the same `Event::PingRttMeasured` event as a
+  caller-requested ping. `WhenPrivate` reserves while reachability is Unknown
   or Private and releases once probes settle on Public.
 
 ## Responder side

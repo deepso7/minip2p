@@ -45,6 +45,10 @@ pub enum NatAction {
     ResetStream { peer: PeerId, stream_id: StreamId },
     /// Call `Swarm::disconnect(&peer)`.
     Disconnect { peer: PeerId },
+    /// Call `Swarm::ping(&peer)` to keep a QUIC relay reservation's
+    /// connection active. Failures may be ignored because connection loss is
+    /// reported through the normal swarm lifecycle.
+    Ping { peer: PeerId },
     /// Send one datagram of `payload_len` random bytes to `target` to open
     /// our NAT mapping (responder-side hole punch). The wiring fills the
     /// random bytes and calls the transport's raw-UDP send; transports

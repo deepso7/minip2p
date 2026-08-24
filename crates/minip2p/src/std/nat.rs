@@ -194,6 +194,9 @@ impl NatDriver {
             NatAction::Disconnect { peer } => {
                 let _ = swarm.disconnect(&peer);
             }
+            NatAction::Ping { peer } => {
+                let _ = swarm.ping(&peer);
+            }
             NatAction::SendRandomUdp {
                 target,
                 payload_len,
@@ -349,6 +352,8 @@ impl NatDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(feature = "quic", feature = "relay-server"))]
+    use crate::QuicLimits;
     use crate::{Ed25519Keypair, Endpoint, Event, NatConfig, ReachabilityState};
     use minip2p_nat::{NatToken, ReservationPolicy};
     use minip2p_relay::{HOP_PROTOCOL_ID, HopMessage, HopMessageType, Status, encode_frame};
@@ -441,6 +446,153 @@ mod tests {
             inner_conn,
             stream,
         }
+    }
+
+    #[cfg(feature = "relay-server")]
+    fn drive_until_reserved(client: &mut Endpoint, relay: &mut Endpoint, transport: &str) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while client.active_reservation().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "client did not acquire {transport} relay reservation"
+            );
+            let _ = client
+                .next_event(std::time::Duration::from_millis(10))
+                .expect("drive reservation client");
+            let _ = relay
+                .next_event(std::time::Duration::from_millis(10))
+                .expect("drive reservation relay");
+        }
+    }
+
+    #[cfg(all(feature = "quic", feature = "relay-server"))]
+    #[test]
+    fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
+        let limits = QuicLimits {
+            idle_timeout_ms: 300,
+            ..QuicLimits::default()
+        };
+        let mut relay = Endpoint::builder()
+            .identity(Ed25519Keypair::from_secret_key_bytes([82; 32]))
+            .quic_limits(limits.clone())
+            .relay_server()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind relay");
+        let relay_addr = relay.listen().expect("relay listens");
+        let mut client = Endpoint::builder()
+            .identity(Ed25519Keypair::from_secret_key_bytes([81; 32]))
+            .quic_limits(limits)
+            .nat_config(NatConfig {
+                relays: vec![relay_addr.clone()],
+                reservation_policy: ReservationPolicy::Always,
+                reservation_keep_alive_interval_ms: 100,
+                ..NatConfig::default()
+            })
+            .bind_quic("127.0.0.1:0")
+            .expect("bind client");
+
+        drive_until_reserved(&mut client, &mut relay, "QUIC");
+
+        let observe_until = Instant::now() + std::time::Duration::from_millis(1_200);
+        let mut ping_rtts = 0;
+        while Instant::now() < observe_until {
+            if matches!(
+                client
+                    .next_event(std::time::Duration::from_millis(10))
+                    .expect("drive client"),
+                Some(Event::PingRttMeasured { .. })
+            ) {
+                ping_rtts += 1;
+            }
+            let _ = relay
+                .next_event(std::time::Duration::from_millis(10))
+                .expect("drive relay");
+        }
+
+        let reservation_events = client.take_nat_events();
+        assert!(ping_rtts > 0, "reservation liveness should send QUIC pings");
+        assert!(client.active_reservation().is_some());
+        assert_eq!(
+            reservation_events
+                .iter()
+                .filter(|event| matches!(event, NatEvent::RelayReserved { .. }))
+                .count(),
+            1,
+            "an idle reservation must not be reacquired"
+        );
+        assert!(
+            !reservation_events
+                .iter()
+                .any(|event| matches!(event, NatEvent::RelayReservationLost { .. })),
+            "an idle reservation must not be reported lost"
+        );
+
+        relay
+            .disconnect(&client.peer_id().clone())
+            .expect("disconnect reservation owner");
+        let reconnect_deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let mut lost = false;
+        let mut reacquired = false;
+        while !reacquired {
+            assert!(
+                Instant::now() < reconnect_deadline,
+                "genuine relay loss did not trigger reacquisition"
+            );
+            let _ = client
+                .next_event(std::time::Duration::from_millis(10))
+                .expect("drive reconnecting client");
+            let _ = relay
+                .next_event(std::time::Duration::from_millis(10))
+                .expect("drive relay after disconnect");
+            for event in client.take_nat_events() {
+                match event {
+                    NatEvent::RelayReservationLost { .. } => lost = true,
+                    NatEvent::RelayReserved { .. } if lost => reacquired = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(lost, "genuine relay loss must remain observable");
+    }
+
+    #[cfg(all(feature = "relay-server", feature = "tcp"))]
+    #[test]
+    fn tcp_relay_reservation_does_not_schedule_liveness_pings() {
+        let mut relay = Endpoint::builder()
+            .identity(Ed25519Keypair::from_secret_key_bytes([84; 32]))
+            .relay_server()
+            .bind_tcp("127.0.0.1:0")
+            .expect("bind TCP relay");
+        let relay_addr = relay.listen().expect("TCP relay listens");
+        let mut client = Endpoint::builder()
+            .identity(Ed25519Keypair::from_secret_key_bytes([83; 32]))
+            .nat_config(NatConfig {
+                relays: vec![relay_addr],
+                reservation_policy: ReservationPolicy::Always,
+                reservation_keep_alive_interval_ms: 25,
+                ..NatConfig::default()
+            })
+            .bind_tcp("127.0.0.1:0")
+            .expect("bind TCP client");
+
+        drive_until_reserved(&mut client, &mut relay, "TCP");
+
+        let observe_until = Instant::now() + std::time::Duration::from_millis(250);
+        while Instant::now() < observe_until {
+            assert!(
+                !matches!(
+                    client
+                        .next_event(std::time::Duration::from_millis(10))
+                        .expect("drive TCP client"),
+                    Some(Event::PingRttMeasured { .. })
+                ),
+                "TCP reservation behavior must not gain automatic pings"
+            );
+            let _ = relay
+                .next_event(std::time::Duration::from_millis(10))
+                .expect("drive TCP relay");
+        }
+        assert!(client.active_reservation().is_some());
     }
 
     fn drain_actions(agent: &mut NatAgent) -> Vec<NatAction> {
