@@ -72,27 +72,27 @@
     "clean": "del-cli android/.cxx android/build example/android/build example/android/app/build example/ios/build lib",
     "build": "bob build && node scripts/normalize-generated.mjs",
     "prepack": "pnpm build && node scripts/check-package-native.mjs",
-    "test": "pnpm build && node --test tests/*.test.mjs",
-    "typecheck": "tsc",
-    "lint": "ultracite check",
-    "format": "ultracite fix"
+    "test": "vitest run --config ../vitest.config.ts --root .",
+    "test:built": "vitest run --config vitest.built.config.ts --root .",
+    "test:watch": "vitest --config ../vitest.config.ts --root .",
+    "typecheck": "tsc"
   },
   "dependencies": {
     "@minip2p/core": "workspace:*",
-    "@ubjs/core": "0.31.0-3",
-    "uniffi-bindgen-react-native": "0.31.0-3"
+    "@ubjs/core": "0.31.0-5",
+    "uniffi-bindgen-react-native": "0.31.0-5"
   },
   "devDependencies": {
-    "@react-native-community/cli": "20.1.0",
-    "@react-native/babel-preset": "0.85.3",
-    "@react-native/typescript-config": "0.85.3",
-    "@types/react": "^19.2.0",
-    "del-cli": "^7.0.0",
-    "react": "19.2.3",
-    "react-native": "0.85.3",
-    "react-native-builder-bob": "^0.43.0",
-    "typescript": "^6.0.3",
-    "ultracite": "7.9.4"
+    "@minip2p/test-fixtures": "workspace:*",
+    "@react-native-community/cli": "20.2.0",
+    "@react-native/babel-preset": "0.87.0",
+    "@react-native/typescript-config": "0.87.0",
+    "@types/react": "catalog:",
+    "del-cli": "catalog:",
+    "react": "catalog:",
+    "react-native": "catalog:",
+    "react-native-builder-bob": "0.43.0",
+    "typescript": "catalog:"
   },
   "peerDependencies": {
     "react": "*",

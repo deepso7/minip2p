@@ -1,6 +1,6 @@
 # Contributing
 
-This package is part of the `bindings/ts` pnpm workspace and includes an Expo SDK 56 development-build example.
+This package is part of the `bindings/ts` pnpm workspace and includes an Expo SDK 57 development-build example.
 
 ## Setup
 

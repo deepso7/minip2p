@@ -3,6 +3,17 @@ packages:
   - node
   - react-native
   - react-native/example
+  - test-fixtures
+
+allowBuilds:
+  esbuild: true
+
+catalog:
+  "@types/react": 19.2.18
+  del-cli: 7.0.0
+  react: 19.2.8
+  react-native: 0.87.0
+  typescript: 7.0.2
 
 minimumReleaseAgeExclude:
   - "@expo/cli@56.1.22"
@@ -12,8 +23,7 @@ minimumReleaseAgeExclude:
 
 nodeLinker: hoisted
 
-onlyBuiltDependencies:
-  - esbuild
+saveExact: true
 
 patchedDependencies:
-  uniffi-bindgen-react-native@0.31.0-3: react-native/patches/uniffi-bindgen-react-native@0.31.0-3.patch
+  uniffi-bindgen-react-native@0.31.0-5: react-native/patches/uniffi-bindgen-react-native@0.31.0-5.patch

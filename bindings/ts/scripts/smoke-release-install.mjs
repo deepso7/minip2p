@@ -5,7 +5,8 @@ import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 
-import ts from "typescript";
+import { verifyHookLifecycle } from "../react-native/tests/hook-lifecycle.contract.mjs";
+import { namedExports } from "./module-exports.mjs";
 
 const [consumerRoot] = process.argv.slice(2);
 if (consumerRoot === undefined) {
@@ -31,6 +32,15 @@ const core = await import(pathToFileURL(path.join(coreRoot, coreEntry)).href);
 if (typeof core.Minip2pBase !== "function") {
   throw new TypeError("installed @minip2p/core is missing Minip2pBase");
 }
+
+const hookLifecycle = await import(
+  pathToFileURL(path.join(reactNativeRoot, "lib/module/hook-lifecycle.js")).href
+);
+verifyHookLifecycle({
+  ClosedError: core.ClosedError,
+  bindAppStateSource: hookLifecycle.bindAppStateSource,
+  mountEndpointLifecycle: hookLifecycle.mountEndpointLifecycle,
+});
 
 requireNamedExport(
   path.join(reactNativeRoot, packageExport(reactNativeManifest, "default")),
@@ -60,23 +70,9 @@ function packageExport(manifest, condition) {
 }
 
 function requireNamedExport(file, expectedExport) {
-  const source = ts.createSourceFile(
-    file,
-    readFileSync(file, "utf-8"),
-    ts.ScriptTarget.Latest,
-    true
-  );
-  for (const statement of source.statements) {
-    if (
-      ts.isExportDeclaration(statement) &&
-      statement.exportClause !== undefined &&
-      ts.isNamedExports(statement.exportClause) &&
-      statement.exportClause.elements.some(
-        (element) => element.name.text === expectedExport
-      )
-    ) {
-      return;
-    }
+  const exports = namedExports(readFileSync(file, "utf-8"));
+  if (exports.has(expectedExport)) {
+    return;
   }
   throw new Error(`${file} is missing the ${expectedExport} public export`);
 }

@@ -48,7 +48,13 @@
       "cache": false
     },
     "test": {
-      "inputs": ["$TURBO_DEFAULT$", "tests/**"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/vitest.config.ts",
+        "src/**",
+        "tests/**",
+        "$TURBO_ROOT$/test-fixtures/**"
+      ],
       "outputs": []
     },
     "typecheck": {

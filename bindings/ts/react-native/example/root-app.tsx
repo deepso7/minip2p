@@ -16,7 +16,7 @@ import {
 import { runSmokeSuite } from "./src/smoke";
 import type { SmokeReport, SmokeResult } from "./src/smoke";
 
-export default function App() {
+const App = () => {
   const endpoints = useRef(new Set<Minip2p>());
   const running = useRef(false);
   const [results, setResults] = useState<SmokeResult[]>([]);
@@ -44,9 +44,8 @@ export default function App() {
         passed: false,
       });
       setStatus("failed");
-    } finally {
-      running.current = false;
     }
+    running.current = false;
   }, []);
 
   useEffect(() => {
@@ -133,7 +132,9 @@ export default function App() {
       <StatusBar style="dark" />
     </SafeAreaView>
   );
-}
+};
+
+export default App;
 
 const styles = StyleSheet.create({
   button: {

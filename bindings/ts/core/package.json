@@ -49,11 +49,13 @@
   "scripts": {
     "build": "del-cli dist && tsc -p tsconfig.build.json",
     "clean": "del-cli dist",
-    "test": "pnpm build && node --test tests/*.test.mjs",
+    "test": "vitest run --config ../vitest.config.ts --root .",
+    "test:watch": "vitest --config ../vitest.config.ts --root .",
     "typecheck": "tsc -p tsconfig.json"
   },
   "devDependencies": {
-    "del-cli": "^7.0.0",
-    "typescript": "^6.0.3"
+    "@minip2p/test-fixtures": "workspace:*",
+    "del-cli": "catalog:",
+    "typescript": "catalog:"
   }
 }

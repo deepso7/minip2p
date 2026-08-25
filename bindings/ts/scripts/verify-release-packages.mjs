@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
 
-import ts from "typescript";
+import { namedExports } from "./module-exports.mjs";
 
 const [expectedVersion, coreTarball, reactNativeTarball, nativeSourceRoot] =
   process.argv.slice(2);
@@ -71,6 +71,7 @@ try {
     "cpp/generated/minip2p_ffi.cpp",
     "cpp/generated/minip2p_ffi.hpp",
     "lib/module/index.js",
+    "lib/module/hook-lifecycle.js",
     "lib/typescript/src/index.d.ts",
     "src/index.ts",
   ]);
@@ -186,24 +187,7 @@ function isRejectedPath(file) {
 
 function requireNamedExports(root, relativePath, requiredExports) {
   const file = path.join(root, relativePath);
-  const source = ts.createSourceFile(
-    file,
-    readFileSync(file, "utf-8"),
-    ts.ScriptTarget.Latest,
-    true
-  );
-  const exports = new Set();
-  for (const statement of source.statements) {
-    if (
-      ts.isExportDeclaration(statement) &&
-      statement.exportClause !== undefined &&
-      ts.isNamedExports(statement.exportClause)
-    ) {
-      for (const element of statement.exportClause.elements) {
-        exports.add(element.name.text);
-      }
-    }
-  }
+  const exports = namedExports(readFileSync(file, "utf-8"));
 
   const missing = requiredExports.filter((name) => !exports.has(name));
   if (missing.length !== 0) {

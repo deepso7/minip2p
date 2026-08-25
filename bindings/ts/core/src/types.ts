@@ -1,3 +1,5 @@
+/* oxlint-disable no-redeclare -- Public constants and their value-union types intentionally share names. */
+
 import type { DriverFailedError } from "./errors.js";
 import type { Stream } from "./sdk.js";
 
