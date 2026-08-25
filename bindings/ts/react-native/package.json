@@ -80,21 +80,21 @@
   },
   "dependencies": {
     "@minip2p/core": "workspace:*",
-    "@ubjs/core": "0.31.0-3",
-    "uniffi-bindgen-react-native": "0.31.0-3"
+    "@ubjs/core": "0.31.0-5",
+    "uniffi-bindgen-react-native": "0.31.0-5"
   },
   "devDependencies": {
     "@minip2p/test-fixtures": "workspace:*",
-    "@react-native-community/cli": "20.1.0",
-    "@react-native/babel-preset": "0.85.3",
-    "@react-native/typescript-config": "0.85.3",
-    "@types/react": "^19.2.0",
-    "del-cli": "^7.0.0",
-    "react": "19.2.3",
-    "react-native": "0.85.3",
+    "@react-native-community/cli": "20.2.0",
+    "@react-native/babel-preset": "0.87.0",
+    "@react-native/typescript-config": "0.87.0",
+    "@types/react": "catalog:",
+    "del-cli": "catalog:",
+    "react": "catalog:",
+    "react-native": "catalog:",
     "react-native-builder-bob": "^0.43.0",
-    "typescript": "^6.0.3",
-    "ultracite": "7.9.4"
+    "typescript": "catalog:",
+    "ultracite": "catalog:"
   },
   "peerDependencies": {
     "react": "*",

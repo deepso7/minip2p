@@ -8,6 +8,14 @@ packages:
 allowBuilds:
   esbuild: true
 
+catalog:
+  "@types/react": ^19.2.18
+  del-cli: ^7.0.0
+  react: 19.2.8
+  react-native: 0.87.0
+  typescript: ^7.0.2
+  ultracite: 7.10.6
+
 minimumReleaseAgeExclude:
   - "@expo/cli@56.1.22"
   - "@expo/inline-modules@0.0.15"
@@ -17,4 +25,4 @@ minimumReleaseAgeExclude:
 nodeLinker: hoisted
 
 patchedDependencies:
-  uniffi-bindgen-react-native@0.31.0-3: react-native/patches/uniffi-bindgen-react-native@0.31.0-3.patch
+  uniffi-bindgen-react-native@0.31.0-5: react-native/patches/uniffi-bindgen-react-native@0.31.0-5.patch
