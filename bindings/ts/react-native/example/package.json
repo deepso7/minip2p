@@ -13,9 +13,9 @@
   },
   "dependencies": {
     "@minip2p/react-native": "workspace:*",
-    "expo": "~57.0.16",
-    "expo-dev-client": "~57.0.15",
-    "expo-status-bar": "~57.0.1",
+    "expo": "57.0.16",
+    "expo-dev-client": "57.0.15",
+    "expo-status-bar": "57.0.1",
     "react": "catalog:",
     "react-native": "catalog:"
   },

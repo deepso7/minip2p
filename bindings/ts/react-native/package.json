@@ -92,7 +92,7 @@
     "del-cli": "catalog:",
     "react": "catalog:",
     "react-native": "catalog:",
-    "react-native-builder-bob": "^0.43.0",
+    "react-native-builder-bob": "0.43.0",
     "typescript": "catalog:",
     "ultracite": "catalog:"
   },

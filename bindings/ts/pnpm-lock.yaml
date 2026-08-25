@@ -7,10 +7,10 @@ settings:
 catalogs:
   default:
     '@types/react':
-      specifier: ^19.2.18
+      specifier: 19.2.18
       version: 19.2.18
     del-cli:
-      specifier: ^7.0.0
+      specifier: 7.0.0
       version: 7.0.0
     react:
       specifier: 19.2.8
@@ -19,7 +19,7 @@ catalogs:
       specifier: 0.87.0
       version: 0.87.0
     typescript:
-      specifier: ^7.0.2
+      specifier: 7.0.2
       version: 7.0.2
     ultracite:
       specifier: 7.10.6
@@ -39,7 +39,7 @@ importers:
         specifier: 1.80.0
         version: 1.80.0
       turbo:
-        specifier: ^2.10.11
+        specifier: 2.10.11
         version: 2.10.11
       typescript:
         specifier: 'catalog:'
@@ -48,7 +48,7 @@ importers:
         specifier: 'catalog:'
         version: 7.10.6(oxfmt@0.65.0)(oxlint@1.80.0)
       vitest:
-        specifier: ^4.1.11
+        specifier: 4.1.11
         version: 4.1.11(@types/node@26.2.0)(vite@7.3.6(@types/node@26.2.0)(lightningcss@1.33.0)(terser@5.50.0)(yaml@2.9.0))
 
   core:
@@ -116,7 +116,7 @@ importers:
         specifier: 'catalog:'
         version: 0.87.0(@babel/core@7.29.7(supports-color@8.1.1))(@react-native-community/cli@20.2.0(supports-color@8.1.1)(typescript@7.0.2))(@types/react@19.2.18)(react@19.2.8)(supports-color@8.1.1)
       react-native-builder-bob:
-        specifier: ^0.43.0
+        specifier: 0.43.0
         version: 0.43.0(supports-color@8.1.1)
       typescript:
         specifier: 'catalog:'
@@ -131,13 +131,13 @@ importers:
         specifier: workspace:*
         version: link:..
       expo:
-        specifier: ~57.0.16
+        specifier: 57.0.16
         version: 57.0.16(@babel/core@7.29.7(supports-color@8.1.1))(@expo/dom-webview@57.0.1)(react-native@0.87.0(@babel/core@7.29.7(supports-color@8.1.1))(@react-native-community/cli@20.2.0(supports-color@8.1.1)(typescript@7.0.2))(@types/react@19.2.18)(react@19.2.8)(supports-color@8.1.1))(react@19.2.8)(supports-color@8.1.1)(typescript@7.0.2)
       expo-dev-client:
-        specifier: ~57.0.15
+        specifier: 57.0.15
         version: 57.0.15(expo@57.0.16)(react-native@0.87.0(@babel/core@7.29.7(supports-color@8.1.1))(@react-native-community/cli@20.2.0(supports-color@8.1.1)(typescript@7.0.2))(@types/react@19.2.18)(react@19.2.8)(supports-color@8.1.1))
       expo-status-bar:
-        specifier: ~57.0.1
+        specifier: 57.0.1
         version: 57.0.1(expo@57.0.16)(react-native@0.87.0(@babel/core@7.29.7(supports-color@8.1.1))(@react-native-community/cli@20.2.0(supports-color@8.1.1)(typescript@7.0.2))(@types/react@19.2.18)(react@19.2.8)(supports-color@8.1.1))(react@19.2.8)
       react:
         specifier: 'catalog:'
