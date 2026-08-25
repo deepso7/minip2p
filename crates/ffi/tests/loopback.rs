@@ -106,12 +106,12 @@ impl P2pEventDoorbell for EventLog {
     }
 }
 
-struct PanicOnceListener {
+struct PanicOnceDoorbell {
     log: Arc<EventLog>,
     panicked: AtomicBool,
 }
 
-struct SlowListener {
+struct SlowDoorbell {
     log: Arc<EventLog>,
 }
 
@@ -137,12 +137,12 @@ impl CallbackGate {
     }
 }
 
-struct BlockingListener {
+struct BlockingDoorbell {
     log: Arc<EventLog>,
     gate: Arc<CallbackGate>,
 }
 
-impl P2pEventDoorbell for BlockingListener {
+impl P2pEventDoorbell for BlockingDoorbell {
     fn on_events_ready(&self) {
         if self
             .log
@@ -168,7 +168,7 @@ impl P2pEventDoorbell for BlockingListener {
     }
 }
 
-impl P2pEventDoorbell for SlowListener {
+impl P2pEventDoorbell for SlowDoorbell {
     fn on_events_ready(&self) {
         if self
             .log
@@ -181,7 +181,7 @@ impl P2pEventDoorbell for SlowListener {
     }
 }
 
-impl P2pEventDoorbell for PanicOnceListener {
+impl P2pEventDoorbell for PanicOnceDoorbell {
     fn on_events_ready(&self) {
         if self
             .log
@@ -497,7 +497,7 @@ fn panicking_doorbell_does_not_kill_driver() -> Result<(), FfiError> {
     let b = endpoint(24);
     let a_log = Arc::new(EventLog::new(Arc::clone(&a)));
     let b_log = Arc::new(EventLog::new(Arc::clone(&b)));
-    let listener = Arc::new(PanicOnceListener {
+    let listener = Arc::new(PanicOnceDoorbell {
         log: Arc::clone(&a_log),
         panicked: AtomicBool::new(false),
     });
@@ -553,7 +553,7 @@ fn query_completes_while_doorbell_callback_is_in_flight() -> Result<(), FfiError
     let gate = Arc::new(CallbackGate::default());
     let a_peer = a.peer_id();
 
-    a.start(Arc::new(BlockingListener {
+    a.start(Arc::new(BlockingDoorbell {
         log: a_log,
         gate: Arc::clone(&gate),
     }))?;
@@ -576,7 +576,6 @@ fn query_completes_while_doorbell_callback_is_in_flight() -> Result<(), FfiError
         gate.wait_until_entered(Duration::from_secs(5)),
         "doorbell callback did not start"
     );
-
     let query_endpoint = Arc::clone(&a);
     let (sent, received) = std::sync::mpsc::sync_channel(1);
     let query = std::thread::spawn(move || {
@@ -605,7 +604,7 @@ fn bounded_load_preserves_order_and_accounting() -> Result<(), FfiError> {
     let a_log = Arc::new(EventLog::new(Arc::clone(&a)));
     let b_log = Arc::new(EventLog::new(Arc::clone(&b)));
     let a_peer = a.peer_id();
-    a.start(Arc::new(SlowListener {
+    a.start(Arc::new(SlowDoorbell {
         log: Arc::clone(&a_log),
     }))?;
     b.start(Arc::clone(&b_log) as Arc<dyn P2pEventDoorbell>)?;

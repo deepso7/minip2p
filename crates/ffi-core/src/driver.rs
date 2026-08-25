@@ -49,6 +49,7 @@ pub(crate) struct Delivery {
 pub(crate) struct Carry {
     events: BTreeMap<u64, P2pEvent>,
     payload_ids: VecDeque<u64>,
+    dropped_terminal_connect_ids: BTreeSet<u64>,
     next_id: u64,
 }
 
@@ -71,10 +72,13 @@ impl Carry {
         if self.events.len() <= MAX_CARRY_EVENTS {
             return false;
         }
-        if let Some(payload_id) = self.payload_ids.pop_front() {
-            self.events.remove(&payload_id);
+        let dropped = if let Some(payload_id) = self.payload_ids.pop_front() {
+            self.events.remove(&payload_id)
         } else {
-            self.events.pop_first();
+            self.events.pop_first().map(|(_, event)| event)
+        };
+        if let Some(connect_id) = dropped.as_ref().and_then(terminal_connect_id) {
+            self.dropped_terminal_connect_ids.insert(connect_id);
         }
         true
     }
@@ -97,6 +101,10 @@ impl Carry {
             .retain(|_, event| p2p_connect_id(event).is_none_or(|id| !cancelled.contains(&id)));
         self.prune_payload_ids();
         before - self.events.len()
+    }
+
+    fn take_dropped_terminal_connect_ids(&mut self) -> BTreeSet<u64> {
+        core::mem::take(&mut self.dropped_terminal_connect_ids)
     }
 
     fn prune_payload_ids(&mut self) {
@@ -247,12 +255,11 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             overflow,
             stats,
         );
-        for event in carry.events.values() {
-            if let Some(id) = terminal_connect_id(event) {
-                connect_ids.remove(&id);
-                cancelled_connect_ids.remove(&id);
-            }
+        for id in carry.take_dropped_terminal_connect_ids() {
+            connect_ids.remove(&id);
+            cancelled_connect_ids.remove(&id);
         }
+        cancelled_connect_ids.clear();
         stats.carry_high_water = stats.carry_high_water.max(carry.len());
         stats.iterations = stats.iterations.saturating_add(1);
         let should_ring = was_empty && !carry.is_empty();
@@ -356,7 +363,7 @@ fn nat_connect_id(event: &NatEvent) -> Option<u64> {
     }
 }
 
-fn p2p_connect_id(event: &P2pEvent) -> Option<u64> {
+pub(crate) fn p2p_connect_id(event: &P2pEvent) -> Option<u64> {
     match event {
         P2pEvent::PathEstablished { connect_id, .. }
         | P2pEvent::PathUpgraded { connect_id, .. }
@@ -367,7 +374,7 @@ fn p2p_connect_id(event: &P2pEvent) -> Option<u64> {
     }
 }
 
-fn terminal_connect_id(event: &P2pEvent) -> Option<u64> {
+pub(crate) fn terminal_connect_id(event: &P2pEvent) -> Option<u64> {
     match event {
         P2pEvent::PathEstablished {
             connect_id, path, ..

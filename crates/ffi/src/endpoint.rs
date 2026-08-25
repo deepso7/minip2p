@@ -21,7 +21,10 @@ pub struct P2pEndpoint(Arc<minip2p_ffi_core::P2pEndpoint>);
 impl P2pEndpoint {
     /// Creates an endpoint after validating configuration and binding sockets.
     #[uniffi::constructor]
-    pub fn new(secret_key: Vec<u8>, config: EndpointConfig) -> Result<Arc<Self>, FfiError> {
+    pub fn new(secret_key: Vec<u8>, mut config: EndpointConfig) -> Result<Arc<Self>, FfiError> {
+        if config.agent_version.is_none() {
+            config.agent_version = Some(format!("minip2p-rn/{}", env!("CARGO_PKG_VERSION")));
+        }
         minip2p_ffi_core::P2pEndpoint::new(secret_key, config).map(|core| Arc::new(Self(core)))
     }
     /// Returns the local peer ID.

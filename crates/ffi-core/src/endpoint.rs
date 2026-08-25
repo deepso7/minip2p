@@ -1,8 +1,10 @@
 //! Binding-agnostic endpoint object and construction.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -126,6 +128,7 @@ pub(crate) struct Shared {
     wait_handle: WaitHandle,
     pub(crate) pending_commands: AtomicUsize,
     pub(crate) driver_running: AtomicBool,
+    doorbell_running: AtomicBool,
 }
 
 pub(crate) struct EndpointState {
@@ -133,6 +136,7 @@ pub(crate) struct EndpointState {
     pub(crate) endpoint: Option<Endpoint>,
     pub(crate) active: bool,
     pub(crate) driver_thread_id: Option<std::thread::ThreadId>,
+    doorbell_thread_id: Option<std::thread::ThreadId>,
     pub(crate) connect_ids: BTreeMap<u64, minip2p::ConnectId>,
     pub(crate) cancelled_connect_ids: BTreeSet<u64>,
     pub(crate) carry: crate::driver::Carry,
@@ -146,6 +150,16 @@ pub(crate) enum Lifecycle {
     Running,
     Stopping,
     Stopped,
+}
+
+struct DoorbellSender(SyncSender<()>);
+
+impl EventDoorbell for DoorbellSender {
+    fn on_events_ready(&self) {
+        match self.0.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) | Err(TrySendError::Disconnected(())) => {}
+        }
+    }
 }
 
 impl P2pEndpoint {
@@ -189,7 +203,7 @@ impl P2pEndpoint {
             .agent_version(
                 config
                     .agent_version
-                    .unwrap_or_else(|| format!("minip2p-rn/{}", env!("CARGO_PKG_VERSION"))),
+                    .unwrap_or_else(|| format!("minip2p/{}", env!("CARGO_PKG_VERSION"))),
             )
             .pubsub_config(pubsub);
         for protocol in config.protocols {
@@ -268,6 +282,7 @@ impl P2pEndpoint {
                     endpoint: Some(endpoint),
                     active: false,
                     driver_thread_id: None,
+                    doorbell_thread_id: None,
                     connect_ids: BTreeMap::new(),
                     cancelled_connect_ids: BTreeSet::new(),
                     carry: crate::driver::Carry::default(),
@@ -278,6 +293,7 @@ impl P2pEndpoint {
                 wait_handle,
                 pending_commands: AtomicUsize::new(0),
                 driver_running: AtomicBool::new(false),
+                doorbell_running: AtomicBool::new(false),
             }),
             peer_id,
             listen_addrs,
@@ -347,6 +363,7 @@ impl P2pEndpoint {
 
     /// Starts the detached background endpoint driver.
     pub fn start(&self, doorbell: Arc<dyn EventDoorbell>) -> Result<(), FfiError> {
+        let doorbell = self.spawn_doorbell(doorbell)?;
         self.start_with(doorbell, |shared, doorbell| {
             std::thread::Builder::new()
                 .name("minip2p-driver".into())
@@ -360,10 +377,12 @@ impl P2pEndpoint {
         if limit == 0 {
             return Vec::new();
         }
+        let _pending = PendingCommand::new(&self.shared);
         let mut state = self.shared.lock_state();
         let EndpointState {
             carry,
             overflow,
+            connect_ids,
             cancelled_connect_ids,
             stats,
             ..
@@ -371,10 +390,17 @@ impl P2pEndpoint {
         let suppressed = carry.suppress_cancelled(cancelled_connect_ids);
         stats.dropped = stats.dropped.saturating_add(suppressed as u64);
         let mut delivery = crate::driver::take_delivery(carry, overflow, stats, limit as usize);
+        for event in &delivery.batch {
+            if let Some(connect_id) = crate::driver::terminal_connect_id(event) {
+                connect_ids.remove(&connect_id);
+                cancelled_connect_ids.remove(&connect_id);
+            }
+        }
         stats.dispatch_attempted = stats
             .dispatch_attempted
             .saturating_add(delivery.batch.len() as u64);
-        let mut events = Vec::with_capacity(limit as usize);
+        let mut events =
+            Vec::with_capacity(delivery.batch.len() + usize::from(delivery.diagnostic.is_some()));
         if let Some(diagnostic) = delivery.diagnostic.take() {
             events.push(diagnostic);
         }
@@ -419,14 +445,20 @@ impl P2pEndpoint {
         let timeout = Duration::from_millis(timeout_ms);
         let started = Instant::now();
         let mut state = self.shared.lock_state();
-        if state.lifecycle == Lifecycle::Stopped {
+        if state.lifecycle == Lifecycle::Stopped
+            && !self.shared.doorbell_running.load(Ordering::Acquire)
+        {
             return true;
         }
-        if state.driver_thread_id == Some(std::thread::current().id()) {
+        if state.driver_thread_id == Some(std::thread::current().id())
+            || state.doorbell_thread_id == Some(std::thread::current().id())
+        {
             return false;
         }
         loop {
-            if state.lifecycle == Lifecycle::Stopped {
+            if state.lifecycle == Lifecycle::Stopped
+                && !self.shared.doorbell_running.load(Ordering::Acquire)
+            {
                 return true;
             }
             let remaining = timeout.saturating_sub(started.elapsed());
@@ -647,10 +679,12 @@ impl P2pEndpoint {
         let _pending = PendingCommand::new(&self.shared);
         let mut state = self.shared.lock_state();
         ensure_accepting_commands(&state)?;
-        let connect_id = state.connect_ids.get(&id).copied();
+        let connect_id = state.connect_ids.remove(&id);
         let endpoint = state.endpoint.as_mut().ok_or(FfiError::Stopped)?;
         if let Some(connect_id) = connect_id {
             endpoint.cancel_connect(connect_id);
+            let suppressed = state.carry.suppress_cancelled(&BTreeSet::from([id]));
+            state.stats.dropped = state.stats.dropped.saturating_add(suppressed as u64);
             state.cancelled_connect_ids.insert(id);
         }
         Ok(())
@@ -721,6 +755,36 @@ impl P2pEndpoint {
 }
 
 impl P2pEndpoint {
+    fn spawn_doorbell(
+        &self,
+        doorbell: Arc<dyn EventDoorbell>,
+    ) -> Result<Arc<dyn EventDoorbell>, FfiError> {
+        let (sender, receiver) = sync_channel(1);
+        let shared = Arc::clone(&self.shared);
+        shared.doorbell_running.store(true, Ordering::Release);
+        std::thread::Builder::new()
+            .name("minip2p-doorbell".into())
+            .spawn(move || {
+                shared.lock_state().doorbell_thread_id = Some(std::thread::current().id());
+                while receiver.recv().is_ok() {
+                    while catch_unwind(AssertUnwindSafe(|| doorbell.on_events_ready())).is_err() {
+                        std::thread::yield_now();
+                    }
+                }
+                shared.lock_state().doorbell_thread_id = None;
+                shared.doorbell_running.store(false, Ordering::Release);
+                shared.stopped_cv.notify_all();
+            })
+            .map(drop)
+            .map_err(|error| {
+                self.shared.doorbell_running.store(false, Ordering::Release);
+                FfiError::Internal {
+                    detail: format!("failed to spawn event doorbell: {error}"),
+                }
+            })?;
+        Ok(Arc::new(DoorbellSender(sender)))
+    }
+
     fn start_with(
         &self,
         doorbell: Arc<dyn EventDoorbell>,
@@ -734,16 +798,17 @@ impl P2pEndpoint {
         }
 
         let shared = Arc::clone(&self.shared);
+        state.lifecycle = Lifecycle::Running;
+        self.shared.driver_running.store(true, Ordering::Release);
         spawn(shared, doorbell).map_err(|error| {
             state.lifecycle = Lifecycle::Stopped;
             state.endpoint.take();
+            self.shared.driver_running.store(false, Ordering::Release);
             self.shared.stopped_cv.notify_all();
             FfiError::Internal {
                 detail: format!("failed to spawn endpoint driver: {error}"),
             }
         })?;
-        state.lifecycle = Lifecycle::Running;
-        self.shared.driver_running.store(true, Ordering::Release);
         Ok(())
     }
     /// Returns Rust-side background-driver diagnostics.
@@ -891,46 +956,46 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    struct NoopListener;
+    struct NoopDoorbell;
 
-    impl EventDoorbell for NoopListener {
+    impl EventDoorbell for NoopDoorbell {
         fn on_events_ready(&self) {}
     }
 
     #[derive(Default)]
-    struct RecordingListener {
+    struct RecordingDoorbell {
         rings: AtomicUsize,
     }
 
-    impl EventDoorbell for RecordingListener {
+    impl EventDoorbell for RecordingDoorbell {
         fn on_events_ready(&self) {
             self.rings.fetch_add(1, Ordering::AcqRel);
         }
     }
 
-    struct DropTrackingListener {
+    struct DropTrackingDoorbell {
         callbacks: Arc<AtomicUsize>,
         dropped: Arc<AtomicBool>,
     }
 
-    impl EventDoorbell for DropTrackingListener {
+    impl EventDoorbell for DropTrackingDoorbell {
         fn on_events_ready(&self) {
             self.callbacks.fetch_add(1, Ordering::AcqRel);
         }
     }
 
-    impl Drop for DropTrackingListener {
+    impl Drop for DropTrackingDoorbell {
         fn drop(&mut self) {
             self.dropped.store(true, Ordering::Release);
         }
     }
 
-    struct WaitingListener {
+    struct WaitingDoorbell {
         endpoint: std::sync::Weak<P2pEndpoint>,
         result: Mutex<Option<bool>>,
     }
 
-    impl EventDoorbell for WaitingListener {
+    impl EventDoorbell for WaitingDoorbell {
         fn on_events_ready(&self) {
             let result = self
                 .endpoint
@@ -985,6 +1050,38 @@ mod tests {
             }]
         );
         assert!(endpoint.drain_events(1).is_empty());
+        assert!(endpoint.drain_events(u32::MAX).is_empty());
+    }
+
+    #[test]
+    fn cancellation_suppresses_a_terminal_event_waiting_in_the_carry() {
+        let a = endpoint(config()).expect("endpoint a");
+        let b = endpoint(config()).expect("endpoint b");
+        a.start(Arc::new(NoopDoorbell)).expect("start a");
+        b.start(Arc::new(NoopDoorbell)).expect("start b");
+
+        let connect_id = a
+            .connect_addr(b.listen_addrs()[0].clone())
+            .expect("connect");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while a.path(b.peer_id()).expect("path").is_none() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(a.path(b.peer_id()).expect("path").is_some());
+
+        a.cancel_connect(connect_id).expect("cancel");
+        let events = a.drain_events(4_096);
+        assert!(
+            events
+                .iter()
+                .all(|event| { crate::driver::p2p_connect_id(event) != Some(connect_id) }),
+            "cancelled terminal event was delivered: {events:#?}"
+        );
+
+        a.stop();
+        b.stop();
+        assert!(a.wait_stopped(5_000));
+        assert!(b.wait_stopped(5_000));
     }
 
     fn endpoint(config: EndpointConfig) -> Result<Arc<P2pEndpoint>, FfiError> {
@@ -1312,7 +1409,7 @@ mod tests {
     #[test]
     fn stop_finishes_a_running_driver() {
         let endpoint = endpoint(config()).expect("endpoint");
-        endpoint.start(Arc::new(NoopListener)).expect("start");
+        endpoint.start(Arc::new(NoopDoorbell)).expect("start");
         assert!(endpoint.is_running());
 
         endpoint.stop();
@@ -1325,16 +1422,16 @@ mod tests {
     #[test]
     fn start_rejects_double_start_and_restart_after_stop() {
         let endpoint = endpoint(config()).expect("endpoint");
-        endpoint.start(Arc::new(NoopListener)).expect("start");
+        endpoint.start(Arc::new(NoopDoorbell)).expect("start");
 
         assert!(matches!(
-            endpoint.start(Arc::new(NoopListener)),
+            endpoint.start(Arc::new(NoopDoorbell)),
             Err(FfiError::AlreadyStarted)
         ));
         endpoint.stop();
         assert!(endpoint.wait_stopped(1_000));
         assert!(matches!(
-            endpoint.start(Arc::new(NoopListener)),
+            endpoint.start(Arc::new(NoopDoorbell)),
             Err(FfiError::Stopped)
         ));
     }
@@ -1344,7 +1441,7 @@ mod tests {
         let endpoint = endpoint(config()).expect("endpoint");
 
         let error = endpoint
-            .start_with(Arc::new(NoopListener), |_, _| {
+            .start_with(Arc::new(NoopDoorbell), |_, _| {
                 Err(std::io::Error::other("injected spawn failure"))
             })
             .expect_err("spawn must fail");
@@ -1362,7 +1459,7 @@ mod tests {
         let callbacks = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(AtomicBool::new(false));
         endpoint
-            .start(Arc::new(DropTrackingListener {
+            .start(Arc::new(DropTrackingDoorbell {
                 callbacks: Arc::clone(&callbacks),
                 dropped: Arc::clone(&dropped),
             }))
@@ -1380,7 +1477,7 @@ mod tests {
         let callbacks = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(AtomicBool::new(false));
         endpoint
-            .start(Arc::new(DropTrackingListener {
+            .start(Arc::new(DropTrackingDoorbell {
                 callbacks,
                 dropped: Arc::clone(&dropped),
             }))
@@ -1398,7 +1495,7 @@ mod tests {
     #[test]
     fn concurrent_commands_queries_and_stop_complete() {
         let endpoint = endpoint(config()).expect("endpoint");
-        endpoint.start(Arc::new(NoopListener)).expect("start");
+        endpoint.start(Arc::new(NoopDoorbell)).expect("start");
         let mut workers = Vec::new();
 
         for worker in 0..4 {
@@ -1434,7 +1531,7 @@ mod tests {
     #[test]
     fn fatal_driver_panic_is_reported_before_stopped() {
         let endpoint = endpoint(config()).expect("endpoint");
-        let listener = Arc::new(RecordingListener::default());
+        let listener = Arc::new(RecordingDoorbell::default());
         {
             let mut state = endpoint.shared.lock_state();
             state.lifecycle = Lifecycle::Running;
@@ -1463,7 +1560,7 @@ mod tests {
     #[test]
     fn wait_stopped_from_driver_callback_returns_immediately() {
         let endpoint = endpoint(config()).expect("endpoint");
-        let listener = Arc::new(WaitingListener {
+        let listener = Arc::new(WaitingDoorbell {
             endpoint: Arc::downgrade(&endpoint),
             result: Mutex::new(None),
         });

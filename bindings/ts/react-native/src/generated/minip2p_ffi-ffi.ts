@@ -69,9 +69,9 @@ interface NativeModuleInterface {
     ubrn_ffi_minip2p_ffi_rust_future_free_void(handle: bigint): void;
     ubrn_uniffi_minip2p_ffi_fn_clone_p2pendpoint(ptr: bigint, uniffi_out_err: UniffiRustCallStatus): bigint;
     ubrn_uniffi_minip2p_ffi_fn_free_p2pendpoint(ptr: bigint, uniffi_out_err: UniffiRustCallStatus): void;
-    ubrn_uniffi_minip2p_ffi_fn_clone_p2peventlistener(ptr: bigint, uniffi_out_err: UniffiRustCallStatus): bigint;
-    ubrn_uniffi_minip2p_ffi_fn_free_p2peventlistener(ptr: bigint, uniffi_out_err: UniffiRustCallStatus): void;
-    ubrn_uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventlistener(vtable: UniffiVTableCallbackInterfaceMinip2pFfiP2pEventListener): void;
+    ubrn_uniffi_minip2p_ffi_fn_clone_p2peventdoorbell(ptr: bigint, uniffi_out_err: UniffiRustCallStatus): bigint;
+    ubrn_uniffi_minip2p_ffi_fn_free_p2peventdoorbell(ptr: bigint, uniffi_out_err: UniffiRustCallStatus): void;
+    ubrn_uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventdoorbell(vtable: UniffiVTableCallbackInterfaceMinip2pFfiP2pEventDoorbell): void;
     ubrn_uniffi_minip2p_ffi_fn_func_circuit_address(relayAddr: Uint8Array, peerId: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_minip2p_ffi_fn_func_generate_secret_key(uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_minip2p_ffi_fn_func_peer_id_from_secret_key(secretKey: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
@@ -90,6 +90,7 @@ interface NativeModuleInterface {
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip6(uniffiSelf: bigint, address: Uint8Array, uniffi_out_err: UniffiRustCallStatus): bigint;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_disconnect(uniffiSelf: bigint, peerId: Uint8Array, uniffi_out_err: UniffiRustCallStatus): void;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_discovery_now_ms(uniffiSelf: bigint, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
+    ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_drain_events(uniffiSelf: bigint, limit: number, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_is_peer_ready(uniffiSelf: bigint, peerId: Uint8Array, uniffi_out_err: UniffiRustCallStatus): number;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_is_running(uniffiSelf: bigint, uniffi_out_err: UniffiRustCallStatus): number;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_known_peers(uniffiSelf: bigint, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
@@ -104,12 +105,12 @@ interface NativeModuleInterface {
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_reset_stream(uniffiSelf: bigint, peerId: Uint8Array, streamId: bigint, uniffi_out_err: UniffiRustCallStatus): void;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_send_stream(uniffiSelf: bigint, peerId: Uint8Array, streamId: bigint, data: Uint8Array, uniffi_out_err: UniffiRustCallStatus): void;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_set_active(uniffiSelf: bigint, active: number, uniffi_out_err: UniffiRustCallStatus): void;
-    ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_start(uniffiSelf: bigint, listener: bigint, uniffi_out_err: UniffiRustCallStatus): void;
+    ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_start(uniffiSelf: bigint, doorbell: bigint, uniffi_out_err: UniffiRustCallStatus): void;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_stop(uniffiSelf: bigint, uniffi_out_err: UniffiRustCallStatus): void;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_subscribe(uniffiSelf: bigint, topic: Uint8Array, uniffi_out_err: UniffiRustCallStatus): number;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_unsubscribe(uniffiSelf: bigint, topic: Uint8Array, uniffi_out_err: UniffiRustCallStatus): number;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_wait_stopped(uniffiSelf: bigint, timeoutMs: bigint, uniffi_out_err: UniffiRustCallStatus): number;
-    ubrn_uniffi_minip2p_ffi_fn_method_p2peventlistener_on_event(uniffiSelf: bigint, event: Uint8Array, uniffi_out_err: UniffiRustCallStatus): void;
+    ubrn_uniffi_minip2p_ffi_fn_method_p2peventdoorbell_on_events_ready(uniffiSelf: bigint, uniffi_out_err: UniffiRustCallStatus): void;
     ubrn_ffi_minip2p_ffi_uniffi_contract_version(): number;
     ubrn_uniffi_minip2p_ffi_checksum_func_circuit_address(): number;
     ubrn_uniffi_minip2p_ffi_checksum_func_generate_secret_key(): number;
@@ -129,6 +130,7 @@ interface NativeModuleInterface {
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip6(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_disconnect(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_discovery_now_ms(): number;
+    ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_drain_events(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_is_peer_ready(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_is_running(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_known_peers(): number;
@@ -148,8 +150,8 @@ interface NativeModuleInterface {
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_subscribe(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_unsubscribe(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_wait_stopped(): number;
-    ubrn_uniffi_minip2p_ffi_checksum_method_p2peventlistener_on_event(): number;
-    ubrn_uniffi_internal_fn_method_p2peventlistener_ffi__bless_pointer(pointer: bigint, uniffi_out_err: UniffiRustCallStatus): UniffiGcObject;
+    ubrn_uniffi_minip2p_ffi_checksum_method_p2peventdoorbell_on_events_ready(): number;
+    ubrn_uniffi_internal_fn_method_p2peventdoorbell_ffi__bless_pointer(pointer: bigint, uniffi_out_err: UniffiRustCallStatus): UniffiGcObject;
     ubrn_uniffi_internal_fn_method_p2pendpoint_ffi__bless_pointer(pointer: bigint, uniffi_out_err: UniffiRustCallStatus): UniffiGcObject;
     // Codegen call sites use these via `nativeModule().rustbuffer_alloc(...)`
     // and `nativeModule().rustbuffer_free(...)`. The JSI host object exposes
@@ -169,13 +171,13 @@ export type UniffiForeignFutureDroppedCallbackStruct = {
   handle: bigint;
   free: UniffiForeignFutureDroppedCallback;
 };
-type UniffiCallbackInterfaceMinip2pFfiP2pEventListenerMethod0 = (uniffiHandle: bigint, event: Uint8Array) => UniffiResult<void>;
-type UniffiCallbackInterfaceCloneMinip2pFfiP2pEventListener = (handle: bigint) => UniffiResult<void>;
-type UniffiCallbackInterfaceFreeMinip2pFfiP2pEventListener = (handle: bigint) => void;
-export type UniffiVTableCallbackInterfaceMinip2pFfiP2pEventListener = {
-  uniffi_free: UniffiCallbackInterfaceFreeMinip2pFfiP2pEventListener;
-  uniffi_clone: UniffiCallbackInterfaceCloneMinip2pFfiP2pEventListener;
-  on_event: UniffiCallbackInterfaceMinip2pFfiP2pEventListenerMethod0;
+type UniffiCallbackInterfaceMinip2pFfiP2pEventDoorbellMethod0 = (uniffiHandle: bigint) => UniffiResult<void>;
+type UniffiCallbackInterfaceCloneMinip2pFfiP2pEventDoorbell = (handle: bigint) => UniffiResult<void>;
+type UniffiCallbackInterfaceFreeMinip2pFfiP2pEventDoorbell = (handle: bigint) => void;
+export type UniffiVTableCallbackInterfaceMinip2pFfiP2pEventDoorbell = {
+  uniffi_free: UniffiCallbackInterfaceFreeMinip2pFfiP2pEventDoorbell;
+  uniffi_clone: UniffiCallbackInterfaceCloneMinip2pFfiP2pEventDoorbell;
+  on_events_ready: UniffiCallbackInterfaceMinip2pFfiP2pEventDoorbellMethod0;
 };
 
 // UniffiRustFutureContinuationCallback is generated as part of the component interface's

@@ -33,7 +33,6 @@ const generatedPaths = [
 
 ensureAndroidMdnsPermissions();
 customizeTurboModuleForMdns();
-guardWaitStoppedDuringCallbacks();
 
 for (const relativePath of generatedPaths) {
   normalizePath(path.join(packageRoot, relativePath));
@@ -138,100 +137,6 @@ import android.net.wifi.WifiManager
 - (NSNumber *)cleanupRustCrate {
 `
   );
-}
-
-function guardWaitStoppedDuringCallbacks() {
-  replaceRequired(
-    "cpp/generated/minip2p_ffi.cpp",
-    `namespace react = facebook::react;
-namespace jsi = facebook::jsi;
-`,
-    `namespace react = facebook::react;
-namespace jsi = facebook::jsi;
-
-namespace minip2p_callback_context {
-thread_local unsigned int depth = 0;
-
-class Scope final {
- public:
-  Scope() noexcept {
-    depth += 1;
-  }
-
-  ~Scope() {
-    depth -= 1;
-  }
-
-  Scope(const Scope&) = delete;
-  Scope& operator=(const Scope&) = delete;
-};
-
-bool active() noexcept {
-  return depth != 0;
-}
-} // namespace minip2p_callback_context
-`
-  );
-  replaceRequiredPattern(
-    "cpp/generated/minip2p_ffi.cpp",
-    /(?<statement>auto js_event\s*=\s*uniffi::minip2p_ffi::Bridging<RustBuffer>::toJs\(\s*rt,\s*callInvoker,\s*rs_event\s*\);\r?\n)(?<gap>(?:[ \t]*\r?\n)*)(?<indent>[ \t]*)(?<comment>\/\/ Now we are ready to call the callback\.\r?\n)/u,
-    `$<statement>$<indent>minip2p_callback_context::Scope callbackScope;
-$<gap>$<indent>$<comment>`,
-    "minip2p_callback_context::Scope callbackScope;"
-  );
-  replaceRequiredPattern(
-    "cpp/generated/minip2p_ffi.cpp",
-    /(?<signature>jsi::Value\s+NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_wait_stopped\s*\([^)]*\)\s*\{\r?\n)(?<indent>[ \t]*)(?<status>RustCallStatus status\s*=\s*uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess\(rt\);\r?\n)/u,
-    `$<signature>$<indent>if (minip2p_callback_context::active()) {
-$<indent>    RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
-$<indent>    // clonePointer creates a per-call Arc handle that Rust normally consumes.
-$<indent>    // This early return must release that clone without calling wait_stopped.
-$<indent>    uniffi_minip2p_ffi_fn_free_p2pendpoint(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), &status);
-$<indent>    uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
-$<indent>    return uniffi_jsi::Bridging<int8_t>::toJs(rt, callInvoker, int8_t{0});
-$<indent>}
-$<indent>$<status>`,
-    "if (minip2p_callback_context::active())"
-  );
-}
-
-function replaceRequired(relativePath, needle, replacement) {
-  const target = path.join(packageRoot, relativePath);
-  if (!existsSync(target)) {
-    throw new Error(`Required generated file is missing: ${relativePath}`);
-  }
-  const source = readFileSync(target, "utf-8");
-  if (source.includes(replacement)) {
-    return;
-  }
-  if (!source.includes(needle)) {
-    throw new Error(
-      `Required generated patch no longer matches ${relativePath}; update normalize-generated.mjs for the current generator output`
-    );
-  }
-  writeFileSync(target, source.replace(needle, replacement));
-}
-
-function replaceRequiredPattern(
-  relativePath,
-  pattern,
-  replacement,
-  appliedMarker
-) {
-  const target = path.join(packageRoot, relativePath);
-  if (!existsSync(target)) {
-    throw new Error(`Required generated file is missing: ${relativePath}`);
-  }
-  const source = readFileSync(target, "utf-8");
-  if (source.includes(appliedMarker)) {
-    return;
-  }
-  if (!pattern.test(source)) {
-    throw new Error(
-      `Required generated patch no longer matches ${relativePath}; update normalize-generated.mjs for the current generator output`
-    );
-  }
-  writeFileSync(target, source.replace(pattern, replacement));
 }
 
 function replaceOnce(relativePath, needle, replacement) {

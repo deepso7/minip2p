@@ -22,6 +22,10 @@ class NativeMinip2pFfi : public jsi::HostObject {
     jsi::Value cpp_uniffi_internal_fn_func_ffi__string_to_buffer(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_internal_fn_func_ffi__string_from_buffer(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_internal_fn_func_ffi__read_string_from_buffer(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_minip2p_ffi_fn_clone_p2peventdoorbell(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_minip2p_ffi_fn_free_p2peventdoorbell(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventdoorbell(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2peventdoorbell_on_events_ready(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_clone_p2pendpoint(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_free_p2pendpoint(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_constructor_p2pendpoint_new(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
@@ -39,6 +43,7 @@ class NativeMinip2pFfi : public jsi::HostObject {
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip6(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_disconnect(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_discovery_now_ms(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_drain_events(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_is_peer_ready(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_is_running(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_known_peers(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
@@ -58,16 +63,13 @@ class NativeMinip2pFfi : public jsi::HostObject {
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_subscribe(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_unsubscribe(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_wait_stopped(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
-    jsi::Value cpp_uniffi_minip2p_ffi_fn_clone_p2peventlistener(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
-    jsi::Value cpp_uniffi_minip2p_ffi_fn_free_p2peventlistener(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
-    jsi::Value cpp_uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventlistener(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
-    jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2peventlistener_on_event(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_func_circuit_address(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_func_generate_secret_key(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_func_peer_id_from_secret_key(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_func_circuit_address(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_func_generate_secret_key(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_func_peer_id_from_secret_key(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2peventdoorbell_on_events_ready(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_abandon_stream(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_active_reservation(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_add_protocol(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
@@ -82,6 +84,7 @@ class NativeMinip2pFfi : public jsi::HostObject {
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip6(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_disconnect(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_discovery_now_ms(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_drain_events(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_is_peer_ready(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_is_running(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_known_peers(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
@@ -101,11 +104,10 @@ class NativeMinip2pFfi : public jsi::HostObject {
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_subscribe(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_unsubscribe(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_wait_stopped(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
-    jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2peventlistener_on_event(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_ffi_minip2p_ffi_uniffi_contract_version(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_internal_fn_method_p2peventdoorbell_ffi__bless_pointer(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_internal_fn_method_p2pendpoint_ffi__bless_pointer(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
-    jsi::Value cpp_uniffi_internal_fn_method_p2peventlistener_ffi__bless_pointer(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
 
   public:
     NativeMinip2pFfi(jsi::Runtime &rt, std::shared_ptr<uniffi_runtime::UniffiCallInvoker> callInvoker);
