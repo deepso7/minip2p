@@ -1,13 +1,28 @@
-//! Foreign-facing event model and upstream event conversion.
+//! UniFFI mirrors for endpoint events.
 
-use minip2p::{
-    DiscoveryEvent, DiscoverySource as UpstreamDiscoverySource, Event, IdentifyMessage, Multiaddr,
-    NatError, NatEvent, Path, PubsubEvent, ReachabilityState,
-};
-use minip2p_swarm::SwarmErrorKind;
+use minip2p_ffi_core as core;
+
+/// UniFFI mirror of a peer's Identify snapshot.
+pub type IdentifyInfo = core::IdentifyInfo;
+/// UniFFI mirror of an opened stream identity.
+pub type OpenStreamResult = core::OpenStreamResult;
+/// UniFFI mirror of the local reachability state.
+pub type Reachability = core::Reachability;
+/// UniFFI mirror of a usable connection path.
+pub type PathKind = core::PathKind;
+/// UniFFI mirror of a discovery observation source.
+pub type DiscoverySource = core::DiscoverySource;
+/// UniFFI mirror of an endpoint error category.
+pub type EndpointErrorKind = core::EndpointErrorKind;
+/// UniFFI mirror of a NAT failure category.
+pub type NatErrorKind = core::NatErrorKind;
+/// UniFFI mirror of a driver failure category.
+pub type DriverFailureKind = core::DriverFailureKind;
+/// UniFFI mirror of a flattened endpoint event.
+pub type P2pEvent = core::P2pEvent;
 
 /// Foreign-friendly snapshot of a peer's Identify message.
-#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+#[uniffi::remote(Record)]
 pub struct IdentifyInfo {
     /// Protobuf-encoded libp2p public key, when supplied.
     pub public_key: Option<Vec<u8>>,
@@ -24,7 +39,7 @@ pub struct IdentifyInfo {
 }
 
 /// Full identity allocated for an outbound application stream.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Record)]
+#[uniffi::remote(Record)]
 pub struct OpenStreamResult {
     /// Transport connection carrying the stream.
     pub conn_id: u64,
@@ -33,7 +48,7 @@ pub struct OpenStreamResult {
 }
 
 /// Coarse local reachability state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+#[uniffi::remote(Enum)]
 pub enum Reachability {
     /// Not enough evidence is available.
     Unknown,
@@ -44,7 +59,7 @@ pub enum Reachability {
 }
 
 /// Kind of usable connection path.
-#[derive(Clone, Debug, Eq, PartialEq, uniffi::Enum)]
+#[uniffi::remote(Enum)]
 pub enum PathKind {
     /// A known address was dialed directly.
     DirectDialed,
@@ -58,7 +73,7 @@ pub enum PathKind {
 }
 
 /// Source that contributed a discovery observation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+#[uniffi::remote(Enum)]
 pub enum DiscoverySource {
     /// Public-key-authenticated signed beacon.
     SignedBeacon,
@@ -67,7 +82,7 @@ pub enum DiscoverySource {
 }
 
 /// Category of a non-fatal endpoint runtime error.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+#[uniffi::remote(Enum)]
 pub enum EndpointErrorKind {
     /// Underlying transport operation failed.
     Transport,
@@ -88,7 +103,7 @@ pub enum EndpointErrorKind {
 }
 
 /// Category of a failed NAT connection attempt.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+#[uniffi::remote(Enum)]
 pub enum NatErrorKind {
     /// No usable direct or relayed path exists.
     NoPathAvailable,
@@ -103,7 +118,7 @@ pub enum NatErrorKind {
 }
 
 /// Category of a fatal background-driver failure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+#[uniffi::remote(Enum)]
 pub enum DriverFailureKind {
     /// The transport driver failed.
     Transport,
@@ -116,7 +131,7 @@ pub enum DriverFailureKind {
 }
 
 /// Event delivered by the native endpoint driver.
-#[derive(Clone, Debug, Eq, PartialEq, uniffi::Enum)]
+#[uniffi::remote(Enum)]
 #[allow(clippy::large_enum_variant)]
 pub enum P2pEvent {
     /// Native event carry overflow discarded source events.
@@ -399,531 +414,4 @@ pub enum P2pEvent {
         /// Additional violations folded into this event.
         suppressed: u32,
     },
-}
-
-/// Listener implemented by the embedding runtime.
-#[uniffi::export(with_foreign)]
-pub trait P2pEventListener: Send + Sync {
-    /// Receives one converted native event.
-    fn on_event(&self, event: P2pEvent);
-}
-
-pub(crate) fn convert_swarm(event: Event) -> Option<P2pEvent> {
-    Some(match event {
-        Event::ConnectionEstablished { peer_id, conn_id } => P2pEvent::ConnectionEstablished {
-            peer_id: peer_id.to_base58(),
-            conn_id: conn_id.as_u64(),
-        },
-        Event::ConnectionClosed {
-            peer_id, conn_id, ..
-        } => P2pEvent::ConnectionClosed {
-            peer_id: peer_id.to_base58(),
-            conn_id: conn_id.as_u64(),
-        },
-        Event::IdentifyReceived { peer_id, info } => P2pEvent::IdentifyReceived {
-            peer_id: peer_id.to_base58(),
-            info: convert_identify(&info),
-        },
-        Event::PeerReady { peer_id, protocols } => P2pEvent::PeerReady {
-            peer_id: peer_id.to_base58(),
-            protocols,
-        },
-        Event::PingRttMeasured { peer_id, rtt_ms } => P2pEvent::PingRttMeasured {
-            peer_id: peer_id.to_base58(),
-            rtt_ms,
-        },
-        Event::PingTimeout { peer_id } => P2pEvent::PingTimeout {
-            peer_id: peer_id.to_base58(),
-        },
-        Event::StreamReady {
-            peer_id,
-            conn_id,
-            stream_id,
-            protocol_id,
-            initiated_locally,
-        } => P2pEvent::StreamReady {
-            peer_id: peer_id.to_base58(),
-            conn_id: conn_id.as_u64(),
-            stream_id: stream_id.as_u64(),
-            protocol_id,
-            initiated_locally,
-        },
-        Event::StreamData {
-            peer_id,
-            conn_id,
-            stream_id,
-            data,
-        } => P2pEvent::StreamData {
-            peer_id: peer_id.to_base58(),
-            conn_id: conn_id.as_u64(),
-            stream_id: stream_id.as_u64(),
-            data,
-        },
-        Event::StreamRemoteWriteClosed {
-            peer_id,
-            conn_id,
-            stream_id,
-        } => P2pEvent::StreamRemoteWriteClosed {
-            peer_id: peer_id.to_base58(),
-            conn_id: conn_id.as_u64(),
-            stream_id: stream_id.as_u64(),
-        },
-        Event::StreamClosed {
-            peer_id,
-            conn_id,
-            stream_id,
-        } => P2pEvent::StreamClosed {
-            peer_id: peer_id.to_base58(),
-            conn_id: conn_id.as_u64(),
-            stream_id: stream_id.as_u64(),
-        },
-        Event::Error(error) => P2pEvent::EndpointError {
-            kind: convert_swarm_error_kind(error.kind),
-            peer_id: error.peer_id.map(|peer| peer.to_base58()),
-            conn_id: error.conn_id.map(|id| id.as_u64()),
-            stream_id: error.stream_id.map(|id| id.as_u64()),
-            detail: error.detail,
-        },
-    })
-}
-
-pub(crate) fn convert_identify(info: &IdentifyMessage) -> IdentifyInfo {
-    IdentifyInfo {
-        public_key: info.public_key.clone(),
-        listen_addrs: info
-            .listen_addrs
-            .iter()
-            .filter_map(|address| Multiaddr::from_bytes(address).ok())
-            .map(|address| address.to_string())
-            .collect(),
-        protocols: info.protocols.clone(),
-        observed_addr: info
-            .observed_addr
-            .as_deref()
-            .and_then(|address| Multiaddr::from_bytes(address).ok())
-            .map(|address| address.to_string()),
-        protocol_version: info.protocol_version.clone(),
-        agent_version: info.agent_version.clone(),
-    }
-}
-
-pub(crate) fn convert_nat(event: NatEvent) -> P2pEvent {
-    match event {
-        NatEvent::ReachabilityChanged {
-            old,
-            new,
-            confirmed_addrs,
-        } => P2pEvent::ReachabilityChanged {
-            previous: convert_reachability(old),
-            current: convert_reachability(new),
-            confirmed_addrs: display_addrs(confirmed_addrs),
-        },
-        NatEvent::PublicAddressesChanged { addrs } => P2pEvent::PublicAddressesChanged {
-            addrs: display_addrs(addrs),
-        },
-        NatEvent::RelayReserved {
-            relay,
-            expires_unix_secs,
-            ..
-        } => P2pEvent::RelayReserved {
-            relay_peer_id: relay.to_base58(),
-            expires_unix_secs,
-        },
-        NatEvent::RelayReservationLost { relay } => P2pEvent::RelayReservationLost {
-            relay_peer_id: relay.to_base58(),
-        },
-        NatEvent::PathEstablished {
-            connect_id,
-            peer,
-            path,
-        } => P2pEvent::PathEstablished {
-            connect_id: connect_id.as_u64(),
-            peer_id: peer.to_base58(),
-            path: convert_path(path),
-        },
-        NatEvent::InboundPathEstablished { peer, path } => P2pEvent::InboundPathEstablished {
-            peer_id: peer.to_base58(),
-            path: convert_path(path),
-        },
-        NatEvent::PathUpgraded {
-            connect_id,
-            peer,
-            from,
-            to,
-        } => P2pEvent::PathUpgraded {
-            connect_id: connect_id.as_u64(),
-            peer_id: peer.to_base58(),
-            from: convert_path(from),
-            to: convert_path(to),
-        },
-        NatEvent::HolePunchFailed {
-            connect_id,
-            attempt,
-            reason,
-        } => P2pEvent::HolePunchFailed {
-            connect_id: connect_id.as_u64(),
-            attempt,
-            reason,
-        },
-        NatEvent::FellBackToRelay { connect_id, peer } => P2pEvent::FellBackToRelay {
-            connect_id: connect_id.as_u64(),
-            peer_id: peer.to_base58(),
-        },
-        NatEvent::ConnectFailed {
-            connect_id,
-            peer,
-            error,
-        } => P2pEvent::ConnectFailed {
-            connect_id: connect_id.as_u64(),
-            peer_id: peer.to_base58(),
-            kind: convert_nat_error_kind(&error),
-            detail: error.to_string(),
-        },
-        NatEvent::InboundDirectUpgrade { peer } => P2pEvent::InboundDirectUpgrade {
-            peer_id: peer.to_base58(),
-        },
-    }
-}
-
-pub(crate) fn convert_pubsub(event: PubsubEvent) -> P2pEvent {
-    match event {
-        PubsubEvent::Message {
-            from,
-            topics,
-            data,
-            seqno,
-            signed,
-        } => P2pEvent::Message {
-            from_peer_id: from.to_base58(),
-            topics,
-            data,
-            seqno,
-            signed,
-        },
-        PubsubEvent::PeerSubscribed { peer, topic } => P2pEvent::PeerSubscribed {
-            peer_id: peer.to_base58(),
-            topic,
-        },
-        PubsubEvent::PeerUnsubscribed { peer, topic } => P2pEvent::PeerUnsubscribed {
-            peer_id: peer.to_base58(),
-            topic,
-        },
-        PubsubEvent::OutboundFailure { peer, reason } => P2pEvent::PubsubOutboundFailure {
-            peer_id: peer.to_base58(),
-            reason,
-        },
-        PubsubEvent::ProtocolViolation { peer, reason } => P2pEvent::PubsubProtocolViolation {
-            peer_id: peer.to_base58(),
-            reason,
-        },
-    }
-}
-
-pub(crate) fn convert_discovery(event: DiscoveryEvent) -> P2pEvent {
-    match event {
-        DiscoveryEvent::PeerDiscovered {
-            peer,
-            addrs,
-            source,
-        } => P2pEvent::PeerDiscovered {
-            peer_id: peer.to_base58(),
-            addrs: display_addrs(addrs),
-            source: convert_discovery_source(source),
-        },
-        DiscoveryEvent::PeerUpdated {
-            peer,
-            addrs,
-            source,
-        } => P2pEvent::PeerUpdated {
-            peer_id: peer.to_base58(),
-            addrs: display_addrs(addrs),
-            source: convert_discovery_source(source),
-        },
-        DiscoveryEvent::PeerExpired { peer } => P2pEvent::PeerExpired {
-            peer_id: peer.to_base58(),
-        },
-        DiscoveryEvent::DialFailed { peer, reason } => P2pEvent::DiscoveryDialFailed {
-            peer_id: peer.to_base58(),
-            reason,
-        },
-        DiscoveryEvent::ProtocolViolation {
-            peer,
-            source,
-            reason,
-            suppressed,
-        } => P2pEvent::DiscoveryProtocolViolation {
-            peer_id: peer.map(|peer| peer.to_base58()),
-            source: convert_discovery_source(source),
-            reason,
-            suppressed,
-        },
-    }
-}
-
-pub(crate) fn convert_reachability(state: ReachabilityState) -> Reachability {
-    match state {
-        ReachabilityState::Unknown => Reachability::Unknown,
-        ReachabilityState::Public => Reachability::Public,
-        ReachabilityState::Private => Reachability::Private,
-    }
-}
-
-pub(crate) fn convert_path(path: Path) -> PathKind {
-    match path {
-        Path::DirectDialed => PathKind::DirectDialed,
-        Path::DirectPunched => PathKind::DirectPunched,
-        Path::Relayed { relay } => PathKind::Relayed {
-            relay_peer_id: relay.to_base58(),
-        },
-    }
-}
-
-fn convert_discovery_source(source: UpstreamDiscoverySource) -> DiscoverySource {
-    match source {
-        UpstreamDiscoverySource::SignedBeacon => DiscoverySource::SignedBeacon,
-        UpstreamDiscoverySource::Mdns => DiscoverySource::Mdns,
-    }
-}
-
-fn convert_swarm_error_kind(kind: SwarmErrorKind) -> EndpointErrorKind {
-    match kind {
-        SwarmErrorKind::Transport => EndpointErrorKind::Transport,
-        SwarmErrorKind::Multistream => EndpointErrorKind::Multistream,
-        SwarmErrorKind::Identify => EndpointErrorKind::Identify,
-        SwarmErrorKind::Ping => EndpointErrorKind::Ping,
-        SwarmErrorKind::IdentifyStreamRejected => EndpointErrorKind::IdentifyStreamRejected,
-        SwarmErrorKind::OpenStreamFailed => EndpointErrorKind::OpenStreamFailed,
-        SwarmErrorKind::UnsupportedProtocol => EndpointErrorKind::UnsupportedProtocol,
-        SwarmErrorKind::Driver => EndpointErrorKind::Driver,
-    }
-}
-
-fn convert_nat_error_kind(error: &NatError) -> NatErrorKind {
-    match error {
-        NatError::NoPathAvailable => NatErrorKind::NoPathAvailable,
-        NatError::Timeout => NatErrorKind::Timeout,
-        NatError::DialFailed(_) => NatErrorKind::DialFailed,
-        NatError::Protocol(_) => NatErrorKind::Protocol,
-        NatError::RelayRefused(_) => NatErrorKind::RelayRefused,
-    }
-}
-
-fn display_addrs(addrs: Vec<minip2p::Multiaddr>) -> Vec<String> {
-    addrs
-        .into_iter()
-        .map(|address| address.to_string())
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use minip2p::{ConnectionId, Ed25519Keypair, PeerId, StreamId};
-    use std::str::FromStr;
-
-    fn peer(seed: u8) -> PeerId {
-        Ed25519Keypair::from_secret_key_bytes([seed; 32]).peer_id()
-    }
-
-    #[test]
-    fn swarm_connection_conversion_preserves_ids() {
-        let remote = peer(3);
-
-        assert_eq!(
-            convert_swarm(Event::ConnectionEstablished {
-                peer_id: remote.clone(),
-                conn_id: ConnectionId::new(17),
-            }),
-            Some(P2pEvent::ConnectionEstablished {
-                peer_id: remote.to_base58(),
-                conn_id: 17,
-            })
-        );
-    }
-
-    #[test]
-    fn identify_and_stream_events_are_exported() {
-        let remote = peer(4);
-        let address =
-            minip2p::Multiaddr::from_str("/ip4/127.0.0.1/udp/7/quic-v1").expect("address");
-        assert_eq!(
-            convert_swarm(Event::IdentifyReceived {
-                peer_id: remote.clone(),
-                info: minip2p::IdentifyMessage {
-                    listen_addrs: vec![address.to_bytes()],
-                    protocols: vec!["/example/1".into()],
-                    ..minip2p::IdentifyMessage::default()
-                },
-            }),
-            Some(P2pEvent::IdentifyReceived {
-                peer_id: remote.to_base58(),
-                info: IdentifyInfo {
-                    public_key: None,
-                    listen_addrs: vec![address.to_string()],
-                    protocols: vec!["/example/1".into()],
-                    observed_addr: None,
-                    protocol_version: None,
-                    agent_version: None,
-                },
-            })
-        );
-        assert_eq!(
-            convert_swarm(Event::StreamData {
-                peer_id: remote.clone(),
-                conn_id: ConnectionId::new(8),
-                stream_id: StreamId::new(12),
-                data: vec![1, 2, 3],
-            }),
-            Some(P2pEvent::StreamData {
-                peer_id: remote.to_base58(),
-                conn_id: 8,
-                stream_id: 12,
-                data: vec![1, 2, 3],
-            })
-        );
-    }
-
-    #[test]
-    fn endpoint_error_conversion_preserves_stream_identity() {
-        let remote = peer(9);
-        assert_eq!(
-            convert_swarm(Event::Error(minip2p_swarm::SwarmRuntimeError {
-                kind: SwarmErrorKind::UnsupportedProtocol,
-                peer_id: Some(remote.clone()),
-                conn_id: Some(ConnectionId::new(23)),
-                stream_id: Some(StreamId::new(42)),
-                detail: "unsupported protocol".into(),
-            })),
-            Some(P2pEvent::EndpointError {
-                kind: EndpointErrorKind::UnsupportedProtocol,
-                peer_id: Some(remote.to_base58()),
-                conn_id: Some(23),
-                stream_id: Some(42),
-                detail: "unsupported protocol".into(),
-            })
-        );
-    }
-
-    #[test]
-    fn pubsub_message_conversion_preserves_binary_fields() {
-        let remote = peer(5);
-        let event = convert_pubsub(PubsubEvent::Message {
-            from: remote.clone(),
-            topics: vec!["room".into()],
-            data: vec![1, 2],
-            seqno: vec![3, 4],
-            signed: true,
-        });
-
-        assert_eq!(
-            event,
-            P2pEvent::Message {
-                from_peer_id: remote.to_base58(),
-                topics: vec!["room".into()],
-                data: vec![1, 2],
-                seqno: vec![3, 4],
-                signed: true,
-            }
-        );
-    }
-
-    #[test]
-    fn discovery_conversion_preserves_source_and_addresses() {
-        let remote = peer(6);
-        let address =
-            minip2p::Multiaddr::from_str("/ip4/127.0.0.1/udp/7/quic-v1").expect("address");
-
-        assert_eq!(
-            convert_discovery(DiscoveryEvent::PeerDiscovered {
-                peer: remote.clone(),
-                addrs: vec![address.clone()],
-                source: UpstreamDiscoverySource::SignedBeacon,
-            }),
-            P2pEvent::PeerDiscovered {
-                peer_id: remote.to_base58(),
-                addrs: vec![address.to_string()],
-                source: DiscoverySource::SignedBeacon,
-            }
-        );
-    }
-
-    #[test]
-    fn nat_error_categories_are_exhaustively_converted() {
-        for (error, expected) in [
-            (NatError::NoPathAvailable, NatErrorKind::NoPathAvailable),
-            (NatError::Timeout, NatErrorKind::Timeout),
-            (
-                NatError::DialFailed("dial".into()),
-                NatErrorKind::DialFailed,
-            ),
-            (
-                NatError::Protocol("protocol".into()),
-                NatErrorKind::Protocol,
-            ),
-            (
-                NatError::RelayRefused("relay".into()),
-                NatErrorKind::RelayRefused,
-            ),
-        ] {
-            assert_eq!(convert_nat_error_kind(&error), expected);
-        }
-    }
-
-    #[test]
-    fn inbound_path_conversion_preserves_relay_provenance() {
-        let remote = peer(10);
-        let relay = peer(11);
-
-        assert_eq!(
-            convert_nat(NatEvent::InboundPathEstablished {
-                peer: remote.clone(),
-                path: Path::Relayed {
-                    relay: relay.clone(),
-                },
-            }),
-            P2pEvent::InboundPathEstablished {
-                peer_id: remote.to_base58(),
-                path: PathKind::Relayed {
-                    relay_peer_id: relay.to_base58(),
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn discovery_terminal_and_failure_events_preserve_fields() {
-        let remote = peer(8);
-        assert_eq!(
-            convert_discovery(DiscoveryEvent::PeerExpired {
-                peer: remote.clone()
-            }),
-            P2pEvent::PeerExpired {
-                peer_id: remote.to_base58()
-            }
-        );
-        assert_eq!(
-            convert_discovery(DiscoveryEvent::DialFailed {
-                peer: remote.clone(),
-                reason: "offline".into(),
-            }),
-            P2pEvent::DiscoveryDialFailed {
-                peer_id: remote.to_base58(),
-                reason: "offline".into(),
-            }
-        );
-        assert_eq!(
-            convert_discovery(DiscoveryEvent::ProtocolViolation {
-                peer: Some(remote.clone()),
-                source: UpstreamDiscoverySource::Mdns,
-                reason: "bad claim".into(),
-                suppressed: 3,
-            }),
-            P2pEvent::DiscoveryProtocolViolation {
-                peer_id: Some(remote.to_base58()),
-                source: DiscoverySource::Mdns,
-                reason: "bad claim".into(),
-                suppressed: 3,
-            }
-        );
-    }
 }

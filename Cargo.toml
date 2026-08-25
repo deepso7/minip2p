@@ -8,6 +8,7 @@ members = [
     "crates/dcutr",
     "crates/discovery",
     "crates/ffi",
+    "crates/ffi-core",
     "crates/identify",
     "crates/identity",
     "crates/mdns",

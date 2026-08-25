@@ -4,17 +4,41 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use minip2p_ffi::{EndpointConfig, FfiError, P2pEndpoint, P2pEvent, P2pEventListener, PathKind};
+use minip2p_ffi::{EndpointConfig, FfiError, P2pEndpoint, P2pEvent, P2pEventDoorbell, PathKind};
 
 static LOOPBACK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-#[derive(Default)]
 struct EventLog {
+    endpoint: Arc<P2pEndpoint>,
     events: Mutex<Vec<P2pEvent>>,
     changed: Condvar,
 }
 
 impl EventLog {
+    fn new(endpoint: Arc<P2pEndpoint>) -> Self {
+        Self {
+            endpoint,
+            events: Mutex::new(Vec::new()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn drain(&self) -> Vec<P2pEvent> {
+        let mut drained = Vec::new();
+        loop {
+            let batch = self.endpoint.drain_events(512);
+            if batch.is_empty() {
+                break;
+            }
+            drained.extend(batch);
+        }
+        self.events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(drained.iter().cloned());
+        self.changed.notify_all();
+        drained
+    }
     fn wait_for(
         &self,
         timeout: Duration,
@@ -76,13 +100,9 @@ impl EventLog {
     }
 }
 
-impl P2pEventListener for EventLog {
-    fn on_event(&self, event: P2pEvent) {
-        self.events
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(event);
-        self.changed.notify_all();
+impl P2pEventDoorbell for EventLog {
+    fn on_events_ready(&self) {
+        self.drain();
     }
 }
 
@@ -122,9 +142,14 @@ struct BlockingListener {
     gate: Arc<CallbackGate>,
 }
 
-impl P2pEventListener for BlockingListener {
-    fn on_event(&self, event: P2pEvent) {
-        if matches!(event, P2pEvent::Message { .. }) {
+impl P2pEventDoorbell for BlockingListener {
+    fn on_events_ready(&self) {
+        if self
+            .log
+            .drain()
+            .iter()
+            .any(|event| matches!(event, P2pEvent::Message { .. }))
+        {
             let mut state = self
                 .gate
                 .state
@@ -140,26 +165,33 @@ impl P2pEventListener for BlockingListener {
                     .unwrap_or_else(PoisonError::into_inner);
             }
         }
-        self.log.on_event(event);
     }
 }
 
-impl P2pEventListener for SlowListener {
-    fn on_event(&self, event: P2pEvent) {
-        if matches!(event, P2pEvent::Message { .. }) {
+impl P2pEventDoorbell for SlowListener {
+    fn on_events_ready(&self) {
+        if self
+            .log
+            .drain()
+            .iter()
+            .any(|event| matches!(event, P2pEvent::Message { .. }))
+        {
             std::thread::sleep(Duration::from_millis(1));
         }
-        self.log.on_event(event);
     }
 }
 
-impl P2pEventListener for PanicOnceListener {
-    fn on_event(&self, event: P2pEvent) {
-        if matches!(event, P2pEvent::Message { .. }) && !self.panicked.swap(true, Ordering::AcqRel)
+impl P2pEventDoorbell for PanicOnceListener {
+    fn on_events_ready(&self) {
+        if self
+            .log
+            .drain()
+            .iter()
+            .any(|event| matches!(event, P2pEvent::Message { .. }))
+            && !self.panicked.swap(true, Ordering::AcqRel)
         {
-            panic!("injected listener panic");
+            panic!("injected doorbell panic");
         }
-        self.log.on_event(event);
     }
 }
 
@@ -212,7 +244,7 @@ fn a_tcp_listen_address_binds_tcp_and_is_dialed_over_it() -> Result<(), FfiError
     let _serial = LOOPBACK_TEST_LOCK
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    // A foreign runtime that hands over a `/tcp` listener gets TCP. Parsing
+    // A foreign runtime that hands over a `/tcp` listen address gets TCP. Parsing
     // `/tcp` peers to dial while binding only QUIC would leave a device that
     // has only TCP able to call out and never be called -- and the address it
     // reported would name a socket it does not have.
@@ -228,11 +260,11 @@ fn a_tcp_listen_address_binds_tcp_and_is_dialed_over_it() -> Result<(), FfiError
         );
     }
 
-    let a_log = Arc::new(EventLog::default());
-    let b_log = Arc::new(EventLog::default());
+    let a_log = Arc::new(EventLog::new(Arc::clone(&a)));
+    let b_log = Arc::new(EventLog::new(Arc::clone(&b)));
     let b_peer = b.peer_id();
-    a.start(Arc::clone(&a_log) as Arc<dyn P2pEventListener>)?;
-    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventListener>)?;
+    a.start(Arc::clone(&a_log) as Arc<dyn P2pEventDoorbell>)?;
+    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventDoorbell>)?;
 
     let connect_id = a.connect_addr(b.listen_addrs()[0].clone())?;
     assert!(
@@ -270,13 +302,13 @@ fn two_endpoints_chat_over_loopback() -> Result<(), FfiError> {
         .unwrap_or_else(PoisonError::into_inner);
     let a = endpoint(21);
     let b = endpoint(22);
-    let a_log = Arc::new(EventLog::default());
-    let b_log = Arc::new(EventLog::default());
+    let a_log = Arc::new(EventLog::new(Arc::clone(&a)));
+    let b_log = Arc::new(EventLog::new(Arc::clone(&b)));
     let a_peer = a.peer_id();
     let b_peer = b.peer_id();
 
-    a.start(Arc::clone(&a_log) as Arc<dyn P2pEventListener>)?;
-    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventListener>)?;
+    a.start(Arc::clone(&a_log) as Arc<dyn P2pEventDoorbell>)?;
+    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventDoorbell>)?;
     a.subscribe("room".into())?;
     b.subscribe("room".into())?;
 
@@ -374,15 +406,15 @@ fn identify_ping_and_custom_streams_cross_the_ffi_boundary() -> Result<(), FfiEr
         .unwrap_or_else(PoisonError::into_inner);
     let a = endpoint(23);
     let b = endpoint(24);
-    let a_log = Arc::new(EventLog::default());
-    let b_log = Arc::new(EventLog::default());
+    let a_log = Arc::new(EventLog::new(Arc::clone(&a)));
+    let b_log = Arc::new(EventLog::new(Arc::clone(&b)));
     let protocol = "/minip2p/ffi-test/1";
     let b_peer = b.peer_id();
 
     a.add_protocol(protocol.into())?;
     b.add_protocol(protocol.into())?;
-    a.start(Arc::clone(&a_log) as Arc<dyn P2pEventListener>)?;
-    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventListener>)?;
+    a.start(Arc::clone(&a_log) as Arc<dyn P2pEventDoorbell>)?;
+    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventDoorbell>)?;
     a.connect_with_addrs(b_peer.clone(), vec![b.listen_addrs()[0].clone()])?;
 
     assert!(
@@ -457,22 +489,22 @@ fn identify_ping_and_custom_streams_cross_the_ffi_boundary() -> Result<(), FfiEr
 }
 
 #[test]
-fn panicking_listener_does_not_kill_driver() -> Result<(), FfiError> {
+fn panicking_doorbell_does_not_kill_driver() -> Result<(), FfiError> {
     let _serial = LOOPBACK_TEST_LOCK
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let a = endpoint(23);
     let b = endpoint(24);
-    let a_log = Arc::new(EventLog::default());
-    let b_log = Arc::new(EventLog::default());
+    let a_log = Arc::new(EventLog::new(Arc::clone(&a)));
+    let b_log = Arc::new(EventLog::new(Arc::clone(&b)));
     let listener = Arc::new(PanicOnceListener {
         log: Arc::clone(&a_log),
         panicked: AtomicBool::new(false),
     });
     let a_peer = a.peer_id();
 
-    a.start(Arc::clone(&listener) as Arc<dyn P2pEventListener>)?;
-    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventListener>)?;
+    a.start(Arc::clone(&listener) as Arc<dyn P2pEventDoorbell>)?;
+    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventDoorbell>)?;
     a.subscribe("panic-room".into())?;
     b.subscribe("panic-room".into())?;
     a.connect_addr(b.listen_addrs()[0].clone())?;
@@ -510,14 +542,14 @@ fn panicking_listener_does_not_kill_driver() -> Result<(), FfiError> {
 }
 
 #[test]
-fn query_completes_while_listener_callback_is_in_flight() -> Result<(), FfiError> {
+fn query_completes_while_doorbell_callback_is_in_flight() -> Result<(), FfiError> {
     let _serial = LOOPBACK_TEST_LOCK
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let a = endpoint(27);
     let b = endpoint(28);
-    let a_log = Arc::new(EventLog::default());
-    let b_log = Arc::new(EventLog::default());
+    let a_log = Arc::new(EventLog::new(Arc::clone(&a)));
+    let b_log = Arc::new(EventLog::new(Arc::clone(&b)));
     let gate = Arc::new(CallbackGate::default());
     let a_peer = a.peer_id();
 
@@ -525,7 +557,7 @@ fn query_completes_while_listener_callback_is_in_flight() -> Result<(), FfiError
         log: a_log,
         gate: Arc::clone(&gate),
     }))?;
-    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventListener>)?;
+    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventDoorbell>)?;
     a.subscribe("handoff-room".into())?;
     b.subscribe("handoff-room".into())?;
     a.connect_addr(b.listen_addrs()[0].clone())?;
@@ -542,7 +574,7 @@ fn query_completes_while_listener_callback_is_in_flight() -> Result<(), FfiError
     b.publish("handoff-room".into(), b"block callback".to_vec())?;
     assert!(
         gate.wait_until_entered(Duration::from_secs(5)),
-        "listener callback did not start"
+        "doorbell callback did not start"
     );
 
     let query_endpoint = Arc::clone(&a);
@@ -554,7 +586,7 @@ fn query_completes_while_listener_callback_is_in_flight() -> Result<(), FfiError
     let query_completed = received.recv_timeout(Duration::from_secs(1));
     gate.release();
     query.join().expect("query worker");
-    assert!(query_completed.expect("query blocked behind listener callback"));
+    assert!(query_completed.expect("query blocked behind doorbell callback"));
 
     stop(&a);
     stop(&b);
@@ -570,13 +602,13 @@ fn bounded_load_preserves_order_and_accounting() -> Result<(), FfiError> {
         .unwrap_or_else(PoisonError::into_inner);
     let a = endpoint(25);
     let b = endpoint(26);
-    let a_log = Arc::new(EventLog::default());
-    let b_log = Arc::new(EventLog::default());
+    let a_log = Arc::new(EventLog::new(Arc::clone(&a)));
+    let b_log = Arc::new(EventLog::new(Arc::clone(&b)));
     let a_peer = a.peer_id();
     a.start(Arc::new(SlowListener {
         log: Arc::clone(&a_log),
     }))?;
-    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventListener>)?;
+    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventDoorbell>)?;
     a.set_active(true);
     a.subscribe("load-room".into())?;
     b.subscribe("load-room".into())?;

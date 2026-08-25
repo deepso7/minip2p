@@ -3,7 +3,7 @@
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use minip2p_ffi::{EndpointConfig, P2pEndpoint, P2pEvent, P2pEventListener, PathKind};
+use minip2p_ffi::{EndpointConfig, P2pEndpoint, P2pEvent, P2pEventDoorbell, PathKind};
 
 #[path = "../../../tests/support/relay.rs"]
 mod relay_support;
@@ -12,13 +12,20 @@ const TOPIC: &str = "ffi-relayed-room";
 const TIMEOUT: Duration = Duration::from_secs(15);
 const RELAY_LOSS_TIMEOUT: Duration = Duration::from_secs(75);
 
-#[derive(Default)]
 struct EventLog {
+    endpoint: Arc<P2pEndpoint>,
     events: Mutex<Vec<P2pEvent>>,
     changed: Condvar,
 }
 
 impl EventLog {
+    fn new(endpoint: Arc<P2pEndpoint>) -> Self {
+        Self {
+            endpoint,
+            events: Mutex::new(Vec::new()),
+            changed: Condvar::new(),
+        }
+    }
     fn wait_for(&self, predicate: impl Fn(&P2pEvent) -> bool) -> P2pEvent {
         self.wait_for_with_timeout(TIMEOUT, predicate)
     }
@@ -52,12 +59,18 @@ impl EventLog {
     }
 }
 
-impl P2pEventListener for EventLog {
-    fn on_event(&self, event: P2pEvent) {
-        self.events
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(event);
+impl P2pEventDoorbell for EventLog {
+    fn on_events_ready(&self) {
+        loop {
+            let batch = self.endpoint.drain_events(512);
+            if batch.is_empty() {
+                break;
+            }
+            self.events
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(batch);
+        }
         self.changed.notify_all();
     }
 }
@@ -96,14 +109,14 @@ fn relayed_chat_and_reservation_loss() {
     let relay_peer = relay.addr().peer_id().to_base58();
     let a = endpoint(31, relay_addr.clone());
     let b = endpoint(32, relay_addr.clone());
-    let a_log = Arc::new(EventLog::default());
-    let b_log = Arc::new(EventLog::default());
+    let a_log = Arc::new(EventLog::new(Arc::clone(&a)));
+    let b_log = Arc::new(EventLog::new(Arc::clone(&b)));
     let a_peer = a.peer_id();
     let b_peer = b.peer_id();
 
-    a.start(Arc::clone(&a_log) as Arc<dyn P2pEventListener>)
+    a.start(Arc::clone(&a_log) as Arc<dyn P2pEventDoorbell>)
         .expect("start initiator");
-    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventListener>)
+    b.start(Arc::clone(&b_log) as Arc<dyn P2pEventDoorbell>)
         .expect("start responder");
 
     let reserved = b_log.wait_for(|event| {

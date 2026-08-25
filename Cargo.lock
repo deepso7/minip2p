@@ -1109,6 +1109,18 @@ dependencies = [
 name = "minip2p-ffi"
 version = "0.4.6"
 dependencies = [
+ "minip2p-ffi-core",
+ "minip2p-relay",
+ "minip2p-rs",
+ "minip2p-test-support",
+ "serde_json",
+ "uniffi",
+]
+
+[[package]]
+name = "minip2p-ffi-core"
+version = "0.4.6"
+dependencies = [
  "minip2p-pubsub",
  "minip2p-relay",
  "minip2p-rs",
@@ -1116,7 +1128,6 @@ dependencies = [
  "minip2p-test-support",
  "serde_json",
  "thiserror",
- "uniffi",
 ]
 
 [[package]]
