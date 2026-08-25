@@ -21,9 +21,6 @@ catalogs:
     typescript:
       specifier: 7.0.2
       version: 7.0.2
-    ultracite:
-      specifier: 7.10.6
-      version: 7.10.6
 
 patchedDependencies:
   uniffi-bindgen-react-native@0.31.0-5: 3d3826cb29db1530c60a1092dde51421bfa266d3c2add5512d462f7c0adac050
@@ -45,7 +42,7 @@ importers:
         specifier: 'catalog:'
         version: 7.0.2
       ultracite:
-        specifier: 'catalog:'
+        specifier: 7.10.6
         version: 7.10.6(oxfmt@0.65.0)(oxlint@1.80.0)
       vitest:
         specifier: 4.1.11
@@ -121,9 +118,6 @@ importers:
       typescript:
         specifier: 'catalog:'
         version: 7.0.2
-      ultracite:
-        specifier: 'catalog:'
-        version: 7.10.6(oxfmt@0.65.0)(oxlint@1.80.0)
 
   react-native/example:
     dependencies:

@@ -75,9 +75,7 @@
     "test": "vitest run --config ../vitest.config.ts --root .",
     "test:built": "vitest run --config vitest.built.config.ts --root .",
     "test:watch": "vitest --config ../vitest.config.ts --root .",
-    "typecheck": "tsc",
-    "lint": "ultracite check",
-    "format": "ultracite fix"
+    "typecheck": "tsc"
   },
   "dependencies": {
     "@minip2p/core": "workspace:*",
@@ -94,8 +92,7 @@
     "react": "catalog:",
     "react-native": "catalog:",
     "react-native-builder-bob": "0.43.0",
-    "typescript": "catalog:",
-    "ultracite": "catalog:"
+    "typescript": "catalog:"
   },
   "peerDependencies": {
     "react": "*",
