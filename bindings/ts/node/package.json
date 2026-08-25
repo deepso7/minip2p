@@ -26,12 +26,15 @@
   "scripts": {
     "build": "del-cli dist && tsc -p tsconfig.build.json",
     "clean": "del-cli dist",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
     "@minip2p/core": "workspace:*"
   },
   "devDependencies": {
+    "@minip2p/test-fixtures": "workspace:*",
     "del-cli": "^7.0.0",
     "typescript": "^6.0.3"
   }

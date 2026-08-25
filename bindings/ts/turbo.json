@@ -48,7 +48,12 @@
       "cache": false
     },
     "test": {
-      "inputs": ["$TURBO_DEFAULT$", "tests/**"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "src/**",
+        "tests/**",
+        "$TURBO_ROOT$/test-fixtures/**"
+      ],
       "outputs": []
     },
     "typecheck": {

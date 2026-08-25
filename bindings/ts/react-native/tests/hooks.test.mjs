@@ -1,14 +1,14 @@
 /* oxlint-disable class-methods-use-this, no-empty-function, node/callback-return, promise/prefer-await-to-callbacks, unicorn/no-useless-spread -- Lifecycle fakes deliberately model callback registration and inert cleanup. */
 
 import assert from "node:assert/strict";
-import test from "node:test";
 
 import { ClosedError } from "@minip2p/core";
+import { test } from "vitest";
 
 import {
   bindAppStateSource,
   mountEndpointLifecycle,
-} from "../lib/module/hook-lifecycle.js";
+} from "../src/hook-lifecycle.ts";
 
 class FakeEndpoint {
   closeHandlers = new Set();

@@ -3,6 +3,10 @@ packages:
   - node
   - react-native
   - react-native/example
+  - test-fixtures
+
+allowBuilds:
+  esbuild: true
 
 minimumReleaseAgeExclude:
   - "@expo/cli@56.1.22"
@@ -11,9 +15,6 @@ minimumReleaseAgeExclude:
   - expo@56.0.18
 
 nodeLinker: hoisted
-
-onlyBuiltDependencies:
-  - esbuild
 
 patchedDependencies:
   uniffi-bindgen-react-native@0.31.0-3: react-native/patches/uniffi-bindgen-react-native@0.31.0-3.patch

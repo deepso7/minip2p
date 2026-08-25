@@ -1,9 +1,11 @@
 /* oxlint-disable class-methods-use-this, func-style, max-classes-per-file, no-await-expression-member, no-await-in-loop, no-empty-function, no-plusplus, promise/prefer-await-to-then, require-await -- Contract-complete fake backend methods and Promise race probes are intentionally direct. */
 
 import assert from "node:assert/strict";
-import test from "node:test";
 
-import { P2pEvent_Tags, PathKind_Tags } from "../dist/backend.js";
+import { MockBackend } from "@minip2p/test-fixtures";
+import { test } from "vitest";
+
+import { P2pEvent_Tags, PathKind_Tags } from "../src/backend.ts";
 import {
   AbortError,
   ClosedError,
@@ -20,147 +22,7 @@ import {
   Stream,
   StreamClosedError,
   TimeoutError,
-} from "../dist/index.js";
-
-class MockBackend {
-  listener;
-  closed = false;
-  connected = [];
-  pingCalls = 0;
-  nextConnectId = 1;
-  nextStreamId = 3;
-  openResults = [];
-  abandonError;
-  operations = [];
-
-  start(listener) {
-    this.listener = listener;
-  }
-
-  emit(event) {
-    this.listener(event);
-  }
-
-  close() {
-    this.closed = true;
-  }
-
-  peerId() {
-    return "local-peer";
-  }
-
-  listenAddrs() {
-    return ["/ip4/127.0.0.1/udp/1/quic-v1/p2p/local-peer"];
-  }
-
-  connectedPeers() {
-    return [...this.connected];
-  }
-
-  isPeerReady() {
-    return false;
-  }
-
-  peerInfo() {}
-
-  knownPeers() {
-    return [];
-  }
-
-  discoveryNowMs() {}
-
-  activeReservation() {}
-
-  path() {}
-
-  circuitAddress(relayAddress, peerId) {
-    return `${relayAddress}/p2p-circuit/p2p/${peerId}`;
-  }
-
-  reachability() {
-    return 0;
-  }
-
-  isRunning() {
-    return !this.closed;
-  }
-
-  setActive() {}
-
-  subscribe() {
-    return true;
-  }
-
-  unsubscribe() {
-    return true;
-  }
-
-  publish() {}
-
-  ping() {
-    this.pingCalls += 1;
-  }
-
-  addProtocol() {}
-
-  openStream() {
-    return (
-      this.openResults.shift() ?? {
-        connId: 2,
-        streamId: this.nextStreamId++,
-      }
-    );
-  }
-
-  sendStream(peerId, streamId, data) {
-    this.operations.push(["write", peerId, streamId, [...data]]);
-  }
-
-  closeStreamWrite(peerId, streamId) {
-    this.operations.push(["closeWrite", peerId, streamId]);
-  }
-
-  resetStream(peerId, streamId) {
-    this.operations.push(["reset", peerId, streamId]);
-  }
-
-  abandonStream(peerId, streamId) {
-    this.operations.push(["abandon", peerId, streamId]);
-    if (this.abandonError !== undefined) {
-      throw this.abandonError;
-    }
-  }
-
-  connect() {
-    return this.nextConnectId++;
-  }
-
-  connectWithAddrs() {
-    return this.nextConnectId++;
-  }
-
-  connectAddr() {
-    return this.nextConnectId++;
-  }
-
-  dial() {
-    return [10];
-  }
-
-  dialIp4() {
-    return 11;
-  }
-
-  dialIp6() {
-    return 12;
-  }
-
-  cancelConnect(id) {
-    this.operations.push(["cancelConnect", id]);
-  }
-
-  disconnect() {}
-}
+} from "../src/index.ts";
 
 class TestMinip2p extends Minip2pBase {
   constructor(backend) {
