@@ -4,10 +4,10 @@ import { test } from "vitest";
 import {
   bindAppStateSource,
   mountEndpointLifecycle,
-} from "../src/hook-lifecycle.ts";
+} from "../lib/module/hook-lifecycle.js";
 import { verifyHookLifecycle } from "./hook-lifecycle.contract.mjs";
 
-test("source hook lifecycle satisfies its contract", () => {
+test("built hook lifecycle satisfies its contract", () => {
   verifyHookLifecycle({
     ClosedError,
     bindAppStateSource,

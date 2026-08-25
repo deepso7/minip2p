@@ -375,6 +375,7 @@ jobs:
       - run: pnpm test
       - run: pnpm lint
       - run: pnpm build
+      - run: pnpm --filter @minip2p/react-native test:built
       - run: pnpm rn:generate
       - name: Generated files are current
         run: test -z "$(git status --porcelain)"

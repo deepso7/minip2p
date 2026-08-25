@@ -73,6 +73,7 @@
     "build": "bob build && node scripts/normalize-generated.mjs",
     "prepack": "pnpm build && node scripts/check-package-native.mjs",
     "test": "vitest run --config ../vitest.config.ts --root .",
+    "test:built": "vitest run --config vitest.built.config.ts --root .",
     "test:watch": "vitest --config ../vitest.config.ts --root .",
     "typecheck": "tsc",
     "lint": "ultracite check",

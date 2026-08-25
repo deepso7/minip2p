@@ -1,21 +1,15 @@
-import { MockBackend } from "@minip2p/test-fixtures";
+import * as coreSdk from "@minip2p/core";
 import { describe, expect, test } from "vitest";
 
-import { Minip2pBase } from "../src/index.js";
-
-class TestMinip2p extends Minip2pBase {
-  constructor(backend: MockBackend) {
-    super(backend, []);
-  }
-}
+import * as nodeSdk from "../src/index.js";
 
 describe("@minip2p/node", () => {
-  test("re-exports the source SDK contract", () => {
-    const backend = new MockBackend();
-    const endpoint = new TestMinip2p(backend);
-
-    expect(endpoint.peerId()).toBe("local-peer");
-    endpoint.close();
-    expect(backend.closed).toBe(true);
+  test("re-exports every runtime SDK value by identity", () => {
+    for (const [name, value] of Object.entries(coreSdk)) {
+      expect(nodeSdk, `missing @minip2p/core export ${name}`).toHaveProperty(
+        name
+      );
+      expect(Reflect.get(nodeSdk, name)).toBe(value);
+    }
   });
 });
