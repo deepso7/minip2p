@@ -7,8 +7,8 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "vitest run",
-    "test:watch": "vitest",
+    "test": "vitest run --config ../vitest.config.ts --root .",
+    "test:watch": "vitest --config ../vitest.config.ts --root .",
     "typecheck": "tsc -p tsconfig.json"
   },
   "devDependencies": {

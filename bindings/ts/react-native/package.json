@@ -72,8 +72,8 @@
     "clean": "del-cli android/.cxx android/build example/android/build example/android/app/build example/ios/build lib",
     "build": "bob build && node scripts/normalize-generated.mjs",
     "prepack": "pnpm build && node scripts/check-package-native.mjs",
-    "test": "vitest run",
-    "test:watch": "vitest",
+    "test": "vitest run --config ../vitest.config.ts --root .",
+    "test:watch": "vitest --config ../vitest.config.ts --root .",
     "typecheck": "tsc",
     "lint": "ultracite check",
     "format": "ultracite fix"
