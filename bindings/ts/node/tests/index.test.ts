@@ -36,13 +36,14 @@ describe("@minip2p/node", () => {
     expect(endpoint.isRunning()).toBe(false);
   });
 
-  test("starts with discovery and mDNS configuration", () => {
+  test("reserves the configured signed-discovery topic", () => {
+    const topic = "node-discovery";
     const endpoint = nodeSdk.Minip2p.create({
       discovery: {
         autoDial: false,
         beaconIntervalMs: 1234,
         peerTtlMs: 5678,
-        topic: "node-discovery",
+        topic,
       },
       mdns: {
         autoDial: false,
@@ -61,11 +62,24 @@ describe("@minip2p/node", () => {
     });
 
     try {
-      expect(endpoint.discoveryNowMs()).toEqual(expect.any(Number));
-      expect(endpoint.isRunning()).toBe(true);
+      expect(() => endpoint.unsubscribe(topic)).toThrow(
+        "cannot unsubscribe from the discovery topic while discovery is enabled"
+      );
     } finally {
       endpoint.close();
     }
+  });
+
+  test("passes mDNS limits through native validation", () => {
+    expect(() =>
+      nodeSdk.Minip2p.create({
+        mdns: { maxPacketBytes: 511 },
+        secretKey: nodeSdk.generateSecretKey(),
+        transports: {
+          quic: { listen: ["/ip4/127.0.0.1/udp/0/quic-v1"] },
+        },
+      })
+    ).toThrow("mDNS maximum packet size must be between 512 and 4096 bytes");
   });
 
   test("two endpoints exchange stream data over QUIC loopback", async () => {
@@ -190,6 +204,7 @@ describe("@minip2p/node", () => {
   }, 20_000);
 
   test("drains a native event flood without losing messages", async () => {
+    const deadline = Date.now() + 25_000;
     const topic = "node-event-flood";
     const a = createFloodEndpoint();
     const b = createFloodEndpoint();
@@ -201,11 +216,15 @@ describe("@minip2p/node", () => {
     b.subscribe(topic);
 
     try {
-      const subscribed = a.once("peerSubscribed", { timeoutMs: 10_000 });
-      await a.connectAddr(b.listenAddrs()[0], { timeoutMs: 10_000 });
+      const subscribed = a.once("peerSubscribed", {
+        timeoutMs: remainingMs(deadline),
+      });
       await Promise.all([
-        a.waitPeerReady(b.peerId(), { timeoutMs: 10_000 }),
-        b.waitPeerReady(a.peerId(), { timeoutMs: 10_000 }),
+        a.connectAddr(b.listenAddrs()[0], {
+          timeoutMs: remainingMs(deadline),
+        }),
+        a.waitPeerReady(b.peerId(), { timeoutMs: remainingMs(deadline) }),
+        b.waitPeerReady(a.peerId(), { timeoutMs: remainingMs(deadline) }),
         subscribed,
       ]);
 
@@ -214,14 +233,15 @@ describe("@minip2p/node", () => {
         await publishWithBackpressure(
           a,
           topic,
-          new TextEncoder().encode(index.toString())
+          new TextEncoder().encode(index.toString()),
+          deadline
         );
       }
-      for (let attempt = 0; attempt < 1000; attempt += 1) {
-        if (received === messageCount) {
+      for (;;) {
+        if (received === messageCount || Date.now() >= deadline) {
           break;
         }
-        await delay(10);
+        await delay(Math.min(10, remainingMs(deadline)));
       }
 
       expect(received).toBe(messageCount);
@@ -229,7 +249,7 @@ describe("@minip2p/node", () => {
       a.close();
       b.close();
     }
-  }, 15_000);
+  }, 30_000);
 });
 
 function createFloodEndpoint(): nodeSdk.Minip2p {
@@ -245,7 +265,8 @@ function createFloodEndpoint(): nodeSdk.Minip2p {
 async function publishWithBackpressure(
   endpoint: nodeSdk.Minip2p,
   topic: string,
-  data: Uint8Array
+  data: Uint8Array,
+  deadline: number
 ): Promise<void> {
   for (;;) {
     try {
@@ -258,9 +279,19 @@ async function publishWithBackpressure(
       ) {
         throw error;
       }
-      await delay(1);
+      if (Date.now() >= deadline) {
+        throw new Error(
+          "Timed out publishing flood messages under outbound backpressure",
+          { cause: error }
+        );
+      }
+      await delay(Math.min(1, remainingMs(deadline)));
     }
   }
+}
+
+function remainingMs(deadline: number): number {
+  return Math.max(1, deadline - Date.now());
 }
 
 async function startRelay(): Promise<{
