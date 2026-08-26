@@ -9,7 +9,7 @@ allowBuilds:
   esbuild: true
 
 catalog:
-  "@types/node": 26.2.0
+  "@types/node": 26.3.0
   "@types/react": 19.2.18
   del-cli: 7.0.0
   react: 19.2.8
@@ -21,6 +21,13 @@ minimumReleaseAgeExclude:
   - "@expo/inline-modules@0.0.15"
   - "@expo/local-build-cache-provider@56.0.11"
   - expo@56.0.18
+  - "@turbo/darwin-64@2.10.12"
+  - "@turbo/darwin-arm64@2.10.12"
+  - "@turbo/linux-64@2.10.12"
+  - "@turbo/linux-arm64@2.10.12"
+  - "@turbo/windows-64@2.10.12"
+  - "@turbo/windows-arm64@2.10.12"
+  - turbo@2.10.12
 
 nodeLinker: hoisted
 
