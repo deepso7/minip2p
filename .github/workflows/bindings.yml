@@ -8,6 +8,8 @@ on:
       - "crates/ffi/**"
       - "crates/ffi-core/**"
       - "crates/nodejs/**"
+      - "examples/common/**"
+      - "examples/relay-server/**"
       - ".github/workflows/bindings.yml"
       - ".github/workflows/bindings-native.yml"
   pull_request:
@@ -16,6 +18,8 @@ on:
       - "crates/ffi/**"
       - "crates/ffi-core/**"
       - "crates/nodejs/**"
+      - "examples/common/**"
+      - "examples/relay-server/**"
       - ".github/workflows/bindings.yml"
       - ".github/workflows/bindings-native.yml"
 
