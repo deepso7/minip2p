@@ -2,7 +2,18 @@ import { createRequire } from "node:module";
 import { performance } from "node:perf_hooks";
 
 const require = createRequire(import.meta.url);
-const binding = require("../../minip2p.linux-x64-gnu.node");
+const report = process.report?.getReport();
+const header = report === undefined ? undefined : Reflect.get(report, "header");
+const libc =
+  header === undefined ||
+  Reflect.get(header, "glibcVersionRuntime") === undefined
+    ? "musl"
+    : "gnu";
+const target =
+  process.platform === "linux"
+    ? `${process.platform}-${process.arch}-${libc}`
+    : `${process.platform}-${process.arch}`;
+const binding = require(`../../minip2p.${target}.node`);
 const endpoint = new binding.NodeEndpoint(binding.generateSecretKey(), {
   allowUnsigned: false,
   autonatServers: [],

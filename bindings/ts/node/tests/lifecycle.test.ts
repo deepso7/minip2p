@@ -58,9 +58,9 @@ function waitForOutput(
     });
     child.once("error", reject);
     child.once("exit", (code) => {
-      if (code !== null && code !== 0) {
-        reject(new Error(`Child exited with ${code}`));
-      }
+      reject(
+        new Error(`Child exited with ${code} before printing ${expected}`)
+      );
     });
   });
 }
@@ -82,14 +82,17 @@ async function collectOutput(child: ReturnType<typeof spawn>): Promise<string> {
   child.stderr.on("data", (chunk: Buffer) => {
     output += chunk.toString();
   });
-  await Promise.race([
-    waitForExit(child),
-    new Promise<never>((_resolve, reject) => {
-      setTimeout(() => {
-        child.kill();
-        reject(new Error(`Child did not exit. Output:\n${output}`));
-      }, 5000);
-    }),
-  ]);
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`Child did not exit. Output:\n${output}`));
+    }, 5000);
+  });
+  try {
+    await Promise.race([waitForExit(child), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
   return output;
 }
