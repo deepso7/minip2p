@@ -21,8 +21,9 @@ unsafe_code = "deny"
 
 [dependencies]
 minip2p-ffi-core = { path = "../ffi-core" }
-napi = { version = "=3.12.2", default-features = false, features = ["napi8"] }
+napi = { version = "=3.12.2", default-features = false, features = ["napi8", "serde-json"] }
 napi-derive = "=3.6.3"
+serde_json = "1.0.149"
 
 [build-dependencies]
 napi-build = "=2.4.1"

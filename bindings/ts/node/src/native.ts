@@ -42,6 +42,22 @@ interface NativeEndpointConfig {
   readonly allowUnsigned: boolean;
   readonly autonatServers: string[];
   readonly forceRelay: boolean;
+  readonly discovery?: {
+    readonly autoDial: boolean;
+    readonly beaconIntervalMs: bigint;
+    readonly peerTtlMs: bigint;
+    readonly topic: string;
+  };
+  readonly mdns?: {
+    readonly autoDial: boolean;
+    readonly enableIpv6: boolean;
+    readonly interfaceRefreshMs: bigint;
+    readonly maxAnnouncedAddrs: number;
+    readonly maxPacketBytes: number;
+    readonly queryIntervalMs: bigint;
+    readonly socketPollIntervalMs: bigint;
+    readonly ttlMs: bigint;
+  };
   readonly protocols: string[];
   readonly pubsubRouter: number;
   readonly quic?: { readonly listenAddrs?: string[] };
@@ -50,11 +66,42 @@ interface NativeEndpointConfig {
 }
 
 export interface NativeEndpoint {
+  abandonStream: (peerId: string, streamId: bigint) => void;
+  activeReservation: () => unknown;
+  addProtocol: (protocolId: string) => void;
+  cancelConnect: (id: bigint) => void;
   close: () => void;
+  closeStreamWrite: (peerId: string, streamId: bigint) => void;
+  connect: (peerId: string) => bigint;
+  connectAddr: (address: string) => bigint;
+  connectedPeers: () => string[];
+  connectWithAddrs: (peerId: string, addresses: string[]) => bigint;
+  dial: (address: string) => bigint[];
+  dialIp4: (address: string) => bigint;
+  dialIp6: (address: string) => bigint;
+  disconnect: (peerId: string) => void;
+  discoveryNowMs: () => bigint | undefined;
+  drainEvents: (limit: number) => unknown[];
   isRunning: () => boolean;
+  isPeerReady: (peerId: string) => boolean;
+  knownPeers: () => unknown[];
   listenAddrs: () => string[];
+  openStream: (
+    peerId: string,
+    protocolId: string
+  ) => { readonly connId: bigint; readonly streamId: bigint };
+  path: (peerId: string) => unknown;
   peerId: () => string;
+  peerInfo: (peerId: string) => unknown;
+  ping: (peerId: string) => void;
+  publish: (topic: string, data: Uint8Array) => void;
+  reachability: () => number;
+  resetStream: (peerId: string, streamId: bigint) => void;
+  sendStream: (peerId: string, streamId: bigint, data: Uint8Array) => void;
+  setActive: (active: boolean) => void;
   start: (doorbell: () => void) => void;
+  subscribe: (topic: string) => boolean;
+  unsubscribe: (topic: string) => boolean;
 }
 
 interface NativeBinding {
