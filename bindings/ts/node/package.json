@@ -27,6 +27,7 @@
     "build": "del-cli dist && tsc -p tsconfig.build.json",
     "clean": "del-cli dist",
     "native:build": "napi build --platform --no-js --dts ../../../target/minip2p-nodejs.d.ts --release --manifest-path ../../../crates/nodejs/Cargo.toml --output-dir . -- --locked",
+    "pretest": "cargo build --locked -p minip2p-relay-server-example",
     "test": "vitest run --config ../vitest.config.ts --root . --no-file-parallelism",
     "test:watch": "vitest --config ../vitest.config.ts --root .",
     "typecheck": "tsc -p tsconfig.json"

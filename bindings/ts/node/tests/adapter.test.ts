@@ -13,6 +13,7 @@ const native = vi.hoisted(() => {
   class FakeNativeEndpoint {
     static latest: FakeNativeEndpoint | undefined;
 
+    readonly config: Readonly<Record<string, unknown>>;
     readonly drainLimits: number[] = [];
     readonly #batches: Event[][] = [];
     #doorbell: (() => void) | undefined;
@@ -20,7 +21,11 @@ const native = vi.hoisted(() => {
     discoveryClock: bigint | null = null;
     onDrain: ((call: number) => void) | undefined;
 
-    constructor() {
+    constructor(
+      _secretKey: Uint8Array,
+      config: Readonly<Record<string, unknown>>
+    ) {
+      this.config = config;
       FakeNativeEndpoint.latest = this;
     }
 
@@ -233,6 +238,62 @@ describe("Node adapter", () => {
     await secondDrain;
 
     expect(timerRanBeforeSecondDrain).toBe(true);
+    endpoint.close();
+  });
+
+  test("coalesces an event flood into one native drain pass", async () => {
+    vi.useFakeTimers();
+    const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
+
+    for (let index = 0; index < 10_000; index += 1) {
+      fake.ring();
+    }
+    await settle();
+
+    expect(fake.drainLimits).toEqual([256]);
+    endpoint.close();
+  });
+
+  test("passes discovery and mDNS configuration to the native endpoint", () => {
+    const endpoint = Minip2p.create({
+      discovery: {
+        autoDial: false,
+        beaconIntervalMs: 1234,
+        peerTtlMs: 5678,
+        topic: "node-discovery",
+      },
+      mdns: {
+        autoDial: true,
+        enableIpv6: true,
+        interfaceRefreshMs: 111,
+        maxAnnouncedAddrs: 12,
+        maxPacketBytes: 1300,
+        queryIntervalMs: 222,
+        socketPollIntervalMs: 333,
+        ttlMs: 444,
+      },
+      secretKey: new Uint8Array(32),
+    });
+
+    expect(fakeEndpoint().config).toMatchObject({
+      discovery: {
+        autoDial: false,
+        beaconIntervalMs: 1234n,
+        peerTtlMs: 5678n,
+        topic: "node-discovery",
+      },
+      mdns: {
+        autoDial: true,
+        enableIpv6: true,
+        interfaceRefreshMs: 111n,
+        maxAnnouncedAddrs: 12,
+        maxPacketBytes: 1300,
+        queryIntervalMs: 222n,
+        socketPollIntervalMs: 333n,
+        ttlMs: 444n,
+      },
+    });
     endpoint.close();
   });
 
