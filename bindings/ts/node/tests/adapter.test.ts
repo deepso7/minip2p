@@ -271,6 +271,118 @@ describe("Node adapter", () => {
     endpoint.close();
   });
 
+  test("forgets connect identifiers after ConnectFailed", async () => {
+    vi.useFakeTimers();
+    const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
+    const first = endpoint.startConnect("remote");
+    fake.enqueue(
+      [
+        {
+          inner: {
+            connectId: 30n,
+            detail: "no route",
+            kind: 0,
+            peerId: "remote",
+          },
+          tag: "ConnectFailed",
+        },
+      ],
+      []
+    );
+
+    fake.ring();
+    await settle();
+    const second = endpoint.startConnect("remote");
+
+    expect([first, second]).toEqual([1, 2]);
+    endpoint.close();
+  });
+
+  test("forgets connect identifiers after cancellation", () => {
+    const endpoint = createEndpoint();
+    const first = endpoint.startConnect("remote");
+
+    endpoint.cancelConnect(first);
+    const second = endpoint.startConnect("remote");
+
+    expect([first, second]).toEqual([1, 2]);
+    endpoint.close();
+  });
+
+  test("forgets connect identifiers after a direct PathEstablished", async () => {
+    vi.useFakeTimers();
+    const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
+    const first = endpoint.startConnect("remote");
+    fake.enqueue(
+      [
+        {
+          inner: {
+            connectId: 30n,
+            path: { tag: "DirectDialed" },
+            peerId: "remote",
+          },
+          tag: "PathEstablished",
+        },
+      ],
+      []
+    );
+
+    fake.ring();
+    await settle();
+    const second = endpoint.startConnect("remote");
+
+    expect([first, second]).toEqual([1, 2]);
+    endpoint.close();
+  });
+
+  test("keeps a relayed connect identifier through PathUpgraded", async () => {
+    vi.useFakeTimers();
+    const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
+    const ids: number[] = [];
+    endpoint.on("pathEstablished", ({ connectId }) => ids.push(connectId));
+    endpoint.on("pathUpgraded", ({ connectId }) => ids.push(connectId));
+    const first = endpoint.startConnect("remote");
+    fake.enqueue(
+      [
+        {
+          inner: {
+            connectId: 30n,
+            path: {
+              inner: { relayPeerId: "relay" },
+              tag: "Relayed",
+            },
+            peerId: "remote",
+          },
+          tag: "PathEstablished",
+        },
+        {
+          inner: {
+            connectId: 30n,
+            from: {
+              inner: { relayPeerId: "relay" },
+              tag: "Relayed",
+            },
+            peerId: "remote",
+            to: { tag: "DirectPunched" },
+          },
+          tag: "PathUpgraded",
+        },
+      ],
+      []
+    );
+
+    fake.ring();
+    await settle();
+    const second = endpoint.startConnect("remote");
+
+    expect(ids).toEqual([first, first]);
+    expect(second).toBe(2);
+    endpoint.close();
+  });
+
   test("forgets stream identifiers after StreamClosed", async () => {
     vi.useFakeTimers();
     const endpoint = createEndpoint();

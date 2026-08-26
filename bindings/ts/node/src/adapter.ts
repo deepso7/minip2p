@@ -209,6 +209,7 @@ class NodeBackend implements Minip2pBackend {
 
   cancelConnect(id: number): void {
     this.#endpoint.cancelConnect(this.#connectIds.toNative(id));
+    this.#connectIds.deletePublic(id);
   }
 
   disconnect(peerId: string): void {
@@ -431,13 +432,14 @@ function normalizeEvent(
   ) {
     event.inner = normalizeEventBytes(event.tag, event.inner);
   }
-  releaseTerminalIds(event, connectionIds, streamIds);
+  releaseTerminalIds(event, connectionIds, connectIds, streamIds);
   return event as P2pEvent;
 }
 
 function releaseTerminalIds(
   event: { readonly tag?: unknown; readonly inner?: unknown },
   connectionIds: IdMap,
+  connectIds: IdMap,
   streamIds: IdMap
 ): void {
   if (event.inner === null || typeof event.inner !== "object") {
@@ -446,9 +448,39 @@ function releaseTerminalIds(
   if (event.tag === "ConnectionClosed") {
     connectionIds.deletePublic(Reflect.get(event.inner, "connId"));
   }
+  if (isTerminalConnectEvent(event)) {
+    connectIds.deletePublic(Reflect.get(event.inner, "connectId"));
+  }
   if (event.tag === "StreamClosed") {
     streamIds.deletePublic(Reflect.get(event.inner, "streamId"));
   }
+}
+
+function isTerminalConnectEvent(event: {
+  readonly tag?: unknown;
+  readonly inner?: unknown;
+}): boolean {
+  if (
+    event.tag === "ConnectFailed" ||
+    event.tag === "FellBackToRelay" ||
+    event.tag === "PathUpgraded"
+  ) {
+    return true;
+  }
+  if (
+    event.tag !== "PathEstablished" ||
+    event.inner === null ||
+    typeof event.inner !== "object"
+  ) {
+    return false;
+  }
+  const path = Reflect.get(event.inner, "path");
+  return (
+    path !== null &&
+    typeof path === "object" &&
+    (Reflect.get(path, "tag") === "DirectDialed" ||
+      Reflect.get(path, "tag") === "DirectPunched")
+  );
 }
 
 function normalizeEventBytes(tag: string, value: unknown): unknown {
