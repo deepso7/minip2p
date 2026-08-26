@@ -1,4 +1,4 @@
-//! Detached background endpoint driver.
+//! Detached background endpoint driver and event delivery.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -10,12 +10,11 @@ use minip2p::{EndpointWake, Error, NatEvent};
 
 use crate::endpoint::{Lifecycle, Shared};
 use crate::events::{convert_discovery, convert_nat, convert_pubsub, convert_swarm};
-use crate::{DriverFailureKind, P2pEvent, P2pEventListener};
+use crate::{DriverFailureKind, EventDoorbell, P2pEvent};
 
 const DRIVER_POLL: Duration = Duration::from_millis(25);
 const DRIVER_IDLE_POLL: Duration = Duration::from_millis(500);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
-const MAX_BATCH_PER_ITER: usize = 512;
 const MAX_CARRY_EVENTS: usize = 4096;
 
 /// Rust-side instrumentation for the background driver.
@@ -23,9 +22,9 @@ const MAX_CARRY_EVENTS: usize = 4096;
 pub struct DriverStats {
     /// Largest bounded carry-buffer length observed.
     pub carry_high_water: usize,
-    /// Source events for which a listener callback was attempted.
+    /// Source events returned by `drain_events`.
     pub dispatch_attempted: u64,
-    /// Synthetic diagnostics for which a listener callback was attempted.
+    /// Synthetic diagnostics returned by `drain_events`.
     pub dispatch_attempted_synthetic: u64,
     /// Source events discarded by overflow or shutdown.
     pub dropped: u64,
@@ -36,33 +35,34 @@ pub struct DriverStats {
 }
 
 #[derive(Default)]
-struct OverflowDiagnostic {
+pub(crate) struct OverflowDiagnostic {
     pending: u64,
     total: u64,
 }
 
-struct Delivery {
-    diagnostic: Option<P2pEvent>,
-    batch: Vec<P2pEvent>,
+pub(crate) struct Delivery {
+    pub(crate) diagnostic: Option<P2pEvent>,
+    pub(crate) batch: Vec<P2pEvent>,
 }
 
 #[derive(Default)]
-struct Carry {
+pub(crate) struct Carry {
     events: BTreeMap<u64, P2pEvent>,
     payload_ids: VecDeque<u64>,
+    dropped_terminal_connect_ids: BTreeSet<u64>,
     next_id: u64,
 }
 
 impl Carry {
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.events.len()
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
 
-    fn push(&mut self, event: P2pEvent) -> bool {
+    pub(crate) fn push(&mut self, event: P2pEvent) -> bool {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         if is_payload_event(&event) {
@@ -72,10 +72,13 @@ impl Carry {
         if self.events.len() <= MAX_CARRY_EVENTS {
             return false;
         }
-        if let Some(payload_id) = self.payload_ids.pop_front() {
-            self.events.remove(&payload_id);
+        let dropped = if let Some(payload_id) = self.payload_ids.pop_front() {
+            self.events.remove(&payload_id)
         } else {
-            self.events.pop_first();
+            self.events.pop_first().map(|(_, event)| event)
+        };
+        if let Some(connect_id) = dropped.as_ref().and_then(terminal_connect_id) {
+            self.dropped_terminal_connect_ids.insert(connect_id);
         }
         true
     }
@@ -92,12 +95,16 @@ impl Carry {
         batch
     }
 
-    fn suppress_cancelled(&mut self, cancelled: &BTreeSet<u64>) -> usize {
+    pub(crate) fn suppress_cancelled(&mut self, cancelled: &BTreeSet<u64>) -> usize {
         let before = self.events.len();
         self.events
             .retain(|_, event| p2p_connect_id(event).is_none_or(|id| !cancelled.contains(&id)));
         self.prune_payload_ids();
         before - self.events.len()
+    }
+
+    fn take_dropped_terminal_connect_ids(&mut self) -> BTreeSet<u64> {
+        core::mem::take(&mut self.dropped_terminal_connect_ids)
     }
 
     fn prune_payload_ids(&mut self) {
@@ -114,12 +121,12 @@ fn is_payload_event(event: &P2pEvent) -> bool {
 
 struct ExitGuard {
     shared: Arc<Shared>,
-    listener: Option<Arc<dyn P2pEventListener>>,
+    doorbell: Option<Arc<dyn EventDoorbell>>,
 }
 
 impl Drop for ExitGuard {
     fn drop(&mut self) {
-        drop(self.listener.take());
+        drop(self.doorbell.take());
         let mut state = self.shared.lock_state();
         state.endpoint.take();
         state.lifecycle = Lifecycle::Stopped;
@@ -129,11 +136,11 @@ impl Drop for ExitGuard {
     }
 }
 
-pub(crate) fn run(shared: Arc<Shared>, listener: Arc<dyn P2pEventListener>) {
+pub(crate) fn run(shared: Arc<Shared>, doorbell: Arc<dyn EventDoorbell>) {
     shared.lock_state().driver_thread_id = Some(std::thread::current().id());
     let mut guard = ExitGuard {
         shared,
-        listener: Some(listener),
+        doorbell: Some(doorbell),
     };
     let result = catch_unwind(AssertUnwindSafe(|| pump(&mut guard)));
     let report_failure = {
@@ -145,67 +152,46 @@ pub(crate) fn run(shared: Arc<Shared>, listener: Arc<dyn P2pEventListener>) {
             false
         }
     };
-    if report_failure && let Some(listener) = guard.listener.as_ref() {
-        {
+    if report_failure && let Some(doorbell) = guard.doorbell.as_ref() {
+        let event = match result {
+            Ok(Err(error)) => P2pEvent::DriverFailed {
+                kind: failure_kind(&error),
+                detail: error.to_string(),
+            },
+            Err(_) => P2pEvent::DriverFailed {
+                kind: DriverFailureKind::Panic,
+                detail: "background endpoint driver panicked".into(),
+            },
+            Ok(Ok(())) => return,
+        };
+        let should_ring = {
             let mut state = guard.shared.lock_state();
-            state.stats.dispatch_attempted_synthetic =
-                state.stats.dispatch_attempted_synthetic.saturating_add(1);
-        }
-        match result {
-            Ok(Err(error)) => dispatch(
-                listener,
-                P2pEvent::DriverFailed {
-                    kind: failure_kind(&error),
-                    detail: error.to_string(),
-                },
-            ),
-            Err(_) => dispatch(
-                listener,
-                P2pEvent::DriverFailed {
-                    kind: DriverFailureKind::Panic,
-                    detail: "background endpoint driver panicked".into(),
-                },
-            ),
-            Ok(Ok(())) => {}
+            let should_ring = state.carry.is_empty();
+            let crate::endpoint::EndpointState {
+                carry,
+                overflow,
+                stats,
+                ..
+            } = &mut *state;
+            ingest([event], carry, overflow, stats);
+            state.stats.carry_high_water = state.stats.carry_high_water.max(state.carry.len());
+            should_ring
+        };
+        if should_ring {
+            ring(doorbell);
         }
     }
 }
 
 fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
-    let mut carry = Carry::default();
-    let mut overflow = OverflowDiagnostic::default();
     let mut next_keepalive_at = Instant::now() + KEEPALIVE_INTERVAL;
     loop {
         service_keepalive(&guard.shared, &mut next_keepalive_at);
         let mut state = guard.shared.lock_state();
         if state.lifecycle != Lifecycle::Running {
-            state.stats.dropped = state.stats.dropped.saturating_add(carry.len() as u64);
             return Ok(());
         }
-        if !carry.is_empty() || overflow.pending != 0 {
-            let cancelled = carry.suppress_cancelled(&state.cancelled_connect_ids);
-            state.stats.dropped = state.stats.dropped.saturating_add(cancelled as u64);
-            let delivery = take_delivery(&mut carry, &mut overflow, &mut state.stats);
-            state.stats.iterations = state.stats.iterations.saturating_add(1);
-            drop(state);
-            let listener = guard.listener.as_ref().expect("listener exists");
-            if let Some(event) = delivery.diagnostic {
-                dispatch(listener, event);
-            }
-            for event in delivery.batch {
-                service_keepalive(&guard.shared, &mut next_keepalive_at);
-                let should_dispatch = {
-                    let mut state = guard.shared.lock_state();
-                    let cancelled = p2p_connect_id(&event)
-                        .is_some_and(|id| state.cancelled_connect_ids.contains(&id));
-                    record_source_dispatch(cancelled, &mut state.stats)
-                };
-                if should_dispatch {
-                    dispatch(listener, event);
-                }
-            }
-            continue;
-        }
+        let was_empty = state.carry.is_empty();
         let deadline = if state.active {
             DRIVER_POLL
         } else {
@@ -214,6 +200,9 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         let crate::endpoint::EndpointState {
             endpoint,
             cancelled_connect_ids,
+            connect_ids,
+            carry,
+            overflow,
             stats,
             ..
         } = &mut *state;
@@ -228,12 +217,12 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         }
 
         if let EndpointWake::Event(event) = wake {
-            ingest(convert_swarm(event), &mut carry, &mut overflow, stats);
+            ingest(convert_swarm(event), carry, overflow, stats);
         }
         ingest(
             endpoint.poll()?.into_iter().filter_map(convert_swarm),
-            &mut carry,
-            &mut overflow,
+            carry,
+            overflow,
             stats,
         );
         let nat_events = endpoint.take_nat_events();
@@ -244,8 +233,8 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
                     nat_connect_id(event).is_none_or(|id| !cancelled_connect_ids.contains(&id))
                 })
                 .map(convert_nat),
-            &mut carry,
-            &mut overflow,
+            carry,
+            overflow,
             stats,
         );
         ingest(
@@ -253,8 +242,8 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
                 .take_pubsub_events()
                 .into_iter()
                 .map(convert_pubsub),
-            &mut carry,
-            &mut overflow,
+            carry,
+            overflow,
             stats,
         );
         ingest(
@@ -262,12 +251,22 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
                 .take_discovery_events()
                 .into_iter()
                 .map(convert_discovery),
-            &mut carry,
-            &mut overflow,
+            carry,
+            overflow,
             stats,
         );
+        for id in carry.take_dropped_terminal_connect_ids() {
+            connect_ids.remove(&id);
+            cancelled_connect_ids.remove(&id);
+        }
+        cancelled_connect_ids.clear();
         stats.carry_high_water = stats.carry_high_water.max(carry.len());
         stats.iterations = stats.iterations.saturating_add(1);
+        let should_ring = was_empty && !carry.is_empty();
+        drop(state);
+        if should_ring {
+            ring(guard.doorbell.as_ref().expect("doorbell exists"));
+        }
     }
 }
 
@@ -329,10 +328,11 @@ fn ingest(
     overflow.total = overflow.total.saturating_add(dropped);
 }
 
-fn take_delivery(
+pub(crate) fn take_delivery(
     carry: &mut Carry,
     overflow: &mut OverflowDiagnostic,
     stats: &mut DriverStats,
+    limit: usize,
 ) -> Delivery {
     let diagnostic = (overflow.pending != 0).then(|| {
         let event = P2pEvent::EventsDropped {
@@ -343,7 +343,7 @@ fn take_delivery(
         stats.dispatch_attempted_synthetic = stats.dispatch_attempted_synthetic.saturating_add(1);
         event
     });
-    let batch = carry.take(MAX_BATCH_PER_ITER);
+    let batch = carry.take(limit.saturating_sub(usize::from(diagnostic.is_some())));
     Delivery { diagnostic, batch }
 }
 
@@ -363,7 +363,7 @@ fn nat_connect_id(event: &NatEvent) -> Option<u64> {
     }
 }
 
-fn p2p_connect_id(event: &P2pEvent) -> Option<u64> {
+pub(crate) fn p2p_connect_id(event: &P2pEvent) -> Option<u64> {
     match event {
         P2pEvent::PathEstablished { connect_id, .. }
         | P2pEvent::PathUpgraded { connect_id, .. }
@@ -374,18 +374,20 @@ fn p2p_connect_id(event: &P2pEvent) -> Option<u64> {
     }
 }
 
-fn record_source_dispatch(cancelled: bool, stats: &mut DriverStats) -> bool {
-    if cancelled {
-        stats.dropped = stats.dropped.saturating_add(1);
-        false
-    } else {
-        stats.dispatch_attempted = stats.dispatch_attempted.saturating_add(1);
-        true
+pub(crate) fn terminal_connect_id(event: &P2pEvent) -> Option<u64> {
+    match event {
+        P2pEvent::PathEstablished {
+            connect_id, path, ..
+        } if !matches!(path, crate::PathKind::Relayed { .. }) => Some(*connect_id),
+        P2pEvent::PathUpgraded { connect_id, .. }
+        | P2pEvent::FellBackToRelay { connect_id, .. }
+        | P2pEvent::ConnectFailed { connect_id, .. } => Some(*connect_id),
+        _ => None,
     }
 }
 
-fn dispatch(listener: &Arc<dyn P2pEventListener>, event: P2pEvent) {
-    let _ = catch_unwind(AssertUnwindSafe(|| listener.on_event(event)));
+fn ring(doorbell: &Arc<dyn EventDoorbell>) {
+    let _ = catch_unwind(AssertUnwindSafe(|| doorbell.on_events_ready()));
 }
 
 fn failure_kind(error: &Error) -> DriverFailureKind {
@@ -401,6 +403,7 @@ fn failure_kind(error: &Error) -> DriverFailureKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn message(byte: u8) -> P2pEvent {
         P2pEvent::Message {
@@ -410,6 +413,78 @@ mod tests {
             seqno: vec![byte],
             signed: true,
         }
+    }
+
+    #[test]
+    fn doorbell_rings_only_on_empty_to_non_empty_edges() {
+        struct Bell(AtomicUsize);
+        impl EventDoorbell for Bell {
+            fn on_events_ready(&self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let bell = Arc::new(Bell(AtomicUsize::new(0)));
+        let doorbell = Arc::clone(&bell) as Arc<dyn EventDoorbell>;
+        let mut carry = Carry::default();
+        let mut overflow = OverflowDiagnostic::default();
+        let mut stats = DriverStats::default();
+
+        let was_empty = carry.is_empty();
+        ingest(
+            [message(1), message(2)],
+            &mut carry,
+            &mut overflow,
+            &mut stats,
+        );
+        if was_empty && !carry.is_empty() {
+            ring(&doorbell);
+        }
+        ingest([message(3)], &mut carry, &mut overflow, &mut stats);
+        assert_eq!(bell.0.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            take_delivery(&mut carry, &mut overflow, &mut stats, 3)
+                .batch
+                .len(),
+            3
+        );
+
+        let was_empty = carry.is_empty();
+        ingest([message(4)], &mut carry, &mut overflow, &mut stats);
+        if was_empty && !carry.is_empty() {
+            ring(&doorbell);
+        }
+        assert_eq!(bell.0.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn terminal_attempt_events_are_identified_for_retirement() {
+        assert_eq!(
+            terminal_connect_id(&P2pEvent::PathEstablished {
+                connect_id: 7,
+                peer_id: "peer".into(),
+                path: crate::PathKind::DirectDialed,
+            }),
+            Some(7)
+        );
+        assert_eq!(
+            terminal_connect_id(&P2pEvent::PathEstablished {
+                connect_id: 8,
+                peer_id: "peer".into(),
+                path: crate::PathKind::Relayed {
+                    relay_peer_id: "relay".into()
+                },
+            }),
+            None
+        );
+        assert_eq!(
+            terminal_connect_id(&P2pEvent::ConnectFailed {
+                connect_id: 9,
+                peer_id: "peer".into(),
+                kind: crate::NatErrorKind::NoPathAvailable,
+                detail: "failed".into(),
+            }),
+            Some(9)
+        );
     }
 
     #[test]
@@ -479,8 +554,8 @@ mod tests {
             &mut stats,
         );
 
-        let first = take_delivery(&mut carry, &mut overflow, &mut stats);
-        assert_eq!(first.batch.len(), MAX_BATCH_PER_ITER);
+        let first = take_delivery(&mut carry, &mut overflow, &mut stats, 512);
+        assert_eq!(first.batch.len(), 511);
         assert_eq!(
             first.diagnostic,
             Some(P2pEvent::EventsDropped {
@@ -489,17 +564,13 @@ mod tests {
             })
         );
         assert_eq!(stats.dispatch_attempted_synthetic, 1);
-        for _ in &first.batch {
-            assert!(record_source_dispatch(false, &mut stats));
-        }
+        stats.dispatch_attempted += first.batch.len() as u64;
 
         while !carry.is_empty() {
-            let delivery = take_delivery(&mut carry, &mut overflow, &mut stats);
-            assert!(delivery.batch.len() <= MAX_BATCH_PER_ITER);
+            let delivery = take_delivery(&mut carry, &mut overflow, &mut stats, 512);
+            assert!(delivery.batch.len() <= 512);
             assert!(delivery.diagnostic.is_none());
-            for _ in &delivery.batch {
-                assert!(record_source_dispatch(false, &mut stats));
-            }
+            stats.dispatch_attempted += delivery.batch.len() as u64;
         }
 
         assert_eq!(stats.converted, stats.dispatch_attempted + stats.dropped);
@@ -521,7 +592,7 @@ mod tests {
         });
 
         let suppressed = carry.suppress_cancelled(&BTreeSet::from([7]));
-        let retained = carry.take(MAX_BATCH_PER_ITER);
+        let retained = carry.take(512);
 
         assert_eq!(suppressed, 1);
         assert_eq!(
@@ -536,11 +607,7 @@ mod tests {
             peer_id: "peer".into(),
             path: crate::PathKind::DirectDialed,
         };
-        let mut stats = DriverStats::default();
-        let cancelled = p2p_connect_id(&extracted).is_some_and(|id| id == 7);
-        assert!(!record_source_dispatch(cancelled, &mut stats));
-        assert_eq!(stats.dropped, 1);
-        assert_eq!(stats.dispatch_attempted, 0);
+        assert_eq!(p2p_connect_id(&extracted), Some(7));
     }
 
     #[test]

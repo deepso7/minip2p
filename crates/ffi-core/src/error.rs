@@ -1,12 +1,7 @@
-//! Errors exposed across the foreign-function boundary.
-
-use minip2p_ffi_core as core;
-
-/// UniFFI mirror of the core synchronous operation error.
-pub type FfiError = core::FfiError;
+//! Errors exposed to binding shells.
 
 /// An error returned by a synchronous FFI operation.
-#[uniffi::remote(Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum FfiError {
     /// The endpoint's background driver was already started.
     #[error("endpoint driver already started")]

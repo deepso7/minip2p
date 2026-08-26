@@ -6,7 +6,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use minip2p_ffi::{
-    EndpointConfig, FfiError, P2pEndpoint, P2pEvent, P2pEventListener, PubsubRouter,
+    EndpointConfig, FfiError, P2pEndpoint, P2pEvent, P2pEventDoorbell, PubsubRouter,
     TransportOptions,
 };
 use serde_json::{Value, json};
@@ -95,13 +95,20 @@ impl Drop for GoPeer {
     }
 }
 
-#[derive(Default)]
 struct EventLog {
+    endpoint: Arc<P2pEndpoint>,
     events: Mutex<Vec<P2pEvent>>,
     changed: Condvar,
 }
 
 impl EventLog {
+    fn new(endpoint: Arc<P2pEndpoint>) -> Self {
+        Self {
+            endpoint,
+            events: Mutex::new(Vec::new()),
+            changed: Condvar::new(),
+        }
+    }
     fn wait_for(&self, predicate: impl Fn(&P2pEvent) -> bool) -> P2pEvent {
         let events = self.events.lock().unwrap_or_else(PoisonError::into_inner);
         let (events, _) = self
@@ -129,12 +136,18 @@ impl EventLog {
     }
 }
 
-impl P2pEventListener for EventLog {
-    fn on_event(&self, event: P2pEvent) {
-        self.events
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(event);
+impl P2pEventDoorbell for EventLog {
+    fn on_events_ready(&self) {
+        loop {
+            let batch = self.endpoint.drain_events(512);
+            if batch.is_empty() {
+                break;
+            }
+            self.events
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(batch);
+        }
         self.changed.notify_all();
     }
 }
@@ -169,8 +182,8 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
     let go_addr = ready["addr"].as_str().expect("go peer address").to_owned();
 
     let endpoint = P2pEndpoint::new(vec![77; 32], config())?;
-    let log = Arc::new(EventLog::default());
-    endpoint.start(Arc::clone(&log) as Arc<dyn P2pEventListener>)?;
+    let log = Arc::new(EventLog::new(Arc::clone(&endpoint)));
+    endpoint.start(Arc::clone(&log) as Arc<dyn P2pEventDoorbell>)?;
 
     endpoint.connect_addr(go_addr)?;
     let initial_conn = match log.wait_for(|event| {

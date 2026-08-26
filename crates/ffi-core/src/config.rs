@@ -1,24 +1,9 @@
-//! UniFFI mirrors for endpoint configuration.
+//! Foreign-facing endpoint configuration.
 
-use minip2p_ffi_core as core;
-
-/// UniFFI mirror of the core signed-discovery options.
-pub type DiscoveryOptions = core::DiscoveryOptions;
-/// UniFFI mirror of the core transport options.
-pub type TransportOptions = core::TransportOptions;
-/// UniFFI mirror of the core pubsub router choice.
-pub type PubsubRouter = core::PubsubRouter;
-/// UniFFI mirror of the core endpoint configuration.
-pub type EndpointConfig = core::EndpointConfig;
-/// UniFFI mirror of the core mDNS options.
-pub type MdnsOptions = core::MdnsOptions;
-/// UniFFI mirror of a known-peer snapshot.
-pub type KnownPeerInfo = core::KnownPeerInfo;
-/// UniFFI mirror of an active relay reservation.
-pub type RelayReservationInfo = core::RelayReservationInfo;
+use std::fmt;
 
 /// Signed-discovery configuration.
-#[uniffi::remote(Record)]
+#[derive(Clone)]
 pub struct DiscoveryOptions {
     /// Pubsub topic carrying signed discovery beacons.
     pub topic: String,
@@ -30,8 +15,20 @@ pub struct DiscoveryOptions {
     pub auto_dial: bool,
 }
 
+impl fmt::Debug for DiscoveryOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiscoveryOptions")
+            .field("topic", &self.topic)
+            .field("beacon_interval_ms", &self.beacon_interval_ms)
+            .field("peer_ttl_ms", &self.peer_ttl_ms)
+            .field("auto_dial", &self.auto_dial)
+            .finish()
+    }
+}
+
 /// Local-link mDNS discovery configuration.
-#[uniffi::remote(Record)]
+#[derive(Clone, Debug)]
 pub struct MdnsOptions {
     /// Whether IPv6 interfaces and advertisements are enabled.
     pub enable_ipv6: bool,
@@ -52,7 +49,7 @@ pub struct MdnsOptions {
 }
 
 /// Pubsub routing engine selected at endpoint construction.
-#[uniffi::remote(Enum)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PubsubRouter {
     /// Mesh-based gossipsub routing.
     #[default]
@@ -62,7 +59,7 @@ pub enum PubsubRouter {
 }
 
 /// One enabled transport and the addresses it should listen on.
-#[uniffi::remote(Record)]
+#[derive(Clone, Debug)]
 pub struct TransportOptions {
     /// Exact listen multiaddresses, or transport defaults when absent.
     ///
@@ -72,7 +69,7 @@ pub struct TransportOptions {
 }
 
 /// Configuration used to construct an FFI endpoint.
-#[uniffi::remote(Record)]
+#[derive(Clone)]
 pub struct EndpointConfig {
     /// Identify agent version, or the crate-derived default when absent.
     pub agent_version: Option<String>,
@@ -99,7 +96,7 @@ pub struct EndpointConfig {
 }
 
 /// One peer in the shared discovery address book.
-#[uniffi::remote(Record)]
+#[derive(Clone, Debug)]
 pub struct KnownPeerInfo {
     /// Discovered peer.
     pub peer_id: String,
@@ -118,10 +115,29 @@ pub struct KnownPeerInfo {
 }
 
 /// Snapshot of the active inbound relay reservation.
-#[uniffi::remote(Record)]
+#[derive(Clone, Debug)]
 pub struct RelayReservationInfo {
     /// Relay holding the reservation.
     pub relay_peer_id: String,
     /// Absolute relay-reported expiry, when present.
     pub expires_unix_secs: Option<u64>,
+}
+
+impl fmt::Debug for EndpointConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EndpointConfig")
+            .field("agent_version", &self.agent_version)
+            .field("relays", &self.relays)
+            .field("autonat_servers", &self.autonat_servers)
+            .field("quic", &self.quic)
+            .field("tcp", &self.tcp)
+            .field("force_relay", &self.force_relay)
+            .field("allow_unsigned", &self.allow_unsigned)
+            .field("pubsub_router", &self.pubsub_router)
+            .field("protocols", &self.protocols)
+            .field("discovery", &self.discovery)
+            .field("mdns", &self.mdns)
+            .finish()
+    }
 }

@@ -4,7 +4,7 @@
 /* eslint-disable */
 // @ts-nocheck
 import nativeModule from "./minip2p_ffi-ffi";
-import { type UniffiRustFutureContinuationCallback, type UniffiForeignFutureDroppedCallback, type UniffiForeignFutureDroppedCallbackStruct, type UniffiVTableCallbackInterfaceMinip2pFfiP2pEventListener,
+import { type UniffiRustFutureContinuationCallback, type UniffiForeignFutureDroppedCallback, type UniffiForeignFutureDroppedCallbackStruct, type UniffiVTableCallbackInterfaceMinip2pFfiP2pEventDoorbell,
 } from "./minip2p_ffi-ffi";
 import { type FfiConverter, type UniffiByteArray, type UniffiGcObject, type UniffiHandle, type UniffiObjectFactory, type UniffiReferenceHolder, type UniffiRustCallStatus, AbstractFfiConverterByteArray, Cursor, FfiConverterArray, FfiConverterArrayBuffer, FfiConverterBool, FfiConverterObject, FfiConverterObjectWithCallbacks, FfiConverterOptional, FfiConverterUInt32, FfiConverterUInt64, FfiConverterUInt8, RustBuffer, UniffiAbstractObject, UniffiEnum, UniffiError, UniffiInternalError, UniffiResult, UniffiRustCaller, destructorGuardSymbol, pointerLiteralSymbol, uniffiCreateFfiConverterString, uniffiCreateRecord, uniffiTraitInterfaceCall, uniffiTypeNameSymbol, variantOrdinalSymbol,
 } from "@ubjs/core";
@@ -21,8 +21,6 @@ const uniffiIsDebug =
 
 /**
  * Builds a circuit multiaddress for `peer_id` through `relay_addr`.
- *
- * `relay_addr` is any direct `/quic-v1` or `/tcp` peer address.
  */
 export function circuitAddress(relayAddr: string, peerId: string): string /*throws*/ {
     const __rb: Uint8Array = uniffiCaller.rustCallWithError(
@@ -3743,42 +3741,41 @@ const FfiConverterTypeP2pEvent = (() => {
 })();
 
 /**
- * Listener implemented by the embedding runtime.
+ * Doorbell implemented by the embedding runtime.
  */
-export interface P2pEventListener {
+export interface P2pEventDoorbell {
 
 /**
- * Receives one converted native event.
+ * Reports that synchronous event draining can make progress.
  */
-    onEvent(event: P2pEvent): void;
+    onEventsReady(): void;
 }
 
 
 /**
- * Listener implemented by the embedding runtime.
+ * Doorbell implemented by the embedding runtime.
  */
-export class P2pEventListenerImpl extends UniffiAbstractObject implements P2pEventListener {
+export class P2pEventDoorbellImpl extends UniffiAbstractObject implements P2pEventDoorbell {
 
-    readonly [uniffiTypeNameSymbol] = "P2pEventListenerImpl";
+    readonly [uniffiTypeNameSymbol] = "P2pEventDoorbellImpl";
     readonly [destructorGuardSymbol]: UniffiGcObject;
     readonly [pointerLiteralSymbol]: UniffiHandle;
     // No primary constructor declared for this class.
 private constructor(pointer: UniffiHandle) {
     super();
     this[pointerLiteralSymbol] = pointer;
-    this[destructorGuardSymbol] = uniffiTypeP2pEventListenerImplObjectFactory.bless(pointer);
+    this[destructorGuardSymbol] = uniffiTypeP2pEventDoorbellImplObjectFactory.bless(pointer);
 }
 
 
 
 
 /**
- * Receives one converted native event.
+ * Reports that synchronous event draining can make progress.
  */
-    onEvent(event: P2pEvent): void {uniffiCaller.rustCall(
-            /*caller:*/ (callStatus) => { nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2peventlistener_on_event(
-                uniffiTypeP2pEventListenerImplObjectFactory.clonePointer(this),
-        FfiConverterTypeP2pEvent.lower(event, nativeModule().rustbuffer_alloc),
+    onEventsReady(): void {uniffiCaller.rustCall(
+            /*caller:*/ (callStatus) => { nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2peventdoorbell_on_events_ready(
+                uniffiTypeP2pEventDoorbellImplObjectFactory.clonePointer(this),
                 callStatus);
             },
             /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
@@ -3789,28 +3786,28 @@ private constructor(pointer: UniffiHandle) {
     uniffiDestroy(): void {
         const ptr = (this as any)[destructorGuardSymbol];
         if (ptr !== undefined) {
-            const pointer = uniffiTypeP2pEventListenerImplObjectFactory.pointer(this);
-            uniffiTypeP2pEventListenerImplObjectFactory.freePointer(pointer);
-            uniffiTypeP2pEventListenerImplObjectFactory.unbless(ptr);
+            const pointer = uniffiTypeP2pEventDoorbellImplObjectFactory.pointer(this);
+            uniffiTypeP2pEventDoorbellImplObjectFactory.freePointer(pointer);
+            uniffiTypeP2pEventDoorbellImplObjectFactory.unbless(ptr);
             delete (this as any)[destructorGuardSymbol];
         }
     }
 
-    static instanceOf(obj_: any): obj_ is P2pEventListenerImpl {
-        return uniffiTypeP2pEventListenerImplObjectFactory.isConcreteType(obj_);
+    static instanceOf(obj_: any): obj_ is P2pEventDoorbellImpl {
+        return uniffiTypeP2pEventDoorbellImplObjectFactory.isConcreteType(obj_);
     }
 
 
 }
 
-const uniffiTypeP2pEventListenerImplObjectFactory: UniffiObjectFactory<P2pEventListener> = (() => {
+const uniffiTypeP2pEventDoorbellImplObjectFactory: UniffiObjectFactory<P2pEventDoorbell> = (() => {
 
     return {
-    create(pointer: UniffiHandle): P2pEventListener {
-        const instance = Object.create(P2pEventListenerImpl.prototype);
+    create(pointer: UniffiHandle): P2pEventDoorbell {
+        const instance = Object.create(P2pEventDoorbellImpl.prototype);
         instance[pointerLiteralSymbol] = pointer;
         instance[destructorGuardSymbol] = this.bless(pointer);
-        instance[uniffiTypeNameSymbol] = "P2pEventListenerImpl";
+        instance[uniffiTypeNameSymbol] = "P2pEventDoorbellImpl";
         return instance;
     },
 
@@ -3818,7 +3815,7 @@ const uniffiTypeP2pEventListenerImplObjectFactory: UniffiObjectFactory<P2pEventL
     bless(p: UniffiHandle): UniffiGcObject {
         return uniffiCaller.rustCall(
             /*caller:*/ (status) =>
-                nativeModule().ubrn_uniffi_internal_fn_method_p2peventlistener_ffi__bless_pointer(p, status),
+                nativeModule().ubrn_uniffi_internal_fn_method_p2peventdoorbell_ffi__bless_pointer(p, status),
             /*liftString:*/ FfiConverterString.lift
         );
     },
@@ -3827,50 +3824,48 @@ const uniffiTypeP2pEventListenerImplObjectFactory: UniffiObjectFactory<P2pEventL
         ptr_.markDestroyed();
     },
 
-    pointer(obj_: P2pEventListener): UniffiHandle {
+    pointer(obj_: P2pEventDoorbell): UniffiHandle {
         if ((obj_ as any)[destructorGuardSymbol] === undefined) {
             throw new UniffiInternalError.UnexpectedNullPointer();
         }
         return (obj_ as any)[pointerLiteralSymbol];
     },
 
-    clonePointer(obj_: P2pEventListener): UniffiHandle {
+    clonePointer(obj_: P2pEventDoorbell): UniffiHandle {
         const pointer = this.pointer(obj_);
         return uniffiCaller.rustCall(
-            /*caller:*/ (callStatus) => nativeModule().ubrn_uniffi_minip2p_ffi_fn_clone_p2peventlistener(pointer, callStatus),
+            /*caller:*/ (callStatus) => nativeModule().ubrn_uniffi_minip2p_ffi_fn_clone_p2peventdoorbell(pointer, callStatus),
             /*liftString:*/ FfiConverterString.lift
         );
     },
 
     freePointer(pointer: UniffiHandle): void {
         uniffiCaller.rustCall(
-            /*caller:*/ (callStatus) => nativeModule().ubrn_uniffi_minip2p_ffi_fn_free_p2peventlistener(pointer, callStatus),
+            /*caller:*/ (callStatus) => nativeModule().ubrn_uniffi_minip2p_ffi_fn_free_p2peventdoorbell(pointer, callStatus),
             /*liftString:*/ FfiConverterString.lift
         );
     },
 
-    isConcreteType(obj_: any): obj_ is P2pEventListener {
-        return obj_[destructorGuardSymbol] && obj_[uniffiTypeNameSymbol] === "P2pEventListenerImpl";
+    isConcreteType(obj_: any): obj_ is P2pEventDoorbell {
+        return obj_[destructorGuardSymbol] && obj_[uniffiTypeNameSymbol] === "P2pEventDoorbellImpl";
     },
 }})();
-const FfiConverterTypeP2pEventListener = new FfiConverterObjectWithCallbacks(uniffiTypeP2pEventListenerImplObjectFactory);
+const FfiConverterTypeP2pEventDoorbell = new FfiConverterObjectWithCallbacks(uniffiTypeP2pEventDoorbellImplObjectFactory);
 
-// Add a vtable for the callbacks that go in P2pEventListener.
+// Add a vtable for the callbacks that go in P2pEventDoorbell.
 
 // Put the implementation in a struct so we don't pollute the top-level namespace
-const uniffiCallbackInterfaceP2pEventListener: { vtable: any; register: () => void; } = {
+const uniffiCallbackInterfaceP2pEventDoorbell: { vtable: any; register: () => void; } = {
     // Create the VTable using a series of closures.
     // ts automatically converts these into C callback functions.
     vtable: {
-        on_event: (
-            uniffiHandle: bigint,
-            event: Uint8Array,) => {
+        on_events_ready: (
+            uniffiHandle: bigint,) => {
             const uniffiMakeCall =
             ()
             : void => {
-                const jsCallback = FfiConverterTypeP2pEventListener.lift(uniffiHandle);
-                return jsCallback.onEvent(
-                    FfiConverterTypeP2pEvent.lift(event)
+                const jsCallback = FfiConverterTypeP2pEventDoorbell.lift(uniffiHandle);
+                return jsCallback.onEventsReady(
                 )
             };
             const uniffiResult = UniffiResult.ready<void>();
@@ -3889,14 +3884,14 @@ const uniffiCallbackInterfaceP2pEventListener: { vtable: any; register: () => vo
         },
         uniffi_free: (uniffiHandle: UniffiHandle): void => {
             // this will throw a stale handle error if the handle isn't found.
-            FfiConverterTypeP2pEventListener.drop(uniffiHandle);
+            FfiConverterTypeP2pEventDoorbell.drop(uniffiHandle);
         },
         uniffi_clone: (uniffiHandle: UniffiHandle): UniffiHandle => {
-            return FfiConverterTypeP2pEventListener.clone(uniffiHandle);
+            return FfiConverterTypeP2pEventDoorbell.clone(uniffiHandle);
         }
     },
-    register: () => {nativeModule().ubrn_uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventlistener(
-            uniffiCallbackInterfaceP2pEventListener.vtable
+    register: () => {nativeModule().ubrn_uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventdoorbell(
+            uniffiCallbackInterfaceP2pEventDoorbell.vtable
         );
     },
 };
@@ -3907,11 +3902,11 @@ const uniffiCallbackInterfaceP2pEventListener: { vtable: any; register: () => vo
 export interface P2pEndpointLike {
 
 /**
- * Resets and forgets an application stream.
+ * Forgets a stream.
  */
     abandonStream(peerId: string, streamId: bigint) /*throws*/: void;
 /**
- * Returns the active inbound relay reservation.
+ * Returns the active relay reservation.
  */
     activeReservation() /*throws*/: RelayReservationInfo | undefined;
 /**
@@ -3919,123 +3914,115 @@ export interface P2pEndpointLike {
  */
     addProtocol(protocolId: string) /*throws*/: void;
 /**
- * Cancels a known connection attempt; unknown ids are an idempotent no-op.
- *
- * Queued connection events are suppressed when possible. A listener
- * callback that already won the dispatch race may still arrive.
+ * Cancels a connection attempt.
  */
     cancelConnect(id: bigint) /*throws*/: void;
 /**
- * Half-closes the local write side of an application stream.
+ * Half-closes a stream's write side.
  */
     closeStreamWrite(peerId: string, streamId: bigint) /*throws*/: void;
 /**
- * Starts a connection attempt toward a peer without known direct addresses.
+ * Starts a connection attempt.
  */
     connect(peerId: string) /*throws*/: bigint;
 /**
- * Starts a connection attempt toward a direct `/quic-v1` or `/tcp` peer
- * address.
+ * Starts a direct-address connection attempt.
  */
     connectAddr(address: string) /*throws*/: bigint;
 /**
- * Starts a NAT connection attempt using an explicit ordered address set.
+ * Starts a connection attempt with explicit addresses.
  */
     connectWithAddrs(peerId: string, addresses: Array<string>) /*throws*/: bigint;
 /**
- * Returns peers with an established QUIC, TCP, or circuit connection.
+ * Returns connected peers.
  */
     connectedPeers() /*throws*/: Array<string>;
 /**
- * Dials a direct peer address on every applicable local address family.
+ * Dials on all applicable address families.
  */
     dial(address: string) /*throws*/: Array<bigint>;
 /**
- * Dials a direct peer address using IPv4.
+ * Dials using IPv4.
  */
     dialIp4(address: string) /*throws*/: bigint;
 /**
- * Dials a direct peer address using IPv6.
+ * Dials using IPv6.
  */
     dialIp6(address: string) /*throws*/: bigint;
 /**
- * Closes the active connection to `peer_id`.
- *
- * Cancelling a connection attempt suppresses that attempt's progress
- * events, but cannot retract a transport connection that has already
- * completed. Call this method when cancellation must also close an
- * established connection.
+ * Disconnects a peer.
  */
     disconnect(peerId: string) /*throws*/: void;
 /**
- * Returns the discovery driver's monotonic clock in milliseconds.
+ * Returns the discovery clock.
  */
     discoveryNowMs() /*throws*/: bigint | undefined;
 /**
- * Returns whether Identify has completed for `peer_id`.
+ * Pulls at most `limit` queued events in order.
+ */
+    drainEvents(limit: number): Array<P2pEvent>;
+/**
+ * Returns whether Identify completed for a peer.
  */
     isPeerReady(peerId: string) /*throws*/: boolean;
 /**
- * Returns whether the background driver is accepting work.
- *
- * This becomes `false` when shutdown is requested. Use
- * [`P2pEndpoint::wait_stopped`] to observe complete driver exit.
+ * Returns whether the driver accepts work.
  */
     isRunning(): boolean;
 /**
- * Returns the shared discovery address-book snapshot.
+ * Returns the discovery address book.
  */
     knownPeers() /*throws*/: Array<KnownPeerInfo>;
 /**
- * Returns the bound QUIC or TCP peer addresses.
+ * Returns bound peer addresses.
  */
     listenAddrs(): Array<string>;
 /**
- * Opens a negotiated application stream and returns its opaque id.
+ * Opens an application stream.
  */
     openStream(peerId: string, protocolId: string) /*throws*/: OpenStreamResult;
 /**
- * Returns the current usable NAT-orchestrated path to `peer_id`.
+ * Returns the current path to a peer.
  */
     path(peerId: string) /*throws*/: PathKind | undefined;
 /**
- * Returns the local peer ID as legacy base58 text.
+ * Returns the local peer ID.
  */
     peerId(): string;
 /**
- * Returns the latest Identify snapshot for `peer_id`.
+ * Returns the latest Identify snapshot.
  */
     peerInfo(peerId: string) /*throws*/: IdentifyInfo | undefined;
 /**
- * Sends an explicit ping; completion arrives as a ping event.
+ * Sends an explicit ping.
  */
     ping(peerId: string) /*throws*/: void;
 /**
- * Publishes one application payload.
+ * Publishes one payload.
  */
     publish(topic: string, data: ArrayBuffer) /*throws*/: void;
 /**
- * Returns the current AutoNAT reachability verdict.
+ * Returns the current reachability verdict.
  */
     reachability() /*throws*/: Reachability;
 /**
- * Resets an application stream while retaining later close events.
+ * Resets a stream.
  */
     resetStream(peerId: string, streamId: bigint) /*throws*/: void;
 /**
- * Sends one byte chunk on an application stream.
+ * Sends bytes on a stream.
  */
     sendStream(peerId: string, streamId: bigint, data: ArrayBuffer) /*throws*/: void;
 /**
- * Selects active or idle driver polling without changing delivery semantics.
+ * Selects active or idle polling.
  */
     setActive(active: boolean): void;
 /**
- * Starts the detached background endpoint driver.
+ * Starts the detached driver and registers its doorbell.
  */
-    start(listener: P2pEventListener) /*throws*/: void;
+    start(doorbell: P2pEventDoorbell) /*throws*/: void;
 /**
- * Requests shutdown without waiting for an in-flight callback.
+ * Requests shutdown.
  */
     stop(): void;
 /**
@@ -4047,14 +4034,7 @@ export interface P2pEndpointLike {
  */
     unsubscribe(topic: string) /*throws*/: boolean;
 /**
- * Waits up to `timeout_ms` for the endpoint to reach the stopped state.
- *
- * A newly created endpoint still owns bound sockets, so this returns
- * `false` until `stop` releases it. For a running endpoint, `stop` only
- * requests shutdown and this waits for the driver exit cleanup.
- *
- * Calling this from a listener callback would wait on the callback's own
- * driver thread, so that case returns `false` immediately.
+ * Waits for complete driver shutdown.
  */
     waitStopped(timeoutMs: bigint): boolean;
 }
@@ -4073,11 +4053,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     readonly [destructorGuardSymbol]: UniffiGcObject;
     readonly [pointerLiteralSymbol]: UniffiHandle;
 /**
- * Validates the secret key and `config`, binds its transports, and creates
- * an endpoint.
- *
- * The endpoint begins in the created state and owns its bound sockets,
- * but does not run a background driver until explicitly started.
+ * Creates an endpoint after validating configuration and binding sockets.
  */
     constructor(secretKey: ArrayBuffer, config: EndpointConfig) /*throws*/ {
         super();
@@ -4100,7 +4076,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
 
 
 /**
- * Resets and forgets an application stream.
+ * Forgets a stream.
  */
     abandonStream(peerId: string, streamId: bigint): void /*throws*/ {uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
@@ -4115,7 +4091,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns the active inbound relay reservation.
+ * Returns the active relay reservation.
  */
     activeReservation(): RelayReservationInfo | undefined /*throws*/ {
     const __rb: Uint8Array = uniffiCaller.rustCallWithError(
@@ -4149,10 +4125,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Cancels a known connection attempt; unknown ids are an idempotent no-op.
- *
- * Queued connection events are suppressed when possible. A listener
- * callback that already won the dispatch race may still arrive.
+ * Cancels a connection attempt.
  */
     cancelConnect(id: bigint): void /*throws*/ {uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
@@ -4166,7 +4139,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Half-closes the local write side of an application stream.
+ * Half-closes a stream's write side.
  */
     closeStreamWrite(peerId: string, streamId: bigint): void /*throws*/ {uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
@@ -4181,7 +4154,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Starts a connection attempt toward a peer without known direct addresses.
+ * Starts a connection attempt.
  */
     connect(peerId: string): bigint /*throws*/ {
     return FfiConverterUInt64.lift(uniffiCaller.rustCallWithError(
@@ -4197,8 +4170,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Starts a connection attempt toward a direct `/quic-v1` or `/tcp` peer
- * address.
+ * Starts a direct-address connection attempt.
  */
     connectAddr(address: string): bigint /*throws*/ {
     return FfiConverterUInt64.lift(uniffiCaller.rustCallWithError(
@@ -4214,7 +4186,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Starts a NAT connection attempt using an explicit ordered address set.
+ * Starts a connection attempt with explicit addresses.
  */
     connectWithAddrs(peerId: string, addresses: Array<string>): bigint /*throws*/ {
     return FfiConverterUInt64.lift(uniffiCaller.rustCallWithError(
@@ -4231,7 +4203,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns peers with an established QUIC, TCP, or circuit connection.
+ * Returns connected peers.
  */
     connectedPeers(): Array<string> /*throws*/ {
     const __rb: Uint8Array = uniffiCaller.rustCallWithError(
@@ -4251,7 +4223,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Dials a direct peer address on every applicable local address family.
+ * Dials on all applicable address families.
  */
     dial(address: string): Array<bigint> /*throws*/ {
     const __rb: Uint8Array = uniffiCaller.rustCallWithError(
@@ -4272,7 +4244,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Dials a direct peer address using IPv4.
+ * Dials using IPv4.
  */
     dialIp4(address: string): bigint /*throws*/ {
     return FfiConverterUInt64.lift(uniffiCaller.rustCallWithError(
@@ -4288,7 +4260,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Dials a direct peer address using IPv6.
+ * Dials using IPv6.
  */
     dialIp6(address: string): bigint /*throws*/ {
     return FfiConverterUInt64.lift(uniffiCaller.rustCallWithError(
@@ -4304,12 +4276,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Closes the active connection to `peer_id`.
- *
- * Cancelling a connection attempt suppresses that attempt's progress
- * events, but cannot retract a transport connection that has already
- * completed. Call this method when cancellation must also close an
- * established connection.
+ * Disconnects a peer.
  */
     disconnect(peerId: string): void /*throws*/ {uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
@@ -4323,7 +4290,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns the discovery driver's monotonic clock in milliseconds.
+ * Returns the discovery clock.
  */
     discoveryNowMs(): bigint | undefined /*throws*/ {
     const __rb: Uint8Array = uniffiCaller.rustCallWithError(
@@ -4343,7 +4310,27 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns whether Identify has completed for `peer_id`.
+ * Pulls at most `limit` queued events in order.
+ */
+    drainEvents(limit: number): Array<P2pEvent> {
+    const __rb: Uint8Array = uniffiCaller.rustCall(
+            /*caller:*/ (callStatus) => {
+                return nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_drain_events(
+                uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
+        FfiConverterUInt32.lower(limit, nativeModule().rustbuffer_alloc),
+                callStatus);
+            },
+            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
+    );
+    try {
+        return FfiConverterSequenceTypeP2pEvent.lift(__rb);
+    } finally {
+        nativeModule().rustbuffer_free(__rb);
+    }
+    }
+
+/**
+ * Returns whether Identify completed for a peer.
  */
     isPeerReady(peerId: string): boolean /*throws*/ {
     return FfiConverterBool.lift(uniffiCaller.rustCallWithError(
@@ -4359,10 +4346,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns whether the background driver is accepting work.
- *
- * This becomes `false` when shutdown is requested. Use
- * [`P2pEndpoint::wait_stopped`] to observe complete driver exit.
+ * Returns whether the driver accepts work.
  */
     isRunning(): boolean {
     return FfiConverterBool.lift(uniffiCaller.rustCall(
@@ -4376,7 +4360,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns the shared discovery address-book snapshot.
+ * Returns the discovery address book.
  */
     knownPeers(): Array<KnownPeerInfo> /*throws*/ {
     const __rb: Uint8Array = uniffiCaller.rustCallWithError(
@@ -4396,7 +4380,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns the bound QUIC or TCP peer addresses.
+ * Returns bound peer addresses.
  */
     listenAddrs(): Array<string> {
     const __rb: Uint8Array = uniffiCaller.rustCall(
@@ -4415,7 +4399,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Opens a negotiated application stream and returns its opaque id.
+ * Opens an application stream.
  */
     openStream(peerId: string, protocolId: string): OpenStreamResult /*throws*/ {
     const __rb: Uint8Array = uniffiCaller.rustCallWithError(
@@ -4437,7 +4421,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns the current usable NAT-orchestrated path to `peer_id`.
+ * Returns the current path to a peer.
  */
     path(peerId: string): PathKind | undefined /*throws*/ {
     const __rb: Uint8Array = uniffiCaller.rustCallWithError(
@@ -4458,7 +4442,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns the local peer ID as legacy base58 text.
+ * Returns the local peer ID.
  */
     peerId(): string {
     const __rb: Uint8Array = uniffiCaller.rustCall(
@@ -4477,7 +4461,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns the latest Identify snapshot for `peer_id`.
+ * Returns the latest Identify snapshot.
  */
     peerInfo(peerId: string): IdentifyInfo | undefined /*throws*/ {
     const __rb: Uint8Array = uniffiCaller.rustCallWithError(
@@ -4498,7 +4482,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Sends an explicit ping; completion arrives as a ping event.
+ * Sends an explicit ping.
  */
     ping(peerId: string): void /*throws*/ {uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
@@ -4512,7 +4496,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Publishes one application payload.
+ * Publishes one payload.
  */
     publish(topic: string, data: ArrayBuffer): void /*throws*/ {uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
@@ -4527,7 +4511,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Returns the current AutoNAT reachability verdict.
+ * Returns the current reachability verdict.
  */
     reachability(): Reachability /*throws*/ {
     const __rb: Uint8Array = uniffiCaller.rustCallWithError(
@@ -4547,7 +4531,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Resets an application stream while retaining later close events.
+ * Resets a stream.
  */
     resetStream(peerId: string, streamId: bigint): void /*throws*/ {uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
@@ -4562,7 +4546,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Sends one byte chunk on an application stream.
+ * Sends bytes on a stream.
  */
     sendStream(peerId: string, streamId: bigint, data: ArrayBuffer): void /*throws*/ {uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
@@ -4578,7 +4562,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Selects active or idle driver polling without changing delivery semantics.
+ * Selects active or idle polling.
  */
     setActive(active: boolean): void {uniffiCaller.rustCall(
             /*caller:*/ (callStatus) => { nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_set_active(
@@ -4591,13 +4575,13 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Starts the detached background endpoint driver.
+ * Starts the detached driver and registers its doorbell.
  */
-    start(listener: P2pEventListener): void /*throws*/ {uniffiCaller.rustCallWithError(
+    start(doorbell: P2pEventDoorbell): void /*throws*/ {uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
             /*caller:*/ (callStatus) => { nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_start(
                 uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
-        FfiConverterTypeP2pEventListener.lower(listener, nativeModule().rustbuffer_alloc),
+        FfiConverterTypeP2pEventDoorbell.lower(doorbell, nativeModule().rustbuffer_alloc),
                 callStatus);
             },
             /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
@@ -4605,7 +4589,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Requests shutdown without waiting for an in-flight callback.
+ * Requests shutdown.
  */
     stop(): void {uniffiCaller.rustCall(
             /*caller:*/ (callStatus) => { nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_stop(
@@ -4649,14 +4633,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Waits up to `timeout_ms` for the endpoint to reach the stopped state.
- *
- * A newly created endpoint still owns bound sockets, so this returns
- * `false` until `stop` releases it. For a running endpoint, `stop` only
- * requests shutdown and this waits for the driver exit cleanup.
- *
- * Calling this from a listener callback would wait on the callback's own
- * driver thread, so that case returns `false` immediately.
+ * Waits for complete driver shutdown.
  */
     waitStopped(timeoutMs: bigint): boolean {
     return FfiConverterBool.lift(uniffiCaller.rustCall(
@@ -4770,6 +4747,9 @@ const FfiConverterOptionalTypeRelayReservationInfo = new FfiConverterOptional(Ff
 // FfiConverter for Array<bigint>
 const FfiConverterSequenceUInt64 = new FfiConverterArray(FfiConverterUInt64);
 
+// FfiConverter for Array<P2pEvent>
+const FfiConverterSequenceTypeP2pEvent = new FfiConverterArray(FfiConverterTypeP2pEvent);
+
 // FfiConverter for Array<KnownPeerInfo>
 const FfiConverterSequenceTypeKnownPeerInfo = new FfiConverterArray(FfiConverterTypeKnownPeerInfo);
 
@@ -4798,7 +4778,7 @@ function uniffiEnsureInitialized() {
     if (bindingsContractVersion !== scaffoldingContractVersion) {
         throw new UniffiInternalError.ContractVersionMismatch(scaffoldingContractVersion, bindingsContractVersion);
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_func_circuit_address() !== 35059) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_func_circuit_address() !== 35260) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_func_circuit_address");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_func_generate_secret_key() !== 44400) {
@@ -4807,97 +4787,100 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_func_peer_id_from_secret_key() !== 8962) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_func_peer_id_from_secret_key");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new() !== 64534) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new() !== 8152) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_abandon_stream() !== 60482) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_abandon_stream() !== 2693) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_abandon_stream");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_active_reservation() !== 46981) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_active_reservation() !== 6405) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_active_reservation");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_add_protocol() !== 12280) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_add_protocol");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_cancel_connect() !== 62501) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_cancel_connect() !== 24195) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_cancel_connect");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_close_stream_write() !== 26147) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_close_stream_write() !== 17994) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_close_stream_write");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect() !== 60427) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect() !== 42064) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr() !== 27341) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr() !== 56611) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs() !== 44153) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs() !== 2062) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers() !== 49290) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers() !== 64148) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial() !== 47576) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial() !== 35216) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip4() !== 48021) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip4() !== 54241) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip4");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip6() !== 24748) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip6() !== 3676) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip6");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_disconnect() !== 59922) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_disconnect() !== 23975) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_disconnect");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_discovery_now_ms() !== 8975) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_discovery_now_ms() !== 14313) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_discovery_now_ms");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_is_peer_ready() !== 1184) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_drain_events() !== 30807) {
+        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_drain_events");
+    }
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_is_peer_ready() !== 30114) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_is_peer_ready");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_is_running() !== 42546) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_is_running() !== 42027) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_is_running");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_known_peers() !== 27328) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_known_peers() !== 8123) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_known_peers");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_listen_addrs() !== 645) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_listen_addrs() !== 43494) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_listen_addrs");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_open_stream() !== 18245) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_open_stream() !== 49419) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_open_stream");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_path() !== 58210) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_path() !== 6891) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_path");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_peer_id() !== 34289) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_peer_id() !== 42474) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_peer_id");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_peer_info() !== 2761) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_peer_info() !== 57911) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_peer_info");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_ping() !== 64674) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_ping() !== 62457) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_ping");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_publish() !== 42508) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_publish() !== 19337) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_publish");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_reachability() !== 24757) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_reachability() !== 22554) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_reachability");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_reset_stream() !== 52801) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_reset_stream() !== 10950) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_reset_stream");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_send_stream() !== 28787) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_send_stream() !== 64427) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_send_stream");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_set_active() !== 14047) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_set_active() !== 95) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_set_active");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_start() !== 28557) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_start() !== 31285) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_start");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_stop() !== 61952) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_stop() !== 11062) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_stop");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_subscribe() !== 55119) {
@@ -4906,14 +4889,14 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_unsubscribe() !== 32264) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_unsubscribe");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_wait_stopped() !== 3101) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_wait_stopped() !== 14108) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_wait_stopped");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2peventlistener_on_event() !== 45831) {
-        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2peventlistener_on_event");
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2peventdoorbell_on_events_ready() !== 57338) {
+        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2peventdoorbell_on_events_ready");
     }
 
-    uniffiCallbackInterfaceP2pEventListener.register();
+    uniffiCallbackInterfaceP2pEventDoorbell.register();
     }
 
 export default Object.freeze({
@@ -4932,7 +4915,7 @@ export default Object.freeze({
     FfiConverterTypeOpenStreamResult,
     FfiConverterTypeP2pEndpoint,
     FfiConverterTypeP2pEvent,
-    FfiConverterTypeP2pEventListener,
+    FfiConverterTypeP2pEventDoorbell,
     FfiConverterTypePathKind,
     FfiConverterTypePubsubRouter,
     FfiConverterTypeReachability,

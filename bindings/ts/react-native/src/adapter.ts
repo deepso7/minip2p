@@ -27,6 +27,7 @@ import type {
   PathKind,
 } from "@minip2p/core/backend";
 
+import { EventDrain } from "./event-drain";
 import {
   FfiError_Tags,
   P2pEndpoint,
@@ -41,7 +42,7 @@ import type {
   KnownPeerInfo as NativeKnownPeerInfo,
   MdnsOptions as NativeMdnsOptions,
   P2pEvent as NativeP2pEvent,
-  P2pEventListener,
+  P2pEventDoorbell,
   RelayReservationInfo as NativeRelayReservationInfo,
   TransportOptions as NativeTransportOptions,
 } from "./native";
@@ -50,7 +51,8 @@ import nativeModule from "./NativeMinip2p";
 class ReactNativeBackend implements Minip2pBackend {
   readonly #endpoint: P2pEndpoint;
   readonly #mdnsEnabled: boolean;
-  #listener: P2pEventListener | undefined;
+  #doorbell: P2pEventDoorbell | undefined;
+  #events: EventDrain<NativeP2pEvent> | undefined;
 
   constructor(config: Minip2pConfig) {
     this.#mdnsEnabled = config.mdns !== undefined && config.mdns !== false;
@@ -74,25 +76,27 @@ class ReactNativeBackend implements Minip2pBackend {
   }
 
   start(listener: (event: P2pEvent) => void): void {
-    this.#listener = {
-      onEvent: (event) => {
-        try {
-          listener(normalizeEvent(event));
-        } catch {
-          // A malformed native value cannot unwind through the callback ABI.
-        }
+    this.#events = new EventDrain(
+      (limit) => this.#endpoint.drainEvents(limit),
+      (event) => listener(normalizeEvent(event))
+    );
+    this.#doorbell = {
+      onEventsReady: () => {
+        this.#events?.ring();
       },
     };
     translateErrors(() => {
-      this.#endpoint.start(this.#listener as P2pEventListener);
+      this.#endpoint.start(this.#doorbell as P2pEventDoorbell);
     });
   }
 
   close(): void {
     try {
       this.#endpoint.stop();
+      this.#events?.stop();
       this.#endpoint.uniffiDestroy();
-      this.#listener = undefined;
+      this.#events = undefined;
+      this.#doorbell = undefined;
     } finally {
       if (this.#mdnsEnabled) {
         nativeModule.setMdnsEnabled(false);

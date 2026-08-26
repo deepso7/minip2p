@@ -12,28 +12,6 @@
 namespace react = facebook::react;
 namespace jsi = facebook::jsi;
 
-namespace minip2p_callback_context {
-thread_local unsigned int depth = 0;
-
-class Scope final {
- public:
-  Scope() noexcept {
-    depth += 1;
-  }
-
-  ~Scope() {
-    depth -= 1;
-  }
-
-  Scope(const Scope&) = delete;
-  Scope& operator=(const Scope&) = delete;
-};
-
-bool active() noexcept {
-  return depth != 0;
-}
-} // namespace minip2p_callback_context
-
 // Calling into Rust.
 extern "C" {
     typedef void
@@ -152,15 +130,29 @@ extern "C" {
     UniffiForeignFutureResultVoid result
     );
     typedef void
-    (*UniffiCallbackInterfaceP2pEventListenerMethod0)(
+    (*UniffiCallbackInterfaceP2pEventDoorbellMethod0)(
     uint64_t uniffi_handle,
-    RustBuffer event,
     void * uniffi_out_return, RustCallStatus* rust_call_status
-    );typedef struct UniffiVTableCallbackInterfaceP2pEventListener {
+    );typedef struct UniffiVTableCallbackInterfaceP2pEventDoorbell {
         UniffiCallbackInterfaceFree uniffi_free;
         UniffiCallbackInterfaceClone uniffi_clone;
-        UniffiCallbackInterfaceP2pEventListenerMethod0 on_event;
-    } UniffiVTableCallbackInterfaceP2pEventListener;
+        UniffiCallbackInterfaceP2pEventDoorbellMethod0 on_events_ready;
+    } UniffiVTableCallbackInterfaceP2pEventDoorbell;
+    /*handle*/ uint64_t uniffi_minip2p_ffi_fn_clone_p2peventdoorbell(
+        /*handle*/ uint64_t handle,
+        RustCallStatus *uniffi_out_err
+    );
+    void uniffi_minip2p_ffi_fn_free_p2peventdoorbell(
+        /*handle*/ uint64_t handle,
+        RustCallStatus *uniffi_out_err
+    );
+    void uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventdoorbell(
+        UniffiVTableCallbackInterfaceP2pEventDoorbell * vtable
+    );
+    void uniffi_minip2p_ffi_fn_method_p2peventdoorbell_on_events_ready(
+        /*handle*/ uint64_t ptr,
+        RustCallStatus *uniffi_out_err
+    );
     /*handle*/ uint64_t uniffi_minip2p_ffi_fn_clone_p2pendpoint(
         /*handle*/ uint64_t handle,
         RustCallStatus *uniffi_out_err
@@ -244,6 +236,11 @@ extern "C" {
         /*handle*/ uint64_t ptr,
         RustCallStatus *uniffi_out_err
     );
+    RustBuffer uniffi_minip2p_ffi_fn_method_p2pendpoint_drain_events(
+        /*handle*/ uint64_t ptr,
+        uint32_t limit,
+        RustCallStatus *uniffi_out_err
+    );
     int8_t uniffi_minip2p_ffi_fn_method_p2pendpoint_is_peer_ready(
         /*handle*/ uint64_t ptr,
         RustBuffer peer_id,
@@ -316,7 +313,7 @@ extern "C" {
     );
     void uniffi_minip2p_ffi_fn_method_p2pendpoint_start(
         /*handle*/ uint64_t ptr,
-        /*handle*/ uint64_t listener,
+        /*handle*/ uint64_t doorbell,
         RustCallStatus *uniffi_out_err
     );
     void uniffi_minip2p_ffi_fn_method_p2pendpoint_stop(
@@ -336,22 +333,6 @@ extern "C" {
     int8_t uniffi_minip2p_ffi_fn_method_p2pendpoint_wait_stopped(
         /*handle*/ uint64_t ptr,
         uint64_t timeout_ms,
-        RustCallStatus *uniffi_out_err
-    );
-    /*handle*/ uint64_t uniffi_minip2p_ffi_fn_clone_p2peventlistener(
-        /*handle*/ uint64_t handle,
-        RustCallStatus *uniffi_out_err
-    );
-    void uniffi_minip2p_ffi_fn_free_p2peventlistener(
-        /*handle*/ uint64_t handle,
-        RustCallStatus *uniffi_out_err
-    );
-    void uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventlistener(
-        UniffiVTableCallbackInterfaceP2pEventListener * vtable
-    );
-    void uniffi_minip2p_ffi_fn_method_p2peventlistener_on_event(
-        /*handle*/ uint64_t ptr,
-        RustBuffer event,
         RustCallStatus *uniffi_out_err
     );
     RustBuffer uniffi_minip2p_ffi_fn_func_circuit_address(
@@ -568,6 +549,8 @@ extern "C" {
     );
     uint16_t uniffi_minip2p_ffi_checksum_func_peer_id_from_secret_key(
     );
+    uint16_t uniffi_minip2p_ffi_checksum_method_p2peventdoorbell_on_events_ready(
+    );
     uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_abandon_stream(
     );
     uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_active_reservation(
@@ -595,6 +578,8 @@ extern "C" {
     uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_disconnect(
     );
     uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_discovery_now_ms(
+    );
+    uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_drain_events(
     );
     uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_is_peer_ready(
     );
@@ -633,8 +618,6 @@ extern "C" {
     uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_unsubscribe(
     );
     uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_wait_stopped(
-    );
-    uint16_t uniffi_minip2p_ffi_checksum_method_p2peventlistener_on_event(
     );
     uint16_t uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new(
     );
@@ -1158,7 +1141,7 @@ namespace uniffi::minip2p_ffi::cb::foreignfuturedroppedcallback {
     // Implementation of free callback function CallbackInterfaceFree
 
 
-// Callback function: uniffi::minip2p_ffi::st::vtablecallbackinterfacep2peventlistener::vtablecallbackinterfacep2peventlistener::free::UniffiCallbackInterfaceFree
+// Callback function: uniffi::minip2p_ffi::st::vtablecallbackinterfacep2peventdoorbell::vtablecallbackinterfacep2peventdoorbell::free::UniffiCallbackInterfaceFree
 //
 // We have the following constraints:
 // - we need to pass a function pointer to Rust.
@@ -1170,7 +1153,7 @@ namespace uniffi::minip2p_ffi::cb::foreignfuturedroppedcallback {
 //
 // We then give the `callback` function pointer to Rust which will call the lambda sometime in the
 // future.
-namespace uniffi::minip2p_ffi::st::vtablecallbackinterfacep2peventlistener::vtablecallbackinterfacep2peventlistener::free {
+namespace uniffi::minip2p_ffi::st::vtablecallbackinterfacep2peventdoorbell::vtablecallbackinterfacep2peventdoorbell::free {
     using namespace facebook;
 
     // We need to store a lambda in a global so we can call it from
@@ -1228,7 +1211,7 @@ namespace uniffi::minip2p_ffi::st::vtablecallbackinterfacep2peventlistener::vtab
     }
 
     [[maybe_unused]] static UniffiCallbackInterfaceFree
-    makeCallbackFunction( // uniffi::minip2p_ffi::st::vtablecallbackinterfacep2peventlistener::vtablecallbackinterfacep2peventlistener::free
+    makeCallbackFunction( // uniffi::minip2p_ffi::st::vtablecallbackinterfacep2peventdoorbell::vtablecallbackinterfacep2peventdoorbell::free
                     jsi::Runtime &rt,
                      std::shared_ptr<uniffi_runtime::UniffiCallInvoker> callInvoker,
                      const jsi::Value &value) {
@@ -1271,7 +1254,7 @@ namespace uniffi::minip2p_ffi::st::vtablecallbackinterfacep2peventlistener::vtab
         // then the pointer will no longer be left dangling.
         rsLambda = nullptr;
     }
-} // namespace uniffi::minip2p_ffi::st::vtablecallbackinterfacep2peventlistener::vtablecallbackinterfacep2peventlistener::free
+} // namespace uniffi::minip2p_ffi::st::vtablecallbackinterfacep2peventdoorbell::vtablecallbackinterfacep2peventdoorbell::free
 namespace uniffi::minip2p_ffi {
 using namespace facebook;
 using CallInvoker = uniffi_runtime::UniffiCallInvoker;
@@ -2190,10 +2173,10 @@ template <> struct Bridging<UniffiForeignFutureCompleteVoid> {
   }
 };
 } // namespace uniffi::minip2p_ffi
-    // Implementation of CallbackInterfaceClone for vtable field uniffi_clone in VTableCallbackInterfaceP2pEventListener
+    // Implementation of CallbackInterfaceClone for vtable field uniffi_clone in VTableCallbackInterfaceP2pEventDoorbell
 
 
-// Callback function: uniffi::minip2p_ffi::cb::callbackinterfaceclone::vtablecallbackinterfacep2peventlistener::UniffiCallbackInterfaceClone
+// Callback function: uniffi::minip2p_ffi::cb::callbackinterfaceclone::vtablecallbackinterfacep2peventdoorbell::UniffiCallbackInterfaceClone
 //
 // We have the following constraints:
 // - we need to pass a function pointer to Rust.
@@ -2205,7 +2188,7 @@ template <> struct Bridging<UniffiForeignFutureCompleteVoid> {
 //
 // We then give the `callback` function pointer to Rust which will call the lambda sometime in the
 // future.
-namespace uniffi::minip2p_ffi::cb::callbackinterfaceclone::vtablecallbackinterfacep2peventlistener {
+namespace uniffi::minip2p_ffi::cb::callbackinterfaceclone::vtablecallbackinterfacep2peventdoorbell {
     using namespace facebook;
 
     // We need to store a lambda in a global so we can call it from
@@ -2273,7 +2256,7 @@ namespace uniffi::minip2p_ffi::cb::callbackinterfaceclone::vtablecallbackinterfa
     }
 
     [[maybe_unused]] static UniffiCallbackInterfaceClone
-    makeCallbackFunction( // uniffi::minip2p_ffi::cb::callbackinterfaceclone::vtablecallbackinterfacep2peventlistener
+    makeCallbackFunction( // uniffi::minip2p_ffi::cb::callbackinterfaceclone::vtablecallbackinterfacep2peventdoorbell
                     jsi::Runtime &rt,
                      std::shared_ptr<uniffi_runtime::UniffiCallInvoker> callInvoker,
                      const jsi::Value &value) {
@@ -2315,11 +2298,11 @@ namespace uniffi::minip2p_ffi::cb::callbackinterfaceclone::vtablecallbackinterfa
         // then the pointer will no longer be left dangling.
         rsLambda = nullptr;
     }
-} // namespace uniffi::minip2p_ffi::cb::callbackinterfaceclone::vtablecallbackinterfacep2peventlistener
-    // Implementation of CallbackInterfaceP2pEventListenerMethod0 for vtable field on_event in VTableCallbackInterfaceP2pEventListener
+} // namespace uniffi::minip2p_ffi::cb::callbackinterfaceclone::vtablecallbackinterfacep2peventdoorbell
+    // Implementation of CallbackInterfaceP2pEventDoorbellMethod0 for vtable field on_events_ready in VTableCallbackInterfaceP2pEventDoorbell
 
 
-// Callback function: uniffi::minip2p_ffi::cb::callbackinterfacep2peventlistenermethod0::vtablecallbackinterfacep2peventlistener::UniffiCallbackInterfaceP2pEventListenerMethod0
+// Callback function: uniffi::minip2p_ffi::cb::callbackinterfacep2peventdoorbellmethod0::vtablecallbackinterfacep2peventdoorbell::UniffiCallbackInterfaceP2pEventDoorbellMethod0
 //
 // We have the following constraints:
 // - we need to pass a function pointer to Rust.
@@ -2331,12 +2314,12 @@ namespace uniffi::minip2p_ffi::cb::callbackinterfaceclone::vtablecallbackinterfa
 //
 // We then give the `callback` function pointer to Rust which will call the lambda sometime in the
 // future.
-namespace uniffi::minip2p_ffi::cb::callbackinterfacep2peventlistenermethod0::vtablecallbackinterfacep2peventlistener {
+namespace uniffi::minip2p_ffi::cb::callbackinterfacep2peventdoorbellmethod0::vtablecallbackinterfacep2peventdoorbell {
     using namespace facebook;
 
     // We need to store a lambda in a global so we can call it from
     // a function pointer. The function pointer is passed to Rust.
-    static std::function<void(uint64_t, RustBuffer, void *, RustCallStatus*)> rsLambda = nullptr;
+    static std::function<void(uint64_t, void *, RustCallStatus*)> rsLambda = nullptr;
 
     // This is the main body of the callback. It's called from the lambda,
     // which itself is called from the callback function which is passed to Rust.
@@ -2344,14 +2327,11 @@ namespace uniffi::minip2p_ffi::cb::callbackinterfacep2peventlistenermethod0::vta
                      std::shared_ptr<uniffi_runtime::UniffiCallInvoker> callInvoker,
                      std::shared_ptr<jsi::Value> callbackValue
             ,uint64_t rs_uniffiHandle
-            ,RustBuffer rs_event
             ,void * rs_uniffiOutReturn, RustCallStatus* uniffi_call_status) {
 
         // Convert the arguments from Rust, into jsi::Values.
         // We'll use the Bridging class to do this…
         auto js_uniffiHandle = uniffi_jsi::Bridging<uint64_t>::toJs(rt, callInvoker, rs_uniffiHandle);
-        auto js_event = uniffi::minip2p_ffi::Bridging<RustBuffer>::toJs(rt, callInvoker, rs_event);
-        minip2p_callback_context::Scope callbackScope;
 
         // Now we are ready to call the callback.
         // We are already on the JS thread, because this `body` function was
@@ -2359,7 +2339,7 @@ namespace uniffi::minip2p_ffi::cb::callbackinterfacep2peventlistenermethod0::vta
         try {
             // Getting the callback function
             auto cb = callbackValue->asObject(rt).asFunction(rt);
-            auto uniffiResult = cb.call(rt, js_uniffiHandle, js_event
+            auto uniffiResult = cb.call(rt, js_uniffiHandle
             );
 
             // Now copy the result back from JS into the RustCallStatus object.
@@ -2372,13 +2352,13 @@ namespace uniffi::minip2p_ffi::cb::callbackinterfacep2peventlistenermethod0::vta
 
 
         } catch (const jsi::JSError &error) {
-            std::cout << "Error in callback UniffiCallbackInterfaceP2pEventListenerMethod0: "
+            std::cout << "Error in callback UniffiCallbackInterfaceP2pEventDoorbellMethod0: "
                     << error.what() << std::endl;
             throw error;
         }
     }
 
-    static void callback(uint64_t rs_uniffiHandle, RustBuffer rs_event, void * rs_uniffiOutReturn, RustCallStatus* uniffi_call_status) {
+    static void callback(uint64_t rs_uniffiHandle, void * rs_uniffiOutReturn, RustCallStatus* uniffi_call_status) {
         // If the runtime has shutdown, then there is no point in trying to
         // call into Javascript. BUT how do we tell if the runtime has shutdown?
         //
@@ -2396,12 +2376,11 @@ namespace uniffi::minip2p_ffi::cb::callbackinterfacep2peventlistenermethod0::vta
         // are all in the lambda.
         rsLambda(
             rs_uniffiHandle,
-            rs_event,
             rs_uniffiOutReturn, uniffi_call_status);
     }
 
-    [[maybe_unused]] static UniffiCallbackInterfaceP2pEventListenerMethod0
-    makeCallbackFunction( // uniffi::minip2p_ffi::cb::callbackinterfacep2peventlistenermethod0::vtablecallbackinterfacep2peventlistener
+    [[maybe_unused]] static UniffiCallbackInterfaceP2pEventDoorbellMethod0
+    makeCallbackFunction( // uniffi::minip2p_ffi::cb::callbackinterfacep2peventdoorbellmethod0::vtablecallbackinterfacep2peventdoorbell
                     jsi::Runtime &rt,
                      std::shared_ptr<uniffi_runtime::UniffiCallInvoker> callInvoker,
                      const jsi::Value &value) {
@@ -2419,18 +2398,16 @@ namespace uniffi::minip2p_ffi::cb::callbackinterfacep2peventlistenermethod0::vta
         }
         auto callbackFunction = value.asObject(rt).asFunction(rt);
         auto callbackValue = std::make_shared<jsi::Value>(rt, callbackFunction);
-        rsLambda = [&rt, callInvoker, callbackValue](uint64_t rs_uniffiHandle, RustBuffer rs_event, void * rs_uniffiOutReturn, RustCallStatus* uniffi_call_status) {
+        rsLambda = [&rt, callInvoker, callbackValue](uint64_t rs_uniffiHandle, void * rs_uniffiOutReturn, RustCallStatus* uniffi_call_status) {
                 // We immediately make a lambda which will do the work of transforming the
                 // arguments into JSI values and calling the callback.
                 uniffi_runtime::UniffiCallFunc jsLambda = [
                     callInvoker,
                     callbackValue
                     , rs_uniffiHandle
-                    , rs_event
                     , rs_uniffiOutReturn, uniffi_call_status](jsi::Runtime &rt) mutable {
                     body(rt, callInvoker, callbackValue
                         , rs_uniffiHandle
-                        , rs_event
                         , rs_uniffiOutReturn, uniffi_call_status);
                 };
                 // We'll then call that lambda from the callInvoker which will
@@ -2447,36 +2424,36 @@ namespace uniffi::minip2p_ffi::cb::callbackinterfacep2peventlistenermethod0::vta
         // then the pointer will no longer be left dangling.
         rsLambda = nullptr;
     }
-} // namespace uniffi::minip2p_ffi::cb::callbackinterfacep2peventlistenermethod0::vtablecallbackinterfacep2peventlistener
+} // namespace uniffi::minip2p_ffi::cb::callbackinterfacep2peventdoorbellmethod0::vtablecallbackinterfacep2peventdoorbell
 namespace uniffi::minip2p_ffi {
 using namespace facebook;
 using CallInvoker = uniffi_runtime::UniffiCallInvoker;
 
-template <> struct Bridging<UniffiVTableCallbackInterfaceP2pEventListener> {
-  static UniffiVTableCallbackInterfaceP2pEventListener fromJs(jsi::Runtime &rt,
+template <> struct Bridging<UniffiVTableCallbackInterfaceP2pEventDoorbell> {
+  static UniffiVTableCallbackInterfaceP2pEventDoorbell fromJs(jsi::Runtime &rt,
     std::shared_ptr<CallInvoker> callInvoker,
     const jsi::Value &jsValue
   ) {
     // Check if the input is an object
     if (!jsValue.isObject()) {
-      throw jsi::JSError(rt, "Expected an object for UniffiVTableCallbackInterfaceP2pEventListener");
+      throw jsi::JSError(rt, "Expected an object for UniffiVTableCallbackInterfaceP2pEventDoorbell");
     }
 
     // Get the object from the jsi::Value
     auto jsObject = jsValue.getObject(rt);
 
     // Create the vtable struct
-    UniffiVTableCallbackInterfaceP2pEventListener rsObject;
+    UniffiVTableCallbackInterfaceP2pEventDoorbell rsObject;
 
     // Create the vtable from the js callbacks.
-    rsObject.uniffi_free = uniffi::minip2p_ffi::st::vtablecallbackinterfacep2peventlistener::vtablecallbackinterfacep2peventlistener::free::makeCallbackFunction(
+    rsObject.uniffi_free = uniffi::minip2p_ffi::st::vtablecallbackinterfacep2peventdoorbell::vtablecallbackinterfacep2peventdoorbell::free::makeCallbackFunction(
           rt, callInvoker, jsObject.getProperty(rt, "uniffi_free")
         );
-    rsObject.uniffi_clone = uniffi::minip2p_ffi::cb::callbackinterfaceclone::vtablecallbackinterfacep2peventlistener::makeCallbackFunction(
+    rsObject.uniffi_clone = uniffi::minip2p_ffi::cb::callbackinterfaceclone::vtablecallbackinterfacep2peventdoorbell::makeCallbackFunction(
           rt, callInvoker, jsObject.getProperty(rt, "uniffi_clone")
         );
-    rsObject.on_event = uniffi::minip2p_ffi::cb::callbackinterfacep2peventlistenermethod0::vtablecallbackinterfacep2peventlistener::makeCallbackFunction(
-          rt, callInvoker, jsObject.getProperty(rt, "on_event")
+    rsObject.on_events_ready = uniffi::minip2p_ffi::cb::callbackinterfacep2peventdoorbellmethod0::vtablecallbackinterfacep2peventdoorbell::makeCallbackFunction(
+          rt, callInvoker, jsObject.getProperty(rt, "on_events_ready")
         );
 
     return rsObject;
@@ -2545,6 +2522,38 @@ NativeMinip2pFfi::NativeMinip2pFfi(
         3,
         [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
             return this->cpp_uniffi_internal_fn_func_ffi__read_string_from_buffer(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_minip2p_ffi_fn_clone_p2peventdoorbell"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_clone_p2peventdoorbell"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_minip2p_ffi_fn_clone_p2peventdoorbell(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_minip2p_ffi_fn_free_p2peventdoorbell"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_free_p2peventdoorbell"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_minip2p_ffi_fn_free_p2peventdoorbell(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventdoorbell"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventdoorbell"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventdoorbell(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_minip2p_ffi_fn_method_p2peventdoorbell_on_events_ready"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_method_p2peventdoorbell_on_events_ready"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_minip2p_ffi_fn_method_p2peventdoorbell_on_events_ready(rt, thisVal, args, count);
         }
     );
     props["ubrn_uniffi_minip2p_ffi_fn_clone_p2pendpoint"] = jsi::Function::createFromHostFunction(
@@ -2681,6 +2690,14 @@ NativeMinip2pFfi::NativeMinip2pFfi(
         1,
         [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
             return this->cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_discovery_now_ms(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_drain_events"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_drain_events"),
+        2,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_drain_events(rt, thisVal, args, count);
         }
     );
     props["ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_is_peer_ready"] = jsi::Function::createFromHostFunction(
@@ -2835,38 +2852,6 @@ NativeMinip2pFfi::NativeMinip2pFfi(
             return this->cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_wait_stopped(rt, thisVal, args, count);
         }
     );
-    props["ubrn_uniffi_minip2p_ffi_fn_clone_p2peventlistener"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_clone_p2peventlistener"),
-        1,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_minip2p_ffi_fn_clone_p2peventlistener(rt, thisVal, args, count);
-        }
-    );
-    props["ubrn_uniffi_minip2p_ffi_fn_free_p2peventlistener"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_free_p2peventlistener"),
-        1,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_minip2p_ffi_fn_free_p2peventlistener(rt, thisVal, args, count);
-        }
-    );
-    props["ubrn_uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventlistener"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventlistener"),
-        1,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventlistener(rt, thisVal, args, count);
-        }
-    );
-    props["ubrn_uniffi_minip2p_ffi_fn_method_p2peventlistener_on_event"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_method_p2peventlistener_on_event"),
-        2,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_minip2p_ffi_fn_method_p2peventlistener_on_event(rt, thisVal, args, count);
-        }
-    );
     props["ubrn_uniffi_minip2p_ffi_fn_func_circuit_address"] = jsi::Function::createFromHostFunction(
         rt,
         jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_func_circuit_address"),
@@ -2913,6 +2898,14 @@ NativeMinip2pFfi::NativeMinip2pFfi(
         0,
         [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
             return this->cpp_uniffi_minip2p_ffi_checksum_func_peer_id_from_secret_key(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_minip2p_ffi_checksum_method_p2peventdoorbell_on_events_ready"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_checksum_method_p2peventdoorbell_on_events_ready"),
+        0,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_minip2p_ffi_checksum_method_p2peventdoorbell_on_events_ready(rt, thisVal, args, count);
         }
     );
     props["ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_abandon_stream"] = jsi::Function::createFromHostFunction(
@@ -3025,6 +3018,14 @@ NativeMinip2pFfi::NativeMinip2pFfi(
         0,
         [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
             return this->cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_discovery_now_ms(rt, thisVal, args, count);
+        }
+    );
+    props["ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_drain_events"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_drain_events"),
+        0,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_drain_events(rt, thisVal, args, count);
         }
     );
     props["ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_is_peer_ready"] = jsi::Function::createFromHostFunction(
@@ -3179,14 +3180,6 @@ NativeMinip2pFfi::NativeMinip2pFfi(
             return this->cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_wait_stopped(rt, thisVal, args, count);
         }
     );
-    props["ubrn_uniffi_minip2p_ffi_checksum_method_p2peventlistener_on_event"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_checksum_method_p2peventlistener_on_event"),
-        0,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_minip2p_ffi_checksum_method_p2peventlistener_on_event(rt, thisVal, args, count);
-        }
-    );
     props["ubrn_uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new"] = jsi::Function::createFromHostFunction(
         rt,
         jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_checksum_constructor_p2pendpoint_new"),
@@ -3203,20 +3196,20 @@ NativeMinip2pFfi::NativeMinip2pFfi(
             return this->cpp_ffi_minip2p_ffi_uniffi_contract_version(rt, thisVal, args, count);
         }
     );
+    props["ubrn_uniffi_internal_fn_method_p2peventdoorbell_ffi__bless_pointer"] = jsi::Function::createFromHostFunction(
+        rt,
+        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_internal_fn_method_p2peventdoorbell_ffi__bless_pointer"),
+        1,
+        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+            return this->cpp_uniffi_internal_fn_method_p2peventdoorbell_ffi__bless_pointer(rt, thisVal, args, count);
+        }
+    );
     props["ubrn_uniffi_internal_fn_method_p2pendpoint_ffi__bless_pointer"] = jsi::Function::createFromHostFunction(
         rt,
         jsi::PropNameID::forAscii(rt, "ubrn_uniffi_internal_fn_method_p2pendpoint_ffi__bless_pointer"),
         1,
         [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
             return this->cpp_uniffi_internal_fn_method_p2pendpoint_ffi__bless_pointer(rt, thisVal, args, count);
-        }
-    );
-    props["ubrn_uniffi_internal_fn_method_p2peventlistener_ffi__bless_pointer"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_internal_fn_method_p2peventlistener_ffi__bless_pointer"),
-        1,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_internal_fn_method_p2peventlistener_ffi__bless_pointer(rt, thisVal, args, count);
         }
     );
 
@@ -3354,9 +3347,9 @@ uniffi::minip2p_ffi::cb::rustfuturecontinuationcallback::cleanup();
     // Cleanup for callback function ForeignFutureDroppedCallback
 uniffi::minip2p_ffi::cb::foreignfuturedroppedcallback::cleanup();
     // Cleanup for "free" callback function CallbackInterfaceFree
-uniffi::minip2p_ffi::st::vtablecallbackinterfacep2peventlistener::vtablecallbackinterfacep2peventlistener::free::cleanup();
-uniffi::minip2p_ffi::cb::callbackinterfaceclone::vtablecallbackinterfacep2peventlistener::cleanup();
-uniffi::minip2p_ffi::cb::callbackinterfacep2peventlistenermethod0::vtablecallbackinterfacep2peventlistener::cleanup();
+uniffi::minip2p_ffi::st::vtablecallbackinterfacep2peventdoorbell::vtablecallbackinterfacep2peventdoorbell::free::cleanup();
+uniffi::minip2p_ffi::cb::callbackinterfaceclone::vtablecallbackinterfacep2peventdoorbell::cleanup();
+uniffi::minip2p_ffi::cb::callbackinterfacep2peventdoorbellmethod0::vtablecallbackinterfacep2peventdoorbell::cleanup();
 }
 
 // Utility functions for serialization/deserialization of strings.
@@ -3374,6 +3367,15 @@ jsi::Value NativeMinip2pFfi::cpp_uniffi_internal_fn_func_ffi__string_from_buffer
 
 jsi::Value NativeMinip2pFfi::cpp_uniffi_internal_fn_func_ffi__read_string_from_buffer(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
     return uniffi_jsi::Bridging<std::string>::read_string_from_buffer(rt, args[0], args[1], args[2]);
+}jsi::Value NativeMinip2pFfi::cpp_uniffi_internal_fn_method_p2peventdoorbell_ffi__bless_pointer(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+    auto pointer = uniffi_jsi::Bridging<uint64_t>::fromJs(rt, callInvoker, args[0]);
+    auto static destructor = [](uint64_t p) {
+        RustCallStatus status = {0};
+        uniffi_minip2p_ffi_fn_free_p2peventdoorbell(p, &status);
+    };
+    auto ptrObj = std::make_shared<uniffi_jsi::DestructibleObject>(pointer, destructor);
+    auto obj = jsi::Object::createFromHostObject(rt, ptrObj);
+    return jsi::Value(rt, obj);
 }jsi::Value NativeMinip2pFfi::cpp_uniffi_internal_fn_method_p2pendpoint_ffi__bless_pointer(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
     auto pointer = uniffi_jsi::Bridging<uint64_t>::fromJs(rt, callInvoker, args[0]);
     auto static destructor = [](uint64_t p) {
@@ -3383,18 +3385,56 @@ jsi::Value NativeMinip2pFfi::cpp_uniffi_internal_fn_func_ffi__read_string_from_b
     auto ptrObj = std::make_shared<uniffi_jsi::DestructibleObject>(pointer, destructor);
     auto obj = jsi::Object::createFromHostObject(rt, ptrObj);
     return jsi::Value(rt, obj);
-}jsi::Value NativeMinip2pFfi::cpp_uniffi_internal_fn_method_p2peventlistener_ffi__bless_pointer(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-    auto pointer = uniffi_jsi::Bridging<uint64_t>::fromJs(rt, callInvoker, args[0]);
-    auto static destructor = [](uint64_t p) {
-        RustCallStatus status = {0};
-        uniffi_minip2p_ffi_fn_free_p2peventlistener(p, &status);
-    };
-    auto ptrObj = std::make_shared<uniffi_jsi::DestructibleObject>(pointer, destructor);
-    auto obj = jsi::Object::createFromHostObject(rt, ptrObj);
-    return jsi::Value(rt, obj);
 }
 
 // Methods calling directly into the uniffi generated C API of the Rust crate.
+jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_clone_p2peventdoorbell(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        auto value = uniffi_minip2p_ffi_fn_clone_p2peventdoorbell(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]),
+            &status
+        );
+        uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+
+        return uniffi_jsi::Bridging</*handle*/ uint64_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_free_p2peventdoorbell(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        uniffi_minip2p_ffi_fn_free_p2peventdoorbell(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]),
+            &status
+        );
+        uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+
+        return jsi::Value::undefined();
+}
+jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventdoorbell(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+    auto vtableInstance =
+        uniffi::minip2p_ffi::Bridging<UniffiVTableCallbackInterfaceP2pEventDoorbell>::fromJs(
+            rt,
+            callInvoker,
+            args[0]
+        );
+
+    std::lock_guard<std::mutex> lock(uniffi::minip2p_ffi::registry::vtableMutex);
+    uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventdoorbell(
+        uniffi::minip2p_ffi::registry::putTable(
+            "UniffiVTableCallbackInterfaceP2pEventDoorbell",
+            vtableInstance
+        )
+    );
+    return jsi::Value::undefined();
+}
+jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2peventdoorbell_on_events_ready(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        uniffi_minip2p_ffi_fn_method_p2peventdoorbell_on_events_ready(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]),
+            &status
+        );
+        uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+
+        return jsi::Value::undefined();
+}
 jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_clone_p2pendpoint(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
         auto value = uniffi_minip2p_ffi_fn_clone_p2pendpoint(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]),
@@ -3558,6 +3598,16 @@ jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_discon
 jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_discovery_now_ms(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
         auto value = uniffi_minip2p_ffi_fn_method_p2pendpoint_discovery_now_ms(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]),
+            &status
+        );
+        uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
+
+
+        return uniffi::minip2p_ffi::Bridging<RustBuffer>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_drain_events(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
+        auto value = uniffi_minip2p_ffi_fn_method_p2pendpoint_drain_events(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi_jsi::Bridging<uint32_t>::fromJs(rt, callInvoker, args[1]),
             &status
         );
         uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
@@ -3746,14 +3796,6 @@ jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_unsubs
         return uniffi_jsi::Bridging<int8_t>::toJs(rt, callInvoker, value);
 }
 jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_wait_stopped(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-        if (minip2p_callback_context::active()) {
-            RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
-            // clonePointer creates a per-call Arc handle that Rust normally consumes.
-            // This early return must release that clone without calling wait_stopped.
-            uniffi_minip2p_ffi_fn_free_p2pendpoint(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), &status);
-            uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
-            return uniffi_jsi::Bridging<int8_t>::toJs(rt, callInvoker, int8_t{0});
-        }
         RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
         auto value = uniffi_minip2p_ffi_fn_method_p2pendpoint_wait_stopped(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi_jsi::Bridging<uint64_t>::fromJs(rt, callInvoker, args[1]),
             &status
@@ -3762,53 +3804,6 @@ jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_wait_s
 
 
         return uniffi_jsi::Bridging<int8_t>::toJs(rt, callInvoker, value);
-}
-jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_clone_p2peventlistener(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-        RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
-        auto value = uniffi_minip2p_ffi_fn_clone_p2peventlistener(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]),
-            &status
-        );
-        uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
-
-
-        return uniffi_jsi::Bridging</*handle*/ uint64_t>::toJs(rt, callInvoker, value);
-}
-jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_free_p2peventlistener(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-        RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
-        uniffi_minip2p_ffi_fn_free_p2peventlistener(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]),
-            &status
-        );
-        uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
-
-
-        return jsi::Value::undefined();
-}
-jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventlistener(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-    auto vtableInstance =
-        uniffi::minip2p_ffi::Bridging<UniffiVTableCallbackInterfaceP2pEventListener>::fromJs(
-            rt,
-            callInvoker,
-            args[0]
-        );
-
-    std::lock_guard<std::mutex> lock(uniffi::minip2p_ffi::registry::vtableMutex);
-    uniffi_minip2p_ffi_fn_init_callback_vtable_p2peventlistener(
-        uniffi::minip2p_ffi::registry::putTable(
-            "UniffiVTableCallbackInterfaceP2pEventListener",
-            vtableInstance
-        )
-    );
-    return jsi::Value::undefined();
-}
-jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2peventlistener_on_event(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-        RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
-        uniffi_minip2p_ffi_fn_method_p2peventlistener_on_event(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::minip2p_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]),
-            &status
-        );
-        uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
-
-
-        return jsi::Value::undefined();
 }
 jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_func_circuit_address(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
@@ -3855,6 +3850,13 @@ jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_func_generate_secre
 }
 jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_func_peer_id_from_secret_key(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         auto value = uniffi_minip2p_ffi_checksum_func_peer_id_from_secret_key(
+        );
+
+
+        return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_method_p2peventdoorbell_on_events_ready(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        auto value = uniffi_minip2p_ffi_checksum_method_p2peventdoorbell_on_events_ready(
         );
 
 
@@ -3953,6 +3955,13 @@ jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_
 }
 jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_discovery_now_ms(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         auto value = uniffi_minip2p_ffi_checksum_method_p2pendpoint_discovery_now_ms(
+        );
+
+
+        return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
+}
+jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_drain_events(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
+        auto value = uniffi_minip2p_ffi_checksum_method_p2pendpoint_drain_events(
         );
 
 
@@ -4086,13 +4095,6 @@ jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_
 }
 jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_wait_stopped(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         auto value = uniffi_minip2p_ffi_checksum_method_p2pendpoint_wait_stopped(
-        );
-
-
-        return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
-}
-jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_method_p2peventlistener_on_event(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-        auto value = uniffi_minip2p_ffi_checksum_method_p2peventlistener_on_event(
         );
 
 
