@@ -1,6 +1,7 @@
 packages:
   - core
   - node
+  - node/npm/*
   - react-native
   - react-native/example
   - test-fixtures

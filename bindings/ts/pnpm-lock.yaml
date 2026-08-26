@@ -85,6 +85,20 @@ importers:
         specifier: 'catalog:'
         version: 7.0.2
 
+  node/npm/darwin-arm64: {}
+
+  node/npm/darwin-x64: {}
+
+  node/npm/linux-arm64-gnu: {}
+
+  node/npm/linux-arm64-musl: {}
+
+  node/npm/linux-x64-gnu: {}
+
+  node/npm/linux-x64-musl: {}
+
+  node/npm/win32-x64-msvc: {}
+
   react-native:
     dependencies:
       '@minip2p/core':

@@ -11,7 +11,7 @@ const supportedTargets = [
   "linux-arm64-musl",
   "darwin-x64",
   "darwin-arm64",
-  "win32-x64",
+  "win32-x64-msvc",
 ] as const;
 
 type SupportedTarget = (typeof supportedTargets)[number];
@@ -30,6 +30,9 @@ function linuxLibc(): "gnu" | "musl" {
 function currentTarget(): string {
   if (process.platform === "linux") {
     return `${process.platform}-${process.arch}-${linuxLibc()}`;
+  }
+  if (process.platform === "win32") {
+    return `${process.platform}-${process.arch}-msvc`;
   }
   return `${process.platform}-${process.arch}`;
 }
@@ -124,7 +127,12 @@ function loadNativeBinding(target: string): NativeBinding {
   }
 
   try {
-    const binding: unknown = require(`../minip2p.${target}.node`);
+    let binding: unknown;
+    try {
+      binding = require(`../minip2p.${target}.node`);
+    } catch {
+      binding = require(`@minip2p/node-${target}`);
+    }
     assertNativeBinding(binding);
     return binding;
   } catch (error) {
