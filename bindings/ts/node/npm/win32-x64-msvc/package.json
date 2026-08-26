@@ -1,13 +1,6 @@
 {
   "name": "@minip2p/node-win32-x64-msvc",
   "version": "0.4.6",
-  "cpu": [
-    "x64"
-  ],
-  "main": "minip2p.win32-x64-msvc.node",
-  "files": [
-    "minip2p.win32-x64-msvc.node"
-  ],
   "description": "Node.js bindings for minip2p",
   "keywords": [
     "libp2p",
@@ -19,14 +12,21 @@
     "rust"
   ],
   "license": "MIT",
-  "engines": {
-    "node": ">=24"
-  },
-  "publishConfig": {
-    "registry": "https://registry.npmjs.org/",
-    "access": "public"
-  },
+  "files": [
+    "minip2p.win32-x64-msvc.node"
+  ],
   "os": [
     "win32"
-  ]
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "minip2p.win32-x64-msvc.node",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "engines": {
+    "node": ">=24"
+  }
 }
