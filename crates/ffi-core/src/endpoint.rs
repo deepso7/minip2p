@@ -364,11 +364,12 @@ impl P2pEndpoint {
     /// Starts the detached background endpoint driver.
     pub fn start(&self, doorbell: Arc<dyn EventDoorbell>) -> Result<(), FfiError> {
         self.start_with(doorbell, |shared, doorbell| {
-            let doorbell = Self::spawn_doorbell(Arc::clone(&shared), doorbell)?;
+            let (doorbell, doorbell_thread_id) =
+                Self::spawn_doorbell(Arc::clone(&shared), doorbell)?;
             std::thread::Builder::new()
                 .name("minip2p-driver".into())
                 .spawn(move || crate::driver::run(shared, doorbell))
-                .map(drop)
+                .map(|_| doorbell_thread_id)
         })
     }
 
@@ -758,14 +759,13 @@ impl P2pEndpoint {
     fn spawn_doorbell(
         shared: Arc<Shared>,
         doorbell: Arc<dyn EventDoorbell>,
-    ) -> std::io::Result<Arc<dyn EventDoorbell>> {
+    ) -> std::io::Result<(Arc<dyn EventDoorbell>, std::thread::ThreadId)> {
         let (sender, receiver) = sync_channel(1);
         shared.doorbell_running.store(true, Ordering::Release);
         let thread_shared = Arc::clone(&shared);
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("minip2p-doorbell".into())
             .spawn(move || {
-                thread_shared.lock_state().doorbell_thread_id = Some(std::thread::current().id());
                 while receiver.recv().is_ok() {
                     for _ in 0..2 {
                         if catch_unwind(AssertUnwindSafe(|| doorbell.on_events_ready())).is_ok() {
@@ -779,17 +779,21 @@ impl P2pEndpoint {
                     .store(false, Ordering::Release);
                 thread_shared.stopped_cv.notify_all();
             })
-            .map(drop)
             .inspect_err(|_| {
                 shared.doorbell_running.store(false, Ordering::Release);
             })?;
-        Ok(Arc::new(DoorbellSender(sender)))
+        let thread_id = thread.thread().id();
+        drop(thread);
+        Ok((Arc::new(DoorbellSender(sender)), thread_id))
     }
 
     fn start_with(
         &self,
         doorbell: Arc<dyn EventDoorbell>,
-        spawn: impl FnOnce(Arc<Shared>, Arc<dyn EventDoorbell>) -> std::io::Result<()>,
+        spawn: impl FnOnce(
+            Arc<Shared>,
+            Arc<dyn EventDoorbell>,
+        ) -> std::io::Result<std::thread::ThreadId>,
     ) -> Result<(), FfiError> {
         let mut state = self.shared.lock_state();
         match state.lifecycle {
@@ -801,7 +805,7 @@ impl P2pEndpoint {
         let shared = Arc::clone(&self.shared);
         state.lifecycle = Lifecycle::Running;
         self.shared.driver_running.store(true, Ordering::Release);
-        spawn(shared, doorbell).map_err(|error| {
+        let doorbell_thread_id = spawn(shared, doorbell).map_err(|error| {
             state.lifecycle = Lifecycle::Stopped;
             state.endpoint.take();
             self.shared.driver_running.store(false, Ordering::Release);
@@ -810,6 +814,7 @@ impl P2pEndpoint {
                 detail: format!("failed to spawn endpoint driver: {error}"),
             }
         })?;
+        state.doorbell_thread_id = Some(doorbell_thread_id);
         Ok(())
     }
     /// Returns Rust-side background-driver diagnostics.
