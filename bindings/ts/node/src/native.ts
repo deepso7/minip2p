@@ -21,7 +21,8 @@ function linuxLibc(): "gnu" | "musl" {
   const header =
     report === undefined ? undefined : Reflect.get(report, "header");
   return header === undefined ||
-    Reflect.get(header, "glibcVersionRuntime") === undefined
+    (Reflect.get(header, "glibcVersionRuntime") === undefined &&
+      Reflect.get(header, "glibcVersionCompiler") === undefined)
     ? "musl"
     : "gnu";
 }
@@ -35,7 +36,7 @@ function currentTarget(): string {
 
 function unsupportedTarget(target: string, cause?: unknown): Error {
   return new Error(
-    `Unsupported minip2p Node target ${target}. Supported targets: ${supportedTargets.join(", ")}. Reinstall @minip2p/node without omitting optional dependencies.`,
+    `Unsupported minip2p Node target ${target}. Supported targets: ${supportedTargets.join(", ")}.`,
     cause === undefined ? undefined : { cause }
   );
 }
@@ -83,7 +84,7 @@ export interface NativeEndpoint {
   dialIp4: (address: string) => bigint;
   dialIp6: (address: string) => bigint;
   disconnect: (peerId: string) => void;
-  discoveryNowMs: () => bigint | undefined;
+  discoveryNowMs: () => bigint | null | undefined;
   drainEvents: (limit: number) => unknown[];
   isRunning: () => boolean;
   isPeerReady: (peerId: string) => boolean;

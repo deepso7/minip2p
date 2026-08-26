@@ -118,6 +118,7 @@ docs-site:
 
 bindings-check:
     cd bindings/ts && pnpm typecheck
+    cd bindings/ts && pnpm --filter @minip2p/node native:build
     cd bindings/ts && pnpm test
     cd bindings/ts && pnpm lint
     cd bindings/ts && pnpm build

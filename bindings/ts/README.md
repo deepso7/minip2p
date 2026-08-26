@@ -13,6 +13,7 @@ Platform adapters implement `@minip2p/core/backend` and re-export the public SDK
 ```sh
 pnpm install --frozen-lockfile
 pnpm typecheck
+pnpm --filter @minip2p/node native:build
 pnpm test
 pnpm lint
 pnpm build
