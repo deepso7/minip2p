@@ -494,6 +494,32 @@ test("stream async iteration yields chunks in order and ends on remote write clo
   endpoint.close();
 });
 
+test("stream async iteration keeps half-close EOF final when StreamClosed follows", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+  const stream = await opening;
+  const reading = (async () => {
+    for await (const _chunk of stream) {
+      // Wait for read-side EOF.
+    }
+  })();
+
+  backend.emit({
+    inner: { connId: 2, peerId: "peer", streamId: 3 },
+    tag: P2pEvent_Tags.StreamRemoteWriteClosed,
+  });
+  await reading;
+  backend.emit({
+    inner: { connId: 2, peerId: "peer", streamId: 3 },
+    tag: P2pEvent_Tags.StreamClosed,
+  });
+  await tick();
+
+  endpoint.close();
+});
+
 test("stream async iteration ends quietly when the endpoint closes", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
