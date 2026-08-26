@@ -177,6 +177,7 @@ export class Stream {
   #mode: "pull" | "flowing" | undefined;
   #remoteWriteClosed = false;
   #closed = false;
+  #terminalError: unknown;
 
   constructor(
     backend: Minip2pBackend,
@@ -237,15 +238,15 @@ export class Stream {
       );
     }
     this.#mode = "pull";
+    if (this.#closed) {
+      return Promise.reject(this.#terminalError);
+    }
     const buffered = this.#shift();
     if (buffered !== undefined) {
       return Promise.resolve(buffered);
     }
     if (this.#remoteWriteClosed) {
       return Promise.resolve(this.#shift());
-    }
-    if (this.#closed) {
-      return Promise.reject(new ClosedError());
     }
     return new Promise((resolve, reject) => {
       this.#reads.push({ reject, resolve });
@@ -357,6 +358,7 @@ export class Stream {
       return;
     }
     this.#closed = true;
+    this.#terminalError = error;
     this.#fifo.length = 0;
     this.#fifoBytes = 0;
     for (const read of this.#reads.splice(0)) {
@@ -510,14 +512,15 @@ export class Minip2pBase {
       }
       wake?.();
     });
+    const offClose = this.onClose(finish);
     const abort = () => {
       aborted = true;
       finish();
       offEvents();
+      offClose();
       buffer.clear();
       dropped = 0;
     };
-    const offClose = this.onClose(finish);
     const removeAbort = listenAbort(options.signal, abort);
     try {
       while (true) {
