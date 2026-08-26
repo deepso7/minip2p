@@ -471,25 +471,32 @@ jobs:
       run:
         working-directory: bindings/ts
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event.release.tag_name || github.sha }}
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: ${{ env.NODE_VERSION }}
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@f520eceda224fe1a4aed5a2a27a194379a409996 # v6
         with:
           version: ${{ env.PNPM_VERSION }}
-      - uses: android-actions/setup-android@v4
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
       - name: Install Android NDK r28c for package validation
         run: |
           sdkmanager "ndk;28.2.13676358"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: false
       - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: node-binding-*
+          path: bindings/ts/node/artifacts
+          merge-multiple: true
+      - name: Assemble Node platform packages
+        run: pnpm --filter @minip2p/node exec napi artifacts --output-dir artifacts
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm lint
@@ -498,11 +505,11 @@ jobs:
       - run: pnpm rn:generate
       - name: Generated files are current
         run: test -z "$(git status --porcelain)"
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: minip2p-android-native
           path: ${{ runner.temp }}/native
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: minip2p-ios-native
           path: ${{ runner.temp }}/native
@@ -513,15 +520,6 @@ jobs:
             -C react-native/android/src/main
           tar -xzf "$RUNNER_TEMP/native/minip2p-ios-native.tar.gz" \
             -C react-native/build
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: node-binding-*
-          path: bindings/ts/node/artifacts
-          merge-multiple: true
-      - name: Assemble Node platform packages
-        run: |
-          pnpm --filter @minip2p/node exec napi create-npm-dirs
-          pnpm --filter @minip2p/node exec napi artifacts --output-dir artifacts
       - name: Pack public packages
         run: |
           mkdir -p release-packages
@@ -531,8 +529,10 @@ jobs:
             --pack-destination "$PWD/release-packages"
           pnpm --filter @minip2p/node pack \
             --pack-destination "$PWD/release-packages"
-          pnpm --dir node/npm/linux-x64-gnu pack \
-            --pack-destination "$PWD/release-packages"
+          for platform_dir in node/npm/*; do
+            pnpm --dir "$platform_dir" pack \
+              --pack-destination "$PWD/release-packages"
+          done
       - name: Verify packed contents and dependency versions
         env:
           RELEASE_VERSION: ${{ needs.verify-release.outputs.version }}
@@ -558,7 +558,14 @@ jobs:
             "$PWD/release-packages/minip2p-node-$RELEASE_VERSION.tgz" \
             "$PWD/release-packages/minip2p-node-linux-x64-gnu-$RELEASE_VERSION.tgz"
           node scripts/smoke-release-install.mjs "$consumer"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: minip2p-node-platform-packages
+          path: bindings/ts/node/npm
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: minip2p-npm-packages
           path: bindings/ts/release-packages/*.tgz
@@ -678,7 +685,7 @@ jobs:
   publish-node-platforms:
     name: Publish Node platform packages
     if: github.event_name == 'release'
-    needs: [verify-release, publish-crates, node-native, node-musl]
+    needs: [verify-release, package-typescript]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: npm
@@ -703,14 +710,10 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          pattern: node-binding-*
-          path: bindings/ts/node/artifacts
-          merge-multiple: true
-      - name: Assemble and validate all platform packages
-        run: |
-          pnpm --filter @minip2p/node exec napi create-npm-dirs
-          pnpm --filter @minip2p/node exec napi artifacts --output-dir artifacts
-          test "$(find node/npm -name 'minip2p.*.node' -type f | wc -l)" -eq 7
+          name: minip2p-node-platform-packages
+          path: bindings/ts/node/npm
+      - name: Check verified platform artifacts
+        run: test "$(find node/npm -name 'minip2p.*.node' -type f -size +0c | wc -l)" -eq 7
       - name: Publish platform packages with npm trusted publishing
         run: pnpm --filter @minip2p/node exec napi prepublish -t npm --no-gh-release
 

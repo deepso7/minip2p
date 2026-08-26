@@ -31,7 +31,7 @@ describe("@minip2p/node distribution", () => {
     });
   });
 
-  test("platform packages contain only their target binary", () => {
+  test("platform manifests declare only their target binary", () => {
     const targets = Object.keys(
       nodeManifest.optionalDependencies as Record<string, string>
     ).map((name) => name.slice("@minip2p/node-".length));

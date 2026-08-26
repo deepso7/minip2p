@@ -59,6 +59,11 @@ try {
       `@minip2p/react-native must depend on @minip2p/core ${expectedVersion}, found ${reactNative.manifest.dependencies?.["@minip2p/core"] ?? "no dependency"}`
     );
   }
+  if (node.manifest.dependencies?.["@minip2p/core"] !== expectedVersion) {
+    throw new Error(
+      `@minip2p/node must depend on @minip2p/core ${expectedVersion}, found ${node.manifest.dependencies?.["@minip2p/core"] ?? "no dependency"}`
+    );
+  }
 
   requireFiles(core.root, [
     "LICENSE",
@@ -193,6 +198,7 @@ function verifyNodePackages(node, platformRoot) {
     ) {
       throw new Error(`${packageName} has invalid release metadata`);
     }
+    requireFiles(path.join(platformRoot, target), [binary]);
   }
 }
 
