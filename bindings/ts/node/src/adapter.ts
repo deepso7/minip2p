@@ -94,7 +94,10 @@ class NodeBackend implements Minip2pBackend {
   }
 
   peerInfo(peerId: string): IdentifyInfo | undefined {
-    return normalizeOptional<IdentifyInfo>(this.#endpoint.peerInfo(peerId));
+    const info = this.#endpoint.peerInfo(peerId);
+    return info === null || info === undefined
+      ? undefined
+      : normalizeIdentifyInfo(info);
   }
 
   knownPeers(): KnownPeerInfo[] {
@@ -325,6 +328,23 @@ function normalizeRecord<Value>(value: unknown): Value {
   return normalizeNativeValue(value) as Value;
 }
 
+function normalizeIdentifyInfo(value: unknown): IdentifyInfo {
+  const info = normalizeRecord<Record<string, unknown>>(value);
+  const publicKey = info.publicKey;
+  if (publicKey === undefined) {
+    return info as unknown as IdentifyInfo;
+  }
+  if (Array.isArray(publicKey) || publicKey instanceof Uint8Array) {
+    return {
+      ...info,
+      publicKey: Uint8Array.from(publicKey).buffer,
+    } as unknown as IdentifyInfo;
+  }
+  throw new TypeError(
+    "The native addon returned an invalid Identify public key"
+  );
+}
+
 function normalizeNativeValue(
   value: unknown,
   key?: string,
@@ -418,10 +438,7 @@ function normalizeEventBytes(tag: string, value: unknown): unknown {
   if (tag === "IdentifyReceived") {
     const info = Reflect.get(inner, "info");
     if (info !== null && typeof info === "object") {
-      const publicKey = Reflect.get(info, "publicKey");
-      if (Array.isArray(publicKey) || publicKey instanceof Uint8Array) {
-        Reflect.set(info, "publicKey", Uint8Array.from(publicKey).buffer);
-      }
+      Reflect.set(inner, "info", normalizeIdentifyInfo(info));
     }
   }
   return inner;

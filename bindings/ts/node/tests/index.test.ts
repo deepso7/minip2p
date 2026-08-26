@@ -49,6 +49,8 @@ describe("@minip2p/node", () => {
         b.waitPeerReady(a.peerId(), { timeoutMs: 10_000 }),
       ]);
 
+      expect(a.peerInfo(b.peerId())?.publicKey).toBeInstanceOf(ArrayBuffer);
+
       const inboundPromise = b.once("stream", { timeoutMs: 10_000 });
       const outbound = await a.openStream(b.peerId(), protocol, {
         timeoutMs: 10_000,
