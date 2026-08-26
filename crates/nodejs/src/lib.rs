@@ -11,9 +11,11 @@ use minip2p_ffi_core::{
 };
 use napi::bindgen_prelude::{BigInt, Uint8Array};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use napi::{Error, Result, Status};
+use napi::{Env, Error, Result, Status, Unknown};
 use napi_derive::napi;
 
+// napi-rs's default MaxQueueSize of 0 is intentionally unbounded. The FFI core
+// coalesces doorbells, so this wakeup must never block the network driver.
 type DoorbellFunction = ThreadsafeFunction<(), (), (), Status, false>;
 
 struct NodeDoorbell(Arc<DoorbellFunction>);
@@ -208,11 +210,11 @@ impl NodeEndpoint {
 
     /// Pulls a bounded batch of native events.
     #[napi]
-    pub fn drain_events(&self, limit: u32) -> Vec<serde_json::Value> {
+    pub fn drain_events(&self, env: Env, limit: u32) -> Result<Vec<Unknown<'static>>> {
         self.0
             .drain_events(limit)
             .into_iter()
-            .map(event_value)
+            .map(|event| event_js_value(&env, event))
             .collect()
     }
 
@@ -479,6 +481,78 @@ pub fn circuit_address(relay_address: String, peer_id: String) -> Result<String>
 
 fn native_error(error: minip2p_ffi_core::FfiError) -> Error {
     Error::from_reason(error.to_string())
+}
+
+fn event_js_value(env: &Env, event: P2pEvent) -> Result<Unknown<'static>> {
+    match event {
+        P2pEvent::StreamData {
+            peer_id,
+            conn_id,
+            stream_id,
+            data,
+        } => env.to_js_value(&EventEnvelope {
+            tag: "StreamData",
+            inner: StreamDataValue {
+                peer_id,
+                conn_id,
+                stream_id,
+                data: NodeBytes(data),
+            },
+        }),
+        P2pEvent::Message {
+            from_peer_id,
+            topics,
+            data,
+            seqno,
+            signed,
+        } => env.to_js_value(&EventEnvelope {
+            tag: "Message",
+            inner: MessageValue {
+                from_peer_id,
+                topics,
+                data: NodeBytes(data),
+                seqno: NodeBytes(seqno),
+                signed,
+            },
+        }),
+        event => env.to_js_value(&event_value(event)),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct EventEnvelope<T> {
+    tag: &'static str,
+    inner: T,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamDataValue {
+    peer_id: String,
+    conn_id: u64,
+    stream_id: u64,
+    data: NodeBytes,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageValue {
+    from_peer_id: String,
+    topics: Vec<String>,
+    data: NodeBytes,
+    seqno: NodeBytes,
+    signed: bool,
+}
+
+struct NodeBytes(Vec<u8>);
+
+impl serde::Serialize for NodeBytes {
+    fn serialize<S>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
 }
 
 fn event_value(event: P2pEvent) -> serde_json::Value {
