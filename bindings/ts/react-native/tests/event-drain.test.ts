@@ -65,4 +65,20 @@ describe("EventDrain", () => {
     expect(drain).toHaveBeenCalledTimes(1);
     vi.useRealTimers();
   });
+
+  test("stop during a batch yield does not drain again", async () => {
+    vi.useFakeTimers();
+    const drain = vi.fn().mockReturnValueOnce([1]).mockReturnValue([]);
+    const events = new EventDrain(drain, () => null, 8);
+
+    events.ring();
+    await vi.advanceTimersToNextTimerAsync();
+    expect(drain).toHaveBeenCalledTimes(1);
+
+    events.stop();
+    await settle();
+
+    expect(drain).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
 });

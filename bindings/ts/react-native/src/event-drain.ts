@@ -64,6 +64,9 @@ export class EventDrain<Event> {
           await new Promise<void>((resolve) => {
             this.#schedule(resolve);
           });
+          if (this.#stopped) {
+            break;
+          }
           batch = this.#drain(this.#limit);
         }
       }

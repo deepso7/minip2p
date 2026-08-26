@@ -363,8 +363,8 @@ impl P2pEndpoint {
 
     /// Starts the detached background endpoint driver.
     pub fn start(&self, doorbell: Arc<dyn EventDoorbell>) -> Result<(), FfiError> {
-        let doorbell = self.spawn_doorbell(doorbell)?;
         self.start_with(doorbell, |shared, doorbell| {
+            let doorbell = Self::spawn_doorbell(Arc::clone(&shared), doorbell)?;
             std::thread::Builder::new()
                 .name("minip2p-driver".into())
                 .spawn(move || crate::driver::run(shared, doorbell))
@@ -756,31 +756,32 @@ impl P2pEndpoint {
 
 impl P2pEndpoint {
     fn spawn_doorbell(
-        &self,
+        shared: Arc<Shared>,
         doorbell: Arc<dyn EventDoorbell>,
-    ) -> Result<Arc<dyn EventDoorbell>, FfiError> {
+    ) -> std::io::Result<Arc<dyn EventDoorbell>> {
         let (sender, receiver) = sync_channel(1);
-        let shared = Arc::clone(&self.shared);
         shared.doorbell_running.store(true, Ordering::Release);
+        let thread_shared = Arc::clone(&shared);
         std::thread::Builder::new()
             .name("minip2p-doorbell".into())
             .spawn(move || {
-                shared.lock_state().doorbell_thread_id = Some(std::thread::current().id());
+                thread_shared.lock_state().doorbell_thread_id = Some(std::thread::current().id());
                 while receiver.recv().is_ok() {
-                    while catch_unwind(AssertUnwindSafe(|| doorbell.on_events_ready())).is_err() {
-                        std::thread::yield_now();
+                    for _ in 0..2 {
+                        if catch_unwind(AssertUnwindSafe(|| doorbell.on_events_ready())).is_ok() {
+                            break;
+                        }
                     }
                 }
-                shared.lock_state().doorbell_thread_id = None;
-                shared.doorbell_running.store(false, Ordering::Release);
-                shared.stopped_cv.notify_all();
+                thread_shared.lock_state().doorbell_thread_id = None;
+                thread_shared
+                    .doorbell_running
+                    .store(false, Ordering::Release);
+                thread_shared.stopped_cv.notify_all();
             })
             .map(drop)
-            .map_err(|error| {
-                self.shared.doorbell_running.store(false, Ordering::Release);
-                FfiError::Internal {
-                    detail: format!("failed to spawn event doorbell: {error}"),
-                }
+            .inspect_err(|_| {
+                shared.doorbell_running.store(false, Ordering::Release);
             })?;
         Ok(Arc::new(DoorbellSender(sender)))
     }
@@ -993,6 +994,27 @@ mod tests {
     struct WaitingDoorbell {
         endpoint: std::sync::Weak<P2pEndpoint>,
         result: Mutex<Option<bool>>,
+    }
+
+    struct DropThreadDoorbell(SyncSender<std::thread::ThreadId>);
+
+    impl EventDoorbell for DropThreadDoorbell {
+        fn on_events_ready(&self) {}
+    }
+
+    impl Drop for DropThreadDoorbell {
+        fn drop(&mut self) {
+            let _ = self.0.send(std::thread::current().id());
+        }
+    }
+
+    struct PanickingDoorbell(Arc<AtomicUsize>);
+
+    impl EventDoorbell for PanickingDoorbell {
+        fn on_events_ready(&self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            panic!("injected doorbell panic");
+        }
     }
 
     impl EventDoorbell for WaitingDoorbell {
@@ -1434,6 +1456,44 @@ mod tests {
             endpoint.start(Arc::new(NoopDoorbell)),
             Err(FfiError::Stopped)
         ));
+    }
+
+    #[test]
+    fn rejected_start_does_not_spawn_an_orphan_doorbell() {
+        let endpoint = endpoint(config()).expect("endpoint");
+        endpoint.start(Arc::new(NoopDoorbell)).expect("start");
+        let caller = std::thread::current().id();
+        let (dropped, received) = sync_channel(1);
+        assert!(matches!(
+            endpoint.start(Arc::new(DropThreadDoorbell(dropped))),
+            Err(FfiError::AlreadyStarted)
+        ));
+        assert_eq!(received.recv_timeout(Duration::from_secs(1)), Ok(caller));
+        endpoint.stop();
+        assert!(endpoint.wait_stopped(1_000));
+    }
+
+    #[test]
+    fn repeated_doorbell_panics_do_not_block_shutdown() {
+        let a = endpoint(config()).expect("endpoint a");
+        let b = endpoint(config()).expect("endpoint b");
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        a.start(Arc::new(PanickingDoorbell(Arc::clone(&callbacks))))
+            .expect("start a");
+        b.start(Arc::new(NoopDoorbell)).expect("start b");
+        a.connect_addr(b.listen_addrs()[0].clone())
+            .expect("connect");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while callbacks.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(callbacks.load(Ordering::Acquire) > 0);
+
+        a.stop();
+        assert!(a.wait_stopped(1_000));
+        b.stop();
+        assert!(b.wait_stopped(1_000));
     }
 
     #[test]
