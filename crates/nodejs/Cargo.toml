@@ -1,0 +1,30 @@
+[package]
+name = "minip2p-nodejs"
+description = "napi-rs binding shell for minip2p"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints.rust]
+# napi-rs's generated module-registration code contains its own scoped
+# `allow(unsafe_code)`. `deny` still rejects unsafe in this crate's source while
+# allowing that generated scope; the workspace's `forbid` cannot be lowered by
+# a procedural macro.
+unsafe_code = "deny"
+
+[dependencies]
+minip2p-ffi-core = { path = "../ffi-core" }
+napi = { version = "=3.12.2", default-features = false, features = ["napi8", "serde-json"] }
+napi-derive = "=3.6.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+
+[build-dependencies]
+napi-build = "=2.4.1"

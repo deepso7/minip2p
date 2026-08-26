@@ -15,6 +15,7 @@ members = [
     "crates/minip2p",
     "crates/multistream-select",
     "crates/nat",
+    "crates/nodejs",
     "crates/noise",
     "crates/ping",
     "crates/platform",
