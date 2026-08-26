@@ -35,6 +35,7 @@
   },
   "devDependencies": {
     "@minip2p/test-fixtures": "workspace:*",
+    "@types/node": "catalog:",
     "del-cli": "catalog:",
     "typescript": "catalog:"
   }

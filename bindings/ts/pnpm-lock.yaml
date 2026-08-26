@@ -6,6 +6,9 @@ settings:
 
 catalogs:
   default:
+    '@types/node':
+      specifier: 26.2.0
+      version: 26.2.0
     '@types/react':
       specifier: 19.2.18
       version: 19.2.18
@@ -69,6 +72,9 @@ importers:
       '@minip2p/test-fixtures':
         specifier: workspace:*
         version: link:../test-fixtures
+      '@types/node':
+        specifier: 'catalog:'
+        version: 26.2.0
       del-cli:
         specifier: 'catalog:'
         version: 7.0.0
