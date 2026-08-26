@@ -773,6 +773,7 @@ impl P2pEndpoint {
                         }
                     }
                 }
+                drop(doorbell);
                 thread_shared.lock_state().doorbell_thread_id = None;
                 thread_shared
                     .doorbell_running
