@@ -241,20 +241,6 @@ describe("Node adapter", () => {
     endpoint.close();
   });
 
-  test("coalesces an event flood into one native drain pass", async () => {
-    vi.useFakeTimers();
-    const endpoint = createEndpoint();
-    const fake = fakeEndpoint();
-
-    for (let index = 0; index < 10_000; index += 1) {
-      fake.ring();
-    }
-    await settle();
-
-    expect(fake.drainLimits).toEqual([256]);
-    endpoint.close();
-  });
-
   test("passes discovery and mDNS configuration to the native endpoint", () => {
     const endpoint = Minip2p.create({
       discovery: {
@@ -264,7 +250,7 @@ describe("Node adapter", () => {
         topic: "node-discovery",
       },
       mdns: {
-        autoDial: true,
+        autoDial: false,
         enableIpv6: true,
         interfaceRefreshMs: 111,
         maxAnnouncedAddrs: 12,
@@ -284,7 +270,7 @@ describe("Node adapter", () => {
         topic: "node-discovery",
       },
       mdns: {
-        autoDial: true,
+        autoDial: false,
         enableIpv6: true,
         interfaceRefreshMs: 111n,
         maxAnnouncedAddrs: 12,

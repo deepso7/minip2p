@@ -1,8 +1,9 @@
-/* oxlint-disable func-style, no-use-before-define, promise/avoid-new -- The real relay fixture bridges child-process readiness into the async test. */
+/* oxlint-disable func-style, no-await-in-loop, no-use-before-define, promise/avoid-new -- The real network fixtures bridge process readiness and bounded polling into async tests. */
 
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import * as coreSdk from "@minip2p/core";
 import { describe, expect, test } from "vitest";
@@ -33,6 +34,38 @@ describe("@minip2p/node", () => {
 
     endpoint.close();
     expect(endpoint.isRunning()).toBe(false);
+  });
+
+  test("starts with discovery and mDNS configuration", () => {
+    const endpoint = nodeSdk.Minip2p.create({
+      discovery: {
+        autoDial: false,
+        beaconIntervalMs: 1234,
+        peerTtlMs: 5678,
+        topic: "node-discovery",
+      },
+      mdns: {
+        autoDial: false,
+        enableIpv6: false,
+        interfaceRefreshMs: 111,
+        maxAnnouncedAddrs: 12,
+        maxPacketBytes: 1300,
+        queryIntervalMs: 222,
+        socketPollIntervalMs: 333,
+        ttlMs: 444,
+      },
+      secretKey: nodeSdk.generateSecretKey(),
+      transports: {
+        quic: { listen: ["/ip4/127.0.0.1/udp/0/quic-v1"] },
+      },
+    });
+
+    try {
+      expect(endpoint.discoveryNowMs()).toEqual(expect.any(Number));
+      expect(endpoint.isRunning()).toBe(true);
+    } finally {
+      endpoint.close();
+    }
   });
 
   test("two endpoints exchange stream data over QUIC loopback", async () => {
@@ -155,7 +188,80 @@ describe("@minip2p/node", () => {
       await relay.close();
     }
   }, 20_000);
+
+  test("drains a native event flood without losing messages", async () => {
+    const topic = "node-event-flood";
+    const a = createFloodEndpoint();
+    const b = createFloodEndpoint();
+    let received = 0;
+    b.on("message", () => {
+      received += 1;
+    });
+    a.subscribe(topic);
+    b.subscribe(topic);
+
+    try {
+      const subscribed = a.once("peerSubscribed", { timeoutMs: 10_000 });
+      await a.connectAddr(b.listenAddrs()[0], { timeoutMs: 10_000 });
+      await Promise.all([
+        a.waitPeerReady(b.peerId(), { timeoutMs: 10_000 }),
+        b.waitPeerReady(a.peerId(), { timeoutMs: 10_000 }),
+        subscribed,
+      ]);
+
+      const messageCount = 512;
+      for (let index = 0; index < messageCount; index += 1) {
+        await publishWithBackpressure(
+          a,
+          topic,
+          new TextEncoder().encode(index.toString())
+        );
+      }
+      for (let attempt = 0; attempt < 1000; attempt += 1) {
+        if (received === messageCount) {
+          break;
+        }
+        await delay(10);
+      }
+
+      expect(received).toBe(messageCount);
+    } finally {
+      a.close();
+      b.close();
+    }
+  }, 15_000);
 });
+
+function createFloodEndpoint(): nodeSdk.Minip2p {
+  return nodeSdk.Minip2p.create({
+    pubsubRouter: nodeSdk.PubsubRouter.Floodsub,
+    secretKey: nodeSdk.generateSecretKey(),
+    transports: {
+      quic: { listen: ["/ip4/127.0.0.1/udp/0/quic-v1"] },
+    },
+  });
+}
+
+async function publishWithBackpressure(
+  endpoint: nodeSdk.Minip2p,
+  topic: string,
+  data: Uint8Array
+): Promise<void> {
+  for (;;) {
+    try {
+      endpoint.publish(topic, data);
+      return;
+    } catch (error) {
+      if (
+        !(error instanceof Error) ||
+        error.message !== "outbound backpressure"
+      ) {
+        throw error;
+      }
+      await delay(1);
+    }
+  }
+}
 
 async function startRelay(): Promise<{
   readonly address: string;
