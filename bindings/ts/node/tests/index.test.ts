@@ -234,7 +234,7 @@ describe("@minip2p/node", () => {
 
 function createFloodEndpoint(): nodeSdk.Minip2p {
   return nodeSdk.Minip2p.create({
-    pubsubRouter: nodeSdk.PubsubRouter.Floodsub,
+    pubsubRouter: coreSdk.PubsubRouter.Floodsub,
     secretKey: nodeSdk.generateSecretKey(),
     transports: {
       quic: { listen: ["/ip4/127.0.0.1/udp/0/quic-v1"] },
