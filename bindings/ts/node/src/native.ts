@@ -37,15 +37,58 @@ function unsupportedTarget(target: string, cause?: unknown): Error {
   );
 }
 
-function loadNativeBinding(target: string): unknown {
+interface NativeEndpointConfig {
+  readonly agentVersion?: string;
+  readonly allowUnsigned: boolean;
+  readonly autonatServers: string[];
+  readonly forceRelay: boolean;
+  readonly protocols: string[];
+  readonly pubsubRouter: number;
+  readonly quic?: { readonly listenAddrs?: string[] };
+  readonly relays: string[];
+  readonly tcp?: { readonly listenAddrs?: string[] };
+}
+
+export interface NativeEndpoint {
+  close: () => void;
+  isRunning: () => boolean;
+  listenAddrs: () => string[];
+  peerId: () => string;
+  start: (doorbell: () => void) => void;
+}
+
+interface NativeBinding {
+  readonly NodeEndpoint: new (
+    secretKey: Uint8Array,
+    config: NativeEndpointConfig
+  ) => NativeEndpoint;
+  circuitAddress: (relayAddress: string, peerId: string) => string;
+  generateSecretKey: () => Uint8Array;
+  peerIdFromSecretKey: (secretKey: Uint8Array) => string;
+}
+
+function loadNativeBinding(target: string): NativeBinding {
   if (!supportedTargets.includes(target as SupportedTarget)) {
     throw unsupportedTarget(target);
   }
 
   try {
-    return require(`../minip2p.${target}.node`);
+    const binding: unknown = require(`../minip2p.${target}.node`);
+    assertNativeBinding(binding);
+    return binding;
   } catch (error) {
     throw unsupportedTarget(target, error);
+  }
+}
+
+function assertNativeBinding(value: unknown): asserts value is NativeBinding {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    typeof Reflect.get(value, "NodeEndpoint") !== "function" ||
+    typeof Reflect.get(value, "generateSecretKey") !== "function"
+  ) {
+    throw new Error("The minip2p native addon has an invalid export shape");
   }
 }
 
