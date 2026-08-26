@@ -1,4 +1,4 @@
-/* oxlint-disable class-methods-use-this, func-style, max-classes-per-file, no-use-before-define, prefer-destructuring, unicorn/no-useless-undefined -- The adapter keeps the contract-complete native endpoint, value conversion, handle maps, and drain loop together at the binding boundary. */
+/* oxlint-disable class-methods-use-this, func-style, max-classes-per-file, no-await-in-loop, no-use-before-define, prefer-destructuring, promise/avoid-new, unicorn/no-useless-undefined -- The adapter keeps the contract-complete native endpoint, value conversion, handle maps, and drain loop together at the binding boundary. */
 
 import { Minip2pBase, PubsubRouter } from "@minip2p/core";
 import type {
@@ -108,7 +108,9 @@ class NodeBackend implements Minip2pBackend {
 
   discoveryNowMs(): number | undefined {
     const value = this.#endpoint.discoveryNowMs();
-    return value === undefined ? undefined : bigintToNumber(value, "clock");
+    return value === null || value === undefined
+      ? undefined
+      : bigintToNumber(value, "clock");
   }
 
   activeReservation(): RelayReservationInfo | undefined {
@@ -287,8 +289,14 @@ function toNativeMdns(
     autoDial: options.autoDial ?? discovery?.autoDial ?? true,
     enableIpv6: options.enableIpv6 ?? false,
     interfaceRefreshMs: numberToBigInt(options.interfaceRefreshMs ?? 10_000),
-    maxAnnouncedAddrs: options.maxAnnouncedAddrs ?? 16,
-    maxPacketBytes: options.maxPacketBytes ?? 1400,
+    maxAnnouncedAddrs: numberToU32(
+      options.maxAnnouncedAddrs ?? 16,
+      "maxAnnouncedAddrs"
+    ),
+    maxPacketBytes: numberToU32(
+      options.maxPacketBytes ?? 1400,
+      "maxPacketBytes"
+    ),
     queryIntervalMs: numberToBigInt(options.queryIntervalMs ?? 300_000),
     socketPollIntervalMs: numberToBigInt(options.socketPollIntervalMs ?? 100),
     ttlMs: numberToBigInt(options.ttlMs ?? 120_000),
@@ -308,6 +316,16 @@ function numberToBigInt(value: number): bigint {
     );
   }
   return BigInt(value);
+}
+
+function numberToU32(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`${name} must be a non-negative safe integer`);
+  }
+  if (value > 0xff_ff_ff_ff) {
+    throw new RangeError(`${name} exceeds the unsigned 32-bit range`);
+  }
+  return value;
 }
 
 function bigintToNumber(value: bigint, name: string): number {
@@ -413,7 +431,24 @@ function normalizeEvent(
   ) {
     event.inner = normalizeEventBytes(event.tag, event.inner);
   }
+  releaseTerminalIds(event, connectionIds, streamIds);
   return event as P2pEvent;
+}
+
+function releaseTerminalIds(
+  event: { readonly tag?: unknown; readonly inner?: unknown },
+  connectionIds: IdMap,
+  streamIds: IdMap
+): void {
+  if (event.inner === null || typeof event.inner !== "object") {
+    return;
+  }
+  if (event.tag === "ConnectionClosed") {
+    connectionIds.deletePublic(Reflect.get(event.inner, "connId"));
+  }
+  if (event.tag === "StreamClosed") {
+    streamIds.deletePublic(Reflect.get(event.inner, "streamId"));
+  }
 }
 
 function normalizeEventBytes(tag: string, value: unknown): unknown {
@@ -448,7 +483,8 @@ class EventDrain {
   readonly #drain: () => unknown[];
   readonly #normalize: (event: unknown) => P2pEvent;
   #listener: ((event: P2pEvent) => void) | undefined;
-  #scheduled = false;
+  #pending = false;
+  #running = false;
   #stopped = false;
 
   constructor(drain: () => unknown[], normalize: (event: unknown) => P2pEvent) {
@@ -461,31 +497,51 @@ class EventDrain {
   }
 
   ring(): void {
-    if (this.#scheduled || this.#stopped) {
+    if (this.#stopped) {
       return;
     }
-    this.#scheduled = true;
-    setImmediate(() => {
-      this.#run();
-    });
+    this.#pending = true;
+    if (!this.#running) {
+      this.#running = true;
+      setTimeout(() => {
+        void this.#run();
+      }, 0);
+    }
   }
 
   stop(): void {
     this.#stopped = true;
+    this.#pending = false;
     this.#listener = undefined;
   }
 
-  #run(): void {
-    this.#scheduled = false;
-    if (this.#stopped) {
-      return;
-    }
-    const events = this.#drain();
-    for (const event of events) {
-      this.#listener?.(this.#normalize(event));
-    }
-    if (events.length > 0) {
-      this.ring();
+  async #run(): Promise<void> {
+    try {
+      while (!this.#stopped && this.#pending) {
+        this.#pending = false;
+        let events = this.#drain();
+        while (!this.#stopped && events.length > 0) {
+          for (const event of events) {
+            try {
+              this.#listener?.(this.#normalize(event));
+            } catch {
+              // Application callbacks and malformed events cannot stop draining.
+            }
+          }
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, 0);
+          });
+          if (this.#stopped) {
+            break;
+          }
+          events = this.#drain();
+        }
+      }
+    } finally {
+      this.#running = false;
+      if (this.#pending && !this.#stopped) {
+        this.ring();
+      }
     }
   }
 }
@@ -519,5 +575,16 @@ class IdMap {
       throw new RangeError(`Unknown native identifier ${publicId}`);
     }
     return native;
+  }
+
+  deletePublic(value: unknown): void {
+    if (typeof value !== "number") {
+      return;
+    }
+    const native = this.#nativeByPublic.get(value);
+    if (native !== undefined) {
+      this.#nativeByPublic.delete(value);
+      this.#publicByNative.delete(native);
+    }
   }
 }

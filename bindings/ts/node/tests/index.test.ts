@@ -49,7 +49,17 @@ describe("@minip2p/node", () => {
         b.waitPeerReady(a.peerId(), { timeoutMs: 10_000 }),
       ]);
 
-      expect(a.peerInfo(b.peerId())?.publicKey).toBeInstanceOf(ArrayBuffer);
+      const publicKey = a.peerInfo(b.peerId())?.publicKey;
+      expect(publicKey).toBeInstanceOf(ArrayBuffer);
+      if (!(publicKey instanceof ArrayBuffer)) {
+        throw new TypeError(
+          "Identify did not return an ArrayBuffer public key"
+        );
+      }
+      expect(publicKey.byteLength).toBe(36);
+      expect([...new Uint8Array(publicKey).subarray(0, 4)]).toEqual([
+        0x08, 0x01, 0x12, 0x20,
+      ]);
 
       const inboundPromise = b.once("stream", { timeoutMs: 10_000 });
       const outbound = await a.openStream(b.peerId(), protocol, {
