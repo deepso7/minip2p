@@ -495,8 +495,12 @@ export class Minip2pBase {
     const buffer = new BoundedQueue<Minip2pEvent>(bufferCap);
     let dropped = 0;
     let done = false;
+    let aborted = false;
     let wake: (() => void) | undefined;
     const finish = () => {
+      if (done) {
+        return;
+      }
       done = true;
       wake?.();
     };
@@ -506,10 +510,20 @@ export class Minip2pBase {
       }
       wake?.();
     });
+    const abort = () => {
+      aborted = true;
+      finish();
+      offEvents();
+      buffer.clear();
+      dropped = 0;
+    };
     const offClose = this.onClose(finish);
-    const removeAbort = listenAbort(options.signal, finish);
+    const removeAbort = listenAbort(options.signal, abort);
     try {
       while (true) {
+        if (aborted) {
+          return;
+        }
         if (dropped > 0) {
           const count = dropped;
           dropped = 0;
@@ -1296,7 +1310,7 @@ export class Minip2pBase {
         clearPendingOpen(pending);
         pending.reject(new StreamClosedError());
       }
-      stream?.terminal();
+      stream?.terminal(new StreamClosedError("The stream closed"));
     } else if (event.tag === P2pEvent_Tags.StreamData) {
       stream?.receive(event.inner.data);
     } else {

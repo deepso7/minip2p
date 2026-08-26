@@ -122,7 +122,7 @@ test("events iteration drops oldest buffered events and reports the drop", async
   assert.equal((await iterator.next()).done, true);
 });
 
-test("events iteration drains retained events before ending after abort", async () => {
+test("events iteration stops immediately on abort while events keep arriving", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
   const controller = new AbortController();
@@ -131,16 +131,12 @@ test("events iteration drains retained events before ending after abort", async 
   backend.emit(peerReady("first"));
   await first;
 
-  backend.emit(peerReady("dropped"));
-  backend.emit(peerReady("retained"));
+  backend.emit(peerReady("buffered"));
   await tick();
   controller.abort();
+  backend.emit(peerReady("after-abort"));
+  await tick();
 
-  assert.deepEqual((await iterator.next()).value, {
-    dropped: 1,
-    type: "queueOverflow",
-  });
-  assert.equal((await iterator.next()).value.peerId, "retained");
   assert.equal((await iterator.next()).done, true);
   endpoint.close();
 });
@@ -493,6 +489,27 @@ test("stream async iteration ends quietly when the endpoint closes", async () =>
   endpoint.close();
 
   await reading;
+});
+
+test("stream async iteration rejects when the remote stream resets", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+  const stream = await opening;
+  const reading = (async () => {
+    for await (const _chunk of stream) {
+      // Wait for the remote terminal event.
+    }
+  })();
+
+  backend.emit({
+    inner: { connId: 2, peerId: "peer", streamId: 3 },
+    tag: P2pEvent_Tags.StreamClosed,
+  });
+
+  await assert.rejects(reading, StreamClosedError);
+  endpoint.close();
 });
 
 test("local stream reset and abandon emit closed exactly once", async () => {
