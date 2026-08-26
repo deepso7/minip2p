@@ -313,6 +313,14 @@ export interface WaitForOptions<Event> extends OpOptions {
   readonly predicate?: (event: Event) => boolean;
 }
 
+/** Controls one endpoint event iterator. */
+export interface EventsOptions {
+  /** Ends iteration without throwing when aborted. */
+  readonly signal?: AbortSignal;
+  /** Maximum events buffered for this iterator. */
+  readonly bufferCap?: number;
+}
+
 /** First usable path produced by a connection attempt. */
 export interface ConnectResult {
   readonly connectId: number;

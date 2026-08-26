@@ -24,6 +24,7 @@ export {
   type Bytes,
   type CloseReason,
   type ConnectResult,
+  type EventsOptions,
   type IdentifyInfo,
   type InboundStreamMeta,
   type KnownPeerInfo,

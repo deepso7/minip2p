@@ -53,6 +53,138 @@ test("named and catch-all subscribers receive flattened events", async () => {
   endpoint.close();
 });
 
+test("events iteration yields endpoint events in order and ends on close", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const events = [];
+  const reading = (async () => {
+    for await (const event of endpoint.events()) {
+      events.push(event);
+    }
+  })();
+
+  backend.emit({
+    inner: { peerId: "first", protocols: ["/test/1"] },
+    tag: P2pEvent_Tags.PeerReady,
+  });
+  backend.emit({
+    inner: { peerId: "second", protocols: ["/test/2"] },
+    tag: P2pEvent_Tags.PeerReady,
+  });
+  await tick();
+  endpoint.close();
+
+  await reading;
+  assert.deepEqual(events, [
+    {
+      peerId: "first",
+      protocols: ["/test/1"],
+      type: "peerReady",
+    },
+    {
+      peerId: "second",
+      protocols: ["/test/2"],
+      type: "peerReady",
+    },
+  ]);
+});
+
+test("events iteration ends quietly on abort", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const controller = new AbortController();
+  const reading = (async () => {
+    for await (const _event of endpoint.events({
+      signal: controller.signal,
+    })) {
+      // Wait for cancellation.
+    }
+  })();
+
+  controller.abort();
+
+  await reading;
+  endpoint.close();
+});
+
+test("events iteration ends immediately for a pre-aborted signal", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const controller = new AbortController();
+  controller.abort();
+
+  const iterator = endpoint.events({ signal: controller.signal });
+
+  assert.equal((await iterator.next()).done, true);
+  endpoint.close();
+});
+
+test("events iteration drops oldest buffered events and reports the drop", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const iterator = endpoint.events({ bufferCap: 2 });
+  const first = iterator.next();
+  backend.emit(peerReady("first"));
+  assert.equal((await first).value.peerId, "first");
+
+  backend.emit(peerReady("dropped"));
+  backend.emit(peerReady("second"));
+  backend.emit(peerReady("third"));
+  await tick();
+
+  assert.deepEqual((await iterator.next()).value, {
+    dropped: 1,
+    type: "queueOverflow",
+  });
+  assert.equal((await iterator.next()).value.peerId, "second");
+  assert.equal((await iterator.next()).value.peerId, "third");
+  endpoint.close();
+  assert.equal((await iterator.next()).done, true);
+});
+
+test("events iteration stops immediately on abort while events keep arriving", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const controller = new AbortController();
+  const iterator = endpoint.events({ bufferCap: 1, signal: controller.signal });
+  const first = iterator.next();
+  backend.emit(peerReady("first"));
+  await first;
+
+  backend.emit(peerReady("buffered"));
+  await tick();
+  controller.abort();
+  backend.emit(peerReady("after-abort"));
+  await tick();
+
+  assert.equal((await iterator.next()).done, true);
+  endpoint.close();
+});
+
+test("events rejects invalid buffer caps", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+
+  await assert.rejects(endpoint.events({ bufferCap: 0 }).next(), RangeError);
+  await assert.rejects(
+    endpoint.events({ bufferCap: Number.POSITIVE_INFINITY }).next(),
+    RangeError
+  );
+  endpoint.close();
+});
+
+test("await using falls back to Symbol.dispose", async () => {
+  const backend = new MockBackend();
+  assert.equal(Symbol.asyncDispose in Minip2pBase.prototype, false);
+
+  {
+    await using endpoint = new TestMinip2p(backend);
+    assert.equal(endpoint.peerId(), "local-peer");
+  }
+
+  assert.equal(backend.closed, true);
+});
+
 test("inbound relayed path events preserve relay provenance", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
@@ -334,6 +466,125 @@ test("stream FIFO counts only queued data and cleans up after terminal", async (
   stream.closeWrite();
   stream.reset();
   stream.abandon();
+  endpoint.close();
+});
+
+test("stream async iteration yields chunks in order and ends on remote write close", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+  const stream = await opening;
+  const chunks = [];
+  const reading = (async () => {
+    for await (const chunk of stream) {
+      chunks.push([...chunk]);
+    }
+  })();
+
+  backend.emit(streamData(new Uint8Array([1, 2]), 3));
+  backend.emit(streamData(new Uint8Array([3]), 3));
+  backend.emit({
+    inner: { connId: 2, peerId: "peer", streamId: 3 },
+    tag: P2pEvent_Tags.StreamRemoteWriteClosed,
+  });
+
+  await reading;
+  assert.deepEqual(chunks, [[1, 2], [3]]);
+  endpoint.close();
+});
+
+test("stream async iteration keeps half-close EOF final when StreamClosed follows", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+  const stream = await opening;
+  const reading = (async () => {
+    for await (const _chunk of stream) {
+      // Wait for read-side EOF.
+    }
+  })();
+
+  backend.emit({
+    inner: { connId: 2, peerId: "peer", streamId: 3 },
+    tag: P2pEvent_Tags.StreamRemoteWriteClosed,
+  });
+  await reading;
+  backend.emit({
+    inner: { connId: 2, peerId: "peer", streamId: 3 },
+    tag: P2pEvent_Tags.StreamClosed,
+  });
+  await tick();
+
+  endpoint.close();
+});
+
+test("stream async iteration ends quietly when the endpoint closes", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+  const stream = await opening;
+  const reading = (async () => {
+    for await (const _chunk of stream) {
+      // Wait for endpoint shutdown.
+    }
+  })();
+
+  endpoint.close();
+
+  await reading;
+});
+
+test("stream async iteration rejects when the remote stream resets", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+  const stream = await opening;
+  const reading = (async () => {
+    for await (const _chunk of stream) {
+      // Wait for the remote terminal event.
+    }
+  })();
+
+  backend.emit({
+    inner: { connId: 2, peerId: "peer", streamId: 3 },
+    tag: P2pEvent_Tags.StreamClosed,
+  });
+
+  await assert.rejects(reading, StreamClosedError);
+  endpoint.close();
+});
+
+test("stream async iteration remembers a reset while the loop body runs", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+  const stream = await opening;
+  const { promise: paused, resolve: resume } = Promise.withResolvers();
+  const reading = (async () => {
+    for await (const _chunk of stream) {
+      await paused;
+    }
+  })();
+
+  backend.emit(streamData(new Uint8Array([1]), 3));
+  await tick();
+  backend.emit({
+    inner: { connId: 2, peerId: "peer", streamId: 3 },
+    tag: P2pEvent_Tags.StreamRemoteWriteClosed,
+  });
+  backend.emit({
+    inner: { connId: 2, peerId: "peer", streamId: 3 },
+    tag: P2pEvent_Tags.StreamClosed,
+  });
+  await tick();
+  resume();
+
+  await assert.rejects(reading, StreamClosedError);
   endpoint.close();
 });
 
@@ -658,6 +909,13 @@ function streamReady(overrides = {}) {
       ...overrides,
     },
     tag: P2pEvent_Tags.StreamReady,
+  };
+}
+
+function peerReady(peerId) {
+  return {
+    inner: { peerId, protocols: ["/test/1"] },
+    tag: P2pEvent_Tags.PeerReady,
   };
 }
 
