@@ -13,7 +13,9 @@ const endpoint = new binding.NodeEndpoint(binding.generateSecretKey(), {
   relays: [],
 });
 
-endpoint.start(() => {});
+endpoint.start(() => {
+  // This test measures the strong doorbell's event-loop reference.
+});
 process.stdout.write("started\n");
 
 if (process.argv[2] === "close") {

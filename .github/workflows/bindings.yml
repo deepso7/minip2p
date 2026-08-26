@@ -6,12 +6,16 @@ on:
     paths:
       - "bindings/**"
       - "crates/ffi/**"
+      - "crates/ffi-core/**"
+      - "crates/nodejs/**"
       - ".github/workflows/bindings.yml"
       - ".github/workflows/bindings-native.yml"
   pull_request:
     paths:
       - "bindings/**"
       - "crates/ffi/**"
+      - "crates/ffi-core/**"
+      - "crates/nodejs/**"
       - ".github/workflows/bindings.yml"
       - ".github/workflows/bindings-native.yml"
 
@@ -44,6 +48,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
+      - run: pnpm --filter @minip2p/node native:build
       - run: pnpm test
       - run: pnpm lint
       - run: pnpm build

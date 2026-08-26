@@ -1,3 +1,5 @@
+/* oxlint-disable func-style, no-use-before-define -- Hoisted loader helpers keep module initialization readable. */
+
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
@@ -16,7 +18,8 @@ type SupportedTarget = (typeof supportedTargets)[number];
 
 function linuxLibc(): "gnu" | "musl" {
   const report = process.report?.getReport();
-  const header = report === undefined ? undefined : Reflect.get(report, "header");
+  const header =
+    report === undefined ? undefined : Reflect.get(report, "header");
   return header === undefined ||
     Reflect.get(header, "glibcVersionRuntime") === undefined
     ? "musl"

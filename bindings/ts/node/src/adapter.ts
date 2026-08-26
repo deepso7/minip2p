@@ -1,3 +1,5 @@
+/* oxlint-disable class-methods-use-this, func-style, max-classes-per-file, no-use-before-define, prefer-destructuring, unicorn/no-useless-undefined -- The adapter keeps the contract-complete native endpoint, value conversion, handle maps, and drain loop together at the binding boundary. */
+
 import { Minip2pBase, PubsubRouter } from "@minip2p/core";
 import type {
   Bytes,
@@ -37,8 +39,8 @@ class NodeBackend implements Minip2pBackend {
         agentVersion: config.agentVersion,
         allowUnsigned: config.allowUnsigned ?? false,
         autonatServers: [...(config.autonatServers ?? [])],
-        forceRelay: config.forceRelay ?? false,
         discovery,
+        forceRelay: config.forceRelay ?? false,
         mdns,
         protocols: [...(config.protocols ?? [])],
         pubsubRouter: config.pubsubRouter ?? PubsubRouter.Gossipsub,
@@ -161,10 +163,7 @@ class NodeBackend implements Minip2pBackend {
   }
 
   closeStreamWrite(peerId: string, streamId: number): void {
-    this.#endpoint.closeStreamWrite(
-      peerId,
-      this.#streamIds.toNative(streamId)
-    );
+    this.#endpoint.closeStreamWrite(peerId, this.#streamIds.toNative(streamId));
   }
 
   resetStream(peerId: string, streamId: number): void {
@@ -190,9 +189,9 @@ class NodeBackend implements Minip2pBackend {
   }
 
   dial(address: string): number[] {
-    return this.#endpoint.dial(address).map((id) =>
-      this.#connectionIds.toPublic(id)
-    );
+    return this.#endpoint
+      .dial(address)
+      .map((id) => this.#connectionIds.toPublic(id));
   }
 
   dialIp4(address: string): number {
@@ -301,7 +300,9 @@ function toUint8Array(value: Bytes): Uint8Array {
 
 function numberToBigInt(value: number): bigint {
   if (!Number.isSafeInteger(value) || value < 0) {
-    throw new RangeError("Native identifiers must be non-negative safe integers");
+    throw new RangeError(
+      "Native identifiers must be non-negative safe integers"
+    );
   }
   return BigInt(value);
 }
@@ -378,8 +379,8 @@ function normalizeEvent(
   streamIds: IdMap
 ): P2pEvent {
   const event = normalizeNativeValue(value, undefined, {
-    connectionIds,
     connectIds,
+    connectionIds,
     streamIds,
   }) as { tag?: unknown; inner?: unknown };
   if (typeof event.tag !== "string" || event.inner === undefined) {
@@ -433,10 +434,7 @@ class EventDrain {
   #scheduled = false;
   #stopped = false;
 
-  constructor(
-    drain: () => unknown[],
-    normalize: (event: unknown) => P2pEvent
-  ) {
+  constructor(drain: () => unknown[], normalize: (event: unknown) => P2pEvent) {
     this.#drain = drain;
     this.#normalize = normalize;
   }

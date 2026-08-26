@@ -1,3 +1,5 @@
+/* oxlint-disable func-style, no-use-before-define, promise/avoid-new -- Child-process readiness and timeout helpers are callback-backed promises. */
+
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -25,8 +27,13 @@ describe("@minip2p/node process lifecycle", () => {
   test("close is non-blocking and releases the event loop", async () => {
     const child = spawn(process.execPath, [fixture, "close"]);
     const output = await collectOutput(child);
-    const closeMs = Number(/closeMs=([\d.]+)/.exec(output)?.[1]);
-    const averageCallMs = Number(/averageCallMs=([\d.]+)/.exec(output)?.[1]);
+    const closeMs = Number(
+      /closeMs=(?<milliseconds>[\d.]+)/u.exec(output)?.groups?.milliseconds
+    );
+    const averageCallMs = Number(
+      /averageCallMs=(?<milliseconds>[\d.]+)/u.exec(output)?.groups
+        ?.milliseconds
+    );
 
     expect(output).toContain("started");
     expect(closeMs).toBeLessThan(50);
@@ -67,9 +74,7 @@ function waitForExit(child: ReturnType<typeof spawn>): Promise<void> {
   });
 }
 
-async function collectOutput(
-  child: ReturnType<typeof spawn>
-): Promise<string> {
+async function collectOutput(child: ReturnType<typeof spawn>): Promise<string> {
   let output = "";
   child.stdout.on("data", (chunk: Buffer) => {
     output += chunk.toString();
