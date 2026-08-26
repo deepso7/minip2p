@@ -1,4 +1,4 @@
-/* oxlint-disable default-case, func-style, max-classes-per-file, no-empty-function, no-use-before-define, promise/avoid-new, promise/prefer-await-to-callbacks, promise/prefer-await-to-then, typescript/no-invalid-void-type, unicorn/consistent-function-scoping, unicorn/no-new-array, unicorn/no-useless-spread, unicorn/no-useless-undefined -- Promise adapters, void event payloads, snapshot fan-out, and bounded queues are deliberate SDK internals. */
+/* oxlint-disable default-case, func-style, max-classes-per-file, no-await-in-loop, no-empty-function, no-loop-func, no-use-before-define, promise/avoid-new, promise/prefer-await-to-callbacks, promise/prefer-await-to-then, typescript/no-invalid-void-type, unicorn/consistent-function-scoping, unicorn/no-new-array, unicorn/no-useless-spread, unicorn/no-useless-undefined -- Promise adapters, sequential async iterators, void event payloads, snapshot fan-out, and bounded queues are deliberate SDK internals. */
 
 import type { Minip2pBackend } from "./backend.js";
 import {
@@ -18,6 +18,7 @@ import type {
   Bytes,
   CloseReason,
   ConnectResult,
+  EventsOptions,
   IdentifyInfo,
   InboundStreamMeta,
   KnownPeerInfo,
@@ -286,6 +287,27 @@ export class Stream {
     this.abandon();
   }
 
+  /**
+   * Iterates received chunks until the remote peer closes its write side.
+   *
+   * @yields {Uint8Array} Received binary chunks in order.
+   */
+  async *[Symbol.asyncIterator](): AsyncGenerator<Uint8Array, void, void> {
+    try {
+      while (true) {
+        const chunk = await this.read();
+        if (chunk === undefined) {
+          return;
+        }
+        yield chunk;
+      }
+    } catch (error) {
+      if (!(error instanceof ClosedError)) {
+        throw error;
+      }
+    }
+  }
+
   /** @internal */
   receive(data: ArrayBuffer): void {
     if (this.#closed) {
@@ -453,6 +475,65 @@ export class Minip2pBase {
       handlers,
       maybeHandler as unknown as (payload: AnyPayload) => void
     );
+  }
+
+  /**
+   * Iterates endpoint events until the endpoint closes or the caller aborts.
+   *
+   * @yields {Minip2pEvent} Endpoint events in delivery order.
+   */
+  async *events(
+    options: EventsOptions = {}
+  ): AsyncGenerator<Minip2pEvent, void, void> {
+    if (options.signal?.aborted === true) {
+      return;
+    }
+    const bufferCap = options.bufferCap ?? EVENT_QUEUE_CAP;
+    if (!Number.isSafeInteger(bufferCap) || bufferCap < 1) {
+      throw new RangeError("bufferCap must be a positive safe integer");
+    }
+    const buffer = new BoundedQueue<Minip2pEvent>(bufferCap);
+    let dropped = 0;
+    let done = false;
+    let wake: (() => void) | undefined;
+    const finish = () => {
+      done = true;
+      wake?.();
+    };
+    const offEvents = this.on((event) => {
+      if (buffer.push(event) !== undefined) {
+        dropped += 1;
+      }
+      wake?.();
+    });
+    const offClose = this.onClose(finish);
+    const removeAbort = listenAbort(options.signal, finish);
+    try {
+      while (true) {
+        if (dropped > 0) {
+          const count = dropped;
+          dropped = 0;
+          yield { dropped: count, type: "queueOverflow" };
+          continue;
+        }
+        const event = buffer.shift();
+        if (event !== undefined) {
+          yield event;
+          continue;
+        }
+        if (done) {
+          return;
+        }
+        await new Promise<void>((resolve) => {
+          wake = resolve;
+        });
+        wake = undefined;
+      }
+    } finally {
+      offEvents();
+      offClose();
+      removeAbort?.();
+    }
   }
 
   /** Resolves with the next event of `type`. */
