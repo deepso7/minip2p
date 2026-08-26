@@ -1,25 +1,25 @@
 # Micro-agent charters (pr-review)
 
-Bugbot is **not** a charter here — launch/merge rules live in `SKILL.md`. This file only defines State / Parse / Security / Flow / Verify / Quality.
+This file defines State / Parse / Security / Flow / Verify / Quality. Launch/merge rules live in `SKILL.md`.
 
 Shared constraints for every specialist:
 
 - Worktree + `git diff <base>...HEAD` only (plus necessary surrounding / out-of-diff callers), including files the orchestrator lists as untracked/added
-- **Read-only**: read files, `rg`/search, `git show`/`git diff`. No `cargo`/`just` — the orchestrator owns test runs. Verify alone may run one focused `cargo test -p <crate>`
+- **Read-only**: read files, search, `git show`/`git diff`. No `cargo`/`just` — the orchestrator owns test runs (the Verify charter carries the single exception)
 - No GitHub review threads
 - No style nits; failure story required
-- Return a JSON array of findings (may be empty):
-  `{"reasoning","severity","confidence","path","line","finding"}`
+- Return a JSON array of findings (may be empty), each shaped:
+  `{"reasoning":"…","severity":"P0|P1|P2|P3","confidence":0.0-1.0,"path":"file","line":123,"finding":"what breaks + who is hurt. fix hint."}`
 - `reasoning` is your scratchpad and is never shown to the user — put the user-facing story in `finding`
 - `line` must be read off the post-change file with a file-read tool, **not** counted from diff hunk headers; a wrong line makes the finding unactionable
-- Severity bar (inlined from `.cursor/rules/pr-review.mdc` so specialists who only receive this charter need not open the rule file):
+- Severity bar:
   - **P0** hangs, panics, definitively wrong results, or tests/fixtures that cannot work as written
   - **P1** correctness or security bug likely to hit real users/peers
   - **P2** contract/lifecycle/resource bugs; clear holes where tests/fuzz/CI won't catch failure
   - **P3** concrete maintainability or portability with a real failure mode (skip pure taste)
-- Omit anything with confidence &lt; 0.8
+- Omit anything with confidence < 0.8 (0–1 scale). If unsure, dig deeper or drop — don’t pad
 - Finish your charter; do not stop after the first finding
-- Read every in-diff hunk relevant to your charter before following out-of-diff callers. Charters partition **failure modes, not files** — expect to share files with other specialists; the merge dedupes
+- Read every in-diff hunk relevant to your charter before following out-of-diff callers. Out-of-diff scope is set by the mode in your prompt: **normal** — follow your charter's Out-of-diff leads only to confirm or refute a suspected finding; **ultra** — additionally sweep every symbol on the planner's out-of-diff list against your charter, suspicion or not. Charters partition **failure modes, not files** — expect to share files with other specialists; the merge dedupes
 
 ## State
 
@@ -55,19 +55,19 @@ Out-of-diff: drivers/endpoints that poll the changed agent.
 
 ## Verify
 
-Focus: proof and claims — *absence* of coverage, or claims that contradict code.
+Focus: proof and claims — _absence_ of coverage, or claims that contradict code.
 
 Hunt: missing tests for new failure modes; CI/just/`no_std`/fuzz coverage dropped on rename/split; README claims contradicting code; AGENTS.md violations on touched code (sans-I/O, unsafe, transport scope, async in core).
 
-Out-of-diff: **before claiming coverage is missing, go look for it.** `rg` the changed symbol and the behavior across sibling `#[cfg(test)]` modules, `crates/*/tests/**`, `examples/**`, and `fuzz/`. An absence claim that skipped this search is the single most common Verify false positive — omit it rather than guess.
+Out-of-diff: **before claiming coverage is missing, go look for it.** Search the changed symbol and the behavior across sibling `#[cfg(test)]` modules, `crates/*/tests/**`, `examples/**`, and `fuzz/`. An absence claim that skipped this search is the single most common Verify false positive — omit it rather than guess.
 
-You are the only specialist permitted to run tests: at most one focused `cargo test -p <crate>`. Note “green but never loads corrupt field” as evidence when that is a *claims* bug (README/test name promises a field). Prefer **Quality** when the test exists but is hollow or checklist-duplicative.
+Exception to the shared read-only rule: you alone may run tests, at most one focused `cargo test -p <crate>` — concurrent cargo runners contend on the same `target/` lock. Note “green but never loads corrupt field” as evidence when that is a _claims_ bug (README/test name promises a field). Prefer **Quality** when the test exists but is hollow or checklist-duplicative.
 
 ## Quality
 
-Focus: hollow proof and LLM-shaped padding in **tests/docs**, plus **internal** no-policy wrappers. Not “thin public API is bad.”
+Focus: hollow proof and LLM-shaped padding in **tests/docs**, plus **internal** no-policy wrappers. Not “thin public API is bad.” In your findings, “who is hurt” may be _reviewers/maintainers misled by false confidence_ or _future regressions the test cannot catch_.
 
-Out-of-diff: peer tests in the same file and sibling test modules covering the same claim (is the new one strictly weaker, or does it add a case?); every call site of a suspected wrapper (`rg` the name — used once with no policy, or genuinely shared?). Both claims are unverifiable from the diff alone.
+Out-of-diff: peer tests in the same file and sibling test modules covering the same claim (is the new one strictly weaker, or does it add a case?); every call site of a suspected wrapper (search the name — used once with no policy, or genuinely shared?). Both claims are unverifiable from the diff alone.
 
 **Severity mapping**
 
@@ -88,7 +88,7 @@ Out-of-diff: peer tests in the same file and sibling test modules covering the s
 
 - Formatting, naming taste, “could use a match”
 - “Sounds like an LLM” without a concrete artifact
-- **Intentional public / layer boundaries** that *are* the API or architectural boundary: `Endpoint` → `Swarm`, `Swarm` → `SwarmCore` (+ `flush_actions` where that is the policy), circuit decorator non-circuit arms → `inner`, sans-I/O `*Action`/`*Event` enums, std driver adapters, feature-gated type aliases/shims, newtype ID accessors
+- **Intentional public / layer boundaries** that _are_ the API or architectural boundary: `Endpoint` → `Swarm`, `Swarm` → `SwarmCore` (+ `flush_actions` where that is the policy), circuit decorator non-circuit arms → `inner`, sans-I/O `*Action`/`*Event` enums, std driver adapters, feature-gated type aliases/shims, newtype ID accessors
 
 **Allowlist (intentional — do not flag by default)**
 
@@ -96,7 +96,7 @@ Test-shaped (merge may re-raise if the new test is strictly weaker than in-file 
 
 - White-box event/agent-queue injection to pin spin-guard / ownership / backlog semantics
 - Real timeout-driven integration tests when they assert a specific protocol outcome (not a slack timing bound alone)
-- Feature-matrix twins when each twin is required by a stated merge gate *and* asserts a distinct type/error path (not a copy with only the feature name changed)
+- Feature-matrix twins when each twin is required by a stated merge gate _and_ asserts a distinct type/error path (not a copy with only the feature name changed)
 
 Boundary-shaped (unconditional — not subject to the “weaker peers” clause):
 
