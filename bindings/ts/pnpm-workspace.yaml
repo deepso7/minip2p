@@ -35,4 +35,5 @@ nodeLinker: hoisted
 saveExact: true
 
 patchedDependencies:
+  expo-modules-autolinking@57.0.11: patches/expo-modules-autolinking@57.0.11.patch
   uniffi-bindgen-react-native@0.31.0-5: react-native/patches/uniffi-bindgen-react-native@0.31.0-5.patch

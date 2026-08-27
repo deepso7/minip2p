@@ -18,7 +18,7 @@ test("release verification accepts workspace-linked Node platform packages", () 
   assert.match(verifyStep.run, /select\(\.value != "workspace:\*"\)/u);
 });
 
-test("Android release uses the Gradle version required by generated AGP", () => {
+test("Android release pins the Gradle version required by generated AGP", () => {
   const gradleStep = workflow.jobs["android-native"].steps.find(
     ({ name }) => name === "Pin generated Gradle wrapper"
   );
