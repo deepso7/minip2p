@@ -26,7 +26,7 @@ catalogs:
       version: 7.0.2
 
 patchedDependencies:
-  expo-modules-autolinking@57.0.11: fe483d52e053e1fe4fd366bf87eec77d87345c4997b6de4e159fbc213a668935
+  expo-modules-autolinking@57.0.11: c6841d7c9aa3c69865457ee8e05a09b61ed55ab70e1eada8ccfcd7895f14f23f
   uniffi-bindgen-react-native@0.31.0-5: 3d3826cb29db1530c60a1092dde51421bfa266d3c2add5512d462f7c0adac050
 
 importers:
@@ -6239,7 +6239,7 @@ snapshots:
       '@expo/json-file': 11.0.1
       '@react-native/normalize-colors': 0.86.2
       debug: 4.4.3(supports-color@8.1.1)
-      expo-modules-autolinking: 57.0.11(patch_hash=fe483d52e053e1fe4fd366bf87eec77d87345c4997b6de4e159fbc213a668935)(supports-color@8.1.1)(typescript@7.0.2)
+      expo-modules-autolinking: 57.0.11(patch_hash=c6841d7c9aa3c69865457ee8e05a09b61ed55ab70e1eada8ccfcd7895f14f23f)(supports-color@8.1.1)(typescript@7.0.2)
       resolve-from: 5.0.0
       semver: 7.8.5
     transitivePeerDependencies:
@@ -8154,7 +8154,7 @@ snapshots:
       expo: 57.0.16(@babel/core@7.29.7(supports-color@8.1.1))(@expo/dom-webview@57.0.1)(react-native@0.87.0(@babel/core@7.29.7(supports-color@8.1.1))(@react-native-community/cli@20.2.0(supports-color@8.1.1)(typescript@7.0.2))(@types/react@19.2.18)(react@19.2.8)(supports-color@8.1.1))(react@19.2.8)(supports-color@8.1.1)(typescript@7.0.2)
       expo-json-utils: 57.0.1
 
-  expo-modules-autolinking@57.0.11(patch_hash=fe483d52e053e1fe4fd366bf87eec77d87345c4997b6de4e159fbc213a668935)(supports-color@8.1.1)(typescript@7.0.2):
+  expo-modules-autolinking@57.0.11(patch_hash=c6841d7c9aa3c69865457ee8e05a09b61ed55ab70e1eada8ccfcd7895f14f23f)(supports-color@8.1.1)(typescript@7.0.2):
     dependencies:
       '@expo/require-utils': 57.0.5(supports-color@8.1.1)(typescript@7.0.2)
       '@expo/spawn-async': 1.8.0
@@ -8207,7 +8207,7 @@ snapshots:
       expo-file-system: 57.0.5(expo@57.0.16)(react-native@0.87.0(@babel/core@7.29.7(supports-color@8.1.1))(@react-native-community/cli@20.2.0(supports-color@8.1.1)(typescript@7.0.2))(@types/react@19.2.18)(react@19.2.8)(supports-color@8.1.1))
       expo-font: 57.0.1(expo@57.0.16)(react-native@0.87.0(@babel/core@7.29.7(supports-color@8.1.1))(@react-native-community/cli@20.2.0(supports-color@8.1.1)(typescript@7.0.2))(@types/react@19.2.18)(react@19.2.8)(supports-color@8.1.1))(react@19.2.8)
       expo-keep-awake: 57.0.1(expo@57.0.16)(react@19.2.8)
-      expo-modules-autolinking: 57.0.11(patch_hash=fe483d52e053e1fe4fd366bf87eec77d87345c4997b6de4e159fbc213a668935)(supports-color@8.1.1)(typescript@7.0.2)
+      expo-modules-autolinking: 57.0.11(patch_hash=c6841d7c9aa3c69865457ee8e05a09b61ed55ab70e1eada8ccfcd7895f14f23f)(supports-color@8.1.1)(typescript@7.0.2)
       expo-modules-core: 57.0.13(react-native@0.87.0(@babel/core@7.29.7(supports-color@8.1.1))(@react-native-community/cli@20.2.0(supports-color@8.1.1)(typescript@7.0.2))(@types/react@19.2.18)(react@19.2.8)(supports-color@8.1.1))(react@19.2.8)
       pretty-format: 29.7.0
       react: 19.2.8
