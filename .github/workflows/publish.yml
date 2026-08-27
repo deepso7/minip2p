@@ -228,7 +228,6 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           docker run --rm \
-            --env PNPM_VERSION \
             --env TARGET \
             --volume "$GITHUB_WORKSPACE:/work" \
             --workdir /work/bindings/ts \
@@ -237,22 +236,20 @@ jobs:
               set -euo pipefail
               apk add --no-cache --upgrade \
                 --repository https://dl-cdn.alpinelinux.org/alpine/v3.23/main \
-                clang20-libclang=20.1.8-r1 \
-                nodejs=24.18.1-r0
-              export PATH="/usr/bin:$PATH"
-              npm install --global --force "pnpm@$PNPM_VERSION"
-              rustup toolchain install 1.91 --profile minimal --target ${{ matrix.target }}
+                clang20-libclang=20.1.8-r1
+              rustup toolchain install 1.91 --profile minimal
               rustup default 1.91
-              ln -sf /usr/bin/gcc "/usr/local/bin/${TARGET%%-*}-linux-musl-gcc"
-              export CC_aarch64_unknown_linux_musl=gcc
-              export CXX_aarch64_unknown_linux_musl=g++
-              export CC_x86_64_unknown_linux_musl=gcc
-              export CXX_x86_64_unknown_linux_musl=g++
+              export CC=gcc
+              export CXX=g++
               export LIBCLANG_PATH=/usr/lib/llvm20/lib
-              export CARGO_BUILD_RUSTFLAGS="-C target-feature=-crt-static"
               export RUSTFLAGS="-C target-feature=-crt-static"
-              pnpm install --frozen-lockfile --force
-              pnpm --filter @minip2p/node native:build:target --target ${{ matrix.target }} -- --locked
+              cargo build --release --locked --manifest-path ../../crates/nodejs/Cargo.toml
+              case "$TARGET" in
+                x86_64-unknown-linux-musl) output=minip2p.linux-x64-musl.node ;;
+                aarch64-unknown-linux-musl) output=minip2p.linux-arm64-musl.node ;;
+                *) echo "Unsupported musl target: $TARGET" >&2; exit 1 ;;
+              esac
+              install ../../target/release/libminip2p_nodejs.so "node/$output"
             '
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
