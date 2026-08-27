@@ -63,7 +63,8 @@ jobs:
           fi
           mkdir -p ../../target/debug
           cp "../../target/release/$relay" "../../target/debug/$relay"
-      - run: |
+      - shell: bash
+        run: |
           pnpm --filter @minip2p/node exec vitest run \
             --config ../vitest.config.ts \
             --root . \

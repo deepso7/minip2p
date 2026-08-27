@@ -49,8 +49,10 @@ test("weekly workflow executes the suite on native runners and musl containers",
   });
   assert.ok(nativeJob.steps.some(({ name }) => name === "Build relay fixture"));
   assert.ok(
-    nativeJob.steps.some(({ run }) =>
-      run?.startsWith("pnpm --filter @minip2p/node exec vitest run")
+    nativeJob.steps.some(
+      ({ run, shell }) =>
+        shell === "bash" &&
+        run?.startsWith("pnpm --filter @minip2p/node exec vitest run")
     )
   );
 
