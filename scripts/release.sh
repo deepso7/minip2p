@@ -138,8 +138,8 @@ else
   perl -pi -e "s/\"version\": \"\\Q$current_version\\E\"/\"version\": \"$version\"/" \
     bindings/ts/core/package.json \
     bindings/ts/react-native/package.json \
+    bindings/ts/node/package.json \
     bindings/ts/node/npm/*/package.json
-  perl -pi -e "s/\\Q$current_version\\E/$version/g" bindings/ts/node/package.json
 
   echo "release: regenerating lockfiles"
   cargo metadata --format-version 1 >/dev/null
@@ -189,7 +189,7 @@ $mismatched_dependencies"
     [[ "$(jq -r .version "$manifest")" == "$version" ]] ||
       die "$(jq -r .name "$manifest") version does not match"
   done
-  [[ "$(jq --arg version "$version" '[.optionalDependencies | to_entries[] | select((.key | startswith("@minip2p/node-")) and .value == $version)] | length' bindings/ts/node/package.json)" == 7 ]] ||
+  [[ "$(jq '[.optionalDependencies | to_entries[] | select((.key | startswith("@minip2p/node-")) and .value == "workspace:*")] | length' bindings/ts/node/package.json)" == 7 ]] ||
     die "@minip2p/node platform dependencies do not match"
 
   just fmt

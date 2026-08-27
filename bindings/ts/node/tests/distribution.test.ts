@@ -22,17 +22,17 @@ const coreManifest = JSON.parse(
 ) as Record<string, unknown>;
 
 describe("@minip2p/node distribution", () => {
-  test("publishes seven lockstep platform packages", () => {
+  test("links seven lockstep platform packages", () => {
     expect(nodeManifest.private).not.toBe(true);
     expect(nodeManifest.version).toBe(coreManifest.version);
     expect(nodeManifest.optionalDependencies).toEqual({
-      "@minip2p/node-darwin-arm64": coreManifest.version,
-      "@minip2p/node-darwin-x64": coreManifest.version,
-      "@minip2p/node-linux-arm64-gnu": coreManifest.version,
-      "@minip2p/node-linux-arm64-musl": coreManifest.version,
-      "@minip2p/node-linux-x64-gnu": coreManifest.version,
-      "@minip2p/node-linux-x64-musl": coreManifest.version,
-      "@minip2p/node-win32-x64-msvc": coreManifest.version,
+      "@minip2p/node-darwin-arm64": "workspace:*",
+      "@minip2p/node-darwin-x64": "workspace:*",
+      "@minip2p/node-linux-arm64-gnu": "workspace:*",
+      "@minip2p/node-linux-arm64-musl": "workspace:*",
+      "@minip2p/node-linux-x64-gnu": "workspace:*",
+      "@minip2p/node-linux-x64-musl": "workspace:*",
+      "@minip2p/node-win32-x64-msvc": "workspace:*",
     });
   });
 

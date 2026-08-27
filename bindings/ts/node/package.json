@@ -51,13 +51,13 @@
     "typescript": "catalog:"
   },
   "optionalDependencies": {
-    "@minip2p/node-darwin-arm64": "0.4.7",
-    "@minip2p/node-darwin-x64": "0.4.7",
-    "@minip2p/node-linux-arm64-gnu": "0.4.7",
-    "@minip2p/node-linux-arm64-musl": "0.4.7",
-    "@minip2p/node-linux-x64-gnu": "0.4.7",
-    "@minip2p/node-linux-x64-musl": "0.4.7",
-    "@minip2p/node-win32-x64-msvc": "0.4.7"
+    "@minip2p/node-darwin-arm64": "workspace:*",
+    "@minip2p/node-darwin-x64": "workspace:*",
+    "@minip2p/node-linux-arm64-gnu": "workspace:*",
+    "@minip2p/node-linux-arm64-musl": "workspace:*",
+    "@minip2p/node-linux-x64-gnu": "workspace:*",
+    "@minip2p/node-linux-x64-musl": "workspace:*",
+    "@minip2p/node-win32-x64-msvc": "workspace:*"
   },
   "napi": {
     "binaryName": "minip2p",
