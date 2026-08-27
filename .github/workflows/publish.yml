@@ -231,7 +231,7 @@ jobs:
             --volume "$GITHUB_WORKSPACE:/work" \
             --workdir /work/bindings/ts \
             "$NAPI_BUILD_IMAGE" \
-            bash -lc 'corepack prepare "pnpm@$PNPM_VERSION" --activate && pnpm install --frozen-lockfile --force && pnpm --filter @minip2p/node native:build:target --target ${{ matrix.target }} -- --locked'
+            bash -lc 'npm install --global --force "@pnpm/exe@$PNPM_VERSION" && pnpm install --frozen-lockfile --force && pnpm --filter @minip2p/node native:build:target --target ${{ matrix.target }} -- --locked'
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: node-binding-${{ matrix.target }}
