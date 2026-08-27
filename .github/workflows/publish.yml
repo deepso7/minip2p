@@ -243,6 +243,8 @@ jobs:
               rustup toolchain install 1.91 --profile minimal --target ${{ matrix.target }}
               rustup default 1.91
               ln -sf /usr/bin/gcc "/usr/local/bin/${TARGET%%-*}-linux-musl-gcc"
+              export CC_aarch64_unknown_linux_musl=gcc
+              export CXX_aarch64_unknown_linux_musl=g++
               pnpm install --frozen-lockfile --force
               pnpm --filter @minip2p/node native:build:target --target ${{ matrix.target }} -- --locked
             '
