@@ -51,7 +51,22 @@ jobs:
       - name: Build addon
         shell: bash
         run: pnpm --filter @minip2p/node native:build:target --target ${{ matrix.target }} -- --locked
-      - run: pnpm test
+      - name: Build relay fixture
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --release --locked -p minip2p-relay-server-example
+          relay=minip2p-relay
+          if [[ "$TARGET" == x86_64-pc-windows-msvc ]]; then
+            relay+=.exe
+          fi
+          install -D "../../target/release/$relay" "../../target/debug/$relay"
+      - run: |
+          pnpm --filter @minip2p/node exec vitest run \
+            --config ../vitest.config.ts \
+            --root . \
+            --no-file-parallelism
 
   node-musl:
     name: Build and test Node addon (${{ matrix.target }})

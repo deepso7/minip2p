@@ -47,7 +47,12 @@ test("weekly workflow executes the suite on native runners and musl containers",
     "x86_64-pc-windows-msvc": "windows-latest",
     "x86_64-unknown-linux-gnu": "ubuntu-24.04",
   });
-  assert.ok(nativeJob.steps.some(({ run }) => run === "pnpm test"));
+  assert.ok(nativeJob.steps.some(({ name }) => name === "Build relay fixture"));
+  assert.ok(
+    nativeJob.steps.some(({ run }) =>
+      run?.startsWith("pnpm --filter @minip2p/node exec vitest run")
+    )
+  );
 
   const muslBuild = workflow.jobs["node-musl"].steps.find(
     ({ name }) => name === "Build addon"
