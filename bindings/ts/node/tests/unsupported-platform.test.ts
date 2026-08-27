@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 const originalPlatform = process.platform;
 const originalGetReport = process.report.getReport;
+const FakeNodeEndpoint = vi.fn();
 
 afterEach(() => {
   Object.defineProperty(process, "platform", { value: originalPlatform });
@@ -18,12 +19,25 @@ describe("@minip2p/node native loader", () => {
 
     const loading = import("../src/native.js");
     await expect(loading).rejects.toThrow(
-      /Unsupported minip2p Node target plan9-x64.*linux-x64-gnu.*darwin-arm64.*win32-x64/su
+      new RegExp(
+        `Unsupported minip2p Node target plan9-${process.arch}.*linux-x64-gnu.*darwin-arm64.*win32-x64`,
+        "su"
+      )
     );
     await expect(loading).rejects.not.toThrow(/optional dependencies/u);
   });
 
   test("recognizes glibc from the compiler version", async () => {
+    const requested: string[] = [];
+    vi.doMock("node:module", () => ({
+      createRequire: () => (specifier: string) => {
+        requested.push(specifier);
+        return {
+          NodeEndpoint: FakeNodeEndpoint,
+          generateSecretKey: () => new Uint8Array(),
+        };
+      },
+    }));
     Object.defineProperty(process, "platform", { value: "linux" });
     Object.defineProperty(process.report, "getReport", {
       value: () => ({ header: { glibcVersionCompiler: "2.28" } }),
@@ -32,6 +46,7 @@ describe("@minip2p/node native loader", () => {
     await expect(import("../src/native.js")).resolves.toHaveProperty(
       "nativeBinding"
     );
+    expect(requested).toEqual([`../minip2p.linux-${process.arch}-gnu.node`]);
   });
 
   test("preserves the loader error for a present but broken local addon", async () => {

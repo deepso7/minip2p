@@ -28,7 +28,10 @@ describe("native event payloads", () => {
     ]);
 
     const stream = a.openStream(b.peerId(), protocol);
-    await waitForEvent(b, "StreamReady");
+    await Promise.all([
+      waitForEvent(a, "StreamReady"),
+      waitForEvent(b, "StreamReady"),
+    ]);
     a.sendStream(b.peerId(), stream.streamId, Uint8Array.of(0, 127, 255));
 
     const event = await waitForEvent(b, "StreamData");

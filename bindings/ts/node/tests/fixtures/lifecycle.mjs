@@ -12,7 +12,7 @@ const libc =
 const target =
   process.platform === "linux"
     ? `${process.platform}-${process.arch}-${libc}`
-    : `${process.platform}-${process.arch}`;
+    : `${process.platform}-${process.arch}${process.platform === "win32" ? "-msvc" : ""}`;
 const binding = require(`../../minip2p.${target}.node`);
 const endpoint = new binding.NodeEndpoint(binding.generateSecretKey(), {
   allowUnsigned: false,

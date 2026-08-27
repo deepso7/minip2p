@@ -1,7 +1,12 @@
-name: React Native native builds
+name: Native binding builds
 
 on:
   workflow_dispatch:
+    inputs:
+      include_mobile:
+        description: Also build the React Native Android and iOS artifacts
+        type: boolean
+        default: false
   schedule:
     - cron: "17 4 * * 1"
 
@@ -13,7 +18,121 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  node-native:
+    name: Build and test Node addon (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-26-intel
+            target: x86_64-apple-darwin
+          - runner: macos-26
+            target: aarch64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    defaults:
+      run:
+        working-directory: bindings/ts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: "24.19.0"
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: "11.24.0"
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: "1.91"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: pnpm install --frozen-lockfile
+      - name: Build addon
+        shell: bash
+        run: pnpm --filter @minip2p/node native:build:target --target ${{ matrix.target }} -- --locked
+      - name: Build relay fixture
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --release --locked -p minip2p-relay-server-example
+          relay=minip2p-relay
+          if [[ "$TARGET" == x86_64-pc-windows-msvc ]]; then
+            relay+=.exe
+          fi
+          mkdir -p ../../target/debug
+          cp "../../target/release/$relay" "../../target/debug/$relay"
+      - shell: bash
+        run: |
+          pnpm --filter @minip2p/node exec vitest run \
+            --config ../vitest.config.ts \
+            --root . \
+            --no-file-parallelism
+
+  node-musl:
+    name: Build and test Node addon (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Build addon
+        env:
+          NAPI_BUILD_IMAGE: ghcr.io/napi-rs/napi-rs/nodejs-rust@sha256:caac2d1b9194eada0c69e669e72763869701351d8957ab805cc45a43999d8be2
+          TARGET: ${{ matrix.target }}
+        run: |
+          docker run --rm \
+            --env TARGET \
+            --volume "$GITHUB_WORKSPACE:/work" \
+            --workdir /work/bindings/ts \
+            "$NAPI_BUILD_IMAGE" \
+            bash -lc '
+              set -euo pipefail
+              apk add --no-cache --upgrade \
+                --repository https://dl-cdn.alpinelinux.org/alpine/v3.23/main \
+                clang20-libclang=20.1.8-r1 \
+                nodejs npm
+              export PATH=/usr/bin:$PATH
+              npm install --global --prefix /opt/pnpm pnpm@11.24.0
+              export PATH=/opt/pnpm/bin:/usr/bin:$PATH
+              rustup toolchain install 1.91 --profile minimal
+              rustup default 1.91
+              export CC=gcc
+              export CXX=g++
+              export LIBCLANG_PATH=/usr/lib/llvm20/lib
+              export RUSTFLAGS="-C target-feature=-crt-static"
+              cargo build --release --locked --manifest-path ../../crates/nodejs/Cargo.toml
+              case "$TARGET" in
+                x86_64-unknown-linux-musl) output=minip2p.linux-x64-musl.node ;;
+                aarch64-unknown-linux-musl) output=minip2p.linux-arm64-musl.node ;;
+                *) echo "Unsupported musl target: $TARGET" >&2; exit 1 ;;
+              esac
+              install ../../target/release/libminip2p_nodejs.so "node/$output"
+              cargo build --release --locked -p minip2p-relay-server-example
+              mkdir -p ../../target/debug
+              cp ../../target/release/minip2p-relay ../../target/debug/minip2p-relay
+              pnpm install --frozen-lockfile
+              pnpm --filter @minip2p/node exec vitest run \
+                --config ../vitest.config.ts \
+                --root . \
+                --no-file-parallelism
+            '
+
   android:
+    if: github.event_name == 'schedule' || inputs.include_mobile
     runs-on: ubuntu-latest
     timeout-minutes: 60
     defaults:
@@ -67,6 +186,7 @@ jobs:
           if-no-files-found: error
 
   ios:
+    if: github.event_name == 'schedule' || inputs.include_mobile
     runs-on: macos-26
     timeout-minutes: 60
     defaults:
