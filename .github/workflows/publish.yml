@@ -233,20 +233,12 @@ jobs:
             "$NAPI_BUILD_IMAGE" \
             bash -lc '
               set -euo pipefail
-              case "$(uname -m)" in
-                x86_64) pnpm_arch=x64 ;;
-                aarch64) pnpm_arch=arm64 ;;
-                *) echo "Unsupported pnpm architecture: $(uname -m)" >&2; exit 1 ;;
-              esac
-              mkdir -p /tmp/pnpm-exe /tmp/pnpm-platform
-              pnpm_exe_tarball=$(npm pack --silent "@pnpm/exe@$PNPM_VERSION" --pack-destination /tmp)
-              pnpm_platform_tarball=$(npm pack --silent "@pnpm/linuxstatic-$pnpm_arch@$PNPM_VERSION" --pack-destination /tmp)
-              tar -xzf "/tmp/$pnpm_exe_tarball" -C /tmp/pnpm-exe
-              tar -xzf "/tmp/$pnpm_platform_tarball" -C /tmp/pnpm-platform
-              install /tmp/pnpm-platform/package/pnpm /tmp/pnpm-exe/package/pnpm
-              pnpm_bin=/tmp/pnpm-exe/package/pnpm
-              "$pnpm_bin" install --frozen-lockfile --force
-              "$pnpm_bin" --filter @minip2p/node native:build:target --target ${{ matrix.target }} -- --locked
+              apk add --no-cache --upgrade \
+                --repository https://dl-cdn.alpinelinux.org/alpine/v3.23/main \
+                nodejs=24.18.1-r0
+              npm install --global --force "pnpm@$PNPM_VERSION"
+              pnpm install --frozen-lockfile --force
+              pnpm --filter @minip2p/node native:build:target --target ${{ matrix.target }} -- --locked
             '
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
