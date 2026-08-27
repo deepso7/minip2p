@@ -61,7 +61,8 @@ jobs:
           if [[ "$TARGET" == x86_64-pc-windows-msvc ]]; then
             relay+=.exe
           fi
-          install -D "../../target/release/$relay" "../../target/debug/$relay"
+          mkdir -p ../../target/debug
+          cp "../../target/release/$relay" "../../target/debug/$relay"
       - run: |
           pnpm --filter @minip2p/node exec vitest run \
             --config ../vitest.config.ts \
@@ -115,9 +116,8 @@ jobs:
               esac
               install ../../target/release/libminip2p_nodejs.so "node/$output"
               cargo build --release --locked -p minip2p-relay-server-example
-              install -D \
-                ../../target/release/minip2p-relay \
-                ../../target/debug/minip2p-relay
+              mkdir -p ../../target/debug
+              cp ../../target/release/minip2p-relay ../../target/debug/minip2p-relay
               pnpm install --frozen-lockfile
               pnpm --filter @minip2p/node exec vitest run \
                 --config ../vitest.config.ts \
