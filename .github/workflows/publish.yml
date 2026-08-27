@@ -249,6 +249,7 @@ jobs:
               export CC_x86_64_unknown_linux_musl=gcc
               export CXX_x86_64_unknown_linux_musl=g++
               export LIBCLANG_PATH=/usr/lib/llvm20/lib
+              export CARGO_BUILD_RUSTFLAGS="-C target-feature=-crt-static"
               export RUSTFLAGS="-C target-feature=-crt-static"
               pnpm install --frozen-lockfile --force
               pnpm --filter @minip2p/node native:build:target --target ${{ matrix.target }} -- --locked
