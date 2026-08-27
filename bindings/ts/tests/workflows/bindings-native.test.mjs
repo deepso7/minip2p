@@ -54,6 +54,5 @@ test("weekly workflow executes the suite on native runners and musl containers",
   ).run;
   assert.match(muslBuild, /PATH=\/opt\/pnpm\/bin:\/usr\/bin:/u);
   assert.match(muslBuild, /--prefix \/opt\/pnpm pnpm@11\.24\.0/u);
-  assert.match(muslBuild, /install .*\n\s+unset RUSTFLAGS/u);
   assert.match(muslBuild, /pnpm test/u);
 });

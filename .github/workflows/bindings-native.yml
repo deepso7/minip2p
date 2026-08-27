@@ -99,7 +99,6 @@ jobs:
                 *) echo "Unsupported musl target: $TARGET" >&2; exit 1 ;;
               esac
               install ../../target/release/libminip2p_nodejs.so "node/$output"
-              unset RUSTFLAGS
               pnpm install --frozen-lockfile
               pnpm test
             '
