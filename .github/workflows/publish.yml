@@ -237,6 +237,7 @@ jobs:
               set -euo pipefail
               apk add --no-cache --upgrade \
                 --repository https://dl-cdn.alpinelinux.org/alpine/v3.23/main \
+                clang20-libclang=20.1.8-r1 \
                 nodejs=24.18.1-r0
               export PATH="/usr/bin:$PATH"
               npm install --global --force "pnpm@$PNPM_VERSION"
@@ -245,6 +246,9 @@ jobs:
               ln -sf /usr/bin/gcc "/usr/local/bin/${TARGET%%-*}-linux-musl-gcc"
               export CC_aarch64_unknown_linux_musl=gcc
               export CXX_aarch64_unknown_linux_musl=g++
+              export CC_x86_64_unknown_linux_musl=gcc
+              export CXX_x86_64_unknown_linux_musl=g++
+              export LIBCLANG_PATH=/usr/lib/llvm20/lib
               pnpm install --frozen-lockfile --force
               pnpm --filter @minip2p/node native:build:target --target ${{ matrix.target }} -- --locked
             '
