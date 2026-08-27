@@ -107,12 +107,12 @@ jobs:
                 | "\(.name) is not public at \($version)"
               ' "$manifest"
             done
-            jq -r --arg version "$version" '
+            jq -r '
               .optionalDependencies // {}
               | to_entries[]
               | select(.key | startswith("@minip2p/node-"))
-              | select(.value != $version)
-              | "\(.key) uses \(.value), expected \($version)"
+              | select(.value != "workspace:*")
+              | "\(.key) uses \(.value), expected workspace:*"
             ' bindings/ts/node/package.json
           } )"
           if [[ -n "$platform_errors" ]] ||
