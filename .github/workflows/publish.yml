@@ -3,12 +3,13 @@ name: Publish release
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.release.tag_name }}
+  group: release-${{ github.event.release.tag_name || github.sha }}
   cancel-in-progress: false
 
 # Every rust-cache below runs with `save-if: false`. These jobs check out a tag,
@@ -28,9 +29,9 @@ jobs:
     outputs:
       version: ${{ steps.release.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || github.sha }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -39,12 +40,13 @@ jobs:
       - name: Verify release tag and package versions
         id: release
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           metadata="$(cargo metadata --no-deps --format-version 1)"
           version="$(jq -r '.packages[] | select(.name == "minip2p-rs") | .version' <<<"$metadata")"
-          if [[ "$RELEASE_TAG" != "v$version" ]]; then
+          if [[ "$EVENT_NAME" == "release" && "$RELEASE_TAG" != "v$version" ]]; then
             echo "::error::Release tag $RELEASE_TAG does not match workspace version $version (expected v$version)"
             exit 1
           fi
@@ -89,12 +91,34 @@ jobs:
 
           core_version="$(jq -r '.version' bindings/ts/core/package.json)"
           react_native_version="$(jq -r '.version' bindings/ts/react-native/package.json)"
-          if [[ "$core_version" != "$version" || "$react_native_version" != "$version" ]]; then
-            echo "::error::Rust and public TypeScript packages must use $version; core=$core_version react-native=$react_native_version"
+          node_version="$(jq -r '.version' bindings/ts/node/package.json)"
+          if [[ "$core_version" != "$version" || "$react_native_version" != "$version" || "$node_version" != "$version" ]]; then
+            echo "::error::Rust and public TypeScript packages must use $version; core=$core_version react-native=$react_native_version node=$node_version"
             exit 1
           fi
-          if [[ "$(jq -r '.private' bindings/ts/node/package.json)" != "true" ]]; then
-            echo "::error::@minip2p/node must remain private until its native backend is implemented"
+          if [[ "$(jq -r '.private // false' bindings/ts/node/package.json)" == "true" ]]; then
+            echo "::error::@minip2p/node must be public"
+            exit 1
+          fi
+          platform_errors="$({
+            for manifest in bindings/ts/node/npm/*/package.json; do
+              jq -r --arg version "$version" '
+                select(.version != $version or .publishConfig.access != "public")
+                | "\(.name) is not public at \($version)"
+              ' "$manifest"
+            done
+            jq -r --arg version "$version" '
+              .optionalDependencies // {}
+              | to_entries[]
+              | select(.key | startswith("@minip2p/node-"))
+              | select(.value != $version)
+              | "\(.key) uses \(.value), expected \($version)"
+            ' bindings/ts/node/package.json
+          } )"
+          if [[ -n "$platform_errors" ]] ||
+            [[ "$(jq '[.optionalDependencies | to_entries[] | select(.key | startswith("@minip2p/node-"))] | length' bindings/ts/node/package.json)" != 7 ]]; then
+            echo "::error::Node platform packages must be public and lockstep-versioned"
+            echo "$platform_errors"
             exit 1
           fi
           if [[ "$(jq -r '.dependencies["@minip2p/core"]' bindings/ts/react-native/package.json)" != "workspace:*" ]]; then
@@ -111,7 +135,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.91"
@@ -130,6 +154,112 @@ jobs:
           cargo doc -p minip2p-mdns --features smoltcp --no-deps --locked
           cargo doc -p minip2p-rs --no-default-features --features smoltcp --no-deps --locked
 
+  node-native:
+    name: Build Node addon (${{ matrix.target }})
+    needs: verify-release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-26
+            target: x86_64-apple-darwin
+          - runner: macos-26
+            target: aarch64-apple-darwin
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    defaults:
+      run:
+        working-directory: bindings/ts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.release.tag_name || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: "1.91"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: false
+      - run: pnpm install --frozen-lockfile
+      - name: Build addon
+        shell: bash
+        run: pnpm --filter @minip2p/node native:build:target --target ${{ matrix.target }} -- --locked
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: node-binding-${{ matrix.target }}
+          path: bindings/ts/node/minip2p.*.node
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
+  node-musl:
+    name: Build Node addon (${{ matrix.target }})
+    needs: verify-release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.release.tag_name || github.sha }}
+      - name: Build addon
+        env:
+          NAPI_BUILD_IMAGE: ghcr.io/napi-rs/napi-rs/nodejs-rust@sha256:caac2d1b9194eada0c69e669e72763869701351d8957ab805cc45a43999d8be2
+          TARGET: ${{ matrix.target }}
+        run: |
+          docker run --rm \
+            --env TARGET \
+            --volume "$GITHUB_WORKSPACE:/work" \
+            --workdir /work/bindings/ts \
+            "$NAPI_BUILD_IMAGE" \
+            bash -lc '
+              set -euo pipefail
+              # Build with Cargo because napi CLI needs a compatible Node host inside Alpine.
+              apk add --no-cache --upgrade \
+                --repository https://dl-cdn.alpinelinux.org/alpine/v3.23/main \
+                clang20-libclang=20.1.8-r1
+              rustup toolchain install 1.91 --profile minimal
+              rustup default 1.91
+              export CC=gcc
+              export CXX=g++
+              export LIBCLANG_PATH=/usr/lib/llvm20/lib
+              export RUSTFLAGS="-C target-feature=-crt-static"
+              cargo build --release --locked --manifest-path ../../crates/nodejs/Cargo.toml
+              case "$TARGET" in
+                x86_64-unknown-linux-musl) output=minip2p.linux-x64-musl.node ;;
+                aarch64-unknown-linux-musl) output=minip2p.linux-arm64-musl.node ;;
+                *) echo "Unsupported musl target: $TARGET" >&2; exit 1 ;;
+              esac
+              install ../../target/release/libminip2p_nodejs.so "node/$output"
+            '
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: node-binding-${{ matrix.target }}
+          path: bindings/ts/node/minip2p.*.node
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
   relay-server-binaries:
     name: Build relay server (${{ matrix.target }})
     needs: verify-release
@@ -146,7 +276,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || github.sha }}
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: "1.91"
@@ -188,6 +318,7 @@ jobs:
 
   publish-relay-server-binaries:
     name: Publish relay server binaries
+    if: github.event_name == 'release'
     needs: [verify-release, relay-server-binaries]
     runs-on: ubuntu-latest
     permissions:
@@ -201,7 +332,7 @@ jobs:
       - name: Attach binaries and checksums to GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || github.sha }}
         working-directory: ${{ runner.temp }}/relay-release
         run: |
           set -euo pipefail
@@ -218,6 +349,7 @@ jobs:
 
   publish-relay-container:
     name: Publish relay container
+    if: github.event_name == 'release'
     needs: [verify-release, publish-relay-server-binaries]
     permissions:
       contents: read
@@ -237,7 +369,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || github.sha }}
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -306,7 +438,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || github.sha }}
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -345,32 +477,39 @@ jobs:
 
   package-typescript:
     name: Assemble TypeScript packages
-    needs: [verify-release, android-native, ios-native]
+    needs: [verify-release, android-native, ios-native, node-native, node-musl]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
       run:
         working-directory: bindings/ts
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.release.tag_name }}
-      - uses: actions/setup-node@v7
+          ref: ${{ github.event.release.tag_name || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: ${{ env.NODE_VERSION }}
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
         with:
           version: ${{ env.PNPM_VERSION }}
-      - uses: android-actions/setup-android@v4
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
       - name: Install Android NDK r28c for package validation
         run: |
           sdkmanager "ndk;28.2.13676358"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: false
       - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: node-binding-*
+          path: bindings/ts/node/artifacts
+          merge-multiple: true
+      - name: Assemble Node platform packages
+        run: pnpm --filter @minip2p/node exec napi artifacts --output-dir artifacts
       - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm lint
@@ -379,11 +518,11 @@ jobs:
       - run: pnpm rn:generate
       - name: Generated files are current
         run: test -z "$(git status --porcelain)"
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: minip2p-android-native
           path: ${{ runner.temp }}/native
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: minip2p-ios-native
           path: ${{ runner.temp }}/native
@@ -401,6 +540,12 @@ jobs:
             --pack-destination "$PWD/release-packages"
           pnpm --filter @minip2p/react-native pack \
             --pack-destination "$PWD/release-packages"
+          pnpm --filter @minip2p/node pack \
+            --pack-destination "$PWD/release-packages"
+          for platform_dir in node/npm/*; do
+            pnpm --dir "$platform_dir" pack \
+              --pack-destination "$PWD/release-packages"
+          done
       - name: Verify packed contents and dependency versions
         env:
           RELEASE_VERSION: ${{ needs.verify-release.outputs.version }}
@@ -409,7 +554,9 @@ jobs:
             "$RELEASE_VERSION" \
             "release-packages/minip2p-core-$RELEASE_VERSION.tgz" \
             "release-packages/minip2p-react-native-$RELEASE_VERSION.tgz" \
-            react-native
+            react-native \
+            "release-packages/minip2p-node-$RELEASE_VERSION.tgz" \
+            node/npm
       - name: Smoke-test installation from tarballs
         env:
           RELEASE_VERSION: ${{ needs.verify-release.outputs.version }}
@@ -420,9 +567,18 @@ jobs:
             --ignore-scripts \
             --legacy-peer-deps \
             "$PWD/release-packages/minip2p-core-$RELEASE_VERSION.tgz" \
-            "$PWD/release-packages/minip2p-react-native-$RELEASE_VERSION.tgz"
+            "$PWD/release-packages/minip2p-react-native-$RELEASE_VERSION.tgz" \
+            "$PWD/release-packages/minip2p-node-$RELEASE_VERSION.tgz" \
+            "$PWD/release-packages/minip2p-node-linux-x64-gnu-$RELEASE_VERSION.tgz"
           node scripts/smoke-release-install.mjs "$consumer"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: minip2p-node-platform-packages
+          path: bindings/ts/node/npm
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: minip2p-npm-packages
           path: bindings/ts/release-packages/*.tgz
@@ -432,6 +588,7 @@ jobs:
 
   publish-crates:
     name: Publish to crates.io
+    if: github.event_name == 'release'
     needs: [verify-release, test-rust, package-typescript]
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -442,7 +599,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.event.release.tag_name || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.91"
@@ -538,9 +695,45 @@ jobs:
             done
           done
 
+  publish-node-platforms:
+    name: Publish Node platform packages
+    if: github.event_name == 'release'
+    needs: [verify-release, package-typescript]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: bindings/ts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.release.tag_name || github.sha }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: minip2p-node-platform-packages
+          path: bindings/ts/node/npm
+      - name: Check verified platform artifacts
+        run: test "$(find node/npm -name 'minip2p.*.node' -type f -size +0c | wc -l)" -eq 7
+      - name: Publish platform packages with npm trusted publishing
+        run: pnpm --filter @minip2p/node exec napi prepublish -t npm --no-gh-release
+
   publish-typescript:
     name: Publish to npm
-    needs: [verify-release, publish-crates]
+    if: github.event_name == 'release'
+    needs: [verify-release, publish-crates, publish-node-platforms]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: npm
@@ -548,12 +741,12 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: minip2p-npm-packages
           path: packages
@@ -601,3 +794,6 @@ jobs:
           publish_package \
             "@minip2p/react-native" \
             "packages/minip2p-react-native-$RELEASE_VERSION.tgz"
+          publish_package \
+            "@minip2p/node" \
+            "packages/minip2p-node-$RELEASE_VERSION.tgz"

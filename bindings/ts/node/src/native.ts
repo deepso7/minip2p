@@ -11,7 +11,7 @@ const supportedTargets = [
   "linux-arm64-musl",
   "darwin-x64",
   "darwin-arm64",
-  "win32-x64",
+  "win32-x64-msvc",
 ] as const;
 
 type SupportedTarget = (typeof supportedTargets)[number];
@@ -30,6 +30,9 @@ function linuxLibc(): "gnu" | "musl" {
 function currentTarget(): string {
   if (process.platform === "linux") {
     return `${process.platform}-${process.arch}-${linuxLibc()}`;
+  }
+  if (process.platform === "win32") {
+    return `${process.platform}-${process.arch}-msvc`;
   }
   return `${process.platform}-${process.arch}`;
 }
@@ -123,13 +126,29 @@ function loadNativeBinding(target: string): NativeBinding {
     throw unsupportedTarget(target);
   }
 
+  let binding: unknown;
   try {
-    const binding: unknown = require(`../minip2p.${target}.node`);
-    assertNativeBinding(binding);
-    return binding;
+    binding = require(`../minip2p.${target}.node`);
   } catch (error) {
-    throw unsupportedTarget(target, error);
+    if (!isModuleNotFound(error)) {
+      throw error;
+    }
+    try {
+      binding = require(`@minip2p/node-${target}`);
+    } catch (packageError) {
+      throw unsupportedTarget(target, packageError);
+    }
   }
+  assertNativeBinding(binding);
+  return binding;
+}
+
+function isModuleNotFound(error: unknown): boolean {
+  return (
+    error !== null &&
+    typeof error === "object" &&
+    Reflect.get(error, "code") === "MODULE_NOT_FOUND"
+  );
 }
 
 function assertNativeBinding(value: unknown): asserts value is NativeBinding {

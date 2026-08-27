@@ -1,0 +1,35 @@
+{
+  "name": "@minip2p/node-linux-arm64-gnu",
+  "version": "0.4.6",
+  "description": "Node.js bindings for minip2p",
+  "keywords": [
+    "libp2p",
+    "napi-rs",
+    "node",
+    "p2p",
+    "peer-to-peer",
+    "quic",
+    "rust"
+  ],
+  "license": "MIT",
+  "files": [
+    "minip2p.linux-arm64-gnu.node"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "main": "minip2p.linux-arm64-gnu.node",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

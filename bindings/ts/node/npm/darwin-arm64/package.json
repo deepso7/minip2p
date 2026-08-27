@@ -1,0 +1,32 @@
+{
+  "name": "@minip2p/node-darwin-arm64",
+  "version": "0.4.6",
+  "description": "Node.js bindings for minip2p",
+  "keywords": [
+    "libp2p",
+    "napi-rs",
+    "node",
+    "p2p",
+    "peer-to-peer",
+    "quic",
+    "rust"
+  ],
+  "license": "MIT",
+  "files": [
+    "minip2p.darwin-arm64.node"
+  ],
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "minip2p.darwin-arm64.node",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

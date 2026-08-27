@@ -16,8 +16,10 @@ if (consumerRoot === undefined) {
 const modules = path.resolve(consumerRoot, "node_modules");
 const coreRoot = path.join(modules, "@minip2p/core");
 const reactNativeRoot = path.join(modules, "@minip2p/react-native");
+const nodeRoot = path.join(modules, "@minip2p/node");
 const coreManifest = readManifest(coreRoot);
 const reactNativeManifest = readManifest(reactNativeRoot);
+const nodeManifest = readManifest(nodeRoot);
 
 if (
   reactNativeManifest.dependencies?.["@minip2p/core"] !== coreManifest.version
@@ -46,13 +48,26 @@ requireNamedExport(
   path.join(reactNativeRoot, packageExport(reactNativeManifest, "default")),
   "Minip2p"
 );
+
+if (nodeManifest.dependencies?.["@minip2p/core"] !== coreManifest.version) {
+  throw new Error(
+    `installed @minip2p/node requires core ${nodeManifest.dependencies?.["@minip2p/core"] ?? "missing"}, but ${coreManifest.version} is installed`
+  );
+}
+const nodeBinding = await import(
+  pathToFileURL(path.join(nodeRoot, packageExport(nodeManifest, "default")))
+    .href
+);
+if (typeof nodeBinding.Minip2p !== "function") {
+  throw new TypeError("installed @minip2p/node is missing Minip2p");
+}
 requireNamedExport(
   path.join(reactNativeRoot, packageExport(reactNativeManifest, "types")),
   "Minip2p"
 );
 
 console.log(
-  `smoke-tested installed @minip2p/core and @minip2p/react-native ${coreManifest.version}`
+  `smoke-tested installed @minip2p/core, @minip2p/react-native, and @minip2p/node ${coreManifest.version}`
 );
 
 function readManifest(root) {

@@ -137,7 +137,9 @@ else
 
   perl -pi -e "s/\"version\": \"\\Q$current_version\\E\"/\"version\": \"$version\"/" \
     bindings/ts/core/package.json \
-    bindings/ts/react-native/package.json
+    bindings/ts/react-native/package.json \
+    bindings/ts/node/npm/*/package.json
+  perl -pi -e "s/\\Q$current_version\\E/$version/g" bindings/ts/node/package.json
 
   echo "release: regenerating lockfiles"
   cargo metadata --format-version 1 >/dev/null
@@ -181,6 +183,14 @@ $mismatched_dependencies"
     die "@minip2p/core version does not match"
   [[ "$(jq -r .version bindings/ts/react-native/package.json)" == "$version" ]] ||
     die "@minip2p/react-native version does not match"
+  [[ "$(jq -r .version bindings/ts/node/package.json)" == "$version" ]] ||
+    die "@minip2p/node version does not match"
+  for manifest in bindings/ts/node/npm/*/package.json; do
+    [[ "$(jq -r .version "$manifest")" == "$version" ]] ||
+      die "$(jq -r .name "$manifest") version does not match"
+  done
+  [[ "$(jq --arg version "$version" '[.optionalDependencies | to_entries[] | select((.key | startswith("@minip2p/node-")) and .value == $version)] | length' bindings/ts/node/package.json)" == 7 ]] ||
+    die "@minip2p/node platform dependencies do not match"
 
   just fmt
   git diff --check
@@ -364,6 +374,13 @@ done
 
 verify_npm_package '%40minip2p%2Fcore' '@minip2p/core'
 verify_npm_package '%40minip2p%2Freact-native' '@minip2p/react-native'
+verify_npm_package '%40minip2p%2Fnode' '@minip2p/node'
+for manifest in bindings/ts/node/npm/*/package.json; do
+  package_name="$(jq -r .name "$manifest")"
+  encoded_name="${package_name/@/%40}"
+  encoded_name="${encoded_name/\//%2F}"
+  verify_npm_package "$encoded_name" "$package_name"
+done
 
 git fetch origin main --tags
 git merge-base --is-ancestor "$head_sha" origin/main ||
@@ -377,4 +394,4 @@ echo "release: commit $head_sha"
 echo "release: GitHub $release_url"
 echo "release: relay server ${#expected_relay_assets[@]}/${#expected_relay_assets[@]} assets"
 echo "release: crates.io ${#publishable_crates[@]}/${#publishable_crates[@]} packages"
-echo "release: npm @minip2p/core@$version and @minip2p/react-native@$version"
+echo "release: npm @minip2p/core, @minip2p/react-native, @minip2p/node, and 7 platform packages at $version"

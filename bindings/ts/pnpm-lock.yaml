@@ -68,6 +68,28 @@ importers:
       '@minip2p/core':
         specifier: workspace:*
         version: link:../core
+    optionalDependencies:
+      '@minip2p/node-darwin-arm64':
+        specifier: 0.4.6
+        version: link:npm/darwin-arm64
+      '@minip2p/node-darwin-x64':
+        specifier: 0.4.6
+        version: link:npm/darwin-x64
+      '@minip2p/node-linux-arm64-gnu':
+        specifier: 0.4.6
+        version: link:npm/linux-arm64-gnu
+      '@minip2p/node-linux-arm64-musl':
+        specifier: 0.4.6
+        version: link:npm/linux-arm64-musl
+      '@minip2p/node-linux-x64-gnu':
+        specifier: 0.4.6
+        version: link:npm/linux-x64-gnu
+      '@minip2p/node-linux-x64-musl':
+        specifier: 0.4.6
+        version: link:npm/linux-x64-musl
+      '@minip2p/node-win32-x64-msvc':
+        specifier: 0.4.6
+        version: link:npm/win32-x64-msvc
     devDependencies:
       '@minip2p/test-fixtures':
         specifier: workspace:*
@@ -84,6 +106,20 @@ importers:
       typescript:
         specifier: 'catalog:'
         version: 7.0.2
+
+  node/npm/darwin-arm64: {}
+
+  node/npm/darwin-x64: {}
+
+  node/npm/linux-arm64-gnu: {}
+
+  node/npm/linux-arm64-musl: {}
+
+  node/npm/linux-x64-gnu: {}
+
+  node/npm/linux-x64-musl: {}
+
+  node/npm/win32-x64-msvc: {}
 
   react-native:
     dependencies:

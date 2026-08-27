@@ -1,0 +1,32 @@
+{
+  "name": "@minip2p/node-win32-x64-msvc",
+  "version": "0.4.6",
+  "description": "Node.js bindings for minip2p",
+  "keywords": [
+    "libp2p",
+    "napi-rs",
+    "node",
+    "p2p",
+    "peer-to-peer",
+    "quic",
+    "rust"
+  ],
+  "license": "MIT",
+  "files": [
+    "minip2p.win32-x64-msvc.node"
+  ],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "minip2p.win32-x64-msvc.node",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

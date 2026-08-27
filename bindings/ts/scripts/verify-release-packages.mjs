@@ -15,18 +15,30 @@ import path from "node:path";
 import process from "node:process";
 
 import { namedExports } from "./module-exports.mjs";
+import {
+  assertNodePlatformManifest,
+  nodePlatforms,
+} from "./node-platform-manifest.mjs";
 
-const [expectedVersion, coreTarball, reactNativeTarball, nativeSourceRoot] =
-  process.argv.slice(2);
+const [
+  expectedVersion,
+  coreTarball,
+  reactNativeTarball,
+  nativeSourceRoot,
+  nodeTarball,
+  nodePlatformRoot,
+] = process.argv.slice(2);
 
 if (
   expectedVersion === undefined ||
   coreTarball === undefined ||
   reactNativeTarball === undefined ||
-  nativeSourceRoot === undefined
+  nativeSourceRoot === undefined ||
+  nodeTarball === undefined ||
+  nodePlatformRoot === undefined
 ) {
   throw new Error(
-    "usage: verify-release-packages.mjs <version> <core.tgz> <react-native.tgz> <native-source-root>"
+    "usage: verify-release-packages.mjs <version> <core.tgz> <react-native.tgz> <native-source-root> <node.tgz> <node-platform-root>"
   );
 }
 
@@ -38,15 +50,22 @@ const temporaryRoot = mkdtempSync(
 try {
   const core = extractPackage(coreTarball, "core");
   const reactNative = extractPackage(reactNativeTarball, "react-native");
+  const node = extractPackage(nodeTarball, "node");
 
   verifyManifest(core, "@minip2p/core");
   verifyManifest(reactNative, "@minip2p/react-native");
+  verifyManifest(node, "@minip2p/node");
 
   if (
     reactNative.manifest.dependencies?.["@minip2p/core"] !== expectedVersion
   ) {
     throw new Error(
       `@minip2p/react-native must depend on @minip2p/core ${expectedVersion}, found ${reactNative.manifest.dependencies?.["@minip2p/core"] ?? "no dependency"}`
+    );
+  }
+  if (node.manifest.dependencies?.["@minip2p/core"] !== expectedVersion) {
+    throw new Error(
+      `@minip2p/node must depend on @minip2p/core ${expectedVersion}, found ${node.manifest.dependencies?.["@minip2p/core"] ?? "no dependency"}`
     );
   }
 
@@ -75,9 +94,19 @@ try {
     "lib/typescript/src/index.d.ts",
     "src/index.ts",
   ]);
+  requireFiles(node.root, [
+    "LICENSE",
+    "README.md",
+    "dist/index.d.ts",
+    "dist/index.js",
+    "dist/native.d.ts",
+    "dist/native.js",
+  ]);
 
   rejectPaths(core.root, core.files);
   rejectPaths(reactNative.root, reactNative.files);
+  rejectPaths(node.root, node.files);
+  verifyNodePackages(node, path.resolve(nodePlatformRoot));
   requireNamedExports(reactNative.root, "lib/module/index.js", ["Minip2p"]);
   requireNamedExports(reactNative.root, "lib/typescript/src/index.d.ts", [
     "Minip2p",
@@ -96,7 +125,9 @@ try {
   );
 
   const combinedSize =
-    directorySize(core.root) + directorySize(reactNative.root);
+    directorySize(core.root) +
+    directorySize(reactNative.root) +
+    directorySize(node.root);
   if (combinedSize > maximumUnpackedBytes) {
     throw new Error(
       `release packages unpack to ${combinedSize} bytes, exceeding the ${maximumUnpackedBytes}-byte limit`
@@ -104,7 +135,7 @@ try {
   }
 
   console.log(
-    `verified @minip2p/core and @minip2p/react-native ${expectedVersion} (${combinedSize} unpacked bytes)`
+    `verified @minip2p/core, @minip2p/react-native, and @minip2p/node ${expectedVersion} (${combinedSize} unpacked bytes)`
   );
 } finally {
   rmSync(temporaryRoot, { force: true, recursive: true });
@@ -135,6 +166,45 @@ function verifyManifest(packageInfo, expectedName) {
   }
   if (packageInfo.manifest.private === true) {
     throw new Error(`${expectedName} is marked private`);
+  }
+}
+
+function verifyNodePackages(node, platformRoot) {
+  const optionalDependencies = node.manifest.optionalDependencies ?? {};
+  const packageNames = Object.keys(optionalDependencies).filter((name) =>
+    name.startsWith("@minip2p/node-")
+  );
+  if (packageNames.length !== nodePlatforms.length) {
+    throw new Error(
+      `@minip2p/node must declare seven platform packages, found ${packageNames.length}`
+    );
+  }
+  if (node.files.some((file) => file.endsWith(".node"))) {
+    throw new Error(
+      "@minip2p/node root package must not contain a native binary"
+    );
+  }
+
+  for (const platform of nodePlatforms) {
+    const { target } = platform;
+    const packageName = `@minip2p/node-${target}`;
+    if (optionalDependencies[packageName] !== expectedVersion) {
+      throw new Error(`${packageName} is not locked to ${expectedVersion}`);
+    }
+    const manifest = JSON.parse(
+      readFileSync(path.join(platformRoot, target, "package.json"), "utf-8")
+    );
+    const binary = `minip2p.${target}.node`;
+    if (
+      manifest.name !== packageName ||
+      manifest.version !== expectedVersion ||
+      manifest.main !== binary ||
+      JSON.stringify(manifest.files) !== JSON.stringify([binary])
+    ) {
+      throw new Error(`${packageName} has invalid release metadata`);
+    }
+    assertNodePlatformManifest(manifest, platform);
+    requireFiles(path.join(platformRoot, target), [binary]);
   }
 }
 

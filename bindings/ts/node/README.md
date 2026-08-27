@@ -21,7 +21,7 @@ endpoint.close();
 
 The Node binding accepts the same TCP, QUIC, circuit-relay, signed-discovery, and mDNS configuration as `@minip2p/react-native`.
 
-The package is private until the platform-package publishing work lands. Build the local addon and run its suite with:
+Published installs select a prebuilt binary from an optional platform package. No Rust toolchain or install script is required. Build the local addon and run its suite with:
 
 ```bash
 pnpm native:build
