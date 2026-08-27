@@ -3,6 +3,11 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, test } from "vitest";
 
+import {
+  assertNodePlatformManifest,
+  nodePlatforms,
+} from "../../scripts/node-platform-manifest.mjs";
+
 const nodeManifest = JSON.parse(
   readFileSync(
     fileURLToPath(new URL("../package.json", import.meta.url)),
@@ -49,6 +54,11 @@ describe("@minip2p/node distribution", () => {
       expect(manifest.version).toBe(nodeManifest.version);
       expect(manifest.files).toEqual([`minip2p.${target}.node`]);
       expect(manifest.main).toBe(`minip2p.${target}.node`);
+      const platform = nodePlatforms.find(
+        ({ target: expectedTarget }) => expectedTarget === target
+      );
+      expect(platform).toBeDefined();
+      assertNodePlatformManifest(manifest, platform);
     }
   });
 });

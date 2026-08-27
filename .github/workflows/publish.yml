@@ -234,6 +234,7 @@ jobs:
             "$NAPI_BUILD_IMAGE" \
             bash -lc '
               set -euo pipefail
+              # Build with Cargo because napi CLI needs a compatible Node host inside Alpine.
               apk add --no-cache --upgrade \
                 --repository https://dl-cdn.alpinelinux.org/alpine/v3.23/main \
                 clang20-libclang=20.1.8-r1

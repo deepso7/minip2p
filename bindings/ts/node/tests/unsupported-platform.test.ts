@@ -9,6 +9,7 @@ afterEach(() => {
     value: originalGetReport,
   });
   vi.resetModules();
+  vi.doUnmock("node:module");
 });
 
 describe("@minip2p/node native loader", () => {
@@ -30,6 +31,23 @@ describe("@minip2p/node native loader", () => {
 
     await expect(import("../src/native.js")).resolves.toHaveProperty(
       "nativeBinding"
+    );
+  });
+
+  test("preserves the loader error for a present but broken local addon", async () => {
+    vi.doMock("node:module", () => ({
+      createRequire: () => (specifier: string) => {
+        if (specifier.startsWith("../minip2p.")) {
+          throw Object.assign(new Error("local addon is corrupt"), {
+            code: "ERR_DLOPEN_FAILED",
+          });
+        }
+        throw new Error(`unexpected package fallback: ${specifier}`);
+      },
+    }));
+
+    await expect(import("../src/native.js")).rejects.toThrow(
+      "local addon is corrupt"
     );
   });
 });

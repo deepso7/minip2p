@@ -15,6 +15,10 @@ import path from "node:path";
 import process from "node:process";
 
 import { namedExports } from "./module-exports.mjs";
+import {
+  assertNodePlatformManifest,
+  nodePlatforms,
+} from "./node-platform-manifest.mjs";
 
 const [
   expectedVersion,
@@ -170,7 +174,7 @@ function verifyNodePackages(node, platformRoot) {
   const packageNames = Object.keys(optionalDependencies).filter((name) =>
     name.startsWith("@minip2p/node-")
   );
-  if (packageNames.length !== 7) {
+  if (packageNames.length !== nodePlatforms.length) {
     throw new Error(
       `@minip2p/node must declare seven platform packages, found ${packageNames.length}`
     );
@@ -181,11 +185,12 @@ function verifyNodePackages(node, platformRoot) {
     );
   }
 
-  for (const packageName of packageNames) {
+  for (const platform of nodePlatforms) {
+    const packageName = `@minip2p/node-${platform.target}`;
     if (optionalDependencies[packageName] !== expectedVersion) {
       throw new Error(`${packageName} is not locked to ${expectedVersion}`);
     }
-    const target = packageName.slice("@minip2p/node-".length);
+    const target = platform.target;
     const manifest = JSON.parse(
       readFileSync(path.join(platformRoot, target, "package.json"), "utf-8")
     );
@@ -198,6 +203,7 @@ function verifyNodePackages(node, platformRoot) {
     ) {
       throw new Error(`${packageName} has invalid release metadata`);
     }
+    assertNodePlatformManifest(manifest, platform);
     requireFiles(path.join(platformRoot, target), [binary]);
   }
 }
