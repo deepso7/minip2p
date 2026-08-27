@@ -83,7 +83,9 @@ jobs:
                 --repository https://dl-cdn.alpinelinux.org/alpine/v3.23/main \
                 clang20-libclang=20.1.8-r1 \
                 nodejs npm
-              npm install --global pnpm@11.24.0
+              export PATH=/usr/bin:$PATH
+              npm install --global --prefix /opt/pnpm pnpm@11.24.0
+              export PATH=/opt/pnpm/bin:/usr/bin:$PATH
               rustup toolchain install 1.91 --profile minimal
               rustup default 1.91
               export CC=gcc
