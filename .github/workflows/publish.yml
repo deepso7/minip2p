@@ -400,11 +400,6 @@ jobs:
       - name: Validate Android ELF alignment and allocator hooks
         run: node react-native/scripts/check-android-elf.mjs
       - run: pnpm example prebuild
-      - name: Use Gradle version required by the Android plugin
-        run: |
-          wrapper=react-native/example/android/gradle/wrapper/gradle-wrapper.properties
-          sed -i 's/gradle-9\.3\.1-bin\.zip/gradle-9.4.1-bin.zip/' "$wrapper"
-          grep -Fq 'gradle-9.4.1-bin.zip' "$wrapper"
       - name: Build both Android ABIs
         working-directory: bindings/ts/react-native/example/android
         run: ./gradlew :app:assembleDebug -PreactNativeArchitectures=arm64-v8a,x86_64
