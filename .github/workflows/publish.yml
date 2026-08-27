@@ -225,9 +225,11 @@ jobs:
       - name: Build addon
         env:
           NAPI_BUILD_IMAGE: ghcr.io/napi-rs/napi-rs/nodejs-rust@sha256:caac2d1b9194eada0c69e669e72763869701351d8957ab805cc45a43999d8be2
+          TARGET: ${{ matrix.target }}
         run: |
           docker run --rm \
             --env PNPM_VERSION \
+            --env TARGET \
             --volume "$GITHUB_WORKSPACE:/work" \
             --workdir /work/bindings/ts \
             "$NAPI_BUILD_IMAGE" \
@@ -240,6 +242,7 @@ jobs:
               npm install --global --force "pnpm@$PNPM_VERSION"
               rustup toolchain install 1.91 --profile minimal --target ${{ matrix.target }}
               rustup default 1.91
+              ln -sf /usr/bin/gcc "/usr/local/bin/${TARGET%%-*}-linux-musl-gcc"
               pnpm install --frozen-lockfile --force
               pnpm --filter @minip2p/node native:build:target --target ${{ matrix.target }} -- --locked
             '
