@@ -186,11 +186,11 @@ function verifyNodePackages(node, platformRoot) {
   }
 
   for (const platform of nodePlatforms) {
-    const packageName = `@minip2p/node-${platform.target}`;
+    const { target } = platform;
+    const packageName = `@minip2p/node-${target}`;
     if (optionalDependencies[packageName] !== expectedVersion) {
       throw new Error(`${packageName} is not locked to ${expectedVersion}`);
     }
-    const target = platform.target;
     const manifest = JSON.parse(
       readFileSync(path.join(platformRoot, target, "package.json"), "utf-8")
     );

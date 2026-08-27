@@ -13,7 +13,7 @@ describe("@minip2p/node platform selectors", () => {
 
     expect(() =>
       assertNodePlatformManifest(
-        { os: ["linux"], cpu: ["x64"], libc: ["glibc"] },
+        { cpu: ["x64"], libc: ["glibc"], os: ["linux"] },
         platform
       )
     ).toThrow("invalid libc metadata");
@@ -26,7 +26,7 @@ describe("@minip2p/node platform selectors", () => {
 
     expect(() =>
       assertNodePlatformManifest(
-        { os: ["darwin"], cpu: ["arm64"], libc: ["musl"] },
+        { cpu: ["arm64"], libc: ["musl"], os: ["darwin"] },
         platform
       )
     ).toThrow("invalid libc metadata");

@@ -1,34 +1,34 @@
 export const nodePlatforms = [
-  { target: "darwin-arm64", os: ["darwin"], cpu: ["arm64"] },
-  { target: "darwin-x64", os: ["darwin"], cpu: ["x64"] },
+  { cpu: ["arm64"], os: ["darwin"], target: "darwin-arm64" },
+  { cpu: ["x64"], os: ["darwin"], target: "darwin-x64" },
   {
+    cpu: ["arm64"],
+    libc: ["glibc"],
+    os: ["linux"],
     target: "linux-arm64-gnu",
-    os: ["linux"],
-    cpu: ["arm64"],
-    libc: ["glibc"],
   },
   {
+    cpu: ["arm64"],
+    libc: ["musl"],
+    os: ["linux"],
     target: "linux-arm64-musl",
-    os: ["linux"],
-    cpu: ["arm64"],
-    libc: ["musl"],
   },
   {
-    target: "linux-x64-gnu",
-    os: ["linux"],
     cpu: ["x64"],
     libc: ["glibc"],
+    os: ["linux"],
+    target: "linux-x64-gnu",
   },
   {
-    target: "linux-x64-musl",
-    os: ["linux"],
     cpu: ["x64"],
     libc: ["musl"],
+    os: ["linux"],
+    target: "linux-x64-musl",
   },
-  { target: "win32-x64-msvc", os: ["win32"], cpu: ["x64"] },
+  { cpu: ["x64"], os: ["win32"], target: "win32-x64-msvc" },
 ];
 
-export function assertNodePlatformManifest(manifest, platform) {
+export const assertNodePlatformManifest = (manifest, platform) => {
   for (const field of ["os", "cpu", "libc"]) {
     if (JSON.stringify(manifest[field]) !== JSON.stringify(platform[field])) {
       throw new Error(
@@ -36,4 +36,4 @@ export function assertNodePlatformManifest(manifest, platform) {
       );
     }
   }
-}
+};
