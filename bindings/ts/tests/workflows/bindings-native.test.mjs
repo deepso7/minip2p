@@ -67,3 +67,15 @@ test("weekly workflow executes the suite on native runners and musl containers",
   );
   assert.match(muslBuild, /pnpm --filter @minip2p\/node exec vitest run/u);
 });
+
+test("weekly Node jobs pin actions to immutable commits", () => {
+  for (const jobName of ["node-native", "node-musl"]) {
+    const actions = workflow.jobs[jobName].steps
+      .map(({ uses }) => uses)
+      .filter((uses) => uses !== undefined);
+
+    for (const action of actions) {
+      assert.match(action, /@[0-9a-f]{40}$/u, `${jobName}: ${action}`);
+    }
+  }
+});
