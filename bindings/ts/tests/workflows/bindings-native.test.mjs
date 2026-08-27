@@ -52,12 +52,11 @@ test("weekly workflow executes the suite on native runners and musl containers",
   const muslBuild = workflow.jobs["node-musl"].steps.find(
     ({ name }) => name === "Build addon"
   ).run;
-  assert.ok(
-    workflow.jobs["node-musl"].steps.some(
-      ({ name }) => name === "Build musl relay fixture"
-    )
-  );
   assert.match(muslBuild, /PATH=\/opt\/pnpm\/bin:\/usr\/bin:/u);
   assert.match(muslBuild, /--prefix \/opt\/pnpm pnpm@11\.24\.0/u);
+  assert.match(
+    muslBuild,
+    /cargo build --release --locked -p minip2p-relay-server-example/u
+  );
   assert.match(muslBuild, /pnpm --filter @minip2p\/node exec vitest run/u);
 });
