@@ -126,21 +126,21 @@ function loadNativeBinding(target: string): NativeBinding {
     throw unsupportedTarget(target);
   }
 
+  let binding: unknown;
   try {
-    let binding: unknown;
-    try {
-      binding = require(`../minip2p.${target}.node`);
-    } catch (error) {
-      if (!isModuleNotFound(error)) {
-        throw error;
-      }
-      binding = require(`@minip2p/node-${target}`);
-    }
-    assertNativeBinding(binding);
-    return binding;
+    binding = require(`../minip2p.${target}.node`);
   } catch (error) {
-    throw unsupportedTarget(target, error);
+    if (!isModuleNotFound(error)) {
+      throw error;
+    }
+    try {
+      binding = require(`@minip2p/node-${target}`);
+    } catch (packageError) {
+      throw unsupportedTarget(target, packageError);
+    }
   }
+  assertNativeBinding(binding);
+  return binding;
 }
 
 function isModuleNotFound(error: unknown): boolean {
