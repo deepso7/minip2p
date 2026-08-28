@@ -13,6 +13,13 @@ description: A minimal, caller-driven libp2p stack with QUIC, TCP, and no_std.
     ```
 
   </Tab>
+  <Tab title="Node.js">
+
+    ```bash
+    npm install @minip2p/node
+    ```
+
+  </Tab>
   <Tab title="React Native">
 
     ```bash
@@ -22,11 +29,12 @@ description: A minimal, caller-driven libp2p stack with QUIC, TCP, and no_std.
   </Tab>
 </Tabs>
 
-minip2p opens authenticated QUIC and TCP connections from Rust and React
-Native. On `no_std + alloc`, TCP runs through a pluggable provider and
+minip2p opens authenticated QUIC and TCP connections from Rust, Node.js, and
+React Native. On `no_std + alloc`, TCP runs through a pluggable provider and
 `Endpoint::portable`. The Rust `Endpoint` is synchronous and caller-driven,
-with no async runtime. The React Native SDK owns the native driver and presents
-typed events, cancellable Promises, and `Stream` handles to JavaScript.
+with no async runtime. The Node.js and React Native SDKs own their native
+drivers and present typed events, cancellable Promises, and `Stream` handles
+to JavaScript.
 
 <Tabs>
   <Tab title="Rust">
@@ -47,6 +55,23 @@ typed events, cancellable Promises, and `Stream` handles to JavaScript.
 
         Ok(())
     }
+    ```
+
+  </Tab>
+  <Tab title="Node.js">
+
+    ```ts
+    import {
+      Minip2p,
+      generateSecretKey,
+    } from "@minip2p/node";
+
+    const endpoint = Minip2p.create({
+      secretKey: generateSecretKey(),
+    });
+
+    console.log(endpoint.peerId(), endpoint.listenAddrs());
+    endpoint.close();
     ```
 
   </Tab>
@@ -83,6 +108,9 @@ discovery, and local-link mDNS.
   </Card>
   <Card title="Start with React Native" href="/react-native/start" icon="waypoints">
     Own an endpoint with a hook, connect, and Ping from a native app.
+  </Card>
+  <Card title="Start with Node.js" href="/node/start" icon="hexagon">
+    Create an endpoint in a script, connect, and Ping from Node.js.
   </Card>
 </CardGroup>
 
@@ -152,5 +180,5 @@ discovery, and local-link mDNS.
 | <Badge>no_std + alloc</Badge> | Protocols, orchestration, and TCP work without an OS; you supply I/O, time, and entropy. |
 | <Badge>QUIC-only punching</Badge> | DCUtR hole punching needs QUIC; a TCP-only peer reaches NATed peers through a relay. |
 | <Badge>Rust 1.91+</Badge> | Workspace MSRV. |
-| <Badge>Caller-driven Rust</Badge> | Rust applications drive progress; the React Native adapter owns its native driver. |
+| <Badge>Caller-driven Rust</Badge> | Rust applications drive progress; the Node.js and React Native adapters own their native drivers. |
 | <Badge>Relay client</Badge> | Bring a Circuit Relay v2 server when a relayed path is required. |

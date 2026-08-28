@@ -1,6 +1,6 @@
 ---
 title: Feature matrix
-description: Compare Rust feature activation and React Native configuration with the network infrastructure each capability needs.
+description: Compare Rust feature activation and TypeScript SDK configuration with the network infrastructure each capability needs.
 ---
 
 ## Rust
@@ -107,10 +107,11 @@ configured relay or HOP CONNECT.
 and TCP keep working. With both `discovery` and `mdns` enabled, both sources
 use one bounded peer book and one automatic-dial state.
 
-## React Native
+## React Native and Node.js
 
-The React Native native library includes these capabilities. `Minip2pConfig`
-selects the agents and infrastructure used by an endpoint.
+The React Native and Node.js native libraries include these capabilities, and
+both accept the same `Minip2pConfig`. It selects the agents and infrastructure
+used by an endpoint.
 
 | Capability | Configuration | Active behavior | Infrastructure |
 | --- | --- | --- | --- |
@@ -118,13 +119,16 @@ selects the agents and infrastructure used by an endpoint.
 | Gossipsub | Default, or `pubsubRouter: PubsubRouter.Gossipsub` | Signed outbound pubsub and strict inbound validation | At least one compatible mesh peer |
 | Floodsub | `pubsubRouter: PubsubRouter.Floodsub` | Floodsub routing | At least one floodsub peer |
 | Signed discovery | `discovery: { topic, ... }` | Signed beacons, shared peer book, optional auto-dial | A connected discovery peer |
-| Local-link discovery | `mdns: true` or options | mDNS, shared peer book, optional auto-dial | Host permissions and a multicast-capable local network |
+| Local-link discovery | `mdns: true` or options | mDNS, shared peer book, optional auto-dial | A multicast-capable local network; mobile hosts also need local-network permissions |
 | Reachability probing | `autonatServers: [...]` | AutoNAT probes | Reachable AutoNAT server |
 | Relayed paths and DCUtR | `relays: [...]` | Reservations, relay race, fallback, hole punching | Reachable Circuit Relay v2 server |
 
 An AutoNAT server still does not provide a relay path. Discovery and mDNS can
 dial advertised direct addresses without a relay. See [Networking and
-events](/react-native/networking-and-events) for configuration examples.
+events](/react-native/networking-and-events) for configuration examples, and
+the [Node API](/reference/node-api) or
+[React Native API](/reference/react-native-api) reference for the full
+configuration map.
 
 ## Exhaustive API docs
 

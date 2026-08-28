@@ -1,0 +1,94 @@
+---
+title: Endpoint lifecycle
+description: Persist an identity, own the process lifetime, and shut a Node.js endpoint down cleanly.
+---
+
+A Node.js `Minip2p` object owns one native endpoint. Its identity, driver,
+events, pending Promises, and streams all share that lifetime.
+
+## Identity first
+
+The secret key is the node's identity. Generate it once, store the raw 32 bytes
+somewhere protected, and supply the same bytes on later launches when the
+service needs a stable peer ID.
+
+```ts
+import { generateSecretKey, peerIdFromSecretKey } from "@minip2p/node";
+
+const secretKey = generateSecretKey();
+const peerId = peerIdFromSecretKey(secretKey);
+```
+
+`peerIdFromSecretKey` derives the public peer identity without starting an
+endpoint. Treat `secretKey` as credentials: keep it in a file with restrictive
+permissions or a secret manager, and do not log it or bake it into an image.
+
+## Own the process lifetime
+
+A started endpoint holds a strong event-loop reference. The process will not
+exit until `close()` is called, so a long-running service should wire shutdown
+to its termination signals:
+
+```ts
+import { Minip2p } from "@minip2p/node";
+
+const endpoint = Minip2p.create({ secretKey });
+
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, () => {
+    endpoint.close();
+  });
+}
+```
+
+`close()` returns quickly rather than blocking on network teardown, and it
+releases the event-loop reference, so the process can exit once nothing else
+keeps it alive.
+
+`Minip2p` also implements `Symbol.dispose`. In a scoped tool or test, a `using`
+declaration closes the endpoint at scope exit:
+
+```ts
+using endpoint = Minip2p.create({ secretKey });
+```
+
+## Active and idle
+
+An endpoint starts in active polling. `setActive(false)` switches the native
+driver to its idle cadence, which trades latency for fewer wakeups;
+`setActive(true)` restores active polling on the same endpoint. Servers
+normally stay active. The idle mode exists for hosts that are sometimes
+backgrounded, such as a desktop app embedding the SDK.
+
+## Close is terminal
+
+`endpoint.close()` is idempotent. It:
+
+1. rejects pending Promise operations;
+2. closes owned `Stream` handles;
+3. stops and destroys the native endpoint;
+4. invokes each `onClose` observer once.
+
+```ts
+const removeClose = endpoint.onClose((reason) => {
+  if (reason.reason === "driverFailed") {
+    console.error(reason.error.kind, reason.error.message);
+  }
+});
+
+endpoint.close();
+removeClose();
+```
+
+## Public SDK boundary
+
+Application code should import from `@minip2p/node`. That package re-exports
+the platform-neutral high-level types and errors from `@minip2p/core`.
+
+The adapter contract at `@minip2p/core/backend` is a low-level integration API
+for platform adapter authors. It exposes raw tagged unions and native ownership
+rules; ordinary applications should not use it.
+
+Next: the shared [Connections and streams](/react-native/connections-and-streams)
+and [Networking and events](/react-native/networking-and-events) guides, or the
+[Node API reference](/reference/node-api).

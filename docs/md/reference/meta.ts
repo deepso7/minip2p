@@ -2,6 +2,12 @@ import { defineMeta } from "blume";
 
 export default defineMeta({
   icon: "library",
-  order: 4,
-  pages: ["feature-matrix", "glossary", "react-native-api", "troubleshooting"],
+  order: 5,
+  pages: [
+    "feature-matrix",
+    "glossary",
+    "node-api",
+    "react-native-api",
+    "troubleshooting",
+  ],
 });
