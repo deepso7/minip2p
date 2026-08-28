@@ -5,5 +5,5 @@ export default defineMeta({
   icon: "cog",
   order: 1,
   display: "group",
-  pages: ["quickstart", "guides"],
+  pages: ["install", "connect-peers", "guides"],
 });
