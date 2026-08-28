@@ -17,3 +17,11 @@ test("release verification accepts workspace-linked Node platform packages", () 
 
   assert.match(verifyStep.run, /select\(\.value != "workspace:\*"\)/u);
 });
+
+test("generated-file validation ignores downloaded Node artifacts", () => {
+  const generatedStep = workflow.jobs["package-typescript"].steps.find(
+    ({ name }) => name === "Generated files are current"
+  );
+
+  assert.match(generatedStep.run, /git status --porcelain -- react-native/u);
+});

@@ -517,7 +517,7 @@ jobs:
       - run: pnpm --filter @minip2p/react-native test:built
       - run: pnpm rn:generate
       - name: Generated files are current
-        run: test -z "$(git status --porcelain)"
+        run: test -z "$(git status --porcelain -- react-native)"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: minip2p-android-native
