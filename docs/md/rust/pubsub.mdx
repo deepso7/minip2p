@@ -5,7 +5,7 @@ description: Enable gossipsub, subscribe and publish signed messages, consume pu
 
 The `pubsub` feature exposes one API for gossipsub and floodsub.
 `EndpointBuilder::pubsub()` selects gossipsub by default. You need a second
-peer on the same topic to observe delivery. See [Drive events](/rust/guides/drive-events)
+peer on the same topic to observe delivery. See [Drive events](/rust/drive-events)
 for the caller-driven event model.
 
 ## Enable gossipsub
@@ -130,4 +130,4 @@ The selected engine controls advertised protocol IDs. Gossipsub advertises
 stream with each other.
 
 For automatic peer address exchange on a signed pubsub topic, continue to
-[Discover peers](/rust/guides/discover-peers).
+[Discover peers](/rust/discover-peers).

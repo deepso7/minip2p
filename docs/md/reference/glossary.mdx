@@ -7,12 +7,12 @@ Definitions only. For recipes, follow the linked guides.
 
 | Term | Meaning |
 | --- | --- |
-| **Endpoint** | App-facing entrypoint that owns identity, transports, and the swarm driver. Std form uses sockets; portable form is caller-driven. See [Concepts](/rust/guides/concepts#endpoint). |
+| **Endpoint** | App-facing entrypoint that owns identity, transports, and the swarm driver. Std form uses sockets; portable form is caller-driven. See [Concepts](/rust/concepts#endpoint). |
 | **PeerId** | Authenticated public-key identity of a peer. |
 | **Multiaddr** | Transport address without a peer identity (for example `/ip4/…/udp/…/quic-v1` or `/ip4/…/tcp/…`). |
 | **PeerAddr** | A `Multiaddr` plus a terminal `/p2p/<peer-id>`. Required for dialing a specific peer. |
 | **PeerReady** | Event after the first Identify exchange; safer milestone than `ConnectionEstablished` before opening app streams. |
-| **Path** | NAT result: `DirectDialed`, `DirectPunched`, or `Relayed`. See [Traverse NAT](/rust/guides/traverse-nat). |
+| **Path** | NAT result: `DirectDialed`, `DirectPunched`, or `Relayed`. See [Traverse NAT](/rust/traverse-nat). |
 | **Sans-I/O** | Deterministic protocol/orchestration state machines; sockets and clocks live in adapters. |
 | **`poll`** | One non-blocking drive step; returns currently available application events. |
 | **`next_event`** | Drives until one ordinary application event or a deadline. |
