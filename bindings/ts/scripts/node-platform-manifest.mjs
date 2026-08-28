@@ -36,4 +36,12 @@ export const assertNodePlatformManifest = (manifest, platform) => {
       );
     }
   }
+
+  if (
+    manifest.repository?.url !== "git+https://github.com/deepso7/minip2p.git"
+  ) {
+    throw new Error(
+      `@minip2p/node-${platform.target} has invalid repository metadata`
+    );
+  }
 };

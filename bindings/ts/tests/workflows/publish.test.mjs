@@ -4,6 +4,11 @@ import test from "node:test";
 
 import { parse } from "yaml";
 
+import {
+  assertNodePlatformManifest,
+  nodePlatforms,
+} from "../../scripts/node-platform-manifest.mjs";
+
 const workflowPath = new URL(
   "../../../../.github/workflows/publish.yml",
   import.meta.url
@@ -24,4 +29,18 @@ test("generated-file validation ignores downloaded Node artifacts", () => {
   );
 
   assert.match(generatedStep.run, /git status --porcelain -- react-native/u);
+});
+
+test("Node platform packages carry npm provenance repository metadata", async () => {
+  await Promise.all(
+    nodePlatforms.map(async (platform) => {
+      const manifestUrl = new URL(
+        `../../node/npm/${platform.target}/package.json`,
+        import.meta.url
+      );
+      const manifest = JSON.parse(await readFile(manifestUrl, "utf-8"));
+
+      assert.doesNotThrow(() => assertNodePlatformManifest(manifest, platform));
+    })
+  );
 });

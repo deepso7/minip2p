@@ -12,6 +12,11 @@
     "rust"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deepso7/minip2p.git",
+    "directory": "bindings/ts/node"
+  },
   "files": [
     "minip2p.darwin-arm64.node"
   ],
