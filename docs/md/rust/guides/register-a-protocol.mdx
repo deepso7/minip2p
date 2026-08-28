@@ -6,7 +6,7 @@ description: Register an application protocol, negotiate streams, exchange bytes
 Application protocols use libp2p multistream-select negotiation over an
 authenticated connection. Both peers must register the same versioned
 protocol ID. Before opening a stream, connect the peers and wait for
-[`PeerReady`](/guides/concepts#connection-readiness).
+[`PeerReady`](/rust/guides/concepts#connection-readiness).
 
 ```rust
 const ECHO_PROTOCOL: &str = "/my-app/echo/1.0.0";
@@ -120,7 +120,7 @@ fully forgotten, a later call returns an error.
 The complete two-peer echo used in CI lives in
 [`docs/snippets/custom-stream`](https://github.com/deepso7/minip2p/tree/main/docs/snippets/custom-stream).
 That fixture rewrites wildcard listen addresses to loopback before printing
-them, the same way [Connect two peers](/quickstart/connect-peers) does.
+them, the same way [Connect two peers](/rust/quickstart/connect-peers) does.
 
 ## Driver-owned streams
 
@@ -128,4 +128,4 @@ When NAT, pubsub, or discovery drivers are active, they register and consume
 their own control-plane streams. Those events do not surface as application
 `StreamData`; use the matching NAT, pubsub, or discovery event APIs instead.
 
-Next: [Drive events](/guides/drive-events).
+Next: [Drive events](/rust/guides/drive-events).

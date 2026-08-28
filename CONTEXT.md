@@ -27,3 +27,12 @@ The coalesced, edge-triggered ready signal a binding registers with the FFI core
 
 **Drain**:
 A binding's synchronous `drain_events(limit)` command pulling a batch from the carry buffer in order. A binding that hears the doorbell must drain until empty.
+
+### SDKs
+
+**TypeScript SDK**:
+The one TypeScript API minip2p presents on every JS runtime: the `@minip2p/core` API plus a runtime's binding package. Documented as a single "TypeScript" docs section.
+_Avoid_: Node SDK, React Native SDK (they are the same SDK on different runtimes)
+
+**Runtime**:
+The host a TypeScript SDK app runs on — Node.js or React Native. Runtimes differ in setup and a short list of one-sided extras; the API is otherwise shared. Distinct from the binding shell that serves it.

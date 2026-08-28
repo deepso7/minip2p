@@ -54,7 +54,7 @@ A `PeerAddr` pairs that transport with a terminal peer identity:
 ```
 
 Use `Multiaddr` when choosing where to bind. Use `PeerAddr` when dialing a
-specific authenticated peer. See [Identity](/guides/identity) for circuit
+specific authenticated peer. See [Identity](/rust/guides/identity) for circuit
 addresses and wildcards.
 
 ## Connection readiness
@@ -90,7 +90,7 @@ lands.
 
 :::warning
 Compiling a Cargo feature only exposes its API. Activate the corresponding
-driver on `EndpointBuilder`; see [Install](/quickstart/install#compiled-is-not-enabled).
+driver on `EndpointBuilder`; see [Install](/rust/quickstart/install#compiled-is-not-enabled).
 :::
 
 ## Where events go
@@ -103,5 +103,5 @@ streams and expose focused queues:
 - `take_pubsub_events` / `next_pubsub_event`;
 - `take_discovery_events` / `next_discovery_event`.
 
-Continue with [Listen and dial](/guides/listen-and-dial) or the
+Continue with [Listen and dial](/rust/guides/listen-and-dial) or the
 [glossary](/reference/glossary).

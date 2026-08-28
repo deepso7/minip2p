@@ -3,7 +3,7 @@ title: Connections and streams
 description: Connect with cancellable Promises, inspect direct or relayed paths, and exchange bytes over custom protocol streams.
 ---
 
-The React Native SDK separates *finding a usable network path* from *opening an
+The TypeScript SDK separates *finding a usable network path* from *opening an
 application protocol*. Connect first, wait for Identify readiness, then open a
 negotiated stream.
 
@@ -60,7 +60,7 @@ const connectPromise = endpoint.connectAddr(remoteAddress, {
   timeoutMs: 20_000,
 });
 
-// A screen transition or user action can stop this attempt.
+// A user action or a shutdown path can stop this attempt.
 controller.abort();
 await connectPromise; // rejects with AbortError
 ```
@@ -69,7 +69,7 @@ For a `connect*` Promise, an abort or timeout cancels the underlying connection
 attempt. Concurrent `ping` calls to the same peer share one native Ping while
 each caller keeps its own timeout and abort signal.
 
-Use the split-phase API when the UI must retain the connection-attempt ID:
+Use the split-phase API when the caller must retain the connection-attempt ID:
 
 ```ts
 const connectId = endpoint.startConnectAddr(remoteAddress);
@@ -77,8 +77,8 @@ const resultPromise = endpoint.waitConnectResult(connectId, {
   timeoutMs: 20_000,
 });
 
-// A separate UI action can cancel by ID.
-cancelButton.onclick = () => endpoint.cancelConnect(connectId);
+// A separate action can cancel by ID.
+const cancel = () => endpoint.cancelConnect(connectId);
 
 const result = await resultPromise;
 console.log(result.path);
@@ -142,11 +142,27 @@ only `inboundStream` metadata and cannot claim the live handle.
 
 ## Choose one read mode
 
-Pull mode is natural for framed or sequential decoders:
+Pull mode is natural for framed or sequential decoders. The `Stream` type comes
+from the binding package for your runtime:
+
+<Tabs>
+  <Tab title="Node.js">
+
+    ```ts
+    import type { Stream } from "@minip2p/node";
+    ```
+
+  </Tab>
+  <Tab title="React Native">
+
+    ```ts
+    import type { Stream } from "@minip2p/react-native";
+    ```
+
+  </Tab>
+</Tabs>
 
 ```ts
-import type { Stream } from "@minip2p/react-native";
-
 async function receiveFile(stream: Stream) {
   try {
     for (;;) {
@@ -171,7 +187,7 @@ const removeRemoteClose = stream.on("remoteWriteClosed", () => {
   finishIncomingMessage();
 });
 
-// Call this if the owner unmounts first; both callbacks are idempotent.
+// Call this if the owner goes away first; both callbacks are idempotent.
 const stopFlowing = () => {
   removeData();
   removeRemoteClose();
@@ -197,4 +213,4 @@ does not keep up, `dataOverflow` reports dropped chunks and bytes. Treat that as
 a protocol-level recovery condition rather than silently continuing a framed
 transfer.
 
-Next: [Networking and events](/react-native/networking-and-events).
+Next: [Networking and events](/typescript/networking-and-events).

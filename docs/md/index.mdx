@@ -32,9 +32,9 @@ description: A minimal, caller-driven libp2p stack with QUIC, TCP, and no_std.
 minip2p opens authenticated QUIC and TCP connections from Rust, Node.js, and
 React Native. On `no_std + alloc`, TCP runs through a pluggable provider and
 `Endpoint::portable`. The Rust `Endpoint` is synchronous and caller-driven,
-with no async runtime. The Node.js and React Native SDKs own their native
-drivers and present typed events, cancellable Promises, and `Stream` handles
-to JavaScript.
+with no async runtime. The TypeScript SDK owns its native driver and presents
+typed events, cancellable Promises, and `Stream` handles on Node.js and React
+Native.
 
 <Tabs>
   <Tab title="Rust">
@@ -100,17 +100,17 @@ discovery, and local-link mDNS.
 ## Get started
 
 <CardGroup cols={2}>
-  <Card title="Install for Rust" href="/quickstart/install#rust" icon="package-plus">
+  <Card title="Install for Rust" href="/rust/quickstart/install" icon="package-plus">
     Add `minip2p-rs` and choose the network features your endpoint needs.
   </Card>
-  <Card title="Connect two peers" href="/quickstart/connect-peers" icon="unplug">
+  <Card title="Connect two peers" href="/rust/quickstart/connect-peers" icon="unplug">
     Connect two Rust processes and measure a Ping RTT.
   </Card>
-  <Card title="Start with React Native" href="/react-native/start" icon="waypoints">
-    Own an endpoint with a hook, connect, and Ping from a native app.
+  <Card title="Start with TypeScript" href="/typescript/start" icon="braces">
+    Create an endpoint, connect, and Ping from Node.js or React Native.
   </Card>
-  <Card title="Start with Node.js" href="/node/start" icon="hexagon">
-    Create an endpoint in a script, connect, and Ping from Node.js.
+  <Card title="TypeScript API" href="/reference/typescript-api" icon="library">
+    Configuration, lifecycle, operations, events, and errors for both runtimes.
   </Card>
 </CardGroup>
 

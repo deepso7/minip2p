@@ -1,0 +1,42 @@
+---
+title: Node.js setup
+description: Module format, the Node.js version requirement, and the prebuilt native addons behind @minip2p/node.
+---
+
+`@minip2p/node` is the Node.js binding for the TypeScript SDK. It loads the
+prebuilt native driver and re-exports the platform-neutral API from
+`@minip2p/core`, so application code imports only `@minip2p/node`. Install it from
+[Start](/typescript/start).
+
+## Runtime requirements
+
+The package is ESM-only and requires **Node.js 24 or newer**. Load it with
+`import`; there is no CommonJS entry point.
+
+## Prebuilt native addons
+
+Installation selects a prebuilt native addon from an optional platform package,
+so no Rust toolchain or install script runs on the target machine. Each target
+ships as `@minip2p/node-<target>`, listed in the `optionalDependencies` of
+`@minip2p/node`; the package manager installs the one that matches the host and
+skips the rest.
+
+| Platform | Prebuilt targets | Packages |
+| --- | --- | --- |
+| Linux | x64 and arm64, glibc and musl | `@minip2p/node-linux-x64-gnu`, `-linux-x64-musl`, `-linux-arm64-gnu`, `-linux-arm64-musl` |
+| macOS | Apple silicon and Intel | `@minip2p/node-darwin-arm64`, `-darwin-x64` |
+| Windows | x64 (MSVC) | `@minip2p/node-win32-x64-msvc` |
+
+There is no build-from-source fallback. A host outside this matrix has no addon
+to load, and a package manager configured to skip optional dependencies leaves
+the addon missing.
+
+## Process lifetime
+
+A started endpoint holds a strong event-loop reference, so the process stays
+alive until `endpoint.close()` is called. Wire that call to your termination
+signals: see [Endpoint lifecycle](/typescript/lifecycle) for signal handling,
+identity persistence, and shutdown.
+
+Next: [Endpoint lifecycle](/typescript/lifecycle) or the
+[TypeScript API reference](/reference/typescript-api).

@@ -1,13 +1,12 @@
 ---
-title: Install for Rust
+title: Install
 description: Install minip2p for Rust and choose the network features your endpoint needs.
 ---
 
 :::note
-Building a React Native app? Go to
-[Start with React Native](/react-native/start) for package installation,
-native configuration, development builds, and local-network permissions.
-Writing a Node.js service or CLI? Go to [Start with Node.js](/node/start).
+Building on Node.js or React Native? Go to
+[Start with TypeScript](/typescript/start) for package installation, the
+first connection, and the per-runtime setup pages.
 :::
 
 minip2p requires **Rust 1.91 or newer**. The application-facing crate is
@@ -71,7 +70,7 @@ inside a particular endpoint.
     Noise XX, Yamux, Identify, Ping, and any protocols you register. It needs
     no OS or async runtime. Add `pubsub`, `portable-autonat`, or `portable-relay`
     if you need them. Continue with
-    [Embedded devices](/guides/embedded-devices) for stack setup,
+    [Embedded devices](/rust/guides/embedded-devices) for stack setup,
     driving, and memory budgeting.
 
   </Tab>
@@ -174,4 +173,4 @@ cargo run
 ```
 
 The endpoint generates an ephemeral Ed25519 identity when no identity is
-provided. Continue to [Connect two peers](/quickstart/connect-peers).
+provided. Continue to [Connect two peers](/rust/quickstart/connect-peers).

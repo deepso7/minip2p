@@ -1,28 +1,55 @@
 ---
-title: React Native API
-description: Concise reference for the high-level React Native configuration, endpoint methods, streams, events, and public errors.
+title: TypeScript API
+description: Concise reference for the high-level TypeScript configuration, endpoint methods, streams, events, and public errors on Node.js and React Native.
 ---
 
-Import application APIs from the platform package:
+The TypeScript SDK is one API on two runtimes. Install `@minip2p/node` or
+`@minip2p/react-native`; both re-export the platform-neutral public types and
+errors from `@minip2p/core`.
 
-```ts
-import {
-  Minip2p,
-  PubsubRouter,
-  bindAppState,
-  circuitAddress,
-  generateSecretKey,
-  peerIdFromSecretKey,
-  useMinip2p,
-} from "@minip2p/react-native";
-```
+Import application APIs from the runtime package:
 
-The platform package re-exports public types and errors from
-`@minip2p/core`.
+<Tabs>
+  <Tab title="Node.js">
+
+    ```ts
+    import {
+      Minip2p,
+      PubsubRouter,
+      circuitAddress,
+      generateSecretKey,
+      peerIdFromSecretKey,
+    } from "@minip2p/node";
+    ```
+
+    `@minip2p/node` is ESM-only and requires Node.js 24 or newer.
+
+  </Tab>
+  <Tab title="React Native">
+
+    ```ts
+    import {
+      Minip2p,
+      PubsubRouter,
+      bindAppState,
+      circuitAddress,
+      generateSecretKey,
+      peerIdFromSecretKey,
+      useMinip2p,
+    } from "@minip2p/react-native";
+    ```
+
+    `useMinip2p` and `bindAppState` exist only here.
+
+  </Tab>
+</Tabs>
+
+Setup per runtime: [Node.js](/typescript/setup-node),
+[React Native](/typescript/setup-react-native).
 
 ## Configuration
 
-`Minip2p.create(config)` constructs and starts an endpoint.
+`Minip2p.create(config)` constructs and starts an endpoint synchronously.
 
 | `Minip2pConfig` field | Type | Purpose |
 | --- | --- | --- |
@@ -74,12 +101,17 @@ transports: {
 | `generateSecretKey()` | New `Uint8Array` containing a 32-byte Ed25519 secret. |
 | `peerIdFromSecretKey(secretKey)` | Base58 peer ID without starting an endpoint. |
 | `Minip2p.create(config)` | Started `Minip2p` endpoint. |
-| `useMinip2p(createConfig)` | Hook state plus an idempotent `close` callback. |
-| `bindAppState(endpoint)` | Idempotent unsubscribe for manual lifecycle ownership. |
+| `useMinip2p(createConfig)` | <Badge>React Native</Badge> Hook state plus an idempotent `close` callback. |
+| `bindAppState(endpoint)` | <Badge>React Native</Badge> Idempotent unsubscribe for manual lifecycle ownership. |
 | `endpoint.close()` | Terminal, idempotent shutdown. |
+| `endpoint[Symbol.dispose]()` | Equivalent to `close()`; supports `using` where the toolchain does. |
 | `endpoint.onClose(handler)` | One-shot close observer unsubscribe. |
 | `endpoint.isRunning()` | Whether the native driver still accepts work. |
-| `endpoint.setActive(active)` | Select foreground or idle driver behavior. |
+| `endpoint.setActive(active)` | Select active or idle driver polling. |
+
+<Badge>Node.js</Badge> A started endpoint keeps the Node.js process alive until
+`close()`. See [Endpoint lifecycle](/typescript/lifecycle) for signal handling
+and shutdown order.
 
 ## State queries
 
@@ -181,13 +213,13 @@ Use `instanceof` for control flow and the typed `kind` fields for telemetry.
 
 ## High-level versus backend APIs
 
-Application code should stay on `@minip2p/react-native`. The following exports
-exist for adapter and host integration work:
+Application code should stay on `@minip2p/node` or `@minip2p/react-native`. The
+following exports exist for adapter and host integration work:
 
 | Import | Audience |
 | --- | --- |
 | `@minip2p/core/backend` | Platform adapter authors implementing `Minip2pBackend`. |
-| `@minip2p/react-native/native` | Generated UniFFI/TurboModule integration and native stopped barriers. |
+| `@minip2p/react-native/native` | <Badge>React Native</Badge> Generated UniFFI/TurboModule integration and native stopped barriers. |
 
 These low-level modules use raw `{ tag, inner }` unions and native ownership
 rules. They are not an alternative application API.

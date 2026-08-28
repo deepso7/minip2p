@@ -1,11 +1,11 @@
 ---
 title: Networking and events
-description: Use typed events, pubsub, signed discovery, mDNS, and relay-assisted NAT traversal from React Native.
+description: Use typed events, pubsub, signed discovery, mDNS, and relay-assisted NAT traversal from TypeScript.
 ---
 
-The React Native package starts its native driver inside `Minip2p.create`.
+The TypeScript SDK starts its native driver inside `Minip2p.create`.
 Configuration selects the network agents that driver coordinates; JavaScript
-receives normalized, high-level events rather than raw UniFFI unions.
+receives normalized, high-level events rather than raw native unions.
 
 ## Prefer named events
 
@@ -72,7 +72,7 @@ const removeMessages = endpoint.on("message", (message) => {
   }
 });
 
-endpoint.publish(topic, "hello from React Native");
+endpoint.publish(topic, "hello from minip2p");
 
 // Later:
 removeMessages();
@@ -85,14 +85,32 @@ synchronously; later forwarding failures arrive as `pubsubOutboundFailure`.
 
 Select floodsub only for interoperability:
 
-```ts
-import { PubsubRouter } from "@minip2p/react-native";
+<Tabs>
+  <Tab title="Node.js">
 
-const endpoint = Minip2p.create({
-  secretKey,
-  pubsubRouter: PubsubRouter.Floodsub,
-});
-```
+    ```ts
+    import { PubsubRouter } from "@minip2p/node";
+
+    const endpoint = Minip2p.create({
+      secretKey,
+      pubsubRouter: PubsubRouter.Floodsub,
+    });
+    ```
+
+  </Tab>
+  <Tab title="React Native">
+
+    ```ts
+    import { PubsubRouter } from "@minip2p/react-native";
+
+    const endpoint = Minip2p.create({
+      secretKey,
+      pubsubRouter: PubsubRouter.Floodsub,
+    });
+    ```
+
+  </Tab>
+</Tabs>
 
 `allowUnsigned: true` accepts unsigned inbound application messages. When
 `message.signed` is `false`, both the bytes and `fromPeerId` are
@@ -137,9 +155,10 @@ const endpoint = Minip2p.create({
 `knownPeers()` book as signed discovery. The event `source` distinguishes
 `DiscoverySource.Mdns` from `DiscoverySource.SignedBeacon`.
 
-Host apps must include the [iOS local-network and Android multicast
-permissions](/react-native/start#local-network-permissions). Discovery stays
-local to the link and depends on the network allowing multicast.
+Discovery stays local to the link and depends on the network allowing
+multicast. React Native apps must also declare the [iOS local-network and
+Android multicast
+permissions](/typescript/setup-react-native#local-network-permissions).
 
 ## Relay and NAT traversal
 
@@ -189,5 +208,5 @@ relay. A relay is still required for relayed connectivity and relay-assisted
 hole punching.
 :::
 
-See the [React Native API reference](/reference/react-native-api) for the full
+See the [TypeScript API reference](/reference/typescript-api) for the full
 configuration and event-family map.

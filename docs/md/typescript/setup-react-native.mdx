@@ -1,0 +1,95 @@
+---
+title: React Native setup
+description: Toolchain versions, the development build, and local-network permissions for @minip2p/react-native.
+---
+
+`@minip2p/react-native` is the React Native binding for the TypeScript SDK. It
+is a native package: a TurboModule plus bundled Rust libraries. It re-exports
+the platform-neutral API from `@minip2p/core`, so application code imports only
+`@minip2p/react-native`. Install it from
+[Start](/typescript/start).
+
+## Toolchain versions
+
+The adapter requires React Native's New Architecture and Hermes.
+
+| Toolchain | Current requirement |
+| --- | --- |
+| React Native | 0.87, New Architecture, Hermes |
+| Node.js | 22 or newer (build toolchain) |
+| Android | SDK 36 and NDK 28.2.13676358 |
+| iOS | Xcode 26 and deployment target 15.1 or newer |
+
+## Create a development build
+
+After adding the package, rebuild the native application so React Native can
+autolink its TurboModule and bundled Rust libraries. **Expo Go is not
+supported** because it cannot load custom native code.
+
+Expo SDK 57 applications should use `expo-dev-client`:
+
+```bash
+npx expo install expo-dev-client
+npx expo prebuild
+```
+
+Then build and start the target platform:
+
+<Tabs>
+  <Tab title="iOS">
+
+    ```bash
+    npx expo run:ios
+    npx expo start --dev-client
+    ```
+
+  </Tab>
+  <Tab title="Android">
+
+    ```bash
+    npx expo run:android
+    npx expo start --dev-client
+    ```
+
+  </Tab>
+</Tabs>
+
+Bare React Native applications can use their normal iOS or Android build after
+installing the package. Ensure the project uses the required deployment target,
+SDK, and NDK versions above.
+
+## Local-network permissions
+
+Only applications that enable mDNS need local multicast setup.
+
+<Tabs>
+  <Tab title="iOS / Expo config">
+
+    ```json
+    {
+      "ios": {
+        "infoPlist": {
+          "NSBonjourServices": ["_p2p._udp"],
+          "NSLocalNetworkUsageDescription": "Discover nearby peers."
+        }
+      }
+    }
+    ```
+
+  </Tab>
+  <Tab title="Android manifest">
+
+    ```xml
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    ```
+
+  </Tab>
+</Tabs>
+
+Rebuild the development build after changing either file; permission changes do
+not reach a running app through the JavaScript bundle.
+
+Next: [Endpoint lifecycle](/typescript/lifecycle) or
+[Networking and events](/typescript/networking-and-events) for the mDNS and
+discovery configuration these permissions unlock.

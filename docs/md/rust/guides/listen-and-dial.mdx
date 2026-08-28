@@ -5,8 +5,8 @@ description: Bind QUIC, TCP, or both; publish dialable peer addresses; and wait 
 
 This guide covers direct QUIC and TCP with the base Endpoint API. QUIC is on
 by default; TCP needs the `tcp` Cargo feature. For relay races and hole
-punching, use [Traverse NAT](/guides/traverse-nat). If you have not run a local
-connection yet, start with [Connect two peers](/quickstart/connect-peers).
+punching, use [Traverse NAT](/rust/guides/traverse-nat). If you have not run a local
+connection yet, start with [Connect two peers](/rust/quickstart/connect-peers).
 
 ## Bind an endpoint
 
@@ -141,7 +141,7 @@ as `Event::ConnectionClosed`.
 `dial*` does not reserve on a relay, establish a circuit, or start DCUtR. When
 the application has enabled the `nat` feature and configured its NAT driver,
 use `connect*` plus `wait_path` instead. See
-[Traverse NAT](/guides/traverse-nat).
+[Traverse NAT](/rust/guides/traverse-nat).
 
-Next: [Register a protocol](/guides/register-a-protocol) or
-[Identity](/guides/identity).
+Next: [Register a protocol](/rust/guides/register-a-protocol) or
+[Identity](/rust/guides/identity).

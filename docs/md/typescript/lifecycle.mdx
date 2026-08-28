@@ -1,0 +1,213 @@
+---
+title: Endpoint lifecycle
+description: Persist an identity, own the endpoint lifetime on each runtime, and shut down cleanly.
+---
+
+A `Minip2p` object owns one native endpoint. Its identity, driver, events,
+pending Promises, and streams all share that lifetime.
+
+## Identity first
+
+The secret key is the node's identity. Generate it once, store the raw 32 bytes
+somewhere protected, and supply the same bytes on later launches when the node
+needs a stable peer ID.
+
+<Tabs>
+  <Tab title="Node.js">
+
+    ```ts
+    import { generateSecretKey, peerIdFromSecretKey } from "@minip2p/node";
+
+    const secretKey = generateSecretKey();
+    const peerId = peerIdFromSecretKey(secretKey);
+    ```
+
+  </Tab>
+  <Tab title="React Native">
+
+    ```ts
+    import {
+      generateSecretKey,
+      peerIdFromSecretKey,
+    } from "@minip2p/react-native";
+
+    const secretKey = generateSecretKey();
+    const peerId = peerIdFromSecretKey(secretKey);
+    ```
+
+  </Tab>
+</Tabs>
+
+`peerIdFromSecretKey` derives the public peer identity without starting an
+endpoint. Treat `secretKey` as credentials: do not log it or transmit it.
+
+- On Node.js, keep it in a file with restrictive permissions or a secret
+  manager, and do not bake it into an image.
+- On React Native, keep it in platform-appropriate secure storage, not in
+  ordinary preferences.
+
+## Own the process lifetime
+
+<Badge>Node.js</Badge>
+
+A started endpoint holds a strong event-loop reference. The process will not
+exit until `close()` is called, so a long-running service should wire shutdown
+to its termination signals:
+
+```ts
+import { Minip2p } from "@minip2p/node";
+
+const endpoint = Minip2p.create({ secretKey });
+
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.once(signal, () => {
+    endpoint.close();
+  });
+}
+```
+
+`close()` returns quickly rather than blocking on network teardown, and it
+releases the event-loop reference, so the process can exit once nothing else
+keeps it alive.
+
+`Minip2p` also implements `Symbol.dispose`. In a scoped tool or test, a `using`
+declaration closes the endpoint at scope exit:
+
+```ts
+using endpoint = Minip2p.create({ secretKey });
+```
+
+## Prefer the lifecycle hook
+
+<Badge>React Native</Badge>
+
+`useMinip2p` is the normal component API. It starts in `starting`, then exposes
+the endpoint only after native construction succeeds.
+
+```tsx
+const node = useMinip2p(createConfig);
+
+switch (node.status) {
+  case "starting":
+    return <LoadingView />;
+  case "failed":
+    return <ErrorView error={node.error} />;
+  case "closed":
+    return <ClosedView />;
+  case "running":
+    return <PeerView endpoint={node.endpoint} peerId={node.peerId} />;
+}
+```
+
+| Status | Available state |
+| --- | --- |
+| `starting` | Native construction is scheduled after commit. |
+| `running` | `endpoint`, `peerId`, and the initial `listenAddrs`. |
+| `closed` | The endpoint closed normally. |
+| `failed` | Construction failed or the native driver stopped unexpectedly. |
+
+Every state also carries an idempotent `close()` callback. Component cleanup
+unbinds `AppState` and closes the endpoint automatically.
+
+Use `isDriverFailure(node)` to narrow a failed hook state to
+`DriverFailedError` when the UI needs the machine-readable failure kind.
+
+:::warning
+Keep the configuration factory pure and stable. React may render a component
+without committing it; the hook deliberately creates native state only in the
+committed effect.
+:::
+
+## Active and idle
+
+An endpoint starts in active polling. `setActive(false)` switches the native
+driver to its idle cadence, which trades latency for fewer wakeups;
+`setActive(true)` restores active polling on the same endpoint. Servers
+normally stay active. The idle mode exists for hosts that are sometimes
+backgrounded, such as a desktop app embedding the SDK.
+
+### Foreground and background
+
+<Badge>React Native</Badge>
+
+The hook immediately mirrors the current React Native `AppState` and keeps it
+in sync:
+
+- `active` selects foreground polling;
+- every other state selects the native idle behavior.
+
+This changes driver cadence; it does not destroy the endpoint. When the app
+returns to the foreground, the same endpoint resumes active polling.
+
+If the endpoint is not component-owned, bind and release `AppState` manually:
+
+```ts
+import {
+  Minip2p,
+  bindAppState,
+  generateSecretKey,
+} from "@minip2p/react-native";
+
+const endpoint = Minip2p.create({
+  secretKey: generateSecretKey(),
+});
+const unbindAppState = bindAppState(endpoint);
+
+// Later, in the owner's cleanup path:
+unbindAppState();
+endpoint.close();
+```
+
+`bindAppState` applies the current state before it subscribes to later changes.
+
+## Close is terminal
+
+`endpoint.close()` is idempotent. It:
+
+1. rejects pending Promise operations;
+2. closes owned `Stream` handles;
+3. stops and destroys the native endpoint;
+4. invokes each `onClose` observer once.
+
+```ts
+const removeClose = endpoint.onClose((reason) => {
+  if (reason.reason === "driverFailed") {
+    console.error(reason.error.kind, reason.error.message);
+  }
+});
+
+endpoint.close();
+removeClose();
+```
+
+## Public SDK boundary
+
+Application code should import from the binding package for its runtime. That
+package re-exports the platform-neutral high-level types and errors from
+`@minip2p/core`.
+
+<Tabs>
+  <Tab title="Node.js">
+
+    Import from `@minip2p/node`.
+
+    The adapter contract at `@minip2p/core/backend` is a low-level integration
+    API for platform adapter authors. It exposes raw tagged unions and native
+    ownership rules; ordinary applications should not use it.
+
+  </Tab>
+  <Tab title="React Native">
+
+    Import from `@minip2p/react-native`.
+
+    The generated UniFFI API at `@minip2p/react-native/native` and the adapter
+    contract at `@minip2p/core/backend` are low-level integration APIs. They
+    expose native lifecycle details and raw tagged unions; ordinary
+    applications should not use them.
+
+  </Tab>
+</Tabs>
+
+Next: [Connections and streams](/typescript/connections-and-streams) and
+[Networking and events](/typescript/networking-and-events), or the
+[TypeScript API reference](/reference/typescript-api).
