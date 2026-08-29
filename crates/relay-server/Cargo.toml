@@ -25,13 +25,13 @@ std = [
 ]
 
 [dependencies]
-minip2p-core = { path = "../core", version = "0.4.7", default-features = false }
-minip2p-platform = { path = "../platform", version = "0.4.7", default-features = false }
-minip2p-relay = { path = "../relay", version = "0.4.7", default-features = false }
-minip2p-swarm = { path = "../swarm", version = "0.4.7", default-features = false }
-minip2p-transport = { path = "../transport", version = "0.4.7", default-features = false }
+minip2p-core = { path = "../core", version = "0.4.8", default-features = false }
+minip2p-platform = { path = "../platform", version = "0.4.8", default-features = false }
+minip2p-relay = { path = "../relay", version = "0.4.8", default-features = false }
+minip2p-swarm = { path = "../swarm", version = "0.4.8", default-features = false }
+minip2p-transport = { path = "../transport", version = "0.4.8", default-features = false }
 thiserror = { version = "2.0.18", default-features = false }
 
 [dev-dependencies]
-minip2p-identity = { path = "../identity", version = "0.4.7" }
-minip2p-nat = { path = "../nat", version = "0.4.7" }
+minip2p-identity = { path = "../identity", version = "0.4.8" }
+minip2p-nat = { path = "../nat", version = "0.4.8" }

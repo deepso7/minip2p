@@ -22,8 +22,8 @@ std = [
 ]
 
 [dependencies]
-minip2p-core = { path = "../core", version = "0.4.7", default-features = false }
-minip2p-identity = { path = "../identity", version = "0.4.7", default-features = false, features = ["ed25519"] }
+minip2p-core = { path = "../core", version = "0.4.8", default-features = false }
+minip2p-identity = { path = "../identity", version = "0.4.8", default-features = false, features = ["ed25519"] }
 x25519-dalek = { version = "3.0.0", default-features = false, features = ["static_secrets"] }
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.11.0", default-features = false }
