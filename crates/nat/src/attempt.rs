@@ -183,6 +183,7 @@ impl ConnectAttempt {
     pub(crate) fn accepts_dcutr(&self, peer: &PeerId, conn_id: ConnectionId) -> bool {
         !self.done
             && !self.punch_settled
+            && !self.punch_dials_issued
             && &self.peer == peer
             && self.promoted == Some(conn_id)
             && self
@@ -207,6 +208,7 @@ impl ConnectAttempt {
         if self.dcutr_stream != Some(stream) {
             return;
         }
+        let exchange_closed = matches!(input, StreamInput::RemoteWriteClosed | StreamInput::Closed);
         let machine_input = match input {
             StreamInput::Data(data) => DcutrResponderInput::Data(data.to_vec()),
             StreamInput::RemoteWriteClosed | StreamInput::Closed => {
@@ -239,9 +241,7 @@ impl ConnectAttempt {
                     self.punch_addrs = select_global_punch_candidates(&remote_addrs);
                 }
                 DcutrResponderOutput::Event(ResponderEvent::SyncReceived) => {
-                    self.dcutr = None;
-                    shared.release_stream(&self.peer, stream);
-                    self.dcutr_stream = None;
+                    self.teardown_dcutr_stream(shared);
                     if self.punch_addrs.is_empty() {
                         self.punch_failed_permanently(
                             shared,
@@ -256,12 +256,14 @@ impl ConnectAttempt {
                 }
             }
         }
+        if exchange_closed && self.dcutr_stream == Some(stream) {
+            self.finish_failed_dcutr(stream, "DCUtR stream closed before SYNC".into(), shared);
+        }
     }
 
     fn finish_failed_dcutr(&mut self, stream: StreamId, reason: String, shared: &mut Shared) {
-        self.dcutr = None;
-        self.dcutr_stream = None;
-        shared.release_stream(&self.peer, stream);
+        debug_assert_eq!(self.dcutr_stream, Some(stream));
+        self.teardown_dcutr_stream(shared);
         shared.push_event(NatEvent::HolePunchFailed {
             connect_id: self.id,
             attempt: 1,
@@ -507,15 +509,7 @@ impl ConnectAttempt {
             TokenPurpose::DirectDial(_) => {
                 self.direct_live = self.direct_live.saturating_sub(1);
                 self.last_error = Some(NatError::DialFailed(reason));
-                if self.direct_live == 0
-                    && matches!(self.best, Some(Path::Relayed { .. }))
-                    && self.dcutr.is_none()
-                    && self.punch_deadline.is_none()
-                {
-                    self.settle_after_punch(shared);
-                } else {
-                    self.fail_if_no_legs_remain(shared);
-                }
+                self.fail_if_no_legs_remain(shared);
             }
             TokenPurpose::RelayDial(_) => {
                 self.fail_relay_leg(shared, NatError::DialFailed(reason));
@@ -882,6 +876,7 @@ impl ConnectAttempt {
         if self.done {
             return;
         }
+        self.teardown_dcutr_stream(shared);
         if self.bridge_alive {
             self.punch_settled = true;
             if let RelayLeg::Bridged { stream } = self.leg {
@@ -1062,14 +1057,7 @@ impl ConnectAttempt {
     /// still holds (including a bridge the application was told about — the
     /// caller emits the explaining event first).
     fn teardown_relay_leg(&mut self, shared: &mut Shared) {
-        if let Some(stream_id) = self.dcutr_stream.take() {
-            shared.push_action(NatAction::ResetStream {
-                peer: self.peer.clone(),
-                stream_id,
-            });
-            shared.release_stream(&self.peer, stream_id);
-        }
-        self.dcutr = None;
+        self.teardown_dcutr_stream(shared);
         match self.leg {
             RelayLeg::WaitHopReady { stream } | RelayLeg::AwaitHopStatus { stream } => {
                 if let Some(relay_peer) = self.relay_peer().cloned() {
@@ -1097,12 +1085,21 @@ impl ConnectAttempt {
         self.relay_deadline = None;
         self.punch_deadline = None;
         self.hop = None;
-        self.dcutr = None;
-        self.dcutr_stream = None;
         self.bridge_alive = false;
         if let Some(conn_id) = self.promoted.take() {
             shared.push_action(NatAction::CloseCircuit { conn_id });
         }
+    }
+
+    fn teardown_dcutr_stream(&mut self, shared: &mut Shared) {
+        if let Some(stream_id) = self.dcutr_stream.take() {
+            shared.push_action(NatAction::ResetStream {
+                peer: self.peer.clone(),
+                stream_id,
+            });
+            shared.release_stream(&self.peer, stream_id);
+        }
+        self.dcutr = None;
     }
 
     fn relay_peer(&self) -> Option<&PeerId> {

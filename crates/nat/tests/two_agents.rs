@@ -606,45 +606,26 @@ fn two_agents_punch_to_a_direct_connection() {
 }
 
 #[test]
-fn force_relay_peer_and_default_peer_still_establish_relayed_paths() {
-    let mut world = World::with_force_relay(true, false);
-    world.settle_reservation();
-    let id = world.start_connect();
+fn force_relay_on_either_peer_keeps_both_paths_relayed() {
+    for (dialer_forced, listener_forced) in [(true, false), (false, true)] {
+        let mut world = World::with_force_relay(dialer_forced, listener_forced);
+        world.settle_reservation();
+        let id = world.start_connect();
 
-    assert!(matches!(
-        drain_events(&mut world.a).as_slice(),
-        [NatEvent::PathEstablished { connect_id, path: Path::Relayed { .. }, .. }]
-            if *connect_id == id
-    ));
-    assert!(matches!(
-        drain_events(&mut world.b).as_slice(),
-        [NatEvent::InboundPathEstablished {
-            path: Path::Relayed { .. },
-            ..
-        }]
-    ));
-    assert_eq!(world.punch_dials_from_a + world.punch_dials_from_b, 0);
-}
-
-#[test]
-fn default_dialer_and_force_relay_listener_still_establish_relayed_paths() {
-    let mut world = World::with_force_relay(false, true);
-    world.settle_reservation();
-    let id = world.start_connect();
-
-    assert!(matches!(
-        drain_events(&mut world.a).as_slice(),
-        [NatEvent::PathEstablished { connect_id, path: Path::Relayed { .. }, .. }]
-            if *connect_id == id
-    ));
-    assert!(matches!(
-        drain_events(&mut world.b).as_slice(),
-        [NatEvent::InboundPathEstablished {
-            path: Path::Relayed { .. },
-            ..
-        }]
-    ));
-    assert_eq!(world.punch_dials_from_a + world.punch_dials_from_b, 0);
+        assert!(matches!(
+            drain_events(&mut world.a).as_slice(),
+            [NatEvent::PathEstablished { connect_id, path: Path::Relayed { .. }, .. }]
+                if *connect_id == id
+        ));
+        assert!(matches!(
+            drain_events(&mut world.b).as_slice(),
+            [NatEvent::InboundPathEstablished {
+                path: Path::Relayed { .. },
+                ..
+            }]
+        ));
+        assert_eq!(world.punch_dials_from_a + world.punch_dials_from_b, 0);
+    }
 }
 
 #[test]

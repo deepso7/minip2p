@@ -44,13 +44,11 @@ pub(crate) struct InboundCircuit {
     stop: Option<StopResponder>,
     dcutr: Option<DcutrInitiator>,
     dcutr_stream: Option<StreamId>,
+    dcutr_deadline: Option<u64>,
     remote_addrs: Vec<Multiaddr>,
     /// Secure-mux bytes coalesced behind the STOP success response. These
     /// must accompany circuit promotion.
     pending_data: Vec<u8>,
-    /// The remote write half reached EOF while the control plane still owned
-    /// the bridge. The transport will not repeat that event after handoff.
-    remote_write_closed: bool,
     /// Deadline for STOP acceptance and handing the bridge to circuit promotion.
     exchange_deadline: u64,
     blast: Option<BlastSchedule>,
@@ -85,9 +83,9 @@ impl InboundCircuit {
             stop: Some(StopResponder::new()),
             dcutr: None,
             dcutr_stream: None,
+            dcutr_deadline: None,
             remote_addrs: Vec::new(),
             pending_data: Vec::new(),
-            remote_write_closed: false,
             exchange_deadline: now.mono_ms + shared.config.relay_leg_deadline_ms,
             blast: None,
             linger_until: None,
@@ -121,6 +119,9 @@ impl InboundCircuit {
         if let Some(handshake) = self.handshake_deadline {
             due = Some(due.map_or(handshake, |d| d.min(handshake)));
         }
+        if let Some(deadline) = self.dcutr_deadline {
+            due = Some(due.map_or(deadline, |d| d.min(deadline)));
+        }
         due
     }
 
@@ -141,7 +142,6 @@ impl InboundCircuit {
                 }
             }
             StreamInput::RemoteWriteClosed => {
-                self.remote_write_closed = true;
                 // A peer can stop sending while the local write half remains
                 // usable. Let the protocol parser consume that boundary and
                 // retain the circuit until its normal exchange deadline.
@@ -208,9 +208,8 @@ impl InboundCircuit {
         }
         self.source = Some(source);
 
-        // STATUS:OK first, then any bytes the relay pipelined behind the
-        // CONNECT — those already belong to the DCUtR exchange and must
-        // reach the machine inside this same cascade.
+        // STATUS:OK first, then preserve any secure-mux bytes the relay
+        // pipelined behind CONNECT for circuit promotion.
         let mut outbound = Vec::new();
         let mut pipelined = Vec::new();
         while let Some(output) = stop.poll_output() {
@@ -252,7 +251,9 @@ impl InboundCircuit {
                 remote_peer: source.clone(),
                 role: BridgeRole::Responder,
                 pending_data: core::mem::take(&mut self.pending_data),
-                remote_write_closed: self.remote_write_closed,
+                // CONNECT completion promotes in the same input cascade, so
+                // no later half-close can arrive while NAT owns the bridge.
+                remote_write_closed: false,
             });
         }
     }
@@ -312,6 +313,12 @@ impl InboundCircuit {
             if let Some(conn_id) = self.promoted.take() {
                 shared.push_action(NatAction::CloseCircuit { conn_id });
             }
+            self.done = true;
+        }
+        if let Some(deadline) = self.dcutr_deadline
+            && now.mono_ms >= deadline
+        {
+            self.finish_dcutr(shared);
             self.done = true;
         }
     }
@@ -431,11 +438,13 @@ impl InboundCircuit {
         peer: &PeerId,
         result: Result<StreamId, alloc::string::String>,
         shared: &mut Shared,
+        now: Now,
     ) {
         match result {
             Ok(stream) => {
                 self.dcutr_stream = Some(stream);
                 self.dcutr = Some(DcutrInitiator::new(&shared.punch_candidates()));
+                self.dcutr_deadline = Some(now.mono_ms + shared.config.relay_leg_deadline_ms);
                 shared.own_stream(
                     peer,
                     stream,
@@ -462,6 +471,7 @@ impl InboundCircuit {
         let Some(dcutr) = self.dcutr.as_mut() else {
             return;
         };
+        let remote_closed = matches!(&input, StreamInput::RemoteWriteClosed | StreamInput::Closed);
         let machine_input = match input {
             StreamInput::Ready => DcutrInitiatorInput::Flush,
             StreamInput::Data(bytes) => DcutrInitiatorInput::Data {
@@ -473,11 +483,7 @@ impl InboundCircuit {
             }
         };
         if dcutr.handle_input(machine_input).is_err() {
-            self.dcutr = None;
-            self.dcutr_stream = None;
-            if let Some(peer) = self.source.as_ref() {
-                shared.release_stream(peer, stream);
-            }
+            self.finish_dcutr(shared);
             self.done = true;
             return;
         }
@@ -528,13 +534,30 @@ impl InboundCircuit {
                 }
             }
         }
-        if completed {
-            self.dcutr = None;
-            self.dcutr_stream = None;
-            if let Some(peer) = self.source.as_ref() {
-                shared.release_stream(peer, stream);
-            }
+        if remote_closed && !completed {
+            self.finish_dcutr(shared);
+            self.done = true;
+            return;
         }
+        if completed {
+            self.finish_dcutr(shared);
+        }
+    }
+
+    fn finish_dcutr(&mut self, shared: &mut Shared) {
+        self.dcutr = None;
+        self.dcutr_deadline = None;
+        let Some(stream_id) = self.dcutr_stream.take() else {
+            return;
+        };
+        let Some(peer) = self.source.as_ref() else {
+            return;
+        };
+        shared.push_action(NatAction::ResetStream {
+            peer: peer.clone(),
+            stream_id,
+        });
+        shared.release_stream(peer, stream_id);
     }
 }
 

@@ -69,6 +69,74 @@ fn open_dcutr(h: &mut Harness, conn: ConnectionId, actions: &[NatAction]) -> Str
     stream
 }
 
+#[test]
+fn silent_inbound_dcutr_exchange_times_out_and_resets_the_stream() {
+    let mut h = inbound_harness(NatConfig {
+        relay_leg_deadline_ms: 5,
+        ..NatConfig::default()
+    });
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    drain_actions(&mut h.agent);
+
+    h.agent.handle_tick(at(18));
+
+    assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
+    assert!(!h.agent.owns_stream(&h.target, stream));
+    assert!(h.agent.is_idle());
+}
+
+#[test]
+fn failed_inbound_dcutr_open_ends_coordination_without_losing_the_relayed_path() {
+    let mut h = inbound_harness(NatConfig::default());
+    let (_, actions) = drive_to_relayed(&mut h);
+    let token = open_stream_token(&actions);
+
+    h.agent
+        .stream_open_result(token, Err("DCUtR unavailable".into()), at(13));
+
+    assert!(drain_actions(&mut h.agent).is_empty());
+    assert!(drain_events(&mut h.agent).is_empty());
+    assert!(h.agent.is_idle());
+}
+
+#[test]
+fn early_closed_inbound_dcutr_exchange_resets_the_stream() {
+    let mut h = inbound_harness(NatConfig::default());
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    drain_actions(&mut h.agent);
+
+    h.agent.handle_event(
+        &SwarmEvent::StreamClosed {
+            conn_id: conn,
+            peer_id: h.target.clone(),
+            stream_id: stream,
+        },
+        at(14),
+    );
+
+    assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
+    assert!(!h.agent.owns_stream(&h.target, stream));
+    assert!(h.agent.is_idle());
+}
+
+#[test]
+fn oversized_inbound_dcutr_connect_keeps_the_relayed_path() {
+    let mut h = inbound_harness(NatConfig::default());
+    let addrs: Vec<_> = (1u16..=400)
+        .map(|port| maddr(&format!("/ip4/198.51.100.5/udp/{port}/quic-v1")))
+        .collect();
+    h.agent.set_listen_addrs(&addrs);
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+
+    assert!(has_reset_for(&drain_actions(&mut h.agent), stream));
+    assert!(drain_events(&mut h.agent).is_empty());
+    assert!(!h.agent.owns_stream(&h.target, stream));
+    assert!(h.agent.is_idle());
+}
+
 fn answer_dcutr(h: &mut Harness, conn: ConnectionId, stream: StreamId, addrs: &[&str]) {
     let reply_addrs: Vec<_> = addrs.iter().map(|addr| maddr(addr)).collect();
     h.agent.handle_event(
@@ -179,7 +247,9 @@ fn peer_supplied_punch_targets_must_be_global_unicast_quic_ips() {
             "/ip4/8.8.4.4/tcp/4001",
         ],
     );
-    drain_actions(&mut h.agent);
+    let sync = drain_actions(&mut h.agent);
+    assert!(has_reset_for(&sync, stream));
+    assert!(!h.agent.owns_stream(&h.target, stream));
     h.agent.handle_tick(at(20));
     let targets: Vec<_> = drain_actions(&mut h.agent)
         .into_iter()

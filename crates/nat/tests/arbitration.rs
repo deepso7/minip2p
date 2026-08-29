@@ -244,21 +244,20 @@ fn malformed_dcutr_keeps_the_established_relayed_path() {
     );
 
     let events = drain_events(&mut h.agent);
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, NatEvent::HolePunchFailed { .. }))
-    );
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, NatEvent::FellBackToRelay { .. }))
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, NatEvent::ConnectFailed { .. }))
-    );
+    assert!(matches!(
+        events.as_slice(),
+        [
+            NatEvent::HolePunchFailed {
+                connect_id,
+                attempt: 1,
+                ..
+            },
+            NatEvent::FellBackToRelay {
+                connect_id: fallback_id,
+                peer,
+            }
+        ] if *connect_id == id && *fallback_id == id && peer == &h.target
+    ));
 }
 
 #[test]

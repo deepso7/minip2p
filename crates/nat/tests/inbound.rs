@@ -79,6 +79,13 @@ fn default_inbound_promotes_immediately_after_stop_acceptance() {
 
     let actions = drain_actions(&mut h.agent);
     assert_eq!(send_stream_count(&actions), 1, "STATUS:OK must be sent");
+    assert!(
+        !actions.iter().any(|action| matches!(
+            action,
+            NatAction::OpenStream { protocol_id, .. } if protocol_id == DCUTR_PROTOCOL_ID
+        )),
+        "DCUtR must wait until the promoted circuit is connected"
+    );
     assert!(actions.iter().any(|action| matches!(
         action,
         NatAction::PromoteBridge {

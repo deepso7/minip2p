@@ -790,7 +790,7 @@ impl NatAgent {
             }
             TokenPurpose::OpenDcutrInbound(id, peer) => match self.inbound.get_mut(&id) {
                 Some(circuit) => {
-                    circuit.on_dcutr_open_result(&peer, result, &mut self.shared);
+                    circuit.on_dcutr_open_result(&peer, result, &mut self.shared, now);
                     self.reap_done();
                 }
                 None => {
