@@ -5,7 +5,7 @@
 //! transport implementation.
 
 use minip2p_core::{PeerAddr, Protocol};
-use minip2p_platform::Now;
+use minip2p_platform::{Deadline, Now};
 use minip2p_quic::{QuicEndpoint, QuicLimits, QuicNodeConfig, QuicTransport};
 use minip2p_transport::{
     BlockingTransport, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
@@ -462,6 +462,45 @@ fn quic_deadline_is_exposed_and_driven_without_socket_input() {
         }
     }
     assert!(closed, "QUIC timeout must close a silent dial");
+}
+
+#[test]
+fn quiet_pair_stays_up_past_idle_timeout() {
+    let limits = QuicLimits {
+        idle_timeout_ms: 80,
+        ..QuicLimits::default()
+    };
+    let (mut server, mut client, peer_addr) = setup_pair_with_client_limits(limits);
+    let (server_id, client_id, _, _) = connect_pair(&mut server, &mut client, &peer_addr);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    let mut closed = false;
+    while std::time::Instant::now() < deadline {
+        closed |= server
+            .poll(common::now())
+            .expect("server poll")
+            .into_iter()
+            .any(|event| matches!(event, TransportEvent::Closed { id, .. } if id == server_id));
+        closed |= client
+            .poll(common::now())
+            .expect("client poll")
+            .into_iter()
+            .any(|event| matches!(event, TransportEvent::Closed { id, .. } if id == client_id));
+        if closed {
+            break;
+        }
+        let sleep = Deadline::earliest_opt(server.next_deadline(), client.next_deadline())
+            .map(|deadline| std::time::Duration::from_millis(deadline.millis_until(common::now())))
+            .unwrap_or(std::time::Duration::from_millis(5))
+            .min(std::time::Duration::from_millis(10));
+        if !sleep.is_zero() {
+            std::thread::sleep(sleep);
+        }
+    }
+    assert!(
+        !closed,
+        "ack-eliciting keepalive must keep a quiet pair past the idle timeout"
+    );
 }
 
 #[test]

@@ -27,6 +27,10 @@ No async runtime required. The host drives the transport by calling `poll(now)` 
   events are already buffered, so calls made between polls -- `listen`,
   `open_stream`, and the stream operations -- never leave a host asleep on an
   undelivered event.
+- Quiet connections send an ack-eliciting packet at half `idle_timeout_ms`
+  (15 s by default) so NAT bindings and the peer's idle timer stay warm
+  without an application ping. Dead paths still idle-timeout: only one ping
+  is sent per receive.
 - Stateless Retry authenticates source addresses before inbound connection
   allocation. Configurable limits bound connections, streams, queued stream
   bytes, queued UDP datagrams, and idle time.

@@ -77,10 +77,10 @@ minip2p, go-libp2p gossipsub, and signed rust-libp2p gossipsub currently emit
 8-byte big-endian counters, while this implementation accepts any 1..=64-byte
 value.
 
-A quiet room generates no traffic, and the QUIC transport drops
-connections after 30 s of silence — the chat loop pings every connected
-peer on a 10 s cadence to keep the room (and any relay reservation
-connection) alive through idle spells.
+A quiet room generates no application traffic. QUIC sends an ack-eliciting
+keepalive halfway through its idle timeout, while TCP and relay circuits use
+Yamux pings. The chat loop does not open ping-protocol streams just to keep
+connections alive.
 
 ## Live-test recipes
 
@@ -116,7 +116,8 @@ Two deployment details surfaced during live validation:
 4. **Manual rust-libp2p interop check (not covered by CI)**: configure a
    rust-libp2p gossipsub peer with `MessageAuthenticity::Signed` and strict
    validation, then verify messages travel in both directions. The rust peer
-   must include a `ping` behaviour (to answer this side's keepalives) or raise
-   its `idle_connection_timeout` — by default rust-libp2p closes a connection
-   after 10 s when no behaviour keeps it alive, which reads as an instant
-   disconnect here.
+   must include a `ping` behaviour or raise its `idle_connection_timeout` —
+   by default rust-libp2p closes a connection after 10 s when no behaviour
+   keeps it alive, which reads as an instant disconnect here. Transport-level
+   keepalives (QUIC PING / Yamux ping) keep the path up on this side; they
+   do not count as "in use" for rust-libp2p's swarm idle timeout.

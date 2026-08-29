@@ -1,8 +1,9 @@
 //! Bounded Sans-I/O implementation of the libp2p Yamux stream multiplexer.
 //!
 //! [`YamuxSession`] accepts ordered connection bytes and emits encoded Yamux
-//! frames plus stream lifecycle events. It performs no I/O, owns no clock, and
-//! remains fully caller-driven.
+//! frames plus stream lifecycle events. It performs no I/O and never reads a
+//! clock: the host supplies [`minip2p_platform::Now`] samples so a quiet
+//! session can emit keepalive pings on a deadline.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
@@ -24,6 +25,13 @@ pub use session::YamuxSession;
 
 /// Multistream-select protocol identifier for libp2p Yamux.
 pub const YAMUX_PROTOCOL_ID: &str = "/yamux/1.0.0";
+
+/// How long a session may stay quiet before it sends a keepalive ping.
+///
+/// The host drives this through [`YamuxSession::poll`] / [`YamuxSession::next_deadline`];
+/// the session never reads a clock of its own. 30 seconds matches go-libp2p
+/// yamux's default `KeepAliveInterval`.
+pub const KEEPALIVE_INTERVAL_MS: u64 = 30_000;
 
 /// Yamux's specification-defined initial stream window (256 KiB).
 pub const DEFAULT_RECEIVE_WINDOW: u32 = 256 * 1024;

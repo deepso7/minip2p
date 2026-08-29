@@ -7,6 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
+use minip2p_platform::{Deadline, Now};
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, ConnectionState, StreamId, TransportError, TransportEvent,
 };
@@ -95,6 +96,14 @@ pub struct QuicConnection {
     /// Source CIDs the transport has entered into its routing table, so
     /// reindexing and unindexing never scan the whole table.
     indexed_cids: Vec<Vec<u8>>,
+    /// Host time of the last packet this connection received.
+    last_recv_ms: Option<u64>,
+    /// An ack-eliciting keepalive has been sent since `last_recv_ms`.
+    ///
+    /// Further pings would restart the idle timer without evidence the peer
+    /// is still there, so one unanswered ping is enough; idle timeout then
+    /// closes a dead path.
+    sent_keepalive_since_recv: bool,
 }
 
 impl QuicConnection {
@@ -121,6 +130,8 @@ impl QuicConnection {
             pending_write_bytes: 0,
             max_pending_write_bytes,
             indexed_cids: Vec::new(),
+            last_recv_ms: None,
+            sent_keepalive_since_recv: false,
         }
     }
 
@@ -168,6 +179,42 @@ impl QuicConnection {
         self.conn.timeout()
     }
 
+    /// When this connection next wants a keepalive poll, if it is quiet.
+    pub(crate) fn keepalive_deadline(&self, interval_ms: u64) -> Option<Deadline> {
+        if self.state != ConnectionState::Connected || self.sent_keepalive_since_recv {
+            return None;
+        }
+        Some(Deadline::from_millis(
+            self.last_recv_ms?.saturating_add(interval_ms),
+        ))
+    }
+
+    /// Sends an ack-eliciting packet if the connection has been quiet long
+    /// enough. One ping per receive; a dead peer is then left to idle-timeout.
+    pub fn maybe_keepalive(
+        &mut self,
+        now: Now,
+        interval_ms: u64,
+        socket: &UdpSocket,
+        events: &mut Vec<TransportEvent>,
+        pending_datagrams: &mut VecDeque<PendingDatagram>,
+        max_pending_datagrams: usize,
+    ) -> Result<(), TransportError> {
+        if self.state != ConnectionState::Connected || self.sent_keepalive_since_recv {
+            return Ok(());
+        }
+        let Some(last) = self.last_recv_ms else {
+            return Ok(());
+        };
+        if now.monotonic_ms.saturating_sub(last) < interval_ms {
+            return Ok(());
+        }
+        let _ = self.conn.send_ack_eliciting();
+        self.sent_keepalive_since_recv = true;
+        self.drain_send_queue(events)?;
+        self.flush(socket, pending_datagrams, max_pending_datagrams)
+    }
+
     /// Advances quiche's loss-recovery and idle timers when they are due.
     pub fn handle_timeout(
         &mut self,
@@ -194,6 +241,7 @@ impl QuicConnection {
         buf: &mut [u8],
         from: SocketAddr,
         local: SocketAddr,
+        now: Now,
         socket: &UdpSocket,
         events: &mut Vec<TransportEvent>,
         pending_datagrams: &mut VecDeque<PendingDatagram>,
@@ -202,8 +250,14 @@ impl QuicConnection {
         let recv_info = quiche::RecvInfo { from, to: local };
 
         match self.conn.recv(buf, recv_info) {
-            Ok(_) => {}
-            Err(quiche::Error::Done) => {}
+            Ok(_) => {
+                self.last_recv_ms = Some(now.monotonic_ms);
+                self.sent_keepalive_since_recv = false;
+            }
+            Err(quiche::Error::Done) => {
+                self.last_recv_ms = Some(now.monotonic_ms);
+                self.sent_keepalive_since_recv = false;
+            }
             Err(e) => {
                 events.push(TransportEvent::Error {
                     id: self.id,

@@ -1,9 +1,11 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
+use minip2p_platform::{Deadline, Now};
+
 use crate::{
     DEFAULT_RECEIVE_WINDOW, FLAG_ACK, FLAG_FIN, FLAG_RST, FLAG_SYN, Frame, FrameDecoder, FrameType,
-    YamuxConfig, YamuxError, YamuxOutput, YamuxRole,
+    KEEPALIVE_INTERVAL_MS, YamuxConfig, YamuxError, YamuxOutput, YamuxRole,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,6 +93,14 @@ pub struct YamuxSession {
     failed: bool,
     local_go_away: bool,
     remote_go_away: bool,
+    /// Monotonic milliseconds of the last poll that observed traffic, or the
+    /// first poll if none has arrived yet. `None` until the host supplies a
+    /// time sample.
+    last_activity_ms: Option<u64>,
+    /// A frame was queued or consumed since `last_activity_ms` was stamped.
+    dirty: bool,
+    /// Nonce for the next locally originated keepalive ping.
+    next_ping_nonce: u32,
 }
 
 impl YamuxSession {
@@ -132,7 +142,45 @@ impl YamuxSession {
             failed: false,
             local_go_away: false,
             remote_go_away: false,
+            last_activity_ms: None,
+            dirty: false,
+            next_ping_nonce: 1,
         }
+    }
+
+    /// Advances keepalive using the host's time sample.
+    ///
+    /// A quiet session queues a ping once [`KEEPALIVE_INTERVAL_MS`] has elapsed
+    /// since the last inbound or outbound frame. Traffic observed since the
+    /// previous sample restamps the timer, so a busy session never pings.
+    pub fn poll(&mut self, now: Now) -> Result<(), YamuxError> {
+        self.ensure_active()?;
+        if self.dirty || self.last_activity_ms.is_none() {
+            self.last_activity_ms = Some(now.monotonic_ms);
+            self.dirty = false;
+        }
+        let last = self.last_activity_ms.expect("stamped above");
+        if now.monotonic_ms.saturating_sub(last) >= KEEPALIVE_INTERVAL_MS {
+            let nonce = self.next_ping_nonce;
+            self.next_ping_nonce = self.next_ping_nonce.wrapping_add(1);
+            self.queue_frame(Frame::ping(FLAG_SYN, nonce)?);
+            self.last_activity_ms = Some(now.monotonic_ms);
+            self.dirty = false;
+        }
+        Ok(())
+    }
+
+    /// When this session next wants a [`poll`](Self::poll) for keepalive.
+    ///
+    /// `None` until the first poll supplies a timeline, and once the session
+    /// has failed or gone away.
+    pub fn next_deadline(&self) -> Option<Deadline> {
+        if self.failed || self.local_go_away || self.remote_go_away {
+            return None;
+        }
+        Some(Deadline::from_millis(
+            self.last_activity_ms?.saturating_add(KEEPALIVE_INTERVAL_MS),
+        ))
     }
 
     /// Opens a local stream and returns its role-partitioned identifier.
@@ -292,6 +340,7 @@ impl YamuxSession {
             if let Err(error) = self.process_frame(frame) {
                 return self.fail_protocol(error);
             }
+            self.dirty = true;
             if self.remote_go_away {
                 self.decoder.clear();
                 return Ok(());
@@ -608,6 +657,7 @@ impl YamuxSession {
     }
 
     fn queue_frame(&mut self, frame: Frame) {
+        self.dirty = true;
         self.pending
             .push_back(YamuxOutput::Outbound(frame.encode()));
     }
@@ -662,6 +712,8 @@ impl YamuxSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::KEEPALIVE_INTERVAL_MS;
+    use minip2p_platform::{Deadline, Now};
 
     fn outbound(session: &mut YamuxSession) -> Vec<u8> {
         match session.poll_output().expect("outbound Yamux frame") {
@@ -1037,6 +1089,118 @@ mod tests {
             Some(YamuxOutput::StreamClosed { stream })
         );
         assert_eq!(session.open_stream(), Err(YamuxError::SessionClosed));
+    }
+
+    #[test]
+    fn quiet_session_sends_ping_after_keepalive_interval() {
+        let mut session = YamuxSession::new(YamuxRole::Client);
+        session.poll(Now::from_millis(0)).unwrap();
+        assert_eq!(session.poll_output(), None, "nothing is due at t=0");
+
+        session
+            .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS - 1))
+            .unwrap();
+        assert_eq!(
+            session.poll_output(),
+            None,
+            "a ping one millisecond early would be early"
+        );
+
+        session
+            .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+            .unwrap();
+        let ping = decode(&outbound(&mut session));
+        assert_eq!(ping.frame_type(), FrameType::Ping);
+        assert_eq!(ping.flags(), FLAG_SYN);
+        assert_ne!(ping.value(), 0, "the nonce is an opaque non-zero value");
+        assert_eq!(session.poll_output(), None);
+    }
+
+    #[test]
+    fn inbound_traffic_defers_the_keepalive_ping() {
+        let mut session = YamuxSession::new(YamuxRole::Server);
+        session.poll(Now::from_millis(0)).unwrap();
+
+        session
+            .handle_data(&Frame::ping(FLAG_SYN, 7).unwrap().encode())
+            .unwrap();
+        let pong = decode(&outbound(&mut session));
+        assert_eq!(pong.flags(), FLAG_ACK);
+        assert_eq!(pong.value(), 7);
+
+        session
+            .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+            .unwrap();
+        assert_eq!(
+            session.poll_output(),
+            None,
+            "the echoed ping was traffic; the next keepalive is another interval out"
+        );
+
+        session
+            .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS * 2))
+            .unwrap();
+        let ping = decode(&outbound(&mut session));
+        assert_eq!(ping.frame_type(), FrameType::Ping);
+        assert_eq!(ping.flags(), FLAG_SYN);
+    }
+
+    #[test]
+    fn outbound_traffic_defers_the_keepalive_ping() {
+        let mut session = YamuxSession::new(YamuxRole::Client);
+        session.poll(Now::from_millis(0)).unwrap();
+        let stream = session.open_stream().unwrap();
+        session.send(stream, b"hello".to_vec()).unwrap();
+        assert_eq!(decode(&outbound(&mut session)).payload(), b"hello");
+
+        session
+            .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+            .unwrap();
+        assert_eq!(
+            session.poll_output(),
+            None,
+            "sending on a stream is traffic; keepalive waits another interval"
+        );
+    }
+
+    #[test]
+    fn next_deadline_is_the_keepalive_interval_after_the_first_poll() {
+        let mut session = YamuxSession::new(YamuxRole::Client);
+        assert_eq!(
+            session.next_deadline(),
+            None,
+            "no sample yet means no timeline to answer on"
+        );
+
+        session.poll(Now::from_millis(10)).unwrap();
+        assert_eq!(
+            session.next_deadline(),
+            Some(Deadline::from_millis(10 + KEEPALIVE_INTERVAL_MS))
+        );
+
+        session
+            .poll(Now::from_millis(10 + KEEPALIVE_INTERVAL_MS))
+            .unwrap();
+        let _ = outbound(&mut session);
+        assert_eq!(
+            session.next_deadline(),
+            Some(Deadline::from_millis(10 + KEEPALIVE_INTERVAL_MS * 2))
+        );
+    }
+
+    #[test]
+    fn a_closed_session_does_not_keepalive() {
+        let mut session = YamuxSession::new(YamuxRole::Client);
+        session.poll(Now::from_millis(0)).unwrap();
+        session.go_away(0);
+        let _ = outbound(&mut session);
+
+        assert_eq!(
+            session.poll(Now::from_millis(KEEPALIVE_INTERVAL_MS)),
+            Err(YamuxError::SessionClosed)
+        );
+        assert_eq!(session.poll_output(), None);
+        assert_eq!(session.next_deadline(), None);
     }
 
     #[test]

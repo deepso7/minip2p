@@ -44,6 +44,8 @@
 //! the peer stayed silent. Two limits bound the damage --
 //! [`TcpConfig::max_buffered_send`] on how much may queue, and
 //! [`TcpConfig::send_stall_timeout_ms`] on how long it may sit there.
+//! Established connections also fold in Yamux's 30 s keepalive deadline so a
+//! quiet TCP or relayed path stays up without an application ping.
 //!
 //! # Limits
 //!

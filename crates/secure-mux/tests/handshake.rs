@@ -6,8 +6,10 @@
 //! clock, or executor anywhere.
 
 use minip2p_identity::{Ed25519Keypair, PeerId};
+use minip2p_platform::{Deadline, Now};
 use minip2p_secure_mux::{
-    SecureMuxSession, SessionConfig, SessionError, SessionOutput, SessionRole, YamuxConfig,
+    KEEPALIVE_INTERVAL_MS, SecureMuxSession, SessionConfig, SessionError, SessionOutput,
+    SessionRole, YamuxConfig,
 };
 use minip2p_transport::StreamId;
 
@@ -533,4 +535,48 @@ fn a_session_that_fails_mid_batch_is_dead_and_stays_dead() {
     // on a half-torn-down session.
     assert!(dialer.handle_input(b"more".to_vec()).is_err());
     assert!(dialer.open_stream().is_err());
+}
+
+#[test]
+fn quiet_established_session_emits_a_keepalive_ping() {
+    let (mut dialer, mut listener, _, _) = upgraded_pair();
+
+    dialer.poll(Now::from_millis(0)).expect("stamp dialer");
+    listener.poll(Now::from_millis(0)).expect("stamp listener");
+    assert_eq!(
+        dialer.next_deadline(),
+        Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS))
+    );
+    assert!(take_writes(&mut dialer).is_empty(), "nothing is due at t=0");
+
+    dialer
+        .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+        .expect("keepalive is due");
+    let ping = take_writes(&mut dialer);
+    assert!(
+        !ping.is_empty(),
+        "a quiet session must emit ciphertext for the yamux ping"
+    );
+
+    listener
+        .handle_input(ping)
+        .expect("listener accepts the ping");
+    let pong = take_writes(&mut listener);
+    assert!(
+        !pong.is_empty(),
+        "the listener already answers pings; that write is the pong"
+    );
+
+    let events = {
+        dialer.handle_input(pong).expect("dialer accepts the pong");
+        let mut events = Vec::new();
+        while let Some(output) = dialer.poll_output() {
+            events.push(output);
+        }
+        events
+    };
+    assert!(
+        events.is_empty(),
+        "a keepalive pong is session traffic, not a substream event: {events:?}"
+    );
 }

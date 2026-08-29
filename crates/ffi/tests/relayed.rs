@@ -200,8 +200,9 @@ fn relayed_chat_and_reservation_loss() {
 
     drop(relay);
     // Stopping the relay cannot signal an immediate close over UDP. The
-    // endpoint detects the dead relay through QUIC's 30-second idle timeout.
-    // The wider bound covers the keepalive/idle phase and slower CI scheduling.
+    // endpoint detects the dead relay through QUIC's 30-second idle timeout
+    // once keepalive pings go unanswered. The wider bound covers that wait
+    // and slower CI scheduling.
     b_log.wait_for_with_timeout(RELAY_LOSS_TIMEOUT, |event| {
         matches!(
             event,

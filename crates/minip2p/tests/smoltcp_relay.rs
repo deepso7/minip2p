@@ -302,6 +302,16 @@ impl RelayService {
                     .send_stream(&self.a, self.a_bridge.unwrap(), data, now)
                     .unwrap();
             }
+            SwarmEvent::StreamClosed {
+                peer_id, stream_id, ..
+            } if (peer_id == self.a && Some(stream_id) == self.a_bridge)
+                || (peer_id == self.b && Some(stream_id) == self.b_stop) =>
+            {
+                self.bridged = false;
+                self.a_bridge = None;
+                self.b_stop = None;
+                self.pending = None;
+            }
             _ => {}
         }
     }
