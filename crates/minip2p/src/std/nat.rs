@@ -91,6 +91,17 @@ impl NatDriver {
             peer_id, conn_id, ..
         } = event
         {
+            let closed_bridges: Vec<_> = self
+                .promoted
+                .keys()
+                .filter(|(inner_conn, _)| inner_conn == conn_id)
+                .copied()
+                .collect();
+            for (inner_conn, stream_id) in closed_bridges {
+                swarm
+                    .transport_mut()
+                    .inject_bridge_closed(inner_conn, stream_id);
+            }
             self.promoted
                 .retain(|(inner_conn, _), circuit| inner_conn != conn_id && circuit != conn_id);
             if !swarm.connected_peers().contains(peer_id) {
@@ -984,6 +995,7 @@ mod tests {
         let inner_key = (inner_pair.inner_conn, inner_pair.stream);
         let (mut inner, action) = promotion_driver(&inner_pair, false);
         execute(&mut inner, action, &mut inner_pair.local);
+        let promoted = circuit_id(&inner, inner_key);
         inner.ingest(
             &SwarmEvent::ConnectionClosed {
                 peer_id: inner_pair.relay_addr.peer_id().clone(),
@@ -993,6 +1005,32 @@ mod tests {
             &mut inner_pair.local.swarm,
         );
         assert!(!inner.promoted.contains_key(&inner_key));
+        let events = inner_pair
+            .local
+            .swarm
+            .transport_mut()
+            .poll(minip2p_platform::Now::from_millis(0))
+            .expect("promoted circuit closure");
+        assert!(events.iter().any(
+            |event| matches!(event, minip2p_transport::TransportEvent::Closed { id } if *id == promoted)
+        ));
+        inner.ingest(
+            &SwarmEvent::ConnectionClosed {
+                peer_id: inner_pair.relay_addr.peer_id().clone(),
+                conn_id: inner_pair.inner_conn,
+                cause: minip2p_swarm::ConnectionCloseCause::Transport,
+            },
+            &mut inner_pair.local.swarm,
+        );
+        assert!(
+            inner_pair
+                .local
+                .swarm
+                .transport_mut()
+                .poll(minip2p_platform::Now::from_millis(0))
+                .expect("idempotent relay closure")
+                .is_empty()
+        );
 
         // A circuit lifecycle close also removes its reverse map entry.
         let mut circuit_pair = negotiated_bridge();

@@ -114,6 +114,21 @@ impl PortableNatDriver {
         } = event
         {
             #[cfg(feature = "portable-relay")]
+            {
+                let closed_bridges: Vec<_> = self
+                    .promoted
+                    .keys()
+                    .filter(|(inner_conn, _)| inner_conn == conn_id)
+                    .copied()
+                    .collect();
+                for (inner_conn, stream_id) in closed_bridges {
+                    endpoint
+                        .runtime_mut()
+                        .transport_mut()
+                        .inject_bridge_closed(inner_conn, stream_id);
+                }
+            }
+            #[cfg(feature = "portable-relay")]
             self.promoted
                 .retain(|(inner_conn, _), circuit| inner_conn != conn_id && circuit != conn_id);
             #[cfg(not(feature = "portable-relay"))]
