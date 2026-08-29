@@ -1365,15 +1365,13 @@ export class Minip2pBase {
         this.#streams.delete(key);
       }
     }
-    if (!this.#backend.connectedPeers().includes(peerId)) {
-      for (const pending of [...this.#pendingOpens.values()]) {
-        if (pending.peerId === peerId) {
-          this.#pendingOpens.delete(
-            pendingOpenKey(pending.peerId, pending.connId, pending.streamId)
-          );
-          clearPendingOpen(pending);
-          pending.reject(new PeerDisconnectedError(peerId, "openStream"));
-        }
+    for (const pending of [...this.#pendingOpens.values()]) {
+      if (pending.peerId === peerId && pending.connId === connId) {
+        this.#pendingOpens.delete(
+          pendingOpenKey(pending.peerId, pending.connId, pending.streamId)
+        );
+        clearPendingOpen(pending);
+        pending.reject(new PeerDisconnectedError(peerId, "openStream"));
       }
     }
   }

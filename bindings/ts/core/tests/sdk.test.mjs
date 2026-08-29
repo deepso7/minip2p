@@ -558,6 +558,24 @@ test("stream async iteration rejects when the remote stream resets", async () =>
   endpoint.close();
 });
 
+test("pending stream read rejects when its connection closes", async () => {
+  const backend = new MockBackend();
+  backend.connected = ["peer"];
+  const endpoint = new TestMinip2p(backend);
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+  const stream = await opening;
+  const reading = stream.read();
+
+  backend.emit({
+    inner: { connId: 2, peerId: "peer" },
+    tag: P2pEvent_Tags.ConnectionClosed,
+  });
+
+  await assert.rejects(reading, PeerDisconnectedError);
+  endpoint.close();
+});
+
 test("stream async iteration remembers a reset while the loop body runs", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
@@ -823,12 +841,40 @@ test("openStream rejects close and disconnect before ready", async () => {
   const disconnected = endpoint.openStream("peer", "/test/1", {
     timeoutMs: 1000,
   });
-  backend.connected = [];
   backend.emit({
     inner: { connId: 2, peerId: "peer" },
     tag: P2pEvent_Tags.ConnectionClosed,
   });
   await assert.rejects(disconnected, PeerDisconnectedError);
+  endpoint.close();
+});
+
+test("connection close rejects only opens on that connection", async () => {
+  const backend = new MockBackend();
+  backend.connected = ["peer"];
+  backend.openResults.push(
+    { connId: 2, streamId: 7 },
+    { connId: 3, streamId: 8 }
+  );
+  const endpoint = new TestMinip2p(backend);
+  const closed = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  const live = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+
+  backend.emit({
+    inner: { connId: 2, peerId: "peer" },
+    tag: P2pEvent_Tags.ConnectionClosed,
+  });
+
+  await assert.rejects(closed, PeerDisconnectedError);
+  assert.equal(await remainsPending(live), true);
+  backend.emit(
+    streamReady({
+      connId: 3,
+      initiatedLocally: true,
+      streamId: 8,
+    })
+  );
+  assert.equal((await live).connId, 3);
   endpoint.close();
 });
 
