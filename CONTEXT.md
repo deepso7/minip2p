@@ -36,3 +36,20 @@ _Avoid_: Node SDK, React Native SDK (they are the same SDK on different runtimes
 
 **Runtime**:
 The host a TypeScript SDK app runs on — Node.js or React Native. Runtimes differ in setup and a short list of one-sided extras; the API is otherwise shared. Distinct from the binding shell that serves it.
+
+### NAT traversal
+
+**Circuit**:
+The hop/stop bridged byte pipe through a Circuit Relay v2 hop, before Noise and Yamux have turned it into a Relayed path.
+_Avoid_: connection (until that upgrade finishes)
+
+**Relayed path**:
+A swarm connection whose transport is a circuit. Identify, ping, and application streams use it like any other connection.
+_Avoid_: fallback connection
+
+**DCUtR**:
+The `/libp2p/dcutr` protocol that coordinates a hole punch over an existing Relayed path. It is an upgrade, not the circuit handshake.
+_Avoid_: using DCUtR as the Noise barrier
+
+**force_relay**:
+Keep the selected path Relayed: no direct candidate dials and no hole punch. The circuit upgrade is the same as without the flag.
