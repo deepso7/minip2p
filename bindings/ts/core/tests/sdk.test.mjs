@@ -849,6 +849,35 @@ test("openStream rejects close and disconnect before ready", async () => {
   endpoint.close();
 });
 
+test("connection close rejects only opens on that connection", async () => {
+  const backend = new MockBackend();
+  backend.connected = ["peer"];
+  backend.openResults.push(
+    { connId: 2, streamId: 7 },
+    { connId: 3, streamId: 8 }
+  );
+  const endpoint = new TestMinip2p(backend);
+  const closed = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  const live = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+
+  backend.emit({
+    inner: { connId: 2, peerId: "peer" },
+    tag: P2pEvent_Tags.ConnectionClosed,
+  });
+
+  await assert.rejects(closed, PeerDisconnectedError);
+  assert.equal(await remainsPending(live), true);
+  backend.emit(
+    streamReady({
+      connId: 3,
+      initiatedLocally: true,
+      streamId: 8,
+    })
+  );
+  assert.equal((await live).connId, 3);
+  endpoint.close();
+});
+
 test("waitPeerReady ignores a superseded connection but rejects final disconnect", async () => {
   const backend = new MockBackend();
   backend.connected = ["peer"];

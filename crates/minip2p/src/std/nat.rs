@@ -1014,23 +1014,6 @@ mod tests {
         assert!(events.iter().any(
             |event| matches!(event, minip2p_transport::TransportEvent::Closed { id } if *id == promoted)
         ));
-        inner.ingest(
-            &SwarmEvent::ConnectionClosed {
-                peer_id: inner_pair.relay_addr.peer_id().clone(),
-                conn_id: inner_pair.inner_conn,
-                cause: minip2p_swarm::ConnectionCloseCause::Transport,
-            },
-            &mut inner_pair.local.swarm,
-        );
-        assert!(
-            inner_pair
-                .local
-                .swarm
-                .transport_mut()
-                .poll(minip2p_platform::Now::from_millis(0))
-                .expect("idempotent relay closure")
-                .is_empty()
-        );
 
         // A circuit lifecycle close also removes its reverse map entry.
         let mut circuit_pair = negotiated_bridge();

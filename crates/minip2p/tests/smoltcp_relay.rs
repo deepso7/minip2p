@@ -346,6 +346,8 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
     let mut b_events = Vec::new();
     let mut app_stream = None;
     let mut sent = false;
+    let mut relay_cut = false;
+    let mut polls_after_circuit_close = 0;
     for _ in 0..MAX_STEPS {
         let now = Now::from_millis(now_ms);
         a_events.extend(a.poll(now).unwrap());
@@ -387,20 +389,38 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
                 .unwrap();
             sent = true;
         }
-        if app_stream.is_some_and(|stream| {
+        let received = app_stream.is_some_and(|stream| {
             b_events.iter().any(|event| {
                 matches!(event, SmoltcpEvent::Endpoint(SwarmEvent::StreamData {
                     peer_id, stream_id, data, ..
                 }) if peer_id == &a_peer && *stream_id == stream && data == PAYLOAD)
             })
-        }) {
+        });
+        if received && !relay_cut {
             assert!(
                 matches!(a.path(&b_peer), Some(Path::Relayed { relay }) if relay == relay_peer)
             );
             assert!(
                 matches!(b.path(&a_peer), Some(Path::Relayed { relay }) if relay == relay_peer)
             );
-            return;
+            a.disconnect(&relay_peer, now).unwrap();
+            relay_cut = true;
+        }
+
+        let circuit_closes = a_events
+            .iter()
+            .filter(|event| {
+                matches!(event, SmoltcpEvent::Endpoint(SwarmEvent::ConnectionClosed {
+                    peer_id, conn_id, ..
+                }) if peer_id == &b_peer && conn_id.is_circuit())
+            })
+            .count();
+        if circuit_closes > 0 {
+            assert_eq!(circuit_closes, 1, "circuit closes exactly once");
+            polls_after_circuit_close += 1;
+            if polls_after_circuit_close == 100 {
+                return;
+            }
         }
 
         if bus.is_quiet() {
@@ -416,7 +436,9 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
             now_ms = now_ms.max(deadline.as_millis());
         }
     }
-    panic!("relay circuit did not carry application data\n  a: {a_events:?}\n  b: {b_events:?}");
+    panic!(
+        "relay circuit did not close after its relay link\n  a: {a_events:?}\n  b: {b_events:?}"
+    );
 }
 
 #[test]
