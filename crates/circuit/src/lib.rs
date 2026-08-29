@@ -852,7 +852,18 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         }
         let mut deadline = self.inner.next_deadline();
         for circuit in self.circuits.values() {
-            deadline = Deadline::earliest_opt(deadline, circuit.session.next_deadline());
+            let session_deadline = circuit.session.next_deadline().or_else(|| {
+                // An externally injected bridge read can complete the upgrade
+                // while `Connected` is pending. The pending-event fast path
+                // then returns before `session.poll` gets a time sample, so
+                // keepalive is not armed yet. Wake once more immediately to
+                // stamp the newly established Yamux session.
+                circuit
+                    .session
+                    .is_established()
+                    .then_some(Deadline::IMMEDIATE)
+            });
+            deadline = Deadline::earliest_opt(deadline, session_deadline);
         }
         deadline
     }
@@ -952,6 +963,7 @@ mod tests {
         inner: T,
         fail_close_write: bool,
         fail_send: bool,
+        send_calls: usize,
         close_write_calls: usize,
         reset_calls: usize,
     }
@@ -1059,6 +1071,7 @@ mod tests {
                 inner,
                 fail_close_write: false,
                 fail_send: false,
+                send_calls: 0,
                 close_write_calls: 0,
                 reset_calls: 0,
             }
@@ -1087,6 +1100,7 @@ mod tests {
             stream_id: StreamId,
             data: Vec<u8>,
         ) -> Result<(), TransportError> {
+            self.send_calls += 1;
             if self.fail_send {
                 return Err(TransportError::StreamSendFailed {
                     id,
@@ -1342,15 +1356,21 @@ mod tests {
 
     #[test]
     fn a_quiet_circuit_keeps_alive_without_opening_a_stream() {
-        let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) = setup_pair();
+        let (mut a, mut b, circuit_id, bridge, a_peer, b_peer) = setup_close_observed_pair();
         complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
+        let inner_conn = a
+            .circuits
+            .get(&circuit_id)
+            .expect("initiator circuit")
+            .inner_conn;
 
-        let _ = a.poll(Now::from_millis(0)).expect("stamp initiator");
-        let _ = b.poll(Now::from_millis(0)).expect("stamp responder");
         assert_eq!(
             a.next_deadline(),
-            Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS))
+            Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS)),
+            "Connected must arm keepalive without another poll"
         );
+
+        let a_sends = a.inner().send_calls;
 
         let ping = a
             .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
@@ -1360,15 +1380,41 @@ mod tests {
                 .all(|event| !matches!(event, TransportEvent::StreamData { .. })),
             "a yamux ping is not stream data: {ping:?}"
         );
-
-        let pong = b
-            .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
-            .expect("responder answers");
-        assert!(
-            pong.iter()
-                .all(|event| !matches!(event, TransportEvent::StreamData { .. })),
-            "answering a yamux ping must not surface as stream data: {pong:?}"
+        assert_eq!(
+            a.inner().send_calls,
+            a_sends + 1,
+            "the keepalive deadline must write a Yamux ping to the bridge"
         );
+
+        let ping_wire = b
+            .inner_mut()
+            .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+            .expect("read ping from bridge");
+        let ping_bytes = ping_wire
+            .into_iter()
+            .find_map(|event| match event {
+                TransportEvent::StreamData {
+                    stream_id, data, ..
+                } if stream_id == bridge => Some(data),
+                _ => None,
+            })
+            .expect("Yamux ping bytes crossed the bridge");
+        b.inject_bridge_data(inner_conn, bridge, ping_bytes);
+
+        let pong_wire = a
+            .inner_mut()
+            .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+            .expect("read pong from bridge");
+        let pong_bytes = pong_wire
+            .into_iter()
+            .find_map(|event| match event {
+                TransportEvent::StreamData {
+                    stream_id, data, ..
+                } if stream_id == bridge => Some(data),
+                _ => None,
+            })
+            .expect("Yamux pong bytes crossed the bridge");
+        a.inject_bridge_data(inner_conn, bridge, pong_bytes);
 
         let ack = a
             .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
@@ -1880,6 +1926,11 @@ mod tests {
             .expect("initiator circuit")
             .inner_conn;
         a.inject_bridge_data(inner_conn, bridge, coalesced);
+        assert_eq!(
+            a.next_deadline(),
+            Some(Deadline::IMMEDIATE),
+            "an injected handshake completion must schedule keepalive arming"
+        );
 
         let events = a
             .poll(Now::from_millis(0))
@@ -1892,6 +1943,20 @@ mod tests {
             TransportEvent::IncomingStream { id, stream_id }
                 if *id == circuit_id && *stream_id == opened
         )));
+        assert_eq!(
+            a.next_deadline(),
+            Some(Deadline::IMMEDIATE),
+            "draining pending events must leave an immediate wakeup"
+        );
+        assert!(
+            a.poll(Now::from_millis(0))
+                .expect("arm keepalive")
+                .is_empty()
+        );
+        assert_eq!(
+            a.next_deadline(),
+            Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS))
+        );
     }
 
     fn assert_pre_ready_bridge_failure(events: &[TransportEvent], circuit_id: ConnectionId) {

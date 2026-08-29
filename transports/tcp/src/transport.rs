@@ -728,18 +728,6 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
             }
         }
 
-        // Yamux keepalive: only when the socket can take the ping. A stalled
-        // backlog would just queue another frame behind bytes that are not
-        // moving.
-        for id in self.connections.keys().copied().collect::<Vec<_>>() {
-            let should_keepalive = self.connections.get(&id).is_some_and(|connection| {
-                connection.session.is_established() && connection.outbound.is_empty()
-            });
-            if should_keepalive {
-                self.drive_connection(id, |session| session.poll(now));
-            }
-        }
-
         // Retry buffered writes even without a `Writable` event, so a provider
         // that only reports readiness coarsely still drains.
         let timeout = self.config.send_stall_timeout_ms;
@@ -784,6 +772,18 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
                     format!("socket accepted nothing for {stalled_for}ms; peer is not reading"),
                     true,
                 );
+            }
+        }
+
+        // Yamux keepalive: only when the socket can take the ping. Run this
+        // after retrying writes so an established session whose final upgrade
+        // bytes drained above gets its first keepalive deadline in this poll.
+        for id in self.connections.keys().copied().collect::<Vec<_>>() {
+            let should_keepalive = self.connections.get(&id).is_some_and(|connection| {
+                connection.session.is_established() && connection.outbound.is_empty()
+            });
+            if should_keepalive {
+                self.drive_connection(id, |session| session.poll(now));
             }
         }
         Ok(self.drain_pending_events())

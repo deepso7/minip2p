@@ -1205,6 +1205,10 @@ fn a_quiet_connection_keeps_alive_without_opening_a_stream() {
         dialer_events.is_empty(),
         "a yamux ping is not a transport event: {dialer_events:?}"
     );
+    assert!(
+        pair.dialer.provider().bytes_in_flight_to_peer() > 0,
+        "the keepalive deadline must write a Yamux ping to the socket"
+    );
 
     let listener_events = pair
         .listener
@@ -1228,4 +1232,59 @@ fn a_quiet_connection_keeps_alive_without_opening_a_stream() {
         1,
         "keepalive must not tear the connection down"
     );
+}
+
+#[test]
+fn completing_an_upgrade_arms_the_keepalive_deadline() {
+    let net = VirtualNetwork::new();
+    let listener_key = identity(2);
+    let listener_peer = listener_key.peer_id();
+    let mut dialer = node(&net, identity(1), 10);
+    let mut listener = node(&net, listener_key, 20);
+    dialer.provider_mut().suppress_writable();
+    listener.listen(&addr(LISTEN_ADDR)).expect("listener binds");
+    let target = PeerAddr::new(addr(LISTEN_ADDR), listener_peer).expect("dial target");
+    dialer.dial(&target).expect("dial starts");
+
+    for _ in 0..128 {
+        dialer.provider_mut().set_in_flight_capacity(Some(0));
+        let dialer_events = dialer.poll(Now::from_millis(0)).expect("drive dialer");
+        if dialer_events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Connected { .. }))
+        {
+            dialer.provider_mut().set_in_flight_capacity(None);
+            dialer
+                .poll(Now::from_millis(0))
+                .expect("drain the final upgrade bytes");
+            assert_eq!(
+                dialer.next_deadline(),
+                Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS)),
+                "the poll that completes and flushes the upgrade must arm keepalive"
+            );
+            return;
+        }
+        dialer.provider_mut().set_in_flight_capacity(None);
+        dialer.poll(Now::from_millis(0)).expect("flush dialer");
+        listener.provider_mut().set_in_flight_capacity(Some(0));
+        let listener_events = listener.poll(Now::from_millis(0)).expect("drive listener");
+        if listener_events
+            .iter()
+            .any(|event| matches!(event, TransportEvent::Connected { .. }))
+        {
+            listener.provider_mut().set_in_flight_capacity(None);
+            listener
+                .poll(Now::from_millis(0))
+                .expect("drain the final upgrade bytes");
+            assert_eq!(
+                listener.next_deadline(),
+                Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS)),
+                "the poll that completes and flushes the upgrade must arm keepalive"
+            );
+            return;
+        }
+        listener.provider_mut().set_in_flight_capacity(None);
+        listener.poll(Now::from_millis(0)).expect("flush listener");
+    }
+    panic!("the upgrade did not complete");
 }

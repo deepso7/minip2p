@@ -77,10 +77,10 @@ minip2p, go-libp2p gossipsub, and signed rust-libp2p gossipsub currently emit
 8-byte big-endian counters, while this implementation accepts any 1..=64-byte
 value.
 
-A quiet room generates no traffic, and the QUIC transport drops
-connections after 30 s of silence — the chat loop pings every connected
-peer on a 10 s cadence to keep the room (and any relay reservation
-connection) alive through idle spells.
+A quiet room generates no application traffic. QUIC sends an ack-eliciting
+keepalive halfway through its idle timeout, while TCP and relay circuits use
+Yamux pings. The chat loop does not open ping-protocol streams just to keep
+connections alive.
 
 ## Live-test recipes
 
