@@ -281,18 +281,6 @@ pub fn promoted_pending_data(actions: &[NatAction]) -> &[u8] {
         .expect("expected PromoteBridge action")
 }
 
-pub fn promotion_remote_write_closed(actions: &[NatAction]) -> bool {
-    actions.iter().any(|action| {
-        matches!(
-            action,
-            NatAction::PromoteBridge {
-                remote_write_closed: true,
-                ..
-            }
-        )
-    })
-}
-
 pub fn complete_promotion(
     agent: &mut NatAgent,
     target: &PeerId,

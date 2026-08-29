@@ -1,22 +1,21 @@
-//! Responder-side hole punching: a NAT'd listener holding a relay
-//! reservation accepts inbound STOP circuits, answers the initiator's DCUtR
-//! exchange, and blasts random UDP datagrams at the initiator's observed
-//! addresses to open its own NAT mapping. Only the initiator dials (DCUtR
-//! for QUIC): the blasts make that dial land.
+//! Inbound circuit and hole-punch coordination for a listener holding a
+//! relay reservation. The STOP bridge is promoted first. Once the Relayed
+//! path is usable, this reserved peer opens `/libp2p/dcutr` and sends CONNECT
+//! and SYNC. The original circuit dialer performs the QUIC dial while this
+//! peer sends random UDP to open its NAT mapping.
 //!
 //! ```text
 //! relay opens STOP stream ──▶ CONNECT ──▶ auto-Accept (STATUS:OK)
-//!   ──▶ DCUtR CONNECT arrives ──▶ reply with our observed addresses
-//!   ──▶ SYNC arrives ──▶ schedule UDP blasts,
-//!       promote the bridge into a circuit connection
-//!   ──▶ circuit Connected ──▶ InboundPathEstablished(Relayed)
-//! initiator's dial lands ──▶ cancel blasts, InboundDirectUpgrade
+//!   ──▶ promote bridge ──▶ circuit Connected
+//!   ──▶ InboundPathEstablished(Relayed)
+//!   ──▶ open DCUtR ──▶ send CONNECT, then SYNC
+//! circuit dialer's punch lands ──▶ InboundDirectUpgrade
 //! ```
 
 use alloc::vec::Vec;
 
 use minip2p_core::{Multiaddr, PeerId, Protocol, SansIoProtocol, select_direct_addrs};
-use minip2p_dcutr::{DcutrResponder, DcutrResponderInput, DcutrResponderOutput, ResponderEvent};
+use minip2p_dcutr::{DcutrInitiator, DcutrInitiatorInput, DcutrInitiatorOutput, InitiatorOutcome};
 use minip2p_relay::{Status, StopResponder, StopResponderInput, StopResponderOutput};
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -43,16 +42,14 @@ pub(crate) struct InboundCircuit {
     /// The initiating peer, once the STOP CONNECT names it.
     source: Option<PeerId>,
     stop: Option<StopResponder>,
-    dcutr: Option<DcutrResponder>,
+    dcutr: Option<DcutrInitiator>,
+    dcutr_stream: Option<StreamId>,
+    dcutr_deadline: Option<u64>,
     remote_addrs: Vec<Multiaddr>,
-    /// Application bytes received after the final DCUtR SYNC frame in the
-    /// same stream read. These must accompany circuit promotion.
+    /// Secure-mux bytes coalesced behind the STOP success response. These
+    /// must accompany circuit promotion.
     pending_data: Vec<u8>,
-    /// The remote write half reached EOF while the control plane still owned
-    /// the bridge. The transport will not repeat that event after handoff.
-    remote_write_closed: bool,
-    /// Deadline for the STOP + DCUtR exchange to finish; after it the
-    /// bridge is released to the app punch-less rather than abandoned.
+    /// Deadline for STOP acceptance and handing the bridge to circuit promotion.
     exchange_deadline: u64,
     blast: Option<BlastSchedule>,
     /// Keep the circuit alive for upgrade detection until this instant
@@ -85,9 +82,10 @@ impl InboundCircuit {
             source: None,
             stop: Some(StopResponder::new()),
             dcutr: None,
+            dcutr_stream: None,
+            dcutr_deadline: None,
             remote_addrs: Vec::new(),
             pending_data: Vec::new(),
-            remote_write_closed: false,
             exchange_deadline: now.mono_ms + shared.config.relay_leg_deadline_ms,
             blast: None,
             linger_until: None,
@@ -121,6 +119,9 @@ impl InboundCircuit {
         if let Some(handshake) = self.handshake_deadline {
             due = Some(due.map_or(handshake, |d| d.min(handshake)));
         }
+        if let Some(deadline) = self.dcutr_deadline {
+            due = Some(due.map_or(deadline, |d| d.min(deadline)));
+        }
         due
     }
 
@@ -130,7 +131,6 @@ impl InboundCircuit {
         stream: StreamId,
         input: StreamInput<'_>,
         shared: &mut Shared,
-        now: Now,
     ) {
         if self.done || conn_id != self.inner_conn || stream != self.stream {
             return;
@@ -138,20 +138,15 @@ impl InboundCircuit {
         match input {
             StreamInput::Data(data) => {
                 if self.source.is_none() {
-                    self.on_stop_data(data, shared, now);
-                } else {
-                    self.on_bridge_data(data, shared, now);
+                    self.on_stop_data(data, shared);
                 }
             }
             StreamInput::RemoteWriteClosed => {
-                self.remote_write_closed = true;
                 // A peer can stop sending while the local write half remains
                 // usable. Let the protocol parser consume that boundary and
                 // retain the circuit until its normal exchange deadline.
                 if self.source.is_none() {
-                    self.on_stop_input(StopResponderInput::RemoteWriteClosed, shared, now);
-                } else {
-                    self.on_dcutr_input(DcutrResponderInput::RemoteWriteClosed, shared, now);
+                    self.on_stop_input(StopResponderInput::RemoteWriteClosed, shared);
                 }
             }
             StreamInput::Closed => {
@@ -163,12 +158,12 @@ impl InboundCircuit {
     }
 
     /// Feeds bytes into the STOP responder until the CONNECT request is
-    /// decoded, then auto-accepts and starts the DCUtR responder.
-    fn on_stop_data(&mut self, data: &[u8], shared: &mut Shared, now: Now) {
-        self.on_stop_input(StopResponderInput::Data(data.to_vec()), shared, now);
+    /// decoded, then auto-accepts and hands the bridge to circuit promotion.
+    fn on_stop_data(&mut self, data: &[u8], shared: &mut Shared) {
+        self.on_stop_input(StopResponderInput::Data(data.to_vec()), shared);
     }
 
-    fn on_stop_input(&mut self, input: StopResponderInput, shared: &mut Shared, now: Now) {
+    fn on_stop_input(&mut self, input: StopResponderInput, shared: &mut Shared) {
         let Some(stop) = self.stop.as_mut() else {
             return;
         };
@@ -213,9 +208,8 @@ impl InboundCircuit {
         }
         self.source = Some(source);
 
-        // STATUS:OK first, then any bytes the relay pipelined behind the
-        // CONNECT — those already belong to the DCUtR exchange and must
-        // reach the machine inside this same cascade.
+        // STATUS:OK first, then preserve any secure-mux bytes the relay
+        // pipelined behind CONNECT for circuit promotion.
         let mut outbound = Vec::new();
         let mut pipelined = Vec::new();
         while let Some(output) = stop.poll_output() {
@@ -234,97 +228,9 @@ impl InboundCircuit {
             });
         }
 
-        if shared.config.force_relay {
-            // STOP yields the CONNECT request before the bytes trailing its
-            // frame. In force-relay mode there is no DCUtR machine to consume
-            // that remainder: it is already circuit transport data and must
-            // cross the ownership boundary with the promoted bridge.
-            self.pending_data = pipelined;
-            self.promote(shared);
-            return;
-        }
-        self.dcutr = Some(DcutrResponder::new(&shared.punch_candidates()));
-        if !pipelined.is_empty() {
-            self.on_bridge_data(&pipelined, shared, now);
-        }
-    }
-
-    /// Feeds bridge bytes into the DCUtR responder.
-    fn on_bridge_data(&mut self, data: &[u8], shared: &mut Shared, now: Now) {
-        self.on_dcutr_input(DcutrResponderInput::Data(data.to_vec()), shared, now);
-    }
-
-    fn on_dcutr_input(&mut self, input: DcutrResponderInput, shared: &mut Shared, now: Now) {
-        let Some(dcutr) = self.dcutr.as_mut() else {
-            return;
-        };
-        if dcutr.handle_input(input).is_err() {
-            // The punch cannot proceed (malformed exchange or our own
-            // oversized reply), but the bridge itself is fine: hand it to
-            // the app without punching.
-            self.dcutr = None;
-            self.promote(shared);
-            return;
-        }
-        let mut outputs = Vec::new();
-        while let Some(output) = dcutr.poll_output() {
-            outputs.push(output);
-        }
-        let mut sync_received = false;
-        for output in outputs {
-            match output {
-                DcutrResponderOutput::Outbound(bytes) => {
-                    shared.push_action(NatAction::SendStream {
-                        peer: self.relay.clone(),
-                        stream_id: self.stream,
-                        data: bytes,
-                    });
-                }
-                DcutrResponderOutput::Event(ResponderEvent::ConnectReceived {
-                    remote_addrs,
-                    ..
-                }) => {
-                    self.remote_addrs = select_global_punch_candidates(&remote_addrs);
-                }
-                DcutrResponderOutput::Event(ResponderEvent::SyncReceived) => {
-                    sync_received = true;
-                }
-            }
-        }
-        if sync_received {
-            self.pending_data = dcutr.take_trailing_data().unwrap_or_default();
-            self.on_sync(shared, now);
-        }
-    }
-
-    /// SYNC arrived: open our NAT mapping with random-UDP blasts and hand
-    /// the bridge to the application.
-    ///
-    /// Per the DCUtR spec for QUIC, only the initiator dials. A responder
-    /// dial would race the initiator's — when both land (guaranteed
-    /// without NATs, common with cone NATs) the second connection
-    /// supersedes the first and the supersede scrubs every stream the
-    /// application just opened on the announced path.
-    fn on_sync(&mut self, shared: &mut Shared, now: Now) {
-        self.dcutr = None;
-        if self.source.is_none() {
-            return;
-        }
-
-        if !self.remote_addrs.is_empty() {
-            self.blast = Some(BlastSchedule {
-                addrs: self.remote_addrs.clone(),
-                // The spec says wait ~RTT/2 after SYNC; without a measured
-                // RTT this configured floor stands in for it.
-                next_at: now.mono_ms + shared.config.responder_sync_delay_ms,
-                until: now.mono_ms + shared.config.punch_deadline_ms,
-            });
-        }
-        // Stay alive for upgrade detection across the initiator's full
-        // retry window.
-        let window =
-            shared.config.punch_deadline_ms * (1 + u64::from(shared.config.punch_max_retries));
-        self.linger_until = Some(now.mono_ms + window);
+        // Bytes behind STOP STATUS belong to the circuit's secure-mux
+        // handshake. DCUtR is opened later on the promoted connection.
+        self.pending_data = pipelined;
         self.promote(shared);
     }
 
@@ -345,7 +251,9 @@ impl InboundCircuit {
                 remote_peer: source.clone(),
                 role: BridgeRole::Responder,
                 pending_data: core::mem::take(&mut self.pending_data),
-                remote_write_closed: self.remote_write_closed,
+                // CONNECT completion promotes in the same input cascade, so
+                // no later half-close can arrive while NAT owns the bridge.
+                remote_write_closed: false,
             });
         }
     }
@@ -356,9 +264,8 @@ impl InboundCircuit {
         }
         if !self.released && now.mono_ms >= self.exchange_deadline {
             if self.source.is_some() {
-                // The punch exchange stalled, but the accepted bridge is
-                // perfectly usable: give it to the app without punching.
-                self.dcutr = None;
+                // STOP completed but promotion did not run. Preserve the
+                // accepted bridge rather than abandoning it.
                 self.promote(shared);
             } else {
                 // The relay never even sent CONNECT.
@@ -408,6 +315,12 @@ impl InboundCircuit {
             }
             self.done = true;
         }
+        if let Some(deadline) = self.dcutr_deadline
+            && now.mono_ms >= deadline
+        {
+            self.finish_dcutr(shared);
+            self.done = true;
+        }
     }
 
     pub(crate) fn on_connection_established(
@@ -433,12 +346,24 @@ impl InboundCircuit {
                             relay: self.relay.clone(),
                         },
                     });
+                    if !shared.config.force_relay {
+                        let token = shared
+                            .alloc_token(TokenPurpose::OpenDcutrInbound(self.id, peer.clone()));
+                        shared.push_action(NatAction::OpenStream {
+                            token,
+                            peer: peer.clone(),
+                            protocol_id: minip2p_dcutr::DCUTR_PROTOCOL_ID.into(),
+                        });
+                    }
                 }
                 if directly_connected {
                     self.blast = None;
                     self.linger_until = None;
                     self.done = true;
-                } else if self.blast.is_none() && self.linger_until.is_none() {
+                } else if shared.config.force_relay
+                    && self.blast.is_none()
+                    && self.linger_until.is_none()
+                {
                     self.done = true;
                 }
             }
@@ -506,6 +431,133 @@ impl InboundCircuit {
             }
             Err(_) => self.done = true,
         }
+    }
+
+    pub(crate) fn on_dcutr_open_result(
+        &mut self,
+        peer: &PeerId,
+        result: Result<StreamId, alloc::string::String>,
+        shared: &mut Shared,
+        now: Now,
+    ) {
+        match result {
+            Ok(stream) => {
+                self.dcutr_stream = Some(stream);
+                self.dcutr = Some(DcutrInitiator::new(&shared.punch_candidates()));
+                self.dcutr_deadline = Some(now.mono_ms + shared.config.relay_leg_deadline_ms);
+                shared.own_stream(
+                    peer,
+                    stream,
+                    crate::agent::StreamRole::DcutrInbound(self.id),
+                );
+            }
+            Err(_) => {
+                self.linger_until = None;
+                self.done = true;
+            }
+        }
+    }
+
+    pub(crate) fn on_dcutr_stream_input(
+        &mut self,
+        stream: StreamId,
+        input: StreamInput<'_>,
+        shared: &mut Shared,
+        now: Now,
+    ) {
+        if self.dcutr_stream != Some(stream) {
+            return;
+        }
+        let Some(dcutr) = self.dcutr.as_mut() else {
+            return;
+        };
+        let remote_closed = matches!(&input, StreamInput::RemoteWriteClosed | StreamInput::Closed);
+        let machine_input = match input {
+            StreamInput::Ready => DcutrInitiatorInput::Flush,
+            StreamInput::Data(bytes) => DcutrInitiatorInput::Data {
+                bytes: bytes.to_vec(),
+                rtt_ms: 0,
+            },
+            StreamInput::RemoteWriteClosed | StreamInput::Closed => {
+                DcutrInitiatorInput::RemoteWriteClosed
+            }
+        };
+        if dcutr.handle_input(machine_input).is_err() {
+            self.finish_dcutr(shared);
+            self.done = true;
+            return;
+        }
+        let mut outputs = Vec::new();
+        while let Some(output) = dcutr.poll_output() {
+            outputs.push(output);
+        }
+        let mut completed = false;
+        for output in outputs {
+            match output {
+                DcutrInitiatorOutput::Outbound(data) => {
+                    if let Some(peer) = self.source.as_ref() {
+                        shared.push_action(NatAction::SendStream {
+                            peer: peer.clone(),
+                            stream_id: stream,
+                            data,
+                        });
+                    }
+                }
+                DcutrInitiatorOutput::Outcome(InitiatorOutcome::DialNow {
+                    remote_addrs, ..
+                }) => {
+                    self.remote_addrs = select_global_punch_candidates(&remote_addrs);
+                    if dcutr.handle_input(DcutrInitiatorInput::SendSync).is_ok() {
+                        while let Some(DcutrInitiatorOutput::Outbound(data)) = dcutr.poll_output() {
+                            if let Some(peer) = self.source.as_ref() {
+                                shared.push_action(NatAction::SendStream {
+                                    peer: peer.clone(),
+                                    stream_id: stream,
+                                    data,
+                                });
+                            }
+                        }
+                    }
+                    completed = true;
+                    if !self.remote_addrs.is_empty() {
+                        self.blast = Some(BlastSchedule {
+                            addrs: self.remote_addrs.clone(),
+                            next_at: now.mono_ms + shared.config.responder_sync_delay_ms,
+                            until: now.mono_ms + shared.config.punch_deadline_ms,
+                        });
+                    }
+                    self.linger_until = Some(
+                        now.mono_ms
+                            + shared.config.punch_deadline_ms
+                                * (1 + u64::from(shared.config.punch_max_retries)),
+                    );
+                }
+            }
+        }
+        if remote_closed && !completed {
+            self.finish_dcutr(shared);
+            self.done = true;
+            return;
+        }
+        if completed {
+            self.finish_dcutr(shared);
+        }
+    }
+
+    fn finish_dcutr(&mut self, shared: &mut Shared) {
+        self.dcutr = None;
+        self.dcutr_deadline = None;
+        let Some(stream_id) = self.dcutr_stream.take() else {
+            return;
+        };
+        let Some(peer) = self.source.as_ref() else {
+            return;
+        };
+        shared.push_action(NatAction::ResetStream {
+            peer: peer.clone(),
+            stream_id,
+        });
+        shared.release_stream(peer, stream_id);
     }
 }
 

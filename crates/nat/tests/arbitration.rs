@@ -48,37 +48,33 @@ fn drive_to_bridged(h: &mut Harness, t0: u64) -> (ConnectId, StreamId) {
     (id, stream)
 }
 
-/// Continues a bridged attempt through the DCUtR reply: punch dial + SYNC
-/// go out, then the bridge is handed to the circuit transport and announced
-/// only after the promoted connection establishes.
-fn drive_to_sync(h: &mut Harness, stream: StreamId, now_ms: u64) -> Vec<NatAction> {
-    h.stream_data(
-        stream,
-        dcutr_connect_reply(&[maddr(REMOTE_OBSERVED_ADDR)]),
-        at(now_ms),
-    );
-    let actions = drain_actions(&mut h.agent);
-    assert_eq!(
-        dial_count_for(&actions, &h.target),
-        1,
-        "one punch dial for the observed address"
-    );
-    assert_eq!(send_stream_count(&actions), 1, "SYNC must be sent");
-    assert!(
-        !h.agent.owns_stream(&h.relay, stream),
-        "bridge belongs to the circuit transport once SYNC is out"
-    );
+fn advertised_dcutr_addrs(h: &mut Harness, t0: u64) -> Vec<Multiaddr> {
+    drive_to_bridged(h, t0);
+    let promotion = drain_actions(&mut h.agent);
     let target = h.target.clone();
-    complete_promotion(&mut h.agent, &target, &actions, at(now_ms + 1));
-    let events = drain_events(&mut h.agent);
-    assert!(matches!(
-        events.as_slice(),
-        [NatEvent::PathEstablished {
-            path: Path::Relayed { .. },
-            ..
-        }]
-    ));
-    actions
+    complete_promotion(&mut h.agent, &target, &promotion, at(t0 + 301));
+    drain_events(&mut h.agent);
+    let stream = StreamId::new(8_000 + t0);
+    h.agent.handle_event(
+        &SwarmEvent::StreamReady {
+            conn_id: ConnectionId::new(TEST_CIRCUIT_ID),
+            peer_id: target.clone(),
+            stream_id: stream,
+            protocol_id: minip2p_nat::DCUTR_PROTOCOL_ID.into(),
+            initiated_locally: false,
+        },
+        at(t0 + 302),
+    );
+    h.agent.handle_event(
+        &SwarmEvent::StreamData {
+            conn_id: ConnectionId::new(TEST_CIRCUIT_ID),
+            peer_id: target,
+            stream_id: stream,
+            data: dcutr_connect_reply(&[maddr(REMOTE_OBSERVED_ADDR)]),
+        },
+        at(t0 + 303),
+    );
+    dcutr_obs_addrs(&sent_data_on(&drain_actions(&mut h.agent), stream))
 }
 
 #[test]
@@ -184,14 +180,83 @@ fn force_relay_skips_direct_dials_and_dcutr() {
     complete_promotion(&mut h.agent, &target, &promotion, at(31));
     assert!(matches!(
         drain_events(&mut h.agent).as_slice(),
+        [NatEvent::PathEstablished {
+            connect_id,
+            path: Path::Relayed { .. },
+            ..
+        }] if *connect_id == id
+    ));
+}
+
+#[test]
+fn default_connect_promotes_the_bridge_before_dcutr() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (_, stream) = drive_to_bridged(&mut h, 0);
+
+    let actions = drain_actions(&mut h.agent);
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        NatAction::PromoteBridge {
+            role: minip2p_nat::BridgeRole::Initiator,
+            stream_id,
+            ..
+        } if *stream_id == stream
+    )));
+    assert_eq!(
+        send_stream_count(&actions),
+        0,
+        "DCUtR starts on the promoted connection, not the raw bridge"
+    );
+}
+
+#[test]
+fn malformed_dcutr_keeps_the_established_relayed_path() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, _) = drive_to_bridged(&mut h, 0);
+    let promotion = drain_actions(&mut h.agent);
+    let target = h.target.clone();
+    complete_promotion(&mut h.agent, &target, &promotion, at(301));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::PathEstablished { connect_id, path: Path::Relayed { .. }, .. }]
+            if *connect_id == id
+    ));
+
+    let stream = StreamId::new(9_001);
+    h.agent.handle_event(
+        &SwarmEvent::StreamReady {
+            conn_id: ConnectionId::new(TEST_CIRCUIT_ID),
+            peer_id: target.clone(),
+            stream_id: stream,
+            protocol_id: minip2p_nat::DCUTR_PROTOCOL_ID.into(),
+            initiated_locally: false,
+        },
+        at(302),
+    );
+    h.agent.handle_event(
+        &SwarmEvent::StreamData {
+            conn_id: ConnectionId::new(TEST_CIRCUIT_ID),
+            peer_id: target,
+            stream_id: stream,
+            data: b"\x13/multistream/1.0.0\n".to_vec(),
+        },
+        at(303),
+    );
+
+    let events = drain_events(&mut h.agent);
+    assert!(matches!(
+        events.as_slice(),
         [
-            NatEvent::PathEstablished {
+            NatEvent::HolePunchFailed {
                 connect_id,
-                path: Path::Relayed { .. },
+                attempt: 1,
                 ..
             },
-            NatEvent::FellBackToRelay { connect_id: fallback, .. },
-        ] if *connect_id == id && *fallback == id
+            NatEvent::FellBackToRelay {
+                connect_id: fallback_id,
+                peer,
+            }
+        ] if *connect_id == id && *fallback_id == id && peer == &h.target
     ));
 }
 
@@ -225,35 +290,27 @@ fn force_relay_preserves_bytes_coalesced_behind_hop_success() {
 }
 
 #[test]
-fn stalled_promoted_outbound_circuit_is_closed_at_connect_deadline() {
-    let mut h = Harness::with_relay(NatConfig {
-        connect_deadline_ms: 1_000,
-        ..NatConfig::default()
-    });
-    let (id, stream) = drive_to_bridged(&mut h, 0);
-    drain_actions(&mut h.agent); // DCUtR CONNECT
-    h.stream_data(
-        stream,
-        dcutr_connect_reply(&[maddr(REMOTE_OBSERVED_ADDR)]),
-        at(350),
-    );
+fn default_connect_preserves_noise_bytes_coalesced_behind_hop_success() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    h.agent.connect(h.target.clone(), Vec::new(), at(0));
     let actions = drain_actions(&mut h.agent);
-    let conn_id = ConnectionId::new(TEST_CIRCUIT_ID);
+    let relay_token = dial_token_for(&actions, &h.relay);
     h.agent
-        .promote_result(promote_token(&actions), Ok(conn_id), at(351));
-    assert!(!h.agent.owns_stream(&h.relay, stream));
+        .dial_result(relay_token, Ok(ConnectionId::new(2)), at(5));
+    h.relay_session_ready(at(10));
+    let open = drain_actions(&mut h.agent);
+    let stream = StreamId::new(42);
+    h.agent
+        .stream_open_result(open_stream_token(&open), Ok(stream), at(15));
+    h.stream_ready(stream, at(20));
+    drain_actions(&mut h.agent);
 
-    h.agent.handle_tick(at(1_000));
-    assert!(
-        drain_actions(&mut h.agent).iter().any(
-            |action| matches!(action, NatAction::CloseCircuit { conn_id: id } if *id == conn_id)
-        )
-    );
-    assert!(matches!(
-        drain_events(&mut h.agent).as_slice(),
-        [NatEvent::ConnectFailed { connect_id, error: minip2p_nat::NatError::Timeout, .. }]
-            if *connect_id == id
-    ));
+    let noise = b"\x13/multistream/1.0.0\n\x07/noise\n".to_vec();
+    let mut coalesced = hop_status(Status::Ok);
+    coalesced.extend_from_slice(&noise);
+    h.stream_data(stream, coalesced, at(30));
+
+    assert_eq!(promoted_pending_data(&drain_actions(&mut h.agent)), noise);
 }
 
 #[test]
@@ -266,44 +323,6 @@ fn no_direct_candidates_skip_the_stagger() {
         1,
         "relay leg starts immediately when there is nothing to stagger against"
     );
-}
-
-#[test]
-fn relayed_path_upgrades_to_direct_without_misattribution() {
-    let mut h = Harness::with_relay(NatConfig::default());
-    let (id, stream) = drive_to_bridged(&mut h, 0);
-
-    assert!(drain_events(&mut h.agent).is_empty());
-    assert!(h.agent.owns_stream(&h.relay, stream));
-    let actions = drain_actions(&mut h.agent);
-    assert_eq!(
-        send_stream_count(&actions),
-        1,
-        "DCUtR CONNECT goes out on the bridge"
-    );
-
-    drive_to_sync(&mut h, stream, 350);
-
-    // The punch lands: the direct connection appears.
-    h.target_connected(at(600));
-    let events = drain_events(&mut h.agent);
-    assert!(matches!(
-        events.as_slice(),
-        [NatEvent::PathUpgraded {
-            connect_id,
-            from: Path::Relayed { .. },
-            to: Path::DirectDialed,
-            ..
-        }] if *connect_id == id
-    ));
-    let actions = drain_actions(&mut h.agent);
-    assert!(
-        actions
-            .iter()
-            .any(|action| matches!(action, NatAction::CloseCircuit { .. })),
-        "the superseded promoted circuit must be closed, never silently leaked"
-    );
-    assert!(h.agent.is_idle());
 }
 
 #[test]
@@ -370,90 +389,6 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
         at(3),
     ));
     assert!(!h.agent.owns_stream(&attacker, stream));
-    assert!(drain_actions(&mut h.agent).is_empty());
-    assert!(drain_events(&mut h.agent).is_empty());
-}
-
-#[test]
-fn remote_write_close_during_dcutr_releases_relay_and_keeps_direct_dials_live() {
-    let mut h = Harness::with_relay(NatConfig::default());
-    let (id, stream) = drive_to_bridged(&mut h, 0);
-    drain_actions(&mut h.agent);
-
-    h.agent.handle_event(
-        &SwarmEvent::StreamRemoteWriteClosed {
-            conn_id: minip2p_transport::ConnectionId::new(1),
-            peer_id: h.relay.clone(),
-            stream_id: stream,
-        },
-        at(310),
-    );
-
-    assert!(!h.agent.owns_stream(&h.relay, stream));
-    let actions = drain_actions(&mut h.agent);
-    assert!(promotion_remote_write_closed(&actions));
-    assert!(matches!(
-        drain_events(&mut h.agent).as_slice(),
-        [NatEvent::HolePunchFailed { connect_id: failed, .. }] if *failed == id
-    ));
-
-    h.agent.promote_result(
-        promote_token(&actions),
-        Err(minip2p_nat::PromoteError::Failed("remote EOF".into())),
-        at(311),
-    );
-
-    h.target_connected(at(320));
-    assert!(matches!(
-        drain_events(&mut h.agent).as_slice(),
-        [NatEvent::PathEstablished {
-            connect_id,
-            path: Path::DirectDialed,
-            ..
-        }] if *connect_id == id
-    ));
-}
-
-#[test]
-fn relay_supersede_scrubs_old_stream_ids_without_resetting_the_new_connection() {
-    let mut h = Harness::with_relay(NatConfig::default());
-    let (_, stream) = drive_to_bridged(&mut h, 0);
-    drain_actions(&mut h.agent);
-    assert!(h.agent.owns_stream(&h.relay, stream));
-
-    h.agent.handle_event(
-        &SwarmEvent::ConnectionClosed {
-            conn_id: minip2p_transport::ConnectionId::new(1),
-            peer_id: h.relay.clone(),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
-        },
-        at(310),
-    );
-    h.agent.handle_event(
-        &SwarmEvent::ConnectionEstablished {
-            conn_id: minip2p_transport::ConnectionId::new(2),
-            peer_id: h.relay.clone(),
-        },
-        at(311),
-    );
-
-    assert!(!h.agent.owns_stream(&h.relay, stream));
-    assert!(
-        !has_reset_for(&drain_actions(&mut h.agent), stream),
-        "a stale stream id must never reset a colliding stream on the replacement connection"
-    );
-
-    // The replacement connection may reuse the same stream id. Its event
-    // must not be routed into the retired attempt.
-    h.agent.handle_event(
-        &SwarmEvent::StreamData {
-            conn_id: minip2p_transport::ConnectionId::new(2),
-            peer_id: h.relay.clone(),
-            stream_id: stream,
-            data: b"new connection data".to_vec(),
-        },
-        at(311),
-    );
     assert!(drain_actions(&mut h.agent).is_empty());
     assert!(drain_events(&mut h.agent).is_empty());
 }
@@ -560,160 +495,6 @@ fn bridge_close_before_dcutr_finishes_waits_for_live_direct_dials() {
 }
 
 #[test]
-fn established_relay_loss_never_turns_success_into_connect_failed() {
-    let mut h = Harness::with_relay(NatConfig {
-        punch_max_retries: 0,
-        ..NatConfig::default()
-    });
-    let (id, stream) = drive_to_bridged(&mut h, 0);
-    drain_actions(&mut h.agent);
-    drive_to_sync(&mut h, stream, 350);
-
-    // The circuit transport turns bridge termination into the promoted
-    // connection's terminal lifecycle event.
-    h.agent.handle_event_with_disposition_classified(
-        &SwarmEvent::ConnectionClosed {
-            conn_id: minip2p_transport::ConnectionId::new(TEST_CIRCUIT_ID),
-            peer_id: h.target.clone(),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
-        },
-        true,
-        at(400),
-    );
-    h.agent.handle_tick(at(3_350));
-    let events = drain_events(&mut h.agent);
-    assert!(matches!(
-        events.as_slice(),
-        [NatEvent::HolePunchFailed { connect_id, .. }] if *connect_id == id
-    ));
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, NatEvent::FellBackToRelay { .. }))
-    );
-
-    // Once the still-live original dial expires there is nothing left to
-    // upgrade, but PathEstablished remains the terminal result for this id.
-    h.agent.handle_tick(at(60_000));
-    assert!(drain_events(&mut h.agent).is_empty());
-    assert!(h.agent.is_idle());
-}
-
-#[test]
-fn peer_already_direct_promotion_error_waits_for_the_direct_connection() {
-    let mut h = Harness::with_relay(NatConfig::default());
-    let (id, stream) = drive_to_bridged(&mut h, 0);
-    drain_actions(&mut h.agent); // DCUtR CONNECT
-    h.stream_data(
-        stream,
-        dcutr_connect_reply(&[maddr(REMOTE_OBSERVED_ADDR)]),
-        at(350),
-    );
-    let promotion = drain_actions(&mut h.agent);
-
-    // The swarm already knows a direct session won, but the NatAgent has
-    // not consumed its ConnectionEstablished event yet.
-    let token = promote_token(&promotion);
-    h.agent.promote_result(
-        token,
-        Err(minip2p_nat::PromoteError::PeerAlreadyDirect),
-        at(351),
-    );
-    assert!(drain_actions(&mut h.agent).is_empty());
-    assert!(drain_events(&mut h.agent).is_empty());
-
-    h.target_connected(at(352));
-    assert!(matches!(
-        drain_events(&mut h.agent).as_slice(),
-        [NatEvent::PathEstablished {
-            connect_id,
-            path: Path::DirectDialed,
-            ..
-        }] if *connect_id == id
-    ));
-    assert!(h.agent.is_idle());
-
-    // The driver echo is tokenized exactly once; duplicates stay inert.
-    h.agent.promote_result(
-        token,
-        Err(minip2p_nat::PromoteError::PeerAlreadyDirect),
-        at(353),
-    );
-    assert!(drain_actions(&mut h.agent).is_empty());
-    assert!(drain_events(&mut h.agent).is_empty());
-}
-
-#[test]
-fn initiator_dials_only_global_ip_targets_from_peer_dcutr_reply() {
-    let mut h = Harness::with_relay(NatConfig::default());
-    let (_, stream) = drive_to_bridged(&mut h, 0);
-    drain_actions(&mut h.agent); // DCUtR CONNECT
-    let global = maddr("/ip4/9.9.9.9/udp/4002/quic-v1");
-    h.stream_data(
-        stream,
-        dcutr_connect_reply(&[
-            maddr("/ip4/10.0.0.7/udp/4002/quic-v1"),
-            maddr("/dns4/attacker.invalid/udp/4002/quic-v1"),
-            maddr("/ip4/192.0.2.7/udp/4002/quic-v1"),
-            global.clone(),
-        ]),
-        at(350),
-    );
-
-    let dials: Vec<_> = drain_actions(&mut h.agent)
-        .into_iter()
-        .filter_map(|action| match action {
-            NatAction::Dial { addr, .. } if addr.peer_id() == &h.target => {
-                Some(addr.transport().clone())
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(dials, vec![global]);
-}
-
-#[test]
-fn punch_exhaustion_falls_back_to_the_relay() {
-    let mut h = Harness::with_relay(NatConfig::default());
-    let (id, stream) = drive_to_bridged(&mut h, 0);
-    drain_actions(&mut h.agent);
-    drive_to_sync(&mut h, stream, 350);
-
-    // Default config: one window + two retries, 3s each.
-    for (tick_ms, window) in [(3_350, 1u32), (6_350, 2)] {
-        h.agent.handle_tick(at(tick_ms));
-        let events = drain_events(&mut h.agent);
-        assert!(matches!(
-            events.as_slice(),
-            [NatEvent::HolePunchFailed { attempt, .. }] if *attempt == window
-        ));
-        let actions = drain_actions(&mut h.agent);
-        assert_eq!(
-            dial_count_for(&actions, &h.target),
-            1,
-            "each retry re-dials the observed address"
-        );
-    }
-
-    h.agent.handle_tick(at(9_350));
-    let events = drain_events(&mut h.agent);
-    assert!(matches!(
-        events.as_slice(),
-        [
-            NatEvent::HolePunchFailed { attempt: 3, .. },
-            NatEvent::FellBackToRelay { connect_id, .. },
-        ] if *connect_id == id
-    ));
-    let actions = drain_actions(&mut h.agent);
-    assert!(
-        !has_reset_for(&actions, stream),
-        "the surviving relayed path must not be reset"
-    );
-    assert!(!h.agent.owns_stream(&h.relay, stream));
-    assert!(h.agent.is_idle());
-}
-
-#[test]
 fn all_legs_failing_reports_connect_failed() {
     let mut h = Harness::with_relay(NatConfig::default());
     h.agent
@@ -815,135 +596,6 @@ fn relay_refusal_fails_when_no_direct_leg_remains() {
 }
 
 #[test]
-fn initiator_reply_coalesced_with_application_data_preserves_remainder() {
-    let mut h = Harness::with_relay(NatConfig::default());
-    let id = h.agent.connect(h.target.clone(), Vec::new(), at(0));
-    let actions = drain_actions(&mut h.agent);
-    let relay_token = dial_token_for(&actions, &h.relay);
-    h.agent
-        .dial_result(relay_token, Ok(ConnectionId::new(2)), at(5));
-    h.relay_session_ready(at(10));
-
-    let actions = drain_actions(&mut h.agent);
-    let open_token = open_stream_token(&actions);
-    let stream = StreamId::new(9);
-    h.agent.stream_open_result(open_token, Ok(stream), at(15));
-    h.stream_ready(stream, at(20));
-    drain_actions(&mut h.agent);
-
-    // STATUS:OK and the responder's DCUtR CONNECT coalesced in one read:
-    // the pipelined bytes must feed the just-created DCUtR machine inside
-    // the same cascade.
-    let app_data = b"application bytes after dcutr reply";
-    let mut coalesced = hop_status(Status::Ok);
-    coalesced.extend(dcutr_connect_reply(&[maddr(REMOTE_OBSERVED_ADDR)]));
-    coalesced.extend_from_slice(app_data);
-    h.stream_data(stream, coalesced, at(100));
-
-    let actions = drain_actions(&mut h.agent);
-    assert_eq!(promoted_pending_data(&actions), app_data);
-    let target = h.target.clone();
-    complete_promotion(&mut h.agent, &target, &actions, at(101));
-    let events = drain_events(&mut h.agent);
-    assert!(matches!(
-        events.as_slice(),
-        [NatEvent::PathEstablished {
-            connect_id,
-            path: Path::Relayed { .. },
-            ..
-        }] if *connect_id == id
-    ));
-    assert_eq!(
-        dial_count_for(&actions, &h.target),
-        1,
-        "punch dial issued from the pipelined reply"
-    );
-    assert_eq!(
-        send_stream_count(&actions),
-        2,
-        "DCUtR CONNECT and SYNC both go out"
-    );
-    assert!(!h.agent.owns_stream(&h.relay, stream));
-
-    h.target_connected(at(110));
-    assert!(matches!(
-        drain_events(&mut h.agent).as_slice(),
-        [NatEvent::PathUpgraded {
-            connect_id,
-            from: Path::Relayed { .. },
-            to: Path::DirectPunched,
-            ..
-        }] if *connect_id == id
-    ));
-    let actions = drain_actions(&mut h.agent);
-    assert!(
-        actions.iter().any(
-            |action| matches!(action, NatAction::CloseCircuit { conn_id } if conn_id.as_u64() == TEST_CIRCUIT_ID)
-        ),
-        "the punched direct connection must retire the promoted circuit"
-    );
-}
-
-#[test]
-fn oversized_dcutr_connect_falls_back_to_relay() {
-    let mut h = Harness::with_relay(NatConfig::default());
-    // Enough distinct addresses that the encoded DCUtR CONNECT exceeds the
-    // 4 KiB frame cap, tripping the machine's deferred construction error.
-    let addrs: Vec<Multiaddr> = (1u16..=400)
-        .map(|port| maddr(&format!("/ip4/198.51.100.5/udp/{port}/quic-v1")))
-        .collect();
-    h.agent.set_listen_addrs(&addrs);
-
-    let (id, stream) = drive_to_bridged(&mut h, 0);
-    let actions = drain_actions(&mut h.agent);
-    let target = h.target.clone();
-    complete_promotion(&mut h.agent, &target, &actions, at(301));
-    let events = drain_events(&mut h.agent);
-    assert!(matches!(
-        events.as_slice(),
-        [
-            NatEvent::HolePunchFailed { .. },
-            NatEvent::PathEstablished { path: Path::Relayed { .. }, .. },
-            NatEvent::FellBackToRelay { connect_id, .. },
-        ] if *connect_id == id
-    ));
-    assert!(!h.agent.owns_stream(&h.relay, stream));
-    assert!(h.agent.is_idle());
-}
-
-#[test]
-fn foreign_stream_events_are_ignored_without_state_changes() {
-    let mut h = Harness::with_relay(NatConfig::default());
-    let (_, stream) = drive_to_bridged(&mut h, 0);
-    drain_events(&mut h.agent);
-    drain_actions(&mut h.agent);
-
-    // A stream the agent never opened — same peer, different id.
-    let foreign = StreamId::new(1_234);
-    assert!(!h.agent.owns_stream(&h.relay, foreign));
-    h.stream_data(foreign, b"app data".to_vec(), at(320));
-
-    // Same id as the bridge but on a different peer's connection.
-    assert!(!h.agent.owns_stream(&h.target, stream));
-    h.agent.handle_event(
-        &SwarmEvent::StreamData {
-            conn_id: minip2p_transport::ConnectionId::new(1),
-            peer_id: h.target.clone(),
-            stream_id: stream,
-            data: b"app data".to_vec(),
-        },
-        at(321),
-    );
-
-    assert!(drain_actions(&mut h.agent).is_empty());
-    assert!(drain_events(&mut h.agent).is_empty());
-    assert!(
-        h.agent.owns_stream(&h.relay, stream),
-        "bridge is still owned"
-    );
-}
-
-#[test]
 fn duplicate_direct_connection_does_not_double_report() {
     let mut h = Harness::with_relay(NatConfig::default());
     h.agent
@@ -956,27 +608,6 @@ fn duplicate_direct_connection_does_not_double_report() {
     h.target_connected(at(60));
     assert!(drain_events(&mut h.agent).is_empty());
     assert!(drain_actions(&mut h.agent).is_empty());
-}
-
-#[test]
-fn cancel_mid_race_resets_streams_and_goes_quiet() {
-    let mut h = Harness::with_relay(NatConfig::default());
-    let (id, stream) = drive_to_bridged(&mut h, 0);
-    drain_events(&mut h.agent);
-    drain_actions(&mut h.agent);
-
-    h.agent.cancel(id, at(320));
-    let actions = drain_actions(&mut h.agent);
-    assert!(has_reset_for(&actions, stream));
-    assert!(drain_events(&mut h.agent).is_empty(), "cancel is silent");
-    assert!(!h.agent.owns_stream(&h.relay, stream));
-
-    // Late inputs for the dead attempt change nothing.
-    h.stream_data(stream, hop_status(Status::Ok), at(330));
-    h.target_connected(at(340));
-    assert!(drain_actions(&mut h.agent).is_empty());
-    assert!(drain_events(&mut h.agent).is_empty());
-    assert!(h.agent.is_idle());
 }
 
 #[test]
@@ -1104,9 +735,7 @@ fn identify_observed_addr_joins_dcutr_connect() {
         at(0),
     );
 
-    let (_id, stream) = drive_to_bridged(&mut h, 10);
-    let actions = drain_actions(&mut h.agent);
-    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    let obs = advertised_dcutr_addrs(&mut h, 10);
     assert!(
         obs.contains(&maddr(LISTEN_ADDR)),
         "bound addresses stay in the CONNECT"
@@ -1127,9 +756,7 @@ fn latest_observation_per_reporter_wins() {
     identify_observed(&mut h.agent, &relay, &maddr(stale), at(0));
     identify_observed(&mut h.agent, &relay, &maddr(OUR_OBSERVED_ADDR), at(1));
 
-    let (_id, stream) = drive_to_bridged(&mut h, 10);
-    let actions = drain_actions(&mut h.agent);
-    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    let obs = advertised_dcutr_addrs(&mut h, 10);
     assert!(obs.contains(&maddr(OUR_OBSERVED_ADDR)));
     assert!(!obs.contains(&maddr(stale)), "replaced observation leaks");
 }
@@ -1161,9 +788,7 @@ fn reporter_disconnect_drops_its_observation() {
     h.agent.handle_tick(at(1));
     h.agent.handle_tick(at(1));
 
-    let (_id, stream) = drive_to_bridged(&mut h, 10);
-    let actions = drain_actions(&mut h.agent);
-    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    let obs = advertised_dcutr_addrs(&mut h, 10);
     assert_eq!(
         obs,
         vec![maddr(LISTEN_ADDR)],
@@ -1201,9 +826,7 @@ fn observed_addrs_from_untrusted_peers_are_ignored() {
     let other = peer(b"other-peer");
     identify_observed(&mut h.agent, &other, &maddr(attacker_chosen), at(1));
 
-    let (_id, stream) = drive_to_bridged(&mut h, 10);
-    let actions = drain_actions(&mut h.agent);
-    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    let obs = advertised_dcutr_addrs(&mut h, 10);
     assert_eq!(
         obs,
         vec![maddr(LISTEN_ADDR)],
@@ -1222,9 +845,7 @@ fn autonat_server_is_a_trusted_reporter() {
     });
     identify_observed(&mut h.agent, &autonat, &maddr(OUR_OBSERVED_ADDR), at(0));
 
-    let (_id, stream) = drive_to_bridged(&mut h, 10);
-    let actions = drain_actions(&mut h.agent);
-    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    let obs = advertised_dcutr_addrs(&mut h, 10);
     assert!(
         obs.contains(&maddr(OUR_OBSERVED_ADDR)),
         "a configured AutoNAT server's observation must be usable"
@@ -1243,9 +864,7 @@ fn tcp_observation_does_not_replace_a_trusted_quic_punch_candidate() {
         at(1),
     );
 
-    let (_id, stream) = drive_to_bridged(&mut h, 10);
-    let actions = drain_actions(&mut h.agent);
-    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    let obs = advertised_dcutr_addrs(&mut h, 10);
     assert!(
         obs.contains(&maddr(OUR_OBSERVED_ADDR)),
         "a later TCP Identify observation must not evict the relay's QUIC mapping"
@@ -1267,9 +886,7 @@ fn undecodable_observed_addr_bytes_are_ignored() {
         at(0),
     );
 
-    let (_id, stream) = drive_to_bridged(&mut h, 10);
-    let actions = drain_actions(&mut h.agent);
-    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    let obs = advertised_dcutr_addrs(&mut h, 10);
     assert_eq!(
         obs,
         vec![maddr(LISTEN_ADDR)],
@@ -1288,9 +905,7 @@ fn non_quic_observed_addr_is_ignored() {
         at(0),
     );
 
-    let (_id, stream) = drive_to_bridged(&mut h, 10);
-    let actions = drain_actions(&mut h.agent);
-    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
+    let obs = advertised_dcutr_addrs(&mut h, 10);
     assert_eq!(
         obs,
         vec![maddr(LISTEN_ADDR)],

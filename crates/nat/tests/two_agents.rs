@@ -12,7 +12,9 @@ mod common;
 use common::{LISTEN_ADDR, at, drain_events, identify_observed, maddr, peer};
 
 use minip2p_core::{Multiaddr, PeerAddr, PeerId};
-use minip2p_nat::{ConnectId, NatAction, NatAgent, NatConfig, NatEvent, Path, ReservationPolicy};
+use minip2p_nat::{
+    ConnectId, DCUTR_PROTOCOL_ID, NatAction, NatAgent, NatConfig, NatEvent, Path, ReservationPolicy,
+};
 use minip2p_relay::{HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 use minip2p_swarm::SwarmEvent;
 use minip2p_test_support::{ConnectRequestOutcome, PendingConnectId, RelayEmulator};
@@ -66,10 +68,16 @@ struct World {
     punch_dials_from_b: usize,
     punch_dial_addrs_from_a: Vec<Multiaddr>,
     punch_dial_addrs_from_b: Vec<Multiaddr>,
+    circuit_conns: [Option<ConnectionId>; 2],
+    dcutr_streams: Vec<(Side, StreamId, Side, StreamId)>,
 }
 
 impl World {
     fn new() -> Self {
+        Self::with_force_relay(false, false)
+    }
+
+    fn with_force_relay(a_force_relay: bool, b_force_relay: bool) -> Self {
         let a_id = peer(b"agent-a");
         let b_id = peer(b"agent-b");
         let relay_id = peer(b"relay-peer");
@@ -80,6 +88,7 @@ impl World {
             NatConfig {
                 relays: vec![relay_addr.clone()],
                 reservation_policy: ReservationPolicy::Never,
+                force_relay: a_force_relay,
                 ..NatConfig::default()
             },
         );
@@ -90,6 +99,7 @@ impl World {
             NatConfig {
                 relays: vec![relay_addr],
                 reservation_policy: ReservationPolicy::Always,
+                force_relay: b_force_relay,
                 ..NatConfig::default()
             },
         );
@@ -115,6 +125,15 @@ impl World {
             punch_dials_from_b: 0,
             punch_dial_addrs_from_a: Vec::new(),
             punch_dial_addrs_from_b: Vec::new(),
+            circuit_conns: [None, None],
+            dcutr_streams: Vec::new(),
+        }
+    }
+
+    fn side_index(side: Side) -> usize {
+        match side {
+            Side::A => 0,
+            Side::B => 1,
         }
     }
 
@@ -137,7 +156,7 @@ impl World {
         loop {
             let mut progressed = false;
             for side in [Side::A, Side::B] {
-                while let Some(action) = self.agent(side).poll_action() {
+                if let Some(action) = self.agent(side).poll_action() {
                     self.process(side, action);
                     progressed = true;
                 }
@@ -220,7 +239,47 @@ impl World {
                 peer,
                 protocol_id,
             } => {
-                assert_eq!(peer, self.relay_id, "agents only open streams to the relay");
+                if peer != self.relay_id {
+                    assert_eq!(protocol_id, DCUTR_PROTOCOL_ID);
+                    let remote = match side {
+                        Side::A => Side::B,
+                        Side::B => Side::A,
+                    };
+                    assert_eq!(peer, self.peer_of(remote));
+                    self.next_stream += 1;
+                    let local_stream = StreamId::new(self.next_stream);
+                    self.next_stream += 1;
+                    let remote_stream = StreamId::new(self.next_stream);
+                    self.dcutr_streams
+                        .push((side, local_stream, remote, remote_stream));
+                    let local_conn = self.circuit_conns[Self::side_index(side)].unwrap();
+                    let remote_conn = self.circuit_conns[Self::side_index(remote)].unwrap();
+                    let local_peer = self.peer_of(remote);
+                    self.agent(side)
+                        .stream_open_result(token, Ok(local_stream), now);
+                    self.agent(side).handle_event(
+                        &SwarmEvent::StreamReady {
+                            conn_id: local_conn,
+                            peer_id: local_peer,
+                            stream_id: local_stream,
+                            protocol_id: protocol_id.clone(),
+                            initiated_locally: true,
+                        },
+                        now,
+                    );
+                    let remote_peer = self.peer_of(side);
+                    self.agent(remote).handle_event(
+                        &SwarmEvent::StreamReady {
+                            conn_id: remote_conn,
+                            peer_id: remote_peer,
+                            stream_id: remote_stream,
+                            protocol_id,
+                            initiated_locally: false,
+                        },
+                        now,
+                    );
+                    return;
+                }
                 assert_eq!(protocol_id, HOP_PROTOCOL_ID);
                 self.next_stream += 1;
                 let stream = StreamId::new(self.next_stream);
@@ -241,7 +300,49 @@ impl World {
             }
             NatAction::SendStream {
                 stream_id, data, ..
-            } => self.on_relay_bytes(side, stream_id, data),
+            } => {
+                if let Some((_, _, remote, remote_stream)) = self
+                    .dcutr_streams
+                    .iter()
+                    .find(|(local, local_stream, _, _)| {
+                        *local == side && *local_stream == stream_id
+                    })
+                    .copied()
+                {
+                    let conn_id = self.circuit_conns[Self::side_index(remote)].unwrap();
+                    let peer = self.peer_of(side);
+                    self.agent(remote).handle_event(
+                        &SwarmEvent::StreamData {
+                            conn_id,
+                            peer_id: peer,
+                            stream_id: remote_stream,
+                            data,
+                        },
+                        now,
+                    );
+                } else if let Some((local, local_stream, _, _)) = self
+                    .dcutr_streams
+                    .iter()
+                    .find(|(_, _, remote, remote_stream)| {
+                        *remote == side && *remote_stream == stream_id
+                    })
+                    .copied()
+                {
+                    let conn_id = self.circuit_conns[Self::side_index(local)].unwrap();
+                    let peer = self.peer_of(side);
+                    self.agent(local).handle_event(
+                        &SwarmEvent::StreamData {
+                            conn_id,
+                            peer_id: peer,
+                            stream_id: local_stream,
+                            data,
+                        },
+                        now,
+                    );
+                } else {
+                    self.on_relay_bytes(side, stream_id, data);
+                }
+            }
             NatAction::SendRandomUdp { .. } => {
                 if side == Side::B {
                     self.blasts_from_b += 1;
@@ -252,6 +353,7 @@ impl World {
             } => {
                 self.next_conn += 1;
                 let conn_id = ConnectionId::new((1 << 63) | self.next_conn);
+                self.circuit_conns[Self::side_index(side)] = Some(conn_id);
                 let agent = self.agent(side);
                 agent.promote_result(token, Ok(conn_id), now);
                 agent.handle_event_with_disposition_classified(
@@ -501,6 +603,29 @@ fn two_agents_punch_to_a_direct_connection() {
         matches!(events.as_slice(), [NatEvent::InboundDirectUpgrade { peer }] if *peer == world.a_id),
         "B reports the inbound upgrade, got {events:?}"
     );
+}
+
+#[test]
+fn force_relay_on_either_peer_keeps_both_paths_relayed() {
+    for (dialer_forced, listener_forced) in [(true, false), (false, true)] {
+        let mut world = World::with_force_relay(dialer_forced, listener_forced);
+        world.settle_reservation();
+        let id = world.start_connect();
+
+        assert!(matches!(
+            drain_events(&mut world.a).as_slice(),
+            [NatEvent::PathEstablished { connect_id, path: Path::Relayed { .. }, .. }]
+                if *connect_id == id
+        ));
+        assert!(matches!(
+            drain_events(&mut world.b).as_slice(),
+            [NatEvent::InboundPathEstablished {
+                path: Path::Relayed { .. },
+                ..
+            }]
+        ));
+        assert_eq!(world.punch_dials_from_a + world.punch_dials_from_b, 0);
+    }
 }
 
 #[test]

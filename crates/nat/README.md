@@ -3,8 +3,8 @@
 Sans-I/O NAT-traversal orchestrator for minip2p. The protocol machines
 (Circuit Relay v2, DCUtR, AutoNAT) live in their own crates; `NatAgent` is
 the missing conductor: it races direct dials against a relayed circuit,
-starts a DCUtR hole punch over the bridge the moment it exists, and reports
-every path decision explicitly.
+promotes the circuit through Noise and Yamux, then runs DCUtR on that
+Relayed path.
 
 `no_std + alloc`, no I/O, no clocks, no async.
 
@@ -16,9 +16,9 @@ Parallel racing with convergence — not sequential fallback:
 t0      direct leg: dial every validated candidate address
 t0+δ    relay leg (stagger δ, default 200 ms; 0 = fully parallel):
           ensure relay session → HOP CONNECT(target)
-          → Bridged ⇒ DCUtR punch starts over the bridge
-          → after SYNC, promote bridge through Noise + Yamux
+          → Bridged ⇒ promote bridge through Noise + Yamux
           → circuit Connected ⇒ PathEstablished(Relayed)
+          → reserved peer opens /libp2p/dcutr on the Relayed path
 inbound STOP circuit Connected ⇒ InboundPathEstablished(Relayed)
 first usable path wins
 a better path later  ⇒ PathUpgraded { from, to }  (+ the circuit closes)
@@ -128,14 +128,14 @@ Independent of connect attempts, the agent also runs:
 ## Responder side
 
 A NAT'd listener holding a reservation handles inbound circuits
-automatically: the relay's STOP CONNECT is auto-accepted, the initiator's
-DCUtR exchange is answered with our validated addresses, and on SYNC the
-agent emits `SendRandomUdp` blasts at the initiator's observed addresses
+automatically: the relay's STOP CONNECT is auto-accepted and the bridge is
+promoted into a normal circuit connection. The agent announces that Relayed
+path, opens `/libp2p/dcutr`, and sends CONNECT followed by SYNC. It emits
+`SendRandomUdp` blasts at the original circuit dialer's observed addresses
 to open its own NAT mapping (first after `responder_sync_delay_ms`, then
-every `blast_interval_ms` until `punch_deadline_ms`). Per DCUtR for QUIC
-only the initiator dials — the blasts make that dial land. The bridge is
-promoted into a normal circuit connection; a landed punch is announced with
-`InboundDirectUpgrade` and supersedes that circuit.
+every `blast_interval_ms` until `punch_deadline_ms`). The original circuit
+dialer makes the QUIC simultaneous-open dial. A landed punch is announced
+with `InboundDirectUpgrade` and supersedes the circuit.
 
 ## Status
 
