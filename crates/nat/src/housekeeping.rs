@@ -1064,6 +1064,8 @@ impl Housekeeping {
             }
             StreamRole::HopConnect(_)
             | StreamRole::StopInbound(_)
+            | StreamRole::DcutrAttempt(_)
+            | StreamRole::DcutrInbound(_)
             | StreamRole::RejectedControl => {}
         }
     }

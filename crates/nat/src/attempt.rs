@@ -3,7 +3,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol, select_direct_addrs};
-use minip2p_dcutr::{DcutrInitiator, DcutrInitiatorInput, DcutrInitiatorOutput, InitiatorOutcome};
+use minip2p_dcutr::{DcutrResponder, DcutrResponderInput, DcutrResponderOutput, ResponderEvent};
 use minip2p_relay::{
     ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopConnectInput, HopConnectOutput,
 };
@@ -29,16 +29,15 @@ enum RelayLeg {
     WaitHopReady { stream: StreamId },
     /// HOP CONNECT sent; waiting for the relay's STATUS response.
     AwaitHopStatus { stream: StreamId },
-    /// Circuit bridged; the stream carries DCUtR and then application bytes.
+    /// Circuit bridged; the stream is being promoted through secure-mux.
     Bridged { stream: StreamId },
     /// The leg failed; only the direct leg (if any) can still win.
     Failed,
 }
 
 /// Per-target dialer-race arbiter: direct candidate dials at `t0` racing a
-/// staggered relay leg, with a DCUtR punch attempted over the bridge as soon
-/// as it exists. The best path wins; improvements are announced as explicit
-/// upgrades.
+/// staggered relay leg. A bridged circuit becomes a Relayed path first;
+/// DCUtR may then upgrade it. Improvements are announced explicitly.
 pub(crate) struct ConnectAttempt {
     id: ConnectId,
     peer: PeerId,
@@ -52,8 +51,8 @@ pub(crate) struct ConnectAttempt {
     /// Absolute deadline for the relay leg to reach `Bridged`.
     relay_deadline: Option<u64>,
     hop: Option<HopConnect>,
-    dcutr: Option<DcutrInitiator>,
-    dcutr_sent_at: Option<u64>,
+    dcutr: Option<DcutrResponder>,
+    dcutr_stream: Option<StreamId>,
     /// The bridge exists and has not been torn down by a close/disconnect.
     bridge_alive: bool,
     /// The bridge stream has been handed to the circuit transport.
@@ -66,8 +65,8 @@ pub(crate) struct ConnectAttempt {
     promotion_requested: bool,
     /// The remote write half reached EOF while the bridge was agent-owned.
     bridge_remote_write_closed: bool,
-    /// Application bytes coalesced behind the initiator-side DCUtR reply.
-    /// Drained exactly once into the first relayed `PathEstablished` event.
+    /// Secure-mux bytes coalesced behind the HOP success response. Passed to
+    /// the circuit transport with `PromoteBridge`.
     bridge_pending_data: Vec<u8>,
     punch_addrs: Vec<Multiaddr>,
     punch_dials_issued: bool,
@@ -123,7 +122,7 @@ impl ConnectAttempt {
             relay_deadline: None,
             hop: None,
             dcutr: None,
-            dcutr_sent_at: None,
+            dcutr_stream: None,
             bridge_alive: false,
             bridge_released: false,
             bridge_inner_conn: None,
@@ -181,6 +180,101 @@ impl ConnectAttempt {
         self.done
     }
 
+    pub(crate) fn accepts_dcutr(&self, peer: &PeerId, conn_id: ConnectionId) -> bool {
+        !self.done
+            && !self.punch_settled
+            && &self.peer == peer
+            && self.promoted == Some(conn_id)
+            && self
+                .best
+                .as_ref()
+                .is_some_and(|path| matches!(path, Path::Relayed { .. }))
+            && self.dcutr_stream.is_none()
+    }
+
+    pub(crate) fn on_dcutr_stream_opened(&mut self, stream: StreamId, shared: &mut Shared) {
+        self.dcutr_stream = Some(stream);
+        self.dcutr = Some(DcutrResponder::new(&shared.punch_candidates()));
+    }
+
+    pub(crate) fn on_dcutr_stream_input(
+        &mut self,
+        stream: StreamId,
+        input: StreamInput<'_>,
+        shared: &mut Shared,
+        now: Now,
+    ) {
+        if self.dcutr_stream != Some(stream) {
+            return;
+        }
+        let machine_input = match input {
+            StreamInput::Data(data) => DcutrResponderInput::Data(data.to_vec()),
+            StreamInput::RemoteWriteClosed | StreamInput::Closed => {
+                DcutrResponderInput::RemoteWriteClosed
+            }
+            StreamInput::Ready => return,
+        };
+        let Some(dcutr) = self.dcutr.as_mut() else {
+            return;
+        };
+        if let Err(error) = dcutr.handle_input(machine_input) {
+            self.finish_failed_dcutr(stream, error.to_string(), shared);
+            return;
+        }
+        let mut outputs = Vec::new();
+        while let Some(output) = dcutr.poll_output() {
+            outputs.push(output);
+        }
+        for output in outputs {
+            match output {
+                DcutrResponderOutput::Outbound(data) => shared.push_action(NatAction::SendStream {
+                    peer: self.peer.clone(),
+                    stream_id: stream,
+                    data,
+                }),
+                DcutrResponderOutput::Event(ResponderEvent::ConnectReceived {
+                    remote_addrs,
+                    ..
+                }) => {
+                    self.punch_addrs = select_global_punch_candidates(&remote_addrs);
+                }
+                DcutrResponderOutput::Event(ResponderEvent::SyncReceived) => {
+                    self.dcutr = None;
+                    shared.release_stream(&self.peer, stream);
+                    self.dcutr_stream = None;
+                    if self.punch_addrs.is_empty() {
+                        self.punch_failed_permanently(
+                            shared,
+                            "no dialable remote addresses in DCUtR CONNECT".into(),
+                            now,
+                        );
+                    } else {
+                        self.issue_punch_dials(shared);
+                        self.punch_window = 1;
+                        self.punch_deadline = Some(now.mono_ms + shared.config.punch_deadline_ms);
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish_failed_dcutr(&mut self, stream: StreamId, reason: String, shared: &mut Shared) {
+        self.dcutr = None;
+        self.dcutr_stream = None;
+        shared.release_stream(&self.peer, stream);
+        shared.push_event(NatEvent::HolePunchFailed {
+            connect_id: self.id,
+            attempt: 1,
+            reason,
+        });
+        self.punch_settled = true;
+        shared.push_event(NatEvent::FellBackToRelay {
+            connect_id: self.id,
+            peer: self.peer.clone(),
+        });
+        self.done = true;
+    }
+
     /// Earliest pending absolute deadline, for the driver's timer fold-in.
     pub(crate) fn next_deadline(&self) -> Option<u64> {
         if self.done {
@@ -223,7 +317,9 @@ impl ConnectAttempt {
         if is_circuit {
             if self.promoted == Some(conn_id) {
                 self.announce_relay_path(shared);
-                if self.punch_settled || shared.config.force_relay {
+                if shared.config.force_relay {
+                    self.done = true;
+                } else if self.punch_settled {
                     shared.push_event(NatEvent::FellBackToRelay {
                         connect_id: self.id,
                         peer: self.peer.clone(),
@@ -275,7 +371,6 @@ impl ConnectAttempt {
         peer: &PeerId,
         conn_id: ConnectionId,
         shared: &mut Shared,
-        now: Now,
     ) {
         if self.done {
             return;
@@ -320,7 +415,7 @@ impl ConnectAttempt {
                 self.last_error = Some(NatError::DialFailed("relay connection closed".into()));
                 self.fail_if_no_legs_remain(shared);
             }
-            RelayLeg::Bridged { .. } => self.on_bridge_lost(shared, now),
+            RelayLeg::Bridged { .. } => self.on_bridge_lost(shared),
             _ => {}
         }
     }
@@ -472,7 +567,6 @@ impl ConnectAttempt {
         stream: StreamId,
         input: StreamInput<'_>,
         shared: &mut Shared,
-        now: Now,
     ) {
         if self.done {
             return;
@@ -485,22 +579,22 @@ impl ConnectAttempt {
                 self.flush_hop_connect(stream, shared);
             }
             (RelayLeg::AwaitHopStatus { stream: s }, StreamInput::Data(data)) if s == stream => {
-                self.on_hop_data(stream, data, shared, now);
+                self.on_hop_data(stream, data, shared);
             }
             (RelayLeg::Bridged { stream: s }, StreamInput::Data(data)) if s == stream => {
-                self.on_bridge_data(stream, data, shared, now);
+                self.bridge_pending_data.extend_from_slice(data);
             }
             (
                 RelayLeg::WaitHopReady { stream: s } | RelayLeg::AwaitHopStatus { stream: s },
                 StreamInput::RemoteWriteClosed,
             ) if s == stream => {
-                self.on_hop_remote_write_closed(stream, shared, now);
+                self.on_hop_remote_write_closed(stream, shared);
             }
             (RelayLeg::Bridged { stream: s }, StreamInput::RemoteWriteClosed) if s == stream => {
-                self.on_bridge_remote_write_closed(stream, shared, now);
+                self.bridge_remote_write_closed = true;
             }
             (_, StreamInput::Closed) => {
-                self.on_stream_closed(stream, shared, now);
+                self.on_stream_closed(stream, shared);
             }
             _ => {}
         }
@@ -626,7 +720,7 @@ impl ConnectAttempt {
         self.leg = RelayLeg::AwaitHopStatus { stream };
     }
 
-    fn on_hop_data(&mut self, stream: StreamId, data: &[u8], shared: &mut Shared, now: Now) {
+    fn on_hop_data(&mut self, stream: StreamId, data: &[u8], shared: &mut Shared) {
         let Some(hop) = self.hop.as_mut() else {
             return;
         };
@@ -639,10 +733,7 @@ impl ConnectAttempt {
         while let Some(output) = hop.poll_output() {
             outputs.push(output);
         }
-        self.capture_force_relay_bridge_data(&outputs, shared);
-        // `HopConnect` yields `Outcome(Bridged)` before any `BridgeData`, so
-        // pipelined peer bytes reach the DCUtR machine created below inside
-        // this same cascade — before any later `StreamData` event.
+        self.capture_bridge_data(&outputs);
         for output in outputs {
             match output {
                 HopConnectOutput::Outbound(data) => {
@@ -655,7 +746,7 @@ impl ConnectAttempt {
                     }
                 }
                 HopConnectOutput::Outcome(ConnectOutcome::Bridged { .. }) => {
-                    self.on_bridged(stream, shared, now);
+                    self.on_bridged(stream, shared);
                 }
                 HopConnectOutput::Outcome(ConnectOutcome::Refused { status, reason }) => {
                     self.fail_relay_leg(
@@ -664,23 +755,18 @@ impl ConnectAttempt {
                     );
                     return;
                 }
-                HopConnectOutput::BridgeData(bytes) => {
-                    if !shared.config.force_relay {
-                        self.on_bridge_data(stream, &bytes, shared, now);
-                    }
-                }
+                HopConnectOutput::BridgeData(_) => {}
             }
         }
     }
 
-    /// The relay bridged the circuit: start the DCUtR punch immediately.
-    /// The raw stream stays agent-owned until SYNC is sent, at which point it
-    /// becomes safe to announce as an application-usable relayed path.
-    fn on_bridged(&mut self, stream: StreamId, shared: &mut Shared, now: Now) {
+    /// The relay bridged the circuit: promote the raw pipe through Noise and
+    /// Yamux. DCUtR runs later on the established circuit connection.
+    fn on_bridged(&mut self, stream: StreamId, shared: &mut Shared) {
         let RelayLeg::AwaitHopStatus { .. } = self.leg else {
             return;
         };
-        let Some(relay_peer) = self.relay_peer().cloned() else {
+        let Some(_) = self.relay_peer() else {
             return;
         };
         self.leg = RelayLeg::Bridged { stream };
@@ -690,57 +776,13 @@ impl ConnectAttempt {
 
         if shared.config.force_relay {
             self.punch_settled = true;
-            self.promote_bridge(stream, shared);
-            return;
         }
-
-        let mut dcutr = DcutrInitiator::new(&shared.punch_candidates());
-        if let Err(e) = dcutr.handle_input(DcutrInitiatorInput::Flush) {
-            // Deferred construction error (e.g. oversized CONNECT): the
-            // punch cannot even start, but the relayed path stands and is
-            // already safe to hand to the application.
-            self.promote_bridge(stream, shared);
-            self.punch_failed_permanently(shared, e.to_string(), now);
-            return;
-        }
-        while let Some(output) = dcutr.poll_output() {
-            if let DcutrInitiatorOutput::Outbound(data) = output {
-                shared.push_action(NatAction::SendStream {
-                    peer: relay_peer.clone(),
-                    stream_id: stream,
-                    data,
-                });
-            }
-        }
-        self.dcutr_sent_at = Some(now.mono_ms);
-        self.dcutr = Some(dcutr);
+        self.promote_bridge(stream, shared);
     }
 
-    fn on_bridge_data(&mut self, stream: StreamId, data: &[u8], shared: &mut Shared, now: Now) {
-        let Some(dcutr) = self.dcutr.as_mut() else {
-            return;
-        };
-        let rtt_ms = now
-            .mono_ms
-            .saturating_sub(self.dcutr_sent_at.unwrap_or(now.mono_ms));
-        if let Err(e) = dcutr.handle_input(DcutrInitiatorInput::Data {
-            bytes: data.to_vec(),
-            rtt_ms,
-        }) {
-            self.dcutr = None;
-            self.punch_failed_permanently(shared, e.to_string(), now);
-            return;
-        }
-        self.drain_dcutr_outputs(stream, shared, now);
-    }
-
-    /// In relay-only mode promotion happens as soon as HOP accepts. Capture
-    /// bytes coalesced behind STATUS:OK before processing the preceding
-    /// `Outcome(Bridged)`, which queues the promotion action.
-    fn capture_force_relay_bridge_data(&mut self, outputs: &[HopConnectOutput], shared: &Shared) {
-        if !shared.config.force_relay {
-            return;
-        }
+    /// Capture bytes coalesced behind STATUS:OK before processing the
+    /// preceding `Outcome(Bridged)`, which queues the promotion action.
+    fn capture_bridge_data(&mut self, outputs: &[HopConnectOutput]) {
         for output in outputs {
             if let HopConnectOutput::BridgeData(bytes) = output {
                 self.bridge_pending_data.extend_from_slice(bytes);
@@ -748,38 +790,10 @@ impl ConnectAttempt {
         }
     }
 
-    fn drain_dcutr_outputs(&mut self, stream: StreamId, shared: &mut Shared, now: Now) {
-        let Some(dcutr) = self.dcutr.as_mut() else {
-            return;
-        };
-        let mut outputs = Vec::new();
-        while let Some(output) = dcutr.poll_output() {
-            outputs.push(output);
-        }
-        for output in outputs {
-            match output {
-                DcutrInitiatorOutput::Outbound(data) => {
-                    if let Some(relay_peer) = self.relay_peer().cloned() {
-                        shared.push_action(NatAction::SendStream {
-                            peer: relay_peer,
-                            stream_id: stream,
-                            data,
-                        });
-                    }
-                }
-                DcutrInitiatorOutput::Outcome(InitiatorOutcome::DialNow {
-                    remote_addrs, ..
-                }) => {
-                    self.on_dial_now(stream, remote_addrs, shared, now);
-                }
-            }
-        }
-    }
-
     /// A remote half-close still permits local protocol writes. Let the
     /// sans-I/O machine consume it rather than treating it as a full circuit
     /// teardown; it may have a complete frame buffered already.
-    fn on_hop_remote_write_closed(&mut self, stream: StreamId, shared: &mut Shared, now: Now) {
+    fn on_hop_remote_write_closed(&mut self, stream: StreamId, shared: &mut Shared) {
         let Some(hop) = self.hop.as_mut() else {
             return;
         };
@@ -791,7 +805,7 @@ impl ConnectAttempt {
         while let Some(output) = hop.poll_output() {
             outputs.push(output);
         }
-        self.capture_force_relay_bridge_data(&outputs, shared);
+        self.capture_bridge_data(&outputs);
         for output in outputs {
             match output {
                 HopConnectOutput::Outbound(data) => {
@@ -804,7 +818,7 @@ impl ConnectAttempt {
                     }
                 }
                 HopConnectOutput::Outcome(ConnectOutcome::Bridged { .. }) => {
-                    self.on_bridged(stream, shared, now);
+                    self.on_bridged(stream, shared);
                 }
                 HopConnectOutput::Outcome(ConnectOutcome::Refused { status, reason }) => {
                     self.fail_relay_leg(
@@ -813,108 +827,9 @@ impl ConnectAttempt {
                     );
                     return;
                 }
-                HopConnectOutput::BridgeData(bytes) => {
-                    if !shared.config.force_relay {
-                        self.on_bridge_data(stream, &bytes, shared, now);
-                    }
-                }
+                HopConnectOutput::BridgeData(_) => {}
             }
         }
-    }
-
-    fn on_bridge_remote_write_closed(&mut self, stream: StreamId, shared: &mut Shared, now: Now) {
-        self.bridge_remote_write_closed = true;
-        let Some(dcutr) = self.dcutr.as_mut() else {
-            return;
-        };
-        if let Err(e) = dcutr.handle_input(DcutrInitiatorInput::RemoteWriteClosed) {
-            self.dcutr = None;
-            self.punch_failed_permanently(shared, e.to_string(), now);
-            return;
-        }
-        self.drain_dcutr_outputs(stream, shared, now);
-        if self.dcutr.is_some() {
-            // No more inbound bytes can complete the CONNECT reply. Release
-            // the still-writable relay bridge immediately, but keep original
-            // direct candidate dials alive so a late direct path can upgrade
-            // it before the connect deadline.
-            self.dcutr = None;
-            shared.push_event(NatEvent::HolePunchFailed {
-                connect_id: self.id,
-                attempt: self.punch_window.max(1),
-                reason: "relay bridge reached EOF before the DCUtR reply completed".into(),
-            });
-            self.punch_deadline = None;
-            self.promote_bridge(stream, shared);
-            if self.direct_live == 0 {
-                self.settle_after_punch(shared);
-            }
-        }
-    }
-
-    /// The remote's observed addresses arrived: dial them all, send SYNC,
-    /// hand the bridge back to the application, and open the punch window.
-    fn on_dial_now(
-        &mut self,
-        stream: StreamId,
-        remote_addrs: Vec<Multiaddr>,
-        shared: &mut Shared,
-        now: Now,
-    ) {
-        // Unlike caller-configured direct candidates, these addresses are
-        // supplied by the remote peer. Restrict them to global IP QUIC
-        // endpoints before allowing either a dial or UDP punch traffic.
-        self.punch_addrs = select_global_punch_candidates(&remote_addrs);
-
-        // Per the spec the initiator dials first, then signals SYNC.
-        if !self.punch_addrs.is_empty() {
-            self.issue_punch_dials(shared);
-        }
-
-        let relay_peer = self.relay_peer().cloned();
-        if let Some(dcutr) = self.dcutr.as_mut() {
-            match dcutr.handle_input(DcutrInitiatorInput::SendSync) {
-                Ok(()) => {
-                    let mut sync_frames = Vec::new();
-                    while let Some(output) = dcutr.poll_output() {
-                        if let DcutrInitiatorOutput::Outbound(data) = output {
-                            sync_frames.push(data);
-                        }
-                    }
-                    if let Some(relay_peer) = relay_peer {
-                        for data in sync_frames {
-                            shared.push_action(NatAction::SendStream {
-                                peer: relay_peer.clone(),
-                                stream_id: stream,
-                                data,
-                            });
-                        }
-                    }
-                    self.bridge_pending_data = dcutr.take_trailing_data().unwrap_or_default();
-                }
-                Err(e) => {
-                    self.dcutr = None;
-                    self.punch_failed_permanently(shared, e.to_string(), now);
-                    return;
-                }
-            }
-        }
-
-        // No further DCUtR frames are expected: from here every byte on the
-        // bridge belongs to the application.
-        self.dcutr = None;
-        self.promote_bridge(stream, shared);
-
-        if self.punch_addrs.is_empty() {
-            self.punch_failed_permanently(
-                shared,
-                "no dialable remote addresses in DCUtR reply".into(),
-                now,
-            );
-            return;
-        }
-        self.punch_window = 1;
-        self.punch_deadline = Some(now.mono_ms + shared.config.punch_deadline_ms);
     }
 
     fn issue_punch_dials(&mut self, shared: &mut Shared) {
@@ -1042,7 +957,7 @@ impl ConnectAttempt {
         });
     }
 
-    fn on_stream_closed(&mut self, stream: StreamId, shared: &mut Shared, now: Now) {
+    fn on_stream_closed(&mut self, stream: StreamId, shared: &mut Shared) {
         match self.leg {
             RelayLeg::WaitHopReady { stream: s } | RelayLeg::AwaitHopStatus { stream: s }
                 if s == stream =>
@@ -1052,13 +967,13 @@ impl ConnectAttempt {
                     NatError::Protocol("HOP stream closed before the circuit was bridged".into()),
                 );
             }
-            RelayLeg::Bridged { stream: s } if s == stream => self.on_bridge_lost(shared, now),
+            RelayLeg::Bridged { stream: s } if s == stream => self.on_bridge_lost(shared),
             _ => {}
         }
     }
 
     /// The bridge died (stream closed or relay connection lost).
-    fn on_bridge_lost(&mut self, shared: &mut Shared, now: Now) {
+    fn on_bridge_lost(&mut self, shared: &mut Shared) {
         if !self.bridge_alive {
             return;
         }
@@ -1074,18 +989,6 @@ impl ConnectAttempt {
         self.last_error = Some(NatError::DialFailed(
             "relay bridge lost before the attempt settled".into(),
         ));
-        if self.dcutr.is_some() {
-            // The DCUtR exchange can never complete now.
-            self.dcutr = None;
-            self.punch_deadline = None;
-            if self.direct_live == 0 {
-                self.punch_failed_permanently(
-                    shared,
-                    "relay bridge lost during the DCUtR exchange".into(),
-                    now,
-                );
-            }
-        }
         // If punch windows are already running, the punch itself may still
         // succeed via `ConnectionEstablished`; the window deadline settles
         // the rest.
@@ -1159,6 +1062,14 @@ impl ConnectAttempt {
     /// still holds (including a bridge the application was told about — the
     /// caller emits the explaining event first).
     fn teardown_relay_leg(&mut self, shared: &mut Shared) {
+        if let Some(stream_id) = self.dcutr_stream.take() {
+            shared.push_action(NatAction::ResetStream {
+                peer: self.peer.clone(),
+                stream_id,
+            });
+            shared.release_stream(&self.peer, stream_id);
+        }
+        self.dcutr = None;
         match self.leg {
             RelayLeg::WaitHopReady { stream } | RelayLeg::AwaitHopStatus { stream } => {
                 if let Some(relay_peer) = self.relay_peer().cloned() {
@@ -1187,6 +1098,7 @@ impl ConnectAttempt {
         self.punch_deadline = None;
         self.hop = None;
         self.dcutr = None;
+        self.dcutr_stream = None;
         self.bridge_alive = false;
         if let Some(conn_id) = self.promoted.take() {
             shared.push_action(NatAction::CloseCircuit { conn_id });

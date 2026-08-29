@@ -13,9 +13,9 @@
 //! t0      direct leg: dial every validated candidate address
 //! t0+δ    relay leg (stagger δ, 0 = fully parallel):
 //!           ensure relay session → HOP CONNECT(target)
-//!           → Bridged ⇒ start a DCUtR punch over the bridge
-//!           → after SYNC, promote bridge through Noise + Yamux
+//!           → Bridged ⇒ promote bridge through Noise + Yamux
 //!           → circuit Connected ⇒ PathEstablished(Relayed)
+//!           → reserved peer opens `/libp2p/dcutr` on that connection
 //! inbound STOP circuit Connected ⇒ InboundPathEstablished(Relayed)
 //! first usable path wins; a better path later ⇒ explicit PathUpgraded
 //! "fallback" is not a phase — it is what remains when the punch leg

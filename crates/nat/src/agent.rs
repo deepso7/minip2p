@@ -21,8 +21,8 @@ use crate::types::{ConnectId, NatToken, Now, PromoteError, ReachabilityState, Re
 /// belong to the application (`Released` is modeled as removal).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StreamRole {
-    /// Outbound HOP CONNECT stream for a dialer-side attempt; after the
-    /// relay reports `Bridged` the same stream carries the DCUtR exchange.
+    /// Outbound HOP CONNECT stream for a dialer-side attempt. After the
+    /// relay reports `Bridged`, the circuit transport adopts this stream.
     HopConnect(ConnectId),
     /// Outbound HOP RESERVE stream (reservation manager).
     HopReserve,
@@ -30,6 +30,10 @@ pub(crate) enum StreamRole {
     AutonatProbe,
     /// Inbound STOP stream from a relay (responder-side circuit).
     StopInbound(u64),
+    /// Inbound DCUtR stream handled by the original circuit dialer.
+    DcutrAttempt(ConnectId),
+    /// Locally opened DCUtR stream handled by the reserved peer.
+    DcutrInbound(u64),
     /// Inbound NAT control stream this node does not serve. Kept owned until
     /// terminal close so its reset lifecycle cannot leak into the application.
     RejectedControl,
@@ -59,6 +63,8 @@ pub(crate) enum TokenPurpose {
     PromoteAttempt(ConnectId),
     /// Relay bridge promotion for an inbound circuit.
     PromoteInbound(u64),
+    /// DCUtR stream opened by the reserved peer after circuit promotion.
+    OpenDcutrInbound(u64, PeerId),
 }
 
 impl TokenPurpose {
@@ -488,7 +494,7 @@ impl NatAgent {
                     }
                 }
                 for attempt in self.attempts.values_mut() {
-                    attempt.on_connection_closed(peer_id, *conn_id, &mut self.shared, now);
+                    attempt.on_connection_closed(peer_id, *conn_id, &mut self.shared);
                 }
                 if peer_disconnected {
                     self.pending_peer_disconnects.insert(peer_id.clone());
@@ -563,7 +569,21 @@ impl NatAgent {
                             .relays
                             .iter()
                             .any(|relay| relay.peer_id() == peer_id);
-                    if !trusted_stop {
+                    let dcutr_attempt = (protocol_id == DCUTR_PROTOCOL_ID)
+                        .then(|| {
+                            self.attempts.iter().find_map(|(id, attempt)| {
+                                attempt.accepts_dcutr(peer_id, *conn_id).then_some(*id)
+                            })
+                        })
+                        .flatten();
+                    if let Some(id) = dcutr_attempt {
+                        self.shared
+                            .own_stream(peer_id, *stream_id, StreamRole::DcutrAttempt(id));
+                        if let Some(attempt) = self.attempts.get_mut(&id) {
+                            attempt.on_dcutr_stream_opened(*stream_id, &mut self.shared);
+                        }
+                        handled = true;
+                    } else if !trusted_stop {
                         // All four ids are registered so the client-side NAT
                         // machines can negotiate outbound streams and advertise
                         // support through Identify. This node serves only STOP,
@@ -768,6 +788,18 @@ impl NatAgent {
                     now,
                 );
             }
+            TokenPurpose::OpenDcutrInbound(id, peer) => match self.inbound.get_mut(&id) {
+                Some(circuit) => {
+                    circuit.on_dcutr_open_result(&peer, result, &mut self.shared);
+                    self.reap_done();
+                }
+                None => {
+                    if let Ok(stream_id) = result {
+                        self.shared
+                            .push_action(NatAction::ResetStream { peer, stream_id });
+                    }
+                }
+            },
             _ => {}
         }
     }
@@ -884,7 +916,7 @@ impl NatAgent {
         match role {
             StreamRole::HopConnect(id) => {
                 if let Some(attempt) = self.attempts.get_mut(&id) {
-                    attempt.on_stream_input(conn_id, stream, input, &mut self.shared, now);
+                    attempt.on_stream_input(conn_id, stream, input, &mut self.shared);
                 }
             }
             StreamRole::HopReserve | StreamRole::AutonatProbe => {
@@ -893,7 +925,17 @@ impl NatAgent {
             }
             StreamRole::StopInbound(id) => {
                 if let Some(circuit) = self.inbound.get_mut(&id) {
-                    circuit.on_stream_input(conn_id, stream, input, &mut self.shared, now);
+                    circuit.on_stream_input(conn_id, stream, input, &mut self.shared);
+                }
+            }
+            StreamRole::DcutrAttempt(id) => {
+                if let Some(attempt) = self.attempts.get_mut(&id) {
+                    attempt.on_dcutr_stream_input(stream, input, &mut self.shared, now);
+                }
+            }
+            StreamRole::DcutrInbound(id) => {
+                if let Some(circuit) = self.inbound.get_mut(&id) {
+                    circuit.on_dcutr_stream_input(stream, input, &mut self.shared, now);
                 }
             }
             StreamRole::RejectedControl => {}

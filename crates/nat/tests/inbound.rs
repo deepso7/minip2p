@@ -40,100 +40,6 @@ fn inbound_stop_stream(h: &mut Harness, stream: StreamId, t: u64) {
     );
 }
 
-/// Drives a claimed circuit through CONNECT-accept and the DCUtR exchange
-/// up to (but not including) SYNC.
-fn drive_to_sync_ready(h: &mut Harness, stream: StreamId) {
-    let target = h.target.clone();
-    h.stream_data(stream, stop_connect(&target), at(10));
-    let actions = drain_actions(&mut h.agent);
-    assert_eq!(send_stream_count(&actions), 1, "STATUS:OK must be sent");
-
-    // The initiator's DCUtR CONNECT (same shape as a reply).
-    h.stream_data(
-        stream,
-        dcutr_connect_reply(&[maddr(REMOTE_OBSERVED_ADDR)]),
-        at(20),
-    );
-    let actions = drain_actions(&mut h.agent);
-    assert_eq!(
-        send_stream_count(&actions),
-        1,
-        "our DCUtR CONNECT reply must be sent"
-    );
-}
-
-#[test]
-fn full_inbound_flow_blasts_and_upgrades() {
-    let mut h = inbound_harness(NatConfig::default());
-    let stream = StreamId::new(STOP_STREAM);
-
-    inbound_stop_stream(&mut h, stream, 0);
-    assert!(h.agent.owns_stream(&h.relay, stream), "STOP stream claimed");
-
-    drive_to_sync_ready(&mut h, stream);
-
-    h.stream_data(stream, dcutr_sync(), at(30));
-    let actions = drain_actions(&mut h.agent);
-    assert!(actions.iter().any(|action| matches!(
-        action,
-        NatAction::PromoteBridge {
-            relay,
-            stream_id,
-            remote_peer,
-            ..
-        } if relay == &h.relay && *stream_id == stream && remote_peer == &h.target
-    )));
-    let target = h.target.clone();
-    complete_promotion(&mut h.agent, &target, &actions, at(31));
-    let events = drain_events(&mut h.agent);
-    assert!(matches!(
-        events.as_slice(),
-        [NatEvent::InboundPathEstablished {
-            peer,
-            path: Path::Relayed { relay },
-        }] if *peer == h.target && *relay == h.relay
-    ));
-    assert_eq!(
-        dial_count_for(&actions, &h.target),
-        0,
-        "only the initiator dials; a responder dial would race it and the \
-         superseded connection would lose its streams"
-    );
-    assert!(
-        !h.agent.owns_stream(&h.relay, stream),
-        "bridge belongs to the circuit transport after SYNC"
-    );
-
-    // First blast waits out the configured sync delay (50ms after SYNC).
-    h.agent.handle_tick(at(79));
-    assert_eq!(blast_count(&drain_actions(&mut h.agent)), 0);
-    h.agent.handle_tick(at(80));
-    let actions = drain_actions(&mut h.agent);
-    assert_eq!(blast_count(&actions), 1);
-    assert!(actions.iter().any(|a| matches!(
-        a,
-        NatAction::SendRandomUdp { target, payload_len: 32 }
-            if *target == maddr(REMOTE_OBSERVED_ADDR)
-    )));
-    h.agent.handle_tick(at(180));
-    assert_eq!(
-        blast_count(&drain_actions(&mut h.agent)),
-        1,
-        "100ms cadence"
-    );
-
-    // The punch lands: blasts stop, the upgrade is announced.
-    h.target_connected(at(250));
-    let events = drain_events(&mut h.agent);
-    assert!(matches!(
-        events.as_slice(),
-        [NatEvent::InboundDirectUpgrade { peer }] if *peer == h.target
-    ));
-    h.agent.handle_tick(at(400));
-    assert_eq!(blast_count(&drain_actions(&mut h.agent)), 0);
-    assert!(h.agent.is_idle());
-}
-
 #[test]
 fn force_relay_promotes_immediately_after_stop_acceptance() {
     let mut h = inbound_harness(NatConfig {
@@ -160,6 +66,54 @@ fn force_relay_promotes_immediately_after_stop_acceptance() {
     complete_promotion(&mut h.agent, &target, &actions, at(11));
     drain_events(&mut h.agent);
     assert!(h.agent.is_idle());
+}
+
+#[test]
+fn default_inbound_promotes_immediately_after_stop_acceptance() {
+    let mut h = inbound_harness(NatConfig::default());
+    let stream = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stream, 0);
+    let target = h.target.clone();
+
+    h.stream_data(stream, stop_connect(&target), at(10));
+
+    let actions = drain_actions(&mut h.agent);
+    assert_eq!(send_stream_count(&actions), 1, "STATUS:OK must be sent");
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        NatAction::PromoteBridge {
+            role: minip2p_nat::BridgeRole::Responder,
+            stream_id,
+            remote_peer,
+            ..
+        } if *stream_id == stream && remote_peer == &target
+    )));
+}
+
+#[test]
+fn inbound_relay_path_opens_dcutr_after_the_circuit_is_connected() {
+    let mut h = inbound_harness(NatConfig::default());
+    let stream = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stream, 0);
+    let target = h.target.clone();
+    h.stream_data(stream, stop_connect(&target), at(10));
+    let promotion = drain_actions(&mut h.agent);
+
+    complete_promotion(&mut h.agent, &target, &promotion, at(11));
+
+    let actions = drain_actions(&mut h.agent);
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        NatAction::OpenStream { peer, protocol_id, .. }
+            if peer == &target && protocol_id == DCUTR_PROTOCOL_ID
+    )));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::InboundPathEstablished {
+            path: Path::Relayed { .. },
+            ..
+        }]
+    ));
 }
 
 #[test]
@@ -230,279 +184,6 @@ fn established_inbound_circuit_disarms_its_handshake_deadline() {
         "a ready inbound circuit must not be reclaimed by its old handshake deadline"
     );
     assert!(h.agent.is_idle());
-}
-
-#[test]
-fn direct_connection_before_circuit_handshake_does_not_downgrade_the_path() {
-    let mut h = inbound_harness(NatConfig::default());
-    let stream = StreamId::new(STOP_STREAM);
-    inbound_stop_stream(&mut h, stream, 0);
-    drive_to_sync_ready(&mut h, stream);
-
-    // The punch lands before SYNC releases the relay bridge.
-    h.target_connected(at(25));
-    assert!(matches!(
-        drain_events(&mut h.agent).as_slice(),
-        [NatEvent::InboundDirectUpgrade { peer }] if *peer == h.target
-    ));
-
-    h.stream_data(stream, dcutr_sync(), at(30));
-    let actions = drain_actions(&mut h.agent);
-    let target = h.target.clone();
-    complete_promotion(&mut h.agent, &target, &actions, at(31));
-
-    assert!(
-        drain_events(&mut h.agent).is_empty(),
-        "the inferior relay path must not be announced after direct wins"
-    );
-    assert!(h.agent.is_idle());
-}
-
-#[test]
-fn linger_expiry_does_not_reap_a_promoted_circuit_before_connected() {
-    let mut h = inbound_harness(NatConfig::default());
-    let stream = StreamId::new(STOP_STREAM);
-    inbound_stop_stream(&mut h, stream, 0);
-    drive_to_sync_ready(&mut h, stream);
-    h.stream_data(stream, dcutr_sync(), at(30));
-    let actions = drain_actions(&mut h.agent);
-    let conn_id = minip2p_transport::ConnectionId::new(TEST_CIRCUIT_ID);
-    h.agent
-        .promote_result(promote_token(&actions), Ok(conn_id), at(31));
-
-    // The 9-second punch linger ends before the 20-second circuit handshake
-    // deadline, but the pending promotion must remain correlated.
-    h.agent.handle_tick(at(9_030));
-    drain_actions(&mut h.agent);
-    assert!(!h.agent.is_idle());
-    h.agent.handle_event_with_disposition_classified(
-        &SwarmEvent::ConnectionEstablished {
-            peer_id: h.target.clone(),
-            conn_id,
-        },
-        true,
-        at(9_031),
-    );
-
-    assert!(matches!(
-        drain_events(&mut h.agent).as_slice(),
-        [NatEvent::InboundPathEstablished {
-            peer,
-            path: Path::Relayed { relay },
-        }] if *peer == h.target && *relay == h.relay
-    ));
-    assert!(h.agent.is_idle());
-}
-
-#[test]
-fn sync_coalesced_with_application_data_preserves_the_bridge_remainder() {
-    let mut h = inbound_harness(NatConfig::default());
-    let stream = StreamId::new(STOP_STREAM);
-    inbound_stop_stream(&mut h, stream, 0);
-    drive_to_sync_ready(&mut h, stream);
-
-    let app_data = b"first application bytes".to_vec();
-    let mut coalesced = dcutr_sync();
-    coalesced.extend_from_slice(&app_data);
-    h.stream_data(stream, coalesced, at(30));
-
-    let actions = drain_actions(&mut h.agent);
-    assert_eq!(promoted_pending_data(&actions), app_data);
-}
-
-#[test]
-fn zero_blast_interval_is_clamped_to_one_millisecond() {
-    let config = NatConfig {
-        blast_interval_ms: 0,
-        ..NatConfig::default()
-    };
-    let mut h = inbound_harness(config);
-    let stream = StreamId::new(STOP_STREAM);
-    inbound_stop_stream(&mut h, stream, 0);
-    drive_to_sync_ready(&mut h, stream);
-    h.stream_data(stream, dcutr_sync(), at(30));
-    drain_events(&mut h.agent);
-    drain_actions(&mut h.agent);
-
-    // The first due tick completes promptly (rather than repeatedly
-    // scheduling the same instant forever), then the clamped cadence is 1ms.
-    h.agent.handle_tick(at(80));
-    assert_eq!(blast_count(&drain_actions(&mut h.agent)), 1);
-    h.agent.handle_tick(at(81));
-    assert_eq!(blast_count(&drain_actions(&mut h.agent)), 1);
-}
-
-#[test]
-fn blast_schedule_exhausts_at_the_punch_deadline() {
-    let mut h = inbound_harness(NatConfig::default());
-    let stream = StreamId::new(STOP_STREAM);
-    inbound_stop_stream(&mut h, stream, 0);
-    drive_to_sync_ready(&mut h, stream);
-    h.stream_data(stream, dcutr_sync(), at(30));
-    drain_events(&mut h.agent);
-    drain_actions(&mut h.agent);
-
-    // Catch up through the whole window (deadline 30 + 3000).
-    h.agent.handle_tick(at(3_100));
-    assert!(blast_count(&drain_actions(&mut h.agent)) > 0);
-    h.agent.handle_tick(at(3_200));
-    assert_eq!(
-        blast_count(&drain_actions(&mut h.agent)),
-        0,
-        "no blasts after the punch window"
-    );
-
-    // No direct connection ever arrives: the circuit lingers through the
-    // initiator's retry window, then retires with no further events.
-    h.agent.handle_tick(at(9_030));
-    assert!(drain_events(&mut h.agent).is_empty());
-    assert!(h.agent.is_idle());
-}
-
-#[test]
-fn peer_supplied_punch_targets_must_be_global_unicast_quic_ips() {
-    let mut h = inbound_harness(NatConfig::default());
-    let stream = StreamId::new(STOP_STREAM);
-    inbound_stop_stream(&mut h, stream, 0);
-    let target = h.target.clone();
-    h.stream_data(stream, stop_connect(&target), at(10));
-    drain_actions(&mut h.agent);
-
-    let global_v4 = maddr("/ip4/8.8.8.8/udp/4001/quic-v1");
-    let global_v6 = maddr("/ip6/2606:4700:4700::1111/udp/4001/quic-v1");
-    let supplied = vec![
-        global_v4.clone(),
-        global_v6.clone(),
-        maddr("/dns4/attacker.invalid/udp/4001/quic-v1"),
-        maddr("/ip4/10.0.0.1/udp/4001/quic-v1"),
-        maddr("/ip4/100.64.0.1/udp/4001/quic-v1"),
-        maddr("/ip4/127.0.0.1/udp/4001/quic-v1"),
-        maddr("/ip4/169.254.1.1/udp/4001/quic-v1"),
-        maddr("/ip4/192.0.2.1/udp/4001/quic-v1"),
-        maddr("/ip4/224.0.0.1/udp/4001/quic-v1"),
-        maddr("/ip6/::1/udp/4001/quic-v1"),
-        maddr("/ip6/fc00::1/udp/4001/quic-v1"),
-        maddr("/ip6/fe80::1/udp/4001/quic-v1"),
-        maddr("/ip6/2001:db8::1/udp/4001/quic-v1"),
-        maddr("/ip6/ff02::1/udp/4001/quic-v1"),
-        // Globally routable, and a perfectly good address to dial -- but a
-        // hole punch is not a dial. Blasting random UDP at a TCP port puts
-        // traffic on one whose owner never asked for it, and no amount of it
-        // opens a path, because TCP is not the transport being punched.
-        maddr("/ip4/8.8.4.4/tcp/4001"),
-        maddr("/ip6/2606:4700:4700::1112/tcp/4001"),
-    ];
-    h.stream_data(stream, dcutr_connect_reply(&supplied), at(20));
-    drain_actions(&mut h.agent);
-    h.stream_data(stream, dcutr_sync(), at(30));
-    drain_actions(&mut h.agent);
-
-    h.agent.handle_tick(at(80));
-    let actions = drain_actions(&mut h.agent);
-    let blasted: Vec<_> = actions
-        .iter()
-        .filter_map(|action| match action {
-            NatAction::SendRandomUdp { target, .. } => Some(target.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(blasted, vec![global_v4, global_v6]);
-}
-
-#[test]
-fn a_tcp_peer_can_still_be_reached_over_the_circuit_it_arrived_on() {
-    let mut h = inbound_harness(NatConfig::default());
-    let stream = StreamId::new(STOP_STREAM);
-    inbound_stop_stream(&mut h, stream, 0);
-    let target = h.target.clone();
-    h.stream_data(stream, stop_connect(&target), at(10));
-    drain_actions(&mut h.agent);
-
-    // Every address the peer offers is TCP, so there is nothing to punch.
-    // That must end as a relayed path rather than as a failure: the circuit
-    // is already carrying the connection, and DCUtR was only ever an attempt
-    // to do better than it.
-    h.stream_data(
-        stream,
-        dcutr_connect_reply(&[maddr("/ip4/8.8.4.4/tcp/4001")]),
-        at(20),
-    );
-    drain_actions(&mut h.agent);
-    h.stream_data(stream, dcutr_sync(), at(30));
-    let actions = drain_actions(&mut h.agent);
-    assert!(
-        actions
-            .iter()
-            .any(|action| matches!(action, NatAction::PromoteBridge { .. })),
-        "the relayed path still goes to the application: {actions:?}"
-    );
-    let target = h.target.clone();
-    complete_promotion(&mut h.agent, &target, &actions, at(31));
-
-    // Not one blast, ever: the punch window opens 50ms after SYNC and there
-    // was never anything in it to aim at.
-    for tick in [80u64, 180, 400] {
-        h.agent.handle_tick(at(tick));
-        assert_eq!(
-            blast_count(&drain_actions(&mut h.agent)),
-            0,
-            "there is nothing here to punch"
-        );
-    }
-}
-
-#[test]
-fn stalled_exchange_still_releases_the_bridge() {
-    let mut h = inbound_harness(NatConfig::default());
-    let stream = StreamId::new(STOP_STREAM);
-    inbound_stop_stream(&mut h, stream, 0);
-    let target = h.target.clone();
-    h.stream_data(stream, stop_connect(&target), at(10));
-    drain_actions(&mut h.agent);
-
-    // The initiator never starts DCUtR; at the exchange deadline the
-    // accepted bridge goes to the app punch-less.
-    h.agent.handle_tick(at(12_000));
-    let actions = drain_actions(&mut h.agent);
-    assert!(
-        actions
-            .iter()
-            .any(|action| matches!(action, NatAction::PromoteBridge { .. }))
-    );
-    assert_eq!(dial_count_for(&actions, &h.target), 0);
-    assert_eq!(blast_count(&actions), 0);
-    assert!(!h.agent.owns_stream(&h.relay, stream));
-    let target = h.target.clone();
-    complete_promotion(&mut h.agent, &target, &actions, at(12_001));
-    drain_events(&mut h.agent);
-    assert!(h.agent.is_idle());
-}
-
-#[test]
-fn remote_write_close_keeps_an_accepted_bridge_alive_until_handoff() {
-    let mut h = inbound_harness(NatConfig::default());
-    let stream = StreamId::new(STOP_STREAM);
-    inbound_stop_stream(&mut h, stream, 0);
-    let target = h.target.clone();
-    h.stream_data(stream, stop_connect(&target), at(10));
-    drain_actions(&mut h.agent);
-
-    h.agent.handle_event(
-        &SwarmEvent::StreamRemoteWriteClosed {
-            conn_id: minip2p_transport::ConnectionId::new(1),
-            peer_id: h.relay.clone(),
-            stream_id: stream,
-        },
-        at(20),
-    );
-    assert!(h.agent.owns_stream(&h.relay, stream));
-    assert!(!has_reset_for(&drain_actions(&mut h.agent), stream));
-
-    // The half-close does not kill the local write half; hand the accepted
-    // bridge to the app once the DCUtR exchange deadline expires.
-    h.agent.handle_tick(at(12_000));
-    let actions = drain_actions(&mut h.agent);
-    assert!(promotion_remote_write_closed(&actions));
 }
 
 #[test]
@@ -619,101 +300,4 @@ fn inbound_unserved_nat_control_streams_are_reset_owned_and_consumed() {
 
     assert!(drain_events(&mut h.agent).is_empty());
     assert!(h.agent.is_idle());
-}
-
-#[test]
-fn relay_disconnect_before_release_drops_the_circuit() {
-    let mut h = inbound_harness(NatConfig::default());
-    let stream = StreamId::new(STOP_STREAM);
-    inbound_stop_stream(&mut h, stream, 0);
-    let target = h.target.clone();
-    h.stream_data(stream, stop_connect(&target), at(10));
-    drain_actions(&mut h.agent);
-
-    h.agent.handle_event(
-        &SwarmEvent::ConnectionClosed {
-            conn_id: minip2p_transport::ConnectionId::new(1),
-            peer_id: h.relay.clone(),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
-        },
-        at(20),
-    );
-    assert!(drain_events(&mut h.agent).is_empty());
-    assert!(!h.agent.owns_stream(&h.relay, stream));
-    assert!(h.agent.is_idle());
-}
-
-#[test]
-fn responder_reply_advertises_peer_observed_mapping() {
-    let mut h = inbound_harness(NatConfig::default());
-    // The relay's identify told us our public mapping earlier in the session.
-    let relay = h.relay.clone();
-    identify_observed(&mut h.agent, &relay, &maddr(OUR_OBSERVED_ADDR), at(0));
-
-    let stream = StreamId::new(STOP_STREAM);
-    inbound_stop_stream(&mut h, stream, 1);
-    let target = h.target.clone();
-    h.stream_data(stream, stop_connect(&target), at(10));
-    drain_actions(&mut h.agent);
-
-    h.stream_data(
-        stream,
-        dcutr_connect_reply(&[maddr(REMOTE_OBSERVED_ADDR)]),
-        at(20),
-    );
-    let actions = drain_actions(&mut h.agent);
-    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
-    assert!(
-        obs.contains(&maddr(LISTEN_ADDR)),
-        "bound addresses stay in the reply"
-    );
-    assert!(
-        obs.contains(&maddr(OUR_OBSERVED_ADDR)),
-        "the reply must advertise our observed public mapping"
-    );
-}
-
-#[test]
-fn our_own_tcp_listener_is_not_offered_as_a_punch_target() {
-    let mut h = inbound_harness(NatConfig::default());
-    // A host that bound both. The direct-candidate selector accepts both,
-    // because both are dialable -- but only one of them is punchable.
-    let tcp = maddr("/ip4/198.51.100.5/tcp/4001");
-    h.agent.set_listen_addrs(&[maddr(LISTEN_ADDR), tcp.clone()]);
-    // Same for a mapping a trusted peer observed for us: the relay watching
-    // us arrive over TCP says nothing about where we can be punched.
-    let relay = h.relay.clone();
-    let observed_tcp = maddr("/ip4/203.0.113.77/tcp/45678");
-    identify_observed(&mut h.agent, &relay, &observed_tcp, at(0));
-
-    let stream = StreamId::new(STOP_STREAM);
-    inbound_stop_stream(&mut h, stream, 1);
-    let target = h.target.clone();
-    h.stream_data(stream, stop_connect(&target), at(10));
-    drain_actions(&mut h.agent);
-    h.stream_data(
-        stream,
-        dcutr_connect_reply(&[maddr(REMOTE_OBSERVED_ADDR)]),
-        at(20),
-    );
-
-    let actions = drain_actions(&mut h.agent);
-    let obs = dcutr_obs_addrs(&sent_data_on(&actions, stream));
-    assert!(
-        obs.contains(&maddr(LISTEN_ADDR)),
-        "the QUIC listener is still offered: {obs:?}"
-    );
-    assert!(
-        !obs.contains(&tcp),
-        // What goes into a CONNECT is an invitation to blast UDP at us. A
-        // `/tcp` listener cannot be punched, so offering one only spends the
-        // peer's punch window on an address that will never open -- and the
-        // peer filters it on arrival anyway, so it was never anything but
-        // noise on the wire.
-        "a TCP listener is not a punch target: {obs:?}"
-    );
-    assert!(
-        !obs.contains(&observed_tcp),
-        "nor is a TCP mapping someone observed for us: {obs:?}"
-    );
 }
