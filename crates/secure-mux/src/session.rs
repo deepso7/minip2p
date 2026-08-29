@@ -9,11 +9,12 @@ use minip2p_multistream_select::{MultistreamInput, MultistreamOutput, Multistrea
 use minip2p_noise::{
     NOISE_PROTOCOL_ID, NoiseConfig, NoiseInput, NoiseOutput, NoiseRole, NoiseSession,
 };
+use minip2p_platform::{Deadline, Now};
 use minip2p_transport::StreamId;
 use minip2p_yamux::{YAMUX_PROTOCOL_ID, YamuxInput, YamuxOutput, YamuxRole, YamuxSession};
 use thiserror::Error;
 
-pub use minip2p_yamux::{YamuxConfig, YamuxError};
+pub use minip2p_yamux::{KEEPALIVE_INTERVAL_MS, YamuxConfig, YamuxError};
 
 /// Which end of the session opened the underlying byte stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -224,6 +225,28 @@ impl SecureMuxSession {
     /// Returns whether the upgrade has completed.
     pub fn is_established(&self) -> bool {
         matches!(self.phase, Some(Phase::Ready { .. }))
+    }
+
+    /// Advances Yamux keepalive using the host's time sample.
+    ///
+    /// A no-op until the upgrade has finished: there is no Yamux session to
+    /// ping during negotiation. After that, quiet sessions emit a ping as
+    /// [`SessionOutput::Write`].
+    pub fn poll(&mut self, now: Now) -> Result<(), SessionError> {
+        match self.with_yamux(|yamux| yamux.poll(now)) {
+            Ok(()) | Err(SessionError::NotEstablished) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// When this session next wants a [`poll`](Self::poll) for keepalive.
+    ///
+    /// `None` until Yamux is up, and once the session has failed or gone away.
+    pub fn next_deadline(&self) -> Option<Deadline> {
+        match self.phase.as_ref()? {
+            Phase::Ready { yamux, .. } => yamux.next_deadline(),
+            _ => None,
+        }
     }
 
     /// Returns the authenticated peer, once Noise has verified it.

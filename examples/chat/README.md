@@ -116,7 +116,8 @@ Two deployment details surfaced during live validation:
 4. **Manual rust-libp2p interop check (not covered by CI)**: configure a
    rust-libp2p gossipsub peer with `MessageAuthenticity::Signed` and strict
    validation, then verify messages travel in both directions. The rust peer
-   must include a `ping` behaviour (to answer this side's keepalives) or raise
-   its `idle_connection_timeout` — by default rust-libp2p closes a connection
-   after 10 s when no behaviour keeps it alive, which reads as an instant
-   disconnect here.
+   must include a `ping` behaviour or raise its `idle_connection_timeout` —
+   by default rust-libp2p closes a connection after 10 s when no behaviour
+   keeps it alive, which reads as an instant disconnect here. Transport-level
+   keepalives (QUIC PING / Yamux ping) keep the path up on this side; they
+   do not count as "in use" for rust-libp2p's swarm idle timeout.

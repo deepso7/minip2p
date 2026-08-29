@@ -825,17 +825,36 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
         for event in self.inner.poll(now)? {
             self.handle_inner_event(event);
         }
+        for id in self.circuits.keys().copied().collect::<Vec<_>>() {
+            if !self
+                .circuits
+                .get(&id)
+                .is_some_and(|circuit| circuit.session.is_established())
+            {
+                continue;
+            }
+            let result = self.with_circuit(id, |this, circuit| {
+                circuit.session.poll(now)?;
+                this.pump(circuit)
+            });
+            if let Err(teardown) = result {
+                self.fail_circuit(id, teardown.message, !teardown.graceful);
+            }
+        }
         Ok(self.drain_pending_events())
     }
 
     fn next_deadline(&self) -> Option<Deadline> {
-        if self.pending.is_empty() {
-            self.inner.next_deadline()
-        } else {
+        if !self.pending.is_empty() {
             // Buffered circuit events are due regardless of what the host's
             // clock reads, so this needs no retained time sample.
-            Some(Deadline::IMMEDIATE)
+            return Some(Deadline::IMMEDIATE);
         }
+        let mut deadline = self.inner.next_deadline();
+        for circuit in self.circuits.values() {
+            deadline = Deadline::earliest_opt(deadline, circuit.session.next_deadline());
+        }
+        deadline
     }
 
     fn local_addresses(&self) -> Vec<Multiaddr> {
@@ -907,6 +926,7 @@ mod tests {
     use minip2p_noise::{
         NOISE_PROTOCOL_ID, NoiseConfig, NoiseInput, NoiseOutput, NoiseRole, NoiseSession,
     };
+    use minip2p_secure_mux::KEEPALIVE_INTERVAL_MS;
     use minip2p_test_support::InMemoryTransport;
 
     #[derive(Clone, Debug)]
@@ -1318,6 +1338,49 @@ mod tests {
             }
         }
         panic!("circuit handshake did not complete");
+    }
+
+    #[test]
+    fn a_quiet_circuit_keeps_alive_without_opening_a_stream() {
+        let (mut a, mut b, circuit_id, _bridge, a_peer, b_peer) = setup_pair();
+        complete_handshake(&mut a, &mut b, circuit_id, &a_peer, &b_peer);
+
+        let _ = a.poll(Now::from_millis(0)).expect("stamp initiator");
+        let _ = b.poll(Now::from_millis(0)).expect("stamp responder");
+        assert_eq!(
+            a.next_deadline(),
+            Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS))
+        );
+
+        let ping = a
+            .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+            .expect("initiator keepalive");
+        assert!(
+            ping.iter()
+                .all(|event| !matches!(event, TransportEvent::StreamData { .. })),
+            "a yamux ping is not stream data: {ping:?}"
+        );
+
+        let pong = b
+            .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+            .expect("responder answers");
+        assert!(
+            pong.iter()
+                .all(|event| !matches!(event, TransportEvent::StreamData { .. })),
+            "answering a yamux ping must not surface as stream data: {pong:?}"
+        );
+
+        let ack = a
+            .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+            .expect("initiator sees the pong");
+        assert!(
+            ack.is_empty(),
+            "a keepalive pong is session traffic: {ack:?}"
+        );
+        assert!(
+            a.circuit_ids().contains(&circuit_id),
+            "keepalive must not tear the circuit down"
+        );
     }
 
     #[test]

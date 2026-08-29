@@ -1497,6 +1497,7 @@ impl Transport for QuicTransport {
                         packet,
                         from,
                         local_addr,
+                        now,
                         &self.socket,
                         &mut self.pending_events,
                         &mut self.pending_datagrams,
@@ -1536,8 +1537,18 @@ impl Transport for QuicTransport {
 
         let mut to_remove = Vec::new();
 
+        let keepalive_interval_ms =
+            keepalive_interval_ms(self.node_config.limits().idle_timeout_ms);
         for (&id, conn) in self.connections.iter_mut() {
             conn.handle_timeout(
+                &self.socket,
+                &mut self.pending_events,
+                &mut self.pending_datagrams,
+                self.node_config.limits().max_pending_datagrams,
+            )?;
+            conn.maybe_keepalive(
+                now,
+                keepalive_interval_ms,
                 &self.socket,
                 &mut self.pending_events,
                 &mut self.pending_datagrams,
@@ -1600,9 +1611,21 @@ impl Transport for QuicTransport {
             .connections
             .values()
             .filter_map(QuicConnection::timeout)
-            .min()?;
-        Some(deadline_for_timeout(now, timeout))
+            .min();
+        let quiche = timeout.map(|timeout| deadline_for_timeout(now, timeout));
+        let keepalive_interval_ms =
+            keepalive_interval_ms(self.node_config.limits().idle_timeout_ms);
+        let keepalive = self.connections.values().fold(None, |earliest, conn| {
+            Deadline::earliest_opt(earliest, conn.keepalive_deadline(keepalive_interval_ms))
+        });
+        Deadline::earliest_opt(quiche, keepalive)
     }
+}
+
+/// Quiet connections send an ack-eliciting packet at half the idle timeout,
+/// matching rust-libp2p / quic-go's "keep-alive at idle/2" rule.
+fn keepalive_interval_ms(idle_timeout_ms: u64) -> u64 {
+    idle_timeout_ms.max(2) / 2
 }
 
 /// Converts a quiche timeout into a deadline on the host's timeline.

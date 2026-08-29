@@ -14,7 +14,9 @@
 //! bytes read from the underlying stream with [`SecureMuxSession::handle_input`]
 //! and drain [`SessionOutput`] values with
 //! [`SecureMuxSession::poll_output`], writing every
-//! [`SessionOutput::Write`] back to that stream. `no_std + alloc`.
+//! [`SessionOutput::Write`] back to that stream. After the upgrade,
+//! [`SecureMuxSession::poll`] / [`SecureMuxSession::next_deadline`] drive
+//! Yamux keepalive from the host's time sample. `no_std + alloc`.
 //!
 //! Relay circuits and TCP connections differ only in what the byte stream is,
 //! so both drive this same component rather than duplicating the state
@@ -35,6 +37,6 @@ extern crate alloc;
 mod session;
 
 pub use session::{
-    SecureMuxSession, SessionConfig, SessionError, SessionOutput, SessionRole, YamuxConfig,
-    YamuxError,
+    KEEPALIVE_INTERVAL_MS, SecureMuxSession, SessionConfig, SessionError, SessionOutput,
+    SessionRole, YamuxConfig, YamuxError,
 };

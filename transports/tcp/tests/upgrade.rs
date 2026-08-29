@@ -9,6 +9,7 @@ mod support;
 use minip2p_core::{Multiaddr, PeerAddr};
 use minip2p_identity::{Ed25519Keypair, PeerId};
 use minip2p_platform::{Deadline, EntropySource, Now};
+use minip2p_secure_mux::KEEPALIVE_INTERVAL_MS;
 use minip2p_tcp::{TcpConfig, TcpTransport};
 use minip2p_transport::{
     ConnectionId, ConnectionNamespace, StreamId, Transport, TransportError, TransportEvent,
@@ -53,14 +54,34 @@ fn drive<A: EntropySource, B: EntropySource>(
     for _ in 0..2048 {
         let from_a = a.poll(Now::from_millis(0)).expect("drive a");
         let from_b = b.poll(Now::from_millis(0)).expect("drive b");
-        let quiet = from_a.is_empty()
-            && from_b.is_empty()
+        a_events.extend(from_a.iter().cloned());
+        b_events.extend(from_b.iter().cloned());
+        // `IMMEDIATE` is real work. A future stall is too — the peer has to
+        // be polled so it can read and unstick the writer. A future keepalive
+        // is not: the session is idle until that timer. One extra pair of
+        // polls lets a stalled writer observe the peer's read before we
+        // decide the link is quiet.
+        let due_now = |deadline: Option<Deadline>| {
+            deadline.is_some_and(|deadline| deadline.is_expired_at(Now::from_millis(0)))
+        };
+        if !from_a.is_empty()
+            || !from_b.is_empty()
+            || !net.is_quiet()
+            || due_now(a.next_deadline())
+            || due_now(b.next_deadline())
+        {
+            continue;
+        }
+        let extra_a = a.poll(Now::from_millis(0)).expect("drive a extra");
+        let extra_b = b.poll(Now::from_millis(0)).expect("drive b extra");
+        a_events.extend(extra_a.iter().cloned());
+        b_events.extend(extra_b.iter().cloned());
+        if extra_a.is_empty()
+            && extra_b.is_empty()
             && net.is_quiet()
-            && a.next_deadline().is_none()
-            && b.next_deadline().is_none();
-        a_events.extend(from_a);
-        b_events.extend(from_b);
-        if quiet {
+            && !due_now(a.next_deadline())
+            && !due_now(b.next_deadline())
+        {
             return (a_events, b_events);
         }
     }
@@ -452,7 +473,11 @@ fn a_full_socket_buffers_and_drains_as_the_peer_reads() {
         "every byte must arrive exactly once, in order"
     );
     assert_eq!(dialer.provider().bytes_in_flight_to_peer(), 0);
-    assert_eq!(dialer.next_deadline(), None, "nothing is left buffered");
+    assert_eq!(
+        dialer.next_deadline(),
+        Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS)),
+        "nothing is left buffered; the yamux keepalive is the remaining deadline"
+    );
 }
 
 #[test]
@@ -569,7 +594,11 @@ fn a_stalled_socket_stops_claiming_urgency_and_recovers() {
         })
         .sum();
     assert_eq!(delivered, 1024, "the queued payload must survive the stall");
-    assert_eq!(pair.dialer.next_deadline(), None);
+    assert_eq!(
+        pair.dialer.next_deadline(),
+        Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS)),
+        "once the stall clears, only yamux keepalive remains"
+    );
 }
 
 #[test]
@@ -990,8 +1019,8 @@ fn an_idle_transport_reports_no_deadline_of_its_own() {
     let pair = upgraded_pair();
     assert_eq!(
         pair.dialer.next_deadline(),
-        None,
-        "a drained connection has nothing pending"
+        Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS)),
+        "a drained connection's only outstanding work is the yamux keepalive"
     );
 }
 
@@ -1064,7 +1093,11 @@ fn an_inbound_connection_past_the_ceiling_is_refused_without_a_word() {
         announced.extend(listener.poll(Now::from_millis(0)).expect("poll listener"));
         let _ = first.poll(Now::from_millis(0)).expect("poll first");
         let _ = second.poll(Now::from_millis(0)).expect("poll second");
-        if net.is_quiet() && listener.next_deadline().is_none() {
+        if net.is_quiet()
+            && !listener
+                .next_deadline()
+                .is_some_and(|deadline| deadline.is_expired_at(Now::from_millis(0)))
+        {
             break;
         }
     }
@@ -1151,7 +1184,48 @@ fn an_established_connection_is_no_longer_on_the_handshake_clock() {
     // an idle host to do it.
     assert_eq!(
         pair.dialer.next_deadline(),
-        None,
-        "an authenticated connection has nothing outstanding"
+        Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS)),
+        "an authenticated connection is off the handshake clock; keepalive is 30s, not 5s"
+    );
+}
+
+#[test]
+fn a_quiet_connection_keeps_alive_without_opening_a_stream() {
+    let mut pair = upgraded_pair();
+    assert_eq!(
+        pair.dialer.next_deadline(),
+        Some(Deadline::from_millis(KEEPALIVE_INTERVAL_MS))
+    );
+
+    let dialer_events = pair
+        .dialer
+        .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+        .expect("dialer keepalive");
+    assert!(
+        dialer_events.is_empty(),
+        "a yamux ping is not a transport event: {dialer_events:?}"
+    );
+
+    let listener_events = pair
+        .listener
+        .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+        .expect("listener sees the ping");
+    assert!(
+        listener_events.is_empty(),
+        "answering a yamux ping must not surface as stream data: {listener_events:?}"
+    );
+
+    let ack = pair
+        .dialer
+        .poll(Now::from_millis(KEEPALIVE_INTERVAL_MS))
+        .expect("dialer sees the pong");
+    assert!(
+        ack.is_empty(),
+        "a keepalive pong is session traffic: {ack:?}"
+    );
+    assert_eq!(
+        pair.dialer.connection_ids().len(),
+        1,
+        "keepalive must not tear the connection down"
     );
 }

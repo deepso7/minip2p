@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use minip2p::{EndpointWake, Error, NatEvent};
 
@@ -14,7 +14,6 @@ use crate::{DriverFailureKind, EventDoorbell, P2pEvent};
 
 const DRIVER_POLL: Duration = Duration::from_millis(25);
 const DRIVER_IDLE_POLL: Duration = Duration::from_millis(500);
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_CARRY_EVENTS: usize = 4096;
 
 /// Rust-side instrumentation for the background driver.
@@ -184,9 +183,7 @@ pub(crate) fn run(shared: Arc<Shared>, doorbell: Arc<dyn EventDoorbell>) {
 }
 
 fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
-    let mut next_keepalive_at = Instant::now() + KEEPALIVE_INTERVAL;
     loop {
-        service_keepalive(&guard.shared, &mut next_keepalive_at);
         let mut state = guard.shared.lock_state();
         if state.lifecycle != Lifecycle::Running {
             return Ok(());
@@ -268,46 +265,6 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             ring(guard.doorbell.as_ref().expect("doorbell exists"));
         }
     }
-}
-
-fn service_keepalive(shared: &Shared, next_at: &mut Instant) {
-    let now = Instant::now();
-    if now < *next_at {
-        return;
-    }
-    advance_keepalive_deadline(next_at, now);
-    let peers = {
-        let state = shared.lock_state();
-        if state.lifecycle != Lifecycle::Running {
-            return;
-        }
-        let Some(endpoint) = state.endpoint.as_ref() else {
-            return;
-        };
-        endpoint.connected_peers()
-    };
-    for peer in keepalive_targets(&peers) {
-        let mut state = shared.lock_state();
-        if state.lifecycle != Lifecycle::Running {
-            return;
-        }
-        let Some(endpoint) = state.endpoint.as_mut() else {
-            return;
-        };
-        // A peer may disconnect between the snapshot and ping. Its
-        // close/timeout event is the authoritative signal.
-        let _ = endpoint.ping(peer);
-    }
-}
-
-fn advance_keepalive_deadline(deadline: &mut Instant, now: Instant) {
-    while *deadline <= now {
-        *deadline += KEEPALIVE_INTERVAL;
-    }
-}
-
-fn keepalive_targets<T>(peers: &[T]) -> &[T] {
-    peers
 }
 
 fn ingest(
@@ -608,25 +565,5 @@ mod tests {
             path: crate::PathKind::DirectDialed,
         };
         assert_eq!(p2p_connect_id(&extracted), Some(7));
-    }
-
-    #[test]
-    fn keepalive_deadline_advances_from_its_previous_schedule() {
-        let start = Instant::now();
-        let mut deadline = start + KEEPALIVE_INTERVAL;
-
-        advance_keepalive_deadline(
-            &mut deadline,
-            start + KEEPALIVE_INTERVAL + Duration::from_secs(25),
-        );
-
-        assert_eq!(deadline, start + Duration::from_secs(40));
-    }
-
-    #[test]
-    fn keepalive_targets_include_every_connected_peer() {
-        let peers: Vec<_> = (0..32).collect();
-
-        assert_eq!(keepalive_targets(&peers), peers);
     }
 }

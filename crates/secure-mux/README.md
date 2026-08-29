@@ -16,7 +16,7 @@ Relay circuits and TCP connections differ only in what the byte stream *is* — 
 
 ## Usage
 
-The session owns no socket, no clock, and no executor. Feed it bytes read from the underlying stream, then drain outputs and write every `Write` back to that stream:
+The session owns no socket, no clock, and no executor. Feed it bytes read from the underlying stream, then drain outputs and write every `Write` back to that stream. After the upgrade, `poll(now)` / `next_deadline()` drive Yamux keepalive from the host's time sample:
 
 ```rust
 use minip2p_secure_mux::{SecureMuxSession, SessionConfig, SessionOutput, SessionRole, YamuxConfig};

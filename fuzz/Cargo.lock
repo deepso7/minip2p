@@ -415,6 +415,7 @@ dependencies = [
  "minip2p-identity",
  "minip2p-multistream-select",
  "minip2p-noise",
+ "minip2p-platform",
  "minip2p-transport",
  "minip2p-yamux",
  "thiserror",
@@ -448,6 +449,7 @@ name = "minip2p-yamux"
 version = "0.4.8"
 dependencies = [
  "minip2p-core",
+ "minip2p-platform",
  "thiserror",
 ]
 
