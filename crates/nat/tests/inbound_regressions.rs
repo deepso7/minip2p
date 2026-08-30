@@ -137,7 +137,7 @@ fn oversized_inbound_dcutr_connect_keeps_the_relayed_path() {
     assert!(h.agent.is_idle());
 }
 
-fn answer_dcutr(h: &mut Harness, conn: ConnectionId, stream: StreamId, addrs: &[&str]) {
+fn answer_dcutr_at(h: &mut Harness, conn: ConnectionId, stream: StreamId, addrs: &[&str], t: u64) {
     let reply_addrs: Vec<_> = addrs.iter().map(|addr| maddr(addr)).collect();
     h.agent.handle_event(
         &SwarmEvent::StreamData {
@@ -146,7 +146,7 @@ fn answer_dcutr(h: &mut Harness, conn: ConnectionId, stream: StreamId, addrs: &[
             stream_id: stream,
             data: dcutr_connect_reply(&reply_addrs),
         },
-        at(20),
+        at(t),
     );
 }
 
@@ -188,9 +188,8 @@ fn direct_connection_before_circuit_handshake_does_not_downgrade_the_path() {
 }
 
 #[test]
-fn blast_schedule_respects_interval_and_deadline() {
+fn blast_schedule_starts_at_half_measured_rtt_and_respects_deadline() {
     let mut h = inbound_harness(NatConfig {
-        responder_sync_delay_ms: 0,
         blast_interval_ms: 100,
         punch_deadline_ms: 250,
         ..NatConfig::default()
@@ -198,10 +197,12 @@ fn blast_schedule_respects_interval_and_deadline() {
     let (conn, actions) = drive_to_relayed(&mut h);
     let stream = open_dcutr(&mut h, conn, &actions);
     drain_actions(&mut h.agent);
-    answer_dcutr(&mut h, conn, stream, &["/ip4/8.8.8.8/udp/4001/quic-v1"]);
+    answer_dcutr_at(&mut h, conn, stream, &["/ip4/8.8.8.8/udp/4001/quic-v1"], 20);
     drain_actions(&mut h.agent);
 
-    for (time, expected) in [(20, 1), (119, 0), (120, 1), (220, 1), (320, 0)] {
+    // CONNECT was queued at t=13 and its reply arrived at t=20. Half the
+    // measured 7 ms RTT rounds up to 4 ms, so the first blast is due at t=24.
+    for (time, expected) in [(23, 0), (24, 1), (123, 0), (124, 1), (224, 1), (274, 0)] {
         h.agent.handle_tick(at(time));
         assert_eq!(
             blast_count(&drain_actions(&mut h.agent)),
@@ -212,32 +213,55 @@ fn blast_schedule_respects_interval_and_deadline() {
 }
 
 #[test]
-fn zero_blast_interval_is_clamped_to_one_millisecond() {
+fn measured_rtt_delay_cannot_consume_the_punch_window() {
     let mut h = inbound_harness(NatConfig {
-        responder_sync_delay_ms: 0,
-        blast_interval_ms: 0,
-        punch_deadline_ms: 2,
+        punch_deadline_ms: 3_000,
         ..NatConfig::default()
     });
     let (conn, actions) = drive_to_relayed(&mut h);
     let stream = open_dcutr(&mut h, conn, &actions);
     drain_actions(&mut h.agent);
-    answer_dcutr(&mut h, conn, stream, &["/ip4/8.8.8.8/udp/4001/quic-v1"]);
+
+    // CONNECT was queued at t=13. A reply at t=6_014 measures 6_001 ms,
+    // whose half-RTT delay rounds up to 3_001 ms. The full punch window must
+    // begin at t=9_015 rather than expiring before the first blast.
+    answer_dcutr_at(
+        &mut h,
+        conn,
+        stream,
+        &["/ip4/8.8.8.8/udp/4001/quic-v1"],
+        6_014,
+    );
     drain_actions(&mut h.agent);
-    h.agent.handle_tick(at(22));
+    h.agent.handle_tick(at(9_014));
+    assert_eq!(blast_count(&drain_actions(&mut h.agent)), 0);
+    h.agent.handle_tick(at(9_015));
+    assert_eq!(blast_count(&drain_actions(&mut h.agent)), 1);
+}
+
+#[test]
+fn zero_blast_interval_is_clamped_to_one_millisecond() {
+    let mut h = inbound_harness(NatConfig {
+        blast_interval_ms: 0,
+        punch_deadline_ms: 10,
+        ..NatConfig::default()
+    });
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    drain_actions(&mut h.agent);
+    answer_dcutr_at(&mut h, conn, stream, &["/ip4/8.8.8.8/udp/4001/quic-v1"], 20);
+    drain_actions(&mut h.agent);
+    h.agent.handle_tick(at(26));
     assert_eq!(blast_count(&drain_actions(&mut h.agent)), 3);
 }
 
 #[test]
 fn peer_supplied_punch_targets_must_be_global_unicast_quic_ips() {
-    let mut h = inbound_harness(NatConfig {
-        responder_sync_delay_ms: 0,
-        ..NatConfig::default()
-    });
+    let mut h = inbound_harness(NatConfig::default());
     let (conn, actions) = drive_to_relayed(&mut h);
     let stream = open_dcutr(&mut h, conn, &actions);
     drain_actions(&mut h.agent);
-    answer_dcutr(
+    answer_dcutr_at(
         &mut h,
         conn,
         stream,
@@ -246,11 +270,12 @@ fn peer_supplied_punch_targets_must_be_global_unicast_quic_ips() {
             "/ip4/8.8.8.8/udp/4001/quic-v1",
             "/ip4/8.8.4.4/tcp/4001",
         ],
+        20,
     );
     let sync = drain_actions(&mut h.agent);
     assert!(has_reset_for(&sync, stream));
     assert!(!h.agent.owns_stream(&h.target, stream));
-    h.agent.handle_tick(at(20));
+    h.agent.handle_tick(at(24));
     let targets: Vec<_> = drain_actions(&mut h.agent)
         .into_iter()
         .filter_map(|action| match action {
