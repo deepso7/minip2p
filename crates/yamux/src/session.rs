@@ -469,7 +469,7 @@ impl YamuxSession {
                 .checked_add(payload_len)
                 .ok_or(YamuxError::Protocol("receive accounting overflow"))?;
             if !frame.payload().is_empty() {
-                data_output = Some(frame.payload().to_vec());
+                data_output = Some(frame.into_payload());
             }
             if state.delivered_since_update > self.config.receive_window / 2 {
                 let credit = state.delivered_since_update;

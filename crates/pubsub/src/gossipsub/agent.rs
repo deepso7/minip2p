@@ -12,7 +12,9 @@ use minip2p_transport::StreamId;
 
 use super::config::GossipsubConfig;
 use super::mcache::MessageCache;
-use crate::events::{PublishError, PubsubAction, PubsubEvent, PubsubToken, TopicError};
+use crate::events::{
+    PublishError, PubsubAction, PubsubEvent, PubsubToken, SharedFrame, TopicError, share_frame,
+};
 use crate::message::{
     ControlGraft, ControlIHave, ControlIWant, ControlMessage, ControlPrune, FrameDecode,
     MAX_RPC_SIZE, MAX_TOPIC_LEN, MESHSUB_PROTOCOL_ID_V10, MESHSUB_PROTOCOL_ID_V11, RawMessage, Rpc,
@@ -375,7 +377,7 @@ impl SendState {
 #[derive(Debug, Default)]
 struct PeerState {
     sender: SendState,
-    pending_messages: VecDeque<Vec<u8>>,
+    pending_messages: VecDeque<SharedFrame>,
     acknowledged_topics: BTreeSet<String>,
     /// Recently acknowledged unsubscriptions replayed after stream reopen.
     /// Bounded by `max_topics_per_peer`; active subscriptions are derived
@@ -595,7 +597,7 @@ impl GossipsubAgent {
         self.mcache
             .put(id, message, alloc::vec![String::from(topic)]);
 
-        let frame = encode_frame(&body);
+        let frame = share_frame(encode_frame(&body));
         for peer in recipients {
             if let Some(state) = self.peers.get_mut(&peer) {
                 state.pending_messages.push_back(frame.clone());
@@ -1298,7 +1300,9 @@ impl GossipsubAgent {
                     control: None,
                 }
                 .encode();
-                if body.len() <= MAX_RPC_SIZE && self.queue_message(peer, encode_frame(&body)) {
+                if body.len() <= MAX_RPC_SIZE
+                    && self.queue_message(peer, share_frame(encode_frame(&body)))
+                {
                     *self.iwant_served.entry(peer.clone()).or_default() += 1;
                 }
             }
@@ -1365,14 +1369,14 @@ impl GossipsubAgent {
             .filter(|peer| **peer != *arrival && **peer != from)
             .cloned()
             .collect();
-        let frame = encode_frame(
+        let frame = share_frame(encode_frame(
             &Rpc {
                 subscriptions: Vec::new(),
                 publish: alloc::vec![message.clone()],
                 control: None,
             }
             .encode(),
-        );
+        ));
         for peer in recipients {
             if self.queue_message(&peer, frame.clone()) {
                 self.drive_sender(&peer, now_ms);
@@ -1613,7 +1617,7 @@ impl GossipsubAgent {
             .encode();
             debug_assert_eq!(body.len(), body_len);
             Some((
-                encode_frame(&body),
+                share_frame(encode_frame(&body)),
                 FrameCommit::Subscriptions(subscriptions),
             ))
         } else {
@@ -1631,7 +1635,10 @@ impl GossipsubAgent {
                 .get_mut(peer)
                 .and_then(|state| state.pending_control.take_frame(version))
             {
-                Some((encode_frame(&body), FrameCommit::Control(items)))
+                Some((
+                    share_frame(encode_frame(&body)),
+                    FrameCommit::Control(items),
+                ))
             } else {
                 self.peers
                     .get(peer)
@@ -1650,7 +1657,7 @@ impl GossipsubAgent {
             token,
             peer: peer.clone(),
             stream_id,
-            data: frame,
+            data: frame.to_vec(),
         });
     }
 
@@ -1730,7 +1737,7 @@ impl GossipsubAgent {
         false
     }
 
-    fn queue_message(&mut self, peer: &PeerId, frame: Vec<u8>) -> bool {
+    fn queue_message(&mut self, peer: &PeerId, frame: SharedFrame) -> bool {
         let Some(state) = self.peers.get_mut(peer) else {
             return false;
         };

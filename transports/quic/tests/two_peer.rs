@@ -127,6 +127,81 @@ fn two_peers_open_stream_and_exchange_data() {
 }
 
 #[test]
+fn stream_data_is_preserved_across_connections_and_streams() {
+    let (mut server, mut client, peer_addr) = setup_pair();
+    let client_connections = [
+        client.dial(&peer_addr).expect("first dial"),
+        client.dial(&peer_addr).expect("second dial"),
+    ];
+    let mut connected_client = Vec::new();
+    let mut connected_server = Vec::new();
+
+    for _ in 0..250 {
+        let (server_events, client_events) = drive_pair_once(&mut server, &mut client);
+        for event in server_events {
+            if let TransportEvent::Connected { id, .. } = event
+                && !connected_server.contains(&id)
+            {
+                connected_server.push(id);
+            }
+        }
+        for event in client_events {
+            if let TransportEvent::Connected { id, .. } = event
+                && client_connections.contains(&id)
+                && !connected_client.contains(&id)
+            {
+                connected_client.push(id);
+            }
+        }
+        if connected_client.len() == client_connections.len()
+            && connected_server.len() == client_connections.len()
+        {
+            break;
+        }
+    }
+    assert_eq!(connected_client.len(), client_connections.len());
+    assert_eq!(connected_server.len(), client_connections.len());
+
+    let payloads = [
+        b"first connection, first stream".to_vec(),
+        b"first connection, second stream".to_vec(),
+        b"second connection, first stream".to_vec(),
+        b"second connection, second stream".to_vec(),
+    ];
+    for (connection_index, connection) in client_connections.into_iter().enumerate() {
+        for stream_index in 0..2 {
+            let stream = client.open_stream(connection).expect("open stream");
+            client
+                .send_stream(
+                    connection,
+                    stream,
+                    payloads[connection_index * 2 + stream_index].clone(),
+                )
+                .expect("send stream data");
+        }
+    }
+
+    let mut received = Vec::new();
+    for _ in 0..250 {
+        let (server_events, _) = drive_pair_once(&mut server, &mut client);
+        for event in server_events {
+            if let TransportEvent::StreamData { id, data, .. } = event
+                && connected_server.contains(&id)
+            {
+                received.push(data);
+            }
+        }
+        if received.len() == payloads.len() {
+            break;
+        }
+    }
+    received.sort();
+    let mut expected = payloads.to_vec();
+    expected.sort();
+    assert_eq!(received, expected);
+}
+
+#[test]
 fn close_stream_write_emits_remote_write_closed() {
     let (mut server, mut client, peer_addr) = setup_pair();
 
@@ -213,7 +288,7 @@ fn listener_rejects_dialer_without_mtls_identity() {
     let mut server =
         QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server bind");
     server.listen_on_bound_addr().expect("server listen");
-    let server_addr = server.local_addr().expect("server socket addr");
+    let server_addr = server.local_addr();
 
     let client_socket = UdpSocket::bind("127.0.0.1:0").expect("client socket");
     client_socket
@@ -301,7 +376,7 @@ fn listener_rejects_dialer_with_invalid_libp2p_cert() {
     let mut server =
         QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("server bind");
     server.listen_on_bound_addr().expect("server listen");
-    let server_addr = server.local_addr().expect("server socket addr");
+    let server_addr = server.local_addr();
 
     let client_socket = UdpSocket::bind("127.0.0.1:0").expect("client socket");
     client_socket
@@ -428,7 +503,7 @@ fn listen_rejects_address_mismatch_with_bound_socket() {
     let config = QuicNodeConfig::generate();
     let mut transport = QuicTransport::new(config, "127.0.0.1:0").expect("bind");
 
-    let local = transport.local_addr().expect("local addr");
+    let local = transport.local_addr();
     let mismatched_port = if local.port() == u16::MAX {
         local.port() - 1
     } else {

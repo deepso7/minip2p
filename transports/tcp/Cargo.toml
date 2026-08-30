@@ -41,8 +41,13 @@ minip2p-smoltcp = { path = "../../crates/smoltcp", version = "0.4.9", optional =
 thiserror = { version = "2.0.18", default-features = false }
 
 [dev-dependencies]
+criterion = "0.8.2"
 minip2p-identity = { path = "../../crates/identity", features = ["ed25519", "std"] }
 minip2p-secure-mux = { path = "../../crates/secure-mux" }
+
+[[bench]]
+name = "readiness_poll"
+harness = false
 
 [package.metadata.docs.rs]
 all-features = true

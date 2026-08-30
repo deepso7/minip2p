@@ -103,8 +103,8 @@ impl RelayServerDriver {
             | SwarmEvent::StreamClosed { conn_id, .. } => conn_id.is_circuit(),
             _ => false,
         };
-        // `handle_event` runs the agent tick with this same sample before it
-        // dispatches the event, preserving deadline-first ordering.
+        // The first event at this time sample runs the agent tick before
+        // dispatch, preserving deadline-first ordering for the batch.
         let claimed = self.agent.handle_event(event, is_circuit, now);
         if let SwarmEvent::ConnectionEstablished { conn_id, .. } = event
             && let Some(address) = swarm.connection_remote_addr(*conn_id).cloned()

@@ -139,6 +139,12 @@ bindings-android:
 
 bench:
     cargo bench -p minip2p-core --bench multiaddr
+    cargo bench -p minip2p-yamux --bench data_path
+    cargo bench -p minip2p-discovery --bench peer_book
+    cargo bench -p minip2p-pubsub --bench fanout
+    cargo bench -p minip2p-relay-server --bench relay_server_event
+    cargo bench -p minip2p-quic --bench idle_poll
+    cargo bench -p minip2p-tcp --bench readiness_poll
 
 fuzz seconds="30":
     cargo +nightly fuzz run wire_inputs -- -max_total_time={{seconds}}

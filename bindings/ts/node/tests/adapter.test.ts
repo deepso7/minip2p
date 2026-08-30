@@ -211,20 +211,64 @@ describe("Node adapter", () => {
     endpoint.close();
   });
 
-  test("gives timers a turn between non-empty native batches", async () => {
+  test("reuses exact native event buffers without exposing sliced bytes", async () => {
+    vi.useFakeTimers();
     const endpoint = createEndpoint();
     const fake = fakeEndpoint();
-    let timerRan = false;
-    let timerRanBeforeSecondDrain = false;
+    const exact = Uint8Array.of(1, 2, 3);
+    const backing = Uint8Array.of(9, 4, 5, 8);
+    const sliced = backing.subarray(1, 3);
+    const received: ArrayBuffer[] = [];
+    endpoint.on("message", ({ data }) => received.push(data));
+    fake.enqueue(
+      [
+        {
+          inner: {
+            data: exact,
+            fromPeerId: "remote",
+            seqno: Uint8Array.of(1),
+            signed: false,
+            topics: ["test"],
+          },
+          tag: "Message",
+        },
+        {
+          inner: {
+            data: sliced,
+            fromPeerId: "remote",
+            seqno: Uint8Array.of(2),
+            signed: false,
+            topics: ["test"],
+          },
+          tag: "Message",
+        },
+      ],
+      []
+    );
+
+    fake.ring();
+    await settle();
+
+    expect(received[0]).toBe(exact.buffer);
+    expect([...new Uint8Array(received[1])]).toEqual([4, 5]);
+    expect(received[1]).not.toBe(backing.buffer);
+    endpoint.close();
+  });
+
+  test("gives the event loop a turn between non-empty native batches", async () => {
+    const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
+    let immediateRan = false;
+    let immediateRanBeforeSecondDrain = false;
     const secondDrain = new Promise<void>((resolve) => {
       fake.onDrain = (call) => {
         if (call === 1) {
-          setTimeout(() => {
-            timerRan = true;
-          }, 0);
+          setImmediate(() => {
+            immediateRan = true;
+          });
         }
         if (call === 2) {
-          timerRanBeforeSecondDrain = timerRan;
+          immediateRanBeforeSecondDrain = immediateRan;
           resolve();
         }
       };
@@ -237,7 +281,7 @@ describe("Node adapter", () => {
     fake.ring();
     await secondDrain;
 
-    expect(timerRanBeforeSecondDrain).toBe(true);
+    expect(immediateRanBeforeSecondDrain).toBe(true);
     endpoint.close();
   });
 

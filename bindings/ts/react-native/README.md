@@ -50,9 +50,7 @@ unsubscribe();
 endpoint.close();
 ```
 
-`Minip2p.create` starts an endpoint. `useMinip2p` manages one for a React
-component, while `bindAppState` keeps its active state synchronized with the
-application.
+`Minip2p.create` starts an endpoint. `useMinip2p` manages one for a React component, while `bindAppState` keeps its active state synchronized with the application.
 
 Configuration defaults to gossipsub with signed messages and no relay or discovery. Set `mdns: true` for local discovery and ensure the host app has local-network and multicast permissions.
 

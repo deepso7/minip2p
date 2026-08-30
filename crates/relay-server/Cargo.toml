@@ -33,5 +33,10 @@ minip2p-transport = { path = "../transport", version = "0.4.9", default-features
 thiserror = { version = "2.0.18", default-features = false }
 
 [dev-dependencies]
+criterion = "0.8.2"
 minip2p-identity = { path = "../identity", version = "0.4.9" }
 minip2p-nat = { path = "../nat", version = "0.4.9" }
+
+[[bench]]
+name = "relay_server_event"
+harness = false

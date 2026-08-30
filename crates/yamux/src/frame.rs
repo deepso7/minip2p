@@ -129,6 +129,11 @@ impl Frame {
         &self.payload
     }
 
+    /// Returns the data-frame payload, consuming the frame.
+    pub(crate) fn into_payload(self) -> Vec<u8> {
+        self.payload
+    }
+
     /// Encodes this frame to its 12-byte header plus optional data payload.
     pub fn encode(&self) -> Vec<u8> {
         let mut output = Vec::with_capacity(HEADER_LEN + self.payload.len());

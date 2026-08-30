@@ -40,6 +40,7 @@ use connection::QuicConnection;
 
 const DEFAULT_IPV4_BIND: &str = "0.0.0.0:0";
 const DEFAULT_IPV6_BIND: &str = "[::]:0";
+const STREAM_READ_BUFFER_SIZE: usize = 65_535;
 /// Maximum UDP datagrams drained from the socket per `poll()` call.
 ///
 /// Bounding the drain keeps a packet flood from starving the connection
@@ -431,6 +432,8 @@ fn build_quiche_config(node_config: &QuicNodeConfig) -> Result<quiche::Config, T
 pub struct QuicTransport {
     /// Non-blocking UDP socket for all QUIC traffic.
     socket: UdpSocket,
+    /// Address fixed when `socket` was bound.
+    bound_addr: SocketAddr,
     /// Poll registration used to wait for socket readability or an external
     /// driver interrupt without consuming a datagram.
     readiness: ReadinessWait,
@@ -446,6 +449,8 @@ pub struct QuicTransport {
     pending_events: Vec<TransportEvent>,
     /// Fully encoded QUIC packets waiting for the UDP socket to become writable.
     pending_datagrams: VecDeque<PendingDatagram>,
+    /// Reused while extracting application stream data from every connection.
+    stream_read_buffer: Vec<u8>,
     /// The socket address we're listening on, if any.
     listen_addr: Option<SocketAddr>,
     /// Connection ids for this socket, namespaced by the family it is bound to
@@ -699,7 +704,7 @@ fn single_dial_family(
     addr: &PeerAddr,
     family: AddressFamily,
 ) -> Result<ConnectionId, TransportError> {
-    let local_family = family_for_socket_addr(transport.local_addr()?);
+    let local_family = family_for_socket_addr(transport.local_addr());
     if local_family != family {
         return Err(TransportError::InvalidAddress {
             context: "dial target",
@@ -918,6 +923,7 @@ impl QuicTransport {
 
         Ok(Self {
             socket,
+            bound_addr: local_addr,
             readiness,
             quiche_config,
             connections: HashMap::new(),
@@ -925,6 +931,7 @@ impl QuicTransport {
             peer_connections: HashMap::new(),
             pending_events: Vec::new(),
             pending_datagrams: VecDeque::new(),
+            stream_read_buffer: vec![0; STREAM_READ_BUFFER_SIZE],
             listen_addr: None,
             connection_ids: ConnectionIdAllocator::new(namespace),
             last_now: None,
@@ -934,12 +941,8 @@ impl QuicTransport {
     }
 
     /// Returns the local socket address this transport is bound to.
-    pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
-        self.socket
-            .local_addr()
-            .map_err(|e| TransportError::PollError {
-                reason: format!("failed to get local addr: {e}"),
-            })
+    pub fn local_addr(&self) -> SocketAddr {
+        self.bound_addr
     }
 
     /// Sends a raw UDP packet to the given multiaddr, bypassing QUIC.
@@ -967,8 +970,8 @@ impl QuicTransport {
     }
 
     /// Exposes the bound local socket address as a multiaddr for external use.
-    pub fn local_multiaddr(&self) -> Result<Multiaddr, TransportError> {
-        Ok(socket_addr_to_multiaddr(self.local_addr()?))
+    pub fn local_multiaddr(&self) -> Multiaddr {
+        socket_addr_to_multiaddr(self.local_addr())
     }
 
     /// Returns this node's `PeerId`, derived from the configured keypair.
@@ -980,7 +983,7 @@ impl QuicTransport {
     ///
     /// Combines the bound socket address with this node's `PeerId`.
     pub fn local_peer_addr(&self) -> Result<PeerAddr, TransportError> {
-        let addr = self.local_addr()?;
+        let addr = self.local_addr();
         let peer_id = self.local_peer_id();
         let multiaddr = socket_addr_to_multiaddr(addr);
         PeerAddr::new(multiaddr, peer_id).map_err(|e| TransportError::InvalidConfig {
@@ -994,7 +997,7 @@ impl QuicTransport {
     /// address the UDP socket is bound to, avoiding manual `Multiaddr`
     /// construction.
     pub fn listen_on_bound_addr(&mut self) -> Result<Multiaddr, TransportError> {
-        let addr = self.local_addr()?;
+        let addr = self.local_addr();
         let multiaddr = socket_addr_to_multiaddr(addr);
         self.listen(&multiaddr)
     }
@@ -1135,7 +1138,7 @@ impl Transport for QuicTransport {
 
         let id = self.allocate_connection_id()?;
         let peer_socket = resolve_dial_socket_addr(addr.transport(), "dial target")?;
-        let local_socket = self.local_addr()?;
+        let local_socket = self.local_addr();
 
         let scid = Self::generate_scid().map_err(|e| TransportError::DialFailed {
             id,
@@ -1209,7 +1212,7 @@ impl Transport for QuicTransport {
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
         let socket_addr = extract_listen_socket_addr(addr, "listen address")?;
 
-        let local_addr = self.local_addr()?;
+        let local_addr = self.local_addr();
         ensure_listen_matches_bound_socket(socket_addr, local_addr)?;
 
         let listen_addr = socket_addr_to_multiaddr(local_addr);
@@ -1308,13 +1311,7 @@ impl Transport for QuicTransport {
     }
 
     fn local_addresses(&self) -> Vec<Multiaddr> {
-        // If the socket isn't bound for some reason (shouldn't happen in
-        // normal usage -- we bind at construction time), return empty
-        // rather than propagate the error. The swarm uses this only to
-        // enrich Identify; a missing value is never fatal.
-        self.local_multiaddr()
-            .map(|addr| vec![addr])
-            .unwrap_or_default()
+        vec![self.local_multiaddr()]
     }
 
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
@@ -1352,7 +1349,7 @@ impl Transport for QuicTransport {
                 }
             };
 
-            let local_addr = self.local_addr()?;
+            let local_addr = self.bound_addr;
             let packet = &mut buf[..len];
 
             let parsed_header = quiche::Header::from_slice(packet, quiche::MAX_CONN_ID_LEN).ok();
@@ -1536,33 +1533,42 @@ impl Transport for QuicTransport {
         }
 
         let mut to_remove = Vec::new();
-
         let keepalive_interval_ms =
             keepalive_interval_ms(self.node_config.limits().idle_timeout_ms);
-        for (&id, conn) in self.connections.iter_mut() {
-            conn.handle_timeout(
-                &self.socket,
+        let max_pending_datagrams = self.node_config.limits().max_pending_datagrams;
+        {
+            let (connections, pending_events, pending_datagrams, stream_read_buffer) = (
+                &mut self.connections,
                 &mut self.pending_events,
                 &mut self.pending_datagrams,
-                self.node_config.limits().max_pending_datagrams,
-            )?;
-            conn.maybe_keepalive(
-                now,
-                keepalive_interval_ms,
-                &self.socket,
-                &mut self.pending_events,
-                &mut self.pending_datagrams,
-                self.node_config.limits().max_pending_datagrams,
-            )?;
-            conn.poll_streams(
-                &mut self.pending_events,
-                &self.socket,
-                &mut self.pending_datagrams,
-                self.node_config.limits().max_pending_datagrams,
-            )?;
+                &mut self.stream_read_buffer,
+            );
+            for (&id, conn) in connections.iter_mut() {
+                conn.handle_timeout(
+                    &self.socket,
+                    pending_events,
+                    pending_datagrams,
+                    max_pending_datagrams,
+                )?;
+                conn.maybe_keepalive(
+                    now,
+                    keepalive_interval_ms,
+                    &self.socket,
+                    pending_events,
+                    pending_datagrams,
+                    max_pending_datagrams,
+                )?;
+                conn.poll_streams(
+                    pending_events,
+                    &self.socket,
+                    stream_read_buffer,
+                    pending_datagrams,
+                    max_pending_datagrams,
+                )?;
 
-            if conn.is_closed() {
-                to_remove.push(id);
+                if conn.is_closed() {
+                    to_remove.push(id);
+                }
             }
         }
 
@@ -1980,6 +1986,17 @@ mod tests {
     use super::*;
     use minip2p_identity::Ed25519Keypair;
 
+    #[test]
+    fn local_addr_returns_the_address_captured_at_bind() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind socket");
+        let bound = socket.local_addr().expect("bound address");
+        let transport = QuicTransport::from_socket(QuicNodeConfig::generate(), socket)
+            .expect("construct transport");
+
+        assert_eq!(transport.bound_addr, bound);
+        assert_eq!(transport.local_addr(), bound);
+    }
+
     fn localhost_peer_addr(port: u16) -> PeerAddr {
         let keypair = Ed25519Keypair::generate();
         let transport = Multiaddr::from_protocols(vec![
@@ -2051,7 +2068,7 @@ mod tests {
             "127.0.0.1:0",
         )
         .expect("bind");
-        let destination = transport.local_addr().expect("local addr");
+        let destination = transport.local_addr();
 
         for payload in [&[1u8][..], &[2u8][..], &[3u8][..]] {
             transport.queue_datagram_best_effort(payload, destination);
@@ -2093,7 +2110,7 @@ mod tests {
     fn poll_drains_a_bounded_number_of_datagrams_per_call() {
         let mut transport =
             QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
-        let destination = transport.local_addr().expect("local addr");
+        let destination = transport.local_addr();
 
         let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
         for _ in 0..MAX_DATAGRAMS_PER_POLL + 8 {
@@ -2133,7 +2150,7 @@ mod tests {
     fn poisoned_queued_datagram_is_dropped_without_failing_the_poll() {
         let mut transport =
             QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
-        let addr = transport.local_multiaddr().expect("multiaddr");
+        let addr = transport.local_multiaddr();
         transport
             .pending_events
             .push(TransportEvent::Listening { addr: addr.clone() });
@@ -2144,7 +2161,7 @@ mod tests {
         // abort the whole endpoint.
         let bad_destination: SocketAddr = "[::1]:9".parse().expect("socket addr");
         transport.queue_datagram_best_effort(&[0u8; 4], bad_destination);
-        let good_destination = transport.local_addr().expect("local addr");
+        let good_destination = transport.local_addr();
         transport.queue_datagram_best_effort(&[0u8; 4], good_destination);
 
         let events = transport.poll(Now::from_millis(0)).expect("poll");
@@ -2208,7 +2225,7 @@ mod tests {
 
         // `dial` can queue a datagram before any poll has taken a sample. A
         // host that idled on `None` here would never flush it.
-        let destination = transport.local_addr().expect("local addr");
+        let destination = transport.local_addr();
         transport.queue_datagram_best_effort(&[0u8; 4], destination);
 
         let deadline = transport.next_deadline().expect("queued work must be due");
@@ -2233,7 +2250,7 @@ mod tests {
             "an idle transport arms no timer"
         );
 
-        let destination = transport.local_addr().expect("local addr");
+        let destination = transport.local_addr();
         transport.queue_datagram_best_effort(&[0u8; 4], destination);
         assert_eq!(
             transport.next_deadline(),
@@ -2259,7 +2276,7 @@ mod tests {
 
         let sender = UdpSocket::bind("127.0.0.1:0").expect("sender");
         sender
-            .send_to(&[1, 2, 3], transport.local_addr().expect("local addr"))
+            .send_to(&[1, 2, 3], transport.local_addr())
             .expect("send probe");
         assert_eq!(
             transport.wait_for_input(Duration::from_secs(2)),
@@ -2386,7 +2403,7 @@ mod tests {
         let mut server =
             QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("bind");
         server.listen_on_bound_addr().expect("listen");
-        let server_addr = server.local_addr().expect("local addr");
+        let server_addr = server.local_addr();
 
         // A syntactically valid Initial whose Retry token exceeds anything we
         // could have minted. Header parsing for an Initial stops after the

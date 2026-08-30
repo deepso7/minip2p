@@ -182,6 +182,7 @@ pub struct RelayServerAgent {
     events: VecDeque<RelayServerEvent>,
     pending_operations: BTreeMap<RelayServerToken, PendingOperation>,
     next_token: u64,
+    last_event_tick_ms: Option<u64>,
     reservation_limiters: AdmissionLimiters,
     circuit_limiters: AdmissionLimiters,
 }
@@ -233,6 +234,7 @@ impl RelayServerAgent {
             events: VecDeque::new(),
             pending_operations: BTreeMap::new(),
             next_token: 1,
+            last_event_tick_ms: None,
         })
     }
 
@@ -296,8 +298,12 @@ impl RelayServerAgent {
     }
 
     /// Feeds one Swarm event and returns whether the service claimed it.
+    ///
+    /// The first event for a `Now` sample processes due deadlines. Subsequent
+    /// events with that same sample share the completed sweep; call
+    /// [`handle_tick`](Self::handle_tick) to force a sweep independently.
     pub fn handle_event(&mut self, event: &SwarmEvent, is_circuit: bool, now: Now) -> bool {
-        self.handle_tick(now);
+        self.tick_before_event(now);
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
                 self.on_connection_established(peer_id.clone(), *conn_id, is_circuit);
@@ -466,6 +472,7 @@ impl RelayServerAgent {
 
     /// Processes every deadline due at or before `now`.
     pub fn handle_tick(&mut self, now: Now) {
+        self.last_event_tick_ms = Some(now.monotonic_ms);
         let expired: Vec<_> = self
             .reservations
             .iter()
@@ -539,6 +546,18 @@ impl RelayServerAgent {
         }
         self.reservation_limiters.sweep(now.monotonic_ms);
         self.circuit_limiters.sweep(now.monotonic_ms);
+    }
+
+    /// Sweeps deadlines before the first event in a driver batch.
+    ///
+    /// A single caller time sample is commonly shared by several events. New
+    /// deadlines created while handling those events are in the future unless
+    /// the clock has saturated, so rescanning unchanged state cannot make
+    /// additional progress.
+    fn tick_before_event(&mut self, now: Now) {
+        if now.monotonic_ms == u64::MAX || self.last_event_tick_ms != Some(now.monotonic_ms) {
+            self.handle_tick(now);
+        }
     }
 
     /// Reports the result of an outbound stream open.
@@ -2354,6 +2373,51 @@ mod tests {
         ));
         agent.handle_tick(Now::from_millis(2_000));
         assert_eq!(agent.poll_event(), None);
+    }
+
+    #[test]
+    fn same_time_events_expire_control_streams_before_the_first_event() {
+        let local = PeerId::from_public_key_protobuf(b"relay-same-timeout");
+        let peer = PeerId::from_public_key_protobuf(b"peer-same-timeout");
+        let config = RelayServerConfig {
+            control_stream_timeout_ms: 5,
+            ..RelayServerConfig::default()
+        };
+        let mut agent = RelayServerAgent::new(local, config).unwrap();
+        let stream = StreamKey {
+            conn_id: ConnectionId::new(34),
+            stream_id: StreamId::new(1),
+        };
+        establish(&mut agent, &peer, stream.conn_id);
+        agent.handle_event(
+            &SwarmEvent::StreamReady {
+                peer_id: peer,
+                conn_id: stream.conn_id,
+                stream_id: stream.stream_id,
+                protocol_id: HOP_PROTOCOL_ID.into(),
+                initiated_locally: false,
+            },
+            false,
+            Now::from_millis(0),
+        );
+
+        let first = SwarmEvent::ConnectionEstablished {
+            peer_id: PeerId::from_public_key_protobuf(b"first-at-deadline"),
+            conn_id: ConnectionId::new(35),
+        };
+        let second = SwarmEvent::ConnectionEstablished {
+            peer_id: PeerId::from_public_key_protobuf(b"second-at-deadline"),
+            conn_id: ConnectionId::new(36),
+        };
+        agent.handle_event(&first, false, Now::from_millis(5));
+        assert!(!agent.owns_stream(stream));
+        agent.handle_event(&second, false, Now::from_millis(5));
+
+        assert!(matches!(
+            agent.poll_action(),
+            Some(RelayServerAction::ResetStream { stream: reset, .. }) if reset == stream
+        ));
+        assert_eq!(agent.poll_action(), None);
     }
 
     #[test]

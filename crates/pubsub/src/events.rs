@@ -1,7 +1,11 @@
 //! Actions the host must execute, events for the application, and the
 //! caller-facing error types.
 
+#[cfg(not(feature = "std"))]
+use alloc::rc::Rc as Shared;
 use alloc::string::String;
+#[cfg(feature = "std")]
+use alloc::sync::Arc as Shared;
 use alloc::vec::Vec;
 
 use minip2p_core::PeerId;
@@ -10,6 +14,16 @@ use minip2p_transport::StreamId;
 /// Correlates an outbound open or write with its agent result echo.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PubsubToken(pub(crate) u64);
+
+/// Immutable framed RPC bytes shared by every recipient of one publish.
+///
+/// Pure `no_std` agents use `Rc`, while the `std` build uses `Arc` so an
+/// endpoint containing an agent remains safe to move into a driver thread.
+pub(crate) type SharedFrame = Shared<[u8]>;
+
+pub(crate) fn share_frame(frame: Vec<u8>) -> SharedFrame {
+    frame.into()
+}
 
 /// I/O the driver must perform on the agent's behalf.
 #[derive(Clone, Debug, Eq, PartialEq)]
