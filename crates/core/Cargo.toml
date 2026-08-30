@@ -18,7 +18,7 @@ default = ["std"]
 std = ["minip2p-identity/std", "thiserror/std"]
 
 [dependencies]
-minip2p-identity = { path = "../identity", version = "0.4.8", default-features = false }
+minip2p-identity = { path = "../identity", version = "0.4.9", default-features = false }
 thiserror = { version = "2.0.18", default-features = false }
 
 [dev-dependencies]
