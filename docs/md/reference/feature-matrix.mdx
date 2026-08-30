@@ -11,15 +11,15 @@ paths are actually usable.
 
 | Capability | Cargo selection | Builder activation | Active behavior | Infrastructure |
 | --- | --- | --- | --- | --- |
-| Direct QUIC, Identify, Ping, custom streams | Base | None required | Base swarm driver | A mutually reachable UDP path |
+| Direct QUIC, Identify, Ping, custom streams | Base | None required | Authenticated QUIC streams and built-in protocols | A mutually reachable UDP path |
 | Direct TCP | `tcp` | `.tcp(...)`, `.tcp_multiaddr(...)`, or `.bind_tcp(...)` | Noise-authenticated Yamux streams over TCP | A mutually reachable TCP path |
 | Portable TCP | `default-features = false, features = ["smoltcp"]` | `Endpoint::portable(...).smoltcp(...).listen(...).build()` | TCP, Noise XX, Yamux, Identify, Ping, and custom streams on a caller-driven loop | Your smoltcp device, interface, clock, and entropy |
-| Reachability probing | `nat` | `.autonat_server(server)` or a `NatConfig` with probe servers | NAT driver and AutoNAT probes | Reachable AutoNAT server |
-| Relayed connections and DCUtR | `nat` | `.relay(relay)` or relay-bearing `.nat_config(...)` | NAT driver, reservations, relay races, hole punching | Reachable Circuit Relay v2 server |
-| Gossipsub | `pubsub` | `.pubsub()` or gossipsub `.pubsub_config(...)` | Pubsub driver | At least one compatible mesh peer |
-| Floodsub | `pubsub` | `.pubsub_config(FloodsubConfig::default())` | Pubsub driver | At least one floodsub peer |
-| Signed discovery | `discovery` | `.discovery()` or `.discovery_config(...)` | Discovery, default pubsub, and NAT drivers | A connected discovery peer; relay optional for direct-only addresses |
-| Local-link discovery | `mdns` | `.mdns()` or `.mdns_config(...)` | mDNS socket driver, shared discovery book, and NAT driver | Multicast-capable local network and interface |
+| Reachability probing | `nat` | `.autonat_server(server)` or a `NatConfig` with probe servers | AutoNAT probes and reachability state | Reachable AutoNAT server |
+| Relayed connections and DCUtR | `nat` | `.relay(relay)` or relay-bearing `.nat_config(...)` | Reservations, relay races, and hole punching | Reachable Circuit Relay v2 server |
+| Gossipsub | `pubsub` | `.pubsub()` or gossipsub `.pubsub_config(...)` | Signed gossipsub messages | At least one compatible mesh peer |
+| Floodsub | `pubsub` | `.pubsub_config(FloodsubConfig::default())` | Floodsub routing | At least one floodsub peer |
+| Signed discovery | `discovery` | `.discovery()` or `.discovery_config(...)` | Signed beacons, shared peer book, and optional automatic dialing | A connected discovery peer; relay optional for direct-only addresses |
+| Local-link discovery | `mdns` | `.mdns()` or `.mdns_config(...)` | Local observations, shared peer book, and optional automatic dialing | Multicast-capable local network and interface |
 
 ## Base API
 
@@ -31,7 +31,8 @@ Always available:
 - State: `peer_id`, `connected_peers`, `is_peer_ready`, `peer_info`
 - Streams: `add_protocol`, `open_stream`, `send_stream`,
   `close_stream_write`, `reset_stream`, `abandon_stream`
-- Driving: `poll`, `next_event`, `wait_peer_ready`, `wait_ping_rtt`
+- Driving: `poll`, `next_event`, `next_wake`, `wait_peer_ready`, `wait_ping_rtt`
+- Shutdown: `close`
 
 ## TCP API
 
@@ -60,7 +61,7 @@ Compiled with `features = ["nat"]`:
 - State: `reachability`, `active_reservation`, `path`
 
 :::warning
-An AutoNAT server activates the driver but does not supply a relay path.
+An AutoNAT server enables reachability probing but does not supply a relay path.
 Configure a relay for circuits, reservations, and relay-assisted DCUtR.
 :::
 
@@ -97,7 +98,7 @@ but not `pubsub`:
 - Shared policy: `peer_discovery_config`
 - State: `known_peers`
 - Events: `take_discovery_events`, `next_discovery_event`
-- Lifecycle: `shutdown`
+- mDNS lifecycle: `shutdown` sends goodbyes and stops mDNS without closing the endpoint
 
 mDNS discovers peers only on multicast-capable local links. Its address claims
 remain unauthenticated until the selected transport verifies the peer identity.
@@ -109,13 +110,12 @@ use one bounded peer book and one automatic-dial state.
 
 ## TypeScript
 
-The Node.js and React Native native libraries include these capabilities, and
-both accept the same `Minip2pConfig`. It selects the agents and infrastructure
-used by an endpoint.
+Node.js and React Native accept the same `Minip2pConfig`. It selects the
+capabilities and infrastructure used by an endpoint.
 
 | Capability | Configuration | Active behavior | Infrastructure |
 | --- | --- | --- | --- |
-| Direct QUIC/TCP, Identify, Ping, custom streams | `secretKey`; optional `transports` and `protocols` | Native driver starts in `Minip2p.create`; transport default is dual-stack QUIC only | A mutually reachable UDP or TCP path |
+| Direct QUIC/TCP, Identify, Ping, custom streams | `secretKey`; optional `transports` and `protocols` | `Minip2p.create` starts the endpoint; transport default is dual-stack QUIC only | A mutually reachable UDP or TCP path |
 | Gossipsub | Default, or `pubsubRouter: PubsubRouter.Gossipsub` | Signed outbound pubsub and strict inbound validation | At least one compatible mesh peer |
 | Floodsub | `pubsubRouter: PubsubRouter.Floodsub` | Floodsub routing | At least one floodsub peer |
 | Signed discovery | `discovery: { topic, ... }` | Signed beacons, shared peer book, optional auto-dial | A connected discovery peer |

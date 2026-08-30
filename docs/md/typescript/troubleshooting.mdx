@@ -1,0 +1,37 @@
+---
+title: TypeScript troubleshooting
+description: Diagnose TypeScript Promise, stream, lifecycle, discovery, and mobile problems by symptom.
+---
+
+Errors are public classes exported by `@minip2p/node` and
+`@minip2p/react-native`. Use `instanceof` for recovery and the typed `kind`
+fields for diagnostics.
+
+## Common problems
+
+| Symptom | Likely cause | What to do |
+| --- | --- | --- |
+| A Promise rejects with `TimeoutError` | No matching result arrived before `timeoutMs` | Confirm the peer and network, then choose a suitable timeout. |
+| A Promise rejects with `AbortError` | Its `AbortSignal` fired | Treat cancellation as expected control flow and create a new controller before retrying. |
+| `waitPeerReady` rejects with `PeerDisconnectedError` | The connection closed before Identify completed | Reconnect and wait again. |
+| `openStream` rejects with `OpenStreamError` | The peer is not ready, lacks the protocol, or negotiation failed | Wait for `peerReady` and register the same protocol version on both peers. |
+| An inbound stream closes immediately | No named `stream` handler or waiter claimed it | Subscribe with `endpoint.on("stream", ...)`. |
+| `read()` rejects after adding a `data` handler | Pull and flowing reads were mixed | Pick one read mode for the stream lifetime. |
+| `dataOverflow` fires | Pull-mode bytes arrived faster than the application consumed them | Reset or abandon the stream and recover at the application protocol layer. |
+| `BackpressureError` is thrown by `publish` | The outbound pubsub queue is full | Slow or batch publishers and retry according to application delivery rules. |
+| AutoNAT reports state but `connect` cannot relay | `autonatServers` probe reachability but provide no relay path | Add a reachable relay address to `relays`. |
+| `queueOverflow` fires | JavaScript did not consume events quickly enough | Refresh queryable state and reduce slow event handlers. |
+
+## React Native
+
+| Symptom | Likely cause | What to do |
+| --- | --- | --- |
+| The package cannot load in Expo Go | Expo Go does not contain minip2p | Use an Expo development build. |
+| The package is missing after installation | The app was not rebuilt | Run `expo prebuild`, then rebuild the target platform. |
+| The hook remains `starting` briefly | Endpoint creation waits for the component to commit | Render the starting state and use the endpoint only when `status` is `running`. |
+| A manually created endpoint stays active in the background | Nothing is forwarding `AppState` | Call `bindAppState(endpoint)` and release it during cleanup. |
+| mDNS finds no peers | Permissions are missing, multicast is blocked, or peers do not share a link | Add the documented permissions and test on a multicast-capable network. |
+| The hook enters `failed` | Endpoint creation or the running driver failed | Use `isDriverFailure`, record its typed kind, and recreate at an application-owned level. |
+
+See the [TypeScript reference](/reference/typescript-api#public-errors) for the
+public error classes.

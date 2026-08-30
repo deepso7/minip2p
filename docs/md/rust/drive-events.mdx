@@ -14,6 +14,7 @@ with custom streams, also read [Register a protocol](/rust/register-a-protocol).
 | --- | --- | --- |
 | `poll()` | Performs one non-blocking drive and returns all currently available application events. | Existing game, UI, or reactor loops |
 | `next_event(deadline)` | Drives until one ordinary application event or the deadline. | Simple synchronous command loops |
+| `next_wake(deadline)` | Drives until an application event, optional-capability progress, interruption, or the deadline. | One loop handling ordinary and capability-specific events |
 | `wait_peer_ready` | Drives until one peer completes Identify. | Connection setup |
 | `wait_ping_rtt` | Drives until one peer's Ping finishes. | Health checks and measurements |
 | Feature-focused waits | Drive until a NAT, pubsub, signed-discovery, or mDNS result. | Feature-specific workflows |
@@ -94,7 +95,38 @@ deadline and alternate consumers.
 - Call `disconnect` to close the active peer connection.
 
 `Endpoint` does not run a background shutdown sequence after it is dropped.
-Drive any graceful application-level close exchanges before leaving scope.
+Drive any graceful application-level close exchanges before leaving scope, then
+call `endpoint.close()?`. `close` consumes the endpoint, disconnects peers, and
+briefly drains the resulting events. Dropping also disconnects, but ignores
+errors.
 
-See [Troubleshooting](/reference/troubleshooting) for common event symptoms and
+With the `mdns` feature, `endpoint.shutdown()` has a narrower meaning: it sends
+mDNS goodbyes and stops mDNS while leaving QUIC and TCP usable.
+
+## Wait for every event family
+
+`next_event` waits for ordinary endpoint events. Use `next_wake` when one loop
+also needs prompt access to NAT, pubsub, discovery, or relay-server events:
+
+```rust
+use minip2p::{Deadline, EndpointWake};
+
+loop {
+    match node.next_wake(Deadline::NEVER)? {
+        EndpointWake::Event(event) => handle_event(event),
+        EndpointWake::DriverProgress => {
+            for event in node.take_pubsub_events() {
+                handle_pubsub_event(event);
+            }
+        }
+        EndpointWake::Deadline | EndpointWake::Interrupted => {}
+    }
+}
+```
+
+`DriverProgress` remains ready while any enabled capability queue contains
+events. Drain every enabled queue before calling `next_wake` again. Leaving one
+non-empty causes the next call to return immediately.
+
+See [Rust troubleshooting](/rust/troubleshooting) for common event symptoms and
 responses.

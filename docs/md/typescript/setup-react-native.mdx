@@ -1,66 +1,89 @@
 ---
-title: React Native setup
-description: Toolchain versions, the development build, and local-network permissions for @minip2p/react-native.
+title: React Native quickstart
+description: Install @minip2p/react-native, create a development build, and connect from a component.
 ---
 
-`@minip2p/react-native` is the React Native binding for the TypeScript SDK. It
-is a native package: a TurboModule plus bundled Rust libraries. It re-exports
-the platform-neutral API from `@minip2p/core`, so application code imports only
-`@minip2p/react-native`. Install it from
-[Start](/typescript/start).
+`@minip2p/react-native` requires React Native 0.87 with the New Architecture and
+Hermes. It supports iOS 15.1 or newer and Android API 24 or newer.
 
-## Toolchain versions
+## Install
 
-The adapter requires React Native's New Architecture and Hermes.
+```bash
+npm install @minip2p/react-native
+```
 
-| Toolchain | Current requirement |
-| --- | --- |
-| React Native | 0.87, New Architecture, Hermes |
-| Node.js | 22 or newer (build toolchain) |
-| Android | SDK 36 and NDK 28.2.13676358 |
-| iOS | Xcode 26 and deployment target 15.1 or newer |
-
-## Create a development build
-
-After adding the package, rebuild the native application so React Native can
-autolink its TurboModule and bundled Rust libraries. **Expo Go is not
-supported** because it cannot load custom native code.
-
-Expo SDK 57 applications should use `expo-dev-client`:
+Rebuild the application after installation. Expo Go cannot load minip2p, so an
+Expo SDK 57 app needs a development build:
 
 ```bash
 npx expo install expo-dev-client
 npx expo prebuild
+npx expo run:ios
+# or: npx expo run:android
 ```
 
-Then build and start the target platform:
+## Connect and ping
 
-<Tabs>
-  <Tab title="iOS">
+`useMinip2p` owns the endpoint for a component. It starts the endpoint after the
+component commits and closes it during cleanup.
 
-    ```bash
-    npx expo run:ios
-    npx expo start --dev-client
-    ```
+```tsx
+import { generateSecretKey, useMinip2p } from "@minip2p/react-native";
+import { useCallback, useMemo, useState } from "react";
+import { Button, Text, View } from "react-native";
 
-  </Tab>
-  <Tab title="Android">
+export function PeerScreen({ remoteAddress }: { remoteAddress: string }) {
+  const secretKey = useMemo(() => generateSecretKey(), []);
+  const createConfig = useCallback(
+    () => ({
+      agentVersion: "my-app/0.1.0",
+      secretKey,
+    }),
+    [secretKey]
+  );
+  const node = useMinip2p(createConfig);
+  const [result, setResult] = useState("Not connected");
 
-    ```bash
-    npx expo run:android
-    npx expo start --dev-client
-    ```
+  const connect = useCallback(async () => {
+    if (node.status !== "running") return;
 
-  </Tab>
-</Tabs>
+    try {
+      const connected = await node.endpoint.connectAddr(remoteAddress, {
+        timeoutMs: 10_000,
+      });
+      await node.endpoint.waitPeerReady(connected.peerId, {
+        timeoutMs: 10_000,
+      });
+      const rttMs = await node.endpoint.ping(connected.peerId, {
+        timeoutMs: 5_000,
+      });
+      setResult(`${connected.path.kind} · ${rttMs} ms`);
+    } catch (error) {
+      setResult(error instanceof Error ? error.message : String(error));
+    }
+  }, [node, remoteAddress]);
 
-Bare React Native applications can use their normal iOS or Android build after
-installing the package. Ensure the project uses the required deployment target,
-SDK, and NDK versions above.
+  if (node.status === "starting") return <Text>Starting minip2p...</Text>;
+  if (node.status === "failed") return <Text>Failed: {String(node.error)}</Text>;
+  if (node.status === "closed") return <Text>Endpoint closed</Text>;
 
-## Local-network permissions
+  return (
+    <View>
+      <Text selectable>{node.peerId}</Text>
+      <Text selectable>{node.listenAddrs.join("\n")}</Text>
+      <Button title="Connect and ping" onPress={() => void connect()} />
+      <Text>{result}</Text>
+    </View>
+  );
+}
+```
 
-Only applications that enable mDNS need local multicast setup.
+Keep `createConfig` pure and stable for the component lifetime. Store the secret
+bytes in protected device storage when the peer needs a stable identity.
+
+## Enable local discovery
+
+Applications that use mDNS need local-network permissions.
 
 <Tabs>
   <Tab title="iOS / Expo config">
@@ -87,9 +110,7 @@ Only applications that enable mDNS need local multicast setup.
   </Tab>
 </Tabs>
 
-Rebuild the development build after changing either file; permission changes do
-not reach a running app through the JavaScript bundle.
+Rebuild after changing either file.
 
 Next: [Endpoint lifecycle](/typescript/lifecycle) or
-[Networking and events](/typescript/networking-and-events) for the mDNS and
-discovery configuration these permissions unlock.
+[Networking and events](/typescript/networking-and-events).

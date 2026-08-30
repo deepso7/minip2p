@@ -10,12 +10,8 @@ for the caller-driven event model.
 
 ## Enable gossipsub
 
-```toml
-[dependencies]
-minip2p-rs = {
-  version = "0.4.9",
-  features = ["pubsub"]
-}
+```bash
+cargo add minip2p-rs --features pubsub
 ```
 
 Then activate it on the endpoint:

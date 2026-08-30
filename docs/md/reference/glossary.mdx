@@ -1,24 +1,29 @@
 ---
 title: Glossary
-description: Short definitions for Endpoint, PeerId, Multiaddr, PeerAddr, PeerReady, Path, Sans-I/O, and driving methods.
+description: Short definitions for identities, addresses, connections, streams, events, and endpoint lifecycle.
 ---
 
 Definitions only. For recipes, follow the linked guides.
 
 | Term | Meaning |
 | --- | --- |
-| **Endpoint** | App-facing entrypoint that owns identity, transports, and the swarm driver. Std form uses sockets; portable form is caller-driven. See [Concepts](/rust/concepts#endpoint). |
+| **Endpoint** | A running minip2p peer. Rust names the type `Endpoint`; TypeScript names it `Minip2p`. |
+| **`Minip2p`** | The TypeScript endpoint type returned by `Minip2p.create` or `useMinip2p`. |
 | **PeerId** | Authenticated public-key identity of a peer. |
 | **Multiaddr** | Transport address without a peer identity (for example `/ip4/…/udp/…/quic-v1` or `/ip4/…/tcp/…`). |
 | **PeerAddr** | A `Multiaddr` plus a terminal `/p2p/<peer-id>`. Required for dialing a specific peer. |
 | **PeerReady** | Event after the first Identify exchange; safer milestone than `ConnectionEstablished` before opening app streams. |
 | **Path** | NAT result: `DirectDialed`, `DirectPunched`, or `Relayed`. See [Traverse NAT](/rust/traverse-nat). |
+| **Stream** | A negotiated byte stream for one application protocol. Writes may be split or combined, so applications add their own framing. |
+| **`useMinip2p`** | React hook that owns an endpoint for a component and closes it during cleanup. |
+| **`queueOverflow`** | TypeScript event reporting that the application did not consume events quickly enough. Refresh queryable state before relying on event history. |
 | **Sans-I/O** | Deterministic protocol/orchestration state machines; sockets and clocks live in adapters. |
 | **`poll`** | One non-blocking drive step; returns currently available application events. |
 | **`next_event`** | Drives until one ordinary application event or a deadline. |
 | **Focused wait** | Drives until a specific result (`wait_peer_ready`, `wait_path`, `next_pubsub_event`, …) while buffering unrelated events. |
-| **Compiled vs enabled** | A Cargo feature unlocks APIs; a builder method activates the driver. See [Install](/rust/install#compiled-is-not-enabled). |
+| **Available vs enabled** | A Cargo feature makes a capability available; a builder method enables it on an endpoint. See [Install](/rust/install#add-an-optional-capability). |
 | **Circuit address** | `/…/p2p/<relay>/p2p-circuit/p2p/<target>` reaches a peer through a Circuit Relay v2 reservation. |
 
-For symptom-driven fixes, see [Troubleshooting](/reference/troubleshooting).
+For symptom-driven fixes, see [Rust troubleshooting](/rust/troubleshooting) or
+[TypeScript troubleshooting](/typescript/troubleshooting).
 For APIs grouped by feature, see the [feature matrix](/reference/feature-matrix).

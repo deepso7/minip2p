@@ -66,7 +66,7 @@ await connectPromise; // rejects with AbortError
 ```
 
 For a `connect*` Promise, an abort or timeout cancels the underlying connection
-attempt. Concurrent `ping` calls to the same peer share one native Ping while
+attempt. Concurrent `ping` calls to the same peer share one Ping request while
 each caller keeps its own timeout and abort signal.
 
 Use the split-phase API when the caller must retain the connection-attempt ID:
@@ -204,7 +204,7 @@ Pull reads and flowing `data` handlers are mutually exclusive. Calling
 | --- | --- |
 | `closeWrite()` | Graceful local half-close; reading remains possible. |
 | `reset()` | Abruptly reset the stream and emit `closed`. |
-| `abandon()` | Reset, relinquish the handle, and suppress later native events. |
+| `abandon()` | Reset, relinquish the handle, and suppress later events. |
 | `stream[Symbol.dispose]()` | Equivalent to `abandon()`. |
 
 `remoteWriteClosed` means no more inbound bytes will arrive. `closed` is the

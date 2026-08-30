@@ -4,7 +4,6 @@ export default defineMeta({
   title: "TypeScript",
   icon: "braces",
   order: 2,
-  display: "group",
   pages: [
     "start",
     "setup-node",
@@ -12,5 +11,6 @@ export default defineMeta({
     "lifecycle",
     "connections-and-streams",
     "networking-and-events",
+    "troubleshooting",
   ],
 });

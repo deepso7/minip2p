@@ -1,0 +1,52 @@
+---
+title: Rust troubleshooting
+description: Diagnose Rust connection, stream, discovery, and event problems by symptom.
+---
+
+Start from the observable symptom. Rust methods return immediate failures as
+`minip2p::Error`. Problems found while driving arrive as events.
+
+## Common problems
+
+| Symptom | Likely cause | What to do |
+| --- | --- | --- |
+| `PeerAddr` fails to parse | The address lacks a terminal `/p2p/<peer-id>` | Copy the complete peer address. |
+| Dialing fails immediately | The address has the wrong shape, or its transport is unavailable | Use `/udp/<port>/quic-v1` or `/tcp/<port>` and bind that transport. |
+| A remote peer cannot dial a printed address | The address contains `0.0.0.0` or `::` | Advertise a real interface, public, or relay address. |
+| A connection exists but an application protocol cannot open | Identify has not completed | Wait for `PeerReady` before `open_stream`. |
+| `ProtocolNotRegistered` | The local endpoint never registered the protocol | Add `.protocol("/app/name/1.0.0")` or call `add_protocol`. |
+| `RemoteDoesNotSupport` | The peer does not advertise the protocol version | Register the same version on both peers. |
+| An optional capability reports "not enabled" | The Cargo feature exists, but the builder did not activate it | Add the builder method listed in the feature matrix. |
+| AutoNAT reports reachability but `connect` cannot relay | Only an AutoNAT server was configured | Add a Circuit Relay v2 server with `.relay(...)`. |
+| Hole punching fails | UDP paths or observed addresses are unusable | Keep the relay path, inspect `HolePunchFailed`, and keep both peers driving. |
+| Pubsub receives no local copy | Self-delivery is disabled | Apply the local action directly and use pubsub for remote delivery. |
+| Discovery rejects a beacon | Discovery beacons must be signed | Fix the publishing peer. `allow_unsigned` does not apply to discovery. |
+| mDNS finds no peers | mDNS is inactive, multicast is blocked, or peers do not share a link | Activate mDNS on both peers and test on a multicast-capable network. |
+| A focused wait returns `EventBacklogExceeded` | Unrelated events filled the preserved backlog | Drain ordinary events, handle the busy source, and retry. |
+
+## Event responses
+
+| Event | Typical response |
+| --- | --- |
+| `Event::PeerReady` | Open application streams or record the peer as usable. |
+| `Event::StreamReady` | Attach the stream to its protocol handler. |
+| `Event::StreamData` | Feed the bytes into the application's decoder. |
+| `Event::StreamRemoteWriteClosed` | Finish decoding and optionally close the local write side. |
+| `Event::Error` | Record the structured context and decide whether to retry. |
+| `NatEvent::PathEstablished` | Begin traffic with the ordinary stream methods. |
+| `NatEvent::PathUpgraded` | Update path state. Existing peer operations keep working. |
+| `NatEvent::ConnectFailed` | Inspect the error, correct the candidates or infrastructure, and retry. |
+| `PubsubEvent::OutboundFailure` | Retry only if the application requires it. |
+| `DiscoveryEvent::DialFailed` | Keep discovery running. Backoff controls later attempts. |
+
+## Debug in order
+
+1. Confirm that both endpoints keep calling `poll`, `next_event`, `next_wake`,
+   or a focused wait.
+2. Log the complete peer address and local peer ID.
+3. Distinguish an authenticated connection from `PeerReady`.
+4. Confirm both the Cargo feature and its builder method.
+5. Read the event queue owned by the capability you are using.
+
+For the complete capability map, see the
+[feature matrix](/reference/feature-matrix).

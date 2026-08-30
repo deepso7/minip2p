@@ -24,7 +24,8 @@ Set `MINIP2P_INSTALL_DIR` to install without root, or `MINIP2P_VERSION` to
 select a release:
 
 ```bash
-MINIP2P_INSTALL_DIR="$HOME/.local/bin" sh relay.sh
+curl -fsSL https://minip2p.com/install/relay.sh | \
+  MINIP2P_INSTALL_DIR="$HOME/.local/bin" sh
 ```
 
 ### Install the service

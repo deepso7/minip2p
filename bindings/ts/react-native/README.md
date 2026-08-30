@@ -1,16 +1,16 @@
 # @minip2p/react-native
 
-React Native bindings for [minip2p](https://minip2p.com), with the platform-neutral `@minip2p/core` API and bundled Android and iOS libraries.
+The React Native package for [minip2p](https://minip2p.com).
 
 The package is pre-1.0 and may introduce breaking changes between releases.
 
 ## Requirements
 
-- React Native 0.85 with the New Architecture and Hermes
+- React Native 0.87 with the New Architecture and Hermes
 - iOS 15.1 or newer
 - Android API 24 or newer
 
-Expo Go cannot load custom Rust and C++ native libraries. Expo projects must use a [development build](https://docs.expo.dev/develop/development-builds/introduction/).
+Expo Go cannot load minip2p. Expo projects must use a [development build](https://docs.expo.dev/develop/development-builds/introduction/).
 
 ## Installation
 
@@ -50,17 +50,19 @@ unsubscribe();
 endpoint.close();
 ```
 
-`Minip2p.create` starts the native driver. `useMinip2p` manages an endpoint for a React component, while `bindAppState` keeps its foreground state synchronized.
+`Minip2p.create` starts an endpoint. `useMinip2p` manages one for a React
+component, while `bindAppState` keeps its active state synchronized with the
+application.
 
 Configuration defaults to gossipsub with signed messages and no relay or discovery. Set `mdns: true` for local discovery and ensure the host app has local-network and multicast permissions.
 
 ## Important behavior
 
 - Operations support timeouts and `AbortSignal` cancellation.
-- Native events are delivered FIFO through a bounded queue; handle `queueOverflow` by refreshing queryable state.
+- Events are delivered FIFO through a bounded queue; handle `queueOverflow` by refreshing queryable state.
 - Use a named `stream` handler to claim inbound streams.
 - Unsigned pubsub payloads and peer IDs are attacker-controlled.
-- `close()` rejects pending work, closes streams, and releases the native endpoint.
+- `close()` rejects pending work, closes streams, and shuts down the endpoint.
 
 ## License
 

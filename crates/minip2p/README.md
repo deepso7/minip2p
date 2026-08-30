@@ -4,7 +4,7 @@ Application-facing `Endpoint` API for minip2p.
 
 ```toml
 [dependencies]
-minip2p = { package = "minip2p-rs", version = "0.4.0" }
+minip2p = { package = "minip2p-rs", version = "0.4.9" }
 ```
 
 The package is named `minip2p-rs` on crates.io and its library target remains
@@ -51,7 +51,7 @@ host owns the smoltcp device and interface; minip2p owns the TCP, Noise XX,
 Yamux, Identify, Ping, and application-protocol state above them:
 
 ```toml
-minip2p = { package = "minip2p-rs", version = "0.4.0", default-features = false, features = ["smoltcp", "pubsub"] }
+minip2p = { package = "minip2p-rs", version = "0.4.9", default-features = false, features = ["smoltcp", "pubsub"] }
 ```
 
 The portable smoltcp builder can compose TCP, pubsub, signed-beacon discovery,
@@ -132,7 +132,7 @@ by the TCP-only portable endpoint.
 
 QUIC comes with the default `std + quic` features. TCP is opt-in via the `tcp`
 Cargo feature, so a QUIC-only app does not pull in the TCP stack. Enable it
-with `minip2p-rs = { version = "0.4.0", features = ["tcp"] }`.
+with `minip2p-rs = { version = "0.4.9", features = ["tcp"] }`.
 
 An endpoint brings up whatever you asked it to bind, then routes by address.
 `quic`, `quic_dual_stack`, and `tcp` add sockets; `bind` brings them all up:

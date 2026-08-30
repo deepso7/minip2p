@@ -1,42 +1,67 @@
 ---
-title: Node.js setup
-description: Module format, the Node.js version requirement, and the prebuilt native addons behind @minip2p/node.
+title: Node.js quickstart
+description: Install @minip2p/node, connect to a peer, and measure a Ping RTT.
 ---
 
-`@minip2p/node` is the Node.js binding for the TypeScript SDK. It loads the
-prebuilt native driver and re-exports the platform-neutral API from
-`@minip2p/core`, so application code imports only `@minip2p/node`. Install it from
-[Start](/typescript/start).
+`@minip2p/node` requires Node.js 24 or newer and uses ES modules.
 
-## Runtime requirements
+## Install
 
-The package is ESM-only and requires **Node.js 24 or newer**. Load it with
-`import`; there is no CommonJS entry point.
+```bash
+npm install @minip2p/node
+```
 
-## Prebuilt native addons
+## Connect and ping
 
-Installation selects a prebuilt native addon from an optional platform package,
-so no Rust toolchain or install script runs on the target machine. Each target
-ships as `@minip2p/node-<target>`, listed in the `optionalDependencies` of
-`@minip2p/node`; the package manager installs the one that matches the host and
-skips the rest.
+Create `connect.mjs`:
 
-| Platform | Prebuilt targets | Packages |
-| --- | --- | --- |
-| Linux | x64 and arm64, glibc and musl | `@minip2p/node-linux-x64-gnu`, `-linux-x64-musl`, `-linux-arm64-gnu`, `-linux-arm64-musl` |
-| macOS | Apple silicon and Intel | `@minip2p/node-darwin-arm64`, `-darwin-x64` |
-| Windows | x64 (MSVC) | `@minip2p/node-win32-x64-msvc` |
+```ts
+import { Minip2p, generateSecretKey } from "@minip2p/node";
 
-There is no build-from-source fallback. A host outside this matrix has no addon
-to load, and a package manager configured to skip optional dependencies leaves
-the addon missing.
+const remoteAddress = process.argv[2];
+if (remoteAddress === undefined) {
+  throw new Error("pass a peer multiaddress");
+}
 
-## Process lifetime
+const endpoint = Minip2p.create({
+  agentVersion: "my-app/0.1.0",
+  secretKey: generateSecretKey(),
+});
 
-A started endpoint holds a strong event-loop reference, so the process stays
-alive until `endpoint.close()` is called. Wire that call to your termination
-signals: see [Endpoint lifecycle](/typescript/lifecycle) for signal handling,
-identity persistence, and shutdown.
+try {
+  console.log("local peer", endpoint.peerId());
+  console.log(endpoint.listenAddrs().join("\n"));
 
-Next: [Endpoint lifecycle](/typescript/lifecycle) or the
-[TypeScript API reference](/reference/typescript-api).
+  const connected = await endpoint.connectAddr(remoteAddress, {
+    timeoutMs: 10_000,
+  });
+  await endpoint.waitPeerReady(connected.peerId, { timeoutMs: 10_000 });
+  const rttMs = await endpoint.ping(connected.peerId, { timeoutMs: 5_000 });
+
+  console.log(`${connected.path.kind} · ${rttMs} ms`);
+} finally {
+  endpoint.close();
+}
+```
+
+Run it with a complete peer multiaddress:
+
+```bash
+node connect.mjs /ip4/192.0.2.7/udp/4001/quic-v1/p2p/12D3KooW...
+```
+
+The address must end in `/p2p/<peer-id>`. `connectAddr` returns the first usable
+path. `waitPeerReady` then waits for the peer's Identify information before the
+application starts protocol work.
+
+`generateSecretKey()` creates a new peer identity on every run. Load the same
+secret bytes from protected storage when the peer needs a stable ID.
+
+## Keep a service running
+
+A running endpoint keeps the Node.js process alive. Long-running applications
+should close it during shutdown. See [Endpoint lifecycle](/typescript/lifecycle)
+for signal handling and identity persistence.
+
+Next: [Connections and streams](/typescript/connections-and-streams) or
+[Networking and events](/typescript/networking-and-events).

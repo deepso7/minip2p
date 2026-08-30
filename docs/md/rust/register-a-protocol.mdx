@@ -47,22 +47,26 @@ loop {
         .next_event(Duration::from_secs(10))?
         .ok_or("stream negotiation timed out")?;
 
-    if let minip2p::Event::StreamReady {
-        peer_id: peer,
-        stream_id: ready,
-        protocol_id,
-        ..
-    } = event
-        && peer == peer_id
-        && ready == stream_id
-        && protocol_id == ECHO_PROTOCOL
-    {
-        node.send_stream(&peer_id, stream_id, b"hello".to_vec())?;
-        node.close_stream_write(&peer_id, stream_id)?;
-        break;
+    match event {
+        minip2p::Event::StreamReady {
+            peer_id: peer,
+            stream_id: ready,
+            protocol_id,
+            ..
+        } if peer == peer_id
+            && ready == stream_id
+            && protocol_id == ECHO_PROTOCOL => {
+            node.send_stream(&peer_id, stream_id, b"hello".to_vec())?;
+            node.close_stream_write(&peer_id, stream_id)?;
+            break;
+        }
+        other => handle_other_event(other),
     }
 }
 ```
+
+Put this match in the application's ordinary event dispatcher. Do not discard
+events for other peers or streams while waiting for negotiation.
 
 QUIC is a byte stream: writes can be fragmented or coalesced. Add framing when
 one application message must be distinguishable from the next.

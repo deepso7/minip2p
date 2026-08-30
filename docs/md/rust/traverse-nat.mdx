@@ -4,9 +4,9 @@ description: Configure relay and AutoNAT, establish the first usable path, and o
 ---
 
 This guide starts where direct [listen and dial](/rust/listen-and-dial) leaves
-off. It configures the NAT driver, races direct and relayed paths, and tracks
-later upgrades or fallback. Relayed paths require a reachable Circuit Relay v2
-server, which minip2p can host.
+off. It configures relays and AutoNAT, races direct and relayed paths, and
+tracks later upgrades or fallback. Relayed paths require a reachable Circuit
+Relay v2 server, which minip2p can host.
 
 <Badge>pre-1.0</Badge>
 
@@ -33,23 +33,19 @@ concrete listeners. Address changes affect future Identify responses only.
 There is no automatic relay discovery: distribute the printed peer address to
 clients explicitly. See the [hosting guide](https://github.com/deepso7/minip2p/tree/main/examples/relay-server).
 
-## Compile and activate the driver
+## Enable NAT traversal
 
-```toml
-[dependencies]
-minip2p-rs = {
-  version = "0.4.9",
-  features = ["nat"]
-}
+```bash
+cargo add minip2p-rs --features nat
 ```
 
-Builder configuration determines what the active driver can do:
+Builder configuration determines the available behavior:
 
 | Builder configuration | What it enables |
 | --- | --- |
 | `.relay(relay)` | Relay connects, reservations, and relay-assisted DCUtR |
 | `.autonat_server(server)` | Reachability probes only, unless a relay is also configured |
-| `.nat_config(config)` | NAT driver with explicit timeouts, retries, relays, probes, and reservation policy |
+| `.nat_config(config)` | Explicit timeouts, retries, relays, probes, and reservation policy |
 | `.discovery()` | NAT coordination as part of discovery, with whatever relay/probe infrastructure is also configured |
 
 ```rust
@@ -63,8 +59,8 @@ let mut node = Endpoint::builder()
 node.listen_all()?;
 ```
 
-Calling `.autonat_server(...)` alone creates a working reachability-probe
-driver, but it does not create a relay leg. Configure a relay for relayed
+Calling `.autonat_server(...)` alone enables reachability probes, but it does
+not create a relay leg. Configure a relay for relayed
 connections, inbound reservations, and relay-assisted hole punching.
 
 ## Choose a connect method

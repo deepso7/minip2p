@@ -31,4 +31,9 @@ just docs-site
 
 The Rust programs under `snippets/` back the main copy-paste examples. Keep
 their corresponding MDX code blocks in sync and compile both fixtures after
-changing an API example.
+changing an example:
+
+```bash
+cargo check --manifest-path docs/snippets/quickstart/Cargo.toml
+cargo check --manifest-path docs/snippets/custom-stream/Cargo.toml
+```

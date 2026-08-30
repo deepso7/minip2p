@@ -9,7 +9,7 @@ on it.
 ## Endpoint
 
 `Endpoint` owns an Ed25519 identity, the transports you bound, and the
-synchronous swarm driver. It is the app-facing entrypoint for listening,
+connection state. It is the app-facing entrypoint for listening,
 dialing, Ping, Identify, and application streams. QUIC is on by default; add
 the `tcp` feature to use QUIC and TCP together, or bind only TCP.
 
@@ -78,7 +78,7 @@ These are separate paths with different policy:
 The base `dial*` methods only start direct dials. The address picks QUIC or
 TCP. They do not reserve on a relay or perform DCUtR.
 
-With the `nat` feature and an activated NAT driver, `connect*` can race direct
+With the `nat` capability enabled, `connect*` can race direct
 candidates against a relay leg. The first usable result is:
 
 - `Path::DirectDialed`: a supplied direct address connected;
@@ -89,15 +89,14 @@ A relayed path can later emit `NatEvent::PathUpgraded` when hole punching
 lands.
 
 :::warning
-Compiling a Cargo feature only exposes its API. Activate the corresponding
-driver on `EndpointBuilder`; see [Install](/rust/install#compiled-is-not-enabled).
+A Cargo feature makes a capability available. Enable it on `EndpointBuilder`;
+see [Install](/rust/install#add-an-optional-capability).
 :::
 
 ## Where events go
 
 Ordinary connection, Identify, Ping, and application stream events come from
-`poll` or `next_event`. Enabled feature drivers consume their own control
-streams and expose focused queues:
+`poll` or `next_event`. Enabled capabilities expose their own event queues:
 
 - `take_nat_events` / `next_nat_event`;
 - `take_pubsub_events` / `next_pubsub_event`;

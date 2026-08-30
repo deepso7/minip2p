@@ -7,6 +7,5 @@ export default defineMeta({
     "feature-matrix",
     "glossary",
     "typescript-api",
-    "troubleshooting",
   ],
 });

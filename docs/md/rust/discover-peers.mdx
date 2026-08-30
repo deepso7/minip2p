@@ -3,42 +3,21 @@ title: Discover peers
 description: Activate signed presence beacons or local-link mDNS with a bounded peer book and automatic dialing.
 ---
 
-Signed discovery builds on [pubsub](/rust/pubsub) and can use a configured
-relay. mDNS needs no pubsub or relay, but its observations are unauthenticated
-and automatic dials from them are always direct-only. See
-[Traverse NAT](/rust/traverse-nat) before adding relayed paths.
+Choose the source that matches where peers meet:
 
-<Badge>pre-1.0</Badge> <Badge>signed: nat + pubsub</Badge> <Badge>mDNS: nat</Badge>
+- Use mDNS for peers on the same local network.
+- Use signed discovery when peers already share a pubsub mesh.
+- Enable both when the application needs both sources.
 
-Discovery layers signed presence beacons and dialing policy over pubsub and
-the NAT agent.
+Both sources feed one bounded peer book and one automatic-dial policy.
 
-For zero-configuration LAN discovery without pubsub, enable the `mdns` Cargo
-feature and call `.mdns()`. Enabling both sources feeds one address book and
-one dial state:
+## Enable signed discovery
 
-```rust
-let node = minip2p::Endpoint::builder()
-    .discovery()
-    .mdns()
-    .bind_quic_dual_stack()?;
+```bash
+cargo add minip2p-rs --features discovery
 ```
 
-mDNS addresses are unauthenticated until QUIC/TLS verifies the remote peer.
-`KnownPeer::beacon_addrs` and `KnownPeer::mdns_addrs` expose their provenance.
-
-## Compile and activate discovery
-
-```toml
-[dependencies]
-minip2p-rs = {
-  version = "0.4.9",
-  features = ["discovery"]
-}
-```
-
-The Cargo feature includes the `nat` and `pubsub` APIs. Runtime activation is
-separate:
+Signed discovery publishes application-scoped presence beacons over pubsub:
 
 ```rust
 let mut node = minip2p::Endpoint::builder()
@@ -48,10 +27,9 @@ let mut node = minip2p::Endpoint::builder()
 node.listen_all()?;
 ```
 
-`.discovery()` activates three coordinated pieces: the discovery driver,
-default gossipsub, and the NAT agent. `.discovery_config(...)` does the same
-with a caller-selected `BeaconConfig` (topic, cadence, announcement cap).
-Tune the shared address book and dial policy with `.peer_discovery_config(...)`.
+`.discovery_config(...)` selects a custom topic, publication cadence, and
+announcement limit. Tune the shared address book and dial policy with
+`.peer_discovery_config(...)`.
 
 Discovery can dial direct addresses announced by other peers without a relay.
 A configured relay is still required for relay circuits, reservations, and
@@ -64,10 +42,32 @@ let node = minip2p::Endpoint::builder()
     .bind_quic_dual_stack()?;
 ```
 
+## Enable local mDNS
+
+```bash
+cargo add minip2p-rs --features mdns
+```
+
+Then enable it on the endpoint:
+
+```rust
+let node = minip2p::Endpoint::builder()
+    .mdns()
+    .bind_quic_dual_stack()?;
+```
+
+mDNS needs no pubsub or relay. Its observations are unauthenticated until the
+transport verifies the remote peer, and its automatic dials remain direct-only.
+`KnownPeer::beacon_addrs` and `KnownPeer::mdns_addrs` show where each address
+came from.
+
+Enable both methods on the same builder when the application needs LAN and
+pubsub-based discovery.
+
 ## How peers appear
 
 Each endpoint periodically publishes a signed beacon containing its current
-dialable address snapshot. The driver:
+dialable address snapshot. Discovery:
 
 1. verifies the beacon identity and signature;
 2. normalizes and bounds the advertised addresses;
@@ -132,7 +132,7 @@ beacons are rejected even when application pubsub was configured with
 :::
 
 :::note
-The discovery topic is driver-owned. Manually subscribing is redundant, and
+minip2p owns the discovery topic. Manually subscribing is redundant, and
 its pubsub messages are consumed before reaching application pubsub events.
 Calling `unsubscribe` for that topic returns
 `PubsubError::DiscoveryTopicReserved`.

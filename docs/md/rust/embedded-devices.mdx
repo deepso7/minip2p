@@ -18,13 +18,8 @@ driving loop change.
 Disable default features. `smoltcp` pulls in portable TCP and the shared
 embedded stack:
 
-```toml
-[dependencies]
-minip2p-rs = {
-  version = "0.4.9",
-  default-features = false,
-  features = ["smoltcp"]
-}
+```bash
+cargo add minip2p-rs --no-default-features --features smoltcp
 ```
 
 Add only what you need:
@@ -89,7 +84,8 @@ should advertise something peers can dial right away. When DHCP or SLAAC
 changes the interface addresses, update the shared smoltcp interface; the
 adapters see that on later polls.
 
-Optional services go on the same builder:
+Optional services go on the same builder. The following example requires the
+`smoltcp` and `pubsub` features because signed discovery uses pubsub:
 
 ```rust
 let mut endpoint = Endpoint::portable(&identity, entropy)
@@ -100,8 +96,9 @@ let mut endpoint = Endpoint::portable(&identity, entropy)
     .build()?;
 ```
 
-This example needs `features = ["smoltcp", "pubsub"]`. `.discovery()` turns on
-default pubsub for signed beacons; mDNS does not use pubsub.
+For this combination, install with
+`cargo add minip2p-rs --no-default-features --features smoltcp,pubsub`. mDNS
+does not use pubsub.
 
 ## Drive time and network progress
 
@@ -131,7 +128,7 @@ loop {
 }
 ```
 
-Wake early when the network driver gets a frame or transmit capacity frees up.
+Wake early when the network stack gets a frame or transmit capacity frees up.
 `PollDeadline::IMMEDIATE` means poll again without sleeping; `None` means
 minip2p has no timer armed, but a network interrupt must still wake the loop.
 

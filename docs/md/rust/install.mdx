@@ -1,160 +1,19 @@
 ---
 title: Install
-description: Install minip2p for Rust and choose the network features your endpoint needs.
+description: Install minip2p for Rust and choose the network capabilities your application needs.
 ---
 
-:::note
-Building on Node.js or React Native? Go to
-[Start with TypeScript](/typescript/start) for package installation, the
-first connection, and the per-runtime setup pages.
-:::
+minip2p requires Rust 1.91 or newer. The package is named `minip2p-rs` on
+crates.io and imported as `minip2p` in Rust code.
 
-minip2p requires **Rust 1.91 or newer**. The application-facing crate is
-published to crates.io as `minip2p-rs` and imported in Rust code as `minip2p`.
+## Install the default endpoint
 
-### Add the dependency
+```bash
+cargo add minip2p-rs
+```
 
-<Tabs>
-  <Tab title="cargo add">
-
-    ```bash
-    cargo add minip2p-rs
-    ```
-
-  </Tab>
-  <Tab title="Cargo.toml">
-
-    ```toml
-    [dependencies]
-    minip2p-rs = "0.4.9"
-    ```
-
-  </Tab>
-</Tabs>
-
-The base crate includes QUIC, mutual peer authentication, Identify, Ping, and
-registered application protocols.
-
-### Choose optional features
-
-Features expose APIs at compile time. Builder methods decide which drivers run
-inside a particular endpoint.
-
-<Tabs>
-  <Tab title="TCP">
-
-    ```toml
-    minip2p-rs = {
-      version = "0.4.9",
-      features = ["tcp"]
-    }
-    ```
-
-    This adds the TCP transport and its `tcp`, `tcp_multiaddr`, `bind_tcp`,
-    and `tcp_config` builder methods. Skip it if you only need QUIC, and the
-    TCP stack will not be linked.
-
-  </Tab>
-  <Tab title="Embedded / no_std">
-
-    ```toml
-    minip2p-rs = {
-      version = "0.4.9",
-      default-features = false,
-      features = ["smoltcp"]
-    }
-    ```
-
-    This unlocks `Endpoint::portable(...)` and the smoltcp builder. You
-    supply the network device, clock samples, and entropy; minip2p runs TCP,
-    Noise XX, Yamux, Identify, Ping, and any protocols you register. It needs
-    no OS or async runtime. Add `pubsub`, `portable-autonat`, or `portable-relay`
-    if you need them. Continue with
-    [Embedded devices](/rust/embedded-devices) for stack setup,
-    driving, and memory budgeting.
-
-  </Tab>
-  <Tab title="NAT">
-
-    ```toml
-    minip2p-rs = {
-      version = "0.4.9",
-      features = ["nat"]
-    }
-    ```
-
-    Then activate the NAT driver with `.relay(...)`,
-    `.autonat_server(...)`, or `.nat_config(...)`.
-
-  </Tab>
-  <Tab title="Pubsub">
-
-    ```toml
-    minip2p-rs = {
-      version = "0.4.9",
-      features = ["pubsub"]
-    }
-    ```
-
-    Then activate pubsub with `.pubsub()` or `.pubsub_config(...)`.
-
-  </Tab>
-  <Tab title="Discovery">
-
-    ```toml
-    minip2p-rs = {
-      version = "0.4.9",
-      features = ["discovery"]
-    }
-    ```
-
-    The `discovery` Cargo feature includes the `nat` and `pubsub` APIs.
-    Calling `.discovery()` or `.discovery_config(...)` activates discovery,
-    default pubsub, and the NAT agent together. Use
-    `.peer_discovery_config(...)` to tune the shared peer book and automatic-dial
-    policy.
-
-  </Tab>
-  <Tab title="mDNS">
-
-    ```toml
-    minip2p-rs = {
-      version = "0.4.9",
-      features = ["mdns"]
-    }
-    ```
-
-    The `mdns` Cargo feature includes the `nat` APIs but does not include
-    pubsub. Calling `.mdns()` or `.mdns_config(...)` activates local-link
-    multicast discovery and the shared peer book. Use
-    `.peer_discovery_config(...)` to tune that book and its automatic-dial
-    policy.
-
-  </Tab>
-</Tabs>
-
-:::warning
-`.autonat_server(...)` by itself enables reachability probing, not a complete
-traversal path. Configure a relay when the endpoint must establish relayed
-connections or perform relay-assisted hole punching.
-:::
-
-### Compiled is not enabled
-
-| Cargo selection | Builder activation | Result |
-| --- | --- | --- |
-| Base | None required | QUIC, Identify, Ping, custom protocols |
-| `default-features = false, features = ["smoltcp"]` | `Endpoint::portable(...).smoltcp(...).listen(...).build()` | Portable TCP on your embedded stack |
-| `features = ["tcp"]` | `.tcp(...)`, `.tcp_multiaddr(...)`, or `.bind_tcp(...)` | QUIC and TCP together, or TCP alone |
-| `features = ["nat"]` | `.relay`, `.autonat_server`, or `.nat_config` | NAT driver runs with the supplied capabilities |
-| `features = ["pubsub"]` | `.pubsub` or `.pubsub_config` | Gossipsub or floodsub driver runs |
-| `features = ["discovery"]` | `.discovery` or `.discovery_config` | Discovery, default pubsub, and NAT coordination run |
-| `features = ["mdns"]` | `.mdns` or `.mdns_config` | Local-link mDNS, shared discovery-book, and NAT coordination run |
-
-See the [feature matrix](/reference/feature-matrix) for the methods, events,
-and infrastructure each option adds.
-
-### Check the Rust installation
+The default endpoint listens over QUIC and includes peer authentication,
+Identify, Ping, and custom protocol streams.
 
 ```rust
 use minip2p::Endpoint;
@@ -166,11 +25,40 @@ fn main() -> Result<(), minip2p::Error> {
 }
 ```
 
-Run it with:
+Continue to [Connect two peers](/rust/connect-peers) if that is enough for the
+application.
+
+## Add an optional capability
+
+Add only the capabilities the application uses:
+
+| Need | Install | Enable on the endpoint |
+| --- | --- | --- |
+| TCP | `cargo add minip2p-rs --features tcp` | Bind a TCP listener. |
+| Relay paths and NAT traversal | `cargo add minip2p-rs --features nat` | Configure a relay, an AutoNAT server, or both. |
+| Pubsub | `cargo add minip2p-rs --features pubsub` | Call `.pubsub()` or provide a pubsub configuration. |
+| Signed discovery | `cargo add minip2p-rs --features discovery` | Call `.discovery()` or provide a discovery configuration. |
+| Local mDNS | `cargo add minip2p-rs --features mdns` | Call `.mdns()` or provide an mDNS configuration. |
+
+A Cargo feature makes the capability available. The corresponding builder
+method turns it on for an endpoint. The feature matrix lists the exact methods
+and required network infrastructure.
+
+:::note
+An AutoNAT server measures reachability. It does not provide a relay path.
+Configure a Circuit Relay v2 server when peers need relayed connections or
+relay-assisted hole punching.
+:::
+
+## Run without an operating system
+
+For a `no_std + alloc` endpoint over smoltcp:
 
 ```bash
-cargo run
+cargo add minip2p-rs --no-default-features --features smoltcp
 ```
 
-The endpoint generates an ephemeral Ed25519 identity when no identity is
-provided. Continue to [Connect two peers](/rust/connect-peers).
+The host supplies network I/O, monotonic time, and secure entropy. Continue to
+[Embedded devices](/rust/embedded-devices) for the complete setup.
+
+See the [feature matrix](/reference/feature-matrix) when combining capabilities.

@@ -139,7 +139,7 @@ as `Event::ConnectionClosed`.
 ## `dial` is direct-only
 
 `dial*` does not reserve on a relay, establish a circuit, or start DCUtR. When
-the application has enabled the `nat` feature and configured its NAT driver,
+the application has enabled and configured NAT traversal,
 use `connect*` plus `wait_path` instead. See
 [Traverse NAT](/rust/traverse-nat).
 

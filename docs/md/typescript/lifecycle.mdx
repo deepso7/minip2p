@@ -3,8 +3,8 @@ title: Endpoint lifecycle
 description: Persist an identity, own the endpoint lifetime on each runtime, and shut down cleanly.
 ---
 
-A `Minip2p` object owns one native endpoint. Its identity, driver, events,
-pending Promises, and streams all share that lifetime.
+A `Minip2p` object owns one endpoint. Its identity, events, pending Promises,
+and streams all share that lifetime.
 
 ## Identity first
 
@@ -81,8 +81,8 @@ using endpoint = Minip2p.create({ secretKey });
 
 <Badge>React Native</Badge>
 
-`useMinip2p` is the normal component API. It starts in `starting`, then exposes
-the endpoint only after native construction succeeds.
+`useMinip2p` is the normal component interface. It starts in `starting`, then
+exposes the endpoint after creation succeeds.
 
 ```tsx
 const node = useMinip2p(createConfig);
@@ -101,10 +101,10 @@ switch (node.status) {
 
 | Status | Available state |
 | --- | --- |
-| `starting` | Native construction is scheduled after commit. |
+| `starting` | Endpoint creation is scheduled after commit. |
 | `running` | `endpoint`, `peerId`, and the initial `listenAddrs`. |
 | `closed` | The endpoint closed normally. |
-| `failed` | Construction failed or the native driver stopped unexpectedly. |
+| `failed` | Creation failed or the endpoint stopped unexpectedly. |
 
 Every state also carries an idempotent `close()` callback. Component cleanup
 unbinds `AppState` and closes the endpoint automatically.
@@ -114,17 +114,14 @@ Use `isDriverFailure(node)` to narrow a failed hook state to
 
 :::warning
 Keep the configuration factory pure and stable. React may render a component
-without committing it; the hook deliberately creates native state only in the
-committed effect.
+without committing it; the hook creates the endpoint only after commit.
 :::
 
 ## Active and idle
 
-An endpoint starts in active polling. `setActive(false)` switches the native
-driver to its idle cadence, which trades latency for fewer wakeups;
-`setActive(true)` restores active polling on the same endpoint. Servers
-normally stay active. The idle mode exists for hosts that are sometimes
-backgrounded, such as a desktop app embedding the SDK.
+An endpoint starts active. `setActive(false)` reduces background work at the
+cost of higher network latency. `setActive(true)` restores normal behavior on
+the same endpoint. Servers normally stay active.
 
 ### Foreground and background
 
@@ -134,10 +131,10 @@ The hook immediately mirrors the current React Native `AppState` and keeps it
 in sync:
 
 - `active` selects foreground polling;
-- every other state selects the native idle behavior.
+- every other state reduces background work.
 
-This changes driver cadence; it does not destroy the endpoint. When the app
-returns to the foreground, the same endpoint resumes active polling.
+This does not destroy the endpoint. When the app returns to the foreground, the
+same endpoint becomes active again.
 
 If the endpoint is not component-owned, bind and release `AppState` manually:
 
@@ -166,7 +163,7 @@ endpoint.close();
 
 1. rejects pending Promise operations;
 2. closes owned `Stream` handles;
-3. stops and destroys the native endpoint;
+3. stops the endpoint;
 4. invokes each `onClose` observer once.
 
 ```ts
@@ -179,34 +176,6 @@ const removeClose = endpoint.onClose((reason) => {
 endpoint.close();
 removeClose();
 ```
-
-## Public SDK boundary
-
-Application code should import from the binding package for its runtime. That
-package re-exports the platform-neutral high-level types and errors from
-`@minip2p/core`.
-
-<Tabs>
-  <Tab title="Node.js">
-
-    Import from `@minip2p/node`.
-
-    The adapter contract at `@minip2p/core/backend` is a low-level integration
-    API for platform adapter authors. It exposes raw tagged unions and native
-    ownership rules; ordinary applications should not use it.
-
-  </Tab>
-  <Tab title="React Native">
-
-    Import from `@minip2p/react-native`.
-
-    The generated UniFFI API at `@minip2p/react-native/native` and the adapter
-    contract at `@minip2p/core/backend` are low-level integration APIs. They
-    expose native lifecycle details and raw tagged unions; ordinary
-    applications should not use them.
-
-  </Tab>
-</Tabs>
 
 Next: [Connections and streams](/typescript/connections-and-streams) and
 [Networking and events](/typescript/networking-and-events), or the

@@ -1,155 +1,67 @@
 ---
 title: Introduction
-description: A minimal, caller-driven libp2p stack with QUIC, TCP, and no_std.
+description: Connect applications over authenticated QUIC and TCP from Rust, Node.js, or React Native.
 ---
 
-## Install
+minip2p connects applications over authenticated QUIC and TCP. Use it from
+Rust, Node.js, or React Native. The Rust API is synchronous and caller-driven;
+the TypeScript API uses Promises and typed events.
 
-<Tabs>
-  <Tab title="Rust">
-
-    ```bash
-    cargo add minip2p-rs
-    ```
-
-  </Tab>
-  <Tab title="Node.js">
-
-    ```bash
-    npm install @minip2p/node
-    ```
-
-  </Tab>
-  <Tab title="React Native">
-
-    ```bash
-    npm install @minip2p/react-native
-    ```
-
-  </Tab>
-</Tabs>
-
-minip2p opens authenticated QUIC and TCP connections from Rust, Node.js, and
-React Native. On `no_std + alloc`, TCP runs through a pluggable provider and
-`Endpoint::portable`. The Rust `Endpoint` is synchronous and caller-driven,
-with no async runtime. The TypeScript SDK owns its native driver and presents
-typed events, cancellable Promises, and `Stream` handles on Node.js and React
-Native.
-
-<Tabs>
-  <Tab title="Rust">
-
-    ```rust
-    use minip2p::{Deadline, Endpoint};
-
-    fn main() -> Result<(), minip2p::Error> {
-        let mut node = Endpoint::builder()
-            .agent_version("my-app/0.1.0")
-            .bind_quic("127.0.0.1:0")?;
-
-        println!("listen={}", node.listen()?);
-
-        while let Some(event) = node.next_event(Deadline::NEVER)? {
-            println!("{event:?}");
-        }
-
-        Ok(())
-    }
-    ```
-
-  </Tab>
-  <Tab title="Node.js">
-
-    ```ts
-    import {
-      Minip2p,
-      generateSecretKey,
-    } from "@minip2p/node";
-
-    const endpoint = Minip2p.create({
-      secretKey: generateSecretKey(),
-    });
-
-    console.log(endpoint.peerId(), endpoint.listenAddrs());
-    endpoint.close();
-    ```
-
-  </Tab>
-  <Tab title="React Native">
-
-    ```ts
-    import {
-      Minip2p,
-      generateSecretKey,
-    } from "@minip2p/react-native";
-
-    const endpoint = Minip2p.create({
-      secretKey: generateSecretKey(),
-    });
-
-    console.log(endpoint.peerId(), endpoint.listenAddrs());
-    endpoint.close();
-    ```
-
-  </Tab>
-</Tabs>
-
-Optional capabilities add custom streams, NAT traversal, pubsub, signed peer
-discovery, and local-link mDNS.
-
-## Get started
+## Choose a starting point
 
 <CardGroup cols={2}>
-  <Card title="Install for Rust" href="/rust/install" icon="package-plus">
-    Add `minip2p-rs` and choose the network features your endpoint needs.
+  <Card title="Rust" href="/rust/install" icon="cog">
+    Install `minip2p-rs`, connect two peers, and choose optional network
+    features.
   </Card>
-  <Card title="Connect two peers" href="/rust/connect-peers" icon="unplug">
-    Connect two Rust processes and measure a Ping RTT.
-  </Card>
-  <Card title="Start with TypeScript" href="/typescript/start" icon="braces">
-    Create an endpoint, connect, and Ping from Node.js or React Native.
-  </Card>
-  <Card title="TypeScript API" href="/reference/typescript-api" icon="library">
-    Configuration, lifecycle, operations, events, and errors for both runtimes.
+  <Card title="TypeScript" href="/typescript/start" icon="braces">
+    Choose Node.js or React Native and make the first connection.
   </Card>
 </CardGroup>
 
-## Understand
+## What minip2p does
+
+- Authenticates peers with Ed25519 identities.
+- Listens and dials over QUIC, TCP, or both.
+- Negotiates custom protocol streams between peers.
+- Adds pubsub, discovery, relay paths, and NAT traversal when requested.
+- Runs on `no_std + alloc` devices through the portable Rust endpoint.
+
+The base configuration includes QUIC, Identify, Ping, and custom protocols.
+Optional capabilities keep the same endpoint interface.
+
+## Common tasks
 
 <CardGroup cols={2}>
-  <Card title="Concepts" href="/rust/concepts" icon="waypoints">
-    Endpoint, PeerId, PeerAddr, PeerReady, and dial versus connect.
+  <Card title="Connect two Rust peers" href="/rust/connect-peers" icon="unplug">
+    Print a peer address and measure a Ping RTT between two processes.
   </Card>
-  <Card title="Identity" href="/rust/identity" icon="key-round">
-    Ephemeral keys, persistent Ed25519 identity, and address shapes.
-  </Card>
-</CardGroup>
-
-## Do next
-
-<CardGroup cols={2}>
   <Card
-    title="Register a protocol"
-    href="/rust/register-a-protocol"
+    title="TypeScript connections and streams"
+    href="/typescript/connections-and-streams"
     icon="waypoints"
   >
-    Negotiate streams, exchange bytes, and half-close or abandon cleanly.
-  </Card>
-  <Card title="Traverse NAT" href="/rust/traverse-nat" icon="network">
-    Race direct dials against a relay and upgrade with DCUtR.
+    Connect, cancel work, and exchange bytes over custom protocols.
   </Card>
   <Card title="Publish with pubsub" href="/rust/pubsub" icon="megaphone">
-    Subscribe, publish signed gossipsub messages, or select floodsub.
+    Subscribe and publish with gossipsub or floodsub from Rust.
   </Card>
-  <Card title="Discover peers" href="/rust/discover-peers" icon="radar">
-    Signed presence beacons or zero-configuration local-link mDNS.
+  <Card
+    title="TypeScript networking"
+    href="/typescript/networking-and-events"
+    icon="network"
+  >
+    Use events, pubsub, discovery, mDNS, relays, and NAT traversal.
   </Card>
-  <Card title="Embedded devices" href="/rust/embedded-devices" icon="cpu">
-    Portable TCP over smoltcp, with caller-supplied I/O, time, and entropy.
+  <Card title="Traverse NAT" href="/rust/traverse-nat" icon="network">
+    Reach peers through a relay and upgrade to a direct path when possible.
+  </Card>
+  <Card title="Host a relay server" href="/rust/host-a-relay" icon="server">
+    Install and operate the minip2p Circuit Relay v2 server.
   </Card>
 </CardGroup>
 
-## Look up
+## Reference
 
 <CardGroup cols={3}>
   <Card
@@ -157,17 +69,20 @@ discovery, and local-link mDNS.
     href="/reference/feature-matrix"
     icon="table-properties"
   >
-    Compiled APIs versus builder-activated drivers.
+    Compare capabilities and required network infrastructure.
   </Card>
   <Card title="Glossary" href="/reference/glossary" icon="book-open">
-    PeerId, Multiaddr, PeerReady, Path, Sans-I/O, and more.
+    Look up the terms used across both language sections.
+  </Card>
+  <Card title="Rust troubleshooting" href="/rust/troubleshooting" icon="life-buoy">
+    Diagnose connection, stream, discovery, and event problems.
   </Card>
   <Card
-    title="Troubleshooting"
-    href="/reference/troubleshooting"
+    title="TypeScript troubleshooting"
+    href="/typescript/troubleshooting"
     icon="life-buoy"
   >
-    Symptom → cause → fix for common connection failures.
+    Diagnose Promise, stream, lifecycle, and mobile problems.
   </Card>
 </CardGroup>
 
@@ -175,10 +90,8 @@ discovery, and local-link mDNS.
 
 | | |
 | --- | --- |
-| <Badge>pre-1.0</Badge> | APIs may change before the first stable release. |
-| <Badge>QUIC and TCP</Badge> | The dial address picks the transport. WebSocket and WebTransport are out of scope. |
-| <Badge>no_std + alloc</Badge> | Protocols, orchestration, and TCP work without an OS; you supply I/O, time, and entropy. |
-| <Badge>QUIC-only punching</Badge> | DCUtR hole punching needs QUIC; a TCP-only peer reaches NATed peers through a relay. |
-| <Badge>Rust 1.91+</Badge> | Workspace MSRV. |
-| <Badge>Caller-driven Rust</Badge> | Rust applications drive progress; the Node.js and React Native adapters own their native drivers. |
-| <Badge>Relay client</Badge> | Bring a Circuit Relay v2 server when a relayed path is required. |
+| <Badge>pre-1.0</Badge> | Interfaces may change before the first stable release. |
+| <Badge>QUIC and TCP</Badge> | The dial address picks the transport. |
+| <Badge>no_std + alloc</Badge> | Portable Rust applications supply network I/O, time, and entropy. |
+| <Badge>Rust 1.91+</Badge> | Minimum supported Rust version. |
+| <Badge>Node.js 24+</Badge> | Minimum supported Node.js version. |

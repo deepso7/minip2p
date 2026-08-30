@@ -146,9 +146,9 @@ The default swarm intentionally includes only identify, ping, and registered
 application protocols. Relay, traversal, pubsub, and discovery policy stay
 opt-in so the base remains small and predictable.
 
-TypeScript bindings live under `bindings/ts`: `@minip2p/core` defines the
-platform-neutral API, and `@minip2p/react-native` provides its UniFFI-backed
-React Native implementation. The Node adapter is currently a private scaffold.
+The TypeScript SDK runs on Node.js through `@minip2p/node` and on React Native
+through `@minip2p/react-native`. Both packages expose the same application
+interface.
 
 Every crate has its own README with API-specific details.
 

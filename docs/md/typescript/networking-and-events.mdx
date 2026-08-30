@@ -3,9 +3,8 @@ title: Networking and events
 description: Use typed events, pubsub, signed discovery, mDNS, and relay-assisted NAT traversal from TypeScript.
 ---
 
-The TypeScript SDK starts its native driver inside `Minip2p.create`.
-Configuration selects the network agents that driver coordinates; JavaScript
-receives normalized, high-level events rather than raw native unions.
+`Minip2p.create` returns a running endpoint. Configuration selects the network
+capabilities it uses.
 
 ## Prefer named events
 
@@ -35,6 +34,21 @@ const message = await endpoint.waitFor("message", {
 
 `once(name, options?)` is the same pattern without a predicate.
 
+Use async iteration when one loop handles every event:
+
+```ts
+const controller = new AbortController();
+
+for await (const event of endpoint.events({ signal: controller.signal })) {
+  console.log(event.type, event);
+}
+```
+
+The iterator ends when the endpoint closes or its signal aborts. Each iterator
+buffers independently. A slow consumer receives `queueOverflow` with the number
+of events it missed. Set `bufferCap` only when the application needs a different
+per-iterator limit.
+
 Use the catch-all form for logging and diagnostics:
 
 ```ts
@@ -47,12 +61,12 @@ Catch-all events are a discriminated union with a `type` field. Inbound streams
 appear there as safe `inboundStream` metadata only. Subscribe specifically to
 `"stream"` to receive and claim a live `Stream`.
 
-Handler exceptions are isolated from native callbacks and from other handlers.
+Handler exceptions are isolated from event delivery and from other handlers.
 The endpoint emits `handlerError` afterward with safe metadata and the thrown
 value.
 
 :::warning
-Native events cross a bounded FIFO host queue. If `queueOverflow` is emitted,
+Events cross a bounded FIFO queue. If `queueOverflow` is emitted,
 some event history was lost. Refresh queryable state such as `connectedPeers()`,
 `knownPeers()`, `path(peerId)`, `reachability()`, and `activeReservation()`.
 :::
@@ -80,7 +94,7 @@ endpoint.unsubscribe(topic);
 ```
 
 There is no self-delivery. Apply the local UI action directly and use the event
-for remote messages. Native queue pressure throws `BackpressureError`
+for remote messages. Queue pressure throws `BackpressureError`
 synchronously; later forwarding failures arrive as `pubsubOutboundFailure`.
 
 Select floodsub only for interoperability:
@@ -151,14 +165,18 @@ const endpoint = Minip2p.create({
 });
 ```
 
-`mdns: true` uses native defaults. mDNS observations join the same
+`mdns: true` uses the defaults. mDNS observations join the same
 `knownPeers()` book as signed discovery. The event `source` distinguishes
 `DiscoverySource.Mdns` from `DiscoverySource.SignedBeacon`.
+
+Signed discovery and mDNS share one automatic-dial policy. If both options set
+`autoDial`, the values must match. Set it only on `discovery` when mDNS should
+inherit that choice.
 
 Discovery stays local to the link and depends on the network allowing
 multicast. React Native apps must also declare the [iOS local-network and
 Android multicast
-permissions](/typescript/setup-react-native#local-network-permissions).
+permissions](/typescript/setup-react-native#enable-local-discovery).
 
 ## Relay and NAT traversal
 
