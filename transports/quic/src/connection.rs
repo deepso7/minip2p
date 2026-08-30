@@ -600,6 +600,10 @@ impl QuicConnection {
                         }
                     }
                     Err(quiche::Error::Done) => break,
+                    Err(quiche::Error::StreamReset(_)) => {
+                        self.note_stream_reset(stream_id, events);
+                        break;
+                    }
                     Err(e) => {
                         events.push(TransportEvent::Error {
                             id: self.id,
@@ -744,6 +748,30 @@ impl QuicConnection {
             && state.is_fully_closed()
             && !state.closed_notified
         {
+            state.closed_notified = true;
+            events.push(TransportEvent::StreamClosed {
+                id: self.id,
+                stream_id,
+            });
+        }
+    }
+
+    /// A peer reset terminates both halves and discards writes that can no
+    /// longer be delivered.
+    fn note_stream_reset(&mut self, stream_id: StreamId, events: &mut Vec<TransportEvent>) {
+        let Some(state) = self.stream_states.get_mut(&stream_id.as_u64()) else {
+            return;
+        };
+        let dropped = state
+            .pending_writes
+            .iter()
+            .map(|write| write.bytes.len().saturating_sub(write.offset))
+            .sum::<usize>();
+        state.pending_writes.clear();
+        self.pending_write_bytes = self.pending_write_bytes.saturating_sub(dropped);
+        state.local_write_closed = true;
+        state.remote_write_closed = true;
+        if !state.closed_notified {
             state.closed_notified = true;
             events.push(TransportEvent::StreamClosed {
                 id: self.id,

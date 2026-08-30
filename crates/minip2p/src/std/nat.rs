@@ -375,6 +375,7 @@ mod tests {
         local_addr: minip2p_core::PeerAddr,
         relay_addr: minip2p_core::PeerAddr,
         inner_conn: ConnectionId,
+        relay_conn: ConnectionId,
         stream: StreamId,
     }
 
@@ -395,6 +396,7 @@ mod tests {
 
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         let mut inner_conn = None;
+        let mut relay_conn = None;
         let mut local_ready = false;
         let mut relay_ready = false;
         while !local_ready || !relay_ready {
@@ -418,15 +420,25 @@ mod tests {
                     _ => {}
                 }
             }
-            if let Some(Event::PeerReady { peer_id, .. }) = relay
+            if let Some(event) = relay
                 .next_event(std::time::Duration::from_millis(10))
                 .expect("drive relay")
-                && peer_id == *local.peer_id()
             {
-                relay_ready = true;
+                match event {
+                    Event::ConnectionEstablished { peer_id, conn_id }
+                        if peer_id == *local.peer_id() =>
+                    {
+                        relay_conn = Some(conn_id);
+                    }
+                    Event::PeerReady { peer_id, .. } if peer_id == *local.peer_id() => {
+                        relay_ready = true;
+                    }
+                    _ => {}
+                }
             }
         }
         let inner_conn = inner_conn.expect("local connection id");
+        let relay_conn = relay_conn.expect("relay connection id");
         let stream = local
             .open_stream(relay_addr.peer_id(), HOP_PROTOCOL_ID)
             .expect("open bridge stream");
@@ -455,6 +467,7 @@ mod tests {
             local_addr,
             relay_addr,
             inner_conn,
+            relay_conn,
             stream,
         }
     }
@@ -1046,5 +1059,49 @@ mod tests {
             .expect("transport-side close");
         swept.pump(&mut swept_pair.local.swarm);
         assert!(swept.promoted.is_empty());
+    }
+
+    #[test]
+    fn remote_bridge_reset_closes_promoted_circuit() {
+        let mut pair = negotiated_bridge();
+        let key = (pair.inner_conn, pair.stream);
+        let (mut driver, action) = promotion_driver(&pair, false);
+        execute(&mut driver, action, &mut pair.local);
+        let promoted = circuit_id(&driver, key);
+
+        pair.relay
+            .swarm
+            .transport_mut()
+            .reset_stream(pair.relay_conn, pair.stream)
+            .expect("reset bridge at relay");
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let mut circuit_failed = false;
+        while Instant::now() < deadline && !circuit_failed {
+            let _ = pair
+                .relay
+                .swarm
+                .poll_next(std::time::Duration::from_millis(10))
+                .expect("drive reset sender");
+            if let Some(event) = pair
+                .local
+                .swarm
+                .poll_next(std::time::Duration::from_millis(10))
+                .expect("drive reset receiver")
+            {
+                circuit_failed = matches!(
+                    &event,
+                    SwarmEvent::Error(error) if error.conn_id == Some(promoted)
+                );
+                driver.ingest(&event, &mut pair.local.swarm);
+            }
+        }
+
+        assert!(
+            circuit_failed,
+            "remote RESET_STREAM did not fail the promoted circuit"
+        );
+        assert!(!driver.promoted.contains_key(&key));
+        assert!(pair.local.swarm.transport().circuit_ids().is_empty());
     }
 }
