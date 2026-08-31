@@ -517,6 +517,29 @@ impl InboundCircuit {
                     ..
                 }) => {
                     self.remote_addrs = select_global_punch_candidates(&remote_addrs);
+                    completed = true;
+                    let blast_start = now.mono_ms.saturating_add(rtt_ms.div_ceil(2));
+                    let blast_until = blast_start.saturating_add(shared.config.punch_deadline_ms);
+                    if !self.remote_addrs.is_empty() {
+                        let next_at = if rtt_ms == 0 {
+                            for addr in &self.remote_addrs {
+                                shared.push_action(NatAction::SendRandomUdp {
+                                    target: addr.clone(),
+                                    payload_len: shared.config.blast_payload_len,
+                                });
+                            }
+                            blast_start
+                                .checked_add(shared.config.blast_interval_ms.max(1))
+                                .filter(|next| *next <= blast_until)
+                        } else {
+                            Some(blast_start)
+                        };
+                        self.blast = next_at.map(|next_at| BlastSchedule {
+                            addrs: self.remote_addrs.clone(),
+                            next_at,
+                            until: blast_until,
+                        });
+                    }
                     if dcutr.handle_input(DcutrInitiatorInput::SendSync).is_ok() {
                         while let Some(DcutrInitiatorOutput::Outbound(data)) = dcutr.poll_output() {
                             if let Some(peer) = self.source.as_ref() {
@@ -527,15 +550,6 @@ impl InboundCircuit {
                                 });
                             }
                         }
-                    }
-                    completed = true;
-                    let blast_start = now.mono_ms.saturating_add(rtt_ms.div_ceil(2));
-                    if !self.remote_addrs.is_empty() {
-                        self.blast = Some(BlastSchedule {
-                            addrs: self.remote_addrs.clone(),
-                            next_at: blast_start,
-                            until: blast_start.saturating_add(shared.config.punch_deadline_ms),
-                        });
                     }
                     self.linger_until = Some(
                         blast_start.saturating_add(

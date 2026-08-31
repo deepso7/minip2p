@@ -213,6 +213,27 @@ fn blast_schedule_starts_at_half_measured_rtt_and_respects_deadline() {
 }
 
 #[test]
+fn zero_rtt_opens_udp_mapping_before_notifying_dialer() {
+    let mut h = inbound_harness(NatConfig::default());
+    let (conn, actions) = drive_to_relayed(&mut h);
+    let stream = open_dcutr(&mut h, conn, &actions);
+    drain_actions(&mut h.agent);
+
+    // CONNECT was queued at t=13 and its reply arrived in the same clock
+    // sample. Open the UDP mapping before SYNC can make the remote dial.
+    answer_dcutr_at(&mut h, conn, stream, &["/ip4/8.8.8.8/udp/4001/quic-v1"], 13);
+    let actions = drain_actions(&mut h.agent);
+
+    assert!(matches!(
+        actions.first(),
+        Some(NatAction::SendRandomUdp { .. })
+    ));
+    assert!(matches!(actions.get(1), Some(NatAction::SendStream { .. })));
+    h.agent.handle_tick(at(13));
+    assert_eq!(blast_count(&drain_actions(&mut h.agent)), 0);
+}
+
+#[test]
 fn measured_rtt_delay_cannot_consume_the_punch_window() {
     let mut h = inbound_harness(NatConfig {
         punch_deadline_ms: 3_000,
