@@ -1,5 +1,9 @@
 //! Memory-only acceptance test joining the production NAT clients to the
 //! production relay-server state machine through their public sans-I/O seams.
+#![expect(
+    clippy::panic,
+    reason = "The helper functions assert the fixed action sequence of this acceptance test."
+)]
 
 use minip2p_core::{Multiaddr, PeerAddr, PeerId};
 use minip2p_nat::{

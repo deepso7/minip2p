@@ -81,7 +81,8 @@ impl World {
         let a_id = peer(b"agent-a");
         let b_id = peer(b"agent-b");
         let relay_id = peer(b"relay-peer");
-        let relay_addr = PeerAddr::new(maddr(RELAY_ADDR), relay_id.clone()).unwrap();
+        let relay_addr =
+            PeerAddr::new(maddr(RELAY_ADDR), relay_id.clone()).expect("valid relay peer address");
 
         let mut a = NatAgent::new(
             a_id.clone(),
@@ -149,6 +150,21 @@ impl World {
             Side::A => self.a_id.clone(),
             Side::B => self.b_id.clone(),
         }
+    }
+
+    fn circuit_conn(&self, side: Side) -> ConnectionId {
+        self.circuit_conns
+            .get(Self::side_index(side))
+            .copied()
+            .flatten()
+            .expect("circuit connection must be promoted before DCUtR traffic")
+    }
+
+    fn set_circuit_conn(&mut self, side: Side, conn_id: ConnectionId) {
+        *self
+            .circuit_conns
+            .get_mut(Self::side_index(side))
+            .expect("every side index selects one circuit connection slot") = Some(conn_id);
     }
 
     /// Runs both agents until neither has pending actions.
@@ -252,8 +268,8 @@ impl World {
                     let remote_stream = StreamId::new(self.next_stream);
                     self.dcutr_streams
                         .push((side, local_stream, remote, remote_stream));
-                    let local_conn = self.circuit_conns[Self::side_index(side)].unwrap();
-                    let remote_conn = self.circuit_conns[Self::side_index(remote)].unwrap();
+                    let local_conn = self.circuit_conn(side);
+                    let remote_conn = self.circuit_conn(remote);
                     let local_peer = self.peer_of(remote);
                     self.agent(side)
                         .stream_open_result(token, Ok(local_stream), now);
@@ -309,7 +325,7 @@ impl World {
                     })
                     .copied()
                 {
-                    let conn_id = self.circuit_conns[Self::side_index(remote)].unwrap();
+                    let conn_id = self.circuit_conn(remote);
                     let peer = self.peer_of(side);
                     self.agent(remote).handle_event(
                         &SwarmEvent::StreamData {
@@ -328,7 +344,7 @@ impl World {
                     })
                     .copied()
                 {
-                    let conn_id = self.circuit_conns[Self::side_index(local)].unwrap();
+                    let conn_id = self.circuit_conn(local);
                     let peer = self.peer_of(side);
                     self.agent(local).handle_event(
                         &SwarmEvent::StreamData {
@@ -353,7 +369,7 @@ impl World {
             } => {
                 self.next_conn += 1;
                 let conn_id = ConnectionId::new((1 << 63) | self.next_conn);
-                self.circuit_conns[Self::side_index(side)] = Some(conn_id);
+                self.set_circuit_conn(side, conn_id);
                 let agent = self.agent(side);
                 agent.promote_result(token, Ok(conn_id), now);
                 agent.handle_event_with_disposition_classified(
@@ -374,6 +390,10 @@ impl World {
     }
 
     /// The emulated relay's byte handling.
+    #[expect(
+        clippy::panic,
+        reason = "the scripted relay must stop on an impossible harness state"
+    )]
     fn on_relay_bytes(&mut self, side: Side, stream: StreamId, data: Vec<u8>) {
         let role = self
             .streams

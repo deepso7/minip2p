@@ -479,9 +479,14 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         let key = circuit.bridge_key();
         self.bridge_index.remove(&key);
         self.retire_bridge(key);
-        let _ = self
+        let reset_result = self
             .inner
             .reset_stream(circuit.inner_conn, circuit.bridge_stream);
+        // The circuit is already retired. A failed bridge reset cannot revive
+        // it or replace the error/close transition below.
+        match reset_result {
+            Ok(()) | Err(_) => {}
+        }
         if emit_error {
             self.pending
                 .push_back(TransportEvent::Error { id, message });
@@ -534,7 +539,12 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
     fn reject_inner_collision(&mut self, id: ConnectionId) {
         self.active_inner.remove(&id);
         self.remove_direct(id);
-        let _ = self.inner.close(id);
+        let close_result = self.inner.close(id);
+        // The colliding connection is removed from circuit bookkeeping;
+        // cleanup failure must not hide the namespace violation.
+        match close_result {
+            Ok(()) | Err(_) => {}
+        }
         self.pending.push_back(TransportEvent::Error {
             id,
             message: "wrapped transport allocated in the circuit connection-ID namespace"
@@ -709,7 +719,11 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
     fn dial(&mut self, address: &minip2p_core::PeerAddr) -> Result<ConnectionId, TransportError> {
         let id = self.inner.dial(address)?;
         if id.is_circuit() {
-            let _ = self.inner.close(id);
+            let close_result = self.inner.close(id);
+            // The dial is rejected regardless of best-effort inner cleanup.
+            match close_result {
+                Ok(()) | Err(_) => {}
+            }
             return Err(TransportError::DialFailed {
                 id,
                 reason: "wrapped transport allocated in the circuit connection-ID namespace"
@@ -810,9 +824,14 @@ impl<T: Transport, E: EntropySource> Transport for CircuitTransport<T, E> {
                 .close_stream_write(circuit.inner_conn, circuit.bridge_stream)
                 .is_ok();
         if !graceful {
-            let _ = self
+            let reset_result = self
                 .inner
                 .reset_stream(circuit.inner_conn, circuit.bridge_stream);
+            // The connection is closed even if best-effort bridge cleanup
+            // fails, so preserve the single `Closed` event below.
+            match reset_result {
+                Ok(()) | Err(_) => {}
+            }
         }
         self.pending.push_back(TransportEvent::Closed { id });
         Ok(())

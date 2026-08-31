@@ -185,8 +185,8 @@ pub fn run_join(
     println!("[join] us={}", endpoint.peer_id());
 
     let (host_peer, connect_id) = match &target {
-        JoinTarget::Circuit { peer, .. } => {
-            println!("[join] target={peer} via-relay={}", relays[0].peer_id());
+        JoinTarget::Circuit { relay, peer } => {
+            println!("[join] target={peer} via-relay={}", relay.peer_id());
             let id = endpoint
                 .connect(peer)
                 .map_err(|e| format!("connect failed: {e}"))?;
@@ -273,7 +273,11 @@ fn spawn_stdin_reader() -> mpsc::Receiver<Option<String>> {
                 return;
             }
         }
-        let _ = tx.send(None);
+        // EOF is best-effort: the receiver may have exited after an endpoint
+        // error, which is already the primary outcome.
+        match tx.send(None) {
+            Ok(()) | Err(_) => {}
+        }
     });
     rx
 }
@@ -432,9 +436,14 @@ fn print_pubsub_event(role: &str, event: PubsubEvent) {
 fn short(peer: &PeerId) -> String {
     const DISPLAY_LEN: usize = 8;
 
-    let encoded = peer.to_base58();
-    // Base58 is ASCII, so this byte offset is always a character boundary.
-    encoded[encoded.len().saturating_sub(DISPLAY_LEN)..].to_owned()
+    peer.to_base58()
+        .chars()
+        .rev()
+        .take(DISPLAY_LEN)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
 
 #[cfg(test)]

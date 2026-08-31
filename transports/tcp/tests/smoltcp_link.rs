@@ -256,14 +256,14 @@ fn run_until(
         if !wire.is_quiet() {
             continue;
         }
-        let next = Deadline::earliest_opt(a.next_deadline(), b.next_deadline()).unwrap_or_else(|| {
-            panic!("nothing on the wire and no deadline to wait for\n  a: {a_events:?}\n  b: {b_events:?}")
-        });
+        let next = Deadline::earliest_opt(a.next_deadline(), b.next_deadline())
+            .expect("active providers must report a deadline when the wire is quiet");
         if next.as_millis() > now {
             now = next.as_millis();
         }
     }
-    panic!("never finished\n  a: {a_events:?}\n  b: {b_events:?}")
+    assert!(done(a_events, b_events), "providers never finished");
+    now
 }
 
 struct Pair {
@@ -651,6 +651,10 @@ mod provider {
         /// about happens on packet arrival, and a harness that jumped forwards
         /// would quietly turn "the peer never heard" into "the peer heard on a
         /// retransmit".
+        #[expect(
+            clippy::panic,
+            reason = "exhausting the test harness step budget is an invariant failure"
+        )]
         fn drain(&mut self) {
             for _ in 0..MAX_STEPS {
                 let now = Now::from_millis(self.now);
@@ -668,7 +672,7 @@ mod provider {
                     return;
                 }
             }
-            panic!("the providers never settled")
+            panic!("the providers never settled within the step budget")
         }
 
         /// Listens, dials, and drives the handshake to completion.

@@ -90,7 +90,11 @@ impl PublicKey {
         }
 
         idx += 1;
-        let (key_type_raw, used) = read_uvarint(&input[idx..]).map_err(PublicKeyError::Varint)?;
+        let remaining = input.get(idx..).ok_or(PublicKeyError::InvalidLength {
+            expected_total: idx,
+            actual_total: input.len(),
+        })?;
+        let (key_type_raw, used) = read_uvarint(remaining).map_err(PublicKeyError::Varint)?;
         idx += used;
         let key_type = KeyType::try_from(key_type_raw)?;
 
@@ -102,23 +106,36 @@ impl PublicKey {
         }
 
         idx += 1;
-        let (data_len, used) = read_uvarint(&input[idx..]).map_err(PublicKeyError::Varint)?;
+        let remaining = input.get(idx..).ok_or(PublicKeyError::InvalidLength {
+            expected_total: idx,
+            actual_total: input.len(),
+        })?;
+        let (data_len, used) = read_uvarint(remaining).map_err(PublicKeyError::Varint)?;
         idx += used;
 
-        let data_len: usize = data_len
-            .try_into()
-            .map_err(|_| PublicKeyError::LengthOverflow)?;
+        let data_len: usize = match data_len.try_into() {
+            Ok(data_len) => data_len,
+            Err(_) => return Err(PublicKeyError::LengthOverflow),
+        };
+        let expected_total = idx
+            .checked_add(data_len)
+            .ok_or(PublicKeyError::LengthOverflow)?;
 
-        if idx + data_len != input.len() {
+        if expected_total != input.len() {
             return Err(PublicKeyError::InvalidLength {
-                expected_total: idx + data_len,
+                expected_total,
                 actual_total: input.len(),
             });
         }
 
+        let data = input.get(idx..).ok_or(PublicKeyError::InvalidLength {
+            expected_total,
+            actual_total: input.len(),
+        })?;
+
         Ok(Self {
             key_type,
-            data: input[idx..].to_vec(),
+            data: data.to_vec(),
         })
     }
 
@@ -129,19 +146,26 @@ impl PublicKey {
     pub fn verify(&self, message: &[u8], signature: &[u8; 64]) -> Result<(), VerifyError> {
         match self.key_type {
             KeyType::Ed25519 => {
-                let public_key_bytes: [u8; 32] = self.data.as_slice().try_into().map_err(|_| {
-                    VerifyError::InvalidEd25519PublicKeyLength {
-                        actual: self.data.len(),
+                let public_key_bytes: &[u8; 32] = match self.data.as_slice().try_into() {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return Err(VerifyError::InvalidEd25519PublicKeyLength {
+                            actual: self.data.len(),
+                        });
                     }
-                })?;
-                let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)
-                    .map_err(|_| VerifyError::InvalidEd25519PublicKey)?;
+                };
+                let verifying_key = match VerifyingKey::from_bytes(public_key_bytes) {
+                    Ok(key) => key,
+                    Err(_) => return Err(VerifyError::InvalidEd25519PublicKey),
+                };
 
                 let signature = Signature::from_bytes(signature);
 
-                verifying_key
-                    .verify_strict(message, &signature)
-                    .map_err(|_| VerifyError::InvalidSignature)
+                if verifying_key.verify_strict(message, &signature).is_err() {
+                    Err(VerifyError::InvalidSignature)
+                } else {
+                    Ok(())
+                }
             }
             other => Err(VerifyError::UnsupportedKeyType(other)),
         }

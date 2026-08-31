@@ -96,6 +96,26 @@ struct Link {
     ends: [End; 2],
 }
 
+impl Link {
+    /// Returns the local endpoint and its peer for a valid two-party link side.
+    fn ends(&self, index: usize) -> Option<(&End, &End)> {
+        match (index, &self.ends) {
+            (0, [local, peer]) => Some((local, peer)),
+            (1, [peer, local]) => Some((local, peer)),
+            _ => None,
+        }
+    }
+
+    /// Returns the local endpoint and its peer mutably for a valid link side.
+    fn ends_mut(&mut self, index: usize) -> Option<(&mut End, &mut End)> {
+        match (index, &mut self.ends) {
+            (0, [local, peer]) => Some((local, peer)),
+            (1, [peer, local]) => Some((local, peer)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Net {
     /// Nodes that never emit `Writable`, standing in for a provider whose
@@ -187,7 +207,10 @@ impl VirtualProvider {
         let handles = net.owned.get(&self.node).cloned().unwrap_or_default();
         for handle in handles {
             if let Some((link, index)) = net.end(handle) {
-                link.ends[1 - index].capacity = capacity;
+                let Some((_, peer)) = link.ends_mut(index) else {
+                    continue;
+                };
+                peer.capacity = capacity;
             }
         }
     }
@@ -242,7 +265,10 @@ impl VirtualProvider {
         let handles = net.owned.get(&self.node).cloned().unwrap_or_default();
         for handle in handles {
             if let Some((link, index)) = net.end(handle) {
-                link.ends[index].write_closed = true;
+                let Some((local, _)) = link.ends_mut(index) else {
+                    continue;
+                };
+                local.write_closed = true;
             }
         }
     }
@@ -256,7 +282,8 @@ impl VirtualProvider {
             .flatten()
             .filter_map(|handle| {
                 let (link, index) = *net.sockets.get(handle)?;
-                Some(net.links.get(&link)?.ends[1 - index].inbox.len())
+                let (_, peer) = net.links.get(&link)?.ends(index)?;
+                Some(peer.inbox.len())
             })
             .sum()
     }
@@ -328,8 +355,11 @@ impl TcpProvider for VirtualProvider {
                 remote: addr.clone(),
             });
         let source: Multiaddr = format!("/ip4/127.0.0.1/tcp/{port}")
-            .parse()
-            .expect("synthetic source address");
+            .parse::<Multiaddr>()
+            .map_err(|error| TcpError::Address {
+                context: "synthetic source address",
+                reason: error.to_string(),
+            })?;
         net.ready
             .entry(target)
             .or_default()
@@ -340,32 +370,42 @@ impl TcpProvider for VirtualProvider {
         Ok(SocketHandle::new(client))
     }
 
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "this test provider asserts the transport's non-empty write contract"
+    )]
     fn send(&mut self, socket: SocketHandle, data: &[u8]) -> Result<usize, TcpError> {
         assert!(!data.is_empty(), "the transport must not send empty writes");
         let mut net = self.net.borrow_mut();
         let Some((link, index)) = net.end(socket.get()) else {
             return Err(TcpError::UnknownSocket { socket });
         };
-        if link.ends[index].gone || link.ends[1 - index].gone {
+        let Some((local, peer)) = link.ends_mut(index) else {
+            return Err(TcpError::UnknownSocket { socket });
+        };
+        if local.gone || peer.gone {
             return Err(TcpError::Io {
                 operation: "send",
                 reason: "stream is gone".to_string(),
             });
         }
-        if link.ends[index].write_closed {
+        if local.write_closed {
             return Err(TcpError::Io {
                 operation: "send",
                 reason: "write side is closed".to_string(),
             });
         }
-        let peer = &link.ends[1 - index];
         let room = peer.capacity.map_or(data.len(), |capacity| {
             capacity.saturating_sub(peer.inbox.len())
         });
         let accepted = room.min(data.len());
-        link.ends[1 - index].inbox.extend(&data[..accepted]);
+        let accepted_data = data.get(..accepted).ok_or(TcpError::Io {
+            operation: "send",
+            reason: "accepted byte count exceeded write buffer".to_string(),
+        })?;
+        peer.inbox.extend(accepted_data);
         if accepted < data.len() {
-            link.ends[index].owes_writable = true;
+            local.owes_writable = true;
         }
         Ok(accepted)
     }
@@ -376,15 +416,20 @@ impl TcpProvider for VirtualProvider {
         let Some((link, index)) = net.end(socket.get()) else {
             return Err(TcpError::UnknownSocket { socket });
         };
-        link.ends[index].write_closed = true;
+        let Some((local, _)) = link.ends_mut(index) else {
+            return Err(TcpError::UnknownSocket { socket });
+        };
+        local.write_closed = true;
         Ok(())
     }
 
     fn abort(&mut self, socket: SocketHandle) {
         let mut net = self.net.borrow_mut();
         *net.abort_calls.entry(self.node).or_default() += 1;
-        if let Some((link, index)) = net.end(socket.get()) {
-            link.ends[index].gone = true;
+        if let Some((link, index)) = net.end(socket.get())
+            && let Some((local, _)) = link.ends_mut(index)
+        {
+            local.gone = true;
         }
         // The provider owes nothing further for an aborted handle, so drop it
         // from this node's roster before it can be polled again.
@@ -412,29 +457,29 @@ impl TcpProvider for VirtualProvider {
             let Some((link, index)) = net.end(handle) else {
                 continue;
             };
+            let Some((local, peer)) = link.ends_mut(index) else {
+                continue;
+            };
             let socket = SocketHandle::new(handle);
 
-            if link.ends[index].owes_writable {
-                link.ends[index].owes_writable = false;
+            if local.owes_writable {
+                local.owes_writable = false;
                 if !silent {
                     events.push(TcpEvent::Writable { socket });
                 }
             }
-            if !link.ends[index].inbox.is_empty() {
-                let data: Vec<u8> = link.ends[index].inbox.drain(..).collect();
+            if !local.inbox.is_empty() {
+                let data: Vec<u8> = local.inbox.drain(..).collect();
                 events.push(TcpEvent::Received { socket, data });
             }
             // Received before the FIN, and the FIN before the close: the peer's
             // last bytes are still readable after it stops writing.
-            if link.ends[1 - index].write_closed
-                && link.ends[index].inbox.is_empty()
-                && !link.ends[index].reported_fin
-            {
-                link.ends[index].reported_fin = true;
+            if peer.write_closed && local.inbox.is_empty() && !local.reported_fin {
+                local.reported_fin = true;
                 events.push(TcpEvent::RemoteWriteClosed { socket });
             }
-            if link.ends[1 - index].gone && !link.ends[index].reported_closed {
-                link.ends[index].reported_closed = true;
+            if peer.gone && !local.reported_closed {
+                local.reported_closed = true;
                 events.push(TcpEvent::Closed {
                     socket,
                     reason: None,

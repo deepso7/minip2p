@@ -51,8 +51,14 @@ pub struct KillOnDrop(pub Child);
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        // The child might already have exited; either outcome is complete
+        // cleanup, but always reap it before releasing the handle.
+        match self.0.kill() {
+            Ok(()) | Err(_) => {}
+        }
+        match self.0.wait() {
+            Ok(_) | Err(_) => {}
+        }
     }
 }
 
@@ -197,13 +203,18 @@ fn write_secret(path: &FsPath, _secret: &[u8; SECRET_KEY_LENGTH]) -> Result<(), 
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
+        out.push(hex_digit(byte >> 4));
+        out.push(hex_digit(byte & 0x0f));
     }
     out
+}
+
+fn hex_digit(nibble: u8) -> char {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    *HEX.get(nibble as usize)
+        .expect("hex digit input is a four-bit nibble") as char
 }
 
 fn decode_secret(input: &str) -> Result<[u8; SECRET_KEY_LENGTH], String> {
@@ -216,11 +227,13 @@ fn decode_secret(input: &str) -> Result<[u8; SECRET_KEY_LENGTH], String> {
     }
 
     let mut out = [0u8; SECRET_KEY_LENGTH];
-    let bytes = input.as_bytes();
-    for idx in 0..SECRET_KEY_LENGTH {
-        let hi = hex_value(bytes[idx * 2])?;
-        let lo = hex_value(bytes[idx * 2 + 1])?;
-        out[idx] = (hi << 4) | lo;
+    let (pairs, remainder) = input.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err("hex decoder received a trailing non-pair byte".into());
+    }
+    for (pair, slot) in pairs.iter().zip(&mut out) {
+        let [hi, lo] = *pair;
+        *slot = (hex_value(hi)? << 4) | hex_value(lo)?;
     }
     Ok(out)
 }
@@ -318,7 +331,7 @@ fn format_addrs(addrs: &[Multiaddr]) -> String {
 /// the printed `bound=` line is directly dialable on the same host.
 pub fn local_dialable_peer_addr(peer_addr: &PeerAddr) -> PeerAddr {
     let protocols = peer_addr.transport().protocols();
-    let Some(first) = protocols.first() else {
+    let Some((first, rest)) = protocols.split_first() else {
         return peer_addr.clone();
     };
 
@@ -336,8 +349,9 @@ pub fn local_dialable_peer_addr(peer_addr: &PeerAddr) -> PeerAddr {
         return peer_addr.clone();
     };
 
-    let mut rewritten = protocols.to_vec();
-    rewritten[0] = replacement;
+    let mut rewritten = Vec::with_capacity(protocols.len());
+    rewritten.push(replacement);
+    rewritten.extend_from_slice(rest);
     PeerAddr::new(
         Multiaddr::from_protocols(rewritten),
         peer_addr.peer_id().clone(),
@@ -378,7 +392,7 @@ mod tests {
 
         let error = load_keypair(Some(&path), "test").unwrap_err().to_string();
 
-        let _ = fs::remove_file(path);
+        fs::remove_file(path).expect("remove permissive test key");
         assert!(error.contains("0600"), "{error}");
     }
 
@@ -389,7 +403,7 @@ mod tests {
 
         let error = load_keypair(Some(&path), "test").unwrap_err().to_string();
 
-        let _ = fs::remove_dir(path);
+        fs::remove_dir(path).expect("remove test key directory");
         assert!(error.contains("regular file"), "{error}");
     }
 
@@ -401,7 +415,7 @@ mod tests {
 
         let error = load_keypair(Some(&path), "test").unwrap_err().to_string();
 
-        let _ = fs::remove_file(path);
+        fs::remove_file(path).expect("remove oversized test key");
         assert!(error.contains("too large"), "{error}");
     }
 }

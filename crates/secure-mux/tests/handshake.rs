@@ -404,7 +404,9 @@ fn a_mismatched_expected_peer_fails_the_handshake() {
         while let Some(output) = dialer.poll_output() {
             if let SessionOutput::Write(bytes) = output {
                 moved = true;
-                let _ = listener.handle_input(bytes);
+                listener
+                    .handle_input(bytes)
+                    .expect("responder accepts the initiator's first handshake message");
             }
         }
         while let Some(output) = listener.poll_output() {
@@ -534,7 +536,7 @@ fn a_session_that_fails_mid_batch_is_dead_and_stays_dead() {
     // The phase was consumed, so every later call fails rather than operating
     // on a half-torn-down session.
     assert!(dialer.handle_input(b"more".to_vec()).is_err());
-    assert!(dialer.open_stream().is_err());
+    let _ = dialer.open_stream().unwrap_err();
 }
 
 #[test]

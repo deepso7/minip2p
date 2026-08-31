@@ -215,21 +215,25 @@ impl PortableNatDriver {
                 peer,
                 stream_id,
                 data,
-            } => {
-                let _ = endpoint.send_stream(&peer, stream_id, data, now);
-            }
+            } => match endpoint.send_stream(&peer, stream_id, data, now) {
+                Ok(()) | Err(_) => {}
+            },
             NatAction::CloseStreamWrite { peer, stream_id } => {
-                let _ = endpoint.close_stream_write(&peer, stream_id, now);
+                match endpoint.close_stream_write(&peer, stream_id, now) {
+                    Ok(()) | Err(_) => {}
+                }
             }
             NatAction::ResetStream { peer, stream_id } => {
-                let _ = endpoint.reset_stream(&peer, stream_id, now);
+                match endpoint.reset_stream(&peer, stream_id, now) {
+                    Ok(()) | Err(_) => {}
+                }
             }
-            NatAction::Disconnect { peer } => {
-                let _ = endpoint.disconnect(&peer, now);
-            }
-            NatAction::Ping { peer } => {
-                let _ = endpoint.ping(&peer, now);
-            }
+            NatAction::Disconnect { peer } => match endpoint.disconnect(&peer, now) {
+                Ok(()) | Err(_) => {}
+            },
+            NatAction::Ping { peer } => match endpoint.ping(&peer, now) {
+                Ok(()) | Err(_) => {}
+            },
             // The smoltcp TCP endpoint has no raw UDP transport. TCP-only
             // relay configurations never emit this; a defensive drop keeps
             // DCUtR explicitly unavailable instead of faking a punch.
@@ -272,7 +276,10 @@ impl PortableNatDriver {
     }
 
     #[cfg(feature = "portable-relay")]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "bridge adoption needs its complete explicit endpoint context"
+    )]
     fn promote_bridge<D: smoltcp::phy::Device, E: EntropySource>(
         &mut self,
         token: NatToken,
@@ -321,18 +328,24 @@ impl PortableNatDriver {
                 };
                 self.agent.promote_result(token, Err(promoted), now);
                 if !matches!(error, AdoptError::UnknownConnection) {
-                    let _ = endpoint
+                    match endpoint
                         .runtime_mut()
                         .transport_mut()
                         .inner_mut()
-                        .reset_stream(inner_conn, stream_id);
+                        .reset_stream(inner_conn, stream_id)
+                    {
+                        Ok(()) | Err(_) => {}
+                    }
                 }
             }
         }
     }
 
     #[cfg(not(feature = "portable-relay"))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the unavailable-bridge fallback mirrors the complete NatAction context"
+    )]
     fn promote_bridge<D: smoltcp::phy::Device, E: EntropySource>(
         &mut self,
         token: NatToken,
@@ -386,7 +399,7 @@ impl PortableNatDriver {
                 transport.inject_bridge_closed(key.0, key.1);
                 self.promoted.remove(&key);
             }
-            _ => unreachable!(),
+            _ => return false,
         }
         true
     }

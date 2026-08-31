@@ -35,6 +35,10 @@ impl CipherState {
             return Ok(plaintext.to_vec());
         };
         let nonce = self.next_nonce()?;
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "NoiseError intentionally hides backend encryption failures."
+        )]
         let ciphertext = ChaCha20Poly1305::new((&key).into())
             .encrypt(
                 (&nonce).into(),
@@ -58,6 +62,10 @@ impl CipherState {
             return Ok(ciphertext.to_vec());
         };
         let nonce = self.next_nonce()?;
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "NoiseError intentionally hides backend decryption failures."
+        )]
         let plaintext = ChaCha20Poly1305::new((&key).into())
             .decrypt(
                 (&nonce).into(),

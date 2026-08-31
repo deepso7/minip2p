@@ -22,7 +22,7 @@ pub use key::VerifyError;
 pub use key::{KeyType, PublicKey, PublicKeyError};
 pub use peer_id::{
     PEER_ID_MULTIHASH_SIZE, PeerId, PeerIdError, PeerMultihash, VarintError, read_uvarint,
-    uvarint_len, write_uvarint,
+    read_uvarint_with_remainder, uvarint_len, write_uvarint,
 };
 
 /// Helpers shared by this crate's unit tests.

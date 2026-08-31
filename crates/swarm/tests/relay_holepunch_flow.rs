@@ -3,6 +3,12 @@
 //! This test validates the **protocol logic** of the hole-punching flow by
 //! driving the client-side state machines against a minimal in-memory relay
 //! emulator. No QUIC, no multistream-select, no UDP — just bytes on pipes.
+#![expect(
+    clippy::panic,
+    clippy::unreachable,
+    clippy::unwrap_used,
+    reason = "The byte-pipe helpers assert each mandatory state-machine transition in this fixed integration transcript."
+)]
 //!
 //! Flow exercised:
 //!

@@ -19,11 +19,13 @@ struct ScriptedTransport {
 
 impl Transport for ScriptedTransport {
     fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
-        unreachable!()
+        Err(TransportError::Unsupported { operation: "dial" })
     }
 
     fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
-        unreachable!()
+        Err(TransportError::Unsupported {
+            operation: "listen",
+        })
     }
 
     fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {

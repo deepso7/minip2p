@@ -492,7 +492,14 @@ fn encode_length_prefixed(payload: &[u8]) -> Vec<u8> {
 fn decode_length_prefixed(buf: &[u8]) -> Result<&[u8], message::IdentifyMessageError> {
     let (len, consumed) =
         read_uvarint(buf).map_err(|e: VarintError| message::IdentifyMessageError::from(e))?;
-    let remaining = buf.len() - consumed;
+    let body = buf
+        .get(consumed..)
+        .ok_or(message::IdentifyMessageError::FieldOverflow {
+            offset: consumed,
+            length: len,
+            remaining: 0,
+        })?;
+    let remaining = body.len();
     // Compare in u64 so an absurd declared length errs identically on
     // 32-bit and 64-bit targets.
     if len > remaining as u64 {
@@ -502,7 +509,20 @@ fn decode_length_prefixed(buf: &[u8]) -> Result<&[u8], message::IdentifyMessageE
             remaining,
         });
     }
-    Ok(&buf[consumed..consumed + len as usize])
+    let len = len as usize;
+    let end = consumed
+        .checked_add(len)
+        .ok_or(message::IdentifyMessageError::FieldOverflow {
+            offset: consumed,
+            length: len as u64,
+            remaining,
+        })?;
+    buf.get(consumed..end)
+        .ok_or(message::IdentifyMessageError::FieldOverflow {
+            offset: consumed,
+            length: len as u64,
+            remaining,
+        })
 }
 
 #[cfg(test)]

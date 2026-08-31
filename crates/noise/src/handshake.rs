@@ -90,7 +90,7 @@ impl HandshakeState {
                 let remote = exact_array::<32>(message, "invalid Noise message 1 length")?;
                 self.remote_ephemeral = Some(remote);
                 self.symmetric.mix_hash(&remote);
-                let plaintext = self.symmetric.decrypt_and_hash(&message[32..])?;
+                let plaintext = self.symmetric.decrypt_and_hash(b"")?;
                 debug_assert!(plaintext.is_empty());
                 self.step = Step::ResponderWriteMessage2;
                 let response = self.write_message2()?;
@@ -137,17 +137,28 @@ impl HandshakeState {
                 "Noise message 2 is too short",
             ));
         }
-        let remote_e: [u8; 32] = message[..32].try_into().expect("length checked");
+        let remote_e = exact_array(
+            message
+                .get(..32)
+                .ok_or(NoiseError::InvalidHandshakeMessage(
+                    "Noise message 2 is too short",
+                ))?,
+            "invalid remote ephemeral key",
+        )?;
         self.remote_ephemeral = Some(remote_e);
         self.symmetric.mix_hash(&remote_e);
         self.symmetric
             .mix_key(&dh(self.local_ephemeral, remote_e)?)?;
 
-        let remote_s_bytes = self.symmetric.decrypt_and_hash(&message[32..80])?;
+        let remote_s_bytes = self.symmetric.decrypt_and_hash(message.get(32..80).ok_or(
+            NoiseError::InvalidHandshakeMessage("Noise message 2 is too short"),
+        )?)?;
         let remote_s = exact_array::<32>(&remote_s_bytes, "invalid remote static key")?;
         self.symmetric
             .mix_key(&dh(self.local_ephemeral, remote_s)?)?;
-        let payload = self.symmetric.decrypt_and_hash(&message[80..])?;
+        let payload = self.symmetric.decrypt_and_hash(message.get(80..).ok_or(
+            NoiseError::InvalidHandshakeMessage("Noise message 2 is too short"),
+        )?)?;
         self.verify_payload(&payload, remote_s)
     }
 
@@ -170,11 +181,15 @@ impl HandshakeState {
                 "Noise message 3 is too short",
             ));
         }
-        let remote_s_bytes = self.symmetric.decrypt_and_hash(&message[..48])?;
+        let remote_s_bytes = self.symmetric.decrypt_and_hash(message.get(..48).ok_or(
+            NoiseError::InvalidHandshakeMessage("Noise message 3 is too short"),
+        )?)?;
         let remote_s = exact_array::<32>(&remote_s_bytes, "invalid remote static key")?;
         self.symmetric
             .mix_key(&dh(self.local_ephemeral, remote_s)?)?;
-        let payload = self.symmetric.decrypt_and_hash(&message[48..])?;
+        let payload = self.symmetric.decrypt_and_hash(message.get(48..).ok_or(
+            NoiseError::InvalidHandshakeMessage("Noise message 3 is too short"),
+        )?)?;
         let verified = self.verify_payload(&payload, remote_s)?;
         self.step = Step::Complete;
         Ok(verified)
@@ -193,8 +208,16 @@ impl HandshakeState {
         remote_static: [u8; 32],
     ) -> Result<(PeerId, PublicKey), NoiseError> {
         let payload = NoiseHandshakePayload::decode(payload)?;
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "NoiseError deliberately exposes a stable identity-key error."
+        )]
         let identity_key = PublicKey::decode_protobuf(&payload.identity_key)
             .map_err(|_| NoiseError::InvalidIdentityKey)?;
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "NoiseError deliberately exposes a stable identity-signature error."
+        )]
         let signature: [u8; 64] = payload
             .identity_sig
             .try_into()
@@ -202,6 +225,10 @@ impl HandshakeState {
         let mut signed = Vec::with_capacity(SIGNATURE_PREFIX.len() + remote_static.len());
         signed.extend_from_slice(SIGNATURE_PREFIX);
         signed.extend_from_slice(&remote_static);
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "Signature verification details are intentionally not exposed to peers."
+        )]
         identity_key
             .verify(&signed, &signature)
             .map_err(|_| NoiseError::InvalidIdentitySignature)?;
@@ -241,7 +268,10 @@ impl SymmetricState {
     fn with_prologue(prologue: &[u8]) -> Self {
         let mut initial = [0u8; 32];
         if PROTOCOL_NAME.len() <= initial.len() {
-            initial[..PROTOCOL_NAME.len()].copy_from_slice(PROTOCOL_NAME);
+            initial
+                .get_mut(..PROTOCOL_NAME.len())
+                .expect("protocol name length was checked against the hash buffer")
+                .copy_from_slice(PROTOCOL_NAME);
         } else {
             initial = Sha256::digest(PROTOCOL_NAME).into();
         }
@@ -306,6 +336,10 @@ fn dh(secret: [u8; 32], public: [u8; 32]) -> Result<[u8; 32], NoiseError> {
 }
 
 fn exact_array<const N: usize>(input: &[u8], reason: &'static str) -> Result<[u8; N], NoiseError> {
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "NoiseError intentionally reports the caller-provided handshake parse reason."
+    )]
     input
         .try_into()
         .map_err(|_| NoiseError::InvalidHandshakeMessage(reason))

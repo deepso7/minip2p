@@ -209,8 +209,9 @@ impl QuicConnection {
         if now.monotonic_ms.saturating_sub(last) < interval_ms {
             return Ok(());
         }
-        let _ = self.conn.send_ack_eliciting();
-        self.sent_keepalive_since_recv = true;
+        if self.conn.send_ack_eliciting().is_ok() {
+            self.sent_keepalive_since_recv = true;
+        }
         self.drain_send_queue(events)?;
         self.flush(socket, pending_datagrams, max_pending_datagrams)
     }
@@ -235,7 +236,10 @@ impl QuicConnection {
     // These arguments are the complete I/O context for a single datagram.
     // Keeping them explicit makes this adapter easy to embed and avoids a
     // second mutable runtime object on the packet hot path.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a packet needs the complete explicit I/O context in this sans-runtime adapter"
+    )]
     pub fn recv_packet(
         &mut self,
         buf: &mut [u8],
@@ -278,7 +282,12 @@ impl QuicConnection {
                     id: self.id,
                     message: "peer TLS certificate missing".into(),
                 });
-                let _ = self.conn.close(true, 0x03, b"peer certificate missing");
+                if let Err(error) = self.conn.close(true, 0x03, b"peer certificate missing") {
+                    events.push(TransportEvent::Error {
+                        id: self.id,
+                        message: format!("failed to close after missing peer certificate: {error}"),
+                    });
+                }
                 self.state = ConnectionState::Closing;
                 self.flush(socket, pending_datagrams, max_pending_datagrams)?;
                 return Ok(());
@@ -298,7 +307,12 @@ impl QuicConnection {
                             ),
                         });
                         // Close the connection — the peer is not who we expected.
-                        let _ = self.conn.close(true, 0x01, b"peer id mismatch");
+                        if let Err(error) = self.conn.close(true, 0x01, b"peer id mismatch") {
+                            events.push(TransportEvent::Error {
+                                id: self.id,
+                                message: format!("failed to close after peer id mismatch: {error}"),
+                            });
+                        }
                         self.state = ConnectionState::Closing;
                         self.flush(socket, pending_datagrams, max_pending_datagrams)?;
                         return Ok(());
@@ -310,9 +324,17 @@ impl QuicConnection {
                         id: self.id,
                         message: format!("peer TLS certificate verification failed: {e}"),
                     });
-                    let _ = self
-                        .conn
-                        .close(true, 0x02, b"certificate verification failed");
+                    if let Err(error) =
+                        self.conn
+                            .close(true, 0x02, b"certificate verification failed")
+                    {
+                        events.push(TransportEvent::Error {
+                            id: self.id,
+                            message: format!(
+                                "failed to close after certificate verification: {error}"
+                            ),
+                        });
+                    }
                     self.state = ConnectionState::Closing;
                     self.flush(socket, pending_datagrams, max_pending_datagrams)?;
                     return Ok(());
@@ -580,7 +602,10 @@ impl QuicConnection {
                             events.push(TransportEvent::StreamData {
                                 id: self.id,
                                 stream_id,
-                                data: stream_read_buffer[..read].to_vec(),
+                                data: stream_read_buffer
+                                    .get(..read)
+                                    .expect("quiche stream reads fit the supplied buffer")
+                                    .to_vec(),
                             });
                         }
 
@@ -646,11 +671,14 @@ impl QuicConnection {
                 }
             };
 
-            match socket.send_to(&out[..written], send_info.to) {
+            let packet = out
+                .get(..written)
+                .expect("quiche reports packet lengths within the supplied buffer");
+            match socket.send_to(packet, send_info.to) {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     pending_datagrams.push_back(PendingDatagram {
-                        bytes: out[..written].to_vec(),
+                        bytes: packet.to_vec(),
                         destination: send_info.to,
                     });
                     break;
@@ -683,7 +711,10 @@ impl QuicConnection {
                     let Some(front) = state.pending_writes.front_mut() else {
                         break;
                     };
-                    let payload = &front.bytes[front.offset..];
+                    let payload = front
+                        .bytes
+                        .get(front.offset..)
+                        .expect("pending write offsets advance only within their buffers");
                     let fin = front.fin && payload.is_empty();
                     match conn.stream_send(raw_stream_id, payload, fin) {
                         Ok(written) => written,

@@ -45,7 +45,10 @@ pub struct RelayServerAddressError {
     pub reason: RelayServerAddressErrorKind,
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(
+    clippy::result_large_err,
+    reason = "The error owns the rejected address so callers can report the exact invalid input."
+)]
 pub(crate) fn normalize_addrs(
     local_peer_id: &PeerId,
     addrs: Vec<Multiaddr>,
@@ -66,7 +69,10 @@ pub(crate) fn normalize_addrs(
     Ok(normalized)
 }
 
-#[allow(clippy::result_large_err)]
+#[expect(
+    clippy::result_large_err,
+    reason = "Address validation keeps the rejected input and its actionable reason together."
+)]
 fn normalize_addr(
     local_peer_id: &PeerId,
     address: Multiaddr,

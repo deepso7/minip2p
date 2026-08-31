@@ -1042,7 +1042,8 @@ mod tests {
         // prefix) and rejects anything beyond it. It runs only on stalled
         // (incomplete) buffers, where `decode_frame`'s own bounds make it
         // unreachable from wire input -- a pure defense-in-depth check.
-        assert!(enforce_max_size(&vec![0u8; MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN]).is_ok());
+        enforce_max_size(&vec![0u8; MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN])
+            .expect("the maximum legal partial frame must be accepted");
         assert!(matches!(
             enforce_max_size(&vec![0u8; MAX_MESSAGE_SIZE + MAX_FRAME_PREFIX_LEN + 1]),
             Err(DcutrError::MessageTooLarge { .. })

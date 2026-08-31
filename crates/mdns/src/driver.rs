@@ -325,12 +325,11 @@ impl<I: MdnsIo> MdnsDriver<I> {
             if !source_is_on_link(snapshot, datagram.from.ip()) {
                 continue;
             }
-            self.agent.handle_packet(
-                datagram.interface,
-                datagram.from,
-                &self.buffer[..datagram.len],
-                now_ms,
-            );
+            let Some(payload) = self.buffer.get(..datagram.len) else {
+                continue;
+            };
+            self.agent
+                .handle_packet(datagram.interface, datagram.from, payload, now_ms);
         }
         Ok(true)
     }
@@ -391,7 +390,10 @@ impl<I: MdnsIo> Drop for MdnsDriver<I> {
         // the last reading a caller gave, since a drop brings no clock with
         // it and a stale-but-real timestamp beats inventing one.
         let now = self.last_now_ms;
-        let _ = self.shutdown(now);
+        if let Err(error) = self.shutdown(now) {
+            // `Drop` cannot return the I/O failure after attempting a goodbye.
+            drop(error);
+        }
     }
 }
 

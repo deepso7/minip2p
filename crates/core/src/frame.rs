@@ -52,13 +52,15 @@ pub fn decode_frame(input: &[u8], max_len: usize) -> FrameDecode<'_> {
     }
     // Cannot truncate: `length <= max_len` holds here.
     let length = length as usize;
-    if length > input.len().saturating_sub(used) {
+    let Some(total) = used.checked_add(length) else {
         return FrameDecode::Incomplete;
-    }
-    let total = used + length;
+    };
+    let Some(payload) = input.get(used..total) else {
+        return FrameDecode::Incomplete;
+    };
 
     FrameDecode::Complete {
-        payload: &input[used..total],
+        payload,
         consumed: total,
     }
 }

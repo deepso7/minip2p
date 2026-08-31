@@ -95,6 +95,10 @@ fn next_value(flag: &str, args: &mut std::vec::IntoIter<String>) -> Result<Strin
 }
 
 fn number<T: core::str::FromStr>(flag: &str, value: String) -> Result<T, String> {
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "the CLI reports one compact, flag-specific parse error"
+    )]
     value
         .parse()
         .map_err(|_| format!("{flag} requires a non-negative integer, got {value:?}"))

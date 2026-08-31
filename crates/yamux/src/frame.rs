@@ -55,7 +55,10 @@ pub struct Frame {
 impl Frame {
     /// Constructs a data frame.
     pub fn data(stream_id: u32, flags: u16, payload: Vec<u8>) -> Result<Self, YamuxError> {
-        let value = u32::try_from(payload.len()).map_err(|_| YamuxError::FrameLengthOverflow)?;
+        let value = match u32::try_from(payload.len()) {
+            Ok(value) => value,
+            Err(_) => return Err(YamuxError::FrameLengthOverflow),
+        };
         let frame = Self {
             frame_type: FrameType::Data,
             flags,
@@ -202,18 +205,44 @@ impl FrameDecoder {
     /// Oversized data frames are rejected as soon as their 12-byte header is
     /// present; the decoder never reserves their declared payload length.
     pub fn next_frame(&mut self) -> Result<Option<Frame>, YamuxError> {
-        let available = self.buffer.len() - self.offset;
+        let available = self
+            .buffer
+            .len()
+            .checked_sub(self.offset)
+            .ok_or(YamuxError::FrameLengthOverflow)?;
         if available < HEADER_LEN {
             return Ok(None);
         }
-        let header = &self.buffer[self.offset..self.offset + HEADER_LEN];
-        if header[0] != 0 {
-            return Err(YamuxError::UnsupportedVersion(header[0]));
+        let header_end = self
+            .offset
+            .checked_add(HEADER_LEN)
+            .ok_or(YamuxError::FrameLengthOverflow)?;
+        let header: [u8; HEADER_LEN] = self
+            .buffer
+            .get(self.offset..header_end)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or(YamuxError::FrameLengthOverflow)?;
+        let [
+            version,
+            frame_type_raw,
+            flags_high,
+            flags_low,
+            stream_3,
+            stream_2,
+            stream_1,
+            stream_0,
+            value_3,
+            value_2,
+            value_1,
+            value_0,
+        ] = header;
+        if version != 0 {
+            return Err(YamuxError::UnsupportedVersion(version));
         }
-        let frame_type = FrameType::decode(header[1])?;
-        let flags = u16::from_be_bytes([header[2], header[3]]);
-        let stream_id = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
-        let value = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
+        let frame_type = FrameType::decode(frame_type_raw)?;
+        let flags = u16::from_be_bytes([flags_high, flags_low]);
+        let stream_id = u32::from_be_bytes([stream_3, stream_2, stream_1, stream_0]);
+        let value = u32::from_be_bytes([value_3, value_2, value_1, value_0]);
         if frame_type == FrameType::Data && value > self.max_frame_len {
             return Err(YamuxError::FrameTooLarge {
                 length: value,
@@ -221,7 +250,10 @@ impl FrameDecoder {
             });
         }
         let payload_len = if frame_type == FrameType::Data {
-            usize::try_from(value).map_err(|_| YamuxError::FrameLengthOverflow)?
+            match usize::try_from(value) {
+                Ok(value) => value,
+                Err(_) => return Err(YamuxError::FrameLengthOverflow),
+            }
         } else {
             0
         };
@@ -231,16 +263,27 @@ impl FrameDecoder {
         if available < frame_len {
             return Ok(None);
         }
-        let payload_start = self.offset + HEADER_LEN;
+        let payload_start = header_end;
+        let payload_end = payload_start
+            .checked_add(payload_len)
+            .ok_or(YamuxError::FrameLengthOverflow)?;
+        let payload = self
+            .buffer
+            .get(payload_start..payload_end)
+            .ok_or(YamuxError::FrameLengthOverflow)?
+            .to_vec();
         let frame = Frame {
             frame_type,
             flags,
             stream_id,
             value,
-            payload: self.buffer[payload_start..payload_start + payload_len].to_vec(),
+            payload,
         };
         frame.validate()?;
-        self.offset += frame_len;
+        self.offset = self
+            .offset
+            .checked_add(frame_len)
+            .ok_or(YamuxError::FrameLengthOverflow)?;
         self.compact_if_needed();
         Ok(Some(frame))
     }

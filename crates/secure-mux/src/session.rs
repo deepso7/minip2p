@@ -724,6 +724,10 @@ impl SecureMuxSession {
 /// congruent to a live stream modulo 2^32 would otherwise alias onto it and
 /// operate on somebody else's substream.
 fn yamux_stream(stream: StreamId) -> Result<u32, SessionError> {
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "SessionError preserves the caller's stream id while intentionally hiding conversion details."
+    )]
     u32::try_from(stream.as_u64()).map_err(|_| SessionError::UnknownStream { stream })
 }
 

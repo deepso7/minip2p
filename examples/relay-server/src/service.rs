@@ -56,7 +56,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> Result<(), Box<dyn Error>>
             run_status(SYSTEMCTL, ["restart", SERVICE_NAME])
         }
         Some(("uninstall", _)) => uninstall(),
-        _ => unreachable!("clap requires a service subcommand"),
+        _ => Err("a service subcommand is required".into()),
     }
 }
 
@@ -304,8 +304,8 @@ fn install_identity(encoded: &[u8]) -> Result<(), Box<dyn Error>> {
         run_status(CHOWN, [OsStr::new(SERVICE_USER), temporary.as_os_str()])?;
         publish_identity(&temporary, Path::new(IDENTITY_PATH))
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+    if result.is_err() && fs::remove_file(&temporary).is_err() {
+        // The primary write/install error remains more useful to callers.
     }
     result
 }
@@ -333,8 +333,8 @@ fn write_unit_atomically(path: &Path, contents: &str) -> Result<(), Box<dyn Erro
         fs::rename(&temporary, path)?;
         Ok(())
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+    if result.is_err() && fs::remove_file(&temporary).is_err() {
+        // The primary write error remains more useful to callers.
     }
     result
 }
@@ -509,6 +509,6 @@ WantedBy=multi-user.target\n"
 
         remove_enable_link(&link).unwrap();
 
-        assert!(std::fs::symlink_metadata(link).is_err());
+        std::fs::symlink_metadata(link).expect_err("failed install must remove the temporary link");
     }
 }

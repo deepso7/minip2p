@@ -757,7 +757,7 @@ impl SwarmCore {
     }
 
     fn handle_tick(&mut self, now_ms: u64) {
-        let _ = self.ping.handle_input(PingInput::Tick { now_ms });
+        self.inform_ping(PingInput::Tick { now_ms });
         self.collect_protocol_events();
         // Safety net for deadlines whose ping was resolved without a
         // corresponding ping event (e.g. the stream fully closed): the tick
@@ -765,6 +765,24 @@ impl SwarmCore {
         // deadline, so a past-due entry can never be load-bearing anymore.
         // Dropping it keeps `next_timeout` from reporting a stale timer.
         self.ping_deadlines.retain(|_, due| *due > now_ms);
+    }
+
+    /// Delivers a core-generated event to Ping.
+    ///
+    /// A rejected input can only be a late event for a stream or peer the
+    /// core has already torn down. There is no separate recovery action: the
+    /// core continues draining Ping's outputs so it can finish any cleanup it
+    /// did accept.
+    fn inform_ping(&mut self, input: PingInput) {
+        drop(self.ping.handle_input(input));
+    }
+
+    /// Delivers a core-generated event to Identify.
+    ///
+    /// As with Ping, a rejection identifies a late event after core state was
+    /// removed. The only useful follow-up is still to drain accepted output.
+    fn inform_identify(&mut self, input: IdentifyInput) {
+        drop(self.identify.handle_input(input));
     }
 
     fn handle_stream_opened(
@@ -1097,10 +1115,10 @@ impl SwarmCore {
                 cause: ConnectionCloseCause::Superseded,
             });
             let pending_ping = self.pending_pings.remove(&peer_id);
-            let _ = self.ping.handle_input(PingInput::RemovePeer {
+            self.inform_ping(PingInput::RemovePeer {
                 peer_id: peer_id.clone(),
             });
-            let _ = self.identify.handle_input(IdentifyInput::RemovePeer {
+            self.inform_identify(IdentifyInput::RemovePeer {
                 peer_id: peer_id.clone(),
             });
             self.drain_ping_outputs();
@@ -1137,11 +1155,11 @@ impl SwarmCore {
             Some(ref current) if *current == new_peer_id => return,
             Some(ref stale) => {
                 self.peer_to_conn.remove(stale);
-                let _ = self.ping.handle_input(PingInput::MigratePeer {
+                self.inform_ping(PingInput::MigratePeer {
                     old_peer_id: stale.clone(),
                     new_peer_id: new_peer_id.clone(),
                 });
-                let _ = self.identify.handle_input(IdentifyInput::MigratePeer {
+                self.inform_identify(IdentifyInput::MigratePeer {
                     old_peer_id: stale.clone(),
                     new_peer_id: new_peer_id.clone(),
                 });
@@ -1291,7 +1309,7 @@ impl SwarmCore {
 
         match protocol {
             ProtocolKind::Ping => {
-                let _ = self.ping.handle_input(PingInput::StreamData {
+                self.inform_ping(PingInput::StreamData {
                     peer_id,
                     stream_id,
                     data,
@@ -1300,7 +1318,7 @@ impl SwarmCore {
                 self.drain_ping_outputs();
             }
             ProtocolKind::IdentifyInitiator => {
-                let _ = self.identify.handle_input(IdentifyInput::StreamData {
+                self.inform_identify(IdentifyInput::StreamData {
                     peer_id,
                     stream_id,
                     data,
@@ -1330,15 +1348,11 @@ impl SwarmCore {
 
         match protocol {
             ProtocolKind::Ping => {
-                let _ = self
-                    .ping
-                    .handle_input(PingInput::StreamRemoteWriteClosed { peer_id, stream_id });
+                self.inform_ping(PingInput::StreamRemoteWriteClosed { peer_id, stream_id });
                 self.drain_ping_outputs();
             }
             ProtocolKind::IdentifyInitiator => {
-                let _ = self
-                    .identify
-                    .handle_input(IdentifyInput::StreamRemoteWriteClosed { peer_id, stream_id });
+                self.inform_identify(IdentifyInput::StreamRemoteWriteClosed { peer_id, stream_id });
                 self.drain_identify_outputs();
             }
             ProtocolKind::IdentifyResponder => {}
@@ -1367,15 +1381,11 @@ impl SwarmCore {
         {
             match protocol {
                 ProtocolKind::Ping => {
-                    let _ = self
-                        .ping
-                        .handle_input(PingInput::StreamClosed { peer_id, stream_id });
+                    self.inform_ping(PingInput::StreamClosed { peer_id, stream_id });
                     self.drain_ping_outputs();
                 }
                 ProtocolKind::IdentifyInitiator | ProtocolKind::IdentifyResponder => {
-                    let _ = self
-                        .identify
-                        .handle_input(IdentifyInput::StreamClosed { peer_id, stream_id });
+                    self.inform_identify(IdentifyInput::StreamClosed { peer_id, stream_id });
                     self.drain_identify_outputs();
                 }
                 ProtocolKind::User(_) => {
@@ -1399,10 +1409,10 @@ impl SwarmCore {
             let was_active = self.peer_to_conn.get(&peer_id) == Some(&conn_id);
             if was_active {
                 self.peer_to_conn.remove(&peer_id);
-                let _ = self.ping.handle_input(PingInput::RemovePeer {
+                self.inform_ping(PingInput::RemovePeer {
                     peer_id: peer_id.clone(),
                 });
-                let _ = self.identify.handle_input(IdentifyInput::RemovePeer {
+                self.inform_identify(IdentifyInput::RemovePeer {
                     peer_id: peer_id.clone(),
                 });
                 self.drain_ping_outputs();
@@ -1620,9 +1630,7 @@ impl SwarmCore {
         if protocol == PING_PROTOCOL_ID {
             self.stream_owner
                 .insert((conn_id, stream_id), ProtocolKind::Ping);
-            let _ = self
-                .ping
-                .handle_input(PingInput::RegisterInboundStream { peer_id, stream_id });
+            self.inform_ping(PingInput::RegisterInboundStream { peer_id, stream_id });
             self.drain_ping_outputs();
             return;
         }
@@ -1739,9 +1747,7 @@ impl SwarmCore {
                 }
             }
             ProtocolKind::IdentifyInitiator => {
-                let _ = self
-                    .identify
-                    .handle_input(IdentifyInput::RegisterInboundStream { peer_id, stream_id });
+                self.inform_identify(IdentifyInput::RegisterInboundStream { peer_id, stream_id });
                 self.drain_identify_outputs();
             }
             ProtocolKind::IdentifyResponder => {}
@@ -2029,7 +2035,7 @@ mod tests {
     #[test]
     fn swarm_core_implements_common_sans_io_protocol_trait() {
         fn drive_idle<S: SansIoProtocol<Input = SwarmInput, Output = SwarmOutput>>(engine: &mut S) {
-            let _ = engine.handle_input(SwarmInput::Tick { now_ms: 0 });
+            drop(engine.handle_input(SwarmInput::Tick { now_ms: 0 }));
             while engine.poll_output().is_some() {}
             assert!(engine.is_idle());
         }

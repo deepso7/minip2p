@@ -129,7 +129,7 @@ EndpointBuilder::relay_server_config(
 ) -> Result<Self, RelayServerConfigError>
 EndpointBuilder::relay_server_announce_addrs(
     Vec<Multiaddr>,
-) -> Result<Self, RelayServerAddressError>
+) -> Result<Self, RelayServerAnnounceError>
 
 Endpoint::set_relay_server_accepting(
     bool,
@@ -142,6 +142,9 @@ Endpoint::next_relay_server_event(
     impl Into<Deadline>,
 ) -> Result<Option<RelayServerEvent>, Error>
 ```
+
+`RelayServerAnnounceError` distinguishes validator configuration failures
+(`Config`) from invalid announce addresses (`Address`).
 
 Only `relay_server()` and `relay_server_config(...)` enable the service and its
 static HOP advertisement. Announce-address calls are order-independent with

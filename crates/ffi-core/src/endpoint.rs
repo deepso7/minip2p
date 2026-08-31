@@ -69,7 +69,13 @@ fn configure_transports(
                 builder = match parsed.as_slice() {
                     [address] => builder.quic_multiaddr(address),
                     [first, second] => builder.quic_dual_multiaddr(first, second),
-                    _ => unreachable!("validation permits at most one address per IP family"),
+                    _ => {
+                        return Err(FfiError::InvalidConfig {
+                            detail:
+                                "QUIC listen address validation produced an unsupported address set"
+                                    .into(),
+                        });
+                    }
                 };
             }
         }
@@ -1010,7 +1016,10 @@ mod tests {
 
     impl Drop for DropThreadDoorbell {
         fn drop(&mut self) {
-            let _ = self.0.send(std::thread::current().id());
+            // The receiver may already be gone while the test tears down.
+            match self.0.send(std::thread::current().id()) {
+                Ok(()) | Err(_) => {}
+            }
         }
     }
 
@@ -1217,11 +1226,12 @@ mod tests {
     fn poisoned_endpoint_lock_recovers() {
         let endpoint = endpoint(config()).expect("endpoint");
         let endpoint_for_panic = Arc::clone(&endpoint);
-        let _ = std::thread::spawn(move || {
+        let result = std::thread::spawn(move || {
             let _guard = endpoint_for_panic.shared.state.lock().expect("lock");
             panic!("poison endpoint lock");
         })
         .join();
+        assert!(result.is_err(), "the lock-poisoning worker must panic");
 
         assert!(endpoint.shared.lock_state().endpoint.is_some());
     }
@@ -1567,17 +1577,17 @@ mod tests {
         for worker in 0..4 {
             let endpoint = Arc::clone(&endpoint);
             workers.push(std::thread::spawn(move || {
-                for index in 0..250 {
+                for index in 0_u8..250 {
                     match worker {
                         0 => {
-                            let _ = endpoint.connected_peers();
+                            drop(endpoint.connected_peers());
                         }
                         1 => endpoint.set_active(index % 2 == 0),
                         2 => {
-                            let _ = endpoint.publish("room".into(), vec![index as u8]);
+                            drop(endpoint.publish("room".into(), vec![index]));
                         }
                         _ => {
-                            let _ = endpoint.cancel_connect(u64::MAX);
+                            drop(endpoint.cancel_connect(u64::MAX));
                         }
                     }
                 }

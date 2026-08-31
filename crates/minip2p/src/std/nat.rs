@@ -194,27 +194,49 @@ impl NatDriver {
             } => {
                 // Failures surface through the agent's own timeouts and the
                 // swarm's error events; nothing to echo synchronously.
-                let _ = swarm.send_stream(&peer, stream_id, data);
+                match swarm.send_stream(&peer, stream_id, data) {
+                    Ok(()) | Err(_) => {}
+                }
             }
             NatAction::CloseStreamWrite { peer, stream_id } => {
-                let _ = swarm.close_stream_write(&peer, stream_id);
+                // A stale close must not replace the lifecycle event that
+                // triggered this action.
+                match swarm.close_stream_write(&peer, stream_id) {
+                    Ok(()) | Err(_) => {}
+                }
             }
             NatAction::ResetStream { peer, stream_id } => {
-                let _ = swarm.reset_stream(&peer, stream_id);
+                // Reset is cleanup, so a stream already gone is equivalent
+                // to a successful reset.
+                match swarm.reset_stream(&peer, stream_id) {
+                    Ok(()) | Err(_) => {}
+                }
             }
             NatAction::Disconnect { peer } => {
-                let _ = swarm.disconnect(&peer);
+                // Connection loss remains visible through the normal swarm
+                // lifecycle; a stale disconnect adds no second outcome.
+                match swarm.disconnect(&peer) {
+                    Ok(()) | Err(_) => {}
+                }
             }
             NatAction::Ping { peer } => {
-                let _ = swarm.ping(&peer);
+                // Relay liveness is re-established from lifecycle events;
+                // a stale ping is not an application-visible failure.
+                match swarm.ping(&peer) {
+                    Ok(()) | Err(_) => {}
+                }
             }
             NatAction::SendRandomUdp {
                 target,
                 payload_len,
             } => {
                 let mut payload = vec![0u8; payload_len];
-                if getrandom::fill(&mut payload).is_ok() {
-                    let _ = swarm.transport_mut().send_datagram(&target, &payload);
+                // A failed entropy sample simply skips this one best-effort
+                // hole-punch datagram.
+                if let Ok(()) = getrandom::fill(&mut payload) {
+                    match swarm.transport_mut().send_datagram(&target, &payload) {
+                        Ok(()) | Err(_) => {}
+                    }
                 }
             }
             NatAction::PromoteBridge {
@@ -260,23 +282,25 @@ impl NatDriver {
                         if !matches!(error, AdoptError::UnknownConnection) {
                             #[cfg(test)]
                             self.bridge_reset_attempts.push((inner_conn, stream_id));
-                            let _ = swarm
+                            match swarm
                                 .transport_mut()
                                 .inner_mut()
-                                .reset_stream(inner_conn, stream_id);
+                                .reset_stream(inner_conn, stream_id)
+                            {
+                                Ok(()) | Err(_) => {}
+                            }
                         }
                     }
                 }
             }
             NatAction::CloseCircuit { conn_id } => {
-                let result = swarm.transport_mut().close(conn_id);
-                if result.is_ok()
-                    || matches!(
-                        result,
-                        Err(minip2p_transport::TransportError::ConnectionNotFound { .. })
-                    )
-                {
-                    self.promoted.retain(|_, id| *id != conn_id);
+                match swarm.transport_mut().close(conn_id) {
+                    Ok(()) | Err(minip2p_transport::TransportError::ConnectionNotFound { .. }) => {
+                        self.promoted.retain(|_, id| *id != conn_id);
+                    }
+                    // A transport failure will emerge through its normal
+                    // event path; retain the promotion until then.
+                    Err(_) => {}
                 }
             }
         }
@@ -311,7 +335,9 @@ impl NatDriver {
                 swarm.transport_mut().inject_bridge_closed(key.0, key.1);
                 self.promoted.remove(&key);
             }
-            _ => unreachable!(),
+            // `key` was extracted above only for these three stream events.
+            // Keep this defensive if a new swarm event reaches this path.
+            _ => return false,
         }
         true
     }
@@ -480,12 +506,18 @@ mod tests {
                 Instant::now() < deadline,
                 "client did not acquire {transport} relay reservation"
             );
-            let _ = client
+            match client
                 .next_event(std::time::Duration::from_millis(10))
-                .expect("drive reservation client");
-            let _ = relay
+                .expect("drive reservation client")
+            {
+                Some(_) | None => {}
+            }
+            match relay
                 .next_event(std::time::Duration::from_millis(10))
-                .expect("drive reservation relay");
+                .expect("drive reservation relay")
+            {
+                Some(_) | None => {}
+            }
         }
     }
 
@@ -528,9 +560,12 @@ mod tests {
             ) {
                 ping_rtts += 1;
             }
-            let _ = relay
+            match relay
                 .next_event(std::time::Duration::from_millis(10))
-                .expect("drive relay");
+                .expect("drive relay")
+            {
+                Some(_) | None => {}
+            }
         }
 
         let reservation_events = client.take_nat_events();
@@ -562,12 +597,18 @@ mod tests {
                 Instant::now() < reconnect_deadline,
                 "genuine relay loss did not trigger reacquisition"
             );
-            let _ = client
+            match client
                 .next_event(std::time::Duration::from_millis(10))
-                .expect("drive reconnecting client");
-            let _ = relay
+                .expect("drive reconnecting client")
+            {
+                Some(_) | None => {}
+            }
+            match relay
                 .next_event(std::time::Duration::from_millis(10))
-                .expect("drive relay after disconnect");
+                .expect("drive relay after disconnect")
+            {
+                Some(_) | None => {}
+            }
             for event in client.take_nat_events() {
                 match event {
                     NatEvent::RelayReservationLost { .. } => lost = true,
@@ -612,9 +653,12 @@ mod tests {
                 ),
                 "TCP reservation behavior must not gain automatic pings"
             );
-            let _ = relay
+            match relay
                 .next_event(std::time::Duration::from_millis(10))
-                .expect("drive TCP relay");
+                .expect("drive TCP relay")
+            {
+                Some(_) | None => {}
+            }
         }
         assert!(client.active_reservation().is_some());
     }
@@ -882,7 +926,9 @@ mod tests {
         );
         assert!(driver.promoted.is_empty());
         assert!(pair.local.swarm.transport().circuit_ids().is_empty());
-        let _ = pair.relay.next_event(std::time::Duration::from_millis(10));
+        match pair.relay.next_event(std::time::Duration::from_millis(10)) {
+            Ok(_) | Err(_) => {}
+        }
     }
 
     #[test]
@@ -1078,11 +1124,14 @@ mod tests {
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         let mut circuit_failed = false;
         while Instant::now() < deadline && !circuit_failed {
-            let _ = pair
+            match pair
                 .relay
                 .swarm
                 .poll_next(std::time::Duration::from_millis(10))
-                .expect("drive reset sender");
+                .expect("drive reset sender")
+            {
+                Some(_) | None => {}
+            }
             if let Some(event) = pair
                 .local
                 .swarm

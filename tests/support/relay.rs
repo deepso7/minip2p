@@ -1,4 +1,11 @@
-#![allow(dead_code, unexpected_cfgs)]
+#![expect(
+    dead_code,
+    reason = "the shared relay harness exposes helpers selected by different integration test binaries"
+)]
+#![allow(
+    unexpected_cfgs,
+    reason = "the including test crate decides whether its optional TCP relay helper is compiled"
+)]
 
 //! Loopback Circuit Relay v2 service used by endpoint and example tests.
 //!
@@ -84,7 +91,11 @@ impl RelayMachine {
             } => {
                 let key = (peer_id, stream_id);
                 if let Some((other_peer, other_stream)) = self.bridges.get(&key).cloned() {
-                    let _ = endpoint.close_stream_write(&other_peer, other_stream);
+                    // A FIN can race teardown of the other bridge half; that
+                    // stale close must not replace the original lifecycle event.
+                    match endpoint.close_stream_write(&other_peer, other_stream) {
+                        Ok(()) | Err(_) => {}
+                    }
                 }
             }
             Event::StreamClosed {
@@ -273,11 +284,15 @@ impl RelayMachine {
         self.hop_buffers.remove(key);
         if let Some(stop) = self.hop_to_stop.remove(key) {
             self.pending_stops.remove(&stop);
-            let _ = endpoint.reset_stream(&stop.0, stop.1);
+            match endpoint.reset_stream(&stop.0, stop.1) {
+                Ok(()) | Err(_) => {}
+            }
         }
         if let Some(other) = self.bridges.remove(key) {
             self.bridges.remove(&other);
-            let _ = endpoint.reset_stream(&other.0, other.1);
+            match endpoint.reset_stream(&other.0, other.1) {
+                Ok(()) | Err(_) => {}
+            }
         }
     }
 }
@@ -328,7 +343,11 @@ impl RelayServer {
                 match receiver.try_recv() {
                     Ok(Command::CutAll) => {
                         for peer in endpoint.connected_peers() {
-                            let _ = endpoint.disconnect(&peer);
+                            // A peer can close between the snapshot and this
+                            // command; its lifecycle event remains authoritative.
+                            match endpoint.disconnect(&peer) {
+                                Ok(()) | Err(_) => {}
+                            }
                         }
                     }
                     Ok(Command::Stop) => break,
@@ -383,6 +402,10 @@ impl RelayServer {
         self.commands.send(Command::CutAll).expect("relay is alive");
     }
 
+    #[expect(
+        clippy::panic,
+        reason = "a test harness must fail with the relay thread's recorded error"
+    )]
     pub fn assert_healthy(&self) {
         if let Some(error) = self.failure.lock().expect("relay failure lock").clone() {
             panic!("loopback relay failed: {error}");
@@ -401,7 +424,11 @@ impl RelayServer {
 
 impl Drop for RelayServer {
     fn drop(&mut self) {
-        let _ = self.commands.send(Command::Stop);
+        // The relay thread may already have stopped after recording its
+        // failure; joining and `assert_healthy` below preserve that outcome.
+        match self.commands.send(Command::Stop) {
+            Ok(()) | Err(_) => {}
+        }
         if let Some(thread) = self.thread.take() {
             thread.join().expect("relay thread joins");
         }

@@ -100,13 +100,15 @@ fn read_bound_line<R: std::io::Read + Send + 'static>(
             line.clear();
             if buf.read_line(&mut line).unwrap_or(0) == 0 {
                 // EOF: listener died before printing its bound line.
-                if !sent_bound {
-                    let _ = tx.send(None);
+                if !sent_bound && tx.send(None).is_err() {
+                    return;
                 }
                 return;
             }
             if !sent_bound && let Some(rest) = line.strip_prefix("[listen] bound=") {
-                let _ = tx.send(Some(rest.trim_end().to_string()));
+                if tx.send(Some(rest.trim_end().to_string())).is_err() {
+                    return;
+                }
                 sent_bound = true;
             }
         }
@@ -123,8 +125,9 @@ fn wait_with_deadline(mut child: Child, deadline: Duration) -> Option<std::proce
             return child.wait_with_output().ok();
         }
         if start.elapsed() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            // The child may have exited between `try_wait` and cleanup.
+            drop(child.kill());
+            drop(child.wait());
             return None;
         }
         thread::sleep(Duration::from_millis(20));

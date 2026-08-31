@@ -182,6 +182,10 @@ impl P2pEventDoorbell for SlowDoorbell {
 }
 
 impl P2pEventDoorbell for PanicOnceDoorbell {
+    #[expect(
+        clippy::panic,
+        reason = "This test-only callback deliberately verifies panic isolation."
+    )]
     fn on_events_ready(&self) {
         if self
             .log
@@ -240,6 +244,10 @@ fn stop(endpoint: &P2pEndpoint) {
 }
 
 #[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "The loopback integration test uses assertions to retain failure context."
+)]
 fn a_tcp_listen_address_binds_tcp_and_is_dialed_over_it() -> Result<(), FfiError> {
     let _serial = LOOPBACK_TEST_LOCK
         .lock()
@@ -248,10 +256,8 @@ fn a_tcp_listen_address_binds_tcp_and_is_dialed_over_it() -> Result<(), FfiError
     // `/tcp` peers to dial while binding only QUIC would leave a device that
     // has only TCP able to call out and never be called -- and the address it
     // reported would name a socket it does not have.
-    let a = P2pEndpoint::new(vec![31; 32], config_on("/ip4/127.0.0.1/tcp/0"))
-        .expect("construct a TCP endpoint");
-    let b = P2pEndpoint::new(vec![32; 32], config_on("/ip4/127.0.0.1/tcp/0"))
-        .expect("construct a TCP endpoint");
+    let a = P2pEndpoint::new(vec![31; 32], config_on("/ip4/127.0.0.1/tcp/0"))?;
+    let b = P2pEndpoint::new(vec![32; 32], config_on("/ip4/127.0.0.1/tcp/0"))?;
     for endpoint in [&a, &b] {
         let addrs = endpoint.listen_addrs();
         assert!(
@@ -296,6 +302,10 @@ fn a_tcp_listen_address_binds_tcp_and_is_dialed_over_it() -> Result<(), FfiError
 }
 
 #[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "The loopback integration test uses assertions to retain failure context."
+)]
 fn two_endpoints_chat_over_loopback() -> Result<(), FfiError> {
     let _serial = LOOPBACK_TEST_LOCK
         .lock()
@@ -400,6 +410,10 @@ fn two_endpoints_chat_over_loopback() -> Result<(), FfiError> {
 }
 
 #[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "The loopback integration test uses assertions to retain failure context."
+)]
 fn identify_ping_and_custom_streams_cross_the_ffi_boundary() -> Result<(), FfiError> {
     let _serial = LOOPBACK_TEST_LOCK
         .lock()
@@ -429,7 +443,9 @@ fn identify_ping_and_custom_streams_cross_the_ffi_boundary() -> Result<(), FfiEr
     assert!(a.is_peer_ready(b_peer.clone())?);
     let info = a
         .peer_info(b_peer.clone())?
-        .expect("ready peer has Identify info");
+        .ok_or_else(|| FfiError::Internal {
+            detail: "ready peer has no Identify info".into(),
+        })?;
     assert!(info.protocols.iter().any(|id| id == protocol));
     assert!(!info.listen_addrs.is_empty());
     assert!(
@@ -467,7 +483,9 @@ fn identify_ping_and_custom_streams_cross_the_ffi_boundary() -> Result<(), FfiEr
                 } if peer_id == &b_peer && *observed == stream_id && protocol_id == protocol
             )
         })
-        .expect("outbound stream becomes ready");
+        .ok_or_else(|| FfiError::Internal {
+            detail: "outbound stream did not become ready".into(),
+        })?;
     assert!(matches!(
         ready,
         P2pEvent::StreamReady { conn_id, .. } if conn_id == opened.conn_id
@@ -489,6 +507,10 @@ fn identify_ping_and_custom_streams_cross_the_ffi_boundary() -> Result<(), FfiEr
 }
 
 #[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "The loopback integration test uses assertions to retain failure context."
+)]
 fn panicking_doorbell_does_not_kill_driver() -> Result<(), FfiError> {
     let _serial = LOOPBACK_TEST_LOCK
         .lock()
@@ -542,6 +564,10 @@ fn panicking_doorbell_does_not_kill_driver() -> Result<(), FfiError> {
 }
 
 #[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "The loopback integration test uses assertions to retain failure context."
+)]
 fn query_completes_while_doorbell_callback_is_in_flight() -> Result<(), FfiError> {
     let _serial = LOOPBACK_TEST_LOCK
         .lock()
@@ -584,8 +610,12 @@ fn query_completes_while_doorbell_callback_is_in_flight() -> Result<(), FfiError
     });
     let query_completed = received.recv_timeout(Duration::from_secs(1));
     gate.release();
-    query.join().expect("query worker");
-    assert!(query_completed.expect("query blocked behind doorbell callback"));
+    query.join().map_err(|_panic| FfiError::Internal {
+        detail: "query worker panicked".into(),
+    })?;
+    assert!(query_completed.map_err(|_timeout| FfiError::Internal {
+        detail: "query blocked behind doorbell callback".into(),
+    })?);
 
     stop(&a);
     stop(&b);
@@ -593,6 +623,10 @@ fn query_completes_while_doorbell_callback_is_in_flight() -> Result<(), FfiError
 }
 
 #[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "The loopback integration test uses assertions to retain failure context."
+)]
 fn bounded_load_preserves_order_and_accounting() -> Result<(), FfiError> {
     const MESSAGE_COUNT: usize = 600;
 

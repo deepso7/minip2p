@@ -370,6 +370,10 @@ impl RawMessage {
             .from
             .as_deref()
             .ok_or(MessageVerifyError::MissingFrom)?;
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "the verification API intentionally exposes one invalid-publisher category"
+        )]
         let from = PeerId::from_bytes(from_bytes).map_err(|_| MessageVerifyError::InvalidFrom)?;
         let seqno = self
             .seqno
@@ -409,6 +413,10 @@ impl RawMessage {
             }
             return Err(MessageVerifyError::MissingSignature);
         };
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "the error records the only useful detail: that the signature length is invalid"
+        )]
         let signature: &[u8; SIGNATURE_LEN] = signature
             .try_into()
             .map_err(|_| MessageVerifyError::InvalidSignatureLength)?;
@@ -418,16 +426,32 @@ impl RawMessage {
         // a forgery vector, and a recovered key trivially satisfies the
         // check only when `from` really inlines it.
         let public_key = match self.key.as_deref() {
-            Some(key) => {
+            Some(key) =>
+            {
+                #[expect(
+                    clippy::map_err_ignore,
+                    reason = "wire decode details intentionally collapse into the public invalid-key category"
+                )]
                 PublicKey::decode_protobuf(key).map_err(|_| MessageVerifyError::InvalidKey)?
             }
-            None => PublicKey::decode_protobuf(from.digest_bytes())
-                .map_err(|_| MessageVerifyError::KeyPeerIdMismatch)?,
+            None =>
+            {
+                #[expect(
+                    clippy::map_err_ignore,
+                    reason = "a non-inline peer id has no recoverable signing key and maps to a key-peer mismatch"
+                )]
+                PublicKey::decode_protobuf(from.digest_bytes())
+                    .map_err(|_| MessageVerifyError::KeyPeerIdMismatch)?
+            }
         };
         if PeerId::from_public_key(&public_key) != from {
             return Err(MessageVerifyError::KeyPeerIdMismatch);
         }
 
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "signature verifier details must not distinguish malformed keys from invalid signatures to callers"
+        )]
         public_key
             .verify(&self.sign_bytes(), signature)
             .map_err(|_| MessageVerifyError::SignatureInvalid)?;
@@ -739,7 +763,7 @@ fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, PubsubWi
         return Ok(None);
     }
     let offset = *idx;
-    let (tag_value, used) = read_uvarint(&input[*idx..])?;
+    let (tag_value, used) = read_uvarint(varint_tail(input, *idx)?)?;
     *idx += used;
     let wire_type = (tag_value & 0x07) as u8;
     let field_number = tag_value >> 3;
@@ -751,8 +775,12 @@ fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, PubsubWi
 
 /// Reads a length-delimited value, advancing `idx` past length and bytes.
 fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], PubsubWireError> {
-    let (length, used) = read_uvarint(&input[*idx..])?;
+    let (length, used) = read_uvarint(varint_tail(input, *idx)?)?;
     *idx += used;
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "the wire format intentionally reports platform-sized length conversion as a varint overflow"
+    )]
     let length = usize::try_from(length).map_err(|_| VarintError::Overflow)?;
     let remaining = input.len().saturating_sub(*idx);
     if length > remaining {
@@ -762,8 +790,19 @@ fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], 
             remaining,
         });
     }
-    let value = &input[*idx..*idx + length];
-    *idx += length;
+    let end = (*idx)
+        .checked_add(length)
+        .ok_or(PubsubWireError::FieldOverflow {
+            offset: *idx,
+            length,
+            remaining,
+        })?;
+    let value = input.get(*idx..end).ok_or(PubsubWireError::FieldOverflow {
+        offset: *idx,
+        length,
+        remaining,
+    })?;
+    *idx = end;
     Ok(value)
 }
 
@@ -771,13 +810,17 @@ fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], 
 fn read_string(input: &[u8], idx: &mut usize) -> Result<String, PubsubWireError> {
     let offset = *idx;
     let bytes = read_len_delimited(input, idx)?;
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "the public error preserves the payload offset, not UTF-8 parser internals"
+    )]
     let value = core::str::from_utf8(bytes).map_err(|_| PubsubWireError::InvalidUtf8 { offset })?;
     Ok(String::from(value))
 }
 
 /// Reads a varint field value.
 fn read_varint_value(input: &[u8], idx: &mut usize) -> Result<u64, PubsubWireError> {
-    let (value, used) = read_uvarint(&input[*idx..])?;
+    let (value, used) = read_uvarint(varint_tail(input, *idx)?)?;
     *idx += used;
     Ok(value)
 }
@@ -786,7 +829,7 @@ fn read_varint_value(input: &[u8], idx: &mut usize) -> Result<u64, PubsubWireErr
 fn skip_unknown_field(input: &[u8], idx: &mut usize, wire_type: u8) -> Result<(), PubsubWireError> {
     match wire_type {
         WIRE_VARINT => {
-            let (_, used) = read_uvarint(&input[*idx..])?;
+            let (_, used) = read_uvarint(varint_tail(input, *idx)?)?;
             *idx += used;
             Ok(())
         }
@@ -821,6 +864,13 @@ fn skip_unknown_field(input: &[u8], idx: &mut usize, wire_type: u8) -> Result<()
             offset: *idx,
         }),
     }
+}
+
+/// Returns the unconsumed protobuf bytes, rejecting a cursor past the input.
+fn varint_tail(input: &[u8], idx: usize) -> Result<&[u8], PubsubWireError> {
+    input
+        .get(idx..)
+        .ok_or(PubsubWireError::Varint(VarintError::BufferTooShort))
 }
 
 // ---------------------------------------------------------------------------
@@ -1258,7 +1308,7 @@ mod tests {
         let kp = keypair();
         let mut message = RawMessage::build_signed(&kp, "chat", b"hi".to_vec(), 7);
         message.key = Some(kp.public_key().encode_protobuf());
-        assert!(message.verify(false).is_ok(), "matching key field verifies");
+        message.verify(false).expect("matching key field verifies");
 
         // A forged key that verifies the signature but hashes to a different
         // peer id must be rejected: otherwise anyone could impersonate `from`.
@@ -1283,7 +1333,7 @@ mod tests {
     fn verification_recovers_the_key_from_an_inline_from() {
         let message = RawMessage::build_signed(&keypair(), "chat", b"hi".to_vec(), 7);
         assert!(message.key.is_none());
-        assert!(message.verify(false).is_ok());
+        message.verify(false).expect("inline key verifies");
     }
 
     #[test]
@@ -1309,7 +1359,7 @@ mod tests {
         // emits 20 random bytes. Anything 1..=64 is accepted.
         let mut rust_seqno = unsigned.clone();
         rust_seqno.seqno = Some(vec![7; 20]);
-        assert!(rust_seqno.verify(true).is_ok(), "20-byte seqno verifies");
+        rust_seqno.verify(true).expect("20-byte seqno verifies");
 
         // Even unsigned, the dedup id fields stay mandatory and bounded.
         let mut no_from = unsigned.clone();

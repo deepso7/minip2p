@@ -121,7 +121,9 @@ fn listener_reclaims_state_after_dialer_close() {
     });
 
     let events = dialer.close().expect("close flushes disconnects");
-    let _ = stop_remote.send(());
+    match stop_remote.send(()) {
+        Ok(()) | Err(_) => {}
+    }
     let mut listener = remote.join().expect("listener driver thread");
 
     assert!(
@@ -200,7 +202,9 @@ fn close_drains_replacement_connection() {
     });
 
     let events = listener.close().expect("close drains replacements");
-    let _ = stop_remote.send(());
+    match stop_remote.send(()) {
+        Ok(()) | Err(_) => {}
+    }
     let _replacement = remote.join().expect("replacement driver thread");
 
     let established: Vec<_> = events
@@ -274,7 +278,9 @@ fn close_drains_pending_replacement_handshake() {
     });
 
     let events = listener.close().expect("close drains pending replacement");
-    let _ = stop_remote.send(());
+    match stop_remote.send(()) {
+        Ok(()) | Err(_) => {}
+    }
     let _replacement = remote.join().expect("replacement driver thread");
 
     let established: Vec<_> = events

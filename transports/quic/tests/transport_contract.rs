@@ -177,7 +177,10 @@ fn no_stream_events_before_connected() {
         .position(|e| matches!(e, TransportEvent::Connected { .. }))
         .expect("must have Connected");
 
-    for event in &client_events[..connected_idx] {
+    for event in client_events
+        .get(..connected_idx)
+        .expect("the connected event index is within the collected events")
+    {
         assert!(
             !matches!(
                 event,

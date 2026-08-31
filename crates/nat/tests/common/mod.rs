@@ -3,7 +3,10 @@
 
 // Each integration-test binary compiles its own copy of this module and
 // uses a different subset of the helpers.
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "each integration test imports only the shared helpers it needs"
+)]
 
 use minip2p_autonat::{AutoNatServer, AutoNatServerInput, AutoNatServerOutput, ResponseStatus};
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol};
@@ -131,6 +134,10 @@ pub fn hop_reserve_ok(expire_unix_secs: Option<u64>) -> Vec<u8> {
 
 /// Runs `request_bytes` through a real [`AutoNatServer`] and returns the
 /// wire bytes of the given response — public with `addrs`, or a dial error.
+#[expect(
+    clippy::panic,
+    reason = "the shared test helper must fail at the unexpected AutoNAT response"
+)]
 pub fn autonat_response(request_bytes: &[u8], public_addrs: Option<&[Multiaddr]>) -> Vec<u8> {
     let mut server = AutoNatServer::new();
     server
@@ -172,6 +179,10 @@ pub fn identify_observed(agent: &mut NatAgent, reporter: &PeerId, addr: &Multiad
 }
 
 /// Decodes the observed addresses out of a framed DCUtR message.
+#[expect(
+    clippy::panic,
+    reason = "the shared test helper requires a complete DCUtR frame"
+)]
 pub fn dcutr_obs_addrs(frame: &[u8]) -> Vec<Multiaddr> {
     let FrameDecode::Complete { payload, .. } = dcutr_decode_frame(frame) else {
         panic!("expected a complete DCUtR frame");

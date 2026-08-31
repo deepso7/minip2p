@@ -211,7 +211,9 @@ fn carrier_with(
     );
     iface.update_ip_addrs(|addrs| {
         for address in addresses {
-            let _ = addrs.push(IpCidr::new((*address).into(), 24));
+            addrs
+                .push(IpCidr::new((*address).into(), 24))
+                .expect("test interface holds configured addresses");
         }
     });
     SmoltcpMdnsIo::new(device, iface, config).expect("the interface takes the mDNS group")
@@ -250,7 +252,9 @@ impl Node {
             Instant::from_millis(0),
         );
         iface.update_ip_addrs(|addrs| {
-            let _ = addrs.push(IpCidr::new(address.into(), 24));
+            addrs
+                .push(IpCidr::new(address.into(), 24))
+                .expect("test interface holds its configured address");
         });
         let io = SmoltcpMdnsIo::new(
             device,
@@ -289,20 +293,24 @@ impl Node {
     }
 }
 
-/// Ticks both nodes until `done`, or panics with what was seen.
-fn run_until(first: &mut Node, second: &mut Node, mut done: impl FnMut(&Node, &Node) -> bool) {
+/// Ticks both nodes until `done`, retaining observations if the deadline passes.
+fn run_until(
+    first: &mut Node,
+    second: &mut Node,
+    mut done: impl FnMut(&Node, &Node) -> bool,
+) -> Result<(), String> {
     for step in 0..MAX_STEPS {
         let now = step as u64 * STEP_MS;
         first.tick(now);
         second.tick(now);
         if done(first, second) {
-            return;
+            return Ok(());
         }
     }
-    panic!(
+    Err(format!(
         "nothing happened in {MAX_STEPS} steps:\n  {:?}\n  {:?}",
         first.events, second.events
-    );
+    ))
 }
 
 // ----------------------------------------------------------------- tests
@@ -315,7 +323,8 @@ fn two_nodes_find_each_other_over_multicast() {
 
     run_until(&mut first, &mut second, |a, b| {
         a.observed(&peer(2)).is_some() && b.observed(&peer(1)).is_some()
-    });
+    })
+    .expect("both nodes discover each other");
 
     // What each learned is what the other actually listens on -- the whole
     // point of the exchange, and the part no fake could have got right by
@@ -339,7 +348,8 @@ fn a_node_that_leaves_says_so_on_the_wire() {
     let mut second = Node::new(&bus, Ipv4Address::new(192, 168, 1, 2), 2);
     run_until(&mut first, &mut second, |a, _| {
         a.observed(&peer(2)).is_some()
-    });
+    })
+    .expect("first node observes the second");
 
     // A goodbye is a claim with a zero TTL, and it has to reach the peer: an
     // unsent one costs it a full TTL of pointing at a host that has gone.
@@ -695,7 +705,9 @@ fn an_address_that_arrives_later_reaches_the_agent() {
 
     // The lease lands. Nothing tells mDNS about it but the next refresh.
     io.stack().borrow_mut().interface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::new(Ipv4Address::new(192, 168, 1, 5).into(), 24));
+        addrs
+            .push(IpCidr::new(Ipv4Address::new(192, 168, 1, 5).into(), 24))
+            .expect("test interface holds the DHCP address");
     });
     assert!(
         io.refresh().expect("refresh"),

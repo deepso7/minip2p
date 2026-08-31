@@ -42,10 +42,9 @@ impl Family {
 /// comes out, and routing it stays the set's decision.
 pub(crate) fn targets(addr: &PeerAddr) -> Result<Vec<(Family, PeerAddr)>, TransportError> {
     let protocols = addr.transport().protocols();
-    let Some(host) = protocols.first() else {
+    let Some((host, rest)) = protocols.split_first() else {
         return Err(invalid("dial target has no host component"));
     };
-    let rest = &protocols[1..];
 
     let (name, filter) = match host {
         Protocol::Ip4(_) | Protocol::Ip6(_) => {
@@ -174,15 +173,18 @@ mod tests {
         );
         for (family, target) in &expanded {
             let protocols = target.transport().protocols();
+            let (host, rest) = protocols
+                .split_first()
+                .expect("a rebuilt peer address always has its concrete host");
             assert!(
                 matches!(
-                    (family, &protocols[0]),
+                    (family, host),
                     (Family::V4, Protocol::Ip4(_)) | (Family::V6, Protocol::Ip6(_))
                 ),
                 "the host is concrete and matches its family: {protocols:?}"
             );
             assert_eq!(
-                &protocols[1..],
+                rest,
                 &[Protocol::Tcp(4001)],
                 "everything after the host is the caller's, not the resolver's"
             );
@@ -248,10 +250,12 @@ mod tests {
         let addr = peer_addr("/dns4/localhost/udp/4001/quic-v1");
         for (family, target) in targets(&addr).expect("targets") {
             assert_eq!(family, Family::V4, "/dns4 must not produce an ipv6 dial");
-            assert!(matches!(
-                target.transport().protocols()[0],
-                Protocol::Ip4(_)
-            ));
+            let (host, _) = target
+                .transport()
+                .protocols()
+                .split_first()
+                .expect("resolved peer address has a concrete host");
+            assert!(matches!(host, Protocol::Ip4(_)));
         }
     }
 

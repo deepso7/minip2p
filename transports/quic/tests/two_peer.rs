@@ -627,13 +627,21 @@ fn raw_quiche_config(
     config
 }
 
+#[expect(
+    clippy::panic,
+    reason = "the raw QUIC test helper must stop immediately on socket or quiche failures"
+)]
 fn flush_raw_quiche_client(conn: &mut quiche::Connection, socket: &UdpSocket) {
     let mut out = [0u8; 1350];
     loop {
         match conn.send(&mut out) {
             Ok((written, send_info)) => {
                 socket
-                    .send_to(&out[..written], send_info.to)
+                    .send_to(
+                        out.get(..written)
+                            .expect("quiche writes packets within the supplied test buffer"),
+                        send_info.to,
+                    )
                     .expect("raw client send");
             }
             Err(quiche::Error::Done) => break,
@@ -642,6 +650,10 @@ fn flush_raw_quiche_client(conn: &mut quiche::Connection, socket: &UdpSocket) {
     }
 }
 
+#[expect(
+    clippy::panic,
+    reason = "the raw QUIC test helper must stop immediately on socket or quiche failures"
+)]
 fn drain_raw_quiche_client(
     conn: &mut quiche::Connection,
     socket: &UdpSocket,
@@ -655,7 +667,11 @@ fn drain_raw_quiche_client(
             Err(e) => panic!("raw client recv failed: {e}"),
         };
         let recv_info = quiche::RecvInfo { from, to: local };
-        match conn.recv(&mut buf[..len], recv_info) {
+        match conn.recv(
+            buf.get_mut(..len)
+                .expect("UDP receive lengths fit the supplied test buffer"),
+            recv_info,
+        ) {
             Ok(_) | Err(quiche::Error::Done) => {}
             Err(e) => panic!("raw client quiche recv failed: {e}"),
         }

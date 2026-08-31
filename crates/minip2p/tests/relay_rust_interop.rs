@@ -12,8 +12,12 @@ struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        match self.0.kill() {
+            Ok(()) | Err(_) => {}
+        }
+        match self.0.wait() {
+            Ok(_) | Err(_) => {}
+        }
     }
 }
 

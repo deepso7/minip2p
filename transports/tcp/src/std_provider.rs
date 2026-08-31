@@ -259,11 +259,14 @@ impl StdTcpProvider {
 
     fn allocate_token(&mut self) -> Result<Token, TcpError> {
         let id = self.next_id;
-        let token = usize::try_from(id)
-            .map(Token)
-            .map_err(|_| TcpError::Exhausted {
-                resource: "readiness tokens",
-            })?;
+        let token = match usize::try_from(id) {
+            Ok(token) => Token(token),
+            Err(_) => {
+                return Err(TcpError::Exhausted {
+                    resource: "readiness tokens",
+                });
+            }
+        };
         self.next_id += 1;
         Ok(token)
     }
@@ -373,8 +376,7 @@ impl StdTcpProvider {
         self.accept_cursor = start.wrapping_add(1);
 
         let mut budget = MAX_ACCEPTS_PER_POLL;
-        for offset in 0..tokens.len() {
-            let token = tokens[(start + offset) % tokens.len()];
+        for &token in tokens.iter().cycle().skip(start).take(tokens.len()) {
             loop {
                 if budget == 0 {
                     // A flood must not hold the poll open; the backlog keeps
@@ -518,7 +520,10 @@ impl StdTcpProvider {
                     return;
                 }
                 Ok(read) => {
-                    let data = self.read_buffer[..read].to_vec();
+                    let Some(data) = self.read_buffer.get(..read).map(ToOwned::to_owned) else {
+                        socket.readable = false;
+                        return;
+                    };
                     self.ready.push_back(TcpEvent::Received {
                         socket: handle,
                         data,
@@ -563,7 +568,10 @@ impl StdTcpProvider {
         let Some(mut socket) = self.sockets.remove(&handle) else {
             return;
         };
-        let _ = self.poll.registry().deregister(&mut socket.stream);
+        if let Err(error) = self.poll.registry().deregister(&mut socket.stream) {
+            // The stream is about to drop, which releases the registration too.
+            drop(error);
+        }
         self.ready.push_back(TcpEvent::Closed {
             socket: handle,
             reason,
@@ -702,7 +710,13 @@ impl TcpProvider for StdTcpProvider {
 
     fn abort(&mut self, socket: SocketHandle) {
         if let Some(mut entry) = self.sockets.remove(&socket) {
-            let _ = self.poll.registry().deregister(&mut entry.stream);
+            match self.poll.registry().deregister(&mut entry.stream) {
+                Ok(()) => {}
+                Err(error) => {
+                    // Dropping the stream releases the registration after an abort.
+                    drop(error);
+                }
+            }
             // Dropping the stream closes it. The kernel still flushes whatever
             // it already accepted, so this is a close rather than a reset --
             // the peer sees the stream end either way, which is what the
@@ -769,7 +783,10 @@ impl BlockingTcpProvider for StdTcpProvider {
     fn wait_handle(&self) -> WaitHandle {
         let waker = Arc::clone(&self.waker);
         WaitHandle::new(move || {
-            let _ = waker.wake();
+            if let Err(error) = waker.wake() {
+                // A destroyed poller cannot be woken; the handle has no error channel.
+                drop(error);
+            }
         })
     }
 }

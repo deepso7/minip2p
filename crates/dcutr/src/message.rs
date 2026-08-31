@@ -116,16 +116,18 @@ impl HolePunch {
             // Read the field tag as a full u64. Field numbers >= 16 encode as
             // multi-byte varints; truncating to u8 would let a remote peer
             // alias known tags (e.g. field 33 + LEN => 266, `266 as u8 = 0x0A`).
-            let (tag_value, used) = read_uvarint(&input[idx..])?;
-            idx += used;
+            let (tag_value, used) =
+                read_uvarint(input.get(idx..).ok_or(VarintError::BufferTooShort)?)?;
+            advance(input, &mut idx, used)?;
 
             let wire_type = (tag_value & 0x07) as u8;
             let field_number = tag_value >> 3;
 
             match (field_number, wire_type) {
                 (FIELD_TYPE, WIRE_VARINT) => {
-                    let (value, used) = read_uvarint(&input[idx..])?;
-                    idx += used;
+                    let (value, used) =
+                        read_uvarint(input.get(idx..).ok_or(VarintError::BufferTooShort)?)?;
+                    advance(input, &mut idx, used)?;
                     kind = Some(
                         HolePunchType::from_u64(value)
                             .ok_or(DcutrMessageError::InvalidType { value })?,
@@ -137,31 +139,42 @@ impl HolePunch {
                 }
                 // Skip unknown fields based on their wire type.
                 (_, WIRE_VARINT) => {
-                    let (_, used) = read_uvarint(&input[idx..])?;
-                    idx += used;
+                    let (_, used) =
+                        read_uvarint(input.get(idx..).ok_or(VarintError::BufferTooShort)?)?;
+                    advance(input, &mut idx, used)?;
                 }
                 (_, WIRE_LEN) => {
                     let _ = read_len_delimited(input, &mut idx)?;
                 }
                 (_, 1 /* I64 */) => {
-                    if idx + 8 > input.len() {
+                    let end = idx.checked_add(8).ok_or(DcutrMessageError::FieldOverflow {
+                        offset: idx,
+                        length: 8,
+                        remaining: input.len().saturating_sub(idx),
+                    })?;
+                    if end > input.len() {
                         return Err(DcutrMessageError::FieldOverflow {
                             offset: idx,
                             length: 8,
                             remaining: input.len().saturating_sub(idx),
                         });
                     }
-                    idx += 8;
+                    idx = end;
                 }
                 (_, 5 /* I32 */) => {
-                    if idx + 4 > input.len() {
+                    let end = idx.checked_add(4).ok_or(DcutrMessageError::FieldOverflow {
+                        offset: idx,
+                        length: 4,
+                        remaining: input.len().saturating_sub(idx),
+                    })?;
+                    if end > input.len() {
                         return Err(DcutrMessageError::FieldOverflow {
                             offset: idx,
                             length: 4,
                             remaining: input.len().saturating_sub(idx),
                         });
                     }
-                    idx += 4;
+                    idx = end;
                 }
                 (_, other) => {
                     return Err(DcutrMessageError::UnsupportedWireType {
@@ -182,10 +195,15 @@ impl HolePunch {
 /// Reads a length-delimited value, performing a checked `u64 -> usize`
 /// conversion to guard against truncation on 32-bit targets.
 fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], DcutrMessageError> {
-    let (length_u64, len_used) = read_uvarint(&input[*idx..])?;
-    *idx += len_used;
+    let (length_u64, len_used) =
+        read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
+    advance(input, idx, len_used)?;
 
     let remaining = input.len().saturating_sub(*idx);
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "the compact field-overflow error reports the unrepresentable length"
+    )]
     let length = usize::try_from(length_u64).map_err(|_| DcutrMessageError::FieldOverflow {
         offset: *idx,
         length: usize::MAX,
@@ -200,9 +218,37 @@ fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], 
         });
     }
 
-    let value = &input[*idx..*idx + length];
-    *idx += length;
+    let end = idx
+        .checked_add(length)
+        .ok_or(DcutrMessageError::FieldOverflow {
+            offset: *idx,
+            length,
+            remaining,
+        })?;
+    let value = input
+        .get(*idx..end)
+        .ok_or(DcutrMessageError::FieldOverflow {
+            offset: *idx,
+            length,
+            remaining,
+        })?;
+    *idx = end;
     Ok(value)
+}
+
+/// Advances a protobuf cursor without allowing it to leave the input slice.
+fn advance(input: &[u8], idx: &mut usize, length: usize) -> Result<(), DcutrMessageError> {
+    let remaining = input.len().saturating_sub(*idx);
+    let end = idx
+        .checked_add(length)
+        .filter(|end| *end <= input.len())
+        .ok_or(DcutrMessageError::FieldOverflow {
+            offset: *idx,
+            length,
+            remaining,
+        })?;
+    *idx = end;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

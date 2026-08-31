@@ -8,9 +8,14 @@ use minip2p_pubsub::{FrameDecode, Rpc, decode_frame};
 fn decode_hex(hex: &str) -> Vec<u8> {
     let hex = hex.trim();
     assert!(hex.len().is_multiple_of(2), "odd hex length");
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex digit"))
+    let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
+    assert!(remainder.is_empty(), "odd hex length");
+    pairs
+        .iter()
+        .map(|pair| {
+            let digit = core::str::from_utf8(pair).expect("hex digit is ASCII");
+            u8::from_str_radix(digit, 16).expect("hex digit")
+        })
         .collect()
 }
 

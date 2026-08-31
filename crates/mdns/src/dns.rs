@@ -330,13 +330,17 @@ fn decode_records(
                 let mut strings = Vec::new();
                 let mut pos = rdata_start;
                 while pos < rdata_end {
-                    let len = packet[pos] as usize;
+                    let len =
+                        usize::from(*packet.get(pos).ok_or(DnsCodecError::InvalidRecordData)?);
                     pos += 1;
                     let end = pos
                         .checked_add(len)
                         .filter(|end| *end <= rdata_end)
                         .ok_or(DnsCodecError::InvalidRecordData)?;
-                    strings.push(packet[pos..end].to_vec());
+                    let value = packet
+                        .get(pos..end)
+                        .ok_or(DnsCodecError::InvalidRecordData)?;
+                    strings.push(value.to_vec());
                     pos = end;
                 }
                 Some(DnsRecordData::Txt(strings))
@@ -384,8 +388,11 @@ fn decode_name(packet: &[u8], cursor: &mut usize) -> Result<String, DnsCodecErro
                     .checked_add(len + 1)
                     .filter(|len| *len <= 255)
                     .ok_or(DnsCodecError::NameTooLong)?;
-                let label = core::str::from_utf8(&packet[pos..end])
-                    .map_err(|_| DnsCodecError::InvalidLabel)?;
+                let label_bytes = packet.get(pos..end).ok_or(DnsCodecError::Truncated)?;
+                let label = match core::str::from_utf8(label_bytes) {
+                    Ok(label) => label,
+                    Err(_) => return Err(DnsCodecError::InvalidLabel),
+                };
                 labels.push(label.to_string());
                 pos = end;
             }
@@ -452,7 +459,9 @@ fn write_record(out: &mut Vec<u8>, record: &DnsRecord) -> Option<()> {
         }
     }
     let len = u16::try_from(out.len().checked_sub(start)?).ok()?;
-    out[len_pos..len_pos + 2].copy_from_slice(&len.to_be_bytes());
+    let len_end = len_pos.checked_add(2)?;
+    out.get_mut(len_pos..len_end)?
+        .copy_from_slice(&len.to_be_bytes());
     Some(())
 }
 
@@ -475,10 +484,7 @@ fn write_name(out: &mut Vec<u8>, name: &str) -> Option<()> {
 }
 
 fn read_u16(packet: &[u8], offset: usize) -> Result<u16, DnsCodecError> {
-    let bytes = packet
-        .get(offset..offset + 2)
-        .ok_or(DnsCodecError::Truncated)?;
-    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    Ok(u16::from_be_bytes(read_array(packet, offset)?))
 }
 
 fn take_u16(packet: &[u8], cursor: &mut usize) -> Result<u16, DnsCodecError> {
@@ -488,11 +494,17 @@ fn take_u16(packet: &[u8], cursor: &mut usize) -> Result<u16, DnsCodecError> {
 }
 
 fn take_u32(packet: &[u8], cursor: &mut usize) -> Result<u32, DnsCodecError> {
-    let bytes = packet
-        .get(*cursor..*cursor + 4)
-        .ok_or(DnsCodecError::Truncated)?;
+    let value = u32::from_be_bytes(read_array(packet, *cursor)?);
     *cursor += 4;
-    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    Ok(value)
+}
+
+fn read_array<const N: usize>(packet: &[u8], offset: usize) -> Result<[u8; N], DnsCodecError> {
+    let end = offset.checked_add(N).ok_or(DnsCodecError::Truncated)?;
+    packet
+        .get(offset..end)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or(DnsCodecError::Truncated)
 }
 
 fn write_u16(out: &mut Vec<u8>, value: u16) {
