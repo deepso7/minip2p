@@ -63,9 +63,9 @@ impl PeerAddr {
             .rposition(|protocol| matches!(protocol, Protocol::P2p(_)))
             .ok_or(PeerAddrError::MissingPeerId)?;
 
-        if last != protocols.len() - 1 {
+        let Some((Protocol::P2p(peer_id), transport_slice)) = protocols.split_last() else {
             return Err(PeerAddrError::NonTerminalPeerId);
-        }
+        };
 
         // Find the first /p2p component; if it differs from `last`, there are
         // multiple /p2p segments, which is not allowed.
@@ -78,18 +78,15 @@ impl PeerAddr {
             return Err(PeerAddrError::NonTerminalPeerId);
         }
 
-        let peer_id = match &protocols[last] {
-            Protocol::P2p(peer_id) => peer_id.clone(),
-            _ => return Err(PeerAddrError::MissingPeerId),
-        };
-
-        let transport_slice = &protocols[..last];
         if transport_slice.is_empty() {
             return Err(PeerAddrError::EmptyTransport);
         }
 
         let transport = Multiaddr::from_protocols(transport_slice.to_vec());
-        Ok(Self { transport, peer_id })
+        Ok(Self {
+            transport,
+            peer_id: peer_id.clone(),
+        })
     }
 
     /// Returns the transport portion (without `/p2p`).

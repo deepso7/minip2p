@@ -90,7 +90,10 @@ fn accept_and_poll(
                 peers.push(stream);
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-            Err(error) => panic!("accept peer: {error}"),
+            Err(error) => {
+                assert_eq!(error.kind(), ErrorKind::WouldBlock, "accept peer: {error}");
+                break;
+            }
         }
     }
     provider

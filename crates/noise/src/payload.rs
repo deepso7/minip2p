@@ -43,9 +43,19 @@ impl NoiseHandshakePayload {
         let mut extensions = None;
 
         while cursor < input.len() {
-            let (tag, used) = read_uvarint(&input[cursor..])
+            let remaining = input
+                .get(cursor..)
+                .ok_or(NoiseError::InvalidPayload("truncated field tag"))?;
+            #[expect(
+                clippy::map_err_ignore,
+                reason = "NoiseError intentionally keeps malformed protobuf tags compact."
+            )]
+            let (tag, used) = read_uvarint(remaining)
                 .map_err(|_| NoiseError::InvalidPayload("invalid field tag"))?;
-            cursor += used;
+            cursor = cursor
+                .checked_add(used)
+                .filter(|end| *end <= input.len())
+                .ok_or(NoiseError::InvalidPayload("invalid field tag"))?;
             let field = tag >> 3;
             let wire = tag & 7;
 
@@ -64,7 +74,7 @@ impl NoiseHandshakePayload {
                     1 => (&mut identity_key, "duplicate identity key"),
                     2 => (&mut identity_sig, "duplicate identity signature"),
                     4 => (&mut extensions, "duplicate extensions"),
-                    _ => unreachable!("known fields were matched above"),
+                    _ => return Err(NoiseError::InvalidPayload("invalid known field")),
                 };
                 if slot.replace(value).is_some() {
                     return Err(NoiseError::InvalidPayload(duplicate_reason));
@@ -90,9 +100,23 @@ fn write_bytes_field(field: u64, value: &[u8], out: &mut Vec<u8>) {
 }
 
 fn read_bytes<'a>(input: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], NoiseError> {
-    let (len, used) = read_uvarint(&input[*cursor..])
-        .map_err(|_| NoiseError::InvalidPayload("invalid field length"))?;
-    *cursor += used;
+    let remaining = input
+        .get(*cursor..)
+        .ok_or(NoiseError::InvalidPayload("truncated field length"))?;
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "NoiseError intentionally keeps malformed protobuf lengths compact."
+    )]
+    let (len, used) =
+        read_uvarint(remaining).map_err(|_| NoiseError::InvalidPayload("invalid field length"))?;
+    *cursor = cursor
+        .checked_add(used)
+        .filter(|end| *end <= input.len())
+        .ok_or(NoiseError::InvalidPayload("invalid field length"))?;
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "NoiseError has a stable field-length overflow variant."
+    )]
     let len =
         usize::try_from(len).map_err(|_| NoiseError::InvalidPayload("field length overflow"))?;
     let end = cursor
@@ -108,7 +132,14 @@ fn read_bytes<'a>(input: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], Noise
 fn skip_unknown(input: &[u8], cursor: &mut usize, wire: u64) -> Result<(), NoiseError> {
     let count = match wire {
         0 => {
-            let (_, used) = read_uvarint(&input[*cursor..])
+            let remaining = input
+                .get(*cursor..)
+                .ok_or(NoiseError::InvalidPayload("truncated unknown field"))?;
+            #[expect(
+                clippy::map_err_ignore,
+                reason = "NoiseError intentionally keeps malformed unknown fields compact."
+            )]
+            let (_, used) = read_uvarint(remaining)
                 .map_err(|_| NoiseError::InvalidPayload("invalid unknown varint"))?;
             used
         }
@@ -148,7 +179,7 @@ mod tests {
 
     #[test]
     fn rejects_truncated_payload() {
-        assert!(NoiseHandshakePayload::decode(&[0x0a, 0x20, 1]).is_err());
+        let _ = NoiseHandshakePayload::decode(&[0x0a, 0x20, 1]).unwrap_err();
     }
 
     #[test]

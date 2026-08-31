@@ -114,7 +114,7 @@ impl FrameBuf {
             return None;
         }
         let mut frame = [0u8; FRAME_LEN];
-        frame.copy_from_slice(&self.buf[self.head..end]);
+        frame.copy_from_slice(self.buf.get(self.head..end)?);
         self.head = end;
         if self.head == self.buf.len() {
             self.buf.clear();
@@ -236,7 +236,9 @@ fn handle_listen_event(
         Event::StreamRemoteWriteClosed {
             peer_id, stream_id, ..
         } if echo_streams.contains(&(peer_id.clone(), *stream_id)) => {
-            let _ = endpoint.close_stream_write(peer_id, *stream_id);
+            if let Err(error) = endpoint.close_stream_write(peer_id, *stream_id) {
+                eprintln!("[listen] echo close failed peer={peer_id} stream={stream_id}: {error}");
+            }
             echo_streams.remove(&(peer_id.clone(), *stream_id));
         }
         Event::StreamClosed {
@@ -351,7 +353,10 @@ pub fn run_dial(
     let start = Instant::now();
     let (peer, connect_id) = match &target {
         DialTarget::Circuit { peer, .. } => {
-            println!("[dial] target={peer} via-relay={}", relays[0].peer_id());
+            let relay = relays
+                .first()
+                .ok_or("circuit target has no relay configured")?;
+            println!("[dial] target={peer} via-relay={}", relay.peer_id());
             let id = endpoint
                 .connect(peer)
                 .map_err(|e| format!("connect failed: {e}"))?;
@@ -432,7 +437,9 @@ fn open_echo_stream(
                 // settled connection. (The caller drained stale
                 // establishments before opening, so this only fires for a
                 // genuine replacement racing the setup.)
-                let _ = endpoint.reset_stream(peer, stream);
+                if let Err(error) = endpoint.reset_stream(peer, stream) {
+                    eprintln!("[dial] failed to reset replaced echo stream: {error}");
+                }
                 return Err("connection replaced during echo stream setup".into());
             }
             _ => print_event("dial", &event),

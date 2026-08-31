@@ -172,11 +172,16 @@ fn inbound_data(a: &mut FloodsubAgent, peer: &PeerId, stream_id: StreamId, data:
 }
 
 fn decode_rpc(frame: &[u8]) -> Rpc {
-    let FrameDecode::Complete { payload, consumed } = decode_frame(frame) else {
-        panic!("frame must be complete");
-    };
+    let (payload, consumed) = complete_frame(frame).expect("frame must be complete");
     assert_eq!(consumed, frame.len());
     Rpc::decode(payload).expect("valid RPC")
+}
+
+fn complete_frame(frame: &[u8]) -> Result<(&[u8], usize), &'static str> {
+    match decode_frame(frame) {
+        FrameDecode::Complete { payload, consumed } => Ok((payload, consumed)),
+        _ => Err("frame was incomplete or malformed"),
+    }
 }
 
 /// A subscription-announcement frame as a remote peer would send it.
@@ -1513,7 +1518,8 @@ fn send_failure_prevents_the_commit() {
     );
 
     // A stale-stream failure report must not disturb a healthy sender.
-    a.publish("t", b"x".to_vec(), 6).ok();
+    a.publish("t", b"x".to_vec(), 6)
+        .expect("healthy sender accepts the publish");
     a.send_result(
         &b,
         StreamId::new(999),

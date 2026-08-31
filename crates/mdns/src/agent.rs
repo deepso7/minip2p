@@ -46,8 +46,8 @@ struct DeterministicRng {
 impl DeterministicRng {
     fn new(seed: [u8; 32]) -> Self {
         let mut state = [0; 4];
-        for (index, chunk) in seed.as_chunks::<8>().0.iter().enumerate() {
-            state[index] = u64::from_le_bytes(*chunk);
+        for (slot, chunk) in state.iter_mut().zip(seed.as_chunks::<8>().0) {
+            *slot = u64::from_le_bytes(*chunk);
         }
         if state == [0; 4] {
             state = [
@@ -389,10 +389,10 @@ impl MdnsAgent {
                     continue;
                 }
                 for value in strings {
-                    if !value.starts_with(TXT_PREFIX) {
+                    let Some(value) = value.strip_prefix(TXT_PREFIX) else {
                         continue;
-                    }
-                    let Ok(text) = core::str::from_utf8(&value[TXT_PREFIX.len()..]) else {
+                    };
+                    let Ok(text) = core::str::from_utf8(value) else {
                         invalid_claim = true;
                         continue;
                     };
@@ -401,7 +401,8 @@ impl MdnsAgent {
                         continue;
                     };
                     let protocols = addr.protocols();
-                    let Some(Protocol::P2p(peer)) = protocols.last() else {
+                    let Some((Protocol::P2p(peer), transport_protocols)) = protocols.split_last()
+                    else {
                         invalid_claim = true;
                         continue;
                     };
@@ -413,8 +414,7 @@ impl MdnsAgent {
                         return;
                     }
                     claimed_peer.get_or_insert_with(|| peer.clone());
-                    let transport =
-                        Multiaddr::from_protocols(protocols[..protocols.len() - 1].to_vec());
+                    let transport = Multiaddr::from_protocols(transport_protocols.to_vec());
                     if !is_supported_transport(&transport) {
                         invalid_claim = true;
                         continue;
@@ -512,7 +512,10 @@ fn random_peer_name(rng: &mut DeterministicRng) -> String {
     let mut name = String::with_capacity(len);
     for _ in 0..len {
         let index = (rng.next_u64() % ALPHABET.len() as u64) as usize;
-        name.push(ALPHABET[index] as char);
+        let byte = ALPHABET
+            .get(index)
+            .expect("modulo keeps the alphabet index in bounds");
+        name.push(*byte as char);
     }
     name
 }
@@ -565,7 +568,10 @@ fn expand_addresses(
                         continue;
                     };
                     let mut expanded = protocols.to_vec();
-                    expanded[0] = Protocol::Ip4(ip.octets());
+                    let Some(first) = expanded.first_mut() else {
+                        continue;
+                    };
+                    *first = Protocol::Ip4(ip.octets());
                     push_unique_supported(&mut result, Multiaddr::from_protocols(expanded));
                 }
             }
@@ -577,7 +583,10 @@ fn expand_addresses(
                         continue;
                     };
                     let mut expanded = protocols.to_vec();
-                    expanded[0] = Protocol::Ip6(ip.octets());
+                    let Some(first) = expanded.first_mut() else {
+                        continue;
+                    };
+                    *first = Protocol::Ip6(ip.octets());
                     push_unique_supported(&mut result, Multiaddr::from_protocols(expanded));
                 }
             }

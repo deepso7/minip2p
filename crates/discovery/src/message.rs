@@ -177,6 +177,10 @@ fn read_varint(input: &[u8], idx: &mut usize) -> Result<u64, DiscoveryWireError>
 }
 
 fn read_len<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], DiscoveryWireError> {
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "wire lengths wider than usize use the compact truncated-input error"
+    )]
     let len: usize = read_varint(input, idx)?
         .try_into()
         .map_err(|_| DiscoveryWireError::Truncated)?;
@@ -256,7 +260,7 @@ mod tests {
             addrs: vec![],
         }
         .encode();
-        assert!(Beacon::decode(&key).is_ok());
+        Beacon::decode(&key).expect("a beacon at the public-key size limit must decode");
         let addr = Beacon {
             public_key: vec![],
             addrs: vec![vec![0; MAX_ADDR_LEN + 1]],

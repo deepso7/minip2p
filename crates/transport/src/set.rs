@@ -287,7 +287,10 @@ impl TransportSet {
 
     fn for_id(&mut self, id: ConnectionId) -> Result<&mut BoxedTransport, TransportError> {
         let index = self.index_for_id(id)?;
-        Ok(&mut self.members[index].transport)
+        self.members
+            .get_mut(index)
+            .map(|member| &mut member.transport)
+            .ok_or(TransportError::ConnectionNotFound { id })
     }
 
     fn index_for_addr(
@@ -309,13 +312,26 @@ impl TransportSet {
                 reason: format!("this set has no {kind:?} transport for {addr}"),
             })
     }
+
+    fn for_addr(
+        &mut self,
+        addr: &Multiaddr,
+        context: &'static str,
+    ) -> Result<&mut Member, TransportError> {
+        let index = self.index_for_addr(addr, context)?;
+        self.members
+            .get_mut(index)
+            .ok_or_else(|| TransportError::InvalidAddress {
+                context,
+                reason: format!("the route for {addr} is no longer available"),
+            })
+    }
 }
 
 impl Transport for TransportSet {
     fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
         let target = addr.transport().clone();
-        let index = self.index_for_addr(&target, "dial target")?;
-        let member = &mut self.members[index];
+        let member = self.for_addr(&target, "dial target")?;
         let id = member.transport.dial(addr)?;
         // A member that stamps an id in a namespace it did not claim hands
         // back an id this set cannot route: every later call on it would look
@@ -323,7 +339,10 @@ impl Transport for TransportSet {
         // while still costing the member everything a connection costs. Fail
         // the dial where the mis-claim is visible, and close what it opened.
         if !member.namespaces.contains(&id.namespace()) {
-            let _ = member.transport.close(id);
+            // The routing failure is what the caller can correct. `id` does
+            // not belong to the set, so a failed best-effort cleanup cannot
+            // be retried or reported through the set's public API.
+            drop(member.transport.close(id));
             return Err(TransportError::DialFailed {
                 id,
                 reason: format!(
@@ -337,8 +356,9 @@ impl Transport for TransportSet {
     }
 
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
-        let index = self.index_for_addr(addr, "listen address")?;
-        self.members[index].transport.listen(addr)
+        self.for_addr(addr, "listen address")?
+            .transport
+            .listen(addr)
     }
 
     fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
@@ -378,8 +398,9 @@ impl Transport for TransportSet {
         // Routed by shape like a dial: a hole punch has to leave the socket the
         // connection it is opening will arrive on, so the member that would
         // dial this address is the only one it can come from.
-        let index = self.index_for_addr(target, "datagram target")?;
-        self.members[index].transport.send_datagram(target, payload)
+        self.for_addr(target, "datagram target")?
+            .transport
+            .send_datagram(target, payload)
     }
 
     fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
@@ -400,8 +421,8 @@ impl Transport for TransportSet {
         // failing member has already told the host what went wrong through the
         // error. What has been collected so far is kept for the next poll
         // rather than dropped, so no connection loses events to a sibling.
-        for index in 0..self.members.len() {
-            match self.members[index].transport.poll(now) {
+        for member in &mut self.members {
+            match member.transport.poll(now) {
                 Ok(events) => self.pending.extend(events),
                 Err(error) => self.failures.push_back(error),
             }
@@ -473,9 +494,9 @@ mod blocking_set {
             let _fanout = wakers
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for index in 0..self.members.len() {
+            for (index, member) in self.members.iter_mut().enumerate() {
                 if index != woken {
-                    self.members[index].transport.wait_for_input(Duration::ZERO);
+                    member.transport.wait_for_input(Duration::ZERO);
                 }
             }
             WaitOutcome::Interrupted
@@ -495,8 +516,8 @@ mod blocking_set {
             // The probe also says which members can park at all, and only
             // those are worth a slice of the budget.
             let mut waiters = Vec::new();
-            for index in 0..self.members.len() {
-                match self.members[index].transport.wait_for_input(Duration::ZERO) {
+            for (index, member) in self.members.iter_mut().enumerate() {
+                match member.transport.wait_for_input(Duration::ZERO) {
                     WaitOutcome::Ready => return WaitOutcome::Ready,
                     WaitOutcome::Interrupted => return self.settle_interrupt(index),
                     WaitOutcome::TimedOut => waiters.push(index),
@@ -538,7 +559,10 @@ mod blocking_set {
                     let share = u32::try_from(waiters.len() - turn)
                         .map_or(remaining, |left| remaining / left);
                     let slice = SLICE.min(remaining).min(share);
-                    match self.members[index].transport.wait_for_input(slice) {
+                    let Some(member) = self.members.get_mut(index) else {
+                        return WaitOutcome::Unsupported;
+                    };
+                    match member.transport.wait_for_input(slice) {
                         WaitOutcome::Ready => return WaitOutcome::Ready,
                         WaitOutcome::Interrupted => return self.settle_interrupt(index),
                         WaitOutcome::TimedOut | WaitOutcome::Unsupported => {}
@@ -1214,7 +1238,7 @@ mod tests {
         let tcp_id = ConnectionId::namespaced(ConnectionNamespace::TCP_IPV4, 1).expect("in range");
         tcp.log().events = vec![TransportEvent::Closed { id: tcp_id }];
         quic.log().fails_poll = true;
-        let _ = set.poll(Now::from_millis(0));
+        drop(set.poll(Now::from_millis(0)));
 
         // A host that slept here would sit on an event it has never seen.
         assert_eq!(set.next_deadline(), Some(Deadline::IMMEDIATE));

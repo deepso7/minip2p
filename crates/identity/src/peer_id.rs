@@ -142,13 +142,30 @@ impl PeerId {
             return Err(PeerIdError::UnsupportedCidVersion(version));
         }
 
-        let (codec, codec_len) = read_uvarint(&cid_bytes[version_len..])
-            .map_err(PeerIdError::InvalidCidMulticodecVarint)?;
+        let codec_input =
+            cid_bytes
+                .get(version_len..)
+                .ok_or(PeerIdError::InvalidCidMulticodecVarint(
+                    VarintError::BufferTooShort,
+                ))?;
+        let (codec, codec_len) =
+            read_uvarint(codec_input).map_err(PeerIdError::InvalidCidMulticodecVarint)?;
         if codec != LIBP2P_KEY_MULTICODEC {
             return Err(PeerIdError::UnsupportedMulticodec(codec));
         }
 
-        let multihash = cid_bytes[version_len + codec_len..].to_vec();
+        let multihash_offset =
+            version_len
+                .checked_add(codec_len)
+                .ok_or(PeerIdError::InvalidCidMulticodecVarint(
+                    VarintError::Overflow,
+                ))?;
+        let multihash = cid_bytes
+            .get(multihash_offset..)
+            .ok_or(PeerIdError::InvalidCidMulticodecVarint(
+                VarintError::BufferTooShort,
+            ))?
+            .to_vec();
         Self::from_bytes(&multihash)
     }
 }
@@ -293,6 +310,10 @@ fn encode_base58(input: &[u8]) -> String {
     let leading_zeros = input.iter().take_while(|byte| **byte == 0).count();
     let mut digits = Vec::with_capacity((input.len() * 138 / 100) + 1);
 
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "leading_zeros is counted from input and cannot exceed its length"
+    )]
     for byte in input[leading_zeros..].iter().copied() {
         let mut carry = byte as u32;
         for digit in &mut digits {
@@ -320,6 +341,10 @@ fn encode_base58(input: &[u8]) -> String {
     }
 
     for digit in digits.iter().rev().copied() {
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "base-58 digits are produced by modulo 58 and fit the alphabet"
+        )]
         out.push(BASE58_ALPHABET[digit as usize] as char);
     }
 
@@ -397,12 +422,20 @@ fn encode_base32_nopad_lower(input: &[u8]) -> String {
         while bits >= 5 {
             bits -= 5;
             let idx = ((buffer >> bits) & 0x1f) as usize;
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "the 0x1f mask restricts base-32 indices to the 32-byte alphabet"
+            )]
             out.push(BASE32_ALPHABET_LOWER[idx] as char);
         }
     }
 
     if bits > 0 {
         let idx = ((buffer << (5 - bits)) & 0x1f) as usize;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "the 0x1f mask restricts base-32 indices to the 32-byte alphabet"
+        )]
         out.push(BASE32_ALPHABET_LOWER[idx] as char);
     }
 

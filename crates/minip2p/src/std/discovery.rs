@@ -70,7 +70,13 @@ impl DiscoveryDriver {
     }
 
     pub(crate) fn next_timeout(&self, now_ms: u64) -> Option<u64> {
-        #[allow(unused_mut)]
+        #[cfg_attr(
+            not(feature = "discovery"),
+            expect(
+                unused_mut,
+                reason = "the discovery beacon feature is the only configuration that refines the book timeout"
+            )
+        )]
         let mut timeout = self.book.next_timeout(now_ms);
         #[cfg(feature = "discovery")]
         if let Some(beacon) = self.beacon.as_ref()
@@ -207,8 +213,13 @@ impl DiscoveryDriver {
                     match action {
                         BeaconAction::PublishBeacon { topic, payload } => {
                             if let Some(pubsub) = pubsub.as_deref_mut() {
-                                let _ = pubsub.agent.publish(&topic, payload, pubsub.now_ms());
-                                pubsub.pump(swarm);
+                                // The beacon is periodic, so a refused local
+                                // publish is retried on its next tick.
+                                if let Ok(()) =
+                                    pubsub.agent.publish(&topic, payload, pubsub.now_ms())
+                                {
+                                    pubsub.pump(swarm);
+                                }
                             }
                         }
                     }

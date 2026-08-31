@@ -43,7 +43,7 @@ fn is_pubsub_protocol(protocol_id: &str) -> bool {
 /// and asserting no pubsub stream events leak to the application.
 fn drive(endpoints: &mut [&mut Endpoint]) -> Vec<Vec<PubsubEvent>> {
     let mut collected = vec![Vec::new(); endpoints.len()];
-    for (i, endpoint) in endpoints.iter_mut().enumerate() {
+    for (endpoint, events) in endpoints.iter_mut().zip(&mut collected) {
         if let Some(event) = endpoint
             .next_event(Duration::from_millis(20))
             .expect("endpoint drives")
@@ -57,7 +57,7 @@ fn drive(endpoints: &mut [&mut Endpoint]) -> Vec<Vec<PubsubEvent>> {
                 "pubsub streams must be invisible to the app: {event:?}"
             );
         }
-        collected[i].extend(endpoint.take_pubsub_events());
+        events.extend(endpoint.take_pubsub_events());
     }
     collected
 }

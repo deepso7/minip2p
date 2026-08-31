@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use minip2p::{Event, Multiaddr, PeerAddr, PeerId, Protocol};
-use minip2p_example_common::{CliError, flag_value};
+use minip2p_example_common::CliError;
 
 /// The modes the CLI dispatches to.
 #[derive(Clone, Debug)]
@@ -93,19 +93,16 @@ fn parse_listen(args: Vec<String>) -> Result<Mode, CliError> {
 fn parse_dial(args: Vec<String>) -> Result<Mode, CliError> {
     let mut positional: Vec<String> = Vec::new();
     let mut rest: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
         if arg.starts_with("--") {
             rest.push(arg.clone());
             let value = args
-                .get(i + 1)
+                .next()
                 .ok_or_else(|| CliError(format!("flag '{arg}' requires a value")))?;
             rest.push(value.clone());
-            i += 2;
         } else {
             positional.push(arg.clone());
-            i += 1;
         }
     }
 
@@ -175,13 +172,13 @@ impl Flags {
         let mut count: Option<u64> = None;
         let mut options = RunOptions::default();
 
-        let mut i = 0;
-        while i < args.len() {
-            let key = &args[i];
-
+        let mut args = args.iter();
+        while let Some(key) = args.next() {
             match key.as_str() {
                 "--relay" => {
-                    let value = flag_value(args, i, key)?;
+                    let value = args
+                        .next()
+                        .ok_or_else(|| CliError(format!("flag '{key}' requires a value")))?;
                     if relay.is_some() {
                         return Err(CliError("--relay specified twice".into()));
                     }
@@ -191,7 +188,9 @@ impl Flags {
                     relay = Some(addr);
                 }
                 "--count" => {
-                    let value = flag_value(args, i, key)?;
+                    let value = args
+                        .next()
+                        .ok_or_else(|| CliError(format!("flag '{key}' requires a value")))?;
                     if count.is_some() {
                         return Err(CliError("--count specified twice".into()));
                     }
@@ -203,14 +202,18 @@ impl Flags {
                     count = Some(n);
                 }
                 "--key" => {
-                    let value = flag_value(args, i, key)?;
+                    let value = args
+                        .next()
+                        .ok_or_else(|| CliError(format!("flag '{key}' requires a value")))?;
                     if options.key_path.is_some() {
                         return Err(CliError("--key specified twice".into()));
                     }
                     options.key_path = Some(PathBuf::from(value));
                 }
                 "--listen" => {
-                    let value = flag_value(args, i, key)?;
+                    let value = args
+                        .next()
+                        .ok_or_else(|| CliError(format!("flag '{key}' requires a value")))?;
                     if options.listen_addr.is_some() {
                         return Err(CliError("--listen specified twice".into()));
                     }
@@ -226,7 +229,9 @@ impl Flags {
                     options.listen_addr = Some(addr);
                 }
                 "--autonat" => {
-                    let value = flag_value(args, i, key)?;
+                    let value = args
+                        .next()
+                        .ok_or_else(|| CliError(format!("flag '{key}' requires a value")))?;
                     if options.autonat.is_some() {
                         return Err(CliError("--autonat specified twice".into()));
                     }
@@ -240,7 +245,6 @@ impl Flags {
                     return Err(CliError(format!("unknown flag '{other}'")));
                 }
             }
-            i += 2;
         }
 
         Ok(Self {

@@ -189,7 +189,13 @@ impl InboundCircuit {
 
         let Ok(source) = PeerId::from_bytes(&request.source_peer_id) else {
             // Unusable source identity: reject and drop the circuit.
-            let _ = stop.handle_input(StopResponderInput::Reject(Status::MalformedMessage));
+            if stop
+                .handle_input(StopResponderInput::Reject(Status::MalformedMessage))
+                .is_err()
+            {
+                self.abandon(shared, true);
+                return;
+            }
             let mut outbound = Vec::new();
             while let Some(output) = stop.poll_output() {
                 if let StopResponderOutput::Outbound(bytes) = output {

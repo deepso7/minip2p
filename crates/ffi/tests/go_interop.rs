@@ -23,6 +23,10 @@ struct GoPeer {
 }
 
 impl GoPeer {
+    #[expect(
+        clippy::panic,
+        reason = "Malformed output from the independent Go fixture is a test-harness failure."
+    )]
     fn spawn() -> Self {
         let project = format!(
             "{}/../../tests/interop/go-libp2p",
@@ -62,22 +66,31 @@ impl GoPeer {
         self.stdin.flush().expect("flush go peer command");
     }
 
+    #[expect(
+        clippy::panic,
+        reason = "A missing response from the independent Go fixture must fail the ignored test clearly."
+    )]
     fn event(&self, expected: &str) -> Value {
         let event = self
             .events
             .recv_timeout(TIMEOUT)
             .unwrap_or_else(|error| panic!("waiting for go `{expected}` event: {error}"));
-        assert_ne!(event["event"], "error", "go peer failed: {event}");
-        assert_eq!(event["event"], expected, "unexpected go peer event");
+        let event_name = required_string(&event, "event");
+        assert_ne!(event_name, "error", "go peer failed: {event}");
+        assert_eq!(event_name, expected, "unexpected go peer event");
         event
     }
 }
 
 impl Drop for GoPeer {
     fn drop(&mut self) {
-        let _ = serde_json::to_writer(&mut self.stdin, &json!({ "op": "stop" }));
-        let _ = self.stdin.write_all(b"\n");
-        let _ = self.stdin.flush();
+        // The child may have already exited; shutdown is best-effort in Drop.
+        drop(serde_json::to_writer(
+            &mut self.stdin,
+            &json!({ "op": "stop" }),
+        ));
+        drop(self.stdin.write_all(b"\n"));
+        drop(self.stdin.flush());
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match self.child.try_wait() {
@@ -86,13 +99,24 @@ impl Drop for GoPeer {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Ok(None) | Err(_) => {
-                    let _ = self.child.kill();
-                    let _ = self.child.wait();
+                    drop(self.child.kill());
+                    drop(self.child.wait());
                     return;
                 }
             }
         }
     }
+}
+
+#[expect(
+    clippy::panic,
+    reason = "A malformed event from the independent Go fixture must fail the ignored test clearly."
+)]
+fn required_string<'a>(event: &'a Value, field: &str) -> &'a str {
+    event
+        .get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("go event has no string `{field}` field: {event}"))
 }
 
 struct EventLog {
@@ -174,12 +198,16 @@ fn config() -> EndpointConfig {
 /// and downloads the independently versioned go-libp2p module.
 #[test]
 #[ignore = "requires Go and the go-libp2p module"]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "The ignored interoperability test uses assertions to preserve the foreign peer trace."
+)]
 fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<(), FfiError> {
     let payload_from_go = "g".repeat(PAYLOAD_FROM_GO_BYTES);
     let mut go = GoPeer::spawn();
     let ready = go.event("ready");
-    let go_peer = ready["peer_id"].as_str().expect("go peer id").to_owned();
-    let go_addr = ready["addr"].as_str().expect("go peer address").to_owned();
+    let go_peer = required_string(&ready, "peer_id").to_owned();
+    let go_addr = required_string(&ready, "addr").to_owned();
 
     let endpoint = P2pEndpoint::new(vec![77; 32], config())?;
     let log = Arc::new(EventLog::new(Arc::clone(&endpoint)));
@@ -190,7 +218,7 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
         matches!(event, P2pEvent::ConnectionEstablished { peer_id, .. } if peer_id == &go_peer)
     }) {
         P2pEvent::ConnectionEstablished { conn_id, .. } => conn_id,
-        _ => unreachable!("predicate pins the event variant"),
+        _ => panic!("connection predicate returned a different event"),
     };
     log.wait_for(|event| {
         matches!(event, P2pEvent::PeerReady { peer_id, protocols }
@@ -201,7 +229,7 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
             if peer_id == &go_peer && info.protocols.iter().any(|id| id == ECHO_PROTOCOL))
     });
     let P2pEvent::IdentifyReceived { info, .. } = identify else {
-        unreachable!("predicate pins the event variant")
+        panic!("identify predicate returned a different event")
     };
     assert!(
         info.agent_version
@@ -241,7 +269,7 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
         match event {
             P2pEvent::StreamData { data, .. } => echoed_to_minip2p.extend_from_slice(&data),
             P2pEvent::StreamRemoteWriteClosed { .. } => break,
-            _ => unreachable!("predicate pins the event variants"),
+            _ => panic!("echo predicate returned a different event"),
         }
     }
     assert_eq!(echoed_to_minip2p, PAYLOAD_FROM_MINIP2P);
@@ -257,7 +285,7 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
             if peer_id == &go_peer && *conn_id != initial_conn)
     }) {
         P2pEvent::ConnectionEstablished { conn_id, .. } => conn_id,
-        _ => unreachable!("predicate pins the event variant"),
+        _ => panic!("reverse-connection predicate returned a different event"),
     };
     let reverse_stream = match log.wait_for(|event| {
         matches!(event, P2pEvent::StreamReady {
@@ -268,7 +296,7 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
         } if *conn_id == reverse_conn && protocol_id == ECHO_PROTOCOL)
     }) {
         P2pEvent::StreamReady { stream_id, .. } => stream_id,
-        _ => unreachable!("predicate pins the event variant"),
+        _ => panic!("reverse-stream predicate returned a different event"),
     };
     let mut received = Vec::with_capacity(payload_from_go.len());
     loop {
@@ -294,12 +322,12 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
                 endpoint.close_stream_write(peer_id, stream_id)?;
                 break;
             }
-            _ => unreachable!("predicate pins the event variants"),
+            _ => panic!("reverse-echo predicate returned a different event"),
         }
     }
     assert_eq!(received, payload_from_go.as_bytes());
     let echoed = go.event("echo");
-    assert_eq!(echoed["payload"], payload_from_go);
+    assert_eq!(required_string(&echoed, "payload"), payload_from_go);
 
     endpoint.stop();
     assert!(endpoint.wait_stopped(5_000), "minip2p driver stopped");

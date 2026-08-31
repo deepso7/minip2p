@@ -189,11 +189,16 @@ fn ack(agent: &mut GossipsubAgent, peer: &PeerId, actions: &[PubsubAction], now_
 }
 
 fn decode_rpc(frame: &[u8]) -> Rpc {
-    let FrameDecode::Complete { payload, consumed } = decode_frame(frame) else {
-        panic!("complete frame expected")
-    };
+    let (payload, consumed) = complete_frame(frame).expect("complete frame expected");
     assert_eq!(consumed, frame.len());
     Rpc::decode(payload).expect("valid emitted RPC")
+}
+
+fn complete_frame(frame: &[u8]) -> Result<(&[u8], usize), &'static str> {
+    match decode_frame(frame) {
+        FrameDecode::Complete { payload, consumed } => Ok((payload, consumed)),
+        _ => Err("frame was incomplete or malformed"),
+    }
 }
 
 #[test]
@@ -1520,7 +1525,9 @@ fn publish_backpressure_is_all_or_nothing_across_mesh_peers() {
     ack_peer(&mut agent, &first, &first_publish, 1);
     drain_actions(&mut agent);
 
-    assert!(agent.publish("room", b"rejected".to_vec(), 2).is_err());
+    agent
+        .publish("room", b"rejected".to_vec(), 2)
+        .expect_err("full peer set rejects the publish");
     assert!(
         drain_actions(&mut agent).is_empty(),
         "the peer with capacity must not receive a partial publish"

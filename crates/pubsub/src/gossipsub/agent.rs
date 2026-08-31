@@ -221,7 +221,8 @@ impl ControlBuffer {
             let mut next_size = size.clone();
             next_size.add(&item, version);
             if next_size.rpc_len() > MAX_RPC_SIZE {
-                debug_assert!(self.insert(item, usize::MAX));
+                let reinserted = self.insert(item, usize::MAX);
+                debug_assert!(reinserted);
                 break;
             }
             size = next_size;
@@ -958,8 +959,12 @@ impl GossipsubAgent {
                 return true;
             }
             let take = room.min(data.len() - offset);
-            buf.extend_from_slice(&data[offset..offset + take]);
-            offset += take;
+            let end = offset + take;
+            let Some(chunk) = data.get(offset..end) else {
+                return true;
+            };
+            buf.extend_from_slice(chunk);
+            offset = end;
 
             let mut head = 0;
             while let Some(step) = self.take_frame(peer, stream_id, &mut head) {
@@ -1004,7 +1009,8 @@ impl GossipsubAgent {
         head: &mut usize,
     ) -> Option<Result<Vec<u8>, String>> {
         let buf = self.peers.get_mut(peer)?.inbound.get_mut(&stream_id)?;
-        match decode_frame(&buf[*head..]) {
+        let tail = buf.get(*head..)?;
+        match decode_frame(tail) {
             FrameDecode::Complete { payload, consumed } => {
                 let payload = payload.to_vec();
                 *head += consumed;

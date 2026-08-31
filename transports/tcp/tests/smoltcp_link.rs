@@ -256,14 +256,14 @@ fn run_until(
         if !wire.is_quiet() {
             continue;
         }
-        let next = Deadline::earliest_opt(a.next_deadline(), b.next_deadline()).unwrap_or_else(|| {
-            panic!("nothing on the wire and no deadline to wait for\n  a: {a_events:?}\n  b: {b_events:?}")
-        });
+        let next = Deadline::earliest_opt(a.next_deadline(), b.next_deadline())
+            .expect("active providers must report a deadline when the wire is quiet");
         if next.as_millis() > now {
             now = next.as_millis();
         }
     }
-    panic!("never finished\n  a: {a_events:?}\n  b: {b_events:?}")
+    assert!(done(a_events, b_events), "providers never finished");
+    now
 }
 
 struct Pair {
@@ -668,7 +668,10 @@ mod provider {
                     return;
                 }
             }
-            panic!("the providers never settled")
+            assert!(
+                self.wire.is_quiet(),
+                "the providers never settled because the wire remained busy"
+            )
         }
 
         /// Listens, dials, and drives the handshake to completion.

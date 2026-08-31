@@ -13,7 +13,8 @@ const EVENTS_PER_BATCH: usize = 100;
 
 fn populated_agent(now: Now) -> (RelayServerAgent, SwarmEvent) {
     let local = PeerId::from_public_key_protobuf(b"relay-server-bench-local");
-    let mut agent = RelayServerAgent::new(local, RelayServerConfig::default()).unwrap();
+    let mut agent = RelayServerAgent::new(local, RelayServerConfig::default())
+        .expect("default relay server configuration is valid");
 
     for index in 0..PEERS {
         let peer = PeerId::from_public_key_protobuf(&index.to_le_bytes());

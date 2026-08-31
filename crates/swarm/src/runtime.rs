@@ -308,6 +308,10 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     /// reply, so a ping that cannot be random must not be sent at all.
     pub fn ping(&mut self, peer_id: &PeerId, now_ms: u64) -> Result<(), DriverError> {
         let mut payload = [0u8; PING_PAYLOAD_LEN];
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "DriverError intentionally keeps entropy backend failures opaque."
+        )]
         self.entropy
             .fill_bytes(&mut payload)
             .map_err(|_| DriverError::Entropy)?;
@@ -399,8 +403,8 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
             // synchronous call keep flowing as SwarmEvent::Error.
             if let Some(index) = (window_start..self.event_buffer.len()).find(|&i| {
                 matches!(
-                    &self.event_buffer[i],
-                    SwarmEvent::Error(e) if e.kind == SwarmErrorKind::OpenStreamFailed
+                    self.event_buffer.get(i),
+                    Some(SwarmEvent::Error(e)) if e.kind == SwarmErrorKind::OpenStreamFailed
                 )
             }) {
                 self.event_buffer.remove(index);
@@ -451,8 +455,8 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
             // buffered runtime-error event this call produced.
             if let Some(index) = (window_start..self.event_buffer.len()).find(|&i| {
                 matches!(
-                    &self.event_buffer[i],
-                    SwarmEvent::Error(e) if e.kind == SwarmErrorKind::Transport
+                    self.event_buffer.get(i),
+                    Some(SwarmEvent::Error(e)) if e.kind == SwarmErrorKind::Transport
                 )
             }) {
                 self.event_buffer.remove(index);
@@ -839,11 +843,13 @@ mod tests {
 
     impl Transport for ScriptedTransport {
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported { operation: "dial" })
         }
 
         fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "listen",
+            })
         }
 
         fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
@@ -857,7 +863,9 @@ mod tests {
                 ]);
                 listener
                     .handle_input(MultistreamInput::Start)
-                    .expect("listener start");
+                    .map_err(|error| TransportError::PollError {
+                        reason: alloc::format!("listener start failed: {error}"),
+                    })?;
                 self.negotiators.insert(stream_id, listener);
             }
             Ok(stream_id)
@@ -878,14 +886,20 @@ mod tests {
 
             negotiator
                 .handle_input(MultistreamInput::Data(data))
-                .expect("listener negotiation input");
+                .map_err(|error| TransportError::PollError {
+                    reason: alloc::format!("listener negotiation input failed: {error}"),
+                })?;
             let mut negotiated = false;
             let mut outbound = Vec::new();
             while let Some(output) = negotiator.poll_output() {
                 match output {
                     MultistreamOutput::OutboundData(bytes) => outbound.push(bytes),
                     MultistreamOutput::Negotiated { .. } => negotiated = true,
-                    other => panic!("unexpected multistream output: {other:?}"),
+                    other => {
+                        return Err(TransportError::PollError {
+                            reason: alloc::format!("unexpected multistream output: {other:?}"),
+                        });
+                    }
                 }
             }
             if negotiated {

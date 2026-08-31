@@ -60,7 +60,7 @@ fn value(name: &str) -> &str {
         .lines()
         .filter_map(|line| line.split_once('='))
         .find_map(|(field, value)| (field == name).then_some(value))
-        .unwrap_or_else(|| panic!("missing fixture field {name}"))
+        .expect("fixture must contain the requested field")
 }
 
 fn array(name: &str) -> [u8; 32] {
@@ -75,8 +75,8 @@ fn hex(input: &str) -> Vec<u8> {
         .0
         .iter()
         .map(|pair| {
-            let text = core::str::from_utf8(pair).unwrap();
-            u8::from_str_radix(text, 16).unwrap()
+            let text = core::str::from_utf8(pair).expect("hex fixture contains only ASCII");
+            u8::from_str_radix(text, 16).expect("hex fixture contains valid hexadecimal")
         })
         .collect()
 }

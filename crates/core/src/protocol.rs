@@ -107,7 +107,11 @@ impl Protocol {
     /// Returns the decoded protocol plus the number of bytes consumed.
     pub(crate) fn read_binary(bytes: &[u8]) -> Result<(Self, usize), MultiaddrError> {
         let (code, mut consumed) = read_uvarint(bytes)?;
-        let rest = &bytes[consumed..];
+        let rest = bytes
+            .get(consumed..)
+            .ok_or(MultiaddrError::TruncatedBinaryValue {
+                protocol: "protocol code",
+            })?;
 
         match code {
             IP4_CODE => {
@@ -181,11 +185,11 @@ impl Protocol {
 
 /// Reads `N` bytes from the front of `bytes` as a fixed-size value.
 fn fixed<const N: usize>(bytes: &[u8], protocol: &'static str) -> Result<[u8; N], MultiaddrError> {
-    if bytes.len() < N {
-        return Err(MultiaddrError::TruncatedBinaryValue { protocol });
-    }
+    let value = bytes
+        .get(..N)
+        .ok_or(MultiaddrError::TruncatedBinaryValue { protocol })?;
     let mut out = [0u8; N];
-    out.copy_from_slice(&bytes[..N]);
+    out.copy_from_slice(value);
     Ok(out)
 }
 
@@ -196,12 +200,20 @@ fn length_prefixed<'a>(
     protocol: &'static str,
 ) -> Result<(&'a [u8], usize), MultiaddrError> {
     let (len, consumed) = read_uvarint(bytes)?;
-    let available = bytes.len() - consumed;
+    let rest = bytes
+        .get(consumed..)
+        .ok_or(MultiaddrError::TruncatedBinaryValue { protocol })?;
     // Compare in u64 so an absurd declared length errs identically on
     // 32-bit and 64-bit targets.
-    if len > available as u64 {
+    if len > rest.len() as u64 {
         return Err(MultiaddrError::TruncatedBinaryValue { protocol });
     }
     let len = len as usize;
-    Ok((&bytes[consumed..consumed + len], consumed + len))
+    let body = rest
+        .get(..len)
+        .ok_or(MultiaddrError::TruncatedBinaryValue { protocol })?;
+    let total = consumed
+        .checked_add(len)
+        .ok_or(MultiaddrError::TruncatedBinaryValue { protocol })?;
+    Ok((body, total))
 }

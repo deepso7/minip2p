@@ -114,7 +114,10 @@ impl From<Duration> for Deadline {
 
 /// Result of an interruptible swarm wait.
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)] // Preserve event ownership without a heap allocation.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "PollNext preserves event ownership without an allocation on the ready path."
+)]
 pub enum PollNext {
     /// A fresh swarm event is ready.
     Event(SwarmEvent),
@@ -620,11 +623,13 @@ mod tests {
 
     impl Transport for IdleTransport {
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported { operation: "dial" })
         }
 
         fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "listen",
+            })
         }
 
         fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
@@ -651,11 +656,13 @@ mod tests {
         }
 
         fn reset_stream(&mut self, _: ConnectionId, _: StreamId) -> Result<(), TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "reset_stream",
+            })
         }
 
         fn close(&mut self, _: ConnectionId) -> Result<(), TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported { operation: "close" })
         }
 
         fn poll(&mut self, now: Now) -> Result<Vec<TransportEvent>, TransportError> {
@@ -709,11 +716,13 @@ mod tests {
 
     impl Transport for SupersessionTransport {
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported { operation: "dial" })
         }
 
         fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "listen",
+            })
         }
 
         fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
@@ -800,11 +809,13 @@ mod tests {
 
     impl Transport for FailingUserOpenTransport {
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported { operation: "dial" })
         }
 
         fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "listen",
+            })
         }
 
         fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
@@ -1230,10 +1241,11 @@ mod tests {
         // Regression: the deadline is already expired, but the matching
         // event sits *behind* a non-matching one. The scan must still reach
         // it instead of bailing after the first rejection.
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("fresh instant is at least one second after its origin");
         let found = swarm
-            .run_until(Instant::now() - Duration::from_secs(1), |event| {
-                matches!(event, SwarmEvent::PeerReady { .. })
-            })
+            .run_until(past, |event| matches!(event, SwarmEvent::PeerReady { .. }))
             .expect("wait")
             .expect("buffered match must be found past the deadline");
         assert!(matches!(found, SwarmEvent::PeerReady { .. }));
@@ -1378,11 +1390,13 @@ mod tests {
 
     impl Transport for FailingSendTransport {
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported { operation: "dial" })
         }
 
         fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "listen",
+            })
         }
 
         fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
@@ -1395,7 +1409,9 @@ mod tests {
             ]);
             listener
                 .handle_input(MultistreamInput::Start)
-                .expect("listener start");
+                .map_err(|error| TransportError::PollError {
+                    reason: format!("listener start failed: {error}"),
+                })?;
             self.negotiators.insert(stream_id, listener);
             Ok(stream_id)
         }
@@ -1417,7 +1433,9 @@ mod tests {
             };
             negotiator
                 .handle_input(MultistreamInput::Data(data))
-                .expect("listener negotiation input");
+                .map_err(|error| TransportError::PollError {
+                    reason: format!("listener negotiation input failed: {error}"),
+                })?;
             let mut negotiated_protocol = None;
             let mut outbound = Vec::new();
             while let Some(output) = negotiator.poll_output() {
@@ -1426,7 +1444,11 @@ mod tests {
                     MultistreamOutput::Negotiated { protocol } => {
                         negotiated_protocol = Some(protocol);
                     }
-                    other => panic!("unexpected multistream output: {other:?}"),
+                    other => {
+                        return Err(TransportError::PollError {
+                            reason: format!("unexpected multistream output: {other:?}"),
+                        });
+                    }
                 }
             }
             if let Some(protocol) = negotiated_protocol {
@@ -1627,8 +1649,11 @@ mod tests {
 
         // Past the deadline, the synchronous buffered scan must honor the
         // same cap as the waiting phase.
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("fresh instant is at least one second after its origin");
         let error = swarm
-            .run_until(Instant::now() - Duration::from_secs(1), |event| {
+            .run_until(past, |event| {
                 matches!(event, SwarmEvent::PingTimeout { .. })
             })
             .expect_err("skip cap must bound the expired-deadline scan");
@@ -1745,11 +1770,13 @@ mod tests {
 
     impl Transport for NeverRespondTransport {
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported { operation: "dial" })
         }
 
         fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "listen",
+            })
         }
 
         fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
@@ -1761,7 +1788,9 @@ mod tests {
             ]);
             listener
                 .handle_input(MultistreamInput::Start)
-                .expect("listener start");
+                .map_err(|error| TransportError::PollError {
+                    reason: format!("listener start failed: {error}"),
+                })?;
             self.negotiators.insert(stream_id, listener);
             Ok(stream_id)
         }
@@ -1779,14 +1808,20 @@ mod tests {
             };
             negotiator
                 .handle_input(MultistreamInput::Data(data))
-                .expect("listener negotiation input");
+                .map_err(|error| TransportError::PollError {
+                    reason: format!("listener negotiation input failed: {error}"),
+                })?;
             let mut negotiated = false;
             let mut outbound = Vec::new();
             while let Some(output) = negotiator.poll_output() {
                 match output {
                     MultistreamOutput::OutboundData(bytes) => outbound.push(bytes),
                     MultistreamOutput::Negotiated { .. } => negotiated = true,
-                    other => panic!("unexpected multistream output: {other:?}"),
+                    other => {
+                        return Err(TransportError::PollError {
+                            reason: format!("unexpected multistream output: {other:?}"),
+                        });
+                    }
                 }
             }
             if negotiated {

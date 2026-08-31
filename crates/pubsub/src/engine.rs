@@ -65,7 +65,10 @@ impl PubsubConfig {
 /// A statically dispatched pubsub router.
 // Keeping both concrete agents inline preserves the no-allocation dispatch
 // contract; their size difference is modest and this object is long-lived.
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "both routers stay inline to preserve allocation-free dispatch in this long-lived agent"
+)]
 pub enum PubsubAgent {
     /// Gossipsub router.
     Gossipsub(GossipsubAgent),

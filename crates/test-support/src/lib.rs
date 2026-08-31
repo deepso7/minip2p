@@ -24,7 +24,7 @@ use minip2p_transport::{
 /// is intentionally single-threaded and is meant for protocol wrapper tests.
 pub struct InMemoryTransport {
     shared: Rc<RefCell<InMemoryLink>>,
-    side: usize,
+    side: LinkSide,
     connection: ConnectionId,
     local_addr: Multiaddr,
     remote_addr: Multiaddr,
@@ -37,11 +37,70 @@ struct InMemoryLink {
     streams: HashMap<StreamId, InMemoryStream>,
 }
 
+/// One endpoint of the fixed two-party in-memory link.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinkSide {
+    First,
+    Second,
+}
+
+impl LinkSide {
+    fn other(self) -> Self {
+        match self {
+            Self::First => Self::Second,
+            Self::Second => Self::First,
+        }
+    }
+}
+
+impl InMemoryLink {
+    fn queue(&self, side: LinkSide) -> &VecDeque<TransportEvent> {
+        side_value(&self.queues, side)
+    }
+
+    fn queue_mut(&mut self, side: LinkSide) -> &mut VecDeque<TransportEvent> {
+        side_value_mut(&mut self.queues, side)
+    }
+
+    fn next_stream_mut(&mut self, side: LinkSide) -> &mut u64 {
+        side_value_mut(&mut self.next_stream, side)
+    }
+}
+
 #[derive(Default)]
 struct InMemoryStream {
     write_closed: [bool; 2],
     closed: bool,
     close_delivered: [bool; 2],
+}
+
+impl InMemoryStream {
+    fn write_closed(&self, side: LinkSide) -> bool {
+        *side_value(&self.write_closed, side)
+    }
+
+    fn close_write(&mut self, side: LinkSide) {
+        *side_value_mut(&mut self.write_closed, side) = true;
+    }
+
+    fn close_delivered(&mut self, side: LinkSide) {
+        *side_value_mut(&mut self.close_delivered, side) = true;
+    }
+}
+
+fn side_value<T>(values: &[T; 2], side: LinkSide) -> &T {
+    let [first, second] = values;
+    match side {
+        LinkSide::First => first,
+        LinkSide::Second => second,
+    }
+}
+
+fn side_value_mut<T>(values: &mut [T; 2], side: LinkSide) -> &mut T {
+    match (side, values) {
+        (LinkSide::First, [first, _]) => first,
+        (LinkSide::Second, [_, second]) => second,
+    }
 }
 
 impl InMemoryTransport {
@@ -55,15 +114,16 @@ impl InMemoryTransport {
             .expect("test multiaddr");
         let connection = ConnectionId::new(1);
         let mut queues = [VecDeque::new(), VecDeque::new()];
-        queues[0].push_back(TransportEvent::Connected {
+        let [first_queue, second_queue] = &mut queues;
+        first_queue.push_back(TransportEvent::Connected {
             id: connection,
             endpoint: ConnectionEndpoint::with_peer_id(b_addr.clone(), remote_peer),
         });
-        queues[1].push_back(TransportEvent::IncomingConnection {
+        second_queue.push_back(TransportEvent::IncomingConnection {
             id: connection,
             endpoint: ConnectionEndpoint::new(a_addr.clone()),
         });
-        queues[1].push_back(TransportEvent::Connected {
+        second_queue.push_back(TransportEvent::Connected {
             id: connection,
             endpoint: ConnectionEndpoint::with_peer_id(a_addr.clone(), local_peer),
         });
@@ -76,14 +136,14 @@ impl InMemoryTransport {
         (
             Self {
                 shared: shared.clone(),
-                side: 0,
+                side: LinkSide::First,
                 connection,
                 local_addr: a_addr.clone(),
                 remote_addr: b_addr.clone(),
             },
             Self {
                 shared,
-                side: 1,
+                side: LinkSide::Second,
                 connection,
                 local_addr: b_addr,
                 remote_addr: a_addr,
@@ -98,7 +158,10 @@ impl InMemoryTransport {
 
     /// Queues a synthetic local event for deterministic wrapper edge cases.
     pub fn push_event(&mut self, event: TransportEvent) {
-        self.shared.borrow_mut().queues[self.side].push_back(event);
+        self.shared
+            .borrow_mut()
+            .queue_mut(self.side)
+            .push_back(event);
     }
 
     fn ensure_connection(&self, id: ConnectionId) -> Result<(), TransportError> {
@@ -126,24 +189,31 @@ impl Transport for InMemoryTransport {
 
     fn listen(&mut self, _addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
         let addr = self.local_addr.clone();
-        self.shared.borrow_mut().queues[self.side]
+        self.shared
+            .borrow_mut()
+            .queue_mut(self.side)
             .push_back(TransportEvent::Listening { addr: addr.clone() });
         Ok(addr)
     }
 
     fn open_stream(&mut self, id: ConnectionId) -> Result<StreamId, TransportError> {
         self.ensure_connection(id)?;
-        let other = 1 - self.side;
+        let other = self.side.other();
         let mut shared = self.shared.borrow_mut();
-        let stream_id = StreamId::new(shared.next_stream[self.side]);
-        shared.next_stream[self.side] += 2;
+        let next_stream = shared.next_stream_mut(self.side);
+        let stream_id = StreamId::new(*next_stream);
+        *next_stream += 2;
         let previous = shared.streams.insert(stream_id, InMemoryStream::default());
         debug_assert!(previous.is_none(), "stream ids are unique within a pair");
-        shared.queues[self.side].push_back(TransportEvent::StreamOpened { id, stream_id });
-        shared.queues[other].push_back(TransportEvent::IncomingStream {
-            id: self.connection,
-            stream_id,
-        });
+        shared
+            .queue_mut(self.side)
+            .push_back(TransportEvent::StreamOpened { id, stream_id });
+        shared
+            .queue_mut(other)
+            .push_back(TransportEvent::IncomingStream {
+                id: self.connection,
+                stream_id,
+            });
         Ok(stream_id)
     }
 
@@ -161,7 +231,7 @@ impl Transport for InMemoryTransport {
         if stream.closed {
             return Err(self.stream_not_found(stream_id));
         }
-        if stream.write_closed[self.side] {
+        if stream.write_closed(self.side) {
             return Err(TransportError::StreamSendFailed {
                 id,
                 stream_id,
@@ -171,11 +241,13 @@ impl Transport for InMemoryTransport {
         if data.is_empty() {
             return Ok(());
         }
-        shared.queues[1 - self.side].push_back(TransportEvent::StreamData {
-            id: self.connection,
-            stream_id,
-            data,
-        });
+        shared
+            .queue_mut(self.side.other())
+            .push_back(TransportEvent::StreamData {
+                id: self.connection,
+                stream_id,
+                data,
+            });
         Ok(())
     }
 
@@ -185,7 +257,7 @@ impl Transport for InMemoryTransport {
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
         self.ensure_connection(id)?;
-        let other = 1 - self.side;
+        let other = self.side.other();
         let mut shared = self.shared.borrow_mut();
         let both_write_closed = {
             let Some(stream) = shared.streams.get_mut(&stream_id) else {
@@ -194,26 +266,32 @@ impl Transport for InMemoryTransport {
             if stream.closed {
                 return Err(self.stream_not_found(stream_id));
             }
-            if stream.write_closed[self.side] {
+            if stream.write_closed(self.side) {
                 return Ok(());
             }
-            stream.write_closed[self.side] = true;
-            let both_write_closed = stream.write_closed[other];
+            stream.close_write(self.side);
+            let both_write_closed = stream.write_closed(other);
             if both_write_closed {
                 stream.closed = true;
             }
             both_write_closed
         };
-        shared.queues[other].push_back(TransportEvent::StreamRemoteWriteClosed {
-            id: self.connection,
-            stream_id,
-        });
-        if both_write_closed {
-            shared.queues[self.side].push_back(TransportEvent::StreamClosed { id, stream_id });
-            shared.queues[other].push_back(TransportEvent::StreamClosed {
+        shared
+            .queue_mut(other)
+            .push_back(TransportEvent::StreamRemoteWriteClosed {
                 id: self.connection,
                 stream_id,
             });
+        if both_write_closed {
+            shared
+                .queue_mut(self.side)
+                .push_back(TransportEvent::StreamClosed { id, stream_id });
+            shared
+                .queue_mut(other)
+                .push_back(TransportEvent::StreamClosed {
+                    id: self.connection,
+                    stream_id,
+                });
         }
         Ok(())
     }
@@ -224,7 +302,7 @@ impl Transport for InMemoryTransport {
         stream_id: StreamId,
     ) -> Result<(), TransportError> {
         self.ensure_connection(id)?;
-        let other = 1 - self.side;
+        let other = self.side.other();
         let mut shared = self.shared.borrow_mut();
         let Some(stream) = shared.streams.get_mut(&stream_id) else {
             return Err(self.stream_not_found(stream_id));
@@ -233,22 +311,28 @@ impl Transport for InMemoryTransport {
             return Ok(());
         }
         stream.closed = true;
-        shared.queues[self.side].push_back(TransportEvent::StreamClosed { id, stream_id });
-        shared.queues[other].push_back(TransportEvent::StreamClosed {
-            id: self.connection,
-            stream_id,
-        });
+        shared
+            .queue_mut(self.side)
+            .push_back(TransportEvent::StreamClosed { id, stream_id });
+        shared
+            .queue_mut(other)
+            .push_back(TransportEvent::StreamClosed {
+                id: self.connection,
+                stream_id,
+            });
         Ok(())
     }
 
     fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
         self.ensure_connection(id)?;
-        let other = 1 - self.side;
+        let other = self.side.other();
         let mut shared = self.shared.borrow_mut();
         shared.active = false;
         shared.streams.clear();
-        shared.queues[self.side].push_back(TransportEvent::Closed { id });
-        shared.queues[other].push_back(TransportEvent::Closed {
+        shared
+            .queue_mut(self.side)
+            .push_back(TransportEvent::Closed { id });
+        shared.queue_mut(other).push_back(TransportEvent::Closed {
             id: self.connection,
         });
         Ok(())
@@ -256,7 +340,7 @@ impl Transport for InMemoryTransport {
 
     fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {
         let mut shared = self.shared.borrow_mut();
-        let events = shared.queues[self.side].drain(..).collect::<Vec<_>>();
+        let events = shared.queue_mut(self.side).drain(..).collect::<Vec<_>>();
         let mut fully_delivered = Vec::new();
         for event in &events {
             let stream_id = match event {
@@ -271,7 +355,7 @@ impl Transport for InMemoryTransport {
             if !stream.closed {
                 continue;
             }
-            stream.close_delivered[self.side] = true;
+            stream.close_delivered(self.side);
             if stream.close_delivered == [true, true] {
                 fully_delivered.push(stream_id);
             }
@@ -284,7 +368,7 @@ impl Transport for InMemoryTransport {
 
     fn next_deadline(&self) -> Option<Deadline> {
         // Queued events are due now; no clock sample needed to say so.
-        (!self.shared.borrow().queues[self.side].is_empty()).then_some(Deadline::IMMEDIATE)
+        (!self.shared.borrow().queue(self.side).is_empty()).then_some(Deadline::IMMEDIATE)
     }
 
     fn local_addresses(&self) -> Vec<Multiaddr> {
@@ -292,7 +376,7 @@ impl Transport for InMemoryTransport {
     }
 
     fn active_inbound_connection_sources(&self) -> Vec<Multiaddr> {
-        if self.side == 1 && self.shared.borrow().active {
+        if self.side == LinkSide::Second && self.shared.borrow().active {
             vec![self.remote_addr.clone()]
         } else {
             Vec::new()
@@ -304,7 +388,7 @@ impl BlockingTransport for InMemoryTransport {
     fn wait_for_input(&mut self, _timeout: Duration) -> WaitOutcome {
         // No socket to wait on: report queued input, otherwise let the driver
         // fall back to its sleep cadence.
-        if self.shared.borrow().queues[self.side].is_empty() {
+        if self.shared.borrow().queue(self.side).is_empty() {
             WaitOutcome::Unsupported
         } else {
             WaitOutcome::Ready
@@ -399,7 +483,7 @@ impl RelayEmulator {
         self.events.push(RelayEvent::ReservationStored {
             peer: reserver.clone(),
         });
-        Ok(bytes[consumed..].to_vec())
+        trailing_bytes(bytes, consumed)
     }
 
     pub fn drain_hop_bytes_for(&mut self, peer: &PeerId) -> Vec<u8> {
@@ -434,9 +518,11 @@ impl RelayEmulator {
             .as_ref()
             .map(|peer| peer.id.clone())
             .ok_or(RelayEmulatorError::Unexpected("missing peer field"))?;
-        let target = PeerId::from_bytes(&target_bytes)
-            .map_err(|_| RelayEmulatorError::Unexpected("invalid target peer id"))?;
-        let trailing = bytes[consumed..].to_vec();
+        let target = match PeerId::from_bytes(&target_bytes) {
+            Ok(target) => target,
+            Err(_) => return Err(RelayEmulatorError::Unexpected("invalid target peer id")),
+        };
+        let trailing = trailing_bytes(bytes, consumed)?;
 
         let Some(channels) = self.reservations.get_mut(&target) else {
             let refusal = HopMessage {
@@ -524,7 +610,7 @@ impl RelayEmulator {
             target: pending.target,
         });
         self.events.push(RelayEvent::StatusOkSentToInitiator);
-        Ok(bytes[consumed..].to_vec())
+        trailing_bytes(bytes, consumed)
     }
 }
 
@@ -545,20 +631,30 @@ impl std::error::Error for RelayEmulatorError {}
 
 fn decode_hop_message(bytes: &[u8]) -> Result<(HopMessage, usize), RelayEmulatorError> {
     match decode_frame(bytes) {
-        FrameDecode::Complete { payload, consumed } => HopMessage::decode(payload)
-            .map(|message| (message, consumed))
-            .map_err(|_| RelayEmulatorError::Unexpected("bad HOP")),
+        FrameDecode::Complete { payload, consumed } => match HopMessage::decode(payload) {
+            Ok(message) => Ok((message, consumed)),
+            Err(_) => Err(RelayEmulatorError::Unexpected("bad HOP")),
+        },
         _ => Err(RelayEmulatorError::Unexpected("incomplete HOP frame")),
     }
 }
 
 fn decode_stop_message(bytes: &[u8]) -> Result<(StopMessage, usize), RelayEmulatorError> {
     match decode_frame(bytes) {
-        FrameDecode::Complete { payload, consumed } => StopMessage::decode(payload)
-            .map(|message| (message, consumed))
-            .map_err(|_| RelayEmulatorError::Unexpected("bad STOP")),
+        FrameDecode::Complete { payload, consumed } => match StopMessage::decode(payload) {
+            Ok(message) => Ok((message, consumed)),
+            Err(_) => Err(RelayEmulatorError::Unexpected("bad STOP")),
+        },
         _ => Err(RelayEmulatorError::Unexpected("incomplete STOP frame")),
     }
+}
+
+/// Copies bytes pipelined after a decoded relay frame.
+fn trailing_bytes(bytes: &[u8], consumed: usize) -> Result<Vec<u8>, RelayEmulatorError> {
+    bytes
+        .get(consumed..)
+        .map(|trailing| trailing.to_vec())
+        .ok_or(RelayEmulatorError::Unexpected("invalid relay frame length"))
 }
 
 #[cfg(test)]

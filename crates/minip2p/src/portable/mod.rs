@@ -1157,10 +1157,17 @@ fn pump_embedded_pubsub<D: smoltcp::phy::Device, E: EntropySource>(
                 agent.send_result(&peer, stream_id, token, result, now.monotonic_ms);
             }
             minip2p_pubsub::PubsubAction::CloseStreamWrite { peer, stream_id } => {
-                let _ = endpoint.close_stream_write(&peer, stream_id, now);
+                // Pubsub has no completion callback for stream teardown; a
+                // failed close is observed through the endpoint event path.
+                match endpoint.close_stream_write(&peer, stream_id, now) {
+                    Ok(()) | Err(_) => {}
+                }
             }
             minip2p_pubsub::PubsubAction::ResetStream { peer, stream_id } => {
-                let _ = endpoint.reset_stream(&peer, stream_id, now);
+                // As above, retain endpoint events as the teardown result.
+                match endpoint.reset_stream(&peer, stream_id, now) {
+                    Ok(()) | Err(_) => {}
+                }
             }
         }
     }
@@ -1679,15 +1686,19 @@ mod tests {
 
     impl Transport for NoopTransport {
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported { operation: "dial" })
         }
 
         fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "listen",
+            })
         }
 
         fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "open stream",
+            })
         }
 
         fn send_stream(
@@ -1696,7 +1707,9 @@ mod tests {
             _: StreamId,
             _: Vec<u8>,
         ) -> Result<(), TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "send stream",
+            })
         }
 
         fn close_stream_write(
@@ -1704,15 +1717,21 @@ mod tests {
             _: ConnectionId,
             _: StreamId,
         ) -> Result<(), TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "close stream write",
+            })
         }
 
         fn reset_stream(&mut self, _: ConnectionId, _: StreamId) -> Result<(), TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "reset stream",
+            })
         }
 
         fn close(&mut self, _: ConnectionId) -> Result<(), TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "close connection",
+            })
         }
 
         fn poll(&mut self, _: Now) -> Result<Vec<TransportEvent>, TransportError> {
@@ -1738,7 +1757,7 @@ mod tests {
 
     impl Transport for RecordingTransport {
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported { operation: "dial" })
         }
 
         fn listen(&mut self, address: &Multiaddr) -> Result<Multiaddr, TransportError> {

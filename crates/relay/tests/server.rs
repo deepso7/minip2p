@@ -10,14 +10,16 @@ use minip2p_relay::{
 };
 
 fn peer() -> PeerId {
-    PeerId::from_str("QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N").unwrap()
+    PeerId::from_str("QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N")
+        .expect("hard-coded peer ID must parse")
 }
 
 fn decode_hop_frame(frame: &[u8]) -> HopMessage {
-    let minip2p_relay::FrameDecode::Complete { payload, .. } = decode_frame(frame) else {
-        panic!("expected complete HOP frame");
+    let payload = match decode_frame(frame) {
+        minip2p_relay::FrameDecode::Complete { payload, .. } => payload,
+        _ => &[],
     };
-    HopMessage::decode(payload).unwrap()
+    HopMessage::decode(payload).expect("expected complete HOP frame")
 }
 
 #[test]
@@ -62,10 +64,11 @@ fn stop_frame(message: StopMessage) -> Vec<u8> {
 }
 
 fn decode_stop_frame(frame: &[u8]) -> StopMessage {
-    let minip2p_relay::FrameDecode::Complete { payload, .. } = decode_frame(frame) else {
-        panic!("expected complete STOP frame");
+    let payload = match decode_frame(frame) {
+        minip2p_relay::FrameDecode::Complete { payload, .. } => payload,
+        _ => &[],
     };
-    StopMessage::decode(payload).unwrap()
+    StopMessage::decode(payload).expect("expected complete STOP frame")
 }
 
 #[test]

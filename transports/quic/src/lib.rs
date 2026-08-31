@@ -71,15 +71,25 @@ fn retry_address_bytes(addr: SocketAddr) -> ([u8; RETRY_TOKEN_MAX_ADDRESS_LEN], 
     let mut bytes = [0u8; RETRY_TOKEN_MAX_ADDRESS_LEN];
     let ip_len = match addr.ip() {
         IpAddr::V4(ip) => {
-            bytes[..4].copy_from_slice(&ip.octets());
+            bytes
+                .get_mut(..4)
+                .expect("the fixed retry address buffer reserves four IPv4 bytes")
+                .copy_from_slice(&ip.octets());
             4
         }
         IpAddr::V6(ip) => {
-            bytes[..16].copy_from_slice(&ip.octets());
+            bytes
+                .get_mut(..16)
+                .expect("the fixed retry address buffer reserves sixteen IPv6 bytes")
+                .copy_from_slice(&ip.octets());
             16
         }
     };
-    bytes[ip_len..ip_len + 2].copy_from_slice(&addr.port().to_be_bytes());
+    bytes
+        .get_mut(ip_len..)
+        .and_then(|remaining| remaining.get_mut(..2))
+        .expect("the retry address buffer reserves two bytes after every IP address")
+        .copy_from_slice(&addr.port().to_be_bytes());
     (bytes, ip_len + 2)
 }
 
@@ -102,7 +112,11 @@ fn mint_retry_token(
     token.push(RETRY_TOKEN_VERSION);
     token.extend_from_slice(&issued_at.to_be_bytes());
     token.push(address_len as u8);
-    token.extend_from_slice(&address[..address_len]);
+    token.extend_from_slice(
+        address
+            .get(..address_len)
+            .expect("retry_address_bytes returns an in-bounds address length"),
+    );
     token.push(original_dcid.len() as u8);
     token.extend_from_slice(original_dcid);
 
@@ -127,7 +141,7 @@ fn validate_retry_token(
     mac.update(body);
     mac.verify_slice(tag).ok()?;
 
-    if body[0] != RETRY_TOKEN_VERSION {
+    if body.first()? != &RETRY_TOKEN_VERSION {
         return None;
     }
     let issued_at = u64::from_be_bytes(body.get(1..9)?.try_into().ok()?);
@@ -140,13 +154,13 @@ fn validate_retry_token(
     let address_end = address_start.checked_add(address_len)?;
     let (expected_address, expected_address_len) = retry_address_bytes(source);
     if address_len != expected_address_len
-        || body.get(address_start..address_end)? != &expected_address[..expected_address_len]
+        || body.get(address_start..address_end)? != expected_address.get(..expected_address_len)?
     {
         return None;
     }
 
     let dcid_len = *body.get(address_end)? as usize;
-    let dcid_start = address_end + 1;
+    let dcid_start = address_end.checked_add(1)?;
     let dcid_end = dcid_start.checked_add(dcid_len)?;
     if dcid_end != body.len() || dcid_len == 0 || dcid_len > quiche::MAX_CONN_ID_LEN {
         return None;
@@ -529,7 +543,13 @@ impl ReadinessWait {
 
     fn consume_pending_interrupt(&mut self) {
         self.events.clear();
-        let _ = self.poll.poll(&mut self.events, Some(Duration::ZERO));
+        if self
+            .poll
+            .poll(&mut self.events, Some(Duration::ZERO))
+            .is_err()
+        {
+            self.events.clear();
+        }
         self.events.clear();
     }
 }
@@ -544,7 +564,10 @@ fn quic_wait_handle(wakers: Vec<Arc<Waker>>, interrupt_lock: Arc<Mutex<()>>) -> 
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for waker in &wakers {
-            let _ = waker.wake();
+            if waker.wake().is_err() {
+                // A closed readiness source needs no further interrupt.
+                continue;
+            }
         }
     })
 }
@@ -1170,7 +1193,10 @@ impl Transport for QuicTransport {
                 }
             };
 
-            match self.socket.send_to(&out[..written], send_info.to) {
+            let packet = out
+                .get(..written)
+                .expect("quiche reports packet lengths within the supplied buffer");
+            match self.socket.send_to(packet, send_info.to) {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // Transient backpressure must not fail the dial. Retain
@@ -1179,7 +1205,7 @@ impl Transport for QuicTransport {
                     // packets left in quiche (or dropped by a full queue)
                     // are resent by its loss-recovery timer once the
                     // connection is registered below.
-                    self.queue_datagram_best_effort(&out[..written], send_info.to);
+                    self.queue_datagram_best_effort(packet, send_info.to);
                     break;
                 }
                 Err(e) => {
@@ -1350,7 +1376,9 @@ impl Transport for QuicTransport {
             };
 
             let local_addr = self.bound_addr;
-            let packet = &mut buf[..len];
+            let packet = buf
+                .get_mut(..len)
+                .expect("UDP receive lengths fit the supplied buffer");
 
             let parsed_header = quiche::Header::from_slice(packet, quiche::MAX_CONN_ID_LEN).ok();
             let mut target_conn_id = parsed_header
@@ -1420,7 +1448,10 @@ impl Transport for QuicTransport {
                         })?;
                         // Best-effort: a dropped Retry is regenerated when
                         // the client retransmits its Initial.
-                        self.send_stateless_datagram(&out[..written], from);
+                        let retry_packet = out
+                            .get(..written)
+                            .expect("quiche writes Retry packets within the supplied buffer");
+                        self.send_stateless_datagram(retry_packet, from);
                         continue;
                     }
 
@@ -1661,9 +1692,13 @@ impl Drop for QuicTransport {
         // were already closed and this call is idempotent.
         let ids: Vec<ConnectionId> = self.connections.keys().copied().collect();
         for id in ids {
-            let _ = self.close(id);
+            match self.close(id) {
+                Ok(()) | Err(_) => {}
+            }
         }
-        let _ = self.flush_pending_datagrams();
+        if self.flush_pending_datagrams().is_err() {
+            self.pending_datagrams.clear();
+        }
     }
 }
 
@@ -2298,7 +2333,11 @@ mod tests {
             .socket
             .recv_from(&mut buf)
             .expect("datagram must still be queued");
-        assert_eq!(&buf[..len], &[1, 2, 3]);
+        assert_eq!(
+            buf.get(..len)
+                .expect("UDP receive lengths fit the supplied test buffer"),
+            &[1, 2, 3]
+        );
     }
 
     #[test]

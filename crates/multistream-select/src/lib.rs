@@ -349,15 +349,15 @@ fn decode_message(buf: &[u8]) -> DecodeResult<'_> {
         return DecodeResult::Incomplete;
     }
 
-    let msg_bytes = &buf[varint_bytes..total];
+    let Some(msg_bytes) = buf.get(varint_bytes..total) else {
+        return DecodeResult::Incomplete;
+    };
 
-    // The message must end with '\n' per the spec.
-    if msg_bytes.last() != Some(&b'\n') {
+    // The message must end with '\n' per the spec. `split_last` also leaves
+    // the payload without the terminator.
+    let Some((&b'\n', payload_bytes)) = msg_bytes.split_last() else {
         return DecodeResult::Error(MultistreamError::MissingNewline);
-    }
-
-    // Strip the trailing newline to get the payload.
-    let payload_bytes = &msg_bytes[..msg_bytes.len() - 1];
+    };
 
     let payload = match core::str::from_utf8(payload_bytes) {
         Ok(s) => s,

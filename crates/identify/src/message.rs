@@ -143,8 +143,22 @@ impl IdentifyMessage {
             // as multi-byte varints. Truncating to u8 here would let a remote
             // peer alias known fields via high-numbered field tags (e.g.
             // field 33 + LEN wire type = 266, cast to u8 = 0x0A = public_key).
-            let (tag_value, tag_used) = read_uvarint(&input[idx..])?;
-            idx += tag_used;
+            let remaining = input
+                .get(idx..)
+                .ok_or(IdentifyMessageError::FieldOverflow {
+                    offset: idx,
+                    length: 0,
+                    remaining: 0,
+                })?;
+            let (tag_value, tag_used) = read_uvarint(remaining)?;
+            idx = idx
+                .checked_add(tag_used)
+                .filter(|end| *end <= input.len())
+                .ok_or(IdentifyMessageError::FieldOverflow {
+                    offset: idx,
+                    length: tag_used as u64,
+                    remaining: input.len().saturating_sub(idx),
+                })?;
 
             let wire_type = (tag_value & 0x07) as u8;
             let field_number = tag_value >> 3;
@@ -161,6 +175,10 @@ impl IdentifyMessage {
                             msg.listen_addrs.push(value.to_vec());
                         }
                         FIELD_PROTOCOLS => {
+                            #[expect(
+                                clippy::map_err_ignore,
+                                reason = "The public error identifies the malformed protobuf field without exposing UTF-8 internals."
+                            )]
                             let s = core::str::from_utf8(value)
                                 .map_err(|_| IdentifyMessageError::InvalidUtf8 { field_number })?;
                             msg.protocols.push(String::from(s));
@@ -169,11 +187,19 @@ impl IdentifyMessage {
                             msg.observed_addr = Some(value.to_vec());
                         }
                         FIELD_PROTOCOL_VERSION => {
+                            #[expect(
+                                clippy::map_err_ignore,
+                                reason = "The public error identifies the malformed protobuf field without exposing UTF-8 internals."
+                            )]
                             let s = core::str::from_utf8(value)
                                 .map_err(|_| IdentifyMessageError::InvalidUtf8 { field_number })?;
                             msg.protocol_version = Some(String::from(s));
                         }
                         FIELD_AGENT_VERSION => {
+                            #[expect(
+                                clippy::map_err_ignore,
+                                reason = "The public error identifies the malformed protobuf field without exposing UTF-8 internals."
+                            )]
                             let s = core::str::from_utf8(value)
                                 .map_err(|_| IdentifyMessageError::InvalidUtf8 { field_number })?;
                             msg.agent_version = Some(String::from(s));
@@ -185,28 +211,29 @@ impl IdentifyMessage {
                 }
                 WIRE_VARINT => {
                     // Skip unknown varint values.
-                    let (_, used) = read_uvarint(&input[idx..])?;
-                    idx += used;
+                    let remaining =
+                        input
+                            .get(idx..)
+                            .ok_or(IdentifyMessageError::FieldOverflow {
+                                offset: idx,
+                                length: 0,
+                                remaining: 0,
+                            })?;
+                    let (_, used) = read_uvarint(remaining)?;
+                    idx = idx
+                        .checked_add(used)
+                        .filter(|end| *end <= input.len())
+                        .ok_or(IdentifyMessageError::FieldOverflow {
+                            offset: idx,
+                            length: used as u64,
+                            remaining: input.len().saturating_sub(idx),
+                        })?;
                 }
                 WIRE_I32 => {
-                    if idx + 4 > input.len() {
-                        return Err(IdentifyMessageError::FieldOverflow {
-                            offset: idx,
-                            length: 4,
-                            remaining: input.len().saturating_sub(idx),
-                        });
-                    }
-                    idx += 4;
+                    idx = checked_advance(input, idx, 4)?;
                 }
                 WIRE_I64 => {
-                    if idx + 8 > input.len() {
-                        return Err(IdentifyMessageError::FieldOverflow {
-                            offset: idx,
-                            length: 8,
-                            remaining: input.len().saturating_sub(idx),
-                        });
-                    }
-                    idx += 8;
+                    idx = checked_advance(input, idx, 8)?;
                 }
                 other => {
                     // Wire types 3 and 4 (deprecated start/end group) and 6,
@@ -238,10 +265,21 @@ fn read_len_delimited<'a>(
     input: &'a [u8],
     idx: &mut usize,
 ) -> Result<&'a [u8], IdentifyMessageError> {
-    let (length_u64, len_used) = read_uvarint(&input[*idx..])?;
-    *idx += len_used;
+    let remaining_input = input
+        .get(*idx..)
+        .ok_or(IdentifyMessageError::FieldOverflow {
+            offset: *idx,
+            length: 0,
+            remaining: 0,
+        })?;
+    let (length_u64, len_used) = read_uvarint(remaining_input)?;
+    *idx = checked_advance(input, *idx, len_used)?;
 
     let remaining = input.len().saturating_sub(*idx);
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "FieldOverflow records the declared wire length, which is the useful cross-platform detail."
+    )]
     let length = usize::try_from(length_u64).map_err(|_| IdentifyMessageError::FieldOverflow {
         offset: *idx,
         length: length_u64,
@@ -256,9 +294,31 @@ fn read_len_delimited<'a>(
         });
     }
 
-    let value = &input[*idx..*idx + length];
-    *idx += length;
+    let end = checked_advance(input, *idx, length)?;
+    let value = input
+        .get(*idx..end)
+        .ok_or(IdentifyMessageError::FieldOverflow {
+            offset: *idx,
+            length: length_u64,
+            remaining,
+        })?;
+    *idx = end;
     Ok(value)
+}
+
+fn checked_advance(
+    input: &[u8],
+    offset: usize,
+    length: usize,
+) -> Result<usize, IdentifyMessageError> {
+    offset
+        .checked_add(length)
+        .filter(|end| *end <= input.len())
+        .ok_or(IdentifyMessageError::FieldOverflow {
+            offset,
+            length: length as u64,
+            remaining: input.len().saturating_sub(offset),
+        })
 }
 
 // ---------------------------------------------------------------------------

@@ -155,11 +155,11 @@ impl BeaconAgent {
 
 pub(crate) fn normalize_addr(peer: &PeerId, addr: Multiaddr) -> Option<Multiaddr> {
     let protocols = addr.protocols();
-    let addr = match protocols.last() {
-        Some(Protocol::P2p(suffix)) if suffix == peer => {
-            Multiaddr::from_protocols(protocols[..protocols.len() - 1].to_vec())
+    let addr = match protocols.split_last() {
+        Some((Protocol::P2p(suffix), prefix)) if suffix == peer => {
+            Multiaddr::from_protocols(prefix.to_vec())
         }
-        Some(Protocol::P2p(_)) => return None,
+        Some((Protocol::P2p(_), _)) => return None,
         _ => addr,
     };
     is_supported_addr(&addr).then_some(addr)

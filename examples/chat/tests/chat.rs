@@ -5,6 +5,11 @@
 //! product loop: a line typed on one peer's stdin reaches every other peer
 //! — including leaf-to-leaf THROUGH the host — and stdin EOF exits cleanly.
 
+#![expect(
+    clippy::panic,
+    reason = "the process-test helpers include collected child output in assertion failures"
+)]
+
 use std::io::{BufRead, BufReader, Write};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -135,7 +140,9 @@ impl Peer {
     fn kill(&mut self) {
         drop(self.stdin.take());
         self.child.0.kill().expect("kill child");
-        let _ = self.child.0.wait();
+        match self.child.0.wait() {
+            Ok(_) | Err(_) => {}
+        }
     }
 
     /// Closes stdin (EOF) and waits for a clean exit.

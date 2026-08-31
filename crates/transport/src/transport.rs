@@ -200,15 +200,19 @@ mod tests {
 
     impl Transport for Minimal {
         fn dial(&mut self, _addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
-            unimplemented!("not reached: this fake exists to exercise the defaults")
+            Err(TransportError::Unsupported { operation: "dial" })
         }
 
         fn listen(&mut self, _addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
-            unimplemented!()
+            Err(TransportError::Unsupported {
+                operation: "listen",
+            })
         }
 
         fn open_stream(&mut self, _id: ConnectionId) -> Result<StreamId, TransportError> {
-            unimplemented!()
+            Err(TransportError::Unsupported {
+                operation: "open_stream",
+            })
         }
 
         fn send_stream(
@@ -217,7 +221,9 @@ mod tests {
             _stream_id: StreamId,
             _data: Vec<u8>,
         ) -> Result<(), TransportError> {
-            unimplemented!()
+            Err(TransportError::Unsupported {
+                operation: "send_stream",
+            })
         }
 
         fn close_stream_write(
@@ -225,7 +231,9 @@ mod tests {
             _id: ConnectionId,
             _stream_id: StreamId,
         ) -> Result<(), TransportError> {
-            unimplemented!()
+            Err(TransportError::Unsupported {
+                operation: "close_stream_write",
+            })
         }
 
         fn reset_stream(
@@ -233,11 +241,13 @@ mod tests {
             _id: ConnectionId,
             _stream_id: StreamId,
         ) -> Result<(), TransportError> {
-            unimplemented!()
+            Err(TransportError::Unsupported {
+                operation: "reset_stream",
+            })
         }
 
         fn close(&mut self, _id: ConnectionId) -> Result<(), TransportError> {
-            unimplemented!()
+            Err(TransportError::Unsupported { operation: "close" })
         }
 
         fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {

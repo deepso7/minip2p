@@ -213,15 +213,19 @@ mod tests {
 
     impl Transport for NoopTransport {
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported { operation: "dial" })
         }
 
         fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "listen",
+            })
         }
 
         fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "open_stream",
+            })
         }
 
         fn send_stream(
@@ -230,7 +234,9 @@ mod tests {
             _: StreamId,
             _: Vec<u8>,
         ) -> Result<(), TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "send_stream",
+            })
         }
 
         fn close_stream_write(
@@ -238,15 +244,19 @@ mod tests {
             _: ConnectionId,
             _: StreamId,
         ) -> Result<(), TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "close_stream_write",
+            })
         }
 
         fn reset_stream(&mut self, _: ConnectionId, _: StreamId) -> Result<(), TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported {
+                operation: "reset_stream",
+            })
         }
 
         fn close(&mut self, _: ConnectionId) -> Result<(), TransportError> {
-            unreachable!()
+            Err(TransportError::Unsupported { operation: "close" })
         }
 
         fn poll(&mut self, _now: Now) -> Result<Vec<TransportEvent>, TransportError> {

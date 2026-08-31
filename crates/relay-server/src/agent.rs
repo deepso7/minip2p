@@ -1,4 +1,5 @@
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -244,7 +245,10 @@ impl RelayServerAgent {
     }
 
     /// Atomically replaces the explicit announce source; empty clears it.
-    #[allow(clippy::result_large_err)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "The error owns the rejected announce address for actionable host diagnostics."
+    )]
     pub fn replace_announce_addrs(
         &mut self,
         addrs: Vec<Multiaddr>,
@@ -255,7 +259,10 @@ impl RelayServerAgent {
     }
 
     /// Replaces the AutoNAT-confirmed direct-address source atomically.
-    #[allow(clippy::result_large_err)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "The error owns the rejected confirmed address for actionable host diagnostics."
+    )]
     pub fn set_confirmed_addrs(
         &mut self,
         addrs: Vec<Multiaddr>,
@@ -265,7 +272,10 @@ impl RelayServerAgent {
     }
 
     /// Replaces the concrete bound-listener source atomically.
-    #[allow(clippy::result_large_err)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "The error owns the rejected listener address for actionable host diagnostics."
+    )]
     pub fn set_listener_addrs(
         &mut self,
         addrs: Vec<Multiaddr>,
@@ -348,11 +358,10 @@ impl RelayServerAgent {
                 if self.pending_circuits.contains_key(&key) {
                     self.append_pending_payload(key, CircuitDirection::SourceToDestination, data);
                     true
-                } else if let Some(worker) = self.hop_workers.get_mut(&key) {
-                    let _ = worker
-                        .responder
-                        .handle_input(HopResponderInput::Data(data.clone()));
-                    self.drain_hop(key, now);
+                } else if self.hop_workers.contains_key(&key) {
+                    if self.feed_hop(key, HopResponderInput::Data(data.clone())) {
+                        self.drain_hop(key, now);
+                    }
                     true
                 } else if self.rejected_hop_streams.contains_key(&key) {
                     true
@@ -360,12 +369,7 @@ impl RelayServerAgent {
                     self.queue_forward(key, CircuitDirection::SourceToDestination, data.clone());
                     true
                 } else if let Some(source_stream) = self.stop_to_source.get(&key).copied() {
-                    if let Some(stop) = self
-                        .pending_circuits
-                        .get_mut(&source_stream)
-                        .and_then(|circuit| circuit.stop.as_mut())
-                    {
-                        let _ = stop.handle_input(StopInitiatorInput::Data(data.clone()));
+                    if self.feed_stop(source_stream, StopInitiatorInput::Data(data.clone())) {
                         self.drain_stop(source_stream, now);
                     } else if self.circuits.contains_key(&source_stream) {
                         self.queue_forward(
@@ -394,21 +398,20 @@ impl RelayServerAgent {
                 {
                     self.circuit_eof(source_stream, CircuitLeg::Destination);
                     true
-                } else if let Some(worker) = self.hop_workers.get_mut(&key) {
+                } else if self.hop_workers.contains_key(&key) {
                     if let Some(circuit) = self.pending_circuits.get_mut(&key) {
                         circuit.source_eof = true;
                     }
-                    let _ = worker
-                        .responder
-                        .handle_input(HopResponderInput::RemoteWriteClosed);
-                    self.drain_hop(key, now);
+                    if self.feed_hop(key, HopResponderInput::RemoteWriteClosed) {
+                        self.drain_hop(key, now);
+                    }
                     true
                 } else if let Some(source_stream) = self.stop_to_source.get(&key).copied()
-                    && let Some(circuit) = self.pending_circuits.get_mut(&source_stream)
-                    && let Some(stop) = circuit.stop.as_mut()
+                    && self.feed_stop(source_stream, StopInitiatorInput::RemoteWriteClosed)
                 {
-                    circuit.destination_eof = true;
-                    let _ = stop.handle_input(StopInitiatorInput::RemoteWriteClosed);
+                    if let Some(circuit) = self.pending_circuits.get_mut(&source_stream) {
+                        circuit.destination_eof = true;
+                    }
                     self.drain_stop(source_stream, now);
                     true
                 } else if self.pending_circuits.contains_key(&key) {
@@ -445,12 +448,8 @@ impl RelayServerAgent {
                     );
                     true
                 } else if let Some(source_stream) = self.stop_to_source.get(&key).copied()
-                    && let Some(stop) = self
-                        .pending_circuits
-                        .get_mut(&source_stream)
-                        .and_then(|circuit| circuit.stop.as_mut())
+                    && self.feed_stop(source_stream, StopInitiatorInput::RemoteReset)
                 {
-                    let _ = stop.handle_input(StopInitiatorInput::RemoteReset);
                     self.drain_stop(source_stream, now);
                     true
                 } else if self.pending_circuits.contains_key(&key) {
@@ -1007,6 +1006,50 @@ impl RelayServerAgent {
         self.hop_workers.insert(key, worker);
     }
 
+    /// Delivers an input to a live HOP responder.
+    ///
+    /// Missing workers are stale stream events and need no new action. A
+    /// responder error after the agent routed the event is an internal
+    /// contract failure, so surface it before the caller decides whether to
+    /// drain any output.
+    fn feed_hop(&mut self, key: StreamKey, input: HopResponderInput) -> bool {
+        let Some(worker) = self.hop_workers.get_mut(&key) else {
+            return false;
+        };
+        let peer_id = worker.peer_id.clone();
+        let result = worker.responder.handle_input(input);
+        if let Err(error) = result {
+            self.runtime_error(
+                RelayServerRuntimeErrorKind::InternalInvariant,
+                Some(peer_id),
+                format!("HOP responder rejected routed input: {error}"),
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Delivers an input to a pending STOP initiator, ignoring stale streams.
+    fn feed_stop(&mut self, source_stream: StreamKey, input: StopInitiatorInput) -> bool {
+        let Some(circuit) = self.pending_circuits.get_mut(&source_stream) else {
+            return false;
+        };
+        let Some(stop) = circuit.stop.as_mut() else {
+            return false;
+        };
+        let peer_id = circuit.source_peer_id.clone();
+        let result = stop.handle_input(input);
+        if let Err(error) = result {
+            self.runtime_error(
+                RelayServerRuntimeErrorKind::InternalInvariant,
+                Some(peer_id),
+                format!("STOP initiator rejected routed input: {error}"),
+            );
+            return false;
+        }
+        true
+    }
+
     fn drain_hop(&mut self, key: StreamKey, now: Now) {
         loop {
             let output = self
@@ -1016,19 +1059,20 @@ impl RelayServerAgent {
             let Some(output) = output else { break };
             match output {
                 HopResponderOutput::Request(HopRequest::Reserve) => {
-                    self.hop_workers.get_mut(&key).unwrap().request_known = true;
-                    if self.hop_workers[&key].is_circuit {
-                        let peer_id = self.hop_workers[&key].peer_id.clone();
+                    let Some((peer_id, is_circuit)) =
+                        self.hop_workers.get_mut(&key).map(|worker| {
+                            worker.request_known = true;
+                            (worker.peer_id.clone(), worker.is_circuit)
+                        })
+                    else {
+                        break;
+                    };
+                    if is_circuit {
                         self.events.push_back(RelayServerEvent::ReservationDenied {
                             peer_id,
                             status: Status::PermissionDenied,
                         });
-                        let _ = self
-                            .hop_workers
-                            .get_mut(&key)
-                            .unwrap()
-                            .responder
-                            .handle_input(HopResponderInput::Reject(Status::PermissionDenied));
+                        self.feed_hop(key, HopResponderInput::Reject(Status::PermissionDenied));
                     } else {
                         self.decide_reservation(key, now)
                     }
@@ -1036,23 +1080,46 @@ impl RelayServerAgent {
                 HopResponderOutput::Request(HopRequest::Connect {
                     destination_peer_id,
                 }) => {
-                    self.hop_workers.get_mut(&key).unwrap().request_known = true;
-                    if self.hop_workers[&key].is_circuit {
+                    let Some(is_circuit) = self.hop_workers.get_mut(&key).map(|worker| {
+                        worker.request_known = true;
+                        worker.is_circuit
+                    }) else {
+                        break;
+                    };
+                    if is_circuit {
                         self.deny_connect(key, destination_peer_id, Status::PermissionDenied);
                     } else {
                         self.decide_connect(key, destination_peer_id, now);
                     }
                 }
                 HopResponderOutput::Outbound(data) => {
-                    let peer_id = self.hop_workers.get(&key).unwrap().peer_id.clone();
+                    let Some(peer_id) = self
+                        .hop_workers
+                        .get(&key)
+                        .map(|worker| worker.peer_id.clone())
+                    else {
+                        break;
+                    };
                     self.queue_send(peer_id, key, data, SendEffect::CompleteHop(key));
                 }
                 HopResponderOutput::CloseWrite => {
-                    let peer_id = self.hop_workers.get(&key).unwrap().peer_id.clone();
+                    let Some(peer_id) = self
+                        .hop_workers
+                        .get(&key)
+                        .map(|worker| worker.peer_id.clone())
+                    else {
+                        break;
+                    };
                     self.queue_close(peer_id, key);
                 }
                 HopResponderOutput::Reset => {
-                    let peer_id = self.hop_workers.get(&key).unwrap().peer_id.clone();
+                    let Some(peer_id) = self
+                        .hop_workers
+                        .get(&key)
+                        .map(|worker| worker.peer_id.clone())
+                    else {
+                        break;
+                    };
                     self.queue_reset(peer_id, key);
                 }
                 HopResponderOutput::BridgeData(data) => {
@@ -1083,18 +1150,22 @@ impl RelayServerAgent {
                     if let Some(circuit) = self.pending_circuits.get_mut(&source_stream) {
                         circuit.stop_deadline_ms = None;
                     }
-                    let Some(worker) = self.hop_workers.get_mut(&source_stream) else {
-                        self.fail_pending_connect(source_stream, Status::ConnectionFailed);
-                        return;
-                    };
-                    let _ = worker
-                        .responder
-                        .handle_input(HopResponderInput::AcceptConnect {
+                    if !self.feed_hop(
+                        source_stream,
+                        HopResponderInput::AcceptConnect {
                             limit: Some(Limit {
                                 duration: Some(self.config.max_circuit_duration_secs as u32),
                                 data: Some(self.config.max_circuit_bytes),
                             }),
-                        });
+                        },
+                    ) {
+                        self.fail_pending_connect(source_stream, Status::ConnectionFailed);
+                        return;
+                    }
+                    let Some(worker) = self.hop_workers.get_mut(&source_stream) else {
+                        self.fail_pending_connect(source_stream, Status::ConnectionFailed);
+                        return;
+                    };
                     let Some(HopResponderOutput::Outbound(data)) = worker.responder.poll_output()
                     else {
                         self.fail_pending_connect(source_stream, Status::ConnectionFailed);
@@ -1424,7 +1495,13 @@ impl RelayServerAgent {
     }
 
     fn decide_reservation(&mut self, key: StreamKey, now: Now) {
-        let peer_id = self.hop_workers.get(&key).unwrap().peer_id.clone();
+        let Some(peer_id) = self
+            .hop_workers
+            .get(&key)
+            .map(|worker| worker.peer_id.clone())
+        else {
+            return;
+        };
         let renewed = self
             .reservations
             .get(&peer_id)
@@ -1477,21 +1554,23 @@ impl RelayServerAgent {
                 peer_id: peer_id.clone(),
                 status,
             });
-            let worker = self.hop_workers.get_mut(&key).unwrap();
-            let _ = worker
-                .responder
-                .handle_input(HopResponderInput::Reject(status));
+            self.feed_hop(key, HopResponderInput::Reject(status));
             return;
         }
 
         let (reservation, limit) = wire.expect("availability checked above");
-        let worker = self.hop_workers.get_mut(&key).unwrap();
-        let _ = worker
-            .responder
-            .handle_input(HopResponderInput::AcceptReservation {
+        if !self.feed_hop(
+            key,
+            HopResponderInput::AcceptReservation {
                 reservation,
                 limit: Some(limit),
-            });
+            },
+        ) {
+            return;
+        }
+        let Some(worker) = self.hop_workers.get_mut(&key) else {
+            return;
+        };
         let Some(HopResponderOutput::Outbound(data)) = worker.responder.poll_output() else {
             self.runtime_error(
                 RelayServerRuntimeErrorKind::InternalInvariant,
@@ -1556,7 +1635,13 @@ impl RelayServerAgent {
     }
 
     fn decide_connect(&mut self, key: StreamKey, destination_peer_id: PeerId, now: Now) {
-        let source_peer_id = self.hop_workers.get(&key).unwrap().peer_id.clone();
+        let Some(source_peer_id) = self
+            .hop_workers
+            .get(&key)
+            .map(|worker| worker.peer_id.clone())
+        else {
+            return;
+        };
         let destination_conn = self
             .reservations
             .get(&destination_peer_id)
@@ -1670,17 +1755,19 @@ impl RelayServerAgent {
     }
 
     fn deny_connect(&mut self, key: StreamKey, destination_peer_id: PeerId, status: Status) {
-        let source_peer_id = self.hop_workers.get(&key).unwrap().peer_id.clone();
+        let Some(source_peer_id) = self
+            .hop_workers
+            .get(&key)
+            .map(|worker| worker.peer_id.clone())
+        else {
+            return;
+        };
         self.events.push_back(RelayServerEvent::CircuitDenied {
             source_peer_id,
             destination_peer_id,
             status,
         });
-        if let Some(worker) = self.hop_workers.get_mut(&key) {
-            let _ = worker
-                .responder
-                .handle_input(HopResponderInput::Reject(status));
-        }
+        self.feed_hop(key, HopResponderInput::Reject(status));
     }
 
     fn fail_pending_connect(&mut self, source_stream: StreamKey, status: Status) {

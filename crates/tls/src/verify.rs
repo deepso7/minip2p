@@ -99,14 +99,26 @@ fn verify_self_signature(cert_der: &[u8], cert: &Certificate) -> Result<(), TlsE
     let tbs = cert.tbs_certificate();
     let spki = tbs.subject_public_key_info();
     let pk_bytes = spki.subject_public_key.raw_bytes();
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "invalid self-signatures intentionally have one public error"
+    )]
     let verifying_key =
         VerifyingKey::from_sec1_bytes(pk_bytes).map_err(|_| TlsError::InvalidSelfSignature)?;
 
     // Extract and verify the signature.
     let sig_bytes = cert.signature().raw_bytes();
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "invalid self-signatures intentionally have one public error"
+    )]
     let signature =
         DerSignature::from_der(sig_bytes).map_err(|_| TlsError::InvalidSelfSignature)?;
 
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "invalid self-signatures intentionally have one public error"
+    )]
     verifying_key
         .verify(tbs_der, &signature)
         .map_err(|_| TlsError::InvalidSelfSignature)
@@ -125,21 +137,32 @@ fn extract_tbs_der(cert_der: &[u8]) -> Result<&[u8], TlsError> {
 
     // Record where the TBSCertificate starts (right after outer header).
     let remaining_before = usize::try_from(reader.remaining_len()).map_err(map_err)?;
-    let tbs_start = cert_der.len() - remaining_before;
+    let tbs_start = cert_der
+        .len()
+        .checked_sub(remaining_before)
+        .ok_or(TlsError::Der("TBS starts beyond certificate".into()))?;
 
     // Parse the TBSCertificate header to determine its total encoded length.
     let tbs_header = der::Header::decode(&mut reader).map_err(map_err)?;
     let remaining_after = usize::try_from(reader.remaining_len()).map_err(map_err)?;
-    let tbs_header_len = remaining_before - remaining_after;
+    let tbs_header_len = remaining_before
+        .checked_sub(remaining_after)
+        .ok_or(TlsError::Der("TBS header exceeds certificate".into()))?;
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "a length conversion failure has one compact TLS error"
+    )]
     let tbs_value_len = usize::try_from(tbs_header.length())
         .map_err(|_| TlsError::Der("TBS length overflow".into()))?;
 
-    let tbs_end = tbs_start + tbs_header_len + tbs_value_len;
-    if tbs_end > cert_der.len() {
-        return Err(TlsError::Der("TBS extends beyond certificate".into()));
-    }
+    let tbs_end = tbs_start
+        .checked_add(tbs_header_len)
+        .and_then(|offset| offset.checked_add(tbs_value_len))
+        .ok_or(TlsError::Der("TBS length overflow".into()))?;
 
-    Ok(&cert_der[tbs_start..tbs_end])
+    cert_der
+        .get(tbs_start..tbs_end)
+        .ok_or(TlsError::Der("TBS extends beyond certificate".into()))
 }
 
 /// Decodes the `SignedKey` ASN.1 structure from DER bytes.
@@ -179,6 +202,10 @@ fn verify_host_signature(
 ) -> Result<(), TlsError> {
     match public_key.key_type() {
         KeyType::Ed25519 => {
+            #[expect(
+                clippy::map_err_ignore,
+                reason = "signature conversion errors are represented by the reported length"
+            )]
             let sig_array: [u8; 64] = signature.try_into().map_err(|_| {
                 TlsError::SignatureVerification(format!(
                     "invalid Ed25519 signature length: expected 64, got {}",
@@ -311,7 +338,7 @@ mod tests {
 
     #[test]
     fn rejects_cert_without_extension() {
-        let result = verify_libp2p_certificate(&[0x30, 0x00]);
-        assert!(result.is_err());
+        verify_libp2p_certificate(&[0x30, 0x00])
+            .expect_err("certificate without the libp2p extension must fail");
     }
 }

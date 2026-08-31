@@ -736,8 +736,8 @@ fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, AutoNatE
         return Ok(None);
     }
     let offset = *idx;
-    let (tag_value, used) = read_uvarint(&input[*idx..])?;
-    *idx += used;
+    let (tag_value, used) = read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
+    advance(input, idx, used)?;
     let wire_type = (tag_value & 0x07) as u8;
     let field_number = tag_value >> 3;
     if field_number == 0 {
@@ -747,8 +747,12 @@ fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, AutoNatE
 }
 
 fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], AutoNatError> {
-    let (length, used) = read_uvarint(&input[*idx..])?;
-    *idx += used;
+    let (length, used) = read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
+    advance(input, idx, used)?;
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "wire lengths wider than usize are reported as varint overflow"
+    )]
     let length = usize::try_from(length).map_err(|_| VarintError::Overflow)?;
     let remaining = input.len().saturating_sub(*idx);
     if length > remaining {
@@ -758,15 +762,38 @@ fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], 
             remaining,
         });
     }
-    let value = &input[*idx..*idx + length];
-    *idx += length;
+    let end = idx.checked_add(length).ok_or(AutoNatError::FieldOverflow {
+        offset: *idx,
+        length,
+        remaining,
+    })?;
+    let value = input.get(*idx..end).ok_or(AutoNatError::FieldOverflow {
+        offset: *idx,
+        length,
+        remaining,
+    })?;
+    *idx = end;
     Ok(value)
 }
 
 fn read_varint_value(input: &[u8], idx: &mut usize) -> Result<u64, AutoNatError> {
-    let (value, used) = read_uvarint(&input[*idx..])?;
-    *idx += used;
+    let (value, used) = read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
+    advance(input, idx, used)?;
     Ok(value)
+}
+
+fn advance(input: &[u8], idx: &mut usize, length: usize) -> Result<(), AutoNatError> {
+    let remaining = input.len().saturating_sub(*idx);
+    let end = idx
+        .checked_add(length)
+        .filter(|end| *end <= input.len())
+        .ok_or(AutoNatError::FieldOverflow {
+            offset: *idx,
+            length,
+            remaining,
+        })?;
+    *idx = end;
+    Ok(())
 }
 
 #[cfg(test)]

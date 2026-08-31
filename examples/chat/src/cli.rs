@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use minip2p::{Multiaddr, PeerAddr, PeerId, Protocol};
-use minip2p_example_common::{CliError, flag_value, require_quic_transport};
+use minip2p_example_common::{CliError, require_quic_transport};
 
 /// The modes the CLI dispatches to.
 #[derive(Clone, Debug)]
@@ -91,23 +91,19 @@ pub fn parse(mut args: Vec<String>) -> Result<Mode, CliError> {
 fn parse_join(args: Vec<String>) -> Result<Mode, CliError> {
     let mut positional: Vec<String> = Vec::new();
     let mut rest: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
         if arg == "--allow-unsigned" || arg == "--no-mesh" || arg == "--relay-only" {
             // Boolean flag: no value follows.
             rest.push(arg.clone());
-            i += 1;
         } else if arg.starts_with("--") {
             rest.push(arg.clone());
             let value = args
-                .get(i + 1)
+                .next()
                 .ok_or_else(|| CliError(format!("flag '{arg}' requires a value")))?;
             rest.push(value.clone());
-            i += 2;
         } else {
             positional.push(arg.clone());
-            i += 1;
         }
     }
 
@@ -174,14 +170,11 @@ impl Flags {
         let mut relay: Option<PeerAddr> = None;
         let mut chat = ChatOptions::default();
 
-        let mut i = 0;
-        while i < args.len() {
-            let key = &args[i];
-
+        let mut args = args.iter();
+        while let Some(key) = args.next() {
             match key.as_str() {
                 "--allow-unsigned" => {
                     chat.allow_unsigned = true;
-                    i += 1;
                     continue;
                 }
                 "--no-mesh" => {
@@ -189,7 +182,6 @@ impl Flags {
                         return Err(CliError("--no-mesh specified twice".into()));
                     }
                     chat.no_mesh = true;
-                    i += 1;
                     continue;
                 }
                 "--relay-only" => {
@@ -197,11 +189,10 @@ impl Flags {
                         return Err(CliError("--relay-only specified twice".into()));
                     }
                     chat.relay_only = true;
-                    i += 1;
                     continue;
                 }
                 "--topic" => {
-                    let value = flag_value(args, i, key)?;
+                    let value = next_flag_value(&mut args, key)?;
                     if chat.topic.is_some() {
                         return Err(CliError("--topic specified twice".into()));
                     }
@@ -211,7 +202,7 @@ impl Flags {
                     chat.topic = Some(value.clone());
                 }
                 "--nick" => {
-                    let value = flag_value(args, i, key)?;
+                    let value = next_flag_value(&mut args, key)?;
                     if chat.nick.is_some() {
                         return Err(CliError("--nick specified twice".into()));
                     }
@@ -223,7 +214,7 @@ impl Flags {
                     chat.nick = Some(value.clone());
                 }
                 "--relay" => {
-                    let value = flag_value(args, i, key)?;
+                    let value = next_flag_value(&mut args, key)?;
                     if relay.is_some() {
                         return Err(CliError("--relay specified twice".into()));
                     }
@@ -233,14 +224,14 @@ impl Flags {
                     relay = Some(addr);
                 }
                 "--key" => {
-                    let value = flag_value(args, i, key)?;
+                    let value = next_flag_value(&mut args, key)?;
                     if chat.key_path.is_some() {
                         return Err(CliError("--key specified twice".into()));
                     }
                     chat.key_path = Some(PathBuf::from(value));
                 }
                 "--listen" => {
-                    let value = flag_value(args, i, key)?;
+                    let value = next_flag_value(&mut args, key)?;
                     if chat.listen_addr.is_some() {
                         return Err(CliError("--listen specified twice".into()));
                     }
@@ -262,11 +253,18 @@ impl Flags {
                     return Err(CliError(format!("unknown flag '{other}'")));
                 }
             }
-            i += 2;
         }
 
         Ok(Self { relay, chat })
     }
+}
+
+fn next_flag_value<'a>(
+    args: &mut impl Iterator<Item = &'a String>,
+    key: &str,
+) -> Result<&'a String, CliError> {
+    args.next()
+        .ok_or_else(|| CliError(format!("flag '{key}' requires a value")))
 }
 
 /// Usage text printed on `--help` and parse errors.
@@ -369,7 +367,7 @@ mod tests {
             .into_iter()
             .map(str::to_string)
             .collect();
-        assert!(parse(duplicate).is_err());
+        parse(duplicate).expect_err("duplicate --no-mesh must be rejected");
     }
 
     #[test]
@@ -389,6 +387,6 @@ mod tests {
             .into_iter()
             .map(str::to_string)
             .collect();
-        assert!(parse(duplicate).is_err());
+        parse(duplicate).expect_err("duplicate --relay-only must be rejected");
     }
 }

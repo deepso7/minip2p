@@ -344,7 +344,10 @@ pub(crate) fn terminal_connect_id(event: &P2pEvent) -> Option<u64> {
 }
 
 fn ring(doorbell: &Arc<dyn EventDoorbell>) {
-    let _ = catch_unwind(AssertUnwindSafe(|| doorbell.on_events_ready()));
+    // Foreign callbacks are advisory; an unwind must not stop event delivery.
+    drop(catch_unwind(AssertUnwindSafe(|| {
+        doorbell.on_events_ready()
+    })));
 }
 
 fn failure_kind(error: &Error) -> DriverFailureKind {

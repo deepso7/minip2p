@@ -179,7 +179,7 @@ impl<D: Device> SmoltcpMdnsIo<D> {
                 addr: None,
                 port: MDNS_PORT,
             }) {
-                let _ = shared.interface.leave_multicast_group(group);
+                leave_multicast_group(&mut shared, group);
                 rollback_families(&mut shared, &families);
                 return Err(MdnsError::io("binding the mDNS port", DisplayError(error)));
             }
@@ -296,7 +296,7 @@ fn rollback_families<D: Device>(
 ) {
     for family in families {
         shared.sockets.remove(family.socket);
-        let _ = shared.interface.leave_multicast_group(family.group);
+        leave_multicast_group(shared, family.group);
     }
 }
 
@@ -305,9 +305,22 @@ impl<D: Device> Drop for SmoltcpMdnsIo<D> {
         let mut shared = self.stack.borrow_mut();
         for family in &self.families {
             shared.sockets.remove(family.socket);
-            let _ = shared.interface.leave_multicast_group(family.group);
+            leave_multicast_group(&mut shared, family.group);
         }
     }
+}
+
+/// Releases a group membership while unwinding setup or tearing down sockets.
+///
+/// Those paths have no error channel. The interface itself is being released
+/// or is already unusable, so there is no recovery action beyond attempting
+/// the leave; a debug build still records an unexpected refusal.
+fn leave_multicast_group<D: Device>(
+    shared: &mut minip2p_smoltcp::SmoltcpStackState<D>,
+    group: IpAddress,
+) {
+    let left = shared.interface.leave_multicast_group(group).is_ok();
+    debug_assert!(left, "mDNS multicast group membership should be removable");
 }
 
 fn instant(millis: u64) -> Instant {
@@ -364,7 +377,9 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
         }
         for step in 0..count {
             let index = (self.next_receive + step) % count;
-            let family = &self.families[index];
+            let Some(family) = self.families.get(index) else {
+                continue;
+            };
             let mut shared = self.stack.borrow_mut();
             let socket = shared.sockets.get_mut::<udp::Socket>(family.socket);
             let (payload, metadata) = match socket.recv() {
@@ -378,7 +393,11 @@ impl<D: Device> MdnsIo for SmoltcpMdnsIo<D> {
             // As much as fits and no more: filling the buffer is how the
             // driver recognises a datagram too big to act on.
             let len = payload.len().min(buffer.len());
-            buffer[..len].copy_from_slice(&payload[..len]);
+            let (Some(destination), Some(source)) = (buffer.get_mut(..len), payload.get(..len))
+            else {
+                continue;
+            };
+            destination.copy_from_slice(source);
             let from = endpoint_to_socket_addr(metadata.endpoint);
             // Both sockets wildcard-bind the mDNS port. smoltcp may therefore
             // deliver a packet to either socket, so the receiving socket is

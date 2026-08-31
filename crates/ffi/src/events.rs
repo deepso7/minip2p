@@ -132,7 +132,10 @@ pub enum DriverFailureKind {
 
 /// Event delivered by the native endpoint driver.
 #[uniffi::remote(Enum)]
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "UniFFI exports complete event payloads by value to foreign callers."
+)]
 pub enum P2pEvent {
     /// Native event carry overflow discarded source events.
     EventsDropped {

@@ -44,17 +44,29 @@ fn build_with_config(
 
     let mut relays = Vec::new();
     if relay_count >= 1 {
-        relays.push(PeerAddr::new(maddr(RELAY_TRANSPORT_ADDR), relay.clone()).unwrap());
+        relays.push(
+            PeerAddr::new(maddr(RELAY_TRANSPORT_ADDR), relay.clone())
+                .expect("valid relay peer address"),
+        );
     }
     if relay_count >= 2 {
-        relays.push(PeerAddr::new(maddr(RELAY2_TRANSPORT_ADDR), relay2.clone()).unwrap());
+        relays.push(
+            PeerAddr::new(maddr(RELAY2_TRANSPORT_ADDR), relay2.clone())
+                .expect("valid second relay peer address"),
+        );
     }
     let mut autonat_servers = Vec::new();
     if server_count >= 1 {
-        autonat_servers.push(PeerAddr::new(maddr(SERVER_ADDR), server.clone()).unwrap());
+        autonat_servers.push(
+            PeerAddr::new(maddr(SERVER_ADDR), server.clone())
+                .expect("valid AutoNAT server peer address"),
+        );
     }
     if server_count >= 2 {
-        autonat_servers.push(PeerAddr::new(maddr(SERVER2_ADDR), server2.clone()).unwrap());
+        autonat_servers.push(
+            PeerAddr::new(maddr(SERVER2_ADDR), server2.clone())
+                .expect("valid second AutoNAT server peer address"),
+        );
     }
 
     let mut config = NatConfig {

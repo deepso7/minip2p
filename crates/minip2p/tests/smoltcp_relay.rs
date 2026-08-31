@@ -1,6 +1,12 @@
 //! Three-node portable relay gate over a virtual smoltcp IP network.
 
 #![cfg(feature = "portable-relay")]
+#![expect(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "the scripted three-node relay harness fails immediately when its fixed topology invariants break"
+)]
 
 extern crate alloc;
 

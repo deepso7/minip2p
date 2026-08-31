@@ -667,8 +667,12 @@ impl FloodsubAgent {
                     return true;
                 }
                 let take = room.min(data.len() - offset);
-                buf.extend_from_slice(&data[offset..offset + take]);
-                offset += take;
+                let end = offset + take;
+                let Some(chunk) = data.get(offset..end) else {
+                    return true;
+                };
+                buf.extend_from_slice(chunk);
+                offset = end;
             }
 
             // Decode behind a cursor and compact once per top-up: draining
@@ -714,7 +718,8 @@ impl FloodsubAgent {
         head: &mut usize,
     ) -> Option<Result<Vec<u8>, String>> {
         let buf = self.peers.get_mut(peer)?.inbound.get_mut(&stream_id)?;
-        match decode_frame(&buf[*head..]) {
+        let tail = buf.get(*head..)?;
+        match decode_frame(tail) {
             FrameDecode::Complete { payload, consumed } => {
                 let payload = payload.to_vec();
                 *head += consumed;

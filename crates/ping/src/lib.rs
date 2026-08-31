@@ -387,15 +387,22 @@ impl PingProtocol {
             );
         }
 
-        // Append data to the per-stream receive buffer.
-        {
-            let peer = self.peers.get_mut(peer_id).expect("peer exists");
-            let buf = peer.recv_bufs.entry(stream_id).or_default();
-            buf.extend_from_slice(data);
-        }
-
-        // Check buffer length (re-borrow to get the size).
-        let buf_len = self.peers[peer_id].recv_bufs[&stream_id].len();
+        // Append data to the per-stream receive buffer and retain its length
+        // while we hold the peer-state borrow.
+        let buf_len = match self.peers.get_mut(peer_id) {
+            Some(peer) => {
+                let buf = peer.recv_bufs.entry(stream_id).or_default();
+                buf.extend_from_slice(data);
+                buf.len()
+            }
+            None => {
+                return self.protocol_violation(
+                    peer_id,
+                    stream_id,
+                    "ping peer state disappeared while receiving data".into(),
+                );
+            }
+        };
 
         if buf_len > PING_PAYLOAD_LEN {
             if let Some(p) = self.peers.get_mut(peer_id) {
@@ -416,12 +423,32 @@ impl PingProtocol {
         }
 
         // Exactly PING_PAYLOAD_LEN bytes -- extract payload and drop the buffer.
-        let mut payload = [0u8; PING_PAYLOAD_LEN];
-        {
-            let peer = self.peers.get_mut(peer_id).expect("peer exists");
-            payload.copy_from_slice(&peer.recv_bufs[&stream_id]);
-            peer.recv_bufs.remove(&stream_id);
-        }
+        let received = match self.peers.get_mut(peer_id) {
+            Some(peer) => match peer.recv_bufs.remove(&stream_id) {
+                Some(received) => received,
+                None => {
+                    return self.protocol_violation(
+                        peer_id,
+                        stream_id,
+                        "ping receive buffer disappeared before processing".into(),
+                    );
+                }
+            },
+            None => {
+                return self.protocol_violation(
+                    peer_id,
+                    stream_id,
+                    "ping peer state disappeared before processing data".into(),
+                );
+            }
+        };
+        let Ok(payload) = received.try_into() else {
+            return self.protocol_violation(
+                peer_id,
+                stream_id,
+                "ping receive buffer changed size before processing".into(),
+            );
+        };
 
         self.process_complete_payload(peer_id, stream_id, payload, now_ms)
     }

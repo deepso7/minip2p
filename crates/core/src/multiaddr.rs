@@ -77,8 +77,12 @@ impl Multiaddr {
         }
 
         for idx in (0..=self.protocols.len() - suffix.protocols.len()).rev() {
-            if self.protocols[idx..idx + suffix.protocols.len()] == suffix.protocols {
-                return Some(Self::from_protocols(self.protocols[..idx].to_vec()));
+            let end = idx + suffix.protocols.len();
+            if self.protocols.get(idx..end) == Some(suffix.protocols.as_slice()) {
+                return self
+                    .protocols
+                    .get(..idx)
+                    .map(|protocols| Self::from_protocols(protocols.to_vec()));
             }
         }
 
@@ -172,7 +176,10 @@ impl Multiaddr {
         let mut protocols = Vec::new();
         let mut offset = 0;
         while offset < bytes.len() {
-            let (protocol, consumed) = Protocol::read_binary(&bytes[offset..])?;
+            let remaining = bytes.get(offset..).ok_or(MultiaddrError::Varint(
+                minip2p_identity::VarintError::BufferTooShort,
+            ))?;
+            let (protocol, consumed) = Protocol::read_binary(remaining)?;
             offset += consumed;
             protocols.push(protocol);
         }
@@ -223,15 +230,15 @@ impl<'a> IntoIterator for &'a Multiaddr {
 
 /// Checks if a protocol slice forms a valid QUIC transport (host + udp + quic-v1).
 pub(crate) fn is_quic_transport_slice(protocols: &[Protocol]) -> bool {
-    protocols.len() == 3
-        && protocols[0].is_host()
-        && matches!(protocols[1], Protocol::Udp(_))
-        && matches!(protocols[2], Protocol::QuicV1)
+    matches!(
+        protocols,
+        [host, Protocol::Udp(_), Protocol::QuicV1] if host.is_host()
+    )
 }
 
 /// Checks if a protocol slice forms a valid TCP transport (host + tcp).
 pub(crate) fn is_tcp_transport_slice(protocols: &[Protocol]) -> bool {
-    protocols.len() == 2 && protocols[0].is_host() && matches!(protocols[1], Protocol::Tcp(_))
+    matches!(protocols, [host, Protocol::Tcp(_)] if host.is_host())
 }
 
 /// Returns which transport can dial a protocol slice, if any.
@@ -268,7 +275,9 @@ fn parse_multiaddr(input: &str) -> Result<Multiaddr, MultiaddrError> {
     let mut idx = 1usize;
 
     while idx < segments.len() {
-        let protocol = segments[idx];
+        let Some(protocol) = segments.get(idx).copied() else {
+            break;
+        };
         if protocol.is_empty() {
             return Err(MultiaddrError::EmptyProtocol);
         }
@@ -284,12 +293,14 @@ fn parse_multiaddr(input: &str) -> Result<Multiaddr, MultiaddrError> {
             }
             "ip6" => {
                 let value = require_value(&segments, idx, "ip6")?;
-                let parsed = value
-                    .parse::<Ipv6Addr>()
-                    .map_err(|_| MultiaddrError::InvalidIp6 {
-                        value: value.to_string(),
-                    })?
-                    .octets();
+                let parsed = match value.parse::<Ipv6Addr>() {
+                    Ok(value) => value.octets(),
+                    Err(_) => {
+                        return Err(MultiaddrError::InvalidIp6 {
+                            value: value.to_string(),
+                        });
+                    }
+                };
                 protocols.push(Protocol::Ip6(parsed));
                 idx += 2;
             }
@@ -312,11 +323,14 @@ fn parse_multiaddr(input: &str) -> Result<Multiaddr, MultiaddrError> {
             }
             "tcp" | "udp" => {
                 let value = require_value(&segments, idx, protocol)?;
-                let parsed = value
-                    .parse::<u16>()
-                    .map_err(|_| MultiaddrError::InvalidPort {
-                        value: value.to_string(),
-                    })?;
+                let parsed = match value.parse::<u16>() {
+                    Ok(port) => port,
+                    Err(_) => {
+                        return Err(MultiaddrError::InvalidPort {
+                            value: value.to_string(),
+                        });
+                    }
+                };
                 protocols.push(if protocol == "tcp" {
                     Protocol::Tcp(parsed)
                 } else {
@@ -574,7 +588,7 @@ mod tests {
         }
 
         // Port 0 is a legal bind wildcard, so it must parse.
-        assert!(Multiaddr::from_str("/ip4/0.0.0.0/tcp/0").is_ok());
+        Multiaddr::from_str("/ip4/0.0.0.0/tcp/0").expect("port 0 must parse");
     }
 
     #[test]

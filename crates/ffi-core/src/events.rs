@@ -117,7 +117,6 @@ pub enum DriverFailureKind {
 
 /// Event delivered by the native endpoint driver.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(clippy::large_enum_variant)]
 pub enum P2pEvent {
     /// Native event carry overflow discarded source events.
     EventsDropped {

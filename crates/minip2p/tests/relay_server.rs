@@ -1,6 +1,10 @@
 //! Real std Endpoint relay-server integration coverage.
 
 #![cfg(all(feature = "relay-server", feature = "nat"))]
+#![expect(
+    clippy::unwrap_used,
+    reason = "the relay integration harness uses fixed local operations that must succeed"
+)]
 
 use std::sync::mpsc;
 use std::thread;

@@ -109,7 +109,14 @@ impl Prober {
             return;
         }
         let servers = &shared.config.autonat_servers;
-        let server = servers[self.server_idx % servers.len()].clone();
+        let server = servers
+            .get(
+                self.server_idx
+                    .checked_rem(servers.len())
+                    .expect("empty AutoNAT server lists return before scheduling"),
+            )
+            .expect("the checked AutoNAT server cursor is within the configured list")
+            .clone();
         let deadline = now.mono_ms + shared.config.probe_deadline_ms;
         let server_peer = server.peer_id().clone();
 
@@ -593,7 +600,14 @@ impl ReservationManager {
             self.state = ResState::Idle;
             return;
         }
-        let relay = relays[self.relay_idx % relays.len()].clone();
+        let relay = relays
+            .get(
+                self.relay_idx
+                    .checked_rem(relays.len())
+                    .expect("empty relay lists return before acquisition"),
+            )
+            .expect("the checked relay cursor is within the configured list")
+            .clone();
         let relay_peer = relay.peer_id().clone();
         let deadline = now.mono_ms + shared.config.relay_leg_deadline_ms;
 

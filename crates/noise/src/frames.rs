@@ -34,18 +34,11 @@ impl FrameDecoder {
 
     /// Returns the next complete frame payload, if one is buffered.
     pub fn next_frame(&mut self) -> Option<Vec<u8>> {
-        let available = self.buffer.len() - self.offset;
-        if available < 2 {
-            return None;
-        }
-        let len =
-            u16::from_be_bytes([self.buffer[self.offset], self.buffer[self.offset + 1]]) as usize;
-        if available < len + 2 {
-            return None;
-        }
-        let payload_start = self.offset + 2;
-        let payload = self.buffer[payload_start..payload_start + len].to_vec();
-        self.offset = payload_start + len;
+        let remaining = self.buffer.get(self.offset..)?;
+        let length: [u8; 2] = remaining.get(..2)?.try_into().ok()?;
+        let len = u16::from_be_bytes(length) as usize;
+        let payload = remaining.get(2..)?.get(..len)?.to_vec();
+        self.offset = self.offset.checked_add(2)?.checked_add(len)?;
         self.compact_if_needed();
         Some(payload)
     }
@@ -71,6 +64,10 @@ impl FrameDecoder {
 
 /// Encodes one Noise handshake or transport message.
 pub fn encode_frame(payload: &[u8]) -> Result<Vec<u8>, NoiseError> {
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "The conversion error has no detail beyond the payload length stored in NoiseError."
+    )]
     let len = u16::try_from(payload.len())
         .map_err(|_| NoiseError::FrameTooLarge { len: payload.len() })?;
     let mut out = Vec::with_capacity(payload.len() + 2);

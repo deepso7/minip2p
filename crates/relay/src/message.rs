@@ -261,8 +261,8 @@ fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, RelayMes
     if *idx >= input.len() {
         return Ok(None);
     }
-    let (tag_value, used) = read_uvarint(&input[*idx..])?;
-    *idx += used;
+    let (tag_value, used) = read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
+    advance(input, idx, used)?;
     let wire_type = (tag_value & 0x07) as u8;
     let field_number = tag_value >> 3;
     Ok(Some((field_number, wire_type)))
@@ -270,8 +270,12 @@ fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, RelayMes
 
 /// Reads a length-delimited value, advancing `idx` past the length and bytes.
 fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], RelayMessageError> {
-    let (length, used) = read_uvarint(&input[*idx..])?;
-    *idx += used;
+    let (length, used) = read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
+    advance(input, idx, used)?;
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "wire lengths wider than usize are reported as varint overflow"
+    )]
     let length = usize::try_from(length).map_err(|_| VarintError::Overflow)?;
     let remaining = input.len().saturating_sub(*idx);
     if length > remaining {
@@ -281,15 +285,28 @@ fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], 
             remaining,
         });
     }
-    let value = &input[*idx..*idx + length];
-    *idx += length;
+    let end = idx
+        .checked_add(length)
+        .ok_or(RelayMessageError::FieldOverflow {
+            offset: *idx,
+            length,
+            remaining,
+        })?;
+    let value = input
+        .get(*idx..end)
+        .ok_or(RelayMessageError::FieldOverflow {
+            offset: *idx,
+            length,
+            remaining,
+        })?;
+    *idx = end;
     Ok(value)
 }
 
 /// Reads a varint field value.
 fn read_varint_value(input: &[u8], idx: &mut usize) -> Result<u64, RelayMessageError> {
-    let (value, used) = read_uvarint(&input[*idx..])?;
-    *idx += used;
+    let (value, used) = read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
+    advance(input, idx, used)?;
     Ok(value)
 }
 
@@ -301,13 +318,17 @@ fn skip_unknown_field(
 ) -> Result<(), RelayMessageError> {
     match wire_type {
         WIRE_VARINT => {
-            let (_, used) = read_uvarint(&input[*idx..])?;
-            *idx += used;
-            Ok(())
+            let (_, used) = read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
+            advance(input, idx, used)
         }
         WIRE_LEN => {
-            let (length, used) = read_uvarint(&input[*idx..])?;
-            *idx += used;
+            let (length, used) =
+                read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
+            advance(input, idx, used)?;
+            #[expect(
+                clippy::map_err_ignore,
+                reason = "wire lengths wider than usize are reported as varint overflow"
+            )]
             let length = usize::try_from(length).map_err(|_| VarintError::Overflow)?;
             let remaining = input.len().saturating_sub(*idx);
             if length > remaining {
@@ -317,36 +338,29 @@ fn skip_unknown_field(
                     remaining,
                 });
             }
-            *idx += length;
-            Ok(())
+            advance(input, idx, length)
         }
-        WIRE_I32 => {
-            if *idx + 4 > input.len() {
-                return Err(RelayMessageError::FieldOverflow {
-                    offset: *idx,
-                    length: 4,
-                    remaining: input.len().saturating_sub(*idx),
-                });
-            }
-            *idx += 4;
-            Ok(())
-        }
-        WIRE_I64 => {
-            if *idx + 8 > input.len() {
-                return Err(RelayMessageError::FieldOverflow {
-                    offset: *idx,
-                    length: 8,
-                    remaining: input.len().saturating_sub(*idx),
-                });
-            }
-            *idx += 8;
-            Ok(())
-        }
+        WIRE_I32 => advance(input, idx, 4),
+        WIRE_I64 => advance(input, idx, 8),
         _ => Err(RelayMessageError::UnsupportedWireType {
             wire_type,
             offset: *idx,
         }),
     }
+}
+
+fn advance(input: &[u8], idx: &mut usize, length: usize) -> Result<(), RelayMessageError> {
+    let remaining = input.len().saturating_sub(*idx);
+    let end = idx
+        .checked_add(length)
+        .filter(|end| *end <= input.len())
+        .ok_or(RelayMessageError::FieldOverflow {
+            offset: *idx,
+            length,
+            remaining,
+        })?;
+    *idx = end;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

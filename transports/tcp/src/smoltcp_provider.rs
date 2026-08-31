@@ -470,7 +470,10 @@ impl<D: Device> SmoltcpTcpProvider<D> {
     /// Promotes listener sockets that caught a connection and refills the pool.
     fn harvest_listeners(&mut self) {
         for index in 0..self.listeners.len() {
-            let armed = core::mem::take(&mut self.listeners[index].armed);
+            let Some(listener) = self.listeners.get_mut(index) else {
+                continue;
+            };
+            let armed = core::mem::take(&mut listener.armed);
             let mut kept = Vec::with_capacity(armed.len());
             for inner in armed {
                 let state = self
@@ -501,7 +504,10 @@ impl<D: Device> SmoltcpTcpProvider<D> {
                     }
                 }
             }
-            self.listeners[index].armed = kept;
+            let Some(listener) = self.listeners.get_mut(index) else {
+                continue;
+            };
+            listener.armed = kept;
         }
     }
 
@@ -511,8 +517,15 @@ impl<D: Device> SmoltcpTcpProvider<D> {
     /// host's budget is the point of the ceiling, and the backlog refills on a
     /// later poll once something frees up.
     fn arm_listener(&mut self, index: usize) {
-        let endpoint = self.listeners[index].endpoint;
-        while self.listeners[index].armed.len() < self.config.backlog {
+        let Some(listener) = self.listeners.get(index) else {
+            return;
+        };
+        let endpoint = listener.endpoint;
+        while self
+            .listeners
+            .get(index)
+            .is_some_and(|listener| listener.armed.len() < self.config.backlog)
+        {
             let Ok(inner) = self.new_socket() else {
                 return;
             };
@@ -527,7 +540,10 @@ impl<D: Device> SmoltcpTcpProvider<D> {
                 self.stack.borrow_mut().sockets.remove(inner);
                 return;
             }
-            self.listeners[index].armed.push(inner);
+            let Some(listener) = self.listeners.get_mut(index) else {
+                return;
+            };
+            listener.armed.push(inner);
         }
     }
 
@@ -606,7 +622,10 @@ impl<D: Device> SmoltcpTcpProvider<D> {
             }
             self.ready.push_back(TcpEvent::Received {
                 socket: handle,
-                data: self.read_buffer[..taken].to_vec(),
+                data: match self.read_buffer.get(..taken) {
+                    Some(data) => data.to_vec(),
+                    None => break,
+                },
             });
         }
 
@@ -819,7 +838,11 @@ impl<D: Device> TcpProvider for SmoltcpTcpProvider<D> {
             armed: Vec::new(),
         });
         self.arm_listener(index);
-        if self.listeners[index].armed.is_empty() {
+        if self
+            .listeners
+            .get(index)
+            .is_none_or(|listener| listener.armed.is_empty())
+        {
             self.listeners.pop();
             self.release(drawn);
             return Err(TcpError::Exhausted {

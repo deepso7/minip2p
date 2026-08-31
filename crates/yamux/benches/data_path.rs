@@ -6,12 +6,17 @@ use minip2p_yamux::{FLAG_SYN, Frame, HEADER_LEN, YamuxOutput, YamuxRole, YamuxSe
 const PAYLOAD_LEN: usize = 64 * 1024;
 
 fn assert_payload_frame(output: YamuxOutput, payload: &[u8]) {
-    let YamuxOutput::Outbound(bytes) = output else {
-        panic!("expected outbound data frame");
-    };
-    assert_eq!(bytes.len(), HEADER_LEN + payload.len());
-    assert_eq!(bytes[1], 0, "frame type must be data");
-    assert_eq!(&bytes[HEADER_LEN..], payload);
+    match output {
+        YamuxOutput::Outbound(bytes) => {
+            assert_eq!(bytes.len(), HEADER_LEN + payload.len());
+            assert_eq!(bytes.get(1), Some(&0), "frame type must be data");
+            assert_eq!(bytes.get(HEADER_LEN..), Some(payload));
+        }
+        unexpected => assert!(
+            matches!(unexpected, YamuxOutput::Outbound(_)),
+            "expected outbound data frame"
+        ),
+    }
 }
 
 fn yamux_data_path(c: &mut Criterion) {

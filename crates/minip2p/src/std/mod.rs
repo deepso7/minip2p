@@ -48,19 +48,30 @@ mod relay_server;
 
 #[cfg(any(feature = "discovery", feature = "mdns"))]
 pub use discovery::DiscoveryError;
-#[allow(unused_imports)] // Only transport-less `std` builds leave this unused.
+#[cfg(any(
+    feature = "quic",
+    feature = "tcp",
+    feature = "nat",
+    feature = "relay-server"
+))]
 use minip2p_core::Multiaddr;
 #[cfg(any(feature = "tcp", feature = "relay-server"))]
 use minip2p_core::Protocol;
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use minip2p_core::TransportKind;
 use minip2p_core::{PeerAddr, PeerId};
+#[cfg(all(any(feature = "discovery", feature = "mdns"), feature = "smoltcp"))]
+#[expect(
+    unused_imports,
+    reason = "The portable mDNS build re-exports this std API type without using it internally."
+)]
+pub use minip2p_discovery::DiscoverySource;
+#[cfg(all(any(feature = "discovery", feature = "mdns"), not(feature = "smoltcp")))]
+pub use minip2p_discovery::DiscoverySource;
 #[cfg(feature = "discovery")]
 pub use minip2p_discovery::{BeaconConfig, DISCOVERY_TOPIC};
 #[cfg(any(feature = "discovery", feature = "mdns"))]
-pub use minip2p_discovery::{
-    DiscoveryConfigError, DiscoveryEvent, DiscoverySource, KnownPeer, PeerDiscoveryConfig,
-};
+pub use minip2p_discovery::{DiscoveryConfigError, DiscoveryEvent, KnownPeer, PeerDiscoveryConfig};
 pub use minip2p_identify::IdentifyMessage;
 pub use minip2p_identity::Ed25519Keypair;
 #[cfg(feature = "mdns")]
@@ -111,6 +122,50 @@ const DEFAULT_AGENT_VERSION: &str = "minip2p/0.1.0";
 const RELAY_HOP_PROTOCOL_ID: &str = "/libp2p/circuit/relay/0.2.0/hop";
 #[cfg(feature = "relay-server")]
 const RELAY_STOP_PROTOCOL_ID: &str = "/libp2p/circuit/relay/0.2.0/stop";
+
+/// Relay announce-address validation failure while building an endpoint.
+#[cfg(feature = "relay-server")]
+#[derive(Debug)]
+pub enum RelayServerAnnounceError {
+    /// The temporary validator could not be constructed from its configuration.
+    Config(RelayServerConfigError),
+    /// An announce address is invalid for the relay identity.
+    Address(RelayServerAddressError),
+}
+
+#[cfg(feature = "relay-server")]
+impl From<RelayServerConfigError> for RelayServerAnnounceError {
+    fn from(error: RelayServerConfigError) -> Self {
+        Self::Config(error)
+    }
+}
+
+#[cfg(feature = "relay-server")]
+impl From<RelayServerAddressError> for RelayServerAnnounceError {
+    fn from(error: RelayServerAddressError) -> Self {
+        Self::Address(error)
+    }
+}
+
+#[cfg(feature = "relay-server")]
+impl core::fmt::Display for RelayServerAnnounceError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Config(error) => error.fmt(formatter),
+            Self::Address(error) => error.fmt(formatter),
+        }
+    }
+}
+
+#[cfg(feature = "relay-server")]
+impl std::error::Error for RelayServerAnnounceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(error) => Some(error),
+            Self::Address(error) => Some(error),
+        }
+    }
+}
 
 /// Synchronous relay-server runtime control failure.
 #[cfg(feature = "relay-server")]
@@ -208,7 +263,10 @@ pub struct Endpoint {
 
 /// Why one [`Endpoint::next_wake`] call returned.
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)] // Preserve Event ownership without a heap allocation.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Event ownership avoids a heap allocation on every application wake."
+)]
 #[must_use = "handle the wake reason and drain every non-empty agent queue after DriverProgress"]
 pub enum EndpointWake {
     /// An application event not owned by an active agent.
@@ -234,9 +292,13 @@ pub enum EndpointWake {
 
 /// Why one driver-aware swarm-driving step returned.
 #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-enum DriverPollKind {
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Application events stay owned so waits avoid a heap allocation."
+)]
+enum DriverPoll {
     /// An event not owned by any agent is ready for the application.
-    Application,
+    Application(Event),
     /// An agent produced application-visible output; focused waits should
     /// re-check their queue immediately.
     Progress,
@@ -247,39 +309,21 @@ enum DriverPollKind {
 }
 
 #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-struct DriverPoll {
-    kind: DriverPollKind,
-    event: Option<Event>,
-}
-
-#[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
 impl DriverPoll {
     fn application(event: Event) -> Self {
-        Self {
-            kind: DriverPollKind::Application,
-            event: Some(event),
-        }
+        Self::Application(event)
     }
 
     fn progress() -> Self {
-        Self {
-            kind: DriverPollKind::Progress,
-            event: None,
-        }
+        Self::Progress
     }
 
     fn deadline() -> Self {
-        Self {
-            kind: DriverPollKind::Deadline,
-            event: None,
-        }
+        Self::Deadline
     }
 
     fn interrupted() -> Self {
-        Self {
-            kind: DriverPollKind::Interrupted,
-            event: None,
-        }
+        Self::Interrupted
     }
 }
 
@@ -496,11 +540,11 @@ impl Endpoint {
     /// already buffered by the endpoint and suppresses later data, EOF, and
     /// close events for the stream. Repeated calls are idempotent.
     pub fn abandon_stream(&mut self, peer_id: &PeerId, stream_id: StreamId) -> Result<(), Error> {
-        let result = self.swarm.abandon_stream(peer_id, stream_id);
+        self.swarm.abandon_stream(peer_id, stream_id)?;
         #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
         self.pending_events
             .retain(|event| !event.matches_stream(peer_id, stream_id));
-        result
+        Ok(())
     }
 
     /// Polls the endpoint once and returns all currently available events.
@@ -573,13 +617,11 @@ impl Endpoint {
             }
             let mut expired_poll_used = false;
             let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
-            return Ok(match poll.kind {
-                DriverPollKind::Application => {
-                    EndpointWake::Event(poll.event.expect("application poll carries event"))
-                }
-                DriverPollKind::Progress => EndpointWake::DriverProgress,
-                DriverPollKind::Interrupted => EndpointWake::Interrupted,
-                DriverPollKind::Deadline => EndpointWake::Deadline,
+            return Ok(match poll {
+                DriverPoll::Application(event) => EndpointWake::Event(event),
+                DriverPoll::Progress => EndpointWake::DriverProgress,
+                DriverPoll::Interrupted => EndpointWake::Interrupted,
+                DriverPoll::Deadline => EndpointWake::Deadline,
             });
         }
         self.swarm
@@ -758,11 +800,11 @@ impl Endpoint {
         let mut expired_poll_used = false;
         loop {
             let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
-            match poll.kind {
-                DriverPollKind::Application => return Ok(poll.event),
-                DriverPollKind::Progress => {}
-                DriverPollKind::Interrupted => {}
-                DriverPollKind::Deadline => return Ok(None),
+            match poll {
+                DriverPoll::Application(event) => return Ok(Some(event)),
+                DriverPoll::Progress => {}
+                DriverPoll::Interrupted => {}
+                DriverPoll::Deadline => return Ok(None),
             }
         }
     }
@@ -942,11 +984,8 @@ impl Endpoint {
                         event,
                         NatEvent::PathEstablished { connect_id, .. } if *connect_id == id
                     )
-                }) {
-                    let Some(NatEvent::PathEstablished { path, .. }) = nat.events.remove(index)
-                    else {
-                        unreachable!("position matched PathEstablished");
-                    };
+                }) && let Some(NatEvent::PathEstablished { path, .. }) = nat.events.remove(index)
+                {
                     return Ok(Some(path));
                 }
                 if nat.events.iter().any(|event| {
@@ -960,13 +999,11 @@ impl Endpoint {
             }
             self.ensure_pending_event_capacity()?;
             let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
-            match poll.kind {
-                DriverPollKind::Application => self
-                    .pending_events
-                    .push_back(poll.event.expect("application poll carries event")),
-                DriverPollKind::Progress => {}
-                DriverPollKind::Interrupted => {}
-                DriverPollKind::Deadline => return Ok(None),
+            match poll {
+                DriverPoll::Application(event) => self.pending_events.push_back(event),
+                DriverPoll::Progress => {}
+                DriverPoll::Interrupted => {}
+                DriverPoll::Deadline => return Ok(None),
             }
         }
     }
@@ -976,7 +1013,10 @@ impl Endpoint {
     /// Existing reservations and circuits remain active, and HOP remains
     /// advertised while admission is paused.
     #[cfg(feature = "relay-server")]
-    #[allow(clippy::result_large_err)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "The error retains the rejected address for actionable host diagnostics."
+    )]
     pub fn set_relay_server_accepting(
         &mut self,
         accepting: bool,
@@ -997,7 +1037,10 @@ impl Endpoint {
     /// remains active. An empty replacement clears the override, restoring the
     /// confirmed-NAT-then-concrete-listener fallback order.
     #[cfg(feature = "relay-server")]
-    #[allow(clippy::result_large_err)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "The error retains the rejected address for actionable host diagnostics."
+    )]
     pub fn set_relay_server_announce_addrs(
         &mut self,
         addrs: Vec<Multiaddr>,
@@ -1052,12 +1095,10 @@ impl Endpoint {
             }
             self.ensure_pending_event_capacity()?;
             let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
-            match poll.kind {
-                DriverPollKind::Application => self
-                    .pending_events
-                    .push_back(poll.event.expect("application poll carries event")),
-                DriverPollKind::Progress | DriverPollKind::Interrupted => {}
-                DriverPollKind::Deadline => return Ok(None),
+            match poll {
+                DriverPoll::Application(event) => self.pending_events.push_back(event),
+                DriverPoll::Progress | DriverPoll::Interrupted => {}
+                DriverPoll::Deadline => return Ok(None),
             }
         }
     }
@@ -1077,9 +1118,13 @@ impl Endpoint {
                 .map(nat::NatDriver::confirmed_public_addrs)
                 .unwrap_or_default();
             if let Some(relay_server) = self.relay_server.as_mut() {
-                let _ = relay_server.agent.set_listener_addrs(listeners);
+                // The address source comes from local bound listeners; on
+                // rejection the agent deliberately keeps its previous source.
+                drop(relay_server.agent.set_listener_addrs(listeners));
                 #[cfg(feature = "nat")]
-                let _ = relay_server.agent.set_confirmed_addrs(confirmed);
+                // Confirmed addresses were already accepted by the NAT agent;
+                // retain the previous relay source if conversion rejects one.
+                drop(relay_server.agent.set_confirmed_addrs(confirmed));
             }
         }
         let mut addresses = self.caller_external_addresses.clone();
@@ -1133,13 +1178,11 @@ impl Endpoint {
             }
             self.ensure_pending_event_capacity()?;
             let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
-            match poll.kind {
-                DriverPollKind::Application => self
-                    .pending_events
-                    .push_back(poll.event.expect("application poll carries event")),
-                DriverPollKind::Progress => {}
-                DriverPollKind::Interrupted => {}
-                DriverPollKind::Deadline => return Ok(None),
+            match poll {
+                DriverPoll::Application(event) => self.pending_events.push_back(event),
+                DriverPoll::Progress => {}
+                DriverPoll::Interrupted => {}
+                DriverPoll::Deadline => return Ok(None),
             }
         }
     }
@@ -1163,17 +1206,16 @@ impl Endpoint {
         loop {
             self.ensure_pending_event_capacity()?;
             let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
-            match poll.kind {
-                DriverPollKind::Application => {
-                    let event = poll.event.expect("application poll carries event");
+            match poll {
+                DriverPoll::Application(event) => {
                     if predicate(&event) {
                         return Ok(Some(event));
                     }
                     self.pending_events.push_back(event);
                 }
-                DriverPollKind::Progress => {}
-                DriverPollKind::Interrupted => {}
-                DriverPollKind::Deadline => return Ok(None),
+                DriverPoll::Progress => {}
+                DriverPoll::Interrupted => {}
+                DriverPoll::Deadline => return Ok(None),
             }
         }
     }
@@ -1297,13 +1339,11 @@ impl Endpoint {
             }
             self.ensure_pending_event_capacity()?;
             let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
-            match poll.kind {
-                DriverPollKind::Application => self
-                    .pending_events
-                    .push_back(poll.event.expect("application poll carries event")),
-                DriverPollKind::Progress => {}
-                DriverPollKind::Interrupted => {}
-                DriverPollKind::Deadline => return Ok(None),
+            match poll {
+                DriverPoll::Application(event) => self.pending_events.push_back(event),
+                DriverPoll::Progress => {}
+                DriverPoll::Interrupted => {}
+                DriverPoll::Deadline => return Ok(None),
             }
         }
     }
@@ -1365,13 +1405,11 @@ impl Endpoint {
             }
             self.ensure_pending_event_capacity()?;
             let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
-            match poll.kind {
-                DriverPollKind::Application => self
-                    .pending_events
-                    .push_back(poll.event.expect("application poll carries event")),
-                DriverPollKind::Progress => {}
-                DriverPollKind::Interrupted => {}
-                DriverPollKind::Deadline => return Ok(None),
+            match poll {
+                DriverPoll::Application(event) => self.pending_events.push_back(event),
+                DriverPoll::Progress => {}
+                DriverPoll::Interrupted => {}
+                DriverPoll::Deadline => return Ok(None),
             }
         }
     }
@@ -1478,7 +1516,8 @@ impl Endpoint {
 
 impl Drop for Endpoint {
     fn drop(&mut self) {
-        let _ = self.disconnect_established();
+        // Drop cannot surface disconnect failures; transports own final cleanup.
+        drop(self.disconnect_established());
     }
 }
 
@@ -1495,16 +1534,16 @@ fn mdns_seed(keypair: &Ed25519Keypair) -> [u8; 32] {
     let mut seed = [0u8; 32];
     let peer_id = keypair.peer_id();
     let digest = peer_id.digest_bytes();
-    for (index, byte) in digest.iter().enumerate() {
-        seed[index % seed.len()] ^= *byte;
+    for (slot, byte) in seed.iter_mut().zip(digest.iter().cycle()) {
+        *slot ^= *byte;
     }
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0)
         .to_le_bytes();
-    for (index, byte) in seed.iter_mut().enumerate() {
-        *byte ^= timestamp[index % timestamp.len()];
+    for (slot, byte) in seed.iter_mut().zip(timestamp.iter().cycle()) {
+        *slot ^= *byte;
     }
     seed
 }
@@ -1514,6 +1553,7 @@ fn mdns_seed(keypair: &Ed25519Keypair) -> [u8; 32] {
 /// Held as a request rather than a socket so nothing is allocated until the
 /// configuration has been validated: a builder that failed after binding would
 /// leave a port taken by an endpoint that never existed.
+#[cfg(any(feature = "quic", feature = "tcp"))]
 enum Bind {
     #[cfg(feature = "quic")]
     Quic(QuicBind),
@@ -1543,6 +1583,7 @@ pub struct EndpointBuilder {
     quic_limits: QuicLimits,
     #[cfg(feature = "tcp")]
     tcp_config: TcpConfig,
+    #[cfg(any(feature = "quic", feature = "tcp"))]
     binds: Vec<Bind>,
     protocols: Vec<String>,
     #[cfg(feature = "relay-server")]
@@ -1574,6 +1615,7 @@ impl Default for EndpointBuilder {
             quic_limits: QuicLimits::default(),
             #[cfg(feature = "tcp")]
             tcp_config: TcpConfig::default(),
+            #[cfg(any(feature = "quic", feature = "tcp"))]
             binds: Vec::new(),
             protocols: Vec::new(),
             #[cfg(feature = "relay-server")]
@@ -1606,6 +1648,7 @@ struct BuilderParts {
     quic_limits: QuicLimits,
     #[cfg(feature = "tcp")]
     tcp_config: TcpConfig,
+    #[cfg(any(feature = "quic", feature = "tcp"))]
     binds: Vec<Bind>,
     protocols: Vec<String>,
     #[cfg(feature = "relay-server")]
@@ -1746,17 +1789,20 @@ impl EndpointBuilder {
     ///
     /// This method validates direct TCP/QUIC shape, rejects wildcard and circuit
     /// addresses, and checks a trailing peer id against an already-fixed builder
-    /// identity. The indexed [`RelayServerAddressError`] identifies the rejected
-    /// input and reason. When identity is not fixed yet, the peer-id match is
+    /// identity. [`RelayServerAnnounceError`] preserves either the rejected input
+    /// or a validator configuration failure. When identity is not fixed yet, the peer-id match is
     /// checked again at bind. Announce addresses alone do not enable the service;
     /// also call [`EndpointBuilder::relay_server`] or
     /// [`EndpointBuilder::relay_server_config`].
     #[cfg(feature = "relay-server")]
-    #[allow(clippy::result_large_err)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "The error owns the rejected announce address for actionable host diagnostics."
+    )]
     pub fn relay_server_announce_addrs(
         mut self,
         addrs: Vec<Multiaddr>,
-    ) -> Result<Self, RelayServerAddressError> {
+    ) -> Result<Self, RelayServerAnnounceError> {
         let validation_peer = self
             .keypair
             .as_ref()
@@ -1773,8 +1819,7 @@ impl EndpointBuilder {
         let mut validator = minip2p_relay_server::RelayServerAgent::new(
             validation_peer,
             RelayServerConfig::default(),
-        )
-        .expect("default relay-server configuration is valid");
+        )?;
         validator.replace_announce_addrs(addrs.clone())?;
         self.relay_server_announce_addrs = addrs;
         Ok(self)
@@ -1992,6 +2037,7 @@ impl EndpointBuilder {
             quic_limits: self.quic_limits,
             #[cfg(feature = "tcp")]
             tcp_config: self.tcp_config,
+            #[cfg(any(feature = "quic", feature = "tcp"))]
             binds: self.binds,
             protocols: self.protocols,
             #[cfg(feature = "relay-server")]
@@ -2077,17 +2123,24 @@ fn tcp_addrs_of(resolved: impl IntoIterator<Item = std::net::SocketAddr>) -> Vec
 /// each: a transport claims an address shape rather than an address family, so
 /// two of them would be two claims on one shape -- and a host asking for IPv4
 /// and IPv6 is asking for two sockets, not two transports.
-fn bind_transports(parts: &BuilderParts) -> Result<TransportSet, Error> {
-    #[allow(unused_mut)] // No member can be inserted in a std-only feature build.
+fn bind_transports(_parts: &BuilderParts) -> Result<TransportSet, Error> {
+    #[cfg(any(feature = "quic", feature = "tcp"))]
+    let mut set = TransportSet::new();
+    #[cfg(not(any(feature = "quic", feature = "tcp")))]
+    #[expect(
+        unused_mut,
+        reason = "Transport-less std builds keep this shared construction path without inserts."
+    )]
     let mut set = TransportSet::new();
     #[cfg(feature = "tcp")]
     let mut tcp_bound = false;
-    for bind in &parts.binds {
+    #[cfg(any(feature = "quic", feature = "tcp"))]
+    for bind in &_parts.binds {
         match bind {
             #[cfg(feature = "quic")]
             Bind::Quic(spec) => {
-                let config = QuicNodeConfig::new(parts.keypair.clone())
-                    .with_limits(parts.quic_limits.clone());
+                let config = QuicNodeConfig::new(_parts.keypair.clone())
+                    .with_limits(_parts.quic_limits.clone());
                 let transport = match spec {
                     QuicBind::Addr(addr) => QuicEndpoint::bind(config, addr)?,
                     QuicBind::Multiaddr(addr) => QuicEndpoint::bind_multiaddr(config, addr)?,
@@ -2107,12 +2160,10 @@ fn bind_transports(parts: &BuilderParts) -> Result<TransportSet, Error> {
             #[cfg(feature = "tcp")]
             Bind::Tcp(_) => {
                 tcp_bound = true;
-                let transport = bind_tcp_member(parts)?;
+                let transport = bind_tcp_member(_parts)?;
                 let namespace = transport.namespace();
                 insert_member(&mut set, TransportKind::Tcp, [namespace], transport)?;
             }
-            #[cfg(not(any(feature = "quic", feature = "tcp")))]
-            _ => unreachable!("Bind has no constructible variants without a transport feature"),
         }
     }
     if set.is_empty() {
@@ -2228,8 +2279,10 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
     }
     #[cfg(feature = "nat")]
     let transport = minip2p_circuit::CircuitTransport::new_os(transport, parts.keypair.clone());
-    #[allow(unused_mut)] // Mutated only by feature-gated composed services.
+    #[cfg(any(feature = "nat", feature = "relay-server"))]
     let mut swarm = builder.build(transport)?;
+    #[cfg(not(any(feature = "nat", feature = "relay-server")))]
+    let swarm = builder.build(transport)?;
     #[cfg(feature = "relay-server")]
     if parts.relay_server_config.is_some() {
         swarm.add_inbound_protocol(RELAY_HOP_PROTOCOL_ID)?;
@@ -2319,6 +2372,10 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
     let mut pubsub = pubsub;
     #[cfg(feature = "discovery")]
     if let (Some(pubsub), Some(config)) = (pubsub.as_mut(), discovery_config.as_ref()) {
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "Both agents validate the shared topic before construction, so this exposes a stable invariant."
+        )]
         pubsub
             .agent
             .subscribe(&config.topic, 0)
@@ -2327,6 +2384,10 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
             })?;
     }
     #[cfg(feature = "discovery")]
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "The builder validated this beacon configuration before creating the agent."
+    )]
     let beacon = match discovery_config {
         Some(config) => Some(
             minip2p_discovery::BeaconAgent::new(parts.keypair.public_key(), config).map_err(
@@ -2378,6 +2439,10 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
         }
     };
     #[cfg(any(feature = "discovery", feature = "mdns"))]
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "The shared discovery policy was validated before the endpoint reached this point."
+    )]
     let discovery = if discovery_enabled {
         let book = minip2p_discovery::PeerDiscoveryAgent::new(
             parts.keypair.peer_id(),
@@ -2469,7 +2534,8 @@ mod tests {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
             if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
+                // A test panic in the driver must not panic again while unwinding.
+                drop(thread.join());
             }
         }
     }
@@ -2481,6 +2547,10 @@ mod tests {
     /// them, so taking whatever arrives next is a race rather than an
     /// assertion.
     #[cfg(feature = "tcp")]
+    #[expect(
+        clippy::panic,
+        reason = "A timed-out test must include the unexpected event trace."
+    )]
     fn wait_for(
         endpoint: &mut Endpoint,
         what: &str,
@@ -2504,6 +2574,10 @@ mod tests {
     }
 
     #[cfg(feature = "tcp")]
+    #[expect(
+        clippy::panic,
+        reason = "A malformed fixture address is a test setup failure."
+    )]
     fn tcp_port(addr: &PeerAddr) -> u16 {
         match addr.transport().protocols() {
             [_, Protocol::Tcp(port)] => *port,
@@ -2717,7 +2791,7 @@ mod tests {
                 |event| matches!(event, Event::ConnectionEstablished { peer_id, .. } if peer_id == addr.peer_id()),
             );
             let Event::ConnectionEstablished { conn_id, .. } = event else {
-                unreachable!("the predicate matched a connection")
+                panic!("the connection predicate returned an unrelated event")
             };
             assert_eq!(
                 conn_id.namespace(),
@@ -3402,7 +3476,10 @@ mod tests {
         let wildcard = "/ip4/0.0.0.0/tcp/4001".parse().unwrap();
         let error = match Endpoint::builder().relay_server_announce_addrs(vec![wildcard]) {
             Ok(_) => panic!("wildcards are not announceable"),
-            Err(error) => error,
+            Err(RelayServerAnnounceError::Address(error)) => error,
+            Err(RelayServerAnnounceError::Config(error)) => {
+                panic!("default validator configuration is valid: {error}")
+            }
         };
         assert_eq!(error.index, 0);
         assert_eq!(error.reason, RelayServerAddressErrorKind::Wildcard);
@@ -3421,7 +3498,10 @@ mod tests {
             .relay_server_announce_addrs(vec![address])
         {
             Ok(_) => panic!("conflicting peer id must fail immediately"),
-            Err(error) => error,
+            Err(RelayServerAnnounceError::Address(error)) => error,
+            Err(RelayServerAnnounceError::Config(error)) => {
+                panic!("default validator configuration is valid: {error}")
+            }
         };
         assert!(matches!(
             error.reason,

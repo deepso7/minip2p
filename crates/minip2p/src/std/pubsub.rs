@@ -138,10 +138,16 @@ impl PubsubDriver {
             // send deadline / close machinery: the frame may well have
             // been delivered, so failing the work here could double-report.
             PubsubAction::CloseStreamWrite { peer, stream_id } => {
-                let _ = swarm.close_stream_write(&peer, stream_id);
+                match swarm.close_stream_write(&peer, stream_id) {
+                    Ok(()) | Err(_) => {}
+                }
             }
             PubsubAction::ResetStream { peer, stream_id } => {
-                let _ = swarm.reset_stream(&peer, stream_id);
+                // A reset races ordinary teardown, so an already-closed
+                // stream is successful cleanup rather than a second error.
+                match swarm.reset_stream(&peer, stream_id) {
+                    Ok(()) | Err(_) => {}
+                }
             }
         }
     }

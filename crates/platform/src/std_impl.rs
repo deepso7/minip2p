@@ -142,7 +142,11 @@ mod tests {
         let mut shared = StdClock::with_epoch(epoch);
         // An epoch further in the past must read as further along the
         // timeline, by exactly the offset between the two epochs.
-        let mut older = StdClock::with_epoch(epoch - Duration::from_millis(OFFSET_MS));
+        let mut older = StdClock::with_epoch(
+            epoch
+                .checked_sub(Duration::from_millis(OFFSET_MS))
+                .expect("fresh instant must be at least OFFSET_MS after its origin"),
+        );
 
         let from_shared = shared.now().monotonic_ms;
         let from_older = older.now().monotonic_ms;

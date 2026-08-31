@@ -85,7 +85,8 @@ fn drive<A: EntropySource, B: EntropySource>(
             return (a_events, b_events);
         }
     }
-    panic!("the virtual link never went quiet");
+    assert!(net.is_quiet(), "the virtual link never went quiet");
+    (a_events, b_events)
 }
 
 /// A listener and a dialer, driven until the upgrade completes.

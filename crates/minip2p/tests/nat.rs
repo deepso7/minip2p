@@ -146,7 +146,9 @@ fn wait_peer_ready_drives_nat_agent() {
             if remote_stop.try_recv().is_ok() {
                 break;
             }
-            let _ = b.next_event(Duration::from_millis(10));
+            match b.next_event(Duration::from_millis(10)) {
+                Ok(_) | Err(_) => {}
+            }
         }
     });
 
@@ -169,7 +171,9 @@ fn wait_peer_ready_drives_nat_agent() {
         }),
         "wait_peer_ready must deliver ConnectionEstablished to NAT: {events:?}"
     );
-    let _ = stop_remote.send(());
+    match stop_remote.send(()) {
+        Ok(()) | Err(_) => {}
+    }
     remote.join().expect("remote driver thread");
 }
 

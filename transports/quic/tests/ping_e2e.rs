@@ -99,6 +99,10 @@ fn multistream_receive(
     outputs
 }
 
+#[expect(
+    clippy::panic,
+    reason = "the test must stop at the exact protocol violation that it observes"
+)]
 fn assert_no_protocol_violations(events: &[PingEvent]) {
     for event in events {
         if let PingEvent::ProtocolViolation {
@@ -129,6 +133,10 @@ struct PingHarness {
 
 impl PingHarness {
     /// Create a connected, verified, and multistream-negotiated ping pair.
+    #[expect(
+        clippy::panic,
+        reason = "setup must stop immediately if mandatory multistream negotiation fails"
+    )]
     fn new(client_conn_id_raw: u64) -> Self {
         let (mut server, mut client, peer_addr) = setup_pair();
 
@@ -288,7 +296,11 @@ impl PingHarness {
     }
 
     /// Process server-side transport events (negotiation + ping echo).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::panic,
+        reason = "the test dispatcher keeps its complete mutable harness state explicit"
+    )]
     fn handle_server_events(
         events: &[TransportEvent],
         server: &mut QuicTransport,

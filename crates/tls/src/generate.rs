@@ -132,6 +132,10 @@ fn encode_signed_key(public_key: &[u8], signature: &[u8]) -> Result<Vec<u8>, der
     let mut buf = Vec::new();
     // SEQUENCE tag + length (DER encoding)
     buf.push(0x30);
+    #[expect(
+        clippy::map_err_ignore,
+        reason = "DER length conversion failures intentionally use the sequence value error"
+    )]
     let len_val = usize::try_from(content_len).map_err(|_| der::Tag::Sequence.value_error())?;
     if len_val < 128 {
         buf.push(len_val as u8);
@@ -147,6 +151,10 @@ fn encode_signed_key(public_key: &[u8], signature: &[u8]) -> Result<Vec<u8>, der
     // Encode the two OCTET STRINGs into the remaining space.
     let offset = buf.len();
     buf.resize(offset + len_val, 0);
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "offset is captured from buf before resizing it to offset + len_val"
+    )]
     let mut writer = der::SliceWriter::new(&mut buf[offset..]);
     pk.encode(&mut writer)?;
     sig.encode(&mut writer)?;

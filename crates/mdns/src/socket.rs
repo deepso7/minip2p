@@ -153,7 +153,9 @@ impl MdnsIo for MdnsSockets {
         // budget's worth of times per tick.
         for step in 0..count {
             let index = (self.next_receive_offset + step) % count;
-            let pair = &mut self.pairs[index];
+            let Some(pair) = self.pairs.get_mut(index) else {
+                continue;
+            };
             match pair.receive.recv_from(buffer) {
                 Ok((len, from)) => {
                     self.next_receive_offset = (index + 1) % count;
