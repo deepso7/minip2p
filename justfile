@@ -138,6 +138,7 @@ bindings-android:
     cd bindings/ts && pnpm rn:android
 
 bench:
+    python3 scripts/bench_results.py start --output target/bench-results/criterion-start
     cargo bench -p minip2p-core --bench multiaddr
     cargo bench -p minip2p-yamux --bench data_path
     cargo bench -p minip2p-discovery --bench peer_book
@@ -146,7 +147,7 @@ bench:
     cargo bench -p minip2p-quic --bench idle_poll
     cargo bench -p minip2p-tcp --bench readiness_poll
     cargo bench -p minip2p-rs --features tcp --bench endpoint_e2e
-    python3 scripts/bench_results.py criterion --output target/bench-results/rust-wall.json --git-sha "$(git rev-parse HEAD)"
+    python3 scripts/bench_results.py criterion --since target/bench-results/criterion-start --output target/bench-results/rust-wall.json --git-sha "$(git rev-parse HEAD)"
 
 bench-ir:
     GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-core --bench multiaddr_ir

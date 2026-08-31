@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -37,6 +38,14 @@ class BenchResultsTest(unittest.TestCase):
         self.assertTrue(all(row.classification == "unclassified" for row in rows if row.tier == "rust-micro"))
         self.assertEqual(next(row for row in rows if row.tier == "rust-wall").classification, "changed")
 
+    def test_missing_current_row_is_unclassified(self):
+        current = {**self.current, "rows": self.current["rows"][:-1]}
+        baseline = {**self.baseline, "rows": [*self.baseline["rows"], self.current["rows"][-1]]}
+        row = next(row for row in bench_results.compare_rows(current, baseline, None) if row.name == "node/missing")
+        self.assertIsNone(row.current)
+        self.assertEqual(row.classification, "unclassified")
+        self.assertEqual(row.reason, "missing current row")
+
     def test_merge_writes_valid_schema(self):
         with tempfile.TemporaryDirectory() as directory:
             first = Path(directory) / "first.json"
@@ -47,6 +56,28 @@ class BenchResultsTest(unittest.TestCase):
             bench_results.merge([first, second], output, None)
             merged = bench_results.validate(json.loads(output.read_text()))
             self.assertEqual(len(merged["rows"]), 4)
+
+    def test_criterion_collector_requires_fresh_complete_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "criterion"
+            marker = Path(directory) / "started"
+            output = Path(directory) / "results.json"
+            stale = root / "removed/benchmark/new/estimates.json"
+            stale.parent.mkdir(parents=True)
+            stale.write_text(json.dumps({"median": {"point_estimate": 1}}))
+            os.utime(stale, ns=(1, 1))
+            marker.touch()
+            for name in bench_results.EXPECTED_CRITERION:
+                estimate = root.joinpath(*name.split("/"), "new", "estimates.json")
+                estimate.parent.mkdir(parents=True)
+                estimate.write_text(json.dumps({"median": {"point_estimate": 10}}))
+            bench_results.collect_criterion(root, output, "sha", marker)
+            self.assertEqual(len(json.loads(output.read_text())["rows"]), 28)
+
+            missing = next(iter(bench_results.EXPECTED_CRITERION))
+            root.joinpath(*missing.split("/"), "new", "estimates.json").unlink()
+            with self.assertRaisesRegex(bench_results.BenchError, "row set mismatch"):
+                bench_results.collect_criterion(root, output, "sha", marker)
 
     def test_renderer_has_locked_layout(self):
         rows = bench_results.compare_rows(self.current, self.baseline, None)

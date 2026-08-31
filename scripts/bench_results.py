@@ -16,6 +16,18 @@ from typing import Any, Iterable
 SCHEMA_VERSION = 1
 TIERS = ("rust-micro", "rust-wall", "node-ffi")
 METRICS = {"rust-micro": "Ir", "rust-wall": "median_ns", "node-ffi": "median_ns"}
+EXPECTED_CRITERION = {
+    "multiaddr/parse_text", "multiaddr/encode_binary", "multiaddr/decode_binary",
+    "yamux/64KiB/session_send_and_drain", "yamux/64KiB/session_receive_and_drain",
+    "peer_book_128_peers_16_addrs/tick_active", "peer_book_128_peers_16_addrs/tick_expire",
+    "peer_book_128_peers_16_addrs/next_timeout", "pubsub/floodsub_publish_32x60KiB",
+    "relay_handle_event_same_now_128_pending_hops",
+    "quic/idle_poll/1", "quic/idle_poll/64", "quic/idle_poll/256", "quic/idle_poll/512",
+    "tcp/readiness_poll/1", "tcp/readiness_poll/64", "tcp/readiness_poll/256", "tcp/readiness_poll/512",
+    "e2e/tcp/setup", "e2e/tcp/ping", "e2e/tcp/echo_64b", "e2e/tcp/echo_64b_crossed_4x4",
+    "e2e/tcp/transfer_1mib", "e2e/quic/setup", "e2e/quic/ping", "e2e/quic/echo_64b",
+    "e2e/quic/echo_64b_crossed_4x4", "e2e/quic/transfer_1mib",
+}
 
 
 class BenchError(ValueError):
@@ -76,17 +88,26 @@ def merge(inputs: list[Path], output: Path, git_sha: str | None) -> None:
     write_results(git_sha, (row for document in documents for row in document["rows"]), output)
 
 
-def collect_criterion(root: Path, output: Path, git_sha: str) -> None:
+def collect_criterion(root: Path, output: Path, git_sha: str, since: Path) -> None:
+    try:
+        started_at = since.stat().st_mtime_ns
+    except OSError as error:
+        raise BenchError(f"cannot read Criterion run marker {since}: {error}") from error
     rows = []
     for estimate in root.glob("**/new/estimates.json"):
+        if estimate.stat().st_mtime_ns < started_at:
+            continue
         relative = estimate.relative_to(root)
         name = "/".join(relative.parts[:-2])
         point = load_json(estimate).get("median", {}).get("point_estimate")
         if point is None:
             raise BenchError(f"missing median.point_estimate in {estimate}")
         rows.append({"tier": "rust-wall", "name": name, "metric": "median_ns", "value": point})
-    if not rows:
-        raise BenchError(f"no Criterion estimates found under {root}")
+    names = {row["name"] for row in rows}
+    if names != EXPECTED_CRITERION:
+        missing = sorted(EXPECTED_CRITERION - names)
+        unexpected = sorted(names - EXPECTED_CRITERION)
+        raise BenchError(f"Criterion row set mismatch; missing={missing}, unexpected={unexpected}")
     write_results(git_sha, rows, output)
 
 
@@ -171,7 +192,7 @@ class ComparedRow:
     name: str
     metric: str
     baseline: float | int | None
-    current: float | int
+    current: float | int | None
     delta: float | None
     classification: str
     direction: str
@@ -205,6 +226,11 @@ def compare_rows(
         classification = "notable" if magnitude >= notable else "changed" if magnitude >= changed else "noise"
         direction = "improved" if delta < 0 else "regressed" if delta > 0 else ""
         compared.append(ComparedRow(*key, baseline_value, row["value"], delta, classification, direction))
+    current_keys = {(row["tier"], row["name"], row["metric"]) for row in current["rows"]}
+    for key, baseline_value in old.items():
+        if key not in current_keys:
+            compared.append(ComparedRow(*key, baseline_value, None, None, "unclassified", "", "missing current row"))
+    compared.sort(key=lambda row: (TIERS.index(row.tier), row.name, row.metric))
     return compared
 
 
@@ -264,7 +290,11 @@ def parser() -> argparse.ArgumentParser:
     criterion_parser.add_argument("--root", type=Path, default=Path("target/criterion"))
     criterion_parser.add_argument("--output", type=Path, required=True)
     criterion_parser.add_argument("--git-sha", required=True)
-    criterion_parser.set_defaults(run=lambda args: collect_criterion(args.root, args.output, args.git_sha))
+    criterion_parser.add_argument("--since", type=Path, required=True)
+    criterion_parser.set_defaults(run=lambda args: collect_criterion(args.root, args.output, args.git_sha, args.since))
+    start_parser = commands.add_parser("start")
+    start_parser.add_argument("--output", type=Path, required=True)
+    start_parser.set_defaults(run=lambda args: (args.output.parent.mkdir(parents=True, exist_ok=True), args.output.touch()))
     vitest_parser = commands.add_parser("vitest")
     vitest_parser.add_argument("--report", type=Path, required=True)
     vitest_parser.add_argument("--output", type=Path, required=True)
