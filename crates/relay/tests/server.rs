@@ -16,9 +16,10 @@ fn peer() -> PeerId {
 
 fn decode_hop_frame(frame: &[u8]) -> HopMessage {
     let payload = match decode_frame(frame) {
-        minip2p_relay::FrameDecode::Complete { payload, .. } => payload,
-        _ => &[],
-    };
+        minip2p_relay::FrameDecode::Complete { payload, .. } => Ok(payload),
+        other => Err(other),
+    }
+    .expect("expected complete HOP frame");
     HopMessage::decode(payload).expect("expected complete HOP frame")
 }
 
@@ -65,9 +66,10 @@ fn stop_frame(message: StopMessage) -> Vec<u8> {
 
 fn decode_stop_frame(frame: &[u8]) -> StopMessage {
     let payload = match decode_frame(frame) {
-        minip2p_relay::FrameDecode::Complete { payload, .. } => payload,
-        _ => &[],
-    };
+        minip2p_relay::FrameDecode::Complete { payload, .. } => Ok(payload),
+        other => Err(other),
+    }
+    .expect("expected complete STOP frame");
     StopMessage::decode(payload).expect("expected complete STOP frame")
 }
 

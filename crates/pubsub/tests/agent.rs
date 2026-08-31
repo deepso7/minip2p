@@ -172,16 +172,13 @@ fn inbound_data(a: &mut FloodsubAgent, peer: &PeerId, stream_id: StreamId, data:
 }
 
 fn decode_rpc(frame: &[u8]) -> Rpc {
-    let (payload, consumed) = complete_frame(frame).expect("frame must be complete");
+    let (payload, consumed) = match decode_frame(frame) {
+        FrameDecode::Complete { payload, consumed } => Ok((payload, consumed)),
+        other => Err(other),
+    }
+    .expect("frame must be complete");
     assert_eq!(consumed, frame.len());
     Rpc::decode(payload).expect("valid RPC")
-}
-
-fn complete_frame(frame: &[u8]) -> Result<(&[u8], usize), &'static str> {
-    match decode_frame(frame) {
-        FrameDecode::Complete { payload, consumed } => Ok((payload, consumed)),
-        _ => Err("frame was incomplete or malformed"),
-    }
 }
 
 /// A subscription-announcement frame as a remote peer would send it.

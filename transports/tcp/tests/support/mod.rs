@@ -370,10 +370,12 @@ impl TcpProvider for VirtualProvider {
         Ok(SocketHandle::new(client))
     }
 
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "this test provider asserts the transport's non-empty write contract"
+    )]
     fn send(&mut self, socket: SocketHandle, data: &[u8]) -> Result<usize, TcpError> {
-        if data.is_empty() {
-            return Ok(0);
-        }
+        assert!(!data.is_empty(), "the transport must not send empty writes");
         let mut net = self.net.borrow_mut();
         let Some((link, index)) = net.end(socket.get()) else {
             return Err(TcpError::UnknownSocket { socket });

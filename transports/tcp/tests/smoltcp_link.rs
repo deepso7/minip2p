@@ -651,6 +651,10 @@ mod provider {
         /// about happens on packet arrival, and a harness that jumped forwards
         /// would quietly turn "the peer never heard" into "the peer heard on a
         /// retransmit".
+        #[expect(
+            clippy::panic,
+            reason = "exhausting the test harness step budget is an invariant failure"
+        )]
         fn drain(&mut self) {
             for _ in 0..MAX_STEPS {
                 let now = Now::from_millis(self.now);
@@ -668,10 +672,7 @@ mod provider {
                     return;
                 }
             }
-            assert!(
-                self.wire.is_quiet(),
-                "the providers never settled because the wire remained busy"
-            )
+            panic!("the providers never settled within the step budget")
         }
 
         /// Listens, dials, and drives the handshake to completion.

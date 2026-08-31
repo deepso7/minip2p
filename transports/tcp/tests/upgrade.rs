@@ -42,6 +42,10 @@ fn node_with(net: &VirtualNetwork, key: Ed25519Keypair, seed: u8, config: TcpCon
 /// takes several round trips that produce no transport event at all, so a
 /// harness that stopped at "neither node reported anything" would abandon the
 /// handshake half-finished.
+#[expect(
+    clippy::panic,
+    reason = "exhausting the test harness step budget is an invariant failure"
+)]
 fn drive<A: EntropySource, B: EntropySource>(
     net: &VirtualNetwork,
     a: &mut TcpTransport<VirtualProvider, A>,
@@ -85,8 +89,7 @@ fn drive<A: EntropySource, B: EntropySource>(
             return (a_events, b_events);
         }
     }
-    assert!(net.is_quiet(), "the virtual link never went quiet");
-    (a_events, b_events)
+    panic!("the virtual link never settled within the step budget");
 }
 
 /// A listener and a dialer, driven until the upgrade completes.

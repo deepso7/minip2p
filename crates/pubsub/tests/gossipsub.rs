@@ -189,16 +189,13 @@ fn ack(agent: &mut GossipsubAgent, peer: &PeerId, actions: &[PubsubAction], now_
 }
 
 fn decode_rpc(frame: &[u8]) -> Rpc {
-    let (payload, consumed) = complete_frame(frame).expect("complete frame expected");
+    let (payload, consumed) = match decode_frame(frame) {
+        FrameDecode::Complete { payload, consumed } => Ok((payload, consumed)),
+        other => Err(other),
+    }
+    .expect("complete frame expected");
     assert_eq!(consumed, frame.len());
     Rpc::decode(payload).expect("valid emitted RPC")
-}
-
-fn complete_frame(frame: &[u8]) -> Result<(&[u8], usize), &'static str> {
-    match decode_frame(frame) {
-        FrameDecode::Complete { payload, consumed } => Ok((payload, consumed)),
-        _ => Err("frame was incomplete or malformed"),
-    }
 }
 
 #[test]
