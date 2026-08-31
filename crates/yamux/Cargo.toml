@@ -28,7 +28,12 @@ thiserror = { version = "2.0.18", default-features = false }
 
 [dev-dependencies]
 criterion = "0.8.2"
+gungraun = "=0.19.4"
 
 [[bench]]
 name = "data_path"
+harness = false
+
+[[bench]]
+name = "data_path_ir"
 harness = false

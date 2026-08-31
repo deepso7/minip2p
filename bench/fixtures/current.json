@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "git_sha": "current",
+  "rows": [
+    { "tier": "rust-micro", "name": "micro/noise", "metric": "Ir", "value": 1009 },
+    { "tier": "rust-micro", "name": "micro/boundary", "metric": "Ir", "value": 1020 },
+    { "tier": "rust-wall", "name": "wall/changed", "metric": "median_ns", "value": 120 },
+    { "tier": "node-ffi", "name": "node/missing", "metric": "median_ns", "value": 50 }
+  ]
+}

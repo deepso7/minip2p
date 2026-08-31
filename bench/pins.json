@@ -1,0 +1,6 @@
+{
+  "rust": "1.98.0",
+  "profile": "release",
+  "gungraun": "0.19.4",
+  "valgrind": "3.27.1"
+}

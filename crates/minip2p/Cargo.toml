@@ -64,5 +64,11 @@ getrandom = { version = "0.4.3", optional = true }
 thiserror = { version = "2.0.18", default-features = false, optional = true }
 
 [dev-dependencies]
+criterion = "0.8.2"
 minip2p-relay = { path = "../relay" }
 minip2p-test-support = { path = "../test-support" }
+
+[[bench]]
+name = "endpoint_e2e"
+harness = false
+required-features = ["quic", "tcp"]

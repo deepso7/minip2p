@@ -145,6 +145,19 @@ bench:
     cargo bench -p minip2p-relay-server --bench relay_server_event
     cargo bench -p minip2p-quic --bench idle_poll
     cargo bench -p minip2p-tcp --bench readiness_poll
+    cargo bench -p minip2p-rs --features tcp --bench endpoint_e2e
+    python3 scripts/bench_results.py criterion --output target/bench-results/rust-wall.json --git-sha "$(git rev-parse HEAD)"
+
+bench-ir:
+    GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-core --bench multiaddr_ir
+    GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-yamux --bench data_path_ir
+    GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-discovery --bench peer_book_ir
+    GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-pubsub --bench fanout_ir
+    GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-relay-server --bench relay_server_event_ir
+    python3 scripts/bench_results.py gungraun --output target/bench-results/rust-micro.json --git-sha "$(git rev-parse HEAD)"
+
+bench-results-test:
+    python3 -m unittest discover -s bench -p 'test_*.py'
 
 fuzz seconds="30":
     cargo +nightly fuzz run wire_inputs -- -max_total_time={{seconds}}

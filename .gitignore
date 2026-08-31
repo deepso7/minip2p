@@ -3,6 +3,7 @@
 # Docker linux cross-compile output (examples deployed to test boxes).
 /target-linux
 .DS_Store
+__pycache__/
 /tmp
 /bindings/ts/node/*.node
 /bindings/ts/node/npm/*/*.node

@@ -34,9 +34,14 @@ thiserror = { version = "2.0.18", default-features = false }
 
 [dev-dependencies]
 criterion = "0.8.2"
+gungraun = "=0.19.4"
 minip2p-identity = { path = "../identity", version = "0.4.11" }
 minip2p-nat = { path = "../nat", version = "0.4.11" }
 
 [[bench]]
 name = "relay_server_event"
+harness = false
+
+[[bench]]
+name = "relay_server_event_ir"
 harness = false
