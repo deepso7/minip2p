@@ -377,9 +377,10 @@ pub fn run_dial(
         return Err("no path to the target".into());
     };
     println!(
-        "[dial] path-established path={} elapsed={}ms",
+        "[dial] path-established path={} elapsed={}ms elapsed-us={}",
         path_name(&path),
-        start.elapsed().as_millis()
+        start.elapsed().as_millis(),
+        micros_since(start)
     );
 
     let relayed = matches!(path, Path::Relayed { .. });
@@ -387,6 +388,11 @@ pub fn run_dial(
     let mut channel =
         establish_direct_channel(&mut endpoint, &peer, &BTreeSet::new(), None, start)?;
     channel.direct = !relayed;
+    println!(
+        "[dial] channel-ready path={} elapsed-us={}",
+        channel.name(),
+        micros_since(start)
+    );
 
     ping_loop(&mut endpoint, &peer, channel, frames, count, start)
 }
@@ -533,6 +539,10 @@ fn ping_loop(
                 && upgraded == peer
                 && !channel.direct
             {
+                println!(
+                    "[dial] path-upgraded path=direct-punched elapsed-us={}",
+                    micros_since(start)
+                );
                 // The old bridge is already reset by the agent — never
                 // touch it again. Pongs in flight on it are gone; the
                 // reopen resends their seqs on the new stream.
@@ -555,8 +565,9 @@ fn ping_loop(
                     Err(e) => return Err(e),
                 };
                 println!(
-                    "[dial] channel-switched path=direct outstanding-resent={}",
-                    outstanding.len()
+                    "[dial] channel-switched path=direct outstanding-resent={} elapsed-us={}",
+                    outstanding.len(),
+                    micros_since(start)
                 );
             }
         }
@@ -707,6 +718,10 @@ fn ping_loop(
 
 fn millis_since(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn micros_since(start: Instant) -> u128 {
+    start.elapsed().as_micros()
 }
 
 fn next_ping_deadline(sent_at: Instant) -> Instant {

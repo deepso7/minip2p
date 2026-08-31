@@ -561,6 +561,7 @@ impl QuicConnection {
         &mut self,
         events: &mut Vec<TransportEvent>,
         socket: &UdpSocket,
+        stream_read_buffer: &mut [u8],
         pending_datagrams: &mut VecDeque<PendingDatagram>,
         max_pending_datagrams: usize,
     ) -> Result<(), TransportError> {
@@ -568,20 +569,18 @@ impl QuicConnection {
             return Ok(());
         }
 
-        let mut buf = [0u8; 65535];
-
         for raw_stream_id in self.conn.readable() {
             let stream_id = StreamId::new(raw_stream_id);
             self.ensure_stream_discovered(stream_id, events);
 
             loop {
-                match self.conn.stream_recv(raw_stream_id, &mut buf) {
+                match self.conn.stream_recv(raw_stream_id, stream_read_buffer) {
                     Ok((read, fin)) => {
                         if read > 0 {
                             events.push(TransportEvent::StreamData {
                                 id: self.id,
                                 stream_id,
-                                data: buf[..read].to_vec(),
+                                data: stream_read_buffer[..read].to_vec(),
                             });
                         }
 

@@ -371,29 +371,43 @@ impl PeerDiscoveryAgent {
     pub fn handle_tick(&mut self, now_ms: u64) {
         let peers: Vec<PeerId> = self.book.keys().cloned().collect();
         for peer in peers {
+            let Some(entry) = self.book.get(&peer) else {
+                continue;
+            };
+            let beacon_due = entry.beacon.as_ref().is_some_and(|source| {
+                now_ms
+                    >= source
+                        .last_seen_ms
+                        .saturating_add(self.config.beacon_peer_ttl_ms)
+            });
+            let mdns_due = entry
+                .mdns
+                .values()
+                .any(|record| now_ms >= record.expires_at_ms);
+            if !beacon_due && !mdns_due {
+                continue;
+            }
+
             let before = self.book.get(&peer).map(|entry| self.view(entry));
             let mut beacon_changed = false;
             let mut mdns_changed = false;
             if let Some(entry) = self.book.get_mut(&peer) {
-                if entry.beacon.as_ref().is_some_and(|source| {
-                    now_ms
-                        >= source
-                            .last_seen_ms
-                            .saturating_add(self.config.beacon_peer_ttl_ms)
-                }) {
+                if beacon_due {
                     entry.beacon = None;
                     beacon_changed = true;
                 }
-                let expired: Vec<Multiaddr> = entry
-                    .mdns
-                    .iter()
-                    .filter(|(_, record)| now_ms >= record.expires_at_ms)
-                    .map(|(addr, _)| addr.clone())
-                    .collect();
-                for addr in expired {
-                    entry.mdns.remove(&addr);
-                    entry.mdns_order.retain(|known| known != &addr);
-                    mdns_changed = true;
+                if mdns_due {
+                    let expired: Vec<Multiaddr> = entry
+                        .mdns
+                        .iter()
+                        .filter(|(_, record)| now_ms >= record.expires_at_ms)
+                        .map(|(addr, _)| addr.clone())
+                        .collect();
+                    for addr in expired {
+                        entry.mdns.remove(&addr);
+                        entry.mdns_order.retain(|known| known != &addr);
+                        mdns_changed = true;
+                    }
                 }
                 entry.assert_mdns_order();
             }
@@ -868,6 +882,75 @@ mod tests {
         agent.observe_mdns(remote, vec![(addr(1), 200)], 1);
         assert!(agent.poll_event().is_none());
         assert_eq!(agent.known_peers()[0].mdns_last_seen_ms, Some(1));
+    }
+
+    #[test]
+    fn inactive_tick_leaves_book_and_pending_events_unchanged() {
+        let config = PeerDiscoveryConfig {
+            auto_dial: false,
+            beacon_peer_ttl_ms: 100,
+            ..PeerDiscoveryConfig::default()
+        };
+        let mut agent = agent(config);
+        let remote = peer(2);
+        agent.observe_beacon(beacon(remote.clone(), vec![addr(1)]), 0);
+        agent.observe_mdns(remote, vec![(addr(2), 100)], 0);
+        while agent.poll_event().is_some() {}
+
+        let before = agent.known_peers();
+        let before_timeout = agent.next_timeout(1);
+        agent.handle_tick(1);
+
+        assert_eq!(agent.known_peers(), before);
+        assert_eq!(agent.next_timeout(1), before_timeout);
+        assert!(agent.poll_event().is_none());
+        assert!(agent.poll_action().is_none());
+    }
+
+    #[test]
+    fn mixed_expiration_preserves_each_transition_and_provenance() {
+        let config = PeerDiscoveryConfig {
+            auto_dial: false,
+            beacon_peer_ttl_ms: 5,
+            ..PeerDiscoveryConfig::default()
+        };
+        let mut agent = agent(config);
+        let mdns_expires = peer(2);
+        let beacon_expires = peer(3);
+        let disappears = peer(4);
+
+        agent.observe_beacon(beacon(mdns_expires.clone(), vec![addr(1)]), 1);
+        agent.observe_mdns(mdns_expires.clone(), vec![(addr(2), 5)], 0);
+        agent.observe_beacon(beacon(beacon_expires.clone(), vec![addr(3)]), 0);
+        agent.observe_mdns(beacon_expires.clone(), vec![(addr(4), 100)], 1);
+        agent.observe_mdns(disappears.clone(), vec![(addr(5), 5)], 0);
+        while agent.poll_event().is_some() {}
+
+        agent.handle_tick(5);
+        let events: Vec<_> = core::iter::from_fn(|| agent.poll_event()).collect();
+
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DiscoveryEvent::PeerUpdated {
+                peer,
+                addrs,
+                source: DiscoverySource::Mdns,
+            } if peer == &mdns_expires && addrs == &vec![addr(1)]
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DiscoveryEvent::PeerUpdated {
+                peer,
+                addrs,
+                source: DiscoverySource::SignedBeacon,
+            } if peer == &beacon_expires && addrs == &vec![addr(4)]
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            DiscoveryEvent::PeerExpired { peer } if peer == &disappears
+        )));
+        assert_eq!(agent.known_peers().len(), 2);
     }
 
     #[test]

@@ -204,6 +204,9 @@ struct Socket {
 pub struct StdTcpProvider {
     poll: Poll,
     events: Events,
+    /// Snapshot of one `mio` event batch. Reused because `Events` borrows
+    /// itself while iterating but changing socket flags needs `&mut self`.
+    observed: Vec<(Token, bool, bool)>,
     waker: Arc<Waker>,
     listeners: BTreeMap<usize, Listener>,
     sockets: BTreeMap<SocketHandle, Socket>,
@@ -241,6 +244,7 @@ impl StdTcpProvider {
         Ok(Self {
             poll,
             events: Events::with_capacity(64),
+            observed: Vec::with_capacity(64),
             waker,
             listeners: BTreeMap::new(),
             sockets: BTreeMap::new(),
@@ -307,25 +311,28 @@ impl StdTcpProvider {
 
         // Collect first: the flags live behind `&mut self`, which `events`
         // borrows for the duration of the iteration.
-        let observed: Vec<(Token, bool, bool)> = self
-            .events
-            .iter()
-            .map(|event| (event.token(), event.is_readable(), event.is_writable()))
-            .collect();
+        self.observed.clear();
+        self.observed.extend(
+            self.events
+                .iter()
+                .map(|event| (event.token(), event.is_readable(), event.is_writable())),
+        );
+        let observed = core::mem::take(&mut self.observed);
 
         let mut ready = false;
         let mut drained = Vec::new();
-        for (token, readable, writable) in observed {
+        for &(token, readable, writable) in &observed {
             if token == WAKER_TOKEN {
                 self.pending_interrupt = true;
                 continue;
             }
             ready = true;
-            let Some((handle, socket)) = self
-                .sockets
-                .iter_mut()
-                .find(|(_, socket)| socket.token == token)
-            else {
+            // Socket handles deliberately reuse the registration token. The
+            // token allocator is shared with listeners, so a listener token
+            // simply misses this map; scanning every socket here turns a
+            // readiness batch into O(events × sockets).
+            let handle = SocketHandle::new(token.0 as u64);
+            let Some(socket) = self.sockets.get_mut(&handle) else {
                 // Listeners need no flag: `accept` runs to `WouldBlock` on
                 // every poll regardless.
                 continue;
@@ -334,7 +341,7 @@ impl StdTcpProvider {
             if writable {
                 socket.writable = true;
                 if matches!(socket.phase, Phase::Open) {
-                    drained.push(*handle);
+                    drained.push(handle);
                 }
             }
         }
@@ -345,6 +352,7 @@ impl StdTcpProvider {
             self.watch_writable(handle, false);
             self.ready.push_back(TcpEvent::Writable { socket: handle });
         }
+        self.observed = observed;
         Ok(ready)
     }
 

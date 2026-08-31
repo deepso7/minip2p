@@ -18,7 +18,9 @@ use minip2p_swarm::SwarmEvent;
 use minip2p_transport::StreamId;
 
 use crate::config::FloodsubConfig;
-use crate::events::{PublishError, PubsubAction, PubsubEvent, PubsubToken, TopicError};
+use crate::events::{
+    PublishError, PubsubAction, PubsubEvent, PubsubToken, SharedFrame, TopicError,
+};
 use crate::message::{
     FLOODSUB_PROTOCOL_ID, FrameDecode, MAX_RPC_SIZE, MAX_TOPIC_LEN, RawMessage, Rpc, SubOpts,
     decode_frame, encode_frame,
@@ -49,15 +51,15 @@ enum OutboundWork {
     /// The frame encodes the diff from `sent_topics` to `snapshot`;
     /// committing sets `sent_topics = snapshot`.
     Subscriptions {
-        frame: Vec<u8>,
+        frame: SharedFrame,
         snapshot: BTreeSet<String>,
     },
     /// The front of `pending`; committing pops it.
-    Publish { frame: Vec<u8> },
+    Publish { frame: SharedFrame },
 }
 
 impl OutboundWork {
-    fn frame(&self) -> &[u8] {
+    fn frame(&self) -> &SharedFrame {
         match self {
             Self::Subscriptions { frame, .. } | Self::Publish { frame } => frame,
         }
@@ -115,7 +117,7 @@ struct PeerState {
     sender: SendState,
     /// Framed publish/forward RPCs awaiting their turn (subscription
     /// updates never queue here — they re-diff at send time).
-    pending: VecDeque<Vec<u8>>,
+    pending: VecDeque<SharedFrame>,
     /// The subscription snapshot last COMMITTED to this peer.
     sent_topics: BTreeSet<String>,
     /// Concurrent inbound streams and their reassembly buffers.
@@ -276,7 +278,7 @@ impl FloodsubAgent {
             self.config.max_seen_messages,
         );
 
-        let frame = encode_frame(&body);
+        let frame: SharedFrame = encode_frame(&body).into();
         for peer in recipients {
             if let Some(state) = self.peers.get_mut(&peer) {
                 state.pending.push_back(frame.clone());
@@ -921,7 +923,7 @@ impl FloodsubAgent {
             publish: alloc::vec![message.clone()],
             control: None,
         };
-        let frame = encode_frame(&rpc.encode());
+        let frame: SharedFrame = encode_frame(&rpc.encode()).into();
         let recipients: Vec<PeerId> = self
             .peers
             .iter()
@@ -989,7 +991,7 @@ impl FloodsubAgent {
                 control: None,
             };
             OutboundWork::Subscriptions {
-                frame: encode_frame(&rpc.encode()),
+                frame: encode_frame(&rpc.encode()).into(),
                 snapshot: self.topics.clone(),
             }
         } else if let Some(front) = state.pending.front() {
@@ -1074,4 +1076,35 @@ fn validate_topic(topic: &str) -> Result<(), TopicError> {
         return Err(TopicError::TooLong);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::string::String;
+
+    use super::*;
+
+    #[test]
+    fn fanout_queues_share_one_framed_payload() {
+        let mut agent = FloodsubAgent::new(
+            Ed25519Keypair::from_secret_key_bytes([1; 32]),
+            FloodsubConfig::default(),
+            0,
+        );
+        let first = Ed25519Keypair::from_secret_key_bytes([2; 32]).peer_id();
+        let second = Ed25519Keypair::from_secret_key_bytes([3; 32]).peer_id();
+        for peer in [&first, &second] {
+            let mut state = PeerState::default();
+            state.remote_topics.insert(String::from("topic"));
+            agent.peers.insert(peer.clone(), state);
+        }
+
+        agent
+            .publish("topic", alloc::vec![7; 1024], 0)
+            .expect("publish");
+
+        let first_frame = agent.peers[&first].pending.front().expect("first frame");
+        let second_frame = agent.peers[&second].pending.front().expect("second frame");
+        assert!(core::ptr::eq(first_frame.as_ptr(), second_frame.as_ptr()));
+    }
 }

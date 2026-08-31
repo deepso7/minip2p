@@ -356,7 +356,7 @@ function normalizeIdentifyInfo(value: unknown): IdentifyInfo {
   if (Array.isArray(publicKey) || publicKey instanceof Uint8Array) {
     return {
       ...info,
-      publicKey: Uint8Array.from(publicKey).buffer,
+      publicKey: nativeBytesToArrayBuffer(publicKey),
     } as unknown as IdentifyInfo;
   }
   throw new TypeError(
@@ -491,14 +491,14 @@ function normalizeEventBytes(tag: string, value: unknown): unknown {
   if (tag === "StreamData") {
     const data = Reflect.get(inner, "data");
     if (Array.isArray(data) || data instanceof Uint8Array) {
-      Reflect.set(inner, "data", Uint8Array.from(data).buffer);
+      Reflect.set(inner, "data", nativeBytesToArrayBuffer(data));
     }
   }
   if (tag === "Message") {
     for (const key of ["data", "seqno"] as const) {
       const bytes = Reflect.get(inner, key);
       if (Array.isArray(bytes) || bytes instanceof Uint8Array) {
-        Reflect.set(inner, key, Uint8Array.from(bytes).buffer);
+        Reflect.set(inner, key, nativeBytesToArrayBuffer(bytes));
       }
     }
   }
@@ -509,6 +509,20 @@ function normalizeEventBytes(tag: string, value: unknown): unknown {
     }
   }
   return inner;
+}
+
+function nativeBytesToArrayBuffer(bytes: number[] | Uint8Array): ArrayBuffer {
+  if (Array.isArray(bytes)) {
+    return Uint8Array.from(bytes).buffer;
+  }
+  if (
+    bytes.buffer instanceof ArrayBuffer &&
+    bytes.byteOffset === 0 &&
+    bytes.byteLength === bytes.buffer.byteLength
+  ) {
+    return bytes.buffer;
+  }
+  return Uint8Array.from(bytes).buffer;
 }
 
 class EventDrain {
@@ -535,9 +549,11 @@ class EventDrain {
     this.#pending = true;
     if (!this.#running) {
       this.#running = true;
-      setTimeout(() => {
+      // One check-phase turn keeps native callbacks out of the caller's stack
+      // without paying the timer granularity for every bounded batch.
+      setImmediate(() => {
         void this.#run();
-      }, 0);
+      });
     }
   }
 
@@ -561,7 +577,7 @@ class EventDrain {
             }
           }
           await new Promise<void>((resolve) => {
-            setTimeout(resolve, 0);
+            setImmediate(resolve);
           });
           if (this.#stopped) {
             break;

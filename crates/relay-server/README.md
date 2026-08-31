@@ -11,10 +11,11 @@ IP policy stay in adapters.
 The host supplies a `Now`, feeds Swarm events, drains tokenized actions, and
 echoes every open/send/close/reset result. Drain a claimed input and all of its
 synchronous results to quiescence before delivering another transport event.
-Call `handle_tick(now)` before events sampled at the same time; deadlines win at
-equality. The service assumes Swarm's single live connection per peer but keeps
-exact connection and stream identities so stale superseded inputs cannot mutate
-replacement state.
+The first `handle_event` at each `Now` sample processes due deadlines before
+dispatching that event, so deadlines win at equality. Call `handle_tick(now)`
+to force that sweep without an event. The service assumes Swarm's single live
+connection per peer but keeps exact connection and stream identities so stale
+superseded inputs cannot mutate replacement state.
 
 ## Compatibility contract
 

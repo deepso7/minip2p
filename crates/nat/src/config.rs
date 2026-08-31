@@ -56,9 +56,6 @@ pub struct NatConfig {
     pub blast_interval_ms: u64,
     /// Payload length of each random-UDP blast packet.
     pub blast_payload_len: usize,
-    /// Responder-side approximation of RTT/2: minimum delay between SYNC
-    /// arrival and the first blast.
-    pub responder_sync_delay_ms: u64,
     /// Probe verdicts (out of [`confidence_window`](Self::confidence_window))
     /// that must agree before reachability flips.
     pub confidence_threshold: u8,
@@ -102,7 +99,6 @@ impl Default for NatConfig {
             punch_max_retries: 2,
             blast_interval_ms: 100,
             blast_payload_len: 32,
-            responder_sync_delay_ms: 50,
             confidence_threshold: 3,
             confidence_window: 5,
             probe_interval_settled_ms: 90_000,

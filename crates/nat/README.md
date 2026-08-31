@@ -132,7 +132,7 @@ automatically: the relay's STOP CONNECT is auto-accepted and the bridge is
 promoted into a normal circuit connection. The agent announces that Relayed
 path, opens `/libp2p/dcutr`, and sends CONNECT followed by SYNC. It emits
 `SendRandomUdp` blasts at the original circuit dialer's observed addresses
-to open its own NAT mapping (first after `responder_sync_delay_ms`, then
+to open its own NAT mapping (first after half the measured relay RTT, then
 every `blast_interval_ms` until `punch_deadline_ms`). The original circuit
 dialer makes the QUIC simultaneous-open dial. A landed punch is announced
 with `InboundDirectUpgrade` and supersedes the circuit.

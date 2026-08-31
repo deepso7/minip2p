@@ -9,12 +9,12 @@
 //! another transport event is delivered. Transport queues then provide the
 //! payload backpressure instead of an unbounded agent queue.
 //!
-//! Call [`RelayServerAgent::handle_tick`] before events sampled at the same
-//! time. This deadline-first order makes expiry, duration, and control timeout
-//! behavior deterministic. Exact [`minip2p_transport::ConnectionId`] identity
-//! is retained throughout; the service relies on Swarm's single live
-//! connection per peer while still rejecting stale results from superseded
-//! connections.
+//! The first [`RelayServerAgent::handle_event`] for a time sample processes
+//! deadlines before it dispatches the event. Call [`RelayServerAgent::handle_tick`]
+//! to force the same deadline-first order without an event. Exact
+//! [`minip2p_transport::ConnectionId`] identity is retained throughout; the
+//! service relies on Swarm's single live connection per peer while still
+//! rejecting stale results from superseded connections.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]

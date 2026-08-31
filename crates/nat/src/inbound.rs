@@ -44,6 +44,10 @@ pub(crate) struct InboundCircuit {
     stop: Option<StopResponder>,
     dcutr: Option<DcutrInitiator>,
     dcutr_stream: Option<StreamId>,
+    /// Monotonic time when the initial DCUtR CONNECT was queued to the
+    /// transport, used to synchronize the first QUIC blast at half the
+    /// measured relay RTT.
+    dcutr_connect_sent_at: Option<u64>,
     dcutr_deadline: Option<u64>,
     remote_addrs: Vec<Multiaddr>,
     /// Secure-mux bytes coalesced behind the STOP success response. These
@@ -83,6 +87,7 @@ impl InboundCircuit {
             stop: Some(StopResponder::new()),
             dcutr: None,
             dcutr_stream: None,
+            dcutr_connect_sent_at: None,
             dcutr_deadline: None,
             remote_addrs: Vec::new(),
             pending_data: Vec::new(),
@@ -476,7 +481,9 @@ impl InboundCircuit {
             StreamInput::Ready => DcutrInitiatorInput::Flush,
             StreamInput::Data(bytes) => DcutrInitiatorInput::Data {
                 bytes: bytes.to_vec(),
-                rtt_ms: 0,
+                rtt_ms: self
+                    .dcutr_connect_sent_at
+                    .map_or(0, |sent_at| now.mono_ms.saturating_sub(sent_at)),
             },
             StreamInput::RemoteWriteClosed | StreamInput::Closed => {
                 DcutrInitiatorInput::RemoteWriteClosed
@@ -495,6 +502,7 @@ impl InboundCircuit {
         for output in outputs {
             match output {
                 DcutrInitiatorOutput::Outbound(data) => {
+                    self.dcutr_connect_sent_at.get_or_insert(now.mono_ms);
                     if let Some(peer) = self.source.as_ref() {
                         shared.push_action(NatAction::SendStream {
                             peer: peer.clone(),
@@ -504,9 +512,34 @@ impl InboundCircuit {
                     }
                 }
                 DcutrInitiatorOutput::Outcome(InitiatorOutcome::DialNow {
-                    remote_addrs, ..
+                    remote_addrs,
+                    rtt_ms,
+                    ..
                 }) => {
                     self.remote_addrs = select_global_punch_candidates(&remote_addrs);
+                    completed = true;
+                    let blast_start = now.mono_ms.saturating_add(rtt_ms.div_ceil(2));
+                    let blast_until = blast_start.saturating_add(shared.config.punch_deadline_ms);
+                    if !self.remote_addrs.is_empty() {
+                        let next_at = if rtt_ms == 0 {
+                            for addr in &self.remote_addrs {
+                                shared.push_action(NatAction::SendRandomUdp {
+                                    target: addr.clone(),
+                                    payload_len: shared.config.blast_payload_len,
+                                });
+                            }
+                            blast_start
+                                .checked_add(shared.config.blast_interval_ms.max(1))
+                                .filter(|next| *next <= blast_until)
+                        } else {
+                            Some(blast_start)
+                        };
+                        self.blast = next_at.map(|next_at| BlastSchedule {
+                            addrs: self.remote_addrs.clone(),
+                            next_at,
+                            until: blast_until,
+                        });
+                    }
                     if dcutr.handle_input(DcutrInitiatorInput::SendSync).is_ok() {
                         while let Some(DcutrInitiatorOutput::Outbound(data)) = dcutr.poll_output() {
                             if let Some(peer) = self.source.as_ref() {
@@ -518,18 +551,13 @@ impl InboundCircuit {
                             }
                         }
                     }
-                    completed = true;
-                    if !self.remote_addrs.is_empty() {
-                        self.blast = Some(BlastSchedule {
-                            addrs: self.remote_addrs.clone(),
-                            next_at: now.mono_ms + shared.config.responder_sync_delay_ms,
-                            until: now.mono_ms + shared.config.punch_deadline_ms,
-                        });
-                    }
                     self.linger_until = Some(
-                        now.mono_ms
-                            + shared.config.punch_deadline_ms
-                                * (1 + u64::from(shared.config.punch_max_retries)),
+                        blast_start.saturating_add(
+                            shared
+                                .config
+                                .punch_deadline_ms
+                                .saturating_mul(1 + u64::from(shared.config.punch_max_retries)),
+                        ),
                     );
                 }
             }

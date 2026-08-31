@@ -1181,6 +1181,7 @@ dependencies = [
 name = "minip2p-discovery"
 version = "0.4.9"
 dependencies = [
+ "criterion",
  "minip2p-core",
  "minip2p-identity",
  "thiserror",
@@ -1328,6 +1329,7 @@ dependencies = [
 name = "minip2p-pubsub"
 version = "0.4.9"
 dependencies = [
+ "criterion",
  "minip2p-core",
  "minip2p-identity",
  "minip2p-swarm",
@@ -1340,6 +1342,7 @@ name = "minip2p-quic"
 version = "0.4.9"
 dependencies = [
  "boring",
+ "criterion",
  "getrandom",
  "hmac",
  "minip2p-core",
@@ -1368,6 +1371,7 @@ dependencies = [
 name = "minip2p-relay-server"
 version = "0.4.9"
 dependencies = [
+ "criterion",
  "minip2p-core",
  "minip2p-identity",
  "minip2p-nat",
@@ -1454,6 +1458,7 @@ dependencies = [
 name = "minip2p-tcp"
 version = "0.4.9"
 dependencies = [
+ "criterion",
  "minip2p-core",
  "minip2p-identity",
  "minip2p-platform",
@@ -1506,6 +1511,7 @@ dependencies = [
 name = "minip2p-yamux"
 version = "0.4.9"
 dependencies = [
+ "criterion",
  "minip2p-core",
  "minip2p-platform",
  "thiserror",

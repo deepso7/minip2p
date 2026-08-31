@@ -119,7 +119,7 @@ fn connect_pair(
 fn listen_returns_the_resolved_listen_address_and_event_matches() {
     let mut listener =
         QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("listener");
-    let requested = listener.local_multiaddr().expect("local multiaddr");
+    let requested = listener.local_multiaddr();
 
     let resolved = listener.listen(&requested).expect("listen");
     assert_eq!(resolved, requested);
