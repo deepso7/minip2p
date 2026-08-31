@@ -1,7 +1,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_identity::{PeerId, read_uvarint, write_uvarint};
+use minip2p_identity::{PeerId, read_uvarint_with_remainder, write_uvarint};
 
 use crate::MultiaddrError;
 use crate::multiaddr::is_valid_dns;
@@ -104,46 +104,36 @@ impl Protocol {
 
     /// Reads a single protocol component from the front of `bytes`.
     ///
-    /// Returns the decoded protocol plus the number of bytes consumed.
-    pub(crate) fn read_binary(bytes: &[u8]) -> Result<(Self, usize), MultiaddrError> {
-        let (code, mut consumed) = read_uvarint(bytes)?;
-        let rest = bytes
-            .get(consumed..)
-            .ok_or(MultiaddrError::TruncatedBinaryValue {
-                protocol: "protocol code",
-            })?;
+    /// Returns the decoded protocol and the unconsumed input.
+    pub(crate) fn read_binary(bytes: &[u8]) -> Result<(Self, &[u8]), MultiaddrError> {
+        let (code, rest) = read_uvarint_with_remainder(bytes)?;
 
         match code {
             IP4_CODE => {
-                let value = fixed::<4>(rest, "ip4")?;
-                consumed += 4;
-                Ok((Self::Ip4(value), consumed))
+                let (value, rest) = fixed::<4>(rest, "ip4")?;
+                Ok((Self::Ip4(value), rest))
             }
             IP6_CODE => {
-                let value = fixed::<16>(rest, "ip6")?;
-                consumed += 16;
-                Ok((Self::Ip6(value), consumed))
+                let (value, rest) = fixed::<16>(rest, "ip6")?;
+                Ok((Self::Ip6(value), rest))
             }
             TCP_CODE => {
-                let value = fixed::<2>(rest, "tcp")?;
-                consumed += 2;
-                Ok((Self::Tcp(u16::from_be_bytes(value)), consumed))
+                let (value, rest) = fixed::<2>(rest, "tcp")?;
+                Ok((Self::Tcp(u16::from_be_bytes(value)), rest))
             }
             UDP_CODE => {
-                let value = fixed::<2>(rest, "udp")?;
-                consumed += 2;
-                Ok((Self::Udp(u16::from_be_bytes(value)), consumed))
+                let (value, rest) = fixed::<2>(rest, "udp")?;
+                Ok((Self::Udp(u16::from_be_bytes(value)), rest))
             }
-            QUIC_V1_CODE => Ok((Self::QuicV1, consumed)),
-            P2P_CIRCUIT_CODE => Ok((Self::P2pCircuit, consumed)),
+            QUIC_V1_CODE => Ok((Self::QuicV1, rest)),
+            P2P_CIRCUIT_CODE => Ok((Self::P2pCircuit, rest)),
             DNS_CODE | DNS4_CODE | DNS6_CODE => {
                 let label = match code {
                     DNS_CODE => "dns",
                     DNS4_CODE => "dns4",
                     _ => "dns6",
                 };
-                let (body, used) = length_prefixed(rest, label)?;
-                consumed += used;
+                let (body, rest) = length_prefixed(rest, label)?;
                 let name = core::str::from_utf8(body)
                     .map_err(|e| MultiaddrError::InvalidBinaryValue {
                         protocol: label,
@@ -166,17 +156,16 @@ impl Protocol {
                     DNS4_CODE => Self::Dns4(name),
                     _ => Self::Dns6(name),
                 };
-                Ok((protocol, consumed))
+                Ok((protocol, rest))
             }
             P2P_CODE => {
-                let (body, used) = length_prefixed(rest, "p2p")?;
-                consumed += used;
+                let (body, rest) = length_prefixed(rest, "p2p")?;
                 let peer_id =
                     PeerId::from_bytes(body).map_err(|e| MultiaddrError::InvalidBinaryValue {
                         protocol: "p2p",
                         reason: e.to_string(),
                     })?;
-                Ok((Self::P2p(peer_id), consumed))
+                Ok((Self::P2p(peer_id), rest))
             }
             _ => Err(MultiaddrError::UnknownProtocolCode { code }),
         }
@@ -184,36 +173,28 @@ impl Protocol {
 }
 
 /// Reads `N` bytes from the front of `bytes` as a fixed-size value.
-fn fixed<const N: usize>(bytes: &[u8], protocol: &'static str) -> Result<[u8; N], MultiaddrError> {
-    let value = bytes
-        .get(..N)
+fn fixed<'a, const N: usize>(
+    bytes: &'a [u8],
+    protocol: &'static str,
+) -> Result<([u8; N], &'a [u8]), MultiaddrError> {
+    let (value, rest) = bytes
+        .split_first_chunk::<N>()
         .ok_or(MultiaddrError::TruncatedBinaryValue { protocol })?;
-    let mut out = [0u8; N];
-    out.copy_from_slice(value);
-    Ok(out)
+    Ok((*value, rest))
 }
 
 /// Reads a varint length prefix and returns a slice of that many bytes
-/// plus the total number of bytes consumed (prefix + body).
+/// and the input following the body.
 fn length_prefixed<'a>(
     bytes: &'a [u8],
     protocol: &'static str,
-) -> Result<(&'a [u8], usize), MultiaddrError> {
-    let (len, consumed) = read_uvarint(bytes)?;
-    let rest = bytes
-        .get(consumed..)
-        .ok_or(MultiaddrError::TruncatedBinaryValue { protocol })?;
+) -> Result<(&'a [u8], &'a [u8]), MultiaddrError> {
+    let (len, rest) = read_uvarint_with_remainder(bytes)?;
     // Compare in u64 so an absurd declared length errs identically on
     // 32-bit and 64-bit targets.
     if len > rest.len() as u64 {
         return Err(MultiaddrError::TruncatedBinaryValue { protocol });
     }
     let len = len as usize;
-    let body = rest
-        .get(..len)
-        .ok_or(MultiaddrError::TruncatedBinaryValue { protocol })?;
-    let total = consumed
-        .checked_add(len)
-        .ok_or(MultiaddrError::TruncatedBinaryValue { protocol })?;
-    Ok((body, total))
+    Ok(rest.split_at(len))
 }

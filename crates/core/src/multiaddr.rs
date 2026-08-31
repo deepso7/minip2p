@@ -174,14 +174,11 @@ impl Multiaddr {
     ///   (e.g. non-UTF-8 DNS name, malformed `/p2p/` multihash).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, MultiaddrError> {
         let mut protocols = Vec::new();
-        let mut offset = 0;
-        while offset < bytes.len() {
-            let remaining = bytes.get(offset..).ok_or(MultiaddrError::Varint(
-                minip2p_identity::VarintError::BufferTooShort,
-            ))?;
-            let (protocol, consumed) = Protocol::read_binary(remaining)?;
-            offset += consumed;
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            let (protocol, rest) = Protocol::read_binary(remaining)?;
             protocols.push(protocol);
+            remaining = rest;
         }
         Ok(Self { protocols })
     }

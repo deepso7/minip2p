@@ -251,10 +251,20 @@ pub fn write_uvarint(mut value: u64, out: &mut Vec<u8>) {
 
 /// Reads an unsigned varint and enforces canonical (minimal) encoding.
 pub fn read_uvarint(input: &[u8]) -> Result<(u64, usize), VarintError> {
+    let (value, remaining) = read_uvarint_with_remainder(input)?;
+    Ok((value, input.len() - remaining.len()))
+}
+
+/// Reads a canonical unsigned varint and returns the input following it.
+pub fn read_uvarint_with_remainder(input: &[u8]) -> Result<(u64, &[u8]), VarintError> {
     let mut value = 0u64;
     let mut shift = 0u32;
+    let mut bytes = input.iter();
 
-    for (idx, byte) in input.iter().copied().enumerate() {
+    for idx in 0..input.len() {
+        let Some(&byte) = bytes.next() else {
+            return Err(VarintError::BufferTooShort);
+        };
         if idx >= 10 {
             return Err(VarintError::Overflow);
         }
@@ -271,7 +281,7 @@ pub fn read_uvarint(input: &[u8]) -> Result<(u64, usize), VarintError> {
             if used != uvarint_len(value) {
                 return Err(VarintError::NonCanonical);
             }
-            return Ok((value, used));
+            return Ok((value, bytes.as_slice()));
         }
 
         shift += 7;
@@ -569,5 +579,14 @@ mod tests {
             err,
             PeerIdError::InvalidCidVersionVarint(VarintError::BufferTooShort)
         );
+    }
+
+    #[test]
+    fn reads_uvarint_with_remainder() {
+        let input = [0xac, 0x02, 0xaa, 0xbb];
+        let (value, remaining) = read_uvarint_with_remainder(&input).expect("valid varint");
+
+        assert_eq!(value, 300);
+        assert_eq!(remaining, [0xaa, 0xbb]);
     }
 }
