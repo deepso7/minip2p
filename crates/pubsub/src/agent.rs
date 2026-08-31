@@ -19,7 +19,7 @@ use minip2p_transport::StreamId;
 
 use crate::config::FloodsubConfig;
 use crate::events::{
-    PublishError, PubsubAction, PubsubEvent, PubsubToken, SharedFrame, TopicError, share_frame,
+    PublishError, PubsubAction, PubsubEvent, PubsubToken, SharedFrame, TopicError,
 };
 use crate::message::{
     FLOODSUB_PROTOCOL_ID, FrameDecode, MAX_RPC_SIZE, MAX_TOPIC_LEN, RawMessage, Rpc, SubOpts,
@@ -278,7 +278,7 @@ impl FloodsubAgent {
             self.config.max_seen_messages,
         );
 
-        let frame = share_frame(encode_frame(&body));
+        let frame: SharedFrame = encode_frame(&body).into();
         for peer in recipients {
             if let Some(state) = self.peers.get_mut(&peer) {
                 state.pending.push_back(frame.clone());
@@ -923,7 +923,7 @@ impl FloodsubAgent {
             publish: alloc::vec![message.clone()],
             control: None,
         };
-        let frame = share_frame(encode_frame(&rpc.encode()));
+        let frame: SharedFrame = encode_frame(&rpc.encode()).into();
         let recipients: Vec<PeerId> = self
             .peers
             .iter()
@@ -991,7 +991,7 @@ impl FloodsubAgent {
                 control: None,
             };
             OutboundWork::Subscriptions {
-                frame: share_frame(encode_frame(&rpc.encode())),
+                frame: encode_frame(&rpc.encode()).into(),
                 snapshot: self.topics.clone(),
             }
         } else if let Some(front) = state.pending.front() {

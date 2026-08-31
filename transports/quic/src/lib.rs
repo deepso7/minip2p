@@ -1987,14 +1987,20 @@ mod tests {
     use minip2p_identity::Ed25519Keypair;
 
     #[test]
-    fn local_addr_returns_the_address_captured_at_bind() {
+    fn bound_socket_address_is_exposed_as_transport_multiaddr() {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("bind socket");
         let bound = socket.local_addr().expect("bound address");
         let transport = QuicTransport::from_socket(QuicNodeConfig::generate(), socket)
             .expect("construct transport");
+        let expected = Multiaddr::from_protocols(vec![
+            Protocol::Ip4([127, 0, 0, 1]),
+            Protocol::Udp(bound.port()),
+            Protocol::QuicV1,
+        ]);
 
-        assert_eq!(transport.bound_addr, bound);
-        assert_eq!(transport.local_addr(), bound);
+        assert_ne!(bound.port(), 0, "the OS must resolve the ephemeral port");
+        assert_eq!(transport.local_multiaddr(), expected);
+        assert_eq!(Transport::local_addresses(&transport), vec![expected]);
     }
 
     fn localhost_peer_addr(port: u16) -> PeerAddr {

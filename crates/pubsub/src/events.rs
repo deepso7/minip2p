@@ -21,10 +21,6 @@ pub struct PubsubToken(pub(crate) u64);
 /// endpoint containing an agent remains safe to move into a driver thread.
 pub(crate) type SharedFrame = Shared<[u8]>;
 
-pub(crate) fn share_frame(frame: Vec<u8>) -> SharedFrame {
-    frame.into()
-}
-
 /// I/O the driver must perform on the agent's behalf.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PubsubAction {

@@ -13,7 +13,7 @@ use minip2p_transport::StreamId;
 use super::config::GossipsubConfig;
 use super::mcache::MessageCache;
 use crate::events::{
-    PublishError, PubsubAction, PubsubEvent, PubsubToken, SharedFrame, TopicError, share_frame,
+    PublishError, PubsubAction, PubsubEvent, PubsubToken, SharedFrame, TopicError,
 };
 use crate::message::{
     ControlGraft, ControlIHave, ControlIWant, ControlMessage, ControlPrune, FrameDecode,
@@ -597,7 +597,7 @@ impl GossipsubAgent {
         self.mcache
             .put(id, message, alloc::vec![String::from(topic)]);
 
-        let frame = share_frame(encode_frame(&body));
+        let frame: SharedFrame = encode_frame(&body).into();
         for peer in recipients {
             if let Some(state) = self.peers.get_mut(&peer) {
                 state.pending_messages.push_back(frame.clone());
@@ -1301,7 +1301,7 @@ impl GossipsubAgent {
                 }
                 .encode();
                 if body.len() <= MAX_RPC_SIZE
-                    && self.queue_message(peer, share_frame(encode_frame(&body)))
+                    && self.queue_message(peer, encode_frame(&body).into())
                 {
                     *self.iwant_served.entry(peer.clone()).or_default() += 1;
                 }
@@ -1369,14 +1369,15 @@ impl GossipsubAgent {
             .filter(|peer| **peer != *arrival && **peer != from)
             .cloned()
             .collect();
-        let frame = share_frame(encode_frame(
+        let frame: SharedFrame = encode_frame(
             &Rpc {
                 subscriptions: Vec::new(),
                 publish: alloc::vec![message.clone()],
                 control: None,
             }
             .encode(),
-        ));
+        )
+        .into();
         for peer in recipients {
             if self.queue_message(&peer, frame.clone()) {
                 self.drive_sender(&peer, now_ms);
@@ -1617,7 +1618,7 @@ impl GossipsubAgent {
             .encode();
             debug_assert_eq!(body.len(), body_len);
             Some((
-                share_frame(encode_frame(&body)),
+                encode_frame(&body).into(),
                 FrameCommit::Subscriptions(subscriptions),
             ))
         } else {
@@ -1635,10 +1636,7 @@ impl GossipsubAgent {
                 .get_mut(peer)
                 .and_then(|state| state.pending_control.take_frame(version))
             {
-                Some((
-                    share_frame(encode_frame(&body)),
-                    FrameCommit::Control(items),
-                ))
+                Some((encode_frame(&body).into(), FrameCommit::Control(items)))
             } else {
                 self.peers
                     .get(peer)
@@ -1892,6 +1890,38 @@ impl SplitMix64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fanout_queues_share_one_framed_payload() {
+        let mut agent = GossipsubAgent::new(
+            Ed25519Keypair::from_secret_key_bytes([1; 32]),
+            GossipsubConfig::default(),
+            0,
+            0,
+        );
+        let first = Ed25519Keypair::from_secret_key_bytes([2; 32]).peer_id();
+        let second = Ed25519Keypair::from_secret_key_bytes([3; 32]).peer_id();
+        for peer in [&first, &second] {
+            let mut state = PeerState::default();
+            state.remote_topics.insert(String::from("topic"));
+            state.advertised_version = Some(MeshsubVersion::V11);
+            agent.peers.insert(peer.clone(), state);
+        }
+
+        agent
+            .publish("topic", alloc::vec![7; 1024], 0)
+            .expect("publish");
+
+        let first_frame = agent.peers[&first]
+            .pending_messages
+            .front()
+            .expect("first frame");
+        let second_frame = agent.peers[&second]
+            .pending_messages
+            .front()
+            .expect("second frame");
+        assert!(core::ptr::eq(first_frame.as_ptr(), second_frame.as_ptr()));
+    }
 
     #[test]
     fn in_flight_control_ownership_preserves_later_aliases() {
