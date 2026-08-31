@@ -268,11 +268,10 @@ impl SymmetricState {
     fn with_prologue(prologue: &[u8]) -> Self {
         let mut initial = [0u8; 32];
         if PROTOCOL_NAME.len() <= initial.len() {
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "The branch proves the fixed hash buffer holds the protocol name."
-            )]
-            initial[..PROTOCOL_NAME.len()].copy_from_slice(PROTOCOL_NAME);
+            initial
+                .get_mut(..PROTOCOL_NAME.len())
+                .expect("protocol name length was checked against the hash buffer")
+                .copy_from_slice(PROTOCOL_NAME);
         } else {
             initial = Sha256::digest(PROTOCOL_NAME).into();
         }

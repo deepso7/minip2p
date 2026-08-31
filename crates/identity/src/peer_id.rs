@@ -320,11 +320,12 @@ fn encode_base58(input: &[u8]) -> String {
     let leading_zeros = input.iter().take_while(|byte| **byte == 0).count();
     let mut digits = Vec::with_capacity((input.len() * 138 / 100) + 1);
 
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "leading_zeros is counted from input and cannot exceed its length"
-    )]
-    for byte in input[leading_zeros..].iter().copied() {
+    for byte in input
+        .get(leading_zeros..)
+        .expect("leading zero count comes from the same input")
+        .iter()
+        .copied()
+    {
         let mut carry = byte as u32;
         for digit in &mut digits {
             let value = (*digit as u32) * 256 + carry;
@@ -351,11 +352,11 @@ fn encode_base58(input: &[u8]) -> String {
     }
 
     for digit in digits.iter().rev().copied() {
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "base-58 digits are produced by modulo 58 and fit the alphabet"
-        )]
-        out.push(BASE58_ALPHABET[digit as usize] as char);
+        out.push(
+            *BASE58_ALPHABET
+                .get(digit as usize)
+                .expect("base-58 digit is produced by modulo 58") as char,
+        );
     }
 
     out
@@ -432,21 +433,21 @@ fn encode_base32_nopad_lower(input: &[u8]) -> String {
         while bits >= 5 {
             bits -= 5;
             let idx = ((buffer >> bits) & 0x1f) as usize;
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "the 0x1f mask restricts base-32 indices to the 32-byte alphabet"
-            )]
-            out.push(BASE32_ALPHABET_LOWER[idx] as char);
+            out.push(
+                *BASE32_ALPHABET_LOWER
+                    .get(idx)
+                    .expect("base-32 index is masked to five bits") as char,
+            );
         }
     }
 
     if bits > 0 {
         let idx = ((buffer << (5 - bits)) & 0x1f) as usize;
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "the 0x1f mask restricts base-32 indices to the 32-byte alphabet"
-        )]
-        out.push(BASE32_ALPHABET_LOWER[idx] as char);
+        out.push(
+            *BASE32_ALPHABET_LOWER
+                .get(idx)
+                .expect("base-32 index is masked to five bits") as char,
+        );
     }
 
     out

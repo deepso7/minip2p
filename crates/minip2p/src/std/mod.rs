@@ -2127,11 +2127,7 @@ fn bind_transports(_parts: &BuilderParts) -> Result<TransportSet, Error> {
     #[cfg(any(feature = "quic", feature = "tcp"))]
     let mut set = TransportSet::new();
     #[cfg(not(any(feature = "quic", feature = "tcp")))]
-    #[expect(
-        unused_mut,
-        reason = "Transport-less std builds keep this shared construction path without inserts."
-    )]
-    let mut set = TransportSet::new();
+    let set = TransportSet::new();
     #[cfg(feature = "tcp")]
     let mut tcp_bound = false;
     #[cfg(any(feature = "quic", feature = "tcp"))]

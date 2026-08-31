@@ -494,12 +494,11 @@ impl StopInitiator {
         self.outputs
             .push_back(StopInitiatorOutput::Outcome(outcome));
         if self.bridged && consumed < self.recv_buf.len() {
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "a complete frame reports consumed within recv_buf"
-            )]
             self.outputs.push_back(StopInitiatorOutput::BridgeData(
-                self.recv_buf[consumed..].to_vec(),
+                self.recv_buf
+                    .get(consumed..)
+                    .expect("a complete frame consumes no more than the receive buffer")
+                    .to_vec(),
             ));
         }
         self.recv_buf.clear();

@@ -211,13 +211,10 @@ fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
-#[expect(
-    clippy::indexing_slicing,
-    reason = "callers pass only the high or masked-low nibble of a byte"
-)]
 fn hex_digit(nibble: u8) -> char {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    HEX[nibble as usize] as char
+    *HEX.get(nibble as usize)
+        .expect("hex digit input is a four-bit nibble") as char
 }
 
 fn decode_secret(input: &str) -> Result<[u8; SECRET_KEY_LENGTH], String> {
