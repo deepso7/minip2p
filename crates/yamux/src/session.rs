@@ -235,12 +235,13 @@ impl YamuxSession {
             }
 
             state.send_window -= immediate_len as u32;
-            let (immediate, queued) = data.split_at(immediate_len);
-            if data.is_empty() && state.pending_open.is_some() {
+            let was_empty = data.is_empty();
+            let mut immediate = data;
+            let queued = immediate.split_off(immediate_len);
+            if was_empty && state.pending_open.is_some() {
                 let flags = state.take_open_flag();
                 frames.push(Frame::data(stream, flags, Vec::new())?);
             } else if immediate_len != 0 {
-                let mut immediate = immediate.to_vec();
                 let mut first = true;
                 while !immediate.is_empty() {
                     let rest = if immediate.len() > max_frame_len {
@@ -255,7 +256,7 @@ impl YamuxSession {
                 }
             }
             if queued_len != 0 {
-                state.send_buffer.push_back(queued.to_vec());
+                state.send_buffer.push_back(queued);
                 state.buffered_send += queued_len;
             }
             buffered_added = queued_len;
