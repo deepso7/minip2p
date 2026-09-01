@@ -79,6 +79,11 @@ The deploy command builds its Docker context under `.alchemy/` from tracked
 files. Local `target/`, dependency trees, reference checkouts, and other
 generated directories never enter Alchemy's pre-Docker content hash.
 
+CI sets `BENCH_STAGE`, `BENCH_CLUSTER`, and `BENCH_TASK_FAMILY` from the
+workflow run ID. Each run therefore owns a separate stack and can execute
+without a lossy GitHub Actions concurrency queue. Local commands omit these
+variables and continue to use the shared `ci` stack.
+
 Remove every stack-owned resource with:
 
 ```bash

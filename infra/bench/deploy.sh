@@ -3,6 +3,7 @@ set -euo pipefail
 
 repository=$(git rev-parse --show-toplevel)
 context="$repository/infra/bench/.alchemy/docker-context"
+stage=${BENCH_STAGE:-ci}
 
 # Alchemy hashes the raw context before Docker applies .dockerignore. Copy only
 # tracked files so local build outputs and reference checkouts never enter that
@@ -14,4 +15,4 @@ git -C "$repository" ls-files -z \
   | tar --extract --directory "$context"
 
 export BENCH_DOCKER_CONTEXT="$context"
-exec alchemy deploy --stage ci --yes
+exec alchemy deploy --stage "$stage" --yes

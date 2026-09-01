@@ -4,8 +4,8 @@ set -euo pipefail
 : "${AWS_REGION:?AWS_REGION is required}"
 : "${BENCH_GIT_SHA:?BENCH_GIT_SHA is required}"
 
-cluster=minip2p-bench
-family=minip2p-bench
+cluster=${BENCH_CLUSTER:-minip2p-bench}
+family=${BENCH_TASK_FAMILY:-minip2p-bench}
 output=${BENCH_OUTPUT:-target/bench-artifacts/current.json}
 task_arn=
 
