@@ -149,6 +149,7 @@ class BenchResultsTest(unittest.TestCase):
                 estimate = root.joinpath(*name.split("/"), "new", "estimates.json")
                 estimate.parent.mkdir(parents=True)
                 estimate.write_text(json.dumps({"median": {"point_estimate": 10}}))
+                estimate.with_name("benchmark.json").write_text(json.dumps({"full_id": name}))
             bench_results.collect_criterion(root, output, "sha", marker)
             self.assertEqual(len(json.loads(output.read_text())["rows"]), len(bench_results.EXPECTED_CRITERION))
 
@@ -156,6 +157,41 @@ class BenchResultsTest(unittest.TestCase):
             root.joinpath(*missing.split("/"), "new", "estimates.json").unlink()
             with self.assertRaisesRegex(bench_results.BenchError, "row set mismatch"):
                 bench_results.collect_criterion(root, output, "sha", marker)
+
+    def test_gungraun_collector_reads_tagged_integer_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "gungraun"
+            marker = Path(directory) / "started"
+            output = Path(directory) / "results.json"
+            marker.touch()
+            for identifier in bench_results.GUNGRAUN_NAMES:
+                summary = root / identifier / "summary.json"
+                summary.parent.mkdir(parents=True)
+                summary.write_text(
+                    json.dumps(
+                        {
+                            "id": identifier,
+                            "profiles": [
+                                {
+                                    "tool": "Callgrind",
+                                    "summaries": {
+                                        "total": {
+                                            "summary": {
+                                                "Callgrind": {
+                                                    "Ir": {"metrics": {"Left": {"Int": 42}}}
+                                                }
+                                            }
+                                        }
+                                    },
+                                }
+                            ],
+                        }
+                    )
+                )
+            bench_results.collect_gungraun(root, output, "sha", marker)
+            rows = json.loads(output.read_text())["rows"]
+            self.assertEqual(len(rows), len(bench_results.GUNGRAUN_NAMES))
+            self.assertTrue(all(row["value"] == 42 for row in rows))
 
     def test_renderer_has_locked_layout(self):
         rows = bench_results.compare_rows(self.current, self.baseline, None)

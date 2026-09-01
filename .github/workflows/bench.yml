@@ -1,0 +1,270 @@
+name: Bench
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.98.0"
+  RUST_TARGET: x86_64-unknown-linux-gnu
+  GUNGRAUN_VERSION: "0.19.4"
+  VALGRIND_VERSION: "3.27.1"
+  NODE_VERSION: "24"
+  PNPM_VERSION: "11.24.0"
+
+jobs:
+  rust-micro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      complete: ${{ steps.result.outputs.complete }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.RUST_TARGET }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: gungraun/setup-gungraun@62591572561bb2f4ed2ae300b8a8bea99ea8ddaf # v1.1.3
+        with:
+          runner-version: ${{ env.GUNGRAUN_VERSION }}
+          runner-target: ${{ env.RUST_TARGET }}
+          valgrind-version: ${{ env.VALGRIND_VERSION }}
+      - name: Measure
+        id: measure
+        continue-on-error: true
+        run: scripts/run-benches.sh ir
+      - name: Prepare result slice
+        id: result
+        if: always()
+        env:
+          MEASURE_OUTCOME: ${{ steps.measure.outcome }}
+        run: |
+          complete=false
+          if [ "$MEASURE_OUTCOME" = success ] && python3 scripts/bench_results.py merge target/bench-results/rust-micro.json --output target/bench-artifacts/rust-micro.json --git-sha "$(git rev-parse HEAD)"; then
+            complete=true
+          else
+            mkdir -p target/bench-artifacts
+            jq -n --arg sha "$(git rev-parse HEAD)" '{schema_version: 1, git_sha: $sha, rows: []}' > target/bench-artifacts/rust-micro.json
+          fi
+          echo "complete=$complete" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-rust-micro
+          path: target/bench-artifacts/rust-micro.json
+          if-no-files-found: error
+
+  rust-wall:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      complete: ${{ steps.result.outputs.complete }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.RUST_TARGET }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Measure
+        id: measure
+        continue-on-error: true
+        run: scripts/run-benches.sh wall
+      - name: Prepare result slice
+        id: result
+        if: always()
+        env:
+          MEASURE_OUTCOME: ${{ steps.measure.outcome }}
+        run: |
+          complete=false
+          if [ "$MEASURE_OUTCOME" = success ] && python3 scripts/bench_results.py merge target/bench-results/rust-wall.json --output target/bench-artifacts/rust-wall.json --git-sha "$(git rev-parse HEAD)"; then
+            complete=true
+          else
+            mkdir -p target/bench-artifacts
+            jq -n --arg sha "$(git rev-parse HEAD)" '{schema_version: 1, git_sha: $sha, rows: []}' > target/bench-artifacts/rust-wall.json
+          fi
+          echo "complete=$complete" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-rust-wall
+          path: target/bench-artifacts/rust-wall.json
+          if-no-files-found: error
+
+  node-ffi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      complete: ${{ steps.result.outputs.complete }}
+    defaults:
+      run:
+        working-directory: bindings/ts
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: bindings/ts/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.RUST_TARGET }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build native binding
+        run: pnpm --filter @minip2p/node native:build
+      - name: Measure
+        id: measure
+        continue-on-error: true
+        run: pnpm --filter @minip2p/node bench
+      - name: Prepare result slice
+        id: result
+        if: always()
+        env:
+          MEASURE_OUTCOME: ${{ steps.measure.outcome }}
+        run: |
+          complete=false
+          if [ "$MEASURE_OUTCOME" = success ] && python3 ../../scripts/bench_results.py merge ../../target/bench-results/node-ffi.json --output ../../target/bench-artifacts/node-ffi.json --git-sha "$(git rev-parse HEAD)"; then
+            complete=true
+          else
+            mkdir -p ../../target/bench-artifacts
+            jq -n --arg sha "$(git rev-parse HEAD)" '{schema_version: 1, git_sha: $sha, rows: []}' > ../../target/bench-artifacts/node-ffi.json
+          fi
+          echo "complete=$complete" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bench-node-ffi
+          path: target/bench-artifacts/node-ffi.json
+          if-no-files-found: error
+
+  baseline:
+    if: >-
+      github.event_name == 'push' &&
+      needs.rust-micro.outputs.complete == 'true' &&
+      needs.rust-wall.outputs.complete == 'true' &&
+      needs.node-ffi.outputs.complete == 'true'
+    needs: [rust-micro, rust-wall, node-ffi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: bench-baseline
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: bench-*
+          path: ${{ runner.temp }}/bench-slices
+          merge-multiple: true
+      - name: Merge result slices
+        run: python3 scripts/bench_results.py merge "$RUNNER_TEMP"/bench-slices/*.json --output "$RUNNER_TEMP/results.json" --git-sha "$GITHUB_SHA"
+      - name: Update baseline branch
+        env:
+          BASELINE_DIR: ${{ runner.temp }}/bench-data
+        run: |
+          git worktree add --detach "$BASELINE_DIR"
+          if git -C "$BASELINE_DIR" fetch --depth=1 origin bench-data; then
+            git -C "$BASELINE_DIR" checkout -B bench-data FETCH_HEAD
+          else
+            git -C "$BASELINE_DIR" checkout --orphan bench-data
+            git -C "$BASELINE_DIR" rm -rf .
+          fi
+          cp "$RUNNER_TEMP/results.json" "$BASELINE_DIR/$GITHUB_SHA.json"
+          printf '%s\n' "$GITHUB_SHA" > "$BASELINE_DIR/latest"
+          git -C "$BASELINE_DIR" add "$GITHUB_SHA.json" latest
+          git -C "$BASELINE_DIR" -c user.name=github-actions -c user.email=41898282+github-actions[bot]@users.noreply.github.com commit -m "bench: $GITHUB_SHA"
+          for attempt in 1 2 3; do
+            if git -C "$BASELINE_DIR" push origin HEAD:bench-data; then
+              exit 0
+            fi
+            git -C "$BASELINE_DIR" pull --rebase origin bench-data
+          done
+          exit 1
+
+  compare:
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    needs: [rust-micro, rust-wall, node-ffi]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: bench-*
+          path: ${{ runner.temp }}/bench-slices
+          merge-multiple: true
+      - name: Merge result slices
+        run: python3 scripts/bench_results.py merge "$RUNNER_TEMP"/bench-slices/*.json --output "$RUNNER_TEMP/current.json" --git-sha "$(git rev-parse HEAD)"
+      - name: Read baseline
+        id: baseline
+        run: |
+          if ! git fetch --depth=1 origin bench-data; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          baseline_sha=$(git show FETCH_HEAD:latest)
+          git show "FETCH_HEAD:$baseline_sha.json" > "$RUNNER_TEMP/baseline.json"
+          git cat-file -e "$baseline_sha^{commit}" 2>/dev/null || git fetch origin "$baseline_sha"
+          merge_base=$(git merge-base "${{ github.event.pull_request.head.sha }}" "${{ github.event.pull_request.base.sha }}")
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$baseline_sha" >> "$GITHUB_OUTPUT"
+          if [ "$baseline_sha" = "$merge_base" ]; then
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Compare with baseline
+        if: steps.baseline.outputs.available == 'true'
+        run: >-
+          python3 scripts/bench_results.py compare
+          --current "$RUNNER_TEMP/current.json"
+          --baseline "$RUNNER_TEMP/baseline.json"
+          --output "$RUNNER_TEMP/comparison.md"
+          --check-ir-pins
+          --baseline-tree "${{ steps.baseline.outputs.sha }}"
+          --current-tree "${{ github.event.pull_request.head.sha }}"
+          ${{ steps.baseline.outputs.stale == 'true' && '--stale' || '' }}
+      - name: Compare without baseline
+        if: steps.baseline.outputs.available != 'true'
+        run: python3 scripts/bench_results.py compare --current "$RUNNER_TEMP/current.json" --output "$RUNNER_TEMP/comparison.md"
+      - name: Prepare comparison artifact
+        run: printf '%s\n' "${{ github.event.pull_request.number }}" > "$RUNNER_TEMP/pr-number"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bench-comparison
+          path: |
+            ${{ runner.temp }}/comparison.md
+            ${{ runner.temp }}/pr-number
+          if-no-files-found: error
