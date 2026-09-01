@@ -75,6 +75,10 @@ pnpm install --frozen-lockfile
 pnpm run deploy
 ```
 
+The deploy command builds its Docker context under `.alchemy/` from tracked
+files. Local `target/`, dependency trees, reference checkouts, and other
+generated directories never enter Alchemy's pre-Docker content hash.
+
 Remove every stack-owned resource with:
 
 ```bash

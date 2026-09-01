@@ -6,7 +6,16 @@
 target
 target-linux
 tmp
+**/.cache
+**/.blume-verify
+**/coverage
+**/dist
+**/out
+**/.next
 **/__pycache__
+**/*.profraw
+core
+core.*
 bindings/ts/node/*.node
 bindings/ts/node/npm/*/*.node
 crates/nodejs/*.node

@@ -8,7 +8,7 @@ use minip2p_quic::{QuicLimits, QuicNodeConfig, QuicTransport};
 use minip2p_transport::Transport;
 
 const COUNTS: &[usize] = &[1, 64, 256, 512];
-const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn idle_poll(c: &mut Criterion) {
     let mut group = c.benchmark_group("quic/idle_poll");
@@ -17,12 +17,12 @@ fn idle_poll(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
 
     for &count in COUNTS {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
-            let (mut server, client, server_peer, client_peer) = establish(count);
-            assert_eq!(server.connection_ids_for_peer(&client_peer).len(), count);
-            assert_eq!(client.connection_ids_for_peer(&server_peer).len(), count);
+        let (mut server, client, server_peer, client_peer) = establish(count);
+        assert_eq!(server.connection_ids_for_peer(&client_peer).len(), count);
+        assert_eq!(client.connection_ids_for_peer(&server_peer).len(), count);
 
-            let mut clock = StdClock::with_epoch(Instant::now());
+        let mut clock = StdClock::with_epoch(Instant::now());
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, move |b, _| {
             b.iter(|| {
                 let events = server.poll(clock.now()).expect("idle poll");
                 assert!(events.is_empty(), "idle benchmark must not emit events");
@@ -34,6 +34,10 @@ fn idle_poll(c: &mut Criterion) {
 }
 
 fn establish(count: usize) -> (QuicTransport, QuicTransport, PeerId, PeerId) {
+    let setup_timeout = std::env::var("MINIP2P_BENCH_SETUP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|seconds| seconds.parse().ok())
+        .map_or(DEFAULT_SETUP_TIMEOUT, Duration::from_secs);
     let limits = QuicLimits {
         idle_timeout_ms: 3_600_000,
         ..QuicLimits::default()
@@ -69,7 +73,7 @@ fn establish(count: usize) -> (QuicTransport, QuicTransport, PeerId, PeerId) {
             return (server, client, server_peer, client_peer);
         }
         assert!(
-            started.elapsed() < SETUP_TIMEOUT,
+            started.elapsed() < setup_timeout,
             "connection setup timed out"
         );
         std::thread::sleep(Duration::from_millis(1));

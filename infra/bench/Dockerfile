@@ -7,9 +7,11 @@ ARG GUNGRAUN_VERSION=0.19.4
 ARG VALGRIND_VERSION=3.27.1
 ARG VALGRIND_SHA256=5d589152eb8071c02feab8ce6ab719e431a1fbc3e2b1700f5432632a8b9264dc
 ARG PNPM_VERSION=11.24.0
+ARG BUILD_JOBS=2
 
 ENV CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
+    CARGO_BUILD_JOBS=$BUILD_JOBS \
     PATH=/usr/local/cargo/bin:$PATH \
     CARGO_TERM_COLOR=always
 
@@ -37,7 +39,7 @@ RUN apt-get update \
     && tar -xjf "valgrind-${VALGRIND_VERSION}.tar.bz2" \
     && cd "valgrind-${VALGRIND_VERSION}" \
     && ./configure --prefix=/usr/local \
-    && make -j"$(nproc)" \
+    && make -j"$BUILD_JOBS" \
     && make install \
     && cd / \
     && rm -rf "valgrind-${VALGRIND_VERSION}" "valgrind-${VALGRIND_VERSION}.tar.bz2" \

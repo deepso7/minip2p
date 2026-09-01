@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import { resolve } from "node:path";
 
 const repository = resolve(import.meta.dirname, "../..");
+const dockerContext = process.env.BENCH_DOCKER_CONTEXT ?? repository;
 
 export default Alchemy.Stack(
   "Minip2pBench",
@@ -20,8 +21,8 @@ export default Alchemy.Stack(
 
     const task = yield* AWS.ECS.Task("Task", {
       taskName: "minip2p-bench",
-      context: repository,
-      dockerfile: resolve(import.meta.dirname, "Dockerfile"),
+      context: dockerContext,
+      dockerfile: resolve(dockerContext, "infra/bench/Dockerfile"),
       cpu: 2048,
       memory: 4096,
       runtimePlatform: {
