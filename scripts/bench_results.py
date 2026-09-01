@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import subprocess
@@ -27,6 +26,25 @@ EXPECTED_CRITERION = {
     "e2e/tcp/setup", "e2e/tcp/ping", "e2e/tcp/echo_64b", "e2e/tcp/echo_64b_crossed_4x4",
     "e2e/tcp/transfer_1mib", "e2e/quic/setup", "e2e/quic/ping", "e2e/quic/echo_64b",
     "e2e/quic/echo_64b_crossed_4x4", "e2e/quic/transfer_1mib",
+}
+GUNGRAUN_NAMES = {
+    "parse_text": "multiaddr/parse_text",
+    "encode_binary": "multiaddr/encode_binary",
+    "decode_binary": "multiaddr/decode_binary",
+    "session_send_and_drain": "yamux/64KiB/session_send_and_drain",
+    "session_receive_and_drain": "yamux/64KiB/session_receive_and_drain",
+    "tick_active": "peer_book_128_peers_16_addrs/tick_active",
+    "tick_expire": "peer_book_128_peers_16_addrs/tick_expire",
+    "next_timeout": "peer_book_128_peers_16_addrs/next_timeout",
+    "floodsub_publish_32x60_kib": "pubsub/floodsub_publish_32x60KiB",
+    "relay_handle_event_same_now_128_pending_hops": "relay_handle_event_same_now_128_pending_hops",
+}
+EXPECTED_VITEST = {"sdk_drain_flood", "raw_drain_events", "connected_peers_sync"}
+IR_PINS = {
+    "rust": "Rust toolchain",
+    "profile": "optimization profile",
+    "gungraun": "Gungraun version",
+    "valgrind": "Valgrind version",
 }
 
 
@@ -121,31 +139,22 @@ def collect_vitest(report: Path, output: Path, git_sha: str) -> None:
                 if not isinstance(name, str) or not isinstance(median_ms, (int, float)):
                     raise BenchError(f"invalid Vitest benchmark in {report}")
                 rows.append({"tier": "node-ffi", "name": name, "metric": "median_ns", "value": median_ms * 1_000_000})
-    if not rows:
-        raise BenchError(f"no Vitest benchmarks found in {report}")
+    names = {row["name"] for row in rows}
+    if names != EXPECTED_VITEST or len(rows) != len(EXPECTED_VITEST):
+        missing = sorted(EXPECTED_VITEST - names)
+        unexpected = sorted(names - EXPECTED_VITEST)
+        raise BenchError(f"Vitest row set mismatch; missing={missing}, unexpected={unexpected}")
     write_results(git_sha, rows, output)
 
 
 def collect_gungraun(root: Path, output: Path, git_sha: str) -> None:
-    name_map = {
-        "parse_text": "multiaddr/parse_text",
-        "encode_binary": "multiaddr/encode_binary",
-        "decode_binary": "multiaddr/decode_binary",
-        "session_send_and_drain": "yamux/64KiB/session_send_and_drain",
-        "session_receive_and_drain": "yamux/64KiB/session_receive_and_drain",
-        "tick_active": "peer_book_128_peers_16_addrs/tick_active",
-        "tick_expire": "peer_book_128_peers_16_addrs/tick_expire",
-        "next_timeout": "peer_book_128_peers_16_addrs/next_timeout",
-        "floodsub_publish_32x60_kib": "pubsub/floodsub_publish_32x60KiB",
-        "relay_handle_event_same_now_128_pending_hops": "relay_handle_event_same_now_128_pending_hops",
-    }
     rows = []
     for path in root.glob("**/summary.json"):
         summary = load_json(path)
         identifier = summary.get("id") or summary.get("function_name")
-        name = name_map.get(identifier)
+        name = GUNGRAUN_NAMES.get(identifier)
         if name is None:
-            continue
+            raise BenchError(f"unexpected Gungraun benchmark {identifier!r} in {path}")
         ir = None
         for profile in summary.get("profiles", []):
             if profile.get("tool") != "Callgrind":
@@ -155,8 +164,12 @@ def collect_gungraun(root: Path, output: Path, git_sha: str) -> None:
         if not isinstance(ir, (int, float)):
             raise BenchError(f"missing Callgrind Ir in {path}")
         rows.append({"tier": "rust-micro", "name": name, "metric": "Ir", "value": ir})
-    if len(rows) != 10:
-        raise BenchError(f"expected 10 Gungraun summaries under {root}, found {len(rows)}")
+    names = {row["name"] for row in rows}
+    expected = set(GUNGRAUN_NAMES.values())
+    if names != expected or len(rows) != len(expected):
+        missing = sorted(expected - names)
+        unexpected = sorted(names - expected)
+        raise BenchError(f"Gungraun row set mismatch; missing={missing}, unexpected={unexpected}")
     write_results(git_sha, rows, output)
 
 
@@ -171,17 +184,15 @@ def git_bytes(tree: str, path: str) -> bytes:
 
 def ir_compatible(baseline_tree: str, current_tree: str) -> tuple[bool, str | None]:
     """Compare the five pins that make instruction counts comparable."""
-    checks = (
-        ("Cargo.lock", "Cargo.lock", True),
-        ("Rust toolchain", "bench/pins.json", False),
-    )
-    for label, path, use_hash in checks:
-        before = git_bytes(baseline_tree, path)
-        after = git_bytes(current_tree, path)
-        if use_hash:
-            before = hashlib.sha256(before).digest()
-            after = hashlib.sha256(after).digest()
-        if before != after:
+    if git_bytes(baseline_tree, "Cargo.lock") != git_bytes(current_tree, "Cargo.lock"):
+        return False, "incompatible Ir pins: Cargo.lock differs"
+    try:
+        before = json.loads(git_bytes(baseline_tree, "bench/pins.json"))
+        after = json.loads(git_bytes(current_tree, "bench/pins.json"))
+    except json.JSONDecodeError as error:
+        raise BenchError(f"invalid bench/pins.json: {error}") from error
+    for key, label in IR_PINS.items():
+        if before.get(key) != after.get(key):
             return False, f"incompatible Ir pins: {label} differs"
     return True, None
 
@@ -269,8 +280,8 @@ def render(
 def command_compare(args: argparse.Namespace) -> None:
     current = validate(load_json(args.current))
     baseline = None if args.baseline is None else validate(load_json(args.baseline))
-    ir_reason = args.ir_reason
-    if baseline is not None and ir_reason is None and args.check_ir_pins:
+    ir_reason = None
+    if baseline is not None and args.check_ir_pins:
         compatible, ir_reason = ir_compatible(args.baseline_tree or baseline["git_sha"], args.current_tree or current["git_sha"])
         if compatible:
             ir_reason = None
@@ -313,7 +324,6 @@ def parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--check-ir-pins", action="store_true")
     compare_parser.add_argument("--baseline-tree")
     compare_parser.add_argument("--current-tree")
-    compare_parser.add_argument("--ir-reason", help=argparse.SUPPRESS)
     compare_parser.set_defaults(run=command_compare)
     return root
 

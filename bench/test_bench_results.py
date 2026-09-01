@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -38,6 +39,44 @@ class BenchResultsTest(unittest.TestCase):
         self.assertTrue(all(row.classification == "unclassified" for row in rows if row.tier == "rust-micro"))
         self.assertEqual(next(row for row in rows if row.tier == "rust-wall").classification, "changed")
 
+    def test_ir_compatibility_checks_each_git_pin(self):
+        changes = {
+            "Cargo.lock": ("Cargo.lock", "lock changed\n", "Cargo.lock differs"),
+            **{
+                key: ("bench/pins.json", {key: "changed"}, f"{label} differs")
+                for key, label in bench_results.IR_PINS.items()
+            },
+        }
+        for name, (path, change, expected) in changes.items():
+            with self.subTest(pin=name), tempfile.TemporaryDirectory() as directory:
+                repository = Path(directory)
+                subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+                subprocess.run(["git", "config", "user.email", "bench@example.invalid"], cwd=repository, check=True)
+                subprocess.run(["git", "config", "user.name", "Bench Test"], cwd=repository, check=True)
+                (repository / "bench").mkdir()
+                (repository / "Cargo.lock").write_text("lock\n")
+                pins = {key: "same" for key in bench_results.IR_PINS}
+                (repository / "bench/pins.json").write_text(json.dumps(pins))
+                subprocess.run(["git", "add", "."], cwd=repository, check=True)
+                subprocess.run(["git", "commit", "-qm", "baseline"], cwd=repository, check=True)
+                baseline = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+                if isinstance(change, str):
+                    (repository / path).write_text(change)
+                else:
+                    pins.update(change)
+                    (repository / path).write_text(json.dumps(pins))
+                subprocess.run(["git", "add", "."], cwd=repository, check=True)
+                subprocess.run(["git", "commit", "-qm", "current"], cwd=repository, check=True)
+                current = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+                previous = Path.cwd()
+                try:
+                    os.chdir(repository)
+                    compatible, reason = bench_results.ir_compatible(baseline, current)
+                finally:
+                    os.chdir(previous)
+                self.assertFalse(compatible)
+                self.assertIn(expected, reason)
+
     def test_missing_current_row_is_unclassified(self):
         current = {**self.current, "rows": self.current["rows"][:-1]}
         baseline = {**self.baseline, "rows": [*self.baseline["rows"], self.current["rows"][-1]]}
@@ -56,6 +95,35 @@ class BenchResultsTest(unittest.TestCase):
             bench_results.merge([first, second], output, None)
             merged = bench_results.validate(json.loads(output.read_text()))
             self.assertEqual(len(merged["rows"]), 4)
+
+    def test_fixture_compare_cli_writes_locked_markdown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "comparison.md"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts/bench_results.py"),
+                    "compare",
+                    "--current",
+                    str(ROOT / "bench/fixtures/current.json"),
+                    "--baseline",
+                    str(ROOT / "bench/fixtures/baseline.json"),
+                    "--output",
+                    str(output),
+                ],
+                check=True,
+            )
+            markdown = output.read_text()
+            self.assertIn("Baseline: `baseline`", markdown)
+            self.assertIn("| rust-micro | 1 | 0 | 1 | 0 |", markdown)
+            self.assertIn("unclassified (missing baseline row)", markdown)
+
+    def test_zero_baseline_is_unclassified(self):
+        baseline = {**self.baseline, "rows": [{**self.baseline["rows"][0], "value": 0}]}
+        current = {**self.current, "rows": [self.current["rows"][0]]}
+        row = bench_results.compare_rows(current, baseline, None)[0]
+        self.assertEqual(row.classification, "unclassified")
+        self.assertEqual(row.reason, "zero baseline")
 
     def test_criterion_collector_requires_fresh_complete_manifest(self):
         with tempfile.TemporaryDirectory() as directory:

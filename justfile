@@ -157,6 +157,9 @@ bench-ir:
     GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-relay-server --bench relay_server_event_ir
     python3 scripts/bench_results.py gungraun --output target/bench-results/rust-micro.json --git-sha "$(git rev-parse HEAD)"
 
+bench-node:
+    cd bindings/ts && pnpm --filter @minip2p/node bench
+
 bench-results-test:
     python3 -m unittest discover -s bench -p 'test_*.py'
 

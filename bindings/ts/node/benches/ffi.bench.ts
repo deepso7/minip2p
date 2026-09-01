@@ -57,7 +57,7 @@ describe("node-ffi", () => {
     const deadline = Date.now() + TIMEOUT_MS;
     while (seen < BURST && Date.now() < deadline) {
       for (const event of rawA.drainEvents(256)) {
-        if (eventTag(event) === "StreamReady") {
+        if (isNativeEvent(event) && event.tag === "StreamReady") {
           seen += 1;
         }
       }
@@ -110,28 +110,24 @@ async function waitRawReady(
 ): Promise<void> {
   const deadline = Date.now() + TIMEOUT_MS;
   while (Date.now() < deadline) {
-    for (const event of endpoint.drainEvents(256)) {
-      if (eventTag(event) === "PeerReady" && eventPeer(event) === peerId) {
-        return;
-      }
+    endpoint.drainEvents(256);
+    if (endpoint.isPeerReady(peerId)) {
+      return;
     }
     await delay(1);
   }
   throw new Error(`Timed out waiting for ${peerId}`);
 }
 
-function eventTag(event: unknown): unknown {
-  return event !== null && typeof event === "object"
-    ? Reflect.get(event, "tag")
-    : undefined;
+interface NativeEvent {
+  readonly tag: string;
 }
 
-function eventPeer(event: unknown): unknown {
-  if (event === null || typeof event !== "object") {
-    return undefined;
-  }
-  const inner = Reflect.get(event, "inner");
-  return inner !== null && typeof inner === "object"
-    ? Reflect.get(inner, "peerId")
-    : undefined;
+function isNativeEvent(value: unknown): value is NativeEvent {
+  return (
+    value !== null &&
+    typeof value === "object" &&
+    "tag" in value &&
+    typeof value.tag === "string"
+  );
 }
