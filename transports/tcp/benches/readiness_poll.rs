@@ -9,6 +9,7 @@ use minip2p_core::Multiaddr;
 use minip2p_platform::Now;
 use minip2p_tcp::{StdTcpProvider, TcpEvent, TcpProvider};
 
+// The locked 512-connection sweep needs at least 1,027 open file descriptors.
 const COUNTS: &[usize] = &[1, 64, 256, 512];
 const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_BATCH: usize = 32;

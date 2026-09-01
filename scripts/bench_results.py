@@ -136,7 +136,7 @@ def collect_vitest(report: Path, output: Path, git_sha: str) -> None:
             for benchmark in group.get("benchmarks", []):
                 median_ms = benchmark.get("median")
                 name = benchmark.get("name")
-                if not isinstance(name, str) or not isinstance(median_ms, (int, float)):
+                if not isinstance(name, str) or isinstance(median_ms, bool) or not isinstance(median_ms, (int, float)):
                     raise BenchError(f"invalid Vitest benchmark in {report}")
                 rows.append({"tier": "node-ffi", "name": name, "metric": "median_ns", "value": median_ms * 1_000_000})
     names = {row["name"] for row in rows}
@@ -160,7 +160,10 @@ def collect_gungraun(root: Path, output: Path, git_sha: str) -> None:
             if profile.get("tool") != "Callgrind":
                 continue
             metric = profile["summaries"]["total"]["summary"]["Callgrind"]["Ir"]["metrics"]
-            ir = metric.get("Left", metric.get("Both", [None])[0])
+            ir = metric.get("Left")
+            if ir is None:
+                both = metric.get("Both") or []
+                ir = both[0] if both else None
         if not isinstance(ir, (int, float)):
             raise BenchError(f"missing Callgrind Ir in {path}")
         rows.append({"tier": "rust-micro", "name": name, "metric": "Ir", "value": ir})
@@ -286,6 +289,7 @@ def command_compare(args: argparse.Namespace) -> None:
         if compatible:
             ir_reason = None
     rows = compare_rows(current, baseline, ir_reason)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(render(current, baseline, rows, args.stale))
 
 

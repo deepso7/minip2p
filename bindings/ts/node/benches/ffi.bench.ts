@@ -15,17 +15,22 @@ let sdkA: Minip2p;
 let sdkB: Minip2p;
 let rawA: NativeEndpoint;
 let rawB: NativeEndpoint;
+const cleanup: (() => void)[] = [];
 
 beforeAll(async () => {
   sdkA = createSdk();
+  cleanup.push(() => sdkA.close());
   sdkB = createSdk();
+  cleanup.push(() => sdkB.close());
   await sdkA.connectAddr(sdkB.listenAddrs()[0], { timeoutMs: TIMEOUT_MS });
   await Promise.all([
     sdkA.waitPeerReady(sdkB.peerId(), { timeoutMs: TIMEOUT_MS }),
     sdkB.waitPeerReady(sdkA.peerId(), { timeoutMs: TIMEOUT_MS }),
   ]);
   rawA = createRaw();
+  cleanup.push(() => rawA.close());
   rawB = createRaw();
+  cleanup.push(() => rawB.close());
   rawA.connectAddr(rawB.listenAddrs()[0]);
   await Promise.all([
     waitRawReady(rawA, rawB.peerId()),
@@ -34,19 +39,21 @@ beforeAll(async () => {
 });
 
 afterAll(() => {
-  sdkA.close();
-  sdkB.close();
-  rawA.close();
-  rawB.close();
+  for (const close of cleanup.splice(0).toReversed()) {
+    close();
+  }
 });
 
 describe("node-ffi", () => {
   bench("sdk_drain_flood", async () => {
-    await Promise.all(
+    const streams = await Promise.all(
       Array.from({ length: BURST }, () =>
-        sdkA.ping(sdkB.peerId(), { timeoutMs: TIMEOUT_MS })
+        sdkA.openStream(sdkB.peerId(), PROTOCOL, { timeoutMs: TIMEOUT_MS })
       )
     );
+    for (const stream of streams) {
+      stream.abandon();
+    }
   });
 
   bench("raw_drain_events", async () => {
@@ -82,6 +89,7 @@ describe("node-ffi", () => {
 
 function createSdk(): Minip2p {
   return Minip2p.create({
+    protocols: [PROTOCOL],
     secretKey: generateSecretKey(),
     transports: { tcp: { listen: ["/ip4/127.0.0.1/tcp/0"] } },
   });

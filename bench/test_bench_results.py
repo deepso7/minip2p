@@ -60,6 +60,12 @@ class BenchResultsTest(unittest.TestCase):
                 subprocess.run(["git", "add", "."], cwd=repository, check=True)
                 subprocess.run(["git", "commit", "-qm", "baseline"], cwd=repository, check=True)
                 baseline = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repository, text=True).strip()
+                previous = Path.cwd()
+                try:
+                    os.chdir(repository)
+                    self.assertEqual(bench_results.ir_compatible(baseline, baseline), (True, None))
+                finally:
+                    os.chdir(previous)
                 if isinstance(change, str):
                     (repository / path).write_text(change)
                 else:
@@ -140,7 +146,7 @@ class BenchResultsTest(unittest.TestCase):
                 estimate.parent.mkdir(parents=True)
                 estimate.write_text(json.dumps({"median": {"point_estimate": 10}}))
             bench_results.collect_criterion(root, output, "sha", marker)
-            self.assertEqual(len(json.loads(output.read_text())["rows"]), 28)
+            self.assertEqual(len(json.loads(output.read_text())["rows"]), len(bench_results.EXPECTED_CRITERION))
 
             missing = next(iter(bench_results.EXPECTED_CRITERION))
             root.joinpath(*missing.split("/"), "new", "estimates.json").unlink()

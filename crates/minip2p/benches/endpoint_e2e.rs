@@ -142,10 +142,14 @@ impl Crossed {
             pending.push(streams);
         }
         let deadline = Instant::now() + TIMEOUT;
+        let mut received = vec![HashMap::<StreamId, Vec<u8>>::new(); self.clients.len()];
         while pending.iter().any(|streams| !streams.is_empty()) {
             assert!(Instant::now() < deadline, "crossed echo timeout");
             for (index, (client, peer)) in self.clients.iter_mut().enumerate() {
-                let Some(event) = client.next_event(Duration::ZERO).expect("client poll") else {
+                let Some(event) = client
+                    .next_event(Duration::from_millis(1))
+                    .expect("client poll")
+                else {
                     continue;
                 };
                 match event {
@@ -172,11 +176,23 @@ impl Crossed {
                         .get(index)
                         .is_some_and(|streams| streams.contains(&stream_id)) =>
                     {
-                        assert_eq!(data, payload);
-                        pending
+                        let bytes = received
                             .get_mut(index)
-                            .expect("client pending set")
-                            .remove(&stream_id);
+                            .expect("client receive map")
+                            .entry(stream_id)
+                            .or_default();
+                        bytes.extend_from_slice(&data);
+                        assert!(
+                            bytes.len() <= payload.len(),
+                            "crossed echo exceeded payload"
+                        );
+                        if bytes.len() == payload.len() {
+                            assert_eq!(bytes, &payload);
+                            pending
+                                .get_mut(index)
+                                .expect("client pending set")
+                                .remove(&stream_id);
+                        }
                     }
                     _ => {}
                 }
