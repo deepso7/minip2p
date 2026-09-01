@@ -19,6 +19,8 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Download comparison
+        id: download
+        continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: bench-comparison
@@ -26,17 +28,29 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ github.event.workflow_run.id }}
 
-      - name: Validate comparison
+      - name: Resolve and validate PR
         id: comparison
         env:
           ARTIFACT_DIR: ${{ runner.temp }}/bench-comparison
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
           EXPECTED_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT_PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          pr_number=$(tr -d '\r\n' < "$ARTIFACT_DIR/pr-number")
+          if [ "$DOWNLOAD_OUTCOME" = success ]; then
+            pr_number=$(tr -d '\r\n' < "$ARTIFACT_DIR/pr-number")
+            test -s "$ARTIFACT_DIR/comparison.md"
+          elif [ "$CONCLUSION" != success ]; then
+            pr_number=$EVENT_PR_NUMBER
+          else
+            echo "successful benchmark run has no comparison artifact" >&2
+            exit 1
+          fi
+
           if ! [[ "$pr_number" =~ ^[1-9][0-9]*$ ]]; then
-            echo "invalid PR number in benchmark artifact" >&2
+            echo "invalid benchmark PR number" >&2
             exit 1
           fi
 
@@ -46,7 +60,6 @@ jobs:
             exit 1
           fi
 
-          test -s "$ARTIFACT_DIR/comparison.md"
           echo "pr-number=$pr_number" >> "$GITHUB_OUTPUT"
 
       - name: Prepare comment
