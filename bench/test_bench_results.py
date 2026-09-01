@@ -142,8 +142,9 @@ class BenchResultsTest(unittest.TestCase):
             stale = root / "removed/benchmark/new/estimates.json"
             stale.parent.mkdir(parents=True)
             stale.write_text(json.dumps({"median": {"point_estimate": 1}}))
-            os.utime(stale, ns=(1, 1))
             marker.touch()
+            marker_time = marker.stat().st_mtime_ns
+            os.utime(stale, ns=(marker_time, marker_time))
             for name in bench_results.EXPECTED_CRITERION:
                 estimate = root.joinpath(*name.split("/"), "new", "estimates.json")
                 estimate.parent.mkdir(parents=True)
@@ -165,10 +166,10 @@ class BenchResultsTest(unittest.TestCase):
         self.assertNotIn("`micro/noise`", markdown)
 
     def test_renderer_escapes_benchmark_names(self):
-        current = {**self.current, "rows": [{**self.current["rows"][0], "name": "bad|`name\nrow"}]}
+        current = {**self.current, "rows": [{**self.current["rows"][0], "name": "bad\\|`name\rrow\nnext"}]}
         rows = bench_results.compare_rows(current, None, None)
         markdown = bench_results.render(current, None, rows, False)
-        self.assertIn("`bad\\|&#96;name<br>row`", markdown)
+        self.assertIn("`bad&#92;&#124;&#96;name<br>row<br>next`", markdown)
 
 
 if __name__ == "__main__":

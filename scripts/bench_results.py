@@ -113,7 +113,7 @@ def collect_criterion(root: Path, output: Path, git_sha: str, since: Path) -> No
         raise BenchError(f"cannot read Criterion run marker {since}: {error}") from error
     rows = []
     for estimate in root.glob("**/new/estimates.json"):
-        if estimate.stat().st_mtime_ns < started_at:
+        if estimate.stat().st_mtime_ns <= started_at:
             continue
         relative = estimate.relative_to(root)
         name = "/".join(relative.parts[:-2])
@@ -154,7 +154,7 @@ def collect_gungraun(root: Path, output: Path, git_sha: str, since: Path) -> Non
         raise BenchError(f"cannot read Gungraun run marker {since}: {error}") from error
     rows = []
     for path in root.glob("**/summary.json"):
-        if path.stat().st_mtime_ns < started_at:
+        if path.stat().st_mtime_ns <= started_at:
             continue
         summary = load_json(path)
         identifier = summary.get("id") or summary.get("function_name")
@@ -269,7 +269,14 @@ def display_value(value: float | int | None) -> str:
 
 def markdown_code(value: str) -> str:
     """Render an untrusted value inside a Markdown table code span."""
-    value = value.replace("|", "\\|").replace("\r\n", "<br>").replace("\n", "<br>").replace("`", "&#96;")
+    value = (
+        value.replace("\\", "&#92;")
+        .replace("|", "&#124;")
+        .replace("\r\n", "<br>")
+        .replace("\r", "<br>")
+        .replace("\n", "<br>")
+        .replace("`", "&#96;")
+    )
     return f"`{value}`"
 
 
