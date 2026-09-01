@@ -149,6 +149,7 @@ class BenchResultsTest(unittest.TestCase):
                 estimate = root.joinpath(*name.split("/"), "new", "estimates.json")
                 estimate.parent.mkdir(parents=True)
                 estimate.write_text(json.dumps({"median": {"point_estimate": 10}}))
+                estimate.with_name("benchmark.json").write_text(json.dumps({"full_id": name}))
             bench_results.collect_criterion(root, output, "sha", marker)
             self.assertEqual(len(json.loads(output.read_text())["rows"]), len(bench_results.EXPECTED_CRITERION))
 

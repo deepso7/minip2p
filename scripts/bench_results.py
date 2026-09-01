@@ -115,8 +115,9 @@ def collect_criterion(root: Path, output: Path, git_sha: str, since: Path) -> No
     for estimate in root.glob("**/new/estimates.json"):
         if estimate.stat().st_mtime_ns <= started_at:
             continue
-        relative = estimate.relative_to(root)
-        name = "/".join(relative.parts[:-2])
+        name = load_json(estimate.with_name("benchmark.json")).get("full_id")
+        if not isinstance(name, str) or not name:
+            raise BenchError(f"missing full_id in {estimate.with_name('benchmark.json')}")
         point = load_json(estimate).get("median", {}).get("point_estimate")
         if point is None:
             raise BenchError(f"missing median.point_estimate in {estimate}")
