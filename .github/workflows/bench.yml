@@ -10,7 +10,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: bench-aws
+  # Keep main baselines isolated while serializing PRs from the same repository.
+  # A skipped fork workflow must not cancel an internal benchmark run.
+  group: bench-aws-${{ github.event_name == 'push' && 'main' || github.event.pull_request.head.repo.full_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -30,18 +32,18 @@ jobs:
     outputs:
       complete: ${{ steps.result.outputs.complete }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: "11.24.0"
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
           cache-dependency-path: infra/bench/pnpm-lock.yaml
-      - uses: aws-actions/configure-aws-credentials@v5
+      - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
         with:
           role-to-assume: ${{ vars.AWS_BENCH_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -73,7 +75,7 @@ jobs:
             jq -n --arg sha "$BENCH_GIT_SHA" '{schema_version: 1, git_sha: $sha, rows: []}' > target/bench-artifacts/current.json
           fi
           echo "complete=$complete" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
           name: bench-aws
@@ -133,11 +135,11 @@ jobs:
     needs: [aws-bench]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: bench-*
           path: ${{ runner.temp }}/bench-slices
@@ -178,7 +180,7 @@ jobs:
         run: python3 scripts/bench_results.py compare --current "$RUNNER_TEMP/current.json" --output "$RUNNER_TEMP/comparison.md"
       - name: Prepare comparison artifact
         run: printf '%s\n' "${{ github.event.pull_request.number }}" > "$RUNNER_TEMP/pr-number"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: bench-comparison
           path: |

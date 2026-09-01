@@ -96,13 +96,38 @@ task_id=${task_arn##*/}
 log_stream="$stream_prefix/$container_name/$task_id"
 mkdir -p "$(dirname "$output")"
 
+retrieve_log() {
+  local next_token=
+  local new_token
+  local page=target/bench-fargate-page.json
+  local -a args
+
+  : > target/bench-fargate.log
+  while true; do
+    args=(
+      --log-group-name "$log_group"
+      --log-stream-name "$log_stream"
+      --start-from-head
+      --no-paginate
+      --output json
+    )
+    if [[ -n "$next_token" ]]; then
+      args+=(--next-token "$next_token")
+    fi
+
+    aws logs get-log-events "${args[@]}" > "$page" || return 1
+    jq -r '.events[].message' "$page" >> target/bench-fargate.log
+
+    new_token=$(jq -r '.nextForwardToken' "$page")
+    if [[ "$new_token" == "$next_token" ]]; then
+      return 0
+    fi
+    next_token=$new_token
+  done
+}
+
 for attempt in {1..12}; do
-  if aws logs get-log-events \
-    --log-group-name "$log_group" \
-    --log-stream-name "$log_stream" \
-    --start-from-head \
-    --query 'events[].[message]' \
-    --output text > target/bench-fargate.log 2>/dev/null \
+  if retrieve_log 2>/dev/null \
     && rg -q 'MINIP2P_BENCH_RESULTS=' target/bench-fargate.log; then
     break
   fi
