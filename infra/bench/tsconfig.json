@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "lib": ["DOM", "ESNext"],
+    "module": "Preserve",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ESNext",
+    "types": ["node"],
+    "verbatimModuleSyntax": true
+  },
+  "include": ["alchemy.run.ts"]
+}

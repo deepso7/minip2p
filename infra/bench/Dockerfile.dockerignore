@@ -1,0 +1,12 @@
+.git
+.repos
+.pnpm-store
+.alchemy
+**/node_modules
+target
+target-linux
+tmp
+**/__pycache__
+bindings/ts/node/*.node
+bindings/ts/node/npm/*/*.node
+crates/nodejs/*.node

@@ -10,169 +10,83 @@ permissions:
   contents: read
 
 concurrency:
-  group: bench-${{ github.ref }}
+  group: bench-aws
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: "1.98.0"
-  RUST_TARGET: x86_64-unknown-linux-gnu
-  GUNGRAUN_VERSION: "0.19.4"
-  VALGRIND_VERSION: "3.27.1"
   NODE_VERSION: "24"
-  PNPM_VERSION: "11.24.0"
+  AWS_REGION: ${{ vars.AWS_BENCH_REGION || 'us-east-1' }}
 
 jobs:
-  rust-micro:
+  aws-bench:
+    if: >-
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
     outputs:
       complete: ${{ steps.result.outputs.complete }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          targets: ${{ env.RUST_TARGET }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: gungraun/setup-gungraun@62591572561bb2f4ed2ae300b8a8bea99ea8ddaf # v1.1.3
-        with:
-          runner-version: ${{ env.GUNGRAUN_VERSION }}
-          runner-target: ${{ env.RUST_TARGET }}
-          valgrind-version: ${{ env.VALGRIND_VERSION }}
-      - name: Measure
-        id: measure
-        continue-on-error: true
-        run: scripts/run-benches.sh ir
-      - name: Prepare result slice
-        id: result
-        if: always()
-        env:
-          MEASURE_OUTCOME: ${{ steps.measure.outcome }}
-        run: |
-          complete=false
-          if [ "$MEASURE_OUTCOME" = success ] && python3 scripts/bench_results.py merge target/bench-results/rust-micro.json --output target/bench-artifacts/rust-micro.json --git-sha "$(git rev-parse HEAD)"; then
-            complete=true
-          else
-            mkdir -p target/bench-artifacts
-            jq -n --arg sha "$(git rev-parse HEAD)" '{schema_version: 1, git_sha: $sha, rows: []}' > target/bench-artifacts/rust-micro.json
-          fi
-          echo "complete=$complete" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: bench-rust-micro
-          path: target/bench-artifacts/rust-micro.json
-          if-no-files-found: error
-
-  rust-wall:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    outputs:
-      complete: ${{ steps.result.outputs.complete }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          targets: ${{ env.RUST_TARGET }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Measure
-        id: measure
-        continue-on-error: true
-        run: scripts/run-benches.sh wall
-      - name: Prepare result slice
-        id: result
-        if: always()
-        env:
-          MEASURE_OUTCOME: ${{ steps.measure.outcome }}
-        run: |
-          complete=false
-          if [ "$MEASURE_OUTCOME" = success ] && python3 scripts/bench_results.py merge target/bench-results/rust-wall.json --output target/bench-artifacts/rust-wall.json --git-sha "$(git rev-parse HEAD)"; then
-            complete=true
-          else
-            mkdir -p target/bench-artifacts
-            jq -n --arg sha "$(git rev-parse HEAD)" '{schema_version: 1, git_sha: $sha, rows: []}' > target/bench-artifacts/rust-wall.json
-          fi
-          echo "complete=$complete" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: bench-rust-wall
-          path: target/bench-artifacts/rust-wall.json
-          if-no-files-found: error
-
-  node-ffi:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    outputs:
-      complete: ${{ steps.result.outputs.complete }}
-    defaults:
-      run:
-        working-directory: bindings/ts
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: pnpm/action-setup@v6
         with:
-          version: ${{ env.PNPM_VERSION }}
+          version: "11.24.0"
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
-          cache-dependency-path: bindings/ts/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
+          cache-dependency-path: infra/bench/pnpm-lock.yaml
+      - uses: aws-actions/configure-aws-credentials@v5
         with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          targets: ${{ env.RUST_TARGET }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install dependencies
+          role-to-assume: ${{ vars.AWS_BENCH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Install infrastructure dependencies
+        working-directory: infra/bench
         run: pnpm install --frozen-lockfile
-      - name: Build native binding
-        run: pnpm --filter @minip2p/node native:build
       - name: Measure
         id: measure
         continue-on-error: true
-        run: pnpm --filter @minip2p/node bench
+        env:
+          BENCH_GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          cd infra/bench
+          pnpm run deploy
+          cd ../..
+          scripts/run-aws-bench-task.sh
       - name: Prepare result slice
         id: result
         if: always()
         env:
           MEASURE_OUTCOME: ${{ steps.measure.outcome }}
+          BENCH_GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           complete=false
-          if [ "$MEASURE_OUTCOME" = success ] && python3 ../../scripts/bench_results.py merge ../../target/bench-results/node-ffi.json --output ../../target/bench-artifacts/node-ffi.json --git-sha "$(git rev-parse HEAD)"; then
+          if [ "$MEASURE_OUTCOME" = success ] && python3 scripts/bench_results.py merge target/bench-artifacts/current.json --output target/bench-artifacts/current.json --git-sha "$BENCH_GIT_SHA"; then
             complete=true
           else
-            mkdir -p ../../target/bench-artifacts
-            jq -n --arg sha "$(git rev-parse HEAD)" '{schema_version: 1, git_sha: $sha, rows: []}' > ../../target/bench-artifacts/node-ffi.json
+            mkdir -p target/bench-artifacts
+            jq -n --arg sha "$BENCH_GIT_SHA" '{schema_version: 1, git_sha: $sha, rows: []}' > target/bench-artifacts/current.json
           fi
           echo "complete=$complete" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: bench-node-ffi
-          path: target/bench-artifacts/node-ffi.json
+          name: bench-aws
+          path: |
+            target/bench-artifacts/current.json
+            target/bench-fargate.log
           if-no-files-found: error
 
   baseline:
     if: >-
       github.event_name == 'push' &&
-      needs.rust-micro.outputs.complete == 'true' &&
-      needs.rust-wall.outputs.complete == 'true' &&
-      needs.node-ffi.outputs.complete == 'true'
-    needs: [rust-micro, rust-wall, node-ffi]
+      needs.aws-bench.outputs.complete == 'true'
+    needs: [aws-bench]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -212,8 +126,11 @@ jobs:
           exit 1
 
   compare:
-    if: ${{ always() && github.event_name == 'pull_request' }}
-    needs: [rust-micro, rust-wall, node-ffi]
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      needs.aws-bench.result != 'skipped'
+    needs: [aws-bench]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
