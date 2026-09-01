@@ -157,6 +157,41 @@ class BenchResultsTest(unittest.TestCase):
             with self.assertRaisesRegex(bench_results.BenchError, "row set mismatch"):
                 bench_results.collect_criterion(root, output, "sha", marker)
 
+    def test_gungraun_collector_reads_tagged_integer_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "gungraun"
+            marker = Path(directory) / "started"
+            output = Path(directory) / "results.json"
+            marker.touch()
+            for identifier in bench_results.GUNGRAUN_NAMES:
+                summary = root / identifier / "summary.json"
+                summary.parent.mkdir(parents=True)
+                summary.write_text(
+                    json.dumps(
+                        {
+                            "id": identifier,
+                            "profiles": [
+                                {
+                                    "tool": "Callgrind",
+                                    "summaries": {
+                                        "total": {
+                                            "summary": {
+                                                "Callgrind": {
+                                                    "Ir": {"metrics": {"Left": {"Int": 42}}}
+                                                }
+                                            }
+                                        }
+                                    },
+                                }
+                            ],
+                        }
+                    )
+                )
+            bench_results.collect_gungraun(root, output, "sha", marker)
+            rows = json.loads(output.read_text())["rows"]
+            self.assertEqual(len(rows), len(bench_results.GUNGRAUN_NAMES))
+            self.assertTrue(all(row["value"] == 42 for row in rows))
+
     def test_renderer_has_locked_layout(self):
         rows = bench_results.compare_rows(self.current, self.baseline, None)
         markdown = bench_results.render(self.current, self.baseline, rows, True)

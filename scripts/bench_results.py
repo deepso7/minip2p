@@ -170,6 +170,8 @@ def collect_gungraun(root: Path, output: Path, git_sha: str, since: Path) -> Non
             if ir is None:
                 both = metric.get("Both") or []
                 ir = both[0] if both else None
+            if isinstance(ir, dict):
+                ir = ir.get("Int")
         if not isinstance(ir, (int, float)):
             raise BenchError(f"missing Callgrind Ir in {path}")
         rows.append({"tier": "rust-micro", "name": name, "metric": "Ir", "value": ir})
