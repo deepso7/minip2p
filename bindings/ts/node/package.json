@@ -36,6 +36,7 @@
     "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
+    "bench": "vitest bench --run --config ../vitest.config.ts --root . --outputJson ../../../target/bench-node-vitest.json && python3 ../../../scripts/bench_results.py vitest --report ../../../target/bench-node-vitest.json --output ../../../target/bench-results/node-ffi.json --git-sha \"$(git rev-parse HEAD)\"",
     "build": "del-cli dist && tsc -p tsconfig.build.json",
     "clean": "del-cli dist",
     "native:build": "napi build --platform --no-js --dts ../../../target/minip2p-nodejs.d.ts --release --manifest-path ../../../crates/nodejs/Cargo.toml --output-dir . -- --locked",

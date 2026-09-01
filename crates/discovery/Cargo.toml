@@ -24,7 +24,12 @@ thiserror = { version = "2.0.18", default-features = false }
 
 [dev-dependencies]
 criterion = "0.8.2"
+gungraun = "=0.19.4"
 
 [[bench]]
 name = "peer_book"
+harness = false
+
+[[bench]]
+name = "peer_book_ir"
 harness = false
