@@ -1,0 +1,112 @@
+name: Bench comment
+
+on:
+  workflow_run:
+    workflows: [Bench]
+    types: [completed]
+
+permissions:
+  actions: read
+  pull-requests: write
+
+jobs:
+  comment:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: bench-comment-${{ github.event.workflow_run.head_repository.id }}-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+    steps:
+      - name: Download comparison
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: bench-comparison
+          path: ${{ runner.temp }}/bench-comparison
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Resolve and validate PR
+        id: comparison
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/bench-comparison
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          EXPECTED_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT_PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ "$DOWNLOAD_OUTCOME" = success ]; then
+            pr_number=$(tr -d '\r\n' < "$ARTIFACT_DIR/pr-number")
+            test -s "$ARTIFACT_DIR/comparison.md"
+          elif [ "$CONCLUSION" != success ]; then
+            pr_number=$EVENT_PR_NUMBER
+          else
+            echo "successful benchmark run has no comparison artifact" >&2
+            exit 1
+          fi
+
+          if ! [[ "$pr_number" =~ ^[1-9][0-9]*$ ]]; then
+            echo "invalid benchmark PR number" >&2
+            exit 1
+          fi
+
+          actual_head_sha=$(gh api "repos/$GH_REPO/pulls/$pr_number" --jq .head.sha)
+          if [ "$actual_head_sha" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "benchmark artifact does not match the PR head" >&2
+            exit 1
+          fi
+
+          echo "pr-number=$pr_number" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare comment
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/bench-comparison
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.comparison.outputs.pr-number }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          TARGET: ${{ runner.temp }}/bench-comment.md
+        run: |
+          existing=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER/comments" --paginate --slurp \
+            --jq '[.[][] | select(.body | contains("<!-- bench-comment -->"))][0].body // empty')
+
+          if [ "$CONCLUSION" = success ]; then
+            cp "$ARTIFACT_DIR/comparison.md" "$TARGET"
+            exit 0
+          fi
+
+          {
+            printf '%s\n' '<!-- bench-comment -->'
+            printf '%s\n' '<!-- bench-status-start -->'
+            printf '> [!WARNING]\n'
+            printf '> Benchmark run [%s](%s). The comparison below is from the last successful run.\n' \
+              "$CONCLUSION" "$RUN_URL"
+            printf '%s\n\n' '<!-- bench-status-end -->'
+            if [ -n "$existing" ]; then
+              printf '%s\n' "$existing" | sed \
+                -e '/^<!-- bench-comment -->$/d' \
+                -e '/^<!-- bench-status-start -->$/,/^<!-- bench-status-end -->$/d'
+            fi
+          } > "$TARGET"
+
+      - name: Upsert sticky comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.comparison.outputs.pr-number }}
+          TARGET: ${{ runner.temp }}/bench-comment.md
+        run: |
+          comment_id=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER/comments" --paginate --slurp \
+            --jq '[.[][] | select(.body | contains("<!-- bench-comment -->"))][0].id // empty')
+          if [ -n "$comment_id" ]; then
+            gh api --method PATCH "repos/$GH_REPO/issues/comments/$comment_id" -F "body=@$TARGET"
+          else
+            gh api --method POST "repos/$GH_REPO/issues/$PR_NUMBER/comments" -F "body=@$TARGET"
+          fi
