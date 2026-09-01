@@ -150,12 +150,13 @@ bench:
     python3 scripts/bench_results.py criterion --since target/bench-results/criterion-start --output target/bench-results/rust-wall.json --git-sha "$(git rev-parse HEAD)"
 
 bench-ir:
+    python3 scripts/bench_results.py start --output target/bench-results/gungraun-start
     GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-core --bench multiaddr_ir
     GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-yamux --bench data_path_ir
     GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-discovery --bench peer_book_ir
     GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-pubsub --bench fanout_ir
     GUNGRAUN_SAVE_SUMMARY=json cargo bench -p minip2p-relay-server --bench relay_server_event_ir
-    python3 scripts/bench_results.py gungraun --output target/bench-results/rust-micro.json --git-sha "$(git rev-parse HEAD)"
+    python3 scripts/bench_results.py gungraun --since target/bench-results/gungraun-start --output target/bench-results/rust-micro.json --git-sha "$(git rev-parse HEAD)"
 
 bench-node:
     cd bindings/ts && pnpm --filter @minip2p/node bench

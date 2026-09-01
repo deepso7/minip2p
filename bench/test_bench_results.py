@@ -42,6 +42,7 @@ class BenchResultsTest(unittest.TestCase):
     def test_ir_compatibility_checks_each_git_pin(self):
         changes = {
             "Cargo.lock": ("Cargo.lock", "lock changed\n", "Cargo.lock differs"),
+            "missing manifest": ("bench/pins.json", None, "pin manifest unavailable"),
             **{
                 key: ("bench/pins.json", {key: "changed"}, f"{label} differs")
                 for key, label in bench_results.IR_PINS.items()
@@ -66,7 +67,9 @@ class BenchResultsTest(unittest.TestCase):
                     self.assertEqual(bench_results.ir_compatible(baseline, baseline), (True, None))
                 finally:
                     os.chdir(previous)
-                if isinstance(change, str):
+                if change is None:
+                    (repository / path).unlink()
+                elif isinstance(change, str):
                     (repository / path).write_text(change)
                 else:
                     pins.update(change)
@@ -160,6 +163,12 @@ class BenchResultsTest(unittest.TestCase):
         self.assertIn("Baseline is stale", markdown)
         self.assertIn("| tier | noise | changed | notable | unclassified |", markdown)
         self.assertNotIn("`micro/noise`", markdown)
+
+    def test_renderer_escapes_benchmark_names(self):
+        current = {**self.current, "rows": [{**self.current["rows"][0], "name": "bad|`name\nrow"}]}
+        rows = bench_results.compare_rows(current, None, None)
+        markdown = bench_results.render(current, None, rows, False)
+        self.assertIn("`bad\\|&#96;name<br>row`", markdown)
 
 
 if __name__ == "__main__":

@@ -147,9 +147,15 @@ def collect_vitest(report: Path, output: Path, git_sha: str) -> None:
     write_results(git_sha, rows, output)
 
 
-def collect_gungraun(root: Path, output: Path, git_sha: str) -> None:
+def collect_gungraun(root: Path, output: Path, git_sha: str, since: Path) -> None:
+    try:
+        started_at = since.stat().st_mtime_ns
+    except OSError as error:
+        raise BenchError(f"cannot read Gungraun run marker {since}: {error}") from error
     rows = []
     for path in root.glob("**/summary.json"):
+        if path.stat().st_mtime_ns < started_at:
+            continue
         summary = load_json(path)
         identifier = summary.get("id") or summary.get("function_name")
         name = GUNGRAUN_NAMES.get(identifier)
@@ -190,8 +196,13 @@ def ir_compatible(baseline_tree: str, current_tree: str) -> tuple[bool, str | No
     if git_bytes(baseline_tree, "Cargo.lock") != git_bytes(current_tree, "Cargo.lock"):
         return False, "incompatible Ir pins: Cargo.lock differs"
     try:
-        before = json.loads(git_bytes(baseline_tree, "bench/pins.json"))
-        after = json.loads(git_bytes(current_tree, "bench/pins.json"))
+        before_bytes = git_bytes(baseline_tree, "bench/pins.json")
+        after_bytes = git_bytes(current_tree, "bench/pins.json")
+    except BenchError:
+        return False, "incompatible Ir pins: pin manifest unavailable"
+    try:
+        before = json.loads(before_bytes)
+        after = json.loads(after_bytes)
     except json.JSONDecodeError as error:
         raise BenchError(f"invalid bench/pins.json: {error}") from error
     for key, label in IR_PINS.items():
@@ -256,6 +267,12 @@ def display_value(value: float | int | None) -> str:
     return f"{value:,.2f}"
 
 
+def markdown_code(value: str) -> str:
+    """Render an untrusted value inside a Markdown table code span."""
+    value = value.replace("|", "\\|").replace("\r\n", "<br>").replace("\n", "<br>").replace("`", "&#96;")
+    return f"`{value}`"
+
+
 def render(
     current: dict[str, Any], baseline: dict[str, Any] | None, rows: list[ComparedRow], stale: bool
 ) -> str:
@@ -276,7 +293,7 @@ def render(
         for row in visible:
             delta = "—" if row.delta is None else f"{row.delta:+.2f}%"
             classification = row.classification if row.reason is None else f"{row.classification} ({row.reason})"
-            lines.append(f"| `{row.name}` | {display_value(row.baseline)} | {display_value(row.current)} | {delta} | {classification} | {row.direction} |")
+            lines.append(f"| {markdown_code(row.name)} | {display_value(row.baseline)} | {display_value(row.current)} | {delta} | {classification} | {row.direction} |")
     return "\n".join(lines) + "\n"
 
 
@@ -319,7 +336,8 @@ def parser() -> argparse.ArgumentParser:
     gungraun_parser.add_argument("--root", type=Path, default=Path("target/gungraun"))
     gungraun_parser.add_argument("--output", type=Path, required=True)
     gungraun_parser.add_argument("--git-sha", required=True)
-    gungraun_parser.set_defaults(run=lambda args: collect_gungraun(args.root, args.output, args.git_sha))
+    gungraun_parser.add_argument("--since", type=Path, required=True)
+    gungraun_parser.set_defaults(run=lambda args: collect_gungraun(args.root, args.output, args.git_sha, args.since))
     compare_parser = commands.add_parser("compare")
     compare_parser.add_argument("--current", type=Path, required=True)
     compare_parser.add_argument("--baseline", type=Path)

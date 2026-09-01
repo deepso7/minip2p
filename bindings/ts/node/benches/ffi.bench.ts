@@ -29,7 +29,7 @@ beforeAll(async () => {
   ]);
   rawA = createRaw();
   cleanup.push(() => rawA.close());
-  rawB = createRaw();
+  rawB = createRaw(true);
   cleanup.push(() => rawB.close());
   rawA.connectAddr(rawB.listenAddrs()[0]);
   await Promise.all([
@@ -95,7 +95,7 @@ function createSdk(): Minip2p {
   });
 }
 
-function createRaw(): NativeEndpoint {
+function createRaw(drainOnDoorbell = false): NativeEndpoint {
   const endpoint = new nativeBinding.NodeEndpoint(
     nativeBinding.generateSecretKey(),
     {
@@ -108,8 +108,18 @@ function createRaw(): NativeEndpoint {
       tcp: { listenAddrs: ["/ip4/127.0.0.1/tcp/0"] },
     }
   );
-  endpoint.start(() => undefined);
+  endpoint.start(() => {
+    if (drainOnDoorbell) {
+      drainAllEvents(endpoint);
+    }
+  });
   return endpoint;
+}
+
+function drainAllEvents(endpoint: NativeEndpoint): void {
+  while (endpoint.drainEvents(256).length === 256) {
+    // The native doorbell is edge-triggered, so empty the queue before returning.
+  }
 }
 
 async function waitRawReady(
