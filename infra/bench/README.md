@@ -45,8 +45,16 @@ to this repository:
 
 The role needs permission to manage this stack's ECS cluster and task
 definitions, ECR repository, IAM roles, CloudWatch log group, and S3 state
-bucket. It also needs `ec2:Describe*`, `ecs:RunTask`, `ecs:StopTask`, and
-`iam:PassRole`. Keep the role dedicated to this repository.
+bucket. The benchmark runner also calls these actions:
+
+- `ec2:DescribeVpcs`, `ec2:DescribeSubnets`, and
+  `ec2:DescribeSecurityGroups`;
+- `ecs:DescribeTaskDefinition`, `ecs:DescribeTasks`, `ecs:RunTask`, and
+  `ecs:StopTask`;
+- `logs:GetLogEvents`; and
+- `iam:PassRole`, scoped to the stack's task and execution roles.
+
+Keep the role dedicated to this repository.
 
 Set these GitHub repository variables under **Settings > Secrets and variables
 > Actions > Variables**:

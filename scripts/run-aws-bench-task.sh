@@ -18,7 +18,8 @@ stop_active_task() {
   fi
 }
 
-trap 'stop_active_task; exit 130' INT TERM
+trap stop_active_task EXIT
+trap 'exit 130' INT TERM
 
 task_definition=$(aws ecs describe-task-definition \
   --task-definition "$family" \
