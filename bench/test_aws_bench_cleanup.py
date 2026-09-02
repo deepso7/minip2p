@@ -74,6 +74,23 @@ class AwsBenchCleanupTest(unittest.TestCase):
         self.assertEqual(sum("describe-clusters" in call for call in calls), 3)
         self.assertFalse(any(call.startswith("alchemy ") for call in calls))
 
+    def test_does_not_repeat_the_long_task_wait(self):
+        result, calls = self.run_destroy(
+            """\
+            #!/usr/bin/env bash
+            printf 'aws %s\n' "$*" >> "$CALLS"
+            case "$1 $2" in
+              'ecs describe-clusters') printf 'ACTIVE\n' ;;
+              'ecs list-tasks') printf 'None\n' ;;
+              'ecs describe-tasks') printf 'STOPPING\n' ;;
+              'ecs wait') exit 1 ;;
+            esac
+            """
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(sum("wait tasks-stopped" in call for call in calls), 1)
+        self.assertFalse(any(call.startswith("alchemy ") for call in calls))
+
 
 if __name__ == "__main__":
     unittest.main()

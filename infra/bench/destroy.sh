@@ -4,10 +4,11 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 
 cluster=$BENCH_CLUSTER
+task_arns=()
 
-stop_running_tasks() {
+prepare_task_cleanup() {
   local cluster_status tasks task_arn task_status tracked_task
-  local -a task_arns=()
+  task_arns=()
 
   cluster_status=$(aws ecs describe-clusters \
     --clusters "$cluster" \
@@ -42,19 +43,27 @@ stop_running_tasks() {
         --task "$task_arn" \
         --reason "Stack cleanup" >/dev/null || return
     done
-    if (( ${#task_arns[@]} > 0 )); then
-      aws ecs wait tasks-stopped --cluster "$cluster" --tasks "${task_arns[@]}" || return
-    fi
   fi
-  rm -f "$BENCH_TASK_ARN_FILE"
 }
 
+prepared=false
 for attempt in 1 2 3; do
-  if stop_running_tasks; then
-    exec alchemy destroy --stage "$BENCH_STAGE" --yes
+  if prepare_task_cleanup; then
+    prepared=true
+    break
   fi
-  echo "ECS task cleanup attempt $attempt failed" >&2
+  echo "ECS task discovery attempt $attempt failed" >&2
 done
 
-echo "ECS tasks are not confirmed stopped; refusing to destroy the stack" >&2
-exit 1
+if [[ "$prepared" != true ]]; then
+  echo "ECS task state could not be read; refusing to destroy the stack" >&2
+  exit 1
+fi
+if (( ${#task_arns[@]} > 0 )) \
+  && ! aws ecs wait tasks-stopped --cluster "$cluster" --tasks "${task_arns[@]}"; then
+  echo "ECS tasks are not confirmed stopped; refusing to destroy the stack" >&2
+  exit 1
+fi
+
+rm -f "$BENCH_TASK_ARN_FILE"
+exec alchemy destroy --stage "$BENCH_STAGE" --yes

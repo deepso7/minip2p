@@ -111,5 +111,18 @@ cd infra/bench
 pnpm run destroy
 ```
 
+Cleanup retries transient ECS discovery and stop errors, then waits once for
+the tasks to stop. If ECS does not confirm that state, cleanup fails without
+destroying the stack. Retry that run's cleanup with the names from the workflow
+log:
+
+```bash
+cd infra/bench
+BENCH_STAGE=run-RUN_ID-RUN_ATTEMPT \
+BENCH_CLUSTER=minip2p-bench-run-RUN_ID-RUN_ATTEMPT \
+BENCH_TASK_FAMILY=minip2p-bench-run-RUN_ID-RUN_ATTEMPT \
+pnpm run destroy
+```
+
 Alchemy state remains in its S3 bucket so later deployments retain resource
 ownership history.
