@@ -1,8 +1,9 @@
 # AWS benchmark runner
 
-The benchmark workflow deploys this Alchemy stack and runs the full benchmark
-suite in one AWS Fargate task. GitHub Actions orchestrates the task and stores
-the returned JSON as its normal `bench-aws` artifact.
+The benchmark workflow builds one container image, runs the full benchmark
+suite in it as a single AWS Fargate task, and stores the returned JSON as its
+`bench-aws` artifact. GitHub Actions orchestrates the task directly with the
+AWS CLI and `jq`; there is no deployment tool in the loop.
 
 Published stable releases produce the baseline stored on `bench-data`. Pull
 requests from this repository run the same task and compare their head commit
@@ -10,23 +11,33 @@ with that release when a baseline is available. Fork pull requests skip AWS
 execution and comparison. Manual runs measure the default branch and produce
 artifacts, but never change the release baseline.
 
-The stack pins `alchemy@2.0.0-beta.76` and `effect@4.0.0-rc.112`. It creates:
+## Resources
 
-- an ECS cluster and 2-vCPU, 4-GiB Fargate task definition;
-- an ECR repository and image;
-- task and execution IAM roles;
-- a CloudWatch log group; and
-- an account-regional S3 bucket for Alchemy state.
+All AWS resources are static and created once by `bootstrap.sh`:
 
-The Fargate task uses the account's default VPC, default subnets, and default
-security group. It receives a public IP so it can pull the image from ECR.
+- ECS cluster `minip2p-bench`;
+- ECR repository `minip2p-bench`, immutable tags, with a lifecycle policy that
+  keeps the ten newest images and drops untagged layers after a day;
+- CloudWatch log group `/minip2p/bench` with 14-day retention;
+- task role `minip2p-bench-task` (no AWS access) and execution role
+  `minip2p-bench-execution` (pull the image, write logs);
+- the inline permissions of the CI role `minip2p-github-bench`.
+
+Per run, the workflow pushes one image tagged with the measured commit, GitHub
+Actions run ID, and run attempt. It registers one revision of the
+`minip2p-bench` task-definition family from `task-definition.json`, runs it,
+and deregisters the revision when the runner exits. Nothing else is created,
+so there is nothing to tear down and nothing to leak when a run fails.
+
+The task uses 2 vCPU and 4 GiB in the account's default VPC, default subnets,
+and default security group, with a public IP so it can pull from ECR.
 
 ## GitHub configuration
 
-Create a protected GitHub Environment named `aws-bench`, require reviewer
-approval for deployments, prevent self-review, and store `AWS_BENCH_ROLE_ARN`
-as an environment variable. Create an OIDC role whose trust is restricted to
-that environment:
+Create a GitHub Environment named `aws-bench` with required reviewers and
+store `AWS_BENCH_ROLE_ARN` as an environment variable. `AWS_BENCH_REGION` is
+optional and defaults to `us-east-1`. Then create the OIDC role
+`minip2p-github-bench` whose trust is restricted to that environment:
 
 ```json
 {
@@ -49,54 +60,31 @@ that environment:
 }
 ```
 
-The role's policy must allow every call Alchemy and the runner make. Alchemy
-converges each resource after creating it, so it needs update and read-back
-actions as well as create and delete. Scope resources to names containing
-`minip2p`, and scope the S3 statement to the `alchemy-state-…` bucket.
+Set its maximum session duration to at least 7200 seconds. Its permissions
+are written by `bootstrap.sh`: push to the one repository, register and run
+tasks on the one cluster, pass the two task roles, and read the one log group.
 
-- `ec2`: `DescribeVpcs`, `DescribeSubnets`, `DescribeSecurityGroups`.
-- `ecs`: `CreateCluster`, `DeleteCluster`, `DescribeClusters`, `ListClusters`,
-  `UpdateCluster`, `UpdateClusterSettings`, `PutClusterCapacityProviders`,
-  `ListContainerInstances`, `ListServices`, `RegisterTaskDefinition`,
-  `DeregisterTaskDefinition`, `DeleteTaskDefinitions`, `DescribeTaskDefinition`,
-  `ListTaskDefinitions`, `RunTask`, `StopTask`, `DescribeTasks`, `ListTasks`,
-  `TagResource`, `UntagResource`, `ListTagsForResource`.
-- `ecr`: `GetAuthorizationToken` on `*`; then `CreateRepository`,
-  `DeleteRepository`, `DescribeRepositories`, `DescribeImages`, `ListImages`,
-  `BatchGetImage`, `BatchDeleteImage`, `BatchCheckLayerAvailability`,
-  `InitiateLayerUpload`, `UploadLayerPart`, `CompleteLayerUpload`, `PutImage`,
-  `GetDownloadUrlForLayer`, `GetRepositoryPolicy`, `SetRepositoryPolicy`,
-  `PutLifecyclePolicy`, `PutImageScanningConfiguration`,
-  `PutImageTagMutability`, `TagResource`, `UntagResource`, `ListTagsForResource`.
-- `logs`: `CreateLogGroup`, `DeleteLogGroup`, `DescribeLogGroups`,
-  `PutRetentionPolicy`, `PutLogGroupDeletionProtection`, `GetLogEvents`,
-  `TagResource`, `UntagResource`, `ListTagsForResource`.
-- `iam`: `CreateRole`, `DeleteRole`, `GetRole`, `UpdateRole`,
-  `UpdateAssumeRolePolicy`, `PutRolePolicy`, `GetRolePolicy`,
-  `DeleteRolePolicy`, `ListRolePolicies`, `AttachRolePolicy`,
-  `DetachRolePolicy`, `ListAttachedRolePolicies`, `TagRole`, `UntagRole`,
-  `ListRoleTags`, `PassRole`.
-- `s3` on the state bucket: `CreateBucket`, `DeleteBucket`, `ListBucket`,
-  `GetBucketLocation`, `GetObject`, `PutObject`, `DeleteObject`,
-  `GetEncryptionConfiguration`, `PutEncryptionConfiguration`,
-  `GetBucketVersioning`, `PutBucketVersioning`, `GetBucketPublicAccessBlock`,
-  `PutBucketPublicAccessBlock`, `GetBucketOwnershipControls`,
-  `PutBucketOwnershipControls`, `GetBucketTagging`, `PutBucketTagging`.
+With administrator credentials exported, create or update everything else.
+Set `AWS_BENCH_REGION` to the same region configured in GitHub, or omit it to
+use `us-east-1`:
 
-Keep the role dedicated to this repository and set its maximum session duration
-to at least 7200 seconds.
+```bash
+AWS_BENCH_REGION=us-east-1 infra/bench/bootstrap.sh
+```
 
-Set these GitHub repository variables under **Settings > Secrets and variables
-> Actions > Variables**:
+The script is idempotent. Rerun it after changing a policy, retention, or the
+lifecycle rules.
 
-- `AWS_BENCH_REGION`: the AWS region, or omit it to use `us-east-1`.
+## Security model
 
 No AWS access keys are stored in GitHub. Pull requests from forks do not run
-the AWS job. For same-repository pull requests, the workflow and infrastructure
-code come from the trusted base commit; only the source compiled inside Docker
-comes from the pull request. Docker still executes the pull request's Rust build
-scripts and package install scripts with the container's permissions. The
-container is the isolation boundary.
+the AWS job. For same-repository pull requests, the workflow, Dockerfile, and
+runner script come from the trusted base commit; only the Docker build context
+comes from the pull request. Docker still executes the pull request's Rust
+build scripts and package install scripts on the runner during the image
+build. The container is the isolation boundary.
+
+## Measurement notes
 
 AWS runs set `GUNGRAUN_ALLOW_ASLR=1` because Fargate blocks the syscall Gungraun
 uses to disable ASLR. Instruction counts from AWS runs are comparable with
@@ -108,44 +96,23 @@ The task runs all three tiers sequentially and publishes one result document.
 If any tier fails, the task publishes no rows. This avoids comparing a partial
 run as though it covered the full benchmark set.
 
-## Local commands
+## Running locally
 
-With AWS credentials exported in the environment:
-
-```bash
-cd infra/bench
-pnpm install --frozen-lockfile
-pnpm run deploy
-```
-
-The deploy command builds its Docker context under `.alchemy/` from tracked
-files. Local `target/`, dependency trees, reference checkouts, and other
-generated directories never enter Alchemy's pre-Docker content hash.
-
-CI sets `BENCH_STAGE`, `BENCH_CLUSTER`, and `BENCH_TASK_FAMILY` from the
-workflow run ID. Each run therefore owns a separate stack and can execute
-without a lossy GitHub Actions concurrency queue. Local commands omit these
-variables and continue to use the shared `ci` stack.
-
-Remove every stack-owned resource with:
+With credentials that can push to the repository and run tasks:
 
 ```bash
-cd infra/bench
-pnpm run destroy
+AWS_REGION=${AWS_BENCH_REGION:-us-east-1}
+export AWS_REGION
+IMAGE_TAG="$(git rev-parse HEAD)-local-$(date +%s)"
+aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+docker build -f infra/bench/Dockerfile -t "$REGISTRY/minip2p-bench:$IMAGE_TAG" .
+docker push "$REGISTRY/minip2p-bench:$IMAGE_TAG"
+BENCH_GIT_SHA=$(git rev-parse HEAD) \
+  BENCH_IMAGE="$REGISTRY/minip2p-bench:$IMAGE_TAG" \
+  scripts/run-aws-bench-task.sh
 ```
 
-Cleanup retries transient ECS discovery and stop errors, then waits once for
-the tasks to stop. If ECS does not confirm that state, cleanup fails without
-destroying the stack. Retry that run's cleanup with the names from the workflow
-log:
-
-```bash
-cd infra/bench
-BENCH_STAGE=run-RUN_ID-RUN_ATTEMPT \
-BENCH_CLUSTER=minip2p-bench-run-RUN_ID-RUN_ATTEMPT \
-BENCH_TASK_FAMILY=minip2p-bench-run-RUN_ID-RUN_ATTEMPT \
-pnpm run destroy
-```
-
-Alchemy state remains in its S3 bucket so later deployments retain resource
-ownership history.
+Set `AWS_BENCH_REGION` to the region used by `bootstrap.sh` and the GitHub
+environment. `REGISTRY` is `ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com`. The
+result lands in `target/bench-artifacts/current.json` and the task log in
+`target/bench-fargate.log`.

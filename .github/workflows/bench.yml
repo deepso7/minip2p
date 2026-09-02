@@ -11,11 +11,7 @@ permissions:
   contents: read
 
 env:
-  NODE_VERSION: "24"
   AWS_REGION: ${{ vars.AWS_BENCH_REGION || 'us-east-1' }}
-  BENCH_STAGE: run-${{ github.run_id }}-${{ github.run_attempt }}
-  BENCH_CLUSTER: minip2p-bench-run-${{ github.run_id }}-${{ github.run_attempt }}
-  BENCH_TASK_FAMILY: minip2p-bench-run-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   aws-bench:
@@ -45,40 +41,35 @@ jobs:
         id: source
         env:
           SOURCE_DIR: ${{ github.event_name == 'pull_request_target' && format('{0}/bench-source', github.workspace) || github.workspace }}
-        run: echo "sha=$(git -C "$SOURCE_DIR" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
-        with:
-          version: "11.24.0"
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: pnpm
-          cache-dependency-path: infra/bench/pnpm-lock.yaml
-      - name: Install infrastructure dependencies
-        working-directory: infra/bench
-        run: pnpm install --frozen-lockfile
-      - name: Typecheck infrastructure
-        working-directory: infra/bench
-        run: pnpm run typecheck
+        run: |
+          sha=$(git -C "$SOURCE_DIR" rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$sha-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
         with:
           role-to-assume: ${{ vars.AWS_BENCH_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-duration-seconds: 7200
+      - uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
+        id: ecr
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      # The Dockerfile always comes from the trusted checkout; only the build
+      # context (the code compiled inside the image) may come from the PR.
+      - name: Build and push benchmark image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: ${{ github.event_name == 'pull_request_target' && 'bench-source' || '.' }}
+          file: infra/bench/Dockerfile
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/minip2p-bench:${{ steps.source.outputs.image_tag }}
+          cache-from: type=gha,scope=bench
+          cache-to: type=gha,mode=max,scope=bench
       - name: Measure
         id: measure
         env:
           BENCH_GIT_SHA: ${{ steps.source.outputs.sha }}
-          BENCH_SOURCE_DIR: ${{ github.event_name == 'pull_request_target' && format('{0}/bench-source', github.workspace) || github.workspace }}
-        run: |
-          cd infra/bench
-          pnpm run deploy
-          cd ../..
-          scripts/run-aws-bench-task.sh
-      - name: Remove benchmark stack
-        if: always()
-        working-directory: infra/bench
-        run: pnpm run destroy
+          BENCH_IMAGE: ${{ steps.ecr.outputs.registry }}/minip2p-bench:${{ steps.source.outputs.image_tag }}
+        run: scripts/run-aws-bench-task.sh
       - name: Prepare result slice
         id: result
         if: always()
