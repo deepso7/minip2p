@@ -45,6 +45,7 @@ IR_PINS = {
     "profile": "optimization profile",
     "gungraun": "Gungraun version",
     "valgrind": "Valgrind version",
+    "valgrind_sha256": "Valgrind archive digest",
 }
 
 
@@ -284,12 +285,13 @@ def markdown_code(value: str) -> str:
 
 
 def render(
-    current: dict[str, Any], baseline: dict[str, Any] | None, rows: list[ComparedRow], stale: bool
+    baseline: dict[str, Any] | None,
+    rows: list[ComparedRow],
+    baseline_label: str | None = None,
 ) -> str:
     baseline_sha = "none" if baseline is None else baseline["git_sha"]
-    lines = ["<!-- bench-comment -->", "## Benchmark comparison", "", f"Baseline: `{baseline_sha}`"]
-    if stale:
-        lines += ["", "> Baseline is stale: it is not this pull request's merge base."]
+    baseline_name = baseline_sha if baseline_label is None else f"{baseline_label} ({baseline_sha})"
+    lines = ["<!-- bench-comment -->", "## Benchmark comparison", "", f"Baseline: {markdown_code(baseline_name)}"]
     lines += ["", "| tier | noise | changed | notable | unclassified |", "| --- | ---: | ---: | ---: | ---: |"]
     for tier in TIERS:
         tier_rows = [row for row in rows if row.tier == tier]
@@ -317,7 +319,7 @@ def command_compare(args: argparse.Namespace) -> None:
             ir_reason = None
     rows = compare_rows(current, baseline, ir_reason)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(render(current, baseline, rows, args.stale))
+    args.output.write_text(render(baseline, rows, args.baseline_label))
 
 
 def parser() -> argparse.ArgumentParser:
@@ -352,9 +354,9 @@ def parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--current", type=Path, required=True)
     compare_parser.add_argument("--baseline", type=Path)
     compare_parser.add_argument("--output", type=Path, required=True)
-    compare_parser.add_argument("--stale", action="store_true")
     compare_parser.add_argument("--check-ir-pins", action="store_true")
     compare_parser.add_argument("--baseline-tree")
+    compare_parser.add_argument("--baseline-label")
     compare_parser.add_argument("--current-tree")
     compare_parser.set_defaults(run=command_compare)
     return root

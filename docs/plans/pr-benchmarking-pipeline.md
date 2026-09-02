@@ -1,7 +1,17 @@
 # PR benchmarking pipeline for minip2p
 
-> **Status:** Locked implementation-ready specification, validated by the
-> [Map: PR benchmarking pipeline spec](https://github.com/deepso7/minip2p/issues/125).
+> **Status:** Historical design record. The AWS implementation supersedes the
+> workflow design below. It runs all tiers sequentially in one isolated Fargate
+> task, has a 90-minute job limit, requires approval through the `aws-bench`
+> environment, and uses `pull_request_target` only to run trusted workflow and
+> infrastructure code. The pull request source is compiled inside Docker.
+> Stable releases, rather than pushes to `main`, publish baselines. Manual runs
+> always measure the default branch. A tier failure rejects the whole result.
+> See [the AWS runner README](../../infra/bench/README.md) and
+> [the workflow](../../.github/workflows/bench.yml) for the current contract.
+>
+> This document remains the locked pre-implementation specification validated
+> by the [Map: PR benchmarking pipeline spec](https://github.com/deepso7/minip2p/issues/125).
 >
 > **Research:**
 > [measurement methodology](https://github.com/deepso7/minip2p/blob/research/bench-methodology/docs/research/bench-measurement-methodology.md),

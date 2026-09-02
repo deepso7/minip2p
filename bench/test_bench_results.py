@@ -119,11 +119,13 @@ class BenchResultsTest(unittest.TestCase):
                     str(ROOT / "bench/fixtures/baseline.json"),
                     "--output",
                     str(output),
+                    "--baseline-label",
+                    "v0.4.11",
                 ],
                 check=True,
             )
             markdown = output.read_text()
-            self.assertIn("Baseline: `baseline`", markdown)
+            self.assertIn("Baseline: `v0.4.11 (baseline)`", markdown)
             self.assertIn("| rust-micro | 1 | 0 | 1 | 0 |", markdown)
             self.assertIn("unclassified (missing baseline row)", markdown)
 
@@ -195,16 +197,15 @@ class BenchResultsTest(unittest.TestCase):
 
     def test_renderer_has_locked_layout(self):
         rows = bench_results.compare_rows(self.current, self.baseline, None)
-        markdown = bench_results.render(self.current, self.baseline, rows, True)
+        markdown = bench_results.render(self.baseline, rows)
         self.assertIn("Baseline: `baseline`", markdown)
-        self.assertIn("Baseline is stale", markdown)
         self.assertIn("| tier | noise | changed | notable | unclassified |", markdown)
         self.assertNotIn("`micro/noise`", markdown)
 
     def test_renderer_escapes_benchmark_names(self):
         current = {**self.current, "rows": [{**self.current["rows"][0], "name": "bad\\|`name\rrow\nnext"}]}
         rows = bench_results.compare_rows(current, None, None)
-        markdown = bench_results.render(current, None, rows, False)
+        markdown = bench_results.render(None, rows)
         self.assertIn("`bad&#92;&#124;&#96;name<br>row<br>next`", markdown)
 
 
