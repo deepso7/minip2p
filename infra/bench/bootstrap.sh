@@ -79,27 +79,23 @@ ensure_role() {
   fi
 }
 
+# Strip every inline and attached policy so reruns converge the role to no
+# AWS access. Word splitting handles the CLI's text output whether it prints
+# the list on one tab-separated line or one entry per line.
 clear_role_permissions() {
-  local name=$1 policy_names_text policy_arns_text policy_name policy_arn
-  local -a policy_names policy_arns
-
-  policy_names_text=$(aws iam list-role-policies --role-name "$name" \
+  local name=$1 policy_names policy_arns policy_name policy_arn
+  policy_names=$(aws iam list-role-policies --role-name "$name" \
     --query 'PolicyNames' --output text)
-  if [[ -n "$policy_names_text" && "$policy_names_text" != None ]]; then
-    read -ra policy_names <<< "$policy_names_text"
-    for policy_name in "${policy_names[@]}"; do
-      aws iam delete-role-policy --role-name "$name" --policy-name "$policy_name"
-    done
-  fi
-
-  policy_arns_text=$(aws iam list-attached-role-policies --role-name "$name" \
+  for policy_name in $policy_names; do
+    [[ "$policy_name" == None ]] && continue
+    aws iam delete-role-policy --role-name "$name" --policy-name "$policy_name"
+  done
+  policy_arns=$(aws iam list-attached-role-policies --role-name "$name" \
     --query 'AttachedPolicies[].PolicyArn' --output text)
-  if [[ -n "$policy_arns_text" && "$policy_arns_text" != None ]]; then
-    read -ra policy_arns <<< "$policy_arns_text"
-    for policy_arn in "${policy_arns[@]}"; do
-      aws iam detach-role-policy --role-name "$name" --policy-arn "$policy_arn"
-    done
-  fi
+  for policy_arn in $policy_arns; do
+    [[ "$policy_arn" == None ]] && continue
+    aws iam detach-role-policy --role-name "$name" --policy-arn "$policy_arn"
+  done
 }
 
 # The task role runs the benchmarks and needs no AWS access.
@@ -149,11 +145,15 @@ if aws iam get-role --role-name minip2p-github-bench >/dev/null 2>&1; then
         {
           "Sid": "TaskDefinitions",
           "Effect": "Allow",
-          "Action": [
-            "ecs:RegisterTaskDefinition", "ecs:DeregisterTaskDefinition",
-            "ecs:DescribeTaskDefinition", "ecs:TagResource"
-          ],
+          "Action": ["ecs:RegisterTaskDefinition", "ecs:DeregisterTaskDefinition", "ecs:DescribeTaskDefinition"],
           "Resource": "*"
+        },
+        {
+          "Sid": "TagNewTaskDefinitions",
+          "Effect": "Allow",
+          "Action": "ecs:TagResource",
+          "Resource": "arn:aws:ecs:'"$region"':'"$account"':task-definition/minip2p-bench:*",
+          "Condition": {"StringEquals": {"ecs:CreateAction": "RegisterTaskDefinition"}}
         },
         {
           "Sid": "RunTasks",
