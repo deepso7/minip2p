@@ -5,8 +5,8 @@ import { resolve } from "node:path";
 
 const repository = resolve(import.meta.dirname, "../..");
 const dockerContext = process.env.BENCH_DOCKER_CONTEXT ?? repository;
-const benchStage = process.env.BENCH_STAGE ?? "ci";
-const resourceSuffix = benchStage === "ci" ? "" : `-${benchStage}`;
+const clusterName = process.env.BENCH_CLUSTER ?? "minip2p-bench";
+const taskFamily = process.env.BENCH_TASK_FAMILY ?? "minip2p-bench";
 
 export default Alchemy.Stack(
   "Minip2pBench",
@@ -16,13 +16,13 @@ export default Alchemy.Stack(
   },
   Effect.gen(function* () {
     const cluster = yield* AWS.ECS.Cluster("Cluster", {
-      clusterName: `minip2p-bench${resourceSuffix}`,
+      clusterName,
       settings: [{ name: "containerInsights", value: "disabled" }],
       tags: { project: "minip2p", purpose: "benchmark" },
     });
 
     const task = yield* AWS.ECS.Task("Task", {
-      taskName: `minip2p-bench${resourceSuffix}`,
+      taskName: taskFamily,
       context: dockerContext,
       dockerfile: resolve(dockerContext, "infra/bench/Dockerfile"),
       cpu: 2048,

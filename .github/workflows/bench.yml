@@ -119,7 +119,8 @@ jobs:
             fi
             cp "$RUNNER_TEMP/results.json" "$BASELINE_DIR/$GITHUB_SHA.json"
             git -C "$BASELINE_DIR" add "$GITHUB_SHA.json"
-            if [ "$GITHUB_SHA" = "$(git -C "$BASELINE_DIR" rev-parse origin/main)" ]; then
+            if [ "$GITHUB_SHA" = "$(git -C "$BASELINE_DIR" rev-parse origin/main)" ] \
+              || ! git -C "$BASELINE_DIR" ls-files --error-unmatch latest >/dev/null 2>&1; then
               printf '%s\n' "$GITHUB_SHA" > "$BASELINE_DIR/latest"
               git -C "$BASELINE_DIR" add latest
             fi
