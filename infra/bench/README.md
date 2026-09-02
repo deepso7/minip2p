@@ -49,18 +49,39 @@ that environment:
 }
 ```
 
-The role needs permission to manage this stack's ECS cluster and task
-definitions, ECR repository, IAM roles, CloudWatch log group, and S3 state
-bucket. Alchemy reads and writes the state bucket's versioning, encryption,
-public-access-block, and ownership-controls settings on every deploy and
-destroy, so the role needs the matching `s3:Get*` and `s3:Put*` actions. The benchmark runner also calls these actions:
+The role's policy must allow every call Alchemy and the runner make. Alchemy
+converges each resource after creating it, so it needs update and read-back
+actions as well as create and delete. Scope resources to names containing
+`minip2p`, and scope the S3 statement to the `alchemy-state-…` bucket.
 
-- `ec2:DescribeVpcs`, `ec2:DescribeSubnets`, and
-  `ec2:DescribeSecurityGroups`;
-- `ecs:DescribeClusters`, `ecs:DescribeTaskDefinition`, `ecs:DescribeTasks`,
-  `ecs:ListTasks`, `ecs:RunTask`, and `ecs:StopTask`;
-- `logs:GetLogEvents`; and
-- `iam:PassRole`, scoped to the stack's task and execution roles.
+- `ec2`: `DescribeVpcs`, `DescribeSubnets`, `DescribeSecurityGroups`.
+- `ecs`: `CreateCluster`, `DeleteCluster`, `DescribeClusters`, `ListClusters`,
+  `UpdateCluster`, `UpdateClusterSettings`, `PutClusterCapacityProviders`,
+  `ListContainerInstances`, `ListServices`, `RegisterTaskDefinition`,
+  `DeregisterTaskDefinition`, `DeleteTaskDefinitions`, `DescribeTaskDefinition`,
+  `ListTaskDefinitions`, `RunTask`, `StopTask`, `DescribeTasks`, `ListTasks`,
+  `TagResource`, `UntagResource`, `ListTagsForResource`.
+- `ecr`: `GetAuthorizationToken` on `*`; then `CreateRepository`,
+  `DeleteRepository`, `DescribeRepositories`, `DescribeImages`, `ListImages`,
+  `BatchGetImage`, `BatchDeleteImage`, `BatchCheckLayerAvailability`,
+  `InitiateLayerUpload`, `UploadLayerPart`, `CompleteLayerUpload`, `PutImage`,
+  `GetDownloadUrlForLayer`, `GetRepositoryPolicy`, `SetRepositoryPolicy`,
+  `PutLifecyclePolicy`, `PutImageScanningConfiguration`,
+  `PutImageTagMutability`, `TagResource`, `UntagResource`, `ListTagsForResource`.
+- `logs`: `CreateLogGroup`, `DeleteLogGroup`, `DescribeLogGroups`,
+  `PutRetentionPolicy`, `PutLogGroupDeletionProtection`, `GetLogEvents`,
+  `TagResource`, `UntagResource`, `ListTagsForResource`.
+- `iam`: `CreateRole`, `DeleteRole`, `GetRole`, `UpdateRole`,
+  `UpdateAssumeRolePolicy`, `PutRolePolicy`, `GetRolePolicy`,
+  `DeleteRolePolicy`, `ListRolePolicies`, `AttachRolePolicy`,
+  `DetachRolePolicy`, `ListAttachedRolePolicies`, `TagRole`, `UntagRole`,
+  `ListRoleTags`, `PassRole`.
+- `s3` on the state bucket: `CreateBucket`, `DeleteBucket`, `ListBucket`,
+  `GetBucketLocation`, `GetObject`, `PutObject`, `DeleteObject`,
+  `GetEncryptionConfiguration`, `PutEncryptionConfiguration`,
+  `GetBucketVersioning`, `PutBucketVersioning`, `GetBucketPublicAccessBlock`,
+  `PutBucketPublicAccessBlock`, `GetBucketOwnershipControls`,
+  `PutBucketOwnershipControls`, `GetBucketTagging`, `PutBucketTagging`.
 
 Keep the role dedicated to this repository and set its maximum session duration
 to at least 7200 seconds.
