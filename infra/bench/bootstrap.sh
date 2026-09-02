@@ -83,19 +83,26 @@ ensure_role() {
 # AWS access. JSON output distinguishes an empty list from a policy named
 # `None`, which the AWS CLI's text output cannot do.
 clear_role_permissions() {
-  local name=$1 policy_names_json policy_arns_json policy_name policy_arn
+  local name=$1 policy_name policy_arn
+  local policy_names_json policy_arns_json policy_names_text policy_arns_text
   local -a policy_names policy_arns
 
   policy_names_json=$(aws iam list-role-policies --role-name "$name" \
     --query 'PolicyNames' --output json)
-  mapfile -t policy_names < <(jq -r '.[]' <<< "$policy_names_json")
+  policy_names_text=$(jq -r '.[]' <<< "$policy_names_json")
+  if [[ -n "$policy_names_text" ]]; then
+    mapfile -t policy_names <<< "$policy_names_text"
+  fi
   for policy_name in "${policy_names[@]}"; do
     aws iam delete-role-policy --role-name "$name" --policy-name "$policy_name"
   done
 
   policy_arns_json=$(aws iam list-attached-role-policies --role-name "$name" \
     --query 'AttachedPolicies[].PolicyArn' --output json)
-  mapfile -t policy_arns < <(jq -r '.[]' <<< "$policy_arns_json")
+  policy_arns_text=$(jq -r '.[]' <<< "$policy_arns_json")
+  if [[ -n "$policy_arns_text" ]]; then
+    mapfile -t policy_arns <<< "$policy_arns_text"
+  fi
   for policy_arn in "${policy_arns[@]}"; do
     aws iam detach-role-policy --role-name "$name" --policy-arn "$policy_arn"
   done
