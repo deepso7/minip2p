@@ -3,7 +3,7 @@
 The benchmark workflow builds one container image, runs the full benchmark
 suite in it as a single AWS Fargate task, and stores the returned JSON as its
 `bench-aws` artifact. GitHub Actions orchestrates the task directly with the
-AWS CLI; there is no deployment tool in the loop.
+AWS CLI and `jq`; there is no deployment tool in the loop.
 
 Published stable releases produce the baseline stored on `bench-data`. Pull
 requests from this repository run the same task and compare their head commit

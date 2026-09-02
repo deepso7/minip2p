@@ -55,16 +55,15 @@ stop_task() {
 
 # Stop a still-running task and deregister this run's revision. Runs on every
 # exit, including cancellation, where GitHub allows about ten seconds (SIGINT,
-# 7.5 s, SIGTERM, 2.5 s, SIGKILL). Cancellation uses a short wait; other exits
-# allow ECS three minutes to stop the task. Nothing else needs cleaning up
-# because the cluster, repository, roles, and log group are permanent.
+# 7.5 s, SIGTERM, 2.5 s, SIGKILL). A cancelled run only requests the stop and
+# moves straight on to deregistering, since a few CLI round trips already use
+# most of that budget and ECS finishes the stop on its own. Other exits allow
+# ECS three minutes to confirm the stop. Nothing else needs cleaning up because
+# the cluster, repository, roles, and log group are permanent.
 cleanup() {
-  local exit_status=$? status stop_timeout=180
+  local exit_status=$? status
   trap '' INT TERM
   trap - EXIT
-  if [[ "$cancelled" == true ]]; then
-    stop_timeout=5
-  fi
   if [[ -n "$task_arn" ]]; then
     status=$(task_status "$task_arn" 2>/dev/null || true)
     if [[ "$status" != STOPPED ]]; then
@@ -72,7 +71,8 @@ cleanup() {
         echo "failed to request an ECS task stop: $task_arn" >&2
         exit_status=1
       fi
-      if ! wait_for_stopped "$task_arn" "$stop_timeout" 1; then
+      if [[ "$cancelled" != true ]] \
+        && ! wait_for_stopped "$task_arn" 180 1; then
         echo "ECS task did not stop before cleanup timed out: $task_arn" >&2
         exit_status=1
       fi
