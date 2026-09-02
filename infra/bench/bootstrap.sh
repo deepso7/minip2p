@@ -86,16 +86,18 @@ clear_role_permissions() {
   local name=$1 policy_names policy_arns policy_name policy_arn
   policy_names=$(aws iam list-role-policies --role-name "$name" \
     --query 'PolicyNames' --output text)
-  for policy_name in $policy_names; do
-    [[ "$policy_name" == None ]] && continue
-    aws iam delete-role-policy --role-name "$name" --policy-name "$policy_name"
-  done
+  if [[ "$policy_names" != None ]]; then
+    for policy_name in $policy_names; do
+      aws iam delete-role-policy --role-name "$name" --policy-name "$policy_name"
+    done
+  fi
   policy_arns=$(aws iam list-attached-role-policies --role-name "$name" \
     --query 'AttachedPolicies[].PolicyArn' --output text)
-  for policy_arn in $policy_arns; do
-    [[ "$policy_arn" == None ]] && continue
-    aws iam detach-role-policy --role-name "$name" --policy-arn "$policy_arn"
-  done
+  if [[ "$policy_arns" != None ]]; then
+    for policy_arn in $policy_arns; do
+      aws iam detach-role-policy --role-name "$name" --policy-arn "$policy_arn"
+    done
+  fi
 }
 
 # The task role runs the benchmarks and needs no AWS access.

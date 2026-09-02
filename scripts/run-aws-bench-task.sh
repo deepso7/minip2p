@@ -38,21 +38,36 @@ wait_for_stopped() {
   return 1
 }
 
+stop_task() {
+  local arn=$1 attempt
+  for attempt in 1 2 3; do
+    if aws ecs stop-task --cluster "$cluster" --task "$arn" \
+      --reason "Benchmark runner exit" >/dev/null; then
+      return 0
+    fi
+    if (( attempt < 3 )); then
+      interruptible_sleep 1
+    fi
+  done
+  return 1
+}
+
 # Stop a still-running task and deregister this run's revision. Runs on every
 # exit, including cancellation, where GitHub allows about ten seconds (SIGINT,
-# 7.5 s, SIGTERM, 2.5 s, SIGKILL). So this makes one quick request each and
-# never waits: ECS stops the task on its own once asked, and deregistering a
-# revision does not affect a task already running. Nothing else needs
-# cleaning up because the cluster, repository, roles, and log group are
-# permanent.
+# 7.5 s, SIGTERM, 2.5 s, SIGKILL). Stop retries and status polling add no more
+# than seven seconds of deliberate waiting. Nothing else needs cleaning up
+# because the cluster, repository, roles, and log group are permanent.
 cleanup() {
-  local exit_status=$?
+  local exit_status=$? status
   trap '' INT TERM
   trap - EXIT
-  if [[ -n "$task_arn" && "$(task_status "$task_arn" 2>/dev/null)" != STOPPED ]]; then
-    if ! aws ecs stop-task --cluster "$cluster" --task "$task_arn" \
-      --reason "Benchmark runner exit" >/dev/null; then
+  if [[ -n "$task_arn" ]]; then
+    status=$(task_status "$task_arn" 2>/dev/null || true)
+    if [[ "$status" != STOPPED ]] && ! stop_task "$task_arn"; then
       echo "failed to stop ECS task, stop it by hand: $task_arn" >&2
+      exit_status=1
+    elif [[ "$status" != STOPPED ]] && ! wait_for_stopped "$task_arn" 5 1; then
+      echo "ECS task did not stop before cleanup timed out: $task_arn" >&2
       exit_status=1
     fi
   fi
