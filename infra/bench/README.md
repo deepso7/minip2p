@@ -51,7 +51,9 @@ that environment:
 
 The role needs permission to manage this stack's ECS cluster and task
 definitions, ECR repository, IAM roles, CloudWatch log group, and S3 state
-bucket. The benchmark runner also calls these actions:
+bucket. Alchemy reads and writes the state bucket's versioning, encryption,
+public-access-block, and ownership-controls settings on every deploy and
+destroy, so the role needs the matching `s3:Get*` and `s3:Put*` actions. The benchmark runner also calls these actions:
 
 - `ec2:DescribeVpcs`, `ec2:DescribeSubnets`, and
   `ec2:DescribeSecurityGroups`;

@@ -66,4 +66,7 @@ if (( ${#task_arns[@]} > 0 )) \
 fi
 
 rm -f "$BENCH_TASK_ARN_FILE"
+# alchemy.run.ts requires a context path. Destroy never builds, so the path
+# does not need to exist.
+export BENCH_DOCKER_CONTEXT=${BENCH_DOCKER_CONTEXT:-/nonexistent/docker-context}
 exec alchemy destroy --stage "$BENCH_STAGE" --yes

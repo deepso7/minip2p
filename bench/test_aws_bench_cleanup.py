@@ -20,7 +20,11 @@ class AwsBenchCleanupTest(unittest.TestCase):
             task_arn.write_text("arn:aws:ecs:region:account:task/cluster/task\n")
             for name, script in {
                 "aws": aws_script,
-                "alchemy": '#!/usr/bin/env bash\nprintf "alchemy %s\\n" "$*" >> "$CALLS"\n',
+                "alchemy": (
+                    '#!/usr/bin/env bash\n'
+                    ': "${BENCH_DOCKER_CONTEXT:?alchemy.run.ts requires a context}"\n'
+                    'printf "alchemy %s\\n" "$*" >> "$CALLS"\n'
+                ),
             }.items():
                 path = binary / name
                 path.write_text(textwrap.dedent(script))
