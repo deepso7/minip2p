@@ -1,10 +1,11 @@
 name: Bench
 
 on:
-  push:
-    branches: [main]
+  release:
+    types: [published]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -19,7 +20,8 @@ env:
 jobs:
   aws-bench:
     if: >-
-      github.event_name == 'push' ||
+      (github.event_name == 'release' && !github.event.release.prerelease) ||
+      github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -89,7 +91,7 @@ jobs:
 
   baseline:
     if: >-
-      github.event_name == 'push' &&
+      (github.event_name == 'release' || github.event_name == 'workflow_dispatch') &&
       needs.aws-bench.outputs.complete == 'true'
     needs: [aws-bench]
     runs-on: ubuntu-latest
@@ -107,10 +109,18 @@ jobs:
       - name: Update baseline branch
         env:
           BASELINE_DIR: ${{ runner.temp }}/bench-data
+          BASELINE_LABEL: ${{ github.event.release.tag_name || 'manual' }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           git worktree add --detach "$BASELINE_DIR"
+          publish_latest=true
+          if [ "$GITHUB_EVENT_NAME" = release ]; then
+            latest_release=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+            if [ "$BASELINE_LABEL" != "$latest_release" ]; then
+              publish_latest=false
+            fi
+          fi
           for attempt in 1 2 3; do
-            git -C "$BASELINE_DIR" fetch origin main
             if git -C "$BASELINE_DIR" fetch --depth=1 origin bench-data; then
               git -C "$BASELINE_DIR" checkout -B bench-data FETCH_HEAD
             else
@@ -119,10 +129,10 @@ jobs:
             fi
             cp "$RUNNER_TEMP/results.json" "$BASELINE_DIR/$GITHUB_SHA.json"
             git -C "$BASELINE_DIR" add "$GITHUB_SHA.json"
-            if [ "$GITHUB_SHA" = "$(git -C "$BASELINE_DIR" rev-parse origin/main)" ] \
-              || ! git -C "$BASELINE_DIR" ls-files --error-unmatch latest >/dev/null 2>&1; then
+            if [ "$publish_latest" = true ]; then
               printf '%s\n' "$GITHUB_SHA" > "$BASELINE_DIR/latest"
-              git -C "$BASELINE_DIR" add latest
+              printf '%s\n' "$BASELINE_LABEL" > "$BASELINE_DIR/latest-release"
+              git -C "$BASELINE_DIR" add latest latest-release
             fi
             if git -C "$BASELINE_DIR" diff --cached --quiet; then
               exit 0
@@ -161,11 +171,13 @@ jobs:
             exit 0
           fi
           baseline_sha=$(git show FETCH_HEAD:latest)
+          baseline_release=$(git show FETCH_HEAD:latest-release 2>/dev/null || printf 'unknown')
           git show "FETCH_HEAD:$baseline_sha.json" > "$RUNNER_TEMP/baseline.json"
           git cat-file -e "$baseline_sha^{commit}" 2>/dev/null || git fetch origin "$baseline_sha"
           merge_base=$(git merge-base "${{ github.event.pull_request.head.sha }}" "${{ github.event.pull_request.base.sha }}")
           echo "available=true" >> "$GITHUB_OUTPUT"
           echo "sha=$baseline_sha" >> "$GITHUB_OUTPUT"
+          echo "release=$baseline_release" >> "$GITHUB_OUTPUT"
           if [ "$baseline_sha" = "$merge_base" ]; then
             echo "stale=false" >> "$GITHUB_OUTPUT"
           else
@@ -173,11 +185,14 @@ jobs:
           fi
       - name: Compare with baseline
         if: steps.baseline.outputs.available == 'true'
+        env:
+          BASELINE_LABEL: ${{ steps.baseline.outputs.release }}
         run: >-
           python3 scripts/bench_results.py compare
           --current "$RUNNER_TEMP/current.json"
           --baseline "$RUNNER_TEMP/baseline.json"
           --output "$RUNNER_TEMP/comparison.md"
+          --baseline-label "$BASELINE_LABEL"
           --check-ir-pins
           --baseline-tree "${{ steps.baseline.outputs.sha }}"
           --current-tree "${{ github.event.pull_request.head.sha }}"

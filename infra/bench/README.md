@@ -4,6 +4,10 @@ The benchmark workflow deploys this Alchemy stack and runs the full benchmark
 suite in one AWS Fargate task. GitHub Actions orchestrates the task and stores
 the returned JSON as its normal `bench-aws` artifact.
 
+Published stable releases produce the baseline stored on `bench-data`. Pull
+requests run the same task and compare their head commit with that release.
+The workflow can also be run manually to refresh the baseline.
+
 The stack pins `alchemy@2.0.0-beta.76` and `effect@4.0.0-rc.112`. It creates:
 
 - an ECS cluster and 2-vCPU, 4-GiB Fargate task definition;

@@ -119,11 +119,13 @@ class BenchResultsTest(unittest.TestCase):
                     str(ROOT / "bench/fixtures/baseline.json"),
                     "--output",
                     str(output),
+                    "--baseline-label",
+                    "v0.4.11",
                 ],
                 check=True,
             )
             markdown = output.read_text()
-            self.assertIn("Baseline: `baseline`", markdown)
+            self.assertIn("Baseline: `v0.4.11 (baseline)`", markdown)
             self.assertIn("| rust-micro | 1 | 0 | 1 | 0 |", markdown)
             self.assertIn("unclassified (missing baseline row)", markdown)
 
