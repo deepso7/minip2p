@@ -2,7 +2,6 @@
 
 FROM node:24-bookworm@sha256:be23f54a88d34e8824c741b19b91064094f92c1c97b194144bfc8b50d67258e2
 
-ARG VALGRIND_SHA256=5d589152eb8071c02feab8ce6ab719e431a1fbc3e2b1700f5432632a8b9264dc
 ARG PNPM_VERSION=11.24.0
 ARG BUILD_JOBS=2
 
@@ -33,6 +32,7 @@ RUN apt-get update \
     && RUST_TOOLCHAIN=$(jq -r .rust /tmp/bench-pins.json) \
     && GUNGRAUN_VERSION=$(jq -r .gungraun /tmp/bench-pins.json) \
     && VALGRIND_VERSION=$(jq -r .valgrind /tmp/bench-pins.json) \
+    && VALGRIND_SHA256=$(jq -r .valgrind_sha256 /tmp/bench-pins.json) \
     && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
       | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal \
     && cargo install --locked --version "$GUNGRAUN_VERSION" gungraun-runner \

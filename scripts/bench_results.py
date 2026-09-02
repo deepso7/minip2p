@@ -45,6 +45,7 @@ IR_PINS = {
     "profile": "optimization profile",
     "gungraun": "Gungraun version",
     "valgrind": "Valgrind version",
+    "valgrind_sha256": "Valgrind archive digest",
 }
 
 

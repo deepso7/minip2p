@@ -2,5 +2,6 @@
   "rust": "1.98.0",
   "profile": "release",
   "gungraun": "0.19.4",
-  "valgrind": "3.27.1"
+  "valgrind": "3.27.1",
+  "valgrind_sha256": "5d589152eb8071c02feab8ce6ab719e431a1fbc3e2b1700f5432632a8b9264dc"
 }

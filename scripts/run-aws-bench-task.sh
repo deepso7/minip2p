@@ -50,6 +50,7 @@ stop_active_task() {
     echo "ECS task did not stop within 3 minutes: $task_arn" >&2
     return 1
   fi
+  rm -f "$BENCH_TASK_ARN_FILE"
   task_arn=
 }
 
@@ -59,11 +60,15 @@ request_task_stop() {
     --cluster "$cluster" \
     --task "$task_arn" \
     --reason "Benchmark runner cancelled" >/dev/null
+  if wait_for_stopped "$task_arn" 7 1; then
+    rm -f "$BENCH_TASK_ARN_FILE"
+    task_arn=
+  fi
 }
 
 cleanup_on_exit() {
   local exit_status=$?
-  trap - EXIT
+  trap - EXIT INT TERM
   if [[ "$cancelled" == true ]]; then
     request_task_stop || exit_status=1
   elif ! stop_active_task; then
@@ -126,6 +131,8 @@ if [[ -z "$task_arn" || "$task_arn" == None ]]; then
   echo "ECS did not return a task ARN" >&2
   exit 1
 fi
+mkdir -p "$(dirname "$BENCH_TASK_ARN_FILE")"
+printf '%s\n' "$task_arn" > "$BENCH_TASK_ARN_FILE"
 
 echo "Started $task_arn"
 
@@ -184,6 +191,7 @@ exit_code=$(aws ecs describe-tasks \
   --query 'tasks[0].containers[0].exitCode' \
   --output text)
 task_arn=
+rm -f "$BENCH_TASK_ARN_FILE"
 
 if [[ "$exit_code" != 0 ]]; then
   cat target/bench-fargate.log >&2
