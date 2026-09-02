@@ -13,6 +13,7 @@ jobs:
   comment:
     if: >-
       github.event.workflow_run.event == 'pull_request_target' &&
+      github.event.workflow_run.pull_requests[0].head.repo.full_name == github.repository &&
       github.event.workflow_run.conclusion != 'cancelled'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -31,6 +32,8 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
 
       - name: Download benchmark context
+        id: context
+        continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: bench-aws
@@ -44,12 +47,20 @@ jobs:
           ARTIFACT_DIR: ${{ runner.temp }}/bench-comparison
           CONTEXT_DIR: ${{ runner.temp }}/bench-context
           CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          CONTEXT_OUTCOME: ${{ steps.context.outcome }}
           DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          EVENT_HEAD_SHA: ${{ github.event.workflow_run.pull_requests[0].head.sha }}
+          EVENT_PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          pr_number=$(tr -d '\r\n' < "$CONTEXT_DIR/pr-number")
-          expected_head_sha=$(tr -d '\r\n' < "$CONTEXT_DIR/head-sha")
+          if [ "$CONTEXT_OUTCOME" = success ]; then
+            pr_number=$(tr -d '\r\n' < "$CONTEXT_DIR/pr-number")
+            expected_head_sha=$(tr -d '\r\n' < "$CONTEXT_DIR/head-sha")
+          else
+            pr_number=$EVENT_PR_NUMBER
+            expected_head_sha=$EVENT_HEAD_SHA
+          fi
           if [ "$DOWNLOAD_OUTCOME" = success ]; then
             comparison_pr_number=$(tr -d '\r\n' < "$ARTIFACT_DIR/pr-number")
             test "$comparison_pr_number" = "$pr_number"

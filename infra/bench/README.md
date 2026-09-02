@@ -55,8 +55,8 @@ bucket. The benchmark runner also calls these actions:
 
 - `ec2:DescribeVpcs`, `ec2:DescribeSubnets`, and
   `ec2:DescribeSecurityGroups`;
-- `ecs:DescribeTaskDefinition`, `ecs:DescribeTasks`, `ecs:RunTask`, and
-  `ecs:StopTask`;
+- `ecs:DescribeClusters`, `ecs:DescribeTaskDefinition`, `ecs:DescribeTasks`,
+  `ecs:ListTasks`, `ecs:RunTask`, and `ecs:StopTask`;
 - `logs:GetLogEvents`; and
 - `iam:PassRole`, scoped to the stack's task and execution roles.
 

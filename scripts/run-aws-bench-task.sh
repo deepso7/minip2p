@@ -114,7 +114,7 @@ done
 
 if [[ ${status:-} != STOPPED ]]; then
   echo "Fargate benchmark exceeded 45 minutes" >&2
-  stop_active_task
+  # The EXIT trap owns the bounded stop-and-wait cleanup.
   exit 1
 fi
 
