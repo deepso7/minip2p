@@ -1,7 +1,6 @@
 .git
 .repos
 .pnpm-store
-.alchemy
 **/node_modules
 target
 target-linux

@@ -1,0 +1,32 @@
+{
+  "family": "minip2p-bench",
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "cpu": "2048",
+  "memory": "4096",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/minip2p-bench-task",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/minip2p-bench-execution",
+  "containerDefinitions": [
+    {
+      "name": "bench",
+      "image": "IMAGE",
+      "essential": true,
+      "linuxParameters": {
+        "capabilities": { "add": ["SYS_PTRACE"] }
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/minip2p/bench",
+          "awslogs-region": "REGION",
+          "awslogs-stream-prefix": "run"
+        }
+      }
+    }
+  ],
+  "tags": [{ "key": "project", "value": "minip2p" }]
+}
