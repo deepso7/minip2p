@@ -1,13 +1,42 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/../infra/bench/config.sh"
+
 : "${AWS_REGION:?AWS_REGION is required}"
 : "${BENCH_GIT_SHA:?BENCH_GIT_SHA is required}"
 
-cluster=${BENCH_CLUSTER:-minip2p-bench}
-family=${BENCH_TASK_FAMILY:-minip2p-bench}
+cluster=$BENCH_CLUSTER
+family=$BENCH_TASK_FAMILY
 output=${BENCH_OUTPUT:-target/bench-artifacts/current.json}
 task_arn=
+cancelled=false
+
+interruptible_sleep() {
+  sleep "$1" &
+  wait $!
+}
+
+wait_for_stopped() {
+  local arn=$1
+  local timeout=$2
+  local interval=$3
+  local deadline=$((SECONDS + timeout))
+  local status
+
+  while (( SECONDS < deadline )); do
+    status=$(aws ecs describe-tasks \
+      --cluster "$cluster" \
+      --tasks "$arn" \
+      --query 'tasks[0].lastStatus' \
+      --output text)
+    if [[ "$status" == STOPPED ]]; then
+      return 0
+    fi
+    interruptible_sleep "$interval"
+  done
+  return 1
+}
 
 stop_active_task() {
   [[ -z "$task_arn" ]] && return 0
@@ -17,35 +46,34 @@ stop_active_task() {
     --task "$task_arn" \
     --reason "Benchmark runner cleanup" >/dev/null
 
-  local stop_deadline=$((SECONDS + 180))
-  local status
-  while (( SECONDS < stop_deadline )); do
-    status=$(aws ecs describe-tasks \
-      --cluster "$cluster" \
-      --tasks "$task_arn" \
-      --query 'tasks[0].lastStatus' \
-      --output text)
-    if [[ "$status" == STOPPED ]]; then
-      task_arn=
-      return 0
-    fi
-    sleep 5
-  done
-  echo "ECS task did not stop within 3 minutes: $task_arn" >&2
-  return 1
+  if ! wait_for_stopped "$task_arn" 180 5; then
+    echo "ECS task did not stop within 3 minutes: $task_arn" >&2
+    return 1
+  fi
+  task_arn=
+}
+
+request_task_stop() {
+  [[ -z "$task_arn" ]] && return 0
+  aws ecs stop-task \
+    --cluster "$cluster" \
+    --task "$task_arn" \
+    --reason "Benchmark runner cancelled" >/dev/null
 }
 
 cleanup_on_exit() {
   local exit_status=$?
   trap - EXIT
-  if ! stop_active_task; then
+  if [[ "$cancelled" == true ]]; then
+    request_task_stop || exit_status=1
+  elif ! stop_active_task; then
     exit_status=1
   fi
   exit "$exit_status"
 }
 
 trap cleanup_on_exit EXIT
-trap 'exit 130' INT TERM
+trap 'cancelled=true; exit 130' INT TERM
 
 task_definition=$(aws ecs describe-task-definition \
   --task-definition "$family" \
@@ -101,20 +129,10 @@ fi
 
 echo "Started $task_arn"
 
-deadline=$((SECONDS + 2700))
-while (( SECONDS < deadline )); do
-  status=$(aws ecs describe-tasks \
-    --cluster "$cluster" \
-    --tasks "$task_arn" \
-    --query 'tasks[0].lastStatus' \
-    --output text)
-  [[ "$status" == STOPPED ]] && break
-  sleep 15
-done
-
-if [[ ${status:-} != STOPPED ]]; then
+if ! wait_for_stopped "$task_arn" 2700 15; then
   echo "Fargate benchmark exceeded 45 minutes" >&2
-  # The EXIT trap owns the bounded stop-and-wait cleanup.
+  # The EXIT trap requests a stop. The workflow's always-running destroy step
+  # remains responsible for removing the stack.
   exit 1
 fi
 
@@ -185,5 +203,3 @@ if encoded is None:
     raise SystemExit("benchmark result marker missing from CloudWatch logs")
 pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(encoded, validate=True))
 PY
-
-python3 scripts/bench_results.py merge "$output" --output "$output" --git-sha "$BENCH_GIT_SHA"

@@ -57,6 +57,9 @@ jobs:
       - name: Install infrastructure dependencies
         working-directory: infra/bench
         run: pnpm install --frozen-lockfile
+      - name: Typecheck infrastructure
+        working-directory: infra/bench
+        run: pnpm run typecheck
       - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
         with:
           role-to-assume: ${{ vars.AWS_BENCH_ROLE_ARN }}
@@ -72,13 +75,6 @@ jobs:
           pnpm run deploy
           cd ../..
           scripts/run-aws-bench-task.sh
-      - name: Refresh AWS credentials for cleanup
-        if: always()
-        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
-        with:
-          role-to-assume: ${{ vars.AWS_BENCH_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-duration-seconds: 7200
       - name: Remove benchmark stack
         if: always()
         working-directory: infra/bench
@@ -164,7 +160,6 @@ jobs:
 
   compare:
     if: >-
-      always() &&
       github.event_name == 'pull_request_target' &&
       needs.aws-bench.result == 'success' &&
       needs.aws-bench.outputs.complete == 'true'
@@ -196,15 +191,9 @@ jobs:
           fi
           baseline_release=$(git show FETCH_HEAD:latest-release 2>/dev/null || printf 'unknown')
           git cat-file -e "$baseline_sha^{commit}" 2>/dev/null || git fetch origin "$baseline_sha"
-          merge_base=$(git merge-base "${{ github.event.pull_request.head.sha }}" "${{ github.event.pull_request.base.sha }}")
           echo "available=true" >> "$GITHUB_OUTPUT"
           echo "sha=$baseline_sha" >> "$GITHUB_OUTPUT"
           echo "release=$baseline_release" >> "$GITHUB_OUTPUT"
-          if [ "$baseline_sha" = "$merge_base" ]; then
-            echo "stale=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "stale=true" >> "$GITHUB_OUTPUT"
-          fi
       - name: Compare with baseline
         if: steps.baseline.outputs.available == 'true'
         env:
@@ -218,7 +207,6 @@ jobs:
           --check-ir-pins
           --baseline-tree "${{ steps.baseline.outputs.sha }}"
           --current-tree "${{ github.event.pull_request.head.sha }}"
-          ${{ steps.baseline.outputs.stale == 'true' && '--stale' || '' }}
       - name: Compare without baseline
         if: steps.baseline.outputs.available != 'true'
         run: python3 scripts/bench_results.py compare --current "$RUNNER_TEMP/current.json" --output "$RUNNER_TEMP/comparison.md"

@@ -11,8 +11,15 @@ use minip2p_tcp::{StdTcpProvider, TcpEvent, TcpProvider};
 
 // The locked 512-connection sweep needs at least 1,027 open file descriptors.
 const COUNTS: &[usize] = &[1, 64, 256, 512];
-const SETUP_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_BATCH: usize = 32;
+
+fn setup_timeout() -> Duration {
+    std::env::var("MINIP2P_BENCH_SETUP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(20))
+}
 
 struct ReadySet {
     provider: StdTcpProvider,
@@ -51,6 +58,7 @@ fn establish(count: usize) -> ReadySet {
     let mut connected = 0;
     let mut started_connections = 0;
     let started = Instant::now();
+    let setup_timeout = setup_timeout();
     while started_connections != count {
         for _ in 0..(count - started_connections).min(CONNECT_BATCH) {
             provider
@@ -60,7 +68,7 @@ fn establish(count: usize) -> ReadySet {
         }
         connected += accept_and_poll(&listener, &mut peers, &mut provider);
         assert!(
-            started.elapsed() < SETUP_TIMEOUT,
+            started.elapsed() < setup_timeout,
             "only started {started_connections}/{count}, established {connected}/{count} provider connections, and accepted {}/{} peer streams",
             peers.len(),
             count
@@ -69,7 +77,7 @@ fn establish(count: usize) -> ReadySet {
     while connected != count || peers.len() != count {
         connected += accept_and_poll(&listener, &mut peers, &mut provider);
         assert!(
-            started.elapsed() < SETUP_TIMEOUT,
+            started.elapsed() < setup_timeout,
             "only established {connected}/{count} provider connections and accepted {}/{} peer streams",
             peers.len(),
             count

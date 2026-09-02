@@ -3,10 +3,13 @@ import * as AWS from "alchemy/AWS";
 import * as Effect from "effect/Effect";
 import { resolve } from "node:path";
 
-const repository = resolve(import.meta.dirname, "../..");
-const dockerContext = process.env.BENCH_DOCKER_CONTEXT ?? repository;
-const clusterName = process.env.BENCH_CLUSTER ?? "minip2p-bench";
-const taskFamily = process.env.BENCH_TASK_FAMILY ?? "minip2p-bench";
+const dockerContext = process.env.BENCH_DOCKER_CONTEXT;
+const clusterName = process.env.BENCH_CLUSTER;
+const taskFamily = process.env.BENCH_TASK_FAMILY;
+
+if (!dockerContext || !clusterName || !taskFamily) {
+  throw new Error("deploy.sh must set the benchmark context and resource names");
+}
 
 export default Alchemy.Stack(
   "Minip2pBench",

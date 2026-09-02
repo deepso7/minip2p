@@ -7,8 +7,8 @@ the returned JSON as its normal `bench-aws` artifact.
 Published stable releases produce the baseline stored on `bench-data`. Pull
 requests from this repository run the same task and compare their head commit
 with that release when a baseline is available. Fork pull requests skip AWS
-execution and comparison. Manual runs produce measurement artifacts but never
-change the release baseline.
+execution and comparison. Manual runs measure the default branch and produce
+artifacts, but never change the release baseline.
 
 The stack pins `alchemy@2.0.0-beta.76` and `effect@4.0.0-rc.112`. It creates:
 
@@ -71,7 +71,19 @@ Set these GitHub repository variables under **Settings > Secrets and variables
 No AWS access keys are stored in GitHub. Pull requests from forks do not run
 the AWS job. For same-repository pull requests, the workflow and infrastructure
 code come from the trusted base commit; only the source compiled inside Docker
-comes from the pull request.
+comes from the pull request. Docker still executes the pull request's Rust build
+scripts and package install scripts with the container's permissions. The
+container is the isolation boundary.
+
+AWS runs set `GUNGRAUN_ALLOW_ASLR=1` because Fargate blocks the syscall Gungraun
+uses to disable ASLR. Instruction counts from AWS runs are comparable with
+other AWS runs that use the same setting, not with local runs that disable
+ASLR. The task also raises both socket-sweep setup timeouts to 120 seconds for
+Fargate's fixed CPU quota.
+
+The task runs all three tiers sequentially and publishes one result document.
+If any tier fails, the task publishes no rows. This avoids comparing a partial
+run as though it covered the full benchmark set.
 
 ## Local commands
 

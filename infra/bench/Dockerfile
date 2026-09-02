@@ -2,9 +2,6 @@
 
 FROM node:24-bookworm@sha256:be23f54a88d34e8824c741b19b91064094f92c1c97b194144bfc8b50d67258e2
 
-ARG RUST_TOOLCHAIN=1.98.0
-ARG GUNGRAUN_VERSION=0.19.4
-ARG VALGRIND_VERSION=3.27.1
 ARG VALGRIND_SHA256=5d589152eb8071c02feab8ce6ab719e431a1fbc3e2b1700f5432632a8b9264dc
 ARG PNPM_VERSION=11.24.0
 ARG BUILD_JOBS=2
@@ -14,6 +11,8 @@ ENV CARGO_HOME=/usr/local/cargo \
     CARGO_BUILD_JOBS=$BUILD_JOBS \
     PATH=/usr/local/cargo/bin:$PATH \
     CARGO_TERM_COLOR=always
+
+COPY bench/pins.json /tmp/bench-pins.json
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -31,6 +30,9 @@ RUN apt-get update \
       pkg-config \
       python3 \
     && rm -rf /var/lib/apt/lists/* \
+    && RUST_TOOLCHAIN=$(jq -r .rust /tmp/bench-pins.json) \
+    && GUNGRAUN_VERSION=$(jq -r .gungraun /tmp/bench-pins.json) \
+    && VALGRIND_VERSION=$(jq -r .valgrind /tmp/bench-pins.json) \
     && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
       | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal \
     && cargo install --locked --version "$GUNGRAUN_VERSION" gungraun-runner \
@@ -42,7 +44,7 @@ RUN apt-get update \
     && make -j"$BUILD_JOBS" \
     && make install \
     && cd / \
-    && rm -rf "valgrind-${VALGRIND_VERSION}" "valgrind-${VALGRIND_VERSION}.tar.bz2" \
+    && rm -rf "valgrind-${VALGRIND_VERSION}" "valgrind-${VALGRIND_VERSION}.tar.bz2" /tmp/bench-pins.json \
     && npm install --global "pnpm@${PNPM_VERSION}"
 
 WORKDIR /minip2p
