@@ -14,6 +14,7 @@ log_group=/minip2p/bench
 output=${BENCH_OUTPUT:-target/bench-artifacts/current.json}
 task_arn=
 task_definition=
+cancelled=false
 
 interruptible_sleep() {
   sleep "$1" &
@@ -54,21 +55,27 @@ stop_task() {
 
 # Stop a still-running task and deregister this run's revision. Runs on every
 # exit, including cancellation, where GitHub allows about ten seconds (SIGINT,
-# 7.5 s, SIGTERM, 2.5 s, SIGKILL). Stop retries and status polling add no more
-# than seven seconds of deliberate waiting. Nothing else needs cleaning up
+# 7.5 s, SIGTERM, 2.5 s, SIGKILL). Cancellation uses a short wait; other exits
+# allow ECS three minutes to stop the task. Nothing else needs cleaning up
 # because the cluster, repository, roles, and log group are permanent.
 cleanup() {
-  local exit_status=$? status
+  local exit_status=$? status stop_timeout=180
   trap '' INT TERM
   trap - EXIT
+  if [[ "$cancelled" == true ]]; then
+    stop_timeout=5
+  fi
   if [[ -n "$task_arn" ]]; then
     status=$(task_status "$task_arn" 2>/dev/null || true)
-    if [[ "$status" != STOPPED ]] && ! stop_task "$task_arn"; then
-      echo "failed to stop ECS task, stop it by hand: $task_arn" >&2
-      exit_status=1
-    elif [[ "$status" != STOPPED ]] && ! wait_for_stopped "$task_arn" 5 1; then
-      echo "ECS task did not stop before cleanup timed out: $task_arn" >&2
-      exit_status=1
+    if [[ "$status" != STOPPED ]]; then
+      if ! stop_task "$task_arn"; then
+        echo "failed to request an ECS task stop: $task_arn" >&2
+        exit_status=1
+      fi
+      if ! wait_for_stopped "$task_arn" "$stop_timeout" 1; then
+        echo "ECS task did not stop before cleanup timed out: $task_arn" >&2
+        exit_status=1
+      fi
     fi
   fi
   if [[ -n "$task_definition" ]]; then
@@ -81,7 +88,7 @@ cleanup() {
   exit "$exit_status"
 }
 trap cleanup EXIT
-trap 'exit 130' INT TERM
+trap 'cancelled=true; exit 130' INT TERM
 
 account=$(aws sts get-caller-identity --query Account --output text)
 mkdir -p target
