@@ -24,7 +24,9 @@ export default Alchemy.Stack(
     const task = yield* AWS.ECS.Task("Task", {
       taskName: taskFamily,
       context: dockerContext,
-      dockerfile: resolve(dockerContext, "infra/bench/Dockerfile"),
+      // Infrastructure always comes from the trusted workflow checkout. A PR
+      // may supply only the source context that is compiled inside Docker.
+      dockerfile: resolve(import.meta.dirname, "Dockerfile"),
       cpu: 2048,
       memory: 4096,
       runtimePlatform: {

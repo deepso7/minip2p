@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repository=$(git rev-parse --show-toplevel)
+source_repository=${BENCH_SOURCE_DIR:-$repository}
 context="$repository/infra/bench/.alchemy/docker-context"
 stage=${BENCH_STAGE:-ci}
 
@@ -10,8 +11,8 @@ stage=${BENCH_STAGE:-ci}
 # hash or exhaust the deploy runner's memory.
 mkdir -p "$context"
 find "$context" -mindepth 1 -delete
-git -C "$repository" ls-files -z \
-  | tar --directory "$repository" --null --create --files-from=- \
+git -C "$source_repository" ls-files -z \
+  | tar --directory "$source_repository" --null --create --files-from=- \
   | tar --extract --directory "$context"
 
 export BENCH_DOCKER_CONTEXT="$context"

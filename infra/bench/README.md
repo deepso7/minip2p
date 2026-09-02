@@ -7,8 +7,8 @@ the returned JSON as its normal `bench-aws` artifact.
 Published stable releases produce the baseline stored on `bench-data`. Pull
 requests from this repository run the same task and compare their head commit
 with that release when a baseline is available. Fork pull requests skip AWS
-execution and comparison. The workflow can also be run manually to refresh the
-baseline.
+execution and comparison. Manual runs produce measurement artifacts but never
+change the release baseline.
 
 The stack pins `alchemy@2.0.0-beta.76` and `effect@4.0.0-rc.112`. It creates:
 
@@ -23,8 +23,10 @@ security group. It receives a public IP so it can pull the image from ECR.
 
 ## GitHub configuration
 
-Create a GitHub Actions OIDC role in the AWS account. Restrict its trust policy
-to this repository:
+Create a protected GitHub Environment named `aws-bench`, require reviewer
+approval for deployments, prevent self-review, and store `AWS_BENCH_ROLE_ARN`
+as an environment variable. Create an OIDC role whose trust is restricted to
+that environment:
 
 ```json
 {
@@ -38,10 +40,8 @@ to this repository:
       "Action": "sts:AssumeRoleWithWebIdentity",
       "Condition": {
         "StringEquals": {
-          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
-        },
-        "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:deepso7/minip2p:*"
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": "repo:deepso7/minip2p:environment:aws-bench"
         }
       }
     }
@@ -60,16 +60,18 @@ bucket. The benchmark runner also calls these actions:
 - `logs:GetLogEvents`; and
 - `iam:PassRole`, scoped to the stack's task and execution roles.
 
-Keep the role dedicated to this repository.
+Keep the role dedicated to this repository and set its maximum session duration
+to at least 7200 seconds.
 
 Set these GitHub repository variables under **Settings > Secrets and variables
 > Actions > Variables**:
 
-- `AWS_BENCH_ROLE_ARN`: the OIDC role ARN;
 - `AWS_BENCH_REGION`: the AWS region, or omit it to use `us-east-1`.
 
 No AWS access keys are stored in GitHub. Pull requests from forks do not run
-the AWS job because their code must not receive the repository's AWS identity.
+the AWS job. For same-repository pull requests, the workflow and infrastructure
+code come from the trusted base commit; only the source compiled inside Docker
+comes from the pull request.
 
 ## Local commands
 

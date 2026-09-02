@@ -10,15 +10,41 @@ output=${BENCH_OUTPUT:-target/bench-artifacts/current.json}
 task_arn=
 
 stop_active_task() {
-  if [[ -n "$task_arn" ]]; then
-    aws ecs stop-task \
+  [[ -z "$task_arn" ]] && return 0
+
+  aws ecs stop-task \
+    --cluster "$cluster" \
+    --task "$task_arn" \
+    --reason "Benchmark runner cleanup" >/dev/null
+
+  local stop_deadline=$((SECONDS + 180))
+  local status
+  while (( SECONDS < stop_deadline )); do
+    status=$(aws ecs describe-tasks \
       --cluster "$cluster" \
-      --task "$task_arn" \
-      --reason "CI interrupted" >/dev/null 2>&1 || true
-  fi
+      --tasks "$task_arn" \
+      --query 'tasks[0].lastStatus' \
+      --output text)
+    if [[ "$status" == STOPPED ]]; then
+      task_arn=
+      return 0
+    fi
+    sleep 5
+  done
+  echo "ECS task did not stop within 3 minutes: $task_arn" >&2
+  return 1
 }
 
-trap stop_active_task EXIT
+cleanup_on_exit() {
+  local exit_status=$?
+  trap - EXIT
+  if ! stop_active_task; then
+    exit_status=1
+  fi
+  exit "$exit_status"
+}
+
+trap cleanup_on_exit EXIT
 trap 'exit 130' INT TERM
 
 task_definition=$(aws ecs describe-task-definition \
@@ -87,9 +113,8 @@ while (( SECONDS < deadline )); do
 done
 
 if [[ ${status:-} != STOPPED ]]; then
-  aws ecs stop-task --cluster "$cluster" --task "$task_arn" --reason "CI timeout" >/dev/null
-  task_arn=
   echo "Fargate benchmark exceeded 45 minutes" >&2
+  stop_active_task
   exit 1
 fi
 

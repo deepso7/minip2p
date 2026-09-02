@@ -3,7 +3,7 @@ name: Bench
 on:
   release:
     types: [published]
-  pull_request:
+  pull_request_target:
     branches: [main]
   workflow_dispatch:
 
@@ -24,7 +24,8 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    environment: aws-bench
+    timeout-minutes: 90
     permissions:
       contents: read
       id-token: write
@@ -33,7 +34,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.default_branch || github.event.pull_request.base.sha || github.sha }}
+      - name: Check out benchmark source
+        if: github.event_name == 'pull_request_target'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: bench-source
+      - name: Resolve benchmark source
+        id: source
+        env:
+          SOURCE_DIR: ${{ github.event_name == 'pull_request_target' && format('{0}/bench-source', github.workspace) || github.workspace }}
+        run: echo "sha=$(git -C "$SOURCE_DIR" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: "11.24.0"
@@ -42,26 +54,33 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
           cache-dependency-path: infra/bench/pnpm-lock.yaml
+      - name: Install infrastructure dependencies
+        working-directory: infra/bench
+        run: pnpm install --frozen-lockfile
       - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
         with:
           role-to-assume: ${{ vars.AWS_BENCH_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-      - name: Install infrastructure dependencies
-        working-directory: infra/bench
-        run: pnpm install --frozen-lockfile
+          role-duration-seconds: 7200
       - name: Measure
         id: measure
-        continue-on-error: true
         env:
-          BENCH_GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BENCH_GIT_SHA: ${{ steps.source.outputs.sha }}
+          BENCH_SOURCE_DIR: ${{ github.event_name == 'pull_request_target' && format('{0}/bench-source', github.workspace) || github.workspace }}
         run: |
           cd infra/bench
           pnpm run deploy
           cd ../..
           scripts/run-aws-bench-task.sh
+      - name: Refresh AWS credentials for cleanup
+        if: always()
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
+        with:
+          role-to-assume: ${{ vars.AWS_BENCH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-duration-seconds: 7200
       - name: Remove benchmark stack
         if: always()
-        continue-on-error: true
         working-directory: infra/bench
         run: pnpm run destroy
       - name: Prepare result slice
@@ -69,7 +88,8 @@ jobs:
         if: always()
         env:
           MEASURE_OUTCOME: ${{ steps.measure.outcome }}
-          BENCH_GIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BENCH_GIT_SHA: ${{ steps.source.outputs.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           complete=false
           if [ "$MEASURE_OUTCOME" = success ] && python3 scripts/bench_results.py merge target/bench-artifacts/current.json --output target/bench-artifacts/current.json --git-sha "$BENCH_GIT_SHA"; then
@@ -81,6 +101,10 @@ jobs:
           if [ -f target/bench-fargate.log ]; then
             mv target/bench-fargate.log target/bench-artifacts/bench-fargate.log
           fi
+          if [ -n "$PR_NUMBER" ]; then
+            printf '%s\n' "$PR_NUMBER" > target/bench-artifacts/pr-number
+            printf '%s\n' "$BENCH_GIT_SHA" > target/bench-artifacts/head-sha
+          fi
           echo "complete=$complete" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
@@ -91,7 +115,7 @@ jobs:
 
   baseline:
     if: >-
-      (github.event_name == 'release' || github.event_name == 'workflow_dispatch') &&
+      github.event_name == 'release' &&
       needs.aws-bench.outputs.complete == 'true'
     needs: [aws-bench]
     runs-on: ubuntu-latest
@@ -109,7 +133,7 @@ jobs:
       - name: Update baseline branch
         env:
           BASELINE_DIR: ${{ runner.temp }}/bench-data
-          BASELINE_LABEL: ${{ github.event.release.tag_name || 'manual' }}
+          BASELINE_LABEL: ${{ github.event.release.tag_name }}
           GH_TOKEN: ${{ github.token }}
         run: |
           git worktree add --detach "$BASELINE_DIR"
@@ -122,15 +146,8 @@ jobs:
             fi
             cp "$RUNNER_TEMP/results.json" "$BASELINE_DIR/$GITHUB_SHA.json"
             git -C "$BASELINE_DIR" add "$GITHUB_SHA.json"
-            publish_latest=true
-            if [ "$GITHUB_EVENT_NAME" = release ]; then
-              latest_release=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
-              if [ "$BASELINE_LABEL" != "$latest_release" ]; then
-                publish_latest=false
-              fi
-            fi
-            if [ "$publish_latest" = true ] \
-              || ! git -C "$BASELINE_DIR" ls-files --error-unmatch latest >/dev/null 2>&1; then
+            latest_release=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+            if [ "$BASELINE_LABEL" = "$latest_release" ]; then
               printf '%s\n' "$GITHUB_SHA" > "$BASELINE_DIR/latest"
               printf '%s\n' "$BASELINE_LABEL" > "$BASELINE_DIR/latest-release"
               git -C "$BASELINE_DIR" add latest latest-release
@@ -148,8 +165,9 @@ jobs:
   compare:
     if: >-
       always() &&
-      github.event_name == 'pull_request' &&
-      needs.aws-bench.result != 'skipped'
+      github.event_name == 'pull_request_target' &&
+      needs.aws-bench.result == 'success' &&
+      needs.aws-bench.outputs.complete == 'true'
     needs: [aws-bench]
     runs-on: ubuntu-latest
     steps:
@@ -171,9 +189,12 @@ jobs:
             echo "available=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          baseline_sha=$(git show FETCH_HEAD:latest)
+          if ! baseline_sha=$(git show FETCH_HEAD:latest 2>/dev/null) \
+            || ! git show "FETCH_HEAD:$baseline_sha.json" > "$RUNNER_TEMP/baseline.json"; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           baseline_release=$(git show FETCH_HEAD:latest-release 2>/dev/null || printf 'unknown')
-          git show "FETCH_HEAD:$baseline_sha.json" > "$RUNNER_TEMP/baseline.json"
           git cat-file -e "$baseline_sha^{commit}" 2>/dev/null || git fetch origin "$baseline_sha"
           merge_base=$(git merge-base "${{ github.event.pull_request.head.sha }}" "${{ github.event.pull_request.base.sha }}")
           echo "available=true" >> "$GITHUB_OUTPUT"
