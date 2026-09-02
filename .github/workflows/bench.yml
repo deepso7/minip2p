@@ -113,13 +113,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           git worktree add --detach "$BASELINE_DIR"
-          publish_latest=true
-          if [ "$GITHUB_EVENT_NAME" = release ]; then
-            latest_release=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
-            if [ "$BASELINE_LABEL" != "$latest_release" ]; then
-              publish_latest=false
-            fi
-          fi
           for attempt in 1 2 3; do
             if git -C "$BASELINE_DIR" fetch --depth=1 origin bench-data; then
               git -C "$BASELINE_DIR" checkout -B bench-data FETCH_HEAD
@@ -129,7 +122,15 @@ jobs:
             fi
             cp "$RUNNER_TEMP/results.json" "$BASELINE_DIR/$GITHUB_SHA.json"
             git -C "$BASELINE_DIR" add "$GITHUB_SHA.json"
-            if [ "$publish_latest" = true ]; then
+            publish_latest=true
+            if [ "$GITHUB_EVENT_NAME" = release ]; then
+              latest_release=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)
+              if [ "$BASELINE_LABEL" != "$latest_release" ]; then
+                publish_latest=false
+              fi
+            fi
+            if [ "$publish_latest" = true ] \
+              || ! git -C "$BASELINE_DIR" ls-files --error-unmatch latest >/dev/null 2>&1; then
               printf '%s\n' "$GITHUB_SHA" > "$BASELINE_DIR/latest"
               printf '%s\n' "$BASELINE_LABEL" > "$BASELINE_DIR/latest-release"
               git -C "$BASELINE_DIR" add latest latest-release
