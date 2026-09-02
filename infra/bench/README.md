@@ -23,11 +23,11 @@ All AWS resources are static and created once by `bootstrap.sh`:
   `minip2p-bench-execution` (pull the image, write logs);
 - the inline permissions of the CI role `minip2p-github-bench`.
 
-Per run, the workflow pushes one image tagged with the measured commit,
-registers one revision of the `minip2p-bench` task-definition family from
-`task-definition.json`, runs it, and deregisters the revision when the runner
-exits. Nothing else is created, so there is nothing to tear down and nothing
-to leak when a run fails.
+Per run, the workflow pushes one image tagged with the measured commit, GitHub
+Actions run ID, and run attempt. It registers one revision of the
+`minip2p-bench` task-definition family from `task-definition.json`, runs it,
+and deregisters the revision when the runner exits. Nothing else is created,
+so there is nothing to tear down and nothing to leak when a run fails.
 
 The task uses 2 vCPU and 4 GiB in the account's default VPC, default subnets,
 and default security group, with a public IP so it can pull from ECR.
@@ -64,10 +64,12 @@ Set its maximum session duration to at least 7200 seconds. Its permissions
 are written by `bootstrap.sh`: push to the one repository, register and run
 tasks on the one cluster, pass the two task roles, and read the one log group.
 
-With administrator credentials exported, create or update everything else:
+With administrator credentials exported, create or update everything else.
+Set `AWS_BENCH_REGION` to the same region configured in GitHub, or omit it to
+use `us-east-1`:
 
 ```bash
-infra/bench/bootstrap.sh
+AWS_BENCH_REGION=us-east-1 infra/bench/bootstrap.sh
 ```
 
 The script is idempotent. Rerun it after changing a policy, retention, or the
@@ -99,14 +101,18 @@ run as though it covered the full benchmark set.
 With credentials that can push to the repository and run tasks:
 
 ```bash
+AWS_REGION=${AWS_BENCH_REGION:-us-east-1}
+export AWS_REGION
+IMAGE_TAG="$(git rev-parse HEAD)-local-$(date +%s)"
 aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
-docker build -f infra/bench/Dockerfile -t "$REGISTRY/minip2p-bench:$(git rev-parse HEAD)" .
-docker push "$REGISTRY/minip2p-bench:$(git rev-parse HEAD)"
-AWS_REGION=us-east-1 BENCH_GIT_SHA=$(git rev-parse HEAD) \
-  BENCH_IMAGE="$REGISTRY/minip2p-bench:$(git rev-parse HEAD)" \
+docker build -f infra/bench/Dockerfile -t "$REGISTRY/minip2p-bench:$IMAGE_TAG" .
+docker push "$REGISTRY/minip2p-bench:$IMAGE_TAG"
+BENCH_GIT_SHA=$(git rev-parse HEAD) \
+  BENCH_IMAGE="$REGISTRY/minip2p-bench:$IMAGE_TAG" \
   scripts/run-aws-bench-task.sh
 ```
 
-`REGISTRY` is `ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com`. The result lands in
-`target/bench-artifacts/current.json` and the task log in
+Set `AWS_BENCH_REGION` to the region used by `bootstrap.sh` and the GitHub
+environment. `REGISTRY` is `ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com`. The
+result lands in `target/bench-artifacts/current.json` and the task log in
 `target/bench-fargate.log`.

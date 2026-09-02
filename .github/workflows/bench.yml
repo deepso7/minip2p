@@ -41,7 +41,10 @@ jobs:
         id: source
         env:
           SOURCE_DIR: ${{ github.event_name == 'pull_request_target' && format('{0}/bench-source', github.workspace) || github.workspace }}
-        run: echo "sha=$(git -C "$SOURCE_DIR" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          sha=$(git -C "$SOURCE_DIR" rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$sha-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5
         with:
           role-to-assume: ${{ vars.AWS_BENCH_ROLE_ARN }}
@@ -58,14 +61,14 @@ jobs:
           context: ${{ github.event_name == 'pull_request_target' && 'bench-source' || '.' }}
           file: infra/bench/Dockerfile
           push: true
-          tags: ${{ steps.ecr.outputs.registry }}/minip2p-bench:${{ steps.source.outputs.sha }}
+          tags: ${{ steps.ecr.outputs.registry }}/minip2p-bench:${{ steps.source.outputs.image_tag }}
           cache-from: type=gha,scope=bench
           cache-to: type=gha,mode=max,scope=bench
       - name: Measure
         id: measure
         env:
           BENCH_GIT_SHA: ${{ steps.source.outputs.sha }}
-          BENCH_IMAGE: ${{ steps.ecr.outputs.registry }}/minip2p-bench:${{ steps.source.outputs.sha }}
+          BENCH_IMAGE: ${{ steps.ecr.outputs.registry }}/minip2p-bench:${{ steps.source.outputs.image_tag }}
         run: scripts/run-aws-bench-task.sh
       - name: Prepare result slice
         id: result

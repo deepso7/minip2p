@@ -38,18 +38,44 @@ wait_for_stopped() {
   return 1
 }
 
+stop_task() {
+  local arn=$1 attempt
+  for attempt in 1 2 3; do
+    if aws ecs stop-task --cluster "$cluster" --task "$arn" \
+      --reason "Benchmark runner exit" >/dev/null; then
+      return 0
+    fi
+    if (( attempt < 3 )); then
+      interruptible_sleep 5
+    fi
+  done
+  echo "failed to stop ECS task after 3 attempts: $arn" >&2
+  return 1
+}
+
 # Stop a still-running task and deregister this run's revision. Runs on every
 # exit, including cancellation; nothing else needs cleaning up because the
 # cluster, repository, roles, and log group are permanent.
 cleanup() {
-  local exit_status=$?
+  local exit_status=$? status
   trap - EXIT INT TERM
-  if [[ -n "$task_arn" ]] && [[ "$(task_status "$task_arn")" != STOPPED ]]; then
-    aws ecs stop-task --cluster "$cluster" --task "$task_arn" \
-      --reason "Benchmark runner exit" >/dev/null || true
+  if [[ -n "$task_arn" ]]; then
+    status=$(task_status "$task_arn" 2>/dev/null || true)
+    if [[ "$status" != STOPPED ]]; then
+      if ! stop_task "$task_arn"; then
+        exit_status=1
+      elif ! wait_for_stopped "$task_arn" 180 5; then
+        echo "ECS task did not stop within 3 minutes: $task_arn" >&2
+        exit_status=1
+      fi
+    fi
   fi
   if [[ -n "$task_definition" ]]; then
-    aws ecs deregister-task-definition --task-definition "$task_definition" >/dev/null || true
+    if ! aws ecs deregister-task-definition \
+      --task-definition "$task_definition" >/dev/null; then
+      echo "failed to deregister task definition: $task_definition" >&2
+      exit_status=1
+    fi
   fi
   exit "$exit_status"
 }

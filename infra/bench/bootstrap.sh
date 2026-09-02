@@ -4,9 +4,10 @@
 # administrator credentials; the CI role only pushes images and runs tasks.
 set -euo pipefail
 
-region=${AWS_REGION:-us-east-1}
-account=$(aws sts get-caller-identity --query Account --output text)
+region=${AWS_BENCH_REGION:-${AWS_REGION:-us-east-1}}
+export AWS_REGION="$region"
 export AWS_DEFAULT_REGION="$region"
+account=$(aws sts get-caller-identity --query Account --output text)
 
 echo "Bootstrapping minip2p benchmark resources in $account/$region"
 
@@ -26,6 +27,8 @@ if ! aws ecr describe-repositories --repository-names minip2p-bench >/dev/null 2
     --tags Key=project,Value=minip2p >/dev/null
   echo "created repository minip2p-bench"
 fi
+aws ecr put-image-tag-mutability --repository-name minip2p-bench \
+  --image-tag-mutability IMMUTABLE >/dev/null
 aws ecr put-lifecycle-policy --repository-name minip2p-bench \
   --lifecycle-policy-text '{
     "rules": [
@@ -76,8 +79,32 @@ ensure_role() {
   fi
 }
 
+clear_role_permissions() {
+  local name=$1 policy_names_text policy_arns_text policy_name policy_arn
+  local -a policy_names policy_arns
+
+  policy_names_text=$(aws iam list-role-policies --role-name "$name" \
+    --query 'PolicyNames' --output text)
+  if [[ -n "$policy_names_text" && "$policy_names_text" != None ]]; then
+    read -ra policy_names <<< "$policy_names_text"
+    for policy_name in "${policy_names[@]}"; do
+      aws iam delete-role-policy --role-name "$name" --policy-name "$policy_name"
+    done
+  fi
+
+  policy_arns_text=$(aws iam list-attached-role-policies --role-name "$name" \
+    --query 'AttachedPolicies[].PolicyArn' --output text)
+  if [[ -n "$policy_arns_text" && "$policy_arns_text" != None ]]; then
+    read -ra policy_arns <<< "$policy_arns_text"
+    for policy_arn in "${policy_arns[@]}"; do
+      aws iam detach-role-policy --role-name "$name" --policy-arn "$policy_arn"
+    done
+  fi
+}
+
 # The task role runs the benchmarks and needs no AWS access.
 ensure_role minip2p-bench-task
+clear_role_permissions minip2p-bench-task
 
 # The execution role pulls the image and ships logs.
 ensure_role minip2p-bench-execution
@@ -122,7 +149,10 @@ if aws iam get-role --role-name minip2p-github-bench >/dev/null 2>&1; then
         {
           "Sid": "TaskDefinitions",
           "Effect": "Allow",
-          "Action": ["ecs:RegisterTaskDefinition", "ecs:DeregisterTaskDefinition", "ecs:DescribeTaskDefinition"],
+          "Action": [
+            "ecs:RegisterTaskDefinition", "ecs:DeregisterTaskDefinition",
+            "ecs:DescribeTaskDefinition", "ecs:TagResource"
+          ],
           "Resource": "*"
         },
         {
