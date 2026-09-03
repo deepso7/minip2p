@@ -40,8 +40,8 @@ aws ecr put-lifecycle-policy --repository-name minip2p-bench \
       },
       {
         "rulePriority": 2,
-        "description": "Keep only the most recent benchmark images",
-        "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 10},
+        "description": "Keep only the most recent tagged benchmark images",
+        "selection": {"tagStatus": "tagged", "tagPatternList": ["*"], "countType": "imageCountMoreThan", "countNumber": 10},
         "action": {"type": "expire"}
       }
     ]

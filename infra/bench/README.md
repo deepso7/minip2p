@@ -17,7 +17,7 @@ All AWS resources are static and created once by `bootstrap.sh`:
 
 - ECS cluster `minip2p-bench`;
 - ECR repository `minip2p-bench`, immutable tags, with a lifecycle policy that
-  keeps the ten newest images and drops untagged layers after a day;
+  keeps the ten newest tagged images and drops untagged layers after a day;
 - CloudWatch log group `/minip2p/bench` with 14-day retention;
 - task role `minip2p-bench-task` (no AWS access) and execution role
   `minip2p-bench-execution` (pull the image, write logs);
