@@ -25,7 +25,8 @@ class BenchResultsTest(unittest.TestCase):
         by_name = {row.name: row for row in rows}
         self.assertEqual(by_name["micro/noise"].classification, "noise")
         self.assertEqual(by_name["micro/boundary"].classification, "notable")
-        self.assertEqual(by_name["wall/changed"].classification, "changed")
+        self.assertEqual(by_name["wall/changed"].classification, "informational")
+        self.assertEqual(by_name["wall/changed"].direction, "")
         self.assertEqual(by_name["node/missing"].classification, "unclassified")
         self.assertEqual(by_name["node/missing"].reason, "missing baseline row")
 
@@ -34,10 +35,13 @@ class BenchResultsTest(unittest.TestCase):
         self.assertTrue(all(row.classification == "unclassified" for row in rows))
         self.assertTrue(all(row.reason == "no baseline" for row in rows))
 
-    def test_incompatible_ir_does_not_affect_wall_clock(self):
+    def test_incompatible_ir_keeps_wall_clock_informational(self):
         rows = bench_results.compare_rows(self.current, self.baseline, "incompatible Ir pins: Valgrind differs")
         self.assertTrue(all(row.classification == "unclassified" for row in rows if row.tier == "rust-micro"))
-        self.assertEqual(next(row for row in rows if row.tier == "rust-wall").classification, "changed")
+        self.assertEqual(
+            next(row for row in rows if row.tier == "rust-wall").classification,
+            "informational",
+        )
 
     def test_ir_compatibility_checks_each_git_pin(self):
         changes = {
@@ -126,7 +130,8 @@ class BenchResultsTest(unittest.TestCase):
             )
             markdown = output.read_text()
             self.assertIn("Baseline: `v0.4.11 (baseline)`", markdown)
-            self.assertIn("| rust-micro | 1 | 0 | 1 | 0 |", markdown)
+            self.assertIn("| rust-micro | 1 | 0 | 1 | 0 | 0 |", markdown)
+            self.assertIn("| rust-wall | 0 | 0 | 0 | 1 | 0 |", markdown)
             self.assertIn("unclassified (missing baseline row)", markdown)
 
     def test_zero_baseline_is_unclassified(self):
@@ -199,7 +204,10 @@ class BenchResultsTest(unittest.TestCase):
         rows = bench_results.compare_rows(self.current, self.baseline, None)
         markdown = bench_results.render(self.baseline, rows)
         self.assertIn("Baseline: `baseline`", markdown)
-        self.assertIn("| tier | noise | changed | notable | unclassified |", markdown)
+        self.assertIn(
+            "| tier | noise | changed | notable | informational | unclassified |",
+            markdown,
+        )
         self.assertNotIn("`micro/noise`", markdown)
 
     def test_renderer_escapes_benchmark_names(self):

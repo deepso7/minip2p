@@ -250,9 +250,11 @@ def compare_rows(
             compared.append(ComparedRow(*key, baseline_value, row["value"], None, "unclassified", "", "zero baseline"))
             continue
         delta = (row["value"] - baseline_value) / baseline_value * 100
+        if row["tier"] != "rust-micro":
+            compared.append(ComparedRow(*key, baseline_value, row["value"], delta, "informational", ""))
+            continue
         magnitude = abs(delta)
-        changed, notable = (1.0, 2.0) if row["tier"] == "rust-micro" else (20.0, 30.0)
-        classification = "notable" if magnitude >= notable else "changed" if magnitude >= changed else "noise"
+        classification = "notable" if magnitude >= 2.0 else "changed" if magnitude >= 1.0 else "noise"
         direction = "improved" if delta < 0 else "regressed" if delta > 0 else ""
         compared.append(ComparedRow(*key, baseline_value, row["value"], delta, classification, direction))
     current_keys = {(row["tier"], row["name"], row["metric"]) for row in current["rows"]}
@@ -292,11 +294,12 @@ def render(
     baseline_sha = "none" if baseline is None else baseline["git_sha"]
     baseline_name = baseline_sha if baseline_label is None else f"{baseline_label} ({baseline_sha})"
     lines = ["<!-- bench-comment -->", "## Benchmark comparison", "", f"Baseline: {markdown_code(baseline_name)}"]
-    lines += ["", "| tier | noise | changed | notable | unclassified |", "| --- | ---: | ---: | ---: | ---: |"]
+    classifications = ("noise", "changed", "notable", "informational", "unclassified")
+    lines += ["", "| tier | noise | changed | notable | informational | unclassified |", "| --- | ---: | ---: | ---: | ---: | ---: |"]
     for tier in TIERS:
         tier_rows = [row for row in rows if row.tier == tier]
-        counts = {name: sum(row.classification == name for row in tier_rows) for name in ("noise", "changed", "notable", "unclassified")}
-        lines.append(f"| {tier} | {counts['noise']} | {counts['changed']} | {counts['notable']} | {counts['unclassified']} |")
+        counts = {name: sum(row.classification == name for row in tier_rows) for name in classifications}
+        lines.append(f"| {tier} | {counts['noise']} | {counts['changed']} | {counts['notable']} | {counts['informational']} | {counts['unclassified']} |")
     for tier in TIERS:
         visible = [row for row in rows if row.tier == tier and row.classification != "noise"]
         if not visible:

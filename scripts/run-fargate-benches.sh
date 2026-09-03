@@ -8,7 +8,7 @@ set -euo pipefail
 export GUNGRAUN_ALLOW_ASLR=1
 # Establishing hundreds of loopback QUIC connections can exceed the local
 # benchmark's setup guard under Fargate's fixed CPU quota. Setup is not timed.
-export MINIP2P_BENCH_SETUP_TIMEOUT_SECS=120
+export MINIP2P_BENCH_SETUP_TIMEOUT_SECS=600
 
 rm -rf target/bench-results
 mkdir -p target/bench-results

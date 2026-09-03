@@ -66,8 +66,9 @@ jobs:
           file: infra/bench/Dockerfile
           push: true
           tags: ${{ steps.ecr.outputs.registry }}/minip2p-bench:${{ steps.source.outputs.image_tag }}
+          provenance: false
           cache-from: type=gha,scope=bench
-          cache-to: type=gha,mode=max,scope=bench
+          cache-to: ${{ github.event_name != 'pull_request_target' && 'type=gha,mode=max,scope=bench' || '' }}
       - name: Measure
         id: measure
         env:
