@@ -39,12 +39,13 @@ rows from the comment.
 | Tier | Job | Metric | Harness | Classification bands |
 | --- | --- | --- | --- | --- |
 | `rust-micro` | Gungraun Callgrind `Ir` | Instruction count | Gungraun + `gungraun-runner` + Valgrind via `gungraun/setup-gungraun` | noise `< 1%`, changed `>= 1%` and `< 2%`, notable `>= 2%` |
-| `rust-wall` | Criterion wall-clock | Median latency | Criterion | noise `< 20%`, changed `>= 20%` and `< 30%`, notable `>= 30%` |
-| `node-ffi` | Vitest Bench / Tinybench | Median latency | Vitest Bench under `bindings/ts/node` | same wall-clock bands as `rust-wall` |
+| `rust-wall` | Criterion wall-clock | Median latency | Criterion | informational |
+| `node-ffi` | Vitest Bench / Tinybench | Median latency | Vitest Bench under `bindings/ts/node` | informational |
 
-A value exactly on a boundary enters the higher category. Bands are symmetric
-for improvements and regressions. Direction is labeled `improved` or
-`regressed`; unclassified rows leave direction blank.
+For instruction counts, a value exactly on a boundary enters the higher
+category. Bands are symmetric for improvements and regressions. Wall-clock rows
+are informational because Fargate placement noise is too large for regression
+labels. Informational and unclassified rows leave direction blank.
 
 Reports may show throughput derived from latency. Throughput never drives
 classification.
@@ -174,8 +175,8 @@ a stale note when that SHA is not the PR's merge-base.
   result file.
 - On incompatibility, Ir rows are `unclassified` (show current value and reason;
   do not call it improved or regressed). The next successful main write replaces
-  `latest`. Wall-clock tiers still classify whenever a baseline exists; bands
-  absorb host noise. Node version is not part of the incompatibility set.
+  `latest`. Wall-clock tiers remain informational whenever a baseline exists.
+  Node version is not part of the incompatibility set.
 - New benchmarks without a matching baseline row are `unclassified`.
 
 ### `results.json` shape
@@ -266,11 +267,12 @@ Bootstrap caveat: `bench-comment.yml` only triggers once its file exists on
 ### Sticky comment layout
 
 - One sticky comment, upserted in place.
-- Per-tier summary counts (noise / changed / notable / unclassified).
-- Row tables only for changed, notable, and unclassified rows. Tiers that are
-  all noise still show summary counts and omit the table.
+- Per-tier summary counts (noise / changed / notable / informational /
+  unclassified).
+- Row tables show changed, notable, informational, and unclassified rows. Tiers
+  that are all noise still show summary counts and omit the table.
 - Delta columns: benchmark · baseline · current · Δ% · class · direction
-  (`improved` / `regressed`; blank when unclassified).
+  (`improved` / `regressed`; blank when informational or unclassified).
 
 ### Failures, timeouts, cancels
 

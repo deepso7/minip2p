@@ -17,7 +17,8 @@ All AWS resources are static and created once by `bootstrap.sh`:
 
 - ECS cluster `minip2p-bench`;
 - ECR repository `minip2p-bench`, immutable tags, with a lifecycle policy that
-  keeps the ten newest images and drops untagged layers after a day;
+  keeps the ten newest images, expires tagged images after 30 days, and drops
+  untagged layers after a day;
 - CloudWatch log group `/minip2p/bench` with 14-day retention;
 - task role `minip2p-bench-task` (no AWS access) and execution role
   `minip2p-bench-execution` (pull the image, write logs);
@@ -89,8 +90,9 @@ build. The container is the isolation boundary.
 AWS runs set `GUNGRAUN_ALLOW_ASLR=1` because Fargate blocks the syscall Gungraun
 uses to disable ASLR. Instruction counts from AWS runs are comparable with
 other AWS runs that use the same setting, not with local runs that disable
-ASLR. The task also raises both socket-sweep setup timeouts to 120 seconds for
-Fargate's fixed CPU quota.
+ASLR. The task also raises both socket-sweep setup timeouts to 600 seconds for
+Fargate's fixed CPU quota. Comparisons classify instruction-count deltas; they
+show wall-clock deltas as informational because Fargate placement affects them.
 
 The task runs all three tiers sequentially and publishes one result document.
 If any tier fails, the task publishes no rows. This avoids comparing a partial

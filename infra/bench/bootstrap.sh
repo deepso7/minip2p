@@ -40,6 +40,12 @@ aws ecr put-lifecycle-policy --repository-name minip2p-bench \
       },
       {
         "rulePriority": 2,
+        "description": "Expire tagged benchmark images after 30 days",
+        "selection": {"tagStatus": "tagged", "tagPatternList": ["*"], "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 30},
+        "action": {"type": "expire"}
+      },
+      {
+        "rulePriority": 3,
         "description": "Keep only the most recent benchmark images",
         "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 10},
         "action": {"type": "expire"}
