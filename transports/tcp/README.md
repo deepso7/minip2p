@@ -21,8 +21,9 @@ default features and supply a provider and an `EntropySource`.
 `StdTcpProvider` is the hosted one: OS sockets driven by `mio`, `/dns*`
 resolution, and a real readiness wait. Implementing `BlockingTcpProvider` is
 what makes `TcpTransport` a `BlockingTransport`, so an idle driver parks on the
-sockets rather than polling on a timer. It needs the `std` feature (on by
-default).
+sockets rather than polling on a timer. It disables Nagle's algorithm because
+delayed small writes add latency to the multiplexed protocol frames. It needs
+the `std` feature (on by default).
 
 `SmoltcpTcpProvider` is the embedded one, over [smoltcp] — a TCP/IP stack, not
 an operating system. It needs the `smoltcp` feature and nothing else: the host
