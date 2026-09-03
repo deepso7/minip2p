@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-autonat"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "minip2p-core",
  "thiserror",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-circuit"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "minip2p-identity",
  "thiserror",
@@ -281,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-dcutr"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "minip2p-core",
  "thiserror",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-discovery"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-identify"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "minip2p-core",
  "minip2p-transport",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-identity"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "ed25519-dalek",
  "getrandom",
@@ -343,7 +343,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-mdns"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
@@ -352,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-multistream-select"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "minip2p-core",
  "thiserror",
@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-noise"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "chacha20poly1305",
  "hmac",
@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-ping"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "minip2p-core",
  "minip2p-transport",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-platform"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "getrandom",
  "thiserror",
@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-pubsub"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-relay"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "minip2p-core",
  "thiserror",
@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-secure-mux"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "minip2p-core",
  "minip2p-identity",
@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-swarm"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "minip2p-core",
  "minip2p-identify",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-transport"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "minip2p-core",
  "minip2p-platform",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "minip2p-yamux"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "minip2p-core",
  "minip2p-platform",

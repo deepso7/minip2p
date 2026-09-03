@@ -1,6 +1,6 @@
 {
   "name": "@minip2p/react-native",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "React Native bindings for minip2p",
   "keywords": [
     "android",
