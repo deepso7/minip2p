@@ -29,8 +29,6 @@ if ! aws ecr describe-repositories --repository-names minip2p-bench >/dev/null 2
 fi
 aws ecr put-image-tag-mutability --repository-name minip2p-bench \
   --image-tag-mutability IMMUTABLE >/dev/null
-# ECR expires an image under only its highest-priority matching rule. Apply the
-# tagged count cap before the final all-image age rule so both limits hold.
 aws ecr put-lifecycle-policy --repository-name minip2p-bench \
   --lifecycle-policy-text '{
     "rules": [
@@ -42,14 +40,8 @@ aws ecr put-lifecycle-policy --repository-name minip2p-bench \
       },
       {
         "rulePriority": 2,
-        "description": "Keep only the most recent tagged benchmark images",
-        "selection": {"tagStatus": "tagged", "tagPatternList": ["*"], "countType": "imageCountMoreThan", "countNumber": 10},
-        "action": {"type": "expire"}
-      },
-      {
-        "rulePriority": 3,
-        "description": "Expire remaining benchmark images after 30 days",
-        "selection": {"tagStatus": "any", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 30},
+        "description": "Keep only the most recent benchmark images",
+        "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 10},
         "action": {"type": "expire"}
       }
     ]
