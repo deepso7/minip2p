@@ -26,6 +26,8 @@ export interface BackendOpenStream {
 export interface Minip2pBackend {
   /** Starts native event delivery exactly once. */
   start: (listener: (event: P2pEvent) => void) => void;
+  /** Releases adapter state retained until an event has been dispatched. */
+  eventHandled?: (event: P2pEvent) => void;
   /** Idempotently releases the native endpoint. */
   close: () => void;
   /** Returns the local peer ID. */

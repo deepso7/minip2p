@@ -1115,7 +1115,11 @@ export class Minip2pBase {
         break;
       }
       if (item.source === "native") {
-        this.#dispatchNative(item.event);
+        try {
+          this.#dispatchNative(item.event);
+        } finally {
+          this.#backend.eventHandled?.(item.event);
+        }
       } else {
         this.#dispatch(item.type, item.payload, item.payload);
       }
@@ -1263,14 +1267,14 @@ export class Minip2pBase {
       return;
     }
     if (meta.initiatedLocally) {
-      stream.abandon();
+      abandonUnclaimed(stream);
       return;
     }
     const claimed = this.#dispatch("stream", stream, undefined as never);
     const inbound = streamMeta(stream);
     this.#dispatchCatchOnly("inboundStream", inbound);
     if (!claimed) {
-      stream.abandon();
+      abandonUnclaimed(stream);
     }
   }
 
@@ -1613,6 +1617,15 @@ function streamMeta(stream: Stream): InboundStreamMeta {
     protocolId: stream.protocolId,
     streamId: stream.streamId,
   };
+}
+
+function abandonUnclaimed(stream: Stream): void {
+  try {
+    stream.abandon();
+  } catch {
+    // The remote may close between native readiness and JS dispatch.
+    stream.terminal();
+  }
 }
 
 function safeMetadata(payload: unknown): Record<string, unknown> {
