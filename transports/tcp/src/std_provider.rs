@@ -94,6 +94,13 @@ fn bind_listener(requested: SocketAddr) -> std::io::Result<mio::net::TcpListener
     Ok(mio::net::TcpListener::from_std(socket.into()))
 }
 
+/// Keeps small protocol frames from waiting behind an unacknowledged write.
+fn disable_nagle(stream: &mio::net::TcpStream) -> Result<(), TcpError> {
+    stream
+        .set_nodelay(true)
+        .map_err(|error| io_error("disabling Nagle's algorithm", &error))
+}
+
 /// Resolves a dial address, performing a blocking name lookup for `/dns*`.
 ///
 /// Resolution is I/O, which is why it lives here rather than in the portable
@@ -421,6 +428,7 @@ impl StdTcpProvider {
         mut stream: mio::net::TcpStream,
         remote: Multiaddr,
     ) -> Result<(), TcpError> {
+        disable_nagle(&stream)?;
         let token = self.allocate_token()?;
         self.poll
             .registry()
@@ -623,6 +631,7 @@ impl TcpProvider for StdTcpProvider {
         let target = dial_addr(addr)?;
         let mut stream = mio::net::TcpStream::connect(target)
             .map_err(|error| io_error("starting a connect", &error))?;
+        disable_nagle(&stream)?;
         let token = self.allocate_token()?;
         self.poll
             .registry()
@@ -788,5 +797,55 @@ impl BlockingTcpProvider for StdTcpProvider {
                 drop(error);
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+    use std::time::Instant;
+
+    #[test]
+    fn accepted_and_dialed_streams_disable_nagle() {
+        let mut server = StdTcpProvider::new().expect("server");
+        let mut client = StdTcpProvider::new().expect("client");
+        let bound = server
+            .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("address"))
+            .expect("listen");
+
+        let dialed = client.connect(&bound).expect("connect");
+        assert!(
+            client.sockets[&dialed]
+                .stream
+                .nodelay()
+                .expect("dialed stream option")
+        );
+
+        let started = Instant::now();
+        let accepted = loop {
+            if let Some(socket) = server
+                .poll(Now::from_millis(0))
+                .expect("poll server")
+                .into_iter()
+                .find_map(|event| match event {
+                    TcpEvent::Accepted { socket, .. } => Some(socket),
+                    _ => None,
+                })
+            {
+                break socket;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "server did not accept the connection"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert!(
+            server.sockets[&accepted]
+                .stream
+                .nodelay()
+                .expect("accepted stream option")
+        );
     }
 }

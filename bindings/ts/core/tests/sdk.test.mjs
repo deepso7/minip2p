@@ -435,6 +435,34 @@ test("queue overflow rejects operations whose native terminals may be lost", asy
   endpoint.close();
 });
 
+test("queue overflow releases the evicted native event", () => {
+  const backend = new MockBackend();
+  const handled = [];
+  backend.eventHandled = (event) => handled.push(event);
+  const endpoint = new TestMinip2p(backend);
+  const evicted = peerReady("evicted");
+  backend.emit(evicted);
+  for (let index = 0; index < 4096; index += 1) {
+    backend.emit(peerReady(`queued-${index}`));
+  }
+
+  assert.deepEqual(handled, [evicted]);
+  endpoint.close();
+});
+
+test("teardown releases queued native events", () => {
+  const backend = new MockBackend();
+  const handled = [];
+  backend.eventHandled = (event) => handled.push(event);
+  const endpoint = new TestMinip2p(backend);
+  const queued = peerReady("queued");
+  backend.emit(queued);
+
+  endpoint.close();
+
+  assert.deepEqual(handled, [queued]);
+});
+
 test("stream FIFO counts only queued data and cleans up after terminal", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
@@ -630,6 +658,23 @@ test("local stream reset and abandon emit closed exactly once", async () => {
     assert.deepEqual(backend.operations, [[operation, "peer", 3]]);
     endpoint.close();
   }
+});
+
+test("abandon tolerates a native close before its event is dispatched", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+  const stream = await opening;
+  backend.abandonError = new Error("stream is not active");
+  backend.emit({
+    inner: { connId: 2, peerId: "peer", streamId: 3 },
+    tag: P2pEvent_Tags.StreamClosed,
+  });
+
+  assert.doesNotThrow(() => stream.abandon());
+  assert.throws(() => stream.write("closed"), ClosedError);
+  endpoint.close();
 });
 
 test("openStream correlates full available identity and abandons late ready", async () => {

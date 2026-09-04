@@ -68,6 +68,15 @@ class NodeBackend implements Minip2pBackend {
     });
   }
 
+  eventHandled(event: P2pEvent): void {
+    releaseTerminalIds(
+      event,
+      this.#connectionIds,
+      this.#connectIds,
+      this.#streamIds
+    );
+  }
+
   close(): void {
     this.#endpoint.close();
     this.#events.stop();
@@ -432,8 +441,19 @@ function normalizeEvent(
   ) {
     event.inner = normalizeEventBytes(event.tag, event.inner);
   }
-  releaseTerminalIds(event, connectionIds, connectIds, streamIds);
+  retireTerminalIds(event, connectionIds, connectIds, streamIds);
   return event as P2pEvent;
+}
+
+function retireTerminalIds(
+  event: { readonly tag?: unknown; readonly inner?: unknown },
+  connectionIds: IdMap,
+  connectIds: IdMap,
+  streamIds: IdMap
+): void {
+  visitTerminalIds(event, connectionIds, connectIds, streamIds, (map, id) => {
+    map.retirePublic(id);
+  });
 }
 
 function releaseTerminalIds(
@@ -442,17 +462,29 @@ function releaseTerminalIds(
   connectIds: IdMap,
   streamIds: IdMap
 ): void {
+  visitTerminalIds(event, connectionIds, connectIds, streamIds, (map, id) => {
+    map.deletePublic(id);
+  });
+}
+
+function visitTerminalIds(
+  event: { readonly tag?: unknown; readonly inner?: unknown },
+  connectionIds: IdMap,
+  connectIds: IdMap,
+  streamIds: IdMap,
+  visit: (map: IdMap, value: unknown) => void
+): void {
   if (event.inner === null || typeof event.inner !== "object") {
     return;
   }
   if (event.tag === "ConnectionClosed") {
-    connectionIds.deletePublic(Reflect.get(event.inner, "connId"));
+    visit(connectionIds, Reflect.get(event.inner, "connId"));
   }
   if (isTerminalConnectEvent(event)) {
-    connectIds.deletePublic(Reflect.get(event.inner, "connectId"));
+    visit(connectIds, Reflect.get(event.inner, "connectId"));
   }
   if (event.tag === "StreamClosed") {
-    streamIds.deletePublic(Reflect.get(event.inner, "streamId"));
+    visit(streamIds, Reflect.get(event.inner, "streamId"));
   }
 }
 
@@ -632,6 +664,18 @@ class IdMap {
     const native = this.#nativeByPublic.get(value);
     if (native !== undefined) {
       this.#nativeByPublic.delete(value);
+      if (this.#publicByNative.get(native) === value) {
+        this.#publicByNative.delete(native);
+      }
+    }
+  }
+
+  retirePublic(value: unknown): void {
+    if (typeof value !== "number") {
+      return;
+    }
+    const native = this.#nativeByPublic.get(value);
+    if (native !== undefined && this.#publicByNative.get(native) === value) {
       this.#publicByNative.delete(native);
     }
   }

@@ -19,7 +19,8 @@
 //! `StdTcpProvider` is the hosted one: operating-system sockets driven by
 //! `mio`, with `/dns*` resolution and a real readiness wait, which makes
 //! [`TcpTransport`] a `BlockingTransport` so an idle driver sleeps instead of
-//! spinning. It needs the `std` feature.
+//! spinning. It disables Nagle's algorithm because delayed small writes add
+//! latency to the multiplexed protocol frames. It needs the `std` feature.
 //!
 //! `SmoltcpTcpProvider` is the embedded one, over a [smoltcp] interface the
 //! host configures and a link it supplies. It needs the `smoltcp` feature and

@@ -14,11 +14,13 @@ const native = vi.hoisted(() => {
     static latest: FakeNativeEndpoint | undefined;
 
     readonly config: Readonly<Record<string, unknown>>;
+    readonly abandonedStreams: { peerId: string; streamId: bigint }[] = [];
     readonly drainLimits: number[] = [];
     readonly #batches: Event[][] = [];
     #doorbell: (() => void) | undefined;
     #drainCalls = 0;
     discoveryClock: bigint | null = null;
+    abandonError: Error | undefined;
     onDrain: ((call: number) => void) | undefined;
 
     constructor(
@@ -63,7 +65,12 @@ const native = vi.hoisted(() => {
 
     addProtocol(): void {}
 
-    abandonStream(): void {}
+    abandonStream(peerId: string, streamId: bigint): void {
+      this.abandonedStreams.push({ peerId, streamId });
+      if (this.abandonError !== undefined) {
+        throw this.abandonError;
+      }
+    }
 
     cancelConnect(): void {}
 
@@ -532,6 +539,47 @@ describe("Node adapter", () => {
     const second = await secondPending;
 
     expect([first.streamId, second.streamId]).toEqual([1, 2]);
+    endpoint.close();
+  });
+
+  test("handles an unclaimed ready stream closed in the same drain", async () => {
+    vi.useFakeTimers();
+    const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
+    const peers: string[] = [];
+    endpoint.on("peerReady", ({ peerId }) => peers.push(peerId));
+    fake.abandonError = new Error("stream is not active");
+    fake.enqueue(
+      [
+        {
+          inner: {
+            connId: 10n,
+            initiatedLocally: false,
+            peerId: "remote",
+            protocolId: "/test/1",
+            streamId: 20n,
+          },
+          tag: "StreamReady",
+        },
+        {
+          inner: { connId: 10n, peerId: "remote", streamId: 20n },
+          tag: "StreamClosed",
+        },
+        {
+          inner: { peerId: "after", protocols: [] },
+          tag: "PeerReady",
+        },
+      ],
+      []
+    );
+
+    fake.ring();
+    await settle();
+
+    expect(fake.abandonedStreams).toEqual([
+      { peerId: "remote", streamId: 20n },
+    ]);
+    expect(peers).toEqual(["after"]);
     endpoint.close();
   });
 
