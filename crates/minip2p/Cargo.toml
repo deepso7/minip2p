@@ -46,20 +46,20 @@ discovery = ["nat", "pubsub", "dep:minip2p-discovery"]
 mdns = ["nat", "dep:minip2p-mdns", "dep:minip2p-discovery", "dep:thiserror"]
 
 [dependencies]
-minip2p-core = { path = "../core", version = "0.5.1", default-features = false }
-minip2p-circuit = { path = "../circuit", version = "0.5.1", default-features = false, optional = true }
-minip2p-discovery = { path = "../discovery", version = "0.5.1", default-features = false, optional = true }
-minip2p-identify = { path = "../identify", version = "0.5.1", default-features = false }
-minip2p-identity = { path = "../identity", version = "0.5.1", default-features = false, features = ["ed25519"] }
-minip2p-mdns = { path = "../mdns", version = "0.5.1", default-features = false, optional = true }
-minip2p-nat = { path = "../nat", version = "0.5.1", default-features = false, optional = true }
-minip2p-platform = { path = "../platform", version = "0.5.1", default-features = false }
-minip2p-pubsub = { path = "../pubsub", version = "0.5.1", default-features = false, optional = true }
-minip2p-relay-server = { path = "../relay-server", version = "0.5.1", default-features = false, optional = true }
-minip2p-quic = { path = "../../transports/quic", version = "0.5.1", optional = true }
-minip2p-tcp = { path = "../../transports/tcp", version = "0.5.1", default-features = false, optional = true }
-minip2p-swarm = { path = "../swarm", version = "0.5.1", default-features = false }
-minip2p-transport = { path = "../transport", version = "0.5.1", default-features = false }
+minip2p-core = { path = "../core", version = "0.5.2", default-features = false }
+minip2p-circuit = { path = "../circuit", version = "0.5.2", default-features = false, optional = true }
+minip2p-discovery = { path = "../discovery", version = "0.5.2", default-features = false, optional = true }
+minip2p-identify = { path = "../identify", version = "0.5.2", default-features = false }
+minip2p-identity = { path = "../identity", version = "0.5.2", default-features = false, features = ["ed25519"] }
+minip2p-mdns = { path = "../mdns", version = "0.5.2", default-features = false, optional = true }
+minip2p-nat = { path = "../nat", version = "0.5.2", default-features = false, optional = true }
+minip2p-platform = { path = "../platform", version = "0.5.2", default-features = false }
+minip2p-pubsub = { path = "../pubsub", version = "0.5.2", default-features = false, optional = true }
+minip2p-relay-server = { path = "../relay-server", version = "0.5.2", default-features = false, optional = true }
+minip2p-quic = { path = "../../transports/quic", version = "0.5.2", optional = true }
+minip2p-tcp = { path = "../../transports/tcp", version = "0.5.2", default-features = false, optional = true }
+minip2p-swarm = { path = "../swarm", version = "0.5.2", default-features = false }
+minip2p-transport = { path = "../transport", version = "0.5.2", default-features = false }
 getrandom = { version = "0.4.3", optional = true }
 thiserror = { version = "2.0.18", default-features = false, optional = true }
 

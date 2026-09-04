@@ -29,7 +29,7 @@ std = [
 ]
 
 [dependencies]
-minip2p-identity = { path = "../identity", version = "0.5.1", default-features = false, features = ["ed25519"] }
+minip2p-identity = { path = "../identity", version = "0.5.2", default-features = false, features = ["ed25519"] }
 der = { version = "0.8.1", default-features = false, features = ["alloc", "oid"] }
 x509-cert = { version = "0.3.0", default-features = false, features = ["builder"] }
 const-oid = { version = "0.10.2", default-features = false }
