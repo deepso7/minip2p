@@ -435,6 +435,34 @@ test("queue overflow rejects operations whose native terminals may be lost", asy
   endpoint.close();
 });
 
+test("queue overflow releases the evicted native event", () => {
+  const backend = new MockBackend();
+  const handled = [];
+  backend.eventHandled = (event) => handled.push(event);
+  const endpoint = new TestMinip2p(backend);
+  const evicted = peerReady("evicted");
+  backend.emit(evicted);
+  for (let index = 0; index < 4096; index += 1) {
+    backend.emit(peerReady(`queued-${index}`));
+  }
+
+  assert.deepEqual(handled, [evicted]);
+  endpoint.close();
+});
+
+test("teardown releases queued native events", () => {
+  const backend = new MockBackend();
+  const handled = [];
+  backend.eventHandled = (event) => handled.push(event);
+  const endpoint = new TestMinip2p(backend);
+  const queued = peerReady("queued");
+  backend.emit(queued);
+
+  endpoint.close();
+
+  assert.deepEqual(handled, [queued]);
+});
+
 test("stream FIFO counts only queued data and cleans up after terminal", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);

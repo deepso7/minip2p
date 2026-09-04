@@ -1066,7 +1066,9 @@ export class Minip2pBase {
     if (this.#closed) {
       return;
     }
-    if (this.#queue.push({ event, source: "native" }) !== undefined) {
+    const dropped = this.#queue.push({ event, source: "native" });
+    if (dropped !== undefined) {
+      this.#releaseQueueItem(dropped);
       this.#dropped += 1;
       this.#handleQueueOverflow();
     }
@@ -1080,7 +1082,9 @@ export class Minip2pBase {
     if (this.#closed) {
       return;
     }
-    if (this.#queue.push({ payload, source: "high", type }) !== undefined) {
+    const dropped = this.#queue.push({ payload, source: "high", type });
+    if (dropped !== undefined) {
+      this.#releaseQueueItem(dropped);
       this.#dropped += 1;
       this.#handleQueueOverflow();
     }
@@ -1118,7 +1122,7 @@ export class Minip2pBase {
         try {
           this.#dispatchNative(item.event);
         } finally {
-          this.#backend.eventHandled?.(item.event);
+          this.#releaseQueueItem(item);
         }
       } else {
         this.#dispatch(item.type, item.payload, item.payload);
@@ -1460,6 +1464,20 @@ export class Minip2pBase {
     waiter.reject(error);
   }
 
+  #releaseQueueItem(item: QueueItem): void {
+    if (item.source === "native") {
+      this.#backend.eventHandled?.(item.event);
+    }
+  }
+
+  #clearQueue(): void {
+    let item = this.#queue.shift();
+    while (item !== undefined) {
+      this.#releaseQueueItem(item);
+      item = this.#queue.shift();
+    }
+  }
+
   #teardown(reason: CloseReason, error: Error): void {
     if (this.#closed) {
       return;
@@ -1467,7 +1485,7 @@ export class Minip2pBase {
     this.#closed = true;
     const closeHandlers = [...this.#closeHandlers];
     this.#closeHandlers.clear();
-    this.#queue.clear();
+    this.#clearQueue();
     this.#dropped = 0;
     this.#named.clear();
     this.#catchAll.clear();
