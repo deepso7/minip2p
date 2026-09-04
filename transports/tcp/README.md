@@ -101,3 +101,7 @@ poll's, and after an idle spell that is arbitrarily long ago.
 The upgrade authenticates both ends, so `Connected` always carries a verified
 peer id. A dial additionally pins the expected identity from its `PeerAddr`: a
 remote that proves a different one fails the handshake instead of connecting.
+
+## Throwaway stream comparison
+
+Branch `prototype/stream-dx` adds `prototype_*` methods for issue #149. They compare pull reads and owned chunks with the same consumption-driven receive credit. These methods are experimental and not a supported API. See [the Endpoint experiment](../../crates/minip2p/prototypes/stream-dx/E2E_RESULTS.md).

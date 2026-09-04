@@ -61,6 +61,69 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 /// it was given, never on the wrapped library's. Such an adapter is
 /// inherently `std`-only.
 pub trait Transport {
+    /// THROWAWAY issue #149 stream comparison seam; unsupported by default.
+    fn prototype_enable(
+        &mut self,
+        _id: ConnectionId,
+        _stream: StreamId,
+    ) -> Result<(), TransportError> {
+        Err(TransportError::PollError {
+            reason: "prototype stream I/O unsupported".into(),
+        })
+    }
+    /// THROWAWAY issue #149 stream comparison seam; unsupported by default.
+    fn prototype_take(
+        &mut self,
+        _id: ConnectionId,
+        _stream: StreamId,
+    ) -> Result<Option<Vec<u8>>, TransportError> {
+        Err(TransportError::PollError {
+            reason: "prototype stream I/O unsupported".into(),
+        })
+    }
+    /// THROWAWAY issue #149 stream comparison seam; unsupported by default.
+    fn prototype_release(
+        &mut self,
+        _id: ConnectionId,
+        _stream: StreamId,
+        _bytes: usize,
+    ) -> Result<(), TransportError> {
+        Err(TransportError::PollError {
+            reason: "prototype stream I/O unsupported".into(),
+        })
+    }
+    /// THROWAWAY issue #149 stream comparison seam; unsupported by default.
+    fn prototype_try_read(
+        &mut self,
+        _id: ConnectionId,
+        _stream: StreamId,
+        _out: &mut [u8],
+    ) -> Result<Option<usize>, TransportError> {
+        Err(TransportError::PollError {
+            reason: "prototype stream I/O unsupported".into(),
+        })
+    }
+    /// THROWAWAY issue #149 stream comparison seam; unsupported by default.
+    fn prototype_try_write(
+        &mut self,
+        _id: ConnectionId,
+        _stream: StreamId,
+        _data: &[u8],
+    ) -> Result<usize, TransportError> {
+        Err(TransportError::PollError {
+            reason: "prototype stream I/O unsupported".into(),
+        })
+    }
+    /// THROWAWAY: count unread and loaned payload.
+    fn prototype_held(
+        &mut self,
+        _id: ConnectionId,
+        _stream: StreamId,
+    ) -> Result<usize, TransportError> {
+        Err(TransportError::PollError {
+            reason: "prototype unsupported".into(),
+        })
+    }
     /// Initiate an outbound connection and return its allocated connection id.
     ///
     /// The transport owns connection-id allocation for both inbound and

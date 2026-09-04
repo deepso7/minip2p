@@ -117,6 +117,11 @@ pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet
 #[cfg(feature = "pubsub")]
 pub use pubsub::PubsubError;
 
+#[cfg(feature = "tcp")]
+mod prototype_stream;
+#[cfg(feature = "tcp")]
+pub use prototype_stream::PrototypeChunk;
+
 const DEFAULT_AGENT_VERSION: &str = "minip2p/0.1.0";
 #[cfg(feature = "relay-server")]
 const RELAY_HOP_PROTOCOL_ID: &str = "/libp2p/circuit/relay/0.2.0/hop";

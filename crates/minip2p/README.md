@@ -269,3 +269,7 @@ Built-in protocol ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see
 registering one via `EndpointBuilder::protocol` makes the `bind_quic*` step
 fail, and `Endpoint::add_protocol` rejects it with
 `SwarmError::ReservedProtocol`.
+
+## Throwaway stream comparison
+
+Branch `prototype/stream-dx` adds `prototype_*` methods for issue #149. They compare pull reads and owned chunks with the same consumption-driven receive credit. These methods are experimental and not a supported API. See [the Endpoint experiment](prototypes/stream-dx/E2E_RESULTS.md).

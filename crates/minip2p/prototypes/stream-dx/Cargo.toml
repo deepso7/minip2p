@@ -5,18 +5,21 @@ edition = "2024"
 publish = false
 default-run = "minip2p-stream-dx-prototype"
 
-# Independent throwaway workspace. No production dependency or feature changes.
+# Independent throwaway workspace; real experiments opt into branch-local crates.
 [workspace]
 
 [lints.rust]
 unsafe_code = "forbid"
 
 [features]
+e2e = ["dep:minip2p-rs", "dep:minip2p-tcp"]
 real-tcp = ["dep:minip2p-secure-mux", "dep:minip2p-identity", "dep:minip2p-platform", "dep:minip2p-transport"]
 
 alloc-stats = ["dep:stats_alloc"]
 
 [dependencies]
+minip2p-rs = { path = "../..", default-features = false, features = ["std", "tcp"], optional = true }
+minip2p-tcp = { path = "../../../../transports/tcp", features = ["std"], optional = true }
 minip2p-secure-mux = { path = "../../../secure-mux", optional = true }
 minip2p-identity = { path = "../../../identity", features = ["ed25519", "std"], optional = true }
 minip2p-platform = { path = "../../../platform", optional = true }
@@ -27,3 +30,8 @@ stats_alloc = { version = "=0.1.10", optional = true }
 name = "real-tcp"
 path = "src/bin/real_tcp.rs"
 required-features = ["real-tcp"]
+
+[[bin]]
+name = "endpoint-e2e"
+path = "src/bin/endpoint_e2e.rs"
+required-features = ["e2e"]

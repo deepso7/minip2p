@@ -329,6 +329,57 @@ impl TransportSet {
 }
 
 impl Transport for TransportSet {
+    fn prototype_held(
+        &mut self,
+        id: ConnectionId,
+        stream: StreamId,
+    ) -> Result<usize, TransportError> {
+        self.for_id(id)?.prototype_held(id, stream)
+    }
+
+    fn prototype_enable(
+        &mut self,
+        id: ConnectionId,
+        stream: StreamId,
+    ) -> Result<(), TransportError> {
+        self.for_id(id)?.prototype_enable(id, stream)
+    }
+
+    fn prototype_take(
+        &mut self,
+        id: ConnectionId,
+        stream: StreamId,
+    ) -> Result<Option<Vec<u8>>, TransportError> {
+        self.for_id(id)?.prototype_take(id, stream)
+    }
+
+    fn prototype_release(
+        &mut self,
+        id: ConnectionId,
+        stream: StreamId,
+        bytes: usize,
+    ) -> Result<(), TransportError> {
+        self.for_id(id)?.prototype_release(id, stream, bytes)
+    }
+
+    fn prototype_try_read(
+        &mut self,
+        id: ConnectionId,
+        stream: StreamId,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, TransportError> {
+        self.for_id(id)?.prototype_try_read(id, stream, out)
+    }
+
+    fn prototype_try_write(
+        &mut self,
+        id: ConnectionId,
+        stream: StreamId,
+        data: &[u8],
+    ) -> Result<usize, TransportError> {
+        self.for_id(id)?.prototype_try_write(id, stream, data)
+    }
+
     fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
         let target = addr.transport().clone();
         let member = self.for_addr(&target, "dial target")?;

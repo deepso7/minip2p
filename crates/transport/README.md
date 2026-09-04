@@ -153,3 +153,7 @@ minip2p-transport = { path = "crates/transport", default-features = false }
 ## Scope
 
 This crate defines the transport contract only. Concrete adapters live in separate crates: `minip2p-tcp` (`no_std + alloc`, over a pluggable byte-stream provider) and `minip2p-quic` (`std`-only, quiche-based).
+
+## Throwaway stream comparison
+
+Branch `prototype/stream-dx` adds `prototype_*` methods for issue #149. They compare pull reads and owned chunks with the same consumption-driven receive credit. These methods are experimental and not a supported API. See [the Endpoint experiment](../minip2p/prototypes/stream-dx/E2E_RESULTS.md).

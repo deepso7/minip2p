@@ -18,6 +18,8 @@ enum OpenFlag {
 struct StreamState {
     prototype_receive: VecDeque<(Vec<u8>, usize)>,
     prototype_receive_bytes: usize,
+    prototype_pull: bool,
+    prototype_loaned: usize,
     locally_opened: bool,
     pending_open: Option<OpenFlag>,
     acknowledged: bool,
@@ -37,6 +39,8 @@ impl StreamState {
         Self {
             prototype_receive: VecDeque::new(),
             prototype_receive_bytes: 0,
+            prototype_pull: config.prototype_pull_reads,
+            prototype_loaned: 0,
             locally_opened: true,
             pending_open: Some(OpenFlag::Syn),
             acknowledged: false,
@@ -56,6 +60,8 @@ impl StreamState {
         Self {
             prototype_receive: VecDeque::new(),
             prototype_receive_bytes: 0,
+            prototype_pull: config.prototype_pull_reads,
+            prototype_loaned: 0,
             locally_opened: false,
             pending_open: Some(OpenFlag::Ack),
             acknowledged: false,
@@ -272,6 +278,60 @@ impl YamuxSession {
         Ok(())
     }
 
+    /// THROWAWAY: unread and loaned payload for one stream.
+    pub fn prototype_held(&mut self, stream: u32) -> Result<usize, YamuxError> {
+        let s = self
+            .streams
+            .get(&stream)
+            .ok_or(YamuxError::UnknownStream(stream))?;
+        Ok(s.prototype_receive_bytes + s.prototype_loaned)
+    }
+    /// THROWAWAY: switch a negotiated application stream to consumption credit.
+    pub fn prototype_enable(&mut self, stream: u32) -> Result<(), YamuxError> {
+        self.streams
+            .get_mut(&stream)
+            .ok_or(YamuxError::UnknownStream(stream))?
+            .prototype_pull = true;
+        Ok(())
+    }
+
+    /// THROWAWAY: transfer a frame's ownership without returning receive credit.
+    /// An empty chunk is EOF; None means no data yet.
+    pub fn prototype_take(&mut self, stream: u32) -> Result<Option<Vec<u8>>, YamuxError> {
+        let state = self
+            .streams
+            .get_mut(&stream)
+            .ok_or(YamuxError::UnknownStream(stream))?;
+        if let Some((mut data, offset)) = state.prototype_receive.pop_front() {
+            if offset != 0 {
+                data.drain(..offset);
+            }
+            state.prototype_receive_bytes -= data.len();
+            state.prototype_loaned += data.len();
+            Ok(Some(data))
+        } else {
+            Ok(state.remote_write_closed.then(Vec::new))
+        }
+    }
+
+    /// THROWAWAY: release credit for a consumed owned chunk.
+    pub fn prototype_release(&mut self, stream: u32, bytes: usize) -> Result<(), YamuxError> {
+        let state = self
+            .streams
+            .get_mut(&stream)
+            .ok_or(YamuxError::UnknownStream(stream))?;
+        if bytes > state.prototype_loaned {
+            return Err(YamuxError::Protocol("release exceeds borrowed credit"));
+        }
+        state.prototype_loaned -= bytes;
+        state.delivered_since_update += bytes as u32;
+        if state.delivered_since_update > self.config.receive_window / 2 {
+            state.pending_credit += u64::from(state.delivered_since_update);
+            state.delivered_since_update = 0;
+        }
+        Ok(())
+    }
+
     /// THROWAWAY: accept a borrowed prefix using actual Yamux send capacity.
     /// Zero means blocked for nonempty input; no allocation occurs on rejection.
     pub fn prototype_try_write(&mut self, stream: u32, data: &[u8]) -> Result<usize, YamuxError> {
@@ -309,9 +369,6 @@ impl YamuxSession {
         stream: u32,
         out: &mut [u8],
     ) -> Result<Option<usize>, YamuxError> {
-        if !self.config.prototype_pull_reads {
-            return Err(YamuxError::InvalidConfig("pull reads not enabled"));
-        }
         let state = self
             .streams
             .get_mut(&stream)
@@ -358,7 +415,7 @@ impl YamuxSession {
     pub fn prototype_received_bytes(&self) -> usize {
         self.streams
             .values()
-            .map(|s| s.prototype_receive_bytes)
+            .map(|s| s.prototype_receive_bytes + s.prototype_loaned)
             .sum()
     }
 
@@ -562,7 +619,7 @@ impl YamuxSession {
                 return Err(YamuxError::ReceiveWindowExceeded { stream });
             }
             state.receive_window -= payload_len;
-            if self.config.prototype_pull_reads {
+            if state.prototype_pull {
                 if !frame.payload().is_empty() {
                     state.prototype_receive_bytes += payload_len as usize;
                     state.prototype_receive.push_back((frame.into_payload(), 0));

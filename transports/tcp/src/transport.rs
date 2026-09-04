@@ -599,6 +599,51 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         Ok(stream_id)
     }
 
+    fn prototype_held(
+        &mut self,
+        id: ConnectionId,
+        stream: StreamId,
+    ) -> Result<usize, TransportError> {
+        self.operate_session(id, |session| session.prototype_held(stream))
+    }
+    fn prototype_enable(
+        &mut self,
+        id: ConnectionId,
+        stream: StreamId,
+    ) -> Result<(), TransportError> {
+        self.operate_session(id, |session| session.prototype_enable(stream))
+    }
+    fn prototype_take(
+        &mut self,
+        id: ConnectionId,
+        stream: StreamId,
+    ) -> Result<Option<Vec<u8>>, TransportError> {
+        self.operate_session(id, |session| session.prototype_take(stream))
+    }
+    fn prototype_release(
+        &mut self,
+        id: ConnectionId,
+        stream: StreamId,
+        bytes: usize,
+    ) -> Result<(), TransportError> {
+        self.operate_session(id, |session| session.prototype_release(stream, bytes))
+    }
+    fn prototype_try_read(
+        &mut self,
+        id: ConnectionId,
+        stream: StreamId,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, TransportError> {
+        self.operate_session(id, |session| session.prototype_try_read(stream, out))
+    }
+    fn prototype_try_write(
+        &mut self,
+        id: ConnectionId,
+        stream: StreamId,
+        data: &[u8],
+    ) -> Result<usize, TransportError> {
+        self.operate_session(id, |session| session.prototype_try_write(stream, data))
+    }
     fn send_stream(
         &mut self,
         id: ConnectionId,

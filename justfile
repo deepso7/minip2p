@@ -162,3 +162,7 @@ prototype-stream-dx scenario='all':
 # Throwaway real TCP + Noise/Yamux comparison for issue #149.
 prototype-tcp:
     python3 crates/minip2p/prototypes/stream-dx/run_tcp.py
+
+# Throwaway Endpoint file transfer with identical consumption-driven credit.
+prototype-e2e:
+    python3 crates/minip2p/prototypes/stream-dx/run_e2e.py

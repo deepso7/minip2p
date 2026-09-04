@@ -82,3 +82,7 @@ Ran the three Rust transfers and the edge-case walkthroughs, compiled the librar
 Run `just prototype-tcp` from this worktree. It builds release binaries and compares two concurrent 8 MiB transfers plus an echo probe, both with fast readers and with one reader paused for 200 ms. The runner writes fresh CSV results into `results/`. It uses localhost TCP and the actual multistream-select, Noise, and Yamux stack below Endpoint.
 
 See [TCP_RESULTS.md](TCP_RESULTS.md) for the measurements, metric definitions, and limitations. This experiment modifies Yamux and secure-mux only on the throwaway branch. The small Rust and HTML models above remain separate artifacts.
+
+## Endpoint comparison with equal credit rules
+
+Run `just prototype-e2e` to compare pull reads against owned chunks with explicit release through Endpoint and the standard TCP provider. It transfers real files, checks EOF and reset behavior, and records separate timing/allocation runs. See [E2E_RESULTS.md](E2E_RESULTS.md) for the decision and limits.

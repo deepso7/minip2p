@@ -16,3 +16,5 @@ default receive window is 256 KiB, matching the Yamux specification.
 ## Throwaway stream experiment
 
 On `prototype/stream-dx`, the `prototype_*` methods support the real TCP experiment for issue #149. Pull receive credit advances only when the caller reads. The option defaults off. This is an open-stream experiment; cancellation, reset, FIN cleanup, and the full Endpoint readiness contract remain unfinished. See [the experiment report](../minip2p/prototypes/stream-dx/TCP_RESULTS.md).
+
+The later [Endpoint experiment](../minip2p/prototypes/stream-dx/E2E_RESULTS.md) enables consumption credit per negotiated application stream and compares pull reads with owned chunks and explicit release. Half-close EOF and reset cases are exercised there; the full lifecycle is still unfinished.

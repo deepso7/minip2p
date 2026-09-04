@@ -269,6 +269,30 @@ impl SecureMuxSession {
         self.with_yamux_stream(stream, move |yamux| yamux.send(yamux_stream, data))
     }
 
+    /// THROWAWAY issue #149 consumption-credit experiment.
+    pub fn prototype_enable(&mut self, stream: StreamId) -> Result<(), SessionError> {
+        let id = yamux_stream(stream)?;
+        self.with_yamux_stream(stream, |yamux| yamux.prototype_enable(id))
+    }
+    /// THROWAWAY issue #149 consumption-credit experiment.
+    pub fn prototype_take(&mut self, stream: StreamId) -> Result<Option<Vec<u8>>, SessionError> {
+        let id = yamux_stream(stream)?;
+        self.with_yamux_stream(stream, |yamux| yamux.prototype_take(id))
+    }
+    /// THROWAWAY issue #149 consumption-credit experiment.
+    pub fn prototype_release(
+        &mut self,
+        stream: StreamId,
+        bytes: usize,
+    ) -> Result<(), SessionError> {
+        let id = yamux_stream(stream)?;
+        self.with_yamux_stream(stream, |yamux| yamux.prototype_release(id, bytes))
+    }
+    /// THROWAWAY: count unread and loaned stream payload.
+    pub fn prototype_held(&mut self, stream: StreamId) -> Result<usize, SessionError> {
+        let id = yamux_stream(stream)?;
+        self.with_yamux_stream(stream, |yamux| yamux.prototype_held(id))
+    }
     /// THROWAWAY TCP experiment: borrowed partial write through real Yamux.
     pub fn prototype_try_write(
         &mut self,
