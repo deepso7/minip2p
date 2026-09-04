@@ -269,6 +269,44 @@ impl SecureMuxSession {
         self.with_yamux_stream(stream, move |yamux| yamux.send(yamux_stream, data))
     }
 
+    /// THROWAWAY TCP experiment: borrowed partial write through real Yamux.
+    pub fn prototype_try_write(
+        &mut self,
+        stream: StreamId,
+        data: &[u8],
+    ) -> Result<usize, SessionError> {
+        let id = yamux_stream(stream)?;
+        self.with_yamux_stream(stream, |yamux| yamux.prototype_try_write(id, data))
+    }
+
+    /// THROWAWAY TCP experiment: consumption-based receive credit.
+    pub fn prototype_try_read(
+        &mut self,
+        stream: StreamId,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, SessionError> {
+        let id = yamux_stream(stream)?;
+        self.with_yamux_stream(stream, |yamux| yamux.prototype_try_read(id, out))
+    }
+
+    /// THROWAWAY: inspect in-memory readiness, with no socket or clock access.
+    pub fn prototype_read_ready(&self, stream: StreamId) -> bool {
+        match &self.phase {
+            Some(Phase::Ready { yamux, .. }) => {
+                u32::try_from(stream.as_u64()).is_ok_and(|id| yamux.prototype_read_ready(id))
+            }
+            _ => false,
+        }
+    }
+
+    /// THROWAWAY: payload retained by the pull experiment.
+    pub fn prototype_received_bytes(&self) -> usize {
+        match &self.phase {
+            Some(Phase::Ready { yamux, .. }) => yamux.prototype_received_bytes(),
+            _ => 0,
+        }
+    }
+
     /// Half-closes the local write side of a substream.
     pub fn close_stream_write(&mut self, stream: StreamId) -> Result<(), SessionError> {
         let yamux_stream = yamux_stream(stream)?;

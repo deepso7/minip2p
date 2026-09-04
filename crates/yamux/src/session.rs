@@ -16,6 +16,8 @@ enum OpenFlag {
 
 #[derive(Debug)]
 struct StreamState {
+    prototype_receive: VecDeque<(Vec<u8>, usize)>,
+    prototype_receive_bytes: usize,
     locally_opened: bool,
     pending_open: Option<OpenFlag>,
     acknowledged: bool,
@@ -33,6 +35,8 @@ struct StreamState {
 impl StreamState {
     fn outbound(config: &YamuxConfig) -> Self {
         Self {
+            prototype_receive: VecDeque::new(),
+            prototype_receive_bytes: 0,
             locally_opened: true,
             pending_open: Some(OpenFlag::Syn),
             acknowledged: false,
@@ -50,6 +54,8 @@ impl StreamState {
 
     fn inbound(config: &YamuxConfig, send_window: u32) -> Self {
         Self {
+            prototype_receive: VecDeque::new(),
+            prototype_receive_bytes: 0,
             locally_opened: false,
             pending_open: Some(OpenFlag::Ack),
             acknowledged: false,
@@ -266,6 +272,96 @@ impl YamuxSession {
         Ok(())
     }
 
+    /// THROWAWAY: accept a borrowed prefix using actual Yamux send capacity.
+    /// Zero means blocked for nonempty input; no allocation occurs on rejection.
+    pub fn prototype_try_write(&mut self, stream: u32, data: &[u8]) -> Result<usize, YamuxError> {
+        self.ensure_active()?;
+        let state = self
+            .streams
+            .get(&stream)
+            .ok_or(YamuxError::UnknownStream(stream))?;
+        if state.local_write_closed || state.close_pending {
+            return Err(YamuxError::StreamWriteClosed(stream));
+        }
+        let queued_room = self
+            .config
+            .max_buffered_send
+            .saturating_sub(state.buffered_send)
+            .min(
+                self.config
+                    .max_total_buffered_send
+                    .saturating_sub(self.total_buffered_send),
+            );
+        let n = data
+            .len()
+            .min(state.send_window as usize + queued_room)
+            .min(self.config.max_frame_len as usize);
+        if n > 0 {
+            self.send(stream, data.get(..n).expect("bounded prefix").to_vec())?;
+        }
+        Ok(n)
+    }
+
+    /// THROWAWAY: copy a buffered prefix and release only its receive credit.
+    /// None means blocked; Some(0) is EOF for a nonempty destination.
+    pub fn prototype_try_read(
+        &mut self,
+        stream: u32,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, YamuxError> {
+        if !self.config.prototype_pull_reads {
+            return Err(YamuxError::InvalidConfig("pull reads not enabled"));
+        }
+        let state = self
+            .streams
+            .get_mut(&stream)
+            .ok_or(YamuxError::UnknownStream(stream))?;
+        if out.is_empty() {
+            return Ok(Some(0));
+        }
+        if state.prototype_receive_bytes == 0 {
+            return Ok(state.remote_write_closed.then_some(0));
+        }
+        let mut copied = 0;
+        while copied < out.len() {
+            let Some((chunk, offset)) = state.prototype_receive.front_mut() else {
+                break;
+            };
+            let n = (out.len() - copied).min(chunk.len() - *offset);
+            out.get_mut(copied..copied + n)
+                .expect("bounded destination")
+                .copy_from_slice(chunk.get(*offset..*offset + n).expect("bounded source"));
+            copied += n;
+            *offset += n;
+            state.prototype_receive_bytes -= n;
+            if *offset == chunk.len() {
+                state.prototype_receive.pop_front();
+            }
+        }
+        // Buffered input is bounded by the u32 receive window.
+        state.delivered_since_update += copied as u32;
+        if state.delivered_since_update > self.config.receive_window / 2 {
+            state.pending_credit += u64::from(state.delivered_since_update);
+            state.delivered_since_update = 0;
+        }
+        Ok(Some(copied))
+    }
+
+    /// THROWAWAY: readiness hint queried after a bounded socket drive.
+    pub fn prototype_read_ready(&self, stream: u32) -> bool {
+        self.streams
+            .get(&stream)
+            .is_some_and(|s| s.prototype_receive_bytes > 0 || s.remote_write_closed)
+    }
+
+    /// THROWAWAY: unread payload retained in Yamux, excluding allocation overhead.
+    pub fn prototype_received_bytes(&self) -> usize {
+        self.streams
+            .values()
+            .map(|s| s.prototype_receive_bytes)
+            .sum()
+    }
+
     /// Gracefully half-closes a stream after all accepted buffered data.
     pub fn close_write(&mut self, stream: u32) -> Result<(), YamuxError> {
         self.ensure_active()?;
@@ -466,23 +562,31 @@ impl YamuxSession {
                 return Err(YamuxError::ReceiveWindowExceeded { stream });
             }
             state.receive_window -= payload_len;
-            state.delivered_since_update = state
-                .delivered_since_update
-                .checked_add(payload_len)
-                .ok_or(YamuxError::Protocol("receive accounting overflow"))?;
-            if !frame.payload().is_empty() {
-                data_output = Some(frame.into_payload());
-            }
-            if state.delivered_since_update > self.config.receive_window / 2 {
-                let credit = state.delivered_since_update;
-                state.pending_credit += u64::from(credit);
-                state.delivered_since_update = 0;
+            if self.config.prototype_pull_reads {
+                if !frame.payload().is_empty() {
+                    state.prototype_receive_bytes += payload_len as usize;
+                    state.prototype_receive.push_back((frame.into_payload(), 0));
+                }
+            } else {
+                state.delivered_since_update = state
+                    .delivered_since_update
+                    .checked_add(payload_len)
+                    .ok_or(YamuxError::Protocol("receive accounting overflow"))?;
+                if !frame.payload().is_empty() {
+                    data_output = Some(frame.into_payload());
+                }
+                if state.delivered_since_update > self.config.receive_window / 2 {
+                    state.pending_credit += u64::from(state.delivered_since_update);
+                    state.delivered_since_update = 0;
+                }
             }
             if flags & FLAG_FIN != 0 && !state.remote_write_closed {
                 state.remote_write_closed = true;
                 remote_closed = true;
             }
-            fully_closed = state.remote_write_closed && state.local_write_closed;
+            fully_closed = state.remote_write_closed
+                && state.local_write_closed
+                && state.prototype_receive_bytes == 0;
         }
         if let Some(data) = data_output {
             self.pending.push_back(YamuxOutput::Data { stream, data });
@@ -562,7 +666,9 @@ impl YamuxSession {
                 state.remote_write_closed = true;
                 remote_closed = true;
             }
-            fully_closed = state.remote_write_closed && state.local_write_closed;
+            fully_closed = state.remote_write_closed
+                && state.local_write_closed
+                && state.prototype_receive_bytes == 0;
         }
         if remote_closed {
             self.pending

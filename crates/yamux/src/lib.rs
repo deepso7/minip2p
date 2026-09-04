@@ -60,6 +60,8 @@ pub enum YamuxRole {
 /// Resource limits and flow-control settings for one Yamux session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct YamuxConfig {
+    /// THROWAWAY branch experiment: retain received bytes until explicit reads.
+    pub prototype_pull_reads: bool,
     /// Receive window maintained for every stream.
     ///
     /// Values below [`DEFAULT_RECEIVE_WINDOW`] are rejected because the peer
@@ -78,6 +80,7 @@ pub struct YamuxConfig {
 impl Default for YamuxConfig {
     fn default() -> Self {
         Self {
+            prototype_pull_reads: false,
             receive_window: DEFAULT_RECEIVE_WINDOW,
             max_frame_len: DEFAULT_MAX_FRAME_LEN,
             max_streams: DEFAULT_MAX_STREAMS,

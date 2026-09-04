@@ -12,3 +12,7 @@ surfaced because the push-based API has no downstream read-backpressure.
 
 Clients allocate odd stream IDs and servers allocate even stream IDs. The
 default receive window is 256 KiB, matching the Yamux specification.
+
+## Throwaway stream experiment
+
+On `prototype/stream-dx`, the `prototype_*` methods support the real TCP experiment for issue #149. Pull receive credit advances only when the caller reads. The option defaults off. This is an open-stream experiment; cancellation, reset, FIN cleanup, and the full Endpoint readiness contract remain unfinished. See [the experiment report](../minip2p/prototypes/stream-dx/TCP_RESULTS.md).

@@ -77,3 +77,7 @@ minip2p-secure-mux = { path = "crates/secure-mux", default-features = false }
 ## License
 
 MIT
+
+## Throwaway stream experiment
+
+On `prototype/stream-dx`, the `prototype_*` methods support the real TCP experiment for issue #149. Pull receive credit advances only when the caller reads. The option defaults off. This is an open-stream experiment; cancellation, reset, FIN cleanup, and the full Endpoint readiness contract remain unfinished. See [the experiment report](../minip2p/prototypes/stream-dx/TCP_RESULTS.md).

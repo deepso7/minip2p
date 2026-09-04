@@ -158,3 +158,7 @@ release version *args:
 # Throwaway caller comparison for issue #149; isolated from production crates.
 prototype-stream-dx scenario='all':
     cargo run --manifest-path crates/minip2p/prototypes/stream-dx/Cargo.toml -- {{scenario}}
+
+# Throwaway real TCP + Noise/Yamux comparison for issue #149.
+prototype-tcp:
+    python3 crates/minip2p/prototypes/stream-dx/run_tcp.py

@@ -71,8 +71,14 @@ I would carry this helper design into a narrow real-transport experiment before 
 
 Main is unchanged. Issue #149 remains a proposal for maintainer review.
 
-## Limits and verification
+## In-memory model limits and verification
 
-One ready stream per endpoint, fixed in-memory capacities, and a manually driven link. No transport, crypto, negotiation, packet loss, multi-peer fairness, cancellation, FFI, or full shutdown lifecycle. Connection replacement explicitly aborts buffered bytes; it does not model retained data after connection failure. The eight-byte capacity is a demonstration value, not an achievable Yamux receive-window setting. Byte counts exclude allocator and protocol overhead. No allocation or timing benchmark was run.
+One ready stream per endpoint, fixed in-memory capacities, and a manually driven link. No transport, crypto, negotiation, packet loss, multi-peer fairness, cancellation, FFI, or full shutdown lifecycle. Connection replacement explicitly aborts buffered bytes; it does not model retained data after connection failure. The eight-byte capacity is a demonstration value, not an achievable Yamux receive-window setting. Byte counts exclude allocator and protocol overhead. The in-memory model does not measure allocations or timing. The later real TCP experiment below does.
 
 Ran the three Rust transfers and the edge-case walkthroughs, compiled the library for the embedded target, and ran Clippy and formatting checks. Executed the HTML model cases offline with Node and checked its scripts parse. No test suite was added. The in-app browser previously blocked the local file URL, so the HTML layout has not been visually verified there.
+
+## Real TCP comparison
+
+Run `just prototype-tcp` from this worktree. It builds release binaries and compares two concurrent 8 MiB transfers plus an echo probe, both with fast readers and with one reader paused for 200 ms. The runner writes fresh CSV results into `results/`. It uses localhost TCP and the actual multistream-select, Noise, and Yamux stack below Endpoint.
+
+See [TCP_RESULTS.md](TCP_RESULTS.md) for the measurements, metric definitions, and limitations. This experiment modifies Yamux and secure-mux only on the throwaway branch. The small Rust and HTML models above remain separate artifacts.

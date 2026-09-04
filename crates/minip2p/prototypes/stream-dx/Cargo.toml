@@ -3,9 +3,27 @@ name = "minip2p-stream-dx-prototype"
 version = "0.0.0"
 edition = "2024"
 publish = false
+default-run = "minip2p-stream-dx-prototype"
 
 # Independent throwaway workspace. No production dependency or feature changes.
 [workspace]
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[features]
+real-tcp = ["dep:minip2p-secure-mux", "dep:minip2p-identity", "dep:minip2p-platform", "dep:minip2p-transport"]
+
+alloc-stats = ["dep:stats_alloc"]
+
+[dependencies]
+minip2p-secure-mux = { path = "../../../secure-mux", optional = true }
+minip2p-identity = { path = "../../../identity", features = ["ed25519", "std"], optional = true }
+minip2p-platform = { path = "../../../platform", optional = true }
+minip2p-transport = { path = "../../../transport", optional = true }
+stats_alloc = { version = "=0.1.10", optional = true }
+
+[[bin]]
+name = "real-tcp"
+path = "src/bin/real_tcp.rs"
+required-features = ["real-tcp"]
