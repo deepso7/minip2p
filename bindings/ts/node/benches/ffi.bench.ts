@@ -22,6 +22,10 @@ beforeAll(async () => {
   cleanup.push(() => sdkA.close());
   sdkB = createSdk();
   cleanup.push(() => sdkB.close());
+  sdkB.on("stream", (stream) => {
+    // Match the raw remote, which drains ready events without rejecting them.
+    void stream;
+  });
   await sdkA.connectAddr(sdkB.listenAddrs()[0], { timeoutMs: TIMEOUT_MS });
   await Promise.all([
     sdkA.waitPeerReady(sdkB.peerId(), { timeoutMs: TIMEOUT_MS }),

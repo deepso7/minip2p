@@ -660,6 +660,23 @@ test("local stream reset and abandon emit closed exactly once", async () => {
   }
 });
 
+test("abandon tolerates a native close before its event is dispatched", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+  const stream = await opening;
+  backend.abandonError = new Error("stream is not active");
+  backend.emit({
+    inner: { connId: 2, peerId: "peer", streamId: 3 },
+    tag: P2pEvent_Tags.StreamClosed,
+  });
+
+  assert.doesNotThrow(() => stream.abandon());
+  assert.throws(() => stream.write("closed"), ClosedError);
+  endpoint.close();
+});
+
 test("openStream correlates full available identity and abandons late ready", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
