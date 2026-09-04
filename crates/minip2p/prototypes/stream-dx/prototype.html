@@ -5,11 +5,11 @@
 <title>minip2p · Stream DX prototype</title>
 <style>
 :root{font:16px/1.5 system-ui,sans-serif;color:#172c37;background:#f5f7f7;--accent:#086b62;--line:#d6dfdf}
-*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:32px 24px 60px}h1{font-size:32px;letter-spacing:-1px;margin:8px 0}h2{font-size:20px;margin:0 0 12px}h3{font-size:16px;margin:0 0 8px}p{margin:8px 0 16px}.tag{font-size:12px;letter-spacing:1px;color:var(--accent);font-weight:750;text-transform:uppercase}.intro{max-width:900px;color:#40545d}.notice{padding:12px 16px;border-left:3px solid var(--accent);background:#e9f2ef;margin:20px 0}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.card,section{background:white;border:1px solid var(--line);border-radius:10px;padding:20px;margin-bottom:16px}.card{margin:0;min-width:0}dl{margin:0;display:grid;grid-template-columns:1fr auto;gap:7px;font-size:14px}dt{color:#4c6069}dd{margin:0;font-variant-numeric:tabular-nums;font-weight:600}.bytes{overflow-wrap:anywhere;font:13px/1.6 ui-monospace,monospace;min-height:28px;background:#f1f5f5;padding:6px 10px;border-radius:4px;margin:12px 0 0}.buttons,.tabs{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}button{font:inherit;font-size:14px;border:1px solid #bacaca;background:white;color:#193c40;padding:8px 12px;border-radius:6px;cursor:pointer}button:hover{background:#edf4f3}button[aria-selected=true],button.primary{background:var(--accent);border-color:var(--accent);color:white}button:disabled{opacity:.4;cursor:default}small,.muted{font-size:13px;color:#5b6e75}.result{font:14px/1.6 ui-monospace,monospace;background:#e9f2ef;border:1px solid #c7dfd8;padding:12px;border-radius:6px;min-height:48px;overflow-wrap:anywhere}.codegrid{display:grid;grid-template-columns:1fr 1fr;gap:14px}pre{white-space:pre-wrap;font:12px/1.65 ui-monospace,monospace;background:#f1f5f5;padding:16px;border-radius:6px;margin:0;overflow-wrap:anywhere}ol{padding-left:24px}.steps button{margin:3px 0}.log{font:12px/1.7 ui-monospace,monospace;max-height:200px;overflow:auto;white-space:pre-wrap}.status{margin-top:14px}.warning{color:#99551b;font-weight:600}.topbar{display:flex;justify-content:space-between;align-items:center;gap:20px}.queue{min-height:24px;font:12px ui-monospace,monospace;overflow-wrap:anywhere;margin:10px 0;color:#40545d}@media(max-width:780px){.grid,.codegrid{grid-template-columns:1fr}.topbar{display:block}body{padding:20px 14px}h1{font-size:26px}}
+*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:32px 24px 60px}h1{font-size:32px;letter-spacing:-1px;margin:8px 0}h2{font-size:20px;margin:0 0 12px}h3{font-size:16px;margin:0 0 8px}p{margin:8px 0 16px}.tag{font-size:12px;letter-spacing:1px;color:var(--accent);font-weight:750;text-transform:uppercase}.intro{max-width:900px;color:#40545d}.notice{padding:12px 16px;border-left:3px solid var(--accent);background:#e9f2ef;margin:20px 0}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.card,section{background:white;border:1px solid var(--line);border-radius:10px;padding:20px;margin-bottom:16px}.card{margin:0;min-width:0}dl{margin:0;display:grid;grid-template-columns:1fr auto;gap:7px;font-size:14px}dt{color:#4c6069}dd{margin:0;font-variant-numeric:tabular-nums;font-weight:600}.bytes{overflow-wrap:anywhere;font:13px/1.6 ui-monospace,monospace;min-height:28px;background:#f1f5f5;padding:6px 10px;border-radius:4px;margin:12px 0 0}.buttons,.tabs{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}button{font:inherit;font-size:14px;border:1px solid #bacaca;background:white;color:#193c40;padding:8px 12px;border-radius:6px;cursor:pointer}button:hover{background:#edf4f3}button[aria-selected=true],button.primary{background:var(--accent);border-color:var(--accent);color:white}button:disabled{opacity:.4;cursor:default}small,.muted{font-size:13px;color:#5b6e75}.result{font:14px/1.6 ui-monospace,monospace;background:#e9f2ef;border:1px solid #c7dfd8;padding:12px;border-radius:6px;min-height:48px;overflow-wrap:anywhere}.codegrid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}pre{white-space:pre-wrap;font:12px/1.65 ui-monospace,monospace;background:#f1f5f5;padding:16px;border-radius:6px;margin:0;overflow-wrap:anywhere}ol{padding-left:24px}.steps button{margin:3px 0}.log{font:12px/1.7 ui-monospace,monospace;max-height:200px;overflow:auto;white-space:pre-wrap}.status{margin-top:14px}.warning{color:#99551b;font-weight:600}.topbar{display:flex;justify-content:space-between;align-items:center;gap:20px}.queue{min-height:24px;font:12px ui-monospace,monospace;overflow-wrap:anywhere;margin:10px 0;color:#40545d}@media(max-width:780px){.grid,.codegrid{grid-template-columns:1fr}.topbar{display:block}body{padding:20px 14px}h1{font-size:26px}}
 </style>
 <div class="tag">Throwaway branch · issue #149</div>
 <h1>What does the stream caller have to remember?</h1>
-<p class="intro">Compare owned chunks with partial writes and pull reads. Both sketches use an 8-byte send buffer, an 8-byte receive buffer, and a 4-byte drive step. Pause the reader, fill the buffers, or read only part of a notification. Watch who owns the remaining bytes and who must resume work.</p>
+<p class="intro">Compare owned chunks, raw partial I/O, and a helper that remembers unfinished work. Both sketches use an 8-byte send buffer, an 8-byte receive buffer, and a 4-byte drive step. Pause the reader, fill the buffers, or read only part of a notification. Watch who owns the remaining bytes and who must resume work.</p>
 <div class="notice">This is an in-memory contract model. It does not run minip2p, QUIC, or TCP, and it does not measure speed or allocations. The Rust companion runs the same kinds of cases. The owned sketch borrows today's interface shape; it does not reproduce today's transport internals.</div>
 <section>
 <div class="topbar"><h2>Current state</h2><div class="tabs" id="modes" role="tablist" aria-label="Interface"></div></div>
@@ -22,7 +22,7 @@
 </section>
 <section><h2>Try any order</h2><p class="muted">Offering bytes only queues them locally. Drive moves bytes. Taking a notification does not read bytes or free capacity.</p><div class="buttons" id="actions"></div></section>
 <section><h2>Guided cases</h2><div class="tabs" id="scenarios" role="tablist" aria-label="Walkthrough"></div><p id="scenarioText"></p><p class="muted">Selecting a case resets its state. Free-play is always available. Re-select the case to start again.</p><ol class="steps" id="steps"></ol></section>
-<section><h2>The caller difference</h2><div class="codegrid"><div><h3>Owned chunks</h3><pre id="ownedCode"></pre></div><div><h3>Partial writes and pull reads</h3><pre id="partialCode"></pre></div></div><p class="muted">These are sketches. Full runnable caller loops, including driving and a paused reader, are in src/main.rs next to this file. A real stream has no message boundaries in either design.</p></section>
+<section><h2>The caller difference</h2><div class="codegrid"><div><h3>Owned chunks</h3><pre id="ownedCode"></pre></div><div><h3>Raw partial I/O</h3><pre id="partialCode"></pre></div><div><h3>Caller helper</h3><pre id="helperCode"></pre></div></div><p class="muted">These are sketches. Full runnable caller loops, including driving and a paused reader, are in src/main.rs next to this file. A real stream has no message boundaries in either design.</p></section>
 <section><h2>Action trace</h2><div class="log" id="log"></div></section>
 <script>
 // Pure in-memory model. No DOM, clocks, sockets, or persistence.
@@ -31,14 +31,42 @@ const StreamModel = (() => {
     mode, payload, offset:0, received:'', tx:'', rx:'', capacity:8,
     readerEvents:[], writerEvents:[], readArmed:true, writeArmed:false,
     localFin:false, remoteFin:false, finSent:false, generation:1, handle:1,
+    helperWriteRunnable:true, helperReadRunnable:true, helperEof:false, helperWriteFailed:false, helperReadFailed:false,
     last:'Ready. Offer bytes, then drive the link.', trace:[]
   });
   const enqueue = (queue, event) => { if (!queue.includes(event)) queue.push(event); };
   const readable = s => { if(s.readArmed){enqueue(s.readerEvents,'Readable');s.readArmed=false;} };
   function step(before, action) {
-    const s = {...before,readerEvents:[...before.readerEvents],writerEvents:[...before.writerEvents],trace:[...before.trace]};
+    let s = {...before,readerEvents:[...before.readerEvents],writerEvents:[...before.writerEvents],trace:[...before.trace]};
     let result='';
-    if(action==='write') {
+    if(action==='helperWrite'||action==='helperRead') {
+      if(s.mode!=='helper') result='Select the helper sketch first.';
+      else if(action==='helperWrite') {
+        if(s.helperWriteFailed) result='Helper write is failed; its unaccepted suffix remains available.';
+        else if(s.offset===s.payload.length){s.helperWriteRunnable=false;result='Helper write complete: all bytes accepted locally.';}
+        else if(!s.helperWriteRunnable) result='Helper waiting for Writable. No write attempt made.';
+        else {
+          const failed=s.handle!==s.generation||s.localFin;
+          s=step(s,'write');s.trace=[...before.trace];result=s.last;
+          s.helperWriteFailed=failed;
+          s.helperWriteRunnable=!failed&&s.offset<s.payload.length&&!s.last.startsWith('WouldBlock');
+        }
+      } else {
+        if(s.helperReadFailed) result='Helper read is failed and no longer runnable.';
+        else if(s.helperEof) result='Helper already observed EOF.';
+        else if(!s.helperReadRunnable) result='Helper waiting for Readable. No read attempt made.';
+        else {
+          const stale=s.handle!==s.generation,hadBytes=s.rx.length>0,fin=s.remoteFin;
+          if(stale){result='StaleHandle. Helper read failed.';s.helperReadFailed=true;s.helperReadRunnable=false;}
+          else {
+            s=step(s,'read2');s.trace=[...before.trace];
+            s.helperEof=!hadBytes&&fin;
+            s.helperReadRunnable=hadBytes;
+            result=hadBytes?`${s.last} Helper remains runnable after this yield.`:s.last;
+          }
+        }
+      }
+    } else if(action==='write') {
       const rest=s.payload.slice(s.offset);
       if(s.handle!==s.generation) result='StaleHandle. This handle belongs to the old connection.';
       else if(s.localFin) result='WriteClosed. FIN already accepted.';
@@ -59,7 +87,12 @@ const StreamModel = (() => {
       result=`Drive moved ${n} bytes. ${s.tx.length&&s.rx.length===s.capacity?'Receiver is full. More drive calls cannot release read credit.':''}`;
     } else if(action==='popReader'||action==='popWriter') {
       const q=action==='popReader'?s.readerEvents:s.writerEvents;
-      result=`Notification: ${q.shift()??'None'}. No stream bytes consumed.`;
+      const event=q.shift();
+      if(s.mode==='helper'&&event){
+        if(action==='popReader'&&!s.helperEof&&!s.helperReadFailed)s.helperReadRunnable=true;
+        if(action==='popWriter'&&!s.helperWriteFailed&&s.offset<s.payload.length)s.helperWriteRunnable=true;
+      }
+      result=`Notification: ${event??'None'}. No stream bytes consumed.`;
     } else if(action==='read2'||action==='drain') {
       if(s.mode==='owned') {
         if(action==='read2')result='Owned sketch delivers a whole buffered chunk. Use Take all available bytes.';
@@ -82,7 +115,7 @@ const StreamModel = (() => {
       s.generation++;s.tx='';s.rx='';s.readerEvents=[];s.writerEvents=['ConnectionClosed(old)'];
       s.localFin=false;s.remoteFin=false;s.finSent=false;s.readArmed=true;s.writeArmed=false;
       result='Aborted the old model connection, explicitly discarding buffered bytes. Application handle is still old.';
-    } else if(action==='newHandle') {s.handle=s.generation;result='Application now uses the new connection handle.';}
+    } else if(action==='newHandle') {if(s.mode==='helper')result='An existing helper keeps its original handle. Reset to create a new helper.';else{s.handle=s.generation;result='Application now uses the new connection handle.';}}
     s.last=result;s.trace.push(`${action}: ${result}`);return s;
   }
   return {initial,step};
@@ -94,6 +127,7 @@ let model=StreamModel.initial();
 let selected='pause',nextStep=0;
 const actions=[['write','Offer next bytes'],['drive','Drive up to 4 bytes'],['popReader','Take reader notification'],['popWriter','Take writer notification'],['read2','Read just 2 bytes'],['drain','Take all available bytes'],['finish','Finish writing'],['replace','Abort and replace connection'],['newHandle','Use new handle']];
 const cases={
+ helper:{title:'Helper resumes after yield',text:'The helper reads only two bytes per scheduled step. It stays runnable after a positive read, even with no new notification. After WouldBlock it stops until another readiness event arrives. The host must schedule runnable helpers before sleeping.',mode:'helper',payload:'abcdefghij',steps:[['helperWrite','Helper accepts eight bytes'],['drive','Deliver four bytes'],['drive','Deliver four more'],['popReader','Forward the readable notification'],['helperRead','Read two bytes and yield'],['popReader','There is no second notification'],['helperRead','Schedule the retained continuation'],['helperRead','Read another two bytes'],['helperRead','Read the final buffered two bytes'],['helperRead','Observe WouldBlock; stop scheduling'],['helperRead','An idle helper makes no read attempt'],['helperWrite','Write the remaining two bytes'],['drive','Deliver them'],['popReader','Forward fresh readiness'],['helperRead','Read the new data']]},
  pause:{title:'Paused reader',text:'Fill receive storage, then take only its notification. The sender still cannot advance. Reading bytes is what releases capacity.',payload:'hello from a tiny buffer',steps:[['write','Offer bytes'],['drive','Move four bytes'],['write','Offer more bytes'],['drive','Fill the receive buffer'],['write','Try to queue more'],['drive','Try driving a full receiver'],['popReader','Take its notification only'],['drive','Drive again: still blocked'],['drain','Read the buffered bytes'],['drive','Drive again: progress resumes']]},
  yield:{title:'Read then yield',text:'Pull mode. Take the notification and read only two bytes. No new notification arrives for the six remaining bytes. A caller that waits again is stuck; its own continuation must finish reading.',mode:'partial',payload:'abcdefghij',steps:[['write','Queue eight bytes'],['drive','Deliver four'],['drive','Deliver four more'],['popReader','Take the readable notification'],['read2','Read two bytes, then yield'],['drive','Try another drive'],['popReader','Look for another notification'],['drain','Resume reading yourself, through WouldBlock'],['write','Queue the final two bytes'],['drive','Drive new data'],['popReader','Now there is a new notification']]},
  fin:{title:'Buffered bytes and EOF',text:'Pull mode. FIN follows accepted bytes. Reading the notification does not discard the buffered prefix. Read the bytes, then observe EOF. Further writes fail.',mode:'partial',payload:'tail',steps:[['write','Queue the tail'],['finish','Finish the write side'],['drive','Deliver bytes then FIN'],['popReader','Take readable notification'],['popReader','Take remote-close notification'],['drain','Read the tail, then EOF'],['write','Attempt a write after FIN']]},
@@ -103,9 +137,9 @@ const $=id=>document.getElementById(id);
 function fields(id,rows){$(id).replaceChildren(...rows.flatMap(([key,value])=>{const dt=document.createElement('dt'),dd=document.createElement('dd');dt.textContent=key;dd.textContent=String(value);return[dt,dd];}));}
 function button(label,fn){const b=document.createElement('button');b.textContent=label;b.onclick=fn;return b;}
 function act(action){model=StreamModel.step(model,action);render();}
-function start(name){selected=name;nextStep=0;const c=cases[name];model=StreamModel.initial(c.mode??model.mode,c.payload);render();}
+function start(name){selected=name;nextStep=0;const c=cases[name];model=StreamModel.initial(c.mode??(model.mode==='helper'?'partial':model.mode),c.payload);render();}
 function render(){
- fields('appState',[['Accepted locally',`${model.offset} / ${model.payload.length} bytes`],['Received',`${model.received.length} bytes`],['Unaccepted suffix',`${model.payload.length-model.offset} bytes`],['Saved handle',`connection ${model.handle}`]]);
+ fields('appState',[...(model.mode==='helper'?[['Helper write runnable',model.helperWriteRunnable&&!model.helperWriteFailed],['Helper read runnable',model.helperReadRunnable&&!model.helperReadFailed],['Helper EOF',model.helperEof],['Helper failed',model.helperReadFailed||model.helperWriteFailed]]:[]),['Accepted locally',`${model.offset} / ${model.payload.length} bytes`],['Received',`${model.received.length} bytes`],['Unaccepted suffix',`${model.payload.length-model.offset} bytes`],['Saved handle',`connection ${model.handle}`]]);
  fields('sendState',[['Send storage',`${model.tx.length} / ${model.capacity} bytes`],['Writable armed',model.writeArmed?'yes':'no'],['FIN accepted',model.localFin?'yes':'no'],['Connection',model.generation]]);
  fields('recvState',[['Receive storage',`${model.rx.length} / ${model.capacity} bytes`],['Free read credit',`${model.capacity-model.rx.length} bytes`],['Readable armed',model.readArmed?'yes':'no'],['Remote FIN',model.remoteFin?'yes':'no']]);
  $('appBytes').textContent=`received: ${JSON.stringify(model.received)}`;$('txBytes').textContent=`queued: ${JSON.stringify(model.tx)}`;$('rxBytes').textContent=`unread: ${JSON.stringify(model.rx)}`;
@@ -113,15 +147,20 @@ function render(){
  const stuck=model.mode==='partial'&&model.rx.length>0&&!model.readArmed&&!model.readerEvents.includes('Readable');
  $('status').className=stuck?'status warning':'status';
  $('status').textContent=stuck?'Unread bytes have no pending readable notification. The application must continue reading.':`Model-owned stream bytes: ${model.tx.length+model.rx.length} / 16. This excludes allocator, framing, and native transport memory.`;
+ if(model.mode==='helper'&&model.helperReadRunnable&&model.rx.length) $('status').textContent=`${model.rx.length} unread bytes. The helper remembers its continuation; schedule another step before sleeping.`;
  $('result').textContent=model.last;$('log').textContent=model.trace.slice(-60).join('\n')||'No actions yet.';
- $('modes').replaceChildren(...[['owned','Owned chunk sketch'],['partial','Proposed pull sketch']].map(([mode,label])=>{const b=button(label,()=>{model=StreamModel.initial(mode);selected='pause';nextStep=0;render();});b.setAttribute('role','tab');b.setAttribute('aria-selected',String(model.mode===mode));return b;}));
- $('actions').replaceChildren(...actions.map(([a,label])=>button(label,()=>act(a))),button('Reset',()=>start(selected)));
+ $('modes').replaceChildren(...[['owned','Owned chunk sketch'],['partial','Raw pull sketch'],['helper','With caller helper']].map(([mode,label])=>{const b=button(label,()=>{model=StreamModel.initial(mode);selected=mode==='helper'?'helper':'pause';nextStep=0;if(mode==='helper')model=StreamModel.initial(mode,cases.helper.payload);render();});b.setAttribute('role','tab');b.setAttribute('aria-selected',String(model.mode===mode));return b;}));
+ const available=model.mode==='helper'
+   ? [['helperWrite','Helper write step'],['helperRead','Helper read 2 bytes'],...actions.filter(([a])=>!['write','read2','drain'].includes(a))]
+   : actions;
+ $('actions').replaceChildren(...available.map(([a,label])=>button(label,()=>act(a))),button('Reset',()=>start(selected)));
  $('scenarios').replaceChildren(...Object.entries(cases).map(([name,c])=>{const b=button(c.title,()=>start(name));b.setAttribute('role','tab');b.setAttribute('aria-selected',String(name===selected));return b;}));
  const c=cases[selected];$('scenarioText').textContent=c.text;
  $('steps').replaceChildren(...c.steps.map(([a,label],i)=>{const li=document.createElement('li');const b=button(label,()=>{nextStep=i+1;act(a);});b.disabled=i!==nextStep;if(i===nextStep)b.className='primary';li.append(b);if(i<nextStep)li.append(' Done');return li;}));
 }
 $('ownedCode').textContent=`// The complete chunk is accepted or rejected.\nendpoint.send_stream(peer, stream, data)?;\n\n// Received payload belongs to the application.\nmatch event {\n    StreamData { data, .. } => consume(data),\n    _ => {}\n}\n\n// Large transfers still need chunk sizing and\n// a policy for retrying rejected writes.`;
-$('partialCode').textContent=`// Retain offset and retry the unaccepted suffix.\nmatch endpoint.try_write(stream, &data[offset..]) {\n    Ok(n) => offset += n,\n    Err(WouldBlock) => wait_for_writable = true,\n    Err(e) => handle_error(e),\n}\n\n// After Readable, keep reading or retain your\n// own continuation if you yield early.\nloop {\n    match endpoint.try_read(stream, &mut scratch) {\n        Ok(0) => break, // EOF\n        Ok(n) => consume(&scratch[..n]),\n        Err(WouldBlock) => break,\n        Err(e) => { handle_error(e); break; }\n    }\n}`;
+$('helperCode').textContent=`let mut write = PendingWrite::new(stream, data);\nlet mut read = ReadContinuation::new(stream);\n\n// Forward events; nothing is hidden or consumed.\nwrite.on_event(&event);\nread.on_event(&event);\n\n// Host turn, including turns without new events:\nif write.is_runnable() {\n    write.step(&mut endpoint)?;\n}\nif read.is_runnable() {\n    if let Data(n) = read.step(&mut endpoint, &mut buf)? {\n        consume(&buf[..n]);\n        // Safe to yield; read remains runnable.\n    }\n}\n// Host must include helper readiness before sleep.\n// One borrowed write, no hidden payload queue.`;
+$('partialCode').textContent=`// Application owns offset, writable, readable, EOF.\n// Notifications set the matching readiness flag.\nif writable && offset < data.len() {\n    match endpoint.try_write(stream, &data[offset..]) {\n        Ok(n) => offset += n,\n        Err(WouldBlock) => writable = false,\n        Err(e) => handle_error(e),\n    }\n}\n\n// One chunk per host turn, including without events.\nif readable {\n    match endpoint.try_read(stream, &mut buf) {\n        Ok(0) => { eof = true; readable = false; }\n        Ok(n) => consume(&buf[..n]),\n        Err(WouldBlock) => readable = false,\n        Err(e) => handle_error(e),\n    }\n}\n// A positive read must keep readable=true.\n// Forget that continuation and early yield stalls.`;
 render();
 </script>
 </html>

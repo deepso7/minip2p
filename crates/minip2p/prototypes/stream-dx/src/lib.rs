@@ -7,6 +7,8 @@ extern crate alloc;
 
 use alloc::{collections::VecDeque, vec::Vec};
 
+pub mod helper;
+
 /// Endpoint-local identity, including the connection that owns the stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Stream {
