@@ -154,3 +154,7 @@ fuzz seconds="30":
 
 release version *args:
     ./scripts/release.sh "{{version}}" {{args}}
+
+# Throwaway caller comparison for issue #149; isolated from production crates.
+prototype-stream-dx scenario='all':
+    cargo run --manifest-path crates/minip2p/prototypes/stream-dx/Cargo.toml -- {{scenario}}

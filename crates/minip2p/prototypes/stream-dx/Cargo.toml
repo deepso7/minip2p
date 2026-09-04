@@ -1,0 +1,11 @@
+[package]
+name = "minip2p-stream-dx-prototype"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Independent throwaway workspace. No production dependency or feature changes.
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"
