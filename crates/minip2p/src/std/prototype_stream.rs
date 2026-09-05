@@ -16,6 +16,12 @@ impl PrototypeChunk {
     }
 }
 impl Endpoint {
+    /// THROWAWAY: read-only payload count; performs no I/O or credit flushing.
+    pub fn prototype_stream_buffered(&self, conn: ConnectionId, stream: StreamId) -> usize {
+        self.swarm
+            .transport()
+            .prototype_stream_buffered(conn, stream)
+    }
     /// THROWAWAY: sampled unread and loaned payload, excluding allocation overhead.
     pub fn prototype_held(
         &mut self,

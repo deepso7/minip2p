@@ -35,3 +35,8 @@ required-features = ["real-tcp"]
 name = "endpoint-e2e"
 path = "src/bin/endpoint_e2e.rs"
 required-features = ["e2e"]
+
+[[bin]]
+name = "consumer-bench"
+path = "src/bin/consumer_bench.rs"
+required-features = ["e2e"]

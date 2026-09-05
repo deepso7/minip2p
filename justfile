@@ -166,3 +166,7 @@ prototype-tcp:
 # Throwaway Endpoint file transfer with identical consumption-driven credit.
 prototype-e2e:
     python3 crates/minip2p/prototypes/stream-dx/run_e2e.py
+
+# Current main versus pull, application ACKs, and whole-driver pausing.
+prototype-consumers:
+    python3 crates/minip2p/prototypes/stream-dx/bench_consumers.py

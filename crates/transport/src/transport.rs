@@ -114,6 +114,10 @@ pub trait Transport {
             reason: "prototype stream I/O unsupported".into(),
         })
     }
+    /// THROWAWAY: read-only measurement, unavailable by default.
+    fn prototype_stream_buffered(&self, _id: ConnectionId, _stream: StreamId) -> usize {
+        0
+    }
     /// THROWAWAY: count unread and loaned payload.
     fn prototype_held(
         &mut self,

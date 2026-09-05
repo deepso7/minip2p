@@ -329,6 +329,12 @@ impl TransportSet {
 }
 
 impl Transport for TransportSet {
+    fn prototype_stream_buffered(&self, id: ConnectionId, stream: StreamId) -> usize {
+        self.index_for_id(id)
+            .ok()
+            .and_then(|i| self.members.get(i))
+            .map_or(0, |m| m.transport.prototype_stream_buffered(id, stream))
+    }
     fn prototype_held(
         &mut self,
         id: ConnectionId,

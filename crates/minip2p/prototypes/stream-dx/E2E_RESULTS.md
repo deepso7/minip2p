@@ -1,5 +1,7 @@
 # Endpoint comparison with equal receive-credit rules
 
+The later [current-interface benchmark](CONSUMER_RESULTS.md) supersedes this report's recommendation to adopt pull by default. The measurements below remain the historical prototype comparison.
+
 THROWAWAY, issue #149, branch `prototype/stream-dx`. Measured 2026-09-05 on Apple M2 Pro, macOS 26.5.2, rustc 1.98.0, Cargo release profile. The commit containing this report contains the measured source and lockfile.
 
 ## Decision

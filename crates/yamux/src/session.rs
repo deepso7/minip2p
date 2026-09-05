@@ -278,6 +278,12 @@ impl YamuxSession {
         Ok(())
     }
 
+    /// THROWAWAY: read-only measurement, never pumps protocol output.
+    pub fn prototype_stream_buffered(&self, stream: u32) -> usize {
+        self.streams
+            .get(&stream)
+            .map_or(0, |s| s.prototype_receive_bytes + s.prototype_loaned)
+    }
     /// THROWAWAY: unread and loaned payload for one stream.
     pub fn prototype_held(&mut self, stream: u32) -> Result<usize, YamuxError> {
         let s = self

@@ -273,3 +273,5 @@ fail, and `Endpoint::add_protocol` rejects it with
 ## Throwaway stream comparison
 
 Branch `prototype/stream-dx` adds `prototype_*` methods for issue #149. They compare pull reads and owned chunks with the same consumption-driven receive credit. These methods are experimental and not a supported API. See [the Endpoint experiment](prototypes/stream-dx/E2E_RESULTS.md).
+
+The latest [consumer benchmark](prototypes/stream-dx/CONSUMER_RESULTS.md) compares actual main and adds read-only payload instrumentation on this branch. It demonstrates a slow-consumer benefit without establishing a need to replace the public interface.

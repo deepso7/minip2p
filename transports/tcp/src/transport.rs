@@ -599,6 +599,11 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         Ok(stream_id)
     }
 
+    fn prototype_stream_buffered(&self, id: ConnectionId, stream: StreamId) -> usize {
+        self.connections
+            .get(&id)
+            .map_or(0, |c| c.session.prototype_stream_buffered(stream))
+    }
     fn prototype_held(
         &mut self,
         id: ConnectionId,

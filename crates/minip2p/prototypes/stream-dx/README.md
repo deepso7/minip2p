@@ -1,5 +1,7 @@
 # Throwaway stream DX prototype
 
+Latest verdict: [current-interface consumer benchmarks](CONSUMER_RESULTS.md) supersede the earlier default-API recommendation. The slow-consumer benefit is real; a public-interface rewrite is not established.
+
 Question: does replacing owned stream-data events with partial writes and pull reads make minip2p easier to use? Does a small caller helper improve that experience?
 
 Three runnable Rust callers share a bounded in-memory model. A standalone HTML walkthrough exposes the awkward states. Neither uses minip2p's real transports. Nothing here should be merged as a transport implementation.
@@ -86,3 +88,7 @@ See [TCP_RESULTS.md](TCP_RESULTS.md) for the measurements, metric definitions, a
 ## Endpoint comparison with equal credit rules
 
 Run `just prototype-e2e` to compare pull reads against owned chunks with explicit release through Endpoint and the standard TCP provider. It transfers real files, checks EOF and reset behavior, and records separate timing/allocation runs. See [E2E_RESULTS.md](E2E_RESULTS.md) for the decision and limits.
+
+## Current-interface comparison
+
+Run `just prototype-consumers` for actual-main comparisons against pull, application acknowledgements, and whole-Endpoint pausing. See [CONSUMER_RESULTS.md](CONSUMER_RESULTS.md) for scenarios, memory/throughput/latency results, and reproduction details.

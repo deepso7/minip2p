@@ -288,6 +288,15 @@ impl SecureMuxSession {
         let id = yamux_stream(stream)?;
         self.with_yamux_stream(stream, |yamux| yamux.prototype_release(id, bytes))
     }
+    /// THROWAWAY: read-only stream payload measurement.
+    pub fn prototype_stream_buffered(&self, stream: StreamId) -> usize {
+        match &self.phase {
+            Some(Phase::Ready { yamux, .. }) => {
+                u32::try_from(stream.as_u64()).map_or(0, |id| yamux.prototype_stream_buffered(id))
+            }
+            _ => 0,
+        }
+    }
     /// THROWAWAY: count unread and loaned stream payload.
     pub fn prototype_held(&mut self, stream: StreamId) -> Result<usize, SessionError> {
         let id = yamux_stream(stream)?;
