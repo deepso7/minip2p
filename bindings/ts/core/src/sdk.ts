@@ -103,6 +103,11 @@ interface PendingRead {
   readonly reject: (error: unknown) => void;
 }
 
+type StreamReceiveState =
+  | { readonly kind: "receiving" }
+  | { readonly kind: "eof" }
+  | { readonly kind: "failed"; readonly error: unknown };
+
 interface PingOperation {
   readonly promise: Promise<number>;
   readonly cancel: (error: unknown) => void;
@@ -175,9 +180,8 @@ export class Stream {
   readonly #reads: PendingRead[] = [];
   #fifoBytes = 0;
   #mode: "pull" | "flowing" | undefined;
-  #remoteWriteClosed = false;
+  #receiveState: StreamReceiveState = { kind: "receiving" };
   #closed = false;
-  #terminalError: unknown;
 
   constructor(
     backend: Minip2pBackend,
@@ -238,14 +242,14 @@ export class Stream {
       );
     }
     this.#mode = "pull";
-    if (this.#closed) {
-      return Promise.reject(this.#terminalError);
+    if (this.#receiveState.kind === "failed") {
+      return Promise.reject(this.#receiveState.error);
     }
     const buffered = this.#shift();
     if (buffered !== undefined) {
       return Promise.resolve(buffered);
     }
-    if (this.#remoteWriteClosed) {
+    if (this.#receiveState.kind === "eof") {
       return Promise.resolve(this.#shift());
     }
     return new Promise((resolve, reject) => {
@@ -298,18 +302,12 @@ export class Stream {
    * @yields {Uint8Array} Received binary chunks in order.
    */
   async *[Symbol.asyncIterator](): AsyncGenerator<Uint8Array, void, void> {
-    try {
-      while (true) {
-        const chunk = await this.read();
-        if (chunk === undefined) {
-          return;
-        }
-        yield chunk;
+    while (true) {
+      const chunk = await this.read();
+      if (chunk === undefined) {
+        return;
       }
-    } catch (error) {
-      if (!(error instanceof ClosedError)) {
-        throw error;
-      }
+      yield chunk;
     }
   }
 
@@ -344,10 +342,10 @@ export class Stream {
 
   /** @internal */
   remoteWriteClosed(): void {
-    if (this.#closed || this.#remoteWriteClosed) {
+    if (this.#closed || this.#receiveState.kind !== "receiving") {
       return;
     }
-    this.#remoteWriteClosed = true;
+    this.#receiveState = { kind: "eof" };
     this.#emit("remoteWriteClosed");
     if (this.#fifo.length === 0) {
       for (const read of this.#reads.splice(0)) {
@@ -357,16 +355,29 @@ export class Stream {
   }
 
   /** @internal */
-  terminal(error: unknown = new ClosedError()): void {
+  terminal(
+    error: unknown = new ClosedError(),
+    options: { readonly preserveRemoteEof?: boolean } = {}
+  ): void {
     if (this.#closed) {
       return;
     }
     this.#closed = true;
-    this.#terminalError = error;
-    this.#fifo.length = 0;
-    this.#fifoBytes = 0;
+    // StreamClosed carries no cause. Once the remote FIN establishes EOF,
+    // later full closure cannot reinterpret that receive-side outcome.
+    const hasRemoteEof =
+      options.preserveRemoteEof === true && this.#receiveState.kind === "eof";
+    if (!hasRemoteEof) {
+      this.#receiveState = { error, kind: "failed" };
+      this.#fifo.length = 0;
+      this.#fifoBytes = 0;
+    }
     for (const read of this.#reads.splice(0)) {
-      read.reject(error);
+      if (hasRemoteEof) {
+        read.resolve(this.#shift());
+      } else {
+        read.reject(error);
+      }
     }
     this.#emit("closed");
     this.#listeners.clear();
@@ -1325,7 +1336,9 @@ export class Minip2pBase {
         clearPendingOpen(pending);
         pending.reject(new StreamClosedError());
       }
-      stream?.terminal(new StreamClosedError("The stream closed"));
+      stream?.terminal(new StreamClosedError("The stream closed"), {
+        preserveRemoteEof: true,
+      });
     } else if (event.tag === P2pEvent_Tags.StreamData) {
       stream?.receive(event.inner.data);
     } else {
