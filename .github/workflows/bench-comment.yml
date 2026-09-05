@@ -95,8 +95,9 @@ jobs:
           RUN_URL: ${{ github.event.workflow_run.html_url }}
           TARGET: ${{ runner.temp }}/bench-comment.md
         run: |
-          existing=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER/comments" --paginate --slurp \
-            --jq '[.[][] | select(.body | contains("<!-- bench-comment -->"))][0].body // empty')
+          existing=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER/comments" --paginate \
+            | jq --slurp --raw-output \
+              '[.[][] | select(.body | contains("<!-- bench-comment -->"))][0].body // empty')
 
           if [ "$CONCLUSION" = success ]; then
             cp "$ARTIFACT_DIR/comparison.md" "$TARGET"
@@ -124,8 +125,9 @@ jobs:
           PR_NUMBER: ${{ steps.comparison.outputs.pr-number }}
           TARGET: ${{ runner.temp }}/bench-comment.md
         run: |
-          comment_id=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER/comments" --paginate --slurp \
-            --jq '[.[][] | select(.body | contains("<!-- bench-comment -->"))][0].id // empty')
+          comment_id=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER/comments" --paginate \
+            | jq --slurp --raw-output \
+              '[.[][] | select(.body | contains("<!-- bench-comment -->"))][0].id // empty')
           if [ -n "$comment_id" ]; then
             gh api --method PATCH "repos/$GH_REPO/issues/comments/$comment_id" -F "body=@$TARGET"
           else
