@@ -363,6 +363,8 @@ export class Stream {
       return;
     }
     this.#closed = true;
+    // StreamClosed carries no cause. Once the remote FIN establishes EOF,
+    // later full closure cannot reinterpret that receive-side outcome.
     const hasRemoteEof =
       options.preserveRemoteEof === true && this.#receiveState.kind === "eof";
     if (!hasRemoteEof) {

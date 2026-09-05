@@ -16,7 +16,7 @@ stream.write(new Uint8Array([1, 2, 3]));
 stream.closeWrite();
 ```
 
-Streams are async iterables. Iteration preserves chunk order. A remote write half-close or local shutdown ends the loop quietly. A reset, peer disconnect, or driver failure observed before that EOF rejects the iterator with its terminal error:
+Streams are async iterables. Iteration preserves chunk order, drains bytes buffered before a remote write half-close, and then ends quietly. Local shutdown, reset, peer disconnect, or driver failure rejects the iterator with its terminal error:
 
 ```ts
 for await (const chunk of stream) {
