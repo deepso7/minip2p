@@ -41,21 +41,33 @@ describe("React Native connection identities", () => {
     const fake = FakeNativeEndpoint.current();
     const opened: number[] = [];
     const closedIds: number[] = [];
+    const lateErrors: (number | undefined)[] = [];
     endpoint.on("connectionEstablished", ({ connId }) => opened.push(connId));
     endpoint.on("connectionClosed", ({ connId }) => closedIds.push(connId));
+    endpoint.on("endpointError", ({ connId }) => lateErrors.push(connId));
     fake.enqueue(
       NATIVE_IDS.map(established),
       [closed(2n ** 63n + 1n), closed(1n)],
+      [
+        {
+          inner: { connId: 1n, detail: "late", kind: 0 },
+          tag: "EndpointError",
+        },
+        established(5n),
+      ],
       []
     );
 
     fake.ring();
     await vi.runAllTimersAsync();
 
-    expect(opened).toHaveLength(NATIVE_IDS.length);
-    expect(new Set(opened).size).toBe(NATIVE_IDS.length);
+    expect(opened).toHaveLength(NATIVE_IDS.length + 1);
     expect(opened.every(isSafeId)).toBe(true);
     expect(closedIds).toEqual([opened[2], opened[0]]);
+    // A released ID never comes back: the late error and the new connection
+    // both get numbers distinct from every ID handed out before.
+    const seen = [...opened, ...lateErrors];
+    expect(new Set(seen).size).toBe(seen.length);
     endpoint.close();
   });
 

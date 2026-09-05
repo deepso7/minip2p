@@ -19,6 +19,7 @@ import type {
   Reachability,
   RelayReservationInfo,
 } from "@minip2p/core";
+import { P2pEvent_Tags } from "@minip2p/core/backend";
 import type {
   Minip2pBackend,
   Minip2pBackendFactory,
@@ -421,24 +422,37 @@ function resolveMdnsAutoDial(
  *
  * Native connection IDs span the full `u64` range, so they cannot round-trip
  * through a JavaScript `number`. Each endpoint owns one map so a native ID
- * resolves to the same public ID in events and synchronous results. Entries
- * live for the endpoint lifetime: connection IDs never flow back into native
- * calls, and keeping them means a delayed event cannot alias a newer
- * connection. Stream and connect-attempt IDs are not mapped because they
- * round-trip into native calls, and native allocates them well inside the
- * safe integer range.
+ * resolves to the same public ID in events and synchronous results. An entry
+ * is released once its `ConnectionClosed` event is normalized, which bounds
+ * the map by live connections. Public numbers come from a counter that never
+ * repeats, so an event arriving after the release gets a fresh number instead
+ * of aliasing a live connection. Stream and connect-attempt IDs are not
+ * mapped because they round-trip into native calls, and native allocates
+ * them well inside the safe integer range.
  */
 class ConnectionIdMap {
   readonly #publicByNative = new Map<bigint, number>();
+  readonly #nativeByPublic = new Map<number, bigint>();
+  #next = 1;
 
   toPublic(native: bigint): number {
     const existing = this.#publicByNative.get(native);
     if (existing !== undefined) {
       return existing;
     }
-    const publicId = this.#publicByNative.size + 1;
+    const publicId = this.#next;
+    this.#next += 1;
     this.#publicByNative.set(native, publicId);
+    this.#nativeByPublic.set(publicId, native);
     return publicId;
+  }
+
+  release(publicId: number): void {
+    const native = this.#nativeByPublic.get(publicId);
+    if (native !== undefined) {
+      this.#nativeByPublic.delete(publicId);
+      this.#publicByNative.delete(native);
+    }
   }
 }
 
@@ -446,13 +460,17 @@ function normalizeEvent(
   event: NativeP2pEvent,
   connectionIds: ConnectionIdMap
 ): P2pEvent {
-  return normalizeBigInts(
+  const normalized = normalizeBigInts(
     {
       inner: event.inner,
       tag: event.tag,
     },
     connectionIds
   ) as P2pEvent;
+  if (normalized.tag === P2pEvent_Tags.ConnectionClosed) {
+    connectionIds.release(normalized.inner.connId);
+  }
+  return normalized;
 }
 
 function normalizeKnownPeer(peer: NativeKnownPeerInfo): KnownPeerInfo {

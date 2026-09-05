@@ -2,16 +2,34 @@
 
 import { vi } from "vitest";
 
+import type {
+  OpenStreamResult,
+  P2pEndpointLike,
+  P2pEvent,
+  P2pEventDoorbell,
+} from "../src/native";
+
+/**
+ * Hand-written stand-in for a generated event class instance. The adapter
+ * only reads `tag` and `inner`, so tests enqueue plain literals.
+ */
 export interface FakeEvent {
   readonly tag: string;
   readonly inner: Readonly<Record<string, unknown>>;
 }
 
-interface Doorbell {
-  onEventsReady: () => void;
-}
+/** Endpoint methods the fake implements with the generated signatures. */
+type FakedMethods =
+  | "dial"
+  | "dialIp4"
+  | "dialIp6"
+  | "discoveryNowMs"
+  | "drainEvents"
+  | "openStream"
+  | "start"
+  | "stop";
 
-export class FakeNativeEndpoint {
+export class FakeNativeEndpoint implements Pick<P2pEndpointLike, FakedMethods> {
   static latest: FakeNativeEndpoint | undefined;
 
   readonly drainLimits: number[] = [];
@@ -22,7 +40,7 @@ export class FakeNativeEndpoint {
   /** Native discovery clock returned by `discoveryNowMs`. */
   discoveryNow: bigint | undefined = undefined;
   readonly #batches: FakeEvent[][] = [];
-  #doorbell: Doorbell | undefined;
+  #doorbell: P2pEventDoorbell | undefined;
 
   constructor() {
     FakeNativeEndpoint.latest = this;
@@ -44,16 +62,16 @@ export class FakeNativeEndpoint {
     this.#doorbell?.onEventsReady();
   }
 
-  start(doorbell: Doorbell): void {
+  start(doorbell: P2pEventDoorbell): void {
     this.#doorbell = doorbell;
   }
 
-  drainEvents(limit: number): FakeEvent[] {
+  drainEvents(limit: number): P2pEvent[] {
     this.drainLimits.push(limit);
-    return this.#batches.shift() ?? [];
+    return (this.#batches.shift() ?? []) as unknown as P2pEvent[];
   }
 
-  openStream(): { connId: bigint; streamId: bigint } {
+  openStream(): OpenStreamResult {
     return this.nextStream;
   }
 
