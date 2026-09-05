@@ -19,6 +19,7 @@ import type {
   Reachability,
   RelayReservationInfo,
 } from "@minip2p/core";
+import { P2pEvent_Tags } from "@minip2p/core/backend";
 import type {
   Minip2pBackend,
   Minip2pBackendFactory,
@@ -51,6 +52,7 @@ import nativeModule from "./NativeMinip2p";
 class ReactNativeBackend implements Minip2pBackend {
   readonly #endpoint: P2pEndpoint;
   readonly #mdnsEnabled: boolean;
+  readonly #connectionIds = new ConnectionIdMap();
   #doorbell: P2pEventDoorbell | undefined;
   #events: EventDrain<NativeP2pEvent> | undefined;
 
@@ -78,7 +80,7 @@ class ReactNativeBackend implements Minip2pBackend {
   start(listener: (event: P2pEvent) => void): void {
     this.#events = new EventDrain(
       (limit) => this.#endpoint.drainEvents(limit),
-      (event) => listener(normalizeEvent(event))
+      (event) => listener(normalizeEvent(event, this.#connectionIds))
     );
     this.#doorbell = {
       onEventsReady: () => {
@@ -199,7 +201,7 @@ class ReactNativeBackend implements Minip2pBackend {
       this.#endpoint.openStream(peerId, protocolId)
     );
     return {
-      connId: u64ToNumber(result.connId, "connId"),
+      connId: this.#connectionIds.toPublic(result.connId),
       streamId: u64ToNumber(result.streamId, "streamId"),
     };
   }
@@ -260,21 +262,19 @@ class ReactNativeBackend implements Minip2pBackend {
 
   dial(address: string): number[] {
     return translateErrors(() => this.#endpoint.dial(address)).map((id) =>
-      u64ToNumber(id, "connectionId")
+      this.#connectionIds.toPublic(id)
     );
   }
 
   dialIp4(address: string): number {
-    return u64ToNumber(
-      translateErrors(() => this.#endpoint.dialIp4(address)),
-      "connectionId"
+    return this.#connectionIds.toPublic(
+      translateErrors(() => this.#endpoint.dialIp4(address))
     );
   }
 
   dialIp6(address: string): number {
-    return u64ToNumber(
-      translateErrors(() => this.#endpoint.dialIp6(address)),
-      "connectionId"
+    return this.#connectionIds.toPublic(
+      translateErrors(() => this.#endpoint.dialIp6(address))
     );
   }
 
@@ -417,11 +417,60 @@ function resolveMdnsAutoDial(
   return mdns.autoDial ?? discovery?.autoDial ?? true;
 }
 
-function normalizeEvent(event: NativeP2pEvent): P2pEvent {
-  return normalizeBigInts({
-    inner: event.inner,
-    tag: event.tag,
-  }) as P2pEvent;
+/**
+ * Maps native `u64` connection identities to small public numbers.
+ *
+ * Native connection IDs span the full `u64` range, so they cannot round-trip
+ * through a JavaScript `number`. Each endpoint owns one map so a native ID
+ * resolves to the same public ID in events and synchronous results. An entry
+ * is released once its `ConnectionClosed` event is normalized, which bounds
+ * the map by live connections. Public numbers come from a counter that never
+ * repeats, so an event arriving after the release gets a fresh number instead
+ * of aliasing a live connection. Stream and connect-attempt IDs are not
+ * mapped because they round-trip into native calls, and native allocates
+ * them well inside the safe integer range.
+ */
+class ConnectionIdMap {
+  readonly #publicByNative = new Map<bigint, number>();
+  readonly #nativeByPublic = new Map<number, bigint>();
+  #next = 1;
+
+  toPublic(native: bigint): number {
+    const existing = this.#publicByNative.get(native);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const publicId = this.#next;
+    this.#next += 1;
+    this.#publicByNative.set(native, publicId);
+    this.#nativeByPublic.set(publicId, native);
+    return publicId;
+  }
+
+  release(publicId: number): void {
+    const native = this.#nativeByPublic.get(publicId);
+    if (native !== undefined) {
+      this.#nativeByPublic.delete(publicId);
+      this.#publicByNative.delete(native);
+    }
+  }
+}
+
+function normalizeEvent(
+  event: NativeP2pEvent,
+  connectionIds: ConnectionIdMap
+): P2pEvent {
+  const normalized = normalizeBigInts(
+    {
+      inner: event.inner,
+      tag: event.tag,
+    },
+    connectionIds
+  ) as P2pEvent;
+  if (normalized.tag === P2pEvent_Tags.ConnectionClosed) {
+    connectionIds.release(normalized.inner.connId);
+  }
+  return normalized;
 }
 
 function normalizeKnownPeer(peer: NativeKnownPeerInfo): KnownPeerInfo {
@@ -438,19 +487,33 @@ function normalizeReservation(
   return normalizeBigInts(reservation) as RelayReservationInfo;
 }
 
-function normalizeBigInts(value: unknown): unknown {
+/**
+ * Converts native `bigint` fields to numbers. `connId` fields go through the
+ * endpoint's connection map when one is supplied; every other `u64` keeps the
+ * checked conversion.
+ */
+function normalizeBigInts(
+  value: unknown,
+  connectionIds?: ConnectionIdMap,
+  key?: string
+): unknown {
   if (typeof value === "bigint") {
-    return u64ToNumber(value, "native u64");
+    return key === "connId" && connectionIds !== undefined
+      ? connectionIds.toPublic(value)
+      : u64ToNumber(value, "native u64");
   }
   if (value instanceof ArrayBuffer) {
     return value;
   }
   if (Array.isArray(value)) {
-    return value.map((item) => normalizeBigInts(item));
+    return value.map((item) => normalizeBigInts(item, connectionIds));
   }
   if (value !== null && typeof value === "object") {
     return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [key, normalizeBigInts(item)])
+      Object.entries(value).map(([itemKey, item]) => [
+        itemKey,
+        normalizeBigInts(item, connectionIds, itemKey),
+      ])
     );
   }
   return value;
