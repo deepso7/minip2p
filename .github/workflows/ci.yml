@@ -32,10 +32,10 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-node@v7
         with:
-          node-version: "22.13.0"
+          node-version: "24.20.0"
       - uses: pnpm/action-setup@v6
         with:
-          version: "11.10.0"
+          version: "11.25.0"
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.91"
@@ -186,7 +186,7 @@ jobs:
     env:
       # Pinned so a broken upstream nightly can't fail every PR and the
       # rust-cache key stays stable. Bump deliberately.
-      NIGHTLY_TOOLCHAIN: nightly-2026-07-01
+      NIGHTLY_TOOLCHAIN: nightly-2026-09-04
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable # installs the nightly toolchain below via the toolchain input
