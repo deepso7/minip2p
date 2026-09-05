@@ -522,6 +522,31 @@ test("stream async iteration yields chunks in order and ends on remote write clo
   endpoint.close();
 });
 
+test("stream reads buffered chunks before EOF when full closure follows remote write close", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
+  backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+  const stream = await opening;
+
+  backend.emit(streamData(new Uint8Array([1, 2]), 3));
+  backend.emit(streamData(new Uint8Array([3]), 3));
+  backend.emit({
+    inner: { connId: 2, peerId: "peer", streamId: 3 },
+    tag: P2pEvent_Tags.StreamRemoteWriteClosed,
+  });
+  backend.emit({
+    inner: { connId: 2, peerId: "peer", streamId: 3 },
+    tag: P2pEvent_Tags.StreamClosed,
+  });
+  await tick();
+
+  assert.deepEqual([...(await stream.read())], [1, 2]);
+  assert.deepEqual([...(await stream.read())], [3]);
+  assert.equal(await stream.read(), undefined);
+  endpoint.close();
+});
+
 test("stream async iteration keeps half-close EOF final when StreamClosed follows", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
@@ -548,7 +573,7 @@ test("stream async iteration keeps half-close EOF final when StreamClosed follow
   endpoint.close();
 });
 
-test("stream async iteration ends quietly when the endpoint closes", async () => {
+test("stream async iteration rejects when the endpoint closes", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
   const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
@@ -562,7 +587,7 @@ test("stream async iteration ends quietly when the endpoint closes", async () =>
 
   endpoint.close();
 
-  await reading;
+  await assert.rejects(reading, ClosedError);
 });
 
 test("stream async iteration rejects when the remote stream resets", async () => {
@@ -583,6 +608,7 @@ test("stream async iteration rejects when the remote stream resets", async () =>
   });
 
   await assert.rejects(reading, StreamClosedError);
+  await assert.rejects(stream.read(), StreamClosedError);
   endpoint.close();
 });
 
@@ -604,21 +630,24 @@ test("pending stream read rejects when its connection closes", async () => {
   endpoint.close();
 });
 
-test("stream async iteration remembers a reset while the loop body runs", async () => {
+test("stream async iteration drains buffered data when full closure follows remote write close", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
   const opening = endpoint.openStream("peer", "/test/1", { timeoutMs: 1000 });
   backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
   const stream = await opening;
   const { promise: paused, resolve: resume } = Promise.withResolvers();
+  const chunks = [];
   const reading = (async () => {
-    for await (const _chunk of stream) {
+    for await (const chunk of stream) {
+      chunks.push([...chunk]);
       await paused;
     }
   })();
 
   backend.emit(streamData(new Uint8Array([1]), 3));
   await tick();
+  backend.emit(streamData(new Uint8Array([2]), 3));
   backend.emit({
     inner: { connId: 2, peerId: "peer", streamId: 3 },
     tag: P2pEvent_Tags.StreamRemoteWriteClosed,
@@ -630,8 +659,41 @@ test("stream async iteration remembers a reset while the loop body runs", async 
   await tick();
   resume();
 
-  await assert.rejects(reading, StreamClosedError);
+  await reading;
+  assert.deepEqual(chunks, [[1], [2]]);
   endpoint.close();
+});
+
+test("endpoint and connection closure override remote write EOF", async () => {
+  for (const failure of ["endpoint", "connection"]) {
+    const backend = new MockBackend();
+    backend.connected = ["peer"];
+    const endpoint = new TestMinip2p(backend);
+    const opening = endpoint.openStream("peer", "/test/1", {
+      timeoutMs: 1000,
+    });
+    backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+    const stream = await opening;
+    backend.emit(streamData(new Uint8Array([1]), 3));
+    backend.emit({
+      inner: { connId: 2, peerId: "peer", streamId: 3 },
+      tag: P2pEvent_Tags.StreamRemoteWriteClosed,
+    });
+    await tick();
+
+    if (failure === "endpoint") {
+      endpoint.close();
+      await assert.rejects(stream.read(), ClosedError);
+    } else {
+      backend.emit({
+        inner: { connId: 2, peerId: "peer" },
+        tag: P2pEvent_Tags.ConnectionClosed,
+      });
+      await tick();
+      await assert.rejects(stream.read(), PeerDisconnectedError);
+      endpoint.close();
+    }
+  }
 });
 
 test("local stream reset and abandon emit closed exactly once", async () => {
@@ -650,12 +712,38 @@ test("local stream reset and abandon emit closed exactly once", async () => {
       stream.reset();
       stream.abandon();
     });
+    const reading = stream.read();
 
     stream[operation]();
     stream[operation]();
 
     assert.equal(closed, 1);
     assert.deepEqual(backend.operations, [[operation, "peer", 3]]);
+    await assert.rejects(reading, ClosedError);
+    await assert.rejects(stream.read(), ClosedError);
+    endpoint.close();
+  }
+});
+
+test("local stream reset and abandon override remote write EOF", async () => {
+  for (const operation of ["reset", "abandon"]) {
+    const backend = new MockBackend();
+    const endpoint = new TestMinip2p(backend);
+    const opening = endpoint.openStream("peer", "/test/1", {
+      timeoutMs: 1000,
+    });
+    backend.emit(streamReady({ initiatedLocally: true, streamId: 3 }));
+    const stream = await opening;
+    backend.emit(streamData(new Uint8Array([1]), 3));
+    backend.emit({
+      inner: { connId: 2, peerId: "peer", streamId: 3 },
+      tag: P2pEvent_Tags.StreamRemoteWriteClosed,
+    });
+    await tick();
+
+    stream[operation]();
+
+    await assert.rejects(stream.read(), ClosedError);
     endpoint.close();
   }
 });
