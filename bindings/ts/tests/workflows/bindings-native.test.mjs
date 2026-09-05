@@ -60,7 +60,7 @@ test("weekly workflow executes the suite on native runners and musl containers",
     ({ name }) => name === "Build addon"
   ).run;
   assert.match(muslBuild, /PATH=\/opt\/pnpm\/bin:\/usr\/bin:/u);
-  assert.match(muslBuild, /--prefix \/opt\/pnpm pnpm@11\.24\.0/u);
+  assert.match(muslBuild, /--prefix \/opt\/pnpm pnpm@11\.25\.0/u);
   assert.match(
     muslBuild,
     /cargo build --release --locked -p minip2p-relay-server-example/u
