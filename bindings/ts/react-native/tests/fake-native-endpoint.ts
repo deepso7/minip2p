@@ -1,3 +1,4 @@
+/* oxlint-disable class-methods-use-this -- The fake mirrors the generated endpoint surface; methods no test reaches throw by name. */
 /** In-memory stand-in for the UniFFI `P2pEndpoint` used by adapter tests. */
 
 import { vi } from "vitest";
@@ -18,18 +19,17 @@ export interface FakeEvent {
   readonly inner: Readonly<Record<string, unknown>>;
 }
 
-/** Endpoint methods the fake implements with the generated signatures. */
-type FakedMethods =
-  | "dial"
-  | "dialIp4"
-  | "dialIp6"
-  | "discoveryNowMs"
-  | "drainEvents"
-  | "openStream"
-  | "start"
-  | "stop";
+const notFaked = (method: keyof P2pEndpointLike): never => {
+  throw new Error(`FakeNativeEndpoint does not fake ${method}`);
+};
 
-export class FakeNativeEndpoint implements Pick<P2pEndpointLike, FakedMethods> {
+/**
+ * Implements the full generated endpoint surface so interface drift fails
+ * `typecheck`. Only the methods the adapter tests reach have behavior; the
+ * rest throw by name so an unexpected call is loud rather than "not a
+ * function".
+ */
+export class FakeNativeEndpoint implements P2pEndpointLike {
   static latest: FakeNativeEndpoint | undefined;
 
   readonly drainLimits: number[] = [];
@@ -97,6 +97,110 @@ export class FakeNativeEndpoint implements Pick<P2pEndpointLike, FakedMethods> {
 
   uniffiDestroy(): void {
     this.#batches.length = 0;
+  }
+
+  abandonStream(): never {
+    return notFaked("abandonStream");
+  }
+
+  activeReservation(): never {
+    return notFaked("activeReservation");
+  }
+
+  addProtocol(): never {
+    return notFaked("addProtocol");
+  }
+
+  cancelConnect(): never {
+    return notFaked("cancelConnect");
+  }
+
+  closeStreamWrite(): never {
+    return notFaked("closeStreamWrite");
+  }
+
+  connect(): never {
+    return notFaked("connect");
+  }
+
+  connectAddr(): never {
+    return notFaked("connectAddr");
+  }
+
+  connectWithAddrs(): never {
+    return notFaked("connectWithAddrs");
+  }
+
+  connectedPeers(): never {
+    return notFaked("connectedPeers");
+  }
+
+  disconnect(): never {
+    return notFaked("disconnect");
+  }
+
+  isPeerReady(): never {
+    return notFaked("isPeerReady");
+  }
+
+  isRunning(): never {
+    return notFaked("isRunning");
+  }
+
+  knownPeers(): never {
+    return notFaked("knownPeers");
+  }
+
+  listenAddrs(): never {
+    return notFaked("listenAddrs");
+  }
+
+  path(): never {
+    return notFaked("path");
+  }
+
+  peerId(): never {
+    return notFaked("peerId");
+  }
+
+  peerInfo(): never {
+    return notFaked("peerInfo");
+  }
+
+  ping(): never {
+    return notFaked("ping");
+  }
+
+  publish(): never {
+    return notFaked("publish");
+  }
+
+  reachability(): never {
+    return notFaked("reachability");
+  }
+
+  resetStream(): never {
+    return notFaked("resetStream");
+  }
+
+  sendStream(): never {
+    return notFaked("sendStream");
+  }
+
+  setActive(): never {
+    return notFaked("setActive");
+  }
+
+  subscribe(): never {
+    return notFaked("subscribe");
+  }
+
+  unsubscribe(): never {
+    return notFaked("unsubscribe");
+  }
+
+  waitStopped(): never {
+    return notFaked("waitStopped");
   }
 }
 
