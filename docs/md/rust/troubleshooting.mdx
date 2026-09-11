@@ -12,7 +12,7 @@ Start from the observable symptom. Rust methods return immediate failures as `mi
 | `PeerAddr` fails to parse | The address lacks a terminal `/p2p/<peer-id>` | Copy the complete peer address. |
 | Dialing fails immediately | The address has the wrong shape, or its transport is unavailable | Use `/udp/<port>/quic-v1` or `/tcp/<port>` and bind that transport. |
 | A remote peer cannot dial a printed address | The address contains `0.0.0.0` or `::` | Advertise a real interface, public, or relay address. |
-| A connection exists but an application protocol cannot open | Peer not connected, protocol unregistered, or remote rejects negotiation | Confirm `ConnectionEstablished`, matching protocol IDs, and keep both peers driving. `PeerReady` is optional; it only enables early `RemoteDoesNotSupport`. |
+| A connection exists but an application protocol cannot open | Protocol unregistered, or remote rejects negotiation | Confirm matching protocol IDs and keep both peers driving. `PeerReady` is optional; it only enables early `RemoteDoesNotSupport`. |
 | `ProtocolNotRegistered` | The local endpoint never registered the protocol | Add `.protocol("/app/name/1.0.0")` or call `add_protocol`. |
 | `RemoteDoesNotSupport` | The peer does not advertise the protocol version | Register the same version on both peers. |
 | An optional capability reports "not enabled" | The Cargo feature exists, but the builder did not activate it | Add the builder method listed in the feature matrix. |
