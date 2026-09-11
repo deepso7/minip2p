@@ -13,7 +13,7 @@ Use focused waits such as `wait_path` and `wait_peer_ready` when you need a part
 | --- | --- | --- |
 | `wait_path` / `wait_peer_ready` / `wait_ping_rtt` | Drive until one milestone, buffering unrelated events. | Connection and setup milestones |
 | Feature-focused waits | Drive until a NAT, pubsub, signed-discovery, or mDNS result. | Feature-specific workflows |
-| `next_event(deadline)` | Drive until one ordinary application event or the deadline. | Synchronous application event loops |
+| `next_event(deadline)` | Drive until one ordinary application event or the deadline. | Synchronous application loops; custom dispatchers; multi-endpoint loops on one thread |
 | `next_wake(deadline)` | Drive until an application event, optional-capability progress, interruption, or the deadline. | One interruptible loop over ordinary and capability events |
 | `poll()` | One non-blocking drive; returns currently available application events. | Existing game, UI, or reactor loops |
 

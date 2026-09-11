@@ -34,7 +34,7 @@ node.wait_peer_ready(&peer_id, Duration::from_secs(10))?
 let stream_id = node.open_stream(&peer_id, ECHO_PROTOCOL)?;
 ```
 
-`open_stream` starts negotiation and returns the allocated stream ID. Wait for the matching `Event::StreamReady` before writing, either in your main `next_event` / `next_wake` loop or with a focused wait for that stream event:
+`open_stream` starts negotiation and returns the allocated stream ID. Wait for the matching `Event::StreamReady` before writing, either in your main `next_event` / `next_wake` loop or by matching the stream event in your event dispatcher:
 
 ```rust
 loop {
