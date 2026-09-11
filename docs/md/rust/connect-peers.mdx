@@ -112,7 +112,7 @@ $ cargo run --bin dialer -- /ip4/127.0.0.1/udp/54321/quic-v1/p2p/12D3KooW…
 peer=12D3KooW… rtt=2ms
 ```
 
-`wait_peer_ready` waits until the connection is authenticated and the first Identify exchange finishes. Only after that does the dialer issue Ping.
+`wait_peer_ready` waits until Identify finishes so the dialer can print the peer and then measure Ping. That wait is a convenient milestone for this demo; `open_stream` does not require Identify for a protocol both peers already registered.
 
 `bind_quic_dual_stack` binds wildcard sockets. The listener rewrites only the printed local-demo addresses to loopback; the endpoint itself continues listening on both wildcard sockets.
 

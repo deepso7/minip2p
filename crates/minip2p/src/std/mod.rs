@@ -497,6 +497,10 @@ impl Endpoint {
     }
 
     /// Opens an application stream after negotiating `protocol_id`.
+    ///
+    /// Allowed once the peer is connected. Identify (`PeerReady`) is not
+    /// required first; after Identify completes, an unsupported protocol can
+    /// fail early with [`SwarmError::RemoteDoesNotSupport`].
     pub fn open_stream(&mut self, peer_id: &PeerId, protocol_id: &str) -> Result<StreamId, Error> {
         self.swarm.open_stream(peer_id, protocol_id)
     }
@@ -571,7 +575,13 @@ impl Endpoint {
         }
     }
 
-    /// Returns the next event, waiting internally until `deadline`.
+    /// Returns the next ordinary application event, waiting until `deadline`.
+    ///
+    /// Prefer focused readiness waits ([`Self::wait_peer_ready`],
+    /// [`Self::wait_path`], [`Self::wait_ping_rtt`]) or [`Self::next_wake`] for
+    /// ordinary setup. Use `next_event` when you own a custom dispatcher or
+    /// drive several endpoints on one thread. Avoid alternating fixed short
+    /// budgets such as `next_event(1ms)` across peers on a single thread.
     ///
     /// `deadline` accepts an [`std::time::Instant`], a relative
     /// [`std::time::Duration`], or [`Deadline::NEVER`] to wait indefinitely.
@@ -864,7 +874,11 @@ impl Endpoint {
         }
     }
 
-    /// Waits until a peer is ready or `deadline` expires.
+    /// Waits until Identify completes for `peer_id` or `deadline` expires.
+    ///
+    /// Recommended when the application needs advertised protocols. Opening a
+    /// known application stream does not require this wait; see
+    /// [`Self::open_stream`].
     pub fn wait_peer_ready(
         &mut self,
         peer_id: &PeerId,
@@ -957,6 +971,10 @@ impl Endpoint {
     }
 
     /// Waits for the first usable path of connect attempt `id`.
+    ///
+    /// Recommended default after `connect*` when the application needs a
+    /// usable NAT path. Prefer this over alternating short `next_event`
+    /// polls across peers on one thread.
     ///
     /// Returns `Ok(Some(path))` on [`NatEvent::PathEstablished`] (the event
     /// is consumed), and `Ok(None)` when the attempt failed or `deadline`

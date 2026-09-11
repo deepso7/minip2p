@@ -100,7 +100,8 @@ If the punch cannot land (e.g. UDP blocked between the peers), you'll see `nat-h
 
 ## Notes
 
+- Dial setup uses readiness waits (`wait_path`, `wait_peer_ready`) rather than alternating short `next_event` polls. Keep driving both peers; a single-thread alternate 1 ms poll is a poor default and inflates loopback connect latency.
 - The echo protocol (`/minip2p/echo/1`) frames are 16 bytes: an 8-byte big-endian seq followed by an 8-byte send timestamp. The listener never parses them — it echoes raw bytes, which also exercises frame fragmentation/coalescing on the dialer's reassembly path.
-- A relayed path is an end-to-end Noise connection multiplexed with Yamux. Identify, ping, and the echo protocol use the same negotiated stream APIs as a direct connection.
+- A relayed path is an end-to-end Noise connection multiplexed with Yamux. Identify, ping, and the echo protocol use the same negotiated stream APIs as a direct connection. This demo waits for Identify before opening echo; that is policy, not a stack requirement for `open_stream`.
 - Exit paths: `--count` is the graceful shutdown (half-close, 3 s drain, summary); Ctrl-C is the blunt one. The listener runs until interrupted.
 - The previous `direct`/`relay`/`autonat` modes (hand-rolled protocol drivers) live in git history; the machine-level reference for the traversal flows is `crates/nat/tests`.

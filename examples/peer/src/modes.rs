@@ -402,9 +402,10 @@ pub fn run_dial(
     ping_loop(&mut endpoint, &peer, channel, frames, count, start)
 }
 
-/// Opens the echo stream on a direct connection: identify must have
-/// completed (protocol routing) and the stream must finish negotiating,
-/// all before `deadline`.
+/// Opens the echo stream on a direct connection. Waiting for Identify first
+/// is this demo's policy (early protocol advertisement); the stack allows
+/// `open_stream` once connected. The stream must finish negotiating before
+/// `deadline`.
 fn open_echo_stream(
     endpoint: &mut Endpoint,
     peer: &PeerId,

@@ -24,7 +24,8 @@ const DEFAULT_TOPIC: &str = "minip2p-chat";
 const CONNECT_DEADLINE: Duration = Duration::from_secs(65);
 /// How long the host waits for its relay reservation before warning.
 const RESERVATION_DEADLINE: Duration = Duration::from_secs(30);
-/// Identify must complete before gossipsub can open streams.
+/// Budget for waiting until Identify finishes so this demo can treat the
+/// peer as mesh-ready; app streams themselves do not require PeerReady.
 const READY_DEADLINE: Duration = Duration::from_secs(15);
 
 struct ChatEndpoint {

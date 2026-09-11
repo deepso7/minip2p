@@ -3,7 +3,7 @@ title: Connections and streams
 description: Connect with cancellable Promises, inspect direct or relayed paths, and exchange bytes over custom protocol streams.
 ---
 
-The TypeScript SDK separates _finding a usable network path_ from _opening an application protocol_. Connect first, wait for Identify readiness, then open a negotiated stream.
+The TypeScript SDK separates _finding a usable network path_ from _opening an application protocol_. Connect first. Call `waitPeerReady` when you need Identify's advertised protocols; `openStream` is allowed once the path is usable.
 
 ## Connect with a Promise
 
@@ -89,7 +89,7 @@ const endpoint = Minip2p.create({
 endpoint.addProtocol("/example/chat/1");
 ```
 
-Both peers must support the same ID. Wait for `peerReady` before opening so the remote Identify snapshot is available.
+Both peers must support the same ID. `waitPeerReady` is useful when you want the remote Identify snapshot before opening; it is not required to start negotiation on a known protocol.
 
 ## Exchange one request and response
 

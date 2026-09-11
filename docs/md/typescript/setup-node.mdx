@@ -88,7 +88,7 @@ connected over directDialed
 ping: 4 ms
 ```
 
-`connectAddr` returns the first usable path. `waitPeerReady` then waits for the peer's Identify information before the application starts protocol work.
+`connectAddr` returns the first usable path. `waitPeerReady` then waits for Identify when you want the advertised protocol list before starting protocol work. `openStream` does not require that wait for a known protocol.
 
 This listener accepts connections only from the same machine. To let a phone or another computer connect, bind a LAN interface instead, such as `/ip4/192.168.1.42/udp/4001/quic-v1`, and give it the printed address.
 

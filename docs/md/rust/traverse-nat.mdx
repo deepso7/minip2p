@@ -131,7 +131,7 @@ for event in node.take_nat_events() {
 
 ## Keep driving after the first path
 
-`wait_path` returns when traffic can flow. Keep calling `next_event`, `poll`, or feature-focused waits afterward so DCUtR, reservation renewal, and connection events continue to progress.
+`wait_path` returns when traffic can flow. Keep calling readiness waits, `next_wake`, `next_event`, or `poll` afterward so DCUtR, reservation renewal, and connection events continue to progress. Prefer those readiness waits over alternating fixed short `next_event` polls on one thread.
 
 ## Custom entropy without `std`
 

@@ -37,11 +37,11 @@ Every endpoint needs a 32-byte Ed25519 secret key. Reuse the same key when the p
 To connect:
 
 1. Pass a complete peer multiaddress to `connectAddr`.
-2. Wait for `waitPeerReady` before opening an application stream.
+2. Open application streams once the path is usable. Call `waitPeerReady` when you need Identify's advertised protocols.
 3. Use `ping`, `openStream`, pubsub, or another operation.
 4. Close the endpoint when its owner shuts down.
 
-`connectAddr` resolves when minip2p has a usable direct or relayed path. `waitPeerReady` waits for Identify and returns the peer's supported protocols.
+`connectAddr` resolves when minip2p has a usable direct or relayed path. `waitPeerReady` waits for Identify and returns the peer's supported protocols. It is not required before `openStream` for a protocol you already know the remote speaks.
 
 ## Continue
 

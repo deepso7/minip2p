@@ -9,15 +9,16 @@ An `Endpoint` is the main application API. Five ideas explain most code built on
 
 `Endpoint` owns an Ed25519 identity, the transports you bound, and the connection state. It is the app-facing entrypoint for listening, dialing, Ping, Identify, and application streams. QUIC is on by default; add the `tcp` feature to use QUIC and TCP together, or bind only TCP.
 
-An endpoint does not spawn a runtime. Your code makes progress by calling:
+An endpoint does not spawn a runtime. Prefer readiness-driven waits for ordinary setup:
 
-- `poll()` for one non-blocking driving step;
-- `next_event(deadline)` to drive until an application event or deadline;
-- a focused wait such as `wait_peer_ready` or `wait_path`.
+- `wait_path`, `wait_peer_ready`, or another focused wait for the milestone you need;
+- `next_wake(deadline)` for one interruptible loop that also drains capability queues;
+- `next_event(deadline)` when you own a custom dispatcher or drive several endpoints on one thread;
+- `poll()` for one non-blocking driving step inside an existing reactor.
 
 ```mermaid
 flowchart TB
-  A["Your caller-driven loop"] <-->|"poll / next_event · events"| B["Endpoint"]
+  A["Your caller-driven loop"] <-->|"wait_* / next_wake · events"| B["Endpoint"]
   B <-->|"QUIC over UDP · Noise + Yamux over TCP"| C["Network"]
 ```
 
@@ -53,7 +54,7 @@ Use `Multiaddr` when choosing where to bind. Use `PeerAddr` when dialing a speci
 
 `ConnectionEstablished` means the transport finished connecting and authenticated the peer. `PeerReady` comes later, after the first Identify exchange has supplied the peer's supported protocols and advertised addresses.
 
-Wait for `PeerReady` before opening an application stream. This avoids racing protocol-support discovery.
+`open_stream` is allowed once the peer is connected. The remote-protocol advertisement check applies only after `PeerReady`; before that, negotiation proceeds without an early `RemoteDoesNotSupport` reject. Waiting for Identify is application policy when you want the advertised protocol list first, not a stack requirement for opening a known protocol.
 
 ## Dial versus connect
 
@@ -61,7 +62,7 @@ These are separate paths with different policy:
 
 | Goal | Start with | Wait for |
 | --- | --- | --- |
-| Direct QUIC or TCP to a known address | `dial`, `dial_ip4`, or `dial_ip6` | `PeerReady` |
+| Direct QUIC or TCP to a known address | `dial`, `dial_ip4`, or `dial_ip6` | connection, then `wait_peer_ready` if you need Identify |
 | NAT-aware attempt with optional relay | `connect`, `connect_addr`, or `connect_with_addrs` | `wait_path` or `NatEvent` |
 
 The base `dial*` methods only start direct dials. The address picks QUIC or TCP. They do not reserve on a relay or perform DCUtR.

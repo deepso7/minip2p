@@ -1,6 +1,6 @@
 ---
 title: Listen and dial
-description: Bind QUIC, TCP, or both; publish dialable peer addresses; and wait for PeerReady.
+description: Bind QUIC, TCP, or both; publish dialable peer addresses; and wait with readiness-driven helpers.
 ---
 
 This guide covers direct QUIC and TCP with the base Endpoint API. QUIC is on by default; TCP needs the `tcp` Cargo feature. For relay races and hole punching, use [Traverse NAT](/rust/traverse-nat). If you have not run a local connection yet, start with [Connect two peers](/rust/connect-peers).
@@ -78,12 +78,14 @@ println!("started {} dial(s)", connection_ids.len());
 
 `dial` starts every applicable local address family. For a `/dns/...` target on a dual-stack endpoint, that can mean both IPv4 and IPv6 connection IDs. `/dns4/...` and `/dns6/...` stay single-family. Use `dial_ip4` or `dial_ip6` when policy requires one family.
 
-## Wait for PeerReady
+## Wait for connection milestones
 
 A successful dial still has two useful milestones:
 
 1. `Event::ConnectionEstablished`: the transport is up and the peer identity is authenticated.
 2. `Event::PeerReady`: the first Identify exchange has completed, so the endpoint knows which protocols the peer supports.
+
+Prefer a readiness wait over a short-poll loop:
 
 ```rust
 use std::time::Duration;
@@ -98,7 +100,7 @@ if ready.is_none() {
 }
 ```
 
-Wait for `PeerReady` before opening an application protocol stream. After Identify completes, `open_stream` can reject an unsupported protocol immediately with `minip2p::Error::Swarm(minip2p::SwarmError::RemoteDoesNotSupport { .. })`.
+`open_stream` works once the peer is connected. You do not have to wait for `PeerReady` to open a protocol you already know the remote speaks. After Identify completes, `open_stream` can reject an unsupported protocol immediately with `minip2p::Error::Swarm(minip2p::SwarmError::RemoteDoesNotSupport { .. })`. Use `wait_peer_ready` when you want that early check or the advertised protocol list.
 
 ## Inspect and disconnect
 

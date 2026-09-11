@@ -8,6 +8,7 @@ The API provides typed events, cancellable Promise operations, and `Stream` hand
 
 ```ts
 const path = await endpoint.connectAddr(remoteAddress);
+// Optional: wait for Identify when you need advertised protocols.
 await endpoint.waitPeerReady(path.peerId);
 const rttMs = await endpoint.ping(path.peerId);
 
