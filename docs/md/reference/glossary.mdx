@@ -19,9 +19,9 @@ Definitions only. For recipes, follow the linked guides.
 | **`queueOverflow`** | TypeScript event reporting that the application did not consume events quickly enough. Refresh queryable state before relying on event history. |
 | **Sans-I/O** | Deterministic protocol/orchestration state machines; sockets and clocks live in adapters. |
 | **`poll`** | One non-blocking drive step; returns currently available application events. |
-| **`next_event`** | Low-level drive until one ordinary application event or a deadline; use for custom or multi-endpoint loops. |
+| **`next_event`** | Synchronous drive until one ordinary application event or a deadline. |
 | **`next_wake`** | Interruptible drive until an application event, capability progress, interruption, or deadline. |
-| **Focused wait** | Recommended default for setup: drive until a specific result (`wait_peer_ready`, `wait_path`, `next_pubsub_event`, …) while buffering unrelated events. |
+| **Focused wait** | Drive until a specific result (`wait_peer_ready`, `wait_path`, `next_pubsub_event`, …) while buffering unrelated events. |
 | **Available vs enabled** | A Cargo feature makes a capability available; a builder method enables it on an endpoint. See [Install](/rust/install#add-an-optional-capability). |
 | **Circuit address** | `/…/p2p/<relay>/p2p-circuit/p2p/<target>` reaches a peer through a Circuit Relay v2 reservation. |
 

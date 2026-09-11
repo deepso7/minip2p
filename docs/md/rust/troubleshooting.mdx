@@ -40,7 +40,7 @@ Start from the observable symptom. Rust methods return immediate failures as `mi
 
 ## Debug in order
 
-1. Confirm that both endpoints keep calling a readiness wait (`wait_path`, `wait_peer_ready`, …), `next_wake`, `next_event`, or `poll`. Prefer readiness waits over alternating short `next_event` polls on one thread.
+1. Confirm that both endpoints keep calling a focused wait (`wait_path`, `wait_peer_ready`, …), `next_wake`, `next_event`, or `poll`. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
 2. Log the complete peer address and local peer ID.
 3. Distinguish an authenticated connection from `PeerReady` (Identify).
 4. Confirm both the Cargo feature and its builder method.

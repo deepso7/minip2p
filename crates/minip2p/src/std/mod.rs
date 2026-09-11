@@ -577,11 +577,13 @@ impl Endpoint {
 
     /// Returns the next ordinary application event, waiting until `deadline`.
     ///
-    /// Prefer focused readiness waits ([`Self::wait_peer_ready`],
-    /// [`Self::wait_path`], [`Self::wait_ping_rtt`]) or [`Self::next_wake`] for
-    /// ordinary setup. Use `next_event` when you own a custom dispatcher or
-    /// drive several endpoints on one thread. Avoid alternating fixed short
-    /// budgets such as `next_event(1ms)` across peers on a single thread.
+    /// Use focused waits such as [`Self::wait_path`] and
+    /// [`Self::wait_peer_ready`] when you need a particular milestone. Use
+    /// `next_event` for a synchronous application event loop, or
+    /// [`Self::next_wake`] when the loop also handles capability queues and
+    /// interruptions. All of these methods use transport readiness when
+    /// supported. Each call drives only this endpoint, so blocking here can
+    /// delay other endpoints that share the same thread.
     ///
     /// `deadline` accepts an [`std::time::Instant`], a relative
     /// [`std::time::Duration`], or [`Deadline::NEVER`] to wait indefinitely.
@@ -972,9 +974,9 @@ impl Endpoint {
 
     /// Waits for the first usable path of connect attempt `id`.
     ///
-    /// Recommended default after `connect*` when the application needs a
-    /// usable NAT path. Prefer this over alternating short `next_event`
-    /// polls across peers on one thread.
+    /// Use this after `connect*` when the application needs a usable NAT
+    /// path. Like [`Self::next_event`], it uses transport readiness when
+    /// supported; it drives only this endpoint.
     ///
     /// Returns `Ok(Some(path))` on [`NatEvent::PathEstablished`] (the event
     /// is consumed), and `Ok(None)` when the attempt failed or `deadline`

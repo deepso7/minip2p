@@ -9,16 +9,11 @@ An `Endpoint` is the main application API. Five ideas explain most code built on
 
 `Endpoint` owns an Ed25519 identity, the transports you bound, and the connection state. It is the app-facing entrypoint for listening, dialing, Ping, Identify, and application streams. QUIC is on by default; add the `tcp` feature to use QUIC and TCP together, or bind only TCP.
 
-An endpoint does not spawn a runtime. Prefer readiness-driven waits for ordinary setup:
-
-- `wait_path`, `wait_peer_ready`, or another focused wait for the milestone you need;
-- `next_wake(deadline)` for one interruptible loop that reports capability queue progress;
-- `next_event(deadline)` when you own a custom dispatcher or drive several endpoints on one thread;
-- `poll()` for one non-blocking driving step inside an existing reactor.
+An endpoint does not spawn a runtime. Use focused waits such as `wait_path` and `wait_peer_ready` when you need a particular milestone. Use `next_event` to handle application events, or `next_wake` when your loop also handles capability queues and interruptions. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. `poll()` is the non-blocking step for an existing reactor.
 
 ```mermaid
 flowchart TB
-  A["Your caller-driven loop"] <-->|"wait_* / next_wake · events"| B["Endpoint"]
+  A["Your caller-driven loop"] <-->|"wait_* / next_event / next_wake · events"| B["Endpoint"]
   B <-->|"QUIC over UDP · Noise + Yamux over TCP"| C["Network"]
 ```
 
