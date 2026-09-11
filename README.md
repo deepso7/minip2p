@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(event) = endpoint.next_event(Deadline::NEVER)? {
         println!("{event:?}");
         if matches!(event, Event::ConnectionEstablished { .. }) {
-            // Open streams, ping the peer, or continue polling for events.
+            // Open streams once connected; PeerReady is optional Identify info.
         }
     }
 
@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`Endpoint` is caller-driven: it owns sockets, but it does not start a runtime or background task. Event waits accept an absolute `Instant`, a relative `Duration`, or `Deadline::NEVER`.
+`Endpoint` is caller-driven: it owns sockets, but it does not start a runtime or background task. Use focused waits such as `wait_path` and `wait_peer_ready` when you need a particular milestone. Use `next_event` to handle application events, or `next_wake` when your loop also handles capability queues and interruptions. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. Event waits accept an absolute `Instant`, a relative `Duration`, or `Deadline::NEVER`.
 
 QUIC is the default. Turn on the `tcp` feature to listen on TCP as well, or TCP only. The dial address picks the transport:
 

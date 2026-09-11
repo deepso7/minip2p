@@ -497,6 +497,10 @@ impl Endpoint {
     }
 
     /// Opens an application stream after negotiating `protocol_id`.
+    ///
+    /// Allowed once the peer is connected. Identify (`PeerReady`) is not
+    /// required first; after Identify completes, an unsupported protocol can
+    /// fail early with [`SwarmError::RemoteDoesNotSupport`].
     pub fn open_stream(&mut self, peer_id: &PeerId, protocol_id: &str) -> Result<StreamId, Error> {
         self.swarm.open_stream(peer_id, protocol_id)
     }
@@ -571,7 +575,15 @@ impl Endpoint {
         }
     }
 
-    /// Returns the next event, waiting internally until `deadline`.
+    /// Returns the next ordinary application event, waiting until `deadline`.
+    ///
+    /// Use focused waits such as [`Self::wait_path`] and
+    /// [`Self::wait_peer_ready`] when you need a particular milestone. Use
+    /// `next_event` for a synchronous application event loop, or
+    /// [`Self::next_wake`] when the loop also handles capability queues and
+    /// interruptions. All of these methods use transport readiness when
+    /// supported. Each call drives only this endpoint, so blocking here can
+    /// delay other endpoints that share the same thread.
     ///
     /// `deadline` accepts an [`std::time::Instant`], a relative
     /// [`std::time::Duration`], or [`Deadline::NEVER`] to wait indefinitely.
@@ -864,7 +876,11 @@ impl Endpoint {
         }
     }
 
-    /// Waits until a peer is ready or `deadline` expires.
+    /// Waits until Identify completes for `peer_id` or `deadline` expires.
+    ///
+    /// Recommended when the application needs advertised protocols. Opening a
+    /// known application stream does not require this wait; see
+    /// [`Self::open_stream`].
     pub fn wait_peer_ready(
         &mut self,
         peer_id: &PeerId,
@@ -957,6 +973,10 @@ impl Endpoint {
     }
 
     /// Waits for the first usable path of connect attempt `id`.
+    ///
+    /// Use this after `connect*` when the application needs a usable NAT
+    /// path. Like [`Self::next_event`], it uses transport readiness when
+    /// supported; it drives only this endpoint.
     ///
     /// Returns `Ok(Some(path))` on [`NatEvent::PathEstablished`] (the event
     /// is consumed), and `Ok(None)` when the attempt failed or `deadline`

@@ -3,7 +3,7 @@ title: Register a protocol
 description: Register an application protocol, negotiate streams, exchange bytes, and close or abandon stream state on purpose.
 ---
 
-Application protocols use libp2p multistream-select negotiation over an authenticated connection. Both peers must register the same versioned protocol ID. Before opening a stream, connect the peers and wait for [`PeerReady`](/rust/concepts#connection-readiness).
+Application protocols use libp2p multistream-select negotiation over an authenticated connection. Both peers must register the same versioned protocol ID. Dial or `connect*` first; open streams once the peer is connected. Waiting for [`PeerReady`](/rust/concepts#connection-readiness) is optional when you want Identify's advertised protocols before opening.
 
 ```rust
 const ECHO_PROTOCOL: &str = "/my-app/echo/1.0.0";
@@ -23,7 +23,7 @@ You can also call `add_protocol` after binding. Registration affects inbound and
 
 ## Open an outbound stream
 
-Wait for `PeerReady`, then request a stream:
+Once the peer is connected, request a stream. The snippet below waits for Identify first so unsupported protocols fail early with `RemoteDoesNotSupport`; that wait is policy, not a stack requirement:
 
 ```rust
 use std::time::Duration;
@@ -34,7 +34,7 @@ node.wait_peer_ready(&peer_id, Duration::from_secs(10))?
 let stream_id = node.open_stream(&peer_id, ECHO_PROTOCOL)?;
 ```
 
-`open_stream` starts negotiation and returns the allocated stream ID. Wait for the matching `Event::StreamReady` before writing:
+`open_stream` starts negotiation and returns the allocated stream ID. Wait for the matching `Event::StreamReady` before writing, either in your main `next_event` / `next_wake` loop or by matching the stream event in your event dispatcher:
 
 ```rust
 loop {

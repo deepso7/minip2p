@@ -12,15 +12,16 @@ Definitions only. For recipes, follow the linked guides.
 | **PeerId** | Authenticated public-key identity of a peer. |
 | **Multiaddr** | Transport address without a peer identity (for example `/ip4/…/udp/…/quic-v1` or `/ip4/…/tcp/…`). |
 | **PeerAddr** | A `Multiaddr` plus a terminal `/p2p/<peer-id>`. Required for dialing a specific peer. |
-| **PeerReady** | Event after the first Identify exchange; safer milestone than `ConnectionEstablished` before opening app streams. |
+| **PeerReady** | Event after the first Identify exchange; supplies advertised protocols. `open_stream` is already allowed once connected. |
 | **Path** | NAT result: `DirectDialed`, `DirectPunched`, or `Relayed`. See [Traverse NAT](/rust/traverse-nat). |
 | **Stream** | A negotiated byte stream for one application protocol. Writes may be split or combined, so applications add their own framing. |
 | **`useMinip2p`** | React hook that owns an endpoint for a component and closes it during cleanup. |
 | **`queueOverflow`** | TypeScript event reporting that the application did not consume events quickly enough. Refresh queryable state before relying on event history. |
 | **Sans-I/O** | Deterministic protocol/orchestration state machines; sockets and clocks live in adapters. |
 | **`poll`** | One non-blocking drive step; returns currently available application events. |
-| **`next_event`** | Drives until one ordinary application event or a deadline. |
-| **Focused wait** | Drives until a specific result (`wait_peer_ready`, `wait_path`, `next_pubsub_event`, …) while buffering unrelated events. |
+| **`next_event`** | Synchronous drive until one ordinary application event or a deadline. |
+| **`next_wake`** | Interruptible drive until an application event, capability progress, interruption, or deadline. |
+| **Focused wait** | Drive until a specific result (`wait_peer_ready`, `wait_path`, `next_pubsub_event`, …) while buffering unrelated events. |
 | **Available vs enabled** | A Cargo feature makes a capability available; a builder method enables it on an endpoint. See [Install](/rust/install#add-an-optional-capability). |
 | **Circuit address** | `/…/p2p/<relay>/p2p-circuit/p2p/<target>` reaches a peer through a Circuit Relay v2 reservation. |
 

@@ -29,7 +29,7 @@ Available on the std `Endpoint`:
 - Direct connections: `dial`, `dial_ip4`, `dial_ip6`, `disconnect`
 - State: `peer_id`, `connected_peers`, `is_peer_ready`, `peer_info`
 - Streams: `add_protocol`, `open_stream`, `send_stream`, `close_stream_write`, `reset_stream`, `abandon_stream`
-- Driving: `poll`, `next_event`, `next_wake`, `wait_peer_ready`, `wait_ping_rtt`
+- Driving: focused waits `wait_peer_ready`, `wait_path` (nat), `wait_ping_rtt`; event loops `next_event`, `next_wake`; non-blocking `poll`
 - Shutdown: `close`
 
 Available on `EndpointBuilder` with `quic`:

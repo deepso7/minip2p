@@ -1,20 +1,21 @@
 ---
 title: Drive events
-description: Choose between poll, next_event, and focused waits without losing unrelated application events.
+description: Use focused waits for milestones, next_event for application loops, and next_wake when capability queues matter.
 ---
 
 minip2p remains caller-driven at every layer. The application chooses when to poll, how long to wait, and which event queue to consume. Read [where events go](/rust/concepts#where-events-go) first. If you are working with custom streams, also read [Register a protocol](/rust/register-a-protocol).
 
 ## Pick a driving method
 
+Use focused waits such as `wait_path` and `wait_peer_ready` when you need a particular milestone. Use `next_event` to handle application events, or `next_wake` when your loop also handles capability queues and interruptions. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
+
 | Method | Behavior | Good fit |
 | --- | --- | --- |
-| `poll()` | Performs one non-blocking drive and returns all currently available application events. | Existing game, UI, or reactor loops |
-| `next_event(deadline)` | Drives until one ordinary application event or the deadline. | Simple synchronous command loops |
-| `next_wake(deadline)` | Drives until an application event, optional-capability progress, interruption, or the deadline. | One loop handling ordinary and capability-specific events |
-| `wait_peer_ready` | Drives until one peer completes Identify. | Connection setup |
-| `wait_ping_rtt` | Drives until one peer's Ping finishes. | Health checks and measurements |
+| `wait_path` / `wait_peer_ready` / `wait_ping_rtt` | Drive until one milestone, buffering unrelated events. | Connection and setup milestones |
 | Feature-focused waits | Drive until a NAT, pubsub, signed-discovery, or mDNS result. | Feature-specific workflows |
+| `next_event(deadline)` | Drive until one ordinary application event or the deadline. | Synchronous application loops; custom dispatchers; multi-endpoint loops on one thread |
+| `next_wake(deadline)` | Drive until an application event, optional-capability progress, interruption, or the deadline. | One interruptible loop over ordinary and capability events |
+| `poll()` | One non-blocking drive; returns currently available application events. | Existing game, UI, or reactor loops |
 
 ## Deadline forms
 
@@ -32,7 +33,26 @@ let forever = Deadline::NEVER;
 
 An expired deadline still permits the endpoint to inspect events that are already synchronously available, but it will not sleep or poll repeatedly past the deadline.
 
-## Build a straightforward event loop
+## Wait for a milestone
+
+```rust
+use std::time::Duration;
+
+use minip2p::{Endpoint, Event};
+
+fn dial_and_ready(
+    node: &mut Endpoint,
+    target: &minip2p::PeerAddr,
+) -> Result<Event, Box<dyn std::error::Error>> {
+    node.dial(target)?;
+    node.wait_peer_ready(target.peer_id(), Duration::from_secs(10))?
+        .ok_or_else(|| "peer did not become ready".into())
+}
+```
+
+With the `nat` feature, prefer `connect*` plus `wait_path` for the first usable path. Use `wait_peer_ready` only when the application needs Identify's protocol list (for example early `RemoteDoesNotSupport` checks). `open_stream` is allowed once the peer is connected; Identify is not a stack gate for opening known app protocols.
+
+## Application event loops
 
 ```rust
 use minip2p::{Deadline, Endpoint, Event};

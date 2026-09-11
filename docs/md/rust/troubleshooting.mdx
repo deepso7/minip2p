@@ -12,7 +12,7 @@ Start from the observable symptom. Rust methods return immediate failures as `mi
 | `PeerAddr` fails to parse | The address lacks a terminal `/p2p/<peer-id>` | Copy the complete peer address. |
 | Dialing fails immediately | The address has the wrong shape, or its transport is unavailable | Use `/udp/<port>/quic-v1` or `/tcp/<port>` and bind that transport. |
 | A remote peer cannot dial a printed address | The address contains `0.0.0.0` or `::` | Advertise a real interface, public, or relay address. |
-| A connection exists but an application protocol cannot open | Identify has not completed | Wait for `PeerReady` before `open_stream`. |
+| A connection exists but an application protocol cannot open | Protocol unregistered, or remote rejects negotiation | Confirm matching protocol IDs and keep both peers driving. `PeerReady` is optional; it only enables early `RemoteDoesNotSupport`. |
 | `ProtocolNotRegistered` | The local endpoint never registered the protocol | Add `.protocol("/app/name/1.0.0")` or call `add_protocol`. |
 | `RemoteDoesNotSupport` | The peer does not advertise the protocol version | Register the same version on both peers. |
 | An optional capability reports "not enabled" | The Cargo feature exists, but the builder did not activate it | Add the builder method listed in the feature matrix. |
@@ -27,7 +27,7 @@ Start from the observable symptom. Rust methods return immediate failures as `mi
 
 | Event | Typical response |
 | --- | --- |
-| `Event::PeerReady` | Open application streams or record the peer as usable. |
+| `Event::PeerReady` | Record advertised protocols, or open streams if you waited for Identify first. |
 | `Event::StreamReady` | Attach the stream to its protocol handler. |
 | `Event::StreamData` | Feed the bytes into the application's decoder. |
 | `Event::StreamRemoteWriteClosed` | Finish decoding and optionally close the local write side. |
@@ -40,9 +40,9 @@ Start from the observable symptom. Rust methods return immediate failures as `mi
 
 ## Debug in order
 
-1. Confirm that both endpoints keep calling `poll`, `next_event`, `next_wake`, or a focused wait.
+1. Confirm that both endpoints keep calling a focused wait (`wait_path`, `wait_peer_ready`, …), `next_wake`, `next_event`, or `poll`. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
 2. Log the complete peer address and local peer ID.
-3. Distinguish an authenticated connection from `PeerReady`.
+3. Distinguish an authenticated connection from `PeerReady` (Identify).
 4. Confirm both the Cargo feature and its builder method.
 5. Read the event queue owned by the capability you are using.
 
