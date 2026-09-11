@@ -80,6 +80,7 @@ release_base_url="http://host.docker.internal:$(<"$work_dir/port")"
 
 docker build \
   --add-host host.docker.internal:host-gateway \
+  --file "$repository/infra/relay/Dockerfile" \
   --build-arg "MINIP2P_VERSION=$version" \
   --build-arg "MINIP2P_RELEASE_BASE_URL=$release_base_url" \
   --tag "$image" \
