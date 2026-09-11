@@ -12,7 +12,7 @@ For most applications, block on the milestone you need instead of alternating sh
 - `wait_path` for the first usable NAT path
 - `wait_peer_ready` when you need Identify's advertised protocols
 - `wait_ping_rtt` for a Ping measurement
-- `next_wake` for one interruptible loop that also drains NAT, pubsub, discovery, or relay-server queues
+- `next_wake(deadline)` for one interruptible loop that reports capability queue progress
 
 These waits sleep on transport readiness when the transport supports it. Fixed short budgets such as alternating `next_event(1ms)` across two endpoints on one thread are a measurement artifact and a poor default; they stall the ready peer and inflate connect latency on loopback.
 
