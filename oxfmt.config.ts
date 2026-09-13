@@ -10,6 +10,8 @@ export default defineConfig({
     "tmp",
     "code-ref",
     ".repos",
+    ".agents",
+    ".claude",
     "docs/.blume",
     "docs/.blume-verify",
     "bindings/ts/react-native/lib",
