@@ -20,20 +20,23 @@ One file per **concept**, not per issue. Multiple issues requesting the same thi
 
 The file should be written in a relaxed, readable style, more like a short design document than a database entry. Use paragraphs, code samples, and examples to make the reasoning clear and useful to someone encountering it for the first time.
 
-````markdown
+```markdown
 # Dark Mode
 
 This project does not support dark mode or user-facing theming.
 
 ## Why this is out of scope
 
-The rendering pipeline assumes a single color palette defined in `ThemeConfig`. Supporting multiple themes would require:
+The rendering pipeline assumes a single color palette defined in
+`ThemeConfig`. Supporting multiple themes would require:
 
 - A theme context provider wrapping the entire component tree
 - Per-component theme-aware style resolution
 - A persistence layer for user theme preferences
 
-This is a significant architectural change that doesn't align with the project's focus on content authoring. Theming is a concern for downstream consumers who embed or redistribute the output.
+This is a significant architectural change that doesn't align with the
+project's focus on content authoring. Theming is a concern for downstream
+consumers who embed or redistribute the output.
 
 ```ts
 // The current ThemeConfig interface is not designed for runtime switching:
@@ -48,7 +51,7 @@ interface ThemeConfig {
 - #42: "Add dark mode support"
 - #87: "Night theme for accessibility"
 - #134: "Dark theme option"
-````
+```
 
 ### Naming the file
 
@@ -80,7 +83,7 @@ The maintainer may:
 
 ## When to write to `.out-of-scope/`
 
-Only when an **enhancement** (not a bug) is _rejected_ as `wontfix`. This applies to enhancement PRs exactly as it does to issues: a rejected PR is recorded here so the same request doesn't return as fresh code.
+Only when an **enhancement** (not a bug) is *rejected* as `wontfix`. This applies to enhancement PRs exactly as it does to issues: a rejected PR is recorded here so the same request doesn't return as fresh code.
 
 Do **not** write here when something is closed as `wontfix` because it's **already implemented**. That's a built feature, not a rejected one; recording it would poison the dedup checks with false rejections. Instead, the closing comment points to where the feature already lives.
 
