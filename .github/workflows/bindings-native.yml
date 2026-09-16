@@ -52,7 +52,8 @@ jobs:
           toolchain: "1.91"
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: pnpm --workspace-root install --frozen-lockfile
+      - shell: bash
+        run: pnpm --workspace-root install --frozen-lockfile
       - name: Build addon
         shell: bash
         run: pnpm --filter @minip2p/node native:build:target --target ${{ matrix.target }} -- --locked
@@ -145,6 +146,8 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
       - name: Install Android SDK 36 and NDK r28c
         run: |
           sdkmanager \

@@ -4,12 +4,17 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to resume; leave blank for validation only
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.release.tag_name || github.sha }}
+  group: release-${{ github.event.release.tag_name || inputs.release_tag || github.sha }}
   cancel-in-progress: false
 
 # Every rust-cache below runs with `save-if: false`. These jobs check out a tag,
@@ -31,7 +36,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.release.tag_name || github.sha }}
+          ref: ${{ github.event.release.tag_name || inputs.release_tag || github.sha }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -40,13 +45,15 @@ jobs:
       - name: Verify release tag and package versions
         id: release
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name || github.sha }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || github.sha }}
           EVENT_NAME: ${{ github.event_name }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
           metadata="$(cargo metadata --no-deps --format-version 1)"
           version="$(jq -r '.packages[] | select(.name == "minip2p-rs") | .version' <<<"$metadata")"
-          if [[ "$EVENT_NAME" == "release" && "$RELEASE_TAG" != "v$version" ]]; then
+          if [[ "$EVENT_NAME" == "release" || -n "$INPUT_RELEASE_TAG" ]] &&
+            [[ "$RELEASE_TAG" != "v$version" ]]; then
             echo "::error::Release tag $RELEASE_TAG does not match workspace version $version (expected v$version)"
             exit 1
           fi
@@ -135,7 +142,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name || github.sha }}
+          ref: ${{ github.event.release.tag_name || inputs.release_tag || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.91"
@@ -179,7 +186,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.release.tag_name || github.sha }}
+          ref: ${{ github.event.release.tag_name || inputs.release_tag || github.sha }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -193,7 +200,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: false
-      - run: pnpm --workspace-root install --frozen-lockfile
+      - shell: bash
+        run: pnpm --workspace-root install --frozen-lockfile
       - name: Build addon
         shell: bash
         run: pnpm --filter @minip2p/node native:build:target --target ${{ matrix.target }} -- --locked
@@ -221,7 +229,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.release.tag_name || github.sha }}
+          ref: ${{ github.event.release.tag_name || inputs.release_tag || github.sha }}
       - name: Build addon
         env:
           NAPI_BUILD_IMAGE: ghcr.io/napi-rs/napi-rs/nodejs-rust@sha256:caac2d1b9194eada0c69e669e72763869701351d8957ab805cc45a43999d8be2
@@ -276,7 +284,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.release.tag_name || github.sha }}
+          ref: ${{ github.event.release.tag_name || inputs.release_tag || github.sha }}
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.91"
@@ -318,7 +326,7 @@ jobs:
 
   publish-relay-server-binaries:
     name: Publish relay server binaries
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || inputs.release_tag != ''
     needs: [verify-release, relay-server-binaries]
     runs-on: ubuntu-latest
     permissions:
@@ -332,7 +340,7 @@ jobs:
       - name: Attach binaries and checksums to GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name || github.sha }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || github.sha }}
         working-directory: ${{ runner.temp }}/relay-release
         run: |
           set -euo pipefail
@@ -349,7 +357,7 @@ jobs:
 
   publish-relay-container:
     name: Publish relay container
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || inputs.release_tag != ''
     needs: [verify-release, publish-relay-server-binaries]
     permissions:
       contents: read
@@ -369,7 +377,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name || github.sha }}
+          ref: ${{ github.event.release.tag_name || inputs.release_tag || github.sha }}
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -381,6 +389,8 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
       - name: Install Android SDK 36 and NDK r28c
         run: |
           sdkmanager \
@@ -438,7 +448,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name || github.sha }}
+          ref: ${{ github.event.release.tag_name || inputs.release_tag || github.sha }}
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -486,7 +496,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.release.tag_name || github.sha }}
+          ref: ${{ github.event.release.tag_name || inputs.release_tag || github.sha }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -494,6 +504,8 @@ jobs:
         with:
           version: ${{ env.PNPM_VERSION }}
       - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+        with:
+          packages: platform-tools
       - name: Install Android NDK r28c for package validation
         run: |
           sdkmanager "ndk;28.2.13676358"
@@ -588,7 +600,7 @@ jobs:
 
   publish-crates:
     name: Publish to crates.io
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || inputs.release_tag != ''
     needs: [verify-release, test-rust, package-typescript]
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -599,7 +611,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.release.tag_name || github.sha }}
+          ref: ${{ github.event.release.tag_name || inputs.release_tag || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.91"
@@ -697,7 +709,7 @@ jobs:
 
   publish-node-platforms:
     name: Publish Node platform packages
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || inputs.release_tag != ''
     needs: [verify-release, package-typescript]
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -711,7 +723,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.release.tag_name || github.sha }}
+          ref: ${{ github.event.release.tag_name || inputs.release_tag || github.sha }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: ${{ env.NODE_VERSION }}
@@ -732,7 +744,7 @@ jobs:
 
   publish-typescript:
     name: Publish to npm
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || inputs.release_tag != ''
     needs: [verify-release, publish-crates, publish-node-platforms]
     runs-on: ubuntu-latest
     timeout-minutes: 20

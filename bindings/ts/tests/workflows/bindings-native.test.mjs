@@ -47,6 +47,13 @@ test("weekly workflow executes the suite on native runners and musl containers",
     "x86_64-pc-windows-msvc": "windows-latest",
     "x86_64-unknown-linux-gnu": "ubuntu-24.04",
   });
+  assert.ok(
+    nativeJob.steps.some(
+      ({ run, shell }) =>
+        shell === "bash" &&
+        run === "pnpm --workspace-root install --frozen-lockfile"
+    )
+  );
   assert.ok(nativeJob.steps.some(({ name }) => name === "Build relay fixture"));
   assert.ok(
     nativeJob.steps.some(
@@ -66,6 +73,14 @@ test("weekly workflow executes the suite on native runners and musl containers",
     /cargo build --release --locked -p minip2p-relay-server-example/u
   );
   assert.match(muslBuild, /pnpm --filter @minip2p\/node exec vitest run/u);
+});
+
+test("weekly Android setup does not request the removed tools package", () => {
+  const setupAndroid = workflow.jobs.android.steps.find(({ uses }) =>
+    uses?.startsWith("android-actions/setup-android@")
+  );
+
+  assert.equal(setupAndroid.with.packages, "platform-tools");
 });
 
 test("weekly Node jobs pin actions to immutable commits", () => {

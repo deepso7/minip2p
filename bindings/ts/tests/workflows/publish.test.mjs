@@ -31,6 +31,45 @@ test("generated-file validation ignores downloaded Node artifacts", () => {
   assert.match(generatedStep.run, /git status --porcelain -- react-native/u);
 });
 
+test("release native setup is portable across Windows and Android", () => {
+  const install = workflow.jobs["node-native"].steps.find(
+    ({ run }) => run === "pnpm --workspace-root install --frozen-lockfile"
+  );
+  assert.equal(install.shell, "bash");
+
+  const androidSetups = Object.values(workflow.jobs).flatMap(({ steps = [] }) =>
+    steps.filter(({ uses }) =>
+      uses?.startsWith("android-actions/setup-android@")
+    )
+  );
+  assert.ok(androidSetups.length > 0);
+  for (const setupAndroid of androidSetups) {
+    assert.equal(setupAndroid.with.packages, "platform-tools");
+  }
+});
+
+test("a failed tagged release can be resumed without moving its tag", () => {
+  const releaseTag = workflow.on.workflow_dispatch.inputs.release_tag;
+  assert.equal(releaseTag.required, false);
+  assert.equal(releaseTag.type, "string");
+
+  const publishJobs = [
+    "publish-relay-server-binaries",
+    "publish-relay-container",
+    "publish-crates",
+    "publish-node-platforms",
+    "publish-typescript",
+  ];
+  for (const jobName of publishJobs) {
+    assert.match(workflow.jobs[jobName].if, /inputs\.release_tag != ''/u);
+  }
+
+  const checkout = workflow.jobs["verify-release"].steps.find(({ uses }) =>
+    uses?.startsWith("actions/checkout@")
+  );
+  assert.match(checkout.with.ref, /inputs\.release_tag/u);
+});
+
 test("Node platform packages carry npm provenance repository metadata", async () => {
   await Promise.all(
     nodePlatforms.map(async (platform) => {
