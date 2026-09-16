@@ -32,10 +32,18 @@ test("generated-file validation ignores downloaded Node artifacts", () => {
 });
 
 test("release native setup is portable across Windows and Android", () => {
+  const nativeSteps = workflow.jobs["node-native"].steps;
   const install = workflow.jobs["node-native"].steps.find(
     ({ run }) => run === "pnpm --workspace-root install --frozen-lockfile"
   );
   assert.equal(install.shell, "bash");
+
+  const normalizePatches = nativeSteps.find(
+    ({ name }) => name === "Normalize pnpm patches on Windows"
+  );
+  assert.equal(normalizePatches.if, "runner.os == 'Windows'");
+  assert.equal(normalizePatches.shell, "bash");
+  assert.match(normalizePatches.run, /react-native\/patches\/\*\.patch/u);
 
   const androidSetups = Object.values(workflow.jobs).flatMap(({ steps = [] }) =>
     steps.filter(({ uses }) =>

@@ -52,6 +52,10 @@ jobs:
           toolchain: "1.91"
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Normalize pnpm patches on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: sed -i 's/\r$//' react-native/patches/*.patch
       - shell: bash
         run: pnpm --workspace-root install --frozen-lockfile
       - name: Build addon

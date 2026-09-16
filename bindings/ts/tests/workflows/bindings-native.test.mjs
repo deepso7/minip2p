@@ -83,6 +83,16 @@ test("weekly Android setup does not request the removed tools package", () => {
   assert.equal(setupAndroid.with.packages, "platform-tools");
 });
 
+test("weekly Windows setup keeps pnpm patches on LF line endings", () => {
+  const normalizePatches = workflow.jobs["node-native"].steps.find(
+    ({ name }) => name === "Normalize pnpm patches on Windows"
+  );
+
+  assert.equal(normalizePatches.if, "runner.os == 'Windows'");
+  assert.equal(normalizePatches.shell, "bash");
+  assert.match(normalizePatches.run, /react-native\/patches\/\*\.patch/u);
+});
+
 test("weekly Node jobs pin actions to immutable commits", () => {
   for (const jobName of ["node-native", "node-musl"]) {
     const actions = workflow.jobs[jobName].steps
