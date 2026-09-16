@@ -12,69 +12,17 @@ clean:
 check:
     cargo check --workspace --all-targets
     cargo check --manifest-path fuzz/Cargo.toml --all-targets
-    cargo check -p minip2p-rs
-    cargo check -p minip2p-rs --features nat
-    cargo check -p minip2p-rs --features pubsub
-    cargo check -p minip2p-rs --features nat,pubsub
-    cargo check -p minip2p-rs --features relay-server
-    cargo check -p minip2p-rs --features nat,relay-server
-    cargo check -p minip2p-rs --features nat,relay-server,tcp
-    cargo check -p minip2p-rs --no-default-features --features std,tcp,relay-server
-    cargo check -p minip2p-rs --features discovery
-    cargo check -p minip2p-rs --features mdns
-    cargo check -p minip2p-rs --features discovery,mdns
-    cargo check -p minip2p-rs --features tcp
-    cargo check -p minip2p-rs --no-default-features --features std,tcp
-    cargo check -p minip2p-rs --no-default-features --features smoltcp
-    cargo check -p minip2p-rs --no-default-features --features smoltcp,pubsub
-    cargo check -p minip2p-rs --no-default-features --features portable-autonat
-    cargo check -p minip2p-rs --no-default-features --features portable-relay
-    cargo check -p minip2p-rs --features discovery,mdns,tcp
-    cargo check -p minip2p-tcp --features smoltcp --all-targets
-    cargo check -p minip2p-mdns --features smoltcp --all-targets
+    scripts/run-feature-matrix.sh check
 
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
-    cargo clippy -p minip2p-rs --features discovery --all-targets -- -D warnings
-    cargo clippy -p minip2p-rs --features mdns --all-targets -- -D warnings
-    cargo clippy -p minip2p-rs --features discovery,mdns --all-targets -- -D warnings
-    cargo clippy -p minip2p-rs --features relay-server --all-targets -- -D warnings
-    cargo clippy -p minip2p-rs --features nat,relay-server --all-targets -- -D warnings
-    cargo clippy -p minip2p-rs --features nat,relay-server,tcp --all-targets -- -D warnings
-    cargo clippy -p minip2p-rs --no-default-features --features std,tcp,relay-server --all-targets -- -D warnings
-    cargo clippy -p minip2p-rs --features tcp --all-targets -- -D warnings
-    cargo clippy -p minip2p-rs --no-default-features --features std,tcp --all-targets -- -D warnings
-    cargo clippy -p minip2p-rs --no-default-features --features smoltcp --all-targets -- -D warnings
-    cargo clippy -p minip2p-rs --no-default-features --features smoltcp,pubsub --all-targets -- -D warnings
-    cargo clippy -p minip2p-rs --no-default-features --features portable-autonat --all-targets -- -D warnings
-    cargo clippy -p minip2p-rs --no-default-features --features portable-relay --all-targets -- -D warnings
-    cargo clippy -p minip2p-rs --features discovery,mdns,tcp --all-targets -- -D warnings
-    cargo clippy -p minip2p-tcp --features smoltcp --all-targets -- -D warnings
-    cargo clippy -p minip2p-mdns --features smoltcp --all-targets -- -D warnings
+    scripts/run-feature-matrix.sh clippy
     cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
 # Mirrors CI's `test` job. Needs cargo-nextest: https://get.nexte.st
 test:
     cargo nextest run --workspace
-    cargo nextest run --profile variants -p minip2p-rs --features nat
-    cargo nextest run --profile variants -p minip2p-rs --features pubsub
-    cargo nextest run --profile variants -p minip2p-rs --features nat,pubsub
-    cargo nextest run --profile variants -p minip2p-rs --features discovery
-    cargo nextest run --profile variants -p minip2p-rs --features mdns
-    cargo nextest run --profile variants -p minip2p-rs --features discovery,mdns
-    cargo nextest run --profile variants -p minip2p-rs --features relay-server
-    cargo nextest run --profile variants -p minip2p-rs --features nat,relay-server
-    cargo nextest run --profile variants -p minip2p-rs --features nat,relay-server,tcp
-    cargo nextest run --profile variants -p minip2p-rs --no-default-features --features std,tcp,relay-server
-    cargo nextest run --profile variants -p minip2p-rs --features tcp
-    cargo nextest run --profile variants -p minip2p-rs --no-default-features --features std,tcp
-    cargo nextest run --profile variants -p minip2p-rs --features discovery,mdns,tcp
-    cargo nextest run --profile variants -p minip2p-rs --no-default-features --features smoltcp
-    cargo nextest run --profile variants -p minip2p-rs --no-default-features --features smoltcp,pubsub
-    cargo nextest run --profile variants -p minip2p-rs --no-default-features --features portable-autonat
-    cargo nextest run --profile variants -p minip2p-rs --no-default-features --features portable-relay
-    cargo nextest run --profile variants -p minip2p-tcp --features smoltcp
-    cargo nextest run --profile variants -p minip2p-mdns --features smoltcp
+    scripts/run-feature-matrix.sh test
     # nextest does not run doctests, and --workspace --doc is default-features
     # only, so feature-gated doctests need their own line.
     cargo test --workspace --doc
