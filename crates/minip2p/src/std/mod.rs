@@ -117,7 +117,7 @@ pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet
 #[cfg(feature = "pubsub")]
 pub use pubsub::PubsubError;
 
-const DEFAULT_AGENT_VERSION: &str = "minip2p/0.1.0";
+const DEFAULT_AGENT_VERSION: &str = concat!("minip2p/", env!("CARGO_PKG_VERSION"));
 #[cfg(feature = "relay-server")]
 const RELAY_HOP_PROTOCOL_ID: &str = "/libp2p/circuit/relay/0.2.0/hop";
 #[cfg(feature = "relay-server")]
@@ -2505,6 +2505,15 @@ fn concrete_relay_listener_addrs(addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
                 && !matches!(address.iter().next(), Some(Protocol::Ip6(ip)) if *ip == [0; 16])
         })
         .collect()
+}
+
+#[cfg(test)]
+#[test]
+fn default_agent_version_matches_package_version() {
+    assert_eq!(
+        EndpointBuilder::default().agent_version,
+        format!("minip2p/{}", env!("CARGO_PKG_VERSION"))
+    );
 }
 
 #[cfg(all(test, feature = "quic"))]
