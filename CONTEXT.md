@@ -28,6 +28,18 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 ### NAT traversal
 
+**Connection attempt**: One application-level effort to reach a peer. It may start several Transport dials, establish a Relayed path, and later upgrade that path, but it has one identity and one cancellation lifecycle. _Avoid_: dial
+
+**Transport dial**: One mechanism-level attempt to establish a transport connection to one peer address. Several Transport dials may belong to one Connection attempt. _Avoid_: connection attempt
+
+**Connect ID**: The endpoint-local identity of a Connection attempt. It remains the same across candidate Transport dials, relay fallback, and direct-path upgrades.
+
+**Connection target**: What an application supplies to start a Connection attempt: a peer ID, one complete peer address, or a non-empty set of complete peer addresses that all name the same peer. Each address retains its transport shape and peer ID so it can be copied as advertised.
+
+**Endpoint event stream**: The endpoint's single public, ordered source of connection, protocol, discovery, and diagnostic events. Applications correlate events with operation IDs and build selective waits above this stream; the endpoint does not expose competing focused queues or waits.
+
+**State snapshot**: The endpoint's authoritative view of durable current state, such as active connections, selected paths, known peer addresses, and listener addresses. Events announce transitions; applications query a State snapshot to recover or answer what is true now.
+
 **Circuit**: The hop/stop bridged byte pipe through a Circuit Relay v2 hop, before Noise and Yamux have turned it into a Relayed path. _Avoid_: connection (until that upgrade finishes)
 
 **Relayed path**: A swarm connection whose transport is a circuit. Identify, ping, and application streams use it like any other connection. _Avoid_: fallback connection
