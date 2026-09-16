@@ -86,24 +86,7 @@ jobs:
       - run: cargo check -p minip2p-rs --features nat,relay-server,tcp
       - run: cargo check -p minip2p-rs --no-default-features --features std,tcp,relay-server
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-rs --features nat --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-rs --features nat,pubsub --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-rs --features discovery --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-rs --features mdns --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-rs --features discovery,mdns --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-rs --features relay-server --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-rs --features nat,relay-server --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-rs --features nat,relay-server,tcp --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-rs --no-default-features --features std,tcp,relay-server --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-rs --features tcp --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-rs --no-default-features --features std,tcp --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-rs --no-default-features --features smoltcp --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-rs --no-default-features --features smoltcp,pubsub --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-rs --no-default-features --features portable-autonat --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-rs --no-default-features --features portable-relay --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-rs --features discovery,mdns,tcp --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-tcp --features smoltcp --all-targets -- -D warnings
-      - run: cargo clippy -p minip2p-mdns --features smoltcp --all-targets -- -D warnings
+      - run: scripts/run-feature-matrix.sh clippy
       - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
       - run: cargo check --no-default-features --target thumbv7em-none-eabi -p minip2p-core -p minip2p-platform -p minip2p-identity -p minip2p-transport -p minip2p-tls -p minip2p-noise -p minip2p-yamux -p minip2p-secure-mux -p minip2p-smoltcp -p minip2p-tcp -p minip2p-circuit -p minip2p-identify -p minip2p-multistream-select -p minip2p-ping -p minip2p-pubsub -p minip2p-discovery -p minip2p-mdns -p minip2p-relay -p minip2p-relay-server -p minip2p-autonat -p minip2p-dcutr -p minip2p-swarm -p minip2p-nat -p minip2p-rs
       - run: cargo check --no-default-features --features smoltcp --target thumbv7em-none-eabi -p minip2p-tcp -p minip2p-mdns -p minip2p-rs
@@ -141,25 +124,7 @@ jobs:
       - name: Install cargo-nextest
         run: curl -sSLf "https://get.nexte.st/$NEXTEST_VERSION/linux" | tar zxf - -C "$HOME/.cargo/bin"
       - run: cargo nextest run --workspace
-      - run: cargo nextest run --profile variants -p minip2p-rs --features nat
-      - run: cargo nextest run --profile variants -p minip2p-rs --features pubsub
-      - run: cargo nextest run --profile variants -p minip2p-rs --features nat,pubsub
-      - run: cargo nextest run --profile variants -p minip2p-rs --features discovery
-      - run: cargo nextest run --profile variants -p minip2p-rs --features mdns
-      - run: cargo nextest run --profile variants -p minip2p-rs --features discovery,mdns
-      - run: cargo nextest run --profile variants -p minip2p-rs --features relay-server
-      - run: cargo nextest run --profile variants -p minip2p-rs --features nat,relay-server
-      - run: cargo nextest run --profile variants -p minip2p-rs --features nat,relay-server,tcp
-      - run: cargo nextest run --profile variants -p minip2p-rs --no-default-features --features std,tcp,relay-server
-      - run: cargo nextest run --profile variants -p minip2p-rs --features tcp
-      - run: cargo nextest run --profile variants -p minip2p-rs --no-default-features --features std,tcp
-      - run: cargo nextest run --profile variants -p minip2p-rs --features discovery,mdns,tcp
-      - run: cargo nextest run --profile variants -p minip2p-rs --no-default-features --features smoltcp
-      - run: cargo nextest run --profile variants -p minip2p-rs --no-default-features --features smoltcp,pubsub
-      - run: cargo nextest run --profile variants -p minip2p-rs --no-default-features --features portable-autonat
-      - run: cargo nextest run --profile variants -p minip2p-rs --no-default-features --features portable-relay
-      - run: cargo nextest run --profile variants -p minip2p-tcp --features smoltcp
-      - run: cargo nextest run --profile variants -p minip2p-mdns --features smoltcp
+      - run: scripts/run-feature-matrix.sh test
       # nextest does not run doctests, and `--workspace --doc` only builds
       # default features, so a doctest behind a feature gate needs its own line
       # here. Today that is just SmoltcpTcpProvider; add a line when there are
