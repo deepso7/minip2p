@@ -1,7 +1,10 @@
 //! Protobuf encoding and decoding for Circuit Relay v2 messages.
 //!
-//! Implements the wire format from
-//! <https://github.com/libp2p/specs/blob/master/relay/circuit-v2.md>:
+//! Message layouts follow
+//! <https://github.com/libp2p/specs/blob/master/relay/circuit-v2.md>.
+//! Field framing uses the shared protobuf vocabulary in [`minip2p_core`];
+//! this module keeps relay-specific message types, semantic checks, and
+//! contextual [`RelayMessageError`] values.
 //!
 //! ```text
 //! message HopMessage {
@@ -27,7 +30,10 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{VarintError, read_uvarint, write_uvarint};
+use minip2p_core::{
+    WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field, encode_nested_field, encode_varint_field,
+    read_len_delimited, read_tag, read_varint_value, skip_field,
+};
 use thiserror::Error;
 
 use crate::MAX_MESSAGE_SIZE;
@@ -196,171 +202,20 @@ pub struct StopMessage {
 // ---------------------------------------------------------------------------
 
 /// Errors that can occur while decoding relay messages.
+///
+/// Shared framing failures are wrapped as [`Self::Wire`] so callers retain
+/// relay context while reusing the core protobuf vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum RelayMessageError {
-    /// A varint could not be decoded.
-    #[error("varint error: {0}")]
-    Varint(#[from] VarintError),
-    /// A length-delimited field extends beyond the message boundary.
-    #[error("field at offset {offset} claims length {length} but only {remaining} bytes remain")]
-    FieldOverflow {
-        offset: usize,
-        length: usize,
-        remaining: usize,
-    },
-    /// An unknown wire type was encountered and cannot be safely skipped.
-    #[error("unsupported wire type {wire_type} at offset {offset}")]
-    UnsupportedWireType { wire_type: u8, offset: usize },
+    /// A shared protobuf framing failure.
+    #[error(transparent)]
+    Wire(#[from] WireError),
     /// The top-level `type` field was missing.
     #[error("required `type` field missing")]
     MissingType,
     /// The top-level `type` field had an unrecognized value.
     #[error("invalid message type value: {value}")]
     InvalidMessageType { value: u64 },
-}
-
-// ---------------------------------------------------------------------------
-// Protobuf helpers
-// ---------------------------------------------------------------------------
-
-/// Computes the tag byte for (field_number, wire_type).
-///
-/// Only handles field numbers < 16 (single-byte tags), which covers everything
-/// in the relay v2 spec.
-const fn tag_byte(field: u8, wire_type: u8) -> u8 {
-    (field << 3) | wire_type
-}
-
-const WIRE_VARINT: u8 = 0;
-const WIRE_I64: u8 = 1;
-const WIRE_LEN: u8 = 2;
-const WIRE_I32: u8 = 5;
-
-/// Writes a `(tag, varint_value)` field.
-fn encode_varint_field(out: &mut Vec<u8>, tag: u8, value: u64) {
-    out.push(tag);
-    write_uvarint(value, out);
-}
-
-/// Writes a `(tag, length, bytes)` field.
-fn encode_bytes_field(out: &mut Vec<u8>, tag: u8, data: &[u8]) {
-    out.push(tag);
-    write_uvarint(data.len() as u64, out);
-    out.extend_from_slice(data);
-}
-
-/// Writes a `(tag, length, nested_message)` field.
-fn encode_nested_field(out: &mut Vec<u8>, tag: u8, nested: &[u8]) {
-    encode_bytes_field(out, tag, nested);
-}
-
-/// Reads the next (tag, wire_type) pair from the buffer.
-///
-/// Returns `Ok(None)` when the buffer is exhausted.
-fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, RelayMessageError> {
-    if *idx >= input.len() {
-        return Ok(None);
-    }
-    let (tag_value, used) = read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
-    advance(input, idx, used)?;
-    let wire_type = (tag_value & 0x07) as u8;
-    let field_number = tag_value >> 3;
-    Ok(Some((field_number, wire_type)))
-}
-
-/// Reads a length-delimited value, advancing `idx` past the length and bytes.
-fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], RelayMessageError> {
-    let (length, used) = read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
-    advance(input, idx, used)?;
-    #[expect(
-        clippy::map_err_ignore,
-        reason = "wire lengths wider than usize are reported as varint overflow"
-    )]
-    let length = usize::try_from(length).map_err(|_| VarintError::Overflow)?;
-    let remaining = input.len().saturating_sub(*idx);
-    if length > remaining {
-        return Err(RelayMessageError::FieldOverflow {
-            offset: *idx,
-            length,
-            remaining,
-        });
-    }
-    let end = idx
-        .checked_add(length)
-        .ok_or(RelayMessageError::FieldOverflow {
-            offset: *idx,
-            length,
-            remaining,
-        })?;
-    let value = input
-        .get(*idx..end)
-        .ok_or(RelayMessageError::FieldOverflow {
-            offset: *idx,
-            length,
-            remaining,
-        })?;
-    *idx = end;
-    Ok(value)
-}
-
-/// Reads a varint field value.
-fn read_varint_value(input: &[u8], idx: &mut usize) -> Result<u64, RelayMessageError> {
-    let (value, used) = read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
-    advance(input, idx, used)?;
-    Ok(value)
-}
-
-/// Skips over an unknown field based on its wire type.
-fn skip_unknown_field(
-    input: &[u8],
-    idx: &mut usize,
-    wire_type: u8,
-) -> Result<(), RelayMessageError> {
-    match wire_type {
-        WIRE_VARINT => {
-            let (_, used) = read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
-            advance(input, idx, used)
-        }
-        WIRE_LEN => {
-            let (length, used) =
-                read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
-            advance(input, idx, used)?;
-            #[expect(
-                clippy::map_err_ignore,
-                reason = "wire lengths wider than usize are reported as varint overflow"
-            )]
-            let length = usize::try_from(length).map_err(|_| VarintError::Overflow)?;
-            let remaining = input.len().saturating_sub(*idx);
-            if length > remaining {
-                return Err(RelayMessageError::FieldOverflow {
-                    offset: *idx,
-                    length,
-                    remaining,
-                });
-            }
-            advance(input, idx, length)
-        }
-        WIRE_I32 => advance(input, idx, 4),
-        WIRE_I64 => advance(input, idx, 8),
-        _ => Err(RelayMessageError::UnsupportedWireType {
-            wire_type,
-            offset: *idx,
-        }),
-    }
-}
-
-fn advance(input: &[u8], idx: &mut usize, length: usize) -> Result<(), RelayMessageError> {
-    let remaining = input.len().saturating_sub(*idx);
-    let end = idx
-        .checked_add(length)
-        .filter(|end| *end <= input.len())
-        .ok_or(RelayMessageError::FieldOverflow {
-            offset: *idx,
-            length,
-            remaining,
-        })?;
-    *idx = end;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -388,10 +243,10 @@ impl Peer {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         if !self.id.is_empty() {
-            encode_bytes_field(&mut out, tag_byte(1, WIRE_LEN), &self.id);
+            encode_bytes_field(&mut out, 1, &self.id);
         }
         for addr in &self.addrs {
-            encode_bytes_field(&mut out, tag_byte(2, WIRE_LEN), addr);
+            encode_bytes_field(&mut out, 2, addr);
         }
         out
     }
@@ -409,7 +264,7 @@ impl Peer {
                     msg.addrs
                         .push(read_len_delimited(input, &mut idx)?.to_vec());
                 }
-                _ => skip_unknown_field(input, &mut idx, wire_type)?,
+                _ => skip_field(input, &mut idx, wire_type)?,
             }
         }
         Ok(msg)
@@ -425,13 +280,13 @@ impl Reservation {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         if let Some(expire) = self.expire {
-            encode_varint_field(&mut out, tag_byte(1, WIRE_VARINT), expire);
+            encode_varint_field(&mut out, 1, expire);
         }
         for addr in &self.addrs {
-            encode_bytes_field(&mut out, tag_byte(2, WIRE_LEN), addr);
+            encode_bytes_field(&mut out, 2, addr);
         }
         if let Some(ref voucher) = self.voucher {
-            encode_bytes_field(&mut out, tag_byte(3, WIRE_LEN), voucher);
+            encode_bytes_field(&mut out, 3, voucher);
         }
         out
     }
@@ -452,7 +307,7 @@ impl Reservation {
                 (3, WIRE_LEN) => {
                     msg.voucher = Some(read_len_delimited(input, &mut idx)?.to_vec());
                 }
-                _ => skip_unknown_field(input, &mut idx, wire_type)?,
+                _ => skip_field(input, &mut idx, wire_type)?,
             }
         }
         Ok(msg)
@@ -468,10 +323,10 @@ impl Limit {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         if let Some(duration) = self.duration {
-            encode_varint_field(&mut out, tag_byte(1, WIRE_VARINT), duration as u64);
+            encode_varint_field(&mut out, 1, duration as u64);
         }
         if let Some(data) = self.data {
-            encode_varint_field(&mut out, tag_byte(2, WIRE_VARINT), data);
+            encode_varint_field(&mut out, 2, data);
         }
         out
     }
@@ -488,7 +343,7 @@ impl Limit {
                 (2, WIRE_VARINT) => {
                     msg.data = Some(read_varint_value(input, &mut idx)?);
                 }
-                _ => skip_unknown_field(input, &mut idx, wire_type)?,
+                _ => skip_field(input, &mut idx, wire_type)?,
             }
         }
         Ok(msg)
@@ -503,22 +358,22 @@ impl HopMessage {
     /// Encodes the HopMessage body (without length prefix).
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        encode_varint_field(&mut out, tag_byte(1, WIRE_VARINT), self.kind as u64);
+        encode_varint_field(&mut out, 1, self.kind as u64);
 
         if let Some(ref peer) = self.peer {
             let nested = peer.encode();
-            encode_nested_field(&mut out, tag_byte(2, WIRE_LEN), &nested);
+            encode_nested_field(&mut out, 2, &nested);
         }
         if let Some(ref reservation) = self.reservation {
             let nested = reservation.encode();
-            encode_nested_field(&mut out, tag_byte(3, WIRE_LEN), &nested);
+            encode_nested_field(&mut out, 3, &nested);
         }
         if let Some(ref limit) = self.limit {
             let nested = limit.encode();
-            encode_nested_field(&mut out, tag_byte(4, WIRE_LEN), &nested);
+            encode_nested_field(&mut out, 4, &nested);
         }
         if let Some(status) = self.status {
-            encode_varint_field(&mut out, tag_byte(5, WIRE_VARINT), status.to_u64());
+            encode_varint_field(&mut out, 5, status.to_u64());
         }
         out
     }
@@ -557,7 +412,7 @@ impl HopMessage {
                     let value = read_varint_value(input, &mut idx)?;
                     status = Some(Status::from_u64(value));
                 }
-                _ => skip_unknown_field(input, &mut idx, wire_type)?,
+                _ => skip_field(input, &mut idx, wire_type)?,
             }
         }
 
@@ -579,18 +434,18 @@ impl StopMessage {
     /// Encodes the StopMessage body (without length prefix).
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        encode_varint_field(&mut out, tag_byte(1, WIRE_VARINT), self.kind as u64);
+        encode_varint_field(&mut out, 1, self.kind as u64);
 
         if let Some(ref peer) = self.peer {
             let nested = peer.encode();
-            encode_nested_field(&mut out, tag_byte(2, WIRE_LEN), &nested);
+            encode_nested_field(&mut out, 2, &nested);
         }
         if let Some(ref limit) = self.limit {
             let nested = limit.encode();
-            encode_nested_field(&mut out, tag_byte(3, WIRE_LEN), &nested);
+            encode_nested_field(&mut out, 3, &nested);
         }
         if let Some(status) = self.status {
-            encode_varint_field(&mut out, tag_byte(4, WIRE_VARINT), status.to_u64());
+            encode_varint_field(&mut out, 4, status.to_u64());
         }
         out
     }
@@ -624,7 +479,7 @@ impl StopMessage {
                     let value = read_varint_value(input, &mut idx)?;
                     status = Some(Status::from_u64(value));
                 }
-                _ => skip_unknown_field(input, &mut idx, wire_type)?,
+                _ => skip_field(input, &mut idx, wire_type)?,
             }
         }
 
@@ -672,6 +527,7 @@ pub(crate) fn describe_status(status: Status) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minip2p_core::write_uvarint;
 
     #[test]
     fn hop_message_reserve_round_trip() {
@@ -761,7 +617,7 @@ mod tests {
     fn hop_message_missing_type_fails() {
         // Encode only a peer field with no type.
         let mut buf = Vec::new();
-        encode_nested_field(&mut buf, tag_byte(2, WIRE_LEN), &Peer::default().encode());
+        encode_nested_field(&mut buf, 2, &Peer::default().encode());
 
         let err = HopMessage::decode(&buf).unwrap_err();
         assert!(matches!(err, RelayMessageError::MissingType));
@@ -771,7 +627,7 @@ mod tests {
     fn hop_message_invalid_type_fails() {
         // Encode type=99 (invalid).
         let mut buf = Vec::new();
-        encode_varint_field(&mut buf, tag_byte(1, WIRE_VARINT), 99);
+        encode_varint_field(&mut buf, 1, 99);
 
         let err = HopMessage::decode(&buf).unwrap_err();
         assert!(matches!(
@@ -781,16 +637,37 @@ mod tests {
     }
 
     #[test]
+    fn wire_failures_preserve_relay_context_in_display() {
+        let input = [0x0a, 0x05, b'a', b'b']; // field 1 LEN, length 5, only 2 bytes
+        let err = Peer::decode(&input).unwrap_err();
+        assert!(matches!(
+            err,
+            RelayMessageError::Wire(WireError::FieldOverflow { .. })
+        ));
+        let display = alloc::format!("{err}");
+        assert!(
+            display.contains("claims length"),
+            "wire detail should remain visible: {display}"
+        );
+        let wrapped = crate::RelayError::Malformed(err);
+        let outer = alloc::format!("{wrapped}");
+        assert!(
+            outer.starts_with("malformed relay message:"),
+            "relay context must wrap the shared failure: {outer}"
+        );
+    }
+
+    #[test]
     fn decoder_skips_unknown_fields() {
         // RESERVE message with unknown field 99 before and after the type.
         let mut buf = Vec::new();
 
         // Unknown field 99, LEN: "extra"
-        encode_bytes_field(&mut buf, tag_byte(9, WIRE_LEN), b"extra");
+        encode_bytes_field(&mut buf, 9, b"extra");
         // type=RESERVE
-        encode_varint_field(&mut buf, tag_byte(1, WIRE_VARINT), 0);
+        encode_varint_field(&mut buf, 1, 0);
         // Unknown field 10, VARINT: 42
-        encode_varint_field(&mut buf, tag_byte(10, WIRE_VARINT), 42);
+        encode_varint_field(&mut buf, 10, 42);
 
         let decoded = HopMessage::decode(&buf).unwrap();
         assert_eq!(decoded.kind, HopMessageType::Reserve);
@@ -894,6 +771,59 @@ mod tests {
         // Tag byte = (2 << 3) | 0 = 0x10
         assert_eq!(encoded, vec![0x10, 100]);
     }
+
+    /// Pins Hop/Stop body bytes so later shared-wire migrations cannot drift.
+    ///
+    /// Captured from the pre-migration encoder; identical on this branch.
+    #[test]
+    fn hop_and_stop_message_body_goldens() {
+        assert_eq!(
+            HopMessage {
+                kind: HopMessageType::Reserve,
+                peer: None,
+                reservation: None,
+                limit: None,
+                status: None,
+            }
+            .encode(),
+            [0x08, 0x00],
+        );
+
+        assert_eq!(
+            HopMessage {
+                kind: HopMessageType::Connect,
+                peer: Some(Peer {
+                    id: b"some-peer-id-multihash".to_vec(),
+                    addrs: vec![],
+                }),
+                reservation: None,
+                limit: None,
+                status: None,
+            }
+            .encode(),
+            [
+                0x08, 0x01, // type = CONNECT
+                0x12, 0x18, // peer LEN=24
+                0x0a, 0x16, // Peer.id LEN=22
+                b's', b'o', b'm', b'e', b'-', b'p', b'e', b'e', b'r', b'-', b'i', b'd', b'-', b'm',
+                b'u', b'l', b't', b'i', b'h', b'a', b's', b'h',
+            ],
+        );
+
+        assert_eq!(
+            StopMessage {
+                kind: StopMessageType::Status,
+                peer: None,
+                limit: None,
+                status: Some(Status::Ok),
+            }
+            .encode(),
+            [
+                0x08, 0x01, // type = STATUS
+                0x20, 0x64, // status = OK (100)
+            ],
+        );
+    }
 }
 
 /// Golden equivalence tests for the varint-length-prefixed frame codec.
@@ -905,6 +835,7 @@ mod tests {
 #[cfg(test)]
 mod frame_golden {
     use super::*;
+    use minip2p_core::VarintError;
 
     #[test]
     fn golden_empty_payload() {

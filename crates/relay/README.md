@@ -6,7 +6,7 @@ Circuit Relay v2 lets a peer behind NAT advertise a relay as its public rendezvo
 
 ## Scope
 
-This crate owns protobuf messages, protocol IDs, status encoding, the 8 KiB control-frame boundary, and the state of one HOP or STOP stream. It does **not** implement:
+This crate owns Circuit Relay v2 message types, protocol IDs, status encoding, the 8 KiB control-frame boundary, and the state of one HOP or STOP stream. Protobuf field framing uses the shared vocabulary in `minip2p-core`; semantic validation and contextual `RelayMessageError` / `RelayError` values stay here. It does **not** implement:
 
 - Reservation tables, clocks, admission or refusal policy.
 - Circuit forwarding, byte accounting, or whole-service lifecycle state.
