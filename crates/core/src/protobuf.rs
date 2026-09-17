@@ -50,28 +50,38 @@ pub enum WireError {
 
 /// Computes the single-byte tag for `(field_number, wire_type)`.
 ///
-/// Only handles field numbers `< 16` (single-byte tags), which covers the
-/// protocols that currently share this helper.
-pub const fn tag_byte(field: u8, wire_type: u8) -> u8 {
-    (field << 3) | wire_type
+/// Returns `None` when the tag needs more than one byte (`field >= 16`) or the
+/// wire type is out of range (`> 7`). Prefer [`write_tag`] / the `encode_*`
+/// helpers, which always emit a full varint tag.
+pub const fn tag_byte(field: u8, wire_type: u8) -> Option<u8> {
+    if field > 15 || wire_type > 7 {
+        None
+    } else {
+        Some((field << 3) | wire_type)
+    }
 }
 
-/// Writes a `(tag, varint_value)` field.
-pub fn encode_varint_field(out: &mut Vec<u8>, tag: u8, value: u64) {
-    out.push(tag);
+/// Writes a protobuf field tag as a canonical uvarint.
+pub fn write_tag(out: &mut Vec<u8>, field: u64, wire_type: u8) {
+    write_uvarint((field << 3) | u64::from(wire_type), out);
+}
+
+/// Writes a `(tag, varint_value)` field for `field` with wire type [`WIRE_VARINT`].
+pub fn encode_varint_field(out: &mut Vec<u8>, field: u64, value: u64) {
+    write_tag(out, field, WIRE_VARINT);
     write_uvarint(value, out);
 }
 
-/// Writes a `(tag, length, bytes)` field.
-pub fn encode_bytes_field(out: &mut Vec<u8>, tag: u8, data: &[u8]) {
-    out.push(tag);
+/// Writes a `(tag, length, bytes)` field for `field` with wire type [`WIRE_LEN`].
+pub fn encode_bytes_field(out: &mut Vec<u8>, field: u64, data: &[u8]) {
+    write_tag(out, field, WIRE_LEN);
     write_uvarint(data.len() as u64, out);
     out.extend_from_slice(data);
 }
 
-/// Writes a `(tag, length, nested_message)` field.
-pub fn encode_nested_field(out: &mut Vec<u8>, tag: u8, nested: &[u8]) {
-    encode_bytes_field(out, tag, nested);
+/// Writes a `(tag, length, nested_message)` field for `field` with wire type [`WIRE_LEN`].
+pub fn encode_nested_field(out: &mut Vec<u8>, field: u64, nested: &[u8]) {
+    encode_bytes_field(out, field, nested);
 }
 
 /// Reads the next `(field_number, wire_type)` pair from the buffer.
@@ -180,29 +190,57 @@ mod tests {
 
     #[test]
     fn tag_byte_packs_field_and_wire_type() {
-        assert_eq!(tag_byte(1, WIRE_VARINT), 0x08);
-        assert_eq!(tag_byte(2, WIRE_LEN), 0x12);
-        assert_eq!(tag_byte(5, WIRE_VARINT), 0x28);
+        assert_eq!(tag_byte(1, WIRE_VARINT), Some(0x08));
+        assert_eq!(tag_byte(2, WIRE_LEN), Some(0x12));
+        assert_eq!(tag_byte(5, WIRE_VARINT), Some(0x28));
+    }
+
+    #[test]
+    fn tag_byte_rejects_field_numbers_that_need_multi_byte_tags() {
+        // field 16 ⇒ tag value 128, which is a multi-byte varint — not a u8 push.
+        assert_eq!(tag_byte(16, WIRE_VARINT), None);
+        assert_eq!(tag_byte(15, WIRE_VARINT), Some(0x78));
+        assert_eq!(tag_byte(1, 8), None);
+    }
+
+    #[test]
+    fn encode_round_trips_field_numbers_that_need_multi_byte_tags() {
+        // Regression for silent corruption: pushing tag_byte(16) as one byte
+        // yields 0x80, so read_tag would swallow the value as a tag continuation.
+        let mut out = Vec::new();
+        encode_varint_field(&mut out, 16, 7);
+        assert_eq!(out, vec![0x80, 0x01, 0x07]);
+
+        let mut idx = 0;
+        assert_eq!(read_tag(&out, &mut idx).unwrap(), Some((16, WIRE_VARINT)));
+        assert_eq!(read_varint_value(&out, &mut idx).unwrap(), 7);
+        assert_eq!(idx, out.len());
+
+        let mut bytes = Vec::new();
+        encode_bytes_field(&mut bytes, 20, b"hi");
+        let mut idx = 0;
+        assert_eq!(read_tag(&bytes, &mut idx).unwrap(), Some((20, WIRE_LEN)));
+        assert_eq!(read_len_delimited(&bytes, &mut idx).unwrap(), b"hi");
     }
 
     #[test]
     fn encode_varint_field_matches_known_bytes() {
         let mut out = Vec::new();
-        encode_varint_field(&mut out, tag_byte(1, WIRE_VARINT), 0);
+        encode_varint_field(&mut out, 1, 0);
         assert_eq!(out, vec![0x08, 0x00]);
     }
 
     #[test]
     fn encode_bytes_field_matches_known_bytes() {
         let mut out = Vec::new();
-        encode_bytes_field(&mut out, tag_byte(1, WIRE_LEN), b"ab");
+        encode_bytes_field(&mut out, 1, b"ab");
         assert_eq!(out, vec![0x0a, 0x02, b'a', b'b']);
     }
 
     #[test]
     fn encode_nested_field_is_length_delimited_bytes() {
         let mut out = Vec::new();
-        encode_nested_field(&mut out, tag_byte(2, WIRE_LEN), &[0x08, 0x01]);
+        encode_nested_field(&mut out, 2, &[0x08, 0x01]);
         assert_eq!(out, vec![0x12, 0x02, 0x08, 0x01]);
     }
 
@@ -231,7 +269,7 @@ mod tests {
     #[test]
     fn read_varint_value_round_trips() {
         let mut buf = Vec::new();
-        encode_varint_field(&mut buf, tag_byte(1, WIRE_VARINT), 150);
+        encode_varint_field(&mut buf, 1, 150);
         let mut idx = 0;
         let (field, wire) = read_tag(&buf, &mut idx).unwrap().unwrap();
         assert_eq!((field, wire), (1, WIRE_VARINT));
@@ -242,7 +280,7 @@ mod tests {
     #[test]
     fn read_len_delimited_round_trips() {
         let mut buf = Vec::new();
-        encode_bytes_field(&mut buf, tag_byte(1, WIRE_LEN), b"hello");
+        encode_bytes_field(&mut buf, 1, b"hello");
         let mut idx = 0;
         let (_, _) = read_tag(&buf, &mut idx).unwrap().unwrap();
         assert_eq!(read_len_delimited(&buf, &mut idx).unwrap(), b"hello");
@@ -266,13 +304,13 @@ mod tests {
     #[test]
     fn read_string_accepts_utf8_and_rejects_invalid() {
         let mut good = Vec::new();
-        encode_bytes_field(&mut good, tag_byte(1, WIRE_LEN), b"ok");
+        encode_bytes_field(&mut good, 1, b"ok");
         let mut idx = 0;
         let (_, _) = read_tag(&good, &mut idx).unwrap().unwrap();
         assert_eq!(read_string(&good, &mut idx).unwrap(), "ok");
 
         let mut bad = Vec::new();
-        encode_bytes_field(&mut bad, tag_byte(1, WIRE_LEN), &[0xff, 0xfe]);
+        encode_bytes_field(&mut bad, 1, &[0xff, 0xfe]);
         let mut idx = 0;
         let (_, _) = read_tag(&bad, &mut idx).unwrap().unwrap();
         assert!(matches!(
@@ -284,9 +322,9 @@ mod tests {
     #[test]
     fn skip_field_skips_known_wire_types() {
         let mut buf = Vec::new();
-        encode_bytes_field(&mut buf, tag_byte(9, WIRE_LEN), b"extra");
-        encode_varint_field(&mut buf, tag_byte(1, WIRE_VARINT), 0);
-        encode_varint_field(&mut buf, tag_byte(10, WIRE_VARINT), 42);
+        encode_bytes_field(&mut buf, 9, b"extra");
+        encode_varint_field(&mut buf, 1, 0);
+        encode_varint_field(&mut buf, 10, 42);
 
         let mut idx = 0;
         let (field, wire) = read_tag(&buf, &mut idx).unwrap().unwrap();
@@ -320,9 +358,9 @@ mod tests {
     #[test]
     fn skip_fixed32_and_fixed64() {
         let mut buf = Vec::new();
-        buf.push(tag_byte(1, WIRE_I32));
+        write_tag(&mut buf, 1, WIRE_I32);
         buf.extend_from_slice(&[1, 2, 3, 4]);
-        buf.push(tag_byte(2, WIRE_I64));
+        write_tag(&mut buf, 2, WIRE_I64);
         buf.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
 
         let mut idx = 0;

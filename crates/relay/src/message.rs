@@ -32,7 +32,7 @@ use alloc::vec::Vec;
 
 use minip2p_core::{
     WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field, encode_nested_field, encode_varint_field,
-    read_len_delimited, read_tag, read_varint_value, skip_field, tag_byte,
+    read_len_delimited, read_tag, read_varint_value, skip_field,
 };
 use thiserror::Error;
 
@@ -243,10 +243,10 @@ impl Peer {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         if !self.id.is_empty() {
-            encode_bytes_field(&mut out, tag_byte(1, WIRE_LEN), &self.id);
+            encode_bytes_field(&mut out, 1, &self.id);
         }
         for addr in &self.addrs {
-            encode_bytes_field(&mut out, tag_byte(2, WIRE_LEN), addr);
+            encode_bytes_field(&mut out, 2, addr);
         }
         out
     }
@@ -280,13 +280,13 @@ impl Reservation {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         if let Some(expire) = self.expire {
-            encode_varint_field(&mut out, tag_byte(1, WIRE_VARINT), expire);
+            encode_varint_field(&mut out, 1, expire);
         }
         for addr in &self.addrs {
-            encode_bytes_field(&mut out, tag_byte(2, WIRE_LEN), addr);
+            encode_bytes_field(&mut out, 2, addr);
         }
         if let Some(ref voucher) = self.voucher {
-            encode_bytes_field(&mut out, tag_byte(3, WIRE_LEN), voucher);
+            encode_bytes_field(&mut out, 3, voucher);
         }
         out
     }
@@ -323,10 +323,10 @@ impl Limit {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         if let Some(duration) = self.duration {
-            encode_varint_field(&mut out, tag_byte(1, WIRE_VARINT), duration as u64);
+            encode_varint_field(&mut out, 1, duration as u64);
         }
         if let Some(data) = self.data {
-            encode_varint_field(&mut out, tag_byte(2, WIRE_VARINT), data);
+            encode_varint_field(&mut out, 2, data);
         }
         out
     }
@@ -358,22 +358,22 @@ impl HopMessage {
     /// Encodes the HopMessage body (without length prefix).
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        encode_varint_field(&mut out, tag_byte(1, WIRE_VARINT), self.kind as u64);
+        encode_varint_field(&mut out, 1, self.kind as u64);
 
         if let Some(ref peer) = self.peer {
             let nested = peer.encode();
-            encode_nested_field(&mut out, tag_byte(2, WIRE_LEN), &nested);
+            encode_nested_field(&mut out, 2, &nested);
         }
         if let Some(ref reservation) = self.reservation {
             let nested = reservation.encode();
-            encode_nested_field(&mut out, tag_byte(3, WIRE_LEN), &nested);
+            encode_nested_field(&mut out, 3, &nested);
         }
         if let Some(ref limit) = self.limit {
             let nested = limit.encode();
-            encode_nested_field(&mut out, tag_byte(4, WIRE_LEN), &nested);
+            encode_nested_field(&mut out, 4, &nested);
         }
         if let Some(status) = self.status {
-            encode_varint_field(&mut out, tag_byte(5, WIRE_VARINT), status.to_u64());
+            encode_varint_field(&mut out, 5, status.to_u64());
         }
         out
     }
@@ -434,18 +434,18 @@ impl StopMessage {
     /// Encodes the StopMessage body (without length prefix).
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        encode_varint_field(&mut out, tag_byte(1, WIRE_VARINT), self.kind as u64);
+        encode_varint_field(&mut out, 1, self.kind as u64);
 
         if let Some(ref peer) = self.peer {
             let nested = peer.encode();
-            encode_nested_field(&mut out, tag_byte(2, WIRE_LEN), &nested);
+            encode_nested_field(&mut out, 2, &nested);
         }
         if let Some(ref limit) = self.limit {
             let nested = limit.encode();
-            encode_nested_field(&mut out, tag_byte(3, WIRE_LEN), &nested);
+            encode_nested_field(&mut out, 3, &nested);
         }
         if let Some(status) = self.status {
-            encode_varint_field(&mut out, tag_byte(4, WIRE_VARINT), status.to_u64());
+            encode_varint_field(&mut out, 4, status.to_u64());
         }
         out
     }
@@ -617,7 +617,7 @@ mod tests {
     fn hop_message_missing_type_fails() {
         // Encode only a peer field with no type.
         let mut buf = Vec::new();
-        encode_nested_field(&mut buf, tag_byte(2, WIRE_LEN), &Peer::default().encode());
+        encode_nested_field(&mut buf, 2, &Peer::default().encode());
 
         let err = HopMessage::decode(&buf).unwrap_err();
         assert!(matches!(err, RelayMessageError::MissingType));
@@ -627,7 +627,7 @@ mod tests {
     fn hop_message_invalid_type_fails() {
         // Encode type=99 (invalid).
         let mut buf = Vec::new();
-        encode_varint_field(&mut buf, tag_byte(1, WIRE_VARINT), 99);
+        encode_varint_field(&mut buf, 1, 99);
 
         let err = HopMessage::decode(&buf).unwrap_err();
         assert!(matches!(
@@ -663,11 +663,11 @@ mod tests {
         let mut buf = Vec::new();
 
         // Unknown field 99, LEN: "extra"
-        encode_bytes_field(&mut buf, tag_byte(9, WIRE_LEN), b"extra");
+        encode_bytes_field(&mut buf, 9, b"extra");
         // type=RESERVE
-        encode_varint_field(&mut buf, tag_byte(1, WIRE_VARINT), 0);
+        encode_varint_field(&mut buf, 1, 0);
         // Unknown field 10, VARINT: 42
-        encode_varint_field(&mut buf, tag_byte(10, WIRE_VARINT), 42);
+        encode_varint_field(&mut buf, 10, 42);
 
         let decoded = HopMessage::decode(&buf).unwrap();
         assert_eq!(decoded.kind, HopMessageType::Reserve);
