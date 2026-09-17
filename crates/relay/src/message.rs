@@ -640,7 +640,10 @@ mod tests {
     fn wire_failures_preserve_relay_context_in_display() {
         let input = [0x0a, 0x05, b'a', b'b']; // field 1 LEN, length 5, only 2 bytes
         let err = Peer::decode(&input).unwrap_err();
-        assert!(matches!(err, RelayMessageError::Wire(WireError::FieldOverflow { .. })));
+        assert!(matches!(
+            err,
+            RelayMessageError::Wire(WireError::FieldOverflow { .. })
+        ));
         let display = alloc::format!("{err}");
         assert!(
             display.contains("claims length"),
