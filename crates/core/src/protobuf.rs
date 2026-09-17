@@ -62,7 +62,14 @@ pub const fn tag_byte(field: u8, wire_type: u8) -> Option<u8> {
 }
 
 /// Writes a protobuf field tag as a canonical uvarint.
+///
+/// `wire_type` must be in `0..=7`. Values above 7 would shift bits into the
+/// field number (same constraint as [`tag_byte`]).
 pub fn write_tag(out: &mut Vec<u8>, field: u64, wire_type: u8) {
+    debug_assert!(
+        wire_type <= 7,
+        "protobuf wire_type must be <= 7 (got {wire_type}); higher values bleed into the field number"
+    );
     write_uvarint((field << 3) | u64::from(wire_type), out);
 }
 
@@ -201,6 +208,14 @@ mod tests {
         assert_eq!(tag_byte(16, WIRE_VARINT), None);
         assert_eq!(tag_byte(15, WIRE_VARINT), Some(0x78));
         assert_eq!(tag_byte(1, 8), None);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "wire_type must be <= 7")]
+    fn write_tag_debug_asserts_wire_type_range() {
+        let mut out = Vec::new();
+        write_tag(&mut out, 1, 8);
     }
 
     #[test]

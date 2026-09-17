@@ -771,6 +771,59 @@ mod tests {
         // Tag byte = (2 << 3) | 0 = 0x10
         assert_eq!(encoded, vec![0x10, 100]);
     }
+
+    /// Pins Hop/Stop body bytes so later shared-wire migrations cannot drift.
+    ///
+    /// Captured from the pre-migration encoder; identical on this branch.
+    #[test]
+    fn hop_and_stop_message_body_goldens() {
+        assert_eq!(
+            HopMessage {
+                kind: HopMessageType::Reserve,
+                peer: None,
+                reservation: None,
+                limit: None,
+                status: None,
+            }
+            .encode(),
+            [0x08, 0x00],
+        );
+
+        assert_eq!(
+            HopMessage {
+                kind: HopMessageType::Connect,
+                peer: Some(Peer {
+                    id: b"some-peer-id-multihash".to_vec(),
+                    addrs: vec![],
+                }),
+                reservation: None,
+                limit: None,
+                status: None,
+            }
+            .encode(),
+            [
+                0x08, 0x01, // type = CONNECT
+                0x12, 0x18, // peer LEN=24
+                0x0a, 0x16, // Peer.id LEN=22
+                b's', b'o', b'm', b'e', b'-', b'p', b'e', b'e', b'r', b'-', b'i', b'd', b'-', b'm',
+                b'u', b'l', b't', b'i', b'h', b'a', b's', b'h',
+            ],
+        );
+
+        assert_eq!(
+            StopMessage {
+                kind: StopMessageType::Status,
+                peer: None,
+                limit: None,
+                status: Some(Status::Ok),
+            }
+            .encode(),
+            [
+                0x08, 0x01, // type = STATUS
+                0x20, 0x64, // status = OK (100)
+            ],
+        );
+    }
 }
 
 /// Golden equivalence tests for the varint-length-prefixed frame codec.

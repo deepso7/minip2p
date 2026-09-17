@@ -2,8 +2,7 @@
 
 Small, `no_std`-friendly core primitives for minip2p.
 
-This crate focuses on typed address handling, peer-qualified endpoint types,
-shared stream framing, and the shared protobuf field wire vocabulary.
+This crate focuses on typed address handling, peer-qualified endpoint types, shared stream framing, and the shared protobuf field wire vocabulary.
 
 ## Features
 
