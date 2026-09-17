@@ -17,9 +17,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use minip2p_core::{
-    FrameDecode, Multiaddr, PeerId, SansIoProtocol, WireError, decode_frame, encode_frame,
-};
+use minip2p_core::{Multiaddr, PeerId, SansIoProtocol, WireError, encode_frame, read_uvarint};
 use minip2p_transport::StreamId;
 use thiserror::Error;
 
@@ -483,17 +481,28 @@ fn encode_length_prefixed(payload: &[u8]) -> Vec<u8> {
 /// Strips the varint length prefix from a framed Identify buffer and
 /// returns a borrowed slice over the body.
 ///
-/// Stream length-prefix framing uses [`decode_frame`], not protobuf
-/// [`WireError`]. A prefix that claims more bytes than the buffer holds
-/// is [`IdentifyMessageError::TruncatedPrefix`]; a malformed varint is
-/// [`IdentifyMessageError::Wire`].
+/// An oversized declared length is always [`WireError::FieldOverflow`],
+/// including when the length does not fit in `usize` on 32-bit targets.
+/// That keeps the error class independent of pointer width. A malformed
+/// prefix varint is [`IdentifyMessageError::Wire`].
 fn decode_length_prefixed(buf: &[u8]) -> Result<&[u8], message::IdentifyMessageError> {
-    match decode_frame(buf, usize::MAX) {
-        FrameDecode::Complete { payload, .. } => Ok(payload),
-        FrameDecode::Incomplete | FrameDecode::TooLarge { .. } => {
-            Err(message::IdentifyMessageError::TruncatedPrefix)
-        }
-        FrameDecode::Error(error) => Err(WireError::from(error).into()),
+    let (len, consumed) = read_uvarint(buf).map_err(WireError::from)?;
+    let remaining = buf.len().saturating_sub(consumed);
+    // Compare as u64 before converting to usize so 32-bit and 64-bit
+    // targets take the same FieldOverflow path.
+    if len > remaining as u64 {
+        return Err(prefix_overflow(consumed, len, remaining).into());
+    }
+    let end = consumed + (len as usize);
+    buf.get(consumed..end)
+        .ok_or(prefix_overflow(consumed, len, remaining).into())
+}
+
+fn prefix_overflow(offset: usize, length: u64, remaining: usize) -> WireError {
+    WireError::FieldOverflow {
+        offset,
+        length: usize::try_from(length).unwrap_or(usize::MAX),
+        remaining,
     }
 }
 
@@ -573,7 +582,33 @@ mod tests {
         framed.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
         assert!(matches!(
             decode_length_prefixed(&framed),
-            Err(message::IdentifyMessageError::TruncatedPrefix)
+            Err(message::IdentifyMessageError::Wire(
+                WireError::FieldOverflow {
+                    length: 255,
+                    remaining: 3,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn length_prefix_oversized_declared_length_is_field_overflow_on_every_target() {
+        // `u64::MAX` does not fit in usize on 32-bit targets. The decoder
+        // must still report FieldOverflow (never Varint Overflow) so the
+        // error class does not depend on pointer width.
+        let mut framed = Vec::new();
+        write_uvarint(u64::MAX, &mut framed);
+        framed.extend_from_slice(&[0xAA]);
+        assert!(matches!(
+            decode_length_prefixed(&framed),
+            Err(message::IdentifyMessageError::Wire(
+                WireError::FieldOverflow {
+                    length: usize::MAX,
+                    remaining: 1,
+                    ..
+                }
+            ))
         ));
     }
 

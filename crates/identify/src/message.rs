@@ -65,9 +65,6 @@ pub enum IdentifyMessageError {
     /// A string field contains invalid UTF-8.
     #[error("invalid UTF-8 in field {field_number}")]
     InvalidUtf8 { field_number: u64 },
-    /// The varint length prefix declared more payload than the buffer holds.
-    #[error("identify length prefix is truncated")]
-    TruncatedPrefix,
 }
 
 impl IdentifyMessage {
