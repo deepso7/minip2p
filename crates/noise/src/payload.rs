@@ -1,8 +1,13 @@
 use alloc::vec::Vec;
 
-use minip2p_identity::{PublicKey, read_uvarint, write_uvarint};
+use minip2p_core::{WIRE_LEN, encode_bytes_field, read_len_delimited, read_tag, skip_field};
+use minip2p_identity::PublicKey;
 
 use crate::NoiseError;
+
+const FIELD_IDENTITY_KEY: u64 = 1;
+const FIELD_IDENTITY_SIG: u64 = 2;
+const FIELD_EXTENSIONS: u64 = 4;
 
 /// Decoded libp2p Noise handshake payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -27,10 +32,10 @@ impl NoiseHandshakePayload {
     /// Encodes the payload using protobuf wire format.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        write_bytes_field(1, &self.identity_key, &mut out);
-        write_bytes_field(2, &self.identity_sig, &mut out);
+        encode_bytes_field(&mut out, FIELD_IDENTITY_KEY, &self.identity_key);
+        encode_bytes_field(&mut out, FIELD_IDENTITY_SIG, &self.identity_sig);
         if let Some(extensions) = &self.extensions {
-            write_bytes_field(4, extensions, &mut out);
+            encode_bytes_field(&mut out, FIELD_EXTENSIONS, extensions);
         }
         out
     }
@@ -42,45 +47,39 @@ impl NoiseHandshakePayload {
         let mut identity_sig = None;
         let mut extensions = None;
 
-        while cursor < input.len() {
-            let remaining = input
-                .get(cursor..)
-                .ok_or(NoiseError::InvalidPayload("truncated field tag"))?;
-            #[expect(
-                clippy::map_err_ignore,
-                reason = "NoiseError intentionally keeps malformed protobuf tags compact."
-            )]
-            let (tag, used) = read_uvarint(remaining)
-                .map_err(|_| NoiseError::InvalidPayload("invalid field tag"))?;
-            cursor = cursor
-                .checked_add(used)
-                .filter(|end| *end <= input.len())
-                .ok_or(NoiseError::InvalidPayload("invalid field tag"))?;
-            let field = tag >> 3;
-            let wire = tag & 7;
-
+        while let Some((field, wire_type)) = read_tag(input, &mut cursor)? {
             if field == 0 {
                 return Err(NoiseError::InvalidPayload("invalid field number zero"));
             }
 
-            if matches!(field, 1 | 2 | 4) {
-                if wire != 2 {
+            match (field, wire_type) {
+                (FIELD_IDENTITY_KEY, WIRE_LEN) => {
+                    set_unique_field(
+                        &mut identity_key,
+                        read_len_delimited(input, &mut cursor)?.to_vec(),
+                        "duplicate identity key",
+                    )?;
+                }
+                (FIELD_IDENTITY_SIG, WIRE_LEN) => {
+                    set_unique_field(
+                        &mut identity_sig,
+                        read_len_delimited(input, &mut cursor)?.to_vec(),
+                        "duplicate identity signature",
+                    )?;
+                }
+                (FIELD_EXTENSIONS, WIRE_LEN) => {
+                    set_unique_field(
+                        &mut extensions,
+                        read_len_delimited(input, &mut cursor)?.to_vec(),
+                        "duplicate extensions",
+                    )?;
+                }
+                (FIELD_IDENTITY_KEY | FIELD_IDENTITY_SIG | FIELD_EXTENSIONS, _) => {
                     return Err(NoiseError::InvalidPayload(
                         "known field has non-length-delimited wire type",
                     ));
                 }
-                let value = read_bytes(input, &mut cursor)?.to_vec();
-                let (slot, duplicate_reason) = match field {
-                    1 => (&mut identity_key, "duplicate identity key"),
-                    2 => (&mut identity_sig, "duplicate identity signature"),
-                    4 => (&mut extensions, "duplicate extensions"),
-                    _ => return Err(NoiseError::InvalidPayload("invalid known field")),
-                };
-                if slot.replace(value).is_some() {
-                    return Err(NoiseError::InvalidPayload(duplicate_reason));
-                }
-            } else {
-                skip_unknown(input, &mut cursor, wire)?;
+                _ => skip_field(input, &mut cursor, wire_type)?,
             }
         }
 
@@ -93,75 +92,37 @@ impl NoiseHandshakePayload {
     }
 }
 
-fn write_bytes_field(field: u64, value: &[u8], out: &mut Vec<u8>) {
-    write_uvarint((field << 3) | 2, out);
-    write_uvarint(value.len() as u64, out);
-    out.extend_from_slice(value);
-}
-
-fn read_bytes<'a>(input: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], NoiseError> {
-    let remaining = input
-        .get(*cursor..)
-        .ok_or(NoiseError::InvalidPayload("truncated field length"))?;
-    #[expect(
-        clippy::map_err_ignore,
-        reason = "NoiseError intentionally keeps malformed protobuf lengths compact."
-    )]
-    let (len, used) =
-        read_uvarint(remaining).map_err(|_| NoiseError::InvalidPayload("invalid field length"))?;
-    *cursor = cursor
-        .checked_add(used)
-        .filter(|end| *end <= input.len())
-        .ok_or(NoiseError::InvalidPayload("invalid field length"))?;
-    #[expect(
-        clippy::map_err_ignore,
-        reason = "NoiseError has a stable field-length overflow variant."
-    )]
-    let len =
-        usize::try_from(len).map_err(|_| NoiseError::InvalidPayload("field length overflow"))?;
-    let end = cursor
-        .checked_add(len)
-        .ok_or(NoiseError::InvalidPayload("field length overflow"))?;
-    let value = input
-        .get(*cursor..end)
-        .ok_or(NoiseError::InvalidPayload("truncated field"))?;
-    *cursor = end;
-    Ok(value)
-}
-
-fn skip_unknown(input: &[u8], cursor: &mut usize, wire: u64) -> Result<(), NoiseError> {
-    let count = match wire {
-        0 => {
-            let remaining = input
-                .get(*cursor..)
-                .ok_or(NoiseError::InvalidPayload("truncated unknown field"))?;
-            #[expect(
-                clippy::map_err_ignore,
-                reason = "NoiseError intentionally keeps malformed unknown fields compact."
-            )]
-            let (_, used) = read_uvarint(remaining)
-                .map_err(|_| NoiseError::InvalidPayload("invalid unknown varint"))?;
-            used
-        }
-        1 => 8,
-        2 => {
-            let _ = read_bytes(input, cursor)?;
-            return Ok(());
-        }
-        5 => 4,
-        _ => return Err(NoiseError::InvalidPayload("unsupported protobuf wire type")),
-    };
-    *cursor = cursor
-        .checked_add(count)
-        .filter(|end| *end <= input.len())
-        .ok_or(NoiseError::InvalidPayload("truncated unknown field"))?;
-    Ok(())
+fn set_unique_field<T>(
+    slot: &mut Option<T>,
+    value: T,
+    duplicate_reason: &'static str,
+) -> Result<(), NoiseError> {
+    if slot.replace(value).is_some() {
+        Err(NoiseError::InvalidPayload(duplicate_reason))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use minip2p_identity::{Ed25519Keypair, KeyType};
+
+    #[test]
+    fn encode_matches_known_payload_bytes() {
+        let payload = NoiseHandshakePayload {
+            identity_key: b"key".to_vec(),
+            identity_sig: vec![7; 4],
+            extensions: Some(b"ext".to_vec()),
+        };
+        assert_eq!(
+            payload.encode(),
+            [
+                0x0a, 3, b'k', b'e', b'y', 0x12, 4, 7, 7, 7, 7, 0x22, 3, b'e', b'x', b't',
+            ]
+        );
+    }
 
     #[test]
     fn round_trips_payload() {

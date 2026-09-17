@@ -13,6 +13,7 @@
 //! }
 //! ```
 //!
+//! Field framing uses the shared protobuf vocabulary in [`minip2p_core`].
 //! All fields use wire type LEN (2). The encoder writes fields in field-number
 //! order. The decoder accepts fields in any order, rejects unsupported wire
 //! types, and silently skips unknown fields that use a known wire type.
@@ -22,14 +23,10 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{VarintError, read_uvarint, write_uvarint};
+use minip2p_core::{
+    WIRE_LEN, WireError, encode_bytes_field, read_len_delimited, read_tag, skip_field,
+};
 use thiserror::Error;
-
-// Protobuf wire types from the spec.
-const WIRE_VARINT: u8 = 0;
-const WIRE_I64: u8 = 1;
-const WIRE_LEN: u8 = 2;
-const WIRE_I32: u8 = 5;
 
 // Protobuf field numbers for the Identify message.
 const FIELD_PUBLIC_KEY: u64 = 1;
@@ -38,16 +35,6 @@ const FIELD_PROTOCOLS: u64 = 3;
 const FIELD_OBSERVED_ADDR: u64 = 4;
 const FIELD_PROTOCOL_VERSION: u64 = 5;
 const FIELD_AGENT_VERSION: u64 = 6;
-
-// Single-byte tag bytes used by the encoder (valid for field numbers < 16).
-// These are only used when producing output; the decoder does not match on
-// truncated u8 tags (see the full-width match in `decode` below).
-const TAG_PUBLIC_KEY: u8 = ((FIELD_PUBLIC_KEY as u8) << 3) | WIRE_LEN;
-const TAG_LISTEN_ADDRS: u8 = ((FIELD_LISTEN_ADDRS as u8) << 3) | WIRE_LEN;
-const TAG_PROTOCOLS: u8 = ((FIELD_PROTOCOLS as u8) << 3) | WIRE_LEN;
-const TAG_OBSERVED_ADDR: u8 = ((FIELD_OBSERVED_ADDR as u8) << 3) | WIRE_LEN;
-const TAG_PROTOCOL_VERSION: u8 = ((FIELD_PROTOCOL_VERSION as u8) << 3) | WIRE_LEN;
-const TAG_AGENT_VERSION: u8 = ((FIELD_AGENT_VERSION as u8) << 3) | WIRE_LEN;
 
 /// The decoded identify message exchanged between peers.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -67,30 +54,23 @@ pub struct IdentifyMessage {
 }
 
 /// Errors that can occur during identify message decoding.
+///
+/// Shared framing failures are wrapped as [`Self::Wire`] so callers retain
+/// identify context while reusing the core protobuf vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum IdentifyMessageError {
-    /// A varint could not be decoded.
-    #[error("varint error: {0}")]
-    Varint(#[from] VarintError),
-    /// A length-delimited field extends beyond the message boundary, or a
-    /// length value exceeds `usize` on the current target.
-    #[error("field at offset {offset} has length {length} but only {remaining} bytes remain")]
-    FieldOverflow {
-        offset: usize,
-        length: u64,
-        remaining: usize,
-    },
+    /// A shared protobuf framing failure.
+    #[error(transparent)]
+    Wire(#[from] WireError),
     /// A string field contains invalid UTF-8.
     #[error("invalid UTF-8 in field {field_number}")]
     InvalidUtf8 { field_number: u64 },
-    /// The wire type of a field is not one of the four supported types
-    /// (`VARINT`, `I64`, `LEN`, `I32`).
-    ///
-    /// Unlike ignorable unknown *fields*, an unknown *wire type* means the
-    /// decoder cannot safely determine the field length, so parsing stops
-    /// with an error rather than silently returning a partial message.
-    #[error("unsupported wire type {wire_type} at offset {offset}")]
-    UnsupportedWireType { wire_type: u8, offset: usize },
+}
+
+impl From<minip2p_core::VarintError> for IdentifyMessageError {
+    fn from(error: minip2p_core::VarintError) -> Self {
+        Self::Wire(error.into())
+    }
 }
 
 impl IdentifyMessage {
@@ -101,27 +81,27 @@ impl IdentifyMessage {
         let mut out = Vec::new();
 
         if let Some(ref key) = self.public_key {
-            encode_bytes_field(&mut out, TAG_PUBLIC_KEY, key);
+            encode_bytes_field(&mut out, FIELD_PUBLIC_KEY, key);
         }
 
         for addr in &self.listen_addrs {
-            encode_bytes_field(&mut out, TAG_LISTEN_ADDRS, addr);
+            encode_bytes_field(&mut out, FIELD_LISTEN_ADDRS, addr);
         }
 
         for proto in &self.protocols {
-            encode_bytes_field(&mut out, TAG_PROTOCOLS, proto.as_bytes());
+            encode_bytes_field(&mut out, FIELD_PROTOCOLS, proto.as_bytes());
         }
 
         if let Some(ref addr) = self.observed_addr {
-            encode_bytes_field(&mut out, TAG_OBSERVED_ADDR, addr);
+            encode_bytes_field(&mut out, FIELD_OBSERVED_ADDR, addr);
         }
 
         if let Some(ref ver) = self.protocol_version {
-            encode_bytes_field(&mut out, TAG_PROTOCOL_VERSION, ver.as_bytes());
+            encode_bytes_field(&mut out, FIELD_PROTOCOL_VERSION, ver.as_bytes());
         }
 
         if let Some(ref ver) = self.agent_version {
-            encode_bytes_field(&mut out, TAG_AGENT_VERSION, ver.as_bytes());
+            encode_bytes_field(&mut out, FIELD_AGENT_VERSION, ver.as_bytes());
         }
 
         out
@@ -138,112 +118,33 @@ impl IdentifyMessage {
         let mut msg = IdentifyMessage::default();
         let mut idx = 0;
 
-        while idx < input.len() {
-            // Read the field tag as a full u64 -- field numbers >= 16 encode
-            // as multi-byte varints. Truncating to u8 here would let a remote
-            // peer alias known fields via high-numbered field tags (e.g.
-            // field 33 + LEN wire type = 266, cast to u8 = 0x0A = public_key).
-            let remaining = input
-                .get(idx..)
-                .ok_or(IdentifyMessageError::FieldOverflow {
-                    offset: idx,
-                    length: 0,
-                    remaining: 0,
-                })?;
-            let (tag_value, tag_used) = read_uvarint(remaining)?;
-            idx = idx
-                .checked_add(tag_used)
-                .filter(|end| *end <= input.len())
-                .ok_or(IdentifyMessageError::FieldOverflow {
-                    offset: idx,
-                    length: tag_used as u64,
-                    remaining: input.len().saturating_sub(idx),
-                })?;
-
-            let wire_type = (tag_value & 0x07) as u8;
-            let field_number = tag_value >> 3;
-
-            match wire_type {
-                WIRE_LEN => {
-                    let value = read_len_delimited(input, &mut idx)?;
-
-                    match field_number {
-                        FIELD_PUBLIC_KEY => {
-                            msg.public_key = Some(value.to_vec());
-                        }
-                        FIELD_LISTEN_ADDRS => {
-                            msg.listen_addrs.push(value.to_vec());
-                        }
-                        FIELD_PROTOCOLS => {
-                            #[expect(
-                                clippy::map_err_ignore,
-                                reason = "The public error identifies the malformed protobuf field without exposing UTF-8 internals."
-                            )]
-                            let s = core::str::from_utf8(value)
-                                .map_err(|_| IdentifyMessageError::InvalidUtf8 { field_number })?;
-                            msg.protocols.push(String::from(s));
-                        }
-                        FIELD_OBSERVED_ADDR => {
-                            msg.observed_addr = Some(value.to_vec());
-                        }
-                        FIELD_PROTOCOL_VERSION => {
-                            #[expect(
-                                clippy::map_err_ignore,
-                                reason = "The public error identifies the malformed protobuf field without exposing UTF-8 internals."
-                            )]
-                            let s = core::str::from_utf8(value)
-                                .map_err(|_| IdentifyMessageError::InvalidUtf8 { field_number })?;
-                            msg.protocol_version = Some(String::from(s));
-                        }
-                        FIELD_AGENT_VERSION => {
-                            #[expect(
-                                clippy::map_err_ignore,
-                                reason = "The public error identifies the malformed protobuf field without exposing UTF-8 internals."
-                            )]
-                            let s = core::str::from_utf8(value)
-                                .map_err(|_| IdentifyMessageError::InvalidUtf8 { field_number })?;
-                            msg.agent_version = Some(String::from(s));
-                        }
-                        _ => {
-                            // Unknown LEN field -- already consumed bytes above.
-                        }
-                    }
+        // Tags are full varints so field numbers >= 16 cannot alias known
+        // single-byte tags (e.g. field 33 + LEN = 266, which is 0x8A 0x02,
+        // not public_key's 0x0A).
+        while let Some((field_number, wire_type)) = read_tag(input, &mut idx)? {
+            match (field_number, wire_type) {
+                (FIELD_PUBLIC_KEY, WIRE_LEN) => {
+                    msg.public_key = Some(read_len_delimited(input, &mut idx)?.to_vec());
                 }
-                WIRE_VARINT => {
-                    // Skip unknown varint values.
-                    let remaining =
-                        input
-                            .get(idx..)
-                            .ok_or(IdentifyMessageError::FieldOverflow {
-                                offset: idx,
-                                length: 0,
-                                remaining: 0,
-                            })?;
-                    let (_, used) = read_uvarint(remaining)?;
-                    idx = idx
-                        .checked_add(used)
-                        .filter(|end| *end <= input.len())
-                        .ok_or(IdentifyMessageError::FieldOverflow {
-                            offset: idx,
-                            length: used as u64,
-                            remaining: input.len().saturating_sub(idx),
-                        })?;
+                (FIELD_LISTEN_ADDRS, WIRE_LEN) => {
+                    msg.listen_addrs
+                        .push(read_len_delimited(input, &mut idx)?.to_vec());
                 }
-                WIRE_I32 => {
-                    idx = checked_advance(input, idx, 4)?;
+                (FIELD_PROTOCOLS, WIRE_LEN) => {
+                    msg.protocols
+                        .push(read_identify_string(input, &mut idx, field_number)?);
                 }
-                WIRE_I64 => {
-                    idx = checked_advance(input, idx, 8)?;
+                (FIELD_OBSERVED_ADDR, WIRE_LEN) => {
+                    msg.observed_addr = Some(read_len_delimited(input, &mut idx)?.to_vec());
                 }
-                other => {
-                    // Wire types 3 and 4 (deprecated start/end group) and 6,
-                    // 7 (undefined) cannot be safely skipped because we have
-                    // no way to determine their field length.
-                    return Err(IdentifyMessageError::UnsupportedWireType {
-                        wire_type: other,
-                        offset: idx,
-                    });
+                (FIELD_PROTOCOL_VERSION, WIRE_LEN) => {
+                    msg.protocol_version =
+                        Some(read_identify_string(input, &mut idx, field_number)?);
                 }
+                (FIELD_AGENT_VERSION, WIRE_LEN) => {
+                    msg.agent_version = Some(read_identify_string(input, &mut idx, field_number)?);
+                }
+                _ => skip_field(input, &mut idx, wire_type)?,
             }
         }
 
@@ -251,74 +152,21 @@ impl IdentifyMessage {
     }
 }
 
-/// Writes a length-delimited protobuf field: tag + varint length + bytes.
-fn encode_bytes_field(out: &mut Vec<u8>, tag: u8, data: &[u8]) {
-    out.push(tag);
-    write_uvarint(data.len() as u64, out);
-    out.extend_from_slice(data);
-}
-
-/// Reads a length-delimited value at `*idx`, advancing `*idx` past the length
-/// prefix and payload bytes. Performs a checked conversion from `u64` to
-/// `usize` to guard against truncation on 32-bit targets.
-fn read_len_delimited<'a>(
-    input: &'a [u8],
+/// Reads a length-delimited UTF-8 string, preserving the Identify field number
+/// in the public error (shared [`minip2p_core::read_string`] reports offset).
+fn read_identify_string(
+    input: &[u8],
     idx: &mut usize,
-) -> Result<&'a [u8], IdentifyMessageError> {
-    let remaining_input = input
-        .get(*idx..)
-        .ok_or(IdentifyMessageError::FieldOverflow {
-            offset: *idx,
-            length: 0,
-            remaining: 0,
-        })?;
-    let (length_u64, len_used) = read_uvarint(remaining_input)?;
-    *idx = checked_advance(input, *idx, len_used)?;
-
-    let remaining = input.len().saturating_sub(*idx);
+    field_number: u64,
+) -> Result<String, IdentifyMessageError> {
+    let value = read_len_delimited(input, idx)?;
     #[expect(
         clippy::map_err_ignore,
-        reason = "FieldOverflow records the declared wire length, which is the useful cross-platform detail."
+        reason = "The public error identifies the malformed protobuf field without exposing UTF-8 internals."
     )]
-    let length = usize::try_from(length_u64).map_err(|_| IdentifyMessageError::FieldOverflow {
-        offset: *idx,
-        length: length_u64,
-        remaining,
-    })?;
-
-    if length > remaining {
-        return Err(IdentifyMessageError::FieldOverflow {
-            offset: *idx,
-            length: length_u64,
-            remaining,
-        });
-    }
-
-    let end = checked_advance(input, *idx, length)?;
-    let value = input
-        .get(*idx..end)
-        .ok_or(IdentifyMessageError::FieldOverflow {
-            offset: *idx,
-            length: length_u64,
-            remaining,
-        })?;
-    *idx = end;
-    Ok(value)
-}
-
-fn checked_advance(
-    input: &[u8],
-    offset: usize,
-    length: usize,
-) -> Result<usize, IdentifyMessageError> {
-    offset
-        .checked_add(length)
-        .filter(|end| *end <= input.len())
-        .ok_or(IdentifyMessageError::FieldOverflow {
-            offset,
-            length: length as u64,
-            remaining: input.len().saturating_sub(offset),
-        })
+    core::str::from_utf8(value)
+        .map(String::from)
+        .map_err(|_| IdentifyMessageError::InvalidUtf8 { field_number })
 }
 
 // ---------------------------------------------------------------------------
@@ -329,7 +177,17 @@ fn checked_advance(
 mod tests {
     use alloc::vec;
 
+    use minip2p_core::{WIRE_LEN, WIRE_VARINT, read_uvarint, write_uvarint};
+
     use super::*;
+
+    // Single-byte tags for field numbers < 16 (known-good fixture literals).
+    const TAG_PUBLIC_KEY: u8 = ((FIELD_PUBLIC_KEY as u8) << 3) | WIRE_LEN;
+    const TAG_LISTEN_ADDRS: u8 = ((FIELD_LISTEN_ADDRS as u8) << 3) | WIRE_LEN;
+    const TAG_PROTOCOLS: u8 = ((FIELD_PROTOCOLS as u8) << 3) | WIRE_LEN;
+    const TAG_OBSERVED_ADDR: u8 = ((FIELD_OBSERVED_ADDR as u8) << 3) | WIRE_LEN;
+    const TAG_PROTOCOL_VERSION: u8 = ((FIELD_PROTOCOL_VERSION as u8) << 3) | WIRE_LEN;
+    const TAG_AGENT_VERSION: u8 = ((FIELD_AGENT_VERSION as u8) << 3) | WIRE_LEN;
 
     #[test]
     fn round_trip_empty_message() {
@@ -406,7 +264,10 @@ mod tests {
         data.extend_from_slice(&[0u8; 5]);
 
         let err = IdentifyMessage::decode(&data).unwrap_err();
-        assert!(matches!(err, IdentifyMessageError::FieldOverflow { .. }));
+        assert!(matches!(
+            err,
+            IdentifyMessageError::Wire(WireError::FieldOverflow { .. })
+        ));
     }
 
     #[test]
@@ -442,6 +303,29 @@ mod tests {
         };
 
         let encoded = msg.encode();
+        assert_eq!(
+            encoded,
+            vec![
+                TAG_PUBLIC_KEY,
+                1,
+                0x01,
+                TAG_LISTEN_ADDRS,
+                1,
+                0x02,
+                TAG_PROTOCOLS,
+                1,
+                b'p',
+                TAG_OBSERVED_ADDR,
+                1,
+                0x03,
+                TAG_PROTOCOL_VERSION,
+                1,
+                b'v',
+                TAG_AGENT_VERSION,
+                1,
+                b'a',
+            ]
+        );
 
         let tags: Vec<u8> = extract_field_tags(&encoded);
         assert_eq!(
@@ -494,7 +378,7 @@ mod tests {
         let err = IdentifyMessage::decode(&data).unwrap_err();
         assert!(matches!(
             err,
-            IdentifyMessageError::UnsupportedWireType { wire_type: 3, .. }
+            IdentifyMessageError::Wire(WireError::UnsupportedWireType { wire_type: 3, .. })
         ));
     }
 
@@ -512,7 +396,7 @@ mod tests {
         let err = IdentifyMessage::decode(&data).unwrap_err();
         assert!(matches!(
             err,
-            IdentifyMessageError::UnsupportedWireType { wire_type: 4, .. }
+            IdentifyMessageError::Wire(WireError::UnsupportedWireType { wire_type: 4, .. })
         ));
     }
 

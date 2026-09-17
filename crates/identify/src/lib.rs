@@ -17,7 +17,9 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId, SansIoProtocol, VarintError, read_uvarint, write_uvarint};
+use minip2p_core::{
+    Multiaddr, PeerId, SansIoProtocol, VarintError, WireError, encode_frame, read_uvarint,
+};
 use minip2p_transport::StreamId;
 use thiserror::Error;
 
@@ -475,59 +477,60 @@ impl SansIoProtocol for IdentifyProtocol {
 /// call site for [`IdentifyInput::RegisterOutboundStream`] for why
 /// omitting it breaks interop with third-party libp2p peers.
 fn encode_length_prefixed(payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(10 + payload.len());
-    write_uvarint(payload.len() as u64, &mut out);
-    out.extend_from_slice(payload);
-    out
+    encode_frame(payload)
 }
 
 /// Strips the varint length prefix from a framed Identify buffer and
 /// returns a borrowed slice over the body.
 ///
 /// Errors:
-/// - `Varint` if the prefix itself is malformed.
-/// - `FieldOverflow` if the prefix declares a length longer than the
+/// - `Wire(Varint)` if the prefix itself is malformed.
+/// - `Wire(FieldOverflow)` if the prefix declares a length longer than the
 ///   bytes we have (the stream was truncated before the full message
 ///   arrived, or the peer lied about the length).
 fn decode_length_prefixed(buf: &[u8]) -> Result<&[u8], message::IdentifyMessageError> {
-    let (len, consumed) =
-        read_uvarint(buf).map_err(|e: VarintError| message::IdentifyMessageError::from(e))?;
-    let body = buf
-        .get(consumed..)
-        .ok_or(message::IdentifyMessageError::FieldOverflow {
-            offset: consumed,
-            length: len,
-            remaining: 0,
-        })?;
+    let (len, consumed) = read_uvarint(buf).map_err(WireError::from)?;
+    let body = buf.get(consumed..).ok_or(WireError::FieldOverflow {
+        offset: consumed,
+        length: 0,
+        remaining: 0,
+    })?;
     let remaining = body.len();
     // Compare in u64 so an absurd declared length errs identically on
     // 32-bit and 64-bit targets.
     if len > remaining as u64 {
-        return Err(message::IdentifyMessageError::FieldOverflow {
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "wire lengths wider than usize are reported as varint overflow"
+        )]
+        let length = usize::try_from(len).map_err(|_| VarintError::Overflow)?;
+        return Err(WireError::FieldOverflow {
+            offset: consumed,
+            length,
+            remaining,
+        }
+        .into());
+    }
+    let len = len as usize;
+    let end = consumed.checked_add(len).ok_or(WireError::FieldOverflow {
+        offset: consumed,
+        length: len,
+        remaining,
+    })?;
+    buf.get(consumed..end).ok_or(
+        WireError::FieldOverflow {
             offset: consumed,
             length: len,
             remaining,
-        });
-    }
-    let len = len as usize;
-    let end = consumed
-        .checked_add(len)
-        .ok_or(message::IdentifyMessageError::FieldOverflow {
-            offset: consumed,
-            length: len as u64,
-            remaining,
-        })?;
-    buf.get(consumed..end)
-        .ok_or(message::IdentifyMessageError::FieldOverflow {
-            offset: consumed,
-            length: len as u64,
-            remaining,
-        })
+        }
+        .into(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minip2p_core::write_uvarint;
 
     impl IdentifyProtocol {
         /// Drain buffered events (test helper).
@@ -600,7 +603,9 @@ mod tests {
         framed.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
         assert!(matches!(
             decode_length_prefixed(&framed),
-            Err(message::IdentifyMessageError::FieldOverflow { .. })
+            Err(message::IdentifyMessageError::Wire(
+                WireError::FieldOverflow { .. }
+            ))
         ));
     }
 
