@@ -1,16 +1,16 @@
 //! Shared protobuf field codec for minip2p protocol crates.
 //!
 //! Owns the common wire vocabulary — tag bytes, varint and length-delimited
-//! field encode/decode, unknown-field skipping, and [`WireError`] — so framing
-//! limits and malformed-input behavior cannot drift between protocols.
+//! field encode/decode, unknown-field skipping, and [`WireError`] — so migrated
+//! protocols share one framing implementation. Protocol crates keep their own
+//! message structs, semantic validation, and contextual public errors; they
+//! wrap [`WireError`] rather than exposing it bare. Field-number policy (for
+//! example rejecting field 0) stays with the caller. This module is
+//! `no_std` + `alloc` and introduces no I/O, clock, or async dependency.
 //!
-//! Protocol crates keep their own message structs, semantic validation, and
-//! contextual public errors; they wrap [`WireError`] rather than exposing it
-//! bare. Field-number policy (for example rejecting field 0) stays with the
-//! caller. This module is `no_std` + `alloc` and introduces no I/O, clock, or
-//! async dependency.
-//!
-//! Stream-level length-prefix framing remains in [`crate::frame`].
+//! Stream-level length-prefix framing remains in [`crate::frame`]. Relay is the
+//! first complete consumer; other protocol crates may still keep local copies
+//! until they migrate.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -106,13 +106,11 @@ pub fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u
             remaining,
         });
     }
-    let end = idx
-        .checked_add(length)
-        .ok_or(WireError::FieldOverflow {
-            offset: *idx,
-            length,
-            remaining,
-        })?;
+    let end = idx.checked_add(length).ok_or(WireError::FieldOverflow {
+        offset: *idx,
+        length,
+        remaining,
+    })?;
     let value = input.get(*idx..end).ok_or(WireError::FieldOverflow {
         offset: *idx,
         length,
@@ -149,23 +147,8 @@ pub fn skip_field(input: &[u8], idx: &mut usize, wire_type: u8) -> Result<(), Wi
             advance(input, idx, used)
         }
         WIRE_LEN => {
-            let (length, used) =
-                read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
-            advance(input, idx, used)?;
-            #[expect(
-                clippy::map_err_ignore,
-                reason = "wire lengths wider than usize are reported as varint overflow"
-            )]
-            let length = usize::try_from(length).map_err(|_| VarintError::Overflow)?;
-            let remaining = input.len().saturating_sub(*idx);
-            if length > remaining {
-                return Err(WireError::FieldOverflow {
-                    offset: *idx,
-                    length,
-                    remaining,
-                });
-            }
-            advance(input, idx, length)
+            read_len_delimited(input, idx)?;
+            Ok(())
         }
         WIRE_I32 => advance(input, idx, 4),
         WIRE_I64 => advance(input, idx, 8),
