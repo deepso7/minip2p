@@ -1,9 +1,12 @@
 //! Sans-I/O multi-source peer discovery for minip2p.
 //!
 //! [`BeaconAgent`] validates and schedules signed pubsub presence beacons.
-//! [`PeerDiscoveryAgent`] maintains one bounded address book and dial policy
-//! across authenticated beacon observations and unauthenticated mDNS claims.
-//! Neither component owns sockets, clocks, streams, or an executor.
+//! Beacon protobuf framing uses the shared vocabulary in [`minip2p_core`];
+//! this crate keeps beacon layout, size caps, and contextual
+//! [`DiscoveryWireError`] values. [`PeerDiscoveryAgent`] maintains one bounded
+//! address book and dial policy across authenticated beacon observations and
+//! unauthenticated mDNS claims. Neither component owns sockets, clocks,
+//! streams, or an executor.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 

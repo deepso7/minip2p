@@ -17,8 +17,7 @@ use alloc::vec::Vec;
 
 use minip2p_core::{
     PeerId, WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field, encode_nested_field,
-    encode_varint_field, read_len_delimited, read_string, read_tag as read_wire_tag,
-    read_varint_value, skip_field,
+    encode_varint_field, read_len_delimited, read_string, read_varint_value, skip_field,
 };
 use minip2p_identity::{Ed25519Keypair, PublicKey};
 
@@ -714,7 +713,7 @@ impl Rpc {
 /// Pubsub matches upstream by refusing field 0 rather than skipping it.
 fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, PubsubWireError> {
     let offset = *idx;
-    match read_wire_tag(input, idx)? {
+    match minip2p_core::read_tag(input, idx)? {
         Some((0, _)) => Err(PubsubWireError::InvalidFieldNumber { offset }),
         other => Ok(other),
     }
