@@ -4,6 +4,10 @@
 //! real libp2p dials. This crate only handles protocol bytes and state; callers
 //! own streams, dial-back attempts, timers, and policy decisions.
 //!
+//! Field framing uses the shared protobuf vocabulary in [`minip2p_core`];
+//! AutoNAT keeps its message types, semantic checks (including rejecting field
+//! number 0), and contextual [`AutoNatError`] values.
+//!
 //! `no_std` + `alloc` compatible.
 
 #![cfg_attr(not(feature = "std"), no_std)]
@@ -13,7 +17,13 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId, SansIoProtocol, VarintError, read_uvarint, write_uvarint};
+use minip2p_core::{
+    Multiaddr, PeerId, SansIoProtocol, WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field,
+    encode_nested_field, encode_varint_field, read_len_delimited, read_tag, read_varint_value,
+    skip_field,
+};
+#[cfg(test)]
+use minip2p_core::{VarintError, write_uvarint};
 
 /// Protocol id for AutoNAT v1.
 pub const AUTONAT_PROTOCOL_ID: &str = "/libp2p/autonat/1.0.0";
@@ -21,17 +31,8 @@ pub const AUTONAT_PROTOCOL_ID: &str = "/libp2p/autonat/1.0.0";
 /// Maximum size for one AutoNAT frame.
 pub const MAX_MESSAGE_SIZE: usize = 8192;
 
-const WIRE_VARINT: u8 = 0;
-const WIRE_LEN: u8 = 2;
+#[cfg(test)]
 const TAG_TYPE: u8 = (1 << 3) | WIRE_VARINT;
-const TAG_DIAL: u8 = (2 << 3) | WIRE_LEN;
-const TAG_DIAL_RESPONSE: u8 = (3 << 3) | WIRE_LEN;
-const TAG_PEER: u8 = (1 << 3) | WIRE_LEN;
-const TAG_PEER_ID: u8 = (1 << 3) | WIRE_LEN;
-const TAG_PEER_ADDRS: u8 = (2 << 3) | WIRE_LEN;
-const TAG_STATUS: u8 = (1 << 3) | WIRE_VARINT;
-const TAG_STATUS_TEXT: u8 = (2 << 3) | WIRE_LEN;
-const TAG_RESPONSE_ADDRS: u8 = (3 << 3) | WIRE_LEN;
 
 /// Top-level AutoNAT message type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,6 +192,9 @@ struct Message {
 }
 
 /// AutoNAT state-machine and message errors.
+///
+/// Shared framing failures are wrapped as [`Self::Wire`] so callers retain
+/// AutoNAT context while reusing the core protobuf vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum AutoNatError {
     /// Incoming message exceeded the configured maximum size.
@@ -199,22 +203,9 @@ pub enum AutoNatError {
     /// Frame prefix declared a message larger than the configured maximum size.
     #[error("AutoNAT frame length exceeds maximum size ({len} > {MAX_MESSAGE_SIZE})")]
     FrameTooLarge { len: u64 },
-    /// A varint could not be decoded.
-    #[error("varint error: {0}")]
-    Varint(#[from] VarintError),
-    /// A length-delimited field extends beyond the message boundary.
-    #[error("field at offset {offset} claims length {length} but only {remaining} bytes remain")]
-    FieldOverflow {
-        /// Byte offset where the field body should start.
-        offset: usize,
-        /// Declared field length.
-        length: usize,
-        /// Remaining bytes in the message.
-        remaining: usize,
-    },
-    /// Unsupported protobuf wire type.
-    #[error("unsupported wire type {wire_type} at offset {offset}")]
-    UnsupportedWireType { wire_type: u8, offset: usize },
+    /// A shared protobuf framing failure.
+    #[error(transparent)]
+    Wire(#[from] WireError),
     /// Required message type field was missing.
     #[error("required `type` field missing")]
     MissingType,
@@ -319,7 +310,7 @@ impl AutoNatClient {
             FrameDecode::Complete { payload, consumed } => (Message::decode(payload), consumed),
             FrameDecode::Incomplete => return Ok(()),
             FrameDecode::TooLarge { len } => return Err(AutoNatError::FrameTooLarge { len }),
-            FrameDecode::Error(e) => return Err(AutoNatError::Varint(e)),
+            FrameDecode::Error(e) => return Err(WireError::from(e).into()),
         };
         self.recv_buf.drain(..consumed);
         let msg = decoded?;
@@ -422,7 +413,7 @@ impl AutoNatServer {
             FrameDecode::Complete { payload, consumed } => (Message::decode(payload), consumed),
             FrameDecode::Incomplete => return Ok(()),
             FrameDecode::TooLarge { len } => return Err(AutoNatError::FrameTooLarge { len }),
-            FrameDecode::Error(e) => return Err(AutoNatError::Varint(e)),
+            FrameDecode::Error(e) => return Err(WireError::from(e).into()),
         };
         self.recv_buf.drain(..consumed);
         let msg = decoded?;
@@ -535,12 +526,12 @@ pub fn decode_frame(input: &[u8]) -> FrameDecode<'_> {
 impl Message {
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        encode_varint_field(&mut out, TAG_TYPE, self.kind as u64);
+        encode_varint_field(&mut out, 1, self.kind as u64);
         if let Some(dial) = &self.dial {
-            encode_bytes_field(&mut out, TAG_DIAL, &dial.encode());
+            encode_nested_field(&mut out, 2, &dial.encode());
         }
         if let Some(response) = &self.dial_response {
-            encode_bytes_field(&mut out, TAG_DIAL_RESPONSE, &response.encode());
+            encode_nested_field(&mut out, 3, &response.encode());
         }
         out
     }
@@ -550,7 +541,7 @@ impl Message {
         let mut kind = None;
         let mut dial = None;
         let mut dial_response = None;
-        while let Some((field, wire)) = read_tag(input, &mut idx)? {
+        while let Some((field, wire)) = read_autonat_tag(input, &mut idx)? {
             match (field, wire) {
                 (1, WIRE_VARINT) => {
                     let value = read_varint_value(input, &mut idx)?;
@@ -564,18 +555,7 @@ impl Message {
                     dial_response =
                         Some(DialResponse::decode(read_len_delimited(input, &mut idx)?)?)
                 }
-                (_, WIRE_LEN) => {
-                    let _ = read_len_delimited(input, &mut idx)?;
-                }
-                (_, WIRE_VARINT) => {
-                    let _ = read_varint_value(input, &mut idx)?;
-                }
-                (_, other) => {
-                    return Err(AutoNatError::UnsupportedWireType {
-                        wire_type: other,
-                        offset: idx,
-                    });
-                }
+                _ => skip_field(input, &mut idx, wire)?,
             }
         }
         Ok(Self {
@@ -590,7 +570,7 @@ impl Dial {
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         if let Some(peer) = &self.peer {
-            encode_bytes_field(&mut out, TAG_PEER, &peer.encode());
+            encode_nested_field(&mut out, 1, &peer.encode());
         }
         out
     }
@@ -598,23 +578,12 @@ impl Dial {
     fn decode(input: &[u8]) -> Result<Self, AutoNatError> {
         let mut idx = 0;
         let mut peer = None;
-        while let Some((field, wire)) = read_tag(input, &mut idx)? {
+        while let Some((field, wire)) = read_autonat_tag(input, &mut idx)? {
             match (field, wire) {
                 (1, WIRE_LEN) => {
                     peer = Some(PeerInfo::decode(read_len_delimited(input, &mut idx)?)?)
                 }
-                (_, WIRE_LEN) => {
-                    let _ = read_len_delimited(input, &mut idx)?;
-                }
-                (_, WIRE_VARINT) => {
-                    let _ = read_varint_value(input, &mut idx)?;
-                }
-                (_, other) => {
-                    return Err(AutoNatError::UnsupportedWireType {
-                        wire_type: other,
-                        offset: idx,
-                    });
-                }
+                _ => skip_field(input, &mut idx, wire)?,
             }
         }
         Ok(Self { peer })
@@ -624,9 +593,9 @@ impl Dial {
 impl PeerInfo {
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        encode_bytes_field(&mut out, TAG_PEER_ID, &self.id);
+        encode_bytes_field(&mut out, 1, &self.id);
         for addr in &self.addrs {
-            encode_bytes_field(&mut out, TAG_PEER_ADDRS, addr);
+            encode_bytes_field(&mut out, 2, addr);
         }
         out
     }
@@ -635,22 +604,11 @@ impl PeerInfo {
         let mut idx = 0;
         let mut id = Vec::new();
         let mut addrs = Vec::new();
-        while let Some((field, wire)) = read_tag(input, &mut idx)? {
+        while let Some((field, wire)) = read_autonat_tag(input, &mut idx)? {
             match (field, wire) {
                 (1, WIRE_LEN) => id = read_len_delimited(input, &mut idx)?.to_vec(),
                 (2, WIRE_LEN) => addrs.push(read_len_delimited(input, &mut idx)?.to_vec()),
-                (_, WIRE_LEN) => {
-                    let _ = read_len_delimited(input, &mut idx)?;
-                }
-                (_, WIRE_VARINT) => {
-                    let _ = read_varint_value(input, &mut idx)?;
-                }
-                (_, other) => {
-                    return Err(AutoNatError::UnsupportedWireType {
-                        wire_type: other,
-                        offset: idx,
-                    });
-                }
+                _ => skip_field(input, &mut idx, wire)?,
             }
         }
         Ok(Self { id, addrs })
@@ -660,12 +618,12 @@ impl PeerInfo {
 impl DialResponse {
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        encode_varint_field(&mut out, TAG_STATUS, self.status as u64);
+        encode_varint_field(&mut out, 1, self.status as u64);
         if let Some(text) = &self.status_text {
-            encode_bytes_field(&mut out, TAG_STATUS_TEXT, text.as_bytes());
+            encode_bytes_field(&mut out, 2, text.as_bytes());
         }
         for addr in &self.addrs {
-            encode_bytes_field(&mut out, TAG_RESPONSE_ADDRS, addr);
+            encode_bytes_field(&mut out, 3, addr);
         }
         out
     }
@@ -675,7 +633,7 @@ impl DialResponse {
         let mut status = ResponseStatus::InternalError;
         let mut status_text = None;
         let mut addrs = Vec::new();
-        while let Some((field, wire)) = read_tag(input, &mut idx)? {
+        while let Some((field, wire)) = read_autonat_tag(input, &mut idx)? {
             match (field, wire) {
                 (1, WIRE_VARINT) => {
                     status = ResponseStatus::from_u64(read_varint_value(input, &mut idx)?)
@@ -685,18 +643,7 @@ impl DialResponse {
                     status_text = Some(String::from_utf8_lossy(text).into_owned());
                 }
                 (3, WIRE_LEN) => addrs.push(read_len_delimited(input, &mut idx)?.to_vec()),
-                (_, WIRE_LEN) => {
-                    let _ = read_len_delimited(input, &mut idx)?;
-                }
-                (_, WIRE_VARINT) => {
-                    let _ = read_varint_value(input, &mut idx)?;
-                }
-                (_, other) => {
-                    return Err(AutoNatError::UnsupportedWireType {
-                        wire_type: other,
-                        offset: idx,
-                    });
-                }
+                _ => skip_field(input, &mut idx, wire)?,
             }
         }
         Ok(Self {
@@ -720,80 +667,13 @@ fn enforce_max_size(buf: &[u8]) -> Result<(), AutoNatError> {
     Ok(())
 }
 
-fn encode_varint_field(out: &mut Vec<u8>, tag: u8, value: u64) {
-    out.push(tag);
-    write_uvarint(value, out);
-}
-
-fn encode_bytes_field(out: &mut Vec<u8>, tag: u8, data: &[u8]) {
-    out.push(tag);
-    write_uvarint(data.len() as u64, out);
-    out.extend_from_slice(data);
-}
-
-fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, AutoNatError> {
-    if *idx >= input.len() {
-        return Ok(None);
-    }
+/// AutoNAT rejects protobuf field number 0; shared `read_tag` leaves that policy to callers.
+fn read_autonat_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, AutoNatError> {
     let offset = *idx;
-    let (tag_value, used) = read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
-    advance(input, idx, used)?;
-    let wire_type = (tag_value & 0x07) as u8;
-    let field_number = tag_value >> 3;
-    if field_number == 0 {
-        return Err(AutoNatError::UnsupportedWireType { wire_type, offset });
+    match read_tag(input, idx)? {
+        Some((0, wire_type)) => Err(WireError::UnsupportedWireType { wire_type, offset }.into()),
+        other => Ok(other),
     }
-    Ok(Some((field_number, wire_type)))
-}
-
-fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], AutoNatError> {
-    let (length, used) = read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
-    advance(input, idx, used)?;
-    #[expect(
-        clippy::map_err_ignore,
-        reason = "wire lengths wider than usize are reported as varint overflow"
-    )]
-    let length = usize::try_from(length).map_err(|_| VarintError::Overflow)?;
-    let remaining = input.len().saturating_sub(*idx);
-    if length > remaining {
-        return Err(AutoNatError::FieldOverflow {
-            offset: *idx,
-            length,
-            remaining,
-        });
-    }
-    let end = idx.checked_add(length).ok_or(AutoNatError::FieldOverflow {
-        offset: *idx,
-        length,
-        remaining,
-    })?;
-    let value = input.get(*idx..end).ok_or(AutoNatError::FieldOverflow {
-        offset: *idx,
-        length,
-        remaining,
-    })?;
-    *idx = end;
-    Ok(value)
-}
-
-fn read_varint_value(input: &[u8], idx: &mut usize) -> Result<u64, AutoNatError> {
-    let (value, used) = read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
-    advance(input, idx, used)?;
-    Ok(value)
-}
-
-fn advance(input: &[u8], idx: &mut usize, length: usize) -> Result<(), AutoNatError> {
-    let remaining = input.len().saturating_sub(*idx);
-    let end = idx
-        .checked_add(length)
-        .filter(|end| *end <= input.len())
-        .ok_or(AutoNatError::FieldOverflow {
-            offset: *idx,
-            length,
-            remaining,
-        })?;
-    *idx = end;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -893,6 +773,83 @@ mod tests {
             FrameDecode::TooLarge {
                 len: (MAX_MESSAGE_SIZE + 1) as u64
             }
+        );
+    }
+
+    #[test]
+    fn dial_encode_matches_known_bytes() {
+        // type=DIAL, nested Dial { Peer { id = [0xaa], no addrs } }
+        let msg = Message {
+            kind: MessageType::Dial,
+            dial: Some(Dial {
+                peer: Some(PeerInfo {
+                    id: vec![0xaa],
+                    addrs: Vec::new(),
+                }),
+            }),
+            dial_response: None,
+        };
+        assert_eq!(
+            msg.encode(),
+            vec![
+                0x08, 0x00, // type = DIAL
+                0x12, 0x05, // dial LEN 5
+                0x0a, 0x03, // peer LEN 3
+                0x0a, 0x01, 0xaa, // peer.id
+            ]
+        );
+    }
+
+    #[test]
+    fn dial_response_encode_matches_known_bytes() {
+        let msg = Message {
+            kind: MessageType::DialResponse,
+            dial: None,
+            dial_response: Some(DialResponse {
+                status: ResponseStatus::Ok,
+                status_text: Some(String::from("ok")),
+                addrs: vec![vec![0x04, 127, 0, 0, 1]],
+            }),
+        };
+        assert_eq!(
+            msg.encode(),
+            vec![
+                0x08, 0x01, // type = DIAL_RESPONSE
+                0x1a, 0x0d, // dialResponse LEN 13
+                0x08, 0x00, // status = OK
+                0x12, 0x02, b'o', b'k', // statusText
+                0x1a, 0x05, 0x04, 127, 0, 0, 1, // addr
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_rejects_field_number_zero() {
+        let err = Message::decode(&[0x02, 0x00]).unwrap_err();
+        assert!(matches!(
+            err,
+            AutoNatError::Wire(WireError::UnsupportedWireType {
+                wire_type: WIRE_LEN,
+                offset: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn wire_failures_keep_autonat_display() {
+        let err = Message::decode(&[0x12, 0x05, b'a', b'b']).unwrap_err();
+        assert!(matches!(
+            err,
+            AutoNatError::Wire(WireError::FieldOverflow {
+                offset: 2,
+                length: 5,
+                remaining: 2
+            })
+        ));
+        let display = alloc::format!("{err}");
+        assert!(
+            display.contains("claims length"),
+            "wire detail should remain visible: {display}"
         );
     }
 

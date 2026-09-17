@@ -13,28 +13,30 @@
 //!   repeated bytes ObsAddrs = 2; // wire type LEN (2)
 //! }
 //! ```
+//!
+//! Field framing uses the shared protobuf vocabulary in [`minip2p_core`];
+//! this module keeps DCUtR message types, semantic checks, and contextual
+//! [`DcutrMessageError`] values.
 
 extern crate alloc;
 
 use alloc::vec::Vec;
 
-use minip2p_core::{VarintError, read_uvarint, uvarint_len, write_uvarint};
+use minip2p_core::{
+    WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field, encode_varint_field, read_len_delimited,
+    read_tag, read_varint_value, skip_field, uvarint_len,
+};
 use thiserror::Error;
 
 use crate::MAX_MESSAGE_SIZE;
-
-// Wire types from the protobuf spec.
-const WIRE_VARINT: u8 = 0;
-const WIRE_LEN: u8 = 2;
 
 // Field numbers for the HolePunch message.
 const FIELD_TYPE: u64 = 1;
 const FIELD_OBS_ADDRS: u64 = 2;
 
-// Single-byte tag bytes used by the encoder (valid for field numbers < 16).
-// The decoder does NOT match on truncated u8 tags -- it uses the full u64
-// field_number + wire_type split below -- so these are encoder-only.
+#[cfg(test)]
 const TAG_TYPE: u8 = ((FIELD_TYPE as u8) << 3) | WIRE_VARINT; // 0x08
+#[cfg(test)]
 const TAG_OBS_ADDRS: u8 = ((FIELD_OBS_ADDRS as u8) << 3) | WIRE_LEN; // 0x12
 
 /// Type discriminator for the HolePunch message.
@@ -65,18 +67,14 @@ pub struct HolePunch {
 }
 
 /// Errors that can occur while decoding a HolePunch message.
+///
+/// Shared framing failures are wrapped as [`Self::Wire`] so callers retain
+/// DCUtR context while reusing the core protobuf vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum DcutrMessageError {
-    #[error("varint error: {0}")]
-    Varint(#[from] VarintError),
-    #[error("field at offset {offset} claims length {length} but only {remaining} bytes remain")]
-    FieldOverflow {
-        offset: usize,
-        length: usize,
-        remaining: usize,
-    },
-    #[error("unsupported wire type {wire_type} at offset {offset}")]
-    UnsupportedWireType { wire_type: u8, offset: usize },
+    /// A shared protobuf framing failure.
+    #[error(transparent)]
+    Wire(#[from] WireError),
     #[error("required `type` field missing")]
     MissingType,
     #[error("invalid HolePunch type value: {value}")]
@@ -94,13 +92,9 @@ impl HolePunch {
             .sum();
         let mut out = Vec::with_capacity(1 + uvarint_len(self.kind as u64) + addrs_bytes);
 
-        out.push(TAG_TYPE);
-        write_uvarint(self.kind as u64, &mut out);
-
+        encode_varint_field(&mut out, FIELD_TYPE, self.kind as u64);
         for addr in &self.obs_addrs {
-            out.push(TAG_OBS_ADDRS);
-            write_uvarint(addr.len() as u64, &mut out);
-            out.extend_from_slice(addr);
+            encode_bytes_field(&mut out, FIELD_OBS_ADDRS, addr);
         }
 
         out
@@ -112,76 +106,19 @@ impl HolePunch {
         let mut obs_addrs = Vec::new();
         let mut idx = 0;
 
-        while idx < input.len() {
-            // Read the field tag as a full u64. Field numbers >= 16 encode as
-            // multi-byte varints; truncating to u8 would let a remote peer
-            // alias known tags (e.g. field 33 + LEN => 266, `266 as u8 = 0x0A`).
-            let (tag_value, used) =
-                read_uvarint(input.get(idx..).ok_or(VarintError::BufferTooShort)?)?;
-            advance(input, &mut idx, used)?;
-
-            let wire_type = (tag_value & 0x07) as u8;
-            let field_number = tag_value >> 3;
-
+        while let Some((field_number, wire_type)) = read_tag(input, &mut idx)? {
             match (field_number, wire_type) {
                 (FIELD_TYPE, WIRE_VARINT) => {
-                    let (value, used) =
-                        read_uvarint(input.get(idx..).ok_or(VarintError::BufferTooShort)?)?;
-                    advance(input, &mut idx, used)?;
+                    let value = read_varint_value(input, &mut idx)?;
                     kind = Some(
                         HolePunchType::from_u64(value)
                             .ok_or(DcutrMessageError::InvalidType { value })?,
                     );
                 }
                 (FIELD_OBS_ADDRS, WIRE_LEN) => {
-                    let value = read_len_delimited(input, &mut idx)?;
-                    obs_addrs.push(value.to_vec());
+                    obs_addrs.push(read_len_delimited(input, &mut idx)?.to_vec());
                 }
-                // Skip unknown fields based on their wire type.
-                (_, WIRE_VARINT) => {
-                    let (_, used) =
-                        read_uvarint(input.get(idx..).ok_or(VarintError::BufferTooShort)?)?;
-                    advance(input, &mut idx, used)?;
-                }
-                (_, WIRE_LEN) => {
-                    let _ = read_len_delimited(input, &mut idx)?;
-                }
-                (_, 1 /* I64 */) => {
-                    let end = idx.checked_add(8).ok_or(DcutrMessageError::FieldOverflow {
-                        offset: idx,
-                        length: 8,
-                        remaining: input.len().saturating_sub(idx),
-                    })?;
-                    if end > input.len() {
-                        return Err(DcutrMessageError::FieldOverflow {
-                            offset: idx,
-                            length: 8,
-                            remaining: input.len().saturating_sub(idx),
-                        });
-                    }
-                    idx = end;
-                }
-                (_, 5 /* I32 */) => {
-                    let end = idx.checked_add(4).ok_or(DcutrMessageError::FieldOverflow {
-                        offset: idx,
-                        length: 4,
-                        remaining: input.len().saturating_sub(idx),
-                    })?;
-                    if end > input.len() {
-                        return Err(DcutrMessageError::FieldOverflow {
-                            offset: idx,
-                            length: 4,
-                            remaining: input.len().saturating_sub(idx),
-                        });
-                    }
-                    idx = end;
-                }
-                (_, other) => {
-                    return Err(DcutrMessageError::UnsupportedWireType {
-                        wire_type: other,
-                        offset: idx,
-                    });
-                }
+                _ => skip_field(input, &mut idx, wire_type)?,
             }
         }
 
@@ -190,65 +127,6 @@ impl HolePunch {
             obs_addrs,
         })
     }
-}
-
-/// Reads a length-delimited value, performing a checked `u64 -> usize`
-/// conversion to guard against truncation on 32-bit targets.
-fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], DcutrMessageError> {
-    let (length_u64, len_used) =
-        read_uvarint(input.get(*idx..).ok_or(VarintError::BufferTooShort)?)?;
-    advance(input, idx, len_used)?;
-
-    let remaining = input.len().saturating_sub(*idx);
-    #[expect(
-        clippy::map_err_ignore,
-        reason = "the compact field-overflow error reports the unrepresentable length"
-    )]
-    let length = usize::try_from(length_u64).map_err(|_| DcutrMessageError::FieldOverflow {
-        offset: *idx,
-        length: usize::MAX,
-        remaining,
-    })?;
-
-    if length > remaining {
-        return Err(DcutrMessageError::FieldOverflow {
-            offset: *idx,
-            length,
-            remaining,
-        });
-    }
-
-    let end = idx
-        .checked_add(length)
-        .ok_or(DcutrMessageError::FieldOverflow {
-            offset: *idx,
-            length,
-            remaining,
-        })?;
-    let value = input
-        .get(*idx..end)
-        .ok_or(DcutrMessageError::FieldOverflow {
-            offset: *idx,
-            length,
-            remaining,
-        })?;
-    *idx = end;
-    Ok(value)
-}
-
-/// Advances a protobuf cursor without allowing it to leave the input slice.
-fn advance(input: &[u8], idx: &mut usize, length: usize) -> Result<(), DcutrMessageError> {
-    let remaining = input.len().saturating_sub(*idx);
-    let end = idx
-        .checked_add(length)
-        .filter(|end| *end <= input.len())
-        .ok_or(DcutrMessageError::FieldOverflow {
-            offset: *idx,
-            length,
-            remaining,
-        })?;
-    *idx = end;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +151,53 @@ pub fn decode_frame(input: &[u8]) -> FrameDecode<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minip2p_core::write_uvarint;
+
+    #[test]
+    fn connect_encode_matches_known_bytes() {
+        let msg = HolePunch {
+            kind: HolePunchType::Connect,
+            obs_addrs: vec![vec![0x04, 127, 0, 0, 1]],
+        };
+        assert_eq!(
+            msg.encode(),
+            vec![0x08, 0x64, 0x12, 0x05, 0x04, 127, 0, 0, 1]
+        );
+    }
+
+    #[test]
+    fn sync_encode_matches_known_bytes() {
+        let msg = HolePunch {
+            kind: HolePunchType::Sync,
+            obs_addrs: Vec::new(),
+        };
+        assert_eq!(msg.encode(), vec![0x08, 0xac, 0x02]);
+    }
+
+    #[test]
+    fn wire_failures_preserve_dcutr_context_in_display() {
+        let input = [0x12, 0x05, b'a', b'b']; // obs_addrs LEN, length 5, only 2 bytes
+        let err = HolePunch::decode(&input).unwrap_err();
+        assert!(matches!(
+            err,
+            DcutrMessageError::Wire(WireError::FieldOverflow {
+                offset: 2,
+                length: 5,
+                remaining: 2
+            })
+        ));
+        let display = alloc::format!("{err}");
+        assert!(
+            display.contains("claims length"),
+            "wire detail should remain visible: {display}"
+        );
+        let wrapped = crate::DcutrError::Malformed(err);
+        let outer = alloc::format!("{wrapped}");
+        assert!(
+            outer.starts_with("malformed DCUtR message:"),
+            "DCUtR context must wrap the shared failure: {outer}"
+        );
+    }
 
     #[test]
     fn connect_round_trip() {
@@ -442,6 +367,7 @@ mod tests {
 #[cfg(test)]
 mod frame_golden {
     use super::*;
+    use minip2p_core::VarintError;
 
     #[test]
     fn golden_empty_payload() {

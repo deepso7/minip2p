@@ -6,7 +6,7 @@ AutoNAT answers whether a peer's advertised addresses are actually dialable by a
 
 ## Scope
 
-This crate implements message framing, encoding/decoding, and the client/server probe state machines. It does **not**:
+This crate implements message framing, encoding/decoding, and the client/server probe state machines. Protobuf field framing uses the shared vocabulary in `minip2p-core`; semantic validation, field-number 0 rejection, and contextual `AutoNatError` values stay here. It does **not**:
 
 - Open streams.
 - Dial candidate addresses.

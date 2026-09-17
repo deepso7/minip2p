@@ -6,7 +6,7 @@ DCUtR is the libp2p protocol that coordinates UDP hole punching between two peer
 
 ## Scope
 
-This crate implements the message state machines only. It does **not**:
+This crate implements the message state machines only. Protobuf field framing for `HolePunch` uses the shared vocabulary in `minip2p-core`; semantic validation and contextual `DcutrMessageError` / `DcutrError` values stay here. It does **not**:
 
 - Open the underlying relayed stream (that is the relay + swarm layer's job).
 - Send UDP packets or dial transports.
