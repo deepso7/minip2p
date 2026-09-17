@@ -10,6 +10,7 @@ This crate focuses on typed address handling and peer-qualified endpoint types.
 - `PeerAddr` helper for validated `transport + peer id` addresses with terminal `/p2p/<peer-id>`.
 - `SansIoProtocol` trait for poll-driven, runtime-agnostic protocol engines.
 - Varint-length-prefixed frame codec (`decode_frame`/`encode_frame`/`FrameDecode`) shared by the protocol crates; decoding is bounded by a caller-supplied maximum payload length.
+- Shared protobuf field codec (`tag_byte`, length-delimited/varint field helpers, `skip_field`, `WireError`) for protocol message bodies; `no_std` + `alloc`, with no I/O, clock, or async dependency. Protocol crates wrap `WireError` in their own contextual errors.
 - Typed error model with actionable parse context.
 - `no_std` support (`alloc`-based), with `std` enabled by default.
 

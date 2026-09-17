@@ -1,13 +1,13 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::SansIoProtocol;
+use minip2p_core::{SansIoProtocol, WireError};
 
 use crate::RelayError;
 use crate::{
-    FrameDecode, HopMessage, HopMessageType, Limit, MAX_PENDING_BRIDGE_SIZE, Peer,
-    RelayMessageError, Reservation, Status, StopMessage, StopMessageType, checked_outbound_frame,
-    decode_frame, describe_status, encode_frame, enforce_max_size,
+    FrameDecode, HopMessage, HopMessageType, Limit, MAX_PENDING_BRIDGE_SIZE, Peer, Reservation,
+    Status, StopMessage, StopMessageType, checked_outbound_frame, decode_frame, describe_status,
+    encode_frame, enforce_max_size,
 };
 #[cfg(test)]
 use crate::{MAX_FRAME_PREFIX_LEN, MAX_MESSAGE_SIZE};
@@ -179,7 +179,7 @@ impl HopReservation {
             }
             FrameDecode::Error(e) => {
                 self.state = FlowState::Done;
-                return Err(RelayError::Malformed(RelayMessageError::Varint(e)));
+                return Err(RelayError::Malformed(WireError::from(e).into()));
             }
         };
         self.recv_buf.drain(..consumed);
@@ -431,7 +431,7 @@ impl HopConnect {
             }
             FrameDecode::Error(e) => {
                 self.state = FlowState::Done;
-                return Err(RelayError::Malformed(RelayMessageError::Varint(e)));
+                return Err(RelayError::Malformed(WireError::from(e).into()));
             }
         };
         self.recv_buf.drain(..consumed);
@@ -721,7 +721,7 @@ impl StopResponder {
             }
             FrameDecode::Error(e) => {
                 self.state = StopState::Done;
-                return Err(RelayError::Malformed(RelayMessageError::Varint(e)));
+                return Err(RelayError::Malformed(WireError::from(e).into()));
             }
         };
         let pending_len = self.recv_buf.len() - consumed;
