@@ -2,7 +2,11 @@
 
 The application-facing endpoint exposes one public, ordered `EndpointEvent` stream. Connection, protocol, discovery, and diagnostic transitions all leave through that stream. Operations return correlation IDs immediately: in particular, `connect` returns one `ConnectId` for the whole Connection attempt, including its candidate Transport dials, relay fallback, and direct-path upgrade. Applications correlate events by these IDs and implement selective waits in their own event loop or in a higher-level adapter.
 
-Stopping a wait does not stop its operation. Cancellation is an explicit endpoint command such as `cancel_connect(connect_id)`, and its outcome is reported through the Endpoint event stream. Events preserve their endpoint emission order, but concurrent transport attempts have no promised completion order. Durable current state is exposed through State snapshots; events report transitions rather than serving as an authoritative event log.
+Every admitted Connection attempt produces exactly one terminal outcome: connected, failed, or cancelled. Synchronous errors are limited to malformed targets or failure to admit the attempt; lack of a currently usable route is a terminal event. Cancelling an unsettled attempt closes every provisional path it opened, stops its remaining Transport dials and direct-path upgrade, and emits cancelled. Cancelling a settled or unknown Connect ID is an idempotent no-op; disconnecting an established connection is a separate command. Stopping a wait does not stop its operation.
+
+A blocking endpoint wait returns one of three Endpoint wait outcomes: event, deadline, or interrupted. Deadline and interruption remain visible so adapters can service timers and commands, but they are not additional event sources. The old driver-progress outcome and its capability-draining contract are removed.
+
+Events preserve their endpoint emission order, but concurrent transport attempts have no promised completion order. State snapshots are authoritative getter operations, not one atomic mega-snapshot. State changes before its corresponding event is queued, so separate getters may be ahead of the Endpoint event stream but never behind their own already-emitted transition.
 
 ## Considered Options
 
@@ -13,9 +17,11 @@ Stopping a wait does not stop its operation. Cancellation is an explicit endpoin
 ## Consequences
 
 - `Endpoint::connect` is the policy-owning application operation and returns one `ConnectId`. Raw mechanism-level dialing remains on `SwarmRuntime`.
+- One sans-I/O Connection-attempt engine in the application-facing crate owns direct candidate racing and coordinates optional NAT, relay, and DCUtR policy. Standard and portable Endpoint compositions use that engine; they do not build parallel attempt state machines. `ConnectId` lives in a portable, feature-independent API module.
 - The Endpoint event stream reports logical Connection-attempt outcomes, not each internal QUIC, TCP, relay, or DNS attempt as an unrelated application operation. Address-level failures may be retained as diagnostics on the logical outcome.
-- Public focused waits and capability-specific endpoint queues are removed. A Rust application dispatches unrelated events while waiting for a matching ID; adapters may offer promises, callbacks, or `waitFor` without changing endpoint semantics.
+- Public focused waits and capability-specific endpoint queues are removed. A Rust application dispatches unrelated events while waiting for a matching ID; adapters may offer promises, callbacks, or `waitFor` without changing endpoint semantics. The standard adapter retains the three Endpoint wait outcomes needed to drive blocking loops.
 - Operation cancellation always requires an explicit command. Dropping or abandoning application-side waiting state has no network side effect.
 - Internally, protocol agents may retain private queues as implementation details, but `Endpoint` is their single public event boundary.
-- The FFI carry buffer from ADR 0003 consumes this stream and retains its documented bounded drop policy; this decision does not add another public queue.
+- The FFI carry buffer from ADR 0003 consumes this stream and retains its documented bounded drop policy. If it drops a terminal Connection-attempt event, its diagnostic identifies the affected Connect ID and every pending foreign-runtime wait for that ID settles with an explicit delivery-loss error; State snapshot getters remain available for recovery. A dropped terminal event must never leave a promise pending indefinitely.
+- In TypeScript, a timeout bounds only the local wait. Aborting with an `AbortSignal` is explicit cancellation intent and invokes the cancellation command. Cancel-on-timeout, if offered, is a separate opt-in policy.
 - Adding a capability normally adds event variants and snapshot state, not another event source or waiting mechanism.

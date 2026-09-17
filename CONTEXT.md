@@ -28,7 +28,7 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 ### NAT traversal
 
-**Connection attempt**: One application-level effort to reach a peer. It may start several Transport dials, establish a Relayed path, and later upgrade that path, but it has one identity and one cancellation lifecycle. _Avoid_: dial
+**Connection attempt**: One application-level effort to reach a peer. It may start several Transport dials, establish a provisional Relayed path, and later upgrade that path, but it has one identity and ends with exactly one terminal outcome: connected, failed, or cancelled. _Avoid_: dial
 
 **Transport dial**: One mechanism-level attempt to establish a transport connection to one peer address. Several Transport dials may belong to one Connection attempt. _Avoid_: connection attempt
 
@@ -38,7 +38,9 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Endpoint event stream**: The endpoint's single public, ordered source of connection, protocol, discovery, and diagnostic events. Applications correlate events with operation IDs and build selective waits above this stream; the endpoint does not expose competing focused queues or waits.
 
-**State snapshot**: The endpoint's authoritative view of durable current state, such as active connections, selected paths, known peer addresses, and listener addresses. Events announce transitions; applications query a State snapshot to recover or answer what is true now.
+**Endpoint wait outcome**: Why a blocking endpoint wait returned: an Endpoint event, the caller's deadline, or an explicit interruption. Deadline and interruption are control outcomes, not competing event sources.
+
+**State snapshot**: An authoritative getter over durable current endpoint state, such as active connections, selected paths, known peer addresses, or listener addresses. State changes before its event is queued, so separate getters may be ahead of the Endpoint event stream and are not one cross-getter atomic snapshot.
 
 **Circuit**: The hop/stop bridged byte pipe through a Circuit Relay v2 hop, before Noise and Yamux have turned it into a Relayed path. _Avoid_: connection (until that upgrade finishes)
 
