@@ -1,6 +1,6 @@
 # minip2p-discovery
 
-Sans-I/O discovery policy shared by signed pubsub beacons and local-link mDNS. `PeerDiscoveryAgent` owns one bounded address book, expiry policy, dial state, backoff, rate limits, provenance, and coalesced application events. `BeaconAgent` separately validates and schedules wire-compatible js-libp2p `pubsub-peer-discovery` beacons on `_peer-discovery._p2p._pubsub`.
+Sans-I/O discovery policy shared by signed pubsub beacons and local-link mDNS. `PeerDiscoveryAgent` owns one bounded address book, expiry policy, dial state, backoff, rate limits, provenance, and coalesced application events. `BeaconAgent` separately validates and schedules wire-compatible js-libp2p `pubsub-peer-discovery` beacons on `_peer-discovery._p2p._pubsub`. Beacon protobuf framing uses the shared vocabulary in `minip2p-core`; this crate keeps beacon layout, size caps, signature-input bytes, and contextual `DiscoveryWireError` values.
 
 The split keeps the book independent of pubsub and DNS. Callers feed validated signed `Observation`s through `observe_beacon` and unauthenticated address/TTL claims through `observe_mdns`, then execute `Dial` and `CancelDial` actions. Neither agent owns sockets, clocks, streams, tasks, or an executor.
 

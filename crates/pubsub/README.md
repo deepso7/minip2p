@@ -33,7 +33,7 @@ This is deliberately a focused compatibility implementation, not a claim of comp
 
 ## Wire compatibility and signing
 
-`Rpc` covers floodsub message fields plus meshsub IHAVE, IWANT, GRAFT, PRUNE, peer-exchange, and prune-backoff fields. Message ids are opaque bytes, matching upstream behavior despite their protobuf `string` declaration. Frames use a varint length prefix and enforce a 64 KiB RPC-body limit.
+`Rpc` covers floodsub message fields plus meshsub IHAVE, IWANT, GRAFT, PRUNE, peer-exchange, and prune-backoff fields. Message ids are opaque bytes, matching upstream behavior despite their protobuf `string` declaration. Field framing uses the shared protobuf vocabulary in `minip2p-core`; this crate keeps RPC/control types, StrictSign canonicalization, the 64 KiB RPC-body limit, and contextual `PubsubWireError` values.
 
 Messages use libp2p StrictSign by default: Ed25519 over `"libp2p-pubsub:" ++ Message`, with `signature` and `key` omitted and the decoded fields canonically re-encoded. The wire message is preserved verbatim for forwarding. minip2p omits the key field because its Ed25519 public key is recoverable from the inline peer id.
 

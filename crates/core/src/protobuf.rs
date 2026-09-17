@@ -8,9 +8,9 @@
 //! example rejecting field 0) stays with the caller. This module is
 //! `no_std` + `alloc` and introduces no I/O, clock, or async dependency.
 //!
-//! Stream-level length-prefix framing remains in [`crate::frame`]. Relay is the
-//! first complete consumer; other protocol crates may still keep local copies
-//! until they migrate.
+//! Stream-level length-prefix framing remains in [`crate::frame`]. Relay,
+//! Gossipsub, and Discovery consume this vocabulary; AutoNAT, DCUtR, Identify,
+//! and Noise still keep local copies until they migrate.
 
 use alloc::string::String;
 use alloc::vec::Vec;
