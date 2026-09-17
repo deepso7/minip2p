@@ -18,7 +18,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use minip2p_core::{
-    Multiaddr, PeerId, SansIoProtocol, VarintError, WireError, encode_frame, read_uvarint,
+    FrameDecode, Multiaddr, PeerId, SansIoProtocol, WireError, decode_frame, encode_frame,
 };
 use minip2p_transport::StreamId;
 use thiserror::Error;
@@ -483,48 +483,18 @@ fn encode_length_prefixed(payload: &[u8]) -> Vec<u8> {
 /// Strips the varint length prefix from a framed Identify buffer and
 /// returns a borrowed slice over the body.
 ///
-/// Errors:
-/// - `Wire(Varint)` if the prefix itself is malformed.
-/// - `Wire(FieldOverflow)` if the prefix declares a length longer than the
-///   bytes we have (the stream was truncated before the full message
-///   arrived, or the peer lied about the length).
+/// Stream length-prefix framing uses [`decode_frame`], not protobuf
+/// [`WireError`]. A prefix that claims more bytes than the buffer holds
+/// is [`IdentifyMessageError::TruncatedPrefix`]; a malformed varint is
+/// [`IdentifyMessageError::Wire`].
 fn decode_length_prefixed(buf: &[u8]) -> Result<&[u8], message::IdentifyMessageError> {
-    let (len, consumed) = read_uvarint(buf).map_err(WireError::from)?;
-    let body = buf.get(consumed..).ok_or(WireError::FieldOverflow {
-        offset: consumed,
-        length: 0,
-        remaining: 0,
-    })?;
-    let remaining = body.len();
-    // Compare in u64 so an absurd declared length errs identically on
-    // 32-bit and 64-bit targets.
-    if len > remaining as u64 {
-        #[expect(
-            clippy::map_err_ignore,
-            reason = "wire lengths wider than usize are reported as varint overflow"
-        )]
-        let length = usize::try_from(len).map_err(|_| VarintError::Overflow)?;
-        return Err(WireError::FieldOverflow {
-            offset: consumed,
-            length,
-            remaining,
+    match decode_frame(buf, usize::MAX) {
+        FrameDecode::Complete { payload, .. } => Ok(payload),
+        FrameDecode::Incomplete | FrameDecode::TooLarge { .. } => {
+            Err(message::IdentifyMessageError::TruncatedPrefix)
         }
-        .into());
+        FrameDecode::Error(error) => Err(WireError::from(error).into()),
     }
-    let len = len as usize;
-    let end = consumed.checked_add(len).ok_or(WireError::FieldOverflow {
-        offset: consumed,
-        length: len,
-        remaining,
-    })?;
-    buf.get(consumed..end).ok_or(
-        WireError::FieldOverflow {
-            offset: consumed,
-            length: len,
-            remaining,
-        }
-        .into(),
-    )
 }
 
 #[cfg(test)]
@@ -603,9 +573,7 @@ mod tests {
         framed.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
         assert!(matches!(
             decode_length_prefixed(&framed),
-            Err(message::IdentifyMessageError::Wire(
-                WireError::FieldOverflow { .. }
-            ))
+            Err(message::IdentifyMessageError::TruncatedPrefix)
         ));
     }
 

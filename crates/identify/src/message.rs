@@ -65,12 +65,9 @@ pub enum IdentifyMessageError {
     /// A string field contains invalid UTF-8.
     #[error("invalid UTF-8 in field {field_number}")]
     InvalidUtf8 { field_number: u64 },
-}
-
-impl From<minip2p_core::VarintError> for IdentifyMessageError {
-    fn from(error: minip2p_core::VarintError) -> Self {
-        Self::Wire(error.into())
-    }
+    /// The varint length prefix declared more payload than the buffer holds.
+    #[error("identify length prefix is truncated")]
+    TruncatedPrefix,
 }
 
 impl IdentifyMessage {
@@ -111,9 +108,10 @@ impl IdentifyMessage {
     ///
     /// - Accepts fields in any order.
     /// - Silently skips unknown *fields* that use a supported wire type.
-    /// - Returns `UnsupportedWireType` for wire types outside the supported
-    ///   set (0, 1, 2, 5) so malformed messages are rejected rather than
-    ///   silently truncated.
+    /// - Returns [`IdentifyMessageError::Wire`] with
+    ///   [`WireError::UnsupportedWireType`] for wire types outside the
+    ///   supported set (0, 1, 2, 5) so malformed messages are rejected
+    ///   rather than silently truncated.
     pub fn decode(input: &[u8]) -> Result<Self, IdentifyMessageError> {
         let mut msg = IdentifyMessage::default();
         let mut idx = 0;
