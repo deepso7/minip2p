@@ -129,6 +129,9 @@ pub enum NoiseError {
     /// The libp2p handshake payload was malformed.
     #[error("invalid libp2p Noise payload: {0}")]
     InvalidPayload(&'static str),
+    /// Shared protobuf framing failed while decoding the handshake payload.
+    #[error("invalid libp2p Noise payload: {0}")]
+    Wire(#[from] minip2p_core::WireError),
     /// The payload's encoded libp2p identity key was invalid.
     #[error("invalid identity key in Noise payload")]
     InvalidIdentityKey,

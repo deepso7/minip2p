@@ -17,7 +17,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId, SansIoProtocol, VarintError, read_uvarint, write_uvarint};
+use minip2p_core::{Multiaddr, PeerId, SansIoProtocol, WireError, encode_frame, read_uvarint};
 use minip2p_transport::StreamId;
 use thiserror::Error;
 
@@ -475,59 +475,41 @@ impl SansIoProtocol for IdentifyProtocol {
 /// call site for [`IdentifyInput::RegisterOutboundStream`] for why
 /// omitting it breaks interop with third-party libp2p peers.
 fn encode_length_prefixed(payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(10 + payload.len());
-    write_uvarint(payload.len() as u64, &mut out);
-    out.extend_from_slice(payload);
-    out
+    encode_frame(payload)
 }
 
 /// Strips the varint length prefix from a framed Identify buffer and
 /// returns a borrowed slice over the body.
 ///
-/// Errors:
-/// - `Varint` if the prefix itself is malformed.
-/// - `FieldOverflow` if the prefix declares a length longer than the
-///   bytes we have (the stream was truncated before the full message
-///   arrived, or the peer lied about the length).
+/// An oversized declared length is always [`WireError::FieldOverflow`],
+/// including when the length does not fit in `usize` on 32-bit targets.
+/// That keeps the error class independent of pointer width. A malformed
+/// prefix varint is [`IdentifyMessageError::Wire`].
 fn decode_length_prefixed(buf: &[u8]) -> Result<&[u8], message::IdentifyMessageError> {
-    let (len, consumed) =
-        read_uvarint(buf).map_err(|e: VarintError| message::IdentifyMessageError::from(e))?;
-    let body = buf
-        .get(consumed..)
-        .ok_or(message::IdentifyMessageError::FieldOverflow {
-            offset: consumed,
-            length: len,
-            remaining: 0,
-        })?;
-    let remaining = body.len();
-    // Compare in u64 so an absurd declared length errs identically on
-    // 32-bit and 64-bit targets.
+    let (len, consumed) = read_uvarint(buf).map_err(WireError::from)?;
+    let remaining = buf.len().saturating_sub(consumed);
+    // Compare as u64 before converting to usize so 32-bit and 64-bit
+    // targets take the same FieldOverflow path.
     if len > remaining as u64 {
-        return Err(message::IdentifyMessageError::FieldOverflow {
-            offset: consumed,
-            length: len,
-            remaining,
-        });
+        return Err(prefix_overflow(consumed, len, remaining).into());
     }
-    let len = len as usize;
-    let end = consumed
-        .checked_add(len)
-        .ok_or(message::IdentifyMessageError::FieldOverflow {
-            offset: consumed,
-            length: len as u64,
-            remaining,
-        })?;
+    let end = consumed + (len as usize);
     buf.get(consumed..end)
-        .ok_or(message::IdentifyMessageError::FieldOverflow {
-            offset: consumed,
-            length: len as u64,
-            remaining,
-        })
+        .ok_or(prefix_overflow(consumed, len, remaining).into())
+}
+
+fn prefix_overflow(offset: usize, length: u64, remaining: usize) -> WireError {
+    WireError::FieldOverflow {
+        offset,
+        length: usize::try_from(length).unwrap_or(usize::MAX),
+        remaining,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minip2p_core::write_uvarint;
 
     impl IdentifyProtocol {
         /// Drain buffered events (test helper).
@@ -600,7 +582,33 @@ mod tests {
         framed.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
         assert!(matches!(
             decode_length_prefixed(&framed),
-            Err(message::IdentifyMessageError::FieldOverflow { .. })
+            Err(message::IdentifyMessageError::Wire(
+                WireError::FieldOverflow {
+                    length: 255,
+                    remaining: 3,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn length_prefix_oversized_declared_length_is_field_overflow_on_every_target() {
+        // `u64::MAX` does not fit in usize on 32-bit targets. The decoder
+        // must still report FieldOverflow (never Varint Overflow) so the
+        // error class does not depend on pointer width.
+        let mut framed = Vec::new();
+        write_uvarint(u64::MAX, &mut framed);
+        framed.extend_from_slice(&[0xAA]);
+        assert!(matches!(
+            decode_length_prefixed(&framed),
+            Err(message::IdentifyMessageError::Wire(
+                WireError::FieldOverflow {
+                    length: usize::MAX,
+                    remaining: 1,
+                    ..
+                }
+            ))
         ));
     }
 
