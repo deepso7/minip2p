@@ -384,14 +384,20 @@ function toNativeConfig(config: Minip2pConfig): NativeEndpointConfig {
       "use either address-shaped listen or legacy transports, not both"
     );
   }
-  const transports: Minip2pTransports =
-    addressListen !== undefined
-      ? {}
-      : configuredTransports === undefined ||
-          (configuredTransports.quic === undefined &&
-            configuredTransports.tcp === undefined)
-        ? { quic: true }
-        : configuredTransports;
+  const transports: Minip2pTransports = (() => {
+    if (addressListen !== undefined) {
+      return {};
+    }
+    if (
+      configuredTransports === undefined ||
+      (configuredTransports.quic === undefined &&
+        configuredTransports.tcp === undefined)
+    ) {
+      return { quic: true };
+    }
+    return configuredTransports;
+  })();
+  const useAddressListen = addressListen !== undefined;
   return {
     agentVersion: config.agentVersion,
     allowUnsigned: config.allowUnsigned ?? false,
@@ -403,15 +409,9 @@ function toNativeConfig(config: Minip2pConfig): NativeEndpointConfig {
     protocols: [...(config.protocols ?? [])],
     pubsubRouter: (config.pubsubRouter ??
       PubsubRouter.Gossipsub) as NativeEndpointConfig["pubsubRouter"],
-    quic:
-      addressListen === undefined
-        ? toNativeTransport(transports.quic)
-        : undefined,
+    quic: useAddressListen ? undefined : toNativeTransport(transports.quic),
     relays: [...(config.relays ?? [])],
-    tcp:
-      addressListen === undefined
-        ? toNativeTransport(transports.tcp)
-        : undefined,
+    tcp: useAddressListen ? undefined : toNativeTransport(transports.tcp),
   };
 }
 

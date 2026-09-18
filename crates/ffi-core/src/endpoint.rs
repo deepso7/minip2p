@@ -38,10 +38,13 @@ fn configure_transports(
             });
         }
         for address in addresses {
-            let parsed = Multiaddr::from_str(&address).map_err(|error| FfiError::InvalidAddress {
-                detail: format!("invalid listen address `{address}`: {error}"),
-            })?;
-            builder = builder.listen_multiaddr(&parsed).map_err(map_listen_error)?;
+            let parsed =
+                Multiaddr::from_str(&address).map_err(|error| FfiError::InvalidAddress {
+                    detail: format!("invalid listen address `{address}`: {error}"),
+                })?;
+            builder = builder
+                .listen_multiaddr(&parsed)
+                .map_err(map_listen_error)?;
         }
         return Ok(builder);
     }
@@ -1323,10 +1326,7 @@ mod tests {
         let Err(error) = endpoint(config) else {
             panic!("listen and quic together must fail");
         };
-        assert!(
-            error.to_string().contains("not both"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("not both"), "{error}");
     }
 
     #[test]
