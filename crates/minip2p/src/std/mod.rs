@@ -91,8 +91,6 @@ pub use minip2p_relay_server::{
     RelayServerConfigError, RelayServerConfigErrorKind, RelayServerEvent, RelayServerRuntimeError,
     RelayServerRuntimeErrorKind, ReservationCloseReason, Status,
 };
-#[cfg(feature = "relay-server")]
-pub use minip2p_swarm::ConnectionCloseCause;
 use minip2p_swarm::SwarmBuilder;
 pub use minip2p_swarm::{
     Deadline, DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, RUN_UNTIL_SKIP_LIMIT, Swarm,
@@ -659,10 +657,7 @@ impl Endpoint {
     ///     }
     /// }
     /// ```
-    pub fn wait(
-        &mut self,
-        deadline: impl Into<Deadline>,
-    ) -> Result<EndpointWaitOutcome, Error> {
+    pub fn wait(&mut self, deadline: impl Into<Deadline>) -> Result<EndpointWaitOutcome, Error> {
         let deadline = deadline.into();
         #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
         if self.has_drivers() {
@@ -3159,7 +3154,9 @@ mod tests {
         let listener_stop = Arc::clone(&stop);
         let listener_thread = std::thread::spawn(move || {
             while !listener_stop.load(Ordering::Relaxed) {
-                let _ = listener.wait(Duration::from_millis(20));
+                listener
+                    .next_event(Duration::from_millis(20))
+                    .expect("drive listener");
             }
         });
 
@@ -3224,7 +3221,9 @@ mod tests {
         let listener_stop = Arc::clone(&stop);
         let listener_thread = std::thread::spawn(move || {
             while !listener_stop.load(Ordering::Relaxed) {
-                let _ = listener.wait(Duration::from_millis(20));
+                listener
+                    .next_event(Duration::from_millis(20))
+                    .expect("drive listener");
             }
         });
 
