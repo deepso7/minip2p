@@ -2149,6 +2149,36 @@ impl EndpointBuilder {
     }
 }
 
+/// One listen multiaddr for a legacy QUIC `host:port` when pairing with other
+/// QUIC listens. Alone, host:port still goes through [`QuicEndpoint::bind`] so
+/// `UdpSocket` can try every candidate; here we only need one concrete address
+/// to group with a complementary multiaddr (first resolved candidate).
+#[cfg(feature = "quic")]
+fn quic_host_port_as_multiaddr(spec: &str) -> Result<Multiaddr, Error> {
+    use std::net::ToSocketAddrs;
+
+    let addr = spec
+        .to_socket_addrs()
+        .map_err(|error| TransportError::InvalidAddress {
+            context: "quic bind address",
+            reason: format!("{spec} is not a bindable address: {error}"),
+        })?
+        .next()
+        .ok_or_else(|| TransportError::InvalidAddress {
+            context: "quic bind address",
+            reason: format!("{spec} resolved to no address"),
+        })?;
+    let host = match addr.ip() {
+        std::net::IpAddr::V4(v4) => Protocol::Ip4(v4.octets()),
+        std::net::IpAddr::V6(v6) => Protocol::Ip6(v6.octets()),
+    };
+    Ok(Multiaddr::from_protocols(vec![
+        host,
+        Protocol::Udp(addr.port()),
+        Protocol::QuicV1,
+    ]))
+}
+
 /// Reads a `host:port` bind spec as the `/tcp` addresses it names.
 ///
 /// The same shape `bind_quic` accepts, so a host does not have to know that one
@@ -2414,14 +2444,6 @@ fn bind_transports(_parts: &BuilderParts) -> Result<TransportSet, Error> {
             if want_quic && has_quic {
                 #[cfg(feature = "quic")]
                 {
-                    if !quic_host_ports.is_empty() && !quic_addrs.is_empty() {
-                        return Err(TransportError::InvalidConfig {
-                            reason:
-                                "cannot mix legacy quic host:port binds with QUIC multiaddr listens"
-                                    .into(),
-                        }
-                        .into());
-                    }
                     if quic_host_ports.len() > 1 {
                         return Err(TransportError::InvalidConfig {
                             reason: "QUIC may contain at most one legacy host:port bind".into(),
@@ -2430,12 +2452,34 @@ fn bind_transports(_parts: &BuilderParts) -> Result<TransportSet, Error> {
                     }
                     let config = QuicNodeConfig::new(_parts.keypair.clone())
                         .with_limits(_parts.quic_limits.clone());
-                    let transport = if let [spec] = quic_host_ports.as_slice() {
-                        // Same path as pre-address-shaped bind_quic: one socket,
-                        // UdpSocket::bind tries every resolved candidate.
-                        QuicEndpoint::bind(config, spec)?
-                    } else {
-                        match quic_addrs.as_slice() {
+                    let transport = match (quic_host_ports.as_slice(), quic_addrs.as_slice()) {
+                        // Alone: one UDP socket; UdpSocket::bind tries candidates.
+                        ([spec], []) => QuicEndpoint::bind(config, spec)?,
+                        // Host:port plus multiaddrs: resolve the host once and
+                        // group with complementary-family multiaddrs (dual).
+                        ([spec], multiaddrs) => {
+                            let host_addr = quic_host_port_as_multiaddr(spec)?;
+                            validate_listen_multiaddr(&host_addr)?;
+                            let mut combined = vec![host_addr];
+                            for address in multiaddrs {
+                                reject_duplicate_quic_family(&combined, address)?;
+                                combined.push((*address).clone());
+                            }
+                            match combined.as_slice() {
+                                [address] => QuicEndpoint::bind_multiaddr(config, address)?,
+                                [first, second] => {
+                                    QuicEndpoint::bind_dual_multiaddr(config, first, second)?
+                                }
+                                _ => {
+                                    return Err(TransportError::InvalidConfig {
+                                        reason: "QUIC listen addresses may contain at most one address per IP family"
+                                            .into(),
+                                    }
+                                    .into());
+                                }
+                            }
+                        }
+                        ([], multiaddrs) => match multiaddrs {
                             [address] => QuicEndpoint::bind_multiaddr(config, address)?,
                             [first, second] => {
                                 QuicEndpoint::bind_dual_multiaddr(config, first, second)?
@@ -2447,6 +2491,12 @@ fn bind_transports(_parts: &BuilderParts) -> Result<TransportSet, Error> {
                                 }
                                 .into());
                             }
+                        },
+                        _ => {
+                            return Err(TransportError::InvalidConfig {
+                                reason: "QUIC may contain at most one legacy host:port bind".into(),
+                            }
+                            .into());
                         }
                     };
                     let namespaces = transport.namespaces();
@@ -3107,6 +3157,41 @@ mod tests {
         assert!(
             addrs[0].transport().to_string().contains("/quic-v1"),
             "{addrs:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_quic_host_port_pairs_with_complementary_multiaddr() {
+        let ipv6 = "/ip6/::1/udp/0/quic-v1".parse().expect("ipv6");
+        let mut endpoint = Endpoint::builder()
+            .quic("127.0.0.1:0")
+            .quic_multiaddr(&ipv6)
+            .bind()
+            .expect("host:port plus complementary multiaddr");
+        let addrs = endpoint.listen_all().expect("listen");
+        assert_eq!(addrs.len(), 2, "{addrs:?}");
+        let has_v4 = addrs
+            .iter()
+            .any(|addr| addr.transport().to_string().contains("/ip4/"));
+        let has_v6 = addrs
+            .iter()
+            .any(|addr| addr.transport().to_string().contains("/ip6/"));
+        assert!(has_v4 && has_v6, "{addrs:?}");
+    }
+
+    #[test]
+    fn legacy_quic_host_port_rejects_same_family_multiaddr() {
+        let ipv4 = "/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("ipv4");
+        let Err(error) = Endpoint::builder()
+            .quic("127.0.0.1:0")
+            .quic_multiaddr(&ipv4)
+            .bind()
+        else {
+            panic!("same-family quic listens must not both bind");
+        };
+        assert!(
+            format!("{error}").contains("at most one address per IP family"),
+            "got {error}"
         );
     }
 
