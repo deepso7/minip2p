@@ -257,7 +257,7 @@ impl IdentifyProtocol {
         };
 
         let encoded = msg.encode();
-        let data = encode_length_prefixed(&encoded);
+        let data = encode_frame(&encoded);
 
         Ok(vec![
             IdentifyAction::Send {
@@ -469,22 +469,17 @@ impl SansIoProtocol for IdentifyProtocol {
 // Wire framing helpers
 // ---------------------------------------------------------------------------
 
-/// Prepends a varint length prefix to a protobuf-encoded Identify payload.
-///
-/// The libp2p Identify spec requires this framing on the wire; see the
-/// call site for [`IdentifyInput::RegisterOutboundStream`] for why
-/// omitting it breaks interop with third-party libp2p peers.
-fn encode_length_prefixed(payload: &[u8]) -> Vec<u8> {
-    encode_frame(payload)
-}
-
 /// Strips the varint length prefix from a framed Identify buffer and
 /// returns a borrowed slice over the body.
 ///
-/// An oversized declared length is always [`WireError::FieldOverflow`],
+/// Identify uses this path instead of [`minip2p_core::decode_frame`] so an
+/// oversized declared length is always [`WireError::FieldOverflow`],
 /// including when the length does not fit in `usize` on 32-bit targets.
 /// That keeps the error class independent of pointer width. A malformed
 /// prefix varint is [`IdentifyMessageError::Wire`].
+///
+/// Encoding uses [`minip2p_core::encode_frame`] directly (see
+/// [`IdentifyInput::RegisterOutboundStream`]).
 fn decode_length_prefixed(buf: &[u8]) -> Result<&[u8], message::IdentifyMessageError> {
     let (len, consumed) = read_uvarint(buf).map_err(WireError::from)?;
     let remaining = buf.len().saturating_sub(consumed);
@@ -568,7 +563,7 @@ mod tests {
     #[test]
     fn length_prefix_round_trip() {
         let body = b"hello identify";
-        let framed = encode_length_prefixed(body);
+        let framed = encode_frame(body);
         assert_eq!(framed[0] as usize, body.len());
         let decoded = decode_length_prefixed(&framed).unwrap();
         assert_eq!(decoded, body);

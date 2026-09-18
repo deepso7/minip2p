@@ -156,19 +156,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_malformed_and_skips_unknown_fields() {
+    fn field_zero_is_rejected_and_unknown_fields_are_skipped() {
+        // Discovery-specific field-number policy plus unknown-field skip.
         assert_eq!(Beacon::decode(&[0]), Err(DiscoveryWireError::FieldZero));
-        assert!(matches!(
-            Beacon::decode(&[0x0b]),
-            Err(DiscoveryWireError::Wire(WireError::UnsupportedWireType {
-                wire_type: 3,
-                ..
-            }))
-        ));
-        assert!(matches!(
-            Beacon::decode(&[0x0a, 2, 1]),
-            Err(DiscoveryWireError::Wire(WireError::FieldOverflow { .. }))
-        ));
         let input = [0x18, 0x96, 1, 0x0a, 1, 7];
         assert_eq!(Beacon::decode(&input).unwrap().public_key, vec![7]);
     }

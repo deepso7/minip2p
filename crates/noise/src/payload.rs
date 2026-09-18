@@ -139,11 +139,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncated_payload() {
-        let _ = NoiseHandshakePayload::decode(&[0x0a, 0x20, 1]).unwrap_err();
-    }
-
-    #[test]
     fn rejects_field_number_zero() {
         let key = Ed25519Keypair::from_secret_key_bytes([3; 32]).public_key();
         let encoded = NoiseHandshakePayload::new(key, [7; 64]).encode();
