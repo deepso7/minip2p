@@ -374,6 +374,15 @@ function toNativeConfig(config: Minip2pConfig): NativeEndpointConfig {
   const configuredTransports = config.transports;
   const addressListen =
     config.listen === undefined ? undefined : [...config.listen];
+  const hasTransports =
+    configuredTransports !== undefined &&
+    (configuredTransports.quic !== undefined ||
+      configuredTransports.tcp !== undefined);
+  if (addressListen !== undefined && hasTransports) {
+    throw new Error(
+      "use either address-shaped listen or legacy transports, not both"
+    );
+  }
   const transports: Minip2pTransports =
     addressListen !== undefined
       ? {}

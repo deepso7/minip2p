@@ -114,7 +114,7 @@ export interface Minip2pConfig {
   readonly autonatServers?: readonly string[];
   /**
    * Address-shaped listen multiaddresses; transport is inferred from each
-   * address. When set, omit `transports` (or leave it empty).
+   * address. When set, omit `transports` (mixing both throws).
    */
   readonly listen?: readonly [string, ...string[]];
   /** Enabled transports. Defaults to dual-stack QUIC only when `listen` is omitted. */

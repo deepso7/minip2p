@@ -1838,7 +1838,7 @@ impl EndpointBuilder {
     /// Registers an application protocol before the endpoint starts.
     ///
     /// Built-in ids ([`RESERVED_PROTOCOL_IDS`]) are reserved; registering
-    /// one makes the `bind_quic*` build step fail with
+    /// one makes the bind step fail with
     /// [`SwarmError::ReservedProtocol`].
     pub fn protocol(mut self, protocol_id: impl Into<String>) -> Self {
         let id = protocol_id.into();
@@ -3056,6 +3056,21 @@ mod tests {
                 .all(|addr| addr.transport().to_string().contains("/quic-v1")),
             "{addrs:?}"
         );
+        let has_v4 = addrs
+            .iter()
+            .any(|addr| addr.transport().to_string().contains("/ip4/"));
+        let has_v6 = addrs
+            .iter()
+            .any(|addr| addr.transport().to_string().contains("/ip6/"));
+        assert!(
+            has_v4 || has_v6,
+            "default listen must bind a concrete IP family: {addrs:?}"
+        );
+        // On dual-stack hosts both wildcards bind; on IPv4-only CI at least one
+        // family is present. When both succeed, that is the intended default.
+        if has_v4 && has_v6 {
+            assert_eq!(addrs.len(), 2, "{addrs:?}");
+        }
     }
 
     #[test]
