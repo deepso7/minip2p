@@ -67,6 +67,11 @@ pub struct EndpointConfig {
     pub relays: Vec<String>,
     /// AutoNAT server peer addresses.
     pub autonat_servers: Vec<String>,
+    /// Address-shaped listen multiaddresses; transport is inferred from shape.
+    ///
+    /// When set, this replaces per-transport `quic` / `tcp` listen lists. Omit
+    /// it to keep the legacy transport options. An empty list is rejected.
+    pub listen: Option<Vec<String>>,
     /// QUIC configuration, or no QUIC transport when absent.
     pub quic: Option<TransportOptions>,
     /// TCP configuration, or no TCP transport when absent.
@@ -118,6 +123,7 @@ impl fmt::Debug for EndpointConfig {
             .field("agent_version", &self.agent_version)
             .field("relays", &self.relays)
             .field("autonat_servers", &self.autonat_servers)
+            .field("listen", &self.listen)
             .field("quic", &self.quic)
             .field("tcp", &self.tcp)
             .field("force_relay", &self.force_relay)

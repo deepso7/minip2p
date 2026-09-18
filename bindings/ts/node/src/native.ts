@@ -55,6 +55,7 @@ interface NativeEndpointConfig {
     readonly peerTtlMs: bigint;
     readonly topic: string;
   };
+  readonly listen?: string[];
   readonly mdns?: {
     readonly autoDial: boolean;
     readonly enableIpv6: boolean;

@@ -372,23 +372,34 @@ function toNativeConfig(config: Minip2pConfig): NativeEndpointConfig {
           ttlMs: numberToU64(mdnsOptions.ttlMs ?? 120_000, "ttlMs"),
         };
   const configuredTransports = config.transports;
+  const addressListen =
+    config.listen === undefined ? undefined : [...config.listen];
   const transports: Minip2pTransports =
-    configuredTransports === undefined ||
-    (configuredTransports.quic === undefined &&
-      configuredTransports.tcp === undefined)
-      ? { quic: true }
-      : configuredTransports;
+    addressListen !== undefined
+      ? {}
+      : configuredTransports === undefined ||
+          (configuredTransports.quic === undefined &&
+            configuredTransports.tcp === undefined)
+        ? { quic: true }
+        : configuredTransports;
   return {
     agentVersion: config.agentVersion,
     allowUnsigned: config.allowUnsigned ?? false,
     autonatServers: [...(config.autonatServers ?? [])],
     discovery,
     forceRelay: config.forceRelay ?? false,
+    listen: addressListen,
     mdns,
     protocols: [...(config.protocols ?? [])],
-    quic: toNativeTransport(transports.quic),
+    quic:
+      addressListen === undefined
+        ? toNativeTransport(transports.quic)
+        : undefined,
     relays: [...(config.relays ?? [])],
-    tcp: toNativeTransport(transports.tcp),
+    tcp:
+      addressListen === undefined
+        ? toNativeTransport(transports.tcp)
+        : undefined,
   };
 }
 
