@@ -32,7 +32,7 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, SansIoProtocol};
+use minip2p_core::{Multiaddr, SansIoProtocol, WireError};
 
 pub use message::{
     DcutrMessageError, FrameDecode, HolePunch, HolePunchType, decode_frame, encode_frame,
@@ -297,7 +297,7 @@ impl DcutrInitiator {
                 return Err(self.fail_reply(DcutrError::FrameTooLarge { len }));
             }
             FrameDecode::Error(e) => {
-                return Err(self.fail_reply(DcutrError::Malformed(DcutrMessageError::Varint(e))));
+                return Err(self.fail_reply(DcutrError::Malformed(WireError::from(e).into())));
             }
         };
         self.recv_buf.drain(..consumed);
@@ -529,7 +529,7 @@ impl DcutrResponder {
                 }
                 FrameDecode::Error(e) => {
                     self.state = ResponderState::Failed;
-                    return Err(DcutrError::Malformed(DcutrMessageError::Varint(e)));
+                    return Err(DcutrError::Malformed(WireError::from(e).into()));
                 }
             };
             self.recv_buf.drain(..consumed);

@@ -9,7 +9,7 @@
 //! `no_std` + `alloc` and introduces no I/O, clock, or async dependency.
 //!
 //! Stream-level length-prefix framing remains in [`crate::frame`]. Relay,
-//! Gossipsub, and Discovery consume this vocabulary; AutoNAT, DCUtR, Identify,
+//! AutoNAT, DCUtR, Gossipsub, and Discovery consume this vocabulary; Identify
 //! and Noise still keep local copies until they migrate.
 
 use alloc::string::String;
