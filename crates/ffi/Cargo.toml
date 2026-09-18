@@ -18,7 +18,7 @@ workspace = true
 [dependencies]
 minip2p-ffi-core = { path = "../ffi-core" }
 # Must remain paired with ubrn and @ubjs/core 0.31.0-5.
-uniffi = "=0.31.2"
+uniffi = "=0.32.1"
 
 [dev-dependencies]
 minip2p = { package = "minip2p-rs", path = "../minip2p", features = [
