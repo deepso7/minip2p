@@ -155,4 +155,4 @@ Discovery source timestamps use a driver-private monotonic epoch. Compute their 
 
 With the `pubsub` feature, `.pubsub()` enables gossipsub by default and advertises `/meshsub/1.1.0` plus `/meshsub/1.0.0`. Pass a `GossipsubConfig` to tune mesh policy, or `.pubsub_config(FloodsubConfig::default())` to select the legacy floodsub engine and advertise only `/floodsub/1.0.0`. This is a pre-1.0 API/default change: `pubsub_config` now accepts either engine through `PubsubConfig`, and gossipsub peers intentionally do not negotiate floodsub streams.
 
-Built-in protocol ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see `minip2p::RESERVED_PROTOCOL_IDS`) belong to the endpoint's own handlers; registering one via `EndpointBuilder::protocol` makes the `bind_quic*` step fail, and `Endpoint::add_protocol` rejects it with `SwarmError::ReservedProtocol`.
+Built-in protocol ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see `minip2p::RESERVED_PROTOCOL_IDS`) belong to the endpoint's own handlers; registering one via `EndpointBuilder::protocol` makes the bind step fail, and `Endpoint::add_protocol` rejects it with `SwarmError::ReservedProtocol`.
