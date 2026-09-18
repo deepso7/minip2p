@@ -96,7 +96,8 @@ pub struct PortableEndpointStats {
     /// Number of connected peers that completed Identify and are ready for
     /// application protocols.
     pub ready_peers: usize,
-    /// Addresses currently exposed by the transport as listening locally.
+    /// Addresses currently bound on the local transport (not necessarily
+    /// accepting connections yet — see [`PortableEndpoint::listen_addresses`]).
     pub listen_addresses: Vec<Multiaddr>,
 }
 
@@ -181,7 +182,11 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         self.runtime.connection_remote_addr(conn_id)
     }
 
-    /// Returns addresses currently exposed by the transport as listening locally.
+    /// Returns addresses currently bound on the local transport.
+    ///
+    /// These are transport-bound local addresses (what the sockets were given),
+    /// not a signal that [`Self::listen`] / [`Self::listen_all`] has started
+    /// accepting connections. The set can be non-empty before listening begins.
     ///
     /// State snapshot getter: does not drive the endpoint. Separate getters are
     /// not one cross-getter atomic snapshot and may be ahead of the Endpoint

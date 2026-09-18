@@ -58,13 +58,17 @@ With the `nat` feature, prefer `connect*` plus `wait_path` for the first usable 
 Prefer `wait` and dispatch unrelated events while correlating an operation:
 
 ```rust
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use minip2p::{Endpoint, EndpointEvent, EndpointWaitOutcome};
 
 fn run(mut node: Endpoint, peer: minip2p::PeerId) -> Result<(), minip2p::Error> {
+    // One absolute deadline for the whole correlated wait — recreating a
+    // relative Duration inside the loop would reset the timeout on every
+    // unrelated event or interruption.
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match node.wait(Duration::from_secs(5))? {
+        match node.wait(deadline)? {
             EndpointWaitOutcome::Event(EndpointEvent::PeerReady { peer_id, .. })
                 if peer_id == peer =>
             {

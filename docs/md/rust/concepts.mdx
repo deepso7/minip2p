@@ -86,6 +86,6 @@ Enabled capabilities still expose their own event queues until a later ticket fo
 - `take_gossipsub_events` / `next_gossipsub_event`;
 - `take_discovery_events` / `next_discovery_event`.
 
-Durable connection, peer, and listener state is available through State snapshot getters (`connected_peers`, `is_peer_ready`, `peer_info`, `connection_id`, `connection_remote_addr`, `listen_addresses`). Those getters do not drive the endpoint, are not one cross-getter atomic snapshot, and may be ahead of the event stream.
+Durable connection, peer, and listener-related state is available through State snapshot getters (`connected_peers`, `is_peer_ready`, `peer_info`, `connection_id`, `connection_remote_addr`, `listen_addresses`). `listen_addresses` reports transport-bound local addresses and can be non-empty before `listen` starts accepting. Those getters do not drive the endpoint, are not one cross-getter atomic snapshot, and may be ahead of the event stream.
 
 Continue with [Listen and dial](/rust/listen-and-dial) or the [glossary](/reference/glossary).

@@ -21,7 +21,7 @@ Definitions only. For recipes, follow the linked guides.
 | **`poll`** | One non-blocking drive step; returns currently available application events. |
 | **`wait`** | Blocking Endpoint wait returning an event, deadline, or interruption (ADR 0007). |
 | **`EndpointEvent`** | Ordered application event from the Endpoint's single public stream. |
-| **State snapshot** | Getter over durable connection, peer, or listener state; not one atomic mega-snapshot and may be ahead of the event stream. |
+| **State snapshot** | Getter over durable connection, peer, or transport-bound address state; not one atomic mega-snapshot and may be ahead of the event stream. `listen_addresses` is bound addresses, not “accepting connections”. |
 | **`next_event`** | Synchronous drive until one ordinary application event or a deadline (swallows interruption; migration). |
 | **`next_wake`** | Interruptible drive until an application event, capability progress, interruption, or deadline. |
 | **Focused wait** | Drive until a specific result (`wait_peer_ready`, `wait_path`, `next_gossipsub_event`, …) while buffering unrelated events. |

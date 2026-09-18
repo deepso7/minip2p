@@ -513,7 +513,11 @@ impl Endpoint {
         self.swarm.connection_remote_addr(conn_id)
     }
 
-    /// Returns addresses currently exposed by the transport as listening locally.
+    /// Returns addresses currently bound on the local transport.
+    ///
+    /// These are transport-bound local addresses (what the sockets were given),
+    /// not a signal that [`Self::listen`] / [`Self::listen_all`] has started
+    /// accepting connections. The set can be non-empty before listening begins.
     ///
     /// State snapshot getter: does not drive the endpoint. Separate getters are
     /// not one cross-getter atomic snapshot and may be ahead of the Endpoint
@@ -625,7 +629,7 @@ impl Endpoint {
     /// Correlate a dial while dispatching unrelated events:
     ///
     /// ```no_run
-    /// use std::time::Duration;
+    /// use std::time::{Duration, Instant};
     ///
     /// use minip2p::{Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr};
     ///
@@ -635,8 +639,12 @@ impl Endpoint {
     /// ) -> Result<(), minip2p::Error> {
     ///     node.dial(target)?;
     ///     let peer = target.peer_id().clone();
+    ///     // One absolute deadline for the whole correlated wait — do not
+    ///     // recreate a relative Duration inside the loop, or unrelated events
+    ///     // and interruptions would reset the timeout.
+    ///     let deadline = Instant::now() + Duration::from_secs(10);
     ///     loop {
-    ///         match node.wait(Duration::from_secs(10))? {
+    ///         match node.wait(deadline)? {
     ///             EndpointWaitOutcome::Event(EndpointEvent::PeerReady { peer_id, .. })
     ///                 if peer_id == peer =>
     ///             {
