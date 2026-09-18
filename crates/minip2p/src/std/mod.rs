@@ -58,8 +58,6 @@ use minip2p_core::Multiaddr;
 #[cfg(any(feature = "quic", feature = "tcp", feature = "relay-server"))]
 use minip2p_core::Protocol;
 #[cfg(any(feature = "quic", feature = "tcp"))]
-use std::str::FromStr;
-#[cfg(any(feature = "quic", feature = "tcp"))]
 use minip2p_core::TransportKind;
 use minip2p_core::{PeerAddr, PeerId};
 #[cfg(all(any(feature = "discovery", feature = "mdns"), feature = "smoltcp"))]
@@ -117,6 +115,8 @@ use minip2p_transport::Transport;
 pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet, WaitHandle};
 #[cfg(feature = "pubsub")]
 pub use pubsub::GossipsubError;
+#[cfg(any(feature = "quic", feature = "tcp"))]
+use std::str::FromStr;
 
 const DEFAULT_AGENT_VERSION: &str = concat!("minip2p/", env!("CARGO_PKG_VERSION"));
 #[cfg(feature = "relay-server")]
@@ -1811,8 +1811,7 @@ impl EndpointBuilder {
             let existing = self.resolved_listen_multiaddrs();
             reject_duplicate_quic_family(&existing, &address)?;
         }
-        self.listen_requests
-            .push(ListenRequest::Multiaddr(address));
+        self.listen_requests.push(ListenRequest::Multiaddr(address));
         Ok(())
     }
 
@@ -2265,9 +2264,7 @@ fn validate_listen_multiaddr(address: &Multiaddr) -> Result<(), Error> {
     if !ip_host {
         return Err(TransportError::InvalidAddress {
             context: "listen address",
-            reason: format!(
-                "`{address}` must use /ip4 or /ip6; DNS names are dial-only"
-            ),
+            reason: format!("`{address}` must use /ip4 or /ip6; DNS names are dial-only"),
         }
         .into());
     }
@@ -2933,7 +2930,10 @@ mod tests {
         let addrs = endpoint.listen_all().expect("listen_all");
         assert_eq!(addrs.len(), 1);
         assert!(
-            addrs[0].transport().to_string().starts_with("/ip4/127.0.0.1/udp/"),
+            addrs[0]
+                .transport()
+                .to_string()
+                .starts_with("/ip4/127.0.0.1/udp/"),
             "{addrs:?}"
         );
         assert!(
@@ -2953,7 +2953,10 @@ mod tests {
         let addrs = endpoint.listen_all().expect("listen_all");
         assert_eq!(addrs.len(), 1);
         assert!(
-            addrs[0].transport().to_string().starts_with("/ip4/127.0.0.1/tcp/"),
+            addrs[0]
+                .transport()
+                .to_string()
+                .starts_with("/ip4/127.0.0.1/tcp/"),
             "{addrs:?}"
         );
     }
@@ -2969,8 +2972,16 @@ mod tests {
             .expect("bind dual");
         let addrs = endpoint.listen_all().expect("listen_all");
         assert_eq!(addrs.len(), 2, "{addrs:?}");
-        assert!(addrs.iter().any(|a| a.transport().to_string().contains("/ip4/")));
-        assert!(addrs.iter().any(|a| a.transport().to_string().contains("/ip6/")));
+        assert!(
+            addrs
+                .iter()
+                .any(|a| a.transport().to_string().contains("/ip4/"))
+        );
+        assert!(
+            addrs
+                .iter()
+                .any(|a| a.transport().to_string().contains("/ip6/"))
+        );
     }
 
     #[cfg(feature = "tcp")]
@@ -3008,8 +3019,7 @@ mod tests {
             "{dns}"
         );
 
-        let Err(circuit) =
-            Endpoint::builder().listen("/ip4/127.0.0.1/udp/0/quic-v1/p2p-circuit")
+        let Err(circuit) = Endpoint::builder().listen("/ip4/127.0.0.1/udp/0/quic-v1/p2p-circuit")
         else {
             panic!("circuit listen must fail");
         };
@@ -3047,7 +3057,7 @@ mod tests {
             .expect("default dual-stack");
         let addrs = endpoint.listen_all().expect("listen_all");
         assert!(
-            addrs.len() >= 1,
+            !addrs.is_empty(),
             "dual-stack default should bind at least one family: {addrs:?}"
         );
         assert!(

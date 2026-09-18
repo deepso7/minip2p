@@ -68,10 +68,7 @@ Prefer top-level address-shaped `listen` when configuration already speaks multi
 
 ```ts
 // Infer transports from complete multiaddresses
-listen: [
-  "/ip4/127.0.0.1/udp/4001/quic-v1",
-  "/ip4/127.0.0.1/tcp/4001",
-]
+listen: ["/ip4/127.0.0.1/udp/4001/quic-v1", "/ip4/127.0.0.1/tcp/4001"];
 ```
 
 ```ts
