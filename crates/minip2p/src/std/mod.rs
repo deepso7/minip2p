@@ -1815,18 +1815,16 @@ impl EndpointBuilder {
         Ok(())
     }
 
-    /// Best-effort already-resolved multiaddrs for early duplicate checks.
-    #[cfg(any(feature = "quic", feature = "tcp"))]
+    /// Best-effort already-resolved multiaddrs for early QUIC duplicate checks.
+    #[cfg(feature = "quic")]
     fn resolved_listen_multiaddrs(&self) -> Vec<Multiaddr> {
         self.listen_requests
             .iter()
             .filter_map(|request| match request {
                 ListenRequest::Multiaddr(address) => Some(address.clone()),
-                #[cfg(feature = "quic")]
                 ListenRequest::QuicMultiaddr(address) => Some(address.clone()),
                 #[cfg(feature = "tcp")]
                 ListenRequest::TcpMultiaddr(address) => Some(address.clone()),
-                #[cfg(feature = "quic")]
                 ListenRequest::QuicHostPort(_) => None,
                 #[cfg(feature = "tcp")]
                 ListenRequest::TcpHostPort(_) => None,
