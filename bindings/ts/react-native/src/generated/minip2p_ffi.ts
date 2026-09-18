@@ -392,6 +392,10 @@ export type EndpointConfig = {
      */
     autonatServers: Array<string>,
     /**
+     * Address-shaped listen multiaddresses; transport is inferred from shape.
+     */
+    listen?: Array<string>,
+    /**
      * QUIC configuration, or no QUIC transport when absent.
      */
     quic?: TransportOptions,
@@ -449,6 +453,7 @@ const FfiConverterTypeEndpointConfig = (() => {
                 agentVersion: FfiConverterOptionalString.readFromCursor(c),
                 relays: FfiConverterSequenceString.readFromCursor(c),
                 autonatServers: FfiConverterSequenceString.readFromCursor(c),
+                listen: FfiConverterOptionalSequenceString.readFromCursor(c),
                 quic: FfiConverterOptionalTypeTransportOptions.readFromCursor(c),
                 tcp: FfiConverterOptionalTypeTransportOptions.readFromCursor(c),
                 forceRelay: FfiConverterBool.readFromCursor(c),
@@ -463,6 +468,7 @@ const FfiConverterTypeEndpointConfig = (() => {
             FfiConverterOptionalString.writeIntoCursor(value.agentVersion, c);
             FfiConverterSequenceString.writeIntoCursor(value.relays, c);
             FfiConverterSequenceString.writeIntoCursor(value.autonatServers, c);
+            FfiConverterOptionalSequenceString.writeIntoCursor(value.listen, c);
             FfiConverterOptionalTypeTransportOptions.writeIntoCursor(value.quic, c);
             FfiConverterOptionalTypeTransportOptions.writeIntoCursor(value.tcp, c);
             FfiConverterBool.writeIntoCursor(value.forceRelay, c);
@@ -476,6 +482,7 @@ const FfiConverterTypeEndpointConfig = (() => {
             return FfiConverterOptionalString.allocationSize(value.agentVersion) +
              FfiConverterSequenceString.allocationSize(value.relays) +
              FfiConverterSequenceString.allocationSize(value.autonatServers) +
+             FfiConverterOptionalSequenceString.allocationSize(value.listen) +
              FfiConverterOptionalTypeTransportOptions.allocationSize(value.quic) +
              FfiConverterOptionalTypeTransportOptions.allocationSize(value.tcp) +
              FfiConverterBool.allocationSize(value.forceRelay) +

@@ -76,6 +76,8 @@ pub struct NodeEndpointConfig {
     pub relays: Vec<String>,
     /// AutoNAT server peer addresses.
     pub autonat_servers: Vec<String>,
+    /// Address-shaped listen multiaddresses.
+    pub listen: Option<Vec<String>>,
     /// QUIC transport configuration.
     pub quic: Option<NodeTransportOptions>,
     /// TCP transport configuration.
@@ -107,6 +109,7 @@ impl TryFrom<NodeEndpointConfig> for EndpointConfig {
             agent_version: config.agent_version,
             relays: config.relays,
             autonat_servers: config.autonat_servers,
+            listen: config.listen,
             quic: config.quic.map(convert_transport),
             tcp: config.tcp.map(convert_transport),
             force_relay: config.force_relay,

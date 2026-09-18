@@ -119,7 +119,12 @@ export interface Minip2pConfig {
   readonly relays?: readonly string[];
   /** AutoNAT server peer multiaddresses. */
   readonly autonatServers?: readonly string[];
-  /** Enabled transports. Defaults to dual-stack QUIC only. */
+  /**
+   * Address-shaped listen multiaddresses; transport is inferred from each
+   * address. When set, omit `transports` (or leave it empty).
+   */
+  readonly listen?: readonly [string, ...string[]];
+  /** Enabled transports. Defaults to dual-stack QUIC only when `listen` is omitted. */
   readonly transports?: Minip2pTransports;
   /** Routes outbound connectivity through relays only. */
   readonly forceRelay?: boolean;
