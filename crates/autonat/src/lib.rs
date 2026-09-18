@@ -17,13 +17,13 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+#[cfg(test)]
+use minip2p_core::write_uvarint;
 use minip2p_core::{
     Multiaddr, PeerId, SansIoProtocol, WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field,
     encode_nested_field, encode_varint_field, read_len_delimited, read_tag, read_varint_value,
     skip_field,
 };
-#[cfg(test)]
-use minip2p_core::write_uvarint;
 
 /// Protocol id for AutoNAT v1.
 pub const AUTONAT_PROTOCOL_ID: &str = "/libp2p/autonat/1.0.0";

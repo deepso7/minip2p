@@ -909,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_and_unknown_control_fields_follow_codec_rules() {
+    fn control_rejects_field_zero_and_skips_unknown_fields() {
         // Control messages share field-0 policy and still skip unknown tags.
         let field_zero = [0x00, 0x01];
         assert!(matches!(
@@ -992,6 +992,20 @@ mod tests {
         assert_eq!(decoded.subscriptions, rpc.subscriptions);
         assert_eq!(decoded.publish[0].from, rpc.publish[0].from);
         assert_eq!(decoded.publish[0].seqno, rpc.publish[0].seqno);
+    }
+
+    #[test]
+    fn unknown_fields_are_skipped() {
+        let mut encoded = SubOpts {
+            subscribe: Some(true),
+            topic_id: Some(String::from("t")),
+        }
+        .encode();
+        // Append field 15, wire type LEN, 3 bytes.
+        encoded.extend_from_slice(&[tag(15, WIRE_LEN), 3, 0xde, 0xad, 0xbe]);
+        let decoded = SubOpts::decode(&encoded).unwrap();
+        assert_eq!(decoded.subscribe, Some(true));
+        assert_eq!(decoded.topic_id.as_deref(), Some("t"));
     }
 
     #[test]

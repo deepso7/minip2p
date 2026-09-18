@@ -156,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_malformed_and_skips_unknown_fields() {
+    fn field_zero_is_rejected_and_unknown_fields_are_skipped() {
         // Discovery-specific field-number policy plus unknown-field skip.
         assert_eq!(Beacon::decode(&[0]), Err(DiscoveryWireError::FieldZero));
         let input = [0x18, 0x96, 1, 0x0a, 1, 7];

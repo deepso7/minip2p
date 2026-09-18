@@ -265,4 +265,38 @@ mod tests {
             FrameDecode::TooLarge { len } if len == (MAX_MESSAGE_SIZE + 1) as u64
         ));
     }
+
+    #[test]
+    fn decoder_skips_unknown_fields() {
+        // Unknown field 5 VARINT before the real type field.
+        let mut buf = Vec::new();
+        buf.push(5 << 3); // unknown field, varint
+        write_uvarint(42, &mut buf);
+        buf.push(TAG_TYPE);
+        write_uvarint(100, &mut buf); // CONNECT
+
+        let decoded = HolePunch::decode(&buf).unwrap();
+        assert_eq!(decoded.kind, HolePunchType::Connect);
+    }
+
+    /// Regression: multi-byte tags must not alias known single-byte fields.
+    #[test]
+    fn decode_does_not_alias_high_field_numbers_to_known_fields() {
+        let mut buf = Vec::new();
+
+        // Unknown field 33, wire type LEN, payload "aliased"
+        write_uvarint((33 << 3) | (WIRE_LEN as u64), &mut buf);
+        write_uvarint(7, &mut buf);
+        buf.extend_from_slice(b"aliased");
+
+        buf.push(TAG_TYPE);
+        write_uvarint(100, &mut buf); // CONNECT
+
+        let decoded = HolePunch::decode(&buf).unwrap();
+        assert_eq!(decoded.kind, HolePunchType::Connect);
+        assert!(
+            decoded.obs_addrs.is_empty(),
+            "field 33 must not alias obs_addrs (tag 0x12)"
+        );
+    }
 }
