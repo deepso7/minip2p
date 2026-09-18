@@ -172,7 +172,7 @@ fn read_identify_string(
 mod tests {
     use alloc::vec;
 
-    use minip2p_core::{WIRE_LEN, WIRE_VARINT, read_uvarint, write_uvarint};
+    use minip2p_core::{WIRE_LEN, WIRE_VARINT, tag_byte, write_uvarint};
 
     use super::*;
 
@@ -229,9 +229,8 @@ mod tests {
     }
 
     #[test]
-    fn decode_ignores_unknown_fields() {
-        // Build a message with a known field, then an unknown field (tag 0x3A = field 7, LEN),
-        // then another known field.
+    fn decode_skips_unknown_fields() {
+        // Known, unknown LEN, unknown VARINT, then another known field.
         let mut data = Vec::new();
 
         data.push(TAG_AGENT_VERSION);
@@ -241,6 +240,8 @@ mod tests {
         data.push((7 << 3) | WIRE_LEN);
         data.push(7);
         data.extend_from_slice(b"unknown");
+
+        data.extend_from_slice(&[(10 << 3) | WIRE_VARINT, 42]);
 
         data.push(TAG_PROTOCOL_VERSION);
         data.push(2);
@@ -252,20 +253,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_truncated_field() {
-        let mut data = Vec::new();
-        data.push(TAG_PUBLIC_KEY);
-        data.push(10);
-        data.extend_from_slice(&[0u8; 5]);
-
-        let err = IdentifyMessage::decode(&data).unwrap_err();
-        assert!(matches!(
-            err,
-            IdentifyMessageError::Wire(WireError::FieldOverflow { .. })
-        ));
-    }
-
-    #[test]
     fn decode_rejects_invalid_utf8_in_string_field() {
         let mut data = Vec::new();
         data.push(TAG_AGENT_VERSION);
@@ -274,16 +261,6 @@ mod tests {
 
         let err = IdentifyMessage::decode(&data).unwrap_err();
         assert!(matches!(err, IdentifyMessageError::InvalidUtf8 { .. }));
-    }
-
-    #[test]
-    fn decode_skips_varint_unknown_fields() {
-        // Unknown field 10, VARINT: value 42
-        let mut data = vec![(10 << 3) | WIRE_VARINT, 42, TAG_AGENT_VERSION, 2];
-        data.extend_from_slice(b"ok");
-
-        let decoded = IdentifyMessage::decode(&data).unwrap();
-        assert_eq!(decoded.agent_version.as_deref(), Some("ok"));
     }
 
     #[test]
@@ -366,18 +343,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_unsupported_wire_type() {
-        // Field 1 with wire type 3 (deprecated "start group").
-        let data = vec![(1 << 3) | 3];
-
-        let err = IdentifyMessage::decode(&data).unwrap_err();
-        assert!(matches!(
-            err,
-            IdentifyMessageError::Wire(WireError::UnsupportedWireType { wire_type: 3, .. })
-        ));
-    }
-
-    #[test]
     fn decode_rejects_unsupported_wire_type_mid_message() {
         // Field 1 wire type 3 appears AFTER a known field; without the fix
         // this would silently return a partial message with only the first
@@ -400,22 +365,12 @@ mod tests {
         let mut tags = Vec::new();
         let mut idx = 0;
         while idx < data.len() {
-            let tag = data[idx];
-            tags.push(tag);
-            idx += 1;
-
-            let wire_type = tag & 0x07;
-            match wire_type {
-                WIRE_LEN => {
-                    let (len, used) = read_uvarint(&data[idx..]).unwrap();
-                    idx += used + len as usize;
-                }
-                WIRE_VARINT => {
-                    let (_, used) = read_uvarint(&data[idx..]).unwrap();
-                    idx += used;
-                }
-                _ => break,
-            }
+            let Some((field, wire_type)) = read_tag(data, &mut idx).unwrap() else {
+                break;
+            };
+            // Single-byte tags only appear in the encode-order golden.
+            tags.push(tag_byte(field as u8, wire_type).expect("spec fields use one-byte tags"));
+            skip_field(data, &mut idx, wire_type).unwrap();
         }
         tags
     }

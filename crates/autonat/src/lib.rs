@@ -23,7 +23,7 @@ use minip2p_core::{
     skip_field,
 };
 #[cfg(test)]
-use minip2p_core::{VarintError, write_uvarint};
+use minip2p_core::write_uvarint;
 
 /// Protocol id for AutoNAT v1.
 pub const AUTONAT_PROTOCOL_ID: &str = "/libp2p/autonat/1.0.0";
@@ -763,13 +763,21 @@ mod tests {
         assert_eq!(request.addrs, vec![addr]);
     }
 
+    /// Wrapper binds [`MAX_MESSAGE_SIZE`]; generic framing goldens live in
+    /// `minip2p_core::frame`.
     #[test]
-    fn rejects_declared_frame_length_above_max() {
-        let mut frame = Vec::new();
-        write_uvarint((MAX_MESSAGE_SIZE + 1) as u64, &mut frame);
+    fn frame_size_limit_is_exact() {
+        let payload = vec![0xabu8; MAX_MESSAGE_SIZE];
+        let framed = encode_frame(&payload);
+        assert!(matches!(
+            decode_frame(&framed),
+            FrameDecode::Complete { payload: p, .. } if p == payload.as_slice()
+        ));
 
+        let mut over = Vec::new();
+        write_uvarint((MAX_MESSAGE_SIZE + 1) as u64, &mut over);
         assert_eq!(
-            decode_frame(&frame),
+            decode_frame(&over),
             FrameDecode::TooLarge {
                 len: (MAX_MESSAGE_SIZE + 1) as u64
             }
@@ -891,126 +899,5 @@ mod tests {
                 if addrs == vec![addr]
         ));
         assert!(client.is_idle());
-    }
-}
-
-/// Golden equivalence tests for the varint-length-prefixed frame codec.
-///
-/// The fixed vectors pin the exact wire behavior of the codec this crate
-/// originally implemented locally; after consolidation into `minip2p-core`
-/// they exercise the shared codec through this crate's wrappers and must
-/// keep passing byte for byte.
-#[cfg(test)]
-mod frame_golden {
-    use super::*;
-
-    #[test]
-    fn golden_empty_payload() {
-        assert_eq!(encode_frame(&[]), [0x00]);
-        assert!(matches!(
-            decode_frame(&[0x00]),
-            FrameDecode::Complete { payload, consumed: 1 } if payload.is_empty()
-        ));
-    }
-
-    #[test]
-    fn golden_single_byte_payload() {
-        assert_eq!(encode_frame(b"\xab"), [0x01, 0xab]);
-        assert!(matches!(
-            decode_frame(&[0x01, 0xab]),
-            FrameDecode::Complete { payload, consumed: 2 } if payload == b"\xab"
-        ));
-    }
-
-    #[test]
-    fn golden_payload_at_max_len() {
-        let payload = vec![0x5au8; MAX_MESSAGE_SIZE];
-        let framed = encode_frame(&payload);
-        // 8192 as a minimal uvarint.
-        assert_eq!(framed[..2], [0x80, 0x40]);
-        assert_eq!(framed.len(), MAX_MESSAGE_SIZE + 2);
-        assert!(matches!(
-            decode_frame(&framed),
-            FrameDecode::Complete { payload: p, consumed }
-                if p == payload.as_slice() && consumed == MAX_MESSAGE_SIZE + 2
-        ));
-    }
-
-    #[test]
-    fn golden_declared_len_above_max_too_large() {
-        // 8193 as a minimal uvarint; rejected from the header alone.
-        assert!(matches!(
-            decode_frame(&[0x81, 0x40]),
-            FrameDecode::TooLarge { len } if len as u128 == 8193
-        ));
-    }
-
-    #[test]
-    fn golden_declared_len_u64_max_too_large() {
-        // u64::MAX as a 10-byte uvarint, followed by a garbage byte.
-        let input = [
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x22,
-        ];
-        assert!(matches!(
-            decode_frame(&input),
-            FrameDecode::TooLarge { len } if len as u128 == u128::from(u64::MAX)
-        ));
-    }
-
-    #[test]
-    fn golden_truncated_header_incomplete() {
-        assert!(matches!(decode_frame(&[]), FrameDecode::Incomplete));
-        // Continuation bit set with no following byte.
-        assert!(matches!(decode_frame(&[0x80]), FrameDecode::Incomplete));
-    }
-
-    #[test]
-    fn golden_truncated_payload_incomplete() {
-        // Declares 5 bytes, only 2 buffered.
-        assert!(matches!(
-            decode_frame(&[0x05, 0xaa, 0xbb]),
-            FrameDecode::Incomplete
-        ));
-        let framed = encode_frame(b"hello");
-        assert!(matches!(
-            decode_frame(&framed[..framed.len() - 1]),
-            FrameDecode::Incomplete
-        ));
-    }
-
-    #[test]
-    fn golden_oversized_varint_header_error() {
-        // Ten continuation bytes overflow u64 before the varint terminates.
-        assert!(matches!(
-            decode_frame(&[0xff; 10]),
-            FrameDecode::Error(VarintError::Overflow)
-        ));
-    }
-
-    #[test]
-    fn golden_non_minimal_length_rejected() {
-        // Length 1 encoded in two bytes ([0x81, 0x00]) is non-canonical.
-        assert!(matches!(
-            decode_frame(&[0x81, 0x00, 0xaa]),
-            FrameDecode::Error(VarintError::NonCanonical)
-        ));
-    }
-
-    #[test]
-    fn golden_multi_frame_consumed() {
-        let mut buf = encode_frame(b"first");
-        buf.extend_from_slice(&encode_frame(b"second"));
-        let consumed = match decode_frame(&buf) {
-            FrameDecode::Complete { payload, consumed } => {
-                assert_eq!(payload, b"first");
-                assert_eq!(consumed, 6);
-                consumed
-            }
-            _ => panic!("expected first frame"),
-        };
-        assert!(matches!(
-            decode_frame(&buf[consumed..]),
-            FrameDecode::Complete { payload, consumed: 7 } if payload == b"second"
-        ));
     }
 }

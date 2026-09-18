@@ -704,7 +704,7 @@ impl Rpc {
 }
 
 // ---------------------------------------------------------------------------
-// Protobuf helpers
+// Field-number policy
 // ---------------------------------------------------------------------------
 
 /// Reads the next `(field_number, wire_type)` pair and rejects field 0.
@@ -910,12 +910,7 @@ mod tests {
 
     #[test]
     fn malformed_and_unknown_control_fields_follow_codec_rules() {
-        let truncated_prune = [tag(1, WIRE_LEN), 4, b't'];
-        assert!(matches!(
-            ControlPrune::decode(&truncated_prune),
-            Err(PubsubWireError::Wire(WireError::FieldOverflow { .. }))
-        ));
-
+        // Control messages share field-0 policy and still skip unknown tags.
         let field_zero = [0x00, 0x01];
         assert!(matches!(
             ControlMessage::decode(&field_zero),
@@ -1000,42 +995,6 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_are_skipped() {
-        let mut encoded = SubOpts {
-            subscribe: Some(true),
-            topic_id: Some(String::from("t")),
-        }
-        .encode();
-        // Append field 15, wire type LEN, 3 bytes.
-        encoded.extend_from_slice(&[tag(15, WIRE_LEN), 3, 0xde, 0xad, 0xbe]);
-        let decoded = SubOpts::decode(&encoded).unwrap();
-        assert_eq!(decoded.subscribe, Some(true));
-        assert_eq!(decoded.topic_id.as_deref(), Some("t"));
-    }
-
-    #[test]
-    fn high_field_numbers_do_not_alias_low_ones() {
-        // Field 33 with wire type LEN encodes as a 2-byte tag whose low byte
-        // could be mistaken for field 1 if tags were truncated to u8.
-        let mut encoded = Vec::new();
-        write_uvarint((33u64 << 3) | u64::from(WIRE_LEN), &mut encoded);
-        write_uvarint(1, &mut encoded);
-        encoded.push(0xFF);
-        let decoded = RawMessage::decode(&encoded).unwrap();
-        assert_eq!(decoded.from, None, "field 33 must not alias field 1");
-    }
-
-    #[test]
-    fn truncated_field_errors() {
-        // from-field claims 5 bytes, provides 1.
-        let encoded = [tag(1, WIRE_LEN), 5, 0xab];
-        assert!(matches!(
-            RawMessage::decode(&encoded),
-            Err(PubsubWireError::Wire(WireError::FieldOverflow { .. }))
-        ));
-    }
-
-    #[test]
     fn invalid_utf8_topic_errors() {
         let encoded = [tag(4, WIRE_LEN), 2, 0xff, 0xfe];
         assert!(matches!(
@@ -1063,45 +1022,10 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn unsupported_wire_type_errors() {
-        // Wire type 3 (group start) is not supported.
-        let encoded = [(9 << 3) | 3];
-        assert!(matches!(
-            RawMessage::decode(&encoded),
-            Err(PubsubWireError::Wire(WireError::UnsupportedWireType {
-                wire_type: 3,
-                ..
-            }))
-        ));
-    }
-
     // -- framing -------------------------------------------------------------
 
-    #[test]
-    fn frame_round_trips() {
-        let framed = encode_frame(b"hello");
-        match decode_frame(&framed) {
-            FrameDecode::Complete { payload, consumed } => {
-                assert_eq!(payload, b"hello");
-                assert_eq!(consumed, framed.len());
-            }
-            _ => panic!("expected complete frame"),
-        }
-    }
-
-    #[test]
-    fn incomplete_prefix_and_payload_wait_for_more() {
-        assert!(matches!(decode_frame(&[]), FrameDecode::Incomplete));
-        // Multi-byte varint cut short.
-        assert!(matches!(decode_frame(&[0x80]), FrameDecode::Incomplete));
-        // Declared 5 bytes, only 2 present.
-        assert!(matches!(
-            decode_frame(&[5, 0xaa, 0xbb]),
-            FrameDecode::Incomplete
-        ));
-    }
-
+    /// Wrapper binds [`MAX_RPC_SIZE`]; generic framing goldens live in
+    /// `minip2p_core::frame`.
     #[test]
     fn frame_size_limit_is_exact() {
         let mut at_limit = Vec::new();
@@ -1268,128 +1192,5 @@ mod tests {
             "unknown fields are not part of the canonical sign bytes"
         );
         assert_eq!(decoded.to_wire(), wire, "forwarding embeds raw verbatim");
-    }
-}
-
-/// Golden equivalence tests for the varint-length-prefixed frame codec.
-///
-/// The fixed vectors pin the exact wire behavior of the codec this crate
-/// originally implemented locally; after consolidation into `minip2p-core`
-/// they exercise the shared codec through this crate's wrappers and must
-/// keep passing byte for byte.
-#[cfg(test)]
-mod frame_golden {
-    use super::*;
-    use alloc::vec;
-    use minip2p_core::VarintError;
-
-    #[test]
-    fn golden_empty_payload() {
-        assert_eq!(encode_frame(&[]), [0x00]);
-        assert!(matches!(
-            decode_frame(&[0x00]),
-            FrameDecode::Complete { payload, consumed: 1 } if payload.is_empty()
-        ));
-    }
-
-    #[test]
-    fn golden_single_byte_payload() {
-        assert_eq!(encode_frame(b"\xab"), [0x01, 0xab]);
-        assert!(matches!(
-            decode_frame(&[0x01, 0xab]),
-            FrameDecode::Complete { payload, consumed: 2 } if payload == b"\xab"
-        ));
-    }
-
-    #[test]
-    fn golden_payload_at_max_len() {
-        let payload = vec![0x5au8; MAX_RPC_SIZE];
-        let framed = encode_frame(&payload);
-        // 65536 as a minimal uvarint.
-        assert_eq!(framed[..3], [0x80, 0x80, 0x04]);
-        assert_eq!(framed.len(), MAX_RPC_SIZE + 3);
-        assert!(matches!(
-            decode_frame(&framed),
-            FrameDecode::Complete { payload: p, consumed }
-                if p == payload.as_slice() && consumed == MAX_RPC_SIZE + 3
-        ));
-    }
-
-    #[test]
-    fn golden_declared_len_above_max_too_large() {
-        // 65537 as a minimal uvarint; rejected from the header alone.
-        assert!(matches!(
-            decode_frame(&[0x81, 0x80, 0x04]),
-            FrameDecode::TooLarge { len } if u128::from(len) == 65537
-        ));
-    }
-
-    #[test]
-    fn golden_declared_len_u64_max_too_large() {
-        // u64::MAX as a 10-byte uvarint, followed by a garbage byte.
-        let input = [
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x22,
-        ];
-        assert!(matches!(
-            decode_frame(&input),
-            FrameDecode::TooLarge { len } if u128::from(len) == u128::from(u64::MAX)
-        ));
-    }
-
-    #[test]
-    fn golden_truncated_header_incomplete() {
-        assert!(matches!(decode_frame(&[]), FrameDecode::Incomplete));
-        // Continuation bit set with no following byte.
-        assert!(matches!(decode_frame(&[0x80]), FrameDecode::Incomplete));
-    }
-
-    #[test]
-    fn golden_truncated_payload_incomplete() {
-        // Declares 5 bytes, only 2 buffered.
-        assert!(matches!(
-            decode_frame(&[0x05, 0xaa, 0xbb]),
-            FrameDecode::Incomplete
-        ));
-        let framed = encode_frame(b"hello");
-        assert!(matches!(
-            decode_frame(&framed[..framed.len() - 1]),
-            FrameDecode::Incomplete
-        ));
-    }
-
-    #[test]
-    fn golden_oversized_varint_header_error() {
-        // Ten continuation bytes overflow u64 before the varint terminates.
-        assert!(matches!(
-            decode_frame(&[0xff; 10]),
-            FrameDecode::Error(VarintError::Overflow)
-        ));
-    }
-
-    #[test]
-    fn golden_non_minimal_length_rejected() {
-        // Length 1 encoded in two bytes ([0x81, 0x00]) is non-canonical.
-        assert!(matches!(
-            decode_frame(&[0x81, 0x00, 0xaa]),
-            FrameDecode::Error(VarintError::NonCanonical)
-        ));
-    }
-
-    #[test]
-    fn golden_multi_frame_consumed() {
-        let mut buf = encode_frame(b"first");
-        buf.extend_from_slice(&encode_frame(b"second"));
-        let consumed = match decode_frame(&buf) {
-            FrameDecode::Complete { payload, consumed } => {
-                assert_eq!(payload, b"first");
-                assert_eq!(consumed, 6);
-                consumed
-            }
-            _ => panic!("expected first frame"),
-        };
-        assert!(matches!(
-            decode_frame(&buf[consumed..]),
-            FrameDecode::Complete { payload, consumed: 7 } if payload == b"second"
-        ));
     }
 }
