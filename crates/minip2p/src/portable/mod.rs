@@ -15,8 +15,14 @@ pub use minip2p_swarm::{
     // Part of `EndpointEvent` / `SwarmEvent` public shapes (`ConnectionClosed`,
     // `Error`); re-exported so portable callers can name them without a direct
     // swarm dependency.
-    ConnectionCloseCause, DriverError, IdentifyMessage, SwarmBuilder, SwarmError, SwarmEvent,
-    SwarmRuntime, SwarmRuntimeError,
+    ConnectionCloseCause,
+    DriverError,
+    IdentifyMessage,
+    SwarmBuilder,
+    SwarmError,
+    SwarmEvent,
+    SwarmRuntime,
+    SwarmRuntimeError,
 };
 pub use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
@@ -78,13 +84,13 @@ pub struct PortableEndpoint<T: Transport, E: EntropySource> {
     runtime: SwarmRuntime<T, E>,
 }
 
-    /// Lightweight snapshot of portable endpoint state.
-    ///
-    /// Aggregate counts only. Prefer the individual State snapshot getters for
-    /// peer and connection detail; they are not one cross-getter atomic snapshot
-    /// and may be ahead of the Endpoint event stream.
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub struct PortableEndpointStats {
+/// Lightweight snapshot of portable endpoint state.
+///
+/// Aggregate counts only. Prefer the individual State snapshot getters for
+/// peer and connection detail; they are not one cross-getter atomic snapshot
+/// and may be ahead of the Endpoint event stream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortableEndpointStats {
     /// Number of peers with an established transport connection.
     pub connected_peers: usize,
     /// Number of connected peers that completed Identify and are ready for
