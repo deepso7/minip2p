@@ -2011,19 +2011,65 @@ mod tests {
         );
 
         // State must reflect the transition before any application drain.
-        assert!(core.connected_peers().contains(&peer_id));
-        assert_eq!(core.connection_id(&peer_id), Some(conn_id));
         assert!(
-            core.events
-                .iter()
-                .any(|event| matches!(
+            core.connected_peers().contains(&peer_id),
+            "connected_peers reflects the peer before the event is drained"
+        );
+        assert_eq!(core.connection_id(&peer_id), Some(conn_id));
+        // The event is still sitting in the output queue — state was updated
+        // before queueing, so getters are never behind an already-emitted event.
+        assert!(
+            !core.events.is_empty(),
+            "the matching event remains queued after state was updated"
+        );
+        assert!(
+            core.events.front().is_some_and(|event| {
+                matches!(
                     event,
                     SwarmEvent::ConnectionEstablished {
                         peer_id: established,
                         conn_id: established_conn,
                     } if *established == peer_id && *established_conn == conn_id
-                )),
-            "the matching event is queued only after state was updated"
+                )
+            }),
+            "ConnectionEstablished is the queued transition for this state change"
+        );
+    }
+
+    #[test]
+    fn peer_ready_state_updates_before_event_is_queued() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"ready-before-event-peer");
+        let conn_id = ConnectionId::new(92);
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        core.established_peers.insert(peer_id.clone());
+        core.peer_info.insert(
+            peer_id.clone(),
+            IdentifyMessage {
+                protocol_version: Some("ipfs/0.1.0".into()),
+                agent_version: Some("test".into()),
+                public_key: None,
+                listen_addrs: Vec::new(),
+                observed_addr: None,
+                protocols: alloc::vec!["/test/1.0.0".into()],
+            },
+        );
+
+        core.try_emit_peer_ready(&peer_id);
+
+        assert!(
+            core.is_peer_ready(&peer_id),
+            "ready state is set before the event is drained"
+        );
+        assert!(
+            core.events.iter().any(|event| {
+                matches!(
+                    event,
+                    SwarmEvent::PeerReady { peer_id: ready, .. } if *ready == peer_id
+                )
+            }),
+            "PeerReady is queued after ready state was updated"
         );
     }
 

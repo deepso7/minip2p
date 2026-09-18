@@ -236,6 +236,11 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         self.core.connection_remote_addr(conn_id)
     }
 
+    /// Returns the active transport connection selected for `peer_id`.
+    pub fn connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
+        self.core.connection_id(peer_id)
+    }
+
     /// Start listening on the given multiaddr and return the resolved local address.
     pub fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, DriverError> {
         Ok(self.transport.listen(addr)?)

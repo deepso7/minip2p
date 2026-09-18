@@ -503,7 +503,7 @@ impl Endpoint {
     /// not one cross-getter atomic snapshot and may be ahead of the Endpoint
     /// event stream.
     pub fn connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
-        self.swarm.core().connection_id(peer_id)
+        self.swarm.connection_id(peer_id)
     }
 
     /// Returns the remote transport address recorded for an exact connection.
@@ -3205,6 +3205,51 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         listener_thread.join().expect("listener driver exits");
         assert!(!duplicate, "ConnectionEstablished must be delivered once");
+    }
+
+    #[test]
+    fn wait_delivers_peer_ready_through_the_endpoint_stream() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut listener = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind listener");
+        let listen_addr = listener.listen().expect("listen");
+        let mut dialer = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind dialer");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let listener_stop = Arc::clone(&stop);
+        let listener_thread = std::thread::spawn(move || {
+            while !listener_stop.load(Ordering::Relaxed) {
+                let _ = listener.wait(Duration::from_millis(20));
+            }
+        });
+
+        dialer.dial(&listen_addr).expect("dial");
+        let peer = listen_addr.peer_id().clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut ready = false;
+        while std::time::Instant::now() < deadline {
+            match dialer.wait(Duration::from_millis(50)).expect("wait") {
+                crate::EndpointWaitOutcome::Event(Event::PeerReady { peer_id, .. })
+                    if peer_id == peer =>
+                {
+                    ready = true;
+                    break;
+                }
+                crate::EndpointWaitOutcome::Event(_)
+                | crate::EndpointWaitOutcome::Deadline
+                | crate::EndpointWaitOutcome::Interrupted => {}
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        listener_thread.join().expect("listener driver exits");
+        assert!(ready, "PeerReady arrives once through Endpoint::wait");
+        assert!(dialer.is_peer_ready(&peer));
+        assert!(dialer.peer_info(&peer).is_some());
     }
 
     #[test]
