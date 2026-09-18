@@ -12,9 +12,13 @@ pub use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol, TransportKind};
 pub use minip2p_identity::Ed25519Keypair;
 pub use minip2p_platform::{Deadline as PollDeadline, EntropySource, Now, SharedEntropy};
 pub use minip2p_swarm::{
-    DriverError, IdentifyMessage, SwarmBuilder, SwarmError, SwarmEvent, SwarmRuntime,
+    ConnectionCloseCause, DriverError, IdentifyMessage, SwarmBuilder, SwarmError, SwarmEvent,
+    SwarmRuntime, SwarmRuntimeError,
 };
 pub use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
+
+mod event_stream;
+pub use event_stream::{EndpointEvent, EndpointWaitOutcome};
 
 #[cfg(feature = "portable-mdns")]
 pub use minip2p_discovery::{
@@ -71,9 +75,13 @@ pub struct PortableEndpoint<T: Transport, E: EntropySource> {
     runtime: SwarmRuntime<T, E>,
 }
 
-/// Lightweight snapshot of portable endpoint state.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PortableEndpointStats {
+    /// Lightweight snapshot of portable endpoint state.
+    ///
+    /// Aggregate counts only. Prefer the individual State snapshot getters for
+    /// peer and connection detail; they are not one cross-getter atomic snapshot
+    /// and may be ahead of the Endpoint event stream.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct PortableEndpointStats {
     /// Number of peers with an established transport connection.
     pub connected_peers: usize,
     /// Number of connected peers that completed Identify and are ready for
@@ -120,18 +128,57 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     }
 
     /// Returns peers with an established transport connection.
+    ///
+    /// State snapshot getter: does not drive the endpoint. Separate getters are
+    /// not one cross-getter atomic snapshot and may be ahead of the Endpoint
+    /// event stream (state changes before its corresponding event is queued).
     pub fn connected_peers(&self) -> Vec<PeerId> {
         self.runtime.connected_peers()
     }
 
     /// Returns whether a peer completed Identify and is ready for application protocols.
+    ///
+    /// State snapshot getter: does not drive the endpoint. Separate getters are
+    /// not one cross-getter atomic snapshot and may be ahead of the Endpoint
+    /// event stream.
     pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
         self.runtime.is_peer_ready(peer_id)
     }
 
     /// Returns the latest Identify information received for a peer.
+    ///
+    /// State snapshot getter: does not drive the endpoint. Separate getters are
+    /// not one cross-getter atomic snapshot and may be ahead of the Endpoint
+    /// event stream.
     pub fn peer_info(&self, peer_id: &PeerId) -> Option<&IdentifyMessage> {
         self.runtime.peer_info(peer_id)
+    }
+
+    /// Returns the active transport connection selected for `peer_id`.
+    ///
+    /// State snapshot getter: does not drive the endpoint. Separate getters are
+    /// not one cross-getter atomic snapshot and may be ahead of the Endpoint
+    /// event stream.
+    pub fn connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
+        self.runtime.core().connection_id(peer_id)
+    }
+
+    /// Returns the remote transport address recorded for an exact connection.
+    ///
+    /// State snapshot getter: does not drive the endpoint. Separate getters are
+    /// not one cross-getter atomic snapshot and may be ahead of the Endpoint
+    /// event stream.
+    pub fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
+        self.runtime.connection_remote_addr(conn_id)
+    }
+
+    /// Returns addresses currently exposed by the transport as listening locally.
+    ///
+    /// State snapshot getter: does not drive the endpoint. Separate getters are
+    /// not one cross-getter atomic snapshot and may be ahead of the Endpoint
+    /// event stream.
+    pub fn listen_addresses(&self) -> Vec<Multiaddr> {
+        self.runtime.transport().local_addresses()
     }
 
     /// Sets externally validated addresses to advertise through Identify.
@@ -205,7 +252,11 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
             .abandon_stream(peer_id, stream_id, now.monotonic_ms)
     }
 
-    /// Returns a lightweight state snapshot without driving the endpoint.
+    /// Returns a lightweight aggregate of durable state without driving the endpoint.
+    ///
+    /// Prefer the individual State snapshot getters when you need peer or
+    /// connection detail. Aggregate counts here are not atomic with those getters
+    /// and may be ahead of the Endpoint event stream.
     pub fn stats(&self) -> PortableEndpointStats {
         let connected = self.runtime.connected_peers();
         PortableEndpointStats {
@@ -214,12 +265,14 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
                 .filter(|peer_id| self.runtime.is_peer_ready(peer_id))
                 .count(),
             connected_peers: connected.len(),
-            listen_addresses: self.runtime.transport().local_addresses(),
+            listen_addresses: self.listen_addresses(),
         }
     }
 
     /// Advances transport and protocol state using one host-supplied time sample.
-    pub fn poll(&mut self, now: Now) -> Result<alloc::vec::Vec<SwarmEvent>, DriverError> {
+    ///
+    /// Returned values are [`EndpointEvent`]s from the Endpoint event stream.
+    pub fn poll(&mut self, now: Now) -> Result<alloc::vec::Vec<EndpointEvent>, DriverError> {
         self.runtime.poll(now)
     }
 
@@ -1870,6 +1923,11 @@ mod tests {
         assert_eq!(a.stats().ready_peers, 1);
         assert_eq!(b.stats().connected_peers, 1);
         assert_eq!(b.stats().ready_peers, 1);
+        assert!(
+            a.connection_id(&b_identity.peer_id()).is_some(),
+            "connection id is visible through the State getter"
+        );
+        assert!(!a.listen_addresses().is_empty());
     }
 
     #[test]
