@@ -2,6 +2,10 @@
 //! protobuf encode/decode, varint-length-prefixed stream framing, and
 //! StrictSign message signing/verification.
 //!
+//! Field framing uses the shared protobuf vocabulary in [`minip2p_core`];
+//! this module keeps pubsub message types, StrictSign canonicalization, and
+//! contextual [`PubsubWireError`] values (including field-number policy).
+//!
 //! Verification matches upstream (go-libp2p / rust-libp2p) exactly: the
 //! decoded message is canonically re-encoded with `signature` and `key`
 //! omitted, and the signature is checked over `"libp2p-pubsub:" ++ that
@@ -11,7 +15,10 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{PeerId, VarintError, read_uvarint, write_uvarint};
+use minip2p_core::{
+    PeerId, WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field, encode_nested_field,
+    encode_varint_field, read_len_delimited, read_string, read_varint_value, skip_field,
+};
 use minip2p_identity::{Ed25519Keypair, PublicKey};
 
 /// Protocol id negotiated for floodsub RPC streams.
@@ -148,35 +155,14 @@ pub struct RawMessage {
 }
 
 /// Decode errors for RPC/message protobuf payloads.
+///
+/// Shared framing failures are wrapped as [`Self::Wire`] so callers retain
+/// pubsub context while reusing the core protobuf vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum PubsubWireError {
-    /// A varint was malformed.
-    #[error("varint error: {0}")]
-    Varint(#[from] VarintError),
-    /// A length-delimited field overran the buffer.
-    #[error("field at offset {offset} declares {length} bytes but only {remaining} remain")]
-    FieldOverflow {
-        /// Offset of the field's payload.
-        offset: usize,
-        /// Declared payload length.
-        length: usize,
-        /// Bytes remaining in the buffer.
-        remaining: usize,
-    },
-    /// A field used a wire type this codec does not accept.
-    #[error("unsupported wire type {wire_type} at offset {offset}")]
-    UnsupportedWireType {
-        /// The offending wire type.
-        wire_type: u8,
-        /// Offset of the field's tag.
-        offset: usize,
-    },
-    /// A string field held invalid UTF-8.
-    #[error("invalid utf-8 in string field at offset {offset}")]
-    InvalidUtf8 {
-        /// Offset of the field's payload.
-        offset: usize,
-    },
+    /// A shared protobuf framing failure.
+    #[error(transparent)]
+    Wire(#[from] WireError),
     /// A tag used field number zero, which protobuf reserves as illegal.
     /// Upstream decoders reject it; silently skipping would let hostile
     /// encoders smuggle bytes that canonical re-encoding drops.
@@ -226,14 +212,10 @@ impl SubOpts {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         if let Some(subscribe) = self.subscribe {
-            encode_varint_field(
-                &mut out,
-                tag_byte(1, WIRE_VARINT),
-                if subscribe { 1 } else { 0 },
-            );
+            encode_varint_field(&mut out, 1, if subscribe { 1 } else { 0 });
         }
         if let Some(topic) = &self.topic_id {
-            encode_bytes_field(&mut out, tag_byte(2, WIRE_LEN), topic.as_bytes());
+            encode_bytes_field(&mut out, 2, topic.as_bytes());
         }
         out
     }
@@ -250,7 +232,7 @@ impl SubOpts {
                 (2, WIRE_LEN) => {
                     opts.topic_id = Some(read_string(input, &mut idx)?);
                 }
-                (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
+                (_, wire_type) => skip_field(input, &mut idx, wire_type)?,
             }
         }
         Ok(opts)
@@ -313,23 +295,23 @@ impl RawMessage {
     fn encode_fields(&self, include_signature: bool) -> Vec<u8> {
         let mut out = Vec::new();
         if let Some(from) = &self.from {
-            encode_bytes_field(&mut out, tag_byte(1, WIRE_LEN), from);
+            encode_bytes_field(&mut out, 1, from);
         }
         if let Some(data) = &self.data {
-            encode_bytes_field(&mut out, tag_byte(2, WIRE_LEN), data);
+            encode_bytes_field(&mut out, 2, data);
         }
         if let Some(seqno) = &self.seqno {
-            encode_bytes_field(&mut out, tag_byte(3, WIRE_LEN), seqno);
+            encode_bytes_field(&mut out, 3, seqno);
         }
         for topic in &self.topic_ids {
-            encode_bytes_field(&mut out, tag_byte(4, WIRE_LEN), topic.as_bytes());
+            encode_bytes_field(&mut out, 4, topic.as_bytes());
         }
         if include_signature {
             if let Some(signature) = &self.signature {
-                encode_bytes_field(&mut out, tag_byte(5, WIRE_LEN), signature);
+                encode_bytes_field(&mut out, 5, signature);
             }
             if let Some(key) = &self.key {
-                encode_bytes_field(&mut out, tag_byte(6, WIRE_LEN), key);
+                encode_bytes_field(&mut out, 6, key);
             }
         }
         out
@@ -356,7 +338,7 @@ impl RawMessage {
                     message.signature = Some(read_len_delimited(input, &mut idx)?.to_vec());
                 }
                 (6, WIRE_LEN) => message.key = Some(read_len_delimited(input, &mut idx)?.to_vec()),
-                (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
+                (_, wire_type) => skip_field(input, &mut idx, wire_type)?,
             }
         }
         Ok(message)
@@ -464,16 +446,16 @@ impl ControlMessage {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         for ihave in &self.ihave {
-            encode_nested_field(&mut out, tag_byte(1, WIRE_LEN), &ihave.encode());
+            encode_nested_field(&mut out, 1, &ihave.encode());
         }
         for iwant in &self.iwant {
-            encode_nested_field(&mut out, tag_byte(2, WIRE_LEN), &iwant.encode());
+            encode_nested_field(&mut out, 2, &iwant.encode());
         }
         for graft in &self.graft {
-            encode_nested_field(&mut out, tag_byte(3, WIRE_LEN), &graft.encode());
+            encode_nested_field(&mut out, 3, &graft.encode());
         }
         for prune in &self.prune {
-            encode_nested_field(&mut out, tag_byte(4, WIRE_LEN), &prune.encode());
+            encode_nested_field(&mut out, 4, &prune.encode());
         }
         out
     }
@@ -507,7 +489,7 @@ impl ControlMessage {
                     self.prune
                         .push(ControlPrune::decode(read_len_delimited(input, &mut idx)?)?);
                 }
-                (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
+                (_, wire_type) => skip_field(input, &mut idx, wire_type)?,
             }
         }
         Ok(())
@@ -519,10 +501,10 @@ impl ControlIHave {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         if let Some(topic_id) = &self.topic_id {
-            encode_bytes_field(&mut out, tag_byte(1, WIRE_LEN), topic_id.as_bytes());
+            encode_bytes_field(&mut out, 1, topic_id.as_bytes());
         }
         for message_id in &self.message_ids {
-            encode_bytes_field(&mut out, tag_byte(2, WIRE_LEN), message_id);
+            encode_bytes_field(&mut out, 2, message_id);
         }
         out
     }
@@ -541,7 +523,7 @@ impl ControlIHave {
                         .message_ids
                         .push(read_len_delimited(input, &mut idx)?.to_vec());
                 }
-                (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
+                (_, wire_type) => skip_field(input, &mut idx, wire_type)?,
             }
         }
         Ok(message)
@@ -553,7 +535,7 @@ impl ControlIWant {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         for message_id in &self.message_ids {
-            encode_bytes_field(&mut out, tag_byte(1, WIRE_LEN), message_id);
+            encode_bytes_field(&mut out, 1, message_id);
         }
         out
     }
@@ -567,7 +549,7 @@ impl ControlIWant {
                 (1, WIRE_LEN) => message
                     .message_ids
                     .push(read_len_delimited(input, &mut idx)?.to_vec()),
-                (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
+                (_, wire_type) => skip_field(input, &mut idx, wire_type)?,
             }
         }
         Ok(message)
@@ -579,7 +561,7 @@ impl ControlGraft {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         if let Some(topic_id) = &self.topic_id {
-            encode_bytes_field(&mut out, tag_byte(1, WIRE_LEN), topic_id.as_bytes());
+            encode_bytes_field(&mut out, 1, topic_id.as_bytes());
         }
         out
     }
@@ -591,7 +573,7 @@ impl ControlGraft {
         while let Some((field, wire_type)) = read_tag(input, &mut idx)? {
             match (field, wire_type) {
                 (1, WIRE_LEN) => message.topic_id = Some(read_string(input, &mut idx)?),
-                (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
+                (_, wire_type) => skip_field(input, &mut idx, wire_type)?,
             }
         }
         Ok(message)
@@ -603,13 +585,13 @@ impl ControlPrune {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         if let Some(topic_id) = &self.topic_id {
-            encode_bytes_field(&mut out, tag_byte(1, WIRE_LEN), topic_id.as_bytes());
+            encode_bytes_field(&mut out, 1, topic_id.as_bytes());
         }
         for peer in &self.peers {
-            encode_nested_field(&mut out, tag_byte(2, WIRE_LEN), &peer.encode());
+            encode_nested_field(&mut out, 2, &peer.encode());
         }
         if let Some(backoff) = self.backoff {
-            encode_varint_field(&mut out, tag_byte(3, WIRE_VARINT), backoff);
+            encode_varint_field(&mut out, 3, backoff);
         }
         out
     }
@@ -625,7 +607,7 @@ impl ControlPrune {
                     .peers
                     .push(PeerInfo::decode(read_len_delimited(input, &mut idx)?)?),
                 (3, WIRE_VARINT) => message.backoff = Some(read_varint_value(input, &mut idx)?),
-                (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
+                (_, wire_type) => skip_field(input, &mut idx, wire_type)?,
             }
         }
         Ok(message)
@@ -637,10 +619,10 @@ impl PeerInfo {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         if let Some(peer_id) = &self.peer_id {
-            encode_bytes_field(&mut out, tag_byte(1, WIRE_LEN), peer_id);
+            encode_bytes_field(&mut out, 1, peer_id);
         }
         if let Some(record) = &self.signed_peer_record {
-            encode_bytes_field(&mut out, tag_byte(2, WIRE_LEN), record);
+            encode_bytes_field(&mut out, 2, record);
         }
         out
     }
@@ -657,7 +639,7 @@ impl PeerInfo {
                 (2, WIRE_LEN) => {
                     peer.signed_peer_record = Some(read_len_delimited(input, &mut idx)?.to_vec());
                 }
-                (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
+                (_, wire_type) => skip_field(input, &mut idx, wire_type)?,
             }
         }
         Ok(peer)
@@ -669,13 +651,13 @@ impl Rpc {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         for sub in &self.subscriptions {
-            encode_nested_field(&mut out, tag_byte(1, WIRE_LEN), &sub.encode());
+            encode_nested_field(&mut out, 1, &sub.encode());
         }
         for message in &self.publish {
-            encode_nested_field(&mut out, tag_byte(2, WIRE_LEN), &message.to_wire());
+            encode_nested_field(&mut out, 2, &message.to_wire());
         }
         if let Some(control) = &self.control {
-            encode_nested_field(&mut out, tag_byte(3, WIRE_LEN), &control.encode());
+            encode_nested_field(&mut out, 3, &control.encode());
         }
         out
     }
@@ -714,7 +696,7 @@ impl Rpc {
                             .merge_from(nested)?;
                     }
                 }
-                (_, wire_type) => skip_unknown_field(input, &mut idx, wire_type)?,
+                (_, wire_type) => skip_field(input, &mut idx, wire_type)?,
             }
         }
         Ok(rpc)
@@ -725,152 +707,16 @@ impl Rpc {
 // Protobuf helpers
 // ---------------------------------------------------------------------------
 
-/// Computes the tag byte for (field_number, wire_type). Only handles field
-/// numbers < 16 (single-byte tags), which covers the whole pubsub RPC.
-const fn tag_byte(field: u8, wire_type: u8) -> u8 {
-    (field << 3) | wire_type
-}
-
-const WIRE_VARINT: u8 = 0;
-const WIRE_I64: u8 = 1;
-const WIRE_LEN: u8 = 2;
-const WIRE_I32: u8 = 5;
-
-/// Writes a `(tag, varint_value)` field.
-fn encode_varint_field(out: &mut Vec<u8>, tag: u8, value: u64) {
-    out.push(tag);
-    write_uvarint(value, out);
-}
-
-/// Writes a `(tag, length, bytes)` field.
-fn encode_bytes_field(out: &mut Vec<u8>, tag: u8, data: &[u8]) {
-    out.push(tag);
-    write_uvarint(data.len() as u64, out);
-    out.extend_from_slice(data);
-}
-
-/// Writes a `(tag, length, nested_message)` field.
-fn encode_nested_field(out: &mut Vec<u8>, tag: u8, nested: &[u8]) {
-    encode_bytes_field(out, tag, nested);
-}
-
-/// Reads the next (field_number, wire_type) pair. The tag is kept as a full
-/// u64 before splitting so high field numbers can never alias low ones.
+/// Reads the next `(field_number, wire_type)` pair and rejects field 0.
 ///
-/// Returns `Ok(None)` when the buffer is exhausted.
+/// Shared [`minip2p_core::read_tag`] does not enforce field-number policy.
+/// Pubsub matches upstream by refusing field 0 rather than skipping it.
 fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, PubsubWireError> {
-    if *idx >= input.len() {
-        return Ok(None);
-    }
     let offset = *idx;
-    let (tag_value, used) = read_uvarint(varint_tail(input, *idx)?)?;
-    *idx += used;
-    let wire_type = (tag_value & 0x07) as u8;
-    let field_number = tag_value >> 3;
-    if field_number == 0 {
-        return Err(PubsubWireError::InvalidFieldNumber { offset });
+    match minip2p_core::read_tag(input, idx)? {
+        Some((0, _)) => Err(PubsubWireError::InvalidFieldNumber { offset }),
+        other => Ok(other),
     }
-    Ok(Some((field_number, wire_type)))
-}
-
-/// Reads a length-delimited value, advancing `idx` past length and bytes.
-fn read_len_delimited<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], PubsubWireError> {
-    let (length, used) = read_uvarint(varint_tail(input, *idx)?)?;
-    *idx += used;
-    #[expect(
-        clippy::map_err_ignore,
-        reason = "the wire format intentionally reports platform-sized length conversion as a varint overflow"
-    )]
-    let length = usize::try_from(length).map_err(|_| VarintError::Overflow)?;
-    let remaining = input.len().saturating_sub(*idx);
-    if length > remaining {
-        return Err(PubsubWireError::FieldOverflow {
-            offset: *idx,
-            length,
-            remaining,
-        });
-    }
-    let end = (*idx)
-        .checked_add(length)
-        .ok_or(PubsubWireError::FieldOverflow {
-            offset: *idx,
-            length,
-            remaining,
-        })?;
-    let value = input.get(*idx..end).ok_or(PubsubWireError::FieldOverflow {
-        offset: *idx,
-        length,
-        remaining,
-    })?;
-    *idx = end;
-    Ok(value)
-}
-
-/// Reads a UTF-8 string field, reporting the payload offset on failure.
-fn read_string(input: &[u8], idx: &mut usize) -> Result<String, PubsubWireError> {
-    let offset = *idx;
-    let bytes = read_len_delimited(input, idx)?;
-    #[expect(
-        clippy::map_err_ignore,
-        reason = "the public error preserves the payload offset, not UTF-8 parser internals"
-    )]
-    let value = core::str::from_utf8(bytes).map_err(|_| PubsubWireError::InvalidUtf8 { offset })?;
-    Ok(String::from(value))
-}
-
-/// Reads a varint field value.
-fn read_varint_value(input: &[u8], idx: &mut usize) -> Result<u64, PubsubWireError> {
-    let (value, used) = read_uvarint(varint_tail(input, *idx)?)?;
-    *idx += used;
-    Ok(value)
-}
-
-/// Skips over an unknown field based on its wire type.
-fn skip_unknown_field(input: &[u8], idx: &mut usize, wire_type: u8) -> Result<(), PubsubWireError> {
-    match wire_type {
-        WIRE_VARINT => {
-            let (_, used) = read_uvarint(varint_tail(input, *idx)?)?;
-            *idx += used;
-            Ok(())
-        }
-        WIRE_LEN => {
-            read_len_delimited(input, idx)?;
-            Ok(())
-        }
-        WIRE_I32 => {
-            if *idx + 4 > input.len() {
-                return Err(PubsubWireError::FieldOverflow {
-                    offset: *idx,
-                    length: 4,
-                    remaining: input.len().saturating_sub(*idx),
-                });
-            }
-            *idx += 4;
-            Ok(())
-        }
-        WIRE_I64 => {
-            if *idx + 8 > input.len() {
-                return Err(PubsubWireError::FieldOverflow {
-                    offset: *idx,
-                    length: 8,
-                    remaining: input.len().saturating_sub(*idx),
-                });
-            }
-            *idx += 8;
-            Ok(())
-        }
-        _ => Err(PubsubWireError::UnsupportedWireType {
-            wire_type,
-            offset: *idx,
-        }),
-    }
-}
-
-/// Returns the unconsumed protobuf bytes, rejecting a cursor past the input.
-fn varint_tail(input: &[u8], idx: usize) -> Result<&[u8], PubsubWireError> {
-    input
-        .get(idx..)
-        .ok_or(PubsubWireError::Varint(VarintError::BufferTooShort))
 }
 
 // ---------------------------------------------------------------------------
@@ -907,6 +753,7 @@ pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use alloc::vec;
+    use minip2p_core::{tag_byte, write_uvarint};
 
     fn keypair() -> Ed25519Keypair {
         Ed25519Keypair::from_secret_key_bytes([7u8; 32])
@@ -914,6 +761,10 @@ mod tests {
 
     fn other_keypair() -> Ed25519Keypair {
         Ed25519Keypair::from_secret_key_bytes([9u8; 32])
+    }
+
+    fn tag(field: u8, wire: u8) -> u8 {
+        tag_byte(field, wire).expect("test field numbers fit in one byte")
     }
 
     // -- protobuf round-trips ------------------------------------------------
@@ -1034,8 +885,8 @@ mod tests {
             ..ControlMessage::default()
         };
         let mut encoded = Vec::new();
-        encode_nested_field(&mut encoded, tag_byte(3, WIRE_LEN), &first.encode());
-        encode_nested_field(&mut encoded, tag_byte(3, WIRE_LEN), &second.encode());
+        encode_nested_field(&mut encoded, 3, &first.encode());
+        encode_nested_field(&mut encoded, 3, &second.encode());
 
         let merged = Rpc::decode(&encoded).unwrap().control.unwrap();
         assert_eq!(merged.graft, first.graft);
@@ -1045,7 +896,7 @@ mod tests {
             ..Rpc::default()
         }
         .encode();
-        assert_eq!(reencoded.first(), Some(&tag_byte(3, WIRE_LEN)));
+        assert_eq!(reencoded.first(), Some(&tag(3, WIRE_LEN)));
         assert_eq!(
             Rpc::decode(&reencoded)
                 .unwrap()
@@ -1059,10 +910,10 @@ mod tests {
 
     #[test]
     fn malformed_and_unknown_control_fields_follow_codec_rules() {
-        let truncated_prune = [tag_byte(1, WIRE_LEN), 4, b't'];
+        let truncated_prune = [tag(1, WIRE_LEN), 4, b't'];
         assert!(matches!(
             ControlPrune::decode(&truncated_prune),
-            Err(PubsubWireError::FieldOverflow { .. })
+            Err(PubsubWireError::Wire(WireError::FieldOverflow { .. }))
         ));
 
         let field_zero = [0x00, 0x01];
@@ -1075,7 +926,7 @@ mod tests {
             topic_id: Some(String::from("t")),
         }
         .encode();
-        with_unknown.extend_from_slice(&[tag_byte(15, WIRE_LEN), 1, 0xff]);
+        with_unknown.extend_from_slice(&[tag(15, WIRE_LEN), 1, 0xff]);
         assert_eq!(
             ControlGraft::decode(&with_unknown)
                 .unwrap()
@@ -1091,10 +942,10 @@ mod tests {
         // meshsub-aware decoder rejects it, while floodsub treats the whole
         // control body as an opaque extension and still decodes later fields.
         let mut encoded = Vec::new();
-        encode_nested_field(&mut encoded, tag_byte(3, WIRE_LEN), &[0x00, 0x01]);
+        encode_nested_field(&mut encoded, 3, &[0x00, 0x01]);
         encode_nested_field(
             &mut encoded,
-            tag_byte(1, WIRE_LEN),
+            1,
             &SubOpts {
                 subscribe: Some(true),
                 topic_id: Some(String::from("t")),
@@ -1156,7 +1007,7 @@ mod tests {
         }
         .encode();
         // Append field 15, wire type LEN, 3 bytes.
-        encoded.extend_from_slice(&[tag_byte(15, WIRE_LEN), 3, 0xde, 0xad, 0xbe]);
+        encoded.extend_from_slice(&[tag(15, WIRE_LEN), 3, 0xde, 0xad, 0xbe]);
         let decoded = SubOpts::decode(&encoded).unwrap();
         assert_eq!(decoded.subscribe, Some(true));
         assert_eq!(decoded.topic_id.as_deref(), Some("t"));
@@ -1177,19 +1028,19 @@ mod tests {
     #[test]
     fn truncated_field_errors() {
         // from-field claims 5 bytes, provides 1.
-        let encoded = [tag_byte(1, WIRE_LEN), 5, 0xab];
+        let encoded = [tag(1, WIRE_LEN), 5, 0xab];
         assert!(matches!(
             RawMessage::decode(&encoded),
-            Err(PubsubWireError::FieldOverflow { .. })
+            Err(PubsubWireError::Wire(WireError::FieldOverflow { .. }))
         ));
     }
 
     #[test]
     fn invalid_utf8_topic_errors() {
-        let encoded = [tag_byte(4, WIRE_LEN), 2, 0xff, 0xfe];
+        let encoded = [tag(4, WIRE_LEN), 2, 0xff, 0xfe];
         assert!(matches!(
             RawMessage::decode(&encoded),
-            Err(PubsubWireError::InvalidUtf8 { .. })
+            Err(PubsubWireError::Wire(WireError::InvalidUtf8 { .. }))
         ));
     }
 
@@ -1218,7 +1069,10 @@ mod tests {
         let encoded = [(9 << 3) | 3];
         assert!(matches!(
             RawMessage::decode(&encoded),
-            Err(PubsubWireError::UnsupportedWireType { wire_type: 3, .. })
+            Err(PubsubWireError::Wire(WireError::UnsupportedWireType {
+                wire_type: 3,
+                ..
+            }))
         ));
     }
 
@@ -1405,7 +1259,7 @@ mod tests {
         let mut wire = signed.encode_fields(true);
         // Unknown field 12 appended by the hypothetical sender AFTER signing
         // the canonical fields (matches upstream behavior).
-        wire.extend_from_slice(&[tag_byte(12, WIRE_LEN), 2, 0xca, 0xfe]);
+        wire.extend_from_slice(&[tag(12, WIRE_LEN), 2, 0xca, 0xfe]);
 
         let decoded = RawMessage::decode(&wire).unwrap();
         assert_eq!(decoded.raw, wire, "raw keeps the original bytes");
@@ -1427,6 +1281,7 @@ mod tests {
 mod frame_golden {
     use super::*;
     use alloc::vec;
+    use minip2p_core::VarintError;
 
     #[test]
     fn golden_empty_payload() {

@@ -1,6 +1,14 @@
 //! Protobuf wire codec compatible with js-libp2p pubsub peer discovery.
+//!
+//! Field framing uses the shared protobuf vocabulary in [`minip2p_core`];
+//! this module keeps beacon layout, size caps, and contextual
+//! [`DiscoveryWireError`] values (including field-number policy).
 
 use alloc::vec::Vec;
+
+use minip2p_core::{
+    WIRE_LEN, WireError, encode_bytes_field, read_len_delimited, read_tag, skip_field, uvarint_len,
+};
 
 /// Default js-libp2p-compatible discovery topic.
 pub const DISCOVERY_TOPIC: &str = "_peer-discovery._p2p._pubsub";
@@ -17,10 +25,6 @@ pub const MAX_ADDR_LEN: usize = 1024;
 /// The three remaining bytes encode the field tag and its two-byte length prefix.
 pub const MAX_PUBLIC_KEY_LEN: usize = MAX_BEACON_SIZE - 3;
 
-const WIRE_VARINT: u64 = 0;
-const WIRE_64: u64 = 1;
-const WIRE_LEN: u64 = 2;
-const WIRE_32: u64 = 5;
 const MAX_FIELD_NUMBER: u64 = (1 << 29) - 1;
 
 /// Presence payload: protobuf `Peer { bytes publicKey = 1; repeated bytes addrs = 2; }`.
@@ -49,10 +53,10 @@ impl Beacon {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.encoded_len());
         if !self.public_key.is_empty() {
-            write_len_field(1, &self.public_key, &mut out);
+            encode_bytes_field(&mut out, 1, &self.public_key);
         }
         for addr in &self.addrs {
-            write_len_field(2, addr, &mut out);
+            encode_bytes_field(&mut out, 2, addr);
         }
         out
     }
@@ -64,10 +68,7 @@ impl Beacon {
         }
         let mut beacon = Self::default();
         let mut idx = 0;
-        while idx < input.len() {
-            let tag = read_varint(input, &mut idx)?;
-            let field = tag >> 3;
-            let wire = tag & 7;
+        while let Some((field, wire)) = read_tag(input, &mut idx)? {
             if field == 0 {
                 return Err(DiscoveryWireError::FieldZero);
             }
@@ -76,7 +77,7 @@ impl Beacon {
             }
             match (field, wire) {
                 (1, WIRE_LEN) => {
-                    let value = read_len(input, &mut idx)?;
+                    let value = read_len_delimited(input, &mut idx)?;
                     if value.len() > MAX_PUBLIC_KEY_LEN {
                         return Err(DiscoveryWireError::PublicKeyTooLarge);
                     }
@@ -86,7 +87,7 @@ impl Beacon {
                     if beacon.addrs.len() == MAX_BEACON_ADDRS {
                         return Err(DiscoveryWireError::TooManyAddresses);
                     }
-                    let value = read_len(input, &mut idx)?;
+                    let value = read_len_delimited(input, &mut idx)?;
                     if value.len() > MAX_ADDR_LEN {
                         return Err(DiscoveryWireError::AddressTooLarge);
                     }
@@ -100,26 +101,23 @@ impl Beacon {
 }
 
 /// Why a beacon payload could not be decoded safely.
+///
+/// Shared framing failures are wrapped as [`Self::Wire`] so callers retain
+/// discovery context while reusing the core protobuf vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum DiscoveryWireError {
+    /// A shared protobuf framing failure.
+    #[error(transparent)]
+    Wire(#[from] WireError),
     /// The top-level payload exceeds [`MAX_BEACON_SIZE`].
     #[error("discovery beacon exceeds the maximum size")]
     BeaconTooLarge,
-    /// A protobuf varint is truncated, too long, or overflows.
-    #[error("invalid protobuf varint")]
-    InvalidVarint,
     /// Protobuf field zero is forbidden.
     #[error("protobuf field number zero is invalid")]
     FieldZero,
     /// The field number exceeds protobuf's 29-bit range.
     #[error("protobuf field number exceeds the supported range")]
     InvalidFieldNumber,
-    /// A length-delimited value extends beyond the input.
-    #[error("truncated length-delimited protobuf field")]
-    Truncated,
-    /// Groups and reserved wire types are unsupported.
-    #[error("unsupported protobuf wire type {0}")]
-    UnsupportedWireType(u64),
     /// The public-key field exceeds its bound.
     #[error("discovery public key exceeds the maximum length")]
     PublicKeyTooLarge,
@@ -131,88 +129,11 @@ pub enum DiscoveryWireError {
     TooManyAddresses,
 }
 
-fn write_len_field(field: u64, value: &[u8], out: &mut Vec<u8>) {
-    write_varint((field << 3) | WIRE_LEN, out);
-    write_varint(value.len() as u64, out);
-    out.extend_from_slice(value);
-}
-
 fn len_field_size(value_len: usize) -> usize {
+    // Beacon fields 1 and 2 always use a single-byte tag.
     1usize
-        .saturating_add(varint_size(value_len))
+        .saturating_add(uvarint_len(value_len as u64))
         .saturating_add(value_len)
-}
-
-fn varint_size(mut value: usize) -> usize {
-    let mut len = 1;
-    while value >= 0x80 {
-        value >>= 7;
-        len += 1;
-    }
-    len
-}
-
-fn write_varint(mut value: u64, out: &mut Vec<u8>) {
-    while value >= 0x80 {
-        out.push((value as u8) | 0x80);
-        value >>= 7;
-    }
-    out.push(value as u8);
-}
-
-fn read_varint(input: &[u8], idx: &mut usize) -> Result<u64, DiscoveryWireError> {
-    let mut value = 0u64;
-    for shift in (0..70).step_by(7) {
-        let byte = *input.get(*idx).ok_or(DiscoveryWireError::InvalidVarint)?;
-        *idx += 1;
-        if shift == 63 && byte > 1 {
-            return Err(DiscoveryWireError::InvalidVarint);
-        }
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-    }
-    Err(DiscoveryWireError::InvalidVarint)
-}
-
-fn read_len<'a>(input: &'a [u8], idx: &mut usize) -> Result<&'a [u8], DiscoveryWireError> {
-    #[expect(
-        clippy::map_err_ignore,
-        reason = "wire lengths wider than usize use the compact truncated-input error"
-    )]
-    let len: usize = read_varint(input, idx)?
-        .try_into()
-        .map_err(|_| DiscoveryWireError::Truncated)?;
-    let end = idx.checked_add(len).ok_or(DiscoveryWireError::Truncated)?;
-    let value = input.get(*idx..end).ok_or(DiscoveryWireError::Truncated)?;
-    *idx = end;
-    Ok(value)
-}
-
-fn skip_field(input: &[u8], idx: &mut usize, wire: u64) -> Result<(), DiscoveryWireError> {
-    match wire {
-        WIRE_VARINT => {
-            read_varint(input, idx)?;
-        }
-        WIRE_64 => {
-            *idx = idx.checked_add(8).ok_or(DiscoveryWireError::Truncated)?;
-            if *idx > input.len() {
-                return Err(DiscoveryWireError::Truncated);
-            }
-        }
-        WIRE_LEN => {
-            let _ = read_len(input, idx)?;
-        }
-        WIRE_32 => {
-            *idx = idx.checked_add(4).ok_or(DiscoveryWireError::Truncated)?;
-            if *idx > input.len() {
-                return Err(DiscoveryWireError::Truncated);
-            }
-        }
-        other => return Err(DiscoveryWireError::UnsupportedWireType(other)),
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -237,14 +158,17 @@ mod tests {
     #[test]
     fn rejects_malformed_and_skips_unknown_fields() {
         assert_eq!(Beacon::decode(&[0]), Err(DiscoveryWireError::FieldZero));
-        assert_eq!(
+        assert!(matches!(
             Beacon::decode(&[0x0b]),
-            Err(DiscoveryWireError::UnsupportedWireType(3))
-        );
-        assert_eq!(
+            Err(DiscoveryWireError::Wire(WireError::UnsupportedWireType {
+                wire_type: 3,
+                ..
+            }))
+        ));
+        assert!(matches!(
             Beacon::decode(&[0x0a, 2, 1]),
-            Err(DiscoveryWireError::Truncated)
-        );
+            Err(DiscoveryWireError::Wire(WireError::FieldOverflow { .. }))
+        ));
         let input = [0x18, 0x96, 1, 0x0a, 1, 7];
         assert_eq!(Beacon::decode(&input).unwrap().public_key, vec![7]);
     }

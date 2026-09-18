@@ -4,7 +4,10 @@
 //! long-lived outbound stream, mesh/fanout routing, heartbeat gossip, and a
 //! bounded message cache. [`FloodsubAgent`] speaks `/floodsub/1.0.0` using
 //! one outbound stream per RPC. [`PubsubAgent`] provides static engine
-//! selection. Both share varint framing, RPC/control encoding, and StrictSign
+//! selection. RPC field framing uses the shared protobuf vocabulary in
+//! [`minip2p_core`]; this crate keeps message types, StrictSign, the 64 KiB
+//! RPC-body limit, and contextual [`PubsubWireError`] values. Both engines
+//! share varint stream framing, RPC/control encoding, and StrictSign
 //! message signing and verification.
 //!
 //! No I/O, no clocks, no async: callers feed inputs and drain
