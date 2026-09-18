@@ -1998,6 +1998,36 @@ mod tests {
     }
 
     #[test]
+    fn connection_state_updates_before_establishment_event_is_queued() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"state-before-event-peer");
+        let conn_id = ConnectionId::new(91);
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+        );
+
+        // State must reflect the transition before any application drain.
+        assert!(core.connected_peers().contains(&peer_id));
+        assert_eq!(core.connection_id(&peer_id), Some(conn_id));
+        assert!(
+            core.events
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    SwarmEvent::ConnectionEstablished {
+                        peer_id: established,
+                        conn_id: established_conn,
+                    } if *established == peer_id && *established_conn == conn_id
+                )),
+            "the matching event is queued only after state was updated"
+        );
+    }
+
+    #[test]
     fn outbound_not_available_error_preserves_stream_id() {
         let mut core = test_core();
         let peer = PeerId::from_public_key_protobuf(b"unsupported-peer");

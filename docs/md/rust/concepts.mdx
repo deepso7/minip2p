@@ -9,11 +9,11 @@ An `Endpoint` is the main application API. Five ideas explain most code built on
 
 `Endpoint` owns an Ed25519 identity, the transports you bound, and the connection state. It is the app-facing entrypoint for listening, dialing, Ping, Identify, and application streams. QUIC is on by default; add the `tcp` feature to use QUIC and TCP together, or bind only TCP.
 
-An endpoint does not spawn a runtime. Use focused waits such as `wait_path` and `wait_peer_ready` when you need a particular milestone. Use `next_event` to handle application events, or `next_wake` when your loop also handles capability queues and interruptions. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. `poll()` is the non-blocking step for an existing reactor.
+An endpoint does not spawn a runtime. Prefer `Endpoint::wait` for the ordered Endpoint event stream (event, deadline, or interrupted). Focused waits such as `wait_path` and `wait_peer_ready`, plus `next_event` / `next_wake`, remain during migration. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. `poll()` is the non-blocking step for an existing reactor.
 
 ```mermaid
 flowchart TB
-  A["Your caller-driven loop"] <-->|"wait_* / next_event / next_wake · events"| B["Endpoint"]
+  A["Your caller-driven loop"] <-->|"wait / wait_* / next_event · events"| B["Endpoint"]
   B <-->|"QUIC over UDP · Noise + Yamux over TCP"| C["Network"]
 ```
 
@@ -78,10 +78,14 @@ A Cargo feature makes a capability available. Enable it on `EndpointBuilder`; se
 
 ## Where events go
 
-Ordinary connection, Identify, Ping, and application stream events come from `poll` or `next_event`. Enabled capabilities expose their own event queues:
+Ordinary connection, Identify, Ping, and application stream events leave through the Endpoint event stream: `Endpoint::wait`, `poll`, or the migration-era `next_event`. Prefer `wait` for new code — it returns an event, deadline, or interruption without swallowing interrupts, and does not use the old driver-progress wake.
+
+Enabled capabilities still expose their own event queues until a later ticket folds them into the stream:
 
 - `take_nat_events` / `next_nat_event`;
 - `take_pubsub_events` / `next_pubsub_event`;
 - `take_discovery_events` / `next_discovery_event`.
+
+Durable connection, peer, and listener state is available through State snapshot getters (`connected_peers`, `is_peer_ready`, `peer_info`, `connection_id`, `connection_remote_addr`, `listen_addresses`). Those getters do not drive the endpoint, are not one cross-getter atomic snapshot, and may be ahead of the event stream.
 
 Continue with [Listen and dial](/rust/listen-and-dial) or the [glossary](/reference/glossary).
