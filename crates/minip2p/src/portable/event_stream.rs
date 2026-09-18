@@ -16,11 +16,11 @@ use minip2p_swarm::SwarmEvent;
 /// delivered event.
 pub type EndpointEvent = SwarmEvent;
 
-/// Why one blocking [`crate::Endpoint::wait`] call returned.
+/// Why one blocking standard Endpoint wait returned.
 ///
 /// Deadline and interruption are control outcomes, not additional event
-/// sources. Unlike [`crate::EndpointWake`], this shape has no driver-progress
-/// variant and does not require draining capability queues.
+/// sources. Unlike the migration-era `EndpointWake` shape, this outcome has no
+/// driver-progress variant and does not require draining capability queues.
 #[derive(Debug)]
 #[expect(
     clippy::large_enum_variant,

@@ -12,6 +12,9 @@ pub use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol, TransportKind};
 pub use minip2p_identity::Ed25519Keypair;
 pub use minip2p_platform::{Deadline as PollDeadline, EntropySource, Now, SharedEntropy};
 pub use minip2p_swarm::{
+    // Part of `EndpointEvent` / `SwarmEvent` public shapes (`ConnectionClosed`,
+    // `Error`); re-exported so portable callers can name them without a direct
+    // swarm dependency.
     ConnectionCloseCause, DriverError, IdentifyMessage, SwarmBuilder, SwarmError, SwarmEvent,
     SwarmRuntime, SwarmRuntimeError,
 };
@@ -160,7 +163,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// not one cross-getter atomic snapshot and may be ahead of the Endpoint
     /// event stream.
     pub fn connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
-        self.runtime.core().connection_id(peer_id)
+        self.runtime.connection_id(peer_id)
     }
 
     /// Returns the remote transport address recorded for an exact connection.
