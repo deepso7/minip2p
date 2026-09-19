@@ -19,7 +19,6 @@ export {
   DriverFailureKind,
   EndpointErrorKind,
   NatErrorKind,
-  PubsubRouter,
   Reachability,
   type Bytes,
   type CloseReason,

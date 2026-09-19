@@ -7,7 +7,7 @@ use std::sync::Arc;
 use minip2p_ffi_core::{
     DiscoveryOptions, DiscoverySource, DriverFailureKind, EndpointConfig, EndpointErrorKind,
     EventDoorbell, IdentifyInfo, MdnsOptions, NatErrorKind, P2pEndpoint, P2pEvent, PathKind,
-    PubsubRouter, Reachability, TransportOptions,
+    Reachability, TransportOptions,
 };
 use napi::bindgen_prelude::{BigInt, Uint8Array};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -84,8 +84,6 @@ pub struct NodeEndpointConfig {
     pub force_relay: bool,
     /// Whether unsigned pubsub messages are accepted.
     pub allow_unsigned: bool,
-    /// Pubsub router discriminant.
-    pub pubsub_router: u32,
     /// Application protocol identifiers.
     pub protocols: Vec<String>,
     /// Signed discovery configuration.
@@ -98,11 +96,6 @@ impl TryFrom<NodeEndpointConfig> for EndpointConfig {
     type Error = Error;
 
     fn try_from(config: NodeEndpointConfig) -> Result<Self> {
-        let pubsub_router = match config.pubsub_router {
-            0 => PubsubRouter::Gossipsub,
-            1 => PubsubRouter::Floodsub,
-            value => return Err(Error::from_reason(format!("unknown pubsub router {value}"))),
-        };
         Ok(Self {
             agent_version: config.agent_version,
             relays: config.relays,
@@ -111,7 +104,6 @@ impl TryFrom<NodeEndpointConfig> for EndpointConfig {
             tcp: config.tcp.map(convert_transport),
             force_relay: config.force_relay,
             allow_unsigned: config.allow_unsigned,
-            pubsub_router,
             protocols: config.protocols,
             discovery: config.discovery.map(convert_discovery).transpose()?,
             mdns: config.mdns.map(convert_mdns).transpose()?,

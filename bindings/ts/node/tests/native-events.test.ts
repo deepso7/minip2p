@@ -72,7 +72,6 @@ function createEndpoint(protocol?: string): NativeEndpoint {
       autonatServers: [],
       forceRelay: false,
       protocols: protocol === undefined ? [] : [protocol],
-      pubsubRouter: 1,
       quic: { listenAddrs: ["/ip4/127.0.0.1/udp/0/quic-v1"] },
       relays: [],
     }

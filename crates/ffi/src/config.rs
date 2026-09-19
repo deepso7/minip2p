@@ -6,8 +6,6 @@ use minip2p_ffi_core as core;
 pub type DiscoveryOptions = core::DiscoveryOptions;
 /// UniFFI mirror of the core transport options.
 pub type TransportOptions = core::TransportOptions;
-/// UniFFI mirror of the core pubsub router choice.
-pub type PubsubRouter = core::PubsubRouter;
 /// UniFFI mirror of the core endpoint configuration.
 pub type EndpointConfig = core::EndpointConfig;
 /// UniFFI mirror of the core mDNS options.
@@ -51,16 +49,6 @@ pub struct MdnsOptions {
     pub auto_dial: bool,
 }
 
-/// Pubsub routing engine selected at endpoint construction.
-#[uniffi::remote(Enum)]
-pub enum PubsubRouter {
-    /// Mesh-based gossipsub routing.
-    #[default]
-    Gossipsub,
-    /// Flood-to-all-subscribers floodsub routing.
-    Floodsub,
-}
-
 /// One enabled transport and the addresses it should listen on.
 #[uniffi::remote(Record)]
 pub struct TransportOptions {
@@ -88,8 +76,6 @@ pub struct EndpointConfig {
     pub force_relay: bool,
     /// Whether unsigned pubsub messages are accepted.
     pub allow_unsigned: bool,
-    /// Pubsub routing engine.
-    pub pubsub_router: PubsubRouter,
     /// Application protocol ids registered before the endpoint starts.
     pub protocols: Vec<String>,
     /// Signed-discovery settings, or no discovery when absent.

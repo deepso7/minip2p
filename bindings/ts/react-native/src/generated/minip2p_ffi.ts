@@ -245,43 +245,6 @@ const FfiConverterTypeTransportOptions = (() => {
 })();
 
 /**
- * Pubsub routing engine selected at endpoint construction.
- */
-export enum PubsubRouter {
-    /**
-     * Mesh-based gossipsub routing.
-     */
-    Gossipsub,
-    /**
-     * Flood-to-all-subscribers floodsub routing.
-     */
-    Floodsub
-}
-
-const FfiConverterTypePubsubRouter = (() => {
-    type TypeName = PubsubRouter;
-    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
-        readFromCursor(c: Cursor): TypeName {
-            switch (c.readI32()) {
-                case 1: return PubsubRouter.Gossipsub;
-                case 2: return PubsubRouter.Floodsub;
-                default: throw new UniffiInternalError.UnexpectedEnumCase();
-            }
-        }
-        writeIntoCursor(value: TypeName, c: Cursor): void {
-            switch (value) {
-                case PubsubRouter.Gossipsub: return c.writeI32(1);
-                case PubsubRouter.Floodsub: return c.writeI32(2);
-            }
-        }
-        allocationSize(value: TypeName): number {
-            return 4;
-        }
-    }
-    return new FFIConverter();
-})();
-
-/**
  * Local-link mDNS discovery configuration.
  */
 export type MdnsOptions = {
@@ -408,10 +371,6 @@ export type EndpointConfig = {
      */
     allowUnsigned: boolean,
     /**
-     * Pubsub routing engine.
-     */
-    pubsubRouter: PubsubRouter,
-    /**
      * Application protocol ids registered before the endpoint starts.
      */
     protocols: Array<string>,
@@ -453,7 +412,6 @@ const FfiConverterTypeEndpointConfig = (() => {
                 tcp: FfiConverterOptionalTypeTransportOptions.readFromCursor(c),
                 forceRelay: FfiConverterBool.readFromCursor(c),
                 allowUnsigned: FfiConverterBool.readFromCursor(c),
-                pubsubRouter: FfiConverterTypePubsubRouter.readFromCursor(c),
                 protocols: FfiConverterSequenceString.readFromCursor(c),
                 discovery: FfiConverterOptionalTypeDiscoveryOptions.readFromCursor(c),
                 mdns: FfiConverterOptionalTypeMdnsOptions.readFromCursor(c)
@@ -467,7 +425,6 @@ const FfiConverterTypeEndpointConfig = (() => {
             FfiConverterOptionalTypeTransportOptions.writeIntoCursor(value.tcp, c);
             FfiConverterBool.writeIntoCursor(value.forceRelay, c);
             FfiConverterBool.writeIntoCursor(value.allowUnsigned, c);
-            FfiConverterTypePubsubRouter.writeIntoCursor(value.pubsubRouter, c);
             FfiConverterSequenceString.writeIntoCursor(value.protocols, c);
             FfiConverterOptionalTypeDiscoveryOptions.writeIntoCursor(value.discovery, c);
             FfiConverterOptionalTypeMdnsOptions.writeIntoCursor(value.mdns, c);
@@ -480,7 +437,6 @@ const FfiConverterTypeEndpointConfig = (() => {
              FfiConverterOptionalTypeTransportOptions.allocationSize(value.tcp) +
              FfiConverterBool.allocationSize(value.forceRelay) +
              FfiConverterBool.allocationSize(value.allowUnsigned) +
-             FfiConverterTypePubsubRouter.allocationSize(value.pubsubRouter) +
              FfiConverterSequenceString.allocationSize(value.protocols) +
              FfiConverterOptionalTypeDiscoveryOptions.allocationSize(value.discovery) +
              FfiConverterOptionalTypeMdnsOptions.allocationSize(value.mdns);
@@ -4917,7 +4873,6 @@ export default Object.freeze({
     FfiConverterTypeP2pEvent,
     FfiConverterTypeP2pEventDoorbell,
     FfiConverterTypePathKind,
-    FfiConverterTypePubsubRouter,
     FfiConverterTypeReachability,
     FfiConverterTypeRelayReservationInfo,
     FfiConverterTypeTransportOptions,

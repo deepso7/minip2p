@@ -48,16 +48,6 @@ pub struct MdnsOptions {
     pub auto_dial: bool,
 }
 
-/// Pubsub routing engine selected at endpoint construction.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum PubsubRouter {
-    /// Mesh-based gossipsub routing.
-    #[default]
-    Gossipsub,
-    /// Flood-to-all-subscribers floodsub routing.
-    Floodsub,
-}
-
 /// One enabled transport and the addresses it should listen on.
 #[derive(Clone, Debug)]
 pub struct TransportOptions {
@@ -85,8 +75,6 @@ pub struct EndpointConfig {
     pub force_relay: bool,
     /// Whether unsigned pubsub messages are accepted.
     pub allow_unsigned: bool,
-    /// Pubsub routing engine.
-    pub pubsub_router: PubsubRouter,
     /// Application protocol ids registered before the endpoint starts.
     pub protocols: Vec<String>,
     /// Signed-discovery settings, or no discovery when absent.
@@ -134,7 +122,6 @@ impl fmt::Debug for EndpointConfig {
             .field("tcp", &self.tcp)
             .field("force_relay", &self.force_relay)
             .field("allow_unsigned", &self.allow_unsigned)
-            .field("pubsub_router", &self.pubsub_router)
             .field("protocols", &self.protocols)
             .field("discovery", &self.discovery)
             .field("mdns", &self.mdns)

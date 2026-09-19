@@ -38,13 +38,6 @@ export interface Minip2pMdnsOptions {
   readonly autoDial?: boolean;
 }
 
-/** Available pubsub routing strategies. */
-export const PubsubRouter = {
-  Floodsub: 1,
-  Gossipsub: 0,
-} as const;
-export type PubsubRouter = (typeof PubsubRouter)[keyof typeof PubsubRouter];
-
 /** Coarse local reachability states. */
 export const Reachability = {
   Private: 2,
@@ -125,8 +118,6 @@ export interface Minip2pConfig {
   readonly forceRelay?: boolean;
   /** Accepts unsigned pubsub messages. */
   readonly allowUnsigned?: boolean;
-  /** Pubsub router to enable. */
-  readonly pubsubRouter?: PubsubRouter;
   /** Application protocol IDs accepted on inbound streams. */
   readonly protocols?: readonly string[];
   /** Signed-beacon discovery configuration. */
