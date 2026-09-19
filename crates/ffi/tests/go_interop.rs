@@ -181,6 +181,7 @@ fn config() -> EndpointConfig {
         agent_version: Some("minip2p-go-interop".into()),
         relays: Vec::new(),
         autonat_servers: Vec::new(),
+        listen: None,
         quic: None,
         tcp: Some(TransportOptions {
             listen_addrs: Some(vec!["/ip4/127.0.0.1/tcp/0".into()]),

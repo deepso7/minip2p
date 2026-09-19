@@ -80,6 +80,8 @@ pub struct EndpointConfig {
     pub relays: Vec<String>,
     /// AutoNAT server peer addresses.
     pub autonat_servers: Vec<String>,
+    /// Address-shaped listen multiaddresses; transport is inferred from shape.
+    pub listen: Option<Vec<String>>,
     /// QUIC configuration, or no QUIC transport when absent.
     pub quic: Option<TransportOptions>,
     /// TCP configuration, or no TCP transport when absent.

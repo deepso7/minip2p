@@ -373,25 +373,45 @@ function toNativeConfig(config: Minip2pConfig): NativeEndpointConfig {
           ttlMs: numberToU64(mdnsOptions.ttlMs ?? 120_000, "ttlMs"),
         };
   const configuredTransports = config.transports;
-  const transports: Minip2pTransports =
-    configuredTransports === undefined ||
-    (configuredTransports.quic === undefined &&
-      configuredTransports.tcp === undefined)
-      ? { quic: true }
-      : configuredTransports;
+  const addressListen =
+    config.listen === undefined ? undefined : [...config.listen];
+  const hasTransports =
+    configuredTransports !== undefined &&
+    (configuredTransports.quic !== undefined ||
+      configuredTransports.tcp !== undefined);
+  if (addressListen !== undefined && hasTransports) {
+    throw new Error(
+      "use either address-shaped listen or legacy transports, not both"
+    );
+  }
+  const transports: Minip2pTransports = (() => {
+    if (addressListen !== undefined) {
+      return {};
+    }
+    if (
+      configuredTransports === undefined ||
+      (configuredTransports.quic === undefined &&
+        configuredTransports.tcp === undefined)
+    ) {
+      return { quic: true };
+    }
+    return configuredTransports;
+  })();
+  const useAddressListen = addressListen !== undefined;
   return {
     agentVersion: config.agentVersion,
     allowUnsigned: config.allowUnsigned ?? false,
     autonatServers: [...(config.autonatServers ?? [])],
     discovery,
     forceRelay: config.forceRelay ?? false,
+    listen: addressListen,
     mdns,
     protocols: [...(config.protocols ?? [])],
     pubsubRouter: (config.pubsubRouter ??
       PubsubRouter.Gossipsub) as NativeEndpointConfig["pubsubRouter"],
-    quic: toNativeTransport(transports.quic),
+    quic: useAddressListen ? undefined : toNativeTransport(transports.quic),
     relays: [...(config.relays ?? [])],
-    tcp: toNativeTransport(transports.tcp),
+    tcp: useAddressListen ? undefined : toNativeTransport(transports.tcp),
   };
 }
 

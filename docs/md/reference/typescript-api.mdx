@@ -52,7 +52,8 @@ Setup per runtime: [Node.js](/typescript/setup-node), [React Native](/typescript
 | --- | --- | --- |
 | `secretKey` | `ArrayBuffer \| Uint8Array` | Required 32-byte Ed25519 secret key. |
 | `agentVersion` | `string` | Identify agent string. |
-| `transports` | `Minip2pTransports` | Enabled transports. Omitted means dual-stack QUIC only. |
+| `transports` | `Minip2pTransports` | Enabled transports. Omitted means dual-stack QUIC only when `listen` is also omitted. |
+| `listen` | `readonly [string, ...string[]]` | Address-shaped listen multiaddresses; transport is inferred from each address. When set, omit `transports`. |
 | `protocols` | `readonly string[]` | Custom protocols accepted on inbound streams. |
 | `relays` | `readonly string[]` | Direct QUIC or TCP relay peer addresses. |
 | `autonatServers` | `readonly string[]` | Reachability probe-server addresses. |
@@ -65,6 +66,13 @@ Setup per runtime: [Node.js](/typescript/setup-node), [React Native](/typescript
 `discovery.topic` is required when signed discovery is enabled. Both discovery options objects accept `autoDial`; remaining timing and capacity fields are typed in the exported declarations and use defaults when omitted. Signed discovery and mDNS share one automatic-dial policy. If both set `autoDial`, the values must match.
 
 Each transport accepts `true` or `{ listen?: readonly [string, ...string[]] }`; omit a transport to disable it. `true` listens on that transport's IPv4 and IPv6 defaults. An explicit `listen` array replaces those defaults exactly; an empty array is rejected. QUIC accepts at most one explicit listener per IP family. An omitted or empty `transports` object defaults to QUIC.
+
+Prefer top-level address-shaped `listen` when configuration already speaks multiaddresses:
+
+```ts
+// Infer transports from complete multiaddresses
+listen: ["/ip4/127.0.0.1/udp/4001/quic-v1", "/ip4/127.0.0.1/tcp/4001"];
+```
 
 ```ts
 // QUIC only, IPv4 + IPv6 (also the default when `transports` is omitted)

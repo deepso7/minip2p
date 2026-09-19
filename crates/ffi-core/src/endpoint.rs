@@ -22,9 +22,33 @@ use crate::{
 
 fn configure_transports(
     mut builder: EndpointBuilder,
+    listen: Option<Vec<String>>,
     quic: Option<TransportOptions>,
     tcp: Option<TransportOptions>,
 ) -> Result<EndpointBuilder, FfiError> {
+    if let Some(addresses) = listen {
+        if addresses.is_empty() {
+            return Err(FfiError::InvalidConfig {
+                detail: "listen cannot be empty; omit listen for transport defaults, or pass complete multiaddresses".into(),
+            });
+        }
+        if quic.is_some() || tcp.is_some() {
+            return Err(FfiError::InvalidConfig {
+                detail: "use either address-shaped `listen` or legacy `quic`/`tcp` transport options, not both".into(),
+            });
+        }
+        for address in addresses {
+            let parsed =
+                Multiaddr::from_str(&address).map_err(|error| FfiError::InvalidAddress {
+                    detail: format!("invalid listen address `{address}`: {error}"),
+                })?;
+            builder = builder
+                .listen_multiaddr(&parsed)
+                .map_err(map_listen_error)?;
+        }
+        return Ok(builder);
+    }
+
     if quic.is_none() && tcp.is_none() {
         return Err(FfiError::InvalidConfig {
             detail: "at least one transport must be enabled".into(),
@@ -98,6 +122,12 @@ fn configure_transports(
     }
 
     Ok(builder)
+}
+
+fn map_listen_error(error: minip2p::Error) -> FfiError {
+    FfiError::InvalidConfig {
+        detail: error.to_string(),
+    }
 }
 
 fn parse_listen_addr(address: &str, transport: &str) -> Result<Multiaddr, FfiError> {
@@ -270,7 +300,7 @@ impl P2pEndpoint {
             }
         }
 
-        builder = configure_transports(builder, config.quic, config.tcp)?;
+        builder = configure_transports(builder, config.listen, config.quic, config.tcp)?;
         let mut endpoint = builder.bind().map_err(map_constructor_error)?;
         let listen_addrs = endpoint
             .listen_all()
@@ -1048,6 +1078,7 @@ mod tests {
             agent_version: None,
             relays: Vec::new(),
             autonat_servers: Vec::new(),
+            listen: None,
             quic: Some(TransportOptions {
                 listen_addrs: Some(vec!["/ip4/127.0.0.1/udp/0/quic-v1".into()]),
             }),
@@ -1270,6 +1301,32 @@ mod tests {
                 .iter()
                 .any(|address| address.starts_with("/ip6/::1/"))
         );
+    }
+
+    #[test]
+    fn constructor_accepts_address_shaped_listen() {
+        let mut config = config();
+        config.quic = None;
+        config.listen = Some(vec![
+            "/ip4/127.0.0.1/udp/0/quic-v1".into(),
+            "/ip4/127.0.0.1/tcp/0".into(),
+        ]);
+
+        let endpoint = endpoint(config).expect("address-shaped listen");
+        let addresses = endpoint.listen_addrs();
+        assert!(addresses.iter().any(|address| address.contains("/quic-v1")));
+        assert!(addresses.iter().any(|address| address.contains("/tcp/")));
+    }
+
+    #[test]
+    fn constructor_rejects_listen_mixed_with_transport_options() {
+        let mut config = config();
+        config.listen = Some(vec!["/ip4/127.0.0.1/udp/0/quic-v1".into()]);
+
+        let Err(error) = endpoint(config) else {
+            panic!("listen and quic together must fail");
+        };
+        assert!(error.to_string().contains("not both"), "{error}");
     }
 
     #[test]
