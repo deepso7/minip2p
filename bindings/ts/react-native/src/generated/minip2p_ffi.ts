@@ -2841,7 +2841,7 @@ inner: {peerId: string; topic: string }): PeerUnsubscribed_ {
 Readonly<{peerId: string; reason: string}>
     };
     /**
-     * Pubsub outbound work was discarded.
+     * Gossipsub outbound work was discarded.
      */
     class GossipsubOutboundFailure_ extends UniffiEnum implements GossipsubOutboundFailure__interface {
         /**
@@ -2875,7 +2875,7 @@ inner: {peerId: string; reason: string }): GossipsubOutboundFailure_ {
 Readonly<{peerId: string; reason: string}>
     };
     /**
-     * A peer violated the pubsub protocol.
+     * A peer violated the gossipsub protocol.
      */
     class GossipsubProtocolViolation_ extends UniffiEnum implements GossipsubProtocolViolation__interface {
         /**
