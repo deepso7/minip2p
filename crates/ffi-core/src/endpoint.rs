@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use minip2p::{
     BeaconConfig, Endpoint, EndpointBuilder, GossipsubConfig, GossipsubError, MdnsConfig,
-    Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, Protocol, PublishError, StreamId,
-    TopicError, TransportError, WaitHandle,
+    Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, PublishError, StreamId, TopicError,
+    TransportError, WaitHandle,
 };
 
 use crate::{
@@ -61,45 +61,15 @@ fn configure_transports(
                 if addresses.is_empty() {
                     return Err(empty_transport_list("QUIC"));
                 }
-                let mut has_ipv4 = false;
-                let mut has_ipv6 = false;
-                let mut parsed = Vec::with_capacity(addresses.len());
                 for address in addresses {
                     let address = parse_listen_addr(&address, "QUIC")?;
                     if !address.is_quic_transport() {
                         return Err(wrong_transport("QUIC", &address));
                     }
-                    let already_present = match address.protocols().first() {
-                        Some(Protocol::Ip4(_)) => core::mem::replace(&mut has_ipv4, true),
-                        Some(Protocol::Ip6(_)) => core::mem::replace(&mut has_ipv6, true),
-                        _ => {
-                            return Err(FfiError::InvalidAddress {
-                                detail: format!(
-                                    "QUIC listen address `{address}` must use /ip4 or /ip6; DNS names are dial-only"
-                                ),
-                            });
-                        }
-                    };
-                    if already_present {
-                        return Err(FfiError::InvalidConfig {
-                            detail: format!(
-                                "QUIC listen addresses may contain at most one address per IP family; `{address}` repeats a family"
-                            ),
-                        });
-                    }
-                    parsed.push(address);
+                    builder = builder
+                        .listen_multiaddr(&address)
+                        .map_err(map_listen_error)?;
                 }
-                builder = match parsed.as_slice() {
-                    [address] => builder.quic_multiaddr(address),
-                    [first, second] => builder.quic_dual_multiaddr(first, second),
-                    _ => {
-                        return Err(FfiError::InvalidConfig {
-                            detail:
-                                "QUIC listen address validation produced an unsupported address set"
-                                    .into(),
-                        });
-                    }
-                };
             }
         }
     }

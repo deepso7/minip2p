@@ -1775,13 +1775,15 @@ impl EndpointBuilder {
 
     /// Adds separate IPv4 and IPv6 wildcard QUIC sockets.
     #[cfg(feature = "quic")]
-    pub fn quic_dual_stack(mut self) -> Self {
+    pub fn quic_dual_stack(self) -> Self {
+        let mut builder = self;
         for default in [DEFAULT_LISTEN_QUIC_V4, DEFAULT_LISTEN_QUIC_V6] {
-            self.listen_requests.push(ListenRequest::Multiaddr(
-                Multiaddr::from_str(default).expect("default QUIC listen"),
-            ));
+            let addr = Multiaddr::from_str(default).expect("default QUIC listen");
+            builder = builder
+                .listen_multiaddr(&addr)
+                .expect("default QUIC listen");
         }
-        self
+        builder
     }
 
     /// Adds a TCP listener bound to `bind_addr`, e.g. `"0.0.0.0:4001"`.
@@ -2146,205 +2148,6 @@ impl EndpointBuilder {
     }
 }
 
-/// Complementary-family QUIC listen multiaddrs from a resolved `host:port`, for
-/// pairing with explicit QUIC multiaddrs.
-///
-/// Same-family results are skipped so a hostname that answers with both
-/// families still pairs when DNS puts the conflicting family first. Alone,
-/// host:port still uses [`QuicEndpoint::bind`] (full OS candidate try).
-#[cfg(feature = "quic")]
-fn quic_host_port_complementary_candidates(
-    resolved: impl IntoIterator<Item = std::net::SocketAddr>,
-    existing: &[Multiaddr],
-) -> Vec<Multiaddr> {
-    let mut candidates = Vec::new();
-    for addr in resolved {
-        let address = socket_addr_to_quic_multiaddr(addr);
-        if existing.iter().any(|other| {
-            other.is_quic_transport() && listen_ip_family(other) == listen_ip_family(&address)
-        }) {
-            continue;
-        }
-        if !candidates.contains(&address) {
-            candidates.push(address);
-        }
-    }
-    candidates
-}
-
-#[cfg(feature = "quic")]
-fn socket_addr_to_quic_multiaddr(addr: std::net::SocketAddr) -> Multiaddr {
-    let host = match addr.ip() {
-        std::net::IpAddr::V4(v4) => Protocol::Ip4(v4.octets()),
-        std::net::IpAddr::V6(v6) => Protocol::Ip6(v6.octets()),
-    };
-    Multiaddr::from_protocols(vec![host, Protocol::Udp(addr.port()), Protocol::QuicV1])
-}
-
-/// Resolves a legacy QUIC `host:port` and returns complementary-family
-/// candidates for grouping with `existing` multiaddrs (resolver order).
-#[cfg(feature = "quic")]
-fn resolve_quic_host_port_complementary(
-    spec: &str,
-    existing: &[Multiaddr],
-) -> Result<Vec<Multiaddr>, Error> {
-    use std::net::ToSocketAddrs;
-
-    let resolved = spec
-        .to_socket_addrs()
-        .map_err(|error| TransportError::InvalidAddress {
-            context: "quic bind address",
-            reason: format!("{spec} is not a bindable address: {error}"),
-        })?;
-    let candidates = quic_host_port_complementary_candidates(resolved, existing);
-    if candidates.is_empty() {
-        return Err(TransportError::InvalidConfig {
-            reason: format!(
-                "QUIC listen addresses may contain at most one address per IP family; `{spec}` has no complementary-family address for the existing QUIC listens"
-            ),
-        }
-        .into());
-    }
-    Ok(candidates)
-}
-
-/// Groups legacy QUIC `host:port` binds with explicit QUIC multiaddrs.
-///
-/// Each host:port contributes at most one address: complementary-family DNS
-/// candidates when other QUIC listens already claim a family, otherwise the
-/// first resolved address. Candidates are tried until bind succeeds.
-#[cfg(feature = "quic")]
-fn bind_quic_hosts_and_multiaddrs(
-    config: QuicNodeConfig,
-    host_ports: &[&str],
-    multiaddrs: &[&Multiaddr],
-) -> Result<QuicEndpoint, Error> {
-    let mut combined = Vec::with_capacity(multiaddrs.len() + host_ports.len());
-    for address in multiaddrs {
-        validate_listen_multiaddr(address)?;
-        reject_duplicate_quic_family(&combined, address)?;
-        combined.push((*address).clone());
-    }
-
-    // One candidate list per host:port, resolved against listens already taken.
-    let mut host_candidate_lists = Vec::with_capacity(host_ports.len());
-    for spec in host_ports {
-        let candidates = if combined.is_empty() && host_candidate_lists.is_empty() {
-            // First host:port in a multi-listen group contributes one address
-            // (first resolved). Full OS try-all remains the alone-bind path.
-            use std::net::ToSocketAddrs;
-            let addr = spec
-                .to_socket_addrs()
-                .map_err(|error| TransportError::InvalidAddress {
-                    context: "quic bind address",
-                    reason: format!("{spec} is not a bindable address: {error}"),
-                })?
-                .next()
-                .ok_or_else(|| TransportError::InvalidAddress {
-                    context: "quic bind address",
-                    reason: format!("{spec} resolved to no address"),
-                })?;
-            vec![socket_addr_to_quic_multiaddr(addr)]
-        } else {
-            resolve_quic_host_port_complementary(spec, &combined)?
-        };
-        for address in &candidates {
-            validate_listen_multiaddr(address)?;
-        }
-        // Reserve the first candidate's family so a later host:port sees it.
-        let Some(first) = candidates.first() else {
-            return Err(TransportError::InvalidConfig {
-                reason: format!(
-                    "QUIC listen addresses may contain at most one address per IP family; `{spec}` has no complementary-family address for the existing QUIC listens"
-                ),
-            }
-            .into());
-        };
-        reject_duplicate_quic_family(&combined, first)?;
-        combined.push(first.clone());
-        host_candidate_lists.push(candidates);
-    }
-
-    // Rebuild bind attempts: multiaddrs fixed; each host:port may retry its list.
-    try_bind_quic_grouped(config, multiaddrs, &host_candidate_lists)
-}
-
-/// Tries concrete QUIC address combinations until one binds.
-#[cfg(feature = "quic")]
-fn try_bind_quic_grouped(
-    config: QuicNodeConfig,
-    multiaddrs: &[&Multiaddr],
-    host_candidate_lists: &[Vec<Multiaddr>],
-) -> Result<QuicEndpoint, Error> {
-    if host_candidate_lists.is_empty() {
-        return match multiaddrs {
-            [address] => QuicEndpoint::bind_multiaddr(config, address).map_err(Error::from),
-            [first, second] => {
-                QuicEndpoint::bind_dual_multiaddr(config, first, second).map_err(Error::from)
-            }
-            _ => Err(TransportError::InvalidConfig {
-                reason: "QUIC listen addresses may contain at most one address per IP family"
-                    .into(),
-            }
-            .into()),
-        };
-    }
-
-    // Cartesian try over host candidate lists (small: ≤2 families, few DNS rows).
-    let mut last_error = None;
-    for host_addrs in cartesian_host_addrs(host_candidate_lists) {
-        let mut combined: Vec<Multiaddr> = multiaddrs.iter().map(|a| (*a).clone()).collect();
-        let mut ok = true;
-        for address in &host_addrs {
-            if reject_duplicate_quic_family(&combined, address).is_err() {
-                ok = false;
-                break;
-            }
-            combined.push(address.clone());
-        }
-        if !ok {
-            continue;
-        }
-        let attempt = match combined.as_slice() {
-            [address] => QuicEndpoint::bind_multiaddr(config.clone(), address),
-            [first, second] => QuicEndpoint::bind_dual_multiaddr(config.clone(), first, second),
-            _ => {
-                return Err(TransportError::InvalidConfig {
-                    reason: "QUIC listen addresses may contain at most one address per IP family"
-                        .into(),
-                }
-                .into());
-            }
-        };
-        match attempt {
-            Ok(transport) => return Ok(transport),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.map(Error::from).unwrap_or_else(|| {
-        TransportError::InvalidConfig {
-            reason: "QUIC listen addresses may contain at most one address per IP family".into(),
-        }
-        .into()
-    }))
-}
-
-/// One address from each host:port candidate list (resolver order).
-#[cfg(feature = "quic")]
-fn cartesian_host_addrs(lists: &[Vec<Multiaddr>]) -> Vec<Vec<Multiaddr>> {
-    lists.iter().fold(vec![vec![]], |acc, list| {
-        let mut next = Vec::with_capacity(acc.len() * list.len().max(1));
-        for prefix in &acc {
-            for address in list {
-                let mut row = prefix.clone();
-                row.push(address.clone());
-                next.push(row);
-            }
-        }
-        next
-    })
-}
-
 /// Reads a `host:port` bind spec as the `/tcp` addresses it names.
 ///
 /// The same shape `bind_quic` accepts, so a host does not have to know that one
@@ -2486,11 +2289,7 @@ fn collect_listen_addrs(parts: &BuilderParts) -> Result<Vec<Multiaddr>, Error> {
     for request in &parts.listen_requests {
         match request {
             ListenRequest::Multiaddr(address) => {
-                validate_listen_multiaddr(address)?;
-                #[cfg(feature = "quic")]
-                if address.is_quic_transport() {
-                    reject_duplicate_quic_family(&addrs, address)?;
-                }
+                // Validated at listen()/listen_multiaddr time.
                 addrs.push(address.clone());
             }
             #[cfg(feature = "quic")]
@@ -2615,11 +2414,16 @@ fn bind_transports(_parts: &BuilderParts) -> Result<TransportSet, Error> {
                     let transport = match (quic_host_ports.as_slice(), quic_addrs.as_slice()) {
                         // Alone: one UDP socket; UdpSocket::bind tries candidates.
                         ([spec], []) => QuicEndpoint::bind(config, spec)?,
-                        // Host:ports and/or multiaddrs: group by IP family.
-                        // Same-family duplicates use the per-family error; a
-                        // complementary pair dual-binds. Alone host:port stays above.
-                        (host_ports, multiaddrs) => {
-                            bind_quic_hosts_and_multiaddrs(config, host_ports, multiaddrs)?
+                        ([], [address]) => QuicEndpoint::bind_multiaddr(config, address)?,
+                        ([], [first, second]) => {
+                            QuicEndpoint::bind_dual_multiaddr(config, first, second)?
+                        }
+                        _ => {
+                            return Err(TransportError::InvalidConfig {
+                                reason: "legacy quic host:port binds cannot be combined with other QUIC listens; use listen(...) for dual-stack"
+                                    .into(),
+                            }
+                            .into());
                         }
                     };
                     let namespaces = transport.namespaces();
@@ -3075,8 +2879,8 @@ mod tests {
 
     #[test]
     fn one_address_shape_cannot_be_bound_twice() {
-        // Two QUIC listeners on the same IP family would be two claims on one
-        // transport shape; refuse that rather than routing by coin toss.
+        // Two legacy QUIC host:port binds cannot share one Quic member (same as
+        // main's DuplicateKind refusal). Use listen(...) for dual-stack.
         let Err(error) = Endpoint::builder()
             .quic("127.0.0.1:0")
             .quic("127.0.0.1:0")
@@ -3085,7 +2889,7 @@ mod tests {
             panic!("one QUIC family must not have two listeners");
         };
         assert!(
-            format!("{error}").contains("at most one address per IP family"),
+            format!("{error}").contains("cannot be combined"),
             "got {error}"
         );
     }
@@ -3283,88 +3087,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_quic_host_port_pairs_with_complementary_multiaddr() {
+    fn legacy_quic_host_port_cannot_mix_with_multiaddr() {
         let ipv6 = "/ip6/::1/udp/0/quic-v1".parse().expect("ipv6");
-        let mut endpoint = Endpoint::builder()
+        let Err(error) = Endpoint::builder()
             .quic("127.0.0.1:0")
             .quic_multiaddr(&ipv6)
             .bind()
-            .expect("host:port plus complementary multiaddr");
-        let addrs = endpoint.listen_all().expect("listen");
-        assert_eq!(addrs.len(), 2, "{addrs:?}");
-        let has_v4 = addrs
-            .iter()
-            .any(|addr| addr.transport().to_string().contains("/ip4/"));
-        let has_v6 = addrs
-            .iter()
-            .any(|addr| addr.transport().to_string().contains("/ip6/"));
-        assert!(has_v4 && has_v6, "{addrs:?}");
-    }
-
-    #[test]
-    fn legacy_quic_host_port_rejects_same_family_multiaddr() {
-        let ipv4 = "/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("ipv4");
-        let Err(error) = Endpoint::builder()
-            .quic("127.0.0.1:0")
-            .quic_multiaddr(&ipv4)
-            .bind()
         else {
-            panic!("same-family quic listens must not both bind");
+            panic!("host:port must not combine with quic multiaddr");
         };
         assert!(
-            format!("{error}").contains("at most one address per IP family"),
+            format!("{error}").contains("cannot be combined"),
             "got {error}"
         );
-    }
-
-    #[test]
-    fn quic_host_mix_skips_same_family_dns_results() {
-        let existing = vec![
-            "/ip6/::1/udp/4001/quic-v1"
-                .parse::<Multiaddr>()
-                .expect("ipv6"),
-        ];
-        // Same-family first — must not be chosen when a complementary result follows.
-        let resolved: Vec<std::net::SocketAddr> = vec![
-            "[::1]:4001".parse().expect("v6"),
-            "[::2]:4001".parse().expect("v6 again"),
-            "127.0.0.1:4001".parse().expect("v4"),
-            "127.0.0.1:4001".parse().expect("v4 dup"),
-        ];
-        assert_eq!(
-            quic_host_port_complementary_candidates(resolved, &existing)
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            vec!["/ip4/127.0.0.1/udp/4001/quic-v1"]
-        );
-    }
-
-    #[test]
-    fn quic_host_mix_tries_next_candidate_when_first_cannot_bind() {
-        use std::net::UdpSocket;
-
-        // Occupy the first complementary IPv4 candidate; production grouping
-        // must try the later one instead of failing on DNS order.
-        let occupied = UdpSocket::bind("127.0.0.1:0").expect("occupy");
-        let busy_port = occupied.local_addr().expect("busy addr").port();
-        let free = UdpSocket::bind("127.0.0.1:0").expect("reserve free");
-        let free_port = free.local_addr().expect("free addr").port();
-        drop(free);
-
-        let ipv6: Multiaddr = "/ip6/::1/udp/0/quic-v1".parse().expect("ipv6");
-        let existing = [ipv6.clone()];
-        let resolved: Vec<std::net::SocketAddr> = vec![
-            format!("127.0.0.1:{busy_port}").parse().expect("busy"),
-            format!("127.0.0.1:{free_port}").parse().expect("free"),
-        ];
-        let candidates = quic_host_port_complementary_candidates(resolved, &existing);
-        assert_eq!(candidates.len(), 2, "{candidates:?}");
-
-        let transport = try_bind_quic_grouped(QuicNodeConfig::generate(), &[&ipv6], &[candidates])
-            .expect("later complementary candidate should bind");
-        assert_eq!(transport.namespaces().len(), 2);
-        let _keep = occupied;
     }
 
     #[cfg(feature = "tcp")]

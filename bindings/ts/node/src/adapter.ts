@@ -258,15 +258,7 @@ function resolveListenConfig(config: Minip2pConfig): {
   readonly quic?: { readonly listenAddrs?: string[] };
   readonly tcp?: { readonly listenAddrs?: string[] };
 } {
-  const transports = config.transports;
-  const hasTransports =
-    transports !== undefined &&
-    (transports.quic !== undefined || transports.tcp !== undefined);
-  if (config.listen !== undefined && hasTransports) {
-    throw new Error(
-      "use either address-shaped listen or legacy transports, not both"
-    );
-  }
+  // Mixed listen + transports is rejected in ffi-core; do not duplicate here.
   if (config.listen !== undefined) {
     return {
       listen: [...config.listen],
@@ -274,10 +266,11 @@ function resolveListenConfig(config: Minip2pConfig): {
       tcp: undefined,
     };
   }
+  const transports = resolveTransports(config);
   return {
     listen: undefined,
-    quic: toNativeTransport(resolveTransports(config).quic),
-    tcp: toNativeTransport(resolveTransports(config).tcp),
+    quic: toNativeTransport(transports.quic),
+    tcp: toNativeTransport(transports.tcp),
   };
 }
 

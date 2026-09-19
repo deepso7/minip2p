@@ -374,28 +374,19 @@ function toNativeConfig(config: Minip2pConfig): NativeEndpointConfig {
   const configuredTransports = config.transports;
   const addressListen =
     config.listen === undefined ? undefined : [...config.listen];
-  const hasTransports =
-    configuredTransports !== undefined &&
-    (configuredTransports.quic !== undefined ||
-      configuredTransports.tcp !== undefined);
-  if (addressListen !== undefined && hasTransports) {
-    throw new Error(
-      "use either address-shaped listen or legacy transports, not both"
-    );
+  // Mixed listen + transports is rejected in ffi-core; do not duplicate here.
+  let transports: Minip2pTransports;
+  if (addressListen !== undefined) {
+    transports = {};
+  } else if (
+    configuredTransports === undefined ||
+    (configuredTransports.quic === undefined &&
+      configuredTransports.tcp === undefined)
+  ) {
+    transports = { quic: true };
+  } else {
+    transports = configuredTransports;
   }
-  const transports: Minip2pTransports = (() => {
-    if (addressListen !== undefined) {
-      return {};
-    }
-    if (
-      configuredTransports === undefined ||
-      (configuredTransports.quic === undefined &&
-        configuredTransports.tcp === undefined)
-    ) {
-      return { quic: true };
-    }
-    return configuredTransports;
-  })();
   const useAddressListen = addressListen !== undefined;
   return {
     agentVersion: config.agentVersion,
