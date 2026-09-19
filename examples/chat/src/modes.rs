@@ -8,8 +8,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BeaconConfig, DISCOVERY_TOPIC, DiscoveryEvent, Endpoint, Event, GossipsubConfig, NatConfig,
-    NatEvent, PeerAddr, PeerDiscoveryConfig, PeerId, PublishError, PubsubError, PubsubEvent,
+    BeaconConfig, DISCOVERY_TOPIC, DiscoveryEvent, Endpoint, Event, GossipsubConfig,
+    GossipsubError, GossipsubEvent, NatConfig, NatEvent, PeerAddr, PeerDiscoveryConfig, PeerId,
+    PublishError,
 };
 
 use minip2p_example_common::{
@@ -47,7 +48,7 @@ fn build_endpoint(
     let mut builder = Endpoint::builder()
         .identity(keypair)
         .agent_version(AGENT)
-        .pubsub_config(GossipsubConfig {
+        .gossipsub_config(GossipsubConfig {
             allow_unsigned: options.allow_unsigned,
             ..GossipsubConfig::default()
         })
@@ -241,7 +242,7 @@ fn wait_for_topic_peer(
     let deadline = Instant::now() + READY_DEADLINE;
     loop {
         let Some(event) = endpoint
-            .next_pubsub_event(deadline)
+            .next_gossipsub_event(deadline)
             .map_err(|e| format!("waiting for pubsub readiness: {e}"))?
         else {
             return Err(
@@ -250,10 +251,10 @@ fn wait_for_topic_peer(
         };
         let ready = matches!(
             &event,
-            PubsubEvent::PeerSubscribed { peer, topic }
+            GossipsubEvent::PeerSubscribed { peer, topic }
                 if peer == expected_peer && topic == expected_topic
         );
-        print_pubsub_event(role, event);
+        print_gossipsub_event(role, event);
         if ready {
             println!("[{role}] pubsub-ready peer={expected_peer} topic={expected_topic}");
             return Ok(());
@@ -311,7 +312,7 @@ fn run_chat(
                     let payload = format!("{nick}: {line}");
                     match endpoint.publish(topic, payload.clone().into_bytes()) {
                         Ok(()) => println!("[you] {payload}"),
-                        Err(PubsubError::Publish(PublishError::Backpressure)) => {
+                        Err(GossipsubError::Publish(PublishError::Backpressure)) => {
                             println!("[chat] dropped (slow peer)");
                         }
                         Err(e) => return Err(format!("publish: {e}").into()),
@@ -340,8 +341,8 @@ fn run_chat(
             }
         }
 
-        for event in endpoint.take_pubsub_events() {
-            print_pubsub_event(role, event);
+        for event in endpoint.take_gossipsub_events() {
+            print_gossipsub_event(role, event);
         }
 
         for event in endpoint.take_nat_events() {
@@ -410,25 +411,25 @@ fn run_chat(
     }
 }
 
-fn print_pubsub_event(role: &str, event: PubsubEvent) {
+fn print_gossipsub_event(role: &str, event: GossipsubEvent) {
     match event {
-        PubsubEvent::Message { data, from, .. } => {
+        GossipsubEvent::Message { data, from, .. } => {
             println!(
                 "[chat] {} ({})",
                 String::from_utf8_lossy(&data),
                 short(&from)
             );
         }
-        PubsubEvent::PeerSubscribed { peer, topic } => {
+        GossipsubEvent::PeerSubscribed { peer, topic } => {
             println!("[{role}] peer-subscribed peer={peer} topic={topic}");
         }
-        PubsubEvent::PeerUnsubscribed { peer, topic } => {
+        GossipsubEvent::PeerUnsubscribed { peer, topic } => {
             println!("[{role}] peer-unsubscribed peer={peer} topic={topic}");
         }
-        PubsubEvent::OutboundFailure { peer, reason } => {
+        GossipsubEvent::OutboundFailure { peer, reason } => {
             eprintln!("[{role}] outbound-failure peer={peer} reason={reason}");
         }
-        PubsubEvent::ProtocolViolation { peer, reason } => {
+        GossipsubEvent::ProtocolViolation { peer, reason } => {
             eprintln!("[{role}] violation peer={peer} reason={reason}");
         }
     }

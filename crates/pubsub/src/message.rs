@@ -4,7 +4,7 @@
 //!
 //! Field framing uses the shared protobuf vocabulary in [`minip2p_core`];
 //! this module keeps pubsub message types, StrictSign canonicalization, and
-//! contextual [`PubsubWireError`] values (including field-number policy).
+//! contextual [`GossipsubWireError`] values (including field-number policy).
 //!
 //! Verification matches upstream (go-libp2p / rust-libp2p) exactly: the
 //! decoded message is canonically re-encoded with `signature` and `key`
@@ -37,7 +37,7 @@ pub const MAX_RPC_SIZE: usize = 65536;
 pub const MAX_TOPIC_LEN: usize = 1024;
 
 /// Maximum accepted `seqno` length in bytes. Implementations disagree on
-/// the format (go: 8 big-endian bytes, rust-libp2p: 20 random
+/// the format (go: 8 big-endian bytes, rust-libp2p floodsub: 20 random
 /// bytes), so the seqno is treated as opaque; the cap bounds what the
 /// seen-cache stores per message id.
 pub(crate) const MAX_SEQNO_LEN: usize = 64;
@@ -159,7 +159,7 @@ pub struct RawMessage {
 /// Shared framing failures are wrapped as [`Self::Wire`] so callers retain
 /// pubsub context while reusing the core protobuf vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum PubsubWireError {
+pub enum GossipsubWireError {
     /// A shared protobuf framing failure.
     #[error(transparent)]
     Wire(#[from] WireError),
@@ -221,7 +221,7 @@ impl SubOpts {
     }
 
     /// Decodes a SubOpts message body.
-    pub fn decode(input: &[u8]) -> Result<Self, PubsubWireError> {
+    pub fn decode(input: &[u8]) -> Result<Self, GossipsubWireError> {
         let mut opts = Self::default();
         let mut idx = 0;
         while let Some((field, wire_type)) = read_tag(input, &mut idx)? {
@@ -318,7 +318,7 @@ impl RawMessage {
     }
 
     /// Decodes a Message submessage body, preserving `input` as `raw`.
-    pub fn decode(input: &[u8]) -> Result<Self, PubsubWireError> {
+    pub fn decode(input: &[u8]) -> Result<Self, GossipsubWireError> {
         let mut message = Self {
             raw: input.to_vec(),
             ..Self::default()
@@ -373,7 +373,7 @@ impl RawMessage {
     /// - `from` must parse as a peer id; `seqno` must be 1..=64 bytes —
     ///   required even for unsigned messages, they form the dedup id.
     ///   Length varies by implementation (go emits 8 big-endian bytes,
-    ///   rust-libp2p 20 random bytes), so the seqno is opaque
+    ///   rust-libp2p floodsub 20 random bytes), so the seqno is opaque
     ///   bytes; the cap only bounds the seen-cache's per-id memory.
     /// - A present signature is always verified, `allow_unsigned` or not.
     /// - `key` without `signature` is invalid.
@@ -461,7 +461,7 @@ impl ControlMessage {
     }
 
     /// Decodes a ControlMessage body.
-    pub fn decode(input: &[u8]) -> Result<Self, PubsubWireError> {
+    pub fn decode(input: &[u8]) -> Result<Self, GossipsubWireError> {
         let mut control = Self::default();
         control.merge_from(input)?;
         Ok(control)
@@ -469,7 +469,7 @@ impl ControlMessage {
 
     /// Applies protobuf message-merge semantics to another encoded
     /// ControlMessage occurrence: repeated fields append in wire order.
-    fn merge_from(&mut self, input: &[u8]) -> Result<(), PubsubWireError> {
+    fn merge_from(&mut self, input: &[u8]) -> Result<(), GossipsubWireError> {
         let mut idx = 0;
         while let Some((field, wire_type)) = read_tag(input, &mut idx)? {
             match (field, wire_type) {
@@ -510,7 +510,7 @@ impl ControlIHave {
     }
 
     /// Decodes a ControlIHave message body.
-    pub fn decode(input: &[u8]) -> Result<Self, PubsubWireError> {
+    pub fn decode(input: &[u8]) -> Result<Self, GossipsubWireError> {
         let mut message = Self::default();
         let mut idx = 0;
         while let Some((field, wire_type)) = read_tag(input, &mut idx)? {
@@ -541,7 +541,7 @@ impl ControlIWant {
     }
 
     /// Decodes a ControlIWant message body.
-    pub fn decode(input: &[u8]) -> Result<Self, PubsubWireError> {
+    pub fn decode(input: &[u8]) -> Result<Self, GossipsubWireError> {
         let mut message = Self::default();
         let mut idx = 0;
         while let Some((field, wire_type)) = read_tag(input, &mut idx)? {
@@ -567,7 +567,7 @@ impl ControlGraft {
     }
 
     /// Decodes a ControlGraft message body.
-    pub fn decode(input: &[u8]) -> Result<Self, PubsubWireError> {
+    pub fn decode(input: &[u8]) -> Result<Self, GossipsubWireError> {
         let mut message = Self::default();
         let mut idx = 0;
         while let Some((field, wire_type)) = read_tag(input, &mut idx)? {
@@ -597,7 +597,7 @@ impl ControlPrune {
     }
 
     /// Decodes a ControlPrune message body.
-    pub fn decode(input: &[u8]) -> Result<Self, PubsubWireError> {
+    pub fn decode(input: &[u8]) -> Result<Self, GossipsubWireError> {
         let mut message = Self::default();
         let mut idx = 0;
         while let Some((field, wire_type)) = read_tag(input, &mut idx)? {
@@ -628,7 +628,7 @@ impl PeerInfo {
     }
 
     /// Decodes a PeerInfo message body.
-    pub fn decode(input: &[u8]) -> Result<Self, PubsubWireError> {
+    pub fn decode(input: &[u8]) -> Result<Self, GossipsubWireError> {
         let mut peer = Self::default();
         let mut idx = 0;
         while let Some((field, wire_type)) = read_tag(input, &mut idx)? {
@@ -663,7 +663,7 @@ impl Rpc {
     }
 
     /// Decodes an RPC body.
-    pub fn decode(input: &[u8]) -> Result<Self, PubsubWireError> {
+    pub fn decode(input: &[u8]) -> Result<Self, GossipsubWireError> {
         let mut rpc = Self::default();
         let mut idx = 0;
         while let Some((field, wire_type)) = read_tag(input, &mut idx)? {
@@ -697,10 +697,10 @@ impl Rpc {
 ///
 /// Shared [`minip2p_core::read_tag`] does not enforce field-number policy.
 /// Pubsub matches upstream by refusing field 0 rather than skipping it.
-fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, PubsubWireError> {
+fn read_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, GossipsubWireError> {
     let offset = *idx;
     match minip2p_core::read_tag(input, idx)? {
-        Some((0, _)) => Err(PubsubWireError::InvalidFieldNumber { offset }),
+        Some((0, _)) => Err(GossipsubWireError::InvalidFieldNumber { offset }),
         other => Ok(other),
     }
 }
@@ -900,7 +900,7 @@ mod tests {
         let field_zero = [0x00, 0x01];
         assert!(matches!(
             ControlMessage::decode(&field_zero),
-            Err(PubsubWireError::InvalidFieldNumber { offset: 0 })
+            Err(GossipsubWireError::InvalidFieldNumber { offset: 0 })
         ));
 
         let mut with_unknown = ControlGraft {
@@ -934,7 +934,7 @@ mod tests {
 
         assert!(matches!(
             Rpc::decode(&encoded),
-            Err(PubsubWireError::InvalidFieldNumber { .. })
+            Err(GossipsubWireError::InvalidFieldNumber { .. })
         ));
     }
 
@@ -993,7 +993,7 @@ mod tests {
         let encoded = [tag(4, WIRE_LEN), 2, 0xff, 0xfe];
         assert!(matches!(
             RawMessage::decode(&encoded),
-            Err(PubsubWireError::Wire(WireError::InvalidUtf8 { .. }))
+            Err(GossipsubWireError::Wire(WireError::InvalidUtf8 { .. }))
         ));
     }
 
@@ -1004,15 +1004,15 @@ mod tests {
         let encoded = [0x00, 0x01];
         assert!(matches!(
             RawMessage::decode(&encoded),
-            Err(PubsubWireError::InvalidFieldNumber { offset: 0 })
+            Err(GossipsubWireError::InvalidFieldNumber { offset: 0 })
         ));
         assert!(matches!(
             SubOpts::decode(&encoded),
-            Err(PubsubWireError::InvalidFieldNumber { offset: 0 })
+            Err(GossipsubWireError::InvalidFieldNumber { offset: 0 })
         ));
         assert!(matches!(
             Rpc::decode(&encoded),
-            Err(PubsubWireError::InvalidFieldNumber { offset: 0 })
+            Err(GossipsubWireError::InvalidFieldNumber { offset: 0 })
         ));
     }
 
@@ -1127,7 +1127,7 @@ mod tests {
         assert_eq!(seqno, 9u64.to_be_bytes().to_vec());
         assert!(!signed);
 
-        // Seqno length is implementation-defined: rust-libp2p emits 20
+        // Seqno length is implementation-defined: rust-libp2p floodsub emits 20
         // random bytes. Anything 1..=64 is accepted.
         let mut rust_seqno = unsigned.clone();
         rust_seqno.seqno = Some(vec![7; 20]);

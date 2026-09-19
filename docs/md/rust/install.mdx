@@ -33,7 +33,7 @@ Add only the capabilities the application uses:
 | --- | --- | --- |
 | TCP | `cargo add minip2p-rs --features tcp` | Bind a TCP listener. |
 | Relay paths and NAT traversal | `cargo add minip2p-rs --features nat` | Configure a relay, an AutoNAT server, or both. |
-| Pubsub | `cargo add minip2p-rs --features pubsub` | Call `.pubsub()` or provide a pubsub configuration. |
+| Gossipsub | `cargo add minip2p-rs --features pubsub` | Call `.gossipsub()` or `.gossipsub_config(...)`. |
 | Signed discovery | `cargo add minip2p-rs --features discovery` | Call `.discovery()` or provide a discovery configuration. |
 | Local mDNS | `cargo add minip2p-rs --features mdns` | Call `.mdns()` or provide an mDNS configuration. |
 

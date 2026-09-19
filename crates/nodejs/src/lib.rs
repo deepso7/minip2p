@@ -774,12 +774,12 @@ fn event_value(event: P2pEvent) -> serde_json::Value {
             "PeerUnsubscribed",
             serde_json::json!({ "peerId": peer_id, "topic": topic }),
         ),
-        P2pEvent::PubsubOutboundFailure { peer_id, reason } => (
-            "PubsubOutboundFailure",
+        P2pEvent::GossipsubOutboundFailure { peer_id, reason } => (
+            "GossipsubOutboundFailure",
             serde_json::json!({ "peerId": peer_id, "reason": reason }),
         ),
-        P2pEvent::PubsubProtocolViolation { peer_id, reason } => (
-            "PubsubProtocolViolation",
+        P2pEvent::GossipsubProtocolViolation { peer_id, reason } => (
+            "GossipsubProtocolViolation",
             serde_json::json!({ "peerId": peer_id, "reason": reason }),
         ),
         P2pEvent::PeerDiscovered {

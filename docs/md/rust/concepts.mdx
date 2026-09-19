@@ -81,7 +81,7 @@ A Cargo feature makes a capability available. Enable it on `EndpointBuilder`; se
 Ordinary connection, Identify, Ping, and application stream events come from `poll` or `next_event`. Enabled capabilities expose their own event queues:
 
 - `take_nat_events` / `next_nat_event`;
-- `take_pubsub_events` / `next_pubsub_event`;
+- `take_gossipsub_events` / `next_gossipsub_event`;
 - `take_discovery_events` / `next_discovery_event`.
 
 Continue with [Listen and dial](/rust/listen-and-dial) or the [glossary](/reference/glossary).

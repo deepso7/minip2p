@@ -13,7 +13,7 @@ use minip2p_transport::StreamId;
 
 /// Correlates an outbound open or write with its agent result echo.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct PubsubToken(pub(crate) u64);
+pub struct GossipsubToken(pub(crate) u64);
 
 /// Immutable framed RPC bytes shared by every recipient of one publish.
 ///
@@ -23,13 +23,13 @@ pub(crate) type SharedFrame = Shared<[u8]>;
 
 /// I/O the driver must perform on the agent's behalf.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PubsubAction {
+pub enum GossipsubAction {
     /// Call `Swarm::open_stream(&peer, &protocol_id)` and echo the result
     /// back via `stream_open_result(&peer, token, ..)` — both fields of
     /// this action, returned as-is.
     OpenStream {
         /// Token identifying this open in the result echo.
-        token: PubsubToken,
+        token: GossipsubToken,
         /// The peer to open toward.
         peer: PeerId,
         /// Negotiated meshsub protocol id.
@@ -40,7 +40,7 @@ pub enum PubsubAction {
     SendStream {
         /// Token the host echoes through `send_result` after attempting the
         /// synchronous write.
-        token: PubsubToken,
+        token: GossipsubToken,
         /// The stream's peer.
         peer: PeerId,
         /// The stream to write to.
@@ -66,7 +66,7 @@ pub enum PubsubAction {
 
 /// Application-facing pubsub events.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PubsubEvent {
+pub enum GossipsubEvent {
     /// A verified, non-duplicate message on a topic we subscribe to.
     Message {
         /// The publisher (not necessarily the peer it arrived from).
@@ -76,7 +76,7 @@ pub enum PubsubEvent {
         /// Application payload.
         data: Vec<u8>,
         /// The publisher's sequence number, as opaque bytes: go peers emit
-        /// 8 big-endian bytes, rust-libp2p 20 random bytes.
+        /// 8 big-endian bytes, rust-libp2p floodsub 20 random bytes.
         /// Together with `from` it identifies the message for dedup.
         seqno: Vec<u8>,
         /// Whether the message carried a signature that passed verification.

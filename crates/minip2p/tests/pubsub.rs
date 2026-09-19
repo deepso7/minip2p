@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use minip2p::{Endpoint, Event, GossipsubConfig, PubsubError, PubsubEvent, TransportError};
+use minip2p::{Endpoint, Event, GossipsubConfig, GossipsubError, GossipsubEvent, TransportError};
 
 #[cfg(feature = "nat")]
 #[path = "../../../tests/support/relay.rs"]
@@ -16,21 +16,18 @@ const TOPIC: &str = "loopback-chat";
 
 fn pubsub_endpoint() -> Endpoint {
     Endpoint::builder()
-        .pubsub()
+        .gossipsub()
         .bind_quic("127.0.0.1:0")
         .expect("bind loopback endpoint")
 }
 
-fn is_pubsub_protocol(protocol_id: &str) -> bool {
-    matches!(
-        protocol_id,
-        minip2p::MESHSUB_PROTOCOL_ID_V10 | minip2p::MESHSUB_PROTOCOL_ID_V11
-    )
+fn is_gossipsub_protocol(protocol_id: &str) -> bool {
+    minip2p::GOSSIPSUB_PROTOCOL_IDS.contains(&protocol_id)
 }
 
 /// Drives all endpoints once with a short budget, collecting pubsub events
 /// and asserting no pubsub stream events leak to the application.
-fn drive(endpoints: &mut [&mut Endpoint]) -> Vec<Vec<PubsubEvent>> {
+fn drive(endpoints: &mut [&mut Endpoint]) -> Vec<Vec<GossipsubEvent>> {
     let mut collected = vec![Vec::new(); endpoints.len()];
     for (endpoint, events) in endpoints.iter_mut().zip(&mut collected) {
         if let Some(event) = endpoint
@@ -41,12 +38,12 @@ fn drive(endpoints: &mut [&mut Endpoint]) -> Vec<Vec<PubsubEvent>> {
                 !matches!(
                     &event,
                     Event::StreamReady { protocol_id, .. }
-                        if is_pubsub_protocol(protocol_id)
+                        if is_gossipsub_protocol(protocol_id)
                 ),
                 "pubsub streams must be invisible to the app: {event:?}"
             );
         }
-        events.extend(endpoint.take_pubsub_events());
+        events.extend(endpoint.take_gossipsub_events());
     }
     collected
 }
@@ -56,9 +53,9 @@ fn drive(endpoints: &mut [&mut Endpoint]) -> Vec<Vec<PubsubEvent>> {
 fn drive_until(
     endpoints: &mut [&mut Endpoint],
     deadline: Duration,
-    mut condition: impl FnMut(&[Vec<PubsubEvent>]) -> bool,
-) -> Vec<Vec<PubsubEvent>> {
-    let mut all: Vec<Vec<PubsubEvent>> = vec![Vec::new(); endpoints.len()];
+    mut condition: impl FnMut(&[Vec<GossipsubEvent>]) -> bool,
+) -> Vec<Vec<GossipsubEvent>> {
+    let mut all: Vec<Vec<GossipsubEvent>> = vec![Vec::new(); endpoints.len()];
     let until = Instant::now() + deadline;
     while !condition(&all) {
         assert!(Instant::now() < until, "condition not met in time: {all:?}");
@@ -70,16 +67,16 @@ fn drive_until(
     all
 }
 
-fn saw_message(events: &[PubsubEvent], data: &[u8]) -> bool {
+fn saw_message(events: &[GossipsubEvent], data: &[u8]) -> bool {
     events
         .iter()
-        .any(|e| matches!(e, PubsubEvent::Message { data: got, .. } if got.as_slice() == data))
+        .any(|e| matches!(e, GossipsubEvent::Message { data: got, .. } if got.as_slice() == data))
 }
 
-fn saw_subscription(events: &[PubsubEvent], topic: &str) -> bool {
+fn saw_subscription(events: &[GossipsubEvent], topic: &str) -> bool {
     events
         .iter()
-        .any(|e| matches!(e, PubsubEvent::PeerSubscribed { topic: got, .. } if got == topic))
+        .any(|e| matches!(e, GossipsubEvent::PeerSubscribed { topic: got, .. } if got == topic))
 }
 
 #[test]
@@ -136,7 +133,7 @@ fn star_center_forwards_between_leaves() {
         |all| {
             all[0]
                 .iter()
-                .filter(|e| matches!(e, PubsubEvent::PeerSubscribed { .. }))
+                .filter(|e| matches!(e, GossipsubEvent::PeerSubscribed { .. }))
                 .count()
                 >= 2
                 && saw_subscription(&all[1], TOPIC)
@@ -154,7 +151,7 @@ fn star_center_forwards_between_leaves() {
     );
     let bob_copies = all[2]
         .iter()
-        .filter(|e| matches!(e, PubsubEvent::Message { data, .. } if data.as_slice() == b"across the star"))
+        .filter(|e| matches!(e, GossipsubEvent::Message { data, .. } if data.as_slice() == b"across the star"))
         .count();
     assert_eq!(bob_copies, 1, "seen-cache dedup: {all:?}");
     assert!(
@@ -182,7 +179,7 @@ fn unsubscribe_stops_delivery() {
     drive_until(&mut [&mut a, &mut b], Duration::from_secs(15), |all| {
         all[0]
             .iter()
-            .any(|e| matches!(e, PubsubEvent::PeerUnsubscribed { topic, .. } if topic == TOPIC))
+            .any(|e| matches!(e, GossipsubEvent::PeerUnsubscribed { topic, .. } if topic == TOPIC))
     });
 
     a.publish(TOPIC, b"into the void")
@@ -205,23 +202,23 @@ fn pubsub_methods_error_when_not_enabled() {
         .expect("bind loopback endpoint");
     assert!(matches!(
         plain.subscribe(TOPIC),
-        Err(PubsubError::NotEnabled)
+        Err(GossipsubError::NotEnabled)
     ));
     assert!(matches!(
         plain.publish(TOPIC, b"x".to_vec()),
-        Err(PubsubError::NotEnabled)
+        Err(GossipsubError::NotEnabled)
     ));
     assert!(matches!(
-        plain.next_pubsub_event(Duration::from_millis(1)),
-        Err(PubsubError::NotEnabled)
+        plain.next_gossipsub_event(Duration::from_millis(1)),
+        Err(GossipsubError::NotEnabled)
     ));
-    assert!(plain.take_pubsub_events().is_empty());
+    assert!(plain.take_gossipsub_events().is_empty());
 }
 
 #[test]
 fn invalid_gossipsub_config_fails_before_transport_bind() {
     let error = Endpoint::builder()
-        .pubsub_config(GossipsubConfig {
+        .gossipsub_config(GossipsubConfig {
             heartbeat_interval_ms: 0,
             ..GossipsubConfig::default()
         })
@@ -236,7 +233,7 @@ fn invalid_gossipsub_config_fails_before_transport_bind() {
 }
 
 #[test]
-fn next_pubsub_event_buffers_application_events() {
+fn next_gossipsub_event_buffers_application_events() {
     let mut a = pubsub_endpoint();
     let mut b = pubsub_endpoint();
     let b_addr = b.listen().expect("b listens");
@@ -253,11 +250,11 @@ fn next_pubsub_event_buffers_application_events() {
     while got.is_none() {
         assert!(Instant::now() < deadline, "no pubsub event in time");
         got = a
-            .next_pubsub_event(Duration::from_millis(20))
+            .next_gossipsub_event(Duration::from_millis(20))
             .expect("a waits");
         let _ = b.next_event(Duration::from_millis(20)).expect("b drives");
     }
-    assert!(matches!(got, Some(PubsubEvent::PeerSubscribed { .. })));
+    assert!(matches!(got, Some(GossipsubEvent::PeerSubscribed { .. })));
 
     // The ConnectionEstablished that arrived during the focused wait was
     // buffered, not dropped.
@@ -282,7 +279,7 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
     let relay = relay_support::RelayServer::spawn();
     let relay_addr = relay.addr().clone();
     let mut b = Endpoint::builder()
-        .pubsub()
+        .gossipsub()
         .relay(relay_addr.clone())
         .nat_config(NatConfig {
             force_relay: true,
@@ -310,7 +307,7 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
     }
 
     let mut a = Endpoint::builder()
-        .pubsub()
+        .gossipsub()
         .relay(relay_addr)
         .nat_config(NatConfig {
             force_relay: true,
@@ -379,11 +376,11 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
         let _ = b
             .next_event(Duration::from_millis(20))
             .expect("drive responder upgrade");
-        a_resubscribed |= a.take_pubsub_events().iter().any(
-            |event| matches!(event, PubsubEvent::PeerSubscribed { topic, .. } if topic == TOPIC),
+        a_resubscribed |= a.take_gossipsub_events().iter().any(
+            |event| matches!(event, GossipsubEvent::PeerSubscribed { topic, .. } if topic == TOPIC),
         );
-        b_resubscribed |= b.take_pubsub_events().iter().any(
-            |event| matches!(event, PubsubEvent::PeerSubscribed { topic, .. } if topic == TOPIC),
+        b_resubscribed |= b.take_gossipsub_events().iter().any(
+            |event| matches!(event, GossipsubEvent::PeerSubscribed { topic, .. } if topic == TOPIC),
         );
         relay.assert_healthy();
     }

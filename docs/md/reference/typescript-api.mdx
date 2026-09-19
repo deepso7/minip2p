@@ -171,7 +171,7 @@ Stream events are `data`, `remoteWriteClosed`, `closed`, and `dataOverflow`.
 | Connection and Identify | `connectionEstablished`, `connectionClosed`, `peerReady`, `identifyReceived` |
 | Ping and streams | `pingRttMeasured`, `pingTimeout`, `stream` |
 | Relay and NAT | `reachabilityChanged`, `publicAddressesChanged`, `relayReserved`, `relayReservationLost`, `pathEstablished`, `pathUpgraded`, `holePunchFailed`, `fellBackToRelay`, `connectFailed`, `inboundDirectUpgrade` |
-| Pubsub | `message`, `peerSubscribed`, `peerUnsubscribed`, `pubsubOutboundFailure`, `pubsubProtocolViolation` |
+| Pubsub | `message`, `peerSubscribed`, `peerUnsubscribed`, `gossipsubOutboundFailure`, `gossipsubProtocolViolation` |
 | Discovery | `peerDiscovered`, `peerUpdated`, `peerExpired`, `discoveryDialFailed`, `discoveryProtocolViolation` |
 
 The catch-all stream uses `inboundStream` metadata instead of the live `stream` handle. Subscribe to the named `stream` event to claim an inbound stream.

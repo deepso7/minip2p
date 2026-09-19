@@ -9,9 +9,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BeaconConfig, Endpoint, EndpointBuilder, GossipsubConfig, MdnsConfig, Multiaddr, NatConfig,
-    PeerDiscoveryConfig, PeerId, Protocol, PublishError, PubsubError, StreamId, TopicError,
-    TransportError, WaitHandle,
+    BeaconConfig, Endpoint, EndpointBuilder, GossipsubConfig, GossipsubError, MdnsConfig,
+    Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, Protocol, PublishError, StreamId,
+    TopicError, TransportError, WaitHandle,
 };
 
 use crate::{
@@ -191,11 +191,10 @@ impl P2pEndpoint {
             });
         }
 
-        let pubsub = GossipsubConfig {
+        let gossipsub = GossipsubConfig {
             allow_unsigned: config.allow_unsigned,
             ..GossipsubConfig::default()
         };
-        pubsub.validate().map_err(invalid_config)?;
 
         let mut builder = Endpoint::builder()
             .identity(keypair)
@@ -204,7 +203,7 @@ impl P2pEndpoint {
                     .agent_version
                     .unwrap_or_else(|| format!("minip2p/{}", env!("CARGO_PKG_VERSION"))),
             )
-            .pubsub_config(pubsub);
+            .gossipsub_config(gossipsub);
         for protocol in config.protocols {
             builder = builder.protocol(protocol);
         }
@@ -479,12 +478,12 @@ impl P2pEndpoint {
 
     /// Subscribes to a pubsub topic.
     pub fn subscribe(&self, topic: String) -> Result<bool, FfiError> {
-        self.with_endpoint_mut(|endpoint| endpoint.subscribe(&topic).map_err(map_pubsub_error))
+        self.with_endpoint_mut(|endpoint| endpoint.subscribe(&topic).map_err(map_gossipsub_error))
     }
 
     /// Withdraws a pubsub subscription.
     pub fn unsubscribe(&self, topic: String) -> Result<bool, FfiError> {
-        self.with_endpoint_mut(|endpoint| endpoint.unsubscribe(&topic).map_err(map_pubsub_error))
+        self.with_endpoint_mut(|endpoint| endpoint.unsubscribe(&topic).map_err(map_gossipsub_error))
     }
 
     /// Publishes one application payload.
@@ -492,7 +491,9 @@ impl P2pEndpoint {
         if data.len() > minip2p_pubsub::MAX_RPC_SIZE {
             return Err(FfiError::MessageTooLarge);
         }
-        self.with_endpoint_mut(|endpoint| endpoint.publish(&topic, data).map_err(map_pubsub_error))
+        self.with_endpoint_mut(|endpoint| {
+            endpoint.publish(&topic, data).map_err(map_gossipsub_error)
+        })
     }
 
     /// Sends an explicit ping; completion arrives as a ping event.
@@ -905,18 +906,18 @@ fn map_constructor_error(error: minip2p::Error) -> FfiError {
     }
 }
 
-fn map_pubsub_error(error: PubsubError) -> FfiError {
+fn map_gossipsub_error(error: GossipsubError) -> FfiError {
     match error {
-        PubsubError::DiscoveryTopicReserved => FfiError::NotPermitted {
+        GossipsubError::DiscoveryTopicReserved => FfiError::NotPermitted {
             detail: error.to_string(),
         },
-        PubsubError::Publish(PublishError::TooLarge) => FfiError::MessageTooLarge,
-        PubsubError::Publish(PublishError::Backpressure) => FfiError::Backpressure,
-        PubsubError::Publish(PublishError::Topic(error)) | PubsubError::Topic(error) => {
+        GossipsubError::Publish(PublishError::TooLarge) => FfiError::MessageTooLarge,
+        GossipsubError::Publish(PublishError::Backpressure) => FfiError::Backpressure,
+        GossipsubError::Publish(PublishError::Topic(error)) | GossipsubError::Topic(error) => {
             map_topic_error(error)
         }
-        PubsubError::Driver(error) => map_driver_error(error),
-        PubsubError::NotEnabled => FfiError::Internal {
+        GossipsubError::Driver(error) => map_driver_error(error),
+        GossipsubError::NotEnabled => FfiError::Internal {
             detail: error.to_string(),
         },
     }
@@ -1797,7 +1798,7 @@ mod tests {
     }
 
     #[test]
-    fn pubsub_and_transport_errors_map_by_context() {
+    fn gossipsub_and_transport_errors_map_by_context() {
         let mut discovery = config();
         discovery.discovery = Some(crate::DiscoveryOptions {
             topic: "presence".into(),
@@ -1812,11 +1813,11 @@ mod tests {
         ));
 
         assert!(matches!(
-            map_pubsub_error(PubsubError::Publish(PublishError::TooLarge)),
+            map_gossipsub_error(GossipsubError::Publish(PublishError::TooLarge)),
             FfiError::MessageTooLarge
         ));
         assert!(matches!(
-            map_pubsub_error(PubsubError::Publish(PublishError::Backpressure)),
+            map_gossipsub_error(GossipsubError::Publish(PublishError::Backpressure)),
             FfiError::Backpressure
         ));
         assert!(matches!(

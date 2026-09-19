@@ -14,7 +14,7 @@ Cargo features control what code is available. Builder methods control what runs
 | Portable TCP | `default-features = false, features = ["smoltcp"]` | `Endpoint::portable(...).smoltcp(...).listen(...).build()` | TCP, Noise XX, Yamux, Identify, Ping, and custom streams on a caller-driven loop | Your smoltcp device, interface, clock, and entropy |
 | Reachability probing | `nat` | `.autonat_server(server)` or a `NatConfig` with probe servers | AutoNAT probes and reachability state | Reachable AutoNAT server |
 | Relayed connections and DCUtR | `nat` | `.relay(relay)` or relay-bearing `.nat_config(...)` | Reservations, relay races, and hole punching | Reachable Circuit Relay v2 server |
-| Gossipsub | `pubsub` | `.pubsub()` or gossipsub `.pubsub_config(...)` | Signed gossipsub messages | At least one compatible mesh peer |
+| Gossipsub | `pubsub` | `.gossipsub()` or gossipsub `.gossipsub_config(...)` | Signed gossipsub messages | At least one compatible mesh peer |
 | Signed discovery | `discovery` | `.discovery()` or `.discovery_config(...)` | Signed beacons, shared peer book, and optional automatic dialing | A connected discovery peer; relay optional for direct-only addresses |
 | Local-link discovery | `mdns` | `.mdns()` or `.mdns_config(...)` | Local observations, shared peer book, and optional automatic dialing | Multicast-capable local network and interface |
 
@@ -71,9 +71,9 @@ An AutoNAT server enables reachability probing but does not supply a relay path.
 
 Compiled with `features = ["pubsub"]`:
 
-- Activation: `pubsub`, `pubsub_config`
+- Activation: `gossipsub`, `gossipsub_config`
 - Topics: `subscribe`, `unsubscribe`, `publish`
-- Events: `take_pubsub_events`, `next_pubsub_event`
+- Events: `take_gossipsub_events`, `next_gossipsub_event`
 
 ## Discovery API
 

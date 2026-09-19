@@ -115,7 +115,7 @@ loop {
     match node.next_wake(Deadline::NEVER)? {
         EndpointWake::Event(event) => handle_event(event),
         EndpointWake::DriverProgress => {
-            for event in node.take_pubsub_events() {
+            for event in node.take_gossipsub_events() {
                 handle_pubsub_event(event);
             }
         }

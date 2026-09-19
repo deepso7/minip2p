@@ -84,7 +84,7 @@ removeMessages();
 endpoint.unsubscribe(topic);
 ```
 
-There is no self-delivery. Apply the local UI action directly and use the event for remote messages. Queue pressure throws `BackpressureError` synchronously; later forwarding failures arrive as `pubsubOutboundFailure`.
+There is no self-delivery. Apply the local UI action directly and use the event for remote messages. Queue pressure throws `BackpressureError` synchronously; later forwarding failures arrive as `gossipsubOutboundFailure`.
 
 `allowUnsigned: true` accepts unsigned inbound application messages. When `message.signed` is `false`, both the bytes and `fromPeerId` are attacker-controlled; do not treat either as authenticated identity.
 

@@ -4,8 +4,8 @@ use minip2p_core::PeerId;
 use minip2p_identity::Ed25519Keypair;
 use minip2p_pubsub::{
     ControlGraft, ControlIHave, ControlIWant, ControlMessage, ControlPrune, FrameDecode,
-    GossipsubAgent, GossipsubConfig, MESHSUB_PROTOCOL_ID_V10, MESHSUB_PROTOCOL_ID_V11,
-    PubsubAction, PubsubEvent, RawMessage, Rpc, SubOpts, decode_frame, encode_frame,
+    GossipsubAction, GossipsubAgent, GossipsubConfig, GossipsubEvent, MESHSUB_PROTOCOL_ID_V10,
+    MESHSUB_PROTOCOL_ID_V11, RawMessage, Rpc, SubOpts, decode_frame, encode_frame,
 };
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};
@@ -26,7 +26,7 @@ fn agent() -> GossipsubAgent {
     agent_with(GossipsubConfig::default())
 }
 
-fn drain_actions(agent: &mut GossipsubAgent) -> Vec<PubsubAction> {
+fn drain_actions(agent: &mut GossipsubAgent) -> Vec<GossipsubAction> {
     let mut actions = Vec::new();
     while let Some(action) = agent.poll_action() {
         actions.push(action);
@@ -34,7 +34,7 @@ fn drain_actions(agent: &mut GossipsubAgent) -> Vec<PubsubAction> {
     actions
 }
 
-fn drain_events(agent: &mut GossipsubAgent) -> Vec<PubsubEvent> {
+fn drain_events(agent: &mut GossipsubAgent) -> Vec<GossipsubEvent> {
     let mut events = Vec::new();
     while let Some(event) = agent.poll_event() {
         events.push(event);
@@ -65,12 +65,12 @@ fn make_ready(
     stream_id: StreamId,
     negotiated: &str,
     now_ms: u64,
-) -> Vec<PubsubAction> {
+) -> Vec<GossipsubAction> {
     let actions = drain_actions(agent);
     let (token, protocol_id) = actions
         .iter()
         .find_map(|action| match action {
-            PubsubAction::OpenStream {
+            GossipsubAction::OpenStream {
                 token, protocol_id, ..
             } => Some((*token, protocol_id.clone())),
             _ => None,
@@ -145,9 +145,11 @@ fn remote_subscribe(
     );
 }
 
-fn sent(actions: &[PubsubAction]) -> Option<(Vec<u8>, minip2p_pubsub::PubsubToken, StreamId)> {
+fn sent(
+    actions: &[GossipsubAction],
+) -> Option<(Vec<u8>, minip2p_pubsub::GossipsubToken, StreamId)> {
     actions.iter().find_map(|action| match action {
-        PubsubAction::SendStream {
+        GossipsubAction::SendStream {
             data,
             token,
             stream_id,
@@ -158,20 +160,20 @@ fn sent(actions: &[PubsubAction]) -> Option<(Vec<u8>, minip2p_pubsub::PubsubToke
 }
 
 fn open_for(
-    actions: &[PubsubAction],
+    actions: &[GossipsubAction],
     expected_peer: &PeerId,
-) -> Option<minip2p_pubsub::PubsubToken> {
+) -> Option<minip2p_pubsub::GossipsubToken> {
     actions.iter().find_map(|action| match action {
-        PubsubAction::OpenStream { token, peer, .. } if peer == expected_peer => Some(*token),
+        GossipsubAction::OpenStream { token, peer, .. } if peer == expected_peer => Some(*token),
         _ => None,
     })
 }
 
-fn ack_peer(agent: &mut GossipsubAgent, peer: &PeerId, actions: &[PubsubAction], now_ms: u64) {
+fn ack_peer(agent: &mut GossipsubAgent, peer: &PeerId, actions: &[GossipsubAction], now_ms: u64) {
     let (token, stream_id) = actions
         .iter()
         .find_map(|action| match action {
-            PubsubAction::SendStream {
+            GossipsubAction::SendStream {
                 token,
                 peer: sent_peer,
                 stream_id,
@@ -183,7 +185,7 @@ fn ack_peer(agent: &mut GossipsubAgent, peer: &PeerId, actions: &[PubsubAction],
     agent.send_result(peer, stream_id, token, Ok(()), now_ms);
 }
 
-fn ack(agent: &mut GossipsubAgent, peer: &PeerId, actions: &[PubsubAction], now_ms: u64) {
+fn ack(agent: &mut GossipsubAgent, peer: &PeerId, actions: &[GossipsubAction], now_ms: u64) {
     let (_, token, stream_id) = sent(actions).expect("send action");
     agent.send_result(peer, stream_id, token, Ok(()), now_ms);
 }
@@ -229,13 +231,13 @@ fn prefers_v11_but_encodes_for_the_actually_negotiated_version() {
     let open = drain_actions(&mut agent);
     assert!(open.iter().any(|action| matches!(
         action,
-        PubsubAction::OpenStream { protocol_id, .. } if protocol_id == MESHSUB_PROTOCOL_ID_V11
+        GossipsubAction::OpenStream { protocol_id, .. } if protocol_id == MESHSUB_PROTOCOL_ID_V11
     )));
     // Put the action back through the manual ready sequence using its token.
     let token = open
         .iter()
         .find_map(|action| match action {
-            PubsubAction::OpenStream { token, .. } => Some(*token),
+            GossipsubAction::OpenStream { token, .. } => Some(*token),
             _ => None,
         })
         .unwrap();
@@ -297,7 +299,7 @@ fn join_promotes_known_peer_and_sender_stays_long_lived() {
     assert!(
         !subscription
             .iter()
-            .any(|action| matches!(action, PubsubAction::CloseStreamWrite { .. }))
+            .any(|action| matches!(action, GossipsubAction::CloseStreamWrite { .. }))
     );
     ack(&mut agent, &remote, &subscription, 1);
     let graft = drain_actions(&mut agent);
@@ -310,7 +312,7 @@ fn join_promotes_known_peer_and_sender_stays_long_lived() {
     assert!(
         !graft
             .iter()
-            .any(|action| matches!(action, PubsubAction::OpenStream { .. }))
+            .any(|action| matches!(action, GossipsubAction::OpenStream { .. }))
     );
 
     inbound_rpc(
@@ -534,7 +536,7 @@ fn new_remote_subscriptions_graft_and_relay_before_heartbeat() {
     let (relay_peer, frame) = relay
         .iter()
         .find_map(|action| match action {
-            PubsubAction::SendStream { peer, data, .. } => Some((peer, data)),
+            GossipsubAction::SendStream { peer, data, .. } => Some((peer, data)),
             _ => None,
         })
         .expect("relay before first heartbeat");
@@ -827,7 +829,7 @@ fn two_publishes_share_stream_and_failed_second_send_retries_in_order() {
     assert!(
         !first
             .iter()
-            .any(|action| matches!(action, PubsubAction::OpenStream { .. }))
+            .any(|action| matches!(action, GossipsubAction::OpenStream { .. }))
     );
     ack(&mut agent, &remote, &first, 2);
     let second = drain_actions(&mut agent);
@@ -849,7 +851,7 @@ fn two_publishes_share_stream_and_failed_second_send_retries_in_order() {
     assert_eq!(
         reset
             .iter()
-            .filter(|action| matches!(action, PubsubAction::ResetStream { .. }))
+            .filter(|action| matches!(action, GossipsubAction::ResetStream { .. }))
             .count(),
         1
     );
@@ -1087,7 +1089,7 @@ fn queued_prune_reencodes_for_v10_after_stream_reopen() {
     let token = opening
         .iter()
         .find_map(|action| match action {
-            PubsubAction::OpenStream {
+            GossipsubAction::OpenStream {
                 token, protocol_id, ..
             } if protocol_id == MESHSUB_PROTOCOL_ID_V10 => Some(*token),
             _ => None,
@@ -1155,14 +1157,14 @@ fn valid_message_delivers_once_and_invalid_signature_never_delivers() {
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event, PubsubEvent::Message { .. }))
+            .filter(|event| matches!(event, GossipsubEvent::Message { .. }))
             .count(),
         1
     );
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, PubsubEvent::ProtocolViolation { .. })),
+            .any(|event| matches!(event, GossipsubEvent::ProtocolViolation { .. })),
         "a known replay is discarded before signature verification"
     );
 
@@ -1183,12 +1185,12 @@ fn valid_message_delivers_once_and_invalid_signature_never_delivers() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, PubsubEvent::ProtocolViolation { .. }))
+            .any(|event| matches!(event, GossipsubEvent::ProtocolViolation { .. }))
     );
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event, PubsubEvent::Message { .. }))
+            .any(|event| matches!(event, GossipsubEvent::Message { .. }))
     );
 }
 
@@ -1230,7 +1232,7 @@ fn unsigned_message_cannot_suppress_later_signed_message_with_same_id() {
         1,
     );
     assert!(drain_events(&mut agent).iter().any(
-        |event| matches!(event, PubsubEvent::Message { signed: false, data, .. } if data == b"forged")
+        |event| matches!(event, GossipsubEvent::Message { signed: false, data, .. } if data == b"forged")
     ));
 
     inbound_rpc(
@@ -1244,7 +1246,7 @@ fn unsigned_message_cannot_suppress_later_signed_message_with_same_id() {
         2,
     );
     assert!(drain_events(&mut agent).iter().any(
-        |event| matches!(event, PubsubEvent::Message { signed: true, data, .. } if data == b"authentic")
+        |event| matches!(event, GossipsubEvent::Message { signed: true, data, .. } if data == b"authentic")
     ));
 }
 
@@ -1294,7 +1296,7 @@ fn off_topic_message_is_not_cached_as_seen() {
     assert_eq!(
         drain_events(&mut agent)
             .into_iter()
-            .filter(|event| matches!(event, PubsubEvent::Message { .. }))
+            .filter(|event| matches!(event, GossipsubEvent::Message { .. }))
             .count(),
         1
     );
@@ -1397,7 +1399,7 @@ fn open_failure_and_establishment_timeout_retry_only_after_stimulus() {
     );
     assert!(drain_events(&mut agent).iter().any(|event| matches!(
         event,
-        PubsubEvent::OutboundFailure { reason, .. } if reason.contains("open failed")
+        GossipsubEvent::OutboundFailure { reason, .. } if reason.contains("open failed")
     )));
     agent.handle_event(
         &SwarmEvent::PeerReady {
@@ -1418,12 +1420,12 @@ fn open_failure_and_establishment_timeout_retry_only_after_stimulus() {
     let timeout_actions = drain_actions(&mut agent);
     assert!(timeout_actions.iter().any(|action| matches!(
         action,
-        PubsubAction::ResetStream { stream_id, .. } if *stream_id == StreamId::new(4)
+        GossipsubAction::ResetStream { stream_id, .. } if *stream_id == StreamId::new(4)
     )));
     assert!(open_for(&timeout_actions, &remote).is_none());
     assert!(drain_events(&mut agent).iter().any(|event| matches!(
         event,
-        PubsubEvent::OutboundFailure { reason, .. }
+        GossipsubEvent::OutboundFailure { reason, .. }
             if reason.contains("establishment timed out")
     )));
     agent.handle_event(
@@ -1478,7 +1480,7 @@ fn disconnect_and_supersede_aggregate_queued_failures() {
     let failures: Vec<_> = drain_events(&mut agent)
         .into_iter()
         .filter_map(|event| match event {
-            PubsubEvent::OutboundFailure { peer, reason } => Some((peer, reason)),
+            GossipsubEvent::OutboundFailure { peer, reason } => Some((peer, reason)),
             _ => None,
         })
         .collect();
@@ -1612,7 +1614,7 @@ fn zero_fanout_ttl_reselects_for_each_publish() {
     let selected = sent_first
         .iter()
         .find_map(|action| match action {
-            PubsubAction::SendStream { peer, .. } => Some(peer.clone()),
+            GossipsubAction::SendStream { peer, .. } => Some(peer.clone()),
             _ => None,
         })
         .unwrap();
@@ -1624,7 +1626,7 @@ fn zero_fanout_ttl_reselects_for_each_publish() {
     let reselected = sent_second
         .iter()
         .find_map(|action| match action {
-            PubsubAction::SendStream { peer, .. } => Some(peer.clone()),
+            GossipsubAction::SendStream { peer, .. } => Some(peer.clone()),
             _ => None,
         })
         .unwrap();

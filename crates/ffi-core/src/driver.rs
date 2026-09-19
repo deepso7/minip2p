@@ -9,7 +9,7 @@ use std::time::Duration;
 use minip2p::{EndpointWake, Error, NatEvent};
 
 use crate::endpoint::{Lifecycle, Shared};
-use crate::events::{convert_discovery, convert_nat, convert_pubsub, convert_swarm};
+use crate::events::{convert_discovery, convert_gossipsub, convert_nat, convert_swarm};
 use crate::{DriverFailureKind, EventDoorbell, P2pEvent};
 
 const DRIVER_POLL: Duration = Duration::from_millis(25);
@@ -236,9 +236,9 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         );
         ingest(
             endpoint
-                .take_pubsub_events()
+                .take_gossipsub_events()
                 .into_iter()
-                .map(convert_pubsub),
+                .map(convert_gossipsub),
             carry,
             overflow,
             stats,

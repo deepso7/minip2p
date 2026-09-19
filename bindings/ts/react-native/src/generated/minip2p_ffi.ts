@@ -1900,8 +1900,8 @@ export enum P2pEvent_Tags {
     Message = "Message",
     PeerSubscribed = "PeerSubscribed",
     PeerUnsubscribed = "PeerUnsubscribed",
-    PubsubOutboundFailure = "PubsubOutboundFailure",
-    PubsubProtocolViolation = "PubsubProtocolViolation",
+    GossipsubOutboundFailure = "GossipsubOutboundFailure",
+    GossipsubProtocolViolation = "GossipsubProtocolViolation",
     PeerDiscovered = "PeerDiscovered",
     PeerUpdated = "PeerUpdated",
     PeerExpired = "PeerExpired",
@@ -2835,70 +2835,70 @@ inner: {peerId: string; topic: string }): PeerUnsubscribed_ {
 
     }
 
-    type PubsubOutboundFailure__interface = {
-        tag: P2pEvent_Tags.PubsubOutboundFailure;
+    type GossipsubOutboundFailure__interface = {
+        tag: P2pEvent_Tags.GossipsubOutboundFailure;
         inner:
 Readonly<{peerId: string; reason: string}>
     };
     /**
      * Pubsub outbound work was discarded.
      */
-    class PubsubOutboundFailure_ extends UniffiEnum implements PubsubOutboundFailure__interface {
+    class GossipsubOutboundFailure_ extends UniffiEnum implements GossipsubOutboundFailure__interface {
         /**
          * @private
          * This field is private and should not be used, use `tag` instead.
          */
         readonly [uniffiTypeNameSymbol] = "P2pEvent";
-        readonly tag = P2pEvent_Tags.PubsubOutboundFailure;
+        readonly tag = P2pEvent_Tags.GossipsubOutboundFailure;
         readonly inner:
 Readonly<{peerId: string; reason: string}>;
         constructor(
 inner: {peerId: string; reason: string }) {
-            super("P2pEvent", "PubsubOutboundFailure");
+            super("P2pEvent", "GossipsubOutboundFailure");
 
             this.inner = Object.freeze(inner);
         }
         static new(
-inner: {peerId: string; reason: string }): PubsubOutboundFailure_ {
-            return new PubsubOutboundFailure_(inner);
+inner: {peerId: string; reason: string }): GossipsubOutboundFailure_ {
+            return new GossipsubOutboundFailure_(inner);
         }
 
-        static instanceOf(obj: any): obj is PubsubOutboundFailure_ {
-            return obj.tag === P2pEvent_Tags.PubsubOutboundFailure;
+        static instanceOf(obj: any): obj is GossipsubOutboundFailure_ {
+            return obj.tag === P2pEvent_Tags.GossipsubOutboundFailure;
         }
 
     }
 
-    type PubsubProtocolViolation__interface = {
-        tag: P2pEvent_Tags.PubsubProtocolViolation;
+    type GossipsubProtocolViolation__interface = {
+        tag: P2pEvent_Tags.GossipsubProtocolViolation;
         inner:
 Readonly<{peerId: string; reason: string}>
     };
     /**
      * A peer violated the pubsub protocol.
      */
-    class PubsubProtocolViolation_ extends UniffiEnum implements PubsubProtocolViolation__interface {
+    class GossipsubProtocolViolation_ extends UniffiEnum implements GossipsubProtocolViolation__interface {
         /**
          * @private
          * This field is private and should not be used, use `tag` instead.
          */
         readonly [uniffiTypeNameSymbol] = "P2pEvent";
-        readonly tag = P2pEvent_Tags.PubsubProtocolViolation;
+        readonly tag = P2pEvent_Tags.GossipsubProtocolViolation;
         readonly inner:
 Readonly<{peerId: string; reason: string}>;
         constructor(
 inner: {peerId: string; reason: string }) {
-            super("P2pEvent", "PubsubProtocolViolation");
+            super("P2pEvent", "GossipsubProtocolViolation");
 
             this.inner = Object.freeze(inner);
         }
         static new(
-inner: {peerId: string; reason: string }): PubsubProtocolViolation_ {
-            return new PubsubProtocolViolation_(inner);
+inner: {peerId: string; reason: string }): GossipsubProtocolViolation_ {
+            return new GossipsubProtocolViolation_(inner);
         }
 
-        static instanceOf(obj: any): obj is PubsubProtocolViolation_ {
-            return obj.tag === P2pEvent_Tags.PubsubProtocolViolation;
+        static instanceOf(obj: any): obj is GossipsubProtocolViolation_ {
+            return obj.tag === P2pEvent_Tags.GossipsubProtocolViolation;
         }
 
     }
@@ -3106,8 +3106,8 @@ inner: {peerId?: string; source: DiscoverySource; reason: string; suppressed: nu
   Message: Message_,
   PeerSubscribed: PeerSubscribed_,
   PeerUnsubscribed: PeerUnsubscribed_,
-  PubsubOutboundFailure: PubsubOutboundFailure_,
-  PubsubProtocolViolation: PubsubProtocolViolation_,
+  GossipsubOutboundFailure: GossipsubOutboundFailure_,
+  GossipsubProtocolViolation: GossipsubProtocolViolation_,
   PeerDiscovered: PeerDiscovered_,
   PeerUpdated: PeerUpdated_,
   PeerExpired: PeerExpired_,
@@ -3120,7 +3120,7 @@ inner: {peerId?: string; source: DiscoverySource; reason: string; suppressed: nu
  * Event delivered by the native endpoint driver.
  */
 export type P2pEvent = InstanceType<
-    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingTimeout' | 'StreamReady' | 'StreamData' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'FellBackToRelay' | 'ConnectFailed' | 'InboundDirectUpgrade' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'PubsubOutboundFailure' | 'PubsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'DiscoveryProtocolViolation']
+    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingTimeout' | 'StreamReady' | 'StreamData' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'FellBackToRelay' | 'ConnectFailed' | 'InboundDirectUpgrade' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'GossipsubOutboundFailure' | 'GossipsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'DiscoveryProtocolViolation']
 >;
 
 // FfiConverter for enum P2pEvent
@@ -3156,8 +3156,8 @@ const FfiConverterTypeP2pEvent = (() => {
                 case 25: return new P2pEvent.Message({fromPeerId: FfiConverterString.readFromCursor(c), topics: FfiConverterSequenceString.readFromCursor(c), data: FfiConverterArrayBuffer.readFromCursor(c), seqno: FfiConverterArrayBuffer.readFromCursor(c), signed: FfiConverterBool.readFromCursor(c) });
                 case 26: return new P2pEvent.PeerSubscribed({peerId: FfiConverterString.readFromCursor(c), topic: FfiConverterString.readFromCursor(c) });
                 case 27: return new P2pEvent.PeerUnsubscribed({peerId: FfiConverterString.readFromCursor(c), topic: FfiConverterString.readFromCursor(c) });
-                case 28: return new P2pEvent.PubsubOutboundFailure({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
-                case 29: return new P2pEvent.PubsubProtocolViolation({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
+                case 28: return new P2pEvent.GossipsubOutboundFailure({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
+                case 29: return new P2pEvent.GossipsubProtocolViolation({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
                 case 30: return new P2pEvent.PeerDiscovered({peerId: FfiConverterString.readFromCursor(c), addrs: FfiConverterSequenceString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c) });
                 case 31: return new P2pEvent.PeerUpdated({peerId: FfiConverterString.readFromCursor(c), addrs: FfiConverterSequenceString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c) });
                 case 32: return new P2pEvent.PeerExpired({peerId: FfiConverterString.readFromCursor(c) });
@@ -3373,14 +3373,14 @@ const FfiConverterTypeP2pEvent = (() => {
                     FfiConverterString.writeIntoCursor(inner.topic, c);
                     return;
                 }
-                case P2pEvent_Tags.PubsubOutboundFailure: {
+                case P2pEvent_Tags.GossipsubOutboundFailure: {
                     c.writeI32(28);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterString.writeIntoCursor(inner.reason, c);
                     return;
                 }
-                case P2pEvent_Tags.PubsubProtocolViolation: {
+                case P2pEvent_Tags.GossipsubProtocolViolation: {
                     c.writeI32(29);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
@@ -3637,14 +3637,14 @@ const FfiConverterTypeP2pEvent = (() => {
                     size += FfiConverterString.allocationSize(inner.topic);
                     return size;
                 }
-                case P2pEvent_Tags.PubsubOutboundFailure: {
+                case P2pEvent_Tags.GossipsubOutboundFailure: {
                     const inner = value.inner;
                     let size = 4;
                     size += FfiConverterString.allocationSize(inner.peerId);
                     size += FfiConverterString.allocationSize(inner.reason);
                     return size;
                 }
-                case P2pEvent_Tags.PubsubProtocolViolation: {
+                case P2pEvent_Tags.GossipsubProtocolViolation: {
                     const inner = value.inner;
                     let size = 4;
                     size += FfiConverterString.allocationSize(inner.peerId);

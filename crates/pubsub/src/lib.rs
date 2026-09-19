@@ -5,7 +5,7 @@
 //! bounded message cache. RPC field framing uses the shared protobuf
 //! vocabulary in [`minip2p_core`]; this crate keeps message types,
 //! StrictSign signing and verification, the 64 KiB RPC-body limit, and
-//! contextual [`PubsubWireError`] values.
+//! contextual [`GossipsubWireError`] values.
 //!
 //! No I/O, no clocks, no async: callers feed inputs and drain
 //! actions/events, exactly like the other minip2p protocol crates.
@@ -19,11 +19,11 @@ mod gossipsub;
 mod message;
 mod seen;
 
-pub use events::{PublishError, PubsubAction, PubsubEvent, PubsubToken, TopicError};
+pub use events::{GossipsubAction, GossipsubEvent, GossipsubToken, PublishError, TopicError};
 pub use gossipsub::{GossipsubAgent, GossipsubConfig, GossipsubConfigError};
 pub use message::{
     ControlGraft, ControlIHave, ControlIWant, ControlMessage, ControlPrune, FrameDecode,
-    GOSSIPSUB_PROTOCOL_IDS, MAX_RPC_SIZE, MAX_TOPIC_LEN, MESHSUB_PROTOCOL_ID_V10,
-    MESHSUB_PROTOCOL_ID_V11, MessageVerifyError, PeerInfo, PubsubWireError, RawMessage, Rpc,
-    SubOpts, decode_frame, encode_frame,
+    GOSSIPSUB_PROTOCOL_IDS, GossipsubWireError, MAX_RPC_SIZE, MAX_TOPIC_LEN,
+    MESHSUB_PROTOCOL_ID_V10, MESHSUB_PROTOCOL_ID_V11, MessageVerifyError, PeerInfo, RawMessage,
+    Rpc, SubOpts, decode_frame, encode_frame,
 };

@@ -29,8 +29,8 @@ This is deliberately a focused compatibility implementation, not a claim of comp
 
 ## Wire compatibility and signing
 
-`Rpc` covers pubsub message and subscription fields plus meshsub IHAVE, IWANT, GRAFT, PRUNE, peer-exchange, and prune-backoff fields. Message ids are opaque bytes, matching upstream behavior despite their protobuf `string` declaration. Field framing uses the shared protobuf vocabulary in `minip2p-core`; this crate keeps RPC/control types, StrictSign canonicalization, the 64 KiB RPC-body limit, and contextual `PubsubWireError` values.
+`Rpc` covers pubsub message and subscription fields plus meshsub IHAVE, IWANT, GRAFT, PRUNE, peer-exchange, and prune-backoff fields. Message ids are opaque bytes, matching upstream behavior despite their protobuf `string` declaration. Field framing uses the shared protobuf vocabulary in `minip2p-core`; this crate keeps RPC/control types, StrictSign canonicalization, the 64 KiB RPC-body limit, and contextual `GossipsubWireError` values.
 
 Messages use libp2p StrictSign by default: Ed25519 over `"libp2p-pubsub:" ++ Message`, with `signature` and `key` omitted and the decoded fields canonically re-encoded. The wire message is preserved verbatim for forwarding. minip2p omits the key field because its Ed25519 public key is recoverable from the inline peer id.
 
-Delivered `PubsubEvent::Message` values include a `signed` flag. It is true only when a signature was present and verified. With `allow_unsigned`, accepted unsigned messages carry `signed = false`, so higher-level protocols can still require authentication independently of the router policy.
+Delivered `GossipsubEvent::Message` values include a `signed` flag. It is true only when a signature was present and verified. With `allow_unsigned`, accepted unsigned messages carry `signed = false`, so higher-level protocols can still require authentication independently of the router policy.

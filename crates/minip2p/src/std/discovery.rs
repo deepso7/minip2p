@@ -11,14 +11,14 @@ use minip2p_discovery::{DiscoveryAction, DiscoverySource, PeerDiscoveryAgent};
 use minip2p_mdns::MdnsEvent;
 use minip2p_nat::{ConnectId, NatEvent};
 #[cfg(feature = "discovery")]
-use minip2p_pubsub::PubsubEvent;
+use minip2p_pubsub::GossipsubEvent;
 use minip2p_swarm::SwarmEvent;
 
 #[cfg(feature = "mdns")]
 use super::mdns::MdnsDriver;
 use super::nat::NatDriver;
 #[cfg(feature = "discovery")]
-use super::pubsub::PubsubDriver;
+use super::pubsub::GossipsubDriver;
 use crate::EndpointSwarm;
 use crate::Error;
 
@@ -110,7 +110,7 @@ impl DiscoveryDriver {
     /// Runs all cross-driver work until no new work is produced.
     pub(crate) fn sweep(
         &mut self,
-        #[cfg(feature = "discovery")] mut pubsub: Option<&mut PubsubDriver>,
+        #[cfg(feature = "discovery")] mut pubsub: Option<&mut GossipsubDriver>,
         #[cfg(feature = "mdns")] mut mdns: Option<&mut MdnsDriver>,
         nat: &mut NatDriver,
         swarm: &mut EndpointSwarm,
@@ -131,7 +131,7 @@ impl DiscoveryDriver {
                     let mut retained = VecDeque::new();
                     while let Some(event) = pubsub.events.pop_front() {
                         let consumed = match &event {
-                            PubsubEvent::Message {
+                            GossipsubEvent::Message {
                                 from,
                                 topics,
                                 data,
@@ -141,8 +141,8 @@ impl DiscoveryDriver {
                                 beacon.handle_beacon(from, data, *signed);
                                 true
                             }
-                            PubsubEvent::PeerSubscribed { topic, .. }
-                            | PubsubEvent::PeerUnsubscribed { topic, .. }
+                            GossipsubEvent::PeerSubscribed { topic, .. }
+                            | GossipsubEvent::PeerUnsubscribed { topic, .. }
                                 if topic == beacon.topic() =>
                             {
                                 true
