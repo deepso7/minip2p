@@ -10,7 +10,7 @@ use minip2p_identity::Ed25519Keypair;
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::StreamId;
 
-use super::config::GossipsubConfig;
+use super::config::{GossipsubConfig, PubsubConfigError};
 use super::mcache::MessageCache;
 use crate::events::{
     PublishError, PubsubAction, PubsubEvent, PubsubToken, SharedFrame, TopicError,
@@ -442,20 +442,19 @@ pub struct GossipsubAgent {
 }
 
 impl GossipsubAgent {
-    /// Creates a router. `initial_seqno` must not repeat across restarts;
-    /// `entropy_seed` controls deterministic peer selection. Call
-    /// [`GossipsubConfig::validate`] first when constructing this concrete
-    /// agent directly; [`PubsubAgent::new`](crate::PubsubAgent::new) does so
-    /// automatically.
+    /// Validates `config` and creates a router. `initial_seqno` must not
+    /// repeat across restarts; `entropy_seed` controls deterministic peer
+    /// selection.
     pub fn new(
         keypair: Ed25519Keypair,
         config: GossipsubConfig,
         initial_seqno: u64,
         entropy_seed: u64,
-    ) -> Self {
+    ) -> Result<Self, PubsubConfigError> {
+        config.validate()?;
         let local_peer_id = keypair.peer_id();
         let mcache = MessageCache::new(config.mcache_len, config.max_mcache_messages);
-        Self {
+        Ok(Self {
             keypair,
             local_peer_id,
             config,
@@ -477,7 +476,7 @@ impl GossipsubAgent {
             next_token: 0,
             next_seqno: initial_seqno,
             rng: SplitMix64::new(entropy_seed),
-        }
+        })
     }
 
     /// The peer id this agent publishes as. Exposed for test support.
@@ -1898,13 +1897,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn constructor_rejects_invalid_config() {
+        let config = GossipsubConfig {
+            heartbeat_interval_ms: 0,
+            ..GossipsubConfig::default()
+        };
+        let error =
+            GossipsubAgent::new(Ed25519Keypair::from_secret_key_bytes([1; 32]), config, 1, 2)
+                .err()
+                .expect("invalid config");
+        assert_eq!(error.field, "heartbeat_interval_ms");
+    }
+
+    #[test]
     fn fanout_queues_share_one_framed_payload() {
         let mut agent = GossipsubAgent::new(
             Ed25519Keypair::from_secret_key_bytes([1; 32]),
             GossipsubConfig::default(),
             0,
             0,
-        );
+        )
+        .expect("default config");
         let first = Ed25519Keypair::from_secret_key_bytes([2; 32]).peer_id();
         let second = Ed25519Keypair::from_secret_key_bytes([3; 32]).peer_id();
         for peer in [&first, &second] {

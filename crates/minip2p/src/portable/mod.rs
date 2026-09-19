@@ -30,8 +30,7 @@ pub use minip2p_nat::{
 };
 #[cfg(all(feature = "pubsub", not(feature = "std")))]
 pub use minip2p_pubsub::{
-    FloodsubConfig, GossipsubConfig, PublishError, PubsubConfig, PubsubConfigError, PubsubEvent,
-    TopicError,
+    GossipsubConfig, PublishError, PubsubConfigError, PubsubEvent, TopicError,
 };
 #[cfg(feature = "smoltcp")]
 pub use minip2p_tcp::{SmoltcpConfig, SmoltcpStack, SmoltcpTcpProvider, smoltcp};
@@ -650,7 +649,7 @@ pub struct SmoltcpEndpointBuilder<D: smoltcp::phy::Device, E: EntropySource> {
     listens: Vec<String>,
     mdns: Option<EmbeddedMdnsConfig>,
     #[cfg(feature = "pubsub")]
-    pubsub: Option<PubsubConfig>,
+    pubsub: Option<GossipsubConfig>,
     #[cfg(feature = "pubsub")]
     beacon: Option<BeaconConfig>,
     #[cfg(feature = "portable-autonat")]
@@ -674,7 +673,7 @@ pub struct SmoltcpEndpoint<D: smoltcp::phy::Device, E: EntropySource> {
     endpoint: PortableEndpoint<SmoltcpComposedTransport<D, E>, SharedEntropy<E>>,
     mdns: Option<minip2p_mdns::MdnsDriver<SmoltcpMdnsIo<D>>>,
     #[cfg(feature = "pubsub")]
-    pubsub: Option<minip2p_pubsub::PubsubAgent>,
+    pubsub: Option<minip2p_pubsub::GossipsubAgent>,
     #[cfg(feature = "pubsub")]
     pending_pubsub_events: VecDeque<PubsubEvent>,
     #[cfg(feature = "pubsub")]
@@ -1129,7 +1128,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
 #[cfg(feature = "smoltcp")]
 #[cfg(feature = "pubsub")]
 fn pump_embedded_pubsub<D: smoltcp::phy::Device, E: EntropySource>(
-    agent: &mut minip2p_pubsub::PubsubAgent,
+    agent: &mut minip2p_pubsub::GossipsubAgent,
     endpoint: &mut PortableEndpoint<SmoltcpComposedTransport<D, E>, SharedEntropy<E>>,
     now: Now,
 ) {
@@ -1175,7 +1174,7 @@ fn pump_embedded_pubsub<D: smoltcp::phy::Device, E: EntropySource>(
 
 #[cfg(all(feature = "smoltcp", feature = "pubsub"))]
 fn collect_embedded_pubsub_events(
-    agent: &mut minip2p_pubsub::PubsubAgent,
+    agent: &mut minip2p_pubsub::GossipsubAgent,
     pending: &mut VecDeque<PubsubEvent>,
 ) {
     while let Some(event) = agent.poll_event() {
@@ -1243,21 +1242,21 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
     /// Enables pubsub with interoperable gossipsub defaults.
     #[cfg(feature = "pubsub")]
     pub fn pubsub(mut self) -> Self {
-        self.pubsub.get_or_insert_with(PubsubConfig::default);
+        self.pubsub.get_or_insert_with(GossipsubConfig::default);
         self
     }
 
-    /// Enables pubsub with an explicit gossipsub or floodsub configuration.
+    /// Enables pubsub with an explicit gossipsub configuration.
     #[cfg(feature = "pubsub")]
-    pub fn pubsub_config(mut self, config: impl Into<PubsubConfig>) -> Self {
-        self.pubsub = Some(config.into());
+    pub fn pubsub_config(mut self, config: GossipsubConfig) -> Self {
+        self.pubsub = Some(config);
         self
     }
 
     /// Enables signed-beacon discovery. Pubsub is enabled automatically.
     #[cfg(feature = "pubsub")]
     pub fn discovery(mut self) -> Self {
-        self.pubsub.get_or_insert_with(PubsubConfig::default);
+        self.pubsub.get_or_insert_with(GossipsubConfig::default);
         self.beacon.get_or_insert_with(BeaconConfig::default);
         self
     }
@@ -1265,7 +1264,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
     /// Enables signed-beacon discovery with explicit beacon policy.
     #[cfg(feature = "pubsub")]
     pub fn beacon_config(mut self, config: BeaconConfig) -> Self {
-        self.pubsub.get_or_insert_with(PubsubConfig::default);
+        self.pubsub.get_or_insert_with(GossipsubConfig::default);
         self.beacon = Some(config);
         self
     }
@@ -1357,8 +1356,8 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
             }
         }
         #[cfg(feature = "pubsub")]
-        if let Some(config) = &self.pubsub {
-            for protocol in config.protocol_ids() {
+        if self.pubsub.is_some() {
+            for protocol in minip2p_pubsub::GOSSIPSUB_PROTOCOL_IDS {
                 self.swarm = self.swarm.protocol(*protocol);
             }
         }
@@ -1420,7 +1419,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
         let mut pubsub = self
             .pubsub
             .map(|config| {
-                minip2p_pubsub::PubsubAgent::new(
+                minip2p_pubsub::GossipsubAgent::new(
                     self.identity.clone(),
                     config,
                     self.entropy.next_u64()?,

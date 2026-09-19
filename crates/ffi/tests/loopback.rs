@@ -227,7 +227,6 @@ fn config_on(listen_addr: &str) -> EndpointConfig {
         tcp,
         force_relay: false,
         allow_unsigned: false,
-        pubsub_router: minip2p_ffi::PubsubRouter::Gossipsub,
         protocols: Vec::new(),
         discovery: None,
         mdns: None,

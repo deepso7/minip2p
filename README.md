@@ -83,7 +83,7 @@ The base `Endpoint` includes whatever you bind — QUIC, TCP, or both — plus m
 | --- | --- |
 | `nat` | Circuit Relay v2, AutoNAT, and DCUtR traversal policy |
 | `relay-server` | std-only Circuit Relay v2 hosting, independent of `nat` |
-| `pubsub` | StrictSign gossipsub by default, with explicit floodsub selection |
+| `pubsub` | StrictSign gossipsub |
 | `discovery` | Signed pubsub presence beacons and coordinated dialing; implies `nat` and `pubsub` |
 | `mdns` | Local-link discovery and coordinated direct dialing; implies `nat` |
 

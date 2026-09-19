@@ -95,7 +95,8 @@ fn fuzz_pubsub(data: &[u8]) {
     let identity = minip2p_identity::Ed25519Keypair::from_secret_key_bytes([11; 32]);
     let remote = fuzz_peer_id();
     let stream_id = StreamId::new(1);
-    let mut agent = GossipsubAgent::new(identity, GossipsubConfig::default(), 1, 7);
+    let mut agent = GossipsubAgent::new(identity, GossipsubConfig::default(), 1, 7)
+        .expect("default gossipsub config");
     let _ = agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
             peer_id: remote.clone(),

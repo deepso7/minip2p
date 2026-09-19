@@ -1,6 +1,6 @@
 /* oxlint-disable class-methods-use-this, func-style, max-classes-per-file, no-await-in-loop, no-use-before-define, prefer-destructuring, promise/avoid-new, unicorn/no-useless-undefined -- The adapter keeps the contract-complete native endpoint, value conversion, handle maps, and drain loop together at the binding boundary. */
 
-import { Minip2pBase, PubsubRouter } from "@minip2p/core";
+import { Minip2pBase } from "@minip2p/core";
 import type {
   Bytes,
   IdentifyInfo,
@@ -43,7 +43,6 @@ class NodeBackend implements Minip2pBackend {
         forceRelay: config.forceRelay ?? false,
         mdns,
         protocols: [...(config.protocols ?? [])],
-        pubsubRouter: config.pubsubRouter ?? PubsubRouter.Gossipsub,
         quic: toNativeTransport(transports.quic),
         relays: [...(config.relays ?? [])],
         tcp: toNativeTransport(transports.tcp),

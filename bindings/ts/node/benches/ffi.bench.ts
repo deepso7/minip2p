@@ -113,7 +113,6 @@ function createRaw(drainOnDoorbell = false): NativeEndpoint {
       autonatServers: [],
       forceRelay: false,
       protocols: [PROTOCOL],
-      pubsubRouter: 1,
       relays: [],
       tcp: { listenAddrs: ["/ip4/127.0.0.1/tcp/0"] },
     }

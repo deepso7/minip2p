@@ -8,8 +8,8 @@ mod error;
 mod events;
 
 pub use config::{
-    DiscoveryOptions, EndpointConfig, KnownPeerInfo, MdnsOptions, PubsubRouter,
-    RelayReservationInfo, TransportOptions,
+    DiscoveryOptions, EndpointConfig, KnownPeerInfo, MdnsOptions, RelayReservationInfo,
+    TransportOptions,
 };
 pub use endpoint::P2pEndpoint;
 pub use error::FfiError;

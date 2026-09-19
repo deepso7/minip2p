@@ -75,7 +75,6 @@ RUN cargo chef cook --release --package minip2p-nodejs --recipe-path recipe.json
     && cargo chef cook --release --package minip2p-core --benches --recipe-path recipe.json \
     && cargo chef cook --release --package minip2p-yamux --benches --recipe-path recipe.json \
     && cargo chef cook --release --package minip2p-discovery --benches --recipe-path recipe.json \
-    && cargo chef cook --release --package minip2p-pubsub --benches --recipe-path recipe.json \
     && cargo chef cook --release --package minip2p-relay-server --benches --recipe-path recipe.json \
     && cargo chef cook --release --package minip2p-quic --benches --recipe-path recipe.json \
     && cargo chef cook --release --package minip2p-tcp --benches --recipe-path recipe.json \
@@ -87,7 +86,6 @@ RUN pnpm --filter @minip2p/node native:build \
     && cargo bench -p minip2p-core --bench multiaddr --no-run \
     && cargo bench -p minip2p-yamux --bench data_path --no-run \
     && cargo bench -p minip2p-discovery --bench peer_book --no-run \
-    && cargo bench -p minip2p-pubsub --bench fanout --no-run \
     && cargo bench -p minip2p-relay-server --bench relay_server_event --no-run \
     && cargo bench -p minip2p-quic --bench idle_poll --no-run \
     && cargo bench -p minip2p-tcp --bench readiness_poll --no-run \
@@ -95,7 +93,6 @@ RUN pnpm --filter @minip2p/node native:build \
     && cargo bench -p minip2p-core --bench multiaddr_ir --no-run \
     && cargo bench -p minip2p-yamux --bench data_path_ir --no-run \
     && cargo bench -p minip2p-discovery --bench peer_book_ir --no-run \
-    && cargo bench -p minip2p-pubsub --bench fanout_ir --no-run \
     && cargo bench -p minip2p-relay-server --bench relay_server_event_ir --no-run
 
 ENTRYPOINT ["scripts/run-fargate-benches.sh"]

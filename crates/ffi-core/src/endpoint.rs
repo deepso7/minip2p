@@ -9,15 +9,14 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BeaconConfig, Endpoint, EndpointBuilder, FloodsubConfig, GossipsubConfig, MdnsConfig,
-    Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, Protocol, PublishError, PubsubConfig,
-    PubsubError, StreamId, TopicError, TransportError, WaitHandle,
+    BeaconConfig, Endpoint, EndpointBuilder, GossipsubConfig, MdnsConfig, Multiaddr, NatConfig,
+    PeerDiscoveryConfig, PeerId, Protocol, PublishError, PubsubError, StreamId, TopicError,
+    TransportError, WaitHandle,
 };
 
 use crate::{
     DriverStats, EndpointConfig, EventDoorbell, FfiError, IdentifyInfo, KnownPeerInfo, P2pEvent,
-    PubsubRouter, RelayReservationInfo, TransportOptions, keypair_from_bytes,
-    parse_direct_peer_addr,
+    RelayReservationInfo, TransportOptions, keypair_from_bytes, parse_direct_peer_addr,
 };
 
 fn configure_transports(
@@ -192,15 +191,9 @@ impl P2pEndpoint {
             });
         }
 
-        let pubsub = match config.pubsub_router {
-            PubsubRouter::Gossipsub => PubsubConfig::Gossipsub(GossipsubConfig {
-                allow_unsigned: config.allow_unsigned,
-                ..GossipsubConfig::default()
-            }),
-            PubsubRouter::Floodsub => PubsubConfig::Floodsub(FloodsubConfig {
-                allow_unsigned: config.allow_unsigned,
-                ..FloodsubConfig::default()
-            }),
+        let pubsub = GossipsubConfig {
+            allow_unsigned: config.allow_unsigned,
+            ..GossipsubConfig::default()
         };
         pubsub.validate().map_err(invalid_config)?;
 
@@ -1054,7 +1047,6 @@ mod tests {
             tcp: None,
             force_relay: false,
             allow_unsigned: false,
-            pubsub_router: PubsubRouter::Gossipsub,
             protocols: Vec::new(),
             discovery: None,
             mdns: None,
@@ -1339,9 +1331,8 @@ mod tests {
     }
 
     #[test]
-    fn constructor_accepts_mdns_and_floodsub_configuration() {
+    fn constructor_accepts_mdns_configuration() {
         let mut config = config();
-        config.pubsub_router = PubsubRouter::Floodsub;
         config.mdns = Some(crate::MdnsOptions {
             enable_ipv6: false,
             ttl_ms: 120_000,
@@ -1353,7 +1344,7 @@ mod tests {
             auto_dial: true,
         });
 
-        endpoint(config).expect("mDNS + floodsub endpoint");
+        endpoint(config).expect("mDNS endpoint");
     }
 
     #[test]

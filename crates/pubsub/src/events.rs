@@ -32,7 +32,7 @@ pub enum PubsubAction {
         token: PubsubToken,
         /// The peer to open toward.
         peer: PeerId,
-        /// Engine-selected protocol id: floodsub or a meshsub version.
+        /// Negotiated meshsub protocol id.
         protocol_id: String,
     },
     /// Call `Swarm::send_stream(&peer, stream_id, data)` and synchronously
@@ -76,7 +76,7 @@ pub enum PubsubEvent {
         /// Application payload.
         data: Vec<u8>,
         /// The publisher's sequence number, as opaque bytes: go peers emit
-        /// 8 big-endian bytes, rust-libp2p floodsub 20 random bytes.
+        /// 8 big-endian bytes, rust-libp2p 20 random bytes.
         /// Together with `from` it identifies the message for dedup.
         seqno: Vec<u8>,
         /// Whether the message carried a signature that passed verification.
@@ -127,10 +127,6 @@ pub enum TopicError {
     /// Topics are bounded by [`MAX_TOPIC_LEN`](crate::MAX_TOPIC_LEN) bytes.
     #[error("topic exceeds the maximum length")]
     TooLong,
-    /// Floodsub only: adding this topic would make its single-frame encoded
-    /// subscription snapshot exceed half of [`MAX_RPC_SIZE`](crate::MAX_RPC_SIZE).
-    #[error("the subscription set would no longer fit in one RPC")]
-    SetTooLarge,
 }
 
 /// Why a publish was refused.

@@ -16,10 +16,8 @@
 //! knowing there is more than one. `bind_quic`, `bind_quic_multiaddr`,
 //! `bind_quic_dual_stack`, and `bind_tcp` are the one-transport shorthands.
 //!
-//! With the `pubsub` feature, `EndpointBuilder::pubsub` selects gossipsub by
-//! default. `EndpointBuilder::pubsub_config` accepts either a
-//! `GossipsubConfig` or `FloodsubConfig`; the selected engine controls which
-//! pubsub protocol ids are advertised.
+//! With the `pubsub` feature, `EndpointBuilder::pubsub` enables gossipsub
+//! and `EndpointBuilder::pubsub_config` tunes it with a `GossipsubConfig`.
 //!
 //! The `nat` feature exposes relay, AutoNAT, and DCUtR coordination. The
 //! `discovery` feature includes `nat` and `pubsub`, adding signed presence
@@ -85,9 +83,8 @@ pub use minip2p_nat::{
 use minip2p_platform::StdEntropy;
 #[cfg(feature = "pubsub")]
 pub use minip2p_pubsub::{
-    FLOODSUB_PROTOCOL_ID, FloodsubConfig, GossipsubConfig, MESHSUB_PROTOCOL_ID_V10,
-    MESHSUB_PROTOCOL_ID_V11, PublishError, PubsubConfig, PubsubConfigError, PubsubEvent,
-    TopicError,
+    GossipsubConfig, MESHSUB_PROTOCOL_ID_V10, MESHSUB_PROTOCOL_ID_V11, PublishError,
+    PubsubConfigError, PubsubEvent, TopicError,
 };
 #[cfg(feature = "quic")]
 pub use minip2p_quic::QuicLimits;
@@ -1617,7 +1614,7 @@ pub struct EndpointBuilder {
     #[cfg(feature = "nat")]
     autonat_servers: Vec<PeerAddr>,
     #[cfg(feature = "pubsub")]
-    pubsub_config: Option<PubsubConfig>,
+    pubsub_config: Option<GossipsubConfig>,
     #[cfg(feature = "discovery")]
     discovery_config: Option<BeaconConfig>,
     #[cfg(feature = "mdns")]
@@ -1678,7 +1675,7 @@ struct BuilderParts {
     #[cfg(feature = "nat")]
     nat_config: Option<NatConfig>,
     #[cfg(feature = "pubsub")]
-    pubsub_config: Option<PubsubConfig>,
+    pubsub_config: Option<GossipsubConfig>,
     #[cfg(feature = "discovery")]
     discovery_config: Option<BeaconConfig>,
     #[cfg(feature = "mdns")]
@@ -1874,23 +1871,22 @@ impl EndpointBuilder {
     /// Enables pubsub with the default gossipsub configuration.
     ///
     /// Builder-time opt-in (rather than a lazy `subscribe`-time enable)
-    /// because the selected engine's protocol ids must be in Identify's
-    /// advertised set from the first handshake.
+    /// because the gossipsub protocol ids must be in Identify's advertised
+    /// set from the first handshake.
     #[cfg(feature = "pubsub")]
     pub fn pubsub(mut self) -> Self {
-        self.pubsub_config.get_or_insert_with(PubsubConfig::default);
+        self.pubsub_config
+            .get_or_insert_with(GossipsubConfig::default);
         self
     }
 
-    /// Enables pubsub with an explicit gossipsub or floodsub configuration.
+    /// Enables pubsub with an explicit gossipsub configuration.
     ///
-    /// [`GossipsubConfig`] and [`FloodsubConfig`] both convert into
-    /// [`PubsubConfig`]. The selected engine determines which protocol ids
-    /// the endpoint advertises. Invalid gossipsub relationships or zero
-    /// bounds fail the later `bind_quic*` call before a socket is allocated.
+    /// Invalid mesh relationships or zero bounds fail the later `bind()`
+    /// before a socket is allocated.
     #[cfg(feature = "pubsub")]
-    pub fn pubsub_config(mut self, config: impl Into<PubsubConfig>) -> Self {
-        self.pubsub_config = Some(config.into());
+    pub fn pubsub_config(mut self, config: GossipsubConfig) -> Self {
+        self.pubsub_config = Some(config);
         self
     }
 
@@ -1901,7 +1897,8 @@ impl EndpointBuilder {
     /// subscription events are consumed before reaching the application.
     #[cfg(feature = "discovery")]
     pub fn discovery(mut self) -> Self {
-        self.pubsub_config.get_or_insert_with(PubsubConfig::default);
+        self.pubsub_config
+            .get_or_insert_with(GossipsubConfig::default);
         self.discovery_config = Some(BeaconConfig::default());
         self
     }
@@ -1915,7 +1912,8 @@ impl EndpointBuilder {
     #[cfg(feature = "discovery")]
     pub fn discovery_config(mut self, config: BeaconConfig) -> Result<Self, DiscoveryConfigError> {
         config.validate()?;
-        self.pubsub_config.get_or_insert_with(PubsubConfig::default);
+        self.pubsub_config
+            .get_or_insert_with(GossipsubConfig::default);
         self.discovery_config = Some(config);
         Ok(self)
     }
@@ -2280,11 +2278,10 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
         }
     }
     #[cfg(feature = "pubsub")]
-    if let Some(config) = &parts.pubsub_config {
-        // Pubsub streams route as ordinary user protocols, and the selected
-        // engine's ids must be advertised by Identify from the first
-        // handshake.
-        for id in config.protocol_ids() {
+    if parts.pubsub_config.is_some() {
+        // Pubsub streams route as ordinary user protocols, and the gossipsub
+        // ids must be advertised by Identify from the first handshake.
+        for id in minip2p_pubsub::GOSSIPSUB_PROTOCOL_IDS {
             if !protocols.iter().any(|existing| existing == id) {
                 protocols.push((*id).to_string());
             }
@@ -2372,7 +2369,7 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
                 .fold(initial_seqno ^ (timestamp >> 64) as u64, |seed, byte| {
                     seed.rotate_left(5) ^ u64::from(*byte)
                 });
-            let agent = minip2p_pubsub::PubsubAgent::new(
+            let agent = minip2p_pubsub::GossipsubAgent::new(
                 parts.keypair.clone(),
                 config,
                 initial_seqno,

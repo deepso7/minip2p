@@ -1,4 +1,4 @@
-//! Std endpoint wiring that pumps a sans-I/O [`PubsubAgent`] against the
+//! Std endpoint wiring that pumps a sans-I/O [`GossipsubAgent`] against the
 //! endpoint's swarm: clock sampling, action execution, and stream-event
 //! interception. Mirrors the endpoint's NAT driver.
 //!
@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use minip2p_pubsub::{PubsubAction, PubsubAgent, PubsubEvent};
+use minip2p_pubsub::{GossipsubAgent, PubsubAction, PubsubEvent};
 use minip2p_swarm::SwarmEvent;
 
 use crate::EndpointSwarm;
@@ -41,9 +41,9 @@ pub enum PubsubError {
     Driver(#[from] Error),
 }
 
-/// Drives the configured [`PubsubAgent`] against the endpoint's swarm.
+/// Drives the configured [`GossipsubAgent`] against the endpoint's swarm.
 pub(crate) struct PubsubDriver {
-    pub(crate) agent: PubsubAgent,
+    pub(crate) agent: GossipsubAgent,
     /// Pubsub events awaiting the application (drained via
     /// `Endpoint::take_pubsub_events` / `next_pubsub_event`).
     pub(crate) events: VecDeque<PubsubEvent>,
@@ -52,7 +52,7 @@ pub(crate) struct PubsubDriver {
 }
 
 impl PubsubDriver {
-    pub(crate) fn new(agent: PubsubAgent) -> Self {
+    pub(crate) fn new(agent: GossipsubAgent) -> Self {
         Self {
             agent,
             events: VecDeque::new(),

@@ -1,4 +1,4 @@
-//! Wire-level interop pin: a floodsub RPC frame captured byte-for-byte from
+//! Wire-level interop pin: a pubsub RPC frame captured byte-for-byte from
 //! go-libp2p-pubsub (StrictSign, Ed25519 identity) must decode and verify.
 //! See `testdata/README.md` for the pinned upstream versions and the capture
 //! harness.

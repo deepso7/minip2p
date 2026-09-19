@@ -1,4 +1,4 @@
-//! Wire codec for the libp2p pubsub RPC as spoken by floodsub and meshsub:
+//! Wire codec for the libp2p pubsub RPC as spoken by meshsub (gossipsub):
 //! protobuf encode/decode, varint-length-prefixed stream framing, and
 //! StrictSign message signing/verification.
 //!
@@ -21,14 +21,14 @@ use minip2p_core::{
 };
 use minip2p_identity::{Ed25519Keypair, PublicKey};
 
-/// Protocol id negotiated for floodsub RPC streams.
-pub const FLOODSUB_PROTOCOL_ID: &str = "/floodsub/1.0.0";
-
 /// Protocol id for gossipsub v1.0 RPC streams.
 pub const MESHSUB_PROTOCOL_ID_V10: &str = "/meshsub/1.0.0";
 
 /// Protocol id for gossipsub v1.1 RPC streams.
 pub const MESHSUB_PROTOCOL_ID_V11: &str = "/meshsub/1.1.0";
+
+/// Protocol ids gossipsub advertises, in preference order.
+pub const GOSSIPSUB_PROTOCOL_IDS: &[&str] = &[MESHSUB_PROTOCOL_ID_V11, MESHSUB_PROTOCOL_ID_V10];
 
 /// Maximum encoded RPC size accepted or produced (libp2p pubsub default).
 pub const MAX_RPC_SIZE: usize = 65536;
@@ -37,7 +37,7 @@ pub const MAX_RPC_SIZE: usize = 65536;
 pub const MAX_TOPIC_LEN: usize = 1024;
 
 /// Maximum accepted `seqno` length in bytes. Implementations disagree on
-/// the format (go: 8 big-endian bytes, rust-libp2p floodsub: 20 random
+/// the format (go: 8 big-endian bytes, rust-libp2p: 20 random
 /// bytes), so the seqno is treated as opaque; the cap bounds what the
 /// seen-cache stores per message id.
 pub(crate) const MAX_SEQNO_LEN: usize = 64;
@@ -373,7 +373,7 @@ impl RawMessage {
     /// - `from` must parse as a peer id; `seqno` must be 1..=64 bytes —
     ///   required even for unsigned messages, they form the dedup id.
     ///   Length varies by implementation (go emits 8 big-endian bytes,
-    ///   rust-libp2p floodsub 20 random bytes), so the seqno is opaque
+    ///   rust-libp2p 20 random bytes), so the seqno is opaque
     ///   bytes; the cap only bounds the seen-cache's per-id memory.
     /// - A present signature is always verified, `allow_unsigned` or not.
     /// - `key` without `signature` is invalid.
@@ -664,18 +664,6 @@ impl Rpc {
 
     /// Decodes an RPC body.
     pub fn decode(input: &[u8]) -> Result<Self, PubsubWireError> {
-        Self::decode_inner(input, true)
-    }
-
-    /// Decodes the floodsub fields of an RPC while treating meshsub control
-    /// as an opaque length-delimited extension. Floodsub never consumes
-    /// field 3, so parsing its nested lists would only allocate attacker-
-    /// controlled state that the router immediately discards.
-    pub(crate) fn decode_floodsub(input: &[u8]) -> Result<Self, PubsubWireError> {
-        Self::decode_inner(input, false)
-    }
-
-    fn decode_inner(input: &[u8], decode_control: bool) -> Result<Self, PubsubWireError> {
         let mut rpc = Self::default();
         let mut idx = 0;
         while let Some((field, wire_type)) = read_tag(input, &mut idx)? {
@@ -690,11 +678,9 @@ impl Rpc {
                 }
                 (3, WIRE_LEN) => {
                     let nested = read_len_delimited(input, &mut idx)?;
-                    if decode_control {
-                        rpc.control
-                            .get_or_insert_with(ControlMessage::default)
-                            .merge_from(nested)?;
-                    }
+                    rpc.control
+                        .get_or_insert_with(ControlMessage::default)
+                        .merge_from(nested)?;
                 }
                 (_, wire_type) => skip_field(input, &mut idx, wire_type)?,
             }
@@ -932,10 +918,8 @@ mod tests {
     }
 
     #[test]
-    fn floodsub_decode_skips_control_without_parsing_it() {
-        // The nested field-zero tag is malformed protobuf. The shared
-        // meshsub-aware decoder rejects it, while floodsub treats the whole
-        // control body as an opaque extension and still decodes later fields.
+    fn decode_rejects_malformed_control() {
+        // The nested field-zero tag is malformed protobuf.
         let mut encoded = Vec::new();
         encode_nested_field(&mut encoded, 3, &[0x00, 0x01]);
         encode_nested_field(
@@ -952,10 +936,6 @@ mod tests {
             Rpc::decode(&encoded),
             Err(PubsubWireError::InvalidFieldNumber { .. })
         ));
-        let floodsub = Rpc::decode_floodsub(&encoded).unwrap();
-        assert_eq!(floodsub.control, None);
-        assert_eq!(floodsub.subscriptions.len(), 1);
-        assert_eq!(floodsub.subscriptions[0].topic_id.as_deref(), Some("t"));
     }
 
     #[test]
@@ -1147,8 +1127,8 @@ mod tests {
         assert_eq!(seqno, 9u64.to_be_bytes().to_vec());
         assert!(!signed);
 
-        // Seqno length is implementation-defined: rust-libp2p floodsub
-        // emits 20 random bytes. Anything 1..=64 is accepted.
+        // Seqno length is implementation-defined: rust-libp2p emits 20
+        // random bytes. Anything 1..=64 is accepted.
         let mut rust_seqno = unsigned.clone();
         rust_seqno.seqno = Some(vec![7; 20]);
         rust_seqno.verify(true).expect("20-byte seqno verifies");
