@@ -7,7 +7,7 @@ minip2p remains caller-driven at every layer. The application chooses when to po
 
 ## Pick a driving method
 
-Use `Endpoint::wait` for the ADR 0007 Endpoint wait outcomes (event, deadline, or interrupted). Use focused waits such as `wait_path` and `wait_peer_ready` when you need a particular milestone during migration. Use `next_event` for legacy application loops, or `next_wake` when your loop also handles capability queues and interruptions. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
+Use `Endpoint::wait` for the ADR 0007 Endpoint wait outcomes (event, deadline, or interrupted). If NAT, pubsub, discovery, or relay-server is enabled, keep using `next_wake` until capability events join the stream (#177) — `wait` does not wake on capability progress. Use focused waits such as `wait_path` and `wait_peer_ready` when you need a particular milestone during migration. Use `next_event` for legacy application loops, or `next_wake` when your loop also handles capability queues and interruptions. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
 
 | Method | Behavior | Good fit |
 | --- | --- | --- |
@@ -55,7 +55,7 @@ With the `nat` feature, prefer `connect*` plus `wait_path` for the first usable 
 
 ## Application event loops
 
-Prefer `wait` and dispatch unrelated events while correlating an operation:
+Prefer `wait` and dispatch unrelated events while correlating an operation (for capability-enabled endpoints, prefer `next_wake` until #177):
 
 ```rust
 use std::time::{Duration, Instant};

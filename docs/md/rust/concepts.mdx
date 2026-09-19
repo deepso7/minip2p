@@ -9,7 +9,7 @@ An `Endpoint` is the main application API. Five ideas explain most code built on
 
 `Endpoint` owns an Ed25519 identity, the transports you bound, and the connection state. It is the app-facing entrypoint for listening, dialing, Ping, Identify, and application streams. QUIC is on by default; add the `tcp` feature to use QUIC and TCP together, or bind only TCP.
 
-An endpoint does not spawn a runtime. Prefer `Endpoint::wait` for the ordered Endpoint event stream (event, deadline, or interrupted). Focused waits such as `wait_path` and `wait_peer_ready`, plus `next_event` / `next_wake`, remain during migration. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. `poll()` is the non-blocking step for an existing reactor.
+An endpoint does not spawn a runtime. Prefer `Endpoint::wait` for the ordered Endpoint event stream (event, deadline, or interrupted). If NAT, pubsub, discovery, or relay-server is enabled, keep using `next_wake` until capability events join the stream (#177) — `wait` does not wake on capability progress. Focused waits such as `wait_path` and `wait_peer_ready`, plus `next_event` / `next_wake`, remain during migration. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. `poll()` is the non-blocking step for an existing reactor.
 
 ```mermaid
 flowchart TB
@@ -78,7 +78,7 @@ A Cargo feature makes a capability available. Enable it on `EndpointBuilder`; se
 
 ## Where events go
 
-Ordinary connection, Identify, Ping, and application stream events leave through the Endpoint event stream: `Endpoint::wait`, `poll`, or the migration-era `next_event`. Prefer `wait` for new code — it returns an event, deadline, or interruption without swallowing interrupts, and does not use the old driver-progress wake.
+Ordinary connection, Identify, Ping, and application stream events leave through the Endpoint event stream: `Endpoint::wait`, `poll`, or the migration-era `next_event`. Prefer `wait` for new code — it returns an event, deadline, or interruption without swallowing interrupts, and does not use the old driver-progress wake. If NAT, pubsub, discovery, or relay-server is enabled, keep using `next_wake` until #177 — `wait` does not wake on capability progress.
 
 Enabled capabilities still expose their own event queues until a later ticket folds them into the stream:
 

@@ -214,8 +214,11 @@ pub type EndpointSwarm = Swarm<EndpointTransport>;
 /// and [`Endpoint::swarm_mut`].
 ///
 /// Prefer [`Endpoint::wait`] for the ordered Endpoint event stream (ADR 0007):
-/// it returns an event, deadline, or interruption. State snapshot getters such
-/// as [`Endpoint::connected_peers`] and [`Endpoint::listen_addresses`] expose
+/// it returns an event, deadline, or interruption. If NAT, pubsub, discovery,
+/// or relay-server is enabled, keep using [`Endpoint::next_wake`] until
+/// capability events join the stream (#177) — `wait` does not wake on
+/// capability progress. State snapshot getters such as
+/// [`Endpoint::connected_peers`] and [`Endpoint::listen_addresses`] expose
 /// durable state without driving. Focused waits and `next_wake` remain during
 /// migration.
 ///
@@ -621,8 +624,10 @@ impl Endpoint {
     /// This is the ADR 0007 blocking wait: deadline and interruption remain
     /// visible, and driver-progress is not part of the outcome. Capability
     /// queues stay on their focused `take_*` / `next_*` APIs until a later
-    /// ticket. Existing [`Self::next_event`], [`Self::next_wake`], and focused
-    /// waits remain available during migration.
+    /// ticket — if NAT, pubsub, discovery, or relay-server is enabled, keep
+    /// using [`Self::next_wake`] until #177, because `wait` does not wake on
+    /// capability progress. Existing [`Self::next_event`], [`Self::next_wake`],
+    /// and focused waits remain available during migration.
     ///
     /// # Examples
     ///
@@ -705,7 +710,9 @@ impl Endpoint {
     /// Returns the next ordinary application event, waiting until `deadline`.
     ///
     /// Prefer [`Self::wait`] for new code: it surfaces interruption and matches
-    /// the ADR 0007 Endpoint wait outcomes. Use focused waits such as
+    /// the ADR 0007 Endpoint wait outcomes. If NAT, pubsub, discovery, or
+    /// relay-server is enabled, keep using [`Self::next_wake`] until #177 —
+    /// `wait` does not wake on capability progress. Use focused waits such as
     /// [`Self::wait_path`] and [`Self::wait_peer_ready`] when you need a
     /// particular milestone. Use `next_event` for a synchronous application
     /// event loop, or [`Self::next_wake`] when the loop also handles capability
