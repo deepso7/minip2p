@@ -643,14 +643,17 @@ impl Endpoint {
     /// an interruption.
     ///
     /// This is the single Endpoint blocking wait: deadline and interruption
-    /// remain visible, and driver-progress is not part of the outcome. If the
-    /// absolute deadline has already passed, this returns
+    /// remain visible, and driver-progress is not part of the outcome. If an
+    /// absolute [`std::time::Instant`] deadline has already passed, this returns
     /// [`EndpointWaitOutcome::Deadline`] before delivering another queued
-    /// event. Capability queues stay on their focused `take_*` / `next_*` APIs
-    /// until a later ticket — if NAT, pubsub, discovery, or relay-server is
-    /// enabled, keep using [`Self::next_wake`] until #177, because `wait` does
-    /// not wake on capability progress. Existing [`Self::next_event`],
-    /// [`Self::next_wake`], and focused waits remain available during migration.
+    /// event. Relative [`std::time::Duration`] deadlines (including
+    /// [`std::time::Duration::ZERO`] non-blocking drains) still inspect buffered
+    /// events and poll once. Capability queues stay on their focused `take_*` /
+    /// `next_*` APIs until a later ticket — if NAT, pubsub, discovery, or
+    /// relay-server is enabled, keep using [`Self::next_wake`] until #177,
+    /// because `wait` does not wake on capability progress. Existing
+    /// [`Self::next_event`], [`Self::next_wake`], and focused waits remain
+    /// available during migration.
     ///
     /// # Examples
     ///
@@ -696,7 +699,8 @@ impl Endpoint {
     pub fn wait(&mut self, deadline: impl Into<Deadline>) -> Result<EndpointWaitOutcome, Error> {
         let deadline = deadline.into();
         // Absolute Instant already past: Deadline wins over queued events.
-        if deadline.has_passed() {
+        // Relative Duration::ZERO still drains / polls once.
+        if deadline.prefers_deadline_over_queued() {
             return Ok(EndpointWaitOutcome::Deadline);
         }
         #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
@@ -744,8 +748,10 @@ impl Endpoint {
     /// [`std::time::Duration`], or [`Deadline::NEVER`] to wait indefinitely.
     ///
     /// Unlike [`Self::wait`], this method swallows interruption and retries.
-    /// Like `wait`, an already-passed absolute deadline returns `None` before
-    /// delivering another queued event.
+    /// Like `wait`, an already-passed absolute [`std::time::Instant`] returns
+    /// `None` before delivering another queued event. Relative
+    /// [`std::time::Duration`] deadlines (including [`std::time::Duration::ZERO`]) still
+    /// drain queued events and poll once.
     pub fn next_event(&mut self, deadline: impl Into<Deadline>) -> Result<Option<Event>, Error> {
         let deadline = deadline.into();
         loop {
@@ -773,12 +779,14 @@ impl Endpoint {
     /// such queue non-empty makes subsequent calls return immediately and can
     /// busy-spin a caller that expected the supplied deadline to block.
     ///
-    /// Like [`Self::wait`], an already-passed absolute deadline returns
-    /// [`EndpointWake::Deadline`] before delivering another queued event or
-    /// driver-progress wake.
+    /// Like [`Self::wait`], an already-passed absolute [`std::time::Instant`]
+    /// returns [`EndpointWake::Deadline`] before delivering another queued
+    /// event or driver-progress wake. Relative [`std::time::Duration`]
+    /// deadlines (including [`std::time::Duration::ZERO`]) still drain queued work and
+    /// poll once.
     pub fn next_wake(&mut self, deadline: impl Into<Deadline>) -> Result<EndpointWake, Error> {
         let deadline = deadline.into();
-        if deadline.has_passed() {
+        if deadline.prefers_deadline_over_queued() {
             return Ok(EndpointWake::Deadline);
         }
         #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
@@ -3155,6 +3163,30 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "nat")]
+    #[test]
+    fn wait_with_duration_zero_still_drains_queued_events() {
+        let mut endpoint = Endpoint::builder()
+            .nat_config(NatConfig::default())
+            .bind_quic("127.0.0.1:0")
+            .expect("bind loopback endpoint");
+        let peer = Ed25519Keypair::generate().peer_id();
+        endpoint.pending_events.push_back(Event::ConnectionClosed {
+            peer_id: peer.clone(),
+            conn_id: ConnectionId::new(1),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
+        });
+        assert!(matches!(
+            endpoint.wait(Duration::ZERO).expect("zero-duration drain"),
+            EndpointWaitOutcome::Event(Event::ConnectionClosed { peer_id, .. })
+                if peer_id == peer
+        ));
+        assert!(
+            endpoint.pending_events.is_empty(),
+            "Duration::ZERO must drain queued events"
+        );
+    }
+
     #[test]
     fn wait_reports_interrupt_without_swallowing_it() {
         let mut endpoint = Endpoint::builder()
@@ -3737,7 +3769,7 @@ mod tests {
         );
         assert!(matches!(
             endpoint
-                .next_event(Duration::from_millis(50))
+                .next_event(Duration::ZERO)
                 .expect("drain buffered event"),
             Some(Event::ConnectionClosed { peer_id, .. }) if peer_id == unrelated
         ));
@@ -3909,9 +3941,7 @@ mod tests {
                 .is_none()
         );
         assert!(matches!(
-            endpoint
-                .next_event(Duration::from_millis(50))
-                .expect("buffered event"),
+            endpoint.next_event(Duration::ZERO).expect("buffered event"),
             Some(Event::ConnectionClosed { peer_id, .. }) if peer_id == unrelated
         ));
 
@@ -3926,9 +3956,7 @@ mod tests {
                 detail: "test diagnostic".into(),
             }));
         assert!(matches!(
-            endpoint
-                .next_wake(Duration::from_millis(50))
-                .expect("queue wake"),
+            endpoint.next_wake(Duration::ZERO).expect("queue wake"),
             EndpointWake::DriverProgress
         ));
         assert_eq!(endpoint.take_relay_server_events().len(), 1);

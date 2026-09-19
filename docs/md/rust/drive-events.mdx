@@ -32,7 +32,7 @@ let absolute = Instant::now() + Duration::from_secs(5);
 let forever = Deadline::NEVER;
 ```
 
-An already-passed absolute deadline returns `Deadline` from `wait` / `next_wake` (or `None` from `next_event`) before delivering another queued event. The endpoint does not sleep or poll repeatedly past the deadline.
+An already-passed absolute `Instant` deadline returns `Deadline` from `wait` / `next_wake` (or `None` from `next_event`) before delivering another queued event. Relative `Duration` deadlines — including `Duration::ZERO` non-blocking drains — still inspect buffered events and poll once. The endpoint does not sleep or poll repeatedly past the deadline.
 
 ## Wait for a milestone
 

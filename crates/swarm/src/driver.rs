@@ -51,6 +51,11 @@ pub const RUN_UNTIL_SKIP_LIMIT: usize = 1024;
 /// - a [`Duration`] -- relative timeout from now,
 /// - [`Deadline::NEVER`] -- wait indefinitely.
 ///
+/// Absolute [`Instant`] deadlines and relative [`Duration`] deadlines that have
+/// already expired behave differently at the Endpoint boundary: an already-past
+/// Instant returns Deadline before delivering queued events, while a relative
+/// zero-duration call still polls once / drains what is already ready.
+///
 /// # Not [`minip2p_platform::Deadline`]
 ///
 /// The two are deliberately distinct despite the shared name. This one is how
@@ -61,17 +66,36 @@ pub const RUN_UNTIL_SKIP_LIMIT: usize = 1024;
 /// monotonic timeline of the samples the driver hands out, and is what
 /// [`Transport::next_deadline`] reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Deadline(Option<Instant>);
+pub struct Deadline {
+    at: Option<Instant>,
+    /// `true` when constructed from an absolute [`Instant`]. Past absolute
+    /// deadlines skip queued events at the Endpoint wait boundary; relative
+    /// [`Duration`] deadlines (including [`Duration::ZERO`]) still poll once.
+    absolute: bool,
+}
 
 impl Deadline {
     /// Wait indefinitely; the call returns only when an event arrives (or,
     /// for `run_until`, when the predicate matches).
-    pub const NEVER: Deadline = Deadline(None);
+    pub const NEVER: Deadline = Deadline {
+        at: None,
+        absolute: false,
+    };
 
     /// Whether the deadline has already passed. [`Deadline::NEVER`] never
     /// passes.
     pub fn has_passed(self) -> bool {
         self.is_expired_at(Instant::now())
+    }
+
+    /// Whether an Endpoint wait should return Deadline before delivering
+    /// another queued event.
+    ///
+    /// Only absolute [`Instant`] deadlines do this. Relative [`Duration`]
+    /// deadlines — including [`Duration::ZERO`] non-blocking drains — still
+    /// inspect buffered events and poll once.
+    pub fn prefers_deadline_over_queued(self) -> bool {
+        self.absolute && self.has_passed()
     }
 
     /// The earlier of two deadlines ([`Deadline::NEVER`] is latest).
@@ -80,27 +104,50 @@ impl Deadline {
     /// to the deadline's internals, mirroring how [`Swarm::poll_next`]
     /// folds the core's protocol timers into its budget.
     pub fn earliest(self, other: Deadline) -> Deadline {
-        match (self.0, other.0) {
-            (Some(a), Some(b)) => Deadline(Some(a.min(b))),
-            (a, b) => Deadline(a.or(b)),
+        match (self.at, other.at) {
+            (Some(a), Some(b)) => {
+                if a <= b {
+                    Deadline {
+                        at: Some(a),
+                        absolute: self.absolute,
+                    }
+                } else {
+                    Deadline {
+                        at: Some(b),
+                        absolute: other.absolute,
+                    }
+                }
+            }
+            (Some(a), None) => Deadline {
+                at: Some(a),
+                absolute: self.absolute,
+            },
+            (None, Some(b)) => Deadline {
+                at: Some(b),
+                absolute: other.absolute,
+            },
+            (None, None) => Deadline::NEVER,
         }
     }
 
     /// Whether the deadline has passed at `now`.
     fn is_expired_at(self, now: Instant) -> bool {
-        self.0.is_some_and(|deadline| now >= deadline)
+        self.at.is_some_and(|deadline| now >= deadline)
     }
 
     /// Time left from `now`; `None` means unbounded.
     fn remaining_at(self, now: Instant) -> Option<Duration> {
-        self.0
+        self.at
             .map(|deadline| deadline.saturating_duration_since(now))
     }
 }
 
 impl From<Instant> for Deadline {
     fn from(instant: Instant) -> Self {
-        Deadline(Some(instant))
+        Deadline {
+            at: Some(instant),
+            absolute: true,
+        }
     }
 }
 
@@ -108,7 +155,10 @@ impl From<Duration> for Deadline {
     /// Relative timeout starting now. A duration too large for `Instant`
     /// arithmetic means [`Deadline::NEVER`].
     fn from(timeout: Duration) -> Self {
-        Deadline(Instant::now().checked_add(timeout))
+        Deadline {
+            at: Instant::now().checked_add(timeout),
+            absolute: false,
+        }
     }
 }
 
@@ -1108,6 +1158,12 @@ mod tests {
         // An Instant behaves as an absolute deadline.
         let past = Deadline::from(Instant::now());
         assert!(past.is_expired_at(Instant::now() + Duration::from_millis(1)));
+        assert!(past.prefers_deadline_over_queued());
+
+        // Relative Duration::ZERO is already expired but still drains/polls once.
+        let zero = Deadline::from(Duration::ZERO);
+        assert!(zero.has_passed());
+        assert!(!zero.prefers_deadline_over_queued());
     }
 
     #[test]
