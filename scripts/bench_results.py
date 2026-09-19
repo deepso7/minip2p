@@ -20,6 +20,7 @@ EXPECTED_CRITERION = {
     "yamux/64KiB/session_send_and_drain", "yamux/64KiB/session_receive_and_drain",
     "peer_book_128_peers_16_addrs/tick_active", "peer_book_128_peers_16_addrs/tick_expire",
     "peer_book_128_peers_16_addrs/next_timeout",
+    "pubsub/gossipsub_publish_32x60KiB",
     "relay_handle_event_same_now_128_pending_hops",
     "quic/idle_poll/1", "quic/idle_poll/64", "quic/idle_poll/256", "quic/idle_poll/512",
     "tcp/readiness_poll/1", "tcp/readiness_poll/64", "tcp/readiness_poll/256", "tcp/readiness_poll/512",
@@ -36,6 +37,7 @@ GUNGRAUN_NAMES = {
     "tick_active": "peer_book_128_peers_16_addrs/tick_active",
     "tick_expire": "peer_book_128_peers_16_addrs/tick_expire",
     "next_timeout": "peer_book_128_peers_16_addrs/next_timeout",
+    "gossipsub_publish_32x60_kib": "pubsub/gossipsub_publish_32x60KiB",
     "relay_handle_event_same_now_128_pending_hops": "relay_handle_event_same_now_128_pending_hops",
 }
 EXPECTED_VITEST = {"sdk_drain_flood", "raw_drain_events", "connected_peers_sync"}

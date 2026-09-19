@@ -1403,6 +1403,8 @@ dependencies = [
 name = "minip2p-pubsub"
 version = "0.5.4"
 dependencies = [
+ "criterion",
+ "gungraun",
  "minip2p-core",
  "minip2p-identity",
  "minip2p-swarm",
