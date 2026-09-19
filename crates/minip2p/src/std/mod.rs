@@ -3344,8 +3344,8 @@ mod tests {
     fn quic_host_mix_tries_next_candidate_when_first_cannot_bind() {
         use std::net::UdpSocket;
 
-        // Occupy the first complementary IPv4 candidate; the mix path must try
-        // the later one instead of failing on DNS order.
+        // Occupy the first complementary IPv4 candidate; production grouping
+        // must try the later one instead of failing on DNS order.
         let occupied = UdpSocket::bind("127.0.0.1:0").expect("occupy");
         let busy_port = occupied.local_addr().expect("busy addr").port();
         let free = UdpSocket::bind("127.0.0.1:0").expect("reserve free");
@@ -3361,22 +3361,9 @@ mod tests {
         let candidates = quic_host_port_complementary_candidates(resolved, &existing);
         assert_eq!(candidates.len(), 2, "{candidates:?}");
 
-        let config = QuicNodeConfig::generate();
-        let mut last_error = None;
-        let mut bound = None;
-        for host_addr in &candidates {
-            match QuicEndpoint::bind_dual_multiaddr(config.clone(), host_addr, &ipv6) {
-                Ok(transport) => {
-                    bound = Some(transport);
-                    break;
-                }
-                Err(error) => last_error = Some(error),
-            }
-        }
-        assert!(
-            bound.is_some(),
-            "expected a later candidate to bind, last error: {last_error:?}"
-        );
+        let transport = try_bind_quic_grouped(QuicNodeConfig::generate(), &[&ipv6], &[candidates])
+            .expect("later complementary candidate should bind");
+        assert_eq!(transport.namespaces().len(), 2);
         let _keep = occupied;
     }
 
