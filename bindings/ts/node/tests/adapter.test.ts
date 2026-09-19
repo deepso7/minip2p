@@ -359,7 +359,7 @@ describe("Node adapter", () => {
         secretKey: new Uint8Array(32),
         transports: { quic: true },
       })
-    ).toThrow(/not both/);
+    ).toThrow(/not both/u);
   });
 
   test("returns no discovery clock when the native option is null", () => {

@@ -201,6 +201,6 @@ describe("React Native connection identities", () => {
         secretKey: new Uint8Array(32),
         transports: { quic: true },
       })
-    ).toThrow(/not both/);
+    ).toThrow(/not both/u);
   });
 });

@@ -1583,9 +1583,20 @@ enum ListenRequest {
 /// Default dual-stack QUIC listen addresses used by
 /// [`EndpointBuilder::listen_default`].
 #[cfg(feature = "quic")]
-const DEFAULT_LISTEN_QUIC_V4: &str = "/ip4/0.0.0.0/udp/0/quic-v1";
-#[cfg(feature = "quic")]
-const DEFAULT_LISTEN_QUIC_V6: &str = "/ip6/::/udp/0/quic-v1";
+fn default_listen_quic_addrs() -> [Multiaddr; 2] {
+    [
+        Multiaddr::from_protocols(vec![
+            Protocol::Ip4([0, 0, 0, 0]),
+            Protocol::Udp(0),
+            Protocol::QuicV1,
+        ]),
+        Multiaddr::from_protocols(vec![
+            Protocol::Ip6([0; 16]),
+            Protocol::Udp(0),
+            Protocol::QuicV1,
+        ]),
+    ]
+}
 
 /// Builder for [`Endpoint`].
 pub struct EndpointBuilder {
@@ -1782,9 +1793,7 @@ impl EndpointBuilder {
     #[cfg(feature = "quic")]
     pub fn quic_dual_stack(self) -> Result<Self, Error> {
         let mut builder = self;
-        for default in [DEFAULT_LISTEN_QUIC_V4, DEFAULT_LISTEN_QUIC_V6] {
-            // Const strings; parse failure would be a crate bug.
-            let addr = Multiaddr::from_str(default).expect("default QUIC listen");
+        for addr in default_listen_quic_addrs() {
             builder = builder.listen_on_multiaddr(&addr)?;
         }
         Ok(builder)
