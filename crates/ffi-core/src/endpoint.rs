@@ -56,7 +56,7 @@ fn configure_transports(
 
     if let Some(options) = quic {
         match options.listen_addrs {
-            None => builder = builder.quic_dual_stack(),
+            None => builder = builder.quic_dual_stack().map_err(map_listen_error)?,
             Some(addresses) => {
                 if addresses.is_empty() {
                     return Err(empty_transport_list("QUIC"));

@@ -208,10 +208,13 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
 }
 
 /** Factory for `vi.mock("../src/native", nativeModuleMock)`. */
-export const nativeModuleMock = () => ({
-  FfiError_Tags: {},
-  P2pEndpoint: FakeNativeEndpoint,
-  circuitAddress: vi.fn(),
-  generateSecretKey: vi.fn(),
-  peerIdFromSecretKey: vi.fn(),
-});
+export const nativeModuleMock = async () => {
+  const { FfiError_Tags } = await import("../src/generated/minip2p_ffi");
+  return {
+    FfiError_Tags,
+    P2pEndpoint: FakeNativeEndpoint,
+    circuitAddress: vi.fn(),
+    generateSecretKey: vi.fn(),
+    peerIdFromSecretKey: vi.fn(),
+  };
+};

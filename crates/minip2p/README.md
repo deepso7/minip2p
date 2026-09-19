@@ -14,7 +14,7 @@ This crate provides the existing batteries-included std `Endpoint` and a caller-
 let mut endpoint = minip2p::Endpoint::builder()
     .agent_version("my-app/0.1.0")
     .protocol("/myapp/1.0.0")
-    .listen_default()
+    .listen_default()?
     .bind()?;
 
 for address in endpoint.listen_all()? {

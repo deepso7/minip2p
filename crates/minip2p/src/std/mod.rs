@@ -1737,8 +1737,11 @@ impl EndpointBuilder {
 
     /// Configures the common dual-stack QUIC defaults
     /// (`/ip4/0.0.0.0/udp/0/quic-v1` and `/ip6/::/udp/0/quic-v1`).
+    ///
+    /// Returns [`Error`] if the builder already has a QUIC listen for either
+    /// family (same duplicate-family rule as [`Self::listen_on`]).
     #[cfg(feature = "quic")]
-    pub fn listen_default(self) -> Self {
+    pub fn listen_default(self) -> Result<Self, Error> {
         self.quic_dual_stack()
     }
 
@@ -1773,16 +1776,18 @@ impl EndpointBuilder {
     }
 
     /// Adds separate IPv4 and IPv6 wildcard QUIC sockets.
+    ///
+    /// Returns [`Error`] if either default collides with an existing QUIC
+    /// listen for that IP family.
     #[cfg(feature = "quic")]
-    pub fn quic_dual_stack(self) -> Self {
+    pub fn quic_dual_stack(self) -> Result<Self, Error> {
         let mut builder = self;
         for default in [DEFAULT_LISTEN_QUIC_V4, DEFAULT_LISTEN_QUIC_V6] {
+            // Const strings; parse failure would be a crate bug.
             let addr = Multiaddr::from_str(default).expect("default QUIC listen");
-            builder = builder
-                .listen_on_multiaddr(&addr)
-                .expect("default QUIC listen");
+            builder = builder.listen_on_multiaddr(&addr)?;
         }
-        builder
+        Ok(builder)
     }
 
     /// Adds a TCP listener bound to `bind_addr`, e.g. `"0.0.0.0:4001"`.
@@ -2049,7 +2054,7 @@ impl EndpointBuilder {
     /// Builds an endpoint with separate IPv4 and IPv6 wildcard QUIC sockets.
     #[cfg(feature = "quic")]
     pub fn bind_quic_dual_stack(self) -> Result<Endpoint, Error> {
-        self.quic_dual_stack().bind()
+        self.quic_dual_stack()?.bind()
     }
 
     /// Builds an endpoint with a TCP transport listening on `bind_addr`.
@@ -3002,6 +3007,7 @@ mod tests {
     fn listen_default_binds_dual_stack_quic() {
         let mut endpoint = Endpoint::builder()
             .listen_default()
+            .expect("default listen")
             .bind()
             .expect("default dual-stack");
         let addrs = endpoint.listen_all().expect("listen_all");
@@ -3025,6 +3031,26 @@ mod tests {
         assert!(
             has_v4 && has_v6,
             "default listen binds IPv4 and IPv6: {addrs:?}"
+        );
+    }
+
+    #[test]
+    fn listen_default_rejects_duplicate_quic_family() {
+        let ipv4 = "/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("ipv4");
+        let Err(error) = Endpoint::builder()
+            .listen_on_multiaddr(&ipv4)
+            .expect("listen ipv4")
+            .listen_default()
+        else {
+            panic!("listen_default after IPv4 QUIC must return InvalidConfig");
+        };
+        assert!(
+            matches!(
+                &error,
+                Error::Transport(TransportError::InvalidConfig { reason })
+                    if reason.contains("IPv4")
+            ),
+            "{error}"
         );
     }
 

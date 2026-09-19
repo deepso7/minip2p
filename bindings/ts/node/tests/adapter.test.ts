@@ -352,6 +352,16 @@ describe("Node adapter", () => {
     endpoint.close();
   });
 
+  test("rejects listen mixed with transports", () => {
+    expect(() =>
+      Minip2p.create({
+        listen: ["/ip4/127.0.0.1/udp/0/quic-v1"],
+        secretKey: new Uint8Array(32),
+        transports: { quic: true },
+      })
+    ).toThrow(/not both/);
+  });
+
   test("returns no discovery clock when the native option is null", () => {
     const endpoint = createEndpoint();
 
