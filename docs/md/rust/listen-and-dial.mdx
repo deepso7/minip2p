@@ -11,12 +11,12 @@ Prefer address-shaped listening: pass complete multiaddresses to `listen` (or `l
 
 | Method | Use it when |
 | --- | --- |
-| `.listen("/ip4/…/udp/…/quic-v1")?.bind()` | Configuration already uses complete multiaddresses. |
+| `.listen_on("/ip4/…/udp/…/quic-v1")?.bind()` | Configuration already uses complete multiaddresses. |
 | `.listen_default().bind()` | Common dual-stack QUIC wildcards. |
 | `bind_quic("127.0.0.1:0")` | Legacy one-socket helper (still supported). |
 | `bind_quic_dual_stack()` | Legacy dual-stack QUIC helper (still supported). |
 | `bind_tcp("0.0.0.0:0")` | Legacy TCP helper (`tcp` feature). |
-| `.listen(quic)?.listen(tcp)?.bind()` | One endpoint that speaks both. |
+| `.listen_on(quic)?.listen_on(tcp)?.bind()` | One endpoint that speaks both. |
 
 Port `0` asks the operating system to pick a free UDP or TCP port.
 
@@ -47,8 +47,8 @@ To listen on both QUIC and TCP:
 
 ```rust
 let mut node = Endpoint::builder()
-    .listen("/ip4/0.0.0.0/udp/4001/quic-v1")?
-    .listen("/ip4/0.0.0.0/tcp/4001")?
+    .listen_on("/ip4/0.0.0.0/udp/4001/quic-v1")?
+    .listen_on("/ip4/0.0.0.0/tcp/4001")?
     .bind()?;
 ```
 

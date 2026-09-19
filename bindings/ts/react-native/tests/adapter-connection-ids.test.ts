@@ -175,4 +175,22 @@ describe("React Native connection identities", () => {
     expect(peers).toEqual([PEER]);
     endpoint.close();
   });
+
+  test("passes address-shaped listen to the native endpoint", () => {
+    const listen = [
+      "/ip4/127.0.0.1/udp/0/quic-v1",
+      "/ip4/127.0.0.1/tcp/0",
+    ] as const;
+    const endpoint = Minip2p.create({
+      listen,
+      secretKey: new Uint8Array(32),
+    });
+    const fake = FakeNativeEndpoint.current();
+    expect(fake.config).toMatchObject({
+      listen: [...listen],
+      quic: undefined,
+      tcp: undefined,
+    });
+    endpoint.close();
+  });
 });

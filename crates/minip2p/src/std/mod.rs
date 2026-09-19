@@ -9,7 +9,7 @@
 //! # Transports
 //!
 //! Prefer address-shaped listening: pass complete multiaddresses to
-//! [`EndpointBuilder::listen`] (or [`EndpointBuilder::listen_default`] for
+//! [`EndpointBuilder::listen_on`] (or [`EndpointBuilder::listen_default`] for
 //! dual-stack QUIC) and call [`EndpointBuilder::bind`]. The builder infers
 //! QUIC vs TCP from each address and groups compatible IPv4/IPv6 listeners
 //! onto one transport per shape.
@@ -1568,17 +1568,12 @@ fn mdns_seed(keypair: &Ed25519Keypair) -> [u8; 32] {
     seed
 }
 
-/// One listen request held until bind validates and groups transports.
+/// One listen request held until bind groups transports.
 #[cfg(any(feature = "quic", feature = "tcp"))]
 enum ListenRequest {
     /// Address-shaped listen; transport inferred from the multiaddr.
+    /// Validated when pushed via [`EndpointBuilder::listen_on`].
     Multiaddr(Multiaddr),
-    /// Legacy QUIC multiaddr that must keep the QUIC shape.
-    #[cfg(feature = "quic")]
-    QuicMultiaddr(Multiaddr),
-    /// Legacy TCP multiaddr that must keep the TCP shape.
-    #[cfg(feature = "tcp")]
-    TcpMultiaddr(Multiaddr),
     #[cfg(feature = "quic")]
     QuicHostPort(String),
     #[cfg(feature = "tcp")]
@@ -1719,8 +1714,11 @@ impl EndpointBuilder {
     /// shapes are accepted. Compatible addresses are grouped at
     /// [`EndpointBuilder::bind`]; unsupported or contradictory shapes fail
     /// here with an actionable error.
+    ///
+    /// Named `listen_on` to avoid colliding with [`Endpoint::listen`], which
+    /// returns the first bound address after bind.
     #[cfg(any(feature = "quic", feature = "tcp"))]
-    pub fn listen(mut self, address: impl AsRef<str>) -> Result<Self, Error> {
+    pub fn listen_on(mut self, address: impl AsRef<str>) -> Result<Self, Error> {
         let raw = address.as_ref();
         let parsed = Multiaddr::from_str(raw).map_err(|error| TransportError::InvalidAddress {
             context: "listen address",
@@ -1732,7 +1730,7 @@ impl EndpointBuilder {
 
     /// Adds a listener from an already-parsed transport multiaddress.
     #[cfg(any(feature = "quic", feature = "tcp"))]
-    pub fn listen_multiaddr(mut self, address: &Multiaddr) -> Result<Self, Error> {
+    pub fn listen_on_multiaddr(mut self, address: &Multiaddr) -> Result<Self, Error> {
         self.push_listen_addr(address.clone())?;
         Ok(self)
     }
@@ -1746,7 +1744,7 @@ impl EndpointBuilder {
 
     /// Adds a QUIC socket bound to `bind_addr`, e.g. `"0.0.0.0:4001"`.
     ///
-    /// Prefer [`EndpointBuilder::listen`] with a complete multiaddress when
+    /// Prefer [`EndpointBuilder::listen_on`] with a complete multiaddress when
     /// configuration already speaks multiaddrs.
     #[cfg(feature = "quic")]
     pub fn quic(mut self, bind_addr: impl Into<String>) -> Self {
@@ -1757,20 +1755,21 @@ impl EndpointBuilder {
 
     /// Adds a QUIC socket bound to a `/ip4|ip6/udp/<port>/quic-v1` multiaddr.
     #[cfg(feature = "quic")]
-    pub fn quic_multiaddr(mut self, addr: &Multiaddr) -> Self {
-        self.listen_requests
-            .push(ListenRequest::QuicMultiaddr(addr.clone()));
-        self
+    pub fn quic_multiaddr(self, addr: &Multiaddr) -> Result<Self, Error> {
+        if !addr.is_quic_transport() {
+            return Err(TransportError::InvalidAddress {
+                context: "quic bind address",
+                reason: format!("`{addr}` is not a /udp/.../quic-v1 transport address"),
+            }
+            .into());
+        }
+        self.listen_on_multiaddr(addr)
     }
 
     /// Adds one dual QUIC member bound to exact IPv4 and IPv6 multiaddresses.
     #[cfg(feature = "quic")]
-    pub fn quic_dual_multiaddr(mut self, first: &Multiaddr, second: &Multiaddr) -> Self {
-        self.listen_requests
-            .push(ListenRequest::QuicMultiaddr(first.clone()));
-        self.listen_requests
-            .push(ListenRequest::QuicMultiaddr(second.clone()));
-        self
+    pub fn quic_dual_multiaddr(self, first: &Multiaddr, second: &Multiaddr) -> Result<Self, Error> {
+        self.quic_multiaddr(first)?.quic_multiaddr(second)
     }
 
     /// Adds separate IPv4 and IPv6 wildcard QUIC sockets.
@@ -1780,7 +1779,7 @@ impl EndpointBuilder {
         for default in [DEFAULT_LISTEN_QUIC_V4, DEFAULT_LISTEN_QUIC_V6] {
             let addr = Multiaddr::from_str(default).expect("default QUIC listen");
             builder = builder
-                .listen_multiaddr(&addr)
+                .listen_on_multiaddr(&addr)
                 .expect("default QUIC listen");
         }
         builder
@@ -1799,10 +1798,15 @@ impl EndpointBuilder {
 
     /// Adds a TCP listener bound to a `/ip4|ip6/tcp/<port>` multiaddr.
     #[cfg(feature = "tcp")]
-    pub fn tcp_multiaddr(mut self, addr: &Multiaddr) -> Self {
-        self.listen_requests
-            .push(ListenRequest::TcpMultiaddr(addr.clone()));
-        self
+    pub fn tcp_multiaddr(self, addr: &Multiaddr) -> Result<Self, Error> {
+        if !addr.is_tcp_transport() {
+            return Err(TransportError::InvalidAddress {
+                context: "tcp bind address",
+                reason: format!("`{addr}` is not a /tcp transport address"),
+            }
+            .into());
+        }
+        self.listen_on_multiaddr(addr)
     }
 
     #[cfg(any(feature = "quic", feature = "tcp"))]
@@ -1817,16 +1821,13 @@ impl EndpointBuilder {
         Ok(())
     }
 
-    /// Best-effort already-resolved multiaddrs for early QUIC duplicate checks.
+    /// Already-pushed multiaddrs for early QUIC duplicate checks.
     #[cfg(feature = "quic")]
     fn resolved_listen_multiaddrs(&self) -> Vec<Multiaddr> {
         self.listen_requests
             .iter()
             .filter_map(|request| match request {
                 ListenRequest::Multiaddr(address) => Some(address.clone()),
-                ListenRequest::QuicMultiaddr(address) => Some(address.clone()),
-                #[cfg(feature = "tcp")]
-                ListenRequest::TcpMultiaddr(address) => Some(address.clone()),
                 ListenRequest::QuicHostPort(_) => None,
                 #[cfg(feature = "tcp")]
                 ListenRequest::TcpHostPort(_) => None,
@@ -2042,7 +2043,7 @@ impl EndpointBuilder {
     /// Builds an endpoint with a QUIC transport bound to a QUIC multiaddr.
     #[cfg(feature = "quic")]
     pub fn bind_quic_multiaddr(self, addr: &Multiaddr) -> Result<Endpoint, Error> {
-        self.quic_multiaddr(addr).bind()
+        self.quic_multiaddr(addr)?.bind()
     }
 
     /// Builds an endpoint with separate IPv4 and IPv6 wildcard QUIC sockets.
@@ -2289,44 +2290,17 @@ fn collect_listen_addrs(parts: &BuilderParts) -> Result<Vec<Multiaddr>, Error> {
     for request in &parts.listen_requests {
         match request {
             ListenRequest::Multiaddr(address) => {
-                // Validated at listen()/listen_multiaddr time.
-                addrs.push(address.clone());
-            }
-            #[cfg(feature = "quic")]
-            ListenRequest::QuicMultiaddr(address) => {
-                if !address.is_quic_transport() {
-                    return Err(TransportError::InvalidAddress {
-                        context: "quic bind address",
-                        reason: format!("`{address}` is not a /udp/.../quic-v1 transport address"),
-                    }
-                    .into());
-                }
-                validate_listen_multiaddr(address)?;
-                reject_duplicate_quic_family(&addrs, address)?;
-                addrs.push(address.clone());
-            }
-            #[cfg(feature = "tcp")]
-            ListenRequest::TcpMultiaddr(address) => {
-                if !address.is_tcp_transport() {
-                    return Err(TransportError::InvalidAddress {
-                        context: "tcp bind address",
-                        reason: format!("`{address}` is not a /tcp transport address"),
-                    }
-                    .into());
-                }
-                validate_listen_multiaddr(address)?;
+                // Validated at listen_on / quic_multiaddr / tcp_multiaddr time.
                 addrs.push(address.clone());
             }
             #[cfg(feature = "quic")]
             ListenRequest::QuicHostPort(_) => {
-                // Legacy host:port is one UDP socket. Expanding every A/AAAA
-                // here rejects a second same-family record as InvalidConfig and
-                // turns dual-stack names into two sockets. Bound later via
-                // QuicEndpoint::bind(spec) so UdpSocket can try candidates.
+                // Bound later via QuicEndpoint::bind(spec) — one UDP socket.
             }
             #[cfg(feature = "tcp")]
             ListenRequest::TcpHostPort(spec) => {
                 for address in tcp_bind_addrs(spec)? {
+                    // Host:port is not validated at push; resolve here.
                     validate_listen_multiaddr(&address)?;
                     addrs.push(address);
                 }
@@ -2388,8 +2362,8 @@ fn bind_transports(_parts: &BuilderParts) -> Result<TransportSet, Error> {
             .listen_requests
             .iter()
             .find_map(|request| match request {
-                ListenRequest::QuicHostPort(_) | ListenRequest::QuicMultiaddr(_) => Some(true),
-                ListenRequest::TcpHostPort(_) | ListenRequest::TcpMultiaddr(_) => Some(false),
+                ListenRequest::QuicHostPort(_) => Some(true),
+                ListenRequest::TcpHostPort(_) => Some(false),
                 ListenRequest::Multiaddr(address) if address.is_quic_transport() => Some(true),
                 ListenRequest::Multiaddr(address) if address.is_tcp_transport() => Some(false),
                 ListenRequest::Multiaddr(_) => None,
@@ -2897,7 +2871,7 @@ mod tests {
     #[test]
     fn listen_configures_a_quic_multiaddr() {
         let mut endpoint = Endpoint::builder()
-            .listen("/ip4/127.0.0.1/udp/0/quic-v1")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
             .expect("listen accepts QUIC")
             .bind()
             .expect("bind");
@@ -2920,7 +2894,7 @@ mod tests {
     #[test]
     fn listen_configures_a_tcp_multiaddr() {
         let mut endpoint = Endpoint::builder()
-            .listen("/ip4/127.0.0.1/tcp/0")
+            .listen_on("/ip4/127.0.0.1/tcp/0")
             .expect("listen accepts TCP")
             .bind()
             .expect("bind");
@@ -2938,9 +2912,9 @@ mod tests {
     #[test]
     fn listen_groups_ipv4_and_ipv6_quic_without_duplicating_transports() {
         let mut endpoint = Endpoint::builder()
-            .listen("/ip4/127.0.0.1/udp/0/quic-v1")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
             .expect("ipv4")
-            .listen("/ip6/::1/udp/0/quic-v1")
+            .listen_on("/ip6/::1/udp/0/quic-v1")
             .expect("ipv6")
             .bind()
             .expect("bind dual");
@@ -2962,9 +2936,9 @@ mod tests {
     #[test]
     fn listen_composes_quic_and_tcp() {
         let mut endpoint = Endpoint::builder()
-            .listen("/ip4/127.0.0.1/udp/0/quic-v1")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
             .expect("quic")
-            .listen("/ip4/127.0.0.1/tcp/0")
+            .listen_on("/ip4/127.0.0.1/tcp/0")
             .expect("tcp")
             .bind()
             .expect("bind both");
@@ -2981,7 +2955,7 @@ mod tests {
 
     #[test]
     fn listen_rejects_unsupported_and_contradictory_shapes() {
-        let Err(dns) = Endpoint::builder().listen("/dns/example.com/udp/0/quic-v1") else {
+        let Err(dns) = Endpoint::builder().listen_on("/dns/example.com/udp/0/quic-v1") else {
             panic!("DNS listen must fail");
         };
         assert!(
@@ -2993,7 +2967,8 @@ mod tests {
             "{dns}"
         );
 
-        let Err(circuit) = Endpoint::builder().listen("/ip4/127.0.0.1/udp/0/quic-v1/p2p-circuit")
+        let Err(circuit) =
+            Endpoint::builder().listen_on("/ip4/127.0.0.1/udp/0/quic-v1/p2p-circuit")
         else {
             panic!("circuit listen must fail");
         };
@@ -3007,9 +2982,9 @@ mod tests {
         );
 
         let Err(duplicate) = Endpoint::builder()
-            .listen("/ip4/127.0.0.1/udp/0/quic-v1")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
             .expect("first")
-            .listen("/ip4/0.0.0.0/udp/0/quic-v1")
+            .listen_on("/ip4/0.0.0.0/udp/0/quic-v1")
         else {
             panic!("duplicate IPv4 QUIC must fail");
         };
@@ -3030,9 +3005,10 @@ mod tests {
             .bind()
             .expect("default dual-stack");
         let addrs = endpoint.listen_all().expect("listen_all");
-        assert!(
-            !addrs.is_empty(),
-            "dual-stack default should bind at least one family: {addrs:?}"
+        assert_eq!(
+            addrs.len(),
+            2,
+            "dual-stack default binds both families: {addrs:?}"
         );
         assert!(
             addrs
@@ -3047,14 +3023,9 @@ mod tests {
             .iter()
             .any(|addr| addr.transport().to_string().contains("/ip6/"));
         assert!(
-            has_v4 || has_v6,
-            "default listen must bind a concrete IP family: {addrs:?}"
+            has_v4 && has_v6,
+            "default listen binds IPv4 and IPv6: {addrs:?}"
         );
-        // On dual-stack hosts both wildcards bind; on IPv4-only CI at least one
-        // family is present. When both succeed, that is the intended default.
-        if has_v4 && has_v6 {
-            assert_eq!(addrs.len(), 2, "{addrs:?}");
-        }
     }
 
     #[test]
@@ -3092,6 +3063,7 @@ mod tests {
         let Err(error) = Endpoint::builder()
             .quic("127.0.0.1:0")
             .quic_multiaddr(&ipv6)
+            .expect("quic multiaddr shape")
             .bind()
         else {
             panic!("host:port must not combine with quic multiaddr");
@@ -3346,6 +3318,7 @@ mod tests {
     fn a_tcp_multiaddr_binds_and_a_wrong_shape_is_refused() {
         let mut endpoint = Endpoint::builder()
             .tcp_multiaddr(&"/ip4/127.0.0.1/tcp/0".parse().expect("address"))
+            .expect("tcp multiaddr")
             .bind()
             .expect("bind by multiaddr");
         let addrs = endpoint.listen_all().expect("listen");
@@ -3358,7 +3331,6 @@ mod tests {
         // reporting, not a socket worth guessing at.
         let Err(error) = Endpoint::builder()
             .tcp_multiaddr(&"/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("address"))
-            .bind()
         else {
             panic!("a /udp address is not a tcp bind address");
         };

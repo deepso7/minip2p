@@ -42,7 +42,7 @@ fn configure_transports(
                     detail: format!("invalid listen address `{address}`: {error}"),
                 })?;
             builder = builder
-                .listen_multiaddr(&parsed)
+                .listen_on_multiaddr(&parsed)
                 .map_err(map_listen_error)?;
         }
         return Ok(builder);
@@ -67,7 +67,7 @@ fn configure_transports(
                         return Err(wrong_transport("QUIC", &address));
                     }
                     builder = builder
-                        .listen_multiaddr(&address)
+                        .listen_on_multiaddr(&address)
                         .map_err(map_listen_error)?;
                 }
             }
@@ -86,7 +86,7 @@ fn configure_transports(
             if !address.is_tcp_transport() {
                 return Err(wrong_transport("TCP", &address));
             }
-            builder = builder.tcp_multiaddr(&address);
+            builder = builder.tcp_multiaddr(&address).map_err(map_listen_error)?;
         }
     }
 

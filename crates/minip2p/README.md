@@ -23,7 +23,7 @@ for address in endpoint.listen_all()? {
 # Ok::<(), minip2p::Error>(())
 ```
 
-Prefer [`EndpointBuilder::listen`] with complete multiaddresses when configuration already speaks multiaddrs; `listen_default` is dual-stack QUIC. Legacy `bind_quic*` / `bind_tcp` helpers remain until contraction.
+Prefer [`EndpointBuilder::listen_on`] with complete multiaddresses when configuration already speaks multiaddrs; `listen_default` is dual-stack QUIC. Legacy `bind_quic*` / `bind_tcp` helpers remain until contraction.
 
 ## Portable endpoint
 
@@ -105,7 +105,7 @@ An endpoint brings up whatever you asked it to listen on, then routes by address
 
 ```rust
 let mut endpoint = minip2p::Endpoint::builder()
-    .listen("/ip4/0.0.0.0/udp/4001/quic-v1")?
+    .listen_on("/ip4/0.0.0.0/udp/4001/quic-v1")?
     .bind()?;
 # Ok::<(), minip2p::Error>(())
 ```
