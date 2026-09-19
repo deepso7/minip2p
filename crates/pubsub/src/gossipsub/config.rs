@@ -3,7 +3,7 @@
 /// Invalid gossipsub configuration.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("invalid gossipsub config field `{field}`: {reason}")]
-pub struct PubsubConfigError {
+pub struct GossipsubConfigError {
     /// Name of the invalid field.
     pub field: &'static str,
     /// Actionable description of the violated constraint.
@@ -93,7 +93,7 @@ impl Default for GossipsubConfig {
 
 impl GossipsubConfig {
     /// Validates relationships and non-zero bounds without normalizing.
-    pub fn validate(&self) -> Result<(), PubsubConfigError> {
+    pub fn validate(&self) -> Result<(), GossipsubConfigError> {
         if self.d_low == 0 || self.d_low > self.d {
             return invalid("d_low", "must be in 1..=d");
         }
@@ -138,7 +138,7 @@ impl GossipsubConfig {
     }
 }
 
-fn nonzero<T>(value: T, field: &'static str) -> Result<(), PubsubConfigError>
+fn nonzero<T>(value: T, field: &'static str) -> Result<(), GossipsubConfigError>
 where
     T: Default + PartialEq,
 {
@@ -149,8 +149,8 @@ where
     }
 }
 
-fn invalid<T>(field: &'static str, reason: &'static str) -> Result<T, PubsubConfigError> {
-    Err(PubsubConfigError { field, reason })
+fn invalid<T>(field: &'static str, reason: &'static str) -> Result<T, GossipsubConfigError> {
+    Err(GossipsubConfigError { field, reason })
 }
 
 #[cfg(test)]

@@ -206,8 +206,8 @@ describe("@minip2p/node", () => {
   test("drains a native event flood without losing messages", async () => {
     const deadline = Date.now() + 25_000;
     const topic = "node-event-flood";
-    const a = createFloodEndpoint();
-    const b = createFloodEndpoint();
+    const a = createPubsubEndpoint();
+    const b = createPubsubEndpoint();
     let received = 0;
     b.on("message", () => {
       received += 1;
@@ -252,9 +252,8 @@ describe("@minip2p/node", () => {
   }, 30_000);
 });
 
-function createFloodEndpoint(): nodeSdk.Minip2p {
+function createPubsubEndpoint(): nodeSdk.Minip2p {
   return nodeSdk.Minip2p.create({
-    pubsubRouter: coreSdk.PubsubRouter.Floodsub,
     secretKey: nodeSdk.generateSecretKey(),
     transports: {
       quic: { listen: ["/ip4/127.0.0.1/udp/0/quic-v1"] },

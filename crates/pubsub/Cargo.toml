@@ -1,6 +1,6 @@
 [package]
 name = "minip2p-pubsub"
-description = "Bounded Sans-I/O libp2p gossipsub and floodsub"
+description = "Bounded Sans-I/O libp2p gossipsub"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -37,9 +37,10 @@ criterion = "0.8.2"
 gungraun = "=0.19.4"
 
 [[bench]]
-name = "fanout"
+name = "publish"
 harness = false
 
 [[bench]]
-name = "fanout_ir"
+name = "publish_ir"
 harness = false
+

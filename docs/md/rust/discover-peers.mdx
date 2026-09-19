@@ -116,7 +116,7 @@ Discovery beacons are always required to be signed. Unsigned discovery beacons a
 
 <Callout type="note">
 
-minip2p owns the discovery topic. Manually subscribing is redundant, and its pubsub messages are consumed before reaching application pubsub events. Calling `unsubscribe` for that topic returns `PubsubError::DiscoveryTopicReserved`.
+minip2p owns the discovery topic. Manually subscribing is redundant, and its pubsub messages are consumed before reaching application pubsub events. Calling `unsubscribe` for that topic returns `GossipsubError::DiscoveryTopicReserved`.
 
 </Callout>
 

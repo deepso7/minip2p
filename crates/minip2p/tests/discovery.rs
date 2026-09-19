@@ -5,8 +5,8 @@
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BeaconConfig, DiscoveryEvent, Endpoint, Event, GossipsubConfig, PeerDiscoveryConfig,
-    PubsubEvent,
+    BeaconConfig, DiscoveryEvent, Endpoint, Event, GossipsubConfig, GossipsubEvent,
+    PeerDiscoveryConfig,
 };
 
 const DISCOVERY_TOPIC: &str = "/minip2p/test/loopback-discovery";
@@ -31,7 +31,7 @@ fn discovery_endpoint() -> Endpoint {
 
 fn slow_heartbeat_discovery_endpoint() -> Endpoint {
     Endpoint::builder()
-        .pubsub_config(GossipsubConfig {
+        .gossipsub_config(GossipsubConfig {
             heartbeat_interval_ms: 60_000,
             ..GossipsubConfig::default()
         })
@@ -51,14 +51,14 @@ fn slow_heartbeat_discovery_endpoint() -> Endpoint {
         .expect("bind loopback endpoint")
 }
 
-fn assert_no_discovery_pubsub(events: Vec<PubsubEvent>) {
+fn assert_no_discovery_gossipsub(events: Vec<GossipsubEvent>) {
     for event in events {
         let leaked = match &event {
-            PubsubEvent::Message { topics, .. } => {
+            GossipsubEvent::Message { topics, .. } => {
                 topics.iter().any(|topic| topic == DISCOVERY_TOPIC)
             }
-            PubsubEvent::PeerSubscribed { topic, .. }
-            | PubsubEvent::PeerUnsubscribed { topic, .. } => topic == DISCOVERY_TOPIC,
+            GossipsubEvent::PeerSubscribed { topic, .. }
+            | GossipsubEvent::PeerUnsubscribed { topic, .. } => topic == DISCOVERY_TOPIC,
             _ => false,
         };
         assert!(!leaked, "discovery pubsub event leaked: {event:?}");
@@ -82,8 +82,8 @@ fn beacons_do_not_leak_to_the_application() {
         assert!(Instant::now() < deadline, "discovery timed out");
         let _ = a.next_event(Duration::from_millis(20)).expect("a drives");
         let _ = b.next_event(Duration::from_millis(20)).expect("b drives");
-        assert_no_discovery_pubsub(a.take_pubsub_events());
-        assert_no_discovery_pubsub(b.take_pubsub_events());
+        assert_no_discovery_gossipsub(a.take_gossipsub_events());
+        assert_no_discovery_gossipsub(b.take_gossipsub_events());
     }
 
     let a_seen_by_b = b
@@ -98,8 +98,8 @@ fn beacons_do_not_leak_to_the_application() {
         .expect("a knows b");
     assert!(a_seen_by_b.addrs.contains(a_addr.transport()));
     assert!(b_seen_by_a.addrs.contains(b_addr.transport()));
-    assert_no_discovery_pubsub(a.take_pubsub_events());
-    assert_no_discovery_pubsub(b.take_pubsub_events());
+    assert_no_discovery_gossipsub(a.take_gossipsub_events());
+    assert_no_discovery_gossipsub(b.take_gossipsub_events());
 }
 
 #[test]
@@ -133,9 +133,9 @@ fn star_beacons_relay_before_the_first_gossipsub_heartbeat() {
 
     assert_eq!(a.connected_peers(), vec![hub_peer.clone()]);
     assert_eq!(b.connected_peers(), vec![hub_peer]);
-    assert_no_discovery_pubsub(hub.take_pubsub_events());
-    assert_no_discovery_pubsub(a.take_pubsub_events());
-    assert_no_discovery_pubsub(b.take_pubsub_events());
+    assert_no_discovery_gossipsub(hub.take_gossipsub_events());
+    assert_no_discovery_gossipsub(a.take_gossipsub_events());
+    assert_no_discovery_gossipsub(b.take_gossipsub_events());
 }
 
 #[test]

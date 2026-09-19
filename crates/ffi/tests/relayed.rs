@@ -88,7 +88,6 @@ fn endpoint(seed: u8, relay: String) -> Arc<P2pEndpoint> {
             tcp: None,
             force_relay: true,
             allow_unsigned: false,
-            pubsub_router: minip2p_ffi::PubsubRouter::Gossipsub,
             protocols: Vec::new(),
             discovery: None,
             mdns: None,

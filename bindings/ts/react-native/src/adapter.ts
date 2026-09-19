@@ -5,7 +5,6 @@ import {
   MessageTooLargeError,
   Minip2pBase,
   NotPermittedError,
-  PubsubRouter,
 } from "@minip2p/core";
 import type {
   Bytes,
@@ -387,8 +386,6 @@ function toNativeConfig(config: Minip2pConfig): NativeEndpointConfig {
     forceRelay: config.forceRelay ?? false,
     mdns,
     protocols: [...(config.protocols ?? [])],
-    pubsubRouter: (config.pubsubRouter ??
-      PubsubRouter.Gossipsub) as NativeEndpointConfig["pubsubRouter"],
     quic: toNativeTransport(transports.quic),
     relays: [...(config.relays ?? [])],
     tcp: toNativeTransport(transports.tcp),

@@ -38,13 +38,6 @@ export interface Minip2pMdnsOptions {
   readonly autoDial?: boolean;
 }
 
-/** Available pubsub routing strategies. */
-export const PubsubRouter = {
-  Floodsub: 1,
-  Gossipsub: 0,
-} as const;
-export type PubsubRouter = (typeof PubsubRouter)[keyof typeof PubsubRouter];
-
 /** Coarse local reachability states. */
 export const Reachability = {
   Private: 2,
@@ -125,8 +118,6 @@ export interface Minip2pConfig {
   readonly forceRelay?: boolean;
   /** Accepts unsigned pubsub messages. */
   readonly allowUnsigned?: boolean;
-  /** Pubsub router to enable. */
-  readonly pubsubRouter?: PubsubRouter;
   /** Application protocol IDs accepted on inbound streams. */
   readonly protocols?: readonly string[];
   /** Signed-beacon discovery configuration. */
@@ -252,8 +243,14 @@ export interface Minip2pNamedEventMap {
   };
   peerSubscribed: { readonly peerId: string; readonly topic: string };
   peerUnsubscribed: { readonly peerId: string; readonly topic: string };
-  pubsubOutboundFailure: { readonly peerId: string; readonly reason: string };
-  pubsubProtocolViolation: { readonly peerId: string; readonly reason: string };
+  gossipsubOutboundFailure: {
+    readonly peerId: string;
+    readonly reason: string;
+  };
+  gossipsubProtocolViolation: {
+    readonly peerId: string;
+    readonly reason: string;
+  };
   peerDiscovered: {
     readonly peerId: string;
     readonly addrs: readonly string[];
@@ -365,6 +362,8 @@ export const P2pEvent_Tags = {
   EndpointError: "EndpointError",
   EventsDropped: "EventsDropped",
   FellBackToRelay: "FellBackToRelay",
+  GossipsubOutboundFailure: "GossipsubOutboundFailure",
+  GossipsubProtocolViolation: "GossipsubProtocolViolation",
   HolePunchFailed: "HolePunchFailed",
   IdentifyReceived: "IdentifyReceived",
   InboundDirectUpgrade: "InboundDirectUpgrade",
@@ -381,8 +380,6 @@ export const P2pEvent_Tags = {
   PingRttMeasured: "PingRttMeasured",
   PingTimeout: "PingTimeout",
   PublicAddressesChanged: "PublicAddressesChanged",
-  PubsubOutboundFailure: "PubsubOutboundFailure",
-  PubsubProtocolViolation: "PubsubProtocolViolation",
   ReachabilityChanged: "ReachabilityChanged",
   RelayReservationLost: "RelayReservationLost",
   RelayReserved: "RelayReserved",
@@ -499,12 +496,12 @@ export type P2pEvent =
       Minip2pNamedEventMap["peerUnsubscribed"]
     >
   | RawEvent<
-      typeof P2pEvent_Tags.PubsubOutboundFailure,
-      Minip2pNamedEventMap["pubsubOutboundFailure"]
+      typeof P2pEvent_Tags.GossipsubOutboundFailure,
+      Minip2pNamedEventMap["gossipsubOutboundFailure"]
     >
   | RawEvent<
-      typeof P2pEvent_Tags.PubsubProtocolViolation,
-      Minip2pNamedEventMap["pubsubProtocolViolation"]
+      typeof P2pEvent_Tags.GossipsubProtocolViolation,
+      Minip2pNamedEventMap["gossipsubProtocolViolation"]
     >
   | RawEvent<
       typeof P2pEvent_Tags.PeerDiscovered,

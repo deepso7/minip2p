@@ -1,8 +1,8 @@
 //! Binding-agnostic event model and upstream event conversion.
 
 use minip2p::{
-    DiscoveryEvent, DiscoverySource as UpstreamDiscoverySource, Event, IdentifyMessage, Multiaddr,
-    NatError, NatEvent, Path, PubsubEvent, ReachabilityState,
+    DiscoveryEvent, DiscoverySource as UpstreamDiscoverySource, Event, GossipsubEvent,
+    IdentifyMessage, Multiaddr, NatError, NatEvent, Path, ReachabilityState,
 };
 use minip2p_swarm::SwarmErrorKind;
 
@@ -343,15 +343,15 @@ pub enum P2pEvent {
         /// Unsubscribed topic.
         topic: String,
     },
-    /// Pubsub outbound work was discarded.
-    PubsubOutboundFailure {
+    /// Gossipsub outbound work was discarded.
+    GossipsubOutboundFailure {
         /// Destination peer.
         peer_id: String,
         /// Human-readable failure detail.
         reason: String,
     },
-    /// A peer violated the pubsub protocol.
-    PubsubProtocolViolation {
+    /// A peer violated the gossipsub protocol.
+    GossipsubProtocolViolation {
         /// Offending peer.
         peer_id: String,
         /// Human-readable violation detail.
@@ -583,9 +583,9 @@ pub(crate) fn convert_nat(event: NatEvent) -> P2pEvent {
     }
 }
 
-pub(crate) fn convert_pubsub(event: PubsubEvent) -> P2pEvent {
+pub(crate) fn convert_gossipsub(event: GossipsubEvent) -> P2pEvent {
     match event {
-        PubsubEvent::Message {
+        GossipsubEvent::Message {
             from,
             topics,
             data,
@@ -598,22 +598,24 @@ pub(crate) fn convert_pubsub(event: PubsubEvent) -> P2pEvent {
             seqno,
             signed,
         },
-        PubsubEvent::PeerSubscribed { peer, topic } => P2pEvent::PeerSubscribed {
+        GossipsubEvent::PeerSubscribed { peer, topic } => P2pEvent::PeerSubscribed {
             peer_id: peer.to_base58(),
             topic,
         },
-        PubsubEvent::PeerUnsubscribed { peer, topic } => P2pEvent::PeerUnsubscribed {
+        GossipsubEvent::PeerUnsubscribed { peer, topic } => P2pEvent::PeerUnsubscribed {
             peer_id: peer.to_base58(),
             topic,
         },
-        PubsubEvent::OutboundFailure { peer, reason } => P2pEvent::PubsubOutboundFailure {
+        GossipsubEvent::OutboundFailure { peer, reason } => P2pEvent::GossipsubOutboundFailure {
             peer_id: peer.to_base58(),
             reason,
         },
-        PubsubEvent::ProtocolViolation { peer, reason } => P2pEvent::PubsubProtocolViolation {
-            peer_id: peer.to_base58(),
-            reason,
-        },
+        GossipsubEvent::ProtocolViolation { peer, reason } => {
+            P2pEvent::GossipsubProtocolViolation {
+                peer_id: peer.to_base58(),
+                reason,
+            }
+        }
     }
 }
 
@@ -805,7 +807,7 @@ mod tests {
     #[test]
     fn pubsub_message_conversion_preserves_binary_fields() {
         let remote = peer(5);
-        let event = convert_pubsub(PubsubEvent::Message {
+        let event = convert_gossipsub(GossipsubEvent::Message {
             from: remote.clone(),
             topics: vec!["room".into()],
             data: vec![1, 2],

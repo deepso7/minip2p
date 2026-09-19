@@ -44,7 +44,7 @@ For an embedded TCP endpoint, enable `smoltcp` with default features disabled an
 cargo add minip2p-rs --no-default-features --features smoltcp,pubsub
 ```
 
-The portable smoltcp builder can compose TCP, pubsub, signed-beacon discovery, and mDNS into one endpoint. Build one `SmoltcpStack` from the device and configured interface, then select the services needed by the application. TCP and portable mDNS are supplied by `smoltcp`; the separate `pubsub` feature enables `.pubsub()` and signed `.discovery()`, which itself implies pubsub at runtime:
+The portable smoltcp builder can compose TCP, pubsub, signed-beacon discovery, and mDNS into one endpoint. Build one `SmoltcpStack` from the device and configured interface, then select the services needed by the application. TCP and portable mDNS are supplied by `smoltcp`; the separate `pubsub` feature enables `.gossipsub()` and signed `.discovery()`, which itself implies pubsub at runtime:
 
 ```rust,ignore
 let mut endpoint = Endpoint::portable(&identity, entropy)
@@ -56,7 +56,7 @@ let mut endpoint = Endpoint::portable(&identity, entropy)
     .build()?;
 ```
 
-Use `tcp_config`, `smoltcp_config`, `mdns_config`, `mdns_carrier_config`, `pubsub_config`, `beacon_config`, and `discovery_config` only when overriding defaults. The endpoint installs every adapter on the same stack, returns TCP, pubsub, and discovery progress through one `SmoltcpEvent` enum, and automatically dials newly observed peers. `poll(now)` advances all enabled services and `next_deadline(now)` folds their timelines. Manual provider composition remains available through `build(transport)`.
+Use `tcp_config`, `smoltcp_config`, `mdns_config`, `mdns_carrier_config`, `gossipsub_config`, `beacon_config`, and `discovery_config` only when overriding defaults. The endpoint installs every adapter on the same stack, returns TCP, pubsub, and discovery progress through one `SmoltcpEvent` enum, and automatically dials newly observed peers. `poll(now)` advances all enabled services and `next_deadline(now)` folds their timelines. Manual provider composition remains available through `build(transport)`.
 
 Portable AutoNAT is opt-in, and does not pull circuit transport state into an AutoNAT-only binary. Enable `portable-autonat`, configure one or more trusted servers, and read the latest verdict from the same caller-driven endpoint:
 
@@ -151,6 +151,6 @@ With the `mdns` feature, `.mdns()` enables zero-configuration local-link discove
 
 Discovery source timestamps use a driver-private monotonic epoch. Compute their ages from `Endpoint::discovery_now_ms()`; an independently created `Instant` does not share that origin.
 
-With the `pubsub` feature, `.pubsub()` enables gossipsub by default and advertises `/meshsub/1.1.0` plus `/meshsub/1.0.0`. Pass a `GossipsubConfig` to tune mesh policy, or `.pubsub_config(FloodsubConfig::default())` to select the legacy floodsub engine and advertise only `/floodsub/1.0.0`. This is a pre-1.0 API/default change: `pubsub_config` now accepts either engine through `PubsubConfig`, and gossipsub peers intentionally do not negotiate floodsub streams.
+With the `pubsub` feature, `.gossipsub()` enables gossipsub and advertises `/meshsub/1.1.0` plus `/meshsub/1.0.0`. Pass a `GossipsubConfig` to `.gossipsub_config(...)` to tune mesh policy; an invalid configuration fails `bind()` before any socket is allocated.
 
 Built-in protocol ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see `minip2p::RESERVED_PROTOCOL_IDS`) belong to the endpoint's own handlers; registering one via `EndpointBuilder::protocol` makes the `bind_quic*` step fail, and `Endpoint::add_protocol` rejects it with `SwarmError::ReservedProtocol`.

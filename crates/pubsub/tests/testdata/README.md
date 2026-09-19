@@ -1,6 +1,6 @@
 # Golden interop fixtures
 
-`go_signed_message_rpc.hex` is a varint-length-prefixed floodsub RPC frame captured byte-for-byte off the wire from go-libp2p-pubsub — see `golden-go/main.go` for the capture harness (`go mod tidy && go run .`).
+`go_signed_message_rpc.hex` is a varint-length-prefixed pubsub RPC frame captured byte-for-byte off the wire from go-libp2p-pubsub — see `golden-go/main.go` for the capture harness (`go mod tidy && go run .`). The harness captures on go's floodsub router because it publishes without mesh setup; the RPC and StrictSign message encoding it pins is the same one meshsub carries.
 
 Pinned versions (recorded in `golden-go/go.mod`):
 

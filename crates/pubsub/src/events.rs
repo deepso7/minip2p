@@ -13,7 +13,7 @@ use minip2p_transport::StreamId;
 
 /// Correlates an outbound open or write with its agent result echo.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct PubsubToken(pub(crate) u64);
+pub struct GossipsubToken(pub(crate) u64);
 
 /// Immutable framed RPC bytes shared by every recipient of one publish.
 ///
@@ -23,16 +23,16 @@ pub(crate) type SharedFrame = Shared<[u8]>;
 
 /// I/O the driver must perform on the agent's behalf.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PubsubAction {
+pub enum GossipsubAction {
     /// Call `Swarm::open_stream(&peer, &protocol_id)` and echo the result
     /// back via `stream_open_result(&peer, token, ..)` — both fields of
     /// this action, returned as-is.
     OpenStream {
         /// Token identifying this open in the result echo.
-        token: PubsubToken,
+        token: GossipsubToken,
         /// The peer to open toward.
         peer: PeerId,
-        /// Engine-selected protocol id: floodsub or a meshsub version.
+        /// Negotiated meshsub protocol id.
         protocol_id: String,
     },
     /// Call `Swarm::send_stream(&peer, stream_id, data)` and synchronously
@@ -40,7 +40,7 @@ pub enum PubsubAction {
     SendStream {
         /// Token the host echoes through `send_result` after attempting the
         /// synchronous write.
-        token: PubsubToken,
+        token: GossipsubToken,
         /// The stream's peer.
         peer: PeerId,
         /// The stream to write to.
@@ -66,7 +66,7 @@ pub enum PubsubAction {
 
 /// Application-facing pubsub events.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PubsubEvent {
+pub enum GossipsubEvent {
     /// A verified, non-duplicate message on a topic we subscribe to.
     Message {
         /// The publisher (not necessarily the peer it arrived from).
@@ -127,10 +127,6 @@ pub enum TopicError {
     /// Topics are bounded by [`MAX_TOPIC_LEN`](crate::MAX_TOPIC_LEN) bytes.
     #[error("topic exceeds the maximum length")]
     TooLong,
-    /// Floodsub only: adding this topic would make its single-frame encoded
-    /// subscription snapshot exceed half of [`MAX_RPC_SIZE`](crate::MAX_RPC_SIZE).
-    #[error("the subscription set would no longer fit in one RPC")]
-    SetTooLarge,
 }
 
 /// Why a publish was refused.

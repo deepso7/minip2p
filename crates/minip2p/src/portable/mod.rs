@@ -30,7 +30,7 @@ pub use minip2p_nat::{
 };
 #[cfg(all(feature = "pubsub", not(feature = "std")))]
 pub use minip2p_pubsub::{
-    FloodsubConfig, GossipsubConfig, PublishError, PubsubConfig, PubsubConfigError, PubsubEvent,
+    GOSSIPSUB_PROTOCOL_IDS, GossipsubConfig, GossipsubConfigError, GossipsubEvent, PublishError,
     TopicError,
 };
 #[cfg(feature = "smoltcp")]
@@ -621,7 +621,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
             listens: Vec::new(),
             mdns: None,
             #[cfg(feature = "pubsub")]
-            pubsub: None,
+            gossipsub: None,
             #[cfg(feature = "pubsub")]
             beacon: None,
             #[cfg(feature = "portable-autonat")]
@@ -650,7 +650,7 @@ pub struct SmoltcpEndpointBuilder<D: smoltcp::phy::Device, E: EntropySource> {
     listens: Vec<String>,
     mdns: Option<EmbeddedMdnsConfig>,
     #[cfg(feature = "pubsub")]
-    pubsub: Option<PubsubConfig>,
+    gossipsub: Option<GossipsubConfig>,
     #[cfg(feature = "pubsub")]
     beacon: Option<BeaconConfig>,
     #[cfg(feature = "portable-autonat")]
@@ -674,9 +674,9 @@ pub struct SmoltcpEndpoint<D: smoltcp::phy::Device, E: EntropySource> {
     endpoint: PortableEndpoint<SmoltcpComposedTransport<D, E>, SharedEntropy<E>>,
     mdns: Option<minip2p_mdns::MdnsDriver<SmoltcpMdnsIo<D>>>,
     #[cfg(feature = "pubsub")]
-    pubsub: Option<minip2p_pubsub::PubsubAgent>,
+    gossipsub: Option<minip2p_pubsub::GossipsubAgent>,
     #[cfg(feature = "pubsub")]
-    pending_pubsub_events: VecDeque<PubsubEvent>,
+    pending_gossipsub_events: VecDeque<GossipsubEvent>,
     #[cfg(feature = "pubsub")]
     beacon: Option<minip2p_discovery::BeaconAgent>,
     #[cfg(feature = "portable-autonat")]
@@ -693,7 +693,7 @@ pub enum SmoltcpEvent {
     Endpoint(SwarmEvent),
     /// Application-visible pubsub progress.
     #[cfg(feature = "pubsub")]
-    Pubsub(PubsubEvent),
+    Gossipsub(GossipsubEvent),
     /// Relay reservation, circuit-path, or reachability progress.
     #[cfg(feature = "portable-autonat")]
     Nat(minip2p_nat::NatEvent),
@@ -769,28 +769,34 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
 
     /// Subscribes to an application topic.
     #[cfg(feature = "pubsub")]
-    pub fn subscribe(&mut self, topic: &str, now: Now) -> Result<bool, SmoltcpPubsubError> {
-        let agent = self.pubsub.as_mut().ok_or(SmoltcpPubsubError::NotEnabled)?;
+    pub fn subscribe(&mut self, topic: &str, now: Now) -> Result<bool, SmoltcpGossipsubError> {
+        let agent = self
+            .gossipsub
+            .as_mut()
+            .ok_or(SmoltcpGossipsubError::NotEnabled)?;
         let subscribed = agent.subscribe(topic, now.monotonic_ms)?;
         pump_embedded_pubsub(agent, &mut self.endpoint, now);
-        collect_embedded_pubsub_events(agent, &mut self.pending_pubsub_events);
+        collect_embedded_pubsub_events(agent, &mut self.pending_gossipsub_events);
         Ok(subscribed)
     }
 
     /// Withdraws an application topic subscription.
     #[cfg(feature = "pubsub")]
-    pub fn unsubscribe(&mut self, topic: &str, now: Now) -> Result<bool, SmoltcpPubsubError> {
+    pub fn unsubscribe(&mut self, topic: &str, now: Now) -> Result<bool, SmoltcpGossipsubError> {
         if self
             .beacon
             .as_ref()
             .is_some_and(|beacon| beacon.topic() == topic)
         {
-            return Err(SmoltcpPubsubError::DiscoveryTopicReserved);
+            return Err(SmoltcpGossipsubError::DiscoveryTopicReserved);
         }
-        let agent = self.pubsub.as_mut().ok_or(SmoltcpPubsubError::NotEnabled)?;
+        let agent = self
+            .gossipsub
+            .as_mut()
+            .ok_or(SmoltcpGossipsubError::NotEnabled)?;
         let removed = agent.unsubscribe(topic, now.monotonic_ms);
         pump_embedded_pubsub(agent, &mut self.endpoint, now);
-        collect_embedded_pubsub_events(agent, &mut self.pending_pubsub_events);
+        collect_embedded_pubsub_events(agent, &mut self.pending_gossipsub_events);
         Ok(removed)
     }
 
@@ -801,18 +807,21 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         topic: &str,
         data: impl Into<Vec<u8>>,
         now: Now,
-    ) -> Result<(), SmoltcpPubsubError> {
+    ) -> Result<(), SmoltcpGossipsubError> {
         if self
             .beacon
             .as_ref()
             .is_some_and(|beacon| beacon.topic() == topic)
         {
-            return Err(SmoltcpPubsubError::DiscoveryTopicReserved);
+            return Err(SmoltcpGossipsubError::DiscoveryTopicReserved);
         }
-        let agent = self.pubsub.as_mut().ok_or(SmoltcpPubsubError::NotEnabled)?;
+        let agent = self
+            .gossipsub
+            .as_mut()
+            .ok_or(SmoltcpGossipsubError::NotEnabled)?;
         agent.publish(topic, data.into(), now.monotonic_ms)?;
         pump_embedded_pubsub(agent, &mut self.endpoint, now);
-        collect_embedded_pubsub_events(agent, &mut self.pending_pubsub_events);
+        collect_embedded_pubsub_events(agent, &mut self.pending_gossipsub_events);
         Ok(())
     }
 
@@ -852,7 +861,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             }
         }
         #[cfg(feature = "pubsub")]
-        if let Some(pubsub) = self.pubsub.as_mut() {
+        if let Some(pubsub) = self.gossipsub.as_mut() {
             if pubsub.next_timeout(now.monotonic_ms) == Some(0) {
                 pubsub.handle_tick(now.monotonic_ms);
             }
@@ -915,11 +924,11 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             #[cfg(feature = "pubsub")]
             let claimed = claimed
                 || self
-                    .pubsub
+                    .gossipsub
                     .as_mut()
                     .is_some_and(|agent| agent.handle_event(&event, now.monotonic_ms));
             #[cfg(feature = "pubsub")]
-            if let Some(agent) = self.pubsub.as_mut() {
+            if let Some(agent) = self.gossipsub.as_mut() {
                 pump_embedded_pubsub(agent, &mut self.endpoint, now);
             }
             if !claimed {
@@ -932,13 +941,13 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     #[cfg(feature = "pubsub")]
     fn drive_beacon(&mut self, now: Now, output: &mut Vec<SmoltcpEvent>) {
         let Some(beacon) = self.beacon.as_mut() else {
-            if let Some(pubsub) = self.pubsub.as_mut() {
-                collect_embedded_pubsub_events(pubsub, &mut self.pending_pubsub_events);
+            if let Some(pubsub) = self.gossipsub.as_mut() {
+                collect_embedded_pubsub_events(pubsub, &mut self.pending_gossipsub_events);
             }
             output.extend(
-                self.pending_pubsub_events
+                self.pending_gossipsub_events
                     .drain(..)
-                    .map(SmoltcpEvent::Pubsub),
+                    .map(SmoltcpEvent::Gossipsub),
             );
             return;
         };
@@ -946,11 +955,11 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         if beacon.next_timeout(now.monotonic_ms) == Some(0) {
             beacon.handle_tick(now.monotonic_ms);
         }
-        if let Some(pubsub) = self.pubsub.as_mut() {
-            collect_embedded_pubsub_events(pubsub, &mut self.pending_pubsub_events);
-            while let Some(event) = self.pending_pubsub_events.pop_front() {
+        if let Some(pubsub) = self.gossipsub.as_mut() {
+            collect_embedded_pubsub_events(pubsub, &mut self.pending_gossipsub_events);
+            while let Some(event) = self.pending_gossipsub_events.pop_front() {
                 let consumed = match &event {
-                    PubsubEvent::Message {
+                    GossipsubEvent::Message {
                         from,
                         topics,
                         data,
@@ -960,8 +969,8 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
                         beacon.handle_beacon(from, data, *signed);
                         true
                     }
-                    PubsubEvent::PeerSubscribed { topic, .. }
-                    | PubsubEvent::PeerUnsubscribed { topic, .. }
+                    GossipsubEvent::PeerSubscribed { topic, .. }
+                    | GossipsubEvent::PeerUnsubscribed { topic, .. }
                         if topic == beacon.topic() =>
                     {
                         true
@@ -969,7 +978,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
                     _ => false,
                 };
                 if !consumed {
-                    output.push(SmoltcpEvent::Pubsub(event));
+                    output.push(SmoltcpEvent::Gossipsub(event));
                 }
             }
             while let Some(minip2p_discovery::BeaconAction::PublishBeacon { topic, payload }) =
@@ -982,9 +991,9 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
                     pump_embedded_pubsub(pubsub, &mut self.endpoint, now);
                 }
             }
-            collect_embedded_pubsub_events(pubsub, &mut self.pending_pubsub_events);
-            while let Some(event) = self.pending_pubsub_events.pop_front() {
-                output.push(SmoltcpEvent::Pubsub(event));
+            collect_embedded_pubsub_events(pubsub, &mut self.pending_gossipsub_events);
+            while let Some(event) = self.pending_gossipsub_events.pop_front() {
+                output.push(SmoltcpEvent::Gossipsub(event));
             }
         }
         if let Some(discovery) = self.discovery.as_mut() {
@@ -1068,11 +1077,11 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         );
         #[cfg(feature = "pubsub")]
         {
-            if !self.pending_pubsub_events.is_empty() {
+            if !self.pending_gossipsub_events.is_empty() {
                 deadline = PollDeadline::earliest_opt(deadline, Some(PollDeadline::IMMEDIATE));
             }
             timeouts.extend(
-                self.pubsub
+                self.gossipsub
                     .as_ref()
                     .and_then(|agent| agent.next_timeout(now.monotonic_ms)),
             );
@@ -1129,13 +1138,13 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
 #[cfg(feature = "smoltcp")]
 #[cfg(feature = "pubsub")]
 fn pump_embedded_pubsub<D: smoltcp::phy::Device, E: EntropySource>(
-    agent: &mut minip2p_pubsub::PubsubAgent,
+    agent: &mut minip2p_pubsub::GossipsubAgent,
     endpoint: &mut PortableEndpoint<SmoltcpComposedTransport<D, E>, SharedEntropy<E>>,
     now: Now,
 ) {
     while let Some(action) = agent.poll_action() {
         match action {
-            minip2p_pubsub::PubsubAction::OpenStream {
+            minip2p_pubsub::GossipsubAction::OpenStream {
                 token,
                 peer,
                 protocol_id,
@@ -1145,7 +1154,7 @@ fn pump_embedded_pubsub<D: smoltcp::phy::Device, E: EntropySource>(
                     .map_err(|e| e.to_string());
                 agent.stream_open_result(&peer, token, result, now.monotonic_ms);
             }
-            minip2p_pubsub::PubsubAction::SendStream {
+            minip2p_pubsub::GossipsubAction::SendStream {
                 token,
                 peer,
                 stream_id,
@@ -1156,14 +1165,14 @@ fn pump_embedded_pubsub<D: smoltcp::phy::Device, E: EntropySource>(
                     .map_err(|e| e.to_string());
                 agent.send_result(&peer, stream_id, token, result, now.monotonic_ms);
             }
-            minip2p_pubsub::PubsubAction::CloseStreamWrite { peer, stream_id } => {
+            minip2p_pubsub::GossipsubAction::CloseStreamWrite { peer, stream_id } => {
                 // Pubsub has no completion callback for stream teardown; a
                 // failed close is observed through the endpoint event path.
                 match endpoint.close_stream_write(&peer, stream_id, now) {
                     Ok(()) | Err(_) => {}
                 }
             }
-            minip2p_pubsub::PubsubAction::ResetStream { peer, stream_id } => {
+            minip2p_pubsub::GossipsubAction::ResetStream { peer, stream_id } => {
                 // As above, retain endpoint events as the teardown result.
                 match endpoint.reset_stream(&peer, stream_id, now) {
                     Ok(()) | Err(_) => {}
@@ -1175,8 +1184,8 @@ fn pump_embedded_pubsub<D: smoltcp::phy::Device, E: EntropySource>(
 
 #[cfg(all(feature = "smoltcp", feature = "pubsub"))]
 fn collect_embedded_pubsub_events(
-    agent: &mut minip2p_pubsub::PubsubAgent,
-    pending: &mut VecDeque<PubsubEvent>,
+    agent: &mut minip2p_pubsub::GossipsubAgent,
+    pending: &mut VecDeque<GossipsubEvent>,
 ) {
     while let Some(event) = agent.poll_event() {
         pending.push_back(event);
@@ -1242,22 +1251,22 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
 
     /// Enables pubsub with interoperable gossipsub defaults.
     #[cfg(feature = "pubsub")]
-    pub fn pubsub(mut self) -> Self {
-        self.pubsub.get_or_insert_with(PubsubConfig::default);
+    pub fn gossipsub(mut self) -> Self {
+        self.gossipsub.get_or_insert_with(GossipsubConfig::default);
         self
     }
 
-    /// Enables pubsub with an explicit gossipsub or floodsub configuration.
+    /// Enables pubsub with an explicit gossipsub configuration.
     #[cfg(feature = "pubsub")]
-    pub fn pubsub_config(mut self, config: impl Into<PubsubConfig>) -> Self {
-        self.pubsub = Some(config.into());
+    pub fn gossipsub_config(mut self, config: GossipsubConfig) -> Self {
+        self.gossipsub = Some(config);
         self
     }
 
     /// Enables signed-beacon discovery. Pubsub is enabled automatically.
     #[cfg(feature = "pubsub")]
     pub fn discovery(mut self) -> Self {
-        self.pubsub.get_or_insert_with(PubsubConfig::default);
+        self.gossipsub.get_or_insert_with(GossipsubConfig::default);
         self.beacon.get_or_insert_with(BeaconConfig::default);
         self
     }
@@ -1265,7 +1274,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
     /// Enables signed-beacon discovery with explicit beacon policy.
     #[cfg(feature = "pubsub")]
     pub fn beacon_config(mut self, config: BeaconConfig) -> Self {
-        self.pubsub.get_or_insert_with(PubsubConfig::default);
+        self.gossipsub.get_or_insert_with(GossipsubConfig::default);
         self.beacon = Some(config);
         self
     }
@@ -1357,8 +1366,8 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
             }
         }
         #[cfg(feature = "pubsub")]
-        if let Some(config) = &self.pubsub {
-            for protocol in config.protocol_ids() {
+        if self.gossipsub.is_some() {
+            for protocol in minip2p_pubsub::GOSSIPSUB_PROTOCOL_IDS {
                 self.swarm = self.swarm.protocol(*protocol);
             }
         }
@@ -1418,15 +1427,15 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
         };
         #[cfg(feature = "pubsub")]
         let mut pubsub = self
-            .pubsub
+            .gossipsub
             .map(|config| {
-                minip2p_pubsub::PubsubAgent::new(
+                minip2p_pubsub::GossipsubAgent::new(
                     self.identity.clone(),
                     config,
                     self.entropy.next_u64()?,
                     self.entropy.next_u64()?,
                 )
-                .map_err(SmoltcpBuildError::Pubsub)
+                .map_err(SmoltcpBuildError::Gossipsub)
             })
             .transpose()?;
         #[cfg(feature = "pubsub")]
@@ -1466,9 +1475,9 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
             endpoint,
             mdns,
             #[cfg(feature = "pubsub")]
-            pubsub,
+            gossipsub: pubsub,
             #[cfg(feature = "pubsub")]
-            pending_pubsub_events: VecDeque::new(),
+            pending_gossipsub_events: VecDeque::new(),
             #[cfg(feature = "pubsub")]
             beacon,
             #[cfg(feature = "portable-autonat")]
@@ -1495,9 +1504,9 @@ pub enum SmoltcpBuildError {
     Mdns(MdnsError),
     /// mDNS or bounded discovery policy was invalid.
     MdnsConfig(PortableMdnsConfigError),
-    /// Pubsub routing policy was invalid.
+    /// Gossipsub configuration was invalid.
     #[cfg(feature = "pubsub")]
-    Pubsub(PubsubConfigError),
+    Gossipsub(GossipsubConfigError),
     /// The reserved discovery topic was invalid.
     #[cfg(feature = "pubsub")]
     Topic(TopicError),
@@ -1568,7 +1577,7 @@ impl core::fmt::Display for SmoltcpBuildError {
             Self::Mdns(error) => error.fmt(formatter),
             Self::MdnsConfig(error) => error.fmt(formatter),
             #[cfg(feature = "pubsub")]
-            Self::Pubsub(error) => error.fmt(formatter),
+            Self::Gossipsub(error) => error.fmt(formatter),
             #[cfg(feature = "pubsub")]
             Self::Topic(error) => error.fmt(formatter),
             Self::Discovery(error) => error.fmt(formatter),
@@ -1632,8 +1641,8 @@ impl core::fmt::Display for SmoltcpRelayError {
 /// Failure from an embedded pubsub operation.
 #[cfg(all(feature = "smoltcp", feature = "pubsub"))]
 #[derive(Debug, Eq, PartialEq)]
-pub enum SmoltcpPubsubError {
-    /// `.pubsub()` or `.discovery()` was not selected on the builder.
+pub enum SmoltcpGossipsubError {
+    /// `.gossipsub()` or `.discovery()` was not selected on the builder.
     NotEnabled,
     /// Signed discovery owns this subscription.
     DiscoveryTopicReserved,
@@ -1644,24 +1653,24 @@ pub enum SmoltcpPubsubError {
 }
 
 #[cfg(all(feature = "smoltcp", feature = "pubsub"))]
-impl From<TopicError> for SmoltcpPubsubError {
+impl From<TopicError> for SmoltcpGossipsubError {
     fn from(error: TopicError) -> Self {
         Self::Topic(error)
     }
 }
 #[cfg(all(feature = "smoltcp", feature = "pubsub"))]
-impl From<PublishError> for SmoltcpPubsubError {
+impl From<PublishError> for SmoltcpGossipsubError {
     fn from(error: PublishError) -> Self {
         Self::Publish(error)
     }
 }
 #[cfg(all(feature = "smoltcp", feature = "pubsub"))]
-impl core::fmt::Display for SmoltcpPubsubError {
+impl core::fmt::Display for SmoltcpGossipsubError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NotEnabled => write!(
                 formatter,
-                "pubsub is not enabled; call .pubsub() or .discovery()"
+                "gossipsub is not enabled; call .gossipsub() or .discovery()"
             ),
             Self::DiscoveryTopicReserved => {
                 write!(formatter, "signed discovery owns this topic subscription")

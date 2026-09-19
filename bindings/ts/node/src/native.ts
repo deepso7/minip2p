@@ -66,7 +66,6 @@ interface NativeEndpointConfig {
     readonly ttlMs: bigint;
   };
   readonly protocols: string[];
-  readonly pubsubRouter: number;
   readonly quic?: { readonly listenAddrs?: string[] };
   readonly relays: string[];
   readonly tcp?: { readonly listenAddrs?: string[] };

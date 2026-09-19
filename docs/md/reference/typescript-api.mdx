@@ -13,7 +13,6 @@ Choose the import for the application's runtime:
     ```ts
     import {
       Minip2p,
-      PubsubRouter,
       circuitAddress,
       generateSecretKey,
       peerIdFromSecretKey,
@@ -28,7 +27,6 @@ Choose the import for the application's runtime:
     ```ts
     import {
       Minip2p,
-      PubsubRouter,
       bindAppState,
       circuitAddress,
       generateSecretKey,
@@ -57,7 +55,6 @@ Setup per runtime: [Node.js](/typescript/setup-node), [React Native](/typescript
 | `relays` | `readonly string[]` | Direct QUIC or TCP relay peer addresses. |
 | `autonatServers` | `readonly string[]` | Reachability probe-server addresses. |
 | `forceRelay` | `boolean` | Route outbound connectivity through relays only. |
-| `pubsubRouter` | `PubsubRouter` | `Gossipsub` by default; choose `Floodsub` explicitly. |
 | `allowUnsigned` | `boolean` | Accept unsigned inbound application pubsub messages; default `false`. |
 | `discovery` | `Minip2pDiscoveryOptions` | Signed-beacon topic, timing, and auto-dial policy. |
 | `mdns` | `boolean \| Minip2pMdnsOptions` | Enable local-link discovery with defaults or explicit options. |
@@ -174,7 +171,7 @@ Stream events are `data`, `remoteWriteClosed`, `closed`, and `dataOverflow`.
 | Connection and Identify | `connectionEstablished`, `connectionClosed`, `peerReady`, `identifyReceived` |
 | Ping and streams | `pingRttMeasured`, `pingTimeout`, `stream` |
 | Relay and NAT | `reachabilityChanged`, `publicAddressesChanged`, `relayReserved`, `relayReservationLost`, `pathEstablished`, `pathUpgraded`, `holePunchFailed`, `fellBackToRelay`, `connectFailed`, `inboundDirectUpgrade` |
-| Pubsub | `message`, `peerSubscribed`, `peerUnsubscribed`, `pubsubOutboundFailure`, `pubsubProtocolViolation` |
+| Pubsub | `message`, `peerSubscribed`, `peerUnsubscribed`, `gossipsubOutboundFailure`, `gossipsubProtocolViolation` |
 | Discovery | `peerDiscovered`, `peerUpdated`, `peerExpired`, `discoveryDialFailed`, `discoveryProtocolViolation` |
 
 The catch-all stream uses `inboundStream` metadata instead of the live `stream` handle. Subscribe to the named `stream` event to claim an inbound stream.

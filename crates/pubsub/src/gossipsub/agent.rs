@@ -10,10 +10,10 @@ use minip2p_identity::Ed25519Keypair;
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::StreamId;
 
-use super::config::GossipsubConfig;
+use super::config::{GossipsubConfig, GossipsubConfigError};
 use super::mcache::MessageCache;
 use crate::events::{
-    PublishError, PubsubAction, PubsubEvent, PubsubToken, SharedFrame, TopicError,
+    GossipsubAction, GossipsubEvent, GossipsubToken, PublishError, SharedFrame, TopicError,
 };
 use crate::message::{
     ControlGraft, ControlIHave, ControlIWant, ControlMessage, ControlPrune, FrameDecode,
@@ -353,7 +353,7 @@ enum SendState {
     #[default]
     Idle,
     Opening {
-        token: PubsubToken,
+        token: GossipsubToken,
         since_ms: u64,
     },
     Negotiating {
@@ -362,7 +362,7 @@ enum SendState {
     },
     Ready {
         stream_id: StreamId,
-        in_flight: Option<(PubsubToken, FrameCommit)>,
+        in_flight: Option<(GossipsubToken, FrameCommit)>,
     },
 }
 
@@ -421,8 +421,8 @@ pub struct GossipsubAgent {
     keypair: Ed25519Keypair,
     local_peer_id: PeerId,
     config: GossipsubConfig,
-    actions: VecDeque<PubsubAction>,
-    events: VecDeque<PubsubEvent>,
+    actions: VecDeque<GossipsubAction>,
+    events: VecDeque<GossipsubEvent>,
     topics: BTreeSet<String>,
     peers: BTreeMap<PeerId, PeerState>,
     roles: BTreeMap<PeerId, BTreeMap<StreamId, StreamRole>>,
@@ -442,20 +442,19 @@ pub struct GossipsubAgent {
 }
 
 impl GossipsubAgent {
-    /// Creates a router. `initial_seqno` must not repeat across restarts;
-    /// `entropy_seed` controls deterministic peer selection. Call
-    /// [`GossipsubConfig::validate`] first when constructing this concrete
-    /// agent directly; [`PubsubAgent::new`](crate::PubsubAgent::new) does so
-    /// automatically.
+    /// Validates `config` and creates a router. `initial_seqno` must not
+    /// repeat across restarts; `entropy_seed` controls deterministic peer
+    /// selection.
     pub fn new(
         keypair: Ed25519Keypair,
         config: GossipsubConfig,
         initial_seqno: u64,
         entropy_seed: u64,
-    ) -> Self {
+    ) -> Result<Self, GossipsubConfigError> {
+        config.validate()?;
         let local_peer_id = keypair.peer_id();
         let mcache = MessageCache::new(config.mcache_len, config.max_mcache_messages);
-        Self {
+        Ok(Self {
             keypair,
             local_peer_id,
             config,
@@ -477,7 +476,7 @@ impl GossipsubAgent {
             next_token: 0,
             next_seqno: initial_seqno,
             rng: SplitMix64::new(entropy_seed),
-        }
+        })
     }
 
     /// The peer id this agent publishes as. Exposed for test support.
@@ -665,7 +664,7 @@ impl GossipsubAgent {
         &mut self,
         peer: &PeerId,
         stream_id: StreamId,
-        token: PubsubToken,
+        token: GossipsubToken,
         result: Result<(), String>,
         now_ms: u64,
     ) {
@@ -695,7 +694,7 @@ impl GossipsubAgent {
             }
             Err(reason) => {
                 self.restore_commit(peer, commit);
-                self.actions.push_back(PubsubAction::ResetStream {
+                self.actions.push_back(GossipsubAction::ResetStream {
                     peer: peer.clone(),
                     stream_id,
                 });
@@ -704,7 +703,7 @@ impl GossipsubAgent {
                     state.outbound_version = None;
                     state.subscription_queue.clear();
                 }
-                self.events.push_back(PubsubEvent::OutboundFailure {
+                self.events.push_back(GossipsubEvent::OutboundFailure {
                     peer: peer.clone(),
                     reason: format!("send failed: {reason}"),
                 });
@@ -716,7 +715,7 @@ impl GossipsubAgent {
     pub fn stream_open_result(
         &mut self,
         peer: &PeerId,
-        token: PubsubToken,
+        token: GossipsubToken,
         result: Result<StreamId, String>,
         _now_ms: u64,
     ) {
@@ -750,7 +749,7 @@ impl GossipsubAgent {
                 if let Some(state) = self.peers.get_mut(peer) {
                     state.sender = SendState::Idle;
                 }
-                self.events.push_back(PubsubEvent::OutboundFailure {
+                self.events.push_back(GossipsubEvent::OutboundFailure {
                     peer: peer.clone(),
                     reason: format!("open failed: {reason}"),
                 });
@@ -787,7 +786,7 @@ impl GossipsubAgent {
                 state.outbound_version = None;
                 state.subscription_queue.clear();
             }
-            self.events.push_back(PubsubEvent::OutboundFailure {
+            self.events.push_back(GossipsubEvent::OutboundFailure {
                 peer,
                 reason: "stream establishment timed out".to_string(),
             });
@@ -800,12 +799,12 @@ impl GossipsubAgent {
     }
 
     /// Next action for the driver.
-    pub fn poll_action(&mut self) -> Option<PubsubAction> {
+    pub fn poll_action(&mut self) -> Option<GossipsubAction> {
         self.actions.pop_front()
     }
 
     /// Next application event.
-    pub fn poll_event(&mut self) -> Option<PubsubEvent> {
+    pub fn poll_event(&mut self) -> Option<GossipsubEvent> {
         self.events.pop_front()
     }
 
@@ -848,7 +847,7 @@ impl GossipsubAgent {
         if let Some(state) = self.peers.get(peer) {
             let dropped = state.queued_work();
             if dropped > 0 {
-                self.events.push_back(PubsubEvent::OutboundFailure {
+                self.events.push_back(GossipsubEvent::OutboundFailure {
                     peer: peer.clone(),
                     reason: format!("{cause}; dropped {dropped} queued items"),
                 });
@@ -916,7 +915,7 @@ impl GossipsubAgent {
 
         let state = self.peers.entry(peer.clone()).or_default();
         if state.inbound.len() >= self.config.max_inbound_streams_per_peer {
-            self.events.push_back(PubsubEvent::ProtocolViolation {
+            self.events.push_back(GossipsubEvent::ProtocolViolation {
                 peer: peer.clone(),
                 reason: "too many concurrent inbound streams".to_string(),
             });
@@ -1036,7 +1035,7 @@ impl GossipsubAgent {
         if leftover {
             self.violation_reset(peer, stream_id, "EOF inside a frame");
         } else {
-            self.actions.push_back(PubsubAction::CloseStreamWrite {
+            self.actions.push_back(GossipsubAction::CloseStreamWrite {
                 peer: peer.clone(),
                 stream_id,
             });
@@ -1085,7 +1084,7 @@ impl GossipsubAgent {
                     self.restore_commit(peer, commit);
                 }
                 if failed_establishment {
-                    self.events.push_back(PubsubEvent::OutboundFailure {
+                    self.events.push_back(GossipsubEvent::OutboundFailure {
                         peer: peer.clone(),
                         reason: "stream closed during negotiation".to_string(),
                     });
@@ -1160,13 +1159,13 @@ impl GossipsubAgent {
             .collect();
         state.remote_topics = candidate;
         if invalid {
-            self.events.push_back(PubsubEvent::ProtocolViolation {
+            self.events.push_back(GossipsubEvent::ProtocolViolation {
                 peer: peer.clone(),
                 reason: "subscription entries with invalid topics skipped".to_string(),
             });
         }
         for topic in &added {
-            self.events.push_back(PubsubEvent::PeerSubscribed {
+            self.events.push_back(GossipsubEvent::PeerSubscribed {
                 peer: peer.clone(),
                 topic: topic.clone(),
             });
@@ -1178,7 +1177,7 @@ impl GossipsubAgent {
             if let Some(fanout) = self.fanout.get_mut(&topic) {
                 fanout.remove(peer);
             }
-            self.events.push_back(PubsubEvent::PeerUnsubscribed {
+            self.events.push_back(GossipsubEvent::PeerUnsubscribed {
                 peer: peer.clone(),
                 topic,
             });
@@ -1319,7 +1318,7 @@ impl GossipsubAgent {
         let (dedup_from, dedup_seqno) = match message.source_and_seqno() {
             Ok(value) => value,
             Err(error) => {
-                self.events.push_back(PubsubEvent::ProtocolViolation {
+                self.events.push_back(GossipsubEvent::ProtocolViolation {
                     peer: arrival.clone(),
                     reason: format!("message rejected: {error}"),
                 });
@@ -1334,7 +1333,7 @@ impl GossipsubAgent {
         let (from, seqno, signed) = match message.verify(self.config.allow_unsigned) {
             Ok(value) => value,
             Err(error) => {
-                self.events.push_back(PubsubEvent::ProtocolViolation {
+                self.events.push_back(GossipsubEvent::ProtocolViolation {
                     peer: arrival.clone(),
                     reason: format!("message rejected: {error}"),
                 });
@@ -1360,7 +1359,7 @@ impl GossipsubAgent {
             self.config.seen_ttl_ms,
             self.config.max_seen_messages,
         );
-        self.events.push_back(PubsubEvent::Message {
+        self.events.push_back(GossipsubEvent::Message {
             from: from.clone(),
             topics: message.topic_ids.clone(),
             data: message.data.clone().unwrap_or_default(),
@@ -1563,7 +1562,7 @@ impl GossipsubAgent {
                         since_ms: now_ms,
                     };
                 }
-                self.actions.push_back(PubsubAction::OpenStream {
+                self.actions.push_back(GossipsubAction::OpenStream {
                     token,
                     peer: peer.clone(),
                     protocol_id: String::from(version.protocol_id()),
@@ -1657,7 +1656,7 @@ impl GossipsubAgent {
         {
             *in_flight = Some((token, commit));
         }
-        self.actions.push_back(PubsubAction::SendStream {
+        self.actions.push_back(GossipsubAction::SendStream {
             token,
             peer: peer.clone(),
             stream_id,
@@ -1746,7 +1745,7 @@ impl GossipsubAgent {
             return false;
         };
         if state.pending_messages.len() >= self.config.max_pending_per_peer {
-            self.events.push_back(PubsubEvent::OutboundFailure {
+            self.events.push_back(GossipsubEvent::OutboundFailure {
                 peer: peer.clone(),
                 reason: "outbound message dropped: queue is full".to_string(),
             });
@@ -1826,8 +1825,8 @@ impl GossipsubAgent {
             .or_insert(expiry);
     }
 
-    fn allocate_token(&mut self) -> PubsubToken {
-        let token = PubsubToken(self.next_token);
+    fn allocate_token(&mut self) -> GossipsubToken {
+        let token = GossipsubToken(self.next_token);
         self.next_token = self.next_token.wrapping_add(1);
         token
     }
@@ -1844,7 +1843,7 @@ impl GossipsubAgent {
             .entry(peer.clone())
             .or_default()
             .insert(stream_id, StreamRole::Rejected);
-        self.actions.push_back(PubsubAction::ResetStream {
+        self.actions.push_back(GossipsubAction::ResetStream {
             peer: peer.clone(),
             stream_id,
         });
@@ -1854,7 +1853,7 @@ impl GossipsubAgent {
         if let Some(state) = self.peers.get_mut(peer) {
             state.inbound.remove(&stream_id);
         }
-        self.events.push_back(PubsubEvent::ProtocolViolation {
+        self.events.push_back(GossipsubEvent::ProtocolViolation {
             peer: peer.clone(),
             reason: reason.to_string(),
         });
@@ -1898,13 +1897,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn constructor_rejects_invalid_config() {
+        let config = GossipsubConfig {
+            heartbeat_interval_ms: 0,
+            ..GossipsubConfig::default()
+        };
+        let error =
+            GossipsubAgent::new(Ed25519Keypair::from_secret_key_bytes([1; 32]), config, 1, 2)
+                .err()
+                .expect("invalid config");
+        assert_eq!(error.field, "heartbeat_interval_ms");
+    }
+
+    #[test]
     fn fanout_queues_share_one_framed_payload() {
         let mut agent = GossipsubAgent::new(
             Ed25519Keypair::from_secret_key_bytes([1; 32]),
             GossipsubConfig::default(),
             0,
             0,
-        );
+        )
+        .expect("default config");
         let first = Ed25519Keypair::from_secret_key_bytes([2; 32]).peer_id();
         let second = Ed25519Keypair::from_secret_key_bytes([3; 32]).peer_id();
         for peer in [&first, &second] {

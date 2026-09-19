@@ -16,7 +16,7 @@ use minip2p::smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken
 use minip2p::smoltcp::time::Instant;
 use minip2p::smoltcp::wire::{HardwareAddress, IpCidr};
 #[cfg(feature = "pubsub")]
-use minip2p::{BeaconConfig, FloodsubConfig, PubsubEvent, SmoltcpPubsubError};
+use minip2p::{BeaconConfig, GossipsubEvent, SmoltcpGossipsubError};
 use minip2p::{
     DiscoveryEvent, Ed25519Keypair, Endpoint, EntropySource, Multiaddr, Now, PeerAddr, PeerId,
     PollDeadline, SmoltcpConfig, SmoltcpEvent, SmoltcpMdnsConfig, SmoltcpStack, SmoltcpTcpProvider,
@@ -431,9 +431,7 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
         .mdns()
         .mdns_carrier_config(carrier.clone());
     #[cfg(feature = "pubsub")]
-    let a_builder = a_builder
-        .pubsub_config(FloodsubConfig::default())
-        .discovery();
+    let a_builder = a_builder.gossipsub().discovery();
     let mut a = a_builder
         .protocol(PROTOCOL)
         .build()
@@ -444,9 +442,7 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
         .mdns()
         .mdns_carrier_config(carrier);
     #[cfg(feature = "pubsub")]
-    let b_builder = b_builder
-        .pubsub_config(FloodsubConfig::default())
-        .discovery();
+    let b_builder = b_builder.gossipsub().discovery();
     let mut b = b_builder
         .protocol(PROTOCOL)
         .build()
@@ -533,13 +529,13 @@ fn portable_pubsub_delivers_over_the_composed_smoltcp_endpoint() {
     let b_peer = b_identity.peer_id();
     let mut a = Endpoint::portable(&a_identity, CountingEntropy(70))
         .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
-        .pubsub_config(FloodsubConfig::default())
+        .gossipsub()
         .build()
         .expect("a endpoint builds");
     let mut b = Endpoint::portable(&b_identity, CountingEntropy(80))
         .smoltcp(stack(wire.listener_device(), &format!("{LISTENER_IP}/24")))
         .listen(format!("/ip4/{LISTENER_IP}/tcp/4001"))
-        .pubsub_config(FloodsubConfig::default())
+        .gossipsub()
         .build()
         .expect("b endpoint builds");
     a.subscribe(TOPIC, Now::from_millis(0))
@@ -564,7 +560,7 @@ fn portable_pubsub_delivers_over_the_composed_smoltcp_endpoint() {
         a_events.extend(a.poll(now).expect("a polls"));
         b_events.extend(b.poll(now).expect("b polls"));
         let remote_subscribed = a_events.iter().any(|event| {
-            matches!(event, SmoltcpEvent::Pubsub(PubsubEvent::PeerSubscribed { peer, topic })
+            matches!(event, SmoltcpEvent::Gossipsub(GossipsubEvent::PeerSubscribed { peer, topic })
                 if peer == &b_peer && topic == TOPIC)
         });
         if remote_subscribed && !published {
@@ -572,7 +568,7 @@ fn portable_pubsub_delivers_over_the_composed_smoltcp_endpoint() {
             published = true;
         }
         if b_events.iter().any(|event| {
-            matches!(event, SmoltcpEvent::Pubsub(PubsubEvent::Message { topics, data, signed: true, .. })
+            matches!(event, SmoltcpEvent::Gossipsub(GossipsubEvent::Message { topics, data, signed: true, .. })
                 if topics.iter().any(|topic| topic == TOPIC) && data == PAYLOAD)
         }) {
             return;
@@ -596,7 +592,7 @@ fn signed_discovery_reserves_its_pubsub_topic() {
             Wire::default().dialer_device(),
             &format!("{DIALER_IP}/24"),
         ))
-        .pubsub_config(FloodsubConfig::default())
+        .gossipsub()
         .beacon_config(BeaconConfig {
             topic: RESERVED.into(),
             ..BeaconConfig::default()
@@ -607,74 +603,12 @@ fn signed_discovery_reserves_its_pubsub_topic() {
 
     assert_eq!(
         endpoint.unsubscribe(RESERVED, now),
-        Err(SmoltcpPubsubError::DiscoveryTopicReserved)
+        Err(SmoltcpGossipsubError::DiscoveryTopicReserved)
     );
     assert_eq!(
         endpoint.publish(RESERVED, b"not a beacon", now),
-        Err(SmoltcpPubsubError::DiscoveryTopicReserved)
+        Err(SmoltcpGossipsubError::DiscoveryTopicReserved)
     );
-}
-
-#[test]
-#[cfg(feature = "pubsub")]
-fn beacon_backpressure_preserves_events_and_does_not_fail_poll() {
-    let wire = Wire::default();
-    let a_identity = identity(85);
-    let b_identity = identity(86);
-    let b_peer = b_identity.peer_id();
-    let flood = FloodsubConfig {
-        max_pending_per_peer: 0,
-        ..FloodsubConfig::default()
-    };
-    let beacon = BeaconConfig {
-        beacon_interval_ms: 1,
-        ..BeaconConfig::default()
-    };
-    let mut a = Endpoint::portable(&a_identity, CountingEntropy(87))
-        .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
-        .listen(format!("/ip4/{DIALER_IP}/tcp/4001"))
-        .pubsub_config(flood.clone())
-        .beacon_config(beacon.clone())
-        .build()
-        .expect("a endpoint builds");
-    let mut b = Endpoint::portable(&b_identity, CountingEntropy(88))
-        .smoltcp(stack(wire.listener_device(), &format!("{LISTENER_IP}/24")))
-        .listen(format!("/ip4/{LISTENER_IP}/tcp/4001"))
-        .pubsub_config(flood)
-        .beacon_config(beacon)
-        .build()
-        .expect("b endpoint builds");
-    a.subscribe(TOPIC, Now::from_millis(0))
-        .expect("a subscribes to application topic");
-    b.subscribe(TOPIC, Now::from_millis(0))
-        .expect("b subscribes to application topic");
-    a.dial(
-        &PeerAddr::new(
-            format!("/ip4/{LISTENER_IP}/tcp/4001").parse().unwrap(),
-            b_peer.clone(),
-        )
-        .unwrap(),
-    )
-    .expect("dial starts");
-
-    let mut now_ms = 0;
-    for _ in 0..MAX_STEPS {
-        let now = Now::from_millis(now_ms);
-        let a_events = a.poll(now).expect("beacon backpressure is best-effort");
-        let _ = b.poll(now).expect("b polls");
-        if a_events.iter().any(|event| {
-            matches!(event, SmoltcpEvent::Pubsub(PubsubEvent::PeerSubscribed { peer, topic })
-                if peer == &b_peer && topic == TOPIC)
-        }) {
-            return;
-        }
-        if wire.is_quiet() {
-            let deadline = PollDeadline::earliest_opt(a.next_deadline(now), b.next_deadline(now))
-                .expect("connected discovery endpoints retain a deadline");
-            now_ms = now_ms.max(deadline.as_millis());
-        }
-    }
-    panic!("remote subscription was lost while beacon publication was backpressured");
 }
 
 #[test]
@@ -688,14 +622,14 @@ fn signed_beacons_populate_discovery_without_mdns() {
     let mut a = Endpoint::portable(&a_identity, CountingEntropy(100))
         .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
         .listen(format!("/ip4/{DIALER_IP}/tcp/4001"))
-        .pubsub_config(FloodsubConfig::default())
+        .gossipsub()
         .discovery()
         .build()
         .expect("a endpoint builds");
     let mut b = Endpoint::portable(&b_identity, CountingEntropy(110))
         .smoltcp(stack(wire.listener_device(), &format!("{LISTENER_IP}/24")))
         .listen(format!("/ip4/{LISTENER_IP}/tcp/4001"))
-        .pubsub_config(FloodsubConfig::default())
+        .gossipsub()
         .discovery()
         .build()
         .expect("b endpoint builds");

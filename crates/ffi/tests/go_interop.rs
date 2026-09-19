@@ -6,8 +6,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use minip2p_ffi::{
-    EndpointConfig, FfiError, P2pEndpoint, P2pEvent, P2pEventDoorbell, PubsubRouter,
-    TransportOptions,
+    EndpointConfig, FfiError, P2pEndpoint, P2pEvent, P2pEventDoorbell, TransportOptions,
 };
 use serde_json::{Value, json};
 
@@ -187,7 +186,6 @@ fn config() -> EndpointConfig {
         }),
         force_relay: false,
         allow_unsigned: false,
-        pubsub_router: PubsubRouter::Gossipsub,
         protocols: vec![ECHO_PROTOCOL.into()],
         discovery: None,
         mdns: None,

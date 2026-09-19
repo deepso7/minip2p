@@ -362,15 +362,15 @@ pub enum P2pEvent {
         /// Unsubscribed topic.
         topic: String,
     },
-    /// Pubsub outbound work was discarded.
-    PubsubOutboundFailure {
+    /// Gossipsub outbound work was discarded.
+    GossipsubOutboundFailure {
         /// Destination peer.
         peer_id: String,
         /// Human-readable failure detail.
         reason: String,
     },
-    /// A peer violated the pubsub protocol.
-    PubsubProtocolViolation {
+    /// A peer violated the gossipsub protocol.
+    GossipsubProtocolViolation {
         /// Offending peer.
         peer_id: String,
         /// Human-readable violation detail.

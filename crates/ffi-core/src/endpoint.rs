@@ -9,15 +9,14 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BeaconConfig, Endpoint, EndpointBuilder, FloodsubConfig, GossipsubConfig, MdnsConfig,
-    Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, Protocol, PublishError, PubsubConfig,
-    PubsubError, StreamId, TopicError, TransportError, WaitHandle,
+    BeaconConfig, Endpoint, EndpointBuilder, GossipsubConfig, GossipsubError, MdnsConfig,
+    Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, Protocol, PublishError, StreamId,
+    TopicError, TransportError, WaitHandle,
 };
 
 use crate::{
     DriverStats, EndpointConfig, EventDoorbell, FfiError, IdentifyInfo, KnownPeerInfo, P2pEvent,
-    PubsubRouter, RelayReservationInfo, TransportOptions, keypair_from_bytes,
-    parse_direct_peer_addr,
+    RelayReservationInfo, TransportOptions, keypair_from_bytes, parse_direct_peer_addr,
 };
 
 fn configure_transports(
@@ -192,17 +191,10 @@ impl P2pEndpoint {
             });
         }
 
-        let pubsub = match config.pubsub_router {
-            PubsubRouter::Gossipsub => PubsubConfig::Gossipsub(GossipsubConfig {
-                allow_unsigned: config.allow_unsigned,
-                ..GossipsubConfig::default()
-            }),
-            PubsubRouter::Floodsub => PubsubConfig::Floodsub(FloodsubConfig {
-                allow_unsigned: config.allow_unsigned,
-                ..FloodsubConfig::default()
-            }),
+        let gossipsub = GossipsubConfig {
+            allow_unsigned: config.allow_unsigned,
+            ..GossipsubConfig::default()
         };
-        pubsub.validate().map_err(invalid_config)?;
 
         let mut builder = Endpoint::builder()
             .identity(keypair)
@@ -211,7 +203,7 @@ impl P2pEndpoint {
                     .agent_version
                     .unwrap_or_else(|| format!("minip2p/{}", env!("CARGO_PKG_VERSION"))),
             )
-            .pubsub_config(pubsub);
+            .gossipsub_config(gossipsub);
         for protocol in config.protocols {
             builder = builder.protocol(protocol);
         }
@@ -486,12 +478,12 @@ impl P2pEndpoint {
 
     /// Subscribes to a pubsub topic.
     pub fn subscribe(&self, topic: String) -> Result<bool, FfiError> {
-        self.with_endpoint_mut(|endpoint| endpoint.subscribe(&topic).map_err(map_pubsub_error))
+        self.with_endpoint_mut(|endpoint| endpoint.subscribe(&topic).map_err(map_gossipsub_error))
     }
 
     /// Withdraws a pubsub subscription.
     pub fn unsubscribe(&self, topic: String) -> Result<bool, FfiError> {
-        self.with_endpoint_mut(|endpoint| endpoint.unsubscribe(&topic).map_err(map_pubsub_error))
+        self.with_endpoint_mut(|endpoint| endpoint.unsubscribe(&topic).map_err(map_gossipsub_error))
     }
 
     /// Publishes one application payload.
@@ -499,7 +491,9 @@ impl P2pEndpoint {
         if data.len() > minip2p_pubsub::MAX_RPC_SIZE {
             return Err(FfiError::MessageTooLarge);
         }
-        self.with_endpoint_mut(|endpoint| endpoint.publish(&topic, data).map_err(map_pubsub_error))
+        self.with_endpoint_mut(|endpoint| {
+            endpoint.publish(&topic, data).map_err(map_gossipsub_error)
+        })
     }
 
     /// Sends an explicit ping; completion arrives as a ping event.
@@ -912,18 +906,18 @@ fn map_constructor_error(error: minip2p::Error) -> FfiError {
     }
 }
 
-fn map_pubsub_error(error: PubsubError) -> FfiError {
+fn map_gossipsub_error(error: GossipsubError) -> FfiError {
     match error {
-        PubsubError::DiscoveryTopicReserved => FfiError::NotPermitted {
+        GossipsubError::DiscoveryTopicReserved => FfiError::NotPermitted {
             detail: error.to_string(),
         },
-        PubsubError::Publish(PublishError::TooLarge) => FfiError::MessageTooLarge,
-        PubsubError::Publish(PublishError::Backpressure) => FfiError::Backpressure,
-        PubsubError::Publish(PublishError::Topic(error)) | PubsubError::Topic(error) => {
+        GossipsubError::Publish(PublishError::TooLarge) => FfiError::MessageTooLarge,
+        GossipsubError::Publish(PublishError::Backpressure) => FfiError::Backpressure,
+        GossipsubError::Publish(PublishError::Topic(error)) | GossipsubError::Topic(error) => {
             map_topic_error(error)
         }
-        PubsubError::Driver(error) => map_driver_error(error),
-        PubsubError::NotEnabled => FfiError::Internal {
+        GossipsubError::Driver(error) => map_driver_error(error),
+        GossipsubError::NotEnabled => FfiError::Internal {
             detail: error.to_string(),
         },
     }
@@ -1054,7 +1048,6 @@ mod tests {
             tcp: None,
             force_relay: false,
             allow_unsigned: false,
-            pubsub_router: PubsubRouter::Gossipsub,
             protocols: Vec::new(),
             discovery: None,
             mdns: None,
@@ -1339,9 +1332,8 @@ mod tests {
     }
 
     #[test]
-    fn constructor_accepts_mdns_and_floodsub_configuration() {
+    fn constructor_accepts_mdns_configuration() {
         let mut config = config();
-        config.pubsub_router = PubsubRouter::Floodsub;
         config.mdns = Some(crate::MdnsOptions {
             enable_ipv6: false,
             ttl_ms: 120_000,
@@ -1353,7 +1345,7 @@ mod tests {
             auto_dial: true,
         });
 
-        endpoint(config).expect("mDNS + floodsub endpoint");
+        endpoint(config).expect("mDNS endpoint");
     }
 
     #[test]
@@ -1806,7 +1798,7 @@ mod tests {
     }
 
     #[test]
-    fn pubsub_and_transport_errors_map_by_context() {
+    fn gossipsub_and_transport_errors_map_by_context() {
         let mut discovery = config();
         discovery.discovery = Some(crate::DiscoveryOptions {
             topic: "presence".into(),
@@ -1821,11 +1813,11 @@ mod tests {
         ));
 
         assert!(matches!(
-            map_pubsub_error(PubsubError::Publish(PublishError::TooLarge)),
+            map_gossipsub_error(GossipsubError::Publish(PublishError::TooLarge)),
             FfiError::MessageTooLarge
         ));
         assert!(matches!(
-            map_pubsub_error(PubsubError::Publish(PublishError::Backpressure)),
+            map_gossipsub_error(GossipsubError::Publish(PublishError::Backpressure)),
             FfiError::Backpressure
         ));
         assert!(matches!(

@@ -1,15 +1,15 @@
-//! Std endpoint wiring that pumps a sans-I/O [`PubsubAgent`] against the
+//! Std endpoint wiring that pumps a sans-I/O [`GossipsubAgent`] against the
 //! endpoint's swarm: clock sampling, action execution, and stream-event
 //! interception. Mirrors the endpoint's NAT driver.
 //!
 //! Available behind the `pubsub` cargo feature; see the pubsub methods on
 //! [`Endpoint`](crate::Endpoint) and
-//! [`EndpointBuilder::pubsub`](crate::EndpointBuilder::pubsub).
+//! [`EndpointBuilder::gossipsub`](crate::EndpointBuilder::gossipsub).
 
 use std::collections::VecDeque;
 use std::time::Instant;
 
-use minip2p_pubsub::{PubsubAction, PubsubAgent, PubsubEvent};
+use minip2p_pubsub::{GossipsubAction, GossipsubAgent, GossipsubEvent};
 use minip2p_swarm::SwarmEvent;
 
 use crate::EndpointSwarm;
@@ -21,10 +21,10 @@ use crate::Error;
 /// The endpoint's [`Error`] is a re-exported swarm type and cannot grow
 /// variants, so pubsub failures get their own enum wrapping it.
 #[derive(Debug, thiserror::Error)]
-pub enum PubsubError {
-    /// Pubsub was not enabled on this endpoint
-    /// ([`EndpointBuilder::pubsub`](crate::EndpointBuilder::pubsub)).
-    #[error("pubsub is not enabled on this endpoint (EndpointBuilder::pubsub)")]
+pub enum GossipsubError {
+    /// Gossipsub was not enabled on this endpoint
+    /// ([`EndpointBuilder::gossipsub`](crate::EndpointBuilder::gossipsub)).
+    #[error("gossipsub is not enabled on this endpoint (EndpointBuilder::gossipsub)")]
     NotEnabled,
     /// The topic is owned by the active discovery driver and cannot be
     /// withdrawn independently.
@@ -41,18 +41,18 @@ pub enum PubsubError {
     Driver(#[from] Error),
 }
 
-/// Drives the configured [`PubsubAgent`] against the endpoint's swarm.
-pub(crate) struct PubsubDriver {
-    pub(crate) agent: PubsubAgent,
+/// Drives the configured [`GossipsubAgent`] against the endpoint's swarm.
+pub(crate) struct GossipsubDriver {
+    pub(crate) agent: GossipsubAgent,
     /// Pubsub events awaiting the application (drained via
-    /// `Endpoint::take_pubsub_events` / `next_pubsub_event`).
-    pub(crate) events: VecDeque<PubsubEvent>,
+    /// `Endpoint::take_gossipsub_events` / `next_gossipsub_event`).
+    pub(crate) events: VecDeque<GossipsubEvent>,
     /// Monotonic epoch for the agent's `now_ms` clock.
     epoch: Instant,
 }
 
-impl PubsubDriver {
-    pub(crate) fn new(agent: PubsubAgent) -> Self {
+impl GossipsubDriver {
+    pub(crate) fn new(agent: GossipsubAgent) -> Self {
         Self {
             agent,
             events: VecDeque::new(),
@@ -105,9 +105,9 @@ impl PubsubDriver {
         }
     }
 
-    fn execute(&mut self, action: PubsubAction, swarm: &mut EndpointSwarm) {
+    fn execute(&mut self, action: GossipsubAction, swarm: &mut EndpointSwarm) {
         match action {
-            PubsubAction::OpenStream {
+            GossipsubAction::OpenStream {
                 token,
                 peer,
                 protocol_id,
@@ -118,7 +118,7 @@ impl PubsubDriver {
                 let now_ms = self.now_ms();
                 self.agent.stream_open_result(&peer, token, result, now_ms);
             }
-            PubsubAction::SendStream {
+            GossipsubAction::SendStream {
                 token,
                 peer,
                 stream_id,
@@ -137,12 +137,12 @@ impl PubsubDriver {
             // A failed half-close after an accepted write is left to the
             // send deadline / close machinery: the frame may well have
             // been delivered, so failing the work here could double-report.
-            PubsubAction::CloseStreamWrite { peer, stream_id } => {
+            GossipsubAction::CloseStreamWrite { peer, stream_id } => {
                 match swarm.close_stream_write(&peer, stream_id) {
                     Ok(()) | Err(_) => {}
                 }
             }
-            PubsubAction::ResetStream { peer, stream_id } => {
+            GossipsubAction::ResetStream { peer, stream_id } => {
                 // A reset races ordinary teardown, so an already-closed
                 // stream is successful cleanup rather than a second error.
                 match swarm.reset_stream(&peer, stream_id) {

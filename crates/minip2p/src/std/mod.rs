@@ -16,10 +16,8 @@
 //! knowing there is more than one. `bind_quic`, `bind_quic_multiaddr`,
 //! `bind_quic_dual_stack`, and `bind_tcp` are the one-transport shorthands.
 //!
-//! With the `pubsub` feature, `EndpointBuilder::pubsub` selects gossipsub by
-//! default. `EndpointBuilder::pubsub_config` accepts either a
-//! `GossipsubConfig` or `FloodsubConfig`; the selected engine controls which
-//! pubsub protocol ids are advertised.
+//! With the `pubsub` feature, `EndpointBuilder::gossipsub` enables gossipsub
+//! and `EndpointBuilder::gossipsub_config` tunes it with a `GossipsubConfig`.
 //!
 //! The `nat` feature exposes relay, AutoNAT, and DCUtR coordination. The
 //! `discovery` feature includes `nat` and `pubsub`, adding signed presence
@@ -85,9 +83,8 @@ pub use minip2p_nat::{
 use minip2p_platform::StdEntropy;
 #[cfg(feature = "pubsub")]
 pub use minip2p_pubsub::{
-    FLOODSUB_PROTOCOL_ID, FloodsubConfig, GossipsubConfig, MESHSUB_PROTOCOL_ID_V10,
-    MESHSUB_PROTOCOL_ID_V11, PublishError, PubsubConfig, PubsubConfigError, PubsubEvent,
-    TopicError,
+    GOSSIPSUB_PROTOCOL_IDS, GossipsubConfig, GossipsubConfigError, GossipsubEvent,
+    MESHSUB_PROTOCOL_ID_V10, MESHSUB_PROTOCOL_ID_V11, PublishError, TopicError,
 };
 #[cfg(feature = "quic")]
 pub use minip2p_quic::QuicLimits;
@@ -115,7 +112,7 @@ use minip2p_transport::ConnectionNamespace;
 use minip2p_transport::Transport;
 pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet, WaitHandle};
 #[cfg(feature = "pubsub")]
-pub use pubsub::PubsubError;
+pub use pubsub::GossipsubError;
 
 const DEFAULT_AGENT_VERSION: &str = concat!("minip2p/", env!("CARGO_PKG_VERSION"));
 #[cfg(feature = "relay-server")]
@@ -246,7 +243,7 @@ pub struct Endpoint {
     #[cfg(feature = "nat")]
     nat: Option<nat::NatDriver>,
     #[cfg(feature = "pubsub")]
-    pubsub: Option<pubsub::PubsubDriver>,
+    gossipsub: Option<pubsub::GossipsubDriver>,
     #[cfg(any(feature = "discovery", feature = "mdns"))]
     discovery: Option<discovery::DiscoveryDriver>,
     #[cfg(feature = "mdns")]
@@ -277,7 +274,7 @@ pub enum EndpointWake {
     /// At least one agent queue contains an event.
     ///
     /// Drain the enabled queues with `Endpoint::take_relay_server_events`,
-    /// `Endpoint::take_nat_events`, `Endpoint::take_pubsub_events`, or
+    /// `Endpoint::take_nat_events`, `Endpoint::take_gossipsub_events`, or
     /// `Endpoint::take_discovery_events`, as applicable. Before calling
     /// [`Endpoint::next_wake`] again, callers must drain every non-empty agent
     /// queue counted by this notification; otherwise the next call returns
@@ -665,7 +662,7 @@ impl Endpoint {
             return true;
         }
         #[cfg(feature = "pubsub")]
-        if self.pubsub.is_some() {
+        if self.gossipsub.is_some() {
             return true;
         }
         false
@@ -694,7 +691,7 @@ impl Endpoint {
             claimed = nat.ingest(event, &mut self.swarm);
         }
         #[cfg(feature = "pubsub")]
-        if !claimed && let Some(pubsub) = self.pubsub.as_mut() {
+        if !claimed && let Some(pubsub) = self.gossipsub.as_mut() {
             claimed = pubsub.ingest(event, &mut self.swarm);
         }
         #[cfg(any(feature = "nat", feature = "relay-server"))]
@@ -714,7 +711,7 @@ impl Endpoint {
             nat.tick(&mut self.swarm);
         }
         #[cfg(feature = "pubsub")]
-        if let Some(pubsub) = self.pubsub.as_mut() {
+        if let Some(pubsub) = self.gossipsub.as_mut() {
             pubsub.tick(&mut self.swarm);
         }
         #[cfg(feature = "mdns")]
@@ -726,7 +723,7 @@ impl Endpoint {
         if let (Some(discovery), Some(nat)) = (self.discovery.as_mut(), self.nat.as_mut()) {
             discovery.sweep(
                 #[cfg(feature = "discovery")]
-                self.pubsub.as_mut(),
+                self.gossipsub.as_mut(),
                 #[cfg(feature = "mdns")]
                 self.mdns.as_mut(),
                 nat,
@@ -752,7 +749,7 @@ impl Endpoint {
             len += nat.events.len();
         }
         #[cfg(feature = "pubsub")]
-        if let Some(pubsub) = self.pubsub.as_ref() {
+        if let Some(pubsub) = self.gossipsub.as_ref() {
             len += pubsub.events.len();
         }
         #[cfg(any(feature = "discovery", feature = "mdns"))]
@@ -780,7 +777,7 @@ impl Endpoint {
             step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
         }
         #[cfg(feature = "pubsub")]
-        if let Some(pubsub) = self.pubsub.as_ref()
+        if let Some(pubsub) = self.gossipsub.as_ref()
             && let Some(ms) = pubsub.agent.next_timeout(pubsub.now_ms())
         {
             step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
@@ -1270,15 +1267,14 @@ impl Endpoint {
     }
 
     /// Subscribes to a pubsub topic. Returns `Ok(false)` when already
-    /// subscribed. The subscription is announced through the configured
-    /// pubsub routing engine.
+    /// subscribed. The subscription is announced over gossipsub.
     ///
-    /// Errors with [`PubsubError::NotEnabled`] unless the endpoint was
-    /// built with [`EndpointBuilder::pubsub`].
+    /// Errors with [`GossipsubError::NotEnabled`] unless the endpoint was
+    /// built with [`EndpointBuilder::gossipsub`].
     #[cfg(feature = "pubsub")]
-    pub fn subscribe(&mut self, topic: &str) -> Result<bool, PubsubError> {
-        let Some(pubsub) = self.pubsub.as_mut() else {
-            return Err(PubsubError::NotEnabled);
+    pub fn subscribe(&mut self, topic: &str) -> Result<bool, GossipsubError> {
+        let Some(pubsub) = self.gossipsub.as_mut() else {
+            return Err(GossipsubError::NotEnabled);
         };
         let now_ms = pubsub.now_ms();
         let newly = pubsub.agent.subscribe(topic, now_ms)?;
@@ -1289,19 +1285,19 @@ impl Endpoint {
     /// Withdraws a pubsub subscription. Returns `Ok(false)` when not
     /// subscribed. The configured discovery topic is reserved while
     /// discovery is enabled and returns
-    /// [`PubsubError::DiscoveryTopicReserved`].
+    /// [`GossipsubError::DiscoveryTopicReserved`].
     #[cfg(feature = "pubsub")]
-    pub fn unsubscribe(&mut self, topic: &str) -> Result<bool, PubsubError> {
+    pub fn unsubscribe(&mut self, topic: &str) -> Result<bool, GossipsubError> {
         #[cfg(feature = "discovery")]
         if self
             .discovery
             .as_ref()
             .is_some_and(|discovery| discovery.topic() == Some(topic))
         {
-            return Err(PubsubError::DiscoveryTopicReserved);
+            return Err(GossipsubError::DiscoveryTopicReserved);
         }
-        let Some(pubsub) = self.pubsub.as_mut() else {
-            return Err(PubsubError::NotEnabled);
+        let Some(pubsub) = self.gossipsub.as_mut() else {
+            return Err(GossipsubError::NotEnabled);
         };
         let now_ms = pubsub.now_ms();
         let removed = pubsub.agent.unsubscribe(topic, now_ms);
@@ -1310,18 +1306,18 @@ impl Endpoint {
     }
 
     /// Publishes `data` on `topic`, signed with this endpoint's identity and
-    /// routed through the configured pubsub engine.
+    /// forwarded over gossipsub.
     ///
     /// A successful return means the message was accepted and its outbound
     /// streams were initiated — the frames themselves go out as the
     /// endpoint is driven (`next_event` / `poll`), so keep driving after
     /// publishing. Delivery failures are never synchronous errors; they
-    /// surface later as [`PubsubEvent::OutboundFailure`] (or
+    /// surface later as [`GossipsubEvent::OutboundFailure`] (or
     /// [`Event::Error`] runtime events). There is no self-delivery.
     #[cfg(feature = "pubsub")]
-    pub fn publish(&mut self, topic: &str, data: impl Into<Vec<u8>>) -> Result<(), PubsubError> {
-        let Some(pubsub) = self.pubsub.as_mut() else {
-            return Err(PubsubError::NotEnabled);
+    pub fn publish(&mut self, topic: &str, data: impl Into<Vec<u8>>) -> Result<(), GossipsubError> {
+        let Some(pubsub) = self.gossipsub.as_mut() else {
+            return Err(GossipsubError::NotEnabled);
         };
         let now_ms = pubsub.now_ms();
         pubsub.agent.publish(topic, data.into(), now_ms)?;
@@ -1331,8 +1327,8 @@ impl Endpoint {
 
     /// Drains all queued pubsub events.
     #[cfg(feature = "pubsub")]
-    pub fn take_pubsub_events(&mut self) -> Vec<PubsubEvent> {
-        match self.pubsub.as_mut() {
+    pub fn take_gossipsub_events(&mut self) -> Vec<GossipsubEvent> {
+        match self.gossipsub.as_mut() {
             Some(pubsub) => pubsub.events.drain(..).collect(),
             None => Vec::new(),
         }
@@ -1342,20 +1338,20 @@ impl Endpoint {
     /// Application events arriving meanwhile are buffered for
     /// [`Endpoint::next_event`].
     #[cfg(feature = "pubsub")]
-    pub fn next_pubsub_event(
+    pub fn next_gossipsub_event(
         &mut self,
         deadline: impl Into<Deadline>,
-    ) -> Result<Option<PubsubEvent>, PubsubError> {
+    ) -> Result<Option<GossipsubEvent>, GossipsubError> {
         let deadline = deadline.into();
         let mut expired_poll_used = false;
         loop {
-            match self.pubsub.as_mut() {
+            match self.gossipsub.as_mut() {
                 Some(pubsub) => {
                     if let Some(event) = pubsub.events.pop_front() {
                         return Ok(Some(event));
                     }
                 }
-                None => return Err(PubsubError::NotEnabled),
+                None => return Err(GossipsubError::NotEnabled),
             }
             self.ensure_pending_event_capacity()?;
             let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
@@ -1617,7 +1613,7 @@ pub struct EndpointBuilder {
     #[cfg(feature = "nat")]
     autonat_servers: Vec<PeerAddr>,
     #[cfg(feature = "pubsub")]
-    pubsub_config: Option<PubsubConfig>,
+    gossipsub_config: Option<GossipsubConfig>,
     #[cfg(feature = "discovery")]
     discovery_config: Option<BeaconConfig>,
     #[cfg(feature = "mdns")]
@@ -1649,7 +1645,7 @@ impl Default for EndpointBuilder {
             #[cfg(feature = "nat")]
             autonat_servers: Vec::new(),
             #[cfg(feature = "pubsub")]
-            pubsub_config: None,
+            gossipsub_config: None,
             #[cfg(feature = "discovery")]
             discovery_config: None,
             #[cfg(feature = "mdns")]
@@ -1678,7 +1674,7 @@ struct BuilderParts {
     #[cfg(feature = "nat")]
     nat_config: Option<NatConfig>,
     #[cfg(feature = "pubsub")]
-    pubsub_config: Option<PubsubConfig>,
+    gossipsub_config: Option<GossipsubConfig>,
     #[cfg(feature = "discovery")]
     discovery_config: Option<BeaconConfig>,
     #[cfg(feature = "mdns")]
@@ -1874,23 +1870,22 @@ impl EndpointBuilder {
     /// Enables pubsub with the default gossipsub configuration.
     ///
     /// Builder-time opt-in (rather than a lazy `subscribe`-time enable)
-    /// because the selected engine's protocol ids must be in Identify's
-    /// advertised set from the first handshake.
+    /// because the gossipsub protocol ids must be in Identify's advertised
+    /// set from the first handshake.
     #[cfg(feature = "pubsub")]
-    pub fn pubsub(mut self) -> Self {
-        self.pubsub_config.get_or_insert_with(PubsubConfig::default);
+    pub fn gossipsub(mut self) -> Self {
+        self.gossipsub_config
+            .get_or_insert_with(GossipsubConfig::default);
         self
     }
 
-    /// Enables pubsub with an explicit gossipsub or floodsub configuration.
+    /// Enables pubsub with an explicit gossipsub configuration.
     ///
-    /// [`GossipsubConfig`] and [`FloodsubConfig`] both convert into
-    /// [`PubsubConfig`]. The selected engine determines which protocol ids
-    /// the endpoint advertises. Invalid gossipsub relationships or zero
-    /// bounds fail the later `bind_quic*` call before a socket is allocated.
+    /// Invalid mesh relationships or zero bounds fail the later `bind()`
+    /// before a socket is allocated.
     #[cfg(feature = "pubsub")]
-    pub fn pubsub_config(mut self, config: impl Into<PubsubConfig>) -> Self {
-        self.pubsub_config = Some(config.into());
+    pub fn gossipsub_config(mut self, config: GossipsubConfig) -> Self {
+        self.gossipsub_config = Some(config);
         self
     }
 
@@ -1901,7 +1896,8 @@ impl EndpointBuilder {
     /// subscription events are consumed before reaching the application.
     #[cfg(feature = "discovery")]
     pub fn discovery(mut self) -> Self {
-        self.pubsub_config.get_or_insert_with(PubsubConfig::default);
+        self.gossipsub_config
+            .get_or_insert_with(GossipsubConfig::default);
         self.discovery_config = Some(BeaconConfig::default());
         self
     }
@@ -1915,7 +1911,8 @@ impl EndpointBuilder {
     #[cfg(feature = "discovery")]
     pub fn discovery_config(mut self, config: BeaconConfig) -> Result<Self, DiscoveryConfigError> {
         config.validate()?;
-        self.pubsub_config.get_or_insert_with(PubsubConfig::default);
+        self.gossipsub_config
+            .get_or_insert_with(GossipsubConfig::default);
         self.discovery_config = Some(config);
         Ok(self)
     }
@@ -2004,7 +2001,7 @@ impl EndpointBuilder {
             .into());
         }
         #[cfg(feature = "pubsub")]
-        if let Some(config) = &self.pubsub_config {
+        if let Some(config) = &self.gossipsub_config {
             config
                 .validate()
                 .map_err(|error| TransportError::InvalidConfig {
@@ -2067,7 +2064,7 @@ impl EndpointBuilder {
             #[cfg(feature = "nat")]
             nat_config,
             #[cfg(feature = "pubsub")]
-            pubsub_config: self.pubsub_config,
+            gossipsub_config: self.gossipsub_config,
             #[cfg(feature = "discovery")]
             discovery_config: self.discovery_config,
             #[cfg(feature = "mdns")]
@@ -2280,11 +2277,10 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
         }
     }
     #[cfg(feature = "pubsub")]
-    if let Some(config) = &parts.pubsub_config {
-        // Pubsub streams route as ordinary user protocols, and the selected
-        // engine's ids must be advertised by Identify from the first
-        // handshake.
-        for id in config.protocol_ids() {
+    if parts.gossipsub_config.is_some() {
+        // Pubsub streams route as ordinary user protocols, and the gossipsub
+        // ids must be advertised by Identify from the first handshake.
+        for id in minip2p_pubsub::GOSSIPSUB_PROTOCOL_IDS {
             if !protocols.iter().any(|existing| existing == id) {
                 protocols.push((*id).to_string());
             }
@@ -2352,9 +2348,9 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
     #[cfg(any(feature = "discovery", feature = "mdns"))]
     let peer_discovery_config = parts.peer_discovery_config;
     #[cfg(feature = "pubsub")]
-    let pubsub = parts
-        .pubsub_config
-        .map(|config| -> Result<pubsub::PubsubDriver, Error> {
+    let gossipsub = parts
+        .gossipsub_config
+        .map(|config| -> Result<pubsub::GossipsubDriver, Error> {
             // Message ids are (from, seqno); a wall-clock seed keeps restarts
             // from reusing ids the network may still remember. Mix the local
             // identity into the peer-selection seed so endpoints created in the
@@ -2372,7 +2368,7 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
                 .fold(initial_seqno ^ (timestamp >> 64) as u64, |seed, byte| {
                     seed.rotate_left(5) ^ u64::from(*byte)
                 });
-            let agent = minip2p_pubsub::PubsubAgent::new(
+            let agent = minip2p_pubsub::GossipsubAgent::new(
                 parts.keypair.clone(),
                 config,
                 initial_seqno,
@@ -2381,13 +2377,13 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
             .map_err(|error| TransportError::InvalidConfig {
                 reason: error.to_string(),
             })?;
-            Ok(pubsub::PubsubDriver::new(agent))
+            Ok(pubsub::GossipsubDriver::new(agent))
         })
         .transpose()?;
     #[cfg(feature = "discovery")]
-    let mut pubsub = pubsub;
+    let mut gossipsub = gossipsub;
     #[cfg(feature = "discovery")]
-    if let (Some(pubsub), Some(config)) = (pubsub.as_mut(), discovery_config.as_ref()) {
+    if let (Some(pubsub), Some(config)) = (gossipsub.as_mut(), discovery_config.as_ref()) {
         #[expect(
             clippy::map_err_ignore,
             reason = "Both agents validate the shared topic before construction, so this exposes a stable invariant."
@@ -2482,7 +2478,7 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
         #[cfg(feature = "nat")]
         nat,
         #[cfg(feature = "pubsub")]
-        pubsub,
+        gossipsub,
         #[cfg(any(feature = "discovery", feature = "mdns"))]
         discovery,
         #[cfg(feature = "mdns")]
@@ -3056,16 +3052,16 @@ mod tests {
     #[test]
     fn next_wake_reports_queued_pubsub_progress_without_consuming_it() {
         let mut endpoint = Endpoint::builder()
-            .pubsub()
+            .gossipsub()
             .bind_quic("127.0.0.1:0")
             .expect("bind pubsub endpoint");
         let peer = Ed25519Keypair::generate().peer_id();
         endpoint
-            .pubsub
+            .gossipsub
             .as_mut()
             .expect("pubsub configured")
             .events
-            .push_back(PubsubEvent::PeerSubscribed {
+            .push_back(GossipsubEvent::PeerSubscribed {
                 peer: peer.clone(),
                 topic: "test".into(),
             });
@@ -3075,8 +3071,8 @@ mod tests {
             EndpointWake::DriverProgress
         ));
         assert!(matches!(
-            endpoint.take_pubsub_events().as_slice(),
-            [PubsubEvent::PeerSubscribed {
+            endpoint.take_gossipsub_events().as_slice(),
+            [GossipsubEvent::PeerSubscribed {
                 peer: returned,
                 topic
             }] if returned == &peer && topic == "test"
@@ -3242,7 +3238,7 @@ mod tests {
 
         assert!(matches!(
             endpoint.unsubscribe(topic),
-            Err(PubsubError::DiscoveryTopicReserved)
+            Err(GossipsubError::DiscoveryTopicReserved)
         ));
     }
 
@@ -3432,9 +3428,9 @@ mod tests {
 
     #[cfg(feature = "pubsub")]
     #[test]
-    fn pubsub_focused_waits_do_not_repoll_buffered_application_events() {
+    fn gossipsub_focused_waits_do_not_repoll_buffered_application_events() {
         let mut endpoint = Endpoint::builder()
-            .pubsub()
+            .gossipsub()
             .bind_quic("127.0.0.1:0")
             .expect("bind endpoint");
         let unrelated = Ed25519Keypair::generate().peer_id();
@@ -3446,10 +3442,10 @@ mod tests {
         });
         assert!(
             endpoint
-                .next_pubsub_event(Duration::ZERO)
+                .next_gossipsub_event(Duration::ZERO)
                 .expect("pubsub wait")
                 .is_none(),
-            "a buffered application event must not make next_pubsub_event spin"
+            "a buffered application event must not make next_gossipsub_event spin"
         );
         assert!(matches!(
             endpoint
@@ -3466,8 +3462,8 @@ mod tests {
             });
         }
         assert!(matches!(
-            endpoint.next_pubsub_event(Deadline::NEVER),
-            Err(PubsubError::Driver(Error::EventBacklogExceeded { limit }))
+            endpoint.next_gossipsub_event(Deadline::NEVER),
+            Err(GossipsubError::Driver(Error::EventBacklogExceeded { limit }))
                 if limit == RUN_UNTIL_SKIP_LIMIT
         ));
     }
