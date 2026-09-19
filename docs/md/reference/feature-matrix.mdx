@@ -15,7 +15,6 @@ Cargo features control what code is available. Builder methods control what runs
 | Reachability probing | `nat` | `.autonat_server(server)` or a `NatConfig` with probe servers | AutoNAT probes and reachability state | Reachable AutoNAT server |
 | Relayed connections and DCUtR | `nat` | `.relay(relay)` or relay-bearing `.nat_config(...)` | Reservations, relay races, and hole punching | Reachable Circuit Relay v2 server |
 | Gossipsub | `pubsub` | `.pubsub()` or gossipsub `.pubsub_config(...)` | Signed gossipsub messages | At least one compatible mesh peer |
-| Floodsub | `pubsub` | `.pubsub_config(FloodsubConfig::default())` | Floodsub routing | At least one floodsub peer |
 | Signed discovery | `discovery` | `.discovery()` or `.discovery_config(...)` | Signed beacons, shared peer book, and optional automatic dialing | A connected discovery peer; relay optional for direct-only addresses |
 | Local-link discovery | `mdns` | `.mdns()` or `.mdns_config(...)` | Local observations, shared peer book, and optional automatic dialing | Multicast-capable local network and interface |
 
@@ -76,8 +75,6 @@ Compiled with `features = ["pubsub"]`:
 - Topics: `subscribe`, `unsubscribe`, `publish`
 - Events: `take_pubsub_events`, `next_pubsub_event`
 
-Gossipsub is the default. Floodsub is an explicit engine selection.
-
 ## Discovery API
 
 Compiled with `features = ["discovery"]`, which includes the `nat` and `pubsub` Cargo features:
@@ -108,8 +105,7 @@ Node.js and React Native accept the same `Minip2pConfig`. It selects the capabil
 | Capability | Configuration | Active behavior | Infrastructure |
 | --- | --- | --- | --- |
 | Direct QUIC/TCP, Identify, Ping, custom streams | `secretKey`; optional `transports` and `protocols` | `Minip2p.create` starts the endpoint; transport default is dual-stack QUIC only | A mutually reachable UDP or TCP path |
-| Gossipsub | Default, or `pubsubRouter: PubsubRouter.Gossipsub` | Signed outbound pubsub and strict inbound validation | At least one compatible mesh peer |
-| Floodsub | `pubsubRouter: PubsubRouter.Floodsub` | Floodsub routing | At least one floodsub peer |
+| Gossipsub | Always on | Signed outbound pubsub and strict inbound validation | At least one compatible mesh peer |
 | Signed discovery | `discovery: { topic, ... }` | Signed beacons, shared peer book, optional auto-dial | A connected discovery peer |
 | Local-link discovery | `mdns: true` or options | mDNS, shared peer book, optional auto-dial | A multicast-capable local network; mobile hosts also need local-network permissions |
 | Reachability probing | `autonatServers: [...]` | AutoNAT probes | Reachable AutoNAT server |

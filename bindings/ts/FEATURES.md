@@ -11,7 +11,7 @@
 | Custom protocol registration | `protocols` configuration, `addProtocol` |
 | Negotiated streams | Promise-returning `openStream` and `Stream` handles with `write`, `read`, `closeWrite`, `reset`, and `abandon` |
 | Relay, AutoNAT, DCUtR | Promise-returning `connect*`, advanced `startConnect*`/`waitConnectResult`, `path(peerId)`, and typed path/reachability events |
-| Pubsub | gossipsub or floodsub selection, subscribe/unsubscribe/publish, pubsub events |
+| Pubsub | gossipsub subscribe/unsubscribe/publish, pubsub events |
 | Signed discovery | discovery configuration, `knownPeers`, discovery events |
 | mDNS | mDNS configuration, merged `knownPeers`, source-tagged discovery events |
 | Shutdown | `close`, `onClose`, and `Symbol.dispose`; the low-level native export also provides `stop`/`waitStopped` |

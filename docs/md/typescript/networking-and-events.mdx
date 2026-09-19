@@ -86,35 +86,6 @@ endpoint.unsubscribe(topic);
 
 There is no self-delivery. Apply the local UI action directly and use the event for remote messages. Queue pressure throws `BackpressureError` synchronously; later forwarding failures arrive as `pubsubOutboundFailure`.
 
-Select floodsub only for interoperability:
-
-<Tabs>
-  <Tab title="Node.js">
-
-    ```ts
-    import { PubsubRouter } from "@minip2p/node";
-
-    const endpoint = Minip2p.create({
-      secretKey,
-      pubsubRouter: PubsubRouter.Floodsub,
-    });
-    ```
-
-  </Tab>
-  <Tab title="React Native">
-
-    ```ts
-    import { PubsubRouter } from "@minip2p/react-native";
-
-    const endpoint = Minip2p.create({
-      secretKey,
-      pubsubRouter: PubsubRouter.Floodsub,
-    });
-    ```
-
-  </Tab>
-</Tabs>
-
 `allowUnsigned: true` accepts unsigned inbound application messages. When `message.signed` is `false`, both the bytes and `fromPeerId` are attacker-controlled; do not treat either as authenticated identity.
 
 ## Signed discovery
