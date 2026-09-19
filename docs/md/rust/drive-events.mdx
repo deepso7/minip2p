@@ -68,6 +68,11 @@ fn run(mut node: Endpoint, peer: minip2p::PeerId) -> Result<(), minip2p::Error> 
     // unrelated event or interruption.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
+        // `wait` may still return already-available events after the Instant
+        // expires, so check the wall clock before each call.
+        if Instant::now() >= deadline {
+            break;
+        }
         match node.wait(deadline)? {
             EndpointWaitOutcome::Event(EndpointEvent::PeerReady { peer_id, .. })
                 if peer_id == peer =>
