@@ -243,8 +243,14 @@ export interface Minip2pNamedEventMap {
   };
   peerSubscribed: { readonly peerId: string; readonly topic: string };
   peerUnsubscribed: { readonly peerId: string; readonly topic: string };
-  gossipsubOutboundFailure: { readonly peerId: string; readonly reason: string };
-  gossipsubProtocolViolation: { readonly peerId: string; readonly reason: string };
+  gossipsubOutboundFailure: {
+    readonly peerId: string;
+    readonly reason: string;
+  };
+  gossipsubProtocolViolation: {
+    readonly peerId: string;
+    readonly reason: string;
+  };
   peerDiscovered: {
     readonly peerId: string;
     readonly addrs: readonly string[];
@@ -356,6 +362,8 @@ export const P2pEvent_Tags = {
   EndpointError: "EndpointError",
   EventsDropped: "EventsDropped",
   FellBackToRelay: "FellBackToRelay",
+  GossipsubOutboundFailure: "GossipsubOutboundFailure",
+  GossipsubProtocolViolation: "GossipsubProtocolViolation",
   HolePunchFailed: "HolePunchFailed",
   IdentifyReceived: "IdentifyReceived",
   InboundDirectUpgrade: "InboundDirectUpgrade",
@@ -372,8 +380,6 @@ export const P2pEvent_Tags = {
   PingRttMeasured: "PingRttMeasured",
   PingTimeout: "PingTimeout",
   PublicAddressesChanged: "PublicAddressesChanged",
-  GossipsubOutboundFailure: "GossipsubOutboundFailure",
-  GossipsubProtocolViolation: "GossipsubProtocolViolation",
   ReachabilityChanged: "ReachabilityChanged",
   RelayReservationLost: "RelayReservationLost",
   RelayReserved: "RelayReserved",
