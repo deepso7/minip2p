@@ -132,7 +132,7 @@ fn try_bind(
             AutomaticBind::Both => {
                 let ipv4: Multiaddr = DEFAULT_IPV4_QUIC.parse()?;
                 let ipv6: Multiaddr = DEFAULT_IPV6_QUIC.parse()?;
-                builder.quic_dual_multiaddr(&ipv4, &ipv6)
+                builder.quic_dual_multiaddr(&ipv4, &ipv6)?
             }
             AutomaticBind::Ipv4 => builder.quic(DEFAULT_IPV4_BIND),
             AutomaticBind::Ipv6 => builder.quic(DEFAULT_IPV6_BIND),
@@ -143,7 +143,7 @@ fn try_bind(
             [first, second] => {
                 let first = quic_multiaddr(first)?;
                 let second = quic_multiaddr(second)?;
-                builder = builder.quic_dual_multiaddr(&first, &second);
+                builder = builder.quic_dual_multiaddr(&first, &second)?;
             }
             _ => return Err("--quic accepts at most one IPv4 and one IPv6 address".into()),
         }

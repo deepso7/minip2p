@@ -62,7 +62,7 @@ fn build_endpoint(
     match &options.listen_addr {
         Some(addr) if addr.is_tcp_transport() => builder
             .tcp_multiaddr(addr)
-            .bind()
+            .and_then(|builder| builder.bind())
             .map_err(|e| format!("TCP bind {addr}: {e}").into()),
         Some(addr) => builder
             .bind_quic_multiaddr(addr)
