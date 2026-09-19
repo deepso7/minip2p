@@ -2408,7 +2408,7 @@ fn bind_transports(_parts: &BuilderParts) -> Result<TransportSet, Error> {
                         }
                         _ => {
                             return Err(TransportError::InvalidConfig {
-                                reason: "legacy quic host:port binds cannot be combined with other QUIC listens; use listen(...) for dual-stack"
+                                reason: "legacy quic host:port binds cannot be combined with other QUIC listens; use listen_on(...) or listen_default() for dual-stack"
                                     .into(),
                             }
                             .into());
@@ -2868,7 +2868,7 @@ mod tests {
     #[test]
     fn one_address_shape_cannot_be_bound_twice() {
         // Two legacy QUIC host:port binds cannot share one Quic member (same as
-        // main's DuplicateKind refusal). Use listen(...) for dual-stack.
+        // main's DuplicateKind refusal). Use listen_on / listen_default for dual-stack.
         let Err(error) = Endpoint::builder()
             .quic("127.0.0.1:0")
             .quic("127.0.0.1:0")
