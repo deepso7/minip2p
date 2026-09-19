@@ -25,7 +25,7 @@ The gossipsub router implements the interoperability core used by meshsub v1.0 a
 
 This is deliberately a focused compatibility implementation, not a claim of complete gossipsub conformance. Peer scoring, opportunistic grafting, peer exchange dialing, flood-publish, gossip promises/penalties, and v1.2 extensions are not implemented. Decoded PRUNE peer-exchange records are preserved by the wire codec but ignored by the router.
 
-`GossipsubConfig` exposes mesh degrees, heartbeat/cache/fanout lifetimes, backoff limits, spam budgets, memory bounds, stream-establishment timeout, and unsigned-message policy. `GossipsubAgent::new` validates it and returns `PubsubConfigError` for inconsistent or zero bounds. `d_lazy = 0` disables gossip emission, while `fanout_ttl_ms = 0` disables fanout reuse.
+`GossipsubConfig` exposes mesh degrees, heartbeat/cache/fanout lifetimes, backoff limits, spam budgets, memory bounds, stream-establishment timeout, and unsigned-message policy. `GossipsubAgent::new` validates it and returns `GossipsubConfigError` for inconsistent or zero bounds. `d_lazy = 0` disables gossip emission, while `fanout_ttl_ms = 0` disables fanout reuse.
 
 ## Wire compatibility and signing
 

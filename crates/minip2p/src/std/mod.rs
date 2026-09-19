@@ -84,7 +84,7 @@ use minip2p_platform::StdEntropy;
 #[cfg(feature = "pubsub")]
 pub use minip2p_pubsub::{
     GossipsubConfig, MESHSUB_PROTOCOL_ID_V10, MESHSUB_PROTOCOL_ID_V11, PublishError,
-    PubsubConfigError, PubsubEvent, TopicError,
+    GossipsubConfigError, PubsubEvent, TopicError,
 };
 #[cfg(feature = "quic")]
 pub use minip2p_quic::QuicLimits;
@@ -1267,8 +1267,7 @@ impl Endpoint {
     }
 
     /// Subscribes to a pubsub topic. Returns `Ok(false)` when already
-    /// subscribed. The subscription is announced through the configured
-    /// pubsub routing engine.
+    /// subscribed. The subscription is announced over gossipsub.
     ///
     /// Errors with [`PubsubError::NotEnabled`] unless the endpoint was
     /// built with [`EndpointBuilder::pubsub`].
@@ -1307,7 +1306,7 @@ impl Endpoint {
     }
 
     /// Publishes `data` on `topic`, signed with this endpoint's identity and
-    /// routed through the configured pubsub engine.
+    /// forwarded over gossipsub.
     ///
     /// A successful return means the message was accepted and its outbound
     /// streams were initiated — the frames themselves go out as the

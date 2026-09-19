@@ -10,7 +10,7 @@ use minip2p_identity::Ed25519Keypair;
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::StreamId;
 
-use super::config::{GossipsubConfig, PubsubConfigError};
+use super::config::{GossipsubConfig, GossipsubConfigError};
 use super::mcache::MessageCache;
 use crate::events::{
     PublishError, PubsubAction, PubsubEvent, PubsubToken, SharedFrame, TopicError,
@@ -450,7 +450,7 @@ impl GossipsubAgent {
         config: GossipsubConfig,
         initial_seqno: u64,
         entropy_seed: u64,
-    ) -> Result<Self, PubsubConfigError> {
+    ) -> Result<Self, GossipsubConfigError> {
         config.validate()?;
         let local_peer_id = keypair.peer_id();
         let mcache = MessageCache::new(config.mcache_len, config.max_mcache_messages);

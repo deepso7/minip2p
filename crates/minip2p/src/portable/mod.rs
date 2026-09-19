@@ -30,7 +30,7 @@ pub use minip2p_nat::{
 };
 #[cfg(all(feature = "pubsub", not(feature = "std")))]
 pub use minip2p_pubsub::{
-    GossipsubConfig, PublishError, PubsubConfigError, PubsubEvent, TopicError,
+    GossipsubConfig, GossipsubConfigError, PublishError, PubsubEvent, TopicError,
 };
 #[cfg(feature = "smoltcp")]
 pub use minip2p_tcp::{SmoltcpConfig, SmoltcpStack, SmoltcpTcpProvider, smoltcp};
@@ -1494,9 +1494,9 @@ pub enum SmoltcpBuildError {
     Mdns(MdnsError),
     /// mDNS or bounded discovery policy was invalid.
     MdnsConfig(PortableMdnsConfigError),
-    /// Pubsub routing policy was invalid.
+    /// Gossipsub configuration was invalid.
     #[cfg(feature = "pubsub")]
-    Pubsub(PubsubConfigError),
+    Pubsub(GossipsubConfigError),
     /// The reserved discovery topic was invalid.
     #[cfg(feature = "pubsub")]
     Topic(TopicError),

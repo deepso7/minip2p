@@ -20,7 +20,7 @@ mod message;
 mod seen;
 
 pub use events::{PublishError, PubsubAction, PubsubEvent, PubsubToken, TopicError};
-pub use gossipsub::{GossipsubAgent, GossipsubConfig, PubsubConfigError};
+pub use gossipsub::{GossipsubAgent, GossipsubConfig, GossipsubConfigError};
 pub use message::{
     ControlGraft, ControlIHave, ControlIWant, ControlMessage, ControlPrune, FrameDecode,
     GOSSIPSUB_PROTOCOL_IDS, MAX_RPC_SIZE, MAX_TOPIC_LEN, MESHSUB_PROTOCOL_ID_V10,
