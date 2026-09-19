@@ -19,7 +19,7 @@ fn peer(seed: u8) -> PeerId {
 }
 
 fn agent_with(config: GossipsubConfig) -> GossipsubAgent {
-    GossipsubAgent::new(keypair(1), config, 100, 7)
+    GossipsubAgent::new(keypair(1), config, 100, 7).expect("valid gossipsub config")
 }
 
 fn agent() -> GossipsubAgent {
@@ -1495,6 +1495,7 @@ fn disconnect_and_supersede_aggregate_queued_failures() {
 fn publish_backpressure_is_all_or_nothing_across_mesh_peers() {
     let config = GossipsubConfig {
         d: 2,
+        d_low: 2,
         max_pending_per_peer: 1,
         ..GossipsubConfig::default()
     };
@@ -1588,6 +1589,7 @@ fn zero_gossip_degree_emits_no_ihave() {
 fn zero_fanout_ttl_reselects_for_each_publish() {
     let config = GossipsubConfig {
         d: 1,
+        d_low: 1,
         fanout_ttl_ms: 0,
         ..GossipsubConfig::default()
     };
