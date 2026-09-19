@@ -192,7 +192,7 @@ fn portable_autonat_builds_without_relay_state() {
         .expect("portable AutoNAT endpoint builds");
 
     assert_eq!(endpoint.reachability(), minip2p::ReachabilityState::Unknown);
-    assert_eq!(endpoint.stats().listen_addresses.len(), 1);
+    assert_eq!(endpoint.stats().bound_addresses.len(), 1);
 
     let now = Now::from_millis(0);
     endpoint.poll(now).expect("AutoNAT schedules its probe");

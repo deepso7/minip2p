@@ -32,7 +32,7 @@ let absolute = Instant::now() + Duration::from_secs(5);
 let forever = Deadline::NEVER;
 ```
 
-An expired deadline still permits the endpoint to inspect events that are already synchronously available, but it will not sleep or poll repeatedly past the deadline.
+An already-passed absolute deadline returns `Deadline` from `wait` / `next_wake` (or `None` from `next_event`) before delivering another queued event. The endpoint does not sleep or poll repeatedly past the deadline.
 
 ## Wait for a milestone
 
@@ -68,11 +68,6 @@ fn run(mut node: Endpoint, peer: minip2p::PeerId) -> Result<(), minip2p::Error> 
     // unrelated event or interruption.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        // `wait` may still return already-available events after the Instant
-        // expires, so check the wall clock before each call.
-        if Instant::now() >= deadline {
-            break;
-        }
         match node.wait(deadline)? {
             EndpointWaitOutcome::Event(EndpointEvent::PeerReady { peer_id, .. })
                 if peer_id == peer =>

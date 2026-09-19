@@ -2038,32 +2038,79 @@ mod tests {
 
     #[test]
     fn peer_ready_state_updates_before_event_is_queued() {
+        use minip2p_core::encode_frame;
+        use minip2p_identify::IDENTIFY_PROTOCOL_ID;
+
         let mut core = test_core();
         let peer_id = PeerId::from_public_key_protobuf(b"ready-before-event-peer");
         let conn_id = ConnectionId::new(92);
-        core.conn_to_peer.insert(conn_id, peer_id.clone());
-        core.peer_to_conn.insert(peer_id.clone(), conn_id);
-        core.established_peers.insert(peer_id.clone());
-        core.peer_info.insert(
-            peer_id.clone(),
-            IdentifyMessage {
-                protocol_version: Some("ipfs/0.1.0".into()),
-                agent_version: Some("test".into()),
-                public_key: None,
-                listen_addrs: Vec::new(),
-                observed_addr: None,
-                protocols: alloc::vec!["/test/1.0.0".into()],
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
             },
         );
 
-        core.try_emit_peer_ready(&peer_id);
+        // Connected auto-opens identify. Complete the outbound initiator path.
+        let token = drain_actions(&mut core)
+            .into_iter()
+            .find_map(|action| match action {
+                SwarmAction::OpenStream { token, .. } => Some(token),
+                _ => None,
+            })
+            .expect("identify OpenStream after Connected");
+        let stream_id = StreamId::new(1);
+        core.handle_input(SwarmInput::StreamOpened {
+            conn_id,
+            stream_id,
+            token,
+            now_ms: 0,
+        });
+        let _ = drain_actions(&mut core);
+
+        let mut accept = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+        accept.extend_from_slice(&multistream_frame(IDENTIFY_PROTOCOL_ID));
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn_id,
+                stream_id,
+                data: accept,
+            },
+        );
+        let _ = drain_actions(&mut core);
+
+        let info = IdentifyMessage {
+            protocol_version: Some("ipfs/0.1.0".into()),
+            agent_version: Some("test".into()),
+            public_key: None,
+            listen_addrs: Vec::new(),
+            observed_addr: None,
+            protocols: alloc::vec!["/test/1.0.0".into()],
+        };
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn_id,
+                stream_id,
+                data: encode_frame(&info.encode()),
+            },
+        );
+        feed(
+            &mut core,
+            TransportEvent::StreamRemoteWriteClosed {
+                id: conn_id,
+                stream_id,
+            },
+        );
 
         assert!(
             core.is_peer_ready(&peer_id),
             "ready state is set before the event is drained"
         );
         assert!(
-            core.events.iter().any(|event| {
+            drain_events(&mut core).iter().any(|event| {
                 matches!(
                     event,
                     SwarmEvent::PeerReady { peer_id: ready, .. } if *ready == peer_id

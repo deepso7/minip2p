@@ -150,7 +150,7 @@ impl PortableNatDriver {
         now: Now,
     ) {
         self.agent
-            .set_listen_addrs(&endpoint.stats().listen_addresses);
+            .set_listen_addrs(&endpoint.stats().bound_addresses);
         if self.agent.next_timeout(now.monotonic_ms) == Some(0) {
             self.agent.handle_tick(Self::now(now));
         }
