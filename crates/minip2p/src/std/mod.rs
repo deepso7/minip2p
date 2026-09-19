@@ -647,6 +647,13 @@ impl Endpoint {
     ///     // and interruptions would reset the timeout.
     ///     let deadline = Instant::now() + Duration::from_secs(10);
     ///     loop {
+    ///         // `wait` may still return already-available events after the
+    ///         // Instant expires, so check the wall clock before each call.
+    ///         if Instant::now() >= deadline {
+    ///             return Err(minip2p::Error::Invariant {
+    ///                 reason: "peer did not become ready before the deadline",
+    ///             });
+    ///         }
     ///         match node.wait(deadline)? {
     ///             EndpointWaitOutcome::Event(EndpointEvent::PeerReady { peer_id, .. })
     ///                 if peer_id == peer =>
