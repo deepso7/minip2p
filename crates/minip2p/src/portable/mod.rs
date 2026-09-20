@@ -193,11 +193,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     }
 
     #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
-    pub(crate) fn observe_connect(
-        &mut self,
-        event: &minip2p_swarm::SwarmEvent,
-        now: Now,
-    ) -> bool {
+    pub(crate) fn observe_connect(&mut self, event: &minip2p_swarm::SwarmEvent, now: Now) -> bool {
         self.connect
             .observe(event, &mut self.runtime, now.monotonic_ms)
     }
@@ -363,7 +359,9 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         let mut events = alloc::vec::Vec::new();
         Self::drain_connect_events(&mut self.connect, &mut events);
         for event in self.runtime.poll(now)? {
-            let consumed = self.connect.observe(&event, &mut self.runtime, now.monotonic_ms);
+            let consumed = self
+                .connect
+                .observe(&event, &mut self.runtime, now.monotonic_ms);
             if !consumed {
                 events.push(EndpointEvent::from(event));
             }

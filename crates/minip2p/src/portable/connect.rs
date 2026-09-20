@@ -416,9 +416,7 @@ impl ConnectEngine {
                 }
                 false
             }
-            SwarmEvent::ConnectionClosed { conn_id, .. } => {
-                self.suppress_closed.remove(conn_id)
-            }
+            SwarmEvent::ConnectionClosed { conn_id, .. } => self.suppress_closed.remove(conn_id),
             _ => false,
         }
     }
