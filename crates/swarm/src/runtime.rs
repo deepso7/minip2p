@@ -311,15 +311,24 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     /// Closes a dial that has not established. Silent: no
     /// [`SwarmEvent::DialFailed`] follows.
     ///
-    /// Unknown or already-established connection ids are a no-op. Never
-    /// disconnects an established peer.
-    pub fn abort_dial(&mut self, conn_id: ConnectionId) -> Result<(), DriverError> {
-        if !self.core.forget_dial(conn_id) {
-            return Ok(());
-        }
+    /// Returns `Ok(true)` when the dial was still pending and was forgotten.
+    /// Returns `Ok(false)` when it was not pending (already established,
+    /// already failed, or unknown) — a [`SwarmEvent::DialFailed`] may already
+    /// be queued for that id. Never disconnects an established peer.
+    ///
+    /// If `close` fails after the dial was taken off the pending map, the
+    /// pending entry is restored so a later close still surfaces as
+    /// [`SwarmEvent::DialFailed`] rather than a silent half-aborted dial.
+    pub fn abort_dial(&mut self, conn_id: ConnectionId) -> Result<bool, DriverError> {
+        let Some(addr) = self.core.take_pending_dial_addr(conn_id) else {
+            return Ok(false);
+        };
         match self.transport.close(conn_id) {
-            Ok(()) | Err(TransportError::ConnectionNotFound { .. }) => Ok(()),
-            Err(error) => Err(error.into()),
+            Ok(()) | Err(TransportError::ConnectionNotFound { .. }) => Ok(true),
+            Err(error) => {
+                self.core.note_dial(conn_id, addr);
+                Err(error.into())
+            }
         }
     }
 
@@ -840,6 +849,7 @@ mod tests {
     struct ScriptedTransport {
         initial: Vec<TransportEvent>,
         next_stream_id: u64,
+        next_conn_id: u64,
         opened: usize,
         deadline: Option<Deadline>,
         /// When set, every locally opened stream gets a multistream-select
@@ -854,6 +864,8 @@ mod tests {
         close_count: usize,
         /// Second `close` returns `ConnectionNotFound` (TCP after map removal).
         fail_second_close: bool,
+        /// Every `close` fails with a non-`ConnectionNotFound` error.
+        refuse_close: bool,
     }
 
     impl ScriptedTransport {
@@ -869,7 +881,8 @@ mod tests {
 
     impl Transport for ScriptedTransport {
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
-            Err(TransportError::Unsupported { operation: "dial" })
+            self.next_conn_id += 1;
+            Ok(ConnectionId::new(self.next_conn_id))
         }
 
         fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
@@ -957,6 +970,11 @@ mod tests {
 
         fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
             self.close_count += 1;
+            if self.refuse_close {
+                return Err(TransportError::InvalidConfig {
+                    reason: String::from("close refused"),
+                });
+            }
             if self.fail_second_close && self.close_count > 1 {
                 return Err(TransportError::ConnectionNotFound { id });
             }
@@ -1285,6 +1303,45 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, SwarmEvent::Error(_))),
             "already-gone close must not surface as Error: {events:?}"
+        );
+    }
+
+    #[test]
+    fn abort_dial_restores_pending_when_close_fails() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let addr = PeerAddr::new(
+            "/ip4/198.51.100.8/udp/4001/quic-v1".parse().expect("addr"),
+            peer,
+        )
+        .expect("peer addr");
+        let mut runtime = runtime_with(
+            ScriptedTransport {
+                refuse_close: true,
+                ..ScriptedTransport::default()
+            },
+            SeqEntropy(1),
+        );
+        let conn_id = runtime.dial(&addr).expect("dial");
+        assert!(
+            runtime.abort_dial(conn_id).is_err(),
+            "close refusal must surface"
+        );
+        // Pending dial was restored: a later close still emits DialFailed,
+        // not a silent half-aborted dial that can still establish.
+        runtime
+            .transport_mut()
+            .initial
+            .push(TransportEvent::Closed { id: conn_id });
+        let events = runtime.poll(Now::from_millis(0)).expect("poll");
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SwarmEvent::DialFailed {
+                    conn_id: failed,
+                    ..
+                }] if *failed == conn_id
+            ),
+            "got {events:?}"
         );
     }
 }

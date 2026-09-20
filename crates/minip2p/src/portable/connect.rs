@@ -4,7 +4,7 @@
 //! The engine races complete [`PeerAddr`]s through [`SwarmRuntime::dial`] and
 //! emits exactly one [`EndpointEvent::ConnectSettled`] per admitted attempt.
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -40,8 +40,7 @@ impl ConnectId {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConnectAddrs(Vec<PeerAddr>);
 
-/// What [`crate::PortableEndpoint::connect`] / [`crate::Endpoint::connect`]
-/// accepts.
+/// What `PortableEndpoint::connect` / `Endpoint::connect` (std feature) accepts.
 ///
 /// #176 adds `Peer(PeerId)`. Collections must be non-empty and name one peer.
 /// Candidate order is not a public contract: every candidate is dialed at
@@ -164,7 +163,7 @@ pub enum ConnectOutcome {
     Connected { conn_id: ConnectionId },
     /// The attempt ended without a connection.
     Failed(ConnectFailure),
-    /// [`crate::PortableEndpoint::cancel_connect`] / [`crate::Endpoint::cancel_connect`]
+    /// `PortableEndpoint::cancel_connect` / `Endpoint::cancel_connect` (std)
     /// ran while the attempt was still unsettled.
     Cancelled,
 }
@@ -214,15 +213,20 @@ fn candidate_summary(candidates: &[CandidateFailure]) -> String {
 /// Sans-I/O engine that owns Connection attempts for both Endpoint compositions.
 pub(crate) struct ConnectEngine {
     next_id: u64,
+    /// Relative attempt budget in milliseconds (not an absolute clock reading).
     deadline_ms: u64,
     attempts: BTreeMap<ConnectId, Attempt>,
+    /// Conn ids whose `DialFailed` may already be queued after settle/cancel.
+    /// Consumed on observe so a same-batch loser failure does not reach the app.
+    suppressed: BTreeSet<ConnectionId>,
     events: VecDeque<EndpointEvent>,
 }
 
 struct Attempt {
     peer: PeerId,
     started_ms: u64,
-    deadline_ms: u64,
+    /// Absolute mono-ms when this attempt expires (`started_ms +` engine budget).
+    expires_ms: u64,
     pending: BTreeMap<ConnectionId, PeerAddr>,
     failed: Vec<CandidateFailure>,
 }
@@ -233,6 +237,7 @@ impl ConnectEngine {
             next_id: 1,
             deadline_ms,
             attempts: BTreeMap::new(),
+            suppressed: BTreeSet::new(),
             events: VecDeque::new(),
         }
     }
@@ -297,7 +302,7 @@ impl ConnectEngine {
             Attempt {
                 peer,
                 started_ms: now_ms,
-                deadline_ms: now_ms.saturating_add(self.deadline_ms),
+                expires_ms: now_ms.saturating_add(self.deadline_ms),
                 pending,
                 failed,
             },
@@ -314,16 +319,18 @@ impl ConnectEngine {
         let Some(attempt) = self.attempts.remove(&id) else {
             return;
         };
-        abort_pending(runtime, attempt.pending.keys().copied());
+        self.abort_pending(runtime, attempt.pending.keys().copied());
         self.push_settled(id, attempt.peer, ConnectOutcome::Cancelled);
     }
 
     /// Sees every swarm event before the app. Returns true when the event is
-    /// consumed (only [`SwarmEvent::DialFailed`] for an owned candidate).
+    /// consumed (only [`SwarmEvent::DialFailed`] for an owned or suppressed
+    /// candidate).
     ///
     /// [`SwarmEvent::ConnectionEstablished`] for the attempt's peer settles
     /// Connected and aborts the other candidates; the event itself still
-    /// passes through.
+    /// passes through. The matching [`EndpointEvent::ConnectSettled`] is
+    /// queued immediately after, so drains see Established then Settled.
     pub(crate) fn observe<T: Transport, E: EntropySource>(
         &mut self,
         event: &SwarmEvent,
@@ -335,6 +342,9 @@ impl ConnectEngine {
                 addr,
                 reason,
             } => {
+                if self.suppressed.remove(conn_id) {
+                    return true;
+                }
                 let Some(id) = self.owner(*conn_id) else {
                     return false;
                 };
@@ -373,7 +383,7 @@ impl ConnectEngine {
                     let Some(attempt) = self.attempts.remove(&id) else {
                         continue;
                     };
-                    abort_pending(
+                    self.abort_pending(
                         runtime,
                         attempt
                             .pending
@@ -401,7 +411,7 @@ impl ConnectEngine {
         let expired: Vec<ConnectId> = self
             .attempts
             .iter()
-            .filter(|(_, attempt)| now_ms >= attempt.deadline_ms)
+            .filter(|(_, attempt)| now_ms >= attempt.expires_ms)
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
@@ -413,7 +423,7 @@ impl ConnectEngine {
                     addr: addr.clone(),
                     reason: String::from("connect deadline elapsed"),
                 });
-                best_effort_abort(runtime, *conn_id);
+                self.abort_one(runtime, *conn_id);
             }
             self.push_settled(
                 id,
@@ -432,7 +442,7 @@ impl ConnectEngine {
         }
         self.attempts
             .values()
-            .map(|attempt| Deadline::from_millis(attempt.deadline_ms))
+            .map(|attempt| Deadline::from_millis(attempt.expires_ms))
             .min()
     }
 
@@ -460,23 +470,31 @@ impl ConnectEngine {
             outcome,
         });
     }
-}
 
-fn abort_pending<T: Transport, E: EntropySource>(
-    runtime: &mut SwarmRuntime<T, E>,
-    ids: impl IntoIterator<Item = ConnectionId>,
-) {
-    for conn_id in ids {
-        best_effort_abort(runtime, conn_id);
+    fn abort_pending<T: Transport, E: EntropySource>(
+        &mut self,
+        runtime: &mut SwarmRuntime<T, E>,
+        ids: impl IntoIterator<Item = ConnectionId>,
+    ) {
+        for conn_id in ids {
+            self.abort_one(runtime, conn_id);
+        }
     }
-}
 
-fn best_effort_abort<T: Transport, E: EntropySource>(
-    runtime: &mut SwarmRuntime<T, E>,
-    conn_id: ConnectionId,
-) {
-    match runtime.abort_dial(conn_id) {
-        Ok(()) | Err(_) => {}
+    /// Aborts a candidate dial. When the dial was already gone (`Ok(false)`)
+    /// or `close` failed (`Err`, pending restored), a `DialFailed` may still
+    /// be queued — tombstone the id so `observe` consumes it.
+    fn abort_one<T: Transport, E: EntropySource>(
+        &mut self,
+        runtime: &mut SwarmRuntime<T, E>,
+        conn_id: ConnectionId,
+    ) {
+        match runtime.abort_dial(conn_id) {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                self.suppressed.insert(conn_id);
+            }
+        }
     }
 }
 
@@ -930,6 +948,37 @@ mod tests {
             Some(ConnectOutcome::Connected { conn_id }) if *conn_id == inbound
         ));
         assert_eq!(runtime.transport().closes, vec![ConnectionId::new(1)]);
+    }
+
+    #[test]
+    fn winner_before_loser_dial_failed_in_same_batch_does_not_leak() {
+        let peer = peer(b"batch-order");
+        let first = addr(&peer, 1);
+        let second = addr(&peer, 2);
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(30_000);
+        let id = engine.connect(
+            ConnectTarget::try_from(vec![first, second.clone()]).expect("same peer"),
+            &mut runtime,
+            0,
+        );
+        // Winner establishes first; loser's close is already in the same poll
+        // batch. abort_dial cannot retract the queued DialFailed.
+        runtime
+            .transport_mut()
+            .push_connected(ConnectionId::new(1), peer.clone(), second);
+        runtime.transport_mut().push_closed(ConnectionId::new(2));
+        let events = drain(&mut engine, &mut runtime, 0);
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, EndpointEvent::DialFailed { .. })),
+            "loser DialFailed must stay inside the engine; got {events:?}"
+        );
+        assert!(matches!(
+            settled_for(&events, id),
+            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == ConnectionId::new(1)
+        ));
     }
 
     #[test]

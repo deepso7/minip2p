@@ -707,7 +707,17 @@ impl SwarmCore {
     /// Returns whether `conn_id` was a pending outbound dial. Used by
     /// [`crate::SwarmRuntime::abort_dial`] so a deliberate abort stays silent.
     pub fn forget_dial(&mut self, conn_id: ConnectionId) -> bool {
-        self.pending_dials.remove(&conn_id).is_some()
+        self.take_pending_dial_addr(conn_id).is_some()
+    }
+
+    /// Removes a pending dial and returns its address, if any.
+    ///
+    /// [`crate::SwarmRuntime::abort_dial`] uses this so a failed `close` can
+    /// reinstate the dial via [`Self::note_dial`].
+    pub fn take_pending_dial_addr(&mut self, conn_id: ConnectionId) -> Option<PeerAddr> {
+        self.pending_dials
+            .remove(&conn_id)
+            .map(|pending| pending.addr)
     }
 
     // -----------------------------------------------------------------------
@@ -1493,12 +1503,16 @@ impl SwarmCore {
                 self.ping_deadlines.remove(&peer_id);
                 self.peer_info.remove(&peer_id);
                 self.ready_peers.remove(&peer_id);
-                self.established_peers.remove(&peer_id);
-                self.events.push_back(SwarmEvent::ConnectionClosed {
-                    peer_id,
-                    conn_id,
-                    cause: ConnectionCloseCause::Transport,
-                });
+                // Pre-identity Connected synthesizes a placeholder peer that
+                // never established. After forget_dial, Closed must not emit
+                // ConnectionClosed for a peer the app never saw Established.
+                if self.established_peers.remove(&peer_id) {
+                    self.events.push_back(SwarmEvent::ConnectionClosed {
+                        peer_id,
+                        conn_id,
+                        cause: ConnectionCloseCause::Transport,
+                    });
+                }
             }
         }
 
@@ -3487,6 +3501,27 @@ mod tests {
                 ..
             }] if *failed == conn_id && failed_addr == &addr
         ));
+    }
+
+    #[test]
+    fn forget_dial_after_anonymous_connected_then_closed_is_silent() {
+        let mut core = test_core();
+        let (_, addr, conn_id) = noted_dial_addr(b"forget-after-anon");
+        core.note_dial(conn_id, addr);
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::new(loopback_transport()),
+            },
+        );
+        assert!(core.forget_dial(conn_id));
+        feed(&mut core, TransportEvent::Closed { id: conn_id });
+        let events = drain_events(&mut core);
+        assert!(
+            events.is_empty(),
+            "forgotten pre-identity dial must not emit ConnectionClosed; got {events:?}"
+        );
     }
 
     #[test]

@@ -88,6 +88,10 @@ pub enum EndpointEvent {
         reason: alloc::string::String,
     },
     /// The one terminal event of a Connection attempt.
+    ///
+    /// On success, [`Self::ConnectionEstablished`] for the peer is delivered
+    /// in the same drain before this Settled event (snapshot getters are true
+    /// at both points).
     ConnectSettled {
         connect_id: ConnectId,
         peer_id: PeerId,

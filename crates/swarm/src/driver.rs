@@ -376,7 +376,7 @@ impl<T: Transport> Swarm<T> {
     }
 
     /// See [`SwarmRuntime::abort_dial`].
-    pub fn abort_dial(&mut self, conn_id: ConnectionId) -> Result<(), DriverError> {
+    pub fn abort_dial(&mut self, conn_id: ConnectionId) -> Result<bool, DriverError> {
         self.runtime.abort_dial(conn_id)
     }
 
