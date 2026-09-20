@@ -54,11 +54,11 @@ Calling `.autonat_server(...)` alone enables reachability probes, but it does no
 
 `Endpoint::connect` is the one entry. Pass a peer ID, one `PeerAddr`, or a set of addresses that all name the same peer:
 
-| Known information | Call |
-| --- | --- |
-| Peer ID; known addresses and/or a configured relay | `connect(&peer_id)` |
-| One complete `PeerAddr` | `connect(&peer_addr)` |
-| Several complete `PeerAddr`s for the same peer | `connect(addrs)?` |
+| Known information                                  | Call                  |
+| -------------------------------------------------- | --------------------- |
+| Peer ID; known addresses and/or a configured relay | `connect(&peer_id)`   |
+| One complete `PeerAddr`                            | `connect(&peer_addr)` |
+| Several complete `PeerAddr`s for the same peer     | `connect(addrs)?`     |
 
 A Peer-ID target with neither known addresses nor a relay settles `ConnectSettled { Failed(NoUsableRoute) }` through one terminal event.
 

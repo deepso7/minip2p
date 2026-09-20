@@ -1,4 +1,4 @@
-#![expect(
+#![allow(
     dead_code,
     reason = "the shared relay harness exposes helpers selected by different integration test binaries"
 )]
