@@ -333,6 +333,12 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         }
     }
 
+    /// Marks a restored dial so a late handshake cannot supersede an existing
+    /// peer connection. See [`SwarmCore::veto_establish`].
+    pub fn veto_establish(&mut self, conn_id: ConnectionId) {
+        self.core.veto_establish(conn_id);
+    }
+
     /// Pings a peer, sending a random 32-byte payload and measuring RTT.
     ///
     /// If a ping stream isn't yet negotiated the payload is queued and
@@ -1351,6 +1357,87 @@ mod tests {
                 }] if *failed == conn_id && reason == "refused"
             ),
             "got {events:?}"
+        );
+    }
+
+    #[test]
+    fn veto_establish_closes_dial_without_superseding_existing_peer() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let existing_addr = PeerAddr::new(
+            "/ip4/198.51.100.9/udp/4001/quic-v1".parse().expect("addr"),
+            peer.clone(),
+        )
+        .expect("peer addr");
+        let late_addr = PeerAddr::new(
+            "/ip4/198.51.100.10/udp/4001/quic-v1".parse().expect("addr"),
+            peer.clone(),
+        )
+        .expect("peer addr");
+        let existing = ConnectionId::new(1);
+        let late = ConnectionId::new(2);
+        let mut runtime = runtime_with(ScriptedTransport::default(), SeqEntropy(1));
+        runtime
+            .transport_mut()
+            .initial
+            .push(TransportEvent::Connected {
+                id: existing,
+                endpoint: ConnectionEndpoint::with_peer_id(
+                    existing_addr.transport().clone(),
+                    peer.clone(),
+                ),
+            });
+        let _ = runtime.poll(Now::from_millis(0)).expect("existing");
+        assert_eq!(runtime.connection_id(&peer), Some(existing));
+
+        runtime.core.note_dial(late, late_addr.clone());
+        runtime.veto_establish(late);
+        runtime
+            .transport_mut()
+            .initial
+            .push(TransportEvent::Connected {
+                id: late,
+                endpoint: ConnectionEndpoint::with_peer_id(
+                    late_addr.transport().clone(),
+                    peer.clone(),
+                ),
+            });
+        let events = runtime.poll(Now::from_millis(1)).expect("vetoed");
+        assert!(
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    SwarmEvent::DialFailed { conn_id, .. } if *conn_id == late
+                )
+            }),
+            "vetoed dial should DialFailed; got {events:?}"
+        );
+        assert!(
+            events.iter().all(|event| {
+                !matches!(
+                    event,
+                    SwarmEvent::ConnectionEstablished { conn_id, .. } if *conn_id == late
+                )
+            }),
+            "vetoed dial must not establish; got {events:?}"
+        );
+        assert!(
+            events.iter().all(|event| {
+                !matches!(
+                    event,
+                    SwarmEvent::ConnectionClosed {
+                        conn_id,
+                        cause: crate::ConnectionCloseCause::Superseded,
+                        ..
+                    } if *conn_id == existing
+                )
+            }),
+            "existing connection must not be superseded; got {events:?}"
+        );
+        assert_eq!(runtime.connection_id(&peer), Some(existing));
+        assert!(
+            runtime.transport().close_count >= 1,
+            "late dial must be closed; close_count={}",
+            runtime.transport().close_count
         );
     }
 }

@@ -222,6 +222,10 @@ pub struct SwarmCore {
     /// Outbound dials that have not yet established. Closed before
     /// [`SwarmEvent::ConnectionEstablished`] becomes [`SwarmEvent::DialFailed`].
     pending_dials: BTreeMap<ConnectionId, PendingDial>,
+    /// Pending dials that must not establish. Checked before
+    /// [`Self::register_connection`] so a late handshake cannot supersede an
+    /// already-valid peer connection (e.g. after a failed `abort_dial`).
+    vetoed_establishes: BTreeSet<ConnectionId>,
 
     // --- Output queues ---
     events: VecDeque<SwarmEvent>,
@@ -270,6 +274,7 @@ impl SwarmCore {
             ready_peers: BTreeSet::new(),
             established_peers: BTreeSet::new(),
             pending_dials: BTreeMap::new(),
+            vetoed_establishes: BTreeSet::new(),
             events: VecDeque::new(),
             actions: VecDeque::new(),
             after_event_actions: VecDeque::new(),
@@ -734,6 +739,15 @@ impl SwarmCore {
             .insert(conn_id, PendingDial { addr, last_error });
     }
 
+    /// Marks `conn_id` so a later handshake cannot register or supersede.
+    ///
+    /// Used after a failed [`crate::SwarmRuntime::abort_dial`]: the dial is
+    /// restored as pending, but must not displace an existing peer connection
+    /// if the transport still completes.
+    pub fn veto_establish(&mut self, conn_id: ConnectionId) {
+        self.vetoed_establishes.insert(conn_id);
+    }
+
     // -----------------------------------------------------------------------
     // Ingress
     // -----------------------------------------------------------------------
@@ -747,6 +761,10 @@ impl SwarmCore {
             TransportEvent::Connected { id, endpoint } => {
                 self.conn_to_remote_addr
                     .insert(id, endpoint.transport().clone());
+                if self.vetoed_establishes.remove(&id) {
+                    self.reject_pending_establish(id);
+                    return;
+                }
                 if let Some(peer_id) = endpoint.peer_id() {
                     self.register_connection(id, peer_id.clone());
                 } else {
@@ -766,6 +784,10 @@ impl SwarmCore {
                 // migration).
                 self.conn_to_remote_addr
                     .insert(id, endpoint.transport().clone());
+                if self.vetoed_establishes.remove(&id) {
+                    self.reject_pending_establish(id);
+                    return;
+                }
                 if let Some(peer_id) = endpoint.peer_id() {
                     self.upgrade_connection_identity(id, peer_id.clone());
                 }
@@ -1115,6 +1137,47 @@ impl SwarmCore {
         self.conn_to_peer.insert(conn_id, peer_id.clone());
         self.peer_to_conn.insert(peer_id.clone(), conn_id);
         peer_id
+    }
+
+    /// Tears down a vetoed dial without peer-level supersession.
+    ///
+    /// Emits [`SwarmEvent::DialFailed`] when the dial was still pending, queues
+    /// a transport close for `conn_id` only, and leaves any other connection
+    /// for the same peer untouched.
+    fn reject_pending_establish(&mut self, conn_id: ConnectionId) {
+        if let Some(pending) = self.pending_dials.remove(&conn_id) {
+            let reason = pending
+                .last_error
+                .unwrap_or_else(|| String::from("connection closed before establishment"));
+            self.events.push_back(SwarmEvent::DialFailed {
+                conn_id,
+                addr: pending.addr,
+                reason,
+            });
+        }
+        if let Some(peer_id) = self.conn_to_peer.remove(&conn_id) {
+            if self.peer_to_conn.get(&peer_id) == Some(&conn_id) {
+                self.peer_to_conn.remove(&peer_id);
+            }
+            // Placeholder peers from pre-identity Connected may already hold
+            // ping/identify state; drop only that non-established bookkeeping.
+            if !self.established_peers.contains(&peer_id) {
+                self.inform_ping(PingInput::RemovePeer {
+                    peer_id: peer_id.clone(),
+                });
+                self.inform_identify(IdentifyInput::RemovePeer {
+                    peer_id: peer_id.clone(),
+                });
+                self.drain_ping_outputs();
+                self.drain_identify_outputs();
+                self.pending_pings.remove(&peer_id);
+                self.ping_deadlines.remove(&peer_id);
+            }
+        }
+        self.conn_to_remote_addr.remove(&conn_id);
+        self.forget_connection_streams(conn_id);
+        self.actions
+            .push_back(SwarmAction::CloseConnection { conn_id });
     }
 
     fn register_connection(&mut self, id: ConnectionId, peer_id: PeerId) {
@@ -1468,6 +1531,7 @@ impl SwarmCore {
 
     fn handle_connection_closed(&mut self, conn_id: ConnectionId) {
         self.conn_to_remote_addr.remove(&conn_id);
+        self.vetoed_establishes.remove(&conn_id);
 
         if let Some(pending) = self.pending_dials.remove(&conn_id) {
             let reason = pending
