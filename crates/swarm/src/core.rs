@@ -223,8 +223,9 @@ pub struct SwarmCore {
     /// [`SwarmEvent::ConnectionEstablished`] becomes [`SwarmEvent::DialFailed`].
     pending_dials: BTreeMap<ConnectionId, PendingDial>,
     /// Pending dials that must not establish. Checked before
-    /// [`Self::register_connection`] so a late handshake cannot supersede an
-    /// already-valid peer connection (e.g. after a failed `abort_dial`).
+    /// [`Self::register_connection`] / identity upgrade so a late handshake
+    /// cannot supersede an already-valid peer connection (e.g. after a failed
+    /// `abort_dial`). Cleared on close, not on the first establish-stage event.
     vetoed_establishes: BTreeSet<ConnectionId>,
 
     // --- Output queues ---
@@ -739,11 +740,13 @@ impl SwarmCore {
             .insert(conn_id, PendingDial { addr, last_error });
     }
 
-    /// Marks `conn_id` so a later handshake cannot register or supersede.
+    /// Marks `conn_id` so establish-stage events cannot register or supersede.
     ///
     /// Used after a failed [`crate::SwarmRuntime::abort_dial`]: the dial is
     /// restored as pending, but must not displace an existing peer connection
-    /// if the transport still completes.
+    /// if the transport still completes. The veto stays until the connection
+    /// closes, covering both [`TransportEvent::Connected`] and a later
+    /// [`TransportEvent::PeerIdentityVerified`].
     pub fn veto_establish(&mut self, conn_id: ConnectionId) {
         self.vetoed_establishes.insert(conn_id);
     }
@@ -761,7 +764,9 @@ impl SwarmCore {
             TransportEvent::Connected { id, endpoint } => {
                 self.conn_to_remote_addr
                     .insert(id, endpoint.transport().clone());
-                if self.vetoed_establishes.remove(&id) {
+                // Keep the veto until Closed so a later PeerIdentityVerified
+                // cannot upgrade after Connected already rejected.
+                if self.vetoed_establishes.contains(&id) {
                     self.reject_pending_establish(id);
                     return;
                 }
@@ -784,7 +789,7 @@ impl SwarmCore {
                 // migration).
                 self.conn_to_remote_addr
                     .insert(id, endpoint.transport().clone());
-                if self.vetoed_establishes.remove(&id) {
+                if self.vetoed_establishes.contains(&id) {
                     self.reject_pending_establish(id);
                     return;
                 }
@@ -3613,6 +3618,76 @@ mod tests {
             drain_events(&mut core).is_empty(),
             "forgotten dials must not emit DialFailed"
         );
+    }
+
+    #[test]
+    fn veto_survives_connected_then_peer_identity_verified() {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(b"veto-two-stage-peer");
+        let existing = ConnectionId::new(41);
+        let late = ConnectionId::new(42);
+        let late_addr = PeerAddr::new(loopback_transport(), peer.clone()).expect("peer addr");
+
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: existing,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone()),
+            },
+        );
+        let _ = drain_events(&mut core);
+        assert_eq!(core.connection_id(&peer), Some(existing));
+
+        core.note_dial(late, late_addr);
+        core.veto_establish(late);
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: late,
+                endpoint: ConnectionEndpoint::new(loopback_transport()),
+            },
+        );
+        let after_connected = drain_events(&mut core);
+        assert!(
+            after_connected.iter().any(|event| {
+                matches!(
+                    event,
+                    SwarmEvent::DialFailed { conn_id, .. } if *conn_id == late
+                )
+            }),
+            "vetoed Connected should DialFailed; got {after_connected:?}"
+        );
+        assert!(
+            after_connected.iter().all(|event| {
+                !matches!(
+                    event,
+                    SwarmEvent::ConnectionEstablished { conn_id, .. } if *conn_id == late
+                )
+            }),
+            "vetoed Connected must not establish; got {after_connected:?}"
+        );
+
+        // Identity arrives after Connected already consumed the first veto check.
+        feed(
+            &mut core,
+            TransportEvent::PeerIdentityVerified {
+                id: late,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone()),
+                previous_peer_id: None,
+            },
+        );
+        let after_identity = drain_events(&mut core);
+        assert!(
+            after_identity.iter().all(|event| {
+                !matches!(
+                    event,
+                    SwarmEvent::ConnectionEstablished { conn_id, .. } if *conn_id == late
+                )
+            }),
+            "veto must still block PeerIdentityVerified; got {after_identity:?}"
+        );
+        assert_eq!(core.connection_id(&peer), Some(existing));
+        assert!(core.connected_peers().contains(&peer));
     }
 
     #[test]
