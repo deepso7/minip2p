@@ -183,8 +183,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     }
 
     /// Idempotent. Settled or unknown ids are a no-op. Never disconnects.
-    pub fn cancel_connect(&mut self, id: ConnectId, now: Now) {
-        let _ = now;
+    pub fn cancel_connect(&mut self, id: ConnectId) {
         self.connect.cancel(id, &mut self.runtime);
     }
 

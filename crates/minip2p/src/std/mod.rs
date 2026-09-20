@@ -726,10 +726,8 @@ impl Endpoint {
     /// fn wait_connected(
     ///     node: &mut Endpoint,
     ///     target: PeerAddr,
-    /// ) -> Result<(), minip2p::Error> {
-    ///     let connect_id = node.connect(target).map_err(|_| minip2p::Error::Invariant {
-    ///         reason: "malformed connect target",
-    ///     })?;
+    /// ) -> Result<(), Box<dyn std::error::Error>> {
+    ///     let connect_id = node.connect(target)?;
     ///     let deadline = Instant::now() + Duration::from_secs(10);
     ///     loop {
     ///         match node.wait(deadline)? {
@@ -738,13 +736,17 @@ impl Endpoint {
     ///                 outcome: ConnectOutcome::Connected { .. },
     ///                 ..
     ///             }) if settled == connect_id => return Ok(()),
-    ///             EndpointWaitOutcome::Event(_other) => {}
-    ///             EndpointWaitOutcome::Deadline => {
-    ///                 return Err(minip2p::Error::Invariant {
-    ///                     reason: "connect did not settle before the deadline",
-    ///                 });
+    ///             EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
+    ///                 connect_id: settled,
+    ///                 outcome,
+    ///                 ..
+    ///             }) if settled == connect_id => {
+    ///                 return Err(format!("connect failed: {outcome:?}").into());
     ///             }
-    ///             EndpointWaitOutcome::Interrupted => {}
+    ///             EndpointWaitOutcome::Event(_) | EndpointWaitOutcome::Interrupted => {}
+    ///             EndpointWaitOutcome::Deadline => {
+    ///                 return Err("connect did not settle before the deadline".into());
+    ///             }
     ///         }
     ///     }
     /// }
