@@ -6,7 +6,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::PeerId;
+use minip2p_core::{PeerAddr, PeerId};
 use minip2p_identify::IdentifyMessage;
 use minip2p_transport::{ConnectionId, StreamId, TransportEvent};
 
@@ -83,6 +83,18 @@ pub enum SwarmEvent {
     },
     /// A non-fatal runtime error occurred.
     Error(SwarmRuntimeError),
+    /// An outbound dial's connection closed before it was established.
+    ///
+    /// Raw [`crate::SwarmRuntime::dial`] callers see this for a refused or
+    /// aborted-too-late handshake. Connection-attempt engines consume the
+    /// events they own and never surface them as application diagnostics of
+    /// their own; [`crate::SwarmRuntime::abort_dial`] forgets the dial first
+    /// so no `DialFailed` follows.
+    DialFailed {
+        conn_id: ConnectionId,
+        addr: PeerAddr,
+        reason: String,
+    },
 }
 
 impl SwarmEvent {

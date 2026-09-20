@@ -243,8 +243,17 @@ impl<T: Transport> Swarm<T> {
         &mut self.runtime
     }
 
-    fn sample_now(&mut self) -> Now {
+    /// Samples this swarm's clock.
+    ///
+    /// Composed hosts that share the swarm's timeline (Connection attempts,
+    /// protocol timers) should use this sample rather than reading a second
+    /// clock.
+    pub fn now(&mut self) -> Now {
         self.clock.now()
+    }
+
+    fn sample_now(&mut self) -> Now {
+        self.now()
     }
 
     fn now_ms(&mut self) -> u64 {
@@ -364,6 +373,11 @@ impl<T: Transport> Swarm<T> {
     /// See [`SwarmRuntime::dial`].
     pub fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, DriverError> {
         self.runtime.dial(addr)
+    }
+
+    /// See [`SwarmRuntime::abort_dial`].
+    pub fn abort_dial(&mut self, conn_id: ConnectionId) -> Result<(), DriverError> {
+        self.runtime.abort_dial(conn_id)
     }
 
     /// See [`SwarmRuntime::forget_stream`].

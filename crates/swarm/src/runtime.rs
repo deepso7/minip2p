@@ -298,8 +298,29 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     }
 
     /// Dial a remote peer. The transport allocates the connection id.
+    ///
+    /// The core notes the dial so a close before
+    /// [`SwarmEvent::ConnectionEstablished`] surfaces as
+    /// [`SwarmEvent::DialFailed`].
     pub fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, DriverError> {
-        Ok(self.transport.dial(addr)?)
+        let id = self.transport.dial(addr)?;
+        self.core.note_dial(id, addr.clone());
+        Ok(id)
+    }
+
+    /// Closes a dial that has not established. Silent: no
+    /// [`SwarmEvent::DialFailed`] follows.
+    ///
+    /// Unknown or already-established connection ids are a no-op. Never
+    /// disconnects an established peer.
+    pub fn abort_dial(&mut self, conn_id: ConnectionId) -> Result<(), DriverError> {
+        if !self.core.forget_dial(conn_id) {
+            return Ok(());
+        }
+        match self.transport.close(conn_id) {
+            Ok(()) | Err(TransportError::ConnectionNotFound { .. }) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Pings a peer, sending a random 32-byte payload and measuring RTT.

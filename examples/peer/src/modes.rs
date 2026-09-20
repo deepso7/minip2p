@@ -27,7 +27,7 @@ const ECHO_PROTOCOL: &str = "/minip2p/echo/1";
 const FRAME_LEN: usize = 16;
 /// Cadence of the dialer's pings.
 const PING_INTERVAL: Duration = Duration::from_secs(1);
-/// Outlives the agent's 60 s connect deadline so `wait_path` sees the
+/// Outlives the agent's 60 s connect deadline so `nat_wait_path` sees the
 /// terminal `ConnectFailed` instead of timing out first.
 const CONNECT_DEADLINE: Duration = Duration::from_secs(65);
 /// How long the listener waits for its first relay reservation before
@@ -41,7 +41,7 @@ const SETUP_DEADLINE: Duration = Duration::from_secs(10);
 // --- shared plumbing -------------------------------------------------------
 
 /// Builds the endpoint both modes share. The NAT agent is always enabled so
-/// `connect`/`wait_path` work even with no relay configured.
+/// `nat_connect`/`nat_wait_path` work even with no relay configured.
 fn build_endpoint(
     role: &str,
     relays: &[PeerAddr],
@@ -358,21 +358,21 @@ pub fn run_dial(
                 .ok_or("circuit target has no relay configured")?;
             println!("[dial] target={peer} via-relay={}", relay.peer_id());
             let id = endpoint
-                .connect(peer)
+                .nat_connect(peer)
                 .map_err(|e| format!("connect failed: {e}"))?;
             (peer.clone(), id)
         }
         DialTarget::Direct(addr) => {
             println!("[dial] target={addr}");
             let id = endpoint
-                .connect_addr(addr)
+                .nat_connect_addr(addr)
                 .map_err(|e| format!("connect failed: {e}"))?;
             (addr.peer_id().clone(), id)
         }
     };
 
     let path = endpoint
-        .wait_path(connect_id, CONNECT_DEADLINE)
+        .nat_wait_path(connect_id, CONNECT_DEADLINE)
         .map_err(|e| format!("waiting for a path: {e}"))?;
     let Some(path) = path else {
         // ConnectFailed (if any) is still queued; surface its error.
@@ -486,7 +486,7 @@ fn open_direct_channel(
 ) -> Result<Channel, Box<dyn Error>> {
     let setup = Instant::now() + SETUP_DEADLINE;
     let deadline = drain_deadline.map_or(setup, |drain| drain.min(setup));
-    // `wait_path` and `PathUpgraded` report on NAT events; the connection's
+    // `nat_wait_path` and `PathUpgraded` report on NAT events; the connection's
     // own `ConnectionEstablished` may still sit in the swarm queue. Drain
     // what is already queued before opening the stream, so a stale
     // establishment cannot masquerade as a superseding punch connection —

@@ -482,6 +482,9 @@ pub(crate) fn convert_swarm(event: Event) -> Option<P2pEvent> {
             stream_id: error.stream_id.map(|id| id.as_u64()),
             detail: error.detail,
         },
+        // #180: Connection-attempt and raw-dial failures join the FFI event
+        // model when that ticket contracts the foreign surface.
+        Event::DialFailed { .. } | Event::ConnectSettled { .. } => return None,
     })
 }
 

@@ -46,9 +46,9 @@ portable-autonat = ["smoltcp", "dep:minip2p-nat"]
 portable-relay = ["portable-autonat", "dep:minip2p-circuit"]
 nat = ["std", "dep:minip2p-circuit", "dep:minip2p-nat", "dep:getrandom"]
 relay-server = ["std", "dep:minip2p-relay-server"]
-pubsub = ["dep:minip2p-pubsub", "dep:thiserror"]
+pubsub = ["dep:minip2p-pubsub"]
 discovery = ["nat", "pubsub", "dep:minip2p-discovery"]
-mdns = ["nat", "dep:minip2p-mdns", "dep:minip2p-discovery", "dep:thiserror"]
+mdns = ["nat", "dep:minip2p-mdns", "dep:minip2p-discovery"]
 
 [dependencies]
 minip2p-core = { path = "../core", version = "0.6.0", default-features = false }
@@ -68,7 +68,7 @@ minip2p-tcp = { path = "../../transports/tcp", version = "0.6.0", default-featur
 minip2p-swarm = { path = "../swarm", version = "0.6.0", default-features = false }
 minip2p-transport = { path = "../transport", version = "0.6.0", default-features = false }
 getrandom = { version = "0.4.3", optional = true }
-thiserror = { version = "2.0.20", default-features = false, optional = true }
+thiserror = { version = "2.0.20", default-features = false }
 
 [dev-dependencies]
 criterion = "0.8.2"

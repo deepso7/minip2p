@@ -34,7 +34,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::Infallible;
 
-use minip2p_core::{Multiaddr, PeerId, SansIoProtocol};
+use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol};
 use minip2p_identify::{
     IDENTIFY_PROTOCOL_ID, IdentifyAction, IdentifyConfig, IdentifyEvent, IdentifyInput,
     IdentifyMessage, IdentifyOutput, IdentifyProtocol,
@@ -219,6 +219,9 @@ pub struct SwarmCore {
     ready_peers: BTreeSet<PeerId>,
     /// Peers that have been surfaced through `ConnectionEstablished`.
     established_peers: BTreeSet<PeerId>,
+    /// Outbound dials that have not yet established. Closed before
+    /// [`SwarmEvent::ConnectionEstablished`] becomes [`SwarmEvent::DialFailed`].
+    pending_dials: BTreeMap<ConnectionId, PendingDial>,
 
     // --- Output queues ---
     events: VecDeque<SwarmEvent>,
@@ -227,6 +230,12 @@ pub struct SwarmCore {
     /// have been surfaced. Supersession uses this to expose the old
     /// connection's eager close before asking the transport to close it.
     after_event_actions: VecDeque<SwarmAction>,
+}
+
+/// An outbound dial waiting to establish, keyed by the transport connection id.
+struct PendingDial {
+    addr: PeerAddr,
+    last_error: Option<String>,
 }
 
 impl SwarmCore {
@@ -260,6 +269,7 @@ impl SwarmCore {
             peer_info: BTreeMap::new(),
             ready_peers: BTreeSet::new(),
             established_peers: BTreeSet::new(),
+            pending_dials: BTreeMap::new(),
             events: VecDeque::new(),
             actions: VecDeque::new(),
             after_event_actions: VecDeque::new(),
@@ -680,6 +690,26 @@ impl SwarmCore {
         self.conn_to_remote_addr.get(&conn_id)
     }
 
+    /// Records an outbound dial so a later close before establishment emits
+    /// [`SwarmEvent::DialFailed`] with `addr`.
+    pub fn note_dial(&mut self, conn_id: ConnectionId, addr: PeerAddr) {
+        self.pending_dials.insert(
+            conn_id,
+            PendingDial {
+                addr,
+                last_error: None,
+            },
+        );
+    }
+
+    /// Drops a noted dial without emitting [`SwarmEvent::DialFailed`].
+    ///
+    /// Returns whether `conn_id` was a pending outbound dial. Used by
+    /// [`crate::SwarmRuntime::abort_dial`] so a deliberate abort stays silent.
+    pub fn forget_dial(&mut self, conn_id: ConnectionId) -> bool {
+        self.pending_dials.remove(&conn_id).is_some()
+    }
+
     // -----------------------------------------------------------------------
     // Ingress
     // -----------------------------------------------------------------------
@@ -746,6 +776,9 @@ impl SwarmCore {
             }
             TransportEvent::Listening { .. } => {}
             TransportEvent::Error { id, message } => {
+                if let Some(pending) = self.pending_dials.get_mut(&id) {
+                    pending.last_error = Some(message.clone());
+                }
                 self.emit_error(
                     SwarmErrorKind::Transport,
                     self.established_peer_for_conn(id),
@@ -1071,6 +1104,7 @@ impl SwarmCore {
         self.peer_to_conn.insert(peer_id.clone(), id);
 
         if is_new {
+            self.pending_dials.remove(&id);
             self.established_peers.insert(peer_id.clone());
             self.events.push_back(SwarmEvent::ConnectionEstablished {
                 peer_id: peer_id.clone(),
@@ -1187,6 +1221,7 @@ impl SwarmCore {
 
         self.conn_to_peer.insert(conn_id, new_peer_id.clone());
         self.peer_to_conn.insert(new_peer_id.clone(), conn_id);
+        self.pending_dials.remove(&conn_id);
         self.established_peers.insert(new_peer_id.clone());
 
         self.events.push_back(SwarmEvent::ConnectionEstablished {
@@ -1242,6 +1277,7 @@ impl SwarmCore {
                         error.peer_id = Some(new.clone());
                     }
                 }
+                SwarmEvent::DialFailed { .. } => {}
             }
         }
     }
@@ -1405,6 +1441,24 @@ impl SwarmCore {
     fn handle_connection_closed(&mut self, conn_id: ConnectionId) {
         self.conn_to_remote_addr.remove(&conn_id);
 
+        if let Some(pending) = self.pending_dials.remove(&conn_id) {
+            let reason = pending
+                .last_error
+                .unwrap_or_else(|| String::from("connection closed before establishment"));
+            self.events.push_back(SwarmEvent::DialFailed {
+                conn_id,
+                addr: pending.addr,
+                reason,
+            });
+            if let Some(peer_id) = self.conn_to_peer.remove(&conn_id)
+                && self.peer_to_conn.get(&peer_id) == Some(&conn_id)
+            {
+                self.peer_to_conn.remove(&peer_id);
+            }
+            self.forget_connection_streams(conn_id);
+            return;
+        }
+
         if let Some(peer_id) = self.conn_to_peer.remove(&conn_id) {
             let was_active = self.peer_to_conn.get(&peer_id) == Some(&conn_id);
             if was_active {
@@ -1430,6 +1484,10 @@ impl SwarmCore {
             }
         }
 
+        self.forget_connection_streams(conn_id);
+    }
+
+    fn forget_connection_streams(&mut self, conn_id: ConnectionId) {
         self.stream_owner.retain(|(cid, _), _| *cid != conn_id);
         self.reset_pending.retain(|(cid, _)| *cid != conn_id);
         self.abandoned_streams.retain(|(cid, _)| *cid != conn_id);
@@ -3294,6 +3352,133 @@ mod tests {
 
         feed(&mut core, TransportEvent::Closed { id: conn_id });
         assert_eq!(core.next_timeout(0), None);
+    }
+
+    fn noted_dial_addr(label: &[u8]) -> (PeerId, PeerAddr, ConnectionId) {
+        let peer = PeerId::from_public_key_protobuf(label);
+        let addr = PeerAddr::new(loopback_transport(), peer.clone()).expect("valid peer addr");
+        (peer, addr, ConnectionId::new(81))
+    }
+
+    #[test]
+    fn noted_dial_closed_before_established_emits_dial_failed() {
+        let mut core = test_core();
+        let (_, addr, conn_id) = noted_dial_addr(b"noted-dial-closed");
+        core.note_dial(conn_id, addr.clone());
+        feed(&mut core, TransportEvent::Closed { id: conn_id });
+
+        assert!(matches!(
+            drain_events(&mut core).as_slice(),
+            [SwarmEvent::DialFailed {
+                conn_id: failed,
+                addr: failed_addr,
+                reason,
+            }] if *failed == conn_id
+                && failed_addr == &addr
+                && reason == "connection closed before establishment"
+        ));
+    }
+
+    #[test]
+    fn noted_dial_uses_transport_error_message_as_dial_failed_reason() {
+        let mut core = test_core();
+        let (_, addr, conn_id) = noted_dial_addr(b"noted-dial-error");
+        core.note_dial(conn_id, addr.clone());
+        feed(
+            &mut core,
+            TransportEvent::Error {
+                id: conn_id,
+                message: "refused".into(),
+            },
+        );
+        feed(&mut core, TransportEvent::Closed { id: conn_id });
+
+        let events = drain_events(&mut core);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                SwarmEvent::Error(error) if error.kind == SwarmErrorKind::Transport
+            )),
+            "transport Error still surfaces; got {events:?}"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(SwarmEvent::DialFailed {
+                conn_id: failed,
+                addr: failed_addr,
+                reason,
+            }) if *failed == conn_id && failed_addr == &addr && reason == "refused"
+        ));
+    }
+
+    #[test]
+    fn noted_dial_that_establishes_does_not_emit_dial_failed() {
+        let mut core = test_core();
+        let (peer, addr, conn_id) = noted_dial_addr(b"noted-dial-established");
+        core.note_dial(conn_id, addr);
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone()),
+            },
+        );
+
+        let established = drain_events(&mut core);
+        assert!(
+            established
+                .iter()
+                .any(|event| matches!(event, SwarmEvent::ConnectionEstablished { .. })),
+            "got {established:?}"
+        );
+        assert!(
+            established
+                .iter()
+                .all(|event| !matches!(event, SwarmEvent::DialFailed { .. })),
+            "got {established:?}"
+        );
+
+        feed(&mut core, TransportEvent::Closed { id: conn_id });
+        assert!(matches!(
+            drain_events(&mut core).as_slice(),
+            [SwarmEvent::ConnectionClosed {
+                conn_id: closed,
+                cause: ConnectionCloseCause::Transport,
+                ..
+            }] if *closed == conn_id
+        ));
+    }
+
+    #[test]
+    fn forget_dial_then_closed_is_silent() {
+        let mut core = test_core();
+        let (_, addr, conn_id) = noted_dial_addr(b"forget-dial-closed");
+        core.note_dial(conn_id, addr);
+        assert!(core.forget_dial(conn_id));
+        feed(&mut core, TransportEvent::Closed { id: conn_id });
+        assert!(
+            drain_events(&mut core).is_empty(),
+            "forgotten dials must not emit DialFailed"
+        );
+    }
+
+    #[test]
+    fn incoming_connection_closed_does_not_emit_dial_failed() {
+        let mut core = test_core();
+        let conn_id = ConnectionId::new(22);
+        feed(
+            &mut core,
+            TransportEvent::IncomingConnection {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::new(loopback_transport()),
+            },
+        );
+        feed(&mut core, TransportEvent::Closed { id: conn_id });
+        assert!(
+            drain_events(&mut core)
+                .iter()
+                .all(|event| !matches!(event, SwarmEvent::DialFailed { .. })),
+        );
     }
 
     #[test]

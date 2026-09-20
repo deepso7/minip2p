@@ -54,17 +54,17 @@ Calling `.autonat_server(...)` alone enables reachability probes, but it does no
 
 | Known information | Method |
 | --- | --- |
-| Peer ID only; rely on configured relay | `connect(&peer_id)` |
-| One direct `PeerAddr`, optionally raced against relays | `connect_addr(&peer_addr)` |
-| Peer ID and several transport `Multiaddr` candidates | `connect_with_addrs(peer_id, addrs)` |
+| Peer ID only; rely on configured relay | `nat_connect(&peer_id)` |
+| One direct `PeerAddr`, optionally raced against relays | `nat_connect_addr(&peer_addr)` |
+| Peer ID and several transport `Multiaddr` candidates | `nat_connect_with_addrs(peer_id, addrs)` |
 
 ```rust
 use std::time::Duration;
 
 use minip2p::NatEvent;
 
-let connect_id = node.connect_addr(&target)?;
-match node.wait_path(connect_id, Duration::from_secs(60))? {
+let connect_id = node.nat_connect_addr(&target)?;
+match node.nat_wait_path(connect_id, Duration::from_secs(60))? {
     Some(path) => println!("connected via {path:?}"),
     None => {
         let failed = node.take_nat_events().into_iter().find(|event| {
@@ -83,7 +83,7 @@ match node.wait_path(connect_id, Duration::from_secs(60))? {
 }
 ```
 
-`wait_path` returns `Ok(Some(path))` when it consumes the matching `NatEvent::PathEstablished`. It returns `Ok(None)` in two cases:
+`nat_wait_path` returns `Ok(Some(path))` when it consumes the matching `NatEvent::PathEstablished`. It returns `Ok(None)` in two cases:
 
 - the attempt failed; `NatEvent::ConnectFailed` stays queued for `take_nat_events`;
 - the deadline expired before either outcome; no `ConnectFailed` is synthesized.
@@ -131,7 +131,7 @@ for event in node.take_nat_events() {
 
 ## Keep driving after the first path
 
-`wait_path` returns when traffic can flow. Keep calling focused waits, `next_wake`, `next_event`, or `poll` afterward so DCUtR, reservation renewal, and connection events continue to progress. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
+`nat_wait_path` returns when traffic can flow. Keep calling focused waits, `next_wake`, `next_event`, or `poll` afterward so DCUtR, reservation renewal, and connection events continue to progress. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
 
 ## Custom entropy without `std`
 

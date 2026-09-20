@@ -1,0 +1,897 @@
+//! Direct Connection-attempt types and the sans-I/O engine that owns them.
+//!
+//! One [`ConnectId`] covers every candidate Transport dial in an attempt.
+//! The engine races complete [`PeerAddr`]s through [`SwarmRuntime::dial`] and
+//! emits exactly one [`EndpointEvent::ConnectSettled`] per admitted attempt.
+
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
+use minip2p_core::{PeerAddr, PeerId};
+use minip2p_platform::{Deadline, EntropySource};
+use minip2p_swarm::{SwarmEvent, SwarmRuntime};
+use minip2p_transport::{ConnectionId, Transport};
+
+use super::event_stream::EndpointEvent;
+
+/// Default Connection-attempt deadline: 30 seconds.
+pub(crate) const DEFAULT_CONNECT_DEADLINE_MS: u64 = 30_000;
+
+/// Endpoint-local identity of one Connection attempt.
+///
+/// Not unique across endpoints or restarts. One id covers every candidate
+/// Transport dial belonging to the attempt.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ConnectId(u64);
+
+impl ConnectId {
+    /// Returns the raw numeric value.
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+/// What [`crate::PortableEndpoint::connect`] / [`crate::Endpoint::connect`]
+/// accepts.
+///
+/// #176 adds `Peer(PeerId)`. Collections must be non-empty and name one peer.
+/// Candidate order is not a public contract: every candidate is dialed at
+/// start.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectTarget {
+    /// One complete peer address.
+    Addr(PeerAddr),
+    /// Non-empty set of complete addresses for one peer.
+    Addrs(Vec<PeerAddr>),
+}
+
+impl ConnectTarget {
+    /// Peer named by every candidate.
+    pub fn peer_id(&self) -> &PeerId {
+        match self {
+            Self::Addr(addr) => addr.peer_id(),
+            Self::Addrs(addrs) => addrs
+                .first()
+                .map(PeerAddr::peer_id)
+                .expect("ConnectTarget::Addrs is non-empty"),
+        }
+    }
+
+    /// Candidate addresses. `Addr` is a slice of one.
+    pub fn candidates(&self) -> &[PeerAddr] {
+        match self {
+            Self::Addr(addr) => core::slice::from_ref(addr),
+            Self::Addrs(addrs) => addrs,
+        }
+    }
+}
+
+impl From<PeerAddr> for ConnectTarget {
+    fn from(addr: PeerAddr) -> Self {
+        Self::Addr(addr)
+    }
+}
+
+impl TryFrom<Vec<PeerAddr>> for ConnectTarget {
+    type Error = ConnectTargetError;
+
+    fn try_from(mut addrs: Vec<PeerAddr>) -> Result<Self, Self::Error> {
+        let mut iter = addrs.iter();
+        let Some(first) = iter.next() else {
+            return Err(ConnectTargetError::Empty);
+        };
+        let expected = first.peer_id().clone();
+        for addr in iter {
+            if addr.peer_id() != &expected {
+                return Err(ConnectTargetError::MixedPeers {
+                    expected,
+                    found: addr.peer_id().clone(),
+                });
+            }
+        }
+        if addrs.len() == 1 {
+            Ok(Self::Addr(addrs.remove(0)))
+        } else {
+            Ok(Self::Addrs(addrs))
+        }
+    }
+}
+
+impl<'a> TryFrom<&'a [PeerAddr]> for ConnectTarget {
+    type Error = ConnectTargetError;
+
+    fn try_from(addrs: &'a [PeerAddr]) -> Result<Self, Self::Error> {
+        Self::try_from(addrs.to_vec())
+    }
+}
+
+/// Why a [`ConnectTarget`] was refused synchronously.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ConnectTargetError {
+    /// The collection was empty.
+    #[error("a Connection target needs at least one complete peer address")]
+    Empty,
+    /// Addresses named more than one peer.
+    #[error("addresses name different peers: {expected} and {found}")]
+    MixedPeers {
+        /// Peer named by the first address.
+        expected: PeerId,
+        /// Peer named by a later address.
+        found: PeerId,
+    },
+}
+
+impl From<core::convert::Infallible> for ConnectTargetError {
+    fn from(never: core::convert::Infallible) -> Self {
+        match never {}
+    }
+}
+
+/// Terminal outcome; exactly one per admitted attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectOutcome {
+    /// A transport connection to the target peer is established.
+    Connected { conn_id: ConnectionId },
+    /// The attempt ended without a connection.
+    Failed(ConnectFailure),
+    /// [`crate::PortableEndpoint::cancel_connect`] / [`crate::Endpoint::cancel_connect`]
+    /// ran while the attempt was still unsettled.
+    Cancelled,
+}
+
+/// Why a Connection attempt failed.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ConnectFailure {
+    /// Every candidate was refused before a Transport dial started.
+    #[error("no usable route: {}", candidate_summary(.candidates))]
+    NoUsableRoute {
+        /// Per-candidate refusals (no transport, DNS produced nothing, …).
+        candidates: Vec<CandidateFailure>,
+    },
+    /// Dials started; every one of them failed.
+    #[error("every candidate dial failed: {}", candidate_summary(.candidates))]
+    AllCandidatesFailed {
+        /// Per-candidate dial failures.
+        candidates: Vec<CandidateFailure>,
+    },
+    /// The attempt deadline elapsed with dials still pending.
+    #[error("connect deadline elapsed after {elapsed_ms} ms")]
+    Timeout {
+        /// Milliseconds from admit to the tick that expired the attempt.
+        elapsed_ms: u64,
+        /// Failures observed before the deadline, plus pending candidates.
+        candidates: Vec<CandidateFailure>,
+    },
+}
+
+/// One candidate's failure diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateFailure {
+    /// Address that could not be used.
+    pub addr: PeerAddr,
+    /// Transport or resolution error text.
+    pub reason: String,
+}
+
+fn candidate_summary(candidates: &[CandidateFailure]) -> String {
+    candidates
+        .iter()
+        .map(|failure| format!("{} ({})", failure.addr, failure.reason))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Sans-I/O engine that owns Connection attempts for both Endpoint compositions.
+pub(crate) struct ConnectEngine {
+    next_id: u64,
+    deadline_ms: u64,
+    attempts: BTreeMap<ConnectId, Attempt>,
+    events: VecDeque<EndpointEvent>,
+}
+
+struct Attempt {
+    peer: PeerId,
+    started_ms: u64,
+    deadline_ms: u64,
+    pending: BTreeMap<ConnectionId, PeerAddr>,
+    failed: Vec<CandidateFailure>,
+}
+
+impl ConnectEngine {
+    pub(crate) fn new(deadline_ms: u64) -> Self {
+        Self {
+            next_id: 1,
+            deadline_ms,
+            attempts: BTreeMap::new(),
+            events: VecDeque::new(),
+        }
+    }
+
+    /// Admits one attempt. Terminal events are queued, not returned.
+    pub(crate) fn connect<T: Transport, E: EntropySource>(
+        &mut self,
+        target: ConnectTarget,
+        runtime: &mut SwarmRuntime<T, E>,
+        now_ms: u64,
+    ) -> ConnectId {
+        self.connect_candidates(
+            target.peer_id().clone(),
+            target.candidates().to_vec(),
+            Vec::new(),
+            runtime,
+            now_ms,
+        )
+    }
+
+    /// Like [`Self::connect`], with extra per-candidate failures (DNS, …)
+    /// already observed by the std adapter.
+    pub(crate) fn connect_candidates<T: Transport, E: EntropySource>(
+        &mut self,
+        peer: PeerId,
+        candidates: Vec<PeerAddr>,
+        extra_failed: Vec<CandidateFailure>,
+        runtime: &mut SwarmRuntime<T, E>,
+        now_ms: u64,
+    ) -> ConnectId {
+        let id = self.alloc();
+        if let Some(conn_id) = runtime.connection_id(&peer) {
+            self.push_settled(id, peer, ConnectOutcome::Connected { conn_id });
+            return id;
+        }
+
+        let mut pending = BTreeMap::new();
+        let mut failed = extra_failed;
+        for addr in candidates {
+            match runtime.dial(&addr) {
+                Ok(conn_id) => {
+                    pending.insert(conn_id, addr);
+                }
+                Err(error) => failed.push(CandidateFailure {
+                    addr,
+                    reason: error.to_string(),
+                }),
+            }
+        }
+
+        if pending.is_empty() {
+            self.push_settled(
+                id,
+                peer,
+                ConnectOutcome::Failed(ConnectFailure::NoUsableRoute { candidates: failed }),
+            );
+            return id;
+        }
+
+        self.attempts.insert(
+            id,
+            Attempt {
+                peer,
+                started_ms: now_ms,
+                deadline_ms: now_ms.saturating_add(self.deadline_ms),
+                pending,
+                failed,
+            },
+        );
+        id
+    }
+
+    /// Idempotent. Settled or unknown ids are a no-op. Never disconnects.
+    pub(crate) fn cancel<T: Transport, E: EntropySource>(
+        &mut self,
+        id: ConnectId,
+        runtime: &mut SwarmRuntime<T, E>,
+    ) {
+        let Some(attempt) = self.attempts.remove(&id) else {
+            return;
+        };
+        abort_pending(runtime, attempt.pending.keys().copied());
+        self.push_settled(id, attempt.peer, ConnectOutcome::Cancelled);
+    }
+
+    /// Sees every swarm event before the app. Returns true when the event is
+    /// consumed (only [`SwarmEvent::DialFailed`] for an owned candidate).
+    ///
+    /// [`SwarmEvent::ConnectionEstablished`] for the attempt's peer settles
+    /// Connected and aborts the other candidates; the event itself still
+    /// passes through.
+    pub(crate) fn observe<T: Transport, E: EntropySource>(
+        &mut self,
+        event: &SwarmEvent,
+        runtime: &mut SwarmRuntime<T, E>,
+    ) -> bool {
+        match event {
+            SwarmEvent::DialFailed {
+                conn_id,
+                addr,
+                reason,
+            } => {
+                let Some(id) = self.owner(*conn_id) else {
+                    return false;
+                };
+                let Some(mut attempt) = self.attempts.remove(&id) else {
+                    return false;
+                };
+                attempt.pending.remove(conn_id);
+                attempt.failed.push(CandidateFailure {
+                    addr: addr.clone(),
+                    reason: reason.clone(),
+                });
+                if attempt.pending.is_empty() {
+                    self.push_settled(
+                        id,
+                        attempt.peer,
+                        ConnectOutcome::Failed(ConnectFailure::AllCandidatesFailed {
+                            candidates: attempt.failed,
+                        }),
+                    );
+                } else {
+                    self.attempts.insert(id, attempt);
+                }
+                true
+            }
+            SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
+                let Some(id) = self.attempt_for_peer(peer_id) else {
+                    return false;
+                };
+                let Some(attempt) = self.attempts.remove(&id) else {
+                    return false;
+                };
+                abort_pending(
+                    runtime,
+                    attempt
+                        .pending
+                        .keys()
+                        .copied()
+                        .filter(|pending| pending != conn_id),
+                );
+                self.push_settled(
+                    id,
+                    attempt.peer,
+                    ConnectOutcome::Connected { conn_id: *conn_id },
+                );
+                false
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn tick<T: Transport, E: EntropySource>(
+        &mut self,
+        runtime: &mut SwarmRuntime<T, E>,
+        now_ms: u64,
+    ) {
+        let expired: Vec<ConnectId> = self
+            .attempts
+            .iter()
+            .filter(|(_, attempt)| now_ms >= attempt.deadline_ms)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            let Some(mut attempt) = self.attempts.remove(&id) else {
+                continue;
+            };
+            for (conn_id, addr) in attempt.pending.iter() {
+                attempt.failed.push(CandidateFailure {
+                    addr: addr.clone(),
+                    reason: String::from("connect deadline elapsed"),
+                });
+                best_effort_abort(runtime, *conn_id);
+            }
+            self.push_settled(
+                id,
+                attempt.peer,
+                ConnectOutcome::Failed(ConnectFailure::Timeout {
+                    elapsed_ms: now_ms.saturating_sub(attempt.started_ms),
+                    candidates: attempt.failed,
+                }),
+            );
+        }
+    }
+
+    pub(crate) fn next_deadline(&self) -> Option<Deadline> {
+        if !self.events.is_empty() {
+            return Some(Deadline::IMMEDIATE);
+        }
+        self.attempts
+            .values()
+            .map(|attempt| Deadline::from_millis(attempt.deadline_ms))
+            .min()
+    }
+
+    pub(crate) fn pop_event(&mut self) -> Option<EndpointEvent> {
+        self.events.pop_front()
+    }
+
+    fn alloc(&mut self) -> ConnectId {
+        let id = ConnectId(self.next_id);
+        self.next_id = self.next_id.saturating_add(1);
+        id
+    }
+
+    fn owner(&self, conn_id: ConnectionId) -> Option<ConnectId> {
+        self.attempts
+            .iter()
+            .find(|(_, attempt)| attempt.pending.contains_key(&conn_id))
+            .map(|(id, _)| *id)
+    }
+
+    fn attempt_for_peer(&self, peer_id: &PeerId) -> Option<ConnectId> {
+        self.attempts
+            .iter()
+            .find(|(_, attempt)| &attempt.peer == peer_id)
+            .map(|(id, _)| *id)
+    }
+
+    fn push_settled(&mut self, connect_id: ConnectId, peer_id: PeerId, outcome: ConnectOutcome) {
+        self.events.push_back(EndpointEvent::ConnectSettled {
+            connect_id,
+            peer_id,
+            outcome,
+        });
+    }
+}
+
+fn abort_pending<T: Transport, E: EntropySource>(
+    runtime: &mut SwarmRuntime<T, E>,
+    ids: impl IntoIterator<Item = ConnectionId>,
+) {
+    for conn_id in ids {
+        best_effort_abort(runtime, conn_id);
+    }
+}
+
+fn best_effort_abort<T: Transport, E: EntropySource>(
+    runtime: &mut SwarmRuntime<T, E>,
+    conn_id: ConnectionId,
+) {
+    match runtime.abort_dial(conn_id) {
+        Ok(()) | Err(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::collections::VecDeque;
+    use alloc::vec;
+    use core::net::{IpAddr, Ipv4Addr};
+
+    use minip2p_identity::Ed25519Keypair;
+    use minip2p_platform::{EntropyError, EntropySource, Now};
+    use minip2p_swarm::{SwarmBuilder, SwarmRuntime};
+    use minip2p_transport::{
+        ConnectionEndpoint, ConnectionId, StreamId, Transport, TransportError, TransportEvent,
+    };
+
+    use super::*;
+
+    fn peer(label: &[u8]) -> PeerId {
+        PeerId::from_public_key_protobuf(label)
+    }
+
+    fn addr(peer: &PeerId, port: u16) -> PeerAddr {
+        PeerAddr::quic_v1(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), port, peer.clone())
+    }
+
+    #[test]
+    fn empty_target_is_empty_error() {
+        let err = ConnectTarget::try_from(Vec::<PeerAddr>::new()).expect_err("empty");
+        assert_eq!(err, ConnectTargetError::Empty);
+        assert_eq!(
+            ConnectTarget::try_from(&[] as &[PeerAddr]).expect_err("empty slice"),
+            ConnectTargetError::Empty
+        );
+    }
+
+    #[test]
+    fn mixed_peers_names_both() {
+        let alice = peer(b"alice");
+        let bob = peer(b"bob");
+        let err = ConnectTarget::try_from(vec![addr(&alice, 1), addr(&bob, 2)]).expect_err("mixed");
+        assert_eq!(
+            err,
+            ConnectTargetError::MixedPeers {
+                expected: alice,
+                found: bob,
+            }
+        );
+    }
+
+    #[test]
+    fn single_peer_addr_from_is_infallible() {
+        let target = ConnectTarget::from(addr(&peer(b"solo"), 9));
+        assert_eq!(target.candidates().len(), 1);
+        assert_eq!(target.peer_id(), &peer(b"solo"));
+    }
+
+    #[test]
+    fn candidates_preserve_input() {
+        let p = peer(b"same");
+        let first = addr(&p, 1);
+        let second = addr(&p, 2);
+        let target =
+            ConnectTarget::try_from(vec![first.clone(), second.clone()]).expect("same peer");
+        assert_eq!(target.candidates(), &[first, second]);
+    }
+
+    struct SeqEntropy(u8);
+
+    impl EntropySource for SeqEntropy {
+        fn fill_bytes(&mut self, output: &mut [u8]) -> Result<(), EntropyError> {
+            for byte in output.iter_mut() {
+                *byte = self.0;
+                self.0 = self.0.wrapping_add(1);
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeTransport {
+        next_id: u64,
+        dials: Vec<PeerAddr>,
+        closes: Vec<ConnectionId>,
+        refuse: bool,
+        events: VecDeque<TransportEvent>,
+        next_stream: u64,
+    }
+
+    impl FakeTransport {
+        fn push_connected(&mut self, id: ConnectionId, peer: PeerId, remote: PeerAddr) {
+            self.events.push_back(TransportEvent::Connected {
+                id,
+                endpoint: ConnectionEndpoint::with_peer_id(remote.transport().clone(), peer),
+            });
+        }
+
+        fn push_closed(&mut self, id: ConnectionId) {
+            self.events.push_back(TransportEvent::Closed { id });
+        }
+    }
+
+    impl Transport for FakeTransport {
+        fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
+            if self.refuse {
+                return Err(TransportError::InvalidAddress {
+                    context: "dial target",
+                    reason: format!("this set has no Tcp transport for {addr}"),
+                });
+            }
+            self.next_id += 1;
+            let id = ConnectionId::new(self.next_id);
+            self.dials.push(addr.clone());
+            Ok(id)
+        }
+
+        fn listen(
+            &mut self,
+            _: &minip2p_core::Multiaddr,
+        ) -> Result<minip2p_core::Multiaddr, TransportError> {
+            Err(TransportError::Unsupported {
+                operation: "listen",
+            })
+        }
+
+        fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
+            self.next_stream += 1;
+            Ok(StreamId::new(self.next_stream))
+        }
+
+        fn send_stream(
+            &mut self,
+            _: ConnectionId,
+            _: StreamId,
+            _: Vec<u8>,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn close_stream_write(
+            &mut self,
+            _: ConnectionId,
+            _: StreamId,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn reset_stream(&mut self, _: ConnectionId, _: StreamId) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
+            self.closes.push(id);
+            Ok(())
+        }
+
+        fn poll(&mut self, _: Now) -> Result<Vec<TransportEvent>, TransportError> {
+            Ok(self.events.drain(..).collect())
+        }
+
+        fn local_addresses(&self) -> Vec<minip2p_core::Multiaddr> {
+            Vec::new()
+        }
+
+        fn next_deadline(&self) -> Option<Deadline> {
+            None
+        }
+    }
+
+    fn runtime(transport: FakeTransport) -> SwarmRuntime<FakeTransport, SeqEntropy> {
+        let identity = Ed25519Keypair::from_secret_key_bytes([7; 32]);
+        SwarmBuilder::new(&identity)
+            .agent_version("minip2p-test/0.1.0")
+            .build_runtime(transport, SeqEntropy(1))
+            .expect("runtime")
+    }
+
+    fn drain(
+        engine: &mut ConnectEngine,
+        runtime: &mut SwarmRuntime<FakeTransport, SeqEntropy>,
+        now_ms: u64,
+    ) -> Vec<EndpointEvent> {
+        engine.tick(runtime, now_ms);
+        let mut out = Vec::new();
+        while let Some(event) = engine.pop_event() {
+            out.push(event);
+        }
+        for event in runtime.poll(Now::from_millis(now_ms)).expect("poll") {
+            let consumed = engine.observe(&event, runtime);
+            if !consumed {
+                out.push(EndpointEvent::from(event));
+            }
+            while let Some(engine_event) = engine.pop_event() {
+                out.push(engine_event);
+            }
+        }
+        out
+    }
+
+    fn settled_for(events: &[EndpointEvent], id: ConnectId) -> Option<&ConnectOutcome> {
+        events.iter().find_map(|event| match event {
+            EndpointEvent::ConnectSettled {
+                connect_id,
+                outcome,
+                ..
+            } if *connect_id == id => Some(outcome),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn one_candidate_connected_then_settled() {
+        let peer = peer(b"one");
+        let target = addr(&peer, 4001);
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(30_000);
+        let id = engine.connect(target.clone().into(), &mut runtime, 0);
+        let conn_id = ConnectionId::new(1);
+        runtime
+            .transport_mut()
+            .push_connected(conn_id, peer.clone(), target);
+        let events = drain(&mut engine, &mut runtime, 0);
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    EndpointEvent::ConnectionEstablished {
+                        peer_id,
+                        conn_id: established,
+                    },
+                    EndpointEvent::ConnectSettled {
+                        connect_id,
+                        outcome: ConnectOutcome::Connected { conn_id: settled },
+                        ..
+                    },
+                    ..
+                ] if peer_id == &peer
+                    && *established == conn_id
+                    && *connect_id == id
+                    && *settled == conn_id
+            ),
+            "{events:?}"
+        );
+        assert!(settled_for(&drain(&mut engine, &mut runtime, 1), id).is_none());
+        assert_eq!(runtime.transport().dials.len(), 1);
+    }
+
+    #[test]
+    fn two_candidates_first_fails_second_connects_without_leaking_dial_failed() {
+        let peer = peer(b"race");
+        let first = addr(&peer, 1);
+        let second = addr(&peer, 2);
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(30_000);
+        let id = engine.connect(
+            ConnectTarget::try_from(vec![first.clone(), second.clone()]).expect("same peer"),
+            &mut runtime,
+            0,
+        );
+        runtime.transport_mut().push_closed(ConnectionId::new(1));
+        runtime
+            .transport_mut()
+            .push_connected(ConnectionId::new(2), peer.clone(), second);
+        let events = drain(&mut engine, &mut runtime, 0);
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, EndpointEvent::DialFailed { .. })),
+            "{events:?}"
+        );
+        assert!(matches!(
+            settled_for(&events, id),
+            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == ConnectionId::new(2)
+        ));
+    }
+
+    #[test]
+    fn all_dial_failed_is_all_candidates_failed() {
+        let peer = peer(b"all-fail");
+        let first = addr(&peer, 1);
+        let second = addr(&peer, 2);
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(30_000);
+        let id = engine.connect(
+            ConnectTarget::try_from(vec![first.clone(), second.clone()]).expect("same peer"),
+            &mut runtime,
+            0,
+        );
+        runtime.transport_mut().push_closed(ConnectionId::new(1));
+        runtime.transport_mut().push_closed(ConnectionId::new(2));
+        let events = drain(&mut engine, &mut runtime, 0);
+        match settled_for(&events, id) {
+            Some(ConnectOutcome::Failed(ConnectFailure::AllCandidatesFailed { candidates })) => {
+                let addrs: Vec<_> = candidates.iter().map(|c| c.addr.clone()).collect();
+                assert!(
+                    addrs.contains(&first) && addrs.contains(&second),
+                    "{candidates:?}"
+                );
+            }
+            other => panic!("expected AllCandidatesFailed, got {other:?} from {events:?}"),
+        }
+        assert!(settled_for(&drain(&mut engine, &mut runtime, 1), id).is_none());
+    }
+
+    #[test]
+    fn synchronous_refusals_return_id_and_queue_no_usable_route() {
+        let peer = peer(b"no-route");
+        let target = addr(&peer, 4001);
+        let mut runtime = runtime(FakeTransport {
+            refuse: true,
+            ..FakeTransport::default()
+        });
+        let mut engine = ConnectEngine::new(30_000);
+        let id = engine.connect(target.clone().into(), &mut runtime, 0);
+        assert_eq!(runtime.transport().dials.len(), 0);
+        match engine.pop_event() {
+            Some(EndpointEvent::ConnectSettled {
+                connect_id,
+                outcome: ConnectOutcome::Failed(ConnectFailure::NoUsableRoute { candidates }),
+                ..
+            }) => {
+                assert_eq!(connect_id, id);
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0].addr, target);
+                assert!(
+                    candidates[0].reason.contains("no Tcp transport"),
+                    "{}",
+                    candidates[0].reason
+                );
+            }
+            other => panic!("expected NoUsableRoute, got {other:?}"),
+        }
+        assert!(engine.pop_event().is_none());
+    }
+
+    #[test]
+    fn tick_past_deadline_times_out_and_aborts() {
+        let peer = peer(b"slow");
+        let target = addr(&peer, 4001);
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(1_000);
+        let id = engine.connect(target.into(), &mut runtime, 0);
+        let events = drain(&mut engine, &mut runtime, 1_000);
+        match settled_for(&events, id) {
+            Some(ConnectOutcome::Failed(ConnectFailure::Timeout { elapsed_ms, .. })) => {
+                assert_eq!(*elapsed_ms, 1_000);
+            }
+            other => panic!("expected Timeout, got {other:?} from {events:?}"),
+        }
+        assert_eq!(runtime.transport().closes, vec![ConnectionId::new(1)]);
+        assert!(settled_for(&drain(&mut engine, &mut runtime, 1_001), id).is_none());
+    }
+
+    #[test]
+    fn winner_aborts_losers() {
+        let peer = peer(b"winner");
+        let first = addr(&peer, 1);
+        let second = addr(&peer, 2);
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(30_000);
+        let _id = engine.connect(
+            ConnectTarget::try_from(vec![first, second.clone()]).expect("same peer"),
+            &mut runtime,
+            0,
+        );
+        runtime
+            .transport_mut()
+            .push_connected(ConnectionId::new(1), peer, second);
+        let _ = drain(&mut engine, &mut runtime, 0);
+        assert_eq!(runtime.transport().closes, vec![ConnectionId::new(2)]);
+    }
+
+    #[test]
+    fn cancel_unsettled_aborts_and_is_idempotent() {
+        let peer = peer(b"cancel");
+        let target = addr(&peer, 4001);
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(30_000);
+        let id = engine.connect(target.into(), &mut runtime, 0);
+        engine.cancel(id, &mut runtime);
+        match engine.pop_event() {
+            Some(EndpointEvent::ConnectSettled {
+                connect_id,
+                outcome: ConnectOutcome::Cancelled,
+                ..
+            }) if connect_id == id => {}
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+        assert_eq!(runtime.transport().closes, vec![ConnectionId::new(1)]);
+        engine.cancel(id, &mut runtime);
+        assert!(engine.pop_event().is_none());
+        engine.cancel(ConnectId(99), &mut runtime);
+        assert!(engine.pop_event().is_none());
+        assert_eq!(runtime.transport().closes.len(), 1);
+    }
+
+    #[test]
+    fn already_connected_peer_settles_without_dials() {
+        let peer = peer(b"existing");
+        let target = addr(&peer, 4001);
+        let mut runtime = runtime(FakeTransport::default());
+        let conn_id = runtime.dial(&target).expect("seed dial");
+        runtime
+            .transport_mut()
+            .push_connected(conn_id, peer.clone(), target.clone());
+        let _ = runtime.poll(Now::from_millis(0)).expect("establish");
+        assert_eq!(runtime.connection_id(&peer), Some(conn_id));
+
+        let mut engine = ConnectEngine::new(30_000);
+        let dials_before = runtime.transport().dials.len();
+        let id = engine.connect(target.into(), &mut runtime, 10);
+        assert_eq!(runtime.transport().dials.len(), dials_before);
+        match engine.pop_event() {
+            Some(EndpointEvent::ConnectSettled {
+                connect_id,
+                outcome: ConnectOutcome::Connected { conn_id: settled },
+                ..
+            }) => {
+                assert_eq!(connect_id, id);
+                assert_eq!(settled, conn_id);
+            }
+            other => panic!("expected Connected, got {other:?}"),
+        }
+        engine.cancel(id, &mut runtime);
+        assert!(engine.pop_event().is_none());
+        assert_eq!(runtime.connected_peers(), vec![peer]);
+    }
+
+    #[test]
+    fn inbound_established_settles_the_attempt() {
+        let peer = peer(b"inbound");
+        let target = addr(&peer, 4001);
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(30_000);
+        let id = engine.connect(target.clone().into(), &mut runtime, 0);
+        let inbound = ConnectionId::new(99);
+        runtime
+            .transport_mut()
+            .push_connected(inbound, peer.clone(), target);
+        let events = drain(&mut engine, &mut runtime, 0);
+        assert!(matches!(
+            settled_for(&events, id),
+            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == inbound
+        ));
+        assert_eq!(runtime.transport().closes, vec![ConnectionId::new(1)]);
+    }
+}

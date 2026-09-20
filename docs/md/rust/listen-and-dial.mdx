@@ -78,6 +78,8 @@ let connection_ids = node.dial(&target)?;
 println!("started {} dial(s)", connection_ids.len());
 ```
 
+Prefer `Endpoint::connect` when one Connection identity and one terminal outcome is enough. `connect` races every candidate (after DNS expansion) and reports `EndpointEvent::ConnectSettled`. `dial` remains for raw Transport dials until the contraction ticket.
+
 `dial` starts every applicable local address family. For a `/dns/...` target on a dual-stack endpoint, that can mean both IPv4 and IPv6 connection IDs. `/dns4/...` and `/dns6/...` stay single-family. Use `dial_ip4` or `dial_ip6` when policy requires one family.
 
 ## Wait for connection milestones
@@ -127,6 +129,6 @@ node.disconnect(target.peer_id())?;
 
 ## `dial` is direct-only
 
-`dial*` does not reserve on a relay, establish a circuit, or start DCUtR. When the application has enabled and configured NAT traversal, use `connect*` plus `wait_path` instead. See [Traverse NAT](/rust/traverse-nat).
+`dial*` does not reserve on a relay, establish a circuit, or start DCUtR. When the application has enabled and configured NAT traversal, use `nat_connect*` plus `nat_wait_path` instead. See [Traverse NAT](/rust/traverse-nat).
 
 Next: [Register a protocol](/rust/register-a-protocol) or [Identity](/rust/identity).

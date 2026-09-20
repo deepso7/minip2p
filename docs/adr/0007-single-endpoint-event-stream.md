@@ -16,7 +16,7 @@ Events preserve their endpoint emission order, but concurrent transport attempts
 
 ## Consequences
 
-- `Endpoint::connect` is the policy-owning application operation and returns one `ConnectId`. Raw mechanism-level dialing remains on `SwarmRuntime`.
+- `Endpoint::connect` is the policy-owning application operation and returns one `ConnectId`. Raw mechanism-level dialing remains on `SwarmRuntime`. `SwarmEvent::DialFailed` reports a raw outbound dial that closed before `ConnectionEstablished`; attempt-owned dials are consumed by the Connection-attempt engine and never surface there.
 - One sans-I/O Connection-attempt engine in the application-facing crate owns direct candidate racing and coordinates optional NAT, relay, and DCUtR policy. Standard and portable Endpoint compositions use that engine; they do not build parallel attempt state machines. `ConnectId` lives in a portable, feature-independent API module.
 - The Endpoint event stream reports logical Connection-attempt outcomes, not each internal QUIC, TCP, relay, or DNS attempt as an unrelated application operation. Address-level failures may be retained as diagnostics on the logical outcome.
 - Public focused waits and capability-specific endpoint queues are removed. A Rust application dispatches unrelated events while waiting for a matching ID; adapters may offer promises, callbacks, or `waitFor` without changing endpoint semantics. The standard adapter retains the three Endpoint wait outcomes needed to drive blocking loops.
