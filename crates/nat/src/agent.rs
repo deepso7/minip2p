@@ -613,18 +613,11 @@ impl NatAgent {
                         );
                         handled = true;
                     }
-                } else {
-                    if self.owns_stream(peer_id, *stream_id)
-                        && self.shared.bind_stream(peer_id, *stream_id, *conn_id)
-                    {
-                        handled = self.route_stream(
-                            *conn_id,
-                            peer_id,
-                            *stream_id,
-                            StreamInput::Ready,
-                            now,
-                        );
-                    }
+                } else if self.owns_stream(peer_id, *stream_id)
+                    && self.shared.bind_stream(peer_id, *stream_id, *conn_id)
+                {
+                    handled =
+                        self.route_stream(*conn_id, peer_id, *stream_id, StreamInput::Ready, now);
                 }
                 touched_state = handled;
             }

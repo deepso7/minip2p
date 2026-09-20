@@ -57,7 +57,7 @@ The `smoltcp` feature adds a shared embedded TCP stack. It includes portable mDN
 Compiled with `features = ["nat"]`:
 
 - Activation: `relay`, `autonat_server`, `nat_config`
-- Attempts: `nat_connect`, `nat_connect_addr`, `nat_connect_with_addrs`, `nat_cancel_connect`, `nat_wait_path`
+- Attempts: `connect`, `cancel_connect`, `nat_wait_path` (migration; removed in #181)
 - Events: `take_nat_events`, `next_nat_event`
 - State: `reachability`, `active_reservation`, `path`
 

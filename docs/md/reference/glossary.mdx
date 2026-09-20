@@ -13,7 +13,10 @@ Definitions only. For recipes, follow the linked guides.
 | **Multiaddr** | Transport address without a peer identity (for example `/ip4/…/udp/…/quic-v1` or `/ip4/…/tcp/…`). |
 | **PeerAddr** | A `Multiaddr` plus a terminal `/p2p/<peer-id>`. Required for dialing a specific peer. |
 | **PeerReady** | Event after the first Identify exchange; supplies advertised protocols. `open_stream` is already allowed once connected. |
-| **Path** | NAT result: `DirectDialed`, `DirectPunched`, or `Relayed`. See [Traverse NAT](/rust/traverse-nat). |
+| **Connection attempt** | One application-level effort to reach a peer. It has one Connect ID and exactly one terminal: connected, failed, or cancelled. |
+| **Connect ID** | Correlation id for a Connection attempt, including its direct dials, relay fallback, and upgrade. |
+| **Relay leg** | NAT-owned part of an attempt: relay dial, HOP CONNECT, bridge promotion, DCUtR. Does not decide the terminal. |
+| **Path** | NAT result: `DirectDialed`, `DirectPunched`, or `Relayed`. A Relayed path may be provisional until the attempt settles. See [Traverse NAT](/rust/traverse-nat). |
 | **Stream** | A negotiated byte stream for one application protocol. Writes may be split or combined, so applications add their own framing. |
 | **`useMinip2p`** | React hook that owns an endpoint for a component and closes it during cleanup. |
 | **`queueOverflow`** | TypeScript event reporting that the application did not consume events quickly enough. Refresh queryable state before relying on event history. |

@@ -2,15 +2,17 @@
 
 #[cfg(feature = "portable-relay")]
 use alloc::collections::BTreeMap;
-use alloc::collections::{BTreeSet, VecDeque};
+#[cfg(feature = "portable-relay")]
+use alloc::collections::BTreeSet;
+use alloc::collections::VecDeque;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
 #[cfg(feature = "portable-relay")]
 use minip2p_circuit::{AdoptError, BridgeAdoption, CircuitRole};
 #[cfg(feature = "portable-relay")]
-use minip2p_core::{ConnectId, Protocol};
-use minip2p_core::{Multiaddr, PeerId};
+use minip2p_core::Protocol;
+use minip2p_core::{ConnectId, Multiaddr, PeerId};
 use minip2p_nat::{
     BridgeRole, NatAction, NatAgent, NatEvent, NatToken, Now as NatNow, PromoteError,
 };
@@ -38,6 +40,7 @@ pub(crate) struct PortableNatDriver {
     promoted: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
     #[cfg(feature = "portable-relay")]
     paths: BTreeMap<PeerId, Path>,
+    observed: usize,
 }
 
 impl PortableNatDriver {
@@ -56,6 +59,7 @@ impl PortableNatDriver {
             promoted: BTreeMap::new(),
             #[cfg(feature = "portable-relay")]
             paths: BTreeMap::new(),
+            observed: 0,
         }
     }
 
@@ -66,19 +70,29 @@ impl PortableNatDriver {
         }
     }
 
-    #[cfg(feature = "portable-relay")]
-    pub(crate) fn connect(&mut self, peer: PeerId, now: Now) -> ConnectId {
-        self.agent.connect(peer, Vec::new(), Self::now(now))
+    pub(crate) fn has_relay(&self) -> bool {
+        self.agent.has_relay()
     }
 
-    #[cfg(feature = "portable-relay")]
-    pub(crate) fn relay_enabled(&self) -> bool {
-        !self.relay_addrs.is_empty()
+    pub(crate) fn force_relay(&self) -> bool {
+        self.agent.force_relay()
     }
 
-    #[cfg(feature = "portable-relay")]
     pub(crate) fn cancel(&mut self, id: ConnectId, now: Now) {
         self.agent.cancel(id, Self::now(now));
+    }
+
+    pub(crate) fn unobserved_events(&self) -> Vec<NatEvent> {
+        self.events.iter().skip(self.observed).cloned().collect()
+    }
+
+    pub(crate) fn mark_observed(&mut self) {
+        self.observed = self.events.len();
+    }
+
+    pub(crate) fn take_events(&mut self) -> Vec<NatEvent> {
+        self.observed = 0;
+        self.events.drain(..).collect()
     }
 
     #[cfg(feature = "portable-relay")]

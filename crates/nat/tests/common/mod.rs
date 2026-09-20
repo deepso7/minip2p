@@ -39,13 +39,7 @@ pub const NO_RELAY: ConnectLegs = ConnectLegs {
     allow_relay: false,
 };
 
-pub fn start(
-    agent: &mut NatAgent,
-    n: u64,
-    peer: PeerId,
-    legs: ConnectLegs,
-    now: Now,
-) -> ConnectId {
+pub fn start(agent: &mut NatAgent, n: u64, peer: PeerId, legs: ConnectLegs, now: Now) -> ConnectId {
     let id = ConnectId::from_u64(n);
     agent.connect(id, peer, legs, now);
     id

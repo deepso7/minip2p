@@ -18,9 +18,9 @@ use minip2p::smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken
 use minip2p::smoltcp::time::Instant;
 use minip2p::smoltcp::wire::{HardwareAddress, IpCidr};
 use minip2p::{
-    DriverError, Ed25519Keypair, Endpoint, EndpointEvent, EntropySource, Multiaddr, NatConfig,
-    NatEvent, Now, Path, PeerAddr, PeerId, ReservationPolicy, SmoltcpEvent, SmoltcpStack, StreamId,
-    SwarmError,
+    ConnectFailure, ConnectOutcome, DriverError, Ed25519Keypair, Endpoint, EndpointEvent,
+    EntropySource, Multiaddr, NatConfig, NatEvent, Now, Path, PeerAddr, PeerId, ReservationPolicy,
+    SmoltcpEvent, SmoltcpStack, StreamId, SwarmError,
 };
 use minip2p_nat::{AUTONAT_PROTOCOL_ID, HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 use minip2p_platform::EntropyError;
@@ -357,7 +357,7 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
     let mut service = RelayService::new(a_peer.clone(), b_peer.clone());
 
     let mut now_ms = 0;
-    let mut connect_started = false;
+    let mut connect_id = None;
     let mut a_events = Vec::new();
     let mut b_events = Vec::new();
     let mut app_stream = None;
@@ -376,9 +376,8 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
             matches!(event, SmoltcpEvent::Nat(NatEvent::RelayReserved { relay, .. })
                 if relay == &relay_peer)
         });
-        if reserved && !connect_started {
-            a.nat_connect_relay(&b_peer, now).unwrap();
-            connect_started = true;
+        if reserved && connect_id.is_none() {
+            connect_id = Some(a.connect(&b_peer, now).unwrap());
         }
         let a_relayed = a_events.iter().any(|event| {
             matches!(event, SmoltcpEvent::Nat(NatEvent::PathEstablished {
@@ -390,7 +389,16 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
                 peer, path: Path::Relayed { relay }
             }) if peer == &a_peer && relay == &relay_peer)
         });
-        if a_relayed && b_relayed && app_stream.is_none() {
+        let a_settled = connect_id.is_some_and(|id| {
+            a_events.iter().any(|event| {
+                matches!(event, SmoltcpEvent::Endpoint(EndpointEvent::ConnectSettled {
+                    connect_id: found,
+                    outcome: ConnectOutcome::Connected { conn_id },
+                    ..
+                }) if *found == id && conn_id.is_circuit())
+            })
+        });
+        if a_relayed && b_relayed && a_settled && app_stream.is_none() {
             app_stream = Some(a.open_stream(&b_peer, APP_PROTOCOL, now).unwrap());
         }
         if let Some(stream) = app_stream
@@ -522,7 +530,7 @@ fn portable_relay_and_autonat_compose_and_register_their_protocols() {
 }
 
 #[test]
-fn nat_connect_relay_rejects_an_autonat_only_policy() {
+fn peer_target_on_an_autonat_only_portable_endpoint_settles_no_usable_route() {
     let bus = VirtualBus::new(1);
     let local = identity(130);
     let server = identity(131);
@@ -537,9 +545,21 @@ fn nat_connect_relay_rejects_an_autonat_only_policy() {
         .build()
         .expect("AutoNAT-only policy builds with relay code available");
 
-    assert_eq!(
-        endpoint.nat_connect_relay(&identity(132).peer_id(), Now::from_millis(0)),
-        Err(minip2p::SmoltcpRelayError::NotEnabled)
+    let peer = identity(132).peer_id();
+    let id = endpoint.connect(&peer, Now::from_millis(0)).unwrap();
+    let events = endpoint.poll(Now::from_millis(0)).unwrap();
+    assert!(
+        events.iter().any(|event| {
+            matches!(
+                event,
+                SmoltcpEvent::Endpoint(EndpointEvent::ConnectSettled {
+                    connect_id,
+                    outcome: ConnectOutcome::Failed(ConnectFailure::NoUsableRoute { .. }),
+                    ..
+                }) if *connect_id == id
+            )
+        }),
+        "expected NoUsableRoute, got {events:?}"
     );
 }
 

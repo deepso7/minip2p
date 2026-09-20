@@ -142,7 +142,7 @@ pub(crate) struct EndpointState {
     pub(crate) active: bool,
     pub(crate) driver_thread_id: Option<std::thread::ThreadId>,
     doorbell_thread_id: Option<std::thread::ThreadId>,
-    pub(crate) connect_ids: BTreeMap<u64, minip2p::NatConnectId>,
+    pub(crate) connect_ids: BTreeMap<u64, minip2p::ConnectId>,
     pub(crate) cancelled_connect_ids: BTreeSet<u64>,
     pub(crate) carry: crate::driver::Carry,
     pub(crate) overflow: crate::driver::OverflowDiagnostic,
@@ -584,8 +584,10 @@ impl P2pEndpoint {
             .endpoint
             .as_mut()
             .ok_or(FfiError::Stopped)?
-            .nat_connect(&peer)
-            .map_err(map_driver_error)?;
+            .connect(&peer)
+            .map_err(|error| FfiError::InvalidAddress {
+                detail: error.to_string(),
+            })?;
         state.connect_ids.insert(id.as_u64(), id);
         Ok(id.as_u64())
     }
@@ -601,15 +603,16 @@ impl P2pEndpoint {
             .iter()
             .map(|address| parse_direct_peer_addr(address))
             .collect::<Result<Vec<_>, _>>()?;
-        if addresses.iter().any(|address| address.peer_id() != &peer) {
+        let target = minip2p::ConnectTarget::try_from(addresses).map_err(|error| {
+            FfiError::InvalidAddress {
+                detail: error.to_string(),
+            }
+        })?;
+        if target.peer_id() != &peer {
             return Err(FfiError::InvalidAddress {
                 detail: "every connection address must end in the requested peer id".into(),
             });
         }
-        let direct_addrs = addresses
-            .into_iter()
-            .map(|address| address.transport().clone())
-            .collect();
         let _pending = PendingCommand::new(&self.shared);
         let mut state = self.shared.lock_state();
         ensure_accepting_commands(&state)?;
@@ -617,8 +620,10 @@ impl P2pEndpoint {
             .endpoint
             .as_mut()
             .ok_or(FfiError::Stopped)?
-            .nat_connect_with_addrs(peer, direct_addrs)
-            .map_err(map_driver_error)?;
+            .connect(target)
+            .map_err(|error| FfiError::InvalidAddress {
+                detail: error.to_string(),
+            })?;
         state.connect_ids.insert(id.as_u64(), id);
         Ok(id.as_u64())
     }
@@ -634,8 +639,10 @@ impl P2pEndpoint {
             .endpoint
             .as_mut()
             .ok_or(FfiError::Stopped)?
-            .nat_connect_addr(&address)
-            .map_err(map_driver_error)?;
+            .connect(&address)
+            .map_err(|error| FfiError::InvalidAddress {
+                detail: error.to_string(),
+            })?;
         state.connect_ids.insert(id.as_u64(), id);
         Ok(id.as_u64())
     }
@@ -683,7 +690,7 @@ impl P2pEndpoint {
         let connect_id = state.connect_ids.remove(&id);
         let endpoint = state.endpoint.as_mut().ok_or(FfiError::Stopped)?;
         if let Some(connect_id) = connect_id {
-            endpoint.nat_cancel_connect(connect_id);
+            endpoint.cancel_connect(connect_id);
             let suppressed = state.carry.suppress_cancelled(&BTreeSet::from([id]));
             state.stats.dropped = state.stats.dropped.saturating_add(suppressed as u64);
             state.cancelled_connect_ids.insert(id);

@@ -87,7 +87,7 @@ let mut endpoint = Endpoint::portable(&identity, entropy)
     .relay(relay_addr)
     .build()?;
 
-let connect = endpoint.nat_connect_relay(&remote_peer, now)?;
+let connect = endpoint.connect(&remote_peer, now)?;
 while endpoint.path(&remote_peer).is_none() {
     for event in endpoint.poll(now)? {
         // Handle SmoltcpEvent::Nat and ordinary endpoint events.

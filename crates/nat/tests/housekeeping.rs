@@ -847,7 +847,13 @@ fn pending_probe_dial_covers_the_probe_deadline_not_the_relay_legs() {
     // A connect starts past the relay-leg deadline but inside the probe
     // deadline: the probe's dial is still in flight, so the relay leg must
     // join it rather than open a superseding second connection.
-    start(&mut hk.agent, 1, peer(b"target-peer"), RELAY_NOW, at(15_000));
+    start(
+        &mut hk.agent,
+        1,
+        peer(b"target-peer"),
+        RELAY_NOW,
+        at(15_000),
+    );
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(
         dial_count_for(&actions, &relay),
@@ -931,7 +937,13 @@ fn waiting_attempt_redials_when_the_shared_dial_expires() {
     assert_eq!(dial_count_for(&actions, &relay), 1, "{actions:?}");
 
     // A connect joins the pending dial mid-flight.
-    start(&mut hk.agent, 1, peer(b"target-peer"), RELAY_NOW, at(15_000));
+    start(
+        &mut hk.agent,
+        1,
+        peer(b"target-peer"),
+        RELAY_NOW,
+        at(15_000),
+    );
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(dial_count_for(&actions, &relay), 0, "{actions:?}");
 

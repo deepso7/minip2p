@@ -2,24 +2,25 @@
 //!
 //! The protocol machines for relay circuits ([`minip2p_relay`]), hole
 //! punching ([`minip2p_dcutr`]), and reachability probing live in their own
-//! crates; this crate provides the missing orchestrator: [`NatAgent`], a
-//! single state machine that races direct dials against a relayed circuit
-//! and upgrades to a punched direct connection when it can.
+//! crates; this crate provides the relay-leg orchestrator: [`NatAgent`], a
+//! state machine that dials a relay, establishes a circuit, and upgrades to
+//! a punched direct connection when it can. Direct candidate racing and the
+//! attempt's terminal outcome belong to the Connection-attempt engine.
 //!
 //! Connection model — parallel racing with convergence, not sequential
 //! fallback:
 //!
 //! ```text
-//! t0      direct leg: dial every validated candidate address
-//! t0+δ    relay leg (stagger δ, 0 = fully parallel):
+//! t0      caller races direct candidates (ConnectEngine)
+//! t0+δ    relay leg (stagger δ when direct_racing, else now):
 //!           ensure relay session → HOP CONNECT(target)
 //!           → Bridged ⇒ promote bridge through Noise + Yamux
-//!           → circuit Connected ⇒ PathEstablished(Relayed)
+//!           → circuit Connected ⇒ PathEstablished(Relayed) (provisional)
 //!           → reserved peer opens `/libp2p/dcutr` on that connection
 //! inbound STOP circuit Connected ⇒ InboundPathEstablished(Relayed)
-//! first usable path wins; a better path later ⇒ explicit PathUpgraded
-//! "fallback" is not a phase — it is what remains when the punch leg
-//! exhausts (FellBackToRelay)
+//! a better path later ⇒ explicit PathUpgraded
+//! punch exhausted ⇒ FellBackToRelay (engine settles Connected)
+//! relay leg dead ⇒ ConnectFailed (engine decides the attempt)
 //! ```
 //!
 //! The agent performs no I/O and reads no clocks: feed it swarm events by

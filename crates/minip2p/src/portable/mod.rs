@@ -29,14 +29,13 @@ pub use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 mod connect;
 pub use connect::{
     CandidateFailure, ConnectFailure, ConnectId, ConnectOutcome, ConnectTarget, ConnectTargetError,
+    RelayFailure,
 };
 #[cfg(feature = "std")]
-pub(crate) use connect::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS};
+pub(crate) use connect::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS, RelayPolicy};
 mod event_stream;
 pub use event_stream::EndpointEvent;
 
-#[cfg(all(feature = "portable-autonat", not(feature = "nat")))]
-pub use crate::ConnectId as NatConnectId;
 #[cfg(feature = "portable-mdns")]
 pub use minip2p_discovery::{
     BeaconConfig, DiscoveryEvent, DiscoverySource, KnownPeer, PeerDiscoveryConfig,
@@ -161,6 +160,12 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
 
     /// Admits one Connection attempt. Sync errors: malformed target only.
     ///
+    /// A [`PeerId`] target with no candidates settles
+    /// [`ConnectFailure::NoUsableRoute`] immediately. Composed endpoints that
+    /// hold a discovery book or NAT driver resolve those sources in their
+    /// inherent `connect`; calling this method through
+    /// [`core::ops::DerefMut`] bypasses that resolution.
+    ///
     /// Every candidate is dialed immediately. Candidate completion order is
     /// not a public contract. The swarm still keeps a single connection per
     /// peer: a race loser that finishes after the winner may supersede it
@@ -186,6 +191,36 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// Idempotent. Settled or unknown ids are a no-op. Never disconnects.
     pub fn cancel_connect(&mut self, id: ConnectId) {
         self.connect.cancel(id, &mut self.runtime);
+    }
+
+    #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
+    pub(crate) fn admit_connect(
+        &mut self,
+        peer: PeerId,
+        candidates: Vec<PeerAddr>,
+        extra_failed: Vec<connect::CandidateFailure>,
+        relay: connect::RelayPolicy,
+        now: Now,
+    ) -> ConnectId {
+        self.connect.connect_candidates(
+            peer,
+            candidates,
+            extra_failed,
+            relay,
+            &mut self.runtime,
+            now.monotonic_ms,
+        )
+    }
+
+    #[cfg(feature = "portable-autonat")]
+    pub(crate) fn is_connect_pending(&self, id: ConnectId) -> bool {
+        self.connect.is_pending(id)
+    }
+
+    #[cfg(feature = "portable-autonat")]
+    pub(crate) fn observe_nat_event(&mut self, event: &minip2p_nat::NatEvent, now: Now) {
+        self.connect
+            .observe_nat(event, &mut self.runtime, now.monotonic_ms);
     }
 
     pub(crate) fn tick_connect(&mut self, now: Now) {
@@ -509,6 +544,38 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
     /// Returns the bounded, TTL-aware peer book populated by mDNS.
     pub fn known_peers(&self) -> Vec<KnownPeer> {
         self.discovery.known_peers()
+    }
+
+    /// Admits one Connection attempt. A Peer-ID target uses the mDNS book.
+    ///
+    /// Shadows [`PortableEndpoint::connect`]: calling `connect` through
+    /// `&mut PortableEndpoint` skips book resolution.
+    #[expect(
+        clippy::result_large_err,
+        reason = "ConnectTargetError retains both peer identities for MixedPeers diagnostics."
+    )]
+    pub fn connect(
+        &mut self,
+        target: impl TryInto<ConnectTarget, Error: Into<ConnectTargetError>>,
+        now: Now,
+    ) -> Result<ConnectId, ConnectTargetError> {
+        let target = target.try_into().map_err(Into::into)?;
+        let peer = target.peer_id().clone();
+        let mut candidates = target.candidates().to_vec();
+        if candidates.is_empty() {
+            candidates =
+                minip2p_core::select_direct_addrs(&self.discovery.known_addrs(&peer), None, None)
+                    .into_iter()
+                    .filter_map(|addr| PeerAddr::new(addr, peer.clone()).ok())
+                    .collect();
+        }
+        Ok(self.endpoint.admit_connect(
+            peer,
+            candidates,
+            Vec::new(),
+            connect::RelayPolicy::None,
+            now,
+        ))
     }
 
     /// Borrows the mDNS carrier, or `None` after it has stopped.
@@ -900,29 +967,96 @@ impl<D: smoltcp::phy::Device, E: EntropySource> core::ops::DerefMut for SmoltcpE
 
 #[cfg(feature = "smoltcp")]
 impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
-    /// Starts a relay-only connection attempt toward `peer`.
-    #[cfg(feature = "portable-relay")]
-    pub fn nat_connect_relay(
+    /// Admits one Connection attempt. Sync errors: malformed target only.
+    ///
+    /// A [`PeerId`] target uses the discovery book's known addresses (when a
+    /// book exists) and the configured relay when one exists. Neither source
+    /// settles [`ConnectFailure::NoUsableRoute`] through one terminal event.
+    ///
+    /// Shadows [`PortableEndpoint::connect`]: calling `connect` through
+    /// `&mut PortableEndpoint` bypasses NAT and Peer-ID book resolution.
+    #[expect(
+        clippy::result_large_err,
+        reason = "ConnectTargetError retains both peer identities for MixedPeers diagnostics."
+    )]
+    pub fn connect(
         &mut self,
-        peer: &PeerId,
+        target: impl TryInto<ConnectTarget, Error: Into<ConnectTargetError>>,
         now: Now,
-    ) -> Result<ConnectId, SmoltcpRelayError> {
-        let nat = self.nat.as_mut().ok_or(SmoltcpRelayError::NotEnabled)?;
-        if !nat.relay_enabled() {
-            return Err(SmoltcpRelayError::NotEnabled);
+    ) -> Result<ConnectId, ConnectTargetError> {
+        let target = target.try_into().map_err(Into::into)?;
+        let peer = target.peer_id().clone();
+        let mut candidates = target.candidates().to_vec();
+        if candidates.is_empty()
+            && let Some(discovery) = self.discovery.as_ref()
+        {
+            candidates =
+                minip2p_core::select_direct_addrs(&discovery.known_addrs(&peer), None, None)
+                    .into_iter()
+                    .filter_map(|addr| PeerAddr::new(addr, peer.clone()).ok())
+                    .collect();
         }
-        let id = nat.connect(peer.clone(), now);
-        nat.pump(&mut self.endpoint, now);
+
+        #[cfg(feature = "portable-autonat")]
+        let relay = match &self.nat {
+            Some(nat) if nat.has_relay() => {
+                if nat.force_relay() {
+                    connect::RelayPolicy::Forced
+                } else {
+                    connect::RelayPolicy::Race
+                }
+            }
+            _ => connect::RelayPolicy::None,
+        };
+        #[cfg(not(feature = "portable-autonat"))]
+        let relay = connect::RelayPolicy::None;
+
+        #[cfg(feature = "portable-autonat")]
+        let candidates = if matches!(relay, connect::RelayPolicy::Forced) {
+            Vec::new()
+        } else {
+            candidates
+        };
+
+        let direct_racing = !candidates.is_empty();
+        let id = self
+            .endpoint
+            .admit_connect(peer.clone(), candidates, Vec::new(), relay, now);
+
+        #[cfg(feature = "portable-autonat")]
+        if let Some(nat) = self.nat.as_mut()
+            && self.endpoint.is_connect_pending(id)
+        {
+            nat.agent.connect(
+                id,
+                peer,
+                minip2p_nat::ConnectLegs {
+                    direct_racing,
+                    allow_relay: true,
+                },
+                nat::PortableNatDriver::now(now),
+            );
+            nat.pump(&mut self.endpoint, now);
+        }
+        #[cfg(not(feature = "portable-autonat"))]
+        let _ = (direct_racing, peer);
+
+        self.feed_nat_to_connect(now);
         Ok(id)
     }
 
-    /// Cancels one relay connection attempt.
-    #[cfg(feature = "portable-relay")]
-    pub fn nat_cancel_connect(&mut self, id: ConnectId, now: Now) {
+    /// Idempotent. Settled or unknown ids are a no-op. Never disconnects.
+    ///
+    /// Shadows [`PortableEndpoint::cancel_connect`]: the NAT relay leg is
+    /// cancelled only through this inherent method.
+    pub fn cancel_connect(&mut self, id: ConnectId, now: Now) {
+        self.endpoint.cancel_connect(id);
+        #[cfg(feature = "portable-autonat")]
         if let Some(nat) = self.nat.as_mut() {
             nat.cancel(id, now);
             nat.pump(&mut self.endpoint, now);
         }
+        self.feed_nat_to_connect(now);
     }
 
     /// Returns the latest NAT-orchestrated path to `peer`.
@@ -1014,6 +1148,51 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             .unwrap_or_default()
     }
 
+    fn feed_nat_to_connect(&mut self, now: Now) {
+        #[cfg(feature = "portable-autonat")]
+        {
+            let events = self
+                .nat
+                .as_ref()
+                .map(nat::PortableNatDriver::unobserved_events)
+                .unwrap_or_default();
+            for event in &events {
+                self.endpoint.observe_nat_event(event, now);
+            }
+            if let Some(nat) = self.nat.as_mut() {
+                nat.mark_observed();
+            }
+        }
+        #[cfg(not(feature = "portable-autonat"))]
+        let _ = now;
+    }
+
+    fn emit_connect_events(&mut self, now: Now, output: &mut Vec<SmoltcpEvent>) {
+        while let Some(event) = self.endpoint.pop_connect_event() {
+            #[cfg(feature = "portable-autonat")]
+            self.cancel_nat_leg_on_terminal(&event, now);
+            #[cfg(not(feature = "portable-autonat"))]
+            let _ = now;
+            output.push(SmoltcpEvent::Endpoint(event));
+        }
+    }
+
+    #[cfg(feature = "portable-autonat")]
+    fn cancel_nat_leg_on_terminal(&mut self, event: &EndpointEvent, now: Now) {
+        let EndpointEvent::ConnectSettled {
+            connect_id,
+            outcome: ConnectOutcome::Failed(_) | ConnectOutcome::Cancelled,
+            ..
+        } = event
+        else {
+            return;
+        };
+        if let Some(nat) = self.nat.as_mut() {
+            nat.cancel(*connect_id, now);
+            nat.pump(&mut self.endpoint, now);
+        }
+    }
+
     /// Advances TCP and every configured embedded service once.
     pub fn poll(&mut self, now: Now) -> Result<Vec<SmoltcpEvent>, SmoltcpDriveError> {
         let mut output = Vec::new();
@@ -1053,7 +1232,12 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         #[cfg(feature = "portable-autonat")]
         if let Some(nat) = self.nat.as_mut() {
             nat.tick(&mut self.endpoint, now);
-            while let Some(event) = nat.events.pop_front() {
+        }
+        self.feed_nat_to_connect(now);
+        self.emit_connect_events(now, &mut output);
+        #[cfg(feature = "portable-autonat")]
+        if let Some(nat) = self.nat.as_mut() {
+            for event in nat.take_events() {
                 output.push(SmoltcpEvent::Nat(event));
             }
         }
@@ -1073,9 +1257,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
 
     fn poll_swarm(&mut self, now: Now, output: &mut Vec<SmoltcpEvent>) -> Result<(), DriverError> {
         self.endpoint.tick_connect(now);
-        while let Some(event) = self.endpoint.pop_connect_event() {
-            output.push(SmoltcpEvent::Endpoint(event));
-        }
+        self.emit_connect_events(now, output);
         for event in self.endpoint.poll_runtime(now)? {
             if let Some(discovery) = self.discovery.as_mut() {
                 match &event {
@@ -1130,9 +1312,8 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             if !claimed {
                 output.push(SmoltcpEvent::Endpoint(event.into()));
             }
-            while let Some(event) = self.endpoint.pop_connect_event() {
-                output.push(SmoltcpEvent::Endpoint(event));
-            }
+            self.feed_nat_to_connect(now);
+            self.emit_connect_events(now, output);
         }
         Ok(())
     }
@@ -1817,23 +1998,6 @@ impl core::fmt::Display for SmoltcpDriveError {
         match self {
             Self::Endpoint(error) => error.fmt(formatter),
             Self::Mdns(error) => error.fmt(formatter),
-        }
-    }
-}
-
-/// Failure from a portable relay operation.
-#[cfg(feature = "portable-relay")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SmoltcpRelayError {
-    /// No relay policy was selected on the builder.
-    NotEnabled,
-}
-
-#[cfg(feature = "portable-relay")]
-impl core::fmt::Display for SmoltcpRelayError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::NotEnabled => write!(formatter, "relay is not enabled; call .relay()"),
         }
     }
 }

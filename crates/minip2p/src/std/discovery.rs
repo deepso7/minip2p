@@ -1,6 +1,8 @@
 //! Std endpoint coordination for discovery sources and NAT traversal.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
+#[cfg(feature = "discovery")]
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use minip2p_core::{ConnectId, PeerId};
@@ -19,8 +21,8 @@ use super::mdns::MdnsDriver;
 use super::nat::NatDriver;
 #[cfg(feature = "discovery")]
 use super::pubsub::GossipsubDriver;
-use crate::EndpointSwarm;
-use crate::Error;
+use crate::portable::ConnectEngine;
+use crate::{ConnectTarget, EndpointSwarm, Error};
 
 /// Errors from discovery-focused endpoint waits.
 #[derive(Debug, thiserror::Error)]
@@ -112,6 +114,7 @@ impl DiscoveryDriver {
         &mut self,
         #[cfg(feature = "discovery")] mut pubsub: Option<&mut GossipsubDriver>,
         #[cfg(feature = "mdns")] mut mdns: Option<&mut MdnsDriver>,
+        connect: &mut ConnectEngine,
         nat: &mut NatDriver,
         swarm: &mut EndpointSwarm,
     ) {
@@ -167,17 +170,18 @@ impl DiscoveryDriver {
                 }
             }
 
-            let mut retained = VecDeque::new();
-            while let Some(event) = nat.events.pop_front() {
-                let connect_id = nat_connect_id(&event);
+            let mut i = 0;
+            while let Some(event) = nat.events.get(i) {
+                let connect_id = nat_connect_id(event);
                 if connect_id.is_some_and(|id| self.inflight.contains_key(&id)) {
                     progressed = true;
+                    let event = nat.events.remove(i).expect("inflight NAT event");
+                    nat.note_removed(i);
                     self.handle_nat_event(event, now);
                 } else {
-                    retained.push_back(event);
+                    i += 1;
                 }
             }
-            nat.events = retained;
 
             #[cfg(feature = "discovery")]
             if let Some(beacon) = self.beacon.as_mut()
@@ -233,19 +237,28 @@ impl DiscoveryDriver {
                         addrs,
                         source,
                     } => {
-                        let id = match source {
-                            DiscoverySource::SignedBeacon => {
-                                nat.agent.connect(peer.clone(), addrs, nat.now())
-                            }
-                            DiscoverySource::Mdns => {
-                                nat.agent.connect_direct(peer.clone(), addrs, nat.now())
-                            }
-                        };
-                        nat.pump(swarm);
+                        let allow_relay = source == DiscoverySource::SignedBeacon;
+                        let candidates: Vec<minip2p_core::PeerAddr> =
+                            minip2p_core::select_direct_addrs(&addrs, None, None)
+                                .into_iter()
+                                .filter_map(|addr| {
+                                    minip2p_core::PeerAddr::new(addr, peer.clone()).ok()
+                                })
+                                .collect();
+                        let target = ConnectTarget::try_from(candidates)
+                            .unwrap_or_else(|_| ConnectTarget::from(peer.clone()));
+                        let id = super::admit_connect(
+                            connect,
+                            swarm,
+                            Some(nat),
+                            Some(&self.book),
+                            target,
+                            allow_relay,
+                        );
                         self.inflight.insert(id, peer);
                     }
                     DiscoveryAction::CancelDial { peer } => {
-                        self.cancel_peer(&peer, nat, swarm);
+                        self.cancel_peer(&peer, connect, nat, swarm);
                     }
                 }
             }
@@ -255,29 +268,44 @@ impl DiscoveryDriver {
         }
     }
 
-    fn handle_nat_event(&mut self, event: NatEvent, now: u64) {
-        match event {
-            NatEvent::PathEstablished {
-                connect_id, peer, ..
-            }
-            | NatEvent::PathUpgraded {
-                connect_id, peer, ..
-            }
-            | NatEvent::FellBackToRelay { connect_id, peer } => {
-                self.inflight.remove(&connect_id);
-                self.book.dial_succeeded(&peer, now);
-            }
-            NatEvent::ConnectFailed {
-                connect_id,
-                peer,
-                error,
-            } => {
-                self.inflight.remove(&connect_id);
-                self.book.dial_failed(&peer, &error.to_string(), now);
-            }
-            NatEvent::HolePunchFailed { .. } => {}
-            _ => {}
+    fn handle_nat_event(&mut self, event: NatEvent, _now: u64) {
+        let _ = event;
+    }
+
+    fn cancel_peer(
+        &mut self,
+        peer: &PeerId,
+        connect: &mut ConnectEngine,
+        nat: &mut NatDriver,
+        swarm: &mut EndpointSwarm,
+    ) {
+        let active = self
+            .inflight
+            .iter()
+            .find_map(|(id, candidate)| (candidate == peer).then_some(*id));
+        if let Some(id) = active {
+            connect.cancel(id, swarm.runtime_mut());
+            nat.agent.cancel(id, nat.now());
+            nat.pump(swarm);
         }
+    }
+
+    /// Cancels all discovery-owned attempts during endpoint shutdown.
+    #[cfg(feature = "mdns")]
+    pub(crate) fn shutdown(
+        &mut self,
+        connect: &mut ConnectEngine,
+        nat: &mut NatDriver,
+        swarm: &mut EndpointSwarm,
+    ) {
+        let attempts: Vec<ConnectId> = self.inflight.keys().copied().collect();
+        for id in attempts {
+            connect.cancel(id, swarm.runtime_mut());
+            nat.agent.cancel(id, nat.now());
+        }
+        self.inflight.clear();
+        self.book.reset_dials();
+        nat.pump(swarm);
     }
 
     #[cfg(feature = "mdns")]
@@ -291,30 +319,6 @@ impl DiscoveryDriver {
                     .report_violation(peer, DiscoverySource::Mdns, &reason);
             }
         }
-    }
-
-    fn cancel_peer(&mut self, peer: &PeerId, nat: &mut NatDriver, swarm: &mut EndpointSwarm) {
-        let active = self
-            .inflight
-            .iter()
-            .find_map(|(id, candidate)| (candidate == peer).then_some(*id));
-        if let Some(id) = active {
-            nat.agent.cancel(id, nat.now());
-            nat.pump(swarm);
-            self.inflight.remove(&id);
-        }
-    }
-
-    /// Cancels all discovery-owned attempts during endpoint shutdown.
-    #[cfg(feature = "mdns")]
-    pub(crate) fn shutdown(&mut self, nat: &mut NatDriver, swarm: &mut EndpointSwarm) {
-        let attempts: Vec<ConnectId> = self.inflight.keys().copied().collect();
-        for id in attempts {
-            nat.agent.cancel(id, nat.now());
-        }
-        self.inflight.clear();
-        self.book.reset_dials();
-        nat.pump(swarm);
     }
 }
 
@@ -371,8 +375,9 @@ mod tests {
                 peer,
                 addrs,
                 source: DiscoverySource::Mdns,
-            }) if peer == remote && addrs == vec![addr]
+            }) if peer == remote && addrs == vec![addr.clone()]
         ));
+        assert_eq!(driver.book.known_addrs(&remote), vec![addr]);
         assert!(matches!(
             driver.book.poll_action(),
             Some(DiscoveryAction::Dial {

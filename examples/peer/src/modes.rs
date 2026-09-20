@@ -41,7 +41,7 @@ const SETUP_DEADLINE: Duration = Duration::from_secs(10);
 // --- shared plumbing -------------------------------------------------------
 
 /// Builds the endpoint both modes share. The NAT agent is always enabled so
-/// `nat_connect`/`nat_wait_path` work even with no relay configured.
+/// `connect`/`nat_wait_path` work even with no relay configured.
 fn build_endpoint(
     role: &str,
     relays: &[PeerAddr],
@@ -358,14 +358,14 @@ pub fn run_dial(
                 .ok_or("circuit target has no relay configured")?;
             println!("[dial] target={peer} via-relay={}", relay.peer_id());
             let id = endpoint
-                .nat_connect(peer)
+                .connect(peer)
                 .map_err(|e| format!("connect failed: {e}"))?;
             (peer.clone(), id)
         }
         DialTarget::Direct(addr) => {
             println!("[dial] target={addr}");
             let id = endpoint
-                .nat_connect_addr(addr)
+                .connect(addr)
                 .map_err(|e| format!("connect failed: {e}"))?;
             (addr.peer_id().clone(), id)
         }

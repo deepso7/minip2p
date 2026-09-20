@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BeaconConfig, DiscoveryEvent, Endpoint, Event, GossipsubConfig, GossipsubEvent,
+    BeaconConfig, ConnectOutcome, DiscoveryEvent, Endpoint, Event, GossipsubConfig, GossipsubEvent,
     PeerDiscoveryConfig,
 };
 
@@ -178,4 +178,64 @@ fn next_discovery_event_buffers_application_events() {
         saw_connection,
         "focused wait must preserve connection events"
     );
+}
+
+#[test]
+fn connect_uses_known_discovery_book_addresses() {
+    let mut hub = slow_heartbeat_discovery_endpoint();
+    let mut a = slow_heartbeat_discovery_endpoint();
+    let mut b = slow_heartbeat_discovery_endpoint();
+    let hub_addr = hub.listen().expect("hub listens");
+    a.listen().expect("a listens");
+    b.listen().expect("b listens");
+    let a_peer = a.peer_id().clone();
+    let b_peer = b.peer_id().clone();
+    a.dial(&hub_addr).expect("a dials hub");
+    b.dial(&hub_addr).expect("b dials hub");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while a.known_peers().iter().all(|known| known.peer != b_peer)
+        || b.known_peers().iter().all(|known| known.peer != a_peer)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "cross-leaf discovery timed out before connect"
+        );
+        let _ = hub
+            .next_event(Duration::from_millis(20))
+            .expect("hub drives");
+        let _ = a.next_event(Duration::from_millis(20)).expect("a drives");
+        let _ = b.next_event(Duration::from_millis(20)).expect("b drives");
+    }
+
+    assert!(
+        !a.connected_peers().contains(&b_peer),
+        "a must not already have a direct connection to b"
+    );
+    let id = a.connect(&b_peer).expect("connect by peer id");
+    let mut settled = None;
+    while settled.is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "connect via discovery book timed out"
+        );
+        if let Some(Event::ConnectSettled {
+            connect_id,
+            outcome,
+            ..
+        }) = a.next_event(Duration::from_millis(20)).expect("a drives")
+            && connect_id == id
+        {
+            settled = Some(outcome);
+        }
+        let _ = hub
+            .next_event(Duration::from_millis(20))
+            .expect("hub drives");
+        let _ = b.next_event(Duration::from_millis(20)).expect("b drives");
+    }
+    assert!(
+        matches!(settled, Some(ConnectOutcome::Connected { .. })),
+        "expected Connected via book addresses, got {settled:?}"
+    );
+    assert!(a.connected_peers().contains(&b_peer));
 }
