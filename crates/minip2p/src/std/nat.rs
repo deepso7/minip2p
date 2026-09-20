@@ -20,12 +20,15 @@ use crate::EndpointSwarm;
 pub(crate) struct NatDriver {
     pub(crate) agent: NatAgent,
     /// NAT events awaiting the application (drained via
-    /// `Endpoint::take_nat_events` / `next_nat_event` / `wait_path`).
+    /// `Endpoint::take_nat_events` / `next_nat_event` / `nat_wait_path`).
     pub(crate) events: VecDeque<NatEvent>,
     /// Monotonic epoch for the agent's `mono_ms` clock.
     epoch: Instant,
     /// Relays we hold a reservation on, for circuit-address advertising.
     reserved_relays: Vec<(PeerId, Multiaddr)>,
+    /// Connection ids this driver dialed; matching [`SwarmEvent::DialFailed`]
+    /// is swallowed so NAT internals stay off the Endpoint stream until #176.
+    nat_dials: BTreeSet<ConnectionId>,
     /// Relay transport addresses by peer, captured at construction.
     relay_addrs: Vec<(PeerId, Multiaddr)>,
     /// Direct public addresses confirmed by AutoNAT.
@@ -45,6 +48,7 @@ impl NatDriver {
             events: VecDeque::new(),
             epoch: Instant::now(),
             reserved_relays: Vec::new(),
+            nat_dials: BTreeSet::new(),
             relay_addrs,
             public_addrs: Vec::new(),
             promoted: BTreeMap::new(),
@@ -75,6 +79,15 @@ impl NatDriver {
         if self.inject_straggler(event, swarm) {
             self.pump(swarm);
             return true;
+        }
+        if let SwarmEvent::DialFailed { conn_id, .. } = event
+            && self.nat_dials.remove(conn_id)
+        {
+            self.pump(swarm);
+            return true;
+        }
+        if let SwarmEvent::ConnectionEstablished { conn_id, .. } = event {
+            self.nat_dials.remove(conn_id);
         }
         let is_circuit = match event {
             SwarmEvent::ConnectionEstablished { conn_id, .. }
@@ -175,6 +188,9 @@ impl NatDriver {
         match action {
             NatAction::Dial { token, addr } => {
                 let result = swarm.dial(&addr).map_err(|e| e.to_string());
+                if let Ok(conn_id) = result {
+                    self.nat_dials.insert(conn_id);
+                }
                 self.agent.dial_result(token, result, now);
             }
             NatAction::OpenStream {

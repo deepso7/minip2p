@@ -18,9 +18,9 @@ use minip2p::smoltcp::wire::{HardwareAddress, IpCidr};
 #[cfg(feature = "pubsub")]
 use minip2p::{BeaconConfig, GossipsubEvent, SmoltcpGossipsubError};
 use minip2p::{
-    DiscoveryEvent, Ed25519Keypair, Endpoint, EntropySource, Multiaddr, Now, PeerAddr, PeerId,
-    PollDeadline, SmoltcpConfig, SmoltcpEvent, SmoltcpMdnsConfig, SmoltcpStack, SmoltcpTcpProvider,
-    StreamId, SwarmEvent, TcpConfig, TcpTransport,
+    ConnectOutcome, DiscoveryEvent, Ed25519Keypair, Endpoint, EndpointEvent, EntropySource,
+    Multiaddr, Now, PeerAddr, PeerId, PollDeadline, SmoltcpConfig, SmoltcpEvent, SmoltcpMdnsConfig,
+    SmoltcpStack, SmoltcpTcpProvider, StreamId, TcpConfig, TcpTransport,
 };
 use minip2p_platform::EntropyError;
 
@@ -292,9 +292,9 @@ fn portable_autonat_rejects_reservation_policy_without_a_relay() {
     assert!(error.to_string().contains("requires at least one relay"));
 }
 
-fn has_ready(events: &[SwarmEvent], peer: &PeerId) -> bool {
+fn has_ready(events: &[EndpointEvent], peer: &PeerId) -> bool {
     events.iter().any(|event| {
-        matches!(event, SwarmEvent::PeerReady { peer_id, protocols }
+        matches!(event, EndpointEvent::PeerReady { peer_id, protocols }
             if peer_id == peer && protocols.iter().any(|protocol| protocol == PROTOCOL))
     })
 }
@@ -355,7 +355,7 @@ fn portable_endpoints_complete_the_embedded_tcp_stack() {
         if let Some(stream_id) = stream
             && !payload_sent
             && dialer_events.iter().any(|event| {
-                matches!(event, SwarmEvent::StreamReady {
+                matches!(event, EndpointEvent::StreamReady {
                     peer_id, stream_id: ready, protocol_id, initiated_locally: true, ..
                 } if peer_id == &listener_peer && *ready == stream_id && protocol_id == PROTOCOL)
             })
@@ -370,18 +370,18 @@ fn portable_endpoints_complete_the_embedded_tcp_stack() {
         }
 
         let ping_finished = dialer_events.iter().any(|event| {
-            matches!(event, SwarmEvent::PingRttMeasured { peer_id, .. } if peer_id == &listener_peer)
+            matches!(event, EndpointEvent::PingRttMeasured { peer_id, .. } if peer_id == &listener_peer)
         });
         let payload_received = stream.is_some_and(|stream_id| {
             listener_events.iter().any(|event| {
-                matches!(event, SwarmEvent::StreamData {
+                matches!(event, EndpointEvent::StreamData {
                     peer_id, stream_id: received, data, ..
                 } if peer_id == &dialer_peer && *received == stream_id && data == PAYLOAD)
             })
         });
         let write_closed = stream.is_some_and(|stream_id| {
             listener_events.iter().any(|event| {
-                matches!(event, SwarmEvent::StreamRemoteWriteClosed {
+                matches!(event, EndpointEvent::StreamRemoteWriteClosed {
                     peer_id, stream_id: closed, ..
                 } if peer_id == &dialer_peer && *closed == stream_id)
             })
@@ -409,6 +409,65 @@ fn portable_endpoints_complete_the_embedded_tcp_stack() {
     panic!(
         "embedded endpoint gate did not finish\n  dialer: {dialer_events:?}\n  listener: {listener_events:?}"
     );
+}
+
+#[test]
+fn portable_connect_settles_over_smoltcp_tcp() {
+    let wire = Wire::default();
+    let dialer_identity = identity(3);
+    let listener_identity = identity(4);
+    let listener_peer = listener_identity.peer_id();
+    let mut dialer = endpoint(
+        wire.dialer_device(),
+        &format!("{DIALER_IP}/24"),
+        &dialer_identity,
+        11,
+    );
+    let mut listener = endpoint(
+        wire.listener_device(),
+        &format!("{LISTENER_IP}/24"),
+        &listener_identity,
+        21,
+    );
+
+    let listen: Multiaddr = format!("/ip4/{LISTENER_IP}/tcp/4001")
+        .parse()
+        .expect("valid listen address");
+    let bound = listener.listen(&listen).expect("listener binds");
+    let target = PeerAddr::new(bound, listener_peer.clone()).expect("valid peer address");
+    let id = dialer
+        .connect(target, Now::from_millis(0))
+        .expect("connect admitted");
+
+    let mut now_ms = 0;
+    let mut dialer_events = Vec::new();
+    for _ in 0..MAX_STEPS {
+        let now = Now::from_millis(now_ms);
+        dialer_events.extend(dialer.poll(now).expect("dialer polls"));
+        listener.poll(now).expect("listener polls");
+        if dialer_events.iter().any(|event| {
+            matches!(
+                event,
+                EndpointEvent::ConnectSettled {
+                    connect_id,
+                    outcome: ConnectOutcome::Connected { .. },
+                    ..
+                } if *connect_id == id
+            )
+        }) {
+            assert!(dialer.connection_id(&listener_peer).is_some());
+            return;
+        }
+        if wire.is_quiet() {
+            let deadline =
+                PollDeadline::earliest_opt(dialer.next_deadline(now), listener.next_deadline(now))
+                    .unwrap_or_else(|| {
+                        panic!("embedded connect wedged\n  dialer: {dialer_events:?}")
+                    });
+            now_ms = now_ms.max(deadline.as_millis());
+        }
+    }
+    panic!("portable connect did not settle\n  dialer: {dialer_events:?}");
 }
 
 #[test]
@@ -472,11 +531,11 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
                 ) if peer == &a_peer && !addrs.is_empty())
         });
         let a_ready = a_events.iter().any(|event| {
-            matches!(event, SmoltcpEvent::Endpoint(SwarmEvent::PeerReady { peer_id, .. })
+            matches!(event, SmoltcpEvent::Endpoint(EndpointEvent::PeerReady { peer_id, .. })
                 if peer_id == &b_peer)
         });
         let b_ready = b_events.iter().any(|event| {
-            matches!(event, SmoltcpEvent::Endpoint(SwarmEvent::PeerReady { peer_id, .. })
+            matches!(event, SmoltcpEvent::Endpoint(EndpointEvent::PeerReady { peer_id, .. })
                 if peer_id == &a_peer)
         });
         if a_ready && b_ready && !ping_started {
@@ -484,7 +543,7 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
             ping_started = true;
         }
         let ping_finished = a_events.iter().any(|event| {
-            matches!(event, SmoltcpEvent::Endpoint(SwarmEvent::PingRttMeasured { peer_id, .. })
+            matches!(event, SmoltcpEvent::Endpoint(EndpointEvent::PingRttMeasured { peer_id, .. })
                 if peer_id == &b_peer)
         });
         #[cfg(feature = "pubsub")]

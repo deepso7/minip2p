@@ -298,8 +298,45 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     }
 
     /// Dial a remote peer. The transport allocates the connection id.
+    ///
+    /// The core notes the dial so a close before
+    /// [`SwarmEvent::ConnectionEstablished`] surfaces as
+    /// [`SwarmEvent::DialFailed`].
     pub fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, DriverError> {
-        Ok(self.transport.dial(addr)?)
+        let id = self.transport.dial(addr)?;
+        self.core.note_dial(id, addr.clone());
+        Ok(id)
+    }
+
+    /// Closes a dial that has not established. Silent: no
+    /// [`SwarmEvent::DialFailed`] follows.
+    ///
+    /// Returns `Ok(true)` when the dial was still pending and was forgotten.
+    /// Returns `Ok(false)` when it was not pending (already established,
+    /// already failed, or unknown) — a [`SwarmEvent::DialFailed`] may already
+    /// be queued for that id. Never disconnects an established peer.
+    ///
+    /// If `close` fails after the dial was taken off the pending map, the
+    /// pending entry is restored (including any recorded `last_error`) so a
+    /// later close still surfaces as [`SwarmEvent::DialFailed`] rather than a
+    /// silent half-aborted dial.
+    pub fn abort_dial(&mut self, conn_id: ConnectionId) -> Result<bool, DriverError> {
+        let Some((addr, last_error)) = self.core.take_pending_dial(conn_id) else {
+            return Ok(false);
+        };
+        match self.transport.close(conn_id) {
+            Ok(()) | Err(TransportError::ConnectionNotFound { .. }) => Ok(true),
+            Err(error) => {
+                self.core.restore_pending_dial(conn_id, addr, last_error);
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Marks a restored dial so a late handshake cannot supersede an existing
+    /// peer connection. See [`SwarmCore::veto_establish`].
+    pub fn veto_establish(&mut self, conn_id: ConnectionId) {
+        self.core.veto_establish(conn_id);
     }
 
     /// Pings a peer, sending a random 32-byte payload and measuring RTT.
@@ -819,6 +856,7 @@ mod tests {
     struct ScriptedTransport {
         initial: Vec<TransportEvent>,
         next_stream_id: u64,
+        next_conn_id: u64,
         opened: usize,
         deadline: Option<Deadline>,
         /// When set, every locally opened stream gets a multistream-select
@@ -833,6 +871,8 @@ mod tests {
         close_count: usize,
         /// Second `close` returns `ConnectionNotFound` (TCP after map removal).
         fail_second_close: bool,
+        /// Every `close` fails with a non-`ConnectionNotFound` error.
+        refuse_close: bool,
     }
 
     impl ScriptedTransport {
@@ -848,7 +888,8 @@ mod tests {
 
     impl Transport for ScriptedTransport {
         fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
-            Err(TransportError::Unsupported { operation: "dial" })
+            self.next_conn_id += 1;
+            Ok(ConnectionId::new(self.next_conn_id))
         }
 
         fn listen(&mut self, _: &Multiaddr) -> Result<Multiaddr, TransportError> {
@@ -936,6 +977,11 @@ mod tests {
 
         fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
             self.close_count += 1;
+            if self.refuse_close {
+                return Err(TransportError::InvalidConfig {
+                    reason: String::from("close refused"),
+                });
+            }
             if self.fail_second_close && self.close_count > 1 {
                 return Err(TransportError::ConnectionNotFound { id });
             }
@@ -1264,6 +1310,134 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, SwarmEvent::Error(_))),
             "already-gone close must not surface as Error: {events:?}"
+        );
+    }
+
+    #[test]
+    fn abort_dial_restores_pending_when_close_fails() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let addr = PeerAddr::new(
+            "/ip4/198.51.100.8/udp/4001/quic-v1".parse().expect("addr"),
+            peer,
+        )
+        .expect("peer addr");
+        let mut runtime = runtime_with(
+            ScriptedTransport {
+                refuse_close: true,
+                ..ScriptedTransport::default()
+            },
+            SeqEntropy(1),
+        );
+        let conn_id = runtime.dial(&addr).expect("dial");
+        // Record a transport error before the failed abort so restore must
+        // keep last_error — not rebuild via note_dial (which clears it).
+        runtime.transport_mut().initial.push(TransportEvent::Error {
+            id: conn_id,
+            message: String::from("refused"),
+        });
+        let _ = runtime.poll(Now::from_millis(0)).expect("record error");
+        assert!(
+            runtime.abort_dial(conn_id).is_err(),
+            "close refusal must surface"
+        );
+        // Pending dial was restored: a later close still emits DialFailed,
+        // not a silent half-aborted dial that can still establish.
+        runtime
+            .transport_mut()
+            .initial
+            .push(TransportEvent::Closed { id: conn_id });
+        let events = runtime.poll(Now::from_millis(1)).expect("poll");
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SwarmEvent::DialFailed {
+                    conn_id: failed,
+                    reason,
+                    ..
+                }] if *failed == conn_id && reason == "refused"
+            ),
+            "got {events:?}"
+        );
+    }
+
+    #[test]
+    fn veto_establish_closes_dial_without_superseding_existing_peer() {
+        let peer = Ed25519Keypair::generate().peer_id();
+        let existing_addr = PeerAddr::new(
+            "/ip4/198.51.100.9/udp/4001/quic-v1".parse().expect("addr"),
+            peer.clone(),
+        )
+        .expect("peer addr");
+        let late_addr = PeerAddr::new(
+            "/ip4/198.51.100.10/udp/4001/quic-v1".parse().expect("addr"),
+            peer.clone(),
+        )
+        .expect("peer addr");
+        let existing = ConnectionId::new(1);
+        let late = ConnectionId::new(2);
+        let mut runtime = runtime_with(ScriptedTransport::default(), SeqEntropy(1));
+        runtime
+            .transport_mut()
+            .initial
+            .push(TransportEvent::Connected {
+                id: existing,
+                endpoint: ConnectionEndpoint::with_peer_id(
+                    existing_addr.transport().clone(),
+                    peer.clone(),
+                ),
+            });
+        let _ = runtime.poll(Now::from_millis(0)).expect("existing");
+        assert_eq!(runtime.connection_id(&peer), Some(existing));
+
+        runtime.core.note_dial(late, late_addr.clone());
+        runtime.veto_establish(late);
+        runtime
+            .transport_mut()
+            .initial
+            .push(TransportEvent::Connected {
+                id: late,
+                endpoint: ConnectionEndpoint::with_peer_id(
+                    late_addr.transport().clone(),
+                    peer.clone(),
+                ),
+            });
+        let events = runtime.poll(Now::from_millis(1)).expect("vetoed");
+        assert!(
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    SwarmEvent::DialFailed { conn_id, .. } if *conn_id == late
+                )
+            }),
+            "vetoed dial should DialFailed; got {events:?}"
+        );
+        assert!(
+            events.iter().all(|event| {
+                !matches!(
+                    event,
+                    SwarmEvent::ConnectionEstablished { conn_id, .. } if *conn_id == late
+                )
+            }),
+            "vetoed dial must not establish; got {events:?}"
+        );
+        assert!(
+            events.iter().all(|event| {
+                !matches!(
+                    event,
+                    SwarmEvent::ConnectionClosed {
+                        conn_id,
+                        cause: crate::ConnectionCloseCause::Superseded,
+                        ..
+                    } if *conn_id == existing
+                )
+            }),
+            "existing connection must not be superseded; got {events:?}"
+        );
+        assert_eq!(runtime.connection_id(&peer), Some(existing));
+        assert!(
+            runtime.transport().close_count >= 1,
+            "late dial must be closed; close_count={}",
+            runtime.transport().close_count
         );
     }
 }

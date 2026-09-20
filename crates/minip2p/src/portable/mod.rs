@@ -26,6 +26,12 @@ pub use minip2p_swarm::{
 };
 pub use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
+mod connect;
+pub use connect::{
+    CandidateFailure, ConnectFailure, ConnectId, ConnectOutcome, ConnectTarget, ConnectTargetError,
+};
+#[cfg(feature = "std")]
+pub(crate) use connect::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS};
 mod event_stream;
 pub use event_stream::EndpointEvent;
 
@@ -39,7 +45,8 @@ pub use minip2p_mdns::{MdnsConfig, MdnsConfigError, MdnsError, MdnsEvent, MdnsIo
 pub use minip2p_mdns::{SmoltcpMdnsConfig, SmoltcpMdnsIo};
 #[cfg(all(feature = "portable-autonat", not(feature = "nat")))]
 pub use minip2p_nat::{
-    ConnectId, NatConfig, NatEvent, Path, ReachabilityState, ReservationInfo, ReservationPolicy,
+    ConnectId as NatConnectId, NatConfig, NatEvent, Path, ReachabilityState, ReservationInfo,
+    ReservationPolicy,
 };
 #[cfg(all(feature = "pubsub", not(feature = "std")))]
 pub use minip2p_pubsub::{
@@ -93,6 +100,7 @@ impl Endpoint {
 /// is queued).
 pub struct PortableEndpoint<T: Transport, E: EntropySource> {
     runtime: SwarmRuntime<T, E>,
+    connect: connect::ConnectEngine,
 }
 
 /// Lightweight snapshot of portable endpoint state.
@@ -142,8 +150,70 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     }
 
     /// Starts dialing a peer address.
+    ///
+    /// Prefer [`Self::connect`] for a Connection attempt with one identity and
+    /// one terminal outcome. `dial` remains for raw Transport dials until the
+    /// contraction ticket.
     pub fn dial(&mut self, address: &PeerAddr) -> Result<ConnectionId, DriverError> {
         self.runtime.dial(address)
+    }
+
+    /// Admits one Connection attempt. Sync errors: malformed target only.
+    ///
+    /// Every candidate is dialed immediately. Candidate completion order is
+    /// not a public contract. The swarm still keeps a single connection per
+    /// peer: a race loser that finishes after the winner may supersede it
+    /// (`ConnectionClosed { Superseded }` then a new `ConnectionEstablished`).
+    /// The attempt is already settled at the first established connection
+    /// (including a simultaneous inbound), and the app sees those as ordinary
+    /// connection events.
+    #[expect(
+        clippy::result_large_err,
+        reason = "ConnectTargetError retains both peer identities for MixedPeers diagnostics."
+    )]
+    pub fn connect(
+        &mut self,
+        target: impl TryInto<ConnectTarget, Error: Into<ConnectTargetError>>,
+        now: Now,
+    ) -> Result<ConnectId, ConnectTargetError> {
+        let target = target.try_into().map_err(Into::into)?.validated()?;
+        Ok(self
+            .connect
+            .connect(target, &mut self.runtime, now.monotonic_ms))
+    }
+
+    /// Idempotent. Settled or unknown ids are a no-op. Never disconnects.
+    pub fn cancel_connect(&mut self, id: ConnectId) {
+        self.connect.cancel(id, &mut self.runtime);
+    }
+
+    pub(crate) fn tick_connect(&mut self, now: Now) {
+        self.connect.tick(&mut self.runtime, now.monotonic_ms);
+    }
+
+    #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
+    pub(crate) fn observe_connect(&mut self, event: &minip2p_swarm::SwarmEvent, now: Now) -> bool {
+        self.connect
+            .observe(event, &mut self.runtime, now.monotonic_ms)
+    }
+
+    #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
+    pub(crate) fn pop_connect_event(&mut self) -> Option<EndpointEvent> {
+        self.connect.pop_event()
+    }
+
+    #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
+    pub(crate) fn poll_runtime(
+        &mut self,
+        now: Now,
+    ) -> Result<alloc::vec::Vec<minip2p_swarm::SwarmEvent>, DriverError> {
+        self.runtime.poll(now)
+    }
+
+    fn drain_connect_events(connect: &mut connect::ConnectEngine, events: &mut Vec<EndpointEvent>) {
+        while let Some(event) = connect.pop_event() {
+            events.push(event);
+        }
     }
 
     /// Returns peers with an established transport connection.
@@ -284,12 +354,27 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     ///
     /// Returned values are [`EndpointEvent`]s from the Endpoint event stream.
     pub fn poll(&mut self, now: Now) -> Result<alloc::vec::Vec<EndpointEvent>, DriverError> {
-        self.runtime.poll(now)
+        self.tick_connect(now);
+        let mut events = alloc::vec::Vec::new();
+        Self::drain_connect_events(&mut self.connect, &mut events);
+        for event in self.runtime.poll(now)? {
+            let consumed = self
+                .connect
+                .observe(&event, &mut self.runtime, now.monotonic_ms);
+            if !consumed {
+                events.push(EndpointEvent::from(event));
+            }
+            Self::drain_connect_events(&mut self.connect, &mut events);
+        }
+        Ok(events)
     }
 
     /// Returns when the endpoint next needs to be polled.
     pub fn next_deadline(&self, now: Now) -> Option<PollDeadline> {
-        self.runtime.next_deadline(now)
+        PollDeadline::earliest_opt(
+            self.runtime.next_deadline(now),
+            self.connect.next_deadline(),
+        )
     }
 
     /// Gracefully closes established peers, drives the resulting actions once,
@@ -299,7 +384,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     /// transport releases listeners and in-progress connections as well as
     /// established ones. Every established peer is attempted even if an
     /// earlier close fails. The first close error wins over a later poll error.
-    pub fn shutdown(mut self, now: Now) -> Result<Vec<SwarmEvent>, DriverError> {
+    pub fn shutdown(mut self, now: Now) -> Result<Vec<EndpointEvent>, DriverError> {
         let mut first_error = None;
         for peer_id in self.runtime.connected_peers() {
             if let Err(error) = self.runtime.disconnect(&peer_id, now.monotonic_ms)
@@ -308,7 +393,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
                 first_error = Some(error);
             }
         }
-        let events = self.runtime.poll(now);
+        let events = self.poll(now);
         match first_error {
             Some(error) => Err(error),
             None => events,
@@ -386,7 +471,7 @@ impl core::fmt::Display for PortableMdnsConfigError {
 #[derive(Clone, Debug)]
 pub enum PortableMdnsEvent {
     /// Ordinary endpoint protocol or connection progress.
-    Endpoint(SwarmEvent),
+    Endpoint(EndpointEvent),
     /// Bounded peer-book and automatic-dial observation.
     Discovery(DiscoveryEvent),
 }
@@ -473,7 +558,11 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
         now: Now,
         events: &mut Vec<PortableMdnsEvent>,
     ) -> Result<(), DriverError> {
-        for event in self.endpoint.poll(now)? {
+        self.endpoint.tick_connect(now);
+        while let Some(event) = self.endpoint.pop_connect_event() {
+            events.push(PortableMdnsEvent::Endpoint(event));
+        }
+        for event in self.endpoint.poll_runtime(now)? {
             match &event {
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                     self.active_dials.remove(peer_id);
@@ -493,9 +582,25 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
                             .dial_failed(&peer_id, &error.detail, now.monotonic_ms);
                     }
                 }
+                SwarmEvent::DialFailed {
+                    conn_id, reason, ..
+                } => {
+                    if let Some(peer_id) =
+                        remove_failed_autodial(&mut self.active_dials, None, Some(*conn_id))
+                    {
+                        self.discovery
+                            .dial_failed(&peer_id, reason, now.monotonic_ms);
+                    }
+                }
                 _ => {}
             }
-            events.push(PortableMdnsEvent::Endpoint(event));
+            let consumed = self.endpoint.observe_connect(&event, now);
+            if !consumed {
+                events.push(PortableMdnsEvent::Endpoint(event.into()));
+            }
+            while let Some(event) = self.endpoint.pop_connect_event() {
+                events.push(PortableMdnsEvent::Endpoint(event));
+            }
         }
         Ok(())
     }
@@ -637,6 +742,7 @@ pub struct PortableEndpointBuilder<E> {
     #[cfg(feature = "smoltcp")]
     identity: Ed25519Keypair,
     entropy: E,
+    connect_deadline_ms: u64,
 }
 
 impl<E: EntropySource> PortableEndpointBuilder<E> {
@@ -647,6 +753,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
             #[cfg(feature = "smoltcp")]
             identity: identity.clone(),
             entropy,
+            connect_deadline_ms: connect::DEFAULT_CONNECT_DEADLINE_MS,
         }
     }
 
@@ -662,10 +769,17 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
         self
     }
 
+    /// Sets the Connection-attempt deadline in milliseconds. Default 30_000.
+    pub fn connect_deadline_ms(mut self, ms: u64) -> Self {
+        self.connect_deadline_ms = ms;
+        self
+    }
+
     /// Builds the portable endpoint over a caller-provided transport.
     pub fn build<T: Transport>(self, transport: T) -> Result<PortableEndpoint<T, E>, SwarmError> {
         Ok(PortableEndpoint {
             runtime: self.swarm.build_runtime(transport, self.entropy)?,
+            connect: connect::ConnectEngine::new(self.connect_deadline_ms),
         })
     }
 
@@ -691,6 +805,7 @@ impl<E: EntropySource> PortableEndpointBuilder<E> {
             #[cfg(feature = "portable-autonat")]
             nat_config: None,
             discovery: PeerDiscoveryConfig::default(),
+            connect_deadline_ms: self.connect_deadline_ms,
         }
     }
 }
@@ -720,6 +835,7 @@ pub struct SmoltcpEndpointBuilder<D: smoltcp::phy::Device, E: EntropySource> {
     #[cfg(feature = "portable-autonat")]
     nat_config: Option<minip2p_nat::NatConfig>,
     discovery: PeerDiscoveryConfig,
+    connect_deadline_ms: u64,
 }
 
 #[cfg(feature = "smoltcp")]
@@ -754,7 +870,7 @@ pub struct SmoltcpEndpoint<D: smoltcp::phy::Device, E: EntropySource> {
 #[derive(Clone, Debug)]
 pub enum SmoltcpEvent {
     /// Ordinary connection, Identify, Ping, or application-stream progress.
-    Endpoint(SwarmEvent),
+    Endpoint(EndpointEvent),
     /// Application-visible pubsub progress.
     #[cfg(feature = "pubsub")]
     Gossipsub(GossipsubEvent),
@@ -785,7 +901,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> core::ops::DerefMut for SmoltcpE
 impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     /// Starts a relay-only connection attempt toward `peer`.
     #[cfg(feature = "portable-relay")]
-    pub fn connect_relay(
+    pub fn nat_connect_relay(
         &mut self,
         peer: &PeerId,
         now: Now,
@@ -801,7 +917,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
 
     /// Cancels one relay connection attempt.
     #[cfg(feature = "portable-relay")]
-    pub fn cancel_connect(&mut self, id: minip2p_nat::ConnectId, now: Now) {
+    pub fn nat_cancel_connect(&mut self, id: minip2p_nat::ConnectId, now: Now) {
         if let Some(nat) = self.nat.as_mut() {
             nat.cancel(id, now);
             nat.pump(&mut self.endpoint, now);
@@ -955,7 +1071,11 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     }
 
     fn poll_swarm(&mut self, now: Now, output: &mut Vec<SmoltcpEvent>) -> Result<(), DriverError> {
-        for event in self.endpoint.poll(now)? {
+        self.endpoint.tick_connect(now);
+        while let Some(event) = self.endpoint.pop_connect_event() {
+            output.push(SmoltcpEvent::Endpoint(event));
+        }
+        for event in self.endpoint.poll_runtime(now)? {
             if let Some(discovery) = self.discovery.as_mut() {
                 match &event {
                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
@@ -975,16 +1095,27 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
                             discovery.dial_failed(&peer, &error.detail, now.monotonic_ms);
                         }
                     }
+                    SwarmEvent::DialFailed {
+                        conn_id, reason, ..
+                    } => {
+                        if let Some(peer) =
+                            remove_failed_autodial(&mut self.active_dials, None, Some(*conn_id))
+                        {
+                            discovery.dial_failed(&peer, reason, now.monotonic_ms);
+                        }
+                    }
                     _ => {}
                 }
             }
+            let engine_consumed = self.endpoint.observe_connect(&event, now);
             #[cfg(feature = "portable-autonat")]
-            let claimed = self
-                .nat
-                .as_mut()
-                .is_some_and(|nat| nat.ingest(&event, &mut self.endpoint, now));
+            let claimed = engine_consumed
+                || self
+                    .nat
+                    .as_mut()
+                    .is_some_and(|nat| nat.ingest(&event, &mut self.endpoint, now));
             #[cfg(not(feature = "portable-autonat"))]
-            let claimed = false;
+            let claimed = engine_consumed;
             #[cfg(feature = "pubsub")]
             let claimed = claimed
                 || self
@@ -996,6 +1127,9 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
                 pump_embedded_pubsub(agent, &mut self.endpoint, now);
             }
             if !claimed {
+                output.push(SmoltcpEvent::Endpoint(event.into()));
+            }
+            while let Some(event) = self.endpoint.pop_connect_event() {
                 output.push(SmoltcpEvent::Endpoint(event));
             }
         }
@@ -1449,6 +1583,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
         );
         let mut endpoint = PortableEndpoint {
             runtime: self.swarm.build_runtime(transport, self.entropy.clone())?,
+            connect: connect::ConnectEngine::new(self.connect_deadline_ms),
         };
         #[cfg(feature = "portable-autonat")]
         if self
@@ -1942,6 +2077,48 @@ mod tests {
     }
 
     #[test]
+    fn portable_connect_settles_when_the_peer_is_already_connected() {
+        let a_identity = Ed25519Keypair::from_secret_key_bytes([21; 32]);
+        let b_identity = Ed25519Keypair::from_secret_key_bytes([22; 32]);
+        let (a_transport, b_transport) =
+            InMemoryTransport::pair(a_identity.peer_id(), b_identity.peer_id());
+        let mut a = Endpoint::portable(&a_identity, ZeroEntropy)
+            .build(a_transport)
+            .expect("a endpoint configuration is valid");
+        let mut b = Endpoint::portable(&b_identity, ZeroEntropy)
+            .build(b_transport)
+            .expect("b endpoint configuration is valid");
+
+        for now_ms in 0..64 {
+            a.poll(Now::from_millis(now_ms)).expect("drive a");
+            b.poll(Now::from_millis(now_ms)).expect("drive b");
+            if a.connection_id(&b_identity.peer_id()).is_some() {
+                break;
+            }
+        }
+        let conn_id = a
+            .connection_id(&b_identity.peer_id())
+            .expect("pair is connected");
+        let target = PeerAddr::new(
+            "/ip4/192.0.2.2/udp/4002/quic-v1".parse().expect("address"),
+            b_identity.peer_id(),
+        )
+        .expect("peer addr");
+        let id = a
+            .connect(target, Now::from_millis(80))
+            .expect("connect admitted");
+        let events = a.poll(Now::from_millis(80)).expect("drain settled");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EndpointEvent::ConnectSettled {
+                connect_id,
+                outcome: ConnectOutcome::Connected { conn_id: settled },
+                ..
+            } if *connect_id == id && *settled == conn_id
+        )));
+    }
+
+    #[test]
     fn portable_shutdown_closes_established_peers_and_releases_the_endpoint() {
         let identity = Ed25519Keypair::from_secret_key_bytes([9; 32]);
         let remote = Ed25519Keypair::from_secret_key_bytes([10; 32]).peer_id();
@@ -1982,7 +2159,7 @@ mod tests {
         );
         assert!(events.iter().any(|event| matches!(
             event,
-            SwarmEvent::ConnectionClosed { peer_id, conn_id: closed_id, .. }
+            EndpointEvent::ConnectionClosed { peer_id, conn_id: closed_id, .. }
                 if peer_id == &remote && closed_id == &conn_id
         )));
     }

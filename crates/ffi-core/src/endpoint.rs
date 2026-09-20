@@ -142,7 +142,7 @@ pub(crate) struct EndpointState {
     pub(crate) active: bool,
     pub(crate) driver_thread_id: Option<std::thread::ThreadId>,
     doorbell_thread_id: Option<std::thread::ThreadId>,
-    pub(crate) connect_ids: BTreeMap<u64, minip2p::ConnectId>,
+    pub(crate) connect_ids: BTreeMap<u64, minip2p::NatConnectId>,
     pub(crate) cancelled_connect_ids: BTreeSet<u64>,
     pub(crate) carry: crate::driver::Carry,
     pub(crate) overflow: crate::driver::OverflowDiagnostic,
@@ -584,7 +584,7 @@ impl P2pEndpoint {
             .endpoint
             .as_mut()
             .ok_or(FfiError::Stopped)?
-            .connect(&peer)
+            .nat_connect(&peer)
             .map_err(map_driver_error)?;
         state.connect_ids.insert(id.as_u64(), id);
         Ok(id.as_u64())
@@ -617,7 +617,7 @@ impl P2pEndpoint {
             .endpoint
             .as_mut()
             .ok_or(FfiError::Stopped)?
-            .connect_with_addrs(peer, direct_addrs)
+            .nat_connect_with_addrs(peer, direct_addrs)
             .map_err(map_driver_error)?;
         state.connect_ids.insert(id.as_u64(), id);
         Ok(id.as_u64())
@@ -634,7 +634,7 @@ impl P2pEndpoint {
             .endpoint
             .as_mut()
             .ok_or(FfiError::Stopped)?
-            .connect_addr(&address)
+            .nat_connect_addr(&address)
             .map_err(map_driver_error)?;
         state.connect_ids.insert(id.as_u64(), id);
         Ok(id.as_u64())
@@ -683,7 +683,7 @@ impl P2pEndpoint {
         let connect_id = state.connect_ids.remove(&id);
         let endpoint = state.endpoint.as_mut().ok_or(FfiError::Stopped)?;
         if let Some(connect_id) = connect_id {
-            endpoint.cancel_connect(connect_id);
+            endpoint.nat_cancel_connect(connect_id);
             let suppressed = state.carry.suppress_cancelled(&BTreeSet::from([id]));
             state.stats.dropped = state.stats.dropped.saturating_add(suppressed as u64);
             state.cancelled_connect_ids.insert(id);

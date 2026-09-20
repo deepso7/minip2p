@@ -18,9 +18,9 @@ use minip2p::smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken
 use minip2p::smoltcp::time::Instant;
 use minip2p::smoltcp::wire::{HardwareAddress, IpCidr};
 use minip2p::{
-    DriverError, Ed25519Keypair, Endpoint, EntropySource, Multiaddr, NatConfig, NatEvent, Now,
-    Path, PeerAddr, PeerId, ReservationPolicy, SmoltcpEvent, SmoltcpStack, StreamId, SwarmError,
-    SwarmEvent,
+    DriverError, Ed25519Keypair, Endpoint, EndpointEvent, EntropySource, Multiaddr, NatConfig,
+    NatEvent, Now, Path, PeerAddr, PeerId, ReservationPolicy, SmoltcpEvent, SmoltcpStack, StreamId,
+    SwarmError,
 };
 use minip2p_nat::{AUTONAT_PROTOCOL_ID, HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 use minip2p_platform::EntropyError;
@@ -201,7 +201,7 @@ impl RelayService {
             return;
         };
         match event {
-            SwarmEvent::StreamReady {
+            EndpointEvent::StreamReady {
                 peer_id,
                 stream_id,
                 protocol_id,
@@ -214,7 +214,7 @@ impl RelayService {
                     self.a_bridge = Some(stream_id);
                 }
             }
-            SwarmEvent::StreamReady {
+            EndpointEvent::StreamReady {
                 peer_id,
                 stream_id,
                 protocol_id,
@@ -227,7 +227,7 @@ impl RelayService {
                     .send_stream(&self.b, stream_id, request, now)
                     .unwrap();
             }
-            SwarmEvent::StreamData {
+            EndpointEvent::StreamData {
                 peer_id,
                 stream_id,
                 data,
@@ -239,7 +239,7 @@ impl RelayService {
                     .send_stream(&self.b, stream_id, response, now)
                     .unwrap();
             }
-            SwarmEvent::StreamData {
+            EndpointEvent::StreamData {
                 peer_id,
                 stream_id,
                 data,
@@ -267,7 +267,7 @@ impl RelayService {
                     .unwrap();
                 self.b_stop = Some(stop);
             }
-            SwarmEvent::StreamData {
+            EndpointEvent::StreamData {
                 peer_id,
                 stream_id,
                 data,
@@ -288,7 +288,7 @@ impl RelayService {
                         .unwrap();
                 }
             }
-            SwarmEvent::StreamData {
+            EndpointEvent::StreamData {
                 peer_id,
                 stream_id,
                 data,
@@ -298,7 +298,7 @@ impl RelayService {
                     .send_stream(&self.b, self.b_stop.unwrap(), data, now)
                     .unwrap();
             }
-            SwarmEvent::StreamData {
+            EndpointEvent::StreamData {
                 peer_id,
                 stream_id,
                 data,
@@ -308,7 +308,7 @@ impl RelayService {
                     .send_stream(&self.a, self.a_bridge.unwrap(), data, now)
                     .unwrap();
             }
-            SwarmEvent::StreamClosed {
+            EndpointEvent::StreamClosed {
                 peer_id, stream_id, ..
             } if (peer_id == self.a && Some(stream_id) == self.a_bridge)
                 || (peer_id == self.b && Some(stream_id) == self.b_stop) =>
@@ -377,7 +377,7 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
                 if relay == &relay_peer)
         });
         if reserved && !connect_started {
-            a.connect_relay(&b_peer, now).unwrap();
+            a.nat_connect_relay(&b_peer, now).unwrap();
             connect_started = true;
         }
         let a_relayed = a_events.iter().any(|event| {
@@ -396,7 +396,7 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
         if let Some(stream) = app_stream
             && !sent
             && a_events.iter().any(|event| {
-                matches!(event, SmoltcpEvent::Endpoint(SwarmEvent::StreamReady {
+                matches!(event, SmoltcpEvent::Endpoint(EndpointEvent::StreamReady {
                     peer_id, stream_id, initiated_locally: true, ..
                 }) if peer_id == &b_peer && *stream_id == stream)
             })
@@ -407,7 +407,7 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
         }
         let received = app_stream.is_some_and(|stream| {
             b_events.iter().any(|event| {
-                matches!(event, SmoltcpEvent::Endpoint(SwarmEvent::StreamData {
+                matches!(event, SmoltcpEvent::Endpoint(EndpointEvent::StreamData {
                     peer_id, stream_id, data, ..
                 }) if peer_id == &a_peer && *stream_id == stream && data == PAYLOAD)
             })
@@ -426,7 +426,7 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
         let circuit_closes = a_events
             .iter()
             .filter(|event| {
-                matches!(event, SmoltcpEvent::Endpoint(SwarmEvent::ConnectionClosed {
+                matches!(event, SmoltcpEvent::Endpoint(EndpointEvent::ConnectionClosed {
                     peer_id, conn_id, ..
                 }) if peer_id == &b_peer && conn_id.is_circuit())
             })
@@ -522,7 +522,7 @@ fn portable_relay_and_autonat_compose_and_register_their_protocols() {
 }
 
 #[test]
-fn connect_relay_rejects_an_autonat_only_policy() {
+fn nat_connect_relay_rejects_an_autonat_only_policy() {
     let bus = VirtualBus::new(1);
     let local = identity(130);
     let server = identity(131);
@@ -538,7 +538,7 @@ fn connect_relay_rejects_an_autonat_only_policy() {
         .expect("AutoNAT-only policy builds with relay code available");
 
     assert_eq!(
-        endpoint.connect_relay(&identity(132).peer_id(), Now::from_millis(0)),
+        endpoint.nat_connect_relay(&identity(132).peer_id(), Now::from_millis(0)),
         Err(minip2p::SmoltcpRelayError::NotEnabled)
     );
 }

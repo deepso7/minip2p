@@ -31,7 +31,7 @@ fn direct_candidate_wins_over_loopback() {
     let b_addr = b.listen().expect("b listens");
     a.listen().expect("a listens");
 
-    let id = a.connect_addr(&b_addr).expect("connect starts");
+    let id = a.nat_connect_addr(&b_addr).expect("connect starts");
 
     // Drive both endpoints; no relay is configured, so the only leg is the
     // direct dial of the provided candidate.
@@ -78,11 +78,11 @@ fn connect_without_candidates_or_relay_fails_fast() {
     a.listen().expect("a listens");
 
     let stranger = minip2p::Ed25519Keypair::generate().peer_id();
-    let id = a.connect(&stranger).expect("connect starts");
+    let id = a.nat_connect(&stranger).expect("connect starts");
 
     let path = a
-        .wait_path(id, Duration::from_secs(2))
-        .expect("wait_path drives");
+        .nat_wait_path(id, Duration::from_secs(2))
+        .expect("nat_wait_path drives");
     assert!(path.is_none(), "no path can exist");
     // The failure detail stays inspectable.
     let events = a.take_nat_events();
@@ -97,7 +97,7 @@ fn connect_without_candidates_or_relay_fails_fast() {
 }
 
 #[test]
-fn wait_path_buffers_application_events() {
+fn nat_wait_path_buffers_application_events() {
     let mut a = nat_endpoint();
     let mut b = Endpoint::builder()
         .bind_quic("127.0.0.1:0")
@@ -105,12 +105,14 @@ fn wait_path_buffers_application_events() {
     let b_addr = b.listen().expect("b listens");
     a.listen().expect("a listens");
 
-    let id = a.connect_addr(&b_addr).expect("connect starts");
+    let id = a.nat_connect_addr(&b_addr).expect("connect starts");
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut path = None;
     while path.is_none() {
         assert!(Instant::now() < deadline, "direct connect timed out");
-        path = a.wait_path(id, Duration::from_millis(20)).expect("a waits");
+        path = a
+            .nat_wait_path(id, Duration::from_millis(20))
+            .expect("a waits");
         let _ = b.next_event(Duration::from_millis(20)).expect("b drives");
     }
     assert!(matches!(path, Some(Path::DirectDialed)));
@@ -124,7 +126,10 @@ fn wait_path_buffers_application_events() {
             break;
         }
     }
-    assert!(saw_connection, "application events must survive wait_path");
+    assert!(
+        saw_connection,
+        "application events must survive nat_wait_path"
+    );
 }
 
 #[test]
@@ -152,7 +157,7 @@ fn wait_peer_ready_drives_nat_agent() {
         }
     });
 
-    let id = a.connect_addr(&b_addr).expect("connect starts");
+    let id = a.nat_connect_addr(&b_addr).expect("connect starts");
     let ready = a
         .wait_peer_ready(b_addr.peer_id(), Duration::from_secs(10))
         .expect("wait succeeds");
@@ -225,7 +230,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
     initiator.listen().expect("initiator listens");
     let initiator_peer = initiator.peer_id().clone();
     let connect_id = initiator
-        .connect(&responder_peer)
+        .nat_connect(&responder_peer)
         .expect("start relay-only connect");
 
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -475,7 +480,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
     initiator.listen().expect("initiator listens");
     let initiator_peer = initiator.peer_id().clone();
     let connect_id = initiator
-        .connect(&responder_peer)
+        .nat_connect(&responder_peer)
         .expect("start relay-only connect");
 
     let deadline = Instant::now() + Duration::from_secs(15);

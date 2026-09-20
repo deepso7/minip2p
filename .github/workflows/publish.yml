@@ -25,7 +25,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   NODE_VERSION: "24.20.0"
-  PNPM_VERSION: "12.3.4"
+  PNPM_VERSION: "12.5.1"
 
 jobs:
   verify-release:

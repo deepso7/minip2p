@@ -25,10 +25,10 @@ The default dependency selection enables `std` and `quic`. `Endpoint` and `Endpo
 Available on the std `Endpoint`:
 
 - Address publication: `listen`, `listen_all`
-- Direct connections: `dial`, `dial_ip4`, `dial_ip6`, `disconnect`
+- Direct connections: `connect`, `cancel_connect`, `dial`, `dial_ip4`, `dial_ip6`, `disconnect`
 - State: `peer_id`, `connected_peers`, `is_peer_ready`, `peer_info`
 - Streams: `add_protocol`, `open_stream`, `send_stream`, `close_stream_write`, `reset_stream`, `abandon_stream`
-- Driving: focused waits `wait_peer_ready`, `wait_path` (nat), `wait_ping_rtt`; event loops `next_event`, `next_wake`; non-blocking `poll`
+- Driving: focused waits `wait_peer_ready`, `nat_wait_path` (nat), `wait_ping_rtt`; event loops `wait`, `next_event`, `next_wake`; non-blocking `poll`
 - Shutdown: `close`
 
 Available on `EndpointBuilder` with `quic`:
@@ -57,7 +57,7 @@ The `smoltcp` feature adds a shared embedded TCP stack. It includes portable mDN
 Compiled with `features = ["nat"]`:
 
 - Activation: `relay`, `autonat_server`, `nat_config`
-- Attempts: `connect`, `connect_addr`, `connect_with_addrs`, `cancel_connect`, `wait_path`
+- Attempts: `nat_connect`, `nat_connect_addr`, `nat_connect_with_addrs`, `nat_cancel_connect`, `nat_wait_path`
 - Events: `take_nat_events`, `next_nat_event`
 - State: `reachability`, `active_reservation`, `path`
 

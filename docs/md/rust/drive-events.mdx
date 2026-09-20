@@ -7,12 +7,12 @@ minip2p remains caller-driven at every layer. The application chooses when to po
 
 ## Pick a driving method
 
-Use `Endpoint::wait` for the ADR 0007 Endpoint wait outcomes (event, deadline, or interrupted). If NAT, pubsub, discovery, or relay-server is enabled, keep using `next_wake` until capability events join the stream (#177) — `wait` does not wake on capability progress. Use focused waits such as `wait_path` and `wait_peer_ready` when you need a particular milestone during migration. Use `next_event` for legacy application loops, or `next_wake` when your loop also handles capability queues and interruptions. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
+Use `Endpoint::wait` for the ADR 0007 Endpoint wait outcomes (event, deadline, or interrupted). If NAT, pubsub, discovery, or relay-server is enabled, keep using `next_wake` until capability events join the stream (#177) — `wait` does not wake on capability progress. Prefer `connect` plus `ConnectSettled` for a Connection attempt. Use focused waits such as `nat_wait_path` (nat) and `wait_peer_ready` when you need a particular milestone during migration. Use `next_event` for legacy application loops, or `next_wake` when your loop also handles capability queues and interruptions. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
 
 | Method | Behavior | Good fit |
 | --- | --- | --- |
 | `wait(deadline)` | Drive until one Endpoint event, deadline, or interruption. No driver-progress. | New application event loops; correlating an operation while dispatching others |
-| `wait_path` / `wait_peer_ready` / `wait_ping_rtt` | Drive until one milestone, buffering unrelated events. | Connection and setup milestones (migration) |
+| `nat_wait_path` / `wait_peer_ready` / `wait_ping_rtt` | Drive until one milestone, buffering unrelated events. | Connection and setup milestones (migration) |
 | Feature-focused waits | Drive until a NAT, pubsub, signed-discovery, or mDNS result. | Feature-specific workflows (migration) |
 | `next_event(deadline)` | Drive until one ordinary application event or the deadline; swallows interruption. | Legacy synchronous loops |
 | `next_wake(deadline)` | Drive until an application event, optional-capability progress, interruption, or the deadline. | One interruptible loop over ordinary and capability events |
@@ -39,19 +39,36 @@ An already-passed absolute `Instant` deadline returns `Deadline` from `wait` / `
 ```rust
 use std::time::Duration;
 
-use minip2p::{Endpoint, Event};
+use minip2p::{ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome};
 
-fn dial_and_ready(
+fn connect_and_ready(
     node: &mut Endpoint,
-    target: &minip2p::PeerAddr,
-) -> Result<Event, Box<dyn std::error::Error>> {
-    node.dial(target)?;
-    node.wait_peer_ready(target.peer_id(), Duration::from_secs(10))?
-        .ok_or_else(|| "peer did not become ready".into())
+    target: minip2p::PeerAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let connect_id = node.connect(target)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match node.wait(deadline)? {
+            EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
+                connect_id: settled,
+                outcome: ConnectOutcome::Connected { .. },
+                ..
+            }) if settled == connect_id => return Ok(()),
+            EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
+                connect_id: settled,
+                outcome,
+                ..
+            }) if settled == connect_id => {
+                return Err(format!("connect failed: {outcome:?}").into());
+            }
+            EndpointWaitOutcome::Event(_) | EndpointWaitOutcome::Interrupted => {}
+            EndpointWaitOutcome::Deadline => return Err("connect did not settle".into()),
+        }
+    }
 }
 ```
 
-With the `nat` feature, prefer `connect*` plus `wait_path` for the first usable path. Use `wait_peer_ready` only when the application needs Identify's protocol list (for example early `RemoteDoesNotSupport` checks). `open_stream` is allowed once the peer is connected; Identify is not a stack gate for opening known app protocols.
+With the `nat` feature, prefer `nat_connect*` plus `nat_wait_path` for the first usable NAT path. Use `wait_peer_ready` only when the application needs Identify's protocol list (for example early `RemoteDoesNotSupport` checks). `open_stream` is allowed once the peer is connected; Identify is not a stack gate for opening known app protocols.
 
 ## Application event loops
 
@@ -95,7 +112,7 @@ Synchronous method failures are returned as `minip2p::Error`. Non-fatal problems
 
 ## Focused waits preserve other events
 
-Suppose `wait_path` is waiting for a NAT result while an application stream receives data. The stream event is retained and becomes available through a later `next_event`; it is not discarded by the NAT wait.
+Suppose `nat_wait_path` is waiting for a NAT result while an application stream receives data. The stream event is retained and becomes available through a later `next_event`; it is not discarded by the NAT wait.
 
 That retained backlog is bounded by `RUN_UNTIL_SKIP_LIMIT` (currently 1024 events). If a focused wait cannot find its result while unrelated events keep arriving, it returns:
 

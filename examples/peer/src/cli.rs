@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use minip2p::{Event, Multiaddr, PeerAddr, PeerId, Protocol};
+use minip2p::{ConnectOutcome, Event, Multiaddr, PeerAddr, PeerId, Protocol};
 use minip2p_example_common::CliError;
 
 /// The modes the CLI dispatches to.
@@ -357,6 +357,37 @@ pub fn print_event(role: &str, event: &Event) {
         Event::Error(error) => {
             eprintln!("[{role}] error {:?}: {}", error.kind, error.detail);
         }
+        Event::DialFailed {
+            conn_id,
+            addr,
+            reason,
+        } => {
+            eprintln!("[{role}] dial-failed conn={conn_id} addr={addr} reason={reason}");
+        }
+        Event::ConnectSettled {
+            connect_id,
+            peer_id,
+            outcome,
+        } => match outcome {
+            ConnectOutcome::Connected { conn_id } => {
+                println!(
+                    "[{role}] connect-settled id={} peer={peer_id} outcome=connected conn={conn_id}",
+                    connect_id.as_u64()
+                );
+            }
+            ConnectOutcome::Failed(failure) => {
+                eprintln!(
+                    "[{role}] connect-settled id={} peer={peer_id} outcome=failed {failure}",
+                    connect_id.as_u64()
+                );
+            }
+            ConnectOutcome::Cancelled => {
+                println!(
+                    "[{role}] connect-settled id={} peer={peer_id} outcome=cancelled",
+                    connect_id.as_u64()
+                );
+            }
+        },
     }
 }
 

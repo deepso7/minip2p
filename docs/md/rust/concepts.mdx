@@ -9,7 +9,7 @@ An `Endpoint` is the main application API. Five ideas explain most code built on
 
 `Endpoint` owns an Ed25519 identity, the transports you bound, and the connection state. It is the app-facing entrypoint for listening, dialing, Ping, Identify, and application streams. QUIC is on by default; add the `tcp` feature to use QUIC and TCP together, or bind only TCP.
 
-An endpoint does not spawn a runtime. Prefer `Endpoint::wait` for the ordered Endpoint event stream (event, deadline, or interrupted). If NAT, pubsub, discovery, or relay-server is enabled, keep using `next_wake` until capability events join the stream (#177) — `wait` does not wake on capability progress. Focused waits such as `wait_path` and `wait_peer_ready`, plus `next_event` / `next_wake`, remain during migration. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. `poll()` is the non-blocking step for an existing reactor.
+An endpoint does not spawn a runtime. Prefer `Endpoint::wait` for the ordered Endpoint event stream (event, deadline, or interrupted). If NAT, pubsub, discovery, or relay-server is enabled, keep using `next_wake` until capability events join the stream (#177) — `wait` does not wake on capability progress. Prefer `connect` plus `ConnectSettled` for a Connection attempt. Focused waits such as `nat_wait_path` and `wait_peer_ready`, plus `next_event` / `next_wake`, remain during migration. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. `poll()` is the non-blocking step for an existing reactor.
 
 ```mermaid
 flowchart TB
@@ -57,12 +57,12 @@ These are separate paths with different policy:
 
 | Goal | Start with | Wait for |
 | --- | --- | --- |
-| Direct QUIC or TCP to a known address | `dial`, `dial_ip4`, or `dial_ip6` | connection, then `wait_peer_ready` if you need Identify |
-| NAT-aware attempt with optional relay | `connect`, `connect_addr`, or `connect_with_addrs` | `wait_path` or `NatEvent` |
+| Direct QUIC or TCP to a known address | `connect`, or `dial` / `dial_ip4` / `dial_ip6` | `ConnectSettled`, or connection then `wait_peer_ready` if you need Identify |
+| NAT-aware attempt with optional relay | `nat_connect`, `nat_connect_addr`, or `nat_connect_with_addrs` | `nat_wait_path` or `NatEvent` |
 
 The base `dial*` methods only start direct dials. The address picks QUIC or TCP. They do not reserve on a relay or perform DCUtR.
 
-With the `nat` capability enabled, `connect*` can race direct candidates against a relay leg. The first usable result is:
+With the `nat` capability enabled, `nat_connect*` can race direct candidates against a relay leg. The first usable result is:
 
 - `Path::DirectDialed`: a supplied direct address connected;
 - `Path::DirectPunched`: DCUtR established a direct connection;

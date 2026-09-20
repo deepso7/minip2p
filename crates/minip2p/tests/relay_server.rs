@@ -70,7 +70,9 @@ fn exercise_relay(
     );
     initiator.listen().expect("initiator listens");
     let initiator_peer = initiator.peer_id().clone();
-    let connect_id = initiator.connect(&responder_peer).expect("connect starts");
+    let connect_id = initiator
+        .nat_connect(&responder_peer)
+        .expect("connect starts");
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut connected = false;
