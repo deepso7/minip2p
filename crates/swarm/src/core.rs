@@ -707,17 +707,31 @@ impl SwarmCore {
     /// Returns whether `conn_id` was a pending outbound dial. Used by
     /// [`crate::SwarmRuntime::abort_dial`] so a deliberate abort stays silent.
     pub fn forget_dial(&mut self, conn_id: ConnectionId) -> bool {
-        self.take_pending_dial_addr(conn_id).is_some()
+        self.pending_dials.remove(&conn_id).is_some()
     }
 
-    /// Removes a pending dial and returns its address, if any.
+    /// Removes a pending dial and returns `(addr, last_error)`, if any.
     ///
     /// [`crate::SwarmRuntime::abort_dial`] uses this so a failed `close` can
-    /// reinstate the dial via [`Self::note_dial`].
-    pub fn take_pending_dial_addr(&mut self, conn_id: ConnectionId) -> Option<PeerAddr> {
+    /// reinstate the full dial via [`Self::restore_pending_dial`].
+    pub fn take_pending_dial(
+        &mut self,
+        conn_id: ConnectionId,
+    ) -> Option<(PeerAddr, Option<String>)> {
         self.pending_dials
             .remove(&conn_id)
-            .map(|pending| pending.addr)
+            .map(|pending| (pending.addr, pending.last_error))
+    }
+
+    /// Puts a previously taken pending dial back, preserving `last_error`.
+    pub fn restore_pending_dial(
+        &mut self,
+        conn_id: ConnectionId,
+        addr: PeerAddr,
+        last_error: Option<String>,
+    ) {
+        self.pending_dials
+            .insert(conn_id, PendingDial { addr, last_error });
     }
 
     // -----------------------------------------------------------------------

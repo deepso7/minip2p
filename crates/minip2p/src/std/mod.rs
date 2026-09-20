@@ -924,7 +924,10 @@ impl Endpoint {
     }
 
     fn ingest(&mut self, event: SwarmEvent) -> Vec<EndpointEvent> {
-        let engine_consumed = self.connect.observe(&event, self.swarm.runtime_mut());
+        let now_ms = self.swarm.now().monotonic_ms;
+        let engine_consumed = self
+            .connect
+            .observe(&event, self.swarm.runtime_mut(), now_ms);
         #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
         let driver_consumed = !engine_consumed && self.ingest_into_drivers(&event);
         #[cfg(not(any(feature = "nat", feature = "pubsub", feature = "relay-server")))]

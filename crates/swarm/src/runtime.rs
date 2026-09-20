@@ -317,16 +317,17 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     /// be queued for that id. Never disconnects an established peer.
     ///
     /// If `close` fails after the dial was taken off the pending map, the
-    /// pending entry is restored so a later close still surfaces as
-    /// [`SwarmEvent::DialFailed`] rather than a silent half-aborted dial.
+    /// pending entry is restored (including any recorded `last_error`) so a
+    /// later close still surfaces as [`SwarmEvent::DialFailed`] rather than a
+    /// silent half-aborted dial.
     pub fn abort_dial(&mut self, conn_id: ConnectionId) -> Result<bool, DriverError> {
-        let Some(addr) = self.core.take_pending_dial_addr(conn_id) else {
+        let Some((addr, last_error)) = self.core.take_pending_dial(conn_id) else {
             return Ok(false);
         };
         match self.transport.close(conn_id) {
             Ok(()) | Err(TransportError::ConnectionNotFound { .. }) => Ok(true),
             Err(error) => {
-                self.core.note_dial(conn_id, addr);
+                self.core.restore_pending_dial(conn_id, addr, last_error);
                 Err(error.into())
             }
         }
@@ -1322,6 +1323,13 @@ mod tests {
             SeqEntropy(1),
         );
         let conn_id = runtime.dial(&addr).expect("dial");
+        // Record a transport error before the failed abort so restore must
+        // keep last_error — not rebuild via note_dial (which clears it).
+        runtime.transport_mut().initial.push(TransportEvent::Error {
+            id: conn_id,
+            message: String::from("refused"),
+        });
+        let _ = runtime.poll(Now::from_millis(0)).expect("record error");
         assert!(
             runtime.abort_dial(conn_id).is_err(),
             "close refusal must surface"
@@ -1332,14 +1340,15 @@ mod tests {
             .transport_mut()
             .initial
             .push(TransportEvent::Closed { id: conn_id });
-        let events = runtime.poll(Now::from_millis(0)).expect("poll");
+        let events = runtime.poll(Now::from_millis(1)).expect("poll");
         assert!(
             matches!(
                 events.as_slice(),
                 [SwarmEvent::DialFailed {
                     conn_id: failed,
+                    reason,
                     ..
-                }] if *failed == conn_id
+                }] if *failed == conn_id && reason == "refused"
             ),
             "got {events:?}"
         );

@@ -193,8 +193,13 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     }
 
     #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
-    pub(crate) fn observe_connect(&mut self, event: &minip2p_swarm::SwarmEvent) -> bool {
-        self.connect.observe(event, &mut self.runtime)
+    pub(crate) fn observe_connect(
+        &mut self,
+        event: &minip2p_swarm::SwarmEvent,
+        now: Now,
+    ) -> bool {
+        self.connect
+            .observe(event, &mut self.runtime, now.monotonic_ms)
     }
 
     #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
@@ -358,7 +363,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         let mut events = alloc::vec::Vec::new();
         Self::drain_connect_events(&mut self.connect, &mut events);
         for event in self.runtime.poll(now)? {
-            let consumed = self.connect.observe(&event, &mut self.runtime);
+            let consumed = self.connect.observe(&event, &mut self.runtime, now.monotonic_ms);
             if !consumed {
                 events.push(EndpointEvent::from(event));
             }
@@ -592,7 +597,7 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
                 }
                 _ => {}
             }
-            let consumed = self.endpoint.observe_connect(&event);
+            let consumed = self.endpoint.observe_connect(&event, now);
             if !consumed {
                 events.push(PortableMdnsEvent::Endpoint(event.into()));
             }
@@ -1105,7 +1110,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
                     _ => {}
                 }
             }
-            let engine_consumed = self.endpoint.observe_connect(&event);
+            let engine_consumed = self.endpoint.observe_connect(&event, now);
             #[cfg(feature = "portable-autonat")]
             let claimed = engine_consumed
                 || self

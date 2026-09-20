@@ -219,6 +219,11 @@ pub(crate) struct ConnectEngine {
     /// Conn ids whose `DialFailed` may already be queued after settle/cancel.
     /// Consumed on observe so a same-batch loser failure does not reach the app.
     suppressed: BTreeSet<ConnectionId>,
+    /// Conn ids restored after a failed `abort_dial`. If they later establish,
+    /// close and consume instead of forwarding `ConnectionEstablished`.
+    reject_establish: BTreeSet<ConnectionId>,
+    /// Conn ids closed after a rejected establish; swallow the matching close.
+    suppress_closed: BTreeSet<ConnectionId>,
     events: VecDeque<EndpointEvent>,
 }
 
@@ -238,6 +243,8 @@ impl ConnectEngine {
             deadline_ms,
             attempts: BTreeMap::new(),
             suppressed: BTreeSet::new(),
+            reject_establish: BTreeSet::new(),
+            suppress_closed: BTreeSet::new(),
             events: VecDeque::new(),
         }
     }
@@ -324,8 +331,8 @@ impl ConnectEngine {
     }
 
     /// Sees every swarm event before the app. Returns true when the event is
-    /// consumed (only [`SwarmEvent::DialFailed`] for an owned or suppressed
-    /// candidate).
+    /// consumed (owned/suppressed [`SwarmEvent::DialFailed`], a rejected
+    /// establish after a failed abort, or the matching close).
     ///
     /// [`SwarmEvent::ConnectionEstablished`] for the attempt's peer settles
     /// Connected and aborts the other candidates; the event itself still
@@ -335,6 +342,7 @@ impl ConnectEngine {
         &mut self,
         event: &SwarmEvent,
         runtime: &mut SwarmRuntime<T, E>,
+        now_ms: u64,
     ) -> bool {
         match event {
             SwarmEvent::DialFailed {
@@ -343,6 +351,7 @@ impl ConnectEngine {
                 reason,
             } => {
                 if self.suppressed.remove(conn_id) {
+                    self.reject_establish.remove(conn_id);
                     return true;
                 }
                 let Some(id) = self.owner(*conn_id) else {
@@ -370,6 +379,14 @@ impl ConnectEngine {
                 true
             }
             SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
+                if self.reject_establish.remove(conn_id) {
+                    self.suppressed.remove(conn_id);
+                    self.suppress_closed.insert(*conn_id);
+                    // Best-effort teardown of a dial that established after
+                    // the attempt already settled Cancelled/Timeout.
+                    let _ = runtime.disconnect(peer_id, now_ms).ok();
+                    return true;
+                }
                 // Every in-flight attempt for this peer succeeds together: the
                 // swarm keeps one connection per peer, so a later attempt's
                 // dial (or an inbound) is success for the earlier ones too.
@@ -398,6 +415,9 @@ impl ConnectEngine {
                     );
                 }
                 false
+            }
+            SwarmEvent::ConnectionClosed { conn_id, .. } => {
+                self.suppress_closed.remove(conn_id)
             }
             _ => false,
         }
@@ -483,7 +503,8 @@ impl ConnectEngine {
 
     /// Aborts a candidate dial. When the dial was already gone (`Ok(false)`)
     /// or `close` failed (`Err`, pending restored), a `DialFailed` may still
-    /// be queued — tombstone the id so `observe` consumes it.
+    /// be queued — tombstone the id so `observe` consumes it. On `Err`, also
+    /// reject a later establish for that restored dial.
     fn abort_one<T: Transport, E: EntropySource>(
         &mut self,
         runtime: &mut SwarmRuntime<T, E>,
@@ -491,8 +512,12 @@ impl ConnectEngine {
     ) {
         match runtime.abort_dial(conn_id) {
             Ok(true) => {}
-            Ok(false) | Err(_) => {
+            Ok(false) => {
                 self.suppressed.insert(conn_id);
+            }
+            Err(_) => {
+                self.suppressed.insert(conn_id);
+                self.reject_establish.insert(conn_id);
             }
         }
     }
@@ -588,6 +613,8 @@ mod tests {
         dials: Vec<PeerAddr>,
         closes: Vec<ConnectionId>,
         refuse: bool,
+        /// When set, `close` fails with a non-`ConnectionNotFound` error.
+        refuse_close: bool,
         events: VecDeque<TransportEvent>,
         next_stream: u64,
     }
@@ -655,6 +682,11 @@ mod tests {
         }
 
         fn close(&mut self, id: ConnectionId) -> Result<(), TransportError> {
+            if self.refuse_close {
+                return Err(TransportError::InvalidConfig {
+                    reason: String::from("close refused"),
+                });
+            }
             self.closes.push(id);
             Ok(())
         }
@@ -691,7 +723,7 @@ mod tests {
             out.push(event);
         }
         for event in runtime.poll(Now::from_millis(now_ms)).expect("poll") {
-            let consumed = engine.observe(&event, runtime);
+            let consumed = engine.observe(&event, runtime, now_ms);
             if !consumed {
                 out.push(EndpointEvent::from(event));
             }
@@ -1006,5 +1038,41 @@ mod tests {
         assert!(settled_for(&later, first).is_none());
         assert!(settled_for(&later, second).is_none());
         assert_eq!(runtime.transport().closes, vec![ConnectionId::new(1)]);
+    }
+
+    #[test]
+    fn failed_abort_then_establish_is_closed_not_forwarded() {
+        let peer = peer(b"abort-fail");
+        let target = addr(&peer, 4001);
+        let mut runtime = runtime(FakeTransport {
+            refuse_close: true,
+            ..FakeTransport::default()
+        });
+        let mut engine = ConnectEngine::new(30_000);
+        let id = engine.connect(target.clone().into(), &mut runtime, 0);
+        let conn_id = ConnectionId::new(1);
+        engine.cancel(id, &mut runtime);
+        match engine.pop_event() {
+            Some(EndpointEvent::ConnectSettled {
+                connect_id,
+                outcome: ConnectOutcome::Cancelled,
+                ..
+            }) if connect_id == id => {}
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+        // Abort close failed: dial restored. Allow close for the later reject.
+        runtime.transport_mut().refuse_close = false;
+        runtime
+            .transport_mut()
+            .push_connected(conn_id, peer.clone(), target);
+        let events = drain(&mut engine, &mut runtime, 0);
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, EndpointEvent::ConnectionEstablished { .. })),
+            "restored dial must not reach the app after Cancelled; got {events:?}"
+        );
+        assert!(settled_for(&events, id).is_none());
+        assert_eq!(runtime.transport().closes, vec![conn_id]);
     }
 }
