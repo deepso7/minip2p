@@ -286,9 +286,15 @@ impl DiscoveryDriver {
             .iter()
             .find_map(|(id, candidate)| (candidate == peer).then_some(*id));
         if let Some(id) = active {
+            // Mirror `Endpoint::cancel_connect`: `ConnectEngine::cancel` is a
+            // no-op after Connected, but `NatAgent::cancel` would still close a
+            // provisional relayed path the engine already settled on.
+            let cancel_leg = connect.is_pending(id);
             connect.cancel(id, swarm.runtime_mut());
-            nat.agent.cancel(id, nat.now());
-            nat.pump(swarm);
+            if cancel_leg {
+                nat.agent.cancel(id, nat.now());
+                nat.pump(swarm);
+            }
         }
     }
 
@@ -301,13 +307,20 @@ impl DiscoveryDriver {
         swarm: &mut EndpointSwarm,
     ) {
         let attempts: Vec<ConnectId> = self.inflight.keys().copied().collect();
+        let mut cancelled_leg = false;
         for id in attempts {
+            let cancel_leg = connect.is_pending(id);
             connect.cancel(id, swarm.runtime_mut());
-            nat.agent.cancel(id, nat.now());
+            if cancel_leg {
+                nat.agent.cancel(id, nat.now());
+                cancelled_leg = true;
+            }
         }
         self.inflight.clear();
         self.book.reset_dials();
-        nat.pump(swarm);
+        if cancelled_leg {
+            nat.pump(swarm);
+        }
     }
 
     #[cfg(feature = "mdns")]

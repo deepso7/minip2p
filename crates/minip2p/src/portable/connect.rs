@@ -1556,6 +1556,12 @@ mod tests {
             settled_for(&events, id),
             Some(ConnectOutcome::Connected { conn_id }) if *conn_id == conn
         ));
+        // Discovery CancelDial / shutdown and Endpoint::cancel_connect gate the
+        // NAT leg on this: after Connected, cancel is a no-op and must not
+        // tear down a provisional relayed path still held by NatAgent.
+        assert!(!engine.is_pending(id));
+        engine.cancel(id, &mut runtime);
+        assert!(engine.pop_event().is_none());
         assert!(settled_for(&drain(&mut engine, &mut runtime, 1_001), id).is_none());
     }
 
