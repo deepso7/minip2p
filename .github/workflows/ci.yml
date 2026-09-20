@@ -35,7 +35,7 @@ jobs:
           node-version: "24.20.0"
       - uses: pnpm/action-setup@v6
         with:
-          version: "12.3.4"
+          version: "12.5.1"
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.91"
