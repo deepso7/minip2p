@@ -177,7 +177,7 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         target: impl TryInto<ConnectTarget, Error: Into<ConnectTargetError>>,
         now: Now,
     ) -> Result<ConnectId, ConnectTargetError> {
-        let target = target.try_into().map_err(Into::into)?.validated()?;
+        let target = target.try_into().map_err(Into::into)?;
         Ok(self
             .connect
             .connect(target, &mut self.runtime, now.monotonic_ms))

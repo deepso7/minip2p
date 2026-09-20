@@ -21,78 +21,64 @@ pub(crate) const DEFAULT_CONNECT_DEADLINE_MS: u64 = 30_000;
 
 pub use minip2p_core::ConnectId;
 
-/// Non-empty, same-peer address list behind [`ConnectTarget::Addrs`].
+/// Peer plus zero or more complete addresses for it.
 ///
-/// Crate-private so callers cannot bypass [`TryFrom`] and build an empty or
-/// mixed-peer [`ConnectTarget`].
+/// Zero addresses is a Peer-ID target: the endpoint resolves known addresses
+/// and relay policy at `connect` time. Collections of addresses must name one
+/// peer. Candidate order is not a public contract: every candidate is dialed
+/// at start.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ConnectAddrs(Vec<PeerAddr>);
-
-/// What `PortableEndpoint::connect` / `Endpoint::connect` (std feature) accepts.
-///
-/// #176 adds `Peer(PeerId)`. Collections must be non-empty and name one peer.
-/// Candidate order is not a public contract: every candidate is dialed at
-/// start.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[expect(
-    private_interfaces,
-    reason = "ConnectAddrs is a sealed TryFrom payload so callers cannot build an invalid Addrs."
-)]
-pub enum ConnectTarget {
-    /// One complete peer address.
-    Addr(PeerAddr),
-    /// Non-empty set of complete addresses for one peer.
-    ///
-    /// Construct through [`TryFrom<Vec<PeerAddr>>`] / [`TryFrom<&[PeerAddr]>`];
-    /// the inner list type is crate-private so invalid values cannot be built
-    /// from outside this crate.
-    Addrs(ConnectAddrs),
+pub struct ConnectTarget {
+    peer: PeerId,
+    addrs: Vec<PeerAddr>,
 }
 
 impl ConnectTarget {
-    /// Peer named by every candidate.
+    /// Peer named by the target.
     pub fn peer_id(&self) -> &PeerId {
-        match self {
-            Self::Addr(addr) => addr.peer_id(),
-            Self::Addrs(ConnectAddrs(addrs)) => addrs
-                .first()
-                .map(PeerAddr::peer_id)
-                .expect("ConnectTarget::Addrs is non-empty"),
-        }
+        &self.peer
     }
 
-    /// Candidate addresses. `Addr` is a slice of one.
+    /// Candidate addresses. Empty for a Peer-ID target.
     pub fn candidates(&self) -> &[PeerAddr] {
-        match self {
-            Self::Addr(addr) => core::slice::from_ref(addr),
-            Self::Addrs(ConnectAddrs(addrs)) => addrs,
+        &self.addrs
+    }
+}
+
+impl From<PeerId> for ConnectTarget {
+    fn from(peer: PeerId) -> Self {
+        Self {
+            peer,
+            addrs: Vec::new(),
         }
     }
+}
 
-    /// Re-runs [`TryFrom`] checks. Identity `TryInto<ConnectTarget>` would
-    /// otherwise admit a hand-built `Addrs` that skipped validation.
-    #[expect(
-        clippy::result_large_err,
-        reason = "ConnectTargetError retains both peer identities for MixedPeers diagnostics."
-    )]
-    pub(crate) fn validated(self) -> Result<Self, ConnectTargetError> {
-        match self {
-            Self::Addr(_) => Ok(self),
-            Self::Addrs(ConnectAddrs(addrs)) => Self::try_from(addrs),
-        }
+impl From<&PeerId> for ConnectTarget {
+    fn from(peer: &PeerId) -> Self {
+        Self::from(peer.clone())
     }
 }
 
 impl From<PeerAddr> for ConnectTarget {
     fn from(addr: PeerAddr) -> Self {
-        Self::Addr(addr)
+        Self {
+            peer: addr.peer_id().clone(),
+            addrs: alloc::vec![addr],
+        }
+    }
+}
+
+impl From<&PeerAddr> for ConnectTarget {
+    fn from(addr: &PeerAddr) -> Self {
+        Self::from(addr.clone())
     }
 }
 
 impl TryFrom<Vec<PeerAddr>> for ConnectTarget {
     type Error = ConnectTargetError;
 
-    fn try_from(mut addrs: Vec<PeerAddr>) -> Result<Self, Self::Error> {
+    fn try_from(addrs: Vec<PeerAddr>) -> Result<Self, Self::Error> {
         let mut iter = addrs.iter();
         let Some(first) = iter.next() else {
             return Err(ConnectTargetError::Empty);
@@ -106,11 +92,10 @@ impl TryFrom<Vec<PeerAddr>> for ConnectTarget {
                 });
             }
         }
-        if addrs.len() == 1 {
-            Ok(Self::Addr(addrs.remove(0)))
-        } else {
-            Ok(Self::Addrs(ConnectAddrs(addrs)))
-        }
+        Ok(Self {
+            peer: expected,
+            addrs,
+        })
     }
 }
 
@@ -160,7 +145,7 @@ pub enum ConnectOutcome {
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ConnectFailure {
     /// Every candidate was refused before a Transport dial started.
-    #[error("no usable route: {}", candidate_summary(.candidates))]
+    #[error("no usable route: {}", no_usable_route_detail(.candidates))]
     NoUsableRoute {
         /// Per-candidate refusals (no transport, DNS produced nothing, …).
         candidates: Vec<CandidateFailure>,
@@ -188,6 +173,14 @@ pub struct CandidateFailure {
     pub addr: PeerAddr,
     /// Transport or resolution error text.
     pub reason: String,
+}
+
+fn no_usable_route_detail(candidates: &[CandidateFailure]) -> String {
+    if candidates.is_empty() {
+        String::from("no known addresses and no relay configured")
+    } else {
+        candidate_summary(candidates)
+    }
 }
 
 fn candidate_summary(candidates: &[CandidateFailure]) -> String {
@@ -550,11 +543,20 @@ mod tests {
     }
 
     #[test]
-    fn hand_built_empty_addrs_fails_validation() {
-        let err = ConnectTarget::Addrs(ConnectAddrs(Vec::new()))
-            .validated()
-            .expect_err("empty");
-        assert_eq!(err, ConnectTargetError::Empty);
+    fn peer_id_target_has_empty_candidates() {
+        let p = peer(b"peer-only");
+        let target = ConnectTarget::from(p.clone());
+        assert!(target.candidates().is_empty());
+        assert_eq!(target.peer_id(), &p);
+        assert_eq!(ConnectTarget::from(&p).peer_id(), &p);
+    }
+
+    #[test]
+    fn peer_id_ref_and_peer_addr_ref_convert() {
+        let p = peer(b"refs");
+        let addr = addr(&p, 9);
+        assert_eq!(ConnectTarget::from(&p).candidates().len(), 0);
+        assert_eq!(ConnectTarget::from(&addr).candidates(), &[addr]);
     }
 
     #[test]
@@ -809,6 +811,35 @@ mod tests {
             other => panic!("expected AllCandidatesFailed, got {other:?} from {events:?}"),
         }
         assert!(settled_for(&drain(&mut engine, &mut runtime, 1), id).is_none());
+    }
+
+    #[test]
+    fn peer_target_with_no_route_names_missing_sources() {
+        let peer = peer(b"peer-no-route");
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(30_000);
+        let id = engine.connect(ConnectTarget::from(peer.clone()), &mut runtime, 0);
+        assert_eq!(runtime.transport().dials.len(), 0);
+        match engine.pop_event() {
+            Some(EndpointEvent::ConnectSettled {
+                connect_id,
+                outcome: ConnectOutcome::Failed(failure),
+                ..
+            }) => {
+                assert_eq!(connect_id, id);
+                assert!(
+                    matches!(failure, ConnectFailure::NoUsableRoute { .. }),
+                    "{failure:?}"
+                );
+                let text = failure.to_string();
+                assert!(
+                    text.contains("no known addresses and no relay configured"),
+                    "{text}"
+                );
+            }
+            other => panic!("expected NoUsableRoute, got {other:?}"),
+        }
+        assert!(engine.pop_event().is_none());
     }
 
     #[test]
