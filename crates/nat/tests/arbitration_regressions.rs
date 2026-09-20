@@ -130,7 +130,7 @@ fn punch_dial_failed_event_does_not_emit_connect_failed() {
             conn_id: conn,
             peer_id: h.target.clone(),
             stream_id: stream,
-            data: dcutr_connect_reply(&[punch.clone()]),
+            data: dcutr_connect_reply(std::slice::from_ref(&punch)),
         },
         at(311),
     );
