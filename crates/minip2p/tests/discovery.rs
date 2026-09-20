@@ -213,10 +213,11 @@ fn connect_uses_known_discovery_book_addresses() {
         "a must not already have a direct connection to b"
     );
     let id = a.connect(&b_peer).expect("connect by peer id");
+    let connect_deadline = Instant::now() + Duration::from_secs(15);
     let mut settled = None;
     while settled.is_none() {
         assert!(
-            Instant::now() < deadline,
+            Instant::now() < connect_deadline,
             "connect via discovery book timed out"
         );
         if let Some(Event::ConnectSettled {

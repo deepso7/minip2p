@@ -170,6 +170,12 @@ impl DiscoveryDriver {
                 }
             }
 
+            // Discovery-owned attempt events are hidden from the app, but the
+            // engine must observe them first: `admit_connect` below can queue
+            // a synchronous `ConnectFailed` in this same sweep after the
+            // pre-sweep `feed_nat_to_connect` pass, and the next iteration
+            // would otherwise discard it before the engine sees it.
+            let now_ms = swarm.now().monotonic_ms;
             let mut i = 0;
             while let Some(event) = nat.events.get(i) {
                 let connect_id = nat_connect_id(event);
@@ -177,7 +183,7 @@ impl DiscoveryDriver {
                     progressed = true;
                     let event = nat.events.remove(i).expect("inflight NAT event");
                     nat.note_removed(i);
-                    self.handle_nat_event(event, now);
+                    connect.observe_nat(&event, swarm.runtime_mut(), now_ms);
                 } else {
                     i += 1;
                 }
@@ -266,10 +272,6 @@ impl DiscoveryDriver {
                 break;
             }
         }
-    }
-
-    fn handle_nat_event(&mut self, event: NatEvent, _now: u64) {
-        let _ = event;
     }
 
     fn cancel_peer(
