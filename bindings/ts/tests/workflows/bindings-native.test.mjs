@@ -8,7 +8,13 @@ const workflowPath = new URL(
   "../../../../.github/workflows/bindings-native.yml",
   import.meta.url
 );
+const packageJsonPath = new URL("../../../../package.json", import.meta.url);
 const workflow = parse(await readFile(workflowPath, "utf-8"));
+const packageManager = JSON.parse(
+  await readFile(packageJsonPath, "utf-8")
+).packageManager;
+const pnpmVersion = packageManager?.match(/^pnpm@([^+]+)/u)?.[1];
+assert.ok(pnpmVersion, `expected packageManager pnpm@…, got ${packageManager}`);
 
 test("native workflow runs weekly and on manual dispatch", () => {
   assert.ok(workflow.on.workflow_dispatch !== undefined);
@@ -67,7 +73,10 @@ test("weekly workflow executes the suite on native runners and musl containers",
     ({ name }) => name === "Build addon"
   ).run;
   assert.match(muslBuild, /PATH=\/opt\/pnpm\/bin:\/usr\/bin:/u);
-  assert.match(muslBuild, /--prefix \/opt\/pnpm pnpm@12\.3\.4/u);
+  assert.match(
+    muslBuild,
+    new RegExp(`--prefix /opt/pnpm pnpm@${pnpmVersion.replaceAll(".", "\\.")}`, "u")
+  );
   assert.match(
     muslBuild,
     /cargo build --release --locked -p minip2p-relay-server-example/u
