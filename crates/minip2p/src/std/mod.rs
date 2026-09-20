@@ -518,7 +518,7 @@ impl Endpoint {
         &mut self,
         target: impl TryInto<ConnectTarget, Error: Into<ConnectTargetError>>,
     ) -> Result<ConnectId, ConnectTargetError> {
-        let target = target.try_into().map_err(Into::into)?;
+        let target = target.try_into().map_err(Into::into)?.validated()?;
         let peer = target.peer_id().clone();
         let mut expanded = Vec::new();
         let mut extra_failed = Vec::new();

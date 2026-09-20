@@ -92,7 +92,7 @@ match node.nat_wait_path(connect_id, Duration::from_secs(60))? {
 
 ```mermaid
 flowchart TB
-  A["connect*"] --> B["Direct candidates"]
+  A["nat_connect*"] --> B["Direct candidates"]
   A --> C["Configured relay leg"]
   B -->|"wins"| D["DirectDialed"]
   C -->|"first usable path"| E["Relayed"]

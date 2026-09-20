@@ -33,6 +33,13 @@ impl ConnectId {
     }
 }
 
+/// Non-empty, same-peer address list behind [`ConnectTarget::Addrs`].
+///
+/// Crate-private so callers cannot bypass [`TryFrom`] and build an empty or
+/// mixed-peer [`ConnectTarget`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConnectAddrs(Vec<PeerAddr>);
+
 /// What [`crate::PortableEndpoint::connect`] / [`crate::Endpoint::connect`]
 /// accepts.
 ///
@@ -40,11 +47,19 @@ impl ConnectId {
 /// Candidate order is not a public contract: every candidate is dialed at
 /// start.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    private_interfaces,
+    reason = "ConnectAddrs is a sealed TryFrom payload so callers cannot build an invalid Addrs."
+)]
 pub enum ConnectTarget {
     /// One complete peer address.
     Addr(PeerAddr),
     /// Non-empty set of complete addresses for one peer.
-    Addrs(Vec<PeerAddr>),
+    ///
+    /// Construct through [`TryFrom<Vec<PeerAddr>>`] / [`TryFrom<&[PeerAddr]>`];
+    /// the inner list type is crate-private so invalid values cannot be built
+    /// from outside this crate.
+    Addrs(ConnectAddrs),
 }
 
 impl ConnectTarget {
@@ -52,7 +67,7 @@ impl ConnectTarget {
     pub fn peer_id(&self) -> &PeerId {
         match self {
             Self::Addr(addr) => addr.peer_id(),
-            Self::Addrs(addrs) => addrs
+            Self::Addrs(ConnectAddrs(addrs)) => addrs
                 .first()
                 .map(PeerAddr::peer_id)
                 .expect("ConnectTarget::Addrs is non-empty"),
@@ -63,7 +78,20 @@ impl ConnectTarget {
     pub fn candidates(&self) -> &[PeerAddr] {
         match self {
             Self::Addr(addr) => core::slice::from_ref(addr),
-            Self::Addrs(addrs) => addrs,
+            Self::Addrs(ConnectAddrs(addrs)) => addrs,
+        }
+    }
+
+    /// Re-runs [`TryFrom`] checks. Identity `TryInto<ConnectTarget>` would
+    /// otherwise admit a hand-built `Addrs` that skipped validation.
+    #[expect(
+        clippy::result_large_err,
+        reason = "ConnectTargetError retains both peer identities for MixedPeers diagnostics."
+    )]
+    pub(crate) fn validated(self) -> Result<Self, ConnectTargetError> {
+        match self {
+            Self::Addr(_) => Ok(self),
+            Self::Addrs(ConnectAddrs(addrs)) => Self::try_from(addrs),
         }
     }
 }
@@ -94,7 +122,7 @@ impl TryFrom<Vec<PeerAddr>> for ConnectTarget {
         if addrs.len() == 1 {
             Ok(Self::Addr(addrs.remove(0)))
         } else {
-            Ok(Self::Addrs(addrs))
+            Ok(Self::Addrs(ConnectAddrs(addrs)))
         }
     }
 }
@@ -332,25 +360,33 @@ impl ConnectEngine {
                 true
             }
             SwarmEvent::ConnectionEstablished { peer_id, conn_id } => {
-                let Some(id) = self.attempt_for_peer(peer_id) else {
-                    return false;
-                };
-                let Some(attempt) = self.attempts.remove(&id) else {
-                    return false;
-                };
-                abort_pending(
-                    runtime,
-                    attempt
-                        .pending
-                        .keys()
-                        .copied()
-                        .filter(|pending| pending != conn_id),
-                );
-                self.push_settled(
-                    id,
-                    attempt.peer,
-                    ConnectOutcome::Connected { conn_id: *conn_id },
-                );
+                // Every in-flight attempt for this peer succeeds together: the
+                // swarm keeps one connection per peer, so a later attempt's
+                // dial (or an inbound) is success for the earlier ones too.
+                let ids: Vec<ConnectId> = self
+                    .attempts
+                    .iter()
+                    .filter(|(_, attempt)| &attempt.peer == peer_id)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in ids {
+                    let Some(attempt) = self.attempts.remove(&id) else {
+                        continue;
+                    };
+                    abort_pending(
+                        runtime,
+                        attempt
+                            .pending
+                            .keys()
+                            .copied()
+                            .filter(|pending| pending != conn_id),
+                    );
+                    self.push_settled(
+                        id,
+                        attempt.peer,
+                        ConnectOutcome::Connected { conn_id: *conn_id },
+                    );
+                }
                 false
             }
             _ => false,
@@ -414,13 +450,6 @@ impl ConnectEngine {
         self.attempts
             .iter()
             .find(|(_, attempt)| attempt.pending.contains_key(&conn_id))
-            .map(|(id, _)| *id)
-    }
-
-    fn attempt_for_peer(&self, peer_id: &PeerId) -> Option<ConnectId> {
-        self.attempts
-            .iter()
-            .find(|(_, attempt)| &attempt.peer == peer_id)
             .map(|(id, _)| *id)
     }
 
@@ -503,6 +532,14 @@ mod tests {
         let target = ConnectTarget::from(addr(&peer(b"solo"), 9));
         assert_eq!(target.candidates().len(), 1);
         assert_eq!(target.peer_id(), &peer(b"solo"));
+    }
+
+    #[test]
+    fn hand_built_empty_addrs_fails_validation() {
+        let err = ConnectTarget::Addrs(ConnectAddrs(Vec::new()))
+            .validated()
+            .expect_err("empty");
+        assert_eq!(err, ConnectTargetError::Empty);
     }
 
     #[test]
@@ -892,6 +929,33 @@ mod tests {
             settled_for(&events, id),
             Some(ConnectOutcome::Connected { conn_id }) if *conn_id == inbound
         ));
+        assert_eq!(runtime.transport().closes, vec![ConnectionId::new(1)]);
+    }
+
+    #[test]
+    fn same_peer_attempts_all_settle_when_one_candidate_establishes() {
+        let peer = peer(b"shared");
+        let first_addr = addr(&peer, 1);
+        let second_addr = addr(&peer, 2);
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(30_000);
+        let first = engine.connect(first_addr.into(), &mut runtime, 0);
+        let second = engine.connect(second_addr.clone().into(), &mut runtime, 0);
+        runtime
+            .transport_mut()
+            .push_connected(ConnectionId::new(2), peer.clone(), second_addr);
+        let events = drain(&mut engine, &mut runtime, 0);
+        assert!(matches!(
+            settled_for(&events, first),
+            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == ConnectionId::new(2)
+        ));
+        assert!(matches!(
+            settled_for(&events, second),
+            Some(ConnectOutcome::Connected { conn_id }) if *conn_id == ConnectionId::new(2)
+        ));
+        let later = drain(&mut engine, &mut runtime, 1);
+        assert!(settled_for(&later, first).is_none());
+        assert!(settled_for(&later, second).is_none());
         assert_eq!(runtime.transport().closes, vec![ConnectionId::new(1)]);
     }
 }

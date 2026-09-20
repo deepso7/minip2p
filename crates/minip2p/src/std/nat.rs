@@ -86,6 +86,9 @@ impl NatDriver {
             self.pump(swarm);
             return true;
         }
+        if let SwarmEvent::ConnectionEstablished { conn_id, .. } = event {
+            self.nat_dials.remove(conn_id);
+        }
         let is_circuit = match event {
             SwarmEvent::ConnectionEstablished { conn_id, .. }
             | SwarmEvent::ConnectionClosed { conn_id, .. } => CircuitTransport::<

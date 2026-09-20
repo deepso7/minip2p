@@ -778,6 +778,10 @@ impl SwarmCore {
             TransportEvent::Error { id, message } => {
                 if let Some(pending) = self.pending_dials.get_mut(&id) {
                     pending.last_error = Some(message.clone());
+                    // Attempt-owned and raw outbound dials report through
+                    // DialFailed on close. Emitting Error here would leak a
+                    // second diagnostic the connect engine cannot consume.
+                    return;
                 }
                 self.emit_error(
                     SwarmErrorKind::Transport,
@@ -1454,6 +1458,20 @@ impl SwarmCore {
                 && self.peer_to_conn.get(&peer_id) == Some(&conn_id)
             {
                 self.peer_to_conn.remove(&peer_id);
+                // Connected-without-identity synthesizes a placeholder peer
+                // that ping/identify may already hold. Drop that state here;
+                // this connection never established, so there is no
+                // ConnectionClosed application event.
+                self.inform_ping(PingInput::RemovePeer {
+                    peer_id: peer_id.clone(),
+                });
+                self.inform_identify(IdentifyInput::RemovePeer {
+                    peer_id: peer_id.clone(),
+                });
+                self.drain_ping_outputs();
+                self.drain_identify_outputs();
+                self.pending_pings.remove(&peer_id);
+                self.ping_deadlines.remove(&peer_id);
             }
             self.forget_connection_streams(conn_id);
             return;
@@ -3395,11 +3413,10 @@ mod tests {
 
         let events = drain_events(&mut core);
         assert!(
-            events.iter().any(|event| matches!(
-                event,
-                SwarmEvent::Error(error) if error.kind == SwarmErrorKind::Transport
-            )),
-            "transport Error still surfaces; got {events:?}"
+            events
+                .iter()
+                .all(|event| !matches!(event, SwarmEvent::Error(_))),
+            "pending-dial transport errors stay on DialFailed; got {events:?}"
         );
         assert!(matches!(
             events.last(),
@@ -3446,6 +3463,29 @@ mod tests {
                 cause: ConnectionCloseCause::Transport,
                 ..
             }] if *closed == conn_id
+        ));
+    }
+
+    #[test]
+    fn noted_dial_connected_without_identity_then_closed_emits_dial_failed() {
+        let mut core = test_core();
+        let (_, addr, conn_id) = noted_dial_addr(b"noted-dial-anonymous");
+        core.note_dial(conn_id, addr.clone());
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::new(loopback_transport()),
+            },
+        );
+        feed(&mut core, TransportEvent::Closed { id: conn_id });
+        assert!(matches!(
+            drain_events(&mut core).as_slice(),
+            [SwarmEvent::DialFailed {
+                conn_id: failed,
+                addr: failed_addr,
+                ..
+            }] if *failed == conn_id && failed_addr == &addr
         ));
     }
 
