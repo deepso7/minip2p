@@ -467,11 +467,17 @@ impl Endpoint {
     }
 
     /// Dials a remote peer using IPv4.
+    ///
+    /// Prefer [`Self::connect`] for a Connection attempt. Family-forced `dial`
+    /// remains until the contraction ticket.
     pub fn dial_ip4(&mut self, addr: &PeerAddr) -> Result<ConnectionId, Error> {
         self.dial_family(addr, dial::Family::V4)
     }
 
     /// Dials a remote peer using IPv6.
+    ///
+    /// Prefer [`Self::connect`] for a Connection attempt. Family-forced `dial`
+    /// remains until the contraction ticket.
     pub fn dial_ip6(&mut self, addr: &PeerAddr) -> Result<ConnectionId, Error> {
         self.dial_family(addr, dial::Family::V6)
     }
@@ -801,7 +807,7 @@ impl Endpoint {
     /// the Endpoint wait outcomes. If NAT, pubsub, discovery, or relay-server
     /// is enabled, keep using [`Self::next_wake`] until #177 — `wait` does not
     /// wake on capability progress. Use focused waits such as
-    /// [`Self::nat_wait_path`] and [`Self::wait_peer_ready`] when you need a
+    /// `nat_wait_path` and [`Self::wait_peer_ready`] when you need a
     /// particular milestone. Use `next_event` for a synchronous application
     /// event loop, or [`Self::next_wake`] when the loop also handles capability
     /// queues and interruptions. All of these methods use transport readiness
