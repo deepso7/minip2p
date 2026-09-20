@@ -19,19 +19,7 @@ use super::event_stream::EndpointEvent;
 /// Default Connection-attempt deadline: 30 seconds.
 pub(crate) const DEFAULT_CONNECT_DEADLINE_MS: u64 = 30_000;
 
-/// Endpoint-local identity of one Connection attempt.
-///
-/// Not unique across endpoints or restarts. One id covers every candidate
-/// Transport dial belonging to the attempt.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ConnectId(u64);
-
-impl ConnectId {
-    /// Returns the raw numeric value.
-    pub const fn as_u64(self) -> u64 {
-        self.0
-    }
-}
+pub use minip2p_core::ConnectId;
 
 /// Non-empty, same-peer address list behind [`ConnectTarget::Addrs`].
 ///
@@ -454,7 +442,7 @@ impl ConnectEngine {
     }
 
     fn alloc(&mut self) -> ConnectId {
-        let id = ConnectId(self.next_id);
+        let id = ConnectId::from_u64(self.next_id);
         self.next_id = self.next_id.saturating_add(1);
         id
     }
@@ -910,7 +898,7 @@ mod tests {
         assert_eq!(runtime.transport().closes, vec![ConnectionId::new(1)]);
         engine.cancel(id, &mut runtime);
         assert!(engine.pop_event().is_none());
-        engine.cancel(ConnectId(99), &mut runtime);
+        engine.cancel(ConnectId::from_u64(99), &mut runtime);
         assert!(engine.pop_event().is_none());
         assert_eq!(runtime.transport().closes.len(), 1);
     }

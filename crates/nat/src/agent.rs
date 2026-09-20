@@ -2,7 +2,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, select_direct_addrs};
+use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, select_direct_addrs};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -15,7 +15,7 @@ use crate::config::NatConfig;
 use crate::events::{NatAction, NatEvent};
 use crate::housekeeping::Housekeeping;
 use crate::inbound::InboundCircuit;
-use crate::types::{ConnectId, NatToken, Now, PromoteError, ReachabilityState, ReservationInfo};
+use crate::types::{NatToken, Now, PromoteError, ReachabilityState, ReservationInfo};
 
 /// Roles a stream owned by the agent can play. Streams not in the registry
 /// belong to the application (`Released` is modeled as removal).
@@ -383,7 +383,7 @@ impl NatAgent {
         allow_relay: bool,
         now: Now,
     ) -> ConnectId {
-        let id = ConnectId(self.next_connect_id);
+        let id = ConnectId::from_u64(self.next_connect_id);
         self.next_connect_id += 1;
         // A connection that is already identity-verified is the best path
         // available. Do not manufacture a new race which can only waste

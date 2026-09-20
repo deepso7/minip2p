@@ -9,13 +9,13 @@ use alloc::vec::Vec;
 #[cfg(feature = "portable-relay")]
 use minip2p_circuit::{AdoptError, BridgeAdoption, CircuitRole};
 #[cfg(feature = "portable-relay")]
-use minip2p_core::Protocol;
+use minip2p_core::{ConnectId, Protocol};
 use minip2p_core::{Multiaddr, PeerId};
 use minip2p_nat::{
     BridgeRole, NatAction, NatAgent, NatEvent, NatToken, Now as NatNow, PromoteError,
 };
 #[cfg(feature = "portable-relay")]
-use minip2p_nat::{ConnectId, Path, ReservationInfo};
+use minip2p_nat::{Path, ReservationInfo};
 use minip2p_platform::{EntropySource, Now, SharedEntropy};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};

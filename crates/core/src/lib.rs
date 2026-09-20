@@ -1,15 +1,17 @@
 //! Transport-agnostic address primitives for minip2p.
 //!
 //! Provides [`Multiaddr`] parsing/formatting, [`PeerAddr`] for validated
-//! transport + peer id addresses, the [`Protocol`] enum, the
-//! varint-length-prefixed frame codec, and the shared protobuf field codec
-//! used by protocol crates. `no_std` + `alloc` compatible.
+//! transport + peer id addresses, [`ConnectId`] for Connection-attempt
+//! correlation, the [`Protocol`] enum, the varint-length-prefixed frame
+//! codec, and the shared protobuf field codec used by protocol crates.
+//! `no_std` + `alloc` compatible.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
 mod candidates;
+mod connect_id;
 mod error;
 mod frame;
 mod multiaddr;
@@ -19,6 +21,7 @@ mod protocol;
 mod sans_io;
 
 pub use candidates::select_direct_addrs;
+pub use connect_id::ConnectId;
 pub use error::{MultiaddrError, PeerAddrError};
 pub use frame::{FrameDecode, decode_frame, encode_frame};
 pub use minip2p_identity::PeerId;

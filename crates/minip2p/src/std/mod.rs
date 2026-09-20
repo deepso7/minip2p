@@ -46,6 +46,8 @@ mod pubsub;
 #[cfg(feature = "relay-server")]
 mod relay_server;
 
+#[cfg(feature = "nat")]
+pub use crate::ConnectId as NatConnectId;
 #[cfg(any(feature = "discovery", feature = "mdns"))]
 pub use discovery::DiscoveryError;
 use minip2p_core::Multiaddr;
@@ -72,8 +74,7 @@ pub use minip2p_identity::Ed25519Keypair;
 pub use minip2p_mdns::{MdnsConfig, MdnsConfigError};
 #[cfg(feature = "nat")]
 pub use minip2p_nat::{
-    ConnectId as NatConnectId, NatConfig, NatError, NatEvent, Path, ReachabilityState,
-    ReservationInfo, ReservationPolicy,
+    NatConfig, NatError, NatEvent, Path, ReachabilityState, ReservationInfo, ReservationPolicy,
 };
 #[cfg(feature = "tcp")]
 use minip2p_platform::StdEntropy;

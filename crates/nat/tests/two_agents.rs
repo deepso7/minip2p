@@ -11,9 +11,9 @@ mod common;
 
 use common::{LISTEN_ADDR, at, drain_events, identify_observed, maddr, peer};
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId};
+use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId};
 use minip2p_nat::{
-    ConnectId, DCUTR_PROTOCOL_ID, NatAction, NatAgent, NatConfig, NatEvent, Path, ReservationPolicy,
+    DCUTR_PROTOCOL_ID, NatAction, NatAgent, NatConfig, NatEvent, Path, ReservationPolicy,
 };
 use minip2p_relay::{HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 use minip2p_swarm::SwarmEvent;

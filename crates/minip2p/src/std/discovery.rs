@@ -3,13 +3,13 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
-use minip2p_core::PeerId;
+use minip2p_core::{ConnectId, PeerId};
 #[cfg(feature = "discovery")]
 use minip2p_discovery::{BeaconAction, BeaconAgent, BeaconEvent};
 use minip2p_discovery::{DiscoveryAction, DiscoverySource, PeerDiscoveryAgent};
 #[cfg(feature = "mdns")]
 use minip2p_mdns::MdnsEvent;
-use minip2p_nat::{ConnectId, NatEvent};
+use minip2p_nat::NatEvent;
 #[cfg(feature = "discovery")]
 use minip2p_pubsub::GossipsubEvent;
 use minip2p_swarm::SwarmEvent;

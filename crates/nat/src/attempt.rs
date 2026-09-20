@@ -2,7 +2,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol, select_direct_addrs};
+use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, SansIoProtocol, select_direct_addrs};
 use minip2p_dcutr::{DcutrResponder, DcutrResponderInput, DcutrResponderOutput, ResponderEvent};
 use minip2p_relay::{
     ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopConnectInput, HopConnectOutput,
@@ -12,7 +12,7 @@ use minip2p_transport::{ConnectionId, StreamId};
 use crate::agent::{Shared, StreamInput, StreamRole, TokenPurpose};
 use crate::events::{BridgeRole, NatAction, NatEvent};
 use crate::inbound::select_global_punch_candidates;
-use crate::types::{ConnectId, NatError, Now, Path, PromoteError};
+use crate::types::{NatError, Now, Path, PromoteError};
 
 /// Progress of the relay leg of a connect attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

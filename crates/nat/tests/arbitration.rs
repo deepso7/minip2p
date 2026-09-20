@@ -5,8 +5,8 @@ mod common;
 
 use common::*;
 
-use minip2p_core::{Multiaddr, PeerAddr};
-use minip2p_nat::{ConnectId, NatAction, NatConfig, NatError, NatEvent, Path};
+use minip2p_core::{ConnectId, Multiaddr, PeerAddr};
+use minip2p_nat::{NatAction, NatConfig, NatError, NatEvent, Path};
 use minip2p_relay::{HOP_PROTOCOL_ID, Status};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};

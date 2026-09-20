@@ -50,9 +50,7 @@ mod types;
 pub use agent::NatAgent;
 pub use config::{NatConfig, ReservationPolicy};
 pub use events::{BridgeRole, NatAction, NatEvent};
-pub use types::{
-    ConnectId, NatError, NatToken, Now, Path, PromoteError, ReachabilityState, ReservationInfo,
-};
+pub use types::{NatError, NatToken, Now, Path, PromoteError, ReachabilityState, ReservationInfo};
 
 // Protocol ids for everything the agent drives, so a driver can register
 // them without depending on each protocol crate.

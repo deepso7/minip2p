@@ -35,6 +35,8 @@ pub(crate) use connect::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS};
 mod event_stream;
 pub use event_stream::EndpointEvent;
 
+#[cfg(all(feature = "portable-autonat", not(feature = "nat")))]
+pub use crate::ConnectId as NatConnectId;
 #[cfg(feature = "portable-mdns")]
 pub use minip2p_discovery::{
     BeaconConfig, DiscoveryEvent, DiscoverySource, KnownPeer, PeerDiscoveryConfig,
@@ -45,8 +47,7 @@ pub use minip2p_mdns::{MdnsConfig, MdnsConfigError, MdnsError, MdnsEvent, MdnsIo
 pub use minip2p_mdns::{SmoltcpMdnsConfig, SmoltcpMdnsIo};
 #[cfg(all(feature = "portable-autonat", not(feature = "nat")))]
 pub use minip2p_nat::{
-    ConnectId as NatConnectId, NatConfig, NatEvent, Path, ReachabilityState, ReservationInfo,
-    ReservationPolicy,
+    NatConfig, NatEvent, Path, ReachabilityState, ReservationInfo, ReservationPolicy,
 };
 #[cfg(all(feature = "pubsub", not(feature = "std")))]
 pub use minip2p_pubsub::{
@@ -905,7 +906,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         &mut self,
         peer: &PeerId,
         now: Now,
-    ) -> Result<minip2p_nat::ConnectId, SmoltcpRelayError> {
+    ) -> Result<ConnectId, SmoltcpRelayError> {
         let nat = self.nat.as_mut().ok_or(SmoltcpRelayError::NotEnabled)?;
         if !nat.relay_enabled() {
             return Err(SmoltcpRelayError::NotEnabled);
@@ -917,7 +918,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
 
     /// Cancels one relay connection attempt.
     #[cfg(feature = "portable-relay")]
-    pub fn nat_cancel_connect(&mut self, id: minip2p_nat::ConnectId, now: Now) {
+    pub fn nat_cancel_connect(&mut self, id: ConnectId, now: Now) {
         if let Some(nat) = self.nat.as_mut() {
             nat.cancel(id, now);
             nat.pump(&mut self.endpoint, now);
