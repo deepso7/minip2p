@@ -547,9 +547,11 @@ impl Endpoint {
 
     /// Idempotent. Settled or unknown ids are a no-op. Never disconnects.
     pub fn cancel_connect(&mut self, id: ConnectId) {
+        #[cfg(feature = "nat")]
+        let cancel_leg = self.connect.is_pending(id);
         self.connect.cancel(id, self.swarm.runtime_mut());
         #[cfg(feature = "nat")]
-        if let Some(nat) = self.nat.as_mut() {
+        if cancel_leg && let Some(nat) = self.nat.as_mut() {
             let now = nat.now();
             nat.agent.cancel(id, now);
             nat.pump(&mut self.swarm);

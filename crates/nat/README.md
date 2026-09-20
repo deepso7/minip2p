@@ -32,6 +32,9 @@ Set `NatConfig::force_relay` to skip direct candidates and DCUtR entirely. This 
 ## Driving the agent
 
 ```rust,ignore
+use minip2p_core::ConnectId;
+use minip2p_nat::{ConnectLegs, NatAgent, NatConfig};
+
 let mut agent = NatAgent::new(local_peer_id, NatConfig {
     relays: vec![relay_peer_addr],
     ..NatConfig::default()

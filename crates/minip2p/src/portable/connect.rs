@@ -147,7 +147,7 @@ pub enum ConnectOutcome {
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ConnectFailure {
     /// Every candidate was refused before a Transport dial started.
-    #[error("no usable route: {}{}", no_usable_route_detail(.candidates), relay_suffix(.relay))]
+    #[error("no usable route: {}{}", no_usable_route_detail(.candidates, .relay), relay_suffix(.relay))]
     NoUsableRoute {
         /// Per-candidate refusals (no transport, DNS produced nothing, …).
         candidates: Vec<CandidateFailure>,
@@ -227,9 +227,13 @@ pub struct CandidateFailure {
     pub reason: String,
 }
 
-fn no_usable_route_detail(candidates: &[CandidateFailure]) -> String {
+fn no_usable_route_detail(candidates: &[CandidateFailure], relay: &Option<RelayFailure>) -> String {
     if candidates.is_empty() {
-        String::from("no known addresses and no relay configured")
+        if relay.is_none() {
+            String::from("no known addresses and no relay configured")
+        } else {
+            String::from("no known addresses")
+        }
     } else {
         candidate_summary(candidates)
     }
@@ -662,6 +666,9 @@ impl ConnectEngine {
     fn settle_if_exhausted(&mut self, id: ConnectId, attempt: Attempt) {
         match &attempt.relay {
             RelayLeg::Pending { .. } | RelayLeg::Provisional { .. } => {
+                self.attempts.insert(id, attempt);
+            }
+            RelayLeg::Failed(_) if !attempt.direct.is_empty() => {
                 self.attempts.insert(id, attempt);
             }
             RelayLeg::None | RelayLeg::Failed(_) => {
@@ -1704,6 +1711,42 @@ mod tests {
 
     #[cfg(feature = "nat")]
     #[test]
+    fn race_connect_failed_while_direct_pending_stays_open() {
+        let peer = peer(b"relay-then-direct");
+        let first = addr(&peer, 1);
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(30_000);
+        let id = admit(
+            &mut engine,
+            peer.clone(),
+            vec![first],
+            RelayPolicy::Race,
+            &mut runtime,
+            0,
+        );
+        engine.observe_nat(&nat_failed(id, &peer, "relay unreachable"), &mut runtime, 0);
+        assert!(engine.is_pending(id));
+        assert!(engine.pop_event().is_none());
+        runtime.transport_mut().push_closed(ConnectionId::new(1));
+        let events = drain(&mut engine, &mut runtime, 0);
+        match settled_for(&events, id) {
+            Some(ConnectOutcome::Failed(ConnectFailure::AllCandidatesFailed { relay, .. })) => {
+                let relay = relay.as_ref().expect("relay diagnostic");
+                assert!(relay.reason.contains("relay unreachable"), "{relay:?}");
+            }
+            other => panic!("expected AllCandidatesFailed after last direct, got {other:?}"),
+        }
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, EndpointEvent::DialFailed { .. })),
+            "owned DialFailed must not leak: {events:?}"
+        );
+        assert!(engine.pop_event().is_none());
+    }
+
+    #[cfg(feature = "nat")]
+    #[test]
     fn race_no_candidates_connect_failed_is_no_usable_route() {
         let peer = peer(b"no-cand-relay");
         let mut runtime = runtime(FakeTransport::default());
@@ -1732,6 +1775,10 @@ mod tests {
                 }
                 .to_string();
                 assert!(text.contains("relay:"), "{text}");
+                assert!(
+                    !text.contains("no relay configured"),
+                    "relay diagnostic must not claim the relay was missing: {text}"
+                );
             }
             other => panic!("expected NoUsableRoute, got {other:?}"),
         }

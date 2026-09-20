@@ -27,8 +27,8 @@ const ECHO_PROTOCOL: &str = "/minip2p/echo/1";
 const FRAME_LEN: usize = 16;
 /// Cadence of the dialer's pings.
 const PING_INTERVAL: Duration = Duration::from_secs(1);
-/// Outlives the agent's 60 s connect deadline so `nat_wait_path` sees the
-/// terminal `ConnectFailed` instead of timing out first.
+/// Outlives the engine's 30 s connect deadline so `nat_wait_path` can still
+/// observe a late `PathEstablished` instead of timing out first.
 const CONNECT_DEADLINE: Duration = Duration::from_secs(65);
 /// How long the listener waits for its first relay reservation before
 /// warning and moving on (the agent keeps retrying in the background).

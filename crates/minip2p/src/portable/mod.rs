@@ -1050,9 +1050,11 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     /// Shadows [`PortableEndpoint::cancel_connect`]: the NAT relay leg is
     /// cancelled only through this inherent method.
     pub fn cancel_connect(&mut self, id: ConnectId, now: Now) {
+        #[cfg(feature = "portable-autonat")]
+        let cancel_leg = self.endpoint.is_connect_pending(id);
         self.endpoint.cancel_connect(id);
         #[cfg(feature = "portable-autonat")]
-        if let Some(nat) = self.nat.as_mut() {
+        if cancel_leg && let Some(nat) = self.nat.as_mut() {
             nat.cancel(id, now);
             nat.pump(&mut self.endpoint, now);
         }

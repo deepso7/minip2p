@@ -425,8 +425,9 @@ impl NatAgent {
     }
 
     /// Feeds one swarm event with the driver's transport classification.
-    /// Circuit connection lifecycle events are correlated with promotions;
-    /// direct events continue to drive the direct-first race.
+    /// Circuit connection lifecycle events are correlated with promotions.
+    /// Direct `ConnectionEstablished` still updates path snapshots for an
+    /// Inactive or racing relay leg.
     pub fn handle_event_with_disposition_classified(
         &mut self,
         event: &SwarmEvent,
