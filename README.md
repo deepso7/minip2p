@@ -59,7 +59,7 @@ cargo add minip2p-rs --features tcp
 
 ```rust
 let endpoint = minip2p::Endpoint::builder()
-    .quic_dual_stack()
+    .quic_dual_stack()?
     .tcp("0.0.0.0:4001")
     .bind()?;
 # Ok::<(), minip2p::Error>(())

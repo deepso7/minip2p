@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use minip2p::{
     BeaconConfig, Endpoint, EndpointBuilder, GossipsubConfig, GossipsubError, MdnsConfig,
-    Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, Protocol, PublishError, StreamId,
-    TopicError, TransportError, WaitHandle,
+    Multiaddr, NatConfig, PeerDiscoveryConfig, PeerId, PublishError, StreamId, TopicError,
+    TransportError, WaitHandle,
 };
 
 use crate::{
@@ -21,9 +21,33 @@ use crate::{
 
 fn configure_transports(
     mut builder: EndpointBuilder,
+    listen: Option<Vec<String>>,
     quic: Option<TransportOptions>,
     tcp: Option<TransportOptions>,
 ) -> Result<EndpointBuilder, FfiError> {
+    if let Some(addresses) = listen {
+        if addresses.is_empty() {
+            return Err(FfiError::InvalidConfig {
+                detail: "listen cannot be empty; omit listen for transport defaults, or pass complete multiaddresses".into(),
+            });
+        }
+        if quic.is_some() || tcp.is_some() {
+            return Err(FfiError::InvalidConfig {
+                detail: "use either address-shaped `listen` or legacy `quic`/`tcp` transport options, not both".into(),
+            });
+        }
+        for address in addresses {
+            let parsed =
+                Multiaddr::from_str(&address).map_err(|error| FfiError::InvalidAddress {
+                    detail: format!("invalid listen address `{address}`: {error}"),
+                })?;
+            builder = builder
+                .listen_on_multiaddr(&parsed)
+                .map_err(map_listen_error)?;
+        }
+        return Ok(builder);
+    }
+
     if quic.is_none() && tcp.is_none() {
         return Err(FfiError::InvalidConfig {
             detail: "at least one transport must be enabled".into(),
@@ -32,50 +56,20 @@ fn configure_transports(
 
     if let Some(options) = quic {
         match options.listen_addrs {
-            None => builder = builder.quic_dual_stack(),
+            None => builder = builder.quic_dual_stack().map_err(map_listen_error)?,
             Some(addresses) => {
                 if addresses.is_empty() {
                     return Err(empty_transport_list("QUIC"));
                 }
-                let mut has_ipv4 = false;
-                let mut has_ipv6 = false;
-                let mut parsed = Vec::with_capacity(addresses.len());
                 for address in addresses {
                     let address = parse_listen_addr(&address, "QUIC")?;
                     if !address.is_quic_transport() {
                         return Err(wrong_transport("QUIC", &address));
                     }
-                    let already_present = match address.protocols().first() {
-                        Some(Protocol::Ip4(_)) => core::mem::replace(&mut has_ipv4, true),
-                        Some(Protocol::Ip6(_)) => core::mem::replace(&mut has_ipv6, true),
-                        _ => {
-                            return Err(FfiError::InvalidAddress {
-                                detail: format!(
-                                    "QUIC listen address `{address}` must use /ip4 or /ip6; DNS names are dial-only"
-                                ),
-                            });
-                        }
-                    };
-                    if already_present {
-                        return Err(FfiError::InvalidConfig {
-                            detail: format!(
-                                "QUIC listen addresses may contain at most one address per IP family; `{address}` repeats a family"
-                            ),
-                        });
-                    }
-                    parsed.push(address);
+                    builder = builder
+                        .listen_on_multiaddr(&address)
+                        .map_err(map_listen_error)?;
                 }
-                builder = match parsed.as_slice() {
-                    [address] => builder.quic_multiaddr(address),
-                    [first, second] => builder.quic_dual_multiaddr(first, second),
-                    _ => {
-                        return Err(FfiError::InvalidConfig {
-                            detail:
-                                "QUIC listen address validation produced an unsupported address set"
-                                    .into(),
-                        });
-                    }
-                };
             }
         }
     }
@@ -92,11 +86,17 @@ fn configure_transports(
             if !address.is_tcp_transport() {
                 return Err(wrong_transport("TCP", &address));
             }
-            builder = builder.tcp_multiaddr(&address);
+            builder = builder.tcp_multiaddr(&address).map_err(map_listen_error)?;
         }
     }
 
     Ok(builder)
+}
+
+fn map_listen_error(error: minip2p::Error) -> FfiError {
+    FfiError::InvalidConfig {
+        detail: error.to_string(),
+    }
 }
 
 fn parse_listen_addr(address: &str, transport: &str) -> Result<Multiaddr, FfiError> {
@@ -262,7 +262,7 @@ impl P2pEndpoint {
             }
         }
 
-        builder = configure_transports(builder, config.quic, config.tcp)?;
+        builder = configure_transports(builder, config.listen, config.quic, config.tcp)?;
         let mut endpoint = builder.bind().map_err(map_constructor_error)?;
         let listen_addrs = endpoint
             .listen_all()
@@ -1042,6 +1042,7 @@ mod tests {
             agent_version: None,
             relays: Vec::new(),
             autonat_servers: Vec::new(),
+            listen: None,
             quic: Some(TransportOptions {
                 listen_addrs: Some(vec!["/ip4/127.0.0.1/udp/0/quic-v1".into()]),
             }),
@@ -1263,6 +1264,32 @@ mod tests {
                 .iter()
                 .any(|address| address.starts_with("/ip6/::1/"))
         );
+    }
+
+    #[test]
+    fn constructor_accepts_address_shaped_listen() {
+        let mut config = config();
+        config.quic = None;
+        config.listen = Some(vec![
+            "/ip4/127.0.0.1/udp/0/quic-v1".into(),
+            "/ip4/127.0.0.1/tcp/0".into(),
+        ]);
+
+        let endpoint = endpoint(config).expect("address-shaped listen");
+        let addresses = endpoint.listen_addrs();
+        assert!(addresses.iter().any(|address| address.contains("/quic-v1")));
+        assert!(addresses.iter().any(|address| address.contains("/tcp/")));
+    }
+
+    #[test]
+    fn constructor_rejects_listen_mixed_with_transport_options() {
+        let mut config = config();
+        config.listen = Some(vec!["/ip4/127.0.0.1/udp/0/quic-v1".into()]);
+
+        let Err(error) = endpoint(config) else {
+            panic!("listen and quic together must fail");
+        };
+        assert!(error.to_string().contains("not both"), "{error}");
     }
 
     #[test]

@@ -82,6 +82,7 @@ fn endpoint(seed: u8, relay: String) -> Arc<P2pEndpoint> {
             agent_version: Some("minip2p-ffi-relay-test".into()),
             relays: vec![relay],
             autonat_servers: Vec::new(),
+            listen: None,
             quic: Some(minip2p_ffi::TransportOptions {
                 listen_addrs: Some(vec!["/ip4/127.0.0.1/udp/0/quic-v1".into()]),
             }),

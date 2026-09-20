@@ -43,7 +43,7 @@ let endpoint = Endpoint::builder()
     .quic_dual_multiaddr(
         &"/ip4/0.0.0.0/udp/19876/quic-v1".parse()?,
         &"/ip6/::/udp/19876/quic-v1".parse()?,
-    )
+    )?
     .tcp("0.0.0.0:19876")
     .tcp("[::]:19876")
     .bind()?;

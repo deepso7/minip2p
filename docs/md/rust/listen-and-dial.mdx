@@ -7,15 +7,16 @@ This guide covers direct QUIC and TCP with the base Endpoint API. QUIC is on by 
 
 ## Bind an endpoint
 
-Choose the bind method that matches the host:
+Prefer address-shaped listening: pass complete multiaddresses to `listen_on` (or `listen_default` for dual-stack QUIC) and call `bind`. The builder infers QUIC vs TCP from each address and groups compatible IPv4/IPv6 listeners onto one transport per shape.
 
 | Method | Use it when |
 | --- | --- |
-| `bind_quic("127.0.0.1:0")` | You want one socket address, commonly for local tests. |
-| `bind_quic_multiaddr(&addr)` | Configuration already uses a QUIC `Multiaddr`. |
-| `bind_quic_dual_stack()` | The application should bind separate IPv4 and IPv6 wildcard sockets. |
-| `bind_tcp("0.0.0.0:0")` | You want TCP only (`tcp` feature). |
-| `.quic_dual_stack().tcp(...).bind()` | You want one endpoint that speaks both. |
+| `.listen_on("/ip4/…/udp/…/quic-v1")?.bind()` | Configuration already uses complete multiaddresses. |
+| `.listen_default()?.bind()` | Common dual-stack QUIC wildcards. |
+| `bind_quic("127.0.0.1:0")` | Legacy one-socket helper (still supported). |
+| `bind_quic_dual_stack()` | Legacy dual-stack QUIC helper (still supported). |
+| `bind_tcp("0.0.0.0:0")` | Legacy TCP helper (`tcp` feature). |
+| `.listen_on(quic)?.listen_on(tcp)?.bind()` | One endpoint that speaks both. |
 
 Port `0` asks the operating system to pick a free UDP or TCP port.
 
@@ -24,7 +25,8 @@ use minip2p::{Endpoint, PeerAddr};
 
 let mut node = Endpoint::builder()
     .agent_version("my-app/0.1.0")
-    .bind_quic_dual_stack()?;
+    .listen_default()?
+    .bind()?;
 
 for address in node.listen_all()? {
     // Wildcards describe the bind socket; rewrite before sharing locally.
@@ -41,12 +43,12 @@ fn local_dialable(address: &PeerAddr) -> String {
 
 `listen()` publishes the first already-bound address. `listen_all()` publishes every bound address, which is normally the right choice for a dual-stack endpoint.
 
-To listen on both, chain the builder methods before `bind`:
+To listen on both QUIC and TCP:
 
 ```rust
 let mut node = Endpoint::builder()
-    .quic_dual_stack()
-    .tcp("0.0.0.0:4001")
+    .listen_on("/ip4/0.0.0.0/udp/4001/quic-v1")?
+    .listen_on("/ip4/0.0.0.0/tcp/4001")?
     .bind()?;
 ```
 

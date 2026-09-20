@@ -14,13 +14,16 @@ This crate provides the existing batteries-included std `Endpoint` and a caller-
 let mut endpoint = minip2p::Endpoint::builder()
     .agent_version("my-app/0.1.0")
     .protocol("/myapp/1.0.0")
-    .bind_quic_dual_stack()?;
+    .listen_default()?
+    .bind()?;
 
 for address in endpoint.listen_all()? {
     println!("{address}");
 }
 # Ok::<(), minip2p::Error>(())
 ```
+
+Prefer [`EndpointBuilder::listen_on`] with complete multiaddresses when configuration already speaks multiaddrs; `listen_default` is dual-stack QUIC. Legacy `bind_quic*` / `bind_tcp` helpers remain until contraction.
 
 ## Portable endpoint
 
@@ -98,17 +101,16 @@ while endpoint.path(&remote_peer).is_none() {
 
 QUIC comes with the default `std + quic` features. TCP is opt-in via the `tcp` Cargo feature, so a QUIC-only app does not pull in the TCP stack. Enable it with `cargo add minip2p-rs --features tcp`.
 
-An endpoint brings up whatever you asked it to bind, then routes by address. `quic`, `quic_dual_stack`, and `tcp` add sockets; `bind` brings them all up:
+An endpoint brings up whatever you asked it to listen on, then routes by address. Prefer complete multiaddresses:
 
 ```rust
 let mut endpoint = minip2p::Endpoint::builder()
-    .quic("0.0.0.0:4001")
-    .tcp("0.0.0.0:4001")
+    .listen_on("/ip4/0.0.0.0/udp/4001/quic-v1")?
     .bind()?;
 # Ok::<(), minip2p::Error>(())
 ```
 
-Dial `/udp/<port>/quic-v1` and you get QUIC; dial a `/tcp` address and you get TCP. The address decides — nothing above the endpoint cares that there are two transports. `bind_quic`, `bind_quic_multiaddr`, `bind_quic_dual_stack`, and `bind_tcp` are the one-transport shortcuts. An endpoint with nothing to bind is refused rather than built empty.
+With the `tcp` feature, chain a `/tcp` listen address the same way. Dial `/udp/<port>/quic-v1` and you get QUIC; dial a `/tcp` address and you get TCP. The address decides — nothing above the endpoint cares that there are two transports. `listen_default` is dual-stack QUIC; legacy `bind_quic*` / `bind_tcp` helpers remain until contraction. An endpoint with nothing to bind is refused rather than built empty.
 
 `dial` resolves a `/dns*` target and dials one address per family, so a dual-stack peer is tried both ways; `dial_ip4` and `dial_ip6` force one.
 
@@ -153,4 +155,4 @@ Discovery source timestamps use a driver-private monotonic epoch. Compute their 
 
 With the `pubsub` feature, `.gossipsub()` enables gossipsub and advertises `/meshsub/1.1.0` plus `/meshsub/1.0.0`. Pass a `GossipsubConfig` to `.gossipsub_config(...)` to tune mesh policy; an invalid configuration fails `bind()` before any socket is allocated.
 
-Built-in protocol ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see `minip2p::RESERVED_PROTOCOL_IDS`) belong to the endpoint's own handlers; registering one via `EndpointBuilder::protocol` makes the `bind_quic*` step fail, and `Endpoint::add_protocol` rejects it with `SwarmError::ReservedProtocol`.
+Built-in protocol ids (`/ipfs/id/1.0.0`, `/ipfs/ping/1.0.0` -- see `minip2p::RESERVED_PROTOCOL_IDS`) belong to the endpoint's own handlers; registering one via `EndpointBuilder::protocol` makes the bind step fail, and `Endpoint::add_protocol` rejects it with `SwarmError::ReservedProtocol`.

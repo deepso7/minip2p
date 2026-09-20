@@ -223,6 +223,7 @@ fn config_on(listen_addr: &str) -> EndpointConfig {
         agent_version: Some("minip2p-ffi-loopback-test".into()),
         relays: Vec::new(),
         autonat_servers: Vec::new(),
+        listen: None,
         quic,
         tcp,
         force_relay: false,

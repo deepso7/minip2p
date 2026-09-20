@@ -30,9 +30,9 @@ class NodeBackend implements Minip2pBackend {
   readonly #streamIds = new IdMap();
 
   constructor(config: Minip2pConfig) {
-    const transports = resolveTransports(config);
     const discovery = toNativeDiscovery(config.discovery);
     const mdns = toNativeMdns(config.mdns, config.discovery);
+    const { listen, quic, tcp } = resolveListenConfig(config);
     this.#endpoint = new nativeBinding.NodeEndpoint(
       toUint8Array(config.secretKey),
       {
@@ -41,11 +41,12 @@ class NodeBackend implements Minip2pBackend {
         autonatServers: [...(config.autonatServers ?? [])],
         discovery,
         forceRelay: config.forceRelay ?? false,
+        listen,
         mdns,
         protocols: [...(config.protocols ?? [])],
-        quic: toNativeTransport(transports.quic),
+        quic,
         relays: [...(config.relays ?? [])],
-        tcp: toNativeTransport(transports.tcp),
+        tcp,
       }
     );
     this.#events = new EventDrain(
@@ -250,6 +251,38 @@ export function peerIdFromSecretKey(secretKey: Bytes): string {
 /** Builds a circuit multiaddress through a direct relay address. */
 export function circuitAddress(relayAddress: string, peerId: string): string {
   return nativeBinding.circuitAddress(relayAddress, peerId);
+}
+
+const MIXED_LISTEN_MESSAGE =
+  "use either address-shaped `listen` or legacy `quic`/`tcp` transport options, not both";
+
+function resolveListenConfig(config: Minip2pConfig): {
+  readonly listen?: string[];
+  readonly quic?: { readonly listenAddrs?: string[] };
+  readonly tcp?: { readonly listenAddrs?: string[] };
+} {
+  if (config.listen !== undefined) {
+    // Adapters would otherwise clear quic/tcp before native sees them, so
+    // reject the mix here (same rule and wording as ffi-core).
+    const transports = config.transports;
+    if (
+      transports !== undefined &&
+      (transports.quic !== undefined || transports.tcp !== undefined)
+    ) {
+      throw new Error(MIXED_LISTEN_MESSAGE);
+    }
+    return {
+      listen: [...config.listen],
+      quic: undefined,
+      tcp: undefined,
+    };
+  }
+  const transports = resolveTransports(config);
+  return {
+    listen: undefined,
+    quic: toNativeTransport(transports.quic),
+    tcp: toNativeTransport(transports.tcp),
+  };
 }
 
 function resolveTransports(config: Minip2pConfig) {

@@ -33,7 +33,7 @@ Available on the std `Endpoint`:
 
 Available on `EndpointBuilder` with `quic`:
 
-- Bind: `quic`, `quic_multiaddr`, `quic_dual_multiaddr`, `quic_dual_stack`, `bind_quic`, `bind_quic_multiaddr`, `bind_quic_dual_stack`
+- Bind: `listen_on`, `listen_on_multiaddr`, `listen_default`, `quic`, `quic_multiaddr`, `quic_dual_multiaddr`, `quic_dual_stack`, `bind_quic`, `bind_quic_multiaddr`, `bind_quic_dual_stack`
 - Configuration: `quic_limits`
 
 `EndpointBuilder::bind` is available with `std`, but needs at least one configured transport. Enable `quic` or `tcp` before adding a corresponding bind.
@@ -42,7 +42,7 @@ Available on `EndpointBuilder` with `quic`:
 
 Compiled with `features = ["tcp"]`:
 
-- Bind: `tcp`, `tcp_multiaddr`, `bind_tcp`
+- Bind: `listen_on`, `listen_on_multiaddr`, `tcp`, `tcp_multiaddr`, `bind_tcp`
 - Configuration: `tcp_config`
 - Routing: QUIC addresses use QUIC; `/tcp` dials use TCP
 

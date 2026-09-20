@@ -32,6 +32,8 @@ const notFaked = (method: keyof P2pEndpointLike): never => {
 export class FakeNativeEndpoint implements P2pEndpointLike {
   static latest: FakeNativeEndpoint | undefined;
 
+  /** Native config passed to the most recent constructor. */
+  readonly config: unknown;
   readonly drainLimits: number[] = [];
   /** Native identities returned by the next `openStream` call. */
   nextStream = { connId: 1n, streamId: 1n };
@@ -42,7 +44,8 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
   readonly #batches: FakeEvent[][] = [];
   #doorbell: P2pEventDoorbell | undefined;
 
-  constructor() {
+  constructor(_secretKey?: Uint8Array, config?: unknown) {
+    this.config = config;
     FakeNativeEndpoint.latest = this;
   }
 
@@ -205,10 +208,13 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
 }
 
 /** Factory for `vi.mock("../src/native", nativeModuleMock)`. */
-export const nativeModuleMock = () => ({
-  FfiError_Tags: {},
-  P2pEndpoint: FakeNativeEndpoint,
-  circuitAddress: vi.fn(),
-  generateSecretKey: vi.fn(),
-  peerIdFromSecretKey: vi.fn(),
-});
+export const nativeModuleMock = async () => {
+  const { FfiError_Tags } = await import("../src/generated/minip2p_ffi");
+  return {
+    FfiError_Tags,
+    P2pEndpoint: FakeNativeEndpoint,
+    circuitAddress: vi.fn(),
+    generateSecretKey: vi.fn(),
+    peerIdFromSecretKey: vi.fn(),
+  };
+};

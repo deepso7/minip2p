@@ -372,23 +372,45 @@ function toNativeConfig(config: Minip2pConfig): NativeEndpointConfig {
           ttlMs: numberToU64(mdnsOptions.ttlMs ?? 120_000, "ttlMs"),
         };
   const configuredTransports = config.transports;
-  const transports: Minip2pTransports =
+  const addressListen =
+    config.listen === undefined ? undefined : [...config.listen];
+  if (
+    addressListen !== undefined &&
+    configuredTransports !== undefined &&
+    (configuredTransports.quic !== undefined ||
+      configuredTransports.tcp !== undefined)
+  ) {
+    // Adapters would otherwise clear quic/tcp before native sees them, so
+    // reject the mix here (same rule and wording as ffi-core).
+    throw new Error(
+      "use either address-shaped `listen` or legacy `quic`/`tcp` transport options, not both"
+    );
+  }
+  let transports: Minip2pTransports;
+  if (addressListen !== undefined) {
+    transports = {};
+  } else if (
     configuredTransports === undefined ||
     (configuredTransports.quic === undefined &&
       configuredTransports.tcp === undefined)
-      ? { quic: true }
-      : configuredTransports;
+  ) {
+    transports = { quic: true };
+  } else {
+    transports = configuredTransports;
+  }
+  const useAddressListen = addressListen !== undefined;
   return {
     agentVersion: config.agentVersion,
     allowUnsigned: config.allowUnsigned ?? false,
     autonatServers: [...(config.autonatServers ?? [])],
     discovery,
     forceRelay: config.forceRelay ?? false,
+    listen: addressListen,
     mdns,
     protocols: [...(config.protocols ?? [])],
-    quic: toNativeTransport(transports.quic),
+    quic: useAddressListen ? undefined : toNativeTransport(transports.quic),
     relays: [...(config.relays ?? [])],
-    tcp: toNativeTransport(transports.tcp),
+    tcp: useAddressListen ? undefined : toNativeTransport(transports.tcp),
   };
 }
 
