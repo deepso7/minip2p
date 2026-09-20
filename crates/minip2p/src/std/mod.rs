@@ -46,12 +46,6 @@ mod relay_server;
 
 #[cfg(any(feature = "discovery", feature = "mdns"))]
 pub use discovery::DiscoveryError;
-#[cfg(any(
-    feature = "quic",
-    feature = "tcp",
-    feature = "nat",
-    feature = "relay-server"
-))]
 use minip2p_core::Multiaddr;
 #[cfg(any(feature = "tcp", feature = "relay-server"))]
 use minip2p_core::Protocol;
@@ -97,22 +91,46 @@ pub use minip2p_relay_server::{
     RelayServerConfigError, RelayServerConfigErrorKind, RelayServerEvent, RelayServerRuntimeError,
     RelayServerRuntimeErrorKind, ReservationCloseReason, Status,
 };
-#[cfg(feature = "relay-server")]
-pub use minip2p_swarm::ConnectionCloseCause;
 use minip2p_swarm::SwarmBuilder;
 pub use minip2p_swarm::{
     Deadline, DriverError as Error, PollNext, RESERVED_PROTOCOL_IDS, RUN_UNTIL_SKIP_LIMIT, Swarm,
-    SwarmError, SwarmEvent as Event,
+    SwarmError,
 };
 #[cfg(feature = "tcp")]
 use minip2p_tcp::{StdTcpProvider, TcpConfig, TcpTransport};
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use minip2p_transport::ConnectionNamespace;
-#[cfg(any(feature = "tcp", feature = "relay-server"))]
 use minip2p_transport::Transport;
 pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet, WaitHandle};
 #[cfg(feature = "pubsub")]
 pub use pubsub::GossipsubError;
+
+use crate::EndpointEvent;
+
+/// Migration alias for [`EndpointEvent`]. Prefer [`EndpointEvent`] at the Endpoint boundary.
+pub type Event = EndpointEvent;
+
+/// Why one blocking [`Endpoint::wait`] returned.
+///
+/// Deadline and interruption are control outcomes, not additional event
+/// sources. Unlike the migration-era [`EndpointWake`] shape, this outcome has
+/// no driver-progress variant and does not require draining capability queues.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "EndpointEvent ownership avoids a heap allocation on the ready path."
+)]
+#[must_use = "handle the wait outcome; an Event has been removed from the endpoint"]
+pub enum EndpointWaitOutcome {
+    /// An application event from the Endpoint event stream.
+    ///
+    /// The event has been removed from the endpoint and belongs to the caller.
+    Event(EndpointEvent),
+    /// The caller's deadline elapsed without an application event.
+    Deadline,
+    /// The transport wait was interrupted by an external wait handle.
+    Interrupted,
+}
 
 const DEFAULT_AGENT_VERSION: &str = concat!("minip2p/", env!("CARGO_PKG_VERSION"));
 #[cfg(feature = "relay-server")]
@@ -219,6 +237,23 @@ pub type EndpointSwarm = Swarm<EndpointTransport>;
 /// `Endpoint` owns identity, transports, and the std swarm driver. Advanced
 /// users can still borrow the underlying [`Swarm`] with [`Endpoint::swarm`]
 /// and [`Endpoint::swarm_mut`].
+///
+/// Prefer [`Endpoint::wait`] for the ordered Endpoint event stream: it returns
+/// an event, deadline, or interruption. If NAT, pubsub, discovery, or
+/// relay-server is enabled, keep using [`Endpoint::next_wake`] until capability
+/// events join the stream (#177) — `wait` does not wake on capability progress.
+/// Focused waits and `next_wake` remain during migration.
+///
+/// # State snapshots
+///
+/// Getter-style snapshots ([`connected_peers`](Self::connected_peers),
+/// [`is_peer_ready`](Self::is_peer_ready), [`peer_info`](Self::peer_info),
+/// [`connection_id`](Self::connection_id),
+/// [`connection_remote_addr`](Self::connection_remote_addr),
+/// [`bound_addresses`](Self::bound_addresses)) do not drive the endpoint.
+/// Separate getters are not one cross-getter atomic snapshot and may be ahead
+/// of the Endpoint event stream (state changes before its corresponding event
+/// is queued).
 ///
 /// QUIC, TCP, or both -- see `EndpointBuilder::quic`,
 /// `EndpointBuilder::tcp`, and [`EndpointBuilder::bind`]. They live behind
@@ -470,18 +505,49 @@ impl Endpoint {
     }
 
     /// Returns peers with an established connection.
+    ///
+    /// See [State snapshots](Self#state-snapshots).
     pub fn connected_peers(&self) -> Vec<PeerId> {
         self.swarm.connected_peers()
     }
 
     /// Returns whether Identify has completed for `peer_id`.
+    ///
+    /// See [State snapshots](Self#state-snapshots).
     pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
         self.swarm.is_peer_ready(peer_id)
     }
 
     /// Returns the latest Identify information received for `peer_id`.
+    ///
+    /// See [State snapshots](Self#state-snapshots).
     pub fn peer_info(&self, peer_id: &PeerId) -> Option<&IdentifyMessage> {
         self.swarm.peer_info(peer_id)
+    }
+
+    /// Returns the active transport connection selected for `peer_id`.
+    ///
+    /// See [State snapshots](Self#state-snapshots).
+    pub fn connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
+        self.swarm.connection_id(peer_id)
+    }
+
+    /// Returns the remote transport address recorded for an exact connection.
+    ///
+    /// See [State snapshots](Self#state-snapshots).
+    pub fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
+        self.swarm.connection_remote_addr(conn_id)
+    }
+
+    /// Returns addresses currently bound on the local transport.
+    ///
+    /// These are what the sockets were given, not a signal that
+    /// [`Self::listen`] / [`Self::listen_all`] has started accepting. The set
+    /// can be non-empty before listening begins.
+    ///
+    /// See [State snapshots](Self#state-snapshots).
+    pub fn bound_addresses(&self) -> Vec<Multiaddr> {
+        self.swarm.transport().local_addresses()
     }
 
     /// Registers an application protocol for inbound and outbound negotiation.
@@ -550,14 +616,15 @@ impl Endpoint {
 
     /// Polls the endpoint once and returns all currently available events.
     ///
+    /// Returned values are [`EndpointEvent`]s from the Endpoint event stream.
     /// With NAT configured, events belonging to the traversal agent are
     /// consumed here (never surfaced to the application); the agent's own
     /// events accumulate for `Endpoint::take_nat_events`.
-    pub fn poll(&mut self) -> Result<Vec<Event>, Error> {
+    pub fn poll(&mut self) -> Result<Vec<EndpointEvent>, Error> {
         #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
         {
             let polled = self.swarm.poll()?;
-            let mut events: Vec<Event> = self.pending_events.drain(..).collect();
+            let mut events: Vec<EndpointEvent> = self.pending_events.drain(..).collect();
             for event in polled {
                 if !self.ingest_into_drivers(&event) {
                     events.push(event);
@@ -572,29 +639,126 @@ impl Endpoint {
         }
     }
 
+    /// Drives the endpoint until an Endpoint event, the caller's deadline, or
+    /// an interruption.
+    ///
+    /// This is the single Endpoint blocking wait: deadline and interruption
+    /// remain visible, and driver-progress is not part of the outcome. If an
+    /// absolute [`std::time::Instant`] deadline has already passed, this returns
+    /// [`EndpointWaitOutcome::Deadline`] before delivering another queued
+    /// event. Relative [`std::time::Duration`] deadlines (including
+    /// [`std::time::Duration::ZERO`] non-blocking drains) still inspect buffered
+    /// events and poll once. Capability queues stay on their focused `take_*` /
+    /// `next_*` APIs until a later ticket — if NAT, pubsub, discovery, or
+    /// relay-server is enabled, keep using [`Self::next_wake`] until #177,
+    /// because `wait` does not wake on capability progress. Existing
+    /// [`Self::next_event`], [`Self::next_wake`], and focused waits remain
+    /// available during migration.
+    ///
+    /// # Examples
+    ///
+    /// Correlate a dial while dispatching unrelated events:
+    ///
+    /// ```no_run
+    /// use std::time::{Duration, Instant};
+    ///
+    /// use minip2p::{Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr};
+    ///
+    /// fn wait_peer_ready_correlated(
+    ///     node: &mut Endpoint,
+    ///     target: &PeerAddr,
+    /// ) -> Result<(), minip2p::Error> {
+    ///     node.dial(target)?;
+    ///     let peer = target.peer_id().clone();
+    ///     // One absolute deadline for the whole correlated wait — do not
+    ///     // recreate a relative Duration inside the loop, or unrelated events
+    ///     // and interruptions would reset the timeout.
+    ///     let deadline = Instant::now() + Duration::from_secs(10);
+    ///     loop {
+    ///         match node.wait(deadline)? {
+    ///             EndpointWaitOutcome::Event(EndpointEvent::PeerReady { peer_id, .. })
+    ///                 if peer_id == peer =>
+    ///             {
+    ///                 return Ok(());
+    ///             }
+    ///             EndpointWaitOutcome::Event(_other) => {
+    ///                 // Dispatch unrelated stream / ping / connection events here.
+    ///             }
+    ///             EndpointWaitOutcome::Deadline => {
+    ///                 return Err(minip2p::Error::Invariant {
+    ///                     reason: "peer did not become ready before the deadline",
+    ///                 });
+    ///             }
+    ///             EndpointWaitOutcome::Interrupted => {
+    ///                 // Service external commands, then continue waiting.
+    ///             }
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    pub fn wait(&mut self, deadline: impl Into<Deadline>) -> Result<EndpointWaitOutcome, Error> {
+        let deadline = deadline.into();
+        // Absolute Instant already past: Deadline wins over queued events.
+        // Relative Duration::ZERO still drains / polls once.
+        if deadline.prefers_deadline_over_queued() {
+            return Ok(EndpointWaitOutcome::Deadline);
+        }
+        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
+        if self.has_drivers() {
+            if let Some(event) = self.pending_events.pop_front() {
+                return Ok(EndpointWaitOutcome::Event(event));
+            }
+            let mut expired_poll_used = false;
+            loop {
+                match self.poll_new_event_driven(deadline, &mut expired_poll_used)? {
+                    DriverPoll::Application(event) => {
+                        return Ok(EndpointWaitOutcome::Event(event));
+                    }
+                    // Capability progress stays on focused queues; keep waiting
+                    // for an application EndpointEvent, deadline, or interrupt.
+                    DriverPoll::Progress => {}
+                    DriverPoll::Interrupted => return Ok(EndpointWaitOutcome::Interrupted),
+                    DriverPoll::Deadline => return Ok(EndpointWaitOutcome::Deadline),
+                }
+            }
+        }
+        self.swarm
+            .poll_next_interruptible(deadline)
+            .map(|event| match event {
+                PollNext::Event(event) => EndpointWaitOutcome::Event(event),
+                PollNext::Deadline => EndpointWaitOutcome::Deadline,
+                PollNext::Interrupted => EndpointWaitOutcome::Interrupted,
+            })
+    }
+
     /// Returns the next ordinary application event, waiting until `deadline`.
     ///
-    /// Use focused waits such as [`Self::wait_path`] and
-    /// [`Self::wait_peer_ready`] when you need a particular milestone. Use
-    /// `next_event` for a synchronous application event loop, or
-    /// [`Self::next_wake`] when the loop also handles capability queues and
-    /// interruptions. All of these methods use transport readiness when
-    /// supported. Each call drives only this endpoint, so blocking here can
+    /// Prefer [`Self::wait`] for new code: it surfaces interruption and matches
+    /// the Endpoint wait outcomes. If NAT, pubsub, discovery, or relay-server
+    /// is enabled, keep using [`Self::next_wake`] until #177 — `wait` does not
+    /// wake on capability progress. Use focused waits such as
+    /// [`Self::wait_path`] and [`Self::wait_peer_ready`] when you need a
+    /// particular milestone. Use `next_event` for a synchronous application
+    /// event loop, or [`Self::next_wake`] when the loop also handles capability
+    /// queues and interruptions. All of these methods use transport readiness
+    /// when supported. Each call drives only this endpoint, so blocking here can
     /// delay other endpoints that share the same thread.
     ///
     /// `deadline` accepts an [`std::time::Instant`], a relative
     /// [`std::time::Duration`], or [`Deadline::NEVER`] to wait indefinitely.
+    ///
+    /// Unlike [`Self::wait`], this method swallows interruption and retries.
+    /// Like `wait`, an already-passed absolute [`std::time::Instant`] returns
+    /// `None` before delivering another queued event. Relative
+    /// [`std::time::Duration`] deadlines (including [`std::time::Duration::ZERO`]) still
+    /// drain queued events and poll once.
     pub fn next_event(&mut self, deadline: impl Into<Deadline>) -> Result<Option<Event>, Error> {
         let deadline = deadline.into();
-        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-        if self.has_drivers() {
-            return self.next_event_driven(deadline);
-        }
         loop {
-            match self.swarm.poll_next_interruptible(deadline)? {
-                PollNext::Event(event) => return Ok(Some(event)),
-                PollNext::Deadline => return Ok(None),
-                PollNext::Interrupted => {}
+            match self.wait(deadline)? {
+                EndpointWaitOutcome::Event(event) => return Ok(Some(event)),
+                EndpointWaitOutcome::Deadline => return Ok(None),
+                EndpointWaitOutcome::Interrupted => {}
             }
         }
     }
@@ -614,8 +778,17 @@ impl Endpoint {
     /// not just the queue currently relevant to the application. Leaving any
     /// such queue non-empty makes subsequent calls return immediately and can
     /// busy-spin a caller that expected the supplied deadline to block.
+    ///
+    /// Like [`Self::wait`], an already-passed absolute [`std::time::Instant`]
+    /// returns [`EndpointWake::Deadline`] before delivering another queued
+    /// event or driver-progress wake. Relative [`std::time::Duration`]
+    /// deadlines (including [`std::time::Duration::ZERO`]) still drain queued work and
+    /// poll once.
     pub fn next_wake(&mut self, deadline: impl Into<Deadline>) -> Result<EndpointWake, Error> {
         let deadline = deadline.into();
+        if deadline.prefers_deadline_over_queued() {
+            return Ok(EndpointWake::Deadline);
+        }
         #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
         if self.has_drivers() {
             if let Some(event) = self.pending_events.pop_front() {
@@ -633,13 +806,11 @@ impl Endpoint {
                 DriverPoll::Deadline => EndpointWake::Deadline,
             });
         }
-        self.swarm
-            .poll_next_interruptible(deadline)
-            .map(|event| match event {
-                PollNext::Event(event) => EndpointWake::Event(event),
-                PollNext::Deadline => EndpointWake::Deadline,
-                PollNext::Interrupted => EndpointWake::Interrupted,
-            })
+        match self.wait(deadline)? {
+            EndpointWaitOutcome::Event(event) => Ok(EndpointWake::Event(event)),
+            EndpointWaitOutcome::Deadline => Ok(EndpointWake::Deadline),
+            EndpointWaitOutcome::Interrupted => Ok(EndpointWake::Interrupted),
+        }
     }
 
     /// Whether any agent driver is active on this endpoint.
@@ -797,32 +968,10 @@ impl Endpoint {
         step
     }
 
-    /// `next_event` with the active agents folded into the wait: the sleep
-    /// budget never overshoots an agent's next timer, agent-owned stream
-    /// events are consumed instead of surfaced, and ticks run between
-    /// waits.
-    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-    fn next_event_driven(&mut self, deadline: Deadline) -> Result<Option<Event>, Error> {
-        if let Some(event) = self.pending_events.pop_front() {
-            return Ok(Some(event));
-        }
-        let mut expired_poll_used = false;
-        loop {
-            let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
-            match poll {
-                DriverPoll::Application(event) => return Ok(Some(event)),
-                DriverPoll::Progress => {}
-                DriverPoll::Interrupted => {}
-                DriverPoll::Deadline => return Ok(None),
-            }
-        }
-    }
-
     /// Drives the swarm and the active agents until a newly-arrived
-    /// application event is available. Unlike [`Self::next_event_driven`],
-    /// this never drains `pending_events`: focused waits must leave
-    /// application events aside instead of repeatedly picking up the same
-    /// one.
+    /// application event is available. Focused waits must leave application
+    /// events aside instead of repeatedly picking up the same one, so this
+    /// never drains `pending_events`.
     #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     fn poll_new_event_driven(
         &mut self,
@@ -2515,9 +2664,7 @@ fn default_agent_version_matches_package_version() {
 #[cfg(all(test, feature = "quic"))]
 mod tests {
     use super::*;
-    #[cfg(feature = "tcp")]
     use std::sync::Arc;
-    #[cfg(feature = "tcp")]
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Drives `endpoint` on a thread until the returned guard is dropped.
@@ -2525,13 +2672,11 @@ mod tests {
     /// A peer that is not being driven answers nothing, so anything asserting
     /// on a connection needs the other end alive for as long as the assertion
     /// takes.
-    #[cfg(feature = "tcp")]
     struct Driven {
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
-    #[cfg(feature = "tcp")]
     impl Driven {
         fn new(mut endpoint: Endpoint) -> Self {
             let stop = Arc::new(AtomicBool::new(false));
@@ -2550,7 +2695,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "tcp")]
     impl Drop for Driven {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
@@ -2943,9 +3087,6 @@ mod tests {
 
     #[test]
     fn a_dial_reaches_a_peer_on_the_transport_its_address_names() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
         let mut listener = Endpoint::builder()
             .bind_quic("127.0.0.1:0")
             .expect("bind listener");
@@ -2953,16 +3094,7 @@ mod tests {
         let mut dialer = Endpoint::builder()
             .bind_quic("127.0.0.1:0")
             .expect("bind dialer");
-
-        let stop = Arc::new(AtomicBool::new(false));
-        let listener_stop = Arc::clone(&stop);
-        let listener_thread = std::thread::spawn(move || {
-            while !listener_stop.load(Ordering::Relaxed) {
-                listener
-                    .next_event(Duration::from_millis(20))
-                    .expect("drive listener");
-            }
-        });
+        let _listener = Driven::new(listener);
 
         // Routing the dial through a set, and resolving families above it,
         // must leave an ordinary dial doing exactly what it did.
@@ -2971,8 +3103,6 @@ mod tests {
         let connected = dialer
             .next_event(Duration::from_secs(5))
             .expect("drive dialer");
-        stop.store(true, Ordering::Relaxed);
-        listener_thread.join().expect("listener driver exits");
 
         assert!(
             matches!(&connected, Some(Event::ConnectionEstablished { peer_id, .. })
@@ -2991,6 +3121,196 @@ mod tests {
             endpoint.next_wake(Duration::ZERO).expect("poll endpoint"),
             EndpointWake::Deadline
         ));
+    }
+
+    #[test]
+    fn wait_reports_deadline_without_swallowing_control_outcomes() {
+        let mut endpoint = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind loopback endpoint");
+
+        assert!(matches!(
+            endpoint.wait(Duration::ZERO).expect("wait endpoint"),
+            EndpointWaitOutcome::Deadline
+        ));
+    }
+
+    #[test]
+    fn wait_prefers_deadline_over_queued_events_when_instant_has_passed() {
+        let mut endpoint = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind loopback endpoint");
+        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
+        {
+            endpoint.pending_events.push_back(Event::ConnectionClosed {
+                peer_id: Ed25519Keypair::generate().peer_id(),
+                conn_id: ConnectionId::new(1),
+                cause: minip2p_swarm::ConnectionCloseCause::Transport,
+            });
+        }
+        let past = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now);
+        assert!(matches!(
+            endpoint.wait(past).expect("wait past deadline"),
+            EndpointWaitOutcome::Deadline
+        ));
+        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
+        assert_eq!(
+            endpoint.pending_events.len(),
+            1,
+            "queued events stay queued when the Instant has already passed"
+        );
+    }
+
+    #[cfg(feature = "nat")]
+    #[test]
+    fn wait_with_duration_zero_still_drains_queued_events() {
+        let mut endpoint = Endpoint::builder()
+            .nat_config(NatConfig::default())
+            .bind_quic("127.0.0.1:0")
+            .expect("bind loopback endpoint");
+        let peer = Ed25519Keypair::generate().peer_id();
+        endpoint.pending_events.push_back(Event::ConnectionClosed {
+            peer_id: peer.clone(),
+            conn_id: ConnectionId::new(1),
+            cause: minip2p_swarm::ConnectionCloseCause::Transport,
+        });
+        assert!(matches!(
+            endpoint.wait(Duration::ZERO).expect("zero-duration drain"),
+            EndpointWaitOutcome::Event(Event::ConnectionClosed { peer_id, .. })
+                if peer_id == peer
+        ));
+        assert!(
+            endpoint.pending_events.is_empty(),
+            "Duration::ZERO must drain queued events"
+        );
+    }
+
+    #[test]
+    fn wait_reports_interrupt_without_swallowing_it() {
+        let mut endpoint = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind loopback endpoint");
+        endpoint.wait_handle().interrupt();
+
+        assert!(matches!(
+            endpoint.wait(Deadline::NEVER).expect("wait endpoint"),
+            EndpointWaitOutcome::Interrupted
+        ));
+    }
+
+    #[test]
+    fn wait_delivers_connection_events_once_through_the_endpoint_stream() {
+        let mut listener = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind listener");
+        let listen_addr = listener.listen().expect("listen");
+        let mut dialer = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind dialer");
+        let _listener = Driven::new(listener);
+
+        dialer.dial(&listen_addr).expect("dial");
+        let peer = listen_addr.peer_id().clone();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut established_count = 0u32;
+        let mut conn_id = None;
+        let mut saw_peer_ready = false;
+        while std::time::Instant::now() < deadline {
+            match dialer.wait(deadline).expect("wait") {
+                EndpointWaitOutcome::Event(Event::ConnectionEstablished {
+                    peer_id,
+                    conn_id: id,
+                }) if peer_id == peer => {
+                    established_count += 1;
+                    conn_id = Some(id);
+                }
+                EndpointWaitOutcome::Event(Event::PeerReady { peer_id, .. }) if peer_id == peer => {
+                    saw_peer_ready = true;
+                    break;
+                }
+                EndpointWaitOutcome::Event(_) | EndpointWaitOutcome::Interrupted => {}
+                EndpointWaitOutcome::Deadline => break,
+            }
+        }
+        assert_eq!(
+            established_count, 1,
+            "ConnectionEstablished must appear exactly once before PeerReady"
+        );
+        let conn_id = conn_id.expect("dialer saw ConnectionEstablished");
+        assert!(saw_peer_ready, "PeerReady follows the single establishment");
+        assert_eq!(dialer.connection_id(&peer), Some(conn_id));
+        assert!(dialer.connected_peers().contains(&peer));
+    }
+
+    #[test]
+    fn wait_delivers_peer_ready_through_the_endpoint_stream() {
+        let mut listener = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind listener");
+        let listen_addr = listener.listen().expect("listen");
+        let mut dialer = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind dialer");
+        let _listener = Driven::new(listener);
+
+        dialer.dial(&listen_addr).expect("dial");
+        let peer = listen_addr.peer_id().clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut ready = false;
+        while std::time::Instant::now() < deadline {
+            match dialer.wait(deadline).expect("wait") {
+                EndpointWaitOutcome::Event(Event::PeerReady { peer_id, .. }) if peer_id == peer => {
+                    ready = true;
+                    break;
+                }
+                EndpointWaitOutcome::Event(_) | EndpointWaitOutcome::Interrupted => {}
+                EndpointWaitOutcome::Deadline => break,
+            }
+        }
+        assert!(ready, "PeerReady arrives once through Endpoint::wait");
+        assert!(dialer.is_peer_ready(&peer));
+        assert!(dialer.peer_info(&peer).is_some());
+    }
+
+    #[test]
+    fn state_getters_expose_bound_addresses_and_connection_without_driving() {
+        let mut endpoint = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind loopback endpoint");
+        let before = endpoint.bound_addresses();
+        assert!(
+            !before.is_empty(),
+            "bound transport addresses are visible before listen/drive"
+        );
+        let listened = endpoint.listen_all().expect("listen");
+        assert_eq!(endpoint.bound_addresses(), before);
+        assert_eq!(endpoint.connected_peers(), Vec::<PeerId>::new());
+        assert!(endpoint.connection_id(listened[0].peer_id()).is_none());
+        assert!(endpoint.peer_info(listened[0].peer_id()).is_none());
+        assert!(!endpoint.is_peer_ready(listened[0].peer_id()));
+    }
+
+    #[cfg(feature = "nat")]
+    #[test]
+    fn wait_does_not_surface_driver_progress_for_queued_nat_events() {
+        let mut endpoint = Endpoint::builder()
+            .nat_config(NatConfig::default())
+            .bind_quic("127.0.0.1:0")
+            .expect("bind NAT endpoint");
+        endpoint
+            .connect(&Ed25519Keypair::generate().peer_id())
+            .expect("start endpoint-local connect");
+
+        // Queued NAT output remains on take_nat_events; wait reports Deadline
+        // rather than a driver-progress wake.
+        assert!(matches!(
+            endpoint.wait(Duration::ZERO).expect("wait"),
+            EndpointWaitOutcome::Deadline
+        ));
+        assert_eq!(endpoint.take_nat_events().len(), 1);
     }
 
     #[test]

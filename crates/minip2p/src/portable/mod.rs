@@ -12,9 +12,22 @@ pub use minip2p_core::{Multiaddr, PeerAddr, PeerId, Protocol, TransportKind};
 pub use minip2p_identity::Ed25519Keypair;
 pub use minip2p_platform::{Deadline as PollDeadline, EntropySource, Now, SharedEntropy};
 pub use minip2p_swarm::{
-    DriverError, IdentifyMessage, SwarmBuilder, SwarmError, SwarmEvent, SwarmRuntime,
+    // Part of `EndpointEvent` / `SwarmEvent` public shapes (`ConnectionClosed`,
+    // `Error`); re-exported so portable callers can name them without a direct
+    // swarm dependency.
+    ConnectionCloseCause,
+    DriverError,
+    IdentifyMessage,
+    SwarmBuilder,
+    SwarmError,
+    SwarmEvent,
+    SwarmRuntime,
+    SwarmRuntimeError,
 };
 pub use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
+
+mod event_stream;
+pub use event_stream::EndpointEvent;
 
 #[cfg(feature = "portable-mdns")]
 pub use minip2p_discovery::{
@@ -67,11 +80,25 @@ impl Endpoint {
 /// [`next_deadline`](Self::next_deadline) to decide how long their platform
 /// loop can idle. Call [`shutdown`](Self::shutdown) to notify peers; there
 /// is no `Drop` disconnect (`into_runtime` moves the runtime out).
+///
+/// # State snapshots
+///
+/// Getter-style snapshots ([`connected_peers`](Self::connected_peers),
+/// [`is_peer_ready`](Self::is_peer_ready), [`peer_info`](Self::peer_info),
+/// [`connection_id`](Self::connection_id),
+/// [`connection_remote_addr`](Self::connection_remote_addr),
+/// [`bound_addresses`](Self::bound_addresses)) do not drive the endpoint.
+/// Separate getters are not one cross-getter atomic snapshot and may be ahead
+/// of the Endpoint event stream (state changes before its corresponding event
+/// is queued).
 pub struct PortableEndpoint<T: Transport, E: EntropySource> {
     runtime: SwarmRuntime<T, E>,
 }
 
 /// Lightweight snapshot of portable endpoint state.
+///
+/// Aggregate counts only. Prefer the individual [State snapshot](PortableEndpoint#state-snapshots)
+/// getters for peer and connection detail.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortableEndpointStats {
     /// Number of peers with an established transport connection.
@@ -79,8 +106,8 @@ pub struct PortableEndpointStats {
     /// Number of connected peers that completed Identify and are ready for
     /// application protocols.
     pub ready_peers: usize,
-    /// Addresses currently exposed by the transport as listening locally.
-    pub listen_addresses: Vec<Multiaddr>,
+    /// Transport-bound local addresses (see [`PortableEndpoint::bound_addresses`]).
+    pub bound_addresses: Vec<Multiaddr>,
 }
 
 impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
@@ -120,18 +147,49 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     }
 
     /// Returns peers with an established transport connection.
+    ///
+    /// See [State snapshots](Self#state-snapshots).
     pub fn connected_peers(&self) -> Vec<PeerId> {
         self.runtime.connected_peers()
     }
 
     /// Returns whether a peer completed Identify and is ready for application protocols.
+    ///
+    /// See [State snapshots](Self#state-snapshots).
     pub fn is_peer_ready(&self, peer_id: &PeerId) -> bool {
         self.runtime.is_peer_ready(peer_id)
     }
 
     /// Returns the latest Identify information received for a peer.
+    ///
+    /// See [State snapshots](Self#state-snapshots).
     pub fn peer_info(&self, peer_id: &PeerId) -> Option<&IdentifyMessage> {
         self.runtime.peer_info(peer_id)
+    }
+
+    /// Returns the active transport connection selected for `peer_id`.
+    ///
+    /// See [State snapshots](Self#state-snapshots).
+    pub fn connection_id(&self, peer_id: &PeerId) -> Option<ConnectionId> {
+        self.runtime.connection_id(peer_id)
+    }
+
+    /// Returns the remote transport address recorded for an exact connection.
+    ///
+    /// See [State snapshots](Self#state-snapshots).
+    pub fn connection_remote_addr(&self, conn_id: ConnectionId) -> Option<&Multiaddr> {
+        self.runtime.connection_remote_addr(conn_id)
+    }
+
+    /// Returns addresses currently bound on the local transport.
+    ///
+    /// These are what the sockets were given, not a signal that
+    /// [`Self::listen`] / [`Self::listen_all`] has started accepting. The set
+    /// can be non-empty before listening begins.
+    ///
+    /// See [State snapshots](Self#state-snapshots).
+    pub fn bound_addresses(&self) -> Vec<Multiaddr> {
+        self.runtime.transport().local_addresses()
     }
 
     /// Sets externally validated addresses to advertise through Identify.
@@ -205,7 +263,11 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
             .abandon_stream(peer_id, stream_id, now.monotonic_ms)
     }
 
-    /// Returns a lightweight state snapshot without driving the endpoint.
+    /// Returns a lightweight aggregate of durable state without driving the endpoint.
+    ///
+    /// Prefer the individual State snapshot getters when you need peer or
+    /// connection detail. Aggregate counts here are not atomic with those getters
+    /// and may be ahead of the Endpoint event stream.
     pub fn stats(&self) -> PortableEndpointStats {
         let connected = self.runtime.connected_peers();
         PortableEndpointStats {
@@ -214,12 +276,14 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
                 .filter(|peer_id| self.runtime.is_peer_ready(peer_id))
                 .count(),
             connected_peers: connected.len(),
-            listen_addresses: self.runtime.transport().local_addresses(),
+            bound_addresses: self.bound_addresses(),
         }
     }
 
     /// Advances transport and protocol state using one host-supplied time sample.
-    pub fn poll(&mut self, now: Now) -> Result<alloc::vec::Vec<SwarmEvent>, DriverError> {
+    ///
+    /// Returned values are [`EndpointEvent`]s from the Endpoint event stream.
+    pub fn poll(&mut self, now: Now) -> Result<alloc::vec::Vec<EndpointEvent>, DriverError> {
         self.runtime.poll(now)
     }
 
@@ -376,7 +440,7 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
         let mut events = Vec::new();
         self.poll_endpoint(now, &mut events)?;
 
-        let local_addrs = self.endpoint.stats().listen_addresses;
+        let local_addrs = self.endpoint.stats().bound_addresses;
         self.mdns.tick(now.monotonic_ms, &local_addrs)?;
         // The mDNS carrier drives the shared interface. That may place TCP
         // bytes into a socket after the transport was serviced above, so run
@@ -838,7 +902,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         let mut output = Vec::new();
         self.poll_swarm(now, &mut output)?;
         if let Some(mdns) = self.mdns.as_mut() {
-            mdns.tick(now.monotonic_ms, &self.endpoint.stats().listen_addresses)?;
+            mdns.tick(now.monotonic_ms, &self.endpoint.stats().bound_addresses)?;
         }
         if self.mdns.is_some() {
             self.poll_swarm(now, &mut output)?;
@@ -951,7 +1015,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             );
             return;
         };
-        beacon.set_local_addrs(&self.endpoint.stats().listen_addresses, now.monotonic_ms);
+        beacon.set_local_addrs(&self.endpoint.stats().bound_addresses, now.monotonic_ms);
         if beacon.next_timeout(now.monotonic_ms) == Some(0) {
             beacon.handle_tick(now.monotonic_ms);
         }
@@ -1870,6 +1934,11 @@ mod tests {
         assert_eq!(a.stats().ready_peers, 1);
         assert_eq!(b.stats().connected_peers, 1);
         assert_eq!(b.stats().ready_peers, 1);
+        assert!(
+            a.connection_id(&b_identity.peer_id()).is_some(),
+            "connection id is visible through the State getter"
+        );
+        assert!(!a.bound_addresses().is_empty());
     }
 
     #[test]
@@ -1900,7 +1969,7 @@ mod tests {
             PortableEndpointStats {
                 connected_peers: 1,
                 ready_peers: 0,
-                listen_addresses: vec![address],
+                bound_addresses: vec![address],
             }
         );
 

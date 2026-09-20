@@ -7,13 +7,14 @@ minip2p remains caller-driven at every layer. The application chooses when to po
 
 ## Pick a driving method
 
-Use focused waits such as `wait_path` and `wait_peer_ready` when you need a particular milestone. Use `next_event` to handle application events, or `next_wake` when your loop also handles capability queues and interruptions. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
+Use `Endpoint::wait` for the ADR 0007 Endpoint wait outcomes (event, deadline, or interrupted). If NAT, pubsub, discovery, or relay-server is enabled, keep using `next_wake` until capability events join the stream (#177) — `wait` does not wake on capability progress. Use focused waits such as `wait_path` and `wait_peer_ready` when you need a particular milestone during migration. Use `next_event` for legacy application loops, or `next_wake` when your loop also handles capability queues and interruptions. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
 
 | Method | Behavior | Good fit |
 | --- | --- | --- |
-| `wait_path` / `wait_peer_ready` / `wait_ping_rtt` | Drive until one milestone, buffering unrelated events. | Connection and setup milestones |
-| Feature-focused waits | Drive until a NAT, pubsub, signed-discovery, or mDNS result. | Feature-specific workflows |
-| `next_event(deadline)` | Drive until one ordinary application event or the deadline. | Synchronous application loops; custom dispatchers; multi-endpoint loops on one thread |
+| `wait(deadline)` | Drive until one Endpoint event, deadline, or interruption. No driver-progress. | New application event loops; correlating an operation while dispatching others |
+| `wait_path` / `wait_peer_ready` / `wait_ping_rtt` | Drive until one milestone, buffering unrelated events. | Connection and setup milestones (migration) |
+| Feature-focused waits | Drive until a NAT, pubsub, signed-discovery, or mDNS result. | Feature-specific workflows (migration) |
+| `next_event(deadline)` | Drive until one ordinary application event or the deadline; swallows interruption. | Legacy synchronous loops |
 | `next_wake(deadline)` | Drive until an application event, optional-capability progress, interruption, or the deadline. | One interruptible loop over ordinary and capability events |
 | `poll()` | One non-blocking drive; returns currently available application events. | Existing game, UI, or reactor loops |
 
@@ -31,7 +32,7 @@ let absolute = Instant::now() + Duration::from_secs(5);
 let forever = Deadline::NEVER;
 ```
 
-An expired deadline still permits the endpoint to inspect events that are already synchronously available, but it will not sleep or poll repeatedly past the deadline.
+An already-passed absolute `Instant` deadline returns `Deadline` from `wait` / `next_wake` (or `None` from `next_event`) before delivering another queued event. Relative `Duration` deadlines — including `Duration::ZERO` non-blocking drains — still inspect buffered events and poll once. The endpoint does not sleep or poll repeatedly past the deadline.
 
 ## Wait for a milestone
 
@@ -54,19 +55,36 @@ With the `nat` feature, prefer `connect*` plus `wait_path` for the first usable 
 
 ## Application event loops
 
-```rust
-use minip2p::{Deadline, Endpoint, Event};
+Prefer `wait` and dispatch unrelated events while correlating an operation (for capability-enabled endpoints, prefer `next_wake` until #177):
 
-fn run(mut node: Endpoint) -> Result<(), minip2p::Error> {
-    while let Some(event) = node.next_event(Deadline::NEVER)? {
-        match event {
-            Event::PeerReady { peer_id, .. } => {
+```rust
+use std::time::{Duration, Instant};
+
+use minip2p::{Endpoint, EndpointEvent, EndpointWaitOutcome};
+
+fn run(mut node: Endpoint, peer: minip2p::PeerId) -> Result<(), minip2p::Error> {
+    // One absolute deadline for the whole correlated wait — recreating a
+    // relative Duration inside the loop would reset the timeout on every
+    // unrelated event or interruption.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match node.wait(deadline)? {
+            EndpointWaitOutcome::Event(EndpointEvent::PeerReady { peer_id, .. })
+                if peer_id == peer =>
+            {
                 println!("ready={peer_id}");
+                break;
             }
-            Event::Error(error) => {
+            EndpointWaitOutcome::Event(EndpointEvent::Error(error)) => {
                 eprintln!("runtime error: {error:?}");
             }
-            _ => {}
+            EndpointWaitOutcome::Event(_) => {
+                // Handle unrelated connection / stream / ping events.
+            }
+            EndpointWaitOutcome::Deadline => break,
+            EndpointWaitOutcome::Interrupted => {
+                // Service external commands, then continue.
+            }
         }
     }
     Ok(())

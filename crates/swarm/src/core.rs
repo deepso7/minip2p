@@ -1998,6 +1998,129 @@ mod tests {
     }
 
     #[test]
+    fn connection_state_updates_before_establishment_event_is_queued() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"state-before-event-peer");
+        let conn_id = ConnectionId::new(91);
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+        );
+
+        // State must reflect the transition before any application drain.
+        assert!(
+            core.connected_peers().contains(&peer_id),
+            "connected_peers reflects the peer before the event is drained"
+        );
+        assert_eq!(core.connection_id(&peer_id), Some(conn_id));
+        // The event is still sitting in the output queue — state was updated
+        // before queueing, so getters are never behind an already-emitted event.
+        assert!(
+            !core.events.is_empty(),
+            "the matching event remains queued after state was updated"
+        );
+        assert!(
+            core.events.front().is_some_and(|event| {
+                matches!(
+                    event,
+                    SwarmEvent::ConnectionEstablished {
+                        peer_id: established,
+                        conn_id: established_conn,
+                    } if *established == peer_id && *established_conn == conn_id
+                )
+            }),
+            "ConnectionEstablished is the queued transition for this state change"
+        );
+    }
+
+    #[test]
+    fn peer_ready_state_updates_before_event_is_queued() {
+        use minip2p_core::encode_frame;
+        use minip2p_identify::IDENTIFY_PROTOCOL_ID;
+
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"ready-before-event-peer");
+        let conn_id = ConnectionId::new(92);
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
+            },
+        );
+
+        // Connected auto-opens identify. Complete the outbound initiator path.
+        let token = drain_actions(&mut core)
+            .into_iter()
+            .find_map(|action| match action {
+                SwarmAction::OpenStream { token, .. } => Some(token),
+                _ => None,
+            })
+            .expect("identify OpenStream after Connected");
+        let stream_id = StreamId::new(1);
+        core.handle_input(SwarmInput::StreamOpened {
+            conn_id,
+            stream_id,
+            token,
+            now_ms: 0,
+        });
+        let _ = drain_actions(&mut core);
+
+        let mut accept = multistream_frame(MULTISTREAM_PROTOCOL_ID);
+        accept.extend_from_slice(&multistream_frame(IDENTIFY_PROTOCOL_ID));
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn_id,
+                stream_id,
+                data: accept,
+            },
+        );
+        let _ = drain_actions(&mut core);
+
+        let info = IdentifyMessage {
+            protocol_version: Some("ipfs/0.1.0".into()),
+            agent_version: Some("test".into()),
+            public_key: None,
+            listen_addrs: Vec::new(),
+            observed_addr: None,
+            protocols: alloc::vec!["/test/1.0.0".into()],
+        };
+        feed(
+            &mut core,
+            TransportEvent::StreamData {
+                id: conn_id,
+                stream_id,
+                data: encode_frame(&info.encode()),
+            },
+        );
+        feed(
+            &mut core,
+            TransportEvent::StreamRemoteWriteClosed {
+                id: conn_id,
+                stream_id,
+            },
+        );
+
+        assert!(
+            core.is_peer_ready(&peer_id),
+            "ready state is set before the event is drained"
+        );
+        assert!(
+            drain_events(&mut core).iter().any(|event| {
+                matches!(
+                    event,
+                    SwarmEvent::PeerReady { peer_id: ready, .. } if *ready == peer_id
+                )
+            }),
+            "PeerReady is queued after ready state was updated"
+        );
+    }
+
+    #[test]
     fn outbound_not_available_error_preserves_stream_id() {
         let mut core = test_core();
         let peer = PeerId::from_public_key_protobuf(b"unsupported-peer");
