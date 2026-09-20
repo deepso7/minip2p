@@ -553,7 +553,7 @@ fn connect_and_reservation_racing_in_one_tick_share_one_dial() {
 
     // Whatever internal order the machines run in, only one dial may reach
     // the relay.
-    hk.agent.connect(peer(b"target-peer"), Vec::new(), at(0));
+    start(&mut hk.agent, 1, peer(b"target-peer"), RELAY_NOW, at(0));
     hk.agent.handle_tick(at(250));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(
@@ -795,7 +795,7 @@ fn concurrent_reservation_and_connect_share_one_relay_dial() {
 
     // A connect starts while that dial is still handshaking; its relay leg
     // must wait on the pending connection instead of dialing again.
-    let _id = hk.agent.connect(peer(b"target-peer"), Vec::new(), at(10));
+    let _id = start(&mut hk.agent, 1, peer(b"target-peer"), RELAY_NOW, at(10));
     hk.agent.handle_tick(at(300));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(
@@ -847,8 +847,7 @@ fn pending_probe_dial_covers_the_probe_deadline_not_the_relay_legs() {
     // A connect starts past the relay-leg deadline but inside the probe
     // deadline: the probe's dial is still in flight, so the relay leg must
     // join it rather than open a superseding second connection.
-    hk.agent
-        .connect(peer(b"target-peer"), Vec::new(), at(15_000));
+    start(&mut hk.agent, 1, peer(b"target-peer"), RELAY_NOW, at(15_000));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(
         dial_count_for(&actions, &relay),
@@ -873,7 +872,7 @@ fn waiting_attempt_redials_when_the_shared_dial_fails() {
     let reserve_dial = dial_token_for(&actions, &relay);
 
     // A connect attempt joins the pending dial.
-    hk.agent.connect(peer(b"target-peer"), Vec::new(), at(10));
+    start(&mut hk.agent, 1, peer(b"target-peer"), RELAY_NOW, at(10));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(dial_count_for(&actions, &relay), 0, "{actions:?}");
 
@@ -932,8 +931,7 @@ fn waiting_attempt_redials_when_the_shared_dial_expires() {
     assert_eq!(dial_count_for(&actions, &relay), 1, "{actions:?}");
 
     // A connect joins the pending dial mid-flight.
-    hk.agent
-        .connect(peer(b"target-peer"), Vec::new(), at(15_000));
+    start(&mut hk.agent, 1, peer(b"target-peer"), RELAY_NOW, at(15_000));
     let actions = drain_actions(&mut hk.agent);
     assert_eq!(dial_count_for(&actions, &relay), 0, "{actions:?}");
 
@@ -961,7 +959,7 @@ fn late_shared_dial_failure_does_not_redial_a_dead_leg() {
     let actions = drain_actions(&mut hk.agent);
     let reserve_dial = dial_token_for(&actions, &relay);
 
-    hk.agent.connect(peer(b"target-peer"), Vec::new(), at(10));
+    start(&mut hk.agent, 1, peer(b"target-peer"), RELAY_NOW, at(10));
     drain_actions(&mut hk.agent);
 
     // The failure lands past the attempt's relay-leg deadline (10 + 12s).

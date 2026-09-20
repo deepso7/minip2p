@@ -42,8 +42,6 @@ pub(crate) enum StreamRole {
 /// What a pending `Dial` / `OpenStream` token was issued for.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TokenPurpose {
-    /// Dial of a caller-supplied direct candidate.
-    DirectDial(ConnectId),
     /// Dial of the relay itself (to start a relay leg).
     RelayDial(ConnectId),
     /// Simultaneous-open dial of a DCUtR observed address.
@@ -70,8 +68,7 @@ pub(crate) enum TokenPurpose {
 impl TokenPurpose {
     fn connect_id(&self) -> Option<ConnectId> {
         match self {
-            Self::DirectDial(id)
-            | Self::RelayDial(id)
+            Self::RelayDial(id)
             | Self::PunchDial(id)
             | Self::OpenHop(id, _)
             | Self::PromoteAttempt(id) => Some(*id),
@@ -294,6 +291,21 @@ impl Shared {
     }
 }
 
+/// Facts about a Connection attempt the relay leg needs.
+///
+/// Policy (relays, stagger, `force_relay`) stays in [`NatConfig`]. The caller
+/// owns direct candidate dials; the leg learns about them through
+/// [`SwarmEvent::ConnectionEstablished`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectLegs {
+    /// The caller is racing direct candidates; give them
+    /// [`NatConfig::relay_stagger_ms`] head start.
+    pub direct_racing: bool,
+    /// Whether this attempt may use a configured relay (false for mDNS-sourced
+    /// dials).
+    pub allow_relay: bool,
+}
+
 /// Sans-I/O NAT-traversal orchestrator.
 ///
 /// Inputs arrive through [`handle_event`](Self::handle_event) (swarm events,
@@ -318,7 +330,6 @@ pub struct NatAgent {
     /// reconciled only if a second tick arrives without the replacement.
     pending_peer_disconnects: BTreeSet<PeerId>,
     reconcile_peer_disconnects: BTreeSet<PeerId>,
-    next_connect_id: u64,
     next_inbound_id: u64,
 }
 
@@ -349,63 +360,42 @@ impl NatAgent {
             inbound: BTreeMap::new(),
             pending_peer_disconnects: BTreeSet::new(),
             reconcile_peer_disconnects: BTreeSet::new(),
-            next_connect_id: 0,
             next_inbound_id: 0,
         }
     }
 
-    /// Starts a connect attempt toward `peer`.
+    /// Registers Connection attempt `id` (allocated by the caller) toward
+    /// `peer` and starts its relay leg per `legs`. The caller owns direct
+    /// candidate dials; the leg learns about them through
+    /// [`SwarmEvent::ConnectionEstablished`].
     ///
-    /// `direct_addrs` are candidate transport addresses for the peer (from
-    /// discovery, config, or out-of-band exchange); they are validated and
-    /// deduplicated with the same policy as
-    /// [`minip2p_core::select_direct_addrs`]. The relay leg uses the
-    /// first configured relay in [`NatConfig::relays`].
-    pub fn connect(&mut self, peer: PeerId, direct_addrs: Vec<Multiaddr>, now: Now) -> ConnectId {
-        self.connect_with_relay_policy(peer, direct_addrs, true, now)
-    }
-
-    /// Starts a direct-only connect attempt toward `peer`.
-    ///
-    /// Candidates are validated identically to [`NatAgent::connect`], but
-    /// configured relays are never dialed and no HOP CONNECT is attempted.
-    /// This is suitable for unauthenticated discovery hints whose authority
-    /// must not extend to relay use.
-    pub fn connect_direct(
-        &mut self,
-        peer: PeerId,
-        direct_addrs: Vec<Multiaddr>,
-        now: Now,
-    ) -> ConnectId {
-        self.connect_with_relay_policy(peer, direct_addrs, false, now)
-    }
-
-    fn connect_with_relay_policy(
-        &mut self,
-        peer: PeerId,
-        direct_addrs: Vec<Multiaddr>,
-        allow_relay: bool,
-        now: Now,
-    ) -> ConnectId {
-        let id = ConnectId::from_u64(self.next_connect_id);
-        self.next_connect_id += 1;
-        // A connection that is already identity-verified is the best path
-        // available. Do not manufacture a new race which can only waste
-        // work (and, with no candidates or relay, falsely report failure).
-        if self.shared.is_directly_connected(&peer) {
-            self.shared.push_event(NatEvent::PathEstablished {
-                connect_id: id,
-                peer,
-                path: crate::types::Path::DirectDialed,
-            });
-            return id;
+    /// With `allow_relay = false` or no relay configured the attempt has an
+    /// inactive relay leg and only tracks the peer's direct establishment so
+    /// [`NatEvent::PathEstablished`] `{ DirectDialed }` and path snapshots
+    /// keep working. It ends when the caller cancels it or a direct
+    /// connection to the peer establishes.
+    pub fn connect(&mut self, id: ConnectId, peer: PeerId, legs: ConnectLegs, now: Now) {
+        if self.attempts.contains_key(&id) {
+            return;
         }
-        if let Some(attempt) =
-            ConnectAttempt::start(id, peer, direct_addrs, allow_relay, &mut self.shared, now)
-        {
+        if let Some(attempt) = ConnectAttempt::start(id, peer, legs, &mut self.shared, now) {
             self.attempts.insert(id, attempt);
         }
-        id
+    }
+
+    /// Whether any relay is configured.
+    pub fn has_relay(&self) -> bool {
+        !self.shared.config.relays.is_empty()
+    }
+
+    /// Whether connects skip direct racing and DCUtR.
+    pub fn force_relay(&self) -> bool {
+        self.shared.config.force_relay
+    }
+
+    /// Current NAT configuration.
+    pub fn config(&self) -> &NatConfig {
+        &self.shared.config
     }
 
     /// Abandons a connect attempt, resetting any streams it holds. No

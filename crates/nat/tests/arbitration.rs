@@ -11,20 +11,11 @@ use minip2p_relay::{HOP_PROTOCOL_ID, Status};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};
 
-/// Drives a fresh connect attempt (with one direct candidate) through the
-/// relay leg up to `Bridged`: direct dial at t0, stagger, relay dial, HOP
-/// open/negotiate/CONNECT, STATUS:OK at t0+300.
-///
-/// Leaves the DCUtR CONNECT send action queued for the caller to drain. The
-/// relay stream remains agent-owned until DCUtR has sent SYNC.
+/// Drives a fresh connect attempt through the relay leg up to `Bridged`:
+/// stagger, relay dial, HOP open/negotiate/CONNECT, STATUS:OK at t0+300.
 fn drive_to_bridged(h: &mut Harness, t0: u64) -> (ConnectId, StreamId) {
-    let id = h
-        .agent
-        .connect(h.target.clone(), vec![maddr(TARGET_ADDR)], at(t0));
-    let actions = drain_actions(&mut h.agent);
-    let direct_token = dial_token_for(&actions, &h.target);
-    h.agent
-        .dial_result(direct_token, Ok(ConnectionId::new(1)), at(t0 + 5));
+    let id = h.start(RACE, at(t0));
+    drain_actions(&mut h.agent);
 
     h.agent.handle_tick(at(t0 + 200));
     let actions = drain_actions(&mut h.agent);
@@ -78,18 +69,15 @@ fn advertised_dcutr_addrs(h: &mut Harness, t0: u64) -> Vec<Multiaddr> {
 }
 
 #[test]
-fn direct_win_before_stagger_never_touches_the_relay() {
+fn direct_established_before_stagger_never_touches_the_relay() {
     let mut h = Harness::with_relay(NatConfig::default());
-    let id = h
-        .agent
-        .connect(h.target.clone(), vec![maddr(TARGET_ADDR)], at(0));
+    let id = h.start(RACE, at(0));
 
     let actions = drain_actions(&mut h.agent);
-    let token = dial_token_for(&actions, &h.target);
+    assert_eq!(dial_count_for(&actions, &h.target), 0);
     assert_eq!(dial_count_for(&actions, &h.relay), 0);
     assert!(!has_hop_open(&actions));
 
-    h.agent.dial_result(token, Ok(ConnectionId::new(1)), at(10));
     h.target_connected(at(50));
 
     let events = drain_events(&mut h.agent);
@@ -98,7 +86,6 @@ fn direct_win_before_stagger_never_touches_the_relay() {
         [NatEvent::PathEstablished { connect_id, path: Path::DirectDialed, .. }] if *connect_id == id
     ));
 
-    // Ticking far past the stagger must not wake a relay leg.
     h.agent.handle_tick(at(1_000));
     let actions = drain_actions(&mut h.agent);
     assert!(
@@ -112,10 +99,9 @@ fn direct_win_before_stagger_never_touches_the_relay() {
 #[test]
 fn stagger_delays_the_relay_leg() {
     let mut h = Harness::with_relay(NatConfig::default());
-    h.agent
-        .connect(h.target.clone(), vec![maddr(TARGET_ADDR)], at(0));
+    h.start(RACE, at(0));
     let actions = drain_actions(&mut h.agent);
-    assert_eq!(dial_count_for(&actions, &h.target), 1);
+    assert_eq!(dial_count_for(&actions, &h.target), 0);
     assert_eq!(dial_count_for(&actions, &h.relay), 0);
 
     // The stagger is the earliest pending deadline.
@@ -135,10 +121,9 @@ fn zero_stagger_races_both_legs_in_parallel() {
         relay_stagger_ms: 0,
         ..NatConfig::default()
     });
-    h.agent
-        .connect(h.target.clone(), vec![maddr(TARGET_ADDR)], at(0));
+    h.start(RACE, at(0));
     let actions = drain_actions(&mut h.agent);
-    assert_eq!(dial_count_for(&actions, &h.target), 1);
+    assert_eq!(dial_count_for(&actions, &h.target), 0);
     assert_eq!(dial_count_for(&actions, &h.relay), 1);
 }
 
@@ -148,9 +133,7 @@ fn force_relay_skips_direct_dials_and_dcutr() {
         force_relay: true,
         ..NatConfig::default()
     });
-    let id = h
-        .agent
-        .connect(h.target.clone(), vec![maddr(TARGET_ADDR)], at(0));
+    let id = h.start(RACE, at(0));
     let actions = drain_actions(&mut h.agent);
     assert_eq!(dial_count_for(&actions, &h.target), 0);
     assert_eq!(dial_count_for(&actions, &h.relay), 1);
@@ -266,8 +249,7 @@ fn force_relay_preserves_bytes_coalesced_behind_hop_success() {
         force_relay: true,
         ..NatConfig::default()
     });
-    h.agent
-        .connect(h.target.clone(), vec![maddr(TARGET_ADDR)], at(0));
+    h.start(RACE, at(0));
     let actions = drain_actions(&mut h.agent);
     let relay_token = dial_token_for(&actions, &h.relay);
     h.agent
@@ -292,7 +274,7 @@ fn force_relay_preserves_bytes_coalesced_behind_hop_success() {
 #[test]
 fn default_connect_preserves_noise_bytes_coalesced_behind_hop_success() {
     let mut h = Harness::with_relay(NatConfig::default());
-    h.agent.connect(h.target.clone(), Vec::new(), at(0));
+    h.start(RELAY_NOW, at(0));
     let actions = drain_actions(&mut h.agent);
     let relay_token = dial_token_for(&actions, &h.relay);
     h.agent
@@ -316,28 +298,13 @@ fn default_connect_preserves_noise_bytes_coalesced_behind_hop_success() {
 #[test]
 fn no_direct_candidates_skip_the_stagger() {
     let mut h = Harness::with_relay(NatConfig::default());
-    h.agent.connect(h.target.clone(), Vec::new(), at(0));
+    h.start(RELAY_NOW, at(0));
     let actions = drain_actions(&mut h.agent);
     assert_eq!(
         dial_count_for(&actions, &h.relay),
         1,
         "relay leg starts immediately when there is nothing to stagger against"
     );
-}
-
-#[test]
-fn already_connected_peer_is_reported_without_starting_a_race() {
-    let mut h = Harness::without_relay(NatConfig::default());
-    h.target_connected(at(0));
-    let id = h.agent.connect(h.target.clone(), Vec::new(), at(1));
-
-    assert!(matches!(
-        drain_events(&mut h.agent).as_slice(),
-        [NatEvent::PathEstablished { connect_id, peer, path: Path::DirectDialed }]
-            if *connect_id == id && *peer == h.target
-    ));
-    assert!(drain_actions(&mut h.agent).is_empty());
-    assert!(h.agent.is_idle());
 }
 
 #[test]
@@ -396,7 +363,7 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
 #[test]
 fn relay_supersede_does_not_abort_waiting_for_peer_ready() {
     let mut h = Harness::with_relay(NatConfig::default());
-    h.agent.connect(h.target.clone(), Vec::new(), at(0));
+    h.start(RELAY_NOW, at(0));
     drain_actions(&mut h.agent); // relay dial
 
     h.agent.handle_event(
@@ -439,7 +406,7 @@ fn relay_supersede_does_not_abort_waiting_for_peer_ready() {
 #[test]
 fn relay_supersede_does_not_abort_an_open_hop_request() {
     let mut h = Harness::with_relay(NatConfig::default());
-    h.agent.connect(h.target.clone(), Vec::new(), at(0));
+    h.start(RELAY_NOW, at(0));
     drain_actions(&mut h.agent); // relay dial
     h.relay_session_ready(at(10));
     let open = drain_actions(&mut h.agent);
@@ -495,16 +462,10 @@ fn bridge_close_before_dcutr_finishes_waits_for_live_direct_dials() {
 }
 
 #[test]
-fn all_legs_failing_reports_connect_failed() {
+fn relay_leg_failing_reports_connect_failed() {
     let mut h = Harness::with_relay(NatConfig::default());
-    h.agent
-        .connect(h.target.clone(), vec![maddr(TARGET_ADDR)], at(0));
-    let actions = drain_actions(&mut h.agent);
-    let direct_token = dial_token_for(&actions, &h.target);
-
-    // Direct dial rejected synchronously; the relay leg is still pending.
-    h.agent
-        .dial_result(direct_token, Err("connection refused".into()), at(10));
+    h.start(RACE, at(0));
+    assert!(drain_actions(&mut h.agent).is_empty());
     assert!(drain_events(&mut h.agent).is_empty());
 
     h.agent.handle_tick(at(200));
@@ -527,7 +488,7 @@ fn all_legs_failing_reports_connect_failed() {
 #[test]
 fn malformed_hop_response_fails_with_protocol_error() {
     let mut h = Harness::with_relay(NatConfig::default());
-    h.agent.connect(h.target.clone(), Vec::new(), at(0));
+    h.start(RELAY_NOW, at(0));
     let actions = drain_actions(&mut h.agent);
     let relay_token = dial_token_for(&actions, &h.relay);
     h.agent
@@ -564,7 +525,7 @@ fn malformed_hop_response_fails_with_protocol_error() {
 #[test]
 fn relay_refusal_fails_when_no_direct_leg_remains() {
     let mut h = Harness::with_relay(NatConfig::default());
-    h.agent.connect(h.target.clone(), Vec::new(), at(0));
+    h.start(RELAY_NOW, at(0));
     let actions = drain_actions(&mut h.agent);
     let relay_token = dial_token_for(&actions, &h.relay);
     h.agent
@@ -598,8 +559,7 @@ fn relay_refusal_fails_when_no_direct_leg_remains() {
 #[test]
 fn duplicate_direct_connection_does_not_double_report() {
     let mut h = Harness::with_relay(NatConfig::default());
-    h.agent
-        .connect(h.target.clone(), vec![maddr(TARGET_ADDR)], at(0));
+    h.start(RACE, at(0));
     drain_actions(&mut h.agent);
     h.target_connected(at(50));
     assert_eq!(drain_events(&mut h.agent).len(), 1);
@@ -613,7 +573,7 @@ fn duplicate_direct_connection_does_not_double_report() {
 #[test]
 fn relay_leg_deadline_fails_a_stalled_leg() {
     let mut h = Harness::with_relay(NatConfig::default());
-    h.agent.connect(h.target.clone(), Vec::new(), at(0));
+    h.start(RELAY_NOW, at(0));
     let actions = drain_actions(&mut h.agent);
     assert_eq!(dial_count_for(&actions, &h.relay), 1);
 
@@ -633,95 +593,33 @@ fn relay_leg_deadline_fails_a_stalled_leg() {
 }
 
 #[test]
-fn connect_deadline_fails_an_attempt_with_no_path() {
-    let mut h = Harness::without_relay(NatConfig::default());
-    h.agent
-        .connect(h.target.clone(), vec![maddr(TARGET_ADDR)], at(0));
-    let actions = drain_actions(&mut h.agent);
-    let token = dial_token_for(&actions, &h.target);
-    // The dial is accepted but the handshake never completes.
-    h.agent.dial_result(token, Ok(ConnectionId::new(1)), at(5));
+fn allow_relay_false_never_arms_a_configured_relay() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    h.start(NO_RELAY, at(0));
 
-    h.agent.handle_tick(at(59_999));
+    assert!(drain_actions(&mut h.agent).is_empty());
     assert!(drain_events(&mut h.agent).is_empty());
-    h.agent.handle_tick(at(60_000));
-    let events = drain_events(&mut h.agent);
-    assert!(matches!(
-        events.as_slice(),
-        [NatEvent::ConnectFailed {
-            error: NatError::Timeout,
-            ..
-        }]
-    ));
-    assert!(h.agent.is_idle());
-}
-
-#[test]
-fn no_candidates_and_no_relay_fails_immediately() {
-    let mut h = Harness::without_relay(NatConfig::default());
-    let id = h.agent.connect(h.target.clone(), Vec::new(), at(0));
-    let events = drain_events(&mut h.agent);
-    assert!(matches!(
-        events.as_slice(),
-        [NatEvent::ConnectFailed { connect_id, error: NatError::NoPathAvailable, .. }]
-            if *connect_id == id
-    ));
-    assert!(h.agent.is_idle());
-}
-
-#[test]
-fn direct_only_connect_never_arms_a_configured_relay() {
-    let mut h = Harness::with_relay(NatConfig::default());
-    let id = h.agent.connect_direct(h.target.clone(), Vec::new(), at(0));
-
-    assert!(drain_actions(&mut h.agent).is_empty());
-    assert!(matches!(
-        drain_events(&mut h.agent).as_slice(),
-        [NatEvent::ConnectFailed {
-            connect_id,
-            error: NatError::NoPathAvailable,
-            ..
-        }] if *connect_id == id
-    ));
-    h.agent.handle_tick(at(1_000));
-    assert!(drain_actions(&mut h.agent).is_empty());
-    assert!(h.agent.is_idle());
-}
-
-#[test]
-fn direct_only_connect_dials_candidates_without_relay_fallback() {
-    let mut h = Harness::with_relay(NatConfig::default());
-    h.agent
-        .connect_direct(h.target.clone(), vec![maddr(TARGET_ADDR)], at(0));
-    let actions = drain_actions(&mut h.agent);
-    assert_eq!(dial_count_for(&actions, &h.target), 1);
-    assert_eq!(dial_count_for(&actions, &h.relay), 0);
-
     h.agent.handle_tick(at(1_000));
     let actions = drain_actions(&mut h.agent);
     assert_eq!(dial_count_for(&actions, &h.relay), 0);
     assert!(!has_hop_open(&actions));
+    assert!(drain_events(&mut h.agent).is_empty());
 }
 
 #[test]
-fn wildcard_and_non_quic_candidates_are_filtered() {
-    let mut h = Harness::without_relay(NatConfig::default());
-    h.agent.connect(
-        h.target.clone(),
-        vec![
-            maddr("/ip4/0.0.0.0/udp/4001/quic-v1"),
-            maddr("/ip4/192.0.2.10/udp/4001"),
-            maddr(TARGET_ADDR),
-            maddr(TARGET_ADDR),
-        ],
-        at(0),
-    );
-    let actions = drain_actions(&mut h.agent);
-    assert_eq!(
-        dial_count_for(&actions, &h.target),
-        1,
-        "wildcards, non-QUIC shapes, and duplicates never get dialed"
-    );
+fn inactive_leg_reports_direct_established() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let id = h.start(NO_RELAY, at(0));
+    h.target_connected(at(10));
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::PathEstablished {
+            connect_id,
+            path: Path::DirectDialed,
+            ..
+        }] if *connect_id == id
+    ));
+    assert!(h.agent.is_idle());
 }
 
 #[test]
@@ -924,7 +822,7 @@ fn dial_failed(conn_id: ConnectionId, addr: PeerAddr, reason: &str) -> SwarmEven
 #[test]
 fn relay_session_dial_failed_event_fails_the_leg_immediately() {
     let mut h = Harness::with_relay(NatConfig::default());
-    h.agent.connect(h.target.clone(), Vec::new(), at(0));
+    h.start(RELAY_NOW, at(0));
     let actions = drain_actions(&mut h.agent);
     let relay_token = dial_token_for(&actions, &h.relay);
     let conn_id = ConnectionId::new(2);
@@ -947,11 +845,11 @@ fn relay_session_dial_failed_event_fails_the_leg_immediately() {
 #[test]
 fn waiting_connect_redials_when_the_shared_relay_dial_fails() {
     let mut h = Harness::with_relay(NatConfig::default());
-    h.agent.connect(h.target.clone(), Vec::new(), at(0));
+    h.start(RELAY_NOW, at(0));
     let actions = drain_actions(&mut h.agent);
     let relay_token = dial_token_for(&actions, &h.relay);
     let other = peer(b"other-target");
-    h.agent.connect(other, Vec::new(), at(1));
+    h.start_peer(other, RELAY_NOW, at(1));
     assert_eq!(
         dial_count_for(&drain_actions(&mut h.agent), &h.relay),
         0,
