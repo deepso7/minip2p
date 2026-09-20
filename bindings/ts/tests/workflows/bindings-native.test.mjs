@@ -10,10 +10,9 @@ const workflowPath = new URL(
 );
 const packageJsonPath = new URL("../../../../package.json", import.meta.url);
 const workflow = parse(await readFile(workflowPath, "utf-8"));
-const packageManager = JSON.parse(
-  await readFile(packageJsonPath, "utf-8")
-).packageManager;
-const pnpmVersion = packageManager?.match(/^pnpm@([^+]+)/u)?.[1];
+const { packageManager } = JSON.parse(await readFile(packageJsonPath, "utf-8"));
+const pnpmVersion = packageManager?.match(/^pnpm@(?<version>[^+]+)/u)?.groups
+  ?.version;
 assert.ok(pnpmVersion, `expected packageManager pnpm@…, got ${packageManager}`);
 
 test("native workflow runs weekly and on manual dispatch", () => {
@@ -75,7 +74,10 @@ test("weekly workflow executes the suite on native runners and musl containers",
   assert.match(muslBuild, /PATH=\/opt\/pnpm\/bin:\/usr\/bin:/u);
   assert.match(
     muslBuild,
-    new RegExp(`--prefix /opt/pnpm pnpm@${pnpmVersion.replaceAll(".", "\\.")}`, "u")
+    new RegExp(
+      `--prefix /opt/pnpm pnpm@${pnpmVersion.replaceAll(".", "\\.")}`,
+      "u"
+    )
   );
   assert.match(
     muslBuild,
