@@ -29,9 +29,6 @@ type Endpoint<D, E> = PortableEndpoint<SmoltcpComposedTransport<D, E>, SharedEnt
 pub(crate) struct PortableNatDriver {
     pub(crate) agent: NatAgent,
     pub(crate) events: VecDeque<NatEvent>,
-    /// Connection ids this driver dialed; matching [`SwarmEvent::DialFailed`]
-    /// is swallowed so NAT internals stay off the Endpoint stream until #176.
-    nat_dials: BTreeSet<ConnectionId>,
     #[cfg(feature = "portable-relay")]
     relay_addrs: Vec<(PeerId, Multiaddr)>,
     #[cfg(feature = "portable-relay")]
@@ -50,7 +47,6 @@ impl PortableNatDriver {
         Self {
             agent,
             events: VecDeque::new(),
-            nat_dials: BTreeSet::new(),
             #[cfg(feature = "portable-relay")]
             relay_addrs,
             #[cfg(feature = "portable-relay")]
@@ -104,15 +100,6 @@ impl PortableNatDriver {
         if self.inject_straggler(event, endpoint) {
             self.pump(endpoint, now);
             return true;
-        }
-        if let SwarmEvent::DialFailed { conn_id, .. } = event
-            && self.nat_dials.remove(conn_id)
-        {
-            self.pump(endpoint, now);
-            return true;
-        }
-        if let SwarmEvent::ConnectionEstablished { conn_id, .. } = event {
-            self.nat_dials.remove(conn_id);
         }
         let is_circuit = match event {
             SwarmEvent::ConnectionEstablished { conn_id, .. }
@@ -212,9 +199,6 @@ impl PortableNatDriver {
         match action {
             NatAction::Dial { token, addr } => {
                 let result = endpoint.dial(&addr).map_err(|error| error.to_string());
-                if let Ok(conn_id) = result {
-                    self.nat_dials.insert(conn_id);
-                }
                 self.agent.dial_result(token, result, nat_now);
             }
             NatAction::OpenStream {

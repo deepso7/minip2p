@@ -4,7 +4,7 @@ mod common;
 
 use common::*;
 
-use minip2p_core::{ConnectId, Multiaddr};
+use minip2p_core::{ConnectId, Multiaddr, PeerAddr};
 use minip2p_nat::{NatAction, NatConfig, NatEvent, Path, PromoteError};
 use minip2p_relay::Status;
 use minip2p_swarm::SwarmEvent;
@@ -144,6 +144,56 @@ fn circuit_dialer_filters_peer_supplied_punch_targets() {
         })
         .collect();
     assert_eq!(dials, vec![global]);
+}
+
+#[test]
+fn punch_dial_failed_event_does_not_emit_connect_failed() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (_, conn) = drive_to_relayed(&mut h);
+    let stream = StreamId::new(90);
+    open_inbound_dcutr(&mut h, conn, stream);
+    let punch = maddr("/ip4/9.9.9.9/udp/4002/quic-v1");
+    h.agent.handle_event(
+        &SwarmEvent::StreamData {
+            conn_id: conn,
+            peer_id: h.target.clone(),
+            stream_id: stream,
+            data: dcutr_connect_reply(&[punch.clone()]),
+        },
+        at(311),
+    );
+    drain_actions(&mut h.agent);
+    h.agent.handle_event(
+        &SwarmEvent::StreamData {
+            conn_id: conn,
+            peer_id: h.target.clone(),
+            stream_id: stream,
+            data: dcutr_sync(),
+        },
+        at(312),
+    );
+    let actions = drain_actions(&mut h.agent);
+    let punch_token = dial_token_for(&actions, &h.target);
+    let punch_conn = ConnectionId::new(44);
+    h.agent.dial_result(punch_token, Ok(punch_conn), at(313));
+    drain_events(&mut h.agent);
+
+    let punch_addr = PeerAddr::new(punch, h.target.clone()).expect("punch addr");
+    assert!(h.agent.handle_event_with_disposition(
+        &SwarmEvent::DialFailed {
+            conn_id: punch_conn,
+            addr: punch_addr,
+            reason: "punch refused".into(),
+        },
+        at(314),
+    ));
+    let events = drain_events(&mut h.agent);
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, NatEvent::ConnectFailed { .. })),
+        "punch DialFailed is governed by the window; got {events:?}"
+    );
 }
 
 #[test]

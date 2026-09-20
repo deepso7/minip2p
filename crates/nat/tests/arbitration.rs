@@ -912,3 +912,73 @@ fn non_quic_observed_addr_is_ignored() {
         "only the validated bound address may be advertised"
     );
 }
+
+fn dial_failed(conn_id: ConnectionId, addr: PeerAddr, reason: &str) -> SwarmEvent {
+    SwarmEvent::DialFailed {
+        conn_id,
+        addr,
+        reason: reason.into(),
+    }
+}
+
+#[test]
+fn relay_session_dial_failed_event_fails_the_leg_immediately() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    h.agent.connect(h.target.clone(), Vec::new(), at(0));
+    let actions = drain_actions(&mut h.agent);
+    let relay_token = dial_token_for(&actions, &h.relay);
+    let conn_id = ConnectionId::new(2);
+    h.agent.dial_result(relay_token, Ok(conn_id), at(5));
+
+    let handled = h.agent.handle_event_with_disposition(
+        &dial_failed(conn_id, h.relay_addr.clone(), "relay unreachable"),
+        at(6),
+    );
+    assert!(handled, "owned DialFailed must be consumed");
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [NatEvent::ConnectFailed {
+            error: NatError::DialFailed(reason),
+            ..
+        }] if reason == "relay unreachable"
+    ));
+}
+
+#[test]
+fn waiting_connect_redials_when_the_shared_relay_dial_fails() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    h.agent.connect(h.target.clone(), Vec::new(), at(0));
+    let actions = drain_actions(&mut h.agent);
+    let relay_token = dial_token_for(&actions, &h.relay);
+    let other = peer(b"other-target");
+    h.agent.connect(other, Vec::new(), at(1));
+    assert_eq!(
+        dial_count_for(&drain_actions(&mut h.agent), &h.relay),
+        0,
+        "second attempt waits on the in-flight relay dial"
+    );
+
+    let conn_id = ConnectionId::new(2);
+    h.agent.dial_result(relay_token, Ok(conn_id), at(5));
+    assert!(h.agent.handle_event_with_disposition(
+        &dial_failed(conn_id, h.relay_addr.clone(), "relay unreachable"),
+        at(6),
+    ));
+    drain_events(&mut h.agent);
+    assert_eq!(
+        dial_count_for(&drain_actions(&mut h.agent), &h.relay),
+        1,
+        "the waiting attempt must issue its own dial"
+    );
+}
+
+#[test]
+fn foreign_dial_failed_is_not_handled() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let handled = h.agent.handle_event_with_disposition(
+        &dial_failed(ConnectionId::new(99), h.relay_addr.clone(), "foreign"),
+        at(0),
+    );
+    assert!(!handled);
+    assert!(drain_events(&mut h.agent).is_empty());
+}

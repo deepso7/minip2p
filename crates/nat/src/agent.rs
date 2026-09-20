@@ -128,6 +128,9 @@ pub(crate) struct Shared {
     /// peer and an expiry (`mono_ms`) so a handshake that never completes
     /// cannot suppress dialing forever.
     pending_session_dials: BTreeMap<NatToken, (PeerId, u64)>,
+    /// Successful `dial_result` conn ids still awaiting establish or
+    /// [`SwarmEvent::DialFailed`].
+    dialed: BTreeMap<ConnectionId, (NatToken, TokenPurpose)>,
 }
 
 impl Shared {
@@ -339,6 +342,7 @@ impl NatAgent {
                 listen_addrs: Vec::new(),
                 observed_addrs: BTreeMap::new(),
                 pending_session_dials: BTreeMap::new(),
+                dialed: BTreeMap::new(),
             },
             attempts: BTreeMap::new(),
             housekeeping,
@@ -446,6 +450,7 @@ impl NatAgent {
                 touched_state = true;
                 self.pending_peer_disconnects.remove(peer_id);
                 self.reconcile_peer_disconnects.remove(peer_id);
+                self.shared.dialed.remove(conn_id);
                 // Any session dial toward this peer has done its job (ours
                 // landed, or another machine's did — either way the peer is
                 // reachable now and further dials would supersede).
@@ -483,6 +488,7 @@ impl NatAgent {
                 peer_id, conn_id, ..
             } => {
                 touched_state = true;
+                self.shared.dialed.remove(conn_id);
                 self.shared.direct_connections.remove(conn_id);
                 let mut peer_disconnected = false;
                 if let Some(ids) = self.shared.connected.get_mut(peer_id) {
@@ -671,6 +677,15 @@ impl NatAgent {
                 }
                 touched_state = handled;
             }
+            SwarmEvent::DialFailed {
+                conn_id, reason, ..
+            } => {
+                if let Some((token, purpose)) = self.shared.dialed.remove(conn_id) {
+                    handled = true;
+                    touched_state = true;
+                    self.finish_dial_failure(token, purpose, reason.clone(), now);
+                }
+            }
             _ => {}
         }
         // Foreign application stream events stop after their single registry
@@ -713,20 +728,16 @@ impl NatAgent {
         let Some(purpose) = self.shared.tokens.remove(&token) else {
             return;
         };
-        if result.is_err()
-            && let Some((peer, _)) = self.shared.pending_session_dials.remove(&token)
-        {
-            // A rejected session dial is no longer in flight. Attempts that
-            // were sharing it must issue their own dial now: nothing else
-            // re-enters a waiting relay leg, so they would otherwise burn
-            // their leg deadline on a dial that already failed. The owner
-            // learns through its own routing below, and housekeeping
-            // waiters fall back to their acquire/probe deadlines.
-            let owner = purpose.connect_id();
-            for (id, attempt) in self.attempts.iter_mut() {
-                if owner.as_ref() != Some(id) {
-                    attempt.on_session_dial_failed(&peer, &mut self.shared, now);
-                }
+        match &result {
+            Ok(conn_id) => {
+                self.shared
+                    .dialed
+                    .insert(*conn_id, (token, purpose.clone()));
+            }
+            Err(reason) => {
+                self.finish_dial_failure(token, purpose, reason.clone(), now);
+                self.reap_done();
+                return;
             }
         }
         match &purpose {
@@ -747,6 +758,46 @@ impl NatAgent {
             }
         }
         self.reap_done();
+    }
+
+    fn finish_dial_failure(
+        &mut self,
+        token: NatToken,
+        purpose: TokenPurpose,
+        reason: String,
+        now: Now,
+    ) {
+        if let Some((peer, _)) = self.shared.pending_session_dials.remove(&token) {
+            // A rejected session dial is no longer in flight. Attempts that
+            // were sharing it must issue their own dial now: nothing else
+            // re-enters a waiting relay leg, so they would otherwise burn
+            // their leg deadline on a dial that already failed. The owner
+            // learns through its own routing below, and housekeeping
+            // waiters fall back to their acquire/probe deadlines.
+            let owner = purpose.connect_id();
+            for (id, attempt) in self.attempts.iter_mut() {
+                if owner.as_ref() != Some(id) {
+                    attempt.on_session_dial_failed(&peer, &mut self.shared, now);
+                }
+            }
+        }
+        match &purpose {
+            TokenPurpose::ProbeDial => {
+                self.housekeeping
+                    .on_probe_dial_result(&Err(reason), &mut self.shared, now);
+            }
+            TokenPurpose::ReserveDial => {
+                self.housekeeping
+                    .on_reserve_dial_result(&Err(reason), &mut self.shared, now);
+            }
+            _ => {
+                if let Some(id) = purpose.connect_id()
+                    && let Some(attempt) = self.attempts.get_mut(&id)
+                {
+                    attempt.on_dial_result(&purpose, Err(reason), &mut self.shared, now);
+                }
+            }
+        }
     }
 
     /// Reports the result of a [`NatAction::OpenStream`] the driver executed.

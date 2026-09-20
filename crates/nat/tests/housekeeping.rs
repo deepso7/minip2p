@@ -888,6 +888,31 @@ fn waiting_attempt_redials_when_the_shared_dial_fails() {
     );
 }
 
+#[test]
+fn reserve_dial_failed_event_schedules_backoff() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    let relay = hk.relay.clone();
+    hk.agent.handle_tick(at(0));
+    let actions = drain_actions(&mut hk.agent);
+    let reserve_dial = dial_token_for(&actions, &relay);
+    let conn_id = ConnectionId::new(3);
+    let relay_addr = PeerAddr::new(maddr(RELAY_TRANSPORT_ADDR), relay.clone()).expect("relay addr");
+    hk.agent.dial_result(reserve_dial, Ok(conn_id), at(5));
+    assert!(hk.agent.handle_event_with_disposition(
+        &SwarmEvent::DialFailed {
+            conn_id,
+            addr: relay_addr,
+            reason: "connection refused".into(),
+        },
+        at(6),
+    ));
+    assert_eq!(
+        hk.agent.next_timeout(6),
+        Some(NatConfig::default().reservation_retry_backoff_ms),
+        "refused reservation dial must back off immediately"
+    );
+}
+
 /// When the owner of a shared dial stalls (no result ever arrives), its
 /// entry expires at the owner's own flight deadline — and the tick running
 /// at that moment must re-drive waiting relay legs. Without the re-drive
