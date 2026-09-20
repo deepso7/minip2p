@@ -834,6 +834,12 @@ impl SwarmCore {
                     // second diagnostic the connect engine cannot consume.
                     return;
                 }
+                // reject_pending_establish already removed pending_dials and
+                // emitted DialFailed; ignore trailing transport errors until
+                // Closed clears the veto.
+                if self.vetoed_establishes.contains(&id) {
+                    return;
+                }
                 self.emit_error(
                     SwarmErrorKind::Transport,
                     self.established_peer_for_conn(id),
@@ -3688,6 +3694,49 @@ mod tests {
         );
         assert_eq!(core.connection_id(&peer), Some(existing));
         assert!(core.connected_peers().contains(&peer));
+    }
+
+    #[test]
+    fn vetoed_establish_suppresses_transport_error_after_dial_failed() {
+        let mut core = test_core();
+        let (_, addr, conn_id) = noted_dial_addr(b"veto-error-after-reject");
+        core.note_dial(conn_id, addr);
+        core.veto_establish(conn_id);
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: conn_id,
+                endpoint: ConnectionEndpoint::new(loopback_transport()),
+            },
+        );
+        let after_reject = drain_events(&mut core);
+        assert!(
+            after_reject.iter().any(|event| {
+                matches!(
+                    event,
+                    SwarmEvent::DialFailed { conn_id: failed, .. } if *failed == conn_id
+                )
+            }),
+            "reject should DialFailed; got {after_reject:?}"
+        );
+
+        // reject_pending_establish already dropped pending_dials; a trailing
+        // Error before Closed must not leak a second SwarmEvent::Error.
+        feed(
+            &mut core,
+            TransportEvent::Error {
+                id: conn_id,
+                message: "reset after veto".into(),
+            },
+        );
+        feed(&mut core, TransportEvent::Closed { id: conn_id });
+        let trailing = drain_events(&mut core);
+        assert!(
+            trailing
+                .iter()
+                .all(|event| !matches!(event, SwarmEvent::Error(_))),
+            "vetoed dial must not emit Error after DialFailed; got {trailing:?}"
+        );
     }
 
     #[test]
