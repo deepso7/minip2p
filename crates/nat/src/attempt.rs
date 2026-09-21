@@ -831,6 +831,9 @@ impl ConnectAttempt {
                         connect_id: self.id,
                         peer: self.peer.clone(),
                     });
+                    // Keep the provisional circuit; drop punch dials so a
+                    // late handshake cannot land after this attempt is reaped.
+                    shared.abort_attempt_dials(self.id);
                     self.done = true;
                 }
             }

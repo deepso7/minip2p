@@ -382,6 +382,59 @@ fn cancel_then_late_punch_dial_result_closes_the_conn() {
 }
 
 #[test]
+fn fallback_closes_an_in_flight_punch_dial() {
+    let mut h = Harness::with_relay(NatConfig {
+        punch_deadline_ms: 250,
+        punch_max_retries: 0,
+        ..NatConfig::default()
+    });
+    let (id, conn) = drive_to_relayed(&mut h);
+    let actions = drive_dcutr_through_sync(&mut h, conn, StreamId::new(90));
+    let punch_token = dial_token_for(&actions, &h.target);
+    let punch_conn = ConnectionId::new(44);
+    h.agent.dial_result(punch_token, Ok(punch_conn), at(313));
+
+    h.agent.handle_tick(at(562));
+    let after = drain_actions(&mut h.agent);
+    assert!(after.iter().any(
+        |action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == punch_conn)
+    ));
+    assert!(
+        after.iter().all(
+            |action| !matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)
+        ),
+        "fallback must keep the provisional relay circuit"
+    );
+    assert!(matches!(
+        drain_events(&mut h.agent).as_slice(),
+        [
+            NatEvent::HolePunchFailed { connect_id, .. },
+            NatEvent::FellBackToRelay { connect_id: fallback_id, .. }
+        ] if *connect_id == id && *fallback_id == id
+    ));
+
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: punch_conn,
+            peer_id: h.target.clone(),
+        },
+        at(563),
+    );
+    assert!(
+        drain_events(&mut h.agent).is_empty(),
+        "a punch must not connect the target after FellBackToRelay"
+    );
+
+    h.agent.cancel(id, at(564));
+    assert!(
+        drain_actions(&mut h.agent).iter().all(
+            |action| !matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)
+        ),
+        "settled cancel after FellBackToRelay must stay a no-op"
+    );
+}
+
+#[test]
 fn incomplete_dcutr_close_fails_and_resets_the_exchange() {
     let mut h = Harness::with_relay(NatConfig::default());
     let (id, conn) = drive_to_relayed(&mut h);
