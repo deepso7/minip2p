@@ -34,7 +34,7 @@ Start from the observable symptom. Rust methods return immediate failures as `mi
 | `Event::Error` | Record the structured context and decide whether to retry. |
 | `NatEvent::PathEstablished` | Begin traffic with the ordinary stream methods. |
 | `NatEvent::PathUpgraded` | Update path state. Existing peer operations keep working. |
-| `NatEvent::ConnectFailed` | Inspect the error, correct the candidates or infrastructure, and retry. |
+| `EndpointEvent::ConnectSettled` with `ConnectOutcome::Failed` | Inspect the failure, correct the candidates or infrastructure, and retry. |
 | `GossipsubEvent::OutboundFailure` | Retry only if the application requires it. |
 | `DiscoveryEvent::DialFailed` | Keep discovery running. Backoff controls later attempts. |
 

@@ -17,12 +17,15 @@ use super::connect::{ConnectId, ConnectOutcome};
 /// at the Endpoint boundary. [`crate::Event`] is a migration alias for the
 /// same type.
 ///
-/// Each event is emitted once, in Endpoint emission order. Within one
-/// Endpoint step, swarm events come first, then capability events in
-/// relay-server, NAT, Gossipsub, Discovery order, then Connection-attempt
-/// terminals ([`Self::ConnectSettled`]), so a path transition caused by a
-/// step precedes the terminal it leads to. No order is promised between
-/// concurrently racing Transport candidates.
+/// Each event is emitted once, in Endpoint emission order: the order is
+/// fixed when the Endpoint queues the event and every consumer preserves
+/// it. A Connection attempt's [`Self::ConnectSettled`] follows the
+/// `ConnectionEstablished` it reports. No order is promised between
+/// concurrently racing Transport candidates. The std `Endpoint` further
+/// orders each step as swarm events, then capability events (relay-server,
+/// NAT, Gossipsub, Discovery), then Connection-attempt terminals; the
+/// embedded endpoints adopt that step order when they share its capability
+/// drivers.
 ///
 /// Payloads move by value across the Endpoint boundary; callers own each
 /// delivered event. Swarm variants keep the same names and fields as
@@ -126,6 +129,19 @@ pub enum EndpointEvent {
     /// Relay-service output: reservations, circuits, and runtime errors.
     #[cfg(feature = "relay-server")]
     RelayServer(minip2p_relay_server::RelayServerEvent),
+}
+
+/// Whether a NAT event reaches the Endpoint event stream.
+///
+/// `ConnectFailed` and `FellBackToRelay` are attempt terminals the
+/// Connection-attempt engine already reports as
+/// [`EndpointEvent::ConnectSettled`], so they are not repeated.
+#[cfg(any(feature = "nat", feature = "portable-autonat"))]
+pub(crate) fn nat_event_reaches_application(event: &minip2p_nat::NatEvent) -> bool {
+    !matches!(
+        event,
+        minip2p_nat::NatEvent::ConnectFailed { .. } | minip2p_nat::NatEvent::FellBackToRelay { .. }
+    )
 }
 
 impl EndpointEvent {

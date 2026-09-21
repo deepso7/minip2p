@@ -532,7 +532,7 @@ impl Endpoint {
             allow_relay,
         );
         self.feed_nat_to_connect();
-        self.drain_connect_into_pending();
+        self.flush_step_events();
         id
     }
 
@@ -548,7 +548,7 @@ impl Endpoint {
             nat.pump(&mut self.swarm);
         }
         self.feed_nat_to_connect();
-        self.drain_connect_into_pending();
+        self.flush_step_events();
     }
 
     /// Sends a ping to `peer_id`.
@@ -759,7 +759,7 @@ impl Endpoint {
             return Ok(EndpointWaitOutcome::Deadline);
         }
         self.tick_connect();
-        self.drain_connect_into_pending();
+        self.flush_step_events();
         if let Some(event) = self.pending_events.pop_front() {
             return Ok(EndpointWaitOutcome::Event(event));
         }
@@ -784,8 +784,7 @@ impl Endpoint {
             let step = self.connect_step_deadline(deadline);
             match self.swarm.poll_next_interruptible(step)? {
                 PollNext::Event(event) => {
-                    let mut produced: Vec<EndpointEvent> = self.ingest(event).into_iter().collect();
-                    self.finish_step(&mut produced)?;
+                    let produced = self.step_events(event)?;
                     self.pending_events.extend(produced);
                     if let Some(event) = self.pending_events.pop_front() {
                         return Ok(EndpointWaitOutcome::Event(event));
@@ -807,8 +806,9 @@ impl Endpoint {
     /// the Endpoint wait outcomes. Both deliver enabled capability output as
     /// [`EndpointEvent`] variants. Focused waits such as `nat_wait_path` and
     /// [`Self::wait_peer_ready`] remain during migration. All of these methods
-    /// use transport readiness when supported. Each call drives only this endpoint, so blocking here can
-    /// delay other endpoints that share the same thread.
+    /// use transport readiness when supported. Each call drives only this
+    /// endpoint, so blocking here can delay other endpoints that share the
+    /// same thread.
     ///
     /// `deadline` accepts an [`std::time::Instant`], a relative
     /// [`std::time::Duration`], or [`Deadline::NEVER`] to wait indefinitely.
@@ -871,13 +871,17 @@ impl Endpoint {
     fn tick_connect(&mut self) {
         let now_ms = self.swarm.now().monotonic_ms;
         self.connect.tick(self.swarm.runtime_mut(), now_ms);
-        self.drain_connect_into_pending();
+        self.flush_step_events();
     }
 
-    fn drain_connect_into_pending(&mut self) {
-        for event in self.take_connect_events() {
-            self.pending_events.push_back(event);
-        }
+    /// Queues output produced outside a swarm step (API calls, timers):
+    /// capability events first, then Connection-attempt events, so a
+    /// terminal never overtakes the NAT events of the same call. Filters
+    /// over the stream call this before they search it.
+    fn flush_step_events(&mut self) {
+        let mut out = Vec::new();
+        self.drain_step_events(&mut out);
+        self.pending_events.extend(out);
     }
 
     /// Returns the first of `produced` and queues the rest behind any
@@ -888,6 +892,14 @@ impl Endpoint {
         let first = produced.next()?;
         self.pending_events.extend(produced);
         Some(first)
+    }
+
+    /// Runs one Endpoint step for a swarm event and returns everything it
+    /// produced, in Endpoint emission order.
+    fn step_events(&mut self, event: SwarmEvent) -> Result<Vec<EndpointEvent>, Error> {
+        let mut produced: Vec<EndpointEvent> = self.ingest(event).into_iter().collect();
+        self.finish_step(&mut produced)?;
+        Ok(produced)
     }
 
     /// Ends one Endpoint step: ticks the agents, then appends capability
@@ -942,15 +954,6 @@ impl Endpoint {
                 out.push(EndpointEvent::Discovery(event));
             }
         }
-    }
-
-    /// Moves queued capability and Connection-attempt output into
-    /// `pending_events` so filters over the stream see it.
-    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-    fn flush_step_events(&mut self) {
-        let mut out = Vec::new();
-        self.drain_step_events(&mut out);
-        self.pending_events.extend(out);
     }
 
     /// Removes and returns every pending event `is_match` accepts, keeping
@@ -1212,8 +1215,7 @@ impl Endpoint {
             }
             match polled {
                 PollNext::Event(event) => {
-                    let mut produced: Vec<EndpointEvent> = self.ingest(event).into_iter().collect();
-                    self.finish_step(&mut produced)?;
+                    let produced = self.step_events(event)?;
                     if let Some(event) = self.first_new_event(produced) {
                         return Ok(DriverPoll::application(event));
                     }
@@ -1537,8 +1539,7 @@ impl Endpoint {
             let step = self.connect_step_deadline(deadline);
             match self.swarm.poll_next_interruptible(step)? {
                 PollNext::Event(event) => {
-                    let mut produced: Vec<EndpointEvent> = self.ingest(event).into_iter().collect();
-                    self.finish_step(&mut produced)?;
+                    let produced = self.step_events(event)?;
                     self.pending_events.extend(produced);
                 }
                 PollNext::Deadline => {
@@ -1833,8 +1834,10 @@ impl Endpoint {
             };
             match polled {
                 Ok(Some(event)) => {
+                    // No agent tick or discovery sweep runs while closing, so
+                    // only connection and attempt events are returned.
                     events.extend(self.ingest(event));
-                    self.drain_step_events(&mut events);
+                    events.extend(self.take_connect_events());
                 }
                 Ok(None) => {
                     if !self.close_drain_busy() || std::time::Instant::now() >= drain_by {
@@ -4361,19 +4364,28 @@ mod tests {
                 detail: "test diagnostic".into(),
             }));
 
+        // A Peer-ID target with no route settles inside `connect`; its
+        // terminal must still follow the capability events already queued.
+        let settled_id = endpoint
+            .connect(Ed25519Keypair::generate().peer_id())
+            .expect("admit route-less connect");
+
         let events = endpoint.poll().expect("poll");
-        let capabilities: Vec<&str> = events
+        let order: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
                 EndpointEvent::RelayServer(_) => Some("relay-server"),
                 EndpointEvent::Nat(_) => Some("nat"),
                 EndpointEvent::Gossipsub(_) => Some("gossipsub"),
+                EndpointEvent::ConnectSettled { connect_id, .. } if *connect_id == settled_id => {
+                    Some("settled")
+                }
                 _ => None,
             })
             .collect();
         // FellBackToRelay is an attempt terminal the engine reports as
         // ConnectSettled; it is not repeated as a NAT event.
-        assert_eq!(capabilities, ["relay-server", "nat", "gossipsub"]);
+        assert_eq!(order, ["relay-server", "nat", "gossipsub", "settled"]);
         assert!(endpoint.take_nat_events().is_empty());
         assert!(endpoint.take_gossipsub_events().is_empty());
         assert!(endpoint.take_relay_server_events().is_empty());

@@ -35,6 +35,8 @@ pub use connect::{
 pub(crate) use connect::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS, RelayPolicy};
 mod event_stream;
 pub use event_stream::EndpointEvent;
+#[cfg(any(feature = "nat", feature = "portable-autonat"))]
+pub(crate) use event_stream::nat_event_reaches_application;
 
 #[cfg(feature = "portable-mdns")]
 pub use minip2p_discovery::{
@@ -1137,18 +1139,11 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
 
     fn feed_nat_to_connect(&mut self, now: Now) {
         #[cfg(feature = "portable-autonat")]
-        {
-            let events = self
-                .nat
-                .as_ref()
-                .map(nat::PortableNatDriver::unobserved_events)
-                .unwrap_or_default();
-            for event in &events {
+        if let Some(nat) = self.nat.as_mut() {
+            for event in nat.unobserved_events() {
                 self.endpoint.observe_nat_event(event, now);
             }
-            if let Some(nat) = self.nat.as_mut() {
-                nat.mark_observed();
-            }
+            nat.mark_observed();
         }
         #[cfg(not(feature = "portable-autonat"))]
         let _ = now;

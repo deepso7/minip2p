@@ -157,18 +157,13 @@ impl NatDriver {
         self.observed = self.events.len();
     }
 
-    /// Drains every queued event for the application once the engine has
-    /// observed it. `ConnectFailed` and `FellBackToRelay` are attempt
-    /// terminals the engine already reports as `ConnectSettled`, so they
-    /// are not repeated.
+    /// Drains every queued event that reaches the Endpoint event stream,
+    /// once the Connection-attempt engine has observed it.
     pub(crate) fn drain_application_events(&mut self) -> impl Iterator<Item = NatEvent> + '_ {
         self.observed = 0;
-        self.events.drain(..).filter(|event| {
-            !matches!(
-                event,
-                NatEvent::ConnectFailed { .. } | NatEvent::FellBackToRelay { .. }
-            )
-        })
+        self.events
+            .drain(..)
+            .filter(crate::portable::nat_event_reaches_application)
     }
 
     /// Keeps the observation cursor aligned when the discovery sweep removes
