@@ -26,15 +26,21 @@ The Cargo feature alone only compiles the APIs. Calling `subscribe` on an endpoi
 ## Publish and keep driving
 
 ```rust
+use std::time::{Duration, Instant};
+
+use minip2p::{EndpointEvent, EndpointWaitOutcome};
+
 node.publish("news", b"hello mesh".to_vec())?;
 
+let deadline = Instant::now() + Duration::from_secs(5);
 loop {
-    match node.wait(std::time::Duration::from_secs(5))? {
-        minip2p::EndpointWaitOutcome::Event(minip2p::EndpointEvent::Gossipsub(event)) => {
+    match node.wait(deadline)? {
+        EndpointWaitOutcome::Event(EndpointEvent::Gossipsub(event)) => {
             println!("{event:?}");
             break;
         }
-        _ => {}
+        EndpointWaitOutcome::Deadline => break,
+        EndpointWaitOutcome::Event(_) | EndpointWaitOutcome::Interrupted => {}
     }
 }
 ```

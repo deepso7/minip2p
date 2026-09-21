@@ -86,7 +86,7 @@ What to look for:
 - subsequent pongs are `path=direct` with a clearly lower RTT;
 - the summary splits the RTT accounting per path.
 
-If the punch cannot land (e.g. UDP blocked between the peers), you'll see `nat-holepunch-failed` for each retry window and finally `nat-fell-back-to-relay`; pings simply continue on `path=relayed`.
+If the punch cannot land (e.g. UDP blocked between the peers), you'll see `nat-holepunch-failed` for each retry window and finally `connect-settled … outcome=connected` on the circuit connection; pings simply continue on `path=relayed`.
 
 ## Options
 

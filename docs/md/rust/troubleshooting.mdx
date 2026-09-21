@@ -44,6 +44,6 @@ Start from the observable symptom. Rust methods return immediate failures as `mi
 2. Log the complete peer address and local peer ID.
 3. Distinguish an authenticated connection from `PeerReady` (Identify).
 4. Confirm both the Cargo feature and its builder method.
-5. Read the event queue owned by the capability you are using.
+5. Match the capability's `EndpointEvent` variant (`Nat`, `Gossipsub`, `Discovery`, `RelayServer`) from `wait` or `poll`, and check durable state with the snapshot getters (`path`, `reachability`, `active_reservation`, `known_peers`).
 
 For the complete capability map, see the [feature matrix](/reference/feature-matrix).

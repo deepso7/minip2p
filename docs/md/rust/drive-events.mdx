@@ -14,7 +14,7 @@ Use `Endpoint::wait` for the ADR 0007 Endpoint wait outcomes (event, deadline, o
 | `wait(deadline)` | Drive until one Endpoint event (including capability events), deadline, or interruption. | Every application event loop; correlating an operation while dispatching others |
 | `nat_wait_path` / `wait_peer_ready` / `wait_ping_rtt` | Drive until one milestone, buffering unrelated events. | Connection and setup milestones (migration) |
 | `next_nat_event` / `next_gossipsub_event` / `next_discovery_event` / `next_relay_server_event` | Drive until the next matching capability event; other events stay queued. | Feature-specific workflows (migration) |
-| `next_event(deadline)` | Drive until one ordinary application event or the deadline; swallows interruption. | Legacy synchronous loops |
+| `next_event(deadline)` | Like `wait`, returns one `EndpointEvent` (capability variants included) or `None` at the deadline, but swallows interruption. `Event` is its migration alias for `EndpointEvent`. | Legacy synchronous loops |
 | `poll()` | One non-blocking drive; returns currently available Endpoint events. | Existing game, UI, or reactor loops |
 
 ## Deadline forms

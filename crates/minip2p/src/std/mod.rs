@@ -1287,6 +1287,10 @@ impl Endpoint {
     /// connected attempt, or `Ok(None)` for a failed or cancelled one.
     /// Returns `Ok(None)` when `deadline` passes. Other events arriving
     /// meanwhile stay queued for later [`Endpoint::wait`] calls.
+    ///
+    /// Returns [`Error::Invariant`] before waiting when the endpoint was built
+    /// without a NAT configuration (the `nat` feature alone does not enable
+    /// traversal).
     #[cfg(feature = "nat")]
     pub fn nat_wait_path(
         &mut self,
