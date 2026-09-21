@@ -19,8 +19,8 @@ use minip2p::smoltcp::wire::{HardwareAddress, IpCidr};
 use minip2p::{BeaconConfig, GossipsubEvent, SmoltcpGossipsubError};
 use minip2p::{
     ConnectOutcome, DiscoveryEvent, Ed25519Keypair, Endpoint, EndpointEvent, EntropySource,
-    Multiaddr, Now, PeerAddr, PeerId, PollDeadline, SmoltcpConfig, SmoltcpEvent, SmoltcpMdnsConfig,
-    SmoltcpStack, SmoltcpTcpProvider, StreamId, TcpConfig, TcpTransport,
+    Multiaddr, Now, PeerAddr, PeerId, PollDeadline, SmoltcpConfig, SmoltcpMdnsConfig, SmoltcpStack,
+    SmoltcpTcpProvider, StreamId, TcpConfig, TcpTransport,
 };
 use minip2p_platform::EntropyError;
 
@@ -518,24 +518,24 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
 
         let a_discovered = a_events.iter().any(|event| {
             matches!(event,
-                SmoltcpEvent::Discovery(
+                EndpointEvent::Discovery(
                     DiscoveryEvent::PeerDiscovered { peer, addrs, source: minip2p::DiscoverySource::Mdns }
                     | DiscoveryEvent::PeerUpdated { peer, addrs, source: minip2p::DiscoverySource::Mdns }
                 ) if peer == &b_peer && !addrs.is_empty())
         });
         let b_discovered = b_events.iter().any(|event| {
             matches!(event,
-                SmoltcpEvent::Discovery(
+                EndpointEvent::Discovery(
                     DiscoveryEvent::PeerDiscovered { peer, addrs, source: minip2p::DiscoverySource::Mdns }
                     | DiscoveryEvent::PeerUpdated { peer, addrs, source: minip2p::DiscoverySource::Mdns }
                 ) if peer == &a_peer && !addrs.is_empty())
         });
         let a_ready = a_events.iter().any(|event| {
-            matches!(event, SmoltcpEvent::Endpoint(EndpointEvent::PeerReady { peer_id, .. })
+            matches!(event, EndpointEvent::PeerReady { peer_id, .. }
                 if peer_id == &b_peer)
         });
         let b_ready = b_events.iter().any(|event| {
-            matches!(event, SmoltcpEvent::Endpoint(EndpointEvent::PeerReady { peer_id, .. })
+            matches!(event, EndpointEvent::PeerReady { peer_id, .. }
                 if peer_id == &a_peer)
         });
         if a_ready && b_ready && !ping_started {
@@ -543,7 +543,7 @@ fn mdns_discovers_and_connects_portable_endpoints_on_one_shared_stack_each() {
             ping_started = true;
         }
         let ping_finished = a_events.iter().any(|event| {
-            matches!(event, SmoltcpEvent::Endpoint(EndpointEvent::PingRttMeasured { peer_id, .. })
+            matches!(event, EndpointEvent::PingRttMeasured { peer_id, .. }
                 if peer_id == &b_peer)
         });
         #[cfg(feature = "pubsub")]
@@ -619,7 +619,7 @@ fn portable_pubsub_delivers_over_the_composed_smoltcp_endpoint() {
         a_events.extend(a.poll(now).expect("a polls"));
         b_events.extend(b.poll(now).expect("b polls"));
         let remote_subscribed = a_events.iter().any(|event| {
-            matches!(event, SmoltcpEvent::Gossipsub(GossipsubEvent::PeerSubscribed { peer, topic })
+            matches!(event, EndpointEvent::Gossipsub(GossipsubEvent::PeerSubscribed { peer, topic })
                 if peer == &b_peer && topic == TOPIC)
         });
         if remote_subscribed && !published {
@@ -627,7 +627,7 @@ fn portable_pubsub_delivers_over_the_composed_smoltcp_endpoint() {
             published = true;
         }
         if b_events.iter().any(|event| {
-            matches!(event, SmoltcpEvent::Gossipsub(GossipsubEvent::Message { topics, data, signed: true, .. })
+            matches!(event, EndpointEvent::Gossipsub(GossipsubEvent::Message { topics, data, signed: true, .. })
                 if topics.iter().any(|topic| topic == TOPIC) && data == PAYLOAD)
         }) {
             return;
@@ -709,12 +709,12 @@ fn signed_beacons_populate_discovery_without_mdns() {
         a_events.extend(a.poll(now).expect("a polls"));
         b_events.extend(b.poll(now).expect("b polls"));
         let a_saw_b = a_events.iter().any(|event| {
-            matches!(event, SmoltcpEvent::Discovery(DiscoveryEvent::PeerDiscovered {
+            matches!(event, EndpointEvent::Discovery(DiscoveryEvent::PeerDiscovered {
                 peer, source: minip2p::DiscoverySource::SignedBeacon, ..
             }) if peer == &b_peer)
         });
         let b_saw_a = b_events.iter().any(|event| {
-            matches!(event, SmoltcpEvent::Discovery(DiscoveryEvent::PeerDiscovered {
+            matches!(event, EndpointEvent::Discovery(DiscoveryEvent::PeerDiscovered {
                 peer, source: minip2p::DiscoverySource::SignedBeacon, ..
             }) if peer == &a_peer)
         });

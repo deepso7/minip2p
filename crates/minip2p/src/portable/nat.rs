@@ -90,9 +90,18 @@ impl PortableNatDriver {
         self.observed = self.events.len();
     }
 
-    pub(crate) fn take_events(&mut self) -> Vec<NatEvent> {
+    /// Drains every queued event for the application once the engine has
+    /// observed it. `ConnectFailed` and `FellBackToRelay` are attempt
+    /// terminals the engine already reports as `ConnectSettled`, so they
+    /// are not repeated.
+    pub(crate) fn drain_application_events(&mut self) -> impl Iterator<Item = NatEvent> + '_ {
         self.observed = 0;
-        self.events.drain(..).collect()
+        self.events.drain(..).filter(|event| {
+            !matches!(
+                event,
+                NatEvent::ConnectFailed { .. } | NatEvent::FellBackToRelay { .. }
+            )
+        })
     }
 
     #[cfg(feature = "portable-relay")]
