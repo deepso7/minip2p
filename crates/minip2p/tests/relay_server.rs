@@ -25,12 +25,16 @@ fn exercise_relay(
 ) {
     let (stop_tx, stop_rx) = mpsc::channel();
     let relay_thread = thread::spawn(move || {
+        let mut relay_events = Vec::new();
         while stop_rx.try_recv().is_err() {
-            relay
+            if let Some(Event::RelayServer(event)) = relay
                 .next_event(Duration::from_millis(10))
-                .expect("drive relay server");
+                .expect("drive relay server")
+            {
+                relay_events.push(event);
+            }
         }
-        relay.take_relay_server_events()
+        relay_events
     });
 
     let config = NatConfig {
@@ -50,10 +54,10 @@ fn exercise_relay(
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         assert!(Instant::now() < deadline, "reservation timed out");
-        let _ = responder.next_event(Duration::from_millis(20)).unwrap();
-        if responder.take_nat_events().iter().any(|event| {
-            matches!(event, NatEvent::RelayReserved { relay, .. } if relay == relay_addr.peer_id())
-        }) {
+        if let Some(Event::Nat(NatEvent::RelayReserved { relay, .. })) =
+            responder.next_event(Duration::from_millis(20)).unwrap()
+            && &relay == relay_addr.peer_id()
+        {
             break;
         }
     }
@@ -81,26 +85,16 @@ fn exercise_relay(
             "relayed connect timed out: {trace:#?}"
         );
         if let Some(event) = initiator.next_event(Duration::from_millis(20)).unwrap() {
-            trace.push(format!("initiator swarm: {event:?}"));
+            trace.push(format!("initiator: {event:?}"));
+            connected = matches!(
+                event,
+                Event::Nat(NatEvent::PathEstablished { connect_id: found, path: Path::Relayed { .. }, .. })
+                    if found == connect_id
+            );
         }
         if let Some(event) = responder.next_event(Duration::from_millis(20)).unwrap() {
-            trace.push(format!("responder swarm: {event:?}"));
+            trace.push(format!("responder: {event:?}"));
         }
-        let initiator_events = initiator.take_nat_events();
-        trace.extend(
-            initiator_events
-                .iter()
-                .map(|event| format!("initiator nat: {event:?}")),
-        );
-        connected = initiator_events.iter().any(|event| {
-            matches!(event, NatEvent::PathEstablished { connect_id: found, path: Path::Relayed { .. }, .. } if *found == connect_id)
-        });
-        trace.extend(
-            responder
-                .take_nat_events()
-                .iter()
-                .map(|event| format!("responder nat: {event:?}")),
-        );
     }
     let ready_deadline = Instant::now() + Duration::from_secs(5);
     while initiator.peer_info(&responder_peer).is_none()

@@ -44,8 +44,7 @@ pub enum GossipsubError {
 /// Drives the configured [`GossipsubAgent`] against the endpoint's swarm.
 pub(crate) struct GossipsubDriver {
     pub(crate) agent: GossipsubAgent,
-    /// Pubsub events awaiting the application (drained via
-    /// `Endpoint::take_gossipsub_events` / `next_gossipsub_event`).
+    /// Gossipsub events awaiting the Endpoint event stream.
     pub(crate) events: VecDeque<GossipsubEvent>,
     /// Monotonic epoch for the agent's `now_ms` clock.
     epoch: Instant,

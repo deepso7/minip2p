@@ -159,10 +159,6 @@ pub fn run_listen(relay: Option<PeerAddr>, options: RunOptions) -> Result<(), Bo
     eprintln!("[listen] echoing on {ECHO_PROTOCOL} (Ctrl-C to stop)");
 
     loop {
-        for nat_event in endpoint.take_nat_events() {
-            print_nat_event("listen", &nat_event);
-            handle_listen_nat_event(&mut endpoint, &nat_event, relays.first());
-        }
         let Some(event) = endpoint
             .next_event(Duration::from_millis(200))
             .map_err(|e| format!("swarm poll: {e}"))?
@@ -170,6 +166,9 @@ pub fn run_listen(relay: Option<PeerAddr>, options: RunOptions) -> Result<(), Bo
             continue;
         };
         print_event("listen", &event);
+        if let Event::Nat(nat_event) = &event {
+            handle_listen_nat_event(&mut endpoint, nat_event, relays.first());
+        }
         handle_listen_event(&mut endpoint, &event, &mut echo_streams);
     }
 }
@@ -375,9 +374,13 @@ pub fn run_dial(
         .nat_wait_path(connect_id, CONNECT_DEADLINE)
         .map_err(|e| format!("waiting for a path: {e}"))?;
     let Some(path) = path else {
-        // ConnectFailed (if any) is still queued; surface its error.
-        for event in endpoint.take_nat_events() {
-            print_nat_event("dial", &event);
+        // The attempt's ConnectSettled (if it settled) is still queued;
+        // surface its outcome.
+        while let Some(event) = endpoint
+            .next_event(Duration::ZERO)
+            .map_err(|e| format!("swarm poll: {e}"))?
+        {
+            print_event("dial", &event);
         }
         return Err("no path to the target".into());
     };
@@ -486,8 +489,8 @@ fn open_direct_channel(
 ) -> Result<Channel, Box<dyn Error>> {
     let setup = Instant::now() + SETUP_DEADLINE;
     let deadline = drain_deadline.map_or(setup, |drain| drain.min(setup));
-    // `nat_wait_path` and `PathUpgraded` report on NAT events; the connection's
-    // own `ConnectionEstablished` may still sit in the swarm queue. Drain
+    // `nat_wait_path` and `PathUpgraded` can land before the connection's own
+    // `ConnectionEstablished` is taken from the Endpoint event stream. Drain
     // what is already queued before opening the stream, so a stale
     // establishment cannot masquerade as a superseding punch connection —
     // that would burn the stream and force a needless retry on every plain
@@ -541,45 +544,6 @@ fn ping_loop(
     let mut reopens_left: u32 = 3;
 
     loop {
-        for nat_event in endpoint.take_nat_events() {
-            print_nat_event("dial", &nat_event);
-            if let NatEvent::PathUpgraded { peer: upgraded, .. } = &nat_event
-                && upgraded == peer
-                && !channel.direct
-            {
-                println!(
-                    "[dial] path-upgraded path=direct-punched elapsed-us={}",
-                    micros_since(start)
-                );
-                // The old bridge is already reset by the agent — never
-                // touch it again. Pongs in flight on it are gone; the
-                // reopen resends their seqs on the new stream.
-                frames.clear();
-                channel = match establish_direct_channel(
-                    endpoint,
-                    peer,
-                    &outstanding,
-                    drain_deadline,
-                    start,
-                ) {
-                    Ok(channel) => channel,
-                    Err(e) if drain_deadline.is_some() => {
-                        // The remaining pongs could only have arrived on
-                        // the replacement stream; the run is over.
-                        eprintln!("[dial] channel switch during drain failed: {e}");
-                        stats.print_summary();
-                        return Ok(());
-                    }
-                    Err(e) => return Err(e),
-                };
-                println!(
-                    "[dial] channel-switched path=direct outstanding-resent={} elapsed-us={}",
-                    outstanding.len(),
-                    micros_since(start)
-                );
-            }
-        }
-
         let wait_until = drain_deadline.unwrap_or(next_ping);
         let event = endpoint
             .next_event(wait_until)
@@ -719,6 +683,44 @@ fn ping_loop(
             // close just before the replacement direct connection is
             // delivered. The matching StreamClosed event (or a failed send)
             // is the authoritative signal that this channel itself died.
+            Event::Nat(nat_event) => {
+                print_nat_event("dial", nat_event);
+                if let NatEvent::PathUpgraded { peer: upgraded, .. } = nat_event
+                    && upgraded == peer
+                    && !channel.direct
+                {
+                    println!(
+                        "[dial] path-upgraded path=direct-punched elapsed-us={}",
+                        micros_since(start)
+                    );
+                    // The old bridge is already reset by the agent — never
+                    // touch it again. Pongs in flight on it are gone; the
+                    // reopen resends their seqs on the new stream.
+                    frames.clear();
+                    channel = match establish_direct_channel(
+                        endpoint,
+                        peer,
+                        &outstanding,
+                        drain_deadline,
+                        start,
+                    ) {
+                        Ok(channel) => channel,
+                        Err(e) if drain_deadline.is_some() => {
+                            // The remaining pongs could only have arrived on
+                            // the replacement stream; the run is over.
+                            eprintln!("[dial] channel switch during drain failed: {e}");
+                            stats.print_summary();
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    println!(
+                        "[dial] channel-switched path=direct outstanding-resent={} elapsed-us={}",
+                        outstanding.len(),
+                        micros_since(start)
+                    );
+                }
+            }
             _ => print_event("dial", &event),
         }
     }

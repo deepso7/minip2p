@@ -1,8 +1,8 @@
 //! Single Endpoint event stream type (ADR 0007).
 //!
-//! Base connection, Identify, ping, stream, and Connection-attempt transitions
-//! leave through [`EndpointEvent`]. Capability-specific queues remain until a
-//! later ticket folds them into this stream.
+//! Connection, Identify, ping, stream, Connection-attempt, and enabled
+//! capability (NAT, Gossipsub, Discovery, relay-server) transitions all leave
+//! through [`EndpointEvent`].
 
 use minip2p_core::{PeerAddr, PeerId};
 use minip2p_swarm::{ConnectionCloseCause, IdentifyMessage, SwarmEvent, SwarmRuntimeError};
@@ -12,17 +12,25 @@ use super::connect::{ConnectId, ConnectOutcome};
 
 /// Ordered application event from the Endpoint's single public stream.
 ///
-/// Connection, Identify, ping, stream, raw-dial, and Connection-attempt
-/// transitions leave through this enum. Prefer this name at the Endpoint
-/// boundary. [`crate::Event`] is a migration alias for the same type. NAT,
-/// pubsub, discovery, and relay-server output stay on focused queues until a
-/// later ticket adds variants here.
+/// Connection, Identify, ping, stream, raw-dial, Connection-attempt, and
+/// enabled capability transitions leave through this enum. Prefer this name
+/// at the Endpoint boundary. [`crate::Event`] is a migration alias for the
+/// same type.
+///
+/// Each event is emitted once, in Endpoint emission order. Within one
+/// Endpoint step, swarm events come first, then capability events in
+/// relay-server, NAT, Gossipsub, Discovery order, then Connection-attempt
+/// terminals ([`Self::ConnectSettled`]), so a path transition caused by a
+/// step precedes the terminal it leads to. No order is promised between
+/// concurrently racing Transport candidates.
 ///
 /// Payloads move by value across the Endpoint boundary; callers own each
 /// delivered event. Swarm variants keep the same names and fields as
 /// [`SwarmEvent`], so existing `Event::PeerReady { .. }` patterns compile
-/// unchanged.
+/// unchanged. The enum is non-exhaustive because enabling a capability
+/// feature adds variants.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum EndpointEvent {
     /// A new connection was established and identity verified.
     ConnectionEstablished {
@@ -97,6 +105,27 @@ pub enum EndpointEvent {
         peer_id: PeerId,
         outcome: ConnectOutcome,
     },
+    /// NAT traversal output: path transitions, reachability, and relay
+    /// reservations.
+    ///
+    /// Attempt terminals travel only as [`Self::ConnectSettled`]:
+    /// `NatEvent::ConnectFailed` and `NatEvent::FellBackToRelay` are consumed
+    /// by the Connection-attempt engine and never appear here. A path
+    /// transition such as `NatEvent::PathUpgraded` can still follow its
+    /// attempt's `ConnectSettled` when the attempt settled on a provisional
+    /// Relayed path first.
+    #[cfg(any(feature = "nat", feature = "portable-autonat"))]
+    Nat(minip2p_nat::NatEvent),
+    /// Gossipsub output: messages, subscription changes, and diagnostics.
+    /// Discovery-owned beacon-topic traffic never appears here.
+    #[cfg(feature = "pubsub")]
+    Gossipsub(minip2p_pubsub::GossipsubEvent),
+    /// Discovery peer-book changes from signed beacons and mDNS.
+    #[cfg(any(feature = "discovery", feature = "mdns", feature = "portable-mdns"))]
+    Discovery(minip2p_discovery::DiscoveryEvent),
+    /// Relay-service output: reservations, circuits, and runtime errors.
+    #[cfg(feature = "relay-server")]
+    RelayServer(minip2p_relay_server::RelayServerEvent),
 }
 
 impl EndpointEvent {

@@ -6,8 +6,8 @@
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectFailure, ConnectOutcome, ConnectionId, Endpoint, Event, NatConfig, NatEvent, Path,
-    PeerId, ReservationPolicy,
+    ConnectFailure, ConnectId, ConnectOutcome, ConnectionId, Endpoint, Event, NatConfig, NatEvent,
+    Path, PeerId, ReservationPolicy,
 };
 
 #[path = "../../../tests/support/relay.rs"]
@@ -41,27 +41,20 @@ fn direct_candidate_wins_over_loopback() {
     let mut settled = None;
     while path.is_none() || settled.is_none() {
         assert!(Instant::now() < deadline, "direct connect timed out");
+        let event = a.next_event(Duration::from_millis(20)).expect("a drives");
         if let Some(Event::ConnectSettled {
             connect_id,
             outcome,
             ..
-        }) = a.next_event(Duration::from_millis(20)).expect("a drives")
-            && connect_id == id
+        }) = &event
+            && *connect_id == id
         {
-            settled = Some(outcome);
+            settled = Some(outcome.clone());
+        }
+        if let Some(event) = &event {
+            observe_path_event(event, id, b_addr.peer_id(), &mut path);
         }
         let _ = b.next_event(Duration::from_millis(20)).expect("b drives");
-        for event in a.take_nat_events() {
-            if let NatEvent::PathEstablished {
-                connect_id,
-                path: found,
-                ..
-            } = event
-                && connect_id == id
-            {
-                path = Some(found);
-            }
-        }
     }
     assert!(matches!(path, Some(Path::DirectDialed)));
     assert!(
@@ -232,12 +225,11 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
             Instant::now() < reservation_deadline,
             "responder did not reserve on relay"
         );
-        let _ = responder
+        if let Some(Event::Nat(NatEvent::RelayReserved { relay, .. })) = responder
             .next_event(Duration::from_millis(20))
-            .expect("drive responder reservation");
-        if responder.take_nat_events().iter().any(
-            |event| matches!(event, NatEvent::RelayReserved { relay, .. } if relay == relay_addr.peer_id()),
-        ) {
+            .expect("drive responder reservation")
+            && &relay == relay_addr.peer_id()
+        {
             break;
         }
         relay.assert_healthy();
@@ -289,6 +281,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
             {
                 settled = Some(outcome.clone());
             }
+            observe_path_event(&event, connect_id, &responder_peer, &mut path);
             observe_circuit_event(
                 event,
                 &responder_peer,
@@ -307,22 +300,6 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
                 &mut responder_circuit,
                 &mut responder_ready,
             );
-        }
-        for event in initiator.take_nat_events() {
-            trace.push(format!("initiator nat: {event:?}"));
-            if let NatEvent::PathEstablished {
-                connect_id: found,
-                peer,
-                path: found_path,
-            } = event
-                && found == connect_id
-                && peer == responder_peer
-            {
-                path = Some(found_path);
-            }
-        }
-        for event in responder.take_nat_events() {
-            trace.push(format!("responder nat: {event:?}"));
         }
         relay.assert_healthy();
     }
@@ -499,12 +476,11 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
             Instant::now() < reservation_deadline,
             "responder did not reserve on the TCP relay"
         );
-        let _ = responder
+        if let Some(Event::Nat(NatEvent::RelayReserved { relay, .. })) = responder
             .next_event(Duration::from_millis(20))
-            .expect("drive responder reservation");
-        if responder.take_nat_events().iter().any(
-            |event| matches!(event, NatEvent::RelayReserved { relay, .. } if relay == relay_addr.peer_id()),
-        ) {
+            .expect("drive responder reservation")
+            && &relay == relay_addr.peer_id()
+        {
             break;
         }
         relay.assert_healthy();
@@ -553,6 +529,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
                 assert!(conn_id.is_circuit());
                 settled = true;
             }
+            observe_path_event(&event, connect_id, &responder_peer, &mut path);
             observe_circuit_event(
                 event,
                 &responder_peer,
@@ -571,19 +548,6 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
                 &mut responder_ready,
             );
         }
-        for event in initiator.take_nat_events() {
-            if let NatEvent::PathEstablished {
-                connect_id: found,
-                peer,
-                path: found_path,
-            } = event
-                && found == connect_id
-                && peer == responder_peer
-            {
-                path = Some(found_path);
-            }
-        }
-        let _ = responder.take_nat_events();
         relay.assert_healthy();
     }
 
@@ -772,12 +736,11 @@ fn cancel_mid_relay_leg_emits_cancelled_and_closes_circuits() {
             Instant::now() < reservation_deadline,
             "responder did not reserve on relay"
         );
-        let _ = responder
+        if let Some(Event::Nat(NatEvent::RelayReserved { relay, .. })) = responder
             .next_event(Duration::from_millis(20))
-            .expect("drive responder reservation");
-        if responder.take_nat_events().iter().any(
-            |event| matches!(event, NatEvent::RelayReserved { relay, .. } if relay == relay_addr.peer_id()),
-        ) {
+            .expect("drive responder reservation")
+            && &relay == relay_addr.peer_id()
+        {
             break;
         }
         relay.assert_healthy();
@@ -821,6 +784,21 @@ fn cancel_mid_relay_leg_emits_cancelled_and_closes_circuits() {
 
     assert!(initiator.swarm().transport().circuit_ids().is_empty());
     assert!(!initiator.connected_peers().contains(&responder_peer));
+}
+
+/// Records the first NAT path the Endpoint event stream reports for `id`.
+fn observe_path_event(event: &Event, id: ConnectId, remote: &PeerId, path: &mut Option<Path>) {
+    if let Event::Nat(NatEvent::PathEstablished {
+        connect_id,
+        peer,
+        path: found,
+    }) = event
+        && *connect_id == id
+        && peer == remote
+        && path.is_none()
+    {
+        *path = Some(found.clone());
+    }
 }
 
 fn observe_circuit_event(

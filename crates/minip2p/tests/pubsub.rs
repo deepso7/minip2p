@@ -30,20 +30,21 @@ fn is_gossipsub_protocol(protocol_id: &str) -> bool {
 fn drive(endpoints: &mut [&mut Endpoint]) -> Vec<Vec<GossipsubEvent>> {
     let mut collected = vec![Vec::new(); endpoints.len()];
     for (endpoint, events) in endpoints.iter_mut().zip(&mut collected) {
-        if let Some(event) = endpoint
+        match endpoint
             .next_event(Duration::from_millis(20))
             .expect("endpoint drives")
         {
-            assert!(
+            Some(Event::Gossipsub(event)) => events.push(event),
+            Some(event) => assert!(
                 !matches!(
                     &event,
                     Event::StreamReady { protocol_id, .. }
                         if is_gossipsub_protocol(protocol_id)
                 ),
                 "pubsub streams must be invisible to the app: {event:?}"
-            );
+            ),
+            None => {}
         }
-        events.extend(endpoint.take_gossipsub_events());
     }
     collected
 }
@@ -295,12 +296,11 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
     let reserve_deadline = Instant::now() + Duration::from_secs(10);
     loop {
         assert!(Instant::now() < reserve_deadline, "reservation timed out");
-        let _ = b
+        if let Some(Event::Nat(NatEvent::RelayReserved { relay, .. })) = b
             .next_event(Duration::from_millis(20))
-            .expect("drive reservation");
-        if b.take_nat_events().iter().any(
-            |event| matches!(event, NatEvent::RelayReserved { relay, .. } if relay == relay_addr.peer_id()),
-        ) {
+            .expect("drive reservation")
+            && &relay == relay_addr.peer_id()
+        {
             break;
         }
         relay.assert_healthy();
@@ -318,20 +318,16 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
         .expect("bind initiator");
     a.listen().expect("initiator listens");
     a.subscribe(TOPIC).expect("initiator subscribes");
-    let connect_id = a.connect(&b_peer).expect("relay-only connect");
+    a.connect(&b_peer).expect("relay-only connect");
 
     drive_until(&mut [&mut a, &mut b], Duration::from_secs(15), |all| {
         saw_subscription(&all[0], TOPIC) && saw_subscription(&all[1], TOPIC)
     });
-    let nat = a.take_nat_events();
-    assert!(nat.iter().any(|event| matches!(
-        event,
-        NatEvent::PathEstablished {
-            connect_id: found,
-            peer,
-            path: Path::Relayed { relay: found_relay },
-        } if *found == connect_id && peer == &b_peer && found_relay == relay.addr().peer_id()
-    )));
+    // `drive` consumed the NAT path event; the State snapshot keeps the truth.
+    assert!(matches!(
+        a.path(&b_peer),
+        Some(Path::Relayed { relay: found_relay }) if &found_relay == relay.addr().peer_id()
+    ));
     let circuit_id = *a
         .swarm()
         .transport()
@@ -370,18 +366,21 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
                 Event::ConnectionEstablished { peer_id, conn_id } if peer_id == b_peer => {
                     a_sequence.push(("established", conn_id));
                 }
+                Event::Gossipsub(GossipsubEvent::PeerSubscribed { topic, .. })
+                    if topic == TOPIC =>
+                {
+                    a_resubscribed = true;
+                }
                 _ => {}
             }
         }
-        let _ = b
+        if let Some(Event::Gossipsub(GossipsubEvent::PeerSubscribed { topic, .. })) = b
             .next_event(Duration::from_millis(20))
-            .expect("drive responder upgrade");
-        a_resubscribed |= a.take_gossipsub_events().iter().any(
-            |event| matches!(event, GossipsubEvent::PeerSubscribed { topic, .. } if topic == TOPIC),
-        );
-        b_resubscribed |= b.take_gossipsub_events().iter().any(
-            |event| matches!(event, GossipsubEvent::PeerSubscribed { topic, .. } if topic == TOPIC),
-        );
+            .expect("drive responder upgrade")
+            && topic == TOPIC
+        {
+            b_resubscribed = true;
+        }
         relay.assert_healthy();
     }
     assert!(

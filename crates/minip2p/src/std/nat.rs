@@ -19,8 +19,8 @@ use crate::EndpointSwarm;
 /// Drives a [`NatAgent`] against the endpoint's swarm.
 pub(crate) struct NatDriver {
     pub(crate) agent: NatAgent,
-    /// NAT events awaiting the application (drained via
-    /// `Endpoint::take_nat_events` / `next_nat_event` / `nat_wait_path`).
+    /// NAT events awaiting the Endpoint event stream; the endpoint moves
+    /// them out once the Connection-attempt engine has observed them.
     pub(crate) events: VecDeque<NatEvent>,
     /// Monotonic epoch for the agent's `mono_ms` clock.
     epoch: Instant,
@@ -148,19 +148,32 @@ impl NatDriver {
         self.promoted.retain(|_, id| active.contains(id));
     }
 
-    pub(crate) fn unobserved_events(&self) -> Vec<NatEvent> {
-        self.events.iter().skip(self.observed).cloned().collect()
+    /// Queued events the Connection-attempt engine has not observed yet.
+    pub(crate) fn unobserved_events(&self) -> impl Iterator<Item = &NatEvent> {
+        self.events.iter().skip(self.observed)
     }
 
     pub(crate) fn mark_observed(&mut self) {
         self.observed = self.events.len();
     }
 
-    pub(crate) fn take_events(&mut self) -> Vec<NatEvent> {
+    /// Drains every queued event for the application once the engine has
+    /// observed it. `ConnectFailed` and `FellBackToRelay` are attempt
+    /// terminals the engine already reports as `ConnectSettled`, so they
+    /// are not repeated.
+    pub(crate) fn drain_application_events(&mut self) -> impl Iterator<Item = NatEvent> + '_ {
         self.observed = 0;
-        self.events.drain(..).collect()
+        self.events.drain(..).filter(|event| {
+            !matches!(
+                event,
+                NatEvent::ConnectFailed { .. } | NatEvent::FellBackToRelay { .. }
+            )
+        })
     }
 
+    /// Keeps the observation cursor aligned when the discovery sweep removes
+    /// an attempt event it owns.
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
     pub(crate) fn note_removed(&mut self, index: usize) {
         if index < self.observed {
             self.observed -= 1;
@@ -530,18 +543,25 @@ mod tests {
     }
 
     #[cfg(feature = "relay-server")]
-    fn drive_until_reserved(client: &mut Endpoint, relay: &mut Endpoint, transport: &str) {
+    /// Drives until the client holds a reservation; returns the NAT events
+    /// the client's Endpoint event stream delivered meanwhile.
+    fn drive_until_reserved(
+        client: &mut Endpoint,
+        relay: &mut Endpoint,
+        transport: &str,
+    ) -> Vec<NatEvent> {
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let mut nat_events = Vec::new();
         while client.active_reservation().is_none() {
             assert!(
                 Instant::now() < deadline,
                 "client did not acquire {transport} relay reservation"
             );
-            match client
+            if let Some(Event::Nat(event)) = client
                 .next_event(std::time::Duration::from_millis(10))
                 .expect("drive reservation client")
             {
-                Some(_) | None => {}
+                nat_events.push(event);
             }
             match relay
                 .next_event(std::time::Duration::from_millis(10))
@@ -550,6 +570,7 @@ mod tests {
                 Some(_) | None => {}
             }
         }
+        nat_events
     }
 
     #[cfg(all(feature = "quic", feature = "relay-server"))]
@@ -578,18 +599,18 @@ mod tests {
             .bind_quic("127.0.0.1:0")
             .expect("bind client");
 
-        drive_until_reserved(&mut client, &mut relay, "QUIC");
+        let mut reservation_events = drive_until_reserved(&mut client, &mut relay, "QUIC");
 
         let observe_until = Instant::now() + std::time::Duration::from_millis(1_200);
         let mut ping_rtts = 0;
         while Instant::now() < observe_until {
-            if matches!(
-                client
-                    .next_event(std::time::Duration::from_millis(10))
-                    .expect("drive client"),
-                Some(Event::PingRttMeasured { .. })
-            ) {
-                ping_rtts += 1;
+            match client
+                .next_event(std::time::Duration::from_millis(10))
+                .expect("drive client")
+            {
+                Some(Event::PingRttMeasured { .. }) => ping_rtts += 1,
+                Some(Event::Nat(event)) => reservation_events.push(event),
+                _ => {}
             }
             match relay
                 .next_event(std::time::Duration::from_millis(10))
@@ -599,7 +620,7 @@ mod tests {
             }
         }
 
-        let reservation_events = client.take_nat_events();
+        reservation_events.extend(client.take_nat_events());
         assert!(ping_rtts > 0, "reservation liveness should send QUIC pings");
         assert!(client.active_reservation().is_some());
         assert_eq!(
@@ -632,20 +653,15 @@ mod tests {
                 .next_event(std::time::Duration::from_millis(10))
                 .expect("drive reconnecting client")
             {
-                Some(_) | None => {}
+                Some(Event::Nat(NatEvent::RelayReservationLost { .. })) => lost = true,
+                Some(Event::Nat(NatEvent::RelayReserved { .. })) if lost => reacquired = true,
+                _ => {}
             }
             match relay
                 .next_event(std::time::Duration::from_millis(10))
                 .expect("drive relay after disconnect")
             {
                 Some(_) | None => {}
-            }
-            for event in client.take_nat_events() {
-                match event {
-                    NatEvent::RelayReservationLost { .. } => lost = true,
-                    NatEvent::RelayReserved { .. } if lost => reacquired = true,
-                    _ => {}
-                }
             }
         }
         assert!(lost, "genuine relay loss must remain observable");

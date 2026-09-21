@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use minip2p::{EndpointWake, Error, NatEvent};
+use minip2p::{EndpointWaitOutcome, Error, NatEvent};
 
 use crate::endpoint::{Lifecycle, Shared};
-use crate::events::{convert_discovery, convert_endpoint_event, convert_gossipsub, convert_nat};
+use crate::events::convert_endpoint_event;
 use crate::{DriverFailureKind, EventDoorbell, P2pEvent};
 
 const DRIVER_POLL: Duration = Duration::from_millis(25);
@@ -204,8 +204,8 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             ..
         } = &mut *state;
         let endpoint = endpoint.as_mut().expect("running endpoint exists");
-        let wake = endpoint.next_wake(deadline)?;
-        if matches!(wake, EndpointWake::Interrupted) {
+        let outcome = endpoint.wait(deadline)?;
+        if matches!(outcome, EndpointWaitOutcome::Interrupted) {
             drop(state);
             while guard.shared.pending_commands.load(Ordering::Acquire) != 0 {
                 std::thread::sleep(Duration::from_millis(1));
@@ -213,19 +213,9 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             continue;
         }
 
-        let nat_events = endpoint.take_nat_events();
-        ingest(
-            nat_events
-                .into_iter()
-                .filter(|event| {
-                    nat_connect_id(event).is_none_or(|id| !cancelled_connect_ids.contains(&id))
-                })
-                .filter_map(convert_nat),
-            carry,
-            overflow,
-            stats,
-        );
-        if let EndpointWake::Event(event) = wake {
+        // Every capability's output arrives through the Endpoint event
+        // stream, so the carry receives events in Endpoint emission order.
+        if let EndpointWaitOutcome::Event(event) = outcome {
             ingest(
                 convert_filtered_endpoint_event(endpoint, event, cancelled_connect_ids),
                 carry,
@@ -237,24 +227,6 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             endpoint.poll()?.into_iter().filter_map(|event| {
                 convert_filtered_endpoint_event(endpoint, event, cancelled_connect_ids)
             }),
-            carry,
-            overflow,
-            stats,
-        );
-        ingest(
-            endpoint
-                .take_gossipsub_events()
-                .into_iter()
-                .map(convert_gossipsub),
-            carry,
-            overflow,
-            stats,
-        );
-        ingest(
-            endpoint
-                .take_discovery_events()
-                .into_iter()
-                .map(convert_discovery),
             carry,
             overflow,
             stats,
@@ -316,9 +288,12 @@ fn convert_filtered_endpoint_event(
     event: minip2p::Event,
     cancelled: &BTreeSet<u64>,
 ) -> Option<P2pEvent> {
-    if let minip2p::Event::ConnectSettled { connect_id, .. } = &event
-        && cancelled.contains(&connect_id.as_u64())
-    {
+    let cancelled_attempt = match &event {
+        minip2p::Event::ConnectSettled { connect_id, .. } => Some(connect_id.as_u64()),
+        minip2p::Event::Nat(event) => nat_connect_id(event),
+        _ => None,
+    };
+    if cancelled_attempt.is_some_and(|id| cancelled.contains(&id)) {
         return None;
     }
     convert_endpoint_event(endpoint, event)
