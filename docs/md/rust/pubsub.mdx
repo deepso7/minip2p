@@ -29,11 +29,12 @@ The Cargo feature alone only compiles the APIs. Calling `subscribe` on an endpoi
 node.publish("news", b"hello mesh".to_vec())?;
 
 loop {
-    if let Some(event) =
-        node.next_gossipsub_event(std::time::Duration::from_secs(5))?
-    {
-        println!("{event:?}");
-        break;
+    match node.wait(std::time::Duration::from_secs(5))? {
+        minip2p::EndpointWaitOutcome::Event(minip2p::EndpointEvent::Gossipsub(event)) => {
+            println!("{event:?}");
+            break;
+        }
+        _ => {}
     }
 }
 ```
@@ -42,34 +43,42 @@ A successful `publish` means the message passed validation and outbound work was
 
 There is no self-delivery. If the local application needs immediate feedback, handle its submitted value locally rather than waiting to receive its own message.
 
-Later delivery problems appear as `GossipsubEvent::OutboundFailure` or ordinary `Event::Error` runtime events; they are not returned synchronously from an already accepted `publish`.
+Later delivery problems appear as `GossipsubEvent::OutboundFailure` or ordinary `EndpointEvent::Error` runtime events; they are not returned synchronously from an already accepted `publish`.
 
 ## Handle messages
 
 ```rust
-use minip2p::GossipsubEvent;
+use std::time::Duration;
 
-for event in node.take_gossipsub_events() {
-    match event {
-        GossipsubEvent::Message {
+use minip2p::{EndpointEvent, EndpointWaitOutcome, GossipsubEvent};
+
+loop {
+    match node.wait(Duration::from_millis(250))? {
+        EndpointWaitOutcome::Event(EndpointEvent::Gossipsub(GossipsubEvent::Message {
             from,
             topics,
             data,
             signed,
             ..
-        } => {
+        })) => {
             println!(
                 "from={from} topics={topics:?} signed={signed} data={:?}",
                 String::from_utf8_lossy(&data),
             );
         }
-        GossipsubEvent::ProtocolViolation { peer, reason } => {
+        EndpointWaitOutcome::Event(EndpointEvent::Gossipsub(GossipsubEvent::ProtocolViolation {
+            peer,
+            reason,
+        })) => {
             eprintln!("peer={peer} violated pubsub: {reason}");
         }
-        _ => {}
+        EndpointWaitOutcome::Event(_) => {} // EndpointEvent is non-exhaustive
+        EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted => {}
     }
 }
 ```
+
+Gossipsub output arrives as `EndpointEvent::Gossipsub` on the Endpoint event stream. Discovery beacon-topic traffic never appears there. The migration APIs `take_gossipsub_events` / `next_gossipsub_event` remain until #181.
 
 Use `subscribe` and `unsubscribe` to change local topic membership. Both return `false` when the requested state already held.
 

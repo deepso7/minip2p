@@ -1,22 +1,21 @@
 ---
 title: Drive events
-description: Use focused waits for milestones, next_event for application loops, and next_wake when capability queues matter.
+description: Use one Endpoint::wait loop for every event, including NAT, pubsub, discovery, and relay-server output.
 ---
 
-minip2p remains caller-driven at every layer. The application chooses when to poll, how long to wait, and which event queue to consume. Read [where events go](/rust/concepts#where-events-go) first. If you are working with custom streams, also read [Register a protocol](/rust/register-a-protocol).
+minip2p remains caller-driven at every layer. The application chooses when to poll, how long to wait, and which events to handle. Read [where events go](/rust/concepts#where-events-go) first. If you are working with custom streams, also read [Register a protocol](/rust/register-a-protocol).
 
 ## Pick a driving method
 
-Use `Endpoint::wait` for the ADR 0007 Endpoint wait outcomes (event, deadline, or interrupted). If NAT, pubsub, discovery, or relay-server is enabled, keep using `next_wake` until capability events join the stream (#177) — `wait` does not wake on capability progress. Prefer `connect` plus `ConnectSettled` for a Connection attempt. Use focused waits such as `nat_wait_path` (nat) and `wait_peer_ready` when you need a particular milestone during migration. Use `next_event` for legacy application loops, or `next_wake` when your loop also handles capability queues and interruptions. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
+Use `Endpoint::wait` for the ADR 0007 Endpoint wait outcomes (event, deadline, or interrupted). It wakes on and delivers enabled capability output, so one `wait` loop sees every event exactly once for every feature combination. Prefer `connect` plus `ConnectSettled` for a Connection attempt. Focused waits such as `nat_wait_path` (nat) and `wait_peer_ready`, plus `next_event`, remain during migration (until #181). All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
 
 | Method | Behavior | Good fit |
 | --- | --- | --- |
-| `wait(deadline)` | Drive until one Endpoint event, deadline, or interruption. No driver-progress. | New application event loops; correlating an operation while dispatching others |
+| `wait(deadline)` | Drive until one Endpoint event (including capability events), deadline, or interruption. | Every application event loop; correlating an operation while dispatching others |
 | `nat_wait_path` / `wait_peer_ready` / `wait_ping_rtt` | Drive until one milestone, buffering unrelated events. | Connection and setup milestones (migration) |
-| Feature-focused waits | Drive until a NAT, pubsub, signed-discovery, or mDNS result. | Feature-specific workflows (migration) |
+| `next_nat_event` / `next_gossipsub_event` / `next_discovery_event` / `next_relay_server_event` | Drive until the next matching capability event; other events stay queued. | Feature-specific workflows (migration) |
 | `next_event(deadline)` | Drive until one ordinary application event or the deadline; swallows interruption. | Legacy synchronous loops |
-| `next_wake(deadline)` | Drive until an application event, optional-capability progress, interruption, or the deadline. | One interruptible loop over ordinary and capability events |
-| `poll()` | One non-blocking drive; returns currently available application events. | Existing game, UI, or reactor loops |
+| `poll()` | One non-blocking drive; returns currently available Endpoint events. | Existing game, UI, or reactor loops |
 
 ## Deadline forms
 
@@ -32,7 +31,7 @@ let absolute = Instant::now() + Duration::from_secs(5);
 let forever = Deadline::NEVER;
 ```
 
-An already-passed absolute `Instant` deadline returns `Deadline` from `wait` / `next_wake` (or `None` from `next_event`) before delivering another queued event. Relative `Duration` deadlines — including `Duration::ZERO` non-blocking drains — still inspect buffered events and poll once. The endpoint does not sleep or poll repeatedly past the deadline.
+An already-passed absolute `Instant` deadline returns `Deadline` from `wait` (or `None` from `next_event`) before delivering another queued event. Relative `Duration` deadlines — including `Duration::ZERO` non-blocking drains — still inspect buffered events and poll once. The endpoint does not sleep or poll repeatedly past the deadline.
 
 ## Wait for a milestone
 
@@ -72,7 +71,7 @@ With the `nat` feature, `connect` races direct candidates against a relay leg wh
 
 ## Application event loops
 
-Prefer `wait` and dispatch unrelated events while correlating an operation (for capability-enabled endpoints, prefer `next_wake` until #177):
+Prefer `wait` and dispatch unrelated events while correlating an operation:
 
 ```rust
 use std::time::{Duration, Instant};
@@ -96,7 +95,7 @@ fn run(mut node: Endpoint, peer: minip2p::PeerId) -> Result<(), minip2p::Error> 
                 eprintln!("runtime error: {error:?}");
             }
             EndpointWaitOutcome::Event(_) => {
-                // Handle unrelated connection / stream / ping events.
+                // Handle unrelated connection / stream / ping / capability events.
             }
             EndpointWaitOutcome::Deadline => break,
             EndpointWaitOutcome::Interrupted => {
@@ -108,11 +107,11 @@ fn run(mut node: Endpoint, peer: minip2p::PeerId) -> Result<(), minip2p::Error> 
 }
 ```
 
-Synchronous method failures are returned as `minip2p::Error`. Non-fatal problems that occur later while driving appear as `Event::Error` or a feature-specific failure event.
+Synchronous method failures are returned as `minip2p::Error`. Non-fatal problems that occur later while driving appear as `EndpointEvent::Error` or a capability failure event such as `EndpointEvent::RelayServer(RelayServerEvent::Error { .. })`.
 
 ## Focused waits preserve other events
 
-Suppose `nat_wait_path` is waiting for a NAT result while an application stream receives data. The stream event is retained and becomes available through a later `next_event`; it is not discarded by the NAT wait.
+Suppose `nat_wait_path` is waiting for a NAT result while an application stream receives data. The stream event is retained and becomes available through a later `wait`; it is not discarded by the NAT wait.
 
 That retained backlog is bounded by `RUN_UNTIL_SKIP_LIMIT` (currently 1024 events). If a focused wait cannot find its result while unrelated events keep arriving, it returns:
 
@@ -120,7 +119,7 @@ That retained backlog is bounded by `RUN_UNTIL_SKIP_LIMIT` (currently 1024 event
 minip2p::Error::EventBacklogExceeded { limit: RUN_UNTIL_SKIP_LIMIT }
 ```
 
-Drain ordinary application events with `next_event` or `poll`, handle the high-volume source, and then retry the focused wait.
+Drain events with `wait` or `poll`, handle the high-volume source, and then retry the focused wait.
 
 <Callout type="tip">
 
@@ -141,24 +140,28 @@ With the `mdns` feature, `endpoint.shutdown()` has a narrower meaning: it sends 
 
 ## Wait for every event family
 
-`next_event` waits for ordinary endpoint events. Use `next_wake` when one loop also needs prompt access to NAT, pubsub, discovery, or relay-server events:
+`wait` delivers ordinary and capability events on one stream. `EndpointEvent` is `#[non_exhaustive]`, so keep a wildcard arm:
 
 ```rust
-use minip2p::{Deadline, EndpointWake};
+use std::time::Duration;
+
+use minip2p::{EndpointEvent, EndpointWaitOutcome, GossipsubEvent, NatEvent};
 
 loop {
-    match node.next_wake(Deadline::NEVER)? {
-        EndpointWake::Event(event) => handle_event(event),
-        EndpointWake::DriverProgress => {
-            for event in node.take_gossipsub_events() {
-                handle_pubsub_event(event);
-            }
-        }
-        EndpointWake::Deadline | EndpointWake::Interrupted => {}
+    match endpoint.wait(Duration::from_millis(250))? {
+        EndpointWaitOutcome::Event(EndpointEvent::Gossipsub(GossipsubEvent::Message { data, .. })) => { /* ... */ }
+        EndpointWaitOutcome::Event(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) => { /* ... */ }
+        EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled { connect_id, outcome, .. }) => { /* ... */ }
+        EndpointWaitOutcome::Event(_) => {} // EndpointEvent is non-exhaustive
+        EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted => {}
     }
 }
 ```
 
-`DriverProgress` remains ready while any enabled capability queue contains events. Drain every enabled queue before calling `next_wake` again. Leaving one non-empty causes the next call to return immediately.
+Capability variants exist only when their feature is enabled: `Nat` (`nat`), `Gossipsub` (`pubsub`), `Discovery` (`discovery` / `mdns`), and `RelayServer` (`relay-server`). Within one Endpoint step, swarm events come first, then capability events in relay-server, NAT, Gossipsub, Discovery order, then Connection-attempt terminals (`ConnectSettled`). No order is promised between concurrently racing Transport candidates. NAT attempt terminals (`ConnectFailed`, `FellBackToRelay`) never appear; `ConnectSettled` carries the outcome. A `PathUpgraded` can still follow its attempt's `ConnectSettled` when the attempt settled on a provisional Relayed path.
+
+State snapshot getters such as `path`, `reachability`, `active_reservation`, and `known_peers` stay authoritative for durable state. They may be ahead of the event stream, never behind their own emitted transition.
+
+The migration APIs `next_wake` (a wrapper over `wait`), `take_*_events`, and `next_*_event` remain until #181. `take_*_events` and `next_*_event` remove matching events from the same stream, so each event is delivered once, either by them or by `wait`.
 
 See [Rust troubleshooting](/rust/troubleshooting) for common event symptoms and responses.

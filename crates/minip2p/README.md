@@ -59,7 +59,7 @@ let mut endpoint = Endpoint::portable(&identity, entropy)
     .build()?;
 ```
 
-Use `tcp_config`, `smoltcp_config`, `mdns_config`, `mdns_carrier_config`, `gossipsub_config`, `beacon_config`, and `discovery_config` only when overriding defaults. The endpoint installs every adapter on the same stack, returns TCP, pubsub, and discovery progress through one `SmoltcpEvent` enum, and automatically dials newly observed peers. `poll(now)` advances all enabled services and `next_deadline(now)` folds their timelines. Manual provider composition remains available through `build(transport)`.
+Use `tcp_config`, `smoltcp_config`, `mdns_config`, `mdns_carrier_config`, `gossipsub_config`, `beacon_config`, and `discovery_config` only when overriding defaults. The endpoint installs every adapter on the same stack, returns TCP, NAT, pubsub, and discovery progress as `EndpointEvent` values (`EndpointEvent::Nat`, `EndpointEvent::Gossipsub`, `EndpointEvent::Discovery`), and automatically dials newly observed peers. `poll(now)` advances all enabled services and `next_deadline(now)` folds their timelines. Manual provider composition remains available through `build(transport)`.
 
 Portable AutoNAT is opt-in, and does not pull circuit transport state into an AutoNAT-only binary. Enable `portable-autonat`, configure one or more trusted servers, and read the latest verdict from the same caller-driven endpoint:
 
@@ -77,7 +77,7 @@ for event in endpoint.poll(now)? {
 let reachability = endpoint.reachability();
 ```
 
-Once at least one TCP listen address exists, the first due `poll(now)` starts a probe by dialing the configured server. Successful exchanges emit `SmoltcpEvent::Nat(NatEvent::ReachabilityChanged { .. })` after the configured confidence threshold is met; `reachability()` then returns that same settled verdict. Until a server exchange succeeds, it remains `Unknown`.
+Once at least one TCP listen address exists, the first due `poll(now)` starts a probe by dialing the configured server. Successful exchanges emit `EndpointEvent::Nat(NatEvent::ReachabilityChanged { .. })` after the configured confidence threshold is met; `reachability()` then returns that same settled verdict. Until a server exchange succeeds, it remains `Unknown`.
 
 Portable relay circuits remain a separate opt-in. Enable `portable-relay` (which includes `portable-autonat` and `smoltcp`), configure a relay, and drive connection progress through the same endpoint:
 
@@ -90,7 +90,7 @@ let mut endpoint = Endpoint::portable(&identity, entropy)
 let connect = endpoint.connect(&remote_peer, now)?;
 while endpoint.path(&remote_peer).is_none() {
     for event in endpoint.poll(now)? {
-        // Handle SmoltcpEvent::Nat and ordinary endpoint events.
+        // Handle EndpointEvent::Nat and ordinary endpoint events.
     }
 }
 ```
@@ -120,9 +120,28 @@ With the `nat` feature, an endpoint holding a QUIC relay reservation sends a pin
 
 `minip2p::Error` preserves transport failures, Sans-I/O state rejections, and driver-invariant failures as separate variants. Resource limits are configurable through `EndpointBuilder::quic_limits` and `EndpointBuilder::tcp_config`.
 
-Prefer `Endpoint::wait` for the ordered Endpoint event stream: it returns an event, deadline, or interruption without swallowing interrupts, and does not use `DriverProgress`. If NAT, pubsub, discovery, or relay-server is enabled, keep using `next_wake` until capability events join the stream (#177) — `wait` does not wake on capability progress. State snapshot getters (`connected_peers`, `is_peer_ready`, `peer_info`, `connection_id`, `connection_remote_addr`, `bound_addresses`) expose durable state without driving the endpoint; they are not one cross-getter atomic snapshot and may be ahead of the event stream. Prefer `connect` plus `ConnectSettled` for a Connection attempt. Focused waits such as `nat_wait_path` and `wait_peer_ready`, plus `next_event` / `next_wake`, remain during migration. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. `next_wake` reports capability queue progress as `DriverProgress`; drain NAT, pubsub, discovery, or relay-server events with the matching `take_*_events` before calling it again. Deadlines accept an `Instant` (absolute), a `Duration` (relative), or `minip2p::Deadline::NEVER`. For `wait`, `next_wake`, and `next_event`, an already-passed absolute Instant returns `Deadline` / `None` before delivering another queued event; relative `Duration::ZERO` still drains / polls once. `next_wake` returns on application events and on capability queue progress, including events already queued when the call begins. Its `Event` result transfers ownership of one application event; `DriverProgress` leaves agent events in their focused queues for the corresponding `take_*_events` method. Progress is level-triggered across all active agents: drain every non-empty agent queue before calling `next_wake` again, or it will immediately report `DriverProgress` again.
+Prefer `Endpoint::wait` for the ordered Endpoint event stream: it returns an event, deadline, or interruption without swallowing interrupts. `EndpointEvent` is `#[non_exhaustive]` and carries enabled capability output — `Nat`, `Gossipsub`, `Discovery`, `RelayServer` — so one `wait` loop sees every event exactly once for every feature combination. `poll()` and `next_event` deliver the same stream. Within one Endpoint step, swarm events come first, then capability events in relay-server, NAT, Gossipsub, Discovery order, then Connection-attempt terminals (`ConnectSettled`); no order is promised between concurrently racing Transport candidates. NAT attempt terminals (`ConnectFailed`, `FellBackToRelay`) never appear: the outcome is `ConnectSettled`. A `PathUpgraded` can still follow its attempt's `ConnectSettled` when the attempt settled on a provisional Relayed path.
 
-Background drivers can clone `Endpoint::wait_handle()` — a transport-neutral `WaitHandle` — and interrupt a blocked `wait` or `next_wake` from another thread. The wake is reported as `EndpointWaitOutcome::Interrupted` / `EndpointWake::Interrupted`; legacy event-specific waits and `next_event` consume interruptions and continue waiting until their event or deadline.
+```rust,ignore
+use std::time::Duration;
+use minip2p::{EndpointEvent, EndpointWaitOutcome, GossipsubEvent, NatEvent};
+
+loop {
+    match endpoint.wait(Duration::from_millis(250))? {
+        EndpointWaitOutcome::Event(EndpointEvent::Gossipsub(GossipsubEvent::Message { data, .. })) => { /* ... */ }
+        EndpointWaitOutcome::Event(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) => { /* ... */ }
+        EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled { connect_id, outcome, .. }) => { /* ... */ }
+        EndpointWaitOutcome::Event(_) => {} // EndpointEvent is non-exhaustive
+        EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted => {}
+    }
+}
+```
+
+State snapshot getters (`path`, `connected_peers`, `is_peer_ready`, `peer_info`, `connection_id`, `connection_remote_addr`, `bound_addresses`, `reachability`, `active_reservation`, `known_peers`) expose durable state without driving the endpoint; they are not one cross-getter atomic snapshot and may be ahead of the event stream, never behind their own emitted transition. Prefer `connect` plus `ConnectSettled` for a Connection attempt. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. Deadlines accept an `Instant` (absolute), a `Duration` (relative), or `minip2p::Deadline::NEVER`. For `wait` and `next_event`, an already-passed absolute Instant returns `Deadline` / `None` before delivering another queued event; relative `Duration::ZERO` still drains / polls once.
+
+Migration APIs remain until #181 but are not needed for ordinary loops: focused waits (`nat_wait_path`, `wait_peer_ready`, `wait_ping_rtt`), `next_event`, `next_wake` (a wrapper over `wait`), `take_*_events` and `next_*_event` for NAT, Gossipsub, Discovery, and relay-server. `take_*_events` and `next_*_event` remove matching events from the single stream, so each event is delivered once, either by them or by `wait`.
+
+Background drivers can clone `Endpoint::wait_handle()` — a transport-neutral `WaitHandle` — and interrupt a blocked `wait` from another thread. The wake is reported as `EndpointWaitOutcome::Interrupted`; legacy event-specific waits and `next_event` consume interruptions and continue waiting until their event or deadline.
 
 `open_stream` is allowed once the peer is connected. Identify (`PeerReady`) supplies advertised protocols and enables early `RemoteDoesNotSupport` rejects; waiting for it before opening a known application protocol is optional policy, not a stack requirement.
 
@@ -139,17 +158,17 @@ let mut endpoint = minip2p::Endpoint::builder()
 
 Use `relay_server_config` for validated capacity, duration, byte, control, and rate limits. `relay_server_announce_addrs` supplies explicit public TCP/QUIC addresses; it does not enable the service, and invalid shapes fail before binding. Runtime replacement is atomic, with an empty list returning to AutoNAT-confirmed addresses and then concrete listeners. Raw Identify-observed addresses are never promoted.
 
-`set_relay_server_accepting(false)` pauses only new reservations and circuits; HOP stays advertised and existing lifecycles remain active. Drain typed output with `take_relay_server_events`, or use `next_relay_server_event(deadline)` to drive the whole Endpoint while preserving unrelated application events. Synchronous controls return `RelayServerControlError`; failed asynchronous open/send/close/reset operations arrive as `RelayServerEvent::Error`.
+`set_relay_server_accepting(false)` pauses only new reservations and circuits; HOP stays advertised and existing lifecycles remain active. Typed output arrives as `EndpointEvent::RelayServer` from `wait`. The migration APIs `take_relay_server_events` and `next_relay_server_event(deadline)` remain until #181; they remove matching events from the same stream. Synchronous controls return `RelayServerControlError`; failed asynchronous open/send/close/reset operations arrive as `RelayServerEvent::Error`.
 
 Relay-only endpoints accept and advertise inbound HOP and can open outbound STOP. NAT-only endpoints open outbound HOP and accept/advertise trusted STOP, without advertising HOP. Combined endpoints install both role sets. The Swarm keeps one live connection per peer; exact connection targeting by the relay driver relies on that invariant.
 
 When an application permanently relinquishes a stream, `Endpoint::abandon_stream` resets it, purges already-buffered events, and suppresses later stream events. Use `Endpoint::reset_stream` when those terminal events should remain visible.
 
-`EndpointTransport` is the `TransportSet` holding whatever was bound — with the `nat` feature, a `CircuitTransport<TransportSet, StdEntropy>` wrapping it — and `EndpointSwarm` names the resulting concrete swarm type. Relay bridges are promoted through end-to-end Noise and Yamux before `nat_wait_path` returns `Path::Relayed`, so application protocols use ordinary streams on direct and relayed paths alike. `Endpoint::path(peer)` returns the current NAT-orchestrated path independently of whether the corresponding event was drained. It is updated before path events are queued for both outbound connects and accepted inbound circuits, and cleared only after the peer's final usable connection closes.
+`EndpointTransport` is the `TransportSet` holding whatever was bound — with the `nat` feature, a `CircuitTransport<TransportSet, StdEntropy>` wrapping it — and `EndpointSwarm` names the resulting concrete swarm type. Relay bridges are promoted through end-to-end Noise and Yamux before `nat_wait_path` returns `Path::Relayed`, so application protocols use ordinary streams on direct and relayed paths alike. `Endpoint::path(peer)` returns the current NAT-orchestrated path independently of whether the corresponding event was delivered. It is updated before path events are queued for both outbound connects and accepted inbound circuits, and cleared only after the peer's final usable connection closes.
 
-With the `discovery` feature, `.discovery()` enables signed pubsub presence beacons, a bounded TTL address book, and caller-driven automatic NAT connects. It implies the `nat` and `pubsub` features. Applications can inspect `known_peers`, drain `DiscoveryEvent`s, pass a validated `BeaconConfig` to select a room-scoped topic, and use `PeerDiscoveryConfig` for shared book and dial policy. Unsigned discovery beacons are always rejected even if unsigned application pubsub messages are allowed.
+With the `discovery` feature, `.discovery()` enables signed pubsub presence beacons, a bounded TTL address book, and caller-driven automatic NAT connects. It implies the `nat` and `pubsub` features. Applications can inspect `known_peers`, handle `EndpointEvent::Discovery` from `wait`, pass a validated `BeaconConfig` to select a room-scoped topic, and use `PeerDiscoveryConfig` for shared book and dial policy. Unsigned discovery beacons are always rejected even if unsigned application pubsub messages are allowed.
 
-With the `mdns` feature, `.mdns()` enables zero-configuration local-link discovery on `_p2p._udp.local` without enabling pubsub. It implies `nat`, uses the same bounded peer book and dial state as signed discovery when both are enabled, and exposes per-address provenance through `KnownPeer`. Use `.mdns_config(...)` for mDNS timing and packet policy, and `.peer_discovery_config(...)` for the shared book and dial policy. Applications can inspect `known_peers` and drain the same `DiscoveryEvent` queue used by signed discovery. Because mDNS claims are unauthenticated, their automatic dials are direct-only and never activate configured relays. Call `Endpoint::shutdown()` to send TTL-zero goodbyes and stop mDNS while keeping QUIC usable; drop performs the same sends best-effort.
+With the `mdns` feature, `.mdns()` enables zero-configuration local-link discovery on `_p2p._udp.local` without enabling pubsub. It implies `nat`, uses the same bounded peer book and dial state as signed discovery when both are enabled, and exposes per-address provenance through `KnownPeer`. Use `.mdns_config(...)` for mDNS timing and packet policy, and `.peer_discovery_config(...)` for the shared book and dial policy. Applications can inspect `known_peers` and handle the same `EndpointEvent::Discovery` events used by signed discovery. Because mDNS claims are unauthenticated, their automatic dials are direct-only and never activate configured relays. Call `Endpoint::shutdown()` to send TTL-zero goodbyes and stop mDNS while keeping QUIC usable; drop performs the same sends best-effort.
 
 Discovery source timestamps use a driver-private monotonic epoch. Compute their ages from `Endpoint::discovery_now_ms()`; an independently created `Instant` does not share that origin.
 

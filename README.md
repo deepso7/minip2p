@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`Endpoint` is caller-driven: it owns sockets, but it does not start a runtime or background task. Prefer `Endpoint::wait` for the ordered Endpoint event stream. Use `connect` plus `ConnectSettled` for a Connection attempt. Focused waits such as `nat_wait_path` and `wait_peer_ready` remain during migration. Use `next_event` to handle application events, or `next_wake` when your loop also handles capability queues and interruptions. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. Event waits accept an absolute `Instant`, a relative `Duration`, or `Deadline::NEVER`.
+`Endpoint` is caller-driven: it owns sockets, but it does not start a runtime or background task. Prefer `Endpoint::wait` for the ordered Endpoint event stream: one loop sees every event exactly once, including enabled capability output such as `EndpointEvent::Nat`, `EndpointEvent::Gossipsub`, `EndpointEvent::Discovery`, and `EndpointEvent::RelayServer`. Use `connect` plus `ConnectSettled` for a Connection attempt. Focused waits such as `nat_wait_path` and `wait_peer_ready`, plus `next_event`, remain during migration. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. Event waits accept an absolute `Instant`, a relative `Duration`, or `Deadline::NEVER`.
 
 QUIC is the default. Turn on the `tcp` feature to listen on TCP as well, or TCP only. The dial address picks the transport:
 
