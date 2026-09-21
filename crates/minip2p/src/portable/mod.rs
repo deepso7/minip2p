@@ -970,8 +970,9 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     /// Admits one Connection attempt. Sync errors: malformed target only.
     ///
     /// A [`PeerId`] target uses the discovery book's known addresses (when a
-    /// book exists) and the configured relay when one exists. Neither source
-    /// settles [`ConnectFailure::NoUsableRoute`] through one terminal event.
+    /// book exists) and the configured relay when one exists. When neither a
+    /// direct candidate nor a configured relay exists, the attempt settles
+    /// [`ConnectFailure::NoUsableRoute`] through one terminal event.
     ///
     /// Shadows [`PortableEndpoint::connect`]: calling `connect` through
     /// `&mut PortableEndpoint` bypasses NAT and Peer-ID book resolution.

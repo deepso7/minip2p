@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, SansIoProtocol};
 use minip2p_dcutr::{DcutrResponder, DcutrResponderInput, DcutrResponderOutput, ResponderEvent};
 use minip2p_relay::{
-    ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopConnectInput, HopConnectOutput,
+    ConnectOutcome, HopConnect, HopConnectInput, HopConnectOutput, HOP_PROTOCOL_ID,
 };
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -997,6 +997,7 @@ impl ConnectAttempt {
     /// still holds (including a bridge the application was told about — the
     /// caller emits the explaining event first).
     fn teardown_relay_leg(&mut self, shared: &mut Shared) {
+        shared.abort_attempt_dials(self.id);
         self.teardown_dcutr_stream(shared);
         match self.leg {
             RelayLeg::WaitHopReady { stream } | RelayLeg::AwaitHopStatus { stream } => {

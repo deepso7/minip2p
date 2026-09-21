@@ -2,7 +2,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, select_direct_addrs};
+use minip2p_core::{select_direct_addrs, ConnectId, Multiaddr, PeerAddr, PeerId};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -177,6 +177,59 @@ impl Shared {
         self.pending_session_dials
             .insert(token, (addr.peer_id().clone(), expires));
         self.push_action(NatAction::Dial { token, addr });
+    }
+
+    /// Drops queued relay/punch dials for `id` and closes handshakes that
+    /// already have a conn id but have not established. Established punch
+    /// or relay sessions stay up — those are no longer in-flight.
+    ///
+    /// Tokens whose `Dial` was already polled but not yet echoed are kept so
+    /// a late `dial_result` can still close the conn.
+    pub(crate) fn abort_attempt_dials(&mut self, id: ConnectId) {
+        let attempt_tokens: BTreeSet<NatToken> = self
+            .tokens
+            .iter()
+            .filter_map(|(token, purpose)| match purpose {
+                TokenPurpose::RelayDial(attempt) | TokenPurpose::PunchDial(attempt)
+                    if *attempt == id =>
+                {
+                    Some(*token)
+                }
+                _ => None,
+            })
+            .collect();
+        let mut queued = BTreeSet::new();
+        self.actions.retain(|action| match action {
+            NatAction::Dial { token, .. } if attempt_tokens.contains(token) => {
+                queued.insert(*token);
+                false
+            }
+            _ => true,
+        });
+        let mut close = Vec::new();
+        let mut echoed = BTreeSet::new();
+        self.dialed.retain(|conn_id, (token, purpose)| {
+            if attempt_tokens.contains(token)
+                || matches!(
+                    purpose,
+                    TokenPurpose::RelayDial(attempt) | TokenPurpose::PunchDial(attempt)
+                        if *attempt == id
+                )
+            {
+                close.push(*conn_id);
+                echoed.insert(*token);
+                false
+            } else {
+                true
+            }
+        });
+        for conn_id in close {
+            self.push_action(NatAction::CloseCircuit { conn_id });
+        }
+        self.pending_session_dials
+            .retain(|token, _| !attempt_tokens.contains(token));
+        self.tokens
+            .retain(|token, _| !queued.contains(token) && !echoed.contains(token));
     }
 
     /// Whether a session dial toward `peer` is still in flight (issued, not
@@ -738,6 +791,15 @@ impl NatAgent {
                     && let Some(attempt) = self.attempts.get_mut(&id)
                 {
                     attempt.on_dial_result(&purpose, result, &mut self.shared, now);
+                } else if matches!(
+                    purpose,
+                    TokenPurpose::PunchDial(_) | TokenPurpose::RelayDial(_)
+                ) && let Ok(conn_id) = result
+                {
+                    // The attempt ended before the driver echoed this dial.
+                    // Close it so a punch cannot land after Cancelled.
+                    self.shared.dialed.remove(&conn_id);
+                    self.shared.push_action(NatAction::CloseCircuit { conn_id });
                 }
             }
         }

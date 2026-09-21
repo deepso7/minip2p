@@ -202,11 +202,9 @@ fn cancelling_an_active_dcutr_resets_it_and_closes_the_circuit() {
 
     let actions = drain_actions(&mut h.agent);
     assert!(has_reset_for(&actions, stream));
-    assert!(
-        actions.iter().any(
-            |action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)
-        )
-    );
+    assert!(actions
+        .iter()
+        .any(|action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)));
     assert!(!h.agent.owns_stream(&h.target, stream));
     assert!(drain_events(&mut h.agent).is_empty());
 }
@@ -243,10 +241,132 @@ fn cancel_of_a_provisional_leg_closes_the_circuit() {
 
     h.agent.cancel(id, at(400));
 
+    assert!(drain_actions(&mut h.agent)
+        .iter()
+        .any(|action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)));
+    assert!(drain_events(&mut h.agent).is_empty());
+}
+
+#[test]
+fn cancel_drops_a_queued_relay_dial() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let id = h.start(RELAY_NOW, at(0));
+    h.agent.cancel(id, at(1));
+    let actions = drain_actions(&mut h.agent);
+    assert_eq!(dial_count_for(&actions, &h.relay), 0);
+    assert!(drain_events(&mut h.agent).is_empty());
+}
+
+#[test]
+fn cancel_closes_an_in_flight_relay_dial() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let id = h.start(RELAY_NOW, at(0));
+    let token = dial_token_for(&drain_actions(&mut h.agent), &h.relay);
+    let conn = ConnectionId::new(2);
+    h.agent.dial_result(token, Ok(conn), at(1));
+
+    h.agent.cancel(id, at(2));
+    assert!(drain_actions(&mut h.agent)
+        .iter()
+        .any(|action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)));
+
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: conn,
+            peer_id: h.relay.clone(),
+        },
+        at(3),
+    );
+    assert!(drain_events(&mut h.agent).is_empty());
+}
+
+#[test]
+fn cancel_drops_queued_punch_dials() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+    open_inbound_dcutr(&mut h, conn, StreamId::new(90));
+    h.agent.handle_event(
+        &SwarmEvent::StreamData {
+            conn_id: conn,
+            peer_id: h.target.clone(),
+            stream_id: StreamId::new(90),
+            data: dcutr_connect_reply(&[maddr("/ip4/9.9.9.9/udp/4002/quic-v1")]),
+        },
+        at(311),
+    );
+    drain_actions(&mut h.agent);
+    h.agent.handle_event(
+        &SwarmEvent::StreamData {
+            conn_id: conn,
+            peer_id: h.target.clone(),
+            stream_id: StreamId::new(90),
+            data: dcutr_sync(),
+        },
+        at(312),
+    );
+
+    h.agent.cancel(id, at(313));
+    let actions = drain_actions(&mut h.agent);
+    assert_eq!(dial_count_for(&actions, &h.target), 0);
+    assert!(actions
+        .iter()
+        .any(|action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)));
+    assert!(drain_events(&mut h.agent).is_empty());
+}
+
+#[test]
+fn cancel_closes_an_in_flight_punch_dial() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+    let actions = drive_dcutr_through_sync(&mut h, conn, StreamId::new(90));
+    let punch_token = dial_token_for(&actions, &h.target);
+    let punch_conn = ConnectionId::new(44);
+    h.agent.dial_result(punch_token, Ok(punch_conn), at(313));
+
+    h.agent.cancel(id, at(314));
+    let after = drain_actions(&mut h.agent);
+    assert!(after.iter().any(
+        |action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == punch_conn)
+    ));
+    assert!(after
+        .iter()
+        .any(|action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)));
+
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: punch_conn,
+            peer_id: h.target.clone(),
+        },
+        at(315),
+    );
     assert!(
-        drain_actions(&mut h.agent).iter().any(
-            |action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)
-        )
+        drain_events(&mut h.agent).is_empty(),
+        "a punch must not connect the target after Cancelled"
+    );
+}
+
+#[test]
+fn cancel_then_late_punch_dial_result_closes_the_conn() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (id, conn) = drive_to_relayed(&mut h);
+    let actions = drive_dcutr_through_sync(&mut h, conn, StreamId::new(90));
+    let punch_token = dial_token_for(&actions, &h.target);
+
+    h.agent.cancel(id, at(313));
+    let _ = drain_actions(&mut h.agent);
+
+    let punch_conn = ConnectionId::new(44);
+    h.agent.dial_result(punch_token, Ok(punch_conn), at(314));
+    assert!(drain_actions(&mut h.agent).iter().any(
+        |action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == punch_conn)
+    ));
+
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: punch_conn,
+            peer_id: h.target.clone(),
+        },
+        at(315),
     );
     assert!(drain_events(&mut h.agent).is_empty());
 }

@@ -505,7 +505,8 @@ impl Endpoint {
     ///
     /// A [`PeerId`] target uses the discovery book's known addresses (when a
     /// book exists) and the configured relay when one exists and `force_relay`
-    /// / the dial source permit. Neither source settles
+    /// / the dial source permit. When neither a direct candidate nor a
+    /// configured relay exists, the attempt settles
     /// [`crate::ConnectFailure::NoUsableRoute`] through one terminal event.
     ///
     /// Every candidate is DNS-expanded and dialed immediately. Candidate
