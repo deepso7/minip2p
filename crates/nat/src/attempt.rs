@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, SansIoProtocol};
 use minip2p_dcutr::{DcutrResponder, DcutrResponderInput, DcutrResponderOutput, ResponderEvent};
 use minip2p_relay::{
-    ConnectOutcome, HopConnect, HopConnectInput, HopConnectOutput, HOP_PROTOCOL_ID,
+    ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopConnectInput, HopConnectOutput,
 };
 use minip2p_transport::{ConnectionId, StreamId};
 

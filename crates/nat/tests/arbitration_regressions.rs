@@ -202,9 +202,11 @@ fn cancelling_an_active_dcutr_resets_it_and_closes_the_circuit() {
 
     let actions = drain_actions(&mut h.agent);
     assert!(has_reset_for(&actions, stream));
-    assert!(actions
-        .iter()
-        .any(|action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)));
+    assert!(
+        actions.iter().any(
+            |action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)
+        )
+    );
     assert!(!h.agent.owns_stream(&h.target, stream));
     assert!(drain_events(&mut h.agent).is_empty());
 }
@@ -241,9 +243,11 @@ fn cancel_of_a_provisional_leg_closes_the_circuit() {
 
     h.agent.cancel(id, at(400));
 
-    assert!(drain_actions(&mut h.agent)
-        .iter()
-        .any(|action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)));
+    assert!(
+        drain_actions(&mut h.agent).iter().any(
+            |action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)
+        )
+    );
     assert!(drain_events(&mut h.agent).is_empty());
 }
 
@@ -266,9 +270,11 @@ fn cancel_closes_an_in_flight_relay_dial() {
     h.agent.dial_result(token, Ok(conn), at(1));
 
     h.agent.cancel(id, at(2));
-    assert!(drain_actions(&mut h.agent)
-        .iter()
-        .any(|action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)));
+    assert!(
+        drain_actions(&mut h.agent).iter().any(
+            |action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)
+        )
+    );
 
     h.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
@@ -308,9 +314,11 @@ fn cancel_drops_queued_punch_dials() {
     h.agent.cancel(id, at(313));
     let actions = drain_actions(&mut h.agent);
     assert_eq!(dial_count_for(&actions, &h.target), 0);
-    assert!(actions
-        .iter()
-        .any(|action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)));
+    assert!(
+        actions.iter().any(
+            |action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)
+        )
+    );
     assert!(drain_events(&mut h.agent).is_empty());
 }
 
@@ -328,9 +336,11 @@ fn cancel_closes_an_in_flight_punch_dial() {
     assert!(after.iter().any(
         |action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == punch_conn)
     ));
-    assert!(after
-        .iter()
-        .any(|action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)));
+    assert!(
+        after.iter().any(
+            |action| matches!(action, NatAction::CloseCircuit { conn_id } if *conn_id == conn)
+        )
+    );
 
     h.agent.handle_event(
         &SwarmEvent::ConnectionEstablished {
