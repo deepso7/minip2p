@@ -93,6 +93,7 @@ jobs:
       - run: cargo check --no-default-features --features smoltcp,pubsub --target thumbv7em-none-eabi -p minip2p-rs
       - run: cargo check --no-default-features --features portable-autonat --target thumbv7em-none-eabi -p minip2p-rs
       - run: cargo check --no-default-features --features portable-relay --target thumbv7em-none-eabi -p minip2p-rs
+      - run: cargo check --no-default-features --features portable-relay,pubsub --target thumbv7em-none-eabi -p minip2p-rs
       - run: cargo doc --workspace --no-deps
       - run: RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-relay-server --no-deps
       - run: RUSTDOCFLAGS="-D warnings" cargo doc -p minip2p-rs --features nat,pubsub,discovery,mdns,tcp,relay-server --no-deps
