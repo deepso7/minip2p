@@ -27,8 +27,8 @@ const ECHO_PROTOCOL: &str = "/minip2p/echo/1";
 const FRAME_LEN: usize = 16;
 /// Cadence of the dialer's pings.
 const PING_INTERVAL: Duration = Duration::from_secs(1);
-/// Outlives the agent's 60 s connect deadline so `nat_wait_path` sees the
-/// terminal `ConnectFailed` instead of timing out first.
+/// Outlives the engine's 30 s connect deadline so `nat_wait_path` can still
+/// observe a late `PathEstablished` instead of timing out first.
 const CONNECT_DEADLINE: Duration = Duration::from_secs(65);
 /// How long the listener waits for its first relay reservation before
 /// warning and moving on (the agent keeps retrying in the background).
@@ -41,7 +41,7 @@ const SETUP_DEADLINE: Duration = Duration::from_secs(10);
 // --- shared plumbing -------------------------------------------------------
 
 /// Builds the endpoint both modes share. The NAT agent is always enabled so
-/// `nat_connect`/`nat_wait_path` work even with no relay configured.
+/// `connect`/`nat_wait_path` work even with no relay configured.
 fn build_endpoint(
     role: &str,
     relays: &[PeerAddr],
@@ -358,14 +358,14 @@ pub fn run_dial(
                 .ok_or("circuit target has no relay configured")?;
             println!("[dial] target={peer} via-relay={}", relay.peer_id());
             let id = endpoint
-                .nat_connect(peer)
+                .connect(peer)
                 .map_err(|e| format!("connect failed: {e}"))?;
             (peer.clone(), id)
         }
         DialTarget::Direct(addr) => {
             println!("[dial] target={addr}");
             let id = endpoint
-                .nat_connect_addr(addr)
+                .connect(addr)
                 .map_err(|e| format!("connect failed: {e}"))?;
             (addr.peer_id().clone(), id)
         }

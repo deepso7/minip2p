@@ -2,7 +2,9 @@
 
 #[cfg(feature = "portable-relay")]
 use alloc::collections::BTreeMap;
-use alloc::collections::{BTreeSet, VecDeque};
+#[cfg(feature = "portable-relay")]
+use alloc::collections::BTreeSet;
+use alloc::collections::VecDeque;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
@@ -10,12 +12,12 @@ use alloc::vec::Vec;
 use minip2p_circuit::{AdoptError, BridgeAdoption, CircuitRole};
 #[cfg(feature = "portable-relay")]
 use minip2p_core::Protocol;
-use minip2p_core::{Multiaddr, PeerId};
+use minip2p_core::{ConnectId, Multiaddr, PeerId};
 use minip2p_nat::{
     BridgeRole, NatAction, NatAgent, NatEvent, NatToken, Now as NatNow, PromoteError,
 };
 #[cfg(feature = "portable-relay")]
-use minip2p_nat::{ConnectId, Path, ReservationInfo};
+use minip2p_nat::{Path, ReservationInfo};
 use minip2p_platform::{EntropySource, Now, SharedEntropy};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};
@@ -29,9 +31,6 @@ type Endpoint<D, E> = PortableEndpoint<SmoltcpComposedTransport<D, E>, SharedEnt
 pub(crate) struct PortableNatDriver {
     pub(crate) agent: NatAgent,
     pub(crate) events: VecDeque<NatEvent>,
-    /// Connection ids this driver dialed; matching [`SwarmEvent::DialFailed`]
-    /// is swallowed so NAT internals stay off the Endpoint stream until #176.
-    nat_dials: BTreeSet<ConnectionId>,
     #[cfg(feature = "portable-relay")]
     relay_addrs: Vec<(PeerId, Multiaddr)>,
     #[cfg(feature = "portable-relay")]
@@ -41,6 +40,7 @@ pub(crate) struct PortableNatDriver {
     promoted: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
     #[cfg(feature = "portable-relay")]
     paths: BTreeMap<PeerId, Path>,
+    observed: usize,
 }
 
 impl PortableNatDriver {
@@ -50,7 +50,6 @@ impl PortableNatDriver {
         Self {
             agent,
             events: VecDeque::new(),
-            nat_dials: BTreeSet::new(),
             #[cfg(feature = "portable-relay")]
             relay_addrs,
             #[cfg(feature = "portable-relay")]
@@ -60,6 +59,7 @@ impl PortableNatDriver {
             promoted: BTreeMap::new(),
             #[cfg(feature = "portable-relay")]
             paths: BTreeMap::new(),
+            observed: 0,
         }
     }
 
@@ -70,19 +70,29 @@ impl PortableNatDriver {
         }
     }
 
-    #[cfg(feature = "portable-relay")]
-    pub(crate) fn connect(&mut self, peer: PeerId, now: Now) -> ConnectId {
-        self.agent.connect(peer, Vec::new(), Self::now(now))
+    pub(crate) fn has_relay(&self) -> bool {
+        self.agent.has_relay()
     }
 
-    #[cfg(feature = "portable-relay")]
-    pub(crate) fn relay_enabled(&self) -> bool {
-        !self.relay_addrs.is_empty()
+    pub(crate) fn force_relay(&self) -> bool {
+        self.agent.force_relay()
     }
 
-    #[cfg(feature = "portable-relay")]
     pub(crate) fn cancel(&mut self, id: ConnectId, now: Now) {
         self.agent.cancel(id, Self::now(now));
+    }
+
+    pub(crate) fn unobserved_events(&self) -> Vec<NatEvent> {
+        self.events.iter().skip(self.observed).cloned().collect()
+    }
+
+    pub(crate) fn mark_observed(&mut self) {
+        self.observed = self.events.len();
+    }
+
+    pub(crate) fn take_events(&mut self) -> Vec<NatEvent> {
+        self.observed = 0;
+        self.events.drain(..).collect()
     }
 
     #[cfg(feature = "portable-relay")]
@@ -104,15 +114,6 @@ impl PortableNatDriver {
         if self.inject_straggler(event, endpoint) {
             self.pump(endpoint, now);
             return true;
-        }
-        if let SwarmEvent::DialFailed { conn_id, .. } = event
-            && self.nat_dials.remove(conn_id)
-        {
-            self.pump(endpoint, now);
-            return true;
-        }
-        if let SwarmEvent::ConnectionEstablished { conn_id, .. } = event {
-            self.nat_dials.remove(conn_id);
         }
         let is_circuit = match event {
             SwarmEvent::ConnectionEstablished { conn_id, .. }
@@ -212,9 +213,6 @@ impl PortableNatDriver {
         match action {
             NatAction::Dial { token, addr } => {
                 let result = endpoint.dial(&addr).map_err(|error| error.to_string());
-                if let Ok(conn_id) = result {
-                    self.nat_dials.insert(conn_id);
-                }
                 self.agent.dial_result(token, result, nat_now);
             }
             NatAction::OpenStream {

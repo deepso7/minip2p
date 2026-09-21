@@ -1,6 +1,6 @@
 # minip2p-nat
 
-Sans-I/O NAT-traversal orchestrator for minip2p. The protocol machines (Circuit Relay v2, DCUtR, AutoNAT) live in their own crates; `NatAgent` is the missing conductor: it races direct dials against a relayed circuit, promotes the circuit through Noise and Yamux, then runs DCUtR on that Relayed path.
+Sans-I/O NAT-traversal orchestrator for minip2p. The protocol machines (Circuit Relay v2, DCUtR, AutoNAT) live in their own crates; `NatAgent` is the relay-leg provider for a Connection attempt: it dials the relay, runs HOP CONNECT, promotes the circuit through Noise and Yamux, then runs DCUtR on that Relayed path. Direct candidate racing and the attempt's terminal outcome belong to the Connection-attempt engine.
 
 `no_std + alloc`, no I/O, no clocks, no async.
 
@@ -9,17 +9,16 @@ Sans-I/O NAT-traversal orchestrator for minip2p. The protocol machines (Circuit 
 Parallel racing with convergence — not sequential fallback:
 
 ```text
-t0      direct leg: dial every validated candidate address
-t0+δ    relay leg (stagger δ, default 200 ms; 0 = fully parallel):
+t0      caller races direct candidates (ConnectEngine)
+t0+δ    relay leg (stagger δ when direct_racing, else now):
           ensure relay session → HOP CONNECT(target)
           → Bridged ⇒ promote bridge through Noise + Yamux
-          → circuit Connected ⇒ PathEstablished(Relayed)
+          → circuit Connected ⇒ PathEstablished(Relayed)  (provisional)
           → reserved peer opens /libp2p/dcutr on the Relayed path
 inbound STOP circuit Connected ⇒ InboundPathEstablished(Relayed)
-first usable path wins
 a better path later  ⇒ PathUpgraded { from, to }  (+ the circuit closes)
-punch exhausted      ⇒ FellBackToRelay            (the circuit stays usable)
-nothing worked       ⇒ ConnectFailed { error }
+punch exhausted      ⇒ FellBackToRelay            (engine settles Connected)
+relay leg dead       ⇒ ConnectFailed { error }    (engine decides the attempt)
 ```
 
 Ranking: `DirectDialed` ≈ `DirectPunched` > `Relayed`.
@@ -28,18 +27,22 @@ Ranking: `DirectDialed` ≈ `DirectPunched` > `Relayed`.
 
 `Path::Relayed { relay }` is metadata describing how the peer was reached. The bridge itself is promoted through end-to-end Noise XX and Yamux before `PathEstablished` (outbound) or `InboundPathEstablished` (inbound) is emitted. Identify, ping, pubsub, and application protocols can therefore use the ordinary swarm stream APIs without knowing whether the selected connection is direct or relayed.
 
-Set `NatConfig::force_relay` to skip direct candidates and DCUtR entirely. This is useful for deterministic relay-only deployments and tests. Stalled outbound promotions are bounded by `connect_deadline_ms`; inbound promotions are bounded by `circuit_handshake_timeout_ms`.
+Set `NatConfig::force_relay` to skip direct candidates and DCUtR entirely. This is useful for deterministic relay-only deployments and tests. Stalled outbound promotions are bounded by `relay_leg_deadline_ms`; inbound promotions are bounded by `circuit_handshake_timeout_ms`. The Connection-attempt engine owns the overall 30 s deadline.
 
 ## Driving the agent
 
 ```rust,ignore
+use minip2p_core::ConnectId;
+use minip2p_nat::{ConnectLegs, NatAgent, NatConfig};
+
 let mut agent = NatAgent::new(local_peer_id, NatConfig {
     relays: vec![relay_peer_addr],
     ..NatConfig::default()
 });
 agent.set_listen_addrs(&validated_external_addrs);
 
-let id = agent.connect(target_peer, candidate_addrs, now());
+let id = ConnectId::from_u64(1);
+agent.connect(id, target_peer, ConnectLegs { direct_racing: true, allow_relay: true }, now());
 
 loop {
     // 1. Feed swarm events by reference. The disposition stays true even
@@ -76,14 +79,14 @@ loop {
 }
 ```
 
-The `minip2p` crate (cargo feature `nat`) wires exactly this loop into `Endpoint` so applications get `nat_connect(&peer)` / `nat_wait_path(...)` / `take_nat_events()` without touching the pump:
+The `minip2p` crate (cargo feature `nat`) wires exactly this loop into `Endpoint` so applications get `connect(&peer)` / `nat_wait_path(...)` / `take_nat_events()` without touching the pump:
 
 ```rust,ignore
 let mut node = minip2p::Endpoint::builder()
     .relay(relay_peer_addr)
     .bind_quic("0.0.0.0:0")?;
 node.listen_all()?;
-let id = node.nat_connect_with_addrs(peer, candidate_addrs)?;
+let id = node.connect(vec_of_peer_addrs)?;
 if let Some(path) = node.nat_wait_path(id, std::time::Duration::from_secs(30))? {
     println!("reached peer via {path:?}");
 }

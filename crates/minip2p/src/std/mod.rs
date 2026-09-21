@@ -53,6 +53,8 @@ use minip2p_core::Multiaddr;
 use minip2p_core::Protocol;
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use minip2p_core::TransportKind;
+#[cfg(any(feature = "discovery", feature = "mdns"))]
+use minip2p_core::select_direct_addrs;
 use minip2p_core::{PeerAddr, PeerId};
 #[cfg(all(any(feature = "discovery", feature = "mdns"), feature = "smoltcp"))]
 #[expect(
@@ -72,8 +74,7 @@ pub use minip2p_identity::Ed25519Keypair;
 pub use minip2p_mdns::{MdnsConfig, MdnsConfigError};
 #[cfg(feature = "nat")]
 pub use minip2p_nat::{
-    ConnectId as NatConnectId, NatConfig, NatError, NatEvent, Path, ReachabilityState,
-    ReservationInfo, ReservationPolicy,
+    NatConfig, NatError, NatEvent, Path, ReachabilityState, ReservationInfo, ReservationPolicy,
 };
 #[cfg(feature = "tcp")]
 use minip2p_platform::StdEntropy;
@@ -109,7 +110,9 @@ pub use pubsub::GossipsubError;
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use std::str::FromStr;
 
-use crate::portable::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS};
+#[cfg(any(feature = "nat", feature = "discovery", feature = "mdns"))]
+use crate::ConnectOutcome;
+use crate::portable::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS, RelayPolicy};
 use crate::{CandidateFailure, ConnectId, ConnectTarget, ConnectTargetError, EndpointEvent};
 
 /// Migration alias for [`EndpointEvent`]. Prefer [`EndpointEvent`] at the Endpoint boundary.
@@ -269,10 +272,10 @@ pub type EndpointSwarm = Swarm<EndpointTransport>;
 /// [`connect`](Self::connect) for a Connection attempt with one identity.
 ///
 /// With the `nat` cargo feature and a NAT configuration
-/// (`EndpointBuilder::relay` / `EndpointBuilder::nat_config`), the endpoint
-/// additionally runs the `minip2p_nat::NatAgent` traversal orchestrator:
-/// see `Endpoint::nat_connect`, `Endpoint::nat_wait_path`, and
-/// `Endpoint::take_nat_events`.
+/// (`EndpointBuilder::relay` / `EndpointBuilder::nat_config`), `connect`
+/// races direct candidates against a relay leg. Attempt-scoped NAT events
+/// remain on [`Endpoint::take_nat_events`]; [`Endpoint::nat_wait_path`] is
+/// the focused wait for the first usable path (migration; removed in #181).
 ///
 /// [`close`](Self::close) or drop disconnects established peers so a listener
 /// is not left on the QUIC idle timeout. Neither path helps after `kill -9`
@@ -500,6 +503,12 @@ impl Endpoint {
 
     /// Admits one Connection attempt. Sync errors: malformed target only.
     ///
+    /// A [`PeerId`] target uses the discovery book's known addresses (when a
+    /// book exists) and the configured relay when one exists and `force_relay`
+    /// / the dial source permit. When neither a direct candidate nor a
+    /// configured relay exists, the attempt settles
+    /// [`crate::ConnectFailure::NoUsableRoute`] through one terminal event.
+    ///
     /// Every candidate is DNS-expanded and dialed immediately. Candidate
     /// completion order is not a public contract. The swarm still keeps a
     /// single connection per peer: a race loser that finishes after the winner
@@ -518,34 +527,37 @@ impl Endpoint {
         &mut self,
         target: impl TryInto<ConnectTarget, Error: Into<ConnectTargetError>>,
     ) -> Result<ConnectId, ConnectTargetError> {
-        let target = target.try_into().map_err(Into::into)?.validated()?;
-        let peer = target.peer_id().clone();
-        let mut expanded = Vec::new();
-        let mut extra_failed = Vec::new();
-        for addr in target.candidates() {
-            match dial::targets(addr) {
-                Ok(targets) => expanded.extend(targets.into_iter().map(|(_, addr)| addr)),
-                Err(error) => extra_failed.push(CandidateFailure {
-                    addr: addr.clone(),
-                    reason: error.to_string(),
-                }),
-            }
-        }
-        let now_ms = self.swarm.now().monotonic_ms;
-        let id = self.connect.connect_candidates(
-            peer,
-            expanded,
-            extra_failed,
-            self.swarm.runtime_mut(),
-            now_ms,
+        Ok(self.connect_from(target.try_into().map_err(Into::into)?, true))
+    }
+
+    fn connect_from(&mut self, target: ConnectTarget, allow_relay: bool) -> ConnectId {
+        let id = admit_connect(
+            &mut self.connect,
+            &mut self.swarm,
+            #[cfg(feature = "nat")]
+            self.nat.as_mut(),
+            #[cfg(any(feature = "discovery", feature = "mdns"))]
+            self.discovery.as_ref().map(|discovery| &discovery.book),
+            target,
+            allow_relay,
         );
+        self.feed_nat_to_connect();
         self.drain_connect_into_pending();
-        Ok(id)
+        id
     }
 
     /// Idempotent. Settled or unknown ids are a no-op. Never disconnects.
     pub fn cancel_connect(&mut self, id: ConnectId) {
+        #[cfg(feature = "nat")]
+        let cancel_leg = self.connect.is_pending(id);
         self.connect.cancel(id, self.swarm.runtime_mut());
+        #[cfg(feature = "nat")]
+        if cancel_leg && let Some(nat) = self.nat.as_mut() {
+            let now = nat.now();
+            nat.agent.cancel(id, now);
+            nat.pump(&mut self.swarm);
+        }
+        self.feed_nat_to_connect();
         self.drain_connect_into_pending();
     }
 
@@ -695,6 +707,7 @@ impl Endpoint {
         }
         #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
         self.tick_drivers()?;
+        events.extend(self.take_connect_events());
         Ok(events)
     }
 
@@ -771,7 +784,11 @@ impl Endpoint {
                     DriverPoll::Application(event) => {
                         return Ok(EndpointWaitOutcome::Event(event));
                     }
-                    DriverPoll::Progress => {}
+                    DriverPoll::Progress => {
+                        if let Some(event) = self.pending_events.pop_front() {
+                            return Ok(EndpointWaitOutcome::Event(event));
+                        }
+                    }
                     DriverPoll::Interrupted => return Ok(EndpointWaitOutcome::Interrupted),
                     DriverPoll::Deadline => return Ok(EndpointWaitOutcome::Deadline),
                 }
@@ -920,8 +937,99 @@ impl Endpoint {
     }
 
     fn drain_connect_into_pending(&mut self) {
-        while let Some(event) = self.connect.pop_event() {
+        for event in self.take_connect_events() {
             self.pending_events.push_back(event);
+        }
+    }
+
+    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
+    fn pop_connect_application(&mut self) -> Option<EndpointEvent> {
+        let mut produced = self.take_connect_events();
+        if produced.is_empty() {
+            return None;
+        }
+        let first = produced.remove(0);
+        self.pending_events.extend(produced);
+        Some(first)
+    }
+
+    fn take_connect_events(&mut self) -> Vec<EndpointEvent> {
+        let mut out = Vec::new();
+        while let Some(event) = self.connect.pop_event() {
+            #[cfg(feature = "nat")]
+            self.cancel_nat_leg_on_terminal(&event);
+            #[cfg(any(feature = "discovery", feature = "mdns"))]
+            if self.discovery_claim_settled(&event) {
+                continue;
+            }
+            out.push(event);
+        }
+        out
+    }
+
+    #[cfg(feature = "nat")]
+    fn cancel_nat_leg_on_terminal(&mut self, event: &EndpointEvent) {
+        let EndpointEvent::ConnectSettled {
+            connect_id,
+            outcome: ConnectOutcome::Failed(_) | ConnectOutcome::Cancelled,
+            ..
+        } = event
+        else {
+            return;
+        };
+        if let Some(nat) = self.nat.as_mut() {
+            let now = nat.now();
+            nat.agent.cancel(*connect_id, now);
+            nat.pump(&mut self.swarm);
+        }
+    }
+
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
+    fn discovery_claim_settled(&mut self, event: &EndpointEvent) -> bool {
+        let EndpointEvent::ConnectSettled {
+            connect_id,
+            peer_id,
+            outcome,
+        } = event
+        else {
+            return false;
+        };
+        let Some(discovery) = self.discovery.as_mut() else {
+            return false;
+        };
+        if discovery.inflight.remove(connect_id).is_none() {
+            return false;
+        }
+        let now = discovery.now_ms();
+        match outcome {
+            ConnectOutcome::Connected { .. } => discovery.book.dial_succeeded(peer_id, now),
+            ConnectOutcome::Failed(failure) => {
+                discovery
+                    .book
+                    .dial_failed(peer_id, &failure.to_string(), now);
+            }
+            ConnectOutcome::Cancelled => {}
+        }
+        true
+    }
+
+    fn feed_nat_to_connect(&mut self) {
+        #[cfg(feature = "nat")]
+        {
+            let Some(events) = self.nat.as_ref().map(nat::NatDriver::unobserved_events) else {
+                return;
+            };
+            if events.is_empty() {
+                return;
+            }
+            let now_ms = self.swarm.now().monotonic_ms;
+            for event in &events {
+                self.connect
+                    .observe_nat(event, self.swarm.runtime_mut(), now_ms);
+            }
+            if let Some(nat) = self.nat.as_mut() {
+                nat.mark_observed();
+            }
         }
     }
 
@@ -938,9 +1046,8 @@ impl Endpoint {
         if !engine_consumed && !driver_consumed {
             out.push(EndpointEvent::from(event));
         }
-        while let Some(event) = self.connect.pop_event() {
-            out.push(event);
-        }
+        self.feed_nat_to_connect();
+        out.extend(self.take_connect_events());
         out
     }
 
@@ -1006,6 +1113,7 @@ impl Endpoint {
             mdns.tick(self.swarm.core().local_addresses())
                 .map_err(mdns_driver_error)?;
         }
+        self.feed_nat_to_connect();
         #[cfg(any(feature = "discovery", feature = "mdns"))]
         if let (Some(discovery), Some(nat)) = (self.discovery.as_mut(), self.nat.as_mut()) {
             discovery.sweep(
@@ -1013,12 +1121,14 @@ impl Endpoint {
                 self.gossipsub.as_mut(),
                 #[cfg(feature = "mdns")]
                 self.mdns.as_mut(),
+                &mut self.connect,
                 nat,
                 &mut self.swarm,
             );
         }
         #[cfg(any(feature = "nat", feature = "relay-server"))]
         self.refresh_external_address_contributions();
+        self.feed_nat_to_connect();
         Ok(())
     }
 
@@ -1108,10 +1218,7 @@ impl Endpoint {
             let step = self.connect_step_deadline(self.driver_step_deadline(deadline));
             let now_ms = self.swarm.now().monotonic_ms;
             self.connect.tick(self.swarm.runtime_mut(), now_ms);
-            if let Some(event) = self.connect.pop_event() {
-                while let Some(more) = self.connect.pop_event() {
-                    self.pending_events.push_back(more);
-                }
+            if let Some(event) = self.pop_connect_application() {
                 return Ok(DriverPoll::application(event));
             }
             let polled = self.swarm.poll_next_interruptible(step)?;
@@ -1123,6 +1230,7 @@ impl Endpoint {
                 PollNext::Event(event) => {
                     let mut produced = self.ingest(event);
                     self.tick_drivers()?;
+                    produced.extend(self.take_connect_events());
                     if !produced.is_empty() {
                         let first = produced.remove(0);
                         self.pending_events.extend(produced);
@@ -1134,6 +1242,9 @@ impl Endpoint {
                 }
                 PollNext::Deadline => {
                     self.tick_drivers()?;
+                    if let Some(event) = self.pop_connect_application() {
+                        return Ok(DriverPoll::application(event));
+                    }
                     if self.driver_events_len() > events_before {
                         return Ok(DriverPoll::progress());
                     }
@@ -1181,57 +1292,14 @@ impl Endpoint {
         })
     }
 
-    /// Starts a NAT-traversing connect toward `peer` with no known direct
-    /// addresses: the relay leg carries the attempt and DCUtR upgrades it.
+    /// Waits for the first usable path of Connection attempt `id`.
     ///
-    /// Temporary name until #176 folds NAT into [`Self::connect`]. Progress
-    /// arrives as [`NatEvent`]s ([`Endpoint::take_nat_events`]);
-    /// [`Endpoint::nat_wait_path`] blocks for the outcome.
-    #[cfg(feature = "nat")]
-    pub fn nat_connect(&mut self, peer: &PeerId) -> Result<NatConnectId, Error> {
-        self.nat_connect_with_addrs(peer.clone(), Vec::new())
-    }
-
-    /// Starts a NAT-traversing connect racing dials of `direct_addrs`
-    /// against the relay leg.
-    #[cfg(feature = "nat")]
-    pub fn nat_connect_with_addrs(
-        &mut self,
-        peer: PeerId,
-        direct_addrs: Vec<Multiaddr>,
-    ) -> Result<NatConnectId, Error> {
-        let Some(nat) = self.nat.as_mut() else {
-            return Err(Error::Invariant {
-                reason: "NAT traversal is not configured; use EndpointBuilder::relay / nat_config",
-            });
-        };
-        let now = nat.now();
-        let id = nat.agent.connect(peer, direct_addrs, now);
-        nat.pump(&mut self.swarm);
-        Ok(id)
-    }
-
-    /// Starts a NAT-traversing connect toward a known peer address.
-    #[cfg(feature = "nat")]
-    pub fn nat_connect_addr(&mut self, addr: &PeerAddr) -> Result<NatConnectId, Error> {
-        self.nat_connect_with_addrs(addr.peer_id().clone(), vec![addr.transport().clone()])
-    }
-
-    /// Abandons a NAT connect attempt. Streams it holds are reset; no further
-    /// events are emitted for `id`.
-    #[cfg(feature = "nat")]
-    pub fn nat_cancel_connect(&mut self, id: NatConnectId) {
-        if let Some(nat) = self.nat.as_mut() {
-            let now = nat.now();
-            nat.agent.cancel(id, now);
-            nat.pump(&mut self.swarm);
-        }
-    }
-
-    /// Waits for the first usable path of NAT connect attempt `id`.
+    /// Migration helper until #181: after [`Self::connect`], this blocks for
+    /// the first [`NatEvent::PathEstablished`] of that attempt (the
+    /// provisional Relayed path, when that is what lands first). The settled
+    /// outcome is [`EndpointEvent::ConnectSettled`].
     ///
-    /// Use this after `nat_connect*` when the application needs a usable NAT
-    /// path. Like [`Self::next_event`], it uses transport readiness when
+    /// Like [`Self::next_event`], it uses transport readiness when
     /// supported; it drives only this endpoint.
     ///
     /// Returns `Ok(Some(path))` on [`NatEvent::PathEstablished`] (the event
@@ -1243,7 +1311,7 @@ impl Endpoint {
     #[cfg(feature = "nat")]
     pub fn nat_wait_path(
         &mut self,
-        id: NatConnectId,
+        id: ConnectId,
         deadline: impl Into<Deadline>,
     ) -> Result<Option<Path>, Error> {
         let deadline = deadline.into();
@@ -1260,8 +1328,10 @@ impl Endpoint {
                         event,
                         NatEvent::PathEstablished { connect_id, .. } if *connect_id == id
                     )
-                }) && let Some(NatEvent::PathEstablished { path, .. }) = nat.events.remove(index)
-                {
+                }) && let Some(NatEvent::PathEstablished { path, .. }) = {
+                    nat.note_removed(index);
+                    nat.events.remove(index)
+                } {
                     return Ok(Some(path));
                 }
                 if nat.events.iter().any(|event| {
@@ -1428,7 +1498,7 @@ impl Endpoint {
     #[cfg(feature = "nat")]
     pub fn take_nat_events(&mut self) -> Vec<NatEvent> {
         match self.nat.as_mut() {
-            Some(nat) => nat.events.drain(..).collect(),
+            Some(nat) => nat.take_events(),
             None => Vec::new(),
         }
     }
@@ -1447,6 +1517,7 @@ impl Endpoint {
             match self.nat.as_mut() {
                 Some(nat) => {
                     if let Some(event) = nat.events.pop_front() {
+                        nat.note_removed(0);
                         return Ok(Some(event));
                     }
                 }
@@ -1757,7 +1828,7 @@ impl Endpoint {
             .map(|_| ())
             .map_err(mdns_driver_error);
         if let (Some(discovery), Some(nat)) = (self.discovery.as_mut(), self.nat.as_mut()) {
-            discovery.shutdown(nat, &mut self.swarm);
+            discovery.shutdown(&mut self.connect, nat, &mut self.swarm);
         }
         result
     }
@@ -3043,6 +3114,102 @@ fn concrete_relay_listener_addrs(addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
         .collect()
 }
 
+fn admit_connect(
+    connect: &mut ConnectEngine,
+    swarm: &mut EndpointSwarm,
+    #[cfg(feature = "nat")] nat: Option<&mut nat::NatDriver>,
+    #[cfg(any(feature = "discovery", feature = "mdns"))] book: Option<
+        &minip2p_discovery::PeerDiscoveryAgent,
+    >,
+    target: ConnectTarget,
+    allow_relay: bool,
+) -> ConnectId {
+    let peer = target.peer_id().clone();
+    #[cfg_attr(
+        not(any(feature = "discovery", feature = "mdns")),
+        expect(
+            unused_mut,
+            reason = "book resolution is the only mutation of Peer-ID candidates"
+        )
+    )]
+    let mut candidates = target.candidates().to_vec();
+    if candidates.is_empty() {
+        #[cfg(any(feature = "discovery", feature = "mdns"))]
+        if let Some(book) = book {
+            candidates = select_direct_addrs(&book.known_addrs(&peer), None, None)
+                .into_iter()
+                .filter_map(|addr| PeerAddr::new(addr, peer.clone()).ok())
+                .collect();
+        }
+    }
+
+    let mut expanded = Vec::new();
+    let mut extra_failed = Vec::new();
+    for addr in &candidates {
+        match dial::targets(addr) {
+            Ok(targets) => expanded.extend(targets.into_iter().map(|(_, addr)| addr)),
+            Err(error) => extra_failed.push(CandidateFailure {
+                addr: addr.clone(),
+                reason: error.to_string(),
+            }),
+        }
+    }
+
+    #[cfg(feature = "nat")]
+    let relay = match &nat {
+        Some(driver) if allow_relay && driver.has_relay() => {
+            if driver.force_relay() {
+                RelayPolicy::Forced
+            } else {
+                RelayPolicy::Race
+            }
+        }
+        _ => RelayPolicy::None,
+    };
+    #[cfg(not(feature = "nat"))]
+    let relay = RelayPolicy::None;
+
+    #[cfg(feature = "nat")]
+    let expanded = if matches!(relay, RelayPolicy::Forced) {
+        Vec::new()
+    } else {
+        expanded
+    };
+
+    let direct_racing = !expanded.is_empty();
+    let now_ms = swarm.now().monotonic_ms;
+    let id = connect.connect_candidates(
+        peer.clone(),
+        expanded,
+        extra_failed,
+        relay,
+        swarm.runtime_mut(),
+        now_ms,
+    );
+
+    #[cfg(feature = "nat")]
+    if let Some(nat) = nat
+        && connect.is_pending(id)
+    {
+        let now = nat.now();
+        nat.agent.connect(
+            id,
+            peer,
+            minip2p_nat::ConnectLegs {
+                direct_racing,
+                allow_relay,
+            },
+            now,
+        );
+        nat.pump(swarm);
+    }
+
+    #[cfg(not(feature = "nat"))]
+    let _ = (direct_racing, allow_relay, peer);
+
+    id
+}
+
 #[cfg(test)]
 #[test]
 fn default_agent_version_matches_package_version() {
@@ -3186,7 +3353,7 @@ mod tests {
         let target = tcp_peer_addr(Ed25519Keypair::generate().peer_id(), 9);
         let id = endpoint.connect(target.clone()).expect("admitted");
         match connect_outcome(&mut endpoint, id) {
-            ConnectOutcome::Failed(ConnectFailure::NoUsableRoute { candidates }) => {
+            ConnectOutcome::Failed(ConnectFailure::NoUsableRoute { candidates, .. }) => {
                 assert_eq!(candidates.len(), 1);
                 assert_eq!(candidates[0].addr, target);
                 assert!(
@@ -4062,8 +4229,15 @@ mod tests {
             .bind_quic("127.0.0.1:0")
             .expect("bind NAT endpoint");
         endpoint
-            .nat_connect(&Ed25519Keypair::generate().peer_id())
-            .expect("start endpoint-local connect");
+            .nat
+            .as_mut()
+            .expect("NAT configured")
+            .events
+            .push_back(NatEvent::ReachabilityChanged {
+                old: ReachabilityState::Unknown,
+                new: ReachabilityState::Private,
+                confirmed_addrs: Vec::new(),
+            });
 
         // Queued NAT output remains on take_nat_events; wait reports Deadline
         // rather than a driver-progress wake.
@@ -4119,8 +4293,15 @@ mod tests {
             .bind_quic("127.0.0.1:0")
             .expect("bind NAT endpoint");
         endpoint
-            .nat_connect(&Ed25519Keypair::generate().peer_id())
-            .expect("start endpoint-local connect");
+            .nat
+            .as_mut()
+            .expect("NAT configured")
+            .events
+            .push_back(NatEvent::ReachabilityChanged {
+                old: ReachabilityState::Unknown,
+                new: ReachabilityState::Private,
+                confirmed_addrs: Vec::new(),
+            });
 
         assert!(matches!(
             endpoint.next_wake(Deadline::NEVER).expect("wake"),
@@ -4220,10 +4401,8 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr};
 
         let mut endpoint = Endpoint::builder()
-            .nat_config(NatConfig {
-                connect_deadline_ms: 20,
-                ..NatConfig::default()
-            })
+            .connect_deadline(Duration::from_millis(20))
+            .nat_config(NatConfig::default())
             .bind_quic("127.0.0.1:0")
             .expect("bind NAT endpoint");
         let unreachable = PeerAddr::quic_v1(
@@ -4231,21 +4410,20 @@ mod tests {
             9,
             Ed25519Keypair::generate().peer_id(),
         );
-        endpoint
-            .nat_connect_addr(&unreachable)
-            .expect("start timed connect");
+        let id = endpoint.connect(&unreachable).expect("start timed connect");
         assert!(endpoint.take_nat_events().is_empty());
 
-        assert!(matches!(
-            endpoint
-                .next_wake(Duration::from_secs(1))
-                .expect("wait for connect deadline"),
-            EndpointWake::DriverProgress
-        ));
-        assert!(matches!(
-            endpoint.take_nat_events().as_slice(),
-            [NatEvent::ConnectFailed { .. }]
-        ));
+        let wake = endpoint
+            .next_wake(Duration::from_secs(1))
+            .expect("wait for connect deadline");
+        match wake {
+            EndpointWake::Event(Event::ConnectSettled {
+                connect_id,
+                outcome: ConnectOutcome::Failed(ConnectFailure::Timeout { .. }),
+                ..
+            }) => assert_eq!(connect_id, id),
+            other => panic!("expected ConnectSettled Timeout, got {other:?}"),
+        }
     }
 
     #[cfg(any(feature = "discovery", feature = "mdns"))]
@@ -4464,16 +4642,16 @@ mod tests {
         ));
 
         let id = endpoint
-            .nat_connect(&Ed25519Keypair::generate().peer_id())
+            .connect(Ed25519Keypair::generate().peer_id())
             .expect("connect");
-        // This no-candidate attempt fails synchronously. Remove the failure
-        // to exercise the timeout path with a live ConnectId.
-        endpoint
-            .nat
-            .as_mut()
-            .expect("NAT configured")
-            .events
-            .clear();
+        match endpoint.pending_events.pop_front() {
+            Some(Event::ConnectSettled {
+                connect_id,
+                outcome: ConnectOutcome::Failed(_),
+                ..
+            }) => assert_eq!(connect_id, id),
+            other => panic!("expected immediate NoUsableRoute, got {other:?}"),
+        }
         endpoint.pending_events.push_back(Event::ConnectionClosed {
             peer_id: unrelated.clone(),
             conn_id: ConnectionId::new(1),

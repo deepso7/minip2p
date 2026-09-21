@@ -560,6 +560,14 @@ impl PeerDiscoveryAgent {
             .collect()
     }
 
+    /// Known transport addresses for `peer`, in book merge order.
+    pub fn known_addrs(&self, peer: &PeerId) -> Vec<Multiaddr> {
+        self.book
+            .get(peer)
+            .map(|entry| self.view(entry).merged)
+            .unwrap_or_default()
+    }
+
     fn view(&self, entry: &PeerEntry) -> PeerView {
         let beacon_addrs = entry
             .beacon
@@ -812,6 +820,20 @@ mod tests {
 
     fn beacon(peer: PeerId, addrs: Vec<Multiaddr>) -> Observation {
         Observation { peer, addrs }
+    }
+
+    #[test]
+    fn known_addrs_returns_merged_book_addresses() {
+        let mut agent = agent(PeerDiscoveryConfig {
+            auto_dial: false,
+            ..PeerDiscoveryConfig::default()
+        });
+        let remote = peer(2);
+        assert!(agent.known_addrs(&remote).is_empty());
+        agent.observe_mdns(remote.clone(), vec![(addr(1), 100)], 0);
+        agent.observe_beacon(beacon(remote.clone(), vec![addr(2)]), 1);
+        assert_eq!(agent.known_addrs(&remote), vec![addr(2), addr(1)]);
+        assert!(agent.known_addrs(&peer(3)).is_empty());
     }
 
     #[test]

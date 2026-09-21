@@ -129,6 +129,6 @@ node.disconnect(target.peer_id())?;
 
 ## `dial` is direct-only
 
-`dial*` does not reserve on a relay, establish a circuit, or start DCUtR. When the application has enabled and configured NAT traversal, use `nat_connect*` plus `nat_wait_path` instead. See [Traverse NAT](/rust/traverse-nat).
+`dial*` does not reserve on a relay, establish a circuit, or start DCUtR. When the application has enabled and configured NAT traversal, use `connect` plus `nat_wait_path` (first usable path) or `ConnectSettled` (terminal). See [Traverse NAT](/rust/traverse-nat).
 
 Next: [Register a protocol](/rust/register-a-protocol) or [Identity](/rust/identity).

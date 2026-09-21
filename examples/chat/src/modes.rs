@@ -190,14 +190,14 @@ pub fn run_join(
         JoinTarget::Circuit { relay, peer } => {
             println!("[join] target={peer} via-relay={}", relay.peer_id());
             let id = endpoint
-                .nat_connect(peer)
+                .connect(peer)
                 .map_err(|e| format!("connect failed: {e}"))?;
             (peer.clone(), id)
         }
         JoinTarget::Direct(addr) => {
             println!("[join] target={addr}");
             let id = endpoint
-                .nat_connect_addr(addr)
+                .connect(addr)
                 .map_err(|e| format!("connect failed: {e}"))?;
             (addr.peer_id().clone(), id)
         }

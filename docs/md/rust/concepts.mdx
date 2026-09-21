@@ -58,11 +58,11 @@ These are separate paths with different policy:
 | Goal | Start with | Wait for |
 | --- | --- | --- |
 | Direct QUIC or TCP to a known address | `connect`, or `dial` / `dial_ip4` / `dial_ip6` | `ConnectSettled`, or connection then `wait_peer_ready` if you need Identify |
-| NAT-aware attempt with optional relay | `nat_connect`, `nat_connect_addr`, or `nat_connect_with_addrs` | `nat_wait_path` or `NatEvent` |
+| NAT-aware attempt with optional relay | `connect` (peer, address, or address set) | `ConnectSettled`; `nat_wait_path` / `NatEvent` for the first usable path |
 
 The base `dial*` methods only start direct dials. The address picks QUIC or TCP. They do not reserve on a relay or perform DCUtR.
 
-With the `nat` capability enabled, `nat_connect*` can race direct candidates against a relay leg. The first usable result is:
+With the `nat` capability enabled, `connect` can race direct candidates against a relay leg. The first usable result is:
 
 - `Path::DirectDialed`: a supplied direct address connected;
 - `Path::DirectPunched`: DCUtR established a direct connection;

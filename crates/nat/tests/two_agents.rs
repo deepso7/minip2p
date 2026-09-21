@@ -9,11 +9,11 @@
 
 mod common;
 
-use common::{LISTEN_ADDR, at, drain_events, identify_observed, maddr, peer};
+use common::{LISTEN_ADDR, RELAY_NOW, at, drain_events, identify_observed, maddr, peer, start};
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId};
+use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId};
 use minip2p_nat::{
-    ConnectId, DCUTR_PROTOCOL_ID, NatAction, NatAgent, NatConfig, NatEvent, Path, ReservationPolicy,
+    DCUTR_PROTOCOL_ID, NatAction, NatAgent, NatConfig, NatEvent, Path, ReservationPolicy,
 };
 use minip2p_relay::{HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 use minip2p_swarm::SwarmEvent;
@@ -68,6 +68,8 @@ struct World {
     punch_dials_from_b: usize,
     punch_dial_addrs_from_a: Vec<Multiaddr>,
     punch_dial_addrs_from_b: Vec<Multiaddr>,
+    punch_conn_a: Option<ConnectionId>,
+    punch_conn_b: Option<ConnectionId>,
     circuit_conns: [Option<ConnectionId>; 2],
     dcutr_streams: Vec<(Side, StreamId, Side, StreamId)>,
 }
@@ -126,6 +128,8 @@ impl World {
             punch_dials_from_b: 0,
             punch_dial_addrs_from_a: Vec::new(),
             punch_dial_addrs_from_b: Vec::new(),
+            punch_conn_a: None,
+            punch_conn_b: None,
             circuit_conns: [None, None],
             dcutr_streams: Vec::new(),
         }
@@ -245,6 +249,10 @@ impl World {
                     self.next_conn += 1;
                     let conn = ConnectionId::new(self.next_conn);
                     self.agent(side).dial_result(token, Ok(conn), now);
+                    match side {
+                        Side::A => self.punch_conn_a = Some(conn),
+                        Side::B => self.punch_conn_b = Some(conn),
+                    }
                     if self.deliver_direct {
                         self.establish_direct();
                     }
@@ -512,16 +520,18 @@ impl World {
     fn establish_direct(&mut self) {
         let (a_id, b_id) = (self.a_id.clone(), self.b_id.clone());
         let now = at(self.now);
+        let a_conn = self.punch_conn_a.unwrap_or(ConnectionId::new(1));
+        let b_conn = self.punch_conn_b.unwrap_or(ConnectionId::new(1));
         self.a.handle_event(
             &SwarmEvent::ConnectionEstablished {
-                conn_id: minip2p_transport::ConnectionId::new(1),
+                conn_id: a_conn,
                 peer_id: b_id,
             },
             now,
         );
         self.b.handle_event(
             &SwarmEvent::ConnectionEstablished {
-                conn_id: minip2p_transport::ConnectionId::new(1),
+                conn_id: b_conn,
                 peer_id: a_id,
             },
             now,
@@ -540,7 +550,7 @@ impl World {
 
     /// A starts connecting to B (relay leg only — no direct candidates).
     fn start_connect(&mut self) -> ConnectId {
-        let id = self.a.connect(self.b_id.clone(), Vec::new(), at(self.now));
+        let id = start(&mut self.a, 1, self.b_id.clone(), RELAY_NOW, at(self.now));
         self.pump();
         id
     }

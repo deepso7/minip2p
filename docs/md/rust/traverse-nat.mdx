@@ -52,20 +52,24 @@ Calling `.autonat_server(...)` alone enables reachability probes, but it does no
 
 ## Choose a connect method
 
-| Known information | Method |
-| --- | --- |
-| Peer ID only; rely on configured relay | `nat_connect(&peer_id)` |
-| One direct `PeerAddr`, optionally raced against relays | `nat_connect_addr(&peer_addr)` |
-| Peer ID and several transport `Multiaddr` candidates | `nat_connect_with_addrs(peer_id, addrs)` |
+`Endpoint::connect` is the one entry. Pass a peer ID, one `PeerAddr`, or a set of addresses that all name the same peer:
+
+| Known information                                  | Call                  |
+| -------------------------------------------------- | --------------------- |
+| Peer ID; known addresses and/or a configured relay | `connect(&peer_id)`   |
+| One complete `PeerAddr`                            | `connect(&peer_addr)` |
+| Several complete `PeerAddr`s for the same peer     | `connect(addrs)?`     |
+
+A Peer-ID target with neither known addresses nor a relay settles `ConnectSettled { Failed(NoUsableRoute) }` through one terminal event.
 
 ```rust
 use std::time::Duration;
 
-use minip2p::NatEvent;
+use minip2p::{EndpointEvent, NatEvent};
 
-let connect_id = node.nat_connect_addr(&target)?;
+let connect_id = node.connect(&target)?;
 match node.nat_wait_path(connect_id, Duration::from_secs(60))? {
-    Some(path) => println!("connected via {path:?}"),
+    Some(path) => println!("first usable path: {path:?}"),
     None => {
         let failed = node.take_nat_events().into_iter().find(|event| {
             matches!(
@@ -83,22 +87,22 @@ match node.nat_wait_path(connect_id, Duration::from_secs(60))? {
 }
 ```
 
-`nat_wait_path` returns `Ok(Some(path))` when it consumes the matching `NatEvent::PathEstablished`. It returns `Ok(None)` in two cases:
+`nat_wait_path` is a migration helper until #181. It returns `Ok(Some(path))` when it consumes the matching `NatEvent::PathEstablished` — the first usable path, which may be a provisional Relayed circuit. The attempt's terminal is `EndpointEvent::ConnectSettled` (connected after DCUtR settles, or immediately under `force_relay`). It returns `Ok(None)` in two cases:
 
-- the attempt failed; `NatEvent::ConnectFailed` stays queued for `take_nat_events`;
+- the attempt failed; `NatEvent::ConnectFailed` stays queued for `take_nat_events` when the NAT leg failed (a Peer target with no route may settle only as `ConnectSettled`);
 - the deadline expired before either outcome; no `ConnectFailed` is synthesized.
 
 ## Path selection and upgrade
 
 ```mermaid
 flowchart TB
-  A["nat_connect*"] --> B["Direct candidates"]
+  A["connect"] --> B["Direct candidates"]
   A --> C["Configured relay leg"]
   B -->|"wins"| D["DirectDialed"]
-  C -->|"first usable path"| E["Relayed"]
+  C -->|"first usable path"| E["Relayed (provisional)"]
   E --> F["DCUtR coordination"]
   F -->|"punch succeeds"| G["DirectPunched"]
-  F -->|"retries exhausted"| H["Stay relayed"]
+  F -->|"retries exhausted"| H["ConnectSettled on Relayed"]
 ```
 
 The first usable path is explicit:
@@ -107,7 +111,7 @@ The first usable path is explicit:
 - `Path::DirectPunched`: a DCUtR hole punch connected;
 - `Path::Relayed { relay }`: the protected relay circuit is usable.
 
-When a relayed path upgrades later, the application receives `NatEvent::PathUpgraded`. If punch windows fail, it receives `HolePunchFailed` events and eventually `FellBackToRelay`; the relayed connection stays usable.
+That Relayed path is provisional until `ConnectSettled`. Applications that need the circuit immediately (echo, ping) can use it as soon as `path(peer)` is `Relayed`; the attempt is not finished until DCUtR settles or `force_relay` skips punching. When a relayed path upgrades later, the application receives `NatEvent::PathUpgraded`. If punch windows fail, it receives `HolePunchFailed` events and eventually `FellBackToRelay`; the relayed connection stays usable.
 
 ## Reservations and reachability
 

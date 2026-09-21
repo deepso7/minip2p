@@ -1,18 +1,19 @@
+use alloc::collections::BTreeSet;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol, select_direct_addrs};
+use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, SansIoProtocol};
 use minip2p_dcutr::{DcutrResponder, DcutrResponderInput, DcutrResponderOutput, ResponderEvent};
 use minip2p_relay::{
     ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopConnectInput, HopConnectOutput,
 };
 use minip2p_transport::{ConnectionId, StreamId};
 
-use crate::agent::{Shared, StreamInput, StreamRole, TokenPurpose};
+use crate::agent::{ConnectLegs, Shared, StreamInput, StreamRole, TokenPurpose};
 use crate::events::{BridgeRole, NatAction, NatEvent};
 use crate::inbound::select_global_punch_candidates;
-use crate::types::{ConnectId, NatError, Now, Path, PromoteError};
+use crate::types::{NatError, Now, Path, PromoteError};
 
 /// Progress of the relay leg of a connect attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,17 +36,13 @@ enum RelayLeg {
     Failed,
 }
 
-/// Per-target dialer-race arbiter: direct candidate dials at `t0` racing a
-/// staggered relay leg. A bridged circuit becomes a Relayed path first;
-/// DCUtR may then upgrade it. Improvements are announced explicitly.
+/// Per-target relay-leg arbiter: staggered HOP CONNECT, bridge promotion,
+/// and DCUtR. Direct candidate racing belongs to the Connection-attempt
+/// engine; this machine only tracks a direct establishment so
+/// [`Path::DirectDialed`] snapshots keep working.
 pub(crate) struct ConnectAttempt {
     id: ConnectId,
     peer: PeerId,
-    connect_deadline: u64,
-    /// Direct-candidate dials whose synchronous result has not come back as
-    /// an error. Successful dials stay "live" until the connection appears
-    /// or the connect deadline fires.
-    direct_live: u32,
     relay: Option<PeerAddr>,
     leg: RelayLeg,
     /// Absolute deadline for the relay leg to reach `Bridged`.
@@ -70,6 +67,8 @@ pub(crate) struct ConnectAttempt {
     bridge_pending_data: Vec<u8>,
     punch_addrs: Vec<Multiaddr>,
     punch_dials_issued: bool,
+    /// Connection ids issued for punch dials that have returned `Ok`.
+    punch_conns: BTreeSet<ConnectionId>,
     /// Absolute deadline of the current punch window.
     punch_deadline: Option<u64>,
     /// 1-based index of the current punch window.
@@ -83,40 +82,24 @@ pub(crate) struct ConnectAttempt {
 }
 
 impl ConnectAttempt {
-    /// Starts an attempt: dials every validated direct candidate now and
-    /// arms the relay leg. Returns `None` when the attempt failed instantly
-    /// (the failure event is already queued).
+    /// Starts the relay leg of an attempt. Never fails immediately: with no
+    /// relay the attempt stays inactive until a direct connection lands or
+    /// the caller cancels it.
     pub(crate) fn start(
         id: ConnectId,
         peer: PeerId,
-        direct_addrs: Vec<Multiaddr>,
-        allow_relay: bool,
+        legs: ConnectLegs,
         shared: &mut Shared,
         now: Now,
     ) -> Option<Self> {
-        let candidates = if shared.config.force_relay {
-            Vec::new()
-        } else {
-            select_direct_addrs(&direct_addrs, None, None)
-        };
-        let relay = allow_relay
+        let relay = legs
+            .allow_relay
             .then(|| shared.config.relays.first().cloned())
             .flatten();
-
-        if candidates.is_empty() && relay.is_none() {
-            shared.push_event(NatEvent::ConnectFailed {
-                connect_id: id,
-                peer,
-                error: NatError::NoPathAvailable,
-            });
-            return None;
-        }
 
         let mut attempt = Self {
             id,
             peer,
-            connect_deadline: now.mono_ms + shared.config.connect_deadline_ms,
-            direct_live: 0,
             relay,
             leg: RelayLeg::Inactive,
             relay_deadline: None,
@@ -132,6 +115,7 @@ impl ConnectAttempt {
             bridge_pending_data: Vec::new(),
             punch_addrs: Vec::new(),
             punch_dials_issued: false,
+            punch_conns: BTreeSet::new(),
             punch_deadline: None,
             punch_window: 0,
             best: None,
@@ -140,28 +124,13 @@ impl ConnectAttempt {
             done: false,
         };
 
-        for addr in candidates {
-            // Candidates are validated pure transport addresses, so pairing
-            // them with the target peer id cannot fail.
-            let Ok(peer_addr) = PeerAddr::new(addr, attempt.peer.clone()) else {
-                continue;
-            };
-            let token = shared.alloc_token(TokenPurpose::DirectDial(id));
-            shared.push_action(NatAction::Dial {
-                token,
-                addr: peer_addr,
-            });
-            attempt.direct_live += 1;
-        }
-
         if attempt.relay.is_some() {
-            let stagger = if shared.config.force_relay {
+            let stagger = if shared.config.force_relay || !legs.direct_racing {
                 0
             } else {
                 shared.config.relay_stagger_ms
             };
-            if stagger == 0 || attempt.direct_live == 0 {
-                // Nothing to give a head start to (or none requested).
+            if stagger == 0 {
                 attempt.begin_relay_leg(shared, now);
             } else {
                 attempt.leg = RelayLeg::WaitStagger {
@@ -282,17 +251,17 @@ impl ConnectAttempt {
         if self.done {
             return None;
         }
-        let mut due = self.connect_deadline;
+        let mut due = None;
         if let RelayLeg::WaitStagger { until } = self.leg {
-            due = due.min(until);
+            due = Some(until);
         }
         for deadline in [self.relay_deadline, self.punch_deadline]
             .into_iter()
             .flatten()
         {
-            due = due.min(deadline);
+            due = Some(due.map_or(deadline, |current| current.min(deadline)));
         }
-        Some(due)
+        due
     }
 
     /// Abandons the attempt silently, cleaning up any held streams.
@@ -331,12 +300,8 @@ impl ConnectAttempt {
             }
             return;
         }
-        // `ConnectionEstablished` carries no dial/connection correlation.
-        // If one of the original candidate dials is still live, classifying
-        // this as punched would be a false claim: it may be that late
-        // candidate connection. Only call it punched when the relay race was
-        // the sole remaining source of a direct connection.
-        let path = if self.punch_dials_issued && self.direct_live == 0 {
+        // Classify punched iff this conn id was issued as a punch dial.
+        let path = if self.punch_conns.contains(&conn_id) {
             Path::DirectPunched
         } else {
             Path::DirectDialed
@@ -380,8 +345,12 @@ impl ConnectAttempt {
         if self.promoted == Some(conn_id) {
             self.promoted = None;
             self.bridge_alive = false;
-            self.last_error = Some(NatError::DialFailed("promoted circuit closed".into()));
-            self.settle_after_punch(shared);
+            let error = NatError::DialFailed("promoted circuit closed".into());
+            self.last_error = Some(error.clone());
+            if self.punch_deadline.is_some() {
+                return;
+            }
+            self.fail(shared, error);
             return;
         }
         if !self.is_relay_peer(peer) || self.bridge_inner_conn.is_some_and(|id| id != conn_id) {
@@ -500,24 +469,19 @@ impl ConnectAttempt {
         if self.done {
             return;
         }
-        let Err(reason) = result else {
-            // A successful dial only means the handshake is under way; the
-            // connection (or the connect deadline) tells the rest.
-            return;
-        };
-        match purpose {
-            TokenPurpose::DirectDial(_) => {
-                self.direct_live = self.direct_live.saturating_sub(1);
-                self.last_error = Some(NatError::DialFailed(reason));
-                self.fail_if_no_legs_remain(shared);
+        match result {
+            Ok(conn_id) => {
+                if matches!(purpose, TokenPurpose::PunchDial(_)) {
+                    self.punch_conns.insert(conn_id);
+                }
             }
-            TokenPurpose::RelayDial(_) => {
-                self.fail_relay_leg(shared, NatError::DialFailed(reason));
-            }
-            // Punch dials are expected to fail often; the punch window
-            // deadline governs the retry/fallback flow.
-            TokenPurpose::PunchDial(_) => {}
-            _ => {}
+            Err(reason) => match purpose {
+                TokenPurpose::RelayDial(_) => {
+                    self.fail_relay_leg(shared, NatError::DialFailed(reason));
+                }
+                TokenPurpose::PunchDial(_) => {}
+                _ => {}
+            },
         }
     }
 
@@ -621,25 +585,6 @@ impl ConnectAttempt {
             && now.mono_ms >= deadline
         {
             self.on_punch_window_elapsed(shared, now);
-        }
-
-        if !self.done && now.mono_ms >= self.connect_deadline {
-            // Accepted direct dials that never produced a connection are no
-            // longer viable past the overall attempt deadline.
-            self.direct_live = 0;
-            if self.best.is_some() {
-                // A relayed path exists but the punch never resolved; settle
-                // on the relay.
-                self.punch_deadline = None;
-                self.settle_after_punch(shared);
-            } else if self.promotion_requested {
-                if let Some(conn_id) = self.promoted.take() {
-                    shared.push_action(NatAction::CloseCircuit { conn_id });
-                }
-                self.fail(shared, NatError::Timeout);
-            } else {
-                self.fail(shared, NatError::Timeout);
-            }
         }
     }
 
@@ -886,20 +831,23 @@ impl ConnectAttempt {
                         connect_id: self.id,
                         peer: self.peer.clone(),
                     });
+                    // Keep the provisional circuit; drop punch dials so a
+                    // late handshake cannot land after this attempt is reaped.
+                    shared.abort_attempt_dials(self.id);
                     self.done = true;
                 }
             }
         } else if self.best.is_some() {
-            // PathEstablished is terminal success for this connect id. If
-            // the promoted circuit is subsequently lost, a still-live
-            // direct leg may upgrade that result, but the loss must never
-            // turn the already-reported success into ConnectFailed.
-            if self.direct_live == 0 && self.punch_deadline.is_none() {
-                self.done = true;
+            if self.punch_deadline.is_none() {
+                let error = self
+                    .last_error
+                    .take()
+                    .unwrap_or(NatError::DialFailed("promoted circuit closed".into()));
+                self.fail(shared, error);
             }
-        } else if self.direct_live > 0 || self.punch_deadline.is_some() {
-            // The relay leg is gone, but a direct candidate or an active
-            // punch window can still establish the first usable path.
+        } else if self.punch_deadline.is_some() {
+            // The relay leg is gone, but an active punch window can still
+            // establish the first usable path.
         } else {
             let error = self
                 .last_error
@@ -1000,11 +948,6 @@ impl ConnectAttempt {
             Err(PromoteError::PeerAlreadyDirect) => {
                 self.bridge_alive = false;
                 self.leg = RelayLeg::Failed;
-                if self.direct_live == 0 {
-                    self.last_error = Some(NatError::DialFailed(
-                        "direct connection won before circuit promotion".into(),
-                    ));
-                }
             }
             Err(error) => {
                 self.bridge_alive = false;
@@ -1036,8 +979,8 @@ impl ConnectAttempt {
     }
 
     fn fail_if_no_legs_remain(&mut self, shared: &mut Shared) {
-        let relay_leg_dead = matches!(self.leg, RelayLeg::Failed | RelayLeg::Inactive);
-        if self.best.is_none() && self.direct_live == 0 && relay_leg_dead && !self.done {
+        let relay_leg_dead = matches!(self.leg, RelayLeg::Failed);
+        if self.best.is_none() && relay_leg_dead && !self.done {
             let error = self.last_error.take().unwrap_or(NatError::NoPathAvailable);
             self.fail(shared, error);
         }
@@ -1057,6 +1000,7 @@ impl ConnectAttempt {
     /// still holds (including a bridge the application was told about — the
     /// caller emits the explaining event first).
     fn teardown_relay_leg(&mut self, shared: &mut Shared) {
+        shared.abort_attempt_dials(self.id);
         self.teardown_dcutr_stream(shared);
         match self.leg {
             RelayLeg::WaitHopReady { stream } | RelayLeg::AwaitHopStatus { stream } => {

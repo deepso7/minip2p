@@ -9,7 +9,7 @@ use std::time::Duration;
 use minip2p::{EndpointWake, Error, NatEvent};
 
 use crate::endpoint::{Lifecycle, Shared};
-use crate::events::{convert_discovery, convert_gossipsub, convert_nat, convert_swarm};
+use crate::events::{convert_discovery, convert_endpoint_event, convert_gossipsub, convert_nat};
 use crate::{DriverFailureKind, EventDoorbell, P2pEvent};
 
 const DRIVER_POLL: Duration = Duration::from_millis(25);
@@ -213,15 +213,6 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             continue;
         }
 
-        if let EndpointWake::Event(event) = wake {
-            ingest(convert_swarm(event), carry, overflow, stats);
-        }
-        ingest(
-            endpoint.poll()?.into_iter().filter_map(convert_swarm),
-            carry,
-            overflow,
-            stats,
-        );
         let nat_events = endpoint.take_nat_events();
         ingest(
             nat_events
@@ -229,7 +220,23 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
                 .filter(|event| {
                     nat_connect_id(event).is_none_or(|id| !cancelled_connect_ids.contains(&id))
                 })
-                .map(convert_nat),
+                .filter_map(convert_nat),
+            carry,
+            overflow,
+            stats,
+        );
+        if let EndpointWake::Event(event) = wake {
+            ingest(
+                convert_filtered_endpoint_event(endpoint, event, cancelled_connect_ids),
+                carry,
+                overflow,
+                stats,
+            );
+        }
+        ingest(
+            endpoint.poll()?.into_iter().filter_map(|event| {
+                convert_filtered_endpoint_event(endpoint, event, cancelled_connect_ids)
+            }),
             carry,
             overflow,
             stats,
@@ -304,6 +311,19 @@ pub(crate) fn take_delivery(
     Delivery { diagnostic, batch }
 }
 
+fn convert_filtered_endpoint_event(
+    endpoint: &minip2p::Endpoint,
+    event: minip2p::Event,
+    cancelled: &BTreeSet<u64>,
+) -> Option<P2pEvent> {
+    if let minip2p::Event::ConnectSettled { connect_id, .. } = &event
+        && cancelled.contains(&connect_id.as_u64())
+    {
+        return None;
+    }
+    convert_endpoint_event(endpoint, event)
+}
+
 fn nat_connect_id(event: &NatEvent) -> Option<u64> {
     match event {
         NatEvent::PathEstablished { connect_id, .. }
@@ -333,10 +353,8 @@ pub(crate) fn p2p_connect_id(event: &P2pEvent) -> Option<u64> {
 
 pub(crate) fn terminal_connect_id(event: &P2pEvent) -> Option<u64> {
     match event {
-        P2pEvent::PathEstablished {
-            connect_id, path, ..
-        } if !matches!(path, crate::PathKind::Relayed { .. }) => Some(*connect_id),
-        P2pEvent::PathUpgraded { connect_id, .. }
+        P2pEvent::PathEstablished { connect_id, .. }
+        | P2pEvent::PathUpgraded { connect_id, .. }
         | P2pEvent::FellBackToRelay { connect_id, .. }
         | P2pEvent::ConnectFailed { connect_id, .. } => Some(*connect_id),
         _ => None,
@@ -434,7 +452,7 @@ mod tests {
                     relay_peer_id: "relay".into()
                 },
             }),
-            None
+            Some(8)
         );
         assert_eq!(
             terminal_connect_id(&P2pEvent::ConnectFailed {

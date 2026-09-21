@@ -318,7 +318,7 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
         .expect("bind initiator");
     a.listen().expect("initiator listens");
     a.subscribe(TOPIC).expect("initiator subscribes");
-    let connect_id = a.nat_connect(&b_peer).expect("relay-only connect");
+    let connect_id = a.connect(&b_peer).expect("relay-only connect");
 
     drive_until(&mut [&mut a, &mut b], Duration::from_secs(15), |all| {
         saw_subscription(&all[0], TOPIC) && saw_subscription(&all[1], TOPIC)

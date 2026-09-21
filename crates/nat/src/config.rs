@@ -33,10 +33,9 @@ pub struct NatConfig {
     /// Empty leaves reachability [`Unknown`](crate::ReachabilityState::Unknown).
     pub autonat_servers: Vec<PeerAddr>,
     /// Head start given to the direct leg before the relay leg spins up.
-    /// `0` races both fully in parallel.
+    /// `0` races both fully in parallel. Ignored when the caller is not
+    /// racing direct candidates.
     pub relay_stagger_ms: u64,
-    /// Overall deadline for a connect attempt.
-    pub connect_deadline_ms: u64,
     /// Deadline for an inbound promoted circuit to finish its Noise and
     /// Yamux handshake. The deadline is disarmed once the circuit connection
     /// is established.
@@ -91,7 +90,6 @@ impl Default for NatConfig {
             relays: Vec::new(),
             autonat_servers: Vec::new(),
             relay_stagger_ms: 200,
-            connect_deadline_ms: 60_000,
             circuit_handshake_timeout_ms: 20_000,
             force_relay: false,
             relay_leg_deadline_ms: 12_000,

@@ -9,12 +9,14 @@
 )]
 
 use minip2p_autonat::{AutoNatServer, AutoNatServerInput, AutoNatServerOutput, ResponseStatus};
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol};
+use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, SansIoProtocol};
 use minip2p_dcutr::{
     FrameDecode, HolePunch, HolePunchType, decode_frame as dcutr_decode_frame,
     encode_frame as dcutr_encode_frame,
 };
-use minip2p_nat::{NatAction, NatAgent, NatConfig, NatEvent, NatToken, Now, ReservationPolicy};
+use minip2p_nat::{
+    ConnectLegs, NatAction, NatAgent, NatConfig, NatEvent, NatToken, Now, ReservationPolicy,
+};
 use minip2p_relay::{
     HOP_PROTOCOL_ID, HopMessage, HopMessageType, Peer, Reservation, Status, StopMessage,
     StopMessageType, encode_frame as relay_encode_frame,
@@ -23,6 +25,25 @@ use minip2p_swarm::{IdentifyMessage, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamId};
 
 pub const TEST_CIRCUIT_ID: u64 = (1 << 63) | 77;
+
+pub const RACE: ConnectLegs = ConnectLegs {
+    direct_racing: true,
+    allow_relay: true,
+};
+pub const RELAY_NOW: ConnectLegs = ConnectLegs {
+    direct_racing: false,
+    allow_relay: true,
+};
+pub const NO_RELAY: ConnectLegs = ConnectLegs {
+    direct_racing: true,
+    allow_relay: false,
+};
+
+pub fn start(agent: &mut NatAgent, n: u64, peer: PeerId, legs: ConnectLegs, now: Now) -> ConnectId {
+    let id = ConnectId::from_u64(n);
+    agent.connect(id, peer, legs, now);
+    id
+}
 
 pub const TARGET_ADDR: &str = "/ip4/192.0.2.10/udp/4001/quic-v1";
 pub const RELAY_TRANSPORT_ADDR: &str = "/ip4/203.0.113.1/udp/4001/quic-v1";
@@ -319,6 +340,7 @@ pub struct Harness {
     pub target: PeerId,
     pub relay: PeerId,
     pub relay_addr: PeerAddr,
+    next_connect: u64,
 }
 
 impl Harness {
@@ -343,6 +365,7 @@ impl Harness {
             target,
             relay,
             relay_addr,
+            next_connect: 1,
         }
     }
 
@@ -361,7 +384,19 @@ impl Harness {
             target,
             relay,
             relay_addr,
+            next_connect: 1,
         }
+    }
+
+    pub fn start(&mut self, legs: ConnectLegs, now: Now) -> ConnectId {
+        self.start_peer(self.target.clone(), legs, now)
+    }
+
+    pub fn start_peer(&mut self, peer: PeerId, legs: ConnectLegs, now: Now) -> ConnectId {
+        let id = ConnectId::from_u64(self.next_connect);
+        self.next_connect += 1;
+        self.agent.connect(id, peer, legs, now);
+        id
     }
 
     /// Marks the relay connection as established and identify-complete

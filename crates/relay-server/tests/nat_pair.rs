@@ -5,9 +5,9 @@
     reason = "The helper functions assert the fixed action sequence of this acceptance test."
 )]
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId};
+use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId};
 use minip2p_nat::{
-    NatAction, NatAgent, NatConfig, NatEvent, Now as NatNow, Path, ReservationPolicy,
+    ConnectLegs, NatAction, NatAgent, NatConfig, NatEvent, Now as NatNow, Path, ReservationPolicy,
 };
 use minip2p_platform::Now as ServerNow;
 use minip2p_relay_server::{
@@ -246,7 +246,16 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
             ..NatConfig::default()
         },
     );
-    let connect_id = source_nat.connect(destination.clone(), vec![], nat_now(10));
+    let connect_id = ConnectId::from_u64(1);
+    source_nat.connect(
+        connect_id,
+        destination.clone(),
+        ConnectLegs {
+            direct_racing: false,
+            allow_relay: true,
+        },
+        nat_now(10),
+    );
     let dial = nat_dial(&drain_nat(&mut source_nat));
     source_nat.dial_result(dial, Ok(CLIENT_RELAY_CONN), nat_now(11));
     establish_relay_session(&mut source_nat, &relay, 12);

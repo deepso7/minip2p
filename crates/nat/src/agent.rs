@@ -2,7 +2,7 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId, select_direct_addrs};
+use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, select_direct_addrs};
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::{ConnectionId, StreamId};
 
@@ -15,7 +15,7 @@ use crate::config::NatConfig;
 use crate::events::{NatAction, NatEvent};
 use crate::housekeeping::Housekeeping;
 use crate::inbound::InboundCircuit;
-use crate::types::{ConnectId, NatToken, Now, PromoteError, ReachabilityState, ReservationInfo};
+use crate::types::{NatToken, Now, PromoteError, ReachabilityState, ReservationInfo};
 
 /// Roles a stream owned by the agent can play. Streams not in the registry
 /// belong to the application (`Released` is modeled as removal).
@@ -42,8 +42,6 @@ pub(crate) enum StreamRole {
 /// What a pending `Dial` / `OpenStream` token was issued for.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TokenPurpose {
-    /// Dial of a caller-supplied direct candidate.
-    DirectDial(ConnectId),
     /// Dial of the relay itself (to start a relay leg).
     RelayDial(ConnectId),
     /// Simultaneous-open dial of a DCUtR observed address.
@@ -70,8 +68,7 @@ pub(crate) enum TokenPurpose {
 impl TokenPurpose {
     fn connect_id(&self) -> Option<ConnectId> {
         match self {
-            Self::DirectDial(id)
-            | Self::RelayDial(id)
+            Self::RelayDial(id)
             | Self::PunchDial(id)
             | Self::OpenHop(id, _)
             | Self::PromoteAttempt(id) => Some(*id),
@@ -128,6 +125,9 @@ pub(crate) struct Shared {
     /// peer and an expiry (`mono_ms`) so a handshake that never completes
     /// cannot suppress dialing forever.
     pending_session_dials: BTreeMap<NatToken, (PeerId, u64)>,
+    /// Successful `dial_result` conn ids still awaiting establish or
+    /// [`SwarmEvent::DialFailed`].
+    dialed: BTreeMap<ConnectionId, (NatToken, TokenPurpose)>,
 }
 
 impl Shared {
@@ -177,6 +177,59 @@ impl Shared {
         self.pending_session_dials
             .insert(token, (addr.peer_id().clone(), expires));
         self.push_action(NatAction::Dial { token, addr });
+    }
+
+    /// Drops queued relay/punch dials for `id` and closes handshakes that
+    /// already have a conn id but have not established. Established punch
+    /// or relay sessions stay up — those are no longer in-flight.
+    ///
+    /// Tokens whose `Dial` was already polled but not yet echoed are kept so
+    /// a late `dial_result` can still close the conn.
+    pub(crate) fn abort_attempt_dials(&mut self, id: ConnectId) {
+        let attempt_tokens: BTreeSet<NatToken> = self
+            .tokens
+            .iter()
+            .filter_map(|(token, purpose)| match purpose {
+                TokenPurpose::RelayDial(attempt) | TokenPurpose::PunchDial(attempt)
+                    if *attempt == id =>
+                {
+                    Some(*token)
+                }
+                _ => None,
+            })
+            .collect();
+        let mut queued = BTreeSet::new();
+        self.actions.retain(|action| match action {
+            NatAction::Dial { token, .. } if attempt_tokens.contains(token) => {
+                queued.insert(*token);
+                false
+            }
+            _ => true,
+        });
+        let mut close = Vec::new();
+        let mut echoed = BTreeSet::new();
+        self.dialed.retain(|conn_id, (token, purpose)| {
+            if attempt_tokens.contains(token)
+                || matches!(
+                    purpose,
+                    TokenPurpose::RelayDial(attempt) | TokenPurpose::PunchDial(attempt)
+                        if *attempt == id
+                )
+            {
+                close.push(*conn_id);
+                echoed.insert(*token);
+                false
+            } else {
+                true
+            }
+        });
+        for conn_id in close {
+            self.push_action(NatAction::CloseCircuit { conn_id });
+        }
+        self.pending_session_dials
+            .retain(|token, _| !attempt_tokens.contains(token));
+        self.tokens
+            .retain(|token, _| !queued.contains(token) && !echoed.contains(token));
     }
 
     /// Whether a session dial toward `peer` is still in flight (issued, not
@@ -291,6 +344,21 @@ impl Shared {
     }
 }
 
+/// Facts about a Connection attempt the relay leg needs.
+///
+/// Policy (relays, stagger, `force_relay`) stays in [`NatConfig`]. The caller
+/// owns direct candidate dials; the leg learns about them through
+/// [`SwarmEvent::ConnectionEstablished`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectLegs {
+    /// The caller is racing direct candidates; give them
+    /// [`NatConfig::relay_stagger_ms`] head start.
+    pub direct_racing: bool,
+    /// Whether this attempt may use a configured relay (false for mDNS-sourced
+    /// dials).
+    pub allow_relay: bool,
+}
+
 /// Sans-I/O NAT-traversal orchestrator.
 ///
 /// Inputs arrive through [`handle_event`](Self::handle_event) (swarm events,
@@ -315,7 +383,6 @@ pub struct NatAgent {
     /// reconciled only if a second tick arrives without the replacement.
     pending_peer_disconnects: BTreeSet<PeerId>,
     reconcile_peer_disconnects: BTreeSet<PeerId>,
-    next_connect_id: u64,
     next_inbound_id: u64,
 }
 
@@ -339,69 +406,49 @@ impl NatAgent {
                 listen_addrs: Vec::new(),
                 observed_addrs: BTreeMap::new(),
                 pending_session_dials: BTreeMap::new(),
+                dialed: BTreeMap::new(),
             },
             attempts: BTreeMap::new(),
             housekeeping,
             inbound: BTreeMap::new(),
             pending_peer_disconnects: BTreeSet::new(),
             reconcile_peer_disconnects: BTreeSet::new(),
-            next_connect_id: 0,
             next_inbound_id: 0,
         }
     }
 
-    /// Starts a connect attempt toward `peer`.
+    /// Registers Connection attempt `id` (allocated by the caller) toward
+    /// `peer` and starts its relay leg per `legs`. The caller owns direct
+    /// candidate dials; the leg learns about them through
+    /// [`SwarmEvent::ConnectionEstablished`].
     ///
-    /// `direct_addrs` are candidate transport addresses for the peer (from
-    /// discovery, config, or out-of-band exchange); they are validated and
-    /// deduplicated with the same policy as
-    /// [`minip2p_core::select_direct_addrs`]. The relay leg uses the
-    /// first configured relay in [`NatConfig::relays`].
-    pub fn connect(&mut self, peer: PeerId, direct_addrs: Vec<Multiaddr>, now: Now) -> ConnectId {
-        self.connect_with_relay_policy(peer, direct_addrs, true, now)
-    }
-
-    /// Starts a direct-only connect attempt toward `peer`.
-    ///
-    /// Candidates are validated identically to [`NatAgent::connect`], but
-    /// configured relays are never dialed and no HOP CONNECT is attempted.
-    /// This is suitable for unauthenticated discovery hints whose authority
-    /// must not extend to relay use.
-    pub fn connect_direct(
-        &mut self,
-        peer: PeerId,
-        direct_addrs: Vec<Multiaddr>,
-        now: Now,
-    ) -> ConnectId {
-        self.connect_with_relay_policy(peer, direct_addrs, false, now)
-    }
-
-    fn connect_with_relay_policy(
-        &mut self,
-        peer: PeerId,
-        direct_addrs: Vec<Multiaddr>,
-        allow_relay: bool,
-        now: Now,
-    ) -> ConnectId {
-        let id = ConnectId(self.next_connect_id);
-        self.next_connect_id += 1;
-        // A connection that is already identity-verified is the best path
-        // available. Do not manufacture a new race which can only waste
-        // work (and, with no candidates or relay, falsely report failure).
-        if self.shared.is_directly_connected(&peer) {
-            self.shared.push_event(NatEvent::PathEstablished {
-                connect_id: id,
-                peer,
-                path: crate::types::Path::DirectDialed,
-            });
-            return id;
+    /// With `allow_relay = false` or no relay configured the attempt has an
+    /// inactive relay leg and only tracks the peer's direct establishment so
+    /// [`NatEvent::PathEstablished`] `{ DirectDialed }` and path snapshots
+    /// keep working. It ends when the caller cancels it or a direct
+    /// connection to the peer establishes.
+    pub fn connect(&mut self, id: ConnectId, peer: PeerId, legs: ConnectLegs, now: Now) {
+        if self.attempts.contains_key(&id) {
+            return;
         }
-        if let Some(attempt) =
-            ConnectAttempt::start(id, peer, direct_addrs, allow_relay, &mut self.shared, now)
-        {
+        if let Some(attempt) = ConnectAttempt::start(id, peer, legs, &mut self.shared, now) {
             self.attempts.insert(id, attempt);
         }
-        id
+    }
+
+    /// Whether any relay is configured.
+    pub fn has_relay(&self) -> bool {
+        !self.shared.config.relays.is_empty()
+    }
+
+    /// Whether connects skip direct racing and DCUtR.
+    pub fn force_relay(&self) -> bool {
+        self.shared.config.force_relay
+    }
+
+    /// Current NAT configuration.
+    pub fn config(&self) -> &NatConfig {
+        &self.shared.config
     }
 
     /// Abandons a connect attempt, resetting any streams it holds. No
@@ -431,8 +478,9 @@ impl NatAgent {
     }
 
     /// Feeds one swarm event with the driver's transport classification.
-    /// Circuit connection lifecycle events are correlated with promotions;
-    /// direct events continue to drive the direct-first race.
+    /// Circuit connection lifecycle events are correlated with promotions.
+    /// Direct `ConnectionEstablished` still updates path snapshots for an
+    /// Inactive or racing relay leg.
     pub fn handle_event_with_disposition_classified(
         &mut self,
         event: &SwarmEvent,
@@ -446,6 +494,7 @@ impl NatAgent {
                 touched_state = true;
                 self.pending_peer_disconnects.remove(peer_id);
                 self.reconcile_peer_disconnects.remove(peer_id);
+                self.shared.dialed.remove(conn_id);
                 // Any session dial toward this peer has done its job (ours
                 // landed, or another machine's did — either way the peer is
                 // reachable now and further dials would supersede).
@@ -483,6 +532,7 @@ impl NatAgent {
                 peer_id, conn_id, ..
             } => {
                 touched_state = true;
+                self.shared.dialed.remove(conn_id);
                 self.shared.direct_connections.remove(conn_id);
                 let mut peer_disconnected = false;
                 if let Some(ids) = self.shared.connected.get_mut(peer_id) {
@@ -617,18 +667,11 @@ impl NatAgent {
                         );
                         handled = true;
                     }
-                } else {
-                    if self.owns_stream(peer_id, *stream_id)
-                        && self.shared.bind_stream(peer_id, *stream_id, *conn_id)
-                    {
-                        handled = self.route_stream(
-                            *conn_id,
-                            peer_id,
-                            *stream_id,
-                            StreamInput::Ready,
-                            now,
-                        );
-                    }
+                } else if self.owns_stream(peer_id, *stream_id)
+                    && self.shared.bind_stream(peer_id, *stream_id, *conn_id)
+                {
+                    handled =
+                        self.route_stream(*conn_id, peer_id, *stream_id, StreamInput::Ready, now);
                 }
                 touched_state = handled;
             }
@@ -670,6 +713,15 @@ impl NatAgent {
                     self.shared.release_stream(peer_id, *stream_id);
                 }
                 touched_state = handled;
+            }
+            SwarmEvent::DialFailed {
+                conn_id, reason, ..
+            } => {
+                if let Some((token, purpose)) = self.shared.dialed.remove(conn_id) {
+                    handled = true;
+                    touched_state = true;
+                    self.finish_dial_failure(token, purpose, reason.clone(), now);
+                }
             }
             _ => {}
         }
@@ -713,20 +765,16 @@ impl NatAgent {
         let Some(purpose) = self.shared.tokens.remove(&token) else {
             return;
         };
-        if result.is_err()
-            && let Some((peer, _)) = self.shared.pending_session_dials.remove(&token)
-        {
-            // A rejected session dial is no longer in flight. Attempts that
-            // were sharing it must issue their own dial now: nothing else
-            // re-enters a waiting relay leg, so they would otherwise burn
-            // their leg deadline on a dial that already failed. The owner
-            // learns through its own routing below, and housekeeping
-            // waiters fall back to their acquire/probe deadlines.
-            let owner = purpose.connect_id();
-            for (id, attempt) in self.attempts.iter_mut() {
-                if owner.as_ref() != Some(id) {
-                    attempt.on_session_dial_failed(&peer, &mut self.shared, now);
-                }
+        match &result {
+            Ok(conn_id) => {
+                self.shared
+                    .dialed
+                    .insert(*conn_id, (token, purpose.clone()));
+            }
+            Err(reason) => {
+                self.finish_dial_failure(token, purpose, reason.clone(), now);
+                self.reap_done();
+                return;
             }
         }
         match &purpose {
@@ -743,10 +791,59 @@ impl NatAgent {
                     && let Some(attempt) = self.attempts.get_mut(&id)
                 {
                     attempt.on_dial_result(&purpose, result, &mut self.shared, now);
+                } else if matches!(
+                    purpose,
+                    TokenPurpose::PunchDial(_) | TokenPurpose::RelayDial(_)
+                ) && let Ok(conn_id) = result
+                {
+                    // The attempt ended before the driver echoed this dial.
+                    // Close it so a punch cannot land after Cancelled.
+                    self.shared.dialed.remove(&conn_id);
+                    self.shared.push_action(NatAction::CloseCircuit { conn_id });
                 }
             }
         }
         self.reap_done();
+    }
+
+    fn finish_dial_failure(
+        &mut self,
+        token: NatToken,
+        purpose: TokenPurpose,
+        reason: String,
+        now: Now,
+    ) {
+        if let Some((peer, _)) = self.shared.pending_session_dials.remove(&token) {
+            // A rejected session dial is no longer in flight. Attempts that
+            // were sharing it must issue their own dial now: nothing else
+            // re-enters a waiting relay leg, so they would otherwise burn
+            // their leg deadline on a dial that already failed. The owner
+            // learns through its own routing below, and housekeeping
+            // waiters fall back to their acquire/probe deadlines.
+            let owner = purpose.connect_id();
+            for (id, attempt) in self.attempts.iter_mut() {
+                if owner.as_ref() != Some(id) {
+                    attempt.on_session_dial_failed(&peer, &mut self.shared, now);
+                }
+            }
+        }
+        match &purpose {
+            TokenPurpose::ProbeDial => {
+                self.housekeeping
+                    .on_probe_dial_result(&Err(reason), &mut self.shared, now);
+            }
+            TokenPurpose::ReserveDial => {
+                self.housekeeping
+                    .on_reserve_dial_result(&Err(reason), &mut self.shared, now);
+            }
+            _ => {
+                if let Some(id) = purpose.connect_id()
+                    && let Some(attempt) = self.attempts.get_mut(&id)
+                {
+                    attempt.on_dial_result(&purpose, Err(reason), &mut self.shared, now);
+                }
+            }
+        }
     }
 
     /// Reports the result of a [`NatAction::OpenStream`] the driver executed.

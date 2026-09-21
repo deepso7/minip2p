@@ -1,10 +1,10 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerAddr, PeerId};
+use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId};
 use minip2p_transport::StreamId;
 
-use crate::types::{ConnectId, NatError, NatToken, Path, ReachabilityState};
+use crate::types::{NatError, NatToken, Path, ReachabilityState};
 
 /// Local role used when promoting a relay bridge into a circuit connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

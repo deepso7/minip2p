@@ -26,9 +26,6 @@ pub(crate) struct NatDriver {
     epoch: Instant,
     /// Relays we hold a reservation on, for circuit-address advertising.
     reserved_relays: Vec<(PeerId, Multiaddr)>,
-    /// Connection ids this driver dialed; matching [`SwarmEvent::DialFailed`]
-    /// is swallowed so NAT internals stay off the Endpoint stream until #176.
-    nat_dials: BTreeSet<ConnectionId>,
     /// Relay transport addresses by peer, captured at construction.
     relay_addrs: Vec<(PeerId, Multiaddr)>,
     /// Direct public addresses confirmed by AutoNAT.
@@ -37,6 +34,8 @@ pub(crate) struct NatDriver {
     promoted: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
     /// Authoritative usable NAT-orchestrated path by remote peer.
     paths: BTreeMap<PeerId, Path>,
+    /// How many queued events the Connection engine has already observed.
+    observed: usize,
     #[cfg(test)]
     bridge_reset_attempts: Vec<(ConnectionId, StreamId)>,
 }
@@ -48,11 +47,11 @@ impl NatDriver {
             events: VecDeque::new(),
             epoch: Instant::now(),
             reserved_relays: Vec::new(),
-            nat_dials: BTreeSet::new(),
             relay_addrs,
             public_addrs: Vec::new(),
             promoted: BTreeMap::new(),
             paths: BTreeMap::new(),
+            observed: 0,
             #[cfg(test)]
             bridge_reset_attempts: Vec::new(),
         }
@@ -79,15 +78,6 @@ impl NatDriver {
         if self.inject_straggler(event, swarm) {
             self.pump(swarm);
             return true;
-        }
-        if let SwarmEvent::DialFailed { conn_id, .. } = event
-            && self.nat_dials.remove(conn_id)
-        {
-            self.pump(swarm);
-            return true;
-        }
-        if let SwarmEvent::ConnectionEstablished { conn_id, .. } = event {
-            self.nat_dials.remove(conn_id);
         }
         let is_circuit = match event {
             SwarmEvent::ConnectionEstablished { conn_id, .. }
@@ -158,6 +148,34 @@ impl NatDriver {
         self.promoted.retain(|_, id| active.contains(id));
     }
 
+    pub(crate) fn unobserved_events(&self) -> Vec<NatEvent> {
+        self.events.iter().skip(self.observed).cloned().collect()
+    }
+
+    pub(crate) fn mark_observed(&mut self) {
+        self.observed = self.events.len();
+    }
+
+    pub(crate) fn take_events(&mut self) -> Vec<NatEvent> {
+        self.observed = 0;
+        self.events.drain(..).collect()
+    }
+
+    pub(crate) fn note_removed(&mut self, index: usize) {
+        if index < self.observed {
+            self.observed -= 1;
+        }
+        self.observed = self.observed.min(self.events.len());
+    }
+    pub(crate) fn has_relay(&self) -> bool {
+        self.agent.has_relay()
+    }
+
+    /// Whether connects skip direct racing and DCUtR.
+    pub(crate) fn force_relay(&self) -> bool {
+        self.agent.force_relay()
+    }
+
     /// Returns the latest usable NAT-orchestrated path for `peer`.
     pub(crate) fn path(&self, peer: &PeerId) -> Option<Path> {
         self.paths.get(peer).cloned()
@@ -188,9 +206,6 @@ impl NatDriver {
         match action {
             NatAction::Dial { token, addr } => {
                 let result = swarm.dial(&addr).map_err(|e| e.to_string());
-                if let Ok(conn_id) = result {
-                    self.nat_dials.insert(conn_id);
-                }
                 self.agent.dial_result(token, result, now);
             }
             NatAction::OpenStream {
@@ -713,7 +728,15 @@ mod tests {
             ..NatConfig::default()
         };
         let mut agent = NatAgent::new(pair.local.peer_id().clone(), config);
-        agent.connect(target, Vec::new(), Now::from_mono(0));
+        agent.connect(
+            minip2p_core::ConnectId::from_u64(1),
+            target,
+            minip2p_nat::ConnectLegs {
+                direct_racing: false,
+                allow_relay: true,
+            },
+            Now::from_mono(0),
+        );
         let dial = drain_actions(&mut agent);
         agent.dial_result(
             only_dial_token(&dial),
@@ -837,9 +860,7 @@ mod tests {
 
         {
             let driver = endpoint.nat.as_mut().expect("NAT configured");
-            let connect_id = driver
-                .agent
-                .connect(peer.clone(), Vec::new(), Now::from_mono(0));
+            let connect_id = minip2p_core::ConnectId::from_u64(1);
             driver.observe(&NatEvent::PathEstablished {
                 connect_id,
                 peer: peer.clone(),
@@ -857,9 +878,7 @@ mod tests {
 
         {
             let driver = endpoint.nat.as_mut().expect("NAT configured");
-            let connect_id = driver
-                .agent
-                .connect(peer.clone(), Vec::new(), Now::from_mono(1));
+            let connect_id = minip2p_core::ConnectId::from_u64(1);
             driver.observe(&NatEvent::PathUpgraded {
                 connect_id,
                 peer: peer.clone(),

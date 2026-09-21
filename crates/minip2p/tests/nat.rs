@@ -6,7 +6,8 @@
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectionId, Endpoint, Event, NatConfig, NatError, NatEvent, Path, PeerId, ReservationPolicy,
+    ConnectFailure, ConnectOutcome, ConnectionId, Endpoint, Event, NatConfig, NatEvent, Path,
+    PeerId, ReservationPolicy,
 };
 
 #[path = "../../../tests/support/relay.rs"]
@@ -31,15 +32,24 @@ fn direct_candidate_wins_over_loopback() {
     let b_addr = b.listen().expect("b listens");
     a.listen().expect("a listens");
 
-    let id = a.nat_connect_addr(&b_addr).expect("connect starts");
+    let id = a.connect(&b_addr).expect("connect starts");
 
     // Drive both endpoints; no relay is configured, so the only leg is the
     // direct dial of the provided candidate.
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut path = None;
-    while path.is_none() {
+    let mut settled = None;
+    while path.is_none() || settled.is_none() {
         assert!(Instant::now() < deadline, "direct connect timed out");
-        let _ = a.next_event(Duration::from_millis(20)).expect("a drives");
+        if let Some(Event::ConnectSettled {
+            connect_id,
+            outcome,
+            ..
+        }) = a.next_event(Duration::from_millis(20)).expect("a drives")
+            && connect_id == id
+        {
+            settled = Some(outcome);
+        }
         let _ = b.next_event(Duration::from_millis(20)).expect("b drives");
         for event in a.take_nat_events() {
             if let NatEvent::PathEstablished {
@@ -54,10 +64,19 @@ fn direct_candidate_wins_over_loopback() {
         }
     }
     assert!(matches!(path, Some(Path::DirectDialed)));
+    assert!(
+        matches!(settled, Some(ConnectOutcome::Connected { conn_id }) if !conn_id.is_circuit())
+    );
     assert!(a.connected_peers().contains(b_addr.peer_id()));
     assert!(
         matches!(a.path(b_addr.peer_id()), Some(Path::DirectDialed)),
         "the path query must survive PathEstablished event consumption"
+    );
+
+    a.cancel_connect(id);
+    assert!(
+        a.connected_peers().contains(b_addr.peer_id()),
+        "cancel after Connected must not disconnect"
     );
 
     a.disconnect(b_addr.peer_id()).expect("disconnect starts");
@@ -78,22 +97,29 @@ fn connect_without_candidates_or_relay_fails_fast() {
     a.listen().expect("a listens");
 
     let stranger = minip2p::Ed25519Keypair::generate().peer_id();
-    let id = a.nat_connect(&stranger).expect("connect starts");
+    let id = a.connect(&stranger).expect("connect starts");
 
-    let path = a
-        .nat_wait_path(id, Duration::from_secs(2))
-        .expect("nat_wait_path drives");
-    assert!(path.is_none(), "no path can exist");
-    // The failure detail stays inspectable.
-    let events = a.take_nat_events();
-    assert!(
-        events.iter().any(|event| matches!(
-            event,
-            NatEvent::ConnectFailed { connect_id, error: NatError::NoPathAvailable, .. }
-                if *connect_id == id
-        )),
-        "expected ConnectFailed, got {events:?}"
-    );
+    let event = a
+        .next_event(Duration::from_secs(1))
+        .expect("connect settles without I/O");
+    match event {
+        Some(Event::ConnectSettled {
+            connect_id,
+            outcome: ConnectOutcome::Failed(failure),
+            ..
+        }) if connect_id == id => {
+            assert!(
+                matches!(failure, ConnectFailure::NoUsableRoute { relay: None, .. }),
+                "expected NoUsableRoute, got {failure:?}"
+            );
+            let text = failure.to_string();
+            assert!(
+                text.contains("no known addresses and no relay configured"),
+                "expected both missing sources, got {text}"
+            );
+        }
+        other => panic!("expected NoUsableRoute ConnectSettled, got {other:?}"),
+    }
 }
 
 #[test]
@@ -105,7 +131,7 @@ fn nat_wait_path_buffers_application_events() {
     let b_addr = b.listen().expect("b listens");
     a.listen().expect("a listens");
 
-    let id = a.nat_connect_addr(&b_addr).expect("connect starts");
+    let id = a.connect(&b_addr).expect("connect starts");
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut path = None;
     while path.is_none() {
@@ -157,7 +183,7 @@ fn wait_peer_ready_drives_nat_agent() {
         }
     });
 
-    let id = a.nat_connect_addr(&b_addr).expect("connect starts");
+    let id = a.connect(&b_addr).expect("connect starts");
     let ready = a
         .wait_peer_ready(b_addr.peer_id(), Duration::from_secs(10))
         .expect("wait succeeds");
@@ -230,7 +256,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
     initiator.listen().expect("initiator listens");
     let initiator_peer = initiator.peer_id().clone();
     let connect_id = initiator
-        .nat_connect(&responder_peer)
+        .connect(&responder_peer)
         .expect("start relay-only connect");
 
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -239,8 +265,9 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
     let mut responder_circuit = None;
     let mut initiator_ready = false;
     let mut responder_ready = false;
+    let mut settled = None;
     let mut trace = Vec::new();
-    while path.is_none() || !initiator_ready || !responder_ready {
+    while path.is_none() || settled.is_none() || !initiator_ready || !responder_ready {
         assert!(
             Instant::now() < deadline,
             "circuit did not become ready:\npeers={trace:#?}\nrelay={:#?}\ninitiator circuits={:?}\nresponder circuits={:?}",
@@ -253,6 +280,15 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
             .expect("drive initiator")
         {
             trace.push(format!("initiator swarm: {event:?}"));
+            if let Event::ConnectSettled {
+                connect_id: found,
+                outcome,
+                ..
+            } = &event
+                && *found == connect_id
+            {
+                settled = Some(outcome.clone());
+            }
             observe_circuit_event(
                 event,
                 &responder_peer,
@@ -297,6 +333,13 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
             relay: relay.addr().peer_id().clone()
         })
     );
+    match settled {
+        Some(ConnectOutcome::Connected { conn_id }) => {
+            assert!(conn_id.is_circuit());
+            assert_eq!(Some(conn_id), initiator_circuit);
+        }
+        other => panic!("expected ConnectSettled Connected circuit, got {other:?}"),
+    }
     let initiator_circuit = initiator_circuit.expect("initiator circuit id");
     let responder_circuit = responder_circuit.expect("responder circuit id");
     assert_ne!(initiator_circuit.as_u64() & (1 << 63), 0);
@@ -480,7 +523,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
     initiator.listen().expect("initiator listens");
     let initiator_peer = initiator.peer_id().clone();
     let connect_id = initiator
-        .nat_connect(&responder_peer)
+        .connect(&responder_peer)
         .expect("start relay-only connect");
 
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -489,7 +532,8 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
     let mut responder_circuit = None;
     let mut initiator_ready = false;
     let mut responder_ready = false;
-    while path.is_none() || !initiator_ready || !responder_ready {
+    let mut settled = false;
+    while path.is_none() || !settled || !initiator_ready || !responder_ready {
         assert!(
             Instant::now() < deadline,
             "circuit over a TCP relay did not become ready:\nrelay={:#?}",
@@ -499,6 +543,16 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
             .next_event(Duration::from_millis(20))
             .expect("drive initiator")
         {
+            if let Event::ConnectSettled {
+                connect_id: found,
+                outcome: ConnectOutcome::Connected { conn_id },
+                ..
+            } = &event
+                && *found == connect_id
+            {
+                assert!(conn_id.is_circuit());
+                settled = true;
+            }
             observe_circuit_event(
                 event,
                 &responder_peer,
@@ -693,6 +747,80 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
         }
         relay.assert_healthy();
     }
+}
+
+#[test]
+fn cancel_mid_relay_leg_emits_cancelled_and_closes_circuits() {
+    let relay = relay_support::RelayServer::spawn();
+    let relay_addr = relay.addr().clone();
+
+    let mut responder = Endpoint::builder()
+        .relay(relay_addr.clone())
+        .nat_config(NatConfig {
+            force_relay: true,
+            reservation_policy: ReservationPolicy::Always,
+            ..NatConfig::default()
+        })
+        .bind_quic("127.0.0.1:0")
+        .expect("bind responder");
+    responder.listen().expect("responder listens");
+    let responder_peer = responder.peer_id().clone();
+
+    let reservation_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            Instant::now() < reservation_deadline,
+            "responder did not reserve on relay"
+        );
+        let _ = responder
+            .next_event(Duration::from_millis(20))
+            .expect("drive responder reservation");
+        if responder.take_nat_events().iter().any(
+            |event| matches!(event, NatEvent::RelayReserved { relay, .. } if relay == relay_addr.peer_id()),
+        ) {
+            break;
+        }
+        relay.assert_healthy();
+    }
+
+    let mut initiator = Endpoint::builder()
+        .relay(relay_addr)
+        .nat_config(NatConfig {
+            force_relay: true,
+            reservation_policy: ReservationPolicy::Never,
+            ..NatConfig::default()
+        })
+        .bind_quic("127.0.0.1:0")
+        .expect("bind initiator");
+    initiator.listen().expect("initiator listens");
+    let id = initiator
+        .connect(&responder_peer)
+        .expect("start relay-only connect");
+    initiator.cancel_connect(id);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut cancelled = false;
+    while !cancelled {
+        assert!(Instant::now() < deadline, "cancel did not settle");
+        if let Some(Event::ConnectSettled {
+            connect_id,
+            outcome: ConnectOutcome::Cancelled,
+            ..
+        }) = initiator
+            .next_event(Duration::from_millis(20))
+            .expect("drive initiator cancel")
+            && connect_id == id
+        {
+            cancelled = true;
+        }
+        let _ = responder
+            .next_event(Duration::from_millis(20))
+            .expect("drive responder");
+        relay.assert_healthy();
+    }
+
+    assert!(initiator.swarm().transport().circuit_ids().is_empty());
+    assert!(!initiator.connected_peers().contains(&responder_peer));
 }
 
 fn observe_circuit_event(

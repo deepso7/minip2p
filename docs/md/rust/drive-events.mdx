@@ -68,7 +68,7 @@ fn connect_and_ready(
 }
 ```
 
-With the `nat` feature, prefer `nat_connect*` plus `nat_wait_path` for the first usable NAT path. Use `wait_peer_ready` only when the application needs Identify's protocol list (for example early `RemoteDoesNotSupport` checks). `open_stream` is allowed once the peer is connected; Identify is not a stack gate for opening known app protocols.
+With the `nat` feature, `connect` races direct candidates against a relay leg when one is configured. Use `nat_wait_path` for the first usable NAT path (the provisional Relayed path, when that lands first); `ConnectSettled` is the attempt's terminal. Use `wait_peer_ready` only when the application needs Identify's protocol list (for example early `RemoteDoesNotSupport` checks). `open_stream` is allowed once the peer is connected; Identify is not a stack gate for opening known app protocols.
 
 ## Application event loops
 
