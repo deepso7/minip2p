@@ -205,6 +205,57 @@ fn portable_autonat_builds_without_relay_state() {
 
 #[test]
 #[cfg(feature = "portable-autonat")]
+fn autonat_picks_up_listen_addresses_bound_after_build() {
+    let local = identity(140);
+    let server = identity(141);
+    let wire = Wire::default();
+    let server_addr = PeerAddr::new(
+        "/ip4/192.168.1.9/tcp/4001"
+            .parse()
+            .expect("valid AutoNAT address"),
+        server.peer_id(),
+    )
+    .expect("valid AutoNAT peer address");
+
+    let mut endpoint = Endpoint::portable(&local, CountingEntropy(142))
+        .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
+        .autonat(server_addr)
+        .build()
+        .expect("portable AutoNAT endpoint builds");
+
+    // No listener yet: there are no dial-back addresses to probe, so the
+    // endpoint must stay quiet no matter how long the host idles.
+    let mut now_ms = 0;
+    for _ in 0..100 {
+        endpoint
+            .poll(Now::from_millis(now_ms))
+            .expect("poll without listeners");
+        assert!(wire.is_quiet(), "no listen address means no AutoNAT dial");
+        now_ms += 100;
+    }
+
+    endpoint
+        .listen(
+            &format!("/ip4/{DIALER_IP}/tcp/4001")
+                .parse()
+                .expect("valid listen address"),
+        )
+        .expect("post-build listen binds");
+
+    for _ in 0..100 {
+        endpoint
+            .poll(Now::from_millis(now_ms))
+            .expect("poll after listen");
+        if !wire.is_quiet() {
+            return;
+        }
+        now_ms += 100;
+    }
+    panic!("AutoNAT never probed after a post-build listen");
+}
+
+#[test]
+#[cfg(feature = "portable-autonat")]
 fn portable_nat_rejects_an_empty_policy() {
     let local = identity(123);
     let result = Endpoint::portable(&local, CountingEntropy(124))

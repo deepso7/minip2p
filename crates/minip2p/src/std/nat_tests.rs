@@ -1,430 +1,12 @@
-//! Std endpoint wiring that pumps a sans-I/O [`NatAgent`] against the endpoint's
-//! swarm: clock sampling, action execution, stream-event interception, and
-//! circuit-address advertising.
-//!
-//! Available behind the `nat` cargo feature; see the `nat` methods on
-//! [`Endpoint`](crate::Endpoint) and [`EndpointBuilder`](crate::EndpointBuilder).
-
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-use minip2p_circuit::{AdoptError, BridgeAdoption, CircuitRole, CircuitTransport};
-use minip2p_core::{Multiaddr, PeerId, Protocol};
-use minip2p_nat::{BridgeRole, NatAction, NatAgent, NatEvent, Now, Path, PromoteError};
+//! Standard Endpoint NAT regression tests.
+use minip2p_core::Multiaddr;
+use minip2p_nat::{NatAction, NatAgent, NatEvent, Now, Path};
+use minip2p_platform::StdEntropy;
 use minip2p_swarm::SwarmEvent;
-use minip2p_transport::{ConnectionId, StreamId, Transport};
-
-use crate::EndpointSwarm;
-
-/// Drives a [`NatAgent`] against the endpoint's swarm.
-pub(crate) struct NatDriver {
-    pub(crate) agent: NatAgent,
-    /// NAT events awaiting the Endpoint event stream; the endpoint moves
-    /// them out once the Connection-attempt engine has observed them.
-    pub(crate) events: VecDeque<NatEvent>,
-    /// Monotonic epoch for the agent's `mono_ms` clock.
-    epoch: Instant,
-    /// Relays we hold a reservation on, for circuit-address advertising.
-    reserved_relays: Vec<(PeerId, Multiaddr)>,
-    /// Relay transport addresses by peer, captured at construction.
-    relay_addrs: Vec<(PeerId, Multiaddr)>,
-    /// Direct public addresses confirmed by AutoNAT.
-    public_addrs: Vec<Multiaddr>,
-    /// Exact adopted bridge keys mapped to their promoted circuit ids.
-    promoted: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
-    /// Authoritative usable NAT-orchestrated path by remote peer.
-    paths: BTreeMap<PeerId, Path>,
-    /// How many queued events the Connection engine has already observed.
-    observed: usize,
-    #[cfg(test)]
-    bridge_reset_attempts: Vec<(ConnectionId, StreamId)>,
-}
-
-impl NatDriver {
-    pub(crate) fn new(agent: NatAgent, relay_addrs: Vec<(PeerId, Multiaddr)>) -> Self {
-        Self {
-            agent,
-            events: VecDeque::new(),
-            epoch: Instant::now(),
-            reserved_relays: Vec::new(),
-            relay_addrs,
-            public_addrs: Vec::new(),
-            promoted: BTreeMap::new(),
-            paths: BTreeMap::new(),
-            observed: 0,
-            #[cfg(test)]
-            bridge_reset_attempts: Vec::new(),
-        }
-    }
-
-    /// Samples the driver's clocks for the agent.
-    pub(crate) fn now(&self) -> Now {
-        Now {
-            mono_ms: self.epoch.elapsed().as_millis() as u64,
-            unix_secs: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .map(|d| d.as_secs()),
-        }
-    }
-
-    /// Feeds one swarm event to the agent and executes its cascade.
-    ///
-    /// Returns `true` when the event belongs to the NAT control plane and
-    /// must not be forwarded to the application. The agent's disposition is
-    /// authoritative even when handling claims or releases the stream.
-    pub(crate) fn ingest(&mut self, event: &SwarmEvent, swarm: &mut EndpointSwarm) -> bool {
-        let now = self.now();
-        if self.inject_straggler(event, swarm) {
-            self.pump(swarm);
-            return true;
-        }
-        let is_circuit = match event {
-            SwarmEvent::ConnectionEstablished { conn_id, .. }
-            | SwarmEvent::ConnectionClosed { conn_id, .. } => CircuitTransport::<
-                minip2p_quic::QuicEndpoint,
-                minip2p_platform::StdEntropy,
-            >::is_circuit(*conn_id),
-            _ => false,
-        };
-        let handled = self
-            .agent
-            .handle_event_with_disposition_classified(event, is_circuit, now);
-        if let SwarmEvent::ConnectionClosed {
-            peer_id, conn_id, ..
-        } = event
-        {
-            let closed_bridges: Vec<_> = self
-                .promoted
-                .keys()
-                .filter(|(inner_conn, _)| inner_conn == conn_id)
-                .copied()
-                .collect();
-            for (inner_conn, stream_id) in closed_bridges {
-                swarm
-                    .transport_mut()
-                    .inject_bridge_closed(inner_conn, stream_id);
-            }
-            self.promoted
-                .retain(|(inner_conn, _), circuit| inner_conn != conn_id && circuit != conn_id);
-            if !swarm.connected_peers().contains(peer_id) {
-                self.paths.remove(peer_id);
-            }
-        }
-        self.pump(swarm);
-        handled
-    }
-
-    /// Advances timers only when the agent reports a due deadline, then
-    /// executes any resulting work.
-    pub(crate) fn tick(&mut self, swarm: &mut EndpointSwarm) {
-        let now = self.now();
-        if self.agent.next_timeout(now.mono_ms) != Some(0) {
-            return;
-        }
-        self.agent.handle_tick(now);
-        self.pump(swarm);
-    }
-
-    /// Drains agent actions into swarm calls (echoing synchronous results
-    /// back) and collects application-visible NAT events.
-    pub(crate) fn pump(&mut self, swarm: &mut EndpointSwarm) {
-        loop {
-            let mut progressed = false;
-            while let Some(action) = self.agent.poll_action() {
-                progressed = true;
-                self.execute(action, swarm);
-            }
-            while let Some(event) = self.agent.poll_event() {
-                progressed = true;
-                self.observe(&event);
-                self.events.push_back(event);
-            }
-            if !progressed {
-                break;
-            }
-        }
-        let active: BTreeSet<_> = swarm.transport().circuit_ids().into_iter().collect();
-        self.promoted.retain(|_, id| active.contains(id));
-    }
-
-    /// Queued events the Connection-attempt engine has not observed yet.
-    pub(crate) fn unobserved_events(&self) -> impl Iterator<Item = &NatEvent> {
-        self.events.iter().skip(self.observed)
-    }
-
-    pub(crate) fn mark_observed(&mut self) {
-        self.observed = self.events.len();
-    }
-
-    /// Drains every queued event that reaches the Endpoint event stream,
-    /// once the Connection-attempt engine has observed it.
-    pub(crate) fn drain_application_events(&mut self) -> impl Iterator<Item = NatEvent> + '_ {
-        self.observed = 0;
-        self.events
-            .drain(..)
-            .filter(crate::portable::nat_event_reaches_application)
-    }
-
-    /// Keeps the observation cursor aligned when the discovery sweep removes
-    /// an attempt event it owns.
-    #[cfg(any(feature = "discovery", feature = "mdns"))]
-    pub(crate) fn note_removed(&mut self, index: usize) {
-        if index < self.observed {
-            self.observed -= 1;
-        }
-        self.observed = self.observed.min(self.events.len());
-    }
-    pub(crate) fn has_relay(&self) -> bool {
-        self.agent.has_relay()
-    }
-
-    /// Whether connects skip direct racing and DCUtR.
-    pub(crate) fn force_relay(&self) -> bool {
-        self.agent.force_relay()
-    }
-
-    /// Returns the latest usable NAT-orchestrated path for `peer`.
-    pub(crate) fn path(&self, peer: &PeerId) -> Option<Path> {
-        self.paths.get(peer).cloned()
-    }
-
-    pub(crate) fn advertised_addrs(&self) -> Vec<Multiaddr> {
-        let mut addrs = self.public_addrs.clone();
-        for (_, addr) in &self.reserved_relays {
-            if !addrs.contains(addr) {
-                addrs.push(addr.clone());
-            }
-        }
-        addrs
-    }
-
-    #[cfg(feature = "relay-server")]
-    pub(crate) fn confirmed_public_addrs(&self) -> Vec<Multiaddr> {
-        self.public_addrs.clone()
-    }
-
-    #[cfg(all(test, feature = "relay-server"))]
-    pub(crate) fn set_test_public_addrs(&mut self, addrs: Vec<Multiaddr>) {
-        self.public_addrs = addrs;
-    }
-
-    fn execute(&mut self, action: NatAction, swarm: &mut EndpointSwarm) {
-        let now = self.now();
-        match action {
-            NatAction::Dial { token, addr } => {
-                let result = swarm.dial(&addr).map_err(|e| e.to_string());
-                self.agent.dial_result(token, result, now);
-            }
-            NatAction::OpenStream {
-                token,
-                peer,
-                protocol_id,
-            } => {
-                let result = swarm
-                    .open_stream(&peer, &protocol_id)
-                    .map_err(|e| e.to_string());
-                self.agent.stream_open_result(token, result, now);
-            }
-            NatAction::SendStream {
-                peer,
-                stream_id,
-                data,
-            } => {
-                // Failures surface through the agent's own timeouts and the
-                // swarm's error events; nothing to echo synchronously.
-                match swarm.send_stream(&peer, stream_id, data) {
-                    Ok(()) | Err(_) => {}
-                }
-            }
-            NatAction::CloseStreamWrite { peer, stream_id } => {
-                // A stale close must not replace the lifecycle event that
-                // triggered this action.
-                match swarm.close_stream_write(&peer, stream_id) {
-                    Ok(()) | Err(_) => {}
-                }
-            }
-            NatAction::ResetStream { peer, stream_id } => {
-                // Reset is cleanup, so a stream already gone is equivalent
-                // to a successful reset.
-                match swarm.reset_stream(&peer, stream_id) {
-                    Ok(()) | Err(_) => {}
-                }
-            }
-            NatAction::Disconnect { peer } => {
-                // Connection loss remains visible through the normal swarm
-                // lifecycle; a stale disconnect adds no second outcome.
-                match swarm.disconnect(&peer) {
-                    Ok(()) | Err(_) => {}
-                }
-            }
-            NatAction::Ping { peer } => {
-                // Relay liveness is re-established from lifecycle events;
-                // a stale ping is not an application-visible failure.
-                match swarm.ping(&peer) {
-                    Ok(()) | Err(_) => {}
-                }
-            }
-            NatAction::SendRandomUdp {
-                target,
-                payload_len,
-            } => {
-                let mut payload = vec![0u8; payload_len];
-                // A failed entropy sample simply skips this one best-effort
-                // hole-punch datagram.
-                if let Ok(()) = getrandom::fill(&mut payload) {
-                    match swarm.transport_mut().send_datagram(&target, &payload) {
-                        Ok(()) | Err(_) => {}
-                    }
-                }
-            }
-            NatAction::PromoteBridge {
-                token,
-                inner_conn,
-                relay,
-                stream_id,
-                remote_peer,
-                role,
-                pending_data,
-                remote_write_closed,
-            } => {
-                let key = (inner_conn, stream_id);
-                if let Some(existing) = self.promoted.get(&key).copied() {
-                    self.agent.promote_result(token, Ok(existing), now);
-                    return;
-                }
-                swarm.forget_stream(inner_conn, stream_id);
-                let adoption = BridgeAdoption {
-                    inner_conn,
-                    bridge_stream: stream_id,
-                    relay,
-                    remote_peer,
-                    role: match role {
-                        BridgeRole::Initiator => CircuitRole::Initiator,
-                        BridgeRole::Responder => CircuitRole::Responder,
-                    },
-                    pending_data,
-                    remote_write_closed,
-                };
-                match swarm.transport_mut().adopt_bridge(adoption) {
-                    Ok(conn_id) => {
-                        self.promoted.insert(key, conn_id);
-                        self.agent.promote_result(token, Ok(conn_id), now);
-                    }
-                    Err(error) => {
-                        let promote_error = match &error {
-                            AdoptError::PeerAlreadyDirect => PromoteError::PeerAlreadyDirect,
-                            AdoptError::UnknownConnection => PromoteError::UnknownConnection,
-                            _ => PromoteError::Failed(error.to_string()),
-                        };
-                        self.agent.promote_result(token, Err(promote_error), now);
-                        if !matches!(error, AdoptError::UnknownConnection) {
-                            #[cfg(test)]
-                            self.bridge_reset_attempts.push((inner_conn, stream_id));
-                            match swarm
-                                .transport_mut()
-                                .inner_mut()
-                                .reset_stream(inner_conn, stream_id)
-                            {
-                                Ok(()) | Err(_) => {}
-                            }
-                        }
-                    }
-                }
-            }
-            NatAction::CloseCircuit { conn_id } => {
-                match swarm.transport_mut().close(conn_id) {
-                    Ok(()) | Err(minip2p_transport::TransportError::ConnectionNotFound { .. }) => {
-                        self.promoted.retain(|_, id| *id != conn_id);
-                    }
-                    // A transport failure will emerge through its normal
-                    // event path; retain the promotion until then.
-                    Err(_) => {}
-                }
-            }
-        }
-    }
-
-    fn inject_straggler(&mut self, event: &SwarmEvent, swarm: &mut EndpointSwarm) -> bool {
-        let key = match event {
-            SwarmEvent::StreamData {
-                conn_id, stream_id, ..
-            }
-            | SwarmEvent::StreamRemoteWriteClosed {
-                conn_id, stream_id, ..
-            }
-            | SwarmEvent::StreamClosed {
-                conn_id, stream_id, ..
-            } => (*conn_id, *stream_id),
-            _ => return false,
-        };
-        if !self.promoted.contains_key(&key) {
-            return false;
-        }
-        match event {
-            SwarmEvent::StreamData { data, .. } => {
-                swarm
-                    .transport_mut()
-                    .inject_bridge_data(key.0, key.1, data.clone());
-            }
-            SwarmEvent::StreamRemoteWriteClosed { .. } => swarm
-                .transport_mut()
-                .inject_bridge_remote_write_closed(key.0, key.1),
-            SwarmEvent::StreamClosed { .. } => {
-                swarm.transport_mut().inject_bridge_closed(key.0, key.1);
-                self.promoted.remove(&key);
-            }
-            // `key` was extracted above only for these three stream events.
-            // Keep this defensive if a new swarm event reaches this path.
-            _ => return false,
-        }
-        true
-    }
-
-    /// Updates NAT's address contribution after a lifecycle event.
-    fn observe(&mut self, event: &NatEvent) {
-        match event {
-            NatEvent::PathEstablished { peer, path, .. } => {
-                self.paths.insert(peer.clone(), path.clone());
-            }
-            NatEvent::InboundPathEstablished { peer, path } => {
-                self.paths.insert(peer.clone(), path.clone());
-            }
-            NatEvent::PathUpgraded { peer, to, .. } => {
-                self.paths.insert(peer.clone(), to.clone());
-            }
-            NatEvent::InboundDirectUpgrade { peer } => {
-                self.paths.insert(peer.clone(), Path::DirectPunched);
-            }
-            NatEvent::RelayReserved { relay, .. } => {
-                if self.reserved_relays.iter().any(|(peer, _)| peer == relay) {
-                    return; // renewal — already advertised
-                }
-                let Some((_, transport)) = self.relay_addrs.iter().find(|(p, _)| p == relay) else {
-                    return;
-                };
-                let mut circuit = transport.clone();
-                circuit.push(Protocol::P2p(relay.clone()));
-                circuit.push(Protocol::P2pCircuit);
-                self.reserved_relays.push((relay.clone(), circuit));
-            }
-            NatEvent::RelayReservationLost { relay } => {
-                self.reserved_relays.retain(|(peer, _)| peer != relay);
-            }
-            NatEvent::ReachabilityChanged {
-                confirmed_addrs: addrs,
-                ..
-            }
-            | NatEvent::PublicAddressesChanged { addrs }
-                if self.public_addrs != *addrs =>
-            {
-                self.public_addrs = addrs.clone();
-            }
-            _ => {}
-        }
-    }
-}
-
+use minip2p_transport::Transport;
+use minip2p_transport::{ConnectionId, StreamId};
+use std::time::Instant;
+type NatDriver = crate::nat::NatDriver<StdEntropy>;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -811,12 +393,14 @@ mod tests {
         let driver = NatDriver::new(
             agent,
             vec![(relay_peer, pair.relay_addr.transport().clone())],
+            StdEntropy,
         );
         (driver, promotion)
     }
 
     fn execute(driver: &mut NatDriver, action: NatAction, endpoint: &mut Endpoint) {
-        driver.execute(action, &mut endpoint.swarm);
+        let now = endpoint.swarm.now();
+        driver.execute(action, endpoint.swarm.runtime_mut(), now);
     }
 
     fn circuit_id(driver: &NatDriver, key: (ConnectionId, StreamId)) -> ConnectionId {
@@ -947,7 +531,8 @@ mod tests {
                 stream_id: pair.stream,
                 data: header,
             },
-            &mut pair.local.swarm,
+            pair.local.swarm.runtime_mut(),
+            minip2p_platform::Now::from_millis(10),
         ));
         assert!(driver.promoted.contains_key(&key));
         assert!(!driver.ingest(
@@ -957,7 +542,8 @@ mod tests {
                 stream_id: pair.stream,
                 data: vec![1],
             },
-            &mut pair.local.swarm,
+            pair.local.swarm.runtime_mut(),
+            minip2p_platform::Now::from_millis(10),
         ));
 
         execute(
@@ -1032,7 +618,8 @@ mod tests {
                 stream_id: stream,
                 data: vec![1],
             },
-            &mut pair.local.swarm,
+            pair.local.swarm.runtime_mut(),
+            minip2p_platform::Now::from_millis(10),
         ));
     }
 
@@ -1077,7 +664,8 @@ mod tests {
                 conn_id: fin_pair.inner_conn,
                 stream_id: fin_pair.stream,
             },
-            &mut fin_pair.local.swarm,
+            fin_pair.local.swarm.runtime_mut(),
+            minip2p_platform::Now::from_millis(10),
         ));
 
         // Exact bridge closure is terminal and removes the keyed adoption.
@@ -1091,7 +679,8 @@ mod tests {
                 conn_id: closed_pair.inner_conn,
                 stream_id: closed_pair.stream,
             },
-            &mut closed_pair.local.swarm,
+            closed_pair.local.swarm.runtime_mut(),
+            minip2p_platform::Now::from_millis(10),
         ));
         assert!(!closed.promoted.contains_key(&closed_key));
 
@@ -1107,7 +696,8 @@ mod tests {
                 conn_id: inner_pair.inner_conn,
                 cause: minip2p_swarm::ConnectionCloseCause::Transport,
             },
-            &mut inner_pair.local.swarm,
+            inner_pair.local.swarm.runtime_mut(),
+            minip2p_platform::Now::from_millis(10),
         );
         assert!(!inner.promoted.contains_key(&inner_key));
         let events = inner_pair
@@ -1132,7 +722,8 @@ mod tests {
                 conn_id: promoted,
                 cause: minip2p_swarm::ConnectionCloseCause::Transport,
             },
-            &mut circuit_pair.local.swarm,
+            circuit_pair.local.swarm.runtime_mut(),
+            minip2p_platform::Now::from_millis(10),
         );
         assert!(!circuit.promoted.contains_key(&circuit_key));
 
@@ -1149,7 +740,10 @@ mod tests {
             .transport_mut()
             .close(promoted)
             .expect("transport-side close");
-        swept.pump(&mut swept_pair.local.swarm);
+        swept.pump(
+            swept_pair.local.swarm.runtime_mut(),
+            minip2p_platform::Now::from_millis(10),
+        );
         assert!(swept.promoted.is_empty());
     }
 
@@ -1188,7 +782,8 @@ mod tests {
                     &event,
                     SwarmEvent::Error(error) if error.conn_id == Some(promoted)
                 );
-                driver.ingest(&event, &mut pair.local.swarm);
+                let now = pair.local.swarm.now();
+                driver.ingest(&event, pair.local.swarm.runtime_mut(), now);
             }
         }
 

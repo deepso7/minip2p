@@ -1473,7 +1473,6 @@ name = "minip2p-rs"
 version = "0.6.0"
 dependencies = [
  "criterion",
- "getrandom",
  "minip2p-circuit",
  "minip2p-core",
  "minip2p-discovery",

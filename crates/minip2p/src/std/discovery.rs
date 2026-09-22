@@ -16,9 +16,9 @@ use minip2p_nat::NatEvent;
 use minip2p_pubsub::GossipsubEvent;
 use minip2p_swarm::SwarmEvent;
 
+use super::NatDriver;
 #[cfg(feature = "mdns")]
 use super::mdns::MdnsDriver;
-use super::nat::NatDriver;
 #[cfg(feature = "discovery")]
 use super::pubsub::GossipsubDriver;
 use crate::portable::ConnectEngine;
@@ -299,8 +299,9 @@ impl DiscoveryDriver {
             let cancel_leg = connect.is_pending(id);
             connect.cancel(id, swarm.runtime_mut());
             if cancel_leg {
-                nat.agent.cancel(id, nat.now());
-                nat.pump(swarm);
+                nat.cancel(id, swarm.now());
+                let now = swarm.now();
+                nat.pump(swarm.runtime_mut(), now);
             }
         }
     }
@@ -319,14 +320,15 @@ impl DiscoveryDriver {
             let cancel_leg = connect.is_pending(id);
             connect.cancel(id, swarm.runtime_mut());
             if cancel_leg {
-                nat.agent.cancel(id, nat.now());
+                nat.cancel(id, swarm.now());
                 cancelled_leg = true;
             }
         }
         self.inflight.clear();
         self.book.reset_dials();
         if cancelled_leg {
-            nat.pump(swarm);
+            let now = swarm.now();
+            nat.pump(swarm.runtime_mut(), now);
         }
     }
 

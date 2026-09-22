@@ -12,6 +12,8 @@
 
 extern crate alloc;
 
+#[cfg(any(feature = "nat", feature = "portable-autonat"))]
+mod nat;
 mod portable;
 #[cfg(feature = "std")]
 mod std;

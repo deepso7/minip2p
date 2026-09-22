@@ -206,6 +206,11 @@ impl<T, E> CircuitTransport<T, E> {
         self.circuits.keys().copied().collect()
     }
 
+    /// Returns whether a circuit is still active without collecting its identifiers.
+    pub fn contains_circuit(&self, id: ConnectionId) -> bool {
+        self.circuits.contains_key(&id)
+    }
+
     /// Borrows the wrapped transport.
     pub fn inner(&self) -> &T {
         &self.inner

@@ -39,8 +39,10 @@ mod dial;
 mod discovery;
 #[cfg(feature = "mdns")]
 mod mdns;
+#[cfg(all(test, feature = "nat", feature = "quic"))]
+mod nat_tests;
 #[cfg(feature = "nat")]
-mod nat;
+type NatDriver = crate::nat::NatDriver<minip2p_platform::StdEntropy>;
 #[cfg(feature = "pubsub")]
 mod pubsub;
 #[cfg(feature = "relay-server")]
@@ -291,7 +293,7 @@ pub struct Endpoint {
     #[cfg(feature = "relay-server")]
     relay_server: Option<relay_server::RelayServerDriver>,
     #[cfg(feature = "nat")]
-    nat: Option<nat::NatDriver>,
+    nat: Option<NatDriver>,
     #[cfg(feature = "pubsub")]
     gossipsub: Option<pubsub::GossipsubDriver>,
     #[cfg(any(feature = "discovery", feature = "mdns"))]
@@ -544,9 +546,9 @@ impl Endpoint {
         self.connect.cancel(id, self.swarm.runtime_mut());
         #[cfg(feature = "nat")]
         if cancel_leg && let Some(nat) = self.nat.as_mut() {
-            let now = nat.now();
-            nat.agent.cancel(id, now);
-            nat.pump(&mut self.swarm);
+            let now = self.swarm.now();
+            nat.cancel(id, now);
+            nat.pump(self.swarm.runtime_mut(), now);
         }
         self.feed_nat_to_connect();
         self.flush_step_events();
@@ -1013,9 +1015,9 @@ impl Endpoint {
             return;
         };
         if let Some(nat) = self.nat.as_mut() {
-            let now = nat.now();
-            nat.agent.cancel(*connect_id, now);
-            nat.pump(&mut self.swarm);
+            let now = self.swarm.now();
+            nat.cancel(*connect_id, now);
+            nat.pump(self.swarm.runtime_mut(), now);
         }
     }
 
@@ -1110,7 +1112,8 @@ impl Endpoint {
         }
         #[cfg(feature = "nat")]
         if !claimed && let Some(nat) = self.nat.as_mut() {
-            claimed = nat.ingest(event, &mut self.swarm);
+            let now = self.swarm.now();
+            claimed = nat.ingest(event, self.swarm.runtime_mut(), now);
         }
         #[cfg(feature = "pubsub")]
         if !claimed && let Some(pubsub) = self.gossipsub.as_mut() {
@@ -1130,7 +1133,8 @@ impl Endpoint {
         }
         #[cfg(feature = "nat")]
         if let Some(nat) = self.nat.as_mut() {
-            nat.tick(&mut self.swarm);
+            let now = self.swarm.now();
+            nat.tick(self.swarm.runtime_mut(), now);
         }
         #[cfg(feature = "pubsub")]
         if let Some(pubsub) = self.gossipsub.as_mut() {
@@ -1163,7 +1167,7 @@ impl Endpoint {
     /// One wait step's deadline: the caller's, shortened by whichever agent
     /// timer is due first.
     #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-    fn driver_step_deadline(&self, deadline: Deadline) -> Deadline {
+    fn driver_step_deadline(&mut self, deadline: Deadline) -> Deadline {
         let mut step = deadline;
         #[cfg(feature = "relay-server")]
         if let Some(relay_server) = self.relay_server.as_ref()
@@ -1173,7 +1177,7 @@ impl Endpoint {
         }
         #[cfg(feature = "nat")]
         if let Some(nat) = self.nat.as_ref()
-            && let Some(ms) = nat.agent.next_timeout(nat.now().mono_ms)
+            && let Some(ms) = nat.next_timeout(self.swarm.now())
         {
             step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
         }
@@ -1223,7 +1227,8 @@ impl Endpoint {
                 }
                 *expired_poll_used = true;
             }
-            let step = self.connect_step_deadline(self.driver_step_deadline(deadline));
+            let step = self.driver_step_deadline(deadline);
+            let step = self.connect_step_deadline(step);
             // Output queued outside a step (API calls, cancellation) first.
             let queued = self.pending_events.len();
             self.tick_connect();
@@ -1465,7 +1470,7 @@ impl Endpoint {
             let confirmed = self
                 .nat
                 .as_ref()
-                .map(nat::NatDriver::confirmed_public_addrs)
+                .map(NatDriver::confirmed_public_addrs)
                 .unwrap_or_default();
             if let Some(relay_server) = self.relay_server.as_mut() {
                 // The address source comes from local bound listeners; on
@@ -2924,7 +2929,7 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
             .map(|relay| (relay.peer_id().clone(), relay.transport().clone()))
             .collect();
         let agent = minip2p_nat::NatAgent::new(swarm.local_peer_id().clone(), config);
-        nat::NatDriver::new(agent, relay_addrs)
+        NatDriver::new(agent, relay_addrs, minip2p_platform::StdEntropy)
     });
     #[cfg(feature = "relay-server")]
     let relay_server = parts
@@ -3115,7 +3120,7 @@ fn concrete_relay_listener_addrs(addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
 fn admit_connect(
     connect: &mut ConnectEngine,
     swarm: &mut EndpointSwarm,
-    #[cfg(feature = "nat")] nat: Option<&mut nat::NatDriver>,
+    #[cfg(feature = "nat")] nat: Option<&mut NatDriver>,
     #[cfg(any(feature = "discovery", feature = "mdns"))] book: Option<
         &minip2p_discovery::PeerDiscoveryAgent,
     >,
@@ -3189,7 +3194,7 @@ fn admit_connect(
     if let Some(nat) = nat
         && connect.is_pending(id)
     {
-        let now = nat.now();
+        let now = swarm.now();
         nat.agent.connect(
             id,
             peer,
@@ -3197,9 +3202,9 @@ fn admit_connect(
                 direct_racing,
                 allow_relay,
             },
-            now,
+            crate::nat::to_nat_now(now),
         );
-        nat.pump(swarm);
+        nat.pump(swarm.runtime_mut(), now);
     }
 
     #[cfg(not(feature = "nat"))]
