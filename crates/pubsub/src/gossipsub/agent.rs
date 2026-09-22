@@ -808,6 +808,14 @@ impl GossipsubAgent {
         self.events.pop_front()
     }
 
+    /// Queues `event` for [`Self::poll_event`].
+    ///
+    /// Embedded shutdown tests use this to leave an event in the agent.
+    #[doc(hidden)]
+    pub fn enqueue_event(&mut self, event: GossipsubEvent) {
+        self.events.push_back(event);
+    }
+
     /// Milliseconds until the next due timer.
     pub fn next_timeout(&self, now_ms: u64) -> Option<u64> {
         let mut due = self.next_heartbeat_ms;

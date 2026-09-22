@@ -1484,13 +1484,30 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         deadline
     }
 
+    /// Queues a Gossipsub event as if the agent produced it and the driver has
+    /// not collected it yet.
+    ///
+    /// Shutdown tests use this. A terminal `shutdown` must still return it.
+    #[doc(hidden)]
+    #[cfg(feature = "pubsub")]
+    pub fn leave_uncollected_gossipsub_event(&mut self, event: GossipsubEvent) {
+        if let Some(agent) = self.gossipsub.as_mut() {
+            agent.enqueue_event(event);
+        }
+    }
+
     /// Sends an mDNS goodbye when enabled, closes peers, and consumes the endpoint.
     ///
     /// Returns the final Endpoint events, including capability events that
-    /// were still queued.
+    /// were still queued and Gossipsub events still held by the agent.
+    /// Connection-close events come first; queued capability events follow.
     pub fn shutdown(mut self, now: Now) -> Result<Vec<EndpointEvent>, SmoltcpDriveError> {
         if let Some(mdns) = self.mdns.as_mut() {
             mdns.shutdown(now.monotonic_ms)?;
+        }
+        #[cfg(feature = "pubsub")]
+        if let Some(agent) = self.gossipsub.as_mut() {
+            collect_embedded_pubsub_events(agent, &mut self.pending_gossipsub_events);
         }
         #[cfg(feature = "pubsub")]
         let gossipsub = core::mem::take(&mut self.pending_gossipsub_events);

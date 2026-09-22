@@ -739,3 +739,32 @@ fn signed_beacons_populate_discovery_without_mdns() {
     }
     panic!("signed discovery did not converge\n  a: {a_events:?}\n  b: {b_events:?}");
 }
+
+#[test]
+#[cfg(feature = "pubsub")]
+fn shutdown_returns_gossipsub_events_still_in_the_agent() {
+    let wire = Wire::default();
+    let endpoint_identity = identity(70);
+    let peer = identity(71).peer_id();
+    let mut endpoint = Endpoint::portable(&endpoint_identity, CountingEntropy(70))
+        .smoltcp(stack(wire.dialer_device(), &format!("{DIALER_IP}/24")))
+        .gossipsub()
+        .build()
+        .expect("embedded endpoint builds");
+    endpoint.leave_uncollected_gossipsub_event(GossipsubEvent::PeerSubscribed {
+        peer: peer.clone(),
+        topic: "still-in-agent".into(),
+    });
+
+    let events = endpoint.shutdown(Now::from_millis(0)).expect("shutdown");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EndpointEvent::Gossipsub(GossipsubEvent::PeerSubscribed {
+                peer: returned,
+                topic,
+            }) if returned == &peer && topic == "still-in-agent"
+        )),
+        "shutdown dropped a Gossipsub event still in the agent: {events:?}"
+    );
+}

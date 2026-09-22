@@ -468,6 +468,16 @@ impl<T: Transport> Swarm<T> {
         let now = self.sample_now();
         self.runtime.poll(now)
     }
+
+    /// Queues `events` ahead of anything the next [`Self::poll`] reads from
+    /// the transport.
+    ///
+    /// Endpoint tests use this to pin step order when one poll returns
+    /// several swarm events.
+    #[doc(hidden)]
+    pub fn preload_poll_events(&mut self, events: impl IntoIterator<Item = SwarmEvent>) {
+        self.runtime.event_buffer.extend(events);
+    }
 }
 
 impl<T: BlockingTransport> Swarm<T> {

@@ -249,11 +249,12 @@ pub type EndpointSwarm = Swarm<EndpointTransport>;
 /// Prefer [`Endpoint::wait`] for the ordered Endpoint event stream: it returns
 /// an event, deadline, or interruption, and delivers every enabled
 /// capability's output (NAT, Gossipsub, Discovery, relay-server) once as an
-/// [`EndpointEvent`] variant. Within one Endpoint step, swarm events come
-/// first, then capability events in relay-server, NAT, Gossipsub, Discovery
-/// order, then Connection-attempt terminals. Focused waits, `next_wake`, and
-/// the `take_*` capability methods remain during migration; they take their
-/// events out of the same stream, so no event is delivered twice.
+/// [`EndpointEvent`] variant. `poll` and `wait` finish each swarm event
+/// before the next one: that swarm event, then capability events in
+/// relay-server, NAT, Gossipsub, Discovery order, then Connection-attempt
+/// terminals. Focused waits, `next_wake`, and the `take_*` capability
+/// methods remain during migration; they take their events out of the same
+/// stream, so no event is delivered twice.
 ///
 /// # State snapshots
 ///
@@ -685,17 +686,23 @@ impl Endpoint {
     /// Polls the endpoint once and returns all currently available events.
     ///
     /// Returned values are [`EndpointEvent`]s from the Endpoint event stream,
-    /// including enabled capability output. Streams owned by an agent (NAT,
-    /// relay service, Gossipsub) are consumed here and never surface as
+    /// including enabled capability output. Each swarm event is finished
+    /// before the next, matching [`Self::wait`]: that event, then capability
+    /// events, then Connection-attempt terminals. Streams owned by an agent
+    /// (NAT, relay service, Gossipsub) are consumed here and never surface as
     /// application stream events.
     pub fn poll(&mut self) -> Result<Vec<EndpointEvent>, Error> {
         self.tick_connect();
         let mut events: Vec<EndpointEvent> = self.pending_events.drain(..).collect();
         let polled = self.swarm.poll()?;
-        for event in polled {
-            events.extend(self.ingest(event));
+        if polled.is_empty() {
+            // A quiet poll still ticks drivers and drains anything they queued.
+            self.finish_step(&mut events)?;
+        } else {
+            for event in polled {
+                events.extend(self.step_events(event)?);
+            }
         }
-        self.finish_step(&mut events)?;
         Ok(events)
     }
 
@@ -802,12 +809,14 @@ impl Endpoint {
         }
     }
 
-    /// Returns the next ordinary application event, waiting until `deadline`.
+    /// Returns the next Endpoint event, including enabled capability variants,
+    /// waiting until `deadline`.
     ///
     /// Prefer [`Self::wait`] for new code: it surfaces interruption and matches
     /// the Endpoint wait outcomes. Both deliver enabled capability output as
     /// [`EndpointEvent`] variants. Focused waits such as `nat_wait_path` and
-    /// [`Self::wait_peer_ready`] remain during migration. All of these methods
+    /// [`Self::wait_peer_ready`] remain during migration, as does
+    /// [`Self::next_wake`] until #181. All of these methods
     /// use transport readiness when supported. Each call drives only this
     /// endpoint, so blocking here can delay other endpoints that share the
     /// same thread.
@@ -4404,6 +4413,59 @@ mod tests {
         assert!(endpoint.take_nat_events().is_empty());
         assert!(endpoint.take_gossipsub_events().is_empty());
         assert!(endpoint.take_relay_server_events().is_empty());
+    }
+
+    /// One transport poll can return several swarm events. `poll` must finish
+    /// each one before the next, the same way `wait` does. Batching the whole
+    /// poll and calling `finish_step` once puts `ConnectSettled` after the
+    /// later swarm event.
+    #[test]
+    fn poll_finishes_each_swarm_event_before_the_next() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mut endpoint = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind endpoint");
+        let peer = Ed25519Keypair::generate().peer_id();
+        let unreachable = PeerAddr::quic_v1(IpAddr::V4(Ipv4Addr::LOCALHOST), 9, peer.clone());
+        let connect_id = endpoint.connect(&unreachable).expect("start connect");
+        endpoint.swarm_mut().preload_poll_events([
+            SwarmEvent::ConnectionEstablished {
+                peer_id: peer.clone(),
+                conn_id: ConnectionId::new(1),
+            },
+            SwarmEvent::PingTimeout {
+                peer_id: peer.clone(),
+            },
+        ]);
+
+        let events = endpoint.poll().expect("poll");
+        let established = events.iter().position(|event| {
+            matches!(
+                event,
+                EndpointEvent::ConnectionEstablished { peer_id, .. } if peer_id == &peer
+            )
+        });
+        let settled = events.iter().position(|event| {
+            matches!(
+                event,
+                EndpointEvent::ConnectSettled { connect_id: id, .. } if *id == connect_id
+            )
+        });
+        let ping = events.iter().position(
+            |event| matches!(event, EndpointEvent::PingTimeout { peer_id } if peer_id == &peer),
+        );
+        match (established, settled, ping) {
+            (Some(established_at), Some(settled_at), Some(ping_at)) => {
+                assert!(
+                    established_at < settled_at && settled_at < ping_at,
+                    "ConnectSettled must follow its ConnectionEstablished and precede the next swarm event: {events:?}"
+                );
+            }
+            _ => panic!(
+                "expected ConnectionEstablished, ConnectSettled, then PingTimeout; got {events:?}"
+            ),
+        }
     }
 
     #[cfg(feature = "nat")]

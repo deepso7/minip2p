@@ -25,7 +25,8 @@ Definitions only. For recipes, follow the linked guides.
 | **`wait`** | Blocking Endpoint wait returning an event (including capability events), deadline, or interruption (ADR 0007). |
 | **`EndpointEvent`** | Ordered, non-exhaustive event from the Endpoint's single public stream; enabled capabilities add `Nat`, `Gossipsub`, `Discovery`, and `RelayServer` variants. |
 | **State snapshot** | Getter over durable connection, peer, or transport-bound address state; not one atomic mega-snapshot and may be ahead of the event stream, never behind its own emitted transition. `bound_addresses` is bound sockets, not “accepting connections”. |
-| **`next_event`** | Synchronous drive until one ordinary application event or a deadline (swallows interruption; migration). |
+| **`next_event`** | Synchronous drive until one Endpoint event (capability variants included) or a deadline. Swallows interruption. Remains until #181. |
+| **`next_wake`** | Migration wrapper over `wait` until #181. One Endpoint event (capability variants included), a deadline, or an interruption. Does not return driver-progress. |
 | **Focused wait** | Migration-era drive until a specific result (`wait_peer_ready`, `nat_wait_path`, `next_gossipsub_event`, …) while buffering unrelated events. |
 | **Available vs enabled** | A Cargo feature makes a capability available; a builder method enables it on an endpoint. See [Install](/rust/install#add-an-optional-capability). |
 | **Circuit address** | `/…/p2p/<relay>/p2p-circuit/p2p/<target>` reaches a peer through a Circuit Relay v2 reservation. |

@@ -17,15 +17,16 @@ use super::connect::{ConnectId, ConnectOutcome};
 /// at the Endpoint boundary. [`crate::Event`] is a migration alias for the
 /// same type.
 ///
-/// Each event is emitted once, in Endpoint emission order: the order is
-/// fixed when the Endpoint queues the event and every consumer preserves
-/// it. A Connection attempt's [`Self::ConnectSettled`] follows the
-/// `ConnectionEstablished` it reports. No order is promised between
-/// concurrently racing Transport candidates. The std `Endpoint` further
-/// orders each step as swarm events, then capability events (relay-server,
-/// NAT, Gossipsub, Discovery), then Connection-attempt terminals; the
-/// embedded endpoints adopt that step order when they share its capability
-/// drivers.
+/// Each event is emitted once. The order is fixed when the Endpoint queues
+/// the event, and every consumer preserves it. A Connection attempt's
+/// [`Self::ConnectSettled`] follows the `ConnectionEstablished` it reports.
+/// No order is promised between concurrently racing Transport candidates.
+///
+/// On the std endpoint, `poll` and `wait` finish each swarm event before
+/// the next one: that swarm event, then capability events (relay-server,
+/// NAT, Gossipsub, Discovery), then Connection-attempt terminals. Embedded
+/// endpoints emit the same variants from their smoltcp loop and do not use
+/// that step order.
 ///
 /// Payloads move by value across the Endpoint boundary; callers own each
 /// delivered event. Swarm variants keep the same names and fields as

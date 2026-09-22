@@ -14,8 +14,9 @@ Use `Endpoint::wait` for the ADR 0007 Endpoint wait outcomes (event, deadline, o
 | `wait(deadline)` | Drive until one Endpoint event (including capability events), deadline, or interruption. | Every application event loop; correlating an operation while dispatching others |
 | `nat_wait_path` / `wait_peer_ready` / `wait_ping_rtt` | Drive until one milestone, buffering unrelated events. | Connection and setup milestones (migration) |
 | `next_nat_event` / `next_gossipsub_event` / `next_discovery_event` / `next_relay_server_event` | Drive until the next matching capability event; other events stay queued. | Feature-specific workflows (migration) |
-| `next_event(deadline)` | Like `wait`, returns one `EndpointEvent` (capability variants included) or `None` at the deadline, but swallows interruption. `Event` is its migration alias for `EndpointEvent`. | Legacy synchronous loops |
-| `poll()` | One non-blocking drive; returns currently available Endpoint events. | Existing game, UI, or reactor loops |
+| `next_event(deadline)` | Like `wait`, returns one `EndpointEvent` (capability variants included) or `None` at the deadline, but swallows interruption. `Event` is its migration alias for `EndpointEvent`. Remains until #181. | Legacy synchronous loops |
+| `next_wake(deadline)` | Migration wrapper over `wait` until #181. Same event (capability variants included), deadline, or interruption. Does not return driver-progress. | Callers not yet on `wait` |
+| `poll()` | One non-blocking drive; returns currently available Endpoint events, finishing each swarm event the same way `wait` does. | Existing game, UI, or reactor loops |
 
 ## Deadline forms
 
@@ -158,7 +159,7 @@ loop {
 }
 ```
 
-Capability variants exist only when their feature is enabled: `Nat` (`nat`), `Gossipsub` (`pubsub`), `Discovery` (`discovery` / `mdns`), and `RelayServer` (`relay-server`). Within one Endpoint step, swarm events come first, then capability events in relay-server, NAT, Gossipsub, Discovery order, then Connection-attempt terminals (`ConnectSettled`). No order is promised between concurrently racing Transport candidates. NAT attempt terminals (`ConnectFailed`, `FellBackToRelay`) never appear; `ConnectSettled` carries the outcome. A `PathUpgraded` can still follow its attempt's `ConnectSettled` when the attempt settled on a provisional Relayed path.
+Capability variants exist only when their feature is enabled: `Nat` (`nat`), `Gossipsub` (`pubsub`), `Discovery` (`discovery` / `mdns`), and `RelayServer` (`relay-server`). `poll` and `wait` finish each swarm event before the next: that swarm event, then capability events in relay-server, NAT, Gossipsub, Discovery order, then Connection-attempt terminals (`ConnectSettled`). No order is promised between concurrently racing Transport candidates. NAT attempt terminals (`ConnectFailed`, `FellBackToRelay`) never appear; `ConnectSettled` carries the outcome. A `PathUpgraded` can still follow its attempt's `ConnectSettled` when the attempt settled on a provisional Relayed path. Embedded endpoints emit the same variants and do not use this step order.
 
 State snapshot getters such as `path`, `reachability`, `active_reservation`, and `known_peers` stay authoritative for durable state. They may be ahead of the event stream, never behind their own emitted transition.
 

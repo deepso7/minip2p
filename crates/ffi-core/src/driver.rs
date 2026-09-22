@@ -15,6 +15,9 @@ use crate::{DriverFailureKind, EventDoorbell, P2pEvent};
 const DRIVER_POLL: Duration = Duration::from_millis(25);
 const DRIVER_IDLE_POLL: Duration = Duration::from_millis(500);
 const MAX_CARRY_EVENTS: usize = 4096;
+/// How many already-queued `wait` results one pump iteration will take
+/// before yielding the lock. Further events stay queued for the next wait.
+const PUMP_DRAIN_LIMIT: usize = 256;
 
 /// Rust-side instrumentation for the background driver.
 #[derive(Clone, Copy, Debug, Default)]
@@ -204,27 +207,37 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             ..
         } = &mut *state;
         let endpoint = endpoint.as_mut().expect("running endpoint exists");
-        let outcome = endpoint.wait(deadline)?;
-        if matches!(outcome, EndpointWaitOutcome::Interrupted) {
+        // Only `Endpoint::wait`, so the carry stays in Endpoint emission
+        // order. A follow-up `poll()` would open a second batch and finish
+        // that batch on its own.
+        let mut batch = Vec::new();
+        let mut interrupted = false;
+        match endpoint.wait(deadline)? {
+            EndpointWaitOutcome::Interrupted => interrupted = true,
+            EndpointWaitOutcome::Event(event) => batch.push(event),
+            EndpointWaitOutcome::Deadline => {}
+        }
+        if !interrupted {
+            for _ in 0..PUMP_DRAIN_LIMIT {
+                match endpoint.wait(Duration::ZERO)? {
+                    EndpointWaitOutcome::Event(event) => batch.push(event),
+                    EndpointWaitOutcome::Deadline => break,
+                    EndpointWaitOutcome::Interrupted => {
+                        interrupted = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if interrupted && batch.is_empty() {
             drop(state);
             while guard.shared.pending_commands.load(Ordering::Acquire) != 0 {
                 std::thread::sleep(Duration::from_millis(1));
             }
             continue;
         }
-
-        // Every capability's output arrives through the Endpoint event
-        // stream, so the carry receives events in Endpoint emission order.
-        if let EndpointWaitOutcome::Event(event) = outcome {
-            ingest(
-                convert_filtered_endpoint_event(endpoint, event, cancelled_connect_ids),
-                carry,
-                overflow,
-                stats,
-            );
-        }
         ingest(
-            endpoint.poll()?.into_iter().filter_map(|event| {
+            batch.into_iter().filter_map(|event| {
                 convert_filtered_endpoint_event(endpoint, event, cancelled_connect_ids)
             }),
             carry,
@@ -242,6 +255,11 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         drop(state);
         if should_ring {
             ring(guard.doorbell.as_ref().expect("doorbell exists"));
+        }
+        if interrupted {
+            while guard.shared.pending_commands.load(Ordering::Acquire) != 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 }
