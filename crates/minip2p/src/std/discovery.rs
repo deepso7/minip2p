@@ -66,6 +66,13 @@ impl DiscoveryDriver {
         self.epoch.elapsed().as_millis() as u64
     }
 
+    /// Whether `event` belongs to a discovery-owned attempt that the sweep
+    /// must hide before the Endpoint drains NAT output.
+    #[cfg(debug_assertions)]
+    pub(crate) fn owns_nat_event(&self, event: &NatEvent) -> bool {
+        nat_connect_id(event).is_some_and(|id| self.inflight.contains_key(&id))
+    }
+
     #[cfg(feature = "discovery")]
     pub(crate) fn topic(&self) -> Option<&str> {
         self.beacon.as_ref().map(BeaconAgent::topic)

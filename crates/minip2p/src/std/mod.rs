@@ -330,14 +330,14 @@ pub enum EndpointWake {
 }
 
 /// Why one driver-aware swarm-driving step returned.
+///
+/// [`DriverPoll::Progress`] means the step appended every event it produced
+/// onto `pending_events`, in Endpoint emission order. Callers scan that
+/// queue; the step is not split into a returned head and a stashed tail.
 #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Application events stay owned so waits avoid a heap allocation."
-)]
 enum DriverPoll {
-    /// A new Endpoint event is ready for the application.
-    Application(Event),
+    /// A step appended one or more events to `pending_events`.
+    Progress,
     /// The transport wait was interrupted externally.
     Interrupted,
     /// The caller's deadline elapsed.
@@ -346,8 +346,8 @@ enum DriverPoll {
 
 #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
 impl DriverPoll {
-    fn application(event: Event) -> Self {
-        Self::Application(event)
+    fn progress() -> Self {
+        Self::Progress
     }
 
     fn deadline() -> Self {
@@ -759,20 +759,22 @@ impl Endpoint {
             return Ok(EndpointWaitOutcome::Deadline);
         }
         self.tick_connect();
-        self.flush_step_events();
         if let Some(event) = self.pending_events.pop_front() {
             return Ok(EndpointWaitOutcome::Event(event));
         }
         #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
         if self.has_drivers() {
             let mut expired_poll_used = false;
-            return Ok(
-                match self.poll_new_event_driven(deadline, &mut expired_poll_used)? {
-                    DriverPoll::Application(event) => EndpointWaitOutcome::Event(event),
-                    DriverPoll::Interrupted => EndpointWaitOutcome::Interrupted,
-                    DriverPoll::Deadline => EndpointWaitOutcome::Deadline,
-                },
-            );
+            return match self.poll_new_event_driven(deadline, &mut expired_poll_used)? {
+                DriverPoll::Progress => {
+                    let event = self.pending_events.pop_front().ok_or(Error::Invariant {
+                        reason: "a driver step reported events but the queue was empty",
+                    })?;
+                    Ok(EndpointWaitOutcome::Event(event))
+                }
+                DriverPoll::Interrupted => Ok(EndpointWaitOutcome::Interrupted),
+                DriverPoll::Deadline => Ok(EndpointWaitOutcome::Deadline),
+            };
         }
         loop {
             // A shortened step deadline is the engine's timer, not the
@@ -884,16 +886,6 @@ impl Endpoint {
         self.pending_events.extend(out);
     }
 
-    /// Returns the first of `produced` and queues the rest behind any
-    /// already-pending events.
-    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-    fn first_new_event(&mut self, produced: Vec<EndpointEvent>) -> Option<EndpointEvent> {
-        let mut produced = produced.into_iter();
-        let first = produced.next()?;
-        self.pending_events.extend(produced);
-        Some(first)
-    }
-
     /// Runs one Endpoint step for a swarm event and returns everything it
     /// produced, in Endpoint emission order.
     fn step_events(&mut self, event: SwarmEvent) -> Result<Vec<EndpointEvent>, Error> {
@@ -922,12 +914,30 @@ impl Endpoint {
     /// Moves every queued capability event into `out` exactly once, in
     /// relay-server, NAT, Gossipsub, Discovery order.
     ///
-    /// Callers run this after the discovery sweep, which removes beacon-topic
-    /// Gossipsub traffic and discovery-owned NAT events. NAT output reaches
-    /// the Connection-attempt engine first; the attempt terminals it turns
-    /// into `ConnectSettled` are not repeated as NAT events.
+    /// The discovery sweep removes beacon-topic Gossipsub traffic and
+    /// discovery-owned NAT events before this drain. [`Self::finish_step`]
+    /// runs that sweep and then calls this. [`Self::flush_step_events`] also
+    /// calls this from `connect`, `cancel_connect`, `tick_connect`, and
+    /// [`Self::wait`] without sweeping again; that stays correct only while
+    /// every path that fills a driver queue ends in `finish_step` first.
+    /// NAT output reaches the Connection-attempt engine before the drain;
+    /// the attempt terminals it turns into `ConnectSettled` are not repeated
+    /// as NAT events.
     #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     fn collect_capability_events(&mut self, out: &mut Vec<EndpointEvent>) {
+        #[cfg(all(
+            debug_assertions,
+            feature = "nat",
+            any(feature = "discovery", feature = "mdns")
+        ))]
+        if let (Some(discovery), Some(nat)) = (self.discovery.as_ref(), self.nat.as_ref()) {
+            debug_assert!(
+                nat.events
+                    .iter()
+                    .all(|event| !discovery.owns_nat_event(event)),
+                "discovery-owned NAT events must be swept before the capability drain"
+            );
+        }
         #[cfg(feature = "relay-server")]
         if let Some(relay_server) = self.relay_server.as_mut() {
             out.extend(
@@ -1179,10 +1189,14 @@ impl Endpoint {
         step
     }
 
-    /// Drives the swarm and the active agents until a newly-arrived
-    /// application event is available. Focused waits must leave application
-    /// events aside instead of repeatedly picking up the same one, so this
-    /// never drains `pending_events`.
+    /// Drives the swarm and the active agents until a step appends events to
+    /// `pending_events`, or the wait ends.
+    ///
+    /// Appends every event from the step, in Endpoint emission order, behind
+    /// anything already queued. It does not remove or reorder queued events.
+    /// Focused waits scan the queue themselves and pull the match out in
+    /// place, so an earlier event in the same step stays in front of a
+    /// terminal.
     #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     fn poll_new_event_driven(
         &mut self,
@@ -1201,13 +1215,11 @@ impl Endpoint {
                 *expired_poll_used = true;
             }
             let step = self.connect_step_deadline(self.driver_step_deadline(deadline));
-            let now_ms = self.swarm.now().monotonic_ms;
-            self.connect.tick(self.swarm.runtime_mut(), now_ms);
             // Output queued outside a step (API calls, cancellation) first.
-            let mut produced = Vec::new();
-            self.drain_step_events(&mut produced);
-            if let Some(event) = self.first_new_event(produced) {
-                return Ok(DriverPoll::application(event));
+            let queued = self.pending_events.len();
+            self.tick_connect();
+            if self.pending_events.len() > queued {
+                return Ok(DriverPoll::progress());
             }
             let polled = self.swarm.poll_next_interruptible(step)?;
             if deadline.has_passed() {
@@ -1216,15 +1228,17 @@ impl Endpoint {
             match polled {
                 PollNext::Event(event) => {
                     let produced = self.step_events(event)?;
-                    if let Some(event) = self.first_new_event(produced) {
-                        return Ok(DriverPoll::application(event));
+                    if !produced.is_empty() {
+                        self.pending_events.extend(produced);
+                        return Ok(DriverPoll::progress());
                     }
                 }
                 PollNext::Deadline => {
                     let mut produced = Vec::new();
                     self.finish_step(&mut produced)?;
-                    if let Some(event) = self.first_new_event(produced) {
-                        return Ok(DriverPoll::application(event));
+                    if !produced.is_empty() {
+                        self.pending_events.extend(produced);
+                        return Ok(DriverPoll::progress());
                     }
                     // Distinguish the caller's deadline from a mere agent
                     // timer that shortened this wait step.
@@ -1332,8 +1346,7 @@ impl Endpoint {
             }
             self.ensure_pending_event_capacity()?;
             match self.poll_new_event_driven(deadline, &mut expired_poll_used)? {
-                DriverPoll::Application(event) => self.pending_events.push_back(event),
-                DriverPoll::Interrupted => {}
+                DriverPoll::Progress | DriverPoll::Interrupted => {}
                 DriverPoll::Deadline => return Ok(None),
             }
         }
@@ -1559,6 +1572,11 @@ impl Endpoint {
     /// Driver-aware equivalent of `Swarm::run_until`. Every swarm event
     /// goes through the active drivers, and non-matching application events
     /// are retained for [`Endpoint::next_event`].
+    ///
+    /// Each iteration appends a whole step onto `pending_events` and scans
+    /// from the front, same as the non-driver [`Self::wait_for_event`]. A
+    /// match later in the step is removed in place, so the events before it
+    /// stay in front.
     #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     fn wait_for_event_driven<F>(
         &mut self,
@@ -1568,22 +1586,15 @@ impl Endpoint {
     where
         F: FnMut(&Event) -> bool,
     {
-        self.flush_step_events();
-        if let Some(index) = self.pending_events.iter().position(&mut predicate) {
-            return Ok(self.pending_events.remove(index));
-        }
         let mut expired_poll_used = false;
         loop {
+            self.flush_step_events();
+            if let Some(index) = self.pending_events.iter().position(&mut predicate) {
+                return Ok(self.pending_events.remove(index));
+            }
             self.ensure_pending_event_capacity()?;
-            let poll = self.poll_new_event_driven(deadline, &mut expired_poll_used)?;
-            match poll {
-                DriverPoll::Application(event) => {
-                    if predicate(&event) {
-                        return Ok(Some(event));
-                    }
-                    self.pending_events.push_back(event);
-                }
-                DriverPoll::Interrupted => {}
+            match self.poll_new_event_driven(deadline, &mut expired_poll_used)? {
+                DriverPoll::Progress | DriverPoll::Interrupted => {}
                 DriverPoll::Deadline => return Ok(None),
             }
         }
@@ -4447,6 +4458,68 @@ mod tests {
             EndpointWake::Event(Event::ConnectionEstablished { peer_id, .. })
                 if peer_id == *remote_addr.peer_id()
         ));
+    }
+
+    /// A step's first event is often `ConnectionEstablished`, with the NAT
+    /// path and `ConnectSettled` behind it. A focused wait must return the
+    /// NAT event and leave the terminal behind `ConnectionEstablished`.
+    #[cfg(feature = "nat")]
+    #[test]
+    fn next_nat_event_returns_same_step_path_without_reordering_connect() {
+        let mut endpoint = Endpoint::builder()
+            .nat_config(NatConfig::default())
+            .bind_quic("127.0.0.1:0")
+            .expect("bind NAT endpoint");
+        let mut remote = Endpoint::builder()
+            .bind_quic("127.0.0.1:0")
+            .expect("bind remote endpoint");
+        endpoint.listen().expect("NAT endpoint listens");
+        let remote_addr = remote.listen().expect("remote listens");
+        let _remote = Driven::new(remote);
+
+        let connect_id = endpoint.connect(&remote_addr).expect("connect");
+        let event = endpoint
+            .next_nat_event(Duration::from_secs(5))
+            .expect("focused NAT wait");
+        match event {
+            Some(NatEvent::PathEstablished {
+                connect_id: id,
+                path: Path::DirectDialed,
+                ..
+            }) => assert_eq!(id, connect_id),
+            other => panic!(
+                "expected PathEstablished, got {other:?}; pending {:?}",
+                endpoint.pending_events
+            ),
+        }
+
+        let established = endpoint.pending_events.iter().position(|event| {
+            matches!(
+                event,
+                Event::ConnectionEstablished { peer_id, .. } if peer_id == remote_addr.peer_id()
+            )
+        });
+        let settled = endpoint.pending_events.iter().position(|event| {
+            matches!(
+                event,
+                Event::ConnectSettled {
+                    connect_id: id,
+                    outcome: ConnectOutcome::Connected { .. },
+                    ..
+                } if *id == connect_id
+            )
+        });
+        match (established, settled) {
+            (Some(established_at), Some(settled_at)) => assert!(
+                established_at < settled_at,
+                "ConnectSettled at {settled_at} is ahead of ConnectionEstablished at {established_at}: {:?}",
+                endpoint.pending_events
+            ),
+            _ => panic!(
+                "ConnectionEstablished then ConnectSettled missing after PathEstablished; pending {:?}",
+                endpoint.pending_events
+            ),
+        }
     }
 
     #[cfg(feature = "nat")]
