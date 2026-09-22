@@ -18,9 +18,12 @@ use super::connect::{ConnectId, ConnectOutcome};
 /// same type.
 ///
 /// Each event is emitted once. The order is fixed when the Endpoint queues
-/// the event, and every consumer preserves it. A Connection attempt's
-/// [`Self::ConnectSettled`] follows the `ConnectionEstablished` it reports.
-/// No order is promised between concurrently racing Transport candidates.
+/// the event. `poll` and `wait` preserve that queue order. Focused methods
+/// (`next_*_event`, `take_*_events`, and similar) may skip unrelated queued
+/// events and preserve only the relative order of the events they retain.
+/// A Connection attempt's [`Self::ConnectSettled`] follows the
+/// `ConnectionEstablished` it reports. No order is promised between
+/// concurrently racing Transport candidates.
 ///
 /// On the std endpoint, `poll` and `wait` finish each swarm event before
 /// the next one: that swarm event, then capability events (relay-server,

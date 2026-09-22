@@ -248,7 +248,6 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             connect_ids.remove(&id);
             cancelled_connect_ids.remove(&id);
         }
-        cancelled_connect_ids.clear();
         stats.carry_high_water = stats.carry_high_water.max(carry.len());
         stats.iterations = stats.iterations.saturating_add(1);
         let should_ring = was_empty && !carry.is_empty();
@@ -304,17 +303,39 @@ pub(crate) fn take_delivery(
 fn convert_filtered_endpoint_event(
     endpoint: &minip2p::Endpoint,
     event: minip2p::Event,
-    cancelled: &BTreeSet<u64>,
+    cancelled: &mut BTreeSet<u64>,
 ) -> Option<P2pEvent> {
-    let cancelled_attempt = match &event {
-        minip2p::Event::ConnectSettled { connect_id, .. } => Some(connect_id.as_u64()),
-        minip2p::Event::Nat(event) => nat_connect_id(event),
-        _ => None,
-    };
-    if cancelled_attempt.is_some_and(|id| cancelled.contains(&id)) {
+    if suppress_cancelled_endpoint_event(&event, cancelled) {
         return None;
     }
     convert_endpoint_event(endpoint, event)
+}
+
+/// Returns `true` when `event` belongs to a cancelled attempt.
+///
+/// The attempt id stays in `cancelled` until this filters that attempt's
+/// `ConnectSettled`, so a later pump batch can still drop events left
+/// queued beyond [`PUMP_DRAIN_LIMIT`]. Same-attempt NAT events precede
+/// `ConnectSettled`, so the id does not need to outlive the terminal.
+fn suppress_cancelled_endpoint_event(
+    event: &minip2p::Event,
+    cancelled: &mut BTreeSet<u64>,
+) -> bool {
+    let id = match event {
+        minip2p::Event::ConnectSettled { connect_id, .. } => connect_id.as_u64(),
+        minip2p::Event::Nat(event) => match nat_connect_id(event) {
+            Some(id) => id,
+            None => return false,
+        },
+        _ => return false,
+    };
+    if !cancelled.contains(&id) {
+        return false;
+    }
+    if matches!(event, minip2p::Event::ConnectSettled { .. }) {
+        cancelled.remove(&id);
+    }
+    true
 }
 
 fn nat_connect_id(event: &NatEvent) -> Option<u64> {
@@ -579,5 +600,39 @@ mod tests {
             path: crate::PathKind::DirectDialed,
         };
         assert_eq!(p2p_connect_id(&extracted), Some(7));
+    }
+
+    #[test]
+    fn cancelled_id_is_removed_only_when_connect_settled_is_filtered() {
+        let connect_id = minip2p::ConnectId::from_u64(7);
+        let peer_id = minip2p::Ed25519Keypair::from_secret_key_bytes([3; 32]).peer_id();
+        let mut cancelled = BTreeSet::from([7_u64]);
+
+        let nat = minip2p::Event::Nat(NatEvent::HolePunchFailed {
+            connect_id,
+            attempt: 1,
+            reason: "timeout".into(),
+        });
+        assert!(suppress_cancelled_endpoint_event(&nat, &mut cancelled));
+        assert!(
+            cancelled.contains(&7),
+            "filtering NAT must keep the id for events still queued beyond the pump drain limit"
+        );
+
+        let settled = minip2p::Event::ConnectSettled {
+            connect_id,
+            peer_id: peer_id.clone(),
+            outcome: minip2p::ConnectOutcome::Cancelled,
+        };
+        assert!(suppress_cancelled_endpoint_event(&settled, &mut cancelled));
+        assert!(
+            cancelled.is_empty(),
+            "filtering ConnectSettled retires the cancelled id"
+        );
+
+        let unrelated = minip2p::Event::PingTimeout { peer_id };
+        let mut empty = BTreeSet::new();
+        assert!(!suppress_cancelled_endpoint_event(&unrelated, &mut empty));
+        assert!(empty.is_empty());
     }
 }
