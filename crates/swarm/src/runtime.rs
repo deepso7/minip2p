@@ -285,6 +285,9 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         let mut resolved = Vec::with_capacity(addrs.len());
         for addr in addrs {
             let addr = self.transport.listen(&addr)?;
+            // A later bind may still fail, leaving this one bound — the
+            // revision must track each successful bind, not the batch.
+            self.bound_addrs_revision = self.bound_addrs_revision.wrapping_add(1);
             let peer_addr = PeerAddr::new(addr, self.local_peer_id.clone()).map_err(|e| {
                 TransportError::InvalidConfig {
                     reason: format!("failed to build local PeerAddr: {e}"),
@@ -292,7 +295,6 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
             })?;
             resolved.push(peer_addr);
         }
-        self.bound_addrs_revision = self.bound_addrs_revision.wrapping_add(1);
         Ok(resolved)
     }
 
