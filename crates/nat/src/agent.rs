@@ -464,6 +464,12 @@ impl NatAgent {
         self.shared.listen_addrs = addrs.to_vec();
     }
 
+    /// Returns the listen addresses currently advertised for dial-back and
+    /// DCUtR exchanges.
+    pub fn listen_addrs(&self) -> &[Multiaddr] {
+        &self.shared.listen_addrs
+    }
+
     /// Feeds one swarm event. Events for streams the agent does not own are
     /// ignored with a single map lookup and zero clones.
     pub fn handle_event(&mut self, event: &SwarmEvent, now: Now) {

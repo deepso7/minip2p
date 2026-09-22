@@ -135,19 +135,6 @@ pub enum EndpointEvent {
     RelayServer(minip2p_relay_server::RelayServerEvent),
 }
 
-/// Whether a NAT event reaches the Endpoint event stream.
-///
-/// `ConnectFailed` and `FellBackToRelay` are attempt terminals the
-/// Connection-attempt engine already reports as
-/// [`EndpointEvent::ConnectSettled`], so they are not repeated.
-#[cfg(any(feature = "nat", feature = "portable-autonat"))]
-pub(crate) fn nat_event_reaches_application(event: &minip2p_nat::NatEvent) -> bool {
-    !matches!(
-        event,
-        minip2p_nat::NatEvent::ConnectFailed { .. } | minip2p_nat::NatEvent::FellBackToRelay { .. }
-    )
-}
-
 impl EndpointEvent {
     /// Returns `true` if this is a stream-scoped event for the given peer and
     /// stream id.

@@ -260,6 +260,12 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         self.core.connection_id(peer_id)
     }
 
+    /// Returns whether `peer_id` has been surfaced to the application as
+    /// connected — pending dials do not count.
+    pub fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
+        self.core.is_peer_connected(peer_id)
+    }
+
     /// Start listening on the given multiaddr and return the resolved local address.
     pub fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, DriverError> {
         let bound = self.transport.listen(addr)?;

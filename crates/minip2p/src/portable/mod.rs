@@ -35,8 +35,6 @@ pub use connect::{
 pub(crate) use connect::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS, RelayPolicy};
 mod event_stream;
 pub use event_stream::EndpointEvent;
-#[cfg(any(feature = "nat", feature = "portable-autonat"))]
-pub(crate) use event_stream::nat_event_reaches_application;
 
 #[cfg(feature = "portable-mdns")]
 pub use minip2p_discovery::{
@@ -67,7 +65,7 @@ pub use minip2p_tcp::{SmoltcpConfig, SmoltcpStack, SmoltcpTcpProvider, smoltcp};
 pub use minip2p_tcp::{TcpConfig, TcpProvider, TcpTransport};
 
 #[cfg(feature = "portable-autonat")]
-use crate::nat::{NatDriver, to_nat_now};
+use crate::nat::NatDriver;
 
 /// Portable endpoint entry point when the std `Endpoint` is not compiled.
 ///
@@ -909,7 +907,9 @@ impl<D: smoltcp::phy::Device, E: EntropySource> core::ops::DerefMut for SmoltcpE
 
 #[cfg(feature = "smoltcp")]
 impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
-    /// Pushes NAT-advertised address changes into Identify. No-op when
+    /// Pushes NAT-advertised address changes into Identify. Called once per
+    /// poll: the external address set only propagates when Identify runs,
+    /// so changes queued between polls flush on the next one. No-op when
     /// portable AutoNAT is not configured.
     fn flush_nat_addresses(&mut self) {
         #[cfg(feature = "portable-autonat")]
@@ -981,18 +981,17 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         if let Some(nat) = self.nat.as_mut()
             && self.endpoint.is_connect_pending(id)
         {
-            nat.agent.connect(
+            nat.connect(
                 id,
                 peer,
                 minip2p_nat::ConnectLegs {
                     direct_racing,
                     allow_relay: true,
                 },
-                to_nat_now(now),
+                self.endpoint.runtime_mut(),
+                now,
             );
-            nat.pump(self.endpoint.runtime_mut(), now);
         }
-        self.flush_nat_addresses();
         #[cfg(not(feature = "portable-autonat"))]
         let _ = (direct_racing, peer);
 
@@ -1013,7 +1012,6 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             nat.cancel(id, now);
             nat.pump(self.endpoint.runtime_mut(), now);
         }
-        self.flush_nat_addresses();
         self.feed_nat_to_connect(now);
     }
 
@@ -1028,7 +1026,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     pub fn active_reservation(&self) -> Option<minip2p_nat::ReservationInfo> {
         self.nat
             .as_ref()
-            .and_then(|nat| nat.agent.active_reservation().cloned())
+            .and_then(|nat| nat.active_reservation().cloned())
     }
 
     /// Returns the current portable AutoNAT reachability verdict.
@@ -1036,7 +1034,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     pub fn reachability(&self) -> minip2p_nat::ReachabilityState {
         self.nat
             .as_ref()
-            .map(|nat| nat.agent.reachability())
+            .map(|nat| nat.reachability())
             .unwrap_or_default()
     }
 
@@ -1142,7 +1140,6 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             nat.cancel(*connect_id, now);
             nat.pump(self.endpoint.runtime_mut(), now);
         }
-        self.flush_nat_addresses();
     }
 
     /// Advances TCP and every configured embedded service once.
@@ -1251,7 +1248,6 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
                     .nat
                     .as_mut()
                     .is_some_and(|nat| nat.ingest(&event, self.endpoint.runtime_mut(), now));
-            self.flush_nat_addresses();
             #[cfg(not(feature = "portable-autonat"))]
             let claimed = engine_consumed;
             #[cfg(feature = "pubsub")]

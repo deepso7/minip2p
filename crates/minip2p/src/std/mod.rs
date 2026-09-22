@@ -928,8 +928,7 @@ impl Endpoint {
         ))]
         if let (Some(discovery), Some(nat)) = (self.discovery.as_ref(), self.nat.as_ref()) {
             debug_assert!(
-                nat.events
-                    .iter()
+                nat.queued_events()
                     .all(|event| !discovery.owns_nat_event(event)),
                 "discovery-owned NAT events must be swept before the capability drain"
             );
@@ -1615,7 +1614,7 @@ impl Endpoint {
     pub fn reachability(&self) -> ReachabilityState {
         self.nat
             .as_ref()
-            .map(|nat| nat.agent.reachability())
+            .map(|nat| nat.reachability())
             .unwrap_or_default()
     }
 
@@ -1624,7 +1623,7 @@ impl Endpoint {
     pub fn active_reservation(&self) -> Option<ReservationInfo> {
         self.nat
             .as_ref()
-            .and_then(|nat| nat.agent.active_reservation().cloned())
+            .and_then(|nat| nat.active_reservation().cloned())
     }
 
     /// Subscribes to a pubsub topic. Returns `Ok(false)` when already
@@ -3180,16 +3179,16 @@ fn admit_connect(
         && connect.is_pending(id)
     {
         let now = swarm.now();
-        nat.agent.connect(
+        nat.connect(
             id,
             peer,
             minip2p_nat::ConnectLegs {
                 direct_racing,
                 allow_relay,
             },
-            crate::nat::to_nat_now(now),
+            swarm.runtime_mut(),
+            now,
         );
-        nat.pump(swarm.runtime_mut(), now);
     }
 
     #[cfg(not(feature = "nat"))]
@@ -4220,8 +4219,7 @@ mod tests {
             .nat
             .as_mut()
             .expect("NAT configured")
-            .events
-            .push_back(NatEvent::ReachabilityChanged {
+            .push_event(NatEvent::ReachabilityChanged {
                 old: ReachabilityState::Unknown,
                 new: ReachabilityState::Private,
                 confirmed_addrs: Vec::new(),
@@ -4292,8 +4290,7 @@ mod tests {
             .nat
             .as_mut()
             .expect("NAT configured")
-            .events
-            .push_back(NatEvent::ReachabilityChanged {
+            .push_event(NatEvent::ReachabilityChanged {
                 old: ReachabilityState::Unknown,
                 new: ReachabilityState::Private,
                 confirmed_addrs: Vec::new(),
@@ -4358,11 +4355,11 @@ mod tests {
                 topic: "test".into(),
             });
         let nat = endpoint.nat.as_mut().unwrap();
-        nat.events.push_back(NatEvent::FellBackToRelay {
+        nat.push_event(NatEvent::FellBackToRelay {
             connect_id: ConnectId::from_u64(99),
             peer: peer.clone(),
         });
-        nat.events.push_back(NatEvent::ReachabilityChanged {
+        nat.push_event(NatEvent::ReachabilityChanged {
             old: ReachabilityState::Unknown,
             new: ReachabilityState::Private,
             confirmed_addrs: Vec::new(),

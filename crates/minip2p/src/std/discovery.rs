@@ -184,12 +184,11 @@ impl DiscoveryDriver {
             // would otherwise discard it before the engine sees it.
             let now_ms = swarm.now().monotonic_ms;
             let mut i = 0;
-            while let Some(event) = nat.events.get(i) {
+            while let Some(event) = nat.event_at(i) {
                 let connect_id = nat_connect_id(event);
                 if connect_id.is_some_and(|id| self.inflight.contains_key(&id)) {
                     progressed = true;
-                    let event = nat.events.remove(i).expect("inflight NAT event");
-                    nat.note_removed(i);
+                    let event = nat.remove_event(i);
                     connect.observe_nat(&event, swarm.runtime_mut(), now_ms);
                 } else {
                     i += 1;

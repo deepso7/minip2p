@@ -11,10 +11,12 @@ use minip2p_platform::{EntropySource, Now as PlatformNow};
 
 #[cfg(any(feature = "nat", feature = "portable-relay"))]
 use minip2p_circuit::{AdoptError, BridgeAdoption, CircuitRole, CircuitTransport};
-use minip2p_core::{Multiaddr, PeerId, Protocol, select_direct_addrs};
+use minip2p_core::{ConnectId, Multiaddr, PeerId, Protocol, select_direct_addrs};
 #[cfg(any(feature = "nat", feature = "portable-relay"))]
 use minip2p_nat::BridgeRole;
-use minip2p_nat::{NatAction, NatAgent, NatEvent, Now, Path, PromoteError};
+use minip2p_nat::{
+    ConnectLegs, NatAction, NatAgent, NatEvent, Now, Path, PromoteError, ReachabilityState,
+};
 use minip2p_swarm::{SwarmEvent, SwarmRuntime};
 use minip2p_transport::{ConnectionId, StreamId, Transport};
 
@@ -26,12 +28,22 @@ pub(crate) fn to_nat_now(now: PlatformNow) -> Now {
     }
 }
 
+/// `ConnectFailed` and `FellBackToRelay` are attempt terminals the
+/// Connection-attempt engine already reports as `ConnectSettled`, so they
+/// are not repeated to the application.
+fn nat_event_reaches_application(event: &NatEvent) -> bool {
+    !matches!(
+        event,
+        NatEvent::ConnectFailed { .. } | NatEvent::FellBackToRelay { .. }
+    )
+}
+
 /// Drives a [`NatAgent`] against the endpoint's swarm.
 pub(crate) struct NatDriver<E> {
-    pub(crate) agent: NatAgent,
+    agent: NatAgent,
     /// NAT events awaiting the Endpoint event stream; the endpoint moves
     /// them out once the Connection-attempt engine has observed them.
-    pub(crate) events: VecDeque<NatEvent>,
+    events: VecDeque<NatEvent>,
     entropy: E,
     addresses_changed: bool,
     /// Relays we hold a reservation on, for circuit-address advertising.
@@ -54,6 +66,9 @@ pub(crate) struct NatDriver<E> {
 }
 
 impl<E: EntropySource> NatDriver<E> {
+    /// Creates a driver over `agent`. `relay_addrs` are the transport
+    /// addresses of configured relays, retained so reservations can be
+    /// advertised as circuit addresses.
     pub(crate) fn new(agent: NatAgent, relay_addrs: Vec<(PeerId, Multiaddr)>, entropy: E) -> Self {
         Self {
             agent,
@@ -66,16 +81,39 @@ impl<E: EntropySource> NatDriver<E> {
             promoted: BTreeMap::new(),
             paths: BTreeMap::new(),
             observed: 0,
-            listen_addrs_revision: u64::MAX,
+            // Matches a fresh runtime: seed only after a real `listen*`
+            // call bumped the revision. Some transports report bound-but-
+            // not-listening sockets from `local_addresses`, so syncing on
+            // an untouched revision would advertise a dial-back address
+            // that drops packets.
+            listen_addrs_revision: 0,
             #[cfg(all(test, feature = "nat", feature = "quic"))]
             bridge_reset_attempts: Vec::new(),
         }
     }
 
-    pub(crate) fn cancel(&mut self, id: minip2p_core::ConnectId, now: PlatformNow) {
+    /// Cancels a pending connect's NAT leg; settled or unknown ids are a
+    /// no-op.
+    pub(crate) fn cancel(&mut self, id: ConnectId, now: PlatformNow) {
         self.agent.cancel(id, to_nat_now(now));
     }
 
+    /// Registers a pending connect with the agent and immediately executes
+    /// any resulting actions, so dial legs leave in the same driver turn.
+    pub(crate) fn connect<T: NatTransport, R: EntropySource>(
+        &mut self,
+        id: ConnectId,
+        peer: PeerId,
+        legs: ConnectLegs,
+        swarm: &mut SwarmRuntime<T, R>,
+        sample: PlatformNow,
+    ) {
+        self.agent.connect(id, peer, legs, to_nat_now(sample));
+        self.pump(swarm, sample);
+    }
+
+    /// How long the caller may idle before [`NatDriver::tick`] has work: `0`
+    /// when queued events or agent timers are due, `None` when nothing is.
     pub(crate) fn next_timeout(&self, now: PlatformNow) -> Option<u64> {
         if !self.events.is_empty() {
             Some(0)
@@ -84,6 +122,19 @@ impl<E: EntropySource> NatDriver<E> {
         }
     }
 
+    /// Returns the current AutoNAT reachability verdict.
+    pub(crate) fn reachability(&self) -> ReachabilityState {
+        self.agent.reachability()
+    }
+
+    /// Returns the currently held relay reservation, when any.
+    #[cfg(any(feature = "nat", feature = "portable-relay"))]
+    pub(crate) fn active_reservation(&self) -> Option<&minip2p_nat::ReservationInfo> {
+        self.agent.active_reservation()
+    }
+
+    /// Returns the advertised address set if it changed since the last call,
+    /// for hosts that push it into the swarm once per poll.
     #[cfg(feature = "portable-autonat")]
     pub(crate) fn take_address_change(&mut self) -> Option<Vec<Multiaddr>> {
         if !core::mem::take(&mut self.addresses_changed) {
@@ -146,7 +197,7 @@ impl<E: EntropySource> NatDriver<E> {
             }
             self.promoted
                 .retain(|(inner_conn, _), circuit| inner_conn != conn_id && circuit != conn_id);
-            if swarm.connection_id(peer_id).is_none() {
+            if !swarm.is_peer_connected(peer_id) {
                 self.paths.remove(peer_id);
             }
         }
@@ -193,6 +244,9 @@ impl<E: EntropySource> NatDriver<E> {
                 break;
             }
         }
+        // Sweeps promotions whose circuit vanished without a lifecycle
+        // event. Runs per pump rather than per host poll — closures surface
+        // through `ingest`'s ConnectionClosed branch regardless.
         self.promoted
             .retain(|_, id| swarm.transport().contains_circuit(*id));
     }
@@ -202,28 +256,61 @@ impl<E: EntropySource> NatDriver<E> {
         self.events.iter().skip(self.observed)
     }
 
+    /// Marks every currently queued event as seen by the Connection engine.
     pub(crate) fn mark_observed(&mut self) {
         self.observed = self.events.len();
+    }
+
+    /// Returns the queued event at `index`, including ones the Connection
+    /// engine has not observed yet.
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
+    pub(crate) fn event_at(&self, index: usize) -> Option<&NatEvent> {
+        self.events.get(index)
+    }
+
+    /// Removes the queued event at `index`, keeping the observation cursor
+    /// aligned. The discovery sweep uses this to claim attempt events.
+    #[cfg(any(feature = "discovery", feature = "mdns"))]
+    pub(crate) fn remove_event(&mut self, index: usize) -> NatEvent {
+        let event = self.events.remove(index).expect("queued NAT event");
+        self.note_removed(index);
+        event
+    }
+
+    /// All queued NAT events, observed or not.
+    #[cfg(all(
+        debug_assertions,
+        feature = "nat",
+        any(feature = "discovery", feature = "mdns")
+    ))]
+    pub(crate) fn queued_events(&self) -> impl Iterator<Item = &NatEvent> {
+        self.events.iter()
+    }
+
+    /// Queues an event for the application drain as if the agent emitted it.
+    #[cfg(all(test, feature = "nat"))]
+    pub(crate) fn push_event(&mut self, event: NatEvent) {
+        self.events.push_back(event);
     }
 
     /// Drains every queued event that reaches the Endpoint event stream,
     /// once the Connection-attempt engine has observed it.
     pub(crate) fn drain_application_events(&mut self) -> impl Iterator<Item = NatEvent> + '_ {
         self.observed = 0;
-        self.events
-            .drain(..)
-            .filter(crate::portable::nat_event_reaches_application)
+        self.events.drain(..).filter(nat_event_reaches_application)
     }
 
     /// Keeps the observation cursor aligned when the discovery sweep removes
     /// an attempt event it owns.
     #[cfg(any(feature = "discovery", feature = "mdns"))]
-    pub(crate) fn note_removed(&mut self, index: usize) {
+    fn note_removed(&mut self, index: usize) {
         if index < self.observed {
             self.observed -= 1;
         }
         self.observed = self.observed.min(self.events.len());
     }
+
+    /// Whether any relay is configured for reservations or circuit dialing.
     pub(crate) fn has_relay(&self) -> bool {
         self.agent.has_relay()
     }
@@ -239,6 +326,8 @@ impl<E: EntropySource> NatDriver<E> {
         self.paths.get(peer).cloned()
     }
 
+    /// Confirmed public addresses plus circuit addresses for every held
+    /// relay reservation — the set Identify should advertise.
     pub(crate) fn advertised_addrs(&self) -> Vec<Multiaddr> {
         let mut addrs = self.public_addrs.clone();
         for (_, addr) in &self.reserved_relays {
@@ -249,6 +338,8 @@ impl<E: EntropySource> NatDriver<E> {
         addrs
     }
 
+    /// Returns only the AutoNAT-confirmed public addresses, for relay-server
+    /// advertisement.
     #[cfg(feature = "relay-server")]
     pub(crate) fn confirmed_public_addrs(&self) -> Vec<Multiaddr> {
         self.public_addrs.clone()
@@ -259,6 +350,15 @@ impl<E: EntropySource> NatDriver<E> {
         self.public_addrs = addrs;
     }
 
+    /// The listen addresses AutoNAT currently offers for dial-back.
+    #[cfg(all(test, feature = "nat", feature = "quic"))]
+    pub(crate) fn listen_addrs(&self) -> &[Multiaddr] {
+        self.agent.listen_addrs()
+    }
+
+    /// Executes one agent action against the swarm and echoes synchronous
+    /// results back to the agent. Best-effort actions swallow errors; the
+    /// agent's timeouts and the swarm's lifecycle events surface failures.
     pub(crate) fn execute<T: NatTransport, R: EntropySource>(
         &mut self,
         action: NatAction,
