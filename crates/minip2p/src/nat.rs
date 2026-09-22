@@ -11,7 +11,7 @@ use minip2p_platform::{EntropySource, Now as PlatformNow};
 
 #[cfg(any(feature = "nat", feature = "portable-relay"))]
 use minip2p_circuit::{AdoptError, BridgeAdoption, CircuitRole, CircuitTransport};
-use minip2p_core::{Multiaddr, PeerId, Protocol};
+use minip2p_core::{Multiaddr, PeerId, Protocol, select_direct_addrs};
 #[cfg(any(feature = "nat", feature = "portable-relay"))]
 use minip2p_nat::BridgeRole;
 use minip2p_nat::{NatAction, NatAgent, NatEvent, Now, Path, PromoteError};
@@ -46,6 +46,9 @@ pub(crate) struct NatDriver<E> {
     paths: BTreeMap<PeerId, Path>,
     /// How many queued events the Connection engine has already observed.
     observed: usize,
+    /// The bound-address revision the agent's `listen_addrs` were seeded
+    /// from; callers can bind through any swarm path between driver turns.
+    listen_addrs_revision: u64,
     #[cfg(all(test, feature = "nat", feature = "quic"))]
     pub(crate) bridge_reset_attempts: Vec<(ConnectionId, StreamId)>,
 }
@@ -63,6 +66,7 @@ impl<E: EntropySource> NatDriver<E> {
             promoted: BTreeMap::new(),
             paths: BTreeMap::new(),
             observed: 0,
+            listen_addrs_revision: u64::MAX,
             #[cfg(all(test, feature = "nat", feature = "quic"))]
             bridge_reset_attempts: Vec::new(),
         }
@@ -88,6 +92,20 @@ impl<E: EntropySource> NatDriver<E> {
         Some(self.advertised_addrs())
     }
 
+    /// Re-seeds the agent's advertised listen addresses when the bound set
+    /// moved since the last driver turn. Revision-checked, so an unchanged
+    /// set costs one integer compare and no transport read.
+    fn sync_listen_addrs<T: NatTransport, R: EntropySource>(&mut self, swarm: &SwarmRuntime<T, R>) {
+        let revision = swarm.bound_addrs_revision();
+        if revision == self.listen_addrs_revision {
+            return;
+        }
+        let bound = swarm.transport().local_addresses();
+        self.agent
+            .set_listen_addrs(&select_direct_addrs(&bound, None, None));
+        self.listen_addrs_revision = revision;
+    }
+
     /// Feeds one swarm event to the agent and executes its cascade.
     ///
     /// Returns `true` when the event belongs to the NAT control plane and
@@ -99,6 +117,7 @@ impl<E: EntropySource> NatDriver<E> {
         swarm: &mut SwarmRuntime<T, R>,
         sample: PlatformNow,
     ) -> bool {
+        self.sync_listen_addrs(swarm);
         let now = to_nat_now(sample);
         if self.inject_straggler(event, swarm) {
             self.pump(swarm, sample);
@@ -142,6 +161,7 @@ impl<E: EntropySource> NatDriver<E> {
         swarm: &mut SwarmRuntime<T, R>,
         sample: PlatformNow,
     ) {
+        self.sync_listen_addrs(swarm);
         let now = to_nat_now(sample);
         if self.agent.next_timeout(now.mono_ms) != Some(0) {
             return;
@@ -157,6 +177,7 @@ impl<E: EntropySource> NatDriver<E> {
         swarm: &mut SwarmRuntime<T, R>,
         sample: PlatformNow,
     ) {
+        self.sync_listen_addrs(swarm);
         loop {
             let mut progressed = false;
             while let Some(action) = self.agent.poll_action() {

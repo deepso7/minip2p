@@ -234,7 +234,10 @@ fn autonat_picks_up_listen_addresses_bound_after_build() {
         now_ms += 100;
     }
 
+    // Binding through the runtime accessor must reach the agent just like
+    // the endpoint's own listen path.
     endpoint
+        .runtime_mut()
         .listen(
             &format!("/ip4/{DIALER_IP}/tcp/4001")
                 .parse()

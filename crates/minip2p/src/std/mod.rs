@@ -412,22 +412,7 @@ impl Endpoint {
     /// Starts listening on all transport-bound addresses.
     pub fn listen_all(&mut self) -> Result<Vec<PeerAddr>, Error> {
         let addrs = self.swarm.listen_on_bound_addrs()?;
-        #[cfg(feature = "nat")]
-        self.sync_nat_listen_addrs(&addrs);
         Ok(addrs)
-    }
-
-    /// Seeds the NAT agent's advertised addresses from the bound set
-    /// (wildcards and anything no transport can dial filtered out). No-op when
-    /// NAT is not configured.
-    #[cfg(feature = "nat")]
-    fn sync_nat_listen_addrs(&mut self, addrs: &[PeerAddr]) {
-        if let Some(nat) = self.nat.as_mut() {
-            let transports: Vec<Multiaddr> =
-                addrs.iter().map(|addr| addr.transport().clone()).collect();
-            let validated = minip2p_core::select_direct_addrs(&transports, None, None);
-            nat.agent.set_listen_addrs(&validated);
-        }
     }
 
     /// Dials a remote peer on every applicable local address family.

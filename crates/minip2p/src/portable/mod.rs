@@ -909,37 +909,6 @@ impl<D: smoltcp::phy::Device, E: EntropySource> core::ops::DerefMut for SmoltcpE
 
 #[cfg(feature = "smoltcp")]
 impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
-    /// Starts listening on a transport address.
-    ///
-    /// Shadows [`PortableEndpoint::listen`]: a successful bind resyncs the
-    /// addresses AutoNAT reports for dial-back.
-    pub fn listen(&mut self, address: &Multiaddr) -> Result<Multiaddr, DriverError> {
-        let bound = self.endpoint.listen(address)?;
-        self.sync_nat_listen_addrs();
-        Ok(bound)
-    }
-
-    /// Starts listening on every address already bound by the transport.
-    ///
-    /// Shadows [`PortableEndpoint::listen_all`]: a successful bind resyncs the
-    /// addresses AutoNAT reports for dial-back.
-    pub fn listen_all(&mut self) -> Result<Vec<PeerAddr>, DriverError> {
-        let bound = self.endpoint.listen_all()?;
-        self.sync_nat_listen_addrs();
-        Ok(bound)
-    }
-
-    /// Re-seeds the NAT agent's advertised addresses from the bound set.
-    /// No-op when portable AutoNAT is not configured.
-    fn sync_nat_listen_addrs(&mut self) {
-        #[cfg(feature = "portable-autonat")]
-        if let Some(nat) = self.nat.as_mut() {
-            let addrs =
-                minip2p_core::select_direct_addrs(&self.endpoint.bound_addresses(), None, None);
-            nat.agent.set_listen_addrs(&addrs);
-        }
-    }
-
     /// Pushes NAT-advertised address changes into Identify. No-op when
     /// portable AutoNAT is not configured.
     fn flush_nat_addresses(&mut self) {
@@ -1854,12 +1823,8 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
                 .iter()
                 .map(|relay| (relay.peer_id().clone(), relay.transport().clone()))
                 .collect();
-            let mut agent = minip2p_nat::NatAgent::new(endpoint.peer_id().clone(), config);
-            agent.set_listen_addrs(&minip2p_core::select_direct_addrs(
-                &endpoint.bound_addresses(),
-                None,
-                None,
-            ));
+            // The driver seeds the agent's listen addresses on its first turn.
+            let agent = minip2p_nat::NatAgent::new(endpoint.peer_id().clone(), config);
             NatDriver::new(agent, relay_addrs, self.entropy.clone())
         });
         Ok(SmoltcpEndpoint {

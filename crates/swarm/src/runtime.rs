@@ -87,6 +87,11 @@ pub struct SwarmRuntime<T: Transport, E: EntropySource> {
     external_addresses: Vec<Multiaddr>,
     external_addresses_revision: u64,
 
+    /// Bumped by every successful `listen*` call so drivers can notice a
+    /// moved bound-address set without re-reading the transport each turn.
+    /// Binding through [`SwarmRuntime::transport_mut`] bypasses it.
+    bound_addrs_revision: u64,
+
     /// Randomness for ping nonces. Injected so the pump stays deterministic
     /// and testable, and so `no_std` hosts can supply their own source.
     entropy: E,
@@ -113,6 +118,7 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
             after_event_actions: VecDeque::new(),
             external_addresses: Vec::new(),
             external_addresses_revision: 0,
+            bound_addrs_revision: 0,
             entropy,
         }
     }
@@ -143,12 +149,25 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         self.external_addresses_revision
     }
 
+    /// Returns the wrapping revision of the transport's bound-address set.
+    ///
+    /// Every successful `listen*` call bumps it, letting drivers refresh
+    /// cached bound addresses without asking the transport each turn.
+    /// Binding directly through [`SwarmRuntime::transport_mut`] does not
+    /// bump it.
+    pub fn bound_addrs_revision(&self) -> u64 {
+        self.bound_addrs_revision
+    }
+
     /// Returns a reference to the underlying transport.
     pub fn transport(&self) -> &T {
         &self.transport
     }
 
     /// Returns a mutable reference to the underlying transport.
+    ///
+    /// Listeners bound through this escape hatch are invisible to
+    /// [`SwarmRuntime::bound_addrs_revision`]; prefer the `listen*` methods.
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
     }
@@ -243,7 +262,9 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
 
     /// Start listening on the given multiaddr and return the resolved local address.
     pub fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, DriverError> {
-        Ok(self.transport.listen(addr)?)
+        let bound = self.transport.listen(addr)?;
+        self.bound_addrs_revision = self.bound_addrs_revision.wrapping_add(1);
+        Ok(bound)
     }
 
     /// Start listening on the transport's already-bound local addresses.
@@ -271,6 +292,7 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
             })?;
             resolved.push(peer_addr);
         }
+        self.bound_addrs_revision = self.bound_addrs_revision.wrapping_add(1);
         Ok(resolved)
     }
 
@@ -288,6 +310,7 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
                 reason: "transport does not expose a bound local address".into(),
             })?;
         let addr = self.transport.listen(&addr)?;
+        self.bound_addrs_revision = self.bound_addrs_revision.wrapping_add(1);
         Ok(
             PeerAddr::new(addr, self.local_peer_id.clone()).map_err(|e| {
                 TransportError::InvalidConfig {
