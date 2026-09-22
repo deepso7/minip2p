@@ -482,7 +482,10 @@ pub(crate) fn convert_swarm(event: Event) -> Option<P2pEvent> {
             stream_id: error.stream_id.map(|id| id.as_u64()),
             detail: error.detail,
         },
-        Event::DialFailed { .. } | Event::ConnectSettled { .. } => return None,
+        // Capability variants are dispatched by `convert_endpoint_event`;
+        // raw dial failures and variants of capabilities this core does
+        // not surface (relay service) have no foreign event.
+        _ => return None,
     })
 }
 
@@ -496,6 +499,9 @@ pub(crate) fn convert_endpoint_event(
             peer_id,
             outcome,
         } => convert_settled(connect_id, &peer_id, outcome, endpoint.path(&peer_id)),
+        Event::Nat(event) => convert_nat(event),
+        Event::Gossipsub(event) => Some(convert_gossipsub(event)),
+        Event::Discovery(event) => Some(convert_discovery(event)),
         other => convert_swarm(other),
     }
 }

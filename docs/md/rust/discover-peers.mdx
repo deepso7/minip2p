@@ -79,12 +79,17 @@ for peer in node.known_peers() {
     );
 }
 
-for event in node.take_discovery_events() {
-    println!("{event:?}");
+loop {
+    match node.wait(std::time::Duration::from_millis(250))? {
+        minip2p::EndpointWaitOutcome::Event(minip2p::EndpointEvent::Discovery(event)) => {
+            println!("{event:?}");
+        }
+        _ => {} // other Endpoint events, deadline, interruption
+    }
 }
 ```
 
-`DiscoveryEvent` reports peers being discovered, updated, or expired, plus automatic dial failures and rejected beacons. Use `next_discovery_event(deadline)` when a synchronous loop wants one focused event.
+`EndpointEvent::Discovery(DiscoveryEvent)` reports peers being discovered, updated, or expired, plus automatic dial failures and rejected beacons. `known_peers` is a State snapshot and may be ahead of these events. The migration APIs `take_discovery_events` / `next_discovery_event(deadline)` remain until #181.
 
 ## Customize policy
 

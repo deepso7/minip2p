@@ -82,17 +82,22 @@ impl PortableNatDriver {
         self.agent.cancel(id, Self::now(now));
     }
 
-    pub(crate) fn unobserved_events(&self) -> Vec<NatEvent> {
-        self.events.iter().skip(self.observed).cloned().collect()
+    /// Queued events the Connection-attempt engine has not observed yet.
+    pub(crate) fn unobserved_events(&self) -> impl Iterator<Item = &NatEvent> {
+        self.events.iter().skip(self.observed)
     }
 
     pub(crate) fn mark_observed(&mut self) {
         self.observed = self.events.len();
     }
 
-    pub(crate) fn take_events(&mut self) -> Vec<NatEvent> {
+    /// Drains every queued event that reaches the Endpoint event stream,
+    /// once the Connection-attempt engine has observed it.
+    pub(crate) fn drain_application_events(&mut self) -> impl Iterator<Item = NatEvent> + '_ {
         self.observed = 0;
-        self.events.drain(..).collect()
+        self.events
+            .drain(..)
+            .filter(crate::portable::nat_event_reaches_application)
     }
 
     #[cfg(feature = "portable-relay")]

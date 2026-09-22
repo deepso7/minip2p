@@ -28,7 +28,7 @@ Available on the std `Endpoint`:
 - Direct connections: `connect`, `cancel_connect`, `dial`, `dial_ip4`, `dial_ip6`, `disconnect`
 - State: `peer_id`, `connected_peers`, `is_peer_ready`, `peer_info`
 - Streams: `add_protocol`, `open_stream`, `send_stream`, `close_stream_write`, `reset_stream`, `abandon_stream`
-- Driving: focused waits `wait_peer_ready`, `nat_wait_path` (nat), `wait_ping_rtt`; event loops `wait`, `next_event`, `next_wake`; non-blocking `poll`
+- Driving: focused waits `wait_peer_ready`, `nat_wait_path` (nat), `wait_ping_rtt`; event loop `wait` (every event, including capability variants); migration `next_event`, `next_wake`; non-blocking `poll`
 - Shutdown: `close`
 
 Available on `EndpointBuilder` with `quic`:
@@ -48,7 +48,7 @@ Compiled with `features = ["tcp"]`:
 
 ## Portable API
 
-With default features off, `Endpoint::portable(identity, entropy)` starts a `PortableEndpoint` builder. Call `build(transport)` with the caller-provided `Transport`. The resulting endpoint uses `poll(now)` and `next_deadline(now)` instead of the std endpoint's blocking wait methods. It never reads a system clock or starts a runtime.
+With default features off, `Endpoint::portable(identity, entropy)` starts a `PortableEndpoint` builder. Call `build(transport)` with the caller-provided `Transport`. The resulting endpoint uses `poll(now)` and `next_deadline(now)` instead of the std endpoint's blocking wait methods; `poll(now)` returns `Vec<EndpointEvent>`, including enabled capability variants. It never reads a system clock or starts a runtime.
 
 The `smoltcp` feature adds a shared embedded TCP stack. It includes portable mDNS; enable `pubsub` for pubsub and signed discovery, `portable-autonat` for AutoNAT, and `portable-relay` for relay circuits.
 
@@ -58,7 +58,7 @@ Compiled with `features = ["nat"]`:
 
 - Activation: `relay`, `autonat_server`, `nat_config`
 - Attempts: `connect`, `cancel_connect`, `nat_wait_path` (migration; removed in #181)
-- Events: `take_nat_events`, `next_nat_event`
+- Events: `EndpointEvent::Nat(..)` via `wait` (migration: `take_nat_events`, `next_nat_event`)
 - State: `reachability`, `active_reservation`, `path`
 
 <Callout type="warning">
@@ -73,7 +73,7 @@ Compiled with `features = ["pubsub"]`:
 
 - Activation: `gossipsub`, `gossipsub_config`
 - Topics: `subscribe`, `unsubscribe`, `publish`
-- Events: `take_gossipsub_events`, `next_gossipsub_event`
+- Events: `EndpointEvent::Gossipsub(..)` via `wait` (migration: `take_gossipsub_events`, `next_gossipsub_event`)
 
 ## Discovery API
 
@@ -82,7 +82,7 @@ Compiled with `features = ["discovery"]`, which includes the `nat` and `pubsub` 
 - Activation: `discovery`, `discovery_config`
 - Shared policy: `peer_discovery_config`
 - State: `known_peers`
-- Events: `take_discovery_events`, `next_discovery_event`
+- Events: `EndpointEvent::Discovery(..)` via `wait` (migration: `take_discovery_events`, `next_discovery_event`)
 
 Activating discovery also activates default pubsub and the NAT agent. A relay remains optional for direct discovery, but required for relayed paths and relay-assisted punching.
 
@@ -93,7 +93,7 @@ Compiled with `features = ["mdns"]`, which includes the `nat` Cargo feature but 
 - Activation: `mdns`, `mdns_config`
 - Shared policy: `peer_discovery_config`
 - State: `known_peers`
-- Events: `take_discovery_events`, `next_discovery_event`
+- Events: `EndpointEvent::Discovery(..)` via `wait` (migration: `take_discovery_events`, `next_discovery_event`)
 - mDNS lifecycle: `shutdown` sends goodbyes and stops mDNS without closing the endpoint
 
 mDNS discovers peers only on multicast-capable local links. Its address claims remain unauthenticated until the selected transport verifies the peer identity. Automatic mDNS-triggered attempts are direct-only and never activate a configured relay or HOP CONNECT. `Endpoint::shutdown` sends TTL-zero goodbyes and permanently stops mDNS; QUIC and TCP keep working. With both `discovery` and `mdns` enabled, both sources use one bounded peer book and one automatic-dial state.

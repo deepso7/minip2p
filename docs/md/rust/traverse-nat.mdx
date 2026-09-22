@@ -63,34 +63,42 @@ Calling `.autonat_server(...)` alone enables reachability probes, but it does no
 A Peer-ID target with neither known addresses nor a relay settles `ConnectSettled { Failed(NoUsableRoute) }` through one terminal event.
 
 ```rust
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use minip2p::{EndpointEvent, NatEvent};
+use minip2p::{ConnectOutcome, EndpointEvent, EndpointWaitOutcome, NatEvent};
 
 let connect_id = node.connect(&target)?;
-match node.nat_wait_path(connect_id, Duration::from_secs(60))? {
-    Some(path) => println!("first usable path: {path:?}"),
-    None => {
-        let failed = node.take_nat_events().into_iter().find(|event| {
-            matches!(
-                event,
-                NatEvent::ConnectFailed { connect_id: id, .. } if *id == connect_id
-            )
-        });
-        match failed {
-            Some(NatEvent::ConnectFailed { error, .. }) => {
-                eprintln!("connect failed: {error:?}");
+let deadline = Instant::now() + Duration::from_secs(60);
+loop {
+    match node.wait(deadline)? {
+        EndpointWaitOutcome::Event(EndpointEvent::Nat(NatEvent::PathEstablished {
+            connect_id: id,
+            path,
+            ..
+        })) if id == connect_id => println!("first usable path: {path:?}"),
+        EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
+            connect_id: id,
+            outcome,
+            ..
+        }) if id == connect_id => {
+            match outcome {
+                ConnectOutcome::Connected { .. } => println!("connected"),
+                other => eprintln!("connect did not succeed: {other:?}"),
             }
-            _ => eprintln!("no usable path before the deadline"),
+            break;
+        }
+        EndpointWaitOutcome::Event(_) | EndpointWaitOutcome::Interrupted => {}
+        EndpointWaitOutcome::Deadline => {
+            eprintln!("no outcome before the deadline");
+            break;
         }
     }
 }
 ```
 
-`nat_wait_path` is a migration helper until #181. It returns `Ok(Some(path))` when it consumes the matching `NatEvent::PathEstablished` — the first usable path, which may be a provisional Relayed circuit. The attempt's terminal is `EndpointEvent::ConnectSettled` (connected after DCUtR settles, or immediately under `force_relay`). It returns `Ok(None)` in two cases:
+`NatEvent::PathEstablished` reports the first usable path, which may be a provisional Relayed circuit. The attempt's terminal is `EndpointEvent::ConnectSettled` (connected after DCUtR settles, or immediately under `force_relay`). NAT attempt terminals (`ConnectFailed`, `FellBackToRelay`) are consumed by the Connection-attempt engine and never reach the stream; a failed attempt settles as `ConnectOutcome::Failed`.
 
-- the attempt failed; `NatEvent::ConnectFailed` stays queued for `take_nat_events` when the NAT leg failed (a Peer target with no route may settle only as `ConnectSettled`);
-- the deadline expired before either outcome; no `ConnectFailed` is synthesized.
+The migration helper `nat_wait_path(connect_id, deadline)` remains until #181. It returns `Ok(Some(path))` on the attempt's `PathEstablished`. If the attempt settles first, it returns the `path()` snapshot for a connected attempt or `Ok(None)` for a failed or cancelled one, leaving `ConnectSettled` queued for `wait`. It also returns `Ok(None)` when the deadline expires first.
 
 ## Path selection and upgrade
 
@@ -111,31 +119,36 @@ The first usable path is explicit:
 - `Path::DirectPunched`: a DCUtR hole punch connected;
 - `Path::Relayed { relay }`: the protected relay circuit is usable.
 
-That Relayed path is provisional until `ConnectSettled`. Applications that need the circuit immediately (echo, ping) can use it as soon as `path(peer)` is `Relayed`; the attempt is not finished until DCUtR settles or `force_relay` skips punching. When a relayed path upgrades later, the application receives `NatEvent::PathUpgraded`. If punch windows fail, it receives `HolePunchFailed` events and eventually `FellBackToRelay`; the relayed connection stays usable.
+That Relayed path is provisional until `ConnectSettled`. Applications that need the circuit immediately (echo, ping) can use it as soon as `path(peer)` is `Relayed`; the attempt is not finished until DCUtR settles or `force_relay` skips punching. When a relayed path upgrades later, the application receives `NatEvent::PathUpgraded`. If punch windows fail, it receives `HolePunchFailed` events and then `ConnectSettled` on the Relayed path; the relayed connection stays usable.
 
 ## Reservations and reachability
 
 A private listener needs a reservation before another peer can reach it through the relay. Watch for:
 
 ```rust
-for event in node.take_nat_events() {
-    match event {
-        minip2p::NatEvent::RelayReserved { relay, .. } => {
+use std::time::Duration;
+
+use minip2p::{EndpointEvent, EndpointWaitOutcome, NatEvent};
+
+loop {
+    match node.wait(Duration::from_millis(250))? {
+        EndpointWaitOutcome::Event(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) => {
             println!("relay reservation ready: {relay}");
         }
-        minip2p::NatEvent::ReachabilityChanged { new, .. } => {
+        EndpointWaitOutcome::Event(EndpointEvent::Nat(NatEvent::ReachabilityChanged { new, .. })) => {
             println!("reachability={new:?}");
         }
-        _ => {}
+        EndpointWaitOutcome::Event(_) => {} // EndpointEvent is non-exhaustive
+        EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted => {}
     }
 }
 ```
 
-`node.reachability()` reports the current AutoNAT verdict. `node.active_reservation()` returns the currently held reservation, if any. AutoNAT servers are caller-supplied; minip2p does not discover them automatically.
+`node.reachability()` reports the current AutoNAT verdict. `node.active_reservation()` returns the currently held reservation, if any. These State snapshot getters may be ahead of the event stream, never behind their own emitted transition. AutoNAT servers are caller-supplied; minip2p does not discover them automatically.
 
 ## Keep driving after the first path
 
-`nat_wait_path` returns when traffic can flow. Keep calling focused waits, `next_wake`, `next_event`, or `poll` afterward so DCUtR, reservation renewal, and connection events continue to progress. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
+The first usable path means traffic can flow. Keep calling `wait` or `poll` afterward so DCUtR, reservation renewal, and connection events continue to progress. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
 
 ## Custom entropy without `std`
 

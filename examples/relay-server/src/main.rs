@@ -6,7 +6,9 @@ use std::io::BufRead as _;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use minip2p::{Ed25519Keypair, Endpoint, EndpointWake, Multiaddr, RelayServerEvent};
+use minip2p::{
+    Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome, Multiaddr, RelayServerEvent,
+};
 use minip2p_example_common::load_keypair;
 
 const STDIN_COMMAND_CAPACITY: usize = 16;
@@ -78,11 +80,10 @@ fn run(args: Vec<String>) -> Result<(), Box<dyn Error>> {
                 command => eprintln!("[relay] unknown command {command:?}; use pause or resume"),
             }
         }
-        if let EndpointWake::Event(event) = endpoint.next_wake(Duration::from_millis(250))? {
-            println!("[endpoint] {event:?}");
-        }
-        for event in endpoint.take_relay_server_events() {
-            print_event(event);
+        match endpoint.wait(Duration::from_millis(250))? {
+            EndpointWaitOutcome::Event(EndpointEvent::RelayServer(event)) => print_event(event),
+            EndpointWaitOutcome::Event(event) => println!("[endpoint] {event:?}"),
+            EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted => {}
         }
     }
 }

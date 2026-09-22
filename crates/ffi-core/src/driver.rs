@@ -6,15 +6,18 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use minip2p::{EndpointWake, Error, NatEvent};
+use minip2p::{EndpointWaitOutcome, Error, NatEvent};
 
 use crate::endpoint::{Lifecycle, Shared};
-use crate::events::{convert_discovery, convert_endpoint_event, convert_gossipsub, convert_nat};
+use crate::events::convert_endpoint_event;
 use crate::{DriverFailureKind, EventDoorbell, P2pEvent};
 
 const DRIVER_POLL: Duration = Duration::from_millis(25);
 const DRIVER_IDLE_POLL: Duration = Duration::from_millis(500);
 const MAX_CARRY_EVENTS: usize = 4096;
+/// How many already-queued `wait` results one pump iteration will take
+/// before yielding the lock. Further events stay queued for the next wait.
+const PUMP_DRAIN_LIMIT: usize = 256;
 
 /// Rust-side instrumentation for the background driver.
 #[derive(Clone, Copy, Debug, Default)]
@@ -204,57 +207,39 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             ..
         } = &mut *state;
         let endpoint = endpoint.as_mut().expect("running endpoint exists");
-        let wake = endpoint.next_wake(deadline)?;
-        if matches!(wake, EndpointWake::Interrupted) {
+        // Only `Endpoint::wait`, so the carry stays in Endpoint emission
+        // order. A follow-up `poll()` would open a second batch and finish
+        // that batch on its own.
+        let mut batch = Vec::new();
+        let mut interrupted = false;
+        match endpoint.wait(deadline)? {
+            EndpointWaitOutcome::Interrupted => interrupted = true,
+            EndpointWaitOutcome::Event(event) => batch.push(event),
+            EndpointWaitOutcome::Deadline => {}
+        }
+        if !interrupted {
+            for _ in 0..PUMP_DRAIN_LIMIT {
+                match endpoint.wait(Duration::ZERO)? {
+                    EndpointWaitOutcome::Event(event) => batch.push(event),
+                    EndpointWaitOutcome::Deadline => break,
+                    EndpointWaitOutcome::Interrupted => {
+                        interrupted = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if interrupted && batch.is_empty() {
             drop(state);
             while guard.shared.pending_commands.load(Ordering::Acquire) != 0 {
                 std::thread::sleep(Duration::from_millis(1));
             }
             continue;
         }
-
-        let nat_events = endpoint.take_nat_events();
         ingest(
-            nat_events
-                .into_iter()
-                .filter(|event| {
-                    nat_connect_id(event).is_none_or(|id| !cancelled_connect_ids.contains(&id))
-                })
-                .filter_map(convert_nat),
-            carry,
-            overflow,
-            stats,
-        );
-        if let EndpointWake::Event(event) = wake {
-            ingest(
-                convert_filtered_endpoint_event(endpoint, event, cancelled_connect_ids),
-                carry,
-                overflow,
-                stats,
-            );
-        }
-        ingest(
-            endpoint.poll()?.into_iter().filter_map(|event| {
+            batch.into_iter().filter_map(|event| {
                 convert_filtered_endpoint_event(endpoint, event, cancelled_connect_ids)
             }),
-            carry,
-            overflow,
-            stats,
-        );
-        ingest(
-            endpoint
-                .take_gossipsub_events()
-                .into_iter()
-                .map(convert_gossipsub),
-            carry,
-            overflow,
-            stats,
-        );
-        ingest(
-            endpoint
-                .take_discovery_events()
-                .into_iter()
-                .map(convert_discovery),
             carry,
             overflow,
             stats,
@@ -263,13 +248,17 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             connect_ids.remove(&id);
             cancelled_connect_ids.remove(&id);
         }
-        cancelled_connect_ids.clear();
         stats.carry_high_water = stats.carry_high_water.max(carry.len());
         stats.iterations = stats.iterations.saturating_add(1);
         let should_ring = was_empty && !carry.is_empty();
         drop(state);
         if should_ring {
             ring(guard.doorbell.as_ref().expect("doorbell exists"));
+        }
+        if interrupted {
+            while guard.shared.pending_commands.load(Ordering::Acquire) != 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         }
     }
 }
@@ -314,14 +303,39 @@ pub(crate) fn take_delivery(
 fn convert_filtered_endpoint_event(
     endpoint: &minip2p::Endpoint,
     event: minip2p::Event,
-    cancelled: &BTreeSet<u64>,
+    cancelled: &mut BTreeSet<u64>,
 ) -> Option<P2pEvent> {
-    if let minip2p::Event::ConnectSettled { connect_id, .. } = &event
-        && cancelled.contains(&connect_id.as_u64())
-    {
+    if suppress_cancelled_endpoint_event(&event, cancelled) {
         return None;
     }
     convert_endpoint_event(endpoint, event)
+}
+
+/// Returns `true` when `event` belongs to a cancelled attempt.
+///
+/// The attempt id stays in `cancelled` until this filters that attempt's
+/// `ConnectSettled`, so a later pump batch can still drop events left
+/// queued beyond [`PUMP_DRAIN_LIMIT`]. Same-attempt NAT events precede
+/// `ConnectSettled`, so the id does not need to outlive the terminal.
+fn suppress_cancelled_endpoint_event(
+    event: &minip2p::Event,
+    cancelled: &mut BTreeSet<u64>,
+) -> bool {
+    let id = match event {
+        minip2p::Event::ConnectSettled { connect_id, .. } => connect_id.as_u64(),
+        minip2p::Event::Nat(event) => match nat_connect_id(event) {
+            Some(id) => id,
+            None => return false,
+        },
+        _ => return false,
+    };
+    if !cancelled.contains(&id) {
+        return false;
+    }
+    if matches!(event, minip2p::Event::ConnectSettled { .. }) {
+        cancelled.remove(&id);
+    }
+    true
 }
 
 fn nat_connect_id(event: &NatEvent) -> Option<u64> {
@@ -586,5 +600,39 @@ mod tests {
             path: crate::PathKind::DirectDialed,
         };
         assert_eq!(p2p_connect_id(&extracted), Some(7));
+    }
+
+    #[test]
+    fn cancelled_id_is_removed_only_when_connect_settled_is_filtered() {
+        let connect_id = minip2p::ConnectId::from_u64(7);
+        let peer_id = minip2p::Ed25519Keypair::from_secret_key_bytes([3; 32]).peer_id();
+        let mut cancelled = BTreeSet::from([7_u64]);
+
+        let nat = minip2p::Event::Nat(NatEvent::HolePunchFailed {
+            connect_id,
+            attempt: 1,
+            reason: "timeout".into(),
+        });
+        assert!(suppress_cancelled_endpoint_event(&nat, &mut cancelled));
+        assert!(
+            cancelled.contains(&7),
+            "filtering NAT must keep the id for events still queued beyond the pump drain limit"
+        );
+
+        let settled = minip2p::Event::ConnectSettled {
+            connect_id,
+            peer_id: peer_id.clone(),
+            outcome: minip2p::ConnectOutcome::Cancelled,
+        };
+        assert!(suppress_cancelled_endpoint_event(&settled, &mut cancelled));
+        assert!(
+            cancelled.is_empty(),
+            "filtering ConnectSettled retires the cancelled id"
+        );
+
+        let unrelated = minip2p::Event::PingTimeout { peer_id };
+        let mut empty = BTreeSet::new();
+        assert!(!suppress_cancelled_endpoint_event(&unrelated, &mut empty));
+        assert!(empty.is_empty());
     }
 }

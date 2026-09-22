@@ -51,17 +51,29 @@ fn slow_heartbeat_discovery_endpoint() -> Endpoint {
         .expect("bind loopback endpoint")
 }
 
-fn assert_no_discovery_gossipsub(events: Vec<GossipsubEvent>) {
-    for event in events {
-        let leaked = match &event {
-            GossipsubEvent::Message { topics, .. } => {
-                topics.iter().any(|topic| topic == DISCOVERY_TOPIC)
-            }
-            GossipsubEvent::PeerSubscribed { topic, .. }
-            | GossipsubEvent::PeerUnsubscribed { topic, .. } => topic == DISCOVERY_TOPIC,
-            _ => false,
-        };
-        assert!(!leaked, "discovery pubsub event leaked: {event:?}");
+/// Fails if an Endpoint event carries discovery-owned beacon-topic traffic.
+fn assert_no_discovery_gossipsub(event: Option<Event>) {
+    let Some(Event::Gossipsub(event)) = event else {
+        return;
+    };
+    let leaked = match &event {
+        GossipsubEvent::Message { topics, .. } => {
+            topics.iter().any(|topic| topic == DISCOVERY_TOPIC)
+        }
+        GossipsubEvent::PeerSubscribed { topic, .. }
+        | GossipsubEvent::PeerUnsubscribed { topic, .. } => topic == DISCOVERY_TOPIC,
+        _ => false,
+    };
+    assert!(!leaked, "discovery pubsub event leaked: {event:?}");
+}
+
+/// Checks every event still queued on `endpoint` for beacon-topic leaks.
+fn assert_queue_has_no_discovery_gossipsub(endpoint: &mut Endpoint) {
+    while let Some(event) = endpoint
+        .next_event(Duration::ZERO)
+        .expect("drain queued events")
+    {
+        assert_no_discovery_gossipsub(Some(event));
     }
 }
 
@@ -80,10 +92,8 @@ fn beacons_do_not_leak_to_the_application() {
         || b.known_peers().iter().all(|known| known.peer != a_peer)
     {
         assert!(Instant::now() < deadline, "discovery timed out");
-        let _ = a.next_event(Duration::from_millis(20)).expect("a drives");
-        let _ = b.next_event(Duration::from_millis(20)).expect("b drives");
-        assert_no_discovery_gossipsub(a.take_gossipsub_events());
-        assert_no_discovery_gossipsub(b.take_gossipsub_events());
+        assert_no_discovery_gossipsub(a.next_event(Duration::from_millis(20)).expect("a drives"));
+        assert_no_discovery_gossipsub(b.next_event(Duration::from_millis(20)).expect("b drives"));
     }
 
     let a_seen_by_b = b
@@ -98,8 +108,8 @@ fn beacons_do_not_leak_to_the_application() {
         .expect("a knows b");
     assert!(a_seen_by_b.addrs.contains(a_addr.transport()));
     assert!(b_seen_by_a.addrs.contains(b_addr.transport()));
-    assert_no_discovery_gossipsub(a.take_gossipsub_events());
-    assert_no_discovery_gossipsub(b.take_gossipsub_events());
+    assert_queue_has_no_discovery_gossipsub(&mut a);
+    assert_queue_has_no_discovery_gossipsub(&mut b);
 }
 
 #[test]
@@ -124,18 +134,19 @@ fn star_beacons_relay_before_the_first_gossipsub_heartbeat() {
             Instant::now() < deadline,
             "cross-leaf discovery waited for a 60s heartbeat"
         );
-        let _ = hub
-            .next_event(Duration::from_millis(20))
-            .expect("hub drives");
-        let _ = a.next_event(Duration::from_millis(20)).expect("a drives");
-        let _ = b.next_event(Duration::from_millis(20)).expect("b drives");
+        assert_no_discovery_gossipsub(
+            hub.next_event(Duration::from_millis(20))
+                .expect("hub drives"),
+        );
+        assert_no_discovery_gossipsub(a.next_event(Duration::from_millis(20)).expect("a drives"));
+        assert_no_discovery_gossipsub(b.next_event(Duration::from_millis(20)).expect("b drives"));
     }
 
     assert_eq!(a.connected_peers(), vec![hub_peer.clone()]);
     assert_eq!(b.connected_peers(), vec![hub_peer]);
-    assert_no_discovery_gossipsub(hub.take_gossipsub_events());
-    assert_no_discovery_gossipsub(a.take_gossipsub_events());
-    assert_no_discovery_gossipsub(b.take_gossipsub_events());
+    assert_queue_has_no_discovery_gossipsub(&mut hub);
+    assert_queue_has_no_discovery_gossipsub(&mut a);
+    assert_queue_has_no_discovery_gossipsub(&mut b);
 }
 
 #[test]

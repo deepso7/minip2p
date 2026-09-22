@@ -207,8 +207,17 @@ pub fn run_join(
         .nat_wait_path(connect_id, CONNECT_DEADLINE)
         .map_err(|e| format!("waiting for a path: {e}"))?;
     let Some(path) = path else {
-        for event in endpoint.take_nat_events() {
-            print_nat_event("join", &event);
+        // The attempt's ConnectSettled (if it settled) is still queued.
+        while let Some(event) = endpoint.next_event(Duration::ZERO)? {
+            if let Event::ConnectSettled {
+                connect_id: settled,
+                outcome,
+                ..
+            } = &event
+                && *settled == connect_id
+            {
+                eprintln!("[join] connect-settled outcome={outcome:?}");
+            }
         }
         return Err("no path to the host".into());
     };
@@ -327,7 +336,7 @@ fn run_chat(
         }
 
         if let Some(event) = endpoint.next_event(Duration::from_millis(100))? {
-            match &event {
+            match event {
                 Event::ConnectionEstablished { peer_id, .. } => {
                     println!("[{role}] connected peer={peer_id}");
                 }
@@ -337,76 +346,74 @@ fn run_chat(
                 Event::Error(error) => {
                     eprintln!("[{role}] error {:?}: {}", error.kind, error.detail);
                 }
+                Event::Gossipsub(event) => print_gossipsub_event(role, event),
+                Event::Nat(event) => {
+                    print_nat_event(role, &event);
+                    // A reservation that lands late (after the startup wait
+                    // warned) or is re-acquired after a loss still needs its
+                    // circuit address printed -- joiners have nothing to
+                    // paste otherwise.
+                    if let Some(relay) = relay
+                        && matches!(&event, NatEvent::RelayReserved { relay: reserved, .. }
+                            if reserved == relay.peer_id())
+                    {
+                        println!(
+                            "[{role}] circuit={}",
+                            circuit_addr(relay, endpoint.peer_id())
+                        );
+                    }
+                }
+                Event::Discovery(event) => print_discovery_event(role, event),
                 _ => {}
             }
         }
+    }
+}
 
-        for event in endpoint.take_gossipsub_events() {
-            print_gossipsub_event(role, event);
+fn print_discovery_event(role: &str, event: DiscoveryEvent) {
+    match event {
+        DiscoveryEvent::PeerDiscovered {
+            peer,
+            addrs,
+            source,
+        } => {
+            println!(
+                "[{role}] discovered peer={} source={source:?} addrs={}",
+                short(&peer),
+                addrs.len()
+            );
         }
-
-        for event in endpoint.take_nat_events() {
-            print_nat_event(role, &event);
-            // A reservation that lands late (after the startup wait warned)
-            // or is re-acquired after a loss still needs its circuit
-            // address printed -- joiners have nothing to paste otherwise.
-            if let Some(relay) = relay
-                && matches!(&event, NatEvent::RelayReserved { relay: reserved, .. }
-                    if reserved == relay.peer_id())
-            {
-                println!(
-                    "[{role}] circuit={}",
-                    circuit_addr(relay, endpoint.peer_id())
-                );
-            }
+        DiscoveryEvent::PeerUpdated {
+            peer,
+            addrs,
+            source,
+        } => {
+            println!(
+                "[{role}] discovery-updated peer={} source={source:?} addrs={}",
+                short(&peer),
+                addrs.len()
+            );
         }
-
-        for event in endpoint.take_discovery_events() {
-            match event {
-                DiscoveryEvent::PeerDiscovered {
-                    peer,
-                    addrs,
-                    source,
-                } => {
-                    println!(
-                        "[{role}] discovered peer={} source={source:?} addrs={}",
-                        short(&peer),
-                        addrs.len()
-                    );
-                }
-                DiscoveryEvent::PeerUpdated {
-                    peer,
-                    addrs,
-                    source,
-                } => {
-                    println!(
-                        "[{role}] discovery-updated peer={} source={source:?} addrs={}",
-                        short(&peer),
-                        addrs.len()
-                    );
-                }
-                DiscoveryEvent::PeerExpired { peer } => {
-                    println!("[{role}] peer-expired peer={}", short(&peer));
-                }
-                DiscoveryEvent::DialFailed { peer, reason } => {
-                    eprintln!(
-                        "[{role}] mesh-dial-failed peer={} reason={reason}",
-                        short(&peer)
-                    );
-                }
-                DiscoveryEvent::ProtocolViolation {
-                    peer,
-                    source,
-                    reason,
-                    suppressed,
-                } => {
-                    let peer = peer.as_ref().map(short).unwrap_or_else(|| "unknown".into());
-                    eprintln!(
-                        "[{role}] discovery-violation peer={peer} source={source:?} \
-                         suppressed={suppressed} reason={reason}"
-                    );
-                }
-            }
+        DiscoveryEvent::PeerExpired { peer } => {
+            println!("[{role}] peer-expired peer={}", short(&peer));
+        }
+        DiscoveryEvent::DialFailed { peer, reason } => {
+            eprintln!(
+                "[{role}] mesh-dial-failed peer={} reason={reason}",
+                short(&peer)
+            );
+        }
+        DiscoveryEvent::ProtocolViolation {
+            peer,
+            source,
+            reason,
+            suppressed,
+        } => {
+            let peer = peer.as_ref().map(short).unwrap_or_else(|| "unknown".into());
+            eprintln!(
+                "[{role}] discovery-violation peer={peer} source={source:?} \
+                 suppressed={suppressed} reason={reason}"
+            );
         }
     }
 }

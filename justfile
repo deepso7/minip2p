@@ -35,6 +35,7 @@ check-nostd:
     cargo check --no-default-features --features smoltcp,pubsub --target thumbv7em-none-eabi -p minip2p-rs
     cargo check --no-default-features --features portable-autonat --target thumbv7em-none-eabi -p minip2p-rs
     cargo check --no-default-features --features portable-relay --target thumbv7em-none-eabi -p minip2p-rs
+    cargo check --no-default-features --features portable-relay,pubsub --target thumbv7em-none-eabi -p minip2p-rs
 
 peer-ping:
     cargo test -p minip2p-peer --test ping

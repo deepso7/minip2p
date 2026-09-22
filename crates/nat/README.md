@@ -79,7 +79,7 @@ loop {
 }
 ```
 
-The `minip2p` crate (cargo feature `nat`) wires exactly this loop into `Endpoint` so applications get `connect(&peer)` / `nat_wait_path(...)` / `take_nat_events()` without touching the pump:
+The `minip2p` crate (cargo feature `nat`) wires exactly this loop into `Endpoint` so applications get `connect(&peer)`, `ConnectSettled`, and `EndpointEvent::Nat(..)` from `Endpoint::wait` without touching the pump. Attempt terminals (`ConnectFailed`, `FellBackToRelay`) are consumed by the Endpoint's Connection-attempt engine and surface only as `ConnectSettled`. The migration-era `nat_wait_path` remains until #181:
 
 ```rust,ignore
 let mut node = minip2p::Endpoint::builder()

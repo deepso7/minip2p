@@ -9,7 +9,7 @@ An `Endpoint` is the main application API. Five ideas explain most code built on
 
 `Endpoint` owns an Ed25519 identity, the transports you bound, and the connection state. It is the app-facing entrypoint for listening, dialing, Ping, Identify, and application streams. QUIC is on by default; add the `tcp` feature to use QUIC and TCP together, or bind only TCP.
 
-An endpoint does not spawn a runtime. Prefer `Endpoint::wait` for the ordered Endpoint event stream (event, deadline, or interrupted). If NAT, pubsub, discovery, or relay-server is enabled, keep using `next_wake` until capability events join the stream (#177) — `wait` does not wake on capability progress. Prefer `connect` plus `ConnectSettled` for a Connection attempt. Focused waits such as `nat_wait_path` and `wait_peer_ready`, plus `next_event` / `next_wake`, remain during migration. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. `poll()` is the non-blocking step for an existing reactor.
+An endpoint does not spawn a runtime. Prefer `Endpoint::wait` for the ordered Endpoint event stream (event, deadline, or interrupted); it also delivers NAT, pubsub, discovery, and relay-server events. Prefer `connect` plus `ConnectSettled` for a Connection attempt. Focused waits such as `nat_wait_path` and `wait_peer_ready`, plus `next_event`, remain during migration. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. `poll()` is the non-blocking step for an existing reactor.
 
 ```mermaid
 flowchart TB
@@ -78,14 +78,15 @@ A Cargo feature makes a capability available. Enable it on `EndpointBuilder`; se
 
 ## Where events go
 
-Ordinary connection, Identify, Ping, and application stream events leave through the Endpoint event stream: `Endpoint::wait`, `poll`, or the migration-era `next_event`. Prefer `wait` for new code — it returns an event, deadline, or interruption without swallowing interrupts, and does not use the old driver-progress wake. If NAT, pubsub, discovery, or relay-server is enabled, keep using `next_wake` until #177 — `wait` does not wake on capability progress.
+Every event leaves through the Endpoint event stream: `Endpoint::wait`, `poll`, or the migration-era `next_event`. Prefer `wait` — it returns an event, deadline, or interruption without swallowing interrupts, and one `wait` loop sees every event exactly once. Connection, Identify, Ping, and application stream events arrive as ordinary `EndpointEvent` variants. Enabled capabilities add variants to the same `#[non_exhaustive]` enum:
 
-Enabled capabilities still expose their own event queues until a later ticket folds them into the stream:
+- `EndpointEvent::Nat(NatEvent)` (`nat`): path transitions, reachability, public addresses, and relay reservations. The attempt outcome is `ConnectSettled`, never a `NatEvent`;
+- `EndpointEvent::Gossipsub(GossipsubEvent)` (`pubsub`);
+- `EndpointEvent::Discovery(DiscoveryEvent)` (`discovery` / `mdns`);
+- `EndpointEvent::RelayServer(RelayServerEvent)` (`relay-server`).
 
-- `take_nat_events` / `next_nat_event`;
-- `take_gossipsub_events` / `next_gossipsub_event`;
-- `take_discovery_events` / `next_discovery_event`.
+The per-capability `take_*_events` / `next_*_event` methods remain as migration APIs until #181; they remove matching events from the same stream.
 
-Durable connection, peer, and bound-address state is available through State snapshot getters (`connected_peers`, `is_peer_ready`, `peer_info`, `connection_id`, `connection_remote_addr`, `bound_addresses`). `bound_addresses` reports transport-bound local addresses and can be non-empty before `listen` starts accepting. Those getters do not drive the endpoint, are not one cross-getter atomic snapshot, and may be ahead of the event stream.
+Durable state is available through State snapshot getters (`connected_peers`, `is_peer_ready`, `peer_info`, `connection_id`, `connection_remote_addr`, `bound_addresses`, and with capabilities `path`, `reachability`, `active_reservation`, `known_peers`). `bound_addresses` reports transport-bound local addresses and can be non-empty before `listen` starts accepting. Those getters do not drive the endpoint, are not one cross-getter atomic snapshot, and may be ahead of the event stream, never behind their own emitted transition.
 
 Continue with [Listen and dial](/rust/listen-and-dial) or the [glossary](/reference/glossary).

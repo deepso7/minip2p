@@ -83,19 +83,19 @@ For this combination, install with `cargo add minip2p-rs --no-default-features -
 
 ## Drive time and network progress
 
-No executor, no background thread. Sample the monotonic clock once, pass that same `Now` into the endpoint, handle every event, then use `next_deadline` to decide how long the board may sleep:
+No executor, no background thread. Sample the monotonic clock once, pass that same `Now` into the endpoint, handle every event, then use `next_deadline` to decide how long the board may sleep. `poll(now)` and `shutdown(now)` return `Vec<EndpointEvent>`; enabled services add `EndpointEvent::Nat`, `EndpointEvent::Gossipsub`, and `EndpointEvent::Discovery` variants:
 
 ```rust
-use minip2p::{Now, SmoltcpEvent};
+use minip2p::{EndpointEvent, Now};
 
 loop {
     let now = Now::from_millis(monotonic_millis());
 
     for event in endpoint.poll(now)? {
         match event {
-            SmoltcpEvent::Endpoint(event) => handle_endpoint_event(event),
-            SmoltcpEvent::Discovery(event) => handle_discovery_event(event),
-            other => handle_optional_service_event(other),
+            EndpointEvent::Discovery(event) => handle_discovery_event(event),
+            EndpointEvent::Gossipsub(event) => handle_pubsub_event(event),
+            other => handle_endpoint_event(other), // EndpointEvent is non-exhaustive
         }
     }
 

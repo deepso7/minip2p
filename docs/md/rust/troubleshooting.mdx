@@ -34,16 +34,16 @@ Start from the observable symptom. Rust methods return immediate failures as `mi
 | `Event::Error` | Record the structured context and decide whether to retry. |
 | `NatEvent::PathEstablished` | Begin traffic with the ordinary stream methods. |
 | `NatEvent::PathUpgraded` | Update path state. Existing peer operations keep working. |
-| `NatEvent::ConnectFailed` | Inspect the error, correct the candidates or infrastructure, and retry. |
+| `EndpointEvent::ConnectSettled` with `ConnectOutcome::Failed` | Inspect the failure, correct the candidates or infrastructure, and retry. |
 | `GossipsubEvent::OutboundFailure` | Retry only if the application requires it. |
 | `DiscoveryEvent::DialFailed` | Keep discovery running. Backoff controls later attempts. |
 
 ## Debug in order
 
-1. Confirm that both endpoints keep calling a focused wait (`nat_wait_path`, `wait_peer_ready`, …), `wait`, `next_wake`, `next_event`, or `poll`. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
+1. Confirm that both endpoints keep calling a focused wait (`nat_wait_path`, `wait_peer_ready`, …), `wait`, `next_event`, or `poll`. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
 2. Log the complete peer address and local peer ID.
 3. Distinguish an authenticated connection from `PeerReady` (Identify).
 4. Confirm both the Cargo feature and its builder method.
-5. Read the event queue owned by the capability you are using.
+5. Match the capability's `EndpointEvent` variant (`Nat`, `Gossipsub`, `Discovery`, `RelayServer`) from `wait` or `poll`, and check durable state with the snapshot getters (`path`, `reachability`, `active_reservation`, `known_peers`).
 
 For the complete capability map, see the [feature matrix](/reference/feature-matrix).

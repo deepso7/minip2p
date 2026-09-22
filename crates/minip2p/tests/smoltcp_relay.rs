@@ -20,7 +20,7 @@ use minip2p::smoltcp::wire::{HardwareAddress, IpCidr};
 use minip2p::{
     ConnectFailure, ConnectOutcome, DriverError, Ed25519Keypair, Endpoint, EndpointEvent,
     EntropySource, Multiaddr, NatConfig, NatEvent, Now, Path, PeerAddr, PeerId, ReservationPolicy,
-    SmoltcpEvent, SmoltcpStack, StreamId, SwarmError,
+    SmoltcpStack, StreamId, SwarmError,
 };
 use minip2p_nat::{AUTONAT_PROTOCOL_ID, HOP_PROTOCOL_ID, STOP_PROTOCOL_ID};
 use minip2p_platform::EntropyError;
@@ -194,12 +194,9 @@ impl RelayService {
     fn handle(
         &mut self,
         endpoint: &mut minip2p::SmoltcpEndpoint<BusDevice, CountingEntropy>,
-        event: SmoltcpEvent,
+        event: EndpointEvent,
         now: Now,
     ) {
-        let SmoltcpEvent::Endpoint(event) = event else {
-            return;
-        };
         match event {
             EndpointEvent::StreamReady {
                 peer_id,
@@ -373,29 +370,29 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
         }
 
         let reserved = b_events.iter().any(|event| {
-            matches!(event, SmoltcpEvent::Nat(NatEvent::RelayReserved { relay, .. })
+            matches!(event, EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })
                 if relay == &relay_peer)
         });
         if reserved && connect_id.is_none() {
             connect_id = Some(a.connect(&b_peer, now).unwrap());
         }
         let a_relayed = a_events.iter().any(|event| {
-            matches!(event, SmoltcpEvent::Nat(NatEvent::PathEstablished {
+            matches!(event, EndpointEvent::Nat(NatEvent::PathEstablished {
                 peer, path: Path::Relayed { relay }, ..
             }) if peer == &b_peer && relay == &relay_peer)
         });
         let b_relayed = b_events.iter().any(|event| {
-            matches!(event, SmoltcpEvent::Nat(NatEvent::InboundPathEstablished {
+            matches!(event, EndpointEvent::Nat(NatEvent::InboundPathEstablished {
                 peer, path: Path::Relayed { relay }
             }) if peer == &a_peer && relay == &relay_peer)
         });
         let a_settled = connect_id.is_some_and(|id| {
             a_events.iter().any(|event| {
-                matches!(event, SmoltcpEvent::Endpoint(EndpointEvent::ConnectSettled {
+                matches!(event, EndpointEvent::ConnectSettled {
                     connect_id: found,
                     outcome: ConnectOutcome::Connected { conn_id },
                     ..
-                }) if *found == id && conn_id.is_circuit())
+                } if *found == id && conn_id.is_circuit())
             })
         });
         if a_relayed && b_relayed && a_settled && app_stream.is_none() {
@@ -404,9 +401,9 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
         if let Some(stream) = app_stream
             && !sent
             && a_events.iter().any(|event| {
-                matches!(event, SmoltcpEvent::Endpoint(EndpointEvent::StreamReady {
+                matches!(event, EndpointEvent::StreamReady {
                     peer_id, stream_id, initiated_locally: true, ..
-                }) if peer_id == &b_peer && *stream_id == stream)
+                } if peer_id == &b_peer && *stream_id == stream)
             })
         {
             a.send_stream(&b_peer, stream, PAYLOAD.to_vec(), now)
@@ -415,9 +412,9 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
         }
         let received = app_stream.is_some_and(|stream| {
             b_events.iter().any(|event| {
-                matches!(event, SmoltcpEvent::Endpoint(EndpointEvent::StreamData {
+                matches!(event, EndpointEvent::StreamData {
                     peer_id, stream_id, data, ..
-                }) if peer_id == &a_peer && *stream_id == stream && data == PAYLOAD)
+                } if peer_id == &a_peer && *stream_id == stream && data == PAYLOAD)
             })
         });
         if received && !relay_cut {
@@ -434,9 +431,9 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
         let circuit_closes = a_events
             .iter()
             .filter(|event| {
-                matches!(event, SmoltcpEvent::Endpoint(EndpointEvent::ConnectionClosed {
+                matches!(event, EndpointEvent::ConnectionClosed {
                     peer_id, conn_id, ..
-                }) if peer_id == &b_peer && conn_id.is_circuit())
+                } if peer_id == &b_peer && conn_id.is_circuit())
             })
             .count();
         if circuit_closes > 0 {
@@ -552,11 +549,11 @@ fn peer_target_on_an_autonat_only_portable_endpoint_settles_no_usable_route() {
         events.iter().any(|event| {
             matches!(
                 event,
-                SmoltcpEvent::Endpoint(EndpointEvent::ConnectSettled {
+                EndpointEvent::ConnectSettled {
                     connect_id,
                     outcome: ConnectOutcome::Failed(ConnectFailure::NoUsableRoute { .. }),
                     ..
-                }) if *connect_id == id
+                } if *connect_id == id
             )
         }),
         "expected NoUsableRoute, got {events:?}"

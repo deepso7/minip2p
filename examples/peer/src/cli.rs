@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use minip2p::{ConnectOutcome, Event, Multiaddr, PeerAddr, PeerId, Protocol};
-use minip2p_example_common::CliError;
+use minip2p_example_common::{CliError, print_nat_event};
 
 /// The modes the CLI dispatches to.
 #[derive(Clone, Debug)]
@@ -388,6 +388,8 @@ pub fn print_event(role: &str, event: &Event) {
                 );
             }
         },
+        Event::Nat(event) => print_nat_event(role, event),
+        other => println!("[{role}] event {other:?}"),
     }
 }
 

@@ -35,6 +35,8 @@ pub use connect::{
 pub(crate) use connect::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS, RelayPolicy};
 mod event_stream;
 pub use event_stream::EndpointEvent;
+#[cfg(any(feature = "nat", feature = "portable-autonat"))]
+pub(crate) use event_stream::nat_event_reaches_application;
 
 #[cfg(feature = "portable-mdns")]
 pub use minip2p_discovery::{
@@ -52,6 +54,12 @@ pub use minip2p_nat::{
 pub use minip2p_pubsub::{
     GOSSIPSUB_PROTOCOL_IDS, GossipsubConfig, GossipsubConfigError, GossipsubEvent, PublishError,
     TopicError,
+};
+// With `std`, the crate root re-exports these from the std module instead;
+// the embedded endpoint still names them here.
+#[cfg(all(feature = "pubsub", feature = "std", feature = "smoltcp"))]
+use minip2p_pubsub::{
+    GossipsubConfig, GossipsubConfigError, GossipsubEvent, PublishError, TopicError,
 };
 #[cfg(feature = "smoltcp")]
 pub use minip2p_tcp::{SmoltcpConfig, SmoltcpStack, SmoltcpTcpProvider, smoltcp};
@@ -502,16 +510,6 @@ impl core::fmt::Display for PortableMdnsConfigError {
     }
 }
 
-/// Event produced by a portable endpoint with mDNS enabled.
-#[cfg(feature = "portable-mdns")]
-#[derive(Clone, Debug)]
-pub enum PortableMdnsEvent {
-    /// Ordinary endpoint protocol or connection progress.
-    Endpoint(EndpointEvent),
-    /// Bounded peer-book and automatic-dial observation.
-    Discovery(DiscoveryEvent),
-}
-
 /// Portable endpoint composed with an injected mDNS carrier.
 #[cfg(feature = "portable-mdns")]
 pub struct PortableMdnsEndpoint<T: Transport, E: EntropySource, I: MdnsIo> {
@@ -589,7 +587,10 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
     }
 
     /// Advances the endpoint, mDNS carrier, and automatic local-peer dialing.
-    pub fn poll(&mut self, now: Now) -> Result<Vec<PortableMdnsEvent>, PortableMdnsError> {
+    ///
+    /// Returns Endpoint events, with peer-book changes as
+    /// [`EndpointEvent::Discovery`] after the step's connection events.
+    pub fn poll(&mut self, now: Now) -> Result<Vec<EndpointEvent>, PortableMdnsError> {
         let mut events = Vec::new();
         self.poll_endpoint(now, &mut events)?;
 
@@ -616,7 +617,7 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
         self.discovery.handle_tick(now.monotonic_ms);
         self.drive_discovery_actions(now)?;
         while let Some(event) = self.discovery.poll_event() {
-            events.push(PortableMdnsEvent::Discovery(event));
+            events.push(EndpointEvent::Discovery(event));
         }
         Ok(events)
     }
@@ -624,11 +625,11 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
     fn poll_endpoint(
         &mut self,
         now: Now,
-        events: &mut Vec<PortableMdnsEvent>,
+        events: &mut Vec<EndpointEvent>,
     ) -> Result<(), DriverError> {
         self.endpoint.tick_connect(now);
         while let Some(event) = self.endpoint.pop_connect_event() {
-            events.push(PortableMdnsEvent::Endpoint(event));
+            events.push(event);
         }
         for event in self.endpoint.poll_runtime(now)? {
             match &event {
@@ -664,10 +665,10 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
             }
             let consumed = self.endpoint.observe_connect(&event, now);
             if !consumed {
-                events.push(PortableMdnsEvent::Endpoint(event.into()));
+                events.push(event.into());
             }
             while let Some(event) = self.endpoint.pop_connect_event() {
-                events.push(PortableMdnsEvent::Endpoint(event));
+                events.push(event);
             }
         }
         Ok(())
@@ -690,14 +691,15 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
     }
 
     /// Sends mDNS goodbyes, closes peers, and consumes the composed endpoint.
-    pub fn shutdown(mut self, now: Now) -> Result<Vec<PortableMdnsEvent>, PortableMdnsError> {
+    ///
+    /// Returns the final Endpoint events, including queued peer-book changes.
+    pub fn shutdown(mut self, now: Now) -> Result<Vec<EndpointEvent>, PortableMdnsError> {
         self.mdns.shutdown(now.monotonic_ms)?;
-        Ok(self
-            .endpoint
-            .shutdown(now)?
-            .into_iter()
-            .map(PortableMdnsEvent::Endpoint)
-            .collect())
+        let mut events = self.endpoint.shutdown(now)?;
+        while let Some(event) = self.discovery.poll_event() {
+            events.push(EndpointEvent::Discovery(event));
+        }
+        Ok(events)
     }
 
     fn drive_discovery_actions(&mut self, now: Now) -> Result<(), PortableMdnsError> {
@@ -933,22 +935,6 @@ pub struct SmoltcpEndpoint<D: smoltcp::phy::Device, E: EntropySource> {
     active_dials: BTreeMap<PeerId, ConnectionId>,
 }
 
-/// Event emitted by the composed embedded endpoint.
-#[cfg(feature = "smoltcp")]
-#[derive(Clone, Debug)]
-pub enum SmoltcpEvent {
-    /// Ordinary connection, Identify, Ping, or application-stream progress.
-    Endpoint(EndpointEvent),
-    /// Application-visible pubsub progress.
-    #[cfg(feature = "pubsub")]
-    Gossipsub(GossipsubEvent),
-    /// Relay reservation, circuit-path, or reachability progress.
-    #[cfg(feature = "portable-autonat")]
-    Nat(minip2p_nat::NatEvent),
-    /// A change or violation from the shared discovery book.
-    Discovery(DiscoveryEvent),
-}
-
 #[cfg(feature = "smoltcp")]
 impl<D: smoltcp::phy::Device, E: EntropySource> core::ops::Deref for SmoltcpEndpoint<D, E> {
     type Target = PortableEndpoint<SmoltcpComposedTransport<D, E>, SharedEntropy<E>>;
@@ -1153,30 +1139,23 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
 
     fn feed_nat_to_connect(&mut self, now: Now) {
         #[cfg(feature = "portable-autonat")]
-        {
-            let events = self
-                .nat
-                .as_ref()
-                .map(nat::PortableNatDriver::unobserved_events)
-                .unwrap_or_default();
-            for event in &events {
+        if let Some(nat) = self.nat.as_mut() {
+            for event in nat.unobserved_events() {
                 self.endpoint.observe_nat_event(event, now);
             }
-            if let Some(nat) = self.nat.as_mut() {
-                nat.mark_observed();
-            }
+            nat.mark_observed();
         }
         #[cfg(not(feature = "portable-autonat"))]
         let _ = now;
     }
 
-    fn emit_connect_events(&mut self, now: Now, output: &mut Vec<SmoltcpEvent>) {
+    fn emit_connect_events(&mut self, now: Now, output: &mut Vec<EndpointEvent>) {
         while let Some(event) = self.endpoint.pop_connect_event() {
             #[cfg(feature = "portable-autonat")]
             self.cancel_nat_leg_on_terminal(&event, now);
             #[cfg(not(feature = "portable-autonat"))]
             let _ = now;
-            output.push(SmoltcpEvent::Endpoint(event));
+            output.push(event);
         }
     }
 
@@ -1197,7 +1176,10 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     }
 
     /// Advances TCP and every configured embedded service once.
-    pub fn poll(&mut self, now: Now) -> Result<Vec<SmoltcpEvent>, SmoltcpDriveError> {
+    ///
+    /// Returns Endpoint events; enabled capabilities report through their
+    /// [`EndpointEvent`] variants.
+    pub fn poll(&mut self, now: Now) -> Result<Vec<EndpointEvent>, SmoltcpDriveError> {
         let mut output = Vec::new();
         self.poll_swarm(now, &mut output)?;
         if let Some(mdns) = self.mdns.as_mut() {
@@ -1240,9 +1222,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         self.emit_connect_events(now, &mut output);
         #[cfg(feature = "portable-autonat")]
         if let Some(nat) = self.nat.as_mut() {
-            for event in nat.take_events() {
-                output.push(SmoltcpEvent::Nat(event));
-            }
+            output.extend(nat.drain_application_events().map(EndpointEvent::Nat));
         }
         if let Some(discovery) = self.discovery.as_mut()
             && discovery.next_timeout(now.monotonic_ms) == Some(0)
@@ -1252,13 +1232,13 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         self.drive_discovery_actions(now)?;
         if let Some(discovery) = self.discovery.as_mut() {
             while let Some(event) = discovery.poll_event() {
-                output.push(SmoltcpEvent::Discovery(event));
+                output.push(EndpointEvent::Discovery(event));
             }
         }
         Ok(output)
     }
 
-    fn poll_swarm(&mut self, now: Now, output: &mut Vec<SmoltcpEvent>) -> Result<(), DriverError> {
+    fn poll_swarm(&mut self, now: Now, output: &mut Vec<EndpointEvent>) -> Result<(), DriverError> {
         self.endpoint.tick_connect(now);
         self.emit_connect_events(now, output);
         for event in self.endpoint.poll_runtime(now)? {
@@ -1313,7 +1293,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
                 pump_embedded_pubsub(agent, &mut self.endpoint, now);
             }
             if !claimed {
-                output.push(SmoltcpEvent::Endpoint(event.into()));
+                output.push(event.into());
             }
             self.feed_nat_to_connect(now);
             self.emit_connect_events(now, output);
@@ -1322,7 +1302,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     }
 
     #[cfg(feature = "pubsub")]
-    fn drive_beacon(&mut self, now: Now, output: &mut Vec<SmoltcpEvent>) {
+    fn drive_beacon(&mut self, now: Now, output: &mut Vec<EndpointEvent>) {
         let Some(beacon) = self.beacon.as_mut() else {
             if let Some(pubsub) = self.gossipsub.as_mut() {
                 collect_embedded_pubsub_events(pubsub, &mut self.pending_gossipsub_events);
@@ -1330,7 +1310,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             output.extend(
                 self.pending_gossipsub_events
                     .drain(..)
-                    .map(SmoltcpEvent::Gossipsub),
+                    .map(EndpointEvent::Gossipsub),
             );
             return;
         };
@@ -1361,7 +1341,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
                     _ => false,
                 };
                 if !consumed {
-                    output.push(SmoltcpEvent::Gossipsub(event));
+                    output.push(EndpointEvent::Gossipsub(event));
                 }
             }
             while let Some(minip2p_discovery::BeaconAction::PublishBeacon { topic, payload }) =
@@ -1376,7 +1356,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             }
             collect_embedded_pubsub_events(pubsub, &mut self.pending_gossipsub_events);
             while let Some(event) = self.pending_gossipsub_events.pop_front() {
-                output.push(SmoltcpEvent::Gossipsub(event));
+                output.push(EndpointEvent::Gossipsub(event));
             }
         }
         if let Some(discovery) = self.discovery.as_mut() {
@@ -1504,17 +1484,50 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         deadline
     }
 
+    /// Queues a Gossipsub event as if the agent produced it and the driver has
+    /// not collected it yet.
+    ///
+    /// Shutdown tests use this. A terminal `shutdown` must still return it.
+    #[doc(hidden)]
+    #[cfg(feature = "pubsub")]
+    pub fn leave_uncollected_gossipsub_event(&mut self, event: GossipsubEvent) {
+        if let Some(agent) = self.gossipsub.as_mut() {
+            agent.enqueue_event(event);
+        }
+    }
+
     /// Sends an mDNS goodbye when enabled, closes peers, and consumes the endpoint.
-    pub fn shutdown(mut self, now: Now) -> Result<Vec<SmoltcpEvent>, SmoltcpDriveError> {
+    ///
+    /// Returns the final Endpoint events, including capability events that
+    /// were still queued and Gossipsub events still held by the agent.
+    /// Connection-close events come first; queued capability events follow.
+    pub fn shutdown(mut self, now: Now) -> Result<Vec<EndpointEvent>, SmoltcpDriveError> {
         if let Some(mdns) = self.mdns.as_mut() {
             mdns.shutdown(now.monotonic_ms)?;
         }
-        Ok(self
-            .endpoint
-            .shutdown(now)?
-            .into_iter()
-            .map(SmoltcpEvent::Endpoint)
-            .collect())
+        #[cfg(feature = "pubsub")]
+        if let Some(agent) = self.gossipsub.as_mut() {
+            collect_embedded_pubsub_events(agent, &mut self.pending_gossipsub_events);
+        }
+        #[cfg(feature = "pubsub")]
+        let gossipsub = core::mem::take(&mut self.pending_gossipsub_events);
+        #[cfg(feature = "portable-autonat")]
+        let nat: Vec<_> = self
+            .nat
+            .as_mut()
+            .map(|nat| nat.drain_application_events().collect())
+            .unwrap_or_default();
+        let mut events = self.endpoint.shutdown(now)?;
+        #[cfg(feature = "portable-autonat")]
+        events.extend(nat.into_iter().map(EndpointEvent::Nat));
+        #[cfg(feature = "pubsub")]
+        events.extend(gossipsub.into_iter().map(EndpointEvent::Gossipsub));
+        if let Some(discovery) = self.discovery.as_mut() {
+            while let Some(event) = discovery.poll_event() {
+                events.push(EndpointEvent::Discovery(event));
+            }
+        }
+        Ok(events)
     }
 }
 
