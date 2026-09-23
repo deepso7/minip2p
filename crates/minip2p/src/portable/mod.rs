@@ -1151,6 +1151,28 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         if let Some(mdns) = self.mdns.as_mut() {
             mdns.shutdown(now.monotonic_ms)?;
         }
+        // Cancel discovery-owned attempts before the endpoint drains, so
+        // their `ConnectSettled::Cancelled` events and any released NAT leg
+        // land in the final output like the other compositions.
+        if let Some(discovery) = self.discovery.as_mut() {
+            let (connect, runtime) = self.endpoint.parts_mut();
+            let work = discovery.shutdown(
+                connect,
+                #[cfg(feature = "portable-autonat")]
+                self.nat.as_mut(),
+                #[cfg(all(feature = "nat", not(feature = "portable-autonat")))]
+                None,
+                runtime,
+                now,
+            );
+            #[cfg(feature = "portable-autonat")]
+            if let Some(nat) = self.nat.as_mut() {
+                let (connect, runtime) = self.endpoint.parts_mut();
+                nat.apply_sweep_work(work, connect, runtime, now);
+            }
+            #[cfg(not(feature = "portable-autonat"))]
+            let _ = work;
+        }
         #[cfg(feature = "pubsub")]
         let gossipsub: Vec<_> = self
             .gossipsub
