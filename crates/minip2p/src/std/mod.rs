@@ -1696,7 +1696,9 @@ impl Endpoint {
     /// endpoint is driven (`next_event` / `poll`), so keep driving after
     /// publishing. Delivery failures are never synchronous errors; they
     /// surface later as [`GossipsubEvent::OutboundFailure`] (or
-    /// [`Event::Error`] runtime events). There is no self-delivery.
+    /// [`Event::Error`] runtime events). There is no self-delivery. The
+    /// configured discovery topic is reserved while discovery is enabled
+    /// and returns [`GossipsubError::DiscoveryTopicReserved`].
     #[cfg(feature = "pubsub")]
     pub fn publish(&mut self, topic: &str, data: impl Into<Vec<u8>>) -> Result<(), GossipsubError> {
         #[cfg(feature = "discovery")]
@@ -1764,7 +1766,7 @@ impl Endpoint {
             .unwrap_or_default()
     }
 
-    /// Returns the discovery driver's last fed monotonic timestamp.
+    /// Returns the discovery driver's current monotonic timestamp.
     ///
     /// This uses the same private clock origin as
     /// `KnownPeer::beacon_last_seen_ms` and `KnownPeer::mdns_last_seen_ms`.
@@ -1772,8 +1774,9 @@ impl Endpoint {
     /// independently created clock. Returns `None` when no discovery source
     /// is active.
     #[cfg(any(feature = "discovery", feature = "mdns"))]
-    pub fn discovery_now_ms(&self) -> Option<u64> {
-        self.discovery.as_ref().map(DiscoveryDriver::now_ms)
+    pub fn discovery_now_ms(&mut self) -> Option<u64> {
+        self.discovery.as_ref()?;
+        Some(self.swarm.now().monotonic_ms)
     }
 
     /// Removes Discovery events from the Endpoint event stream.
@@ -4555,7 +4558,7 @@ mod tests {
     #[cfg(any(feature = "discovery", feature = "mdns"))]
     #[test]
     fn discovery_clock_is_present_only_for_an_active_source() {
-        let inactive = Endpoint::builder()
+        let mut inactive = Endpoint::builder()
             .bind_quic("127.0.0.1:0")
             .expect("bind plain endpoint");
         assert_eq!(inactive.discovery_now_ms(), None);
@@ -4565,7 +4568,7 @@ mod tests {
         let builder = builder.discovery();
         #[cfg(all(feature = "mdns", not(feature = "discovery")))]
         let builder = builder.mdns();
-        let active = builder
+        let mut active = builder
             .bind_quic("127.0.0.1:0")
             .expect("bind discovery endpoint");
         let first = active.discovery_now_ms().expect("discovery clock");

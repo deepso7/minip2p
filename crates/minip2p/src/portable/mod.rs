@@ -924,7 +924,9 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         Ok(pubsub.subscribe(topic, self.endpoint.runtime_mut(), now.monotonic_ms)?)
     }
 
-    /// Withdraws an application topic subscription.
+    /// Withdraws an application topic subscription. The configured
+    /// discovery topic is reserved while discovery is enabled and returns
+    /// [`crate::GossipsubError::DiscoveryTopicReserved`].
     #[cfg(feature = "pubsub")]
     pub fn unsubscribe(&mut self, topic: &str, now: Now) -> Result<bool, crate::GossipsubError> {
         let reserved = self.discovery.as_ref().and_then(|d| d.topic());
@@ -940,7 +942,9 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         )
     }
 
-    /// Publishes one application message.
+    /// Publishes one application message. The configured discovery topic is
+    /// reserved while discovery is enabled and returns
+    /// [`crate::GossipsubError::DiscoveryTopicReserved`].
     #[cfg(feature = "pubsub")]
     pub fn publish(
         &mut self,

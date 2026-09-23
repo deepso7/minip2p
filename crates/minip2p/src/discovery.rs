@@ -107,9 +107,6 @@ pub(crate) struct DiscoveryDriver {
     /// Bound/listened address set last pushed into the beacon.
     #[cfg(feature = "pubsub")]
     last_local_addrs: Vec<Multiaddr>,
-    /// Last monotonic-ms sample fed to the book, so the endpoint can report
-    /// the driver's own timebase without resampling the clock.
-    last_now_ms: u64,
 }
 
 impl DiscoveryDriver {
@@ -124,14 +121,7 @@ impl DiscoveryDriver {
             inflight: BTreeMap::new(),
             #[cfg(feature = "pubsub")]
             last_local_addrs: Vec::new(),
-            last_now_ms: 0,
         }
-    }
-
-    /// The last host-supplied monotonic timestamp, matching `KnownPeer` ages.
-    #[cfg(any(feature = "discovery", feature = "mdns"))]
-    pub(crate) fn now_ms(&self) -> u64 {
-        self.last_now_ms
     }
 
     /// Beacon topic, when signed beacons are configured. Only pubsub-capable
@@ -180,7 +170,6 @@ impl DiscoveryDriver {
     /// Observes connection lifecycle for the book, whichever driver claimed
     /// the event.
     pub(crate) fn observe(&mut self, event: &SwarmEvent, core: &SwarmCore, now_ms: u64) {
-        self.last_now_ms = now_ms;
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 self.book.peer_connected(peer_id, now_ms);
@@ -195,7 +184,6 @@ impl DiscoveryDriver {
     /// Feeds an mDNS observation into the book.
     #[cfg(any(feature = "mdns", feature = "portable-mdns"))]
     pub(crate) fn handle_mdns_event(&mut self, event: MdnsEvent, now_ms: u64) {
-        self.last_now_ms = now_ms;
         match event {
             MdnsEvent::PeerObserved { peer, addrs } => {
                 self.book.observe_mdns(peer, addrs, now_ms);
@@ -211,7 +199,6 @@ impl DiscoveryDriver {
     /// updates the book from the outcome and returns `true` so the endpoint
     /// does not forward the event to the application.
     pub(crate) fn claim_settled(&mut self, event: &EndpointEvent, now_ms: u64) -> bool {
-        self.last_now_ms = now_ms;
         let EndpointEvent::ConnectSettled {
             connect_id,
             peer_id,
@@ -287,7 +274,6 @@ impl DiscoveryDriver {
     ) -> DiscoveryNatWork {
         let mut work = DiscoveryNatWork::default();
         let now_ms = now.monotonic_ms;
-        self.last_now_ms = now_ms;
         loop {
             let mut progressed = false;
 
