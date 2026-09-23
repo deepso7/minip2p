@@ -79,10 +79,10 @@ const { directions, reactions, aspect = 1, class: className, label = "mascot" } 
   const DIZZY_WINDOW = 1600;
   const DIZZY_END = 1100;
   const SQUASH: Keyframe[] = [
-    { transform: "scale(1, 1)", easing: "ease-in" },
-    { transform: "scale(1.10, 0.86)", offset: 0.18, easing: "ease-out" },
-    { transform: "scale(0.95, 1.08)", offset: 0.45, easing: "ease-in-out" },
-    { transform: "scale(1.03, 0.97)", offset: 0.72, easing: "ease-in-out" },
+    { easing: "ease-in", transform: "scale(1, 1)" },
+    { easing: "ease-out", offset: 0.18, transform: "scale(1.10, 0.86)" },
+    { easing: "ease-in-out", offset: 0.45, transform: "scale(0.95, 1.08)" },
+    { easing: "ease-in-out", offset: 0.72, transform: "scale(1.03, 0.97)" },
     { transform: "scale(1, 1)" },
   ];
 
@@ -91,15 +91,20 @@ const { directions, reactions, aspect = 1, class: className, label = "mascot" } 
   const wrap = (angle: number) => Math.atan2(Math.sin(angle), Math.cos(angle));
 
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-mascot]")) {
-    const squash = button.querySelector<HTMLElement>(".mascot-squash")!;
-    const head = button.querySelector<HTMLElement>('[data-layer="directions"]')!;
-    const face = button.querySelector<HTMLElement>('[data-layer="reactions"]')!;
+    const squash = button.querySelector<HTMLElement>(".mascot-squash");
+    const head = button.querySelector<HTMLElement>('[data-layer="directions"]');
+    const face = button.querySelector<HTMLElement>('[data-layer="reactions"]');
+    if (!(squash && head && face)) {
+      continue;
+    }
 
     const look = (direction: Direction) => {
       head.style.backgroundPosition = cell(DIRECTIONS.indexOf(direction));
     };
     const react = (reaction: Reaction | null) => {
-      if (reaction) face.style.backgroundPosition = cell(REACTIONS.indexOf(reaction));
+      if (reaction) {
+        face.style.backgroundPosition = cell(REACTIONS.indexOf(reaction));
+      }
       face.style.opacity = reaction ? "1" : "0";
       head.style.opacity = reaction ? "0" : "1";
     };
@@ -109,7 +114,9 @@ const { directions, reactions, aspect = 1, class: className, label = "mascot" } 
       let pointer: { x: number; y: number } | null = null;
 
       const aim = () => {
-        if (!pointer) return;
+        if (!pointer) {
+          return;
+        }
         const box = button.getBoundingClientRect();
         const dx = pointer.x - (box.left + box.width / 2);
         const dy = pointer.y - (box.top + box.height / 2);
@@ -122,7 +129,9 @@ const { directions, reactions, aspect = 1, class: className, label = "mascot" } 
 
         // Hold the current sector until the pointer is well past its edge.
         const angle = Math.atan2(dy, dx);
-        if (sector !== -1 && Math.abs(wrap(angle - sector * SECTOR)) < SECTOR / 2 + HYSTERESIS) return;
+        if (sector !== -1 && Math.abs(wrap(angle - sector * SECTOR)) < SECTOR / 2 + HYSTERESIS) {
+          return;
+        }
 
         sector = (Math.round(angle / SECTOR) + CLOCKWISE.length) % CLOCKWISE.length;
         look(CLOCKWISE[sector]);
@@ -136,10 +145,12 @@ const { directions, reactions, aspect = 1, class: className, label = "mascot" } 
     }
 
     let timers: number[] = [];
-    const boops = { count: 0, at: 0 };
+    const boops = { at: 0, count: 0 };
 
     button.addEventListener("click", () => {
-      timers.forEach(clearTimeout);
+      for (const timer of timers) {
+        clearTimeout(timer);
+      }
       timers = [];
       const later = (ms: number, next: Reaction | null) => timers.push(setTimeout(() => react(next), ms));
 
@@ -157,7 +168,9 @@ const { directions, reactions, aspect = 1, class: className, label = "mascot" } 
         later(BOOP_END, null);
       }
 
-      if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+      if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        return;
+      }
       // Per-keyframe easing with the effect itself linear: an easing on the effect
       // would reinterpret every offset and front-load the whole bounce.
       squash.animate(SQUASH, { duration: 420, easing: "linear" });

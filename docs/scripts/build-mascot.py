@@ -2,7 +2,7 @@
 """Build the landing-page mascot sprite sheets from public/logo.svg.
 
 The logo is pixel art drawn on a 20-unit grid. This rasterises it onto a 10-unit
-grid, then draws two 3x3 SVG sheets for components/Mascot.astro:
+grid, then draws two 3x3 SVG sheets for components/mascot.astro:
 
   public/mascots/logo-directions.svg  up-left, up, up-right / left, center, right / down-...
   public/mascots/logo-reactions.svg   blink, heart, sparkle / surprised, wink, bashful /
