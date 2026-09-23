@@ -143,17 +143,18 @@ impl<E: EntropySource> NatDriver<E> {
         Some(self.advertised_addrs())
     }
 
-    /// Re-seeds the agent's advertised listen addresses when the bound set
-    /// moved since the last driver turn. Revision-checked, so an unchanged
-    /// set costs one integer compare and no transport read.
+    /// Re-seeds the agent's advertised listen addresses when the listened
+    /// set moved since the last driver turn. Revision-checked, so an
+    /// unchanged set costs one integer compare and no transport read. Uses
+    /// the runtime's recorded listen results rather than bound addresses —
+    /// a transport can report sockets it never listened on.
     fn sync_listen_addrs<T: NatTransport, R: EntropySource>(&mut self, swarm: &SwarmRuntime<T, R>) {
         let revision = swarm.bound_addrs_revision();
         if revision == self.listen_addrs_revision {
             return;
         }
-        let bound = swarm.transport().local_addresses();
         self.agent
-            .set_listen_addrs(&select_direct_addrs(&bound, None, None));
+            .set_listen_addrs(&select_direct_addrs(swarm.listened_addrs(), None, None));
         self.listen_addrs_revision = revision;
     }
 
