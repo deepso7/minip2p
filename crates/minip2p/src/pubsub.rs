@@ -1,5 +1,5 @@
 //! Caller-driven Gossipsub capability shared by standard and portable
-//! Endpoints. Time is supplied by the host; I/O runs through SwarmRuntime.
+//! Endpoints. Time is supplied by the host; I/O runs through `SwarmRuntime`.
 
 use alloc::collections::VecDeque;
 use alloc::string::ToString;
@@ -22,9 +22,9 @@ pub enum GossipsubError {
     #[cfg(any(feature = "std", feature = "smoltcp"))]
     #[error("gossipsub is not enabled on this endpoint (gossipsub or discovery builder opt-in)")]
     NotEnabled,
-    /// The topic is owned by the active discovery driver and cannot be
-    /// withdrawn independently.
-    #[error("cannot unsubscribe from the discovery topic while discovery is enabled")]
+    /// The discovery topic is reserved for signed beacons while discovery
+    /// is enabled: it cannot be unsubscribed from or published to directly.
+    #[error("the discovery topic is reserved while discovery is enabled")]
     DiscoveryTopicReserved,
     /// The publish was refused (topic validation, size, backpressure).
     #[error(transparent)]
@@ -44,9 +44,9 @@ pub(crate) struct GossipsubDriver {
     pub(crate) events: VecDeque<GossipsubEvent>,
 }
 
-/// The `std`/`smoltcp` gates keep portable-mDNS-only builds from carrying
-/// endpoint-facing methods nothing calls there; a `DiscoveryDriver` sweep
-/// still names the type in its signature.
+// The `std`/`smoltcp` gates keep portable-mDNS-only builds from carrying
+// endpoint-facing methods nothing calls there; a `DiscoveryDriver` sweep
+// still names the type in its signature.
 impl GossipsubDriver {
     #[cfg(any(feature = "std", feature = "smoltcp"))]
     pub(crate) fn new(agent: GossipsubAgent) -> Self {
@@ -121,7 +121,7 @@ impl GossipsubDriver {
     /// Removes every queued event `f` claims, returning `true` when it
     /// claimed any. Cross-driver sweeps lift their traffic out of the
     /// application queue with this before the Endpoint drains it.
-    #[cfg(any(feature = "discovery", feature = "mdns", feature = "portable-mdns"))]
+    #[cfg(feature = "_discovery-driver")]
     pub(crate) fn extract_events(&mut self, mut f: impl FnMut(&GossipsubEvent) -> bool) -> bool {
         let mut claimed = false;
         let mut retained = VecDeque::new();

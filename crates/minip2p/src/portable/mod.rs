@@ -23,6 +23,8 @@ pub use minip2p_swarm::{
 pub use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
 pub(crate) mod connect;
+#[cfg(feature = "portable-autonat")]
+use connect::cancel_attempt;
 pub use connect::{
     CandidateFailure, ConnectFailure, ConnectId, ConnectOutcome, ConnectTarget, ConnectTargetError,
     RelayFailure,
@@ -524,7 +526,7 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
         Ok(admit_connect(
             connect,
             runtime,
-            #[cfg(any(feature = "nat", feature = "portable-autonat"))]
+            #[cfg(feature = "_nat-driver")]
             None,
             ConnectAdmission {
                 peer,
@@ -532,7 +534,7 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
                 allow_relay: false,
             },
             &mut expand_concrete,
-            now,
+            now.monotonic_ms,
         ))
     }
 
@@ -566,16 +568,16 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
         let (connect, runtime) = self.endpoint.parts_mut();
         // The sweep's NAT work is dropped: this composition carries no NAT
         // driver, so its attempts never had a leg to attach.
-        self.discovery.sweep(
+        drop(self.discovery.sweep(
             #[cfg(feature = "pubsub")]
             None,
-            #[cfg(any(feature = "nat", feature = "portable-autonat"))]
+            #[cfg(feature = "_nat-driver")]
             None,
             connect,
             runtime,
             &mut expand_concrete,
             now,
-        );
+        ));
         // The sweep can admit attempts that settle immediately; surface them
         // now so `claim_settled` clears `inflight` in the same poll.
         self.emit_connect_events(now, &mut events);
@@ -633,13 +635,14 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
     pub fn shutdown(mut self, now: Now) -> Result<Vec<EndpointEvent>, PortableDriveError> {
         self.mdns.shutdown(now.monotonic_ms)?;
         let (connect, runtime) = self.endpoint.parts_mut();
-        self.discovery.shutdown(
+        // Same as the sweep above: no NAT driver means no work to apply.
+        drop(self.discovery.shutdown(
             connect,
-            #[cfg(any(feature = "nat", feature = "portable-autonat"))]
+            #[cfg(feature = "_nat-driver")]
             None,
             runtime,
             now,
-        );
+        ));
         let mut events = self.endpoint.shutdown(now)?;
         self.discovery.drain_events(&mut events);
         Ok(events)
@@ -851,7 +854,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             runtime,
             #[cfg(feature = "portable-autonat")]
             self.nat.as_ref(),
-            #[cfg(all(feature = "nat", not(feature = "portable-autonat")))]
+            #[cfg(all(feature = "_nat-driver", not(feature = "portable-autonat")))]
             None,
             ConnectAdmission {
                 peer: peer.clone(),
@@ -859,7 +862,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
                 allow_relay: true,
             },
             &mut expand_concrete,
-            now,
+            now.monotonic_ms,
         );
         #[cfg(feature = "portable-autonat")]
         if let Some(nat) = self.nat.as_mut() {
@@ -876,14 +879,12 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     /// cancelled only through this inherent method.
     pub fn cancel_connect(&mut self, id: ConnectId, now: Now) {
         #[cfg(feature = "portable-autonat")]
-        match self.nat.as_mut() {
-            Some(nat) => {
-                let (connect, runtime) = self.endpoint.parts_mut();
-                if nat.cancel_leg(connect, id, runtime, now) {
-                    nat.pump(runtime, now);
-                }
+        {
+            let (connect, runtime) = self.endpoint.parts_mut();
+            let needs_pump = cancel_attempt(connect, self.nat.as_mut(), id, runtime, now);
+            if needs_pump && let Some(nat) = self.nat.as_mut() {
+                nat.pump(runtime, now);
             }
-            None => self.endpoint.cancel_connect(id),
         }
         #[cfg(not(feature = "portable-autonat"))]
         self.endpoint.cancel_connect(id);
@@ -989,8 +990,6 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             {
                 continue;
             }
-            #[cfg(not(feature = "portable-autonat"))]
-            let _ = now;
             output.push(event);
         }
     }
@@ -1037,7 +1036,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
                 self.gossipsub.as_mut(),
                 #[cfg(feature = "portable-autonat")]
                 self.nat.as_mut(),
-                #[cfg(all(feature = "nat", not(feature = "portable-autonat")))]
+                #[cfg(all(feature = "_nat-driver", not(feature = "portable-autonat")))]
                 None,
                 connect,
                 runtime,
@@ -1048,9 +1047,12 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             if let Some(nat) = self.nat.as_mut() {
                 let (connect, runtime) = self.endpoint.parts_mut();
                 nat.apply_sweep_work(work, connect, runtime, now);
+                // Leg attach can queue a synchronous terminal the sweep's
+                // claim pass already ran past.
+                discovery.claim_nat_events(nat, connect, runtime, now.monotonic_ms);
             }
             #[cfg(not(feature = "portable-autonat"))]
-            let _ = work;
+            drop(work);
         }
         self.feed_nat_to_connect(now);
         #[cfg(feature = "portable-autonat")]
@@ -1061,10 +1063,15 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         if let Some(pubsub) = self.gossipsub.as_mut() {
             output.extend(pubsub.events.drain(..).map(EndpointEvent::Gossipsub));
         }
+        // Claim attempt terminals before draining the book, so the updates
+        // `claim_settled` records surface in this poll's discovery events.
+        // Unclaimed attempt events still come after capability output.
+        let mut settled = Vec::new();
+        self.emit_connect_events(now, &mut settled);
         if let Some(discovery) = self.discovery.as_mut() {
             discovery.drain_events(&mut output);
         }
-        self.emit_connect_events(now, &mut output);
+        output.extend(settled);
         Ok(output)
     }
 
@@ -1163,7 +1170,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
                 connect,
                 #[cfg(feature = "portable-autonat")]
                 self.nat.as_mut(),
-                #[cfg(all(feature = "nat", not(feature = "portable-autonat")))]
+                #[cfg(all(feature = "_nat-driver", not(feature = "portable-autonat")))]
                 None,
                 runtime,
                 now,
@@ -1172,9 +1179,10 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             if let Some(nat) = self.nat.as_mut() {
                 let (connect, runtime) = self.endpoint.parts_mut();
                 nat.apply_sweep_work(work, connect, runtime, now);
+                discovery.claim_nat_events(nat, connect, runtime, now.monotonic_ms);
             }
             #[cfg(not(feature = "portable-autonat"))]
-            let _ = work;
+            drop(work);
         }
         // The shutdown pump can queue NAT terminal events; let the Connection
         // engine observe them before the application drain filters them out.

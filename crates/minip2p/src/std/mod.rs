@@ -47,9 +47,9 @@ mod relay_server;
 #[cfg(feature = "pubsub")]
 use crate::GossipsubError;
 #[cfg(any(feature = "discovery", feature = "mdns"))]
-pub use crate::discovery::DiscoveryError;
-#[cfg(any(feature = "discovery", feature = "mdns"))]
 use crate::discovery::{DiscoveryDriver, resolve_book_candidates};
+#[cfg(feature = "nat")]
+use crate::portable::connect::cancel_attempt;
 use crate::portable::connect::{ConnectAdmission, admit_connect};
 #[cfg(feature = "pubsub")]
 use crate::pubsub::GossipsubDriver;
@@ -142,6 +142,19 @@ pub enum EndpointWaitOutcome {
 }
 
 const DEFAULT_AGENT_VERSION: &str = concat!("minip2p/", env!("CARGO_PKG_VERSION"));
+
+/// Errors from discovery-focused endpoint waits.
+#[cfg(any(feature = "discovery", feature = "mdns"))]
+#[derive(Debug, thiserror::Error)]
+pub enum DiscoveryError {
+    /// No discovery source was enabled with the endpoint builder.
+    #[error("discovery is not enabled on this endpoint")]
+    NotEnabled,
+    /// The endpoint failed while driving the swarm.
+    #[error(transparent)]
+    Driver(#[from] minip2p_swarm::DriverError),
+}
+
 #[cfg(feature = "relay-server")]
 const RELAY_HOP_PROTOCOL_ID: &str = "/libp2p/circuit/relay/0.2.0/hop";
 #[cfg(feature = "relay-server")]
@@ -523,7 +536,7 @@ impl Endpoint {
             self.swarm.runtime_mut(),
             #[cfg(feature = "nat")]
             self.nat.as_ref(),
-            #[cfg(all(feature = "portable-autonat", not(feature = "nat")))]
+            #[cfg(all(feature = "_nat-driver", not(feature = "nat")))]
             None,
             ConnectAdmission {
                 peer: peer.clone(),
@@ -531,7 +544,7 @@ impl Endpoint {
                 allow_relay,
             },
             &mut dial::expand_dial_targets,
-            now,
+            now.monotonic_ms,
         );
         #[cfg(feature = "nat")]
         if let Some(nat) = self.nat.as_mut() {
@@ -553,14 +566,18 @@ impl Endpoint {
     /// Idempotent. Settled or unknown ids are a no-op. Never disconnects.
     pub fn cancel_connect(&mut self, id: ConnectId) {
         #[cfg(feature = "nat")]
-        match self.nat.as_mut() {
-            Some(nat) => {
-                let now = self.swarm.now();
-                if nat.cancel_leg(&mut self.connect, id, self.swarm.runtime_mut(), now) {
-                    nat.pump(self.swarm.runtime_mut(), now);
-                }
+        {
+            let now = self.swarm.now();
+            let needs_pump = cancel_attempt(
+                &mut self.connect,
+                self.nat.as_mut(),
+                id,
+                self.swarm.runtime_mut(),
+                now,
+            );
+            if needs_pump && let Some(nat) = self.nat.as_mut() {
+                nat.pump(self.swarm.runtime_mut(), now);
             }
-            None => self.connect.cancel(id, self.swarm.runtime_mut()),
         }
         #[cfg(not(feature = "nat"))]
         self.connect.cancel(id, self.swarm.runtime_mut());
@@ -1140,20 +1157,25 @@ impl Endpoint {
             let work = discovery.sweep(
                 #[cfg(feature = "pubsub")]
                 self.gossipsub.as_mut(),
-                #[cfg(feature = "nat")]
                 self.nat.as_mut(),
                 &mut self.connect,
                 self.swarm.runtime_mut(),
                 &mut dial::expand_dial_targets,
                 now,
             );
-            #[cfg(feature = "nat")]
+            // Both discovery features imply `nat`.
             if let Some(nat) = self.nat.as_mut() {
-                let now = self.swarm.now();
                 nat.apply_sweep_work(work, &self.connect, self.swarm.runtime_mut(), now);
+                // Attaching a leg can queue a synchronous terminal the
+                // sweep's claim pass already ran past; the engine must
+                // observe it before the capability drain filters it out.
+                discovery.claim_nat_events(
+                    nat,
+                    &mut self.connect,
+                    self.swarm.runtime_mut(),
+                    now.monotonic_ms,
+                );
             }
-            #[cfg(not(feature = "nat"))]
-            let _ = work;
         }
         #[cfg(any(feature = "nat", feature = "relay-server"))]
         self.refresh_external_address_contributions();
@@ -1825,18 +1847,20 @@ impl Endpoint {
             let now = self.swarm.now();
             let work = discovery.shutdown(
                 &mut self.connect,
-                #[cfg(feature = "nat")]
                 self.nat.as_mut(),
                 self.swarm.runtime_mut(),
                 now,
             );
-            #[cfg(feature = "nat")]
+            // `mdns` implies `nat`.
             if let Some(nat) = self.nat.as_mut() {
-                let now = self.swarm.now();
                 nat.apply_sweep_work(work, &self.connect, self.swarm.runtime_mut(), now);
+                discovery.claim_nat_events(
+                    nat,
+                    &mut self.connect,
+                    self.swarm.runtime_mut(),
+                    now.monotonic_ms,
+                );
             }
-            #[cfg(not(feature = "nat"))]
-            let _ = work;
         }
         result
     }

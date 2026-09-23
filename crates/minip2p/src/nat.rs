@@ -9,10 +9,10 @@ use alloc::{
 };
 use minip2p_platform::{EntropySource, Now as PlatformNow};
 
-#[cfg(any(feature = "nat", feature = "portable-relay"))]
+#[cfg(feature = "_circuit-driver")]
 use minip2p_circuit::{AdoptError, BridgeAdoption, CircuitRole, CircuitTransport};
 use minip2p_core::{ConnectId, Multiaddr, PeerId, Protocol, select_direct_addrs};
-#[cfg(any(feature = "nat", feature = "portable-relay"))]
+#[cfg(feature = "_circuit-driver")]
 use minip2p_nat::BridgeRole;
 use minip2p_nat::{
     ConnectLegs, NatAction, NatAgent, NatEvent, Now, Path, PromoteError, ReachabilityState,
@@ -155,7 +155,7 @@ impl<E: EntropySource> NatDriver<E> {
     }
 
     /// Returns the currently held relay reservation, when any.
-    #[cfg(any(feature = "nat", feature = "portable-relay"))]
+    #[cfg(feature = "_circuit-driver")]
     pub(crate) fn active_reservation(&self) -> Option<&minip2p_nat::ReservationInfo> {
         self.agent.active_reservation()
     }
@@ -305,7 +305,7 @@ impl<E: EntropySource> NatDriver<E> {
                 id,
                 peer,
                 ConnectLegs {
-                    direct_racing: connect.is_direct_racing(id),
+                    direct_racing: connect.dialed_direct(id),
                     allow_relay,
                 },
                 swarm,
@@ -317,7 +317,10 @@ impl<E: EntropySource> NatDriver<E> {
     /// Applies the work a `DiscoveryDriver` sweep queued: attaches legs for
     /// attempts automatic dialing admitted, then pumps once when a leg was
     /// cancelled. Call it right after the sweep.
-    #[cfg(any(feature = "discovery", feature = "mdns", feature = "portable-mdns"))]
+    #[cfg(any(
+        feature = "portable-autonat",
+        all(feature = "nat", any(feature = "discovery", feature = "mdns"))
+    ))]
     pub(crate) fn apply_sweep_work<T: NatTransport, R: EntropySource>(
         &mut self,
         work: crate::discovery::DiscoveryNatWork,
@@ -325,8 +328,8 @@ impl<E: EntropySource> NatDriver<E> {
         swarm: &mut SwarmRuntime<T, R>,
         sample: PlatformNow,
     ) {
-        for (id, peer, allow_relay) in work.legs {
-            self.attach_leg(connect, id, peer, allow_relay, swarm, sample);
+        for leg in work.legs {
+            self.attach_leg(connect, leg.id, leg.peer, leg.allow_relay, swarm, sample);
         }
         if work.pump {
             self.pump(swarm, sample);
@@ -376,14 +379,14 @@ impl<E: EntropySource> NatDriver<E> {
 
     /// Returns the queued event at `index`, including ones the Connection
     /// engine has not observed yet.
-    #[cfg(any(feature = "discovery", feature = "mdns", feature = "portable-autonat"))]
+    #[cfg(all(feature = "_nat-driver", feature = "_discovery-driver"))]
     pub(crate) fn event_at(&self, index: usize) -> Option<&NatEvent> {
         self.events.get(index)
     }
 
     /// Removes the queued event at `index`, keeping the observation cursor
     /// aligned. The discovery sweep uses this to claim attempt events.
-    #[cfg(any(feature = "discovery", feature = "mdns", feature = "portable-autonat"))]
+    #[cfg(all(feature = "_nat-driver", feature = "_discovery-driver"))]
     pub(crate) fn remove_event(&mut self, index: usize) -> NatEvent {
         let event = self.events.remove(index).expect("queued NAT event");
         self.note_removed(index);
@@ -415,7 +418,7 @@ impl<E: EntropySource> NatDriver<E> {
 
     /// Keeps the observation cursor aligned when the discovery sweep removes
     /// an attempt event it owns.
-    #[cfg(any(feature = "discovery", feature = "mdns", feature = "portable-autonat"))]
+    #[cfg(all(feature = "_nat-driver", feature = "_discovery-driver"))]
     fn note_removed(&mut self, index: usize) {
         if index < self.observed {
             self.observed -= 1;
@@ -434,7 +437,7 @@ impl<E: EntropySource> NatDriver<E> {
     }
 
     /// Returns the latest usable NAT-orchestrated path for `peer`.
-    #[cfg(any(feature = "nat", feature = "portable-relay"))]
+    #[cfg(feature = "_circuit-driver")]
     pub(crate) fn path(&self, peer: &PeerId) -> Option<Path> {
         self.paths.get(peer).cloned()
     }
@@ -567,7 +570,7 @@ impl<E: EntropySource> NatDriver<E> {
                     self.agent.promote_result(token, Ok(existing), now);
                     return;
                 }
-                #[cfg(not(any(feature = "nat", feature = "portable-relay")))]
+                #[cfg(not(feature = "_circuit-driver"))]
                 {
                     let _ = (relay, remote_peer, role, pending_data, remote_write_closed);
                     self.agent.promote_result(
@@ -576,7 +579,7 @@ impl<E: EntropySource> NatDriver<E> {
                         now,
                     );
                 }
-                #[cfg(any(feature = "nat", feature = "portable-relay"))]
+                #[cfg(feature = "_circuit-driver")]
                 {
                     swarm.forget_stream(inner_conn, stream_id);
                     let adoption = BridgeAdoption {
@@ -724,11 +727,11 @@ pub(crate) trait NatTransport: Transport {
     fn inject_bridge_closed(&mut self, _conn: ConnectionId, _stream: StreamId) {}
     fn inject_bridge_remote_write_closed(&mut self, _conn: ConnectionId, _stream: StreamId) {}
     fn inject_bridge_data(&mut self, _conn: ConnectionId, _stream: StreamId, _data: Vec<u8>) {}
-    #[cfg(any(feature = "nat", feature = "portable-relay"))]
+    #[cfg(feature = "_circuit-driver")]
     fn adopt_bridge(&mut self, _adoption: BridgeAdoption) -> Result<ConnectionId, AdoptError> {
         Err(AdoptError::UnknownConnection)
     }
-    #[cfg(any(feature = "nat", feature = "portable-relay"))]
+    #[cfg(feature = "_circuit-driver")]
     fn reset_bridge(
         &mut self,
         conn: ConnectionId,
@@ -738,7 +741,7 @@ pub(crate) trait NatTransport: Transport {
     }
 }
 
-#[cfg(any(feature = "nat", feature = "portable-relay"))]
+#[cfg(feature = "_circuit-driver")]
 impl<T: Transport, E: EntropySource> NatTransport for CircuitTransport<T, E> {
     fn contains_circuit(&self, id: ConnectionId) -> bool {
         self.contains_circuit(id)

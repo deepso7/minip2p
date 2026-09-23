@@ -121,14 +121,14 @@ pub enum EndpointEvent {
     /// transition such as `NatEvent::PathUpgraded` can still follow its
     /// attempt's `ConnectSettled` when the attempt settled on a provisional
     /// Relayed path first.
-    #[cfg(any(feature = "nat", feature = "portable-autonat"))]
+    #[cfg(feature = "_nat-driver")]
     Nat(minip2p_nat::NatEvent),
     /// Gossipsub output: messages, subscription changes, and diagnostics.
     /// Discovery-owned beacon-topic traffic never appears here.
     #[cfg(feature = "pubsub")]
     Gossipsub(minip2p_pubsub::GossipsubEvent),
     /// Discovery peer-book changes from signed beacons and mDNS.
-    #[cfg(any(feature = "discovery", feature = "mdns", feature = "portable-mdns"))]
+    #[cfg(feature = "_discovery-driver")]
     Discovery(minip2p_discovery::DiscoveryEvent),
     /// Relay-service output: reservations, circuits, and runtime errors.
     #[cfg(feature = "relay-server")]

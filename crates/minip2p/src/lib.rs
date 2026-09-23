@@ -12,9 +12,9 @@
 
 extern crate alloc;
 
-#[cfg(any(feature = "discovery", feature = "mdns", feature = "portable-mdns"))]
+#[cfg(feature = "_discovery-driver")]
 mod discovery;
-#[cfg(any(feature = "nat", feature = "portable-autonat"))]
+#[cfg(feature = "_nat-driver")]
 mod nat;
 mod portable;
 #[cfg(all(
