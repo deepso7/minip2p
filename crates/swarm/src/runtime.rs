@@ -88,9 +88,9 @@ pub struct SwarmRuntime<T: Transport, E: EntropySource> {
     external_addresses_revision: u64,
 
     /// Bumped by every successful `listen*` call so drivers can notice a
-    /// moved bound-address set without re-reading the transport each turn.
-    /// Binding through [`SwarmRuntime::transport_mut`] bypasses it.
-    bound_addrs_revision: u64,
+    /// moved listened-address set without re-reading the transport each
+    /// turn. Binding through [`SwarmRuntime::transport_mut`] bypasses it.
+    listened_addrs_revision: u64,
 
     /// Resolved addresses every successful `listen*` call returned, deduped.
     /// `Transport::local_addresses` can report bound-but-not-listening
@@ -123,7 +123,7 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
             after_event_actions: VecDeque::new(),
             external_addresses: Vec::new(),
             external_addresses_revision: 0,
-            bound_addrs_revision: 0,
+            listened_addrs_revision: 0,
             listened_addrs: Vec::new(),
             entropy,
         }
@@ -155,14 +155,14 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         self.external_addresses_revision
     }
 
-    /// Returns the wrapping revision of the transport's bound-address set.
+    /// Returns the wrapping revision of the listened-address set.
     ///
     /// Every successful `listen*` call bumps it, letting drivers refresh
-    /// cached bound addresses without asking the transport each turn.
+    /// cached listen addresses without asking the transport each turn.
     /// Binding directly through [`SwarmRuntime::transport_mut`] does not
     /// bump it.
-    pub fn bound_addrs_revision(&self) -> u64 {
-        self.bound_addrs_revision
+    pub fn listened_addrs_revision(&self) -> u64 {
+        self.listened_addrs_revision
     }
 
     /// Returns the resolved addresses the transport has confirmed it listens
@@ -183,7 +183,7 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
     /// Returns a mutable reference to the underlying transport.
     ///
     /// Listeners bound through this escape hatch are invisible to
-    /// [`SwarmRuntime::bound_addrs_revision`]; prefer the `listen*` methods.
+    /// [`SwarmRuntime::listened_addrs_revision`]; prefer the `listen*` methods.
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
     }
@@ -282,13 +282,19 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         self.core.is_peer_connected(peer_id)
     }
 
+    /// Bumps the listened-address revision and records `addr` (deduped)
+    /// after a successful `Transport::listen`.
+    fn record_listen(&mut self, addr: &Multiaddr) {
+        self.listened_addrs_revision = self.listened_addrs_revision.wrapping_add(1);
+        if !self.listened_addrs.contains(addr) {
+            self.listened_addrs.push(addr.clone());
+        }
+    }
+
     /// Start listening on the given multiaddr and return the resolved local address.
     pub fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, DriverError> {
         let bound = self.transport.listen(addr)?;
-        self.bound_addrs_revision = self.bound_addrs_revision.wrapping_add(1);
-        if !self.listened_addrs.contains(&bound) {
-            self.listened_addrs.push(bound.clone());
-        }
+        self.record_listen(&bound);
         Ok(bound)
     }
 
@@ -310,12 +316,9 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         let mut resolved = Vec::with_capacity(addrs.len());
         for addr in addrs {
             let addr = self.transport.listen(&addr)?;
-            // A later bind may still fail, leaving this one bound — the
-            // revision must track each successful bind, not the batch.
-            self.bound_addrs_revision = self.bound_addrs_revision.wrapping_add(1);
-            if !self.listened_addrs.contains(&addr) {
-                self.listened_addrs.push(addr.clone());
-            }
+            // A later bind may still fail, leaving this one bound — record
+            // each successful bind, not the batch.
+            self.record_listen(&addr);
             let peer_addr = PeerAddr::new(addr, self.local_peer_id.clone()).map_err(|e| {
                 TransportError::InvalidConfig {
                     reason: format!("failed to build local PeerAddr: {e}"),
@@ -340,10 +343,7 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
                 reason: "transport does not expose a bound local address".into(),
             })?;
         let addr = self.transport.listen(&addr)?;
-        self.bound_addrs_revision = self.bound_addrs_revision.wrapping_add(1);
-        if !self.listened_addrs.contains(&addr) {
-            self.listened_addrs.push(addr.clone());
-        }
+        self.record_listen(&addr);
         Ok(
             PeerAddr::new(addr, self.local_peer_id.clone()).map_err(|e| {
                 TransportError::InvalidConfig {

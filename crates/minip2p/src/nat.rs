@@ -53,7 +53,7 @@ pub(crate) struct NatDriver<E> {
     /// Direct public addresses confirmed by AutoNAT.
     public_addrs: Vec<Multiaddr>,
     /// Exact adopted bridge keys mapped to their promoted circuit ids.
-    pub(crate) promoted: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
+    promoted: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
     /// Authoritative usable NAT-orchestrated path by remote peer.
     paths: BTreeMap<PeerId, Path>,
     /// How many queued events the Connection engine has already observed.
@@ -149,7 +149,7 @@ impl<E: EntropySource> NatDriver<E> {
     /// the runtime's recorded listen results rather than bound addresses —
     /// a transport can report sockets it never listened on.
     fn sync_listen_addrs<T: NatTransport, R: EntropySource>(&mut self, swarm: &SwarmRuntime<T, R>) {
-        let revision = swarm.bound_addrs_revision();
+        let revision = swarm.listened_addrs_revision();
         if revision == self.listen_addrs_revision {
             return;
         }
@@ -213,6 +213,9 @@ impl<E: EntropySource> NatDriver<E> {
         swarm: &mut SwarmRuntime<T, R>,
         sample: PlatformNow,
     ) {
+        // A fresh listen must seed even when the agent has no due work —
+        // the seed is what arms the probe timers that would otherwise
+        // keep this tick early-returning forever.
         self.sync_listen_addrs(swarm);
         let now = to_nat_now(sample);
         if self.agent.next_timeout(now.mono_ms) != Some(0) {
@@ -355,6 +358,12 @@ impl<E: EntropySource> NatDriver<E> {
     #[cfg(all(test, feature = "nat", feature = "quic"))]
     pub(crate) fn listen_addrs(&self) -> &[Multiaddr] {
         self.agent.listen_addrs()
+    }
+
+    /// The adopted-bridge to promoted-circuit map, for test assertions.
+    #[cfg(all(test, feature = "nat", feature = "quic"))]
+    pub(crate) fn promoted(&self) -> &BTreeMap<(ConnectionId, StreamId), ConnectionId> {
+        &self.promoted
     }
 
     /// Executes one agent action against the swarm and echoes synchronous

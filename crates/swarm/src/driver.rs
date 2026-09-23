@@ -1154,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    fn bound_addrs_revision_counts_each_successful_listen() {
+    fn listened_addrs_revision_counts_each_successful_listen() {
         let keypair = Ed25519Keypair::generate();
         let identify = IdentifyConfig {
             protocol_version: "test/1".into(),
@@ -1169,14 +1169,14 @@ mod tests {
             keypair.peer_id(),
         );
 
-        assert_eq!(swarm.runtime().bound_addrs_revision(), 0);
+        assert_eq!(swarm.runtime().listened_addrs_revision(), 0);
         // The first bound address listens; the second fails — the earlier
         // bind stays live, so the revision must reflect it, and the
         // listened set must contain only the address that accepted.
         swarm
             .listen_on_bound_addrs()
             .expect_err("second bind fails");
-        assert_eq!(swarm.runtime().bound_addrs_revision(), 1);
+        assert_eq!(swarm.runtime().listened_addrs_revision(), 1);
         assert_eq!(
             swarm.runtime().listened_addrs(),
             ["/ip4/127.0.0.1/tcp/4001".parse().unwrap()]

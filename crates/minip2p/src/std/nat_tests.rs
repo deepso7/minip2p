@@ -401,7 +401,7 @@ fn execute(driver: &mut NatDriver, action: NatAction, endpoint: &mut Endpoint) {
 }
 
 fn circuit_id(driver: &NatDriver, key: (ConnectionId, StreamId)) -> ConnectionId {
-    *driver.promoted.get(&key).expect("promoted bridge entry")
+    *driver.promoted().get(&key).expect("promoted bridge entry")
 }
 
 #[test]
@@ -539,7 +539,7 @@ fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently(
     assert_eq!(pair.local.swarm.transport().circuit_ids(), vec![promoted]);
 
     execute(&mut driver, duplicate, &mut pair.local);
-    assert_eq!(driver.promoted.len(), 1);
+    assert_eq!(driver.promoted().len(), 1);
     assert_eq!(pair.local.swarm.transport().circuit_ids(), vec![promoted]);
     assert!(driver.bridge_reset_attempts.is_empty());
 
@@ -555,7 +555,7 @@ fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently(
         pair.local.swarm.runtime_mut(),
         minip2p_platform::Now::from_millis(10),
     ));
-    assert!(driver.promoted.contains_key(&key));
+    assert!(driver.promoted().contains_key(&key));
     assert!(!driver.ingest(
         &SwarmEvent::StreamData {
             peer_id: pair.relay_addr.peer_id().clone(),
@@ -577,7 +577,7 @@ fn driver_promotes_idempotently_routes_exact_stragglers_and_closes_idempotently(
         NatAction::CloseCircuit { conn_id: promoted },
         &mut pair.local,
     );
-    assert!(driver.promoted.is_empty());
+    assert!(driver.promoted().is_empty());
     assert!(pair.local.swarm.transport().circuit_ids().is_empty());
     match pair.relay.next_event(std::time::Duration::from_millis(10)) {
         Ok(_) | Err(_) => {}
@@ -630,8 +630,8 @@ fn promotion_uses_action_connection_after_same_batch_relay_supersede() {
     );
 
     execute(&mut driver, promotion, &mut pair.local);
-    assert!(driver.promoted.contains_key(&(old_conn, stream)));
-    assert!(!driver.promoted.contains_key(&(replacement, stream)));
+    assert!(driver.promoted().contains_key(&(old_conn, stream)));
+    assert!(!driver.promoted().contains_key(&(replacement, stream)));
     assert!(!driver.ingest(
         &SwarmEvent::StreamData {
             peer_id: relay_peer,
@@ -650,7 +650,7 @@ fn driver_resets_failed_adoptions_but_not_unknown_connections() {
     let failed_key = (failed_pair.inner_conn, failed_pair.stream);
     let (mut failed, action) = promotion_driver(&failed_pair, true);
     execute(&mut failed, action, &mut failed_pair.local);
-    assert!(failed.promoted.is_empty());
+    assert!(failed.promoted().is_empty());
     assert_eq!(failed.bridge_reset_attempts, vec![failed_key]);
 
     let mut unknown_pair = negotiated_bridge();
@@ -660,7 +660,7 @@ fn driver_resets_failed_adoptions_but_not_unknown_connections() {
         *inner_conn = missing;
     }
     execute(&mut unknown, action, &mut unknown_pair.local);
-    assert!(unknown.promoted.is_empty());
+    assert!(unknown.promoted().is_empty());
     assert!(unknown.bridge_reset_attempts.is_empty());
     assert!(
         unknown_pair
@@ -703,7 +703,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
         closed_pair.local.swarm.runtime_mut(),
         minip2p_platform::Now::from_millis(10),
     ));
-    assert!(!closed.promoted.contains_key(&closed_key));
+    assert!(!closed.promoted().contains_key(&closed_key));
 
     // An inner relay connection close drops every circuit riding it.
     let mut inner_pair = negotiated_bridge();
@@ -720,7 +720,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
         inner_pair.local.swarm.runtime_mut(),
         minip2p_platform::Now::from_millis(10),
     );
-    assert!(!inner.promoted.contains_key(&inner_key));
+    assert!(!inner.promoted().contains_key(&inner_key));
     let events = inner_pair
         .local
         .swarm
@@ -746,7 +746,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
         circuit_pair.local.swarm.runtime_mut(),
         minip2p_platform::Now::from_millis(10),
     );
-    assert!(!circuit.promoted.contains_key(&circuit_key));
+    assert!(!circuit.promoted().contains_key(&circuit_key));
 
     // Reconciliation catches transport-side removal even if no lifecycle
     // event passed through the driver.
@@ -765,7 +765,7 @@ fn driver_prunes_promotions_on_every_external_cleanup_path() {
         swept_pair.local.swarm.runtime_mut(),
         minip2p_platform::Now::from_millis(10),
     );
-    assert!(swept.promoted.is_empty());
+    assert!(swept.promoted().is_empty());
 }
 
 #[test]
@@ -812,6 +812,6 @@ fn remote_bridge_reset_closes_promoted_circuit() {
         circuit_failed,
         "remote RESET_STREAM did not fail the promoted circuit"
     );
-    assert!(!driver.promoted.contains_key(&key));
+    assert!(!driver.promoted().contains_key(&key));
     assert!(pair.local.swarm.transport().circuit_ids().is_empty());
 }
