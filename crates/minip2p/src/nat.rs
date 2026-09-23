@@ -20,6 +20,9 @@ use minip2p_nat::{
 use minip2p_swarm::{SwarmEvent, SwarmRuntime};
 use minip2p_transport::{ConnectionId, StreamId, Transport};
 
+use crate::EndpointEvent;
+use crate::portable::connect::ConnectEngine;
+
 /// Converts a host time sample into the agent's clock pair.
 pub(crate) fn to_nat_now(now: PlatformNow) -> Now {
     Now {
@@ -96,6 +99,30 @@ impl<E: EntropySource> NatDriver<E> {
     /// no-op.
     pub(crate) fn cancel(&mut self, id: ConnectId, now: PlatformNow) {
         self.agent.cancel(id, to_nat_now(now));
+    }
+
+    /// Cancels `id` in the Connection-attempt engine and, while the attempt
+    /// is still pending, its NAT leg. Returns `true` when the leg was
+    /// cancelled and the caller must `pump` the queued actions; pumping
+    /// needs the composition's concrete [`NatTransport`], so it stays at
+    /// the call site.
+    ///
+    /// The pending check runs before the engine cancel: `ConnectEngine`
+    /// forgets the attempt once it settles, but the agent would still close
+    /// a provisional relayed path the engine already settled on.
+    pub(crate) fn cancel_leg<T: Transport, R: EntropySource>(
+        &mut self,
+        connect: &mut ConnectEngine,
+        id: ConnectId,
+        swarm: &mut SwarmRuntime<T, R>,
+        now: PlatformNow,
+    ) -> bool {
+        let pending = connect.is_pending(id);
+        connect.cancel(id, swarm);
+        if pending {
+            self.cancel(id, now);
+        }
+        pending
     }
 
     /// Registers a pending connect with the agent and immediately executes
@@ -260,6 +287,88 @@ impl<E: EntropySource> NatDriver<E> {
         self.events.iter().skip(self.observed)
     }
 
+    /// Attaches the attempt's NAT leg while it is still pending. Compositions
+    /// call this right after `admit_connect`; keeping the attach at the call
+    /// site lets shared admission stay transport-agnostic while the leg
+    /// needs the composition's concrete [`NatTransport`].
+    pub(crate) fn attach_leg<T: NatTransport, R: EntropySource>(
+        &mut self,
+        connect: &ConnectEngine,
+        id: ConnectId,
+        peer: PeerId,
+        allow_relay: bool,
+        swarm: &mut SwarmRuntime<T, R>,
+        sample: PlatformNow,
+    ) {
+        if connect.is_pending(id) {
+            self.connect(
+                id,
+                peer,
+                ConnectLegs {
+                    direct_racing: connect.is_direct_racing(id),
+                    allow_relay,
+                },
+                swarm,
+                sample,
+            );
+        }
+    }
+
+    /// Applies the work a `DiscoveryDriver` sweep queued: attaches legs for
+    /// attempts automatic dialing admitted, then pumps once when a leg was
+    /// cancelled. Call it right after the sweep.
+    #[cfg(any(feature = "discovery", feature = "mdns", feature = "portable-mdns"))]
+    pub(crate) fn apply_sweep_work<T: NatTransport, R: EntropySource>(
+        &mut self,
+        work: crate::discovery::DiscoveryNatWork,
+        connect: &ConnectEngine,
+        swarm: &mut SwarmRuntime<T, R>,
+        sample: PlatformNow,
+    ) {
+        for (id, peer, allow_relay) in work.legs {
+            self.attach_leg(connect, id, peer, allow_relay, swarm, sample);
+        }
+        if work.pump {
+            self.pump(swarm, sample);
+        }
+    }
+
+    /// Lets the Connection-attempt engine observe NAT output it has not seen
+    /// yet, by reference; the events stay queued for the application.
+    pub(crate) fn feed_unobserved_to_connect<T: NatTransport, R: EntropySource>(
+        &mut self,
+        connect: &mut ConnectEngine,
+        swarm: &mut SwarmRuntime<T, R>,
+        sample: PlatformNow,
+    ) {
+        let now_ms = sample.monotonic_ms;
+        for event in self.unobserved_events() {
+            connect.observe_nat(event, swarm, now_ms);
+        }
+        self.mark_observed();
+    }
+
+    /// Cancels the attempt's NAT leg when `event` is a failed or cancelled
+    /// Connection-attempt terminal. Connected and unrelated events are a
+    /// no-op: a settled provisional path is the leg to keep.
+    pub(crate) fn cancel_leg_on_terminal<T: NatTransport, R: EntropySource>(
+        &mut self,
+        event: &EndpointEvent,
+        swarm: &mut SwarmRuntime<T, R>,
+        sample: PlatformNow,
+    ) {
+        let EndpointEvent::ConnectSettled {
+            connect_id,
+            outcome: crate::ConnectOutcome::Failed(_) | crate::ConnectOutcome::Cancelled,
+            ..
+        } = event
+        else {
+            return;
+        };
+        self.cancel(*connect_id, sample);
+        self.pump(swarm, sample);
+    }
+
     /// Marks every currently queued event as seen by the Connection engine.
     pub(crate) fn mark_observed(&mut self) {
         self.observed = self.events.len();
@@ -267,14 +376,14 @@ impl<E: EntropySource> NatDriver<E> {
 
     /// Returns the queued event at `index`, including ones the Connection
     /// engine has not observed yet.
-    #[cfg(any(feature = "discovery", feature = "mdns"))]
+    #[cfg(any(feature = "discovery", feature = "mdns", feature = "portable-autonat"))]
     pub(crate) fn event_at(&self, index: usize) -> Option<&NatEvent> {
         self.events.get(index)
     }
 
     /// Removes the queued event at `index`, keeping the observation cursor
     /// aligned. The discovery sweep uses this to claim attempt events.
-    #[cfg(any(feature = "discovery", feature = "mdns"))]
+    #[cfg(any(feature = "discovery", feature = "mdns", feature = "portable-autonat"))]
     pub(crate) fn remove_event(&mut self, index: usize) -> NatEvent {
         let event = self.events.remove(index).expect("queued NAT event");
         self.note_removed(index);
@@ -306,7 +415,7 @@ impl<E: EntropySource> NatDriver<E> {
 
     /// Keeps the observation cursor aligned when the discovery sweep removes
     /// an attempt event it owns.
-    #[cfg(any(feature = "discovery", feature = "mdns"))]
+    #[cfg(any(feature = "discovery", feature = "mdns", feature = "portable-autonat"))]
     fn note_removed(&mut self, index: usize) {
         if index < self.observed {
             self.observed -= 1;

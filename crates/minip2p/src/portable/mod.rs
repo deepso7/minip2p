@@ -1,10 +1,6 @@
 extern crate alloc;
 
-#[cfg(feature = "portable-mdns")]
-use alloc::collections::BTreeMap;
-#[cfg(all(feature = "smoltcp", feature = "pubsub"))]
-use alloc::collections::VecDeque;
-#[cfg(feature = "portable-mdns")]
+#[cfg(feature = "smoltcp")]
 use alloc::string::ToString;
 use alloc::{string::String, vec::Vec};
 
@@ -26,13 +22,15 @@ pub use minip2p_swarm::{
 };
 pub use minip2p_transport::{ConnectionId, StreamId, Transport, TransportError};
 
-mod connect;
+pub(crate) mod connect;
 pub use connect::{
     CandidateFailure, ConnectFailure, ConnectId, ConnectOutcome, ConnectTarget, ConnectTargetError,
     RelayFailure,
 };
+#[cfg(feature = "portable-mdns")]
+use connect::{ConnectAdmission, admit_connect};
 #[cfg(feature = "std")]
-pub(crate) use connect::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS, RelayPolicy};
+pub(crate) use connect::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS};
 mod event_stream;
 pub use event_stream::EndpointEvent;
 
@@ -56,16 +54,18 @@ pub use minip2p_pubsub::{
 // With `std`, the crate root re-exports these from the std module instead;
 // the embedded endpoint still names them here.
 #[cfg(all(feature = "pubsub", feature = "std", feature = "smoltcp"))]
-use minip2p_pubsub::{
-    GossipsubConfig, GossipsubConfigError, GossipsubEvent, PublishError, TopicError,
-};
+use minip2p_pubsub::{GossipsubConfig, GossipsubConfigError, GossipsubEvent, TopicError};
 #[cfg(feature = "smoltcp")]
 pub use minip2p_tcp::{SmoltcpConfig, SmoltcpStack, SmoltcpTcpProvider, smoltcp};
 #[cfg(feature = "tcp")]
 pub use minip2p_tcp::{TcpConfig, TcpProvider, TcpTransport};
 
+#[cfg(feature = "portable-mdns")]
+use crate::discovery::{DiscoveryDriver, resolve_book_candidates};
 #[cfg(feature = "portable-autonat")]
 use crate::nat::NatDriver;
+#[cfg(all(feature = "smoltcp", feature = "pubsub"))]
+use crate::pubsub::GossipsubDriver;
 
 /// Portable endpoint entry point when the std `Endpoint` is not compiled.
 ///
@@ -199,36 +199,6 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         self.connect.cancel(id, &mut self.runtime);
     }
 
-    #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
-    pub(crate) fn admit_connect(
-        &mut self,
-        peer: PeerId,
-        candidates: Vec<PeerAddr>,
-        extra_failed: Vec<connect::CandidateFailure>,
-        relay: connect::RelayPolicy,
-        now: Now,
-    ) -> ConnectId {
-        self.connect.connect_candidates(
-            peer,
-            candidates,
-            extra_failed,
-            relay,
-            &mut self.runtime,
-            now.monotonic_ms,
-        )
-    }
-
-    #[cfg(feature = "portable-autonat")]
-    pub(crate) fn is_connect_pending(&self, id: ConnectId) -> bool {
-        self.connect.is_pending(id)
-    }
-
-    #[cfg(feature = "portable-autonat")]
-    pub(crate) fn observe_nat_event(&mut self, event: &minip2p_nat::NatEvent, now: Now) {
-        self.connect
-            .observe_nat(event, &mut self.runtime, now.monotonic_ms);
-    }
-
     pub(crate) fn tick_connect(&mut self, now: Now) {
         self.connect.tick(&mut self.runtime, now.monotonic_ms);
     }
@@ -242,6 +212,13 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
     #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
     pub(crate) fn pop_connect_event(&mut self) -> Option<EndpointEvent> {
         self.connect.pop_event()
+    }
+
+    /// Splits the endpoint into its Connection engine and runtime so shared
+    /// drivers can borrow both at once.
+    #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
+    pub(crate) fn parts_mut(&mut self) -> (&mut connect::ConnectEngine, &mut SwarmRuntime<T, E>) {
+        (&mut self.connect, &mut self.runtime)
     }
 
     #[cfg(any(feature = "portable-mdns", feature = "smoltcp"))]
@@ -465,11 +442,15 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         let agent =
             minip2p_mdns::MdnsAgent::new(self.peer_id().clone(), mdns_config.clone(), seed)?;
         let local_peer_id = self.peer_id().clone();
+        let book = minip2p_discovery::PeerDiscoveryAgent::new(local_peer_id, discovery_config)?;
         Ok(PortableMdnsEndpoint {
             endpoint: self,
             mdns: minip2p_mdns::MdnsDriver::new(agent, io, &mdns_config),
-            discovery: minip2p_discovery::PeerDiscoveryAgent::new(local_peer_id, discovery_config)?,
-            active_dials: BTreeMap::new(),
+            discovery: DiscoveryDriver::new(
+                book,
+                #[cfg(feature = "pubsub")]
+                None,
+            ),
         })
     }
 }
@@ -491,8 +472,7 @@ pub enum PortableMdnsConfigError {
 pub struct PortableMdnsEndpoint<T: Transport, E: EntropySource, I: MdnsIo> {
     endpoint: PortableEndpoint<T, E>,
     mdns: minip2p_mdns::MdnsDriver<I>,
-    discovery: minip2p_discovery::PeerDiscoveryAgent,
-    active_dials: BTreeMap<PeerId, ConnectionId>,
+    discovery: DiscoveryDriver,
 }
 
 #[cfg(feature = "portable-mdns")]
@@ -517,7 +497,7 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> core::ops::DerefMut
 impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
     /// Returns the bounded, TTL-aware peer book populated by mDNS.
     pub fn known_peers(&self) -> Vec<KnownPeer> {
-        self.discovery.known_peers()
+        self.discovery.book.known_peers()
     }
 
     /// Admits one Connection attempt. A Peer-ID target uses the mDNS book.
@@ -535,19 +515,23 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
     ) -> Result<ConnectId, ConnectTargetError> {
         let target = target.try_into().map_err(Into::into)?;
         let peer = target.peer_id().clone();
-        let mut candidates = target.candidates().to_vec();
-        if candidates.is_empty() {
-            candidates =
-                minip2p_core::select_direct_addrs(&self.discovery.known_addrs(&peer), None, None)
-                    .into_iter()
-                    .filter_map(|addr| PeerAddr::new(addr, peer.clone()).ok())
-                    .collect();
-        }
-        Ok(self.endpoint.admit_connect(
-            peer,
-            candidates,
-            Vec::new(),
-            connect::RelayPolicy::None,
+        let candidates = resolve_book_candidates(
+            Some(&self.discovery.book),
+            &peer,
+            target.candidates().to_vec(),
+        );
+        let (connect, runtime) = self.endpoint.parts_mut();
+        Ok(admit_connect(
+            connect,
+            runtime,
+            #[cfg(any(feature = "nat", feature = "portable-autonat"))]
+            None,
+            ConnectAdmission {
+                peer,
+                candidates,
+                allow_relay: false,
+            },
+            &mut expand_concrete,
             now,
         ))
     }
@@ -566,35 +550,33 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
     ///
     /// Returns Endpoint events, with peer-book changes as
     /// [`EndpointEvent::Discovery`] after the step's connection events.
-    pub fn poll(&mut self, now: Now) -> Result<Vec<EndpointEvent>, PortableMdnsError> {
+    pub fn poll(&mut self, now: Now) -> Result<Vec<EndpointEvent>, PortableDriveError> {
         let mut events = Vec::new();
         self.poll_endpoint(now, &mut events)?;
 
-        let local_addrs = self.endpoint.stats().bound_addresses;
+        let local_addrs = self.endpoint.bound_addresses();
         self.mdns.tick(now.monotonic_ms, &local_addrs)?;
         // The mDNS carrier drives the shared interface. That may place TCP
         // bytes into a socket after the transport was serviced above, so run
         // the endpoint once more before computing a sleep deadline.
         self.poll_endpoint(now, &mut events)?;
         while let Some(event) = self.mdns.poll_event() {
-            match event {
-                MdnsEvent::PeerObserved { peer, addrs } => {
-                    self.discovery.observe_mdns(peer, addrs, now.monotonic_ms);
-                }
-                MdnsEvent::ProtocolViolation { peer, reason } => {
-                    self.discovery.report_violation(
-                        peer,
-                        minip2p_discovery::DiscoverySource::Mdns,
-                        &reason,
-                    );
-                }
-            }
+            self.discovery.handle_mdns_event(event, now.monotonic_ms);
         }
-        self.discovery.handle_tick(now.monotonic_ms);
-        self.drive_discovery_actions(now)?;
-        while let Some(event) = self.discovery.poll_event() {
-            events.push(EndpointEvent::Discovery(event));
-        }
+        let (connect, runtime) = self.endpoint.parts_mut();
+        // The sweep's NAT work is dropped: this composition carries no NAT
+        // driver, so its attempts never had a leg to attach.
+        self.discovery.sweep(
+            #[cfg(feature = "pubsub")]
+            None,
+            #[cfg(any(feature = "nat", feature = "portable-autonat"))]
+            None,
+            connect,
+            runtime,
+            &mut expand_concrete,
+            now,
+        );
+        self.discovery.drain_events(&mut events);
         Ok(events)
     }
 
@@ -604,50 +586,26 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
         events: &mut Vec<EndpointEvent>,
     ) -> Result<(), DriverError> {
         self.endpoint.tick_connect(now);
-        while let Some(event) = self.endpoint.pop_connect_event() {
-            events.push(event);
-        }
+        self.emit_connect_events(now, events);
         for event in self.endpoint.poll_runtime(now)? {
-            match &event {
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    self.active_dials.remove(peer_id);
-                    self.discovery.dial_succeeded(peer_id, now.monotonic_ms);
-                    self.discovery.peer_connected(peer_id, now.monotonic_ms);
-                }
-                SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                    self.discovery.peer_disconnected(peer_id, now.monotonic_ms);
-                }
-                SwarmEvent::Error(error) => {
-                    if let Some(peer_id) = remove_failed_autodial(
-                        &mut self.active_dials,
-                        error.peer_id.as_ref(),
-                        error.conn_id,
-                    ) {
-                        self.discovery
-                            .dial_failed(&peer_id, &error.detail, now.monotonic_ms);
-                    }
-                }
-                SwarmEvent::DialFailed {
-                    conn_id, reason, ..
-                } => {
-                    if let Some(peer_id) =
-                        remove_failed_autodial(&mut self.active_dials, None, Some(*conn_id))
-                    {
-                        self.discovery
-                            .dial_failed(&peer_id, reason, now.monotonic_ms);
-                    }
-                }
-                _ => {}
-            }
             let consumed = self.endpoint.observe_connect(&event, now);
+            self.discovery
+                .observe(&event, self.endpoint.runtime().core(), now.monotonic_ms);
             if !consumed {
                 events.push(event.into());
             }
-            while let Some(event) = self.endpoint.pop_connect_event() {
-                events.push(event);
-            }
+            self.emit_connect_events(now, events);
         }
         Ok(())
+    }
+
+    fn emit_connect_events(&mut self, now: Now, events: &mut Vec<EndpointEvent>) {
+        while let Some(event) = self.endpoint.pop_connect_event() {
+            if self.discovery.claim_settled(&event, now.monotonic_ms) {
+                continue;
+            }
+            events.push(event);
+        }
     }
 
     /// Returns the earliest endpoint or mDNS deadline.
@@ -669,93 +627,37 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
     /// Sends mDNS goodbyes, closes peers, and consumes the composed endpoint.
     ///
     /// Returns the final Endpoint events, including queued peer-book changes.
-    pub fn shutdown(mut self, now: Now) -> Result<Vec<EndpointEvent>, PortableMdnsError> {
+    pub fn shutdown(mut self, now: Now) -> Result<Vec<EndpointEvent>, PortableDriveError> {
         self.mdns.shutdown(now.monotonic_ms)?;
+        let (connect, runtime) = self.endpoint.parts_mut();
+        self.discovery.shutdown(
+            connect,
+            #[cfg(any(feature = "nat", feature = "portable-autonat"))]
+            None,
+            runtime,
+            now,
+        );
         let mut events = self.endpoint.shutdown(now)?;
-        while let Some(event) = self.discovery.poll_event() {
-            events.push(EndpointEvent::Discovery(event));
-        }
+        self.discovery.drain_events(&mut events);
         Ok(events)
     }
-
-    fn drive_discovery_actions(&mut self, now: Now) -> Result<(), PortableMdnsError> {
-        while let Some(action) = self.discovery.poll_action() {
-            match action {
-                minip2p_discovery::DiscoveryAction::Dial { peer, addrs, .. } => {
-                    let mut started = None;
-                    let mut last_error = None;
-                    for address in addrs {
-                        let Ok(target) = PeerAddr::new(address, peer.clone()) else {
-                            continue;
-                        };
-                        match self.endpoint.dial(&target) {
-                            Ok(connection) => {
-                                started = Some(connection);
-                                break;
-                            }
-                            Err(error) => last_error = Some(error),
-                        }
-                    }
-                    if let Some(connection) = started {
-                        self.active_dials.insert(peer, connection);
-                    } else {
-                        let reason = last_error
-                            .map(|error| error.to_string())
-                            .unwrap_or_else(|| "mDNS supplied no dialable address".into());
-                        self.discovery.dial_failed(&peer, &reason, now.monotonic_ms);
-                    }
-                }
-                minip2p_discovery::DiscoveryAction::CancelDial { peer } => {
-                    if let Some(connection) = self.active_dials.remove(&peer) {
-                        let close = self
-                            .endpoint
-                            .runtime_mut()
-                            .transport_mut()
-                            .close(connection);
-                        match close {
-                            Ok(())
-                            | Err(
-                                TransportError::ConnectionNotFound { .. }
-                                | TransportError::InvalidState { .. },
-                            ) => {}
-                            Err(error) => return Err(DriverError::from(error).into()),
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
+/// Candidate expansion for portable compositions: addresses are already
+/// concrete, so expansion is the identity.
 #[cfg(feature = "portable-mdns")]
-fn remove_failed_autodial(
-    active: &mut BTreeMap<PeerId, ConnectionId>,
-    peer_id: Option<&PeerId>,
-    connection: Option<ConnectionId>,
-) -> Option<PeerId> {
-    let peer = peer_id
-        .filter(|peer| active.contains_key(*peer))
-        .cloned()
-        .or_else(|| {
-            connection.and_then(|failed| {
-                active
-                    .iter()
-                    .find_map(|(peer, current)| (*current == failed).then(|| peer.clone()))
-            })
-        })?;
-    active.remove(&peer);
-    Some(peer)
+fn expand_concrete(addr: &PeerAddr) -> Result<Vec<PeerAddr>, String> {
+    Ok(alloc::vec![addr.clone()])
 }
 
-/// Failure while driving a portable endpoint with mDNS.
+/// Failure while driving a composed portable endpoint (mDNS or smoltcp).
 #[cfg(feature = "portable-mdns")]
 #[derive(Debug, thiserror::Error)]
-pub enum PortableMdnsError {
+pub enum PortableDriveError {
     /// Endpoint transport or swarm failure.
     #[error(transparent)]
     Endpoint(#[from] DriverError),
-    /// mDNS carrier failure.
+    /// The mDNS carrier failed.
     #[error(transparent)]
     Mdns(#[from] MdnsError),
 }
@@ -878,15 +780,10 @@ pub struct SmoltcpEndpoint<D: smoltcp::phy::Device, E: EntropySource> {
     endpoint: PortableEndpoint<SmoltcpComposedTransport<D, E>, SharedEntropy<E>>,
     mdns: Option<minip2p_mdns::MdnsDriver<SmoltcpMdnsIo<D>>>,
     #[cfg(feature = "pubsub")]
-    gossipsub: Option<minip2p_pubsub::GossipsubAgent>,
-    #[cfg(feature = "pubsub")]
-    pending_gossipsub_events: VecDeque<GossipsubEvent>,
-    #[cfg(feature = "pubsub")]
-    beacon: Option<minip2p_discovery::BeaconAgent>,
+    gossipsub: Option<GossipsubDriver>,
     #[cfg(feature = "portable-autonat")]
     nat: Option<NatDriver<SharedEntropy<E>>>,
-    discovery: Option<minip2p_discovery::PeerDiscoveryAgent>,
-    active_dials: BTreeMap<PeerId, ConnectionId>,
+    discovery: Option<DiscoveryDriver>,
 }
 
 #[cfg(feature = "smoltcp")]
@@ -940,61 +837,32 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     ) -> Result<ConnectId, ConnectTargetError> {
         let target = target.try_into().map_err(Into::into)?;
         let peer = target.peer_id().clone();
-        let mut candidates = target.candidates().to_vec();
-        if candidates.is_empty()
-            && let Some(discovery) = self.discovery.as_ref()
-        {
-            candidates =
-                minip2p_core::select_direct_addrs(&discovery.known_addrs(&peer), None, None)
-                    .into_iter()
-                    .filter_map(|addr| PeerAddr::new(addr, peer.clone()).ok())
-                    .collect();
+        let candidates = resolve_book_candidates(
+            self.discovery.as_ref().map(|discovery| &discovery.book),
+            &peer,
+            target.candidates().to_vec(),
+        );
+        let (connect, runtime) = self.endpoint.parts_mut();
+        let id = admit_connect(
+            connect,
+            runtime,
+            #[cfg(feature = "portable-autonat")]
+            self.nat.as_ref(),
+            #[cfg(all(feature = "nat", not(feature = "portable-autonat")))]
+            None,
+            ConnectAdmission {
+                peer: peer.clone(),
+                candidates,
+                allow_relay: true,
+            },
+            &mut expand_concrete,
+            now,
+        );
+        #[cfg(feature = "portable-autonat")]
+        if let Some(nat) = self.nat.as_mut() {
+            let (connect, runtime) = self.endpoint.parts_mut();
+            nat.attach_leg(connect, id, peer, true, runtime, now);
         }
-
-        #[cfg(feature = "portable-autonat")]
-        let relay = match &self.nat {
-            Some(nat) if nat.has_relay() => {
-                if nat.force_relay() {
-                    connect::RelayPolicy::Forced
-                } else {
-                    connect::RelayPolicy::Race
-                }
-            }
-            _ => connect::RelayPolicy::None,
-        };
-        #[cfg(not(feature = "portable-autonat"))]
-        let relay = connect::RelayPolicy::None;
-
-        #[cfg(feature = "portable-autonat")]
-        let candidates = if matches!(relay, connect::RelayPolicy::Forced) {
-            Vec::new()
-        } else {
-            candidates
-        };
-
-        let direct_racing = !candidates.is_empty();
-        let id = self
-            .endpoint
-            .admit_connect(peer.clone(), candidates, Vec::new(), relay, now);
-
-        #[cfg(feature = "portable-autonat")]
-        if let Some(nat) = self.nat.as_mut()
-            && self.endpoint.is_connect_pending(id)
-        {
-            nat.connect(
-                id,
-                peer,
-                minip2p_nat::ConnectLegs {
-                    direct_racing,
-                    allow_relay: true,
-                },
-                self.endpoint.runtime_mut(),
-                now,
-            );
-        }
-        #[cfg(not(feature = "portable-autonat"))]
-        let _ = (direct_racing, peer);
-
         self.feed_nat_to_connect(now);
         Ok(id)
     }
@@ -1005,13 +873,17 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     /// cancelled only through this inherent method.
     pub fn cancel_connect(&mut self, id: ConnectId, now: Now) {
         #[cfg(feature = "portable-autonat")]
-        let cancel_leg = self.endpoint.is_connect_pending(id);
-        self.endpoint.cancel_connect(id);
-        #[cfg(feature = "portable-autonat")]
-        if cancel_leg && let Some(nat) = self.nat.as_mut() {
-            nat.cancel(id, now);
-            nat.pump(self.endpoint.runtime_mut(), now);
+        match self.nat.as_mut() {
+            Some(nat) => {
+                let (connect, runtime) = self.endpoint.parts_mut();
+                if nat.cancel_leg(connect, id, runtime, now) {
+                    nat.pump(runtime, now);
+                }
+            }
+            None => self.endpoint.cancel_connect(id),
         }
+        #[cfg(not(feature = "portable-autonat"))]
+        self.endpoint.cancel_connect(id);
         self.feed_nat_to_connect(now);
     }
 
@@ -1040,35 +912,28 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
 
     /// Subscribes to an application topic.
     #[cfg(feature = "pubsub")]
-    pub fn subscribe(&mut self, topic: &str, now: Now) -> Result<bool, SmoltcpGossipsubError> {
-        let agent = self
+    pub fn subscribe(&mut self, topic: &str, now: Now) -> Result<bool, crate::GossipsubError> {
+        let pubsub = self
             .gossipsub
             .as_mut()
-            .ok_or(SmoltcpGossipsubError::NotEnabled)?;
-        let subscribed = agent.subscribe(topic, now.monotonic_ms)?;
-        pump_embedded_pubsub(agent, &mut self.endpoint, now);
-        collect_embedded_pubsub_events(agent, &mut self.pending_gossipsub_events);
-        Ok(subscribed)
+            .ok_or(crate::GossipsubError::NotEnabled)?;
+        Ok(pubsub.subscribe(topic, self.endpoint.runtime_mut(), now.monotonic_ms)?)
     }
 
     /// Withdraws an application topic subscription.
     #[cfg(feature = "pubsub")]
-    pub fn unsubscribe(&mut self, topic: &str, now: Now) -> Result<bool, SmoltcpGossipsubError> {
-        if self
-            .beacon
-            .as_ref()
-            .is_some_and(|beacon| beacon.topic() == topic)
-        {
-            return Err(SmoltcpGossipsubError::DiscoveryTopicReserved);
-        }
-        let agent = self
+    pub fn unsubscribe(&mut self, topic: &str, now: Now) -> Result<bool, crate::GossipsubError> {
+        let reserved = self.discovery.as_ref().and_then(|d| d.topic());
+        let pubsub = self
             .gossipsub
             .as_mut()
-            .ok_or(SmoltcpGossipsubError::NotEnabled)?;
-        let removed = agent.unsubscribe(topic, now.monotonic_ms);
-        pump_embedded_pubsub(agent, &mut self.endpoint, now);
-        collect_embedded_pubsub_events(agent, &mut self.pending_gossipsub_events);
-        Ok(removed)
+            .ok_or(crate::GossipsubError::NotEnabled)?;
+        pubsub.unsubscribe(
+            topic,
+            reserved,
+            self.endpoint.runtime_mut(),
+            now.monotonic_ms,
+        )
     }
 
     /// Publishes one application message.
@@ -1078,21 +943,19 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         topic: &str,
         data: impl Into<Vec<u8>>,
         now: Now,
-    ) -> Result<(), SmoltcpGossipsubError> {
-        if self
-            .beacon
-            .as_ref()
-            .is_some_and(|beacon| beacon.topic() == topic)
-        {
-            return Err(SmoltcpGossipsubError::DiscoveryTopicReserved);
-        }
-        let agent = self
+    ) -> Result<(), crate::GossipsubError> {
+        let reserved = self.discovery.as_ref().and_then(|d| d.topic());
+        let pubsub = self
             .gossipsub
             .as_mut()
-            .ok_or(SmoltcpGossipsubError::NotEnabled)?;
-        agent.publish(topic, data.into(), now.monotonic_ms)?;
-        pump_embedded_pubsub(agent, &mut self.endpoint, now);
-        collect_embedded_pubsub_events(agent, &mut self.pending_gossipsub_events);
+            .ok_or(crate::GossipsubError::NotEnabled)?;
+        pubsub.publish(
+            topic,
+            data.into(),
+            reserved,
+            self.endpoint.runtime_mut(),
+            now.monotonic_ms,
+        )?;
         Ok(())
     }
 
@@ -1100,17 +963,15 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     pub fn known_peers(&self) -> Vec<KnownPeer> {
         self.discovery
             .as_ref()
-            .map(minip2p_discovery::PeerDiscoveryAgent::known_peers)
+            .map(|discovery| discovery.book.known_peers())
             .unwrap_or_default()
     }
 
     fn feed_nat_to_connect(&mut self, now: Now) {
         #[cfg(feature = "portable-autonat")]
         if let Some(nat) = self.nat.as_mut() {
-            for event in nat.unobserved_events() {
-                self.endpoint.observe_nat_event(event, now);
-            }
-            nat.mark_observed();
+            let (connect, runtime) = self.endpoint.parts_mut();
+            nat.feed_unobserved_to_connect(connect, runtime, now);
         }
         #[cfg(not(feature = "portable-autonat"))]
         let _ = now;
@@ -1120,6 +981,11 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         while let Some(event) = self.endpoint.pop_connect_event() {
             #[cfg(feature = "portable-autonat")]
             self.cancel_nat_leg_on_terminal(&event, now);
+            if let Some(discovery) = self.discovery.as_mut()
+                && discovery.claim_settled(&event, now.monotonic_ms)
+            {
+                continue;
+            }
             #[cfg(not(feature = "portable-autonat"))]
             let _ = now;
             output.push(event);
@@ -1128,17 +994,8 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
 
     #[cfg(feature = "portable-autonat")]
     fn cancel_nat_leg_on_terminal(&mut self, event: &EndpointEvent, now: Now) {
-        let EndpointEvent::ConnectSettled {
-            connect_id,
-            outcome: ConnectOutcome::Failed(_) | ConnectOutcome::Cancelled,
-            ..
-        } = event
-        else {
-            return;
-        };
         if let Some(nat) = self.nat.as_mut() {
-            nat.cancel(*connect_id, now);
-            nat.pump(self.endpoint.runtime_mut(), now);
+            nat.cancel_leg_on_terminal(event, self.endpoint.runtime_mut(), now);
         }
     }
 
@@ -1146,63 +1003,65 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     ///
     /// Returns Endpoint events; enabled capabilities report through their
     /// [`EndpointEvent`] variants.
-    pub fn poll(&mut self, now: Now) -> Result<Vec<EndpointEvent>, SmoltcpDriveError> {
+    pub fn poll(&mut self, now: Now) -> Result<Vec<EndpointEvent>, PortableDriveError> {
         let mut output = Vec::new();
         self.poll_swarm(now, &mut output)?;
         if let Some(mdns) = self.mdns.as_mut() {
-            mdns.tick(now.monotonic_ms, &self.endpoint.stats().bound_addresses)?;
+            mdns.tick(now.monotonic_ms, &self.endpoint.bound_addresses())?;
         }
         if self.mdns.is_some() {
             self.poll_swarm(now, &mut output)?;
         }
-        if let Some(mdns) = self.mdns.as_mut() {
+        if let (Some(mdns), Some(discovery)) = (self.mdns.as_mut(), self.discovery.as_mut()) {
             while let Some(event) = mdns.poll_event() {
-                if let Some(discovery) = self.discovery.as_mut() {
-                    match event {
-                        MdnsEvent::PeerObserved { peer, addrs } => {
-                            discovery.observe_mdns(peer, addrs, now.monotonic_ms);
-                        }
-                        MdnsEvent::ProtocolViolation { peer, reason } => discovery
-                            .report_violation(
-                                peer,
-                                minip2p_discovery::DiscoverySource::Mdns,
-                                &reason,
-                            ),
-                    }
-                }
+                discovery.handle_mdns_event(event, now.monotonic_ms);
             }
         }
         #[cfg(feature = "pubsub")]
         if let Some(pubsub) = self.gossipsub.as_mut() {
-            if pubsub.next_timeout(now.monotonic_ms) == Some(0) {
-                pubsub.handle_tick(now.monotonic_ms);
-            }
-            pump_embedded_pubsub(pubsub, &mut self.endpoint, now);
+            pubsub.tick(self.endpoint.runtime_mut(), now.monotonic_ms);
         }
-        #[cfg(feature = "pubsub")]
-        self.drive_beacon(now, &mut output);
         #[cfg(feature = "portable-autonat")]
         if let Some(nat) = self.nat.as_mut() {
             nat.tick(self.endpoint.runtime_mut(), now);
         }
         self.flush_nat_addresses();
         self.feed_nat_to_connect(now);
-        self.emit_connect_events(now, &mut output);
+        if let Some(discovery) = self.discovery.as_mut() {
+            let (connect, runtime) = self.endpoint.parts_mut();
+            let work = discovery.sweep(
+                #[cfg(feature = "pubsub")]
+                self.gossipsub.as_mut(),
+                #[cfg(feature = "portable-autonat")]
+                self.nat.as_mut(),
+                #[cfg(all(feature = "nat", not(feature = "portable-autonat")))]
+                None,
+                connect,
+                runtime,
+                &mut expand_concrete,
+                now,
+            );
+            #[cfg(feature = "portable-autonat")]
+            if let Some(nat) = self.nat.as_mut() {
+                let (connect, runtime) = self.endpoint.parts_mut();
+                nat.apply_sweep_work(work, connect, runtime, now);
+            }
+            #[cfg(not(feature = "portable-autonat"))]
+            let _ = work;
+        }
+        self.feed_nat_to_connect(now);
         #[cfg(feature = "portable-autonat")]
         if let Some(nat) = self.nat.as_mut() {
             output.extend(nat.drain_application_events().map(EndpointEvent::Nat));
         }
-        if let Some(discovery) = self.discovery.as_mut()
-            && discovery.next_timeout(now.monotonic_ms) == Some(0)
-        {
-            discovery.handle_tick(now.monotonic_ms);
+        #[cfg(feature = "pubsub")]
+        if let Some(pubsub) = self.gossipsub.as_mut() {
+            output.extend(pubsub.events.drain(..).map(EndpointEvent::Gossipsub));
         }
-        self.drive_discovery_actions(now)?;
         if let Some(discovery) = self.discovery.as_mut() {
-            while let Some(event) = discovery.poll_event() {
-                output.push(EndpointEvent::Discovery(event));
-            }
+            discovery.drain_events(&mut output);
         }
+        self.emit_connect_events(now, &mut output);
         Ok(output)
     }
 
@@ -1210,38 +1069,10 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         self.endpoint.tick_connect(now);
         self.emit_connect_events(now, output);
         for event in self.endpoint.poll_runtime(now)? {
-            if let Some(discovery) = self.discovery.as_mut() {
-                match &event {
-                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                        self.active_dials.remove(peer_id);
-                        discovery.dial_succeeded(peer_id, now.monotonic_ms);
-                        discovery.peer_connected(peer_id, now.monotonic_ms);
-                    }
-                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                        discovery.peer_disconnected(peer_id, now.monotonic_ms);
-                    }
-                    SwarmEvent::Error(error) => {
-                        if let Some(peer) = remove_failed_autodial(
-                            &mut self.active_dials,
-                            error.peer_id.as_ref(),
-                            error.conn_id,
-                        ) {
-                            discovery.dial_failed(&peer, &error.detail, now.monotonic_ms);
-                        }
-                    }
-                    SwarmEvent::DialFailed {
-                        conn_id, reason, ..
-                    } => {
-                        if let Some(peer) =
-                            remove_failed_autodial(&mut self.active_dials, None, Some(*conn_id))
-                        {
-                            discovery.dial_failed(&peer, reason, now.monotonic_ms);
-                        }
-                    }
-                    _ => {}
-                }
-            }
             let engine_consumed = self.endpoint.observe_connect(&event, now);
+            if let Some(discovery) = self.discovery.as_mut() {
+                discovery.observe(&event, self.endpoint.runtime().core(), now.monotonic_ms);
+            }
             #[cfg(feature = "portable-autonat")]
             let claimed = engine_consumed
                 || self
@@ -1252,147 +1083,14 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             let claimed = engine_consumed;
             #[cfg(feature = "pubsub")]
             let claimed = claimed
-                || self
-                    .gossipsub
-                    .as_mut()
-                    .is_some_and(|agent| agent.handle_event(&event, now.monotonic_ms));
-            #[cfg(feature = "pubsub")]
-            if let Some(agent) = self.gossipsub.as_mut() {
-                pump_embedded_pubsub(agent, &mut self.endpoint, now);
-            }
+                || self.gossipsub.as_mut().is_some_and(|pubsub| {
+                    pubsub.ingest(&event, self.endpoint.runtime_mut(), now.monotonic_ms)
+                });
             if !claimed {
                 output.push(event.into());
             }
             self.feed_nat_to_connect(now);
             self.emit_connect_events(now, output);
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "pubsub")]
-    fn drive_beacon(&mut self, now: Now, output: &mut Vec<EndpointEvent>) {
-        let Some(beacon) = self.beacon.as_mut() else {
-            if let Some(pubsub) = self.gossipsub.as_mut() {
-                collect_embedded_pubsub_events(pubsub, &mut self.pending_gossipsub_events);
-            }
-            output.extend(
-                self.pending_gossipsub_events
-                    .drain(..)
-                    .map(EndpointEvent::Gossipsub),
-            );
-            return;
-        };
-        beacon.set_local_addrs(&self.endpoint.stats().bound_addresses, now.monotonic_ms);
-        if beacon.next_timeout(now.monotonic_ms) == Some(0) {
-            beacon.handle_tick(now.monotonic_ms);
-        }
-        if let Some(pubsub) = self.gossipsub.as_mut() {
-            collect_embedded_pubsub_events(pubsub, &mut self.pending_gossipsub_events);
-            while let Some(event) = self.pending_gossipsub_events.pop_front() {
-                let consumed = match &event {
-                    GossipsubEvent::Message {
-                        from,
-                        topics,
-                        data,
-                        signed,
-                        ..
-                    } if topics.iter().any(|topic| topic == beacon.topic()) => {
-                        beacon.handle_beacon(from, data, *signed);
-                        true
-                    }
-                    GossipsubEvent::PeerSubscribed { topic, .. }
-                    | GossipsubEvent::PeerUnsubscribed { topic, .. }
-                        if topic == beacon.topic() =>
-                    {
-                        true
-                    }
-                    _ => false,
-                };
-                if !consumed {
-                    output.push(EndpointEvent::Gossipsub(event));
-                }
-            }
-            while let Some(minip2p_discovery::BeaconAction::PublishBeacon { topic, payload }) =
-                beacon.poll_action()
-            {
-                // Beacon publication is best-effort, matching the hosted
-                // driver. Backpressure must not discard events already
-                // collected by this poll; the next interval announces again.
-                if pubsub.publish(&topic, payload, now.monotonic_ms).is_ok() {
-                    pump_embedded_pubsub(pubsub, &mut self.endpoint, now);
-                }
-            }
-            collect_embedded_pubsub_events(pubsub, &mut self.pending_gossipsub_events);
-            while let Some(event) = self.pending_gossipsub_events.pop_front() {
-                output.push(EndpointEvent::Gossipsub(event));
-            }
-        }
-        if let Some(discovery) = self.discovery.as_mut() {
-            while let Some(event) = beacon.poll_event() {
-                match event {
-                    minip2p_discovery::BeaconEvent::Observation(observation) => {
-                        discovery.observe_beacon(observation, now.monotonic_ms);
-                    }
-                    minip2p_discovery::BeaconEvent::ProtocolViolation { peer, reason } => {
-                        discovery.report_violation(
-                            Some(peer),
-                            minip2p_discovery::DiscoverySource::SignedBeacon,
-                            &reason,
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    fn drive_discovery_actions(&mut self, now: Now) -> Result<(), DriverError> {
-        let Some(discovery) = self.discovery.as_mut() else {
-            return Ok(());
-        };
-        while let Some(action) = discovery.poll_action() {
-            match action {
-                minip2p_discovery::DiscoveryAction::Dial { peer, addrs, .. } => {
-                    let mut started = None;
-                    let mut last_error = None;
-                    for address in addrs {
-                        let Ok(target) = PeerAddr::new(address, peer.clone()) else {
-                            continue;
-                        };
-                        match self.endpoint.dial(&target) {
-                            Ok(connection) => {
-                                started = Some(connection);
-                                break;
-                            }
-                            Err(error) => last_error = Some(error),
-                        }
-                    }
-                    if let Some(connection) = started {
-                        self.active_dials.insert(peer, connection);
-                    } else {
-                        let reason = last_error
-                            .map(|error| error.to_string())
-                            .unwrap_or_else(|| "discovery supplied no dialable address".into());
-                        discovery.dial_failed(&peer, &reason, now.monotonic_ms);
-                    }
-                }
-                minip2p_discovery::DiscoveryAction::CancelDial { peer } => {
-                    if let Some(connection) = self.active_dials.remove(&peer) {
-                        match self
-                            .endpoint
-                            .runtime_mut()
-                            .transport_mut()
-                            .close(connection)
-                        {
-                            Ok(())
-                            | Err(
-                                TransportError::ConnectionNotFound { .. }
-                                | TransportError::InvalidState { .. },
-                            ) => {}
-                            Err(error) => return Err(error.into()),
-                        }
-                    }
-                }
-            }
         }
         Ok(())
     }
@@ -1411,21 +1109,11 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         );
         #[cfg(feature = "pubsub")]
         {
-            if !self.pending_gossipsub_events.is_empty() {
-                deadline = PollDeadline::earliest_opt(deadline, Some(PollDeadline::IMMEDIATE));
-            }
             deadline = PollDeadline::earliest_opt(
                 deadline,
                 self.gossipsub
                     .as_ref()
-                    .and_then(|agent| agent.next_timeout(now.monotonic_ms))
-                    .map(at),
-            );
-            deadline = PollDeadline::earliest_opt(
-                deadline,
-                self.beacon
-                    .as_ref()
-                    .and_then(|agent| agent.next_timeout(now.monotonic_ms))
+                    .and_then(|driver| driver.next_timeout(now.monotonic_ms))
                     .map(at),
             );
         }
@@ -1437,7 +1125,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             deadline,
             self.discovery
                 .as_ref()
-                .and_then(|agent| agent.next_timeout(now.monotonic_ms))
+                .and_then(|driver| driver.next_timeout(now.monotonic_ms))
                 .map(at),
         )
     }
@@ -1449,8 +1137,8 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     #[doc(hidden)]
     #[cfg(feature = "pubsub")]
     pub fn leave_uncollected_gossipsub_event(&mut self, event: GossipsubEvent) {
-        if let Some(agent) = self.gossipsub.as_mut() {
-            agent.enqueue_event(event);
+        if let Some(driver) = self.gossipsub.as_mut() {
+            driver.agent.enqueue_event(event);
         }
     }
 
@@ -1459,16 +1147,19 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     /// Returns the final Endpoint events, including capability events that
     /// were still queued and Gossipsub events still held by the agent.
     /// Connection-close events come first; queued capability events follow.
-    pub fn shutdown(mut self, now: Now) -> Result<Vec<EndpointEvent>, SmoltcpDriveError> {
+    pub fn shutdown(mut self, now: Now) -> Result<Vec<EndpointEvent>, PortableDriveError> {
         if let Some(mdns) = self.mdns.as_mut() {
             mdns.shutdown(now.monotonic_ms)?;
         }
         #[cfg(feature = "pubsub")]
-        if let Some(agent) = self.gossipsub.as_mut() {
-            collect_embedded_pubsub_events(agent, &mut self.pending_gossipsub_events);
-        }
-        #[cfg(feature = "pubsub")]
-        let gossipsub = core::mem::take(&mut self.pending_gossipsub_events);
+        let gossipsub: Vec<_> = self
+            .gossipsub
+            .as_mut()
+            .map(|driver| {
+                driver.collect_agent_events();
+                driver.events.drain(..).collect()
+            })
+            .unwrap_or_default();
         #[cfg(feature = "portable-autonat")]
         let nat: Vec<_> = self
             .nat
@@ -1481,68 +1172,9 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         #[cfg(feature = "pubsub")]
         events.extend(gossipsub.into_iter().map(EndpointEvent::Gossipsub));
         if let Some(discovery) = self.discovery.as_mut() {
-            while let Some(event) = discovery.poll_event() {
-                events.push(EndpointEvent::Discovery(event));
-            }
+            discovery.drain_events(&mut events);
         }
         Ok(events)
-    }
-}
-
-#[cfg(feature = "smoltcp")]
-#[cfg(feature = "pubsub")]
-fn pump_embedded_pubsub<D: smoltcp::phy::Device, E: EntropySource>(
-    agent: &mut minip2p_pubsub::GossipsubAgent,
-    endpoint: &mut PortableEndpoint<SmoltcpComposedTransport<D, E>, SharedEntropy<E>>,
-    now: Now,
-) {
-    while let Some(action) = agent.poll_action() {
-        match action {
-            minip2p_pubsub::GossipsubAction::OpenStream {
-                token,
-                peer,
-                protocol_id,
-            } => {
-                let result = endpoint
-                    .open_stream(&peer, &protocol_id, now)
-                    .map_err(|e| e.to_string());
-                agent.stream_open_result(&peer, token, result, now.monotonic_ms);
-            }
-            minip2p_pubsub::GossipsubAction::SendStream {
-                token,
-                peer,
-                stream_id,
-                data,
-            } => {
-                let result = endpoint
-                    .send_stream(&peer, stream_id, data, now)
-                    .map_err(|e| e.to_string());
-                agent.send_result(&peer, stream_id, token, result, now.monotonic_ms);
-            }
-            minip2p_pubsub::GossipsubAction::CloseStreamWrite { peer, stream_id } => {
-                // Pubsub has no completion callback for stream teardown; a
-                // failed close is observed through the endpoint event path.
-                match endpoint.close_stream_write(&peer, stream_id, now) {
-                    Ok(()) | Err(_) => {}
-                }
-            }
-            minip2p_pubsub::GossipsubAction::ResetStream { peer, stream_id } => {
-                // As above, retain endpoint events as the teardown result.
-                match endpoint.reset_stream(&peer, stream_id, now) {
-                    Ok(()) | Err(_) => {}
-                }
-            }
-        }
-    }
-}
-
-#[cfg(all(feature = "smoltcp", feature = "pubsub"))]
-fn collect_embedded_pubsub_events(
-    agent: &mut minip2p_pubsub::GossipsubAgent,
-    pending: &mut VecDeque<GossipsubEvent>,
-) {
-    while let Some(event) = agent.poll_event() {
-        pending.push_back(event);
     }
 }
 
@@ -1805,10 +1437,15 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
         #[cfg(not(feature = "pubsub"))]
         let discovery_enabled = mdns.is_some();
         let discovery = if discovery_enabled {
-            Some(minip2p_discovery::PeerDiscoveryAgent::new(
+            let book = minip2p_discovery::PeerDiscoveryAgent::new(
                 endpoint.peer_id().clone(),
                 self.discovery,
-            )?)
+            )?;
+            Some(DiscoveryDriver::new(
+                book,
+                #[cfg(feature = "pubsub")]
+                beacon,
+            ))
         } else {
             None
         };
@@ -1827,15 +1464,10 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
             endpoint,
             mdns,
             #[cfg(feature = "pubsub")]
-            gossipsub: pubsub,
-            #[cfg(feature = "pubsub")]
-            pending_gossipsub_events: VecDeque::new(),
-            #[cfg(feature = "pubsub")]
-            beacon,
+            gossipsub: pubsub.map(GossipsubDriver::new),
             #[cfg(feature = "portable-autonat")]
             nat,
             discovery,
-            active_dials: BTreeMap::new(),
         })
     }
 }
@@ -1877,36 +1509,6 @@ pub enum SmoltcpBuildError {
     #[cfg(feature = "portable-autonat")]
     #[error("invalid portable NAT config: {reason}")]
     NatConfig { reason: &'static str },
-}
-
-/// Failure while driving the composed smoltcp endpoint.
-#[cfg(feature = "smoltcp")]
-#[derive(Debug, thiserror::Error)]
-pub enum SmoltcpDriveError {
-    /// TCP or swarm progress failed.
-    #[error(transparent)]
-    Endpoint(#[from] DriverError),
-    /// The mDNS carrier failed.
-    #[error(transparent)]
-    Mdns(#[from] MdnsError),
-}
-
-/// Failure from an embedded pubsub operation.
-#[cfg(all(feature = "smoltcp", feature = "pubsub"))]
-#[derive(Debug, Eq, PartialEq, thiserror::Error)]
-pub enum SmoltcpGossipsubError {
-    /// `.gossipsub()` or `.discovery()` was not selected on the builder.
-    #[error("gossipsub is not enabled; call .gossipsub() or .discovery()")]
-    NotEnabled,
-    /// Signed discovery owns this subscription.
-    #[error("signed discovery owns this topic subscription")]
-    DiscoveryTopicReserved,
-    /// The topic was invalid.
-    #[error(transparent)]
-    Topic(#[from] TopicError),
-    /// The message could not be queued.
-    #[error(transparent)]
-    Publish(#[from] PublishError),
 }
 
 #[cfg(test)]
@@ -2191,19 +1793,5 @@ mod tests {
             EndpointEvent::ConnectionClosed { peer_id, conn_id: closed_id, .. }
                 if peer_id == &remote && closed_id == &conn_id
         )));
-    }
-
-    #[cfg(feature = "portable-mdns")]
-    #[test]
-    fn failed_autodial_is_correlated_by_connection_without_a_peer_id() {
-        let peer = Ed25519Keypair::from_secret_key_bytes([42; 32]).peer_id();
-        let connection = ConnectionId::new(77);
-        let mut active = BTreeMap::from([(peer.clone(), connection)]);
-
-        assert_eq!(
-            remove_failed_autodial(&mut active, None, Some(connection)),
-            Some(peer)
-        );
-        assert!(active.is_empty(), "a failed dial must become retryable");
     }
 }

@@ -17,6 +17,8 @@ use minip2p_swarm::{SwarmEvent, SwarmRuntime};
 use minip2p_transport::{ConnectionId, Transport};
 
 use super::event_stream::EndpointEvent;
+#[cfg(any(feature = "nat", feature = "portable-autonat"))]
+use crate::nat::NatDriver;
 
 /// Default Connection-attempt deadline: 30 seconds.
 pub(crate) const DEFAULT_CONNECT_DEADLINE_MS: u64 = 30_000;
@@ -450,6 +452,15 @@ impl ConnectEngine {
         self.attempts.contains_key(&id)
     }
 
+    /// Whether a direct dial is in flight for the attempt. The NAT driver
+    /// reads this to stagger the relay leg only while a direct path races.
+    #[cfg(any(feature = "nat", feature = "portable-autonat"))]
+    pub(crate) fn is_direct_racing(&self, id: ConnectId) -> bool {
+        self.attempts
+            .get(&id)
+            .is_some_and(|attempt| attempt.dialed_any)
+    }
+
     /// Idempotent. Settled or unknown ids are a no-op. Never disconnects.
     pub(crate) fn cancel<T: Transport, E: EntropySource>(
         &mut self,
@@ -781,6 +792,74 @@ impl ConnectEngine {
             }
         }
     }
+}
+
+/// What one Connection attempt should dial: the peer, its candidate
+/// addresses, and whether a relay leg may race them.
+#[cfg(any(feature = "std", feature = "portable-mdns"))]
+pub(crate) struct ConnectAdmission {
+    pub(crate) peer: PeerId,
+    pub(crate) candidates: Vec<PeerAddr>,
+    pub(crate) allow_relay: bool,
+}
+
+/// Admits one Connection attempt for `peer`: expands each candidate through
+/// `expand` (DNS-shaped resolution on std, identity on portable), selects
+/// the relay policy from the NAT driver, and starts direct dials. Both
+/// Endpoint compositions run this; only the injected `expand` differs.
+///
+/// When the attempt stays pending, the caller attaches its NAT leg with
+/// [`NatDriver::attach_leg`]: the leg needs the composition's concrete
+/// transport while admission works over any [`Transport`].
+#[cfg(any(feature = "std", feature = "portable-mdns"))]
+pub(crate) fn admit_connect<T: Transport, E: EntropySource>(
+    connect: &mut ConnectEngine,
+    runtime: &mut SwarmRuntime<T, E>,
+    #[cfg(any(feature = "nat", feature = "portable-autonat"))] nat: Option<&NatDriver<E>>,
+    admission: ConnectAdmission,
+    expand: &mut dyn FnMut(&PeerAddr) -> Result<Vec<PeerAddr>, String>,
+    now: minip2p_platform::Now,
+) -> ConnectId {
+    let ConnectAdmission {
+        peer,
+        candidates,
+        allow_relay,
+    } = admission;
+    let mut expanded = Vec::new();
+    let mut failed = Vec::new();
+    for addr in &candidates {
+        match expand(addr) {
+            Ok(addrs) => expanded.extend(addrs),
+            Err(reason) => failed.push(CandidateFailure {
+                addr: addr.clone(),
+                reason,
+            }),
+        }
+    }
+
+    #[cfg(any(feature = "nat", feature = "portable-autonat"))]
+    let relay = match &nat {
+        Some(driver) if allow_relay && driver.has_relay() => {
+            if driver.force_relay() {
+                RelayPolicy::Forced
+            } else {
+                RelayPolicy::Race
+            }
+        }
+        _ => RelayPolicy::None,
+    };
+    #[cfg(not(any(feature = "nat", feature = "portable-autonat")))]
+    let relay = RelayPolicy::None;
+    let _ = allow_relay;
+
+    #[cfg(any(feature = "nat", feature = "portable-autonat"))]
+    let expanded = if matches!(relay, RelayPolicy::Forced) {
+        Vec::new()
+    } else {
+        expanded
+    };
+
+    connect.connect_candidates(peer, expanded, failed, relay, runtime, now.monotonic_ms)
 }
 
 #[cfg(test)]
