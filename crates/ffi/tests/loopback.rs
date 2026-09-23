@@ -281,6 +281,7 @@ fn a_tcp_listen_address_binds_tcp_and_is_dialed_over_it() -> Result<(), FfiError
                     connect_id: observed,
                     peer_id,
                     path: PathKind::DirectDialed,
+                    ..
                 } if *observed == connect_id && peer_id == &b_peer
             ))
             .is_some(),
@@ -330,6 +331,7 @@ fn two_endpoints_chat_over_loopback() -> Result<(), FfiError> {
                 connect_id: observed,
                 peer_id,
                 path: PathKind::DirectDialed,
+                ..
             } if *observed == connect_id && peer_id == &b_peer
         )),
         Some(P2pEvent::PathEstablished { .. })

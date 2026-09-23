@@ -148,6 +148,7 @@ fn relayed_chat_and_reservation_loss() {
                 connect_id: found,
                 peer_id,
                 path: PathKind::Relayed { relay_peer_id },
+                ..
             } if *found == connect_id && peer_id == &b_peer && relay_peer_id == &relay_peer
         )
     });

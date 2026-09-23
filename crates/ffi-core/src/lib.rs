@@ -1,8 +1,21 @@
 //! Binding-agnostic endpoint lifecycle and event delivery for foreign runtimes.
+//!
+//! Connection attempts follow one contract: [`P2pEndpoint::connect_target`]
+//! admits an attempt under a single Connect ID and the event stream carries
+//! exactly one terminal for it — [`P2pEvent::PathEstablished`],
+//! [`P2pEvent::ConnectFailed`], or [`P2pEvent::ConnectCancelled`] after
+//! [`P2pEndpoint::cancel_connect`]. If the bounded carry drops a terminal,
+//! `P2pEvent::EventsDropped::terminal_connect_ids` names its Connect ID so a
+//! foreign wait settles with a delivery-loss error and recovers through the
+//! State getters (`connected_peers`, `connection_info`, `path`,
+//! `known_peers`, `listen_addrs`). The detached driver owns the Endpoint
+//! wait outcomes — event, deadline, interrupted — and releases ownership on
+//! interruption so commands never deadlock.
 
 #![warn(missing_docs)]
 
 mod config;
+mod connect;
 mod driver;
 mod endpoint;
 mod error;
@@ -12,12 +25,13 @@ pub use config::{
     DiscoveryOptions, EndpointConfig, KnownPeerInfo, MdnsOptions, RelayReservationInfo,
     TransportOptions,
 };
+pub use connect::ConnectTarget;
 pub use driver::DriverStats;
 pub use endpoint::P2pEndpoint;
 pub use error::FfiError;
 pub use events::{
-    DiscoverySource, DriverFailureKind, EndpointErrorKind, EventDoorbell, IdentifyInfo,
-    NatErrorKind, OpenStreamResult, P2pEvent, PathKind, Reachability,
+    ConnectionInfo, DiscoverySource, DriverFailureKind, EndpointErrorKind, EventDoorbell,
+    IdentifyInfo, NatErrorKind, OpenStreamResult, P2pEvent, PathKind, Reachability,
 };
 
 use std::str::FromStr;
@@ -50,15 +64,16 @@ pub fn circuit_address(relay_addr: String, peer_id: String) -> Result<String, Ff
 }
 
 fn parse_direct_peer_addr(address: &str) -> Result<PeerAddr, FfiError> {
-    let relay = PeerAddr::from_str(address).map_err(|error| FfiError::InvalidAddress {
+    let peer_addr = PeerAddr::from_str(address).map_err(|error| FfiError::InvalidAddress {
         detail: error.to_string(),
     })?;
-    if relay.transport().transport_kind().is_none() || relay.transport().is_wildcard_host() {
+    if peer_addr.transport().transport_kind().is_none() || peer_addr.transport().is_wildcard_host()
+    {
         return Err(FfiError::InvalidAddress {
-            detail: "relay address must be a direct /quic-v1 or /tcp peer address".into(),
+            detail: "address must be a complete direct /quic-v1 or /tcp peer address".into(),
         });
     }
-    Ok(relay)
+    Ok(peer_addr)
 }
 
 fn keypair_from_bytes(secret_key: Vec<u8>) -> Result<Ed25519Keypair, FfiError> {

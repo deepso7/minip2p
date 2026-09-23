@@ -32,6 +32,15 @@ pub struct OpenStreamResult {
     pub stream_id: u64,
 }
 
+/// State snapshot of the transport connection selected for a peer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectionInfo {
+    /// Endpoint-local transport connection id.
+    pub conn_id: u64,
+    /// Remote transport address, when recorded.
+    pub remote_addr: Option<String>,
+}
+
 /// Coarse local reachability state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Reachability {
@@ -124,6 +133,11 @@ pub enum P2pEvent {
         dropped: u64,
         /// Events discarded since this driver started.
         total_dropped: u64,
+        /// Connect IDs whose terminal event (PathEstablished / ConnectFailed
+        /// / ConnectCancelled) was among the dropped events since the
+        /// previous diagnostic. Foreign waits on these IDs must settle with
+        /// a delivery-loss error and recover through State getters.
+        terminal_connect_ids: Vec<u64>,
     },
     /// The background driver terminated after a fatal failure.
     DriverFailed {
@@ -259,6 +273,8 @@ pub enum P2pEvent {
         connect_id: u64,
         /// Remote peer.
         peer_id: String,
+        /// Transport connection the attempt settled on.
+        conn_id: u64,
         /// Established path.
         path: PathKind,
     },
@@ -306,6 +322,14 @@ pub enum P2pEvent {
         kind: NatErrorKind,
         /// Human-readable failure detail.
         detail: String,
+    },
+    /// A Connection attempt was cancelled by `cancel_connect` before it
+    /// settled. Terminal for that Connect ID.
+    ConnectCancelled {
+        /// Endpoint-local connection-attempt id.
+        connect_id: u64,
+        /// Remote peer.
+        peer_id: String,
     },
     /// An inbound circuit upgraded to a direct connection.
     InboundDirectUpgrade {
@@ -513,9 +537,10 @@ pub(crate) fn convert_settled(
     path: Option<Path>,
 ) -> Option<P2pEvent> {
     match outcome {
-        ConnectOutcome::Connected { .. } => Some(P2pEvent::PathEstablished {
+        ConnectOutcome::Connected { conn_id } => Some(P2pEvent::PathEstablished {
             connect_id: connect_id.as_u64(),
             peer_id: peer_id.to_base58(),
+            conn_id: conn_id.as_u64(),
             path: convert_path(path.unwrap_or(Path::DirectDialed)),
         }),
         ConnectOutcome::Failed(failure) => Some(P2pEvent::ConnectFailed {
@@ -524,7 +549,10 @@ pub(crate) fn convert_settled(
             kind: convert_connect_failure_kind(&failure),
             detail: failure.to_string(),
         }),
-        ConnectOutcome::Cancelled => None,
+        ConnectOutcome::Cancelled => Some(P2pEvent::ConnectCancelled {
+            connect_id: connect_id.as_u64(),
+            peer_id: peer_id.to_base58(),
+        }),
     }
 }
 
@@ -902,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_settled_maps_connected_and_failed_and_drops_cancelled() {
+    fn convert_settled_maps_connected_and_failed_and_cancelled() {
         let remote = peer(12);
         let connect_id = minip2p::ConnectId::from_u64(3);
         assert_eq!(
@@ -917,6 +945,7 @@ mod tests {
             Some(P2pEvent::PathEstablished {
                 connect_id: 3,
                 peer_id: remote.to_base58(),
+                conn_id: 9,
                 path: PathKind::DirectDialed,
             })
         );
@@ -940,7 +969,10 @@ mod tests {
         );
         assert_eq!(
             convert_settled(connect_id, &remote, ConnectOutcome::Cancelled, None),
-            None
+            Some(P2pEvent::ConnectCancelled {
+                connect_id: 3,
+                peer_id: remote.to_base58(),
+            })
         );
     }
 

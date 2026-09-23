@@ -14,8 +14,8 @@ pub use config::{
 pub use endpoint::P2pEndpoint;
 pub use error::FfiError;
 pub use events::{
-    DiscoverySource, DriverFailureKind, EndpointErrorKind, IdentifyInfo, NatErrorKind,
-    OpenStreamResult, P2pEvent, PathKind, Reachability,
+    ConnectTarget, ConnectionInfo, DiscoverySource, DriverFailureKind, EndpointErrorKind,
+    IdentifyInfo, NatErrorKind, OpenStreamResult, P2pEvent, PathKind, Reachability,
 };
 
 /// Doorbell implemented by the embedding runtime.

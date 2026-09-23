@@ -18,6 +18,10 @@ pub type EndpointErrorKind = core::EndpointErrorKind;
 pub type NatErrorKind = core::NatErrorKind;
 /// UniFFI mirror of a driver failure category.
 pub type DriverFailureKind = core::DriverFailureKind;
+/// UniFFI mirror of a Connection-attempt target.
+pub type ConnectTarget = core::ConnectTarget;
+/// UniFFI mirror of a peer's transport connection snapshot.
+pub type ConnectionInfo = core::ConnectionInfo;
 /// UniFFI mirror of a flattened endpoint event.
 pub type P2pEvent = core::P2pEvent;
 
@@ -45,6 +49,15 @@ pub struct OpenStreamResult {
     pub conn_id: u64,
     /// Opaque stream id.
     pub stream_id: u64,
+}
+
+/// State snapshot of the transport connection selected for a peer.
+#[uniffi::remote(Record)]
+pub struct ConnectionInfo {
+    /// Endpoint-local transport connection id.
+    pub conn_id: u64,
+    /// Remote transport address, when recorded.
+    pub remote_addr: Option<String>,
 }
 
 /// Coarse local reachability state.
@@ -130,6 +143,26 @@ pub enum DriverFailureKind {
     Panic,
 }
 
+/// What a foreign runtime supplies to start one Connection attempt.
+///
+/// Validation for every form lives here, once; binding shells only adapt
+/// the shape to their toolchain.
+#[uniffi::remote(Enum)]
+pub enum ConnectTarget {
+    /// Peer ID only: the endpoint applies its discovery-book and relay
+    /// policy.
+    Peer {
+        /// Base58 peer ID.
+        peer_id: String,
+    },
+    /// One or more complete direct peer addresses that all name the same
+    /// peer. One address is the single-address form.
+    Addresses {
+        /// Complete `/quic-v1` or `/tcp` peer addresses.
+        addresses: Vec<String>,
+    },
+}
+
 /// Event delivered by the native endpoint driver.
 #[uniffi::remote(Enum)]
 #[expect(
@@ -143,6 +176,11 @@ pub enum P2pEvent {
         dropped: u64,
         /// Events discarded since this driver started.
         total_dropped: u64,
+        /// Connect IDs whose terminal event (PathEstablished / ConnectFailed
+        /// / ConnectCancelled) was among the dropped events since the
+        /// previous diagnostic. Foreign waits on these IDs must settle with
+        /// a delivery-loss error and recover through State getters.
+        terminal_connect_ids: Vec<u64>,
     },
     /// The background driver terminated after a fatal failure.
     DriverFailed {
@@ -278,6 +316,8 @@ pub enum P2pEvent {
         connect_id: u64,
         /// Remote peer.
         peer_id: String,
+        /// Transport connection the attempt settled on.
+        conn_id: u64,
         /// Established path.
         path: PathKind,
     },
@@ -325,6 +365,14 @@ pub enum P2pEvent {
         kind: NatErrorKind,
         /// Human-readable failure detail.
         detail: String,
+    },
+    /// A Connection attempt was cancelled by `cancel_connect` before it
+    /// settled. Terminal for that Connect ID.
+    ConnectCancelled {
+        /// Endpoint-local connection-attempt id.
+        connect_id: u64,
+        /// Remote peer.
+        peer_id: String,
     },
     /// An inbound circuit upgraded to a direct connection.
     InboundDirectUpgrade {

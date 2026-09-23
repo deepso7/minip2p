@@ -1,6 +1,5 @@
 //! Binding-agnostic endpoint object and construction.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -142,8 +141,6 @@ pub(crate) struct EndpointState {
     pub(crate) active: bool,
     pub(crate) driver_thread_id: Option<std::thread::ThreadId>,
     doorbell_thread_id: Option<std::thread::ThreadId>,
-    pub(crate) connect_ids: BTreeMap<u64, minip2p::ConnectId>,
-    pub(crate) cancelled_connect_ids: BTreeSet<u64>,
     pub(crate) carry: crate::driver::Carry,
     pub(crate) overflow: crate::driver::OverflowDiagnostic,
     pub(crate) stats: DriverStats,
@@ -281,8 +278,6 @@ impl P2pEndpoint {
                     active: false,
                     driver_thread_id: None,
                     doorbell_thread_id: None,
-                    connect_ids: BTreeMap::new(),
-                    cancelled_connect_ids: BTreeSet::new(),
                     carry: crate::driver::Carry::default(),
                     overflow: crate::driver::OverflowDiagnostic::default(),
                     stats: DriverStats::default(),
@@ -381,20 +376,10 @@ impl P2pEndpoint {
         let EndpointState {
             carry,
             overflow,
-            connect_ids,
-            cancelled_connect_ids,
             stats,
             ..
         } = &mut *state;
-        let suppressed = carry.suppress_cancelled(cancelled_connect_ids);
-        stats.dropped = stats.dropped.saturating_add(suppressed as u64);
         let mut delivery = crate::driver::take_delivery(carry, overflow, stats, limit as usize);
-        for event in &delivery.batch {
-            if let Some(connect_id) = crate::driver::terminal_connect_id(event) {
-                connect_ids.remove(&connect_id);
-                cancelled_connect_ids.remove(&connect_id);
-            }
-        }
         stats.dispatch_attempted = stats
             .dispatch_attempted
             .saturating_add(delivery.batch.len() as u64);
@@ -572,47 +557,58 @@ impl P2pEndpoint {
         })
     }
 
-    /// Starts a connection attempt toward a peer without known direct addresses.
+    /// Starts one Connection attempt toward `target` and returns its Connect
+    /// ID.
+    ///
+    /// The whole attempt — every candidate dial, relay fallback, and path
+    /// upgrade — settles under that one Connect ID with exactly one terminal
+    /// event: [`P2pEvent::PathEstablished`], [`P2pEvent::ConnectFailed`], or
+    /// [`P2pEvent::ConnectCancelled`] after [`Self::cancel_connect`].
+    /// Synchronous errors cover malformed targets only.
+    pub fn connect_target(&self, target: crate::ConnectTarget) -> Result<u64, FfiError> {
+        let target = crate::connect::parse_connect_target(target)?;
+        self.admit_connect(target)
+    }
+
+    /// Starts a connection attempt toward a peer without known direct
+    /// addresses.
+    ///
+    /// Legacy form; prefer [`Self::connect_target`]. Removed in #181.
     pub fn connect(&self, peer_id: String) -> Result<u64, FfiError> {
-        let peer = PeerId::from_str(&peer_id).map_err(|error| FfiError::InvalidPeerId {
-            detail: error.to_string(),
-        })?;
-        let _pending = PendingCommand::new(&self.shared);
-        let mut state = self.shared.lock_state();
-        ensure_accepting_commands(&state)?;
-        let id = state
-            .endpoint
-            .as_mut()
-            .ok_or(FfiError::Stopped)?
-            .connect(&peer)
-            .map_err(|error| FfiError::InvalidAddress {
-                detail: error.to_string(),
-            })?;
-        state.connect_ids.insert(id.as_u64(), id);
-        Ok(id.as_u64())
+        self.connect_target(crate::ConnectTarget::Peer { peer_id })
     }
 
     /// Starts a NAT connection attempt using an explicit ordered address set.
+    ///
+    /// Legacy form; prefer [`Self::connect_target`]. Removed in #181.
     pub fn connect_with_addrs(
         &self,
         peer_id: String,
         addresses: Vec<String>,
     ) -> Result<u64, FfiError> {
         let peer = parse_peer_id(&peer_id)?;
-        let addresses = addresses
-            .iter()
-            .map(|address| parse_direct_peer_addr(address))
-            .collect::<Result<Vec<_>, _>>()?;
-        let target = minip2p::ConnectTarget::try_from(addresses).map_err(|error| {
-            FfiError::InvalidAddress {
-                detail: error.to_string(),
-            }
-        })?;
+        let target =
+            crate::connect::parse_connect_target(crate::ConnectTarget::Addresses { addresses })?;
         if target.peer_id() != &peer {
             return Err(FfiError::InvalidAddress {
                 detail: "every connection address must end in the requested peer id".into(),
             });
         }
+        self.admit_connect(target)
+    }
+
+    /// Starts a connection attempt toward a direct `/quic-v1` or `/tcp` peer
+    /// address.
+    ///
+    /// Legacy form; prefer [`Self::connect_target`]. Removed in #181.
+    pub fn connect_addr(&self, address: String) -> Result<u64, FfiError> {
+        self.connect_target(crate::ConnectTarget::Addresses {
+            addresses: vec![address],
+        })
+    }
+
+    /// Admits a validated Connection target and returns its Connect ID.
+    fn admit_connect(&self, target: minip2p::ConnectTarget) -> Result<u64, FfiError> {
         let _pending = PendingCommand::new(&self.shared);
         let mut state = self.shared.lock_state();
         ensure_accepting_commands(&state)?;
@@ -624,26 +620,6 @@ impl P2pEndpoint {
             .map_err(|error| FfiError::InvalidAddress {
                 detail: error.to_string(),
             })?;
-        state.connect_ids.insert(id.as_u64(), id);
-        Ok(id.as_u64())
-    }
-
-    /// Starts a connection attempt toward a direct `/quic-v1` or `/tcp` peer
-    /// address.
-    pub fn connect_addr(&self, address: String) -> Result<u64, FfiError> {
-        let address = parse_direct_peer_addr(&address)?;
-        let _pending = PendingCommand::new(&self.shared);
-        let mut state = self.shared.lock_state();
-        ensure_accepting_commands(&state)?;
-        let id = state
-            .endpoint
-            .as_mut()
-            .ok_or(FfiError::Stopped)?
-            .connect(&address)
-            .map_err(|error| FfiError::InvalidAddress {
-                detail: error.to_string(),
-            })?;
-        state.connect_ids.insert(id.as_u64(), id);
         Ok(id.as_u64())
     }
 
@@ -680,28 +656,23 @@ impl P2pEndpoint {
         })
     }
 
-    /// Cancels a known connection attempt; unknown ids are an idempotent no-op.
+    /// Cancels a connection attempt by Connect ID.
     ///
-    /// Queued connection events are suppressed when possible.
+    /// Idempotent. An unsettled attempt emits exactly one
+    /// [`P2pEvent::ConnectCancelled`] terminal; settled or unknown ids are a
+    /// no-op and their terminal is still delivered once. Never disconnects
+    /// an established connection — use [`Self::disconnect`].
     pub fn cancel_connect(&self, id: u64) -> Result<(), FfiError> {
-        let _pending = PendingCommand::new(&self.shared);
-        let mut state = self.shared.lock_state();
-        ensure_accepting_commands(&state)?;
-        let connect_id = state.connect_ids.remove(&id);
-        let endpoint = state.endpoint.as_mut().ok_or(FfiError::Stopped)?;
-        if let Some(connect_id) = connect_id {
-            endpoint.cancel_connect(connect_id);
-            let suppressed = state.carry.suppress_cancelled(&BTreeSet::from([id]));
-            state.stats.dropped = state.stats.dropped.saturating_add(suppressed as u64);
-            state.cancelled_connect_ids.insert(id);
-        }
-        Ok(())
+        self.with_endpoint_mut(|endpoint| {
+            endpoint.cancel_connect(minip2p::ConnectId::from_u64(id));
+            Ok(())
+        })
     }
 
     /// Closes the active connection to `peer_id`.
     ///
-    /// Cancelling a connection attempt suppresses that attempt's progress
-    /// events, but cannot retract a transport connection that has already
+    /// Cancelling a connection attempt ends it with a `ConnectCancelled`
+    /// terminal, but cannot retract a transport connection that has already
     /// completed. Call this method when cancellation must also close an
     /// established connection.
     pub fn disconnect(&self, peer_id: String) -> Result<(), FfiError> {
@@ -717,6 +688,23 @@ impl P2pEndpoint {
             detail: error.to_string(),
         })?;
         self.with_endpoint(|endpoint| endpoint.path(&peer).map(crate::events::convert_path))
+    }
+
+    /// Returns the transport connection selected for `peer_id`, when
+    /// connected.
+    pub fn connection_info(
+        &self,
+        peer_id: String,
+    ) -> Result<Option<crate::ConnectionInfo>, FfiError> {
+        let peer = parse_peer_id(&peer_id)?;
+        self.with_endpoint(|endpoint| {
+            endpoint
+                .connection_id(&peer)
+                .map(|id| crate::ConnectionInfo {
+                    conn_id: id.as_u64(),
+                    remote_addr: endpoint.connection_remote_addr(id).map(ToString::to_string),
+                })
+        })
     }
 
     /// Returns the shared discovery address-book snapshot.
@@ -893,7 +881,7 @@ fn invalid_config(error: impl std::fmt::Display) -> FfiError {
     }
 }
 
-fn parse_peer_id(peer_id: &str) -> Result<PeerId, FfiError> {
+pub(crate) fn parse_peer_id(peer_id: &str) -> Result<PeerId, FfiError> {
     PeerId::from_str(peer_id).map_err(|error| FfiError::InvalidPeerId {
         detail: error.to_string(),
     })
@@ -1092,29 +1080,184 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_suppresses_a_terminal_event_waiting_in_the_carry() {
+    fn cancelling_an_unsettled_attempt_emits_exactly_one_connect_cancelled() {
+        let a = endpoint(config()).expect("endpoint a");
+        a.start(Arc::new(NoopDoorbell)).expect("start a");
+
+        let black_hole_peer = minip2p::Ed25519Keypair::from_secret_key_bytes([8; 32])
+            .peer_id()
+            .to_base58();
+        let connect_id = a
+            .connect_target(crate::ConnectTarget::Addresses {
+                addresses: vec![format!(
+                    "/ip4/127.0.0.1/udp/1/quic-v1/p2p/{black_hole_peer}"
+                )],
+            })
+            .expect("connect");
+        a.cancel_connect(connect_id).expect("cancel");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut drained = Vec::new();
+        while Instant::now() < deadline {
+            drained.extend(a.drain_events(4_096));
+            if drained
+                .iter()
+                .any(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let terminals: Vec<&P2pEvent> = drained
+            .iter()
+            .filter(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+            .collect();
+        assert_eq!(
+            terminals,
+            [&P2pEvent::ConnectCancelled {
+                connect_id,
+                peer_id: black_hole_peer,
+            }]
+            .as_slice(),
+            "exactly one ConnectCancelled terminal: {drained:#?}"
+        );
+
+        a.cancel_connect(connect_id).expect("idempotent cancel");
+        let quiet = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < quiet {
+            drained.extend(a.drain_events(4_096));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            drained
+                .iter()
+                .filter(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+                .count(),
+            1,
+            "no further terminal after the first cancel: {drained:#?}"
+        );
+
+        a.stop();
+        assert!(a.wait_stopped(5_000));
+    }
+
+    #[test]
+    fn cancelling_a_settled_attempt_is_a_no_op_and_the_terminal_is_delivered_once() {
         let a = endpoint(config()).expect("endpoint a");
         let b = endpoint(config()).expect("endpoint b");
         a.start(Arc::new(NoopDoorbell)).expect("start a");
         b.start(Arc::new(NoopDoorbell)).expect("start b");
 
         let connect_id = a
-            .connect_addr(b.listen_addrs()[0].clone())
+            .connect_target(crate::ConnectTarget::Addresses {
+                addresses: vec![b.listen_addrs()[0].clone()],
+            })
             .expect("connect");
         let deadline = Instant::now() + Duration::from_secs(5);
         while a.path(b.peer_id()).expect("path").is_none() && Instant::now() < deadline {
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(10));
         }
         assert!(a.path(b.peer_id()).expect("path").is_some());
 
-        a.cancel_connect(connect_id).expect("cancel");
-        let events = a.drain_events(4_096);
-        assert!(
-            events
+        a.cancel_connect(connect_id).expect("cancel after settle");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut drained = Vec::new();
+        while Instant::now() < deadline {
+            drained.extend(a.drain_events(4_096));
+            if drained
                 .iter()
-                .all(|event| { crate::driver::p2p_connect_id(event) != Some(connect_id) }),
-            "cancelled terminal event was delivered: {events:#?}"
+                .any(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Let the driver run a little longer so a duplicate terminal could
+        // not still be in flight.
+        let quiet = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < quiet {
+            drained.extend(a.drain_events(4_096));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let terminals: Vec<&P2pEvent> = drained
+            .iter()
+            .filter(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+            .collect();
+        assert_eq!(
+            terminals.len(),
+            1,
+            "exactly one terminal event for connect id {connect_id}: {drained:#?}"
         );
+        assert!(
+            matches!(terminals[0], P2pEvent::PathEstablished { .. }),
+            "settled attempt keeps its PathEstablished terminal: {terminals:#?}"
+        );
+
+        a.stop();
+        b.stop();
+        assert!(a.wait_stopped(5_000));
+        assert!(b.wait_stopped(5_000));
+    }
+
+    #[test]
+    fn connect_target_admits_addresses_and_settles_once() {
+        let a = endpoint(config()).expect("endpoint a");
+        let b = endpoint(config()).expect("endpoint b");
+        a.start(Arc::new(NoopDoorbell)).expect("start a");
+        b.start(Arc::new(NoopDoorbell)).expect("start b");
+
+        let connect_id = a
+            .connect_target(crate::ConnectTarget::Addresses {
+                addresses: vec![b.listen_addrs()[0].clone()],
+            })
+            .expect("connect");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut drained = Vec::new();
+        while Instant::now() < deadline {
+            drained.extend(a.drain_events(4_096));
+            if drained.iter().any(|event| {
+                matches!(event, P2pEvent::PathEstablished { connect_id: id, .. } if *id == connect_id)
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let terminals: Vec<&P2pEvent> = drained
+            .iter()
+            .filter(|event| crate::driver::terminal_connect_id(event) == Some(connect_id))
+            .collect();
+        assert_eq!(
+            terminals.len(),
+            1,
+            "exactly one terminal event for connect id {connect_id}: {drained:#?}"
+        );
+        let P2pEvent::PathEstablished { conn_id, .. } = terminals[0] else {
+            panic!("terminal must be PathEstablished: {terminals:#?}");
+        };
+
+        let info = a
+            .connection_info(b.peer_id())
+            .expect("connection info")
+            .expect("connected peer has a transport connection");
+        assert_eq!(info.conn_id, *conn_id);
+        assert!(
+            info.remote_addr
+                .as_deref()
+                .is_some_and(|addr| addr.contains("/quic-v1")),
+            "remote addr records the transport: {info:?}"
+        );
+        assert!(matches!(
+            a.connection_info("not-a-peer-id".into()),
+            Err(FfiError::InvalidPeerId { .. })
+        ));
+        let stranger = minip2p::Ed25519Keypair::from_secret_key_bytes([7; 32])
+            .peer_id()
+            .to_base58();
+        assert_eq!(a.connection_info(stranger).expect("connection info"), None);
 
         a.stop();
         b.stop();
@@ -1753,18 +1896,10 @@ mod tests {
         let connect_id = endpoint
             .connect(remote.to_base58())
             .expect("connection attempt");
-        {
-            let state = endpoint.shared.lock_state();
-            assert!(state.connect_ids.contains_key(&connect_id));
-        }
         endpoint.cancel_connect(connect_id).expect("known cancel");
-        assert!(
-            endpoint
-                .shared
-                .lock_state()
-                .cancelled_connect_ids
-                .contains(&connect_id)
-        );
+        endpoint
+            .cancel_connect(connect_id)
+            .expect("settled cancel is a no-op");
         endpoint.cancel_connect(u64::MAX).expect("unknown cancel");
     }
 

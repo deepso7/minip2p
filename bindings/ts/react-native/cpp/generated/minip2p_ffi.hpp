@@ -36,8 +36,10 @@ class NativeMinip2pFfi : public jsi::HostObject {
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_close_stream_write(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_addr(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_target(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_with_addrs(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_connected_peers(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_connection_info(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip4(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip6(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
@@ -77,8 +79,10 @@ class NativeMinip2pFfi : public jsi::HostObject {
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_close_stream_write(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_target(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
+    jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connection_info(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip4(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);
     jsi::Value cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip6(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count);

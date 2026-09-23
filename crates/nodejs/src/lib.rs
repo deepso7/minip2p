@@ -5,11 +5,11 @@
 use std::sync::Arc;
 
 use minip2p_ffi_core::{
-    DiscoveryOptions, DiscoverySource, DriverFailureKind, EndpointConfig, EndpointErrorKind,
-    EventDoorbell, IdentifyInfo, MdnsOptions, NatErrorKind, P2pEndpoint, P2pEvent, PathKind,
-    Reachability, TransportOptions,
+    ConnectTarget, DiscoveryOptions, DiscoverySource, DriverFailureKind, EndpointConfig,
+    EndpointErrorKind, EventDoorbell, IdentifyInfo, MdnsOptions, NatErrorKind, P2pEndpoint,
+    P2pEvent, PathKind, Reachability, TransportOptions,
 };
-use napi::bindgen_prelude::{BigInt, Uint8Array};
+use napi::bindgen_prelude::{BigInt, Either, Uint8Array};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, Error, Result, Status, Unknown};
 use napi_derive::napi;
@@ -314,6 +314,20 @@ impl NodeEndpoint {
             .map_err(native_error)
     }
 
+    /// Starts one Connection attempt: a peer ID string, or an array of
+    /// complete peer addresses naming one peer. Returns the Connect ID.
+    #[napi]
+    pub fn connect_target(&self, target: Either<String, Vec<String>>) -> Result<BigInt> {
+        let target = match target {
+            Either::A(peer_id) => ConnectTarget::Peer { peer_id },
+            Either::B(addresses) => ConnectTarget::Addresses { addresses },
+        };
+        self.0
+            .connect_target(target)
+            .map(BigInt::from)
+            .map_err(native_error)
+    }
+
     /// Starts a NAT-orchestrated connection attempt.
     #[napi]
     pub fn connect(&self, peer_id: String) -> Result<BigInt> {
@@ -388,6 +402,22 @@ impl NodeEndpoint {
         self.0
             .path(peer_id)
             .map(|path| path.map(path_value))
+            .map_err(native_error)
+    }
+
+    /// Returns the transport connection selected for a peer.
+    #[napi]
+    pub fn connection_info(&self, peer_id: String) -> Result<Option<serde_json::Value>> {
+        self.0
+            .connection_info(peer_id)
+            .map(|info| {
+                info.map(|info| {
+                    serde_json::json!({
+                        "connId": info.conn_id,
+                        "remoteAddr": info.remote_addr,
+                    })
+                })
+            })
             .map_err(native_error)
     }
 
@@ -555,9 +585,14 @@ fn event_value(event: P2pEvent) -> serde_json::Value {
         P2pEvent::EventsDropped {
             dropped,
             total_dropped,
+            terminal_connect_ids,
         } => (
             "EventsDropped",
-            serde_json::json!({ "dropped": dropped, "totalDropped": total_dropped }),
+            serde_json::json!({
+                "dropped": dropped,
+                "totalDropped": total_dropped,
+                "terminalConnectIds": terminal_connect_ids,
+            }),
         ),
         P2pEvent::DriverFailed { kind, detail } => (
             "DriverFailed",
@@ -689,12 +724,14 @@ fn event_value(event: P2pEvent) -> serde_json::Value {
         P2pEvent::PathEstablished {
             connect_id,
             peer_id,
+            conn_id,
             path,
         } => (
             "PathEstablished",
             serde_json::json!({
                 "connectId": connect_id,
                 "peerId": peer_id,
+                "connId": conn_id,
                 "path": path_value(path),
             }),
         ),
@@ -748,6 +785,13 @@ fn event_value(event: P2pEvent) -> serde_json::Value {
                 "kind": nat_error_value(kind),
                 "detail": detail,
             }),
+        ),
+        P2pEvent::ConnectCancelled {
+            connect_id,
+            peer_id,
+        } => (
+            "ConnectCancelled",
+            serde_json::json!({ "connectId": connect_id, "peerId": peer_id }),
         ),
         P2pEvent::InboundDirectUpgrade { peer_id } => (
             "InboundDirectUpgrade",

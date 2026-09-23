@@ -83,8 +83,10 @@ interface NativeModuleInterface {
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_close_stream_write(uniffiSelf: bigint, peerId: Uint8Array, streamId: bigint, uniffi_out_err: UniffiRustCallStatus): void;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect(uniffiSelf: bigint, peerId: Uint8Array, uniffi_out_err: UniffiRustCallStatus): bigint;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_addr(uniffiSelf: bigint, address: Uint8Array, uniffi_out_err: UniffiRustCallStatus): bigint;
+    ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_target(uniffiSelf: bigint, target: Uint8Array, uniffi_out_err: UniffiRustCallStatus): bigint;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_with_addrs(uniffiSelf: bigint, peerId: Uint8Array, addresses: Uint8Array, uniffi_out_err: UniffiRustCallStatus): bigint;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connected_peers(uniffiSelf: bigint, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
+    ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connection_info(uniffiSelf: bigint, peerId: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial(uniffiSelf: bigint, address: Uint8Array, uniffi_out_err: UniffiRustCallStatus): Uint8Array;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip4(uniffiSelf: bigint, address: Uint8Array, uniffi_out_err: UniffiRustCallStatus): bigint;
     ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip6(uniffiSelf: bigint, address: Uint8Array, uniffi_out_err: UniffiRustCallStatus): bigint;
@@ -123,8 +125,10 @@ interface NativeModuleInterface {
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_close_stream_write(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr(): number;
+    ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_target(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers(): number;
+    ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connection_info(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip4(): number;
     ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip6(): number;

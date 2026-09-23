@@ -1,8 +1,8 @@
 //! Thin UniFFI endpoint shell.
 
 use crate::{
-    EndpointConfig, FfiError, IdentifyInfo, KnownPeerInfo, OpenStreamResult, P2pEvent,
-    P2pEventDoorbell, PathKind, Reachability, RelayReservationInfo,
+    ConnectTarget, ConnectionInfo, EndpointConfig, FfiError, IdentifyInfo, KnownPeerInfo,
+    OpenStreamResult, P2pEvent, P2pEventDoorbell, PathKind, Reachability, RelayReservationInfo,
 };
 use std::sync::Arc;
 
@@ -120,6 +120,10 @@ impl P2pEndpoint {
     pub fn abandon_stream(&self, peer_id: String, stream_id: u64) -> Result<(), FfiError> {
         self.0.abandon_stream(peer_id, stream_id)
     }
+    /// Starts one Connection attempt and returns its Connect ID.
+    pub fn connect_target(&self, target: ConnectTarget) -> Result<u64, FfiError> {
+        self.0.connect_target(target)
+    }
     /// Starts a connection attempt.
     pub fn connect(&self, peer_id: String) -> Result<u64, FfiError> {
         self.0.connect(peer_id)
@@ -159,6 +163,10 @@ impl P2pEndpoint {
     /// Returns the current path to a peer.
     pub fn path(&self, peer_id: String) -> Result<Option<PathKind>, FfiError> {
         self.0.path(peer_id)
+    }
+    /// Returns the transport connection selected for a peer.
+    pub fn connection_info(&self, peer_id: String) -> Result<Option<ConnectionInfo>, FfiError> {
+        self.0.connection_info(peer_id)
     }
     /// Returns the discovery address book.
     pub fn known_peers(&self) -> Result<Vec<KnownPeerInfo>, FfiError> {

@@ -82,6 +82,10 @@ export interface NativeEndpoint {
   connect: (peerId: string) => bigint;
   connectAddr: (address: string) => bigint;
   connectedPeers: () => string[];
+  connectionInfo: (
+    peerId: string
+  ) => { readonly connId: bigint; readonly remoteAddr?: string } | null;
+  connectTarget: (target: string | string[]) => bigint;
   connectWithAddrs: (peerId: string, addresses: string[]) => bigint;
   dial: (address: string) => bigint[];
   dialIp4: (address: string) => bigint;
