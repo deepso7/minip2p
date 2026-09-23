@@ -87,6 +87,16 @@ pub struct SwarmRuntime<T: Transport, E: EntropySource> {
     external_addresses: Vec<Multiaddr>,
     external_addresses_revision: u64,
 
+    /// Bumped by every successful `listen*` call so drivers can notice a
+    /// moved listened-address set without re-reading the transport each
+    /// turn. Binding through [`SwarmRuntime::transport_mut`] bypasses it.
+    listened_addrs_revision: u64,
+
+    /// Resolved addresses every successful `listen*` call returned, deduped.
+    /// `Transport::local_addresses` can report bound-but-not-listening
+    /// sockets, so this — not that — is the set that accepts inbound.
+    listened_addrs: Vec<Multiaddr>,
+
     /// Randomness for ping nonces. Injected so the pump stays deterministic
     /// and testable, and so `no_std` hosts can supply their own source.
     entropy: E,
@@ -113,6 +123,8 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
             after_event_actions: VecDeque::new(),
             external_addresses: Vec::new(),
             external_addresses_revision: 0,
+            listened_addrs_revision: 0,
+            listened_addrs: Vec::new(),
             entropy,
         }
     }
@@ -143,12 +155,35 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         self.external_addresses_revision
     }
 
+    /// Returns the wrapping revision of the listened-address set.
+    ///
+    /// Every successful `listen*` call bumps it, letting drivers refresh
+    /// cached listen addresses without asking the transport each turn.
+    /// Binding directly through [`SwarmRuntime::transport_mut`] does not
+    /// bump it.
+    pub fn listened_addrs_revision(&self) -> u64 {
+        self.listened_addrs_revision
+    }
+
+    /// Returns the resolved addresses the transport has confirmed it listens
+    /// on through this runtime's `listen*` methods, deduped.
+    ///
+    /// [`Transport::local_addresses`] reports bound sockets, which on some
+    /// transports exist before — or without — a successful `listen`. For
+    /// "which addresses accept inbound connections", use this set.
+    pub fn listened_addrs(&self) -> &[Multiaddr] {
+        &self.listened_addrs
+    }
+
     /// Returns a reference to the underlying transport.
     pub fn transport(&self) -> &T {
         &self.transport
     }
 
     /// Returns a mutable reference to the underlying transport.
+    ///
+    /// Listeners bound through this escape hatch are invisible to
+    /// [`SwarmRuntime::listened_addrs_revision`]; prefer the `listen*` methods.
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
     }
@@ -241,9 +276,26 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         self.core.connection_id(peer_id)
     }
 
+    /// Returns whether `peer_id` has been surfaced to the application as
+    /// connected — pending dials do not count.
+    pub fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
+        self.core.is_peer_connected(peer_id)
+    }
+
+    /// Bumps the listened-address revision and records `addr` (deduped)
+    /// after a successful `Transport::listen`.
+    fn record_listen(&mut self, addr: &Multiaddr) {
+        self.listened_addrs_revision = self.listened_addrs_revision.wrapping_add(1);
+        if !self.listened_addrs.contains(addr) {
+            self.listened_addrs.push(addr.clone());
+        }
+    }
+
     /// Start listening on the given multiaddr and return the resolved local address.
     pub fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, DriverError> {
-        Ok(self.transport.listen(addr)?)
+        let bound = self.transport.listen(addr)?;
+        self.record_listen(&bound);
+        Ok(bound)
     }
 
     /// Start listening on the transport's already-bound local addresses.
@@ -264,6 +316,9 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         let mut resolved = Vec::with_capacity(addrs.len());
         for addr in addrs {
             let addr = self.transport.listen(&addr)?;
+            // A later bind may still fail, leaving this one bound — record
+            // each successful bind, not the batch.
+            self.record_listen(&addr);
             let peer_addr = PeerAddr::new(addr, self.local_peer_id.clone()).map_err(|e| {
                 TransportError::InvalidConfig {
                     reason: format!("failed to build local PeerAddr: {e}"),
@@ -288,6 +343,7 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
                 reason: "transport does not expose a bound local address".into(),
             })?;
         let addr = self.transport.listen(&addr)?;
+        self.record_listen(&addr);
         Ok(
             PeerAddr::new(addr, self.local_peer_id.clone()).map_err(|e| {
                 TransportError::InvalidConfig {

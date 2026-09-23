@@ -16,9 +16,9 @@ use minip2p_nat::NatEvent;
 use minip2p_pubsub::GossipsubEvent;
 use minip2p_swarm::SwarmEvent;
 
+use super::NatDriver;
 #[cfg(feature = "mdns")]
 use super::mdns::MdnsDriver;
-use super::nat::NatDriver;
 #[cfg(feature = "discovery")]
 use super::pubsub::GossipsubDriver;
 use crate::portable::ConnectEngine;
@@ -184,12 +184,11 @@ impl DiscoveryDriver {
             // would otherwise discard it before the engine sees it.
             let now_ms = swarm.now().monotonic_ms;
             let mut i = 0;
-            while let Some(event) = nat.events.get(i) {
+            while let Some(event) = nat.event_at(i) {
                 let connect_id = nat_connect_id(event);
                 if connect_id.is_some_and(|id| self.inflight.contains_key(&id)) {
                     progressed = true;
-                    let event = nat.events.remove(i).expect("inflight NAT event");
-                    nat.note_removed(i);
+                    let event = nat.remove_event(i);
                     connect.observe_nat(&event, swarm.runtime_mut(), now_ms);
                 } else {
                     i += 1;
@@ -299,8 +298,9 @@ impl DiscoveryDriver {
             let cancel_leg = connect.is_pending(id);
             connect.cancel(id, swarm.runtime_mut());
             if cancel_leg {
-                nat.agent.cancel(id, nat.now());
-                nat.pump(swarm);
+                nat.cancel(id, swarm.now());
+                let now = swarm.now();
+                nat.pump(swarm.runtime_mut(), now);
             }
         }
     }
@@ -319,14 +319,15 @@ impl DiscoveryDriver {
             let cancel_leg = connect.is_pending(id);
             connect.cancel(id, swarm.runtime_mut());
             if cancel_leg {
-                nat.agent.cancel(id, nat.now());
+                nat.cancel(id, swarm.now());
                 cancelled_leg = true;
             }
         }
         self.inflight.clear();
         self.book.reset_dials();
         if cancelled_leg {
-            nat.pump(swarm);
+            let now = swarm.now();
+            nat.pump(swarm.runtime_mut(), now);
         }
     }
 

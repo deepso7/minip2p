@@ -35,8 +35,6 @@ pub use connect::{
 pub(crate) use connect::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS, RelayPolicy};
 mod event_stream;
 pub use event_stream::EndpointEvent;
-#[cfg(any(feature = "nat", feature = "portable-autonat"))]
-pub(crate) use event_stream::nat_event_reaches_application;
 
 #[cfg(feature = "portable-mdns")]
 pub use minip2p_discovery::{
@@ -67,7 +65,7 @@ pub use minip2p_tcp::{SmoltcpConfig, SmoltcpStack, SmoltcpTcpProvider, smoltcp};
 pub use minip2p_tcp::{TcpConfig, TcpProvider, TcpTransport};
 
 #[cfg(feature = "portable-autonat")]
-mod nat;
+use crate::nat::NatDriver;
 
 /// Portable endpoint entry point when the std `Endpoint` is not compiled.
 ///
@@ -478,36 +476,14 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
 
 /// Invalid portable mDNS or peer-discovery configuration.
 #[cfg(feature = "portable-mdns")]
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PortableMdnsConfigError {
     /// Invalid mDNS wire or scheduling policy.
-    Mdns(MdnsConfigError),
+    #[error(transparent)]
+    Mdns(#[from] MdnsConfigError),
     /// Invalid bounded peer-book or automatic-dial policy.
-    Discovery(minip2p_discovery::DiscoveryConfigError),
-}
-
-#[cfg(feature = "portable-mdns")]
-impl From<MdnsConfigError> for PortableMdnsConfigError {
-    fn from(error: MdnsConfigError) -> Self {
-        Self::Mdns(error)
-    }
-}
-
-#[cfg(feature = "portable-mdns")]
-impl From<minip2p_discovery::DiscoveryConfigError> for PortableMdnsConfigError {
-    fn from(error: minip2p_discovery::DiscoveryConfigError) -> Self {
-        Self::Discovery(error)
-    }
-}
-
-#[cfg(feature = "portable-mdns")]
-impl core::fmt::Display for PortableMdnsConfigError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Mdns(error) => error.fmt(formatter),
-            Self::Discovery(error) => error.fmt(formatter),
-        }
-    }
+    #[error(transparent)]
+    Discovery(#[from] minip2p_discovery::DiscoveryConfigError),
 }
 
 /// Portable endpoint composed with an injected mDNS carrier.
@@ -774,36 +750,14 @@ fn remove_failed_autodial(
 
 /// Failure while driving a portable endpoint with mDNS.
 #[cfg(feature = "portable-mdns")]
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PortableMdnsError {
     /// Endpoint transport or swarm failure.
-    Endpoint(DriverError),
+    #[error(transparent)]
+    Endpoint(#[from] DriverError),
     /// mDNS carrier failure.
-    Mdns(MdnsError),
-}
-
-#[cfg(feature = "portable-mdns")]
-impl From<DriverError> for PortableMdnsError {
-    fn from(error: DriverError) -> Self {
-        Self::Endpoint(error)
-    }
-}
-
-#[cfg(feature = "portable-mdns")]
-impl From<MdnsError> for PortableMdnsError {
-    fn from(error: MdnsError) -> Self {
-        Self::Mdns(error)
-    }
-}
-
-#[cfg(feature = "portable-mdns")]
-impl core::fmt::Display for PortableMdnsError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Endpoint(error) => error.fmt(formatter),
-            Self::Mdns(error) => error.fmt(formatter),
-        }
-    }
+    #[error(transparent)]
+    Mdns(#[from] MdnsError),
 }
 
 /// Builder for a [`PortableEndpoint`].
@@ -930,7 +884,7 @@ pub struct SmoltcpEndpoint<D: smoltcp::phy::Device, E: EntropySource> {
     #[cfg(feature = "pubsub")]
     beacon: Option<minip2p_discovery::BeaconAgent>,
     #[cfg(feature = "portable-autonat")]
-    nat: Option<nat::PortableNatDriver>,
+    nat: Option<NatDriver<SharedEntropy<E>>>,
     discovery: Option<minip2p_discovery::PeerDiscoveryAgent>,
     active_dials: BTreeMap<PeerId, ConnectionId>,
 }
@@ -953,6 +907,19 @@ impl<D: smoltcp::phy::Device, E: EntropySource> core::ops::DerefMut for SmoltcpE
 
 #[cfg(feature = "smoltcp")]
 impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
+    /// Pushes NAT-advertised address changes into Identify. Called once per
+    /// poll: the external address set only propagates when Identify runs,
+    /// so changes queued between polls flush on the next one. No-op when
+    /// portable AutoNAT is not configured.
+    fn flush_nat_addresses(&mut self) {
+        #[cfg(feature = "portable-autonat")]
+        if let Some(nat) = self.nat.as_mut()
+            && let Some(addrs) = nat.take_address_change()
+        {
+            self.endpoint.set_external_addresses(addrs);
+        }
+    }
+
     /// Admits one Connection attempt. Sync errors: malformed target only.
     ///
     /// A [`PeerId`] target uses the discovery book's known addresses (when a
@@ -1014,16 +981,16 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         if let Some(nat) = self.nat.as_mut()
             && self.endpoint.is_connect_pending(id)
         {
-            nat.agent.connect(
+            nat.connect(
                 id,
                 peer,
                 minip2p_nat::ConnectLegs {
                     direct_racing,
                     allow_relay: true,
                 },
-                nat::PortableNatDriver::now(now),
+                self.endpoint.runtime_mut(),
+                now,
             );
-            nat.pump(&mut self.endpoint, now);
         }
         #[cfg(not(feature = "portable-autonat"))]
         let _ = (direct_racing, peer);
@@ -1043,7 +1010,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         #[cfg(feature = "portable-autonat")]
         if cancel_leg && let Some(nat) = self.nat.as_mut() {
             nat.cancel(id, now);
-            nat.pump(&mut self.endpoint, now);
+            nat.pump(self.endpoint.runtime_mut(), now);
         }
         self.feed_nat_to_connect(now);
     }
@@ -1059,7 +1026,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     pub fn active_reservation(&self) -> Option<minip2p_nat::ReservationInfo> {
         self.nat
             .as_ref()
-            .and_then(nat::PortableNatDriver::active_reservation)
+            .and_then(|nat| nat.active_reservation().cloned())
     }
 
     /// Returns the current portable AutoNAT reachability verdict.
@@ -1067,7 +1034,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     pub fn reachability(&self) -> minip2p_nat::ReachabilityState {
         self.nat
             .as_ref()
-            .map(|nat| nat.agent.reachability())
+            .map(|nat| nat.reachability())
             .unwrap_or_default()
     }
 
@@ -1171,7 +1138,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         };
         if let Some(nat) = self.nat.as_mut() {
             nat.cancel(*connect_id, now);
-            nat.pump(&mut self.endpoint, now);
+            nat.pump(self.endpoint.runtime_mut(), now);
         }
     }
 
@@ -1216,8 +1183,9 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         self.drive_beacon(now, &mut output);
         #[cfg(feature = "portable-autonat")]
         if let Some(nat) = self.nat.as_mut() {
-            nat.tick(&mut self.endpoint, now);
+            nat.tick(self.endpoint.runtime_mut(), now);
         }
+        self.flush_nat_addresses();
         self.feed_nat_to_connect(now);
         self.emit_connect_events(now, &mut output);
         #[cfg(feature = "portable-autonat")]
@@ -1279,7 +1247,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
                 || self
                     .nat
                     .as_mut()
-                    .is_some_and(|nat| nat.ingest(&event, &mut self.endpoint, now));
+                    .is_some_and(|nat| nat.ingest(&event, self.endpoint.runtime_mut(), now));
             #[cfg(not(feature = "portable-autonat"))]
             let claimed = engine_consumed;
             #[cfg(feature = "pubsub")]
@@ -1431,57 +1399,47 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
 
     /// Returns the earliest deadline across TCP and configured services.
     pub fn next_deadline(&self, now: Now) -> Option<PollDeadline> {
+        // Agents report milliseconds-until-due; the endpoint reports absolute.
+        let at = |timeout: u64| PollDeadline::from_millis(now.monotonic_ms.saturating_add(timeout));
         let mut deadline = self.endpoint.next_deadline(now);
-        let mut timeouts = Vec::new();
-        timeouts.extend(
+        deadline = PollDeadline::earliest_opt(
+            deadline,
             self.mdns
                 .as_ref()
-                .and_then(|agent| agent.next_timeout(now.monotonic_ms)),
+                .and_then(|agent| agent.next_timeout(now.monotonic_ms))
+                .map(at),
         );
         #[cfg(feature = "pubsub")]
         {
             if !self.pending_gossipsub_events.is_empty() {
                 deadline = PollDeadline::earliest_opt(deadline, Some(PollDeadline::IMMEDIATE));
             }
-            timeouts.extend(
+            deadline = PollDeadline::earliest_opt(
+                deadline,
                 self.gossipsub
                     .as_ref()
-                    .and_then(|agent| agent.next_timeout(now.monotonic_ms)),
+                    .and_then(|agent| agent.next_timeout(now.monotonic_ms))
+                    .map(at),
             );
-            timeouts.extend(
+            deadline = PollDeadline::earliest_opt(
+                deadline,
                 self.beacon
                     .as_ref()
-                    .and_then(|agent| agent.next_timeout(now.monotonic_ms)),
+                    .and_then(|agent| agent.next_timeout(now.monotonic_ms))
+                    .map(at),
             );
         }
         #[cfg(feature = "portable-autonat")]
-        if let Some(nat) = self.nat.as_ref()
-            && let Some(timeout) = nat.agent.next_timeout(now.monotonic_ms)
-        {
-            deadline = PollDeadline::earliest_opt(
-                deadline,
-                Some(PollDeadline::from_millis(
-                    now.monotonic_ms.saturating_add(timeout),
-                )),
-            );
-            if !nat.events.is_empty() {
-                deadline = PollDeadline::earliest_opt(deadline, Some(PollDeadline::IMMEDIATE));
-            }
+        if let Some(nat) = self.nat.as_ref() {
+            deadline = PollDeadline::earliest_opt(deadline, nat.next_timeout(now).map(at));
         }
-        timeouts.extend(
+        PollDeadline::earliest_opt(
+            deadline,
             self.discovery
                 .as_ref()
-                .and_then(|agent| agent.next_timeout(now.monotonic_ms)),
-        );
-        for timeout in timeouts {
-            deadline = PollDeadline::earliest_opt(
-                deadline,
-                Some(PollDeadline::from_millis(
-                    now.monotonic_ms.saturating_add(timeout),
-                )),
-            );
-        }
-        deadline
+                .and_then(|agent| agent.next_timeout(now.monotonic_ms))
+                .map(at),
+        )
     }
 
     /// Queues a Gossipsub event as if the agent produced it and the driver has
@@ -1815,9 +1773,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
             let io = SmoltcpMdnsIo::on_stack(self.stack, config.carrier)?;
             let agent =
                 minip2p_mdns::MdnsAgent::new(endpoint.peer_id().clone(), config.mdns.clone(), seed)
-                    .map_err(|error| {
-                        SmoltcpBuildError::MdnsConfig(PortableMdnsConfigError::Mdns(error))
-                    })?;
+                    .map_err(PortableMdnsConfigError::Mdns)?;
             Some(minip2p_mdns::MdnsDriver::new(agent, io, &config.mdns))
         } else {
             None
@@ -1863,10 +1819,9 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
                 .iter()
                 .map(|relay| (relay.peer_id().clone(), relay.transport().clone()))
                 .collect();
-            nat::PortableNatDriver::new(
-                minip2p_nat::NatAgent::new(endpoint.peer_id().clone(), config),
-                relay_addrs,
-            )
+            // The driver seeds the agent's listen addresses on its first turn.
+            let agent = minip2p_nat::NatAgent::new(endpoint.peer_id().clone(), config);
+            NatDriver::new(agent, relay_addrs, self.entropy.clone())
         });
         Ok(SmoltcpEndpoint {
             endpoint,
@@ -1887,178 +1842,71 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
 
 /// Failure while constructing a specialized smoltcp endpoint.
 #[cfg(feature = "smoltcp")]
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SmoltcpBuildError {
     /// The supplied entropy source failed.
-    Entropy(minip2p_platform::EntropyError),
+    #[error(transparent)]
+    Entropy(#[from] minip2p_platform::EntropyError),
     /// Portable swarm configuration was invalid.
-    Swarm(SwarmError),
+    #[error(transparent)]
+    Swarm(#[from] SwarmError),
     /// A listen or transport operation failed.
-    Driver(DriverError),
+    #[error(transparent)]
+    Driver(#[from] DriverError),
     /// A listen address was not a valid multiaddress.
+    #[error("invalid smoltcp listen address {address}: {reason}")]
     ListenAddress { address: String, reason: String },
     /// The mDNS carrier could not be constructed.
-    Mdns(MdnsError),
+    #[error(transparent)]
+    Mdns(#[from] MdnsError),
     /// mDNS or bounded discovery policy was invalid.
-    MdnsConfig(PortableMdnsConfigError),
+    #[error(transparent)]
+    MdnsConfig(#[from] PortableMdnsConfigError),
     /// Gossipsub configuration was invalid.
     #[cfg(feature = "pubsub")]
+    #[error(transparent)]
     Gossipsub(GossipsubConfigError),
     /// The reserved discovery topic was invalid.
     #[cfg(feature = "pubsub")]
-    Topic(TopicError),
+    #[error(transparent)]
+    Topic(#[from] TopicError),
     /// Signed-beacon or bounded discovery policy was invalid.
-    Discovery(minip2p_discovery::DiscoveryConfigError),
+    #[error(transparent)]
+    Discovery(#[from] minip2p_discovery::DiscoveryConfigError),
     /// Portable NAT policy requested an unsupported path.
     #[cfg(feature = "portable-autonat")]
+    #[error("invalid portable NAT config: {reason}")]
     NatConfig { reason: &'static str },
-}
-
-#[cfg(feature = "smoltcp")]
-impl From<minip2p_platform::EntropyError> for SmoltcpBuildError {
-    fn from(error: minip2p_platform::EntropyError) -> Self {
-        Self::Entropy(error)
-    }
-}
-#[cfg(feature = "smoltcp")]
-impl From<SwarmError> for SmoltcpBuildError {
-    fn from(error: SwarmError) -> Self {
-        Self::Swarm(error)
-    }
-}
-#[cfg(feature = "smoltcp")]
-impl From<DriverError> for SmoltcpBuildError {
-    fn from(error: DriverError) -> Self {
-        Self::Driver(error)
-    }
-}
-#[cfg(feature = "smoltcp")]
-impl From<MdnsError> for SmoltcpBuildError {
-    fn from(error: MdnsError) -> Self {
-        Self::Mdns(error)
-    }
-}
-#[cfg(feature = "smoltcp")]
-impl From<PortableMdnsConfigError> for SmoltcpBuildError {
-    fn from(error: PortableMdnsConfigError) -> Self {
-        Self::MdnsConfig(error)
-    }
-}
-#[cfg(feature = "smoltcp")]
-#[cfg(feature = "pubsub")]
-impl From<TopicError> for SmoltcpBuildError {
-    fn from(error: TopicError) -> Self {
-        Self::Topic(error)
-    }
-}
-#[cfg(feature = "smoltcp")]
-impl From<minip2p_discovery::DiscoveryConfigError> for SmoltcpBuildError {
-    fn from(error: minip2p_discovery::DiscoveryConfigError) -> Self {
-        Self::Discovery(error)
-    }
-}
-
-#[cfg(feature = "smoltcp")]
-impl core::fmt::Display for SmoltcpBuildError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Entropy(error) => error.fmt(formatter),
-            Self::Swarm(error) => error.fmt(formatter),
-            Self::Driver(error) => error.fmt(formatter),
-            Self::ListenAddress { address, reason } => {
-                write!(
-                    formatter,
-                    "invalid smoltcp listen address {address}: {reason}"
-                )
-            }
-            Self::Mdns(error) => error.fmt(formatter),
-            Self::MdnsConfig(error) => error.fmt(formatter),
-            #[cfg(feature = "pubsub")]
-            Self::Gossipsub(error) => error.fmt(formatter),
-            #[cfg(feature = "pubsub")]
-            Self::Topic(error) => error.fmt(formatter),
-            Self::Discovery(error) => error.fmt(formatter),
-            #[cfg(feature = "portable-autonat")]
-            Self::NatConfig { reason } => {
-                write!(formatter, "invalid portable NAT config: {reason}")
-            }
-        }
-    }
 }
 
 /// Failure while driving the composed smoltcp endpoint.
 #[cfg(feature = "smoltcp")]
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SmoltcpDriveError {
     /// TCP or swarm progress failed.
-    Endpoint(DriverError),
+    #[error(transparent)]
+    Endpoint(#[from] DriverError),
     /// The mDNS carrier failed.
-    Mdns(MdnsError),
-}
-
-#[cfg(feature = "smoltcp")]
-impl From<DriverError> for SmoltcpDriveError {
-    fn from(error: DriverError) -> Self {
-        Self::Endpoint(error)
-    }
-}
-#[cfg(feature = "smoltcp")]
-impl From<MdnsError> for SmoltcpDriveError {
-    fn from(error: MdnsError) -> Self {
-        Self::Mdns(error)
-    }
-}
-#[cfg(feature = "smoltcp")]
-impl core::fmt::Display for SmoltcpDriveError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Endpoint(error) => error.fmt(formatter),
-            Self::Mdns(error) => error.fmt(formatter),
-        }
-    }
+    #[error(transparent)]
+    Mdns(#[from] MdnsError),
 }
 
 /// Failure from an embedded pubsub operation.
 #[cfg(all(feature = "smoltcp", feature = "pubsub"))]
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, thiserror::Error)]
 pub enum SmoltcpGossipsubError {
     /// `.gossipsub()` or `.discovery()` was not selected on the builder.
+    #[error("gossipsub is not enabled; call .gossipsub() or .discovery()")]
     NotEnabled,
     /// Signed discovery owns this subscription.
+    #[error("signed discovery owns this topic subscription")]
     DiscoveryTopicReserved,
     /// The topic was invalid.
-    Topic(TopicError),
+    #[error(transparent)]
+    Topic(#[from] TopicError),
     /// The message could not be queued.
-    Publish(PublishError),
-}
-
-#[cfg(all(feature = "smoltcp", feature = "pubsub"))]
-impl From<TopicError> for SmoltcpGossipsubError {
-    fn from(error: TopicError) -> Self {
-        Self::Topic(error)
-    }
-}
-#[cfg(all(feature = "smoltcp", feature = "pubsub"))]
-impl From<PublishError> for SmoltcpGossipsubError {
-    fn from(error: PublishError) -> Self {
-        Self::Publish(error)
-    }
-}
-#[cfg(all(feature = "smoltcp", feature = "pubsub"))]
-impl core::fmt::Display for SmoltcpGossipsubError {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::NotEnabled => write!(
-                formatter,
-                "gossipsub is not enabled; call .gossipsub() or .discovery()"
-            ),
-            Self::DiscoveryTopicReserved => {
-                write!(formatter, "signed discovery owns this topic subscription")
-            }
-            Self::Topic(error) => error.fmt(formatter),
-            Self::Publish(error) => error.fmt(formatter),
-        }
-    }
+    #[error(transparent)]
+    Publish(#[from] PublishError),
 }
 
 #[cfg(test)]

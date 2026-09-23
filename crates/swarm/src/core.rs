@@ -670,6 +670,13 @@ impl SwarmCore {
         self.established_peers.iter().cloned().collect()
     }
 
+    /// Returns whether `peer_id` has been surfaced to the application as
+    /// connected. Unlike [`SwarmCore::connection_id`], pending dials and
+    /// other pre-established mappings do not count.
+    pub fn is_peer_connected(&self, peer_id: &PeerId) -> bool {
+        self.established_peers.contains(peer_id)
+    }
+
     /// Returns whether a transport connection is still tracked, including
     /// inbound handshakes that have not yet emitted [`SwarmEvent::ConnectionEstablished`].
     pub fn has_tracked_connections(&self) -> bool {

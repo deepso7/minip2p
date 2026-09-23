@@ -39,8 +39,10 @@ mod dial;
 mod discovery;
 #[cfg(feature = "mdns")]
 mod mdns;
+#[cfg(all(test, feature = "nat", feature = "quic"))]
+mod nat_tests;
 #[cfg(feature = "nat")]
-mod nat;
+type NatDriver = crate::nat::NatDriver<minip2p_platform::StdEntropy>;
 #[cfg(feature = "pubsub")]
 mod pubsub;
 #[cfg(feature = "relay-server")]
@@ -291,7 +293,7 @@ pub struct Endpoint {
     #[cfg(feature = "relay-server")]
     relay_server: Option<relay_server::RelayServerDriver>,
     #[cfg(feature = "nat")]
-    nat: Option<nat::NatDriver>,
+    nat: Option<NatDriver>,
     #[cfg(feature = "pubsub")]
     gossipsub: Option<pubsub::GossipsubDriver>,
     #[cfg(any(feature = "discovery", feature = "mdns"))]
@@ -410,22 +412,7 @@ impl Endpoint {
     /// Starts listening on all transport-bound addresses.
     pub fn listen_all(&mut self) -> Result<Vec<PeerAddr>, Error> {
         let addrs = self.swarm.listen_on_bound_addrs()?;
-        #[cfg(feature = "nat")]
-        self.sync_nat_listen_addrs(&addrs);
         Ok(addrs)
-    }
-
-    /// Seeds the NAT agent's advertised addresses from the bound set
-    /// (wildcards and anything no transport can dial filtered out). No-op when
-    /// NAT is not configured.
-    #[cfg(feature = "nat")]
-    fn sync_nat_listen_addrs(&mut self, addrs: &[PeerAddr]) {
-        if let Some(nat) = self.nat.as_mut() {
-            let transports: Vec<Multiaddr> =
-                addrs.iter().map(|addr| addr.transport().clone()).collect();
-            let validated = minip2p_core::select_direct_addrs(&transports, None, None);
-            nat.agent.set_listen_addrs(&validated);
-        }
     }
 
     /// Dials a remote peer on every applicable local address family.
@@ -544,9 +531,9 @@ impl Endpoint {
         self.connect.cancel(id, self.swarm.runtime_mut());
         #[cfg(feature = "nat")]
         if cancel_leg && let Some(nat) = self.nat.as_mut() {
-            let now = nat.now();
-            nat.agent.cancel(id, now);
-            nat.pump(&mut self.swarm);
+            let now = self.swarm.now();
+            nat.cancel(id, now);
+            nat.pump(self.swarm.runtime_mut(), now);
         }
         self.feed_nat_to_connect();
         self.flush_step_events();
@@ -941,8 +928,7 @@ impl Endpoint {
         ))]
         if let (Some(discovery), Some(nat)) = (self.discovery.as_ref(), self.nat.as_ref()) {
             debug_assert!(
-                nat.events
-                    .iter()
+                nat.queued_events()
                     .all(|event| !discovery.owns_nat_event(event)),
                 "discovery-owned NAT events must be swept before the capability drain"
             );
@@ -1013,9 +999,9 @@ impl Endpoint {
             return;
         };
         if let Some(nat) = self.nat.as_mut() {
-            let now = nat.now();
-            nat.agent.cancel(*connect_id, now);
-            nat.pump(&mut self.swarm);
+            let now = self.swarm.now();
+            nat.cancel(*connect_id, now);
+            nat.pump(self.swarm.runtime_mut(), now);
         }
     }
 
@@ -1110,7 +1096,8 @@ impl Endpoint {
         }
         #[cfg(feature = "nat")]
         if !claimed && let Some(nat) = self.nat.as_mut() {
-            claimed = nat.ingest(event, &mut self.swarm);
+            let now = self.swarm.now();
+            claimed = nat.ingest(event, self.swarm.runtime_mut(), now);
         }
         #[cfg(feature = "pubsub")]
         if !claimed && let Some(pubsub) = self.gossipsub.as_mut() {
@@ -1130,7 +1117,8 @@ impl Endpoint {
         }
         #[cfg(feature = "nat")]
         if let Some(nat) = self.nat.as_mut() {
-            nat.tick(&mut self.swarm);
+            let now = self.swarm.now();
+            nat.tick(self.swarm.runtime_mut(), now);
         }
         #[cfg(feature = "pubsub")]
         if let Some(pubsub) = self.gossipsub.as_mut() {
@@ -1163,7 +1151,7 @@ impl Endpoint {
     /// One wait step's deadline: the caller's, shortened by whichever agent
     /// timer is due first.
     #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-    fn driver_step_deadline(&self, deadline: Deadline) -> Deadline {
+    fn driver_step_deadline(&mut self, deadline: Deadline) -> Deadline {
         let mut step = deadline;
         #[cfg(feature = "relay-server")]
         if let Some(relay_server) = self.relay_server.as_ref()
@@ -1173,7 +1161,7 @@ impl Endpoint {
         }
         #[cfg(feature = "nat")]
         if let Some(nat) = self.nat.as_ref()
-            && let Some(ms) = nat.agent.next_timeout(nat.now().mono_ms)
+            && let Some(ms) = nat.next_timeout(self.swarm.now())
         {
             step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
         }
@@ -1223,7 +1211,8 @@ impl Endpoint {
                 }
                 *expired_poll_used = true;
             }
-            let step = self.connect_step_deadline(self.driver_step_deadline(deadline));
+            let step = self.driver_step_deadline(deadline);
+            let step = self.connect_step_deadline(step);
             // Output queued outside a step (API calls, cancellation) first.
             let queued = self.pending_events.len();
             self.tick_connect();
@@ -1465,7 +1454,7 @@ impl Endpoint {
             let confirmed = self
                 .nat
                 .as_ref()
-                .map(nat::NatDriver::confirmed_public_addrs)
+                .map(NatDriver::confirmed_public_addrs)
                 .unwrap_or_default();
             if let Some(relay_server) = self.relay_server.as_mut() {
                 // The address source comes from local bound listeners; on
@@ -1625,7 +1614,7 @@ impl Endpoint {
     pub fn reachability(&self) -> ReachabilityState {
         self.nat
             .as_ref()
-            .map(|nat| nat.agent.reachability())
+            .map(|nat| nat.reachability())
             .unwrap_or_default()
     }
 
@@ -1634,7 +1623,7 @@ impl Endpoint {
     pub fn active_reservation(&self) -> Option<ReservationInfo> {
         self.nat
             .as_ref()
-            .and_then(|nat| nat.agent.active_reservation().cloned())
+            .and_then(|nat| nat.active_reservation().cloned())
     }
 
     /// Subscribes to a pubsub topic. Returns `Ok(false)` when already
@@ -2924,7 +2913,7 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
             .map(|relay| (relay.peer_id().clone(), relay.transport().clone()))
             .collect();
         let agent = minip2p_nat::NatAgent::new(swarm.local_peer_id().clone(), config);
-        nat::NatDriver::new(agent, relay_addrs)
+        NatDriver::new(agent, relay_addrs, minip2p_platform::StdEntropy)
     });
     #[cfg(feature = "relay-server")]
     let relay_server = parts
@@ -3115,7 +3104,7 @@ fn concrete_relay_listener_addrs(addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
 fn admit_connect(
     connect: &mut ConnectEngine,
     swarm: &mut EndpointSwarm,
-    #[cfg(feature = "nat")] nat: Option<&mut nat::NatDriver>,
+    #[cfg(feature = "nat")] nat: Option<&mut NatDriver>,
     #[cfg(any(feature = "discovery", feature = "mdns"))] book: Option<
         &minip2p_discovery::PeerDiscoveryAgent,
     >,
@@ -3189,17 +3178,17 @@ fn admit_connect(
     if let Some(nat) = nat
         && connect.is_pending(id)
     {
-        let now = nat.now();
-        nat.agent.connect(
+        let now = swarm.now();
+        nat.connect(
             id,
             peer,
             minip2p_nat::ConnectLegs {
                 direct_racing,
                 allow_relay,
             },
+            swarm.runtime_mut(),
             now,
         );
-        nat.pump(swarm);
     }
 
     #[cfg(not(feature = "nat"))]
@@ -4230,8 +4219,7 @@ mod tests {
             .nat
             .as_mut()
             .expect("NAT configured")
-            .events
-            .push_back(NatEvent::ReachabilityChanged {
+            .push_event(NatEvent::ReachabilityChanged {
                 old: ReachabilityState::Unknown,
                 new: ReachabilityState::Private,
                 confirmed_addrs: Vec::new(),
@@ -4302,8 +4290,7 @@ mod tests {
             .nat
             .as_mut()
             .expect("NAT configured")
-            .events
-            .push_back(NatEvent::ReachabilityChanged {
+            .push_event(NatEvent::ReachabilityChanged {
                 old: ReachabilityState::Unknown,
                 new: ReachabilityState::Private,
                 confirmed_addrs: Vec::new(),
@@ -4368,11 +4355,11 @@ mod tests {
                 topic: "test".into(),
             });
         let nat = endpoint.nat.as_mut().unwrap();
-        nat.events.push_back(NatEvent::FellBackToRelay {
+        nat.push_event(NatEvent::FellBackToRelay {
             connect_id: ConnectId::from_u64(99),
             peer: peer.clone(),
         });
-        nat.events.push_back(NatEvent::ReachabilityChanged {
+        nat.push_event(NatEvent::ReachabilityChanged {
             old: ReachabilityState::Unknown,
             new: ReachabilityState::Private,
             confirmed_addrs: Vec::new(),

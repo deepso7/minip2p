@@ -589,3 +589,70 @@ fn relay_preserves_an_explicit_reservation_policy() {
         "ReservationPolicy::Always must survive the .relay() merge"
     );
 }
+
+#[test]
+fn relay_attempt_uses_host_deadline_and_cancellation_settles_once() {
+    for cancel in [false, true] {
+        let bus = VirtualBus::new(1);
+        let local = identity(135);
+        let relay = PeerAddr::new(
+            format!("/ip4/{RELAY_IP}/tcp/4001").parse().unwrap(),
+            identity(136).peer_id(),
+        )
+        .unwrap();
+        let peer = identity(137).peer_id();
+        let mut endpoint = Endpoint::portable(&local, CountingEntropy(53))
+            .connect_deadline_ms(50)
+            .smoltcp(stack(bus.device(0), A_IP))
+            .relay_config(relay_config(relay, ReservationPolicy::Never))
+            .build()
+            .unwrap();
+
+        // Starting well after zero catches deadlines anchored to an internal epoch.
+        let start = Now::from_millis(50_000);
+        let id = endpoint.connect(&peer, start).unwrap();
+        let mut events = endpoint.poll(start).unwrap();
+        assert!(!events.iter().any(|event| matches!(event,
+            EndpointEvent::ConnectSettled { connect_id, .. } if *connect_id == id)));
+        let due = endpoint
+            .next_deadline(start)
+            .expect("pending attempt has a deadline");
+        assert!(due.as_millis() > start.monotonic_ms);
+        assert!(due.as_millis() <= 50_050);
+
+        if cancel {
+            endpoint.cancel_connect(id, Now::from_millis(50_025));
+            endpoint.cancel_connect(id, Now::from_millis(50_025));
+        }
+        events.extend(endpoint.poll(Now::from_millis(50_049)).unwrap());
+        if !cancel {
+            assert!(!events.iter().any(|event| matches!(event,
+                EndpointEvent::ConnectSettled { connect_id, .. } if *connect_id == id)));
+        }
+        events.extend(endpoint.poll(Now::from_millis(50_050)).unwrap());
+        endpoint.cancel_connect(id, Now::from_millis(50_050));
+        // Advancing beyond the abandoned relay dial must not settle the attempt again.
+        events.extend(endpoint.poll(Now::from_millis(100_000)).unwrap());
+        let outcomes: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                EndpointEvent::ConnectSettled {
+                    connect_id,
+                    outcome,
+                    ..
+                } if *connect_id == id => Some(outcome),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outcomes.len(), 1, "{events:?}");
+        if cancel {
+            assert_eq!(outcomes[0], &ConnectOutcome::Cancelled);
+        } else {
+            assert!(matches!(
+                outcomes[0],
+                ConnectOutcome::Failed(ConnectFailure::Timeout { elapsed_ms: 50, .. })
+            ));
+        }
+        assert_eq!(endpoint.path(&peer), None);
+    }
+}

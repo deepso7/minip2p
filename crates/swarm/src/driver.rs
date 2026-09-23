@@ -1085,6 +1085,104 @@ mod tests {
         assert!(swarm.core().local_addresses().is_empty());
     }
 
+    /// Reports two bound addresses and refuses the second listen, so a
+    /// partially applied `listen_on_bound_addrs` batch can be observed.
+    #[derive(Default)]
+    struct PartialListenTransport {
+        listens: usize,
+    }
+
+    impl Transport for PartialListenTransport {
+        fn dial(&mut self, _: &PeerAddr) -> Result<ConnectionId, TransportError> {
+            Err(TransportError::Unsupported { operation: "dial" })
+        }
+
+        fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
+            self.listens += 1;
+            if self.listens == 2 {
+                Err(TransportError::Unsupported {
+                    operation: "listen",
+                })
+            } else {
+                Ok(addr.clone())
+            }
+        }
+
+        fn local_addresses(&self) -> Vec<Multiaddr> {
+            vec![
+                "/ip4/127.0.0.1/tcp/4001".parse().unwrap(),
+                "/ip4/127.0.0.1/tcp/4002".parse().unwrap(),
+            ]
+        }
+
+        fn open_stream(&mut self, _: ConnectionId) -> Result<StreamId, TransportError> {
+            Err(TransportError::Unsupported {
+                operation: "open_stream",
+            })
+        }
+
+        fn send_stream(
+            &mut self,
+            _: ConnectionId,
+            _: StreamId,
+            _: Vec<u8>,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn close_stream_write(
+            &mut self,
+            _: ConnectionId,
+            _: StreamId,
+        ) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn reset_stream(&mut self, _: ConnectionId, _: StreamId) -> Result<(), TransportError> {
+            Err(TransportError::Unsupported {
+                operation: "reset_stream",
+            })
+        }
+
+        fn close(&mut self, _: ConnectionId) -> Result<(), TransportError> {
+            Err(TransportError::Unsupported { operation: "close" })
+        }
+
+        fn poll(&mut self, _: Now) -> Result<Vec<TransportEvent>, TransportError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn listened_addrs_revision_counts_each_successful_listen() {
+        let keypair = Ed25519Keypair::generate();
+        let identify = IdentifyConfig {
+            protocol_version: "test/1".into(),
+            agent_version: "test/1".into(),
+            protocols: Vec::new(),
+            public_key: keypair.public_key().encode_protobuf(),
+        };
+        let mut swarm = Swarm::new(
+            PartialListenTransport::default(),
+            identify,
+            PingConfig::default(),
+            keypair.peer_id(),
+        );
+
+        assert_eq!(swarm.runtime().listened_addrs_revision(), 0);
+        // The first bound address listens; the second fails — the earlier
+        // bind stays live, so the revision must reflect it, and the
+        // listened set must contain only the address that accepted.
+        swarm
+            .listen_on_bound_addrs()
+            .expect_err("second bind fails");
+        assert_eq!(swarm.runtime().listened_addrs_revision(), 1);
+        assert_eq!(
+            swarm.runtime().listened_addrs(),
+            ["/ip4/127.0.0.1/tcp/4001".parse().unwrap()]
+        );
+    }
+
     #[test]
     fn superseded_connection_closes_after_public_event_is_returned() {
         let remote_peer = Ed25519Keypair::generate().peer_id();
