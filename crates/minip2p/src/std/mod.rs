@@ -967,11 +967,7 @@ impl Endpoint {
     /// as NAT events.
     #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
     fn collect_capability_events(&mut self, out: &mut Vec<EndpointEvent>) {
-        #[cfg(all(
-            debug_assertions,
-            feature = "nat",
-            any(feature = "discovery", feature = "mdns")
-        ))]
+        #[cfg(all(debug_assertions, any(feature = "discovery", feature = "mdns")))]
         if let (Some(discovery), Some(nat)) = (self.discovery.as_ref(), self.nat.as_ref()) {
             debug_assert!(
                 nat.queued_events()
@@ -1851,15 +1847,11 @@ impl Endpoint {
                 self.swarm.runtime_mut(),
                 now,
             );
-            // `mdns` implies `nat`.
+            // `mdns` implies `nat`. Shutdown already cleared `inflight`, so
+            // its queued events are not discovery-owned anymore; the next
+            // poll feeds them to the engine and the app like any NAT event.
             if let Some(nat) = self.nat.as_mut() {
                 nat.apply_sweep_work(work, &self.connect, self.swarm.runtime_mut(), now);
-                discovery.claim_nat_events(
-                    nat,
-                    &mut self.connect,
-                    self.swarm.runtime_mut(),
-                    now.monotonic_ms,
-                );
             }
         }
         result

@@ -1179,7 +1179,6 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             if let Some(nat) = self.nat.as_mut() {
                 let (connect, runtime) = self.endpoint.parts_mut();
                 nat.apply_sweep_work(work, connect, runtime, now);
-                discovery.claim_nat_events(nat, connect, runtime, now.monotonic_ms);
             }
             #[cfg(not(feature = "portable-autonat"))]
             drop(work);

@@ -317,6 +317,8 @@ impl<E: EntropySource> NatDriver<E> {
     /// Applies the work a `DiscoveryDriver` sweep queued: attaches legs for
     /// attempts automatic dialing admitted, then pumps once when a leg was
     /// cancelled. Call it right after the sweep.
+    // The only `DiscoveryNatWork` readers; `PendingLeg`'s dead-code `expect`
+    // in discovery.rs repeats this condition — keep them in sync.
     #[cfg(any(
         feature = "portable-autonat",
         all(feature = "nat", any(feature = "discovery", feature = "mdns"))
@@ -394,11 +396,7 @@ impl<E: EntropySource> NatDriver<E> {
     }
 
     /// All queued NAT events, observed or not.
-    #[cfg(all(
-        debug_assertions,
-        feature = "nat",
-        any(feature = "discovery", feature = "mdns")
-    ))]
+    #[cfg(all(debug_assertions, any(feature = "discovery", feature = "mdns")))]
     pub(crate) fn queued_events(&self) -> impl Iterator<Item = &NatEvent> {
         self.events.iter()
     }

@@ -14,11 +14,7 @@ use minip2p_discovery::{BeaconAction, BeaconAgent, BeaconEvent};
 use minip2p_discovery::{DiscoveryAction, DiscoverySource, PeerDiscoveryAgent};
 #[cfg(any(feature = "mdns", feature = "portable-mdns"))]
 use minip2p_mdns::MdnsEvent;
-#[cfg(all(
-    debug_assertions,
-    feature = "nat",
-    any(feature = "discovery", feature = "mdns")
-))]
+#[cfg(all(debug_assertions, any(feature = "discovery", feature = "mdns")))]
 use minip2p_nat::NatEvent;
 use minip2p_platform::{EntropySource, Now};
 #[cfg(feature = "pubsub")]
@@ -174,11 +170,7 @@ impl DiscoveryDriver {
 
     /// Whether `event` belongs to a discovery-owned attempt that the sweep
     /// must hide before the Endpoint drains NAT output.
-    #[cfg(all(
-        debug_assertions,
-        feature = "nat",
-        any(feature = "discovery", feature = "mdns")
-    ))]
+    #[cfg(all(debug_assertions, any(feature = "discovery", feature = "mdns")))]
     pub(crate) fn owns_nat_event(&self, event: &NatEvent) -> bool {
         event
             .connect_id()
