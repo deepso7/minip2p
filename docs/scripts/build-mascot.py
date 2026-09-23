@@ -21,8 +21,9 @@ ROOT = Path(__file__).resolve().parent.parent
 PX = 10  # grid unit, half a logo pixel so the pupil can move inside the eye
 FILL = "#b96c45"
 
-# Cell frame in logo coordinates: the logo's own frame plus headroom for effects.
-X0, Y0, W, H = -30, -110, 820, 620
+# Cell frame in logo coordinates: the logo plus headroom for effects, padded evenly
+# on each axis so the dino sits centred in the frame.
+X0, Y0, W, H = -50, -110, 840, 700
 
 EYE = (60, 8)  # top-left grid cell of the 4x4 eye
 HEAD_X, HEAD_Y = 54, 20  # head = cells right of x=540 and above y=200
