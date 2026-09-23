@@ -148,6 +148,15 @@ pub struct NodeOpenStream {
     pub stream_id: BigInt,
 }
 
+/// State snapshot of the transport connection selected for a peer.
+#[napi(object)]
+pub struct NodeConnectionInfo {
+    /// Transport connection selected for the peer.
+    pub conn_id: BigInt,
+    /// Remote transport address, when recorded.
+    pub remote_addr: Option<String>,
+}
+
 fn convert_transport(options: NodeTransportOptions) -> TransportOptions {
     TransportOptions {
         listen_addrs: options.listen_addrs,
@@ -407,15 +416,13 @@ impl NodeEndpoint {
 
     /// Returns the transport connection selected for a peer.
     #[napi]
-    pub fn connection_info(&self, peer_id: String) -> Result<Option<serde_json::Value>> {
+    pub fn connection_info(&self, peer_id: String) -> Result<Option<NodeConnectionInfo>> {
         self.0
             .connection_info(peer_id)
             .map(|info| {
-                info.map(|info| {
-                    serde_json::json!({
-                        "connId": info.conn_id,
-                        "remoteAddr": info.remote_addr,
-                    })
+                info.map(|info| NodeConnectionInfo {
+                    conn_id: info.conn_id.into(),
+                    remote_addr: info.remote_addr,
                 })
             })
             .map_err(native_error)
