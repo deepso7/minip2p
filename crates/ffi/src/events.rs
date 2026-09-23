@@ -145,8 +145,7 @@ pub enum DriverFailureKind {
 
 /// What a foreign runtime supplies to start one Connection attempt.
 ///
-/// Validation for every form lives here, once; binding shells only adapt
-/// the shape to their toolchain.
+/// Validation lives in `minip2p-ffi-core`; this mirror only declares the shape.
 #[uniffi::remote(Enum)]
 pub enum ConnectTarget {
     /// Peer ID only: the endpoint applies its discovery-book and relay

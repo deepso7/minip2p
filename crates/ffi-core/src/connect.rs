@@ -5,8 +5,8 @@ use crate::{FfiError, parse_direct_peer_addr};
 
 /// What a foreign runtime supplies to start one Connection attempt.
 ///
-/// Validation for every form lives here, once; binding shells only adapt
-/// the shape to their toolchain.
+/// Validation for every form lives in this module, once; binding shells only
+/// adapt the shape to their toolchain.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectTarget {
     /// Peer ID only: the endpoint applies its discovery-book and relay

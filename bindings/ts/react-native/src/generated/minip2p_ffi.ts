@@ -785,8 +785,7 @@ export enum ConnectTarget_Tags {
 /**
  * What a foreign runtime supplies to start one Connection attempt.
  *
- * Validation for every form lives here, once; binding shells only adapt
- * the shape to their toolchain.
+ * Validation lives in `minip2p-ffi-core`; this mirror only declares the shape.
  */
 export const ConnectTarget = (() => {
 
@@ -874,8 +873,7 @@ inner: {addresses: Array<string> }): Addresses_ {
 /**
  * What a foreign runtime supplies to start one Connection attempt.
  *
- * Validation for every form lives here, once; binding shells only adapt
- * the shape to their toolchain.
+ * Validation lives in `minip2p-ffi-core`; this mirror only declares the shape.
  */
 export type ConnectTarget = InstanceType<
     typeof ConnectTarget['Peer' | 'Addresses']

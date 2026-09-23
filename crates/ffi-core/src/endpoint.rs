@@ -393,6 +393,9 @@ impl P2pEndpoint {
     }
 
     /// Requests shutdown without waiting for an in-flight callback.
+    ///
+    /// Unsettled Connection attempts emit no terminal after this: shells must
+    /// settle their pending waits on stop (and on `DriverFailed`) themselves.
     pub fn stop(&self) {
         let _pending = PendingCommand::new(&self.shared);
         let endpoint = {
@@ -578,7 +581,8 @@ impl P2pEndpoint {
         self.connect_target(crate::ConnectTarget::Peer { peer_id })
     }
 
-    /// Starts a NAT connection attempt using an explicit ordered address set.
+    /// Starts a Connection attempt using an explicit address set that must
+    /// name `peer_id`.
     ///
     /// Legacy form; prefer [`Self::connect_target`]. Removed in #181.
     pub fn connect_with_addrs(
