@@ -130,7 +130,7 @@ impl DiscoveryDriver {
 
     /// Beacon topic, when signed beacons are configured. Only pubsub-capable
     /// endpoint compositions read it, for the reserved-topic guard.
-    #[cfg(all(feature = "pubsub", any(feature = "std", feature = "smoltcp")))]
+    #[cfg(all(feature = "pubsub", any(feature = "discovery", feature = "smoltcp")))]
     pub(crate) fn topic(&self) -> Option<&str> {
         self.beacon.as_ref().map(BeaconAgent::topic)
     }

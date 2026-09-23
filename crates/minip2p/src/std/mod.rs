@@ -3034,6 +3034,10 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
         ),
         None => None,
     };
+    // `mdns` enables the shared driver without `discovery`, so no beacon can
+    // be configured; the driver's pubsub slot stays empty in that build.
+    #[cfg(all(feature = "pubsub", feature = "mdns", not(feature = "discovery")))]
+    let beacon = None;
     #[cfg(feature = "mdns")]
     let mdns = match mdns_config {
         Some(config) => {

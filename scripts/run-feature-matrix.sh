@@ -17,6 +17,7 @@ minip2p-rs|default|pubsub
 minip2p-rs|default|nat,pubsub
 minip2p-rs|default|discovery
 minip2p-rs|default|mdns
+minip2p-rs|default|mdns,pubsub
 minip2p-rs|default|discovery,mdns
 minip2p-rs|default|relay-server
 minip2p-rs|default|nat,relay-server

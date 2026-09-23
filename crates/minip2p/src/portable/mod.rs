@@ -576,6 +576,9 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
             &mut expand_concrete,
             now,
         );
+        // The sweep can admit attempts that settle immediately; surface them
+        // now so `claim_settled` clears `inflight` in the same poll.
+        self.emit_connect_events(now, &mut events);
         self.discovery.drain_events(&mut events);
         Ok(events)
     }
@@ -1173,6 +1176,9 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             #[cfg(not(feature = "portable-autonat"))]
             let _ = work;
         }
+        // The shutdown pump can queue NAT terminal events; let the Connection
+        // engine observe them before the application drain filters them out.
+        self.feed_nat_to_connect(now);
         #[cfg(feature = "pubsub")]
         let gossipsub: Vec<_> = self
             .gossipsub
