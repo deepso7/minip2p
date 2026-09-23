@@ -1,6 +1,7 @@
 ---
 import data from "blume:data";
 import PageLayout from "blume/components/layout/PageLayout.astro";
+import Mascot from "../components/mascot.astro";
 
 const { config, navigation, fontCssVars } = data;
 ---
@@ -52,14 +53,11 @@ const { config, navigation, fontCssVars } = data;
       </div>
       <div class="relative isolate order-first w-28 select-none justify-self-center sm:w-48 lg:order-none lg:w-full landscape:max-lg:order-none landscape:max-lg:w-36">
         <div class="pointer-events-none absolute inset-0 -z-10 scale-150 rounded-full bg-accent/15 blur-3xl" aria-hidden="true"></div>
-        <img
-          class="block h-auto w-full"
-          src="/logo.svg"
-          alt="minip2p dinosaur connected to peer nodes"
-          width="960"
-          height="640"
-          fetchpriority="high"
-          draggable="false"
+        <Mascot
+          directions="/mascots/logo-directions.svg"
+          reactions="/mascots/logo-reactions.svg"
+          aspect={820 / 620}
+          label="minip2p dinosaur"
         />
       </div>
       <nav class="flex flex-wrap justify-center gap-x-4 gap-y-2 lg:grid lg:justify-self-end lg:gap-7 landscape:max-lg:col-span-full" aria-label="Get started by platform">
