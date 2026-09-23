@@ -41,14 +41,19 @@ smoltcp = [
   "minip2p-tcp/smoltcp",
   "minip2p-mdns/smoltcp",
 ]
-portable-mdns = ["dep:minip2p-mdns", "dep:minip2p-discovery"]
-portable-autonat = ["smoltcp", "dep:minip2p-nat"]
-portable-relay = ["portable-autonat", "dep:minip2p-circuit"]
-nat = ["std", "dep:minip2p-circuit", "dep:minip2p-nat"]
+portable-mdns = ["dep:minip2p-mdns", "_discovery-driver"]
+portable-autonat = ["smoltcp", "_nat-driver"]
+portable-relay = ["portable-autonat", "_circuit-driver"]
+nat = ["std", "_circuit-driver", "_nat-driver"]
 relay-server = ["std", "dep:minip2p-relay-server"]
 pubsub = ["dep:minip2p-pubsub"]
-discovery = ["nat", "pubsub", "dep:minip2p-discovery"]
-mdns = ["nat", "dep:minip2p-mdns", "dep:minip2p-discovery"]
+discovery = ["nat", "pubsub", "_discovery-driver"]
+mdns = ["nat", "dep:minip2p-mdns", "_discovery-driver"]
+# Internal aliases for capability-driver dependencies, reached only through
+# the public features above; not a supported opt-in surface.
+_circuit-driver = ["dep:minip2p-circuit"]
+_discovery-driver = ["dep:minip2p-discovery"]
+_nat-driver = ["dep:minip2p-nat"]
 
 [dependencies]
 minip2p-core = { path = "../core", version = "0.6.0", default-features = false }

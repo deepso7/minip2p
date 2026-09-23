@@ -17,6 +17,8 @@ use minip2p_swarm::{SwarmEvent, SwarmRuntime};
 use minip2p_transport::{ConnectionId, Transport};
 
 use super::event_stream::EndpointEvent;
+#[cfg(feature = "_nat-driver")]
+use crate::nat::NatDriver;
 
 /// Default Connection-attempt deadline: 30 seconds.
 pub(crate) const DEFAULT_CONNECT_DEADLINE_MS: u64 = 30_000;
@@ -200,7 +202,7 @@ pub(crate) enum RelayPolicy {
     None,
     /// Race direct candidates against the relay; Relayed is provisional.
     #[cfg_attr(
-        all(not(test), not(any(feature = "nat", feature = "portable-autonat"))),
+        all(not(test), not(feature = "_nat-driver")),
         expect(
             dead_code,
             reason = "only NAT-enabled compositions construct a racing relay policy"
@@ -209,7 +211,7 @@ pub(crate) enum RelayPolicy {
     Race,
     /// Skip direct racing; a circuit is a terminal Connected path.
     #[cfg_attr(
-        all(not(test), not(any(feature = "nat", feature = "portable-autonat"))),
+        all(not(test), not(feature = "_nat-driver")),
         expect(
             dead_code,
             reason = "only NAT-enabled compositions construct a forced relay policy"
@@ -290,7 +292,7 @@ enum RelayLeg {
         relay: Option<PeerId>,
     },
     #[cfg_attr(
-        not(any(feature = "nat", feature = "portable-autonat")),
+        not(feature = "_nat-driver"),
         expect(dead_code, reason = "only observe_nat constructs a failed relay leg",)
     )]
     Failed(RelayFailure),
@@ -312,7 +314,7 @@ impl RelayLeg {
     }
 
     #[cfg_attr(
-        not(any(feature = "nat", feature = "portable-autonat")),
+        not(feature = "_nat-driver"),
         expect(dead_code, reason = "only observe_nat reads the relay peer")
     )]
     fn relay_peer(&self) -> Option<PeerId> {
@@ -324,7 +326,7 @@ impl RelayLeg {
     }
 
     #[cfg_attr(
-        not(any(feature = "nat", feature = "portable-autonat")),
+        not(feature = "_nat-driver"),
         expect(dead_code, reason = "only observe_nat records the relay peer")
     )]
     fn set_relay(&mut self, peer: PeerId) {
@@ -440,7 +442,7 @@ impl ConnectEngine {
     }
 
     #[cfg_attr(
-        all(not(test), not(any(feature = "nat", feature = "portable-autonat"))),
+        all(not(test), not(feature = "_nat-driver")),
         expect(
             dead_code,
             reason = "only NAT-enabled compositions start a relay leg after admit"
@@ -448,6 +450,16 @@ impl ConnectEngine {
     )]
     pub(crate) fn is_pending(&self, id: ConnectId) -> bool {
         self.attempts.contains_key(&id)
+    }
+
+    /// Whether admission started any direct dial for the attempt. The NAT
+    /// driver reads this snapshot at leg-attach time to stagger the relay
+    /// leg; it does not track later direct-dial failures.
+    #[cfg(feature = "_nat-driver")]
+    pub(crate) fn dialed_direct(&self, id: ConnectId) -> bool {
+        self.attempts
+            .get(&id)
+            .is_some_and(|attempt| attempt.dialed_any)
     }
 
     /// Idempotent. Settled or unknown ids are a no-op. Never disconnects.
@@ -689,7 +701,7 @@ impl ConnectEngine {
         }
     }
 
-    #[cfg(any(feature = "nat", feature = "portable-autonat"))]
+    #[cfg(feature = "_nat-driver")]
     pub(crate) fn observe_nat<T: Transport, E: EntropySource>(
         &mut self,
         event: &minip2p_nat::NatEvent,
@@ -779,6 +791,96 @@ impl ConnectEngine {
                 self.suppressed.insert(conn_id);
                 runtime.veto_establish(conn_id);
             }
+        }
+    }
+}
+
+/// What one Connection attempt should dial: the peer, its candidate
+/// addresses, and whether a relay leg may race them.
+#[cfg(any(feature = "std", feature = "portable-mdns"))]
+pub(crate) struct ConnectAdmission {
+    pub(crate) peer: PeerId,
+    pub(crate) candidates: Vec<PeerAddr>,
+    pub(crate) allow_relay: bool,
+}
+
+/// Admits one Connection attempt for `peer`: expands each candidate through
+/// `expand` (DNS-shaped resolution on std, identity on portable), selects
+/// the relay policy from the NAT driver, and starts direct dials. Both
+/// Endpoint compositions run this; only the injected `expand` differs.
+///
+/// When the attempt stays pending, the caller attaches its NAT leg with
+/// [`NatDriver::attach_leg`]: the leg needs the composition's concrete
+/// transport while admission works over any [`Transport`].
+#[cfg(any(feature = "std", feature = "portable-mdns"))]
+pub(crate) fn admit_connect<T: Transport, E: EntropySource>(
+    connect: &mut ConnectEngine,
+    runtime: &mut SwarmRuntime<T, E>,
+    #[cfg(feature = "_nat-driver")] nat: Option<&NatDriver<E>>,
+    admission: ConnectAdmission,
+    expand: &mut dyn FnMut(&PeerAddr) -> Result<Vec<PeerAddr>, String>,
+    now_ms: u64,
+) -> ConnectId {
+    let ConnectAdmission {
+        peer,
+        candidates,
+        allow_relay,
+    } = admission;
+    let mut expanded = Vec::new();
+    let mut failed = Vec::new();
+    for addr in &candidates {
+        match expand(addr) {
+            Ok(addrs) => expanded.extend(addrs),
+            Err(reason) => failed.push(CandidateFailure {
+                addr: addr.clone(),
+                reason,
+            }),
+        }
+    }
+
+    #[cfg(feature = "_nat-driver")]
+    let relay = match &nat {
+        Some(driver) if allow_relay && driver.has_relay() => {
+            if driver.force_relay() {
+                RelayPolicy::Forced
+            } else {
+                RelayPolicy::Race
+            }
+        }
+        _ => RelayPolicy::None,
+    };
+    #[cfg(not(feature = "_nat-driver"))]
+    let relay = RelayPolicy::None;
+    #[cfg(not(feature = "_nat-driver"))]
+    let _ = allow_relay;
+
+    #[cfg(feature = "_nat-driver")]
+    let expanded = if matches!(relay, RelayPolicy::Forced) {
+        Vec::new()
+    } else {
+        expanded
+    };
+
+    connect.connect_candidates(peer, expanded, failed, relay, runtime, now_ms)
+}
+
+/// Cancels `id`, routing through the NAT driver (engine cancel plus relay
+/// leg) when the composition has one and through the engine alone
+/// otherwise. Returns `true` when a leg was cancelled and the driver must
+/// `pump` the queued actions.
+#[cfg(feature = "_nat-driver")]
+pub(crate) fn cancel_attempt<T: Transport, E: EntropySource>(
+    connect: &mut ConnectEngine,
+    nat: Option<&mut NatDriver<E>>,
+    id: ConnectId,
+    runtime: &mut SwarmRuntime<T, E>,
+    now: minip2p_platform::Now,
+) -> bool {
+    match nat {
+        Some(nat) => nat.cancel_leg(connect, id, runtime, now),
+        None => {
+            connect.cancel(id, runtime);
+            false
         }
     }
 }

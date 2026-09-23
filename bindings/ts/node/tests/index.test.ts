@@ -63,7 +63,7 @@ describe("@minip2p/node", () => {
 
     try {
       expect(() => endpoint.unsubscribe(topic)).toThrow(
-        "cannot unsubscribe from the discovery topic while discovery is enabled"
+        "the discovery topic is reserved while discovery is enabled"
       );
     } finally {
       endpoint.close();

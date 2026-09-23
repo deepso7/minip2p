@@ -141,6 +141,14 @@ fn invalid(reason: impl Into<String>) -> TransportError {
     }
 }
 
+/// The shared `admit_connect` expansion for the std endpoint: DNS-shaped
+/// resolution into concrete dial targets, with the refusal as display text.
+pub(crate) fn expand_dial_targets(addr: &PeerAddr) -> Result<Vec<PeerAddr>, String> {
+    targets(addr)
+        .map(|targets| targets.into_iter().map(|(_, addr)| addr).collect())
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

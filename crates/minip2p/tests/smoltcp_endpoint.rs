@@ -16,7 +16,7 @@ use minip2p::smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken
 use minip2p::smoltcp::time::Instant;
 use minip2p::smoltcp::wire::{HardwareAddress, IpCidr};
 #[cfg(feature = "pubsub")]
-use minip2p::{BeaconConfig, GossipsubEvent, SmoltcpGossipsubError};
+use minip2p::{BeaconConfig, GossipsubError, GossipsubEvent};
 use minip2p::{
     ConnectOutcome, DiscoveryEvent, Ed25519Keypair, Endpoint, EndpointEvent, EntropySource,
     Multiaddr, Now, PeerAddr, PeerId, PollDeadline, SmoltcpConfig, SmoltcpMdnsConfig, SmoltcpStack,
@@ -714,14 +714,14 @@ fn signed_discovery_reserves_its_pubsub_topic() {
         .expect("discovery endpoint builds");
     let now = Now::from_millis(0);
 
-    assert_eq!(
+    assert!(matches!(
         endpoint.unsubscribe(RESERVED, now),
-        Err(SmoltcpGossipsubError::DiscoveryTopicReserved)
-    );
-    assert_eq!(
+        Err(GossipsubError::DiscoveryTopicReserved)
+    ));
+    assert!(matches!(
         endpoint.publish(RESERVED, b"not a beacon", now),
-        Err(SmoltcpGossipsubError::DiscoveryTopicReserved)
-    );
+        Err(GossipsubError::DiscoveryTopicReserved)
+    ));
 }
 
 #[test]

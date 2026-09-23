@@ -17,6 +17,7 @@ minip2p-rs|default|pubsub
 minip2p-rs|default|nat,pubsub
 minip2p-rs|default|discovery
 minip2p-rs|default|mdns
+minip2p-rs|default|mdns,pubsub
 minip2p-rs|default|discovery,mdns
 minip2p-rs|default|relay-server
 minip2p-rs|default|nat,relay-server
@@ -27,6 +28,8 @@ minip2p-rs|no-default|std,tcp
 minip2p-rs|default|discovery,mdns,tcp
 minip2p-rs|no-default|smoltcp
 minip2p-rs|no-default|smoltcp,pubsub
+minip2p-rs|default|nat,smoltcp
+minip2p-rs|default|nat,portable-mdns
 minip2p-rs|no-default|portable-autonat
 minip2p-rs|no-default|portable-relay
 minip2p-rs|no-default|portable-relay,pubsub

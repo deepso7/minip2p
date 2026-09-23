@@ -721,9 +721,9 @@ impl P2pEndpoint {
 
     /// Returns the shared discovery address-book snapshot.
     pub fn known_peers(&self) -> Result<Vec<KnownPeerInfo>, FfiError> {
-        self.with_endpoint(|endpoint| {
+        self.with_endpoint_mut(|endpoint| {
             let now = endpoint.discovery_now_ms();
-            endpoint
+            Ok(endpoint
                 .known_peers()
                 .into_iter()
                 .map(|peer| KnownPeerInfo {
@@ -735,13 +735,13 @@ impl P2pEndpoint {
                     mdns_last_seen_age_ms: age(now, peer.mdns_last_seen_ms),
                     connected: peer.connected,
                 })
-                .collect()
+                .collect())
         })
     }
 
     /// Returns the discovery driver's monotonic clock in milliseconds.
     pub fn discovery_now_ms(&self) -> Result<Option<u64>, FfiError> {
-        self.with_endpoint(|endpoint| endpoint.discovery_now_ms())
+        self.with_endpoint_mut(|endpoint| Ok(endpoint.discovery_now_ms()))
     }
 
     /// Returns the current AutoNAT reachability verdict.

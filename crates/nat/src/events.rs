@@ -140,3 +140,26 @@ pub enum NatEvent {
     /// connected.
     InboundDirectUpgrade { peer: PeerId },
 }
+
+impl NatEvent {
+    /// The connection attempt this event reports on, when it is scoped to
+    /// one. Reservation and inbound-path events are attempt-independent.
+    ///
+    /// Exhaustive on purpose: adding an attempt-scoped variant without
+    /// returning its `connect_id` here stops the compile.
+    pub fn connect_id(&self) -> Option<ConnectId> {
+        match self {
+            NatEvent::PathEstablished { connect_id, .. }
+            | NatEvent::PathUpgraded { connect_id, .. }
+            | NatEvent::HolePunchFailed { connect_id, .. }
+            | NatEvent::FellBackToRelay { connect_id, .. }
+            | NatEvent::ConnectFailed { connect_id, .. } => Some(*connect_id),
+            NatEvent::ReachabilityChanged { .. }
+            | NatEvent::PublicAddressesChanged { .. }
+            | NatEvent::RelayReserved { .. }
+            | NatEvent::RelayReservationLost { .. }
+            | NatEvent::InboundPathEstablished { .. }
+            | NatEvent::InboundDirectUpgrade { .. } => None,
+        }
+    }
+}
