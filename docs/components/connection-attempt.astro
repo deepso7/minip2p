@@ -1,309 +1,111 @@
 ---
 // The shape of one Connection attempt: direct candidates race a relay leg that
-// starts `relay_stagger_ms` later, a circuit carries traffic while DCUtR punches,
-// and the attempt ends in exactly one ConnectSettled.
+// starts `relay_stagger_ms` later, a circuit carries traffic while DCUtR
+// punches, and the attempt ends in exactly one ConnectSettled.
 //
-// Transform and opacity only, one pass, played when it scrolls into view. The
-// last keyframe of every track IS the finished diagram, so the site-wide
-// reduced-motion guard in theme.css lands on a correct static picture.
+// Transform and opacity only, one pass, played when it scrolls into view. What
+// the markup describes is the *finished* diagram — paths drawn, chips shown —
+// so a browser that never runs the script, or one asking for reduced motion,
+// still gets the explanation. The `animate-*` utilities (see theme.css) only
+// take over while the story plays, because an animation outranks a plain
+// declaration.
 interface Props {
   class?: string;
 }
 
 const { class: className } = Astro.props;
+
+// `data-play` starts the story, `data-reset` rewinds it for Replay; both are
+// set by the script below on the figure, which is the `group`.
+const gate =
+  "group-data-play:[animation-play-state:running]! group-data-reset:animate-none!";
+
+const mono = "font-mono text-xs text-muted-foreground";
+const lane =
+  "grid grid-cols-[11rem_1fr_7rem] items-center gap-4 @max-[34rem]:grid-cols-1 @max-[34rem]:gap-2";
+const track = "relative h-[2px] bg-border";
+const runner = `absolute inset-y-0 right-[9px] left-0 ${gate}`;
+const dot = `absolute -top-1 left-0 size-[9px] rounded-full bg-accent opacity-0 ${gate}`;
+const chip =
+  "justify-self-start whitespace-nowrap rounded-full border border-border px-2 py-0.5 font-mono text-xs text-muted-foreground";
+const liveChip = `${chip} border-accent text-accent ${gate}`;
 ---
 
-<figure class:list={["attempt", className]} data-attempt>
-  <div class="attempt-head">
-    <figcaption>One attempt, four routes, one outcome</figcaption>
-    <button type="button" class="attempt-replay" data-replay>Replay</button>
+<figure class:list={["group @container m-0", className]} data-attempt>
+  <div class="mb-5 flex items-baseline justify-between gap-4">
+    <figcaption class={mono}>One attempt, four routes, one outcome</figcaption>
+    <button
+      type="button"
+      class="hidden cursor-pointer rounded-full border border-border px-3 py-1 font-mono text-xs text-muted-foreground group-data-motion:block hover:bg-muted hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent"
+      data-replay
+    >Replay</button>
   </div>
 
-  <div class="lanes">
-    <div class="lane">
-      <span class="lane-label">QUIC candidate</span>
-      <div class="track">
-        <div class="runner probe"><span class="dot"></span></div>
+  {/* A runner is as wide as its track, so translating it by 100% leaves its
+      (invisible) box hanging past the page. Clip that, not the y axis: the dots
+      and the punch flash sit above and below the 2px line. */}
+  <div class="grid gap-3 overflow-x-clip @max-[34rem]:gap-6">
+    <div class={lane}>
+      <span class={mono}>QUIC candidate</span>
+      <div class={track}>
+        <div class={`${runner} group-data-motion:animate-probe`}>
+          <span class={`${dot} group-data-motion:animate-probe-dot`}></span>
+        </div>
       </div>
-      <span class="chip">no route</span>
+      <span class={chip}>no route</span>
     </div>
 
-    <div class="lane">
-      <span class="lane-label">TCP candidate</span>
-      <div class="track">
-        <div class="runner probe probe-late"><span class="dot"></span></div>
+    <div class={lane}>
+      <span class={mono}>TCP candidate</span>
+      <div class={track}>
+        <div class={`${runner} group-data-motion:animate-probe-late`}>
+          <span class={`${dot} group-data-motion:animate-probe-dot-late`}></span>
+        </div>
       </div>
-      <span class="chip">no route</span>
+      <span class={chip}>no route</span>
     </div>
 
-    <div class="lane">
-      <span class="lane-label">relay leg <b>+200 ms</b></span>
-      <div class="track">
-        <span class="path path-relay"></span>
-        <div class="runner relay"><span class="dot"></span></div>
+    <div class={lane}>
+      <span class={mono}>relay leg <span class="text-accent">+200 ms</span></span>
+      <div class={track}>
+        <span
+          class={`absolute inset-x-0 top-0 origin-left border-t-2 border-dashed border-accent opacity-25 ${gate} group-data-motion:animate-relay-path`}
+        ></span>
+        <div class={`${runner} group-data-motion:animate-relay`}>
+          <span class={`${dot} group-data-motion:animate-relay-dot`}></span>
+        </div>
       </div>
-      <span class="chip chip-live chip-relayed">Relayed</span>
+      <span class={`${liveChip} opacity-25 group-data-motion:animate-relay-chip`}>Relayed</span>
     </div>
 
-    <div class="lane">
-      <span class="lane-label">DCUtR hole punch</span>
-      <div class="track">
-        <span class="path path-direct"></span>
-        <div class="runner punch-l"><span class="dot"></span></div>
-        <div class="runner punch-r"><span class="dot dot-right"></span></div>
-        <span class="flash"></span>
+    <div class={lane}>
+      <span class={mono}>DCUtR hole punch</span>
+      <div class={track}>
+        <span
+          class={`absolute inset-0 origin-left bg-accent ${gate} group-data-motion:animate-direct-path`}
+        ></span>
+        <div class={`${runner} group-data-motion:animate-punch-left`}>
+          <span class={`${dot} group-data-motion:animate-punch-dot`}></span>
+        </div>
+        <div class={`${runner} group-data-motion:animate-punch-right`}>
+          <span class={`${dot} right-0 left-auto group-data-motion:animate-punch-dot`}></span>
+        </div>
+        <span
+          class={`absolute -top-1 left-1/2 -ml-[4.5px] size-[9px] rounded-full bg-accent opacity-0 ${gate} group-data-motion:animate-flash`}
+        ></span>
       </div>
-      <span class="chip chip-live chip-direct">Direct</span>
+      <span class={`${liveChip} group-data-motion:animate-direct-chip`}>Direct</span>
     </div>
   </div>
 
-  <p class="settled"><span class="chip chip-live chip-settled">ConnectSettled · Connected</span></p>
+  <p class="mt-5 mb-0 pl-48 @max-[34rem]:pl-0">
+    <span class={`${liveChip} group-data-motion:animate-settled-chip`}>ConnectSettled · Connected</span>
+  </p>
 </figure>
 
-<style>
-  .attempt {
-    margin: 0;
-    container-type: inline-size;
-  }
-  .attempt-head {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 1rem;
-    margin-bottom: 1.25rem;
-  }
-  .attempt figcaption {
-    font-family: var(--blume-font-mono, ui-monospace, monospace);
-    font-size: 0.75rem;
-    color: var(--blume-muted-foreground);
-  }
-  .attempt-replay {
-    padding: 0.25rem 0.75rem;
-    border: 1px solid var(--blume-border);
-    border-radius: 999px;
-    background: transparent;
-    color: var(--blume-muted-foreground);
-    font: inherit;
-    font-size: 0.75rem;
-    cursor: pointer;
-  }
-  .attempt-replay:hover {
-    color: var(--blume-foreground);
-    background: var(--blume-muted);
-  }
-  .attempt-replay:focus-visible {
-    outline: 2px solid var(--blume-accent);
-    outline-offset: 4px;
-  }
-
-  .lanes {
-    display: grid;
-    gap: var(--lane-gap);
-    /* A runner is as wide as its track, so translating it by 100% leaves its
-       (invisible) box hanging past the page. Clip that, not the y axis: the
-       dots and the punch flash sit above and below the 2px line. */
-    overflow-x: clip;
-  }
-  .lanes { --lane-gap: 0.75rem; }
-  .lane {
-    display: grid;
-    grid-template-columns: 11rem 1fr 7rem;
-    align-items: center;
-    gap: 1rem;
-  }
-  .lane-label,
-  .chip {
-    font-family: var(--blume-font-mono, ui-monospace, monospace);
-    font-size: 0.75rem;
-    color: var(--blume-muted-foreground);
-  }
-  .lane-label b {
-    font-weight: 400;
-    color: var(--blume-accent);
-  }
-  .chip {
-    justify-self: start;
-    padding: 0.2rem 0.55rem;
-    border: 1px solid var(--blume-border);
-    border-radius: 999px;
-    white-space: nowrap;
-  }
-  .chip-live {
-    border-color: var(--blume-accent);
-    color: var(--blume-accent);
-    opacity: 0;
-  }
-  .settled {
-    margin: 1.25rem 0 0;
-    padding-left: 12rem;
-  }
-
-  .track {
-    position: relative;
-    height: 2px;
-    background: var(--blume-border);
-  }
-  /* A runner spans the track minus the dot, so a 100% translate lands the dot
-     exactly on the far node at any width — no pixel distances to maintain. */
-  .runner {
-    position: absolute;
-    inset: 0 9px 0 0;
-  }
-  .dot {
-    position: absolute;
-    top: -4px;
-    left: 0;
-    width: 9px;
-    height: 9px;
-    border-radius: 999px;
-    background: var(--blume-accent);
-    opacity: 0;
-  }
-  .dot-right {
-    left: auto;
-    right: 0;
-  }
-  .path {
-    position: absolute;
-    inset: 0;
-    transform: scaleX(0);
-    transform-origin: left center;
-  }
-  .path-relay {
-    background: repeating-linear-gradient(
-      90deg,
-      var(--blume-accent) 0 6px,
-      transparent 6px 12px
-    );
-  }
-  .path-direct {
-    background: var(--blume-accent);
-  }
-  .flash {
-    position: absolute;
-    top: -4px;
-    left: 50%;
-    width: 9px;
-    height: 9px;
-    margin-left: -4.5px;
-    border-radius: 999px;
-    background: var(--blume-accent);
-    opacity: 0;
-  }
-
-  @keyframes probe-run {
-    0% { transform: translateX(0); }
-    100% { transform: translateX(100%); }
-  }
-  @keyframes probe-dot {
-    0% { opacity: 0; }
-    12% { opacity: 1; }
-    88% { opacity: 1; }
-    100% { opacity: 0.2; }
-  }
-  @keyframes relay-run {
-    0% { transform: translateX(0); }
-    45% { transform: translateX(50%); }
-    55% { transform: translateX(50%); }
-    100% { transform: translateX(100%); }
-  }
-  @keyframes draw {
-    0% { transform: scaleX(0); }
-    100% { transform: scaleX(1); }
-  }
-  @keyframes dim {
-    0% { opacity: 1; }
-    100% { opacity: 0.25; }
-  }
-  @keyframes punch-l-run {
-    0% { transform: translateX(0); }
-    100% { transform: translateX(46%); }
-  }
-  @keyframes punch-r-run {
-    0% { transform: translateX(0); }
-    100% { transform: translateX(-46%); }
-  }
-  /* The punch dots exist only until they meet; the drawn path is the result. */
-  @keyframes punch-dot {
-    0% { opacity: 0; }
-    12% { opacity: 1; }
-    88% { opacity: 1; }
-    100% { opacity: 0; }
-  }
-  @keyframes flash-pop {
-    0% { opacity: 0; transform: scale(0.4); }
-    40% { opacity: 1; transform: scale(1.6); }
-    100% { opacity: 0; transform: scale(1.6); }
-  }
-  @keyframes rise {
-    0% { opacity: 0; transform: translateY(4px); }
-    100% { opacity: 1; transform: translateY(0); }
-  }
-
-  /* Without scripts the diagram is simply finished: paths drawn, chips shown.
-     `data-motion` (set by the script below) is what opts into the animation,
-     and `data-play` starts it once the figure is on screen. */
-  .attempt:not([data-motion]) :is(.path, .chip-live) {
-    transform: scaleX(1);
-    opacity: 1;
-  }
-  /* …with the relay leg already dimmed, as it is once DCUtR has landed. */
-  .attempt:not([data-motion]) :is(.path-relay, .chip-relayed) {
-    opacity: 0.25;
-  }
-  .attempt:not([data-motion]) .attempt-replay {
-    display: none;
-  }
-  .attempt[data-motion] :is(.runner, .dot, .path, .flash, .chip-live) {
-    animation-play-state: paused;
-    animation-fill-mode: both;
-    animation-timing-function: var(--minip2p-ease);
-    animation-duration: var(--minip2p-step);
-  }
-  .attempt[data-motion][data-play] :is(.runner, .dot, .path, .flash, .chip-live) {
-    animation-play-state: running;
-  }
-  /* One frame with no animation at all: how Replay rewinds, since toggling
-     play-state only resumes a finished animation where it stopped. */
-  .attempt[data-reset] :is(.runner, .dot, .path, .flash, .chip-live) {
-    animation: none !important;
-  }
-
-  .probe { animation-name: probe-run; }
-  .probe .dot { animation-name: probe-dot; }
-  .probe-late,
-  .probe-late .dot { animation-delay: 150ms; }
-
-  .relay { animation-name: relay-run; animation-duration: calc(var(--minip2p-step) * 2); animation-delay: 200ms; }
-  .relay .dot { animation-name: probe-dot; animation-duration: calc(var(--minip2p-step) * 2); animation-delay: 200ms; }
-  .path-relay { animation-name: draw, dim; animation-duration: var(--minip2p-duration-base), var(--minip2p-duration-base); animation-delay: calc(var(--minip2p-step) * 2.2), calc(var(--minip2p-step) * 4); }
-  .chip-relayed { animation-name: rise, dim; animation-duration: var(--minip2p-duration-base), var(--minip2p-duration-base); animation-delay: calc(var(--minip2p-step) * 2.2), calc(var(--minip2p-step) * 4); }
-
-  .punch-l { animation-name: punch-l-run; animation-delay: calc(var(--minip2p-step) * 2.6); }
-  .punch-r { animation-name: punch-r-run; animation-delay: calc(var(--minip2p-step) * 2.6); }
-  .punch-l .dot,
-  .punch-r .dot { animation-name: punch-dot; animation-delay: calc(var(--minip2p-step) * 2.6); }
-  .flash { animation-name: flash-pop; animation-duration: var(--minip2p-duration-base); animation-delay: calc(var(--minip2p-step) * 3.5); }
-  .path-direct { animation-name: draw; animation-duration: var(--minip2p-duration-base); animation-delay: calc(var(--minip2p-step) * 3.8); }
-  .chip-direct { animation-name: rise; animation-duration: var(--minip2p-duration-base); animation-delay: calc(var(--minip2p-step) * 4); }
-  .chip-settled { animation-name: rise; animation-duration: var(--minip2p-duration-base); animation-delay: calc(var(--minip2p-step) * 4.4); }
-
-  /* Narrow: the label sits above its own track so it never shrinks, and the
-     chip moves under the lane instead of stealing track width. */
-  @container (max-width: 34rem) {
-    .lanes { --lane-gap: 1.5rem; }
-    .lane {
-      grid-template-columns: 1fr auto;
-      gap: 0.5rem 0.75rem;
-    }
-    .lane-label { grid-column: 1 / -1; }
-    .track { grid-column: 1 / -1; }
-    .chip { grid-column: 1 / -1; }
-    .settled { padding-left: 0; }
-  }
-</style>
-
 <script>
+  const THRESHOLD = 0.35;
+
   for (const figure of document.querySelectorAll<HTMLElement>("[data-attempt]")) {
     // Scripts run, so the diagram may animate rather than stand finished.
     figure.dataset.motion = "";
@@ -318,13 +120,19 @@ const { class: className } = Astro.props;
       const seen = new IntersectionObserver(
         (entries, observer) => {
           for (const entry of entries) {
-            if (entry.isIntersecting) {
+            // `isIntersecting` flips on the first pixel, so wait for the share
+            // the threshold asks for — unless the figure is taller than the
+            // viewport, where that share can never be reached.
+            const readable =
+              entry.intersectionRatio >= THRESHOLD ||
+              entry.intersectionRect.height >= window.innerHeight * 0.6;
+            if (entry.isIntersecting && readable) {
               play();
               observer.disconnect();
             }
           }
         },
-        { threshold: 0.35 }
+        { threshold: [0, THRESHOLD] }
       );
       seen.observe(figure);
     }

@@ -124,3 +124,184 @@
     scroll-behavior: auto !important;
   }
 }
+
+/* Landing-page diagram motion.
+ *
+ * Tailwind turns every `--animate-*` into an `animate-<name>` utility, so a
+ * component says `animate-relay-path` and the choreography — which keyframes,
+ * how long, how far into the story — lives here in one readable column.
+ *
+ * Each one is `paused`; the diagrams start themselves when they scroll into
+ * view. The last keyframe is always the finished picture, so the
+ * reduced-motion guard above lands on a correct diagram rather than a blank
+ * one, and so does a browser that never runs the script.
+ */
+@theme {
+  --animate-probe: probe-run var(--minip2p-step) var(--minip2p-ease) both paused;
+  --animate-probe-dot: probe-dot var(--minip2p-step) var(--minip2p-ease) both
+    paused;
+  --animate-probe-late: probe-run var(--minip2p-step) var(--minip2p-ease) 150ms
+    both paused;
+  --animate-probe-dot-late: probe-dot var(--minip2p-step) var(--minip2p-ease)
+    150ms both paused;
+
+  --animate-relay: relay-run calc(var(--minip2p-step) * 2) var(--minip2p-ease)
+    200ms both paused;
+  --animate-relay-dot: probe-dot calc(var(--minip2p-step) * 2)
+    var(--minip2p-ease) 200ms both paused;
+  --animate-relay-path:
+    draw var(--minip2p-duration-base) var(--minip2p-ease)
+      calc(var(--minip2p-step) * 2.2) both paused,
+    dim var(--minip2p-duration-base) var(--minip2p-ease)
+      calc(var(--minip2p-step) * 4) both paused;
+  /* The chip is opacity only, so `dim` fills forwards: a backwards fill would
+     override `rise` and show the chip from the first frame. */
+  --animate-relay-chip:
+    rise var(--minip2p-duration-base) var(--minip2p-ease)
+      calc(var(--minip2p-step) * 2.2) both paused,
+    dim var(--minip2p-duration-base) var(--minip2p-ease)
+      calc(var(--minip2p-step) * 4) forwards paused;
+
+  --animate-punch-left: punch-l-run var(--minip2p-step) var(--minip2p-ease)
+    calc(var(--minip2p-step) * 2.6) both paused;
+  --animate-punch-right: punch-r-run var(--minip2p-step) var(--minip2p-ease)
+    calc(var(--minip2p-step) * 2.6) both paused;
+  --animate-punch-dot: punch-dot var(--minip2p-step) var(--minip2p-ease)
+    calc(var(--minip2p-step) * 2.6) both paused;
+  --animate-flash: flash-pop var(--minip2p-duration-base) var(--minip2p-ease)
+    calc(var(--minip2p-step) * 3.5) both paused;
+  --animate-direct-path: draw var(--minip2p-duration-base) var(--minip2p-ease)
+    calc(var(--minip2p-step) * 3.8) both paused;
+  --animate-direct-chip: rise var(--minip2p-duration-base) var(--minip2p-ease)
+    calc(var(--minip2p-step) * 4) both paused;
+  --animate-settled-chip: rise var(--minip2p-duration-base) var(--minip2p-ease)
+    calc(var(--minip2p-step) * 4.4) both paused;
+
+  --animate-event-first: arrive var(--minip2p-duration-base) var(--minip2p-ease)
+    120ms both paused;
+  --animate-event-second: arrive var(--minip2p-duration-base)
+    var(--minip2p-ease) 360ms both paused;
+  --animate-event-third: arrive var(--minip2p-duration-base) var(--minip2p-ease)
+    600ms both paused;
+}
+
+/* A runner box spans its track, so translating it by 100% lands the dot on the
+   far node at any width — no pixel distances to keep in sync. */
+@keyframes probe-run {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+@keyframes probe-dot {
+  0% {
+    opacity: 0;
+  }
+  12% {
+    opacity: 1;
+  }
+  88% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.2;
+  }
+}
+/* The relay leg pauses at the relay before carrying on to the peer. */
+@keyframes relay-run {
+  0% {
+    transform: translateX(0);
+  }
+  45% {
+    transform: translateX(50%);
+  }
+  55% {
+    transform: translateX(50%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+@keyframes draw {
+  0% {
+    transform: scaleX(0);
+  }
+  100% {
+    transform: scaleX(1);
+  }
+}
+@keyframes dim {
+  0% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0.25;
+  }
+}
+@keyframes punch-l-run {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(46%);
+  }
+}
+@keyframes punch-r-run {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(-46%);
+  }
+}
+/* The punch dots exist only until they meet; the drawn path is the result. */
+@keyframes punch-dot {
+  0% {
+    opacity: 0;
+  }
+  12% {
+    opacity: 1;
+  }
+  88% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+@keyframes flash-pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.4);
+  }
+  40% {
+    opacity: 1;
+    transform: scale(1.6);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.6);
+  }
+}
+@keyframes rise {
+  0% {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes arrive {
+  0% {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
