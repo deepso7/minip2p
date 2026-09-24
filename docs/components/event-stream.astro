@@ -1,7 +1,7 @@
 ---
-// One `wait` call, then the events it hands back in Endpoint emission order.
+// The loop: each `wait` call returns one event, in Endpoint emission order.
 // Same rules as the attempt diagram: transform and opacity, one pass on reveal,
-// last keyframe is the finished state.
+// last keyframe is the finished state, finished is also the no-script default.
 interface Props {
   class?: string;
 }
@@ -13,7 +13,7 @@ const { class: className } = Astro.props;
   <div class="layout">
     <div class="call">
       <span class="call-label">your loop</span>
-      <code>node.wait(deadline)?</code>
+      <code>match node.wait(deadline)? &#123; … &#125;</code>
     </div>
 
     <ol class="events">
@@ -23,7 +23,10 @@ const { class: className } = Astro.props;
     </ol>
   </div>
 
-  <figcaption>One ordered stream. Every event delivered once.</figcaption>
+  <figcaption>
+    One ordered stream: each call returns the next event, never a batch. One
+    possible order &mdash; a path can still upgrade after the attempt settles.
+  </figcaption>
 </figure>
 
 <style>
@@ -59,6 +62,13 @@ const { class: className } = Astro.props;
     font-family: var(--blume-font-mono, ui-monospace, monospace);
     font-size: 0.8125rem;
   }
+  /* Each row is one turn of the loop, so each carries its own call marker. */
+  .event::before {
+    content: "wait →";
+    font-family: var(--blume-font-mono, ui-monospace, monospace);
+    font-size: 0.6875rem;
+    color: var(--blume-muted-foreground);
+  }
   .events {
     display: grid;
     gap: 0.5rem;
@@ -93,14 +103,18 @@ const { class: className } = Astro.props;
     100% { opacity: 1; transform: translateY(0); }
   }
 
-  .stream .event {
+  /* No script: the stream simply stands complete. */
+  .stream:not([data-motion]) .event {
+    opacity: 1;
+  }
+  .stream[data-motion] .event {
     animation-play-state: paused;
     animation-fill-mode: both;
     animation-name: arrive;
     animation-duration: var(--minip2p-duration-base);
     animation-timing-function: var(--minip2p-ease);
   }
-  .stream[data-play] .event {
+  .stream[data-motion][data-play] .event {
     animation-play-state: running;
   }
   .event:nth-child(1) { animation-delay: 120ms; }
@@ -118,6 +132,9 @@ const { class: className } = Astro.props;
 
 <script>
   for (const figure of document.querySelectorAll<HTMLElement>("[data-stream]")) {
+    // Scripts run, so the stream may animate rather than stand finished.
+    figure.dataset.motion = "";
+
     const play = () => {
       figure.dataset.play = "";
     };
