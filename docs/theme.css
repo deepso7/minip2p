@@ -116,7 +116,11 @@
   *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+    /* Delays too: a landing-page diagram staged over seconds would otherwise
+       stay blank for that long before snapping to its end state. */
+    animation-delay: -1ms !important;
     transition-duration: 0.01ms !important;
+    transition-delay: 0s !important;
     scroll-behavior: auto !important;
   }
 }
