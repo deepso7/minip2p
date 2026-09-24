@@ -512,7 +512,7 @@ function visitTerminalIds(
   if (event.tag === "ConnectionClosed") {
     visit(connectionIds, Reflect.get(event.inner, "connId"));
   }
-  if (isTerminalConnectEvent(event)) {
+  if (isLastConnectIdEvent(event)) {
     visit(connectIds, Reflect.get(event.inner, "connectId"));
   }
   if (event.tag === "EventsDropped") {
@@ -522,20 +522,31 @@ function visitTerminalIds(
         visit(connectIds, id);
       }
     }
+    if (Reflect.get(event.inner, "terminalConnectIdsTruncated") === true) {
+      // The SDK fails every undelivered attempt on truncation, so their
+      // mappings must go too.
+      for (const id of connectIds.publicIds()) {
+        visit(connectIds, id);
+      }
+    }
   }
   if (event.tag === "StreamClosed") {
     visit(streamIds, Reflect.get(event.inner, "streamId"));
   }
 }
 
-function isTerminalConnectEvent(event: {
+// The last event that can carry a Connect ID — not the attempt-terminal set:
+// a relayed PathEstablished may still be followed by PathUpgraded on the same
+// id, so only a direct PathEstablished, PathUpgraded, ConnectFailed, or
+// ConnectCancelled ends the id's lifetime. A relayed settle with no later
+// upgrade keeps its mapping (known gap, tracked in #184).
+function isLastConnectIdEvent(event: {
   readonly tag?: unknown;
   readonly inner?: unknown;
 }): boolean {
   if (
     event.tag === "ConnectCancelled" ||
     event.tag === "ConnectFailed" ||
-    event.tag === "FellBackToRelay" ||
     event.tag === "PathUpgraded"
   ) {
     return true;
@@ -696,6 +707,10 @@ class IdMap {
       throw new RangeError(`Unknown native identifier ${publicId}`);
     }
     return native;
+  }
+
+  publicIds(): number[] {
+    return [...this.#nativeByPublic.keys()];
   }
 
   deletePublic(value: unknown): void {

@@ -22,6 +22,7 @@ const native = vi.hoisted(() => {
     discoveryClock: bigint | null = null;
     abandonError: Error | undefined;
     onDrain: ((call: number) => void) | undefined;
+    nextConnectId = 30n;
 
     constructor(
       _secretKey: Uint8Array,
@@ -81,11 +82,15 @@ const native = vi.hoisted(() => {
     closeStreamWrite(): void {}
 
     connect(): bigint {
-      return 30n;
+      const id = this.nextConnectId;
+      this.nextConnectId += 1n;
+      return id;
     }
 
     connectAddr(): bigint {
-      return 30n;
+      const id = this.nextConnectId;
+      this.nextConnectId += 1n;
+      return id;
     }
 
     connectedPeers(): string[] {
@@ -93,7 +98,9 @@ const native = vi.hoisted(() => {
     }
 
     connectWithAddrs(): bigint {
-      return 30n;
+      const id = this.nextConnectId;
+      this.nextConnectId += 1n;
+      return id;
     }
 
     dial(): bigint[] {
@@ -505,6 +512,34 @@ describe("Node adapter", () => {
     const second = endpoint.startConnect("remote");
 
     expect([first, second]).toEqual([1, 2]);
+    endpoint.close();
+  });
+
+  test("truncated EventsDropped releases every pending connect identifier", async () => {
+    vi.useFakeTimers();
+    const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
+    const first = endpoint.startConnect("remote");
+    const second = endpoint.startConnect("remote");
+    expect([first, second]).toEqual([1, 2]);
+
+    fake.enqueue([
+      {
+        inner: {
+          dropped: 2n,
+          terminalConnectIds: [],
+          terminalConnectIdsTruncated: true,
+          totalDropped: 2n,
+        },
+        tag: "EventsDropped",
+      },
+    ]);
+
+    fake.ring();
+    await settle();
+
+    expect(() => endpoint.cancelConnect(first)).toThrowError(RangeError);
+    expect(() => endpoint.cancelConnect(second)).toThrowError(RangeError);
     endpoint.close();
   });
 
