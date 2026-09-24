@@ -1460,12 +1460,12 @@ export class Minip2pBase {
   // Terminals dropped by the native carry arrive as EventsDropped ids: settle
   // each tracked attempt with a delivery-loss error so waits cannot hang. A
   // truncated list cannot name every dropped terminal, so every tracked
-  // attempt settles.
+  // attempt without a delivered terminal settles.
   #connectResultsLost(connectIds: readonly number[], truncated: boolean): void {
     const lost = truncated ? [...this.#connects.keys()] : connectIds;
     for (const connectId of lost) {
       const attempt = this.#connects.get(connectId);
-      if (attempt === undefined) {
+      if (attempt === undefined || attempt.terminal !== undefined) {
         continue;
       }
       const error = new ConnectResultLostError(connectId);

@@ -526,6 +526,42 @@ test("truncated EventsDropped settles every pending connect result", async () =>
   endpoint.close();
 });
 
+test("truncated EventsDropped keeps a delivered connect terminal", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const connectId = endpoint.startConnect("peer");
+
+  backend.emit({
+    inner: {
+      connId: 7,
+      connectId,
+      path: { tag: PathKind_Tags.DirectDialed },
+      peerId: "peer",
+    },
+    tag: P2pEvent_Tags.PathEstablished,
+  });
+  backend.emit({
+    inner: {
+      dropped: 1,
+      terminalConnectIds: [],
+      terminalConnectIdsTruncated: true,
+      totalDropped: 1,
+    },
+    tag: P2pEvent_Tags.EventsDropped,
+  });
+  await tick();
+
+  assert.deepEqual(
+    await endpoint.waitConnectResult(connectId, { timeoutMs: 0 }),
+    {
+      connectId,
+      path: { kind: "directDialed" },
+      peerId: "peer",
+    }
+  );
+  endpoint.close();
+});
+
 test("ping coalesces native work while caller abort remains independent", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
