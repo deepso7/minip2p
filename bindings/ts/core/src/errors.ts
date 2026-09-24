@@ -97,6 +97,19 @@ export class ConnectFailedError extends Error {
   }
 }
 
+/** A terminal connection event was dropped by the bounded native event carry. */
+export class ConnectResultLostError extends Error {
+  readonly connectId: number;
+
+  constructor(connectId: number) {
+    super(
+      `Connection result ${connectId} was lost: the native event carry dropped its terminal event; check connectedPeers()/path() to recover state`
+    );
+    this.name = "ConnectResultLostError";
+    this.connectId = connectId;
+  }
+}
+
 /** A connection result is unknown, already awaited, or already consumed. */
 export class ConnectResultUnavailableError extends Error {
   readonly connectId: number;

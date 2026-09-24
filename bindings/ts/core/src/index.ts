@@ -3,6 +3,7 @@ export {
   BackpressureError,
   ClosedError,
   ConnectFailedError,
+  ConnectResultLostError,
   ConnectResultUnavailableError,
   DriverFailedError,
   EventQueueOverflowError,
