@@ -218,7 +218,6 @@ class NodeBackend implements Minip2pBackend {
 
   cancelConnect(id: number): void {
     this.#endpoint.cancelConnect(this.#connectIds.toNative(id));
-    this.#connectIds.deletePublic(id);
   }
 
   disconnect(peerId: string): void {
@@ -525,6 +524,7 @@ function isTerminalConnectEvent(event: {
   readonly inner?: unknown;
 }): boolean {
   if (
+    event.tag === "ConnectCancelled" ||
     event.tag === "ConnectFailed" ||
     event.tag === "FellBackToRelay" ||
     event.tag === "PathUpgraded"

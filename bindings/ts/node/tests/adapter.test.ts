@@ -425,14 +425,30 @@ describe("Node adapter", () => {
     endpoint.close();
   });
 
-  test("forgets connect identifiers after cancellation", () => {
+  test("forgets connect identifiers after cancellation", async () => {
+    vi.useFakeTimers();
     const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
     const first = endpoint.startConnect("remote");
 
     endpoint.cancelConnect(first);
-    const second = endpoint.startConnect("remote");
+    // The mapping outlives the cancel call until the ConnectCancelled
+    // terminal arrives, so a second cancel still resolves the native id.
+    endpoint.cancelConnect(first);
+    fake.enqueue([
+      {
+        inner: { connectId: 30n, peerId: "remote" },
+        tag: "ConnectCancelled",
+      },
+    ]);
 
-    expect([first, second]).toEqual([1, 2]);
+    fake.ring();
+    await settle();
+
+    // The terminal normalized to `first` and eventHandled released the
+    // mapping; no fresh public id was minted for the same native id.
+    expect(() => endpoint.cancelConnect(first)).toThrowError(RangeError);
+    expect(() => endpoint.cancelConnect(2)).toThrowError(RangeError);
     endpoint.close();
   });
 
