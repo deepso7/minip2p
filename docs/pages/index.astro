@@ -2,8 +2,34 @@
 import data from "blume:data";
 import PageLayout from "blume/components/layout/PageLayout.astro";
 import Mascot from "../components/mascot.astro";
+import ConnectionAttempt from "../components/connection-attempt.astro";
+import EventStream from "../components/event-stream.astro";
+// The dialer the docs build compiles, verbatim: the landing page cannot drift
+// from code that works.
+import dialer from "../snippets/quickstart/src/bin/dialer.rs?raw";
 
 const { config, navigation, fontCssVars } = data;
+
+const platforms = [
+  {
+    body:
+      "QUIC over quiche with libp2p TLS certificates, and TCP upgraded with Noise XX and Yamux. One transport set routes each address to the transport that serves its shape.",
+    label: "Transports",
+    title: "QUIC and TCP",
+  },
+  {
+    body:
+      "The core crates build for thumbv7em with no operating system. TCP runs over smoltcp, and mDNS discovery comes with it.",
+    label: "Embedded",
+    title: "no_std + alloc",
+  },
+  {
+    body:
+      "One binding-agnostic FFI core, wrapped by napi-rs for Node and UniFFI for React Native, under a shared TypeScript SDK.",
+    label: "Bindings",
+    title: "Node and React Native",
+  },
+];
 ---
 
 <PageLayout
@@ -75,13 +101,128 @@ const { config, navigation, fontCssVars } = data;
         </a>
       </nav>
     </section>
-    <footer class="shrink-0 px-6 py-3 text-center sm:py-4 text-xs text-muted-foreground landscape:max-lg:py-2">
-      Made with <svg class="inline-block size-3.5 fill-accent align-middle" viewBox="0 0 24 24" role="img" aria-label="love"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78Z" /></svg> by <a
-        class="text-foreground no-underline underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent"
-        href="https://deepso.sh"
-        target="_blank"
-        rel="noopener noreferrer"
-      >deepso</a>
-    </footer>
+    <p class="shrink-0 pb-3 text-center sm:pb-4 landscape:max-lg:pb-2">
+      <a
+        class="font-mono text-xs text-muted-foreground no-underline hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent"
+        href="#how-it-works"
+      >How it works <span aria-hidden="true">↓</span></a>
+    </p>
   </div>
+
+  <div class="mx-auto max-w-7xl px-6 lg:px-8">
+    <section class="border-t border-border py-16 sm:py-20" id="how-it-works" aria-labelledby="attempt-title">
+      <div class="grid gap-8 lg:grid-cols-[minmax(0,22rem)_minmax(0,1fr)] lg:gap-16">
+        <div>
+          <p class="m-0 font-mono text-xs uppercase tracking-wide text-muted-foreground">Connection attempt</p>
+          <h2 class="mt-4 mb-0 text-2xl font-medium leading-tight tracking-tighter sm:text-3xl" id="attempt-title">
+            Many routes.<br />One outcome.
+          </h2>
+          <p class="mt-4 mb-0 text-sm leading-relaxed text-muted-foreground sm:text-base">
+            Call <code class="font-mono text-[0.9em] text-foreground">connect</code> once and you get one Connect ID back.
+            Direct QUIC and TCP candidates race a relay leg that starts 200&nbsp;ms later, and a relayed circuit can carry
+            traffic while DCUtR punches a direct path.
+          </p>
+          <p class="mt-3 mb-0 text-sm leading-relaxed text-muted-foreground sm:text-base">
+            Whichever route wins, the attempt ends in exactly one{" "}
+            <code class="font-mono text-[0.9em] text-foreground">ConnectSettled</code>.
+          </p>
+          <p class="mt-5 mb-0">
+            <a
+              class="text-sm text-foreground underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent"
+              href="/rust/traverse-nat"
+            >Traverse NAT <span aria-hidden="true">↗</span></a>
+          </p>
+        </div>
+        <ConnectionAttempt />
+      </div>
+    </section>
+
+    <section class="border-t border-border py-16 sm:py-20" aria-labelledby="loop-title">
+      <div class="grid gap-8 lg:grid-cols-[minmax(0,1fr)_minmax(0,22rem)] lg:gap-16">
+        <EventStream class="order-last lg:order-first" />
+        <div>
+          <p class="m-0 font-mono text-xs uppercase tracking-wide text-muted-foreground">Sans-I/O</p>
+          <h2 class="mt-4 mb-0 text-2xl font-medium leading-tight tracking-tighter sm:text-3xl" id="loop-title">
+            You drive<br />the loop.
+          </h2>
+          <p class="mt-4 mb-0 text-sm leading-relaxed text-muted-foreground sm:text-base">
+            Nothing runs behind your back. The protocol crates are deterministic state machines: you hand them bytes and a
+            timestamp, they hand you events and a deadline. Sockets, clocks and timers live only in adapters.
+          </p>
+          <p class="mt-3 mb-0 text-sm leading-relaxed text-muted-foreground sm:text-base">
+            Connections, streams, NAT paths, Gossipsub and discovery all leave through one ordered event stream, so a
+            single{" "}<code class="font-mono text-[0.9em] text-foreground">wait</code> loop sees everything, exactly once.
+          </p>
+          <p class="mt-5 mb-0">
+            <a
+              class="text-sm text-foreground underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent"
+              href="/rust/drive-events"
+            >Drive events <span aria-hidden="true">↗</span></a>
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section class="border-t border-border py-16 sm:py-20" aria-labelledby="platforms-title">
+      <p class="m-0 font-mono text-xs uppercase tracking-wide text-muted-foreground">Same core everywhere</p>
+      <h2 class="mt-4 mb-0 max-w-xl text-2xl font-medium leading-tight tracking-tighter sm:text-3xl" id="platforms-title">
+        From a server to a microcontroller.
+      </h2>
+      <div class="mt-10 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        {
+          platforms.map((platform) => (
+            <div class="rounded-xl border border-border p-6">
+              <p class="m-0 font-mono text-xs uppercase tracking-wide text-accent">{platform.label}</p>
+              <p class="mt-3 mb-0 text-lg font-medium">{platform.title}</p>
+              <p class="mt-2 mb-0 text-sm leading-relaxed text-muted-foreground">{platform.body}</p>
+            </div>
+          ))
+        }
+        <div class="rounded-xl bg-muted p-6 sm:col-span-2 lg:col-span-3">
+          <p class="m-0 font-mono text-xs uppercase tracking-wide text-muted-foreground">Also inside</p>
+          <p class="mt-3 mb-0 text-sm leading-relaxed text-muted-foreground">
+            Circuit Relay v2 reservations and circuits, StrictSign Gossipsub pinned against go-libp2p, signed presence beacons
+            and mDNS discovery — with <code class="font-mono text-[0.9em] text-foreground">unsafe</code> forbidden across
+            the workspace.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section class="border-t border-border py-16 sm:py-20" aria-labelledby="start-title">
+      <p class="m-0 font-mono text-xs uppercase tracking-wide text-muted-foreground">Quickstart</p>
+      <h2 class="mt-4 mb-0 text-2xl font-medium leading-tight tracking-tighter sm:text-3xl" id="start-title">
+        Connect, then drive.
+      </h2>
+      <p class="mt-4 mb-0 max-w-xl text-sm leading-relaxed text-muted-foreground sm:text-base">
+        The dialer below is the quickstart binary this site compiles in CI, shown verbatim.
+      </p>
+      <div class="mt-8 overflow-hidden rounded-xl border border-border">
+        <div class="flex items-center justify-between gap-4 border-b border-border bg-muted px-4 py-3">
+          <span class="font-mono text-xs">dialer.rs</span>
+          <span class="font-mono text-xs text-muted-foreground">cargo add minip2p-rs</span>
+        </div>
+        <pre class="m-0 overflow-x-auto p-5 font-mono text-xs leading-relaxed sm:text-[0.8125rem]"><code>{dialer}</code></pre>
+      </div>
+      <div class="mt-6 flex flex-wrap gap-4">
+        <a
+          class="text-sm text-foreground underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent"
+          href="/rust/install"
+        >Rust quickstart <span aria-hidden="true">↗</span></a>
+        <a
+          class="text-sm text-foreground underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent"
+          href="/typescript/start"
+        >TypeScript quickstart <span aria-hidden="true">↗</span></a>
+      </div>
+    </section>
+  </div>
+
+  <footer class="mx-auto max-w-7xl shrink-0 px-6 py-6 text-center text-xs text-muted-foreground lg:px-8">
+    Made with <svg class="inline-block size-3.5 fill-accent align-middle" viewBox="0 0 24 24" role="img" aria-label="love"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78Z" /></svg> by <a
+      class="text-foreground no-underline underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-accent"
+      href="https://deepso.sh"
+      target="_blank"
+      rel="noopener noreferrer"
+    >deepso</a>
+  </footer>
 </PageLayout>

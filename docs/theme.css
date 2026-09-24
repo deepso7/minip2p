@@ -5,6 +5,13 @@
   --minip2p-black: oklch(0.17 0.008 250);
   --minip2p-white: oklch(0.95 0.006 60);
 
+  /* Motion. Landing-page diagrams share these; one step of the story is
+     `--minip2p-step`, and every ease matches the mascot's settle. */
+  --minip2p-duration-fast: 120ms;
+  --minip2p-duration-base: 200ms;
+  --minip2p-step: 900ms;
+  --minip2p-ease: cubic-bezier(0.2, 0, 0, 1);
+
   --blume-background: var(--minip2p-white);
   --blume-foreground: var(--minip2p-black);
   --blume-muted: color-mix(
@@ -98,4 +105,18 @@
     var(--blume-muted-foreground) 55%,
     transparent
   );
+}
+
+/* One guard for the whole site: animations collapse to their end state, which
+   every landing-page diagram authors as its finished state. The mascot keeps
+   its own check because it animates from script. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
