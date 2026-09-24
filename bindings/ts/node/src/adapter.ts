@@ -433,7 +433,8 @@ function normalizeNativeValue(
     return bigintToNumber(value, "native value");
   }
   if (Array.isArray(value)) {
-    return value.map((item) => normalizeNativeValue(item, undefined, maps));
+    const itemKey = key === "terminalConnectIds" ? "connectId" : undefined;
+    return value.map((item) => normalizeNativeValue(item, itemKey, maps));
   }
   if (value instanceof Uint8Array) {
     return value;
@@ -513,6 +514,14 @@ function visitTerminalIds(
   }
   if (isTerminalConnectEvent(event)) {
     visit(connectIds, Reflect.get(event.inner, "connectId"));
+  }
+  if (event.tag === "EventsDropped") {
+    const dropped = Reflect.get(event.inner, "terminalConnectIds");
+    if (Array.isArray(dropped)) {
+      for (const id of dropped) {
+        visit(connectIds, id);
+      }
+    }
   }
   if (event.tag === "StreamClosed") {
     visit(streamIds, Reflect.get(event.inner, "streamId"));

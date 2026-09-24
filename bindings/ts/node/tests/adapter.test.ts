@@ -452,6 +452,34 @@ describe("Node adapter", () => {
     endpoint.close();
   });
 
+  test("normalizes and releases connect identifiers in EventsDropped", async () => {
+    vi.useFakeTimers();
+    const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
+    const first = endpoint.startConnect("remote");
+    const dropped: Record<string, unknown>[] = [];
+    endpoint.on("eventsDropped", (event) => dropped.push(event));
+    fake.enqueue([
+      {
+        inner: {
+          dropped: 1n,
+          terminalConnectIds: [30n],
+          totalDropped: 1n,
+        },
+        tag: "EventsDropped",
+      },
+    ]);
+
+    fake.ring();
+    await settle();
+
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]?.terminalConnectIds).toEqual([first]);
+    // eventHandled released the mapping like a terminal event would.
+    expect(() => endpoint.cancelConnect(first)).toThrowError(RangeError);
+    endpoint.close();
+  });
+
   test("forgets connect identifiers after a direct PathEstablished", async () => {
     vi.useFakeTimers();
     const endpoint = createEndpoint();
