@@ -1193,7 +1193,10 @@ export class Minip2pBase {
       this.#connectTerminal(event);
     }
     if (event.tag === P2pEvent_Tags.EventsDropped) {
-      this.#connectResultsLost(event.inner.terminalConnectIds);
+      this.#connectResultsLost(
+        event.inner.terminalConnectIds,
+        event.inner.terminalConnectIdsTruncated
+      );
     }
 
     const normalized = normalizeEvent(event);
@@ -1455,9 +1458,12 @@ export class Minip2pBase {
   }
 
   // Terminals dropped by the native carry arrive as EventsDropped ids: settle
-  // each tracked attempt with a delivery-loss error so waits cannot hang.
-  #connectResultsLost(connectIds: readonly number[]): void {
-    for (const connectId of connectIds) {
+  // each tracked attempt with a delivery-loss error so waits cannot hang. A
+  // truncated list cannot name every dropped terminal, so every tracked
+  // attempt settles.
+  #connectResultsLost(connectIds: readonly number[], truncated: boolean): void {
+    const lost = truncated ? [...this.#connects.keys()] : connectIds;
+    for (const connectId of lost) {
       const attempt = this.#connects.get(connectId);
       if (attempt === undefined) {
         continue;

@@ -464,6 +464,7 @@ describe("Node adapter", () => {
         inner: {
           dropped: 1n,
           terminalConnectIds: [30n],
+          terminalConnectIdsTruncated: false,
           totalDropped: 1n,
         },
         tag: "EventsDropped",

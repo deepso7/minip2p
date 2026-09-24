@@ -185,6 +185,7 @@ export interface Minip2pNamedEventMap {
     readonly dropped: number;
     readonly totalDropped: number;
     readonly terminalConnectIds: readonly number[];
+    readonly terminalConnectIdsTruncated: boolean;
   };
   driverFailed: {
     readonly kind: DriverFailureKind;
@@ -413,7 +414,12 @@ interface RawEvent<Tag extends P2pEventTag, Inner> {
 export type P2pEvent =
   | RawEvent<
       typeof P2pEvent_Tags.EventsDropped,
-      { dropped: number; totalDropped: number; terminalConnectIds: number[] }
+      {
+        dropped: number;
+        totalDropped: number;
+        terminalConnectIds: number[];
+        terminalConnectIdsTruncated: boolean;
+      }
     >
   | RawEvent<
       typeof P2pEvent_Tags.DriverFailed,

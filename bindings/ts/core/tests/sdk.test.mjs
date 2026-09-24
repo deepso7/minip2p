@@ -340,8 +340,8 @@ test("connect operations resolve paths and advanced results are one-shot", async
   const connectId = endpoint.startConnect("peer");
   backend.emit({
     inner: {
-      connectId,
       connId: 7,
+      connectId,
       path: { tag: PathKind_Tags.DirectDialed },
       peerId: "peer",
     },
@@ -351,8 +351,8 @@ test("connect operations resolve paths and advanced results are one-shot", async
 
   assert.deepEqual(established, [
     {
-      connectId,
       connId: 7,
+      connectId,
       path: { kind: "directDialed" },
       peerId: "peer",
     },
@@ -444,6 +444,7 @@ test("EventsDropped settles pending connect results with a lost error", async ()
     inner: {
       dropped: 1,
       terminalConnectIds: [connectId],
+      terminalConnectIdsTruncated: false,
       totalDropped: 1,
     },
     tag: P2pEvent_Tags.EventsDropped,
@@ -456,7 +457,12 @@ test("EventsDropped settles pending connect results with a lost error", async ()
     return true;
   });
   assert.deepEqual(dropped, [
-    { dropped: 1, terminalConnectIds: [connectId], totalDropped: 1 },
+    {
+      dropped: 1,
+      terminalConnectIds: [connectId],
+      terminalConnectIdsTruncated: false,
+      totalDropped: 1,
+    },
   ]);
   endpoint.close();
 });
@@ -470,6 +476,7 @@ test("EventsDropped stores a lost terminal for results not yet awaited", async (
     inner: {
       dropped: 1,
       terminalConnectIds: [connectId],
+      terminalConnectIdsTruncated: false,
       totalDropped: 1,
     },
     tag: P2pEvent_Tags.EventsDropped,
@@ -484,6 +491,38 @@ test("EventsDropped stores a lost terminal for results not yet awaited", async (
       return true;
     }
   );
+  endpoint.close();
+});
+
+test("truncated EventsDropped settles every pending connect result", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const first = endpoint.startConnect("peer");
+  const second = endpoint.startConnect("peer");
+  const waitingFirst = endpoint.waitConnectResult(first, { timeoutMs: 0 });
+  const waitingSecond = endpoint.waitConnectResult(second, { timeoutMs: 0 });
+
+  backend.emit({
+    inner: {
+      dropped: 1,
+      terminalConnectIds: [],
+      terminalConnectIdsTruncated: true,
+      totalDropped: 1,
+    },
+    tag: P2pEvent_Tags.EventsDropped,
+  });
+  await tick();
+
+  for (const [waiting, connectId] of [
+    [waitingFirst, first],
+    [waitingSecond, second],
+  ]) {
+    await assert.rejects(waiting, (error) => {
+      assert.ok(error instanceof ConnectResultLostError);
+      assert.equal(error.connectId, connectId);
+      return true;
+    });
+  }
   endpoint.close();
 });
 
@@ -529,8 +568,8 @@ test("queue overflow rejects operations whose native terminals may be lost", asy
   });
   backend.emit({
     inner: {
-      connectId: 1,
       connId: 7,
+      connectId: 1,
       path: { tag: PathKind_Tags.DirectDialed },
       peerId: "peer",
     },

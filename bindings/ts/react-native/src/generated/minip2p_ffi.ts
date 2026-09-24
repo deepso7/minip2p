@@ -2130,7 +2130,7 @@ export const P2pEvent = (() => {
     type EventsDropped__interface = {
         tag: P2pEvent_Tags.EventsDropped;
         inner:
-Readonly<{dropped: bigint; totalDropped: bigint; terminalConnectIds: Array<bigint>}>
+Readonly<{dropped: bigint; totalDropped: bigint; terminalConnectIds: Array<bigint>; terminalConnectIdsTruncated: boolean}>
     };
     /**
      * Native event carry overflow discarded source events.
@@ -2143,15 +2143,15 @@ Readonly<{dropped: bigint; totalDropped: bigint; terminalConnectIds: Array<bigin
         readonly [uniffiTypeNameSymbol] = "P2pEvent";
         readonly tag = P2pEvent_Tags.EventsDropped;
         readonly inner:
-Readonly<{dropped: bigint; totalDropped: bigint; terminalConnectIds: Array<bigint>}>;
+Readonly<{dropped: bigint; totalDropped: bigint; terminalConnectIds: Array<bigint>; terminalConnectIdsTruncated: boolean}>;
         constructor(
-inner: {dropped: bigint; totalDropped: bigint; terminalConnectIds: Array<bigint> }) {
+inner: {dropped: bigint; totalDropped: bigint; terminalConnectIds: Array<bigint>; terminalConnectIdsTruncated: boolean }) {
             super("P2pEvent", "EventsDropped");
 
             this.inner = Object.freeze(inner);
         }
         static new(
-inner: {dropped: bigint; totalDropped: bigint; terminalConnectIds: Array<bigint> }): EventsDropped_ {
+inner: {dropped: bigint; totalDropped: bigint; terminalConnectIds: Array<bigint>; terminalConnectIdsTruncated: boolean }): EventsDropped_ {
             return new EventsDropped_(inner);
         }
 
@@ -3379,7 +3379,7 @@ const FfiConverterTypeP2pEvent = (() => {
     class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
         readFromCursor(c: Cursor): TypeName {
             switch (c.readI32()) {
-                case 1: return new P2pEvent.EventsDropped({dropped: FfiConverterUInt64.readFromCursor(c), totalDropped: FfiConverterUInt64.readFromCursor(c), terminalConnectIds: FfiConverterSequenceUInt64.readFromCursor(c) });
+                case 1: return new P2pEvent.EventsDropped({dropped: FfiConverterUInt64.readFromCursor(c), totalDropped: FfiConverterUInt64.readFromCursor(c), terminalConnectIds: FfiConverterSequenceUInt64.readFromCursor(c), terminalConnectIdsTruncated: FfiConverterBool.readFromCursor(c) });
                 case 2: return new P2pEvent.DriverFailed({kind: FfiConverterTypeDriverFailureKind.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
                 case 3: return new P2pEvent.ConnectionEstablished({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c) });
                 case 4: return new P2pEvent.ConnectionClosed({peerId: FfiConverterString.readFromCursor(c), connId: FfiConverterUInt64.readFromCursor(c) });
@@ -3425,6 +3425,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     FfiConverterUInt64.writeIntoCursor(inner.dropped, c);
                     FfiConverterUInt64.writeIntoCursor(inner.totalDropped, c);
                     FfiConverterSequenceUInt64.writeIntoCursor(inner.terminalConnectIds, c);
+                    FfiConverterBool.writeIntoCursor(inner.terminalConnectIdsTruncated, c);
                     return;
                 }
                 case P2pEvent_Tags.DriverFailed: {
@@ -3698,6 +3699,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     size += FfiConverterUInt64.allocationSize(inner.dropped);
                     size += FfiConverterUInt64.allocationSize(inner.totalDropped);
                     size += FfiConverterSequenceUInt64.allocationSize(inner.terminalConnectIds);
+                    size += FfiConverterBool.allocationSize(inner.terminalConnectIdsTruncated);
                     return size;
                 }
                 case P2pEvent_Tags.DriverFailed: {

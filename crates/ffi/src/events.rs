@@ -180,6 +180,11 @@ pub enum P2pEvent {
         /// previous diagnostic. Foreign waits on these IDs must settle with
         /// a delivery-loss error and recover through State getters.
         terminal_connect_ids: Vec<u64>,
+        /// True when more terminals were dropped than `terminal_connect_ids`
+        /// can name. Foreign runtimes must then treat every pending
+        /// Connection-attempt wait as delivery-lost and recover through
+        /// State getters.
+        terminal_connect_ids_truncated: bool,
     },
     /// The background driver terminated after a fatal failure.
     DriverFailed {
