@@ -4,9 +4,20 @@ import PageLayout from "blume/components/layout/PageLayout.astro";
 import Mascot from "../components/mascot.astro";
 import ConnectionAttempt from "../components/connection-attempt.astro";
 import EventStream from "../components/event-stream.astro";
-// The dialer the docs build compiles, verbatim: the landing page cannot drift
-// from code that works.
+// Both snippets are read from code that lives in the repo and is kept working —
+// the Rust one is compiled by CI, the Node one is the example package — so the
+// landing page cannot drift from code that runs.
 import dialer from "../snippets/quickstart/src/bin/dialer.rs?raw";
+// The Node example arrives through a glob rather than a plain `?raw` import:
+// same build-time inline, but the linter resolves `.mjs` and would look for a
+// default export that Vite's `?raw` only adds at build time.
+const [ping] = Object.values(
+  import.meta.glob<string>("../../examples/nodejs/ping.mjs", {
+    eager: true,
+    import: "default",
+    query: "?raw",
+  })
+);
 
 const { config, navigation, fontCssVars } = data;
 
@@ -194,14 +205,31 @@ const platforms = [
         Connect, then drive.
       </h2>
       <p class="mt-4 mb-0 max-w-xl text-sm leading-relaxed text-muted-foreground sm:text-base">
-        The dialer below is the quickstart binary this site compiles in CI, shown verbatim.
+        Connect to a peer, wait for it, ping it. Both snippets are shown verbatim from code in the
+        repository: the dialer this site compiles in CI, and the Node example package.
       </p>
-      <div class="mt-8 overflow-hidden rounded-xl border border-border">
+      {/* Radio inputs, so the tabs work with no script and answer arrow keys.
+          The wrapper reads which one is checked, since the header labels are
+          not siblings of the inputs. */}
+      <div class="group mt-8 overflow-hidden rounded-xl border border-border">
+        <input class="peer/rust sr-only" type="radio" name="quickstart" id="quickstart-rust" checked />
+        <input class="peer/node sr-only" type="radio" name="quickstart" id="quickstart-node" />
         <div class="flex items-center justify-between gap-4 border-b border-border bg-muted px-4 py-3">
-          <span class="font-mono text-xs">dialer.rs</span>
-          <span class="font-mono text-xs text-muted-foreground">cargo add minip2p-rs</span>
+          <div class="flex gap-4">
+            <label
+              class="cursor-pointer font-mono text-xs text-muted-foreground underline-offset-4 group-has-[#quickstart-rust:checked]:text-foreground group-has-[#quickstart-rust:focus-visible]:underline"
+              for="quickstart-rust"
+            >dialer.rs</label>
+            <label
+              class="cursor-pointer font-mono text-xs text-muted-foreground underline-offset-4 group-has-[#quickstart-node:checked]:text-foreground group-has-[#quickstart-node:focus-visible]:underline"
+              for="quickstart-node"
+            >ping.mjs</label>
+          </div>
+          <span class="hidden font-mono text-xs text-muted-foreground sm:group-has-[#quickstart-rust:checked]:block">cargo add minip2p-rs</span>
+          <span class="hidden font-mono text-xs text-muted-foreground sm:group-has-[#quickstart-node:checked]:block">pnpm add @minip2p/node</span>
         </div>
-        <pre class="m-0 overflow-x-auto p-5 font-mono text-xs leading-relaxed sm:text-[0.8125rem]"><code>{dialer}</code></pre>
+        <pre class="m-0 hidden overflow-x-auto p-5 font-mono text-xs leading-relaxed peer-checked/rust:block sm:text-[0.8125rem]"><code>{dialer}</code></pre>
+        <pre class="m-0 hidden overflow-x-auto p-5 font-mono text-xs leading-relaxed peer-checked/node:block sm:text-[0.8125rem]"><code>{ping}</code></pre>
       </div>
       <div class="mt-6 flex flex-wrap gap-4">
         <a
