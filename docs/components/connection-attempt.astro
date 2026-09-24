@@ -99,6 +99,10 @@ const { class: className } = Astro.props;
   .lanes {
     display: grid;
     gap: var(--lane-gap);
+    /* A runner is as wide as its track, so translating it by 100% leaves its
+       (invisible) box hanging past the page. Clip that, not the y axis: the
+       dots and the punch flash sit above and below the 2px line. */
+    overflow-x: clip;
   }
   .lanes { --lane-gap: 0.75rem; }
   .lane {
@@ -236,15 +240,33 @@ const { class: className } = Astro.props;
     100% { opacity: 1; transform: translateY(0); }
   }
 
-  /* Nothing moves until the figure is on screen. */
-  .attempt :is(.runner, .dot, .path, .flash, .chip-live) {
+  /* Without scripts the diagram is simply finished: paths drawn, chips shown.
+     `data-motion` (set by the script below) is what opts into the animation,
+     and `data-play` starts it once the figure is on screen. */
+  .attempt:not([data-motion]) :is(.path, .chip-live) {
+    transform: scaleX(1);
+    opacity: 1;
+  }
+  /* …with the relay leg already dimmed, as it is once DCUtR has landed. */
+  .attempt:not([data-motion]) :is(.path-relay, .chip-relayed) {
+    opacity: 0.25;
+  }
+  .attempt:not([data-motion]) .attempt-replay {
+    display: none;
+  }
+  .attempt[data-motion] :is(.runner, .dot, .path, .flash, .chip-live) {
     animation-play-state: paused;
     animation-fill-mode: both;
     animation-timing-function: var(--minip2p-ease);
     animation-duration: var(--minip2p-step);
   }
-  .attempt[data-play] :is(.runner, .dot, .path, .flash, .chip-live) {
+  .attempt[data-motion][data-play] :is(.runner, .dot, .path, .flash, .chip-live) {
     animation-play-state: running;
+  }
+  /* One frame with no animation at all: how Replay rewinds, since toggling
+     play-state only resumes a finished animation where it stopped. */
+  .attempt[data-reset] :is(.runner, .dot, .path, .flash, .chip-live) {
+    animation: none !important;
   }
 
   .probe { animation-name: probe-run; }
@@ -283,6 +305,9 @@ const { class: className } = Astro.props;
 
 <script>
   for (const figure of document.querySelectorAll<HTMLElement>("[data-attempt]")) {
+    // Scripts run, so the diagram may animate rather than stand finished.
+    figure.dataset.motion = "";
+
     const play = () => {
       figure.dataset.play = "";
     };
@@ -305,9 +330,12 @@ const { class: className } = Astro.props;
     }
 
     figure.querySelector<HTMLButtonElement>("[data-replay]")?.addEventListener("click", () => {
-      // Drop the attribute for one frame so every animation restarts together.
-      delete figure.dataset.play;
-      requestAnimationFrame(() => requestAnimationFrame(play));
+      // Strip the animations, force a reflow so the removal is observed, then
+      // reattach them: pausing and resuming would leave the finished state.
+      figure.dataset.reset = "";
+      void figure.offsetWidth;
+      delete figure.dataset.reset;
+      play();
     });
   }
 </script>
