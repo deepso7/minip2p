@@ -15,6 +15,7 @@ const native = vi.hoisted(() => {
 
     readonly config: Readonly<Record<string, unknown>>;
     readonly abandonedStreams: { peerId: string; streamId: bigint }[] = [];
+    readonly cancelledConnects: bigint[] = [];
     readonly drainLimits: number[] = [];
     readonly #batches: Event[][] = [];
     #doorbell: (() => void) | undefined;
@@ -73,7 +74,9 @@ const native = vi.hoisted(() => {
       }
     }
 
-    cancelConnect(): void {}
+    cancelConnect(connectId: bigint): void {
+      this.cancelledConnects.push(connectId);
+    }
 
     circuitAddress(): string {
       return "";
@@ -404,146 +407,7 @@ describe("Node adapter", () => {
     endpoint.close();
   });
 
-  test("forgets connect identifiers after ConnectFailed", async () => {
-    vi.useFakeTimers();
-    const endpoint = createEndpoint();
-    const fake = fakeEndpoint();
-    const first = endpoint.startConnect("remote");
-    fake.enqueue(
-      [
-        {
-          inner: {
-            connectId: 30n,
-            detail: "no route",
-            kind: 0,
-            peerId: "remote",
-          },
-          tag: "ConnectFailed",
-        },
-      ],
-      []
-    );
-
-    fake.ring();
-    await settle();
-    const second = endpoint.startConnect("remote");
-
-    expect([first, second]).toEqual([1, 2]);
-    endpoint.close();
-  });
-
-  test("forgets connect identifiers after cancellation", async () => {
-    vi.useFakeTimers();
-    const endpoint = createEndpoint();
-    const fake = fakeEndpoint();
-    const first = endpoint.startConnect("remote");
-
-    endpoint.cancelConnect(first);
-    // The mapping outlives the cancel call until the ConnectCancelled
-    // terminal arrives, so a second cancel still resolves the native id.
-    endpoint.cancelConnect(first);
-    fake.enqueue([
-      {
-        inner: { connectId: 30n, peerId: "remote" },
-        tag: "ConnectCancelled",
-      },
-    ]);
-
-    fake.ring();
-    await settle();
-
-    // The terminal normalized to `first` and eventHandled released the
-    // mapping; no fresh public id was minted for the same native id.
-    expect(() => endpoint.cancelConnect(first)).toThrowError(RangeError);
-    expect(() => endpoint.cancelConnect(2)).toThrowError(RangeError);
-    endpoint.close();
-  });
-
-  test("normalizes and releases connect identifiers in EventsDropped", async () => {
-    vi.useFakeTimers();
-    const endpoint = createEndpoint();
-    const fake = fakeEndpoint();
-    const first = endpoint.startConnect("remote");
-    const dropped: Record<string, unknown>[] = [];
-    endpoint.on("eventsDropped", (event) => dropped.push(event));
-    fake.enqueue([
-      {
-        inner: {
-          dropped: 1n,
-          terminalConnectIds: [30n],
-          terminalConnectIdsTruncated: false,
-          totalDropped: 1n,
-        },
-        tag: "EventsDropped",
-      },
-    ]);
-
-    fake.ring();
-    await settle();
-
-    expect(dropped).toHaveLength(1);
-    expect(dropped[0]?.terminalConnectIds).toEqual([first]);
-    // eventHandled released the mapping like a terminal event would.
-    expect(() => endpoint.cancelConnect(first)).toThrowError(RangeError);
-    endpoint.close();
-  });
-
-  test("forgets connect identifiers after a direct PathEstablished", async () => {
-    vi.useFakeTimers();
-    const endpoint = createEndpoint();
-    const fake = fakeEndpoint();
-    const first = endpoint.startConnect("remote");
-    fake.enqueue(
-      [
-        {
-          inner: {
-            connectId: 30n,
-            path: { tag: "DirectDialed" },
-            peerId: "remote",
-          },
-          tag: "PathEstablished",
-        },
-      ],
-      []
-    );
-
-    fake.ring();
-    await settle();
-    const second = endpoint.startConnect("remote");
-
-    expect([first, second]).toEqual([1, 2]);
-    endpoint.close();
-  });
-
-  test("truncated EventsDropped releases every pending connect identifier", async () => {
-    vi.useFakeTimers();
-    const endpoint = createEndpoint();
-    const fake = fakeEndpoint();
-    const first = endpoint.startConnect("remote");
-    const second = endpoint.startConnect("remote");
-    expect([first, second]).toEqual([1, 2]);
-
-    fake.enqueue([
-      {
-        inner: {
-          dropped: 2n,
-          terminalConnectIds: [],
-          terminalConnectIdsTruncated: true,
-          totalDropped: 2n,
-        },
-        tag: "EventsDropped",
-      },
-    ]);
-
-    fake.ring();
-    await settle();
-
-    expect(() => endpoint.cancelConnect(first)).toThrowError(RangeError);
-    expect(() => endpoint.cancelConnect(second)).toThrowError(RangeError);
-    endpoint.close();
-  });
-
-  test("keeps a relayed connect identifier through PathUpgraded", async () => {
+  test("passes connect identifiers straight through", async () => {
     vi.useFakeTimers();
     const endpoint = createEndpoint();
     const fake = fakeEndpoint();
@@ -582,10 +446,48 @@ describe("Node adapter", () => {
 
     fake.ring();
     await settle();
-    const second = endpoint.startConnect("remote");
 
+    expect(first).toBe(30);
     expect(ids).toEqual([first, first]);
-    expect(second).toBe(2);
+    endpoint.close();
+  });
+
+  test("normalizes terminal connect ids in EventsDropped", async () => {
+    vi.useFakeTimers();
+    const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
+    const first = endpoint.startConnect("remote");
+    const dropped: Record<string, unknown>[] = [];
+    endpoint.on("eventsDropped", (event) => dropped.push(event));
+    fake.enqueue([
+      {
+        inner: {
+          dropped: 1n,
+          terminalConnectIds: [30n],
+          terminalConnectIdsTruncated: false,
+          totalDropped: 1n,
+        },
+        tag: "EventsDropped",
+      },
+    ]);
+
+    fake.ring();
+    await settle();
+
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]?.terminalConnectIds).toEqual([first]);
+    endpoint.close();
+  });
+
+  test("forwards connect ids to cancelConnect unchanged", () => {
+    const endpoint = createEndpoint();
+    const fake = fakeEndpoint();
+    const first = endpoint.startConnect("remote");
+
+    endpoint.cancelConnect(first);
+    endpoint.cancelConnect(999);
+
+    expect(fake.cancelledConnects).toEqual([30n, 999n]);
     endpoint.close();
   });
 
