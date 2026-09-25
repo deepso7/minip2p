@@ -1,5 +1,6 @@
 import type {
   Bytes,
+  ConnectionInfo,
   IdentifyInfo,
   KnownPeerInfo,
   Minip2pConfig,
@@ -16,6 +17,14 @@ export interface BackendOpenStream {
   /** Endpoint-local transport stream identifier. */
   readonly streamId: number;
 }
+
+/**
+ * A Connection target already shaped by the SDK. Native adapters translate it
+ * into their toolchain's target type; the FFI core validates it.
+ */
+export type BackendConnectTarget =
+  | { readonly kind: "peer"; readonly peerId: string }
+  | { readonly kind: "addresses"; readonly addresses: readonly string[] };
 
 /**
  * Native endpoint contract consumed by {@link Minip2pBase}.
@@ -48,6 +57,8 @@ export interface Minip2pBackend {
   activeReservation: () => RelayReservationInfo | undefined;
   /** Returns the authoritative native path to a peer. */
   path: (peerId: string) => PathKind | undefined;
+  /** Returns the transport connection selected for a peer. */
+  connectionInfo: (peerId: string) => ConnectionInfo | undefined;
   /** Builds a circuit address through a relay. */
   circuitAddress: (relayAddress: string, peerId: string) => string;
   /** Returns the native reachability state. */
@@ -76,24 +87,25 @@ export interface Minip2pBackend {
   resetStream: (peerId: string, streamId: number) => void;
   /** Resets and relinquishes a stream. */
   abandonStream: (peerId: string, streamId: number) => void;
-  /** Starts a NAT-orchestrated connection attempt. */
-  connect: (peerId: string) => number;
-  /** Starts a connection attempt with explicit addresses. */
-  connectWithAddrs: (peerId: string, addresses: readonly string[]) => number;
-  /** Starts a connection attempt from one full peer address. */
-  connectAddr: (address: string) => number;
+  /** Starts one Connection attempt and returns its Connect ID. */
+  connectTarget: (target: BackendConnectTarget) => number;
   /** Starts direct dials for applicable address families. */
   dial: (address: string) => number[];
   /** Starts one direct IPv4 dial. */
   dialIp4: (address: string) => number;
   /** Starts one direct IPv6 dial. */
   dialIp6: (address: string) => number;
-  /** Cancels a connection attempt. */
+  /** Cancels a Connection attempt; its terminal event still follows. */
   cancelConnect: (id: number) => void;
   /** Closes the active connection to a peer. */
   disconnect: (peerId: string) => void;
 }
 
+export {
+  resolveEndpointConfig,
+  type BackendEndpointConfig,
+  type BackendTransportConfig,
+} from "./config.js";
 export {
   P2pEvent_Tags,
   PathKind_Tags,

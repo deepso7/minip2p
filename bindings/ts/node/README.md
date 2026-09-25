@@ -17,7 +17,7 @@ console.log(endpoint.peerId(), endpoint.listenAddrs());
 endpoint.close();
 ```
 
-`Minip2p.create()` starts the endpoint. A running endpoint keeps the Node.js process alive until `close()` shuts it down. Promise-returning operations such as `connectAddr()` and `openStream()` resolve as their network work completes.
+`Minip2p.create()` starts the endpoint. A running endpoint keeps the Node.js process alive until `close()` shuts it down. Promise-returning operations such as `connect()` and `openStream()` resolve as their network work completes.
 
 The Node binding accepts the same TCP, QUIC, circuit-relay, signed-discovery, and mDNS configuration as `@minip2p/react-native`.
 

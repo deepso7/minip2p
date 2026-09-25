@@ -316,6 +316,38 @@ export interface OpOptions {
   readonly signal?: AbortSignal;
 }
 
+/**
+ * Where one Connection attempt goes:
+ *
+ * - a base58 peer ID, which applies the endpoint's discovery and relay policy;
+ * - one complete peer multiaddress ending in `/p2p/<peer>`, as advertised;
+ * - a non-empty list of complete peer multiaddresses that all name one peer.
+ *
+ * A string starting with `/` is an address; any other string is a peer ID.
+ * Address family and transport come from the addresses themselves.
+ */
+export type ConnectTarget = string | readonly [string, ...string[]];
+
+/**
+ * Wait controls for a Connection attempt.
+ *
+ * `timeoutMs` bounds only the local wait: the attempt keeps running, and a
+ * later {@link Minip2pBase.waitConnectResult} can still consume its terminal
+ * outcome. Aborting `signal` ends the wait *and* cancels the attempt.
+ */
+export interface ConnectOptions extends OpOptions {
+  /** Also cancel the attempt when `timeoutMs` elapses. Defaults to `false`. */
+  readonly cancelOnTimeout?: boolean;
+}
+
+/** The transport connection currently selected for a peer. */
+export interface ConnectionInfo {
+  /** Endpoint-local connection identifier, as carried by connection events. */
+  readonly connId: number;
+  /** Remote transport address, when known. */
+  readonly remoteAddr?: string;
+}
+
 /** Options accepted by {@link Minip2pBase.once}. */
 export type OnceOptions = OpOptions;
 

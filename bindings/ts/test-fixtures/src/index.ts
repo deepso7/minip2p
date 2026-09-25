@@ -1,6 +1,7 @@
 /* oxlint-disable class-methods-use-this, no-empty-function, no-plusplus -- A contract-complete test double must implement inert backend methods directly. */
 
 import type {
+  BackendConnectTarget,
   BackendOpenStream,
   Minip2pBackend,
   P2pEvent,
@@ -10,6 +11,7 @@ import { Reachability } from "../../core/src/index.js";
 export type MockBackendOperation =
   | readonly ["abandon" | "closeWrite" | "reset", string, number]
   | readonly ["cancelConnect", number]
+  | readonly ["connectTarget", BackendConnectTarget]
   | readonly ["write", string, number, readonly number[]];
 
 /** Scriptable, contract-complete backend for package-level SDK tests. */
@@ -76,6 +78,10 @@ export class MockBackend implements Minip2pBackend {
     return undefined;
   }
 
+  connectionInfo(): undefined {
+    return undefined;
+  }
+
   circuitAddress(relayAddress: string, peerId: string): string {
     return `${relayAddress}/p2p-circuit/p2p/${peerId}`;
   }
@@ -134,15 +140,8 @@ export class MockBackend implements Minip2pBackend {
     }
   }
 
-  connect(_peerId: string): number {
-    return this.nextConnectId++;
-  }
-
-  connectWithAddrs(_peerId: string, _addresses: readonly string[]): number {
-    return this.nextConnectId++;
-  }
-
-  connectAddr(_address: string): number {
+  connectTarget(target: BackendConnectTarget): number {
+    this.operations.push(["connectTarget", target]);
     return this.nextConnectId++;
   }
 

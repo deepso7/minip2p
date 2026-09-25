@@ -10,7 +10,9 @@
 | Identify readiness and snapshots | `isPeerReady`, `waitPeerReady`, `peerInfo`, Identify events |
 | Custom protocol registration | `protocols` configuration, `addProtocol` |
 | Negotiated streams | Promise-returning `openStream` and `Stream` handles with `write`, `read`, `closeWrite`, `reset`, and `abandon` |
-| Relay, AutoNAT, DCUtR | Promise-returning `connect*`, advanced `startConnect*`/`waitConnectResult`, `path(peerId)`, and typed path/reachability events |
+| Connection targets and Connect IDs | Promise-returning `connect(target)`, split-phase `startConnect(target)`/`waitConnectResult`/`cancelConnect`, and typed terminal events |
+| Relay, AutoNAT, DCUtR | Driven by `connect`; `path(peerId)` and typed path/reachability events |
+| State snapshots | `connectedPeers`, `path`, `connectionInfo`, `knownPeers`, `listenAddrs`, `activeReservation` |
 | Pubsub | gossipsub subscribe/unsubscribe/publish, pubsub events |
 | Signed discovery | discovery configuration, `knownPeers`, discovery events |
 | mDNS | mDNS configuration, merged `knownPeers`, source-tagged discovery events |

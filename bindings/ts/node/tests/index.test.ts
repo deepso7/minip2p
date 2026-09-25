@@ -82,6 +82,32 @@ describe("@minip2p/node", () => {
     ).toThrow("mDNS maximum packet size must be between 512 and 4096 bytes");
   });
 
+  test("Connection targets settle through the native endpoint", async () => {
+    const a = createDualStackEndpoint();
+    const b = createDualStackEndpoint();
+    const established: number[] = [];
+    a.on("connectionEstablished", ({ connId }) => established.push(connId));
+
+    try {
+      const [first, ...rest] = b.listenAddrs();
+      if (first === undefined) {
+        throw new Error("b has no listen address");
+      }
+      const result = await a.connect([first, ...rest], { timeoutMs: 10_000 });
+      expect(result.peerId).toBe(b.peerId());
+      expect(established).toContain(a.connectionInfo(b.peerId())?.connId);
+
+      // A Peer-ID target with no known route is admitted, then fails.
+      const stranger = nodeSdk.peerIdFromSecretKey(nodeSdk.generateSecretKey());
+      await expect(
+        a.connect(stranger, { timeoutMs: 10_000 })
+      ).rejects.toBeInstanceOf(nodeSdk.ConnectFailedError);
+    } finally {
+      a.close();
+      b.close();
+    }
+  });
+
   test("two endpoints exchange stream data over QUIC loopback", async () => {
     const protocol = "/minip2p/node-loopback/1";
     const createEndpoint = () =>
@@ -96,7 +122,7 @@ describe("@minip2p/node", () => {
     const b = createEndpoint();
 
     try {
-      await a.connectAddr(b.listenAddrs()[0], { timeoutMs: 10_000 });
+      await a.connect(b.listenAddrs()[0], { timeoutMs: 10_000 });
       await Promise.all([
         a.waitPeerReady(b.peerId(), { timeoutMs: 10_000 }),
         b.waitPeerReady(a.peerId(), { timeoutMs: 10_000 }),
@@ -149,7 +175,7 @@ describe("@minip2p/node", () => {
     const b = createEndpoint();
 
     try {
-      await a.connectAddr(b.listenAddrs()[0], { timeoutMs: 10_000 });
+      await a.connect(b.listenAddrs()[0], { timeoutMs: 10_000 });
       await Promise.all([
         a.waitPeerReady(b.peerId(), { timeoutMs: 10_000 }),
         b.waitPeerReady(a.peerId(), { timeoutMs: 10_000 }),
@@ -220,7 +246,7 @@ describe("@minip2p/node", () => {
         timeoutMs: remainingMs(deadline),
       });
       await Promise.all([
-        a.connectAddr(b.listenAddrs()[0], {
+        a.connect(b.listenAddrs()[0], {
           timeoutMs: remainingMs(deadline),
         }),
         a.waitPeerReady(b.peerId(), { timeoutMs: remainingMs(deadline) }),
@@ -343,4 +369,11 @@ async function startRelay(): Promise<{
       }
     },
   };
+}
+
+function createDualStackEndpoint(): nodeSdk.Minip2p {
+  return nodeSdk.Minip2p.create({
+    listen: ["/ip4/127.0.0.1/udp/0/quic-v1", "/ip4/127.0.0.1/tcp/0"],
+    secretKey: nodeSdk.generateSecretKey(),
+  });
 }

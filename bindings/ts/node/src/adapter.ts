@@ -3,16 +3,16 @@
 import { Minip2pBase } from "@minip2p/core";
 import type {
   Bytes,
+  ConnectionInfo,
   IdentifyInfo,
   KnownPeerInfo,
   Minip2pConfig,
-  Minip2pDiscoveryOptions,
-  Minip2pMdnsOptions,
-  Minip2pTransportOptions,
   Reachability,
   RelayReservationInfo,
 } from "@minip2p/core";
+import { resolveEndpointConfig } from "@minip2p/core/backend";
 import type {
+  BackendConnectTarget,
   BackendOpenStream,
   Minip2pBackend,
   PathKind,
@@ -29,24 +29,9 @@ class NodeBackend implements Minip2pBackend {
   readonly #streamIds = new IdMap();
 
   constructor(config: Minip2pConfig) {
-    const discovery = toNativeDiscovery(config.discovery);
-    const mdns = toNativeMdns(config.mdns, config.discovery);
-    const { listen, quic, tcp } = resolveListenConfig(config);
     this.#endpoint = new nativeBinding.NodeEndpoint(
       toUint8Array(config.secretKey),
-      {
-        agentVersion: config.agentVersion,
-        allowUnsigned: config.allowUnsigned ?? false,
-        autonatServers: [...(config.autonatServers ?? [])],
-        discovery,
-        forceRelay: config.forceRelay ?? false,
-        listen,
-        mdns,
-        protocols: [...(config.protocols ?? [])],
-        quic,
-        relays: [...(config.relays ?? [])],
-        tcp,
-      }
+      resolveEndpointConfig(config)
     );
     this.#events = new EventDrain(
       () => this.#endpoint.drainEvents(256),
@@ -120,6 +105,17 @@ class NodeBackend implements Minip2pBackend {
     return normalizeOptional<PathKind>(this.#endpoint.path(peerId));
   }
 
+  connectionInfo(peerId: string): ConnectionInfo | undefined {
+    const info = this.#endpoint.connectionInfo(peerId);
+    if (info === null || info === undefined) {
+      return undefined;
+    }
+    const connId = this.#connectionIds.toPublic(info.connId);
+    return typeof info.remoteAddr === "string"
+      ? { connId, remoteAddr: info.remoteAddr }
+      : { connId };
+  }
+
   circuitAddress(relayAddress: string, peerId: string): string {
     return nativeBinding.circuitAddress(relayAddress, peerId);
   }
@@ -178,19 +174,13 @@ class NodeBackend implements Minip2pBackend {
 
   // Connect IDs are not mapped because they round-trip into native calls,
   // and native allocates them well inside the safe integer range.
-  connect(peerId: string): number {
-    return bigintToNumber(this.#endpoint.connect(peerId), "connectId");
-  }
-
-  connectWithAddrs(peerId: string, addresses: readonly string[]): number {
+  connectTarget(target: BackendConnectTarget): number {
     return bigintToNumber(
-      this.#endpoint.connectWithAddrs(peerId, [...addresses]),
+      this.#endpoint.connectTarget(
+        target.kind === "peer" ? target.peerId : [...target.addresses]
+      ),
       "connectId"
     );
-  }
-
-  connectAddr(address: string): number {
-    return bigintToNumber(this.#endpoint.connectAddr(address), "connectId");
   }
 
   dial(address: string): number[] {
@@ -243,121 +233,10 @@ export function circuitAddress(relayAddress: string, peerId: string): string {
   return nativeBinding.circuitAddress(relayAddress, peerId);
 }
 
-const MIXED_LISTEN_MESSAGE =
-  "use either address-shaped `listen` or legacy `quic`/`tcp` transport options, not both";
-
-function resolveListenConfig(config: Minip2pConfig): {
-  readonly listen?: string[];
-  readonly quic?: { readonly listenAddrs?: string[] };
-  readonly tcp?: { readonly listenAddrs?: string[] };
-} {
-  if (config.listen !== undefined) {
-    // Adapters would otherwise clear quic/tcp before native sees them, so
-    // reject the mix here (same rule and wording as ffi-core).
-    const transports = config.transports;
-    if (
-      transports !== undefined &&
-      (transports.quic !== undefined || transports.tcp !== undefined)
-    ) {
-      throw new Error(MIXED_LISTEN_MESSAGE);
-    }
-    return {
-      listen: [...config.listen],
-      quic: undefined,
-      tcp: undefined,
-    };
-  }
-  const transports = resolveTransports(config);
-  return {
-    listen: undefined,
-    quic: toNativeTransport(transports.quic),
-    tcp: toNativeTransport(transports.tcp),
-  };
-}
-
-function resolveTransports(config: Minip2pConfig) {
-  const transports = config.transports;
-  if (
-    transports === undefined ||
-    (transports.quic === undefined && transports.tcp === undefined)
-  ) {
-    return { quic: true } as const;
-  }
-  return transports;
-}
-
-function toNativeTransport(
-  transport: true | Minip2pTransportOptions | undefined
-): { readonly listenAddrs?: string[] } | undefined {
-  if (transport === undefined) {
-    return undefined;
-  }
-  if (transport === true || transport.listen === undefined) {
-    return {};
-  }
-  return { listenAddrs: [...transport.listen] };
-}
-
-function toNativeDiscovery(discovery: Minip2pDiscoveryOptions | undefined) {
-  return discovery === undefined
-    ? undefined
-    : {
-        autoDial: discovery.autoDial ?? true,
-        beaconIntervalMs: numberToBigInt(discovery.beaconIntervalMs ?? 10_000),
-        peerTtlMs: numberToBigInt(discovery.peerTtlMs ?? 35_000),
-        topic: discovery.topic,
-      };
-}
-
-function toNativeMdns(
-  mdns: boolean | Minip2pMdnsOptions | undefined,
-  discovery: Minip2pDiscoveryOptions | undefined
-) {
-  const options = mdns === true ? {} : mdns;
-  if (options === undefined || options === false) {
-    return undefined;
-  }
-  return {
-    autoDial: options.autoDial ?? discovery?.autoDial ?? true,
-    enableIpv6: options.enableIpv6 ?? false,
-    interfaceRefreshMs: numberToBigInt(options.interfaceRefreshMs ?? 10_000),
-    maxAnnouncedAddrs: numberToU32(
-      options.maxAnnouncedAddrs ?? 16,
-      "maxAnnouncedAddrs"
-    ),
-    maxPacketBytes: numberToU32(
-      options.maxPacketBytes ?? 1400,
-      "maxPacketBytes"
-    ),
-    queryIntervalMs: numberToBigInt(options.queryIntervalMs ?? 300_000),
-    socketPollIntervalMs: numberToBigInt(options.socketPollIntervalMs ?? 100),
-    ttlMs: numberToBigInt(options.ttlMs ?? 120_000),
-  };
-}
-
 function toUint8Array(value: Bytes): Uint8Array {
   return value instanceof Uint8Array
     ? Uint8Array.from(value)
     : new Uint8Array(value);
-}
-
-function numberToBigInt(value: number): bigint {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new RangeError(
-      "Native identifiers must be non-negative safe integers"
-    );
-  }
-  return BigInt(value);
-}
-
-function numberToU32(value: number, name: string): number {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new RangeError(`${name} must be a non-negative safe integer`);
-  }
-  if (value > 0xff_ff_ff_ff) {
-    throw new RangeError(`${name} exceeds the unsigned 32-bit range`);
-  }
-  return value;
 }
 
 function bigintToNumber(value: bigint, name: string): number {

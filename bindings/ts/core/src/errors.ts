@@ -97,13 +97,34 @@ export class ConnectFailedError extends Error {
   }
 }
 
-/** A terminal connection event was dropped by the bounded native event carry. */
+/**
+ * A Connection attempt ended with a `connectCancelled` terminal after
+ * `cancelConnect()` or an aborted `waitConnectResult()`.
+ */
+export class ConnectCancelledError extends AbortError {
+  /** Endpoint-local connection-attempt identifier. */
+  readonly connectId: number;
+  /** Target peer ID. */
+  readonly peerId: string;
+
+  constructor(connectId: number, peerId: string) {
+    super(`Connection attempt ${connectId} to ${peerId} was cancelled`);
+    this.name = "ConnectCancelledError";
+    this.connectId = connectId;
+    this.peerId = peerId;
+  }
+}
+
+/**
+ * A Connection attempt's terminal event was dropped by a bounded event carry
+ * (native or SDK), so its outcome is unknowable from events.
+ */
 export class ConnectResultLostError extends Error {
   readonly connectId: number;
 
   constructor(connectId: number) {
     super(
-      `Connection result ${connectId} was lost: the native event carry dropped its terminal event; check connectedPeers()/path() to recover state`
+      `Connection result ${connectId} was lost: an event carry dropped its terminal event; check connectedPeers()/path() to recover state`
     );
     this.name = "ConnectResultLostError";
     this.connectId = connectId;

@@ -47,15 +47,19 @@ describe("MockBackend", () => {
     });
   });
 
-  test("shares connection IDs and records abandonment before throwing", () => {
+  test("allocates connect IDs and records abandonment before throwing", () => {
     const backend = new MockBackend();
+    const target = { kind: "peer", peerId: "peer" } as const;
 
-    expect(backend.connect("peer")).toBe(1);
-    expect(backend.connectWithAddrs("peer", ["/test"])).toBe(2);
-    expect(backend.connectAddr("/test")).toBe(3);
+    expect(backend.connectTarget(target)).toBe(1);
+    expect(backend.connectTarget(target)).toBe(2);
 
     backend.abandonError = new Error("abandon failed");
     expect(() => backend.abandonStream("peer", 7)).toThrow("abandon failed");
-    expect(backend.operations).toEqual([["abandon", "peer", 7]]);
+    expect(backend.operations).toEqual([
+      ["connectTarget", target],
+      ["connectTarget", target],
+      ["abandon", "peer", 7],
+    ]);
   });
 });

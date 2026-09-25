@@ -4,6 +4,8 @@
 import { vi } from "vitest";
 
 import type {
+  ConnectionInfo,
+  ConnectTarget,
   OpenStreamResult,
   P2pEndpointLike,
   P2pEvent,
@@ -41,6 +43,14 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
   dialResults: bigint[] = [1n];
   /** Native discovery clock returned by `discoveryNowMs`. */
   discoveryNow: bigint | undefined = undefined;
+  /** Targets passed to `connectTarget`, in call order. */
+  readonly connectTargets: ConnectTarget[] = [];
+  /** Connect IDs passed to `cancelConnect`, in call order. */
+  readonly cancelledConnects: bigint[] = [];
+  /** Connect ID returned by the next `connectTarget` call. */
+  nextConnectId = 30n;
+  /** Value returned by `connectionInfo` for every peer. */
+  connection: ConnectionInfo | undefined = undefined;
   readonly #batches: FakeEvent[][] = [];
   #doorbell: P2pEventDoorbell | undefined;
 
@@ -114,8 +124,8 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
     return notFaked("addProtocol");
   }
 
-  cancelConnect(): never {
-    return notFaked("cancelConnect");
+  cancelConnect(id: bigint): void {
+    this.cancelledConnects.push(id);
   }
 
   closeStreamWrite(): never {
@@ -130,8 +140,11 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
     return notFaked("connectAddr");
   }
 
-  connectTarget(): never {
-    return notFaked("connectTarget");
+  connectTarget(target: ConnectTarget): bigint {
+    this.connectTargets.push(target);
+    const id = this.nextConnectId;
+    this.nextConnectId += 1n;
+    return id;
   }
 
   connectWithAddrs(): never {
@@ -142,8 +155,8 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
     return notFaked("connectedPeers");
   }
 
-  connectionInfo(): never {
-    return notFaked("connectionInfo");
+  connectionInfo(): ConnectionInfo | undefined {
+    return this.connection;
   }
 
   disconnect(): never {
@@ -217,8 +230,10 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
 
 /** Factory for `vi.mock("../src/native", nativeModuleMock)`. */
 export const nativeModuleMock = async () => {
-  const { FfiError_Tags } = await import("../src/generated/minip2p_ffi");
+  const { ConnectTarget, FfiError_Tags } =
+    await import("../src/generated/minip2p_ffi");
   return {
+    ConnectTarget,
     FfiError_Tags,
     P2pEndpoint: FakeNativeEndpoint,
     circuitAddress: vi.fn(),

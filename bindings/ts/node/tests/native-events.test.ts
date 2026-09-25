@@ -20,7 +20,7 @@ describe("native event payloads", () => {
     const protocol = "/minip2p/node-native-events/1";
     const a = createEndpoint(protocol);
     const b = createEndpoint(protocol);
-    a.connectAddr(b.listenAddrs()[0]);
+    a.connectTarget([b.listenAddrs()[0]]);
 
     await Promise.all([
       waitPeerReady(a, b.peerId()),
@@ -45,7 +45,7 @@ describe("native event payloads", () => {
     const b = createEndpoint();
     a.subscribe("native-events");
     b.subscribe("native-events");
-    a.connectAddr(b.listenAddrs()[0]);
+    a.connectTarget([b.listenAddrs()[0]]);
 
     await Promise.all([
       waitPeerReady(a, b.peerId()),

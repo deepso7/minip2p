@@ -1,9 +1,10 @@
 /* oxlint-disable default-case, func-style, max-classes-per-file, no-await-in-loop, no-empty-function, no-loop-func, no-use-before-define, promise/avoid-new, promise/prefer-await-to-callbacks, promise/prefer-await-to-then, typescript/no-invalid-void-type, unicorn/consistent-function-scoping, unicorn/no-new-array, unicorn/no-useless-spread, unicorn/no-useless-undefined -- Promise adapters, sequential async iterators, void event payloads, snapshot fan-out, and bounded queues are deliberate SDK internals. */
 
-import type { Minip2pBackend } from "./backend.js";
+import type { BackendConnectTarget, Minip2pBackend } from "./backend.js";
 import {
   AbortError,
   ClosedError,
+  ConnectCancelledError,
   ConnectFailedError,
   ConnectResultLostError,
   ConnectResultUnavailableError,
@@ -18,7 +19,10 @@ import { P2pEvent_Tags, PathKind_Tags } from "./types.js";
 import type {
   Bytes,
   CloseReason,
+  ConnectionInfo,
+  ConnectOptions,
   ConnectResult,
+  ConnectTarget,
   EventsOptions,
   IdentifyInfo,
   InboundStreamMeta,
@@ -78,14 +82,14 @@ type ConnectTerminal =
     }
   | {
       readonly ok: false;
-      readonly error: AbortError | ConnectFailedError | ConnectResultLostError;
+      readonly error: unknown;
     };
 
+// A tracked Connection attempt holds either its not-yet-consumed terminal or
+// at most one local wait. The attempt outlives a wait that ends early.
 interface ConnectAttempt {
   terminal?: ConnectTerminal;
-  waiting: boolean;
-  resolve?: (result: ConnectResult) => void;
-  reject?: (error: unknown) => void;
+  settle?: (terminal: ConnectTerminal) => void;
 }
 
 interface PendingOpen {
@@ -712,6 +716,12 @@ export class Minip2pBase {
     return path === undefined ? undefined : normalizePath(path);
   }
 
+  /** Returns the transport connection selected for `peerId`, if connected. */
+  connectionInfo(peerId: string): ConnectionInfo | undefined {
+    this.#assertOpen();
+    return this.#backend.connectionInfo(peerId);
+  }
+
   /** Returns whether the native driver is accepting work. */
   isRunning(): boolean {
     return !this.#closed && this.#backend.isRunning();
@@ -870,90 +880,114 @@ export class Minip2pBase {
     });
   }
 
-  /** Starts an advanced NAT-orchestrated connection attempt. */
-  startConnect(peerId: string): number {
+  /**
+   * Starts one Connection attempt toward `target` and returns its Connect ID.
+   *
+   * Every internal dial, relay fallback, and path upgrade belongs to that ID,
+   * and the attempt ends with exactly one terminal event: `pathEstablished`,
+   * `connectFailed`, or `connectCancelled`. Only malformed targets throw.
+   */
+  startConnect(target: ConnectTarget): number {
     this.#assertOpen();
-    return this.#rememberConnect(this.#backend.connect(peerId));
+    const connectId = this.#backend.connectTarget(toBackendTarget(target));
+    this.#connects.set(connectId, {});
+    return connectId;
   }
 
-  /** Starts a connection attempt with an explicit ordered address set. */
-  startConnectWithAddrs(peerId: string, addresses: readonly string[]): number {
-    this.#assertOpen();
-    return this.#rememberConnect(
-      this.#backend.connectWithAddrs(peerId, addresses)
-    );
-  }
-
-  /** Starts a connection attempt from one full peer multiaddress. */
-  startConnectAddr(address: string): number {
-    this.#assertOpen();
-    return this.#rememberConnect(this.#backend.connectAddr(address));
-  }
-
-  /** Connects to a known peer and resolves with its first usable path. */
-  connect(peerId: string, options: OpOptions = {}): Promise<ConnectResult> {
-    return this.#primaryConnect(this.startConnect(peerId), options);
-  }
-
-  /** Connects using an explicit ordered address set. */
-  connectWithAddrs(
-    peerId: string,
-    addresses: readonly string[],
-    options: OpOptions = {}
+  /** Connects to `target` and resolves with the attempt's first usable path. */
+  connect(
+    target: ConnectTarget,
+    options: ConnectOptions = {}
   ): Promise<ConnectResult> {
-    return this.#primaryConnect(
-      this.startConnectWithAddrs(peerId, addresses),
-      options
-    );
+    return this.waitConnectResult(this.startConnect(target), options);
   }
 
-  /** Connects using one full peer multiaddress. */
-  connectAddr(
-    address: string,
-    options: OpOptions = {}
-  ): Promise<ConnectResult> {
-    return this.#primaryConnect(this.startConnectAddr(address), options);
-  }
-
-  /** Consumes the terminal result for a `startConnect*` attempt. */
+  /**
+   * Waits for the terminal outcome of a {@link startConnect} attempt.
+   *
+   * One wait per attempt may be pending. A timeout ends only this wait (unless
+   * `cancelOnTimeout` is set); the attempt keeps running and a later call can
+   * still consume its outcome. Aborting `signal` ends the wait and cancels the
+   * attempt. A terminal lost to event-delivery overflow rejects with
+   * {@link ConnectResultLostError}; recover state from `connectedPeers()` and
+   * `path()`.
+   */
   waitConnectResult(
     connectId: number,
-    options: OpOptions = {}
+    options: ConnectOptions = {}
   ): Promise<ConnectResult> {
     this.#assertOpen();
     assertId(connectId, "connectId");
+    const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    assertTimeout(timeoutMs);
     const attempt = this.#connects.get(connectId);
-    if (attempt === undefined || attempt.waiting) {
+    if (attempt === undefined || attempt.settle !== undefined) {
       return Promise.reject(new ConnectResultUnavailableError(connectId));
     }
-    if (attempt.terminal !== undefined) {
-      this.#connects.delete(connectId);
-      this.#terminalConnects.delete(connectId);
-      return attempt.terminal.ok
-        ? Promise.resolve(attempt.terminal.result)
-        : Promise.reject(attempt.terminal.error);
+    const { terminal } = attempt;
+    if (terminal !== undefined) {
+      this.#forgetConnect(connectId);
+      return terminal.ok
+        ? Promise.resolve(terminal.result)
+        : Promise.reject(terminal.error);
     }
-    attempt.waiting = true;
-    const result = new Promise<ConnectResult>((resolve, reject) => {
-      attempt.resolve = resolve;
-      attempt.reject = reject;
-    });
-    return withOptions(result, options, () => {
-      this.cancelConnect(connectId);
-    }).finally(() => {
-      this.#connects.delete(connectId);
+    if (options.signal?.aborted === true) {
+      this.#backend.cancelConnect(connectId);
+      return Promise.reject(new AbortError());
+    }
+    return new Promise((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const stopWaiting = () => {
+        clearTimeout(timer);
+        removeAbort?.();
+        attempt.settle = undefined;
+      };
+      // Ends this wait only; the attempt stays tracked for its terminal.
+      const abandon = (error: Error, cancel: boolean) => {
+        stopWaiting();
+        reject(error);
+        if (cancel && !this.#closed) {
+          try {
+            this.#backend.cancelConnect(connectId);
+          } catch {
+            // The wait already ended; native cancellation is best effort.
+          }
+        }
+      };
+      const removeAbort = listenAbort(options.signal, () => {
+        abandon(new AbortError(), true);
+      });
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          abandon(
+            new TimeoutError(timeoutMs),
+            options.cancelOnTimeout === true
+          );
+        }, timeoutMs);
+      }
+      attempt.settle = (outcome) => {
+        stopWaiting();
+        if (outcome.ok) {
+          resolve(outcome.result);
+        } else {
+          reject(outcome.error);
+        }
+      };
     });
   }
 
-  /** Cancels an in-flight advanced connection attempt. */
+  /**
+   * Requests cancellation of a Connection attempt. Idempotent; unknown or
+   * settled IDs are a no-op.
+   *
+   * Local waits settle from the attempt's terminal event: `connectCancelled`,
+   * or its real outcome if it had already settled. Never disconnects an
+   * established connection; use {@link disconnect} for that.
+   */
   cancelConnect(connectId: number): void {
     this.#assertOpen();
     assertId(connectId, "connectId");
     this.#backend.cancelConnect(connectId);
-    const attempt = this.#connects.get(connectId);
-    attempt?.reject?.(new AbortError("The connection attempt was cancelled"));
-    this.#connects.delete(connectId);
-    this.#terminalConnects.delete(connectId);
   }
 
   /** Starts direct transport dials for every applicable local address family. */
@@ -978,18 +1012,6 @@ export class Minip2pBase {
   disconnect(peerId: string): void {
     this.#assertOpen();
     this.#backend.disconnect(peerId);
-  }
-
-  #rememberConnect(connectId: number): number {
-    this.#connects.set(connectId, { waiting: false });
-    return connectId;
-  }
-
-  #primaryConnect(
-    connectId: number,
-    options: OpOptions
-  ): Promise<ConnectResult> {
-    return this.waitConnectResult(connectId, options);
   }
 
   #runPing(peerId: string): PingOperation {
@@ -1050,7 +1072,7 @@ export class Minip2pBase {
     }
   }
 
-  #handleQueueOverflow(): void {
+  #handleQueueOverflow(dropped: QueueItem): void {
     const error = new EventQueueOverflowError();
     for (const waiter of [...this.#waiters]) {
       this.#settleWaiter(waiter, error);
@@ -1059,11 +1081,17 @@ export class Minip2pBase {
       ping.cancel(error);
     }
     this.#pings.clear();
-    for (const [connectId, attempt] of [...this.#connects]) {
-      if (attempt.terminal === undefined) {
-        attempt.reject?.(error);
-        this.#connects.delete(connectId);
-        this.#terminalConnects.delete(connectId);
+    // Connection attempts correlate exactly: only a dropped terminal, or a
+    // dropped native loss report naming it, settles its attempt.
+    if (dropped.source === "native") {
+      const { event } = dropped;
+      if (isConnectTerminal(event)) {
+        this.#connectResultsLost([event.inner.connectId], false);
+      } else if (event.tag === P2pEvent_Tags.EventsDropped) {
+        this.#connectResultsLost(
+          event.inner.terminalConnectIds,
+          event.inner.terminalConnectIdsTruncated
+        );
       }
     }
     for (const pending of this.#pendingOpens.values()) {
@@ -1086,7 +1114,7 @@ export class Minip2pBase {
     if (dropped !== undefined) {
       this.#releaseQueueItem(dropped);
       this.#dropped += 1;
-      this.#handleQueueOverflow();
+      this.#handleQueueOverflow(dropped);
     }
     this.#scheduleFlush();
   }
@@ -1102,7 +1130,7 @@ export class Minip2pBase {
     if (dropped !== undefined) {
       this.#releaseQueueItem(dropped);
       this.#dropped += 1;
-      this.#handleQueueOverflow();
+      this.#handleQueueOverflow(dropped);
     }
     this.#scheduleFlush();
   }
@@ -1185,11 +1213,7 @@ export class Minip2pBase {
     if (event.tag === P2pEvent_Tags.ConnectionClosed) {
       this.#connectionClosed(event.inner.peerId, event.inner.connId);
     }
-    if (
-      event.tag === P2pEvent_Tags.PathEstablished ||
-      event.tag === P2pEvent_Tags.ConnectFailed ||
-      event.tag === P2pEvent_Tags.ConnectCancelled
-    ) {
+    if (isConnectTerminal(event)) {
       this.#connectTerminal(event);
     }
     if (event.tag === P2pEvent_Tags.EventsDropped) {
@@ -1409,17 +1433,7 @@ export class Minip2pBase {
     }
   }
 
-  #connectTerminal(
-    event: Extract<
-      P2pEvent,
-      {
-        readonly tag:
-          | typeof P2pEvent_Tags.PathEstablished
-          | typeof P2pEvent_Tags.ConnectFailed
-          | typeof P2pEvent_Tags.ConnectCancelled;
-      }
-    >
-  ): void {
+  #connectTerminal(event: ConnectTerminalEvent): void {
     const attempt = this.#connects.get(event.inner.connectId);
     if (attempt === undefined) {
       return;
@@ -1437,7 +1451,10 @@ export class Minip2pBase {
         : {
             error:
               event.tag === P2pEvent_Tags.ConnectCancelled
-                ? new AbortError("The connection attempt was cancelled")
+                ? new ConnectCancelledError(
+                    event.inner.connectId,
+                    event.inner.peerId
+                  )
                 : new ConnectFailedError(
                     event.inner.connectId,
                     event.inner.peerId,
@@ -1446,21 +1463,13 @@ export class Minip2pBase {
                   ),
             ok: false,
           };
-    if (attempt.waiting) {
-      if (terminal.ok) {
-        attempt.resolve?.(terminal.result);
-      } else {
-        attempt.reject?.(terminal.error);
-      }
-    } else {
-      this.#recordConnectTerminal(event.inner.connectId, attempt, terminal);
-    }
+    this.#settleConnect(event.inner.connectId, attempt, terminal);
   }
 
-  // Terminals dropped by the native carry arrive as EventsDropped ids: settle
-  // each tracked attempt with a delivery-loss error so waits cannot hang. A
-  // truncated list cannot name every dropped terminal, so every tracked
-  // attempt without a delivered terminal settles.
+  // Terminals dropped by either event carry settle their attempts with a
+  // delivery-loss error so waits cannot hang. A truncated list cannot name
+  // every dropped terminal, so every tracked attempt without a delivered
+  // terminal settles.
   #connectResultsLost(connectIds: readonly number[], truncated: boolean): void {
     const lost = truncated ? [...this.#connects.keys()] : connectIds;
     for (const connectId of lost) {
@@ -1468,20 +1477,24 @@ export class Minip2pBase {
       if (attempt === undefined || attempt.terminal !== undefined) {
         continue;
       }
-      const error = new ConnectResultLostError(connectId);
-      if (attempt.waiting) {
-        attempt.reject?.(error);
-      } else {
-        this.#recordConnectTerminal(connectId, attempt, { error, ok: false });
-      }
+      this.#settleConnect(connectId, attempt, {
+        error: new ConnectResultLostError(connectId),
+        ok: false,
+      });
     }
   }
 
-  #recordConnectTerminal(
+  // Hands a terminal to the pending wait, or keeps it for a later one.
+  #settleConnect(
     connectId: number,
     attempt: ConnectAttempt,
     terminal: ConnectTerminal
   ): void {
+    if (attempt.settle !== undefined) {
+      this.#forgetConnect(connectId);
+      attempt.settle(terminal);
+      return;
+    }
     attempt.terminal = terminal;
     this.#terminalConnects.delete(connectId);
     this.#terminalConnects.add(connectId);
@@ -1493,6 +1506,11 @@ export class Minip2pBase {
       this.#terminalConnects.delete(oldest);
       this.#connects.delete(oldest);
     }
+  }
+
+  #forgetConnect(connectId: number): void {
+    this.#connects.delete(connectId);
+    this.#terminalConnects.delete(connectId);
   }
 
   #expireOpen(pending: PendingOpen, error: unknown): void {
@@ -1550,7 +1568,7 @@ export class Minip2pBase {
       this.#settleWaiter(waiter, error);
     }
     for (const attempt of this.#connects.values()) {
-      attempt.reject?.(error);
+      attempt.settle?.({ error, ok: false });
     }
     this.#connects.clear();
     this.#terminalConnects.clear();
@@ -1585,6 +1603,34 @@ export class Minip2pBase {
       throw new ClosedError();
     }
   }
+}
+
+type ConnectTerminalEvent = Extract<
+  P2pEvent,
+  {
+    readonly tag:
+      | typeof P2pEvent_Tags.PathEstablished
+      | typeof P2pEvent_Tags.ConnectFailed
+      | typeof P2pEvent_Tags.ConnectCancelled;
+  }
+>;
+
+function isConnectTerminal(event: P2pEvent): event is ConnectTerminalEvent {
+  return (
+    event.tag === P2pEvent_Tags.PathEstablished ||
+    event.tag === P2pEvent_Tags.ConnectFailed ||
+    event.tag === P2pEvent_Tags.ConnectCancelled
+  );
+}
+
+// A string starting with `/` is a multiaddress; any other string is a peer ID.
+function toBackendTarget(target: ConnectTarget): BackendConnectTarget {
+  if (typeof target !== "string") {
+    return { addresses: [...target], kind: "addresses" };
+  }
+  return target.startsWith("/")
+    ? { addresses: [target], kind: "addresses" }
+    : { kind: "peer", peerId: target };
 }
 
 function normalizeEvent(
@@ -1762,13 +1808,11 @@ function listenAbort(
 
 function withOptions<Value>(
   promise: Promise<Value>,
-  options: OpOptions,
-  onCancel?: () => void
+  options: OpOptions
 ): Promise<Value> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   assertTimeout(timeoutMs);
   if (options.signal?.aborted === true) {
-    onCancel?.();
     return Promise.reject(new AbortError());
   }
   return new Promise((resolve, reject) => {
@@ -1785,14 +1829,12 @@ function withOptions<Value>(
     };
     const removeAbort = listenAbort(options.signal, () => {
       finish(() => {
-        onCancel?.();
         reject(new AbortError());
       });
     });
     if (timeoutMs > 0) {
       timer = setTimeout(() => {
         finish(() => {
-          onCancel?.();
           reject(new TimeoutError(timeoutMs));
         });
       }, timeoutMs);

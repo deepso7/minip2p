@@ -26,7 +26,7 @@ beforeAll(async () => {
     // Match the raw remote, which drains ready events without rejecting them.
     void stream;
   });
-  await sdkA.connectAddr(sdkB.listenAddrs()[0], { timeoutMs: TIMEOUT_MS });
+  await sdkA.connect(sdkB.listenAddrs()[0], { timeoutMs: TIMEOUT_MS });
   await Promise.all([
     sdkA.waitPeerReady(sdkB.peerId(), { timeoutMs: TIMEOUT_MS }),
     sdkB.waitPeerReady(sdkA.peerId(), { timeoutMs: TIMEOUT_MS }),
@@ -35,7 +35,7 @@ beforeAll(async () => {
   cleanup.push(() => rawA.close());
   rawB = createRaw(true);
   cleanup.push(() => rawB.close());
-  rawA.connectAddr(rawB.listenAddrs()[0]);
+  rawA.connectTarget([rawB.listenAddrs()[0]]);
   await Promise.all([
     waitRawReady(rawA, rawB.peerId()),
     waitRawReady(rawB, rawA.peerId()),

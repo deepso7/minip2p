@@ -144,10 +144,10 @@ const endpoint = Minip2p.create({
 | `autonatServers` | Reachability probing only. It does not create a traversal path. |
 | `forceRelay: true` | Routes outbound connectivity through configured relays. |
 
-Use `connect*` to run NAT orchestration. `dial*` remains direct-only.
+Use `connect` to run NAT orchestration. `dial*` remains direct-only.
 
 ```ts
-const result = await endpoint.connectAddr(remoteAddress);
+const result = await endpoint.connect(remoteAddress);
 
 if (result.path.kind === "relayed") {
   console.log("relay", result.path.relayPeerId);
