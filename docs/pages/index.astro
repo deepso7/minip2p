@@ -7,11 +7,12 @@ import { highlightCode } from "blume/markdown";
 import Mascot from "../components/mascot.astro";
 import ConnectionAttempt from "../components/connection-attempt.astro";
 import SansIoLoop from "../components/sans-io-loop.astro";
-// Both snippets are read verbatim from files in the repo, so the landing page
-// shows what a reader would run. Only the Rust dialer is compiled by CI.
+// Both snippets are read verbatim from files CI checks, so the landing page
+// shows code that compiles: the Rust dialer (`cargo check` in the docs job)
+// and the Node example (`tsc` in the bindings job's `pnpm typecheck`).
 import dialer from "../snippets/quickstart/src/bin/dialer.rs?raw";
-// oxlint-disable-next-line import/default -- Vite's `?raw` adds the default export; the linter resolves the bare `.mjs`.
-import ping from "../../examples/nodejs/ping.mjs?raw";
+// oxlint-disable-next-line import/default -- Vite's `?raw` adds the default export; the linter resolves the bare `.ts`.
+import ping from "../../examples/nodejs/ping.ts?raw";
 
 const { config, navigation, fontCssVars } = data;
 
@@ -22,7 +23,7 @@ const highlight = (code: string, lang: string) =>
   highlightCode(code.trimEnd(), lang, { themes: config.codeThemes });
 const [dialerHtml, pingHtml] = await Promise.all([
   highlight(dialer, "rust"),
-  highlight(ping, "js"),
+  highlight(ping, "ts"),
 ]);
 
 const platforms = [
@@ -271,14 +272,14 @@ const platforms = [
         Add <code class="font-mono text-foreground">minip2p-rs</code> or{" "}
         <code class="font-mono text-foreground">@minip2p/node</code>, then dial
         a peer, wait until it is ready, and ping it. Both snippets are shown
-        verbatim from the repository: the Rust dialer this site compiles in CI,
-        and the runnable Node example.
+        verbatim from the repository, and CI compiles both: the Rust dialer and
+        the TypeScript example you can run with Node.
       </p>
       {/* `.prose` gives the tabs the same code styles as a docs page. */}
       <div class="prose mt-8 max-w-none">
         <Tabs hash={false}>
           <Tab title="Rust"><Fragment set:html={dialerHtml} /></Tab>
-          <Tab title="Node.js"><Fragment set:html={pingHtml} /></Tab>
+          <Tab title="TypeScript"><Fragment set:html={pingHtml} /></Tab>
         </Tabs>
       </div>
       <div class="mt-6 flex flex-wrap gap-4">

@@ -3,11 +3,16 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node listener.mjs",
-    "ping": "node ping.mjs"
+    "start": "node listener.ts",
+    "ping": "node ping.ts",
+    "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
     "@minip2p/node": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:"
   },
   "engines": {
     "node": ">=24"
