@@ -393,11 +393,13 @@ pub fn run_dial(
         micros_since(start)
     );
 
-    let relayed = matches!(path, Path::Relayed { .. });
     let frames = FrameBuf::default();
     let mut channel =
         establish_direct_channel(&mut endpoint, &peer, &BTreeSet::new(), None, start)?;
-    channel.direct = !relayed;
+    // The path can upgrade while the channel is being set up, and its
+    // `PathUpgraded` is then printed by the setup waits rather than seen by
+    // the ping loop. The State snapshot is authoritative either way.
+    channel.direct = !matches!(endpoint.path(&peer), Some(Path::Relayed { .. }));
     println!(
         "[dial] channel-ready path={} elapsed-us={}",
         channel.name(),

@@ -50,7 +50,7 @@ let endpoint = Endpoint::builder()
 
 The executable tries both transports on IPv4 and IPv6 port `19876`, falling back to whichever address family is available. It prints dialable addresses with its peer identity and renders typed reservation/circuit lifecycle events, directional byte totals, denial statuses, close causes, and operational errors. Type `pause` or `resume` on stdin to change admission without removing HOP from Identify or terminating existing reservations and circuits.
 
-Use repeatable `--quic` and `--tcp` flags to replace automatic binds with exact `HOST:PORT` socket addresses. A hostname is resolved to its first address per IP family, and the relay turns each address into its `listen_on` multiaddr:
+Use repeatable `--quic` and `--tcp` flags to replace automatic binds with exact `HOST:PORT` socket addresses. A hostname binds its first resolved address; repeat the flag with each family's address to bind both. The relay turns each address into its `listen_on` multiaddr:
 
 ```bash
 cargo run -p minip2p-relay-server-example -- \

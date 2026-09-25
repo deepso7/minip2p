@@ -17,14 +17,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // One Connection attempt, one Connect ID, one terminal event.
     let connect_id = node.connect(target)?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let event = match node.wait(deadline)? {
             EndpointWaitOutcome::Event(event) => event,
             // Another thread woke the wait; nothing to service here.
             EndpointWaitOutcome::Interrupted => continue,
             EndpointWaitOutcome::Deadline => {
-                return Err("peer did not answer within 10 seconds".into());
+                return Err("peer did not answer in time".into());
             }
         };
         match event {
@@ -37,7 +37,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Err(format!("connect failed: {outcome:?}").into());
                 }
             }
-            EndpointEvent::PeerReady { peer_id, .. } if peer_id == peer => node.ping(&peer)?,
+            EndpointEvent::PeerReady { peer_id, .. } if peer_id == peer => {
+                node.ping(&peer)?;
+                // The ping gets its own budget, however long setup took.
+                deadline = Instant::now() + Duration::from_secs(5);
+            }
             EndpointEvent::PingRttMeasured { peer_id, rtt_ms } if peer_id == peer => {
                 println!("peer={peer} rtt={rtt_ms}ms");
                 return Ok(());

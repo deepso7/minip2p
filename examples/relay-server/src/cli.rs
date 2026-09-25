@@ -29,10 +29,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         let value = |args: &mut std::vec::IntoIter<String>| next_value(&flag, args);
         match flag.as_str() {
             "--help" | "-h" => return Err(usage().into()),
-            "--quic" => options
-                .quic_binds
-                .extend(sockets(&flag, value(&mut args)?)?),
-            "--tcp" => options.tcp_binds.extend(sockets(&flag, value(&mut args)?)?),
+            "--quic" => options.quic_binds.push(socket(&flag, value(&mut args)?)?),
+            "--tcp" => options.tcp_binds.push(socket(&flag, value(&mut args)?)?),
             "--key" => options.key_path = Some(value(&mut args)?.into()),
             "--announce" => options.announce_addrs.push(
                 value(&mut args)?
@@ -107,22 +105,17 @@ fn number<T: core::str::FromStr>(flag: &str, value: String) -> Result<T, String>
         .map_err(|_| format!("{flag} requires a non-negative integer, got {value:?}"))
 }
 
-/// Resolves one `HOST:PORT` bind to its socket addresses, keeping the first
-/// answer per IP family: `localhost:19876` becomes an IPv4 and an IPv6 bind.
-fn sockets(flag: &str, value: String) -> Result<Vec<SocketAddr>, String> {
-    let resolved = value.to_socket_addrs().map_err(|error| {
-        format!("{flag} requires a HOST:PORT socket address, got {value:?}: {error}")
-    })?;
-    let mut addrs: Vec<SocketAddr> = Vec::new();
-    for addr in resolved {
-        if !addrs.iter().any(|seen| seen.is_ipv4() == addr.is_ipv4()) {
-            addrs.push(addr);
-        }
-    }
-    if addrs.is_empty() {
-        return Err(format!("{flag} {value:?} resolved to no address"));
-    }
-    Ok(addrs)
+/// Resolves one `HOST:PORT` bind to the single socket address it binds: the
+/// resolver's first answer. One flag is one socket, as before binds became
+/// listen multiaddrs; repeat the flag (or pass IPs) to bind both families.
+fn socket(flag: &str, value: String) -> Result<SocketAddr, String> {
+    value
+        .to_socket_addrs()
+        .map_err(|error| {
+            format!("{flag} requires a HOST:PORT socket address, got {value:?}: {error}")
+        })?
+        .next()
+        .ok_or_else(|| format!("{flag} {value:?} resolved to no address"))
 }
 
 fn rate(flag: &str, value: String) -> Result<Option<RateLimit>, String> {
@@ -192,15 +185,11 @@ mod tests {
     }
 
     #[test]
-    fn resolves_a_hostname_bind_to_one_address_per_family() {
+    fn resolves_a_hostname_bind_to_one_address() {
         let options = parse(["--tcp".into(), "localhost:4201".into()]).unwrap();
-        assert!(!options.tcp_binds.is_empty() && options.tcp_binds.len() <= 2);
-        assert!(
-            options
-                .tcp_binds
-                .iter()
-                .all(|addr| addr.ip().is_loopback() && addr.port() == 4201)
-        );
+        assert_eq!(options.tcp_binds.len(), 1);
+        let bind = options.tcp_binds[0];
+        assert!(bind.ip().is_loopback() && bind.port() == 4201, "{bind}");
     }
 
     #[test]
