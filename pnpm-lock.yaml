@@ -345,6 +345,13 @@ importers:
       '@minip2p/node':
         specifier: workspace:*
         version: link:../../bindings/ts/node
+    devDependencies:
+      '@types/node':
+        specifier: 'catalog:'
+        version: 26.5.0
+      typescript:
+        specifier: 'catalog:'
+        version: 7.0.2
 
   examples/react-native:
     dependencies:

@@ -1,0 +1,17 @@
+{
+  "extends": "../../.config/tsconfig.base.json",
+  "compilerOptions": {
+    // Read @minip2p/node and @minip2p/core from source, so CI type-checks
+    // this example without building the bindings first.
+    "customConditions": ["minip2p-source"],
+    // Node runs these files directly by stripping types, which only works
+    // for syntax that erases cleanly.
+    "erasableSyntaxOnly": true,
+    "lib": ["DOM", "ES2023", "ESNext.Disposable"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "target": "ES2022",
+    "types": ["node"]
+  },
+  "include": ["*.ts"]
+}

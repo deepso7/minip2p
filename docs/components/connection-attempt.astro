@@ -1,0 +1,192 @@
+---
+// One Connection attempt, played as a short scene (see scene.ts): direct
+// candidates die at the peer's NAT, a relay leg lands a provisional circuit,
+// DCUtR punches a direct path, and the attempt settles once. The event log is
+// what `wait` hands the application, in Endpoint order (connect.rs, attempt.rs).
+//
+// The default slot is the section heading and intro, shown above the steps.
+import SceneControls from "./scene-controls.astro";
+import SceneSteps from "./scene-steps.astro";
+
+const steps = [
+  {
+    body: "QUIC and TCP candidates race at once. The peer's NAT drops both, and the failures stay inside the attempt.",
+    title: "`connect` dials every candidate",
+  },
+  {
+    body: "The circuit through the relay is usable right away, but provisional.",
+    title: "A relay leg starts 200 ms later",
+  },
+  {
+    body: "One peer dials while the other fires timed UDP packets back, so both NATs open for the same path. The path upgrades.",
+    title: "DCUtR punches a direct path",
+  },
+  {
+    body: "One `ConnectSettled` ends the attempt, and the relay circuit closes.",
+    title: "The attempt settles, once",
+  },
+];
+
+const mono = "font-mono text-xs";
+const node =
+  "absolute bottom-8 grid size-16 translate-y-1/2 place-items-center rounded-blume border border-border bg-background font-mono text-xs";
+// An invisible track a pulse runs along; its runner spans it, so moving the
+// runner by 100% lands the dot (centred on the runner's start) on the far end.
+const track = "absolute bottom-8 h-0.5";
+const dot = "absolute top-1/2 -left-1 size-2 -translate-y-1/2 rounded-full bg-accent";
+// The same dot on the far end, for a pulse that runs backwards.
+const dotEnd = "absolute top-1/2 -right-1 size-2 -translate-y-1/2 rounded-full bg-accent";
+const row = "flex items-baseline justify-between gap-3 border-t border-border px-4 py-2.5";
+---
+
+<div class="group/scene grid gap-8 lg:grid-cols-3 lg:gap-16" data-scene data-durations="2800,2800,3000,2600">
+  <div>
+    <slot />
+    {/* On narrow screens the list sits far from the stage, so once the scene
+        plays it gives way to the caption inside the figure. */}
+    <div class="mt-6 group-data-scene-live/scene:max-lg:hidden"><SceneSteps steps={steps} /></div>
+    <p class="mt-5 mb-0"><slot name="more" /></p>
+  </div>
+
+  <figure class="m-0 flex flex-col lg:col-span-2" aria-label="A Connection attempt from dial to ConnectSettled">
+    <div class="flex grow flex-col gap-6">
+      <div class="flex grow flex-col">
+        {/* The network: you and the peer, each behind a NAT, and a relay. */}
+        <div class="relative min-h-48 grow overflow-x-clip">
+          {/* Relay route: up from each node and across, through the relay. */}
+          <div class="absolute inset-x-8 top-3.5 bottom-8 rounded-t-3xl border-2 border-b-0 border-dashed border-border" />
+          <div
+            class="absolute inset-x-8 top-3.5 bottom-8 rounded-t-3xl border-2 border-b-0 border-dashed border-accent data-on:animate-draw"
+            data-show="2"
+            data-hide="4"
+          />
+          <span class="absolute top-3.5 left-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-border bg-background px-2.5 py-1 font-mono text-xs text-muted-foreground">
+            relay
+          </span>
+          <span
+            class="absolute top-3.5 left-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-accent bg-background px-2.5 py-1 font-mono text-xs text-accent"
+            data-show="2"
+            data-hide="4"
+          >
+            relay
+          </span>
+
+          {/* Direct route, and the punched path that replaces the relay. */}
+          <div class="absolute inset-x-8 bottom-8 h-0.5 bg-border" />
+          <div class="absolute inset-x-8 bottom-8 h-0.5 bg-accent data-on:animate-grow" data-show="3" />
+
+          {/* Each side's NAT. */}
+          <span class="absolute bottom-8 left-1/4 h-8 w-1.5 -translate-x-1/2 translate-y-1/2 rounded-full bg-muted-foreground/40" />
+          <span class="absolute bottom-14 left-1/4 -translate-x-1/2 font-mono text-xs text-muted-foreground">NAT</span>
+          <span class="absolute right-1/4 bottom-8 h-8 w-1.5 translate-x-1/2 translate-y-1/2 rounded-full bg-muted-foreground/40" />
+          <span class="absolute right-1/4 bottom-14 translate-x-1/2 font-mono text-xs text-muted-foreground">NAT</span>
+
+          {/* Step 1: QUIC then TCP die at the peer's NAT. */}
+          <div class={`${track} right-1/4 left-8`} data-show="1" data-hide="2">
+            <div class="absolute inset-0 data-on:animate-travel" data-show="1" data-hide="2">
+              <span class={dot} />
+            </div>
+            <div class="absolute inset-0 data-on:animate-travel-late" data-show="1" data-hide="2">
+              <span class={dot} />
+            </div>
+          </div>
+          <span
+            class="absolute right-1/4 bottom-8 mr-2 translate-y-1/2 font-mono text-sm text-accent data-on:animate-pop-late"
+            aria-label="no route"
+            data-show="1"
+            data-hide="3"
+          >
+            ✕
+          </span>
+
+          {/* Step 3: both sides punch at once and meet in the middle. */}
+          <div class={`${track} right-1/2 left-8`} data-show="3" data-hide="4">
+            <div class="absolute inset-0 data-on:animate-travel" data-show="3" data-hide="4">
+              <span class={dot} />
+            </div>
+          </div>
+          <div class={`${track} right-8 left-1/2`} data-show="3" data-hide="4">
+            <div class="absolute inset-0 data-on:animate-travel-back" data-show="3" data-hide="4">
+              <span class={dotEnd} />
+            </div>
+          </div>
+          <span
+            class="absolute bottom-8 left-1/2 size-3 -translate-x-1/2 translate-y-1/2 rounded-full bg-accent opacity-0 data-on:animate-flash"
+            data-show="3"
+            data-hide="4"
+           
+          />
+
+          <span class={`${node} left-0`}>you</span>
+          <span class={`${node} right-0`}>peer</span>
+          <span
+            class={`${node} right-0 border-accent text-accent`}
+            data-show="4"
+          >
+            peer ✓
+          </span>
+        </div>
+
+        {/* What the attempt looks like from outside, frame by frame. */}
+        <dl class={`${mono} m-0 mt-4 grid grid-cols-2 gap-4 text-muted-foreground`}>
+          <div class="grid gap-1">
+            <dt>attempt</dt>
+            <dd class="m-0 grid text-foreground">
+              <span class="col-start-1 row-start-1" data-show="1" data-hide="4">pending</span>
+              <span class="col-start-1 row-start-1 text-accent" data-show="4">settled</span>
+            </dd>
+          </div>
+          <div class="grid gap-1">
+            <dt>path</dt>
+            <dd class="m-0 grid text-foreground">
+              <span class="col-start-1 row-start-1" data-show="1" data-hide="2">none yet</span>
+              <span class="col-start-1 row-start-1" data-show="2" data-hide="3">Relayed · provisional</span>
+              <span class="col-start-1 row-start-1 text-accent" data-show="3">DirectPunched</span>
+            </dd>
+          </div>
+        </dl>
+      </div>
+
+      {/* What the application sees: each row is a separate `wait` call. */}
+      <div class="overflow-hidden rounded-blume border border-border">
+        <div class="flex items-baseline justify-between gap-3 bg-muted px-4 py-2.5">
+          <span class={`${mono} text-muted-foreground`}>your loop</span>
+          <span class={`${mono} text-muted-foreground`}>
+            one event per <code class="text-foreground">node.wait()</code>
+          </span>
+        </div>
+        <ol class={`${mono} m-0 list-none p-0`}>
+          <li class={`${row} text-muted-foreground`} data-show="1" data-rise>
+            connect(peer) → ConnectId
+          </li>
+          <li class={row} data-show="2" data-rise>
+            <span><span class="text-muted-foreground">wait → </span>ConnectionEstablished</span><span class="text-muted-foreground">circuit</span>
+          </li>
+          <li class={`${row} delay-300`} data-show="2" data-rise>
+            <span><span class="text-muted-foreground">wait → </span>Nat(PathEstablished)</span><span class="text-muted-foreground">Relayed</span>
+          </li>
+          <li class={row} data-show="3" data-rise>
+            <span><span class="text-muted-foreground">wait → </span>ConnectionEstablished</span><span class="text-muted-foreground">direct</span>
+          </li>
+          <li class={`${row} delay-300`} data-show="3" data-rise>
+            <span><span class="text-muted-foreground">wait → </span>Nat(PathUpgraded)</span><span class="text-muted-foreground">→ Punched</span>
+          </li>
+          <li class={`${row} text-accent`} data-show="4" data-rise>
+            <span><span class="text-muted-foreground">wait → </span>ConnectSettled</span><span>Connected</span>
+          </li>
+          <li class={`${row} delay-300`} data-show="4" data-rise>
+            <span><span class="text-muted-foreground">wait → </span>ConnectionClosed</span><span class="text-muted-foreground">circuit</span>
+          </li>
+        </ol>
+        <p class={`${mono} m-0 border-t border-border px-4 py-2.5 text-muted-foreground`}>
+          The order for this run. An attempt that settles on the relay can still
+          see <code class="text-foreground">Nat(PathUpgraded)</code> after{" "}
+          <code class="text-foreground">ConnectSettled</code>.
+        </p>
+      </div>
+    </div>
+
+    <SceneSteps steps={steps} caption />
+    <SceneControls steps={steps.length} />
+  </figure>
+</div>

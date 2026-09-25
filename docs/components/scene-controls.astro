@@ -1,0 +1,66 @@
+---
+// Playback for a scene: play/pause, replay, and one progress segment per step
+// (each jumps there). Hidden until scene.ts takes over, since without the
+// script the scene is a still frame.
+interface Props {
+  steps: number;
+}
+
+const { steps } = Astro.props;
+const button =
+  "grid size-7 shrink-0 cursor-pointer place-items-center rounded-full border border-border bg-transparent text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-2 focus-visible:outline-accent";
+const icon = "size-3.5 fill-none stroke-current stroke-2";
+---
+
+<div class="mt-6 hidden items-center gap-3 group-data-scene-live/scene:flex">
+  <button type="button" class={button} aria-label="Play" data-toggle>
+    {/* Pause while playing, replay once ended, play otherwise. */}
+    <svg class={`${icon} hidden group-data-playing/scene:block`} viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M9 5v14M15 5v14" />
+    </svg>
+    <svg class={`${icon} hidden group-data-ended/scene:block`} viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" />
+    </svg>
+    <svg
+      class={`${icon} group-data-ended/scene:hidden group-data-playing/scene:hidden`}
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+    >
+      <path d="M7 4.5v15L19 12Z" />
+    </svg>
+  </button>
+  <div class="flex flex-1 gap-1.5">
+    {
+      Array.from({ length: steps }, (_, index) => (
+        <button
+          type="button"
+          class="group/seg flex-1 cursor-pointer border-0 bg-transparent py-2 focus-visible:outline-2 focus-visible:outline-accent"
+          aria-label={`Step ${index + 1}`}
+          data-goto={index + 1}
+        >
+          <span class="block h-0.5 overflow-hidden rounded-full bg-border">
+            <span class="block h-full origin-left scale-x-0 bg-accent group-data-[state=current]/seg:animate-fill group-data-[state=done]/seg:scale-x-100 group-data-ended/scene:scale-x-100" />
+          </span>
+        </button>
+      ))
+    }
+  </div>
+  <button
+    type="button"
+    class={`${button} group-data-ended/scene:hidden`}
+    aria-label="Replay"
+    data-restart
+  >
+    <svg class={icon} viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" />
+    </svg>
+  </button>
+</div>
+
+<script>
+  import { initScene } from "./scene";
+
+  for (const root of document.querySelectorAll<HTMLElement>("[data-scene]")) {
+    initScene(root);
+  }
+</script>

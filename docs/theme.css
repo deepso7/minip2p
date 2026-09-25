@@ -5,6 +5,11 @@
   --minip2p-black: oklch(0.17 0.008 250);
   --minip2p-white: oklch(0.95 0.006 60);
 
+  /* Motion. Landing-page scenes share these; the ease matches the mascot's
+     settle. */
+  --minip2p-duration-base: 200ms;
+  --minip2p-ease: cubic-bezier(0.2, 0, 0, 1);
+
   --blume-background: var(--minip2p-white);
   --blume-foreground: var(--minip2p-black);
   --blume-muted: color-mix(
@@ -98,4 +103,183 @@
     var(--blume-muted-foreground) 55%,
     transparent
   );
+}
+
+/* One guard for the whole site: animations collapse to their end state, which
+   every landing-page diagram authors as its finished state. The mascot keeps
+   its own check because it animates from script. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    /* Delays too: a landing-page diagram staged over seconds would otherwise
+       stay blank for that long before snapping to its end state. */
+    animation-delay: -1ms !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0s !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Landing-page scenes (components/scene.ts).
+ *
+ * Once the script runs, each `[data-show]` part is hidden until its step
+ * switches it on. Without the script the scene is a still of its last frame:
+ * everything shows except the parts that a later step hides (`[data-hide]`).
+ */
+/* Longhands, not the `transition` shorthand: this rule is unlayered, so a
+   shorthand would reset the `delay-*` utilities that stagger paired rows. */
+[data-scene-live] [data-show] {
+  transition-property: opacity, translate;
+  transition-duration: var(--minip2p-duration-base);
+  transition-timing-function: var(--minip2p-ease);
+}
+[data-scene-live] [data-show]:not([data-on]) {
+  opacity: 0;
+}
+/* Rows that slide in as they arrive. */
+[data-scene-live] [data-rise]:not([data-on]) {
+  translate: 0 0.375rem;
+}
+[data-scene-live] [data-past] {
+  animation: none !important;
+}
+[data-scene]:not([data-scene-live]) [data-hide] {
+  display: none;
+}
+[data-scene][data-paused] * {
+  animation-play-state: paused !important;
+}
+
+/* Tailwind turns every `--animate-*` into an `animate-<name>` utility; scenes
+   start them with `data-on:animate-<name>`. Travel is a runner moving the
+   length of its track, so a pulse fits any width. */
+@theme {
+  --animate-travel: scene-travel 1s var(--minip2p-ease) both;
+  --animate-travel-late: scene-travel 1s var(--minip2p-ease) 300ms both;
+  --animate-travel-back: scene-travel-back 1s var(--minip2p-ease) both;
+  --animate-travel-down: scene-travel-down 700ms var(--minip2p-ease) both;
+  --animate-travel-down-late: scene-travel-down 700ms var(--minip2p-ease) 700ms
+    both;
+  --animate-travel-up: scene-travel-up 900ms var(--minip2p-ease) both;
+  --animate-draw: scene-draw 1s var(--minip2p-ease) both;
+  /* The punched path grows out from where the two pulses meet. */
+  --animate-grow: scene-grow 500ms var(--minip2p-ease) 1s both;
+  --animate-flash: scene-flash 600ms ease-out 900ms both;
+  --animate-pop: scene-pop var(--minip2p-duration-base) var(--minip2p-ease) both;
+  --animate-pop-late: scene-pop var(--minip2p-duration-base) var(--minip2p-ease)
+    1.2s both;
+}
+
+/* Inline, so `--scene-step-ms` (set on each scene by scene.ts) resolves on the
+   progress segment; a plain @theme token would resolve it on :root, to 0ms. */
+@theme inline {
+  --animate-fill: scene-fill var(--scene-step-ms, 0ms) linear both;
+}
+
+@keyframes scene-travel {
+  0% {
+    opacity: 0;
+    transform: translateX(0);
+  }
+  10%,
+  90% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+}
+@keyframes scene-travel-back {
+  0% {
+    opacity: 0;
+    transform: translateX(0);
+  }
+  10%,
+  90% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateX(-100%);
+  }
+}
+@keyframes scene-travel-down {
+  0% {
+    opacity: 0;
+    transform: translateY(0);
+  }
+  10%,
+  90% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(100%);
+  }
+}
+@keyframes scene-travel-up {
+  0% {
+    opacity: 0;
+    transform: translateY(0);
+  }
+  10%,
+  90% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-100%);
+  }
+}
+@keyframes scene-draw {
+  0% {
+    clip-path: inset(0 100% 0 0);
+  }
+  100% {
+    clip-path: inset(0 0 0 0);
+  }
+}
+@keyframes scene-grow {
+  0% {
+    transform: scaleX(0);
+  }
+  100% {
+    transform: scaleX(1);
+  }
+}
+@keyframes scene-flash {
+  0% {
+    opacity: 0;
+    transform: scale(0.4);
+  }
+  40% {
+    opacity: 1;
+    transform: scale(1.8);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(2.4);
+  }
+}
+@keyframes scene-pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes scene-fill {
+  0% {
+    transform: scaleX(0);
+  }
+  100% {
+    transform: scaleX(1);
+  }
 }
