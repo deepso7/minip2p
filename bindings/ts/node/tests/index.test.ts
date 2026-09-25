@@ -101,7 +101,7 @@ describe("@minip2p/node", () => {
       const stranger = nodeSdk.peerIdFromSecretKey(nodeSdk.generateSecretKey());
       await expect(
         a.connect(stranger, { timeoutMs: 10_000 })
-      ).rejects.toBeInstanceOf(nodeSdk.ConnectFailedError);
+      ).rejects.toMatchObject({ name: "ConnectFailedError" });
     } finally {
       a.close();
       b.close();
