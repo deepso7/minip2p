@@ -221,7 +221,7 @@ const platforms = [
       >
         From a server to a microcontroller.
       </h2>
-      <div class="mt-10 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      <div class="mt-10 grid gap-4 md:grid-cols-3">
         {
           platforms.map((platform) => (
             <div class="rounded-blume border border-border p-6">
@@ -235,19 +235,6 @@ const platforms = [
             </div>
           ))
         }
-        <div class="rounded-blume bg-muted p-6 sm:col-span-2 lg:col-span-3">
-          <p
-            class="m-0 font-mono text-xs uppercase tracking-wide text-muted-foreground"
-          >
-            Also inside
-          </p>
-          <p class="mt-3 mb-0 text-sm leading-relaxed text-muted-foreground">
-            Circuit Relay v2 reservations and circuits, StrictSign Gossipsub
-            pinned against go-libp2p, signed presence beacons and mDNS discovery
-            — with <code class="font-mono text-foreground">unsafe</code> denied in
-            every crate.
-          </p>
-        </div>
       </div>
     </section>
 
