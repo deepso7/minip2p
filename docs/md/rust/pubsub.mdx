@@ -16,7 +16,8 @@ Then activate it on the endpoint:
 ```rust
 let mut node = minip2p::Endpoint::builder()
     .gossipsub()
-    .bind_quic_dual_stack()?;
+    .listen_default()?
+    .bind()?;
 
 node.subscribe("news")?;
 ```
@@ -84,7 +85,7 @@ loop {
 }
 ```
 
-Gossipsub output arrives as `EndpointEvent::Gossipsub` on the Endpoint event stream. Discovery beacon-topic traffic never appears there. The migration APIs `take_gossipsub_events` / `next_gossipsub_event` remain until #181.
+Gossipsub output arrives as `EndpointEvent::Gossipsub` on the Endpoint event stream. Discovery beacon-topic traffic never appears there.
 
 Use `subscribe` and `unsubscribe` to change local topic membership. Both return `false` when the requested state already held.
 
@@ -104,7 +105,8 @@ let config = GossipsubConfig {
 
 let node = Endpoint::builder()
     .gossipsub_config(config)
-    .bind_quic_dual_stack()?;
+    .listen_default()?
+    .bind()?;
 ```
 
 Messages that include a signature are still verified. `allow_unsigned` does not make local publications unsigned.

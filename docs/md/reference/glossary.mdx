@@ -11,10 +11,12 @@ Definitions only. For recipes, follow the linked guides.
 | **`Minip2p`** | The TypeScript endpoint type returned by `Minip2p.create` or `useMinip2p`. |
 | **PeerId** | Authenticated public-key identity of a peer. |
 | **Multiaddr** | Transport address without a peer identity (for example `/ip4/…/udp/…/quic-v1` or `/ip4/…/tcp/…`). |
-| **PeerAddr** | A `Multiaddr` plus a terminal `/p2p/<peer-id>`. Required for dialing a specific peer. |
+| **PeerAddr** | A `Multiaddr` plus a terminal `/p2p/<peer-id>`. A complete peer address, as a Connection target names one. |
 | **PeerReady** | Event after the first Identify exchange; supplies advertised protocols. `open_stream` is already allowed once connected. |
-| **Connection attempt** | One application-level effort to reach a peer. It has one Connect ID and exactly one terminal: connected, failed, or cancelled. |
-| **Connect ID** | Correlation id for a Connection attempt, including its direct dials, relay fallback, and upgrade. |
+| **Connection attempt** | One application-level effort to reach a peer, started by `connect`. It has one Connect ID and exactly one terminal (`ConnectSettled`): connected, failed, or cancelled. Only explicit cancellation stops it; abandoning a wait does not. |
+| **Connection target** | What `connect` takes: a `PeerId`, one complete `PeerAddr`, or a non-empty list of complete addresses that all name the same peer. |
+| **Transport dial** | One mechanism-level dial of one peer address. A Connection attempt may run several; raw dials outside an attempt live on the swarm. |
+| **Connect ID** | Correlation ID for a Connection attempt, stable across its Transport dials, relay fallback, and upgrade. |
 | **Relay leg** | NAT-owned part of an attempt: relay dial, HOP CONNECT, bridge promotion, DCUtR. Does not decide the terminal. |
 | **Path** | NAT result: `DirectDialed`, `DirectPunched`, or `Relayed`. A Relayed path may be provisional until the attempt settles. See [Traverse NAT](/rust/traverse-nat). |
 | **Stream** | A negotiated byte stream for one application protocol. Writes may be split or combined, so applications add their own framing. |
@@ -22,12 +24,11 @@ Definitions only. For recipes, follow the linked guides.
 | **`queueOverflow`** | TypeScript event reporting that the application did not consume events quickly enough. Refresh queryable state before relying on event history. |
 | **Sans-I/O** | Deterministic protocol/orchestration state machines; sockets and clocks live in adapters. |
 | **`poll`** | One non-blocking drive step; returns currently available Endpoint events. |
-| **`wait`** | Blocking Endpoint wait returning an event (including capability events), deadline, or interruption (ADR 0007). |
+| **`wait`** | The one blocking Endpoint wait; returns an Endpoint wait outcome. |
+| **Endpoint event stream** | The endpoint's single, ordered source of connection, protocol, discovery, and diagnostic events. Applications wait for an outcome by matching its ID in their own loop. |
+| **Endpoint wait outcome** | Why `wait` returned: `Event(EndpointEvent)`, `Deadline`, or `Interrupted`. |
 | **`EndpointEvent`** | Ordered, non-exhaustive event from the Endpoint's single public stream; enabled capabilities add `Nat`, `Gossipsub`, `Discovery`, and `RelayServer` variants. |
 | **State snapshot** | Getter over durable connection, peer, or transport-bound address state; not one atomic mega-snapshot and may be ahead of the event stream, never behind its own emitted transition. `bound_addresses` is bound sockets, not “accepting connections”. |
-| **`next_event`** | Synchronous drive until one Endpoint event (capability variants included) or a deadline. Swallows interruption. Remains until #181. |
-| **`next_wake`** | Migration wrapper over `wait` until #181. One Endpoint event (capability variants included), a deadline, or an interruption. Does not return driver-progress. |
-| **Focused wait** | Migration-era drive until a specific result (`wait_peer_ready`, `nat_wait_path`, `next_gossipsub_event`, …) while buffering unrelated events. |
 | **Available vs enabled** | A Cargo feature makes a capability available; a builder method enables it on an endpoint. See [Install](/rust/install#add-an-optional-capability). |
 | **Circuit address** | `/…/p2p/<relay>/p2p-circuit/p2p/<target>` reaches a peer through a Circuit Relay v2 reservation. |
 

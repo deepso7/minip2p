@@ -7,15 +7,11 @@ minip2p remains caller-driven at every layer. The application chooses when to po
 
 ## Pick a driving method
 
-Use `Endpoint::wait` for the ADR 0007 Endpoint wait outcomes (event, deadline, or interrupted). It wakes on and delivers enabled capability output, so one `wait` loop sees every event exactly once for every feature combination. Prefer `connect` plus `ConnectSettled` for a Connection attempt. Focused waits such as `nat_wait_path` (nat) and `wait_peer_ready`, plus `next_event`, remain during migration (until #181). All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
+The endpoint has one ordered event stream and two ways to read it. `Endpoint::wait` blocks until an Endpoint event, the caller's deadline, or an interruption; `poll()` drains whatever is ready without blocking. Enabled capabilities (NAT, pubsub, discovery, relay server) deliver their output as variants on the same stream, so one loop sees every event exactly once for every feature combination. Both use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
 
 | Method | Behavior | Good fit |
 | --- | --- | --- |
-| `wait(deadline)` | Drive until one Endpoint event (including capability events), deadline, or interruption. | Every application event loop; correlating an operation while dispatching others |
-| `nat_wait_path` / `wait_peer_ready` / `wait_ping_rtt` | Drive until one milestone, buffering unrelated events. | Connection and setup milestones (migration) |
-| `next_nat_event` / `next_gossipsub_event` / `next_discovery_event` / `next_relay_server_event` | Drive until the next matching capability event; other events stay queued. | Feature-specific workflows (migration) |
-| `next_event(deadline)` | Like `wait`, returns one `EndpointEvent` (capability variants included) or `None` at the deadline, but swallows interruption. `Event` is its migration alias for `EndpointEvent`. Remains until #181. | Legacy synchronous loops |
-| `next_wake(deadline)` | Migration wrapper over `wait` until #181. Same event (capability variants included), deadline, or interruption. Does not return driver-progress. | Callers not yet on `wait` |
+| `wait(deadline)` | Drive until one `EndpointWaitOutcome`: `Event(EndpointEvent)`, `Deadline`, or `Interrupted`. | Every blocking application loop; correlating an operation while dispatching others |
 | `poll()` | One non-blocking drive; returns currently available Endpoint events, finishing each swarm event the same way `wait` does. | Existing game, UI, or reactor loops |
 
 ## Deadline forms
@@ -32,16 +28,18 @@ let absolute = Instant::now() + Duration::from_secs(5);
 let forever = Deadline::NEVER;
 ```
 
-An already-passed absolute `Instant` deadline returns `Deadline` from `wait` (or `None` from `next_event`) before delivering another queued event. Relative `Duration` deadlines — including `Duration::ZERO` non-blocking drains — still inspect buffered events and poll once. The endpoint does not sleep or poll repeatedly past the deadline.
+An already-passed absolute `Instant` deadline returns `Deadline` from `wait` before delivering another queued event. Relative `Duration` deadlines — including `Duration::ZERO` non-blocking drains — still inspect buffered events and poll once. The endpoint does not sleep or poll repeatedly past the deadline.
 
-## Wait for a milestone
+## Wait for a correlated outcome
+
+Operations return IDs; wait for the matching event in your own loop:
 
 ```rust
 use std::time::Duration;
 
 use minip2p::{ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome};
 
-fn connect_and_ready(
+fn connect_to(
     node: &mut Endpoint,
     target: minip2p::PeerAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -61,14 +59,21 @@ fn connect_and_ready(
             }) if settled == connect_id => {
                 return Err(format!("connect failed: {outcome:?}").into());
             }
-            EndpointWaitOutcome::Event(_) | EndpointWaitOutcome::Interrupted => {}
-            EndpointWaitOutcome::Deadline => return Err("connect did not settle".into()),
+            // Unrelated events keep flowing: dispatch them as usual.
+            EndpointWaitOutcome::Event(event) => println!("{event:?}"),
+            EndpointWaitOutcome::Interrupted => {}
+            EndpointWaitOutcome::Deadline => {
+                node.cancel_connect(connect_id);
+                return Err("connect did not settle".into());
+            }
         }
     }
 }
 ```
 
-With the `nat` feature, `connect` races direct candidates against a relay leg when one is configured. Use `nat_wait_path` for the first usable NAT path (the provisional Relayed path, when that lands first); `ConnectSettled` is the attempt's terminal. Use `wait_peer_ready` only when the application needs Identify's protocol list (for example early `RemoteDoesNotSupport` checks). `open_stream` is allowed once the peer is connected; Identify is not a stack gate for opening known app protocols.
+The deadline bounds only this wait. Abandoning a wait never cancels the attempt, which keeps running and still settles; `cancel_connect` is the explicit stop.
+
+With the `nat` feature, `connect` races direct candidates against a relay leg when one is configured. `EndpointEvent::Nat(NatEvent::PathEstablished { connect_id, .. })` reports the first usable path (the provisional Relayed path, when that lands first); `ConnectSettled` is the attempt's terminal. Match `PeerReady` only when the application needs Identify's protocol list (for example early `RemoteDoesNotSupport` checks). `open_stream` is allowed once the peer is connected; Identify is not a stack gate for opening known app protocols.
 
 ## Application event loops
 
@@ -108,25 +113,9 @@ fn run(mut node: Endpoint, peer: minip2p::PeerId) -> Result<(), minip2p::Error> 
 }
 ```
 
+The endpoint has no second queue, so a correlated wait never buffers or drops unrelated events: each one comes back to your loop in order. Handle a busy source (such as a chatty stream) where it arrives rather than ignoring it.
+
 Synchronous method failures are returned as `minip2p::Error`. Non-fatal problems that occur later while driving appear as `EndpointEvent::Error` or a capability failure event such as `EndpointEvent::RelayServer(RelayServerEvent::Error { .. })`.
-
-## Focused waits preserve other events
-
-Suppose `nat_wait_path` is waiting for a NAT result while an application stream receives data. The stream event is retained and becomes available through a later `wait`; it is not discarded by the NAT wait.
-
-That retained backlog is bounded by `RUN_UNTIL_SKIP_LIMIT` (currently 1024 events). If a focused wait cannot find its result while unrelated events keep arriving, it returns:
-
-```text
-minip2p::Error::EventBacklogExceeded { limit: RUN_UNTIL_SKIP_LIMIT }
-```
-
-Drain events with `wait` or `poll`, handle the high-volume source, and then retry the focused wait.
-
-<Callout type="tip">
-
-Avoid calling `Deadline::NEVER` on a narrow predicate while ignoring a busy stream. Either consume those stream events in the main loop or use a finite deadline and alternate consumers.
-
-</Callout>
 
 ## Stream and connection shutdown
 
@@ -162,7 +151,5 @@ loop {
 Capability variants exist only when their feature is enabled: `Nat` (`nat`), `Gossipsub` (`pubsub`), `Discovery` (`discovery` / `mdns`), and `RelayServer` (`relay-server`). `poll` and `wait` finish each swarm event before the next: that swarm event, then capability events in relay-server, NAT, Gossipsub, Discovery order, then Connection-attempt terminals (`ConnectSettled`). No order is promised between concurrently racing Transport candidates. NAT attempt terminals (`ConnectFailed`, `FellBackToRelay`) never appear; `ConnectSettled` carries the outcome. A `PathUpgraded` can still follow its attempt's `ConnectSettled` when the attempt settled on a provisional Relayed path. Embedded endpoints emit the same variants and do not use this step order.
 
 State snapshot getters such as `path`, `reachability`, `active_reservation`, and `known_peers` stay authoritative for durable state. They may be ahead of the event stream, never behind their own emitted transition.
-
-The migration APIs `next_wake` (a wrapper over `wait`), `take_*_events`, and `next_*_event` remain until #181. `take_*_events` and `next_*_event` remove matching events from the same stream, so each event is delivered once, either by them or by `wait`.
 
 See [Rust troubleshooting](/rust/troubleshooting) for common event symptoms and responses.

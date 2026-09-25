@@ -24,34 +24,54 @@ Install minip2p:
 cargo add minip2p-rs
 ```
 
-Then create an endpoint:
+Then create an endpoint, connect to a peer by its complete address, and dispatch events until that one Connection attempt settles:
 
 ```rust
-use minip2p::{Deadline, Endpoint, Event};
+use std::time::{Duration, Instant};
+
+use minip2p::{Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut endpoint = Endpoint::builder()
         .agent_version("my-app/0.1.0")
-        .bind_quic_dual_stack()?;
+        .listen_default()?
+        .bind()?;
 
     for address in endpoint.listen_all()? {
         println!("listening on {address}");
     }
 
-    while let Some(event) = endpoint.next_event(Deadline::NEVER)? {
-        println!("{event:?}");
-        if matches!(event, Event::ConnectionEstablished { .. }) {
-            // Open streams once connected; PeerReady is optional Identify info.
+    // A complete peer address, copied from the remote's listen output.
+    let target: PeerAddr =
+        "/ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+            .parse()?;
+    let connect_id = endpoint.connect(target)?;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match endpoint.wait(deadline)? {
+            EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled { connect_id: id, outcome, .. })
+                if id == connect_id =>
+            {
+                println!("attempt settled: {outcome:?}");
+                break;
+            }
+            // Every other event is dispatched as usual while we wait.
+            EndpointWaitOutcome::Event(event) => println!("{event:?}"),
+            EndpointWaitOutcome::Interrupted => {}
+            EndpointWaitOutcome::Deadline => {
+                endpoint.cancel_connect(connect_id);
+                break;
+            }
         }
     }
-
     Ok(())
 }
 ```
 
-`Endpoint` is caller-driven: it owns sockets, but it does not start a runtime or background task. Prefer `Endpoint::wait` for the ordered Endpoint event stream: one loop sees every event exactly once, including enabled capability output such as `EndpointEvent::Nat`, `EndpointEvent::Gossipsub`, `EndpointEvent::Discovery`, and `EndpointEvent::RelayServer`. Use `connect` plus `ConnectSettled` for a Connection attempt. Focused waits such as `nat_wait_path` and `wait_peer_ready`, plus `next_event`, remain during migration. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. Event waits accept an absolute `Instant`, a relative `Duration`, or `Deadline::NEVER`.
+`Endpoint` is caller-driven: it owns sockets, but it does not start a runtime or background task. `connect` is the one Connection-attempt operation: it returns a `ConnectId` at once, and the attempt ends with exactly one `EndpointEvent::ConnectSettled`. `Endpoint::wait` is the one blocking wait over the one ordered Endpoint event stream: a loop sees every event exactly once, including enabled capability output such as `EndpointEvent::Nat`, `EndpointEvent::Gossipsub`, `EndpointEvent::Discovery`, and `EndpointEvent::RelayServer`, plus `Deadline` and `Interrupted` outcomes so it can service its own timers and commands. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. Waits accept an absolute `Instant`, a relative `Duration`, or `Deadline::NEVER`.
 
-QUIC is the default. Turn on the `tcp` feature to listen on TCP as well, or TCP only. The dial address picks the transport:
+QUIC is the default. Turn on the `tcp` feature to listen on TCP as well, or TCP only. Listen and peer addresses name their transport, so the address picks it:
 
 ```bash
 cargo add minip2p-rs --features tcp
@@ -59,8 +79,8 @@ cargo add minip2p-rs --features tcp
 
 ```rust
 let endpoint = minip2p::Endpoint::builder()
-    .quic_dual_stack()?
-    .tcp("0.0.0.0:4001")
+    .listen_default()?
+    .listen_on("/ip4/0.0.0.0/tcp/4001")?
     .bind()?;
 # Ok::<(), minip2p::Error>(())
 ```

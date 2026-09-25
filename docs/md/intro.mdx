@@ -20,7 +20,7 @@ minip2p connects applications over authenticated QUIC and TCP. Use it from Rust,
 ## What minip2p does
 
 - Authenticates peers with Ed25519 identities.
-- Listens and dials over QUIC, TCP, or both.
+- Listens and connects over QUIC, TCP, or both.
 - Negotiates custom protocol streams between peers.
 - Adds pubsub, discovery, relay paths, and NAT traversal when requested.
 - Runs on `no_std + alloc` devices through the portable Rust endpoint.
@@ -99,7 +99,7 @@ The base configuration includes QUIC, Identify, Ping, and custom protocols. Opti
 |  |  |
 | --- | --- |
 | <Badge>pre-1.0</Badge> | Interfaces may change before the first stable release. |
-| <Badge>QUIC and TCP</Badge> | The dial address picks the transport. |
+| <Badge>QUIC and TCP</Badge> | The peer address picks the transport. |
 | <Badge>no_std + alloc</Badge> | Portable Rust applications supply network I/O, time, and entropy. |
 | <Badge>Rust 1.91+</Badge> | Minimum supported Rust version. |
 | <Badge>Node.js 24+</Badge> | Minimum supported Node.js version. |

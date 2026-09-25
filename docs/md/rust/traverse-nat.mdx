@@ -3,7 +3,7 @@ title: Traverse NAT
 description: Configure relay and AutoNAT, establish the first usable path, and observe direct upgrades or relay fallback.
 ---
 
-This guide starts where direct [listen and dial](/rust/listen-and-dial) leaves off. It configures relays and AutoNAT, races direct and relayed paths, and tracks later upgrades or fallback. Relayed paths require a reachable Circuit Relay v2 server, which minip2p can host.
+This guide starts where direct [listen and connect](/rust/listen-and-dial) leaves off. It configures relays and AutoNAT, races direct and relayed paths, and tracks later upgrades or fallback. Relayed paths require a reachable Circuit Relay v2 server, which minip2p can host.
 
 <Badge>pre-1.0</Badge>
 
@@ -20,7 +20,7 @@ cargo run -p minip2p-relay-server-example -- \
   --announce /dns4/relay.example.com/tcp/19876
 ```
 
-Its default is the small `.relay_server().bind_*()` application path. Optional flags expose frozen resource/rate/control limits, and stdin `pause`/`resume` changes only new admissions. Explicit addresses are trusted operator input; otherwise selection prefers AutoNAT-confirmed direct addresses and then concrete listeners. Address changes affect future Identify responses only. There is no automatic relay discovery: distribute the printed peer address to clients explicitly. See the [hosting guide](https://github.com/deepso7/minip2p/tree/main/examples/relay-server).
+Its default is the small `.relay_server().listen_on(..)?.bind()` application path. Optional flags expose frozen resource/rate/control limits, and stdin `pause`/`resume` changes only new admissions. Explicit addresses are trusted operator input; otherwise selection prefers AutoNAT-confirmed direct addresses and then concrete listeners. Address changes affect future Identify responses only. There is no automatic relay discovery: distribute the printed peer address to clients explicitly. See the [hosting guide](https://github.com/deepso7/minip2p/tree/main/examples/relay-server).
 
 ## Enable NAT traversal
 
@@ -43,7 +43,8 @@ use minip2p::{Endpoint, PeerAddr};
 let relay: PeerAddr = std::env::var("MINIP2P_RELAY")?.parse()?;
 let mut node = Endpoint::builder()
     .relay(relay)
-    .bind_quic_dual_stack()?;
+    .listen_default()?
+    .bind()?;
 
 node.listen_all()?;
 ```
@@ -58,15 +59,20 @@ Calling `.autonat_server(...)` alone enables reachability probes, but it does no
 | -------------------------------------------------- | --------------------- |
 | Peer ID; known addresses and/or a configured relay | `connect(&peer_id)`   |
 | One complete `PeerAddr`                            | `connect(&peer_addr)` |
-| Several complete `PeerAddr`s for the same peer     | `connect(addrs)?`     |
+| Several complete `PeerAddr`s for the same peer     | `connect(addrs)`      |
 
-A Peer-ID target with neither known addresses nor a relay settles `ConnectSettled { Failed(NoUsableRoute) }` through one terminal event.
+A Peer-ID target with neither known addresses nor a relay settles `ConnectSettled { Failed(NoUsableRoute) }` through one terminal event. An empty or mixed-peer address list is refused synchronously with `ConnectTargetError`.
+
+Wait for the Connect ID in your event loop:
 
 ```rust
 use std::time::{Duration, Instant};
 
-use minip2p::{ConnectOutcome, EndpointEvent, EndpointWaitOutcome, NatEvent};
+use minip2p::{ConnectOutcome, EndpointEvent, EndpointWaitOutcome, NatEvent, PeerAddr};
 
+let target: PeerAddr =
+    "/ip4/192.0.2.7/udp/4001/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+        .parse()?;
 let connect_id = node.connect(&target)?;
 let deadline = Instant::now() + Duration::from_secs(60);
 loop {
@@ -87,9 +93,11 @@ loop {
             }
             break;
         }
-        EndpointWaitOutcome::Event(_) | EndpointWaitOutcome::Interrupted => {}
+        EndpointWaitOutcome::Event(event) => println!("{event:?}"), // dispatch as usual
+        EndpointWaitOutcome::Interrupted => {}
         EndpointWaitOutcome::Deadline => {
-            eprintln!("no outcome before the deadline");
+            // The deadline is local; stop the attempt explicitly.
+            node.cancel_connect(connect_id);
             break;
         }
     }
@@ -98,7 +106,7 @@ loop {
 
 `NatEvent::PathEstablished` reports the first usable path, which may be a provisional Relayed circuit. The attempt's terminal is `EndpointEvent::ConnectSettled` (connected after DCUtR settles, or immediately under `force_relay`). NAT attempt terminals (`ConnectFailed`, `FellBackToRelay`) are consumed by the Connection-attempt engine and never reach the stream; a failed attempt settles as `ConnectOutcome::Failed`.
 
-The migration helper `nat_wait_path(connect_id, deadline)` remains until #181. It returns `Ok(Some(path))` on the attempt's `PathEstablished`. If the attempt settles first, it returns the `path()` snapshot for a connected attempt or `Ok(None)` for a failed or cancelled one, leaving `ConnectSettled` queued for `wait`. It also returns `Ok(None)` when the deadline expires first.
+`node.path(&peer)` is the State snapshot of the current path, independent of whether its event has been consumed yet.
 
 ## Path selection and upgrade
 
