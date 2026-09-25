@@ -903,8 +903,10 @@ export class Minip2pBase {
     target: ConnectTarget,
     options: ConnectOptions = {}
   ): Promise<ConnectResult> {
+    this.#assertOpen();
+    // Validate before admitting, so a bad option never orphans an attempt.
+    assertTimeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     if (options.signal?.aborted === true) {
-      this.#assertOpen();
       return Promise.reject(new AbortError());
     }
     return this.waitConnectResult(this.startConnect(target), options);

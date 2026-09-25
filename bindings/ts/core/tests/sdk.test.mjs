@@ -462,6 +462,15 @@ test("a connect timeout ends only the wait and leaves the attempt running", asyn
   endpoint.close();
 });
 
+test("connect rejects an invalid timeout before starting an attempt", () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+
+  assert.throws(() => endpoint.connect("peer", { timeoutMs: -1 }), RangeError);
+  assert.deepEqual(backend.operations, []);
+  endpoint.close();
+});
+
 test("cancelOnTimeout opts into cancelling the attempt", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
