@@ -124,14 +124,15 @@ const labelRight = `${mono} absolute top-1/2 right-14 -translate-y-1/2 text-righ
           <p class={`${mono} m-0 text-muted-foreground`}>std · owns the I/O</p>
         </div>
         <div class="mt-3 flex flex-wrap gap-1.5">
-          <span class="relative">
+          {/* The socket lights while the datagram lands: an outline over the
+              chip rather than a second copy of its text. */}
+          <span class="relative inline-flex">
             <span class={chip}>UDP socket</span>
             <span
-              class={`${chip} absolute inset-0 border-accent text-accent`}
+              class="pointer-events-none absolute inset-0 rounded-full border border-accent bg-accent/15"
               data-show="2"
               data-hide="3"
-             >UDP socket</span
-            >
+            />
           </span>
           <span class={chip}>clock</span>
         </div>
