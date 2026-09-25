@@ -12,6 +12,11 @@
 // Without this script nothing is hidden (see theme.css), so the markup reads
 // as the finished frame.
 export const initScene = (root: HTMLElement) => {
+  // Without an observer the scene could never start, so leave it as the
+  // finished still frame rather than hiding its parts.
+  if (!("IntersectionObserver" in window)) {
+    return;
+  }
   const durations = (root.dataset.durations ?? "").split(",").map(Number);
   const last = durations.length;
   const parts = [...root.querySelectorAll<HTMLElement>("[data-show]")];
@@ -58,10 +63,16 @@ export const initScene = (root: HTMLElement) => {
     render();
   };
 
+  const toggle = root.querySelector("[data-toggle]");
   const setMode = (mode: "playing" | "paused" | "ended") => {
     root.toggleAttribute("data-playing", mode === "playing");
     root.toggleAttribute("data-paused", mode === "paused");
     root.toggleAttribute("data-ended", mode === "ended");
+    // The toggle's name follows the action it will take, like its icon.
+    toggle?.setAttribute(
+      "aria-label",
+      { ended: "Replay", paused: "Play", playing: "Pause" }[mode]
+    );
   };
 
   const schedule = (ms: number) => {
@@ -92,6 +103,8 @@ export const initScene = (root: HTMLElement) => {
       setMode("playing");
       schedule(durations[step - 1]);
     } else {
+      // Play then runs this step for its full length.
+      remaining = durations[step - 1];
       setMode(step === last ? "ended" : "paused");
     }
   };
