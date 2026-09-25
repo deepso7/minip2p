@@ -185,7 +185,6 @@ export interface Minip2pNamedEventMap {
     readonly dropped: number;
     readonly totalDropped: number;
     readonly terminalConnectIds: readonly number[];
-    readonly terminalConnectIdsTruncated: boolean;
   };
   driverFailed: {
     readonly kind: DriverFailureKind;
@@ -453,7 +452,6 @@ export type P2pEvent =
         dropped: number;
         totalDropped: number;
         terminalConnectIds: number[];
-        terminalConnectIdsTruncated: boolean;
       }
     >
   | RawEvent<

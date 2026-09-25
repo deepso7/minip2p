@@ -1087,12 +1087,9 @@ export class Minip2pBase {
     if (dropped.source === "native") {
       const { event } = dropped;
       if (isConnectTerminal(event)) {
-        this.#connectResultsLost([event.inner.connectId], false);
+        this.#connectResultsLost([event.inner.connectId]);
       } else if (event.tag === P2pEvent_Tags.EventsDropped) {
-        this.#connectResultsLost(
-          event.inner.terminalConnectIds,
-          event.inner.terminalConnectIdsTruncated
-        );
+        this.#connectResultsLost(event.inner.terminalConnectIds);
       }
     }
     for (const pending of this.#pendingOpens.values()) {
@@ -1218,10 +1215,7 @@ export class Minip2pBase {
       this.#connectTerminal(event);
     }
     if (event.tag === P2pEvent_Tags.EventsDropped) {
-      this.#connectResultsLost(
-        event.inner.terminalConnectIds,
-        event.inner.terminalConnectIdsTruncated
-      );
+      this.#connectResultsLost(event.inner.terminalConnectIds);
     }
 
     const normalized = normalizeEvent(event);
@@ -1436,8 +1430,7 @@ export class Minip2pBase {
 
   #connectTerminal(event: ConnectTerminalEvent): void {
     const attempt = this.#connects.get(event.inner.connectId);
-    // A recorded loss is final, so every wait sees one outcome per attempt.
-    if (attempt === undefined || attempt.terminal !== undefined) {
+    if (attempt === undefined) {
       return;
     }
     const terminal: ConnectTerminal =
@@ -1468,13 +1461,11 @@ export class Minip2pBase {
     this.#settleConnect(event.inner.connectId, attempt, terminal);
   }
 
-  // Terminals dropped by either event carry settle their attempts with a
-  // delivery-loss error so waits cannot hang. A truncated list cannot name
-  // every dropped terminal, so every tracked attempt without a delivered
-  // terminal settles, even one whose real terminal is still queued.
-  #connectResultsLost(connectIds: readonly number[], truncated: boolean): void {
-    const lost = truncated ? [...this.#connects.keys()] : connectIds;
-    for (const connectId of lost) {
+  // Terminals dropped by either event carry settle exactly their attempts
+  // with a delivery-loss error so waits cannot hang. Both carries name every
+  // dropped terminal, so every other attempt still receives its own.
+  #connectResultsLost(connectIds: readonly number[]): void {
+    for (const connectId of connectIds) {
       const attempt = this.#connects.get(connectId);
       if (attempt === undefined || attempt.terminal !== undefined) {
         continue;

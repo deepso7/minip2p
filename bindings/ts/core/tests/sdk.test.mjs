@@ -595,7 +595,6 @@ test("EventsDropped settles pending connect results with a lost error", async ()
     inner: {
       dropped: 1,
       terminalConnectIds: [connectId],
-      terminalConnectIdsTruncated: false,
       totalDropped: 1,
     },
     tag: P2pEvent_Tags.EventsDropped,
@@ -611,7 +610,6 @@ test("EventsDropped settles pending connect results with a lost error", async ()
     {
       dropped: 1,
       terminalConnectIds: [connectId],
-      terminalConnectIdsTruncated: false,
       totalDropped: 1,
     },
   ]);
@@ -627,7 +625,6 @@ test("EventsDropped stores a lost terminal for results not yet awaited", async (
     inner: {
       dropped: 1,
       terminalConnectIds: [connectId],
-      terminalConnectIdsTruncated: false,
       totalDropped: 1,
     },
     tag: P2pEvent_Tags.EventsDropped,
@@ -645,94 +642,22 @@ test("EventsDropped stores a lost terminal for results not yet awaited", async (
   endpoint.close();
 });
 
-test("truncated EventsDropped settles every pending connect result", async () => {
+test("EventsDropped leaves unnamed attempts to their own terminals", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
-  const first = endpoint.startConnect("peer");
-  const second = endpoint.startConnect("peer");
-  const waitingFirst = endpoint.waitConnectResult(first, { timeoutMs: 0 });
-  const waitingSecond = endpoint.waitConnectResult(second, { timeoutMs: 0 });
+  const lost = endpoint.startConnect("peer");
+  const kept = endpoint.startConnect("peer");
+  const lostWait = endpoint.waitConnectResult(lost, { timeoutMs: 0 });
+  const keptWait = endpoint.waitConnectResult(kept, { timeoutMs: 0 });
 
   backend.emit({
-    inner: {
-      dropped: 1,
-      terminalConnectIds: [],
-      terminalConnectIdsTruncated: true,
-      totalDropped: 1,
-    },
+    inner: { dropped: 1, terminalConnectIds: [lost], totalDropped: 1 },
     tag: P2pEvent_Tags.EventsDropped,
   });
-  await tick();
+  backend.emit(pathEstablished(kept));
 
-  for (const [waiting, connectId] of [
-    [waitingFirst, first],
-    [waitingSecond, second],
-  ]) {
-    await assert.rejects(waiting, (error) => {
-      assert.ok(error instanceof ConnectResultLostError);
-      assert.equal(error.connectId, connectId);
-      return true;
-    });
-  }
-  endpoint.close();
-});
-
-test("a recorded loss stays the attempt's only outcome", async () => {
-  const backend = new MockBackend();
-  const endpoint = new TestMinip2p(backend);
-  const connectId = endpoint.startConnect("peer");
-  backend.emit({
-    inner: {
-      dropped: 1,
-      terminalConnectIds: [],
-      terminalConnectIdsTruncated: true,
-      totalDropped: 1,
-    },
-    tag: P2pEvent_Tags.EventsDropped,
-  });
-  backend.emit(pathEstablished(connectId));
-  await tick();
-
-  await assert.rejects(
-    endpoint.waitConnectResult(connectId, { timeoutMs: 0 }),
-    ConnectResultLostError
-  );
-  endpoint.close();
-});
-
-test("truncated EventsDropped keeps a delivered connect terminal", async () => {
-  const backend = new MockBackend();
-  const endpoint = new TestMinip2p(backend);
-  const connectId = endpoint.startConnect("peer");
-
-  backend.emit({
-    inner: {
-      connId: 7,
-      connectId,
-      path: { tag: PathKind_Tags.DirectDialed },
-      peerId: "peer",
-    },
-    tag: P2pEvent_Tags.PathEstablished,
-  });
-  backend.emit({
-    inner: {
-      dropped: 1,
-      terminalConnectIds: [],
-      terminalConnectIdsTruncated: true,
-      totalDropped: 1,
-    },
-    tag: P2pEvent_Tags.EventsDropped,
-  });
-  await tick();
-
-  assert.deepEqual(
-    await endpoint.waitConnectResult(connectId, { timeoutMs: 0 }),
-    {
-      connectId,
-      path: { kind: "directDialed" },
-      peerId: "peer",
-    }
-  );
+  await assert.rejects(lostWait, ConnectResultLostError);
+  assert.equal((await keptWait).connectId, kept);
   endpoint.close();
 });
 
@@ -799,7 +724,6 @@ test("queue overflow settles connects named by a dropped EventsDropped", async (
     inner: {
       dropped: 1,
       terminalConnectIds: [connectId],
-      terminalConnectIdsTruncated: false,
       totalDropped: 1,
     },
     tag: P2pEvent_Tags.EventsDropped,

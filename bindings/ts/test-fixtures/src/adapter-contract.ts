@@ -160,7 +160,6 @@ export function describeAdapterContract(
           inner: {
             dropped: 1n,
             terminalConnectIds: [CONNECT_ID],
-            terminalConnectIdsTruncated: false,
             totalDropped: 1n,
           },
           tag: "EventsDropped",

@@ -15,9 +15,6 @@ use crate::{DriverFailureKind, EventDoorbell, P2pEvent};
 const DRIVER_POLL: Duration = Duration::from_millis(25);
 const DRIVER_IDLE_POLL: Duration = Duration::from_millis(500);
 const MAX_CARRY_EVENTS: usize = 4096;
-/// Enough for any realistic burst of dropped terminals between drains;
-/// beyond it the diagnostic reports truncation instead of naming Connect IDs.
-const MAX_DROPPED_TERMINAL_IDS: usize = 256;
 /// How many already-queued `wait` results one pump iteration will take
 /// before yielding the lock. Further events stay queued for the next wait.
 const PUMP_DRAIN_LIMIT: usize = 256;
@@ -39,11 +36,18 @@ pub struct DriverStats {
     pub iterations: u64,
 }
 
+/// Drop accounting reported by the next delivery's `EventsDropped`.
+///
+/// `terminal_connect_ids` is deliberately uncapped so foreign runtimes can
+/// correlate every lost terminal exactly. It stays bounded by application
+/// work: only application-admitted Connection attempts reach this stream
+/// (discovery-owned attempts settle internally), each emits one terminal,
+/// and the list empties at every delivery — at most one `u64` per attempt
+/// that settled while the foreign runtime was not draining.
 #[derive(Default)]
 pub(crate) struct OverflowDiagnostic {
     pending: u64,
     terminal_connect_ids: Vec<u64>,
-    terminal_connect_ids_truncated: bool,
     total: u64,
 }
 
@@ -270,16 +274,11 @@ fn ingest(
     stats.dropped = stats.dropped.saturating_add(dropped);
     overflow.pending = overflow.pending.saturating_add(dropped);
     overflow.total = overflow.total.saturating_add(dropped);
-    let dropped_terminal_ids = carry.take_dropped_terminal_connect_ids();
-    // Each Connect ID settles exactly one terminal, so the set cannot
+    // Each Connect ID settles exactly one terminal, so the list cannot
     // contain duplicates.
-    let room = MAX_DROPPED_TERMINAL_IDS.saturating_sub(overflow.terminal_connect_ids.len());
-    if dropped_terminal_ids.len() > room {
-        overflow.terminal_connect_ids_truncated = true;
-    }
     overflow
         .terminal_connect_ids
-        .extend(dropped_terminal_ids.into_iter().take(room));
+        .extend(carry.take_dropped_terminal_connect_ids());
 }
 
 pub(crate) fn take_delivery(
@@ -292,11 +291,9 @@ pub(crate) fn take_delivery(
         let event = P2pEvent::EventsDropped {
             dropped: overflow.pending,
             terminal_connect_ids: core::mem::take(&mut overflow.terminal_connect_ids),
-            terminal_connect_ids_truncated: overflow.terminal_connect_ids_truncated,
             total_dropped: overflow.total,
         };
         overflow.pending = 0;
-        overflow.terminal_connect_ids_truncated = false;
         stats.dispatch_attempted_synthetic = stats.dispatch_attempted_synthetic.saturating_add(1);
         event
     });
@@ -526,7 +523,6 @@ mod tests {
             Some(P2pEvent::EventsDropped {
                 dropped: 10,
                 terminal_connect_ids: Vec::new(),
-                terminal_connect_ids_truncated: false,
                 total_dropped: 10,
             })
         );
@@ -577,7 +573,6 @@ mod tests {
             Some(P2pEvent::EventsDropped {
                 dropped: 1,
                 terminal_connect_ids: vec![41],
-                terminal_connect_ids_truncated: false,
                 total_dropped: 1,
             })
         );
@@ -607,7 +602,6 @@ mod tests {
             Some(P2pEvent::EventsDropped {
                 dropped: 1,
                 terminal_connect_ids: Vec::new(),
-                terminal_connect_ids_truncated: false,
                 total_dropped: 1,
             })
         );
@@ -615,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn dropped_terminal_ids_are_bounded_and_report_truncation() {
+    fn every_dropped_terminal_id_is_named() {
         let terminal = |connect_id: u64| P2pEvent::ConnectFailed {
             connect_id,
             peer_id: "peer".into(),
@@ -625,45 +619,30 @@ mod tests {
         let ping = |index: usize| P2pEvent::PingTimeout {
             peer_id: index.to_string(),
         };
+        let lost = MAX_CARRY_EVENTS as u64;
 
         // Terminals pushed first are the oldest events, so enough later
-        // non-payload pushes drop every one of them.
+        // non-payload pushes drop every one of them — more than a single
+        // carry's worth, across two ingests before one delivery.
         let mut carry = Carry::default();
         let mut overflow = OverflowDiagnostic::default();
         let mut stats = DriverStats::default();
-        ingest(
-            (1..=MAX_DROPPED_TERMINAL_IDS + 2)
-                .map(|id| terminal(id as u64))
-                .chain((0..MAX_CARRY_EVENTS).map(ping)),
-            &mut carry,
-            &mut overflow,
-            &mut stats,
-        );
+        for ids in [1..=lost / 2, lost / 2 + 1..=lost] {
+            ingest(
+                ids.map(terminal).chain((0..MAX_CARRY_EVENTS).map(ping)),
+                &mut carry,
+                &mut overflow,
+                &mut stats,
+            );
+        }
 
-        let delivery = take_delivery(&mut carry, &mut overflow, &mut stats, 512);
-        assert_eq!(
-            delivery.diagnostic,
-            Some(P2pEvent::EventsDropped {
-                dropped: (MAX_DROPPED_TERMINAL_IDS + 2) as u64,
-                terminal_connect_ids: (1..=MAX_DROPPED_TERMINAL_IDS as u64).collect(),
-                terminal_connect_ids_truncated: true,
-                total_dropped: (MAX_DROPPED_TERMINAL_IDS + 2) as u64,
-            })
-        );
-
-        // The truncation flag resets with the diagnostic that carried it.
-        // The first delivery drained part of the carry, so refill it to
-        // force one more non-terminal drop.
-        ingest((0..512).map(ping), &mut carry, &mut overflow, &mut stats);
-        let delivery = take_delivery(&mut carry, &mut overflow, &mut stats, 512);
-        assert_eq!(
-            delivery.diagnostic,
-            Some(P2pEvent::EventsDropped {
-                dropped: 1,
-                terminal_connect_ids: Vec::new(),
-                terminal_connect_ids_truncated: false,
-                total_dropped: (MAX_DROPPED_TERMINAL_IDS + 3) as u64,
-            })
-        );
+        let Some(P2pEvent::EventsDropped {
+            terminal_connect_ids,
+            ..
+        }) = take_delivery(&mut carry, &mut overflow, &mut stats, 512).diagnostic
+        else {
+            panic!("overflow must report a diagnostic");
+        };
+        assert_eq!(terminal_connect_ids, (1..=lost).collect::<Vec<_>>());
     }
 }

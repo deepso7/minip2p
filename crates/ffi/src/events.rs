@@ -175,16 +175,12 @@ pub enum P2pEvent {
         dropped: u64,
         /// Events discarded since this driver started.
         total_dropped: u64,
-        /// Connect IDs whose terminal event (PathEstablished / ConnectFailed
-        /// / ConnectCancelled) was among the dropped events since the
-        /// previous diagnostic. Foreign waits on these IDs must settle with
-        /// a delivery-loss error and recover through State getters.
+        /// Every Connect ID whose terminal event (PathEstablished /
+        /// ConnectFailed / ConnectCancelled) was among the dropped events
+        /// since the previous diagnostic. Foreign waits on exactly these IDs
+        /// must settle with a delivery-loss error and recover through State
+        /// getters; every other attempt's terminal is still delivered.
         terminal_connect_ids: Vec<u64>,
-        /// True when more terminals were dropped than `terminal_connect_ids`
-        /// can name. Foreign runtimes must then treat every pending
-        /// Connection-attempt wait as delivery-lost and recover through
-        /// State getters.
-        terminal_connect_ids_truncated: bool,
     },
     /// The background driver terminated after a fatal failure.
     DriverFailed {
