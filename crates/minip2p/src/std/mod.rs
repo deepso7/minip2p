@@ -474,12 +474,18 @@ impl Endpoint {
 
     /// Returns the current usable NAT-orchestrated path to `peer_id`.
     ///
-    /// The map is updated before the corresponding NAT event is queued, is
-    /// independent of event consumption, and is cleared after the peer's last
-    /// usable connection closes. Raw swarm dials are not tracked.
+    /// The map is updated before the corresponding NAT event is queued and is
+    /// independent of event consumption. It is cleared once the connection it
+    /// describes is gone: when the peer's last relay circuit closes for
+    /// [`Path::Relayed`], when its last direct connection closes for a direct
+    /// path, or when the peer has no connection left. It is never rewritten to
+    /// the kind that remains, so this can return `None` while the peer stays
+    /// connected. Raw swarm dials are not tracked.
     #[cfg(feature = "nat")]
     pub fn path(&self, peer_id: &PeerId) -> Option<Path> {
-        self.nat.as_ref().and_then(|nat| nat.path(peer_id))
+        self.nat
+            .as_ref()
+            .and_then(|nat| nat.path(peer_id, self.swarm.runtime()))
     }
 
     /// Returns peers with an established connection.

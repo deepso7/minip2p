@@ -282,6 +282,12 @@ impl<T: Transport, E: EntropySource> SwarmRuntime<T, E> {
         self.core.is_peer_connected(peer_id)
     }
 
+    /// Returns every established connection with its peer; see
+    /// [`SwarmCore::established_connections`].
+    pub fn established_connections(&self) -> impl Iterator<Item = (ConnectionId, &PeerId)> {
+        self.core.established_connections()
+    }
+
     /// Bumps the listened-address revision and records `addr` (deduped)
     /// after a successful `Transport::listen`.
     fn record_listen(&mut self, addr: &Multiaddr) {

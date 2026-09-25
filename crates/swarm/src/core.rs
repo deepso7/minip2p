@@ -677,6 +677,19 @@ impl SwarmCore {
         self.established_peers.contains(peer_id)
     }
 
+    /// Returns every established connection with its peer, primaries
+    /// included, in ascending id order. A peer can hold several at once
+    /// (e.g. a relay circuit plus a direct connection after a late identity
+    /// upgrade). A peer's connections drop out once it is no longer
+    /// connected (see [`SwarmCore::is_peer_connected`]); pending dials never
+    /// appear.
+    pub fn established_connections(&self) -> impl Iterator<Item = (ConnectionId, &PeerId)> {
+        self.conn_to_peer
+            .iter()
+            .filter(|(_, peer)| self.established_peers.contains(*peer))
+            .map(|(conn_id, peer)| (*conn_id, peer))
+    }
+
     /// Returns whether a transport connection is still tracked, including
     /// inbound handshakes that have not yet emitted [`SwarmEvent::ConnectionEstablished`].
     pub fn has_tracked_connections(&self) -> bool {
@@ -3782,5 +3795,56 @@ mod tests {
         core.on_outbound_negotiated(conn_id, stream_id, ProtocolKind::Ping, 2_000);
         assert_eq!(core.next_timeout(2_000), Some(10_001));
         assert_eq!(core.next_timeout(4_000), Some(8_001));
+    }
+
+    #[test]
+    fn established_connections_lists_every_connection_of_a_connected_peer() {
+        let mut core = test_core();
+        let peer = PeerId::from_public_key_protobuf(b"multi-connection-peer");
+        let circuit = ConnectionId::new(1);
+        let direct = ConnectionId::new(2);
+        let unverified = ConnectionId::new(3);
+        assert_eq!(core.established_connections().count(), 0);
+
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: circuit,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone()),
+            },
+        );
+        // A late identity upgrade adds a second connection without
+        // superseding the first; an unverified connection is not the peer's.
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: direct,
+                endpoint: ConnectionEndpoint::new(loopback_transport()),
+            },
+        );
+        feed(
+            &mut core,
+            TransportEvent::PeerIdentityVerified {
+                id: direct,
+                endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer.clone()),
+                previous_peer_id: None,
+            },
+        );
+        feed(
+            &mut core,
+            TransportEvent::Connected {
+                id: unverified,
+                endpoint: ConnectionEndpoint::new(loopback_transport()),
+            },
+        );
+        assert_eq!(
+            core.established_connections().collect::<Vec<_>>(),
+            vec![(circuit, &peer), (direct, &peer)]
+        );
+
+        // Closing the primary ends the peer's established state, so the
+        // leftover mapping is no longer reported.
+        feed(&mut core, TransportEvent::Closed { id: direct });
+        assert_eq!(core.established_connections().count(), 0);
     }
 }

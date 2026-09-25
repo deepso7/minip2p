@@ -4,7 +4,7 @@ use minip2p_nat::{NatAction, NatAgent, NatEvent, Now, Path};
 use minip2p_platform::StdEntropy;
 use minip2p_swarm::SwarmEvent;
 use minip2p_transport::Transport;
-use minip2p_transport::{ConnectionId, StreamId};
+use minip2p_transport::{ConnectionId, ConnectionNamespace, StreamId};
 use std::time::Instant;
 type NatDriver = crate::nat::NatDriver<StdEntropy>;
 use super::NextEvent;
@@ -499,6 +499,14 @@ fn endpoint_path_tracks_outbound_and_inbound_establishment_and_upgrade() {
     let peer = Ed25519Keypair::from_secret_key_bytes([74; 32]).peer_id();
     let inbound = Ed25519Keypair::from_secret_key_bytes([75; 32]).peer_id();
     let relay = Ed25519Keypair::from_secret_key_bytes([76; 32]).peer_id();
+    let recorded = |endpoint: &Endpoint, peer| {
+        endpoint
+            .nat
+            .as_ref()
+            .expect("NAT configured")
+            .recorded_path(peer)
+            .cloned()
+    };
 
     {
         let driver = endpoint.nat.as_mut().expect("NAT configured");
@@ -512,7 +520,7 @@ fn endpoint_path_tracks_outbound_and_inbound_establishment_and_upgrade() {
         });
     }
     assert_eq!(
-        endpoint.path(&peer),
+        recorded(&endpoint, &peer),
         Some(Path::Relayed {
             relay: relay.clone()
         })
@@ -537,7 +545,7 @@ fn endpoint_path_tracks_outbound_and_inbound_establishment_and_upgrade() {
         });
     }
     assert_eq!(
-        endpoint.path(&inbound),
+        recorded(&endpoint, &inbound),
         Some(Path::Relayed {
             relay: relay.clone()
         })
@@ -549,8 +557,44 @@ fn endpoint_path_tracks_outbound_and_inbound_establishment_and_upgrade() {
             peer: inbound.clone(),
         });
     }
-    assert_eq!(endpoint.path(&peer), Some(Path::DirectPunched));
-    assert_eq!(endpoint.path(&inbound), Some(Path::DirectPunched));
+    assert_eq!(recorded(&endpoint, &peer), Some(Path::DirectPunched));
+    assert_eq!(recorded(&endpoint, &inbound), Some(Path::DirectPunched));
+    // Neither peer holds a live connection here, so the public read hides
+    // the recorded paths.
+    assert_eq!(endpoint.path(&peer), None);
+    assert_eq!(endpoint.path(&inbound), None);
+}
+
+#[test]
+fn path_is_live_only_while_a_connection_of_its_kind_remains() {
+    let relayed = Path::Relayed {
+        relay: Ed25519Keypair::from_secret_key_bytes([78; 32]).peer_id(),
+    };
+    let circuit = ConnectionId::namespaced(ConnectionNamespace::CIRCUIT, 1).unwrap();
+    let direct = ConnectionId::namespaced(ConnectionNamespace::QUIC_IPV4, 1).unwrap();
+    let other_direct = ConnectionId::namespaced(ConnectionNamespace::TCP_IPV4, 1).unwrap();
+    // (recorded path, peer's established connections, live)
+    let cases = [
+        // The path's own connection closed: stale even though the peer
+        // stays connected over the other kind.
+        (Path::DirectPunched, vec![circuit], false),
+        (Path::DirectDialed, vec![circuit], false),
+        (relayed.clone(), vec![direct], false),
+        // A connection of the path's kind remains.
+        (Path::DirectPunched, vec![direct, circuit], true),
+        (relayed.clone(), vec![direct, circuit], true),
+        (Path::DirectDialed, vec![other_direct], true),
+        // The peer has no connection left.
+        (relayed.clone(), vec![], false),
+        (Path::DirectDialed, vec![], false),
+    ];
+    for (path, connections, live) in cases {
+        assert_eq!(
+            crate::nat::path_is_live(&path, connections.iter().copied()),
+            live,
+            "path {path:?}, connections {connections:?}"
+        );
+    }
 }
 
 #[test]
