@@ -14,9 +14,8 @@
 //! QUIC vs TCP from each address and groups compatible IPv4/IPv6 listeners
 //! onto one transport per shape.
 //!
-//! Legacy `quic` / `tcp` / `bind_quic*` / `bind_tcp` helpers remain until the
-//! final contraction. Either way, dial routing stays address-shaped: a
-//! `/udp/…/quic-v1` peer is reached over QUIC and a `/tcp` one over TCP.
+//! Dial routing is address-shaped too: a `/udp/…/quic-v1` candidate is
+//! reached over QUIC and a `/tcp` one over TCP.
 //!
 //! With the `pubsub` feature, `EndpointBuilder::gossipsub` enables gossipsub
 //! and `EndpointBuilder::gossipsub_config` tunes it with a `GossipsubConfig`.
@@ -30,7 +29,7 @@
 //! activate their drivers.
 //!
 //! The independent std-only `relay-server` feature enables the three-line
-//! `Endpoint::builder().relay_server().bind_*()` hosting path. Relay-only
+//! `Endpoint::builder().relay_server().listen_on(…)?.bind()` hosting path. Relay-only
 //! endpoints advertise inbound HOP and open outbound STOP; NAT-only endpoints
 //! install the trusted client roles, and combined endpoints compose both.
 
@@ -111,13 +110,8 @@ pub use minip2p_transport::{ConnectionId, StreamId, TransportError, TransportSet
 #[cfg(any(feature = "quic", feature = "tcp"))]
 use std::str::FromStr;
 
-#[cfg(any(feature = "nat", feature = "discovery", feature = "mdns"))]
-use crate::ConnectOutcome;
 use crate::portable::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS};
 use crate::{ConnectId, ConnectTarget, ConnectTargetError, EndpointEvent};
-
-/// Migration alias for [`EndpointEvent`]. Prefer [`EndpointEvent`] at the Endpoint boundary.
-pub type Event = EndpointEvent;
 
 /// Why one blocking [`Endpoint::wait`] returned.
 ///
@@ -129,7 +123,7 @@ pub type Event = EndpointEvent;
     clippy::large_enum_variant,
     reason = "EndpointEvent ownership avoids a heap allocation on the ready path."
 )]
-#[must_use = "handle the wait outcome; an Event has been removed from the endpoint"]
+#[must_use = "handle the wait outcome; an EndpointEvent has been removed from the endpoint"]
 pub enum EndpointWaitOutcome {
     /// An application event from the Endpoint event stream.
     ///
@@ -142,18 +136,6 @@ pub enum EndpointWaitOutcome {
 }
 
 const DEFAULT_AGENT_VERSION: &str = concat!("minip2p/", env!("CARGO_PKG_VERSION"));
-
-/// Errors from discovery-focused endpoint waits.
-#[cfg(any(feature = "discovery", feature = "mdns"))]
-#[derive(Debug, thiserror::Error)]
-pub enum DiscoveryError {
-    /// No discovery source was enabled with the endpoint builder.
-    #[error("discovery is not enabled on this endpoint")]
-    NotEnabled,
-    /// The endpoint failed while driving the swarm.
-    #[error(transparent)]
-    Driver(#[from] minip2p_swarm::DriverError),
-}
 
 #[cfg(feature = "relay-server")]
 const RELAY_HOP_PROTOCOL_ID: &str = "/libp2p/circuit/relay/0.2.0/hop";
@@ -256,19 +238,23 @@ pub type EndpointSwarm = Swarm<EndpointTransport>;
 
 /// App-facing minip2p endpoint over the transports it was asked to bind.
 ///
-/// `Endpoint` owns identity, transports, and the std swarm driver. Advanced
-/// users can still borrow the underlying [`Swarm`] with [`Endpoint::swarm`]
-/// and [`Endpoint::swarm_mut`].
+/// `Endpoint` owns identity, transports, and the std swarm driver. It has one
+/// Connection-attempt entry point, [`connect`](Self::connect), and one ordered
+/// Endpoint event stream, read with [`wait`](Self::wait) (blocking) or
+/// [`poll`](Self::poll) (non-blocking). Every enabled capability (NAT,
+/// Gossipsub, Discovery, relay-server) delivers its output once, as an
+/// [`EndpointEvent`] variant on that stream. `poll` and `wait` finish each
+/// swarm event before the next one: that swarm event, then capability events
+/// in relay-server, NAT, Gossipsub, Discovery order, then Connection-attempt
+/// terminals.
 ///
-/// Prefer [`Endpoint::wait`] for the ordered Endpoint event stream: it returns
-/// an event, deadline, or interruption, and delivers every enabled
-/// capability's output (NAT, Gossipsub, Discovery, relay-server) once as an
-/// [`EndpointEvent`] variant. `poll` and `wait` finish each swarm event
-/// before the next one: that swarm event, then capability events in
-/// relay-server, NAT, Gossipsub, Discovery order, then Connection-attempt
-/// terminals. Focused waits, `next_wake`, and the `take_*` capability
-/// methods remain during migration; they take their events out of the same
-/// stream, so no event is delivered twice.
+/// Applications correlate events by the IDs they carry (a [`ConnectId`], a
+/// [`ConnectionId`], a [`StreamId`]) and dispatch unrelated events while they
+/// wait for a particular one; see [`wait`](Self::wait) for the canonical loop.
+///
+/// Raw Transport dials bypass Connection-attempt policy and belong to the
+/// lower-level swarm: borrow it with [`Endpoint::swarm_mut`] when that is
+/// really what you want.
 ///
 /// # State snapshots
 ///
@@ -281,20 +267,18 @@ pub type EndpointSwarm = Swarm<EndpointTransport>;
 /// of the Endpoint event stream (state changes before its corresponding event
 /// is queued).
 ///
-/// QUIC, TCP, or both -- see `EndpointBuilder::quic`,
-/// `EndpointBuilder::tcp`, and [`EndpointBuilder::bind`]. They live behind
-/// one [`TransportSet`], which routes each address to the transport that
-/// serves its shape, so nothing here or above changes with the second one:
-/// [`dial`](Self::dial) takes the same [`PeerAddr`], [`listen`](Self::listen)
-/// arms every bound address, and the events are the same events. Prefer
-/// [`connect`](Self::connect) for a Connection attempt with one identity.
+/// QUIC, TCP, or both, chosen by the addresses passed to
+/// [`EndpointBuilder::listen_on`]. They live behind one [`TransportSet`],
+/// which routes each address to the transport that serves its shape, so
+/// nothing here or above changes with the second one: [`connect`](Self::connect)
+/// takes the same complete peer addresses, [`listen`](Self::listen) arms every
+/// bound address, and the events are the same events.
 ///
 /// With the `nat` cargo feature and a NAT configuration
 /// (`EndpointBuilder::relay` / `EndpointBuilder::nat_config`), `connect`
 /// races direct candidates against a relay leg. Path transitions arrive as
 /// [`EndpointEvent::Nat`]; the attempt's outcome is its
-/// [`EndpointEvent::ConnectSettled`]. [`Endpoint::nat_wait_path`] is the
-/// focused wait for the first usable path (migration; removed in #181).
+/// [`EndpointEvent::ConnectSettled`].
 ///
 /// [`close`](Self::close) or drop disconnects established peers so a listener
 /// is not left on the QUIC idle timeout. Neither path helps after `kill -9`
@@ -313,65 +297,12 @@ pub struct Endpoint {
     #[cfg(feature = "mdns")]
     mdns: Option<mdns::MdnsDriver>,
     /// The Endpoint event stream's queue: events produced by a step beyond
-    /// the one returned, and events set aside by focused waits.
-    pending_events: std::collections::VecDeque<Event>,
+    /// the one returned.
+    pending_events: std::collections::VecDeque<EndpointEvent>,
     #[cfg(any(feature = "nat", feature = "relay-server"))]
     caller_external_addresses: Vec<Multiaddr>,
     #[cfg(any(feature = "nat", feature = "relay-server"))]
     external_addresses_revision: u64,
-}
-
-/// Why one [`Endpoint::next_wake`] call returned.
-#[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Event ownership avoids a heap allocation on every application wake."
-)]
-#[must_use = "handle the wake reason"]
-pub enum EndpointWake {
-    /// An Endpoint event, including capability output.
-    ///
-    /// The event has been removed from the endpoint and belongs to the
-    /// caller.
-    Event(Event),
-    /// Never returned since capability events joined the Endpoint event
-    /// stream; kept only until the migration API is removed (#181).
-    DriverProgress,
-    /// The transport wait was interrupted by an external wait handle.
-    Interrupted,
-    /// The caller's deadline elapsed without an application event or agent
-    /// progress.
-    Deadline,
-}
-
-/// Why one driver-aware swarm-driving step returned.
-///
-/// [`DriverPoll::Progress`] means the step appended every event it produced
-/// onto `pending_events`, in Endpoint emission order. Callers scan that
-/// queue; the step is not split into a returned head and a stashed tail.
-#[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-enum DriverPoll {
-    /// A step appended one or more events to `pending_events`.
-    Progress,
-    /// The transport wait was interrupted externally.
-    Interrupted,
-    /// The caller's deadline elapsed.
-    Deadline,
-}
-
-#[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-impl DriverPoll {
-    fn progress() -> Self {
-        Self::Progress
-    }
-
-    fn deadline() -> Self {
-        Self::Deadline
-    }
-
-    fn interrupted() -> Self {
-        Self::Interrupted
-    }
 }
 
 impl Endpoint {
@@ -427,71 +358,14 @@ impl Endpoint {
         Ok(addrs)
     }
 
-    /// Dials a remote peer on every applicable local address family.
+    /// Admits one Connection attempt and returns its [`ConnectId`].
     ///
-    /// `/dns` targets are resolved first, and a name that answers with both
-    /// families is dialed over both. The address shape decides which transport
-    /// carries each dial, so a `/tcp` target goes to TCP and a
-    /// `/udp/quic-v1` one to QUIC without the caller choosing. Use
-    /// [`Endpoint::dial_ip4`] or [`Endpoint::dial_ip6`] to force one family.
-    ///
-    /// Fails only if every address failed; the returned ids are the dials that
-    /// started.
-    ///
-    /// Prefer [`Self::connect`] for a Connection attempt with one identity and
-    /// one terminal outcome. `dial` remains until the contraction ticket.
-    pub fn dial(&mut self, addr: &PeerAddr) -> Result<Vec<ConnectionId>, Error> {
-        let targets = dial::targets(addr)?;
-        let mut ids = Vec::with_capacity(targets.len());
-        let mut failure = None;
-        for (_, target) in targets {
-            match self.swarm.dial(&target) {
-                Ok(id) => ids.push(id),
-                // One family being unreachable is not the dial failing: the
-                // other may still connect, and reporting the first error would
-                // hide a path that worked.
-                Err(error) => failure = failure.or(Some(error)),
-            }
-        }
-        match failure {
-            Some(error) if ids.is_empty() => Err(error),
-            _ => Ok(ids),
-        }
-    }
-
-    /// Dials a remote peer using IPv4.
-    ///
-    /// Prefer [`Self::connect`] for a Connection attempt. Family-forced `dial`
-    /// remains until the contraction ticket.
-    pub fn dial_ip4(&mut self, addr: &PeerAddr) -> Result<ConnectionId, Error> {
-        self.dial_family(addr, dial::Family::V4)
-    }
-
-    /// Dials a remote peer using IPv6.
-    ///
-    /// Prefer [`Self::connect`] for a Connection attempt. Family-forced `dial`
-    /// remains until the contraction ticket.
-    pub fn dial_ip6(&mut self, addr: &PeerAddr) -> Result<ConnectionId, Error> {
-        self.dial_family(addr, dial::Family::V6)
-    }
-
-    fn dial_family(
-        &mut self,
-        addr: &PeerAddr,
-        family: dial::Family,
-    ) -> Result<ConnectionId, Error> {
-        let target = dial::targets(addr)?
-            .into_iter()
-            .find(|(candidate, _)| *candidate == family)
-            .map(|(_, target)| target)
-            .ok_or_else(|| TransportError::InvalidAddress {
-                context: "dial target",
-                reason: format!("{} names no {family:?} address", addr.transport()),
-            })?;
-        self.swarm.dial(&target)
-    }
-
-    /// Admits one Connection attempt. Sync errors: malformed target only.
+    /// `target` is a [`PeerId`], one complete peer address such as
+    /// `/ip4/192.0.2.7/udp/4001/quic-v1/p2p/12D3KooW…`, or a non-empty list of
+    /// complete peer addresses that all name the same peer. Synchronous errors
+    /// are malformed targets only; everything else, including "no usable
+    /// route", arrives later as the attempt's one
+    /// [`EndpointEvent::ConnectSettled`].
     ///
     /// A [`PeerId`] target uses the discovery book's known addresses (when a
     /// book exists) and the configured relay when one exists and `force_relay`
@@ -507,8 +381,9 @@ impl Endpoint {
     /// established connection (including a simultaneous inbound), and the app
     /// sees those as ordinary connection events.
     ///
-    /// Prefer this over [`Self::dial`] when one identity and one terminal
-    /// outcome is enough. `dial` remains until the contraction ticket.
+    /// Candidates may name the IP family explicitly (`/ip4`, `/ip6`); a
+    /// `/dns` candidate is resolved and dialed over every family it answers
+    /// with.
     #[expect(
         clippy::result_large_err,
         reason = "ConnectTargetError retains both peer identities for MixedPeers diagnostics."
@@ -587,7 +462,7 @@ impl Endpoint {
 
     /// Sends a ping to `peer_id`.
     ///
-    /// The RTT is emitted later as [`Event::PingRttMeasured`].
+    /// The RTT is emitted later as [`EndpointEvent::PingRttMeasured`].
     pub fn ping(&mut self, peer_id: &PeerId) -> Result<(), Error> {
         self.swarm.ping(peer_id)
     }
@@ -601,7 +476,7 @@ impl Endpoint {
     ///
     /// The map is updated before the corresponding NAT event is queued, is
     /// independent of event consumption, and is cleared after the peer's last
-    /// usable connection closes. Raw `dial*` connections are not tracked.
+    /// usable connection closes. Raw swarm dials are not tracked.
     #[cfg(feature = "nat")]
     pub fn path(&self, peer_id: &PeerId) -> Option<Path> {
         self.nat.as_ref().and_then(|nat| nat.path(peer_id))
@@ -742,49 +617,54 @@ impl Endpoint {
     /// Drives the endpoint until an Endpoint event, the caller's deadline, or
     /// an interruption.
     ///
-    /// This is the single Endpoint blocking wait: deadline and interruption
-    /// remain visible, and driver-progress is not part of the outcome. If an
-    /// absolute [`std::time::Instant`] deadline has already passed, this returns
+    /// This is the single Endpoint blocking wait. Deadline and interruption
+    /// stay visible so a loop can service its own timers and commands (a
+    /// [`WaitHandle`] from another thread interrupts it). If an absolute
+    /// [`std::time::Instant`] deadline has already passed, this returns
     /// [`EndpointWaitOutcome::Deadline`] before delivering another queued
     /// event. Relative [`std::time::Duration`] deadlines (including
-    /// [`std::time::Duration::ZERO`] non-blocking drains) still inspect buffered
-    /// events and poll once. Enabled capabilities (NAT, Gossipsub, Discovery,
-    /// relay-server) deliver their output here as [`EndpointEvent`] variants,
-    /// so one `wait` loop sees every event exactly once. Existing
-    /// [`Self::next_event`], [`Self::next_wake`], and focused waits remain
-    /// available during migration; they take events from the same stream.
+    /// [`std::time::Duration::ZERO`] non-blocking drains) still inspect
+    /// buffered events and poll once. Enabled capabilities deliver their
+    /// output here as [`EndpointEvent`] variants, so one `wait` loop sees
+    /// every event exactly once. Each call drives only this endpoint.
     ///
     /// # Examples
     ///
-    /// Correlate a Connection attempt while dispatching unrelated events:
+    /// The canonical event loop: wait for one correlated outcome while still
+    /// dispatching every unrelated event.
     ///
     /// ```no_run
     /// use std::time::{Duration, Instant};
     ///
     /// use minip2p::{ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr};
     ///
-    /// fn wait_connected(
-    ///     node: &mut Endpoint,
-    ///     target: PeerAddr,
-    /// ) -> Result<(), Box<dyn std::error::Error>> {
+    /// fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let mut node = Endpoint::builder().listen_default()?.bind()?;
+    ///     // A complete peer address, copied from the remote's `listen()` output.
+    ///     let target: PeerAddr = "/ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+    ///         .parse()?;
     ///     let connect_id = node.connect(target)?;
     ///     let deadline = Instant::now() + Duration::from_secs(10);
     ///     loop {
     ///         match node.wait(deadline)? {
     ///             EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
     ///                 connect_id: settled,
-    ///                 outcome: ConnectOutcome::Connected { .. },
-    ///                 ..
-    ///             }) if settled == connect_id => return Ok(()),
-    ///             EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
-    ///                 connect_id: settled,
     ///                 outcome,
     ///                 ..
-    ///             }) if settled == connect_id => {
-    ///                 return Err(format!("connect failed: {outcome:?}").into());
-    ///             }
-    ///             EndpointWaitOutcome::Event(_) | EndpointWaitOutcome::Interrupted => {}
+    ///             }) if settled == connect_id => match outcome {
+    ///                 ConnectOutcome::Connected { conn_id } => {
+    ///                     println!("connected on {conn_id:?}");
+    ///                     return Ok(());
+    ///                 }
+    ///                 other => return Err(format!("connect failed: {other:?}").into()),
+    ///             },
+    ///             // Unrelated events keep flowing: dispatch them as usual.
+    ///             EndpointWaitOutcome::Event(event) => println!("{event:?}"),
+    ///             // Another thread woke us; service its commands, then wait again.
+    ///             EndpointWaitOutcome::Interrupted => {}
+    ///             // Giving up locally does not cancel the attempt; do that explicitly.
     ///             EndpointWaitOutcome::Deadline => {
+    ///                 node.cancel_connect(connect_id);
     ///                 return Err("connect did not settle before the deadline".into());
     ///             }
     ///         }
@@ -798,118 +678,43 @@ impl Endpoint {
         if deadline.prefers_deadline_over_queued() {
             return Ok(EndpointWaitOutcome::Deadline);
         }
-        self.tick_connect();
-        if let Some(event) = self.pending_events.pop_front() {
-            return Ok(EndpointWaitOutcome::Event(event));
-        }
-        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-        if self.has_drivers() {
-            let mut expired_poll_used = false;
-            return match self.poll_new_event_driven(deadline, &mut expired_poll_used)? {
-                DriverPoll::Progress => {
-                    let event = self.pending_events.pop_front().ok_or(Error::Invariant {
-                        reason: "a driver step reported events but the queue was empty",
-                    })?;
-                    Ok(EndpointWaitOutcome::Event(event))
-                }
-                DriverPoll::Interrupted => Ok(EndpointWaitOutcome::Interrupted),
-                DriverPoll::Deadline => Ok(EndpointWaitOutcome::Deadline),
-            };
-        }
+        // `Swarm::poll_next_interruptible` performs one synchronous poll even
+        // for an expired deadline. Allow that once, so a continuous event
+        // stream cannot keep this wait running past its deadline.
+        let mut expired_poll_used = false;
         loop {
-            // A shortened step deadline is the engine's timer, not the
-            // caller's. Tick first so Timeout lands as ConnectSettled.
+            // A shortened step deadline is an internal timer, not the
+            // caller's. Tick first so an attempt Timeout lands as
+            // ConnectSettled.
             self.tick_connect();
             if let Some(event) = self.pending_events.pop_front() {
                 return Ok(EndpointWaitOutcome::Event(event));
             }
-            let step = self.connect_step_deadline(deadline);
-            match self.swarm.poll_next_interruptible(step)? {
+            if deadline.has_passed() {
+                if expired_poll_used {
+                    return Ok(EndpointWaitOutcome::Deadline);
+                }
+                expired_poll_used = true;
+            }
+            let step = self.step_deadline(deadline);
+            let polled = self.swarm.poll_next_interruptible(step)?;
+            if deadline.has_passed() {
+                expired_poll_used = true;
+            }
+            match polled {
                 PollNext::Event(event) => {
                     let produced = self.step_events(event)?;
                     self.pending_events.extend(produced);
-                    if let Some(event) = self.pending_events.pop_front() {
-                        return Ok(EndpointWaitOutcome::Event(event));
-                    }
                 }
                 PollNext::Deadline => {
-                    if deadline.has_passed() {
-                        return Ok(EndpointWaitOutcome::Deadline);
-                    }
+                    // An agent timer may have ended this step; let it act.
+                    let mut produced = Vec::new();
+                    self.finish_step(&mut produced)?;
+                    self.pending_events.extend(produced);
                 }
                 PollNext::Interrupted => return Ok(EndpointWaitOutcome::Interrupted),
             }
         }
-    }
-
-    /// Returns the next Endpoint event, including enabled capability variants,
-    /// waiting until `deadline`.
-    ///
-    /// Prefer [`Self::wait`] for new code: it surfaces interruption and matches
-    /// the Endpoint wait outcomes. Both deliver enabled capability output as
-    /// [`EndpointEvent`] variants. Focused waits such as `nat_wait_path` and
-    /// [`Self::wait_peer_ready`] remain during migration, as does
-    /// [`Self::next_wake`] until #181. All of these methods
-    /// use transport readiness when supported. Each call drives only this
-    /// endpoint, so blocking here can delay other endpoints that share the
-    /// same thread.
-    ///
-    /// `deadline` accepts an [`std::time::Instant`], a relative
-    /// [`std::time::Duration`], or [`Deadline::NEVER`] to wait indefinitely.
-    ///
-    /// Unlike [`Self::wait`], this method swallows interruption and retries.
-    /// Like `wait`, an already-passed absolute [`std::time::Instant`] returns
-    /// `None` before delivering another queued event. Relative
-    /// [`std::time::Duration`] deadlines (including [`std::time::Duration::ZERO`]) still
-    /// drain queued events and poll once.
-    pub fn next_event(&mut self, deadline: impl Into<Deadline>) -> Result<Option<Event>, Error> {
-        let deadline = deadline.into();
-        loop {
-            match self.wait(deadline)? {
-                EndpointWaitOutcome::Event(event) => return Ok(Some(event)),
-                EndpointWaitOutcome::Deadline => return Ok(None),
-                EndpointWaitOutcome::Interrupted => {}
-            }
-        }
-    }
-
-    /// Migration wrapper around [`Self::wait`] until #181.
-    ///
-    /// Capability output now arrives as [`EndpointWake::Event`] carrying an
-    /// [`EndpointEvent`] variant, so [`EndpointWake::DriverProgress`] is
-    /// never returned and no `take_*` draining is needed between calls.
-    pub fn next_wake(&mut self, deadline: impl Into<Deadline>) -> Result<EndpointWake, Error> {
-        Ok(match self.wait(deadline)? {
-            EndpointWaitOutcome::Event(event) => EndpointWake::Event(event),
-            EndpointWaitOutcome::Deadline => EndpointWake::Deadline,
-            EndpointWaitOutcome::Interrupted => EndpointWake::Interrupted,
-        })
-    }
-
-    /// Whether any agent driver is active on this endpoint.
-    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-    fn has_drivers(&self) -> bool {
-        #[cfg(feature = "relay-server")]
-        if self.relay_server.is_some() {
-            return true;
-        }
-        #[cfg(any(feature = "discovery", feature = "mdns"))]
-        if self.discovery.is_some() {
-            return true;
-        }
-        #[cfg(feature = "mdns")]
-        if self.mdns.is_some() {
-            return true;
-        }
-        #[cfg(feature = "nat")]
-        if self.nat.is_some() {
-            return true;
-        }
-        #[cfg(feature = "pubsub")]
-        if self.gossipsub.is_some() {
-            return true;
-        }
-        false
     }
 
     fn tick_connect(&mut self) {
@@ -920,8 +725,7 @@ impl Endpoint {
 
     /// Queues output produced outside a swarm step (API calls, timers):
     /// capability events first, then Connection-attempt events, so a
-    /// terminal never overtakes the NAT events of the same call. Filters
-    /// over the stream call this before they search it.
+    /// terminal never overtakes the NAT events of the same call.
     fn flush_step_events(&mut self) {
         let mut out = Vec::new();
         self.drain_step_events(&mut out);
@@ -959,8 +763,8 @@ impl Endpoint {
     /// The discovery sweep removes beacon-topic Gossipsub traffic and
     /// discovery-owned NAT events before this drain. [`Self::finish_step`]
     /// runs that sweep and then calls this. [`Self::flush_step_events`] also
-    /// calls this from `connect`, `cancel_connect`, `tick_connect`, and
-    /// [`Self::wait`] without sweeping again; that stays correct only while
+    /// calls this from `connect`, `cancel_connect`, and `tick_connect`
+    /// without sweeping again; that stays correct only while
     /// every path that fills a driver queue ends in `finish_step` first.
     /// NAT output reaches the Connection-attempt engine before the drain;
     /// the attempt terminals it turns into `ConnectSettled` are not repeated
@@ -999,19 +803,6 @@ impl Endpoint {
         if let Some(discovery) = self.discovery.as_mut() {
             discovery.drain_events(out);
         }
-    }
-
-    /// Removes and returns every pending event `is_match` accepts, keeping
-    /// the rest in order.
-    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-    fn extract_pending(&mut self, is_match: impl Fn(&EndpointEvent) -> bool) -> Vec<EndpointEvent> {
-        self.flush_step_events();
-        let (picked, kept): (Vec<_>, Vec<_>) = self
-            .pending_events
-            .drain(..)
-            .partition(|event| is_match(event));
-        self.pending_events = kept.into();
-        picked
     }
 
     fn take_connect_events(&mut self) -> Vec<EndpointEvent> {
@@ -1072,13 +863,50 @@ impl Endpoint {
         (!engine_consumed && !driver_consumed).then(|| EndpointEvent::from(event))
     }
 
-    fn connect_step_deadline(&mut self, deadline: Deadline) -> Deadline {
+    /// One wait step's deadline: the caller's, shortened by whichever
+    /// Connection-attempt or agent timer is due first.
+    fn step_deadline(&mut self, deadline: Deadline) -> Deadline {
+        let now = self.swarm.now();
         let mut step = deadline;
+        let mut shorten = |ms: u64| {
+            step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
+        };
         if let Some(next) = self.connect.next_deadline() {
-            let now = self.swarm.now();
-            step = step.earliest(Deadline::from(std::time::Duration::from_millis(
-                next.millis_until(now).max(1),
-            )));
+            shorten(next.millis_until(now));
+        }
+        #[cfg(feature = "relay-server")]
+        if let Some(relay_server) = self.relay_server.as_ref()
+            && let Some(ms) = relay_server.agent.next_timeout(relay_server.now())
+        {
+            shorten(ms);
+        }
+        #[cfg(feature = "nat")]
+        if let Some(ms) = self.nat.as_ref().and_then(|nat| nat.next_timeout(now)) {
+            shorten(ms);
+        }
+        #[cfg(feature = "pubsub")]
+        if let Some(ms) = self
+            .gossipsub
+            .as_ref()
+            .and_then(|pubsub| pubsub.next_timeout(now.monotonic_ms))
+        {
+            shorten(ms);
+        }
+        #[cfg(any(feature = "discovery", feature = "mdns"))]
+        if let Some(ms) = self
+            .discovery
+            .as_ref()
+            .and_then(|discovery| discovery.next_timeout(now.monotonic_ms))
+        {
+            shorten(ms);
+        }
+        #[cfg(feature = "mdns")]
+        if let Some(ms) = self
+            .mdns
+            .as_ref()
+            .and_then(|mdns| mdns.next_timeout(mdns.now_ms()))
+        {
+            shorten(ms);
         }
         step
     }
@@ -1179,208 +1007,6 @@ impl Endpoint {
         Ok(())
     }
 
-    /// One wait step's deadline: the caller's, shortened by whichever agent
-    /// timer is due first.
-    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-    fn driver_step_deadline(&mut self, deadline: Deadline) -> Deadline {
-        let mut step = deadline;
-        #[cfg(feature = "relay-server")]
-        if let Some(relay_server) = self.relay_server.as_ref()
-            && let Some(ms) = relay_server.agent.next_timeout(relay_server.now())
-        {
-            step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
-        }
-        #[cfg(feature = "nat")]
-        if let Some(nat) = self.nat.as_ref()
-            && let Some(ms) = nat.next_timeout(self.swarm.now())
-        {
-            step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
-        }
-        #[cfg(feature = "pubsub")]
-        if let Some(pubsub) = self.gossipsub.as_ref()
-            && let Some(ms) = pubsub.next_timeout(self.swarm.now().monotonic_ms)
-        {
-            step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
-        }
-        #[cfg(any(feature = "discovery", feature = "mdns"))]
-        if let Some(discovery) = self.discovery.as_ref()
-            && let Some(ms) = discovery.next_timeout(self.swarm.now().monotonic_ms)
-        {
-            step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
-        }
-        #[cfg(feature = "mdns")]
-        if let Some(mdns) = self.mdns.as_ref()
-            && let Some(ms) = mdns.next_timeout(mdns.now_ms())
-        {
-            step = step.earliest(Deadline::from(std::time::Duration::from_millis(ms.max(1))));
-        }
-        step
-    }
-
-    /// Drives the swarm and the active agents until a step appends events to
-    /// `pending_events`, or the wait ends.
-    ///
-    /// Appends every event from the step, in Endpoint emission order, behind
-    /// anything already queued. It does not remove or reorder queued events.
-    /// Focused waits scan the queue themselves and pull the match out in
-    /// place, so an earlier event in the same step stays in front of a
-    /// terminal.
-    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-    fn poll_new_event_driven(
-        &mut self,
-        deadline: Deadline,
-        expired_poll_used: &mut bool,
-    ) -> Result<DriverPoll, Error> {
-        loop {
-            // `Swarm::poll_next` deliberately performs one synchronous poll
-            // even for an expired deadline. That is useful for one-shot
-            // callers, but repeating it here under a continuous event stream
-            // would let a focused wait run forever past its deadline.
-            if deadline.has_passed() {
-                if *expired_poll_used {
-                    return Ok(DriverPoll::deadline());
-                }
-                *expired_poll_used = true;
-            }
-            let step = self.driver_step_deadline(deadline);
-            let step = self.connect_step_deadline(step);
-            // Output queued outside a step (API calls, cancellation) first.
-            let queued = self.pending_events.len();
-            self.tick_connect();
-            if self.pending_events.len() > queued {
-                return Ok(DriverPoll::progress());
-            }
-            let polled = self.swarm.poll_next_interruptible(step)?;
-            if deadline.has_passed() {
-                *expired_poll_used = true;
-            }
-            match polled {
-                PollNext::Event(event) => {
-                    let produced = self.step_events(event)?;
-                    if !produced.is_empty() {
-                        self.pending_events.extend(produced);
-                        return Ok(DriverPoll::progress());
-                    }
-                }
-                PollNext::Deadline => {
-                    let mut produced = Vec::new();
-                    self.finish_step(&mut produced)?;
-                    if !produced.is_empty() {
-                        self.pending_events.extend(produced);
-                        return Ok(DriverPoll::progress());
-                    }
-                    // Distinguish the caller's deadline from a mere agent
-                    // timer that shortened this wait step.
-                    if deadline.has_passed() {
-                        return Ok(DriverPoll::deadline());
-                    }
-                }
-                PollNext::Interrupted => return Ok(DriverPoll::interrupted()),
-            }
-        }
-    }
-
-    /// Waits until Identify completes for `peer_id` or `deadline` expires.
-    ///
-    /// Recommended when the application needs advertised protocols. Opening a
-    /// known application stream does not require this wait; see
-    /// [`Self::open_stream`].
-    pub fn wait_peer_ready(
-        &mut self,
-        peer_id: &PeerId,
-        deadline: impl Into<Deadline>,
-    ) -> Result<Option<Event>, Error> {
-        let deadline = deadline.into();
-        self.wait_for_event(
-            deadline,
-            |event| matches!(event, Event::PeerReady { peer_id: ready, .. } if ready == peer_id),
-        )
-    }
-
-    /// Waits until a ping RTT for `peer_id` is measured or `deadline` expires.
-    pub fn wait_ping_rtt(
-        &mut self,
-        peer_id: &PeerId,
-        deadline: impl Into<Deadline>,
-    ) -> Result<Option<u64>, Error> {
-        let deadline = deadline.into();
-        let event = self.wait_for_event(deadline, |event| {
-            matches!(event, Event::PingRttMeasured { peer_id: ready, .. } if ready == peer_id)
-        })?;
-        Ok(match event {
-            Some(Event::PingRttMeasured { rtt_ms, .. }) => Some(rtt_ms),
-            _ => None,
-        })
-    }
-
-    /// Waits for the first usable path of Connection attempt `id`.
-    ///
-    /// Migration helper until #181: after [`Self::connect`], this blocks for
-    /// the first [`NatEvent::PathEstablished`] of that attempt (the
-    /// provisional Relayed path, when that is what lands first). The settled
-    /// outcome is [`EndpointEvent::ConnectSettled`].
-    ///
-    /// Like [`Self::next_event`], it uses transport readiness when
-    /// supported; it drives only this endpoint.
-    ///
-    /// Returns `Ok(Some(path))` on [`NatEvent::PathEstablished`] (the event
-    /// is taken from the Endpoint event stream). If the attempt settles
-    /// first, its [`EndpointEvent::ConnectSettled`] stays queued for the
-    /// application and this returns the [`Self::path`] snapshot for a
-    /// connected attempt, or `Ok(None)` for a failed or cancelled one.
-    /// Returns `Ok(None)` when `deadline` passes. Other events arriving
-    /// meanwhile stay queued for later [`Endpoint::wait`] calls.
-    ///
-    /// Returns [`Error::Invariant`] before waiting when the endpoint was built
-    /// without a NAT configuration (the `nat` feature alone does not enable
-    /// traversal).
-    #[cfg(feature = "nat")]
-    pub fn nat_wait_path(
-        &mut self,
-        id: ConnectId,
-        deadline: impl Into<Deadline>,
-    ) -> Result<Option<Path>, Error> {
-        if self.nat.is_none() {
-            return Err(Error::Invariant {
-                reason: "NAT traversal is not configured",
-            });
-        }
-        let deadline = deadline.into();
-        let mut expired_poll_used = false;
-        loop {
-            self.flush_step_events();
-            if let Some(index) = self.pending_events.iter().position(|event| {
-                matches!(
-                    event,
-                    EndpointEvent::Nat(NatEvent::PathEstablished { connect_id, .. })
-                        if *connect_id == id
-                )
-            }) && let Some(EndpointEvent::Nat(NatEvent::PathEstablished { path, .. })) =
-                self.pending_events.remove(index)
-            {
-                return Ok(Some(path));
-            }
-            let settled = self.pending_events.iter().find_map(|event| match event {
-                EndpointEvent::ConnectSettled {
-                    connect_id,
-                    peer_id,
-                    outcome,
-                } if *connect_id == id => Some(
-                    matches!(outcome, ConnectOutcome::Connected { .. }).then(|| peer_id.clone()),
-                ),
-                _ => None,
-            });
-            if let Some(connected_peer) = settled {
-                return Ok(connected_peer.and_then(|peer| self.path(&peer)));
-            }
-            self.ensure_pending_event_capacity()?;
-            match self.poll_new_event_driven(deadline, &mut expired_poll_used)? {
-                DriverPoll::Progress | DriverPoll::Interrupted => {}
-                DriverPoll::Deadline => return Ok(None),
-            }
-        }
-    }
-
     /// Pauses or resumes admission of new relay reservations and circuits.
     ///
     /// Existing reservations and circuits remain active, and HOP remains
@@ -1430,49 +1056,6 @@ impl Endpoint {
         Ok(())
     }
 
-    /// Removes relay-server events from the Endpoint event stream.
-    ///
-    /// Migration helper until #181: relay-server output is delivered by
-    /// [`Self::wait`] as [`EndpointEvent::RelayServer`]; this takes the queued
-    /// ones out of the stream instead, leaving other events in order.
-    #[cfg(feature = "relay-server")]
-    pub fn take_relay_server_events(&mut self) -> Vec<RelayServerEvent> {
-        self.extract_pending(|event| matches!(event, EndpointEvent::RelayServer(_)))
-            .into_iter()
-            .filter_map(|event| match event {
-                EndpointEvent::RelayServer(event) => Some(event),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Drives the endpoint until a relay-server event or caller deadline.
-    ///
-    /// Migration helper until #181: takes the next
-    /// [`EndpointEvent::RelayServer`] from the Endpoint event stream. Other
-    /// events stay queued for [`Endpoint::wait`]. Returns `Ok(None)` when relay
-    /// service is absent or the deadline expires. It can return
-    /// [`Error::EventBacklogExceeded`] when preserving those events exhausts the
-    /// bounded backlog. Transport/action failures discovered asynchronously are
-    /// returned as [`RelayServerEvent::Error`] rather than as this method's
-    /// `Err` value.
-    #[cfg(feature = "relay-server")]
-    pub fn next_relay_server_event(
-        &mut self,
-        deadline: impl Into<Deadline>,
-    ) -> Result<Option<RelayServerEvent>, Error> {
-        if self.relay_server.is_none() {
-            return Ok(None);
-        }
-        let event = self.wait_for_event(deadline.into(), |event| {
-            matches!(event, EndpointEvent::RelayServer(_))
-        })?;
-        Ok(match event {
-            Some(EndpointEvent::RelayServer(event)) => Some(event),
-            _ => None,
-        })
-    }
-
     #[cfg(any(feature = "nat", feature = "relay-server"))]
     fn refresh_external_address_contributions(&mut self) {
         if self.swarm.external_addresses_revision() != self.external_addresses_revision {
@@ -1516,126 +1099,6 @@ impl Endpoint {
         }
         self.swarm.set_external_addresses(addresses);
         self.external_addresses_revision = self.swarm.external_addresses_revision();
-    }
-
-    /// Removes NAT events from the Endpoint event stream.
-    ///
-    /// Migration helper until #181: NAT output is delivered by
-    /// [`Self::wait`] as [`EndpointEvent::Nat`]; this takes the queued ones out
-    /// of the stream instead, leaving other events in order.
-    #[cfg(feature = "nat")]
-    pub fn take_nat_events(&mut self) -> Vec<NatEvent> {
-        self.extract_pending(|event| matches!(event, EndpointEvent::Nat(_)))
-            .into_iter()
-            .filter_map(|event| match event {
-                EndpointEvent::Nat(event) => Some(event),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Returns the next NAT event, waiting internally until `deadline`.
-    ///
-    /// Migration helper until #181: takes the next [`EndpointEvent::Nat`] from
-    /// the Endpoint event stream. Other events stay queued for
-    /// [`Endpoint::wait`].
-    #[cfg(feature = "nat")]
-    pub fn next_nat_event(
-        &mut self,
-        deadline: impl Into<Deadline>,
-    ) -> Result<Option<NatEvent>, Error> {
-        if self.nat.is_none() {
-            return Ok(None);
-        }
-        let event = self.wait_for_event(deadline.into(), |event| {
-            matches!(event, EndpointEvent::Nat(_))
-        })?;
-        Ok(match event {
-            Some(EndpointEvent::Nat(event)) => Some(event),
-            _ => None,
-        })
-    }
-
-    fn wait_for_event<F>(
-        &mut self,
-        deadline: Deadline,
-        mut predicate: F,
-    ) -> Result<Option<Event>, Error>
-    where
-        F: FnMut(&Event) -> bool,
-    {
-        self.tick_connect();
-        #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-        if self.has_drivers() {
-            return self.wait_for_event_driven(deadline, predicate);
-        }
-        let mut expired_poll_used = false;
-        loop {
-            self.tick_connect();
-            if let Some(index) = self.pending_events.iter().position(&mut predicate) {
-                return Ok(self.pending_events.remove(index));
-            }
-            self.ensure_pending_event_capacity()?;
-            if deadline.has_passed() {
-                if expired_poll_used {
-                    return Ok(None);
-                }
-                expired_poll_used = true;
-            }
-            let step = self.connect_step_deadline(deadline);
-            match self.swarm.poll_next_interruptible(step)? {
-                PollNext::Event(event) => {
-                    let produced = self.step_events(event)?;
-                    self.pending_events.extend(produced);
-                }
-                PollNext::Deadline => {
-                    if deadline.has_passed() {
-                        return Ok(None);
-                    }
-                }
-                PollNext::Interrupted => {}
-            }
-        }
-    }
-
-    /// Driver-aware equivalent of `Swarm::run_until`. Every swarm event
-    /// goes through the active drivers, and non-matching application events
-    /// are retained for [`Endpoint::next_event`].
-    ///
-    /// Each iteration appends a whole step onto `pending_events` and scans
-    /// from the front, same as the non-driver [`Self::wait_for_event`]. A
-    /// match later in the step is removed in place, so the events before it
-    /// stay in front.
-    #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
-    fn wait_for_event_driven<F>(
-        &mut self,
-        deadline: Deadline,
-        mut predicate: F,
-    ) -> Result<Option<Event>, Error>
-    where
-        F: FnMut(&Event) -> bool,
-    {
-        let mut expired_poll_used = false;
-        loop {
-            self.flush_step_events();
-            if let Some(index) = self.pending_events.iter().position(&mut predicate) {
-                return Ok(self.pending_events.remove(index));
-            }
-            self.ensure_pending_event_capacity()?;
-            match self.poll_new_event_driven(deadline, &mut expired_poll_used)? {
-                DriverPoll::Progress | DriverPoll::Interrupted => {}
-                DriverPoll::Deadline => return Ok(None),
-            }
-        }
-    }
-
-    fn ensure_pending_event_capacity(&self) -> Result<(), Error> {
-        if self.pending_events.len() >= RUN_UNTIL_SKIP_LIMIT {
-            return Err(Error::EventBacklogExceeded {
-                limit: RUN_UNTIL_SKIP_LIMIT,
-            });
-        }
-        Ok(())
     }
 
     /// Our current reachability verdict from AutoNAT probing
@@ -1693,10 +1156,10 @@ impl Endpoint {
     ///
     /// A successful return means the message was accepted and its outbound
     /// streams were initiated — the frames themselves go out as the
-    /// endpoint is driven (`next_event` / `poll`), so keep driving after
+    /// endpoint is driven (`wait` / `poll`), so keep driving after
     /// publishing. Delivery failures are never synchronous errors; they
     /// surface later as [`GossipsubEvent::OutboundFailure`] (or
-    /// [`Event::Error`] runtime events). There is no self-delivery. The
+    /// [`EndpointEvent::Error`] runtime events). There is no self-delivery. The
     /// configured discovery topic is reserved while discovery is enabled
     /// and returns [`GossipsubError::DiscoveryTopicReserved`].
     #[cfg(feature = "pubsub")]
@@ -1719,44 +1182,6 @@ impl Endpoint {
         Ok(())
     }
 
-    /// Removes Gossipsub events from the Endpoint event stream.
-    ///
-    /// Migration helper until #181: Gossipsub output is delivered by
-    /// [`Self::wait`] as [`EndpointEvent::Gossipsub`]; this takes the queued
-    /// ones out of the stream instead, leaving other events in order.
-    #[cfg(feature = "pubsub")]
-    pub fn take_gossipsub_events(&mut self) -> Vec<GossipsubEvent> {
-        self.extract_pending(|event| matches!(event, EndpointEvent::Gossipsub(_)))
-            .into_iter()
-            .filter_map(|event| match event {
-                EndpointEvent::Gossipsub(event) => Some(event),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Returns the next Gossipsub event, waiting internally until `deadline`.
-    ///
-    /// Migration helper until #181: takes the next
-    /// [`EndpointEvent::Gossipsub`] from the Endpoint event stream. Other
-    /// events stay queued for [`Endpoint::wait`].
-    #[cfg(feature = "pubsub")]
-    pub fn next_gossipsub_event(
-        &mut self,
-        deadline: impl Into<Deadline>,
-    ) -> Result<Option<GossipsubEvent>, GossipsubError> {
-        if self.gossipsub.is_none() {
-            return Err(GossipsubError::NotEnabled);
-        }
-        let event = self.wait_for_event(deadline.into(), |event| {
-            matches!(event, EndpointEvent::Gossipsub(_))
-        })?;
-        Ok(match event {
-            Some(EndpointEvent::Gossipsub(event)) => Some(event),
-            _ => None,
-        })
-    }
-
     /// Returns the current discovery address-book snapshot.
     #[cfg(any(feature = "discovery", feature = "mdns"))]
     pub fn known_peers(&self) -> Vec<KnownPeer> {
@@ -1777,43 +1202,6 @@ impl Endpoint {
     pub fn discovery_now_ms(&mut self) -> Option<u64> {
         self.discovery.as_ref()?;
         Some(self.swarm.now().monotonic_ms)
-    }
-
-    /// Removes Discovery events from the Endpoint event stream.
-    ///
-    /// Migration helper until #181: Discovery output is delivered by
-    /// [`Self::wait`] as [`EndpointEvent::Discovery`]; this takes the queued
-    /// ones out of the stream instead, leaving other events in order.
-    #[cfg(any(feature = "discovery", feature = "mdns"))]
-    pub fn take_discovery_events(&mut self) -> Vec<DiscoveryEvent> {
-        self.extract_pending(|event| matches!(event, EndpointEvent::Discovery(_)))
-            .into_iter()
-            .filter_map(|event| match event {
-                EndpointEvent::Discovery(event) => Some(event),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Returns the next Discovery event while preserving unrelated events.
-    ///
-    /// Migration helper until #181: takes the next
-    /// [`EndpointEvent::Discovery`] from the Endpoint event stream.
-    #[cfg(any(feature = "discovery", feature = "mdns"))]
-    pub fn next_discovery_event(
-        &mut self,
-        deadline: impl Into<Deadline>,
-    ) -> Result<Option<DiscoveryEvent>, DiscoveryError> {
-        if self.discovery.is_none() {
-            return Err(DiscoveryError::NotEnabled);
-        }
-        let event = self.wait_for_event(deadline.into(), |event| {
-            matches!(event, EndpointEvent::Discovery(_))
-        })?;
-        Ok(match event {
-            Some(EndpointEvent::Discovery(event)) => Some(event),
-            _ => None,
-        })
     }
 
     /// Borrows the underlying swarm.
@@ -1868,7 +1256,7 @@ impl Endpoint {
     /// notifies a peer after `kill -9` or a hard partition. A replacement
     /// that lands while draining is disconnected too, including a handshake
     /// still pending when the superseded connection closes.
-    pub fn close(mut self) -> Result<Vec<Event>, Error> {
+    pub fn close(mut self) -> Result<Vec<EndpointEvent>, Error> {
         let mut first_error = None;
         #[cfg(feature = "mdns")]
         if let Err(error) = self.shutdown() {
@@ -1967,18 +1355,6 @@ fn mdns_seed(keypair: &Ed25519Keypair) -> [u8; 32] {
     seed
 }
 
-/// One listen request held until bind groups transports.
-#[cfg(any(feature = "quic", feature = "tcp"))]
-enum ListenRequest {
-    /// Address-shaped listen; transport inferred from the multiaddr.
-    /// Validated when pushed via [`EndpointBuilder::listen_on`].
-    Multiaddr(Multiaddr),
-    #[cfg(feature = "quic")]
-    QuicHostPort(String),
-    #[cfg(feature = "tcp")]
-    TcpHostPort(String),
-}
-
 /// Default dual-stack QUIC listen addresses used by
 /// [`EndpointBuilder::listen_default`].
 #[cfg(feature = "quic")]
@@ -2005,9 +1381,9 @@ pub struct EndpointBuilder {
     quic_limits: QuicLimits,
     #[cfg(feature = "tcp")]
     tcp_config: TcpConfig,
-    /// Ordered listen requests; transport is inferred from address shape.
+    /// Ordered listen addresses; transport is inferred from address shape.
     #[cfg(any(feature = "quic", feature = "tcp"))]
-    listen_requests: Vec<ListenRequest>,
+    listen_addrs: Vec<Multiaddr>,
     protocols: Vec<String>,
     #[cfg(feature = "relay-server")]
     relay_server_config: Option<RelayServerConfig>,
@@ -2041,7 +1417,7 @@ impl Default for EndpointBuilder {
             #[cfg(feature = "tcp")]
             tcp_config: TcpConfig::default(),
             #[cfg(any(feature = "quic", feature = "tcp"))]
-            listen_requests: Vec::new(),
+            listen_addrs: Vec::new(),
             protocols: Vec::new(),
             #[cfg(feature = "relay-server")]
             relay_server_config: None,
@@ -2063,34 +1439,6 @@ impl Default for EndpointBuilder {
             peer_discovery_config: PeerDiscoveryConfig::default(),
         }
     }
-}
-
-/// Validated builder output consumed by the bind step.
-struct BuilderParts {
-    keypair: Ed25519Keypair,
-    agent_version: String,
-    #[cfg(feature = "quic")]
-    quic_limits: QuicLimits,
-    #[cfg(feature = "tcp")]
-    tcp_config: TcpConfig,
-    #[cfg(any(feature = "quic", feature = "tcp"))]
-    listen_requests: Vec<ListenRequest>,
-    protocols: Vec<String>,
-    #[cfg(feature = "relay-server")]
-    relay_server_config: Option<RelayServerConfig>,
-    #[cfg(feature = "relay-server")]
-    relay_server_announce_addrs: Vec<Multiaddr>,
-    #[cfg(feature = "nat")]
-    nat_config: Option<NatConfig>,
-    #[cfg(feature = "pubsub")]
-    gossipsub_config: Option<GossipsubConfig>,
-    #[cfg(feature = "discovery")]
-    discovery_config: Option<BeaconConfig>,
-    #[cfg(feature = "mdns")]
-    mdns_config: Option<MdnsConfig>,
-    #[cfg(any(feature = "discovery", feature = "mdns"))]
-    peer_discovery_config: PeerDiscoveryConfig,
-    connect_deadline_ms: u64,
 }
 
 impl EndpointBuilder {
@@ -2160,75 +1508,11 @@ impl EndpointBuilder {
     /// Returns [`Error`] if the builder already has a QUIC listen for either
     /// family (same duplicate-family rule as [`Self::listen_on`]).
     #[cfg(feature = "quic")]
-    pub fn listen_default(self) -> Result<Self, Error> {
-        self.quic_dual_stack()
-    }
-
-    /// Adds a QUIC socket bound to `bind_addr`, e.g. `"0.0.0.0:4001"`.
-    ///
-    /// Prefer [`EndpointBuilder::listen_on`] with a complete multiaddress when
-    /// configuration already speaks multiaddrs.
-    #[cfg(feature = "quic")]
-    pub fn quic(mut self, bind_addr: impl Into<String>) -> Self {
-        self.listen_requests
-            .push(ListenRequest::QuicHostPort(bind_addr.into()));
-        self
-    }
-
-    /// Adds a QUIC socket bound to a `/ip4|ip6/udp/<port>/quic-v1` multiaddr.
-    #[cfg(feature = "quic")]
-    pub fn quic_multiaddr(self, addr: &Multiaddr) -> Result<Self, Error> {
-        if !addr.is_quic_transport() {
-            return Err(TransportError::InvalidAddress {
-                context: "quic bind address",
-                reason: format!("`{addr}` is not a /udp/.../quic-v1 transport address"),
-            }
-            .into());
+    pub fn listen_default(mut self) -> Result<Self, Error> {
+        for address in default_listen_quic_addrs() {
+            self.push_listen_addr(address)?;
         }
-        self.listen_on_multiaddr(addr)
-    }
-
-    /// Adds one dual QUIC member bound to exact IPv4 and IPv6 multiaddresses.
-    #[cfg(feature = "quic")]
-    pub fn quic_dual_multiaddr(self, first: &Multiaddr, second: &Multiaddr) -> Result<Self, Error> {
-        self.quic_multiaddr(first)?.quic_multiaddr(second)
-    }
-
-    /// Adds separate IPv4 and IPv6 wildcard QUIC sockets.
-    ///
-    /// Returns [`Error`] if either default collides with an existing QUIC
-    /// listen for that IP family.
-    #[cfg(feature = "quic")]
-    pub fn quic_dual_stack(self) -> Result<Self, Error> {
-        let mut builder = self;
-        for addr in default_listen_quic_addrs() {
-            builder = builder.listen_on_multiaddr(&addr)?;
-        }
-        Ok(builder)
-    }
-
-    /// Adds a TCP listener bound to `bind_addr`, e.g. `"0.0.0.0:4001"`.
-    ///
-    /// One TCP transport serves `/ip4` and `/ip6` alike, so a host that wants
-    /// both listens twice on the one member rather than running two.
-    #[cfg(feature = "tcp")]
-    pub fn tcp(mut self, bind_addr: impl Into<String>) -> Self {
-        self.listen_requests
-            .push(ListenRequest::TcpHostPort(bind_addr.into()));
-        self
-    }
-
-    /// Adds a TCP listener bound to a `/ip4|ip6/tcp/<port>` multiaddr.
-    #[cfg(feature = "tcp")]
-    pub fn tcp_multiaddr(self, addr: &Multiaddr) -> Result<Self, Error> {
-        if !addr.is_tcp_transport() {
-            return Err(TransportError::InvalidAddress {
-                context: "tcp bind address",
-                reason: format!("`{addr}` is not a /tcp transport address"),
-            }
-            .into());
-        }
-        self.listen_on_multiaddr(addr)
+        Ok(self)
     }
 
     #[cfg(any(feature = "quic", feature = "tcp"))]
@@ -2236,25 +1520,10 @@ impl EndpointBuilder {
         validate_listen_multiaddr(&address)?;
         #[cfg(feature = "quic")]
         if address.is_quic_transport() {
-            let existing = self.resolved_listen_multiaddrs();
-            reject_duplicate_quic_family(&existing, &address)?;
+            reject_duplicate_quic_family(&self.listen_addrs, &address)?;
         }
-        self.listen_requests.push(ListenRequest::Multiaddr(address));
+        self.listen_addrs.push(address);
         Ok(())
-    }
-
-    /// Already-pushed multiaddrs for early QUIC duplicate checks.
-    #[cfg(feature = "quic")]
-    fn resolved_listen_multiaddrs(&self) -> Vec<Multiaddr> {
-        self.listen_requests
-            .iter()
-            .filter_map(|request| match request {
-                ListenRequest::Multiaddr(address) => Some(address.clone()),
-                ListenRequest::QuicHostPort(_) => None,
-                #[cfg(feature = "tcp")]
-                ListenRequest::TcpHostPort(_) => None,
-            })
-            .collect()
     }
 
     /// Registers an application protocol before the endpoint starts.
@@ -2273,8 +1542,9 @@ impl EndpointBuilder {
     /// Enables Circuit Relay v2 service with production-oriented defaults.
     ///
     /// After binding, use [`Endpoint::set_relay_server_accepting`] to pause or
-    /// resume admission and [`Endpoint::next_relay_server_event`] to consume
-    /// reservation, circuit, accounting, and asynchronous failure events.
+    /// resume admission. Reservation, circuit, accounting, and asynchronous
+    /// failure events arrive from [`Endpoint::wait`] as
+    /// [`EndpointEvent::RelayServer`].
     #[cfg(feature = "relay-server")]
     pub fn relay_server(mut self) -> Self {
         self.relay_server_config
@@ -2450,42 +1720,19 @@ impl EndpointBuilder {
     /// endpoint with nothing to bind is refused: it could neither dial nor be
     /// reached, and failing here says so more clearly than every later call
     /// would.
-    pub fn bind(self) -> Result<Endpoint, Error> {
-        let parts = self.into_parts()?;
-        let transport = bind_transports(&parts)?;
-        build_endpoint(parts, transport)
+    pub fn bind(mut self) -> Result<Endpoint, Error> {
+        self.validate()?;
+        let keypair = self.keypair.take().unwrap_or_else(Ed25519Keypair::generate);
+        let transport = bind_transports(&self, &keypair)?;
+        build_endpoint(self, keypair, transport)
     }
 
-    /// Builds an endpoint with a QUIC transport bound to `bind_addr`.
-    #[cfg(feature = "quic")]
-    pub fn bind_quic(self, bind_addr: impl Into<String>) -> Result<Endpoint, Error> {
-        self.quic(bind_addr).bind()
-    }
-
-    /// Builds an endpoint with a QUIC transport bound to a QUIC multiaddr.
-    #[cfg(feature = "quic")]
-    pub fn bind_quic_multiaddr(self, addr: &Multiaddr) -> Result<Endpoint, Error> {
-        self.quic_multiaddr(addr)?.bind()
-    }
-
-    /// Builds an endpoint with separate IPv4 and IPv6 wildcard QUIC sockets.
-    #[cfg(feature = "quic")]
-    pub fn bind_quic_dual_stack(self) -> Result<Endpoint, Error> {
-        self.quic_dual_stack()?.bind()
-    }
-
-    /// Builds an endpoint with a TCP transport listening on `bind_addr`.
-    #[cfg(feature = "tcp")]
-    pub fn bind_tcp(self, bind_addr: impl Into<String>) -> Result<Endpoint, Error> {
-        self.tcp(bind_addr).bind()
-    }
-
-    /// Validates the static configuration and decomposes the builder.
+    /// Validates the static configuration.
     ///
     /// Reserved protocol ids are rejected here -- before any socket is
     /// bound -- so a configuration error can neither allocate resources
     /// nor be masked by a bind failure.
-    fn into_parts(self) -> Result<BuilderParts, Error> {
+    fn validate(&self) -> Result<(), Error> {
         if let Some(protocol) = self
             .protocols
             .iter()
@@ -2504,38 +1751,6 @@ impl EndpointBuilder {
                     reason: error.to_string(),
                 })?;
         }
-        #[cfg(feature = "nat")]
-        let nat_config = {
-            let enabled = self.nat_config.is_some()
-                || !self.relays.is_empty()
-                || !self.autonat_servers.is_empty()
-                || {
-                    #[cfg(feature = "discovery")]
-                    {
-                        self.discovery_config.is_some()
-                    }
-                    #[cfg(not(feature = "discovery"))]
-                    {
-                        false
-                    }
-                }
-                || {
-                    #[cfg(feature = "mdns")]
-                    {
-                        self.mdns_config.is_some()
-                    }
-                    #[cfg(not(feature = "mdns"))]
-                    {
-                        false
-                    }
-                };
-            enabled.then(|| {
-                let mut config = self.nat_config.unwrap_or_default();
-                config.relays.extend(self.relays);
-                config.autonat_servers.extend(self.autonat_servers);
-                config
-            })
-        };
         #[cfg(feature = "relay-server")]
         if self.relay_server_config.is_none() && !self.relay_server_announce_addrs.is_empty() {
             return Err(TransportError::InvalidConfig {
@@ -2543,88 +1758,33 @@ impl EndpointBuilder {
             }
             .into());
         }
-        Ok(BuilderParts {
-            keypair: self.keypair.unwrap_or_else(Ed25519Keypair::generate),
-            agent_version: self.agent_version,
-            #[cfg(feature = "quic")]
-            quic_limits: self.quic_limits,
-            #[cfg(feature = "tcp")]
-            tcp_config: self.tcp_config,
-            #[cfg(any(feature = "quic", feature = "tcp"))]
-            listen_requests: self.listen_requests,
-            protocols: self.protocols,
-            #[cfg(feature = "relay-server")]
-            relay_server_config: self.relay_server_config,
-            #[cfg(feature = "relay-server")]
-            relay_server_announce_addrs: self.relay_server_announce_addrs,
-            #[cfg(feature = "nat")]
-            nat_config,
-            #[cfg(feature = "pubsub")]
-            gossipsub_config: self.gossipsub_config,
-            #[cfg(feature = "discovery")]
-            discovery_config: self.discovery_config,
-            #[cfg(feature = "mdns")]
-            mdns_config: self.mdns_config,
-            #[cfg(any(feature = "discovery", feature = "mdns"))]
-            peer_discovery_config: self.peer_discovery_config,
-            connect_deadline_ms: u64::try_from(self.connect_deadline.as_millis())
-                .unwrap_or(u64::MAX),
+        Ok(())
+    }
+
+    /// The NAT configuration to run, if any builder option enabled NAT:
+    /// explicit config, relays, AutoNAT servers, or a discovery source.
+    #[cfg(feature = "nat")]
+    fn take_nat_config(&mut self) -> Option<NatConfig> {
+        #[cfg(feature = "discovery")]
+        let discovery = self.discovery_config.is_some();
+        #[cfg(not(feature = "discovery"))]
+        let discovery = false;
+        #[cfg(feature = "mdns")]
+        let mdns = self.mdns_config.is_some();
+        #[cfg(not(feature = "mdns"))]
+        let mdns = false;
+        let enabled = self.nat_config.is_some()
+            || !self.relays.is_empty()
+            || !self.autonat_servers.is_empty()
+            || discovery
+            || mdns;
+        enabled.then(|| {
+            let mut config = self.nat_config.take().unwrap_or_default();
+            config.relays.append(&mut self.relays);
+            config.autonat_servers.append(&mut self.autonat_servers);
+            config
         })
     }
-}
-
-/// Reads a `host:port` bind spec as the `/tcp` addresses it names.
-///
-/// The same shape `bind_quic` accepts, so a host does not have to know that one
-/// transport speaks socket addresses and the other multiaddrs.
-///
-/// A name that answers with more than one address gives more than one: a host
-/// that asked to be reachable as `localhost` means both families, and listening
-/// on whichever the resolver happened to put first would leave half of that
-/// silently unserved. One TCP transport holds them all.
-#[cfg(feature = "tcp")]
-fn tcp_bind_addrs(spec: &str) -> Result<Vec<Multiaddr>, Error> {
-    use std::net::ToSocketAddrs;
-
-    let resolved = spec
-        .to_socket_addrs()
-        .map_err(|error| TransportError::InvalidAddress {
-            context: "tcp bind address",
-            reason: format!("{spec} is not a bindable address: {error}"),
-        })?;
-    let addrs = tcp_addrs_of(resolved);
-    if addrs.is_empty() {
-        return Err(TransportError::InvalidAddress {
-            context: "tcp bind address",
-            reason: format!("{spec} resolved to no address"),
-        }
-        .into());
-    }
-    Ok(addrs)
-}
-
-/// The `/tcp` multiaddrs for resolved socket addresses, in order, without
-/// repeats.
-///
-/// Split from resolution so what is kept can be tested without a resolver: no
-/// test can make a name answer with two families on demand, and "keeps every
-/// answer" is exactly the part that was wrong when it kept only the first.
-#[cfg(feature = "tcp")]
-fn tcp_addrs_of(resolved: impl IntoIterator<Item = std::net::SocketAddr>) -> Vec<Multiaddr> {
-    let mut addrs: Vec<Multiaddr> = Vec::new();
-    for addr in resolved {
-        let host = match addr.ip() {
-            std::net::IpAddr::V4(v4) => Protocol::Ip4(v4.octets()),
-            std::net::IpAddr::V6(v6) => Protocol::Ip6(v6.octets()),
-        };
-        let addr = Multiaddr::from_protocols(vec![host, Protocol::Tcp(addr.port())]);
-        // A resolver may answer with the same address twice; binding it twice
-        // would fail the second time with the address in use.
-        if !addrs.contains(&addr) {
-            addrs.push(addr);
-        }
-    }
-    addrs
 }
 
 #[cfg(any(feature = "quic", feature = "tcp"))]
@@ -2706,42 +1866,16 @@ fn reject_duplicate_quic_family(existing: &[Multiaddr], next: &Multiaddr) -> Res
     Ok(())
 }
 
-/// Collects every listen multiaddr in configuration order.
-#[cfg(any(feature = "quic", feature = "tcp"))]
-fn collect_listen_addrs(parts: &BuilderParts) -> Result<Vec<Multiaddr>, Error> {
-    let mut addrs = Vec::new();
-
-    for request in &parts.listen_requests {
-        match request {
-            ListenRequest::Multiaddr(address) => {
-                // Validated at listen_on / quic_multiaddr / tcp_multiaddr time.
-                addrs.push(address.clone());
-            }
-            #[cfg(feature = "quic")]
-            ListenRequest::QuicHostPort(_) => {
-                // Bound later via QuicEndpoint::bind(spec) — one UDP socket.
-            }
-            #[cfg(feature = "tcp")]
-            ListenRequest::TcpHostPort(spec) => {
-                for address in tcp_bind_addrs(spec)? {
-                    // Host:port is not validated at push; resolve here.
-                    validate_listen_multiaddr(&address)?;
-                    addrs.push(address);
-                }
-            }
-        }
-    }
-
-    Ok(addrs)
-}
-
 /// Brings up every requested transport behind one set.
 ///
 /// Listen multiaddresses are grouped by transport shape: compatible QUIC IPv4
 /// and IPv6 addresses become one QUIC member, and every `/tcp` address lands on
-/// one TCP member. Asking for two members of one shape is refused rather than
-/// producing a set that routes by coin toss.
-fn bind_transports(_parts: &BuilderParts) -> Result<TransportSet, Error> {
+/// one TCP member. Members are inserted in the order their shape first appears,
+/// so `listen_all` reports addresses in configuration order.
+fn bind_transports(
+    _options: &EndpointBuilder,
+    _keypair: &Ed25519Keypair,
+) -> Result<TransportSet, Error> {
     #[cfg(any(feature = "quic", feature = "tcp"))]
     let mut set = TransportSet::new();
     #[cfg(not(any(feature = "quic", feature = "tcp")))]
@@ -2749,16 +1883,7 @@ fn bind_transports(_parts: &BuilderParts) -> Result<TransportSet, Error> {
 
     #[cfg(any(feature = "quic", feature = "tcp"))]
     {
-        let addrs = collect_listen_addrs(_parts)?;
-        #[cfg(feature = "quic")]
-        let quic_host_ports: Vec<&str> = _parts
-            .listen_requests
-            .iter()
-            .filter_map(|request| match request {
-                ListenRequest::QuicHostPort(spec) => Some(spec.as_str()),
-                _ => None,
-            })
-            .collect();
+        let addrs = &_options.listen_addrs;
         #[cfg(feature = "quic")]
         let quic_addrs: Vec<&Multiaddr> = addrs
             .iter()
@@ -2769,78 +1894,44 @@ fn bind_transports(_parts: &BuilderParts) -> Result<TransportSet, Error> {
             .iter()
             .filter(|address| address.is_tcp_transport())
             .collect();
-
-        #[cfg(feature = "quic")]
-        let has_quic = !quic_addrs.is_empty() || !quic_host_ports.is_empty();
-        #[cfg(not(feature = "quic"))]
-        let has_quic = false;
-        #[cfg(feature = "tcp")]
-        let has_tcp = !tcp_addrs.is_empty();
-        #[cfg(not(feature = "tcp"))]
-        let has_tcp = false;
-
-        // Preserve request order from the builder so listen_all reporting
-        // follows configuration order (including legacy host:port binds).
-        #[cfg(all(feature = "quic", feature = "tcp"))]
-        let quic_first = _parts
-            .listen_requests
-            .iter()
-            .find_map(|request| match request {
-                ListenRequest::QuicHostPort(_) => Some(true),
-                ListenRequest::TcpHostPort(_) => Some(false),
-                ListenRequest::Multiaddr(address) if address.is_quic_transport() => Some(true),
-                ListenRequest::Multiaddr(address) if address.is_tcp_transport() => Some(false),
-                ListenRequest::Multiaddr(_) => None,
-            })
-            .unwrap_or(true);
-        #[cfg(all(feature = "quic", not(feature = "tcp")))]
-        let quic_first = true;
-        #[cfg(all(feature = "tcp", not(feature = "quic")))]
-        let quic_first = false;
-
+        let quic_first = addrs
+            .first()
+            .is_none_or(|address| address.is_quic_transport());
         let order = if quic_first {
             [true, false]
         } else {
             [false, true]
         };
         for want_quic in order {
-            if want_quic && has_quic {
-                #[cfg(feature = "quic")]
-                {
-                    let config = QuicNodeConfig::new(_parts.keypair.clone())
-                        .with_limits(_parts.quic_limits.clone());
-                    let transport = match (quic_host_ports.as_slice(), quic_addrs.as_slice()) {
-                        // Alone: one UDP socket; UdpSocket::bind tries candidates.
-                        ([spec], []) => QuicEndpoint::bind(config, spec)?,
-                        ([], [address]) => QuicEndpoint::bind_multiaddr(config, address)?,
-                        ([], [first, second]) => {
-                            QuicEndpoint::bind_dual_multiaddr(config, first, second)?
-                        }
-                        _ => {
-                            return Err(TransportError::InvalidConfig {
-                                reason: "legacy quic host:port binds cannot be combined with other QUIC listens; use listen_on(...) or listen_default() for dual-stack"
-                                    .into(),
-                            }
-                            .into());
-                        }
-                    };
-                    let namespaces = transport.namespaces();
-                    insert_member(&mut set, TransportKind::Quic, namespaces, transport)?;
-                }
-            } else if !want_quic && has_tcp {
-                #[cfg(feature = "tcp")]
-                {
-                    let transport = bind_tcp_member(_parts, &tcp_addrs)?;
-                    let namespace = transport.namespace();
-                    insert_member(&mut set, TransportKind::Tcp, [namespace], transport)?;
-                }
+            #[cfg(feature = "quic")]
+            if want_quic && !quic_addrs.is_empty() {
+                let config =
+                    QuicNodeConfig::new(_keypair.clone()).with_limits(_options.quic_limits.clone());
+                let transport = match quic_addrs.as_slice() {
+                    [address] => QuicEndpoint::bind_multiaddr(config, address)?,
+                    [first, second] => QuicEndpoint::bind_dual_multiaddr(config, first, second)?,
+                    // `listen_on` allows at most one QUIC address per family.
+                    _ => {
+                        return Err(Error::Invariant {
+                            reason: "more than one QUIC listen address per IP family",
+                        });
+                    }
+                };
+                let namespaces = transport.namespaces();
+                insert_member(&mut set, TransportKind::Quic, namespaces, transport)?;
+            }
+            #[cfg(feature = "tcp")]
+            if !want_quic && !tcp_addrs.is_empty() {
+                let transport = bind_tcp_member(_options, _keypair, &tcp_addrs)?;
+                let namespace = transport.namespace();
+                insert_member(&mut set, TransportKind::Tcp, [namespace], transport)?;
             }
         }
     }
 
     if set.is_empty() {
         return Err(TransportError::InvalidConfig {
-            reason: "an endpoint needs at least one transport to bind".into(),
+            reason: "an endpoint needs at least one transport to bind; add a listen address with EndpointBuilder::listen_on or listen_default".into(),
         }
         .into());
     }
@@ -2850,14 +1941,15 @@ fn bind_transports(_parts: &BuilderParts) -> Result<TransportSet, Error> {
 /// Builds the one TCP transport, listening on every `/tcp` address asked for.
 #[cfg(feature = "tcp")]
 fn bind_tcp_member(
-    parts: &BuilderParts,
+    options: &EndpointBuilder,
+    keypair: &Ed25519Keypair,
     tcp_addrs: &[&Multiaddr],
 ) -> Result<TcpTransport<StdTcpProvider, StdEntropy>, Error> {
     // Checked before a socket exists: the namespace is what routes a connection
     // id back to the transport that minted it, so a TCP transport tagged as
     // something else hands out ids that name the wrong carrier -- and would
     // take a claim a QUIC member needs.
-    let namespace = parts.tcp_config.namespace;
+    let namespace = options.tcp_config.namespace;
     if namespace != ConnectionNamespace::TCP_IPV4 && namespace != ConnectionNamespace::TCP_IPV6 {
         return Err(TransportError::InvalidConfig {
             reason: format!(
@@ -2873,9 +1965,9 @@ fn bind_tcp_member(
     })?;
     let mut transport = TcpTransport::with_config(
         provider,
-        parts.keypair.clone(),
+        keypair.clone(),
         StdEntropy::new(),
-        parts.tcp_config.clone(),
+        options.tcp_config.clone(),
     );
     for addr in tcp_addrs {
         // Bound here, like a QUIC socket is: `Endpoint::listen` then listens
@@ -2902,14 +1994,22 @@ fn insert_member<T: minip2p_transport::BlockingTransport + Send + 'static>(
         })
 }
 
-fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoint, Error> {
-    let mut builder = SwarmBuilder::new(&parts.keypair).agent_version(parts.agent_version);
-    #[cfg(any(feature = "nat", feature = "pubsub"))]
-    let mut protocols = parts.protocols;
-    #[cfg(not(any(feature = "nat", feature = "pubsub")))]
-    let protocols = parts.protocols;
+fn build_endpoint(
+    options: EndpointBuilder,
+    keypair: Ed25519Keypair,
+    transport: TransportSet,
+) -> Result<Endpoint, Error> {
     #[cfg(feature = "nat")]
-    if parts.nat_config.is_some() {
+    let mut options = options;
+    #[cfg(feature = "nat")]
+    let nat_config = options.take_nat_config();
+    let mut builder = SwarmBuilder::new(&keypair).agent_version(options.agent_version);
+    #[cfg(any(feature = "nat", feature = "pubsub"))]
+    let mut protocols = options.protocols;
+    #[cfg(not(any(feature = "nat", feature = "pubsub")))]
+    let protocols = options.protocols;
+    #[cfg(feature = "nat")]
+    if nat_config.is_some() {
         for id in [
             minip2p_nat::DCUTR_PROTOCOL_ID,
             minip2p_nat::AUTONAT_PROTOCOL_ID,
@@ -2920,7 +2020,7 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
         }
     }
     #[cfg(feature = "pubsub")]
-    if parts.gossipsub_config.is_some() {
+    if options.gossipsub_config.is_some() {
         // Pubsub streams route as ordinary user protocols, and the gossipsub
         // ids must be advertised by Identify from the first handshake.
         for id in minip2p_pubsub::GOSSIPSUB_PROTOCOL_IDS {
@@ -2933,25 +2033,25 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
         builder = builder.protocol(protocol);
     }
     #[cfg(feature = "nat")]
-    let transport = minip2p_circuit::CircuitTransport::new_os(transport, parts.keypair.clone());
+    let transport = minip2p_circuit::CircuitTransport::new_os(transport, keypair.clone());
     #[cfg(any(feature = "nat", feature = "relay-server"))]
     let mut swarm = builder.build(transport)?;
     #[cfg(not(any(feature = "nat", feature = "relay-server")))]
     let swarm = builder.build(transport)?;
     #[cfg(feature = "relay-server")]
-    if parts.relay_server_config.is_some() {
+    if options.relay_server_config.is_some() {
         swarm.add_inbound_protocol(RELAY_HOP_PROTOCOL_ID)?;
         swarm.add_advertised_protocol(RELAY_HOP_PROTOCOL_ID)?;
         swarm.add_outbound_protocol(RELAY_STOP_PROTOCOL_ID)?;
     }
     #[cfg(feature = "nat")]
-    if parts.nat_config.is_some() {
+    if nat_config.is_some() {
         swarm.add_outbound_protocol(minip2p_nat::HOP_PROTOCOL_ID)?;
         swarm.add_inbound_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
         swarm.add_advertised_protocol(minip2p_nat::STOP_PROTOCOL_ID)?;
     }
     #[cfg(feature = "nat")]
-    let nat = parts.nat_config.map(|config| {
+    let nat = nat_config.map(|config| {
         let relay_addrs = config
             .relays
             .iter()
@@ -2961,7 +2061,7 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
         NatDriver::new(agent, relay_addrs, minip2p_platform::StdEntropy)
     });
     #[cfg(feature = "relay-server")]
-    let relay_server = parts
+    let relay_server = options
         .relay_server_config
         .map(|config| -> Result<relay_server::RelayServerDriver, Error> {
             let mut agent =
@@ -2970,7 +2070,7 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
                         reason: error.to_string(),
                     })?;
             agent
-                .replace_announce_addrs(parts.relay_server_announce_addrs)
+                .replace_announce_addrs(options.relay_server_announce_addrs)
                 .map_err(|error| TransportError::InvalidConfig {
                     reason: error.to_string(),
                 })?;
@@ -2985,13 +2085,13 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
         })
         .transpose()?;
     #[cfg(feature = "discovery")]
-    let discovery_config = parts.discovery_config;
+    let discovery_config = options.discovery_config;
     #[cfg(feature = "mdns")]
-    let mdns_config = parts.mdns_config;
+    let mdns_config = options.mdns_config;
     #[cfg(any(feature = "discovery", feature = "mdns"))]
-    let peer_discovery_config = parts.peer_discovery_config;
+    let peer_discovery_config = options.peer_discovery_config;
     #[cfg(feature = "pubsub")]
-    let gossipsub = parts
+    let gossipsub = options
         .gossipsub_config
         .map(|config| -> Result<GossipsubDriver, Error> {
             // Message ids are (from, seqno); a wall-clock seed keeps restarts
@@ -3003,8 +2103,7 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
                 .map(|duration| duration.as_nanos())
                 .unwrap_or(0);
             let initial_seqno = timestamp as u64;
-            let entropy_seed = parts
-                .keypair
+            let entropy_seed = keypair
                 .peer_id()
                 .digest_bytes()
                 .iter()
@@ -3012,7 +2111,7 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
                     seed.rotate_left(5) ^ u64::from(*byte)
                 });
             let agent = minip2p_pubsub::GossipsubAgent::new(
-                parts.keypair.clone(),
+                keypair.clone(),
                 config,
                 initial_seqno,
                 entropy_seed,
@@ -3045,11 +2144,11 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
     )]
     let beacon = match discovery_config {
         Some(config) => Some(
-            minip2p_discovery::BeaconAgent::new(parts.keypair.public_key(), config).map_err(
-                |_| Error::Invariant {
+            minip2p_discovery::BeaconAgent::new(keypair.public_key(), config).map_err(|_| {
+                Error::Invariant {
                     reason: "validated beacon configuration was rejected",
-                },
-            )?,
+                }
+            })?,
         ),
         None => None,
     };
@@ -3061,9 +2160,9 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
     let mdns = match mdns_config {
         Some(config) => {
             let agent = minip2p_mdns::MdnsAgent::new(
-                parts.keypair.peer_id(),
+                keypair.peer_id(),
                 config.clone(),
-                mdns_seed(&parts.keypair),
+                mdns_seed(&keypair),
             )
             .map_err(|error| TransportError::InvalidConfig {
                 reason: error.to_string(),
@@ -3103,13 +2202,11 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
         reason = "The shared discovery policy was validated before the endpoint reached this point."
     )]
     let discovery = if discovery_enabled {
-        let book = minip2p_discovery::PeerDiscoveryAgent::new(
-            parts.keypair.peer_id(),
-            peer_discovery_config,
-        )
-        .map_err(|_| Error::Invariant {
-            reason: "validated discovery configuration was rejected",
-        })?;
+        let book =
+            minip2p_discovery::PeerDiscoveryAgent::new(keypair.peer_id(), peer_discovery_config)
+                .map_err(|_| Error::Invariant {
+                    reason: "validated discovery configuration was rejected",
+                })?;
         Some(DiscoveryDriver::new(
             book,
             #[cfg(feature = "pubsub")]
@@ -3120,7 +2217,9 @@ fn build_endpoint(parts: BuilderParts, transport: TransportSet) -> Result<Endpoi
     };
     Ok(Endpoint {
         swarm,
-        connect: ConnectEngine::new(parts.connect_deadline_ms),
+        connect: ConnectEngine::new(
+            u64::try_from(options.connect_deadline.as_millis()).unwrap_or(u64::MAX),
+        ),
         #[cfg(feature = "relay-server")]
         relay_server,
         #[cfg(feature = "nat")]
@@ -3148,6 +2247,31 @@ fn concrete_relay_listener_addrs(addrs: Vec<Multiaddr>) -> Vec<Multiaddr> {
                 && !matches!(address.iter().next(), Some(Protocol::Ip6(ip)) if *ip == [0; 16])
         })
         .collect()
+}
+
+/// Test-only convenience over [`Endpoint::wait`]: the next event, or `None`
+/// once the deadline passes. Interruptions are retried.
+#[cfg(all(test, feature = "quic"))]
+pub(crate) trait NextEvent {
+    fn next_event(&mut self, deadline: impl Into<Deadline>)
+    -> Result<Option<EndpointEvent>, Error>;
+}
+
+#[cfg(all(test, feature = "quic"))]
+impl NextEvent for Endpoint {
+    fn next_event(
+        &mut self,
+        deadline: impl Into<Deadline>,
+    ) -> Result<Option<EndpointEvent>, Error> {
+        let deadline = deadline.into();
+        loop {
+            match self.wait(deadline)? {
+                EndpointWaitOutcome::Event(event) => return Ok(Some(event)),
+                EndpointWaitOutcome::Deadline => return Ok(None),
+                EndpointWaitOutcome::Interrupted => {}
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3218,8 +2342,8 @@ mod tests {
     fn wait_for(
         endpoint: &mut Endpoint,
         what: &str,
-        mut wanted: impl FnMut(&Event) -> bool,
-    ) -> Event {
+        mut wanted: impl FnMut(&EndpointEvent) -> bool,
+    ) -> EndpointEvent {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut seen = Vec::new();
         while std::time::Instant::now() < deadline {
@@ -3245,9 +2369,9 @@ mod tests {
         match wait_for(
             endpoint,
             "connect settled",
-            |event| matches!(event, Event::ConnectSettled { connect_id, .. } if *connect_id == id),
+            |event| matches!(event, EndpointEvent::ConnectSettled { connect_id, .. } if *connect_id == id),
         ) {
-            Event::ConnectSettled { outcome, .. } => outcome,
+            EndpointEvent::ConnectSettled { outcome, .. } => outcome,
             other => panic!("expected ConnectSettled, got {other:?}"),
         }
     }
@@ -3263,13 +2387,17 @@ mod tests {
     #[test]
     fn connect_races_quic_and_tcp_candidates_on_a_quic_only_endpoint() {
         let mut listener = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind listener");
         let quic_addr = listener.listen().expect("listen");
         let tcp_addr = tcp_peer_addr(quic_addr.peer_id().clone(), 9);
         let _driver = Driven::new(listener);
         let mut dialer = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind dialer");
         let id = dialer
             .connect(vec![quic_addr.clone(), tcp_addr.clone()])
@@ -3289,7 +2417,11 @@ mod tests {
 
     #[test]
     fn connect_without_a_transport_for_the_address_is_no_usable_route() {
-        let mut endpoint = Endpoint::builder().bind_quic("127.0.0.1:0").expect("bind");
+        let mut endpoint = Endpoint::builder()
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
+            .expect("bind");
         let target = tcp_peer_addr(Ed25519Keypair::generate().peer_id(), 9);
         let id = endpoint.connect(target.clone()).expect("admitted");
         match connect_outcome(&mut endpoint, id) {
@@ -3309,12 +2441,16 @@ mod tests {
     #[test]
     fn cancel_connect_before_handshake_settles_cancelled() {
         let mut listener = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind listener");
         let addr = listener.listen().expect("listen");
         let _driver = Driven::new(listener);
         let mut dialer = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind dialer");
         let id = dialer.connect(addr).expect("connect");
         dialer.cancel_connect(id);
@@ -3329,7 +2465,9 @@ mod tests {
     #[test]
     fn connect_reaches_quic_when_the_tcp_candidate_is_closed() {
         let mut listener = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind listener");
         let quic_addr = listener.listen().expect("listen");
         let tcp_addr = tcp_peer_addr(quic_addr.peer_id().clone(), 9);
@@ -3354,20 +2492,24 @@ mod tests {
     #[test]
     fn wait_delivers_connect_timeout_before_the_caller_deadline() {
         let mut listener = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind listener");
         let addr = listener.listen().expect("listen");
         // Leave the listener undriven so the handshake hangs past the
         // attempt deadline instead of failing immediately.
         let mut dialer = Endpoint::builder()
             .connect_deadline(Duration::from_millis(80))
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind dialer");
         let id = dialer.connect(addr).expect("connect");
         let caller = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             match dialer.wait(caller).expect("wait") {
-                EndpointWaitOutcome::Event(Event::ConnectSettled {
+                EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
                     connect_id,
                     outcome: ConnectOutcome::Failed(ConnectFailure::Timeout { .. }),
                     ..
@@ -3415,23 +2557,6 @@ mod tests {
         };
         assert!(
             format!("{error}").contains("at least one transport"),
-            "got {error}"
-        );
-    }
-
-    #[test]
-    fn one_address_shape_cannot_be_bound_twice() {
-        // Two legacy QUIC host:port binds cannot share one Quic member (same as
-        // main's DuplicateKind refusal). Use listen_on / listen_default for dual-stack.
-        let Err(error) = Endpoint::builder()
-            .quic("127.0.0.1:0")
-            .quic("127.0.0.1:0")
-            .bind()
-        else {
-            panic!("one QUIC family must not have two listeners");
-        };
-        assert!(
-            format!("{error}").contains("cannot be combined"),
             "got {error}"
         );
     }
@@ -3617,57 +2742,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn legacy_bind_quic_still_works() {
-        let mut endpoint = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
-            .expect("legacy bind");
-        assert_eq!(endpoint.listen_all().expect("listen").len(), 1);
-    }
-
-    #[test]
-    fn legacy_quic_hostname_bind_keeps_one_socket() {
-        // localhost commonly answers with both families (and some names with
-        // multiple A records). Expanding every result would dual-bind or hit
-        // InvalidConfig on a second same-family address. Legacy quic/bind_quic
-        // pass the name to UdpSocket::bind — one socket, try until one works.
-        let mut endpoint = Endpoint::builder()
-            .bind_quic("localhost:0")
-            .expect("legacy hostname bind");
-        let addrs = endpoint.listen_all().expect("listen");
-        assert_eq!(
-            addrs.len(),
-            1,
-            "one UDP socket, one reported address: {addrs:?}"
-        );
-        assert!(
-            addrs[0].transport().to_string().contains("/quic-v1"),
-            "{addrs:?}"
-        );
-    }
-
-    #[test]
-    fn legacy_quic_host_port_cannot_mix_with_multiaddr() {
-        let ipv6 = "/ip6/::1/udp/0/quic-v1".parse().expect("ipv6");
-        let Err(error) = Endpoint::builder()
-            .quic("127.0.0.1:0")
-            .quic_multiaddr(&ipv6)
-            .expect("quic multiaddr shape")
-            .bind()
-        else {
-            panic!("host:port must not combine with quic multiaddr");
-        };
-        assert!(
-            format!("{error}").contains("cannot be combined"),
-            "got {error}"
-        );
-    }
-
     #[cfg(feature = "tcp")]
     #[test]
     fn a_tcp_endpoint_reports_the_port_it_was_given() {
         let mut endpoint = Endpoint::builder()
-            .bind_tcp("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/tcp/0")
+            .expect("tcp listen address")
+            .bind()
             .expect("bind tcp endpoint");
 
         // Bound at build time like a QUIC socket, so a caller that asked for
@@ -3691,8 +2772,10 @@ mod tests {
     #[test]
     fn every_bound_transport_reports_where_it_listens() {
         let mut endpoint = Endpoint::builder()
-            .quic("127.0.0.1:0")
-            .tcp("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .listen_on("/ip4/127.0.0.1/tcp/0")
+            .expect("tcp listen address")
             .bind()
             .expect("bind both");
 
@@ -3720,8 +2803,10 @@ mod tests {
     #[test]
     fn a_second_tcp_address_joins_the_transport_that_already_serves_tcp() {
         let mut endpoint = Endpoint::builder()
-            .tcp("127.0.0.1:0")
-            .tcp("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/tcp/0")
+            .expect("tcp listen address")
+            .listen_on("/ip4/127.0.0.1/tcp/0")
+            .expect("tcp listen address")
             .bind()
             .expect("both tcp addresses bind");
         let addrs = endpoint.listen_all().expect("listen");
@@ -3738,13 +2823,17 @@ mod tests {
         let second = addrs[1].clone();
         let _driver = Driven::new(endpoint);
         let mut dialer = Endpoint::builder()
-            .bind_tcp("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/tcp/0")
+            .expect("tcp listen address")
+            .bind()
             .expect("bind dialer");
-        dialer.dial(&second).expect("dial the second address");
+        dialer
+            .connect(second.clone())
+            .expect("connect to the second address");
         wait_for(
             &mut dialer,
             "connection",
-            |event| matches!(event, Event::ConnectionEstablished { peer_id, .. } if peer_id == second.peer_id()),
+            |event| matches!(event, EndpointEvent::ConnectionEstablished { peer_id, .. } if peer_id == second.peer_id()),
         );
     }
 
@@ -3755,8 +2844,10 @@ mod tests {
         // `listen` does not return. An endpoint that reported success while
         // QUIC accepted nothing would look bound and be unreachable.
         let mut listener = Endpoint::builder()
-            .tcp("127.0.0.1:0")
-            .quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/tcp/0")
+            .expect("tcp listen address")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
             .bind()
             .expect("bind both");
         // Read straight off the bound sockets, so nothing here arms anything:
@@ -3777,13 +2868,15 @@ mod tests {
         let _driver = Driven::new(listener);
 
         let mut dialer = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind dialer");
-        dialer.dial(&quic_addr).expect("dial");
+        dialer.connect(&quic_addr).expect("connect");
         wait_for(
             &mut dialer,
             "connection",
-            |event| matches!(event, Event::ConnectionEstablished { peer_id, .. } if peer_id == quic_addr.peer_id()),
+            |event| matches!(event, EndpointEvent::ConnectionEstablished { peer_id, .. } if peer_id == quic_addr.peer_id()),
         );
     }
 
@@ -3794,17 +2887,23 @@ mod tests {
         // peer, so two paths to one host would be the second superseding the
         // first rather than a test of which path each address took.
         let mut over_tcp = Endpoint::builder()
-            .bind_tcp("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/tcp/0")
+            .expect("tcp listen address")
+            .bind()
             .expect("bind tcp peer");
         let mut over_quic = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind quic peer");
         let tcp_addr = over_tcp.listen().expect("tcp peer listens");
         let quic_addr = over_quic.listen().expect("quic peer listens");
 
         let mut dialer = Endpoint::builder()
-            .quic("127.0.0.1:0")
-            .tcp("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .listen_on("/ip4/127.0.0.1/tcp/0")
+            .expect("tcp listen address")
             .bind()
             .expect("bind dialer");
         let _drivers = (Driven::new(over_tcp), Driven::new(over_quic));
@@ -3817,13 +2916,13 @@ mod tests {
             (&tcp_addr, ConnectionNamespace::TCP_IPV4),
             (&quic_addr, ConnectionNamespace::QUIC_IPV4),
         ] {
-            dialer.dial(addr).expect("dial");
+            dialer.connect(addr).expect("connect");
             let event = wait_for(
                 &mut dialer,
                 "connection",
-                |event| matches!(event, Event::ConnectionEstablished { peer_id, .. } if peer_id == addr.peer_id()),
+                |event| matches!(event, EndpointEvent::ConnectionEstablished { peer_id, .. } if peer_id == addr.peer_id()),
             );
-            let Event::ConnectionEstablished { conn_id, .. } = event else {
+            let EndpointEvent::ConnectionEstablished { conn_id, .. } = event else {
                 panic!("the connection predicate returned an unrelated event")
             };
             assert_eq!(
@@ -3843,7 +2942,9 @@ mod tests {
                 namespace: ConnectionNamespace::TCP_IPV6,
                 ..TcpConfig::default()
             })
-            .bind_tcp("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/tcp/0")
+            .expect("tcp listen address")
+            .bind()
             .expect("bind tcp endpoint");
         let target = PeerAddr::new(
             "/ip4/127.0.0.1/tcp/1".parse().expect("address"),
@@ -3851,12 +2952,11 @@ mod tests {
         )
         .expect("target");
 
-        // The id a dial hands back is minted by the transport, so its
-        // namespace is what the configuration actually reached -- whether
+        // The id a raw swarm dial hands back is minted by the transport, so
+        // its namespace is what the configuration actually reached -- whether
         // anything answers is beside the point.
-        let ids = endpoint.dial(&target).expect("the dial starts");
-        assert_eq!(ids.len(), 1);
-        assert_eq!(ids[0].namespace(), ConnectionNamespace::TCP_IPV6);
+        let id = endpoint.swarm_mut().dial(&target).expect("the dial starts");
+        assert_eq!(id.namespace(), ConnectionNamespace::TCP_IPV6);
     }
 
     #[cfg(feature = "tcp")]
@@ -3870,7 +2970,9 @@ mod tests {
                 namespace: ConnectionNamespace::QUIC_IPV4,
                 ..TcpConfig::default()
             })
-            .bind_tcp("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/tcp/0")
+            .expect("tcp listen address")
+            .bind()
         else {
             panic!("a tcp transport must not claim another transport's ids");
         };
@@ -3880,121 +2982,12 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "tcp")]
-    #[test]
-    fn a_bind_spec_keeps_every_address_it_named() {
-        let resolved: Vec<std::net::SocketAddr> = vec![
-            "127.0.0.1:4001".parse().expect("v4"),
-            "[::1]:4001".parse().expect("v6"),
-            "127.0.0.1:4001".parse().expect("v4 again"),
-        ];
-
-        // A host that asked to be reachable as a name meant every address that
-        // name answers with; listening on whichever the resolver happened to
-        // put first would leave the rest silently unserved. Repeats are not
-        // extra sockets, though -- binding one twice fails the second time.
-        assert_eq!(
-            tcp_addrs_of(resolved)
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            vec!["/ip4/127.0.0.1/tcp/4001", "/ip6/::1/tcp/4001"]
-        );
-    }
-
-    #[cfg(feature = "tcp")]
-    #[test]
-    fn a_tcp_multiaddr_binds_and_a_wrong_shape_is_refused() {
-        let mut endpoint = Endpoint::builder()
-            .tcp_multiaddr(&"/ip4/127.0.0.1/tcp/0".parse().expect("address"))
-            .expect("tcp multiaddr")
-            .bind()
-            .expect("bind by multiaddr");
-        let addrs = endpoint.listen_all().expect("listen");
-        assert_eq!(
-            addrs[0].transport().to_string(),
-            format!("/ip4/127.0.0.1/tcp/{}", tcp_port(&addrs[0]))
-        );
-
-        // A QUIC address handed to the TCP transport is a mistake worth
-        // reporting, not a socket worth guessing at.
-        let Err(error) = Endpoint::builder()
-            .tcp_multiaddr(&"/ip4/127.0.0.1/udp/0/quic-v1".parse().expect("address"))
-        else {
-            panic!("a /udp address is not a tcp bind address");
-        };
-        assert!(
-            matches!(&error, Error::Transport(TransportError::InvalidAddress { reason, .. })
-                if reason.contains("not a /tcp transport address")),
-            "got {error:?}"
-        );
-    }
-
-    #[test]
-    fn an_address_no_bound_transport_serves_is_refused_by_name() {
-        let mut endpoint = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
-            .expect("bind loopback endpoint");
-        let target = PeerAddr::new(
-            "/ip4/127.0.0.1/tcp/4001".parse().expect("address"),
-            Ed25519Keypair::generate().peer_id(),
-        )
-        .expect("target");
-
-        // A QUIC-only endpoint has no business guessing a transport for a
-        // /tcp address, and the error has to say which is missing rather than
-        // read as "that host refused you".
-        let error = endpoint
-            .dial(&target)
-            .expect_err("nothing serves /tcp here");
-        assert!(
-            format!("{error}").contains("Tcp"),
-            "the error should name the missing transport, got {error}"
-        );
-    }
-
-    #[test]
-    fn a_dial_reaches_a_peer_on_the_transport_its_address_names() {
-        let mut listener = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
-            .expect("bind listener");
-        let listen_addr = listener.listen().expect("listen");
-        let mut dialer = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
-            .expect("bind dialer");
-        let _listener = Driven::new(listener);
-
-        // Routing the dial through a set, and resolving families above it,
-        // must leave an ordinary dial doing exactly what it did.
-        let ids = dialer.dial(&listen_addr).expect("dial");
-        assert_eq!(ids.len(), 1, "one address, one dial: {ids:?}");
-        let connected = dialer
-            .next_event(Duration::from_secs(5))
-            .expect("drive dialer");
-
-        assert!(
-            matches!(&connected, Some(Event::ConnectionEstablished { peer_id, .. })
-                if peer_id == listen_addr.peer_id()),
-            "got {connected:?}"
-        );
-    }
-
-    #[test]
-    fn next_wake_reports_deadline_without_active_drivers() {
-        let mut endpoint = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
-            .expect("bind loopback endpoint");
-
-        assert!(matches!(
-            endpoint.next_wake(Duration::ZERO).expect("poll endpoint"),
-            EndpointWake::Deadline
-        ));
-    }
-
     #[test]
     fn wait_reports_deadline_without_swallowing_control_outcomes() {
         let mut endpoint = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind loopback endpoint");
 
         assert!(matches!(
@@ -4006,15 +2999,19 @@ mod tests {
     #[test]
     fn wait_prefers_deadline_over_queued_events_when_instant_has_passed() {
         let mut endpoint = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind loopback endpoint");
         #[cfg(any(feature = "nat", feature = "pubsub", feature = "relay-server"))]
         {
-            endpoint.pending_events.push_back(Event::ConnectionClosed {
-                peer_id: Ed25519Keypair::generate().peer_id(),
-                conn_id: ConnectionId::new(1),
-                cause: minip2p_swarm::ConnectionCloseCause::Transport,
-            });
+            endpoint
+                .pending_events
+                .push_back(EndpointEvent::ConnectionClosed {
+                    peer_id: Ed25519Keypair::generate().peer_id(),
+                    conn_id: ConnectionId::new(1),
+                    cause: minip2p_swarm::ConnectionCloseCause::Transport,
+                });
         }
         let past = std::time::Instant::now()
             .checked_sub(Duration::from_secs(1))
@@ -4036,17 +3033,21 @@ mod tests {
     fn wait_with_duration_zero_still_drains_queued_events() {
         let mut endpoint = Endpoint::builder()
             .nat_config(NatConfig::default())
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind loopback endpoint");
         let peer = Ed25519Keypair::generate().peer_id();
-        endpoint.pending_events.push_back(Event::ConnectionClosed {
-            peer_id: peer.clone(),
-            conn_id: ConnectionId::new(1),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
-        });
+        endpoint
+            .pending_events
+            .push_back(EndpointEvent::ConnectionClosed {
+                peer_id: peer.clone(),
+                conn_id: ConnectionId::new(1),
+                cause: minip2p_swarm::ConnectionCloseCause::Transport,
+            });
         assert!(matches!(
             endpoint.wait(Duration::ZERO).expect("zero-duration drain"),
-            EndpointWaitOutcome::Event(Event::ConnectionClosed { peer_id, .. })
+            EndpointWaitOutcome::Event(EndpointEvent::ConnectionClosed { peer_id, .. })
                 if peer_id == peer
         ));
         assert!(
@@ -4058,7 +3059,9 @@ mod tests {
     #[test]
     fn wait_reports_interrupt_without_swallowing_it() {
         let mut endpoint = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind loopback endpoint");
         endpoint.wait_handle().interrupt();
 
@@ -4071,15 +3074,19 @@ mod tests {
     #[test]
     fn wait_delivers_connection_events_once_through_the_endpoint_stream() {
         let mut listener = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind listener");
         let listen_addr = listener.listen().expect("listen");
         let mut dialer = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind dialer");
         let _listener = Driven::new(listener);
 
-        dialer.dial(&listen_addr).expect("dial");
+        dialer.connect(&listen_addr).expect("connect");
         let peer = listen_addr.peer_id().clone();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -4088,14 +3095,16 @@ mod tests {
         let mut saw_peer_ready = false;
         while std::time::Instant::now() < deadline {
             match dialer.wait(deadline).expect("wait") {
-                EndpointWaitOutcome::Event(Event::ConnectionEstablished {
+                EndpointWaitOutcome::Event(EndpointEvent::ConnectionEstablished {
                     peer_id,
                     conn_id: id,
                 }) if peer_id == peer => {
                     established_count += 1;
                     conn_id = Some(id);
                 }
-                EndpointWaitOutcome::Event(Event::PeerReady { peer_id, .. }) if peer_id == peer => {
+                EndpointWaitOutcome::Event(EndpointEvent::PeerReady { peer_id, .. })
+                    if peer_id == peer =>
+                {
                     saw_peer_ready = true;
                     break;
                 }
@@ -4116,21 +3125,27 @@ mod tests {
     #[test]
     fn wait_delivers_peer_ready_through_the_endpoint_stream() {
         let mut listener = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind listener");
         let listen_addr = listener.listen().expect("listen");
         let mut dialer = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind dialer");
         let _listener = Driven::new(listener);
 
-        dialer.dial(&listen_addr).expect("dial");
+        dialer.connect(&listen_addr).expect("connect");
         let peer = listen_addr.peer_id().clone();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut ready = false;
         while std::time::Instant::now() < deadline {
             match dialer.wait(deadline).expect("wait") {
-                EndpointWaitOutcome::Event(Event::PeerReady { peer_id, .. }) if peer_id == peer => {
+                EndpointWaitOutcome::Event(EndpointEvent::PeerReady { peer_id, .. })
+                    if peer_id == peer =>
+                {
                     ready = true;
                     break;
                 }
@@ -4146,7 +3161,9 @@ mod tests {
     #[test]
     fn state_getters_expose_bound_addresses_and_connection_without_driving() {
         let mut endpoint = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind loopback endpoint");
         let before = endpoint.bound_addresses();
         assert!(
@@ -4166,7 +3183,9 @@ mod tests {
     fn wait_delivers_queued_nat_events_once() {
         let mut endpoint = Endpoint::builder()
             .nat_config(NatConfig::default())
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind NAT endpoint");
         endpoint
             .nat
@@ -4182,90 +3201,20 @@ mod tests {
             endpoint.wait(Duration::ZERO).expect("wait"),
             EndpointWaitOutcome::Event(EndpointEvent::Nat(NatEvent::ReachabilityChanged { .. }))
         ));
-        assert!(endpoint.take_nat_events().is_empty());
         assert!(matches!(
             endpoint.wait(Duration::ZERO).expect("wait"),
             EndpointWaitOutcome::Deadline
         ));
     }
 
-    #[test]
-    fn next_wake_reports_interrupt_without_active_drivers() {
-        let mut endpoint = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
-            .expect("bind loopback endpoint");
-        endpoint.wait_handle().interrupt();
-
-        assert!(matches!(
-            endpoint.next_wake(Deadline::NEVER).expect("poll endpoint"),
-            EndpointWake::Interrupted
-        ));
-    }
-
-    #[cfg(feature = "nat")]
-    #[test]
-    fn next_wake_transfers_buffered_application_event_ownership() {
-        let mut endpoint = Endpoint::builder()
-            .nat_config(NatConfig::default())
-            .bind_quic("127.0.0.1:0")
-            .expect("bind NAT endpoint");
-        let peer_id = Ed25519Keypair::generate().peer_id();
-        endpoint.pending_events.push_back(Event::ConnectionClosed {
-            peer_id: peer_id.clone(),
-            conn_id: ConnectionId::new(7),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
-        });
-
-        assert!(matches!(
-            endpoint.next_wake(Deadline::NEVER).expect("wake"),
-            EndpointWake::Event(Event::ConnectionClosed {
-                peer_id: returned,
-                ..
-            }) if returned == peer_id
-        ));
-        assert!(endpoint.pending_events.is_empty());
-    }
-
-    #[cfg(feature = "nat")]
-    #[test]
-    fn take_nat_events_extracts_from_the_stream_without_redelivery() {
-        let mut endpoint = Endpoint::builder()
-            .nat_config(NatConfig::default())
-            .bind_quic("127.0.0.1:0")
-            .expect("bind NAT endpoint");
-        let unrelated = Ed25519Keypair::generate().peer_id();
-        endpoint.pending_events.push_back(Event::ConnectionClosed {
-            peer_id: unrelated.clone(),
-            conn_id: ConnectionId::new(7),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
-        });
-        endpoint
-            .nat
-            .as_mut()
-            .expect("NAT configured")
-            .push_event(NatEvent::ReachabilityChanged {
-                old: ReachabilityState::Unknown,
-                new: ReachabilityState::Private,
-                confirmed_addrs: Vec::new(),
-            });
-
-        assert_eq!(endpoint.take_nat_events().len(), 1);
-        assert!(matches!(
-            endpoint.next_wake(Duration::ZERO).expect("wake"),
-            EndpointWake::Event(Event::ConnectionClosed { peer_id, .. }) if peer_id == unrelated
-        ));
-        assert!(matches!(
-            endpoint.next_wake(Duration::ZERO).expect("wake"),
-            EndpointWake::Deadline
-        ));
-    }
-
     #[cfg(feature = "pubsub")]
     #[test]
-    fn next_wake_delivers_queued_gossipsub_events_as_endpoint_events() {
+    fn wait_delivers_queued_gossipsub_events_as_endpoint_events() {
         let mut endpoint = Endpoint::builder()
             .gossipsub()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind pubsub endpoint");
         let peer = Ed25519Keypair::generate().peer_id();
         endpoint
@@ -4279,13 +3228,12 @@ mod tests {
             });
 
         assert!(matches!(
-            endpoint.next_wake(Duration::ZERO).expect("wake"),
-            EndpointWake::Event(EndpointEvent::Gossipsub(GossipsubEvent::PeerSubscribed {
+            endpoint.wait(Duration::ZERO).expect("wait"),
+            EndpointWaitOutcome::Event(EndpointEvent::Gossipsub(GossipsubEvent::PeerSubscribed {
                 peer: returned,
                 topic,
             })) if returned == peer && topic == "test"
         ));
-        assert!(endpoint.take_gossipsub_events().is_empty());
     }
 
     #[cfg(all(feature = "nat", feature = "pubsub", feature = "relay-server"))]
@@ -4295,7 +3243,9 @@ mod tests {
             .nat_config(NatConfig::default())
             .gossipsub()
             .relay_server()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind capability endpoint");
         let peer = Ed25519Keypair::generate().peer_id();
         endpoint
@@ -4350,9 +3300,6 @@ mod tests {
         // FellBackToRelay is an attempt terminal the engine reports as
         // ConnectSettled; it is not repeated as a NAT event.
         assert_eq!(order, ["relay-server", "nat", "gossipsub", "settled"]);
-        assert!(endpoint.take_nat_events().is_empty());
-        assert!(endpoint.take_gossipsub_events().is_empty());
-        assert!(endpoint.take_relay_server_events().is_empty());
     }
 
     /// One transport poll can return several swarm events. `poll` must finish
@@ -4364,7 +3311,9 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr};
 
         let mut endpoint = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind endpoint");
         let peer = Ed25519Keypair::generate().peer_id();
         let unreachable = PeerAddr::quic_v1(IpAddr::V4(Ipv4Addr::LOCALHOST), 9, peer.clone());
@@ -4410,30 +3359,36 @@ mod tests {
 
     #[cfg(feature = "nat")]
     #[test]
-    fn next_wake_honors_expired_deadline_with_active_driver() {
+    fn wait_honors_expired_deadline_with_active_driver() {
         let mut endpoint = Endpoint::builder()
             .nat_config(NatConfig::default())
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind NAT endpoint");
 
         assert!(matches!(
-            endpoint.next_wake(Duration::ZERO).expect("expired wake"),
-            EndpointWake::Deadline
+            endpoint.wait(Duration::ZERO).expect("expired wait"),
+            EndpointWaitOutcome::Deadline
         ));
     }
 
     #[cfg(feature = "nat")]
     #[test]
-    fn next_wake_returns_application_event_produced_during_driver_poll() {
+    fn wait_returns_application_event_produced_during_driver_poll() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let mut endpoint = Endpoint::builder()
             .nat_config(NatConfig::default())
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind driven endpoint");
         let mut remote = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind remote endpoint");
         endpoint.listen().expect("driven endpoint listens");
         let remote_addr = remote.listen().expect("remote listens");
@@ -4448,91 +3403,72 @@ mod tests {
             }
         });
 
-        endpoint.dial(&remote_addr).expect("dial remote");
+        endpoint.connect(&remote_addr).expect("connect to remote");
         let wake = endpoint
-            .next_wake(Duration::from_secs(5))
+            .wait(Duration::from_secs(5))
             .expect("wait for application event");
         stop.store(true, Ordering::Relaxed);
         remote_thread.join().expect("remote driver exits");
 
         assert!(matches!(
             wake,
-            EndpointWake::Event(Event::ConnectionEstablished { peer_id, .. })
+            EndpointWaitOutcome::Event(EndpointEvent::ConnectionEstablished { peer_id, .. })
                 if peer_id == *remote_addr.peer_id()
         ));
     }
 
     /// A step's first event is often `ConnectionEstablished`, with the NAT
-    /// path and `ConnectSettled` behind it. A focused wait must return the
-    /// NAT event and leave the terminal behind `ConnectionEstablished`.
+    /// path and `ConnectSettled` behind it. `wait` must hand them out in that
+    /// order: the terminal never overtakes the connection it reports.
     #[cfg(feature = "nat")]
     #[test]
-    fn next_nat_event_returns_same_step_path_without_reordering_connect() {
+    fn nat_path_and_connect_settled_follow_connection_established() {
         let mut endpoint = Endpoint::builder()
             .nat_config(NatConfig::default())
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind NAT endpoint");
         let mut remote = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind remote endpoint");
         endpoint.listen().expect("NAT endpoint listens");
         let remote_addr = remote.listen().expect("remote listens");
         let _remote = Driven::new(remote);
 
         let connect_id = endpoint.connect(&remote_addr).expect("connect");
-        let event = endpoint
-            .next_nat_event(Duration::from_secs(5))
-            .expect("focused NAT wait");
-        match event {
-            Some(NatEvent::PathEstablished {
-                connect_id: id,
-                path: Path::DirectDialed,
-                ..
-            }) => assert_eq!(id, connect_id),
-            other => panic!(
-                "expected PathEstablished, got {other:?}; pending {:?}",
-                endpoint.pending_events
-            ),
-        }
-
-        let established = endpoint.pending_events.iter().position(|event| {
-            matches!(
-                event,
-                Event::ConnectionEstablished { peer_id, .. } if peer_id == remote_addr.peer_id()
-            )
+        let mut events = Vec::new();
+        wait_for(&mut endpoint, "connect settled", |event| {
+            events.push(format!("{event:?}"));
+            matches!(event, EndpointEvent::ConnectSettled { connect_id: id, .. } if *id == connect_id)
         });
-        let settled = endpoint.pending_events.iter().position(|event| {
-            matches!(
-                event,
-                Event::ConnectSettled {
-                    connect_id: id,
-                    outcome: ConnectOutcome::Connected { .. },
-                    ..
-                } if *id == connect_id
-            )
-        });
-        match (established, settled) {
-            (Some(established_at), Some(settled_at)) => assert!(
-                established_at < settled_at,
-                "ConnectSettled at {settled_at} is ahead of ConnectionEstablished at {established_at}: {:?}",
-                endpoint.pending_events
+        let position = |needle: &str| events.iter().position(|event| event.contains(needle));
+        match (
+            position("ConnectionEstablished"),
+            position("PathEstablished"),
+            position("ConnectSettled"),
+        ) {
+            (Some(established), Some(path), Some(settled)) => assert!(
+                established < path && path < settled,
+                "expected ConnectionEstablished, PathEstablished, ConnectSettled: {events:?}"
             ),
-            _ => panic!(
-                "ConnectionEstablished then ConnectSettled missing after PathEstablished; pending {:?}",
-                endpoint.pending_events
-            ),
+            _ => panic!("missing connection, path, or terminal event: {events:?}"),
         }
     }
 
     #[cfg(feature = "nat")]
     #[test]
-    fn next_wake_returns_driver_progress_produced_by_timer_during_poll() {
+    fn wait_delivers_connect_timeout_with_an_active_driver() {
         use std::net::{IpAddr, Ipv4Addr};
 
         let mut endpoint = Endpoint::builder()
             .connect_deadline(Duration::from_millis(20))
             .nat_config(NatConfig::default())
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind NAT endpoint");
         let unreachable = PeerAddr::quic_v1(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -4540,13 +3476,12 @@ mod tests {
             Ed25519Keypair::generate().peer_id(),
         );
         let id = endpoint.connect(&unreachable).expect("start timed connect");
-        assert!(endpoint.take_nat_events().is_empty());
 
         let wake = endpoint
-            .next_wake(Duration::from_secs(1))
+            .wait(Duration::from_secs(1))
             .expect("wait for connect deadline");
         match wake {
-            EndpointWake::Event(Event::ConnectSettled {
+            EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
                 connect_id,
                 outcome: ConnectOutcome::Failed(ConnectFailure::Timeout { .. }),
                 ..
@@ -4559,7 +3494,9 @@ mod tests {
     #[test]
     fn discovery_clock_is_present_only_for_an_active_source() {
         let mut inactive = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind plain endpoint");
         assert_eq!(inactive.discovery_now_ms(), None);
 
@@ -4569,7 +3506,9 @@ mod tests {
         #[cfg(all(feature = "mdns", not(feature = "discovery")))]
         let builder = builder.mdns();
         let mut active = builder
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind discovery endpoint");
         let first = active.discovery_now_ms().expect("discovery clock");
         let second = active.discovery_now_ms().expect("discovery clock");
@@ -4599,7 +3538,9 @@ mod tests {
                 ..PeerDiscoveryConfig::default()
             })
             .expect("valid peer discovery policy")
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind mDNS endpoint");
         endpoint.listen().expect("QUIC listens");
         endpoint.shutdown().expect("first mDNS shutdown");
@@ -4621,7 +3562,9 @@ mod tests {
         let mut endpoint = Endpoint::builder()
             .discovery_config(config)
             .expect("valid discovery configuration")
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind discovery endpoint");
 
         assert!(matches!(
@@ -4634,55 +3577,15 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "discovery")]
-    #[test]
-    fn discovery_focused_waits_preserve_events_and_enforce_the_spin_guard() {
-        let mut endpoint = Endpoint::builder()
-            .discovery()
-            .bind_quic("127.0.0.1:0")
-            .expect("bind discovery endpoint");
-        let unrelated = Ed25519Keypair::generate().peer_id();
-
-        endpoint.pending_events.push_back(Event::ConnectionClosed {
-            peer_id: unrelated.clone(),
-            conn_id: ConnectionId::new(1),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
-        });
-        assert!(
-            endpoint
-                .next_discovery_event(Duration::from_millis(5))
-                .expect("discovery wait")
-                .is_none(),
-            "a buffered application event must not make next_discovery_event spin"
-        );
-        assert!(matches!(
-            endpoint
-                .next_event(Duration::from_millis(1))
-                .expect("drain buffered event"),
-            Some(Event::ConnectionClosed { peer_id, .. }) if peer_id == unrelated
-        ));
-
-        for _ in 0..RUN_UNTIL_SKIP_LIMIT {
-            endpoint.pending_events.push_back(Event::ConnectionClosed {
-                peer_id: unrelated.clone(),
-                conn_id: ConnectionId::new(1),
-                cause: minip2p_swarm::ConnectionCloseCause::Transport,
-            });
-        }
-        assert!(matches!(
-            endpoint.next_discovery_event(Deadline::NEVER),
-            Err(DiscoveryError::Driver(Error::EventBacklogExceeded { limit }))
-                if limit == RUN_UNTIL_SKIP_LIMIT
-        ));
-    }
-
     const PROTOCOL: &str = "/myapp/1.0.0";
 
     #[test]
     fn builder_protocol_registers_for_stream_routing() {
         let mut endpoint = Endpoint::builder()
             .protocol(PROTOCOL)
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind loopback endpoint");
 
         // A registered protocol fails with NotConnected for an unknown
@@ -4704,7 +3607,9 @@ mod tests {
         for reserved in RESERVED_PROTOCOL_IDS {
             let error = Endpoint::builder()
                 .protocol(reserved)
-                .bind_quic("127.0.0.1:0")
+                .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+                .expect("quic listen address")
+                .bind()
                 .err()
                 .expect("reserved ids must fail the build");
             assert!(matches!(
@@ -4720,7 +3625,10 @@ mod tests {
         // validation happens before any socket is allocated.
         let error = Endpoint::builder()
             .protocol(RESERVED_PROTOCOL_IDS[0])
-            .bind_quic("not-a-bindable-address")
+            // TEST-NET-1 is never a local address, so this bind would fail.
+            .listen_on("/ip4/192.0.2.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .err()
             .expect("reserved ids must fail the build");
         assert!(matches!(
@@ -4732,7 +3640,9 @@ mod tests {
     #[test]
     fn add_protocol_rejects_reserved_protocol_ids() {
         let mut endpoint = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind loopback endpoint");
         let error = endpoint
             .add_protocol(RESERVED_PROTOCOL_IDS[0])
@@ -4746,119 +3656,6 @@ mod tests {
             .expect("application ids must be accepted");
     }
 
-    #[cfg(feature = "nat")]
-    #[test]
-    fn nat_focused_waits_do_not_repoll_buffered_application_events() {
-        let mut endpoint = Endpoint::builder()
-            .nat_config(NatConfig::default())
-            .bind_quic("127.0.0.1:0")
-            .expect("bind endpoint");
-        let unrelated = Ed25519Keypair::generate().peer_id();
-
-        endpoint.pending_events.push_back(Event::ConnectionClosed {
-            peer_id: unrelated.clone(),
-            conn_id: ConnectionId::new(1),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
-        });
-        assert!(
-            endpoint
-                .next_nat_event(Duration::from_millis(5))
-                .expect("NAT wait")
-                .is_none(),
-            "a buffered application event must not make next_nat_event spin"
-        );
-        assert!(matches!(
-            endpoint
-                .next_event(Duration::from_millis(1))
-                .expect("drain buffered event"),
-            Some(Event::ConnectionClosed { peer_id, .. }) if peer_id == unrelated
-        ));
-
-        let id = endpoint
-            .connect(Ed25519Keypair::generate().peer_id())
-            .expect("connect");
-        match endpoint.pending_events.pop_front() {
-            Some(Event::ConnectSettled {
-                connect_id,
-                outcome: ConnectOutcome::Failed(_),
-                ..
-            }) => assert_eq!(connect_id, id),
-            other => panic!("expected immediate NoUsableRoute, got {other:?}"),
-        }
-        endpoint.pending_events.push_back(Event::ConnectionClosed {
-            peer_id: unrelated.clone(),
-            conn_id: ConnectionId::new(1),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
-        });
-        assert!(
-            endpoint
-                .nat_wait_path(id, Duration::from_millis(5))
-                .expect("path wait")
-                .is_none(),
-            "a buffered application event must not make nat_wait_path spin"
-        );
-        assert!(matches!(
-            endpoint
-                .next_event(Duration::from_millis(1))
-                .expect("drain buffered event"),
-            Some(Event::ConnectionClosed { peer_id, .. }) if peer_id == unrelated
-        ));
-
-        for _ in 0..RUN_UNTIL_SKIP_LIMIT {
-            endpoint.pending_events.push_back(Event::ConnectionClosed {
-                peer_id: unrelated.clone(),
-                conn_id: ConnectionId::new(1),
-                cause: minip2p_swarm::ConnectionCloseCause::Transport,
-            });
-        }
-        assert!(matches!(
-            endpoint.next_nat_event(Deadline::NEVER),
-            Err(Error::EventBacklogExceeded { limit }) if limit == RUN_UNTIL_SKIP_LIMIT
-        ));
-    }
-
-    #[cfg(feature = "pubsub")]
-    #[test]
-    fn gossipsub_focused_waits_do_not_repoll_buffered_application_events() {
-        let mut endpoint = Endpoint::builder()
-            .gossipsub()
-            .bind_quic("127.0.0.1:0")
-            .expect("bind endpoint");
-        let unrelated = Ed25519Keypair::generate().peer_id();
-
-        endpoint.pending_events.push_back(Event::ConnectionClosed {
-            peer_id: unrelated.clone(),
-            conn_id: ConnectionId::new(1),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
-        });
-        assert!(
-            endpoint
-                .next_gossipsub_event(Duration::ZERO)
-                .expect("pubsub wait")
-                .is_none(),
-            "a buffered application event must not make next_gossipsub_event spin"
-        );
-        assert!(matches!(
-            endpoint
-                .next_event(Duration::ZERO)
-                .expect("drain buffered event"),
-            Some(Event::ConnectionClosed { peer_id, .. }) if peer_id == unrelated
-        ));
-
-        for _ in 0..RUN_UNTIL_SKIP_LIMIT {
-            endpoint.pending_events.push_back(Event::ConnectionClosed {
-                peer_id: unrelated.clone(),
-                conn_id: ConnectionId::new(1),
-                cause: minip2p_swarm::ConnectionCloseCause::Transport,
-            });
-        }
-        assert!(matches!(
-            endpoint.next_gossipsub_event(Deadline::NEVER),
-            Err(GossipsubError::Driver(Error::EventBacklogExceeded { limit }))
-                if limit == RUN_UNTIL_SKIP_LIMIT
-        ));
-    }
-
     #[cfg(all(feature = "relay-server", feature = "tcp"))]
     #[test]
     fn relay_server_builder_is_order_independent_and_announce_does_not_enable() {
@@ -4867,14 +3664,18 @@ mod tests {
             .relay_server_announce_addrs(announce.clone())
             .expect("valid announce address")
             .relay_server()
-            .bind_tcp("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/tcp/0")
+            .expect("tcp listen address")
+            .bind()
             .expect("enabled relay server binds");
         assert!(endpoint.relay_server.is_some());
 
         let result = Endpoint::builder()
             .relay_server_announce_addrs(announce)
             .expect("valid announce address")
-            .bind_tcp("127.0.0.1:0");
+            .listen_on("/ip4/127.0.0.1/tcp/0")
+            .expect("tcp listen address")
+            .bind();
         let error = match result {
             Ok(_) => panic!("announce addresses alone must not enable the service"),
             Err(error) => error,
@@ -4926,7 +3727,9 @@ mod tests {
     #[test]
     fn relay_server_runtime_controls_are_typed_and_address_replacement_is_atomic() {
         let mut absent = Endpoint::builder()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind endpoint");
         assert!(matches!(
             absent.set_relay_server_accepting(false),
@@ -4938,7 +3741,9 @@ mod tests {
             .relay_server()
             .relay_server_announce_addrs(vec![original.clone()])
             .expect("valid initial address")
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind relay server");
         let invalid = "/ip4/0.0.0.0/udp/4002/quic-v1".parse().unwrap();
         let error = endpoint
@@ -4979,7 +3784,9 @@ mod tests {
     fn wildcard_listener_binds_without_becoming_a_relay_announce_address() {
         let endpoint = Endpoint::builder()
             .relay_server()
-            .bind_quic("0.0.0.0:0")
+            .listen_on("/ip4/0.0.0.0/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("wildcard listener may host once a usable address source appears");
         assert!(
             endpoint
@@ -4994,28 +3801,13 @@ mod tests {
 
     #[cfg(feature = "relay-server")]
     #[test]
-    fn relay_focused_wait_preserves_unrelated_events_and_wait_delivers_relay_events() {
+    fn wait_delivers_relay_server_events() {
         let mut endpoint = Endpoint::builder()
             .relay_server()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind relay server");
-        let unrelated = Ed25519Keypair::generate().peer_id();
-        endpoint.pending_events.push_back(Event::ConnectionClosed {
-            peer_id: unrelated.clone(),
-            conn_id: ConnectionId::new(1),
-            cause: minip2p_swarm::ConnectionCloseCause::Transport,
-        });
-        assert!(
-            endpoint
-                .next_relay_server_event(Duration::ZERO)
-                .expect("focused wait")
-                .is_none()
-        );
-        assert!(matches!(
-            endpoint.next_event(Duration::ZERO).expect("buffered event"),
-            Some(Event::ConnectionClosed { peer_id, .. }) if peer_id == unrelated
-        ));
-
         endpoint
             .relay_server
             .as_mut()
@@ -5027,10 +3819,13 @@ mod tests {
                 detail: "test diagnostic".into(),
             }));
         assert!(matches!(
-            endpoint.next_wake(Duration::ZERO).expect("queue wake"),
-            EndpointWake::Event(EndpointEvent::RelayServer(RelayServerEvent::Error(_)))
+            endpoint.wait(Duration::ZERO).expect("queue wait"),
+            EndpointWaitOutcome::Event(EndpointEvent::RelayServer(RelayServerEvent::Error(_)))
         ));
-        assert!(endpoint.take_relay_server_events().is_empty());
+        assert!(matches!(
+            endpoint.wait(Duration::ZERO).expect("drained wait"),
+            EndpointWaitOutcome::Deadline
+        ));
     }
 
     #[cfg(all(feature = "nat", feature = "relay-server"))]
@@ -5039,7 +3834,9 @@ mod tests {
         let mut endpoint = Endpoint::builder()
             .nat_config(NatConfig::default())
             .relay_server()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind combined endpoint");
         let nat_only: Multiaddr = "/ip4/203.0.113.1/udp/4001/quic-v1".parse().unwrap();
         let duplicate: Multiaddr = "/ip4/203.0.113.2/udp/4002/quic-v1".parse().unwrap();
@@ -5081,7 +3878,9 @@ mod tests {
     fn relay_refresh_preserves_caller_owned_swarm_external_addresses() {
         let mut endpoint = Endpoint::builder()
             .relay_server()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind relay endpoint");
         let caller_owned: Multiaddr = "/ip4/203.0.113.8/udp/4008/quic-v1".parse().unwrap();
         let relay_owned: Multiaddr = "/ip4/203.0.113.9/udp/4009/quic-v1".parse().unwrap();
@@ -5103,7 +3902,9 @@ mod tests {
     fn caller_keeps_an_address_after_the_matching_driver_contribution_clears() {
         let mut endpoint = Endpoint::builder()
             .relay_server()
-            .bind_quic("127.0.0.1:0")
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
             .expect("bind relay endpoint");
         let shared: Multiaddr = "/ip4/203.0.113.10/udp/4010/quic-v1".parse().unwrap();
         endpoint

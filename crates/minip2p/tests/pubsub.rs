@@ -6,7 +6,13 @@
 
 use std::time::{Duration, Instant};
 
-use minip2p::{Endpoint, Event, GossipsubConfig, GossipsubError, GossipsubEvent, TransportError};
+use minip2p::{
+    Endpoint, EndpointEvent, GossipsubConfig, GossipsubError, GossipsubEvent, TransportError,
+};
+
+#[path = "../../../tests/support/endpoint.rs"]
+mod endpoint_support;
+use endpoint_support::NextEvent;
 
 #[cfg(feature = "nat")]
 #[path = "../../../tests/support/relay.rs"]
@@ -17,7 +23,9 @@ const TOPIC: &str = "loopback-chat";
 fn pubsub_endpoint() -> Endpoint {
     Endpoint::builder()
         .gossipsub()
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind loopback endpoint")
 }
 
@@ -34,11 +42,11 @@ fn drive(endpoints: &mut [&mut Endpoint]) -> Vec<Vec<GossipsubEvent>> {
             .next_event(Duration::from_millis(20))
             .expect("endpoint drives")
         {
-            Some(Event::Gossipsub(event)) => events.push(event),
+            Some(EndpointEvent::Gossipsub(event)) => events.push(event),
             Some(event) => assert!(
                 !matches!(
                     &event,
-                    Event::StreamReady { protocol_id, .. }
+                    EndpointEvent::StreamReady { protocol_id, .. }
                         if is_gossipsub_protocol(protocol_id)
                 ),
                 "pubsub streams must be invisible to the app: {event:?}"
@@ -89,7 +97,7 @@ fn two_endpoints_exchange_messages_over_real_quic() {
 
     a.subscribe(TOPIC).expect("a subscribes");
     b.subscribe(TOPIC).expect("b subscribes");
-    a.dial(&b_addr).expect("a dials b");
+    a.connect(&b_addr).expect("a connects to b");
 
     // Both sides learn of each other's subscription first.
     drive_until(&mut [&mut a, &mut b], Duration::from_secs(15), |all| {
@@ -123,8 +131,8 @@ fn star_center_forwards_between_leaves() {
     hub.subscribe(TOPIC).expect("hub subscribes");
     alice.subscribe(TOPIC).expect("alice subscribes");
     bob.subscribe(TOPIC).expect("bob subscribes");
-    alice.dial(&hub_addr).expect("alice dials hub");
-    bob.dial(&hub_addr).expect("bob dials hub");
+    alice.connect(&hub_addr).expect("alice connects to hub");
+    bob.connect(&hub_addr).expect("bob connects to hub");
 
     // The hub must know both leaves' subscriptions, and each leaf the
     // hub's, before a publish can traverse the star.
@@ -170,7 +178,7 @@ fn unsubscribe_stops_delivery() {
 
     a.subscribe(TOPIC).expect("a subscribes");
     b.subscribe(TOPIC).expect("b subscribes");
-    a.dial(&b_addr).expect("a dials b");
+    a.connect(&b_addr).expect("a connects to b");
     drive_until(&mut [&mut a, &mut b], Duration::from_secs(15), |all| {
         saw_subscription(&all[0], TOPIC) && saw_subscription(&all[1], TOPIC)
     });
@@ -199,7 +207,9 @@ fn unsubscribe_stops_delivery() {
 #[test]
 fn pubsub_methods_error_when_not_enabled() {
     let mut plain = Endpoint::builder()
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind loopback endpoint");
     assert!(matches!(
         plain.subscribe(TOPIC),
@@ -209,11 +219,6 @@ fn pubsub_methods_error_when_not_enabled() {
         plain.publish(TOPIC, b"x".to_vec()),
         Err(GossipsubError::NotEnabled)
     ));
-    assert!(matches!(
-        plain.next_gossipsub_event(Duration::from_millis(1)),
-        Err(GossipsubError::NotEnabled)
-    ));
-    assert!(plain.take_gossipsub_events().is_empty());
 }
 
 #[test]
@@ -223,7 +228,10 @@ fn invalid_gossipsub_config_fails_before_transport_bind() {
             heartbeat_interval_ms: 0,
             ..GossipsubConfig::default()
         })
-        .bind_quic("not a socket address")
+        // TEST-NET-1 is never a local address, so this bind would fail.
+        .listen_on("/ip4/192.0.2.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .err()
         .expect("invalid pubsub config");
     assert!(matches!(
@@ -231,45 +239,6 @@ fn invalid_gossipsub_config_fails_before_transport_bind() {
         minip2p::Error::Transport(TransportError::InvalidConfig { ref reason })
             if reason.contains("heartbeat_interval_ms")
     ));
-}
-
-#[test]
-fn next_gossipsub_event_buffers_application_events() {
-    let mut a = pubsub_endpoint();
-    let mut b = pubsub_endpoint();
-    let b_addr = b.listen().expect("b listens");
-    a.listen().expect("a listens");
-
-    a.subscribe(TOPIC).expect("a subscribes");
-    b.subscribe(TOPIC).expect("b subscribes");
-    a.dial(&b_addr).expect("a dials b");
-
-    // Drive B in the background-ish loop while A waits specifically for a
-    // pubsub event; A's connection events must survive into next_event.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut got = None;
-    while got.is_none() {
-        assert!(Instant::now() < deadline, "no pubsub event in time");
-        got = a
-            .next_gossipsub_event(Duration::from_millis(20))
-            .expect("a waits");
-        let _ = b.next_event(Duration::from_millis(20)).expect("b drives");
-    }
-    assert!(matches!(got, Some(GossipsubEvent::PeerSubscribed { .. })));
-
-    // The ConnectionEstablished that arrived during the focused wait was
-    // buffered, not dropped.
-    let mut saw_connect = false;
-    let drain_deadline = Instant::now() + Duration::from_secs(5);
-    while !saw_connect && Instant::now() < drain_deadline {
-        if let Some(event) = a
-            .next_event(Duration::from_millis(20))
-            .expect("a drains buffered events")
-        {
-            saw_connect |= matches!(event, Event::ConnectionEstablished { .. });
-        }
-    }
-    assert!(saw_connect, "application events must be buffered, not lost");
 }
 
 #[cfg(feature = "nat")]
@@ -287,7 +256,9 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
             reservation_policy: ReservationPolicy::Always,
             ..NatConfig::default()
         })
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind responder");
     let b_addr = b.listen().expect("responder listens");
     let b_peer = b.peer_id().clone();
@@ -296,7 +267,7 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
     let reserve_deadline = Instant::now() + Duration::from_secs(10);
     loop {
         assert!(Instant::now() < reserve_deadline, "reservation timed out");
-        if let Some(Event::Nat(NatEvent::RelayReserved { relay, .. })) = b
+        if let Some(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) = b
             .next_event(Duration::from_millis(20))
             .expect("drive reservation")
             && &relay == relay_addr.peer_id()
@@ -314,7 +285,9 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
             reservation_policy: ReservationPolicy::Never,
             ..NatConfig::default()
         })
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind initiator");
     a.listen().expect("initiator listens");
     a.subscribe(TOPIC).expect("initiator subscribes");
@@ -343,7 +316,9 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
     // A direct connection supersedes the ready circuit. The public sequence
     // must close the old id before establishing the replacement, and the
     // pubsub driver must re-open and re-announce subscriptions.
-    a.dial(&b_addr).expect("manual direct upgrade");
+    // A raw swarm dial forces the direct replacement; `connect` would
+    // settle against the existing relayed connection.
+    a.swarm_mut().dial(&b_addr).expect("manual direct upgrade");
     let upgrade_deadline = Instant::now() + Duration::from_secs(15);
     let mut a_sequence = Vec::new();
     let mut a_resubscribed = false;
@@ -358,15 +333,15 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
             .expect("drive initiator upgrade")
         {
             match event {
-                Event::ConnectionClosed {
+                EndpointEvent::ConnectionClosed {
                     peer_id, conn_id, ..
                 } if peer_id == b_peer => {
                     a_sequence.push(("closed", conn_id));
                 }
-                Event::ConnectionEstablished { peer_id, conn_id } if peer_id == b_peer => {
+                EndpointEvent::ConnectionEstablished { peer_id, conn_id } if peer_id == b_peer => {
                     a_sequence.push(("established", conn_id));
                 }
-                Event::Gossipsub(GossipsubEvent::PeerSubscribed { topic, .. })
+                EndpointEvent::Gossipsub(GossipsubEvent::PeerSubscribed { topic, .. })
                     if topic == TOPIC =>
                 {
                     a_resubscribed = true;
@@ -374,7 +349,7 @@ fn pubsub_flows_over_relay_and_reannounces_after_direct_supersede() {
                 _ => {}
             }
         }
-        if let Some(Event::Gossipsub(GossipsubEvent::PeerSubscribed { topic, .. })) = b
+        if let Some(EndpointEvent::Gossipsub(GossipsubEvent::PeerSubscribed { topic, .. })) = b
             .next_event(Duration::from_millis(20))
             .expect("drive responder upgrade")
             && topic == TOPIC

@@ -2,7 +2,7 @@
 
 use minip2p::{
     ConnectFailure, ConnectOutcome, DiscoveryEvent, DiscoverySource as UpstreamDiscoverySource,
-    Event, GossipsubEvent, IdentifyMessage, Multiaddr, NatEvent, Path, ReachabilityState,
+    EndpointEvent, GossipsubEvent, IdentifyMessage, Multiaddr, NatEvent, Path, ReachabilityState,
 };
 use minip2p_swarm::SwarmErrorKind;
 
@@ -424,34 +424,36 @@ pub trait EventDoorbell: Send + Sync {
     fn on_events_ready(&self);
 }
 
-pub(crate) fn convert_swarm(event: Event) -> Option<P2pEvent> {
+pub(crate) fn convert_swarm(event: EndpointEvent) -> Option<P2pEvent> {
     Some(match event {
-        Event::ConnectionEstablished { peer_id, conn_id } => P2pEvent::ConnectionEstablished {
-            peer_id: peer_id.to_base58(),
-            conn_id: conn_id.as_u64(),
-        },
-        Event::ConnectionClosed {
+        EndpointEvent::ConnectionEstablished { peer_id, conn_id } => {
+            P2pEvent::ConnectionEstablished {
+                peer_id: peer_id.to_base58(),
+                conn_id: conn_id.as_u64(),
+            }
+        }
+        EndpointEvent::ConnectionClosed {
             peer_id, conn_id, ..
         } => P2pEvent::ConnectionClosed {
             peer_id: peer_id.to_base58(),
             conn_id: conn_id.as_u64(),
         },
-        Event::IdentifyReceived { peer_id, info } => P2pEvent::IdentifyReceived {
+        EndpointEvent::IdentifyReceived { peer_id, info } => P2pEvent::IdentifyReceived {
             peer_id: peer_id.to_base58(),
             info: convert_identify(&info),
         },
-        Event::PeerReady { peer_id, protocols } => P2pEvent::PeerReady {
+        EndpointEvent::PeerReady { peer_id, protocols } => P2pEvent::PeerReady {
             peer_id: peer_id.to_base58(),
             protocols,
         },
-        Event::PingRttMeasured { peer_id, rtt_ms } => P2pEvent::PingRttMeasured {
+        EndpointEvent::PingRttMeasured { peer_id, rtt_ms } => P2pEvent::PingRttMeasured {
             peer_id: peer_id.to_base58(),
             rtt_ms,
         },
-        Event::PingTimeout { peer_id } => P2pEvent::PingTimeout {
+        EndpointEvent::PingTimeout { peer_id } => P2pEvent::PingTimeout {
             peer_id: peer_id.to_base58(),
         },
-        Event::StreamReady {
+        EndpointEvent::StreamReady {
             peer_id,
             conn_id,
             stream_id,
@@ -464,7 +466,7 @@ pub(crate) fn convert_swarm(event: Event) -> Option<P2pEvent> {
             protocol_id,
             initiated_locally,
         },
-        Event::StreamData {
+        EndpointEvent::StreamData {
             peer_id,
             conn_id,
             stream_id,
@@ -475,7 +477,7 @@ pub(crate) fn convert_swarm(event: Event) -> Option<P2pEvent> {
             stream_id: stream_id.as_u64(),
             data,
         },
-        Event::StreamRemoteWriteClosed {
+        EndpointEvent::StreamRemoteWriteClosed {
             peer_id,
             conn_id,
             stream_id,
@@ -484,7 +486,7 @@ pub(crate) fn convert_swarm(event: Event) -> Option<P2pEvent> {
             conn_id: conn_id.as_u64(),
             stream_id: stream_id.as_u64(),
         },
-        Event::StreamClosed {
+        EndpointEvent::StreamClosed {
             peer_id,
             conn_id,
             stream_id,
@@ -493,7 +495,7 @@ pub(crate) fn convert_swarm(event: Event) -> Option<P2pEvent> {
             conn_id: conn_id.as_u64(),
             stream_id: stream_id.as_u64(),
         },
-        Event::Error(error) => P2pEvent::EndpointError {
+        EndpointEvent::Error(error) => P2pEvent::EndpointError {
             kind: convert_swarm_error_kind(error.kind),
             peer_id: error.peer_id.map(|peer| peer.to_base58()),
             conn_id: error.conn_id.map(|id| id.as_u64()),
@@ -509,17 +511,17 @@ pub(crate) fn convert_swarm(event: Event) -> Option<P2pEvent> {
 
 pub(crate) fn convert_endpoint_event(
     endpoint: &minip2p::Endpoint,
-    event: Event,
+    event: EndpointEvent,
 ) -> Option<P2pEvent> {
     match event {
-        Event::ConnectSettled {
+        EndpointEvent::ConnectSettled {
             connect_id,
             peer_id,
             outcome,
         } => convert_settled(connect_id, &peer_id, outcome, endpoint.path(&peer_id)),
-        Event::Nat(event) => convert_nat(event),
-        Event::Gossipsub(event) => Some(convert_gossipsub(event)),
-        Event::Discovery(event) => Some(convert_discovery(event)),
+        EndpointEvent::Nat(event) => convert_nat(event),
+        EndpointEvent::Gossipsub(event) => Some(convert_gossipsub(event)),
+        EndpointEvent::Discovery(event) => Some(convert_discovery(event)),
         other => convert_swarm(other),
     }
 }
@@ -775,7 +777,7 @@ mod tests {
         let remote = peer(3);
 
         assert_eq!(
-            convert_swarm(Event::ConnectionEstablished {
+            convert_swarm(EndpointEvent::ConnectionEstablished {
                 peer_id: remote.clone(),
                 conn_id: ConnectionId::new(17),
             }),
@@ -792,7 +794,7 @@ mod tests {
         let address =
             minip2p::Multiaddr::from_str("/ip4/127.0.0.1/udp/7/quic-v1").expect("address");
         assert_eq!(
-            convert_swarm(Event::IdentifyReceived {
+            convert_swarm(EndpointEvent::IdentifyReceived {
                 peer_id: remote.clone(),
                 info: minip2p::IdentifyMessage {
                     listen_addrs: vec![address.to_bytes()],
@@ -813,7 +815,7 @@ mod tests {
             })
         );
         assert_eq!(
-            convert_swarm(Event::StreamData {
+            convert_swarm(EndpointEvent::StreamData {
                 peer_id: remote.clone(),
                 conn_id: ConnectionId::new(8),
                 stream_id: StreamId::new(12),
@@ -832,7 +834,7 @@ mod tests {
     fn endpoint_error_conversion_preserves_stream_identity() {
         let remote = peer(9);
         assert_eq!(
-            convert_swarm(Event::Error(minip2p_swarm::SwarmRuntimeError {
+            convert_swarm(EndpointEvent::Error(minip2p_swarm::SwarmRuntimeError {
                 kind: SwarmErrorKind::UnsupportedProtocol,
                 peer_id: Some(remote.clone()),
                 conn_id: Some(ConnectionId::new(23)),

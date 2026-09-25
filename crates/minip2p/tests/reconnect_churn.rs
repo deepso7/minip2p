@@ -5,7 +5,11 @@
 
 use std::time::{Duration, Instant};
 
-use minip2p::{Ed25519Keypair, Endpoint, Event, PeerId};
+use minip2p::{Ed25519Keypair, Endpoint, EndpointEvent, PeerId};
+
+#[path = "../../../tests/support/endpoint.rs"]
+mod endpoint_support;
+use endpoint_support::NextEvent;
 
 const CHURN_ROUNDS: usize = 50;
 /// Must stay ≪ default `QuicLimits::idle_timeout_ms` (30s).
@@ -38,7 +42,9 @@ fn ping_until_rtt(listener: &mut Endpoint, dialer: &mut Endpoint, listener_peer:
             .next_event(Duration::from_millis(10))
             .expect("drive dialer ping")
         {
-            Some(Event::PingRttMeasured { peer_id, .. }) if peer_id == *listener_peer => return,
+            Some(EndpointEvent::PingRttMeasured { peer_id, .. }) if peer_id == *listener_peer => {
+                return;
+            }
             _ => {}
         }
         let _ = listener
@@ -68,7 +74,9 @@ fn assert_listener_reclaimed(listener: &mut Endpoint, dialer_peer: &PeerId, roun
 
 fn bind_loopback() -> Endpoint {
     Endpoint::builder()
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind loopback")
 }
 
@@ -81,7 +89,7 @@ fn listener_reclaims_state_after_dialer_drop_without_disconnect() {
     for round in 0..CHURN_ROUNDS {
         let mut dialer = bind_loopback();
         let dialer_peer = dialer.peer_id().clone();
-        dialer.dial(&listener_addr).expect("dial listener");
+        dialer.connect(&listener_addr).expect("connect to listener");
 
         wait_peer_ready(&mut listener, &mut dialer, &listener_peer, &dialer_peer);
         ping_until_rtt(&mut listener, &mut dialer, &listener_peer);
@@ -100,7 +108,7 @@ fn listener_reclaims_state_after_dialer_close() {
 
     let mut dialer = bind_loopback();
     let dialer_peer = dialer.peer_id().clone();
-    dialer.dial(&listener_addr).expect("dial listener");
+    dialer.connect(&listener_addr).expect("connect to listener");
     wait_peer_ready(&mut listener, &mut dialer, &listener_peer, &dialer_peer);
     ping_until_rtt(&mut listener, &mut dialer, &listener_peer);
 
@@ -129,7 +137,7 @@ fn listener_reclaims_state_after_dialer_close() {
     assert!(
         events.iter().any(|event| matches!(
             event,
-            Event::ConnectionClosed { peer_id, .. } if peer_id == &listener_peer
+            EndpointEvent::ConnectionClosed { peer_id, .. } if peer_id == &listener_peer
         )),
         "close must surface ConnectionClosed rather than relying on Drop: {events:?}"
     );
@@ -143,7 +151,7 @@ fn listener_reclaims_state_after_dialer_drop_during_handshake() {
 
     let mut dialer = bind_loopback();
     let dialer_peer = dialer.peer_id().clone();
-    dialer.dial(&listener_addr).expect("dial listener");
+    dialer.connect(&listener_addr).expect("connect to listener");
 
     // Do not wait for Identify; the connection may still be handshaking.
     for _ in 0..8 {
@@ -168,19 +176,25 @@ fn close_drains_replacement_connection() {
     let dialer_key = Ed25519Keypair::generate();
     let mut dialer = Endpoint::builder()
         .identity(dialer_key.clone())
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind first dialer");
     let dialer_peer = dialer.peer_id().clone();
-    dialer.dial(&listener_addr).expect("dial listener");
+    dialer.connect(&listener_addr).expect("connect to listener");
     wait_peer_ready(&mut listener, &mut dialer, &listener_peer, &dialer_peer);
 
     // Queue a same-peer handshake without polling the listener, so close()
     // is the first drive that can supersede and establish the replacement.
     let mut replacement = Endpoint::builder()
         .identity(dialer_key)
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind replacement dialer");
-    replacement.dial(&listener_addr).expect("redial listener");
+    replacement
+        .connect(&listener_addr)
+        .expect("reconnect to listener");
     for _ in 0..8 {
         let _ = replacement
             .next_event(Duration::from_millis(10))
@@ -210,7 +224,9 @@ fn close_drains_replacement_connection() {
     let established: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            Event::ConnectionEstablished { peer_id, conn_id } if peer_id == &dialer_peer => {
+            EndpointEvent::ConnectionEstablished { peer_id, conn_id }
+                if peer_id == &dialer_peer =>
+            {
                 Some(*conn_id)
             }
             _ => None,
@@ -224,7 +240,7 @@ fn close_drains_replacement_connection() {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                Event::ConnectionClosed { peer_id, conn_id: closed, .. }
+                EndpointEvent::ConnectionClosed { peer_id, conn_id: closed, .. }
                     if peer_id == &dialer_peer && *closed == conn_id
             )),
             "close must drain the replacement {conn_id:?}: {events:?}"
@@ -241,17 +257,23 @@ fn close_drains_pending_replacement_handshake() {
     let dialer_key = Ed25519Keypair::generate();
     let mut dialer = Endpoint::builder()
         .identity(dialer_key.clone())
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind first dialer");
     let dialer_peer = dialer.peer_id().clone();
-    dialer.dial(&listener_addr).expect("dial listener");
+    dialer.connect(&listener_addr).expect("connect to listener");
     wait_peer_ready(&mut listener, &mut dialer, &listener_peer, &dialer_peer);
 
     let mut replacement = Endpoint::builder()
         .identity(dialer_key)
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind replacement dialer");
-    replacement.dial(&listener_addr).expect("redial listener");
+    replacement
+        .connect(&listener_addr)
+        .expect("reconnect to listener");
     for _ in 0..4 {
         let _ = replacement
             .next_event(Duration::from_millis(10))
@@ -286,7 +308,9 @@ fn close_drains_pending_replacement_handshake() {
     let established: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            Event::ConnectionEstablished { peer_id, conn_id } if peer_id == &dialer_peer => {
+            EndpointEvent::ConnectionEstablished { peer_id, conn_id }
+                if peer_id == &dialer_peer =>
+            {
                 Some(*conn_id)
             }
             _ => None,
@@ -300,7 +324,7 @@ fn close_drains_pending_replacement_handshake() {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                Event::ConnectionClosed { peer_id, conn_id: closed, .. }
+                EndpointEvent::ConnectionClosed { peer_id, conn_id: closed, .. }
                     if peer_id == &dialer_peer && *closed == conn_id
             )),
             "close must drain the pending replacement {conn_id:?}: {events:?}"

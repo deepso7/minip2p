@@ -6,9 +6,13 @@
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    ConnectFailure, ConnectId, ConnectOutcome, ConnectionId, Endpoint, Event, NatConfig, NatEvent,
-    Path, PeerId, ReservationPolicy,
+    ConnectFailure, ConnectId, ConnectOutcome, ConnectionId, Endpoint, EndpointEvent, NatConfig,
+    NatEvent, Path, PeerId, ReservationPolicy,
 };
+
+#[path = "../../../tests/support/endpoint.rs"]
+mod endpoint_support;
+use endpoint_support::NextEvent;
 
 #[path = "../../../tests/support/relay.rs"]
 mod relay_support;
@@ -18,7 +22,9 @@ const ECHO_PROTOCOL: &str = "/minip2p/tests/nat-echo/1.0.0";
 fn nat_endpoint() -> Endpoint {
     Endpoint::builder()
         .nat_config(NatConfig::default())
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind loopback endpoint")
 }
 
@@ -26,7 +32,9 @@ fn nat_endpoint() -> Endpoint {
 fn direct_candidate_wins_over_loopback() {
     let mut a = nat_endpoint();
     let mut b = Endpoint::builder()
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind loopback endpoint");
 
     let b_addr = b.listen().expect("b listens");
@@ -42,7 +50,7 @@ fn direct_candidate_wins_over_loopback() {
     while path.is_none() || settled.is_none() {
         assert!(Instant::now() < deadline, "direct connect timed out");
         let event = a.next_event(Duration::from_millis(20)).expect("a drives");
-        if let Some(Event::ConnectSettled {
+        if let Some(EndpointEvent::ConnectSettled {
             connect_id,
             outcome,
             ..
@@ -96,7 +104,7 @@ fn connect_without_candidates_or_relay_fails_fast() {
         .next_event(Duration::from_secs(1))
         .expect("connect settles without I/O");
     match event {
-        Some(Event::ConnectSettled {
+        Some(EndpointEvent::ConnectSettled {
             connect_id,
             outcome: ConnectOutcome::Failed(failure),
             ..
@@ -116,53 +124,18 @@ fn connect_without_candidates_or_relay_fails_fast() {
 }
 
 #[test]
-fn nat_wait_path_buffers_application_events() {
+fn waiting_for_peer_ready_drives_the_nat_agent() {
     let mut a = nat_endpoint();
     let mut b = Endpoint::builder()
-        .bind_quic("127.0.0.1:0")
-        .expect("bind loopback endpoint");
-    let b_addr = b.listen().expect("b listens");
-    a.listen().expect("a listens");
-
-    let id = a.connect(&b_addr).expect("connect starts");
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut path = None;
-    while path.is_none() {
-        assert!(Instant::now() < deadline, "direct connect timed out");
-        path = a
-            .nat_wait_path(id, Duration::from_millis(20))
-            .expect("a waits");
-        let _ = b.next_event(Duration::from_millis(20)).expect("b drives");
-    }
-    assert!(matches!(path, Some(Path::DirectDialed)));
-
-    // The swarm events observed during the wait (ConnectionEstablished,
-    // PeerReady, ...) were buffered, not swallowed.
-    let mut saw_connection = false;
-    while let Some(event) = a.next_event(Duration::from_millis(50)).expect("drain") {
-        if matches!(event, minip2p::Event::ConnectionEstablished { .. }) {
-            saw_connection = true;
-            break;
-        }
-    }
-    assert!(
-        saw_connection,
-        "application events must survive nat_wait_path"
-    );
-}
-
-#[test]
-fn wait_peer_ready_drives_nat_agent() {
-    let mut a = nat_endpoint();
-    let mut b = Endpoint::builder()
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind loopback endpoint");
     let b_addr = b.listen().expect("b listens");
     a.listen().expect("a listens");
 
     // The endpoint wait drives only `a`, so keep the remote's socket serviced
-    // concurrently. `wait_peer_ready` must feed ConnectionEstablished to
-    // the NAT agent on the way to the matching PeerReady event.
+    // concurrently.
     let (stop_remote, remote_stop) = std::sync::mpsc::channel();
     let remote = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -177,23 +150,27 @@ fn wait_peer_ready_drives_nat_agent() {
     });
 
     let id = a.connect(&b_addr).expect("connect starts");
-    let ready = a
-        .wait_peer_ready(b_addr.peer_id(), Duration::from_secs(10))
-        .expect("wait succeeds");
-    assert!(
-        matches!(ready, Some(minip2p::Event::PeerReady { peer_id, .. }) if peer_id == *b_addr.peer_id())
-    );
-
-    let events = a.take_nat_events();
+    // Waiting for PeerReady must feed ConnectionEstablished to the NAT agent
+    // on the way; its path event arrives on the same stream.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut events = Vec::new();
+    loop {
+        assert!(Instant::now() < deadline, "no PeerReady: {events:?}");
+        match a.next_event(deadline).expect("a waits") {
+            Some(EndpointEvent::PeerReady { peer_id, .. }) if peer_id == *b_addr.peer_id() => break,
+            Some(event) => events.push(event),
+            None => {}
+        }
+    }
     assert!(
         events.iter().any(|event| {
             matches!(
                 event,
-                NatEvent::PathEstablished { connect_id, path: Path::DirectDialed, .. }
+                EndpointEvent::Nat(NatEvent::PathEstablished { connect_id, path: Path::DirectDialed, .. })
                     if *connect_id == id
             )
         }),
-        "wait_peer_ready must deliver ConnectionEstablished to NAT: {events:?}"
+        "the endpoint must deliver ConnectionEstablished to NAT: {events:?}"
     );
     match stop_remote.send(()) {
         Ok(()) | Err(_) => {}
@@ -214,7 +191,9 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
             reservation_policy: ReservationPolicy::Always,
             ..NatConfig::default()
         })
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind responder");
     responder.listen().expect("responder listens");
     let responder_peer = responder.peer_id().clone();
@@ -225,7 +204,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
             Instant::now() < reservation_deadline,
             "responder did not reserve on relay"
         );
-        if let Some(Event::Nat(NatEvent::RelayReserved { relay, .. })) = responder
+        if let Some(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) = responder
             .next_event(Duration::from_millis(20))
             .expect("drive responder reservation")
             && &relay == relay_addr.peer_id()
@@ -243,7 +222,9 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
             reservation_policy: ReservationPolicy::Never,
             ..NatConfig::default()
         })
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind initiator");
     initiator.listen().expect("initiator listens");
     let initiator_peer = initiator.peer_id().clone();
@@ -272,7 +253,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
             .expect("drive initiator")
         {
             trace.push(format!("initiator swarm: {event:?}"));
-            if let Event::ConnectSettled {
+            if let EndpointEvent::ConnectSettled {
                 connect_id: found,
                 outcome,
                 ..
@@ -329,7 +310,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
     let mut ping_rtt = None;
     while ping_rtt.is_none() {
         assert!(Instant::now() < ping_deadline, "circuit ping timed out");
-        if let Some(Event::PingRttMeasured { peer_id, rtt_ms }) = initiator
+        if let Some(EndpointEvent::PingRttMeasured { peer_id, rtt_ms }) = initiator
             .next_event(Duration::from_millis(20))
             .expect("drive initiator ping")
             && peer_id == responder_peer
@@ -357,7 +338,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
             .expect("drive initiator echo")
         {
             match event {
-                Event::StreamReady {
+                EndpointEvent::StreamReady {
                     peer_id,
                     stream_id,
                     initiated_locally: true,
@@ -368,7 +349,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
                         .send_stream(&responder_peer, stream, payload.clone())
                         .expect("send echo payload");
                 }
-                Event::StreamData {
+                EndpointEvent::StreamData {
                     peer_id,
                     stream_id,
                     data,
@@ -382,7 +363,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
             .expect("drive responder echo")
         {
             match event {
-                Event::StreamReady {
+                EndpointEvent::StreamReady {
                     peer_id,
                     stream_id,
                     initiated_locally: false,
@@ -391,7 +372,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
                 } if peer_id == initiator_peer && protocol_id == ECHO_PROTOCOL => {
                     responder_stream = Some(stream_id);
                 }
-                Event::StreamData {
+                EndpointEvent::StreamData {
                     peer_id,
                     stream_id,
                     data,
@@ -418,7 +399,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
             Instant::now() < close_deadline,
             "circuit did not close after relay cut"
         );
-        if let Some(Event::ConnectionClosed {
+        if let Some(EndpointEvent::ConnectionClosed {
             peer_id, conn_id, ..
         }) = initiator
             .next_event(Duration::from_millis(20))
@@ -428,7 +409,7 @@ fn relay_promotion_runs_identify_ping_and_protocol_then_closes_on_relay_cut() {
         {
             initiator_closed = true;
         }
-        if let Some(Event::ConnectionClosed {
+        if let Some(EndpointEvent::ConnectionClosed {
             peer_id, conn_id, ..
         }) = responder
             .next_event(Duration::from_millis(20))
@@ -465,7 +446,9 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
             reservation_policy: ReservationPolicy::Always,
             ..NatConfig::default()
         })
-        .bind_tcp("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/tcp/0")
+        .expect("tcp listen address")
+        .bind()
         .expect("bind responder");
     responder.listen().expect("responder listens");
     let responder_peer = responder.peer_id().clone();
@@ -476,7 +459,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
             Instant::now() < reservation_deadline,
             "responder did not reserve on the TCP relay"
         );
-        if let Some(Event::Nat(NatEvent::RelayReserved { relay, .. })) = responder
+        if let Some(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) = responder
             .next_event(Duration::from_millis(20))
             .expect("drive responder reservation")
             && &relay == relay_addr.peer_id()
@@ -494,7 +477,9 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
             reservation_policy: ReservationPolicy::Never,
             ..NatConfig::default()
         })
-        .bind_tcp("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/tcp/0")
+        .expect("tcp listen address")
+        .bind()
         .expect("bind initiator");
     initiator.listen().expect("initiator listens");
     let initiator_peer = initiator.peer_id().clone();
@@ -519,7 +504,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
             .next_event(Duration::from_millis(20))
             .expect("drive initiator")
         {
-            if let Event::ConnectSettled {
+            if let EndpointEvent::ConnectSettled {
                 connect_id: found,
                 outcome: ConnectOutcome::Connected { conn_id },
                 ..
@@ -597,7 +582,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
     let mut ping_rtt = None;
     while ping_rtt.is_none() {
         assert!(Instant::now() < ping_deadline, "circuit ping timed out");
-        if let Some(Event::PingRttMeasured { peer_id, .. }) = initiator
+        if let Some(EndpointEvent::PingRttMeasured { peer_id, .. }) = initiator
             .next_event(Duration::from_millis(20))
             .expect("drive initiator ping")
             && peer_id == responder_peer
@@ -626,7 +611,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
             .expect("drive initiator echo")
         {
             match event {
-                Event::StreamReady {
+                EndpointEvent::StreamReady {
                     peer_id,
                     stream_id,
                     initiated_locally: true,
@@ -636,7 +621,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
                         .send_stream(&responder_peer, stream, payload.clone())
                         .expect("send echo payload");
                 }
-                Event::StreamData {
+                EndpointEvent::StreamData {
                     peer_id,
                     stream_id,
                     data,
@@ -650,7 +635,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
             .expect("drive responder echo")
         {
             match event {
-                Event::StreamReady {
+                EndpointEvent::StreamReady {
                     peer_id,
                     stream_id,
                     initiated_locally: false,
@@ -659,7 +644,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
                 } if peer_id == initiator_peer && protocol_id == ECHO_PROTOCOL => {
                     responder_stream = Some(stream_id);
                 }
-                Event::StreamData {
+                EndpointEvent::StreamData {
                     peer_id,
                     stream_id,
                     data,
@@ -689,7 +674,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
             Instant::now() < close_deadline,
             "circuit did not close after the TCP relay was cut"
         );
-        if let Some(Event::ConnectionClosed {
+        if let Some(EndpointEvent::ConnectionClosed {
             peer_id, conn_id, ..
         }) = initiator
             .next_event(Duration::from_millis(20))
@@ -699,7 +684,7 @@ fn a_tcp_relay_carries_a_circuit_and_the_traffic_on_it() {
         {
             initiator_closed = true;
         }
-        if let Some(Event::ConnectionClosed {
+        if let Some(EndpointEvent::ConnectionClosed {
             peer_id, conn_id, ..
         }) = responder
             .next_event(Duration::from_millis(20))
@@ -725,7 +710,9 @@ fn cancel_mid_relay_leg_emits_cancelled_and_closes_circuits() {
             reservation_policy: ReservationPolicy::Always,
             ..NatConfig::default()
         })
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind responder");
     responder.listen().expect("responder listens");
     let responder_peer = responder.peer_id().clone();
@@ -736,7 +723,7 @@ fn cancel_mid_relay_leg_emits_cancelled_and_closes_circuits() {
             Instant::now() < reservation_deadline,
             "responder did not reserve on relay"
         );
-        if let Some(Event::Nat(NatEvent::RelayReserved { relay, .. })) = responder
+        if let Some(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) = responder
             .next_event(Duration::from_millis(20))
             .expect("drive responder reservation")
             && &relay == relay_addr.peer_id()
@@ -753,7 +740,9 @@ fn cancel_mid_relay_leg_emits_cancelled_and_closes_circuits() {
             reservation_policy: ReservationPolicy::Never,
             ..NatConfig::default()
         })
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind initiator");
     initiator.listen().expect("initiator listens");
     let id = initiator
@@ -765,7 +754,7 @@ fn cancel_mid_relay_leg_emits_cancelled_and_closes_circuits() {
     let mut cancelled = false;
     while !cancelled {
         assert!(Instant::now() < deadline, "cancel did not settle");
-        if let Some(Event::ConnectSettled {
+        if let Some(EndpointEvent::ConnectSettled {
             connect_id,
             outcome: ConnectOutcome::Cancelled,
             ..
@@ -787,8 +776,13 @@ fn cancel_mid_relay_leg_emits_cancelled_and_closes_circuits() {
 }
 
 /// Records the first NAT path the Endpoint event stream reports for `id`.
-fn observe_path_event(event: &Event, id: ConnectId, remote: &PeerId, path: &mut Option<Path>) {
-    if let Event::Nat(NatEvent::PathEstablished {
+fn observe_path_event(
+    event: &EndpointEvent,
+    id: ConnectId,
+    remote: &PeerId,
+    path: &mut Option<Path>,
+) {
+    if let EndpointEvent::Nat(NatEvent::PathEstablished {
         connect_id,
         peer,
         path: found,
@@ -802,16 +796,16 @@ fn observe_path_event(event: &Event, id: ConnectId, remote: &PeerId, path: &mut 
 }
 
 fn observe_circuit_event(
-    event: Event,
+    event: EndpointEvent,
     remote: &PeerId,
     circuit: &mut Option<ConnectionId>,
     ready: &mut bool,
 ) {
     match event {
-        Event::ConnectionEstablished { peer_id, conn_id } if peer_id == *remote => {
+        EndpointEvent::ConnectionEstablished { peer_id, conn_id } if peer_id == *remote => {
             *circuit = Some(conn_id);
         }
-        Event::PeerReady { peer_id, protocols } if peer_id == *remote => {
+        EndpointEvent::PeerReady { peer_id, protocols } if peer_id == *remote => {
             assert!(protocols.iter().any(|protocol| protocol == ECHO_PROTOCOL));
             *ready = true;
         }

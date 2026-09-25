@@ -266,7 +266,7 @@ fn portable_nat_rejects_an_empty_policy() {
             Wire::default().dialer_device(),
             &format!("{DIALER_IP}/24"),
         ))
-        .portable_nat_config(minip2p::NatConfig::default())
+        .nat_config(minip2p::NatConfig::default())
         .build();
     let error = match result {
         Ok(_) => panic!("empty portable NAT policy must be invalid"),
@@ -302,7 +302,7 @@ fn portable_autonat_rejects_relay_addresses_without_relay_support() {
             Wire::default().dialer_device(),
             &format!("{DIALER_IP}/24"),
         ))
-        .portable_nat_config(config)
+        .nat_config(config)
         .build();
     let error = match result {
         Ok(_) => panic!("relay addresses must require portable-relay"),
@@ -337,7 +337,7 @@ fn portable_autonat_rejects_reservation_policy_without_a_relay() {
             Wire::default().dialer_device(),
             &format!("{DIALER_IP}/24"),
         ))
-        .portable_nat_config(config)
+        .nat_config(config)
         .build();
     let error = match result {
         Ok(_) => panic!("reservation policy without a relay must be invalid"),
@@ -378,8 +378,11 @@ fn portable_endpoints_complete_the_embedded_tcp_stack() {
         .expect("valid listen address");
     let bound = listener.listen(&listen).expect("listener binds");
     dialer
-        .dial(&PeerAddr::new(bound, listener_peer.clone()).expect("valid peer address"))
-        .expect("dial starts");
+        .connect(
+            PeerAddr::new(bound, listener_peer.clone()).expect("valid peer address"),
+            Now::from_millis(0),
+        )
+        .expect("connect starts");
 
     let mut now_ms = 0;
     let mut dialer_events = Vec::new();
@@ -655,14 +658,15 @@ fn portable_pubsub_delivers_over_the_composed_smoltcp_endpoint() {
         .expect("a subscribes");
     b.subscribe(TOPIC, Now::from_millis(0))
         .expect("b subscribes");
-    a.dial(
-        &PeerAddr::new(
+    a.connect(
+        PeerAddr::new(
             format!("/ip4/{LISTENER_IP}/tcp/4001").parse().unwrap(),
             b_peer.clone(),
         )
         .unwrap(),
+        Now::from_millis(0),
     )
-    .expect("dial starts");
+    .expect("connect starts");
 
     let mut now_ms = 0;
     let mut published = false;
@@ -746,12 +750,13 @@ fn signed_beacons_populate_discovery_without_mdns() {
         .discovery()
         .build()
         .expect("b endpoint builds");
-    a.dial(
-        &PeerAddr::new(
+    a.connect(
+        PeerAddr::new(
             format!("/ip4/{LISTENER_IP}/tcp/4001").parse().unwrap(),
             b_peer.clone(),
         )
         .unwrap(),
+        Now::from_millis(0),
     )
     .expect("bootstrap dial starts");
 

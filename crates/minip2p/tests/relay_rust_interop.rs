@@ -6,7 +6,11 @@ use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
-use minip2p::{Endpoint, RelayServerConfig, RelayServerEvent};
+use minip2p::{Endpoint, EndpointEvent, RelayServerConfig, RelayServerEvent};
+
+#[path = "../../../tests/support/endpoint.rs"]
+mod endpoint_support;
+use endpoint_support::NextEvent;
 
 struct ChildGuard(Child);
 
@@ -32,7 +36,9 @@ fn pinned_rust_libp2p_reserves_connects_and_exchanges_bytes() {
     let mut relay = Endpoint::builder()
         .relay_server_config(config)
         .unwrap()
-        .bind_tcp("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/tcp/0")
+        .expect("tcp listen address")
+        .bind()
         .unwrap();
     let relay_addr = relay.listen().unwrap().to_string();
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -80,9 +86,8 @@ fn pinned_rust_libp2p_reserves_connects_and_exchanges_bytes() {
     let mut opened = false;
     let mut bidirectional = false;
     loop {
-        if let Some(event) = relay
-            .next_relay_server_event(Duration::from_millis(100))
-            .unwrap()
+        if let Some(EndpointEvent::RelayServer(event)) =
+            relay.next_event(Duration::from_millis(100)).unwrap()
         {
             match event {
                 RelayServerEvent::ReservationAccepted { .. } => reserved = true,
@@ -117,9 +122,8 @@ fn pinned_rust_libp2p_reserves_connects_and_exchanges_bytes() {
     }
     // Drive closure/accounting after the foreign process exits.
     for _ in 0..20 {
-        if let Some(RelayServerEvent::CircuitClosed { bytes, .. }) = relay
-            .next_relay_server_event(Duration::from_millis(100))
-            .unwrap()
+        if let Some(EndpointEvent::RelayServer(RelayServerEvent::CircuitClosed { bytes, .. })) =
+            relay.next_event(Duration::from_millis(100)).unwrap()
         {
             bidirectional = bytes.source_to_destination > 0 && bytes.destination_to_source > 0;
             break;

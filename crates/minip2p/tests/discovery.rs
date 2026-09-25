@@ -5,9 +5,13 @@
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BeaconConfig, ConnectOutcome, DiscoveryEvent, Endpoint, Event, GossipsubConfig, GossipsubEvent,
+    BeaconConfig, ConnectOutcome, Endpoint, EndpointEvent, GossipsubConfig, GossipsubEvent,
     PeerDiscoveryConfig,
 };
+
+#[path = "../../../tests/support/endpoint.rs"]
+mod endpoint_support;
+use endpoint_support::NextEvent;
 
 const DISCOVERY_TOPIC: &str = "/minip2p/test/loopback-discovery";
 
@@ -25,7 +29,9 @@ fn discovery_endpoint() -> Endpoint {
             ..PeerDiscoveryConfig::default()
         })
         .expect("valid peer discovery config")
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind loopback endpoint")
 }
 
@@ -47,13 +53,15 @@ fn slow_heartbeat_discovery_endpoint() -> Endpoint {
             ..PeerDiscoveryConfig::default()
         })
         .expect("valid peer discovery config")
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind loopback endpoint")
 }
 
 /// Fails if an Endpoint event carries discovery-owned beacon-topic traffic.
-fn assert_no_discovery_gossipsub(event: Option<Event>) {
-    let Some(Event::Gossipsub(event)) = event else {
+fn assert_no_discovery_gossipsub(event: Option<EndpointEvent>) {
+    let Some(EndpointEvent::Gossipsub(event)) = event else {
         return;
     };
     let leaked = match &event {
@@ -85,7 +93,7 @@ fn beacons_do_not_leak_to_the_application() {
     let b_addr = b.listen().expect("b listens");
     let a_peer = a.peer_id().clone();
     let b_peer = b.peer_id().clone();
-    a.dial(&b_addr).expect("a dials b");
+    a.connect(&b_addr).expect("a connects to b");
 
     let deadline = Instant::now() + Duration::from_secs(15);
     while a.known_peers().iter().all(|known| known.peer != b_peer)
@@ -123,8 +131,8 @@ fn star_beacons_relay_before_the_first_gossipsub_heartbeat() {
     let hub_peer = hub.peer_id().clone();
     let a_peer = a.peer_id().clone();
     let b_peer = b.peer_id().clone();
-    a.dial(&hub_addr).expect("a dials hub");
-    b.dial(&hub_addr).expect("b dials hub");
+    a.connect(&hub_addr).expect("a connects to hub");
+    b.connect(&hub_addr).expect("b connects to hub");
 
     let deadline = Instant::now() + Duration::from_secs(15);
     while a.known_peers().iter().all(|known| known.peer != b_peer)
@@ -150,48 +158,6 @@ fn star_beacons_relay_before_the_first_gossipsub_heartbeat() {
 }
 
 #[test]
-fn next_discovery_event_buffers_application_events() {
-    let mut a = discovery_endpoint();
-    let mut b = discovery_endpoint();
-    a.listen().expect("a listens");
-    let b_addr = b.listen().expect("b listens");
-    let b_peer = b.peer_id().clone();
-    a.dial(&b_addr).expect("a dials b");
-
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let discovered = loop {
-        assert!(Instant::now() < deadline, "discovery event timed out");
-        if let Some(event) = a
-            .next_discovery_event(Duration::from_millis(20))
-            .expect("focused discovery wait")
-        {
-            break event;
-        }
-        let _ = b.next_event(Duration::from_millis(20)).expect("b drives");
-    };
-    assert!(matches!(
-        discovered,
-        DiscoveryEvent::PeerDiscovered { peer, .. } if peer == b_peer
-    ));
-
-    let drain_deadline = Instant::now() + Duration::from_secs(5);
-    let mut saw_connection = false;
-    while !saw_connection && Instant::now() < drain_deadline {
-        if let Some(event) = a
-            .next_event(Duration::from_millis(20))
-            .expect("drain buffered application event")
-        {
-            saw_connection = matches!(event, Event::ConnectionEstablished { .. });
-        }
-        let _ = b.next_event(Duration::from_millis(20)).expect("b drives");
-    }
-    assert!(
-        saw_connection,
-        "focused wait must preserve connection events"
-    );
-}
-
-#[test]
 fn connect_uses_known_discovery_book_addresses() {
     let mut hub = slow_heartbeat_discovery_endpoint();
     let mut a = slow_heartbeat_discovery_endpoint();
@@ -201,8 +167,8 @@ fn connect_uses_known_discovery_book_addresses() {
     b.listen().expect("b listens");
     let a_peer = a.peer_id().clone();
     let b_peer = b.peer_id().clone();
-    a.dial(&hub_addr).expect("a dials hub");
-    b.dial(&hub_addr).expect("b dials hub");
+    a.connect(&hub_addr).expect("a connects to hub");
+    b.connect(&hub_addr).expect("b connects to hub");
 
     let deadline = Instant::now() + Duration::from_secs(15);
     while a.known_peers().iter().all(|known| known.peer != b_peer)
@@ -231,7 +197,7 @@ fn connect_uses_known_discovery_book_addresses() {
             Instant::now() < connect_deadline,
             "connect via discovery book timed out"
         );
-        if let Some(Event::ConnectSettled {
+        if let Some(EndpointEvent::ConnectSettled {
             connect_id,
             outcome,
             ..

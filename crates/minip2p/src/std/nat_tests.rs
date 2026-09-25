@@ -7,9 +7,10 @@ use minip2p_transport::Transport;
 use minip2p_transport::{ConnectionId, StreamId};
 use std::time::Instant;
 type NatDriver = crate::nat::NatDriver<StdEntropy>;
+use super::NextEvent;
 #[cfg(all(feature = "quic", feature = "relay-server"))]
 use crate::QuicLimits;
-use crate::{Ed25519Keypair, Endpoint, Event, NatConfig, ReachabilityState};
+use crate::{Ed25519Keypair, Endpoint, EndpointEvent, NatConfig, ReachabilityState};
 use minip2p_nat::{NatToken, ReservationPolicy};
 use minip2p_relay::{HOP_PROTOCOL_ID, HopMessage, HopMessageType, Status, encode_frame};
 
@@ -27,16 +28,20 @@ fn negotiated_bridge() -> BridgePair {
     let mut relay = Endpoint::builder()
         .identity(Ed25519Keypair::from_secret_key_bytes([72; 32]))
         .protocol(HOP_PROTOCOL_ID)
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind relay");
     let relay_addr = relay.listen().expect("relay listens");
     let mut local = Endpoint::builder()
         .identity(Ed25519Keypair::from_secret_key_bytes([71; 32]))
         .protocol(HOP_PROTOCOL_ID)
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind local");
     let local_addr = local.listen().expect("local listens");
-    local.dial(&relay_addr).expect("dial relay");
+    local.swarm_mut().dial(&relay_addr).expect("dial relay");
 
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
     let mut inner_conn = None;
@@ -53,12 +58,12 @@ fn negotiated_bridge() -> BridgePair {
             .expect("drive local")
         {
             match event {
-                Event::ConnectionEstablished { peer_id, conn_id }
+                EndpointEvent::ConnectionEstablished { peer_id, conn_id }
                     if peer_id == *relay_addr.peer_id() =>
                 {
                     inner_conn = Some(conn_id);
                 }
-                Event::PeerReady { peer_id, .. } if peer_id == *relay_addr.peer_id() => {
+                EndpointEvent::PeerReady { peer_id, .. } if peer_id == *relay_addr.peer_id() => {
                     local_ready = true;
                 }
                 _ => {}
@@ -69,12 +74,12 @@ fn negotiated_bridge() -> BridgePair {
             .expect("drive relay")
         {
             match event {
-                Event::ConnectionEstablished { peer_id, conn_id }
+                EndpointEvent::ConnectionEstablished { peer_id, conn_id }
                     if peer_id == *local.peer_id() =>
                 {
                     relay_conn = Some(conn_id);
                 }
-                Event::PeerReady { peer_id, .. } if peer_id == *local.peer_id() => {
+                EndpointEvent::PeerReady { peer_id, .. } if peer_id == *local.peer_id() => {
                     relay_ready = true;
                 }
                 _ => {}
@@ -90,14 +95,14 @@ fn negotiated_bridge() -> BridgePair {
     let mut relay_stream_ready = false;
     while !local_stream_ready || !relay_stream_ready {
         assert!(Instant::now() < deadline, "bridge stream did not negotiate");
-        if let Some(Event::StreamReady { stream_id, .. }) = local
+        if let Some(EndpointEvent::StreamReady { stream_id, .. }) = local
             .next_event(std::time::Duration::from_millis(10))
             .expect("drive local stream")
             && stream_id == stream
         {
             local_stream_ready = true;
         }
-        if let Some(Event::StreamReady { stream_id, .. }) = relay
+        if let Some(EndpointEvent::StreamReady { stream_id, .. }) = relay
             .next_event(std::time::Duration::from_millis(10))
             .expect("drive relay stream")
             && stream_id == stream
@@ -131,7 +136,7 @@ fn drive_until_reserved(
             Instant::now() < deadline,
             "client did not acquire {transport} relay reservation"
         );
-        if let Some(Event::Nat(event)) = client
+        if let Some(EndpointEvent::Nat(event)) = client
             .next_event(std::time::Duration::from_millis(10))
             .expect("drive reservation client")
         {
@@ -158,7 +163,9 @@ fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
         .identity(Ed25519Keypair::from_secret_key_bytes([82; 32]))
         .quic_limits(limits.clone())
         .relay_server()
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind relay");
     let relay_addr = relay.listen().expect("relay listens");
     let mut client = Endpoint::builder()
@@ -170,7 +177,9 @@ fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
             reservation_keep_alive_interval_ms: 100,
             ..NatConfig::default()
         })
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind client");
 
     let mut reservation_events = drive_until_reserved(&mut client, &mut relay, "QUIC");
@@ -182,8 +191,8 @@ fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
             .next_event(std::time::Duration::from_millis(10))
             .expect("drive client")
         {
-            Some(Event::PingRttMeasured { .. }) => ping_rtts += 1,
-            Some(Event::Nat(event)) => reservation_events.push(event),
+            Some(EndpointEvent::PingRttMeasured { .. }) => ping_rtts += 1,
+            Some(EndpointEvent::Nat(event)) => reservation_events.push(event),
             _ => {}
         }
         match relay
@@ -194,7 +203,14 @@ fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
         }
     }
 
-    reservation_events.extend(client.take_nat_events());
+    while let Some(event) = client
+        .next_event(std::time::Duration::ZERO)
+        .expect("drain client")
+    {
+        if let EndpointEvent::Nat(event) = event {
+            reservation_events.push(event);
+        }
+    }
     assert!(ping_rtts > 0, "reservation liveness should send QUIC pings");
     assert!(client.active_reservation().is_some());
     assert_eq!(
@@ -227,8 +243,8 @@ fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
             .next_event(std::time::Duration::from_millis(10))
             .expect("drive reconnecting client")
         {
-            Some(Event::Nat(NatEvent::RelayReservationLost { .. })) => lost = true,
-            Some(Event::Nat(NatEvent::RelayReserved { .. })) if lost => reacquired = true,
+            Some(EndpointEvent::Nat(NatEvent::RelayReservationLost { .. })) => lost = true,
+            Some(EndpointEvent::Nat(NatEvent::RelayReserved { .. })) if lost => reacquired = true,
             _ => {}
         }
         match relay
@@ -247,7 +263,9 @@ fn tcp_relay_reservation_does_not_schedule_liveness_pings() {
     let mut relay = Endpoint::builder()
         .identity(Ed25519Keypair::from_secret_key_bytes([84; 32]))
         .relay_server()
-        .bind_tcp("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/tcp/0")
+        .expect("tcp listen address")
+        .bind()
         .expect("bind TCP relay");
     let relay_addr = relay.listen().expect("TCP relay listens");
     let mut client = Endpoint::builder()
@@ -258,7 +276,9 @@ fn tcp_relay_reservation_does_not_schedule_liveness_pings() {
             reservation_keep_alive_interval_ms: 25,
             ..NatConfig::default()
         })
-        .bind_tcp("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/tcp/0")
+        .expect("tcp listen address")
+        .bind()
         .expect("bind TCP client");
 
     drive_until_reserved(&mut client, &mut relay, "TCP");
@@ -270,7 +290,7 @@ fn tcp_relay_reservation_does_not_schedule_liveness_pings() {
                 client
                     .next_event(std::time::Duration::from_millis(10))
                     .expect("drive TCP client"),
-                Some(Event::PingRttMeasured { .. })
+                Some(EndpointEvent::PingRttMeasured { .. })
             ),
             "TCP reservation behavior must not gain automatic pings"
         );
@@ -408,7 +428,9 @@ fn circuit_id(driver: &NatDriver, key: (ConnectionId, StreamId)) -> ConnectionId
 fn autonat_listen_addrs_stay_empty_until_a_listener_is_bound() {
     let mut endpoint = Endpoint::builder()
         .nat_config(NatConfig::default())
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind endpoint");
     // QUIC reports its bound socket from `local_addresses` even before
     // `listen` runs, and the socket drops Initials until then — AutoNAT
@@ -432,7 +454,9 @@ fn autonat_listen_addrs_stay_empty_until_a_listener_is_bound() {
 fn confirmed_public_addresses_are_advertised_and_cleared() {
     let mut endpoint = Endpoint::builder()
         .nat_config(NatConfig::default())
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind endpoint");
     let public: Multiaddr = "/ip4/203.0.113.9/udp/4001/quic-v1"
         .parse()
@@ -468,7 +492,9 @@ fn confirmed_public_addresses_are_advertised_and_cleared() {
 fn endpoint_path_tracks_outbound_and_inbound_establishment_and_upgrade() {
     let mut endpoint = Endpoint::builder()
         .nat_config(NatConfig::default())
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind endpoint");
     let peer = Ed25519Keypair::from_secret_key_bytes([74; 32]).peer_id();
     let inbound = Ed25519Keypair::from_secret_key_bytes([75; 32]).peer_id();
@@ -596,6 +622,7 @@ fn promotion_uses_action_connection_after_same_batch_relay_supersede() {
     // public Established events have been delivered. At this seam the
     // core points at B while its eager close of A is still deferred.
     pair.relay
+        .swarm_mut()
         .dial(&pair.local_addr)
         .expect("relay dials replacement");
     let deadline = Instant::now() + std::time::Duration::from_secs(5);
@@ -604,7 +631,7 @@ fn promotion_uses_action_connection_after_same_batch_relay_supersede() {
     while replacement.is_none() || !relay_established {
         assert!(Instant::now() < deadline, "replacement did not establish");
         if replacement.is_none()
-            && let Some(Event::ConnectionEstablished { peer_id, conn_id }) = pair
+            && let Some(EndpointEvent::ConnectionEstablished { peer_id, conn_id }) = pair
                 .local
                 .next_event(std::time::Duration::from_millis(10))
                 .expect("drive local replacement")
@@ -614,7 +641,7 @@ fn promotion_uses_action_connection_after_same_batch_relay_supersede() {
             replacement = Some(conn_id);
         }
         if !relay_established
-            && let Some(Event::ConnectionEstablished { peer_id, .. }) = pair
+            && let Some(EndpointEvent::ConnectionEstablished { peer_id, .. }) = pair
                 .relay
                 .next_event(std::time::Duration::from_millis(10))
                 .expect("drive relay replacement")
