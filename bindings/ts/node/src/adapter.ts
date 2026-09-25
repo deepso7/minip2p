@@ -174,27 +174,13 @@ class NodeBackend implements Minip2pBackend {
 
   // Connect IDs are not mapped because they round-trip into native calls,
   // and native allocates them well inside the safe integer range.
-  connectTarget(target: BackendConnectTarget): number {
+  connect(target: BackendConnectTarget): number {
     return bigintToNumber(
-      this.#endpoint.connectTarget(
+      this.#endpoint.connect(
         target.kind === "peer" ? target.peerId : [...target.addresses]
       ),
       "connectId"
     );
-  }
-
-  dial(address: string): number[] {
-    return this.#endpoint
-      .dial(address)
-      .map((id) => this.#connectionIds.toPublic(id));
-  }
-
-  dialIp4(address: string): number {
-    return this.#connectionIds.toPublic(this.#endpoint.dialIp4(address));
-  }
-
-  dialIp6(address: string): number {
-    return this.#connectionIds.toPublic(this.#endpoint.dialIp6(address));
   }
 
   cancelConnect(id: number): void {

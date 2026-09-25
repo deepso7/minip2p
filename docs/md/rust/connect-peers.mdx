@@ -25,23 +25,24 @@ Before starting, [install minip2p](/rust/install) with Rust 1.91 or newer.
     Create `src/bin/listener.rs`:
 
     ```rust
-    use minip2p::{Deadline, Endpoint, PeerAddr};
+    use minip2p::{Deadline, Endpoint, EndpointWaitOutcome, PeerAddr};
 
     fn main() -> Result<(), minip2p::Error> {
         let mut node = Endpoint::builder()
             .agent_version("minip2p-hello/listener")
-            .bind_quic_dual_stack()?;
+            .listen_default()?
+            .bind()?;
 
         println!("peer={}", node.peer_id());
         for address in node.listen_all()? {
             println!("listen={}", local_dialable(&address));
         }
 
-        while let Some(event) = node.next_event(Deadline::NEVER)? {
-            println!("{event:?}");
+        loop {
+            if let EndpointWaitOutcome::Event(event) = node.wait(Deadline::NEVER)? {
+                println!("{event:?}");
+            }
         }
-
-        Ok(())
     }
 
     fn local_dialable(address: &PeerAddr) -> String {
@@ -58,36 +59,58 @@ Before starting, [install minip2p](/rust/install) with Rust 1.91 or newer.
     Create `src/bin/dialer.rs`:
 
     ```rust
-    use std::{str::FromStr, time::Duration};
+    use std::time::{Duration, Instant};
 
-    use minip2p::{Endpoint, PeerAddr};
+    use minip2p::{ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr};
 
     fn main() -> Result<(), Box<dyn std::error::Error>> {
-        let target = std::env::args()
+        // A complete peer address, e.g. /ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3KooW...
+        let target: PeerAddr = std::env::args()
             .nth(1)
-            .ok_or("usage: dialer <peer-address>")?;
-        let target = PeerAddr::from_str(&target)?;
+            .ok_or("usage: dialer <peer-address>")?
+            .parse()?;
+        let peer = target.peer_id().clone();
 
         let mut node = Endpoint::builder()
             .agent_version("minip2p-hello/dialer")
-            .bind_quic_dual_stack()?;
+            .listen_default()?
+            .bind()?;
 
-        node.dial(&target)?;
-        let ready = node.wait_peer_ready(
-            target.peer_id(),
-            Duration::from_secs(10),
-        )?;
-        if ready.is_none() {
-            return Err("peer did not become ready within 10 seconds".into());
+        // One Connection attempt, one Connect ID, one terminal event.
+        let connect_id = node.connect(target)?;
+        let mut deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let event = match node.wait(deadline)? {
+                EndpointWaitOutcome::Event(event) => event,
+                // Another thread woke the wait; nothing to service here.
+                EndpointWaitOutcome::Interrupted => continue,
+                EndpointWaitOutcome::Deadline => {
+                    return Err("peer did not answer in time".into());
+                }
+            };
+            match event {
+                EndpointEvent::ConnectSettled {
+                    connect_id: id,
+                    outcome,
+                    ..
+                } if id == connect_id => {
+                    if !matches!(outcome, ConnectOutcome::Connected { .. }) {
+                        return Err(format!("connect failed: {outcome:?}").into());
+                    }
+                }
+                EndpointEvent::PeerReady { peer_id, .. } if peer_id == peer => {
+                    node.ping(&peer)?;
+                    // The ping gets its own budget, however long setup took.
+                    deadline = Instant::now() + Duration::from_secs(5);
+                }
+                EndpointEvent::PingRttMeasured { peer_id, rtt_ms } if peer_id == peer => {
+                    println!("peer={peer} rtt={rtt_ms}ms");
+                    return Ok(());
+                }
+                // Everything else is unrelated to this exchange.
+                _ => {}
+            }
         }
-
-        node.ping(target.peer_id())?;
-        let rtt = node
-            .wait_ping_rtt(target.peer_id(), Duration::from_secs(5))?
-            .ok_or("ping timed out")?;
-
-        println!("peer={} rtt={}ms", target.peer_id(), rtt);
-        Ok(())
     }
     ```
 
@@ -112,9 +135,9 @@ $ cargo run --bin dialer -- /ip4/127.0.0.1/udp/54321/quic-v1/p2p/12D3KooW…
 peer=12D3KooW… rtt=2ms
 ```
 
-`wait_peer_ready` waits until Identify finishes so the dialer can print the peer and then measure Ping. That wait is a convenient milestone for this demo; `open_stream` does not require Identify for a protocol both peers already registered.
+`connect` returns a Connect ID immediately; the attempt ends with exactly one `ConnectSettled` event carrying that ID. The dialer's loop is the canonical pattern: match the events it is waiting for by ID or peer, and let everything else pass. It pings after `PeerReady` (Identify finished) only because that is a convenient milestone for this demo; `open_stream` does not require Identify for a protocol both peers already registered.
 
-`bind_quic_dual_stack` binds wildcard sockets. The listener rewrites only the printed local-demo addresses to loopback; the endpoint itself continues listening on both wildcard sockets.
+`listen_default` binds dual-stack QUIC wildcard sockets. The listener rewrites only the printed local-demo addresses to loopback; the endpoint itself continues listening on both wildcard sockets.
 
 ## If it does not connect
 
@@ -125,11 +148,11 @@ peer=12D3KooW… rtt=2ms
   </AccordionItem>
   <AccordionItem title="The peer never becomes ready">
     Keep the listener process running. minip2p is caller-driven, so the
-    listener must continue calling `next_event` to accept the connection,
+    listener must continue calling `wait` to accept the connection,
     complete Identify, and answer Ping.
   </AccordionItem>
   <AccordionItem title="The IPv6 address does not work">
-    Use the printed IPv4 loopback address instead. `bind_quic_dual_stack`
+    Use the printed IPv4 loopback address instead. `listen_default`
     binds separate IPv4 and IPv6 sockets, but the host still needs the
     corresponding address family available.
   </AccordionItem>

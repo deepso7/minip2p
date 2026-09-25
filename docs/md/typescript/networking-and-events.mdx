@@ -144,7 +144,7 @@ const endpoint = Minip2p.create({
 | `autonatServers` | Reachability probing only. It does not create a traversal path. |
 | `forceRelay: true` | Routes outbound connectivity through configured relays. |
 
-Use `connect` to run NAT orchestration. `dial*` remains direct-only.
+`connect` runs NAT orchestration: direct candidates and the relay leg race under one Connect ID.
 
 ```ts
 const result = await endpoint.connect(remoteAddress);
@@ -160,7 +160,7 @@ console.log(endpoint.circuitAddress);
 
 `circuitAddress` is available after a usable reservation matches one of the configured relay addresses. The exported `circuitAddress(relayAddress, peerId)` helper builds the same address explicitly.
 
-Watch `relayReserved`, `relayReservationLost`, `pathEstablished`, `pathUpgraded`, `holePunchFailed`, `fellBackToRelay`, and `connectFailed` for diagnostics and UI state. Keep using ordinary peer and stream APIs when a path upgrades. The peer identity does not change.
+Watch `relayReserved`, `relayReservationLost`, `pathEstablished`, `pathUpgraded`, `holePunchFailed`, and `connectFailed` for diagnostics and UI state. Keep using ordinary peer and stream APIs when a path upgrades. The peer identity does not change.
 
 <Callout type="note">
 

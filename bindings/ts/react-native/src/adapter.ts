@@ -242,32 +242,14 @@ class ReactNativeBackend implements Minip2pBackend {
     });
   }
 
-  connectTarget(target: BackendConnectTarget): number {
+  connect(target: BackendConnectTarget): number {
     const native =
       target.kind === "peer"
         ? new ConnectTarget.Peer({ peerId: target.peerId })
         : new ConnectTarget.Addresses({ addresses: [...target.addresses] });
     return u64ToNumber(
-      translateErrors(() => this.#endpoint.connectTarget(native)),
+      translateErrors(() => this.#endpoint.connect(native)),
       "connectId"
-    );
-  }
-
-  dial(address: string): number[] {
-    return translateErrors(() => this.#endpoint.dial(address)).map((id) =>
-      this.#connectionIds.toPublic(id)
-    );
-  }
-
-  dialIp4(address: string): number {
-    return this.#connectionIds.toPublic(
-      translateErrors(() => this.#endpoint.dialIp4(address))
-    );
-  }
-
-  dialIp6(address: string): number {
-    return this.#connectionIds.toPublic(
-      translateErrors(() => this.#endpoint.dialIp6(address))
     );
   }
 

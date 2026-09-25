@@ -20,7 +20,7 @@ export interface NativeEventLiteral {
 export interface FakeNativeState {
   /** Config handed to the native constructor. */
   readonly config: unknown;
-  /** Targets passed to native `connectTarget`, in runtime-neutral form. */
+  /** Targets passed to native `connect`, in runtime-neutral form. */
   readonly connectTargets: readonly BackendConnectTarget[];
   /** Connect IDs passed to native `cancelConnect`. */
   readonly cancelledConnects: readonly bigint[];
@@ -227,17 +227,11 @@ export function describeAdapterContract(
         protocols: [],
         relays: [],
       });
-      expect(harness.native().config).not.toHaveProperty("quic");
 
+      // Absent listen leaves the choice to the native defaults.
       harness.create().close();
-      expect(harness.native().config).toMatchObject({ quic: {} });
+      expect(harness.native().config).toMatchObject({ listen: undefined });
 
-      expect(() =>
-        harness.create({
-          listen: ["/ip4/0.0.0.0/udp/0/quic-v1"],
-          transports: { quic: true },
-        })
-      ).toThrow(/not both/u);
       expect(() =>
         harness.create({ mdns: { maxPacketBytes: 2 ** 32 } })
       ).toThrow(RangeError);

@@ -13,14 +13,10 @@ use super::connect::{ConnectId, ConnectOutcome};
 /// Ordered application event from the Endpoint's single public stream.
 ///
 /// Connection, Identify, ping, stream, raw-dial, Connection-attempt, and
-/// enabled capability transitions leave through this enum. Prefer this name
-/// at the Endpoint boundary. [`crate::Event`] is a migration alias for the
-/// same type.
+/// enabled capability transitions leave through this enum.
 ///
 /// Each event is emitted once. The order is fixed when the Endpoint queues
-/// the event. `poll` and `wait` preserve that queue order. Focused methods
-/// (`next_*_event`, `take_*_events`, and similar) may skip unrelated queued
-/// events and preserve only the relative order of the events they retain.
+/// the event, and `poll` and `wait` preserve that queue order.
 /// A Connection attempt's [`Self::ConnectSettled`] follows the
 /// `ConnectionEstablished` it reports. No order is promised between
 /// concurrently racing Transport candidates.
@@ -93,7 +89,10 @@ pub enum EndpointEvent {
     },
     /// A non-fatal runtime error occurred.
     Error(SwarmRuntimeError),
-    /// A raw `dial`'s connection closed before it was established.
+    /// A raw swarm dial's connection closed before it was established.
+    ///
+    /// Raw dials are made on the lower-level swarm runtime (for example
+    /// through `Endpoint::swarm_mut`), bypassing Connection-attempt policy.
     ///
     /// Attempt-owned dials never surface here; they become
     /// [`Self::ConnectSettled`] diagnostics.

@@ -133,12 +133,12 @@ function createEndpoint(
 ): Minip2p {
   const config: Minip2pConfig = {
     agentVersion: "minip2p-react-native-smoke",
+    listen,
     mdns: mdns
       ? { autoDial: false, queryIntervalMs: 1000, socketPollIntervalMs: 50 }
       : undefined,
     protocols: [STREAM_PROTOCOL],
     secretKey: generateSecretKey(),
-    transports: { quic: { listen } },
   };
   const endpoint = Minip2p.create(config);
   liveEndpoints.add(endpoint);

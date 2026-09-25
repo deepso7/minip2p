@@ -6,7 +6,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use minip2p_ffi::{
-    EndpointConfig, FfiError, P2pEndpoint, P2pEvent, P2pEventDoorbell, TransportOptions,
+    ConnectTarget, EndpointConfig, FfiError, P2pEndpoint, P2pEvent, P2pEventDoorbell,
 };
 use serde_json::{Value, json};
 
@@ -180,11 +180,7 @@ fn config() -> EndpointConfig {
         agent_version: Some("minip2p-go-interop".into()),
         relays: Vec::new(),
         autonat_servers: Vec::new(),
-        listen: None,
-        quic: None,
-        tcp: Some(TransportOptions {
-            listen_addrs: Some(vec!["/ip4/127.0.0.1/tcp/0".into()]),
-        }),
+        listen: Some(vec!["/ip4/127.0.0.1/tcp/0".into()]),
         force_relay: false,
         allow_unsigned: false,
         protocols: vec![ECHO_PROTOCOL.into()],
@@ -212,7 +208,9 @@ fn tcp_noise_yamux_identify_ping_and_streams_interoperate_with_go() -> Result<()
     let log = Arc::new(EventLog::new(Arc::clone(&endpoint)));
     endpoint.start(Arc::clone(&log) as Arc<dyn P2pEventDoorbell>)?;
 
-    endpoint.connect_addr(go_addr)?;
+    endpoint.connect(ConnectTarget::Addresses {
+        addresses: vec![go_addr],
+    })?;
     let initial_conn = match log.wait_for(|event| {
         matches!(event, P2pEvent::ConnectionEstablished { peer_id, .. } if peer_id == &go_peer)
     }) {

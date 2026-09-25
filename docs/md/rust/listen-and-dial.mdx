@@ -1,22 +1,20 @@
 ---
-title: Listen and dial
-description: Bind QUIC, TCP, or both; publish dialable peer addresses; and wait with readiness-driven helpers.
+title: Listen and connect
+description: Listen on QUIC, TCP, or both; publish dialable peer addresses; and connect to a known peer.
 ---
 
 This guide covers direct QUIC and TCP with the base Endpoint API. QUIC is on by default; TCP needs the `tcp` Cargo feature. For relay races and hole punching, use [Traverse NAT](/rust/traverse-nat). If you have not run a local connection yet, start with [Connect two peers](/rust/connect-peers).
 
 ## Bind an endpoint
 
-Prefer address-shaped listening: pass complete multiaddresses to `listen_on` (or `listen_default` for dual-stack QUIC) and call `bind`. The builder infers QUIC vs TCP from each address and groups compatible IPv4/IPv6 listeners onto one transport per shape.
+Listening is address-shaped: pass complete multiaddresses to `listen_on` (or `listen_default` for dual-stack QUIC) and call `bind`. The builder infers QUIC vs TCP from each address and groups compatible IPv4/IPv6 listeners onto one transport per shape. It accepts at most one QUIC listen address per IP family, and rejects `/p2p`, `/p2p-circuit`, and DNS hosts, which cannot be listened on.
 
 | Method | Use it when |
 | --- | --- |
 | `.listen_on("/ip4/…/udp/…/quic-v1")?.bind()` | Configuration already uses complete multiaddresses. |
 | `.listen_default()?.bind()` | Common dual-stack QUIC wildcards. |
-| `bind_quic("127.0.0.1:0")` | Legacy one-socket helper (still supported). |
-| `bind_quic_dual_stack()` | Legacy dual-stack QUIC helper (still supported). |
-| `bind_tcp("0.0.0.0:0")` | Legacy TCP helper (`tcp` feature). |
-| `.listen_on(quic)?.listen_on(tcp)?.bind()` | One endpoint that speaks both. |
+| `.listen_on_multiaddr(&addr)?.bind()` | You already hold a parsed `Multiaddr`. |
+| `.listen_on(quic)?.listen_on(tcp)?.bind()` | One endpoint that speaks both (`tcp` feature). |
 
 Port `0` asks the operating system to pick a free UDP or TCP port.
 
@@ -60,57 +58,71 @@ An address containing `/ip4/0.0.0.0` or `/ip6/::` describes where the socket is 
 
 </Callout>
 
-## Dial a known peer
+## Connect to a known peer
 
-Parse a complete `PeerAddr`, including its terminal `/p2p/<peer-id>`:
+`connect` takes a complete `PeerAddr`, including its terminal `/p2p/<peer-id>`, and returns a `ConnectId` immediately:
 
 ```rust
-use std::str::FromStr;
-
 use minip2p::{Endpoint, PeerAddr};
 
-let target = PeerAddr::from_str(
-    "/dns/node.example.com/udp/4001/quic-v1/p2p/12D3KooW…",
-)?;
+let target: PeerAddr =
+    "/ip4/192.0.2.7/udp/4001/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
+        .parse()?;
+let peer = target.peer_id().clone();
 
-let mut node = Endpoint::builder().bind_quic_dual_stack()?;
-let connection_ids = node.dial(&target)?;
-println!("started {} dial(s)", connection_ids.len());
+let mut node = Endpoint::builder().listen_default()?.bind()?;
+let connect_id = node.connect(target)?;
 ```
 
-Prefer `Endpoint::connect` when one Connection identity and one terminal outcome is enough. `connect` races every candidate (after DNS expansion) and reports `EndpointEvent::ConnectSettled`. `dial` remains for raw Transport dials until the contraction ticket.
+A target can also be a `PeerId` (known addresses and the configured relay are used) or a non-empty `Vec<PeerAddr>` naming the same peer. Every candidate is dialed at once and the attempt ends with exactly one `EndpointEvent::ConnectSettled`: `Connected { conn_id }`, `Failed(ConnectFailure)`, or `Cancelled`. Only a malformed target (an empty list, or addresses naming different peers) fails synchronously; "no usable route" is a `Failed` outcome.
 
-`dial` starts every applicable local address family. For a `/dns/...` target on a dual-stack endpoint, that can mean both IPv4 and IPv6 connection IDs. `/dns4/...` and `/dns6/...` stay single-family. Use `dial_ip4` or `dial_ip6` when policy requires one family.
+The address picks the transport and the IP family. `/ip4` and `/ip6` candidates are dialed as written; a `/dns` candidate is resolved and dialed over every family it answers with, while `/dns4` and `/dns6` keep to one. To limit an attempt to one family, pass only addresses of that family.
 
-## Wait for connection milestones
+## Wait for the outcome
 
-A successful dial still has two useful milestones:
-
-1. `Event::ConnectionEstablished`: the transport is up and the peer identity is authenticated.
-2. `Event::PeerReady`: the first Identify exchange has completed, so the endpoint knows which protocols the peer supports.
-
-Prefer a readiness wait over a short-poll loop:
+Wait for the Connect ID in your event loop and dispatch every other event as usual:
 
 ```rust
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-let ready = node.wait_peer_ready(
-    target.peer_id(),
-    Duration::from_secs(10),
-)?;
+use minip2p::{ConnectOutcome, EndpointEvent, EndpointWaitOutcome};
 
-if ready.is_none() {
-    eprintln!("peer connected but did not become ready before the deadline");
+let deadline = Instant::now() + Duration::from_secs(10);
+loop {
+    match node.wait(deadline)? {
+        EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
+            connect_id: id,
+            outcome,
+            ..
+        }) if id == connect_id => {
+            match outcome {
+                ConnectOutcome::Connected { conn_id } => println!("connected on {conn_id:?}"),
+                other => eprintln!("connect failed: {other:?}"),
+            }
+            break;
+        }
+        EndpointWaitOutcome::Event(event) => println!("{event:?}"), // dispatch as usual
+        EndpointWaitOutcome::Interrupted => {}
+        EndpointWaitOutcome::Deadline => {
+            // The deadline only bounds this wait; cancel the attempt explicitly.
+            node.cancel_connect(connect_id);
+            break;
+        }
+    }
 }
 ```
 
-`open_stream` works once the peer is connected. You do not have to wait for `PeerReady` to open a protocol you already know the remote speaks. After Identify completes, `open_stream` can reject an unsupported protocol immediately with `minip2p::Error::Swarm(minip2p::SwarmError::RemoteDoesNotSupport { .. })`. Use `wait_peer_ready` when you want that early check or the advertised protocol list.
+`cancel_connect` is the only way to stop an attempt: it closes anything the attempt opened and settles it `Cancelled`. Giving up on a wait never cancels. Cancelling a settled or unknown ID is a no-op, and closing an established connection is `disconnect`.
+
+A connected peer then reaches `PeerReady` once the first Identify exchange completes, so the endpoint knows which protocols it supports. `open_stream` works as soon as the peer is connected; you do not have to wait for `PeerReady` to open a protocol you already know the remote speaks. After Identify completes, `open_stream` can reject an unsupported protocol immediately with `minip2p::Error::Swarm(minip2p::SwarmError::RemoteDoesNotSupport { .. })`. Match `PeerReady` in the same loop when you want that early check or the advertised protocol list.
 
 ## Inspect and disconnect
 
+State snapshot getters read current state without driving the endpoint:
+
 ```rust
-if node.is_peer_ready(target.peer_id()) {
-    if let Some(info) = node.peer_info(target.peer_id()) {
+if node.is_peer_ready(&peer) {
+    if let Some(info) = node.peer_info(&peer) {
         println!(
             "agent={}",
             info.agent_version.as_deref().unwrap_or("<none>")
@@ -118,17 +130,19 @@ if node.is_peer_ready(target.peer_id()) {
     }
 }
 
-for peer in node.connected_peers() {
-    println!("connected={peer}");
+for connected in node.connected_peers() {
+    println!("connected={connected}");
 }
 
-node.disconnect(target.peer_id())?;
+node.disconnect(&peer)?;
 ```
 
-`disconnect` closes the active connection. A later connection closure appears as `Event::ConnectionClosed`.
+`disconnect` closes the active connection. The closure appears as `EndpointEvent::ConnectionClosed`.
 
-## `dial` is direct-only
+## Direct and NAT-aware attempts
 
-`dial*` does not reserve on a relay, establish a circuit, or start DCUtR. When the application has enabled and configured NAT traversal, use `connect` plus `nat_wait_path` (first usable path) or `ConnectSettled` (terminal). See [Traverse NAT](/rust/traverse-nat).
+Without NAT configuration, `connect` dials only the direct candidates. With the `nat` feature and a configured relay, the same call also races a relay leg and can later upgrade to a direct path. See [Traverse NAT](/rust/traverse-nat).
+
+Raw Transport dials, which bypass Connection-attempt policy entirely, live on the lower-level swarm: `node.swarm_mut().dial(&addr)`.
 
 Next: [Register a protocol](/rust/register-a-protocol) or [Identity](/rust/identity).

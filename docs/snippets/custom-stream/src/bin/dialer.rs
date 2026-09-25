@@ -1,6 +1,9 @@
-use std::{str::FromStr, time::Duration};
+use std::{
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
-use minip2p::{Endpoint, Event, PeerAddr};
+use minip2p::{ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr};
 
 const ECHO_PROTOCOL: &str = "/my-app/echo/1.0.0";
 
@@ -14,54 +17,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut node = Endpoint::builder()
         .agent_version("minip2p-stream/dialer")
         .protocol(ECHO_PROTOCOL)
-        .bind_quic_dual_stack()?;
+        .listen_default()?
+        .bind()?;
 
-    node.dial(&target)?;
-    node.wait_peer_ready(&peer_id, Duration::from_secs(10))?
-        .ok_or("peer did not become ready")?;
-
-    let stream_id = node.open_stream(&peer_id, ECHO_PROTOCOL)?;
+    let connect_id = node.connect(target)?;
+    let mut stream_id = None;
     let mut response = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
 
     loop {
-        let event = node
-            .next_event(Duration::from_secs(10))?
-            .ok_or("stream exchange timed out")?;
+        let event = match node.wait(deadline)? {
+            EndpointWaitOutcome::Event(event) => event,
+            // Another thread woke the wait; nothing to service here.
+            EndpointWaitOutcome::Interrupted => continue,
+            EndpointWaitOutcome::Deadline => return Err("stream exchange timed out".into()),
+        };
 
         match event {
-            Event::StreamReady {
+            EndpointEvent::ConnectSettled {
+                connect_id: id,
+                outcome,
+                ..
+            } if id == connect_id => {
+                match outcome {
+                    // A known protocol does not need to wait for Identify.
+                    ConnectOutcome::Connected { .. } => {
+                        stream_id = Some(node.open_stream(&peer_id, ECHO_PROTOCOL)?);
+                    }
+                    other => return Err(format!("connect failed: {other:?}").into()),
+                }
+            }
+            EndpointEvent::StreamReady {
                 peer_id: peer,
                 stream_id: ready,
                 protocol_id,
                 ..
-            } if peer == peer_id && ready == stream_id && protocol_id == ECHO_PROTOCOL => {
-                node.send_stream(&peer_id, stream_id, b"hello".to_vec())?;
-                node.close_stream_write(&peer_id, stream_id)?;
+            } if peer == peer_id && Some(ready) == stream_id && protocol_id == ECHO_PROTOCOL => {
+                node.send_stream(&peer_id, ready, b"hello".to_vec())?;
+                node.close_stream_write(&peer_id, ready)?;
             }
-            Event::StreamData {
+            EndpointEvent::StreamData {
                 peer_id: peer,
                 stream_id: ready,
                 data,
                 ..
-            } if peer == peer_id && ready == stream_id => {
+            } if peer == peer_id && Some(ready) == stream_id => {
                 response.extend_from_slice(&data);
             }
-            Event::StreamRemoteWriteClosed {
+            EndpointEvent::StreamRemoteWriteClosed {
                 peer_id: peer,
                 stream_id: ready,
                 ..
-            } if peer == peer_id && ready == stream_id => {
+            } if peer == peer_id && Some(ready) == stream_id => {
                 println!("{}", String::from_utf8_lossy(&response));
                 return Ok(());
             }
-            Event::StreamClosed {
+            EndpointEvent::StreamClosed {
                 peer_id: peer,
                 stream_id: ready,
                 ..
-            } if peer == peer_id && ready == stream_id => {
+            } if peer == peer_id && Some(ready) == stream_id => {
                 return Err("stream closed before the echo completed".into());
             }
-            Event::Error(error) => eprintln!("runtime error: {error:?}"),
+            EndpointEvent::Error(error) => eprintln!("runtime error: {error:?}"),
             _ => {}
         }
     }

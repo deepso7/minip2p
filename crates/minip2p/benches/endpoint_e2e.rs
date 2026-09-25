@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use minip2p::{Deadline, Endpoint, Event, PeerAddr, PeerId, StreamId};
+use minip2p::{Deadline, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr, PeerId, StreamId};
 
 const ECHO: &str = "/minip2p/bench/echo/1";
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -23,10 +23,51 @@ fn bind(kind: Kind) -> Endpoint {
         .agent_version("minip2p-bench")
         .protocol(ECHO);
     match kind {
-        Kind::Tcp => builder.bind_tcp("127.0.0.1:0"),
-        Kind::Quic => builder.bind_quic("127.0.0.1:0"),
+        Kind::Tcp => builder
+            .listen_on("/ip4/127.0.0.1/tcp/0")
+            .expect("tcp listen address")
+            .bind(),
+        Kind::Quic => builder
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind(),
     }
     .expect("bind endpoint")
+}
+
+/// The next Endpoint event, or `None` once `deadline` passes.
+fn next_event(endpoint: &mut Endpoint, deadline: impl Into<Deadline>) -> Option<EndpointEvent> {
+    let deadline = deadline.into();
+    loop {
+        match endpoint.wait(deadline).expect("endpoint wait") {
+            EndpointWaitOutcome::Event(event) => return Some(event),
+            EndpointWaitOutcome::Deadline => return None,
+            EndpointWaitOutcome::Interrupted => {}
+        }
+    }
+}
+
+/// Drives `endpoint` until `wanted` accepts an event, dispatching (here:
+/// dropping) everything else, as an application event loop would.
+fn wait_for(endpoint: &mut Endpoint, what: &str, wanted: impl Fn(&EndpointEvent) -> bool) {
+    let deadline = Deadline::from(Instant::now() + TIMEOUT);
+    loop {
+        let event = next_event(endpoint, deadline).expect(what);
+        if wanted(&event) {
+            return;
+        }
+    }
+}
+
+/// Starts one Connection attempt and waits until Identify completes.
+fn connect_ready(client: &mut Endpoint, server: &PeerAddr) {
+    client.connect(server).expect("connect");
+    let peer = server.peer_id();
+    wait_for(
+        client,
+        "ready",
+        |event| matches!(event, EndpointEvent::PeerReady { peer_id, .. } if peer_id == peer),
+    );
 }
 
 struct EchoServer {
@@ -44,11 +85,9 @@ impl EchoServer {
         let thread = thread::spawn(move || {
             let mut streams = HashSet::<(PeerId, StreamId)>::new();
             while !worker_stop.load(Ordering::Relaxed) {
-                let event = endpoint
-                    .next_event(Duration::from_millis(5))
-                    .expect("server poll");
+                let event = next_event(&mut endpoint, Duration::from_millis(5));
                 match event {
-                    Some(Event::StreamReady {
+                    Some(EndpointEvent::StreamReady {
                         peer_id,
                         stream_id,
                         protocol_id,
@@ -57,7 +96,7 @@ impl EchoServer {
                     }) if protocol_id == ECHO => {
                         streams.insert((peer_id, stream_id));
                     }
-                    Some(Event::StreamData {
+                    Some(EndpointEvent::StreamData {
                         peer_id,
                         stream_id,
                         data,
@@ -67,14 +106,14 @@ impl EchoServer {
                             .send_stream(&peer_id, stream_id, data)
                             .expect("echo");
                     }
-                    Some(Event::StreamRemoteWriteClosed {
+                    Some(EndpointEvent::StreamRemoteWriteClosed {
                         peer_id, stream_id, ..
                     }) if streams.contains(&(peer_id.clone(), stream_id)) => {
                         endpoint
                             .close_stream_write(&peer_id, stream_id)
                             .expect("close echo");
                     }
-                    Some(Event::StreamClosed {
+                    Some(EndpointEvent::StreamClosed {
                         peer_id, stream_id, ..
                     }) => {
                         streams.remove(&(peer_id, stream_id));
@@ -118,11 +157,7 @@ impl Crossed {
         let mut clients = Vec::new();
         for _ in 0..4 {
             let mut client = bind(kind);
-            client.dial(&server.address).expect("dial");
-            client
-                .wait_peer_ready(&peer, TIMEOUT)
-                .expect("wait ready")
-                .expect("ready timeout");
+            connect_ready(&mut client, &server.address);
             clients.push((client, peer.clone()));
         }
         Self {
@@ -146,14 +181,11 @@ impl Crossed {
         while pending.iter().any(|streams| !streams.is_empty()) {
             assert!(Instant::now() < deadline, "crossed echo timeout");
             for (index, (client, peer)) in self.clients.iter_mut().enumerate() {
-                let Some(event) = client
-                    .next_event(Duration::from_millis(1))
-                    .expect("client poll")
-                else {
+                let Some(event) = next_event(client, Duration::from_millis(1)) else {
                     continue;
                 };
                 match event {
-                    Event::StreamReady {
+                    EndpointEvent::StreamReady {
                         stream_id,
                         protocol_id,
                         initiated_locally: true,
@@ -170,7 +202,7 @@ impl Crossed {
                             .close_stream_write(peer, stream_id)
                             .expect("close write");
                     }
-                    Event::StreamData {
+                    EndpointEvent::StreamData {
                         stream_id, data, ..
                     } if pending
                         .get(index)
@@ -219,19 +251,17 @@ impl Pair {
     }
 
     fn connect(&mut self) {
-        self.client.dial(&self._server.address).expect("dial");
-        self.client
-            .wait_peer_ready(&self.peer, TIMEOUT)
-            .expect("wait ready")
-            .expect("ready timeout");
+        connect_ready(&mut self.client, &self._server.address);
     }
 
     fn ping(&mut self) {
         self.client.ping(&self.peer).expect("ping");
-        self.client
-            .wait_ping_rtt(&self.peer, TIMEOUT)
-            .expect("wait ping")
-            .expect("ping timeout");
+        let peer = &self.peer;
+        wait_for(
+            &mut self.client,
+            "ping",
+            |event| matches!(event, EndpointEvent::PingRttMeasured { peer_id, .. } if peer_id == peer),
+        );
     }
 
     fn echo(&mut self, payload: Vec<u8>, streams: usize) {
@@ -245,13 +275,8 @@ impl Pair {
         }
         let deadline = Deadline::from(Instant::now() + TIMEOUT);
         while !pending.is_empty() {
-            match self
-                .client
-                .next_event(deadline)
-                .expect("client poll")
-                .expect("echo timeout")
-            {
-                Event::StreamReady {
+            match next_event(&mut self.client, deadline).expect("echo timeout") {
+                EndpointEvent::StreamReady {
                     peer_id,
                     stream_id,
                     protocol_id,
@@ -271,7 +296,7 @@ impl Pair {
                         .expect("send");
                     pending.get_mut(&stream_id).expect("pending stream").0 = end;
                 }
-                Event::StreamData {
+                EndpointEvent::StreamData {
                     peer_id,
                     stream_id,
                     data,

@@ -20,7 +20,7 @@ describe("native event payloads", () => {
     const protocol = "/minip2p/node-native-events/1";
     const a = createEndpoint(protocol);
     const b = createEndpoint(protocol);
-    a.connectTarget([b.listenAddrs()[0]]);
+    a.connect([b.listenAddrs()[0]]);
 
     await Promise.all([
       waitPeerReady(a, b.peerId()),
@@ -45,7 +45,7 @@ describe("native event payloads", () => {
     const b = createEndpoint();
     a.subscribe("native-events");
     b.subscribe("native-events");
-    a.connectTarget([b.listenAddrs()[0]]);
+    a.connect([b.listenAddrs()[0]]);
 
     await Promise.all([
       waitPeerReady(a, b.peerId()),
@@ -71,8 +71,8 @@ function createEndpoint(protocol?: string): NativeEndpoint {
       allowUnsigned: false,
       autonatServers: [],
       forceRelay: false,
+      listen: ["/ip4/127.0.0.1/udp/0/quic-v1"],
       protocols: protocol === undefined ? [] : [protocol],
-      quic: { listenAddrs: ["/ip4/127.0.0.1/udp/0/quic-v1"] },
       relays: [],
     }
   );

@@ -22,10 +22,8 @@ describe("@minip2p/node", () => {
 
   test("creates, starts, and closes a QUIC endpoint", () => {
     const endpoint = nodeSdk.Minip2p.create({
+      listen: ["/ip4/127.0.0.1/udp/0/quic-v1"],
       secretKey: nodeSdk.generateSecretKey(),
-      transports: {
-        quic: { listen: ["/ip4/127.0.0.1/udp/0/quic-v1"] },
-      },
     });
 
     expect(endpoint.peerId()).toMatch(/^12D3Koo/u);
@@ -45,6 +43,7 @@ describe("@minip2p/node", () => {
         peerTtlMs: 5678,
         topic,
       },
+      listen: ["/ip4/127.0.0.1/udp/0/quic-v1"],
       mdns: {
         autoDial: false,
         enableIpv6: false,
@@ -56,9 +55,6 @@ describe("@minip2p/node", () => {
         ttlMs: 444,
       },
       secretKey: nodeSdk.generateSecretKey(),
-      transports: {
-        quic: { listen: ["/ip4/127.0.0.1/udp/0/quic-v1"] },
-      },
     });
 
     try {
@@ -73,11 +69,9 @@ describe("@minip2p/node", () => {
   test("passes mDNS limits through native validation", () => {
     expect(() =>
       nodeSdk.Minip2p.create({
+        listen: ["/ip4/127.0.0.1/udp/0/quic-v1"],
         mdns: { maxPacketBytes: 511 },
         secretKey: nodeSdk.generateSecretKey(),
-        transports: {
-          quic: { listen: ["/ip4/127.0.0.1/udp/0/quic-v1"] },
-        },
       })
     ).toThrow("mDNS maximum packet size must be between 512 and 4096 bytes");
   });
@@ -112,11 +106,9 @@ describe("@minip2p/node", () => {
     const protocol = "/minip2p/node-loopback/1";
     const createEndpoint = () =>
       nodeSdk.Minip2p.create({
+        listen: ["/ip4/127.0.0.1/udp/0/quic-v1"],
         protocols: [protocol],
         secretKey: nodeSdk.generateSecretKey(),
-        transports: {
-          quic: { listen: ["/ip4/127.0.0.1/udp/0/quic-v1"] },
-        },
       });
     const a = createEndpoint();
     const b = createEndpoint();
@@ -165,11 +157,9 @@ describe("@minip2p/node", () => {
     const protocol = "/minip2p/node-tcp-loopback/1";
     const createEndpoint = () =>
       nodeSdk.Minip2p.create({
+        listen: ["/ip4/127.0.0.1/tcp/0"],
         protocols: [protocol],
         secretKey: nodeSdk.generateSecretKey(),
-        transports: {
-          tcp: { listen: ["/ip4/127.0.0.1/tcp/0"] },
-        },
       });
     const a = createEndpoint();
     const b = createEndpoint();
@@ -202,11 +192,9 @@ describe("@minip2p/node", () => {
     const createEndpoint = () =>
       nodeSdk.Minip2p.create({
         forceRelay: true,
+        listen: ["/ip4/127.0.0.1/udp/0/quic-v1"],
         relays: [relay.address],
         secretKey: nodeSdk.generateSecretKey(),
-        transports: {
-          quic: { listen: ["/ip4/127.0.0.1/udp/0/quic-v1"] },
-        },
       });
     const a = createEndpoint();
     const b = createEndpoint();
@@ -280,10 +268,8 @@ describe("@minip2p/node", () => {
 
 function createPubsubEndpoint(): nodeSdk.Minip2p {
   return nodeSdk.Minip2p.create({
+    listen: ["/ip4/127.0.0.1/udp/0/quic-v1"],
     secretKey: nodeSdk.generateSecretKey(),
-    transports: {
-      quic: { listen: ["/ip4/127.0.0.1/udp/0/quic-v1"] },
-    },
   });
 }
 

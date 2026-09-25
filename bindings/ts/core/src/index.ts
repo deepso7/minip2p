@@ -38,8 +38,6 @@ export {
   type Minip2pEvent,
   type Minip2pMdnsOptions,
   type Minip2pNamedEventMap,
-  type Minip2pTransportOptions,
-  type Minip2pTransports,
   type OnceOptions,
   type OpOptions,
   type Path,

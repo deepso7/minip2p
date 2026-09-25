@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use minip2p_ffi::{EndpointConfig, FfiError, P2pEndpoint, P2pEvent, P2pEventDoorbell, PathKind};
+use minip2p_ffi::{
+    ConnectTarget, EndpointConfig, FfiError, P2pEndpoint, P2pEvent, P2pEventDoorbell, PathKind,
+};
 
 static LOOPBACK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -204,28 +206,11 @@ fn config() -> EndpointConfig {
 }
 
 fn config_on(listen_addr: &str) -> EndpointConfig {
-    let (quic, tcp) = if listen_addr.contains("/quic-v1") {
-        (
-            Some(minip2p_ffi::TransportOptions {
-                listen_addrs: Some(vec![listen_addr.into()]),
-            }),
-            None,
-        )
-    } else {
-        (
-            None,
-            Some(minip2p_ffi::TransportOptions {
-                listen_addrs: Some(vec![listen_addr.into()]),
-            }),
-        )
-    };
     EndpointConfig {
         agent_version: Some("minip2p-ffi-loopback-test".into()),
         relays: Vec::new(),
         autonat_servers: Vec::new(),
-        listen: None,
-        quic,
-        tcp,
+        listen: Some(vec![listen_addr.into()]),
         force_relay: false,
         allow_unsigned: false,
         protocols: Vec::new(),
@@ -272,7 +257,9 @@ fn a_tcp_listen_address_binds_tcp_and_is_dialed_over_it() -> Result<(), FfiError
     a.start(Arc::clone(&a_log) as Arc<dyn P2pEventDoorbell>)?;
     b.start(Arc::clone(&b_log) as Arc<dyn P2pEventDoorbell>)?;
 
-    let connect_id = a.connect_addr(b.listen_addrs()[0].clone())?;
+    let connect_id = a.connect(ConnectTarget::Addresses {
+        addresses: vec![b.listen_addrs()[0].clone()],
+    })?;
     assert!(
         a_log
             .wait_for(Duration::from_secs(5), |event| matches!(
@@ -323,7 +310,9 @@ fn two_endpoints_chat_over_loopback() -> Result<(), FfiError> {
     a.subscribe("room".into())?;
     b.subscribe("room".into())?;
 
-    let connect_id = a.connect_addr(b.listen_addrs()[0].clone())?;
+    let connect_id = a.connect(ConnectTarget::Addresses {
+        addresses: vec![b.listen_addrs()[0].clone()],
+    })?;
     assert!(matches!(
         a_log.wait_for(Duration::from_secs(5), |event| matches!(
             event,
@@ -431,7 +420,9 @@ fn identify_ping_and_custom_streams_cross_the_ffi_boundary() -> Result<(), FfiEr
     b.add_protocol(protocol.into())?;
     a.start(Arc::clone(&a_log) as Arc<dyn P2pEventDoorbell>)?;
     b.start(Arc::clone(&b_log) as Arc<dyn P2pEventDoorbell>)?;
-    a.connect_with_addrs(b_peer.clone(), vec![b.listen_addrs()[0].clone()])?;
+    a.connect(ConnectTarget::Addresses {
+        addresses: vec![b.listen_addrs()[0].clone()],
+    })?;
 
     assert!(
         a_log
@@ -531,7 +522,9 @@ fn panicking_doorbell_does_not_kill_driver() -> Result<(), FfiError> {
     b.start(Arc::clone(&b_log) as Arc<dyn P2pEventDoorbell>)?;
     a.subscribe("panic-room".into())?;
     b.subscribe("panic-room".into())?;
-    a.connect_addr(b.listen_addrs()[0].clone())?;
+    a.connect(ConnectTarget::Addresses {
+        addresses: vec![b.listen_addrs()[0].clone()],
+    })?;
     assert!(
         b_log
             .wait_for(Duration::from_secs(5), |event| matches!(
@@ -588,7 +581,9 @@ fn query_completes_while_doorbell_callback_is_in_flight() -> Result<(), FfiError
     b.start(Arc::clone(&b_log) as Arc<dyn P2pEventDoorbell>)?;
     a.subscribe("handoff-room".into())?;
     b.subscribe("handoff-room".into())?;
-    a.connect_addr(b.listen_addrs()[0].clone())?;
+    a.connect(ConnectTarget::Addresses {
+        addresses: vec![b.listen_addrs()[0].clone()],
+    })?;
     assert!(
         b_log
             .wait_for(Duration::from_secs(5), |event| matches!(
@@ -647,7 +642,9 @@ fn bounded_load_preserves_order_and_accounting() -> Result<(), FfiError> {
     a.set_active(true);
     a.subscribe("load-room".into())?;
     b.subscribe("load-room".into())?;
-    a.connect_addr(b.listen_addrs()[0].clone())?;
+    a.connect(ConnectTarget::Addresses {
+        addresses: vec![b.listen_addrs()[0].clone()],
+    })?;
     assert!(
         b_log
             .wait_for(Duration::from_secs(5), |event| matches!(

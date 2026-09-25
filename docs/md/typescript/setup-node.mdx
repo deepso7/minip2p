@@ -24,9 +24,7 @@ import { Minip2p, generateSecretKey } from "@minip2p/node";
 const endpoint = Minip2p.create({
   agentVersion: "my-app/0.1.0",
   secretKey: generateSecretKey(),
-  transports: {
-    quic: { listen: ["/ip4/127.0.0.1/udp/4001/quic-v1"] },
-  },
+  listen: ["/ip4/127.0.0.1/udp/4001/quic-v1"],
 });
 
 console.log("listening at");

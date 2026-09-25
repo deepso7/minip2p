@@ -10,8 +10,9 @@ Start from the observable symptom. Rust methods return immediate failures as `mi
 | Symptom | Likely cause | What to do |
 | --- | --- | --- |
 | `PeerAddr` fails to parse | The address lacks a terminal `/p2p/<peer-id>` | Copy the complete peer address. |
-| Dialing fails immediately | The address has the wrong shape, or its transport is unavailable | Use `/udp/<port>/quic-v1` or `/tcp/<port>` and bind that transport. |
-| A remote peer cannot dial a printed address | The address contains `0.0.0.0` or `::` | Advertise a real interface, public, or relay address. |
+| `connect` returns `ConnectTargetError` | The address list was empty, or its addresses name different peers | Pass one peer's complete addresses. |
+| `ConnectSettled` fails with `NoUsableRoute` | No candidate had a usable shape or transport, and no relay applied | Use `/udp/<port>/quic-v1` or `/tcp/<port>` and listen on that transport, or configure a relay. |
+| A remote peer cannot connect to a printed address | The address contains `0.0.0.0` or `::` | Advertise a real interface, public, or relay address. |
 | A connection exists but an application protocol cannot open | Protocol unregistered, or remote rejects negotiation | Confirm matching protocol IDs and keep both peers driving. `PeerReady` is optional; it only enables early `RemoteDoesNotSupport`. |
 | `ProtocolNotRegistered` | The local endpoint never registered the protocol | Add `.protocol("/app/name/1.0.0")` or call `add_protocol`. |
 | `RemoteDoesNotSupport` | The peer does not advertise the protocol version | Register the same version on both peers. |
@@ -21,17 +22,16 @@ Start from the observable symptom. Rust methods return immediate failures as `mi
 | Pubsub receives no local copy | Self-delivery is disabled | Apply the local action directly and use pubsub for remote delivery. |
 | Discovery rejects a beacon | Discovery beacons must be signed | Fix the publishing peer. `allow_unsigned` does not apply to discovery. |
 | mDNS finds no peers | mDNS is inactive, multicast is blocked, or peers do not share a link | Activate mDNS on both peers and test on a multicast-capable network. |
-| A focused wait returns `EventBacklogExceeded` | Unrelated events filled the preserved backlog | Drain ordinary events, handle the busy source, and retry. |
 
 ## Event responses
 
 | Event | Typical response |
 | --- | --- |
-| `Event::PeerReady` | Record advertised protocols, or open streams if you waited for Identify first. |
-| `Event::StreamReady` | Attach the stream to its protocol handler. |
-| `Event::StreamData` | Feed the bytes into the application's decoder. |
-| `Event::StreamRemoteWriteClosed` | Finish decoding and optionally close the local write side. |
-| `Event::Error` | Record the structured context and decide whether to retry. |
+| `EndpointEvent::PeerReady` | Record advertised protocols, or open streams if you waited for Identify first. |
+| `EndpointEvent::StreamReady` | Attach the stream to its protocol handler. |
+| `EndpointEvent::StreamData` | Feed the bytes into the application's decoder. |
+| `EndpointEvent::StreamRemoteWriteClosed` | Finish decoding and optionally close the local write side. |
+| `EndpointEvent::Error` | Record the structured context and decide whether to retry. |
 | `NatEvent::PathEstablished` | Begin traffic with the ordinary stream methods. |
 | `NatEvent::PathUpgraded` | Update path state. Existing peer operations keep working. |
 | `EndpointEvent::ConnectSettled` with `ConnectOutcome::Failed` | Inspect the failure, correct the candidates or infrastructure, and retry. |
@@ -40,7 +40,7 @@ Start from the observable symptom. Rust methods return immediate failures as `mi
 
 ## Debug in order
 
-1. Confirm that both endpoints keep calling a focused wait (`nat_wait_path`, `wait_peer_ready`, …), `wait`, `next_event`, or `poll`. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
+1. Confirm that both endpoints keep calling `wait` or `poll`. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
 2. Log the complete peer address and local peer ID.
 3. Distinguish an authenticated connection from `PeerReady` (Identify).
 4. Confirm both the Cargo feature and its builder method.

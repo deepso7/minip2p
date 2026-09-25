@@ -1,19 +1,19 @@
 ---
 title: Concepts
-description: Endpoint, PeerId, PeerAddr, PeerReady, dial versus connect, and where events go.
+description: Endpoint, PeerId, PeerAddr, PeerReady, Connection attempts, and where events go.
 ---
 
 An `Endpoint` is the main application API. Five ideas explain most code built on it.
 
 ## Endpoint
 
-`Endpoint` owns an Ed25519 identity, the transports you bound, and the connection state. It is the app-facing entrypoint for listening, dialing, Ping, Identify, and application streams. QUIC is on by default; add the `tcp` feature to use QUIC and TCP together, or bind only TCP.
+`Endpoint` owns an Ed25519 identity, the transports you bound, and the connection state. It is the app-facing entrypoint for listening, connecting, Ping, Identify, and application streams. QUIC is on by default; add the `tcp` feature to use QUIC and TCP together, or listen only on TCP.
 
-An endpoint does not spawn a runtime. Prefer `Endpoint::wait` for the ordered Endpoint event stream (event, deadline, or interrupted); it also delivers NAT, pubsub, discovery, and relay-server events. Prefer `connect` plus `ConnectSettled` for a Connection attempt. Focused waits such as `nat_wait_path` and `wait_peer_ready`, plus `next_event`, remain during migration. All these methods use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread. `poll()` is the non-blocking step for an existing reactor.
+An endpoint does not spawn a runtime. `Endpoint::wait` is its one blocking wait over the ordered Endpoint event stream and returns an event, the deadline, or an interruption; it also delivers NAT, pubsub, discovery, and relay-server events. `poll()` is the non-blocking step for an existing reactor. Both use transport readiness when supported. Each call drives only its own endpoint, so blocking on one endpoint can delay others sharing the same thread.
 
 ```mermaid
 flowchart TB
-  A["Your caller-driven loop"] <-->|"wait / wait_* / next_event · events"| B["Endpoint"]
+  A["Your caller-driven loop"] <-->|"connect / wait / poll · events"| B["Endpoint"]
   B <-->|"QUIC over UDP · Noise + Yamux over TCP"| C["Network"]
 ```
 
@@ -43,7 +43,7 @@ A `PeerAddr` pairs that transport with a terminal peer identity:
 /ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3KooW…
 ```
 
-Use `Multiaddr` when choosing where to bind. Use `PeerAddr` when dialing a specific authenticated peer. See [Identity](/rust/identity) for circuit addresses and wildcards.
+Use `Multiaddr` when choosing where to listen. Use `PeerAddr` when connecting to a specific authenticated peer. See [Identity](/rust/identity) for circuit addresses and wildcards.
 
 ## Connection readiness
 
@@ -51,18 +51,11 @@ Use `Multiaddr` when choosing where to bind. Use `PeerAddr` when dialing a speci
 
 `open_stream` is allowed once the peer is connected. The remote-protocol advertisement check applies only after `PeerReady`; before that, negotiation proceeds without an early `RemoteDoesNotSupport` reject. Waiting for Identify is application policy when you want the advertised protocol list first, not a stack requirement for opening a known protocol.
 
-## Dial versus connect
+## Connection attempts
 
-These are separate paths with different policy:
+`connect` starts one Connection attempt and returns its `ConnectId` immediately. The target is a `PeerId`, one complete `PeerAddr`, or a non-empty list of complete addresses naming the same peer. The attempt may run several Transport dials at once (one per candidate and IP family) and, with NAT traversal, a relay leg, but it ends with exactly one `EndpointEvent::ConnectSettled` carrying that ID: `Connected`, `Failed`, or `Cancelled`. `cancel_connect` is the only way to stop it; abandoning a wait never cancels.
 
-| Goal | Start with | Wait for |
-| --- | --- | --- |
-| Direct QUIC or TCP to a known address | `connect`, or `dial` / `dial_ip4` / `dial_ip6` | `ConnectSettled`, or connection then `wait_peer_ready` if you need Identify |
-| NAT-aware attempt with optional relay | `connect` (peer, address, or address set) | `ConnectSettled`; `nat_wait_path` / `NatEvent` for the first usable path |
-
-The base `dial*` methods only start direct dials. The address picks QUIC or TCP. They do not reserve on a relay or perform DCUtR.
-
-With the `nat` capability enabled, `connect` can race direct candidates against a relay leg. The first usable result is:
+Each address picks its transport (`/udp/…/quic-v1` or `/tcp`) and IP family (`/ip4`, `/ip6`, or `/dns*` resolution). Without NAT configuration, `connect` dials only direct candidates. With the `nat` capability enabled and a relay configured, it can race direct candidates against a relay leg. The first usable result is:
 
 - `Path::DirectDialed`: a supplied direct address connected;
 - `Path::DirectPunched`: DCUtR established a direct connection;
@@ -78,15 +71,13 @@ A Cargo feature makes a capability available. Enable it on `EndpointBuilder`; se
 
 ## Where events go
 
-Every event leaves through the Endpoint event stream: `Endpoint::wait`, `poll`, or the migration-era `next_event`. Prefer `wait` — it returns an event, deadline, or interruption without swallowing interrupts, and one `wait` loop sees every event exactly once. Connection, Identify, Ping, and application stream events arrive as ordinary `EndpointEvent` variants. Enabled capabilities add variants to the same `#[non_exhaustive]` enum:
+Every event leaves through the Endpoint event stream, read with `Endpoint::wait` or `poll`. One loop sees every event exactly once. Applications wait for a particular outcome by matching its ID (a `ConnectId`, `ConnectionId`, or `StreamId`) in that loop while dispatching everything else; see [Drive events](/rust/drive-events). Connection, Identify, Ping, and application stream events arrive as ordinary `EndpointEvent` variants. Enabled capabilities add variants to the same `#[non_exhaustive]` enum:
 
 - `EndpointEvent::Nat(NatEvent)` (`nat`): path transitions, reachability, public addresses, and relay reservations. The attempt outcome is `ConnectSettled`, never a `NatEvent`;
 - `EndpointEvent::Gossipsub(GossipsubEvent)` (`pubsub`);
 - `EndpointEvent::Discovery(DiscoveryEvent)` (`discovery` / `mdns`);
 - `EndpointEvent::RelayServer(RelayServerEvent)` (`relay-server`).
 
-The per-capability `take_*_events` / `next_*_event` methods remain as migration APIs until #181; they remove matching events from the same stream.
-
 Durable state is available through State snapshot getters (`connected_peers`, `is_peer_ready`, `peer_info`, `connection_id`, `connection_remote_addr`, `bound_addresses`, and with capabilities `path`, `reachability`, `active_reservation`, `known_peers`). `bound_addresses` reports transport-bound local addresses and can be non-empty before `listen` starts accepting. Those getters do not drive the endpoint, are not one cross-getter atomic snapshot, and may be ahead of the event stream, never behind their own emitted transition.
 
-Continue with [Listen and dial](/rust/listen-and-dial) or the [glossary](/reference/glossary).
+Continue with [Listen and connect](/rust/listen-and-dial) or the [glossary](/reference/glossary).

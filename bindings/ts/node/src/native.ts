@@ -67,9 +67,7 @@ interface NativeEndpointConfig {
     readonly ttlMs: bigint;
   };
   readonly protocols: string[];
-  readonly quic?: { readonly listenAddrs?: string[] };
   readonly relays: string[];
-  readonly tcp?: { readonly listenAddrs?: string[] };
 }
 
 export interface NativeEndpoint {
@@ -87,10 +85,7 @@ export interface NativeEndpoint {
       }
     | null
     | undefined;
-  connectTarget: (target: string | string[]) => bigint;
-  dial: (address: string) => bigint[];
-  dialIp4: (address: string) => bigint;
-  dialIp6: (address: string) => bigint;
+  connect: (target: string | string[]) => bigint;
   disconnect: (peerId: string) => void;
   discoveryNowMs: () => bigint | null | undefined;
   drainEvents: (limit: number) => unknown[];

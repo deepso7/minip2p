@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use minip2p::{ConnectOutcome, Event, Multiaddr, PeerAddr, PeerId, Protocol};
+use minip2p::{ConnectOutcome, EndpointEvent, Multiaddr, PeerAddr, PeerId, Protocol};
 use minip2p_example_common::{CliError, print_nat_event};
 
 /// The modes the CLI dispatches to.
@@ -276,19 +276,19 @@ fn require_supported_transport(what: &str, raw: &str, addr: &PeerAddr) -> Result
     }
 }
 
-/// Prints an [`Event`] in the CLI's one-event-per-line format.
+/// Prints an [`EndpointEvent`] in the CLI's one-event-per-line format.
 ///
 /// `role` is the tag shown in brackets at the start of the line
 /// (`listen` or `dial`).
-pub fn print_event(role: &str, event: &Event) {
+pub fn print_event(role: &str, event: &EndpointEvent) {
     match event {
-        Event::ConnectionEstablished { peer_id, .. } => {
+        EndpointEvent::ConnectionEstablished { peer_id, .. } => {
             println!("[{role}] connected peer={peer_id}");
         }
-        Event::ConnectionClosed { peer_id, .. } => {
+        EndpointEvent::ConnectionClosed { peer_id, .. } => {
             println!("[{role}] disconnected peer={peer_id}");
         }
-        Event::IdentifyReceived { peer_id, info } => {
+        EndpointEvent::IdentifyReceived { peer_id, info } => {
             let agent = info.agent_version.as_deref().unwrap_or("?");
             let nprotos = info.protocols.len();
             let protocols = format_protocols(&info.protocols);
@@ -302,7 +302,7 @@ pub fn print_event(role: &str, event: &Event) {
                 "[{role}] identify peer={peer_id} agent={agent} protocols={nprotos} list=[{protocols}] observed={observed}"
             );
         }
-        Event::PeerReady { peer_id, protocols } => {
+        EndpointEvent::PeerReady { peer_id, protocols } => {
             let protocol_list = format_protocols(protocols);
             println!(
                 "[{role}] peer-ready peer={peer_id} protocols={} list=[{}]",
@@ -310,13 +310,13 @@ pub fn print_event(role: &str, event: &Event) {
                 protocol_list
             );
         }
-        Event::PingRttMeasured { peer_id, rtt_ms } => {
+        EndpointEvent::PingRttMeasured { peer_id, rtt_ms } => {
             println!("[{role}] ping peer={peer_id} rtt={rtt_ms}ms");
         }
-        Event::PingTimeout { peer_id } => {
+        EndpointEvent::PingTimeout { peer_id } => {
             println!("[{role}] ping-timeout peer={peer_id}");
         }
-        Event::StreamReady {
+        EndpointEvent::StreamReady {
             peer_id,
             stream_id,
             protocol_id,
@@ -333,7 +333,7 @@ pub fn print_event(role: &str, event: &Event) {
                  protocol={protocol_id} dir={dir}"
             );
         }
-        Event::StreamData {
+        EndpointEvent::StreamData {
             peer_id,
             stream_id,
             data,
@@ -344,27 +344,27 @@ pub fn print_event(role: &str, event: &Event) {
                 data.len()
             );
         }
-        Event::StreamRemoteWriteClosed {
+        EndpointEvent::StreamRemoteWriteClosed {
             peer_id, stream_id, ..
         } => {
             println!("[{role}] user-stream-remote-write-closed peer={peer_id} stream={stream_id}");
         }
-        Event::StreamClosed {
+        EndpointEvent::StreamClosed {
             peer_id, stream_id, ..
         } => {
             println!("[{role}] user-stream-closed peer={peer_id} stream={stream_id}");
         }
-        Event::Error(error) => {
+        EndpointEvent::Error(error) => {
             eprintln!("[{role}] error {:?}: {}", error.kind, error.detail);
         }
-        Event::DialFailed {
+        EndpointEvent::DialFailed {
             conn_id,
             addr,
             reason,
         } => {
             eprintln!("[{role}] dial-failed conn={conn_id} addr={addr} reason={reason}");
         }
-        Event::ConnectSettled {
+        EndpointEvent::ConnectSettled {
             connect_id,
             peer_id,
             outcome,
@@ -388,7 +388,7 @@ pub fn print_event(role: &str, event: &Event) {
                 );
             }
         },
-        Event::Nat(event) => print_nat_event(role, event),
+        EndpointEvent::Nat(event) => print_nat_event(role, event),
         other => println!("[{role}] event {other:?}"),
     }
 }

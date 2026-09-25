@@ -348,13 +348,6 @@ pub enum P2pEvent {
         /// Human-readable failure detail.
         reason: String,
     },
-    /// Direct upgrade attempts ended with the relay path retained.
-    FellBackToRelay {
-        /// Endpoint-local connection-attempt id.
-        connect_id: u64,
-        /// Remote peer.
-        peer_id: String,
-    },
     /// A connection attempt ended without a usable path.
     ConnectFailed {
         /// Endpoint-local connection-attempt id.

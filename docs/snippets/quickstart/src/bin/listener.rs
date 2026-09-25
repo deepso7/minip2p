@@ -1,20 +1,21 @@
-use minip2p::{Deadline, Endpoint, PeerAddr};
+use minip2p::{Deadline, Endpoint, EndpointWaitOutcome, PeerAddr};
 
 fn main() -> Result<(), minip2p::Error> {
     let mut node = Endpoint::builder()
         .agent_version("minip2p-hello/listener")
-        .bind_quic_dual_stack()?;
+        .listen_default()?
+        .bind()?;
 
     println!("peer={}", node.peer_id());
     for address in node.listen_all()? {
         println!("listen={}", local_dialable(&address));
     }
 
-    while let Some(event) = node.next_event(Deadline::NEVER)? {
-        println!("{event:?}");
+    loop {
+        if let EndpointWaitOutcome::Event(event) = node.wait(Deadline::NEVER)? {
+            println!("{event:?}");
+        }
     }
-
-    Ok(())
 }
 
 fn local_dialable(address: &PeerAddr) -> String {

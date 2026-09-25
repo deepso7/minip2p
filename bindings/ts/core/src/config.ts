@@ -4,14 +4,7 @@ import type {
   Minip2pConfig,
   Minip2pDiscoveryOptions,
   Minip2pMdnsOptions,
-  Minip2pTransportOptions,
 } from "./types.js";
-
-/** Listen settings for one legacy transport-keyed listener. */
-export interface BackendTransportConfig {
-  /** Exact listen multiaddresses, or `undefined` for dual-stack defaults. */
-  readonly listenAddrs?: string[];
-}
 
 /**
  * Native-ready endpoint configuration: every SDK default applied, every
@@ -30,7 +23,7 @@ export interface BackendEndpointConfig {
     readonly topic: string;
   };
   readonly forceRelay: boolean;
-  /** Address-shaped listen set; when present, `quic` and `tcp` are absent. */
+  /** Listen multiaddresses, or `undefined` for the native QUIC dual-stack defaults. */
   readonly listen?: string[];
   readonly mdns?: {
     readonly autoDial: boolean;
@@ -43,13 +36,8 @@ export interface BackendEndpointConfig {
     readonly ttlMs: bigint;
   };
   readonly protocols: string[];
-  readonly quic?: BackendTransportConfig;
   readonly relays: string[];
-  readonly tcp?: BackendTransportConfig;
 }
-
-const MIXED_LISTEN_MESSAGE =
-  "use either address-shaped `listen` or legacy `quic`/`tcp` transport options, not both";
 
 /** Applies SDK defaults to `config` and validates it for a native adapter. */
 export function resolveEndpointConfig(
@@ -61,44 +49,11 @@ export function resolveEndpointConfig(
     autonatServers: [...(config.autonatServers ?? [])],
     discovery: resolveDiscovery(config.discovery),
     forceRelay: config.forceRelay ?? false,
+    listen: config.listen && [...config.listen],
     mdns: resolveMdns(config.mdns, config.discovery),
     protocols: [...(config.protocols ?? [])],
     relays: [...(config.relays ?? [])],
-    ...resolveListen(config),
   };
-}
-
-function resolveListen(
-  config: Minip2pConfig
-): Pick<BackendEndpointConfig, "listen" | "quic" | "tcp"> {
-  const { listen, transports } = config;
-  if (listen !== undefined) {
-    // Native would see only one of the two shapes, so reject the mix here
-    // with ffi-core's wording.
-    if (transports?.quic !== undefined || transports?.tcp !== undefined) {
-      throw new Error(MIXED_LISTEN_MESSAGE);
-    }
-    return { listen: [...listen] };
-  }
-  if (transports?.quic === undefined && transports?.tcp === undefined) {
-    return { quic: {} };
-  }
-  return {
-    quic: resolveTransport(transports.quic),
-    tcp: resolveTransport(transports.tcp),
-  };
-}
-
-function resolveTransport(
-  transport: true | Minip2pTransportOptions | undefined
-): BackendTransportConfig | undefined {
-  if (transport === undefined) {
-    return undefined;
-  }
-  if (transport === true || transport.listen === undefined) {
-    return {};
-  }
-  return { listenAddrs: [...transport.listen] };
 }
 
 function resolveDiscovery(

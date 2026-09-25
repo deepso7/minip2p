@@ -1,3 +1,4 @@
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 
 use minip2p::{Multiaddr, RateLimit, RelayServerConfig};
@@ -5,9 +6,9 @@ use minip2p::{Multiaddr, RateLimit, RelayServerConfig};
 #[derive(Debug)]
 pub struct Options {
     /// Exact QUIC binds; empty selects automatic IPv4/IPv6 binding.
-    pub quic_binds: Vec<String>,
+    pub quic_binds: Vec<SocketAddr>,
     /// Exact TCP binds; empty selects automatic IPv4/IPv6 binding.
-    pub tcp_binds: Vec<String>,
+    pub tcp_binds: Vec<SocketAddr>,
     pub key_path: Option<PathBuf>,
     pub announce_addrs: Vec<Multiaddr>,
     pub accepting: bool,
@@ -28,8 +29,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         let value = |args: &mut std::vec::IntoIter<String>| next_value(&flag, args);
         match flag.as_str() {
             "--help" | "-h" => return Err(usage().into()),
-            "--quic" => options.quic_binds.push(value(&mut args)?),
-            "--tcp" => options.tcp_binds.push(value(&mut args)?),
+            "--quic" => options.quic_binds.push(socket(&flag, value(&mut args)?)?),
+            "--tcp" => options.tcp_binds.push(socket(&flag, value(&mut args)?)?),
             "--key" => options.key_path = Some(value(&mut args)?.into()),
             "--announce" => options.announce_addrs.push(
                 value(&mut args)?
@@ -104,6 +105,19 @@ fn number<T: core::str::FromStr>(flag: &str, value: String) -> Result<T, String>
         .map_err(|_| format!("{flag} requires a non-negative integer, got {value:?}"))
 }
 
+/// Resolves one `HOST:PORT` bind to the single socket address it binds: the
+/// resolver's first answer. One flag is one socket, as before binds became
+/// listen multiaddrs; repeat the flag (or pass IPs) to bind both families.
+fn socket(flag: &str, value: String) -> Result<SocketAddr, String> {
+    value
+        .to_socket_addrs()
+        .map_err(|error| {
+            format!("{flag} requires a HOST:PORT socket address, got {value:?}: {error}")
+        })?
+        .next()
+        .ok_or_else(|| format!("{flag} {value:?} resolved to no address"))
+}
+
 fn rate(flag: &str, value: String) -> Result<Option<RateLimit>, String> {
     if value == "off" {
         return Ok(None);
@@ -118,7 +132,7 @@ fn rate(flag: &str, value: String) -> Result<Option<RateLimit>, String> {
 }
 
 pub fn usage() -> &'static str {
-    "usage: minip2p-relay [options]\n       minip2p-relay service <COMMAND>\n\nDefaults try QUIC and TCP on IPv4 and IPv6 port 19876, falling back to the available family.\n\n--quic ADDR                    exact QUIC socket bind (repeatable; replaces automatic binds)\n--tcp ADDR                     exact TCP socket bind (repeatable; replaces automatic binds)\n--key PATH                     load/create persistent Ed25519 identity\n--announce MULTIADDR           explicit public address (repeatable)\n--paused                       start with new admissions paused\n--max-reservations N           reservation capacity\n--reservation-duration SECS    reservation lifetime\n--max-circuits N               circuit capacity\n--max-circuits-per-peer N      per-endpoint circuit capacity\n--max-circuit-duration SECS    circuit lifetime (0 = unlimited)\n--max-circuit-bytes BYTES      per-direction bytes (0 = unlimited)\n--max-pending-hop N            pending HOP controls per connection\n--max-pending-stop N           pending STOP controls per connection\n--control-timeout-ms MS        end-to-end control timeout\n--reservation-peer-rate R      CAPACITY/REFILL_MS or off\n--reservation-ip-rate R        CAPACITY/REFILL_MS or off\n--circuit-peer-rate R          CAPACITY/REFILL_MS or off\n--circuit-ip-rate R            CAPACITY/REFILL_MS or off\n-h, --help                     show this help\n-V, --version                  show the release version\n\nService management:\n  minip2p-relay service install --hostname HOSTNAME\n  minip2p-relay service status | logs | restart | uninstall"
+    "usage: minip2p-relay [options]\n       minip2p-relay service <COMMAND>\n\nDefaults try QUIC and TCP on IPv4 and IPv6 port 19876, falling back to the available family.\n\n--quic HOST:PORT               exact QUIC socket bind (repeatable; replaces automatic binds)\n--tcp HOST:PORT                exact TCP socket bind (repeatable; replaces automatic binds)\n--key PATH                     load/create persistent Ed25519 identity\n--announce MULTIADDR           explicit public address (repeatable)\n--paused                       start with new admissions paused\n--max-reservations N           reservation capacity\n--reservation-duration SECS    reservation lifetime\n--max-circuits N               circuit capacity\n--max-circuits-per-peer N      per-endpoint circuit capacity\n--max-circuit-duration SECS    circuit lifetime (0 = unlimited)\n--max-circuit-bytes BYTES      per-direction bytes (0 = unlimited)\n--max-pending-hop N            pending HOP controls per connection\n--max-pending-stop N           pending STOP controls per connection\n--control-timeout-ms MS        end-to-end control timeout\n--reservation-peer-rate R      CAPACITY/REFILL_MS or off\n--reservation-ip-rate R        CAPACITY/REFILL_MS or off\n--circuit-peer-rate R          CAPACITY/REFILL_MS or off\n--circuit-ip-rate R            CAPACITY/REFILL_MS or off\n-h, --help                     show this help\n-V, --version                  show the release version\n\nService management:\n  minip2p-relay service install --hostname HOSTNAME\n  minip2p-relay service status | logs | restart | uninstall"
 }
 
 #[cfg(test)]
@@ -150,8 +164,9 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(options.quic_binds, ["127.0.0.1:4101", "[::1]:4101"]);
-        assert_eq!(options.tcp_binds, ["127.0.0.1:4201", "[::1]:4201"]);
+        let text = |binds: &[SocketAddr]| binds.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(text(&options.quic_binds), ["127.0.0.1:4101", "[::1]:4101"]);
+        assert_eq!(text(&options.tcp_binds), ["127.0.0.1:4201", "[::1]:4201"]);
     }
 
     #[test]
@@ -167,6 +182,20 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("at most one IPv4 and one IPv6"), "{error}");
+    }
+
+    #[test]
+    fn resolves_a_hostname_bind_to_one_address() {
+        let options = parse(["--tcp".into(), "localhost:4201".into()]).unwrap();
+        assert_eq!(options.tcp_binds.len(), 1);
+        let bind = options.tcp_binds[0];
+        assert!(bind.ip().is_loopback() && bind.port() == 4201, "{bind}");
+    }
+
+    #[test]
+    fn rejects_a_non_socket_bind_address() {
+        let error = parse(["--tcp".into(), "/ip4/127.0.0.1/tcp/4201".into()]).unwrap_err();
+        assert!(error.contains("--tcp requires a HOST:PORT"), "{error}");
     }
 
     #[test]

@@ -4,8 +4,6 @@ use minip2p_ffi_core as core;
 
 /// UniFFI mirror of the core signed-discovery options.
 pub type DiscoveryOptions = core::DiscoveryOptions;
-/// UniFFI mirror of the core transport options.
-pub type TransportOptions = core::TransportOptions;
 /// UniFFI mirror of the core endpoint configuration.
 pub type EndpointConfig = core::EndpointConfig;
 /// UniFFI mirror of the core mDNS options.
@@ -49,16 +47,6 @@ pub struct MdnsOptions {
     pub auto_dial: bool,
 }
 
-/// One enabled transport and the addresses it should listen on.
-#[uniffi::remote(Record)]
-pub struct TransportOptions {
-    /// Exact listen multiaddresses, or transport defaults when absent.
-    ///
-    /// An explicitly empty list is rejected: omit this field for defaults or
-    /// disable the transport by omitting it from [`EndpointConfig`].
-    pub listen_addrs: Option<Vec<String>>,
-}
-
 /// Configuration used to construct an FFI endpoint.
 #[uniffi::remote(Record)]
 pub struct EndpointConfig {
@@ -68,12 +56,9 @@ pub struct EndpointConfig {
     pub relays: Vec<String>,
     /// AutoNAT server peer addresses.
     pub autonat_servers: Vec<String>,
-    /// Address-shaped listen multiaddresses; transport is inferred from shape.
+    /// Listen multiaddresses; each address's shape selects its transport.
+    /// Absent binds the QUIC dual-stack defaults; an empty list is rejected.
     pub listen: Option<Vec<String>>,
-    /// QUIC configuration, or no QUIC transport when absent.
-    pub quic: Option<TransportOptions>,
-    /// TCP configuration, or no TCP transport when absent.
-    pub tcp: Option<TransportOptions>,
     /// Whether connection attempts must remain relayed.
     pub force_relay: bool,
     /// Whether unsigned pubsub messages are accepted.

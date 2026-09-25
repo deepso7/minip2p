@@ -9,8 +9,9 @@ if (!address || process.argv.length !== 3) {
 
 const endpoint = Minip2p.create({
   agentVersion: "minip2p-nodejs-example/0.1.0",
+  // Bind both transports so either printed listener address can be dialed.
+  listen: ["/ip4/127.0.0.1/udp/0/quic-v1", "/ip4/127.0.0.1/tcp/0"],
   secretKey: generateSecretKey(),
-  transports: { quic: {}, tcp: {} },
 });
 
 try {

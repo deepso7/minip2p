@@ -6,6 +6,10 @@ use std::time::{Duration, Instant};
 
 use minip2p::{Endpoint, PeerDiscoveryConfig};
 
+#[path = "../../../tests/support/endpoint.rs"]
+mod endpoint_support;
+use endpoint_support::NextEvent;
+
 fn endpoint() -> Endpoint {
     Endpoint::builder()
         .mdns()
@@ -14,7 +18,9 @@ fn endpoint() -> Endpoint {
             ..PeerDiscoveryConfig::default()
         })
         .expect("valid shared discovery policy")
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind mDNS endpoint")
 }
 

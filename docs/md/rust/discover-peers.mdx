@@ -22,7 +22,8 @@ Signed discovery publishes application-scoped presence beacons over pubsub:
 ```rust
 let mut node = minip2p::Endpoint::builder()
     .discovery()
-    .bind_quic_dual_stack()?;
+    .listen_default()?
+    .bind()?;
 
 node.listen_all()?;
 ```
@@ -35,7 +36,8 @@ Discovery can dial direct addresses announced by other peers without a relay. A 
 let node = minip2p::Endpoint::builder()
     .relay(relay)
     .discovery()
-    .bind_quic_dual_stack()?;
+    .listen_default()?
+    .bind()?;
 ```
 
 ## Enable local mDNS
@@ -49,7 +51,8 @@ Then enable it on the endpoint:
 ```rust
 let node = minip2p::Endpoint::builder()
     .mdns()
-    .bind_quic_dual_stack()?;
+    .listen_default()?
+    .bind()?;
 ```
 
 mDNS needs no pubsub or relay. Its observations are unauthenticated until the transport verifies the remote peer, and its automatic dials remain direct-only. `KnownPeer::beacon_addrs` and `KnownPeer::mdns_addrs` show where each address came from.
@@ -84,12 +87,13 @@ loop {
         minip2p::EndpointWaitOutcome::Event(minip2p::EndpointEvent::Discovery(event)) => {
             println!("{event:?}");
         }
-        _ => {} // other Endpoint events, deadline, interruption
+        minip2p::EndpointWaitOutcome::Event(other) => println!("{other:?}"), // dispatch as usual
+        _ => {} // deadline or interruption
     }
 }
 ```
 
-`EndpointEvent::Discovery(DiscoveryEvent)` reports peers being discovered, updated, or expired, plus automatic dial failures and rejected beacons. `known_peers` is a State snapshot and may be ahead of these events. The migration APIs `take_discovery_events` / `next_discovery_event(deadline)` remain until #181.
+`EndpointEvent::Discovery(DiscoveryEvent)` reports peers being discovered, updated, or expired, plus automatic dial failures and rejected beacons. `known_peers` is a State snapshot and may be ahead of these events.
 
 ## Customize policy
 
@@ -108,7 +112,8 @@ let policy = PeerDiscoveryConfig {
 let node = Endpoint::builder()
     .discovery_config(beacon)?
     .peer_discovery_config(policy)?
-    .bind_quic_dual_stack()?;
+    .listen_default()?
+    .bind()?;
 ```
 
 `BeaconConfig` controls the pubsub topic, cadence, and local announcement cap. `PeerDiscoveryConfig` is shared by signed discovery and mDNS; it controls peer and address bounds, source TTLs, automatic dialing, tie breaking, retry backoff, and mDNS dial-rate limits. Invalid bounds are rejected before a socket is allocated.

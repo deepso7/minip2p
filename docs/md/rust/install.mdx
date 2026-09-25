@@ -17,7 +17,9 @@ The default endpoint listens over QUIC and includes peer authentication, Identif
 use minip2p::Endpoint;
 
 fn main() -> Result<(), minip2p::Error> {
-    let node = Endpoint::builder().bind_quic("127.0.0.1:0")?;
+    let node = Endpoint::builder()
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")?
+        .bind()?;
     println!("local peer: {}", node.peer_id());
     Ok(())
 }
@@ -31,7 +33,7 @@ Add only the capabilities the application uses:
 
 | Need | Install | Enable on the endpoint |
 | --- | --- | --- |
-| TCP | `cargo add minip2p-rs --features tcp` | Bind a TCP listener. |
+| TCP | `cargo add minip2p-rs --features tcp` | Listen on a `/tcp` address with `.listen_on(...)`. |
 | Relay paths and NAT traversal | `cargo add minip2p-rs --features nat` | Configure a relay, an AutoNAT server, or both. |
 | Gossipsub | `cargo add minip2p-rs --features pubsub` | Call `.gossipsub()` or `.gossipsub_config(...)`. |
 | Signed discovery | `cargo add minip2p-rs --features discovery` | Call `.discovery()` or provide a discovery configuration. |

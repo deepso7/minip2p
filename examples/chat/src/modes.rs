@@ -8,9 +8,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    BeaconConfig, DISCOVERY_TOPIC, DiscoveryEvent, Endpoint, Event, GossipsubConfig,
-    GossipsubError, GossipsubEvent, NatConfig, NatEvent, PeerAddr, PeerDiscoveryConfig, PeerId,
-    PublishError,
+    BeaconConfig, ConnectId, ConnectOutcome, DISCOVERY_TOPIC, DiscoveryEvent, Endpoint,
+    EndpointEvent, EndpointWaitOutcome, GossipsubConfig, GossipsubError, GossipsubEvent, NatConfig,
+    NatEvent, Path, PeerAddr, PeerDiscoveryConfig, PeerId, PublishError,
 };
 
 use minip2p_example_common::{
@@ -74,10 +74,12 @@ fn build_endpoint(
     }
     let endpoint = match &options.listen_addr {
         Some(addr) => builder
-            .bind_quic_multiaddr(addr)
+            .listen_on_multiaddr(addr)
+            .and_then(|builder| builder.bind())
             .map_err(|e| format!("quic bind {addr}: {e}"))?,
         None => builder
-            .bind_quic_dual_stack()
+            .listen_default()
+            .and_then(|builder| builder.bind())
             .map_err(|e| format!("quic dual-stack bind: {e}"))?,
     };
     Ok(ChatEndpoint { endpoint })
@@ -138,22 +140,30 @@ pub fn run_host(relay: Option<PeerAddr>, options: ChatOptions) -> Result<(), Box
 fn wait_for_reservation(endpoint: &mut Endpoint, relay: &PeerAddr) -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + RESERVATION_DEADLINE;
     loop {
-        let Some(event) = endpoint
-            .next_nat_event(deadline)
+        match endpoint
+            .wait(deadline)
             .map_err(|e| format!("swarm poll: {e}"))?
-        else {
-            eprintln!(
-                "[host] warning: no relay reservation within {}s; still retrying",
-                RESERVATION_DEADLINE.as_secs()
-            );
-            return Ok(());
-        };
-        print_nat_event("host", &event);
-        if matches!(&event, NatEvent::RelayReserved { relay: reserved, .. }
-            if reserved == relay.peer_id())
         {
-            println!("[host] circuit={}", circuit_addr(relay, endpoint.peer_id()));
-            return Ok(());
+            EndpointWaitOutcome::Event(event) => {
+                let reserved = matches!(
+                    &event,
+                    EndpointEvent::Nat(NatEvent::RelayReserved { relay: reserved, .. })
+                        if reserved == relay.peer_id()
+                );
+                // Prints the `circuit=` line for the reservation too.
+                handle_event(endpoint, "host", Some(relay), event);
+                if reserved {
+                    return Ok(());
+                }
+            }
+            EndpointWaitOutcome::Interrupted => {}
+            EndpointWaitOutcome::Deadline => {
+                eprintln!(
+                    "[host] warning: no relay reservation within {}s; still retrying",
+                    RESERVATION_DEADLINE.as_secs()
+                );
+                return Ok(());
+            }
         }
     }
 }
@@ -185,6 +195,10 @@ pub fn run_join(
         .listen_all()
         .map_err(|e| format!("listen failed: {e}"))?;
     println!("[join] us={}", endpoint.peer_id());
+    let (topic, nick) = topic_and_nick(&options, &endpoint);
+    // The host announces its topic once per connection, and that can land
+    // while the joiner is still waiting for a path or Identify.
+    let mut host_subscribed = false;
 
     let (host_peer, connect_id) = match &target {
         JoinTarget::Circuit { relay, peer } => {
@@ -203,39 +217,88 @@ pub fn run_join(
         }
     };
 
-    let path = endpoint
-        .nat_wait_path(connect_id, CONNECT_DEADLINE)
-        .map_err(|e| format!("waiting for a path: {e}"))?;
-    let Some(path) = path else {
-        // The attempt's ConnectSettled (if it settled) is still queued.
-        while let Some(event) = endpoint.next_event(Duration::ZERO)? {
-            if let Event::ConnectSettled {
-                connect_id: settled,
-                outcome,
-                ..
-            } = &event
-                && *settled == connect_id
-            {
-                eprintln!("[join] connect-settled outcome={outcome:?}");
-            }
-        }
-        return Err("no path to the host".into());
-    };
+    let path = wait_for_path(
+        &mut endpoint,
+        &host_peer,
+        connect_id,
+        &topic,
+        &mut host_subscribed,
+    )?;
     println!("[join] path={}", path_name(&path));
 
-    endpoint
-        .wait_peer_ready(&host_peer, READY_DEADLINE)
-        .map_err(|e| format!("waiting for identify: {e}"))?
-        .ok_or("identify never completed on the selected connection")?;
+    let ready_deadline = Instant::now() + READY_DEADLINE;
+    while !endpoint.is_peer_ready(&host_peer) {
+        match endpoint
+            .wait(ready_deadline)
+            .map_err(|e| format!("waiting for identify: {e}"))?
+        {
+            EndpointWaitOutcome::Event(event) => {
+                host_subscribed |= is_topic_subscription(&event, &host_peer, &topic);
+                handle_event(&endpoint, "join", None, event);
+            }
+            EndpointWaitOutcome::Interrupted => {}
+            EndpointWaitOutcome::Deadline => {
+                return Err("identify never completed on the selected connection".into());
+            }
+        }
+    }
 
-    let (topic, nick) = topic_and_nick(&options, &endpoint);
     endpoint
         .subscribe(&topic)
         .map_err(|e| format!("subscribe: {e}"))?;
     println!("[join] subscribed topic={topic} nick={nick}");
-    wait_for_topic_peer(&mut endpoint, &host_peer, &topic, "join")?;
+    if host_subscribed {
+        println!("[join] pubsub-ready peer={host_peer} topic={topic}");
+    } else {
+        wait_for_topic_peer(&mut endpoint, &host_peer, &topic, "join")?;
+    }
 
     run_chat(&mut endpoint, &topic, &nick, "join", None)
+}
+
+/// Waits for the attempt's first usable path (the provisional relayed one,
+/// when that lands first) while handling unrelated events as the chat loop
+/// would. An attempt that settles connected without a path event reports the
+/// current path. Records whether the host's `topic` announcement went by.
+fn wait_for_path(
+    endpoint: &mut Endpoint,
+    host_peer: &PeerId,
+    connect_id: ConnectId,
+    topic: &str,
+    host_subscribed: &mut bool,
+) -> Result<Path, Box<dyn Error>> {
+    let deadline = Instant::now() + CONNECT_DEADLINE;
+    loop {
+        match endpoint
+            .wait(deadline)
+            .map_err(|e| format!("waiting for a path: {e}"))?
+        {
+            EndpointWaitOutcome::Event(EndpointEvent::Nat(NatEvent::PathEstablished {
+                connect_id: id,
+                path,
+                ..
+            })) if id == connect_id => return Ok(path),
+            EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled {
+                connect_id: id,
+                outcome,
+                ..
+            }) if id == connect_id => {
+                if matches!(outcome, ConnectOutcome::Connected { .. })
+                    && let Some(path) = endpoint.path(host_peer)
+                {
+                    return Ok(path);
+                }
+                eprintln!("[join] connect-settled outcome={outcome:?}");
+                return Err("no path to the host".into());
+            }
+            EndpointWaitOutcome::Event(event) => {
+                *host_subscribed |= is_topic_subscription(&event, host_peer, topic);
+                handle_event(endpoint, "join", None, event);
+            }
+            EndpointWaitOutcome::Interrupted => {}
+            EndpointWaitOutcome::Deadline => return Err("no path to the host".into()),
+        }
+    }
 }
 
 /// Waits until the host's topic announcement has been applied. The
@@ -250,25 +313,35 @@ fn wait_for_topic_peer(
 ) -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + READY_DEADLINE;
     loop {
-        let Some(event) = endpoint
-            .next_gossipsub_event(deadline)
+        let event = match endpoint
+            .wait(deadline)
             .map_err(|e| format!("waiting for pubsub readiness: {e}"))?
-        else {
-            return Err(
-                format!("peer {expected_peer} did not announce topic {expected_topic}").into(),
-            );
+        {
+            EndpointWaitOutcome::Event(event) => event,
+            EndpointWaitOutcome::Interrupted => continue,
+            EndpointWaitOutcome::Deadline => {
+                return Err(format!(
+                    "peer {expected_peer} did not announce topic {expected_topic}"
+                )
+                .into());
+            }
         };
-        let ready = matches!(
-            &event,
-            GossipsubEvent::PeerSubscribed { peer, topic }
-                if peer == expected_peer && topic == expected_topic
-        );
-        print_gossipsub_event(role, event);
+        let ready = is_topic_subscription(&event, expected_peer, expected_topic);
+        handle_event(endpoint, role, None, event);
         if ready {
             println!("[{role}] pubsub-ready peer={expected_peer} topic={expected_topic}");
             return Ok(());
         }
     }
+}
+
+/// Whether `event` is `peer` announcing a subscription to `topic`.
+fn is_topic_subscription(event: &EndpointEvent, peer: &PeerId, topic: &str) -> bool {
+    matches!(
+        event,
+        EndpointEvent::Gossipsub(GossipsubEvent::PeerSubscribed { peer: subscriber, topic: subscribed })
+            if subscriber == peer && subscribed == topic
+    )
 }
 
 // --- the chat loop ----------------------------------------------------------
@@ -306,7 +379,7 @@ fn run_chat(
     eprintln!("[{role}] type to chat; Ctrl-D to leave");
 
     // A pipe can produce lines faster than a human ever will; bounding the
-    // per-tick drain keeps the network pump (next_event below) live even
+    // per-tick drain keeps the network pump (`wait` below) live even
     // under a stdin flood.
     const MAX_LINES_PER_TICK: usize = 32;
 
@@ -335,38 +408,46 @@ fn run_chat(
             }
         }
 
-        if let Some(event) = endpoint.next_event(Duration::from_millis(100))? {
-            match event {
-                Event::ConnectionEstablished { peer_id, .. } => {
-                    println!("[{role}] connected peer={peer_id}");
-                }
-                Event::ConnectionClosed { peer_id, .. } => {
-                    println!("[{role}] disconnected peer={peer_id}");
-                }
-                Event::Error(error) => {
-                    eprintln!("[{role}] error {:?}: {}", error.kind, error.detail);
-                }
-                Event::Gossipsub(event) => print_gossipsub_event(role, event),
-                Event::Nat(event) => {
-                    print_nat_event(role, &event);
-                    // A reservation that lands late (after the startup wait
-                    // warned) or is re-acquired after a loss still needs its
-                    // circuit address printed -- joiners have nothing to
-                    // paste otherwise.
-                    if let Some(relay) = relay
-                        && matches!(&event, NatEvent::RelayReserved { relay: reserved, .. }
-                            if reserved == relay.peer_id())
-                    {
-                        println!(
-                            "[{role}] circuit={}",
-                            circuit_addr(relay, endpoint.peer_id())
-                        );
-                    }
-                }
-                Event::Discovery(event) => print_discovery_event(role, event),
-                _ => {}
+        match endpoint.wait(Duration::from_millis(100))? {
+            EndpointWaitOutcome::Event(event) => handle_event(endpoint, role, relay, event),
+            EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted => {}
+        }
+    }
+}
+
+/// Prints one endpoint event the way the chat loop surfaces it: membership,
+/// failures, room traffic, and NAT/discovery progress. With `relay`, a
+/// reservation on it also prints the `circuit=` line joiners paste.
+fn handle_event(endpoint: &Endpoint, role: &str, relay: Option<&PeerAddr>, event: EndpointEvent) {
+    match event {
+        EndpointEvent::ConnectionEstablished { peer_id, .. } => {
+            println!("[{role}] connected peer={peer_id}");
+        }
+        EndpointEvent::ConnectionClosed { peer_id, .. } => {
+            println!("[{role}] disconnected peer={peer_id}");
+        }
+        EndpointEvent::Error(error) => {
+            eprintln!("[{role}] error {:?}: {}", error.kind, error.detail);
+        }
+        EndpointEvent::Gossipsub(event) => print_gossipsub_event(role, event),
+        EndpointEvent::Nat(event) => {
+            print_nat_event(role, &event);
+            // A reservation that lands late (after the startup wait
+            // warned) or is re-acquired after a loss still needs its
+            // circuit address printed -- joiners have nothing to
+            // paste otherwise.
+            if let Some(relay) = relay
+                && matches!(&event, NatEvent::RelayReserved { relay: reserved, .. }
+                    if reserved == relay.peer_id())
+            {
+                println!(
+                    "[{role}] circuit={}",
+                    circuit_addr(relay, endpoint.peer_id())
+                );
             }
         }
+        EndpointEvent::Discovery(event) => print_discovery_event(role, event),
+        _ => {}
     }
 }
 

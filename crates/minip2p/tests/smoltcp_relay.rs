@@ -334,13 +334,13 @@ fn tcp_smoltcp_peers_establish_and_use_a_relay_circuit() {
 
     let mut a = Endpoint::portable(&a_identity, CountingEntropy(10))
         .smoltcp(stack(bus.device(0), A_IP))
-        .relay_config(relay_config(relay_addr.clone(), ReservationPolicy::Never))
+        .nat_config(relay_config(relay_addr.clone(), ReservationPolicy::Never))
         .protocol(APP_PROTOCOL)
         .build()
         .unwrap();
     let mut b = Endpoint::portable(&b_identity, CountingEntropy(20))
         .smoltcp(stack(bus.device(1), B_IP))
-        .relay_config(relay_config(relay_addr, ReservationPolicy::Always))
+        .nat_config(relay_config(relay_addr, ReservationPolicy::Always))
         .protocol(APP_PROTOCOL)
         .build()
         .unwrap();
@@ -477,7 +477,7 @@ fn portable_relay_rejects_udp_traversal_policy() {
 
     let error = Endpoint::portable(&local, CountingEntropy(40))
         .smoltcp(stack(bus.device(0), A_IP))
-        .relay_config(config)
+        .nat_config(config)
         .build()
         .err()
         .expect("DCUtR policy is rejected");
@@ -510,7 +510,7 @@ fn portable_relay_and_autonat_compose_and_register_their_protocols() {
     };
     let mut endpoint = Endpoint::portable(&local, CountingEntropy(50))
         .smoltcp(stack(bus.device(0), A_IP))
-        .portable_nat_config(config)
+        .nat_config(config)
         .build()
         .expect("relay and AutoNAT policy composes");
 
@@ -576,7 +576,7 @@ fn relay_preserves_an_explicit_reservation_policy() {
     };
     let mut endpoint = Endpoint::portable(&local, CountingEntropy(52))
         .smoltcp(stack(bus.device(0), A_IP))
-        .portable_nat_config(config)
+        .nat_config(config)
         .relay(relay_addr)
         .build()
         .expect("adding a relay completes the reservation policy");
@@ -604,7 +604,7 @@ fn relay_attempt_uses_host_deadline_and_cancellation_settles_once() {
         let mut endpoint = Endpoint::portable(&local, CountingEntropy(53))
             .connect_deadline_ms(50)
             .smoltcp(stack(bus.device(0), A_IP))
-            .relay_config(relay_config(relay, ReservationPolicy::Never))
+            .nat_config(relay_config(relay, ReservationPolicy::Never))
             .build()
             .unwrap();
 

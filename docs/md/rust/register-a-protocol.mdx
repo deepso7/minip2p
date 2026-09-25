@@ -3,14 +3,15 @@ title: Register a protocol
 description: Register an application protocol, negotiate streams, exchange bytes, and close or abandon stream state on purpose.
 ---
 
-Application protocols use libp2p multistream-select negotiation over an authenticated connection. Both peers must register the same versioned protocol ID. Dial or `connect*` first; open streams once the peer is connected. Waiting for [`PeerReady`](/rust/concepts#connection-readiness) is optional when you want Identify's advertised protocols before opening.
+Application protocols use libp2p multistream-select negotiation over an authenticated connection. Both peers must register the same versioned protocol ID. `connect` first; open streams once the peer is connected. Waiting for [`PeerReady`](/rust/concepts#connection-readiness) is optional when you want Identify's advertised protocols before opening.
 
 ```rust
 const ECHO_PROTOCOL: &str = "/my-app/echo/1.0.0";
 
 let mut node = minip2p::Endpoint::builder()
     .protocol(ECHO_PROTOCOL)
-    .bind_quic_dual_stack()?;
+    .listen_default()?
+    .bind()?;
 ```
 
 You can also call `add_protocol` after binding. Registration affects inbound and outbound negotiation.
@@ -23,36 +24,47 @@ You can also call `add_protocol` after binding. Registration affects inbound and
 
 ## Open an outbound stream
 
-Once the peer is connected, request a stream. The snippet below waits for Identify first so unsupported protocols fail early with `RemoteDoesNotSupport`; that wait is policy, not a stack requirement:
+Once the attempt settles `Connected`, request a stream. A protocol both peers registered does not need to wait for Identify; match `PeerReady` first only if you want unsupported protocols to fail early with `RemoteDoesNotSupport`.
+
+`open_stream` starts negotiation and returns the allocated stream ID. Wait for the matching `EndpointEvent::StreamReady` before writing:
 
 ```rust
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-node.wait_peer_ready(&peer_id, Duration::from_secs(10))?
-    .ok_or("peer did not become ready")?;
+use minip2p::{ConnectOutcome, EndpointEvent, EndpointWaitOutcome};
 
-let stream_id = node.open_stream(&peer_id, ECHO_PROTOCOL)?;
-```
+let peer_id = target.peer_id().clone();
+let connect_id = node.connect(target)?;
+let mut stream_id = None;
+let deadline = Instant::now() + Duration::from_secs(10);
 
-`open_stream` starts negotiation and returns the allocated stream ID. Wait for the matching `Event::StreamReady` before writing, either in your main `wait` loop or by matching the stream event in your event dispatcher:
-
-```rust
 loop {
-    let event = node
-        .next_event(Duration::from_secs(10))?
-        .ok_or("stream negotiation timed out")?;
+    let event = match node.wait(deadline)? {
+        EndpointWaitOutcome::Event(event) => event,
+        // Another thread woke the wait; nothing to service here.
+        EndpointWaitOutcome::Interrupted => continue,
+        EndpointWaitOutcome::Deadline => return Err("stream negotiation timed out".into()),
+    };
 
     match event {
-        minip2p::Event::StreamReady {
+        EndpointEvent::ConnectSettled {
+            connect_id: id,
+            outcome,
+            ..
+        } if id == connect_id => match outcome {
+            ConnectOutcome::Connected { .. } => {
+                stream_id = Some(node.open_stream(&peer_id, ECHO_PROTOCOL)?);
+            }
+            other => return Err(format!("connect failed: {other:?}").into()),
+        },
+        EndpointEvent::StreamReady {
             peer_id: peer,
             stream_id: ready,
             protocol_id,
             ..
-        } if peer == peer_id
-            && ready == stream_id
-            && protocol_id == ECHO_PROTOCOL => {
-            node.send_stream(&peer_id, stream_id, b"hello".to_vec())?;
-            node.close_stream_write(&peer_id, stream_id)?;
+        } if peer == peer_id && Some(ready) == stream_id && protocol_id == ECHO_PROTOCOL => {
+            node.send_stream(&peer_id, ready, b"hello".to_vec())?;
+            node.close_stream_write(&peer_id, ready)?;
             break;
         }
         other => handle_other_event(other),
@@ -71,12 +83,12 @@ Inbound negotiation produces the same `StreamReady` event with `initiated_locall
 ```rust
 use std::collections::HashSet;
 
-use minip2p::{Event, PeerId, StreamId};
+use minip2p::{EndpointEvent, PeerId, StreamId};
 
 let mut echo_streams: HashSet<(PeerId, StreamId)> = HashSet::new();
 
 match event {
-    Event::StreamReady {
+    EndpointEvent::StreamReady {
         peer_id,
         stream_id,
         protocol_id,
@@ -85,7 +97,7 @@ match event {
     } if protocol_id == ECHO_PROTOCOL => {
         echo_streams.insert((peer_id, stream_id));
     }
-    Event::StreamData {
+    EndpointEvent::StreamData {
         peer_id,
         stream_id,
         data,
@@ -107,12 +119,12 @@ match event {
 | `reset_stream` | Abruptly terminate the stream while keeping terminal stream events visible. |
 | `abandon_stream` | Reset the stream, purge buffered matching events, and suppress later matching stream events. |
 
-Use `abandon_stream` when an application has permanently stopped consuming a stream. Calling it again while the abandon/reset is still pending is safe and keeps an ignored stream from filling focused wait buffers. After the stream is fully forgotten, a later call returns an error.
+Use `abandon_stream` when an application has permanently stopped consuming a stream. Calling it again while the abandon/reset is still pending is safe and keeps an ignored stream's events out of the Endpoint event stream. After the stream is fully forgotten, a later call returns an error.
 
 The complete two-peer echo used in CI lives in [`docs/snippets/custom-stream`](https://github.com/deepso7/minip2p/tree/main/docs/snippets/custom-stream). That fixture rewrites wildcard listen addresses to loopback before printing them, the same way [Connect two peers](/rust/connect-peers) does.
 
 ## Driver-owned streams
 
-When NAT, pubsub, or discovery drivers are active, they register and consume their own control-plane streams. Those events do not surface as application `StreamData`; use the matching NAT, pubsub, or discovery event APIs instead.
+When NAT, pubsub, or discovery drivers are active, they register and consume their own control-plane streams. Those events do not surface as application `StreamData`; handle `EndpointEvent::Nat`, `EndpointEvent::Gossipsub`, or `EndpointEvent::Discovery` instead.
 
 Next: [Drive events](/rust/drive-events).

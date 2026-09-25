@@ -5,7 +5,7 @@
 | Rust `Endpoint` capability | TypeScript SDK |
 | --- | --- |
 | Identity, peer ID, bound addresses | `@minip2p/react-native` exports `generateSecretKey` and `peerIdFromSecretKey`; the portable `@minip2p/core` endpoint API exposes `peerId` and `listenAddrs` |
-| QUIC and TCP direct dial (dual family, IPv4, IPv6) | `dial`, `dialIp4`, `dialIp6` |
+| Address-shaped QUIC and TCP listeners | `listen` configuration |
 | Ping | Promise-returning `ping`, plus typed ping events |
 | Identify readiness and snapshots | `isPeerReady`, `waitPeerReady`, `peerInfo`, Identify events |
 | Custom protocol registration | `protocols` configuration, `addProtocol` |
@@ -17,6 +17,6 @@
 | Signed discovery | discovery configuration, `knownPeers`, discovery events |
 | mDNS | mDNS configuration, merged `knownPeers`, source-tagged discovery events |
 | Shutdown | `close`, `onClose`, and `Symbol.dispose`; the low-level native export also provides `stop`/`waitStopped` |
-| Caller-driven polling and focused waits | Implemented by each platform backend; surfaced as callbacks, queries, and typed Promise waits |
+| One Endpoint event stream and its blocking wait (event, deadline, interrupted) | Driven by each platform backend; surfaced as typed events, State getters, and Promise waits such as `waitFor` and `waitConnectResult` |
 
 Rust-only escape hatches such as `swarm()`/`swarm_mut()` are implementation accessors rather than portable endpoint features and are intentionally not part of the cross-platform SDK. Resource-policy tuning remains native configuration until it has consistent semantics across every backend.

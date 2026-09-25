@@ -121,36 +121,8 @@ impl P2pEndpoint {
         self.0.abandon_stream(peer_id, stream_id)
     }
     /// Starts one Connection attempt and returns its Connect ID.
-    pub fn connect_target(&self, target: ConnectTarget) -> Result<u64, FfiError> {
-        self.0.connect_target(target)
-    }
-    /// Starts a connection attempt.
-    pub fn connect(&self, peer_id: String) -> Result<u64, FfiError> {
-        self.0.connect(peer_id)
-    }
-    /// Starts a connection attempt with explicit addresses.
-    pub fn connect_with_addrs(
-        &self,
-        peer_id: String,
-        addresses: Vec<String>,
-    ) -> Result<u64, FfiError> {
-        self.0.connect_with_addrs(peer_id, addresses)
-    }
-    /// Starts a direct-address connection attempt.
-    pub fn connect_addr(&self, address: String) -> Result<u64, FfiError> {
-        self.0.connect_addr(address)
-    }
-    /// Dials on all applicable address families.
-    pub fn dial(&self, address: String) -> Result<Vec<u64>, FfiError> {
-        self.0.dial(address)
-    }
-    /// Dials using IPv4.
-    pub fn dial_ip4(&self, address: String) -> Result<u64, FfiError> {
-        self.0.dial_ip4(address)
-    }
-    /// Dials using IPv6.
-    pub fn dial_ip6(&self, address: String) -> Result<u64, FfiError> {
-        self.0.dial_ip6(address)
+    pub fn connect(&self, target: ConnectTarget) -> Result<u64, FfiError> {
+        self.0.connect(target)
     }
     /// Cancels a connection attempt.
     pub fn cancel_connect(&self, id: u64) -> Result<(), FfiError> {

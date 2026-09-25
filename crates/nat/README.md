@@ -79,16 +79,38 @@ loop {
 }
 ```
 
-The `minip2p` crate (cargo feature `nat`) wires exactly this loop into `Endpoint` so applications get `connect(&peer)`, `ConnectSettled`, and `EndpointEvent::Nat(..)` from `Endpoint::wait` without touching the pump. Attempt terminals (`ConnectFailed`, `FellBackToRelay`) are consumed by the Endpoint's Connection-attempt engine and surface only as `ConnectSettled`. The migration-era `nat_wait_path` remains until #181:
+The `minip2p` crate (cargo feature `nat`) wires exactly this loop into `Endpoint` so applications get `connect(target)`, `ConnectSettled`, and `EndpointEvent::Nat(..)` from `Endpoint::wait` without touching the pump. Attempt terminals (`ConnectFailed`, `FellBackToRelay`) are consumed by the Endpoint's Connection-attempt engine and surface only as `ConnectSettled`:
 
 ```rust,ignore
+use minip2p::{EndpointEvent, EndpointWaitOutcome, NatEvent};
+
 let mut node = minip2p::Endpoint::builder()
     .relay(relay_peer_addr)
-    .bind_quic("0.0.0.0:0")?;
+    .listen_default()?
+    .bind()?;
 node.listen_all()?;
 let id = node.connect(vec_of_peer_addrs)?;
-if let Some(path) = node.nat_wait_path(id, std::time::Duration::from_secs(30))? {
-    println!("reached peer via {path:?}");
+let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+loop {
+    match node.wait(deadline)? {
+        EndpointWaitOutcome::Event(EndpointEvent::Nat(NatEvent::PathEstablished {
+            connect_id,
+            path,
+            ..
+        })) if connect_id == id => println!("reached peer via {path:?}"),
+        EndpointWaitOutcome::Event(EndpointEvent::ConnectSettled { connect_id, outcome, .. })
+            if connect_id == id =>
+        {
+            println!("settled: {outcome:?}");
+            break;
+        }
+        EndpointWaitOutcome::Event(other) => { /* dispatch unrelated events */ }
+        EndpointWaitOutcome::Interrupted => {}
+        EndpointWaitOutcome::Deadline => {
+            node.cancel_connect(id); // the deadline is local; cancel explicitly
+            break;
+        }
+    }
 }
 ```
 
@@ -97,7 +119,7 @@ if let Some(path) = node.nat_wait_path(id, std::time::Duration::from_secs(30))? 
 Independent of connect attempts, the agent also runs:
 
 - **Reachability probing** (`NatConfig::autonat_servers`): single-shot AutoNAT probes aggregated through an M-sample window — the verdict flips only when N of the last M probes agree (defaults N=3, M=5), so one flaky probe never flaps `ReachabilityChanged`.
-- **Relay reservations** (`NatConfig::reservation_policy`): held per policy (`Always` / `WhenPrivate` / `Never`), renewed `reservation_renewal_margin_secs` before the relay-reported `expire` (default-TTL fallback when the relay omits it or the host has no wall clock), rotating relays with backoff on refusal, and reacquiring after a lost relay session. While a QUIC reservation is held, the agent requests a ping every `reservation_keep_alive_interval_ms` (15 seconds by default) so an otherwise idle connection does not reach QUIC's idle timeout. Set it below the configured QUIC idle timeout; `0` disables these pings. TCP reservations do not schedule them. In the `minip2p` endpoint, successful automatic pings emit the same `Event::PingRttMeasured` event as a caller-requested ping. `WhenPrivate` reserves while reachability is Unknown or Private and releases once probes settle on Public.
+- **Relay reservations** (`NatConfig::reservation_policy`): held per policy (`Always` / `WhenPrivate` / `Never`), renewed `reservation_renewal_margin_secs` before the relay-reported `expire` (default-TTL fallback when the relay omits it or the host has no wall clock), rotating relays with backoff on refusal, and reacquiring after a lost relay session. While a QUIC reservation is held, the agent requests a ping every `reservation_keep_alive_interval_ms` (15 seconds by default) so an otherwise idle connection does not reach QUIC's idle timeout. Set it below the configured QUIC idle timeout; `0` disables these pings. TCP reservations do not schedule them. In the `minip2p` endpoint, successful automatic pings emit the same `EndpointEvent::PingRttMeasured` event as a caller-requested ping. `WhenPrivate` reserves while reachability is Unknown or Private and releases once probes settle on Public.
 
 ## Responder side
 

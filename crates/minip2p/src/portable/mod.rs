@@ -157,15 +157,6 @@ impl<T: Transport, E: EntropySource> PortableEndpoint<T, E> {
         self.runtime.listen_on_bound_addrs()
     }
 
-    /// Starts dialing a peer address.
-    ///
-    /// Prefer [`Self::connect`] for a Connection attempt with one identity and
-    /// one terminal outcome. `dial` remains for raw Transport dials until the
-    /// contraction ticket.
-    pub fn dial(&mut self, address: &PeerAddr) -> Result<ConnectionId, DriverError> {
-        self.runtime.dial(address)
-    }
-
     /// Admits one Connection attempt. Sync errors: malformed target only.
     ///
     /// A [`PeerId`] target with no candidates settles
@@ -1344,17 +1335,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpointBuilder<D, E> {
     /// TCP relay configurations must set `force_relay`; UDP DCUtR remains
     /// unavailable. AutoNAT servers may be configured with or without relays.
     #[cfg(feature = "portable-autonat")]
-    pub fn portable_nat_config(mut self, config: minip2p_nat::NatConfig) -> Self {
-        self.nat_config = Some(config);
-        self
-    }
-
-    /// Enables portable relay orchestration with explicit policy.
-    ///
-    /// This is an alias for [`Self::portable_nat_config`] available with the
-    /// relay feature.
-    #[cfg(feature = "portable-relay")]
-    pub fn relay_config(mut self, config: minip2p_nat::NatConfig) -> Self {
+    pub fn nat_config(mut self, config: minip2p_nat::NatConfig) -> Self {
         self.nat_config = Some(config);
         self
     }

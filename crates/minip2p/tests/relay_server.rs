@@ -11,9 +11,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use minip2p::{
-    Endpoint, EndpointBuilder, Event, NatConfig, NatEvent, Path, PeerAddr, RelayServerEvent,
-    ReservationPolicy,
+    Endpoint, EndpointBuilder, EndpointEvent, NatConfig, NatEvent, Path, PeerAddr,
+    RelayServerEvent, ReservationPolicy,
 };
+
+#[path = "../../../tests/support/endpoint.rs"]
+mod endpoint_support;
+use endpoint_support::NextEvent;
 
 const ECHO_PROTOCOL: &str = "/minip2p/tests/endpoint-relay-echo/1.0.0";
 const HOP_PROTOCOL: &str = "/libp2p/circuit/relay/0.2.0/hop";
@@ -27,7 +31,7 @@ fn exercise_relay(
     let relay_thread = thread::spawn(move || {
         let mut relay_events = Vec::new();
         while stop_rx.try_recv().is_err() {
-            if let Some(Event::RelayServer(event)) = relay
+            if let Some(EndpointEvent::RelayServer(event)) = relay
                 .next_event(Duration::from_millis(10))
                 .expect("drive relay server")
             {
@@ -54,7 +58,7 @@ fn exercise_relay(
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         assert!(Instant::now() < deadline, "reservation timed out");
-        if let Some(Event::Nat(NatEvent::RelayReserved { relay, .. })) =
+        if let Some(EndpointEvent::Nat(NatEvent::RelayReserved { relay, .. })) =
             responder.next_event(Duration::from_millis(20)).unwrap()
             && &relay == relay_addr.peer_id()
         {
@@ -88,7 +92,7 @@ fn exercise_relay(
             trace.push(format!("initiator: {event:?}"));
             connected = matches!(
                 event,
-                Event::Nat(NatEvent::PathEstablished { connect_id: found, path: Path::Relayed { .. }, .. })
+                EndpointEvent::Nat(NatEvent::PathEstablished { connect_id: found, path: Path::Relayed { .. }, .. })
                     if found == connect_id
             );
         }
@@ -137,7 +141,7 @@ fn exercise_relay(
         assert!(Instant::now() < deadline, "relay payload timed out");
         if let Some(event) = initiator.next_event(Duration::from_millis(20)).unwrap() {
             match event {
-                Event::StreamReady {
+                EndpointEvent::StreamReady {
                     peer_id,
                     stream_id,
                     initiated_locally: true,
@@ -147,7 +151,7 @@ fn exercise_relay(
                         .send_stream(&responder_peer, stream, payload.clone())
                         .unwrap();
                 }
-                Event::StreamData {
+                EndpointEvent::StreamData {
                     peer_id,
                     stream_id,
                     data,
@@ -160,7 +164,7 @@ fn exercise_relay(
         }
         if let Some(event) = responder.next_event(Duration::from_millis(20)).unwrap() {
             match event {
-                Event::StreamReady {
+                EndpointEvent::StreamReady {
                     peer_id,
                     stream_id,
                     initiated_locally: false,
@@ -169,7 +173,7 @@ fn exercise_relay(
                 } if peer_id == initiator_peer && protocol_id == ECHO_PROTOCOL => {
                     responder_stream = Some(stream_id);
                 }
-                Event::StreamData {
+                EndpointEvent::StreamData {
                     peer_id,
                     stream_id,
                     data,
@@ -199,11 +203,17 @@ fn exercise_relay(
 fn quic_clients_exchange_payload_through_quic_relay_endpoint() {
     let mut relay = Endpoint::builder()
         .relay_server()
-        .bind_quic("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
         .expect("bind relay");
     let relay_addr = relay.listen().expect("relay listens");
     exercise_relay(relay, relay_addr, |builder| {
-        builder.bind_quic("127.0.0.1:0").expect("bind client")
+        builder
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
+            .expect("bind client")
     });
 }
 
@@ -212,10 +222,16 @@ fn quic_clients_exchange_payload_through_quic_relay_endpoint() {
 fn tcp_clients_exchange_payload_through_tcp_relay_endpoint() {
     let mut relay = Endpoint::builder()
         .relay_server()
-        .bind_tcp("127.0.0.1:0")
+        .listen_on("/ip4/127.0.0.1/tcp/0")
+        .expect("tcp listen address")
+        .bind()
         .expect("bind relay");
     let relay_addr = relay.listen().expect("relay listens");
     exercise_relay(relay, relay_addr, |builder| {
-        builder.bind_tcp("127.0.0.1:0").expect("bind client")
+        builder
+            .listen_on("/ip4/127.0.0.1/tcp/0")
+            .expect("tcp listen address")
+            .bind()
+            .expect("bind client")
     });
 }

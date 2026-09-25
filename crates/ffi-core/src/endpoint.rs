@@ -15,107 +15,36 @@ use minip2p::{
 
 use crate::{
     DriverStats, EndpointConfig, EventDoorbell, FfiError, IdentifyInfo, KnownPeerInfo, P2pEvent,
-    RelayReservationInfo, TransportOptions, keypair_from_bytes, parse_direct_peer_addr,
+    RelayReservationInfo, keypair_from_bytes, parse_direct_peer_addr,
 };
 
-fn configure_transports(
-    mut builder: EndpointBuilder,
+/// Adds address-shaped listeners, or the QUIC dual-stack defaults when
+/// `listen` is absent. Transport is inferred from each address's shape.
+fn configure_listen(
+    builder: EndpointBuilder,
     listen: Option<Vec<String>>,
-    quic: Option<TransportOptions>,
-    tcp: Option<TransportOptions>,
 ) -> Result<EndpointBuilder, FfiError> {
-    if let Some(addresses) = listen {
-        if addresses.is_empty() {
-            return Err(FfiError::InvalidConfig {
-                detail: "listen cannot be empty; omit listen for transport defaults, or pass complete multiaddresses".into(),
-            });
-        }
-        if quic.is_some() || tcp.is_some() {
-            return Err(FfiError::InvalidConfig {
-                detail: "use either address-shaped `listen` or legacy `quic`/`tcp` transport options, not both".into(),
-            });
-        }
-        for address in addresses {
-            let parsed =
-                Multiaddr::from_str(&address).map_err(|error| FfiError::InvalidAddress {
-                    detail: format!("invalid listen address `{address}`: {error}"),
-                })?;
-            builder = builder
-                .listen_on_multiaddr(&parsed)
-                .map_err(map_listen_error)?;
-        }
-        return Ok(builder);
-    }
-
-    if quic.is_none() && tcp.is_none() {
+    let Some(addresses) = listen else {
+        return builder.listen_default().map_err(map_listen_error);
+    };
+    if addresses.is_empty() {
         return Err(FfiError::InvalidConfig {
-            detail: "at least one transport must be enabled".into(),
+            detail: "listen cannot be empty; omit listen for the QUIC dual-stack defaults, or pass complete multiaddresses".into(),
         });
     }
-
-    if let Some(options) = quic {
-        match options.listen_addrs {
-            None => builder = builder.quic_dual_stack().map_err(map_listen_error)?,
-            Some(addresses) => {
-                if addresses.is_empty() {
-                    return Err(empty_transport_list("QUIC"));
-                }
-                for address in addresses {
-                    let address = parse_listen_addr(&address, "QUIC")?;
-                    if !address.is_quic_transport() {
-                        return Err(wrong_transport("QUIC", &address));
-                    }
-                    builder = builder
-                        .listen_on_multiaddr(&address)
-                        .map_err(map_listen_error)?;
-                }
-            }
-        }
-    }
-
-    if let Some(options) = tcp {
-        let addresses = options
-            .listen_addrs
-            .unwrap_or_else(|| vec!["/ip4/0.0.0.0/tcp/0".into(), "/ip6/::/tcp/0".into()]);
-        if addresses.is_empty() {
-            return Err(empty_transport_list("TCP"));
-        }
-        for address in addresses {
-            let address = parse_listen_addr(&address, "TCP")?;
-            if !address.is_tcp_transport() {
-                return Err(wrong_transport("TCP", &address));
-            }
-            builder = builder.tcp_multiaddr(&address).map_err(map_listen_error)?;
-        }
-    }
-
-    Ok(builder)
+    addresses.iter().try_fold(builder, |builder, address| {
+        let parsed = Multiaddr::from_str(address).map_err(|error| FfiError::InvalidAddress {
+            detail: format!("invalid listen address `{address}`: {error}"),
+        })?;
+        builder
+            .listen_on_multiaddr(&parsed)
+            .map_err(map_listen_error)
+    })
 }
 
 fn map_listen_error(error: minip2p::Error) -> FfiError {
     FfiError::InvalidConfig {
         detail: error.to_string(),
-    }
-}
-
-fn parse_listen_addr(address: &str, transport: &str) -> Result<Multiaddr, FfiError> {
-    Multiaddr::from_str(address).map_err(|error| FfiError::InvalidAddress {
-        detail: format!("invalid {transport} listen address `{address}`: {error}"),
-    })
-}
-
-fn empty_transport_list(transport: &str) -> FfiError {
-    FfiError::InvalidConfig {
-        detail: format!(
-            "{transport} listen cannot be empty; omit listen to use dual-stack defaults, or omit the {} transport configuration to disable it",
-            transport.to_ascii_lowercase()
-        ),
-    }
-}
-
-fn wrong_transport(transport: &str, address: &Multiaddr) -> FfiError {
-    FfiError::InvalidConfig {
-        detail: format!("{transport} listen address `{address}` does not use {transport}"),
     }
 }
 
@@ -259,7 +188,7 @@ impl P2pEndpoint {
             }
         }
 
-        builder = configure_transports(builder, config.listen, config.quic, config.tcp)?;
+        builder = configure_listen(builder, config.listen)?;
         let mut endpoint = builder.bind().map_err(map_constructor_error)?;
         let listen_addrs = endpoint
             .listen_all()
@@ -568,51 +497,8 @@ impl P2pEndpoint {
     /// event: [`P2pEvent::PathEstablished`], [`P2pEvent::ConnectFailed`], or
     /// [`P2pEvent::ConnectCancelled`] after [`Self::cancel_connect`].
     /// Synchronous errors cover malformed targets only.
-    pub fn connect_target(&self, target: crate::ConnectTarget) -> Result<u64, FfiError> {
+    pub fn connect(&self, target: crate::ConnectTarget) -> Result<u64, FfiError> {
         let target = crate::connect::parse_connect_target(target)?;
-        self.admit_connect(target)
-    }
-
-    /// Starts a connection attempt toward a peer without known direct
-    /// addresses.
-    ///
-    /// Legacy form; prefer [`Self::connect_target`]. Removed in #181.
-    pub fn connect(&self, peer_id: String) -> Result<u64, FfiError> {
-        self.connect_target(crate::ConnectTarget::Peer { peer_id })
-    }
-
-    /// Starts a Connection attempt using an explicit address set that must
-    /// name `peer_id`.
-    ///
-    /// Legacy form; prefer [`Self::connect_target`]. Removed in #181.
-    pub fn connect_with_addrs(
-        &self,
-        peer_id: String,
-        addresses: Vec<String>,
-    ) -> Result<u64, FfiError> {
-        let peer = parse_peer_id(&peer_id)?;
-        let target =
-            crate::connect::parse_connect_target(crate::ConnectTarget::Addresses { addresses })?;
-        if target.peer_id() != &peer {
-            return Err(FfiError::InvalidAddress {
-                detail: "every connection address must end in the requested peer id".into(),
-            });
-        }
-        self.admit_connect(target)
-    }
-
-    /// Starts a connection attempt toward a direct `/quic-v1` or `/tcp` peer
-    /// address.
-    ///
-    /// Legacy form; prefer [`Self::connect_target`]. Removed in #181.
-    pub fn connect_addr(&self, address: String) -> Result<u64, FfiError> {
-        self.connect_target(crate::ConnectTarget::Addresses {
-            addresses: vec![address],
-        })
-    }
-
-    /// Admits a validated Connection target and returns its Connect ID.
-    fn admit_connect(&self, target: minip2p::ConnectTarget) -> Result<u64, FfiError> {
         let _pending = PendingCommand::new(&self.shared);
         let mut state = self.shared.lock_state();
         ensure_accepting_commands(&state)?;
@@ -625,39 +511,6 @@ impl P2pEndpoint {
                 detail: error.to_string(),
             })?;
         Ok(id.as_u64())
-    }
-
-    /// Dials a direct peer address on every applicable local address family.
-    pub fn dial(&self, address: String) -> Result<Vec<u64>, FfiError> {
-        let address = parse_direct_peer_addr(&address)?;
-        self.with_endpoint_mut(|endpoint| {
-            endpoint
-                .dial(&address)
-                .map(|ids| ids.into_iter().map(|id| id.as_u64()).collect())
-                .map_err(map_driver_error)
-        })
-    }
-
-    /// Dials a direct peer address using IPv4.
-    pub fn dial_ip4(&self, address: String) -> Result<u64, FfiError> {
-        let address = parse_direct_peer_addr(&address)?;
-        self.with_endpoint_mut(|endpoint| {
-            endpoint
-                .dial_ip4(&address)
-                .map(|id| id.as_u64())
-                .map_err(map_driver_error)
-        })
-    }
-
-    /// Dials a direct peer address using IPv6.
-    pub fn dial_ip6(&self, address: String) -> Result<u64, FfiError> {
-        let address = parse_direct_peer_addr(&address)?;
-        self.with_endpoint_mut(|endpoint| {
-            endpoint
-                .dial_ip6(&address)
-                .map(|id| id.as_u64())
-                .map_err(map_driver_error)
-        })
     }
 
     /// Cancels a connection attempt by Connect ID.
@@ -1041,11 +894,7 @@ mod tests {
             agent_version: None,
             relays: Vec::new(),
             autonat_servers: Vec::new(),
-            listen: None,
-            quic: Some(TransportOptions {
-                listen_addrs: Some(vec!["/ip4/127.0.0.1/udp/0/quic-v1".into()]),
-            }),
-            tcp: None,
+            listen: Some(vec!["/ip4/127.0.0.1/udp/0/quic-v1".into()]),
             force_relay: false,
             allow_unsigned: false,
             protocols: Vec::new(),
@@ -1092,7 +941,7 @@ mod tests {
             .peer_id()
             .to_base58();
         let connect_id = a
-            .connect_target(crate::ConnectTarget::Addresses {
+            .connect(crate::ConnectTarget::Addresses {
                 addresses: vec![format!(
                     "/ip4/127.0.0.1/udp/1/quic-v1/p2p/{black_hole_peer}"
                 )],
@@ -1154,7 +1003,7 @@ mod tests {
         b.start(Arc::new(NoopDoorbell)).expect("start b");
 
         let connect_id = a
-            .connect_target(crate::ConnectTarget::Addresses {
+            .connect(crate::ConnectTarget::Addresses {
                 addresses: vec![b.listen_addrs()[0].clone()],
             })
             .expect("connect");
@@ -1207,14 +1056,14 @@ mod tests {
     }
 
     #[test]
-    fn connect_target_admits_addresses_and_settles_once() {
+    fn connect_admits_addresses_and_settles_once() {
         let a = endpoint(config()).expect("endpoint a");
         let b = endpoint(config()).expect("endpoint b");
         a.start(Arc::new(NoopDoorbell)).expect("start a");
         b.start(Arc::new(NoopDoorbell)).expect("start b");
 
         let connect_id = a
-            .connect_target(crate::ConnectTarget::Addresses {
+            .connect(crate::ConnectTarget::Addresses {
                 addresses: vec![b.listen_addrs()[0].clone()],
             })
             .expect("connect");
@@ -1310,9 +1159,7 @@ mod tests {
         ));
 
         let mut bad_listen = config();
-        bad_listen.quic = Some(TransportOptions {
-            listen_addrs: Some(vec!["not-a-multiaddr".into()]),
-        });
+        bad_listen.listen = Some(vec!["not-a-multiaddr".into()]);
         assert!(matches!(
             endpoint(bad_listen),
             Err(FfiError::InvalidAddress { .. })
@@ -1385,114 +1232,55 @@ mod tests {
     }
 
     #[test]
-    fn constructor_accepts_default_dual_stack_binding() {
+    fn constructor_uses_quic_dual_stack_defaults_without_listen() {
         let mut config = config();
-        config.quic = Some(TransportOptions { listen_addrs: None });
+        config.listen = None;
 
-        let endpoint = endpoint(config).expect("dual-stack endpoint");
+        let endpoint = endpoint(config).expect("default endpoint");
 
         assert!(!endpoint.listen_addrs().is_empty());
-    }
-
-    #[test]
-    fn constructor_accepts_exact_dual_stack_quic_addresses() {
-        let mut config = config();
-        config.quic = Some(TransportOptions {
-            listen_addrs: Some(vec![
-                "/ip4/127.0.0.1/udp/0/quic-v1".into(),
-                "/ip6/::1/udp/0/quic-v1".into(),
-            ]),
-        });
-
-        let endpoint = endpoint(config).expect("exact dual-stack endpoint");
-        let addresses = endpoint.listen_addrs();
-
-        assert_eq!(addresses.len(), 2);
         assert!(
-            addresses
+            endpoint
+                .listen_addrs()
                 .iter()
-                .any(|address| address.starts_with("/ip4/127.0.0.1/"))
-        );
-        assert!(
-            addresses
-                .iter()
-                .any(|address| address.starts_with("/ip6/::1/"))
+                .all(|address| address.contains("/quic-v1"))
         );
     }
 
     #[test]
-    fn constructor_accepts_address_shaped_listen() {
+    fn constructor_infers_each_transport_from_the_listen_address() {
         let mut config = config();
-        config.quic = None;
         config.listen = Some(vec![
             "/ip4/127.0.0.1/udp/0/quic-v1".into(),
+            "/ip6/::1/udp/0/quic-v1".into(),
             "/ip4/127.0.0.1/tcp/0".into(),
         ]);
 
         let endpoint = endpoint(config).expect("address-shaped listen");
         let addresses = endpoint.listen_addrs();
-        assert!(addresses.iter().any(|address| address.contains("/quic-v1")));
+        assert_eq!(addresses.len(), 3);
+        assert!(
+            addresses
+                .iter()
+                .any(|address| address.starts_with("/ip6/::1/") && address.contains("/quic-v1"))
+        );
         assert!(addresses.iter().any(|address| address.contains("/tcp/")));
     }
 
     #[test]
-    fn constructor_rejects_listen_mixed_with_transport_options() {
-        let mut config = config();
-        config.listen = Some(vec!["/ip4/127.0.0.1/udp/0/quic-v1".into()]);
-
-        let Err(error) = endpoint(config) else {
-            panic!("listen and quic together must fail");
-        };
-        assert!(error.to_string().contains("not both"), "{error}");
-    }
-
-    #[test]
-    fn constructor_accepts_quic_and_tcp_together() {
-        let mut config = config();
-        config.tcp = Some(TransportOptions {
-            listen_addrs: Some(vec!["/ip4/127.0.0.1/tcp/0".into()]),
-        });
-
-        let endpoint = endpoint(config).expect("QUIC + TCP endpoint");
-        let addresses = endpoint.listen_addrs();
-        assert!(addresses.iter().any(|address| address.contains("/quic-v1")));
-        assert!(addresses.iter().any(|address| address.contains("/tcp/")));
-    }
-
-    #[test]
-    fn constructor_rejects_disabled_empty_and_mismatched_transports() {
-        let mut disabled = config();
-        disabled.quic = None;
-        assert!(matches!(
-            endpoint(disabled),
-            Err(FfiError::InvalidConfig { .. })
-        ));
-
+    fn constructor_rejects_empty_and_duplicate_family_listen() {
         let mut empty = config();
-        empty.quic = Some(TransportOptions {
-            listen_addrs: Some(Vec::new()),
-        });
-        assert!(matches!(
-            endpoint(empty),
-            Err(FfiError::InvalidConfig { .. })
-        ));
-
-        let mut mismatched = config();
-        mismatched.quic = Some(TransportOptions {
-            listen_addrs: Some(vec!["/ip4/127.0.0.1/tcp/0".into()]),
-        });
-        assert!(matches!(
-            endpoint(mismatched),
-            Err(FfiError::InvalidConfig { .. })
-        ));
+        empty.listen = Some(Vec::new());
+        let Err(FfiError::InvalidConfig { detail }) = endpoint(empty) else {
+            panic!("an explicit empty listen list must fail");
+        };
+        assert!(detail.contains("omit listen"), "{detail}");
 
         let mut duplicate_quic_family = config();
-        duplicate_quic_family.quic = Some(TransportOptions {
-            listen_addrs: Some(vec![
-                "/ip4/127.0.0.1/udp/0/quic-v1".into(),
-                "/ip4/0.0.0.0/udp/0/quic-v1".into(),
-            ]),
-        });
+        duplicate_quic_family.listen = Some(vec![
+            "/ip4/127.0.0.1/udp/0/quic-v1".into(),
+            "/ip4/0.0.0.0/udp/0/quic-v1".into(),
+        ]);
         assert!(matches!(
             endpoint(duplicate_quic_family),
             Err(FfiError::InvalidConfig { .. })
@@ -1670,8 +1458,10 @@ mod tests {
         a.start(Arc::new(PanickingDoorbell(Arc::clone(&callbacks))))
             .expect("start a");
         b.start(Arc::new(NoopDoorbell)).expect("start b");
-        a.connect_addr(b.listen_addrs()[0].clone())
-            .expect("connect");
+        a.connect(crate::ConnectTarget::Addresses {
+            addresses: vec![b.listen_addrs()[0].clone()],
+        })
+        .expect("connect");
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while callbacks.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
@@ -1851,13 +1641,13 @@ mod tests {
         let waiter = std::thread::spawn(move || {
             let mut state = shared.lock_state();
             entered_tx.send(()).expect("signal waiter");
-            let wake = state
+            let outcome = state
                 .endpoint
                 .as_mut()
                 .expect("endpoint")
-                .next_wake(Duration::from_secs(5))
+                .wait(Duration::from_secs(5))
                 .expect("wait");
-            assert!(matches!(wake, minip2p::EndpointWake::Interrupted));
+            assert!(matches!(outcome, minip2p::EndpointWaitOutcome::Interrupted));
         });
         entered_rx.recv().expect("waiter entered");
         std::thread::sleep(Duration::from_millis(20));
@@ -1898,7 +1688,9 @@ mod tests {
                 .is_none()
         );
         let connect_id = endpoint
-            .connect(remote.to_base58())
+            .connect(crate::ConnectTarget::Peer {
+                peer_id: remote.to_base58(),
+            })
             .expect("connection attempt");
         endpoint.cancel_connect(connect_id).expect("known cancel");
         endpoint
@@ -1926,11 +1718,15 @@ mod tests {
             Err(FfiError::InvalidTopic { .. })
         ));
         assert!(matches!(
-            endpoint.connect("not-a-peer".into()),
+            endpoint.connect(crate::ConnectTarget::Peer {
+                peer_id: "not-a-peer".into()
+            }),
             Err(FfiError::InvalidPeerId { .. })
         ));
         assert!(matches!(
-            endpoint.connect_addr("not-an-address".into()),
+            endpoint.connect(crate::ConnectTarget::Addresses {
+                addresses: vec!["not-an-address".into()]
+            }),
             Err(FfiError::InvalidAddress { .. })
         ));
 

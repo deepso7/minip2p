@@ -11,7 +11,7 @@ import { Reachability } from "../../core/src/index.js";
 export type MockBackendOperation =
   | readonly ["abandon" | "closeWrite" | "reset", string, number]
   | readonly ["cancelConnect", number]
-  | readonly ["connectTarget", BackendConnectTarget]
+  | readonly ["connect", BackendConnectTarget]
   | readonly ["write", string, number, readonly number[]];
 
 /** Scriptable, contract-complete backend for package-level SDK tests. */
@@ -140,21 +140,9 @@ export class MockBackend implements Minip2pBackend {
     }
   }
 
-  connectTarget(target: BackendConnectTarget): number {
-    this.operations.push(["connectTarget", target]);
+  connect(target: BackendConnectTarget): number {
+    this.operations.push(["connect", target]);
     return this.nextConnectId++;
-  }
-
-  dial(_address: string): number[] {
-    return [10];
-  }
-
-  dialIp4(_address: string): number {
-    return 11;
-  }
-
-  dialIp6(_address: string): number {
-    return 12;
   }
 
   cancelConnect(id: number): void {
