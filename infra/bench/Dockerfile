@@ -2,7 +2,6 @@
 
 FROM node:24-bookworm@sha256:be23f54a88d34e8824c741b19b91064094f92c1c97b194144bfc8b50d67258e2 AS toolchain
 
-ARG PNPM_VERSION=12.3.4
 ARG BUILD_JOBS=2
 
 ENV CARGO_HOME=/usr/local/cargo \
@@ -46,8 +45,7 @@ RUN apt-get update \
     && make -j"$BUILD_JOBS" \
     && make install \
     && cd / \
-    && rm -rf "valgrind-${VALGRIND_VERSION}" "valgrind-${VALGRIND_VERSION}.tar.bz2" /tmp/bench-pins.json \
-    && npm install --global "pnpm@${PNPM_VERSION}"
+    && rm -rf "valgrind-${VALGRIND_VERSION}" "valgrind-${VALGRIND_VERSION}.tar.bz2" /tmp/bench-pins.json
 
 FROM toolchain AS planner
 
@@ -68,7 +66,11 @@ COPY bindings/ts/react-native/package.json bindings/ts/react-native/
 COPY examples/react-native/package.json examples/react-native/
 COPY bindings/ts/react-native/patches/ bindings/ts/react-native/patches/
 COPY bindings/ts/test-fixtures/package.json bindings/ts/test-fixtures/
-RUN pnpm install --frozen-lockfile
+# Install the pnpm pinned by `packageManager` so it can never drift from the
+# workspace (a mismatched pnpm tries to self-switch and fails in the image).
+RUN PNPM_VERSION=$(jq -er '.packageManager | select(startswith("pnpm@")) | ltrimstr("pnpm@") | split("+")[0]' package.json) \
+    && npm install --global "pnpm@${PNPM_VERSION}" \
+    && pnpm install --frozen-lockfile
 
 COPY --from=planner /minip2p/recipe.json recipe.json
 RUN cargo chef cook --release --package minip2p-nodejs --recipe-path recipe.json \
