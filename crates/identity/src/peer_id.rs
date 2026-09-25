@@ -201,6 +201,12 @@ pub enum PeerIdError {
     UnsupportedMulticodec(u64),
     #[error("invalid sha2-256 digest length: expected 32, got {actual}")]
     InvalidSha256DigestLength { actual: usize },
+    #[error("invalid identity digest length: expected at most 42, got {actual}")]
+    InvalidIdentityDigestLength { actual: usize },
+    #[error(
+        "unsupported peer id multihash code 0x{0:x}; expected identity (0x0) or sha2-256 (0x12)"
+    )]
+    UnsupportedMultihashCode(u64),
     #[error("invalid base58btc character '{character}' at index {index}")]
     InvalidBase58Character { character: char, index: usize },
     #[error("invalid base32 character '{character}' at index {index}")]
@@ -293,13 +299,21 @@ pub fn read_uvarint_with_remainder(input: &[u8]) -> Result<(u64, &[u8]), VarintE
 /// Validates that a multihash is a legal peer id encoding.
 /// Currently only checks that SHA-256 digests are exactly 32 bytes;
 /// identity-hashed multihashes are accepted with any digest length.
+/// Accepts only the peer id shapes libp2p defines: an inlined key (identity,
+/// at most 42 bytes) or its sha2-256 digest. Those are also exactly the
+/// shapes whose base58 text (`1…` / `Qm…`) parses back as a peer id.
 fn validate_multihash(multihash: &PeerMultihash) -> Result<(), PeerIdError> {
     let digest_len = multihash.digest().len();
-    if multihash.code() == SHA256_MULTIHASH_CODE && digest_len != 32 {
-        return Err(PeerIdError::InvalidSha256DigestLength { actual: digest_len });
+    match multihash.code() {
+        IDENTITY_MULTIHASH_CODE if digest_len > MAX_INLINE_KEY_LENGTH => {
+            Err(PeerIdError::InvalidIdentityDigestLength { actual: digest_len })
+        }
+        SHA256_MULTIHASH_CODE if digest_len != 32 => {
+            Err(PeerIdError::InvalidSha256DigestLength { actual: digest_len })
+        }
+        IDENTITY_MULTIHASH_CODE | SHA256_MULTIHASH_CODE => Ok(()),
+        code => Err(PeerIdError::UnsupportedMultihashCode(code)),
     }
-
-    Ok(())
 }
 
 /// Constructs a typed `Multihash<64>` by wrapping the given hash code and digest.
@@ -534,6 +548,26 @@ mod tests {
         let parsed_cid = PeerId::from_cid(&encoded_cid).expect("cid parse must work");
         assert_eq!(parsed_legacy, peer_id);
         assert_eq!(parsed_cid, peer_id);
+    }
+
+    #[test]
+    fn rejects_multihashes_that_are_not_peer_ids() {
+        // Fuzz find: code 0x02 decoded, printed as "9q", and failed to parse.
+        assert_eq!(
+            PeerId::from_bytes(&[0x02, 0x00]),
+            Err(PeerIdError::UnsupportedMultihashCode(0x02))
+        );
+
+        let mut oversized = vec![0x00, 43];
+        oversized.extend([7; 43]);
+        assert_eq!(
+            PeerId::from_bytes(&oversized),
+            Err(PeerIdError::InvalidIdentityDigestLength { actual: 43 })
+        );
+
+        // Every accepted shape prints text that parses back.
+        let inline = PeerId::from_bytes(&[0x00, 0x00]).expect("empty identity");
+        assert_eq!(inline.to_string().parse::<PeerId>(), Ok(inline));
     }
 
     #[test]
