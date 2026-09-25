@@ -883,9 +883,17 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
     }
 
     /// Returns the latest NAT-orchestrated path to `peer`.
+    ///
+    /// Cleared once the connection it describes is gone: the peer's last
+    /// relay circuit for `Relayed`, its last direct connection for a direct
+    /// path, or its last connection of any kind. It is never rewritten to the
+    /// kind that remains, so this can return `None` while the peer stays
+    /// connected.
     #[cfg(feature = "portable-relay")]
     pub fn path(&self, peer: &PeerId) -> Option<minip2p_nat::Path> {
-        self.nat.as_ref().and_then(|nat| nat.path(peer))
+        self.nat
+            .as_ref()
+            .and_then(|nat| nat.path(peer, self.endpoint.runtime()))
     }
 
     /// Returns the currently held relay reservation, when any.

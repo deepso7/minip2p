@@ -540,6 +540,10 @@ impl P2pEndpoint {
     }
 
     /// Returns the current usable NAT-orchestrated path to `peer_id`.
+    ///
+    /// `None` once the connection the path describes closes (the last relay
+    /// circuit for a relayed path, the last direct connection for a direct
+    /// one), even while the peer stays connected over the other kind.
     pub fn path(&self, peer_id: String) -> Result<Option<crate::PathKind>, FfiError> {
         let peer = PeerId::from_str(&peer_id).map_err(|error| FfiError::InvalidPeerId {
             detail: error.to_string(),

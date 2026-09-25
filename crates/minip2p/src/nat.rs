@@ -23,6 +23,19 @@ use minip2p_transport::{ConnectionId, StreamId, Transport};
 use crate::EndpointEvent;
 use crate::portable::connect::ConnectEngine;
 
+/// Whether `path` still describes a live connection: the peer's
+/// established `connections` include one of the path's kind (a circuit for
+/// [`Path::Relayed`], a direct connection otherwise). A stale path is
+/// dropped rather than rewritten to the kind that remains, whose origin
+/// (relay, dialed or punched) is unknown.
+pub(crate) fn path_is_live(
+    path: &Path,
+    mut connections: impl Iterator<Item = ConnectionId>,
+) -> bool {
+    let relayed = matches!(path, Path::Relayed { .. });
+    connections.any(|id| id.is_circuit() == relayed)
+}
+
 /// Converts a host time sample into the agent's clock pair.
 pub(crate) fn to_nat_now(now: PlatformNow) -> Now {
     Now {
@@ -57,7 +70,8 @@ pub(crate) struct NatDriver<E> {
     public_addrs: Vec<Multiaddr>,
     /// Exact adopted bridge keys mapped to their promoted circuit ids.
     promoted: BTreeMap<(ConnectionId, StreamId), ConnectionId>,
-    /// Authoritative usable NAT-orchestrated path by remote peer.
+    /// Authoritative usable NAT-orchestrated path by remote peer; swept by
+    /// [`path_is_live`] once its connection closes.
     paths: BTreeMap<PeerId, Path>,
     /// How many queued events the Connection engine has already observed.
     observed: usize,
@@ -210,10 +224,7 @@ impl<E: EntropySource> NatDriver<E> {
         let handled = self
             .agent
             .handle_event_with_disposition_classified(event, is_circuit, now);
-        if let SwarmEvent::ConnectionClosed {
-            peer_id, conn_id, ..
-        } = event
-        {
+        if let SwarmEvent::ConnectionClosed { conn_id, .. } = event {
             for &(inner_conn, stream_id) in self
                 .promoted
                 .keys()
@@ -225,9 +236,6 @@ impl<E: EntropySource> NatDriver<E> {
             }
             self.promoted
                 .retain(|(inner_conn, _), circuit| inner_conn != conn_id && circuit != conn_id);
-            if !swarm.is_peer_connected(peer_id) {
-                self.paths.remove(peer_id);
-            }
         }
         self.pump(swarm, sample);
         handled
@@ -280,6 +288,10 @@ impl<E: EntropySource> NatDriver<E> {
         // through `ingest`'s ConnectionClosed branch regardless.
         self.promoted
             .retain(|_, id| swarm.transport().contains_circuit(*id));
+        // Sweeps paths whose connection is gone. Per pump, not per
+        // ConnectionClosed: a non-primary connection closes without one.
+        self.paths
+            .retain(|peer, path| path_is_live(path, swarm.peer_connections(peer)));
     }
 
     /// Queued events the Connection-attempt engine has not observed yet.
@@ -434,10 +446,19 @@ impl<E: EntropySource> NatDriver<E> {
         self.agent.force_relay()
     }
 
-    /// Returns the latest usable NAT-orchestrated path for `peer`.
+    /// Returns the latest usable NAT-orchestrated path for `peer`. Checks
+    /// liveness at read time too, so a close the next pump has not swept
+    /// yet never surfaces a stale path.
     #[cfg(feature = "_circuit-driver")]
-    pub(crate) fn path(&self, peer: &PeerId) -> Option<Path> {
-        self.paths.get(peer).cloned()
+    pub(crate) fn path<T: NatTransport, R: EntropySource>(
+        &self,
+        peer: &PeerId,
+        swarm: &SwarmRuntime<T, R>,
+    ) -> Option<Path> {
+        self.paths
+            .get(peer)
+            .filter(|path| path_is_live(path, swarm.peer_connections(peer)))
+            .cloned()
     }
 
     /// Confirmed public addresses plus circuit addresses for every held
@@ -468,6 +489,13 @@ impl<E: EntropySource> NatDriver<E> {
     #[cfg(all(test, feature = "nat", feature = "quic"))]
     pub(crate) fn listen_addrs(&self) -> &[Multiaddr] {
         self.agent.listen_addrs()
+    }
+
+    /// The recorded path for `peer` before the liveness check, for test
+    /// assertions on path bookkeeping.
+    #[cfg(all(test, feature = "nat", feature = "quic"))]
+    pub(crate) fn recorded_path(&self, peer: &PeerId) -> Option<&Path> {
+        self.paths.get(peer)
     }
 
     /// The adopted-bridge to promoted-circuit map, for test assertions.
