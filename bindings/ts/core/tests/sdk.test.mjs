@@ -10,6 +10,7 @@ import {
   AbortError,
   ClosedError,
   ConnectFailedError,
+  ConnectResultLostError,
   ConnectResultUnavailableError,
   DriverFailedError,
   DriverFailureKind,
@@ -334,9 +335,12 @@ test("handler failures fan out first and enqueue safe handlerError metadata", as
 test("connect operations resolve paths and advanced results are one-shot", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
+  const established = [];
+  endpoint.on("pathEstablished", (event) => established.push(event));
   const connectId = endpoint.startConnect("peer");
   backend.emit({
     inner: {
+      connId: 7,
       connectId,
       path: { tag: PathKind_Tags.DirectDialed },
       peerId: "peer",
@@ -345,6 +349,14 @@ test("connect operations resolve paths and advanced results are one-shot", async
   });
   await tick();
 
+  assert.deepEqual(established, [
+    {
+      connId: 7,
+      connectId,
+      path: { kind: "directDialed" },
+      peerId: "peer",
+    },
+  ]);
   const result = await endpoint.waitConnectResult(connectId, { timeoutMs: 0 });
   assert.deepEqual(result, {
     connectId,
@@ -401,6 +413,155 @@ test("connect failure, timeout and abort cancel and clear attempts", async () =>
   endpoint.close();
 });
 
+test("connectCancelled reaches listeners and settles tracked attempts", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const cancelled = [];
+  endpoint.on("connectCancelled", (event) => cancelled.push(event));
+  const connectId = endpoint.startConnect("peer");
+  const waiting = endpoint.waitConnectResult(connectId, { timeoutMs: 0 });
+
+  backend.emit({
+    inner: { connectId, peerId: "peer" },
+    tag: P2pEvent_Tags.ConnectCancelled,
+  });
+  await tick();
+
+  assert.deepEqual(cancelled, [{ connectId, peerId: "peer" }]);
+  await assert.rejects(waiting, AbortError);
+  endpoint.close();
+});
+
+test("EventsDropped settles pending connect results with a lost error", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const dropped = [];
+  endpoint.on("eventsDropped", (event) => dropped.push(event));
+  const connectId = endpoint.startConnect("peer");
+  const waiting = endpoint.waitConnectResult(connectId, { timeoutMs: 0 });
+
+  backend.emit({
+    inner: {
+      dropped: 1,
+      terminalConnectIds: [connectId],
+      terminalConnectIdsTruncated: false,
+      totalDropped: 1,
+    },
+    tag: P2pEvent_Tags.EventsDropped,
+  });
+  await tick();
+
+  await assert.rejects(waiting, (error) => {
+    assert.ok(error instanceof ConnectResultLostError);
+    assert.equal(error.connectId, connectId);
+    return true;
+  });
+  assert.deepEqual(dropped, [
+    {
+      dropped: 1,
+      terminalConnectIds: [connectId],
+      terminalConnectIdsTruncated: false,
+      totalDropped: 1,
+    },
+  ]);
+  endpoint.close();
+});
+
+test("EventsDropped stores a lost terminal for results not yet awaited", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const connectId = endpoint.startConnect("peer");
+
+  backend.emit({
+    inner: {
+      dropped: 1,
+      terminalConnectIds: [connectId],
+      terminalConnectIdsTruncated: false,
+      totalDropped: 1,
+    },
+    tag: P2pEvent_Tags.EventsDropped,
+  });
+  await tick();
+
+  await assert.rejects(
+    endpoint.waitConnectResult(connectId, { timeoutMs: 0 }),
+    (error) => {
+      assert.ok(error instanceof ConnectResultLostError);
+      assert.equal(error.connectId, connectId);
+      return true;
+    }
+  );
+  endpoint.close();
+});
+
+test("truncated EventsDropped settles every pending connect result", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const first = endpoint.startConnect("peer");
+  const second = endpoint.startConnect("peer");
+  const waitingFirst = endpoint.waitConnectResult(first, { timeoutMs: 0 });
+  const waitingSecond = endpoint.waitConnectResult(second, { timeoutMs: 0 });
+
+  backend.emit({
+    inner: {
+      dropped: 1,
+      terminalConnectIds: [],
+      terminalConnectIdsTruncated: true,
+      totalDropped: 1,
+    },
+    tag: P2pEvent_Tags.EventsDropped,
+  });
+  await tick();
+
+  for (const [waiting, connectId] of [
+    [waitingFirst, first],
+    [waitingSecond, second],
+  ]) {
+    await assert.rejects(waiting, (error) => {
+      assert.ok(error instanceof ConnectResultLostError);
+      assert.equal(error.connectId, connectId);
+      return true;
+    });
+  }
+  endpoint.close();
+});
+
+test("truncated EventsDropped keeps a delivered connect terminal", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const connectId = endpoint.startConnect("peer");
+
+  backend.emit({
+    inner: {
+      connId: 7,
+      connectId,
+      path: { tag: PathKind_Tags.DirectDialed },
+      peerId: "peer",
+    },
+    tag: P2pEvent_Tags.PathEstablished,
+  });
+  backend.emit({
+    inner: {
+      dropped: 1,
+      terminalConnectIds: [],
+      terminalConnectIdsTruncated: true,
+      totalDropped: 1,
+    },
+    tag: P2pEvent_Tags.EventsDropped,
+  });
+  await tick();
+
+  assert.deepEqual(
+    await endpoint.waitConnectResult(connectId, { timeoutMs: 0 }),
+    {
+      connectId,
+      path: { kind: "directDialed" },
+      peerId: "peer",
+    }
+  );
+  endpoint.close();
+});
+
 test("ping coalesces native work while caller abort remains independent", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
@@ -443,6 +604,7 @@ test("queue overflow rejects operations whose native terminals may be lost", asy
   });
   backend.emit({
     inner: {
+      connId: 7,
       connectId: 1,
       path: { tag: PathKind_Tags.DirectDialed },
       peerId: "peer",

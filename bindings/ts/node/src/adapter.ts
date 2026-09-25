@@ -24,7 +24,6 @@ import type { NativeEndpoint } from "./native.js";
 
 class NodeBackend implements Minip2pBackend {
   readonly #connectionIds = new IdMap();
-  readonly #connectIds = new IdMap();
   readonly #endpoint: NativeEndpoint;
   readonly #events: EventDrain;
   readonly #streamIds = new IdMap();
@@ -51,13 +50,7 @@ class NodeBackend implements Minip2pBackend {
     );
     this.#events = new EventDrain(
       () => this.#endpoint.drainEvents(256),
-      (event) =>
-        normalizeEvent(
-          event,
-          this.#connectionIds,
-          this.#connectIds,
-          this.#streamIds
-        )
+      (event) => normalizeEvent(event, this.#connectionIds, this.#streamIds)
     );
   }
 
@@ -69,12 +62,7 @@ class NodeBackend implements Minip2pBackend {
   }
 
   eventHandled(event: P2pEvent): void {
-    releaseTerminalIds(
-      event,
-      this.#connectionIds,
-      this.#connectIds,
-      this.#streamIds
-    );
+    releaseTerminalIds(event, this.#connectionIds, this.#streamIds);
   }
 
   close(): void {
@@ -188,18 +176,21 @@ class NodeBackend implements Minip2pBackend {
     this.#endpoint.abandonStream(peerId, this.#streamIds.toNative(streamId));
   }
 
+  // Connect IDs are not mapped because they round-trip into native calls,
+  // and native allocates them well inside the safe integer range.
   connect(peerId: string): number {
-    return this.#connectIds.toPublic(this.#endpoint.connect(peerId));
+    return bigintToNumber(this.#endpoint.connect(peerId), "connectId");
   }
 
   connectWithAddrs(peerId: string, addresses: readonly string[]): number {
-    return this.#connectIds.toPublic(
-      this.#endpoint.connectWithAddrs(peerId, [...addresses])
+    return bigintToNumber(
+      this.#endpoint.connectWithAddrs(peerId, [...addresses]),
+      "connectId"
     );
   }
 
   connectAddr(address: string): number {
-    return this.#connectIds.toPublic(this.#endpoint.connectAddr(address));
+    return bigintToNumber(this.#endpoint.connectAddr(address), "connectId");
   }
 
   dial(address: string): number[] {
@@ -217,8 +208,7 @@ class NodeBackend implements Minip2pBackend {
   }
 
   cancelConnect(id: number): void {
-    this.#endpoint.cancelConnect(this.#connectIds.toNative(id));
-    this.#connectIds.deletePublic(id);
+    this.#endpoint.cancelConnect(BigInt(id));
   }
 
   disconnect(peerId: string): void {
@@ -414,9 +404,6 @@ function normalizeNativeValue(
     if (key === "connId") {
       return maps.connectionIds.toPublic(BigInt(value));
     }
-    if (key === "connectId") {
-      return maps.connectIds.toPublic(BigInt(value));
-    }
     if (key === "streamId") {
       return maps.streamIds.toPublic(BigInt(value));
     }
@@ -424,9 +411,6 @@ function normalizeNativeValue(
   if (typeof value === "bigint") {
     if (key === "connId" && maps !== undefined) {
       return maps.connectionIds.toPublic(value);
-    }
-    if (key === "connectId" && maps !== undefined) {
-      return maps.connectIds.toPublic(value);
     }
     if (key === "streamId" && maps !== undefined) {
       return maps.streamIds.toPublic(value);
@@ -455,11 +439,9 @@ function normalizeNativeValue(
 function normalizeEvent(
   value: unknown,
   connectionIds: IdMap,
-  connectIds: IdMap,
   streamIds: IdMap
 ): P2pEvent {
   const event = normalizeNativeValue(value, undefined, {
-    connectIds,
     connectionIds,
     streamIds,
   }) as { tag?: unknown; inner?: unknown };
@@ -473,17 +455,16 @@ function normalizeEvent(
   ) {
     event.inner = normalizeEventBytes(event.tag, event.inner);
   }
-  retireTerminalIds(event, connectionIds, connectIds, streamIds);
+  retireTerminalIds(event, connectionIds, streamIds);
   return event as P2pEvent;
 }
 
 function retireTerminalIds(
   event: { readonly tag?: unknown; readonly inner?: unknown },
   connectionIds: IdMap,
-  connectIds: IdMap,
   streamIds: IdMap
 ): void {
-  visitTerminalIds(event, connectionIds, connectIds, streamIds, (map, id) => {
+  visitTerminalIds(event, connectionIds, streamIds, (map, id) => {
     map.retirePublic(id);
   });
 }
@@ -491,10 +472,9 @@ function retireTerminalIds(
 function releaseTerminalIds(
   event: { readonly tag?: unknown; readonly inner?: unknown },
   connectionIds: IdMap,
-  connectIds: IdMap,
   streamIds: IdMap
 ): void {
-  visitTerminalIds(event, connectionIds, connectIds, streamIds, (map, id) => {
+  visitTerminalIds(event, connectionIds, streamIds, (map, id) => {
     map.deletePublic(id);
   });
 }
@@ -502,7 +482,6 @@ function releaseTerminalIds(
 function visitTerminalIds(
   event: { readonly tag?: unknown; readonly inner?: unknown },
   connectionIds: IdMap,
-  connectIds: IdMap,
   streamIds: IdMap,
   visit: (map: IdMap, value: unknown) => void
 ): void {
@@ -512,39 +491,9 @@ function visitTerminalIds(
   if (event.tag === "ConnectionClosed") {
     visit(connectionIds, Reflect.get(event.inner, "connId"));
   }
-  if (isTerminalConnectEvent(event)) {
-    visit(connectIds, Reflect.get(event.inner, "connectId"));
-  }
   if (event.tag === "StreamClosed") {
     visit(streamIds, Reflect.get(event.inner, "streamId"));
   }
-}
-
-function isTerminalConnectEvent(event: {
-  readonly tag?: unknown;
-  readonly inner?: unknown;
-}): boolean {
-  if (
-    event.tag === "ConnectFailed" ||
-    event.tag === "FellBackToRelay" ||
-    event.tag === "PathUpgraded"
-  ) {
-    return true;
-  }
-  if (
-    event.tag !== "PathEstablished" ||
-    event.inner === null ||
-    typeof event.inner !== "object"
-  ) {
-    return false;
-  }
-  const path = Reflect.get(event.inner, "path");
-  return (
-    path !== null &&
-    typeof path === "object" &&
-    (Reflect.get(path, "tag") === "DirectDialed" ||
-      Reflect.get(path, "tag") === "DirectPunched")
-  );
 }
 
 function normalizeEventBytes(tag: string, value: unknown): unknown {
@@ -660,7 +609,6 @@ class EventDrain {
 
 interface NativeIdMaps {
   readonly connectionIds: IdMap;
-  readonly connectIds: IdMap;
   readonly streamIds: IdMap;
 }
 

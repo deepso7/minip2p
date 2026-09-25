@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use minip2p::{EndpointWaitOutcome, Error, NatEvent};
+use minip2p::{EndpointWaitOutcome, Error};
 
 use crate::endpoint::{Lifecycle, Shared};
 use crate::events::convert_endpoint_event;
@@ -15,6 +15,9 @@ use crate::{DriverFailureKind, EventDoorbell, P2pEvent};
 const DRIVER_POLL: Duration = Duration::from_millis(25);
 const DRIVER_IDLE_POLL: Duration = Duration::from_millis(500);
 const MAX_CARRY_EVENTS: usize = 4096;
+/// Enough for any realistic burst of dropped terminals between drains;
+/// beyond it the diagnostic reports truncation instead of naming Connect IDs.
+const MAX_DROPPED_TERMINAL_IDS: usize = 256;
 /// How many already-queued `wait` results one pump iteration will take
 /// before yielding the lock. Further events stay queued for the next wait.
 const PUMP_DRAIN_LIMIT: usize = 256;
@@ -39,6 +42,8 @@ pub struct DriverStats {
 #[derive(Default)]
 pub(crate) struct OverflowDiagnostic {
     pending: u64,
+    terminal_connect_ids: Vec<u64>,
+    terminal_connect_ids_truncated: bool,
     total: u64,
 }
 
@@ -95,14 +100,6 @@ impl Carry {
         }
         self.prune_payload_ids();
         batch
-    }
-
-    pub(crate) fn suppress_cancelled(&mut self, cancelled: &BTreeSet<u64>) -> usize {
-        let before = self.events.len();
-        self.events
-            .retain(|_, event| p2p_connect_id(event).is_none_or(|id| !cancelled.contains(&id)));
-        self.prune_payload_ids();
-        before - self.events.len()
     }
 
     fn take_dropped_terminal_connect_ids(&mut self) -> BTreeSet<u64> {
@@ -199,8 +196,6 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         };
         let crate::endpoint::EndpointState {
             endpoint,
-            cancelled_connect_ids,
-            connect_ids,
             carry,
             overflow,
             stats,
@@ -237,17 +232,13 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             continue;
         }
         ingest(
-            batch.into_iter().filter_map(|event| {
-                convert_filtered_endpoint_event(endpoint, event, cancelled_connect_ids)
-            }),
+            batch
+                .into_iter()
+                .filter_map(|event| convert_endpoint_event(endpoint, event)),
             carry,
             overflow,
             stats,
         );
-        for id in carry.take_dropped_terminal_connect_ids() {
-            connect_ids.remove(&id);
-            cancelled_connect_ids.remove(&id);
-        }
         stats.carry_high_water = stats.carry_high_water.max(carry.len());
         stats.iterations = stats.iterations.saturating_add(1);
         let should_ring = was_empty && !carry.is_empty();
@@ -279,6 +270,16 @@ fn ingest(
     stats.dropped = stats.dropped.saturating_add(dropped);
     overflow.pending = overflow.pending.saturating_add(dropped);
     overflow.total = overflow.total.saturating_add(dropped);
+    let dropped_terminal_ids = carry.take_dropped_terminal_connect_ids();
+    // Each Connect ID settles exactly one terminal, so the set cannot
+    // contain duplicates.
+    let room = MAX_DROPPED_TERMINAL_IDS.saturating_sub(overflow.terminal_connect_ids.len());
+    if dropped_terminal_ids.len() > room {
+        overflow.terminal_connect_ids_truncated = true;
+    }
+    overflow
+        .terminal_connect_ids
+        .extend(dropped_terminal_ids.into_iter().take(room));
 }
 
 pub(crate) fn take_delivery(
@@ -290,9 +291,12 @@ pub(crate) fn take_delivery(
     let diagnostic = (overflow.pending != 0).then(|| {
         let event = P2pEvent::EventsDropped {
             dropped: overflow.pending,
+            terminal_connect_ids: core::mem::take(&mut overflow.terminal_connect_ids),
+            terminal_connect_ids_truncated: overflow.terminal_connect_ids_truncated,
             total_dropped: overflow.total,
         };
         overflow.pending = 0;
+        overflow.terminal_connect_ids_truncated = false;
         stats.dispatch_attempted_synthetic = stats.dispatch_attempted_synthetic.saturating_add(1);
         event
     });
@@ -300,77 +304,17 @@ pub(crate) fn take_delivery(
     Delivery { diagnostic, batch }
 }
 
-fn convert_filtered_endpoint_event(
-    endpoint: &minip2p::Endpoint,
-    event: minip2p::Event,
-    cancelled: &mut BTreeSet<u64>,
-) -> Option<P2pEvent> {
-    if suppress_cancelled_endpoint_event(&event, cancelled) {
-        return None;
-    }
-    convert_endpoint_event(endpoint, event)
-}
-
-/// Returns `true` when `event` belongs to a cancelled attempt.
+/// Returns the Connect ID `event` terminates, when it is one of the three
+/// attempt terminals.
 ///
-/// The attempt id stays in `cancelled` until this filters that attempt's
-/// `ConnectSettled`, so a later pump batch can still drop events left
-/// queued beyond [`PUMP_DRAIN_LIMIT`]. Same-attempt NAT events precede
-/// `ConnectSettled`, so the id does not need to outlive the terminal.
-fn suppress_cancelled_endpoint_event(
-    event: &minip2p::Event,
-    cancelled: &mut BTreeSet<u64>,
-) -> bool {
-    let id = match event {
-        minip2p::Event::ConnectSettled { connect_id, .. } => connect_id.as_u64(),
-        minip2p::Event::Nat(event) => match nat_connect_id(event) {
-            Some(id) => id,
-            None => return false,
-        },
-        _ => return false,
-    };
-    if !cancelled.contains(&id) {
-        return false;
-    }
-    if matches!(event, minip2p::Event::ConnectSettled { .. }) {
-        cancelled.remove(&id);
-    }
-    true
-}
-
-fn nat_connect_id(event: &NatEvent) -> Option<u64> {
-    match event {
-        NatEvent::PathEstablished { connect_id, .. }
-        | NatEvent::PathUpgraded { connect_id, .. }
-        | NatEvent::HolePunchFailed { connect_id, .. }
-        | NatEvent::FellBackToRelay { connect_id, .. }
-        | NatEvent::ConnectFailed { connect_id, .. } => Some(connect_id.as_u64()),
-        NatEvent::ReachabilityChanged { .. }
-        | NatEvent::PublicAddressesChanged { .. }
-        | NatEvent::RelayReserved { .. }
-        | NatEvent::RelayReservationLost { .. }
-        | NatEvent::InboundPathEstablished { .. }
-        | NatEvent::InboundDirectUpgrade { .. } => None,
-    }
-}
-
-pub(crate) fn p2p_connect_id(event: &P2pEvent) -> Option<u64> {
-    match event {
-        P2pEvent::PathEstablished { connect_id, .. }
-        | P2pEvent::PathUpgraded { connect_id, .. }
-        | P2pEvent::HolePunchFailed { connect_id, .. }
-        | P2pEvent::FellBackToRelay { connect_id, .. }
-        | P2pEvent::ConnectFailed { connect_id, .. } => Some(*connect_id),
-        _ => None,
-    }
-}
-
+/// `PathUpgraded` and `FellBackToRelay` carry a Connect ID but are not
+/// terminals: they can follow an attempt that settled on a provisional
+/// relayed path.
 pub(crate) fn terminal_connect_id(event: &P2pEvent) -> Option<u64> {
     match event {
         P2pEvent::PathEstablished { connect_id, .. }
-        | P2pEvent::PathUpgraded { connect_id, .. }
-        | P2pEvent::FellBackToRelay { connect_id, .. }
-        | P2pEvent::ConnectFailed { connect_id, .. } => Some(*connect_id),
+        | P2pEvent::ConnectFailed { connect_id, .. }
+        | P2pEvent::ConnectCancelled { connect_id, .. } => Some(*connect_id),
         _ => None,
     }
 }
@@ -454,6 +398,7 @@ mod tests {
             terminal_connect_id(&P2pEvent::PathEstablished {
                 connect_id: 7,
                 peer_id: "peer".into(),
+                conn_id: 70,
                 path: crate::PathKind::DirectDialed,
             }),
             Some(7)
@@ -462,6 +407,7 @@ mod tests {
             terminal_connect_id(&P2pEvent::PathEstablished {
                 connect_id: 8,
                 peer_id: "peer".into(),
+                conn_id: 80,
                 path: crate::PathKind::Relayed {
                     relay_peer_id: "relay".into()
                 },
@@ -476,6 +422,33 @@ mod tests {
                 detail: "failed".into(),
             }),
             Some(9)
+        );
+        assert_eq!(
+            terminal_connect_id(&P2pEvent::ConnectCancelled {
+                connect_id: 10,
+                peer_id: "peer".into(),
+            }),
+            Some(10)
+        );
+        // Path progress events carry a Connect ID but are not terminals:
+        // they can follow an attempt that settled on a provisional path.
+        assert_eq!(
+            terminal_connect_id(&P2pEvent::PathUpgraded {
+                connect_id: 11,
+                peer_id: "peer".into(),
+                from: crate::PathKind::Relayed {
+                    relay_peer_id: "relay".into()
+                },
+                to: crate::PathKind::DirectPunched,
+            }),
+            None
+        );
+        assert_eq!(
+            terminal_connect_id(&P2pEvent::FellBackToRelay {
+                connect_id: 12,
+                peer_id: "peer".into(),
+            }),
+            None
         );
     }
 
@@ -552,6 +525,8 @@ mod tests {
             first.diagnostic,
             Some(P2pEvent::EventsDropped {
                 dropped: 10,
+                terminal_connect_ids: Vec::new(),
+                terminal_connect_ids_truncated: false,
                 total_dropped: 10,
             })
         );
@@ -571,68 +546,124 @@ mod tests {
     }
 
     #[test]
-    fn live_cancellation_suppresses_events_already_in_carry() {
-        let mut carry = Carry::default();
-        carry.push(P2pEvent::ConnectFailed {
-            connect_id: 7,
+    fn dropped_terminal_connect_ids_travel_in_the_overflow_diagnostic() {
+        let terminal = || P2pEvent::ConnectFailed {
+            connect_id: 41,
             peer_id: "peer".into(),
             kind: crate::NatErrorKind::NoPathAvailable,
             detail: "no path".into(),
-        });
-        carry.push(P2pEvent::PingTimeout {
-            peer_id: "other".into(),
-        });
+        };
+        let ping = |index: usize| P2pEvent::PingTimeout {
+            peer_id: index.to_string(),
+        };
 
-        let suppressed = carry.suppress_cancelled(&BTreeSet::from([7]));
-        let retained = carry.take(512);
-
-        assert_eq!(suppressed, 1);
-        assert_eq!(
-            retained,
-            vec![P2pEvent::PingTimeout {
-                peer_id: "other".into()
-            }]
+        // A full carry of non-payload events drops the oldest event — the
+        // terminal — under the fallback rule.
+        let mut carry = Carry::default();
+        let mut overflow = OverflowDiagnostic::default();
+        let mut stats = DriverStats::default();
+        ingest(
+            [terminal()]
+                .into_iter()
+                .chain((0..MAX_CARRY_EVENTS).map(ping)),
+            &mut carry,
+            &mut overflow,
+            &mut stats,
         );
 
-        let extracted = P2pEvent::PathEstablished {
-            connect_id: 7,
-            peer_id: "peer".into(),
-            path: crate::PathKind::DirectDialed,
-        };
-        assert_eq!(p2p_connect_id(&extracted), Some(7));
+        let delivery = take_delivery(&mut carry, &mut overflow, &mut stats, 512);
+        assert_eq!(
+            delivery.diagnostic,
+            Some(P2pEvent::EventsDropped {
+                dropped: 1,
+                terminal_connect_ids: vec![41],
+                terminal_connect_ids_truncated: false,
+                total_dropped: 1,
+            })
+        );
+        assert!(
+            take_delivery(&mut carry, &mut overflow, &mut stats, 512)
+                .diagnostic
+                .is_none()
+        );
+
+        // Payload events drop before lifecycle events, so the terminal is
+        // retained and no Connect ID is reported.
+        let mut carry = Carry::default();
+        let mut overflow = OverflowDiagnostic::default();
+        let mut stats = DriverStats::default();
+        ingest(
+            [terminal()]
+                .into_iter()
+                .chain((0..MAX_CARRY_EVENTS).map(|index| message(index as u8))),
+            &mut carry,
+            &mut overflow,
+            &mut stats,
+        );
+
+        let delivery = take_delivery(&mut carry, &mut overflow, &mut stats, 512);
+        assert_eq!(
+            delivery.diagnostic,
+            Some(P2pEvent::EventsDropped {
+                dropped: 1,
+                terminal_connect_ids: Vec::new(),
+                terminal_connect_ids_truncated: false,
+                total_dropped: 1,
+            })
+        );
+        assert!(delivery.batch.contains(&terminal()));
     }
 
     #[test]
-    fn cancelled_id_is_removed_only_when_connect_settled_is_filtered() {
-        let connect_id = minip2p::ConnectId::from_u64(7);
-        let peer_id = minip2p::Ed25519Keypair::from_secret_key_bytes([3; 32]).peer_id();
-        let mut cancelled = BTreeSet::from([7_u64]);
-
-        let nat = minip2p::Event::Nat(NatEvent::HolePunchFailed {
+    fn dropped_terminal_ids_are_bounded_and_report_truncation() {
+        let terminal = |connect_id: u64| P2pEvent::ConnectFailed {
             connect_id,
-            attempt: 1,
-            reason: "timeout".into(),
-        });
-        assert!(suppress_cancelled_endpoint_event(&nat, &mut cancelled));
-        assert!(
-            cancelled.contains(&7),
-            "filtering NAT must keep the id for events still queued beyond the pump drain limit"
-        );
-
-        let settled = minip2p::Event::ConnectSettled {
-            connect_id,
-            peer_id: peer_id.clone(),
-            outcome: minip2p::ConnectOutcome::Cancelled,
+            peer_id: "peer".into(),
+            kind: crate::NatErrorKind::NoPathAvailable,
+            detail: "no path".into(),
         };
-        assert!(suppress_cancelled_endpoint_event(&settled, &mut cancelled));
-        assert!(
-            cancelled.is_empty(),
-            "filtering ConnectSettled retires the cancelled id"
+        let ping = |index: usize| P2pEvent::PingTimeout {
+            peer_id: index.to_string(),
+        };
+
+        // Terminals pushed first are the oldest events, so enough later
+        // non-payload pushes drop every one of them.
+        let mut carry = Carry::default();
+        let mut overflow = OverflowDiagnostic::default();
+        let mut stats = DriverStats::default();
+        ingest(
+            (1..=MAX_DROPPED_TERMINAL_IDS + 2)
+                .map(|id| terminal(id as u64))
+                .chain((0..MAX_CARRY_EVENTS).map(ping)),
+            &mut carry,
+            &mut overflow,
+            &mut stats,
         );
 
-        let unrelated = minip2p::Event::PingTimeout { peer_id };
-        let mut empty = BTreeSet::new();
-        assert!(!suppress_cancelled_endpoint_event(&unrelated, &mut empty));
-        assert!(empty.is_empty());
+        let delivery = take_delivery(&mut carry, &mut overflow, &mut stats, 512);
+        assert_eq!(
+            delivery.diagnostic,
+            Some(P2pEvent::EventsDropped {
+                dropped: (MAX_DROPPED_TERMINAL_IDS + 2) as u64,
+                terminal_connect_ids: (1..=MAX_DROPPED_TERMINAL_IDS as u64).collect(),
+                terminal_connect_ids_truncated: true,
+                total_dropped: (MAX_DROPPED_TERMINAL_IDS + 2) as u64,
+            })
+        );
+
+        // The truncation flag resets with the diagnostic that carried it.
+        // The first delivery drained part of the carry, so refill it to
+        // force one more non-terminal drop.
+        ingest((0..512).map(ping), &mut carry, &mut overflow, &mut stats);
+        let delivery = take_delivery(&mut carry, &mut overflow, &mut stats, 512);
+        assert_eq!(
+            delivery.diagnostic,
+            Some(P2pEvent::EventsDropped {
+                dropped: 1,
+                terminal_connect_ids: Vec::new(),
+                terminal_connect_ids_truncated: false,
+                total_dropped: (MAX_DROPPED_TERMINAL_IDS + 3) as u64,
+            })
+        );
     }
 }

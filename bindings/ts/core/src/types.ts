@@ -181,7 +181,12 @@ export interface InboundStreamMeta {
 
 /** Payload types keyed by high-level SDK event name. */
 export interface Minip2pNamedEventMap {
-  eventsDropped: { readonly dropped: number; readonly totalDropped: number };
+  eventsDropped: {
+    readonly dropped: number;
+    readonly totalDropped: number;
+    readonly terminalConnectIds: readonly number[];
+    readonly terminalConnectIdsTruncated: boolean;
+  };
   driverFailed: {
     readonly kind: DriverFailureKind;
     readonly detail: string;
@@ -214,6 +219,7 @@ export interface Minip2pNamedEventMap {
   pathEstablished: {
     readonly connectId: number;
     readonly peerId: string;
+    readonly connId: number;
     readonly path: Path;
   };
   inboundPathEstablished: {
@@ -237,6 +243,10 @@ export interface Minip2pNamedEventMap {
     readonly peerId: string;
     readonly kind: NatErrorKind;
     readonly detail: string;
+  };
+  connectCancelled: {
+    readonly connectId: number;
+    readonly peerId: string;
   };
   inboundDirectUpgrade: { readonly peerId: string };
   message: {
@@ -358,6 +368,7 @@ export type PathKind =
 
 /** Raw backend-only event tags. */
 export const P2pEvent_Tags = {
+  ConnectCancelled: "ConnectCancelled",
   ConnectFailed: "ConnectFailed",
   ConnectionClosed: "ConnectionClosed",
   ConnectionEstablished: "ConnectionEstablished",
@@ -403,7 +414,12 @@ interface RawEvent<Tag extends P2pEventTag, Inner> {
 export type P2pEvent =
   | RawEvent<
       typeof P2pEvent_Tags.EventsDropped,
-      { dropped: number; totalDropped: number }
+      {
+        dropped: number;
+        totalDropped: number;
+        terminalConnectIds: number[];
+        terminalConnectIdsTruncated: boolean;
+      }
     >
   | RawEvent<
       typeof P2pEvent_Tags.DriverFailed,
@@ -465,7 +481,7 @@ export type P2pEvent =
     >
   | RawEvent<
       typeof P2pEvent_Tags.PathEstablished,
-      { connectId: number; peerId: string; path: PathKind }
+      { connectId: number; peerId: string; connId: number; path: PathKind }
     >
   | RawEvent<
       typeof P2pEvent_Tags.InboundPathEstablished,
@@ -486,6 +502,10 @@ export type P2pEvent =
   | RawEvent<
       typeof P2pEvent_Tags.ConnectFailed,
       Minip2pNamedEventMap["connectFailed"]
+    >
+  | RawEvent<
+      typeof P2pEvent_Tags.ConnectCancelled,
+      Minip2pNamedEventMap["connectCancelled"]
     >
   | RawEvent<
       typeof P2pEvent_Tags.InboundDirectUpgrade,

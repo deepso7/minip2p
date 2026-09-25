@@ -130,12 +130,20 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
     return notFaked("connectAddr");
   }
 
+  connectTarget(): never {
+    return notFaked("connectTarget");
+  }
+
   connectWithAddrs(): never {
     return notFaked("connectWithAddrs");
   }
 
   connectedPeers(): never {
     return notFaked("connectedPeers");
+  }
+
+  connectionInfo(): never {
+    return notFaked("connectionInfo");
   }
 
   disconnect(): never {

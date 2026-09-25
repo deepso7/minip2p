@@ -5,6 +5,7 @@ import {
   AbortError,
   ClosedError,
   ConnectFailedError,
+  ConnectResultLostError,
   ConnectResultUnavailableError,
   DriverFailedError,
   EventQueueOverflowError,
@@ -77,7 +78,7 @@ type ConnectTerminal =
     }
   | {
       readonly ok: false;
-      readonly error: ConnectFailedError;
+      readonly error: AbortError | ConnectFailedError | ConnectResultLostError;
     };
 
 interface ConnectAttempt {
@@ -1186,9 +1187,16 @@ export class Minip2pBase {
     }
     if (
       event.tag === P2pEvent_Tags.PathEstablished ||
-      event.tag === P2pEvent_Tags.ConnectFailed
+      event.tag === P2pEvent_Tags.ConnectFailed ||
+      event.tag === P2pEvent_Tags.ConnectCancelled
     ) {
       this.#connectTerminal(event);
+    }
+    if (event.tag === P2pEvent_Tags.EventsDropped) {
+      this.#connectResultsLost(
+        event.inner.terminalConnectIds,
+        event.inner.terminalConnectIdsTruncated
+      );
     }
 
     const normalized = normalizeEvent(event);
@@ -1407,7 +1415,8 @@ export class Minip2pBase {
       {
         readonly tag:
           | typeof P2pEvent_Tags.PathEstablished
-          | typeof P2pEvent_Tags.ConnectFailed;
+          | typeof P2pEvent_Tags.ConnectFailed
+          | typeof P2pEvent_Tags.ConnectCancelled;
       }
     >
   ): void {
@@ -1426,12 +1435,15 @@ export class Minip2pBase {
             },
           }
         : {
-            error: new ConnectFailedError(
-              event.inner.connectId,
-              event.inner.peerId,
-              event.inner.kind,
-              event.inner.detail
-            ),
+            error:
+              event.tag === P2pEvent_Tags.ConnectCancelled
+                ? new AbortError("The connection attempt was cancelled")
+                : new ConnectFailedError(
+                    event.inner.connectId,
+                    event.inner.peerId,
+                    event.inner.kind,
+                    event.inner.detail
+                  ),
             ok: false,
           };
     if (attempt.waiting) {
@@ -1441,17 +1453,45 @@ export class Minip2pBase {
         attempt.reject?.(terminal.error);
       }
     } else {
-      attempt.terminal = terminal;
-      this.#terminalConnects.delete(event.inner.connectId);
-      this.#terminalConnects.add(event.inner.connectId);
-      while (this.#terminalConnects.size > CONNECT_TERMINAL_CAP) {
-        const oldest = this.#terminalConnects.values().next().value;
-        if (oldest === undefined) {
-          break;
-        }
-        this.#terminalConnects.delete(oldest);
-        this.#connects.delete(oldest);
+      this.#recordConnectTerminal(event.inner.connectId, attempt, terminal);
+    }
+  }
+
+  // Terminals dropped by the native carry arrive as EventsDropped ids: settle
+  // each tracked attempt with a delivery-loss error so waits cannot hang. A
+  // truncated list cannot name every dropped terminal, so every tracked
+  // attempt without a delivered terminal settles.
+  #connectResultsLost(connectIds: readonly number[], truncated: boolean): void {
+    const lost = truncated ? [...this.#connects.keys()] : connectIds;
+    for (const connectId of lost) {
+      const attempt = this.#connects.get(connectId);
+      if (attempt === undefined || attempt.terminal !== undefined) {
+        continue;
       }
+      const error = new ConnectResultLostError(connectId);
+      if (attempt.waiting) {
+        attempt.reject?.(error);
+      } else {
+        this.#recordConnectTerminal(connectId, attempt, { error, ok: false });
+      }
+    }
+  }
+
+  #recordConnectTerminal(
+    connectId: number,
+    attempt: ConnectAttempt,
+    terminal: ConnectTerminal
+  ): void {
+    attempt.terminal = terminal;
+    this.#terminalConnects.delete(connectId);
+    this.#terminalConnects.add(connectId);
+    while (this.#terminalConnects.size > CONNECT_TERMINAL_CAP) {
+      const oldest = this.#terminalConnects.values().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.#terminalConnects.delete(oldest);
+      this.#connects.delete(oldest);
     }
   }
 
@@ -1587,6 +1627,7 @@ function normalizeEvent(
     [P2pEvent_Tags.HolePunchFailed]: "holePunchFailed",
     [P2pEvent_Tags.FellBackToRelay]: "fellBackToRelay",
     [P2pEvent_Tags.ConnectFailed]: "connectFailed",
+    [P2pEvent_Tags.ConnectCancelled]: "connectCancelled",
     [P2pEvent_Tags.InboundDirectUpgrade]: "inboundDirectUpgrade",
     [P2pEvent_Tags.Message]: "message",
     [P2pEvent_Tags.PeerSubscribed]: "peerSubscribed",
