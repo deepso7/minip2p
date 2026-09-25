@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 
 import { MockBackend } from "@minip2p/test-fixtures";
-import { test } from "vitest";
+import { test, vi } from "vitest";
 
 import { P2pEvent_Tags, PathKind_Tags } from "../src/backend.ts";
 import {
@@ -505,6 +505,59 @@ test("aborting a connect wait cancels, then the terminal settles it", async () =
   await assert.rejects(cancelledWait, ConnectCancelledError);
   assert.equal((await racedWait).connectId, raced);
   endpoint.close();
+});
+
+test("aborting a connect wait drops its timeout and waits for the terminal", async () => {
+  vi.useFakeTimers();
+  try {
+    const backend = new MockBackend();
+    const endpoint = new TestMinip2p(backend);
+    const controller = new AbortController();
+    const connectId = endpoint.startConnect("peer");
+    const waiting = endpoint.waitConnectResult(connectId, {
+      signal: controller.signal,
+      timeoutMs: 50,
+    });
+
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(50);
+    assert.equal(await remainsPending(waiting), true);
+    assert.deepEqual(cancelCalls(backend), [["cancelConnect", connectId]]);
+
+    backend.emit({
+      inner: { connectId, peerId: "peer" },
+      tag: P2pEvent_Tags.ConnectCancelled,
+    });
+    await assert.rejects(waiting, ConnectCancelledError);
+    endpoint.close();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("an already-aborted connect wait drops its timeout", async () => {
+  vi.useFakeTimers();
+  try {
+    const backend = new MockBackend();
+    const endpoint = new TestMinip2p(backend);
+    const connectId = endpoint.startConnect("peer");
+    const waiting = endpoint.waitConnectResult(connectId, {
+      signal: AbortSignal.abort(),
+      timeoutMs: 50,
+    });
+
+    await vi.advanceTimersByTimeAsync(50);
+    assert.equal(await remainsPending(waiting), true);
+
+    backend.emit({
+      inner: { connectId, peerId: "peer" },
+      tag: P2pEvent_Tags.ConnectCancelled,
+    });
+    await assert.rejects(waiting, ConnectCancelledError);
+    endpoint.close();
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test("an already-aborted signal cancels before waiting", async () => {

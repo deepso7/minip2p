@@ -948,11 +948,13 @@ export class Minip2pBase {
         removeAbort?.();
         attempt.settle = undefined;
       };
-      // Abort only requests cancellation; the terminal it causes, or the one
-      // it raced, settles this wait.
-      const removeAbort = listenAbort(options.signal, () => {
+      // Abort only requests cancellation. Drop the local timeout so it cannot
+      // reject with TimeoutError before the terminal settles this wait.
+      const cancelForAbort = () => {
+        clearTimeout(timer);
         this.#requestCancel(connectId);
-      });
+      };
+      const removeAbort = listenAbort(options.signal, cancelForAbort);
       if (timeoutMs > 0) {
         // Ends this wait only; the attempt stays tracked for its terminal.
         timer = setTimeout(() => {
@@ -964,7 +966,7 @@ export class Minip2pBase {
         }, timeoutMs);
       }
       if (options.signal?.aborted === true) {
-        this.#requestCancel(connectId);
+        cancelForAbort();
       }
       attempt.settle = (outcome) => {
         stopWaiting();
