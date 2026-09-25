@@ -889,7 +889,7 @@ export class Minip2pBase {
    */
   startConnect(target: ConnectTarget): number {
     this.#assertOpen();
-    const connectId = this.#backend.connectTarget(toBackendTarget(target));
+    const connectId = this.#backend.connect(toBackendTarget(target));
     this.#connects.set(connectId, {});
     return connectId;
   }
@@ -993,24 +993,6 @@ export class Minip2pBase {
     this.#assertOpen();
     assertId(connectId, "connectId");
     this.#backend.cancelConnect(connectId);
-  }
-
-  /** Starts direct transport dials for every applicable local address family. */
-  dial(address: string): number[] {
-    this.#assertOpen();
-    return this.#backend.dial(address);
-  }
-
-  /** Starts a direct IPv4 transport dial. */
-  dialIp4(address: string): number {
-    this.#assertOpen();
-    return this.#backend.dialIp4(address);
-  }
-
-  /** Starts a direct IPv6 transport dial. */
-  dialIp6(address: string): number {
-    this.#assertOpen();
-    return this.#backend.dialIp6(address);
   }
 
   /** Closes the active connection to `peerId`. */
@@ -1682,7 +1664,6 @@ function normalizeEvent(
     [P2pEvent_Tags.InboundPathEstablished]: "inboundPathEstablished",
     [P2pEvent_Tags.PathUpgraded]: "pathUpgraded",
     [P2pEvent_Tags.HolePunchFailed]: "holePunchFailed",
-    [P2pEvent_Tags.FellBackToRelay]: "fellBackToRelay",
     [P2pEvent_Tags.ConnectFailed]: "connectFailed",
     [P2pEvent_Tags.ConnectCancelled]: "connectCancelled",
     [P2pEvent_Tags.InboundDirectUpgrade]: "inboundDirectUpgrade",

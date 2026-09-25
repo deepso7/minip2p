@@ -249,54 +249,6 @@ const FfiConverterTypeDiscoveryOptions = (() => {
 })();
 
 /**
- * One enabled transport and the addresses it should listen on.
- */
-export type TransportOptions = {
-    /**
-     * Exact listen multiaddresses, or transport defaults when absent.
-     *
-     * An explicitly empty list is rejected: omit this field for defaults or
-     * disable the transport by omitting it from [`EndpointConfig`].
-     */
-    listenAddrs?: Array<string>
-}
-
-/**
- * Generated factory for {@link TransportOptions} record objects.
- */
-export const TransportOptions = (() => {
-    const defaults = () => ({
-    });
-    const create = (() => {
-        return uniffiCreateRecord<TransportOptions, ReturnType<typeof defaults>>(defaults);
-    })();
-    return Object.freeze({
-        create,
-        new: create,
-        defaults: () => Object.freeze(defaults()) as Partial<TransportOptions>,
-    });
-})();
-
-const FfiConverterTypeTransportOptions = (() => {
-    type TypeName = TransportOptions;
-    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
-        readFromCursor(c: Cursor): TypeName {
-            return {
-                listenAddrs: FfiConverterOptionalSequenceString.readFromCursor(c)
-            };
-        }
-        writeIntoCursor(value: TypeName, c: Cursor): void {
-            FfiConverterOptionalSequenceString.writeIntoCursor(value.listenAddrs, c);
-        }
-        allocationSize(value: TypeName): number {
-            return FfiConverterOptionalSequenceString.allocationSize(value.listenAddrs);
-
-        }
-    };
-    return new FFIConverter();
-})();
-
-/**
  * Local-link mDNS discovery configuration.
  */
 export type MdnsOptions = {
@@ -407,17 +359,10 @@ export type EndpointConfig = {
      */
     autonatServers: Array<string>,
     /**
-     * Address-shaped listen multiaddresses; transport is inferred from shape.
+     * Listen multiaddresses; each address's shape selects its transport.
+     * Absent binds the QUIC dual-stack defaults; an empty list is rejected.
      */
     listen?: Array<string>,
-    /**
-     * QUIC configuration, or no QUIC transport when absent.
-     */
-    quic?: TransportOptions,
-    /**
-     * TCP configuration, or no TCP transport when absent.
-     */
-    tcp?: TransportOptions,
     /**
      * Whether connection attempts must remain relayed.
      */
@@ -465,8 +410,6 @@ const FfiConverterTypeEndpointConfig = (() => {
                 relays: FfiConverterSequenceString.readFromCursor(c),
                 autonatServers: FfiConverterSequenceString.readFromCursor(c),
                 listen: FfiConverterOptionalSequenceString.readFromCursor(c),
-                quic: FfiConverterOptionalTypeTransportOptions.readFromCursor(c),
-                tcp: FfiConverterOptionalTypeTransportOptions.readFromCursor(c),
                 forceRelay: FfiConverterBool.readFromCursor(c),
                 allowUnsigned: FfiConverterBool.readFromCursor(c),
                 protocols: FfiConverterSequenceString.readFromCursor(c),
@@ -479,8 +422,6 @@ const FfiConverterTypeEndpointConfig = (() => {
             FfiConverterSequenceString.writeIntoCursor(value.relays, c);
             FfiConverterSequenceString.writeIntoCursor(value.autonatServers, c);
             FfiConverterOptionalSequenceString.writeIntoCursor(value.listen, c);
-            FfiConverterOptionalTypeTransportOptions.writeIntoCursor(value.quic, c);
-            FfiConverterOptionalTypeTransportOptions.writeIntoCursor(value.tcp, c);
             FfiConverterBool.writeIntoCursor(value.forceRelay, c);
             FfiConverterBool.writeIntoCursor(value.allowUnsigned, c);
             FfiConverterSequenceString.writeIntoCursor(value.protocols, c);
@@ -492,8 +433,6 @@ const FfiConverterTypeEndpointConfig = (() => {
              FfiConverterSequenceString.allocationSize(value.relays) +
              FfiConverterSequenceString.allocationSize(value.autonatServers) +
              FfiConverterOptionalSequenceString.allocationSize(value.listen) +
-             FfiConverterOptionalTypeTransportOptions.allocationSize(value.quic) +
-             FfiConverterOptionalTypeTransportOptions.allocationSize(value.tcp) +
              FfiConverterBool.allocationSize(value.forceRelay) +
              FfiConverterBool.allocationSize(value.allowUnsigned) +
              FfiConverterSequenceString.allocationSize(value.protocols) +
@@ -2107,7 +2046,6 @@ export enum P2pEvent_Tags {
     InboundPathEstablished = "InboundPathEstablished",
     PathUpgraded = "PathUpgraded",
     HolePunchFailed = "HolePunchFailed",
-    FellBackToRelay = "FellBackToRelay",
     ConnectFailed = "ConnectFailed",
     ConnectCancelled = "ConnectCancelled",
     InboundDirectUpgrade = "InboundDirectUpgrade",
@@ -2841,40 +2779,6 @@ inner: {connectId: bigint; attempt: number; reason: string }): HolePunchFailed_ 
 
     }
 
-    type FellBackToRelay__interface = {
-        tag: P2pEvent_Tags.FellBackToRelay;
-        inner:
-Readonly<{connectId: bigint; peerId: string}>
-    };
-    /**
-     * Direct upgrade attempts ended with the relay path retained.
-     */
-    class FellBackToRelay_ extends UniffiEnum implements FellBackToRelay__interface {
-        /**
-         * @private
-         * This field is private and should not be used, use `tag` instead.
-         */
-        readonly [uniffiTypeNameSymbol] = "P2pEvent";
-        readonly tag = P2pEvent_Tags.FellBackToRelay;
-        readonly inner:
-Readonly<{connectId: bigint; peerId: string}>;
-        constructor(
-inner: {connectId: bigint; peerId: string }) {
-            super("P2pEvent", "FellBackToRelay");
-
-            this.inner = Object.freeze(inner);
-        }
-        static new(
-inner: {connectId: bigint; peerId: string }): FellBackToRelay_ {
-            return new FellBackToRelay_(inner);
-        }
-
-        static instanceOf(obj: any): obj is FellBackToRelay_ {
-            return obj.tag === P2pEvent_Tags.FellBackToRelay;
-        }
-
-    }
-
     type ConnectFailed__interface = {
         tag: P2pEvent_Tags.ConnectFailed;
         inner:
@@ -3349,7 +3253,6 @@ inner: {peerId?: string; source: DiscoverySource; reason: string; suppressed: nu
   InboundPathEstablished: InboundPathEstablished_,
   PathUpgraded: PathUpgraded_,
   HolePunchFailed: HolePunchFailed_,
-  FellBackToRelay: FellBackToRelay_,
   ConnectFailed: ConnectFailed_,
   ConnectCancelled: ConnectCancelled_,
   InboundDirectUpgrade: InboundDirectUpgrade_,
@@ -3370,7 +3273,7 @@ inner: {peerId?: string; source: DiscoverySource; reason: string; suppressed: nu
  * Event delivered by the native endpoint driver.
  */
 export type P2pEvent = InstanceType<
-    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingTimeout' | 'StreamReady' | 'StreamData' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'FellBackToRelay' | 'ConnectFailed' | 'ConnectCancelled' | 'InboundDirectUpgrade' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'GossipsubOutboundFailure' | 'GossipsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'DiscoveryProtocolViolation']
+    typeof P2pEvent['EventsDropped' | 'DriverFailed' | 'ConnectionEstablished' | 'ConnectionClosed' | 'PeerReady' | 'IdentifyReceived' | 'PingRttMeasured' | 'PingTimeout' | 'StreamReady' | 'StreamData' | 'StreamRemoteWriteClosed' | 'StreamClosed' | 'EndpointError' | 'ReachabilityChanged' | 'PublicAddressesChanged' | 'RelayReserved' | 'RelayReservationLost' | 'PathEstablished' | 'InboundPathEstablished' | 'PathUpgraded' | 'HolePunchFailed' | 'ConnectFailed' | 'ConnectCancelled' | 'InboundDirectUpgrade' | 'Message' | 'PeerSubscribed' | 'PeerUnsubscribed' | 'GossipsubOutboundFailure' | 'GossipsubProtocolViolation' | 'PeerDiscovered' | 'PeerUpdated' | 'PeerExpired' | 'DiscoveryDialFailed' | 'DiscoveryProtocolViolation']
 >;
 
 // FfiConverter for enum P2pEvent
@@ -3400,20 +3303,19 @@ const FfiConverterTypeP2pEvent = (() => {
                 case 19: return new P2pEvent.InboundPathEstablished({peerId: FfiConverterString.readFromCursor(c), path: FfiConverterTypePathKind.readFromCursor(c) });
                 case 20: return new P2pEvent.PathUpgraded({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c), from: FfiConverterTypePathKind.readFromCursor(c), to: FfiConverterTypePathKind.readFromCursor(c) });
                 case 21: return new P2pEvent.HolePunchFailed({connectId: FfiConverterUInt64.readFromCursor(c), attempt: FfiConverterUInt32.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
-                case 22: return new P2pEvent.FellBackToRelay({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c) });
-                case 23: return new P2pEvent.ConnectFailed({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c), kind: FfiConverterTypeNatErrorKind.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
-                case 24: return new P2pEvent.ConnectCancelled({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c) });
-                case 25: return new P2pEvent.InboundDirectUpgrade({peerId: FfiConverterString.readFromCursor(c) });
-                case 26: return new P2pEvent.Message({fromPeerId: FfiConverterString.readFromCursor(c), topics: FfiConverterSequenceString.readFromCursor(c), data: FfiConverterArrayBuffer.readFromCursor(c), seqno: FfiConverterArrayBuffer.readFromCursor(c), signed: FfiConverterBool.readFromCursor(c) });
-                case 27: return new P2pEvent.PeerSubscribed({peerId: FfiConverterString.readFromCursor(c), topic: FfiConverterString.readFromCursor(c) });
-                case 28: return new P2pEvent.PeerUnsubscribed({peerId: FfiConverterString.readFromCursor(c), topic: FfiConverterString.readFromCursor(c) });
-                case 29: return new P2pEvent.GossipsubOutboundFailure({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
-                case 30: return new P2pEvent.GossipsubProtocolViolation({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
-                case 31: return new P2pEvent.PeerDiscovered({peerId: FfiConverterString.readFromCursor(c), addrs: FfiConverterSequenceString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c) });
-                case 32: return new P2pEvent.PeerUpdated({peerId: FfiConverterString.readFromCursor(c), addrs: FfiConverterSequenceString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c) });
-                case 33: return new P2pEvent.PeerExpired({peerId: FfiConverterString.readFromCursor(c) });
-                case 34: return new P2pEvent.DiscoveryDialFailed({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
-                case 35: return new P2pEvent.DiscoveryProtocolViolation({peerId: FfiConverterOptionalString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c), reason: FfiConverterString.readFromCursor(c), suppressed: FfiConverterUInt32.readFromCursor(c) });
+                case 22: return new P2pEvent.ConnectFailed({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c), kind: FfiConverterTypeNatErrorKind.readFromCursor(c), detail: FfiConverterString.readFromCursor(c) });
+                case 23: return new P2pEvent.ConnectCancelled({connectId: FfiConverterUInt64.readFromCursor(c), peerId: FfiConverterString.readFromCursor(c) });
+                case 24: return new P2pEvent.InboundDirectUpgrade({peerId: FfiConverterString.readFromCursor(c) });
+                case 25: return new P2pEvent.Message({fromPeerId: FfiConverterString.readFromCursor(c), topics: FfiConverterSequenceString.readFromCursor(c), data: FfiConverterArrayBuffer.readFromCursor(c), seqno: FfiConverterArrayBuffer.readFromCursor(c), signed: FfiConverterBool.readFromCursor(c) });
+                case 26: return new P2pEvent.PeerSubscribed({peerId: FfiConverterString.readFromCursor(c), topic: FfiConverterString.readFromCursor(c) });
+                case 27: return new P2pEvent.PeerUnsubscribed({peerId: FfiConverterString.readFromCursor(c), topic: FfiConverterString.readFromCursor(c) });
+                case 28: return new P2pEvent.GossipsubOutboundFailure({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
+                case 29: return new P2pEvent.GossipsubProtocolViolation({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
+                case 30: return new P2pEvent.PeerDiscovered({peerId: FfiConverterString.readFromCursor(c), addrs: FfiConverterSequenceString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c) });
+                case 31: return new P2pEvent.PeerUpdated({peerId: FfiConverterString.readFromCursor(c), addrs: FfiConverterSequenceString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c) });
+                case 32: return new P2pEvent.PeerExpired({peerId: FfiConverterString.readFromCursor(c) });
+                case 33: return new P2pEvent.DiscoveryDialFailed({peerId: FfiConverterString.readFromCursor(c), reason: FfiConverterString.readFromCursor(c) });
+                case 34: return new P2pEvent.DiscoveryProtocolViolation({peerId: FfiConverterOptionalString.readFromCursor(c), source: FfiConverterTypeDiscoverySource.readFromCursor(c), reason: FfiConverterString.readFromCursor(c), suppressed: FfiConverterUInt32.readFromCursor(c) });
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -3580,15 +3482,8 @@ const FfiConverterTypeP2pEvent = (() => {
                     FfiConverterString.writeIntoCursor(inner.reason, c);
                     return;
                 }
-                case P2pEvent_Tags.FellBackToRelay: {
-                    c.writeI32(22);
-                    const inner = value.inner;
-                    FfiConverterUInt64.writeIntoCursor(inner.connectId, c);
-                    FfiConverterString.writeIntoCursor(inner.peerId, c);
-                    return;
-                }
                 case P2pEvent_Tags.ConnectFailed: {
-                    c.writeI32(23);
+                    c.writeI32(22);
                     const inner = value.inner;
                     FfiConverterUInt64.writeIntoCursor(inner.connectId, c);
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
@@ -3597,20 +3492,20 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.ConnectCancelled: {
-                    c.writeI32(24);
+                    c.writeI32(23);
                     const inner = value.inner;
                     FfiConverterUInt64.writeIntoCursor(inner.connectId, c);
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     return;
                 }
                 case P2pEvent_Tags.InboundDirectUpgrade: {
-                    c.writeI32(25);
+                    c.writeI32(24);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     return;
                 }
                 case P2pEvent_Tags.Message: {
-                    c.writeI32(26);
+                    c.writeI32(25);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.fromPeerId, c);
                     FfiConverterSequenceString.writeIntoCursor(inner.topics, c);
@@ -3620,35 +3515,35 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.PeerSubscribed: {
-                    c.writeI32(27);
+                    c.writeI32(26);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterString.writeIntoCursor(inner.topic, c);
                     return;
                 }
                 case P2pEvent_Tags.PeerUnsubscribed: {
-                    c.writeI32(28);
+                    c.writeI32(27);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterString.writeIntoCursor(inner.topic, c);
                     return;
                 }
                 case P2pEvent_Tags.GossipsubOutboundFailure: {
-                    c.writeI32(29);
+                    c.writeI32(28);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterString.writeIntoCursor(inner.reason, c);
                     return;
                 }
                 case P2pEvent_Tags.GossipsubProtocolViolation: {
-                    c.writeI32(30);
+                    c.writeI32(29);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterString.writeIntoCursor(inner.reason, c);
                     return;
                 }
                 case P2pEvent_Tags.PeerDiscovered: {
-                    c.writeI32(31);
+                    c.writeI32(30);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterSequenceString.writeIntoCursor(inner.addrs, c);
@@ -3656,7 +3551,7 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.PeerUpdated: {
-                    c.writeI32(32);
+                    c.writeI32(31);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterSequenceString.writeIntoCursor(inner.addrs, c);
@@ -3664,20 +3559,20 @@ const FfiConverterTypeP2pEvent = (() => {
                     return;
                 }
                 case P2pEvent_Tags.PeerExpired: {
-                    c.writeI32(33);
+                    c.writeI32(32);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     return;
                 }
                 case P2pEvent_Tags.DiscoveryDialFailed: {
-                    c.writeI32(34);
+                    c.writeI32(33);
                     const inner = value.inner;
                     FfiConverterString.writeIntoCursor(inner.peerId, c);
                     FfiConverterString.writeIntoCursor(inner.reason, c);
                     return;
                 }
                 case P2pEvent_Tags.DiscoveryProtocolViolation: {
-                    c.writeI32(35);
+                    c.writeI32(34);
                     const inner = value.inner;
                     FfiConverterOptionalString.writeIntoCursor(inner.peerId, c);
                     FfiConverterTypeDiscoverySource.writeIntoCursor(inner.source, c);
@@ -3851,13 +3746,6 @@ const FfiConverterTypeP2pEvent = (() => {
                     size += FfiConverterUInt64.allocationSize(inner.connectId);
                     size += FfiConverterUInt32.allocationSize(inner.attempt);
                     size += FfiConverterString.allocationSize(inner.reason);
-                    return size;
-                }
-                case P2pEvent_Tags.FellBackToRelay: {
-                    const inner = value.inner;
-                    let size = 4;
-                    size += FfiConverterUInt64.allocationSize(inner.connectId);
-                    size += FfiConverterString.allocationSize(inner.peerId);
                     return size;
                 }
                 case P2pEvent_Tags.ConnectFailed: {
@@ -4147,21 +4035,9 @@ export interface P2pEndpointLike {
  */
     closeStreamWrite(peerId: string, streamId: bigint) /*throws*/: void;
 /**
- * Starts a connection attempt.
- */
-    connect(peerId: string) /*throws*/: bigint;
-/**
- * Starts a direct-address connection attempt.
- */
-    connectAddr(address: string) /*throws*/: bigint;
-/**
  * Starts one Connection attempt and returns its Connect ID.
  */
-    connectTarget(target: ConnectTarget) /*throws*/: bigint;
-/**
- * Starts a connection attempt with explicit addresses.
- */
-    connectWithAddrs(peerId: string, addresses: Array<string>) /*throws*/: bigint;
+    connect(target: ConnectTarget) /*throws*/: bigint;
 /**
  * Returns connected peers.
  */
@@ -4170,18 +4046,6 @@ export interface P2pEndpointLike {
  * Returns the transport connection selected for a peer.
  */
     connectionInfo(peerId: string) /*throws*/: ConnectionInfo | undefined;
-/**
- * Dials on all applicable address families.
- */
-    dial(address: string) /*throws*/: Array<bigint>;
-/**
- * Dials using IPv4.
- */
-    dialIp4(address: string) /*throws*/: bigint;
-/**
- * Dials using IPv6.
- */
-    dialIp6(address: string) /*throws*/: bigint;
 /**
  * Disconnects a peer.
  */
@@ -4387,64 +4251,15 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Starts a connection attempt.
+ * Starts one Connection attempt and returns its Connect ID.
  */
-    connect(peerId: string): bigint /*throws*/ {
+    connect(target: ConnectTarget): bigint /*throws*/ {
     return FfiConverterUInt64.lift(uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
             /*caller:*/ (callStatus) => {
                 return nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect(
                 uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
-        FfiConverterString.lower(peerId, nativeModule().rustbuffer_alloc),
-                callStatus);
-            },
-            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
-    ));
-    }
-
-/**
- * Starts a direct-address connection attempt.
- */
-    connectAddr(address: string): bigint /*throws*/ {
-    return FfiConverterUInt64.lift(uniffiCaller.rustCallWithError(
-            /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
-            /*caller:*/ (callStatus) => {
-                return nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_addr(
-                uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
-        FfiConverterString.lower(address, nativeModule().rustbuffer_alloc),
-                callStatus);
-            },
-            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
-    ));
-    }
-
-/**
- * Starts one Connection attempt and returns its Connect ID.
- */
-    connectTarget(target: ConnectTarget): bigint /*throws*/ {
-    return FfiConverterUInt64.lift(uniffiCaller.rustCallWithError(
-            /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
-            /*caller:*/ (callStatus) => {
-                return nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_target(
-                uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
         FfiConverterTypeConnectTarget.lower(target, nativeModule().rustbuffer_alloc),
-                callStatus);
-            },
-            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
-    ));
-    }
-
-/**
- * Starts a connection attempt with explicit addresses.
- */
-    connectWithAddrs(peerId: string, addresses: Array<string>): bigint /*throws*/ {
-    return FfiConverterUInt64.lift(uniffiCaller.rustCallWithError(
-            /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
-            /*caller:*/ (callStatus) => {
-                return nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_with_addrs(
-                uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
-        FfiConverterString.lower(peerId, nativeModule().rustbuffer_alloc),
-        FfiConverterSequenceString.lower(addresses, nativeModule().rustbuffer_alloc),
                 callStatus);
             },
             /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
@@ -4490,59 +4305,6 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     } finally {
         nativeModule().rustbuffer_free(__rb);
     }
-    }
-
-/**
- * Dials on all applicable address families.
- */
-    dial(address: string): Array<bigint> /*throws*/ {
-    const __rb: Uint8Array = uniffiCaller.rustCallWithError(
-            /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
-            /*caller:*/ (callStatus) => {
-                return nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial(
-                uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
-        FfiConverterString.lower(address, nativeModule().rustbuffer_alloc),
-                callStatus);
-            },
-            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
-    );
-    try {
-        return FfiConverterSequenceUInt64.lift(__rb);
-    } finally {
-        nativeModule().rustbuffer_free(__rb);
-    }
-    }
-
-/**
- * Dials using IPv4.
- */
-    dialIp4(address: string): bigint /*throws*/ {
-    return FfiConverterUInt64.lift(uniffiCaller.rustCallWithError(
-            /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
-            /*caller:*/ (callStatus) => {
-                return nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip4(
-                uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
-        FfiConverterString.lower(address, nativeModule().rustbuffer_alloc),
-                callStatus);
-            },
-            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
-    ));
-    }
-
-/**
- * Dials using IPv6.
- */
-    dialIp6(address: string): bigint /*throws*/ {
-    return FfiConverterUInt64.lift(uniffiCaller.rustCallWithError(
-            /*liftError:*/ FfiConverterTypeFfiError.lift.bind(FfiConverterTypeFfiError),
-            /*caller:*/ (callStatus) => {
-                return nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip6(
-                uniffiTypeP2pEndpointObjectFactory.clonePointer(this),
-        FfiConverterString.lower(address, nativeModule().rustbuffer_alloc),
-                callStatus);
-            },
-            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
-    ));
     }
 
 /**
@@ -4996,9 +4758,6 @@ const FfiConverterSequenceString = new FfiConverterArray(FfiConverterString);
 // FfiConverter for Array<string> | undefined
 const FfiConverterOptionalSequenceString = new FfiConverterOptional(FfiConverterSequenceString);
 
-// FfiConverter for TransportOptions | undefined
-const FfiConverterOptionalTypeTransportOptions = new FfiConverterOptional(FfiConverterTypeTransportOptions);
-
 // FfiConverter for DiscoveryOptions | undefined
 const FfiConverterOptionalTypeDiscoveryOptions = new FfiConverterOptional(FfiConverterTypeDiscoveryOptions);
 
@@ -5078,32 +4837,14 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_close_stream_write() !== 17994) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_close_stream_write");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect() !== 42064) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect() !== 53603) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect");
-    }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr() !== 56611) {
-        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr");
-    }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_target() !== 39553) {
-        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_target");
-    }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs() !== 2062) {
-        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers() !== 64148) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connection_info() !== 24337) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_connection_info");
-    }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial() !== 35216) {
-        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial");
-    }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip4() !== 54241) {
-        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip4");
-    }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip6() !== 3676) {
-        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip6");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_disconnect() !== 23975) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_disconnect");
@@ -5200,6 +4941,5 @@ export default Object.freeze({
     FfiConverterTypePathKind,
     FfiConverterTypeReachability,
     FfiConverterTypeRelayReservationInfo,
-    FfiConverterTypeTransportOptions,
   }
 });

@@ -88,20 +88,6 @@ export const NatErrorKind = {
 } as const;
 export type NatErrorKind = (typeof NatErrorKind)[keyof typeof NatErrorKind];
 
-/** Listen configuration for one enabled transport. */
-export interface Minip2pTransportOptions {
-  /** Exact listen multiaddresses. Omit to listen on IPv4 and IPv6 defaults. */
-  readonly listen?: readonly [string, ...string[]];
-}
-
-/** Transports enabled by an endpoint. */
-export interface Minip2pTransports {
-  /** Enables QUIC with defaults or explicit options. */
-  readonly quic?: true | Minip2pTransportOptions;
-  /** Enables TCP with defaults or explicit options. */
-  readonly tcp?: true | Minip2pTransportOptions;
-}
-
 /** Configuration accepted by a platform minip2p endpoint. */
 export interface Minip2pConfig {
   /** Raw 32-byte Ed25519 secret key. */
@@ -113,12 +99,11 @@ export interface Minip2pConfig {
   /** AutoNAT server peer multiaddresses. */
   readonly autonatServers?: readonly string[];
   /**
-   * Address-shaped listen multiaddresses; transport is inferred from each
-   * address. When set, omit `transports` (mixing both throws).
+   * Listen multiaddresses; each address's shape selects its transport, e.g.
+   * `/ip4/0.0.0.0/udp/4001/quic-v1` or `/ip4/0.0.0.0/tcp/4001`. Omit for the
+   * native QUIC dual-stack defaults on ephemeral ports.
    */
   readonly listen?: readonly [string, ...string[]];
-  /** Enabled transports. Defaults to dual-stack QUIC only when `listen` is omitted. */
-  readonly transports?: Minip2pTransports;
   /** Routes outbound connectivity through relays only. */
   readonly forceRelay?: boolean;
   /** Accepts unsigned pubsub messages. */
@@ -236,7 +221,6 @@ export interface Minip2pNamedEventMap {
     readonly attempt: number;
     readonly reason: string;
   };
-  fellBackToRelay: { readonly connectId: number; readonly peerId: string };
   connectFailed: {
     readonly connectId: number;
     readonly peerId: string;
@@ -411,7 +395,6 @@ export const P2pEvent_Tags = {
   DriverFailed: "DriverFailed",
   EndpointError: "EndpointError",
   EventsDropped: "EventsDropped",
-  FellBackToRelay: "FellBackToRelay",
   GossipsubOutboundFailure: "GossipsubOutboundFailure",
   GossipsubProtocolViolation: "GossipsubProtocolViolation",
   HolePunchFailed: "HolePunchFailed",
@@ -527,10 +510,6 @@ export type P2pEvent =
   | RawEvent<
       typeof P2pEvent_Tags.HolePunchFailed,
       Minip2pNamedEventMap["holePunchFailed"]
-    >
-  | RawEvent<
-      typeof P2pEvent_Tags.FellBackToRelay,
-      Minip2pNamedEventMap["fellBackToRelay"]
     >
   | RawEvent<
       typeof P2pEvent_Tags.ConnectFailed,

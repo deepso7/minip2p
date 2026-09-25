@@ -39,15 +39,13 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
   readonly drainLimits: number[] = [];
   /** Native identities returned by the next `openStream` call. */
   nextStream = { connId: 1n, streamId: 1n };
-  /** Native connection identities returned by the dial methods. */
-  dialResults: bigint[] = [1n];
   /** Native discovery clock returned by `discoveryNowMs`. */
   discoveryNow: bigint | undefined = undefined;
-  /** Targets passed to `connectTarget`, in call order. */
+  /** Targets passed to `connect`, in call order. */
   readonly connectTargets: ConnectTarget[] = [];
   /** Connect IDs passed to `cancelConnect`, in call order. */
   readonly cancelledConnects: bigint[] = [];
-  /** Connect ID returned by the next `connectTarget` call. */
+  /** Connect ID returned by the next `connect` call. */
   nextConnectId = 30n;
   /** Value returned by `connectionInfo` for every peer. */
   connection: ConnectionInfo | undefined = undefined;
@@ -88,18 +86,6 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
     return this.nextStream;
   }
 
-  dial(): bigint[] {
-    return this.dialResults;
-  }
-
-  dialIp4(): bigint {
-    return this.dialResults[0] ?? 0n;
-  }
-
-  dialIp6(): bigint {
-    return this.dialResults[0] ?? 0n;
-  }
-
   discoveryNowMs(): bigint | undefined {
     return this.discoveryNow;
   }
@@ -132,23 +118,11 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
     return notFaked("closeStreamWrite");
   }
 
-  connect(): never {
-    return notFaked("connect");
-  }
-
-  connectAddr(): never {
-    return notFaked("connectAddr");
-  }
-
-  connectTarget(target: ConnectTarget): bigint {
+  connect(target: ConnectTarget): bigint {
     this.connectTargets.push(target);
     const id = this.nextConnectId;
     this.nextConnectId += 1n;
     return id;
-  }
-
-  connectWithAddrs(): never {
-    return notFaked("connectWithAddrs");
   }
 
   connectedPeers(): never {

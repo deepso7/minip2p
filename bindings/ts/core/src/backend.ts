@@ -88,24 +88,14 @@ export interface Minip2pBackend {
   /** Resets and relinquishes a stream. */
   abandonStream: (peerId: string, streamId: number) => void;
   /** Starts one Connection attempt and returns its Connect ID. */
-  connectTarget: (target: BackendConnectTarget) => number;
-  /** Starts direct dials for applicable address families. */
-  dial: (address: string) => number[];
-  /** Starts one direct IPv4 dial. */
-  dialIp4: (address: string) => number;
-  /** Starts one direct IPv6 dial. */
-  dialIp6: (address: string) => number;
+  connect: (target: BackendConnectTarget) => number;
   /** Cancels a Connection attempt; its terminal event still follows. */
   cancelConnect: (id: number) => void;
   /** Closes the active connection to a peer. */
   disconnect: (peerId: string) => void;
 }
 
-export {
-  resolveEndpointConfig,
-  type BackendEndpointConfig,
-  type BackendTransportConfig,
-} from "./config.js";
+export { resolveEndpointConfig, type BackendEndpointConfig } from "./config.js";
 export {
   P2pEvent_Tags,
   PathKind_Tags,

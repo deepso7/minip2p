@@ -24,14 +24,12 @@ console.log(result.connectId, result.path);
 | Connection target | Example |
 | --- | --- |
 | Peer ID; the endpoint applies its discovery-book and relay policy | `connect(peerId)` |
-| One complete address ending in `/p2p/<peer-id>` | `connect("/ip4/…/udp/4001/quic-v1/p2p/12D3Koo…")` |
+| One complete address ending in `/p2p/<peer-id>` | `connect("/ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN")` |
 | Several complete addresses naming one peer | `connect([quicAddr, tcpAddr])` |
 
 A string that starts with `/` is an address; any other string is a peer ID. Transport and IP family come from the addresses, and every candidate races under one attempt. Malformed targets throw synchronously; a valid peer ID with no route is admitted and then rejects with `ConnectFailedError`.
 
 `connect` resolves with `{ connectId, peerId, path }`. The first path may be `directDialed`, `directPunched`, or `relayed`. Call `path(peerId)` when you need the current answer; a relayed connection can upgrade after the original Promise resolves.
-
-The lower-level `dial`, `dialIp4`, and `dialIp6` methods only start direct TCP or QUIC dials and return connection IDs immediately. They do not run the relay race or return a `Path`. Observe `peerReady` or call `waitPeerReady` afterward.
 
 ## Timeouts and cancellation
 
@@ -118,9 +116,7 @@ const decoder = new TextDecoder();
 const endpoint = Minip2p.create({
   protocols: [protocol],
   secretKey: generateSecretKey(),
-  transports: {
-    quic: { listen: ["/ip4/127.0.0.1/udp/4002/quic-v1"] },
-  },
+  listen: ["/ip4/127.0.0.1/udp/4002/quic-v1"],
 });
 
 try {

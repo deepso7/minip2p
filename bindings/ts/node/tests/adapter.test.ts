@@ -88,7 +88,7 @@ const native = vi.hoisted(() => {
 
     closeStreamWrite(): void {}
 
-    connectTarget(target: string | string[]): bigint {
+    connect(target: string | string[]): bigint {
       this.connectTargets.push(target);
       const id = this.nextConnectId;
       this.nextConnectId += 1n;
@@ -101,18 +101,6 @@ const native = vi.hoisted(() => {
 
     connectionInfo(): { connId: bigint; remoteAddr?: string } | null {
       return this.connection;
-    }
-
-    dial(): bigint[] {
-      return [];
-    }
-
-    dialIp4(): bigint {
-      return 10n;
-    }
-
-    dialIp6(): bigint {
-      return 10n;
     }
 
     disconnect(): void {}

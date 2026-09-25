@@ -7,10 +7,7 @@ import { Minip2p, generateSecretKey } from "@minip2p/node";
 
 const endpoint = Minip2p.create({
   secretKey: generateSecretKey(),
-  transports: {
-    quic: { listen: ["/ip4/127.0.0.1/udp/0/quic-v1"] },
-    tcp: { listen: ["/ip4/127.0.0.1/tcp/0"] },
-  },
+  listen: ["/ip4/127.0.0.1/udp/0/quic-v1", "/ip4/127.0.0.1/tcp/0"],
 });
 
 console.log(endpoint.peerId(), endpoint.listenAddrs());

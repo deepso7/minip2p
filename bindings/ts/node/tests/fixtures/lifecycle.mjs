@@ -18,8 +18,8 @@ const endpoint = new binding.NodeEndpoint(binding.generateSecretKey(), {
   allowUnsigned: false,
   autonatServers: [],
   forceRelay: false,
+  listen: ["/ip4/127.0.0.1/udp/0/quic-v1"],
   protocols: [],
-  quic: { listenAddrs: ["/ip4/127.0.0.1/udp/0/quic-v1"] },
   relays: [],
 });
 

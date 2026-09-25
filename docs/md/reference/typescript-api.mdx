@@ -50,8 +50,7 @@ Setup per runtime: [Node.js](/typescript/setup-node), [React Native](/typescript
 | --- | --- | --- |
 | `secretKey` | `ArrayBuffer \| Uint8Array` | Required 32-byte Ed25519 secret key. |
 | `agentVersion` | `string` | Identify agent string. |
-| `transports` | `Minip2pTransports` | Enabled transports. Omitted means dual-stack QUIC only when `listen` is also omitted. |
-| `listen` | `readonly [string, ...string[]]` | Address-shaped listen multiaddresses; transport is inferred from each address. When set, omit `transports`. |
+| `listen` | `readonly [string, ...string[]]` | Listen multiaddresses; each address's shape selects QUIC or TCP. Omitted means dual-stack QUIC on ephemeral ports. |
 | `protocols` | `readonly string[]` | Custom protocols accepted on inbound streams. |
 | `relays` | `readonly string[]` | Direct QUIC or TCP relay peer addresses. |
 | `autonatServers` | `readonly string[]` | Reachability probe-server addresses. |
@@ -62,31 +61,16 @@ Setup per runtime: [Node.js](/typescript/setup-node), [React Native](/typescript
 
 `discovery.topic` is required when signed discovery is enabled. Both discovery options objects accept `autoDial`; remaining timing and capacity fields are typed in the exported declarations and use defaults when omitted. Signed discovery and mDNS share one automatic-dial policy. If both set `autoDial`, the values must match.
 
-Each transport accepts `true` or `{ listen?: readonly [string, ...string[]] }`; omit a transport to disable it. `true` listens on that transport's IPv4 and IPv6 defaults. An explicit `listen` array replaces those defaults exactly; an empty array is rejected. QUIC accepts at most one explicit listener per IP family. An omitted or empty `transports` object defaults to QUIC.
-
-Prefer top-level address-shaped `listen` when configuration already speaks multiaddresses:
+`listen` is the only listen setting. A `/udp/<port>/quic-v1` address binds QUIC and a `/tcp/<port>` address binds TCP; a transport with no listen address is not bound. An explicit array replaces the defaults exactly, and QUIC accepts at most one listener per IP family.
 
 ```ts
-// Infer transports from complete multiaddresses
-listen: ["/ip4/127.0.0.1/udp/4001/quic-v1", "/ip4/127.0.0.1/tcp/4001"];
-```
+// Omitted: QUIC on /ip4/0.0.0.0/udp/0/quic-v1 and /ip6/::/udp/0/quic-v1
 
-```ts
-// QUIC only, IPv4 + IPv6 (also the default when `transports` is omitted)
-transports: { quic: true }
+// QUIC + TCP on fixed IPv4 ports
+listen: ["/ip4/0.0.0.0/udp/4001/quic-v1", "/ip4/0.0.0.0/tcp/4001"];
 
-// QUIC + TCP, both IPv4 + IPv6
-transports: { quic: true, tcp: true }
-
-// TCP on exactly these listeners
-transports: {
-  tcp: {
-    listen: [
-      "/ip4/0.0.0.0/tcp/4001",
-      "/ip6/::/tcp/4001",
-    ],
-  },
-}
+// TCP only, IPv4 + IPv6
+listen: ["/ip4/0.0.0.0/tcp/4001", "/ip6/::/tcp/4001"];
 ```
 
 ## Identity and lifecycle
@@ -134,7 +118,6 @@ Promise operations use `{ timeoutMs?, signal? }`. Their default timeout is 65 se
 | `connect(target, options?)` | First usable path to a `ConnectTarget`: a peer ID, one complete peer address, or a list of complete addresses naming one peer. |
 | `startConnect(target)` / `waitConnectResult(connectId, options?)` | Split-phase connection flow using a `connectId`. |
 | `cancelConnect(connectId)` | Cancel an attempt; its terminal event settles any pending wait. |
-| `dial` / `dialIp4` / `dialIp6` | Start direct-only QUIC or TCP dialing and return connection IDs. |
 | `waitPeerReady(peerId, options?)` | Peer ID and advertised protocol list after Identify. |
 | `ping(peerId, options?)` | RTT in milliseconds. |
 | `openStream(peerId, protocol, options?)` | Negotiated `Stream`. |
@@ -177,7 +160,7 @@ Stream events are `data`, `remoteWriteClosed`, `closed`, and `dataOverflow`.
 | Endpoint and queue | `eventsDropped`, `queueOverflow`, `driverFailed`, `handlerError`, `endpointError` |
 | Connection and Identify | `connectionEstablished`, `connectionClosed`, `peerReady`, `identifyReceived` |
 | Ping and streams | `pingRttMeasured`, `pingTimeout`, `stream` |
-| Relay and NAT | `reachabilityChanged`, `publicAddressesChanged`, `relayReserved`, `relayReservationLost`, `pathEstablished`, `pathUpgraded`, `holePunchFailed`, `fellBackToRelay`, `connectFailed`, `connectCancelled`, `inboundDirectUpgrade` |
+| Relay and NAT | `reachabilityChanged`, `publicAddressesChanged`, `relayReserved`, `relayReservationLost`, `pathEstablished`, `pathUpgraded`, `holePunchFailed`, `connectFailed`, `connectCancelled`, `inboundDirectUpgrade` |
 | Pubsub | `message`, `peerSubscribed`, `peerUnsubscribed`, `gossipsubOutboundFailure`, `gossipsubProtocolViolation` |
 | Discovery | `peerDiscovered`, `peerUpdated`, `peerExpired`, `discoveryDialFailed`, `discoveryProtocolViolation` |
 

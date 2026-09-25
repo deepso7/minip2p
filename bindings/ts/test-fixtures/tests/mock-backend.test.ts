@@ -51,14 +51,14 @@ describe("MockBackend", () => {
     const backend = new MockBackend();
     const target = { kind: "peer", peerId: "peer" } as const;
 
-    expect(backend.connectTarget(target)).toBe(1);
-    expect(backend.connectTarget(target)).toBe(2);
+    expect(backend.connect(target)).toBe(1);
+    expect(backend.connect(target)).toBe(2);
 
     backend.abandonError = new Error("abandon failed");
     expect(() => backend.abandonStream("peer", 7)).toThrow("abandon failed");
     expect(backend.operations).toEqual([
-      ["connectTarget", target],
-      ["connectTarget", target],
+      ["connect", target],
+      ["connect", target],
       ["abandon", "peer", 7],
     ]);
   });

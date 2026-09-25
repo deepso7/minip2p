@@ -194,23 +194,7 @@ extern "C" {
     );
     uint64_t uniffi_minip2p_ffi_fn_method_p2pendpoint_connect(
         /*handle*/ uint64_t ptr,
-        RustBuffer peer_id,
-        RustCallStatus *uniffi_out_err
-    );
-    uint64_t uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_addr(
-        /*handle*/ uint64_t ptr,
-        RustBuffer address,
-        RustCallStatus *uniffi_out_err
-    );
-    uint64_t uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_target(
-        /*handle*/ uint64_t ptr,
         RustBuffer target,
-        RustCallStatus *uniffi_out_err
-    );
-    uint64_t uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_with_addrs(
-        /*handle*/ uint64_t ptr,
-        RustBuffer peer_id,
-        RustBuffer addresses,
         RustCallStatus *uniffi_out_err
     );
     RustBuffer uniffi_minip2p_ffi_fn_method_p2pendpoint_connected_peers(
@@ -220,21 +204,6 @@ extern "C" {
     RustBuffer uniffi_minip2p_ffi_fn_method_p2pendpoint_connection_info(
         /*handle*/ uint64_t ptr,
         RustBuffer peer_id,
-        RustCallStatus *uniffi_out_err
-    );
-    RustBuffer uniffi_minip2p_ffi_fn_method_p2pendpoint_dial(
-        /*handle*/ uint64_t ptr,
-        RustBuffer address,
-        RustCallStatus *uniffi_out_err
-    );
-    uint64_t uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip4(
-        /*handle*/ uint64_t ptr,
-        RustBuffer address,
-        RustCallStatus *uniffi_out_err
-    );
-    uint64_t uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip6(
-        /*handle*/ uint64_t ptr,
-        RustBuffer address,
         RustCallStatus *uniffi_out_err
     );
     void uniffi_minip2p_ffi_fn_method_p2pendpoint_disconnect(
@@ -573,21 +542,9 @@ extern "C" {
     );
     uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect(
     );
-    uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr(
-    );
-    uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_target(
-    );
-    uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs(
-    );
     uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers(
     );
     uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_connection_info(
-    );
-    uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial(
-    );
-    uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip4(
-    );
-    uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip6(
     );
     uint16_t uniffi_minip2p_ffi_checksum_method_p2pendpoint_disconnect(
     );
@@ -2642,30 +2599,6 @@ NativeMinip2pFfi::NativeMinip2pFfi(
             return this->cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect(rt, thisVal, args, count);
         }
     );
-    props["ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_addr"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_addr"),
-        2,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_addr(rt, thisVal, args, count);
-        }
-    );
-    props["ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_target"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_target"),
-        2,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_target(rt, thisVal, args, count);
-        }
-    );
-    props["ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_with_addrs"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_with_addrs"),
-        3,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_with_addrs(rt, thisVal, args, count);
-        }
-    );
     props["ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connected_peers"] = jsi::Function::createFromHostFunction(
         rt,
         jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_connected_peers"),
@@ -2680,30 +2613,6 @@ NativeMinip2pFfi::NativeMinip2pFfi(
         2,
         [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
             return this->cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_connection_info(rt, thisVal, args, count);
-        }
-    );
-    props["ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial"),
-        2,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial(rt, thisVal, args, count);
-        }
-    );
-    props["ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip4"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip4"),
-        2,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip4(rt, thisVal, args, count);
-        }
-    );
-    props["ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip6"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip6"),
-        2,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip6(rt, thisVal, args, count);
         }
     );
     props["ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_disconnect"] = jsi::Function::createFromHostFunction(
@@ -2986,30 +2895,6 @@ NativeMinip2pFfi::NativeMinip2pFfi(
             return this->cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect(rt, thisVal, args, count);
         }
     );
-    props["ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr"),
-        0,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr(rt, thisVal, args, count);
-        }
-    );
-    props["ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_target"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_target"),
-        0,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_target(rt, thisVal, args, count);
-        }
-    );
-    props["ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs"),
-        0,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs(rt, thisVal, args, count);
-        }
-    );
     props["ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers"] = jsi::Function::createFromHostFunction(
         rt,
         jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers"),
@@ -3024,30 +2909,6 @@ NativeMinip2pFfi::NativeMinip2pFfi(
         0,
         [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
             return this->cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connection_info(rt, thisVal, args, count);
-        }
-    );
-    props["ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial"),
-        0,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial(rt, thisVal, args, count);
-        }
-    );
-    props["ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip4"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip4"),
-        0,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip4(rt, thisVal, args, count);
-        }
-    );
-    props["ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip6"] = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip6"),
-        0,
-        [this](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            return this->cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip6(rt, thisVal, args, count);
         }
     );
     props["ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_disconnect"] = jsi::Function::createFromHostFunction(
@@ -3571,36 +3432,6 @@ jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_connec
 
         return uniffi_jsi::Bridging<uint64_t>::toJs(rt, callInvoker, value);
 }
-jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_addr(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-        RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
-        auto value = uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_addr(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::minip2p_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]),
-            &status
-        );
-        uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
-
-
-        return uniffi_jsi::Bridging<uint64_t>::toJs(rt, callInvoker, value);
-}
-jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_target(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-        RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
-        auto value = uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_target(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::minip2p_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]),
-            &status
-        );
-        uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
-
-
-        return uniffi_jsi::Bridging<uint64_t>::toJs(rt, callInvoker, value);
-}
-jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_with_addrs(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-        RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
-        auto value = uniffi_minip2p_ffi_fn_method_p2pendpoint_connect_with_addrs(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::minip2p_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]), uniffi::minip2p_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[2]),
-            &status
-        );
-        uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
-
-
-        return uniffi_jsi::Bridging<uint64_t>::toJs(rt, callInvoker, value);
-}
 jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_connected_peers(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
         auto value = uniffi_minip2p_ffi_fn_method_p2pendpoint_connected_peers(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]),
@@ -3620,36 +3451,6 @@ jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_connec
 
 
         return uniffi::minip2p_ffi::Bridging<RustBuffer>::toJs(rt, callInvoker, value);
-}
-jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-        RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
-        auto value = uniffi_minip2p_ffi_fn_method_p2pendpoint_dial(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::minip2p_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]),
-            &status
-        );
-        uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
-
-
-        return uniffi::minip2p_ffi::Bridging<RustBuffer>::toJs(rt, callInvoker, value);
-}
-jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip4(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-        RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
-        auto value = uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip4(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::minip2p_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]),
-            &status
-        );
-        uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
-
-
-        return uniffi_jsi::Bridging<uint64_t>::toJs(rt, callInvoker, value);
-}
-jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip6(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-        RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
-        auto value = uniffi_minip2p_ffi_fn_method_p2pendpoint_dial_ip6(uniffi_jsi::Bridging</*handle*/ uint64_t>::fromJs(rt, callInvoker, args[0]), uniffi::minip2p_ffi::Bridging<RustBuffer>::fromJs(rt, callInvoker, args[1]),
-            &status
-        );
-        uniffi::minip2p_ffi::Bridging<RustCallStatus>::copyIntoJs(rt, callInvoker, status, args[count - 1]);
-
-
-        return uniffi_jsi::Bridging<uint64_t>::toJs(rt, callInvoker, value);
 }
 jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_fn_method_p2pendpoint_disconnect(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         RustCallStatus status = uniffi::minip2p_ffi::Bridging<RustCallStatus>::rustSuccess(rt);
@@ -3970,27 +3771,6 @@ jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_
 
         return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
 }
-jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-        auto value = uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_addr(
-        );
-
-
-        return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
-}
-jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_target(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-        auto value = uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_target(
-        );
-
-
-        return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
-}
-jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-        auto value = uniffi_minip2p_ffi_checksum_method_p2pendpoint_connect_with_addrs(
-        );
-
-
-        return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
-}
 jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         auto value = uniffi_minip2p_ffi_checksum_method_p2pendpoint_connected_peers(
         );
@@ -4000,27 +3780,6 @@ jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_
 }
 jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_connection_info(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
         auto value = uniffi_minip2p_ffi_checksum_method_p2pendpoint_connection_info(
-        );
-
-
-        return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
-}
-jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-        auto value = uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial(
-        );
-
-
-        return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
-}
-jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip4(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-        auto value = uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip4(
-        );
-
-
-        return uniffi_jsi::Bridging<uint16_t>::toJs(rt, callInvoker, value);
-}
-jsi::Value NativeMinip2pFfi::cpp_uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip6(jsi::Runtime& rt, const jsi::Value& thisVal, const jsi::Value* args, size_t count) {
-        auto value = uniffi_minip2p_ffi_checksum_method_p2pendpoint_dial_ip6(
         );
 
 

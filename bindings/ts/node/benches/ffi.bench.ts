@@ -35,7 +35,7 @@ beforeAll(async () => {
   cleanup.push(() => rawA.close());
   rawB = createRaw(true);
   cleanup.push(() => rawB.close());
-  rawA.connectTarget([rawB.listenAddrs()[0]]);
+  rawA.connect([rawB.listenAddrs()[0]]);
   await Promise.all([
     waitRawReady(rawA, rawB.peerId()),
     waitRawReady(rawB, rawA.peerId()),
@@ -99,9 +99,9 @@ describe("node-ffi", () => {
 
 function createSdk(): Minip2p {
   return Minip2p.create({
+    listen: ["/ip4/127.0.0.1/tcp/0"],
     protocols: [PROTOCOL],
     secretKey: generateSecretKey(),
-    transports: { tcp: { listen: ["/ip4/127.0.0.1/tcp/0"] } },
   });
 }
 
@@ -112,9 +112,9 @@ function createRaw(drainOnDoorbell = false): NativeEndpoint {
       allowUnsigned: false,
       autonatServers: [],
       forceRelay: false,
+      listen: ["/ip4/127.0.0.1/tcp/0"],
       protocols: [PROTOCOL],
       relays: [],
-      tcp: { listenAddrs: ["/ip4/127.0.0.1/tcp/0"] },
     }
   );
   endpoint.start(() => {

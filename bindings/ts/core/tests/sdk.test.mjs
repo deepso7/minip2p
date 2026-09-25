@@ -408,11 +408,11 @@ test("startConnect shapes peer, address, and address-list targets", () => {
   endpoint.startConnect([quic, tcp]);
 
   assert.deepEqual(
-    backend.operations.filter(([name]) => name === "connectTarget"),
+    backend.operations.filter(([name]) => name === "connect"),
     [
-      ["connectTarget", { kind: "peer", peerId: "peer" }],
-      ["connectTarget", { addresses: [quic], kind: "addresses" }],
-      ["connectTarget", { addresses: [quic, tcp], kind: "addresses" }],
+      ["connect", { kind: "peer", peerId: "peer" }],
+      ["connect", { addresses: [quic], kind: "addresses" }],
+      ["connect", { addresses: [quic, tcp], kind: "addresses" }],
     ]
   );
   endpoint.close();
@@ -589,7 +589,7 @@ test("an already-aborted signal cancels before waiting", async () => {
   // connect() with an aborted signal never starts a native attempt.
   await assert.rejects(endpoint.connect("peer", { signal }), AbortError);
   assert.equal(
-    backend.operations.filter(([name]) => name === "connectTarget").length,
+    backend.operations.filter(([name]) => name === "connect").length,
     1
   );
   endpoint.close();

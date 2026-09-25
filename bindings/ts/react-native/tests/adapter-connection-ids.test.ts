@@ -125,34 +125,6 @@ describe("React Native connection identities", () => {
     endpoint.close();
   });
 
-  test("dial results map the full u64 range consistently with events", async () => {
-    vi.useFakeTimers();
-    const endpoint = Minip2p.create({ secretKey: new Uint8Array(32) });
-    const fake = FakeNativeEndpoint.current();
-    const opened: number[] = [];
-    endpoint.on("connectionEstablished", ({ connId }) => opened.push(connId));
-
-    fake.dialResults = [2n ** 64n - 1n, 2n ** 63n + 2n];
-    const dialed = endpoint.dial("/ip4/127.0.0.1/udp/4001/quic-v1");
-    fake.dialResults = [2n ** 63n + 2n];
-    const ip4 = endpoint.dialIp4("/ip4/127.0.0.1/udp/4001/quic-v1");
-    fake.dialResults = [2n ** 53n];
-    const ip6 = endpoint.dialIp6("/ip6/::1/udp/4001/quic-v1");
-    fake.enqueue([
-      established(2n ** 63n + 2n),
-      established(2n ** 64n - 1n),
-      established(2n ** 53n),
-    ]);
-    fake.ring();
-    await vi.runAllTimersAsync();
-
-    expect([...dialed, ip6].every(isSafeId)).toBe(true);
-    expect(new Set([...dialed, ip6]).size).toBe(3);
-    expect(ip4).toBe(dialed[1]);
-    expect(opened).toEqual([dialed[1], dialed[0], ip6]);
-    endpoint.close();
-  });
-
   test("other native u64 fields keep their range checks without blocking the batch", async () => {
     vi.useFakeTimers();
     const endpoint = Minip2p.create({ secretKey: new Uint8Array(32) });
