@@ -106,7 +106,7 @@ Node.js and React Native accept the same `Minip2pConfig`. It selects the capabil
 
 | Capability | Configuration | Active behavior | Infrastructure |
 | --- | --- | --- | --- |
-| Direct QUIC/TCP, Identify, Ping, custom streams | `secretKey`; optional `transports` and `protocols` | `Minip2p.create` starts the endpoint; transport default is dual-stack QUIC only | A mutually reachable UDP or TCP path |
+| Direct QUIC/TCP, Identify, Ping, custom streams | `secretKey`; optional `listen` (complete multiaddresses) and `protocols` | `Minip2p.create` starts the endpoint; without `listen` it binds dual-stack QUIC only | A mutually reachable UDP or TCP path |
 | Gossipsub | Always on | Signed outbound pubsub and strict inbound validation | At least one compatible mesh peer |
 | Signed discovery | `discovery: { topic, ... }` | Signed beacons, shared peer book, optional auto-dial | A connected discovery peer |
 | Local-link discovery | `mdns: true` or options | mDNS, shared peer book, optional auto-dial | A multicast-capable local network; mobile hosts also need local-network permissions |
