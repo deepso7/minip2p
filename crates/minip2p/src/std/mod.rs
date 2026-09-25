@@ -710,6 +710,9 @@ impl Endpoint {
                     // An agent timer may have ended this step; let it act.
                     let mut produced = Vec::new();
                     self.finish_step(&mut produced)?;
+                    if produced.is_empty() && deadline.has_passed() {
+                        return Ok(EndpointWaitOutcome::Deadline);
+                    }
                     self.pending_events.extend(produced);
                 }
                 PollNext::Interrupted => return Ok(EndpointWaitOutcome::Interrupted),
