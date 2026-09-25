@@ -304,9 +304,8 @@ pub(crate) fn take_delivery(
 /// Returns the Connect ID `event` terminates, when it is one of the three
 /// attempt terminals.
 ///
-/// `PathUpgraded` and `FellBackToRelay` carry a Connect ID but are not
-/// terminals: they can follow an attempt that settled on a provisional
-/// relayed path.
+/// `PathUpgraded` carries a Connect ID but is not a terminal: it can follow
+/// an attempt that settled on a provisional relayed path.
 pub(crate) fn terminal_connect_id(event: &P2pEvent) -> Option<u64> {
     match event {
         P2pEvent::PathEstablished { connect_id, .. }
@@ -427,8 +426,8 @@ mod tests {
             }),
             Some(10)
         );
-        // Path progress events carry a Connect ID but are not terminals:
-        // they can follow an attempt that settled on a provisional path.
+        // Path progress carries a Connect ID but is not a terminal: it can
+        // follow an attempt that settled on a provisional path.
         assert_eq!(
             terminal_connect_id(&P2pEvent::PathUpgraded {
                 connect_id: 11,
@@ -437,13 +436,6 @@ mod tests {
                     relay_peer_id: "relay".into()
                 },
                 to: crate::PathKind::DirectPunched,
-            }),
-            None
-        );
-        assert_eq!(
-            terminal_connect_id(&P2pEvent::FellBackToRelay {
-                connect_id: 12,
-                peer_id: "peer".into(),
             }),
             None
         );

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use minip2p_ffi_core::{
     ConnectTarget, DiscoveryOptions, DiscoverySource, DriverFailureKind, EndpointConfig,
     EndpointErrorKind, EventDoorbell, IdentifyInfo, MdnsOptions, NatErrorKind, P2pEndpoint,
-    P2pEvent, PathKind, Reachability, TransportOptions,
+    P2pEvent, PathKind, Reachability,
 };
 use napi::bindgen_prelude::{BigInt, Either, Uint8Array};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -24,13 +24,6 @@ impl EventDoorbell for NodeDoorbell {
     fn on_events_ready(&self) {
         self.0.call((), ThreadsafeFunctionCallMode::NonBlocking);
     }
-}
-
-/// QUIC listen configuration accepted from Node.js.
-#[napi(object)]
-pub struct NodeTransportOptions {
-    /// Exact listen addresses, or native defaults when absent.
-    pub listen_addrs: Option<Vec<String>>,
 }
 
 /// Signed-discovery configuration accepted from Node.js.
@@ -76,12 +69,8 @@ pub struct NodeEndpointConfig {
     pub relays: Vec<String>,
     /// AutoNAT server peer addresses.
     pub autonat_servers: Vec<String>,
-    /// Address-shaped listen multiaddresses.
+    /// Listen multiaddresses, or the QUIC dual-stack defaults when absent.
     pub listen: Option<Vec<String>>,
-    /// QUIC transport configuration.
-    pub quic: Option<NodeTransportOptions>,
-    /// TCP transport configuration.
-    pub tcp: Option<NodeTransportOptions>,
     /// Whether all outbound paths must remain relayed.
     pub force_relay: bool,
     /// Whether unsigned pubsub messages are accepted.
@@ -103,8 +92,6 @@ impl TryFrom<NodeEndpointConfig> for EndpointConfig {
             relays: config.relays,
             autonat_servers: config.autonat_servers,
             listen: config.listen,
-            quic: config.quic.map(convert_transport),
-            tcp: config.tcp.map(convert_transport),
             force_relay: config.force_relay,
             allow_unsigned: config.allow_unsigned,
             protocols: config.protocols,
@@ -155,12 +142,6 @@ pub struct NodeConnectionInfo {
     pub conn_id: BigInt,
     /// Remote transport address, when recorded.
     pub remote_addr: Option<String>,
-}
-
-fn convert_transport(options: NodeTransportOptions) -> TransportOptions {
-    TransportOptions {
-        listen_addrs: options.listen_addrs,
-    }
 }
 
 /// A native minip2p endpoint owned by Node.js.
@@ -326,67 +307,13 @@ impl NodeEndpoint {
     /// Starts one Connection attempt: a peer ID string, or an array of
     /// complete peer addresses naming one peer. Returns the Connect ID.
     #[napi]
-    pub fn connect_target(&self, target: Either<String, Vec<String>>) -> Result<BigInt> {
+    pub fn connect(&self, target: Either<String, Vec<String>>) -> Result<BigInt> {
         let target = match target {
             Either::A(peer_id) => ConnectTarget::Peer { peer_id },
             Either::B(addresses) => ConnectTarget::Addresses { addresses },
         };
         self.0
-            .connect_target(target)
-            .map(BigInt::from)
-            .map_err(native_error)
-    }
-
-    /// Starts a NAT-orchestrated connection attempt.
-    #[napi]
-    pub fn connect(&self, peer_id: String) -> Result<BigInt> {
-        self.0
-            .connect(peer_id)
-            .map(BigInt::from)
-            .map_err(native_error)
-    }
-
-    /// Starts a connection attempt with explicit addresses.
-    #[napi]
-    pub fn connect_with_addrs(&self, peer_id: String, addresses: Vec<String>) -> Result<BigInt> {
-        self.0
-            .connect_with_addrs(peer_id, addresses)
-            .map(BigInt::from)
-            .map_err(native_error)
-    }
-
-    /// Starts a direct-address connection attempt.
-    #[napi]
-    pub fn connect_addr(&self, address: String) -> Result<BigInt> {
-        self.0
-            .connect_addr(address)
-            .map(BigInt::from)
-            .map_err(native_error)
-    }
-
-    /// Starts direct dials for every applicable address family.
-    #[napi]
-    pub fn dial(&self, address: String) -> Result<Vec<BigInt>> {
-        self.0
-            .dial(address)
-            .map(|ids| ids.into_iter().map(BigInt::from).collect())
-            .map_err(native_error)
-    }
-
-    /// Starts one IPv4 dial.
-    #[napi]
-    pub fn dial_ip4(&self, address: String) -> Result<BigInt> {
-        self.0
-            .dial_ip4(address)
-            .map(BigInt::from)
-            .map_err(native_error)
-    }
-
-    /// Starts one IPv6 dial.
-    #[napi]
-    pub fn dial_ip6(&self, address: String) -> Result<BigInt> {
-        self.0
-            .dial_ip6(address)
+            .connect(target)
             .map(BigInt::from)
             .map_err(native_error)
     }
@@ -771,13 +698,6 @@ fn event_value(event: P2pEvent) -> serde_json::Value {
                 "attempt": attempt,
                 "reason": reason,
             }),
-        ),
-        P2pEvent::FellBackToRelay {
-            connect_id,
-            peer_id,
-        } => (
-            "FellBackToRelay",
-            serde_json::json!({ "connectId": connect_id, "peerId": peer_id }),
         ),
         P2pEvent::ConnectFailed {
             connect_id,

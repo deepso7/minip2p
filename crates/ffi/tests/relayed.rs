@@ -82,11 +82,7 @@ fn endpoint(seed: u8, relay: String) -> Arc<P2pEndpoint> {
             agent_version: Some("minip2p-ffi-relay-test".into()),
             relays: vec![relay],
             autonat_servers: Vec::new(),
-            listen: None,
-            quic: Some(minip2p_ffi::TransportOptions {
-                listen_addrs: Some(vec!["/ip4/127.0.0.1/udp/0/quic-v1".into()]),
-            }),
-            tcp: None,
+            listen: Some(vec!["/ip4/127.0.0.1/udp/0/quic-v1".into()]),
             force_relay: true,
             allow_unsigned: false,
             protocols: Vec::new(),
@@ -140,7 +136,11 @@ fn relayed_chat_and_reservation_loss() {
     ));
     a.subscribe(TOPIC.into()).expect("subscribe initiator");
     b.subscribe(TOPIC.into()).expect("subscribe responder");
-    let connect_id = a.connect(b_peer.clone()).expect("start relay connect");
+    let connect_id = a
+        .connect(minip2p_ffi::ConnectTarget::Peer {
+            peer_id: b_peer.clone(),
+        })
+        .expect("start relay connect");
     a_log.wait_for(|event| {
         matches!(
             event,

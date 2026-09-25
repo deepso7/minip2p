@@ -1,6 +1,6 @@
 //! Binding-agnostic endpoint lifecycle and event delivery for foreign runtimes.
 //!
-//! Connection attempts follow one contract: [`P2pEndpoint::connect_target`]
+//! Connection attempts follow one contract: [`P2pEndpoint::connect`]
 //! admits an attempt under a single Connect ID and the event stream carries
 //! exactly one terminal for it — [`P2pEvent::PathEstablished`],
 //! [`P2pEvent::ConnectFailed`], or [`P2pEvent::ConnectCancelled`] after
@@ -23,7 +23,6 @@ mod events;
 
 pub use config::{
     DiscoveryOptions, EndpointConfig, KnownPeerInfo, MdnsOptions, RelayReservationInfo,
-    TransportOptions,
 };
 pub use connect::ConnectTarget;
 pub use driver::DriverStats;

@@ -306,13 +306,6 @@ pub enum P2pEvent {
         /// Human-readable failure detail.
         reason: String,
     },
-    /// Direct upgrade attempts ended with the relay path retained.
-    FellBackToRelay {
-        /// Endpoint-local connection-attempt id.
-        connect_id: u64,
-        /// Remote peer.
-        peer_id: String,
-    },
     /// A connection attempt ended without a usable path.
     ConnectFailed {
         /// Endpoint-local connection-attempt id.
@@ -602,7 +595,11 @@ pub(crate) fn convert_nat(event: NatEvent) -> Option<P2pEvent> {
         NatEvent::RelayReservationLost { relay } => P2pEvent::RelayReservationLost {
             relay_peer_id: relay.to_base58(),
         },
-        NatEvent::PathEstablished { .. } | NatEvent::ConnectFailed { .. } => return None,
+        // Attempt terminals reach the app only as the Endpoint's
+        // `ConnectSettled`, converted by `convert_settled`.
+        NatEvent::PathEstablished { .. }
+        | NatEvent::ConnectFailed { .. }
+        | NatEvent::FellBackToRelay { .. } => return None,
         NatEvent::InboundPathEstablished { peer, path } => P2pEvent::InboundPathEstablished {
             peer_id: peer.to_base58(),
             path: convert_path(path),
@@ -626,10 +623,6 @@ pub(crate) fn convert_nat(event: NatEvent) -> Option<P2pEvent> {
             connect_id: connect_id.as_u64(),
             attempt,
             reason,
-        },
-        NatEvent::FellBackToRelay { connect_id, peer } => P2pEvent::FellBackToRelay {
-            connect_id: connect_id.as_u64(),
-            peer_id: peer.to_base58(),
         },
         NatEvent::InboundDirectUpgrade { peer } => P2pEvent::InboundDirectUpgrade {
             peer_id: peer.to_base58(),
@@ -978,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_nat_skips_dialer_path_established_and_connect_failed() {
+    fn convert_nat_skips_attempt_terminals() {
         let remote = peer(13);
         assert_eq!(
             convert_nat(NatEvent::PathEstablished {
@@ -991,8 +984,15 @@ mod tests {
         assert_eq!(
             convert_nat(NatEvent::ConnectFailed {
                 connect_id: minip2p::ConnectId::from_u64(1),
-                peer: remote,
+                peer: remote.clone(),
                 error: NatError::NoPathAvailable,
+            }),
+            None
+        );
+        assert_eq!(
+            convert_nat(NatEvent::FellBackToRelay {
+                connect_id: minip2p::ConnectId::from_u64(1),
+                peer: remote,
             }),
             None
         );
