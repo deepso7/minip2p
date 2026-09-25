@@ -18,8 +18,8 @@ default = ["std"]
 std = ["minip2p-core/std", "minip2p-identity/std", "thiserror/std"]
 
 [dependencies]
-minip2p-core = { path = "../core", version = "0.6.0", default-features = false }
-minip2p-identity = { path = "../identity", version = "0.6.0", default-features = false, features = [
+minip2p-core = { path = "../core", version = "0.7.0", default-features = false }
+minip2p-identity = { path = "../identity", version = "0.7.0", default-features = false, features = [
   "ed25519",
 ] }
 x25519-dalek = { version = "3.0.0", default-features = false, features = [
