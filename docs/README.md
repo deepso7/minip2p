@@ -9,7 +9,7 @@ Blume emits `js-yaml` imports into its generated runtime. The root `js-yaml` dep
 ## Requirements
 
 - Node.js 24.20 or newer
-- pnpm 12.3.4
+- pnpm 12.5.1
 
 ## Work locally
 
