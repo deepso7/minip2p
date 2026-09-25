@@ -145,35 +145,42 @@ const row = "flex items-baseline justify-between gap-3 border-t border-border px
         </dl>
       </div>
 
-      {/* What the application sees: one event per `wait` call. */}
+      {/* What the application sees: each row is a separate `wait` call. */}
       <div class="overflow-hidden rounded-blume border border-border">
         <div class="flex items-baseline justify-between gap-3 bg-muted px-4 py-2.5">
           <span class={`${mono} text-muted-foreground`}>your loop</span>
-          <code class={`${mono} text-foreground`}>node.wait()</code>
+          <span class={`${mono} text-muted-foreground`}>
+            one event per <code class="text-foreground">node.wait()</code>
+          </span>
         </div>
         <ol class={`${mono} m-0 list-none p-0`}>
           <li class={`${row} text-muted-foreground`} data-show="1" data-rise>
             connect(peer) → ConnectId
           </li>
           <li class={row} data-show="2" data-rise>
-            <span>ConnectionEstablished</span><span class="text-muted-foreground">circuit</span>
+            <span><span class="text-muted-foreground">wait → </span>ConnectionEstablished</span><span class="text-muted-foreground">circuit</span>
           </li>
           <li class={`${row} delay-300`} data-show="2" data-rise>
-            <span>Nat(PathEstablished)</span><span class="text-muted-foreground">Relayed</span>
+            <span><span class="text-muted-foreground">wait → </span>Nat(PathEstablished)</span><span class="text-muted-foreground">Relayed</span>
           </li>
           <li class={row} data-show="3" data-rise>
-            <span>ConnectionEstablished</span><span class="text-muted-foreground">direct</span>
+            <span><span class="text-muted-foreground">wait → </span>ConnectionEstablished</span><span class="text-muted-foreground">direct</span>
           </li>
           <li class={`${row} delay-300`} data-show="3" data-rise>
-            <span>Nat(PathUpgraded)</span><span class="text-muted-foreground">→ Punched</span>
+            <span><span class="text-muted-foreground">wait → </span>Nat(PathUpgraded)</span><span class="text-muted-foreground">→ Punched</span>
           </li>
           <li class={`${row} text-accent`} data-show="4" data-rise>
-            <span>ConnectSettled</span><span>Connected</span>
+            <span><span class="text-muted-foreground">wait → </span>ConnectSettled</span><span>Connected</span>
           </li>
           <li class={`${row} delay-300`} data-show="4" data-rise>
-            <span>ConnectionClosed</span><span class="text-muted-foreground">circuit</span>
+            <span><span class="text-muted-foreground">wait → </span>ConnectionClosed</span><span class="text-muted-foreground">circuit</span>
           </li>
         </ol>
+        <p class={`${mono} m-0 border-t border-border px-4 py-2.5 text-muted-foreground`}>
+          The order for this run. An attempt that settles on the relay can still
+          see <code class="text-foreground">Nat(PathUpgraded)</code> after{" "}
+          <code class="text-foreground">ConnectSettled</code>.
+        </p>
       </div>
     </div>
 
