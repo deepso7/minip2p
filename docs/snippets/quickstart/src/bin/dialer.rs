@@ -1,28 +1,45 @@
-use std::{str::FromStr, time::Duration};
+use std::time::{Duration, Instant};
 
-use minip2p::{Endpoint, PeerAddr};
+use minip2p::{ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome, PeerAddr};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let target = std::env::args()
+    // A complete peer address, e.g. /ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3KooW...
+    let target: PeerAddr = std::env::args()
         .nth(1)
-        .ok_or("usage: dialer <peer-address>")?;
-    let target = PeerAddr::from_str(&target)?;
+        .ok_or("usage: dialer <peer-address>")?
+        .parse()?;
+    let peer = target.peer_id().clone();
 
     let mut node = Endpoint::builder()
         .agent_version("minip2p-hello/dialer")
-        .bind_quic_dual_stack()?;
+        .listen_default()?
+        .bind()?;
 
-    node.dial(&target)?;
-    let ready = node.wait_peer_ready(target.peer_id(), Duration::from_secs(10))?;
-    if ready.is_none() {
-        return Err("peer did not become ready within 10 seconds".into());
+    // One Connection attempt, one Connect ID, one terminal event.
+    let connect_id = node.connect(target)?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let EndpointWaitOutcome::Event(event) = node.wait(deadline)? else {
+            // Deadline (or an interruption we have no use for): give up.
+            return Err("peer did not answer within 10 seconds".into());
+        };
+        match event {
+            EndpointEvent::ConnectSettled {
+                connect_id: id,
+                outcome,
+                ..
+            } if id == connect_id => {
+                if !matches!(outcome, ConnectOutcome::Connected { .. }) {
+                    return Err(format!("connect failed: {outcome:?}").into());
+                }
+            }
+            EndpointEvent::PeerReady { peer_id, .. } if peer_id == peer => node.ping(&peer)?,
+            EndpointEvent::PingRttMeasured { peer_id, rtt_ms } if peer_id == peer => {
+                println!("peer={peer} rtt={rtt_ms}ms");
+                return Ok(());
+            }
+            // Everything else is unrelated to this exchange.
+            _ => {}
+        }
     }
-
-    node.ping(target.peer_id())?;
-    let rtt = node
-        .wait_ping_rtt(target.peer_id(), Duration::from_secs(5))?
-        .ok_or("ping timed out")?;
-
-    println!("peer={} rtt={}ms", target.peer_id(), rtt);
-    Ok(())
 }

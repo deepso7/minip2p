@@ -12,7 +12,10 @@ use std::collections::{BTreeSet, HashSet};
 use std::error::Error;
 use std::time::{Duration, Instant};
 
-use minip2p::{Endpoint, Event, NatConfig, NatEvent, Path, PeerAddr, PeerId, StreamId};
+use minip2p::{
+    ConnectId, ConnectOutcome, Endpoint, EndpointEvent, EndpointWaitOutcome, NatConfig, NatEvent,
+    Path, PeerAddr, PeerId, StreamId,
+};
 
 use minip2p_example_common::{
     circuit_addr, load_keypair, local_dialable_peer_addr, path_name, print_nat_event,
@@ -27,7 +30,7 @@ const ECHO_PROTOCOL: &str = "/minip2p/echo/1";
 const FRAME_LEN: usize = 16;
 /// Cadence of the dialer's pings.
 const PING_INTERVAL: Duration = Duration::from_secs(1);
-/// Outlives the engine's 30 s connect deadline so `nat_wait_path` can still
+/// Outlives the engine's 30 s connect deadline so the path wait can still
 /// observe a late `PathEstablished` instead of timing out first.
 const CONNECT_DEADLINE: Duration = Duration::from_secs(65);
 /// How long the listener waits for its first relay reservation before
@@ -41,7 +44,7 @@ const SETUP_DEADLINE: Duration = Duration::from_secs(10);
 // --- shared plumbing -------------------------------------------------------
 
 /// Builds the endpoint both modes share. The NAT agent is always enabled so
-/// `connect`/`nat_wait_path` work even with no relay configured.
+/// `connect` reports a path even with no relay configured.
 fn build_endpoint(
     role: &str,
     relays: &[PeerAddr],
@@ -60,15 +63,13 @@ fn build_endpoint(
         builder = builder.autonat_server(autonat.clone());
     }
     match &options.listen_addr {
-        Some(addr) if addr.is_tcp_transport() => builder
-            .tcp_multiaddr(addr)
-            .and_then(|builder| builder.bind())
-            .map_err(|e| format!("TCP bind {addr}: {e}").into()),
         Some(addr) => builder
-            .bind_quic_multiaddr(addr)
-            .map_err(|e| format!("QUIC bind {addr}: {e}").into()),
+            .listen_on_multiaddr(addr)
+            .and_then(|builder| builder.bind())
+            .map_err(|e| format!("bind {addr}: {e}").into()),
         None => builder
-            .bind_quic_dual_stack()
+            .listen_default()
+            .and_then(|builder| builder.bind())
             .map_err(|e| format!("quic dual-stack bind: {e}").into()),
     }
 }
@@ -154,52 +155,65 @@ pub fn run_listen(relay: Option<PeerAddr>, options: RunOptions) -> Result<(), Bo
     let mut echo_streams: HashSet<(PeerId, StreamId)> = HashSet::new();
 
     if let Some(relay) = relays.first() {
-        wait_for_reservation(&mut endpoint, relay)?;
+        wait_for_reservation(&mut endpoint, relay, &mut echo_streams)?;
     }
     eprintln!("[listen] echoing on {ECHO_PROTOCOL} (Ctrl-C to stop)");
 
     loop {
-        let Some(event) = endpoint
-            .next_event(Duration::from_millis(200))
+        match endpoint
+            .wait(Duration::from_millis(200))
             .map_err(|e| format!("swarm poll: {e}"))?
-        else {
-            continue;
-        };
-        print_event("listen", &event);
-        if let Event::Nat(nat_event) = &event {
-            handle_listen_nat_event(&mut endpoint, nat_event, relays.first());
+        {
+            EndpointWaitOutcome::Event(event) => {
+                dispatch_listen_event(&mut endpoint, &event, relays.first(), &mut echo_streams);
+            }
+            EndpointWaitOutcome::Deadline | EndpointWaitOutcome::Interrupted => {}
         }
-        handle_listen_event(&mut endpoint, &event, &mut echo_streams);
     }
 }
 
-/// Pumps NAT events until the first reservation confirms (printing the
+/// Serves events until the first reservation confirms (printing the
 /// paste-ready `circuit=` line) or the deadline passes with a warning; the
 /// agent keeps retrying either way and renewals re-print via the main loop.
-fn wait_for_reservation(endpoint: &mut Endpoint, relay: &PeerAddr) -> Result<(), Box<dyn Error>> {
+fn wait_for_reservation(
+    endpoint: &mut Endpoint,
+    relay: &PeerAddr,
+    echo_streams: &mut HashSet<(PeerId, StreamId)>,
+) -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + RESERVATION_DEADLINE;
     loop {
-        let Some(event) = endpoint
-            .next_nat_event(deadline)
+        match endpoint
+            .wait(deadline)
             .map_err(|e| format!("swarm poll: {e}"))?
-        else {
-            eprintln!(
-                "[listen] warning: no relay reservation within {}s; still retrying",
-                RESERVATION_DEADLINE.as_secs()
-            );
-            return Ok(());
-        };
-        print_nat_event("listen", &event);
-        let reserved = matches!(event, NatEvent::RelayReserved { .. });
-        handle_listen_nat_event(endpoint, &event, Some(relay));
-        if reserved {
-            return Ok(());
+        {
+            EndpointWaitOutcome::Event(event) => {
+                dispatch_listen_event(endpoint, &event, Some(relay), echo_streams);
+                if let EndpointEvent::Nat(NatEvent::RelayReserved { .. }) = event {
+                    return Ok(());
+                }
+            }
+            EndpointWaitOutcome::Interrupted => {}
+            EndpointWaitOutcome::Deadline => {
+                eprintln!(
+                    "[listen] warning: no relay reservation within {}s; still retrying",
+                    RESERVATION_DEADLINE.as_secs()
+                );
+                return Ok(());
+            }
         }
     }
 }
 
-fn handle_listen_nat_event(endpoint: &mut Endpoint, event: &NatEvent, relay: Option<&PeerAddr>) {
-    if let NatEvent::RelayReserved { .. } = event
+/// Prints one listener event and serves it: `circuit=` lines for
+/// reservations and byte-for-byte echo on tracked echo streams.
+fn dispatch_listen_event(
+    endpoint: &mut Endpoint,
+    event: &EndpointEvent,
+    relay: Option<&PeerAddr>,
+    echo_streams: &mut HashSet<(PeerId, StreamId)>,
+) {
+    print_event("listen", event);
+    if let EndpointEvent::Nat(NatEvent::RelayReserved { .. }) = event
         && let Some(relay) = relay
     {
         println!(
@@ -207,15 +221,16 @@ fn handle_listen_nat_event(endpoint: &mut Endpoint, event: &NatEvent, relay: Opt
             circuit_addr(relay, endpoint.peer_id())
         );
     }
+    handle_listen_event(endpoint, event, echo_streams);
 }
 
 fn handle_listen_event(
     endpoint: &mut Endpoint,
-    event: &Event,
+    event: &EndpointEvent,
     echo_streams: &mut HashSet<(PeerId, StreamId)>,
 ) {
     match event {
-        Event::StreamReady {
+        EndpointEvent::StreamReady {
             peer_id,
             stream_id,
             protocol_id,
@@ -224,7 +239,7 @@ fn handle_listen_event(
         } if protocol_id == ECHO_PROTOCOL => {
             echo_streams.insert((peer_id.clone(), *stream_id));
         }
-        Event::StreamData {
+        EndpointEvent::StreamData {
             peer_id,
             stream_id,
             data,
@@ -232,7 +247,7 @@ fn handle_listen_event(
         } if echo_streams.contains(&(peer_id.clone(), *stream_id)) => {
             echo_bytes(endpoint, peer_id, *stream_id, data, echo_streams);
         }
-        Event::StreamRemoteWriteClosed {
+        EndpointEvent::StreamRemoteWriteClosed {
             peer_id, stream_id, ..
         } if echo_streams.contains(&(peer_id.clone(), *stream_id)) => {
             if let Err(error) = endpoint.close_stream_write(peer_id, *stream_id) {
@@ -240,7 +255,7 @@ fn handle_listen_event(
             }
             echo_streams.remove(&(peer_id.clone(), *stream_id));
         }
-        Event::StreamClosed {
+        EndpointEvent::StreamClosed {
             peer_id, stream_id, ..
         } => {
             echo_streams.remove(&(peer_id.clone(), *stream_id));
@@ -370,20 +385,7 @@ pub fn run_dial(
         }
     };
 
-    let path = endpoint
-        .nat_wait_path(connect_id, CONNECT_DEADLINE)
-        .map_err(|e| format!("waiting for a path: {e}"))?;
-    let Some(path) = path else {
-        // The attempt's ConnectSettled (if it settled) is still queued;
-        // surface its outcome.
-        while let Some(event) = endpoint
-            .next_event(Duration::ZERO)
-            .map_err(|e| format!("swarm poll: {e}"))?
-        {
-            print_event("dial", &event);
-        }
-        return Err("no path to the target".into());
-    };
+    let path = wait_for_path(&mut endpoint, &peer, connect_id)?;
     println!(
         "[dial] path-established path={} elapsed={}ms elapsed-us={}",
         path_name(&path),
@@ -405,6 +407,49 @@ pub fn run_dial(
     ping_loop(&mut endpoint, &peer, channel, frames, count, start)
 }
 
+/// Waits for the attempt's first usable path (the provisional relayed one,
+/// when that lands first), printing unrelated events as they arrive. An
+/// attempt that settles connected without a path event reports the current
+/// path; a failed or cancelled one ends the run.
+fn wait_for_path(
+    endpoint: &mut Endpoint,
+    peer: &PeerId,
+    connect_id: ConnectId,
+) -> Result<Path, Box<dyn Error>> {
+    let deadline = Instant::now() + CONNECT_DEADLINE;
+    loop {
+        match endpoint
+            .wait(deadline)
+            .map_err(|e| format!("waiting for a path: {e}"))?
+        {
+            EndpointWaitOutcome::Event(EndpointEvent::Nat(NatEvent::PathEstablished {
+                connect_id: id,
+                path,
+                ..
+            })) if id == connect_id => return Ok(path),
+            EndpointWaitOutcome::Event(
+                event @ EndpointEvent::ConnectSettled { connect_id: id, .. },
+            ) if id == connect_id => {
+                print_event("dial", &event);
+                let connected = matches!(
+                    event,
+                    EndpointEvent::ConnectSettled {
+                        outcome: ConnectOutcome::Connected { .. },
+                        ..
+                    }
+                );
+                return connected
+                    .then(|| endpoint.path(peer))
+                    .flatten()
+                    .ok_or_else(|| "no path to the target".into());
+            }
+            EndpointWaitOutcome::Event(event) => print_event("dial", &event),
+            EndpointWaitOutcome::Interrupted => {}
+            EndpointWaitOutcome::Deadline => return Err("no path to the target".into()),
+        }
+    }
+}
+
 /// Opens the echo stream on a direct connection. Waiting for Identify first
 /// is this demo's policy (early protocol advertisement); the stack allows
 /// `open_stream` once connected. The stream must finish negotiating before
@@ -414,25 +459,35 @@ fn open_echo_stream(
     peer: &PeerId,
     deadline: Instant,
 ) -> Result<StreamId, Box<dyn Error>> {
-    if !endpoint.is_peer_ready(peer) {
-        endpoint
-            .wait_peer_ready(peer, deadline)
+    while !endpoint.is_peer_ready(peer) {
+        match endpoint
+            .wait(deadline)
             .map_err(|e| format!("waiting for identify: {e}"))?
-            .ok_or("identify never completed on the direct connection")?;
+        {
+            EndpointWaitOutcome::Event(event) => print_event("dial", &event),
+            EndpointWaitOutcome::Interrupted => {}
+            EndpointWaitOutcome::Deadline => {
+                return Err("identify never completed on the direct connection".into());
+            }
+        }
     }
     let stream = endpoint
         .open_stream(peer, ECHO_PROTOCOL)
         .map_err(|e| format!("open echo stream: {e}"))?;
     loop {
-        let event = endpoint
-            .next_event(deadline)
+        let event = match endpoint
+            .wait(deadline)
             .map_err(|e| format!("waiting for echo stream: {e}"))?
-            .ok_or("echo stream never became ready")?;
+        {
+            EndpointWaitOutcome::Event(event) => event,
+            EndpointWaitOutcome::Interrupted => continue,
+            EndpointWaitOutcome::Deadline => return Err("echo stream never became ready".into()),
+        };
         match &event {
-            Event::StreamReady {
+            EndpointEvent::StreamReady {
                 peer_id, stream_id, ..
             } if peer_id == peer && *stream_id == stream => return Ok(stream),
-            Event::ConnectionEstablished { peer_id, .. } if peer_id == peer => {
+            EndpointEvent::ConnectionEstablished { peer_id, .. } if peer_id == peer => {
                 print_event("dial", &event);
                 // A second punch connection just replaced the one this
                 // stream was opened on — the swarm keeps the newcomer and
@@ -489,14 +544,14 @@ fn open_direct_channel(
 ) -> Result<Channel, Box<dyn Error>> {
     let setup = Instant::now() + SETUP_DEADLINE;
     let deadline = drain_deadline.map_or(setup, |drain| drain.min(setup));
-    // `nat_wait_path` and `PathUpgraded` can land before the connection's own
-    // `ConnectionEstablished` is taken from the Endpoint event stream. Drain
-    // what is already queued before opening the stream, so a stale
+    // `PathEstablished` and `PathUpgraded` can land before the connection's
+    // own `ConnectionEstablished` is taken from the Endpoint event stream.
+    // Drain what is already queued before opening the stream, so a stale
     // establishment cannot masquerade as a superseding punch connection —
     // that would burn the stream and force a needless retry on every plain
     // direct dial.
-    while let Some(event) = endpoint
-        .next_event(Duration::ZERO)
+    for event in endpoint
+        .poll()
         .map_err(|e| format!("draining queued events: {e}"))?
     {
         print_event("dial", &event);
@@ -545,9 +600,14 @@ fn ping_loop(
 
     loop {
         let wait_until = drain_deadline.unwrap_or(next_ping);
-        let event = endpoint
-            .next_event(wait_until)
-            .map_err(|e| format!("swarm poll: {e}"))?;
+        let event = match endpoint
+            .wait(wait_until)
+            .map_err(|e| format!("swarm poll: {e}"))?
+        {
+            EndpointWaitOutcome::Event(event) => Some(event),
+            EndpointWaitOutcome::Interrupted => continue,
+            EndpointWaitOutcome::Deadline => None,
+        };
         let Some(event) = event else {
             // Deadline tick.
             if let Some(deadline) = drain_deadline {
@@ -610,7 +670,7 @@ fn ping_loop(
         };
 
         match &event {
-            Event::StreamData {
+            EndpointEvent::StreamData {
                 peer_id,
                 stream_id,
                 data,
@@ -640,10 +700,10 @@ fn ping_loop(
                     return Ok(());
                 }
             }
-            Event::StreamRemoteWriteClosed {
+            EndpointEvent::StreamRemoteWriteClosed {
                 peer_id, stream_id, ..
             }
-            | Event::StreamClosed {
+            | EndpointEvent::StreamClosed {
                 peer_id, stream_id, ..
             } if *peer_id == channel.send_peer && *stream_id == channel.stream => {
                 print_event("dial", &event);
@@ -683,7 +743,7 @@ fn ping_loop(
             // close just before the replacement direct connection is
             // delivered. The matching StreamClosed event (or a failed send)
             // is the authoritative signal that this channel itself died.
-            Event::Nat(nat_event) => {
+            EndpointEvent::Nat(nat_event) => {
                 print_nat_event("dial", nat_event);
                 if let NatEvent::PathUpgraded { peer: upgraded, .. } = nat_event
                     && upgraded == peer

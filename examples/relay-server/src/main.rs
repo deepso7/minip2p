@@ -3,19 +3,18 @@ mod service;
 
 use std::error::Error;
 use std::io::BufRead as _;
+use std::net::SocketAddr;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use minip2p::{
-    Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome, Multiaddr, RelayServerEvent,
-};
+use minip2p::{Ed25519Keypair, Endpoint, EndpointEvent, EndpointWaitOutcome, RelayServerEvent};
 use minip2p_example_common::load_keypair;
 
 const STDIN_COMMAND_CAPACITY: usize = 16;
-const DEFAULT_IPV4_BIND: &str = "0.0.0.0:19876";
-const DEFAULT_IPV6_BIND: &str = "[::]:19876";
 const DEFAULT_IPV4_QUIC: &str = "/ip4/0.0.0.0/udp/19876/quic-v1";
 const DEFAULT_IPV6_QUIC: &str = "/ip6/::/udp/19876/quic-v1";
+const DEFAULT_IPV4_TCP: &str = "/ip4/0.0.0.0/tcp/19876";
+const DEFAULT_IPV6_TCP: &str = "/ip6/::/tcp/19876";
 
 #[derive(Clone, Copy, Debug)]
 enum AutomaticBind {
@@ -129,36 +128,22 @@ fn try_bind(
         .relay_server_config(options.config.clone())?;
 
     if options.quic_binds.is_empty() {
-        builder = match mode {
-            AutomaticBind::Both => {
-                let ipv4: Multiaddr = DEFAULT_IPV4_QUIC.parse()?;
-                let ipv6: Multiaddr = DEFAULT_IPV6_QUIC.parse()?;
-                builder.quic_dual_multiaddr(&ipv4, &ipv6)?
-            }
-            AutomaticBind::Ipv4 => builder.quic(DEFAULT_IPV4_BIND),
-            AutomaticBind::Ipv6 => builder.quic(DEFAULT_IPV6_BIND),
-        };
+        for address in automatic_addrs(mode, DEFAULT_IPV4_QUIC, DEFAULT_IPV6_QUIC) {
+            builder = builder.listen_on(address)?;
+        }
     } else {
-        match options.quic_binds.as_slice() {
-            [address] => builder = builder.quic(address),
-            [first, second] => {
-                let first = quic_multiaddr(first)?;
-                let second = quic_multiaddr(second)?;
-                builder = builder.quic_dual_multiaddr(&first, &second)?;
-            }
-            _ => return Err("--quic accepts at most one IPv4 and one IPv6 address".into()),
+        for &address in &options.quic_binds {
+            builder = builder.listen_on(listen_multiaddr(address, "udp", "/quic-v1"))?;
         }
     }
 
     if options.tcp_binds.is_empty() {
-        builder = match mode {
-            AutomaticBind::Both => builder.tcp(DEFAULT_IPV4_BIND).tcp(DEFAULT_IPV6_BIND),
-            AutomaticBind::Ipv4 => builder.tcp(DEFAULT_IPV4_BIND),
-            AutomaticBind::Ipv6 => builder.tcp(DEFAULT_IPV6_BIND),
-        };
+        for address in automatic_addrs(mode, DEFAULT_IPV4_TCP, DEFAULT_IPV6_TCP) {
+            builder = builder.listen_on(address)?;
+        }
     } else {
-        for address in &options.tcp_binds {
-            builder = builder.tcp(address);
+        for &address in &options.tcp_binds {
+            builder = builder.listen_on(listen_multiaddr(address, "tcp", ""))?;
         }
     }
 
@@ -168,12 +153,28 @@ fn try_bind(
     Ok(builder.bind()?)
 }
 
-fn quic_multiaddr(address: &str) -> Result<Multiaddr, Box<dyn Error>> {
-    let address: std::net::SocketAddr = address
-        .parse()
-        .map_err(|error| format!("invalid dual-stack --quic address {address:?}: {error}"))?;
+/// The default listen addresses one automatic bind layout uses.
+fn automatic_addrs(
+    mode: AutomaticBind,
+    ipv4: &'static str,
+    ipv6: &'static str,
+) -> Vec<&'static str> {
+    match mode {
+        AutomaticBind::Both => vec![ipv4, ipv6],
+        AutomaticBind::Ipv4 => vec![ipv4],
+        AutomaticBind::Ipv6 => vec![ipv6],
+    }
+}
+
+/// Converts a `--quic`/`--tcp` socket address into its listen multiaddr, e.g.
+/// `192.0.2.10:4101` over `udp` + `/quic-v1` → `/ip4/192.0.2.10/udp/4101/quic-v1`.
+fn listen_multiaddr(address: SocketAddr, protocol: &str, suffix: &str) -> String {
     let family = if address.is_ipv4() { "ip4" } else { "ip6" };
-    Ok(format!("/{family}/{}/udp/{}/quic-v1", address.ip(), address.port()).parse()?)
+    format!(
+        "/{family}/{}/{protocol}/{}{suffix}",
+        address.ip(),
+        address.port()
+    )
 }
 
 fn stdin_commands() -> mpsc::Receiver<String> {
@@ -262,5 +263,19 @@ mod tests {
             sender.try_send("overflow".into()),
             Err(mpsc::TrySendError::Full(_))
         ));
+    }
+
+    #[test]
+    fn socket_binds_map_to_listen_multiaddrs() {
+        let ipv6: SocketAddr = "[::1]:4101".parse().unwrap();
+        let ipv4: SocketAddr = "192.0.2.10:4201".parse().unwrap();
+        assert_eq!(
+            listen_multiaddr(ipv6, "udp", "/quic-v1"),
+            "/ip6/::1/udp/4101/quic-v1"
+        );
+        assert_eq!(
+            listen_multiaddr(ipv4, "tcp", ""),
+            "/ip4/192.0.2.10/tcp/4201"
+        );
     }
 }

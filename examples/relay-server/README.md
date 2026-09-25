@@ -5,7 +5,8 @@ The default application path is the same three calls as any other endpoint:
 ```rust
 let endpoint = Endpoint::builder()
     .relay_server()
-    .bind_quic("0.0.0.0:19876")?;
+    .listen_on("/ip4/0.0.0.0/udp/19876/quic-v1")?
+    .bind()?;
 ```
 
 Run the included operational host to serve QUIC and TCP on both address families with production defaults:
@@ -40,18 +41,16 @@ The executable expands the same builder when composing all four listeners:
 ```rust
 let endpoint = Endpoint::builder()
     .relay_server()
-    .quic_dual_multiaddr(
-        &"/ip4/0.0.0.0/udp/19876/quic-v1".parse()?,
-        &"/ip6/::/udp/19876/quic-v1".parse()?,
-    )?
-    .tcp("0.0.0.0:19876")
-    .tcp("[::]:19876")
+    .listen_on("/ip4/0.0.0.0/udp/19876/quic-v1")?
+    .listen_on("/ip6/::/udp/19876/quic-v1")?
+    .listen_on("/ip4/0.0.0.0/tcp/19876")?
+    .listen_on("/ip6/::/tcp/19876")?
     .bind()?;
 ```
 
 The executable tries both transports on IPv4 and IPv6 port `19876`, falling back to whichever address family is available. It prints dialable addresses with its peer identity and renders typed reservation/circuit lifecycle events, directional byte totals, denial statuses, close causes, and operational errors. Type `pause` or `resume` on stdin to change admission without removing HOP from Identify or terminating existing reservations and circuits.
 
-Use repeatable `--quic` and `--tcp` flags to replace automatic binds with exact addresses:
+Use repeatable `--quic` and `--tcp` flags to replace automatic binds with exact `HOST:PORT` socket addresses (the host turns each into its `listen_on` multiaddr):
 
 ```bash
 cargo run -p minip2p-relay-server-example -- \

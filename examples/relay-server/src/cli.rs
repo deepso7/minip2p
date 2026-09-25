@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use minip2p::{Multiaddr, RateLimit, RelayServerConfig};
@@ -5,9 +6,9 @@ use minip2p::{Multiaddr, RateLimit, RelayServerConfig};
 #[derive(Debug)]
 pub struct Options {
     /// Exact QUIC binds; empty selects automatic IPv4/IPv6 binding.
-    pub quic_binds: Vec<String>,
+    pub quic_binds: Vec<SocketAddr>,
     /// Exact TCP binds; empty selects automatic IPv4/IPv6 binding.
-    pub tcp_binds: Vec<String>,
+    pub tcp_binds: Vec<SocketAddr>,
     pub key_path: Option<PathBuf>,
     pub announce_addrs: Vec<Multiaddr>,
     pub accepting: bool,
@@ -28,8 +29,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         let value = |args: &mut std::vec::IntoIter<String>| next_value(&flag, args);
         match flag.as_str() {
             "--help" | "-h" => return Err(usage().into()),
-            "--quic" => options.quic_binds.push(value(&mut args)?),
-            "--tcp" => options.tcp_binds.push(value(&mut args)?),
+            "--quic" => options.quic_binds.push(socket(&flag, value(&mut args)?)?),
+            "--tcp" => options.tcp_binds.push(socket(&flag, value(&mut args)?)?),
             "--key" => options.key_path = Some(value(&mut args)?.into()),
             "--announce" => options.announce_addrs.push(
                 value(&mut args)?
@@ -104,6 +105,12 @@ fn number<T: core::str::FromStr>(flag: &str, value: String) -> Result<T, String>
         .map_err(|_| format!("{flag} requires a non-negative integer, got {value:?}"))
 }
 
+fn socket(flag: &str, value: String) -> Result<SocketAddr, String> {
+    value.parse().map_err(|error| {
+        format!("{flag} requires a HOST:PORT socket address, got {value:?}: {error}")
+    })
+}
+
 fn rate(flag: &str, value: String) -> Result<Option<RateLimit>, String> {
     if value == "off" {
         return Ok(None);
@@ -150,8 +157,9 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(options.quic_binds, ["127.0.0.1:4101", "[::1]:4101"]);
-        assert_eq!(options.tcp_binds, ["127.0.0.1:4201", "[::1]:4201"]);
+        let text = |binds: &[SocketAddr]| binds.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(text(&options.quic_binds), ["127.0.0.1:4101", "[::1]:4101"]);
+        assert_eq!(text(&options.tcp_binds), ["127.0.0.1:4201", "[::1]:4201"]);
     }
 
     #[test]
@@ -167,6 +175,12 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("at most one IPv4 and one IPv6"), "{error}");
+    }
+
+    #[test]
+    fn rejects_a_non_socket_bind_address() {
+        let error = parse(["--tcp".into(), "/ip4/127.0.0.1/tcp/4201".into()]).unwrap_err();
+        assert!(error.contains("--tcp requires a HOST:PORT"), "{error}");
     }
 
     #[test]

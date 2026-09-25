@@ -100,7 +100,7 @@ If the punch cannot land (e.g. UDP blocked between the peers), you'll see `nat-h
 
 ## Notes
 
-- Dial setup uses focused waits such as `nat_wait_path` and `wait_peer_ready` when a milestone is needed, and `next_event` for the application loop; new code can use one `Endpoint::wait` loop for every event. Keep driving both peers; blocking one endpoint on a shared thread can delay the other.
+- Every phase is one `Endpoint::wait` loop: dial setup matches the milestone it needs (the attempt's `PathEstablished`, then Identify) and prints every other event as the steady-state loop would. Keep driving both peers; blocking one endpoint on a shared thread can delay the other.
 - The echo protocol (`/minip2p/echo/1`) frames are 16 bytes: an 8-byte big-endian seq followed by an 8-byte send timestamp. The listener never parses them — it echoes raw bytes, which also exercises frame fragmentation/coalescing on the dialer's reassembly path.
 - A relayed path is an end-to-end Noise connection multiplexed with Yamux. Identify, ping, and the echo protocol use the same negotiated stream APIs as a direct connection. This demo waits for Identify before opening echo; that is policy, not a stack requirement for `open_stream`.
 - Exit paths: `--count` is the graceful shutdown (half-close, 3 s drain, summary); Ctrl-C is the blunt one. The listener runs until interrupted.
