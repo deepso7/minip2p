@@ -134,16 +134,21 @@ export const initScene = (root: HTMLElement) => {
     }
   });
 
-  // Start when it is mostly on screen; pause when it scrolls away and pick up
-  // again on return. A reader who asks for less motion gets the finished
-  // frame and steps through it by hand.
+  // Start when the stage itself is on screen (not the step list beside it);
+  // pause when it scrolls away and pick up again on return. A stage taller
+  // than the viewport (phone landscape) counts once it fills half the screen.
+  // A reader who asks for less motion gets the finished frame and steps
+  // through it by hand.
+  const stage = root.querySelector("figure") ?? root;
   let seen = false;
   new IntersectionObserver(
     ([entry]) => {
       if (!entry) {
         return;
       }
-      const visible = entry.intersectionRatio >= 0.4;
+      const visible =
+        entry.intersectionRatio >= 0.4 ||
+        entry.intersectionRect.height >= window.innerHeight * 0.5;
       if (visible && !seen) {
         seen = true;
         goTo(reducedMotion.matches ? last : 1, !reducedMotion.matches);
@@ -155,6 +160,6 @@ export const initScene = (root: HTMLElement) => {
         pause();
       }
     },
-    { threshold: [0, 0.4] }
-  ).observe(root);
+    { threshold: [0, 0.1, 0.2, 0.3, 0.4] }
+  ).observe(stage);
 };

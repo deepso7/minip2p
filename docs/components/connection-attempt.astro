@@ -42,15 +42,17 @@ const row = "flex items-baseline justify-between gap-3 border-t border-border px
 <div class="group/scene grid gap-8 lg:grid-cols-3 lg:gap-16" data-scene data-durations="2800,2800,3000,2600">
   <div>
     <slot />
-    <div class="mt-6"><SceneSteps steps={steps} /></div>
+    {/* On narrow screens the list sits far from the stage, so once the scene
+        plays it gives way to the caption inside the figure. */}
+    <div class="mt-6 group-data-scene-live/scene:max-lg:hidden"><SceneSteps steps={steps} /></div>
     <p class="mt-5 mb-0"><slot name="more" /></p>
   </div>
 
-  <figure class="@container m-0 flex flex-col lg:col-span-2" aria-label="A Connection attempt from dial to ConnectSettled">
+  <figure class="m-0 flex flex-col lg:col-span-2" aria-label="A Connection attempt from dial to ConnectSettled">
     <div class="flex grow flex-col gap-6">
       <div class="flex grow flex-col">
         {/* The network: you and the peer, each behind a NAT, and a relay. */}
-        <div class="relative min-h-48 grow">
+        <div class="relative min-h-48 grow overflow-x-clip">
           {/* Relay route: up from each node and across, through the relay. */}
           <div class="absolute inset-x-8 top-3.5 bottom-8 rounded-t-3xl border-2 border-b-0 border-dashed border-border" />
           <div
@@ -184,6 +186,7 @@ const row = "flex items-baseline justify-between gap-3 border-t border-border px
       </div>
     </div>
 
+    <SceneSteps steps={steps} caption />
     <SceneControls steps={steps.length} />
   </figure>
 </div>

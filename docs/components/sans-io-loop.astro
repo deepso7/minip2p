@@ -48,7 +48,7 @@ const labelRight = `${mono} absolute top-1/2 right-14 -translate-y-1/2 text-righ
 ---
 
 <div class="group/scene grid gap-8 lg:grid-cols-3 lg:gap-16" data-scene data-durations="2200,2400,2400,2400,2600">
-  <figure class="@container order-last m-0 lg:order-first lg:col-span-2" aria-label="One turn of a wait loop">
+  <figure class="order-last m-0 lg:order-first lg:col-span-2" aria-label="One turn of a wait loop">
     <div class="mx-auto max-w-2xl">
       <div class={layer}>
         <span class={`${lit} data-on:animate-pop`} data-show="1" data-hide="2" />
@@ -148,12 +148,15 @@ const labelRight = `${mono} absolute top-1/2 right-14 -translate-y-1/2 text-righ
       </div>
     </div>
 
+    <SceneSteps steps={steps} caption />
     <SceneControls steps={steps.length} />
   </figure>
 
   <div>
     <slot />
-    <div class="mt-6"><SceneSteps steps={steps} /></div>
+    {/* On narrow screens the list sits far from the stage, so once the scene
+        plays it gives way to the caption inside the figure. */}
+    <div class="mt-6 group-data-scene-live/scene:max-lg:hidden"><SceneSteps steps={steps} /></div>
     <p class="mt-5 mb-0"><slot name="more" /></p>
   </div>
 </div>
