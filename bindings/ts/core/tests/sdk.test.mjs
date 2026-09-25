@@ -474,33 +474,58 @@ test("cancelOnTimeout opts into cancelling the attempt", async () => {
   endpoint.close();
 });
 
-test("aborting a connect wait cancels the attempt, whose terminal stays consumable", async () => {
+test("aborting a connect wait cancels, then the terminal settles it", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
   const controller = new AbortController();
-  const connectId = endpoint.startConnect("peer");
-  const waiting = endpoint.waitConnectResult(connectId, {
+  const cancelled = endpoint.startConnect("peer");
+  const raced = endpoint.startConnect("peer");
+  const cancelledWait = endpoint.waitConnectResult(cancelled, {
+    signal: controller.signal,
+    timeoutMs: 0,
+  });
+  const racedWait = endpoint.waitConnectResult(raced, {
     signal: controller.signal,
     timeoutMs: 0,
   });
 
   controller.abort();
-  await assert.rejects(waiting, AbortError);
-  assert.deepEqual(cancelCalls(backend), [["cancelConnect", connectId]]);
+  assert.deepEqual(cancelCalls(backend), [
+    ["cancelConnect", cancelled],
+    ["cancelConnect", raced],
+  ]);
+  assert.equal(await remainsPending(cancelledWait), true);
 
+  backend.emit({
+    inner: { connectId: cancelled, peerId: "peer" },
+    tag: P2pEvent_Tags.ConnectCancelled,
+  });
+  // Cancellation is a no-op for an attempt that already settled.
+  backend.emit(pathEstablished(raced));
+  await assert.rejects(cancelledWait, ConnectCancelledError);
+  assert.equal((await racedWait).connectId, raced);
+  endpoint.close();
+});
+
+test("an already-aborted signal cancels before waiting", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const signal = AbortSignal.abort();
+  const connectId = endpoint.startConnect("peer");
+  const waiting = endpoint.waitConnectResult(connectId, {
+    signal,
+    timeoutMs: 0,
+  });
+
+  assert.deepEqual(cancelCalls(backend), [["cancelConnect", connectId]]);
   backend.emit({
     inner: { connectId, peerId: "peer" },
     tag: P2pEvent_Tags.ConnectCancelled,
   });
-  await tick();
-  await assert.rejects(
-    endpoint.waitConnectResult(connectId, { timeoutMs: 0 }),
-    ConnectCancelledError
-  );
+  await assert.rejects(waiting, ConnectCancelledError);
 
-  const preAborted = endpoint.connect("peer", { signal: controller.signal });
-  await assert.rejects(preAborted, AbortError);
-  // An already-aborted connect never starts a native attempt.
+  // connect() with an aborted signal never starts a native attempt.
+  await assert.rejects(endpoint.connect("peer", { signal }), AbortError);
   assert.equal(
     backend.operations.filter(([name]) => name === "connectTarget").length,
     1

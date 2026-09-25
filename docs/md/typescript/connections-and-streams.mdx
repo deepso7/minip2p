@@ -49,7 +49,7 @@ The default timeout is 65 seconds. Set `timeoutMs: 0` only when a caller truly w
 For a Connection attempt the two controls differ on purpose:
 
 - **Timeout** bounds only the local wait. It rejects with `TimeoutError` and the attempt keeps running. Pass `cancelOnTimeout: true` to also cancel it.
-- **Abort** ends the wait with `AbortError` _and_ cancels the attempt.
+- **Abort** cancels the attempt. The wait then settles from the attempt's terminal: `ConnectCancelledError` (an `AbortError`), or the real result if the attempt had already connected.
 
 ```ts
 const controller = new AbortController();
@@ -61,7 +61,7 @@ const connectPromise = endpoint.connect(remoteAddress, {
 
 // A user action or a shutdown path can stop this attempt.
 controller.abort();
-await connectPromise; // rejects with AbortError
+await connectPromise; // rejects with ConnectCancelledError once the attempt ends
 ```
 
 Waiting never blocks event dispatch: `on` handlers, `events()` iterators, and other waits keep receiving unrelated events. Concurrent `ping` calls to the same peer share one Ping request while each caller keeps its own timeout and abort signal.

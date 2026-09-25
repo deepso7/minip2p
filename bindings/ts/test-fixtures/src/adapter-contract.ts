@@ -4,7 +4,6 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 import type { BackendConnectTarget } from "../../core/src/backend.js";
 import {
-  AbortError,
   ConnectCancelledError,
   ConnectResultLostError,
   TimeoutError,
@@ -111,7 +110,7 @@ export function describeAdapterContract(
       endpoint.close();
     });
 
-    test("a timeout ends only the wait; abort cancels the attempt", async () => {
+    test("a timeout ends only the wait; abort cancels and the terminal settles", async () => {
       vi.useFakeTimers();
       const endpoint = harness.create();
       const native = harness.native();
@@ -129,8 +128,10 @@ export function describeAdapterContract(
         signal: controller.signal,
         timeoutMs: 0,
       });
+      const cancelled = expect(aborted).rejects.toBeInstanceOf(
+        ConnectCancelledError
+      );
       controller.abort();
-      await expect(aborted).rejects.toBeInstanceOf(AbortError);
       expect(native.cancelledConnects).toEqual([BigInt(connectId)]);
 
       native.deliver([
@@ -140,9 +141,7 @@ export function describeAdapterContract(
         },
       ]);
       await drained();
-      await expect(
-        endpoint.waitConnectResult(connectId, { timeoutMs: 0 })
-      ).rejects.toBeInstanceOf(ConnectCancelledError);
+      await cancelled;
       endpoint.close();
     });
 

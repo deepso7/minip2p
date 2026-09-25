@@ -98,9 +98,8 @@ export class ConnectFailedError extends Error {
 }
 
 /**
- * A Connection attempt ended with a `connectCancelled` terminal. A wait
- * pending at that moment rejects with it; the wait whose own signal aborted
- * already rejected with a plain {@link AbortError}.
+ * A Connection attempt ended with a `connectCancelled` terminal after
+ * `cancelConnect()` or an aborted wait signal.
  */
 export class ConnectCancelledError extends AbortError {
   /** Endpoint-local connection-attempt identifier. */

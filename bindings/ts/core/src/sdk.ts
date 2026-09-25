@@ -915,8 +915,10 @@ export class Minip2pBase {
    *
    * One wait per attempt may be pending. A timeout ends only this wait (unless
    * `cancelOnTimeout` is set); the attempt keeps running and a later call can
-   * still consume its outcome. Aborting `signal` ends the wait and cancels the
-   * attempt. A terminal lost to event-delivery overflow rejects with
+   * still consume its outcome. Aborting `signal` issues {@link cancelConnect}
+   * and the wait settles from the attempt's terminal: {@link
+   * ConnectCancelledError}, or the real outcome if the attempt had already
+   * settled. A terminal lost to event-delivery overflow rejects with
    * {@link ConnectResultLostError}; recover state from `connectedPeers()` and
    * `path()`.
    */
@@ -939,10 +941,6 @@ export class Minip2pBase {
         ? Promise.resolve(terminal.result)
         : Promise.reject(terminal.error);
     }
-    if (options.signal?.aborted === true) {
-      this.#cancelAfterWait(connectId);
-      return Promise.reject(new AbortError());
-    }
     return new Promise((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | undefined;
       const stopWaiting = () => {
@@ -950,24 +948,23 @@ export class Minip2pBase {
         removeAbort?.();
         attempt.settle = undefined;
       };
-      // Ends this wait only; the attempt stays tracked for its terminal.
-      const abandon = (error: Error, cancel: boolean) => {
-        stopWaiting();
-        reject(error);
-        if (cancel) {
-          this.#cancelAfterWait(connectId);
-        }
-      };
+      // Abort only requests cancellation; the terminal it causes, or the one
+      // it raced, settles this wait.
       const removeAbort = listenAbort(options.signal, () => {
-        abandon(new AbortError(), true);
+        this.#requestCancel(connectId);
       });
       if (timeoutMs > 0) {
+        // Ends this wait only; the attempt stays tracked for its terminal.
         timer = setTimeout(() => {
-          abandon(
-            new TimeoutError(timeoutMs),
-            options.cancelOnTimeout === true
-          );
+          stopWaiting();
+          reject(new TimeoutError(timeoutMs));
+          if (options.cancelOnTimeout === true) {
+            this.#requestCancel(connectId);
+          }
         }, timeoutMs);
+      }
+      if (options.signal?.aborted === true) {
+        this.#requestCancel(connectId);
       }
       attempt.settle = (outcome) => {
         stopWaiting();
@@ -1513,15 +1510,17 @@ export class Minip2pBase {
     }
   }
 
-  // The caller's wait has ended, so native cancellation is best effort.
-  #cancelAfterWait(connectId: number): void {
+  // Cancellation requested from a signal or timer has no caller to throw to.
+  // Native cancel fails only once the endpoint stops, and teardown then
+  // settles the wait.
+  #requestCancel(connectId: number): void {
     if (this.#closed) {
       return;
     }
     try {
       this.#backend.cancelConnect(connectId);
     } catch {
-      // Nothing is left to report the failure to.
+      // Teardown settles every pending wait.
     }
   }
 

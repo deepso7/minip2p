@@ -35,7 +35,7 @@ for await (const event of endpoint.events({ signal })) {
 }
 ```
 
-`connect` accepts a Connection target: a peer ID, one complete peer multiaddress, or a list of complete addresses naming one peer. For a Connection attempt, a timeout ends only the local wait (`cancelOnTimeout: true` opts into cancelling), an aborted `signal` cancels the attempt, and a terminal lost to event overflow rejects with `ConnectResultLostError`. Waits never stop unrelated events from reaching other subscribers.
+`connect` accepts a Connection target: a peer ID, one complete peer multiaddress, or a list of complete addresses naming one peer. For a Connection attempt, a timeout ends only the local wait (`cancelOnTimeout: true` opts into cancelling), an aborted `signal` cancels the attempt (the wait settles from its terminal), and a terminal lost to event overflow rejects with `ConnectResultLostError`. Waits never stop unrelated events from reaching other subscribers.
 
 Use `endpoint.on("stream", handler)` to claim inbound streams. Operations accept `{ timeoutMs, signal }`; the default timeout is 65 seconds and `timeoutMs: 0` disables it. Both endpoints and streams implement `Symbol.dispose`, including the fallback used by `await using`; neither implements `Symbol.asyncDispose`.
 

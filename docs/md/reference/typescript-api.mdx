@@ -127,7 +127,7 @@ and shutdown order.
 
 ## Operations
 
-Promise operations use `{ timeoutMs?, signal? }`. Their default timeout is 65 seconds; `timeoutMs: 0` disables it. For Connection attempts a timeout ends only the wait (set `cancelOnTimeout: true` to also cancel), while an aborted `signal` cancels the attempt.
+Promise operations use `{ timeoutMs?, signal? }`. Their default timeout is 65 seconds; `timeoutMs: 0` disables it. For Connection attempts a timeout ends only the wait (set `cancelOnTimeout: true` to also cancel), while an aborted `signal` cancels the attempt and the wait settles from its terminal.
 
 | API | Result |
 | --- | --- |
