@@ -677,20 +677,17 @@ impl SwarmCore {
         self.established_peers.contains(peer_id)
     }
 
-    /// Returns every established connection to `peer_id`, primary included,
-    /// in ascending id order. A peer can hold several at once (e.g. a relay
-    /// circuit plus a direct connection after a late identity upgrade).
-    /// Empty once the peer is no longer connected (see
-    /// [`SwarmCore::is_peer_connected`]).
-    pub fn peer_connections<'a>(
-        &'a self,
-        peer_id: &'a PeerId,
-    ) -> impl Iterator<Item = ConnectionId> + 'a {
-        let connected = self.is_peer_connected(peer_id);
+    /// Returns every established connection with its peer, primaries
+    /// included, in ascending id order. A peer can hold several at once
+    /// (e.g. a relay circuit plus a direct connection after a late identity
+    /// upgrade). A peer's connections drop out once it is no longer
+    /// connected (see [`SwarmCore::is_peer_connected`]); pending dials never
+    /// appear.
+    pub fn established_connections(&self) -> impl Iterator<Item = (ConnectionId, &PeerId)> {
         self.conn_to_peer
             .iter()
-            .filter(move |(_, peer)| connected && *peer == peer_id)
-            .map(|(conn_id, _)| *conn_id)
+            .filter(|(_, peer)| self.established_peers.contains(*peer))
+            .map(|(conn_id, peer)| (*conn_id, peer))
     }
 
     /// Returns whether a transport connection is still tracked, including
@@ -3801,13 +3798,13 @@ mod tests {
     }
 
     #[test]
-    fn peer_connections_lists_every_established_connection_of_a_peer() {
+    fn established_connections_lists_every_connection_of_a_connected_peer() {
         let mut core = test_core();
         let peer = PeerId::from_public_key_protobuf(b"multi-connection-peer");
         let circuit = ConnectionId::new(1);
         let direct = ConnectionId::new(2);
         let unverified = ConnectionId::new(3);
-        assert_eq!(core.peer_connections(&peer).count(), 0);
+        assert_eq!(core.established_connections().count(), 0);
 
         feed(
             &mut core,
@@ -3841,13 +3838,13 @@ mod tests {
             },
         );
         assert_eq!(
-            core.peer_connections(&peer).collect::<Vec<_>>(),
-            vec![circuit, direct]
+            core.established_connections().collect::<Vec<_>>(),
+            vec![(circuit, &peer), (direct, &peer)]
         );
 
         // Closing the primary ends the peer's established state, so the
         // leftover mapping is no longer reported.
         feed(&mut core, TransportEvent::Closed { id: direct });
-        assert_eq!(core.peer_connections(&peer).count(), 0);
+        assert_eq!(core.established_connections().count(), 0);
     }
 }

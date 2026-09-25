@@ -290,8 +290,16 @@ impl<E: EntropySource> NatDriver<E> {
             .retain(|_, id| swarm.transport().contains_circuit(*id));
         // Sweeps paths whose connection is gone. Per pump, not per
         // ConnectionClosed: a non-primary connection closes without one.
-        self.paths
-            .retain(|peer, path| path_is_live(path, swarm.peer_connections(peer)));
+        // Groups connections by peer in one pass to stay linear.
+        if !self.paths.is_empty() {
+            let mut by_peer: BTreeMap<&PeerId, Vec<ConnectionId>> = BTreeMap::new();
+            for (conn_id, peer) in swarm.established_connections() {
+                by_peer.entry(peer).or_default().push(conn_id);
+            }
+            self.paths.retain(|peer, path| {
+                path_is_live(path, by_peer.get(peer).into_iter().flatten().copied())
+            });
+        }
     }
 
     /// Queued events the Connection-attempt engine has not observed yet.
@@ -457,7 +465,13 @@ impl<E: EntropySource> NatDriver<E> {
     ) -> Option<Path> {
         self.paths
             .get(peer)
-            .filter(|path| path_is_live(path, swarm.peer_connections(peer)))
+            .filter(|path| {
+                let connections = swarm
+                    .established_connections()
+                    .filter(|(_, owner)| *owner == peer)
+                    .map(|(conn_id, _)| conn_id);
+                path_is_live(path, connections)
+            })
             .cloned()
     }
 
