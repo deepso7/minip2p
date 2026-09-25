@@ -8,7 +8,7 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **FFI core**: The binding-agnostic embedding layer (`minip2p-ffi-core`): the detached driver thread, event flattening, and endpoint lifecycle that every binding shell builds on.
 
-**Binding shell**: A thin crate adapting the FFI core to one foreign toolchain — UniFFI for React Native (`minip2p-ffi`), napi-rs for Node (`minip2p-nodejs`). Shells hold no driver or lifecycle logic of their own. _Avoid_: wrapper
+**Binding shell**: A thin crate adapting the FFI core to one foreign toolchain — UniFFI for React Native (`minip2p-ffi`), napi-rs for Node (`minip2p-nodejs`), PyO3 for Python (`minip2p-python`). Shells hold no driver or lifecycle logic of their own. _Avoid_: wrapper
 
 **Backend contract**: The synchronous `Minip2pBackend` interface in `@minip2p/core` that each JS binding implements; the TypeScript-facing seam shared by React Native and Node.
 
@@ -23,6 +23,8 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 ### SDKs
 
 **TypeScript SDK**: The one TypeScript API minip2p presents on every JS runtime: the `@minip2p/core` API plus a runtime's binding package. Documented as a single "TypeScript" docs section. _Avoid_: Node SDK, React Native SDK (they are the same SDK on different runtimes)
+
+**Python SDK**: minip2p's asyncio-first Python API: the pure-Python `minip2p` package over the PyO3 binding shell, mirroring the TypeScript SDK's concepts with Pythonic names. Documented as a single "Python" docs section. _Avoid_: Python bindings (that is the binding shell)
 
 **Runtime**: The host a TypeScript SDK app runs on — Node.js or React Native. Runtimes differ in setup and a short list of one-sided extras; the API is otherwise shared. Distinct from the binding shell that serves it.
 
