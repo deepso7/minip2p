@@ -61,7 +61,9 @@ const connectPromise = endpoint.connect(remoteAddress, {
 
 // A user action or a shutdown path can stop this attempt.
 controller.abort();
-await connectPromise; // rejects with ConnectCancelledError once the attempt ends
+// ConnectCancelledError only if the attempt has not already connected when
+// abort takes effect. A connection that completes first still resolves.
+await connectPromise;
 ```
 
 Waiting never blocks event dispatch: `on` handlers, `events()` iterators, and other waits keep receiving unrelated events. Concurrent `ping` calls to the same peer share one Ping request while each caller keeps its own timeout and abort signal.
