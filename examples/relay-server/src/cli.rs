@@ -107,7 +107,9 @@ fn number<T: core::str::FromStr>(flag: &str, value: String) -> Result<T, String>
 
 fn socket(flag: &str, value: String) -> Result<SocketAddr, String> {
     value.parse().map_err(|error| {
-        format!("{flag} requires a HOST:PORT socket address, got {value:?}: {error}")
+        format!(
+            "{flag} requires an IP:PORT socket address (listen hosts cannot be DNS names), got {value:?}: {error}"
+        )
     })
 }
 
@@ -125,7 +127,7 @@ fn rate(flag: &str, value: String) -> Result<Option<RateLimit>, String> {
 }
 
 pub fn usage() -> &'static str {
-    "usage: minip2p-relay [options]\n       minip2p-relay service <COMMAND>\n\nDefaults try QUIC and TCP on IPv4 and IPv6 port 19876, falling back to the available family.\n\n--quic ADDR                    exact QUIC socket bind (repeatable; replaces automatic binds)\n--tcp ADDR                     exact TCP socket bind (repeatable; replaces automatic binds)\n--key PATH                     load/create persistent Ed25519 identity\n--announce MULTIADDR           explicit public address (repeatable)\n--paused                       start with new admissions paused\n--max-reservations N           reservation capacity\n--reservation-duration SECS    reservation lifetime\n--max-circuits N               circuit capacity\n--max-circuits-per-peer N      per-endpoint circuit capacity\n--max-circuit-duration SECS    circuit lifetime (0 = unlimited)\n--max-circuit-bytes BYTES      per-direction bytes (0 = unlimited)\n--max-pending-hop N            pending HOP controls per connection\n--max-pending-stop N           pending STOP controls per connection\n--control-timeout-ms MS        end-to-end control timeout\n--reservation-peer-rate R      CAPACITY/REFILL_MS or off\n--reservation-ip-rate R        CAPACITY/REFILL_MS or off\n--circuit-peer-rate R          CAPACITY/REFILL_MS or off\n--circuit-ip-rate R            CAPACITY/REFILL_MS or off\n-h, --help                     show this help\n-V, --version                  show the release version\n\nService management:\n  minip2p-relay service install --hostname HOSTNAME\n  minip2p-relay service status | logs | restart | uninstall"
+    "usage: minip2p-relay [options]\n       minip2p-relay service <COMMAND>\n\nDefaults try QUIC and TCP on IPv4 and IPv6 port 19876, falling back to the available family.\n\n--quic IP:PORT                 exact QUIC socket bind (repeatable; replaces automatic binds)\n--tcp IP:PORT                  exact TCP socket bind (repeatable; replaces automatic binds)\n--key PATH                     load/create persistent Ed25519 identity\n--announce MULTIADDR           explicit public address (repeatable)\n--paused                       start with new admissions paused\n--max-reservations N           reservation capacity\n--reservation-duration SECS    reservation lifetime\n--max-circuits N               circuit capacity\n--max-circuits-per-peer N      per-endpoint circuit capacity\n--max-circuit-duration SECS    circuit lifetime (0 = unlimited)\n--max-circuit-bytes BYTES      per-direction bytes (0 = unlimited)\n--max-pending-hop N            pending HOP controls per connection\n--max-pending-stop N           pending STOP controls per connection\n--control-timeout-ms MS        end-to-end control timeout\n--reservation-peer-rate R      CAPACITY/REFILL_MS or off\n--reservation-ip-rate R        CAPACITY/REFILL_MS or off\n--circuit-peer-rate R          CAPACITY/REFILL_MS or off\n--circuit-ip-rate R            CAPACITY/REFILL_MS or off\n-h, --help                     show this help\n-V, --version                  show the release version\n\nService management:\n  minip2p-relay service install --hostname HOSTNAME\n  minip2p-relay service status | logs | restart | uninstall"
 }
 
 #[cfg(test)]
@@ -180,7 +182,7 @@ mod tests {
     #[test]
     fn rejects_a_non_socket_bind_address() {
         let error = parse(["--tcp".into(), "/ip4/127.0.0.1/tcp/4201".into()]).unwrap_err();
-        assert!(error.contains("--tcp requires a HOST:PORT"), "{error}");
+        assert!(error.contains("--tcp requires an IP:PORT"), "{error}");
     }
 
     #[test]

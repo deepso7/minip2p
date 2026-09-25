@@ -72,16 +72,16 @@ Secure-mux handshake and wire-codec decode benches are deliberate follow-ups, no
 
 | Scenario | Measurement | Connection state | Scale |
 | --- | --- | --- | --- |
-| Setup | `dial` → `PeerReady` | Cold each sample | Single connection |
-| Ping | `ping` → `PingRttMeasured` / `wait_ping_rtt` | Warm | Single connection |
+| Setup | `connect` → `PeerReady` | Cold each sample | Single connection |
+| Ping | `ping` → `PingRttMeasured` | Warm | Single connection |
 | Echo | 64-byte app-protocol stream round-trip | Warm | Single stream, plus one crossed multi bench |
 | Transfer | 1 MiB app-protocol stream round-trip | Warm | Single connection, single stream |
 
-Crossed multi applies only to the 64-byte echo: N=4 connections × 4 streams (16 in flight). One Criterion sample is wall time until every echo in the batch completes. Topology is one listener and one dialer; multi-conn means N dials to the same listener `PeerAddr`.
+Crossed multi applies only to the 64-byte echo: N=4 connections × 4 streams (16 in flight). One Criterion sample is wall time until every echo in the batch completes. Topology is one listener and one dialer; multi-conn means N Connection attempts to the same listener `PeerAddr`.
 
 Timer boundaries:
 
-- Setup: start before `dial`; stop at first `PeerReady` for that peer.
+- Setup: start before `connect`; stop at first `PeerReady` for that peer.
 - Ping: start before `ping`; stop when `PingRttMeasured` arrives.
 - Echo (including crossed): start before opening the batch of streams; stop when the last echo payload is received.
 - Transfer: start before `open_stream` / first send; stop when the full 1 MiB echo is received.

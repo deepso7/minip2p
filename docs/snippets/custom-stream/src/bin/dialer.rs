@@ -26,8 +26,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(10);
 
     loop {
-        let EndpointWaitOutcome::Event(event) = node.wait(deadline)? else {
-            return Err("stream exchange timed out".into());
+        let event = match node.wait(deadline)? {
+            EndpointWaitOutcome::Event(event) => event,
+            // Another thread woke the wait; nothing to service here.
+            EndpointWaitOutcome::Interrupted => continue,
+            EndpointWaitOutcome::Deadline => return Err("stream exchange timed out".into()),
         };
 
         match event {

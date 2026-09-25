@@ -195,6 +195,10 @@ pub fn run_join(
         .listen_all()
         .map_err(|e| format!("listen failed: {e}"))?;
     println!("[join] us={}", endpoint.peer_id());
+    let (topic, nick) = topic_and_nick(&options, &endpoint);
+    // The host announces its topic once per connection, and that can land
+    // while the joiner is still waiting for a path or Identify.
+    let mut host_subscribed = false;
 
     let (host_peer, connect_id) = match &target {
         JoinTarget::Circuit { relay, peer } => {
@@ -213,7 +217,13 @@ pub fn run_join(
         }
     };
 
-    let path = wait_for_path(&mut endpoint, &host_peer, connect_id)?;
+    let path = wait_for_path(
+        &mut endpoint,
+        &host_peer,
+        connect_id,
+        &topic,
+        &mut host_subscribed,
+    )?;
     println!("[join] path={}", path_name(&path));
 
     let ready_deadline = Instant::now() + READY_DEADLINE;
@@ -222,7 +232,10 @@ pub fn run_join(
             .wait(ready_deadline)
             .map_err(|e| format!("waiting for identify: {e}"))?
         {
-            EndpointWaitOutcome::Event(event) => handle_event(&endpoint, "join", None, event),
+            EndpointWaitOutcome::Event(event) => {
+                host_subscribed |= is_topic_subscription(&event, &host_peer, &topic);
+                handle_event(&endpoint, "join", None, event);
+            }
             EndpointWaitOutcome::Interrupted => {}
             EndpointWaitOutcome::Deadline => {
                 return Err("identify never completed on the selected connection".into());
@@ -230,12 +243,15 @@ pub fn run_join(
         }
     }
 
-    let (topic, nick) = topic_and_nick(&options, &endpoint);
     endpoint
         .subscribe(&topic)
         .map_err(|e| format!("subscribe: {e}"))?;
     println!("[join] subscribed topic={topic} nick={nick}");
-    wait_for_topic_peer(&mut endpoint, &host_peer, &topic, "join")?;
+    if host_subscribed {
+        println!("[join] pubsub-ready peer={host_peer} topic={topic}");
+    } else {
+        wait_for_topic_peer(&mut endpoint, &host_peer, &topic, "join")?;
+    }
 
     run_chat(&mut endpoint, &topic, &nick, "join", None)
 }
@@ -243,11 +259,13 @@ pub fn run_join(
 /// Waits for the attempt's first usable path (the provisional relayed one,
 /// when that lands first) while handling unrelated events as the chat loop
 /// would. An attempt that settles connected without a path event reports the
-/// current path.
+/// current path. Records whether the host's `topic` announcement went by.
 fn wait_for_path(
     endpoint: &mut Endpoint,
     host_peer: &PeerId,
     connect_id: ConnectId,
+    topic: &str,
+    host_subscribed: &mut bool,
 ) -> Result<Path, Box<dyn Error>> {
     let deadline = Instant::now() + CONNECT_DEADLINE;
     loop {
@@ -273,7 +291,10 @@ fn wait_for_path(
                 eprintln!("[join] connect-settled outcome={outcome:?}");
                 return Err("no path to the host".into());
             }
-            EndpointWaitOutcome::Event(event) => handle_event(endpoint, "join", None, event),
+            EndpointWaitOutcome::Event(event) => {
+                *host_subscribed |= is_topic_subscription(&event, host_peer, topic);
+                handle_event(endpoint, "join", None, event);
+            }
             EndpointWaitOutcome::Interrupted => {}
             EndpointWaitOutcome::Deadline => return Err("no path to the host".into()),
         }
@@ -305,17 +326,22 @@ fn wait_for_topic_peer(
                 .into());
             }
         };
-        let ready = matches!(
-            &event,
-            EndpointEvent::Gossipsub(GossipsubEvent::PeerSubscribed { peer, topic })
-                if peer == expected_peer && topic == expected_topic
-        );
+        let ready = is_topic_subscription(&event, expected_peer, expected_topic);
         handle_event(endpoint, role, None, event);
         if ready {
             println!("[{role}] pubsub-ready peer={expected_peer} topic={expected_topic}");
             return Ok(());
         }
     }
+}
+
+/// Whether `event` is `peer` announcing a subscription to `topic`.
+fn is_topic_subscription(event: &EndpointEvent, peer: &PeerId, topic: &str) -> bool {
+    matches!(
+        event,
+        EndpointEvent::Gossipsub(GossipsubEvent::PeerSubscribed { peer: subscriber, topic: subscribed })
+            if subscriber == peer && subscribed == topic
+    )
 }
 
 // --- the chat loop ----------------------------------------------------------

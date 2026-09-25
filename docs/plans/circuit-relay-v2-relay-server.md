@@ -104,11 +104,9 @@ Endpoint::set_relay_server_accepting(
 Endpoint::set_relay_server_announce_addrs(
     Vec<Multiaddr>,
 ) -> Result<(), RelayServerControlError>
-Endpoint::take_relay_server_events() -> Vec<RelayServerEvent>
-Endpoint::next_relay_server_event(
-    impl Into<Deadline>,
-) -> Result<Option<RelayServerEvent>, Error>
 ```
+
+Relay-server output arrives on the Endpoint event stream as `EndpointEvent::RelayServer(RelayServerEvent)` from `Endpoint::wait` / `Endpoint::poll`.
 
 `RelayServerAnnounceError` distinguishes validator configuration failures (`Config`) from invalid announce addresses (`Address`).
 

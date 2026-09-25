@@ -19,9 +19,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connect_id = node.connect(target)?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let EndpointWaitOutcome::Event(event) = node.wait(deadline)? else {
-            // Deadline (or an interruption we have no use for): give up.
-            return Err("peer did not answer within 10 seconds".into());
+        let event = match node.wait(deadline)? {
+            EndpointWaitOutcome::Event(event) => event,
+            // Another thread woke the wait; nothing to service here.
+            EndpointWaitOutcome::Interrupted => continue,
+            EndpointWaitOutcome::Deadline => {
+                return Err("peer did not answer within 10 seconds".into());
+            }
         };
         match event {
             EndpointEvent::ConnectSettled {
