@@ -349,11 +349,12 @@ verify_npm_package() {
   local display_name="$2"
   local attempt found
 
-  for attempt in $(seq 1 30); do
+  # npm can take several minutes to expose a freshly published version.
+  for attempt in $(seq 1 60); do
     found="$(curl -fsSL "https://registry.npmjs.org/$encoded_name/$version" 2>/dev/null |
       jq -r '.version // empty' 2>/dev/null || true)"
     [[ "$found" == "$version" ]] && return 0
-    sleep 2
+    sleep 10
   done
   die "$display_name@$version is not visible on npm"
 }
