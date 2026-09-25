@@ -332,8 +332,9 @@ export type ConnectTarget = string | readonly [string, ...string[]];
  * Wait controls for a Connection attempt.
  *
  * `timeoutMs` bounds only the local wait: the attempt keeps running, and a
- * later {@link Minip2pBase.waitConnectResult} can still consume its terminal
- * outcome. Aborting `signal` ends the wait *and* cancels the attempt.
+ * later {@link Minip2pBase.waitConnectResult} on its
+ * {@link Minip2pBase.startConnect} ID can still consume its terminal outcome.
+ * Aborting `signal` ends the wait *and* cancels the attempt.
  */
 export interface ConnectOptions extends OpOptions {
   /** Also cancel the attempt when `timeoutMs` elapses. Defaults to `false`. */

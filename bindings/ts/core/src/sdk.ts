@@ -82,7 +82,7 @@ type ConnectTerminal =
     }
   | {
       readonly ok: false;
-      readonly error: unknown;
+      readonly error: Error;
     };
 
 // A tracked Connection attempt holds either its not-yet-consumed terminal or
@@ -894,11 +894,19 @@ export class Minip2pBase {
     return connectId;
   }
 
-  /** Connects to `target` and resolves with the attempt's first usable path. */
+  /**
+   * Connects to `target` and resolves with the attempt's first usable path.
+   * Use {@link startConnect} instead when a timed-out attempt must stay
+   * reachable by its Connect ID.
+   */
   connect(
     target: ConnectTarget,
     options: ConnectOptions = {}
   ): Promise<ConnectResult> {
+    if (options.signal?.aborted === true) {
+      this.#assertOpen();
+      return Promise.reject(new AbortError());
+    }
     return this.waitConnectResult(this.startConnect(target), options);
   }
 
@@ -932,7 +940,7 @@ export class Minip2pBase {
         : Promise.reject(terminal.error);
     }
     if (options.signal?.aborted === true) {
-      this.#backend.cancelConnect(connectId);
+      this.#cancelAfterWait(connectId);
       return Promise.reject(new AbortError());
     }
     return new Promise((resolve, reject) => {
@@ -946,12 +954,8 @@ export class Minip2pBase {
       const abandon = (error: Error, cancel: boolean) => {
         stopWaiting();
         reject(error);
-        if (cancel && !this.#closed) {
-          try {
-            this.#backend.cancelConnect(connectId);
-          } catch {
-            // The wait already ended; native cancellation is best effort.
-          }
+        if (cancel) {
+          this.#cancelAfterWait(connectId);
         }
       };
       const removeAbort = listenAbort(options.signal, () => {
@@ -1435,7 +1439,8 @@ export class Minip2pBase {
 
   #connectTerminal(event: ConnectTerminalEvent): void {
     const attempt = this.#connects.get(event.inner.connectId);
-    if (attempt === undefined) {
+    // A recorded loss is final, so every wait sees one outcome per attempt.
+    if (attempt === undefined || attempt.terminal !== undefined) {
       return;
     }
     const terminal: ConnectTerminal =
@@ -1469,7 +1474,7 @@ export class Minip2pBase {
   // Terminals dropped by either event carry settle their attempts with a
   // delivery-loss error so waits cannot hang. A truncated list cannot name
   // every dropped terminal, so every tracked attempt without a delivered
-  // terminal settles.
+  // terminal settles, even one whose real terminal is still queued.
   #connectResultsLost(connectIds: readonly number[], truncated: boolean): void {
     const lost = truncated ? [...this.#connects.keys()] : connectIds;
     for (const connectId of lost) {
@@ -1505,6 +1510,18 @@ export class Minip2pBase {
       }
       this.#terminalConnects.delete(oldest);
       this.#connects.delete(oldest);
+    }
+  }
+
+  // The caller's wait has ended, so native cancellation is best effort.
+  #cancelAfterWait(connectId: number): void {
+    if (this.#closed) {
+      return;
+    }
+    try {
+      this.#backend.cancelConnect(connectId);
+    } catch {
+      // Nothing is left to report the failure to.
     }
   }
 

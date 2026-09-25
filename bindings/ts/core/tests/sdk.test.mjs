@@ -500,7 +500,11 @@ test("aborting a connect wait cancels the attempt, whose terminal stays consumab
 
   const preAborted = endpoint.connect("peer", { signal: controller.signal });
   await assert.rejects(preAborted, AbortError);
-  assert.deepEqual(cancelCalls(backend).at(-1), ["cancelConnect", 2]);
+  // An already-aborted connect never starts a native attempt.
+  assert.equal(
+    backend.operations.filter(([name]) => name === "connectTarget").length,
+    1
+  );
   endpoint.close();
 });
 
@@ -645,6 +649,29 @@ test("truncated EventsDropped settles every pending connect result", async () =>
       return true;
     });
   }
+  endpoint.close();
+});
+
+test("a recorded loss stays the attempt's only outcome", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const connectId = endpoint.startConnect("peer");
+  backend.emit({
+    inner: {
+      dropped: 1,
+      terminalConnectIds: [],
+      terminalConnectIdsTruncated: true,
+      totalDropped: 1,
+    },
+    tag: P2pEvent_Tags.EventsDropped,
+  });
+  backend.emit(pathEstablished(connectId));
+  await tick();
+
+  await assert.rejects(
+    endpoint.waitConnectResult(connectId, { timeoutMs: 0 }),
+    ConnectResultLostError
+  );
   endpoint.close();
 });
 
