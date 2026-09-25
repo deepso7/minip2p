@@ -129,10 +129,12 @@
  * switches it on. Without the script the scene is a still of its last frame:
  * everything shows except the parts that a later step hides (`[data-hide]`).
  */
+/* Longhands, not the `transition` shorthand: this rule is unlayered, so a
+   shorthand would reset the `delay-*` utilities that stagger paired rows. */
 [data-scene-live] [data-show] {
-  transition:
-    opacity var(--minip2p-duration-base) var(--minip2p-ease),
-    translate var(--minip2p-duration-base) var(--minip2p-ease);
+  transition-property: opacity, translate;
+  transition-duration: var(--minip2p-duration-base);
+  transition-timing-function: var(--minip2p-ease);
 }
 [data-scene-live] [data-show]:not([data-on]) {
   opacity: 0;
@@ -169,6 +171,11 @@
   --animate-pop: scene-pop var(--minip2p-duration-base) var(--minip2p-ease) both;
   --animate-pop-late: scene-pop var(--minip2p-duration-base) var(--minip2p-ease)
     1.2s both;
+}
+
+/* Inline, so `--scene-step-ms` (set on each scene by scene.ts) resolves on the
+   progress segment; a plain @theme token would resolve it on :root, to 0ms. */
+@theme inline {
   --animate-fill: scene-fill var(--scene-step-ms, 0ms) linear both;
 }
 

@@ -121,8 +121,9 @@ export const initScene = (root: HTMLElement) => {
     }
     autoPaused = false;
     if (control.dataset.goto) {
-      // A jump plays on from that step, like scrubbing a video.
-      goTo(Number(control.dataset.goto), true);
+      // A jump plays on from that step, like scrubbing a video, unless the
+      // reader asked for less motion: then it stays on the step they picked.
+      goTo(Number(control.dataset.goto), !reducedMotion.matches);
     } else if (Object.hasOwn(control.dataset, "restart")) {
       goTo(1, true);
     } else if (Object.hasOwn(root.dataset, "playing")) {
