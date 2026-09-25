@@ -276,11 +276,33 @@ const platforms = [
         the TypeScript example you can run with Node.
       </p>
       {/* `.prose` gives the tabs the same code styles as a docs page. */}
-      <div class="prose mt-8 max-w-none">
+      <div class="prose mt-8 max-w-none" data-quickstart>
         <Tabs hash={false}>
           <Tab title="Rust"><Fragment set:html={dialerHtml} /></Tab>
           <Tab title="TypeScript"><Fragment set:html={pingHtml} /></Tab>
         </Tabs>
+        {/* Blume builds the tab buttons from script and, until then, shows only
+            the first panel. Without scripts, show both snippets instead, each
+            labelled from the title Blume already puts on its panel. */}
+        <noscript>
+          <style>
+            [data-quickstart] [data-blume-tablist] {
+              display: none;
+            }
+            [data-quickstart] [data-blume-tab-content] > * {
+              display: block !important;
+            }
+            [data-quickstart] [data-blume-tab-panel]::before {
+              border-bottom: 1px solid var(--blume-border);
+              color: var(--blume-muted-foreground);
+              content: attr(data-title);
+              display: block;
+              font-family: var(--blume-font-mono);
+              font-size: 0.75rem;
+              padding: 0.625rem 1rem;
+            }
+          </style>
+        </noscript>
       </div>
       <div class="mt-6 flex flex-wrap gap-4">
         <a
