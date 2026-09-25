@@ -5,11 +5,9 @@
   --minip2p-black: oklch(0.17 0.008 250);
   --minip2p-white: oklch(0.95 0.006 60);
 
-  /* Motion. Landing-page diagrams share these; one step of the story is
-     `--minip2p-step`, and every ease matches the mascot's settle. */
-  --minip2p-duration-fast: 120ms;
+  /* Motion. Landing-page scenes share these; the ease matches the mascot's
+     settle. */
   --minip2p-duration-base: 200ms;
-  --minip2p-step: 900ms;
   --minip2p-ease: cubic-bezier(0.2, 0, 0, 1);
 
   --blume-background: var(--minip2p-white);
@@ -125,106 +123,120 @@
   }
 }
 
-/* Landing-page diagram motion.
+/* Landing-page scenes (components/scene.ts).
  *
- * Tailwind turns every `--animate-*` into an `animate-<name>` utility, so a
- * component says `animate-relay-path` and the choreography — which keyframes,
- * how long, how far into the story — lives here in one readable column.
- *
- * Each one is `paused`; the diagrams start themselves when they scroll into
- * view. The last keyframe is always the finished picture, so the
- * reduced-motion guard above lands on a correct diagram rather than a blank
- * one, and so does a browser that never runs the script.
+ * Once the script runs, each `[data-show]` part is hidden until its step
+ * switches it on. Without the script the scene is a still of its last frame:
+ * everything shows except the parts that a later step hides (`[data-hide]`).
  */
+[data-scene-live] [data-show] {
+  transition:
+    opacity var(--minip2p-duration-base) var(--minip2p-ease),
+    translate var(--minip2p-duration-base) var(--minip2p-ease);
+}
+[data-scene-live] [data-show]:not([data-on]) {
+  opacity: 0;
+}
+/* Rows that slide in as they arrive. */
+[data-scene-live] [data-rise]:not([data-on]) {
+  translate: 0 0.375rem;
+}
+[data-scene-live] [data-past] {
+  animation: none !important;
+}
+[data-scene]:not([data-scene-live]) [data-hide] {
+  display: none;
+}
+[data-scene][data-paused] * {
+  animation-play-state: paused !important;
+}
+
+/* Tailwind turns every `--animate-*` into an `animate-<name>` utility; scenes
+   start them with `data-on:animate-<name>`. Travel is a runner moving the
+   length of its track, so a pulse fits any width. */
 @theme {
-  --animate-probe: probe-run var(--minip2p-step) var(--minip2p-ease) both paused;
-  --animate-probe-dot: probe-dot var(--minip2p-step) var(--minip2p-ease) both
-    paused;
-  --animate-probe-late: probe-run var(--minip2p-step) var(--minip2p-ease) 150ms
-    both paused;
-  --animate-probe-dot-late: probe-dot var(--minip2p-step) var(--minip2p-ease)
-    150ms both paused;
-
-  --animate-relay: relay-run calc(var(--minip2p-step) * 2) var(--minip2p-ease)
-    200ms both paused;
-  --animate-relay-dot: probe-dot calc(var(--minip2p-step) * 2)
-    var(--minip2p-ease) 200ms both paused;
-  --animate-relay-path:
-    draw var(--minip2p-duration-base) var(--minip2p-ease)
-      calc(var(--minip2p-step) * 2.2) both paused,
-    dim var(--minip2p-duration-base) var(--minip2p-ease)
-      calc(var(--minip2p-step) * 4) both paused;
-  /* The chip is opacity only, so `dim` fills forwards: a backwards fill would
-     override `rise` and show the chip from the first frame. */
-  --animate-relay-chip:
-    rise var(--minip2p-duration-base) var(--minip2p-ease)
-      calc(var(--minip2p-step) * 2.2) both paused,
-    dim var(--minip2p-duration-base) var(--minip2p-ease)
-      calc(var(--minip2p-step) * 4) forwards paused;
-
-  --animate-punch-left: punch-l-run var(--minip2p-step) var(--minip2p-ease)
-    calc(var(--minip2p-step) * 2.6) both paused;
-  --animate-punch-right: punch-r-run var(--minip2p-step) var(--minip2p-ease)
-    calc(var(--minip2p-step) * 2.6) both paused;
-  --animate-punch-dot: punch-dot var(--minip2p-step) var(--minip2p-ease)
-    calc(var(--minip2p-step) * 2.6) both paused;
-  --animate-flash: flash-pop var(--minip2p-duration-base) var(--minip2p-ease)
-    calc(var(--minip2p-step) * 3.5) both paused;
-  --animate-direct-path: draw var(--minip2p-duration-base) var(--minip2p-ease)
-    calc(var(--minip2p-step) * 3.8) both paused;
-  --animate-direct-chip: rise var(--minip2p-duration-base) var(--minip2p-ease)
-    calc(var(--minip2p-step) * 4) both paused;
-  --animate-settled-chip: rise var(--minip2p-duration-base) var(--minip2p-ease)
-    calc(var(--minip2p-step) * 4.4) both paused;
-
-  --animate-event-first: arrive var(--minip2p-duration-base) var(--minip2p-ease)
-    120ms both paused;
-  --animate-event-second: arrive var(--minip2p-duration-base)
-    var(--minip2p-ease) 360ms both paused;
-  --animate-event-third: arrive var(--minip2p-duration-base) var(--minip2p-ease)
-    600ms both paused;
+  --animate-travel: scene-travel 1s var(--minip2p-ease) both;
+  --animate-travel-late: scene-travel 1s var(--minip2p-ease) 300ms both;
+  --animate-travel-back: scene-travel-back 1s var(--minip2p-ease) both;
+  --animate-travel-down: scene-travel-down 700ms var(--minip2p-ease) both;
+  --animate-travel-down-late: scene-travel-down 700ms var(--minip2p-ease) 700ms
+    both;
+  --animate-travel-up: scene-travel-up 900ms var(--minip2p-ease) both;
+  --animate-draw: scene-draw 1s var(--minip2p-ease) both;
+  /* The punched path grows out from where the two pulses meet. */
+  --animate-grow: scene-grow 500ms var(--minip2p-ease) 1s both;
+  --animate-flash: scene-flash 600ms ease-out 900ms both;
+  --animate-pop: scene-pop var(--minip2p-duration-base) var(--minip2p-ease) both;
+  --animate-pop-late: scene-pop var(--minip2p-duration-base) var(--minip2p-ease)
+    1.2s both;
+  --animate-fill: scene-fill var(--scene-step-ms, 0ms) linear both;
 }
 
-/* A runner box spans its track, so translating it by 100% lands the dot on the
-   far node at any width — no pixel distances to keep in sync. */
-@keyframes probe-run {
-  0% {
-    transform: translateX(0);
-  }
-  100% {
-    transform: translateX(100%);
-  }
-}
-@keyframes probe-dot {
+@keyframes scene-travel {
   0% {
     opacity: 0;
-  }
-  12% {
-    opacity: 1;
-  }
-  88% {
-    opacity: 1;
-  }
-  100% {
-    opacity: 0.2;
-  }
-}
-/* The relay leg pauses at the relay before carrying on to the peer. */
-@keyframes relay-run {
-  0% {
     transform: translateX(0);
   }
-  45% {
-    transform: translateX(50%);
-  }
-  55% {
-    transform: translateX(50%);
+  10%,
+  90% {
+    opacity: 1;
   }
   100% {
+    opacity: 0;
     transform: translateX(100%);
   }
 }
-@keyframes draw {
+@keyframes scene-travel-back {
+  0% {
+    opacity: 0;
+    transform: translateX(0);
+  }
+  10%,
+  90% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateX(-100%);
+  }
+}
+@keyframes scene-travel-down {
+  0% {
+    opacity: 0;
+    transform: translateY(0);
+  }
+  10%,
+  90% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(100%);
+  }
+}
+@keyframes scene-travel-up {
+  0% {
+    opacity: 0;
+    transform: translateY(0);
+  }
+  10%,
+  90% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-100%);
+  }
+}
+@keyframes scene-draw {
+  0% {
+    clip-path: inset(0 100% 0 0);
+  }
+  100% {
+    clip-path: inset(0 0 0 0);
+  }
+}
+@keyframes scene-grow {
   0% {
     transform: scaleX(0);
   }
@@ -232,76 +244,35 @@
     transform: scaleX(1);
   }
 }
-@keyframes dim {
-  0% {
-    opacity: 1;
-  }
-  100% {
-    opacity: 0.25;
-  }
-}
-@keyframes punch-l-run {
-  0% {
-    transform: translateX(0);
-  }
-  100% {
-    transform: translateX(46%);
-  }
-}
-@keyframes punch-r-run {
-  0% {
-    transform: translateX(0);
-  }
-  100% {
-    transform: translateX(-46%);
-  }
-}
-/* The punch dots exist only until they meet; the drawn path is the result. */
-@keyframes punch-dot {
-  0% {
-    opacity: 0;
-  }
-  12% {
-    opacity: 1;
-  }
-  88% {
-    opacity: 1;
-  }
-  100% {
-    opacity: 0;
-  }
-}
-@keyframes flash-pop {
+@keyframes scene-flash {
   0% {
     opacity: 0;
     transform: scale(0.4);
   }
   40% {
     opacity: 1;
-    transform: scale(1.6);
+    transform: scale(1.8);
   }
   100% {
     opacity: 0;
-    transform: scale(1.6);
+    transform: scale(2.4);
   }
 }
-@keyframes rise {
+@keyframes scene-pop {
   0% {
     opacity: 0;
-    transform: translateY(4px);
+    transform: scale(0.96);
   }
   100% {
     opacity: 1;
-    transform: translateY(0);
+    transform: scale(1);
   }
 }
-@keyframes arrive {
+@keyframes scene-fill {
   0% {
-    opacity: 0;
-    transform: translateY(6px);
+    transform: scaleX(0);
   }
   100% {
-    opacity: 1;
-    transform: translateY(0);
+    transform: scaleX(1);
   }
 }

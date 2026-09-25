@@ -1,0 +1,46 @@
+---
+// The numbered story beside a scene. Each step is a button that jumps the
+// scene there, and lights up while its step plays (see scene.ts).
+interface Step {
+  title: string;
+  /** Plain text; `backticked` spans render as code. */
+  body: string;
+}
+
+interface Props {
+  steps: Step[];
+}
+
+const { steps } = Astro.props;
+
+// "a `b` c" → ["a ", "b", " c"]: every odd segment was inside backticks.
+const segments = (text: string) => text.split("`");
+---
+
+<ol class="m-0 grid list-none gap-1 p-0">
+  {
+    steps.map((step, index) => (
+      <li>
+        <button
+          type="button"
+          class="group/step flex w-full cursor-pointer gap-3 rounded-blume border border-transparent bg-transparent px-3 py-2.5 text-left text-muted-foreground transition-colors hover:bg-muted data-[state=current]:border-border data-[state=current]:bg-muted focus-visible:outline-2 focus-visible:outline-accent"
+          data-goto={index + 1}
+        >
+          <span class="mt-0.5 grid size-5 shrink-0 place-items-center rounded-sm border border-border font-mono text-xs transition-colors group-data-[state=current]/step:border-accent group-data-[state=current]/step:bg-accent group-data-[state=current]/step:text-accent-foreground group-data-[state=done]/step:text-foreground">
+            {index + 1}
+          </span>
+          <span class="grid gap-1">
+            <span class="text-sm font-medium text-foreground">
+              {segments(step.title).map((segment, i) => (i % 2 === 1 ? <code class="font-mono">{segment}</code> : segment))}
+            </span>
+            <span class="text-sm leading-relaxed">
+              {segments(step.body).map((segment, i) =>
+                i % 2 === 1 ? <code class="font-mono text-foreground">{segment}</code> : segment
+              )}
+            </span>
+          </span>
+        </button>
+      </li>
+    ))
+  }
+</ol>

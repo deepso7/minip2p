@@ -1,0 +1,158 @@
+---
+// One turn of the caller-driven loop, played as a short scene (see scene.ts):
+// your `wait` call drives the adapter, which feeds bytes and a timestamp to
+// the I/O-free core, and one event comes back to your match arm.
+//
+// The default slot is the section heading and intro, shown above the steps.
+import SceneControls from "./scene-controls.astro";
+import SceneSteps from "./scene-steps.astro";
+
+const steps = [
+  { body: "Nothing runs until you do. The call drives the endpoint.", title: "You call `wait(deadline)`" },
+  { body: "It sleeps on its socket and the core's next timer. A datagram lands.", title: "The adapter waits" },
+  {
+    body: "The core is plain state machines: no sockets, no clock. Same input, same output.",
+    title: "Bytes and the time go in",
+  },
+  { body: "`wait` returns a single event: here, the path upgrade.", title: "One event comes out" },
+  {
+    body: "Handle it and go around again. Connections, streams, NAT, Gossipsub and discovery all arrive this way.",
+    title: "Your match arm runs",
+  },
+];
+
+const code = [
+  { text: "use minip2p::EndpointWaitOutcome::*;" },
+  { text: "" },
+  { text: "loop {" },
+  { at: 1, text: "    match node.wait(deadline)? {" },
+  { at: 5, text: "        Event(event) => handle(event)," },
+  { text: "        Deadline | Interrupted => {}" },
+  { text: "    }" },
+  { text: "}" },
+];
+
+const mono = "font-mono text-xs";
+const layer = "relative rounded-blume border border-border bg-background p-4";
+// Accent outline over a layer while its step plays.
+const lit = "pointer-events-none absolute -inset-px rounded-blume border border-accent";
+const chip = "rounded-full border border-border px-2 py-0.5 font-mono text-xs text-muted-foreground";
+const connector = "relative h-16";
+// Rails between layers: calls go down on the left, data comes up on the right.
+const railDown = "absolute inset-y-0 left-10 w-0.5 bg-border";
+const railUp = "absolute inset-y-0 right-10 w-0.5 bg-border";
+const dotDown = "absolute -top-1 left-1/2 size-2 -translate-x-1/2 rounded-full bg-accent";
+const dotUp = "absolute -bottom-1 left-1/2 size-2 -translate-x-1/2 rounded-full bg-accent";
+const labelLeft = `${mono} absolute top-1/2 left-14 -translate-y-1/2`;
+const labelRight = `${mono} absolute top-1/2 right-14 -translate-y-1/2 text-right`;
+---
+
+<div class="group/scene grid gap-8 lg:grid-cols-3 lg:gap-16" data-scene data-durations="2200,2400,2400,2400,2600">
+  <figure class="@container order-last m-0 lg:order-first lg:col-span-2" aria-label="One turn of a wait loop">
+    <div class="mx-auto max-w-2xl">
+      <div class={layer}>
+        <span class={`${lit} data-on:animate-pop`} data-show="1" data-hide="2" />
+        <span class={`${lit} data-on:animate-pop`} data-show="5" />
+        <p class={`${mono} m-0 mb-3 text-muted-foreground`}>your code</p>
+        {/* Each line keeps its own spaces; the container does not, so template
+            whitespace between lines never renders. */}
+        <code class="block overflow-x-auto font-mono text-xs leading-relaxed sm:text-sm">
+          {
+            code.map((line) => (
+              <span class="relative block">
+                {line.at !== undefined && (
+                  <span
+                    class="absolute -inset-x-2 inset-y-0 rounded-sm bg-accent/15"
+                    data-show={line.at}
+                    data-hide={line.at + 1}
+                  />
+                )}
+                <span class="relative whitespace-pre">{line.text || " "}</span>
+              </span>
+            ))
+          }
+        </code>
+      </div>
+
+      <div class={connector}>
+        <div class={railDown}>
+          <div class="absolute inset-0 data-on:animate-travel-down" data-show="1" data-hide="2">
+            <span class={dotDown} />
+          </div>
+        </div>
+        <span class={`${labelLeft} text-foreground`} data-show="1" data-hide="3">wait(deadline)</span>
+        <div class={railUp}>
+          <div class="absolute inset-0 data-on:animate-travel-up" data-show="4" data-hide="5">
+            <span class={dotUp} />
+          </div>
+        </div>
+        <span class={`${labelRight} text-accent`} data-show="4">Nat(PathUpgraded)</span>
+      </div>
+
+      <div class={layer}>
+        <span class={`${lit} data-on:animate-pop`} data-show="3" data-hide="5" />
+        <div class="flex flex-wrap items-baseline justify-between gap-2">
+          <p class="m-0 text-sm font-medium">Endpoint core</p>
+          <p class={`${mono} m-0 text-muted-foreground`}>sans-I/O · no sockets · no clock</p>
+        </div>
+        <div class="mt-3 flex flex-wrap gap-1.5">
+          {["identify", "ping", "nat", "relay", "gossipsub", "discovery"].map((name) => <span class={chip}>{name}</span>)}
+        </div>
+      </div>
+
+      <div class={connector}>
+        <div class={railDown}>
+          <div class="absolute inset-0 data-on:animate-travel-down-late" data-show="1" data-hide="2">
+            <span class={dotDown} />
+          </div>
+        </div>
+        <span class={`${labelLeft} text-muted-foreground`} data-show="1" data-hide="3">
+          sleep on socket + timer
+        </span>
+        <div class={railUp}>
+          <div class="absolute inset-0 data-on:animate-travel-up" data-show="3" data-hide="4">
+            <span class={dotUp} />
+          </div>
+        </div>
+        <span class={`${labelRight} text-foreground`} data-show="3" data-hide="5">bytes + now</span>
+      </div>
+
+      <div class={layer}>
+        <span class={`${lit} data-on:animate-pop`} data-show="2" data-hide="3" />
+        <div class="flex flex-wrap items-baseline justify-between gap-2">
+          <p class="m-0 text-sm font-medium">Transport adapter</p>
+          <p class={`${mono} m-0 text-muted-foreground`}>std · owns the I/O</p>
+        </div>
+        <div class="mt-3 flex flex-wrap gap-1.5">
+          <span class="relative">
+            <span class={chip}>UDP socket</span>
+            <span
+              class={`${chip} absolute inset-0 border-accent text-accent`}
+              data-show="2"
+              data-hide="3"
+             >UDP socket</span
+            >
+          </span>
+          <span class={chip}>clock</span>
+        </div>
+      </div>
+
+      <div class={connector}>
+        <div class={railUp}>
+          <div class="absolute inset-0 data-on:animate-travel-up" data-show="2" data-hide="3">
+            <span class={dotUp} />
+          </div>
+        </div>
+        <span class={`${labelRight} text-muted-foreground`}>datagram from the peer</span>
+      </div>
+    </div>
+
+    <SceneControls steps={steps.length} />
+  </figure>
+
+  <div>
+    <slot />
+    <div class="mt-6"><SceneSteps steps={steps} /></div>
+    <p class="mt-5 mb-0"><slot name="more" /></p>
+  </div>
+</div>
