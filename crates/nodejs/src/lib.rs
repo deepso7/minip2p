@@ -593,14 +593,12 @@ fn event_value(event: P2pEvent) -> serde_json::Value {
             dropped,
             total_dropped,
             terminal_connect_ids,
-            terminal_connect_ids_truncated,
         } => (
             "EventsDropped",
             serde_json::json!({
                 "dropped": dropped,
                 "totalDropped": total_dropped,
                 "terminalConnectIds": terminal_connect_ids,
-                "terminalConnectIdsTruncated": terminal_connect_ids_truncated,
             }),
         ),
         P2pEvent::DriverFailed { kind, detail } => (

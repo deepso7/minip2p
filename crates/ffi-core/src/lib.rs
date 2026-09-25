@@ -5,9 +5,8 @@
 //! exactly one terminal for it — [`P2pEvent::PathEstablished`],
 //! [`P2pEvent::ConnectFailed`], or [`P2pEvent::ConnectCancelled`] after
 //! [`P2pEndpoint::cancel_connect`]. If the bounded carry drops a terminal,
-//! `P2pEvent::EventsDropped::terminal_connect_ids` names its Connect ID —
-//! or sets `terminal_connect_ids_truncated` when the list itself overflowed —
-//! so a foreign wait settles with a delivery-loss error and recovers through
+//! `P2pEvent::EventsDropped::terminal_connect_ids` names its Connect ID, so
+//! exactly the affected foreign wait settles with a delivery-loss error and recovers through
 //! the State getters (`connected_peers`, `connection_info`, `path`,
 //! `known_peers`, `listen_addrs`). The detached driver owns the Endpoint
 //! wait outcomes — event, deadline, interrupted — and releases ownership on

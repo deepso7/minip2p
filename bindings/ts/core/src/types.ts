@@ -185,7 +185,6 @@ export interface Minip2pNamedEventMap {
     readonly dropped: number;
     readonly totalDropped: number;
     readonly terminalConnectIds: readonly number[];
-    readonly terminalConnectIdsTruncated: boolean;
   };
   driverFailed: {
     readonly kind: DriverFailureKind;
@@ -316,6 +315,41 @@ export interface OpOptions {
   readonly signal?: AbortSignal;
 }
 
+/**
+ * Where one Connection attempt goes:
+ *
+ * - a base58 peer ID, which applies the endpoint's discovery and relay policy;
+ * - one complete peer multiaddress ending in `/p2p/<peer>`, as advertised;
+ * - a non-empty list of complete peer multiaddresses that all name one peer.
+ *
+ * A string starting with `/` is an address; any other string is a peer ID.
+ * Address family and transport come from the addresses themselves.
+ */
+export type ConnectTarget = string | readonly [string, ...string[]];
+
+/**
+ * Wait controls for a Connection attempt.
+ *
+ * `timeoutMs` bounds only the local wait: the attempt keeps running, and a
+ * later {@link Minip2pBase.waitConnectResult} on its
+ * {@link Minip2pBase.startConnect} ID can still consume its terminal outcome.
+ * Aborting `signal` cancels the attempt, and the wait then settles from its
+ * terminal: `ConnectCancelledError`, or the real outcome if cancellation
+ * raced an attempt that had already settled.
+ */
+export interface ConnectOptions extends OpOptions {
+  /** Also cancel the attempt when `timeoutMs` elapses. Defaults to `false`. */
+  readonly cancelOnTimeout?: boolean;
+}
+
+/** The transport connection currently selected for a peer. */
+export interface ConnectionInfo {
+  /** Endpoint-local connection identifier, as carried by connection events. */
+  readonly connId: number;
+  /** Remote transport address, when known. */
+  readonly remoteAddr?: string;
+}
+
 /** Options accepted by {@link Minip2pBase.once}. */
 export type OnceOptions = OpOptions;
 
@@ -418,7 +452,6 @@ export type P2pEvent =
         dropped: number;
         totalDropped: number;
         terminalConnectIds: number[];
-        terminalConnectIdsTruncated: boolean;
       }
     >
   | RawEvent<

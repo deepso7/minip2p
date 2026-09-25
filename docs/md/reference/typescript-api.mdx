@@ -110,31 +110,30 @@ and shutdown order.
 
 ## State queries
 
-| API                   | Result                                       |
-| --------------------- | -------------------------------------------- |
-| `peerId()`            | Local peer ID.                               |
-| `listenAddrs()`       | Currently bound peer multiaddresses.         |
-| `connectedPeers()`    | Peer IDs with live transport connections.    |
-| `isPeerReady(peerId)` | Whether Identify completed.                  |
-| `peerInfo(peerId)`    | Latest remote Identify snapshot, if known.   |
-| `knownPeers()`        | Multi-source discovery address book.         |
-| `discoveryNowMs()`    | Discovery monotonic time, when enabled.      |
-| `path(peerId)`        | Authoritative current `Path`, if connected.  |
-| `reachability()`      | Latest AutoNAT reachability verdict.         |
-| `activeReservation()` | Active relay reservation metadata.           |
-| `circuitAddress`      | Usable local circuit address, when reserved. |
+| API                      | Result                                            |
+| ------------------------ | ------------------------------------------------- |
+| `peerId()`               | Local peer ID.                                    |
+| `listenAddrs()`          | Currently bound peer multiaddresses.              |
+| `connectedPeers()`       | Peer IDs with live transport connections.         |
+| `isPeerReady(peerId)`    | Whether Identify completed.                       |
+| `peerInfo(peerId)`       | Latest remote Identify snapshot, if known.        |
+| `knownPeers()`           | Multi-source discovery address book.              |
+| `discoveryNowMs()`       | Discovery monotonic time, when enabled.           |
+| `path(peerId)`           | Authoritative current `Path`, if connected.       |
+| `connectionInfo(peerId)` | Selected `{ connId, remoteAddr? }`, if connected. |
+| `reachability()`         | Latest AutoNAT reachability verdict.              |
+| `activeReservation()`    | Active relay reservation metadata.                |
+| `circuitAddress`         | Usable local circuit address, when reserved.      |
 
 ## Operations
 
-Promise operations use `{ timeoutMs?, signal? }`. Their default timeout is 65 seconds; `timeoutMs: 0` disables it.
+Promise operations use `{ timeoutMs?, signal? }`. Their default timeout is 65 seconds; `timeoutMs: 0` disables it. For Connection attempts a timeout ends only the wait (set `cancelOnTimeout: true` to also cancel), while an aborted `signal` cancels the attempt and the wait settles from its terminal.
 
 | API | Result |
 | --- | --- |
-| `connect(peerId, options?)` | First usable path to a known peer. |
-| `connectWithAddrs(peerId, addrs, options?)` | First usable path from explicit candidates. |
-| `connectAddr(addr, options?)` | First usable path from a complete peer address. |
-| `startConnect*` / `waitConnectResult` | Split-phase connection flow using a `connectId`. |
-| `cancelConnect(connectId)` | Cancel a split-phase attempt. |
+| `connect(target, options?)` | First usable path to a `ConnectTarget`: a peer ID, one complete peer address, or a list of complete addresses naming one peer. |
+| `startConnect(target)` / `waitConnectResult(connectId, options?)` | Split-phase connection flow using a `connectId`. |
+| `cancelConnect(connectId)` | Cancel an attempt; its terminal event settles any pending wait. |
 | `dial` / `dialIp4` / `dialIp6` | Start direct-only QUIC or TCP dialing and return connection IDs. |
 | `waitPeerReady(peerId, options?)` | Peer ID and advertised protocol list after Identify. |
 | `ping(peerId, options?)` | RTT in milliseconds. |
@@ -178,7 +177,7 @@ Stream events are `data`, `remoteWriteClosed`, `closed`, and `dataOverflow`.
 | Endpoint and queue | `eventsDropped`, `queueOverflow`, `driverFailed`, `handlerError`, `endpointError` |
 | Connection and Identify | `connectionEstablished`, `connectionClosed`, `peerReady`, `identifyReceived` |
 | Ping and streams | `pingRttMeasured`, `pingTimeout`, `stream` |
-| Relay and NAT | `reachabilityChanged`, `publicAddressesChanged`, `relayReserved`, `relayReservationLost`, `pathEstablished`, `pathUpgraded`, `holePunchFailed`, `fellBackToRelay`, `connectFailed`, `inboundDirectUpgrade` |
+| Relay and NAT | `reachabilityChanged`, `publicAddressesChanged`, `relayReserved`, `relayReservationLost`, `pathEstablished`, `pathUpgraded`, `holePunchFailed`, `fellBackToRelay`, `connectFailed`, `connectCancelled`, `inboundDirectUpgrade` |
 | Pubsub | `message`, `peerSubscribed`, `peerUnsubscribed`, `gossipsubOutboundFailure`, `gossipsubProtocolViolation` |
 | Discovery | `peerDiscovered`, `peerUpdated`, `peerExpired`, `discoveryDialFailed`, `discoveryProtocolViolation` |
 
@@ -191,6 +190,8 @@ Use `instanceof` for control flow and the typed `kind` fields for telemetry.
 | Error | Meaning |
 | --- | --- |
 | `AbortError` | This caller's wait was cancelled. |
+| `ConnectCancelledError` | An `AbortError`: the attempt ended with a `connectCancelled` terminal; includes `connectId` and `peerId`. |
+| `ConnectResultLostError` | A dropped event carried the attempt's terminal; recover state with `connectedPeers()` / `path()`. |
 | `TimeoutError` | A Promise operation exceeded its timeout. |
 | `EventQueueOverflowError` | Event loss made an in-flight result unknowable. Refresh state, then retry the operation. |
 | `ClosedError` | The endpoint or stream is already closed. |

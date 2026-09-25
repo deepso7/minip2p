@@ -7,7 +7,7 @@ Applications normally install a platform package such as `@minip2p/react-native`
 The API provides typed events, cancellable Promise operations, and `Stream` handles:
 
 ```ts
-const path = await endpoint.connectAddr(remoteAddress);
+const path = await endpoint.connect(remoteAddress);
 // Optional: wait for Identify when you need advertised protocols.
 await endpoint.waitPeerReady(path.peerId);
 const rttMs = await endpoint.ping(path.peerId);
@@ -35,6 +35,8 @@ for await (const event of endpoint.events({ signal })) {
 }
 ```
 
+`connect` accepts a Connection target: a peer ID, one complete peer multiaddress, or a list of complete addresses naming one peer. For a Connection attempt, a timeout ends only the local wait (`cancelOnTimeout: true` opts into cancelling), an aborted `signal` cancels the attempt (the wait settles from its terminal), and a terminal lost to event overflow rejects with `ConnectResultLostError`. Waits never stop unrelated events from reaching other subscribers.
+
 Use `endpoint.on("stream", handler)` to claim inbound streams. Operations accept `{ timeoutMs, signal }`; the default timeout is 65 seconds and `timeoutMs: 0` disables it. Both endpoints and streams implement `Symbol.dispose`, including the fallback used by `await using`; neither implements `Symbol.asyncDispose`.
 
-Raw native unions and the `Minip2pBackend` adapter contract are available from `@minip2p/core/backend`.
+Raw native unions, the `Minip2pBackend` adapter contract, and `resolveEndpointConfig` (shared config defaults and validation) are available from `@minip2p/core/backend`.

@@ -14,7 +14,7 @@ const endpoint = Minip2p.create({
 });
 
 try {
-  const connected = await endpoint.connectAddr(address, { timeoutMs: 10_000 });
+  const connected = await endpoint.connect(address, { timeoutMs: 10_000 });
   await endpoint.waitPeerReady(connected.peerId, { timeoutMs: 10_000 });
   const rttMs = await endpoint.ping(connected.peerId, { timeoutMs: 5000 });
 

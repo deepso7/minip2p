@@ -1,5 +1,7 @@
 /* oxlint-disable class-methods-use-this, max-classes-per-file, promise/avoid-new -- The fake implements the native endpoint boundary used by the adapter, including one deferred drain observation. */
 
+import { describeAdapterContract } from "@minip2p/test-fixtures/adapter-contract";
+import type { NativeEventLiteral } from "@minip2p/test-fixtures/adapter-contract";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { Minip2p } from "../src/adapter";
@@ -16,6 +18,8 @@ const native = vi.hoisted(() => {
     readonly config: Readonly<Record<string, unknown>>;
     readonly abandonedStreams: { peerId: string; streamId: bigint }[] = [];
     readonly cancelledConnects: bigint[] = [];
+    readonly connectTargets: (string | string[])[] = [];
+    connection: { connId: bigint; remoteAddr?: string } | null = null;
     readonly drainLimits: number[] = [];
     readonly #batches: Event[][] = [];
     #doorbell: (() => void) | undefined;
@@ -84,13 +88,8 @@ const native = vi.hoisted(() => {
 
     closeStreamWrite(): void {}
 
-    connect(): bigint {
-      const id = this.nextConnectId;
-      this.nextConnectId += 1n;
-      return id;
-    }
-
-    connectAddr(): bigint {
+    connectTarget(target: string | string[]): bigint {
+      this.connectTargets.push(target);
       const id = this.nextConnectId;
       this.nextConnectId += 1n;
       return id;
@@ -100,10 +99,8 @@ const native = vi.hoisted(() => {
       return [];
     }
 
-    connectWithAddrs(): bigint {
-      const id = this.nextConnectId;
-      this.nextConnectId += 1n;
-      return id;
+    connectionInfo(): { connId: bigint; remoteAddr?: string } | null {
+      return this.connection;
     }
 
     dial(): bigint[] {
@@ -344,34 +341,6 @@ describe("Node adapter", () => {
     endpoint.close();
   });
 
-  test("passes address-shaped listen to the native endpoint", () => {
-    const listen = [
-      "/ip4/127.0.0.1/udp/0/quic-v1",
-      "/ip4/127.0.0.1/tcp/0",
-    ] as const;
-    const endpoint = Minip2p.create({
-      listen,
-      secretKey: new Uint8Array(32),
-    });
-
-    expect(fakeEndpoint().config).toMatchObject({
-      listen: [...listen],
-      quic: undefined,
-      tcp: undefined,
-    });
-    endpoint.close();
-  });
-
-  test("rejects listen mixed with transports", () => {
-    expect(() =>
-      Minip2p.create({
-        listen: ["/ip4/127.0.0.1/udp/0/quic-v1"],
-        secretKey: new Uint8Array(32),
-        transports: { quic: true },
-      })
-    ).toThrow(/not both/u);
-  });
-
   test("returns no discovery clock when the native option is null", () => {
     const endpoint = createEndpoint();
 
@@ -404,90 +373,6 @@ describe("Node adapter", () => {
     await settle();
 
     expect(ids).toEqual([1, 2]);
-    endpoint.close();
-  });
-
-  test("passes connect identifiers straight through", async () => {
-    vi.useFakeTimers();
-    const endpoint = createEndpoint();
-    const fake = fakeEndpoint();
-    const ids: number[] = [];
-    endpoint.on("pathEstablished", ({ connectId }) => ids.push(connectId));
-    endpoint.on("pathUpgraded", ({ connectId }) => ids.push(connectId));
-    const first = endpoint.startConnect("remote");
-    fake.enqueue(
-      [
-        {
-          inner: {
-            connectId: 30n,
-            path: {
-              inner: { relayPeerId: "relay" },
-              tag: "Relayed",
-            },
-            peerId: "remote",
-          },
-          tag: "PathEstablished",
-        },
-        {
-          inner: {
-            connectId: 30n,
-            from: {
-              inner: { relayPeerId: "relay" },
-              tag: "Relayed",
-            },
-            peerId: "remote",
-            to: { tag: "DirectPunched" },
-          },
-          tag: "PathUpgraded",
-        },
-      ],
-      []
-    );
-
-    fake.ring();
-    await settle();
-
-    expect(first).toBe(30);
-    expect(ids).toEqual([first, first]);
-    endpoint.close();
-  });
-
-  test("normalizes terminal connect ids in EventsDropped", async () => {
-    vi.useFakeTimers();
-    const endpoint = createEndpoint();
-    const fake = fakeEndpoint();
-    const first = endpoint.startConnect("remote");
-    const dropped: Record<string, unknown>[] = [];
-    endpoint.on("eventsDropped", (event) => dropped.push(event));
-    fake.enqueue([
-      {
-        inner: {
-          dropped: 1n,
-          terminalConnectIds: [30n],
-          terminalConnectIdsTruncated: false,
-          totalDropped: 1n,
-        },
-        tag: "EventsDropped",
-      },
-    ]);
-
-    fake.ring();
-    await settle();
-
-    expect(dropped).toHaveLength(1);
-    expect(dropped[0]?.terminalConnectIds).toEqual([first]);
-    endpoint.close();
-  });
-
-  test("forwards connect ids to cancelConnect unchanged", () => {
-    const endpoint = createEndpoint();
-    const fake = fakeEndpoint();
-    const first = endpoint.startConnect("remote");
-
-    endpoint.cancelConnect(first);
-    endpoint.cancelConnect(999);
-
-    expect(fake.cancelledConnects).toEqual([30n, 999n]);
     endpoint.close();
   });
 
@@ -604,4 +489,28 @@ describe("Node adapter", () => {
       })
     ).toThrow(RangeError);
   });
+});
+
+describeAdapterContract("Node", {
+  create: (config = {}) =>
+    Minip2p.create({ ...config, secretKey: new Uint8Array(32) }),
+  native: () => {
+    const fake = fakeEndpoint();
+    return {
+      cancelledConnects: fake.cancelledConnects,
+      config: fake.config,
+      connectTargets: fake.connectTargets.map((target) =>
+        typeof target === "string"
+          ? { kind: "peer" as const, peerId: target }
+          : { addresses: target, kind: "addresses" as const }
+      ),
+      deliver: (events: readonly NativeEventLiteral[]) => {
+        fake.enqueue([...events], []);
+        fake.ring();
+      },
+      setConnectionInfo: (connId: bigint, remoteAddr?: string) => {
+        fake.connection = { connId, remoteAddr };
+      },
+    };
+  },
 });

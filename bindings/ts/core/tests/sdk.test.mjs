@@ -3,12 +3,13 @@
 import assert from "node:assert/strict";
 
 import { MockBackend } from "@minip2p/test-fixtures";
-import { test } from "vitest";
+import { test, vi } from "vitest";
 
 import { P2pEvent_Tags, PathKind_Tags } from "../src/backend.ts";
 import {
   AbortError,
   ClosedError,
+  ConnectCancelledError,
   ConnectFailedError,
   ConnectResultLostError,
   ConnectResultUnavailableError,
@@ -34,6 +35,16 @@ class TestMinip2p extends Minip2pBase {
 async function tick() {
   await Promise.resolve();
   await Promise.resolve();
+}
+
+async function remainsPending(promise) {
+  return Promise.race([
+    promise.then(
+      () => false,
+      () => false
+    ),
+    tick().then(() => true),
+  ]);
 }
 
 test("named and catch-all subscribers receive flattened events", async () => {
@@ -370,7 +381,44 @@ test("connect operations resolve paths and advanced results are one-shot", async
   endpoint.close();
 });
 
-test("connect failure, timeout and abort cancel and clear attempts", async () => {
+function pathEstablished(connectId, peerId = "peer") {
+  return {
+    inner: {
+      connId: 7,
+      connectId,
+      path: { tag: PathKind_Tags.DirectDialed },
+      peerId,
+    },
+    tag: P2pEvent_Tags.PathEstablished,
+  };
+}
+
+function cancelCalls(backend) {
+  return backend.operations.filter(([name]) => name === "cancelConnect");
+}
+
+test("startConnect shapes peer, address, and address-list targets", () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const quic = "/ip4/127.0.0.1/udp/1/quic-v1/p2p/peer";
+  const tcp = "/ip4/127.0.0.1/tcp/1/p2p/peer";
+
+  endpoint.startConnect("peer");
+  endpoint.startConnect(quic);
+  endpoint.startConnect([quic, tcp]);
+
+  assert.deepEqual(
+    backend.operations.filter(([name]) => name === "connectTarget"),
+    [
+      ["connectTarget", { kind: "peer", peerId: "peer" }],
+      ["connectTarget", { addresses: [quic], kind: "addresses" }],
+      ["connectTarget", { addresses: [quic, tcp], kind: "addresses" }],
+    ]
+  );
+  endpoint.close();
+});
+
+test("connect failure rejects with the terminal's typed error", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
   const failed = endpoint.connect("peer", { timeoutMs: 1000 });
@@ -391,25 +439,190 @@ test("connect failure, timeout and abort cancel and clear attempts", async () =>
     assert.equal(error.message, "no path");
     return true;
   });
+  endpoint.close();
+});
+
+test("a connect timeout ends only the wait and leaves the attempt running", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const connectId = endpoint.startConnect("peer");
 
   await assert.rejects(
-    endpoint.connect("peer", { timeoutMs: 1 }),
+    endpoint.waitConnectResult(connectId, { timeoutMs: 1 }),
     TimeoutError
   );
+  assert.deepEqual(cancelCalls(backend), []);
+
+  backend.emit(pathEstablished(connectId));
+  await tick();
+  assert.equal(
+    (await endpoint.waitConnectResult(connectId, { timeoutMs: 0 })).connectId,
+    connectId
+  );
+  endpoint.close();
+});
+
+test("connect rejects an invalid timeout before starting an attempt", () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+
+  assert.throws(() => endpoint.connect("peer", { timeoutMs: -1 }), RangeError);
+  assert.deepEqual(backend.operations, []);
+  endpoint.close();
+});
+
+test("cancelOnTimeout opts into cancelling the attempt", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+
+  await assert.rejects(
+    endpoint.connect("peer", { cancelOnTimeout: true, timeoutMs: 1 }),
+    TimeoutError
+  );
+  assert.deepEqual(cancelCalls(backend), [["cancelConnect", 1]]);
+  endpoint.close();
+});
+
+test("aborting a connect wait cancels, then the terminal settles it", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
   const controller = new AbortController();
-  const aborted = endpoint.connect("peer", {
+  const cancelled = endpoint.startConnect("peer");
+  const raced = endpoint.startConnect("peer");
+  const cancelledWait = endpoint.waitConnectResult(cancelled, {
     signal: controller.signal,
     timeoutMs: 0,
   });
+  const racedWait = endpoint.waitConnectResult(raced, {
+    signal: controller.signal,
+    timeoutMs: 0,
+  });
+
   controller.abort();
-  await assert.rejects(aborted, AbortError);
-  assert.deepEqual(
-    backend.operations.filter((operation) => operation[0] === "cancelConnect"),
-    [
-      ["cancelConnect", 2],
-      ["cancelConnect", 3],
-    ]
+  assert.deepEqual(cancelCalls(backend), [
+    ["cancelConnect", cancelled],
+    ["cancelConnect", raced],
+  ]);
+  assert.equal(await remainsPending(cancelledWait), true);
+
+  backend.emit({
+    inner: { connectId: cancelled, peerId: "peer" },
+    tag: P2pEvent_Tags.ConnectCancelled,
+  });
+  // Cancellation is a no-op for an attempt that already settled.
+  backend.emit(pathEstablished(raced));
+  await assert.rejects(cancelledWait, ConnectCancelledError);
+  assert.equal((await racedWait).connectId, raced);
+  endpoint.close();
+});
+
+test("aborting a connect wait drops its timeout and waits for the terminal", async () => {
+  vi.useFakeTimers();
+  try {
+    const backend = new MockBackend();
+    const endpoint = new TestMinip2p(backend);
+    const controller = new AbortController();
+    const connectId = endpoint.startConnect("peer");
+    const waiting = endpoint.waitConnectResult(connectId, {
+      signal: controller.signal,
+      timeoutMs: 50,
+    });
+
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(50);
+    assert.equal(await remainsPending(waiting), true);
+    assert.deepEqual(cancelCalls(backend), [["cancelConnect", connectId]]);
+
+    backend.emit({
+      inner: { connectId, peerId: "peer" },
+      tag: P2pEvent_Tags.ConnectCancelled,
+    });
+    await assert.rejects(waiting, ConnectCancelledError);
+    endpoint.close();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("an already-aborted connect wait drops its timeout", async () => {
+  vi.useFakeTimers();
+  try {
+    const backend = new MockBackend();
+    const endpoint = new TestMinip2p(backend);
+    const connectId = endpoint.startConnect("peer");
+    const waiting = endpoint.waitConnectResult(connectId, {
+      signal: AbortSignal.abort(),
+      timeoutMs: 50,
+    });
+
+    await vi.advanceTimersByTimeAsync(50);
+    assert.equal(await remainsPending(waiting), true);
+
+    backend.emit({
+      inner: { connectId, peerId: "peer" },
+      tag: P2pEvent_Tags.ConnectCancelled,
+    });
+    await assert.rejects(waiting, ConnectCancelledError);
+    endpoint.close();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("an already-aborted signal cancels before waiting", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const signal = AbortSignal.abort();
+  const connectId = endpoint.startConnect("peer");
+  const waiting = endpoint.waitConnectResult(connectId, {
+    signal,
+    timeoutMs: 0,
+  });
+
+  assert.deepEqual(cancelCalls(backend), [["cancelConnect", connectId]]);
+  backend.emit({
+    inner: { connectId, peerId: "peer" },
+    tag: P2pEvent_Tags.ConnectCancelled,
+  });
+  await assert.rejects(waiting, ConnectCancelledError);
+
+  // connect() with an aborted signal never starts a native attempt.
+  await assert.rejects(endpoint.connect("peer", { signal }), AbortError);
+  assert.equal(
+    backend.operations.filter(([name]) => name === "connectTarget").length,
+    1
   );
+  endpoint.close();
+});
+
+test("cancelConnect lets the native terminal settle the pending wait", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const settled = endpoint.startConnect("peer");
+  const unsettled = endpoint.startConnect("peer");
+  const settledWait = endpoint.waitConnectResult(settled, { timeoutMs: 0 });
+  const unsettledWait = endpoint.waitConnectResult(unsettled, {
+    timeoutMs: 0,
+  });
+
+  endpoint.cancelConnect(settled);
+  endpoint.cancelConnect(unsettled);
+  assert.equal(await remainsPending(settledWait), true);
+  assert.equal(await remainsPending(unsettledWait), true);
+
+  // Cancellation raced a settled attempt: its real outcome still arrives.
+  backend.emit(pathEstablished(settled));
+  backend.emit({
+    inner: { connectId: unsettled, peerId: "peer" },
+    tag: P2pEvent_Tags.ConnectCancelled,
+  });
+  assert.equal((await settledWait).connectId, settled);
+  await assert.rejects(unsettledWait, (error) => {
+    assert.ok(error instanceof ConnectCancelledError);
+    assert.ok(error instanceof AbortError);
+    assert.equal(error.connectId, unsettled);
+    return true;
+  });
   endpoint.close();
 });
 
@@ -428,7 +641,7 @@ test("connectCancelled reaches listeners and settles tracked attempts", async ()
   await tick();
 
   assert.deepEqual(cancelled, [{ connectId, peerId: "peer" }]);
-  await assert.rejects(waiting, AbortError);
+  await assert.rejects(waiting, ConnectCancelledError);
   endpoint.close();
 });
 
@@ -444,7 +657,6 @@ test("EventsDropped settles pending connect results with a lost error", async ()
     inner: {
       dropped: 1,
       terminalConnectIds: [connectId],
-      terminalConnectIdsTruncated: false,
       totalDropped: 1,
     },
     tag: P2pEvent_Tags.EventsDropped,
@@ -460,7 +672,6 @@ test("EventsDropped settles pending connect results with a lost error", async ()
     {
       dropped: 1,
       terminalConnectIds: [connectId],
-      terminalConnectIdsTruncated: false,
       totalDropped: 1,
     },
   ]);
@@ -476,7 +687,6 @@ test("EventsDropped stores a lost terminal for results not yet awaited", async (
     inner: {
       dropped: 1,
       terminalConnectIds: [connectId],
-      terminalConnectIdsTruncated: false,
       totalDropped: 1,
     },
     tag: P2pEvent_Tags.EventsDropped,
@@ -494,71 +704,22 @@ test("EventsDropped stores a lost terminal for results not yet awaited", async (
   endpoint.close();
 });
 
-test("truncated EventsDropped settles every pending connect result", async () => {
+test("EventsDropped leaves unnamed attempts to their own terminals", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
-  const first = endpoint.startConnect("peer");
-  const second = endpoint.startConnect("peer");
-  const waitingFirst = endpoint.waitConnectResult(first, { timeoutMs: 0 });
-  const waitingSecond = endpoint.waitConnectResult(second, { timeoutMs: 0 });
+  const lost = endpoint.startConnect("peer");
+  const kept = endpoint.startConnect("peer");
+  const lostWait = endpoint.waitConnectResult(lost, { timeoutMs: 0 });
+  const keptWait = endpoint.waitConnectResult(kept, { timeoutMs: 0 });
 
   backend.emit({
-    inner: {
-      dropped: 1,
-      terminalConnectIds: [],
-      terminalConnectIdsTruncated: true,
-      totalDropped: 1,
-    },
+    inner: { dropped: 1, terminalConnectIds: [lost], totalDropped: 1 },
     tag: P2pEvent_Tags.EventsDropped,
   });
-  await tick();
+  backend.emit(pathEstablished(kept));
 
-  for (const [waiting, connectId] of [
-    [waitingFirst, first],
-    [waitingSecond, second],
-  ]) {
-    await assert.rejects(waiting, (error) => {
-      assert.ok(error instanceof ConnectResultLostError);
-      assert.equal(error.connectId, connectId);
-      return true;
-    });
-  }
-  endpoint.close();
-});
-
-test("truncated EventsDropped keeps a delivered connect terminal", async () => {
-  const backend = new MockBackend();
-  const endpoint = new TestMinip2p(backend);
-  const connectId = endpoint.startConnect("peer");
-
-  backend.emit({
-    inner: {
-      connId: 7,
-      connectId,
-      path: { tag: PathKind_Tags.DirectDialed },
-      peerId: "peer",
-    },
-    tag: P2pEvent_Tags.PathEstablished,
-  });
-  backend.emit({
-    inner: {
-      dropped: 1,
-      terminalConnectIds: [],
-      terminalConnectIdsTruncated: true,
-      totalDropped: 1,
-    },
-    tag: P2pEvent_Tags.EventsDropped,
-  });
-  await tick();
-
-  assert.deepEqual(
-    await endpoint.waitConnectResult(connectId, { timeoutMs: 0 }),
-    {
-      connectId,
-      path: { kind: "directDialed" },
-      peerId: "peer",
-    }
-  );
+  await assert.rejects(lostWait, ConnectResultLostError);
+  assert.equal((await keptWait).connectId, kept);
   endpoint.close();
 });
 
@@ -593,33 +754,79 @@ test("ping coalescing recovers after its last waiter leaves and rejects on teard
   await assert.rejects(retry, ClosedError);
 });
 
-test("queue overflow rejects operations whose native terminals may be lost", async () => {
+test("queue overflow rejects uncorrelated waits and exactly the lost connects", async () => {
   const backend = new MockBackend();
   const endpoint = new TestMinip2p(backend);
   const ping = endpoint.ping("peer", { timeoutMs: 0 });
-  const connect = endpoint.connect("peer", { timeoutMs: 0 });
-  backend.emit({
-    inner: { peerId: "peer", rttMs: 7 },
-    tag: P2pEvent_Tags.PingRttMeasured,
-  });
-  backend.emit({
-    inner: {
-      connId: 7,
-      connectId: 1,
-      path: { tag: PathKind_Tags.DirectDialed },
-      peerId: "peer",
-    },
-    tag: P2pEvent_Tags.PathEstablished,
-  });
+  const lost = endpoint.startConnect("peer");
+  const kept = endpoint.startConnect("peer");
+  const lostWait = endpoint.waitConnectResult(lost, { timeoutMs: 0 });
+  const keptWait = endpoint.waitConnectResult(kept, { timeoutMs: 0 });
+  backend.emit(pathEstablished(lost));
+  backend.emit(pathEstablished(kept));
   for (let index = 0; index < 4095; index += 1) {
-    backend.emit({
-      inner: { peerId: `flood-${index}`, protocols: [] },
-      tag: P2pEvent_Tags.PeerReady,
-    });
+    backend.emit(peerReady(`flood-${index}`));
   }
 
   await assert.rejects(ping, EventQueueOverflowError);
-  await assert.rejects(connect, EventQueueOverflowError);
+  await assert.rejects(lostWait, (error) => {
+    assert.ok(error instanceof ConnectResultLostError);
+    assert.equal(error.connectId, lost);
+    return true;
+  });
+  assert.equal((await keptWait).connectId, kept);
+  endpoint.close();
+});
+
+test("queue overflow settles connects named by a dropped EventsDropped", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const connectId = endpoint.startConnect("peer");
+  backend.emit({
+    inner: {
+      dropped: 1,
+      terminalConnectIds: [connectId],
+      totalDropped: 1,
+    },
+    tag: P2pEvent_Tags.EventsDropped,
+  });
+  for (let index = 0; index < 4096; index += 1) {
+    backend.emit(peerReady(`flood-${index}`));
+  }
+
+  await assert.rejects(
+    endpoint.waitConnectResult(connectId, { timeoutMs: 0 }),
+    ConnectResultLostError
+  );
+  endpoint.close();
+});
+
+test("pending waits leave unrelated events flowing to every subscriber", async () => {
+  const backend = new MockBackend();
+  const endpoint = new TestMinip2p(backend);
+  const seen = [];
+  endpoint.on("peerReady", ({ peerId }) => seen.push(`named:${peerId}`));
+  endpoint.on((event) => seen.push(`all:${event.type}`));
+  const connectId = endpoint.startConnect("peer");
+  const connecting = endpoint.waitConnectResult(connectId, { timeoutMs: 0 });
+  const waiting = endpoint.waitFor("peerReady", {
+    predicate: ({ peerId }) => peerId === "wanted",
+    timeoutMs: 0,
+  });
+
+  backend.emit(peerReady("other"));
+  backend.emit(pathEstablished(connectId, "other"));
+  backend.emit(peerReady("wanted"));
+
+  assert.equal((await connecting).connectId, connectId);
+  assert.equal((await waiting).peerId, "wanted");
+  assert.deepEqual(seen, [
+    "named:other",
+    "all:peerReady",
+    "all:pathEstablished",
+    "named:wanted",
+    "all:peerReady",
+  ]);
   endpoint.close();
 });
 
@@ -964,16 +1171,6 @@ test("abandon tolerates a native close before its event is dispatched", async ()
   assert.throws(() => stream.write("closed"), ClosedError);
   endpoint.close();
 });
-
-async function remainsPending(promise) {
-  return Promise.race([
-    promise.then(
-      () => false,
-      () => false
-    ),
-    tick().then(() => true),
-  ]);
-}
 
 test("openStream correlates full available identity and abandons late ready", async () => {
   const backend = new MockBackend();

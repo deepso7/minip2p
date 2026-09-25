@@ -57,7 +57,7 @@ export async function runSmokeSuite(
     const secondReady = second.waitPeerReady(firstPeer, {
       timeoutMs: WAIT_MS,
     });
-    const result = await first.connectAddr(second.listenAddrs()[0] as string, {
+    const result = await first.connect(second.listenAddrs()[0] as string, {
       timeoutMs: WAIT_MS,
     });
     await Promise.all([firstReady, secondReady]);

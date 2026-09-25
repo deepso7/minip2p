@@ -81,7 +81,7 @@ export default function App() {
     if (node.status !== "running") return;
 
     try {
-      const connected = await node.endpoint.connectAddr(remoteAddress, {
+      const connected = await node.endpoint.connect(remoteAddress, {
         timeoutMs: 10_000,
       });
       await node.endpoint.waitPeerReady(connected.peerId, {

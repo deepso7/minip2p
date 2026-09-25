@@ -79,14 +79,15 @@ export interface NativeEndpoint {
   cancelConnect: (id: bigint) => void;
   close: () => void;
   closeStreamWrite: (peerId: string, streamId: bigint) => void;
-  connect: (peerId: string) => bigint;
-  connectAddr: (address: string) => bigint;
   connectedPeers: () => string[];
-  connectionInfo: (
-    peerId: string
-  ) => { readonly connId: bigint; readonly remoteAddr?: string } | null;
+  connectionInfo: (peerId: string) =>
+    | {
+        readonly connId: bigint;
+        readonly remoteAddr?: string | null;
+      }
+    | null
+    | undefined;
   connectTarget: (target: string | string[]) => bigint;
-  connectWithAddrs: (peerId: string, addresses: string[]) => bigint;
   dial: (address: string) => bigint[];
   dialIp4: (address: string) => bigint;
   dialIp6: (address: string) => bigint;

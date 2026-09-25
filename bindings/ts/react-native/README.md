@@ -38,7 +38,7 @@ const unsubscribe = endpoint.on("peerReady", ({ peerId }) => {
 endpoint.subscribe("/example/chat/1");
 endpoint.publish("/example/chat/1", "hello");
 
-const path = await endpoint.connectAddr(remoteAddress);
+const path = await endpoint.connect(remoteAddress);
 // Optional: wait for Identify when you need advertised protocols.
 await endpoint.waitPeerReady(path.peerId);
 const rttMs = await endpoint.ping(path.peerId);

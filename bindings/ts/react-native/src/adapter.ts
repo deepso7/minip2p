@@ -8,18 +8,16 @@ import {
 } from "@minip2p/core";
 import type {
   Bytes,
+  ConnectionInfo,
   IdentifyInfo,
   KnownPeerInfo,
   Minip2pConfig,
-  Minip2pDiscoveryOptions,
-  Minip2pMdnsOptions,
-  Minip2pTransportOptions,
-  Minip2pTransports,
   Reachability,
   RelayReservationInfo,
 } from "@minip2p/core";
-import { P2pEvent_Tags } from "@minip2p/core/backend";
+import { P2pEvent_Tags, resolveEndpointConfig } from "@minip2p/core/backend";
 import type {
+  BackendConnectTarget,
   Minip2pBackend,
   Minip2pBackendFactory,
   BackendOpenStream,
@@ -29,6 +27,7 @@ import type {
 
 import { EventDrain } from "./event-drain";
 import {
+  ConnectTarget,
   FfiError_Tags,
   P2pEndpoint,
   circuitAddress as nativeCircuitAddress,
@@ -36,15 +35,11 @@ import {
   peerIdFromSecretKey as nativePeerIdFromSecretKey,
 } from "./native";
 import type {
-  DiscoveryOptions as NativeDiscoveryOptions,
-  EndpointConfig as NativeEndpointConfig,
   IdentifyInfo as NativeIdentifyInfo,
   KnownPeerInfo as NativeKnownPeerInfo,
-  MdnsOptions as NativeMdnsOptions,
   P2pEvent as NativeP2pEvent,
   P2pEventDoorbell,
   RelayReservationInfo as NativeRelayReservationInfo,
-  TransportOptions as NativeTransportOptions,
 } from "./native";
 import nativeModule from "./NativeMinip2p";
 
@@ -65,7 +60,7 @@ class ReactNativeBackend implements Minip2pBackend {
         () =>
           new P2pEndpoint(
             toArrayBuffer(config.secretKey),
-            toNativeConfig(config)
+            resolveEndpointConfig(config)
           )
       );
     } catch (error) {
@@ -153,6 +148,17 @@ class ReactNativeBackend implements Minip2pBackend {
       : (normalizeBigInts(path) as PathKind);
   }
 
+  connectionInfo(peerId: string): ConnectionInfo | undefined {
+    const info = translateErrors(() => this.#endpoint.connectionInfo(peerId));
+    if (info === undefined) {
+      return undefined;
+    }
+    const connId = this.#connectionIds.toPublic(info.connId);
+    return info.remoteAddr === undefined
+      ? { connId }
+      : { connId, remoteAddr: info.remoteAddr };
+  }
+
   circuitAddress(relayAddress: string, peerId: string): string {
     return translateErrors(() => nativeCircuitAddress(relayAddress, peerId));
   }
@@ -236,25 +242,13 @@ class ReactNativeBackend implements Minip2pBackend {
     });
   }
 
-  connect(peerId: string): number {
+  connectTarget(target: BackendConnectTarget): number {
+    const native =
+      target.kind === "peer"
+        ? new ConnectTarget.Peer({ peerId: target.peerId })
+        : new ConnectTarget.Addresses({ addresses: [...target.addresses] });
     return u64ToNumber(
-      translateErrors(() => this.#endpoint.connect(peerId)),
-      "connectId"
-    );
-  }
-
-  connectWithAddrs(peerId: string, addresses: readonly string[]): number {
-    return u64ToNumber(
-      translateErrors(() =>
-        this.#endpoint.connectWithAddrs(peerId, [...addresses])
-      ),
-      "connectId"
-    );
-  }
-
-  connectAddr(address: string): number {
-    return u64ToNumber(
-      translateErrors(() => this.#endpoint.connectAddr(address)),
+      translateErrors(() => this.#endpoint.connectTarget(native)),
       "connectId"
     );
   }
@@ -324,116 +318,6 @@ export function peerIdFromSecretKey(secretKey: Bytes): string {
 /** Builds a circuit multiaddress through a direct QUIC or TCP relay address. */
 export function circuitAddress(relayAddress: string, peerId: string): string {
   return backendFactory.circuitAddress(relayAddress, peerId);
-}
-
-function toNativeConfig(config: Minip2pConfig): NativeEndpointConfig {
-  const discovery: NativeDiscoveryOptions | undefined =
-    config.discovery === undefined
-      ? undefined
-      : {
-          autoDial: config.discovery.autoDial ?? true,
-          beaconIntervalMs: numberToU64(
-            config.discovery.beaconIntervalMs ?? 10_000,
-            "beaconIntervalMs"
-          ),
-          peerTtlMs: numberToU64(
-            config.discovery.peerTtlMs ?? 35_000,
-            "peerTtlMs"
-          ),
-          topic: config.discovery.topic,
-        };
-  const mdnsOptions = config.mdns === true ? {} : config.mdns;
-  const mdns: NativeMdnsOptions | undefined =
-    mdnsOptions === undefined || mdnsOptions === false
-      ? undefined
-      : {
-          autoDial: resolveMdnsAutoDial(mdnsOptions, config.discovery),
-          enableIpv6: mdnsOptions.enableIpv6 ?? false,
-          interfaceRefreshMs: numberToU64(
-            mdnsOptions.interfaceRefreshMs ?? 10_000,
-            "interfaceRefreshMs"
-          ),
-          maxAnnouncedAddrs: numberToU32(
-            mdnsOptions.maxAnnouncedAddrs ?? 16,
-            "maxAnnouncedAddrs"
-          ),
-          maxPacketBytes: numberToU32(
-            mdnsOptions.maxPacketBytes ?? 1400,
-            "maxPacketBytes"
-          ),
-          queryIntervalMs: numberToU64(
-            mdnsOptions.queryIntervalMs ?? 300_000,
-            "queryIntervalMs"
-          ),
-          socketPollIntervalMs: numberToU64(
-            mdnsOptions.socketPollIntervalMs ?? 100,
-            "socketPollIntervalMs"
-          ),
-          ttlMs: numberToU64(mdnsOptions.ttlMs ?? 120_000, "ttlMs"),
-        };
-  const configuredTransports = config.transports;
-  const addressListen =
-    config.listen === undefined ? undefined : [...config.listen];
-  if (
-    addressListen !== undefined &&
-    configuredTransports !== undefined &&
-    (configuredTransports.quic !== undefined ||
-      configuredTransports.tcp !== undefined)
-  ) {
-    // Adapters would otherwise clear quic/tcp before native sees them, so
-    // reject the mix here (same rule and wording as ffi-core).
-    throw new Error(
-      "use either address-shaped `listen` or legacy `quic`/`tcp` transport options, not both"
-    );
-  }
-  let transports: Minip2pTransports;
-  if (addressListen !== undefined) {
-    transports = {};
-  } else if (
-    configuredTransports === undefined ||
-    (configuredTransports.quic === undefined &&
-      configuredTransports.tcp === undefined)
-  ) {
-    transports = { quic: true };
-  } else {
-    transports = configuredTransports;
-  }
-  const useAddressListen = addressListen !== undefined;
-  return {
-    agentVersion: config.agentVersion,
-    allowUnsigned: config.allowUnsigned ?? false,
-    autonatServers: [...(config.autonatServers ?? [])],
-    discovery,
-    forceRelay: config.forceRelay ?? false,
-    listen: addressListen,
-    mdns,
-    protocols: [...(config.protocols ?? [])],
-    quic: useAddressListen ? undefined : toNativeTransport(transports.quic),
-    relays: [...(config.relays ?? [])],
-    tcp: useAddressListen ? undefined : toNativeTransport(transports.tcp),
-  };
-}
-
-function toNativeTransport(
-  transport: true | Minip2pTransportOptions | undefined
-): NativeTransportOptions | undefined {
-  if (transport === undefined) {
-    return undefined;
-  }
-  if (transport === true) {
-    return { listenAddrs: undefined };
-  }
-  return {
-    listenAddrs:
-      transport.listen === undefined ? undefined : [...transport.listen],
-  };
-}
-
-function resolveMdnsAutoDial(
-  mdns: Minip2pMdnsOptions,
-  discovery: Minip2pDiscoveryOptions | undefined
-): boolean {
-  return mdns.autoDial ?? discovery?.autoDial ?? true;
 }
 
 /**
@@ -548,14 +432,6 @@ function toArrayBuffer(value: Bytes): ArrayBuffer {
 function numberToU64(value: number, name: string): bigint {
   assertSafeUnsignedInteger(value, name);
   return BigInt(value);
-}
-
-function numberToU32(value: number, name: string): number {
-  assertSafeUnsignedInteger(value, name);
-  if (value > 0xff_ff_ff_ff) {
-    throw new RangeError(`${name} exceeds the unsigned 32-bit range`);
-  }
-  return value;
 }
 
 function u64ToNumber(value: bigint, name: string): number {
