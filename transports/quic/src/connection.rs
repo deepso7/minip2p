@@ -61,9 +61,19 @@ struct StreamRuntimeState {
     incoming_notified: bool,
     /// Whether a StreamClosed event was emitted.
     closed_notified: bool,
+    /// Whether a StreamWriteStopped event was emitted.
+    write_stopped: bool,
 }
 
 impl StreamRuntimeState {
+    /// Drops every queued write, returning how many unsent bytes it held.
+    fn drop_pending_writes(&mut self) -> usize {
+        self.pending_writes
+            .drain(..)
+            .map(|write| write.bytes.len().saturating_sub(write.offset))
+            .sum()
+    }
+
     /// Returns true if both sides have closed their write side.
     fn is_fully_closed(&self) -> bool {
         self.local_write_closed && self.remote_write_closed
@@ -525,42 +535,28 @@ impl QuicConnection {
             },
         )?;
 
-        let dropped = state
-            .pending_writes
-            .iter()
-            .map(|write| write.bytes.len().saturating_sub(write.offset))
-            .sum::<usize>();
-        state.pending_writes.clear();
+        let dropped = state.drop_pending_writes();
         self.pending_write_bytes = self.pending_write_bytes.saturating_sub(dropped);
 
         // `Done` means quiche already shut that half down or collected the
         // stream (e.g. after the peer's STOP_SENDING and FIN), so there is
         // nothing left to reset.
-        match self
-            .conn
-            .stream_shutdown(stream_id.as_u64(), quiche::Shutdown::Write, 0x00)
-        {
-            Ok(()) | Err(quiche::Error::Done) => {}
-            Err(e) => {
-                return Err(TransportError::StreamResetFailed {
-                    id: self.id,
-                    stream_id,
-                    reason: format!("failed to shutdown stream write side: {e}"),
-                });
-            }
-        }
-
-        match self
-            .conn
-            .stream_shutdown(stream_id.as_u64(), quiche::Shutdown::Read, 0x00)
-        {
-            Ok(()) | Err(quiche::Error::Done) => {}
-            Err(e) => {
-                return Err(TransportError::StreamResetFailed {
-                    id: self.id,
-                    stream_id,
-                    reason: format!("failed to shutdown stream read side: {e}"),
-                });
+        for (direction, side) in [
+            (quiche::Shutdown::Write, "write"),
+            (quiche::Shutdown::Read, "read"),
+        ] {
+            match self
+                .conn
+                .stream_shutdown(stream_id.as_u64(), direction, 0x00)
+            {
+                Ok(()) | Err(quiche::Error::Done) => {}
+                Err(e) => {
+                    return Err(TransportError::StreamResetFailed {
+                        id: self.id,
+                        stream_id,
+                        reason: format!("failed to shutdown stream {side} side: {e}"),
+                    });
+                }
             }
         }
 
@@ -619,6 +615,19 @@ impl QuicConnection {
     ) -> Result<(), TransportError> {
         if !self.conn.is_established() {
             return Ok(());
+        }
+
+        // quiche marks a stream writable when STOP_SENDING arrives. Catch the
+        // stop here, before reading: once the peer's FIN is read, quiche may
+        // collect the stream and every later write would only report `Done`.
+        for raw_stream_id in self.conn.writable() {
+            if let Err(quiche::Error::StreamStopped(error_code)) =
+                self.conn.stream_capacity(raw_stream_id)
+            {
+                let stream_id = StreamId::new(raw_stream_id);
+                self.ensure_stream_discovered(stream_id, events);
+                self.note_write_stopped(stream_id, error_code, events);
+            }
         }
 
         for raw_stream_id in self.conn.readable() {
@@ -796,9 +805,8 @@ impl QuicConnection {
     /// The peer sent STOP_SENDING: our write half is gone for good, so queued
     /// writes are dropped. The read half stays open until the peer finishes.
     ///
-    /// Emits `StreamWriteStopped` once: afterwards the queue is empty and the
-    /// write side is closed, so neither the drain nor `send_stream` can reach
-    /// quiche for this stream again.
+    /// The stop can surface from the drain, from `send_stream`, or from the
+    /// writable scan in `poll_streams`; `StreamWriteStopped` is emitted once.
     fn note_write_stopped(
         &mut self,
         stream_id: StreamId,
@@ -808,12 +816,11 @@ impl QuicConnection {
         let Some(state) = self.stream_states.get_mut(&stream_id.as_u64()) else {
             return;
         };
-        let dropped = state
-            .pending_writes
-            .iter()
-            .map(|write| write.bytes.len().saturating_sub(write.offset))
-            .sum::<usize>();
-        state.pending_writes.clear();
+        if state.write_stopped {
+            return;
+        }
+        state.write_stopped = true;
+        let dropped = state.drop_pending_writes();
         self.pending_write_bytes = self.pending_write_bytes.saturating_sub(dropped);
         state.local_write_closed = true;
         events.push(TransportEvent::StreamWriteStopped {
@@ -826,7 +833,14 @@ impl QuicConnection {
 
     /// Closes this connection after an error quiche did not scope to a single
     /// stream. The transport reports `Closed` once quiche finishes draining.
+    ///
+    /// Every queued write is dropped so later drains cannot hit the same error
+    /// again while quiche drains the connection.
     fn fail_connection(&mut self, message: String, events: &mut Vec<TransportEvent>) {
+        for state in self.stream_states.values_mut() {
+            state.drop_pending_writes();
+        }
+        self.pending_write_bytes = 0;
         events.push(TransportEvent::Error {
             id: self.id,
             message,
@@ -881,12 +895,7 @@ impl QuicConnection {
         let Some(state) = self.stream_states.get_mut(&stream_id.as_u64()) else {
             return;
         };
-        let dropped = state
-            .pending_writes
-            .iter()
-            .map(|write| write.bytes.len().saturating_sub(write.offset))
-            .sum::<usize>();
-        state.pending_writes.clear();
+        let dropped = state.drop_pending_writes();
         self.pending_write_bytes = self.pending_write_bytes.saturating_sub(dropped);
         state.local_write_closed = true;
         state.remote_write_closed = true;

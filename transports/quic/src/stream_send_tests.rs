@@ -244,6 +244,51 @@ fn stop_sending_drops_queued_writes_and_keeps_the_endpoint_polling() {
 }
 
 #[test]
+fn stop_sending_is_reported_when_nothing_is_queued() {
+    let mut server = listening_server(30_000);
+    let (mut peer, id) = accept(&mut server, &mut [], |_| {});
+
+    // STOP_SENDING and FIN land together, before the server ever writes:
+    // reading the FIN lets quiche forget the stream, so the stop must be
+    // caught first.
+    peer.conn
+        .stream_send(0, b"hi", true)
+        .expect("open and finish");
+    peer.conn
+        .stream_shutdown(0, quiche::Shutdown::Read, 9)
+        .expect("stop sending");
+    let stream = StreamId::new(0);
+    let mut events = Vec::new();
+    drive_until(
+        &mut server,
+        &mut [&mut peer],
+        &mut events,
+        "stream close",
+        |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, TransportEvent::StreamClosed { .. }))
+        },
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, TransportEvent::StreamWriteStopped { .. }))
+            .collect::<Vec<_>>(),
+        [&TransportEvent::StreamWriteStopped {
+            id,
+            stream_id: stream,
+            error_code: 9,
+        }]
+    );
+    assert!(matches!(
+        server.send_stream(id, stream, b"late".to_vec()),
+        Err(TransportError::StreamSendFailed { .. } | TransportError::StreamNotFound { .. })
+    ));
+    assert_eq!(pending_write_bytes(&server, id), 0);
+}
+
+#[test]
 fn fin_waiting_for_stream_credit_stays_queued_until_granted() {
     let mut server = listening_server(30_000);
     let (mut peer, id) = accept(&mut server, &mut [], |config| {
@@ -328,10 +373,13 @@ fn connection_fatal_send_error_closes_only_that_connection() {
         "faulty connection close",
         |events| events.contains(&TransportEvent::Closed { id: faulty_id }),
     );
-    assert!(
+    assert_eq!(
         events
             .iter()
-            .any(|event| matches!(event, TransportEvent::Error { id, .. } if *id == faulty_id))
+            .filter(|event| matches!(event, TransportEvent::Error { id, .. } if *id == faulty_id))
+            .count(),
+        1,
+        "the failed write is dropped, not retried on every drain: {events:?}"
     );
     assert!(events.contains(&TransportEvent::StreamData {
         id: healthy_id,
