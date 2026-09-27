@@ -422,6 +422,28 @@ impl RelayServerAgent {
                     self.rejected_hop_streams.contains_key(&key)
                 }
             }
+            SwarmEvent::StreamWriteStopped {
+                peer_id,
+                conn_id,
+                stream_id,
+                ..
+            } => {
+                // Every relay stream needs to write, so a stopped one is reset;
+                // the `StreamClosed` that follows runs the usual teardown.
+                let key = StreamKey {
+                    conn_id: *conn_id,
+                    stream_id: *stream_id,
+                };
+                let owned = self.circuits.contains_key(&key)
+                    || self.stop_to_source.contains_key(&key)
+                    || self.hop_workers.contains_key(&key)
+                    || self.pending_circuits.contains_key(&key)
+                    || self.rejected_hop_streams.contains_key(&key);
+                if owned {
+                    self.queue_reset(peer_id.clone(), key);
+                }
+                owned
+            }
             SwarmEvent::StreamClosed {
                 conn_id, stream_id, ..
             } => {
@@ -3326,6 +3348,27 @@ mod tests {
         );
         agent.handle_tick(Now::from_millis(2_000));
         assert_eq!(agent.poll_event(), None);
+    }
+
+    #[test]
+    fn write_stop_on_a_circuit_leg_resets_it_before_teardown() {
+        let (mut agent, _, destination, _, stop_stream) =
+            connected_circuit(RelayServerConfig::default(), 0);
+        let claimed = agent.handle_event(
+            &SwarmEvent::StreamWriteStopped {
+                peer_id: destination,
+                conn_id: stop_stream.conn_id,
+                stream_id: stop_stream.stream_id,
+                error_code: 0,
+            },
+            false,
+            Now::from_millis(1),
+        );
+        assert!(claimed);
+        assert!(matches!(
+            agent.poll_action(),
+            Some(RelayServerAction::ResetStream { stream, .. }) if stream == stop_stream
+        ));
     }
 
     #[test]

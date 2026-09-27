@@ -162,6 +162,12 @@ impl QuicConnection {
         &self.indexed_cids
     }
 
+    /// Application bytes queued but not yet accepted by quiche.
+    #[cfg(test)]
+    pub(crate) fn pending_write_bytes(&self) -> usize {
+        self.pending_write_bytes
+    }
+
     pub fn endpoint(&self) -> &ConnectionEndpoint {
         &self.endpoint
     }
@@ -212,7 +218,7 @@ impl QuicConnection {
         if self.conn.send_ack_eliciting().is_ok() {
             self.sent_keepalive_since_recv = true;
         }
-        self.drain_send_queue(events)?;
+        self.drain_send_queue(events);
         self.flush(socket, pending_datagrams, max_pending_datagrams)
     }
 
@@ -229,7 +235,7 @@ impl QuicConnection {
         }
 
         self.conn.on_timeout();
-        self.drain_send_queue(events)?;
+        self.drain_send_queue(events);
         self.flush(socket, pending_datagrams, max_pending_datagrams)
     }
 
@@ -273,7 +279,7 @@ impl QuicConnection {
 
         if self.state == ConnectionState::Connecting && self.conn.is_established() {
             self.state = ConnectionState::Connected;
-            self.drain_send_queue(events)?;
+            self.drain_send_queue(events);
             self.flush(socket, pending_datagrams, max_pending_datagrams)?;
 
             // Auto-verify the remote peer's identity from their TLS certificate.
@@ -346,7 +352,7 @@ impl QuicConnection {
                 endpoint: self.endpoint.clone(),
             });
         } else {
-            self.drain_send_queue(events)?;
+            self.drain_send_queue(events);
             self.flush(socket, pending_datagrams, max_pending_datagrams)?;
         }
 
@@ -428,15 +434,11 @@ impl QuicConnection {
             // reject up front when the unsendable remainder would not fit the
             // queue. This keeps oversized writes all-or-nothing: no bytes are
             // committed to quiche before the write is known to fit.
+            // `StreamLimit` means the peer has not yet granted this stream;
+            // it has no capacity, so the whole write queues until it does.
             match self.conn.stream_send(raw_stream_id, &[], false) {
-                Ok(_) | Err(quiche::Error::Done) => {}
-                Err(e) => {
-                    return Err(TransportError::StreamSendFailed {
-                        id: self.id,
-                        stream_id,
-                        reason: format!("stream_send error: {e}"),
-                    });
-                }
+                Ok(_) | Err(quiche::Error::Done | quiche::Error::StreamLimit) => {}
+                Err(e) => return Err(self.direct_send_failed(stream_id, e, events)),
             }
             let capacity = self.conn.stream_capacity(raw_stream_id).unwrap_or(0);
             if data.len().saturating_sub(capacity) > queue_capacity {
@@ -447,14 +449,8 @@ impl QuicConnection {
 
             match self.conn.stream_send(raw_stream_id, &data, false) {
                 Ok(written) => written,
-                Err(quiche::Error::Done) => 0,
-                Err(e) => {
-                    return Err(TransportError::StreamSendFailed {
-                        id: self.id,
-                        stream_id,
-                        reason: format!("stream_send error: {e}"),
-                    });
-                }
+                Err(quiche::Error::Done | quiche::Error::StreamLimit) => 0,
+                Err(e) => return Err(self.direct_send_failed(stream_id, e, events)),
             }
         };
 
@@ -467,9 +463,28 @@ impl QuicConnection {
                 .push_back(PendingStreamWrite::data(data, offset));
         }
 
-        self.drain_send_queue(events)?;
+        self.drain_send_queue(events);
         self.flush(socket, pending_datagrams, max_pending_datagrams)?;
         Ok(())
+    }
+
+    /// Maps a quiche error from `send_stream`'s direct write to the caller's
+    /// error. A STOP_SENDING seen here is also recorded like one seen by the
+    /// drain, so the stream still reports `StreamWriteStopped`.
+    fn direct_send_failed(
+        &mut self,
+        stream_id: StreamId,
+        error: quiche::Error,
+        events: &mut Vec<TransportEvent>,
+    ) -> TransportError {
+        if let quiche::Error::StreamStopped(error_code) = error {
+            self.note_write_stopped(stream_id, error_code, events);
+        }
+        TransportError::StreamSendFailed {
+            id: self.id,
+            stream_id,
+            reason: format!("stream_send error: {error}"),
+        }
     }
 
     pub fn close_stream_write(
@@ -493,7 +508,7 @@ impl QuicConnection {
         state.local_write_closed = true;
         state.pending_writes.push_back(PendingStreamWrite::fin());
 
-        self.drain_send_queue(events)?;
+        self.drain_send_queue(events);
         self.flush(socket, pending_datagrams, max_pending_datagrams)?;
         Ok(())
     }
@@ -518,21 +533,36 @@ impl QuicConnection {
         state.pending_writes.clear();
         self.pending_write_bytes = self.pending_write_bytes.saturating_sub(dropped);
 
-        self.conn
+        // `Done` means quiche already shut that half down or collected the
+        // stream (e.g. after the peer's STOP_SENDING and FIN), so there is
+        // nothing left to reset.
+        match self
+            .conn
             .stream_shutdown(stream_id.as_u64(), quiche::Shutdown::Write, 0x00)
-            .map_err(|e| TransportError::StreamResetFailed {
-                id: self.id,
-                stream_id,
-                reason: format!("failed to shutdown stream write side: {e}"),
-            })?;
+        {
+            Ok(()) | Err(quiche::Error::Done) => {}
+            Err(e) => {
+                return Err(TransportError::StreamResetFailed {
+                    id: self.id,
+                    stream_id,
+                    reason: format!("failed to shutdown stream write side: {e}"),
+                });
+            }
+        }
 
-        self.conn
+        match self
+            .conn
             .stream_shutdown(stream_id.as_u64(), quiche::Shutdown::Read, 0x00)
-            .map_err(|e| TransportError::StreamResetFailed {
-                id: self.id,
-                stream_id,
-                reason: format!("failed to shutdown stream read side: {e}"),
-            })?;
+        {
+            Ok(()) | Err(quiche::Error::Done) => {}
+            Err(e) => {
+                return Err(TransportError::StreamResetFailed {
+                    id: self.id,
+                    stream_id,
+                    reason: format!("failed to shutdown stream read side: {e}"),
+                });
+            }
+        }
 
         state.local_write_closed = true;
         state.remote_write_closed = true;
@@ -574,7 +604,7 @@ impl QuicConnection {
 
         self.state = ConnectionState::Closing;
         let mut drain_events = Vec::new();
-        self.drain_send_queue(&mut drain_events)?;
+        self.drain_send_queue(&mut drain_events);
         self.flush(socket, pending_datagrams, max_pending_datagrams)?;
         Ok(())
     }
@@ -639,7 +669,7 @@ impl QuicConnection {
             }
         }
 
-        self.drain_send_queue(events)?;
+        self.drain_send_queue(events);
         self.flush(socket, pending_datagrams, max_pending_datagrams)?;
         self.gc_closed_streams();
         Ok(())
@@ -697,13 +727,17 @@ impl QuicConnection {
     }
 
     /// Pushes queued stream writes into quiche, handling partial writes.
-    fn drain_send_queue(&mut self, events: &mut Vec<TransportEvent>) -> Result<(), TransportError> {
+    ///
+    /// Never fails the caller: a stopped stream loses only its own queue, a
+    /// write still waiting on peer credit stays queued for a later drain, and
+    /// any other quiche error closes only this connection.
+    fn drain_send_queue(&mut self, events: &mut Vec<TransportEvent>) {
         let stream_ids: Vec<u64> = self.stream_states.keys().copied().collect();
 
         for raw_stream_id in stream_ids {
             loop {
                 let stream_id = StreamId::new(raw_stream_id);
-                let written = {
+                let result = {
                     let (conn, stream_states) = (&mut self.conn, &mut self.stream_states);
                     let Some(state) = stream_states.get_mut(&raw_stream_id) else {
                         break;
@@ -716,16 +750,23 @@ impl QuicConnection {
                         .get(front.offset..)
                         .expect("pending write offsets advance only within their buffers");
                     let fin = front.fin && payload.is_empty();
-                    match conn.stream_send(raw_stream_id, payload, fin) {
-                        Ok(written) => written,
-                        Err(quiche::Error::Done) => break,
-                        Err(e) => {
-                            return Err(TransportError::StreamSendFailed {
-                                id: self.id,
-                                stream_id,
-                                reason: format!("stream_send error: {e}"),
-                            });
-                        }
+                    conn.stream_send(raw_stream_id, payload, fin)
+                };
+                let written = match result {
+                    Ok(written) => written,
+                    // Out of flow-control or stream-count credit: the peer's
+                    // next MAX_* frame lets a later drain continue.
+                    Err(quiche::Error::Done | quiche::Error::StreamLimit) => break,
+                    Err(quiche::Error::StreamStopped(error_code)) => {
+                        self.note_write_stopped(stream_id, error_code, events);
+                        break;
+                    }
+                    Err(e) => {
+                        self.fail_connection(
+                            format!("stream_send error on {stream_id}: {e}"),
+                            events,
+                        );
+                        return;
                     }
                 };
 
@@ -750,8 +791,56 @@ impl QuicConnection {
                 self.note_stream_closed_if_finished(stream_id, events);
             }
         }
+    }
 
-        Ok(())
+    /// The peer sent STOP_SENDING: our write half is gone for good, so queued
+    /// writes are dropped. The read half stays open until the peer finishes.
+    ///
+    /// Emits `StreamWriteStopped` once: afterwards the queue is empty and the
+    /// write side is closed, so neither the drain nor `send_stream` can reach
+    /// quiche for this stream again.
+    fn note_write_stopped(
+        &mut self,
+        stream_id: StreamId,
+        error_code: u64,
+        events: &mut Vec<TransportEvent>,
+    ) {
+        let Some(state) = self.stream_states.get_mut(&stream_id.as_u64()) else {
+            return;
+        };
+        let dropped = state
+            .pending_writes
+            .iter()
+            .map(|write| write.bytes.len().saturating_sub(write.offset))
+            .sum::<usize>();
+        state.pending_writes.clear();
+        self.pending_write_bytes = self.pending_write_bytes.saturating_sub(dropped);
+        state.local_write_closed = true;
+        events.push(TransportEvent::StreamWriteStopped {
+            id: self.id,
+            stream_id,
+            error_code,
+        });
+        self.note_stream_closed_if_finished(stream_id, events);
+    }
+
+    /// Closes this connection after an error quiche did not scope to a single
+    /// stream. The transport reports `Closed` once quiche finishes draining.
+    fn fail_connection(&mut self, message: String, events: &mut Vec<TransportEvent>) {
+        events.push(TransportEvent::Error {
+            id: self.id,
+            message,
+        });
+        // 0x1 is QUIC's INTERNAL_ERROR. `Done` means quiche is already closing.
+        if let Err(error) = self.conn.close(false, 0x1, b"stream send failed")
+            && error != quiche::Error::Done
+        {
+            events.push(TransportEvent::Error {
+                id: self.id,
+                message: format!("failed to close after stream send error: {error}"),
+            });
+        }
+        self.state = ConnectionState::Closing;
     }
 
     /// Emits IncomingStream for remote-initiated streams not yet notified.

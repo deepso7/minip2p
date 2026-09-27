@@ -34,6 +34,17 @@ pub enum TransportEvent {
         id: ConnectionId,
         stream_id: StreamId,
     },
+    /// The remote peer asked us to stop sending (QUIC STOP_SENDING).
+    ///
+    /// Our write side is closed for good and any queued writes were dropped;
+    /// the read side stays open, so `StreamData` and `StreamRemoteWriteClosed`
+    /// may still follow. Emitted at most once per stream. Yamux has no
+    /// equivalent, so byte-stream transports never emit it.
+    StreamWriteStopped {
+        id: ConnectionId,
+        stream_id: StreamId,
+        error_code: u64,
+    },
     /// Both sides of the stream are closed. No further events for this stream.
     StreamClosed {
         id: ConnectionId,

@@ -9,7 +9,7 @@ This crate defines the transport abstraction that concrete adapters implement â€
 - `Transport` trait with a `poll(now)`-based event model; the host supplies the time.
 - `ConnectionId` and `StreamId` identifiers, with `ConnectionNamespace` keeping each transport's id space disjoint.
 - Connection lifecycle events (`Connected`, `Closed`, `IncomingConnection`, `PeerIdentityVerified`, `Listening`).
-- Stream lifecycle events (`StreamOpened`, `IncomingStream`, `StreamData`, `StreamRemoteWriteClosed`, `StreamClosed`).
+- Stream lifecycle events (`StreamOpened`, `IncomingStream`, `StreamData`, `StreamRemoteWriteClosed`, `StreamWriteStopped`, `StreamClosed`). `StreamWriteStopped` is QUIC's STOP_SENDING; byte-stream transports never emit it.
 - Host intents via trait methods: `dial`, `listen`, `open_stream`, `send_stream`, `close_stream_write`, `reset_stream`, `close`.
 - Typed error model with transport, connection, and stream context.
 

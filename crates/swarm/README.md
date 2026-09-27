@@ -37,7 +37,7 @@ Orchestration layer that composes minip2p's protocol state machines into a singl
 - Connection lifecycle events: `ConnectionEstablished`, and `ConnectionClosed` with `Transport` or `Superseded` cause. Exact remote transport addresses remain queryable by `ConnectionId`, so policy never accidentally inspects a last-wins replacement connection.
 - Identify lifecycle: `IdentifyReceived { peer_id, info }` with observed-addr populated from the transport endpoint.
 - Ping lifecycle: `PingRttMeasured`, `PingTimeout`.
-- User-stream lifecycle: `StreamReady`, `StreamData`, `StreamRemoteWriteClosed`, `StreamClosed`.
+- User-stream lifecycle: `StreamReady`, `StreamData`, `StreamRemoteWriteClosed`, `StreamWriteStopped`, `StreamClosed`. A write stop on an identify, ping, or still-negotiating stream resets it instead.
 - Synthetic-`PeerId` path for transports that don't authenticate the remote at handshake time; promotes the id to the verified one via `TransportEvent::PeerIdentityVerified`, migrating all per-peer state and buffered events atomically.
 
 ## Sans-I/O usage

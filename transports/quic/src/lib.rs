@@ -33,6 +33,8 @@ pub(crate) struct PendingDatagram {
 
 mod config;
 mod connection;
+#[cfg(test)]
+mod stream_send_tests;
 
 pub use config::{QuicLimits, QuicNodeConfig};
 

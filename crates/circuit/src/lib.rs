@@ -377,6 +377,21 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
         }
     }
 
+    /// Delivers a relay-side STOP_SENDING on a bridge stream.
+    ///
+    /// A bridge that can no longer carry our bytes cannot carry the circuit
+    /// either, so the circuit fails and the bridge is reset.
+    pub fn inject_bridge_write_stopped(
+        &mut self,
+        inner_conn: ConnectionId,
+        bridge_stream: StreamId,
+    ) {
+        if let Some(id) = self.bridge_index.get(&(inner_conn, bridge_stream)).copied() {
+            let pre_ready = self.circuits.get(&id).is_some_and(|c| !c.is_ready());
+            self.fail_circuit(id, "relay bridge write side stopped".to_string(), pre_ready);
+        }
+    }
+
     fn with_circuit<R>(
         &mut self,
         id: ConnectionId,
@@ -564,6 +579,7 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
             | TransportEvent::IncomingStream { id, .. }
             | TransportEvent::StreamData { id, .. }
             | TransportEvent::StreamRemoteWriteClosed { id, .. }
+            | TransportEvent::StreamWriteStopped { id, .. }
             | TransportEvent::StreamClosed { id, .. }
             | TransportEvent::Closed { id }
             | TransportEvent::Error { id, .. }
@@ -628,6 +644,22 @@ impl<T: Transport, E: EntropySource> CircuitTransport<T, E> {
                 } else if !self.retired_bridges.contains(&key) {
                     self.pending
                         .push_back(TransportEvent::StreamRemoteWriteClosed { id, stream_id });
+                }
+            }
+            TransportEvent::StreamWriteStopped {
+                id,
+                stream_id,
+                error_code,
+            } => {
+                let key = (id, stream_id);
+                if self.bridge_index.contains_key(&key) {
+                    self.inject_bridge_write_stopped(id, stream_id);
+                } else if !self.retired_bridges.contains(&key) {
+                    self.pending.push_back(TransportEvent::StreamWriteStopped {
+                        id,
+                        stream_id,
+                        error_code,
+                    });
                 }
             }
             TransportEvent::StreamClosed { id, stream_id } => {
@@ -2019,6 +2051,15 @@ mod tests {
                 .expect("nothing follows terminal close")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn bridge_write_stop_fails_the_circuit() {
+        let (mut a, _b, circuit_id, bridge, _a_peer, _b_peer) = setup_pair();
+
+        a.inject_bridge_write_stopped(ConnectionId::new(1), bridge);
+        let events = a.poll(Now::from_millis(0)).expect("bridge write stop");
+        assert_pre_ready_bridge_failure(&events, circuit_id);
     }
 
     #[test]
