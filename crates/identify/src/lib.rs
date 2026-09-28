@@ -615,6 +615,19 @@ mod tests {
         assert!(error_text(&events).contains("rejected"), "got {events:?}");
     }
 
+    #[test]
+    fn a_declared_length_one_over_the_maximum_is_refused() {
+        let mut framed = Vec::new();
+        write_uvarint(MAX_MESSAGE_SIZE as u64 + 1, &mut framed);
+        framed.extend_from_slice(&vec![0u8; MAX_MESSAGE_SIZE + 1]);
+
+        let events = receive(&framed);
+        assert!(
+            error_text(&events).contains("exceeds the maximum"),
+            "got {events:?}"
+        );
+    }
+
     /// The declared length is checked as a `u64` before it ever becomes a
     /// `usize`, so the error class does not depend on pointer width.
     #[test]

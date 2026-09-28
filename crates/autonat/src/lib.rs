@@ -765,6 +765,26 @@ mod tests {
         assert_eq!(client.frames.buffered(), b"pipelined");
     }
 
+    /// The header and the payload it lies about arrive in the same read, and
+    /// the allowance for pipelined bytes leaves room for both. The payload must
+    /// still never be buffered.
+    #[test]
+    fn an_over_declared_response_is_refused_before_its_payload_is_buffered() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let mut client = AutoNatClient::new(&peer_id, &[]).expect("request fits");
+        let mut chunk = Vec::new();
+        write_uvarint(MAX_MESSAGE_SIZE as u64 + 1, &mut chunk);
+        chunk.extend_from_slice(&vec![0u8; MAX_MESSAGE_SIZE + 1]);
+
+        assert_eq!(
+            client.on_data(&chunk),
+            Err(AutoNatError::FrameTooLarge {
+                len: MAX_MESSAGE_SIZE as u64 + 1
+            })
+        );
+        assert!(client.frames.buffered().is_empty());
+    }
+
     #[test]
     fn an_oversized_chunk_is_refused_before_it_is_buffered() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();

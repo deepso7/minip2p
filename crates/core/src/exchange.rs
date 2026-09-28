@@ -7,13 +7,14 @@
 //! states, errors and policy for what may follow a frame.
 //!
 //! The receive buffer is bounded. A frame whose declared length is over the
-//! maximum is rejected from its header alone by [`decode_frame`], and bytes
-//! that could never become a legal frame are refused before they are copied in,
-//! so a peer cannot grow the buffer by sending a prefix it never completes.
+//! maximum is refused from its header, before its payload is copied in, and so
+//! are bytes that could never become a legal frame — so a peer can neither make
+//! us hold an oversized frame nor grow the buffer with a prefix it never
+//! completes.
 
 use alloc::vec::Vec;
 
-use minip2p_identity::uvarint_len;
+use minip2p_identity::{read_uvarint, uvarint_len};
 use thiserror::Error;
 
 use crate::frame::{FrameDecode, decode_frame, encode_frame};
@@ -45,6 +46,9 @@ pub enum FrameFault {
     #[error(transparent)]
     Wire(#[from] WireError),
 }
+
+/// The longest a canonical uvarint length prefix can be.
+const MAX_PREFIX_LEN: usize = 10;
 
 /// Buffers one side of a framed exchange: bytes to send, bytes received, and
 /// the decode loop between them.
@@ -116,8 +120,19 @@ impl FrameExchange {
     /// Buffers received bytes.
     ///
     /// Refuses them — before copying — when they could not be part of a legal
-    /// frame, so an unbounded chunk is never held.
+    /// frame: either the header already declares more than the maximum, or the
+    /// buffer would grow past what one frame plus its allowance can need. An
+    /// oversized frame is therefore never held, and neither is a prefix a peer
+    /// never completes.
     pub fn push(&mut self, data: &[u8]) -> Result<(), FrameFault> {
+        if let Some(declared) = self.declared_len(data)
+            && declared > self.max_len as u64
+        {
+            return Err(FrameFault::TooLarge {
+                len: declared,
+                max: self.max_len,
+            });
+        }
         let len = self.recv.len().saturating_add(data.len());
         if len > self.recv_limit {
             return Err(FrameFault::Overflow {
@@ -156,6 +171,26 @@ impl FrameExchange {
         };
         self.recv.drain(..consumed);
         decoded.map(Some)
+    }
+
+    /// The payload length the next frame declares, once enough of its header
+    /// has arrived to read one.
+    ///
+    /// The receive buffer always starts on a frame boundary, because
+    /// [`next_frame`](Self::next_frame) drains exactly one frame, so the bytes
+    /// in hand followed by `data` begin with the next frame's prefix. A header
+    /// that is still incomplete, or malformed, reads as `None` and is left to
+    /// [`next_frame`](Self::next_frame) to report.
+    fn declared_len(&self, data: &[u8]) -> Option<u64> {
+        let mut head = [0u8; MAX_PREFIX_LEN];
+        let mut len = 0;
+        for (slot, byte) in head.iter_mut().zip(self.recv.iter().chain(data)) {
+            *slot = *byte;
+            len += 1;
+        }
+        read_uvarint(head.get(..len)?)
+            .ok()
+            .map(|(declared, _)| declared)
     }
 
     /// The bytes received but not yet consumed by [`next_frame`](Self::next_frame).
@@ -204,12 +239,50 @@ mod tests {
     }
 
     #[test]
-    fn declared_len_above_max_is_rejected_from_the_header() {
+    fn declared_len_above_max_is_refused_from_the_header() {
         let mut ex = FrameExchange::new(MAX);
         // 8193 as a minimal uvarint, with no payload behind it.
-        ex.push(&[0x81, 0x40]).expect("two bytes fit");
         assert_eq!(
-            ex.next_frame(identity).unwrap_err(),
+            ex.push(&[0x81, 0x40]).unwrap_err(),
+            FrameFault::TooLarge {
+                len: MAX as u64 + 1,
+                max: MAX
+            }
+        );
+        assert!(ex.buffered().is_empty());
+    }
+
+    /// The header and the payload it lies about can arrive together, and the
+    /// allowance for trailing bytes can leave room for both. The payload must
+    /// still never be copied in.
+    #[test]
+    fn an_over_declared_frame_is_refused_before_its_payload_is_buffered() {
+        let mut ex = FrameExchange::with_trailing(MAX, MAX);
+        let mut chunk = vec![0x81, 0x40];
+        chunk.extend_from_slice(&vec![0u8; MAX + 1]);
+        assert!(
+            chunk.len() < MAX + PREFIX + MAX,
+            "the chunk fits the receive limit, so only the header can refuse it"
+        );
+
+        assert_eq!(
+            ex.push(&chunk).unwrap_err(),
+            FrameFault::TooLarge {
+                len: MAX as u64 + 1,
+                max: MAX
+            }
+        );
+        assert!(ex.buffered().is_empty());
+    }
+
+    #[test]
+    fn a_header_split_across_reads_is_refused_once_it_can_be_read() {
+        let mut ex = FrameExchange::new(MAX);
+        ex.push(&[0x81])
+            .expect("half a header declares nothing yet");
+
+        assert_eq!(
+            ex.push(&[0x40]).unwrap_err(),
             FrameFault::TooLarge {
                 len: MAX as u64 + 1,
                 max: MAX
