@@ -351,6 +351,33 @@ fn relay_addresses_are_tried_until_the_relay_is_reached() {
 }
 
 #[test]
+fn a_relays_addresses_split_its_share_not_the_next_relays() {
+    // A's second address is listed after B; it is still tried with A.
+    let mut w = relays_with(|a, b| {
+        vec![
+            relay_addr("/ip4/203.0.113.1/udp/4001/quic-v1", a),
+            relay_addr("/ip4/203.0.113.2/udp/4001/quic-v1", b),
+            relay_addr("/ip4/203.0.113.1/tcp/4001", a),
+        ]
+    });
+    let target = w.target.clone();
+    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    drain_actions(&mut w.agent);
+
+    // A never answers on either address; together they use A's half of the
+    // 12 s leg, and B still gets the other half.
+    w.agent.handle_tick(at(3_000));
+    w.agent.handle_tick(at(5_999));
+    assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &w.b), 0);
+    w.agent.handle_tick(at(6_000));
+    assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &w.b), 1);
+    assert!(
+        drain_events(&mut w.agent).is_empty(),
+        "the leg is still live"
+    );
+}
+
+#[test]
 fn late_failure_of_a_relays_first_address_dials_its_next() {
     let mut w = relays_with(|a, b| {
         vec![
@@ -364,13 +391,14 @@ fn late_failure_of_a_relays_first_address_dials_its_next() {
     let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
     let quic_token = dial_token_for(&drain_actions(&mut w.agent), &w.a);
 
-    // The QUIC share (a third of 12 s) elapses with the dial still in
-    // flight; the TCP entry waits on it rather than dialing A a second time.
-    w.agent.handle_tick(at(4_000));
+    // The QUIC address's part (half of A's 6 s share) elapses with the dial
+    // still in flight; the TCP entry waits on it rather than dialing A a
+    // second time.
+    w.agent.handle_tick(at(3_000));
     assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &w.a), 0);
 
     w.agent
-        .dial_result(quic_token, Err("QUIC gave up".into()), at(4_100));
+        .dial_result(quic_token, Err("QUIC gave up".into()), at(3_100));
     assert!(
         drain_actions(&mut w.agent)
             .iter()

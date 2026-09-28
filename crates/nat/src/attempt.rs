@@ -44,7 +44,8 @@ enum RelayLeg {
 /// The relay leg tries eligible relays one at a time. Each relay gets an
 /// even share of the leg's remaining time (`remaining / relays left`), so
 /// time a relay leaves unused by failing fast rolls over to the rest, and
-/// the last relay runs out the leg deadline. Any relay-scoped failure before
+/// the last relay runs out the leg deadline. A relay listed under several
+/// addresses splits its share across them. Any relay-scoped failure before
 /// the circuit carries a path, including a bridge that fails to promote,
 /// moves on to the next relay; the leg fails with the last relay's error.
 pub(crate) struct ConnectAttempt {
@@ -59,7 +60,10 @@ pub(crate) struct ConnectAttempt {
     leg_deadline: u64,
     /// The caller's deadline for the attempt, which caps `leg_deadline`.
     attempt_deadline: Option<u64>,
-    /// Absolute deadline for the current relay: the end of its share.
+    /// Absolute end of the current relay's share, across all its addresses.
+    share_deadline: u64,
+    /// Absolute deadline for the current relay address: the end of its part
+    /// of the relay's share.
     relay_deadline: Option<u64>,
     hop: Option<HopConnect>,
     dcutr: Option<DcutrResponder>,
@@ -120,6 +124,7 @@ impl ConnectAttempt {
             leg: RelayLeg::Inactive,
             leg_deadline: 0,
             attempt_deadline: legs.deadline_ms,
+            share_deadline: 0,
             relay_deadline: None,
             hop: None,
             dcutr: None,
@@ -628,16 +633,35 @@ impl ConnectAttempt {
         self.try_next_relay(shared, now);
     }
 
-    /// Starts on the next untried relay with an even share of the leg's
-    /// remaining time. Callers check that one is left.
+    /// Starts on the next untried relay entry. A relay reached for the first
+    /// time gets an even share of the leg's remaining time; its addresses
+    /// split what is left of that share. Callers check that one is left.
     fn try_next_relay(&mut self, shared: &mut Shared, now: Now) {
         let Some(relay) = self.untried.pop_front() else {
             return;
         };
-        let remaining = self.leg_deadline.saturating_sub(now.mono_ms);
-        let relays_left = self.untried.len() as u64 + 1;
-        self.relay_deadline = Some(now.mono_ms + remaining / relays_left);
         let relay_peer = relay.peer_id().clone();
+        if !self.is_relay_peer(&relay_peer) {
+            // `relay_order` keeps a relay's addresses together, so each
+            // remaining peer appears once as a run.
+            let mut peers_left = 1;
+            let mut last = &relay_peer;
+            for entry in &self.untried {
+                if entry.peer_id() != last {
+                    peers_left += 1;
+                    last = entry.peer_id();
+                }
+            }
+            let remaining = self.leg_deadline.saturating_sub(now.mono_ms);
+            self.share_deadline = now.mono_ms + remaining / peers_left;
+        }
+        let addrs_left = 1 + self
+            .untried
+            .iter()
+            .take_while(|entry| entry.peer_id() == &relay_peer)
+            .count() as u64;
+        let share_left = self.share_deadline.saturating_sub(now.mono_ms);
+        self.relay_deadline = Some(now.mono_ms + share_left / addrs_left);
         self.relay = Some(relay.clone());
 
         if let Some(protocols) = shared.ready.get(&relay_peer) {
@@ -1137,8 +1161,9 @@ impl ConnectAttempt {
 /// The relay entries a leg tries, in order: configured relays that
 /// `target_addrs` name in a `/p2p/<relay>/p2p-circuit` address first, then
 /// the rest; each in config order and once. A relay listed under several
-/// addresses keeps every entry, so an unreachable address falls through to
-/// the next one (see [`ConnectAttempt::fail_relay_leg`]).
+/// addresses keeps every entry, grouped at its first position, so an
+/// unreachable address falls through to the next one within the relay's
+/// share (see [`ConnectAttempt::try_next_relay`]).
 fn relay_order(relays: &[PeerAddr], target_addrs: &[Multiaddr]) -> VecDeque<PeerAddr> {
     let reachable_through = |relay: &PeerId| {
         target_addrs.iter().any(|addr| {
@@ -1150,10 +1175,17 @@ fn relay_order(relays: &[PeerAddr], target_addrs: &[Multiaddr]) -> VecDeque<Peer
     let (hinted, rest): (Vec<_>, Vec<_>) = relays
         .iter()
         .partition(|relay| reachable_through(relay.peer_id()));
+    let ordered: Vec<&PeerAddr> = hinted.into_iter().chain(rest).collect();
     let mut order: VecDeque<PeerAddr> = VecDeque::new();
-    for relay in hinted.into_iter().chain(rest) {
-        if !order.contains(relay) {
-            order.push_back(relay.clone());
+    for relay in &ordered {
+        if order.iter().any(|seen| seen.peer_id() == relay.peer_id()) {
+            continue;
+        }
+        // Keep a relay's addresses together so it is tried as one run.
+        for entry in ordered.iter().filter(|e| e.peer_id() == relay.peer_id()) {
+            if !order.contains(entry) {
+                order.push_back((*entry).clone());
+            }
         }
     }
     order
