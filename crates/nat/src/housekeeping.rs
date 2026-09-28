@@ -237,9 +237,15 @@ impl Prober {
         match result {
             Ok(stream) => {
                 // Our own address list has to fit in one AutoNAT frame; if it
-                // does not, there is no probe to send.
+                // does not, there is no probe to send. The stream is already
+                // open and the flight has no stream recorded yet, so reset it
+                // here — `abort_flight` only resets a stream the stage knows.
                 let Ok(machine) = AutoNatClient::new(&shared.local_peer_id, &shared.listen_addrs)
                 else {
+                    shared.push_action(NatAction::ResetStream {
+                        peer: server_peer.clone(),
+                        stream_id: stream,
+                    });
                     self.abort_flight(shared, now);
                     return;
                 };

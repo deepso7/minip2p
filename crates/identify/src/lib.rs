@@ -229,15 +229,15 @@ impl IdentifyProtocol {
         observed_addr: Option<Multiaddr>,
         listen_addrs: &[Multiaddr],
     ) -> Result<Vec<IdentifyAction>, IdentifyError> {
-        let state = self.peers.entry(peer_id.clone()).or_default();
-
-        if state.outbound_stream.is_some() {
+        if self
+            .peers
+            .get(&peer_id)
+            .is_some_and(|state| state.outbound_stream.is_some())
+        {
             return Err(IdentifyError::StreamAlreadyRegistered {
                 peer_id: peer_id.clone(),
             });
         }
-
-        state.outbound_stream = Some(stream_id);
 
         // libp2p's Identify spec prescribes multicodec-based binary
         // encoding for observed_addr and listen_addrs (see
@@ -265,8 +265,16 @@ impl IdentifyProtocol {
 
         let encoded = msg.encode();
         let mut outbound = FrameExchange::new(MAX_MESSAGE_SIZE);
+        // Everything that can fail happens before the stream is recorded: a
+        // message we refuse to send leaves no registration behind, so the next
+        // identify on this peer is not rejected as already registered.
         outbound.queue(&encoded)?;
         let data = outbound.take_outbound();
+
+        self.peers
+            .entry(peer_id.clone())
+            .or_default()
+            .outbound_stream = Some(stream_id);
 
         Ok(vec![
             IdentifyAction::Send {
@@ -647,6 +655,28 @@ mod tests {
             error_text(&events).contains("8 trailing bytes"),
             "got {events:?}"
         );
+    }
+
+    #[test]
+    fn a_refused_message_leaves_no_registered_stream() {
+        // The refusal must not consume the peer's outbound slot: a later
+        // identify on the same live peer has to be able to register.
+        let mut identify = IdentifyProtocol::new(IdentifyConfig {
+            protocol_version: "minip2p/test".into(),
+            agent_version: "x".repeat(MAX_MESSAGE_SIZE),
+            protocols: Vec::new(),
+            public_key: Vec::new(),
+        });
+        let peer = sample_peer();
+        assert!(matches!(
+            identify.register_outbound_stream(peer.clone(), StreamId::new(1), None, &[]),
+            Err(IdentifyError::MessageTooLarge(_))
+        ));
+
+        identify.config.agent_version = "minip2p-test/0.0.1".into();
+        identify
+            .register_outbound_stream(peer, StreamId::new(2), None, &[])
+            .expect("the refused attempt must not hold the slot");
     }
 
     #[test]
