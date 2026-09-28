@@ -7,10 +7,11 @@ use common::*;
 
 use minip2p_core::{PeerAddr, PeerId};
 use minip2p_nat::{
-    ConnectLegs, NatAction, NatAgent, NatConfig, NatError, NatEvent, Path, ReservationPolicy,
+    ConnectLegs, NatAction, NatAgent, NatConfig, NatError, NatEvent, Path, PromoteError,
+    ReservationPolicy,
 };
 use minip2p_relay::{HOP_PROTOCOL_ID, Status};
-use minip2p_swarm::SwarmEvent;
+use minip2p_swarm::{ConnectionCloseCause, SwarmEvent};
 use minip2p_transport::{ConnectionId, StreamId};
 
 struct World {
@@ -20,17 +21,26 @@ struct World {
     b: PeerId,
 }
 
+fn relay_addr(addr: &str, relay: &PeerId) -> PeerAddr {
+    PeerAddr::new(maddr(addr), relay.clone()).expect("valid relay addr")
+}
+
 /// An agent configured with relays `[A, B]` and no reservations.
 fn two_relays() -> World {
+    relays_with(|a, b| {
+        vec![
+            relay_addr("/ip4/203.0.113.1/udp/4001/quic-v1", a),
+            relay_addr("/ip4/203.0.113.2/udp/4001/quic-v1", b),
+        ]
+    })
+}
+
+/// An agent configured with the relay entries `relays(A, B)` returns.
+fn relays_with(relays: impl FnOnce(&PeerId, &PeerId) -> Vec<PeerAddr>) -> World {
     let a = peer(b"relay-a");
     let b = peer(b"relay-b");
     let config = NatConfig {
-        relays: vec![
-            PeerAddr::new(maddr("/ip4/203.0.113.1/udp/4001/quic-v1"), a.clone())
-                .expect("valid relay addr"),
-            PeerAddr::new(maddr("/ip4/203.0.113.2/udp/4001/quic-v1"), b.clone())
-                .expect("valid relay addr"),
-        ],
+        relays: relays(&a, &b),
         reservation_policy: ReservationPolicy::Never,
         ..NatConfig::default()
     };
@@ -256,4 +266,86 @@ fn leg_fails_with_the_last_relays_error_after_trying_all() {
     ));
     drain_actions(&mut w.agent);
     assert!(w.agent.is_idle());
+}
+
+#[test]
+fn failed_promotion_at_first_relay_moves_to_the_next() {
+    let mut w = two_relays();
+    let target = w.target.clone();
+    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    drain_actions(&mut w.agent);
+
+    let (a, b) = (w.a.clone(), w.b.clone());
+    hop_exchange(&mut w, &a, 2, Status::Ok, 10);
+    let token = promote_token(&drain_actions(&mut w.agent));
+    w.agent.promote_result(
+        token,
+        Err(PromoteError::Failed("secure-mux handshake failed".into())),
+        at(20),
+    );
+    assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &b), 1);
+    assert!(
+        drain_events(&mut w.agent).is_empty(),
+        "the leg is still live"
+    );
+
+    hop_exchange(&mut w, &b, 3, Status::Ok, 30);
+    assert_relayed_via(&mut w, &b, 31);
+}
+
+#[test]
+fn circuit_closing_before_it_establishes_moves_to_the_next_relay() {
+    let mut w = two_relays();
+    let target = w.target.clone();
+    let _ = start(&mut w.agent, 1, target.clone(), RELAY_NOW, at(0));
+    drain_actions(&mut w.agent);
+
+    let (a, b) = (w.a.clone(), w.b.clone());
+    hop_exchange(&mut w, &a, 2, Status::Ok, 10);
+    let token = promote_token(&drain_actions(&mut w.agent));
+    let circuit = ConnectionId::new(TEST_CIRCUIT_ID);
+    w.agent.promote_result(token, Ok(circuit), at(20));
+    w.agent.handle_event(
+        &SwarmEvent::ConnectionClosed {
+            peer_id: target,
+            conn_id: circuit,
+            cause: ConnectionCloseCause::Transport,
+        },
+        at(30),
+    );
+    assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &b), 1);
+    assert!(
+        drain_events(&mut w.agent).is_empty(),
+        "the leg is still live"
+    );
+}
+
+#[test]
+fn relay_addresses_are_tried_until_the_relay_is_reached() {
+    let mut w = relays_with(|a, b| {
+        vec![
+            relay_addr("/ip4/203.0.113.1/udp/4001/quic-v1", a),
+            relay_addr("/ip4/203.0.113.1/tcp/4001", a),
+            relay_addr("/ip4/203.0.113.2/udp/4001/quic-v1", b),
+        ]
+    });
+    let tcp = relay_addr("/ip4/203.0.113.1/tcp/4001", &w.a);
+    let target = w.target.clone();
+    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    let token = dial_token_for(&drain_actions(&mut w.agent), &w.a);
+    w.agent
+        .dial_result(token, Err("QUIC unreachable".into()), at(10));
+    assert!(
+        drain_actions(&mut w.agent)
+            .iter()
+            .any(|action| matches!(action, NatAction::Dial { addr, .. } if *addr == tcp)),
+        "A's TCP address is tried next"
+    );
+
+    // Reached over TCP, A refuses: its addresses are spent, B is next.
+    let (a, b) = (w.a.clone(), w.b.clone());
+    hop_exchange(&mut w, &a, 2, Status::NoReservation, 20);
+    let actions = drain_actions(&mut w.agent);
+    assert_eq!(dial_count_for(&actions, &b), 1);
+    assert!(!has_hop_open(&actions), "A is not asked again");
 }

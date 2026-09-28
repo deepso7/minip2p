@@ -44,8 +44,9 @@ enum RelayLeg {
 /// The relay leg tries eligible relays one at a time. Each relay gets an
 /// even share of the leg's remaining time (`remaining / relays left`), so
 /// time a relay leaves unused by failing fast rolls over to the rest, and
-/// the last relay runs out the leg deadline. Any relay-scoped failure moves
-/// on to the next relay; the leg fails with the last relay's error.
+/// the last relay runs out the leg deadline. Any relay-scoped failure before
+/// the circuit carries a path, including a bridge that fails to promote,
+/// moves on to the next relay; the leg fails with the last relay's error.
 pub(crate) struct ConnectAttempt {
     id: ConnectId,
     peer: PeerId,
@@ -361,9 +362,14 @@ impl ConnectAttempt {
             return;
         }
         if self.promoted == Some(conn_id) {
+            let error = NatError::DialFailed("promoted circuit closed".into());
+            if self.best.is_none() {
+                // The circuit closed before it carried a path.
+                self.fail_bridge(shared, error, now);
+                return;
+            }
             self.promoted = None;
             self.bridge_alive = false;
-            let error = NatError::DialFailed("promoted circuit closed".into());
             self.last_error = Some(error.clone());
             if self.punch_deadline.is_some() {
                 return;
@@ -395,7 +401,7 @@ impl ConnectAttempt {
                     now,
                 );
             }
-            RelayLeg::Bridged { .. } => self.on_bridge_lost(shared),
+            RelayLeg::Bridged { .. } => self.on_bridge_lost(shared, now),
             _ => {}
         }
     }
@@ -947,13 +953,13 @@ impl ConnectAttempt {
                     now,
                 );
             }
-            RelayLeg::Bridged { stream: s } if s == stream => self.on_bridge_lost(shared),
+            RelayLeg::Bridged { stream: s } if s == stream => self.on_bridge_lost(shared, now),
             _ => {}
         }
     }
 
     /// The bridge died (stream closed or relay connection lost).
-    fn on_bridge_lost(&mut self, shared: &mut Shared) {
+    fn on_bridge_lost(&mut self, shared: &mut Shared, now: Now) {
         if !self.bridge_alive {
             return;
         }
@@ -965,10 +971,16 @@ impl ConnectAttempt {
             shared.release_stream(&relay_peer, stream);
             self.bridge_released = true;
         }
+        let error = NatError::DialFailed("relay bridge lost before the attempt settled".into());
+        if self.best.is_none() && !self.promotion_requested {
+            // No path and no promotion outcome to wait for: this relay is done.
+            self.fail_bridge(shared, error, now);
+            return;
+        }
+        // A requested promotion still reports its outcome, which settles
+        // the relay (see `on_promote_result`).
         self.leg = RelayLeg::Failed;
-        self.last_error = Some(NatError::DialFailed(
-            "relay bridge lost before the attempt settled".into(),
-        ));
+        self.last_error = Some(error);
         // If punch windows are already running, the punch itself may still
         // succeed via `ConnectionEstablished`; the window deadline settles
         // the rest.
@@ -978,7 +990,7 @@ impl ConnectAttempt {
         &mut self,
         result: Result<ConnectionId, PromoteError>,
         shared: &mut Shared,
-        _now: Now,
+        now: Now,
     ) {
         match result {
             Ok(conn_id) => self.promoted = Some(conn_id),
@@ -986,18 +998,35 @@ impl ConnectAttempt {
                 self.bridge_alive = false;
                 self.leg = RelayLeg::Failed;
             }
-            Err(error) => {
-                self.bridge_alive = false;
-                self.leg = RelayLeg::Failed;
-                self.last_error = Some(NatError::Protocol(error.to_string()));
-                self.fail_if_no_legs_remain(shared);
-            }
+            Err(error) => self.fail_bridge(shared, NatError::Protocol(error.to_string()), now),
         }
+    }
+
+    /// The bridge failed before the circuit carried a path. Clears the
+    /// bridge state and fails the relay like any other relay-scoped failure,
+    /// so the leg moves on while it has relays and time left.
+    fn fail_bridge(&mut self, shared: &mut Shared, error: NatError, now: Now) {
+        self.bridge_alive = false;
+        self.bridge_released = false;
+        self.promoted = None;
+        self.promotion_requested = false;
+        self.bridge_remote_write_closed = false;
+        self.bridge_pending_data.clear();
+        self.fail_relay_leg(shared, error, now);
     }
 
     /// The current relay failed: move on to the next one while the leg has
     /// time left, otherwise fail the leg with `error`.
+    ///
+    /// Other addresses of the same relay stay eligible only while the relay
+    /// is unreached: once connected, every entry for it would reuse that
+    /// connection and repeat the same failure.
     fn fail_relay_leg(&mut self, shared: &mut Shared, error: NatError, now: Now) {
+        if let Some(relay_peer) = self.relay_peer().cloned()
+            && shared.is_connected(&relay_peer)
+        {
+            self.untried.retain(|relay| relay.peer_id() != &relay_peer);
+        }
         match self.leg {
             RelayLeg::WaitHopReady { stream } | RelayLeg::AwaitHopStatus { stream } => {
                 if let Some(relay_peer) = self.relay_peer().cloned() {
@@ -1099,9 +1128,11 @@ impl ConnectAttempt {
     }
 }
 
-/// The relays a leg tries, in order: configured relays that `target_addrs`
-/// name in a `/p2p/<relay>/p2p-circuit` address first, then the rest; each
-/// in config order and once.
+/// The relay entries a leg tries, in order: configured relays that
+/// `target_addrs` name in a `/p2p/<relay>/p2p-circuit` address first, then
+/// the rest; each in config order and once. A relay listed under several
+/// addresses keeps every entry, so an unreachable address falls through to
+/// the next one (see [`ConnectAttempt::fail_relay_leg`]).
 fn relay_order(relays: &[PeerAddr], target_addrs: &[Multiaddr]) -> VecDeque<PeerAddr> {
     let reachable_through = |relay: &PeerId| {
         target_addrs.iter().any(|addr| {
@@ -1115,7 +1146,7 @@ fn relay_order(relays: &[PeerAddr], target_addrs: &[Multiaddr]) -> VecDeque<Peer
         .partition(|relay| reachable_through(relay.peer_id()));
     let mut order: VecDeque<PeerAddr> = VecDeque::new();
     for relay in hinted.into_iter().chain(rest) {
-        if !order.iter().any(|seen| seen.peer_id() == relay.peer_id()) {
+        if !order.contains(relay) {
             order.push_back(relay.clone());
         }
     }
