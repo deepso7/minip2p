@@ -501,9 +501,14 @@ impl ConnectAttempt {
                     self.punch_conns.insert(conn_id);
                 }
             }
-            // A dial toward a relay the leg already moved on from is stale.
+            // A dial failure matters only while the leg waits on it: once
+            // another connection to the relay made it ready, or the leg moved
+            // on, the failure is stale.
             Err(reason) => match purpose {
-                TokenPurpose::RelayDial(_, dialed) if self.relay.as_ref() == Some(dialed) => {
+                TokenPurpose::RelayDial(_, dialed)
+                    if self.leg == RelayLeg::WaitRelayReady
+                        && self.relay.as_ref() == Some(dialed) =>
+                {
                     self.fail_relay_leg(shared, NatError::DialFailed(reason), now);
                 }
                 // An earlier address of the current relay gave up after the

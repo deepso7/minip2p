@@ -223,6 +223,41 @@ fn late_dial_failure_from_an_abandoned_relay_is_ignored() {
 }
 
 #[test]
+fn dial_failure_after_the_relay_became_ready_is_ignored() {
+    let mut w = two_relays();
+    let target = w.target.clone();
+    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    let a_token = dial_token_for(&drain_actions(&mut w.agent), &w.a);
+
+    // Another connection to A lands and becomes ready; the leg opens HOP.
+    w.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            peer_id: w.a.clone(),
+            conn_id: ConnectionId::new(9),
+        },
+        at(10),
+    );
+    w.agent.handle_event(
+        &SwarmEvent::PeerReady {
+            peer_id: w.a.clone(),
+            protocols: vec![HOP_PROTOCOL_ID.to_string()],
+        },
+        at(10),
+    );
+    assert!(has_hop_open(&drain_actions(&mut w.agent)));
+
+    // The attempt's own dial to A fails afterwards.
+    w.agent
+        .dial_result(a_token, Err("superseded".into()), at(20));
+    assert_eq!(
+        dial_count_for(&drain_actions(&mut w.agent), &w.b),
+        0,
+        "the HOP on A is kept"
+    );
+    assert!(drain_events(&mut w.agent).is_empty());
+}
+
+#[test]
 fn no_reservation_at_first_relay_moves_to_the_next() {
     let mut w = two_relays();
     let target = w.target.clone();
