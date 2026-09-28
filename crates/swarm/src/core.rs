@@ -839,6 +839,13 @@ impl SwarmCore {
             TransportEvent::StreamRemoteWriteClosed { id, stream_id } => {
                 self.handle_stream_remote_write_closed(id, stream_id);
             }
+            TransportEvent::StreamWriteStopped {
+                id,
+                stream_id,
+                error_code,
+            } => {
+                self.handle_stream_write_stopped(id, stream_id, error_code);
+            }
             TransportEvent::StreamClosed { id, stream_id } => {
                 self.handle_stream_closed(id, stream_id);
             }
@@ -1384,6 +1391,7 @@ impl SwarmCore {
                 | SwarmEvent::StreamReady { peer_id, .. }
                 | SwarmEvent::StreamData { peer_id, .. }
                 | SwarmEvent::StreamRemoteWriteClosed { peer_id, .. }
+                | SwarmEvent::StreamWriteStopped { peer_id, .. }
                 | SwarmEvent::StreamClosed { peer_id, .. } => {
                     if peer_id == old {
                         *peer_id = new.clone();
@@ -1521,6 +1529,38 @@ impl SwarmCore {
                     stream_id,
                 });
             }
+        }
+    }
+
+    /// User streams surface the stop to the application. Internal protocols
+    /// and in-flight negotiations cannot finish without writing, so their
+    /// stream is reset; the resulting `StreamClosed` tears them down.
+    fn handle_stream_write_stopped(
+        &mut self,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        error_code: u64,
+    ) {
+        let key = (conn_id, stream_id);
+        if self.abandoned_streams.contains(&key) {
+            return;
+        }
+        if let Some(ProtocolKind::User(_)) = self.stream_owner.get(&key) {
+            let peer_id = self.ensure_peer_id_for_conn(conn_id);
+            self.events.push_back(SwarmEvent::StreamWriteStopped {
+                peer_id,
+                conn_id,
+                stream_id,
+                error_code,
+            });
+            return;
+        }
+        let known = self.stream_owner.contains_key(&key)
+            || self.inbound_negotiators.contains_key(&key)
+            || self.outbound_negotiators.contains_key(&key);
+        if known && self.reset_pending.insert(key) {
+            self.actions
+                .push_back(SwarmAction::ResetStream { conn_id, stream_id });
         }
     }
 
@@ -2914,6 +2954,53 @@ mod tests {
             actions.as_slice(),
             [SwarmAction::SendStream { conn_id, stream_id: sid, data }]
                 if *conn_id == original_conn && *sid == stream_id && data == b"ok"
+        ));
+    }
+
+    #[test]
+    fn write_stop_surfaces_on_user_streams_and_resets_internal_ones() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"write-stop-peer");
+        let conn_id = ConnectionId::new(12);
+        let user = StreamId::new(4);
+        let ping = StreamId::new(8);
+        core.conn_to_peer.insert(conn_id, peer_id.clone());
+        core.peer_to_conn.insert(peer_id.clone(), conn_id);
+        core.stream_owner.insert(
+            (conn_id, user),
+            ProtocolKind::User("/minip2p/test/1.0.0".into()),
+        );
+        core.stream_owner
+            .insert((conn_id, ping), ProtocolKind::Ping);
+
+        for stream_id in [user, ping] {
+            feed(
+                &mut core,
+                TransportEvent::StreamWriteStopped {
+                    id: conn_id,
+                    stream_id,
+                    error_code: 7,
+                },
+            );
+        }
+
+        let mut actions = Vec::new();
+        let mut events = Vec::new();
+        while let Some(output) = core.poll_output() {
+            match output {
+                SwarmOutput::Action(action) => actions.push(action),
+                SwarmOutput::Event(event) => events.push(event),
+            }
+        }
+        assert!(matches!(
+            events.as_slice(),
+            [SwarmEvent::StreamWriteStopped { peer_id: stopped_peer, conn_id: stopped_conn, stream_id, error_code: 7 }]
+                if *stopped_peer == peer_id && *stopped_conn == conn_id && *stream_id == user
+        ));
+        assert!(matches!(
+            actions.as_slice(),
+            [SwarmAction::ResetStream { conn_id: reset_conn, stream_id }]
+                if *reset_conn == conn_id && *stream_id == ping
         ));
     }
 

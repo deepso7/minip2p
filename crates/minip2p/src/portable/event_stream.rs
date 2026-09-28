@@ -81,6 +81,16 @@ pub enum EndpointEvent {
         conn_id: ConnectionId,
         stream_id: StreamId,
     },
+    /// The remote asked us to stop sending on a user stream.
+    ///
+    /// Writes to the stream now fail and any queued bytes were dropped; the
+    /// read side stays open until `StreamClosed`. Only QUIC emits this.
+    StreamWriteStopped {
+        peer_id: PeerId,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        error_code: u64,
+    },
     /// A user stream was fully closed.
     StreamClosed {
         peer_id: PeerId,
@@ -143,6 +153,7 @@ impl EndpointEvent {
             Self::StreamReady { peer_id: peer, stream_id: stream, .. }
                 | Self::StreamData { peer_id: peer, stream_id: stream, .. }
                 | Self::StreamRemoteWriteClosed { peer_id: peer, stream_id: stream, .. }
+                | Self::StreamWriteStopped { peer_id: peer, stream_id: stream, .. }
                 | Self::StreamClosed { peer_id: peer, stream_id: stream, .. }
                 if peer == peer_id && *stream == stream_id
         )
@@ -204,6 +215,17 @@ impl From<SwarmEvent> for EndpointEvent {
                 peer_id,
                 conn_id,
                 stream_id,
+            },
+            SwarmEvent::StreamWriteStopped {
+                peer_id,
+                conn_id,
+                stream_id,
+                error_code,
+            } => Self::StreamWriteStopped {
+                peer_id,
+                conn_id,
+                stream_id,
+                error_code,
             },
             SwarmEvent::StreamClosed {
                 peer_id,

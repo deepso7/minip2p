@@ -100,6 +100,7 @@ impl RelayServerDriver {
             | SwarmEvent::StreamReady { conn_id, .. }
             | SwarmEvent::StreamData { conn_id, .. }
             | SwarmEvent::StreamRemoteWriteClosed { conn_id, .. }
+            | SwarmEvent::StreamWriteStopped { conn_id, .. }
             | SwarmEvent::StreamClosed { conn_id, .. } => conn_id.is_circuit(),
             _ => false,
         };

@@ -31,6 +31,7 @@ Start from the observable symptom. Rust methods return immediate failures as `mi
 | `EndpointEvent::StreamReady` | Attach the stream to its protocol handler. |
 | `EndpointEvent::StreamData` | Feed the bytes into the application's decoder. |
 | `EndpointEvent::StreamRemoteWriteClosed` | Finish decoding and optionally close the local write side. |
+| `EndpointEvent::StreamWriteStopped` | Stop writing: the peer refused further bytes (QUIC STOP_SENDING). Keep reading until `StreamClosed`. |
 | `EndpointEvent::Error` | Record the structured context and decide whether to retry. |
 | `NatEvent::PathEstablished` | Begin traffic with the ordinary stream methods. |
 | `NatEvent::PathUpgraded` | Update path state. Existing peer operations keep working. |

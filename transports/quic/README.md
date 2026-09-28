@@ -14,7 +14,8 @@ No async runtime required. The host drives the transport by calling `poll(now)` 
   - `send_stream`
   - `close_stream_write`
   - `reset_stream`
-- Stream events (`StreamOpened`, `IncomingStream`, `StreamData`, `StreamRemoteWriteClosed`, `StreamClosed`).
+- Stream events (`StreamOpened`, `IncomingStream`, `StreamData`, `StreamRemoteWriteClosed`, `StreamWriteStopped`, `StreamClosed`).
+- Stream errors stay stream-scoped: a peer's STOP_SENDING drops that stream's queued writes and emits `StreamWriteStopped` while the read half stays open; writes waiting on peer credit stay queued; any other quiche stream-send error hit while draining closes only its connection. A quiche packet-send failure can still fail `poll()`.
 - Mutual libp2p TLS peer authentication. Dialing and listening require a configured Ed25519 keypair.
 - Automatic peer-id verification from libp2p TLS certificates. `Connected` carries the verified endpoint; `PeerIdentityVerified` is also emitted when the peer index is bound or updated.
 - `QuicNodeConfig` is identity-first: constructing a transport requires an Ed25519 host keypair.

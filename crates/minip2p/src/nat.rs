@@ -682,6 +682,9 @@ impl<E: EntropySource> NatDriver<E> {
             | SwarmEvent::StreamRemoteWriteClosed {
                 conn_id, stream_id, ..
             }
+            | SwarmEvent::StreamWriteStopped {
+                conn_id, stream_id, ..
+            }
             | SwarmEvent::StreamClosed {
                 conn_id, stream_id, ..
             } => (*conn_id, *stream_id),
@@ -699,11 +702,14 @@ impl<E: EntropySource> NatDriver<E> {
             SwarmEvent::StreamRemoteWriteClosed { .. } => swarm
                 .transport_mut()
                 .inject_bridge_remote_write_closed(key.0, key.1),
+            SwarmEvent::StreamWriteStopped { .. } => swarm
+                .transport_mut()
+                .inject_bridge_write_stopped(key.0, key.1),
             SwarmEvent::StreamClosed { .. } => {
                 swarm.transport_mut().inject_bridge_closed(key.0, key.1);
                 self.promoted.remove(&key);
             }
-            // `key` was extracted above only for these three stream events.
+            // `key` was extracted above only for these stream events.
             // Keep this defensive if a new swarm event reaches this path.
             _ => return false,
         }
@@ -766,6 +772,7 @@ pub(crate) trait NatTransport: Transport {
     }
     fn inject_bridge_closed(&mut self, _conn: ConnectionId, _stream: StreamId) {}
     fn inject_bridge_remote_write_closed(&mut self, _conn: ConnectionId, _stream: StreamId) {}
+    fn inject_bridge_write_stopped(&mut self, _conn: ConnectionId, _stream: StreamId) {}
     fn inject_bridge_data(&mut self, _conn: ConnectionId, _stream: StreamId, _data: Vec<u8>) {}
     #[cfg(feature = "_circuit-driver")]
     fn adopt_bridge(&mut self, _adoption: BridgeAdoption) -> Result<ConnectionId, AdoptError> {
@@ -791,6 +798,9 @@ impl<T: Transport, E: EntropySource> NatTransport for CircuitTransport<T, E> {
     }
     fn inject_bridge_remote_write_closed(&mut self, conn: ConnectionId, stream: StreamId) {
         self.inject_bridge_remote_write_closed(conn, stream);
+    }
+    fn inject_bridge_write_stopped(&mut self, conn: ConnectionId, stream: StreamId) {
+        self.inject_bridge_write_stopped(conn, stream);
     }
     fn inject_bridge_data(&mut self, conn: ConnectionId, stream: StreamId, data: Vec<u8>) {
         self.inject_bridge_data(conn, stream, data);

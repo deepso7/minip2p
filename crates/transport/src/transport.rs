@@ -34,6 +34,9 @@ use crate::{ConnectionId, StreamId, TransportError, TransportEvent};
 /// - `StreamData` may be emitted zero or more times for a stream.
 /// - `StreamRemoteWriteClosed` is emitted at most once per stream when the
 ///   remote half-closes its write side.
+/// - `StreamWriteStopped` is emitted at most once per stream when the remote
+///   asks us to stop sending (QUIC only). Our write side is then closed; the
+///   read side stays open.
 /// - `StreamClosed` is emitted at most once when both sides are closed.
 ///   No further events are emitted for that stream after `StreamClosed`.
 /// - `reset_stream()` immediately closes both directions and emits

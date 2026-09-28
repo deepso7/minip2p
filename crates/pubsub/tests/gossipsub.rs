@@ -916,6 +916,37 @@ fn stream_reopen_resyncs_an_acked_unsubscribe() {
 }
 
 #[test]
+fn write_stop_resets_the_outbound_stream_and_is_claimed_on_inbound() {
+    let mut agent = agent();
+    agent.subscribe("room", 0).unwrap();
+    let remote = peer(2);
+    connect(&mut agent, &remote, &[MESHSUB_PROTOCOL_ID_V11], 0);
+    let outbound = StreamId::new(4);
+    let subscribed = make_ready(&mut agent, &remote, outbound, MESHSUB_PROTOCOL_ID_V11, 0);
+    ack(&mut agent, &remote, &subscribed, 0);
+    drain_actions(&mut agent);
+    let inbound = StreamId::new(5);
+    inbound_open(&mut agent, &remote, inbound, 0);
+    drain_actions(&mut agent);
+
+    let stopped = |stream_id| SwarmEvent::StreamWriteStopped {
+        peer_id: remote.clone(),
+        conn_id: ConnectionId::new(1),
+        stream_id,
+        error_code: 0,
+    };
+    // We never write to an inbound stream, so its stop needs no action.
+    assert!(agent.handle_event(&stopped(inbound), 1));
+    assert!(drain_actions(&mut agent).is_empty());
+
+    assert!(agent.handle_event(&stopped(outbound), 1));
+    assert!(matches!(
+        drain_actions(&mut agent).as_slice(),
+        [GossipsubAction::ResetStream { peer, stream_id }] if *peer == remote && *stream_id == outbound
+    ));
+}
+
+#[test]
 fn disconnect_preserves_backoff_and_supersede_reannounces_subscriptions() {
     let mut agent = agent();
     agent.subscribe("room", 0).unwrap();

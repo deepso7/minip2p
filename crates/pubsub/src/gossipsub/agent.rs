@@ -652,6 +652,9 @@ impl GossipsubAgent {
             SwarmEvent::StreamRemoteWriteClosed {
                 peer_id, stream_id, ..
             } => self.on_remote_write_closed(peer_id, *stream_id),
+            SwarmEvent::StreamWriteStopped {
+                peer_id, stream_id, ..
+            } => self.on_write_stopped(peer_id, *stream_id),
             SwarmEvent::StreamClosed {
                 peer_id, stream_id, ..
             } => self.on_stream_closed(peer_id, *stream_id),
@@ -1049,6 +1052,23 @@ impl GossipsubAgent {
             });
         }
         true
+    }
+
+    /// The peer refused our writes. An outbound stream can no longer carry
+    /// RPCs, so it is reset and its `StreamClosed` recovers the sender;
+    /// inbound and rejected streams are never written to.
+    fn on_write_stopped(&mut self, peer: &PeerId, stream_id: StreamId) -> bool {
+        match self.role(peer, stream_id) {
+            Some(StreamRole::Outbound) => {
+                self.actions.push_back(GossipsubAction::ResetStream {
+                    peer: peer.clone(),
+                    stream_id,
+                });
+                true
+            }
+            Some(StreamRole::Inbound | StreamRole::Rejected) => true,
+            None => false,
+        }
     }
 
     fn on_stream_closed(&mut self, peer: &PeerId, stream_id: StreamId) -> bool {
