@@ -21,8 +21,8 @@ use alloc::vec::Vec;
 use minip2p_core::write_uvarint;
 use minip2p_core::{
     FrameExchange, FrameFault, Multiaddr, PeerId, SansIoProtocol, WIRE_LEN, WIRE_VARINT, WireError,
-    encode_bytes_field, encode_nested_field, encode_varint_field, read_len_delimited, read_tag,
-    read_varint_value, skip_field,
+    encode_bytes_field, encode_varint_field, read_len_delimited, read_tag, read_varint_value,
+    skip_field,
 };
 
 /// Protocol id for AutoNAT v1.
@@ -544,10 +544,10 @@ impl Message {
         let mut out = Vec::new();
         encode_varint_field(&mut out, 1, self.kind as u64);
         if let Some(dial) = &self.dial {
-            encode_nested_field(&mut out, 2, &dial.encode());
+            encode_bytes_field(&mut out, 2, &dial.encode());
         }
         if let Some(response) = &self.dial_response {
-            encode_nested_field(&mut out, 3, &response.encode());
+            encode_bytes_field(&mut out, 3, &response.encode());
         }
         out
     }
@@ -586,7 +586,7 @@ impl Dial {
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         if let Some(peer) = &self.peer {
-            encode_nested_field(&mut out, 1, &peer.encode());
+            encode_bytes_field(&mut out, 1, &peer.encode());
         }
         out
     }

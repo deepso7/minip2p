@@ -80,15 +80,12 @@ pub fn encode_varint_field(out: &mut Vec<u8>, field: u64, value: u64) {
 }
 
 /// Writes a `(tag, length, bytes)` field for `field` with wire type [`WIRE_LEN`].
+///
+/// A nested message is encoded the same way: pass its encoded bytes.
 pub fn encode_bytes_field(out: &mut Vec<u8>, field: u64, data: &[u8]) {
     write_tag(out, field, WIRE_LEN);
     write_uvarint(data.len() as u64, out);
     out.extend_from_slice(data);
-}
-
-/// Writes a `(tag, length, nested_message)` field for `field` with wire type [`WIRE_LEN`].
-pub fn encode_nested_field(out: &mut Vec<u8>, field: u64, nested: &[u8]) {
-    encode_bytes_field(out, field, nested);
 }
 
 /// Reads the next `(field_number, wire_type)` pair from the buffer.
@@ -252,10 +249,12 @@ mod tests {
         assert_eq!(out, vec![0x0a, 0x02, b'a', b'b']);
     }
 
+    /// A nested message goes on the wire as its encoded bytes, which is why
+    /// there is no separate helper for it.
     #[test]
-    fn encode_nested_field_is_length_delimited_bytes() {
+    fn encode_bytes_field_carries_a_nested_message() {
         let mut out = Vec::new();
-        encode_nested_field(&mut out, 2, &[0x08, 0x01]);
+        encode_bytes_field(&mut out, 2, &[0x08, 0x01]);
         assert_eq!(out, vec![0x12, 0x02, 0x08, 0x01]);
     }
 
