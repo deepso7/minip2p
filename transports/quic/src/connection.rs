@@ -85,8 +85,6 @@ pub struct QuicConnection {
     id: ConnectionId,
     /// The underlying quiche QUIC connection.
     conn: quiche::Connection,
-    /// Remote peer's socket address.
-    peer_addr: SocketAddr,
     /// Connection endpoint metadata (transport address + optional peer id).
     endpoint: ConnectionEndpoint,
     /// Current connection lifecycle state.
@@ -106,6 +104,9 @@ pub struct QuicConnection {
     /// Source CIDs the transport has entered into its routing table, so
     /// reindexing and unindexing never scan the whole table.
     indexed_cids: Vec<Vec<u8>>,
+    /// Peer's stateless reset token, once entered into the transport's reset
+    /// routing table.
+    indexed_reset_token: Option<u128>,
     /// Host time of the last packet this connection received.
     last_recv_ms: Option<u64>,
     /// An ack-eliciting keepalive has been sent since `last_recv_ms`.
@@ -120,7 +121,6 @@ impl QuicConnection {
     pub fn new(
         id: ConnectionId,
         conn: quiche::Connection,
-        peer_addr: SocketAddr,
         endpoint: ConnectionEndpoint,
         max_local_bidi_streams: u64,
         max_pending_write_bytes: usize,
@@ -130,7 +130,6 @@ impl QuicConnection {
         Self {
             id,
             conn,
-            peer_addr,
             endpoint,
             state: ConnectionState::Connecting,
             stream_states: HashMap::new(),
@@ -140,6 +139,7 @@ impl QuicConnection {
             pending_write_bytes: 0,
             max_pending_write_bytes,
             indexed_cids: Vec::new(),
+            indexed_reset_token: None,
             last_recv_ms: None,
             sent_keepalive_since_recv: false,
         }
@@ -157,6 +157,39 @@ impl QuicConnection {
         }
         self.indexed_cids.extend(new_cids.iter().cloned());
         new_cids
+    }
+
+    /// Returns source CIDs quiche has retired since the last call, dropping
+    /// them from the indexed set so the transport can unroute them.
+    ///
+    /// The transport never issues extra source CIDs (`new_scid`), so peers
+    /// have nothing to rotate onto today; this keeps the table exact if it
+    /// ever does.
+    pub fn take_retired_source_cids(&mut self) -> Vec<Vec<u8>> {
+        let mut retired = Vec::new();
+        while let Some(cid) = self.conn.retired_scid_next() {
+            self.indexed_cids.retain(|known| known != cid.as_ref());
+            retired.push(cid.to_vec());
+        }
+        retired
+    }
+
+    /// Returns the peer's stateless reset token the first time it is known
+    /// (after the peer's transport parameters arrive), recording it as indexed.
+    ///
+    /// Only servers advertise one, and it is the only token quiche checks when
+    /// deciding whether an undecryptable packet is a reset.
+    pub fn take_unindexed_reset_token(&mut self) -> Option<u128> {
+        if self.indexed_reset_token.is_some() {
+            return None;
+        }
+        self.indexed_reset_token = self.conn.peer_transport_params()?.stateless_reset_token;
+        self.indexed_reset_token
+    }
+
+    /// The reset token the transport routes to this connection, if any.
+    pub fn indexed_reset_token(&self) -> Option<u128> {
+        self.indexed_reset_token
     }
 
     /// Records a CID the transport indexed outside of quiche's source-id set
@@ -964,9 +997,5 @@ impl QuicConnection {
     /// Checks if a stream id was initiated by the remote side.
     fn is_remote_initiated_stream(&self, stream_id: u64) -> bool {
         !self.is_local_initiated_stream(stream_id)
-    }
-
-    pub fn matches_peer(&self, addr: SocketAddr) -> bool {
-        self.peer_addr == addr
     }
 }
