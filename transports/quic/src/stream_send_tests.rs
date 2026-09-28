@@ -289,6 +289,58 @@ fn stop_sending_is_reported_when_nothing_is_queued() {
 }
 
 #[test]
+fn stop_sending_is_reported_while_connection_credit_is_exhausted() {
+    let mut server = listening_server(30_000);
+    // The peer never reads, so it never raises this connection-level limit.
+    let (mut peer, id) = accept(&mut server, &mut [], |config| {
+        config.set_initial_max_data(2_000);
+    });
+
+    peer.conn.stream_send(0, b"hi", false).expect("open");
+    let mut events = Vec::new();
+    drive_until(
+        &mut server,
+        &mut [&mut peer],
+        &mut events,
+        "inbound stream",
+        |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, TransportEvent::StreamData { .. }))
+        },
+    );
+    // Use up the connection's send credit: quiche now lists no stream as
+    // writable, stopped or not.
+    server
+        .send_stream(id, StreamId::new(0), vec![7; 10_000])
+        .expect("send");
+
+    peer.conn
+        .stream_send(4, b"hi", true)
+        .expect("open and finish");
+    peer.conn
+        .stream_shutdown(4, quiche::Shutdown::Read, 5)
+        .expect("stop sending");
+    let stream = StreamId::new(4);
+    drive_until(
+        &mut server,
+        &mut [&mut peer],
+        &mut events,
+        "stream close",
+        |events| {
+            events.iter().any(|event| {
+                matches!(event, TransportEvent::StreamClosed { stream_id, .. } if *stream_id == stream)
+            })
+        },
+    );
+    assert!(events.contains(&TransportEvent::StreamWriteStopped {
+        id,
+        stream_id: stream,
+        error_code: 5,
+    }));
+}
+
+#[test]
 fn fin_waiting_for_stream_credit_stays_queued_until_granted() {
     let mut server = listening_server(30_000);
     let (mut peer, id) = accept(&mut server, &mut [], |config| {

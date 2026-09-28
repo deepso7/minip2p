@@ -361,6 +361,42 @@ fn unconfigured_peer_cannot_claim_an_inbound_stop_stream() {
 }
 
 #[test]
+fn write_stop_resets_only_nat_owned_streams() {
+    let mut h = Harness::without_relay(NatConfig::default());
+    let remote = peer(b"write-stop-peer");
+    let conn_id = ConnectionId::new(1);
+    let owned = StreamId::new(88);
+    assert!(h.agent.handle_event_with_disposition(
+        &SwarmEvent::StreamReady {
+            conn_id,
+            peer_id: remote.clone(),
+            stream_id: owned,
+            protocol_id: minip2p_relay::STOP_PROTOCOL_ID.to_string(),
+            initiated_locally: false,
+        },
+        at(0),
+    ));
+    drain_actions(&mut h.agent);
+
+    let stopped = |stream_id| SwarmEvent::StreamWriteStopped {
+        conn_id,
+        peer_id: remote.clone(),
+        stream_id,
+        error_code: 0,
+    };
+    assert!(
+        !h.agent
+            .handle_event_with_disposition(&stopped(StreamId::new(92)), at(1)),
+        "application streams stay application-visible"
+    );
+    assert!(
+        h.agent
+            .handle_event_with_disposition(&stopped(owned), at(1))
+    );
+    assert!(has_reset_for(&drain_actions(&mut h.agent), owned));
+}
+
+#[test]
 fn relay_supersede_does_not_abort_waiting_for_peer_ready() {
     let mut h = Harness::with_relay(NatConfig::default());
     h.start(RELAY_NOW, at(0));

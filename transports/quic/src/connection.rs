@@ -617,10 +617,13 @@ impl QuicConnection {
             return Ok(());
         }
 
-        // quiche marks a stream writable when STOP_SENDING arrives. Catch the
-        // stop here, before reading: once the peer's FIN is read, quiche may
-        // collect the stream and every later write would only report `Done`.
-        for raw_stream_id in self.conn.writable() {
+        // Catch STOP_SENDING before reading: once the peer's FIN is read,
+        // quiche may collect the stream and every later write would only
+        // report `Done`. quiche marks a stopped stream writable, but lists no
+        // writable streams while connection credit is exhausted, so readable
+        // streams (the ones a FIN could collect) are checked as well.
+        let candidates: Vec<u64> = self.conn.writable().chain(self.conn.readable()).collect();
+        for raw_stream_id in candidates {
             if let Err(quiche::Error::StreamStopped(error_code)) =
                 self.conn.stream_capacity(raw_stream_id)
             {
@@ -806,7 +809,7 @@ impl QuicConnection {
     /// writes are dropped. The read half stays open until the peer finishes.
     ///
     /// The stop can surface from the drain, from `send_stream`, or from the
-    /// writable scan in `poll_streams`; `StreamWriteStopped` is emitted once.
+    /// stream scan in `poll_streams`; `StreamWriteStopped` is emitted once.
     fn note_write_stopped(
         &mut self,
         stream_id: StreamId,

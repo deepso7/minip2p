@@ -707,6 +707,22 @@ impl NatAgent {
                 );
                 touched_state = handled;
             }
+            SwarmEvent::StreamWriteStopped {
+                conn_id,
+                peer_id,
+                stream_id,
+                ..
+            } => {
+                // Every NAT control stream has to write, so a stopped one is
+                // reset; its `StreamClosed` then retires the owning machine.
+                if self.owned_role(*conn_id, peer_id, *stream_id).is_some() {
+                    handled = true;
+                    self.shared.push_action(NatAction::ResetStream {
+                        peer: peer_id.clone(),
+                        stream_id: *stream_id,
+                    });
+                }
+            }
             SwarmEvent::StreamClosed {
                 conn_id,
                 peer_id,
@@ -998,6 +1014,17 @@ impl NatAgent {
             && self.housekeeping.is_quiet()
     }
 
+    /// The role of an agent-owned stream on exactly this connection.
+    fn owned_role(
+        &self,
+        conn_id: ConnectionId,
+        peer: &PeerId,
+        stream: StreamId,
+    ) -> Option<StreamRole> {
+        let role = self.shared.registry.get(peer)?.get(&stream).copied()?;
+        (self.shared.stream_connection(peer, stream) == Some(conn_id)).then_some(role)
+    }
+
     fn route_stream(
         &mut self,
         conn_id: ConnectionId,
@@ -1007,15 +1034,9 @@ impl NatAgent {
         now: Now,
     ) -> bool {
         // Guardrail: streams we don't own are none of our business.
-        let Some(streams) = self.shared.registry.get(peer) else {
+        let Some(role) = self.owned_role(conn_id, peer, stream) else {
             return false;
         };
-        let Some(role) = streams.get(&stream).copied() else {
-            return false;
-        };
-        if self.shared.stream_connection(peer, stream) != Some(conn_id) {
-            return false;
-        }
         match role {
             StreamRole::HopConnect(id) => {
                 if let Some(attempt) = self.attempts.get_mut(&id) {
