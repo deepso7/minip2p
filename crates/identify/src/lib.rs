@@ -301,8 +301,8 @@ impl IdentifyProtocol {
 
     /// Feed received stream data into the protocol.
     ///
-    /// Returns actions the host must execute (none expected for the initiator
-    /// side, but included for consistency).
+    /// Returns actions the host must execute: none while a message is still
+    /// arriving, and a half-close if the bytes are refused.
     fn on_stream_data(
         &mut self,
         peer_id: PeerId,
@@ -324,6 +324,12 @@ impl IdentifyProtocol {
                 error: alloc::format!("identify message rejected: {fault}"),
             });
             state.inbound_streams.remove(&stream_id);
+            // Close our write side here. It is still open — multistream-select
+            // sent on it — and dropping the stream's state means the remote's
+            // half-close finds nothing to act on, so without this the stream
+            // never reaches `Closed` and its swarm and transport state leaks
+            // for the lifetime of the connection.
+            return vec![IdentifyAction::CloseStreamWrite { peer_id, stream_id }];
         }
 
         Vec::new()
@@ -613,6 +619,39 @@ mod tests {
 
         let events = receive(&oversized);
         assert!(error_text(&events).contains("rejected"), "got {events:?}");
+    }
+
+    /// A refused stream still has to be closed from our side, or it never
+    /// reaches `Closed` and its swarm and transport state is never reclaimed.
+    #[test]
+    fn a_refused_stream_is_closed_from_our_side() {
+        let mut identify = IdentifyProtocol::new(sample_config());
+        let peer = sample_peer();
+        let stream = StreamId::new(4);
+        identify.register_inbound_stream(peer.clone(), stream);
+
+        let mut oversized = encode_frame(&body_of_len(MAX_MESSAGE_SIZE));
+        oversized.push(0);
+        let actions = identify.on_stream_data(peer.clone(), stream, oversized);
+
+        assert_eq!(
+            actions,
+            vec![IdentifyAction::CloseStreamWrite {
+                peer_id: peer.clone(),
+                stream_id: stream,
+            }]
+        );
+        assert!(matches!(
+            identify.poll_events().as_slice(),
+            [IdentifyEvent::Error { .. }]
+        ));
+        // The remote's half-close arrives after the stream is already gone; it
+        // must not produce a second close.
+        assert!(
+            identify
+                .on_stream_remote_write_closed(peer, stream)
+                .is_empty()
+        );
     }
 
     #[test]
