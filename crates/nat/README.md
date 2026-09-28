@@ -25,7 +25,7 @@ relay leg dead       ⇒ ConnectFailed { error }    (engine decides the attempt)
 
 Ranking: `DirectDialed` ≈ `DirectPunched` > `Relayed`.
 
-HOP CONNECT only works at a relay where the *target* holds a reservation, so the relay leg tries the configured relays one at a time. Relays that `ConnectLegs::target_addrs` name in a circuit address (`.../p2p/<relay>/p2p-circuit`) go first, the rest follow in `NatConfig::relays` order; relays that are not configured are never used. Each relay gets `remaining / relays left` of `relay_leg_deadline_ms`, so a relay that fails fast leaves its time to the rest and one stalled relay cannot use up the leg. The leg fails only after every relay has failed, with the last relay's error (`NatError::Timeout` when the last one ran out the leg deadline).
+HOP CONNECT only works at a relay where the _target_ holds a reservation, so the relay leg tries the configured relays one at a time. Relays that `ConnectLegs::target_addrs` name in a circuit address (`.../p2p/<relay>/p2p-circuit`) go first, the rest follow in `NatConfig::relays` order; relays that are not configured are never used. Each relay gets `remaining / relays left` of `relay_leg_deadline_ms`, so a relay that fails fast leaves its time to the rest and one stalled relay cannot use up the leg. The leg fails only after every relay has failed, with the last relay's error (`NatError::Timeout` when the last one ran out the leg deadline).
 
 ## Relayed paths are normal connections
 
