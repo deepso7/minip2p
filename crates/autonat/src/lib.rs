@@ -20,9 +20,9 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use minip2p_core::write_uvarint;
 use minip2p_core::{
-    Multiaddr, PeerId, SansIoProtocol, WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field,
-    encode_nested_field, encode_varint_field, read_len_delimited, read_tag, read_varint_value,
-    skip_field,
+    FrameExchange, FrameFault, Multiaddr, PeerId, SansIoProtocol, WIRE_LEN, WIRE_VARINT, WireError,
+    encode_bytes_field, encode_nested_field, encode_varint_field, read_len_delimited, read_tag,
+    read_varint_value, skip_field,
 };
 
 /// Protocol id for AutoNAT v1.
@@ -223,10 +223,26 @@ pub enum AutoNatError {
     InvalidPeerId(String),
 }
 
+impl From<FrameFault> for AutoNatError {
+    fn from(fault: FrameFault) -> Self {
+        match fault {
+            FrameFault::TooLarge { len, .. } => Self::FrameTooLarge { len },
+            FrameFault::Overflow { len, .. } => Self::MessageTooLarge { len },
+            FrameFault::Wire(e) => Self::Wire(e),
+        }
+    }
+}
+
+/// How many bytes may sit behind the frame being parsed.
+///
+/// One maximal frame: a peer that pipelines its next message is legal, and a
+/// maximal response must not be refused because trailing bytes arrived in the
+/// same read.
+const MAX_TRAILING: usize = MAX_MESSAGE_SIZE;
+
 /// Client-side AutoNAT probe.
 pub struct AutoNatClient {
-    outbound: Vec<u8>,
-    recv_buf: Vec<u8>,
+    frames: FrameExchange,
     state: FlowState,
     outcome: Option<Reachability>,
     emitted_outcome: bool,
@@ -234,8 +250,7 @@ pub struct AutoNatClient {
 
 /// Server-side AutoNAT request handler.
 pub struct AutoNatServer {
-    outbound: Vec<u8>,
-    recv_buf: Vec<u8>,
+    frames: FrameExchange,
     request: Option<AutoNatRequest>,
     emitted_request: bool,
     state: ServerState,
@@ -257,7 +272,10 @@ enum ServerState {
 
 impl AutoNatClient {
     /// Creates a client probe and queues a DIAL request.
-    pub fn new(peer_id: &PeerId, addrs: &[Multiaddr]) -> Self {
+    ///
+    /// Fails when our own address list does not fit in one AutoNAT frame,
+    /// rather than sending a request the server is required to refuse.
+    pub fn new(peer_id: &PeerId, addrs: &[Multiaddr]) -> Result<Self, AutoNatError> {
         let peer = PeerInfo {
             id: peer_id.to_bytes(),
             addrs: addrs.iter().map(Multiaddr::to_bytes).collect(),
@@ -267,13 +285,14 @@ impl AutoNatClient {
             dial: Some(Dial { peer: Some(peer) }),
             dial_response: None,
         };
-        Self {
-            outbound: encode_frame(&msg.encode()),
-            recv_buf: Vec::new(),
+        let mut frames = FrameExchange::with_trailing(MAX_MESSAGE_SIZE, MAX_TRAILING);
+        frames.queue(&msg.encode())?;
+        Ok(Self {
+            frames,
             state: FlowState::Pending,
             outcome: None,
             emitted_outcome: false,
-        }
+        })
     }
 
     /// Drains pending outbound bytes.
@@ -281,7 +300,7 @@ impl AutoNatClient {
         if self.state == FlowState::Pending {
             self.state = FlowState::AwaitingResponse;
         }
-        core::mem::take(&mut self.outbound)
+        self.frames.take_outbound()
     }
 
     /// Feeds incoming bytes from the AutoNAT service stream.
@@ -289,7 +308,7 @@ impl AutoNatClient {
         if self.state == FlowState::Done {
             return Ok(());
         }
-        self.recv_buf.extend_from_slice(data);
+        self.frames.push(data)?;
         self.try_decode_response()
     }
 
@@ -305,15 +324,9 @@ impl AutoNatClient {
     }
 
     fn try_decode_response(&mut self) -> Result<(), AutoNatError> {
-        enforce_max_size(&self.recv_buf)?;
-        let (decoded, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => (Message::decode(payload), consumed),
-            FrameDecode::Incomplete => return Ok(()),
-            FrameDecode::TooLarge { len } => return Err(AutoNatError::FrameTooLarge { len }),
-            FrameDecode::Error(e) => return Err(WireError::from(e).into()),
+        let Some(msg) = self.frames.next_frame(Message::decode)? else {
+            return Ok(());
         };
-        self.recv_buf.drain(..consumed);
-        let msg = decoded?;
 
         if msg.kind != MessageType::DialResponse {
             self.state = FlowState::Done;
@@ -350,8 +363,7 @@ impl AutoNatServer {
     /// Creates a server state machine awaiting one DIAL request.
     pub fn new() -> Self {
         Self {
-            outbound: Vec::new(),
-            recv_buf: Vec::new(),
+            frames: FrameExchange::with_trailing(MAX_MESSAGE_SIZE, MAX_TRAILING),
             request: None,
             emitted_request: false,
             state: ServerState::AwaitingRequest,
@@ -363,7 +375,7 @@ impl AutoNatServer {
         if self.state != ServerState::AwaitingRequest {
             return Ok(());
         }
-        self.recv_buf.extend_from_slice(data);
+        self.frames.push(data)?;
         self.try_decode_request()
     }
 
@@ -374,26 +386,35 @@ impl AutoNatServer {
     }
 
     /// Queues a successful DIAL_RESPONSE with dialable addresses.
-    fn respond_public(&mut self, addrs: &[Multiaddr]) {
-        self.respond(ResponseStatus::Ok, None, addrs);
+    fn respond_public(&mut self, addrs: &[Multiaddr]) -> Result<(), AutoNatError> {
+        self.respond(ResponseStatus::Ok, None, addrs)
     }
 
     /// Queues an unsuccessful DIAL_RESPONSE.
-    fn respond_error(&mut self, status: ResponseStatus, reason: impl Into<String>) {
-        self.respond(status, Some(reason.into()), &[]);
+    fn respond_error(
+        &mut self,
+        status: ResponseStatus,
+        reason: impl Into<String>,
+    ) -> Result<(), AutoNatError> {
+        self.respond(status, Some(reason.into()), &[])
     }
 
     /// Drains pending outbound bytes.
     fn take_outbound(&mut self) -> Vec<u8> {
-        core::mem::take(&mut self.outbound)
+        self.frames.take_outbound()
     }
 
+    /// Queues a DIAL_RESPONSE.
+    ///
+    /// Fails when the addresses we would report do not fit in one frame; the
+    /// caller can still answer with [`Self::respond_error`], whose payload is
+    /// bounded by its status text.
     fn respond(
         &mut self,
         status: ResponseStatus,
         status_text: Option<String>,
         addrs: &[Multiaddr],
-    ) {
+    ) -> Result<(), AutoNatError> {
         let msg = Message {
             kind: MessageType::DialResponse,
             dial: None,
@@ -403,20 +424,15 @@ impl AutoNatServer {
                 addrs: addrs.iter().map(Multiaddr::to_bytes).collect(),
             }),
         };
-        self.outbound = encode_frame(&msg.encode());
+        self.frames.queue(&msg.encode())?;
         self.state = ServerState::Done;
+        Ok(())
     }
 
     fn try_decode_request(&mut self) -> Result<(), AutoNatError> {
-        enforce_max_size(&self.recv_buf)?;
-        let (decoded, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => (Message::decode(payload), consumed),
-            FrameDecode::Incomplete => return Ok(()),
-            FrameDecode::TooLarge { len } => return Err(AutoNatError::FrameTooLarge { len }),
-            FrameDecode::Error(e) => return Err(WireError::from(e).into()),
+        let Some(msg) = self.frames.next_frame(Message::decode)? else {
+            return Ok(());
         };
-        self.recv_buf.drain(..consumed);
-        let msg = decoded?;
 
         if msg.kind != MessageType::Dial {
             self.state = ServerState::Done;
@@ -467,7 +483,7 @@ impl SansIoProtocol for AutoNatClient {
     }
 
     fn is_idle(&self) -> bool {
-        self.outbound.is_empty() && (self.emitted_outcome || self.outcome.is_none())
+        !self.frames.has_outbound() && (self.emitted_outcome || self.outcome.is_none())
     }
 }
 
@@ -479,9 +495,9 @@ impl SansIoProtocol for AutoNatServer {
     fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
         match input {
             AutoNatServerInput::Data(data) => self.on_data(&data)?,
-            AutoNatServerInput::RespondPublic { addrs } => self.respond_public(&addrs),
+            AutoNatServerInput::RespondPublic { addrs } => self.respond_public(&addrs)?,
             AutoNatServerInput::RespondError { status, reason } => {
-                self.respond_error(status, reason)
+                self.respond_error(status, reason)?;
             }
             AutoNatServerInput::Flush => {}
         }
@@ -503,7 +519,7 @@ impl SansIoProtocol for AutoNatServer {
     }
 
     fn is_idle(&self) -> bool {
-        self.outbound.is_empty() && (self.emitted_request || self.request.is_none())
+        !self.frames.has_outbound() && (self.emitted_request || self.request.is_none())
     }
 }
 
@@ -660,13 +676,6 @@ fn decode_addrs(raw: &[Vec<u8>]) -> Vec<Multiaddr> {
         .collect()
 }
 
-fn enforce_max_size(buf: &[u8]) -> Result<(), AutoNatError> {
-    if buf.len() > MAX_MESSAGE_SIZE {
-        return Err(AutoNatError::MessageTooLarge { len: buf.len() });
-    }
-    Ok(())
-}
-
 /// AutoNAT rejects protobuf field number 0; shared `read_tag` leaves that policy to callers.
 fn read_autonat_tag(input: &[u8], idx: &mut usize) -> Result<Option<(u64, u8)>, AutoNatError> {
     let offset = *idx;
@@ -685,11 +694,120 @@ mod tests {
 
     const PEER_ID: &str = "QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N";
 
+    /// A DIAL_RESPONSE whose encoded payload is exactly `len` bytes, padded
+    /// through the status text.
+    fn response_payload(len: usize) -> Vec<u8> {
+        for pad in len.saturating_sub(16)..=len {
+            let msg = Message {
+                kind: MessageType::DialResponse,
+                dial: None,
+                dial_response: Some(DialResponse {
+                    status: ResponseStatus::DialError,
+                    status_text: Some("x".repeat(pad)),
+                    addrs: Vec::new(),
+                }),
+            };
+            let encoded = msg.encode();
+            if encoded.len() == len {
+                return encoded;
+            }
+        }
+        panic!("no status text pads a DIAL_RESPONSE to {len} bytes");
+    }
+
+    /// Regression: the pre-decode check counted the length prefix, so a legal
+    /// maximal message was refused as `MessageTooLarge`.
+    #[test]
+    fn client_accepts_a_response_at_the_maximum_size() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let mut client = AutoNatClient::new(&peer_id, &[]).expect("request fits");
+        let framed = encode_frame(&response_payload(MAX_MESSAGE_SIZE));
+        assert_eq!(framed.len(), MAX_MESSAGE_SIZE + 2);
+
+        client
+            .on_data(&framed)
+            .expect("a maximal response is legal");
+        assert!(matches!(
+            client.outcome(),
+            Some(Reachability::Private { .. })
+        ));
+    }
+
+    #[test]
+    fn client_rejects_a_declared_length_above_the_maximum() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let mut client = AutoNatClient::new(&peer_id, &[]).expect("request fits");
+        // A header declaring MAX + 1, rejected before any payload arrives.
+        let mut framed = Vec::new();
+        write_uvarint(MAX_MESSAGE_SIZE as u64 + 1, &mut framed);
+
+        assert_eq!(
+            client.on_data(&framed),
+            Err(AutoNatError::FrameTooLarge {
+                len: MAX_MESSAGE_SIZE as u64 + 1
+            })
+        );
+    }
+
+    /// Regression: a maximal frame that arrived with pipelined bytes behind it
+    /// was refused, because the whole buffer was measured against the limit.
+    #[test]
+    fn client_accepts_a_maximal_response_carrying_trailing_bytes() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let mut client = AutoNatClient::new(&peer_id, &[]).expect("request fits");
+        let mut chunk = encode_frame(&response_payload(MAX_MESSAGE_SIZE));
+        chunk.extend_from_slice(b"pipelined");
+
+        client
+            .on_data(&chunk)
+            .expect("trailing bytes are not our business");
+        assert!(client.outcome().is_some());
+        assert_eq!(client.frames.buffered(), b"pipelined");
+    }
+
+    #[test]
+    fn an_oversized_chunk_is_refused_before_it_is_buffered() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let mut client = AutoNatClient::new(&peer_id, &[]).expect("request fits");
+        let oversized = vec![0u8; 2 * MAX_MESSAGE_SIZE + 3];
+
+        assert!(matches!(
+            client.on_data(&oversized),
+            Err(AutoNatError::MessageTooLarge { .. })
+        ));
+        assert!(client.frames.buffered().is_empty());
+    }
+
+    #[test]
+    fn a_request_that_cannot_be_framed_is_refused_locally() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let addr = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
+        let addrs = vec![addr; 2048];
+
+        assert!(matches!(
+            AutoNatClient::new(&peer_id, &addrs),
+            Err(AutoNatError::FrameTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn a_response_that_cannot_be_framed_is_refused_locally() {
+        let addr = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
+        let mut server = AutoNatServer::new();
+
+        assert!(matches!(
+            server.respond_public(&vec![addr; 2048]),
+            Err(AutoNatError::FrameTooLarge { .. })
+        ));
+        assert!(!server.frames.has_outbound(), "nothing is queued");
+    }
+
     #[test]
     fn client_server_public_round_trip() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
         let addr = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
-        let mut client = AutoNatClient::new(&peer_id, core::slice::from_ref(&addr));
+        let mut client =
+            AutoNatClient::new(&peer_id, core::slice::from_ref(&addr)).expect("request fits");
         let mut server = AutoNatServer::new();
 
         server.on_data(&client.take_outbound()).unwrap();
@@ -697,7 +815,9 @@ mod tests {
         assert_eq!(request.peer_id, peer_id);
         assert_eq!(request.addrs, vec![addr.clone()]);
 
-        server.respond_public(&request.addrs.clone());
+        server
+            .respond_public(&request.addrs.clone())
+            .expect("response fits");
         client.on_data(&server.take_outbound()).unwrap();
 
         assert!(
@@ -708,11 +828,13 @@ mod tests {
     #[test]
     fn client_maps_dial_error_to_private() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
-        let mut client = AutoNatClient::new(&peer_id, &[]);
+        let mut client = AutoNatClient::new(&peer_id, &[]).expect("request fits");
         let mut server = AutoNatServer::new();
 
         server.on_data(&client.take_outbound()).unwrap();
-        server.respond_error(ResponseStatus::DialError, "all dialbacks failed");
+        server
+            .respond_error(ResponseStatus::DialError, "all dialbacks failed")
+            .expect("response fits");
         client.on_data(&server.take_outbound()).unwrap();
 
         assert!(
@@ -723,7 +845,7 @@ mod tests {
     #[test]
     fn client_consumes_bad_frame_before_decode_error() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
-        let mut client = AutoNatClient::new(&peer_id, &[]);
+        let mut client = AutoNatClient::new(&peer_id, &[]).expect("request fits");
         let _ = client.take_outbound();
 
         let bad_frame = encode_frame(&[TAG_TYPE, 99]);
@@ -733,7 +855,9 @@ mod tests {
         ));
 
         let mut server = AutoNatServer::new();
-        server.respond_error(ResponseStatus::DialError, "after bad frame");
+        server
+            .respond_error(ResponseStatus::DialError, "after bad frame")
+            .expect("response fits");
         client.on_data(&server.take_outbound()).unwrap();
 
         assert!(
@@ -753,7 +877,8 @@ mod tests {
 
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
         let addr = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
-        let mut client = AutoNatClient::new(&peer_id, core::slice::from_ref(&addr));
+        let mut client =
+            AutoNatClient::new(&peer_id, core::slice::from_ref(&addr)).expect("request fits");
         server.on_data(&client.take_outbound()).unwrap();
 
         let request = server
@@ -865,7 +990,8 @@ mod tests {
     fn client_and_server_implement_sans_io_protocol() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
         let addr = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
-        let mut client = AutoNatClient::new(&peer_id, core::slice::from_ref(&addr));
+        let mut client =
+            AutoNatClient::new(&peer_id, core::slice::from_ref(&addr)).expect("request fits");
         let mut server = AutoNatServer::new();
 
         client.handle_input(AutoNatClientInput::Flush).unwrap();

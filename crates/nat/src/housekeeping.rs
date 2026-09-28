@@ -236,12 +236,16 @@ impl Prober {
         }
         match result {
             Ok(stream) => {
+                // Our own address list has to fit in one AutoNAT frame; if it
+                // does not, there is no probe to send.
+                let Ok(machine) = AutoNatClient::new(&shared.local_peer_id, &shared.listen_addrs)
+                else {
+                    self.abort_flight(shared, now);
+                    return;
+                };
                 let flight = self.flight.as_mut().expect("checked above");
                 shared.own_stream(server_peer, stream, StreamRole::AutonatProbe);
-                flight.machine = Some(AutoNatClient::new(
-                    &shared.local_peer_id,
-                    &shared.listen_addrs,
-                ));
+                flight.machine = Some(machine);
                 flight.stage = ExchangeStage::WaitStreamReady { stream };
             }
             Err(_) => self.abort_flight(shared, now),

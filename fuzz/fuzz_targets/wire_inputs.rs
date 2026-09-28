@@ -508,7 +508,8 @@ fn fuzz_autonat(data: &[u8]) {
     let _ = server.handle_input(AutoNatServerInput::Data(data.to_vec()));
     while server.poll_output().is_some() {}
 
-    let mut client = AutoNatClient::new(&fuzz_peer_id(), &[]);
+    // An empty address list always frames, so the probe is always built here.
+    let mut client = AutoNatClient::new(&fuzz_peer_id(), &[]).expect("empty request fits");
     let _ = client.handle_input(AutoNatClientInput::Data(data.to_vec()));
     while client.poll_output().is_some() {}
 }
