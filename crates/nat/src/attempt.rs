@@ -502,12 +502,14 @@ impl ConnectAttempt {
                 }
             }
             // A dial failure matters only while the leg waits on it: once
-            // another connection to the relay made it ready, or the leg moved
-            // on, the failure is stale.
+            // another connection to the relay landed (`PeerReady` or the
+            // address deadline decides from there), or the leg moved on, the
+            // failure is stale.
             Err(reason) => match purpose {
                 TokenPurpose::RelayDial(_, dialed)
                     if self.leg == RelayLeg::WaitRelayReady
-                        && self.relay.as_ref() == Some(dialed) =>
+                        && self.relay.as_ref() == Some(dialed)
+                        && !shared.is_connected(dialed.peer_id()) =>
                 {
                     self.fail_relay_leg(shared, NatError::DialFailed(reason), now);
                 }
