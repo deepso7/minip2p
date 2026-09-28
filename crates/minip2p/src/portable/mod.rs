@@ -858,7 +858,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         #[cfg(feature = "portable-autonat")]
         if let Some(nat) = self.nat.as_mut() {
             let (connect, runtime) = self.endpoint.parts_mut();
-            nat.attach_leg(connect, id, peer, true, runtime, now);
+            nat.attach_leg(connect, id, peer, true, Vec::new(), runtime, now);
         }
         self.feed_nat_to_connect(now);
         Ok(id)

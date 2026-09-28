@@ -424,11 +424,22 @@ impl Endpoint {
         #[cfg(feature = "nat")]
         if let Some(nat) = self.nat.as_mut() {
             let now = self.swarm.now();
+            // The book may know circuit addresses for the peer, which tell
+            // the relay leg where the peer holds a reservation.
+            #[cfg(any(feature = "discovery", feature = "mdns"))]
+            let target_addrs = self
+                .discovery
+                .as_ref()
+                .map(|discovery| discovery.book.known_addrs(&peer))
+                .unwrap_or_default();
+            #[cfg(not(any(feature = "discovery", feature = "mdns")))]
+            let target_addrs = Vec::new();
             nat.attach_leg(
                 &self.connect,
                 id,
                 peer,
                 allow_relay,
+                target_addrs,
                 self.swarm.runtime_mut(),
                 now,
             );

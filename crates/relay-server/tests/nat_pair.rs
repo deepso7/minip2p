@@ -253,6 +253,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
         ConnectLegs {
             direct_racing: false,
             allow_relay: true,
+            target_addrs: Vec::new(),
         },
         nat_now(10),
     );

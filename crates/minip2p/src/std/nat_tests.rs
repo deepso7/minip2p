@@ -344,6 +344,7 @@ fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver,
         minip2p_nat::ConnectLegs {
             direct_racing: false,
             allow_relay: true,
+            target_addrs: Vec::new(),
         },
         Now::from_mono(0),
     );

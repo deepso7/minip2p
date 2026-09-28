@@ -1,9 +1,9 @@
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeSet, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, SansIoProtocol};
+use minip2p_core::{ConnectId, Multiaddr, PeerAddr, PeerId, Protocol, SansIoProtocol};
 use minip2p_dcutr::{DcutrResponder, DcutrResponderInput, DcutrResponderOutput, ResponderEvent};
 use minip2p_relay::{
     ConnectOutcome, HOP_PROTOCOL_ID, HopConnect, HopConnectInput, HopConnectOutput,
@@ -40,12 +40,23 @@ enum RelayLeg {
 /// and DCUtR. Direct candidate racing belongs to the Connection-attempt
 /// engine; this machine only tracks a direct establishment so
 /// [`Path::DirectDialed`] snapshots keep working.
+///
+/// The relay leg tries eligible relays one at a time. Each relay gets an
+/// even share of the leg's remaining time (`remaining / relays left`), so
+/// time a relay leaves unused by failing fast rolls over to the rest, and
+/// the last relay runs out the leg deadline. Any relay-scoped failure moves
+/// on to the next relay; the leg fails with the last relay's error.
 pub(crate) struct ConnectAttempt {
     id: ConnectId,
     peer: PeerId,
+    /// The relay currently being tried.
     relay: Option<PeerAddr>,
+    /// Relays still to try after `relay`, in order.
+    untried: VecDeque<PeerAddr>,
     leg: RelayLeg,
-    /// Absolute deadline for the relay leg to reach `Bridged`.
+    /// Absolute deadline for the whole relay leg to reach `Bridged`.
+    leg_deadline: u64,
+    /// Absolute deadline for the current relay: the end of its share.
     relay_deadline: Option<u64>,
     hop: Option<HopConnect>,
     dcutr: Option<DcutrResponder>,
@@ -92,16 +103,19 @@ impl ConnectAttempt {
         shared: &mut Shared,
         now: Now,
     ) -> Option<Self> {
-        let relay = legs
-            .allow_relay
-            .then(|| shared.config.relays.first().cloned())
-            .flatten();
+        let untried = if legs.allow_relay {
+            relay_order(&shared.config.relays, &legs.target_addrs)
+        } else {
+            VecDeque::new()
+        };
 
         let mut attempt = Self {
             id,
             peer,
-            relay,
+            relay: None,
+            untried,
             leg: RelayLeg::Inactive,
+            leg_deadline: 0,
             relay_deadline: None,
             hop: None,
             dcutr: None,
@@ -124,7 +138,7 @@ impl ConnectAttempt {
             done: false,
         };
 
-        if attempt.relay.is_some() {
+        if !attempt.untried.is_empty() {
             let stagger = if shared.config.force_relay || !legs.direct_racing {
                 0
             } else {
@@ -338,6 +352,7 @@ impl ConnectAttempt {
         peer: &PeerId,
         conn_id: ConnectionId,
         shared: &mut Shared,
+        now: Now,
     ) {
         if self.done {
             return;
@@ -364,27 +379,18 @@ impl ConnectAttempt {
         // still bounded by the relay deadline (and usually an open error).
         // Allocated stream phases retain conservative teardown until
         // StreamReady records exact ownership in `bridge_inner_conn`.
-        if matches!(self.leg, RelayLeg::WaitRelayReady | RelayLeg::OpeningHop) {
-            return;
-        }
         match self.leg {
-            RelayLeg::WaitRelayReady | RelayLeg::OpeningHop => {
-                self.leg = RelayLeg::Failed;
-                self.relay_deadline = None;
-                self.hop = None;
-                self.last_error = Some(NatError::DialFailed("relay connection closed".into()));
-                self.fail_if_no_legs_remain(shared);
-            }
             RelayLeg::WaitHopReady { stream } | RelayLeg::AwaitHopStatus { stream } => {
                 // The exact owning connection is terminal. Release local
                 // state without a peer-scoped reset that could target its
                 // eager replacement.
                 shared.release_stream(peer, stream);
                 self.leg = RelayLeg::Failed;
-                self.relay_deadline = None;
-                self.hop = None;
-                self.last_error = Some(NatError::DialFailed("relay connection closed".into()));
-                self.fail_if_no_legs_remain(shared);
+                self.fail_relay_leg(
+                    shared,
+                    NatError::DialFailed("relay connection closed".into()),
+                    now,
+                );
             }
             RelayLeg::Bridged { .. } => self.on_bridge_lost(shared),
             _ => {}
@@ -396,7 +402,7 @@ impl ConnectAttempt {
         peer: &PeerId,
         protocols: &[String],
         shared: &mut Shared,
-        _now: Now,
+        now: Now,
     ) {
         if self.done || self.leg != RelayLeg::WaitRelayReady || !self.is_relay_peer(peer) {
             return;
@@ -407,6 +413,7 @@ impl ConnectAttempt {
             self.fail_relay_leg(
                 shared,
                 NatError::Protocol("relay does not advertise the HOP protocol".into()),
+                now,
             );
         }
     }
@@ -443,8 +450,8 @@ impl ConnectAttempt {
         let Some(relay) = self.relay.clone() else {
             return;
         };
-        let relay_peer = relay.peer_id();
-        if shared.is_connected(relay_peer) || shared.session_dial_pending(relay_peer, now) {
+        let relay_peer = relay.peer_id().clone();
+        if shared.is_connected(&relay_peer) || shared.session_dial_pending(&relay_peer, now) {
             // The shared connection landed anyway, or an earlier-woken
             // waiter already re-dialed; keep waiting on that.
             return;
@@ -456,7 +463,12 @@ impl ConnectAttempt {
         // peer's entries), whereas a shorter lifetime would re-open the
         // duplicate-dial window while the handshake is still under way.
         let deadline_ms = shared.config.relay_leg_deadline_ms;
-        shared.push_session_dial(TokenPurpose::RelayDial(self.id), relay, now, deadline_ms);
+        shared.push_session_dial(
+            TokenPurpose::RelayDial(self.id, relay_peer),
+            relay,
+            now,
+            deadline_ms,
+        );
     }
 
     pub(crate) fn on_dial_result(
@@ -464,7 +476,7 @@ impl ConnectAttempt {
         purpose: &TokenPurpose,
         result: Result<ConnectionId, String>,
         shared: &mut Shared,
-        _now: Now,
+        now: Now,
     ) {
         if self.done {
             return;
@@ -475,11 +487,11 @@ impl ConnectAttempt {
                     self.punch_conns.insert(conn_id);
                 }
             }
+            // A dial toward a relay the leg already moved on from is stale.
             Err(reason) => match purpose {
-                TokenPurpose::RelayDial(_) => {
-                    self.fail_relay_leg(shared, NatError::DialFailed(reason));
+                TokenPurpose::RelayDial(_, relay) if self.is_relay_peer(relay) => {
+                    self.fail_relay_leg(shared, NatError::DialFailed(reason), now);
                 }
-                TokenPurpose::PunchDial(_) => {}
                 _ => {}
             },
         }
@@ -487,25 +499,24 @@ impl ConnectAttempt {
 
     pub(crate) fn on_stream_open_result(
         &mut self,
+        relay_peer: PeerId,
         result: Result<StreamId, String>,
         shared: &mut Shared,
-        _now: Now,
+        now: Now,
     ) {
-        if self.done || self.leg != RelayLeg::OpeningHop {
-            // Stale result (leg already failed); don't leak the stream.
-            if let (Ok(stream), Some(relay_peer)) = (&result, self.relay_peer().cloned()) {
+        if self.done || self.leg != RelayLeg::OpeningHop || !self.is_relay_peer(&relay_peer) {
+            // Stale result (leg failed or moved to another relay); don't
+            // leak the stream.
+            if let Ok(stream) = result {
                 shared.push_action(NatAction::ResetStream {
                     peer: relay_peer,
-                    stream_id: *stream,
+                    stream_id: stream,
                 });
             }
             return;
         }
         match result {
             Ok(stream) => {
-                let Some(relay_peer) = self.relay_peer().cloned() else {
-                    return;
-                };
                 self.hop = Some(HopConnect::new(self.peer.to_bytes()));
                 shared.own_stream(&relay_peer, stream, StreamRole::HopConnect(self.id));
                 self.leg = RelayLeg::WaitHopReady { stream };
@@ -514,6 +525,7 @@ impl ConnectAttempt {
                 self.fail_relay_leg(
                     shared,
                     NatError::Protocol(format!("opening HOP stream failed: {reason}")),
+                    now,
                 );
             }
         }
@@ -525,6 +537,7 @@ impl ConnectAttempt {
         stream: StreamId,
         input: StreamInput<'_>,
         shared: &mut Shared,
+        now: Now,
     ) {
         if self.done {
             return;
@@ -534,10 +547,10 @@ impl ConnectAttempt {
         }
         match (self.leg, input) {
             (RelayLeg::WaitHopReady { stream: s }, StreamInput::Ready) if s == stream => {
-                self.flush_hop_connect(stream, shared);
+                self.flush_hop_connect(stream, shared, now);
             }
             (RelayLeg::AwaitHopStatus { stream: s }, StreamInput::Data(data)) if s == stream => {
-                self.on_hop_data(stream, data, shared);
+                self.on_hop_data(stream, data, shared, now);
             }
             (RelayLeg::Bridged { stream: s }, StreamInput::Data(data)) if s == stream => {
                 self.bridge_pending_data.extend_from_slice(data);
@@ -546,13 +559,13 @@ impl ConnectAttempt {
                 RelayLeg::WaitHopReady { stream: s } | RelayLeg::AwaitHopStatus { stream: s },
                 StreamInput::RemoteWriteClosed,
             ) if s == stream => {
-                self.on_hop_remote_write_closed(stream, shared);
+                self.on_hop_remote_write_closed(stream, shared, now);
             }
             (RelayLeg::Bridged { stream: s }, StreamInput::RemoteWriteClosed) if s == stream => {
                 self.bridge_remote_write_closed = true;
             }
             (_, StreamInput::Closed) => {
-                self.on_stream_closed(stream, shared);
+                self.on_stream_closed(stream, shared, now);
             }
             _ => {}
         }
@@ -572,7 +585,7 @@ impl ConnectAttempt {
         if let Some(deadline) = self.relay_deadline
             && now.mono_ms >= deadline
         {
-            self.fail_relay_leg(shared, NatError::Timeout);
+            self.fail_relay_leg(shared, NatError::Timeout, now);
         }
 
         // A shared dial the leg was waiting on can vanish without a result
@@ -593,12 +606,21 @@ impl ConnectAttempt {
     // -----------------------------------------------------------------------
 
     fn begin_relay_leg(&mut self, shared: &mut Shared, now: Now) {
-        let Some(relay) = self.relay.clone() else {
-            self.leg = RelayLeg::Inactive;
+        self.leg_deadline = now.mono_ms + shared.config.relay_leg_deadline_ms;
+        self.try_next_relay(shared, now);
+    }
+
+    /// Starts on the next untried relay with an even share of the leg's
+    /// remaining time. Callers check that one is left.
+    fn try_next_relay(&mut self, shared: &mut Shared, now: Now) {
+        let Some(relay) = self.untried.pop_front() else {
             return;
         };
-        self.relay_deadline = Some(now.mono_ms + shared.config.relay_leg_deadline_ms);
+        let remaining = self.leg_deadline.saturating_sub(now.mono_ms);
+        let relays_left = self.untried.len() as u64 + 1;
+        self.relay_deadline = Some(now.mono_ms + remaining / relays_left);
         let relay_peer = relay.peer_id().clone();
+        self.relay = Some(relay.clone());
 
         if let Some(protocols) = shared.ready.get(&relay_peer) {
             if protocols.iter().any(|p| p == HOP_PROTOCOL_ID) {
@@ -607,6 +629,7 @@ impl ConnectAttempt {
                 self.fail_relay_leg(
                     shared,
                     NatError::Protocol("relay does not advertise the HOP protocol".into()),
+                    now,
                 );
             }
         } else if shared.is_connected(&relay_peer) || shared.session_dial_pending(&relay_peer, now)
@@ -616,7 +639,12 @@ impl ConnectAttempt {
             self.leg = RelayLeg::WaitRelayReady;
         } else {
             let deadline_ms = shared.config.relay_leg_deadline_ms;
-            shared.push_session_dial(TokenPurpose::RelayDial(self.id), relay, now, deadline_ms);
+            shared.push_session_dial(
+                TokenPurpose::RelayDial(self.id, relay_peer),
+                relay,
+                now,
+                deadline_ms,
+            );
             self.leg = RelayLeg::WaitRelayReady;
         }
     }
@@ -635,7 +663,7 @@ impl ConnectAttempt {
     }
 
     /// The HOP stream finished multistream negotiation: send CONNECT.
-    fn flush_hop_connect(&mut self, stream: StreamId, shared: &mut Shared) {
+    fn flush_hop_connect(&mut self, stream: StreamId, shared: &mut Shared, now: Now) {
         let Some(relay_peer) = self.relay_peer().cloned() else {
             return;
         };
@@ -644,7 +672,7 @@ impl ConnectAttempt {
         };
         if let Err(e) = hop.handle_input(HopConnectInput::Flush) {
             let reason = e.to_string();
-            self.fail_relay_leg(shared, NatError::Protocol(reason));
+            self.fail_relay_leg(shared, NatError::Protocol(reason), now);
             return;
         }
         while let Some(output) = hop.poll_output() {
@@ -659,13 +687,13 @@ impl ConnectAttempt {
         self.leg = RelayLeg::AwaitHopStatus { stream };
     }
 
-    fn on_hop_data(&mut self, stream: StreamId, data: &[u8], shared: &mut Shared) {
+    fn on_hop_data(&mut self, stream: StreamId, data: &[u8], shared: &mut Shared, now: Now) {
         let Some(hop) = self.hop.as_mut() else {
             return;
         };
         if let Err(e) = hop.handle_input(HopConnectInput::Data(data.to_vec())) {
             let reason = e.to_string();
-            self.fail_relay_leg(shared, NatError::Protocol(reason));
+            self.fail_relay_leg(shared, NatError::Protocol(reason), now);
             return;
         }
         let mut outputs = Vec::new();
@@ -691,6 +719,7 @@ impl ConnectAttempt {
                     self.fail_relay_leg(
                         shared,
                         NatError::RelayRefused(format!("{status:?}: {reason}")),
+                        now,
                     );
                     return;
                 }
@@ -732,12 +761,12 @@ impl ConnectAttempt {
     /// A remote half-close still permits local protocol writes. Let the
     /// sans-I/O machine consume it rather than treating it as a full circuit
     /// teardown; it may have a complete frame buffered already.
-    fn on_hop_remote_write_closed(&mut self, stream: StreamId, shared: &mut Shared) {
+    fn on_hop_remote_write_closed(&mut self, stream: StreamId, shared: &mut Shared, now: Now) {
         let Some(hop) = self.hop.as_mut() else {
             return;
         };
         if let Err(e) = hop.handle_input(HopConnectInput::RemoteWriteClosed) {
-            self.fail_relay_leg(shared, NatError::Protocol(e.to_string()));
+            self.fail_relay_leg(shared, NatError::Protocol(e.to_string()), now);
             return;
         }
         let mut outputs = Vec::new();
@@ -763,6 +792,7 @@ impl ConnectAttempt {
                     self.fail_relay_leg(
                         shared,
                         NatError::RelayRefused(format!("{status:?}: {reason}")),
+                        now,
                     );
                     return;
                 }
@@ -900,7 +930,7 @@ impl ConnectAttempt {
         });
     }
 
-    fn on_stream_closed(&mut self, stream: StreamId, shared: &mut Shared) {
+    fn on_stream_closed(&mut self, stream: StreamId, shared: &mut Shared, now: Now) {
         match self.leg {
             RelayLeg::WaitHopReady { stream: s } | RelayLeg::AwaitHopStatus { stream: s }
                 if s == stream =>
@@ -908,6 +938,7 @@ impl ConnectAttempt {
                 self.fail_relay_leg(
                     shared,
                     NatError::Protocol("HOP stream closed before the circuit was bridged".into()),
+                    now,
                 );
             }
             RelayLeg::Bridged { stream: s } if s == stream => self.on_bridge_lost(shared),
@@ -958,7 +989,9 @@ impl ConnectAttempt {
         }
     }
 
-    fn fail_relay_leg(&mut self, shared: &mut Shared, error: NatError) {
+    /// The current relay failed: move on to the next one while the leg has
+    /// time left, otherwise fail the leg with `error`.
+    fn fail_relay_leg(&mut self, shared: &mut Shared, error: NatError, now: Now) {
         match self.leg {
             RelayLeg::WaitHopReady { stream } | RelayLeg::AwaitHopStatus { stream } => {
                 if let Some(relay_peer) = self.relay_peer().cloned() {
@@ -974,8 +1007,13 @@ impl ConnectAttempt {
         self.leg = RelayLeg::Failed;
         self.relay_deadline = None;
         self.hop = None;
+        self.bridge_inner_conn = None;
         self.last_error = Some(error);
-        self.fail_if_no_legs_remain(shared);
+        if !self.untried.is_empty() && now.mono_ms < self.leg_deadline {
+            self.try_next_relay(shared, now);
+        } else {
+            self.fail_if_no_legs_remain(shared);
+        }
     }
 
     fn fail_if_no_legs_remain(&mut self, shared: &mut Shared) {
@@ -1053,4 +1091,27 @@ impl ConnectAttempt {
     fn is_relay_peer(&self, peer: &PeerId) -> bool {
         self.relay_peer() == Some(peer)
     }
+}
+
+/// The relays a leg tries, in order: configured relays that `target_addrs`
+/// name in a `/p2p/<relay>/p2p-circuit` address first, then the rest; each
+/// in config order and once.
+fn relay_order(relays: &[PeerAddr], target_addrs: &[Multiaddr]) -> VecDeque<PeerAddr> {
+    let reachable_through = |relay: &PeerId| {
+        target_addrs.iter().any(|addr| {
+            addr.protocols().windows(2).any(
+                |pair| matches!(pair, [Protocol::P2p(id), Protocol::P2pCircuit] if id == relay),
+            )
+        })
+    };
+    let (hinted, rest): (Vec<_>, Vec<_>) = relays
+        .iter()
+        .partition(|relay| reachable_through(relay.peer_id()));
+    let mut order: VecDeque<PeerAddr> = VecDeque::new();
+    for relay in hinted.into_iter().chain(rest) {
+        if !order.iter().any(|seen| seen.peer_id() == relay.peer_id()) {
+            order.push_back(relay.clone());
+        }
+    }
+    order
 }

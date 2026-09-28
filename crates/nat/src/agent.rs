@@ -42,8 +42,9 @@ pub(crate) enum StreamRole {
 /// What a pending `Dial` / `OpenStream` token was issued for.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TokenPurpose {
-    /// Dial of the relay itself (to start a relay leg).
-    RelayDial(ConnectId),
+    /// Dial of a relay (to start a relay leg on it). The relay is kept so a
+    /// failure arriving after the leg moved to another relay is ignored.
+    RelayDial(ConnectId, PeerId),
     /// Simultaneous-open dial of a DCUtR observed address.
     PunchDial(ConnectId),
     /// HOP stream open on the relay; the peer is kept so a result arriving
@@ -68,7 +69,7 @@ pub(crate) enum TokenPurpose {
 impl TokenPurpose {
     fn connect_id(&self) -> Option<ConnectId> {
         match self {
-            Self::RelayDial(id)
+            Self::RelayDial(id, _)
             | Self::PunchDial(id)
             | Self::OpenHop(id, _)
             | Self::PromoteAttempt(id) => Some(*id),
@@ -190,7 +191,7 @@ impl Shared {
             .tokens
             .iter()
             .filter_map(|(token, purpose)| match purpose {
-                TokenPurpose::RelayDial(attempt) | TokenPurpose::PunchDial(attempt)
+                TokenPurpose::RelayDial(attempt, _) | TokenPurpose::PunchDial(attempt)
                     if *attempt == id =>
                 {
                     Some(*token)
@@ -212,7 +213,7 @@ impl Shared {
             if attempt_tokens.contains(token)
                 || matches!(
                     purpose,
-                    TokenPurpose::RelayDial(attempt) | TokenPurpose::PunchDial(attempt)
+                    TokenPurpose::RelayDial(attempt, _) | TokenPurpose::PunchDial(attempt)
                         if *attempt == id
                 )
             {
@@ -349,7 +350,7 @@ impl Shared {
 /// Policy (relays, stagger, `force_relay`) stays in [`NatConfig`]. The caller
 /// owns direct candidate dials; the leg learns about them through
 /// [`SwarmEvent::ConnectionEstablished`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectLegs {
     /// The caller is racing direct candidates; give them
     /// [`NatConfig::relay_stagger_ms`] head start.
@@ -357,6 +358,12 @@ pub struct ConnectLegs {
     /// Whether this attempt may use a configured relay (false for mDNS-sourced
     /// dials).
     pub allow_relay: bool,
+    /// Addresses the caller knows for the target, from any source. A circuit
+    /// address through a configured relay (`.../p2p/<relay>/p2p-circuit`) is
+    /// evidence the target holds a reservation there, so that relay is tried
+    /// before the others. Everything else is ignored, including circuits
+    /// through relays that are not configured. Empty keeps config order.
+    pub target_addrs: Vec<Multiaddr>,
 }
 
 /// Sans-I/O NAT-traversal orchestrator.
@@ -550,7 +557,7 @@ impl NatAgent {
                     }
                 }
                 for attempt in self.attempts.values_mut() {
-                    attempt.on_connection_closed(peer_id, *conn_id, &mut self.shared);
+                    attempt.on_connection_closed(peer_id, *conn_id, &mut self.shared, now);
                 }
                 if peer_disconnected {
                     self.pending_peer_disconnects.insert(peer_id.clone());
@@ -815,7 +822,7 @@ impl NatAgent {
                     attempt.on_dial_result(&purpose, result, &mut self.shared, now);
                 } else if matches!(
                     purpose,
-                    TokenPurpose::PunchDial(_) | TokenPurpose::RelayDial(_)
+                    TokenPurpose::PunchDial(_) | TokenPurpose::RelayDial(..)
                 ) && let Ok(conn_id) = result
                 {
                     // The attempt ended before the driver echoed this dial.
@@ -881,7 +888,7 @@ impl NatAgent {
         match purpose {
             TokenPurpose::OpenHop(id, relay_peer) => match self.attempts.get_mut(&id) {
                 Some(attempt) => {
-                    attempt.on_stream_open_result(result, &mut self.shared, now);
+                    attempt.on_stream_open_result(relay_peer, result, &mut self.shared, now);
                     self.reap_done();
                 }
                 None => {
@@ -1040,7 +1047,7 @@ impl NatAgent {
         match role {
             StreamRole::HopConnect(id) => {
                 if let Some(attempt) = self.attempts.get_mut(&id) {
-                    attempt.on_stream_input(conn_id, stream, input, &mut self.shared);
+                    attempt.on_stream_input(conn_id, stream, input, &mut self.shared, now);
                 }
             }
             StreamRole::HopReserve | StreamRole::AutonatProbe => {
