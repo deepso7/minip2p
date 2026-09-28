@@ -17,7 +17,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId, SansIoProtocol, WireError, encode_frame, read_uvarint};
+use minip2p_core::{FrameExchange, FrameFault, Multiaddr, PeerId, SansIoProtocol};
 use minip2p_transport::StreamId;
 use thiserror::Error;
 
@@ -147,6 +147,12 @@ pub enum IdentifyError {
     /// The peer already has an active identify exchange on this role.
     #[error("identify stream already registered for peer {peer_id}")]
     StreamAlreadyRegistered { peer_id: PeerId },
+    /// Our own identify message does not fit in one frame.
+    ///
+    /// Sending it anyway would hand the remote a message it is required to
+    /// refuse; the local listen-address set or protocol list has to shrink.
+    #[error("identify message cannot be framed: {0}")]
+    MessageTooLarge(#[from] FrameFault),
 }
 
 // ---------------------------------------------------------------------------
@@ -158,8 +164,9 @@ pub enum IdentifyError {
 struct PeerIdentifyState {
     /// Stream where we are the responder (sending our info).
     outbound_stream: Option<StreamId>,
-    /// Streams where we are the initiator (receiving their info).
-    inbound_streams: BTreeMap<StreamId, Vec<u8>>,
+    /// Streams where we are the initiator (receiving their info), each with
+    /// the bytes buffered for it so far.
+    inbound_streams: BTreeMap<StreamId, FrameExchange>,
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +264,9 @@ impl IdentifyProtocol {
         };
 
         let encoded = msg.encode();
-        let data = encode_frame(&encoded);
+        let mut outbound = FrameExchange::new(MAX_MESSAGE_SIZE);
+        outbound.queue(&encoded)?;
+        let data = outbound.take_outbound();
 
         Ok(vec![
             IdentifyAction::Send {
@@ -276,7 +285,10 @@ impl IdentifyProtocol {
     /// remote closes its write side.
     fn register_inbound_stream(&mut self, peer_id: PeerId, stream_id: StreamId) {
         let state = self.peers.entry(peer_id).or_default();
-        state.inbound_streams.entry(stream_id).or_default();
+        state
+            .inbound_streams
+            .entry(stream_id)
+            .or_insert_with(|| FrameExchange::new(MAX_MESSAGE_SIZE));
     }
 
     /// Feed received stream data into the protocol.
@@ -293,20 +305,17 @@ impl IdentifyProtocol {
             return Vec::new();
         };
 
-        if let Some(buf) = state.inbound_streams.get_mut(&stream_id) {
-            buf.extend_from_slice(&data);
-
-            if buf.len() > MAX_MESSAGE_SIZE {
-                self.events.push_back(IdentifyEvent::Error {
-                    peer_id: peer_id.clone(),
-                    stream_id,
-                    error: alloc::format!(
-                        "identify message exceeds maximum size ({} > {MAX_MESSAGE_SIZE})",
-                        buf.len()
-                    ),
-                });
-                state.inbound_streams.remove(&stream_id);
-            }
+        if let Some(frames) = state.inbound_streams.get_mut(&stream_id)
+            && let Err(fault) = frames.push(&data)
+        {
+            // The bytes are refused before they are buffered: nothing legal
+            // can still be growing towards one identify message.
+            self.events.push_back(IdentifyEvent::Error {
+                peer_id: peer_id.clone(),
+                stream_id,
+                error: alloc::format!("identify message rejected: {fault}"),
+            });
+            state.inbound_streams.remove(&stream_id);
         }
 
         Vec::new()
@@ -327,24 +336,31 @@ impl IdentifyProtocol {
             return Vec::new();
         };
 
-        let Some(buf) = state.inbound_streams.remove(&stream_id) else {
+        let Some(mut frames) = state.inbound_streams.remove(&stream_id) else {
             return Vec::new();
         };
 
-        match decode_length_prefixed(&buf).and_then(IdentifyMessage::decode) {
-            Ok(info) => {
-                self.events.push_back(IdentifyEvent::Received {
-                    peer_id: peer_id.clone(),
-                    info,
-                });
-            }
-            Err(e) => {
-                self.events.push_back(IdentifyEvent::Error {
-                    peer_id: peer_id.clone(),
-                    stream_id,
-                    error: alloc::format!("failed to decode identify message: {e}"),
-                });
-            }
+        let mut fail = |error| {
+            self.events.push_back(IdentifyEvent::Error {
+                peer_id: peer_id.clone(),
+                stream_id,
+                error,
+            });
+        };
+        match frames.next_frame(IdentifyMessage::decode) {
+            // One identify message per stream: bytes behind it are not a
+            // second message we would ever read, so they are reported rather
+            // than dropped.
+            Ok(Some(_)) if !frames.buffered().is_empty() => fail(alloc::format!(
+                "identify message followed by {} trailing bytes",
+                frames.buffered().len()
+            )),
+            Ok(Some(info)) => self.events.push_back(IdentifyEvent::Received {
+                peer_id: peer_id.clone(),
+                info,
+            }),
+            Ok(None) => fail("identify message ended before its frame completed".into()),
+            Err(e) => fail(alloc::format!("failed to decode identify message: {e}")),
         }
 
         // Close our own write side. We never send data on an initiator
@@ -469,42 +485,10 @@ impl SansIoProtocol for IdentifyProtocol {
 // Wire framing helpers
 // ---------------------------------------------------------------------------
 
-/// Strips the varint length prefix from a framed Identify buffer and
-/// returns a borrowed slice over the body.
-///
-/// Identify uses this path instead of [`minip2p_core::decode_frame`] so an
-/// oversized declared length is always [`WireError::FieldOverflow`],
-/// including when the length does not fit in `usize` on 32-bit targets.
-/// That keeps the error class independent of pointer width. A malformed
-/// prefix varint is [`IdentifyMessageError::Wire`].
-///
-/// Encoding uses [`minip2p_core::encode_frame`] directly (see
-/// [`IdentifyInput::RegisterOutboundStream`]).
-fn decode_length_prefixed(buf: &[u8]) -> Result<&[u8], message::IdentifyMessageError> {
-    let (len, consumed) = read_uvarint(buf).map_err(WireError::from)?;
-    let remaining = buf.len().saturating_sub(consumed);
-    // Compare as u64 before converting to usize so 32-bit and 64-bit
-    // targets take the same FieldOverflow path.
-    if len > remaining as u64 {
-        return Err(prefix_overflow(consumed, len, remaining).into());
-    }
-    let end = consumed + (len as usize);
-    buf.get(consumed..end)
-        .ok_or(prefix_overflow(consumed, len, remaining).into())
-}
-
-fn prefix_overflow(offset: usize, length: u64, remaining: usize) -> WireError {
-    WireError::FieldOverflow {
-        offset,
-        length: usize::try_from(length).unwrap_or(usize::MAX),
-        remaining,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minip2p_core::write_uvarint;
+    use minip2p_core::{FrameDecode, encode_frame, write_uvarint};
 
     impl IdentifyProtocol {
         /// Drain buffered events (test helper).
@@ -560,50 +544,123 @@ mod tests {
         assert!(identify.is_idle());
     }
 
-    #[test]
-    fn length_prefix_round_trip() {
-        let body = b"hello identify";
-        let framed = encode_frame(body);
-        assert_eq!(framed[0] as usize, body.len());
-        let decoded = decode_length_prefixed(&framed).unwrap();
-        assert_eq!(decoded, body);
+    /// Feeds `data` to an initiator stream and returns what the protocol
+    /// reported once the remote closed its write side.
+    fn receive(data: &[u8]) -> Vec<IdentifyEvent> {
+        let mut initiator = IdentifyProtocol::new(sample_config());
+        let peer = sample_peer();
+        let stream = StreamId::new(3);
+
+        initiator.register_inbound_stream(peer.clone(), stream);
+        let _ = initiator.on_stream_data(peer.clone(), stream, data.to_vec());
+        let _ = initiator.on_stream_remote_write_closed(peer, stream);
+        initiator.poll_events()
     }
 
+    fn error_text(events: &[IdentifyEvent]) -> &str {
+        match events {
+            [IdentifyEvent::Error { error, .. }] => error,
+            other => panic!("expected one error, got {other:?}"),
+        }
+    }
+
+    /// An identify message whose encoded body is exactly `len` bytes, padded
+    /// through the agent version.
+    fn body_of_len(len: usize) -> Vec<u8> {
+        for pad in len.saturating_sub(16)..=len {
+            let encoded = IdentifyMessage {
+                protocol_version: None,
+                agent_version: Some("x".repeat(pad)),
+                public_key: None,
+                listen_addrs: Vec::new(),
+                observed_addr: None,
+                protocols: Vec::new(),
+            }
+            .encode();
+            if encoded.len() == len {
+                return encoded;
+            }
+        }
+        panic!("no agent version pads an identify message to {len} bytes");
+    }
+
+    /// Regression: the buffer check counted the length prefix, so a legal
+    /// maximal message was refused.
     #[test]
-    fn length_prefix_decode_rejects_overshoot() {
-        // Declare a 255-byte body but only ship 3 bytes: should fail.
-        let mut framed = Vec::new();
-        write_uvarint(255, &mut framed);
-        framed.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+    fn a_message_at_the_maximum_size_is_accepted() {
+        let framed = encode_frame(&body_of_len(MAX_MESSAGE_SIZE));
+        assert_eq!(framed.len(), MAX_MESSAGE_SIZE + 2);
+
         assert!(matches!(
-            decode_length_prefixed(&framed),
-            Err(message::IdentifyMessageError::Wire(
-                WireError::FieldOverflow {
-                    length: 255,
-                    remaining: 3,
-                    ..
-                }
-            ))
+            receive(&framed).as_slice(),
+            [IdentifyEvent::Received { .. }]
         ));
     }
 
     #[test]
-    fn length_prefix_oversized_declared_length_is_field_overflow_on_every_target() {
-        // `u64::MAX` does not fit in usize on 32-bit targets. The decoder
-        // must still report FieldOverflow (never Varint Overflow) so the
-        // error class does not depend on pointer width.
+    fn a_message_over_the_maximum_size_is_refused_before_it_is_buffered() {
+        let framed = encode_frame(&body_of_len(MAX_MESSAGE_SIZE));
+        let mut oversized = framed.clone();
+        oversized.push(0);
+
+        let events = receive(&oversized);
+        assert!(error_text(&events).contains("rejected"), "got {events:?}");
+    }
+
+    /// The declared length is checked as a `u64` before it ever becomes a
+    /// `usize`, so the error class does not depend on pointer width.
+    #[test]
+    fn a_declared_length_beyond_the_maximum_is_refused_on_every_target() {
         let mut framed = Vec::new();
         write_uvarint(u64::MAX, &mut framed);
         framed.extend_from_slice(&[0xAA]);
+
+        let events = receive(&framed);
+        assert!(
+            error_text(&events).contains("exceeds the maximum"),
+            "got {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_never_completes_is_reported_at_end_of_stream() {
+        // Declares 255 bytes, ships three.
+        let mut framed = Vec::new();
+        write_uvarint(255, &mut framed);
+        framed.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+
+        let events = receive(&framed);
+        assert!(
+            error_text(&events).contains("ended before its frame completed"),
+            "got {events:?}"
+        );
+    }
+
+    /// One message per stream: anything behind it is reported, not dropped.
+    #[test]
+    fn trailing_bytes_after_the_message_are_reported() {
+        let mut framed = encode_frame(&body_of_len(64));
+        framed.extend_from_slice(b"trailing");
+
+        let events = receive(&framed);
+        assert!(
+            error_text(&events).contains("8 trailing bytes"),
+            "got {events:?}"
+        );
+    }
+
+    #[test]
+    fn our_own_oversized_message_is_refused_locally() {
+        let mut identify = IdentifyProtocol::new(IdentifyConfig {
+            protocol_version: "minip2p/test".into(),
+            agent_version: "x".repeat(MAX_MESSAGE_SIZE),
+            protocols: Vec::new(),
+            public_key: Vec::new(),
+        });
+
         assert!(matches!(
-            decode_length_prefixed(&framed),
-            Err(message::IdentifyMessageError::Wire(
-                WireError::FieldOverflow {
-                    length: usize::MAX,
-                    remaining: 1,
-                    ..
-                }
-            ))
+            identify.register_outbound_stream(sample_peer(), StreamId::new(1), None, &[]),
+            Err(IdentifyError::MessageTooLarge(_))
         ));
     }
 
@@ -638,7 +695,11 @@ mod tests {
 
         // The frame must decode as `<varint prefix><body>` and the body
         // must itself be a valid IdentifyMessage.
-        let body = decode_length_prefixed(&data).expect("length-prefixed framing");
+        let FrameDecode::Complete { payload: body, .. } =
+            minip2p_core::decode_frame(&data, MAX_MESSAGE_SIZE)
+        else {
+            panic!("expected one complete length-prefixed frame");
+        };
         let msg = IdentifyMessage::decode(body).expect("body decodes");
         assert_eq!(msg.agent_version.as_deref(), Some("minip2p-test/0.0.1"));
         assert_eq!(msg.protocol_version.as_deref(), Some("minip2p/test"));

@@ -65,6 +65,7 @@ let mut identify = IdentifyProtocol::new(config);
 
 - Protocol ID: `/ipfs/id/1.0.0`
 - Wire format: a varint length prefix followed by a protobuf-encoded `Identify` message, then the responder half-closes its write side.
+- Size: one message per stream, at most 8192 payload bytes. The declared length is checked from the frame header, so bytes that could never complete a legal message are refused before they are buffered, and a message at exactly the maximum is accepted. Bytes behind the message, or a frame that never completes, are reported as an `Error` event rather than dropped. An outgoing message that would exceed the limit is refused locally instead of being put on the wire.
 - Fields: `publicKey`, `listenAddrs` (repeated, multicodec-binary), `protocols` (repeated), `observedAddr` (multicodec-binary), `protocolVersion`, `agentVersion`.
 
 ## no_std
