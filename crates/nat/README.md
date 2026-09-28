@@ -11,7 +11,9 @@ Parallel racing with convergence — not sequential fallback:
 ```text
 t0      caller races direct candidates (ConnectEngine)
 t0+δ    relay leg (stagger δ when direct_racing, else now):
-          ensure relay session → HOP CONNECT(target)
+          for each eligible relay, within its share of the leg deadline:
+            ensure relay session → HOP CONNECT(target)
+            relay fails (unreachable, refused, share elapsed) ⇒ next relay
           → Bridged ⇒ promote bridge through Noise + Yamux
           → circuit Connected ⇒ PathEstablished(Relayed)  (provisional)
           → reserved peer opens /libp2p/dcutr on the Relayed path
@@ -22,6 +24,8 @@ relay leg dead       ⇒ ConnectFailed { error }    (engine decides the attempt)
 ```
 
 Ranking: `DirectDialed` ≈ `DirectPunched` > `Relayed`.
+
+HOP CONNECT only works at a relay where the *target* holds a reservation, so the relay leg tries the configured relays one at a time. Relays that `ConnectLegs::target_addrs` name in a circuit address (`.../p2p/<relay>/p2p-circuit`) go first, the rest follow in `NatConfig::relays` order; relays that are not configured are never used. Each relay gets `remaining / relays left` of `relay_leg_deadline_ms`, so a relay that fails fast leaves its time to the rest and one stalled relay cannot use up the leg. The leg fails only after every relay has failed, with the last relay's error (`NatError::Timeout` when the last one ran out the leg deadline).
 
 ## Relayed paths are normal connections
 
@@ -42,7 +46,12 @@ let mut agent = NatAgent::new(local_peer_id, NatConfig {
 agent.set_listen_addrs(&validated_external_addrs);
 
 let id = ConnectId::from_u64(1);
-agent.connect(id, target_peer, ConnectLegs { direct_racing: true, allow_relay: true }, now());
+let legs = ConnectLegs {
+    direct_racing: true,
+    allow_relay: true,
+    target_addrs: known_addrs_for_target, // circuit addresses steer relay choice
+};
+agent.connect(id, target_peer, legs, now());
 
 loop {
     // 1. Feed swarm events by reference. The disposition stays true even
@@ -127,6 +136,6 @@ A NAT'd listener holding a reservation handles inbound circuits automatically: t
 
 ## Status
 
-- Dialer-side race (direct dials × relay leg × DCUtR punch): implemented, covered by scripted no-I/O tests in `tests/arbitration.rs`.
+- Dialer-side race (direct dials × relay leg × DCUtR punch): implemented, covered by scripted no-I/O tests in `tests/arbitration.rs`; relay rotation within one attempt in `tests/relay_rotation.rs`.
 - Housekeeping (AutoNAT confidence aggregation, relay reservation renewal): implemented, covered by `tests/housekeeping.rs`.
 - Responder side (inbound STOP circuits, punch-window UDP blasts): implemented, covered by `tests/inbound.rs` plus a two-agent end-to-end exchange over an in-memory relay emulator (`tests/two_agents.rs`).
