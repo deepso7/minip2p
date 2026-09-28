@@ -345,6 +345,7 @@ fn promotion_driver(pair: &BridgePair, remote_write_closed: bool) -> (NatDriver,
             direct_racing: false,
             allow_relay: true,
             target_addrs: Vec::new(),
+            deadline_ms: None,
         },
         Now::from_mono(0),
     );

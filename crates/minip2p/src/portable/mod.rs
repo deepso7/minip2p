@@ -839,6 +839,13 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
             &peer,
             target.candidates().to_vec(),
         );
+        // Circuit addresses the book knows steer the relay leg.
+        #[cfg(feature = "portable-autonat")]
+        let target_addrs = self
+            .discovery
+            .as_ref()
+            .map(|discovery| discovery.book.known_addrs(&peer))
+            .unwrap_or_default();
         let (connect, runtime) = self.endpoint.parts_mut();
         let id = admit_connect(
             connect,
@@ -858,7 +865,7 @@ impl<D: smoltcp::phy::Device, E: EntropySource> SmoltcpEndpoint<D, E> {
         #[cfg(feature = "portable-autonat")]
         if let Some(nat) = self.nat.as_mut() {
             let (connect, runtime) = self.endpoint.parts_mut();
-            nat.attach_leg(connect, id, peer, true, Vec::new(), runtime, now);
+            nat.attach_leg(connect, id, peer, true, target_addrs, runtime, now);
         }
         self.feed_nat_to_connect(now);
         Ok(id)

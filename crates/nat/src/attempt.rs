@@ -56,6 +56,8 @@ pub(crate) struct ConnectAttempt {
     leg: RelayLeg,
     /// Absolute deadline for the whole relay leg to reach `Bridged`.
     leg_deadline: u64,
+    /// The caller's deadline for the attempt, which caps `leg_deadline`.
+    attempt_deadline: Option<u64>,
     /// Absolute deadline for the current relay: the end of its share.
     relay_deadline: Option<u64>,
     hop: Option<HopConnect>,
@@ -116,6 +118,7 @@ impl ConnectAttempt {
             untried,
             leg: RelayLeg::Inactive,
             leg_deadline: 0,
+            attempt_deadline: legs.deadline_ms,
             relay_deadline: None,
             hop: None,
             dcutr: None,
@@ -606,7 +609,10 @@ impl ConnectAttempt {
     // -----------------------------------------------------------------------
 
     fn begin_relay_leg(&mut self, shared: &mut Shared, now: Now) {
-        self.leg_deadline = now.mono_ms + shared.config.relay_leg_deadline_ms;
+        let leg_deadline = now.mono_ms + shared.config.relay_leg_deadline_ms;
+        self.leg_deadline = self
+            .attempt_deadline
+            .map_or(leg_deadline, |attempt| attempt.min(leg_deadline));
         self.try_next_relay(shared, now);
     }
 

@@ -50,6 +50,7 @@ let legs = ConnectLegs {
     direct_racing: true,
     allow_relay: true,
     target_addrs: known_addrs_for_target, // circuit addresses steer relay choice
+    deadline_ms: Some(attempt_expires_mono_ms), // relays split the time left
 };
 agent.connect(id, target_peer, legs, now());
 

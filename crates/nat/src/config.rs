@@ -46,7 +46,9 @@ pub struct NatConfig {
     /// Use relayed circuits without racing direct dials or attempting DCUtR.
     pub force_relay: bool,
     /// Deadline for the relay leg to reach `Bridged` (measured from when the
-    /// leg starts, i.e. after the stagger). Shared by the relays the leg
+    /// leg starts, i.e. after the stagger), or the caller's
+    /// [`ConnectLegs::deadline_ms`](crate::ConnectLegs::deadline_ms) if that
+    /// comes first. Shared by the relays the leg
     /// tries: each gets an even share of the time left when it starts
     /// (`remaining / relays left`), so a relay that fails fast leaves its
     /// time to the rest and one slow relay cannot use up the whole leg.

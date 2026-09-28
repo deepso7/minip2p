@@ -131,6 +131,30 @@ fn stalled_first_relay_hands_over_after_its_share() {
 }
 
 #[test]
+fn shares_fit_a_caller_deadline_shorter_than_the_leg_deadline() {
+    let mut w = two_relays();
+    let target = w.target.clone();
+    let legs = ConnectLegs {
+        deadline_ms: Some(4_000),
+        ..RELAY_NOW
+    };
+    let _ = start(&mut w.agent, 1, target, legs, at(0));
+    drain_actions(&mut w.agent);
+
+    // The attempt gives up at 4 s, so A gets 2 s rather than 6 s.
+    w.agent.handle_tick(at(2_000));
+    assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &w.b), 1);
+    w.agent.handle_tick(at(4_000));
+    assert!(matches!(
+        drain_events(&mut w.agent).as_slice(),
+        [NatEvent::ConnectFailed {
+            error: NatError::Timeout,
+            ..
+        }]
+    ));
+}
+
+#[test]
 fn relay_the_target_is_known_through_goes_first() {
     let mut w = two_relays();
     let target = w.target.clone();

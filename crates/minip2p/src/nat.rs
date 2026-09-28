@@ -335,6 +335,7 @@ impl<E: EntropySource> NatDriver<E> {
                     direct_racing: connect.dialed_direct(id),
                     allow_relay,
                     target_addrs,
+                    deadline_ms: connect.expires_ms(id),
                 },
                 swarm,
                 sample,

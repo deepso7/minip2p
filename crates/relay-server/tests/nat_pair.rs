@@ -254,6 +254,7 @@ fn two_nat_agents_reserve_and_connect_through_the_real_relay_server() {
             direct_racing: false,
             allow_relay: true,
             target_addrs: Vec::new(),
+            deadline_ms: None,
         },
         nat_now(10),
     );

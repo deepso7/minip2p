@@ -364,6 +364,12 @@ pub struct ConnectLegs {
     /// before the others. Everything else is ignored, including circuits
     /// through relays that are not configured. Empty keeps config order.
     pub target_addrs: Vec<Multiaddr>,
+    /// When the caller gives up on the attempt, on the [`Now::mono_ms`]
+    /// clock. The relay leg ends at the earlier of this and
+    /// [`NatConfig::relay_leg_deadline_ms`] after it starts, so its relays
+    /// split time the attempt actually has. `None` when the caller has no
+    /// deadline.
+    pub deadline_ms: Option<u64>,
 }
 
 /// Sans-I/O NAT-traversal orchestrator.

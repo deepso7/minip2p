@@ -30,16 +30,19 @@ pub const RACE: ConnectLegs = ConnectLegs {
     direct_racing: true,
     allow_relay: true,
     target_addrs: Vec::new(),
+    deadline_ms: None,
 };
 pub const RELAY_NOW: ConnectLegs = ConnectLegs {
     direct_racing: false,
     allow_relay: true,
     target_addrs: Vec::new(),
+    deadline_ms: None,
 };
 pub const NO_RELAY: ConnectLegs = ConnectLegs {
     direct_racing: true,
     allow_relay: false,
     target_addrs: Vec::new(),
+    deadline_ms: None,
 };
 
 pub fn start(agent: &mut NatAgent, n: u64, peer: PeerId, legs: ConnectLegs, now: Now) -> ConnectId {
