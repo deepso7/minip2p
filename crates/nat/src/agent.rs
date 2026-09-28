@@ -42,9 +42,11 @@ pub(crate) enum StreamRole {
 /// What a pending `Dial` / `OpenStream` token was issued for.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TokenPurpose {
-    /// Dial of a relay (to start a relay leg on it). The relay is kept so a
-    /// failure arriving after the leg moved to another relay is ignored.
-    RelayDial(ConnectId, PeerId),
+    /// Dial of a relay address (to start a relay leg on it). The address is
+    /// kept so a failure arriving after the leg moved on to another relay,
+    /// or to another address of the same relay, is not taken for the
+    /// current one.
+    RelayDial(ConnectId, PeerAddr),
     /// Simultaneous-open dial of a DCUtR observed address.
     PunchDial(ConnectId),
     /// HOP stream open on the relay; the peer is kept so a result arriving

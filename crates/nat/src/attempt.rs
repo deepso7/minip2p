@@ -473,7 +473,7 @@ impl ConnectAttempt {
         // duplicate-dial window while the handshake is still under way.
         let deadline_ms = shared.config.relay_leg_deadline_ms;
         shared.push_session_dial(
-            TokenPurpose::RelayDial(self.id, relay_peer),
+            TokenPurpose::RelayDial(self.id, relay.clone()),
             relay,
             now,
             deadline_ms,
@@ -498,8 +498,14 @@ impl ConnectAttempt {
             }
             // A dial toward a relay the leg already moved on from is stale.
             Err(reason) => match purpose {
-                TokenPurpose::RelayDial(_, relay) if self.is_relay_peer(relay) => {
+                TokenPurpose::RelayDial(_, dialed) if self.relay.as_ref() == Some(dialed) => {
                     self.fail_relay_leg(shared, NatError::DialFailed(reason), now);
+                }
+                // An earlier address of the current relay gave up after the
+                // leg moved on to this one, which was waiting on that dial:
+                // dial this address now that nothing is in flight.
+                TokenPurpose::RelayDial(_, dialed) if self.is_relay_peer(dialed.peer_id()) => {
+                    self.redrive_relay_leg(shared, now);
                 }
                 _ => {}
             },
@@ -652,7 +658,7 @@ impl ConnectAttempt {
         } else {
             let deadline_ms = shared.config.relay_leg_deadline_ms;
             shared.push_session_dial(
-                TokenPurpose::RelayDial(self.id, relay_peer),
+                TokenPurpose::RelayDial(self.id, relay.clone()),
                 relay,
                 now,
                 deadline_ms,

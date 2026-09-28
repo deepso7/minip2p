@@ -349,3 +349,36 @@ fn relay_addresses_are_tried_until_the_relay_is_reached() {
     assert_eq!(dial_count_for(&actions, &b), 1);
     assert!(!has_hop_open(&actions), "A is not asked again");
 }
+
+#[test]
+fn late_failure_of_a_relays_first_address_dials_its_next() {
+    let mut w = relays_with(|a, b| {
+        vec![
+            relay_addr("/ip4/203.0.113.1/udp/4001/quic-v1", a),
+            relay_addr("/ip4/203.0.113.1/tcp/4001", a),
+            relay_addr("/ip4/203.0.113.2/udp/4001/quic-v1", b),
+        ]
+    });
+    let tcp = relay_addr("/ip4/203.0.113.1/tcp/4001", &w.a);
+    let target = w.target.clone();
+    let _ = start(&mut w.agent, 1, target, RELAY_NOW, at(0));
+    let quic_token = dial_token_for(&drain_actions(&mut w.agent), &w.a);
+
+    // The QUIC share (a third of 12 s) elapses with the dial still in
+    // flight; the TCP entry waits on it rather than dialing A a second time.
+    w.agent.handle_tick(at(4_000));
+    assert_eq!(dial_count_for(&drain_actions(&mut w.agent), &w.a), 0);
+
+    w.agent
+        .dial_result(quic_token, Err("QUIC gave up".into()), at(4_100));
+    assert!(
+        drain_actions(&mut w.agent)
+            .iter()
+            .any(|action| matches!(action, NatAction::Dial { addr, .. } if *addr == tcp)),
+        "the TCP address is dialed, not skipped"
+    );
+    assert!(
+        drain_events(&mut w.agent).is_empty(),
+        "the leg is still live"
+    );
+}
