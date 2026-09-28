@@ -194,6 +194,9 @@ fn stateless_reset_closes_the_connection_whose_token_it_carries() {
     assert_eq!(closed, ids, "each reset should close its own connection");
 }
 
+/// quiche silently discards these packets even when misrouted, so this pins
+/// that stray datagrams cannot disturb either connection; the reset test above
+/// is the one that fails if routing by source address returns.
 #[test]
 fn unknown_cid_datagrams_from_a_shared_peer_address_leave_both_connections_intact() {
     let (mut client, mut server, ids) = connect_twice();
