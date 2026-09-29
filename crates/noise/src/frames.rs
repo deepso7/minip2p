@@ -43,7 +43,8 @@ impl FrameDecoder {
     /// Returns the next complete frame payload, if one is buffered.
     ///
     /// A buffer holding exactly one frame is handed back whole, minus its
-    /// length prefix, so a caller-owned frame is never copied.
+    /// length prefix (shifted in place), so a caller-owned frame is never
+    /// reallocated.
     pub fn next_frame(&mut self) -> Option<Vec<u8>> {
         let remaining = self.buffer.get(self.offset..)?;
         let length: [u8; 2] = remaining.get(..2)?.try_into().ok()?;
@@ -149,7 +150,7 @@ mod tests {
     }
 
     #[test]
-    fn adopts_a_lone_caller_owned_frame_without_copying() {
+    fn adopts_a_lone_caller_owned_frame_without_reallocating() {
         let bytes = encode_frame(b"payload").unwrap();
         let allocation = bytes.as_ptr();
         let mut decoder = FrameDecoder::new();
