@@ -793,14 +793,11 @@ impl QuicConnection {
 
         for raw_stream_id in stream_ids {
             let stream_id = StreamId::new(raw_stream_id);
-            loop {
-                let Some(front) = self
-                    .send_queues
-                    .get(&raw_stream_id)
-                    .and_then(VecDeque::front)
-                else {
-                    break;
-                };
+            while let Some(front) = self
+                .send_queues
+                .get(&raw_stream_id)
+                .and_then(VecDeque::front)
+            {
                 let payload = front
                     .bytes
                     .get(front.offset..)
@@ -824,9 +821,11 @@ impl QuicConnection {
                     }
                 };
 
-                let Some(queue) = self.send_queues.get_mut(&raw_stream_id) else {
-                    break;
-                };
+                // Only the error arms above drop a queue, and they leave the loop.
+                let queue = self
+                    .send_queues
+                    .get_mut(&raw_stream_id)
+                    .expect("a successful send leaves the stream's queue in place");
                 let front = queue
                     .front_mut()
                     .expect("stored send queues are never empty");
