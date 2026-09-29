@@ -133,7 +133,7 @@ impl Drop for ExitGuard {
         state.lifecycle = Lifecycle::Stopped;
         self.shared.driver_running.store(false, Ordering::Release);
         drop(state);
-        self.shared.wake_stop_waiters(true);
+        self.shared.latch_stopped();
     }
 }
 

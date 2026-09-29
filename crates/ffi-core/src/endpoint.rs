@@ -350,7 +350,7 @@ impl P2pEndpoint {
         let released = endpoint.is_some();
         drop(endpoint);
         if released {
-            self.shared.wake_stop_waiters(true);
+            self.shared.latch_stopped();
         }
     }
 
@@ -640,7 +640,7 @@ impl P2pEndpoint {
                 thread_shared
                     .doorbell_running
                     .store(false, Ordering::Release);
-                thread_shared.wake_stop_waiters(false);
+                thread_shared.wake_stop_waiters();
             })
             .inspect_err(|_| {
                 shared.doorbell_running.store(false, Ordering::Release);
@@ -674,7 +674,7 @@ impl P2pEndpoint {
             state.lifecycle = Lifecycle::Stopped;
             state.endpoint.take();
             self.shared.driver_running.store(false, Ordering::Release);
-            self.shared.wake_stop_waiters(true);
+            self.shared.latch_stopped();
             FfiError::Internal {
                 detail: format!("failed to spawn endpoint driver: {error}"),
             }
@@ -726,35 +726,41 @@ impl Shared {
         self.stopped.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Wakes `wait_stopped` callers, first latching the stopped lifecycle
-    /// when `stopped` is set.
-    pub(crate) fn wake_stop_waiters(&self, stopped: bool) {
-        *self.lock_stopped() |= stopped;
+    /// Records that the lifecycle reached `Stopped` and wakes `wait_stopped`.
+    pub(crate) fn latch_stopped(&self) {
+        *self.lock_stopped() = true;
+        self.stopped_cv.notify_all();
+    }
+
+    /// Wakes `wait_stopped` to re-check the doorbell thread.
+    fn wake_stop_waiters(&self) {
+        let _latch = self.lock_stopped();
         self.stopped_cv.notify_all();
     }
 }
 
+/// Marks a caller about to take the state lock and interrupts the driver so
+/// it lets go.
+///
+/// Engaged unconditionally: a caller that skipped it on seeing no driver
+/// could race a concurrent `start` and then wait on a driver parked with no
+/// deadline. An interrupt with no wait to end is latched for the next one,
+/// which costs the driver one extra pass.
 struct PendingCommand<'a> {
     shared: &'a Shared,
-    engaged: bool,
 }
 
 impl<'a> PendingCommand<'a> {
     fn new(shared: &'a Shared) -> Self {
-        let engaged = shared.driver_running.load(Ordering::Acquire);
-        if engaged {
-            shared.pending_commands.fetch_add(1, Ordering::AcqRel);
-            shared.wait_handle.interrupt();
-        }
-        Self { shared, engaged }
+        shared.pending_commands.fetch_add(1, Ordering::AcqRel);
+        shared.wait_handle.interrupt();
+        Self { shared }
     }
 }
 
 impl Drop for PendingCommand<'_> {
     fn drop(&mut self) {
-        if self.engaged {
-            self.shared.pending_commands.fetch_sub(1, Ordering::AcqRel);
-        }
+        self.shared.pending_commands.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -1445,7 +1451,7 @@ mod tests {
     fn an_idle_driver_sleeps_until_a_caller_wakes_it() {
         let endpoint = endpoint(config()).expect("endpoint");
         endpoint.start(Arc::new(NoopDoorbell)).expect("start");
-        // Longer than the old 500 ms idle budget, which cycled regardless.
+        // Long enough for any fixed polling cadence to show.
         std::thread::sleep(Duration::from_millis(600));
         assert_eq!(
             endpoint.driver_stats().iterations,
