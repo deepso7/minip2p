@@ -65,7 +65,7 @@ export interface Minip2pBackend {
   reachability: () => Reachability;
   /** Returns whether the driver accepts work. */
   isRunning: () => boolean;
-  /** Selects foreground or idle polling. */
+  /** Accepted for compatibility; has no effect, since the driver sleeps until the endpoint's next deadline. */
   setActive: (active: boolean) => void;
   /** Subscribes to a pubsub topic. */
   subscribe: (topic: string) => boolean;

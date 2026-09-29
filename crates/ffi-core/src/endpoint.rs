@@ -57,7 +57,11 @@ pub struct P2pEndpoint {
 
 pub(crate) struct Shared {
     state: Mutex<EndpointState>,
-    pub(crate) stopped_cv: Condvar,
+    /// Latched once the lifecycle reaches `Stopped`. `wait_stopped` sleeps on
+    /// this rather than on `state`, which the driver holds for as long as the
+    /// endpoint has nothing due.
+    stopped: Mutex<bool>,
+    stopped_cv: Condvar,
     wait_handle: WaitHandle,
     pub(crate) pending_commands: AtomicUsize,
     pub(crate) driver_running: AtomicBool,
@@ -67,7 +71,6 @@ pub(crate) struct Shared {
 pub(crate) struct EndpointState {
     pub(crate) lifecycle: Lifecycle,
     pub(crate) endpoint: Option<Endpoint>,
-    pub(crate) active: bool,
     pub(crate) driver_thread_id: Option<std::thread::ThreadId>,
     doorbell_thread_id: Option<std::thread::ThreadId>,
     pub(crate) carry: crate::driver::Carry,
@@ -204,13 +207,13 @@ impl P2pEndpoint {
                 state: Mutex::new(EndpointState {
                     lifecycle: Lifecycle::Created,
                     endpoint: Some(endpoint),
-                    active: false,
                     driver_thread_id: None,
                     doorbell_thread_id: None,
                     carry: crate::driver::Carry::default(),
                     overflow: crate::driver::OverflowDiagnostic::default(),
                     stats: DriverStats::default(),
                 }),
+                stopped: Mutex::new(false),
                 stopped_cv: Condvar::new(),
                 wait_handle,
                 pending_commands: AtomicUsize::new(0),
@@ -268,11 +271,12 @@ impl P2pEndpoint {
         })
     }
 
-    /// Selects active or idle driver polling without changing delivery semantics.
-    pub fn set_active(&self, active: bool) {
-        let _pending = PendingCommand::new(&self.shared);
-        self.shared.lock_state().active = active;
-    }
+    /// Accepted for compatibility and ignored.
+    ///
+    /// The driver used to poll on a faster cadence while active. It now
+    /// sleeps until the endpoint's next deadline in either state, so there is
+    /// no cadence left to select.
+    pub fn set_active(&self, _active: bool) {}
 
     /// Returns whether the background driver is accepting work.
     ///
@@ -341,11 +345,12 @@ impl P2pEndpoint {
                 Lifecycle::Stopping | Lifecycle::Stopped => None,
             }
         };
+        // Only a stop from `Created` releases the endpoint here; a running
+        // driver releases it on exit.
+        let released = endpoint.is_some();
         drop(endpoint);
-
-        let stopped = self.shared.lock_state().lifecycle == Lifecycle::Stopped;
-        if stopped {
-            self.shared.stopped_cv.notify_all();
+        if released {
+            self.shared.latch_stopped();
         }
     }
 
@@ -360,36 +365,42 @@ impl P2pEndpoint {
     pub fn wait_stopped(&self, timeout_ms: u64) -> bool {
         let timeout = Duration::from_millis(timeout_ms);
         let started = Instant::now();
-        let mut state = self.shared.lock_state();
-        if state.lifecycle == Lifecycle::Stopped
-            && !self.shared.doorbell_running.load(Ordering::Acquire)
-        {
+        let is_stopped =
+            |latched: bool| latched && !self.shared.doorbell_running.load(Ordering::Acquire);
+        if is_stopped(*self.shared.lock_stopped()) {
             return true;
         }
-        if state.driver_thread_id == Some(std::thread::current().id())
-            || state.doorbell_thread_id == Some(std::thread::current().id())
-        {
+        // A zero timeout is a pure poll: skip the thread-identity check, which
+        // interrupts the driver and takes `state`, since there's nothing to wait on.
+        if timeout.is_zero() {
             return false;
         }
-        loop {
-            if state.lifecycle == Lifecycle::Stopped
-                && !self.shared.doorbell_running.load(Ordering::Acquire)
+        {
+            let _pending = PendingCommand::new(&self.shared);
+            let state = self.shared.lock_state();
+            if state.driver_thread_id == Some(std::thread::current().id())
+                || state.doorbell_thread_id == Some(std::thread::current().id())
             {
+                return false;
+            }
+        }
+        // Sleeps on the stopped latch rather than on `state`: an idle driver
+        // holds `state` until something is due, which could be never.
+        let mut stopped = self.shared.lock_stopped();
+        loop {
+            if is_stopped(*stopped) {
                 return true;
             }
             let remaining = timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 return false;
             }
-            let (next, result) = self
+            stopped = self
                 .shared
                 .stopped_cv
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(PoisonError::into_inner);
-            state = next;
-            if result.timed_out() && state.lifecycle != Lifecycle::Stopped {
-                return false;
-            }
+                .wait_timeout(stopped, remaining)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
     }
 
@@ -634,7 +645,7 @@ impl P2pEndpoint {
                 thread_shared
                     .doorbell_running
                     .store(false, Ordering::Release);
-                thread_shared.stopped_cv.notify_all();
+                thread_shared.wake_stop_waiters();
             })
             .inspect_err(|_| {
                 shared.doorbell_running.store(false, Ordering::Release);
@@ -652,6 +663,8 @@ impl P2pEndpoint {
             Arc<dyn EventDoorbell>,
         ) -> std::io::Result<std::thread::ThreadId>,
     ) -> Result<(), FfiError> {
+        // A second `start` finds the driver parked on the lock.
+        let _pending = PendingCommand::new(&self.shared);
         let mut state = self.shared.lock_state();
         match state.lifecycle {
             Lifecycle::Created => {}
@@ -666,7 +679,7 @@ impl P2pEndpoint {
             state.lifecycle = Lifecycle::Stopped;
             state.endpoint.take();
             self.shared.driver_running.store(false, Ordering::Release);
-            self.shared.stopped_cv.notify_all();
+            self.shared.latch_stopped();
             FfiError::Internal {
                 detail: format!("failed to spawn endpoint driver: {error}"),
             }
@@ -678,6 +691,7 @@ impl P2pEndpoint {
     ///
     /// This method is intentionally outside the UniFFI export block.
     pub fn driver_stats(&self) -> DriverStats {
+        let _pending = PendingCommand::new(&self.shared);
         self.shared.lock_state().stats
     }
 
@@ -707,32 +721,51 @@ impl Drop for P2pEndpoint {
 }
 
 impl Shared {
+    /// Locks the endpoint state. The driver holds this across its blocking
+    /// wait, so another thread takes a `PendingCommand` first to interrupt it.
     pub(crate) fn lock_state(&self) -> MutexGuard<'_, EndpointState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    fn lock_stopped(&self) -> MutexGuard<'_, bool> {
+        self.stopped.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records that the lifecycle reached `Stopped` and wakes `wait_stopped`.
+    pub(crate) fn latch_stopped(&self) {
+        *self.lock_stopped() = true;
+        self.stopped_cv.notify_all();
+    }
+
+    /// Wakes `wait_stopped` to re-check the doorbell thread.
+    fn wake_stop_waiters(&self) {
+        let _latch = self.lock_stopped();
+        self.stopped_cv.notify_all();
+    }
 }
 
+/// Marks a caller about to take the state lock and interrupts the driver so
+/// it lets go.
+///
+/// Engaged unconditionally: a caller that skipped it on seeing no driver
+/// could race a concurrent `start` and then wait on a driver parked with no
+/// deadline. An interrupt with no wait to end is latched for the next one,
+/// which costs the driver one extra pass.
 struct PendingCommand<'a> {
     shared: &'a Shared,
-    engaged: bool,
 }
 
 impl<'a> PendingCommand<'a> {
     fn new(shared: &'a Shared) -> Self {
-        let engaged = shared.driver_running.load(Ordering::Acquire);
-        if engaged {
-            shared.pending_commands.fetch_add(1, Ordering::AcqRel);
-            shared.wait_handle.interrupt();
-        }
-        Self { shared, engaged }
+        shared.pending_commands.fetch_add(1, Ordering::AcqRel);
+        shared.wait_handle.interrupt();
+        Self { shared }
     }
 }
 
 impl Drop for PendingCommand<'_> {
     fn drop(&mut self) {
-        if self.engaged {
-            self.shared.pending_commands.fetch_sub(1, Ordering::AcqRel);
-        }
+        self.shared.pending_commands.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -1394,18 +1427,15 @@ mod tests {
     }
 
     #[test]
-    fn stop_and_set_active_are_idempotent_in_created_and_stopped_states() {
+    fn stop_is_idempotent_in_created_and_stopped_states() {
         let endpoint = endpoint(config()).expect("endpoint");
 
-        endpoint.set_active(true);
-        assert!(endpoint.shared.lock_state().active);
         endpoint.stop();
         endpoint.stop();
-        endpoint.set_active(false);
 
+        assert!(endpoint.wait_stopped(0));
         let state = endpoint.shared.lock_state();
         assert_eq!(state.lifecycle, Lifecycle::Stopped);
-        assert!(!state.active);
         assert!(state.endpoint.is_none());
     }
 
@@ -1420,6 +1450,44 @@ mod tests {
         assert!(endpoint.wait_stopped(1_000));
         assert!(!endpoint.is_running());
         assert!(endpoint.shared.lock_state().endpoint.is_none());
+    }
+
+    #[test]
+    fn an_idle_driver_sleeps_until_a_caller_wakes_it() {
+        let endpoint = endpoint(config()).expect("endpoint");
+        endpoint.start(Arc::new(NoopDoorbell)).expect("start");
+        // Long enough for any fixed polling cadence to show.
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(
+            endpoint.driver_stats().iterations,
+            0,
+            "an endpoint with nothing due must not cycle its driver"
+        );
+
+        // The parked driver holds the endpoint lock with no deadline, so each
+        // of these would block forever if it failed to wake it.
+        let (done, finished) = std::sync::mpsc::channel();
+        let caller = Arc::clone(&endpoint);
+        std::thread::spawn(move || {
+            assert!(!caller.wait_stopped(20), "nothing has stopped it yet");
+            assert!(matches!(
+                caller.start(Arc::new(NoopDoorbell)),
+                Err(FfiError::AlreadyStarted)
+            ));
+            assert_eq!(
+                caller.driver_stats().iterations,
+                0,
+                "an interrupt alone is no cycle"
+            );
+            assert!(caller.subscribe("room".into()).expect("subscribe"));
+            caller.stop();
+            done.send(caller.wait_stopped(60_000)).expect("report");
+        });
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(30)),
+            Ok(true),
+            "queries, commands and stop must each wake an idle driver"
+        );
     }
 
     #[test]

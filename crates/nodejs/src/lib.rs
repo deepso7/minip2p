@@ -224,7 +224,7 @@ impl NodeEndpoint {
             .map_err(native_error)
     }
 
-    /// Selects foreground or idle polling.
+    /// Accepted for compatibility; has no effect, since the driver sleeps until the endpoint's next deadline.
     #[napi]
     pub fn set_active(&self, active: bool) {
         self.0.set_active(active);

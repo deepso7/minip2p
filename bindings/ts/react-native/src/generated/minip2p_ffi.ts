@@ -4111,7 +4111,7 @@ export interface P2pEndpointLike {
  */
     sendStream(peerId: string, streamId: bigint, data: ArrayBuffer) /*throws*/: void;
 /**
- * Selects active or idle polling.
+ * Accepted for compatibility; has no effect, since the driver sleeps until the endpoint's next deadline.
  */
     setActive(active: boolean): void;
 /**
@@ -4594,7 +4594,7 @@ export class P2pEndpoint extends UniffiAbstractObject implements P2pEndpointLike
     }
 
 /**
- * Selects active or idle polling.
+ * Accepted for compatibility; has no effect, since the driver sleeps until the endpoint's next deadline.
  */
     setActive(active: boolean): void {uniffiCaller.rustCall(
             /*caller:*/ (callStatus) => { nativeModule().ubrn_uniffi_minip2p_ffi_fn_method_p2pendpoint_set_active(
@@ -4894,7 +4894,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_send_stream() !== 64427) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_send_stream");
     }
-    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_set_active() !== 95) {
+    if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_set_active() !== 10522) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_minip2p_ffi_checksum_method_p2pendpoint_set_active");
     }
     if (nativeModule().ubrn_uniffi_minip2p_ffi_checksum_method_p2pendpoint_start() !== 31285) {

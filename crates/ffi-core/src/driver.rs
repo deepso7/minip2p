@@ -6,14 +6,12 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use minip2p::{EndpointWaitOutcome, Error};
+use minip2p::{Deadline, EndpointWaitOutcome, Error};
 
 use crate::endpoint::{Lifecycle, Shared};
 use crate::events::convert_endpoint_event;
 use crate::{DriverFailureKind, EventDoorbell, P2pEvent};
 
-const DRIVER_POLL: Duration = Duration::from_millis(25);
-const DRIVER_IDLE_POLL: Duration = Duration::from_millis(500);
 const MAX_CARRY_EVENTS: usize = 4096;
 /// How many already-queued `wait` results one pump iteration will take
 /// before yielding the lock. Further events stay queued for the next wait.
@@ -135,7 +133,7 @@ impl Drop for ExitGuard {
         state.lifecycle = Lifecycle::Stopped;
         self.shared.driver_running.store(false, Ordering::Release);
         drop(state);
-        self.shared.stopped_cv.notify_all();
+        self.shared.latch_stopped();
     }
 }
 
@@ -193,11 +191,6 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
             return Ok(());
         }
         let was_empty = state.carry.is_empty();
-        let deadline = if state.active {
-            DRIVER_POLL
-        } else {
-            DRIVER_IDLE_POLL
-        };
         let crate::endpoint::EndpointState {
             endpoint,
             carry,
@@ -209,9 +202,14 @@ fn pump(guard: &mut ExitGuard) -> Result<(), Error> {
         // Only `Endpoint::wait`, so the carry stays in Endpoint emission
         // order. A follow-up `poll()` would open a second batch and finish
         // that batch on its own.
+        //
+        // No deadline of our own: the wait already wakes for every timer the
+        // endpoint's transports, protocols and agents report (mDNS's socket
+        // polling included), and every command, query and `stop` interrupts
+        // it. An idle driver therefore sleeps until something is due.
         let mut batch = Vec::new();
         let mut interrupted = false;
-        match endpoint.wait(deadline)? {
+        match endpoint.wait(Deadline::NEVER)? {
             EndpointWaitOutcome::Interrupted => interrupted = true,
             EndpointWaitOutcome::Event(event) => batch.push(event),
             EndpointWaitOutcome::Deadline => {}
