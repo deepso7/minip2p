@@ -370,6 +370,11 @@ impl P2pEndpoint {
         if is_stopped(*self.shared.lock_stopped()) {
             return true;
         }
+        // A zero timeout is a pure poll: skip the thread-identity check, which
+        // interrupts the driver and takes `state`, since there's nothing to wait on.
+        if timeout.is_zero() {
+            return false;
+        }
         {
             let _pending = PendingCommand::new(&self.shared);
             let state = self.shared.lock_state();
