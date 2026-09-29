@@ -24,7 +24,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use minip2p_core::{
-    FrameFault, WIRE_LEN, WireError, encode_bytes_field, read_len_delimited, read_tag, skip_field,
+    WIRE_LEN, WireError, encode_bytes_field, read_len_delimited, read_tag, skip_field,
 };
 use thiserror::Error;
 
@@ -62,9 +62,6 @@ pub enum IdentifyMessageError {
     /// A shared protobuf framing failure.
     #[error(transparent)]
     Wire(#[from] WireError),
-    /// The length-prefixed frame carrying the message was not acceptable.
-    #[error(transparent)]
-    Frame(#[from] FrameFault),
     /// A string field contains invalid UTF-8.
     #[error("invalid UTF-8 in field {field_number}")]
     InvalidUtf8 { field_number: u64 },

@@ -27,8 +27,7 @@ use minip2p_autonat::{
 };
 use minip2p_core::SansIoProtocol;
 
-// Fails if our own address list does not fit in one 8192-byte frame.
-let mut client = AutoNatClient::new(&our_peer_id, &candidate_addrs)?;
+let mut client = AutoNatClient::new(&our_peer_id, &candidate_addrs);
 let mut server = AutoNatServer::new();
 
 while let Some(AutoNatClientOutput::Outbound(bytes)) = client.poll_output() {
@@ -51,7 +50,7 @@ server.handle_input(AutoNatServerInput::Flush)?;
 
 ## Size limits
 
-Messages carry at most 8192 payload bytes. The declared length is checked from the frame header, so a message at exactly the maximum is accepted — including one that arrives with pipelined bytes behind it — while bytes that could never complete a legal frame are refused before they are buffered. Outgoing requests and responses are checked against the same limit, so neither side puts a frame on the wire that the other is required to refuse.
+Messages carry at most 8192 payload bytes. The declared length is checked from the frame header, so a message at exactly the maximum is accepted — including one that arrives with pipelined bytes behind it — while bytes that could never complete a legal frame are refused before they are buffered. Outgoing messages respect the same limit, so neither side puts a frame on the wire that the other is required to refuse: a DIAL request carries as many of our addresses as fit, in the order given, and a response that would not fit is refused locally and queues nothing.
 
 ## no_std
 

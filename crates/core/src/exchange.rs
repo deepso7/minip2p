@@ -72,10 +72,10 @@ impl FrameExchange {
     /// An exchange that also tolerates `trailing` bytes behind the frame being
     /// parsed.
     ///
-    /// For a protocol that pipelines (DCUtR's SYNC can arrive with CONNECT) or
-    /// hands the remainder on (the relay passes bytes after HOP to the bridged
-    /// stream), those bytes are legal and must not be refused with the frame
-    /// they arrived with.
+    /// For a protocol whose peer may pipeline its next message behind the
+    /// current one, those bytes are legal and must not be refused with the
+    /// frame they arrived with; they stay in [`buffered`](Self::buffered) until
+    /// the next [`next_frame`](Self::next_frame).
     pub fn with_trailing(max_len: usize, trailing: usize) -> Self {
         Self {
             outbound: Vec::new(),
@@ -87,14 +87,9 @@ impl FrameExchange {
         }
     }
 
-    /// The largest payload this exchange sends or accepts.
-    pub const fn max_len(&self) -> usize {
-        self.max_len
-    }
-
     /// Frames `payload` and queues it for sending.
     ///
-    /// Rejects a payload over [`max_len`](Self::max_len) rather than putting a
+    /// Rejects a payload over the maximum rather than putting a
     /// frame on the wire that a compliant peer must refuse.
     pub fn queue(&mut self, payload: &[u8]) -> Result<(), FrameFault> {
         if payload.len() > self.max_len {
@@ -188,6 +183,8 @@ impl FrameExchange {
             *slot = *byte;
             len += 1;
         }
+        // `len` never exceeds `head`; `get` only satisfies the workspace's
+        // no-panicking-slices lint.
         read_uvarint(head.get(..len)?)
             .ok()
             .map(|(declared, _)| declared)
@@ -196,19 +193,6 @@ impl FrameExchange {
     /// The bytes received but not yet consumed by [`next_frame`](Self::next_frame).
     pub fn buffered(&self) -> &[u8] {
         &self.recv
-    }
-
-    /// Takes the unconsumed bytes, leaving the receive buffer empty.
-    ///
-    /// This is how a protocol hands on what follows its last frame: the relay
-    /// gives it to the bridged stream, DCUtR keeps what arrived behind CONNECT.
-    pub fn take_buffered(&mut self) -> Vec<u8> {
-        core::mem::take(&mut self.recv)
-    }
-
-    /// Drops the unconsumed bytes and releases the buffer.
-    pub fn clear_buffered(&mut self) {
-        self.recv = Vec::new();
     }
 }
 
@@ -328,8 +312,6 @@ mod tests {
             .expect("a maximal frame plus trailing bytes");
         assert_eq!(ex.next_frame(identity).unwrap().unwrap().len(), MAX);
         assert_eq!(ex.buffered(), b"pipelined");
-        assert_eq!(ex.take_buffered(), b"pipelined");
-        assert!(ex.buffered().is_empty());
     }
 
     #[test]

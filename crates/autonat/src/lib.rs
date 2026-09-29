@@ -22,7 +22,7 @@ use minip2p_core::write_uvarint;
 use minip2p_core::{
     FrameExchange, FrameFault, Multiaddr, PeerId, SansIoProtocol, WIRE_LEN, WIRE_VARINT, WireError,
     encode_bytes_field, encode_varint_field, read_len_delimited, read_tag, read_varint_value,
-    skip_field,
+    skip_field, uvarint_len,
 };
 
 /// Protocol id for AutoNAT v1.
@@ -197,9 +197,10 @@ struct Message {
 /// AutoNAT context while reusing the core protobuf vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum AutoNatError {
-    /// Incoming message exceeded the configured maximum size.
-    #[error("AutoNAT message exceeds maximum size ({len} > {MAX_MESSAGE_SIZE})")]
-    MessageTooLarge { len: usize },
+    /// Received bytes would exceed the receive buffer limit: one maximal
+    /// frame plus the pipelined bytes allowed behind it.
+    #[error("AutoNAT receive buffer would hold {len} bytes, over the limit of {limit}")]
+    MessageTooLarge { len: usize, limit: usize },
     /// Frame prefix declared a message larger than the configured maximum size.
     #[error("AutoNAT frame length exceeds maximum size ({len} > {MAX_MESSAGE_SIZE})")]
     FrameTooLarge { len: u64 },
@@ -227,7 +228,7 @@ impl From<FrameFault> for AutoNatError {
     fn from(fault: FrameFault) -> Self {
         match fault {
             FrameFault::TooLarge { len, .. } => Self::FrameTooLarge { len },
-            FrameFault::Overflow { len, .. } => Self::MessageTooLarge { len },
+            FrameFault::Overflow { len, limit } => Self::MessageTooLarge { len, limit },
             FrameFault::Wire(e) => Self::Wire(e),
         }
     }
@@ -273,26 +274,40 @@ enum ServerState {
 impl AutoNatClient {
     /// Creates a client probe and queues a DIAL request.
     ///
-    /// Fails when our own address list does not fit in one AutoNAT frame,
-    /// rather than sending a request the server is required to refuse.
-    pub fn new(peer_id: &PeerId, addrs: &[Multiaddr]) -> Result<Self, AutoNatError> {
-        let peer = PeerInfo {
+    /// The request carries `addrs` in order, up to as many as fit in one
+    /// AutoNAT frame; the rest are left out. Offering a subset is legal — the
+    /// server just has fewer candidates to dial back — whereas an oversized
+    /// request is one the server is required to refuse.
+    pub fn new(peer_id: &PeerId, addrs: &[Multiaddr]) -> Self {
+        let mut peer = PeerInfo {
             id: peer_id.to_bytes(),
-            addrs: addrs.iter().map(Multiaddr::to_bytes).collect(),
+            addrs: Vec::new(),
         };
+        let mut peer_len = field_len(peer.id.len());
+        for addr in addrs {
+            let addr = addr.to_bytes();
+            let grown = peer_len + field_len(addr.len());
+            if dial_message_len(grown) > MAX_MESSAGE_SIZE {
+                break;
+            }
+            peer_len = grown;
+            peer.addrs.push(addr);
+        }
         let msg = Message {
             kind: MessageType::Dial,
             dial: Some(Dial { peer: Some(peer) }),
             dial_response: None,
         };
         let mut frames = FrameExchange::with_trailing(MAX_MESSAGE_SIZE, MAX_TRAILING);
-        frames.queue(&msg.encode())?;
-        Ok(Self {
+        frames
+            .queue(&msg.encode())
+            .expect("addresses were trimmed to fit one frame");
+        Self {
             frames,
             state: FlowState::Pending,
             outcome: None,
             emitted_outcome: false,
-        })
+        }
     }
 
     /// Drains pending outbound bytes.
@@ -670,6 +685,18 @@ impl DialResponse {
     }
 }
 
+/// Encoded size of a length-delimited field with a one-byte tag.
+fn field_len(len: usize) -> usize {
+    1 + uvarint_len(len as u64) + len
+}
+
+/// Encoded size of a DIAL [`Message`] whose `PeerInfo` body is `peer_len`
+/// bytes: the type field, then `dial { peer { .. } }`. Mirrors the encoders
+/// above, so [`AutoNatClient::new`] can size a request without re-encoding it.
+fn dial_message_len(peer_len: usize) -> usize {
+    2 + field_len(field_len(peer_len))
+}
+
 fn decode_addrs(raw: &[Vec<u8>]) -> Vec<Multiaddr> {
     raw.iter()
         .filter_map(|bytes| Multiaddr::from_bytes(bytes).ok())
@@ -720,7 +747,7 @@ mod tests {
     #[test]
     fn client_accepts_a_response_at_the_maximum_size() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
-        let mut client = AutoNatClient::new(&peer_id, &[]).expect("request fits");
+        let mut client = AutoNatClient::new(&peer_id, &[]);
         let framed = encode_frame(&response_payload(MAX_MESSAGE_SIZE));
         assert_eq!(framed.len(), MAX_MESSAGE_SIZE + 2);
 
@@ -736,7 +763,7 @@ mod tests {
     #[test]
     fn client_rejects_a_declared_length_above_the_maximum() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
-        let mut client = AutoNatClient::new(&peer_id, &[]).expect("request fits");
+        let mut client = AutoNatClient::new(&peer_id, &[]);
         // A header declaring MAX + 1, rejected before any payload arrives.
         let mut framed = Vec::new();
         write_uvarint(MAX_MESSAGE_SIZE as u64 + 1, &mut framed);
@@ -754,7 +781,7 @@ mod tests {
     #[test]
     fn client_accepts_a_maximal_response_carrying_trailing_bytes() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
-        let mut client = AutoNatClient::new(&peer_id, &[]).expect("request fits");
+        let mut client = AutoNatClient::new(&peer_id, &[]);
         let mut chunk = encode_frame(&response_payload(MAX_MESSAGE_SIZE));
         chunk.extend_from_slice(b"pipelined");
 
@@ -771,7 +798,7 @@ mod tests {
     #[test]
     fn an_over_declared_response_is_refused_before_its_payload_is_buffered() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
-        let mut client = AutoNatClient::new(&peer_id, &[]).expect("request fits");
+        let mut client = AutoNatClient::new(&peer_id, &[]);
         let mut chunk = Vec::new();
         write_uvarint(MAX_MESSAGE_SIZE as u64 + 1, &mut chunk);
         chunk.extend_from_slice(&vec![0u8; MAX_MESSAGE_SIZE + 1]);
@@ -788,26 +815,53 @@ mod tests {
     #[test]
     fn an_oversized_chunk_is_refused_before_it_is_buffered() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
-        let mut client = AutoNatClient::new(&peer_id, &[]).expect("request fits");
+        let mut client = AutoNatClient::new(&peer_id, &[]);
         let oversized = vec![0u8; 2 * MAX_MESSAGE_SIZE + 3];
 
-        assert!(matches!(
+        // The limit is one maximal frame (2-byte prefix) plus its trailing allowance.
+        assert_eq!(
             client.on_data(&oversized),
-            Err(AutoNatError::MessageTooLarge { .. })
-        ));
+            Err(AutoNatError::MessageTooLarge {
+                len: 2 * MAX_MESSAGE_SIZE + 3,
+                limit: 2 * MAX_MESSAGE_SIZE + 2,
+            })
+        );
         assert!(client.frames.buffered().is_empty());
     }
 
+    /// Our own addresses are trimmed to what fits in one frame, keeping their
+    /// order, so the probe is always sent rather than refused.
     #[test]
-    fn a_request_that_cannot_be_framed_is_refused_locally() {
+    fn a_request_is_trimmed_to_the_addresses_that_fit() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
-        let addr = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
-        let addrs = vec![addr; 2048];
+        let addrs: Vec<Multiaddr> = (0..2048)
+            .map(|port| {
+                Multiaddr::from_str(&alloc::format!("/ip4/203.0.113.7/udp/{port}/quic-v1")).unwrap()
+            })
+            .collect();
+        let mut client = AutoNatClient::new(&peer_id, &addrs);
+        let mut server = AutoNatServer::new();
 
-        assert!(matches!(
-            AutoNatClient::new(&peer_id, &addrs),
-            Err(AutoNatError::FrameTooLarge { .. })
-        ));
+        server
+            .on_data(&client.take_outbound())
+            .expect("the request fits");
+        let request = server.request().expect("request should decode");
+        let kept = request.addrs.len();
+        assert!(0 < kept && kept < addrs.len());
+        assert_eq!(request.addrs, addrs[..kept], "a prefix, in order");
+
+        // The boundary is exact: one more address would not have fit.
+        let one_more = Message {
+            kind: MessageType::Dial,
+            dial: Some(Dial {
+                peer: Some(PeerInfo {
+                    id: peer_id.to_bytes(),
+                    addrs: addrs[..=kept].iter().map(Multiaddr::to_bytes).collect(),
+                }),
+            }),
+            dial_response: None,
+        };
+        assert!(one_more.encode().len() > MAX_MESSAGE_SIZE);
     }
 
     #[test]
@@ -826,8 +880,7 @@ mod tests {
     fn client_server_public_round_trip() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
         let addr = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
-        let mut client =
-            AutoNatClient::new(&peer_id, core::slice::from_ref(&addr)).expect("request fits");
+        let mut client = AutoNatClient::new(&peer_id, core::slice::from_ref(&addr));
         let mut server = AutoNatServer::new();
 
         server.on_data(&client.take_outbound()).unwrap();
@@ -848,7 +901,7 @@ mod tests {
     #[test]
     fn client_maps_dial_error_to_private() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
-        let mut client = AutoNatClient::new(&peer_id, &[]).expect("request fits");
+        let mut client = AutoNatClient::new(&peer_id, &[]);
         let mut server = AutoNatServer::new();
 
         server.on_data(&client.take_outbound()).unwrap();
@@ -865,7 +918,7 @@ mod tests {
     #[test]
     fn client_consumes_bad_frame_before_decode_error() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
-        let mut client = AutoNatClient::new(&peer_id, &[]).expect("request fits");
+        let mut client = AutoNatClient::new(&peer_id, &[]);
         let _ = client.take_outbound();
 
         let bad_frame = encode_frame(&[TAG_TYPE, 99]);
@@ -897,8 +950,7 @@ mod tests {
 
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
         let addr = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
-        let mut client =
-            AutoNatClient::new(&peer_id, core::slice::from_ref(&addr)).expect("request fits");
+        let mut client = AutoNatClient::new(&peer_id, core::slice::from_ref(&addr));
         server.on_data(&client.take_outbound()).unwrap();
 
         let request = server
@@ -1010,8 +1062,7 @@ mod tests {
     fn client_and_server_implement_sans_io_protocol() {
         let peer_id = PeerId::from_str(PEER_ID).unwrap();
         let addr = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
-        let mut client =
-            AutoNatClient::new(&peer_id, core::slice::from_ref(&addr)).expect("request fits");
+        let mut client = AutoNatClient::new(&peer_id, core::slice::from_ref(&addr));
         let mut server = AutoNatServer::new();
 
         client.handle_input(AutoNatClientInput::Flush).unwrap();
