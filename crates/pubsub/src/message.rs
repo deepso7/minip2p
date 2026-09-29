@@ -16,8 +16,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use minip2p_core::{
-    PeerId, WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field, encode_nested_field,
-    encode_varint_field, read_len_delimited, read_string, read_varint_value, skip_field,
+    PeerId, WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field, encode_varint_field,
+    read_len_delimited, read_string, read_varint_value, skip_field,
 };
 use minip2p_identity::{Ed25519Keypair, PublicKey};
 
@@ -446,16 +446,16 @@ impl ControlMessage {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         for ihave in &self.ihave {
-            encode_nested_field(&mut out, 1, &ihave.encode());
+            encode_bytes_field(&mut out, 1, &ihave.encode());
         }
         for iwant in &self.iwant {
-            encode_nested_field(&mut out, 2, &iwant.encode());
+            encode_bytes_field(&mut out, 2, &iwant.encode());
         }
         for graft in &self.graft {
-            encode_nested_field(&mut out, 3, &graft.encode());
+            encode_bytes_field(&mut out, 3, &graft.encode());
         }
         for prune in &self.prune {
-            encode_nested_field(&mut out, 4, &prune.encode());
+            encode_bytes_field(&mut out, 4, &prune.encode());
         }
         out
     }
@@ -588,7 +588,7 @@ impl ControlPrune {
             encode_bytes_field(&mut out, 1, topic_id.as_bytes());
         }
         for peer in &self.peers {
-            encode_nested_field(&mut out, 2, &peer.encode());
+            encode_bytes_field(&mut out, 2, &peer.encode());
         }
         if let Some(backoff) = self.backoff {
             encode_varint_field(&mut out, 3, backoff);
@@ -651,13 +651,13 @@ impl Rpc {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         for sub in &self.subscriptions {
-            encode_nested_field(&mut out, 1, &sub.encode());
+            encode_bytes_field(&mut out, 1, &sub.encode());
         }
         for message in &self.publish {
-            encode_nested_field(&mut out, 2, &message.to_wire());
+            encode_bytes_field(&mut out, 2, &message.to_wire());
         }
         if let Some(control) = &self.control {
-            encode_nested_field(&mut out, 3, &control.encode());
+            encode_bytes_field(&mut out, 3, &control.encode());
         }
         out
     }
@@ -871,8 +871,8 @@ mod tests {
             ..ControlMessage::default()
         };
         let mut encoded = Vec::new();
-        encode_nested_field(&mut encoded, 3, &first.encode());
-        encode_nested_field(&mut encoded, 3, &second.encode());
+        encode_bytes_field(&mut encoded, 3, &first.encode());
+        encode_bytes_field(&mut encoded, 3, &second.encode());
 
         let merged = Rpc::decode(&encoded).unwrap().control.unwrap();
         assert_eq!(merged.graft, first.graft);
@@ -921,8 +921,8 @@ mod tests {
     fn decode_rejects_malformed_control() {
         // The nested field-zero tag is malformed protobuf.
         let mut encoded = Vec::new();
-        encode_nested_field(&mut encoded, 3, &[0x00, 0x01]);
-        encode_nested_field(
+        encode_bytes_field(&mut encoded, 3, &[0x00, 0x01]);
+        encode_bytes_field(
             &mut encoded,
             1,
             &SubOpts {

@@ -11,10 +11,10 @@ Identify is the libp2p handshake that lets two peers exchange their supported pr
   - **Initiator** (dialer side): reads the remote's identify message and surfaces it as an event.
 - Per-peer state tracking with multi-stream support.
 - Protobuf encode/decode for `IdentifyMessage` (field-number order on encode, any-order accept on decode; unknown fields with known wire types are silently skipped). Field framing uses the shared vocabulary in `minip2p-core`; semantic validation and contextual `IdentifyMessageError` values stay here.
-- 8 KiB inbound message size cap.
+- 8 KiB frame size cap; a message may arrive in up to two frames, which are merged.
 - Peer-id migration support for swarms that discover the real `PeerId` after connection establishment.
 - `IdentifyInput` values for stream lifecycle, peer migration, and received bytes.
-- `IdentifyOutput` values wrapping host actions (`Send`, `CloseStreamWrite`) and protocol events (`Received`, `Error`).
+- `IdentifyOutput` values wrapping host actions (`Send`, `CloseStreamWrite`, `ResetStream`) and protocol events (`Received`, `Error`).
 
 ## Usage
 
@@ -65,6 +65,7 @@ let mut identify = IdentifyProtocol::new(config);
 
 - Protocol ID: `/ipfs/id/1.0.0`
 - Wire format: a varint length prefix followed by a protobuf-encoded `Identify` message, then the responder half-closes its write side.
+- Size: one message per stream, in at most two frames of at most 8192 payload bytes each. go-libp2p sends a large message with a signed peer record as a base frame followed by a frame holding only the record; the frames are merged as protobuf (repeated fields append, a later scalar wins), matching go's reader. A frame at exactly the maximum is accepted. The declared length is checked from the frame header, so bytes that could never complete a legal message are refused before they are buffered, and the stream is reset. More frames than allowed, or bytes that never complete a frame, are reported as an `Error` event rather than dropped. An outgoing message that would exceed the limit is refused locally instead of being put on the wire.
 - Fields: `publicKey`, `listenAddrs` (repeated, multicodec-binary), `protocols` (repeated), `observedAddr` (multicodec-binary), `protocolVersion`, `agentVersion`.
 
 ## no_std

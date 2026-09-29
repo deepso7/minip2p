@@ -472,7 +472,8 @@ fn fuzz_mdns(data: &[u8]) {
 }
 
 /// Exercises both the raw message decoder and the state-machine path that
-/// runs the private length-prefixed framing decoder.
+/// runs the length-prefixed framing decoder. The input is fed in two halves so
+/// a frame header can straddle buffered bytes and the incoming chunk.
 fn fuzz_identify(data: &[u8]) {
     let _ = IdentifyMessage::decode(data);
 
@@ -488,11 +489,14 @@ fn fuzz_identify(data: &[u8]) {
         peer_id: peer_id.clone(),
         stream_id,
     });
-    let _ = identify.handle_input(IdentifyInput::StreamData {
-        peer_id: peer_id.clone(),
-        stream_id,
-        data: data.to_vec(),
-    });
+    let (head, tail) = data.split_at(data.len() / 2);
+    for chunk in [head, tail] {
+        let _ = identify.handle_input(IdentifyInput::StreamData {
+            peer_id: peer_id.clone(),
+            stream_id,
+            data: chunk.to_vec(),
+        });
+    }
     // Closing the remote write side decodes the buffered length-prefixed
     // message.
     let _ = identify.handle_input(IdentifyInput::StreamRemoteWriteClosed { peer_id, stream_id });
@@ -500,16 +504,23 @@ fn fuzz_identify(data: &[u8]) {
 }
 
 /// Runs the frame decoder plus both state machines so the message-level
-/// `read_len_delimited` path sees the decoded payload.
+/// `read_len_delimited` path sees the decoded payload. The state machines get
+/// the input in two halves so a frame header can straddle buffered bytes and
+/// the incoming chunk.
 fn fuzz_autonat(data: &[u8]) {
     let _ = minip2p_autonat::decode_frame(data);
+    let (head, tail) = data.split_at(data.len() / 2);
 
     let mut server = AutoNatServer::new();
-    let _ = server.handle_input(AutoNatServerInput::Data(data.to_vec()));
+    for chunk in [head, tail] {
+        let _ = server.handle_input(AutoNatServerInput::Data(chunk.to_vec()));
+    }
     while server.poll_output().is_some() {}
 
     let mut client = AutoNatClient::new(&fuzz_peer_id(), &[]);
-    let _ = client.handle_input(AutoNatClientInput::Data(data.to_vec()));
+    for chunk in [head, tail] {
+        let _ = client.handle_input(AutoNatClientInput::Data(chunk.to_vec()));
+    }
     while client.poll_output().is_some() {}
 }
 

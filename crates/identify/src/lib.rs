@@ -17,7 +17,10 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use minip2p_core::{Multiaddr, PeerId, SansIoProtocol, WireError, encode_frame, read_uvarint};
+use minip2p_core::{
+    FrameDecode, FrameExchange, FrameFault, Multiaddr, PeerId, SansIoProtocol, decode_frame,
+    encode_frame, uvarint_len,
+};
 use minip2p_transport::StreamId;
 use thiserror::Error;
 
@@ -26,10 +29,14 @@ pub use message::{IdentifyMessage, IdentifyMessageError};
 /// The identify protocol identifier.
 pub const IDENTIFY_PROTOCOL_ID: &str = "/ipfs/id/1.0.0";
 
-/// Maximum size for an incoming identify message (8 KiB).
+/// Maximum size of one identify frame, sent or received (8 KiB).
 ///
-/// Messages larger than this are rejected as a protocol violation.
+/// Frames larger than this are rejected as a protocol violation.
 const MAX_MESSAGE_SIZE: usize = 8192;
+
+/// Most frames one identify message may arrive in. go-libp2p sends at most
+/// two: the base message, then its signed peer record on its own.
+const MAX_MESSAGE_PARTS: usize = 2;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -69,6 +76,15 @@ pub enum IdentifyAction {
     },
     /// Half-close the write side of a stream.
     CloseStreamWrite {
+        peer_id: PeerId,
+        stream_id: StreamId,
+    },
+    /// Abruptly reset a stream in both directions.
+    ///
+    /// Emitted when a remote sends bytes that can never form a legal identify
+    /// message. A half-close would leave the stream open for as long as the
+    /// remote keeps its own write side open; a reset reclaims it now.
+    ResetStream {
         peer_id: PeerId,
         stream_id: StreamId,
     },
@@ -147,6 +163,12 @@ pub enum IdentifyError {
     /// The peer already has an active identify exchange on this role.
     #[error("identify stream already registered for peer {peer_id}")]
     StreamAlreadyRegistered { peer_id: PeerId },
+    /// Our own identify message does not fit in one frame.
+    ///
+    /// Sending it anyway would hand the remote a message it is required to
+    /// refuse; the local listen-address set or protocol list has to shrink.
+    #[error("outbound identify message exceeds maximum size ({len} > {MAX_MESSAGE_SIZE})")]
+    MessageTooLarge { len: usize },
 }
 
 // ---------------------------------------------------------------------------
@@ -158,8 +180,9 @@ pub enum IdentifyError {
 struct PeerIdentifyState {
     /// Stream where we are the responder (sending our info).
     outbound_stream: Option<StreamId>,
-    /// Streams where we are the initiator (receiving their info).
-    inbound_streams: BTreeMap<StreamId, Vec<u8>>,
+    /// Streams where we are the initiator (receiving their info), each with
+    /// the frames buffered for it so far.
+    inbound_streams: BTreeMap<StreamId, FrameExchange>,
 }
 
 // ---------------------------------------------------------------------------
@@ -222,15 +245,15 @@ impl IdentifyProtocol {
         observed_addr: Option<Multiaddr>,
         listen_addrs: &[Multiaddr],
     ) -> Result<Vec<IdentifyAction>, IdentifyError> {
-        let state = self.peers.entry(peer_id.clone()).or_default();
-
-        if state.outbound_stream.is_some() {
+        if self
+            .peers
+            .get(&peer_id)
+            .is_some_and(|state| state.outbound_stream.is_some())
+        {
             return Err(IdentifyError::StreamAlreadyRegistered {
                 peer_id: peer_id.clone(),
             });
         }
-
-        state.outbound_stream = Some(stream_id);
 
         // libp2p's Identify spec prescribes multicodec-based binary
         // encoding for observed_addr and listen_addrs (see
@@ -257,7 +280,18 @@ impl IdentifyProtocol {
         };
 
         let encoded = msg.encode();
+        // Everything that can fail happens before the stream is recorded: a
+        // message we refuse to send leaves no registration behind, so the next
+        // identify on this peer is not rejected as already registered.
+        if encoded.len() > MAX_MESSAGE_SIZE {
+            return Err(IdentifyError::MessageTooLarge { len: encoded.len() });
+        }
         let data = encode_frame(&encoded);
+
+        self.peers
+            .entry(peer_id.clone())
+            .or_default()
+            .outbound_stream = Some(stream_id);
 
         Ok(vec![
             IdentifyAction::Send {
@@ -276,13 +310,18 @@ impl IdentifyProtocol {
     /// remote closes its write side.
     fn register_inbound_stream(&mut self, peer_id: PeerId, stream_id: StreamId) {
         let state = self.peers.entry(peer_id).or_default();
-        state.inbound_streams.entry(stream_id).or_default();
+        state.inbound_streams.entry(stream_id).or_insert_with(|| {
+            // Room for every part at its maximum: the first frame is covered by
+            // the exchange itself, the rest ride behind it as trailing bytes.
+            let frame_len = MAX_MESSAGE_SIZE + uvarint_len(MAX_MESSAGE_SIZE as u64);
+            FrameExchange::with_trailing(MAX_MESSAGE_SIZE, (MAX_MESSAGE_PARTS - 1) * frame_len)
+        });
     }
 
     /// Feed received stream data into the protocol.
     ///
-    /// Returns actions the host must execute (none expected for the initiator
-    /// side, but included for consistency).
+    /// Returns actions the host must execute: none while a message is still
+    /// arriving, and a reset if the bytes are refused.
     fn on_stream_data(
         &mut self,
         peer_id: PeerId,
@@ -293,20 +332,23 @@ impl IdentifyProtocol {
             return Vec::new();
         };
 
-        if let Some(buf) = state.inbound_streams.get_mut(&stream_id) {
-            buf.extend_from_slice(&data);
-
-            if buf.len() > MAX_MESSAGE_SIZE {
-                self.events.push_back(IdentifyEvent::Error {
-                    peer_id: peer_id.clone(),
-                    stream_id,
-                    error: alloc::format!(
-                        "identify message exceeds maximum size ({} > {MAX_MESSAGE_SIZE})",
-                        buf.len()
-                    ),
-                });
-                state.inbound_streams.remove(&stream_id);
-            }
+        if let Some(frames) = state.inbound_streams.get_mut(&stream_id)
+            && let Err(fault) = frames.push(&data)
+        {
+            // The bytes are refused before they are buffered: nothing legal
+            // can still be growing towards one identify message.
+            self.events.push_back(IdentifyEvent::Error {
+                peer_id: peer_id.clone(),
+                stream_id,
+                error: alloc::format!("identify message rejected: {fault}"),
+            });
+            state.inbound_streams.remove(&stream_id);
+            // Reset rather than half-close: dropping the stream's state means
+            // the remote's half-close finds nothing to act on, and a remote
+            // that never sends one would otherwise keep the stream — and its
+            // swarm and transport state — allocated for the life of the
+            // connection.
+            return vec![IdentifyAction::ResetStream { peer_id, stream_id }];
         }
 
         Vec::new()
@@ -315,7 +357,8 @@ impl IdentifyProtocol {
     /// Notify that the remote peer closed its write side on a stream.
     ///
     /// For inbound identify streams (where we are the initiator), this
-    /// signals the message is complete. The initiator closes its own write
+    /// signals the message is complete: its parts are merged and reported as
+    /// one [`IdentifyEvent::Received`]. The initiator closes its own write
     /// side in response so that the stream can reach the `Closed` state and
     /// have its transport-level and protocol-level state reclaimed.
     fn on_stream_remote_write_closed(
@@ -327,25 +370,21 @@ impl IdentifyProtocol {
             return Vec::new();
         };
 
-        let Some(buf) = state.inbound_streams.remove(&stream_id) else {
+        let Some(mut frames) = state.inbound_streams.remove(&stream_id) else {
             return Vec::new();
         };
 
-        match decode_length_prefixed(&buf).and_then(IdentifyMessage::decode) {
-            Ok(info) => {
-                self.events.push_back(IdentifyEvent::Received {
-                    peer_id: peer_id.clone(),
-                    info,
-                });
-            }
-            Err(e) => {
-                self.events.push_back(IdentifyEvent::Error {
-                    peer_id: peer_id.clone(),
-                    stream_id,
-                    error: alloc::format!("failed to decode identify message: {e}"),
-                });
-            }
-        }
+        self.events.push_back(match merge_parts(&mut frames) {
+            Ok(info) => IdentifyEvent::Received {
+                peer_id: peer_id.clone(),
+                info,
+            },
+            Err(error) => IdentifyEvent::Error {
+                peer_id: peer_id.clone(),
+                stream_id,
+                error,
+            },
+        });
 
         // Close our own write side. We never send data on an initiator
         // identify stream, but multistream-select did, so the QUIC transport
@@ -403,6 +442,52 @@ impl IdentifyProtocol {
             }
         }
     }
+}
+
+/// Reads one identify message from every frame the remote sent.
+///
+/// go-libp2p splits a large message into a base frame and a frame carrying
+/// only its signed peer record, and its reader `proto.Merge`s the parts.
+/// Merging protobuf messages is decoding their concatenation (repeated fields
+/// append, a later scalar wins), so the payloads are joined and decoded once.
+/// More parts than [`MAX_MESSAGE_PARTS`], or bytes that never complete a
+/// frame, are reported rather than dropped.
+///
+/// The usual single-frame message is decoded in place, without joining.
+fn merge_parts(frames: &mut FrameExchange) -> Result<IdentifyMessage, String> {
+    let decode = |body: &[u8]| {
+        IdentifyMessage::decode(body)
+            .map_err(|e| alloc::format!("failed to decode identify message: {e}"))
+    };
+    if let FrameDecode::Complete { payload, consumed } =
+        decode_frame(frames.buffered(), MAX_MESSAGE_SIZE)
+        && consumed == frames.buffered().len()
+    {
+        return decode(payload);
+    }
+
+    let mut body = Vec::new();
+    let mut parts = 0;
+    loop {
+        let part = frames.next_frame(|payload| {
+            body.extend_from_slice(payload);
+            Ok::<_, FrameFault>(())
+        });
+        match part {
+            Ok(Some(())) => parts += 1,
+            Ok(None) => break,
+            Err(e) => return Err(alloc::format!("invalid identify frame: {e}")),
+        }
+        if parts > MAX_MESSAGE_PARTS {
+            return Err(alloc::format!(
+                "identify message sent in more than {MAX_MESSAGE_PARTS} parts"
+            ));
+        }
+    }
+    if parts == 0 || !frames.buffered().is_empty() {
+        return Err("identify message ended before its frame completed".into());
+    }
+    decode(&body)
 }
 
 impl SansIoProtocol for IdentifyProtocol {
@@ -465,46 +550,10 @@ impl SansIoProtocol for IdentifyProtocol {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Wire framing helpers
-// ---------------------------------------------------------------------------
-
-/// Strips the varint length prefix from a framed Identify buffer and
-/// returns a borrowed slice over the body.
-///
-/// Identify uses this path instead of [`minip2p_core::decode_frame`] so an
-/// oversized declared length is always [`WireError::FieldOverflow`],
-/// including when the length does not fit in `usize` on 32-bit targets.
-/// That keeps the error class independent of pointer width. A malformed
-/// prefix varint is [`IdentifyMessageError::Wire`].
-///
-/// Encoding uses [`minip2p_core::encode_frame`] directly (see
-/// [`IdentifyInput::RegisterOutboundStream`]).
-fn decode_length_prefixed(buf: &[u8]) -> Result<&[u8], message::IdentifyMessageError> {
-    let (len, consumed) = read_uvarint(buf).map_err(WireError::from)?;
-    let remaining = buf.len().saturating_sub(consumed);
-    // Compare as u64 before converting to usize so 32-bit and 64-bit
-    // targets take the same FieldOverflow path.
-    if len > remaining as u64 {
-        return Err(prefix_overflow(consumed, len, remaining).into());
-    }
-    let end = consumed + (len as usize);
-    buf.get(consumed..end)
-        .ok_or(prefix_overflow(consumed, len, remaining).into())
-}
-
-fn prefix_overflow(offset: usize, length: u64, remaining: usize) -> WireError {
-    WireError::FieldOverflow {
-        offset,
-        length: usize::try_from(length).unwrap_or(usize::MAX),
-        remaining,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minip2p_core::write_uvarint;
+    use minip2p_core::{encode_bytes_field, write_uvarint};
 
     impl IdentifyProtocol {
         /// Drain buffered events (test helper).
@@ -560,50 +609,241 @@ mod tests {
         assert!(identify.is_idle());
     }
 
-    #[test]
-    fn length_prefix_round_trip() {
-        let body = b"hello identify";
-        let framed = encode_frame(body);
-        assert_eq!(framed[0] as usize, body.len());
-        let decoded = decode_length_prefixed(&framed).unwrap();
-        assert_eq!(decoded, body);
+    /// Feeds `data` to an initiator stream and returns what the protocol
+    /// reported once the remote closed its write side.
+    fn receive(data: &[u8]) -> Vec<IdentifyEvent> {
+        let mut initiator = IdentifyProtocol::new(sample_config());
+        let peer = sample_peer();
+        let stream = StreamId::new(3);
+
+        initiator.register_inbound_stream(peer.clone(), stream);
+        let _ = initiator.on_stream_data(peer.clone(), stream, data.to_vec());
+        let _ = initiator.on_stream_remote_write_closed(peer, stream);
+        initiator.poll_events()
     }
 
+    fn error_text(events: &[IdentifyEvent]) -> &str {
+        match events {
+            [IdentifyEvent::Error { error, .. }] => error,
+            other => panic!("expected one error, got {other:?}"),
+        }
+    }
+
+    /// An identify message whose encoded body is exactly `len` bytes, padded
+    /// through the agent version.
+    fn body_of_len(len: usize) -> Vec<u8> {
+        for pad in len.saturating_sub(16)..=len {
+            let encoded = IdentifyMessage {
+                protocol_version: None,
+                agent_version: Some("x".repeat(pad)),
+                public_key: None,
+                listen_addrs: Vec::new(),
+                observed_addr: None,
+                protocols: Vec::new(),
+            }
+            .encode();
+            if encoded.len() == len {
+                return encoded;
+            }
+        }
+        panic!("no agent version pads an identify message to {len} bytes");
+    }
+
+    /// Regression: the buffer check counted the length prefix, so a legal
+    /// maximal message was refused.
     #[test]
-    fn length_prefix_decode_rejects_overshoot() {
-        // Declare a 255-byte body but only ship 3 bytes: should fail.
-        let mut framed = Vec::new();
-        write_uvarint(255, &mut framed);
-        framed.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+    fn a_message_at_the_maximum_size_is_accepted() {
+        let framed = encode_frame(&body_of_len(MAX_MESSAGE_SIZE));
+        assert_eq!(framed.len(), MAX_MESSAGE_SIZE + 2);
+
         assert!(matches!(
-            decode_length_prefixed(&framed),
-            Err(message::IdentifyMessageError::Wire(
-                WireError::FieldOverflow {
-                    length: 255,
-                    remaining: 3,
-                    ..
-                }
-            ))
+            receive(&framed).as_slice(),
+            [IdentifyEvent::Received { .. }]
         ));
     }
 
+    /// More bytes than every allowed part at its maximum could need.
+    fn more_than_every_part() -> Vec<u8> {
+        encode_frame(&body_of_len(MAX_MESSAGE_SIZE)).repeat(MAX_MESSAGE_PARTS + 1)
+    }
+
     #[test]
-    fn length_prefix_oversized_declared_length_is_field_overflow_on_every_target() {
-        // `u64::MAX` does not fit in usize on 32-bit targets. The decoder
-        // must still report FieldOverflow (never Varint Overflow) so the
-        // error class does not depend on pointer width.
+    fn bytes_beyond_every_allowed_part_are_refused_before_they_are_buffered() {
+        let events = receive(&more_than_every_part());
+        assert!(error_text(&events).contains("rejected"), "got {events:?}");
+    }
+
+    /// A refused stream is reset: a half-close would leave it allocated for as
+    /// long as the remote keeps its own write side open.
+    #[test]
+    fn a_refused_stream_is_reset() {
+        let mut identify = IdentifyProtocol::new(sample_config());
+        let peer = sample_peer();
+        let stream = StreamId::new(4);
+        identify.register_inbound_stream(peer.clone(), stream);
+
+        let actions = identify.on_stream_data(peer.clone(), stream, more_than_every_part());
+
+        assert_eq!(
+            actions,
+            vec![IdentifyAction::ResetStream {
+                peer_id: peer.clone(),
+                stream_id: stream,
+            }]
+        );
+        assert!(matches!(
+            identify.poll_events().as_slice(),
+            [IdentifyEvent::Error { .. }]
+        ));
+        // A half-close racing the reset finds the stream already gone; it
+        // must not produce a close.
+        assert!(
+            identify
+                .on_stream_remote_write_closed(peer, stream)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_declared_length_one_over_the_maximum_is_refused() {
+        let mut framed = Vec::new();
+        write_uvarint(MAX_MESSAGE_SIZE as u64 + 1, &mut framed);
+        framed.extend_from_slice(&vec![0u8; MAX_MESSAGE_SIZE + 1]);
+
+        let events = receive(&framed);
+        assert!(
+            error_text(&events).contains("exceeds the maximum"),
+            "got {events:?}"
+        );
+    }
+
+    /// The declared length is checked as a `u64` before it ever becomes a
+    /// `usize`, so the error class does not depend on pointer width.
+    #[test]
+    fn a_declared_length_beyond_the_maximum_is_refused_on_every_target() {
         let mut framed = Vec::new();
         write_uvarint(u64::MAX, &mut framed);
         framed.extend_from_slice(&[0xAA]);
-        assert!(matches!(
-            decode_length_prefixed(&framed),
-            Err(message::IdentifyMessageError::Wire(
-                WireError::FieldOverflow {
-                    length: usize::MAX,
-                    remaining: 1,
-                    ..
+
+        let events = receive(&framed);
+        assert!(
+            error_text(&events).contains("exceeds the maximum"),
+            "got {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_never_completes_is_reported_at_end_of_stream() {
+        // Declares 255 bytes, ships three.
+        let mut framed = Vec::new();
+        write_uvarint(255, &mut framed);
+        framed.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+
+        let events = receive(&framed);
+        assert!(
+            error_text(&events).contains("ended before its frame completed"),
+            "got {events:?}"
+        );
+    }
+
+    /// Bytes behind the message that never complete a frame are reported,
+    /// not dropped.
+    #[test]
+    fn trailing_bytes_after_the_message_are_reported() {
+        let mut framed = encode_frame(&body_of_len(64));
+        // `t` declares a 116-byte frame that the rest never fills.
+        framed.extend_from_slice(b"trailing");
+
+        let events = receive(&framed);
+        assert!(
+            error_text(&events).contains("ended before its frame completed"),
+            "got {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_message_in_more_parts_than_allowed_is_reported() {
+        let events = receive(&encode_frame(&body_of_len(64)).repeat(MAX_MESSAGE_PARTS + 1));
+        assert!(
+            error_text(&events).contains("more than 2 parts"),
+            "got {events:?}"
+        );
+    }
+
+    /// go-libp2p sends a large identify as a base frame, then a frame holding
+    /// only the signed peer record (field 8), and merges the parts on read.
+    #[test]
+    fn a_chunked_message_with_a_signed_peer_record_is_merged() {
+        let mut signed_record = Vec::new();
+        encode_bytes_field(&mut signed_record, 8, &[0xAB; 4096]);
+        let mut framed = encode_frame(&body_of_len(MAX_MESSAGE_SIZE));
+        framed.extend_from_slice(&encode_frame(&signed_record));
+
+        match receive(&framed).as_slice() {
+            [IdentifyEvent::Received { info, .. }] => {
+                let base = IdentifyMessage::decode(&body_of_len(MAX_MESSAGE_SIZE)).unwrap();
+                assert_eq!(info, &base);
+            }
+            other => panic!("expected the merged message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_later_part_overrides_an_earlier_scalar() {
+        let part = |agent: &str| {
+            encode_frame(
+                &IdentifyMessage {
+                    agent_version: Some(agent.into()),
+                    ..IdentifyMessage::default()
                 }
-            ))
+                .encode(),
+            )
+        };
+        let mut framed = part("first");
+        framed.extend_from_slice(&part("second"));
+
+        match receive(&framed).as_slice() {
+            [IdentifyEvent::Received { info, .. }] => {
+                assert_eq!(info.agent_version.as_deref(), Some("second"));
+            }
+            other => panic!("expected the merged message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refused_message_leaves_no_registered_stream() {
+        // The refusal must not consume the peer's outbound slot: a later
+        // identify on the same live peer has to be able to register.
+        let mut identify = IdentifyProtocol::new(IdentifyConfig {
+            protocol_version: "minip2p/test".into(),
+            agent_version: "x".repeat(MAX_MESSAGE_SIZE),
+            protocols: Vec::new(),
+            public_key: Vec::new(),
+        });
+        let peer = sample_peer();
+        assert!(matches!(
+            identify.register_outbound_stream(peer.clone(), StreamId::new(1), None, &[]),
+            Err(IdentifyError::MessageTooLarge { .. })
+        ));
+
+        identify.config.agent_version = "minip2p-test/0.0.1".into();
+        identify
+            .register_outbound_stream(peer, StreamId::new(2), None, &[])
+            .expect("the refused attempt must not hold the slot");
+    }
+
+    #[test]
+    fn our_own_oversized_message_is_refused_locally() {
+        let mut identify = IdentifyProtocol::new(IdentifyConfig {
+            protocol_version: "minip2p/test".into(),
+            agent_version: "x".repeat(MAX_MESSAGE_SIZE),
+            protocols: Vec::new(),
+            public_key: Vec::new(),
+        });
+
+        assert!(matches!(
+            identify.register_outbound_stream(sample_peer(), StreamId::new(1), None, &[]),
+            Err(IdentifyError::MessageTooLarge { len }) if len > MAX_MESSAGE_SIZE
         ));
     }
 
@@ -638,7 +878,11 @@ mod tests {
 
         // The frame must decode as `<varint prefix><body>` and the body
         // must itself be a valid IdentifyMessage.
-        let body = decode_length_prefixed(&data).expect("length-prefixed framing");
+        let FrameDecode::Complete { payload: body, .. } =
+            minip2p_core::decode_frame(&data, MAX_MESSAGE_SIZE)
+        else {
+            panic!("expected one complete length-prefixed frame");
+        };
         let msg = IdentifyMessage::decode(body).expect("body decodes");
         assert_eq!(msg.agent_version.as_deref(), Some("minip2p-test/0.0.1"));
         assert_eq!(msg.protocol_version.as_deref(), Some("minip2p/test"));

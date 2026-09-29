@@ -2072,6 +2072,19 @@ impl SwarmCore {
                         .push_back(SwarmAction::CloseStreamWrite { conn_id, stream_id });
                 }
             }
+            // Only the initiator role reads, so only it refuses bytes. The
+            // transport's `StreamClosed` for the reset reclaims the stream.
+            IdentifyAction::ResetStream {
+                ref peer_id,
+                stream_id,
+            } => {
+                if let Some(conn_id) =
+                    self.conn_for_owned_stream(peer_id, stream_id, ProtocolKind::IdentifyInitiator)
+                {
+                    self.actions
+                        .push_back(SwarmAction::ResetStream { conn_id, stream_id });
+                }
+            }
         }
     }
 
@@ -3431,6 +3444,46 @@ mod tests {
             }] if *conn_id == original_conn
                 && *stream_id == inbound_stream
                 && data == &[7; PING_PAYLOAD_LEN]
+        ));
+    }
+
+    /// Identify's refusal resets the stream on the connection that owns it.
+    #[test]
+    fn refused_identify_bytes_reset_the_owned_stream() {
+        let mut core = test_core();
+        let peer_id = PeerId::from_public_key_protobuf(b"known-peer");
+        let original_conn = ConnectionId::new(10);
+        let newer_conn = ConnectionId::new(11);
+        let stream_id = StreamId::new(8);
+
+        core.conn_to_peer.insert(original_conn, peer_id.clone());
+        core.conn_to_peer.insert(newer_conn, peer_id.clone());
+        core.peer_to_conn.insert(peer_id.clone(), newer_conn);
+        core.stream_owner
+            .insert((original_conn, stream_id), ProtocolKind::IdentifyInitiator);
+        core.identify
+            .handle_input(IdentifyInput::RegisterInboundStream {
+                peer_id: peer_id.clone(),
+                stream_id,
+            })
+            .expect("register inbound identify stream");
+
+        // A header declaring a frame far beyond identify's limit.
+        let mut data = Vec::new();
+        minip2p_core::write_uvarint(u64::from(u32::MAX), &mut data);
+        core.identify
+            .handle_input(IdentifyInput::StreamData {
+                peer_id,
+                stream_id,
+                data,
+            })
+            .expect("refused bytes are reported, not returned");
+        core.drain_identify_outputs();
+
+        assert!(matches!(
+            drain_actions(&mut core).as_slice(),
+            [SwarmAction::ResetStream { conn_id, stream_id: sid }]
+                if *conn_id == original_conn && *sid == stream_id
         ));
     }
 

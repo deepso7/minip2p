@@ -31,8 +31,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use minip2p_core::{
-    WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field, encode_nested_field, encode_varint_field,
-    read_len_delimited, read_tag, read_varint_value, skip_field,
+    WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field, encode_varint_field, read_len_delimited,
+    read_tag, read_varint_value, skip_field,
 };
 use thiserror::Error;
 
@@ -362,15 +362,15 @@ impl HopMessage {
 
         if let Some(ref peer) = self.peer {
             let nested = peer.encode();
-            encode_nested_field(&mut out, 2, &nested);
+            encode_bytes_field(&mut out, 2, &nested);
         }
         if let Some(ref reservation) = self.reservation {
             let nested = reservation.encode();
-            encode_nested_field(&mut out, 3, &nested);
+            encode_bytes_field(&mut out, 3, &nested);
         }
         if let Some(ref limit) = self.limit {
             let nested = limit.encode();
-            encode_nested_field(&mut out, 4, &nested);
+            encode_bytes_field(&mut out, 4, &nested);
         }
         if let Some(status) = self.status {
             encode_varint_field(&mut out, 5, status.to_u64());
@@ -438,11 +438,11 @@ impl StopMessage {
 
         if let Some(ref peer) = self.peer {
             let nested = peer.encode();
-            encode_nested_field(&mut out, 2, &nested);
+            encode_bytes_field(&mut out, 2, &nested);
         }
         if let Some(ref limit) = self.limit {
             let nested = limit.encode();
-            encode_nested_field(&mut out, 3, &nested);
+            encode_bytes_field(&mut out, 3, &nested);
         }
         if let Some(status) = self.status {
             encode_varint_field(&mut out, 4, status.to_u64());
@@ -617,7 +617,7 @@ mod tests {
     fn hop_message_missing_type_fails() {
         // Encode only a peer field with no type.
         let mut buf = Vec::new();
-        encode_nested_field(&mut buf, 2, &Peer::default().encode());
+        encode_bytes_field(&mut buf, 2, &Peer::default().encode());
 
         let err = HopMessage::decode(&buf).unwrap_err();
         assert!(matches!(err, RelayMessageError::MissingType));

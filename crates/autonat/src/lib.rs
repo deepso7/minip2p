@@ -20,9 +20,9 @@ use alloc::vec::Vec;
 #[cfg(test)]
 use minip2p_core::write_uvarint;
 use minip2p_core::{
-    Multiaddr, PeerId, SansIoProtocol, WIRE_LEN, WIRE_VARINT, WireError, encode_bytes_field,
-    encode_nested_field, encode_varint_field, read_len_delimited, read_tag, read_varint_value,
-    skip_field,
+    FrameExchange, FrameFault, Multiaddr, PeerId, SansIoProtocol, WIRE_LEN, WIRE_VARINT, WireError,
+    encode_bytes_field, encode_varint_field, read_len_delimited, read_tag, read_varint_value,
+    skip_field, uvarint_len,
 };
 
 /// Protocol id for AutoNAT v1.
@@ -197,9 +197,10 @@ struct Message {
 /// AutoNAT context while reusing the core protobuf vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum AutoNatError {
-    /// Incoming message exceeded the configured maximum size.
-    #[error("AutoNAT message exceeds maximum size ({len} > {MAX_MESSAGE_SIZE})")]
-    MessageTooLarge { len: usize },
+    /// Received bytes would exceed the receive buffer limit: one maximal
+    /// frame plus the pipelined bytes allowed behind it.
+    #[error("AutoNAT receive buffer would hold {len} bytes, over the limit of {limit}")]
+    MessageTooLarge { len: usize, limit: usize },
     /// Frame prefix declared a message larger than the configured maximum size.
     #[error("AutoNAT frame length exceeds maximum size ({len} > {MAX_MESSAGE_SIZE})")]
     FrameTooLarge { len: u64 },
@@ -223,10 +224,31 @@ pub enum AutoNatError {
     InvalidPeerId(String),
 }
 
+impl From<FrameFault> for AutoNatError {
+    fn from(fault: FrameFault) -> Self {
+        match fault {
+            FrameFault::TooLarge { len, .. } => Self::FrameTooLarge { len },
+            FrameFault::Overflow { len, limit } => Self::MessageTooLarge { len, limit },
+            FrameFault::Wire(e) => Self::Wire(e),
+        }
+    }
+}
+
+/// How many bytes may sit behind the frame being parsed.
+///
+/// One maximal frame: a peer that pipelines its next message is legal, and a
+/// maximal response must not be refused because trailing bytes arrived in the
+/// same read.
+const MAX_TRAILING: usize = MAX_MESSAGE_SIZE;
+
+/// The longest status text a DIAL_RESPONSE carries; longer reasons are cut.
+///
+/// It is diagnostic only, and the cap keeps every response within one frame.
+pub const MAX_STATUS_TEXT: usize = 1024;
+
 /// Client-side AutoNAT probe.
 pub struct AutoNatClient {
-    outbound: Vec<u8>,
-    recv_buf: Vec<u8>,
+    frames: FrameExchange,
     state: FlowState,
     outcome: Option<Reachability>,
     emitted_outcome: bool,
@@ -234,8 +256,7 @@ pub struct AutoNatClient {
 
 /// Server-side AutoNAT request handler.
 pub struct AutoNatServer {
-    outbound: Vec<u8>,
-    recv_buf: Vec<u8>,
+    frames: FrameExchange,
     request: Option<AutoNatRequest>,
     emitted_request: bool,
     state: ServerState,
@@ -257,19 +278,26 @@ enum ServerState {
 
 impl AutoNatClient {
     /// Creates a client probe and queues a DIAL request.
+    ///
+    /// The request carries `addrs` in order, skipping any that would not fit
+    /// in one AutoNAT frame. Offering a subset is legal — the
+    /// server just has fewer candidates to dial back — whereas an oversized
+    /// request is one the server is required to refuse.
     pub fn new(peer_id: &PeerId, addrs: &[Multiaddr]) -> Self {
-        let peer = PeerInfo {
-            id: peer_id.to_bytes(),
-            addrs: addrs.iter().map(Multiaddr::to_bytes).collect(),
-        };
+        let id = peer_id.to_bytes();
+        let addrs = fitting_addrs(addrs, field_len(id.len()), dial_message_len);
+        let peer = PeerInfo { id, addrs };
         let msg = Message {
             kind: MessageType::Dial,
             dial: Some(Dial { peer: Some(peer) }),
             dial_response: None,
         };
+        let mut frames = FrameExchange::with_trailing(MAX_MESSAGE_SIZE, MAX_TRAILING);
+        frames
+            .queue(&msg.encode())
+            .expect("addresses were trimmed to fit one frame");
         Self {
-            outbound: encode_frame(&msg.encode()),
-            recv_buf: Vec::new(),
+            frames,
             state: FlowState::Pending,
             outcome: None,
             emitted_outcome: false,
@@ -281,7 +309,7 @@ impl AutoNatClient {
         if self.state == FlowState::Pending {
             self.state = FlowState::AwaitingResponse;
         }
-        core::mem::take(&mut self.outbound)
+        self.frames.take_outbound()
     }
 
     /// Feeds incoming bytes from the AutoNAT service stream.
@@ -289,7 +317,7 @@ impl AutoNatClient {
         if self.state == FlowState::Done {
             return Ok(());
         }
-        self.recv_buf.extend_from_slice(data);
+        self.frames.push(data)?;
         self.try_decode_response()
     }
 
@@ -305,15 +333,9 @@ impl AutoNatClient {
     }
 
     fn try_decode_response(&mut self) -> Result<(), AutoNatError> {
-        enforce_max_size(&self.recv_buf)?;
-        let (decoded, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => (Message::decode(payload), consumed),
-            FrameDecode::Incomplete => return Ok(()),
-            FrameDecode::TooLarge { len } => return Err(AutoNatError::FrameTooLarge { len }),
-            FrameDecode::Error(e) => return Err(WireError::from(e).into()),
+        let Some(msg) = self.frames.next_frame(Message::decode)? else {
+            return Ok(());
         };
-        self.recv_buf.drain(..consumed);
-        let msg = decoded?;
 
         if msg.kind != MessageType::DialResponse {
             self.state = FlowState::Done;
@@ -350,8 +372,7 @@ impl AutoNatServer {
     /// Creates a server state machine awaiting one DIAL request.
     pub fn new() -> Self {
         Self {
-            outbound: Vec::new(),
-            recv_buf: Vec::new(),
+            frames: FrameExchange::with_trailing(MAX_MESSAGE_SIZE, MAX_TRAILING),
             request: None,
             emitted_request: false,
             state: ServerState::AwaitingRequest,
@@ -363,7 +384,7 @@ impl AutoNatServer {
         if self.state != ServerState::AwaitingRequest {
             return Ok(());
         }
-        self.recv_buf.extend_from_slice(data);
+        self.frames.push(data)?;
         self.try_decode_request()
     }
 
@@ -385,38 +406,42 @@ impl AutoNatServer {
 
     /// Drains pending outbound bytes.
     fn take_outbound(&mut self) -> Vec<u8> {
-        core::mem::take(&mut self.outbound)
+        self.frames.take_outbound()
     }
 
+    /// Queues a DIAL_RESPONSE, trimmed to fit one frame: the status text is
+    /// cut to [`MAX_STATUS_TEXT`] bytes and `addrs` that would not fit are
+    /// skipped.
     fn respond(
         &mut self,
         status: ResponseStatus,
-        status_text: Option<String>,
+        mut status_text: Option<String>,
         addrs: &[Multiaddr],
     ) {
+        if let Some(text) = &mut status_text {
+            text.truncate(text.floor_char_boundary(MAX_STATUS_TEXT));
+        }
+        let mut response = DialResponse {
+            status,
+            status_text,
+            addrs: Vec::new(),
+        };
+        response.addrs = fitting_addrs(addrs, response.encode().len(), response_message_len);
         let msg = Message {
             kind: MessageType::DialResponse,
             dial: None,
-            dial_response: Some(DialResponse {
-                status,
-                status_text,
-                addrs: addrs.iter().map(Multiaddr::to_bytes).collect(),
-            }),
+            dial_response: Some(response),
         };
-        self.outbound = encode_frame(&msg.encode());
+        self.frames
+            .queue(&msg.encode())
+            .expect("the response was trimmed to fit one frame");
         self.state = ServerState::Done;
     }
 
     fn try_decode_request(&mut self) -> Result<(), AutoNatError> {
-        enforce_max_size(&self.recv_buf)?;
-        let (decoded, consumed) = match decode_frame(&self.recv_buf) {
-            FrameDecode::Complete { payload, consumed } => (Message::decode(payload), consumed),
-            FrameDecode::Incomplete => return Ok(()),
-            FrameDecode::TooLarge { len } => return Err(AutoNatError::FrameTooLarge { len }),
-            FrameDecode::Error(e) => return Err(WireError::from(e).into()),
+        let Some(msg) = self.frames.next_frame(Message::decode)? else {
+            return Ok(());
         };
-        self.recv_buf.drain(..consumed);
-        let msg = decoded?;
 
         if msg.kind != MessageType::Dial {
             self.state = ServerState::Done;
@@ -467,7 +492,7 @@ impl SansIoProtocol for AutoNatClient {
     }
 
     fn is_idle(&self) -> bool {
-        self.outbound.is_empty() && (self.emitted_outcome || self.outcome.is_none())
+        !self.frames.has_outbound() && (self.emitted_outcome || self.outcome.is_none())
     }
 }
 
@@ -481,7 +506,7 @@ impl SansIoProtocol for AutoNatServer {
             AutoNatServerInput::Data(data) => self.on_data(&data)?,
             AutoNatServerInput::RespondPublic { addrs } => self.respond_public(&addrs),
             AutoNatServerInput::RespondError { status, reason } => {
-                self.respond_error(status, reason)
+                self.respond_error(status, reason);
             }
             AutoNatServerInput::Flush => {}
         }
@@ -503,7 +528,7 @@ impl SansIoProtocol for AutoNatServer {
     }
 
     fn is_idle(&self) -> bool {
-        self.outbound.is_empty() && (self.emitted_request || self.request.is_none())
+        !self.frames.has_outbound() && (self.emitted_request || self.request.is_none())
     }
 }
 
@@ -528,10 +553,10 @@ impl Message {
         let mut out = Vec::new();
         encode_varint_field(&mut out, 1, self.kind as u64);
         if let Some(dial) = &self.dial {
-            encode_nested_field(&mut out, 2, &dial.encode());
+            encode_bytes_field(&mut out, 2, &dial.encode());
         }
         if let Some(response) = &self.dial_response {
-            encode_nested_field(&mut out, 3, &response.encode());
+            encode_bytes_field(&mut out, 3, &response.encode());
         }
         out
     }
@@ -570,7 +595,7 @@ impl Dial {
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         if let Some(peer) = &self.peer {
-            encode_nested_field(&mut out, 1, &peer.encode());
+            encode_bytes_field(&mut out, 1, &peer.encode());
         }
         out
     }
@@ -654,17 +679,51 @@ impl DialResponse {
     }
 }
 
+/// Encoded size of a length-delimited field with a one-byte tag.
+fn field_len(len: usize) -> usize {
+    1 + uvarint_len(len as u64) + len
+}
+
+/// Encoded size of a DIAL [`Message`] whose `PeerInfo` body is `peer_len`
+/// bytes: the type field, then `dial { peer { .. } }`. Mirrors the encoders
+/// above, so a request is sized without re-encoding it per address.
+fn dial_message_len(peer_len: usize) -> usize {
+    2 + field_len(field_len(peer_len))
+}
+
+/// Encoded size of a DIAL_RESPONSE [`Message`] whose `DialResponse` body is
+/// `body_len` bytes: the type field, then `dialResponse { .. }`.
+fn response_message_len(body_len: usize) -> usize {
+    2 + field_len(body_len)
+}
+
+/// Encodes `addrs` in order, skipping any that would push the message over
+/// [`MAX_MESSAGE_SIZE`].
+///
+/// `body_len` is the encoded size of the message holding the addresses
+/// before any is added; `message_len` maps that body size to the size of the
+/// whole message.
+fn fitting_addrs(
+    addrs: &[Multiaddr],
+    mut body_len: usize,
+    message_len: impl Fn(usize) -> usize,
+) -> Vec<Vec<u8>> {
+    let mut fitting = Vec::new();
+    for addr in addrs {
+        let addr = addr.to_bytes();
+        let grown = body_len + field_len(addr.len());
+        if message_len(grown) <= MAX_MESSAGE_SIZE {
+            body_len = grown;
+            fitting.push(addr);
+        }
+    }
+    fitting
+}
+
 fn decode_addrs(raw: &[Vec<u8>]) -> Vec<Multiaddr> {
     raw.iter()
         .filter_map(|bytes| Multiaddr::from_bytes(bytes).ok())
         .collect()
-}
-
-fn enforce_max_size(buf: &[u8]) -> Result<(), AutoNatError> {
-    if buf.len() > MAX_MESSAGE_SIZE {
-        return Err(AutoNatError::MessageTooLarge { len: buf.len() });
-    }
-    Ok(())
 }
 
 /// AutoNAT rejects protobuf field number 0; shared `read_tag` leaves that policy to callers.
@@ -684,6 +743,198 @@ mod tests {
     use super::*;
 
     const PEER_ID: &str = "QmYyQSo1c1Ym7orWxLYvCrM2EmxFTANf8wXmmE7DWjhx5N";
+
+    /// A DIAL_RESPONSE whose encoded payload is exactly `len` bytes, padded
+    /// through the status text.
+    fn response_payload(len: usize) -> Vec<u8> {
+        for pad in len.saturating_sub(16)..=len {
+            let msg = Message {
+                kind: MessageType::DialResponse,
+                dial: None,
+                dial_response: Some(DialResponse {
+                    status: ResponseStatus::DialError,
+                    status_text: Some("x".repeat(pad)),
+                    addrs: Vec::new(),
+                }),
+            };
+            let encoded = msg.encode();
+            if encoded.len() == len {
+                return encoded;
+            }
+        }
+        panic!("no status text pads a DIAL_RESPONSE to {len} bytes");
+    }
+
+    /// Regression: the pre-decode check counted the length prefix, so a legal
+    /// maximal message was refused as `MessageTooLarge`.
+    #[test]
+    fn client_accepts_a_response_at_the_maximum_size() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let mut client = AutoNatClient::new(&peer_id, &[]);
+        let framed = encode_frame(&response_payload(MAX_MESSAGE_SIZE));
+        assert_eq!(framed.len(), MAX_MESSAGE_SIZE + 2);
+
+        client
+            .on_data(&framed)
+            .expect("a maximal response is legal");
+        assert!(matches!(
+            client.outcome(),
+            Some(Reachability::Private { .. })
+        ));
+    }
+
+    #[test]
+    fn client_rejects_a_declared_length_above_the_maximum() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let mut client = AutoNatClient::new(&peer_id, &[]);
+        // A header declaring MAX + 1, rejected before any payload arrives.
+        let mut framed = Vec::new();
+        write_uvarint(MAX_MESSAGE_SIZE as u64 + 1, &mut framed);
+
+        assert_eq!(
+            client.on_data(&framed),
+            Err(AutoNatError::FrameTooLarge {
+                len: MAX_MESSAGE_SIZE as u64 + 1
+            })
+        );
+    }
+
+    /// Regression: a maximal frame that arrived with pipelined bytes behind it
+    /// was refused, because the whole buffer was measured against the limit.
+    #[test]
+    fn client_accepts_a_maximal_response_carrying_trailing_bytes() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let mut client = AutoNatClient::new(&peer_id, &[]);
+        let mut chunk = encode_frame(&response_payload(MAX_MESSAGE_SIZE));
+        chunk.extend_from_slice(b"pipelined");
+
+        client
+            .on_data(&chunk)
+            .expect("trailing bytes are not our business");
+        assert!(client.outcome().is_some());
+        assert_eq!(client.frames.buffered(), b"pipelined");
+    }
+
+    /// The header and the payload it lies about arrive in the same read, and
+    /// the allowance for pipelined bytes leaves room for both. The payload must
+    /// still never be buffered.
+    #[test]
+    fn an_over_declared_response_is_refused_before_its_payload_is_buffered() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let mut client = AutoNatClient::new(&peer_id, &[]);
+        let mut chunk = Vec::new();
+        write_uvarint(MAX_MESSAGE_SIZE as u64 + 1, &mut chunk);
+        chunk.extend_from_slice(&vec![0u8; MAX_MESSAGE_SIZE + 1]);
+
+        assert_eq!(
+            client.on_data(&chunk),
+            Err(AutoNatError::FrameTooLarge {
+                len: MAX_MESSAGE_SIZE as u64 + 1
+            })
+        );
+        assert!(client.frames.buffered().is_empty());
+    }
+
+    #[test]
+    fn an_oversized_chunk_is_refused_before_it_is_buffered() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let mut client = AutoNatClient::new(&peer_id, &[]);
+        let oversized = vec![0u8; 2 * MAX_MESSAGE_SIZE + 3];
+
+        // The limit is one maximal frame (2-byte prefix) plus its trailing allowance.
+        assert_eq!(
+            client.on_data(&oversized),
+            Err(AutoNatError::MessageTooLarge {
+                len: 2 * MAX_MESSAGE_SIZE + 3,
+                limit: 2 * MAX_MESSAGE_SIZE + 2,
+            })
+        );
+        assert!(client.frames.buffered().is_empty());
+    }
+
+    /// Our own addresses are trimmed to what fits in one frame, keeping their
+    /// order, so the probe is always sent rather than refused.
+    #[test]
+    fn a_request_is_trimmed_to_the_addresses_that_fit() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let addrs: Vec<Multiaddr> = (0..2048)
+            .map(|port| {
+                Multiaddr::from_str(&alloc::format!("/ip4/203.0.113.7/udp/{port}/quic-v1")).unwrap()
+            })
+            .collect();
+        let mut client = AutoNatClient::new(&peer_id, &addrs);
+        let mut server = AutoNatServer::new();
+
+        server
+            .on_data(&client.take_outbound())
+            .expect("the request fits");
+        let request = server.request().expect("request should decode");
+        let kept = request.addrs.len();
+        assert!(0 < kept && kept < addrs.len());
+        assert_eq!(request.addrs, addrs[..kept], "a prefix, in order");
+
+        // The boundary is exact: one more address would not have fit.
+        let one_more = Message {
+            kind: MessageType::Dial,
+            dial: Some(Dial {
+                peer: Some(PeerInfo {
+                    id: peer_id.to_bytes(),
+                    addrs: addrs[..=kept].iter().map(Multiaddr::to_bytes).collect(),
+                }),
+            }),
+            dial_response: None,
+        };
+        assert!(one_more.encode().len() > MAX_MESSAGE_SIZE);
+    }
+
+    /// An address that no longer fits is skipped, not the end of the list:
+    /// a shorter one behind it is still offered.
+    #[test]
+    fn an_address_that_does_not_fit_does_not_hide_later_ones() {
+        let long = Multiaddr::from_str(&alloc::format!("/dns4/{}.example/tcp/1", "a".repeat(200)))
+            .unwrap();
+        let short = Multiaddr::from_str("/ip4/203.0.113.7/tcp/1").unwrap();
+        // Room for exactly the short address.
+        let body_len = MAX_MESSAGE_SIZE - field_len(short.to_bytes().len());
+
+        let fitting = fitting_addrs(&[long, short.clone()], body_len, |len| len);
+        assert_eq!(fitting, vec![short.to_bytes()]);
+    }
+
+    /// A response is trimmed rather than refused: addresses to what fits, and
+    /// the status text to [`MAX_STATUS_TEXT`].
+    #[test]
+    fn a_response_is_trimmed_to_fit() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let addrs: Vec<Multiaddr> = (0..2048)
+            .map(|port| {
+                Multiaddr::from_str(&alloc::format!("/ip4/203.0.113.7/udp/{port}/quic-v1")).unwrap()
+            })
+            .collect();
+
+        let mut server = AutoNatServer::new();
+        server.respond_public(&addrs);
+        let mut client = AutoNatClient::new(&peer_id, &[]);
+        client
+            .on_data(&server.take_outbound())
+            .expect("the response fits");
+        let Some(Reachability::Public { addrs: kept, .. }) = client.outcome() else {
+            panic!("expected a public outcome, got {:?}", client.outcome());
+        };
+        assert!(!kept.is_empty() && kept.len() < addrs.len());
+        assert_eq!(kept[..], addrs[..kept.len()], "a prefix, in order");
+
+        let mut server = AutoNatServer::new();
+        server.respond_error(ResponseStatus::DialError, "é".repeat(MAX_MESSAGE_SIZE));
+        let mut client = AutoNatClient::new(&peer_id, &[]);
+        client
+            .on_data(&server.take_outbound())
+            .expect("the response fits");
+        let Some(Reachability::Private { reason, .. }) = client.outcome() else {
+            panic!("expected a private outcome, got {:?}", client.outcome());
+        };
+        assert_eq!(reason.len(), MAX_STATUS_TEXT, "cut on a char boundary");
+    }
 
     #[test]
     fn client_server_public_round_trip() {

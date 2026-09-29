@@ -48,6 +48,10 @@ while let Some(output) = server.poll_output() {
 server.handle_input(AutoNatServerInput::Flush)?;
 ```
 
+## Size limits
+
+Messages carry at most 8192 payload bytes. The declared length is checked from the frame header, so a message at exactly the maximum is accepted — including one that arrives with pipelined bytes behind it — while bytes that could never complete a legal frame are refused before they are buffered. Outgoing messages respect the same limit, so neither side puts a frame on the wire that the other is required to refuse: a DIAL request or DIAL_RESPONSE carries the given addresses in order, skipping any that would not fit, and a response's status text is cut to `MAX_STATUS_TEXT` (1024) bytes.
+
 ## no_std
 
 Disable default features:
