@@ -727,7 +727,7 @@ export class Minip2pBase {
     return !this.#closed && this.#backend.isRunning();
   }
 
-  /** Selects foreground or idle native polling behavior. */
+  /** Accepted for compatibility; has no effect, since the driver sleeps until the endpoint's next deadline. */
   setActive(active: boolean): void {
     this.#assertOpen();
     this.#backend.setActive(active);
