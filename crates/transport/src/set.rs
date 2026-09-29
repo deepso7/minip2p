@@ -509,6 +509,13 @@ mod blocking_set {
             if !self.pending.is_empty() {
                 return WaitOutcome::Ready;
             }
+            // A lone member has nobody to take turns with, so it gets the
+            // whole budget in one wait: probing and slicing would only turn
+            // one idle wait into a wakeup every slice. Its own handle, which
+            // the set's reaches, still wakes it at once.
+            if let [member] = &mut self.members[..] {
+                return member.transport.wait_for_input(timeout);
+            }
 
             // Probe every member without blocking before blocking on any of
             // them: a budget spent waiting on a quiet member would report
@@ -817,7 +824,15 @@ mod tests {
             }
             // Spend the budget, as a real readiness wait would: a fake that
             // returned instantly would make a slice's length unobservable.
-            std::thread::sleep(timeout);
+            // An interrupt still ends it early, as it ends a real one.
+            let deadline = std::time::Instant::now().checked_add(timeout);
+            while deadline.is_none_or(|deadline| std::time::Instant::now() < deadline) {
+                if self.interrupts.load(Ordering::SeqCst) > 0 {
+                    self.interrupts.fetch_sub(1, Ordering::SeqCst);
+                    return crate::WaitOutcome::Interrupted;
+                }
+                std::thread::sleep(core::time::Duration::from_millis(1));
+            }
             crate::WaitOutcome::TimedOut
         }
 
@@ -1474,6 +1489,34 @@ mod tests {
             set.wait_handle().interrupt();
             assert_eq!(tcp.waits(), vec![Duration::ZERO]);
             assert_eq!(quic.waits(), vec![Duration::ZERO]);
+        }
+
+        #[test]
+        fn a_lone_member_parks_for_the_whole_budget_and_still_wakes_on_interrupt() {
+            let tcp = Fake::new("tcp", ConnectionNamespace::TCP_IPV4).waking();
+            let mut set = set_of(&[&tcp]);
+            let handle = set.wait_handle();
+            let budget = Duration::from_secs(30);
+
+            // Interrupt from another thread once the set is parked.
+            let waker = {
+                let tcp = tcp.clone();
+                std::thread::spawn(move || {
+                    while tcp.waits().is_empty() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    handle.interrupt();
+                })
+            };
+            assert_eq!(set.wait_for_input(budget), WaitOutcome::Interrupted);
+            waker.join().expect("waker");
+            // With nobody to take turns with, slicing would only turn one
+            // idle wait into a wakeup every slice.
+            assert_eq!(
+                tcp.waits(),
+                vec![budget],
+                "a lone member is handed the caller's whole budget in one wait"
+            );
         }
 
         #[test]
