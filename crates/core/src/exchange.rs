@@ -14,10 +14,10 @@
 
 use alloc::vec::Vec;
 
-use minip2p_identity::{read_uvarint, uvarint_len};
+use minip2p_identity::{read_uvarint, uvarint_len, write_uvarint};
 use thiserror::Error;
 
-use crate::frame::{FrameDecode, decode_frame, encode_frame};
+use crate::frame::{FrameDecode, decode_frame};
 use crate::protobuf::WireError;
 
 /// A framing failure, before any protocol meaning is read from the bytes.
@@ -98,7 +98,9 @@ impl FrameExchange {
                 max: self.max_len,
             });
         }
-        self.outbound.extend_from_slice(&encode_frame(payload));
+        // Frame straight into the send buffer rather than through a temporary.
+        write_uvarint(payload.len() as u64, &mut self.outbound);
+        self.outbound.extend_from_slice(payload);
         Ok(())
     }
 
@@ -201,6 +203,7 @@ mod tests {
     use alloc::vec;
 
     use super::*;
+    use crate::frame::encode_frame;
 
     const MAX: usize = 8192;
     /// `MAX` is below 2^14, so its length prefix is two bytes.

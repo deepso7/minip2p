@@ -18,7 +18,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use minip2p_core::{
-    FrameExchange, FrameFault, Multiaddr, PeerId, SansIoProtocol, encode_frame, uvarint_len,
+    FrameDecode, FrameExchange, FrameFault, Multiaddr, PeerId, SansIoProtocol, decode_frame,
+    encode_frame, uvarint_len,
 };
 use minip2p_transport::StreamId;
 use thiserror::Error;
@@ -451,7 +452,20 @@ impl IdentifyProtocol {
 /// append, a later scalar wins), so the payloads are joined and decoded once.
 /// More parts than [`MAX_MESSAGE_PARTS`], or bytes that never complete a
 /// frame, are reported rather than dropped.
+///
+/// The usual single-frame message is decoded in place, without joining.
 fn merge_parts(frames: &mut FrameExchange) -> Result<IdentifyMessage, String> {
+    let decode = |body: &[u8]| {
+        IdentifyMessage::decode(body)
+            .map_err(|e| alloc::format!("failed to decode identify message: {e}"))
+    };
+    if let FrameDecode::Complete { payload, consumed } =
+        decode_frame(frames.buffered(), MAX_MESSAGE_SIZE)
+        && consumed == frames.buffered().len()
+    {
+        return decode(payload);
+    }
+
     let mut body = Vec::new();
     let mut parts = 0;
     loop {
@@ -473,8 +487,7 @@ fn merge_parts(frames: &mut FrameExchange) -> Result<IdentifyMessage, String> {
     if parts == 0 || !frames.buffered().is_empty() {
         return Err("identify message ended before its frame completed".into());
     }
-    IdentifyMessage::decode(&body)
-        .map_err(|e| alloc::format!("failed to decode identify message: {e}"))
+    decode(&body)
 }
 
 impl SansIoProtocol for IdentifyProtocol {
@@ -540,7 +553,7 @@ impl SansIoProtocol for IdentifyProtocol {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minip2p_core::{FrameDecode, encode_bytes_field, write_uvarint};
+    use minip2p_core::{encode_bytes_field, write_uvarint};
 
     impl IdentifyProtocol {
         /// Drain buffered events (test helper).
