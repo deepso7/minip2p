@@ -459,6 +459,9 @@ pub struct QuicTransport {
     connections: HashMap<ConnectionId, QuicConnection>,
     /// Maps QUIC connection-id bytes to logical connection ids for packet routing.
     cid_to_connection: HashMap<Vec<u8>, ConnectionId>,
+    /// Maps peers' stateless reset tokens to connections, the only route for
+    /// packets whose destination CID is unknown. See `stateless_reset_token`.
+    reset_token_to_connection: HashMap<u128, ConnectionId>,
     /// Maps peer ids to their set of connection ids.
     peer_connections: HashMap<PeerId, BTreeSet<ConnectionId>>,
     /// Events queued between poll() calls.
@@ -953,6 +956,7 @@ impl QuicTransport {
             quiche_config,
             connections: HashMap::new(),
             cid_to_connection: HashMap::new(),
+            reset_token_to_connection: HashMap::new(),
             peer_connections: HashMap::new(),
             pending_events: Vec::new(),
             pending_datagrams: VecDeque::new(),
@@ -1074,12 +1078,18 @@ impl QuicTransport {
         }
     }
 
-    /// Removes all index entries (CID and peer) for a removed connection,
+    /// Removes all index entries (CID, reset token, and peer) for a removed connection,
     /// using the connection's own record of indexed CIDs instead of scanning
     /// the whole routing table.
     fn unindex_connection(&mut self, id: ConnectionId, conn: &QuicConnection) {
         for cid in conn.indexed_cids() {
             self.cid_to_connection.remove(cid);
+        }
+
+        if let Some(token) = conn.indexed_reset_token()
+            && self.reset_token_to_connection.get(&token) == Some(&id)
+        {
+            self.reset_token_to_connection.remove(&token);
         }
 
         if let Some(peer_id) = conn.endpoint().peer_id().cloned() {
@@ -1222,7 +1232,6 @@ impl Transport for QuicTransport {
         let mut conn = QuicConnection::new(
             id,
             quiche_conn,
-            peer_socket,
             ConnectionEndpoint::from_peer_addr(addr),
             self.node_config.limits().max_streams_per_connection,
             self.node_config.limits().max_pending_stream_bytes,
@@ -1488,7 +1497,6 @@ impl Transport for QuicTransport {
                 let mut conn = QuicConnection::new(
                     id,
                     quiche_conn,
-                    from,
                     endpoint.clone(),
                     self.node_config.limits().max_streams_per_connection,
                     self.node_config.limits().max_pending_stream_bytes,
@@ -1510,16 +1518,19 @@ impl Transport for QuicTransport {
                 target_conn_id = Some(id);
             }
 
+            // Never route an unknown CID by source address: peers behind one
+            // NAT share it. The one packet a live connection receives with an
+            // unknown CID is a stateless reset, which is routed by its token.
+            // Anything else is dropped.
             if target_conn_id.is_none() {
-                target_conn_id = self
-                    .connections
-                    .iter()
-                    .find(|(_, conn)| conn.matches_peer(from))
-                    .map(|(id, _)| *id);
+                target_conn_id = stateless_reset_token(packet)
+                    .and_then(|token| self.reset_token_to_connection.get(&token).copied());
             }
 
             if let Some(id) = target_conn_id {
                 let mut new_cids = Vec::new();
+                let mut retired_cids = Vec::new();
+                let mut reset_token = None;
                 let mut identity_update: Option<(Option<PeerId>, ConnectionEndpoint)> = None;
                 if let Some(conn) = self.connections.get_mut(&id) {
                     let previous_peer_id = conn.endpoint().peer_id().cloned();
@@ -1533,10 +1544,13 @@ impl Transport for QuicTransport {
                         &mut self.pending_datagrams,
                         self.node_config.limits().max_pending_datagrams,
                     )?;
-                    // Source CIDs only change while packets are processed, so
-                    // indexing here keeps the routing table current without a
-                    // per-poll sweep over every connection.
+                    // Source CIDs and the peer's reset token only change while
+                    // packets are processed, so indexing here keeps the routing
+                    // tables current without a per-poll sweep over every
+                    // connection.
                     new_cids = conn.take_unindexed_source_cids();
+                    retired_cids = conn.take_retired_source_cids();
+                    reset_token = conn.take_unindexed_reset_token();
                     if conn.endpoint().peer_id() != previous_peer_id.as_ref() {
                         identity_update = Some((previous_peer_id, conn.endpoint().clone()));
                     }
@@ -1544,6 +1558,14 @@ impl Transport for QuicTransport {
 
                 for cid in new_cids {
                     self.cid_to_connection.insert(cid, id);
+                }
+                for cid in retired_cids {
+                    self.cid_to_connection.remove(&cid);
+                }
+                if let Some(token) = reset_token {
+                    // First claim wins, so a peer cannot hijack another
+                    // connection's resets by advertising the same token.
+                    self.reset_token_to_connection.entry(token).or_insert(id);
                 }
 
                 if let Some((previous_peer_id, endpoint)) = identity_update {
@@ -1659,6 +1681,25 @@ impl Transport for QuicTransport {
         });
         Deadline::earliest_opt(quiche, keepalive)
     }
+}
+
+/// The token a datagram would carry if it were a stateless reset (RFC 9000
+/// §10.3): a short-header packet of at least 21 bytes whose last 16 bytes are
+/// the token.
+///
+/// Resets use a random destination CID, so this token is their only route to a
+/// connection. quiche then decides whether the packet really is a reset, and
+/// only compares the token from the peer's transport parameters, which is the
+/// one the transport indexes. Resets for tokens issued later in
+/// NEW_CONNECTION_ID frames are dropped; the connection then ends by idle
+/// timeout.
+fn stateless_reset_token(packet: &[u8]) -> Option<u128> {
+    if packet.len() < 21 || packet.first()? & 0x80 != 0 {
+        return None;
+    }
+    packet
+        .last_chunk::<16>()
+        .map(|token| u128::from_be_bytes(*token))
 }
 
 /// Quiet connections send an ack-eliciting packet at half the idle timeout,
