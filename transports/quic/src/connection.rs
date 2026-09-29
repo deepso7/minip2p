@@ -48,11 +48,20 @@ impl PendingStreamWrite {
     }
 }
 
-/// Per-stream bookkeeping for half-close tracking and pending writes.
+/// Queued writes for one stream, never empty while stored.
+type SendQueue = VecDeque<PendingStreamWrite>;
+
+/// Unsent bytes held by a dropped queue.
+fn unsent_bytes(queue: SendQueue) -> usize {
+    queue
+        .into_iter()
+        .map(|write| write.bytes.len().saturating_sub(write.offset))
+        .sum()
+}
+
+/// Per-stream bookkeeping for half-close tracking.
 #[derive(Debug, Default)]
 struct StreamRuntimeState {
-    /// Outbound write queue.
-    pending_writes: VecDeque<PendingStreamWrite>,
     /// Whether we have closed our write side.
     local_write_closed: bool,
     /// Whether the remote has closed their write side.
@@ -66,14 +75,6 @@ struct StreamRuntimeState {
 }
 
 impl StreamRuntimeState {
-    /// Drops every queued write, returning how many unsent bytes it held.
-    fn drop_pending_writes(&mut self) -> usize {
-        self.pending_writes
-            .drain(..)
-            .map(|write| write.bytes.len().saturating_sub(write.offset))
-            .sum()
-    }
-
     /// Returns true if both sides have closed their write side.
     fn is_fully_closed(&self) -> bool {
         self.local_write_closed && self.remote_write_closed
@@ -91,6 +92,9 @@ pub struct QuicConnection {
     state: ConnectionState,
     /// Per-stream runtime state keyed by raw QUIC stream id.
     stream_states: HashMap<u64, StreamRuntimeState>,
+    /// Outbound write queues keyed by raw QUIC stream id. Only streams with
+    /// pending output have an entry, so a drain visits nothing else.
+    send_queues: HashMap<u64, SendQueue>,
     /// Next stream id to allocate (increments by 4 per QUIC spec).
     next_local_bidi_stream_id: u64,
     /// Number of active locally initiated bidirectional streams.
@@ -133,6 +137,7 @@ impl QuicConnection {
             endpoint,
             state: ConnectionState::Connecting,
             stream_states: HashMap::new(),
+            send_queues: HashMap::new(),
             next_local_bidi_stream_id,
             active_local_bidi_streams: 0,
             max_local_bidi_streams,
@@ -209,6 +214,19 @@ impl QuicConnection {
     #[cfg(test)]
     pub(crate) fn pending_write_bytes(&self) -> usize {
         self.pending_write_bytes
+    }
+
+    /// Number of streams with queued writes.
+    #[cfg(test)]
+    pub(crate) fn queued_stream_count(&self) -> usize {
+        self.send_queues.len()
+    }
+
+    /// Drops `raw_stream_id`'s queued writes and their byte accounting.
+    fn drop_send_queue(&mut self, raw_stream_id: u64) {
+        if let Some(queue) = self.send_queues.remove(&raw_stream_id) {
+            self.pending_write_bytes = self.pending_write_bytes.saturating_sub(unsent_bytes(queue));
+        }
     }
 
     pub fn endpoint(&self) -> &ConnectionEndpoint {
@@ -447,17 +465,14 @@ impl QuicConnection {
         }
 
         let raw_stream_id = stream_id.as_u64();
-        let has_queued_writes = {
-            let state = self.stream_state_mut(stream_id)?;
-            if state.local_write_closed {
-                return Err(TransportError::StreamSendFailed {
-                    id: self.id,
-                    stream_id,
-                    reason: "local stream write side is already closed".into(),
-                });
-            }
-            !state.pending_writes.is_empty()
-        };
+        if self.stream_state_mut(stream_id)?.local_write_closed {
+            return Err(TransportError::StreamSendFailed {
+                id: self.id,
+                stream_id,
+                reason: "local stream write side is already closed".into(),
+            });
+        }
+        let has_queued_writes = self.send_queues.contains_key(&raw_stream_id);
 
         let queue_capacity = self
             .max_pending_write_bytes
@@ -499,10 +514,9 @@ impl QuicConnection {
 
         if offset < data.len() {
             self.pending_write_bytes += data.len() - offset;
-            self.stream_states
+            self.send_queues
                 .entry(raw_stream_id)
                 .or_default()
-                .pending_writes
                 .push_back(PendingStreamWrite::data(data, offset));
         }
 
@@ -549,7 +563,10 @@ impl QuicConnection {
         }
 
         state.local_write_closed = true;
-        state.pending_writes.push_back(PendingStreamWrite::fin());
+        self.send_queues
+            .entry(stream_id.as_u64())
+            .or_default()
+            .push_back(PendingStreamWrite::fin());
 
         self.drain_send_queue(events);
         self.flush(socket, pending_datagrams, max_pending_datagrams)?;
@@ -561,15 +578,9 @@ impl QuicConnection {
         stream_id: StreamId,
         events: &mut Vec<TransportEvent>,
     ) -> Result<(), TransportError> {
-        let state = self.stream_states.get_mut(&stream_id.as_u64()).ok_or(
-            TransportError::StreamNotFound {
-                id: self.id,
-                stream_id,
-            },
-        )?;
-
-        let dropped = state.drop_pending_writes();
-        self.pending_write_bytes = self.pending_write_bytes.saturating_sub(dropped);
+        // Fail with `StreamNotFound` before touching quiche.
+        self.stream_state_mut(stream_id)?;
+        self.drop_send_queue(stream_id.as_u64());
 
         // `Done` means quiche already shut that half down or collected the
         // stream (e.g. after the peer's STOP_SENDING and FIN), so there is
@@ -593,6 +604,7 @@ impl QuicConnection {
             }
         }
 
+        let state = self.stream_state_mut(stream_id)?;
         state.local_write_closed = true;
         state.remote_write_closed = true;
 
@@ -777,27 +789,22 @@ impl QuicConnection {
     /// write still waiting on peer credit stays queued for a later drain, and
     /// any other quiche error closes only this connection.
     fn drain_send_queue(&mut self, events: &mut Vec<TransportEvent>) {
-        let stream_ids: Vec<u64> = self.stream_states.keys().copied().collect();
+        // Only streams with pending output; collecting none allocates nothing.
+        let stream_ids: Vec<u64> = self.send_queues.keys().copied().collect();
 
         for raw_stream_id in stream_ids {
-            loop {
-                let stream_id = StreamId::new(raw_stream_id);
-                let result = {
-                    let (conn, stream_states) = (&mut self.conn, &mut self.stream_states);
-                    let Some(state) = stream_states.get_mut(&raw_stream_id) else {
-                        break;
-                    };
-                    let Some(front) = state.pending_writes.front_mut() else {
-                        break;
-                    };
-                    let payload = front
-                        .bytes
-                        .get(front.offset..)
-                        .expect("pending write offsets advance only within their buffers");
-                    let fin = front.fin && payload.is_empty();
-                    conn.stream_send(raw_stream_id, payload, fin)
-                };
-                let written = match result {
+            let stream_id = StreamId::new(raw_stream_id);
+            while let Some(front) = self
+                .send_queues
+                .get(&raw_stream_id)
+                .and_then(VecDeque::front)
+            {
+                let payload = front
+                    .bytes
+                    .get(front.offset..)
+                    .expect("pending write offsets advance only within their buffers");
+                let fin = front.fin && payload.is_empty();
+                let written = match self.conn.stream_send(raw_stream_id, payload, fin) {
                     Ok(written) => written,
                     // Out of flow-control or stream-count credit: the peer's
                     // next MAX_* frame lets a later drain continue.
@@ -815,21 +822,25 @@ impl QuicConnection {
                     }
                 };
 
-                if let Some(state) = self.stream_states.get_mut(&raw_stream_id)
-                    && let Some(front) = state.pending_writes.front_mut()
-                {
-                    if front.fin && front.bytes.is_empty() {
-                        state.pending_writes.pop_front();
-                    } else {
-                        if written == 0 {
-                            break;
-                        }
-
-                        front.offset = front.offset.saturating_add(written);
-                        self.pending_write_bytes = self.pending_write_bytes.saturating_sub(written);
-                        if front.offset >= front.bytes.len() {
-                            state.pending_writes.pop_front();
-                        }
+                // Only the error arms above drop a queue, and they leave the loop.
+                let queue = self
+                    .send_queues
+                    .get_mut(&raw_stream_id)
+                    .expect("a successful send leaves the stream's queue in place");
+                let front = queue
+                    .front_mut()
+                    .expect("stored send queues are never empty");
+                if !front.fin || !front.bytes.is_empty() {
+                    if written == 0 {
+                        break;
+                    }
+                    front.offset = front.offset.saturating_add(written);
+                    self.pending_write_bytes = self.pending_write_bytes.saturating_sub(written);
+                }
+                if front.offset >= front.bytes.len() {
+                    queue.pop_front();
+                    if queue.is_empty() {
+                        self.send_queues.remove(&raw_stream_id);
                     }
                 }
 
@@ -856,9 +867,8 @@ impl QuicConnection {
             return;
         }
         state.write_stopped = true;
-        let dropped = state.drop_pending_writes();
-        self.pending_write_bytes = self.pending_write_bytes.saturating_sub(dropped);
         state.local_write_closed = true;
+        self.drop_send_queue(stream_id.as_u64());
         events.push(TransportEvent::StreamWriteStopped {
             id: self.id,
             stream_id,
@@ -873,9 +883,7 @@ impl QuicConnection {
     /// Every queued write is dropped so later drains cannot hit the same error
     /// again while quiche drains the connection.
     fn fail_connection(&mut self, message: String, events: &mut Vec<TransportEvent>) {
-        for state in self.stream_states.values_mut() {
-            state.drop_pending_writes();
-        }
+        self.send_queues.clear();
         self.pending_write_bytes = 0;
         events.push(TransportEvent::Error {
             id: self.id,
@@ -928,11 +936,10 @@ impl QuicConnection {
     /// A peer reset terminates both halves and discards writes that can no
     /// longer be delivered.
     fn note_stream_reset(&mut self, stream_id: StreamId, events: &mut Vec<TransportEvent>) {
+        self.drop_send_queue(stream_id.as_u64());
         let Some(state) = self.stream_states.get_mut(&stream_id.as_u64()) else {
             return;
         };
-        let dropped = state.drop_pending_writes();
-        self.pending_write_bytes = self.pending_write_bytes.saturating_sub(dropped);
         state.local_write_closed = true;
         state.remote_write_closed = true;
         if !state.closed_notified {
@@ -950,7 +957,7 @@ impl QuicConnection {
             .stream_states
             .iter()
             .filter_map(|(stream_id, state)| {
-                if state.closed_notified && state.pending_writes.is_empty() {
+                if state.closed_notified && !self.send_queues.contains_key(stream_id) {
                     Some(*stream_id)
                 } else {
                     None

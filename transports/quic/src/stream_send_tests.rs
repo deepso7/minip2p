@@ -441,3 +441,43 @@ fn connection_fatal_send_error_closes_only_that_connection() {
     assert!(!events.contains(&TransportEvent::Closed { id: healthy_id }));
     assert!(server.connections.contains_key(&healthy_id));
 }
+
+#[test]
+fn partially_written_queue_drains_once_the_stream_is_writable() {
+    let mut server = listening_server(30_000);
+    // The peer grants 1,000 bytes per server stream until it reads.
+    let (mut peer, id) = accept(&mut server, &mut [], |config| {
+        config.set_initial_max_stream_data_bidi_remote(1_000);
+    });
+
+    let stream = server.open_stream(id).expect("open");
+    server
+        .send_stream(id, stream, vec![7; 10_000])
+        .expect("send");
+    server.close_stream_write(id, stream).expect("queue fin");
+    let connection = server.connections.get(&id).expect("connection");
+    assert!(connection.pending_write_bytes() > 0);
+    assert_eq!(connection.queued_stream_count(), 1);
+
+    let mut received = Vec::new();
+    let mut fin = false;
+    let start = Instant::now();
+    while !fin {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "queued bytes never arrived; got {} bytes",
+            received.len()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        peer.pump();
+        server.poll(now()).expect("poll must not fail");
+        peer.pump();
+        let (data, done) = peer.read(stream.as_u64());
+        received.extend(data);
+        fin = done;
+    }
+    assert_eq!(received, vec![7; 10_000]);
+    let connection = server.connections.get(&id).expect("connection");
+    assert_eq!(connection.pending_write_bytes(), 0);
+    assert_eq!(connection.queued_stream_count(), 0);
+}
