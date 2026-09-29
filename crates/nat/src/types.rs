@@ -90,8 +90,11 @@ pub enum NatError {
     /// No dialable direct candidates and no relay configured.
     #[error("no dialable candidates and no relay configured")]
     NoPathAvailable,
-    /// The connect deadline elapsed before any path was established.
-    #[error("connect deadline elapsed before any path was established")]
+    /// The relay leg's deadline
+    /// ([`NatConfig::relay_leg_deadline_ms`](crate::NatConfig::relay_leg_deadline_ms))
+    /// elapsed while the last relay tried was still working on the circuit.
+    /// The overall connect deadline belongs to the Connection-attempt engine.
+    #[error("relay leg deadline elapsed before a relay bridged the circuit")]
     Timeout,
     /// A dial was rejected or a connection was lost.
     #[error("dial failed: {0}")]

@@ -74,6 +74,8 @@ pub(crate) struct PendingLeg {
     pub(crate) peer: PeerId,
     /// Whether a relay leg may race its direct dials.
     pub(crate) allow_relay: bool,
+    /// Every address the source announced, circuit addresses included.
+    pub(crate) addrs: Vec<Multiaddr>,
 }
 
 /// NAT-driver work a [`DiscoveryDriver::sweep`] or
@@ -388,6 +390,7 @@ impl DiscoveryDriver {
                             id,
                             peer,
                             allow_relay,
+                            addrs,
                         });
                     }
                     DiscoveryAction::CancelDial { peer } => {

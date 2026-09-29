@@ -310,13 +310,20 @@ impl<E: EntropySource> NatDriver<E> {
     /// Attaches the attempt's NAT leg while it is still pending. Compositions
     /// call this right after `admit_connect`; keeping the attach at the call
     /// site lets shared admission stay transport-agnostic while the leg
-    /// needs the composition's concrete [`NatTransport`].
+    /// needs the composition's concrete [`NatTransport`]. `target_addrs` are
+    /// the addresses known for `peer`; circuit addresses among them steer
+    /// the relay leg toward relays the peer is reserved at.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one flat call per admission site; a bundle type would only move the fields"
+    )]
     pub(crate) fn attach_leg<T: NatTransport, R: EntropySource>(
         &mut self,
         connect: &ConnectEngine,
         id: ConnectId,
         peer: PeerId,
         allow_relay: bool,
+        target_addrs: Vec<Multiaddr>,
         swarm: &mut SwarmRuntime<T, R>,
         sample: PlatformNow,
     ) {
@@ -327,6 +334,8 @@ impl<E: EntropySource> NatDriver<E> {
                 ConnectLegs {
                     direct_racing: connect.dialed_direct(id),
                     allow_relay,
+                    target_addrs,
+                    deadline_ms: connect.expires_ms(id),
                 },
                 swarm,
                 sample,
@@ -351,7 +360,15 @@ impl<E: EntropySource> NatDriver<E> {
         sample: PlatformNow,
     ) {
         for leg in work.legs {
-            self.attach_leg(connect, leg.id, leg.peer, leg.allow_relay, swarm, sample);
+            self.attach_leg(
+                connect,
+                leg.id,
+                leg.peer,
+                leg.allow_relay,
+                leg.addrs,
+                swarm,
+                sample,
+            );
         }
         if work.pump {
             self.pump(swarm, sample);

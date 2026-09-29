@@ -27,7 +27,10 @@ pub enum ReservationPolicy {
 #[derive(Clone, Debug)]
 pub struct NatConfig {
     /// Relays available for circuit legs and reservations, in preference
-    /// order. Empty disables the relay leg entirely.
+    /// order. A connect's relay leg tries them one at a time, moving on when
+    /// a relay fails; relays the target is known to be reachable through
+    /// ([`ConnectLegs::target_addrs`](crate::ConnectLegs::target_addrs)) go
+    /// first. Empty disables the relay leg entirely.
     pub relays: Vec<PeerAddr>,
     /// AutoNAT servers used for reachability probes, in preference order.
     /// Empty leaves reachability [`Unknown`](crate::ReachabilityState::Unknown).
@@ -43,7 +46,12 @@ pub struct NatConfig {
     /// Use relayed circuits without racing direct dials or attempting DCUtR.
     pub force_relay: bool,
     /// Deadline for the relay leg to reach `Bridged` (measured from when the
-    /// leg starts, i.e. after the stagger).
+    /// leg starts, i.e. after the stagger), or the caller's
+    /// [`ConnectLegs::deadline_ms`](crate::ConnectLegs::deadline_ms) if that
+    /// comes first. Shared by the relays the leg
+    /// tries: each gets an even share of the time left when it starts
+    /// (`remaining / relays left`), so a relay that fails fast leaves its
+    /// time to the rest and one slow relay cannot use up the whole leg.
     pub relay_leg_deadline_ms: u64,
     /// One hole-punch window: how long to wait for the direct connection
     /// after dialing the remote's observed addresses.

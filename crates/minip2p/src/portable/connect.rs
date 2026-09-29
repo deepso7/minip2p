@@ -462,6 +462,13 @@ impl ConnectEngine {
             .is_some_and(|attempt| attempt.dialed_any)
     }
 
+    /// When the pending attempt expires, in monotonic ms. The NAT driver
+    /// hands it to the relay leg so relays split time the attempt has.
+    #[cfg(feature = "_nat-driver")]
+    pub(crate) fn expires_ms(&self, id: ConnectId) -> Option<u64> {
+        self.attempts.get(&id).map(|attempt| attempt.expires_ms)
+    }
+
     /// Idempotent. Settled or unknown ids are a no-op. Never disconnects.
     pub(crate) fn cancel<T: Transport, E: EntropySource>(
         &mut self,
