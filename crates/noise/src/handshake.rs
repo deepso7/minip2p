@@ -72,9 +72,10 @@ impl HandshakeState {
                 self.symmetric.mix_hash(&public);
                 // XX message 1 has an empty payload. Noise still runs
                 // EncryptAndHash over it, which advances the handshake hash.
-                let _ = self.symmetric.encrypt_and_hash(b"")?;
+                let mut message = public.to_vec();
+                self.symmetric.encrypt_and_hash(&mut message, b"")?;
                 self.step = Step::InitiatorReadMessage2;
-                Ok(Some(public.to_vec()))
+                Ok(Some(message))
             }
             Step::ResponderReadMessage1 => Ok(None),
             _ => Err(NoiseError::AlreadyStarted),
@@ -123,10 +124,10 @@ impl HandshakeState {
             .mix_key(&dh(self.local_ephemeral, remote_e)?)?;
 
         let local_s_public = public_key(self.local_static);
-        out.extend_from_slice(&self.symmetric.encrypt_and_hash(&local_s_public)?);
+        self.symmetric.encrypt_and_hash(&mut out, &local_s_public)?;
         self.symmetric.mix_key(&dh(self.local_static, remote_e)?)?;
         let payload = self.local_payload(local_s_public);
-        out.extend_from_slice(&self.symmetric.encrypt_and_hash(&payload)?);
+        self.symmetric.encrypt_and_hash(&mut out, &payload)?;
         self.step = Step::ResponderReadMessage3;
         Ok(out)
     }
@@ -167,10 +168,11 @@ impl HandshakeState {
         debug_assert_eq!(self.step, Step::InitiatorWriteMessage3);
         let remote_e = required(self.remote_ephemeral)?;
         let local_s_public = public_key(self.local_static);
-        let mut out = self.symmetric.encrypt_and_hash(&local_s_public)?;
+        let mut out = Vec::new();
+        self.symmetric.encrypt_and_hash(&mut out, &local_s_public)?;
         self.symmetric.mix_key(&dh(self.local_static, remote_e)?)?;
         let payload = self.local_payload(local_s_public);
-        out.extend_from_slice(&self.symmetric.encrypt_and_hash(&payload)?);
+        self.symmetric.encrypt_and_hash(&mut out, &payload)?;
         self.step = Step::Complete;
         Ok(out)
     }
@@ -300,14 +302,18 @@ impl SymmetricState {
         Ok(())
     }
 
-    fn encrypt_and_hash(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, NoiseError> {
-        let ciphertext = self.cipher.encrypt_with_ad(&self.hash, plaintext)?;
-        self.mix_hash(&ciphertext);
-        Ok(ciphertext)
+    /// Appends `plaintext` to `out`, encrypted, and mixes that ciphertext into `h`.
+    fn encrypt_and_hash(&mut self, out: &mut Vec<u8>, plaintext: &[u8]) -> Result<(), NoiseError> {
+        let start = out.len();
+        out.extend_from_slice(plaintext);
+        self.cipher.encrypt_with_ad(&self.hash, out, start)?;
+        self.mix_hash(out.get(start..).unwrap_or_default());
+        Ok(())
     }
 
     fn decrypt_and_hash(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, NoiseError> {
-        let plaintext = self.cipher.decrypt_with_ad(&self.hash, ciphertext)?;
+        let mut plaintext = ciphertext.to_vec();
+        self.cipher.decrypt_with_ad(&self.hash, &mut plaintext)?;
         self.mix_hash(ciphertext);
         Ok(plaintext)
     }
@@ -397,7 +403,9 @@ mod tests {
         let initiator_e = public_key(initiator_ephemeral);
         let mut message1 = initiator_e.to_vec();
         initiator.mix_hash(&initiator_e);
-        message1.extend_from_slice(&initiator.encrypt_and_hash(&payloads[0]).unwrap());
+        initiator
+            .encrypt_and_hash(&mut message1, &payloads[0])
+            .unwrap();
         assert_eq!(message1, expected[0]);
 
         responder.mix_hash(&message1[..32]);
@@ -413,11 +421,15 @@ mod tests {
             .mix_key(&dh(responder_ephemeral, initiator_e).unwrap())
             .unwrap();
         let responder_s = public_key(responder_static);
-        message2.extend_from_slice(&responder.encrypt_and_hash(&responder_s).unwrap());
+        responder
+            .encrypt_and_hash(&mut message2, &responder_s)
+            .unwrap();
         responder
             .mix_key(&dh(responder_static, initiator_e).unwrap())
             .unwrap();
-        message2.extend_from_slice(&responder.encrypt_and_hash(&payloads[1]).unwrap());
+        responder
+            .encrypt_and_hash(&mut message2, &payloads[1])
+            .unwrap();
         assert_eq!(message2, expected[1]);
 
         initiator.mix_hash(&message2[..32]);
@@ -437,11 +449,16 @@ mod tests {
         );
 
         let initiator_s = public_key(initiator_static);
-        let mut message3 = initiator.encrypt_and_hash(&initiator_s).unwrap();
+        let mut message3 = Vec::new();
+        initiator
+            .encrypt_and_hash(&mut message3, &initiator_s)
+            .unwrap();
         initiator
             .mix_key(&dh(initiator_static, responder_e).unwrap())
             .unwrap();
-        message3.extend_from_slice(&initiator.encrypt_and_hash(&payloads[2]).unwrap());
+        initiator
+            .encrypt_and_hash(&mut message3, &payloads[2])
+            .unwrap();
         assert_eq!(message3, expected[2]);
 
         assert_eq!(
@@ -459,27 +476,36 @@ mod tests {
         let (mut initiator_send, mut initiator_receive) = initiator.split();
         let (responder_receive, mut responder_send) = responder.split();
 
-        let message4 = responder_send.encrypt_with_ad(b"", &payloads[3]).unwrap();
+        let mut message4 = payloads[3].clone();
+        responder_send
+            .encrypt_with_ad(b"", &mut message4, 0)
+            .unwrap();
         assert_eq!(message4, expected[3]);
-        assert_eq!(
-            initiator_receive.decrypt_with_ad(b"", &message4).unwrap(),
-            payloads[3]
-        );
+        initiator_receive
+            .decrypt_with_ad(b"", &mut message4)
+            .unwrap();
+        assert_eq!(message4, payloads[3]);
 
-        let message5 = initiator_send.encrypt_with_ad(b"", &payloads[4]).unwrap();
+        let mut message5 = payloads[4].clone();
+        initiator_send
+            .encrypt_with_ad(b"", &mut message5, 0)
+            .unwrap();
         assert_eq!(message5, expected[4]);
         let mut responder_receive = responder_receive;
-        assert_eq!(
-            responder_receive.decrypt_with_ad(b"", &message5).unwrap(),
-            payloads[4]
-        );
+        responder_receive
+            .decrypt_with_ad(b"", &mut message5)
+            .unwrap();
+        assert_eq!(message5, payloads[4]);
 
-        let message6 = responder_send.encrypt_with_ad(b"", &payloads[5]).unwrap();
+        let mut message6 = payloads[5].clone();
+        responder_send
+            .encrypt_with_ad(b"", &mut message6, 0)
+            .unwrap();
         assert_eq!(message6, expected[5]);
-        assert_eq!(
-            initiator_receive.decrypt_with_ad(b"", &message6).unwrap(),
-            payloads[5]
-        );
+        initiator_receive
+            .decrypt_with_ad(b"", &mut message6)
+            .unwrap();
+        assert_eq!(message6, payloads[5]);
     }
 
     fn value(name: &str) -> &str {

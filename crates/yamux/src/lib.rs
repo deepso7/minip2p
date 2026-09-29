@@ -70,6 +70,9 @@ pub struct YamuxConfig {
     /// Maximum number of simultaneously tracked inbound and outbound streams.
     pub max_streams: usize,
     /// Per-stream cap for bytes queued after its remote send window is spent.
+    ///
+    /// The cap counts unsent bytes. A `send` buffer that was framed only in
+    /// part is kept whole, not copied, until its last byte is framed.
     pub max_buffered_send: usize,
     /// Aggregate cap for queued send bytes across all streams.
     pub max_total_buffered_send: usize,

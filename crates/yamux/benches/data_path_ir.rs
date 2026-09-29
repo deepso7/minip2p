@@ -34,5 +34,40 @@ fn session_receive_and_drain(input: (YamuxSession, Vec<u8>)) {
     black_box(session.poll_output());
 }
 
-library_benchmark_group!(name = benches; benchmarks = session_send_and_drain, session_receive_and_drain);
+const QUEUED_LEN: usize = 256 * 1024;
+const WINDOW_STEP: u32 = 16 * 1024;
+
+/// A window-exhausted stream, a chunk to queue, and the updates that drain it.
+fn queued_sender() -> (YamuxSession, u32, Vec<u8>, Vec<u8>) {
+    let mut session = YamuxSession::new(YamuxRole::Client);
+    let stream = session.open_stream().expect("open stream");
+    session
+        .send(stream, vec![0; QUEUED_LEN])
+        .expect("fill window");
+    while session.poll_output().is_some() {}
+    let updates = (0..QUEUED_LEN / WINDOW_STEP as usize)
+        .flat_map(|_| {
+            Frame::window_update(stream, 0, WINDOW_STEP)
+                .expect("valid frame")
+                .encode()
+        })
+        .collect();
+    (session, stream, vec![0x5a; QUEUED_LEN], updates)
+}
+
+#[library_benchmark]
+#[bench::queued_send_16kib_window_updates(queued_sender())]
+fn queued_send_16kib_window_updates(input: (YamuxSession, u32, Vec<u8>, Vec<u8>)) {
+    let (mut session, stream, data, updates) = input;
+    session.send(stream, data).expect("send");
+    session.handle_data(&updates).expect("window updates");
+    while let Some(output) = session.poll_output() {
+        black_box(output);
+    }
+}
+
+library_benchmark_group!(
+    name = benches;
+    benchmarks = session_send_and_drain, session_receive_and_drain, queued_send_16kib_window_updates
+);
 gungraun::main!(library_benchmark_groups = benches);

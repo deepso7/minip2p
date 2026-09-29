@@ -139,13 +139,31 @@ impl Frame {
 
     /// Encodes this frame to its 12-byte header plus optional data payload.
     pub fn encode(&self) -> Vec<u8> {
-        let mut output = Vec::with_capacity(HEADER_LEN + self.payload.len());
+        self.encode_with_payload(&self.payload)
+    }
+
+    /// Encodes a data frame straight from borrowed bytes, so the payload is
+    /// copied once, into the wire buffer, instead of into an owned `Frame` first.
+    pub(crate) fn encode_data(
+        stream_id: u32,
+        flags: u16,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, YamuxError> {
+        let header = Self::data(stream_id, flags, Vec::new())?;
+        let Ok(value) = u32::try_from(payload.len()) else {
+            return Err(YamuxError::FrameLengthOverflow);
+        };
+        Ok(Self { value, ..header }.encode_with_payload(payload))
+    }
+
+    fn encode_with_payload(&self, payload: &[u8]) -> Vec<u8> {
+        let mut output = Vec::with_capacity(HEADER_LEN + payload.len());
         output.push(0);
         output.push(self.frame_type as u8);
         output.extend_from_slice(&self.flags.to_be_bytes());
         output.extend_from_slice(&self.stream_id.to_be_bytes());
         output.extend_from_slice(&self.value.to_be_bytes());
-        output.extend_from_slice(&self.payload);
+        output.extend_from_slice(payload);
         output
     }
 

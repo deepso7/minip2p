@@ -4,6 +4,8 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use minip2p_yamux::{FLAG_SYN, Frame, HEADER_LEN, YamuxOutput, YamuxRole, YamuxSession};
 
 const PAYLOAD_LEN: usize = 64 * 1024;
+const QUEUED_LEN: usize = 256 * 1024;
+const WINDOW_STEP: u32 = 16 * 1024;
 
 fn assert_payload_frame(output: YamuxOutput, payload: &[u8]) {
     match output {
@@ -75,6 +77,42 @@ fn yamux_data_path(c: &mut Criterion) {
         );
     });
     group.finish();
+
+    // A stream whose window is exhausted queues a whole chunk, then drains it
+    // across many small window updates: the partial-send path.
+    let updates = (0..QUEUED_LEN / WINDOW_STEP as usize)
+        .flat_map(|_| {
+            Frame::window_update(1, 0, WINDOW_STEP)
+                .expect("valid frame")
+                .encode()
+        })
+        .collect::<Vec<u8>>();
+    let mut group = c.benchmark_group("yamux/256KiB");
+    group.bench_function("queued_send_16KiB_window_updates", |b| {
+        b.iter_batched(
+            || (window_exhausted_sender(), vec![0x5a; QUEUED_LEN]),
+            |((mut session, stream), data)| {
+                session.send(stream, data).expect("send");
+                session.handle_data(&updates).expect("window updates");
+                while let Some(output) = session.poll_output() {
+                    black_box(output);
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+/// A client stream that has spent its whole initial send window.
+fn window_exhausted_sender() -> (YamuxSession, u32) {
+    let mut session = YamuxSession::new(YamuxRole::Client);
+    let stream = session.open_stream().expect("open stream");
+    session
+        .send(stream, vec![0; QUEUED_LEN])
+        .expect("fill window");
+    while session.poll_output().is_some() {}
+    (session, stream)
 }
 
 criterion_group!(benches, yamux_data_path);

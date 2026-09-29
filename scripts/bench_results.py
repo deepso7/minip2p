@@ -18,6 +18,7 @@ METRICS = {"rust-micro": "Ir", "rust-wall": "median_ns", "node-ffi": "median_ns"
 EXPECTED_CRITERION = {
     "multiaddr/parse_text", "multiaddr/encode_binary", "multiaddr/decode_binary",
     "yamux/64KiB/session_send_and_drain", "yamux/64KiB/session_receive_and_drain",
+    "yamux/256KiB/queued_send_16KiB_window_updates",
     "peer_book_128_peers_16_addrs/tick_active", "peer_book_128_peers_16_addrs/tick_expire",
     "peer_book_128_peers_16_addrs/next_timeout",
     "pubsub/gossipsub_publish_32x60KiB",
@@ -34,6 +35,7 @@ GUNGRAUN_NAMES = {
     "decode_binary": "multiaddr/decode_binary",
     "session_send_and_drain": "yamux/64KiB/session_send_and_drain",
     "session_receive_and_drain": "yamux/64KiB/session_receive_and_drain",
+    "queued_send_16kib_window_updates": "yamux/256KiB/queued_send_16KiB_window_updates",
     "tick_active": "peer_book_128_peers_16_addrs/tick_active",
     "tick_expire": "peer_book_128_peers_16_addrs/tick_expire",
     "next_timeout": "peer_book_128_peers_16_addrs/next_timeout",
