@@ -16,7 +16,7 @@ enum OpenFlag {
 
 /// Bytes accepted by [`YamuxSession::send`] but not yet framed. A chunk that
 /// only part of a window could take keeps its buffer; `sent` marks the resume
-/// point, so the unsent tail is never copied.
+/// point, so a partial window does not copy the unsent tail.
 #[derive(Debug)]
 struct QueuedChunk {
     bytes: Vec<u8>,
@@ -24,8 +24,25 @@ struct QueuedChunk {
 }
 
 impl QueuedChunk {
+    fn new(bytes: Vec<u8>, sent: usize) -> Self {
+        let mut chunk = Self { bytes, sent };
+        chunk.bound_retained();
+        chunk
+    }
+
     fn unsent(&self) -> &[u8] {
         self.bytes.get(self.sent..).unwrap_or_default()
+    }
+
+    /// Keeps the allocation within twice the unsent (cap-counted) bytes, so a
+    /// peer withholding credit cannot pin already-framed bytes. Each move at
+    /// least halves the allocation, so a chunk's tail copies sum to less than
+    /// its original size.
+    fn bound_retained(&mut self) {
+        if self.bytes.capacity() > self.unsent().len().saturating_mul(2) {
+            self.bytes = self.unsent().to_vec();
+            self.sent = 0;
+        }
     }
 }
 
@@ -261,10 +278,9 @@ impl YamuxSession {
                 }
             }
             if queued_len != 0 {
-                state.send_buffer.push_back(QueuedChunk {
-                    bytes: data,
-                    sent: immediate_len,
-                });
+                state
+                    .send_buffer
+                    .push_back(QueuedChunk::new(data, immediate_len));
                 state.buffered_send += queued_len;
             }
             buffered_added = queued_len;
@@ -615,6 +631,8 @@ impl YamuxSession {
                 chunk.sent += send_len;
                 if chunk.unsent().is_empty() {
                     state.send_buffer.pop_front();
+                } else {
+                    chunk.bound_retained();
                 }
                 state.send_window -= send_len as u32;
                 state.buffered_send -= send_len;
@@ -926,6 +944,35 @@ mod tests {
             assert_eq!(payloads(&mut client), expected);
         }
         assert_eq!(client.total_buffered_send(), 0);
+    }
+
+    #[test]
+    fn queued_chunks_retain_at_most_twice_their_unsent_bytes() {
+        let mut client = YamuxSession::with_config(YamuxRole::Client, config()).unwrap();
+        let stream = client.open_stream().unwrap();
+        let retained = |client: &YamuxSession| {
+            client.streams[&stream]
+                .send_buffer
+                .iter()
+                .map(|chunk| chunk.bytes.capacity())
+                .sum::<usize>()
+        };
+        client.streams.get_mut(&stream).unwrap().send_window = 99;
+        client.send(stream, alloc::vec![1; 100]).unwrap();
+        assert_eq!(client.total_buffered_send(), 1);
+        assert!(
+            retained(&client) <= 2,
+            "a mostly framed send keeps only its tail"
+        );
+
+        client.send(stream, alloc::vec![2; 100]).unwrap();
+        for credit in [30, 30, 25] {
+            let update = Frame::window_update(stream, 0, credit).unwrap().encode();
+            client.handle_data(&update).unwrap();
+            while client.poll_output().is_some() {}
+            assert!(retained(&client) <= 2 * client.total_buffered_send());
+        }
+        assert_eq!(client.total_buffered_send(), 16);
     }
 
     #[test]

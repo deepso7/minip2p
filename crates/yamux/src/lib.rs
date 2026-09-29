@@ -71,8 +71,10 @@ pub struct YamuxConfig {
     pub max_streams: usize,
     /// Per-stream cap for bytes queued after its remote send window is spent.
     ///
-    /// The cap counts unsent bytes. A `send` buffer that was framed only in
-    /// part is kept whole, not copied, until its last byte is framed.
+    /// The cap counts unsent bytes. A `send` buffer framed only in part is
+    /// kept, not copied, until its framed prefix outgrows the unsent tail;
+    /// the tail then moves to a right-sized buffer. Queued sends therefore
+    /// hold at most twice the bytes this cap and the total cap count.
     pub max_buffered_send: usize,
     /// Aggregate cap for queued send bytes across all streams.
     pub max_total_buffered_send: usize,
