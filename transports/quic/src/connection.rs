@@ -578,6 +578,7 @@ impl QuicConnection {
         stream_id: StreamId,
         events: &mut Vec<TransportEvent>,
     ) -> Result<(), TransportError> {
+        // Fail with `StreamNotFound` before touching quiche.
         self.stream_state_mut(stream_id)?;
         self.drop_send_queue(stream_id.as_u64());
 

@@ -33,6 +33,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::Infallible;
+use core::ops::RangeInclusive;
 
 use minip2p_core::{Multiaddr, PeerAddr, PeerId, SansIoProtocol};
 use minip2p_identify::{
@@ -80,8 +81,27 @@ enum ProtocolKind {
     User(String),
 }
 
-/// `SwarmCore::stream_owner` key: the owning peer, stream id, and connection.
-type OwnedStream = (PeerId, StreamId, ConnectionId);
+/// `SwarmCore::stream_owner` key. Field order is sort order: peer and stream
+/// come first so a `(peer, stream)` lookup is a range query.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct OwnedStream {
+    peer_id: PeerId,
+    stream_id: StreamId,
+    conn_id: ConnectionId,
+}
+
+impl OwnedStream {
+    /// Every key for `peer_id` with a stream id in `first..=last`, on any
+    /// connection.
+    fn peer_range(peer_id: &PeerId, first: StreamId, last: StreamId) -> RangeInclusive<Self> {
+        let key = |stream_id, conn_id| Self {
+            peer_id: peer_id.clone(),
+            stream_id,
+            conn_id,
+        };
+        key(first, ConnectionId::new(0))..=key(last, ConnectionId::new(u64::MAX))
+    }
+}
 
 /// Tracks a pending outbound stream that is still negotiating multistream-select.
 struct PendingOutbound {
@@ -1033,18 +1053,39 @@ impl SwarmCore {
         peer_id: &PeerId,
         stream_id: StreamId,
     ) -> impl Iterator<Item = (ConnectionId, &ProtocolKind)> {
-        let first = (peer_id.clone(), stream_id, ConnectionId::new(0));
-        let last = (peer_id.clone(), stream_id, ConnectionId::new(u64::MAX));
         self.stream_owner
-            .range(first..=last)
-            .map(|((_, _, conn_id), protocol)| (*conn_id, protocol))
+            .range(OwnedStream::peer_range(peer_id, stream_id, stream_id))
+            .map(|(key, protocol)| (key.conn_id, protocol))
     }
 
     /// The `stream_owner` key for a stream on `conn_id`, if the connection
     /// has a peer (every owned stream's connection does).
     fn owned_stream(&self, conn_id: ConnectionId, stream_id: StreamId) -> Option<OwnedStream> {
         let peer_id = self.conn_to_peer.get(&conn_id)?.clone();
-        Some((peer_id, stream_id, conn_id))
+        Some(OwnedStream {
+            peer_id,
+            stream_id,
+            conn_id,
+        })
+    }
+
+    /// Records `protocol` as the owner of a negotiated stream. Keys it under
+    /// the connection's current peer, synthesizing one if needed.
+    fn insert_stream_owner(
+        &mut self,
+        conn_id: ConnectionId,
+        stream_id: StreamId,
+        protocol: ProtocolKind,
+    ) {
+        let peer_id = self.ensure_peer_id_for_conn(conn_id);
+        self.stream_owner.insert(
+            OwnedStream {
+                peer_id,
+                stream_id,
+                conn_id,
+            },
+            protocol,
+        );
     }
 
     fn stream_protocol(&self, conn_id: ConnectionId, stream_id: StreamId) -> Option<&ProtocolKind> {
@@ -1070,18 +1111,20 @@ impl SwarmCore {
         if old == peer_id {
             return;
         }
-        let first = (old.clone(), StreamId::new(0), ConnectionId::new(0));
-        let last = (old, StreamId::new(u64::MAX), ConnectionId::new(u64::MAX));
         let moved: Vec<OwnedStream> = self
             .stream_owner
-            .range(first..=last)
-            .filter(|((_, _, cid), _)| *cid == conn_id)
+            .range(OwnedStream::peer_range(
+                &old,
+                StreamId::new(0),
+                StreamId::new(u64::MAX),
+            ))
+            .filter(|(key, _)| key.conn_id == conn_id)
             .map(|(key, _)| key.clone())
             .collect();
-        for key in moved {
+        for mut key in moved {
             if let Some(protocol) = self.stream_owner.remove(&key) {
-                self.stream_owner
-                    .insert((peer_id.clone(), key.1, conn_id), protocol);
+                key.peer_id = peer_id.clone();
+                self.stream_owner.insert(key, protocol);
             }
         }
     }
@@ -1344,7 +1387,7 @@ impl SwarmCore {
             self.established_peers.remove(&peer_id);
         }
         self.conn_to_remote_addr.remove(&old_id);
-        self.stream_owner.retain(|(_, _, cid), _| *cid != old_id);
+        self.stream_owner.retain(|key, _| key.conn_id != old_id);
         self.reset_pending.retain(|(cid, _)| *cid != old_id);
         self.abandoned_streams.retain(|(cid, _)| *cid != old_id);
         self.inbound_negotiators
@@ -1624,7 +1667,7 @@ impl SwarmCore {
         if let Some(key) = self.owned_stream(conn_id, stream_id)
             && let Some(protocol) = self.stream_owner.remove(&key)
         {
-            let peer_id = key.0;
+            let peer_id = key.peer_id;
             match protocol {
                 ProtocolKind::Ping => {
                     self.inform_ping(PingInput::StreamClosed { peer_id, stream_id });
@@ -1717,7 +1760,7 @@ impl SwarmCore {
     }
 
     fn forget_connection_streams(&mut self, conn_id: ConnectionId) {
-        self.stream_owner.retain(|(_, _, cid), _| *cid != conn_id);
+        self.stream_owner.retain(|key, _| key.conn_id != conn_id);
         self.reset_pending.retain(|(cid, _)| *cid != conn_id);
         self.abandoned_streams.retain(|(cid, _)| *cid != conn_id);
         self.inbound_negotiators
@@ -1915,8 +1958,7 @@ impl SwarmCore {
         let peer_id = self.ensure_peer_id_for_conn(conn_id);
 
         if protocol == PING_PROTOCOL_ID {
-            self.stream_owner
-                .insert((peer_id.clone(), stream_id, conn_id), ProtocolKind::Ping);
+            self.insert_stream_owner(conn_id, stream_id, ProtocolKind::Ping);
             self.inform_ping(PingInput::RegisterInboundStream { peer_id, stream_id });
             self.drain_ping_outputs();
             return;
@@ -1947,10 +1989,7 @@ impl SwarmCore {
                     // Only record ownership on success, so a rejected
                     // registration doesn't leave the stream tracked here
                     // with no owning handler.
-                    self.stream_owner.insert(
-                        (responder_peer_id, stream_id, conn_id),
-                        ProtocolKind::IdentifyResponder,
-                    );
+                    self.insert_stream_owner(conn_id, stream_id, ProtocolKind::IdentifyResponder);
                     self.drain_identify_outputs();
                 }
                 Err(e) => {
@@ -1972,10 +2011,7 @@ impl SwarmCore {
         }
 
         if self.inbound_protocols.iter().any(|p| p == protocol) {
-            self.stream_owner.insert(
-                (peer_id.clone(), stream_id, conn_id),
-                ProtocolKind::User(protocol.to_string()),
-            );
+            self.insert_stream_owner(conn_id, stream_id, ProtocolKind::User(protocol.to_string()));
             self.events.push_back(SwarmEvent::StreamReady {
                 peer_id,
                 conn_id,
@@ -1994,8 +2030,7 @@ impl SwarmCore {
         now_ms: u64,
     ) {
         let peer_id = self.ensure_peer_id_for_conn(conn_id);
-        self.stream_owner
-            .insert((peer_id.clone(), stream_id, conn_id), target.clone());
+        self.insert_stream_owner(conn_id, stream_id, target.clone());
 
         match target {
             ProtocolKind::Ping => {
@@ -2009,8 +2044,7 @@ impl SwarmCore {
                         Some(conn_id),
                         format!("ping register error: {e}"),
                     );
-                    self.stream_owner
-                        .remove(&(peer_id.clone(), stream_id, conn_id));
+                    self.remove_stream_owner(conn_id, stream_id);
                     self.actions
                         .push_back(SwarmAction::ResetStream { conn_id, stream_id });
                     return;
@@ -2264,20 +2298,6 @@ mod tests {
 
     fn feed(core: &mut SwarmCore, event: TransportEvent) {
         core.handle_input(SwarmInput::Transport { event, now_ms: 0 });
-    }
-
-    /// Marks `stream_id` on `conn_id` as negotiated for `protocol`, as if
-    /// multistream-select had completed. The connection must have a peer.
-    fn own_stream(
-        core: &mut SwarmCore,
-        conn_id: ConnectionId,
-        stream_id: StreamId,
-        protocol: ProtocolKind,
-    ) {
-        let key = core
-            .owned_stream(conn_id, stream_id)
-            .expect("connection should have a peer");
-        core.stream_owner.insert(key, protocol);
     }
 
     fn drain_actions(core: &mut SwarmCore) -> Vec<SwarmAction> {
@@ -2803,12 +2823,7 @@ mod tests {
         let stream = StreamId::new(9);
         core.conn_to_peer.insert(conn, peer.clone());
         core.peer_to_conn.insert(peer.clone(), conn);
-        own_stream(
-            &mut core,
-            conn,
-            stream,
-            ProtocolKind::User("/test/1".into()),
-        );
+        core.insert_stream_owner(conn, stream, ProtocolKind::User("/test/1".into()));
         core.events.push_back(SwarmEvent::StreamData {
             peer_id: peer.clone(),
             conn_id: conn,
@@ -2897,12 +2912,7 @@ mod tests {
         let stream = StreamId::new(10);
         core.conn_to_peer.insert(conn, peer.clone());
         core.peer_to_conn.insert(peer.clone(), conn);
-        own_stream(
-            &mut core,
-            conn,
-            stream,
-            ProtocolKind::User("/test/1".into()),
-        );
+        core.insert_stream_owner(conn, stream, ProtocolKind::User("/test/1".into()));
 
         core.reset_stream(&peer, stream).unwrap();
         assert!(matches!(
@@ -2937,12 +2947,7 @@ mod tests {
         let stream = StreamId::new(11);
         core.conn_to_peer.insert(conn, peer.clone());
         core.peer_to_conn.insert(peer.clone(), conn);
-        own_stream(
-            &mut core,
-            conn,
-            stream,
-            ProtocolKind::User("/test/1".into()),
-        );
+        core.insert_stream_owner(conn, stream, ProtocolKind::User("/test/1".into()));
 
         feed(
             &mut core,
@@ -3031,8 +3036,7 @@ mod tests {
         core.conn_to_peer.insert(original_conn, peer_id.clone());
         core.conn_to_peer.insert(newer_conn, peer_id.clone());
         core.peer_to_conn.insert(peer_id.clone(), newer_conn);
-        own_stream(
-            &mut core,
+        core.insert_stream_owner(
             original_conn,
             stream_id,
             ProtocolKind::User("/minip2p/test/1.0.0".into()),
@@ -3058,13 +3062,12 @@ mod tests {
         let ping = StreamId::new(8);
         core.conn_to_peer.insert(conn_id, peer_id.clone());
         core.peer_to_conn.insert(peer_id.clone(), conn_id);
-        own_stream(
-            &mut core,
+        core.insert_stream_owner(
             conn_id,
             user,
             ProtocolKind::User("/minip2p/test/1.0.0".into()),
         );
-        own_stream(&mut core, conn_id, ping, ProtocolKind::Ping);
+        core.insert_stream_owner(conn_id, ping, ProtocolKind::Ping);
 
         for stream_id in [user, ping] {
             feed(
@@ -3112,8 +3115,7 @@ mod tests {
                 endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
             },
         );
-        own_stream(
-            &mut core,
+        core.insert_stream_owner(
             original_conn,
             stream_id,
             ProtocolKind::User("/minip2p/test/1.0.0".into()),
@@ -3148,12 +3150,7 @@ mod tests {
         core.conn_to_peer.insert(surviving, peer_id.clone());
         core.peer_to_conn.insert(peer_id.clone(), surviving);
         for conn_id in [closed, surviving] {
-            own_stream(
-                &mut core,
-                conn_id,
-                stream_id,
-                ProtocolKind::User("/test/1".into()),
-            );
+            core.insert_stream_owner(conn_id, stream_id, ProtocolKind::User("/test/1".into()));
         }
 
         feed(&mut core, TransportEvent::Closed { id: closed });
@@ -3185,12 +3182,7 @@ mod tests {
             },
         );
         let placeholder = core.conn_to_peer[&conn_id].clone();
-        own_stream(
-            &mut core,
-            conn_id,
-            stream_id,
-            ProtocolKind::User("/test/1".into()),
-        );
+        core.insert_stream_owner(conn_id, stream_id, ProtocolKind::User("/test/1".into()));
 
         let verified = PeerId::from_public_key_protobuf(b"verified-peer");
         feed(
@@ -3226,8 +3218,7 @@ mod tests {
                 endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
             },
         );
-        own_stream(
-            &mut core,
+        core.insert_stream_owner(
             original,
             stream,
             ProtocolKind::User("/minip2p/test/1.0.0".into()),
@@ -3414,12 +3405,7 @@ mod tests {
         let key = (conn, stream);
         core.conn_to_peer.insert(conn, peer.clone());
         core.peer_to_conn.insert(peer.clone(), conn);
-        own_stream(
-            &mut core,
-            key.0,
-            key.1,
-            ProtocolKind::User("/test/1".into()),
-        );
+        core.insert_stream_owner(conn, stream, ProtocolKind::User("/test/1".into()));
         core.inbound_negotiators
             .insert(key, MultistreamSelect::listener(["/test/1".to_string()]));
         core.outbound_negotiators.insert(
@@ -3455,7 +3441,7 @@ mod tests {
 
         core.forget_stream(conn, stream);
 
-        assert!(core.stream_protocol(key.0, key.1).is_none());
+        assert!(core.stream_protocol(conn, stream).is_none());
         assert!(!core.inbound_negotiators.contains_key(&key));
         assert!(!core.outbound_negotiators.contains_key(&key));
         assert!(!core.reset_pending.contains(&key));
@@ -3488,7 +3474,7 @@ mod tests {
                 endpoint: ConnectionEndpoint::with_peer_id(loopback_transport(), peer_id.clone()),
             },
         );
-        own_stream(&mut core, original_conn, stale_stream, ProtocolKind::Ping);
+        core.insert_stream_owner(original_conn, stale_stream, ProtocolKind::Ping);
         core.ping
             .handle_input(PingInput::RegisterOutboundStream {
                 peer_id: peer_id.clone(),
@@ -3575,7 +3561,7 @@ mod tests {
         core.conn_to_peer.insert(original_conn, peer_id.clone());
         core.conn_to_peer.insert(newer_conn, peer_id.clone());
         core.peer_to_conn.insert(peer_id.clone(), newer_conn);
-        own_stream(&mut core, original_conn, inbound_stream, ProtocolKind::Ping);
+        core.insert_stream_owner(original_conn, inbound_stream, ProtocolKind::Ping);
         core.ping
             .handle_input(PingInput::RegisterInboundStream {
                 peer_id: peer_id.clone(),
@@ -3619,12 +3605,7 @@ mod tests {
         core.conn_to_peer.insert(original_conn, peer_id.clone());
         core.conn_to_peer.insert(newer_conn, peer_id.clone());
         core.peer_to_conn.insert(peer_id.clone(), newer_conn);
-        own_stream(
-            &mut core,
-            original_conn,
-            stream_id,
-            ProtocolKind::IdentifyInitiator,
-        );
+        core.insert_stream_owner(original_conn, stream_id, ProtocolKind::IdentifyInitiator);
         core.identify
             .handle_input(IdentifyInput::RegisterInboundStream {
                 peer_id: peer_id.clone(),
@@ -3667,7 +3648,7 @@ mod tests {
             },
         );
         while core.poll_output().is_some() {}
-        own_stream(core, conn_id, stream_id, ProtocolKind::Ping);
+        core.insert_stream_owner(conn_id, stream_id, ProtocolKind::Ping);
         core.ping
             .handle_input(PingInput::RegisterOutboundStream {
                 peer_id: peer_id.clone(),
