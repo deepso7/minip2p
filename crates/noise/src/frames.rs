@@ -28,17 +28,38 @@ impl FrameDecoder {
     }
 
     /// Appends bytes received from the underlying stream.
-    pub fn push(&mut self, bytes: &[u8]) {
-        self.buffer.extend_from_slice(bytes);
+    ///
+    /// When nothing is buffered, `bytes` is adopted as the buffer instead of
+    /// being copied into it.
+    pub fn push(&mut self, bytes: Vec<u8>) {
+        if self.buffer.is_empty() {
+            self.buffer = bytes;
+            self.offset = 0;
+        } else {
+            self.buffer.extend_from_slice(&bytes);
+        }
     }
 
     /// Returns the next complete frame payload, if one is buffered.
+    ///
+    /// A buffer holding exactly one frame is handed back whole, minus its
+    /// length prefix (shifted in place), so a caller-owned frame is never
+    /// reallocated.
     pub fn next_frame(&mut self) -> Option<Vec<u8>> {
         let remaining = self.buffer.get(self.offset..)?;
         let length: [u8; 2] = remaining.get(..2)?.try_into().ok()?;
-        let len = u16::from_be_bytes(length) as usize;
-        let payload = remaining.get(2..)?.get(..len)?.to_vec();
-        self.offset = self.offset.checked_add(2)?.checked_add(len)?;
+        let start = self.offset.checked_add(2)?;
+        let end = start.checked_add(u16::from_be_bytes(length).into())?;
+        if end > self.buffer.len() {
+            return None;
+        }
+        if self.offset == 0 && end == self.buffer.len() {
+            let mut frame = core::mem::take(&mut self.buffer);
+            frame.drain(..2);
+            return Some(frame);
+        }
+        let payload = self.buffer.get(start..end)?.to_vec();
+        self.offset = end;
         self.compact_if_needed();
         Some(payload)
     }
@@ -86,10 +107,10 @@ mod tests {
         let mut bytes = encode_frame(b"one").unwrap();
         bytes.extend_from_slice(&encode_frame(b"two").unwrap());
         for byte in &bytes[..4] {
-            decoder.push(core::slice::from_ref(byte));
+            decoder.push(alloc::vec![*byte]);
             assert!(decoder.next_frame().is_none());
         }
-        decoder.push(&bytes[4..]);
+        decoder.push(bytes[4..].to_vec());
         assert_eq!(decoder.next_frame().unwrap(), b"one");
         assert_eq!(decoder.next_frame().unwrap(), b"two");
         assert!(decoder.next_frame().is_none());
@@ -105,7 +126,7 @@ mod tests {
         }
 
         let mut decoder = FrameDecoder::new();
-        decoder.push(&bytes);
+        decoder.push(bytes);
         let mut compactions = 0;
         let mut previous_storage_len = decoder.buffer.len();
 
@@ -126,6 +147,18 @@ mod tests {
         assert_eq!(decoder.buffered_len(), 0);
         assert!(decoder.buffer.is_empty());
         assert_eq!(decoder.offset, 0);
+    }
+
+    #[test]
+    fn adopts_a_lone_caller_owned_frame_without_reallocating() {
+        let bytes = encode_frame(b"payload").unwrap();
+        let allocation = bytes.as_ptr();
+        let mut decoder = FrameDecoder::new();
+        decoder.push(bytes);
+        let frame = decoder.next_frame().unwrap();
+        assert_eq!(frame, b"payload");
+        assert_eq!(frame.as_ptr(), allocation, "the pushed buffer is reused");
+        assert_eq!(decoder.buffered_len(), 0);
     }
 
     #[test]

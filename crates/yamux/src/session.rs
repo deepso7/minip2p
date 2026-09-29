@@ -14,6 +14,38 @@ enum OpenFlag {
     Ack,
 }
 
+/// Bytes accepted by [`YamuxSession::send`] but not yet framed. A chunk that
+/// only part of a window could take keeps its buffer; `sent` marks the resume
+/// point, so a partial window does not copy the unsent tail.
+#[derive(Debug)]
+struct QueuedChunk {
+    bytes: Vec<u8>,
+    sent: usize,
+}
+
+impl QueuedChunk {
+    fn new(bytes: Vec<u8>, sent: usize) -> Self {
+        let mut chunk = Self { bytes, sent };
+        chunk.bound_retained();
+        chunk
+    }
+
+    fn unsent(&self) -> &[u8] {
+        self.bytes.get(self.sent..).unwrap_or_default()
+    }
+
+    /// Keeps the allocation within twice the unsent (cap-counted) bytes, so a
+    /// peer withholding credit cannot pin already-framed bytes. Each move at
+    /// least halves the allocation, so a chunk's tail copies sum to less than
+    /// its original size.
+    fn bound_retained(&mut self) {
+        if self.bytes.capacity() > self.unsent().len().saturating_mul(2) {
+            self.bytes = self.unsent().to_vec();
+            self.sent = 0;
+        }
+    }
+}
+
 #[derive(Debug)]
 struct StreamState {
     locally_opened: bool,
@@ -23,7 +55,7 @@ struct StreamState {
     receive_window: u32,
     delivered_since_update: u32,
     pending_credit: u64,
-    send_buffer: VecDeque<Vec<u8>>,
+    send_buffer: VecDeque<QueuedChunk>,
     buffered_send: usize,
     close_pending: bool,
     local_write_closed: bool,
@@ -235,34 +267,26 @@ impl YamuxSession {
             }
 
             state.send_window -= immediate_len as u32;
-            let was_empty = data.is_empty();
-            let mut immediate = data;
-            let queued = immediate.split_off(immediate_len);
-            if was_empty && state.pending_open.is_some() {
+            if data.is_empty() && state.pending_open.is_some() {
                 let flags = state.take_open_flag();
-                frames.push(Frame::data(stream, flags, Vec::new())?);
+                frames.push(Frame::encode_data(stream, flags, &[])?);
             } else if immediate_len != 0 {
-                let mut first = true;
-                while !immediate.is_empty() {
-                    let rest = if immediate.len() > max_frame_len {
-                        immediate.split_off(max_frame_len)
-                    } else {
-                        Vec::new()
-                    };
-                    let flags = if first { state.take_open_flag() } else { 0 };
-                    frames.push(Frame::data(stream, flags, immediate)?);
-                    immediate = rest;
-                    first = false;
+                let immediate = data.get(..immediate_len).unwrap_or_default();
+                for segment in immediate.chunks(max_frame_len) {
+                    let flags = state.take_open_flag();
+                    frames.push(Frame::encode_data(stream, flags, segment)?);
                 }
             }
             if queued_len != 0 {
-                state.send_buffer.push_back(queued);
+                state
+                    .send_buffer
+                    .push_back(QueuedChunk::new(data, immediate_len));
                 state.buffered_send += queued_len;
             }
             buffered_added = queued_len;
         }
         self.total_buffered_send += buffered_added;
-        self.queue_frames(frames);
+        self.queue_encoded(frames);
         Ok(())
     }
 
@@ -592,35 +616,39 @@ impl YamuxSession {
                 .streams
                 .get_mut(&stream)
                 .ok_or(YamuxError::UnknownStream(stream))?;
-            while state.send_window != 0 {
-                let Some(mut chunk) = state.send_buffer.pop_front() else {
+            while state.send_window != 0 && !state.send_buffer.is_empty() {
+                let flags = state.take_open_flag();
+                let Some(chunk) = state.send_buffer.front_mut() else {
                     break;
                 };
-                let send_len = chunk
+                let unsent = chunk.unsent();
+                let send_len = unsent
                     .len()
                     .min(state.send_window as usize)
                     .min(max_frame_len);
-                let remainder = chunk.split_off(send_len);
+                let payload = unsent.get(..send_len).unwrap_or_default();
+                frames.push(Frame::encode_data(stream, flags, payload)?);
+                chunk.sent += send_len;
+                if chunk.unsent().is_empty() {
+                    state.send_buffer.pop_front();
+                } else {
+                    chunk.bound_retained();
+                }
                 state.send_window -= send_len as u32;
                 state.buffered_send -= send_len;
                 drained += send_len;
-                let flags = state.take_open_flag();
-                frames.push(Frame::data(stream, flags, chunk)?);
-                if !remainder.is_empty() {
-                    state.send_buffer.push_front(remainder);
-                }
             }
             if state.send_buffer.is_empty() && state.close_pending {
                 state.close_pending = false;
                 state.local_write_closed = true;
                 let flags = state.take_open_flag() | FLAG_FIN;
-                frames.push(Frame::data(stream, flags, Vec::new())?);
+                frames.push(Frame::encode_data(stream, flags, &[])?);
                 close_after_flush = true;
             }
             fully_closed = close_after_flush && state.remote_write_closed;
         }
         self.total_buffered_send -= drained;
-        self.queue_frames(frames);
+        self.queue_encoded(frames);
         if fully_closed {
             self.remove_stream(stream, true);
         }
@@ -664,10 +692,10 @@ impl YamuxSession {
             .push_back(YamuxOutput::Outbound(frame.encode()));
     }
 
-    fn queue_frames(&mut self, frames: Vec<Frame>) {
-        for frame in frames {
-            self.queue_frame(frame);
-        }
+    fn queue_encoded(&mut self, frames: Vec<Vec<u8>>) {
+        self.dirty |= !frames.is_empty();
+        self.pending
+            .extend(frames.into_iter().map(YamuxOutput::Outbound));
     }
 
     fn remove_stream(&mut self, stream: u32, emit: bool) {
@@ -885,6 +913,66 @@ mod tests {
         client.handle_data(&update).unwrap();
         assert_eq!(client.total_buffered_send(), 0);
         assert_eq!(decode(&outbound(&mut client)).payload(), &[7; 5]);
+    }
+
+    #[test]
+    fn partial_windows_frame_queued_bytes_in_order() {
+        let mut limits = config();
+        limits.max_frame_len = 4;
+        let mut client = YamuxSession::with_config(YamuxRole::Client, limits).unwrap();
+        let stream = client.open_stream().unwrap();
+        client.streams.get_mut(&stream).unwrap().send_window = 10;
+        client.send(stream, b"abcdefghijkl".to_vec()).unwrap();
+        client.send(stream, b"mnopqrstu".to_vec()).unwrap();
+        let payloads = |client: &mut YamuxSession| {
+            core::iter::from_fn(|| client.poll_output())
+                .map(|output| match output {
+                    YamuxOutput::Outbound(bytes) => decode(&bytes).payload().to_vec(),
+                    output => panic!("expected outbound bytes, got {output:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(payloads(&mut client), [&b"abcd"[..], b"efgh", b"ij"]);
+
+        for (credit, expected) in [
+            (1, &[&b"k"[..]][..]),
+            (3, &[b"l", b"mn"]),
+            (9, &[b"opqr", b"stu"]),
+        ] {
+            let update = Frame::window_update(stream, 0, credit).unwrap().encode();
+            client.handle_data(&update).unwrap();
+            assert_eq!(payloads(&mut client), expected);
+        }
+        assert_eq!(client.total_buffered_send(), 0);
+    }
+
+    #[test]
+    fn queued_chunks_retain_at_most_twice_their_unsent_bytes() {
+        let mut client = YamuxSession::with_config(YamuxRole::Client, config()).unwrap();
+        let stream = client.open_stream().unwrap();
+        let retained = |client: &YamuxSession| {
+            client.streams[&stream]
+                .send_buffer
+                .iter()
+                .map(|chunk| chunk.bytes.capacity())
+                .sum::<usize>()
+        };
+        client.streams.get_mut(&stream).unwrap().send_window = 99;
+        client.send(stream, alloc::vec![1; 100]).unwrap();
+        assert_eq!(client.total_buffered_send(), 1);
+        assert!(
+            retained(&client) <= 2,
+            "a mostly framed send keeps only its tail"
+        );
+
+        client.send(stream, alloc::vec![2; 100]).unwrap();
+        for credit in [30, 30, 25] {
+            let update = Frame::window_update(stream, 0, credit).unwrap().encode();
+            client.handle_data(&update).unwrap();
+            while client.poll_output().is_some() {}
+            assert!(retained(&client) <= 2 * client.total_buffered_send());
+        }
+        assert_eq!(client.total_buffered_send(), 16);
     }
 
     #[test]

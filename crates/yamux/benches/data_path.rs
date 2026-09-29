@@ -1,9 +1,13 @@
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use minip2p_yamux::{FLAG_SYN, Frame, HEADER_LEN, YamuxOutput, YamuxRole, YamuxSession};
+use minip2p_yamux::{
+    FLAG_SYN, Frame, FrameDecoder, FrameType, HEADER_LEN, YamuxOutput, YamuxRole, YamuxSession,
+};
 
 const PAYLOAD_LEN: usize = 64 * 1024;
+const QUEUED_LEN: usize = 256 * 1024;
+const WINDOW_STEP: u32 = 16 * 1024;
 
 fn assert_payload_frame(output: YamuxOutput, payload: &[u8]) {
     match output {
@@ -75,6 +79,68 @@ fn yamux_data_path(c: &mut Criterion) {
         );
     });
     group.finish();
+
+    // A stream whose window is exhausted queues a whole chunk, then drains it
+    // across many small window updates: the partial-send path.
+    let updates = (0..QUEUED_LEN / WINDOW_STEP as usize)
+        .flat_map(|_| {
+            Frame::window_update(1, 0, WINDOW_STEP)
+                .expect("valid frame")
+                .encode()
+        })
+        .collect::<Vec<u8>>();
+    let queued = vec![0x5a; QUEUED_LEN];
+    let (mut verified, stream) = window_exhausted_sender();
+    verified.send(stream, queued.clone()).expect("send");
+    verified.handle_data(&updates).expect("window updates");
+    assert!(
+        drained_data(&mut verified) == queued,
+        "window updates must frame the whole queued chunk"
+    );
+
+    let mut group = c.benchmark_group("yamux/256KiB");
+    group.bench_function("queued_send_16KiB_window_updates", |b| {
+        b.iter_batched(
+            || (window_exhausted_sender(), queued.clone()),
+            |((mut session, stream), data)| {
+                session.send(stream, data).expect("send");
+                session.handle_data(&updates).expect("window updates");
+                while let Some(output) = session.poll_output() {
+                    black_box(output);
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
+/// A client stream that has spent its whole initial send window.
+fn window_exhausted_sender() -> (YamuxSession, u32) {
+    let mut session = YamuxSession::new(YamuxRole::Client);
+    let stream = session.open_stream().expect("open stream");
+    session
+        .send(stream, vec![0; QUEUED_LEN])
+        .expect("fill window");
+    while session.poll_output().is_some() {}
+    (session, stream)
+}
+
+/// Drains `session` and concatenates the payloads of its outbound data frames.
+fn drained_data(session: &mut YamuxSession) -> Vec<u8> {
+    let mut decoder = FrameDecoder::new(u32::MAX);
+    while let Some(output) = session.poll_output() {
+        if let YamuxOutput::Outbound(bytes) = output {
+            decoder.push(&bytes);
+        }
+    }
+    let mut data = Vec::new();
+    while let Some(frame) = decoder.next_frame().expect("valid frame") {
+        if frame.frame_type() == FrameType::Data {
+            data.extend_from_slice(frame.payload());
+        }
+    }
+    data
 }
 
 criterion_group!(benches, yamux_data_path);

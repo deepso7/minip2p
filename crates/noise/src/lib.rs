@@ -36,7 +36,7 @@ pub use payload::NoiseHandshakePayload;
 pub const NOISE_PROTOCOL_ID: &str = "/noise";
 
 /// Largest plaintext carried by one encrypted transport frame.
-pub const MAX_TRANSPORT_PLAINTEXT: usize = MAX_FRAME_LEN - 16;
+pub const MAX_TRANSPORT_PLAINTEXT: usize = MAX_FRAME_LEN - cipher::TAG_LEN;
 
 /// Role of this side in the Noise XX handshake.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -221,19 +221,18 @@ impl NoiseSession {
         Ok(())
     }
 
-    fn receive(&mut self, bytes: &[u8]) -> Result<(), NoiseError> {
+    fn receive(&mut self, bytes: Vec<u8>) -> Result<(), NoiseError> {
         if !self.started {
             return Err(NoiseError::InvalidInput("session has not been started"));
         }
         self.decoder.push(bytes);
-        while let Some(message) = self.decoder.next_frame() {
+        while let Some(mut message) = self.decoder.next_frame() {
             if self.is_handshake_complete() {
-                let plaintext = self
-                    .receive_cipher
+                self.receive_cipher
                     .as_mut()
                     .ok_or(NoiseError::InvalidState("receive cipher is unavailable"))?
-                    .decrypt_with_ad(b"", &message)?;
-                self.pending.push_back(NoiseOutput::Decrypted(plaintext));
+                    .decrypt_with_ad(b"", &mut message)?;
+                self.pending.push_back(NoiseOutput::Decrypted(message));
                 continue;
             }
 
@@ -263,21 +262,27 @@ impl NoiseSession {
         });
     }
 
+    /// Frames and encrypts `plaintext` in `MAX_TRANSPORT_PLAINTEXT` segments.
+    /// Each segment is copied once into its outbound frame and encrypted there.
     fn encrypt(&mut self, plaintext: &[u8]) -> Result<(), NoiseError> {
         let cipher = self
             .send_cipher
             .as_mut()
             .ok_or(NoiseError::InvalidInput("handshake is not complete"))?;
-        if plaintext.is_empty() {
-            let ciphertext = cipher.encrypt_with_ad(b"", plaintext)?;
-            self.pending
-                .push_back(NoiseOutput::Outbound(encode_frame(&ciphertext)?));
-            return Ok(());
-        }
-        for segment in plaintext.chunks(MAX_TRANSPORT_PLAINTEXT) {
-            let ciphertext = cipher.encrypt_with_ad(b"", segment)?;
-            self.pending
-                .push_back(NoiseOutput::Outbound(encode_frame(&ciphertext)?));
+        // An empty write still emits one tag-only frame.
+        let empty = plaintext.is_empty().then_some(&[][..]);
+        for segment in plaintext.chunks(MAX_TRANSPORT_PLAINTEXT).chain(empty) {
+            let len = segment.len() + cipher::TAG_LEN;
+            #[expect(
+                clippy::map_err_ignore,
+                reason = "The conversion error has no detail beyond the length stored in NoiseError."
+            )]
+            let prefix = u16::try_from(len).map_err(|_| NoiseError::FrameTooLarge { len })?;
+            let mut frame = Vec::with_capacity(2 + len);
+            frame.extend_from_slice(&prefix.to_be_bytes());
+            frame.extend_from_slice(segment);
+            cipher.encrypt_with_ad(b"", &mut frame, 2)?;
+            self.pending.push_back(NoiseOutput::Outbound(frame));
         }
         Ok(())
     }
@@ -294,7 +299,7 @@ impl SansIoProtocol for NoiseSession {
         }
         let result = match input {
             NoiseInput::Start => self.start(),
-            NoiseInput::Data(bytes) => self.receive(&bytes),
+            NoiseInput::Data(bytes) => self.receive(bytes),
             NoiseInput::Encrypt(plaintext) => self.encrypt(&plaintext),
         };
         if result.as_ref().is_err_and(NoiseError::is_terminal) {
@@ -571,6 +576,25 @@ mod tests {
         assert_eq!(
             pair.responder.poll_output(),
             Some(NoiseOutput::Decrypted(plaintext))
+        );
+    }
+
+    #[test]
+    fn empty_write_emits_one_tag_only_frame() {
+        let mut pair = Pair::new();
+        pair.handshake();
+        pair.initiator
+            .handle_input(NoiseInput::Encrypt(Vec::new()))
+            .unwrap();
+        let frame = outbound(&mut pair.initiator);
+        assert_eq!(frame.len(), 2 + cipher::TAG_LEN);
+        assert!(pair.initiator.poll_output().is_none());
+        pair.responder
+            .handle_input(NoiseInput::Data(frame))
+            .unwrap();
+        assert_eq!(
+            pair.responder.poll_output(),
+            Some(NoiseOutput::Decrypted(Vec::new()))
         );
     }
 
