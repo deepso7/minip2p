@@ -241,6 +241,11 @@ impl From<FrameFault> for AutoNatError {
 /// same read.
 const MAX_TRAILING: usize = MAX_MESSAGE_SIZE;
 
+/// The longest status text a DIAL_RESPONSE carries; longer reasons are cut.
+///
+/// It is diagnostic only, and the cap keeps every response within one frame.
+pub const MAX_STATUS_TEXT: usize = 1024;
+
 /// Client-side AutoNAT probe.
 pub struct AutoNatClient {
     frames: FrameExchange,
@@ -274,25 +279,14 @@ enum ServerState {
 impl AutoNatClient {
     /// Creates a client probe and queues a DIAL request.
     ///
-    /// The request carries `addrs` in order, up to as many as fit in one
-    /// AutoNAT frame; the rest are left out. Offering a subset is legal — the
+    /// The request carries `addrs` in order, skipping any that would not fit
+    /// in one AutoNAT frame. Offering a subset is legal — the
     /// server just has fewer candidates to dial back — whereas an oversized
     /// request is one the server is required to refuse.
     pub fn new(peer_id: &PeerId, addrs: &[Multiaddr]) -> Self {
-        let mut peer = PeerInfo {
-            id: peer_id.to_bytes(),
-            addrs: Vec::new(),
-        };
-        let mut peer_len = field_len(peer.id.len());
-        for addr in addrs {
-            let addr = addr.to_bytes();
-            let grown = peer_len + field_len(addr.len());
-            if dial_message_len(grown) > MAX_MESSAGE_SIZE {
-                break;
-            }
-            peer_len = grown;
-            peer.addrs.push(addr);
-        }
+        let id = peer_id.to_bytes();
+        let addrs = fitting_addrs(addrs, field_len(id.len()), dial_message_len);
+        let peer = PeerInfo { id, addrs };
         let msg = Message {
             kind: MessageType::Dial,
             dial: Some(Dial { peer: Some(peer) }),
@@ -401,17 +395,13 @@ impl AutoNatServer {
     }
 
     /// Queues a successful DIAL_RESPONSE with dialable addresses.
-    fn respond_public(&mut self, addrs: &[Multiaddr]) -> Result<(), AutoNatError> {
-        self.respond(ResponseStatus::Ok, None, addrs)
+    fn respond_public(&mut self, addrs: &[Multiaddr]) {
+        self.respond(ResponseStatus::Ok, None, addrs);
     }
 
     /// Queues an unsuccessful DIAL_RESPONSE.
-    fn respond_error(
-        &mut self,
-        status: ResponseStatus,
-        reason: impl Into<String>,
-    ) -> Result<(), AutoNatError> {
-        self.respond(status, Some(reason.into()), &[])
+    fn respond_error(&mut self, status: ResponseStatus, reason: impl Into<String>) {
+        self.respond(status, Some(reason.into()), &[]);
     }
 
     /// Drains pending outbound bytes.
@@ -419,29 +409,33 @@ impl AutoNatServer {
         self.frames.take_outbound()
     }
 
-    /// Queues a DIAL_RESPONSE.
-    ///
-    /// Fails when the addresses we would report do not fit in one frame; the
-    /// caller can still answer with [`Self::respond_error`], whose payload is
-    /// bounded by its status text.
+    /// Queues a DIAL_RESPONSE, trimmed to fit one frame: the status text is
+    /// cut to [`MAX_STATUS_TEXT`] bytes and `addrs` that would not fit are
+    /// skipped.
     fn respond(
         &mut self,
         status: ResponseStatus,
-        status_text: Option<String>,
+        mut status_text: Option<String>,
         addrs: &[Multiaddr],
-    ) -> Result<(), AutoNatError> {
+    ) {
+        if let Some(text) = &mut status_text {
+            text.truncate(text.floor_char_boundary(MAX_STATUS_TEXT));
+        }
+        let mut response = DialResponse {
+            status,
+            status_text,
+            addrs: Vec::new(),
+        };
+        response.addrs = fitting_addrs(addrs, response.encode().len(), response_message_len);
         let msg = Message {
             kind: MessageType::DialResponse,
             dial: None,
-            dial_response: Some(DialResponse {
-                status,
-                status_text,
-                addrs: addrs.iter().map(Multiaddr::to_bytes).collect(),
-            }),
+            dial_response: Some(response),
         };
-        self.frames.queue(&msg.encode())?;
+        self.frames
+            .queue(&msg.encode())
+            .expect("the response was trimmed to fit one frame");
         self.state = ServerState::Done;
-        Ok(())
     }
 
     fn try_decode_request(&mut self) -> Result<(), AutoNatError> {
@@ -510,9 +504,9 @@ impl SansIoProtocol for AutoNatServer {
     fn handle_input(&mut self, input: Self::Input) -> Result<(), Self::Error> {
         match input {
             AutoNatServerInput::Data(data) => self.on_data(&data)?,
-            AutoNatServerInput::RespondPublic { addrs } => self.respond_public(&addrs)?,
+            AutoNatServerInput::RespondPublic { addrs } => self.respond_public(&addrs),
             AutoNatServerInput::RespondError { status, reason } => {
-                self.respond_error(status, reason)?;
+                self.respond_error(status, reason);
             }
             AutoNatServerInput::Flush => {}
         }
@@ -692,9 +686,38 @@ fn field_len(len: usize) -> usize {
 
 /// Encoded size of a DIAL [`Message`] whose `PeerInfo` body is `peer_len`
 /// bytes: the type field, then `dial { peer { .. } }`. Mirrors the encoders
-/// above, so [`AutoNatClient::new`] can size a request without re-encoding it.
+/// above, so a request is sized without re-encoding it per address.
 fn dial_message_len(peer_len: usize) -> usize {
     2 + field_len(field_len(peer_len))
+}
+
+/// Encoded size of a DIAL_RESPONSE [`Message`] whose `DialResponse` body is
+/// `body_len` bytes: the type field, then `dialResponse { .. }`.
+fn response_message_len(body_len: usize) -> usize {
+    2 + field_len(body_len)
+}
+
+/// Encodes `addrs` in order, skipping any that would push the message over
+/// [`MAX_MESSAGE_SIZE`].
+///
+/// `body_len` is the encoded size of the message holding the addresses
+/// before any is added; `message_len` maps that body size to the size of the
+/// whole message.
+fn fitting_addrs(
+    addrs: &[Multiaddr],
+    mut body_len: usize,
+    message_len: impl Fn(usize) -> usize,
+) -> Vec<Vec<u8>> {
+    let mut fitting = Vec::new();
+    for addr in addrs {
+        let addr = addr.to_bytes();
+        let grown = body_len + field_len(addr.len());
+        if message_len(grown) <= MAX_MESSAGE_SIZE {
+            body_len = grown;
+            fitting.push(addr);
+        }
+    }
+    fitting
 }
 
 fn decode_addrs(raw: &[Vec<u8>]) -> Vec<Multiaddr> {
@@ -864,16 +887,53 @@ mod tests {
         assert!(one_more.encode().len() > MAX_MESSAGE_SIZE);
     }
 
+    /// An address that no longer fits is skipped, not the end of the list:
+    /// a shorter one behind it is still offered.
     #[test]
-    fn a_response_that_cannot_be_framed_is_refused_locally() {
-        let addr = Multiaddr::from_str("/ip4/203.0.113.7/udp/4001/quic-v1").unwrap();
-        let mut server = AutoNatServer::new();
+    fn an_address_that_does_not_fit_does_not_hide_later_ones() {
+        let long = Multiaddr::from_str(&alloc::format!("/dns4/{}.example/tcp/1", "a".repeat(200)))
+            .unwrap();
+        let short = Multiaddr::from_str("/ip4/203.0.113.7/tcp/1").unwrap();
+        // Room for exactly the short address.
+        let body_len = MAX_MESSAGE_SIZE - field_len(short.to_bytes().len());
 
-        assert!(matches!(
-            server.respond_public(&vec![addr; 2048]),
-            Err(AutoNatError::FrameTooLarge { .. })
-        ));
-        assert!(!server.frames.has_outbound(), "nothing is queued");
+        let fitting = fitting_addrs(&[long, short.clone()], body_len, |len| len);
+        assert_eq!(fitting, vec![short.to_bytes()]);
+    }
+
+    /// A response is trimmed rather than refused: addresses to what fits, and
+    /// the status text to [`MAX_STATUS_TEXT`].
+    #[test]
+    fn a_response_is_trimmed_to_fit() {
+        let peer_id = PeerId::from_str(PEER_ID).unwrap();
+        let addrs: Vec<Multiaddr> = (0..2048)
+            .map(|port| {
+                Multiaddr::from_str(&alloc::format!("/ip4/203.0.113.7/udp/{port}/quic-v1")).unwrap()
+            })
+            .collect();
+
+        let mut server = AutoNatServer::new();
+        server.respond_public(&addrs);
+        let mut client = AutoNatClient::new(&peer_id, &[]);
+        client
+            .on_data(&server.take_outbound())
+            .expect("the response fits");
+        let Some(Reachability::Public { addrs: kept, .. }) = client.outcome() else {
+            panic!("expected a public outcome, got {:?}", client.outcome());
+        };
+        assert!(!kept.is_empty() && kept.len() < addrs.len());
+        assert_eq!(kept[..], addrs[..kept.len()], "a prefix, in order");
+
+        let mut server = AutoNatServer::new();
+        server.respond_error(ResponseStatus::DialError, "é".repeat(MAX_MESSAGE_SIZE));
+        let mut client = AutoNatClient::new(&peer_id, &[]);
+        client
+            .on_data(&server.take_outbound())
+            .expect("the response fits");
+        let Some(Reachability::Private { reason, .. }) = client.outcome() else {
+            panic!("expected a private outcome, got {:?}", client.outcome());
+        };
+        assert_eq!(reason.len(), MAX_STATUS_TEXT, "cut on a char boundary");
     }
 
     #[test]
@@ -888,9 +948,7 @@ mod tests {
         assert_eq!(request.peer_id, peer_id);
         assert_eq!(request.addrs, vec![addr.clone()]);
 
-        server
-            .respond_public(&request.addrs.clone())
-            .expect("response fits");
+        server.respond_public(&request.addrs.clone());
         client.on_data(&server.take_outbound()).unwrap();
 
         assert!(
@@ -905,9 +963,7 @@ mod tests {
         let mut server = AutoNatServer::new();
 
         server.on_data(&client.take_outbound()).unwrap();
-        server
-            .respond_error(ResponseStatus::DialError, "all dialbacks failed")
-            .expect("response fits");
+        server.respond_error(ResponseStatus::DialError, "all dialbacks failed");
         client.on_data(&server.take_outbound()).unwrap();
 
         assert!(
@@ -928,9 +984,7 @@ mod tests {
         ));
 
         let mut server = AutoNatServer::new();
-        server
-            .respond_error(ResponseStatus::DialError, "after bad frame")
-            .expect("response fits");
+        server.respond_error(ResponseStatus::DialError, "after bad frame");
         client.on_data(&server.take_outbound()).unwrap();
 
         assert!(
