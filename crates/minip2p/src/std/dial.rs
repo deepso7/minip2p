@@ -148,6 +148,9 @@ fn invalid(reason: impl Into<String>) -> String {
 /// What a lookup produced: the host's IP addresses, or the resolver's error.
 pub(crate) type Answer = Result<Vec<IpAddr>, String>;
 
+/// Distinct names that may be looking up at once; one thread each.
+const MAX_IN_FLIGHT_LOOKUPS: usize = 32;
+
 /// A blocking name lookup. Swappable only inside the crate, so tests can
 /// inject one that stalls or fails; there is no public resolver API.
 pub(crate) type Lookup = Arc<dyn Fn(&str) -> Answer + Send + Sync>;
@@ -212,6 +215,14 @@ impl Resolver {
     fn start(&mut self, host: &str) -> Result<(), String> {
         if self.in_flight.contains(host) {
             return Ok(());
+        }
+        // A stalled resolver holds its thread until the OS gives up, so the
+        // number of distinct names in flight is capped rather than trusted
+        // to whatever candidates discovery or the application supplies.
+        if self.in_flight.len() >= MAX_IN_FLIGHT_LOOKUPS {
+            return Err(format!(
+                "not looking up {host}: {MAX_IN_FLIGHT_LOOKUPS} dns lookups are already in flight"
+            ));
         }
         let lookup = Arc::clone(&self.lookup);
         let answers = self.answers_tx.clone();
@@ -382,5 +393,38 @@ mod tests {
             matches!(&refused, Expansion::Refused(reason) if reason.contains("port")),
             "a portless name is refused"
         );
+    }
+
+    #[test]
+    fn lookups_in_flight_are_capped() {
+        let (release_tx, release_rx) = channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let mut resolver = Resolver::with_lookup(
+            WaitHandle::noop(),
+            Arc::new(move |_: &str| {
+                // Held until the test ends, like a dead resolver.
+                match release_rx.lock().expect("lock").recv() {
+                    Ok(()) | Err(_) => {}
+                }
+                Err("released".into())
+            }),
+        );
+        for index in 0..MAX_IN_FLIGHT_LOOKUPS {
+            let addr = peer_addr(&format!("/dns/host{index}.invalid/tcp/4001"));
+            assert!(matches!(resolver.expand(&addr), Expansion::Resolving));
+        }
+        let refused = resolver.expand(&peer_addr("/dns/one-more.invalid/tcp/4001"));
+        assert!(
+            matches!(&refused, Expansion::Refused(reason) if reason.contains("one-more.invalid")),
+            "a name past the cap is refused with an actionable reason"
+        );
+        assert!(
+            matches!(
+                resolver.expand(&peer_addr("/dns4/host0.invalid/tcp/4002")),
+                Expansion::Resolving
+            ),
+            "a name already in flight still joins its lookup"
+        );
+        drop(release_tx);
     }
 }
