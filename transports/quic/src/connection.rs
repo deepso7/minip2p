@@ -400,7 +400,12 @@ impl QuicConnection {
             self.flush(socket, pending_datagrams, max_pending_datagrams)?;
 
             // Auto-verify the remote peer's identity from their TLS certificate.
-            match self.verify_peer_identity(crate::unix_time()) {
+            // Prefer the caller's wall-clock sample; fall back to the system
+            // clock when the caller's platform supplied none.
+            let unix_now = now
+                .unix_seconds
+                .map_or_else(crate::unix_time, Duration::from_secs);
+            match self.verify_peer_identity(unix_now) {
                 Ok(verified_peer_id) => self.endpoint.set_peer_id(verified_peer_id),
                 Err(rejection) => {
                     events.push(TransportEvent::Error {

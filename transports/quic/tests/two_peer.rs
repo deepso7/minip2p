@@ -501,6 +501,93 @@ fn listener_rejects_dialer_presenting_certificate_chain() {
 }
 
 #[test]
+fn dialer_rejects_listener_presenting_certificate_chain() {
+    use boring::pkey::PKey;
+    use boring::x509::X509;
+    use minip2p_identity::Ed25519Keypair;
+
+    let server_socket = UdpSocket::bind("127.0.0.1:0").expect("server socket");
+    server_socket
+        .set_nonblocking(true)
+        .expect("server socket nonblocking");
+    let server_addr = server_socket.local_addr().expect("server local addr");
+
+    // A valid libp2p leaf certificate, followed by a second certificate.
+    let keypair = Ed25519Keypair::generate();
+    let (leaf_der, key_der) = minip2p_tls::generate_certificate(&keypair).expect("leaf cert");
+    let (extra_der, _) =
+        minip2p_tls::generate_certificate(&Ed25519Keypair::generate()).expect("extra cert");
+    let leaf = X509::from_der(&leaf_der).expect("leaf");
+    let key = PKey::private_key_from_der(&key_der).expect("key");
+    let extra = X509::from_der(&extra_der).expect("extra");
+    let mut config = raw_quiche_config(Some((&leaf, &key)), &[extra]);
+
+    let mut dialer = QuicTransport::new(QuicNodeConfig::generate(), "127.0.0.1:0").expect("dialer");
+    let peer_addr: PeerAddr = format!(
+        "/ip4/127.0.0.1/udp/{}/quic-v1/p2p/{}",
+        server_addr.port(),
+        keypair.peer_id()
+    )
+    .parse()
+    .expect("peer addr");
+    dialer.dial(&peer_addr).expect("dial starts");
+
+    let mut server_conn: Option<quiche::Connection> = None;
+    let mut saw_chain_error = false;
+    let mut saw_connected = false;
+
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        for event in dialer.poll(common::now()).expect("dialer poll") {
+            saw_chain_error |= matches!(
+                event,
+                TransportEvent::Error { ref message, .. }
+                    if message.contains("presented 2 certificates")
+            );
+            saw_connected |= matches!(event, TransportEvent::Connected { .. });
+        }
+
+        // Accept the dialer's first Initial, then drive the raw server.
+        if server_conn.is_none() {
+            let mut buf = [0u8; 65535];
+            if let Ok((len, from)) = server_socket.recv_from(&mut buf) {
+                let packet = buf.get_mut(..len).expect("received packet");
+                let scid = QuicConnectionId::from_vec(vec![0x44; quiche::MAX_CONN_ID_LEN]);
+                let mut conn = quiche::accept(&scid, None, server_addr, from, &mut config)
+                    .expect("raw quiche accept");
+                conn.recv(
+                    packet,
+                    quiche::RecvInfo {
+                        from,
+                        to: server_addr,
+                    },
+                )
+                .expect("raw server recv initial");
+                server_conn = Some(conn);
+            }
+        }
+        if let Some(conn) = server_conn.as_mut() {
+            drain_raw_quiche_client(conn, &server_socket, server_addr);
+            flush_raw_quiche_client(conn, &server_socket);
+            if conn.peer_error().is_some() {
+                break;
+            }
+        }
+    }
+
+    assert!(saw_chain_error, "dialer must reject a certificate chain");
+    assert!(
+        !saw_connected,
+        "dialer must not connect a certificate chain"
+    );
+    assert!(
+        server_conn.is_some_and(|conn| conn.peer_error().is_some()),
+        "dialer must close the connection"
+    );
+}
+
+#[test]
 fn mtls_verifies_listener_side_client_identity_and_updates_peer_index() {
     let (mut server, mut client, peer_addr) = setup_pair();
     let client_peer_id = client.local_peer_id();
