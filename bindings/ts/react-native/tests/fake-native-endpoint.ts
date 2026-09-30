@@ -47,6 +47,8 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
   readonly cancelledConnects: bigint[] = [];
   /** Connect ID returned by the next `connect` call. */
   nextConnectId = 30n;
+  /** Error thrown by every `publish` call, when set. */
+  publishError: Error | undefined = undefined;
   /** Value returned by `connectionInfo` for every peer. */
   connection: ConnectionInfo | undefined = undefined;
   readonly #batches: FakeEvent[][] = [];
@@ -169,8 +171,8 @@ export class FakeNativeEndpoint implements P2pEndpointLike {
     return notFaked("ping");
   }
 
-  publish(): never {
-    return notFaked("publish");
+  publish(): void {
+    throw this.publishError ?? notFaked("publish");
   }
 
   reachability(): never {
