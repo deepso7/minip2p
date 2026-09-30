@@ -51,8 +51,8 @@ fn recv_raw(peer: &RawPeer) -> Option<Vec<u8>> {
 fn a_held_packet_waits_for_its_send_time_and_sets_the_deadline() {
     let (mut server, peer, id, _) = paced_burst();
     // quiche's real pacing gaps are microseconds on loopback; push this one
-    // out far enough to observe without racing the clock.
-    let at = Instant::now() + Duration::from_millis(20);
+    // out far enough that a stalled test thread cannot reach it.
+    let at = Instant::now() + Duration::from_secs(1);
     server
         .connections
         .get_mut(&id)
@@ -74,7 +74,7 @@ fn a_held_packet_waits_for_its_send_time_and_sets_the_deadline() {
         "a packet not yet due must not demand an immediate poll"
     );
     assert!(
-        deadline <= polled_at.deadline_after(20),
+        deadline <= polled_at.deadline_after(1_000),
         "the held packet's send time must bound the deadline"
     );
 }
@@ -82,10 +82,11 @@ fn a_held_packet_waits_for_its_send_time_and_sets_the_deadline() {
 #[test]
 fn held_packets_leave_in_order_and_never_early() {
     let (mut server, peer, id, stream) = paced_burst();
-    let (held, at) = server.connections[&id]
-        .paced_packet()
-        .map(|(bytes, at)| (bytes.to_vec(), at))
-        .expect("held packet");
+    // A send time far enough out that many polls finish before it.
+    let at = Instant::now() + Duration::from_millis(50);
+    let conn = server.connections.get_mut(&id).expect("connection");
+    conn.repace_held_packet(at);
+    let held = conn.paced_packet().expect("held packet").0.to_vec();
     // Discard the unpaced burst so the next datagram is whatever leaves next.
     while recv_raw(&peer).is_some() {}
 
@@ -100,11 +101,14 @@ fn held_packets_leave_in_order_and_never_early() {
             "held packet never sent"
         );
         server.poll(now()).expect("poll");
+        // Loopback delivers at once, so a datagram seen after a poll that
+        // finished before `at` was sent early.
+        let polled_before_due = Instant::now() < at;
         if let Some(datagram) = recv_raw(&peer) {
+            assert!(!polled_before_due, "a paced packet left early");
             break datagram;
         }
     };
-    assert!(Instant::now() >= at, "a paced packet left early");
     assert_eq!(first, held, "the held packet must be the first to leave");
 }
 

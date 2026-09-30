@@ -1750,7 +1750,11 @@ impl Drop for QuicTransport {
             }
         }
         // Nothing polls after this, so packets still held for pacing -- and
-        // any CONNECTION_CLOSE queued behind them -- leave now.
+        // any CONNECTION_CLOSE queued behind them -- leave now. Drain the
+        // retry queue first so a full one has room to retain them.
+        match self.flush_pending_datagrams() {
+            Ok(()) | Err(_) => {}
+        }
         let max_pending_datagrams = self.node_config.limits().max_pending_datagrams;
         for conn in self.connections.values_mut() {
             match conn.flush_ignoring_pacing(
