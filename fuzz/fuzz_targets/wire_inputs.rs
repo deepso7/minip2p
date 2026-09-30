@@ -49,6 +49,12 @@ fuzz_target!(|data: &[u8]| {
     fuzz_circuit(data);
     fuzz_relay_server_machines(data);
 
+    // Peer TLS certificates are attacker-controlled X.509 DER.
+    let _ = minip2p_tls::verify_libp2p_certificate(
+        data,
+        core::time::Duration::from_secs(1_700_000_000),
+    );
+
     if let RelayFrame::Complete { payload, .. } = minip2p_relay::decode_frame(data) {
         let _ = HopMessage::decode(payload);
         let _ = StopMessage::decode(payload);

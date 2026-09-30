@@ -69,6 +69,7 @@ minip2p-pubsub = { path = "../crates/pubsub", default-features = false }
 minip2p-relay = { path = "../crates/relay" }
 minip2p-secure-mux = { path = "../crates/secure-mux" }
 minip2p-swarm = { path = "../crates/swarm", default-features = false }
+minip2p-tls = { path = "../crates/tls", default-features = false }
 minip2p-transport = { path = "../crates/transport" }
 minip2p-yamux = { path = "../crates/yamux" }
 
