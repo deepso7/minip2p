@@ -256,6 +256,32 @@ fn candidate_summary(candidates: &[CandidateFailure]) -> String {
         .join("; ")
 }
 
+/// One attempt's candidates, sorted by admission.
+#[derive(Default)]
+pub(crate) struct Candidates {
+    /// Concrete addresses to dial now.
+    pub(crate) ready: Vec<PeerAddr>,
+    /// `/dns*` candidates whose Name resolution is under way.
+    pub(crate) resolving: Vec<PeerAddr>,
+    /// Candidates already refused, with why.
+    pub(crate) refused: Vec<CandidateFailure>,
+}
+
+impl Candidates {
+    /// Concrete addresses only.
+    pub(crate) fn ready(ready: Vec<PeerAddr>) -> Self {
+        Self {
+            ready,
+            ..Self::default()
+        }
+    }
+}
+
+/// What Name resolution made of one `/dns*` candidate: the concrete
+/// addresses to dial, or why there are none.
+#[cfg(feature = "std")]
+pub(crate) type NameAnswer = Result<Vec<PeerAddr>, String>;
+
 /// Sans-I/O engine that owns Connection attempts for both Endpoint compositions.
 pub(crate) struct ConnectEngine {
     next_id: u64,
@@ -274,10 +300,21 @@ struct Attempt {
     /// Absolute mono-ms when this attempt expires (`started_ms +` engine budget).
     expires_ms: u64,
     direct: BTreeMap<ConnectionId, PeerAddr>,
+    /// `/dns*` candidates whose Name resolution has not answered yet. Each
+    /// joins `direct` or `failed` when [`ConnectEngine::resolved`] sees it.
+    resolving: Vec<PeerAddr>,
     /// True once at least one Transport dial started.
     dialed_any: bool,
     failed: Vec<CandidateFailure>,
     relay: RelayLeg,
+}
+
+impl Attempt {
+    /// Whether a direct candidate is still in the race: dialing, or waiting on
+    /// Name resolution to become a dial.
+    fn racing_direct(&self) -> bool {
+        !self.direct.is_empty() || !self.resolving.is_empty()
+    }
 }
 
 enum RelayLeg {
@@ -373,25 +410,28 @@ impl ConnectEngine {
     ) -> ConnectId {
         self.connect_candidates(
             target.peer_id().clone(),
-            target.candidates().to_vec(),
-            Vec::new(),
+            Candidates::ready(target.candidates().to_vec()),
             RelayPolicy::None,
             runtime,
             now_ms,
         )
     }
 
-    /// Like [`Self::connect`], with extra per-candidate failures (DNS, …)
-    /// already observed by the std adapter and a relay-leg policy.
+    /// Like [`Self::connect`], with candidates as admission sorted them and
+    /// a relay-leg policy.
     pub(crate) fn connect_candidates<T: Transport, E: EntropySource>(
         &mut self,
         peer: PeerId,
-        candidates: Vec<PeerAddr>,
-        extra_failed: Vec<CandidateFailure>,
+        candidates: Candidates,
         relay: RelayPolicy,
         runtime: &mut SwarmRuntime<T, E>,
         now_ms: u64,
     ) -> ConnectId {
+        let Candidates {
+            ready: candidates,
+            resolving,
+            refused: extra_failed,
+        } = candidates;
         let id = self.alloc();
         if let Some(conn_id) = runtime.connection_id(&peer) {
             self.push_settled(id, peer, ConnectOutcome::Connected { conn_id });
@@ -414,7 +454,7 @@ impl ConnectEngine {
         let dialed_any = !direct.is_empty();
         let relay = RelayLeg::from_policy(relay);
 
-        if direct.is_empty() && matches!(relay, RelayLeg::None) {
+        if direct.is_empty() && resolving.is_empty() && matches!(relay, RelayLeg::None) {
             self.push_settled(
                 id,
                 peer,
@@ -433,12 +473,69 @@ impl ConnectEngine {
                 started_ms: now_ms,
                 expires_ms: now_ms.saturating_add(self.deadline_ms),
                 direct,
+                resolving,
                 dialed_any,
                 failed,
                 relay,
             },
         );
         id
+    }
+
+    /// Feeds Name resolution answers to every attempt waiting on one.
+    ///
+    /// `answer` is asked about each still-resolving candidate: `None` keeps
+    /// it waiting, `Some(Ok(addrs))` dials the concrete addresses, and
+    /// `Some(Err(reason))` records a failed candidate. An attempt left with no
+    /// direct candidate and no relay leg settles as failed. Answers for
+    /// attempts that already settled have nowhere to go and are dropped.
+    #[cfg(feature = "std")]
+    pub(crate) fn resolved<T: Transport, E: EntropySource>(
+        &mut self,
+        answer: &mut dyn FnMut(&PeerAddr) -> Option<NameAnswer>,
+        runtime: &mut SwarmRuntime<T, E>,
+    ) {
+        let ids: Vec<ConnectId> = self
+            .attempts
+            .iter()
+            .filter(|(_, attempt)| !attempt.resolving.is_empty())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            let Some(mut attempt) = self.attempts.remove(&id) else {
+                continue;
+            };
+            let mut answered = false;
+            for addr in core::mem::take(&mut attempt.resolving) {
+                match answer(&addr) {
+                    None => attempt.resolving.push(addr),
+                    Some(Ok(addrs)) => {
+                        answered = true;
+                        for addr in addrs {
+                            match runtime.dial(&addr) {
+                                Ok(conn_id) => {
+                                    attempt.dialed_any = true;
+                                    attempt.direct.insert(conn_id, addr);
+                                }
+                                Err(error) => attempt.failed.push(CandidateFailure {
+                                    addr,
+                                    reason: error.to_string(),
+                                }),
+                            }
+                        }
+                    }
+                    Some(Err(reason)) => {
+                        answered = true;
+                        attempt.failed.push(CandidateFailure { addr, reason });
+                    }
+                }
+            }
+            if answered && !attempt.racing_direct() {
+                self.settle_if_exhausted(id, attempt);
+            } else {
+                self.attempts.insert(id, attempt);
+            }
+        }
     }
 
     #[cfg_attr(
@@ -452,14 +549,13 @@ impl ConnectEngine {
         self.attempts.contains_key(&id)
     }
 
-    /// Whether admission started any direct dial for the attempt. The NAT
-    /// driver reads this snapshot at leg-attach time to stagger the relay
-    /// leg; it does not track later direct-dial failures.
+    /// Whether admission left the attempt racing a direct candidate: a dial,
+    /// or a name still resolving into one. The NAT driver reads this snapshot
+    /// at leg-attach time to stagger the relay leg; it does not track later
+    /// direct-dial failures.
     #[cfg(feature = "_nat-driver")]
     pub(crate) fn dialed_direct(&self, id: ConnectId) -> bool {
-        self.attempts
-            .get(&id)
-            .is_some_and(|attempt| attempt.dialed_any)
+        self.attempts.get(&id).is_some_and(Attempt::racing_direct)
     }
 
     /// When the pending attempt expires, in monotonic ms. The NAT driver
@@ -515,7 +611,7 @@ impl ConnectEngine {
                     addr: addr.clone(),
                     reason: reason.clone(),
                 });
-                if attempt.direct.is_empty() {
+                if !attempt.racing_direct() {
                     self.settle_if_exhausted(id, attempt);
                 } else {
                     self.attempts.insert(id, attempt);
@@ -643,6 +739,12 @@ impl ConnectEngine {
                 });
                 self.abort_one(runtime, *conn_id);
             }
+            for addr in attempt.resolving.drain(..) {
+                attempt.failed.push(CandidateFailure {
+                    addr,
+                    reason: String::from("connect deadline elapsed while resolving the name"),
+                });
+            }
             self.push_settled(
                 id,
                 attempt.peer,
@@ -687,7 +789,7 @@ impl ConnectEngine {
             RelayLeg::Pending { .. } | RelayLeg::Provisional { .. } => {
                 self.attempts.insert(id, attempt);
             }
-            RelayLeg::Failed(_) if !attempt.direct.is_empty() => {
+            RelayLeg::Failed(_) if attempt.racing_direct() => {
                 self.attempts.insert(id, attempt);
             }
             RelayLeg::None | RelayLeg::Failed(_) => {
@@ -811,10 +913,33 @@ pub(crate) struct ConnectAdmission {
     pub(crate) allow_relay: bool,
 }
 
-/// Admits one Connection attempt for `peer`: expands each candidate through
-/// `expand` (DNS-shaped resolution on std, identity on portable), selects
-/// the relay policy from the NAT driver, and starts direct dials. Both
-/// Endpoint compositions run this; only the injected `expand` differs.
+/// What admission's `expand` step made of one candidate address.
+#[cfg(any(feature = "std", feature = "portable-mdns"))]
+pub(crate) enum Expansion {
+    /// Concrete addresses to dial now.
+    Ready(Vec<PeerAddr>),
+    /// Name resolution started; the answer arrives later through
+    /// [`ConnectEngine::resolved`].
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "only the std Endpoint resolves names")
+    )]
+    Resolving,
+    /// The candidate cannot be used; the reason becomes its
+    /// [`CandidateFailure`].
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(dead_code, reason = "portable expansion never refuses")
+    )]
+    Refused(String),
+}
+
+/// Admits one Connection attempt for `peer`: selects the relay policy from
+/// the NAT driver, expands each candidate through `expand` (Name resolution
+/// on std, identity on portable), and starts direct dials. Both Endpoint
+/// compositions run this; only the injected `expand` differs. Under
+/// `force_relay` direct candidates are discarded unexpanded, so no name is
+/// looked up for them.
 ///
 /// When the attempt stays pending, the caller attaches its NAT leg with
 /// [`NatDriver::attach_leg`]: the leg needs the composition's concrete
@@ -825,7 +950,7 @@ pub(crate) fn admit_connect<T: Transport, E: EntropySource>(
     runtime: &mut SwarmRuntime<T, E>,
     #[cfg(feature = "_nat-driver")] nat: Option<&NatDriver<E>>,
     admission: ConnectAdmission,
-    expand: &mut dyn FnMut(&PeerAddr) -> Result<Vec<PeerAddr>, String>,
+    expand: &mut dyn FnMut(&PeerAddr) -> Expansion,
     now_ms: u64,
 ) -> ConnectId {
     let ConnectAdmission {
@@ -833,17 +958,6 @@ pub(crate) fn admit_connect<T: Transport, E: EntropySource>(
         candidates,
         allow_relay,
     } = admission;
-    let mut expanded = Vec::new();
-    let mut failed = Vec::new();
-    for addr in &candidates {
-        match expand(addr) {
-            Ok(addrs) => expanded.extend(addrs),
-            Err(reason) => failed.push(CandidateFailure {
-                addr: addr.clone(),
-                reason,
-            }),
-        }
-    }
 
     #[cfg(feature = "_nat-driver")]
     let relay = match &nat {
@@ -861,14 +975,21 @@ pub(crate) fn admit_connect<T: Transport, E: EntropySource>(
     #[cfg(not(feature = "_nat-driver"))]
     let _ = allow_relay;
 
-    #[cfg(feature = "_nat-driver")]
-    let expanded = if matches!(relay, RelayPolicy::Forced) {
+    let candidates = if matches!(relay, RelayPolicy::Forced) {
         Vec::new()
     } else {
-        expanded
+        candidates
     };
+    let mut sorted = Candidates::default();
+    for addr in candidates {
+        match expand(&addr) {
+            Expansion::Ready(addrs) => sorted.ready.extend(addrs),
+            Expansion::Resolving => sorted.resolving.push(addr),
+            Expansion::Refused(reason) => sorted.refused.push(CandidateFailure { addr, reason }),
+        }
+    }
 
-    connect.connect_candidates(peer, expanded, failed, relay, runtime, now_ms)
+    connect.connect_candidates(peer, sorted, relay, runtime, now_ms)
 }
 
 /// Cancels `id`, routing through the NAT driver (engine cancel plus relay
@@ -1593,7 +1714,7 @@ mod tests {
         runtime: &mut SwarmRuntime<FakeTransport, SeqEntropy>,
         now_ms: u64,
     ) -> ConnectId {
-        engine.connect_candidates(peer, candidates, Vec::new(), relay, runtime, now_ms)
+        engine.connect_candidates(peer, Candidates::ready(candidates), relay, runtime, now_ms)
     }
 
     #[test]
@@ -1672,6 +1793,37 @@ mod tests {
         engine.cancel(id, &mut runtime);
         assert!(engine.pop_event().is_none());
         assert!(settled_for(&drain(&mut engine, &mut runtime, 1_001), id).is_none());
+    }
+
+    #[test]
+    fn a_resolving_candidate_keeps_the_attempt_open_until_the_deadline() {
+        // A name still resolving is a candidate in the race: the attempt must
+        // not fail at admission for lack of a dial, and the attempt deadline
+        // is the only bound on the lookup.
+        let peer = peer(b"resolving");
+        let named = addr(&peer, 4001);
+        let mut runtime = runtime(FakeTransport::default());
+        let mut engine = ConnectEngine::new(1_000);
+        let id = engine.connect_candidates(
+            peer,
+            Candidates {
+                resolving: vec![named.clone()],
+                ..Candidates::default()
+            },
+            RelayPolicy::None,
+            &mut runtime,
+            0,
+        );
+        assert!(settled_for(&drain(&mut engine, &mut runtime, 999), id).is_none());
+
+        match settled_for(&drain(&mut engine, &mut runtime, 1_000), id) {
+            Some(ConnectOutcome::Failed(ConnectFailure::Timeout { candidates, .. })) => {
+                assert_eq!(candidates.len(), 1);
+                assert_eq!(candidates[0].addr, named);
+                assert!(candidates[0].reason.contains("resolving"), "{candidates:?}");
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
     }
 
     #[test]

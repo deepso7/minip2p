@@ -30,7 +30,7 @@ pub use connect::{
     RelayFailure,
 };
 #[cfg(feature = "portable-mdns")]
-use connect::{ConnectAdmission, admit_connect};
+use connect::{ConnectAdmission, Expansion, admit_connect};
 #[cfg(feature = "std")]
 pub(crate) use connect::{ConnectEngine, DEFAULT_CONNECT_DEADLINE_MS};
 mod event_stream;
@@ -643,8 +643,8 @@ impl<T: Transport, E: EntropySource, I: MdnsIo> PortableMdnsEndpoint<T, E, I> {
 /// Candidate expansion for portable compositions: addresses are already
 /// concrete, so expansion is the identity.
 #[cfg(feature = "portable-mdns")]
-fn expand_concrete(addr: &PeerAddr) -> Result<Vec<PeerAddr>, String> {
-    Ok(alloc::vec![addr.clone()])
+fn expand_concrete(addr: &PeerAddr) -> Expansion {
+    Expansion::Ready(alloc::vec![addr.clone()])
 }
 
 /// Failure while driving a composed portable endpoint (mDNS or smoltcp).

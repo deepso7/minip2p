@@ -257,6 +257,41 @@ fn idle_quic_relay_reservation_stays_live_past_transport_timeout() {
     assert!(lost, "genuine relay loss must remain observable");
 }
 
+#[cfg(feature = "relay-server")]
+#[test]
+fn a_relay_configured_by_name_is_resolved_off_the_driver_and_reserved() {
+    // The transports refuse `/dns*`, so a relay dial reaches one only
+    // because the endpoint resolved the name first.
+    let mut relay = Endpoint::builder()
+        .identity(Ed25519Keypair::from_secret_key_bytes([86; 32]))
+        .relay_server()
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind relay");
+    let relay_addr = relay.listen().expect("relay listens");
+    let mut protocols = relay_addr.transport().protocols().to_vec();
+    *protocols.first_mut().expect("a host") = minip2p_core::Protocol::Dns4("localhost".to_string());
+    let named = minip2p_core::PeerAddr::new(
+        Multiaddr::from_protocols(protocols),
+        relay_addr.peer_id().clone(),
+    )
+    .expect("named relay addr");
+    let mut client = Endpoint::builder()
+        .identity(Ed25519Keypair::from_secret_key_bytes([85; 32]))
+        .nat_config(NatConfig {
+            relays: vec![named],
+            reservation_policy: ReservationPolicy::Always,
+            ..NatConfig::default()
+        })
+        .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+        .expect("quic listen address")
+        .bind()
+        .expect("bind client");
+
+    drive_until_reserved(&mut client, &mut relay, "QUIC");
+}
+
 #[cfg(all(feature = "relay-server", feature = "tcp"))]
 #[test]
 fn tcp_relay_reservation_does_not_schedule_liveness_pings() {

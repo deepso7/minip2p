@@ -4,7 +4,6 @@
 //! engine. Time is supplied by the host; I/O runs through `SwarmRuntime`.
 
 use alloc::collections::BTreeMap;
-use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
@@ -25,7 +24,7 @@ use minip2p_swarm::{SwarmCore, SwarmEvent, SwarmRuntime};
 use crate::nat::NatDriver;
 #[cfg(feature = "_nat-driver")]
 use crate::portable::connect::cancel_attempt;
-use crate::portable::connect::{ConnectAdmission, ConnectEngine, admit_connect};
+use crate::portable::connect::{ConnectAdmission, ConnectEngine, Expansion, admit_connect};
 #[cfg(feature = "pubsub")]
 use crate::pubsub::GossipsubDriver;
 use crate::{ConnectOutcome, EndpointEvent};
@@ -263,15 +262,15 @@ impl DiscoveryDriver {
     /// NAT legs for attempts admitted here and pumps for cancelled legs are
     /// returned as [`DiscoveryNatWork`]; the composition applies them with
     /// `NatDriver::apply_sweep_work` against its concrete transport. On the
-    /// standard Endpoint `expand` resolves DNS, so a sweep can block on
-    /// resolution.
+    /// standard Endpoint `expand` starts Name resolution off the driver, so a
+    /// sweep never blocks on a lookup.
     pub(crate) fn sweep<T: Transport, E: EntropySource>(
         &mut self,
         #[cfg(feature = "pubsub")] mut pubsub: Option<&mut GossipsubDriver>,
         #[cfg(feature = "_nat-driver")] mut nat: Option<&mut NatDriver<E>>,
         connect: &mut ConnectEngine,
         runtime: &mut SwarmRuntime<T, E>,
-        expand: &mut dyn FnMut(&PeerAddr) -> Result<Vec<PeerAddr>, String>,
+        expand: &mut dyn FnMut(&PeerAddr) -> Expansion,
         now: Now,
     ) -> DiscoveryNatWork {
         let mut work = DiscoveryNatWork::default();
