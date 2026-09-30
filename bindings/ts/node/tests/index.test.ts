@@ -6,6 +6,11 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
 import * as coreSdk from "@minip2p/core";
+import {
+  BackpressureError,
+  MessageTooLargeError,
+  NotPermittedError,
+} from "@minip2p/core";
 import { describe, expect, test } from "vitest";
 
 import * as nodeSdk from "../src/index.js";
@@ -58,12 +63,40 @@ describe("@minip2p/node", () => {
     });
 
     try {
-      expect(() => endpoint.unsubscribe(topic)).toThrow(
-        "the discovery topic is reserved while discovery is enabled"
+      const unsubscribe = () => endpoint.unsubscribe(topic);
+      expect(unsubscribe).toThrow(NotPermittedError);
+      // The typed error carries the variant's detail, not the formatted message.
+      expect(unsubscribe).toThrow(
+        /^the discovery topic is reserved while discovery is enabled$/u
       );
     } finally {
       endpoint.close();
     }
+  });
+
+  test("oversized publishes throw MessageTooLargeError", () => {
+    const endpoint = createPubsubEndpoint();
+
+    try {
+      expect(() =>
+        endpoint.publish("node-large", new Uint8Array(64 * 1024 + 1))
+      ).toThrow(MessageTooLargeError);
+    } finally {
+      endpoint.close();
+    }
+  });
+
+  test("untyped native errors keep their message and expose the variant tag", () => {
+    const relay = `/ip4/127.0.0.1/udp/4001/quic-v1/p2p/${nodeSdk.peerIdFromSecretKey(
+      nodeSdk.generateSecretKey()
+    )}`;
+    expect(() => nodeSdk.circuitAddress(relay, "not-a-peer")).toThrow(
+      expect.objectContaining({
+        code: "InvalidPeerId",
+        detail: expect.any(String),
+        message: expect.stringMatching(/^invalid peer id: /u),
+      })
+    );
   });
 
   test("passes mDNS limits through native validation", () => {
@@ -284,10 +317,7 @@ async function publishWithBackpressure(
       endpoint.publish(topic, data);
       return;
     } catch (error) {
-      if (
-        !(error instanceof Error) ||
-        error.message !== "outbound backpressure"
-      ) {
+      if (!(error instanceof BackpressureError)) {
         throw error;
       }
       if (Date.now() >= deadline) {

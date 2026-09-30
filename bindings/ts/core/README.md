@@ -39,4 +39,4 @@ for await (const event of endpoint.events({ signal })) {
 
 Use `endpoint.on("stream", handler)` to claim inbound streams. Operations accept `{ timeoutMs, signal }`; the default timeout is 65 seconds and `timeoutMs: 0` disables it. Both endpoints and streams implement `Symbol.dispose`, including the fallback used by `await using`; neither implements `Symbol.asyncDispose`.
 
-Raw native unions, the `Minip2pBackend` adapter contract, and `resolveEndpointConfig` (shared config defaults and validation) are available from `@minip2p/core/backend`.
+Raw native unions, the `Minip2pBackend` adapter contract, `resolveEndpointConfig` (shared config defaults and validation), and `typedFfiError` (native `FfiError` variant name to typed SDK error) are available from `@minip2p/core/backend`.

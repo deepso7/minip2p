@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use minip2p_ffi_core::{
     ConnectTarget, DiscoveryOptions, DiscoverySource, DriverFailureKind, EndpointConfig,
-    EndpointErrorKind, EventDoorbell, IdentifyInfo, MdnsOptions, NatErrorKind, P2pEndpoint,
-    P2pEvent, PathKind, Reachability,
+    EndpointErrorKind, EventDoorbell, FfiError, IdentifyInfo, MdnsOptions, NatErrorKind,
+    P2pEndpoint, P2pEvent, PathKind, Reachability,
 };
-use napi::bindgen_prelude::{BigInt, Either, Uint8Array};
+use napi::bindgen_prelude::{BigInt, Either, JsObjectValue, JsValue, Uint8Array};
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi::{Env, Error, Result, Status, Unknown};
 use napi_derive::napi;
@@ -152,21 +152,21 @@ pub struct NodeEndpoint(Arc<P2pEndpoint>);
 impl NodeEndpoint {
     /// Binds a native endpoint without starting its driver.
     #[napi(constructor)]
-    pub fn new(secret_key: Uint8Array, mut config: NodeEndpointConfig) -> Result<Self> {
+    pub fn new(env: Env, secret_key: Uint8Array, mut config: NodeEndpointConfig) -> Result<Self> {
         if config.agent_version.is_none() {
             config.agent_version = Some(format!("minip2p-node/{}", env!("CARGO_PKG_VERSION")));
         }
         P2pEndpoint::new(secret_key.to_vec(), config.try_into()?)
             .map(Self)
-            .map_err(native_error)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Starts the detached driver with a strong event-loop doorbell.
     #[napi]
-    pub fn start(&self, doorbell: Arc<DoorbellFunction>) -> Result<()> {
+    pub fn start(&self, env: Env, doorbell: Arc<DoorbellFunction>) -> Result<()> {
         self.0
             .start(Arc::new(NodeDoorbell(doorbell)))
-            .map_err(native_error)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Requests shutdown without waiting for the driver thread.
@@ -205,23 +205,27 @@ impl NodeEndpoint {
 
     /// Returns connected peer IDs.
     #[napi]
-    pub fn connected_peers(&self) -> Result<Vec<String>> {
-        self.0.connected_peers().map_err(native_error)
+    pub fn connected_peers(&self, env: Env) -> Result<Vec<String>> {
+        self.0
+            .connected_peers()
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Returns whether Identify completed for a peer.
     #[napi]
-    pub fn is_peer_ready(&self, peer_id: String) -> Result<bool> {
-        self.0.is_peer_ready(peer_id).map_err(native_error)
+    pub fn is_peer_ready(&self, env: Env, peer_id: String) -> Result<bool> {
+        self.0
+            .is_peer_ready(peer_id)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Returns the latest Identify snapshot.
     #[napi]
-    pub fn peer_info(&self, peer_id: String) -> Result<Option<serde_json::Value>> {
+    pub fn peer_info(&self, env: Env, peer_id: String) -> Result<Option<serde_json::Value>> {
         self.0
             .peer_info(peer_id)
             .map(|info| info.map(identify_value))
-            .map_err(native_error)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Accepted for compatibility; has no effect, since the driver sleeps until the endpoint's next deadline.
@@ -232,82 +236,103 @@ impl NodeEndpoint {
 
     /// Subscribes to a pubsub topic.
     #[napi]
-    pub fn subscribe(&self, topic: String) -> Result<bool> {
-        self.0.subscribe(topic).map_err(native_error)
+    pub fn subscribe(&self, env: Env, topic: String) -> Result<bool> {
+        self.0
+            .subscribe(topic)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Unsubscribes from a pubsub topic.
     #[napi]
-    pub fn unsubscribe(&self, topic: String) -> Result<bool> {
-        self.0.unsubscribe(topic).map_err(native_error)
+    pub fn unsubscribe(&self, env: Env, topic: String) -> Result<bool> {
+        self.0
+            .unsubscribe(topic)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Publishes one pubsub payload.
     #[napi]
-    pub fn publish(&self, topic: String, data: Uint8Array) -> Result<()> {
-        self.0.publish(topic, data.to_vec()).map_err(native_error)
+    pub fn publish(&self, env: Env, topic: String, data: Uint8Array) -> Result<()> {
+        self.0
+            .publish(topic, data.to_vec())
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Starts one ping operation.
     #[napi]
-    pub fn ping(&self, peer_id: String) -> Result<()> {
-        self.0.ping(peer_id).map_err(native_error)
+    pub fn ping(&self, env: Env, peer_id: String) -> Result<()> {
+        self.0
+            .ping(peer_id)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Registers an application protocol.
     #[napi]
-    pub fn add_protocol(&self, protocol_id: String) -> Result<()> {
-        self.0.add_protocol(protocol_id).map_err(native_error)
+    pub fn add_protocol(&self, env: Env, protocol_id: String) -> Result<()> {
+        self.0
+            .add_protocol(protocol_id)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Starts opening an application stream.
     #[napi]
-    pub fn open_stream(&self, peer_id: String, protocol_id: String) -> Result<NodeOpenStream> {
+    pub fn open_stream(
+        &self,
+        env: Env,
+        peer_id: String,
+        protocol_id: String,
+    ) -> Result<NodeOpenStream> {
         self.0
             .open_stream(peer_id, protocol_id)
             .map(|stream| NodeOpenStream {
                 conn_id: stream.conn_id.into(),
                 stream_id: stream.stream_id.into(),
             })
-            .map_err(native_error)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Sends bytes on an application stream.
     #[napi]
-    pub fn send_stream(&self, peer_id: String, stream_id: BigInt, data: Uint8Array) -> Result<()> {
+    pub fn send_stream(
+        &self,
+        env: Env,
+        peer_id: String,
+        stream_id: BigInt,
+        data: Uint8Array,
+    ) -> Result<()> {
         self.0
             .send_stream(peer_id, bigint_u64(stream_id, "streamId")?, data.to_vec())
-            .map_err(native_error)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Half-closes the local stream write side.
     #[napi]
-    pub fn close_stream_write(&self, peer_id: String, stream_id: BigInt) -> Result<()> {
+    pub fn close_stream_write(&self, env: Env, peer_id: String, stream_id: BigInt) -> Result<()> {
         self.0
             .close_stream_write(peer_id, bigint_u64(stream_id, "streamId")?)
-            .map_err(native_error)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Resets an application stream.
     #[napi]
-    pub fn reset_stream(&self, peer_id: String, stream_id: BigInt) -> Result<()> {
+    pub fn reset_stream(&self, env: Env, peer_id: String, stream_id: BigInt) -> Result<()> {
         self.0
             .reset_stream(peer_id, bigint_u64(stream_id, "streamId")?)
-            .map_err(native_error)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Resets and relinquishes an application stream.
     #[napi]
-    pub fn abandon_stream(&self, peer_id: String, stream_id: BigInt) -> Result<()> {
+    pub fn abandon_stream(&self, env: Env, peer_id: String, stream_id: BigInt) -> Result<()> {
         self.0
             .abandon_stream(peer_id, bigint_u64(stream_id, "streamId")?)
-            .map_err(native_error)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Starts one Connection attempt: a peer ID string, or an array of
     /// complete peer addresses naming one peer. Returns the Connect ID.
     #[napi]
-    pub fn connect(&self, target: Either<String, Vec<String>>) -> Result<BigInt> {
+    pub fn connect(&self, env: Env, target: Either<String, Vec<String>>) -> Result<BigInt> {
         let target = match target {
             Either::A(peer_id) => ConnectTarget::Peer { peer_id },
             Either::B(addresses) => ConnectTarget::Addresses { addresses },
@@ -315,35 +340,37 @@ impl NodeEndpoint {
         self.0
             .connect(target)
             .map(BigInt::from)
-            .map_err(native_error)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Cancels a connection attempt.
     #[napi]
-    pub fn cancel_connect(&self, id: BigInt) -> Result<()> {
+    pub fn cancel_connect(&self, env: Env, id: BigInt) -> Result<()> {
         self.0
             .cancel_connect(bigint_u64(id, "connectId")?)
-            .map_err(native_error)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Disconnects one peer.
     #[napi]
-    pub fn disconnect(&self, peer_id: String) -> Result<()> {
-        self.0.disconnect(peer_id).map_err(native_error)
+    pub fn disconnect(&self, env: Env, peer_id: String) -> Result<()> {
+        self.0
+            .disconnect(peer_id)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Returns the current path to a peer.
     #[napi]
-    pub fn path(&self, peer_id: String) -> Result<Option<serde_json::Value>> {
+    pub fn path(&self, env: Env, peer_id: String) -> Result<Option<serde_json::Value>> {
         self.0
             .path(peer_id)
             .map(|path| path.map(path_value))
-            .map_err(native_error)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Returns the transport connection selected for a peer.
     #[napi]
-    pub fn connection_info(&self, peer_id: String) -> Result<Option<NodeConnectionInfo>> {
+    pub fn connection_info(&self, env: Env, peer_id: String) -> Result<Option<NodeConnectionInfo>> {
         self.0
             .connection_info(peer_id)
             .map(|info| {
@@ -352,12 +379,12 @@ impl NodeEndpoint {
                     remote_addr: info.remote_addr,
                 })
             })
-            .map_err(native_error)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Returns the discovery address book.
     #[napi]
-    pub fn known_peers(&self) -> Result<Vec<serde_json::Value>> {
+    pub fn known_peers(&self, env: Env) -> Result<Vec<serde_json::Value>> {
         self.0
             .known_peers()
             .map(|peers| {
@@ -376,30 +403,30 @@ impl NodeEndpoint {
                     })
                     .collect()
             })
-            .map_err(native_error)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Returns the discovery clock.
     #[napi]
-    pub fn discovery_now_ms(&self) -> Result<Option<BigInt>> {
+    pub fn discovery_now_ms(&self, env: Env) -> Result<Option<BigInt>> {
         self.0
             .discovery_now_ms()
             .map(|value| value.map(BigInt::from))
-            .map_err(native_error)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Returns the current reachability verdict.
     #[napi]
-    pub fn reachability(&self) -> Result<u32> {
+    pub fn reachability(&self, env: Env) -> Result<u32> {
         self.0
             .reachability()
             .map(reachability_value)
-            .map_err(native_error)
+            .map_err(|error| native_error(&env, error))
     }
 
     /// Returns the active relay reservation.
     #[napi]
-    pub fn active_reservation(&self) -> Result<Option<serde_json::Value>> {
+    pub fn active_reservation(&self, env: Env) -> Result<Option<serde_json::Value>> {
         self.0
             .active_reservation()
             .map(|reservation| {
@@ -410,7 +437,7 @@ impl NodeEndpoint {
                     })
                 })
             })
-            .map_err(native_error)
+            .map_err(|error| native_error(&env, error))
     }
 }
 
@@ -428,18 +455,48 @@ pub fn generate_secret_key() -> Uint8Array {
 
 /// Derives a peer ID from raw Ed25519 secret key material.
 #[napi]
-pub fn peer_id_from_secret_key(secret_key: Uint8Array) -> Result<String> {
-    minip2p_ffi_core::peer_id_from_secret_key(secret_key.to_vec()).map_err(native_error)
+pub fn peer_id_from_secret_key(env: Env, secret_key: Uint8Array) -> Result<String> {
+    minip2p_ffi_core::peer_id_from_secret_key(secret_key.to_vec())
+        .map_err(|error| native_error(&env, error))
 }
 
 /// Builds a circuit address through a direct relay address.
 #[napi]
-pub fn circuit_address(relay_address: String, peer_id: String) -> Result<String> {
-    minip2p_ffi_core::circuit_address(relay_address, peer_id).map_err(native_error)
+pub fn circuit_address(env: Env, relay_address: String, peer_id: String) -> Result<String> {
+    minip2p_ffi_core::circuit_address(relay_address, peer_id)
+        .map_err(|error| native_error(&env, error))
 }
 
-fn native_error(error: minip2p_ffi_core::FfiError) -> Error {
-    Error::from_reason(error.to_string())
+/// Converts an `FfiError` into a JS `Error` that keeps the formatted message
+/// and adds a stable `code` (the variant name) plus the variant's `detail`,
+/// when it has one. The TypeScript adapter maps `code` to typed SDK errors.
+fn native_error(env: &Env, error: FfiError) -> Error {
+    let (code, detail) = match &error {
+        FfiError::AlreadyStarted => ("AlreadyStarted", None),
+        FfiError::Stopped => ("Stopped", None),
+        FfiError::InvalidConfig { detail } => ("InvalidConfig", Some(detail)),
+        FfiError::InvalidKey { detail } => ("InvalidKey", Some(detail)),
+        FfiError::InvalidPeerId { detail } => ("InvalidPeerId", Some(detail)),
+        FfiError::InvalidAddress { detail } => ("InvalidAddress", Some(detail)),
+        FfiError::InvalidTopic { detail } => ("InvalidTopic", Some(detail)),
+        FfiError::NotPermitted { detail } => ("NotPermitted", Some(detail)),
+        FfiError::Backpressure => ("Backpressure", None),
+        FfiError::MessageTooLarge => ("MessageTooLarge", None),
+        FfiError::Transport { detail } => ("Transport", Some(detail)),
+        FfiError::InvalidState { detail } => ("InvalidState", Some(detail)),
+        FfiError::Internal { detail } => ("Internal", Some(detail)),
+    };
+    let tagged = || -> Result<Error> {
+        let mut js_error = env.create_error(Error::from_reason(error.to_string()))?;
+        js_error.set_named_property("code", code)?;
+        if let Some(detail) = detail {
+            js_error.set_named_property("detail", detail.as_str())?;
+        }
+        Ok(Error::from(js_error.to_unknown()))
+    };
+    // Building the JS value only fails if the engine is unusable; the message
+    // alone is still the most useful thing to throw then.
+    tagged().unwrap_or_else(|_| Error::from_reason(error.to_string()))
 }
 
 fn event_js_value(env: &Env, event: P2pEvent) -> Result<Unknown<'static>> {

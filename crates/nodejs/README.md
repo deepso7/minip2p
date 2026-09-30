@@ -4,6 +4,8 @@ Thin [napi-rs](https://napi.rs/) binding shell over `minip2p-ffi-core`. The `@mi
 
 The shell translates napi values and forwards synchronous commands to `minip2p-ffi-core`. A strong `ThreadsafeFunction` acts as the event doorbell; the TypeScript adapter drains the core's bounded carry on the Node.js thread. The shell does not own sockets, driver lifecycle policy, or another event queue.
 
+Every `FfiError` is thrown as a JS `Error` with the formatted message, a `code` set to the variant name (for example `Backpressure`), and a `detail` property for variants that carry one. The TypeScript adapter maps `code` to the typed SDK errors.
+
 Build the linux addon from `bindings/ts/node` with:
 
 ```bash
