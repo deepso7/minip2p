@@ -132,3 +132,29 @@ fn dropping_the_transport_sends_held_packets_at_once() {
     assert_eq!(recv_raw(&peer), Some(held), "the held packet leaves first");
     assert!(recv_raw(&peer).is_some(), "the close follows it");
 }
+
+#[test]
+fn a_due_held_packet_never_overtakes_retained_datagrams() {
+    let (mut server, peer, id, stream) = paced_burst();
+    let conn = server.connections.get_mut(&id).expect("connection");
+    conn.repace_held_packet(Instant::now());
+    let held = conn.paced_packet().expect("held packet").0.to_vec();
+    while recv_raw(&peer).is_some() {}
+
+    // An earlier packet still waiting on socket writability.
+    let destination = peer.socket.local_addr().expect("peer addr");
+    server.queue_datagram_best_effort(b"earlier", destination);
+    // `send_stream` flushes the connection without draining the retry queue.
+    server
+        .send_stream(id, stream, vec![9; 1024])
+        .expect("send more");
+    assert_eq!(
+        recv_raw(&peer),
+        None,
+        "nothing overtakes a retained datagram"
+    );
+
+    server.poll(now()).expect("poll");
+    assert_eq!(recv_raw(&peer).as_deref(), Some(&b"earlier"[..]));
+    assert_eq!(recv_raw(&peer), Some(held), "the held packet follows it");
+}

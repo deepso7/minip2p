@@ -1099,23 +1099,28 @@ impl QuicConnection {
     }
 }
 
-/// Sends one packet, retaining it on `WouldBlock`. Returns whether the caller
-/// should keep flushing.
+/// Sends one packet, retaining it on `WouldBlock` or behind datagrams already
+/// retained, so it never overtakes them. Returns whether the caller should
+/// keep flushing.
 fn send_or_retain(
     socket: &UdpSocket,
     packet: &[u8],
     destination: SocketAddr,
     pending_datagrams: &mut VecDeque<PendingDatagram>,
 ) -> bool {
+    let retain = |pending_datagrams: &mut VecDeque<PendingDatagram>| {
+        pending_datagrams.push_back(PendingDatagram {
+            bytes: packet.to_vec(),
+            destination,
+        });
+        false
+    };
+    if !pending_datagrams.is_empty() {
+        return retain(pending_datagrams);
+    }
     match socket.send_to(packet, destination) {
         Ok(_) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            pending_datagrams.push_back(PendingDatagram {
-                bytes: packet.to_vec(),
-                destination,
-            });
-            false
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => retain(pending_datagrams),
         // Any other send error (EHOSTUNREACH after a route flap,
         // ICMP-driven ECONNREFUSED, ...) affects only this connection's path,
         // so it must not abort the whole endpoint's poll. Treat the packet as
