@@ -4,7 +4,7 @@
 //! No async runtime required.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -240,85 +240,28 @@ fn extract_listen_socket_addr(
     Ok(SocketAddr::new(ip, port))
 }
 
-/// Resolves a QUIC multiaddr to a socket address, performing synchronous DNS resolution for /dns* hosts.
-fn resolve_dial_socket_addr(
+/// The socket address a QUIC dial or raw UDP send targets.
+///
+/// Only `/ip4` and `/ip6` hosts are accepted. Name resolution blocks, so it
+/// never happens here: the std `Endpoint` resolves `/dns*` candidates off its
+/// driver thread, and a direct caller must resolve the name itself first.
+fn dial_socket_addr(
     multiaddr: &Multiaddr,
     context: &'static str,
 ) -> Result<SocketAddr, TransportError> {
-    resolve_dial_socket_addrs(multiaddr, context)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| TransportError::InvalidAddress {
-            context,
-            reason: "dial target resolved to no usable addresses".into(),
-        })
-}
-
-/// Resolves a QUIC multiaddr to all usable socket addresses.
-fn resolve_dial_socket_addrs(
-    multiaddr: &Multiaddr,
-    context: &'static str,
-) -> Result<Vec<SocketAddr>, TransportError> {
     let (host, port) = extract_quic_host_and_port(multiaddr, context)?;
 
     match host {
-        Protocol::Ip4(bytes) => Ok(vec![SocketAddr::new(IpAddr::from(bytes), port)]),
-        Protocol::Ip6(bytes) => Ok(vec![SocketAddr::new(IpAddr::from(bytes), port)]),
-        Protocol::Dns(host) => {
-            let query = format!("{host}:{port}");
-            let resolved = query
-                .to_socket_addrs()
-                .map_err(|e| TransportError::InvalidAddress {
-                    context,
-                    reason: format!("dns resolution failed for {query}: {e}"),
-                })?
-                .collect::<Vec<_>>();
-
-            if resolved.is_empty() {
-                return Err(TransportError::InvalidAddress {
-                    context,
-                    reason: format!("dns resolution returned no usable address for {query}"),
-                });
-            }
-            Ok(resolved)
-        }
-        Protocol::Dns4(host) => {
-            let query = format!("{host}:{port}");
-            let resolved = query
-                .to_socket_addrs()
-                .map_err(|e| TransportError::InvalidAddress {
-                    context,
-                    reason: format!("dns resolution failed for {query}: {e}"),
-                })?
-                .filter(SocketAddr::is_ipv4)
-                .collect::<Vec<_>>();
-
-            if resolved.is_empty() {
-                return Err(TransportError::InvalidAddress {
-                    context,
-                    reason: format!("dns resolution returned no ipv4 address for {query}"),
-                });
-            }
-            Ok(resolved)
-        }
-        Protocol::Dns6(host) => {
-            let query = format!("{host}:{port}");
-            let resolved = query
-                .to_socket_addrs()
-                .map_err(|e| TransportError::InvalidAddress {
-                    context,
-                    reason: format!("dns resolution failed for {query}: {e}"),
-                })?
-                .filter(SocketAddr::is_ipv6)
-                .collect::<Vec<_>>();
-
-            if resolved.is_empty() {
-                return Err(TransportError::InvalidAddress {
-                    context,
-                    reason: format!("dns resolution returned no ipv6 address for {query}"),
-                });
-            }
-            Ok(resolved)
+        Protocol::Ip4(bytes) => Ok(SocketAddr::new(IpAddr::from(bytes), port)),
+        Protocol::Ip6(bytes) => Ok(SocketAddr::new(IpAddr::from(bytes), port)),
+        Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) => {
+            Err(TransportError::InvalidAddress {
+                context,
+                reason: format!(
+                    "{multiaddr} names a host; resolve it to /ip4 or /ip6 first \
+                     (the QUIC transport does not resolve names)"
+                ),
+            })
         }
         _ => Err(TransportError::InvalidAddress {
             context,
@@ -602,26 +545,19 @@ fn family_for_socket_addr(addr: SocketAddr) -> AddressFamily {
     }
 }
 
+/// `addr` itself when its host is in `family`; an address error otherwise.
 fn peer_addr_for_family(
     addr: &PeerAddr,
     family: AddressFamily,
 ) -> Result<PeerAddr, TransportError> {
-    let socket_addrs = resolve_dial_socket_addrs(addr.transport(), "dial target")?;
-    let Some(socket_addr) = socket_addrs
-        .into_iter()
-        .find(|socket_addr| family_for_socket_addr(*socket_addr) == family)
-    else {
+    let socket_addr = dial_socket_addr(addr.transport(), "dial target")?;
+    if family_for_socket_addr(socket_addr) != family {
         return Err(TransportError::InvalidAddress {
             context: "dial target",
-            reason: format!("no {} target resolved", family.name()),
+            reason: format!("{} is not an {} target", addr.transport(), family.name()),
         });
-    };
-
-    let transport = socket_addr_to_multiaddr(socket_addr);
-    PeerAddr::new(transport, addr.peer_id().clone()).map_err(|e| TransportError::InvalidAddress {
-        context: "dial target",
-        reason: format!("resolved address was not a peer addr: {e}"),
-    })
+    }
+    Ok(addr.clone())
 }
 
 impl QuicEndpoint {
@@ -667,19 +603,6 @@ impl QuicEndpoint {
     /// Binds IPv4 and IPv6 wildcard UDP sockets.
     pub fn dual_stack(node_config: QuicNodeConfig) -> Result<Self, TransportError> {
         DualQuicTransport::new(node_config).map(|transport| Self::Dual(Box::new(transport)))
-    }
-
-    /// Dials `addr` using every applicable local socket and returns the
-    /// allocated connection ids.
-    ///
-    /// A dual-stack endpoint tries both IPv4 and IPv6 for `/dns` targets when
-    /// DNS resolution provides both families. Family-specific addresses such
-    /// as `/ip4`, `/ip6`, `/dns4`, and `/dns6` only use their matching socket.
-    pub fn dial_all(&mut self, addr: &PeerAddr) -> Result<Vec<ConnectionId>, TransportError> {
-        match self {
-            Self::Single(transport) => transport.dial(addr).map(|id| vec![id]),
-            Self::Dual(transport) => transport.dial_all(addr),
-        }
     }
 
     /// Dials `addr` with the IPv4 socket.
@@ -780,10 +703,8 @@ impl DualQuicTransport {
 
     /// Sends a raw UDP packet to `target`, bypassing QUIC.
     pub fn send_raw_udp(&self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
-        let target = resolve_dial_socket_addr(target, "raw udp target")?;
-        let family = family_for_socket_addr(target);
-        self.transport(family)
-            .send_raw_udp(&socket_addr_to_multiaddr(target), payload)
+        let family = family_for_socket_addr(dial_socket_addr(target, "raw udp target")?);
+        self.transport(family).send_raw_udp(target, payload)
     }
 
     fn transport(&self, family: AddressFamily) -> &QuicTransport {
@@ -800,68 +721,13 @@ impl DualQuicTransport {
         }
     }
 
-    fn dial_all(&mut self, addr: &PeerAddr) -> Result<Vec<ConnectionId>, TransportError> {
-        let targets = self.dial_targets(addr)?;
-        let mut ids = Vec::with_capacity(targets.len());
-        let mut last_err = None;
-        for (family, addr) in targets {
-            match self.transport_mut(family).dial(&addr) {
-                Ok(id) => ids.push(id),
-                Err(err) => last_err = Some(err),
-            }
-        }
-
-        if ids.is_empty() {
-            return Err(last_err.unwrap_or_else(|| TransportError::InvalidAddress {
-                context: "dial target",
-                reason: "no usable ipv4 or ipv6 dial target".into(),
-            }));
-        }
-
-        Ok(ids)
-    }
-
     fn dial_family(
         &mut self,
         addr: &PeerAddr,
         family: AddressFamily,
     ) -> Result<ConnectionId, TransportError> {
-        let targets = self.dial_targets(addr)?;
-        let Some((_, addr)) = targets
-            .into_iter()
-            .find(|(target_family, _)| *target_family == family)
-        else {
-            return Err(TransportError::InvalidAddress {
-                context: "dial target",
-                reason: format!("no {} target resolved", family.name()),
-            });
-        };
-
+        let addr = peer_addr_for_family(addr, family)?;
         self.transport_mut(family).dial(&addr)
-    }
-
-    fn dial_targets(
-        &self,
-        addr: &PeerAddr,
-    ) -> Result<Vec<(AddressFamily, PeerAddr)>, TransportError> {
-        let socket_addrs = resolve_dial_socket_addrs(addr.transport(), "dial target")?;
-        let mut seen = BTreeSet::new();
-        let mut targets = Vec::new();
-        for socket_addr in socket_addrs {
-            let family = family_for_socket_addr(socket_addr);
-            if !seen.insert(family) {
-                continue;
-            }
-            let transport = socket_addr_to_multiaddr(socket_addr);
-            let peer_addr = PeerAddr::new(transport, addr.peer_id().clone()).map_err(|e| {
-                TransportError::InvalidAddress {
-                    context: "dial target",
-                    reason: format!("resolved address was not a peer addr: {e}"),
-                }
-            })?;
-            targets.push((family, peer_addr));
-        }
-        Ok(targets)
     }
 
     fn family_for_addr(addr: &Multiaddr) -> AddressFamily {
@@ -982,10 +848,10 @@ impl QuicTransport {
     /// peer needs to send stray UDP bytes to open a NAT binding for inbound
     /// QUIC packets from a remote peer.
     ///
-    /// The multiaddr must be of the form `/ip4|ip6|dns*/udp/<port>/quic-v1`.
-    /// DNS names are resolved synchronously.
+    /// The multiaddr must be of the form `/ip4|ip6/<addr>/udp/<port>/quic-v1`;
+    /// `/dns*` hosts are rejected, so resolve names before calling this.
     pub fn send_raw_udp(&self, target: &Multiaddr, payload: &[u8]) -> Result<(), TransportError> {
-        let addr = resolve_dial_socket_addr(target, "raw udp target")?;
+        let addr = dial_socket_addr(target, "raw udp target")?;
         self.socket
             .send_to(payload, addr)
             .map_err(|e| TransportError::PollError {
@@ -1174,7 +1040,7 @@ impl Transport for QuicTransport {
         }
 
         let id = self.allocate_connection_id()?;
-        let peer_socket = resolve_dial_socket_addr(addr.transport(), "dial target")?;
+        let peer_socket = dial_socket_addr(addr.transport(), "dial target")?;
         let local_socket = self.local_addr();
 
         let scid = Self::generate_scid().map_err(|e| TransportError::DialFailed {
@@ -1904,13 +1770,8 @@ impl BlockingTransport for QuicEndpoint {
 
 impl Transport for DualQuicTransport {
     fn dial(&mut self, addr: &PeerAddr) -> Result<ConnectionId, TransportError> {
-        let (family, addr) = self.dial_targets(addr)?.into_iter().next().ok_or_else(|| {
-            TransportError::InvalidAddress {
-                context: "dial target",
-                reason: "no usable ipv4 or ipv6 dial target".into(),
-            }
-        })?;
-        self.transport_mut(family).dial(&addr)
+        let family = family_for_socket_addr(dial_socket_addr(addr.transport(), "dial target")?);
+        self.transport_mut(family).dial(addr)
     }
 
     fn listen(&mut self, addr: &Multiaddr) -> Result<Multiaddr, TransportError> {
@@ -2107,13 +1968,9 @@ mod tests {
         assert_eq!(Transport::local_addresses(&transport), vec![expected]);
     }
 
-    fn localhost_peer_addr(port: u16) -> PeerAddr {
+    fn loopback_peer_addr(host: Protocol) -> PeerAddr {
         let keypair = Ed25519Keypair::generate();
-        let transport = Multiaddr::from_protocols(vec![
-            Protocol::Dns("localhost".to_string()),
-            Protocol::Udp(port),
-            Protocol::QuicV1,
-        ]);
+        let transport = Multiaddr::from_protocols(vec![host, Protocol::Udp(9), Protocol::QuicV1]);
         PeerAddr::new(transport, keypair.peer_id()).expect("peer addr")
     }
 
@@ -2567,38 +2424,29 @@ mod tests {
         );
     }
 
-    fn localhost_families(port: u16) -> BTreeSet<AddressFamily> {
-        let transport = Multiaddr::from_protocols(vec![
-            Protocol::Dns("localhost".to_string()),
-            Protocol::Udp(port),
-            Protocol::QuicV1,
-        ]);
-        resolve_dial_socket_addrs(&transport, "test dns")
-            .expect("localhost resolves")
-            .into_iter()
-            .map(family_for_socket_addr)
-            .collect()
-    }
-
     #[test]
-    fn dual_stack_dial_all_uses_every_resolved_dns_family() {
-        let families = localhost_families(9);
-        let mut endpoint = QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("bind");
-        let peer_addr = localhost_peer_addr(9);
+    fn dns_hosts_are_refused_with_a_resolve_first_error() {
+        // A lookup here would block the driver thread for the resolver's
+        // timeout, so a name is an address error that says what to do.
+        let named = loopback_peer_addr(Protocol::Dns4("localhost".to_string()));
+        let assert_resolve_first = |result: Result<(), TransportError>| {
+            assert!(
+                matches!(&result, Err(TransportError::InvalidAddress { reason, .. })
+                    if reason.contains("resolve it to /ip4 or /ip6 first")),
+                "got {result:?}"
+            );
+        };
 
-        let ids = endpoint.dial_all(&peer_addr).expect("dial all");
+        let mut single =
+            QuicEndpoint::bind(QuicNodeConfig::generate(), DEFAULT_IPV4_BIND).expect("bind ipv4");
+        assert_resolve_first(Transport::dial(&mut single, &named).map(drop));
+        assert_resolve_first(single.dial_ip4(&named).map(drop));
+        assert_resolve_first(single.send_raw_udp(named.transport(), b"x"));
 
-        assert_eq!(ids.len(), families.len());
-        assert_eq!(
-            ids.iter()
-                .any(|id| id.namespace() == ConnectionNamespace::QUIC_IPV4),
-            families.contains(&AddressFamily::Ipv4)
-        );
-        assert_eq!(
-            ids.iter()
-                .any(|id| id.namespace() == ConnectionNamespace::QUIC_IPV6),
-            families.contains(&AddressFamily::Ipv6)
-        );
+        let mut dual = QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("bind");
+        assert_resolve_first(Transport::dial(&mut dual, &named).map(drop));
+        assert_resolve_first(dual.dial_ip4(&named).map(drop));
+        assert_resolve_first(dual.send_raw_udp(named.transport(), b"x"));
     }
 
     #[test]
@@ -2637,56 +2485,33 @@ mod tests {
 
     #[test]
     fn dual_stack_explicit_family_dials_only_that_family() {
-        let families = localhost_families(9);
-        let peer_addr = localhost_peer_addr(9);
+        let mut endpoint = QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("bind");
+        let id = endpoint
+            .dial_ip4(&loopback_peer_addr(Protocol::Ip4([127, 0, 0, 1])))
+            .expect("dial ipv4");
+        assert_eq!(id.namespace(), ConnectionNamespace::QUIC_IPV4);
 
-        if families.contains(&AddressFamily::Ipv4) {
-            let mut endpoint = QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("bind");
-            let id = endpoint.dial_ip4(&peer_addr).expect("dial ipv4");
-            assert_eq!(id.namespace(), ConnectionNamespace::QUIC_IPV4);
-        }
+        let mut ipv6 = [0; 16];
+        ipv6[15] = 1;
+        let id = endpoint
+            .dial_ip6(&loopback_peer_addr(Protocol::Ip6(ipv6)))
+            .expect("dial ipv6");
+        assert_eq!(id.namespace(), ConnectionNamespace::QUIC_IPV6);
 
-        if families.contains(&AddressFamily::Ipv6) {
-            let mut endpoint = QuicEndpoint::dual_stack(QuicNodeConfig::generate()).expect("bind");
-            let id = endpoint.dial_ip6(&peer_addr).expect("dial ipv6");
-            assert_eq!(id.namespace(), ConnectionNamespace::QUIC_IPV6);
-        }
-    }
-
-    #[test]
-    fn peer_addr_for_family_filters_dns_targets() {
-        let families = localhost_families(9);
-        let peer_addr = localhost_peer_addr(9);
-
-        if families.contains(&AddressFamily::Ipv4) {
-            let addr = peer_addr_for_family(&peer_addr, AddressFamily::Ipv4).expect("ipv4 addr");
-            assert!(matches!(
-                addr.transport().protocols().first(),
-                Some(Protocol::Ip4(_))
-            ));
-        }
-
-        if families.contains(&AddressFamily::Ipv6) {
-            let addr = peer_addr_for_family(&peer_addr, AddressFamily::Ipv6).expect("ipv6 addr");
-            assert!(matches!(
-                addr.transport().protocols().first(),
-                Some(Protocol::Ip6(_))
-            ));
-        }
+        assert!(matches!(
+            endpoint.dial_ip6(&loopback_peer_addr(Protocol::Ip4([127, 0, 0, 1]))),
+            Err(TransportError::InvalidAddress { .. })
+        ));
     }
 
     #[test]
     fn single_endpoint_explicit_family_rejects_mismatched_socket() {
-        let families = localhost_families(9);
-        if !families.contains(&AddressFamily::Ipv6) {
-            return;
-        }
-
+        let mut ipv6 = [0; 16];
+        ipv6[15] = 1;
         let mut endpoint =
             QuicEndpoint::bind(QuicNodeConfig::generate(), DEFAULT_IPV4_BIND).expect("bind ipv4");
-        let peer_addr = localhost_peer_addr(9);
         let err = endpoint
-            .dial_ip6(&peer_addr)
+            .dial_ip6(&loopback_peer_addr(Protocol::Ip6(ipv6)))
             .expect_err("ipv4 endpoint must not dial ipv6");
 
         assert!(matches!(

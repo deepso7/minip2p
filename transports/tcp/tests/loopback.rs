@@ -407,23 +407,25 @@ fn listening_again_on_a_bound_address_is_the_same_listener() {
 }
 
 #[test]
-fn listening_needs_a_concrete_host_but_dialing_may_use_a_name() {
+fn names_are_refused_with_a_resolve_first_error() {
+    // A lookup inside `dial` would block the driver thread, so the std
+    // provider takes concrete hosts only and says what to do instead.
     let mut transport = node(identity(1));
     assert!(matches!(
         transport.listen(&"/dns/localhost/tcp/0".parse().expect("addr")),
         Err(TransportError::ListenFailed { .. })
     ));
 
-    // The name resolves, so the dial gets as far as opening a socket; whether
-    // anything answers is beside the point here.
     let target = PeerAddr::new(
-        "/dns/localhost/tcp/1".parse().expect("addr"),
+        "/dns4/localhost/tcp/1".parse().expect("addr"),
         identity(2).peer_id(),
     )
     .expect("dial target");
+    let result = transport.dial(&target);
     assert!(
-        transport.dial(&target).is_ok(),
-        "a resolvable name must be dialable"
+        matches!(&result, Err(TransportError::InvalidAddress { reason, .. })
+            if reason.contains("resolve it to /ip4 or /ip6 first")),
+        "got {result:?}"
     );
 }
 
@@ -1229,52 +1231,6 @@ mod provider {
         assert!(
             after.is_empty(),
             "an aborted handle is owed nothing further, got {after:?}"
-        );
-    }
-
-    #[test]
-    fn a_dns4_dial_reaches_an_ipv4_address() {
-        let mut server = StdTcpProvider::new().expect("server");
-        let mut client = StdTcpProvider::new().expect("client");
-        let bound = server
-            .listen(&"/ip4/127.0.0.1/tcp/0".parse().expect("addr"))
-            .expect("bind");
-        let port = bound
-            .to_string()
-            .rsplit('/')
-            .next()
-            .expect("port")
-            .to_string();
-
-        let named: Multiaddr = format!("/dns4/localhost/tcp/{port}").parse().expect("addr");
-        let _ = client
-            .connect(&named)
-            .expect("a dns4 name resolves and dials");
-
-        let (mut server_seen, mut client_seen) = (Vec::new(), Vec::new());
-        pump_until(
-            &mut server,
-            &mut client,
-            &mut server_seen,
-            &mut client_seen,
-            |_, client| {
-                client
-                    .iter()
-                    .any(|event| matches!(event, TcpEvent::Connected { .. }))
-            },
-        );
-
-        let reached = client_seen
-            .iter()
-            .find_map(|event| match event {
-                TcpEvent::Connected { remote, .. } => Some(remote.clone()),
-                _ => None,
-            })
-            .expect("connected");
-        // The filter is the point: `/dns4` must not settle on a v6 answer.
-        assert!(
-            reached.to_string().starts_with("/ip4/"),
-            "a /dns4 dial must reach an IPv4 address, got {reached}"
         );
     }
 

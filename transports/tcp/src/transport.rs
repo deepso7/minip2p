@@ -533,13 +533,16 @@ impl<P: TcpProvider, E: EntropySource> Transport for TcpTransport<P, E> {
         let consumed = self.ids.allocate();
         debug_assert_eq!(consumed, Ok(id), "peeked id must match the allocated one");
 
-        let socket = self
-            .provider
-            .connect(target)
-            .map_err(|error| TransportError::DialFailed {
+        let socket = self.provider.connect(target).map_err(|error| match error {
+            // A refused address is the caller's to fix, not a dial outcome.
+            TcpError::Address { context, reason } => {
+                TransportError::InvalidAddress { context, reason }
+            }
+            error => TransportError::DialFailed {
                 id,
                 reason: error.to_string(),
-            })?;
+            },
+        })?;
 
         self.by_socket.insert(socket, id);
         self.connections.insert(

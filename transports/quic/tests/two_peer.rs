@@ -476,29 +476,6 @@ fn mtls_verifies_listener_side_client_identity_and_updates_peer_index() {
 }
 
 #[test]
-fn dial_supports_dns4_target_for_quic_transport() {
-    let (mut server, mut client, peer_addr) = setup_pair();
-
-    let port = match peer_addr.transport().protocols().get(1) {
-        Some(minip2p_core::Protocol::Udp(port)) => *port,
-        _ => panic!("peer transport must contain udp port"),
-    };
-
-    let dns_transport = minip2p_core::Multiaddr::from_protocols(vec![
-        minip2p_core::Protocol::Dns4("localhost".to_string()),
-        minip2p_core::Protocol::Udp(port),
-        minip2p_core::Protocol::QuicV1,
-    ]);
-    let dns_peer_addr =
-        PeerAddr::new(dns_transport, peer_addr.peer_id().clone()).expect("dns peer addr");
-
-    let conn_id = client.dial(&dns_peer_addr).expect("dial via dns4");
-
-    let connected = wait_for_connection(&mut server, &mut client, conn_id, &dns_peer_addr, 250);
-    assert!(connected.is_some(), "client should connect via dns4 target");
-}
-
-#[test]
 fn listen_rejects_address_mismatch_with_bound_socket() {
     let config = QuicNodeConfig::generate();
     let mut transport = QuicTransport::new(config, "127.0.0.1:0").expect("bind");
