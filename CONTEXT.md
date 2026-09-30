@@ -38,6 +38,8 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Connection target**: What an application supplies to start a Connection attempt: a peer ID, one complete peer address, or a non-empty set of complete peer addresses that all name the same peer. Each address retains its transport shape and peer ID so it can be copied as advertised.
 
+**Name resolution**: The Endpoint step that turns a `/dns*` candidate of a Connection attempt into concrete `/ip4`/`/ip6` candidates. It runs beside the attempt, never on the driver: other candidates and the relay leg race while it is pending, and a failed lookup is one failed candidate. Transports never resolve names. _Avoid_: expansion
+
 **Endpoint event stream**: The endpoint's single public, ordered source of connection, protocol, discovery, and diagnostic events. Applications correlate events with operation IDs and build selective waits above this stream; the endpoint does not expose competing focused queues or waits.
 
 **Endpoint wait outcome**: Why a blocking endpoint wait returned: an Endpoint event, the caller's deadline, or an explicit interruption. Deadline and interruption are control outcomes, not competing event sources.
