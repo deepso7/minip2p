@@ -34,6 +34,8 @@ pub(crate) struct PendingDatagram {
 mod config;
 mod connection;
 #[cfg(test)]
+mod pacing_tests;
+#[cfg(test)]
 mod stream_send_tests;
 
 pub use config::{QuicLimits, QuicNodeConfig};
@@ -1193,6 +1195,9 @@ impl Transport for QuicTransport {
         })?;
 
         let mut out = [0u8; 1350];
+        // A fresh connection's first flight is inside quiche's initial unpaced
+        // burst, so `SendInfo::at` needs no honouring here; `flush` paces the
+        // rest.
         loop {
             let (written, send_info) = match quiche_conn.send(&mut out) {
                 Ok(v) => v,
@@ -1648,8 +1653,10 @@ impl Transport for QuicTransport {
 
         // Datagrams stuck on socket writability can't be woken by a
         // readable peek; return a near deadline so the driver retries the
-        // flush soon. (A `flush` blocked mid-connection always leaves its
-        // packet queued here, so this also covers packets still in quiche.)
+        // flush soon. (A `flush` blocked on the socket mid-connection always
+        // leaves its packet queued here, so this also covers packets still in
+        // quiche; one stopped by pacing holds its packet on the connection,
+        // whose send time is reported below.)
         // Stream writes queued on QUIC flow-control credit, by contrast,
         // only progress when a peer packet arrives -- which wakes
         // `wait_for_input` -- or a QUIC timer fires, so they fall through
@@ -1668,10 +1675,13 @@ impl Transport for QuicTransport {
         // No sample yet means no timeline to answer on.
         let now = self.last_now?;
 
+        // quiche's timers and any held paced packet's send time; both round
+        // sub-millisecond delays up so the driver never busy-loops on them.
         let timeout = self
             .connections
             .values()
-            .filter_map(QuicConnection::timeout)
+            .flat_map(|conn| [conn.timeout(), conn.pacing_delay()])
+            .flatten()
             .min();
         let quiche = timeout.map(|timeout| deadline_for_timeout(now, timeout));
         let keepalive_interval_ms =

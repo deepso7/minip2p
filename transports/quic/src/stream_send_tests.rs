@@ -9,16 +9,16 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
-static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+pub(crate) static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-fn now() -> Now {
+pub(crate) fn now() -> Now {
     Now::from_millis(EPOCH.elapsed().as_millis() as u64)
 }
 
 /// A quiche client on its own loopback socket, pumped by hand.
-struct RawPeer {
-    conn: quiche::Connection,
-    socket: UdpSocket,
+pub(crate) struct RawPeer {
+    pub(crate) conn: quiche::Connection,
+    pub(crate) socket: UdpSocket,
 }
 
 impl RawPeer {
@@ -39,7 +39,7 @@ impl RawPeer {
 
     /// Receives everything queued on the socket, services timers, and sends
     /// whatever quiche has to say.
-    fn pump(&mut self) {
+    pub(crate) fn pump(&mut self) {
         let mut buf = [0u8; 65535];
         let local = self.socket.local_addr().expect("client addr");
         while let Ok((len, from)) = self.socket.recv_from(&mut buf) {
@@ -77,7 +77,7 @@ impl RawPeer {
     }
 }
 
-fn listening_server(idle_timeout_ms: u64) -> QuicTransport {
+pub(crate) fn listening_server(idle_timeout_ms: u64) -> QuicTransport {
     let limits = QuicLimits {
         idle_timeout_ms,
         ..QuicLimits::default()
@@ -118,7 +118,7 @@ fn drive_until(
 }
 
 /// Connects a raw peer and returns the server-side connection id.
-fn accept(
+pub(crate) fn accept(
     server: &mut QuicTransport,
     others: &mut [&mut RawPeer],
     tune: impl FnOnce(&mut quiche::Config),
