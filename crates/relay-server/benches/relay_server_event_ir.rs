@@ -355,7 +355,7 @@ fn assert_batch_expired(mut agent: RelayServerAgent) {
     assert_eq!(agent.circuit_count(), RESERVATIONS as usize);
 }
 
-fn assert_reservation_accepted(mut agent: RelayServerAgent) {
+fn assert_reservation_accepted((mut agent, _request): (RelayServerAgent, SwarmEvent)) {
     assert!(agent.poll_event().is_none(), "RESERVE must not be denied");
     ack_all(&mut agent, NOW);
     assert!(matches!(
@@ -365,7 +365,7 @@ fn assert_reservation_accepted(mut agent: RelayServerAgent) {
     assert_eq!(agent.reservation_count(), RESERVATIONS as usize + 1);
 }
 
-fn assert_circuits_torn_down(mut agent: RelayServerAgent) {
+fn assert_circuits_torn_down((mut agent, _closed): (RelayServerAgent, SwarmEvent)) {
     let mut closed = 0;
     while let Some(event) = agent.poll_event() {
         assert!(matches!(
@@ -385,7 +385,7 @@ fn assert_circuits_torn_down(mut agent: RelayServerAgent) {
     assert_eq!(agent.reservation_count(), RESERVATIONS as usize);
 }
 
-// Each benchmark returns the agent so its drop and the assertions in
+// Each benchmark returns its inputs so their drop and the assertions in
 // `teardown` stay outside the measured region.
 
 #[library_benchmark]
@@ -414,10 +414,11 @@ fn relay_1k_tick_expire_100(mut agent: RelayServerAgent) -> RelayServerAgent {
     args = (scale_agent_with_new_reserver()),
     teardown = assert_reservation_accepted
 )]
-fn relay_1k_reserve_new_peer(input: (RelayServerAgent, SwarmEvent)) -> RelayServerAgent {
-    let (mut agent, request) = input;
+fn relay_1k_reserve_new_peer(
+    (mut agent, request): (RelayServerAgent, SwarmEvent),
+) -> (RelayServerAgent, SwarmEvent) {
     black_box(agent.handle_event(black_box(&request), false, black_box(NOW)));
-    agent
+    (agent, request)
 }
 
 #[library_benchmark]
@@ -426,11 +427,10 @@ fn relay_1k_reserve_new_peer(input: (RelayServerAgent, SwarmEvent)) -> RelayServ
     teardown = assert_circuits_torn_down
 )]
 fn relay_1k_close_connection_100_circuits(
-    input: (RelayServerAgent, SwarmEvent),
-) -> RelayServerAgent {
-    let (mut agent, closed) = input;
+    (mut agent, closed): (RelayServerAgent, SwarmEvent),
+) -> (RelayServerAgent, SwarmEvent) {
     black_box(agent.handle_event(black_box(&closed), false, black_box(NOW)));
-    agent
+    (agent, closed)
 }
 
 library_benchmark_group!(
