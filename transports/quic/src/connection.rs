@@ -816,6 +816,9 @@ impl QuicConnection {
         )
     }
 
+    /// Shared body of `flush` and `flush_ignoring_pacing`: sends any held
+    /// packet, then pulls from quiche until it is done, a packet must wait for
+    /// its send time (under `Pacing::Honour`), or the socket pushes back.
     fn send_output(
         &mut self,
         socket: &UdpSocket,
