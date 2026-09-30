@@ -64,6 +64,7 @@ What the adapter _does_ guarantee is that nothing quiche's clock touches leaks i
 - `poll(now)` retains the sample purely to anchor `next_deadline()` on the host's timeline, so a host driving several transports can still compare their deadlines.
 - quiche measures its timeout from an `Instant::now()` at or after that sample, so anchoring rounds the deadline slightly early — an extra harmless wakeup, never a missed timer.
 - Sub-millisecond timeouts (common on loopback) are rounded _up_ to a whole millisecond rather than truncated to zero. Truncation would report "already due" and spin a driver's budget loop until wall time caught up.
+- quiche's pacing send times (`SendInfo::at`) are honoured on its clock too: a packet due later is held on its connection, which generates nothing more until a later `poll` sends it, so packets never leave early or out of order. The held packet's send time joins `next_deadline()` under the same rounding. Dropping the transport sends anything still held at once, since no later `poll` would. quiche only paces under BBR2; with its default CUBIC, which this adapter uses, every packet is due immediately.
 
 `quiche 0.29` exposes its TLS builder using `boring` 4.x types, so this crate intentionally uses the newest compatible `boring` 4.x release rather than the incompatible 5.x major.
 

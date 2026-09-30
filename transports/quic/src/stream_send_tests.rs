@@ -11,14 +11,14 @@ use super::*;
 
 static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-fn now() -> Now {
+pub(crate) fn now() -> Now {
     Now::from_millis(EPOCH.elapsed().as_millis() as u64)
 }
 
 /// A quiche client on its own loopback socket, pumped by hand.
-struct RawPeer {
+pub(crate) struct RawPeer {
     conn: quiche::Connection,
-    socket: UdpSocket,
+    pub(crate) socket: UdpSocket,
 }
 
 impl RawPeer {
@@ -77,7 +77,7 @@ impl RawPeer {
     }
 }
 
-fn listening_server(idle_timeout_ms: u64) -> QuicTransport {
+pub(crate) fn listening_server(idle_timeout_ms: u64) -> QuicTransport {
     let limits = QuicLimits {
         idle_timeout_ms,
         ..QuicLimits::default()
@@ -118,7 +118,7 @@ fn drive_until(
 }
 
 /// Connects a raw peer and returns the server-side connection id.
-fn accept(
+pub(crate) fn accept(
     server: &mut QuicTransport,
     others: &mut [&mut RawPeer],
     tune: impl FnOnce(&mut quiche::Config),

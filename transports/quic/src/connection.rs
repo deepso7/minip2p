@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use minip2p_platform::{Deadline, Now};
 use minip2p_transport::{
@@ -119,6 +119,24 @@ pub struct QuicConnection {
     /// is still there, so one unanswered ping is enough; idle timeout then
     /// closes a dead path.
     sent_keepalive_since_recv: bool,
+    /// A packet quiche paced into the future (`SendInfo::at`), held until its
+    /// send time. While one is held, `flush` generates nothing further for
+    /// this connection, so packets leave in order and never early.
+    paced: Option<PacedPacket>,
+}
+
+/// Whether a flush waits for quiche's pacing send times.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pacing {
+    Honour,
+    Ignore,
+}
+
+/// An encoded packet waiting for its pacing send time.
+struct PacedPacket {
+    datagram: PendingDatagram,
+    /// quiche's intended send time, on its own `Instant` clock.
+    at: Instant,
 }
 
 impl QuicConnection {
@@ -147,6 +165,7 @@ impl QuicConnection {
             indexed_reset_token: None,
             last_recv_ms: None,
             sent_keepalive_since_recv: false,
+            paced: None,
         }
     }
 
@@ -246,6 +265,27 @@ impl QuicConnection {
         self.conn.timeout()
     }
 
+    /// Time until a held paced packet is due, if one is held.
+    pub(crate) fn pacing_delay(&self) -> Option<Duration> {
+        self.paced
+            .as_ref()
+            .map(|paced| paced.at.saturating_duration_since(Instant::now()))
+    }
+
+    /// The held paced packet's bytes and send time.
+    #[cfg(test)]
+    pub(crate) fn paced_packet(&self) -> Option<(&[u8], Instant)> {
+        self.paced
+            .as_ref()
+            .map(|paced| (paced.datagram.bytes.as_slice(), paced.at))
+    }
+
+    /// Moves the held paced packet's send time to `at`.
+    #[cfg(test)]
+    pub(crate) fn repace_held_packet(&mut self, at: Instant) {
+        self.paced.as_mut().expect("a held packet").at = at;
+    }
+
     /// When this connection next wants a keepalive poll, if it is quiet.
     pub(crate) fn keepalive_deadline(&self, interval_ms: u64) -> Option<Deadline> {
         if self.state != ConnectionState::Connected || self.sent_keepalive_since_recv {
@@ -291,12 +331,19 @@ impl QuicConnection {
         pending_datagrams: &mut VecDeque<PendingDatagram>,
         max_pending_datagrams: usize,
     ) -> Result<(), TransportError> {
-        if !self.timeout().is_some_and(|timeout| timeout.is_zero()) {
+        let timer_due = self.timeout().is_some_and(|timeout| timeout.is_zero());
+        // A due paced packet counts too: before the handshake completes no
+        // other per-poll path flushes, and `next_deadline` would report it due
+        // on every poll.
+        let paced_due = self.pacing_delay().is_some_and(|delay| delay.is_zero());
+        if !timer_due && !paced_due {
             return Ok(());
         }
 
-        self.conn.on_timeout();
-        self.drain_send_queue(events);
+        if timer_due {
+            self.conn.on_timeout();
+            self.drain_send_queue(events);
+        }
         self.flush(socket, pending_datagrams, max_pending_datagrams)
     }
 
@@ -732,13 +779,66 @@ impl QuicConnection {
         Ok(())
     }
 
-    /// Sends all pending quiche output packets via the UDP socket.
+    /// Sends quiche's output packets via the UDP socket, honouring pacing.
+    ///
+    /// A packet whose `SendInfo::at` is still in the future is held rather
+    /// than sent, and flushing stops there; a later flush sends it first once
+    /// it is due. quiche's clock is `Instant`, so due-ness is judged on it.
     fn flush(
         &mut self,
         socket: &UdpSocket,
         pending_datagrams: &mut VecDeque<PendingDatagram>,
         max_pending_datagrams: usize,
     ) -> Result<(), TransportError> {
+        self.send_output(
+            socket,
+            pending_datagrams,
+            max_pending_datagrams,
+            Pacing::Honour,
+        )
+    }
+
+    /// Sends everything left, held packet first, ignoring pacing.
+    ///
+    /// For a transport being dropped: no later poll would send held packets,
+    /// and a `close` stopped behind one would never tell the peer.
+    pub(crate) fn flush_ignoring_pacing(
+        &mut self,
+        socket: &UdpSocket,
+        pending_datagrams: &mut VecDeque<PendingDatagram>,
+        max_pending_datagrams: usize,
+    ) -> Result<(), TransportError> {
+        self.send_output(
+            socket,
+            pending_datagrams,
+            max_pending_datagrams,
+            Pacing::Ignore,
+        )
+    }
+
+    /// Shared body of `flush` and `flush_ignoring_pacing`: sends any held
+    /// packet, then pulls from quiche until it is done, a packet must wait for
+    /// its send time (under `Pacing::Honour`), or the socket pushes back.
+    fn send_output(
+        &mut self,
+        socket: &UdpSocket,
+        pending_datagrams: &mut VecDeque<PendingDatagram>,
+        max_pending_datagrams: usize,
+        pacing: Pacing,
+    ) -> Result<(), TransportError> {
+        let not_due = |at: Instant| pacing == Pacing::Honour && at > Instant::now();
+        if let Some(paced) = self.paced.take() {
+            // Not due yet, or nowhere to retain it on `WouldBlock`.
+            if not_due(paced.at) || pending_datagrams.len() >= max_pending_datagrams {
+                self.paced = Some(paced);
+                return Ok(());
+            }
+            let PendingDatagram { bytes, destination } = &paced.datagram;
+            if !send_or_retain(socket, bytes, *destination, pending_datagrams) {
+                return Ok(());
+            }
+        }
+
         let mut out = [0u8; SEND_BUF_SIZE];
         loop {
             // `quiche::Connection::send()` advances congestion and loss state.
@@ -761,23 +861,18 @@ impl QuicConnection {
             let packet = out
                 .get(..written)
                 .expect("quiche reports packet lengths within the supplied buffer");
-            match socket.send_to(packet, send_info.to) {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    pending_datagrams.push_back(PendingDatagram {
+            if not_due(send_info.at) {
+                self.paced = Some(PacedPacket {
+                    datagram: PendingDatagram {
                         bytes: packet.to_vec(),
                         destination: send_info.to,
-                    });
-                    break;
-                }
-                // Any other send error (EHOSTUNREACH after a route flap,
-                // ICMP-driven ECONNREFUSED, ...) affects only this
-                // connection's path, so it must not abort the whole
-                // endpoint's poll. Treat the packet as lost -- quiche's
-                // loss recovery retransmits it, and a path that stays dead
-                // ends in this connection's idle timeout. Stop draining so
-                // a dead route is not hammered within one flush.
-                Err(_) => break,
+                    },
+                    at: send_info.at,
+                });
+                break;
+            }
+            if !send_or_retain(socket, packet, send_info.to, pending_datagrams) {
+                break;
             }
         }
         Ok(())
@@ -1004,5 +1099,37 @@ impl QuicConnection {
     /// Checks if a stream id was initiated by the remote side.
     fn is_remote_initiated_stream(&self, stream_id: u64) -> bool {
         !self.is_local_initiated_stream(stream_id)
+    }
+}
+
+/// Sends one packet, retaining it on `WouldBlock` or behind datagrams already
+/// retained, so it never overtakes them. Returns whether the caller should
+/// keep flushing.
+fn send_or_retain(
+    socket: &UdpSocket,
+    packet: &[u8],
+    destination: SocketAddr,
+    pending_datagrams: &mut VecDeque<PendingDatagram>,
+) -> bool {
+    let retain = |pending_datagrams: &mut VecDeque<PendingDatagram>| {
+        pending_datagrams.push_back(PendingDatagram {
+            bytes: packet.to_vec(),
+            destination,
+        });
+        false
+    };
+    if !pending_datagrams.is_empty() {
+        return retain(pending_datagrams);
+    }
+    match socket.send_to(packet, destination) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => retain(pending_datagrams),
+        // Any other send error (EHOSTUNREACH after a route flap,
+        // ICMP-driven ECONNREFUSED, ...) affects only this connection's path,
+        // so it must not abort the whole endpoint's poll. Treat the packet as
+        // lost -- quiche's loss recovery retransmits it, and a path that stays
+        // dead ends in this connection's idle timeout. Stop draining so a dead
+        // route is not hammered within one flush.
+        Err(_) => false,
     }
 }
