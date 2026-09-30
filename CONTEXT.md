@@ -28,6 +28,12 @@ A minimal libp2p implementation in Rust with sans-I/O cores, transport adapters,
 
 **Runtime**: The host a TypeScript SDK app runs on — Node.js or React Native. Runtimes differ in setup and a short list of one-sided extras; the API is otherwise shared. Distinct from the binding shell that serves it.
 
+### Connections
+
+**Connection replacement**: A newer connection to a peer taking the single per-peer connection slot from an older one. The peer never counts as disconnected. Everything that belonged to the old connection ends with it, including its streams and its readiness. _Avoid_: supersede, reconnect
+
+**Peer readiness**: A peer's current connection has completed Identify, so its protocols are known. Readiness belongs to a connection: after a Connection replacement the peer becomes ready again once the new connection is identified.
+
 ### NAT traversal
 
 **Connection attempt**: One application-level effort to reach a peer. It may start several Transport dials, establish a provisional Relayed path, and later upgrade that path, but it has one identity and ends with exactly one terminal outcome: connected, failed, or cancelled. _Avoid_: dial
