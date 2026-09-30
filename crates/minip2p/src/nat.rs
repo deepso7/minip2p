@@ -138,8 +138,20 @@ impl<E: EntropySource> NatDriver<E> {
         core::mem::take(&mut self.named_dials)
     }
 
+    /// Whether the agent still waits on a parked dial; retires it when not.
+    /// See [`NatAgent::deferred_dial_wanted`].
+    #[cfg(feature = "nat")]
+    pub(crate) fn named_dial_wanted(
+        &mut self,
+        token: minip2p_nat::NatToken,
+        sample: PlatformNow,
+    ) -> bool {
+        self.agent.deferred_dial_wanted(token, to_nat_now(sample))
+    }
+
     /// Finishes a parked dial: dials the first resolved address the swarm
-    /// accepts, or reports the resolution failure, then pumps the agent.
+    /// accepts, or reports the resolution failure, then pumps the agent. An
+    /// answer for a dial the agent no longer waits on is dropped.
     #[cfg(feature = "nat")]
     pub(crate) fn named_dial_resolved<T: NatTransport, R: EntropySource>(
         &mut self,
@@ -148,6 +160,9 @@ impl<E: EntropySource> NatDriver<E> {
         swarm: &mut SwarmRuntime<T, R>,
         sample: PlatformNow,
     ) {
+        if !self.named_dial_wanted(token, sample) {
+            return;
+        }
         let result = resolved.and_then(|targets| {
             let mut last = alloc::string::String::from("name resolved to no address");
             for target in targets {

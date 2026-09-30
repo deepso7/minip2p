@@ -893,6 +893,32 @@ fn waiting_attempt_redials_when_the_shared_dial_fails() {
     );
 }
 
+/// A driver that defers a dial (to resolve a name) must not echo it into a
+/// newer flight: once the owner's deadline passes, the dial is retired and a
+/// late result has nowhere to land.
+#[test]
+fn a_deferred_dial_past_its_flight_is_retired_and_its_late_result_ignored() {
+    let mut hk = build(ReservationPolicy::Always, 1, 0);
+    let relay = hk.relay.clone();
+    hk.agent.handle_tick(at(0));
+    let actions = drain_actions(&mut hk.agent);
+    let reserve_dial = dial_token_for(&actions, &relay);
+
+    assert!(hk.agent.deferred_dial_wanted(reserve_dial, at(1)));
+    assert!(!hk.agent.deferred_dial_wanted(reserve_dial, at(3_600_000)));
+    assert!(
+        !hk.agent.deferred_dial_wanted(reserve_dial, at(1)),
+        "a retired dial stays retired"
+    );
+
+    let timeout = hk.agent.next_timeout(3_600_000);
+    hk.agent
+        .dial_result(reserve_dial, Err("lookup failed".into()), at(3_600_000));
+    assert!(drain_actions(&mut hk.agent).is_empty());
+    assert!(hk.agent.poll_event().is_none());
+    assert_eq!(hk.agent.next_timeout(3_600_000), timeout);
+}
+
 #[test]
 fn reserve_dial_failed_event_schedules_backoff() {
     let mut hk = build(ReservationPolicy::Always, 1, 0);

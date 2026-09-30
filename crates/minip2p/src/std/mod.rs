@@ -771,9 +771,9 @@ impl Endpoint {
         }
     }
 
-    /// Starts lookups for NAT dials to named hosts, applies finished
-    /// lookups to Connection attempts and NAT dials, expires due attempts,
-    /// and queues whatever settled.
+    /// Starts lookups for NAT dials to named hosts, expires due attempts,
+    /// applies finished lookups to the Connection attempts and NAT dials
+    /// still waiting on them, and queues whatever settled.
     ///
     /// Runs before every blocking wait, so a lookup is under way before the
     /// driver sleeps, and its answer is applied on the wake it causes.
@@ -782,6 +782,11 @@ impl Endpoint {
         let mut nat_answered = Vec::new();
         #[cfg(feature = "nat")]
         if let Some(nat) = self.nat.as_mut() {
+            // A lookup can outlive the flight that wanted it; retire those so
+            // retries during a stall do not pile up.
+            let now = self.swarm.now();
+            self.nat_dials
+                .retain(|(token, _)| nat.named_dial_wanted(*token, now));
             for (token, addr) in nat.take_named_dials() {
                 match self.resolver.expand(&addr) {
                     Expansion::Resolving => self.nat_dials.push((token, addr)),
@@ -790,6 +795,10 @@ impl Endpoint {
                 }
             }
         }
+        // Expire first: an answer that arrives after an attempt's deadline
+        // must not turn its Timeout into another outcome.
+        let now_ms = self.swarm.now().monotonic_ms;
+        self.connect.tick(self.swarm.runtime_mut(), now_ms);
         let answers = self.resolver.take_answers();
         if !answers.is_empty() {
             self.connect.resolved(
@@ -806,8 +815,6 @@ impl Endpoint {
                     None => true,
                 });
         }
-        let now_ms = self.swarm.now().monotonic_ms;
-        self.connect.tick(self.swarm.runtime_mut(), now_ms);
         #[cfg(feature = "nat")]
         if !nat_answered.is_empty()
             && let Some(nat) = self.nat.as_mut()
@@ -2758,6 +2765,40 @@ mod tests {
             );
         }
         assert!(dialer.connected_peers().is_empty());
+    }
+
+    #[test]
+    fn an_answer_after_the_deadline_leaves_the_attempt_timed_out() {
+        let mut dialer = Endpoint::builder()
+            .connect_deadline(Duration::from_millis(50))
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1")
+            .expect("quic listen address")
+            .bind()
+            .expect("bind");
+        let (lookup, started, answer) = stalling_lookup();
+        with_lookup(&mut dialer, lookup);
+        let target = PeerAddr::new(
+            "/dns/slow.invalid/udp/4001/quic-v1".parse().expect("addr"),
+            Ed25519Keypair::generate().peer_id(),
+        )
+        .expect("peer addr");
+
+        let id = dialer.connect(target).expect("connect");
+        started.recv().expect("lookup started");
+        // The answer lands past the deadline but before the next poll: the
+        // attempt already ran out of time, so the answer must not decide it.
+        std::thread::sleep(Duration::from_millis(100));
+        answer
+            .send(Err("NXDOMAIN".to_string()))
+            .expect("lookup waiting");
+        // Give the lookup thread time to queue its answer.
+        std::thread::sleep(Duration::from_millis(50));
+        match connect_outcome(&mut dialer, id) {
+            ConnectOutcome::Failed(ConnectFailure::Timeout { candidates, .. }) => {
+                assert!(candidates[0].reason.contains("resolving"), "{candidates:?}");
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
     }
 
     #[test]
