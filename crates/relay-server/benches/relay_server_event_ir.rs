@@ -120,6 +120,23 @@ fn source_conn(index: u64) -> ConnectionId {
     ConnectionId::new(RESERVATIONS + index + 1)
 }
 
+/// Establishes a connection from its own IPv4 address, so both the per-peer
+/// and per-IP admission limiters see every peer.
+fn establish(agent: &mut RelayServerAgent, peer_id: &PeerId, conn_id: ConnectionId, now: Now) {
+    agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            peer_id: peer_id.clone(),
+            conn_id,
+        },
+        false,
+        now,
+    );
+    let [a, b] = (conn_id.as_u64() as u16).to_be_bytes();
+    let address =
+        Multiaddr::from_str(&format!("/ip4/10.0.{a}.{b}/tcp/4001")).expect("valid multiaddr");
+    agent.set_connection_addr(conn_id, address);
+}
+
 fn hop_frame(kind: HopMessageType, peer: Option<&PeerId>) -> Vec<u8> {
     encode_frame(
         &HopMessage {
@@ -186,14 +203,7 @@ fn reserve(agent: &mut RelayServerAgent, index: u64, now: Now) {
         conn_id: reserved_conn(index),
         stream_id: StreamId::new(HOP_STREAM),
     };
-    agent.handle_event(
-        &SwarmEvent::ConnectionEstablished {
-            peer_id: peer_id.clone(),
-            conn_id: stream.conn_id,
-        },
-        false,
-        now,
-    );
+    establish(agent, &peer_id, stream.conn_id, now);
     open_hop(agent, &peer_id, stream, now);
     let request = stream_data(&peer_id, stream, hop_frame(HopMessageType::Reserve, None));
     assert!(agent.handle_event(&request, false, now));
@@ -279,12 +289,10 @@ fn scale_agent() -> RelayServerAgent {
         );
     }
     for source in 0..SOURCES {
-        agent.handle_event(
-            &SwarmEvent::ConnectionEstablished {
-                peer_id: peer("source", source),
-                conn_id: source_conn(source),
-            },
-            false,
+        establish(
+            &mut agent,
+            &peer("source", source),
+            source_conn(source),
             NOW,
         );
         for slot in 0..CIRCUITS_PER_SOURCE {
@@ -306,14 +314,7 @@ fn scale_agent_with_new_reserver() -> (RelayServerAgent, SwarmEvent) {
         conn_id: ConnectionId::new(RESERVATIONS + SOURCES + 1),
         stream_id: StreamId::new(HOP_STREAM),
     };
-    agent.handle_event(
-        &SwarmEvent::ConnectionEstablished {
-            peer_id: peer_id.clone(),
-            conn_id: stream.conn_id,
-        },
-        false,
-        NOW,
-    );
+    establish(&mut agent, &peer_id, stream.conn_id, NOW);
     open_hop(&mut agent, &peer_id, stream, NOW);
     let request = stream_data(&peer_id, stream, hop_frame(HopMessageType::Reserve, None));
     (agent, request)
@@ -363,6 +364,7 @@ fn assert_reservation_accepted((mut agent, _request): (RelayServerAgent, SwarmEv
         Some(RelayServerEvent::ReservationAccepted { renewed: false, .. })
     ));
     assert_eq!(agent.reservation_count(), RESERVATIONS as usize + 1);
+    assert!(agent.is_idle());
 }
 
 fn assert_circuits_torn_down((mut agent, _closed): (RelayServerAgent, SwarmEvent)) {
@@ -383,6 +385,17 @@ fn assert_circuits_torn_down((mut agent, _closed): (RelayServerAgent, SwarmEvent
         (RESERVATIONS - CIRCUITS_PER_SOURCE) as usize
     );
     assert_eq!(agent.reservation_count(), RESERVATIONS as usize);
+    // Each torn-down circuit resets its surviving destination leg.
+    let mut resets = 0;
+    while let Some(action) = agent.poll_action() {
+        let RelayServerAction::ResetStream { token, .. } = action else {
+            continue;
+        };
+        agent.reset_stream_result(token, Ok(()), NOW);
+        resets += 1;
+    }
+    assert_eq!(resets, CIRCUITS_PER_SOURCE);
+    assert!(agent.is_idle());
 }
 
 // Each benchmark returns its inputs so their drop and the assertions in
