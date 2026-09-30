@@ -17,6 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use minip2p_core::{Multiaddr, PeerAddr, Protocol};
@@ -148,7 +149,8 @@ fn invalid(reason: impl Into<String>) -> String {
 /// What a lookup produced: the host's IP addresses, or the resolver's error.
 pub(crate) type Answer = Result<Vec<IpAddr>, String>;
 
-/// Distinct names that may be looking up at once; one thread each.
+/// Lookup threads that may be blocked in the resolver at once, one per
+/// distinct name.
 const MAX_IN_FLIGHT_LOOKUPS: usize = 32;
 
 /// A blocking name lookup. Swappable only inside the crate, so tests can
@@ -175,6 +177,9 @@ pub(crate) struct Resolver {
     wake: WaitHandle,
     /// Names with a lookup thread running or an answer not yet taken.
     in_flight: BTreeSet<String>,
+    /// Lookup threads still blocked in the resolver; what the cap counts.
+    /// An answered name leaves this at once, before its answer is taken.
+    running: Arc<AtomicUsize>,
     answers_tx: Sender<(String, Answer)>,
     answers_rx: Receiver<(String, Answer)>,
 }
@@ -192,6 +197,7 @@ impl Resolver {
             lookup,
             wake,
             in_flight: BTreeSet::new(),
+            running: Arc::default(),
             answers_tx,
             answers_rx,
         }
@@ -217,9 +223,9 @@ impl Resolver {
             return Ok(());
         }
         // A stalled resolver holds its thread until the OS gives up, so the
-        // number of distinct names in flight is capped rather than trusted
-        // to whatever candidates discovery or the application supplies.
-        if self.in_flight.len() >= MAX_IN_FLIGHT_LOOKUPS {
+        // number of lookup threads is capped rather than trusted to whatever
+        // candidates discovery or the application supplies.
+        if self.running.load(Ordering::SeqCst) >= MAX_IN_FLIGHT_LOOKUPS {
             return Err(format!(
                 "not looking up {host}: {MAX_IN_FLIGHT_LOOKUPS} dns lookups are already in flight"
             ));
@@ -227,18 +233,24 @@ impl Resolver {
         let lookup = Arc::clone(&self.lookup);
         let answers = self.answers_tx.clone();
         let wake = self.wake.clone();
+        let running = Arc::clone(&self.running);
         let name = host.to_owned();
+        running.fetch_add(1, Ordering::SeqCst);
         std::thread::Builder::new()
             .name("minip2p-dns".into())
             .spawn(move || {
                 let answer = lookup(&name);
+                running.fetch_sub(1, Ordering::SeqCst);
                 // A closed channel means the endpoint is gone and nobody
                 // is waiting for this answer.
                 if answers.send((name, answer)).is_ok() {
                     wake.interrupt();
                 }
             })
-            .map_err(|error| format!("could not start a dns lookup for {host}: {error}"))?;
+            .map_err(|error| {
+                self.running.fetch_sub(1, Ordering::SeqCst);
+                format!("could not start a dns lookup for {host}: {error}")
+            })?;
         self.in_flight.insert(host.to_owned());
         Ok(())
     }
@@ -425,6 +437,15 @@ mod tests {
             ),
             "a name already in flight still joins its lookup"
         );
+
+        // Finished lookups free their slots before their answers are taken.
         drop(release_tx);
+        while resolver.running.load(Ordering::SeqCst) > 0 {
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            resolver.expand(&peer_addr("/dns/one-more.invalid/tcp/4001")),
+            Expansion::Resolving
+        ));
     }
 }
