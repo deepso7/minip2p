@@ -7,6 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
+use minip2p_core::PeerId;
 use minip2p_platform::{Deadline, Now};
 use minip2p_transport::{
     ConnectionEndpoint, ConnectionId, ConnectionState, StreamId, TransportError, TransportEvent,
@@ -15,6 +16,14 @@ use minip2p_transport::{
 use crate::PendingDatagram;
 
 const SEND_BUF_SIZE: usize = 1350;
+
+/// Why a handshaken peer's identity was rejected: the QUIC close code and
+/// reason sent to the peer, and the message reported to the local caller.
+struct PeerRejection {
+    code: u64,
+    reason: &'static [u8],
+    message: String,
+}
 
 /// A queued write operation for a QUIC stream.
 #[derive(Debug)]
@@ -391,62 +400,17 @@ impl QuicConnection {
             self.flush(socket, pending_datagrams, max_pending_datagrams)?;
 
             // Auto-verify the remote peer's identity from their TLS certificate.
-            let Some(peer_cert_der) = self.conn.peer_cert() else {
-                events.push(TransportEvent::Error {
-                    id: self.id,
-                    message: "peer TLS certificate missing".into(),
-                });
-                if let Err(error) = self.conn.close(true, 0x03, b"peer certificate missing") {
+            match self.verify_peer_identity(crate::unix_time()) {
+                Ok(verified_peer_id) => self.endpoint.set_peer_id(verified_peer_id),
+                Err(rejection) => {
                     events.push(TransportEvent::Error {
                         id: self.id,
-                        message: format!("failed to close after missing peer certificate: {error}"),
+                        message: rejection.message,
                     });
-                }
-                self.state = ConnectionState::Closing;
-                self.flush(socket, pending_datagrams, max_pending_datagrams)?;
-                return Ok(());
-            };
-
-            match minip2p_tls::verify_libp2p_certificate(peer_cert_der) {
-                Ok(verified_peer_id) => {
-                    // If the dialer specified an expected PeerId (via PeerAddr),
-                    // reject the connection if the verified identity doesn't match.
-                    if let Some(expected) = self.endpoint.peer_id()
-                        && *expected != verified_peer_id
-                    {
+                    if let Err(error) = self.conn.close(true, rejection.code, rejection.reason) {
                         events.push(TransportEvent::Error {
                             id: self.id,
-                            message: format!(
-                                "peer id mismatch: dialed {expected} but server certificate proves {verified_peer_id}"
-                            ),
-                        });
-                        // Close the connection — the peer is not who we expected.
-                        if let Err(error) = self.conn.close(true, 0x01, b"peer id mismatch") {
-                            events.push(TransportEvent::Error {
-                                id: self.id,
-                                message: format!("failed to close after peer id mismatch: {error}"),
-                            });
-                        }
-                        self.state = ConnectionState::Closing;
-                        self.flush(socket, pending_datagrams, max_pending_datagrams)?;
-                        return Ok(());
-                    }
-                    self.endpoint.set_peer_id(verified_peer_id);
-                }
-                Err(e) => {
-                    events.push(TransportEvent::Error {
-                        id: self.id,
-                        message: format!("peer TLS certificate verification failed: {e}"),
-                    });
-                    if let Err(error) =
-                        self.conn
-                            .close(true, 0x02, b"certificate verification failed")
-                    {
-                        events.push(TransportEvent::Error {
-                            id: self.id,
-                            message: format!(
-                                "failed to close after certificate verification: {error}"
-                            ),
+                            message: format!("failed to close rejected peer connection: {error}"),
                         });
                     }
                     self.state = ConnectionState::Closing;
@@ -465,6 +429,57 @@ impl QuicConnection {
         }
 
         Ok(())
+    }
+
+    /// Checks the handshaken peer's libp2p identity: exactly one certificate
+    /// (the libp2p TLS spec forbids chains), a valid libp2p certificate at
+    /// `now` (wall-clock time since the Unix epoch), and the expected
+    /// `PeerId` when the dialer named one.
+    fn verify_peer_identity(&self, now: Duration) -> Result<PeerId, PeerRejection> {
+        // quiche lists the leaf first on both the dialer and listener sides.
+        let chain = self.conn.peer_cert_chain().unwrap_or_default();
+        let leaf = match chain.as_slice() {
+            [] => {
+                return Err(PeerRejection {
+                    code: 0x03,
+                    reason: b"peer certificate missing",
+                    message: "peer TLS certificate missing".into(),
+                });
+            }
+            [leaf] => *leaf,
+            certs => {
+                return Err(PeerRejection {
+                    code: 0x04,
+                    reason: b"peer certificate chain rejected",
+                    message: format!(
+                        "peer presented {} certificates; libp2p TLS requires exactly one",
+                        certs.len()
+                    ),
+                });
+            }
+        };
+
+        let verified =
+            minip2p_tls::verify_libp2p_certificate(leaf, now).map_err(|e| PeerRejection {
+                code: 0x02,
+                reason: b"certificate verification failed",
+                message: format!("peer TLS certificate verification failed: {e}"),
+            })?;
+
+        // If the dialer specified an expected PeerId (via PeerAddr), the
+        // peer must be exactly that identity.
+        if let Some(expected) = self.endpoint.peer_id()
+            && *expected != verified
+        {
+            return Err(PeerRejection {
+                code: 0x01,
+                reason: b"peer id mismatch",
+                message: format!(
+                    "peer id mismatch: dialed {expected} but server certificate proves {verified}"
+                ),
+            });
+        }
+        Ok(verified)
     }
 
     pub fn open_stream(&mut self) -> Result<StreamId, TransportError> {

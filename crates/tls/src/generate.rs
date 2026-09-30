@@ -8,7 +8,7 @@
 //! The core function [`generate_certificate_with_rng`] is `no_std + alloc`
 //! compatible — the caller provides the validity period and CSPRNG. The
 //! [`generate_certificate`] convenience wrapper (requires `std`) fills in
-//! OS randomness and a 100-year validity window.
+//! OS randomness and a validity window from one hour ago to 100 years out.
 
 use alloc::format;
 use alloc::vec;
@@ -30,7 +30,11 @@ use x509_cert::time::Validity;
 use crate::{SIGNATURE_PREFIX, TlsError};
 
 /// Generates a libp2p TLS certificate from an Ed25519 host keypair using OS
-/// randomness and a 100-year validity window.
+/// randomness and a validity window from one hour ago to 100 years from now.
+///
+/// NotBefore is backdated (as go-libp2p does) because verifiers reject a
+/// certificate that is not yet valid: without the margin, a peer whose clock
+/// runs slightly behind ours would reject a freshly generated certificate.
 ///
 /// This is a convenience wrapper around [`generate_certificate_with_rng`].
 ///
@@ -39,8 +43,20 @@ use crate::{SIGNATURE_PREFIX, TlsError};
 /// ephemeral private key.
 #[cfg(feature = "std")]
 pub fn generate_certificate(keypair: &Ed25519Keypair) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
-    let validity = Validity::from_now(core::time::Duration::from_secs(100 * 365 * 24 * 60 * 60))
-        .map_err(|e| TlsError::CertificateGeneration(format!("{e}")))?;
+    use core::time::Duration;
+    use x509_cert::time::Time;
+
+    const CLOCK_SKEW_MARGIN: Duration = Duration::from_secs(60 * 60);
+    const LIFETIME: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
+    let gen_err = |e: der::Error| TlsError::CertificateGeneration(format!("{e}"));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| TlsError::CertificateGeneration(format!("system clock: {e}")))?;
+    let not_before = der::DateTime::from_unix_duration(now.saturating_sub(CLOCK_SKEW_MARGIN))
+        .map_err(gen_err)?;
+    let not_after = der::DateTime::from_unix_duration(now + LIFETIME).map_err(gen_err)?;
+    let validity = Validity::new(Time::from(not_before), Time::from(not_after));
     let mut rng = rand_core::UnwrapErr(getrandom::SysRng);
     generate_certificate_with_rng(keypair, validity, &mut rng)
 }
@@ -57,6 +73,18 @@ pub fn generate_certificate_with_rng(
     keypair: &Ed25519Keypair,
     validity: Validity,
     rng: &mut (impl CryptoRng + ?Sized),
+) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
+    build_certificate(keypair, validity, rng, &[])
+}
+
+/// Builds a libp2p TLS certificate carrying `extra_extensions` after the
+/// libp2p extension. Production callers pass none; tests use it to craft
+/// certificates the verifier must reject.
+pub(crate) fn build_certificate(
+    keypair: &Ed25519Keypair,
+    validity: Validity,
+    rng: &mut (impl CryptoRng + ?Sized),
+    extra_extensions: &[Extension],
 ) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
     use p256::pkcs8::EncodePrivateKey;
 
@@ -97,6 +125,9 @@ pub fn generate_certificate_with_rng(
         .map_err(gen_err)?;
 
     builder.add_extension(&libp2p_ext).map_err(gen_err)?;
+    for extension in extra_extensions {
+        builder.add_extension(extension.clone()).map_err(gen_err)?;
+    }
 
     let cert = builder
         .build::<_, ecdsa::der::Signature<p256::NistP256>>(&ephemeral_signing_key)
@@ -217,48 +248,13 @@ impl der::Encode for Libp2pExtension {
 
 #[cfg(test)]
 mod tests {
-    use core::{convert::Infallible, time::Duration};
+    use core::time::Duration;
 
-    use rand_core::{TryCryptoRng, TryRng};
     use x509_cert::time::Time;
 
     use super::*;
+    use crate::test_rng::TestRng;
     use crate::verify::verify_libp2p_certificate;
-
-    struct TestRng(u64);
-
-    impl TestRng {
-        fn new(seed: u64) -> Self {
-            Self(seed)
-        }
-    }
-
-    impl TryRng for TestRng {
-        type Error = Infallible;
-
-        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
-            Ok(self.try_next_u64()? as u32)
-        }
-
-        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            Ok(self.0)
-        }
-
-        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
-            for chunk in dest.chunks_mut(8) {
-                let bytes = self.try_next_u64()?.to_le_bytes();
-                let len = chunk.len();
-                chunk.copy_from_slice(&bytes[..len]);
-            }
-            Ok(())
-        }
-    }
-
-    impl TryCryptoRng for TestRng {}
 
     fn test_validity() -> Validity {
         let not_before = der::DateTime::from_unix_duration(Duration::from_secs(1_600_000_000))
@@ -269,7 +265,7 @@ mod tests {
     }
 
     fn generate_test_certificate(keypair: &Ed25519Keypair, seed: u64) -> (Vec<u8>, Vec<u8>) {
-        let mut rng = TestRng::new(seed);
+        let mut rng = TestRng(seed);
         generate_certificate_with_rng(keypair, test_validity(), &mut rng).expect("must generate")
     }
 
@@ -278,7 +274,8 @@ mod tests {
         let keypair = Ed25519Keypair::from_secret_key_bytes([7u8; 32]);
         let (cert_der, _key_der) = generate_test_certificate(&keypair, 1);
 
-        let peer_id = verify_libp2p_certificate(&cert_der).expect("must verify");
+        let peer_id = verify_libp2p_certificate(&cert_der, Duration::from_secs(1_700_000_000))
+            .expect("must verify");
         assert_eq!(peer_id, keypair.peer_id());
     }
 
@@ -290,11 +287,26 @@ mod tests {
         let (cert1, _) = generate_test_certificate(&kp1, 11);
         let (cert2, _) = generate_test_certificate(&kp2, 22);
 
-        let pid1 = verify_libp2p_certificate(&cert1).unwrap();
-        let pid2 = verify_libp2p_certificate(&cert2).unwrap();
+        let pid1 = verify_libp2p_certificate(&cert1, Duration::from_secs(1_700_000_000)).unwrap();
+        let pid2 = verify_libp2p_certificate(&cert2, Duration::from_secs(1_700_000_000)).unwrap();
 
         assert_ne!(pid1, pid2);
         assert_eq!(pid1, kp1.peer_id());
         assert_eq!(pid2, kp2.peer_id());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn generated_certificate_accepts_verifier_clock_slightly_behind() {
+        let keypair = Ed25519Keypair::from_secret_key_bytes([5u8; 32]);
+        let (cert_der, _) = generate_certificate(&keypair).expect("must generate");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+
+        let peer_id =
+            verify_libp2p_certificate(&cert_der, now.saturating_sub(Duration::from_secs(30 * 60)))
+                .expect("a verifier 30 minutes behind must accept a fresh certificate");
+        assert_eq!(peer_id, keypair.peer_id());
     }
 }

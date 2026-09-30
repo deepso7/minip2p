@@ -64,11 +64,15 @@ const RETRY_TOKEN_MAX_LEN: usize =
 
 type RetryHmac = Hmac<Sha256>;
 
-fn unix_time_secs() -> u64 {
+/// Wall-clock time since the Unix epoch, or zero if the clock reads earlier.
+fn unix_time() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+        .unwrap_or_default()
+}
+
+fn unix_time_secs() -> u64 {
+    unix_time().as_secs()
 }
 
 fn retry_address_bytes(addr: SocketAddr) -> ([u8; RETRY_TOKEN_MAX_ADDRESS_LEN], usize) {

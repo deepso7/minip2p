@@ -70,7 +70,7 @@ What the adapter _does_ guarantee is that nothing quiche's clock touches leaks i
 
 ## Authentication Notes
 
-- QUIC handshakes require mutual TLS. A peer that omits a certificate or presents a certificate without the libp2p public-key extension is rejected before `Connected` is emitted.
-- The TLS backend only handles the wire handshake. libp2p identity verification is performed by `minip2p-tls` after quiche exposes the peer certificate.
-- `minip2p-tls` currently accepts Ed25519 host-key signatures for verified peers.
+- QUIC handshakes require mutual TLS. A peer that omits a certificate, presents a chain of more than one certificate, or presents a certificate that fails libp2p verification is rejected and the connection closed before `Connected` is emitted.
+- The TLS backend only handles the wire handshake. libp2p identity verification is performed by `minip2p-tls` after quiche exposes the peer certificate, against the local wall-clock time, so a badly wrong system clock makes peers' certificates look expired or not yet valid.
+- `minip2p-tls` verifies Ed25519 and ECDSA P-256 host keys; secp256k1 and RSA peers are rejected.
 - `IncomingConnection` is pre-auth and may be emitted before certificate verification finishes. Treat `Connected` or `PeerIdentityVerified` as the authenticated connection signal.
