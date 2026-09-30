@@ -156,8 +156,9 @@ class BenchResultsTest(unittest.TestCase):
             source.write_text(json.dumps({"schema_version": 1, "git_sha": "sha", "rows": rows}))
             bench_results.merge([source], output, None)
             self.assertEqual(len(json.loads(output.read_text())["rows"]), 3)
-        with self.assertRaisesRegex(bench_results.BenchError, "unknown metric 'furlongs'"):
-            bench_results.validate({"schema_version": 1, "git_sha": "sha", "rows": [{**rows[0], "metric": "furlongs"}]})
+        for metric in ("furlongs", []):
+            with self.subTest(metric=metric), self.assertRaisesRegex(bench_results.BenchError, "unknown metric"):
+                bench_results.validate({"schema_version": 1, "git_sha": "sha", "rows": [{**rows[0], "metric": metric}]})
 
     def test_fixture_compare_cli_writes_locked_markdown(self):
         with tempfile.TemporaryDirectory() as directory:

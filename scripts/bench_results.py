@@ -107,7 +107,7 @@ def validate(document: Any) -> dict[str, Any]:
             raise BenchError(f"row {index} has unknown tier {tier!r}")
         if not isinstance(name, str) or not name:
             raise BenchError(f"row {index} requires a non-empty name")
-        if metric not in METRICS:
+        if not isinstance(metric, str) or metric not in METRICS:
             raise BenchError(f"row {index} has unknown metric {metric!r}")
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise BenchError(f"row {index} requires a finite non-negative value")
@@ -234,13 +234,11 @@ def collect_custom(root: Path, output: Path, git_sha: str, since: Path) -> None:
         if not isinstance(document, list):
             raise BenchError(f"custom rows file must hold a JSON array: {path}")
         rows.extend(document)
-    try:
-        keys = [(row["tier"], row["name"], row["metric"]) for row in rows]
-    except (KeyError, TypeError) as error:
-        raise BenchError(f"invalid custom row: {error!r}") from error
-    if set(keys) != EXPECTED_CUSTOM:
-        missing = sorted(EXPECTED_CUSTOM - set(keys))
-        unexpected = sorted(set(keys) - EXPECTED_CUSTOM)
+    validate({"schema_version": SCHEMA_VERSION, "git_sha": git_sha, "rows": rows})
+    keys = {(row["tier"], row["name"], row["metric"]) for row in rows}
+    if keys != EXPECTED_CUSTOM:
+        missing = sorted(EXPECTED_CUSTOM - keys)
+        unexpected = sorted(keys - EXPECTED_CUSTOM)
         raise BenchError(f"custom row set mismatch; missing={missing}, unexpected={unexpected}")
     write_results(git_sha, rows, output)
 
