@@ -1749,6 +1749,18 @@ impl Drop for QuicTransport {
                 Ok(()) | Err(_) => {}
             }
         }
+        // Nothing polls after this, so packets still held for pacing -- and
+        // any CONNECTION_CLOSE queued behind them -- leave now.
+        let max_pending_datagrams = self.node_config.limits().max_pending_datagrams;
+        for conn in self.connections.values_mut() {
+            match conn.flush_ignoring_pacing(
+                &self.socket,
+                &mut self.pending_datagrams,
+                max_pending_datagrams,
+            ) {
+                Ok(()) | Err(_) => {}
+            }
+        }
         if self.flush_pending_datagrams().is_err() {
             self.pending_datagrams.clear();
         }

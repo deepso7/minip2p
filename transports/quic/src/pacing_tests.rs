@@ -107,3 +107,24 @@ fn held_packets_leave_in_order_and_never_early() {
     assert!(Instant::now() >= at, "a paced packet left early");
     assert_eq!(first, held, "the held packet must be the first to leave");
 }
+
+#[test]
+fn dropping_the_transport_sends_held_packets_at_once() {
+    let (mut server, peer, id, _) = paced_burst();
+    let (held, _) = server.connections[&id]
+        .paced_packet()
+        .map(|(bytes, at)| (bytes.to_vec(), at))
+        .expect("held packet");
+    server
+        .connections
+        .get_mut(&id)
+        .expect("connection")
+        .repace_held_packet(Instant::now() + Duration::from_secs(60));
+    while recv_raw(&peer).is_some() {}
+
+    // No poll follows a drop, so pacing must not strand the held packet or
+    // the CONNECTION_CLOSE queued behind it.
+    drop(server);
+    assert_eq!(recv_raw(&peer), Some(held), "the held packet leaves first");
+    assert!(recv_raw(&peer).is_some(), "the close follows it");
+}

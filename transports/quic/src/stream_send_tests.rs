@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
-pub(crate) static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 pub(crate) fn now() -> Now {
     Now::from_millis(EPOCH.elapsed().as_millis() as u64)
@@ -17,7 +17,7 @@ pub(crate) fn now() -> Now {
 
 /// A quiche client on its own loopback socket, pumped by hand.
 pub(crate) struct RawPeer {
-    pub(crate) conn: quiche::Connection,
+    conn: quiche::Connection,
     pub(crate) socket: UdpSocket,
 }
 
@@ -39,7 +39,7 @@ impl RawPeer {
 
     /// Receives everything queued on the socket, services timers, and sends
     /// whatever quiche has to say.
-    pub(crate) fn pump(&mut self) {
+    fn pump(&mut self) {
         let mut buf = [0u8; 65535];
         let local = self.socket.local_addr().expect("client addr");
         while let Ok((len, from)) = self.socket.recv_from(&mut buf) {

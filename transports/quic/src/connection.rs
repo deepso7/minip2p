@@ -125,6 +125,13 @@ pub struct QuicConnection {
     paced: Option<PacedPacket>,
 }
 
+/// Whether a flush waits for quiche's pacing send times.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pacing {
+    Honour,
+    Ignore,
+}
+
 /// An encoded packet waiting for its pacing send time.
 struct PacedPacket {
     datagram: PendingDatagram,
@@ -324,12 +331,19 @@ impl QuicConnection {
         pending_datagrams: &mut VecDeque<PendingDatagram>,
         max_pending_datagrams: usize,
     ) -> Result<(), TransportError> {
-        if !self.timeout().is_some_and(|timeout| timeout.is_zero()) {
+        let timer_due = self.timeout().is_some_and(|timeout| timeout.is_zero());
+        // A due paced packet counts too: before the handshake completes no
+        // other per-poll path flushes, and `next_deadline` would report it due
+        // on every poll.
+        let paced_due = self.pacing_delay().is_some_and(|delay| delay.is_zero());
+        if !timer_due && !paced_due {
             return Ok(());
         }
 
-        self.conn.on_timeout();
-        self.drain_send_queue(events);
+        if timer_due {
+            self.conn.on_timeout();
+            self.drain_send_queue(events);
+        }
         self.flush(socket, pending_datagrams, max_pending_datagrams)
     }
 
@@ -776,9 +790,43 @@ impl QuicConnection {
         pending_datagrams: &mut VecDeque<PendingDatagram>,
         max_pending_datagrams: usize,
     ) -> Result<(), TransportError> {
+        self.send_output(
+            socket,
+            pending_datagrams,
+            max_pending_datagrams,
+            Pacing::Honour,
+        )
+    }
+
+    /// Sends everything left, held packet first, ignoring pacing.
+    ///
+    /// For a transport being dropped: no later poll would send held packets,
+    /// and a `close` stopped behind one would never tell the peer.
+    pub(crate) fn flush_ignoring_pacing(
+        &mut self,
+        socket: &UdpSocket,
+        pending_datagrams: &mut VecDeque<PendingDatagram>,
+        max_pending_datagrams: usize,
+    ) -> Result<(), TransportError> {
+        self.send_output(
+            socket,
+            pending_datagrams,
+            max_pending_datagrams,
+            Pacing::Ignore,
+        )
+    }
+
+    fn send_output(
+        &mut self,
+        socket: &UdpSocket,
+        pending_datagrams: &mut VecDeque<PendingDatagram>,
+        max_pending_datagrams: usize,
+        pacing: Pacing,
+    ) -> Result<(), TransportError> {
+        let not_due = |at: Instant| pacing == Pacing::Honour && at > Instant::now();
         if let Some(paced) = self.paced.take() {
             // Not due yet, or nowhere to retain it on `WouldBlock`.
-            if paced.at > Instant::now() || pending_datagrams.len() >= max_pending_datagrams {
+            if not_due(paced.at) || pending_datagrams.len() >= max_pending_datagrams {
                 self.paced = Some(paced);
                 return Ok(());
             }
@@ -810,7 +858,7 @@ impl QuicConnection {
             let packet = out
                 .get(..written)
                 .expect("quiche reports packet lengths within the supplied buffer");
-            if send_info.at > Instant::now() {
+            if not_due(send_info.at) {
                 self.paced = Some(PacedPacket {
                     datagram: PendingDatagram {
                         bytes: packet.to_vec(),
