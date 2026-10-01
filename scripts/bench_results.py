@@ -45,6 +45,8 @@ EXPECTED_CRITERION = {
     "peer_book_128_peers_16_addrs/tick_active", "peer_book_128_peers_16_addrs/tick_expire",
     "peer_book_128_peers_16_addrs/next_timeout",
     "pubsub/gossipsub_publish_32x60KiB",
+    "pubsub/gossipsub_forward_1KiB/8", "pubsub/gossipsub_forward_1KiB/32",
+    "pubsub/gossipsub_forward_1KiB/128", "pubsub/gossipsub_heartbeat_1000_peers_100_topics",
     "relay_handle_event_same_now_128_pending_hops",
     "quic/idle_poll/1", "quic/idle_poll/64", "quic/idle_poll/256", "quic/idle_poll/512",
     "tcp/readiness_poll/1", "tcp/readiness_poll/64", "tcp/readiness_poll/256", "tcp/readiness_poll/512",
@@ -63,6 +65,10 @@ GUNGRAUN_NAMES = {
     "tick_expire": "peer_book_128_peers_16_addrs/tick_expire",
     "next_timeout": "peer_book_128_peers_16_addrs/next_timeout",
     "gossipsub_publish_32x60_kib": "pubsub/gossipsub_publish_32x60KiB",
+    "gossipsub_forward_1_kib_8": "pubsub/gossipsub_forward_1KiB/8",
+    "gossipsub_forward_1_kib_32": "pubsub/gossipsub_forward_1KiB/32",
+    "gossipsub_forward_1_kib_128": "pubsub/gossipsub_forward_1KiB/128",
+    "gossipsub_heartbeat_1000_peers_100_topics": "pubsub/gossipsub_heartbeat_1000_peers_100_topics",
     "relay_handle_event_same_now_128_pending_hops": "relay_handle_event_same_now_128_pending_hops",
     "relay_1k_next_timeout": "relay_server_1k/next_timeout",
     "relay_1k_tick_idle": "relay_server_1k/tick_idle",
@@ -74,7 +80,11 @@ EXPECTED_VITEST = {"sdk_drain_flood", "raw_drain_events", "connected_peers_sync"
 # Rows a bench measures itself (for example throughput or allocations), keyed by
 # (tier, name, metric). Each such bench writes a JSON array of rows into the
 # `custom` collector's root; list every row it emits here.
-EXPECTED_CUSTOM: set[tuple[str, str, str]] = set()
+EXPECTED_CUSTOM: set[tuple[str, str, str]] = {
+    ("rust-micro", f"pubsub/gossipsub_forward_1KiB/{n}", metric)
+    for n in (8, 32, 128)
+    for metric in ("allocs_per_msg", "bytes_allocated_per_msg")
+}
 IR_PINS = {
     "rust": "Rust toolchain",
     "profile": "optimization profile",

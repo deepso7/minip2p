@@ -34,3 +34,17 @@ This is deliberately a focused compatibility implementation, not a claim of comp
 Messages use libp2p StrictSign by default: Ed25519 over `"libp2p-pubsub:" ++ Message`, with `signature` and `key` omitted and the decoded fields canonically re-encoded. The wire message is preserved verbatim for forwarding. minip2p omits the key field because its Ed25519 public key is recoverable from the inline peer id.
 
 Delivered `GossipsubEvent::Message` values include a `signed` flag. It is true only when a signature was present and verified. With `allow_unsigned`, accepted unsigned messages carry `signed = false`, so higher-level protocols can still require authentication independently of the router policy.
+
+## Benchmarks
+
+Fixtures live in `benches/common.rs`; every measurement uses a fresh one built outside the measured region.
+
+- `publish` / `publish_ir`: a local 60 KiB publish to a 32-peer mesh.
+- `router` / `router_ir`: forwarding one fresh, StrictSigned 1 KiB message, delivered and authored by a mesh peer, to the other N−1 peers of an N = 8, 32 or 128 mesh, from handing the inbound frame to the agent through draining its actions; and one heartbeat at 1,000 peers and 100 topics with 500 cached messages over 5 history windows. Each run asserts the forward reached exactly the non-source mesh peers, or that the heartbeat ran and gossiped the 3 newest windows.
+- `router_allocs`: heap allocations and bytes allocated over the same forwarding boundary, counted by `stats_alloc` as the binary's global allocator.
+
+```bash
+cargo bench -p minip2p-pubsub --bench router
+cargo bench -p minip2p-pubsub --bench router_allocs
+cargo bench -p minip2p-pubsub --bench router_ir   # needs Valgrind
+```
