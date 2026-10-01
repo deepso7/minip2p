@@ -122,14 +122,17 @@ fn spawn_sink(target: Endpoint, client: &Endpoint) -> (Driven, Progress) {
     (driven, Progress { received, done })
 }
 
-/// Whether a refused write is backpressure (retry later) rather than failure.
+/// Whether a refused write is backpressure (retry later) rather than failure:
+/// QUIC's full write queue, or a full Yamux send buffer (TCP and circuits),
+/// which reaches the Endpoint only as a `StreamSendFailed` reason.
 fn is_backpressure(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::Transport(
-            TransportError::ResourceExhausted { .. } | TransportError::StreamSendFailed { .. }
-        )
-    )
+    match error {
+        Error::Transport(TransportError::ResourceExhausted { .. }) => true,
+        Error::Transport(TransportError::StreamSendFailed { reason, .. }) => {
+            reason.contains("send buffer is full")
+        }
+        _ => false,
+    }
 }
 
 /// Opens a stream and moves [`TOTAL`] bytes over it, returning the marks
