@@ -761,9 +761,8 @@ export class Minip2pBase {
    * Waits until the peer's current connection is ready, or rejects if the
    * peer disconnects.
    *
-   * The wait follows the peer's current connection as `connectionEstablished`
-   * and `connectionReplaced` move it, so only that connection's `peerReady`
-   * resolves it; a stale `peerReady` for a replaced connection does not.
+   * A `peerReady` resolves it only while its connection is still the peer's
+   * current one, so a stale `peerReady` for a replaced connection does not.
    */
   waitPeerReady(
     peerId: string,
@@ -777,17 +776,6 @@ export class Minip2pBase {
     if (info?.readyProtocols !== undefined) {
       return Promise.resolve({ peerId, protocols: info.readyProtocols });
     }
-    let current = info?.connId;
-    const offEstablished = this.on("connectionEstablished", (event) => {
-      if (event.peerId === peerId) {
-        current = event.connId;
-      }
-    });
-    const offReplaced = this.on("connectionReplaced", (event) => {
-      if (event.peerId === peerId) {
-        current = event.new;
-      }
-    });
     const controller = new AbortController();
     if (options.signal?.aborted === true) {
       controller.abort();
@@ -795,24 +783,28 @@ export class Minip2pBase {
     const removeExternalAbort = listenAbort(options.signal, () => {
       controller.abort();
     });
-    const isCurrent = (event: { peerId: string; connId: number }) =>
-      event.peerId === peerId && event.connId === current;
+    // Events trail the native state, so a queued `peerReady` counts only if
+    // its connection is still the peer's current one; a replaced
+    // connection's readiness never resolves the wait.
     const ready = this.waitFor("peerReady", {
       ...options,
-      predicate: isCurrent,
+      predicate: (event) =>
+        event.peerId === peerId &&
+        this.#backend.connectionInfo(peerId)?.connId === event.connId,
       signal: controller.signal,
     }).then(({ protocols }) => ({ peerId, protocols }));
     const disconnected = this.waitFor("connectionClosed", {
       ...options,
-      predicate: isCurrent,
+      predicate: (event) =>
+        event.peerId === peerId &&
+        !this.#backend.connectedPeers().includes(peerId),
       signal: controller.signal,
     }).then(() => {
       throw new PeerDisconnectedError(peerId, "waitPeerReady");
     });
     return Promise.race([ready, disconnected]).finally(() => {
-      offEstablished();
-      offReplaced();
       removeExternalAbort?.();
+
       controller.abort();
     });
   }

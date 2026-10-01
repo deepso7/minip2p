@@ -592,14 +592,9 @@ impl InboundCircuit {
         let Some(stream_id) = self.dcutr_stream.take() else {
             return;
         };
-        let Some(peer) = self.source.as_ref() else {
-            return;
-        };
-        shared.push_action(NatAction::ResetStream {
-            peer: peer.clone(),
-            stream_id,
-        });
-        shared.release_stream(peer, stream_id);
+        if let Some(peer) = self.source.as_ref() {
+            shared.reset_owned_stream(peer, stream_id);
+        }
     }
 }
 

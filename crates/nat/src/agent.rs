@@ -278,6 +278,23 @@ impl Shared {
             .insert(stream, role);
     }
 
+    /// Resets and releases a stream the agent still owns. A stream already
+    /// released because its connection went away is left alone: resets are
+    /// peer-scoped, and the id may now belong to the peer's new connection.
+    pub(crate) fn reset_owned_stream(&mut self, peer: &PeerId, stream: StreamId) {
+        if self
+            .registry
+            .get(peer)
+            .is_some_and(|streams| streams.contains_key(&stream))
+        {
+            self.push_action(NatAction::ResetStream {
+                peer: peer.clone(),
+                stream_id: stream,
+            });
+            self.release_stream(peer, stream);
+        }
+    }
+
     /// Releases `stream` back to the application (or forgets it entirely).
     pub(crate) fn release_stream(&mut self, peer: &PeerId, stream: StreamId) {
         if let Some(streams) = self.registry.get_mut(peer) {
@@ -1046,17 +1063,19 @@ impl NatAgent {
     /// `conn_id` is gone: its streams, its path origin, and every machine
     /// state bound to it end. Peer-level state is the caller's call.
     fn connection_down(&mut self, peer: &PeerId, conn_id: ConnectionId, now: Now) {
+        self.forget_connection(peer, conn_id);
+        self.notify_connection_down(peer, conn_id, now);
+    }
+
+    /// Drops `conn_id` from connectivity and releases the streams bound to
+    /// it, before any machine reacts, so no machine counts it as live or
+    /// resets one of its streams by peer.
+    fn forget_connection(&mut self, peer: &PeerId, conn_id: ConnectionId) {
         self.shared.dialed.remove(&conn_id);
         self.shared.direct_connections.remove(&conn_id);
         self.shared.origins.remove(&conn_id);
         if let Some(ids) = self.shared.connected.get_mut(peer) {
             ids.remove(&conn_id);
-        }
-        for attempt in self.attempts.values_mut() {
-            attempt.on_connection_closed(peer, conn_id, &mut self.shared, now);
-        }
-        for circuit in self.inbound.values_mut() {
-            circuit.on_connection_closed(peer, conn_id, &mut self.shared);
         }
         let closed_streams: Vec<_> = self
             .shared
@@ -1067,6 +1086,16 @@ impl NatAgent {
             .collect();
         for (peer, stream) in closed_streams {
             self.shared.release_stream(&peer, stream);
+        }
+    }
+
+    /// Lets every machine end what it bound to `conn_id`.
+    fn notify_connection_down(&mut self, peer: &PeerId, conn_id: ConnectionId, now: Now) {
+        for attempt in self.attempts.values_mut() {
+            attempt.on_connection_closed(peer, conn_id, &mut self.shared, now);
+        }
+        for circuit in self.inbound.values_mut() {
+            circuit.on_connection_closed(peer, conn_id, &mut self.shared);
         }
         self.shared
             .pending_session_dials
@@ -1088,11 +1117,15 @@ impl NatAgent {
         let old_origin = self.shared.origins.get(&old).cloned();
         self.shared.ready.remove(peer);
         self.shared.observed_addrs.remove(peer);
+        // `old` stops counting before machines see `new`: a direct `old`
+        // must not make a relayed `new` look redundant.
+        self.forget_connection(peer, old);
         self.connection_up(peer, new, is_circuit, now);
         for attempt in self.attempts.values_mut() {
             attempt.on_target_replaced(peer, old, &mut self.shared);
         }
-        self.connection_down(peer, old, now);
+        self.notify_connection_down(peer, old, now);
+
         self.housekeeping
             .on_connection_replaced(peer, &mut self.shared, now);
 

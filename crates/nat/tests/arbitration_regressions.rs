@@ -677,3 +677,22 @@ fn direct_replacement_after_the_attempt_ended_reports_against_its_origin() {
     ));
     assert_eq!(h.agent.path(&h.target), Some(&Path::DirectDialed));
 }
+
+#[test]
+fn direct_replacement_during_dcutr_never_resets_the_retired_stream_by_peer() {
+    let mut h = Harness::with_relay(NatConfig::default());
+    let (_, circuit) = drive_to_relayed(&mut h);
+    let dcutr = StreamId::new(3);
+    open_inbound_dcutr(&mut h, circuit, dcutr);
+    drain_actions(&mut h.agent);
+
+    replace_target(&mut h, circuit, ConnectionId::new(50), 400);
+    assert!(
+        !drain_actions(&mut h.agent).iter().any(|action| matches!(
+            action,
+            NatAction::ResetStream { stream_id, .. } if *stream_id == dcutr
+        )),
+        "the DCUtR stream ended with the circuit; a reset by peer could hit the new connection"
+    );
+    assert!(!h.agent.owns_stream(&h.target, dcutr));
+}

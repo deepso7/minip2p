@@ -377,12 +377,8 @@ impl ConnectAttempt {
         self.promoted = None;
         self.bridge_alive = false;
         self.punch_deadline = None;
-        // The DCUtR stream lived on `old`; a peer-scoped reset could hit a
-        // stream of `new` that reuses its id.
-        if let Some(stream) = self.dcutr_stream.take() {
-            shared.release_stream(peer, stream);
-        }
         self.teardown_relay_leg(shared);
+
         self.done = true;
     }
 
@@ -1097,11 +1093,7 @@ impl ConnectAttempt {
         match self.leg {
             RelayLeg::WaitHopReady { stream } | RelayLeg::AwaitHopStatus { stream } => {
                 if let Some(relay_peer) = self.relay_peer().cloned() {
-                    shared.push_action(NatAction::ResetStream {
-                        peer: relay_peer.clone(),
-                        stream_id: stream,
-                    });
-                    shared.release_stream(&relay_peer, stream);
+                    shared.reset_owned_stream(&relay_peer, stream);
                 }
             }
             _ => {}
@@ -1145,11 +1137,7 @@ impl ConnectAttempt {
         match self.leg {
             RelayLeg::WaitHopReady { stream } | RelayLeg::AwaitHopStatus { stream } => {
                 if let Some(relay_peer) = self.relay_peer().cloned() {
-                    shared.push_action(NatAction::ResetStream {
-                        peer: relay_peer.clone(),
-                        stream_id: stream,
-                    });
-                    shared.release_stream(&relay_peer, stream);
+                    shared.reset_owned_stream(&relay_peer, stream);
                 }
             }
             RelayLeg::Bridged { stream } => {
@@ -1177,11 +1165,7 @@ impl ConnectAttempt {
 
     fn teardown_dcutr_stream(&mut self, shared: &mut Shared) {
         if let Some(stream_id) = self.dcutr_stream.take() {
-            shared.push_action(NatAction::ResetStream {
-                peer: self.peer.clone(),
-                stream_id,
-            });
-            shared.release_stream(&self.peer, stream_id);
+            shared.reset_owned_stream(&self.peer, stream_id);
         }
         self.dcutr = None;
     }

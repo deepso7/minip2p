@@ -447,3 +447,45 @@ fn circuit_replacement_through_another_relay_updates_the_path_origin() {
         Some(&Path::Relayed { relay: relay_b })
     );
 }
+
+#[test]
+fn inbound_circuit_replacing_a_direct_connection_announces_its_path() {
+    let mut h = inbound_harness(NatConfig::default());
+    let target = h.target.clone();
+    let direct = ConnectionId::new(9);
+    h.agent.handle_event(
+        &SwarmEvent::ConnectionEstablished {
+            conn_id: direct,
+            peer_id: target.clone(),
+        },
+        at(0),
+    );
+    let stop = StreamId::new(STOP_STREAM);
+    inbound_stop_stream(&mut h, stop, 1);
+    h.stream_data(stop, stop_connect(&target), at(10));
+    let promotion = drain_actions(&mut h.agent);
+    let circuit = ConnectionId::new(TEST_CIRCUIT_ID);
+    h.agent
+        .promote_result(promote_token(&promotion), Ok(circuit), at(11));
+
+    h.agent.handle_event_with_disposition_classified(
+        &SwarmEvent::ConnectionReplaced {
+            peer_id: target.clone(),
+            old: direct,
+            new: circuit,
+        },
+        true,
+        at(12),
+    );
+    assert!(
+        drain_events(&mut h.agent).iter().any(|event| matches!(
+            event,
+            NatEvent::InboundPathEstablished {
+                path: Path::Relayed { .. },
+                ..
+            }
+        )),
+        "the retired direct connection must not make the circuit look redundant"
+    );
+    assert!(matches!(h.agent.path(&target), Some(Path::Relayed { .. })));
+}
